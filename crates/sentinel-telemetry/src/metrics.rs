@@ -34,9 +34,14 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+#[cfg(feature = "telemetry")]
+use std::sync::OnceLock;
+use std::sync::{Arc, RwLock};
 
-use serde::Serialize;
+use sentinel_common::{Tick, Timestamp};
+use serde::{Deserialize, Serialize};
+
+use crate::health::HealthStatus;
 
 // ──────────────────────────────────────────────
 // Counter
@@ -159,18 +164,39 @@ impl Histogram {
 }
 
 // ──────────────────────────────────────────────
-// Snapshots (serializable for Dashboard/Export)
+// Snapshots (Dashboard-ready, MessagePack transport)
 // ──────────────────────────────────────────────
 
-/// Serializable snapshot of all metrics.
-#[derive(Debug, Clone, Serialize)]
+/// Top-level metrics snapshot for Dashboard consumption.
+///
+/// Serialized as MessagePack over Zenoh to `sentinel/telemetry/metrics`.
+/// The Dashboard subscribes directly - no intermediate layer.
+///
+/// **Lazy filtering:** Only subsystems with at least one non-zero metric
+/// appear. Counters with value 0 and histograms with count 0 are omitted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
+    /// Wall-clock timestamp when snapshot was taken.
+    pub timestamp: Timestamp,
+    /// Simulation tick at snapshot time.
+    pub tick: Tick,
+    /// Per-subsystem metrics (key = subsystem name, e.g. "redb", "zenoh").
+    pub subsystems: HashMap<String, SubsystemMetrics>,
+}
+
+/// Metrics for a single subsystem, including health status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubsystemMetrics {
+    /// Current health status of this subsystem.
+    pub health: HealthStatus,
+    /// Counters with value > 0 (lazy: zero-value counters omitted).
     pub counters: HashMap<String, u64>,
+    /// Histograms with count > 0 (lazy: unused histograms omitted).
     pub histograms: HashMap<String, HistogramSnapshot>,
 }
 
 /// Serializable snapshot of a single histogram.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistogramSnapshot {
     pub boundaries: Vec<f64>,
     pub bucket_counts: Vec<u64>,
@@ -188,10 +214,14 @@ pub struct MetricsRegistry {
     histograms: RwLock<HashMap<String, Arc<Histogram>>>,
 }
 
+#[cfg(feature = "telemetry")]
 static GLOBAL_METRICS: OnceLock<MetricsRegistry> = OnceLock::new();
 
 impl MetricsRegistry {
     /// Get the global metrics registry (created on first access).
+    ///
+    /// Only available with the `telemetry` feature (default: enabled).
+    #[cfg(feature = "telemetry")]
     pub fn global() -> &'static Self {
         GLOBAL_METRICS.get_or_init(|| MetricsRegistry {
             counters: RwLock::new(HashMap::new()),
@@ -231,21 +261,34 @@ impl MetricsRegistry {
         )
     }
 
-    /// Take a snapshot of all metrics for export.
-    pub fn snapshot(&self) -> MetricsSnapshot {
+    /// Take a raw snapshot of all counters and histograms.
+    ///
+    /// **Lazy filtering:** Only returns counters with value > 0 and
+    /// histograms with count > 0. Zero-value metrics are omitted.
+    ///
+    /// Returns `(counters, histograms)` maps. Use these to build a
+    /// [`MetricsSnapshot`] with timestamp, tick, and health data.
+    pub fn snapshot_raw(&self) -> (HashMap<String, u64>, HashMap<String, HistogramSnapshot>) {
         let counters = self.counters.read().unwrap();
         let histograms = self.histograms.read().unwrap();
 
-        MetricsSnapshot {
-            counters: counters
-                .iter()
-                .map(|(k, v)| (k.clone(), v.get()))
-                .collect(),
-            histograms: histograms
-                .iter()
-                .map(|(k, v)| (k.clone(), v.snapshot()))
-                .collect(),
-        }
+        let filtered_counters: HashMap<String, u64> = counters
+            .iter()
+            .filter_map(|(k, v)| {
+                let val = v.get();
+                if val > 0 { Some((k.clone(), val)) } else { None }
+            })
+            .collect();
+
+        let filtered_histograms: HashMap<String, HistogramSnapshot> = histograms
+            .iter()
+            .filter_map(|(k, v)| {
+                let snap = v.snapshot();
+                if snap.count > 0 { Some((k.clone(), snap)) } else { None }
+            })
+            .collect();
+
+        (filtered_counters, filtered_histograms)
     }
 }
 
@@ -321,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_snapshot() {
+    fn test_registry_snapshot_raw() {
         let registry = MetricsRegistry {
             counters: RwLock::new(HashMap::new()),
             histograms: RwLock::new(HashMap::new()),
@@ -332,10 +375,10 @@ mod tests {
             .histogram("latency", &[1.0, 5.0, 10.0])
             .observe(3.0);
 
-        let snap = registry.snapshot();
-        assert_eq!(*snap.counters.get("ops").unwrap(), 42);
-        assert!(snap.histograms.contains_key("latency"));
-        assert_eq!(snap.histograms.get("latency").unwrap().count, 1);
+        let (counters, histograms) = registry.snapshot_raw();
+        assert_eq!(*counters.get("ops").unwrap(), 42);
+        assert!(histograms.contains_key("latency"));
+        assert_eq!(histograms.get("latency").unwrap().count, 1);
     }
 
     #[test]
@@ -355,16 +398,52 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_serializable() {
+    fn test_snapshot_lazy_filtering() {
         let registry = MetricsRegistry {
             counters: RwLock::new(HashMap::new()),
             histograms: RwLock::new(HashMap::new()),
         };
-        registry.counter("test").increment();
 
-        let snap = registry.snapshot();
+        // Create metrics but don't increment some
+        registry.counter("active").increment();
+        registry.counter("inactive"); // value = 0
+        registry.histogram("used", &[1.0]).observe(0.5);
+        registry.histogram("unused", &[1.0]); // count = 0
+
+        let (counters, histograms) = registry.snapshot_raw();
+
+        // Only non-zero metrics appear
+        assert!(counters.contains_key("active"));
+        assert!(!counters.contains_key("inactive"));
+        assert!(histograms.contains_key("used"));
+        assert!(!histograms.contains_key("unused"));
+    }
+
+    #[test]
+    fn test_metrics_snapshot_serializable() {
+        use sentinel_common::{Tick, Timestamp};
+        use crate::health::HealthStatus;
+
+        let mut subsystems = HashMap::new();
+        subsystems.insert("redb".to_string(), SubsystemMetrics {
+            health: HealthStatus::Healthy,
+            counters: HashMap::from([("ops".to_string(), 42)]),
+            histograms: HashMap::new(),
+        });
+
+        let snap = MetricsSnapshot {
+            timestamp: Timestamp(1000),
+            tick: Tick(5),
+            subsystems,
+        };
+
         let json = serde_json::to_string(&snap).unwrap();
-        assert!(json.contains("\"test\""));
-        assert!(json.contains("1"));
+        assert!(json.contains("\"redb\""));
+        assert!(json.contains("42"));
+
+        // Deserialize roundtrip
+        let deserialized: MetricsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.tick, Tick(5));
+        assert!(deserialized.subsystems.contains_key("redb"));
     }
 }

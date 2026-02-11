@@ -10,8 +10,13 @@ pub mod health;
 pub mod logging;
 pub mod metrics;
 
-pub use context::{TraceContext, TELEMETRY_HEALTH, TELEMETRY_METRICS, TELEMETRY_TRACES};
-pub use errors::{ClassifiedError, ErrorSeverity};
+pub use context::{
+    TraceContext, TELEMETRY_ERRORS, TELEMETRY_HEALTH, TELEMETRY_METRICS, TELEMETRY_TRACES,
+};
+pub use errors::{ClassifiedError, ErrorEvent, ErrorSeverity};
 pub use health::{HealthRegistry, HealthStatus};
+#[cfg(feature = "telemetry")]
 pub use logging::{init_logging, init_logging_dev};
-pub use metrics::{metric_name, Counter, Histogram, MetricsRegistry, MetricsSnapshot};
+pub use metrics::{
+    metric_name, Counter, Histogram, MetricsRegistry, MetricsSnapshot, SubsystemMetrics,
+};

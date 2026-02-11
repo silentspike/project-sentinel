@@ -3,11 +3,17 @@
 //! Provides a trait for classifying errors by severity, enabling
 //! consistent error handling across all crates. The trait is defined
 //! here; implementations are added by individual crates in Sprint 2+.
+//!
+//! [`ErrorEvent`] is the wire format published to `sentinel/telemetry/errors`
+//! for Dashboard consumption.
+
+use sentinel_common::{AgentId, Tick, Timestamp};
+use serde::{Deserialize, Serialize};
 
 /// Severity classification for errors.
 ///
 /// Determines the system's response to an error condition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorSeverity {
     /// Unrecoverable error. Triggers graceful shutdown.
     /// Example: redb corruption, persistent Zenoh disconnect.
@@ -50,6 +56,32 @@ pub trait ClassifiedError {
     fn is_retryable(&self) -> bool;
 }
 
+// ──────────────────────────────────────────────
+// ErrorEvent (wire format for Dashboard)
+// ──────────────────────────────────────────────
+
+/// Classified error event published to `sentinel/telemetry/errors`.
+///
+/// The Dashboard subscribes to this topic for real-time error display.
+/// Serialized as MessagePack over Zenoh transport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorEvent {
+    /// Severity classification.
+    pub severity: ErrorSeverity,
+    /// Subsystem that produced the error (e.g. "redb", "zenoh", "limbo").
+    pub subsystem: String,
+    /// Human-readable error message.
+    pub message: String,
+    /// Whether this error can be retried.
+    pub retryable: bool,
+    /// Agent context (if error relates to a specific agent).
+    pub agent_id: Option<AgentId>,
+    /// Simulation tick when error occurred.
+    pub tick: Option<Tick>,
+    /// Wall-clock timestamp.
+    pub timestamp: Timestamp,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +119,34 @@ mod tests {
         let err = TestError(ErrorSeverity::Degraded);
         assert_eq!(err.severity(), ErrorSeverity::Degraded);
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_error_event_serialization_roundtrip() {
+        let event = ErrorEvent {
+            severity: ErrorSeverity::Transient,
+            subsystem: "zenoh".to_string(),
+            message: "Connection timeout".to_string(),
+            retryable: true,
+            agent_id: Some(AgentId(7)),
+            tick: Some(Tick(42)),
+            timestamp: Timestamp(1000),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: ErrorEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.severity, ErrorSeverity::Transient);
+        assert_eq!(deserialized.subsystem, "zenoh");
+        assert!(deserialized.retryable);
+        assert_eq!(deserialized.agent_id, Some(AgentId(7)));
+        assert_eq!(deserialized.tick, Some(Tick(42)));
+    }
+
+    #[test]
+    fn test_error_severity_serialization() {
+        let json = serde_json::to_string(&ErrorSeverity::Fatal).unwrap();
+        let deserialized: ErrorSeverity = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, ErrorSeverity::Fatal);
     }
 }

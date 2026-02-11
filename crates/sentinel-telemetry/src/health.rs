@@ -4,16 +4,21 @@
 //! The registry can be queried for the aggregate health status.
 
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+#[cfg(feature = "telemetry")]
+use std::sync::OnceLock;
+use std::sync::RwLock;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // ──────────────────────────────────────────────
 // HealthStatus
 // ──────────────────────────────────────────────
 
 /// Health status of a subsystem.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+///
+/// Serialized as part of [`SubsystemMetrics`] for Dashboard transport
+/// over Zenoh topic `sentinel/telemetry/health`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HealthStatus {
     /// Subsystem is operating normally.
     Healthy,
@@ -35,10 +40,14 @@ pub struct HealthRegistry {
     checks: RwLock<HashMap<String, Box<dyn Fn() -> HealthStatus + Send + Sync>>>,
 }
 
+#[cfg(feature = "telemetry")]
 static GLOBAL_HEALTH: OnceLock<HealthRegistry> = OnceLock::new();
 
 impl HealthRegistry {
     /// Get the global health registry (created on first access).
+    ///
+    /// Only available with the `telemetry` feature (default: enabled).
+    #[cfg(feature = "telemetry")]
     pub fn global() -> &'static Self {
         GLOBAL_HEALTH.get_or_init(|| HealthRegistry {
             checks: RwLock::new(HashMap::new()),

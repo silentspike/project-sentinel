@@ -27,12 +27,16 @@
 //! Die Hierarchie wird durch verschachtelte `tracing::Span`s realisiert.
 //! Jeder Tick erzeugt einen Root-Span, Agent-Operationen sind Kind-Spans.
 
+#[cfg(feature = "telemetry")]
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// Initialize structured logging with JSON output (production mode).
 ///
 /// Respects RUST_LOG env var. Default filter: `info`.
 /// Call once at startup.
+///
+/// Only available with the `telemetry` feature (default: enabled).
+#[cfg(feature = "telemetry")]
 pub fn init_logging() {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -47,6 +51,9 @@ pub fn init_logging() {
 ///
 /// Respects RUST_LOG env var. Default filter: `debug`.
 /// Call once at startup.
+///
+/// Only available with the `telemetry` feature (default: enabled).
+#[cfg(feature = "telemetry")]
 pub fn init_logging_dev() {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
