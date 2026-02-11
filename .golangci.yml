@@ -1,11 +1,13 @@
+version: "2"
+
 run:
   timeout: 5m
   modules-download-mode: readonly
 
 linters:
+  default: none
   enable:
     - errcheck
-    - gosimple
     - govet
     - ineffassign
     - staticcheck
@@ -14,12 +16,11 @@ linters:
     - gocyclo
     - misspell
     - prealloc
-
-linters-settings:
-  gocyclo:
-    min-complexity: 20
-  gosec:
-    severity: medium
+  settings:
+    gocyclo:
+      min-complexity: 20
+    gosec:
+      severity: medium
 
 issues:
   max-issues-per-linter: 50
