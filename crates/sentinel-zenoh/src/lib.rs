@@ -27,7 +27,7 @@ pub struct SentinelBus {
 impl SentinelBus {
     /// Create a new SentinelBus with default Zenoh config.
     /// SHM is prepared but not activated (needs runtime validation first).
-    #[instrument(name = "SentinelBus::new")]
+    #[instrument(name = "SentinelBus::new", level = "debug")]
     pub async fn new() -> anyhow::Result<Self> {
         let config = zenoh::Config::default();
         // TODO: SHM activation after runtime validation
@@ -40,7 +40,7 @@ impl SentinelBus {
     }
 
     /// Publish a message to a topic.
-    #[instrument(skip(self, payload), fields(topic = %topic))]
+    #[instrument(skip(self, payload), level = "trace", fields(topic = %topic))]
     pub async fn publish(&self, topic: &str, payload: &[u8]) -> anyhow::Result<()> {
         self.session
             .put(topic, payload)
@@ -51,7 +51,7 @@ impl SentinelBus {
 
     /// Subscribe to a topic. Returns a Subscriber that yields samples
     /// via `recv_async().await`.
-    #[instrument(skip(self), fields(topic = %topic))]
+    #[instrument(skip(self), level = "debug", fields(topic = %topic))]
     pub async fn subscribe(&self, topic: &str) -> anyhow::Result<BusSubscriber> {
         let subscriber = self
             .session
@@ -63,7 +63,7 @@ impl SentinelBus {
     }
 
     /// Publish an agent action.
-    #[instrument(skip(self, payload), fields(agent_id = %agent_id))]
+    #[instrument(skip(self, payload), level = "trace", fields(agent_id = %agent_id))]
     pub async fn publish_action(
         &self,
         agent_id: AgentId,
@@ -74,7 +74,7 @@ impl SentinelBus {
     }
 
     /// Subscribe to an agent's perception channel.
-    #[instrument(skip(self), fields(agent_id = %agent_id))]
+    #[instrument(skip(self), level = "debug", fields(agent_id = %agent_id))]
     pub async fn subscribe_perception(
         &self,
         agent_id: AgentId,
@@ -84,7 +84,7 @@ impl SentinelBus {
     }
 
     /// Publish a room event (audio, smell, or presence).
-    #[instrument(skip(self, payload), fields(room_id = %room_id, event_type = %event_type))]
+    #[instrument(skip(self, payload), level = "trace", fields(room_id = %room_id, event_type = %event_type))]
     pub async fn publish_room_event(
         &self,
         room_id: RoomId,
@@ -97,7 +97,7 @@ impl SentinelBus {
 
     /// Publish a global simulation tick.
     /// Uses raw numeric tick value for compact topic paths (e.g. sentinel/physics/tick/42).
-    #[instrument(skip(self, payload), fields(tick = %tick))]
+    #[instrument(skip(self, payload), level = "trace", fields(tick = %tick))]
     pub async fn publish_tick(
         &self,
         tick: Tick,
@@ -108,7 +108,7 @@ impl SentinelBus {
     }
 
     /// Publish a chaos event.
-    #[instrument(skip(self, payload))]
+    #[instrument(skip(self, payload), level = "trace")]
     pub async fn publish_chaos_event(&self, payload: &[u8]) -> anyhow::Result<()> {
         self.publish(topics::CHAOS_EVENT, payload).await
     }

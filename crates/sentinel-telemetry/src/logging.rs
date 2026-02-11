@@ -2,6 +2,30 @@
 //!
 //! Two modes: JSON (production) and pretty (development).
 //! Respects RUST_LOG env var for filtering.
+//!
+//! # Log-Level-Strategie
+//!
+//! | Level | Wann | Beispiel |
+//! |-------|------|---------|
+//! | ERROR | Fatal/Unrecoverable | redb corruption, Zenoh disconnect |
+//! | WARN  | Transient/Degraded | API timeout, retry |
+//! | INFO  | Business Events | Agent moved, message sent, tick completed |
+//! | DEBUG | Subsystem Details | Bio-Engine Werte, Physics Berechnung |
+//! | TRACE | Hot Path Instrumentation | Jeder redb get/set, jeder Zenoh publish |
+//!
+//! # Span-Hierarchie (geplant fuer Sprint 2+)
+//!
+//! ```text
+//! tick{tick=t42}
+//!   agent{agent_id=AGENT-01}
+//!     bio{hunger=45.5, energy=72.0}
+//!     physics{room_id=ROOM-3}
+//!     zenoh.publish{topic=sentinel/agent/AGENT-01/action}
+//!     redb.get_agent_state{agent_id=AGENT-01}
+//! ```
+//!
+//! Die Hierarchie wird durch verschachtelte `tracing::Span`s realisiert.
+//! Jeder Tick erzeugt einen Root-Span, Agent-Operationen sind Kind-Spans.
 
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
