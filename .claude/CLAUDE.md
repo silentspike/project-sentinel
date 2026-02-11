@@ -201,6 +201,9 @@ config/              # Raum-Layout, Agent-Defs, Simulations-Parameter
 | Typos Config | `typos.toml` |
 | Audit Ignores | `.cargo/audit.toml` |
 | Changelog | `CHANGELOG.md` |
+| Cortex Gateway Config | `config/cortex-gateway.toml` |
+| Go Package Layout | `cmd/cortex-gateway/internal/` |
+| Sprint 3 Domain Knowledge | `.claude/rules/sprint3-domain.md` |
 
 **Regel:** Plan ist SSOT fuer Architektur. Wenn Plan und Code divergieren → Plan gewinnt.
 
@@ -233,6 +236,16 @@ _Erkenntnisse aus der Implementierung. Format: Datum, Kontext, was gelernt._
 - 2026-02-11: cargo-deny v2: `vulnerability`/`notice` entfernt, `unmaintained`/`unsound` sind Scope-Werte.
 - 2026-02-11: golangci-lint v2: `version: "2"` noetig, `gosimple` in `staticcheck` gemerged.
 - 2026-02-11: GitHub Actions Major-Bumps koennen Breaking Changes haben. IMMER Release Notes pruefen.
+
+### IMMER (gelernt, Sprint 3)
+- 2026-02-11: Go structs mit `sync.RWMutex` duerfen NICHT by-value kopiert/serialisiert werden. Loesung: DTO-Struct ohne Mutex (z.B. `ConfigSnapshot`).
+- 2026-02-11: Prometheus `init()` MustRegister panikt bei doppelter Registrierung in Tests. Alternative: `promauto.New*` oder Custom Registry.
+- 2026-02-11: Go HTTP Handler: IMMER `io.LimitReader` fuer Request/Response Bodies (Defense-in-Depth).
+- 2026-02-11: HTTP Client Timeouts setzen (nicht 0 = unendlich). LLM-Calls brauchen laengere Timeouts (5min).
+- 2026-02-11: Koffein-Entzug Schwellenwert (caffeine<20 + tolerance>0.3) kollidiert mit default_bio() wo caffeine=0. Tests muessen caffeine_mg explizit setzen.
+- 2026-02-11: `go.work` im Repo-Root fuer Go Workspace (cmd/cortex-gateway ist ein separates Go Module).
+- 2026-02-11: Deutsche Regex-Patterns in Go-Strings: typos.toml muss ALLE deutschen Woerter enthalten.
+- 2026-02-11: UTF-8-sichere String-Truncation in Go: `string[:N]` kann Multi-Byte Runes kaputt machen. `utf8.Valid` pruefen oder Rune-basiert truncaten.
 
 ### Kontext-Wissen (Sprint 2)
 - 2026-02-11: Dependency-Graph Sprint 2: common(+bevy_ecs) → bio + physics → ecs. NICHT umgekehrt.

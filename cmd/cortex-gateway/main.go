@@ -1,7 +1,168 @@
 package main
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/compiler"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy"
+)
+
+// version is set at build time via ldflags.
+var version = "0.1.0"
+
+// Server timeouts for both proxy and control plane.
+const (
+	readTimeout     = 30 * time.Second
+	writeTimeout    = 60 * time.Second
+	idleTimeout     = 120 * time.Second
+	shutdownTimeout = 10 * time.Second
+)
 
 func main() {
-	fmt.Println("Cortex Gateway - not yet implemented")
+	// 1. Structured logging via slog
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
+	logger.Info("cortex-gateway starting", "version", version)
+
+	// 2. Configuration from environment
+	port := envOrDefault("CORTEX_PORT", "8080")
+	controlPort := envOrDefault("CORTEX_CONTROL_PORT", "8081")
+
+	// 3. Provider registry
+	registry := proxy.NewRegistry()
+
+	claudeAPIKey := os.Getenv("ANTHROPIC_API_KEY")
+	if claudeAPIKey != "" {
+		claudeProvider := proxy.NewClaudeProvider(proxy.ProviderConfig{
+			Name:      "claude",
+			Type:      "claude",
+			BaseURL:   envOrDefault("CLAUDE_BASE_URL", "https://api.anthropic.com"),
+			APIKey:    claudeAPIKey,
+			Model:     envOrDefault("CLAUDE_MODEL", "claude-sonnet-4-5-20250929"),
+			MaxTokens: 4096,
+			Priority:  1,
+		})
+		registry.Register("claude", claudeProvider)
+		logger.Info("registered provider", "name", "claude")
+	} else {
+		logger.Warn("ANTHROPIC_API_KEY not set, claude provider not registered")
+	}
+
+	ollamaURL := envOrDefault("OLLAMA_BASE_URL", "http://localhost:11434")
+	ollamaProvider := proxy.NewOllamaProvider(proxy.ProviderConfig{
+		Name:      "ollama",
+		Type:      "ollama",
+		BaseURL:   ollamaURL,
+		Model:     envOrDefault("OLLAMA_MODEL", "qwen3:7b"),
+		MaxTokens: 4096,
+		Priority:  2,
+	})
+	registry.Register("ollama", ollamaProvider)
+	logger.Info("registered provider", "name", "ollama")
+
+	// 4. Processing pipeline components (wired in Phase 4)
+	norm := normalizer.New()
+	comp := compiler.New()
+	ext := extraction.New()
+	caps := capability.New()
+	_ = norm
+	_ = comp
+	_ = ext
+	_ = caps
+
+	// 5. HTTP proxy server
+	proxyHandler := proxy.NewHandler(registry, logger)
+	proxyMux := http.NewServeMux()
+	proxyMux.Handle("POST /v1/chat/completions", proxyHandler)
+	proxyMux.HandleFunc("GET /health", handleHealth)
+	proxyMux.HandleFunc("GET /ready", handleReady)
+	proxyMux.Handle("GET /metrics", promhttp.Handler())
+
+	proxyServer := &http.Server{
+		Addr:         ":" + port,
+		Handler:      proxyMux,
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
+		IdleTimeout:  idleTimeout,
+	}
+
+	// 6. Control plane server (separate port)
+	controlConfig := control.NewConfig("claude")
+	controlPlane := control.NewPlane(controlConfig, logger)
+	controlMux := controlPlane.Handler()
+
+	controlServer := &http.Server{
+		Addr:         ":" + controlPort,
+		Handler:      controlMux,
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
+		IdleTimeout:  idleTimeout,
+	}
+
+	// 7. Start servers
+	go func() {
+		logger.Info("proxy server starting", "addr", proxyServer.Addr)
+		if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("proxy server failed", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	go func() {
+		logger.Info("control plane starting", "addr", controlServer.Addr)
+		if err := controlServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("control server failed", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	// 8. Graceful shutdown on signal
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
+
+	logger.Info("shutdown signal received", "signal", sig.String())
+
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	if err := proxyServer.Shutdown(ctx); err != nil {
+		logger.Error("proxy server shutdown error", "error", err)
+	}
+	if err := controlServer.Shutdown(ctx); err != nil {
+		logger.Error("control server shutdown error", "error", err)
+	}
+
+	logger.Info("cortex-gateway stopped")
+}
+
+func handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`, version)
+}
+
+func handleReady(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = fmt.Fprint(w, `{"ready":true}`)
+}
+
+func envOrDefault(key, defaultVal string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return defaultVal
 }

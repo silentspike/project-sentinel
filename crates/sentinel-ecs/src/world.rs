@@ -110,6 +110,7 @@ pub fn spawn_agent(
                 extraversion: 0.5,
                 agreeableness: 0.5,
                 neuroticism: 0.3,
+                caffeine_tolerance: 0.5,
                 is_morning_person: true,
             },
             Mood {

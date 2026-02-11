@@ -7,11 +7,7 @@ on:
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
-  pull_request:
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
+  workflow_dispatch:
 
 concurrency:
   group: coverage-${{ github.ref }}
@@ -29,8 +25,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
 
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          cache-on-failure: true
+
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
+        uses: taiki-e/install-action@d4422f254e595ee762a758628fe4f16ce050fa2e # v2.67.28
+        with:
+          tool: cargo-tarpaulin
 
       - name: Generate coverage
         run: cargo tarpaulin --workspace --out xml --output-dir target/coverage
