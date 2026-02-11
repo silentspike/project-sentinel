@@ -12,6 +12,24 @@ hono = "hono"     # Hono web framework
 toml = "toml"     # TOML config format
 zenoh = "zenoh"   # Zenoh pub/sub
 
+# German words used in code comments (CLAUDE.md, deny.toml, Rust doc comments)
+ist = "ist"
+Prozess = "Prozess"
+Hierarchie = "Hierarchie"
+initialisiert = "initialisiert"
+fuer = "fuer"
+ueber = "ueber"
+aenderungen = "aenderungen"
+Aenderungen = "Aenderungen"
+geprueft = "geprueft"
+ausfuehren = "ausfuehren"
+aktualisieren = "aktualisieren"
+Lokal = "Lokal"
+muessen = "muessen"
+moglich = "moglich"
+Woche = "Woche"
+und = "und"
+
 [files]
 extend-exclude = [
     "Cargo.lock",
