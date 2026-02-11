@@ -66,6 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sprint 3: `config/cortex-gateway.toml` gateway configuration
 - Sprint 3: `caffeine_tolerance` field added to `Personality` component
 - Sprint 3: Go CI enhanced with `go build` step and race detector (`go test -race`)
+- Sprint 4: `sentinel-runtime` crate: Agent orchestrator with spawn/despawn lifecycle, shift transition (Sonder-Set preserved), health checks, max-agents enforcement (6 tests)
+- Sprint 4: `sentinel-sandbox` crate: Bubblewrap (bwrap) config builder with for_agent() defaults (ro-bind, rw-bind, tmpfs, unshare-all), cgroups v2 config (CPU/memory/IO limits), PSI metrics parser (8 tests, 3 ignored)
+- Sprint 4: `sentinel-wasm` crate: Tool runtime with registry, native FileRead/FileWrite handlers, placeholder tools (Chat/Calendar/Search) (5 tests)
+- Sprint 4: `sentinel-common::agent_config` module: TOML-based agent definition parser with Big Five personality validation [0.0, 1.0], load_agent_config() and load_all_agents() (5 tests)
+- Sprint 4: 5 agent definition TOML files migrated from Markdown (AGENT-01 through AGENT-05: Thomas CEO, Lisa/Max/Sophie Design, Andreas Dev)
+- Sprint 4: `sentinel-dashboard` backend: Hono-based API (health, agents, rooms, agent state, room chat, metrics endpoints) with WebSocket live events (5 tests)
+- Sprint 4: `sentinel-dashboard` frontend: Dark mode UI with 4 views (Agents with bio-bars, Floorplan with room grouping, Chat with room filter, Metrics), vanilla JS ES modules, textContent-only (no innerHTML)
 
 ### Changed
 
@@ -91,3 +98,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Clippy `manual_range_contains` warnings in sentinel-common validation
 - Clippy `type_complexity` warning in telemetry test mock
 - `cargo fmt` formatting across workspace
+
+### Dependencies
+
+- Rust: zenoh 1.5.1 → 1.7.2, x509-parser 0.16.0 → 0.18.1, and transitive dependency updates via `cargo update`
+- Removed unused `flatbuffers` dependency from sentinel-common
+- Removed unused `sentinel-common` and `tracing` dependencies from sentinel-wasm

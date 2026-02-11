@@ -1,5 +1,28 @@
 <!DOCTYPE html>
 <html lang="de">
-<head><meta charset="UTF-8"><title>Sentinel Dashboard</title></head>
-<body><h1>Sentinel Dashboard</h1><p>Not yet implemented.</p></body>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Project Sentinel - Dashboard</title>
+  <link rel="stylesheet" href="/public/css/style.css">
+</head>
+<body>
+  <header>
+    <h1>Project Sentinel</h1>
+    <nav id="main-nav">
+      <button class="nav-btn active" data-view="agents">Agents</button>
+      <button class="nav-btn" data-view="floorplan">Büroplan</button>
+      <button class="nav-btn" data-view="chat">Chat</button>
+      <button class="nav-btn" data-view="metrics">Metriken</button>
+    </nav>
+    <div id="connection-status">Verbinde...</div>
+  </header>
+  <main>
+    <section id="view-agents" class="view active"></section>
+    <section id="view-floorplan" class="view"></section>
+    <section id="view-chat" class="view"></section>
+    <section id="view-metrics" class="view"></section>
+  </main>
+  <script type="module" src="/public/js/app.js"></script>
+</body>
 </html>

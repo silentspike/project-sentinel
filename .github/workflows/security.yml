@@ -10,7 +10,7 @@ on:
       - '**/go.mod'
       - '**/go.sum'
       - '**/package.json'
-      - '**/bun.lockb'
+      - '**/bun.lock'
   workflow_dispatch:
 
 permissions:
