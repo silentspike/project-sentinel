@@ -20,7 +20,7 @@ zenoh = "1.1"
 redb = "2.4"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-flatbuffers = "24.12"
+flatbuffers = "25.12"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
