@@ -1,0 +1,4 @@
+# Company context - will be populated during migration
+[company]
+name = "PixelPerfekt GmbH"
+city = "Nuernberg"

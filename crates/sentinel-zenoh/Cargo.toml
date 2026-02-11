@@ -1,0 +1,10 @@
+[package]
+name = "sentinel-zenoh"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zenoh = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+sentinel-common = { path = "../sentinel-common" }

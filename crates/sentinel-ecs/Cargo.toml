@@ -1,0 +1,11 @@
+[package]
+name = "sentinel-ecs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy_ecs = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+sentinel-common = { path = "../sentinel-common" }
