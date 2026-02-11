@@ -9,12 +9,12 @@ enum ActionType : byte {
 }
 
 table AgentAction {
-    agent_name: string (required);
+    agent_id: uint16;
     action_type: ActionType;
-    target_room: string;
-    target_agent: string;
+    target_room: uint16;
+    target_agent: uint16;
     content: string;
-    timestamp_ms: uint64;
+    timestamp: uint64;
     tick: uint64;
 }
 
