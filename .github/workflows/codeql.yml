@@ -1,0 +1,50 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cmd/**'
+      - 'dashboard/**'
+  schedule:
+    - cron: '0 4 * * 3'  # Mittwoch 04:00 UTC
+
+permissions:
+  security-events: write
+
+jobs:
+  analyze-go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cmd/cortex-gateway/go.mod
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: go
+          source-root: cmd/cortex-gateway
+
+      - uses: github/codeql-action/autobuild@v3
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: go
+
+  analyze-js:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          source-root: dashboard
+
+      - uses: github/codeql-action/autobuild@v3
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: dashboard
