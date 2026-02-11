@@ -68,6 +68,29 @@ unveraenderlich = "unveraenderlich"
 Nachbarraeume = "Nachbarraeume"
 Belegung = "Belegung"
 
+# Sprint 2 code comment words (German in Rust doc comments)
+Normales = "Normales"
+Normale = "Normale"
+Ein = "Ein"
+ein = "ein"
+Startet = "Startet"
+triggern = "triggern"
+alle = "alle"
+Alle = "Alle"
+Temperatur = "Temperatur"
+Faktor = "Faktor"
+extraversion = "extraversion"  # Big Five uses "extraversion" (NOT "extroversion")
+Konfiguration = "Konfiguration"
+valide = "valide"
+Typs = "Typs"
+als = "als"
+Ende = "Ende"
+Modell = "Modell"
+negativ = "negativ"
+positiv = "positiv"
+Funktion = "Funktion"
+unter = "unter"
+
 [files]
 extend-exclude = [
     "Cargo.lock",
