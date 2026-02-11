@@ -17,12 +17,15 @@
 - Files editieren ohne sie vorher zu lesen
 - "production ready" behaupten ohne Evidence
 - Architektur-Entscheidungen treffen die vom Plan abweichen ohne User-Freigabe
+- GitHub Actions auf Tags referenzieren (`@v4`) - IMMER SHA-Pins verwenden
+- `allow(unused)` ohne Kommentar warum
 
 ### IMMER
-- `make ci` vor Push (lokale CI = Lint + Tests)
+- `make ci` vor Push (lokale CI = Lint + Tests + cargo deny)
 - Read before Edit - jedes File vor Bearbeitung lesen
 - Conventional Commits fuer PR-Titel und Commits
 - CHANGELOG.md bei user-facing Aenderungen aktualisieren
+- `cargo deny check` vor Push (Licenses + Advisories)
 - IOPS-Impact bedenken (DRAM-lose NVMe! Budget: siehe Plan)
 - Performance-kritischen Code benchmarken
 - FlatBuffer Schema validieren bei Schema-Aenderungen
@@ -43,6 +46,35 @@ VERBOTEN in Code/Docs:
 
 ---
 
+## TEAM-REGELN (Claude Code Teammates)
+
+### Modell-Zuweisung
+- **Lead-Rollen** (Teamlead, Architect): IMMER Opus Modell (`model: "opus"`)
+- **Worker-Rollen** (Implementierung, Tests): IMMER Sonnet Modell (`model: "sonnet"`)
+
+### Verifikation + Push
+- Push to main: NUR die Hauptsession (User/Owner), KEINE Delegation an Teammates
+- Teammates erstellen PRs, aber mergen NICHT selbst
+
+### Lessons Learned (PFLICHT)
+- Teamlead MUSS nach Abschluss JEDER Task alle Teammates nach Lessons Learned fragen
+- Erkenntnisse werden SOFORT in dieser Datei unter PROJEKT-LEARNINGS eingetragen
+- Unerwartetes Verhalten, Fehler, Workarounds - alles dokumentieren
+
+### Architektur-Mindset
+- NIEMALS in Phasen denken - IMMER den Endausbau im Blick behalten
+- Endausbau = Claude Code + Cortex Gateway (permanent, NICHT Migration weg von CC)
+- Cortex Gateway ist permanenter Middleware-Layer UEBER Claude Code
+- System muss modell-agnostisch sein (Claude, Qwen3, BitNet als Provider hinter Cortex Gateway)
+- BitNet = optionaler Cost-Saving-Layer fuer triviale Interaktionen, NICHT das Brain
+
+### Teammate-Management
+- Teammates die Tasks wiederholt ignorieren oder nicht nach Instruktion arbeiten: Frueh terminieren
+- Selbst fixen ist oft schneller als wiederholtes Anweisen
+- Jeder Teammate arbeitet nach DIESER CLAUDE.md - sie ist autoritativ
+
+---
+
 ## REQUIRED GUIDELINES
 
 ### Code Quality
@@ -54,8 +86,15 @@ VERBOTEN in Code/Docs:
 
 ### Code Style
 - Rust: `cargo fmt` + `cargo clippy -- -D warnings` (zero warnings)
-- Go: `gofmt` + `go vet` + `golangci-lint`
+- Rust: `rustfmt.toml` definiert max_width=100, `clippy.toml` definiert Thresholds
+- Go: `gofmt` + `go vet` + `golangci-lint` (Config: `.golangci.yml`)
 - TypeScript: Bun-native, kein extra Formatter
+
+### Supply-Chain-Security
+- Alle GitHub Actions MUESSEN auf volle Commit-SHAs gepinnt sein (nie `@v4`, immer `@sha # v4.x.y`)
+- `deny.toml` definiert erlaubte Licenses, Advisory-Policy, Crate-Bans, Source-Restrictions
+- Bei neuen Dependencies: `cargo deny check` ausfuehren und ggf. `deny.toml` anpassen
+- Dependabot PRs nutzen Conventional Commit Messages (`deps(scope): ...`)
 
 ---
 
@@ -63,7 +102,7 @@ VERBOTEN in Code/Docs:
 
 ### PR Workflow
 1. Branch: `feat/beschreibung` oder `fix/beschreibung`
-2. Lokal: `make ci` (muss gruen sein)
+2. Lokal: `make ci` (muss gruen sein - inkl. deny check)
 3. Push + PR erstellen (Conventional Commit Titel)
 4. CI laeuft automatisch (nur betroffene Jobs via path-filter)
 5. Review → Merge → Branch loeschen
@@ -71,6 +110,7 @@ VERBOTEN in Code/Docs:
 ### VERIFY nach jedem Schritt (PFLICHT)
 ```
 □ Tests ausgefuehrt? → Command + Output
+□ Lints bestanden? → cargo fmt --check + clippy + deny
 □ Manuell verifiziert? → Was geprueft?
 □ Lessons-Check: Unerwartetes Verhalten?
   → JA: Sofort unten in "Projekt-Learnings" dokumentieren
@@ -90,6 +130,8 @@ VERBOTEN in Code/Docs:
 | **Tests** | `make test` |
 | **Build** | `make build` |
 | **Format** | `make fmt` |
+| **Supply Chain** | `make deny` |
+| **Coverage** | `make coverage` |
 | **FlatBuffer Gen** | `make generate` |
 | **Security Audit** | `make security` |
 | **Benchmarks** | `make bench` |
@@ -117,13 +159,16 @@ bitnet/              # CPU-Inference
 deploy/              # VM-Config, systemd, init.sh
 ```
 
-### CI/CD Workflows
+### CI/CD Workflows (alle Actions SHA-gepinnt)
 - **ci.yml**: Smart path-filtered CI (nur betroffene Sprachen)
 - **pr-lint.yml**: Conventional Commits Validierung
 - **auto-label.yml**: Automatische Labels auf Issues und PRs
-- **security.yml**: Woechentlich cargo audit + govulncheck
-- **codeql.yml**: Woechentlich CodeQL fuer Go + TypeScript
-- **release.yml**: Tag-triggered Release mit Changelog
+- **deny.yml**: cargo-deny (Advisories, Licenses, Bans, Sources) - bei Cargo-Aenderungen + woechentlich
+- **coverage.yml**: cargo-tarpaulin + Codecov Upload - bei Rust-Aenderungen
+- **scorecard.yml**: OSSF Scorecard (woechentlich) - Security-Posture
+- **security.yml**: cargo audit + govulncheck + npm audit - woechentlich
+- **codeql.yml**: CodeQL SAST fuer Go + TypeScript - woechentlich
+- **release.yml**: Tag-triggered Release mit Changelog + SBOM (CycloneDX)
 - **labels.yml**: Label-Sync aus .github/labels.yml
 
 ### Remote Infrastruktur
@@ -146,6 +191,10 @@ deploy/              # VM-Config, systemd, init.sh
 | FlatBuffer Schemas | `schemas/*.fbs` |
 | Changelog | `CHANGELOG.md` |
 | Labels | `.github/labels.yml` |
+| Supply-Chain Policy | `deny.toml` |
+| Rust Format Config | `rustfmt.toml` |
+| Clippy Config | `clippy.toml` |
+| Go Lint Config | `.golangci.yml` |
 
 **Regel:** Plan ist SSOT fuer Architektur. Wenn Plan und Code divergieren → Plan gewinnt, Code anpassen.
 
@@ -158,13 +207,16 @@ _Format: Datum, Kontext, was gelernt wurde._
 
 ### NIEMALS (gelernt)
 - 2026-02-11: PR mergen ohne `make ci` (fmt+clippy+test) lokal/remote verifiziert zu haben. CI war FAILING nach Merge.
+- 2026-02-11: GitHub Actions mit Tags (`@v4`) referenzieren - Supply-Chain-Attacke ueber gekaperte Tags moeglich. IMMER SHA-Pins.
 
 ### IMMER (gelernt)
 - 2026-02-11: `cargo fmt --all -- --check` + `cargo clippy -- -D warnings` VOR Push ausfuehren. Nicht nur `cargo test`.
 - 2026-02-11: CHANGELOG.md bei JEDEM PR aktualisieren, nicht erst nachtraeglich.
 - 2026-02-11: Consumer-Crates muessen Feature-Gates in eigener Cargo.toml deklarieren: `telemetry = ["sentinel-telemetry/telemetry"]`
 - 2026-02-11: `cargo remote -- fmt` synct formatierte Files NICHT zurueck. `cargo fmt` lokal ausfuehren (ist kein Build).
+- 2026-02-11: deny.toml IMMER aktualisieren wenn neue Dependencies hinzukommen (License-Check).
 
 ### Kontext-Wissen
 - 2026-02-11: BioStateUpdate::new() hat bewusst viele Args (10) - `#[allow(clippy::too_many_arguments)]` ist ok.
 - 2026-02-11: rustfmt Version auf Build-Server und lokal koennen abweichen - IMMER CI-kompatible Version verifizieren.
+- 2026-02-11: `ring` Crate hat spezielle License-Clarification in deny.toml (MIT AND ISC AND OpenSSL).
