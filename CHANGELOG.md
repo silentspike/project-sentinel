@@ -40,8 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `config/**` path filter in CI (triggers Rust tests when config files change)
 - Sprint 2 domain knowledge in CLAUDE.md (ECS, Bio-Engine, Physics, Room System, naming conventions, performance constraints)
 - Sprint 2 German domain words in `typos.toml` (Buero, Kueche, Laermpegel, Koffein, etc.)
+- `.claude/rules/` modular rules directory with Sprint 2 domain knowledge
 
 ### Changed
+
+- CLAUDE.md restructured per `/claudemd` best practices (382→229 lines, domain knowledge moved to rules/)
 
 - All GitHub Actions updated to latest versions and pinned to full commit SHAs (17 actions across 10 workflows)
 - `.golangci.yml` migrated to v2 format (version field, gosimple merged into staticcheck)
