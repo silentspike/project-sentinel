@@ -10,7 +10,7 @@
 use rusqlite::{params, Connection};
 use sentinel_common::{AgentId, Emotion, EventType, RoomId, Tick, Timestamp};
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use tracing::{info, instrument};
 
 // ──────────────────────────────────────────────
 // SQL Constants
@@ -80,6 +80,7 @@ pub struct ChatStore {
 impl ChatStore {
     /// Open or create the chat store at the given path.
     /// Runs performance pragmas and creates all tables.
+    #[instrument(fields(path = %path))]
     pub async fn open(path: &str) -> anyhow::Result<Self> {
         let path = path.to_string();
         let conn = tokio::task::spawn_blocking(move || -> anyhow::Result<Connection> {
@@ -114,6 +115,7 @@ impl ChatStore {
     // === MESSAGES ===
 
     /// Insert a chat message. Returns the rowid of the inserted row.
+    #[instrument(skip(self, content), fields(room_id = %room_id, agent_id = %agent_id, tick = %tick))]
     pub async fn insert_message(
         &self,
         room_id: RoomId,
@@ -143,6 +145,7 @@ impl ChatStore {
     }
 
     /// Get messages for a room, ordered by timestamp descending.
+    #[instrument(skip(self), fields(room_id = %room_id, limit = %limit))]
     pub async fn get_room_messages(
         &self,
         room_id: RoomId,
@@ -180,6 +183,7 @@ impl ChatStore {
 
     /// Insert a meeting record. Participants are serialized as JSON array.
     /// Returns the rowid of the inserted row.
+    #[instrument(skip(self, participants), fields(room_id = %room_id, title = %title))]
     pub async fn insert_meeting(
         &self,
         room_id: RoomId,
@@ -206,6 +210,7 @@ impl ChatStore {
     }
 
     /// End a meeting by setting ended_at and summary.
+    #[instrument(skip(self, summary), fields(meeting_id = %meeting_id))]
     pub async fn end_meeting(
         &self,
         meeting_id: i64,
@@ -230,6 +235,7 @@ impl ChatStore {
     // === OBSERVATIONS ===
 
     /// Insert an observation data point. Returns the rowid of the inserted row.
+    #[instrument(skip(self, context), fields(agent_id = %agent_id, model = %model, metric = %metric))]
     pub async fn insert_observation(
         &self,
         agent_id: AgentId,
@@ -260,6 +266,7 @@ impl ChatStore {
     // === CHAOS EVENTS ===
 
     /// Insert a chaos event. Returns the rowid of the inserted row.
+    #[instrument(skip(self, description), fields(event_type = ?event_type, target_room = ?target_room, target_agent = ?target_agent))]
     pub async fn insert_chaos_event(
         &self,
         event_type: EventType,

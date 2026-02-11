@@ -2,6 +2,7 @@
 
 use redb::{Database, ReadableTable, TableDefinition};
 use sentinel_common::{AgentId, RoomId};
+use tracing::instrument;
 
 // Table definitions - u16 keys for agent/room IDs, u32 for relationship pairs
 const AGENT_STATE: TableDefinition<u16, &[u8]> = TableDefinition::new("agent_state");
@@ -16,6 +17,7 @@ pub struct StateStore {
 impl StateStore {
     /// Open or create the state store at the given path.
     /// Creates all 4 tables if they don't exist.
+    #[instrument(fields(path = %path))]
     pub fn open(path: &str) -> anyhow::Result<Self> {
         let db = Database::create(path)
             .map_err(|e| anyhow::anyhow!("Failed to create/open redb at {path}: {e}"))?;
@@ -36,6 +38,7 @@ impl StateStore {
     // === AGENT STATE ===
 
     /// Get agent state by ID. Returns None if not found.
+    #[instrument(skip(self), fields(agent_id = %agent_id))]
     pub fn get_agent_state(&self, agent_id: AgentId) -> anyhow::Result<Option<Vec<u8>>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(AGENT_STATE)?;
@@ -43,6 +46,7 @@ impl StateStore {
     }
 
     /// Set agent state. Creates or overwrites.
+    #[instrument(skip(self, state), fields(agent_id = %agent_id))]
     pub fn set_agent_state(&self, agent_id: AgentId, state: &[u8]) -> anyhow::Result<()> {
         let write_txn = self.db.begin_write()?;
         {
@@ -54,6 +58,7 @@ impl StateStore {
     }
 
     /// Delete agent state. Returns true if existed.
+    #[instrument(skip(self), fields(agent_id = %agent_id))]
     pub fn delete_agent_state(&self, agent_id: AgentId) -> anyhow::Result<bool> {
         let write_txn = self.db.begin_write()?;
         let existed;
@@ -66,6 +71,7 @@ impl StateStore {
     }
 
     /// List all stored agent IDs.
+    #[instrument(skip(self))]
     pub fn list_agents(&self) -> anyhow::Result<Vec<AgentId>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(AGENT_STATE)?;
@@ -81,6 +87,7 @@ impl StateStore {
     // === RELATIONSHIPS ===
 
     /// Get relationship between two agents. Key is automatically canonicalized.
+    #[instrument(skip(self), fields(agent_a = %a, agent_b = %b))]
     pub fn get_relationship(&self, a: AgentId, b: AgentId) -> anyhow::Result<Option<Vec<u8>>> {
         let key = relationship_key(a, b);
         let read_txn = self.db.begin_read()?;
@@ -89,6 +96,7 @@ impl StateStore {
     }
 
     /// Set relationship data. Key is automatically canonicalized.
+    #[instrument(skip(self, data), fields(agent_a = %a, agent_b = %b))]
     pub fn set_relationship(&self, a: AgentId, b: AgentId, data: &[u8]) -> anyhow::Result<()> {
         let key = relationship_key(a, b);
         let write_txn = self.db.begin_write()?;
@@ -103,6 +111,7 @@ impl StateStore {
     // === PERSONALITY ===
 
     /// Get personality profile by agent ID.
+    #[instrument(skip(self), fields(agent_id = %agent_id))]
     pub fn get_personality(&self, agent_id: AgentId) -> anyhow::Result<Option<Vec<u8>>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(PERSONALITY)?;
@@ -110,6 +119,7 @@ impl StateStore {
     }
 
     /// Set personality profile.
+    #[instrument(skip(self, data), fields(agent_id = %agent_id))]
     pub fn set_personality(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
         let write_txn = self.db.begin_write()?;
         {
@@ -123,6 +133,7 @@ impl StateStore {
     // === ROOM STATE ===
 
     /// Get room state by room ID.
+    #[instrument(skip(self), fields(room_id = %room_id))]
     pub fn get_room_state(&self, room_id: RoomId) -> anyhow::Result<Option<Vec<u8>>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ROOM_STATE)?;
@@ -130,6 +141,7 @@ impl StateStore {
     }
 
     /// Set room state.
+    #[instrument(skip(self, data), fields(room_id = %room_id))]
     pub fn set_room_state(&self, room_id: RoomId, data: &[u8]) -> anyhow::Result<()> {
         let write_txn = self.db.begin_write()?;
         {
