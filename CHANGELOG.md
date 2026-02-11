@@ -37,6 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rustdoc warnings-as-errors check in Rust CI job (`RUSTDOCFLAGS="-D warnings"`)
 - cargo-machete unused dependency detection in Rust CI job (non-blocking warning)
 - Concurrency groups on deny.yml and coverage.yml (cancel superseded runs)
+- `config/**` path filter in CI (triggers Rust tests when config files change)
+- Sprint 2 domain knowledge in CLAUDE.md (ECS, Bio-Engine, Physics, Room System, naming conventions, performance constraints)
+- Sprint 2 German domain words in `typos.toml` (Buero, Kueche, Laermpegel, Koffein, etc.)
 
 ### Changed
 
