@@ -4,20 +4,33 @@
 Synthetische Enterprise-Reality: 54 KI-Agents glauben echte Mitarbeiter zu sein.
 Polyglot: Rust (ECS, Hot Path), Go (Cortex Gateway), Bun/TypeScript (Dashboard).
 
-## Build Commands
+## Quick Reference
 
 | Was | Command |
 |-----|---------|
-| Rust Build | `cargo remote -- build` |
+| **Alles pruefen** | `make ci` |
+| **Quick Lint** | `make check` |
+| **Full Lint** | `make lint-all` |
+| **Tests** | `make test` |
+| **Build** | `make build` |
+| **Format** | `make fmt` |
+| **FlatBuffer Gen** | `make generate` |
+| **Security Audit** | `make security` |
+| **Benchmarks** | `make bench` |
+
+### Einzelne Targets
+
+| Was | Command |
+|-----|---------|
+| Rust Build (remote!) | `cargo remote -- build` |
 | Rust Tests | `cargo remote -- test` |
 | Rust Clippy | `cargo remote -- clippy -- -D warnings` |
 | Rust Format | `cargo fmt --all -- --check` |
 | Go Build | `cd cmd/cortex-gateway && go build ./...` |
 | Go Tests | `cd cmd/cortex-gateway && go test ./...` |
-| Go Vet | `cd cmd/cortex-gateway && go vet ./...` |
-| Dashboard Install | `cd dashboard && bun install` |
-| Dashboard Tests | `cd dashboard && bun test` |
-| FlatBuffer Compile | `flatc --rust -o crates/sentinel-common/src/generated schemas/*.fbs` |
+| Go Lint | `cd cmd/cortex-gateway && golangci-lint run` |
+| Dashboard | `cd dashboard && bun install && bun test` |
+| FlatBuffer | `flatc --rust -o crates/sentinel-common/src/generated schemas/*.fbs` |
 
 ## Verzeichnisstruktur
 
@@ -70,16 +83,34 @@ Conventional Commits: `feat:`, `fix:`, `perf:`, `refactor:`, `docs:`, `test:`, `
 - eval() in jeglicher Sprache
 
 ## IMMER
-- Tests vor Commit (`cargo remote -- test && cd cmd/cortex-gateway && go test ./...`)
+- `make ci` vor Push (lokale CI = Lint + Tests, schneller als GitHub Actions abwarten)
 - Clippy clean (`cargo remote -- clippy -- -D warnings`)
 - FlatBuffer Schema validieren bei Schema-Aenderungen
 - Performance-kritischen Code benchmarken (criterion.rs)
 - IOPS-Impact bedenken (DRAM-lose NVMe!)
+- Conventional Commits fuer PR-Titel und Commits
+- CHANGELOG.md bei user-facing Aenderungen aktualisieren
 
 ## Remote Infrastruktur
 - Build-Server: `root@192.0.2.155` (LXC rustbuild, 8 Cores, 12GB RAM)
 - Runtime-Host: `root@192.0.2.70` (LXC pixelperfekt-runtime)
 - Proxmox: `root@10.0.0.69`
+
+## PR Workflow
+1. Branch: `feat/beschreibung` oder `fix/beschreibung`
+2. Lokal: `make ci` (muss gruen sein)
+3. Push + PR erstellen (Conventional Commit Titel)
+4. CI laeuft automatisch (nur betroffene Jobs via path-filter)
+5. Review → Merge → Branch loeschen
+
+## CI/CD Uebersicht
+- **ci.yml**: Smart path-filtered CI (Rust/Go/Dashboard/Schemas nur wenn betroffen)
+- **pr-lint.yml**: Conventional Commits Validierung
+- **auto-label.yml**: Automatische Labels auf Issues und PRs
+- **security.yml**: Woechentlich cargo audit + govulncheck
+- **codeql.yml**: Woechentlich CodeQL fuer Go + TypeScript
+- **release.yml**: Tag-triggered Release mit Changelog
+- **labels.yml**: Label-Sync aus .github/labels.yml
 
 ## Vollstaendiger Implementierungsplan
 Siehe: `/home/jan/.claude/plans/peaceful-splashing-willow.md`
