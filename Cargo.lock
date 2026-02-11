@@ -2661,6 +2661,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-inference"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "sentinel-common",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "sentinel-limbo"
 version = "0.1.0"
 dependencies = [
