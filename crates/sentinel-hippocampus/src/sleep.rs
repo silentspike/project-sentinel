@@ -144,7 +144,10 @@ impl SleepCycle {
     /// begin_sleep → add_episodes → score_and_select → consolidate → wake_up
     ///
     /// Returns the list of (summary, score) tuples for consolidated episodes.
-    pub fn run_full_cycle(&mut self, day_episodes: Vec<Episode>) -> anyhow::Result<Vec<(String, f64)>> {
+    pub fn run_full_cycle(
+        &mut self,
+        day_episodes: Vec<Episode>,
+    ) -> anyhow::Result<Vec<(String, f64)>> {
         self.begin_sleep();
         self.add_episodes(day_episodes);
         let selected = self.score_and_select();
@@ -214,10 +217,18 @@ mod tests {
         let result = cycle.run_full_cycle(episodes).unwrap();
 
         // Should select high-scoring episodes
-        assert!(result.len() > 0, "Should select at least one episode");
+        assert!(!result.is_empty(), "Should select at least one episode");
         assert_eq!(cycle.phase, SleepPhase::Awake);
-        assert_eq!(cycle.episodes.len(), 0, "Episodes should be cleared after wake_up");
-        assert_eq!(cycle.selected.len(), 0, "Selected should be cleared after wake_up");
+        assert_eq!(
+            cycle.episodes.len(),
+            0,
+            "Episodes should be cleared after wake_up"
+        );
+        assert_eq!(
+            cycle.selected.len(),
+            0,
+            "Selected should be cleared after wake_up"
+        );
     }
 
     #[test]
@@ -239,7 +250,11 @@ mod tests {
 
         // Should select episodes with score >= 0.5
         // Only episode 1 has score >= 0.5 (0.81)
-        assert_eq!(selected.len(), 1, "Should select only high-scoring episodes");
+        assert_eq!(
+            selected.len(),
+            1,
+            "Should select only high-scoring episodes"
+        );
         assert_eq!(selected[0].0, "Konflikt");
         assert_relative_eq!(selected[0].1, 0.81, epsilon = 0.01);
     }
@@ -248,16 +263,20 @@ mod tests {
     fn test_wake_up_clears_state() {
         let mut cycle = SleepCycle::new("Thomas");
 
-        let episodes = vec![
-            make_episode(1, "Test", 0.5, 0.5, 1, 1.0),
-        ];
+        let episodes = vec![make_episode(1, "Test", 0.5, 0.5, 1, 1.0)];
 
         cycle.begin_sleep();
         cycle.add_episodes(episodes);
         cycle.score_and_select();
 
-        assert!(cycle.episodes.len() > 0, "Should have episodes before wake_up");
-        assert!(cycle.selected.len() > 0, "Should have selected before wake_up");
+        assert!(
+            !cycle.episodes.is_empty(),
+            "Should have episodes before wake_up"
+        );
+        assert!(
+            !cycle.selected.is_empty(),
+            "Should have selected before wake_up"
+        );
 
         cycle.wake_up();
 
@@ -284,7 +303,11 @@ mod tests {
         let selected = cycle.score_and_select();
 
         // High threshold (0.8) should filter most episodes
-        assert_eq!(selected.len(), 1, "High threshold should filter most episodes");
+        assert_eq!(
+            selected.len(),
+            1,
+            "High threshold should filter most episodes"
+        );
         assert_eq!(selected[0].0, "High score");
     }
 }

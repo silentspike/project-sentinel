@@ -82,7 +82,7 @@ func (q *QualityScorer) ScoreMessage(agentName string, message string, recentHis
 	avgScore := float64(totalScore) / 3.0
 	overallScore := int(avgScore + 0.5) // round to nearest int
 
-	details := "message quality assessment"
+	var details string
 	if overallScore >= 4 {
 		details = "high quality response"
 	} else if overallScore <= 2 {
