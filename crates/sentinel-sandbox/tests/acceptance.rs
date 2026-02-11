@@ -80,10 +80,7 @@ fn ac_16_04_cgroup_limits() {
         256 * 1024 * 1024,
         "memory_bytes default should be 256MB"
     );
-    assert_eq!(
-        limits.io_max_iops, 300,
-        "io_max_iops default should be 300"
-    );
+    assert_eq!(limits.io_max_iops, 300, "io_max_iops default should be 300");
     assert_eq!(
         limits.io_max_bps,
         10 * 1024 * 1024,

@@ -15,8 +15,7 @@ fn ac_34_03_init_logging() {
     // We use try_init to avoid double-initialization issues in test runner
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
 
     let _ = tracing_subscriber::registry()
         .with(filter)
@@ -211,7 +210,9 @@ fn count_instrument_attrs(source: &str) -> usize {
         .filter(|line| {
             let trimmed = line.trim();
             // Ignoriere Kommentare und Docstrings
-            !trimmed.starts_with("//") && !trimmed.starts_with("///") && trimmed.contains("#[instrument")
+            !trimmed.starts_with("//")
+                && !trimmed.starts_with("///")
+                && trimmed.contains("#[instrument")
         })
         .count()
 }

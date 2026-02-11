@@ -5,9 +5,9 @@
 
 use sentinel_common::{AgentId, Tick};
 use sentinel_ecs::{
-    create_simulation_world, spawn_agent, AgentIdentity, BioState, LlmConfig, Mood, Personality,
-    PerceptionState, Position, Relationships, ShiftInfo, SimulationPhase, SimulationTime,
-    WorkContext,
+    create_simulation_world, spawn_agent, AgentIdentity, BioState, LlmConfig, Mood,
+    PerceptionState, Personality, Position, Relationships, ShiftInfo, SimulationPhase,
+    SimulationTime, WorkContext,
 };
 
 // ── #9 AC2: spawn_agent() erstellt Entity mit allen 10 Components ──
@@ -81,7 +81,11 @@ fn ac_09_04_system_execution_order() {
         SimulationPhase::Output,
         SimulationPhase::Persist,
     ];
-    assert_eq!(phases.len(), 9, "SimulationPhase must have exactly 9 variants");
+    assert_eq!(
+        phases.len(),
+        9,
+        "SimulationPhase must have exactly 9 variants"
+    );
 
     // Varianten muessen unterschiedlich sein (PartialEq)
     for i in 0..phases.len() {

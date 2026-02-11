@@ -71,10 +71,7 @@ fn ac_20_02_parser_all_sections() {
     );
 
     // Background
-    assert!(
-        !config.background.bio.is_empty(),
-        "bio should not be empty"
-    );
+    assert!(!config.background.bio.is_empty(), "bio should not be empty");
 }
 
 // AC #20.03: PersonalityConfig Validation: Wert 1.5 -> Error, Wert -0.1 -> Error

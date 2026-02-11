@@ -121,7 +121,7 @@ func TestAC_13_04_ClaudeProviderRequest(t *testing.T) {
 	}
 
 	// Verify x-api-key header
-	if receivedAPIKey != "sk-test-key-123" {
+	if receivedAPIKey != "sk-test-key-123" { //nolint:gosec // test credential, not real
 		t.Errorf("x-api-key = %q, want %q", receivedAPIKey, "sk-test-key-123")
 	}
 

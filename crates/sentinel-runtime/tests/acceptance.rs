@@ -191,11 +191,7 @@ fn ac_15_06_health_check() {
 
     let unhealthy = orch.check_health();
 
-    assert_eq!(
-        unhealthy.len(),
-        1,
-        "Exactly one agent should be unhealthy"
-    );
+    assert_eq!(unhealthy.len(), 1, "Exactly one agent should be unhealthy");
     assert_eq!(unhealthy[0].0, AgentId(1), "Unhealthy agent should be #1");
     assert_eq!(
         unhealthy[0].1,

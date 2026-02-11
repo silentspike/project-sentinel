@@ -65,9 +65,9 @@ fn ac_14_03_generate_perception_signature() {
         &bio,
         &pos,
         &personality,
-        45.0,   // room_noise_db
-        22.0,   // room_temp_c
-        800.0,  // room_co2_ppm
+        45.0,  // room_noise_db
+        22.0,  // room_temp_c
+        800.0, // room_co2_ppm
         &smells,
         &agents,
         "10:30", // sim_time
@@ -188,8 +188,7 @@ fn ac_14_05_acoustics_mapping() {
         1.0,
     );
     assert!(
-        result_50.acoustic_text.contains("Normal")
-            || result_50.acoustic_text.contains("Buero"),
+        result_50.acoustic_text.contains("Normal") || result_50.acoustic_text.contains("Buero"),
         "50dB should produce 'Normal' or 'Buero', got: '{}'",
         result_50.acoustic_text
     );

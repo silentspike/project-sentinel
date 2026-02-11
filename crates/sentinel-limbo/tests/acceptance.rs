@@ -128,7 +128,10 @@ async fn ac_08_05_meeting_lifecycle() {
         .insert_meeting(room, "Sprint Review", &participants, Timestamp(9000))
         .await
         .unwrap();
-    assert!(meeting_id > 0, "Meeting insert should return positive rowid");
+    assert!(
+        meeting_id > 0,
+        "Meeting insert should return positive rowid"
+    );
 
     // Verify meeting is open (ended_at is NULL)
     let conn = rusqlite::Connection::open(dir.path().join("test.db")).unwrap();
@@ -139,10 +142,7 @@ async fn ac_08_05_meeting_lifecycle() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(
-        ended_at.is_none(),
-        "Meeting should be open (ended_at NULL)"
-    );
+    assert!(ended_at.is_none(), "Meeting should be open (ended_at NULL)");
 
     // End meeting
     store

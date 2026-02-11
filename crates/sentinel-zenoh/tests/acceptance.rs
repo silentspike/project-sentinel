@@ -22,14 +22,8 @@ fn ac_06_02_topic_generation() {
     );
 
     // Room topics
-    assert_eq!(
-        topics::room_audio("kueche"),
-        "sentinel/room/kueche/audio"
-    );
-    assert_eq!(
-        topics::room_smell("lobby"),
-        "sentinel/room/lobby/smell"
-    );
+    assert_eq!(topics::room_audio("kueche"), "sentinel/room/kueche/audio");
+    assert_eq!(topics::room_smell("lobby"), "sentinel/room/lobby/smell");
     assert_eq!(
         topics::room_presence("grossraum"),
         "sentinel/room/grossraum/presence"
@@ -76,7 +70,9 @@ fn ac_06_04_sentinelbus_api_exists() {
         bus.publish("t", b"p").await
     }
     // subscribe() → Result<BusSubscriber>
-    async fn _sig_subscribe(bus: &sentinel_zenoh::SentinelBus) -> anyhow::Result<sentinel_zenoh::BusSubscriber> {
+    async fn _sig_subscribe(
+        bus: &sentinel_zenoh::SentinelBus,
+    ) -> anyhow::Result<sentinel_zenoh::BusSubscriber> {
         bus.subscribe("t").await
     }
 }

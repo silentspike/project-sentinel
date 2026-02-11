@@ -4,6 +4,10 @@
 [default]
 locale = "en-us"
 
+[default.extend-identifiers]
+# Variable names that look like typos but are intentional
+ba = "ba"       # key_ba in redb relationship tests
+
 [default.extend-words]
 # Domain-specific words that are NOT typos
 ecs = "ecs"       # Entity Component System
@@ -156,6 +160,12 @@ negativ = "negativ"
 positiv = "positiv"
 Funktion = "Funktion"
 unter = "unter"
+
+# Acceptance test German words (doc comments + string literals)
+Signatur = "Signatur"
+separat = "separat"
+Effekt = "Effekt"
+Explizit = "Explizit"
 
 # Sprint 4 words (Runtime, Sandbox, Dashboard)
 oder = "oder"
