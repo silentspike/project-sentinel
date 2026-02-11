@@ -5,6 +5,7 @@
 
 pub mod topics;
 
+use sentinel_common::{AgentId, RoomId, Tick};
 use tracing::info;
 use zenoh::handlers::FifoChannelHandler;
 use zenoh::pubsub::Subscriber;
@@ -61,39 +62,40 @@ impl SentinelBus {
     /// Publish an agent action.
     pub async fn publish_action(
         &self,
-        agent_name: &str,
+        agent_id: AgentId,
         payload: &[u8],
     ) -> anyhow::Result<()> {
-        self.publish(&topics::agent_action(agent_name), payload)
+        self.publish(&topics::agent_action(&agent_id.0.to_string()), payload)
             .await
     }
 
     /// Subscribe to an agent's perception channel.
     pub async fn subscribe_perception(
         &self,
-        agent_name: &str,
+        agent_id: AgentId,
     ) -> anyhow::Result<BusSubscriber> {
-        self.subscribe(&topics::agent_perception(agent_name)).await
+        self.subscribe(&topics::agent_perception(&agent_id.0.to_string()))
+            .await
     }
 
     /// Publish a room event (audio, smell, or presence).
     pub async fn publish_room_event(
         &self,
-        room_id: &str,
+        room_id: RoomId,
         event_type: &str,
         payload: &[u8],
     ) -> anyhow::Result<()> {
-        let topic = format!("{}/room/{room_id}/{event_type}", topics::PREFIX);
+        let topic = format!("{}/room/{}/{event_type}", topics::PREFIX, room_id.0);
         self.publish(&topic, payload).await
     }
 
     /// Publish a global simulation tick.
     pub async fn publish_tick(
         &self,
-        tick_number: u64,
+        tick: Tick,
         payload: &[u8],
     ) -> anyhow::Result<()> {
-        self.publish(&topics::physics_tick(tick_number), payload)
+        self.publish(&topics::physics_tick(tick.0), payload)
             .await
     }
 
