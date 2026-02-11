@@ -13,11 +13,11 @@ enum EventType : byte {
 
 table ChaosEvent {
     event_type: EventType;
-    target_room: string;
-    target_agent: string;
+    target_room: uint16;
+    target_agent: uint16;
     description: string (required);
     duration_minutes: uint32;
-    timestamp_ms: uint64;
+    timestamp: uint64;
     tick: uint64;
 }
 

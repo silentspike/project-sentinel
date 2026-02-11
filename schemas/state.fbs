@@ -1,7 +1,20 @@
 namespace sentinel;
 
+enum Emotion : byte {
+    Neutral = 0,
+    Happy = 1,
+    Frustrated = 2,
+    Stressed = 3,
+    Relaxed = 4,
+    Excited = 5,
+    Bored = 6,
+    Anxious = 7,
+    Focused = 8,
+    Tired = 9,
+}
+
 table BioStateUpdate {
-    agent_name: string (required);
+    agent_id: uint16;
     hunger: float;
     energy: float;
     caffeine_mg: float;
@@ -9,25 +22,25 @@ table BioStateUpdate {
     stress: float;
     social_need: float;
     comfort: float;
-    timestamp_ms: uint64;
+    timestamp: uint64;
     tick: uint64;
 }
 
 table PositionUpdate {
-    agent_name: string (required);
-    room_id: string (required);
+    agent_id: uint16;
+    room_id: uint16;
     in_transit: bool;
-    transit_target: string;
-    timestamp_ms: uint64;
+    transit_target: uint16;
+    timestamp: uint64;
     tick: uint64;
 }
 
 table MoodUpdate {
-    agent_name: string (required);
+    agent_id: uint16;
     valence: float;
     arousal: float;
-    dominant_emotion: string;
-    timestamp_ms: uint64;
+    dominant_emotion: Emotion;
+    timestamp: uint64;
     tick: uint64;
 }
 
