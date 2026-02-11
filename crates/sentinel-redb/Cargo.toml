@@ -1,0 +1,9 @@
+[package]
+name = "sentinel-redb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+redb = { workspace = true }
+serde = { workspace = true }
+sentinel-common = { path = "../sentinel-common" }

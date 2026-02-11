@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sentinel-ecs",
+    "crates/sentinel-bio",
+    "crates/sentinel-physics",
+    "crates/sentinel-zenoh",
+    "crates/sentinel-redb",
+    "crates/sentinel-limbo",
+    "crates/sentinel-sandbox",
+    "crates/sentinel-ebpf",
+    "crates/sentinel-wasm",
+    "crates/sentinel-common",
+]
+
+[workspace.dependencies]
+bevy_ecs = "0.15"
+zenoh = "1.1"
+redb = "2.4"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+flatbuffers = "24.12"
+tracing = "0.1"
+tracing-subscriber = "0.3"
