@@ -1,6 +1,7 @@
 //! cgroups v2 resource limits and PSI monitoring.
 
-use anyhow::{anyhow, Result};
+// PsiMetrics and parse_psi live in sentinel-common for cross-crate reuse.
+pub use sentinel_common::psi::{parse_psi, PsiMetrics};
 
 /// Resource limits fuer cgroups v2.
 #[derive(Debug, Clone)]
@@ -27,42 +28,6 @@ impl Default for CgroupLimits {
 /// Erzeugt den cgroup v2 Pfad fuer einen Agenten.
 pub fn cgroup_path(name: &str) -> String {
     format!("/sys/fs/cgroup/sentinel/{name}")
-}
-
-/// PSI (Pressure Stall Information) Metriken.
-#[derive(Debug, Clone, Default)]
-pub struct PsiMetrics {
-    pub avg10: f64,
-    pub avg60: f64,
-    pub avg300: f64,
-    pub total: u64,
-}
-
-/// Parsed eine PSI-Zeile im Format: "some avg10=0.00 avg60=0.00 avg300=0.00 total=0"
-pub fn parse_psi(content: &str) -> Result<PsiMetrics> {
-    // Finde die erste Zeile die mit "some" beginnt
-    let line = content
-        .lines()
-        .find(|l| l.starts_with("some"))
-        .ok_or_else(|| anyhow!("No 'some' line found in PSI content"))?;
-
-    let mut metrics = PsiMetrics::default();
-
-    // Parse die Werte
-    for part in line.split_whitespace().skip(1) {
-        // skip "some"
-        if let Some((key, value)) = part.split_once('=') {
-            match key {
-                "avg10" => metrics.avg10 = value.parse()?,
-                "avg60" => metrics.avg60 = value.parse()?,
-                "avg300" => metrics.avg300 = value.parse()?,
-                "total" => metrics.total = value.parse()?,
-                _ => {}
-            }
-        }
-    }
-
-    Ok(metrics)
 }
 
 #[cfg(test)]

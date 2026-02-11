@@ -7,4 +7,5 @@ publish = false
 
 [dependencies]
 anyhow = { workspace = true }
+sentinel-common = { path = "../sentinel-common" }
 tracing = { workspace = true }
