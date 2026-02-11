@@ -46,7 +46,7 @@ pub struct SubsystemHealth {
 
 /// Health status of a subsystem.
 ///
-/// Serialized as part of [`SubsystemMetrics`] for Dashboard transport
+/// Serialized as part of `SubsystemMetrics` for Dashboard transport
 /// over Zenoh topic `sentinel/telemetry/health`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HealthStatus {
