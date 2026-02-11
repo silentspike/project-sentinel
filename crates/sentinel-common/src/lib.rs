@@ -92,8 +92,16 @@ mod tests {
     #[test]
     fn test_bio_state_valid() {
         let bio = BioStateUpdate::new(
-            AgentId(1), 45.5, 72.0, 95.0, 30.0, 55.0, 20.0, 80.0,
-            Timestamp(2000), Tick(100),
+            AgentId(1),
+            45.5,
+            72.0,
+            95.0,
+            30.0,
+            55.0,
+            20.0,
+            80.0,
+            Timestamp(2000),
+            Tick(100),
         );
         assert!(bio.is_ok());
         let bio = bio.unwrap();
@@ -104,20 +112,46 @@ mod tests {
     fn test_bio_state_boundary_valid() {
         // Exact boundaries: 0.0 and 100.0 are valid
         assert!(BioStateUpdate::new(
-            AgentId(1), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-            Timestamp(0), Tick(0),
-        ).is_ok());
+            AgentId(1),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            Timestamp(0),
+            Tick(0),
+        )
+        .is_ok());
         assert!(BioStateUpdate::new(
-            AgentId(1), 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0,
-            Timestamp(0), Tick(0),
-        ).is_ok());
+            AgentId(1),
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+            Timestamp(0),
+            Tick(0),
+        )
+        .is_ok());
     }
 
     #[test]
     fn test_bio_state_invalid_negative() {
         let result = BioStateUpdate::new(
-            AgentId(1), -1.0, 72.0, 95.0, 30.0, 55.0, 20.0, 80.0,
-            Timestamp(2000), Tick(100),
+            AgentId(1),
+            -1.0,
+            72.0,
+            95.0,
+            30.0,
+            55.0,
+            20.0,
+            80.0,
+            Timestamp(2000),
+            Tick(100),
         );
         assert!(result.is_err());
     }
@@ -125,8 +159,16 @@ mod tests {
     #[test]
     fn test_bio_state_invalid_over_100() {
         let result = BioStateUpdate::new(
-            AgentId(1), 45.5, 101.0, 95.0, 30.0, 55.0, 20.0, 80.0,
-            Timestamp(2000), Tick(100),
+            AgentId(1),
+            45.5,
+            101.0,
+            95.0,
+            30.0,
+            55.0,
+            20.0,
+            80.0,
+            Timestamp(2000),
+            Tick(100),
         );
         assert!(result.is_err());
     }
@@ -136,8 +178,12 @@ mod tests {
     #[test]
     fn test_mood_update_valid() {
         let mood = MoodUpdate::new(
-            AgentId(1), 0.5, 0.7, Emotion::Happy,
-            Timestamp(3000), Tick(150),
+            AgentId(1),
+            0.5,
+            0.7,
+            Emotion::Happy,
+            Timestamp(3000),
+            Tick(150),
         );
         assert!(mood.is_ok());
     }
@@ -145,37 +191,67 @@ mod tests {
     #[test]
     fn test_mood_update_boundary_valid() {
         assert!(MoodUpdate::new(
-            AgentId(1), -1.0, 0.0, Emotion::Neutral,
-            Timestamp(0), Tick(0),
-        ).is_ok());
+            AgentId(1),
+            -1.0,
+            0.0,
+            Emotion::Neutral,
+            Timestamp(0),
+            Tick(0),
+        )
+        .is_ok());
         assert!(MoodUpdate::new(
-            AgentId(1), 1.0, 1.0, Emotion::Excited,
-            Timestamp(0), Tick(0),
-        ).is_ok());
+            AgentId(1),
+            1.0,
+            1.0,
+            Emotion::Excited,
+            Timestamp(0),
+            Tick(0),
+        )
+        .is_ok());
     }
 
     #[test]
     fn test_mood_update_invalid_valence() {
         assert!(MoodUpdate::new(
-            AgentId(1), -1.1, 0.5, Emotion::Neutral,
-            Timestamp(0), Tick(0),
-        ).is_err());
+            AgentId(1),
+            -1.1,
+            0.5,
+            Emotion::Neutral,
+            Timestamp(0),
+            Tick(0),
+        )
+        .is_err());
         assert!(MoodUpdate::new(
-            AgentId(1), 1.1, 0.5, Emotion::Neutral,
-            Timestamp(0), Tick(0),
-        ).is_err());
+            AgentId(1),
+            1.1,
+            0.5,
+            Emotion::Neutral,
+            Timestamp(0),
+            Tick(0),
+        )
+        .is_err());
     }
 
     #[test]
     fn test_mood_update_invalid_arousal() {
         assert!(MoodUpdate::new(
-            AgentId(1), 0.5, -0.1, Emotion::Neutral,
-            Timestamp(0), Tick(0),
-        ).is_err());
+            AgentId(1),
+            0.5,
+            -0.1,
+            Emotion::Neutral,
+            Timestamp(0),
+            Tick(0),
+        )
+        .is_err());
         assert!(MoodUpdate::new(
-            AgentId(1), 0.5, 1.1, Emotion::Neutral,
-            Timestamp(0), Tick(0),
-        ).is_err());
+            AgentId(1),
+            0.5,
+            1.1,
+            Emotion::Neutral,
+            Timestamp(0),
+            Tick(0),
+        )
+        .is_err());
     }
 
     // ── Serialization ───────────────────────────
