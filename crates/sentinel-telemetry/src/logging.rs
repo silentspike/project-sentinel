@@ -38,8 +38,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 /// Only available with the `telemetry` feature (default: enabled).
 #[cfg(feature = "telemetry")]
 pub fn init_logging() {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::registry()
         .with(filter)
@@ -55,8 +54,7 @@ pub fn init_logging() {
 /// Only available with the `telemetry` feature (default: enabled).
 #[cfg(feature = "telemetry")]
 pub fn init_logging_dev() {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
 
     tracing_subscriber::registry()
         .with(filter)
@@ -75,8 +73,7 @@ mod tests {
     #[test]
     fn test_init_logging_does_not_panic() {
         // try_init statt init um Doppel-Initialisierung zu vermeiden
-        let filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
         let _ = tracing_subscriber::registry()
             .with(filter)
@@ -86,8 +83,7 @@ mod tests {
 
     #[test]
     fn test_init_logging_dev_does_not_panic() {
-        let filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
 
         let _ = tracing_subscriber::registry()
             .with(filter)

@@ -33,7 +33,11 @@ use crate::metrics::{MetricsRegistry, MetricsSnapshot};
 /// Also useful for testing (mock transport) and alternative outputs.
 pub trait TelemetryTransport: Send + Sync {
     /// Publish serialized data to a topic.
-    fn publish(&self, topic: &str, payload: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    fn publish(
+        &self,
+        topic: &str,
+        payload: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ──────────────────────────────────────────────
@@ -111,25 +115,25 @@ impl<T: TelemetryTransport> TelemetryExporter<T> {
         for (name, value) in &counters {
             // Extract subsystem from metric name: sentinel.{subsystem}.{op}.{type}
             if let Some(subsystem) = extract_subsystem(name) {
-                let entry = subsystems
-                    .entry(subsystem.to_string())
-                    .or_insert_with(|| crate::metrics::SubsystemMetrics {
+                let entry = subsystems.entry(subsystem.to_string()).or_insert_with(|| {
+                    crate::metrics::SubsystemMetrics {
                         health: crate::health::HealthStatus::Healthy,
                         counters: std::collections::HashMap::new(),
                         histograms: std::collections::HashMap::new(),
-                    });
+                    }
+                });
                 entry.counters.insert(name.clone(), *value);
             }
         }
         for (name, snap) in histograms {
             if let Some(subsystem) = extract_subsystem(&name) {
-                let entry = subsystems
-                    .entry(subsystem.to_string())
-                    .or_insert_with(|| crate::metrics::SubsystemMetrics {
+                let entry = subsystems.entry(subsystem.to_string()).or_insert_with(|| {
+                    crate::metrics::SubsystemMetrics {
                         health: crate::health::HealthStatus::Healthy,
                         counters: std::collections::HashMap::new(),
                         histograms: std::collections::HashMap::new(),
-                    });
+                    }
+                });
                 entry.histograms.insert(name, snap);
             }
         }
@@ -187,13 +191,15 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    type MessageLog = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
     /// Mock transport that records all published messages.
     struct MockTransport {
-        messages: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+        messages: MessageLog,
     }
 
     impl MockTransport {
-        fn new() -> (Self, Arc<Mutex<Vec<(String, Vec<u8>)>>>) {
+        fn new() -> (Self, MessageLog) {
             let messages = Arc::new(Mutex::new(Vec::new()));
             (
                 Self {
@@ -205,7 +211,11 @@ mod tests {
     }
 
     impl TelemetryTransport for MockTransport {
-        fn publish(&self, topic: &str, payload: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        fn publish(
+            &self,
+            topic: &str,
+            payload: &[u8],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.messages
                 .lock()
                 .unwrap()
@@ -216,8 +226,8 @@ mod tests {
 
     #[test]
     fn test_export_error_event() {
-        use sentinel_common::{AgentId, Tick, Timestamp};
         use crate::errors::{ErrorEvent, ErrorSeverity};
+        use sentinel_common::{AgentId, Tick, Timestamp};
 
         let (transport, messages) = MockTransport::new();
         let exporter = TelemetryExporter::new(transport, ExporterConfig::default());
@@ -246,7 +256,10 @@ mod tests {
     #[test]
     fn test_extract_subsystem() {
         assert_eq!(extract_subsystem("sentinel.redb.read.count"), Some("redb"));
-        assert_eq!(extract_subsystem("sentinel.zenoh.publish.latency_us"), Some("zenoh"));
+        assert_eq!(
+            extract_subsystem("sentinel.zenoh.publish.latency_us"),
+            Some("zenoh")
+        );
         assert_eq!(extract_subsystem("invalid"), None);
         assert_eq!(extract_subsystem("other.prefix.op"), None);
     }

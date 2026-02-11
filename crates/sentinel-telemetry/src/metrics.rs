@@ -101,9 +101,7 @@ impl Histogram {
         sorted.dedup();
 
         let bucket_count = sorted.len() + 1; // +1 fuer +Inf
-        let buckets = (0..bucket_count)
-            .map(|_| AtomicU64::new(0))
-            .collect();
+        let buckets = (0..bucket_count).map(|_| AtomicU64::new(0)).collect();
 
         Self {
             boundaries: sorted,
@@ -131,12 +129,7 @@ impl Histogram {
             let new_bits = new.to_bits();
             if self
                 .sum_bits
-                .compare_exchange_weak(
-                    current_bits,
-                    new_bits,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(current_bits, new_bits, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
                 break;
@@ -250,7 +243,11 @@ impl MetricsRegistry {
         }
         // Slow path: write lock
         let mut counters = self.counters.write().unwrap();
-        Arc::clone(counters.entry(name.to_string()).or_insert_with(|| Arc::new(Counter::new())))
+        Arc::clone(
+            counters
+                .entry(name.to_string())
+                .or_insert_with(|| Arc::new(Counter::new())),
+        )
     }
 
     /// Get or create a histogram by name with given bucket boundaries.
@@ -286,7 +283,11 @@ impl MetricsRegistry {
             .iter()
             .filter_map(|(k, v)| {
                 let val = v.get();
-                if val > 0 { Some((k.clone(), val)) } else { None }
+                if val > 0 {
+                    Some((k.clone(), val))
+                } else {
+                    None
+                }
             })
             .collect();
 
@@ -294,7 +295,11 @@ impl MetricsRegistry {
             .iter()
             .filter_map(|(k, v)| {
                 let snap = v.snapshot();
-                if snap.count > 0 { Some((k.clone(), snap)) } else { None }
+                if snap.count > 0 {
+                    Some((k.clone(), snap))
+                } else {
+                    None
+                }
             })
             .collect();
 
@@ -460,15 +465,18 @@ mod tests {
 
     #[test]
     fn test_metrics_snapshot_serializable() {
-        use sentinel_common::{Tick, Timestamp};
         use crate::health::HealthStatus;
+        use sentinel_common::{Tick, Timestamp};
 
         let mut subsystems = HashMap::new();
-        subsystems.insert("redb".to_string(), SubsystemMetrics {
-            health: HealthStatus::Healthy,
-            counters: HashMap::from([("ops".to_string(), 42)]),
-            histograms: HashMap::new(),
-        });
+        subsystems.insert(
+            "redb".to_string(),
+            SubsystemMetrics {
+                health: HealthStatus::Healthy,
+                counters: HashMap::from([("ops".to_string(), 42)]),
+                histograms: HashMap::new(),
+            },
+        );
 
         let snap = MetricsSnapshot {
             timestamp: Timestamp(1000),

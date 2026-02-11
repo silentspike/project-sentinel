@@ -157,10 +157,14 @@ _Hier werden Erkenntnisse dokumentiert die waehrend der Implementierung gewonnen
 _Format: Datum, Kontext, was gelernt wurde._
 
 ### NIEMALS (gelernt)
-_(noch leer - wird waehrend Implementierung befuellt)_
+- 2026-02-11: PR mergen ohne `make ci` (fmt+clippy+test) lokal/remote verifiziert zu haben. CI war FAILING nach Merge.
 
 ### IMMER (gelernt)
-_(noch leer - wird waehrend Implementierung befuellt)_
+- 2026-02-11: `cargo fmt --all -- --check` + `cargo clippy -- -D warnings` VOR Push ausfuehren. Nicht nur `cargo test`.
+- 2026-02-11: CHANGELOG.md bei JEDEM PR aktualisieren, nicht erst nachtraeglich.
+- 2026-02-11: Consumer-Crates muessen Feature-Gates in eigener Cargo.toml deklarieren: `telemetry = ["sentinel-telemetry/telemetry"]`
+- 2026-02-11: `cargo remote -- fmt` synct formatierte Files NICHT zurueck. `cargo fmt` lokal ausfuehren (ist kein Build).
 
 ### Kontext-Wissen
-_(noch leer - wird waehrend Implementierung befuellt)_
+- 2026-02-11: BioStateUpdate::new() hat bewusst viele Args (10) - `#[allow(clippy::too_many_arguments)]` ist ok.
+- 2026-02-11: rustfmt Version auf Build-Server und lokal koennen abweichen - IMMER CI-kompatible Version verifizieren.
