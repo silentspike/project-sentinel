@@ -12,6 +12,9 @@ use zenoh::pubsub::Subscriber;
 use zenoh::sample::Sample;
 use zenoh::Session;
 
+/// Histogram bucket boundaries for Zenoh operation latencies (microseconds).
+const LATENCY_BUCKETS: &[f64] = &[10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0];
+
 /// Type alias for the default Zenoh subscriber (FIFO handler).
 pub type BusSubscriber = Subscriber<FifoChannelHandler<Sample>>;
 
@@ -42,10 +45,18 @@ impl SentinelBus {
     /// Publish a message to a topic.
     #[instrument(skip(self, payload), level = "trace", fields(topic = %topic))]
     pub async fn publish(&self, topic: &str, payload: &[u8]) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
         self.session
             .put(topic, payload)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to publish to {topic}: {e}"))?;
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.zenoh.publish.count").increment();
+            reg.histogram("sentinel.zenoh.publish.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
         Ok(())
     }
 
@@ -58,6 +69,12 @@ impl SentinelBus {
             .declare_subscriber(topic)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to subscribe to {topic}: {e}"))?;
+        #[cfg(feature = "telemetry")]
+        {
+            sentinel_telemetry::MetricsRegistry::global()
+                .counter("sentinel.zenoh.subscribe.count")
+                .increment();
+        }
         info!("SentinelBus: Subscribed to {topic}");
         Ok(subscriber)
     }

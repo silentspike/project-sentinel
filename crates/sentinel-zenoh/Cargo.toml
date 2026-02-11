@@ -3,12 +3,17 @@ name = "sentinel-zenoh"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["telemetry"]
+telemetry = ["sentinel-telemetry/telemetry"]
+
 [dependencies]
 zenoh = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
+sentinel-telemetry = { path = "../sentinel-telemetry" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

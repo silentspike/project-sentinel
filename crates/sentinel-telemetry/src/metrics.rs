@@ -146,19 +146,25 @@ impl Histogram {
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Get a snapshot of bucket counts.
+    /// Get a snapshot of bucket counts, including estimated p50 and p99.
     pub fn snapshot(&self) -> HistogramSnapshot {
         let bucket_counts: Vec<u64> = self
             .buckets
             .iter()
             .map(|b| b.load(Ordering::Relaxed))
             .collect();
+        let count = self.count.load(Ordering::Relaxed);
+
+        let p50 = percentile_from_buckets(&self.boundaries, &bucket_counts, count, 0.50);
+        let p99 = percentile_from_buckets(&self.boundaries, &bucket_counts, count, 0.99);
 
         HistogramSnapshot {
             boundaries: self.boundaries.clone(),
             bucket_counts,
             sum: f64::from_bits(self.sum_bits.load(Ordering::Relaxed)),
-            count: self.count.load(Ordering::Relaxed),
+            count,
+            p50,
+            p99,
         }
     }
 }
@@ -202,6 +208,10 @@ pub struct HistogramSnapshot {
     pub bucket_counts: Vec<u64>,
     pub sum: f64,
     pub count: u64,
+    /// Estimated 50th percentile (median), interpolated from buckets.
+    pub p50: f64,
+    /// Estimated 99th percentile, interpolated from buckets.
+    pub p99: f64,
 }
 
 // ──────────────────────────────────────────────
@@ -306,6 +316,35 @@ impl MetricsRegistry {
 /// ```
 pub fn metric_name(crate_name: &str, operation: &str, metric_type: &str) -> String {
     format!("sentinel.{crate_name}.{operation}.{metric_type}")
+}
+
+/// Estimate a percentile from histogram buckets via linear interpolation.
+/// Returns 0.0 if count is 0.
+fn percentile_from_buckets(
+    boundaries: &[f64],
+    bucket_counts: &[u64],
+    total: u64,
+    quantile: f64,
+) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let target = (total as f64 * quantile).ceil() as u64;
+    let mut cumulative: u64 = 0;
+
+    for (i, &count) in bucket_counts.iter().enumerate() {
+        cumulative += count;
+        if cumulative >= target {
+            // Return upper boundary of this bucket (or last boundary for +Inf bucket)
+            return if i < boundaries.len() {
+                boundaries[i]
+            } else {
+                // +Inf bucket: best estimate is last boundary (or sum/total)
+                boundaries.last().copied().unwrap_or(0.0)
+            };
+        }
+    }
+    boundaries.last().copied().unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -445,5 +484,33 @@ mod tests {
         let deserialized: MetricsSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.tick, Tick(5));
         assert!(deserialized.subsystems.contains_key("redb"));
+    }
+
+    #[test]
+    fn test_histogram_percentiles() {
+        let hist = Histogram::new(&[10.0, 50.0, 100.0, 500.0]);
+        // 50 fast observations, 49 medium, 1 slow
+        for _ in 0..50 {
+            hist.observe(5.0); // bucket <=10
+        }
+        for _ in 0..49 {
+            hist.observe(30.0); // bucket <=50
+        }
+        hist.observe(200.0); // bucket <=500
+
+        let snap = hist.snapshot();
+        assert_eq!(snap.count, 100);
+        // p50 should be in the <=10 bucket (50% of data is <=10)
+        assert_eq!(snap.p50, 10.0);
+        // p99 should be in the <=50 bucket (99% is at observation 99, which is <=50)
+        assert_eq!(snap.p99, 50.0);
+    }
+
+    #[test]
+    fn test_histogram_empty_percentiles() {
+        let hist = Histogram::new(&[10.0, 100.0]);
+        let snap = hist.snapshot();
+        assert_eq!(snap.p50, 0.0);
+        assert_eq!(snap.p99, 0.0);
     }
 }

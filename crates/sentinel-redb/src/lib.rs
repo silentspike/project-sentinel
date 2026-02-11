@@ -4,6 +4,9 @@ use redb::{Database, ReadableTable, TableDefinition};
 use sentinel_common::{AgentId, RoomId};
 use tracing::instrument;
 
+/// Histogram bucket boundaries for redb operation latencies (microseconds).
+const LATENCY_BUCKETS: &[f64] = &[10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0];
+
 // Table definitions - u16 keys for agent/room IDs, u32 for relationship pairs
 const AGENT_STATE: TableDefinition<u16, &[u8]> = TableDefinition::new("agent_state");
 const RELATIONSHIPS: TableDefinition<u32, &[u8]> = TableDefinition::new("relationships");
@@ -40,26 +43,44 @@ impl StateStore {
     /// Get agent state by ID. Returns None if not found.
     #[instrument(skip(self), level = "trace", fields(agent_id = %agent_id))]
     pub fn get_agent_state(&self, agent_id: AgentId) -> anyhow::Result<Option<Vec<u8>>> {
+        let start = std::time::Instant::now();
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(AGENT_STATE)?;
-        Ok(table.get(agent_id.0)?.map(|v| v.value().to_vec()))
+        let result = Ok(table.get(agent_id.0)?.map(|v| v.value().to_vec()));
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.redb.read.count").increment();
+            reg.histogram("sentinel.redb.read.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
+        result
     }
 
     /// Set agent state. Creates or overwrites.
     #[instrument(skip(self, state), level = "trace", fields(agent_id = %agent_id))]
     pub fn set_agent_state(&self, agent_id: AgentId, state: &[u8]) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(AGENT_STATE)?;
             table.insert(agent_id.0, state)?;
         }
         write_txn.commit()?;
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.redb.write.count").increment();
+            reg.histogram("sentinel.redb.write.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
         Ok(())
     }
 
     /// Delete agent state. Returns true if existed.
     #[instrument(skip(self), level = "trace", fields(agent_id = %agent_id))]
     pub fn delete_agent_state(&self, agent_id: AgentId) -> anyhow::Result<bool> {
+        let start = std::time::Instant::now();
         let write_txn = self.db.begin_write()?;
         let existed;
         {
@@ -67,6 +88,13 @@ impl StateStore {
             existed = table.remove(agent_id.0)?.is_some();
         }
         write_txn.commit()?;
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.redb.write.count").increment();
+            reg.histogram("sentinel.redb.write.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
         Ok(existed)
     }
 
@@ -89,15 +117,25 @@ impl StateStore {
     /// Get relationship between two agents. Key is automatically canonicalized.
     #[instrument(skip(self), level = "trace", fields(agent_a = %a, agent_b = %b))]
     pub fn get_relationship(&self, a: AgentId, b: AgentId) -> anyhow::Result<Option<Vec<u8>>> {
+        let start = std::time::Instant::now();
         let key = relationship_key(a, b);
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(RELATIONSHIPS)?;
-        Ok(table.get(key)?.map(|v| v.value().to_vec()))
+        let result = Ok(table.get(key)?.map(|v| v.value().to_vec()));
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.redb.read.count").increment();
+            reg.histogram("sentinel.redb.read.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
+        result
     }
 
     /// Set relationship data. Key is automatically canonicalized.
     #[instrument(skip(self, data), level = "trace", fields(agent_a = %a, agent_b = %b))]
     pub fn set_relationship(&self, a: AgentId, b: AgentId, data: &[u8]) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
         let key = relationship_key(a, b);
         let write_txn = self.db.begin_write()?;
         {
@@ -105,6 +143,13 @@ impl StateStore {
             table.insert(key, data)?;
         }
         write_txn.commit()?;
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.redb.write.count").increment();
+            reg.histogram("sentinel.redb.write.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
         Ok(())
     }
 
@@ -113,20 +158,37 @@ impl StateStore {
     /// Get personality profile by agent ID.
     #[instrument(skip(self), level = "trace", fields(agent_id = %agent_id))]
     pub fn get_personality(&self, agent_id: AgentId) -> anyhow::Result<Option<Vec<u8>>> {
+        let start = std::time::Instant::now();
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(PERSONALITY)?;
-        Ok(table.get(agent_id.0)?.map(|v| v.value().to_vec()))
+        let result = Ok(table.get(agent_id.0)?.map(|v| v.value().to_vec()));
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.redb.read.count").increment();
+            reg.histogram("sentinel.redb.read.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
+        result
     }
 
     /// Set personality profile.
     #[instrument(skip(self, data), level = "trace", fields(agent_id = %agent_id))]
     pub fn set_personality(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(PERSONALITY)?;
             table.insert(agent_id.0, data)?;
         }
         write_txn.commit()?;
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.redb.write.count").increment();
+            reg.histogram("sentinel.redb.write.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
         Ok(())
     }
 
@@ -135,20 +197,37 @@ impl StateStore {
     /// Get room state by room ID.
     #[instrument(skip(self), level = "trace", fields(room_id = %room_id))]
     pub fn get_room_state(&self, room_id: RoomId) -> anyhow::Result<Option<Vec<u8>>> {
+        let start = std::time::Instant::now();
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ROOM_STATE)?;
-        Ok(table.get(room_id.0)?.map(|v| v.value().to_vec()))
+        let result = Ok(table.get(room_id.0)?.map(|v| v.value().to_vec()));
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.redb.read.count").increment();
+            reg.histogram("sentinel.redb.read.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
+        result
     }
 
     /// Set room state.
     #[instrument(skip(self, data), level = "trace", fields(room_id = %room_id))]
     pub fn set_room_state(&self, room_id: RoomId, data: &[u8]) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(ROOM_STATE)?;
             table.insert(room_id.0, data)?;
         }
         write_txn.commit()?;
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.redb.write.count").increment();
+            reg.histogram("sentinel.redb.write.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
         Ok(())
     }
 }
