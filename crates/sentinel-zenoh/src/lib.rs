@@ -81,21 +81,14 @@ impl SentinelBus {
 
     /// Publish an agent action.
     #[instrument(skip(self, payload), level = "trace", fields(agent_id = %agent_id))]
-    pub async fn publish_action(
-        &self,
-        agent_id: AgentId,
-        payload: &[u8],
-    ) -> anyhow::Result<()> {
+    pub async fn publish_action(&self, agent_id: AgentId, payload: &[u8]) -> anyhow::Result<()> {
         self.publish(&topics::agent_action(&agent_id.to_string()), payload)
             .await
     }
 
     /// Subscribe to an agent's perception channel.
     #[instrument(skip(self), level = "debug", fields(agent_id = %agent_id))]
-    pub async fn subscribe_perception(
-        &self,
-        agent_id: AgentId,
-    ) -> anyhow::Result<BusSubscriber> {
+    pub async fn subscribe_perception(&self, agent_id: AgentId) -> anyhow::Result<BusSubscriber> {
         self.subscribe(&topics::agent_perception(&agent_id.to_string()))
             .await
     }
@@ -115,13 +108,8 @@ impl SentinelBus {
     /// Publish a global simulation tick.
     /// Uses raw numeric tick value for compact topic paths (e.g. sentinel/physics/tick/42).
     #[instrument(skip(self, payload), level = "trace", fields(tick = %tick))]
-    pub async fn publish_tick(
-        &self,
-        tick: Tick,
-        payload: &[u8],
-    ) -> anyhow::Result<()> {
-        self.publish(&topics::physics_tick(tick.0), payload)
-            .await
+    pub async fn publish_tick(&self, tick: Tick, payload: &[u8]) -> anyhow::Result<()> {
+        self.publish(&topics::physics_tick(tick.0), payload).await
     }
 
     /// Publish a chaos event.
@@ -152,11 +140,8 @@ mod tests {
             .expect("Failed to publish");
 
         // Receive with timeout
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            subscriber.recv_async(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), subscriber.recv_async()).await;
 
         assert!(result.is_ok(), "Should receive message within timeout");
         let sample = result.unwrap().unwrap();

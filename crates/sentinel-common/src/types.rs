@@ -29,7 +29,7 @@ pub struct AgentId(pub u16);
 
 impl AgentId {
     pub fn new(id: u16) -> Result<Self, ValidationError> {
-        if id >= 1 && id <= 54 {
+        if (1..=54).contains(&id) {
             Ok(Self(id))
         } else {
             Err(ValidationError::InvalidAgentId(id))
@@ -62,7 +62,9 @@ impl fmt::Display for RoomId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 pub struct Tick(pub u64);
 
 impl fmt::Display for Tick {
@@ -71,7 +73,9 @@ impl fmt::Display for Tick {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 pub struct Timestamp(pub u64);
 
 impl fmt::Display for Timestamp {
@@ -168,6 +172,7 @@ pub struct BioStateUpdate {
 }
 
 impl BioStateUpdate {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent_id: AgentId,
         hunger: f32,
@@ -181,7 +186,7 @@ impl BioStateUpdate {
         tick: Tick,
     ) -> Result<Self, ValidationError> {
         fn validate(field: &str, value: f32) -> Result<(), ValidationError> {
-            if value >= 0.0 && value <= 100.0 {
+            if (0.0..=100.0).contains(&value) {
                 Ok(())
             } else {
                 Err(ValidationError::OutOfRange {
@@ -245,7 +250,7 @@ impl MoodUpdate {
         timestamp: Timestamp,
         tick: Tick,
     ) -> Result<Self, ValidationError> {
-        if valence < -1.0 || valence > 1.0 {
+        if !(-1.0..=1.0).contains(&valence) {
             return Err(ValidationError::OutOfRange {
                 field: "valence".to_string(),
                 value: valence,
@@ -253,7 +258,7 @@ impl MoodUpdate {
                 max: 1.0,
             });
         }
-        if arousal < 0.0 || arousal > 1.0 {
+        if !(0.0..=1.0).contains(&arousal) {
             return Err(ValidationError::OutOfRange {
                 field: "arousal".to_string(),
                 value: arousal,

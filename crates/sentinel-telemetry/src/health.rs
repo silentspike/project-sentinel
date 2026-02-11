@@ -86,11 +86,7 @@ impl HealthRegistry {
 
     /// Register a health check for a subsystem.
     /// Overwrites any existing check with the same name.
-    pub fn register(
-        &self,
-        name: &str,
-        check: impl Fn() -> HealthStatus + Send + Sync + 'static,
-    ) {
+    pub fn register(&self, name: &str, check: impl Fn() -> HealthStatus + Send + Sync + 'static) {
         let mut checks = self.checks.write().unwrap();
         checks.insert(name.to_string(), Box::new(check));
     }
@@ -168,9 +164,7 @@ mod tests {
         };
 
         registry.register("zenoh", || HealthStatus::Healthy);
-        registry.register("redb", || {
-            HealthStatus::Degraded("disk slow".to_string())
-        });
+        registry.register("redb", || HealthStatus::Degraded("disk slow".to_string()));
 
         let results = registry.check_all();
         assert_eq!(results.len(), 2);

@@ -2459,6 +2459,7 @@ dependencies = [
  "anyhow",
  "rusqlite",
  "sentinel-common",
+ "sentinel-telemetry",
  "serde",
  "serde_json",
  "tempfile",
@@ -2480,6 +2481,7 @@ dependencies = [
  "anyhow",
  "redb",
  "sentinel-common",
+ "sentinel-telemetry",
  "serde",
  "tempfile",
  "tracing",
@@ -2520,6 +2522,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "sentinel-common",
+ "sentinel-telemetry",
  "tokio",
  "tracing",
  "tracing-subscriber",

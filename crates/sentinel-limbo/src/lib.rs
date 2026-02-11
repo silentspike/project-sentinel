@@ -243,7 +243,9 @@ impl ChatStore {
         let summary = summary.to_string();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = conn.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+            let conn = conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
             conn.execute(
                 "UPDATE meetings SET ended_at = ?1, summary = ?2 WHERE id = ?3",
                 params![ended, summary, meeting_id],

@@ -62,10 +62,7 @@ mod tests {
     #[test]
     fn test_agent_topics() {
         assert_eq!(agent_action("thomas"), "sentinel/agent/thomas/action");
-        assert_eq!(
-            agent_perception("lisa"),
-            "sentinel/agent/lisa/perception"
-        );
+        assert_eq!(agent_perception("lisa"), "sentinel/agent/lisa/perception");
         assert_eq!(agent_state("andreas"), "sentinel/agent/andreas/state");
     }
 
@@ -83,15 +80,15 @@ mod tests {
     fn test_physics_tick() {
         assert_eq!(physics_tick(0), "sentinel/physics/tick/0");
         assert_eq!(physics_tick(42), "sentinel/physics/tick/42");
-        assert_eq!(physics_tick(u64::MAX), format!("sentinel/physics/tick/{}", u64::MAX));
+        assert_eq!(
+            physics_tick(u64::MAX),
+            format!("sentinel/physics/tick/{}", u64::MAX)
+        );
     }
 
     #[test]
     fn test_cortex_inject() {
-        assert_eq!(
-            cortex_inject("thomas"),
-            "sentinel/cortex/inject/thomas"
-        );
+        assert_eq!(cortex_inject("thomas"), "sentinel/cortex/inject/thomas");
     }
 
     #[test]
