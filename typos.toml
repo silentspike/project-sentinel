@@ -68,6 +68,12 @@ unveraenderlich = "unveraenderlich"
 Nachbarraeume = "Nachbarraeume"
 Belegung = "Belegung"
 
+# Sprint 2 ECS system words (German in doc comments + perception text)
+sie = "sie"
+vor = "vor"
+Dominante = "Dominante"
+dominante = "dominante"
+
 # Sprint 2 ECS system output words (German perception text)
 Aktivitaet = "Aktivitaet"
 Aktivierung = "Aktivierung"
