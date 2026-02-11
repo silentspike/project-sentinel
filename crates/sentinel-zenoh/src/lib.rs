@@ -65,7 +65,7 @@ impl SentinelBus {
         agent_id: AgentId,
         payload: &[u8],
     ) -> anyhow::Result<()> {
-        self.publish(&topics::agent_action(&agent_id.0.to_string()), payload)
+        self.publish(&topics::agent_action(&agent_id.to_string()), payload)
             .await
     }
 
@@ -74,7 +74,7 @@ impl SentinelBus {
         &self,
         agent_id: AgentId,
     ) -> anyhow::Result<BusSubscriber> {
-        self.subscribe(&topics::agent_perception(&agent_id.0.to_string()))
+        self.subscribe(&topics::agent_perception(&agent_id.to_string()))
             .await
     }
 
@@ -85,7 +85,7 @@ impl SentinelBus {
         event_type: &str,
         payload: &[u8],
     ) -> anyhow::Result<()> {
-        let topic = format!("{}/room/{}/{event_type}", topics::PREFIX, room_id.0);
+        let topic = format!("{}/room/{room_id}/{event_type}", topics::PREFIX);
         self.publish(&topic, payload).await
     }
 
