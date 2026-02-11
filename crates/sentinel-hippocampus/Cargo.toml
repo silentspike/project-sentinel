@@ -1,0 +1,15 @@
+[package]
+name = "sentinel-hippocampus"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+sentinel-common = { path = "../sentinel-common" }
+
+[dev-dependencies]
+approx = { workspace = true }
