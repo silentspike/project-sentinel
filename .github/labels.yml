@@ -1,7 +1,10 @@
-# Sync with: gh label create "name" --color "hex" --description "desc"
-# Or use: github/issue-labeler action
+# Label Schema - Project Sentinel
+# Sync via: .github/workflows/labels.yml (EndBug/label-sync)
 
 # Type
+- name: "type:epic"
+  color: "3e4b9e"
+  description: "Epic: groups related stories"
 - name: "type:bug"
   color: "d73a4a"
   description: "Something is broken"
@@ -24,16 +27,28 @@
   color: "d4c5f9"
   description: "Code restructuring"
 
-# Status
+# Status (Kanban Workflow: backlog → ready → in-progress → review → completed)
 - name: "status:triage"
   color: "fbca04"
   description: "Needs triage"
 - name: "status:backlog"
   color: "c5def5"
   description: "Accepted, not started"
+- name: "status:ready"
+  color: "0e8a16"
+  description: "Ready for development, all deps fulfilled"
+- name: "status:in-progress"
+  color: "fbca04"
+  description: "Currently being worked on"
+- name: "status:review"
+  color: "1d76db"
+  description: "PR open, in review"
 - name: "status:blocked"
   color: "b60205"
   description: "Blocked by dependency"
+- name: "status:completed"
+  color: "238636"
+  description: "Work completed"
 
 # Component
 - name: "comp:ecs"
@@ -65,3 +80,17 @@
 - name: "prio:low"
   color: "c5def5"
   description: "Nice to have"
+
+# Size (Story Points / Estimation)
+- name: "size:S"
+  color: "c5def5"
+  description: "Small: < 1 day"
+- name: "size:M"
+  color: "bfdadc"
+  description: "Medium: 1-3 days"
+- name: "size:L"
+  color: "f9d0c4"
+  description: "Large: 3-5 days"
+- name: "size:XL"
+  color: "e99695"
+  description: "Extra Large: > 5 days"
