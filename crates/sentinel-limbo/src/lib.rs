@@ -10,7 +10,10 @@
 use rusqlite::{params, Connection};
 use sentinel_common::{AgentId, Emotion, EventType, RoomId, Tick, Timestamp};
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use tracing::{info, instrument};
+
+/// Histogram bucket boundaries for SQLite query latencies (microseconds).
+const LATENCY_BUCKETS: &[f64] = &[50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0];
 
 // ──────────────────────────────────────────────
 // SQL Constants
@@ -80,6 +83,7 @@ pub struct ChatStore {
 impl ChatStore {
     /// Open or create the chat store at the given path.
     /// Runs performance pragmas and creates all tables.
+    #[instrument(level = "debug", fields(path = %path))]
     pub async fn open(path: &str) -> anyhow::Result<Self> {
         let path = path.to_string();
         let conn = tokio::task::spawn_blocking(move || -> anyhow::Result<Connection> {
@@ -114,6 +118,7 @@ impl ChatStore {
     // === MESSAGES ===
 
     /// Insert a chat message. Returns the rowid of the inserted row.
+    #[instrument(skip(self, content), level = "debug", fields(room_id = %room_id, agent_id = %agent_id, tick = %tick))]
     pub async fn insert_message(
         &self,
         room_id: RoomId,
@@ -123,6 +128,7 @@ impl ChatStore {
         timestamp: Timestamp,
         tick: Tick,
     ) -> anyhow::Result<i64> {
+        let start = std::time::Instant::now();
         let conn = self.conn.clone();
         let room_str = room_id.to_string();
         let agent_str = agent_id.to_string();
@@ -131,7 +137,7 @@ impl ChatStore {
         let ts = timestamp.0 as i64;
         let t = tick.0 as i64;
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
             let conn = conn.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
             conn.execute(
                 "INSERT INTO messages (room_id, agent_name, content, emotion, timestamp_ms, tick) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -139,19 +145,29 @@ impl ChatStore {
             )?;
             Ok(conn.last_insert_rowid())
         })
-        .await?
+        .await?;
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.limbo.insert.count").increment();
+            reg.histogram("sentinel.limbo.insert.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
+        result
     }
 
     /// Get messages for a room, ordered by timestamp descending.
+    #[instrument(skip(self), level = "debug", fields(room_id = %room_id, limit = %limit))]
     pub async fn get_room_messages(
         &self,
         room_id: RoomId,
         limit: u32,
     ) -> anyhow::Result<Vec<MessageRow>> {
+        let start = std::time::Instant::now();
         let conn = self.conn.clone();
         let room_str = room_id.to_string();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageRow>> {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageRow>> {
             let conn = conn.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
             let mut stmt = conn.prepare(
                 "SELECT id, room_id, agent_name, content, emotion, timestamp_ms, tick FROM messages WHERE room_id = ?1 ORDER BY timestamp_ms DESC LIMIT ?2",
@@ -173,13 +189,22 @@ impl ChatStore {
             }
             Ok(results)
         })
-        .await?
+        .await?;
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.limbo.query.count").increment();
+            reg.histogram("sentinel.limbo.query.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
+        result
     }
 
     // === MEETINGS ===
 
     /// Insert a meeting record. Participants are serialized as JSON array.
     /// Returns the rowid of the inserted row.
+    #[instrument(skip(self, participants), level = "debug", fields(room_id = %room_id, title = %title))]
     pub async fn insert_meeting(
         &self,
         room_id: RoomId,
@@ -206,6 +231,7 @@ impl ChatStore {
     }
 
     /// End a meeting by setting ended_at and summary.
+    #[instrument(skip(self, summary), level = "debug", fields(meeting_id = %meeting_id))]
     pub async fn end_meeting(
         &self,
         meeting_id: i64,
@@ -230,6 +256,7 @@ impl ChatStore {
     // === OBSERVATIONS ===
 
     /// Insert an observation data point. Returns the rowid of the inserted row.
+    #[instrument(skip(self, context), level = "debug", fields(agent_id = %agent_id, model = %model, metric = %metric))]
     pub async fn insert_observation(
         &self,
         agent_id: AgentId,
@@ -239,6 +266,7 @@ impl ChatStore {
         context: Option<&str>,
         timestamp: Timestamp,
     ) -> anyhow::Result<i64> {
+        let start = std::time::Instant::now();
         let conn = self.conn.clone();
         let agent_str = agent_id.to_string();
         let model = model.to_string();
@@ -246,7 +274,7 @@ impl ChatStore {
         let context = context.map(|c| c.to_string());
         let ts = timestamp.0 as i64;
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
             let conn = conn.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
             conn.execute(
                 "INSERT INTO observations (agent_name, model, metric, value, context, timestamp_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -254,12 +282,21 @@ impl ChatStore {
             )?;
             Ok(conn.last_insert_rowid())
         })
-        .await?
+        .await?;
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.limbo.insert.count").increment();
+            reg.histogram("sentinel.limbo.insert.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
+        result
     }
 
     // === CHAOS EVENTS ===
 
     /// Insert a chaos event. Returns the rowid of the inserted row.
+    #[instrument(skip(self, description), level = "debug", fields(event_type = ?event_type, target_room = ?target_room, target_agent = ?target_agent))]
     pub async fn insert_chaos_event(
         &self,
         event_type: EventType,
@@ -268,6 +305,7 @@ impl ChatStore {
         description: &str,
         timestamp: Timestamp,
     ) -> anyhow::Result<i64> {
+        let start = std::time::Instant::now();
         let conn = self.conn.clone();
         let event_str = event_type_to_str(event_type);
         let room_str = target_room.map(|r| r.to_string());
@@ -275,7 +313,7 @@ impl ChatStore {
         let description = description.to_string();
         let ts = timestamp.0 as i64;
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
             let conn = conn.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
             conn.execute(
                 "INSERT INTO chaos_events (event_type, target_room, target_agent, description, timestamp_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -283,7 +321,15 @@ impl ChatStore {
             )?;
             Ok(conn.last_insert_rowid())
         })
-        .await?
+        .await?;
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.limbo.insert.count").increment();
+            reg.histogram("sentinel.limbo.insert.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
+        result
     }
 
     /// Get a reference to the inner connection for testing.
