@@ -41,6 +41,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sprint 2 domain knowledge in CLAUDE.md (ECS, Bio-Engine, Physics, Room System, naming conventions, performance constraints)
 - Sprint 2 German domain words in `typos.toml` (Buero, Kueche, Laermpegel, Koffein, etc.)
 - `.claude/rules/` modular rules directory with Sprint 2 domain knowledge
+- `sentinel-ecs` crate: ECS core with bevy_ecs (10 components, 9 systems via SimulationPhase, agent spawning)
+- `sentinel-bio` crate: Bio-Engine with 6 differential equations (hunger, energy, caffeine decay, bladder, stress, social need)
+- `sentinel-physics` crate: Matrix physics (acoustics/dB, temperature/CO2, smell propagation, transit/hallway encounters, chaos events)
+- `config/rooms.toml`: Office building layout (15 rooms, 2 floors, bidirectional adjacency)
+- `sentinel-common::room` module: Room config parser with validation (adjacency, capacity, room types)
+- `config/company.toml`, `config/simulation.toml`: Company and simulation configuration files
+- Bio-Engine example: 8-hour workday simulation (`crates/sentinel-bio/examples/bio_simulation.rs`)
+- ECS component types moved to `sentinel-common::components` (breaks circular dependency)
+- `SimulationTime` ECS Resource for tick-based time management
+- Real ECS system implementations: `bio_system` (sentinel-bio), `transit_system`, `chaos_system` (sentinel-physics), `mood_system` (valence-arousal), `perception_system` (German text generation)
+- Mood system: valence-arousal model with weighted bio/stress/hunger/social factors
+- Perception system: German natural-language body/environment/social text for LLM prompts
+- Room-ID to German text mapping (15 rooms with descriptive names)
 
 ### Changed
 

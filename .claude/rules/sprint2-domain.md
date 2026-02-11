@@ -99,13 +99,20 @@ Max 15+9=24 Agents gleichzeitig (eine Schicht + Sonder-Set).
 ## Crate-Dependency-Map (Sprint 2)
 
 ```
-sentinel-ecs ──────→ sentinel-common, bevy_ecs
-sentinel-bio ──────→ sentinel-ecs (fuer BioState, Personality, WorkContext Typen)
-sentinel-physics ──→ sentinel-common (fuer RoomId, Tick), sentinel-ecs (fuer Position)
-sentinel-common ───→ toml (fuer rooms.toml Parsing), serde, anyhow
+sentinel-common ───→ bevy_ecs (fuer Component derive), toml, serde, anyhow
+sentinel-bio ──────→ sentinel-common (fuer BioState, Personality, WorkContext)
+sentinel-physics ──→ sentinel-common (fuer RoomId, Tick)
+sentinel-ecs ──────→ sentinel-common + sentinel-bio + sentinel-physics + bevy_ecs
 ```
 
-**Reihenfolge:** common → ecs → bio + physics (bio und physics sind parallel moeglich)
+**Reihenfolge:** common → bio + physics (parallel) → ecs
+
+**Architektur-Entscheidung:** Component-Typen (BioState, Personality, etc.) liegen in
+`sentinel-common::components`, NICHT in sentinel-ecs. Dies bricht die zirkulaere
+Abhaengigkeit sentinel-ecs ↔ sentinel-bio. sentinel-ecs re-exportiert die Typen.
+
+**ECS Component vs Message Struct:** `PerceptionState` (ECS Component in components.rs)
+vs `Perception` (Message-Struct in types.rs) - bewusst unterschiedliche Namen.
 
 ## Naming Conventions (Sprint 2)
 

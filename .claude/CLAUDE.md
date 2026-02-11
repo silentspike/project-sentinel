@@ -221,9 +221,22 @@ _Erkenntnisse aus der Implementierung. Format: Datum, Kontext, was gelernt._
 - 2026-02-11: `cargo remote -- fmt` synct NICHT zurueck. `cargo fmt` lokal ausfuehren.
 - 2026-02-11: deny.toml IMMER aktualisieren bei neuen Dependencies.
 
+### IMMER (gelernt, Sprint 2)
+- 2026-02-11: Zirkulaere Crate-Abhaengigkeiten frueh erkennen. Component-Typen gehoeren in die unterste Schicht (sentinel-common), NICHT in sentinel-ecs.
+- 2026-02-11: ECS Component-Name darf NICHT mit Message-Struct kollidieren. Loesung: `PerceptionState` (Component) vs `Perception` (Message in types.rs).
+- 2026-02-11: bevy_ecs `Res<T>` fuer System-Parameter: Resource MUSS in World inserted sein BEVOR Schedule::run(), sonst Panic.
+- 2026-02-11: Deutsche Woerter in Rust-Strings (perception text) muessen ALLE in typos.toml stehen - CI-typos-Check prueft auch String-Literale.
+
 ### Kontext-Wissen
 - 2026-02-11: BioStateUpdate::new() hat bewusst viele Args (10) - `#[allow(clippy::too_many_arguments)]` ist ok.
 - 2026-02-11: `ring` Crate: spezielle License-Clarification in deny.toml (MIT AND ISC AND OpenSSL).
 - 2026-02-11: cargo-deny v2: `vulnerability`/`notice` entfernt, `unmaintained`/`unsound` sind Scope-Werte.
 - 2026-02-11: golangci-lint v2: `version: "2"` noetig, `gosimple` in `staticcheck` gemerged.
 - 2026-02-11: GitHub Actions Major-Bumps koennen Breaking Changes haben. IMMER Release Notes pruefen.
+
+### Kontext-Wissen (Sprint 2)
+- 2026-02-11: Dependency-Graph Sprint 2: common(+bevy_ecs) → bio + physics → ecs. NICHT umgekehrt.
+- 2026-02-11: sentinel-ecs re-exportiert Components aus sentinel-common. Externe Crates koennen beides nutzen.
+- 2026-02-11: SimulationTime Resource muss AUSSERHALB des Schedules aktualisiert werden (vor schedule.run()).
+- 2026-02-11: Physics-Berechnungen sind pro RAUM (nicht pro Agent). Agenten pro Raum zaehlen via Position-Query.
+- 2026-02-11: Mood-System nutzt Valenz-Arousal-Modell. Quadranten-Mapping auf 10 Emotionen (Emotion enum in types.rs).
