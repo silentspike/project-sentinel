@@ -2661,13 +2661,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "sentinel-inference"
+name = "sentinel-hippocampus"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "approx",
  "sentinel-common",
- "tempfile",
- "tracing",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
