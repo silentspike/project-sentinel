@@ -1,0 +1,22 @@
+# typos configuration
+# https://github.com/crate-ci/typos
+
+[default]
+locale = "en-us"
+
+[default.extend-words]
+# Domain-specific words that are NOT typos
+ecs = "ecs"       # Entity Component System
+ebpf = "ebpf"     # Extended Berkeley Packet Filter
+hono = "hono"     # Hono web framework
+toml = "toml"     # TOML config format
+zenoh = "zenoh"   # Zenoh pub/sub
+
+[files]
+extend-exclude = [
+    "Cargo.lock",
+    "*.lock",
+    "target/",
+    "node_modules/",
+    "*.min.js",
+]

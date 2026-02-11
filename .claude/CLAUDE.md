@@ -100,9 +100,11 @@ VERBOTEN in Code/Docs:
 
 ### Code Style
 - Rust: `cargo fmt` + `cargo clippy -- -D warnings` (zero warnings)
+- Rust: `RUSTDOCFLAGS="-D warnings" cargo doc` (zero doc-warnings)
 - Rust: `rustfmt.toml` definiert max_width=100, `clippy.toml` definiert Thresholds
-- Go: `gofmt` + `go vet` + `golangci-lint` (Config: `.golangci.yml`)
+- Go: `gofmt` + `go vet` + `golangci-lint` (Config: `.golangci.yml`, v2-Format!)
 - TypeScript: Bun-native, kein extra Formatter
+- Alle: `typos` Spellcheck (Config: `typos.toml`) - keine Tippfehler in Code oder Docs
 
 ### Supply-Chain-Security
 - Alle GitHub Actions MUESSEN auf volle Commit-SHAs gepinnt sein (nie `@v4`, immer `@sha # v4.x.y`)
@@ -124,7 +126,7 @@ VERBOTEN in Code/Docs:
 ### VERIFY nach jedem Schritt (PFLICHT)
 ```
 □ Tests ausgefuehrt? → Command + Output
-□ Lints bestanden? → cargo fmt --check + clippy + deny
+□ Lints bestanden? → cargo fmt --check + clippy + deny + typos + doc
 □ Manuell verifiziert? → Was geprueft?
 □ Lessons-Check: Unerwartetes Verhalten?
   → JA: Sofort unten in "Projekt-Learnings" dokumentieren
@@ -146,6 +148,9 @@ VERBOTEN in Code/Docs:
 | **Format** | `make fmt` |
 | **Supply Chain** | `make deny` |
 | **Coverage** | `make coverage` |
+| **Typos** | `make typos` |
+| **Docs (Warnings=Error)** | `make doc` |
+| **Unused Deps** | `make machete` |
 | **FlatBuffer Gen** | `make generate` |
 | **Security Audit** | `make security` |
 | **Benchmarks** | `make bench` |
@@ -173,8 +178,8 @@ bitnet/              # CPU-Inference
 deploy/              # VM-Config, systemd, init.sh
 ```
 
-### CI/CD Workflows (alle Actions SHA-gepinnt)
-- **ci.yml**: Smart path-filtered CI (nur betroffene Sprachen)
+### CI/CD Workflows (alle Actions SHA-gepinnt, Concurrency-Groups aktiv)
+- **ci.yml**: Smart path-filtered CI (lint, typos, rust+doc+machete, go, dashboard, schemas)
 - **pr-lint.yml**: Conventional Commits Validierung
 - **auto-label.yml**: Automatische Labels auf Issues und PRs
 - **deny.yml**: cargo-deny (Advisories, Licenses, Bans, Sources) - bei Cargo-Aenderungen + woechentlich
@@ -209,6 +214,8 @@ deploy/              # VM-Config, systemd, init.sh
 | Rust Format Config | `rustfmt.toml` |
 | Clippy Config | `clippy.toml` |
 | Go Lint Config | `.golangci.yml` |
+| Typos Config | `typos.toml` |
+| Audit Ignores | `.cargo/audit.toml` |
 
 **Regel:** Plan ist SSOT fuer Architektur. Wenn Plan und Code divergieren → Plan gewinnt, Code anpassen.
 
