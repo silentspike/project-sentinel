@@ -2358,6 +2358,8 @@ version = "0.1.0"
 dependencies = [
  "flatbuffers",
  "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
