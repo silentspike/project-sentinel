@@ -6,6 +6,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
+bevy_ecs = { workspace = true }
 serde = { workspace = true }
 flatbuffers = { workspace = true }
 thiserror = { workspace = true }

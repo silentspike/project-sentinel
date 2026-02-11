@@ -11,3 +11,5 @@ serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
+sentinel-bio = { path = "../sentinel-bio" }
+sentinel-physics = { path = "../sentinel-physics" }

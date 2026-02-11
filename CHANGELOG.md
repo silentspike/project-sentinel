@@ -48,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sentinel-common::room` module: Room config parser with validation (adjacency, capacity, room types)
 - `config/company.toml`, `config/simulation.toml`: Company and simulation configuration files
 - Bio-Engine example: 8-hour workday simulation (`crates/sentinel-bio/examples/bio_simulation.rs`)
+- ECS component types moved to `sentinel-common::components` (breaks circular dependency)
+- `SimulationTime` ECS Resource for tick-based time management
+- Real ECS system implementations: `bio_system` (sentinel-bio), `transit_system`, `chaos_system` (sentinel-physics), `mood_system` (valence-arousal), `perception_system` (German text generation)
+- Mood system: valence-arousal model with weighted bio/stress/hunger/social factors
+- Perception system: German natural-language body/environment/social text for LLM prompts
+- Room-ID to German text mapping (15 rooms with descriptive names)
 
 ### Changed
 

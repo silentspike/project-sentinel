@@ -8,10 +8,33 @@ use super::systems::*;
 use bevy_ecs::prelude::*;
 use sentinel_common::{AgentId, Emotion, Tick};
 
+/// Simulationszeit-Resource (muss vor jedem Schedule::run() aktualisiert werden)
+#[derive(Resource, Debug, Clone)]
+pub struct SimulationTime {
+    pub tick: Tick,
+    pub tick_count: u64,
+    pub delta_seconds: f32,
+    pub sim_hour: f32, // 0.0-24.0 simulierte Tageszeit
+}
+
+impl Default for SimulationTime {
+    fn default() -> Self {
+        Self {
+            tick: Tick(0),
+            tick_count: 0,
+            delta_seconds: 1.0, // 1 Sekunde pro Tick default
+            sim_hour: 8.0,      // Arbeitsbeginn 08:00
+        }
+    }
+}
+
 /// Erstellt einen neuen ECS World mit allen Systems in korrekter Reihenfolge
 pub fn create_simulation_world() -> (World, Schedule) {
-    let world = World::new();
+    let mut world = World::new();
     let mut schedule = Schedule::default();
+
+    // Resources einfuegen
+    world.insert_resource(SimulationTime::default());
 
     // System-Reihenfolge via configure_sets
     schedule.configure_sets(
@@ -94,7 +117,7 @@ pub fn spawn_agent(
                 arousal: 0.3,
                 dominant_emotion: Emotion::Neutral,
             },
-            Perception {
+            PerceptionState {
                 environment_text: String::new(),
                 body_text: String::new(),
                 social_text: String::new(),

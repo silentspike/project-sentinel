@@ -2,7 +2,7 @@
 //!
 //! 6 biologische Parameter mit Formeln + 3 Action-Funktionen.
 
-use sentinel_ecs::{BioState, Personality, WorkContext};
+use sentinel_common::components::{BioState, Personality, WorkContext};
 
 // ── Konstanten ──
 

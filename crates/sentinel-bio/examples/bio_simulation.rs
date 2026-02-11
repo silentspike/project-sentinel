@@ -1,7 +1,7 @@
 //! Beispiel: 8-Stunden-Arbeitstag mit biologischen Zyklen simulieren
 
 use sentinel_bio::{drink_coffee, eat_meal, update_bio_state, use_bathroom};
-use sentinel_ecs::{BioState, Personality, WorkContext};
+use sentinel_common::components::{BioState, Personality, WorkContext};
 
 fn main() {
     // Initialisierung: Morgen-Person, extrovertiert, niedriger Neurotizismus

@@ -2487,7 +2487,6 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "sentinel-common",
- "sentinel-ecs",
 ]
 
 [[package]]
@@ -2495,6 +2494,7 @@ name = "sentinel-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bevy_ecs",
  "flatbuffers",
  "serde",
  "serde_json",
@@ -2515,7 +2515,9 @@ name = "sentinel-ecs"
 version = "0.1.0"
 dependencies = [
  "bevy_ecs",
+ "sentinel-bio",
  "sentinel-common",
+ "sentinel-physics",
  "serde",
  "tokio",
  "tracing",
