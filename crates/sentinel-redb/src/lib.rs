@@ -1,6 +1,6 @@
 //! redb ACID KV-store for hot agent state and relationships.
 
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use sentinel_common::{AgentId, RoomId};
 use tracing::instrument;
 
@@ -46,7 +46,9 @@ impl StateStore {
         let start = std::time::Instant::now();
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(AGENT_STATE)?;
-        let result = Ok(table.get(agent_id.0)?.map(|v| v.value().to_vec()));
+        let result = Ok(table
+            .get(agent_id.0)?
+            .map(|v: redb::AccessGuard<'_, &[u8]>| v.value().to_vec()));
         #[cfg(feature = "telemetry")]
         {
             let reg = sentinel_telemetry::MetricsRegistry::global();
@@ -106,7 +108,7 @@ impl StateStore {
         let mut ids = Vec::new();
         let iter = table.iter()?;
         for entry in iter {
-            let (key, _) = entry?;
+            let (key, _): (redb::AccessGuard<'_, u16>, redb::AccessGuard<'_, &[u8]>) = entry?;
             ids.push(AgentId(key.value()));
         }
         Ok(ids)
@@ -121,7 +123,9 @@ impl StateStore {
         let key = relationship_key(a, b);
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(RELATIONSHIPS)?;
-        let result = Ok(table.get(key)?.map(|v| v.value().to_vec()));
+        let result = Ok(table
+            .get(key)?
+            .map(|v: redb::AccessGuard<'_, &[u8]>| v.value().to_vec()));
         #[cfg(feature = "telemetry")]
         {
             let reg = sentinel_telemetry::MetricsRegistry::global();
@@ -161,7 +165,9 @@ impl StateStore {
         let start = std::time::Instant::now();
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(PERSONALITY)?;
-        let result = Ok(table.get(agent_id.0)?.map(|v| v.value().to_vec()));
+        let result = Ok(table
+            .get(agent_id.0)?
+            .map(|v: redb::AccessGuard<'_, &[u8]>| v.value().to_vec()));
         #[cfg(feature = "telemetry")]
         {
             let reg = sentinel_telemetry::MetricsRegistry::global();
@@ -200,7 +206,9 @@ impl StateStore {
         let start = std::time::Instant::now();
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ROOM_STATE)?;
-        let result = Ok(table.get(room_id.0)?.map(|v| v.value().to_vec()));
+        let result = Ok(table
+            .get(room_id.0)?
+            .map(|v: redb::AccessGuard<'_, &[u8]>| v.value().to_vec()));
         #[cfg(feature = "telemetry")]
         {
             let reg = sentinel_telemetry::MetricsRegistry::global();
@@ -332,7 +340,7 @@ mod tests {
         store.set_agent_state(agent(1), b"small").unwrap();
         let path = dir.path().join("test.redb");
         let size = std::fs::metadata(&path).unwrap().len();
-        // redb 2.x mit 4 Tabellen benoetigt ~1.5MB CoW B-Tree Overhead
+        // redb 3.x mit 4 Tabellen: ~1MB (CoW B-Tree Overhead)
         assert!(
             size < 2_097_152,
             "DB should be <2MB initially, was {size} bytes"
