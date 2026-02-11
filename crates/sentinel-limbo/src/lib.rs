@@ -163,8 +163,8 @@ impl ChatStore {
                     agent_name: row.get(2)?,
                     content: row.get(3)?,
                     emotion: row.get(4)?,
-                    timestamp_ms: row.get::<_, i64>(5)? as u64,
-                    tick: row.get::<_, i64>(6)? as u64,
+                    timestamp: Timestamp(row.get::<_, i64>(5)? as u64),
+                    tick: Tick(row.get::<_, i64>(6)? as u64),
                 })
             })?;
             let mut results = Vec::new();
@@ -184,13 +184,14 @@ impl ChatStore {
         &self,
         room_id: RoomId,
         title: &str,
-        participants: &[String],
+        participants: &[AgentId],
         started_at: Timestamp,
     ) -> anyhow::Result<i64> {
         let conn = self.conn.clone();
         let room_str = room_id.to_string();
         let title = title.to_string();
-        let participants_json = serde_json::to_string(participants)?;
+        let participant_strings: Vec<String> = participants.iter().map(|a| a.to_string()).collect();
+        let participants_json = serde_json::to_string(&participant_strings)?;
         let started = started_at.0 as i64;
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
@@ -304,8 +305,8 @@ pub struct MessageRow {
     pub agent_name: String,
     pub content: String,
     pub emotion: Option<String>,
-    pub timestamp_ms: u64,
-    pub tick: u64,
+    pub timestamp: Timestamp,
+    pub tick: Tick,
 }
 
 // ──────────────────────────────────────────────
@@ -408,8 +409,8 @@ mod tests {
         assert_eq!(messages[0].agent_name, "AGENT-01");
         assert_eq!(messages[0].content, "Guten Morgen!");
         assert_eq!(messages[0].emotion, Some("happy".to_string()));
-        assert_eq!(messages[0].timestamp_ms, 1000);
-        assert_eq!(messages[0].tick, 42);
+        assert_eq!(messages[0].timestamp, Timestamp(1000));
+        assert_eq!(messages[0].tick, Tick(42));
     }
 
     #[tokio::test]
@@ -419,7 +420,7 @@ mod tests {
         let store = ChatStore::open(path.to_str().unwrap()).await.unwrap();
 
         let room = RoomId::new(5).unwrap();
-        let participants = vec!["AGENT-01".to_string(), "AGENT-02".to_string()];
+        let participants = vec![AgentId::new(1).unwrap(), AgentId::new(2).unwrap()];
         let id = store
             .insert_meeting(room, "Sprint Review", &participants, Timestamp(9000))
             .await
