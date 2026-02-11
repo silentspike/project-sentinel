@@ -25,9 +25,10 @@ jobs:
       go: ${{ steps.filter.outputs.go }}
       dashboard: ${{ steps.filter.outputs.dashboard }}
       schemas: ${{ steps.filter.outputs.schemas }}
+      config: ${{ steps.filter.outputs.config }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
         id: filter
         with:
           filters: |
@@ -43,6 +44,8 @@ jobs:
               - 'dashboard/**'
             schemas:
               - 'schemas/**'
+            config:
+              - 'config/**'
 
   # ──────────────────────────────────────────────
   # Always runs - fast checks (<30s)
@@ -50,7 +53,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Reject hidden Unicode / Bidi characters
         run: |
@@ -69,20 +72,29 @@ jobs:
           done
 
   # ──────────────────────────────────────────────
+  # Typo detection (all files)
+  # ──────────────────────────────────────────────
+  typos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: crate-ci/typos@e0d770e210c9b97939ad1eaf0d9837a2cb28879a # v1.43.4
+
+  # ──────────────────────────────────────────────
   # Rust - only when crates/ or Cargo.* changed
   # ──────────────────────────────────────────────
   rust:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.config == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
         with:
           cache-on-failure: true
 
@@ -92,8 +104,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Rustdoc warnings
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --document-private-items
+
       - name: Tests
         run: cargo test --workspace
+
+      - name: Unused dependencies
+        run: |
+          cargo install cargo-machete --locked 2>/dev/null || true
+          cargo machete || echo "::warning::Unused dependencies found (non-blocking)"
 
   # ──────────────────────────────────────────────
   # Go - only when cmd/ changed
@@ -103,9 +125,9 @@ jobs:
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
         with:
           go-version-file: cmd/cortex-gateway/go.mod
           cache-dependency-path: cmd/cortex-gateway/go.sum
@@ -119,7 +141,7 @@ jobs:
         run: go test ./...
 
       - name: Lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
         with:
           working-directory: cmd/cortex-gateway
 
@@ -131,9 +153,9 @@ jobs:
     if: needs.changes.outputs.dashboard == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
 
       - name: Install
         working-directory: dashboard
@@ -155,7 +177,7 @@ jobs:
     if: needs.changes.outputs.schemas == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install flatc
         run: |
@@ -175,13 +197,14 @@ jobs:
   # ──────────────────────────────────────────────
   ci-pass:
     if: always()
-    needs: [lint, rust, go, dashboard, schemas]
+    needs: [lint, typos, rust, go, dashboard, schemas]
     runs-on: ubuntu-latest
     steps:
       - name: Evaluate results
         run: |
           results=(
             "${{ needs.lint.result }}"
+            "${{ needs.typos.result }}"
             "${{ needs.rust.result }}"
             "${{ needs.go.result }}"
             "${{ needs.dashboard.result }}"

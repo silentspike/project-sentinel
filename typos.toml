@@ -1,0 +1,78 @@
+# typos configuration
+# https://github.com/crate-ci/typos
+
+[default]
+locale = "en-us"
+
+[default.extend-words]
+# Domain-specific words that are NOT typos
+ecs = "ecs"       # Entity Component System
+ebpf = "ebpf"     # Extended Berkeley Packet Filter
+hono = "hono"     # Hono web framework
+toml = "toml"     # TOML config format
+zenoh = "zenoh"   # Zenoh pub/sub
+
+# German words used in code comments (CLAUDE.md, deny.toml, Rust doc comments)
+ist = "ist"
+Prozess = "Prozess"
+Hierarchie = "Hierarchie"
+initialisiert = "initialisiert"
+fuer = "fuer"
+ueber = "ueber"
+aenderungen = "aenderungen"
+Aenderungen = "Aenderungen"
+geprueft = "geprueft"
+ausfuehren = "ausfuehren"
+aktualisieren = "aktualisieren"
+Lokal = "Lokal"
+muessen = "muessen"
+moglich = "moglich"
+Woche = "Woche"
+und = "und"
+
+# Sprint 2 domain words (ECS, Bio-Engine, Physics, Room System)
+Buero = "Buero"
+Kueche = "Kueche"
+Pausenraum = "Pausenraum"
+Meetingraum = "Meetingraum"
+Erdgeschoss = "Erdgeschoss"
+Obergeschoss = "Obergeschoss"
+Treppenhaus = "Treppenhaus"
+Geschaeftsfuehrung = "Geschaeftsfuehrung"
+Nuernberg = "Nuernberg"
+Fuerther = "Fuerther"
+Laermpegel = "Laermpegel"
+Lautstaerke = "Lautstaerke"
+Olfaktorik = "Olfaktorik"
+Gerueche = "Gerueche"
+Koffein = "Koffein"
+Blasendrang = "Blasendrang"
+Beduerfnisse = "Beduerfnisse"
+Halbwertszeit = "Halbwertszeit"
+Neurotizismus = "Neurotizismus"
+Wahrnehmung = "Wahrnehmung"
+Empfang = "Empfang"
+Entwicklung = "Entwicklung"
+Schichtdienst = "Schichtdienst"
+Frueh = "Frueh"
+Spaet = "Spaet"
+Mittel = "Mittel"
+Betriebsrat = "Betriebsrat"
+Betriebsaerzte = "Betriebsaerzte"
+Psychologen = "Psychologen"
+Persoenlichkeit = "Persoenlichkeit"
+Emotionen = "Emotionen"
+Beziehungen = "Beziehungen"
+Raumwechsel = "Raumwechsel"
+unveraenderlich = "unveraenderlich"
+Nachbarraeume = "Nachbarraeume"
+Belegung = "Belegung"
+
+[files]
+extend-exclude = [
+    "Cargo.lock",
+    "*.lock",
+    "target/",
+    "node_modules/",
+    "*.min.js",
+]
