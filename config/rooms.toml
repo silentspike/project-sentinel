@@ -1,3 +1,139 @@
-# Room layout - will be populated in Phase 2
+# PixelPerfekt GmbH - Bürogebäude Layout
+# 15 Räume auf 2 Stockwerken + Treppenhaus
+
 [building]
 name = "PixelPerfekt GmbH"
+address = "Fuerther Strasse 42, 90429 Nuernberg"
+floors = 2
+
+# ── Erdgeschoss (Floor 0) ──
+
+[[rooms]]
+id = "empfang"
+name = "Empfang"
+floor = 0
+capacity = 4
+room_type = "common"
+adjacent = ["flur-eg", "meetingraum-01"]
+
+[[rooms]]
+id = "flur-eg"
+name = "Flur Erdgeschoss"
+floor = 0
+capacity = 20
+room_type = "transit"
+adjacent = ["empfang", "kueche", "buero-dev-1", "buero-dev-2", "meetingraum-01", "toilette-eg", "treppenhaus"]
+
+[[rooms]]
+id = "kueche"
+name = "Kueche / Pausenraum"
+floor = 0
+capacity = 10
+room_type = "break"
+adjacent = ["flur-eg"]
+has_coffee_machine = true
+
+[[rooms]]
+id = "buero-dev-1"
+name = "Entwicklungsbuero 1"
+floor = 0
+capacity = 6
+room_type = "office"
+adjacent = ["flur-eg", "buero-dev-2"]
+department = "Entwicklung"
+
+[[rooms]]
+id = "buero-dev-2"
+name = "Entwicklungsbuero 2"
+floor = 0
+capacity = 6
+room_type = "office"
+adjacent = ["flur-eg", "buero-dev-1"]
+department = "Entwicklung"
+
+[[rooms]]
+id = "meetingraum-01"
+name = "Meetingraum Galileo"
+floor = 0
+capacity = 8
+room_type = "meeting"
+adjacent = ["empfang", "flur-eg"]
+
+[[rooms]]
+id = "toilette-eg"
+name = "Toilette EG"
+floor = 0
+capacity = 3
+room_type = "bathroom"
+adjacent = ["flur-eg"]
+
+# ── Treppenhaus (Stockwerk-übergreifend) ──
+
+[[rooms]]
+id = "treppenhaus"
+name = "Treppenhaus"
+floor = -1
+capacity = 5
+room_type = "transit"
+adjacent = ["flur-eg", "flur-og"]
+
+# ── Obergeschoss (Floor 1) ──
+
+[[rooms]]
+id = "flur-og"
+name = "Flur Obergeschoss"
+floor = 1
+capacity = 20
+room_type = "transit"
+adjacent = ["treppenhaus", "buero-design-1", "buero-design-2", "buero-ceo", "meetingraum-02", "meetingraum-03", "toilette-og"]
+
+[[rooms]]
+id = "buero-design-1"
+name = "Designbuero 1"
+floor = 1
+capacity = 6
+room_type = "office"
+adjacent = ["flur-og", "buero-design-2"]
+department = "Design"
+
+[[rooms]]
+id = "buero-design-2"
+name = "Designbuero 2"
+floor = 1
+capacity = 6
+room_type = "office"
+adjacent = ["flur-og", "buero-design-1"]
+department = "Design"
+
+[[rooms]]
+id = "buero-ceo"
+name = "Geschaeftsfuehrung"
+floor = 1
+capacity = 4
+room_type = "office"
+adjacent = ["flur-og"]
+department = "Geschaeftsfuehrung"
+
+[[rooms]]
+id = "meetingraum-02"
+name = "Meetingraum Tesla"
+floor = 1
+capacity = 12
+room_type = "meeting"
+adjacent = ["flur-og"]
+
+[[rooms]]
+id = "meetingraum-03"
+name = "Meetingraum Edison"
+floor = 1
+capacity = 6
+room_type = "meeting"
+adjacent = ["flur-og"]
+
+[[rooms]]
+id = "toilette-og"
+name = "Toilette OG"
+floor = 1
+capacity = 3
+room_type = "bathroom"
+adjacent = ["flur-og"]

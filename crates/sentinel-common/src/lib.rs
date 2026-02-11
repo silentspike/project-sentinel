@@ -5,6 +5,7 @@
 //! - Internal (Zenoh Pub/Sub): FlatBuffers (zero-copy)
 //! - External (Dashboard, Logs): MessagePack
 
+pub mod room;
 pub mod types;
 
 pub use types::*;

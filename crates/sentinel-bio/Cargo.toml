@@ -7,3 +7,7 @@ publish = false
 
 [dependencies]
 sentinel-common = { path = "../sentinel-common" }
+sentinel-ecs = { path = "../sentinel-ecs" }
+
+[dev-dependencies]
+approx = { workspace = true }
