@@ -21,6 +21,7 @@ fn main() {
         extraversion: 0.75, // Extrovertiert
         agreeableness: 0.6,
         neuroticism: 0.2, // Stressresistent
+        caffeine_tolerance: 0.5,
         is_morning_person: true,
     };
 

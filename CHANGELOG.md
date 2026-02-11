@@ -54,9 +54,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Mood system: valence-arousal model with weighted bio/stress/hunger/social factors
 - Perception system: German natural-language body/environment/social text for LLM prompts
 - Room-ID to German text mapping (15 rooms with descriptive names)
+- Sprint 3: `cortex-gateway` Go HTTP proxy with LLM pipeline (Provider Registry, HTTP Handler, Prompt Compiler, Session Normalizer, Action Extraction, Capability Detection, Control Plane API)
+- Sprint 3: `perception.rs` - Perception text generator with `generate_perception()` and `format_injection()` for [SYSTEM_INJECTION] blocks
+- Sprint 3: Fourth-wall detection package with 15 regex patterns, LLM judge (2-stage pipeline), re-generation, Prometheus metrics
+- Sprint 3: Provider interface with Claude API and Ollama backends, HTTP proxy handler with size limits and timeouts
+- Sprint 3: Session normalizer for unified LLM response format (Claude + Ollama)
+- Sprint 3: Prompt compiler with model-specific configs (full bio for Claude, distilled for 7B)
+- Sprint 3: Action extraction with German emotion/intent regex patterns
+- Sprint 3: Capability detection with provider feature maps and fallback strategies
+- Sprint 3: Control Plane API (GET/PATCH config, POST provider switch) on separate port
+- Sprint 3: `config/cortex-gateway.toml` gateway configuration
+- Sprint 3: `caffeine_tolerance` field added to `Personality` component
+- Sprint 3: Go CI enhanced with `go build` step and race detector (`go test -race`)
 
 ### Changed
 
+- CI: Merged `lint` + `typos` into single job (saves runner startup time)
+- CI: Coverage runs only on `main` push (not on PRs), reduces PR check time by ~8min
+- CI: `cargo-machete` + `cargo-tarpaulin` installed via pre-built binaries (`taiki-e/install-action`)
+- CI: Security workflow now has concurrency groups (cancel superseded runs)
+- CI: Go vulnerability check uses `cache-dependency-path` for faster Go module caching
+- Go minimum version bumped from 1.23 to 1.25.0 (toolchain 1.25.7) for crypto/tls vulnerability fixes
 - `redb` upgraded from 2.x to 3.1.0 (new `ReadableDatabase` trait, explicit type annotations for `AccessGuard`)
 - CLAUDE.md restructured per `/claudemd` best practices (382→229 lines, domain knowledge moved to rules/)
 

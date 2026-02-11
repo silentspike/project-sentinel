@@ -18,6 +18,10 @@ permissions:
   issues: write
   checks: write
 
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust-audit:
     runs-on: ubuntu-latest
@@ -34,6 +38,7 @@ jobs:
       - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
         with:
           go-version-file: cmd/cortex-gateway/go.mod
+          cache-dependency-path: cmd/cortex-gateway/go.sum
       - name: govulncheck
         working-directory: cmd/cortex-gateway
         run: |

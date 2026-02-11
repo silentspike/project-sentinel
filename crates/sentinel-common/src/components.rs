@@ -38,14 +38,15 @@ pub struct BioState {
     pub comfort: f32,     // 0-100
 }
 
-/// Persoenlichkeit (Big Five + chronotype)
+/// Persoenlichkeit (Big Five + chronotype + Koffein-Toleranz)
 #[derive(Component, Debug, Clone)]
 pub struct Personality {
-    pub openness: f32,          // 0-1
-    pub conscientiousness: f32, // 0-1
-    pub extraversion: f32,      // 0-1
-    pub agreeableness: f32,     // 0-1
-    pub neuroticism: f32,       // 0-1
+    pub openness: f32,           // 0-1
+    pub conscientiousness: f32,  // 0-1
+    pub extraversion: f32,       // 0-1
+    pub agreeableness: f32,      // 0-1
+    pub neuroticism: f32,        // 0-1
+    pub caffeine_tolerance: f32, // 0-1, Koffein-Toleranz
     pub is_morning_person: bool,
 }
 
