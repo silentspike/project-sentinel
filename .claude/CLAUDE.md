@@ -26,6 +26,9 @@
 - Conventional Commits fuer PR-Titel und Commits
 - CHANGELOG.md bei user-facing Aenderungen aktualisieren
 - `cargo deny check` vor Push (Licenses + Advisories)
+- `cargo update` vor PR (neueste kompatible Dependency-Versionen)
+- Aktuellste Versionen aller Tools/Actions/Libraries verwenden
+- Nach Feature-Install: Updates pruefen, Configs verifizieren, `make ci` ausfuehren
 - IOPS-Impact bedenken (DRAM-lose NVMe! Budget: siehe Plan)
 - Performance-kritischen Code benchmarken
 - FlatBuffer Schema validieren bei Schema-Aenderungen
@@ -67,6 +70,17 @@ VERBOTEN in Code/Docs:
 - Cortex Gateway ist permanenter Middleware-Layer UEBER Claude Code
 - System muss modell-agnostisch sein (Claude, Qwen3, BitNet als Provider hinter Cortex Gateway)
 - BitNet = optionaler Cost-Saving-Layer fuer triviale Interaktionen, NICHT das Brain
+
+### Dependency- und Tool-Management (PFLICHT)
+- IMMER die **aktuellste Version** aller Tools, Libraries, Actions und Configs verwenden
+- Nach JEDEM Feature-Install / Konfigurationsaenderung: `cargo update`, Go-Module updaten, Action-SHAs pruefen
+- `cargo update` vor jedem PR ausfuehren (holt neueste kompatible Patch-Versionen)
+- GitHub Actions: Vor PR pruefen ob neuere Major/Minor-Releases verfuegbar sind (`gh api repos/OWNER/REPO/releases/latest`)
+- Bei Major-Version-Bumps von Actions: Breaking Changes pruefen, Config migrieren falls noetig
+- golangci-lint: `.golangci.yml` hat `version: "2"` - bei Updates Format-Kompatibilitaet pruefen
+- deny.toml: cargo-deny v2 Format (NICHT v1!) - `unmaintained`/`unsound` sind Scope-Werte (all/workspace/transitive/none)
+- Nie veraltete Versionen deployen - lieber kurz recherchieren als mit altem Stand arbeiten
+- Nach Updates IMMER verifizieren: `make ci` (oder mindestens die betroffenen Checks)
 
 ### Teammate-Management
 - Teammates die Tasks wiederholt ignorieren oder nicht nach Instruktion arbeiten: Frueh terminieren
@@ -220,3 +234,6 @@ _Format: Datum, Kontext, was gelernt wurde._
 - 2026-02-11: BioStateUpdate::new() hat bewusst viele Args (10) - `#[allow(clippy::too_many_arguments)]` ist ok.
 - 2026-02-11: rustfmt Version auf Build-Server und lokal koennen abweichen - IMMER CI-kompatible Version verifizieren.
 - 2026-02-11: `ring` Crate hat spezielle License-Clarification in deny.toml (MIT AND ISC AND OpenSSL).
+- 2026-02-11: cargo-deny v2 hat Config-Format geaendert: `vulnerability`/`notice` entfernt, `unmaintained`/`unsound` sind jetzt Scope-Werte (all/workspace/transitive/none) statt deny/warn.
+- 2026-02-11: golangci-lint v2 hat Config-Format geaendert: `version: "2"` noetig, `gosimple` in `staticcheck` gemerged, `linters-settings` → `linters.settings`, `linters.default: none` statt implizit.
+- 2026-02-11: GitHub Actions Major-Version-Bumps koennen Breaking Changes haben (z.B. golangci-lint v6→v9 erfordert golangci-lint v2 Config). IMMER Release Notes pruefen.
