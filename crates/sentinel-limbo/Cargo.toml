@@ -8,3 +8,11 @@ tokio = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
+# Fallback: rusqlite statt limbo (limbo v0.0.22 hat keinen Pragma-Setter)
+rusqlite = { version = "0.32", features = ["bundled"] }
+anyhow = "1"
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
