@@ -16,7 +16,7 @@ tracing = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
 sentinel-telemetry = { path = "../sentinel-telemetry" }
 # Fallback: rusqlite statt limbo (limbo v0.0.22 hat keinen Pragma-Setter)
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 
