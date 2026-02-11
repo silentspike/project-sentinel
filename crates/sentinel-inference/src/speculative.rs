@@ -17,6 +17,7 @@ pub struct SpeculativeConfig {
 /// 1. Draft-Model generiert N Kandidaten-Tokens schnell
 /// 2. Verify-Model prueft alle N Tokens in einem Pass
 /// 3. Akzeptierte Tokens werden uebernommen, ab erstem Reject: neu generieren
+///
 /// Speedup: typisch 1.5-3x (abhaengig von Akzeptanzrate)
 pub struct SpeculativeDecoder {
     config: SpeculativeConfig,
@@ -93,7 +94,10 @@ mod tests {
 
     #[test]
     fn test_count_matching_prefix() {
-        assert_eq!(count_matching_prefix("hello world foo", "hello world bar"), 2);
+        assert_eq!(
+            count_matching_prefix("hello world foo", "hello world bar"),
+            2
+        );
         assert_eq!(count_matching_prefix("hello world", "hello world"), 2);
         assert_eq!(count_matching_prefix("hello", "goodbye"), 0);
         assert_eq!(count_matching_prefix("", "hello"), 0);
