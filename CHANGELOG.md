@@ -29,12 +29,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scorecard.yml` workflow: OSSF Scorecard for security posture (weekly + SARIF upload)
 - SBOM generation in release workflow (CycloneDX JSON via Syft, attached to GitHub Releases)
 - npm audit job in security workflow for Dashboard dependencies
-- `make deny` and `make coverage` Makefile targets
+- `make deny`, `make coverage`, `make typos`, `make doc`, `make machete` Makefile targets
 - Team rules in CLAUDE.md (model assignments, verification protocol, lessons learned, architecture mindset)
+- `typos.toml`: Spell-check config for code and docs (crate-ci/typos)
+- `.cargo/audit.toml`: cargo-audit advisory ignore list (synced with deny.toml)
+- Typos CI job in ci.yml (runs on every PR, part of ci-pass gate)
+- Rustdoc warnings-as-errors check in Rust CI job (`RUSTDOCFLAGS="-D warnings"`)
+- cargo-machete unused dependency detection in Rust CI job (non-blocking warning)
+- Concurrency groups on deny.yml and coverage.yml (cancel superseded runs)
 
 ### Changed
 
-- All GitHub Actions pinned to full commit SHAs (supply-chain hardening, 13 actions across 10 workflows)
+- All GitHub Actions updated to latest versions and pinned to full commit SHAs (17 actions across 10 workflows)
+- `.golangci.yml` migrated to v2 format (version field, gosimple merged into staticcheck)
+- All workspace crates now have `license = "MIT"` and `publish = false`
 - Dependabot configured with Conventional Commit messages per ecosystem
 - PR template extended with CHANGELOG, breaking changes, performance, and secrets checklist
 - `make lint-all` now includes `cargo deny check`

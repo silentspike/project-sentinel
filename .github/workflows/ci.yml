@@ -69,6 +69,15 @@ jobs:
           done
 
   # ──────────────────────────────────────────────
+  # Typo detection (all files)
+  # ──────────────────────────────────────────────
+  typos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: crate-ci/typos@e0d770e210c9b97939ad1eaf0d9837a2cb28879a # v1.43.4
+
+  # ──────────────────────────────────────────────
   # Rust - only when crates/ or Cargo.* changed
   # ──────────────────────────────────────────────
   rust:
@@ -92,8 +101,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Rustdoc warnings
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --document-private-items
+
       - name: Tests
         run: cargo test --workspace
+
+      - name: Unused dependencies
+        run: |
+          cargo install cargo-machete --locked 2>/dev/null || true
+          cargo machete || echo "::warning::Unused dependencies found (non-blocking)"
 
   # ──────────────────────────────────────────────
   # Go - only when cmd/ changed
@@ -175,13 +194,14 @@ jobs:
   # ──────────────────────────────────────────────
   ci-pass:
     if: always()
-    needs: [lint, rust, go, dashboard, schemas]
+    needs: [lint, typos, rust, go, dashboard, schemas]
     runs-on: ubuntu-latest
     steps:
       - name: Evaluate results
         run: |
           results=(
             "${{ needs.lint.result }}"
+            "${{ needs.typos.result }}"
             "${{ needs.rust.result }}"
             "${{ needs.go.result }}"
             "${{ needs.dashboard.result }}"

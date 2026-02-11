@@ -13,6 +13,10 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
 
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 

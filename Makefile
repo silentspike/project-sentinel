@@ -1,5 +1,5 @@
 .PHONY: help lint lint-all test build build-rust build-go build-dashboard \
-       fmt check clean hooks ci deny coverage
+       fmt check clean hooks ci deny coverage typos doc machete
 
 # Default target
 help: ## Show this help
@@ -27,7 +27,9 @@ lint: check ## Alias for check
 lint-all: ## Full lint (like CI, slower)
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items 2>&1 | tail -5
 	cargo deny check 2>/dev/null || echo "(cargo-deny not installed, skipping)"
+	typos 2>/dev/null || echo "(typos not installed, skipping)"
 	cd cmd/cortex-gateway && go vet ./...
 	cd cmd/cortex-gateway && golangci-lint run
 	@echo "Full lint: OK"
@@ -106,6 +108,16 @@ security: ## Run security audits
 	cargo deny check advisories
 	cd cmd/cortex-gateway && govulncheck ./...
 	@echo "Security audit: OK"
+
+typos: ## Check for typos in code and docs
+	typos
+
+doc: ## Build docs with warnings as errors
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
+	@echo "Docs: OK"
+
+machete: ## Find unused Rust dependencies
+	cargo machete
 
 bench: ## Run benchmarks
 	cargo bench --workspace
