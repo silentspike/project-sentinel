@@ -28,7 +28,7 @@ func TestAC_22_01_AllPatternsDetected(t *testing.T) {
 		{"Ich bin ein LLM", "ich bin ein llm"},
 		{"Ich existiere nicht wirklich", "ich existiere nicht wirklich"},
 		{"Ich bin nicht real", "ich bin nicht real"},
-		{"Ich bin nur ein Algorithmus", "ich bin nur ein algorithmus"},
+		{"Ich bin nur ein Algorithmus", "ich bin nur ein algorithmus"}, //nolint:misspell // German word, intentional
 		{"Mein Kontextfenster ist begrenzt", "mein kontextfenster"},
 		{"Das Token-Limit ist erreicht", "token-limit"},
 	}

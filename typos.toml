@@ -4,12 +4,9 @@
 [default]
 locale = "en-us"
 
-[default.extend-identifiers]
-# Variable names that look like typos but are intentional
-ba = "ba"       # key_ba in redb relationship tests
-
 [default.extend-words]
 # Domain-specific words that are NOT typos
+ba = "ba"         # key_ba variable in redb relationship tests
 ecs = "ecs"       # Entity Component System
 ebpf = "ebpf"     # Extended Berkeley Packet Filter
 hono = "hono"     # Hono web framework

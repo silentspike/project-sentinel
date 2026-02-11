@@ -21,9 +21,6 @@ linters:
       min-complexity: 20
     gosec:
       severity: medium
-    misspell:
-      ignore-words:
-        - Algorithmus  # German word (intentional, fourth-wall detection pattern)
 
 issues:
   max-issues-per-linter: 50
