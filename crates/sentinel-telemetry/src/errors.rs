@@ -48,12 +48,18 @@ pub enum ErrorSeverity {
 ///     }
 /// }
 /// ```
-pub trait ClassifiedError {
+pub trait ClassifiedError: std::error::Error {
     /// Classify this error's severity.
     fn severity(&self) -> ErrorSeverity;
 
+    /// The subsystem that produced this error (e.g. "redb", "zenoh", "limbo").
+    fn subsystem(&self) -> &str;
+
     /// Whether this error can be retried.
-    fn is_retryable(&self) -> bool;
+    /// Default: true only for Transient errors.
+    fn is_retryable(&self) -> bool {
+        matches!(self.severity(), ErrorSeverity::Transient)
+    }
 }
 
 // ──────────────────────────────────────────────
@@ -90,13 +96,21 @@ mod tests {
     #[derive(Debug)]
     struct TestError(ErrorSeverity);
 
+    impl std::fmt::Display for TestError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "test error: {:?}", self.0)
+        }
+    }
+
+    impl std::error::Error for TestError {}
+
     impl ClassifiedError for TestError {
         fn severity(&self) -> ErrorSeverity {
             self.0
         }
 
-        fn is_retryable(&self) -> bool {
-            self.0 == ErrorSeverity::Transient
+        fn subsystem(&self) -> &str {
+            "test"
         }
     }
 
