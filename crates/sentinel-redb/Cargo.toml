@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 redb = { workspace = true }
 serde = { workspace = true }
+tracing = { workspace = true }
 anyhow = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
 
