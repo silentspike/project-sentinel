@@ -2,6 +2,35 @@
 //!
 //! No Prometheus dependency - just atomic counters and histograms.
 //! Designed for Dashboard/API export via MetricsSnapshot.
+//!
+//! # Naming Convention
+//!
+//! All metric names follow the pattern:
+//! ```text
+//! sentinel.{crate}.{operation}.{metric_type}
+//! ```
+//!
+//! Where `metric_type` is one of:
+//! - `count` - Number of occurrences (Counter)
+//! - `duration_us` - Duration in microseconds (Histogram)
+//! - `size_bytes` - Size in bytes (Histogram)
+//!
+//! Examples:
+//! ```text
+//! sentinel.redb.get_agent_state.count
+//! sentinel.redb.get_agent_state.duration_us
+//! sentinel.zenoh.publish.count
+//! sentinel.limbo.insert_message.duration_us
+//! ```
+//!
+//! Use [`metric_name`] to construct names consistently.
+//!
+//! # Lock-Free Guarantees
+//!
+//! [`Counter::increment`] and [`Histogram::observe`] are fully lock-free
+//! (atomic operations only). The [`RwLock`] in [`MetricsRegistry`] is only
+//! taken during metric registration (first access), never on the hot
+//! increment/observe path.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -220,6 +249,22 @@ impl MetricsRegistry {
     }
 }
 
+/// Build a metric name following the sentinel naming convention.
+///
+/// Format: `sentinel.{crate_name}.{operation}.{metric_type}`
+///
+/// # Examples
+/// ```
+/// use sentinel_telemetry::metrics::metric_name;
+/// assert_eq!(
+///     metric_name("redb", "get_agent_state", "duration_us"),
+///     "sentinel.redb.get_agent_state.duration_us"
+/// );
+/// ```
+pub fn metric_name(crate_name: &str, operation: &str, metric_type: &str) -> String {
+    format!("sentinel.{crate_name}.{operation}.{metric_type}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +336,22 @@ mod tests {
         assert_eq!(*snap.counters.get("ops").unwrap(), 42);
         assert!(snap.histograms.contains_key("latency"));
         assert_eq!(snap.histograms.get("latency").unwrap().count, 1);
+    }
+
+    #[test]
+    fn test_metric_name() {
+        assert_eq!(
+            metric_name("redb", "get_agent_state", "duration_us"),
+            "sentinel.redb.get_agent_state.duration_us"
+        );
+        assert_eq!(
+            metric_name("zenoh", "publish", "count"),
+            "sentinel.zenoh.publish.count"
+        );
+        assert_eq!(
+            metric_name("limbo", "insert_message", "duration_us"),
+            "sentinel.limbo.insert_message.duration_us"
+        );
     }
 
     #[test]

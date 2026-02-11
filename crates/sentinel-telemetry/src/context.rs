@@ -7,6 +7,26 @@ use sentinel_common::{AgentId, Tick};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+// ──────────────────────────────────────────────
+// Zenoh Telemetry Topics
+// ──────────────────────────────────────────────
+
+/// Zenoh topic for aggregated metrics snapshots.
+/// Publishing logic will be added with the Dashboard (Phase 6).
+pub const TELEMETRY_METRICS: &str = "sentinel/telemetry/metrics";
+
+/// Zenoh topic for health check results.
+/// Publishing logic will be added with the Dashboard (Phase 6).
+pub const TELEMETRY_HEALTH: &str = "sentinel/telemetry/health";
+
+/// Zenoh topic for trace context propagation.
+/// Publishing logic will be added with the Dashboard (Phase 6).
+pub const TELEMETRY_TRACES: &str = "sentinel/telemetry/traces";
+
+// ──────────────────────────────────────────────
+// TraceContext
+// ──────────────────────────────────────────────
+
 /// Correlation context propagated through Zenoh messages and spans.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TraceContext {
@@ -134,6 +154,13 @@ mod tests {
         assert!(ctx.origin_agent.is_none());
         assert!(ctx.origin_tick.is_none());
         assert!(!ctx.correlation_id.is_empty());
+    }
+
+    #[test]
+    fn test_telemetry_topics() {
+        assert_eq!(TELEMETRY_METRICS, "sentinel/telemetry/metrics");
+        assert_eq!(TELEMETRY_HEALTH, "sentinel/telemetry/health");
+        assert_eq!(TELEMETRY_TRACES, "sentinel/telemetry/traces");
     }
 
     #[test]
