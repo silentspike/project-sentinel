@@ -3,11 +3,17 @@ name = "sentinel-redb"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["telemetry"]
+telemetry = ["sentinel-telemetry/telemetry"]
+
 [dependencies]
 redb = { workspace = true }
 serde = { workspace = true }
+tracing = { workspace = true }
 anyhow = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
+sentinel-telemetry = { path = "../sentinel-telemetry" }
 
 [dev-dependencies]
 tempfile = "3"

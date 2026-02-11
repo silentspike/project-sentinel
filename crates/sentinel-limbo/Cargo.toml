@@ -3,15 +3,20 @@ name = "sentinel-limbo"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["telemetry"]
+telemetry = ["sentinel-telemetry/telemetry"]
+
 [dependencies]
 tokio = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
+sentinel-telemetry = { path = "../sentinel-telemetry" }
 # Fallback: rusqlite statt limbo (limbo v0.0.22 hat keinen Pragma-Setter)
 rusqlite = { version = "0.32", features = ["bundled"] }
-anyhow = "1"
-serde_json = "1"
+anyhow = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

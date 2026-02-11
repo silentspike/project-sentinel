@@ -6,11 +6,14 @@
 pub mod topics;
 
 use sentinel_common::{AgentId, RoomId, Tick};
-use tracing::info;
+use tracing::{info, instrument};
 use zenoh::handlers::FifoChannelHandler;
 use zenoh::pubsub::Subscriber;
 use zenoh::sample::Sample;
 use zenoh::Session;
+
+/// Histogram bucket boundaries for Zenoh operation latencies (microseconds).
+const LATENCY_BUCKETS: &[f64] = &[10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0];
 
 /// Type alias for the default Zenoh subscriber (FIFO handler).
 pub type BusSubscriber = Subscriber<FifoChannelHandler<Sample>>;
@@ -27,6 +30,7 @@ pub struct SentinelBus {
 impl SentinelBus {
     /// Create a new SentinelBus with default Zenoh config.
     /// SHM is prepared but not activated (needs runtime validation first).
+    #[instrument(name = "SentinelBus::new", level = "debug")]
     pub async fn new() -> anyhow::Result<Self> {
         let config = zenoh::Config::default();
         // TODO: SHM activation after runtime validation
@@ -39,27 +43,44 @@ impl SentinelBus {
     }
 
     /// Publish a message to a topic.
+    #[instrument(skip(self, payload), level = "trace", fields(topic = %topic))]
     pub async fn publish(&self, topic: &str, payload: &[u8]) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
         self.session
             .put(topic, payload)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to publish to {topic}: {e}"))?;
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.zenoh.publish.count").increment();
+            reg.histogram("sentinel.zenoh.publish.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
         Ok(())
     }
 
     /// Subscribe to a topic. Returns a Subscriber that yields samples
     /// via `recv_async().await`.
+    #[instrument(skip(self), level = "debug", fields(topic = %topic))]
     pub async fn subscribe(&self, topic: &str) -> anyhow::Result<BusSubscriber> {
         let subscriber = self
             .session
             .declare_subscriber(topic)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to subscribe to {topic}: {e}"))?;
+        #[cfg(feature = "telemetry")]
+        {
+            sentinel_telemetry::MetricsRegistry::global()
+                .counter("sentinel.zenoh.subscribe.count")
+                .increment();
+        }
         info!("SentinelBus: Subscribed to {topic}");
         Ok(subscriber)
     }
 
     /// Publish an agent action.
+    #[instrument(skip(self, payload), level = "trace", fields(agent_id = %agent_id))]
     pub async fn publish_action(
         &self,
         agent_id: AgentId,
@@ -70,6 +91,7 @@ impl SentinelBus {
     }
 
     /// Subscribe to an agent's perception channel.
+    #[instrument(skip(self), level = "debug", fields(agent_id = %agent_id))]
     pub async fn subscribe_perception(
         &self,
         agent_id: AgentId,
@@ -79,6 +101,7 @@ impl SentinelBus {
     }
 
     /// Publish a room event (audio, smell, or presence).
+    #[instrument(skip(self, payload), level = "trace", fields(room_id = %room_id, event_type = %event_type))]
     pub async fn publish_room_event(
         &self,
         room_id: RoomId,
@@ -91,6 +114,7 @@ impl SentinelBus {
 
     /// Publish a global simulation tick.
     /// Uses raw numeric tick value for compact topic paths (e.g. sentinel/physics/tick/42).
+    #[instrument(skip(self, payload), level = "trace", fields(tick = %tick))]
     pub async fn publish_tick(
         &self,
         tick: Tick,
@@ -101,6 +125,7 @@ impl SentinelBus {
     }
 
     /// Publish a chaos event.
+    #[instrument(skip(self, payload), level = "trace")]
     pub async fn publish_chaos_event(&self, payload: &[u8]) -> anyhow::Result<()> {
         self.publish(topics::CHAOS_EVENT, payload).await
     }
