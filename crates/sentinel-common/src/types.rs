@@ -62,7 +62,7 @@ impl fmt::Display for RoomId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 pub struct Tick(pub u64);
 
 impl fmt::Display for Tick {
@@ -71,7 +71,7 @@ impl fmt::Display for Tick {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 pub struct Timestamp(pub u64);
 
 impl fmt::Display for Timestamp {
