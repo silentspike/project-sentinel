@@ -1,0 +1,27 @@
+version: "2"
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosec
+    - gocyclo
+    - misspell
+    - prealloc
+  settings:
+    gocyclo:
+      min-complexity: 20
+    gosec:
+      severity: medium
+
+issues:
+  max-issues-per-linter: 50
+  max-same-issues: 5

@@ -1,0 +1,9 @@
+# cargo-audit configuration
+# Keep in sync with deny.toml [advisories].ignore
+
+[advisories]
+ignore = [
+    # rsa 0.9.x Marvin Attack: transitive via zenoh, no safe upgrade available
+    # Track: https://github.com/RustCrypto/RSA/issues/19
+    "RUSTSEC-2023-0071",
+]
