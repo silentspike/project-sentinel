@@ -8,6 +8,7 @@
 //! with tokio::task::spawn_blocking for async compatibility.
 
 use rusqlite::{params, Connection};
+use sentinel_common::{AgentId, Emotion, EventType, RoomId, Tick, Timestamp};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
@@ -115,26 +116,26 @@ impl ChatStore {
     /// Insert a chat message. Returns the rowid of the inserted row.
     pub async fn insert_message(
         &self,
-        room_id: &str,
-        agent_name: &str,
+        room_id: RoomId,
+        agent_id: AgentId,
         content: &str,
-        emotion: Option<&str>,
-        timestamp_ms: u64,
-        tick: u64,
+        emotion: Option<Emotion>,
+        timestamp: Timestamp,
+        tick: Tick,
     ) -> anyhow::Result<i64> {
         let conn = self.conn.clone();
-        let room_id = room_id.to_string();
-        let agent_name = agent_name.to_string();
+        let room_str = room_id.to_string();
+        let agent_str = agent_id.to_string();
         let content = content.to_string();
-        let emotion = emotion.map(|e| e.to_string());
-        let ts = timestamp_ms as i64;
-        let t = tick as i64;
+        let emotion_str = emotion.map(emotion_to_str);
+        let ts = timestamp.0 as i64;
+        let t = tick.0 as i64;
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
             let conn = conn.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
             conn.execute(
                 "INSERT INTO messages (room_id, agent_name, content, emotion, timestamp_ms, tick) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![room_id, agent_name, content, emotion, ts, t],
+                params![room_str, agent_str, content, emotion_str, ts, t],
             )?;
             Ok(conn.last_insert_rowid())
         })
@@ -144,18 +145,18 @@ impl ChatStore {
     /// Get messages for a room, ordered by timestamp descending.
     pub async fn get_room_messages(
         &self,
-        room_id: &str,
+        room_id: RoomId,
         limit: u32,
     ) -> anyhow::Result<Vec<MessageRow>> {
         let conn = self.conn.clone();
-        let room_id = room_id.to_string();
+        let room_str = room_id.to_string();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageRow>> {
             let conn = conn.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
             let mut stmt = conn.prepare(
                 "SELECT id, room_id, agent_name, content, emotion, timestamp_ms, tick FROM messages WHERE room_id = ?1 ORDER BY timestamp_ms DESC LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![room_id, limit], |row| {
+            let rows = stmt.query_map(params![room_str, limit], |row| {
                 Ok(MessageRow {
                     id: row.get(0)?,
                     room_id: row.get(1)?,
@@ -181,22 +182,22 @@ impl ChatStore {
     /// Returns the rowid of the inserted row.
     pub async fn insert_meeting(
         &self,
-        room_id: &str,
+        room_id: RoomId,
         title: &str,
         participants: &[String],
-        started_at: u64,
+        started_at: Timestamp,
     ) -> anyhow::Result<i64> {
         let conn = self.conn.clone();
-        let room_id = room_id.to_string();
+        let room_str = room_id.to_string();
         let title = title.to_string();
         let participants_json = serde_json::to_string(participants)?;
-        let started = started_at as i64;
+        let started = started_at.0 as i64;
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
             let conn = conn.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
             conn.execute(
                 "INSERT INTO meetings (room_id, title, participants, started_at) VALUES (?1, ?2, ?3, ?4)",
-                params![room_id, title, participants_json, started],
+                params![room_str, title, participants_json, started],
             )?;
             Ok(conn.last_insert_rowid())
         })
@@ -207,11 +208,11 @@ impl ChatStore {
     pub async fn end_meeting(
         &self,
         meeting_id: i64,
-        ended_at: u64,
+        ended_at: Timestamp,
         summary: &str,
     ) -> anyhow::Result<()> {
         let conn = self.conn.clone();
-        let ended = ended_at as i64;
+        let ended = ended_at.0 as i64;
         let summary = summary.to_string();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -230,25 +231,25 @@ impl ChatStore {
     /// Insert an observation data point. Returns the rowid of the inserted row.
     pub async fn insert_observation(
         &self,
-        agent_name: &str,
+        agent_id: AgentId,
         model: &str,
         metric: &str,
         value: f64,
         context: Option<&str>,
-        timestamp_ms: u64,
+        timestamp: Timestamp,
     ) -> anyhow::Result<i64> {
         let conn = self.conn.clone();
-        let agent_name = agent_name.to_string();
+        let agent_str = agent_id.to_string();
         let model = model.to_string();
         let metric = metric.to_string();
         let context = context.map(|c| c.to_string());
-        let ts = timestamp_ms as i64;
+        let ts = timestamp.0 as i64;
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
             let conn = conn.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
             conn.execute(
                 "INSERT INTO observations (agent_name, model, metric, value, context, timestamp_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![agent_name, model, metric, value, context, ts],
+                params![agent_str, model, metric, value, context, ts],
             )?;
             Ok(conn.last_insert_rowid())
         })
@@ -260,24 +261,24 @@ impl ChatStore {
     /// Insert a chaos event. Returns the rowid of the inserted row.
     pub async fn insert_chaos_event(
         &self,
-        event_type: &str,
-        target_room: Option<&str>,
-        target_agent: Option<&str>,
+        event_type: EventType,
+        target_room: Option<RoomId>,
+        target_agent: Option<AgentId>,
         description: &str,
-        timestamp_ms: u64,
+        timestamp: Timestamp,
     ) -> anyhow::Result<i64> {
         let conn = self.conn.clone();
-        let event_type = event_type.to_string();
-        let target_room = target_room.map(|r| r.to_string());
-        let target_agent = target_agent.map(|a| a.to_string());
+        let event_str = event_type_to_str(event_type);
+        let room_str = target_room.map(|r| r.to_string());
+        let agent_str = target_agent.map(|a| a.to_string());
         let description = description.to_string();
-        let ts = timestamp_ms as i64;
+        let ts = timestamp.0 as i64;
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
             let conn = conn.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
             conn.execute(
                 "INSERT INTO chaos_events (event_type, target_room, target_agent, description, timestamp_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![event_type, target_room, target_agent, description, ts],
+                params![event_str, room_str, agent_str, description, ts],
             )?;
             Ok(conn.last_insert_rowid())
         })
@@ -305,6 +306,42 @@ pub struct MessageRow {
     pub emotion: Option<String>,
     pub timestamp_ms: u64,
     pub tick: u64,
+}
+
+// ──────────────────────────────────────────────
+// Helpers
+// ──────────────────────────────────────────────
+
+/// Convert Emotion enum to lowercase string for DB storage.
+fn emotion_to_str(e: Emotion) -> String {
+    match e {
+        Emotion::Neutral => "neutral",
+        Emotion::Happy => "happy",
+        Emotion::Frustrated => "frustrated",
+        Emotion::Stressed => "stressed",
+        Emotion::Relaxed => "relaxed",
+        Emotion::Excited => "excited",
+        Emotion::Bored => "bored",
+        Emotion::Anxious => "anxious",
+        Emotion::Focused => "focused",
+        Emotion::Tired => "tired",
+    }
+    .to_string()
+}
+
+/// Convert EventType enum to snake_case string for DB storage.
+fn event_type_to_str(e: EventType) -> String {
+    match e {
+        EventType::PhoneRing => "phone_ring",
+        EventType::PrinterBroken => "printer_broken",
+        EventType::PackageDelivery => "package_delivery",
+        EventType::SBahnDelay => "sbahn_delay",
+        EventType::FireAlarmDrill => "fire_alarm_drill",
+        EventType::CakeInKitchen => "cake_in_kitchen",
+        EventType::AirConBroken => "air_con_broken",
+        EventType::InternetOutage => "internet_outage",
+    }
+    .to_string()
 }
 
 // ──────────────────────────────────────────────
@@ -350,15 +387,25 @@ mod tests {
         let path = dir.path().join("test.db");
         let store = ChatStore::open(path.to_str().unwrap()).await.unwrap();
 
+        let room = RoomId::new(1).unwrap();
+        let agent = AgentId::new(1).unwrap();
+
         let id = store
-            .insert_message("kueche", "thomas", "Guten Morgen!", Some("happy"), 1000, 42)
+            .insert_message(
+                room,
+                agent,
+                "Guten Morgen!",
+                Some(Emotion::Happy),
+                Timestamp(1000),
+                Tick(42),
+            )
             .await
             .unwrap();
         assert!(id > 0);
 
-        let messages = store.get_room_messages("kueche", 10).await.unwrap();
+        let messages = store.get_room_messages(room, 10).await.unwrap();
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].agent_name, "thomas");
+        assert_eq!(messages[0].agent_name, "AGENT-01");
         assert_eq!(messages[0].content, "Guten Morgen!");
         assert_eq!(messages[0].emotion, Some("happy".to_string()));
         assert_eq!(messages[0].timestamp_ms, 1000);
@@ -371,15 +418,16 @@ mod tests {
         let path = dir.path().join("test.db");
         let store = ChatStore::open(path.to_str().unwrap()).await.unwrap();
 
-        let participants = vec!["thomas".to_string(), "lisa".to_string()];
+        let room = RoomId::new(5).unwrap();
+        let participants = vec!["AGENT-01".to_string(), "AGENT-02".to_string()];
         let id = store
-            .insert_meeting("meetingraum-01", "Sprint Review", &participants, 9000)
+            .insert_meeting(room, "Sprint Review", &participants, Timestamp(9000))
             .await
             .unwrap();
         assert!(id > 0);
 
         store
-            .end_meeting(id, 10800, "Sprint goals achieved")
+            .end_meeting(id, Timestamp(10800), "Sprint goals achieved")
             .await
             .unwrap();
 
@@ -403,8 +451,10 @@ mod tests {
         let store = ChatStore::open(path.to_str().unwrap()).await.unwrap();
 
         // Insert something to trigger WAL file creation
+        let room = RoomId::new(1).unwrap();
+        let agent = AgentId::new(1).unwrap();
         store
-            .insert_message("lobby", "system", "test", None, 1, 1)
+            .insert_message(room, agent, "test", None, Timestamp(1), Tick(1))
             .await
             .unwrap();
 
