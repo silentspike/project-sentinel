@@ -57,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `redb` upgraded from 2.x to 3.1.0 (new `ReadableDatabase` trait, explicit type annotations for `AccessGuard`)
 - CLAUDE.md restructured per `/claudemd` best practices (382→229 lines, domain knowledge moved to rules/)
 
 - All GitHub Actions updated to latest versions and pinned to full commit SHAs (17 actions across 10 workflows)

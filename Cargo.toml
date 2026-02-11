@@ -17,7 +17,7 @@ members = [
 [workspace.dependencies]
 bevy_ecs = "0.15"
 zenoh = "1.1"
-redb = "2.4"
+redb = "3.1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 flatbuffers = "25.12"
