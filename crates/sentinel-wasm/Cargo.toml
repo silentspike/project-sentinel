@@ -1,0 +1,9 @@
+[package]
+name = "sentinel-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+sentinel-common = { path = "../sentinel-common" }
