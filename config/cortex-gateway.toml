@@ -1,0 +1,33 @@
+# Cortex Gateway Configuration
+# Environment variables override these values
+
+[server]
+proxy_port = 8080
+control_port = 8081
+read_timeout_seconds = 30
+write_timeout_seconds = 60
+
+[providers.claude]
+type = "claude"
+base_url = "https://api.anthropic.com"
+model = "claude-sonnet-4-5-20250929"
+max_tokens = 4096
+priority = 1
+# api_key: Set via ANTHROPIC_API_KEY env var
+
+[providers.ollama]
+type = "ollama"
+base_url = "http://localhost:11434"
+model = "qwen3:7b"
+max_tokens = 4096
+priority = 2
+
+[pipeline]
+temperature = 0.7
+enable_fourth_wall_detection = true
+enable_perception_injection = true
+enable_action_extraction = true
+
+[metrics]
+enabled = true
+path = "/metrics"

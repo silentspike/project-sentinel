@@ -7,10 +7,12 @@
 //! Systems rufen sentinel-bio und sentinel-physics fuer echte Berechnungen auf.
 
 pub mod components;
+pub mod perception;
 pub mod systems;
 pub mod world;
 
 pub use components::*;
+pub use perception::{format_injection, generate_perception, PerceptionTexts, SmellEvent};
 pub use systems::SimulationPhase;
 pub use world::{create_simulation_world, spawn_agent, SimulationTime};
 

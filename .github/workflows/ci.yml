@@ -49,6 +49,7 @@ jobs:
 
   # ──────────────────────────────────────────────
   # Always runs - fast checks (<30s)
+  # Merged: lint + typos (saves runner startup)
   # ──────────────────────────────────────────────
   lint:
     runs-on: ubuntu-latest
@@ -71,14 +72,8 @@ jobs:
             python3 -c "import tomllib; tomllib.load(open('$f','rb'))" || exit 1
           done
 
-  # ──────────────────────────────────────────────
-  # Typo detection (all files)
-  # ──────────────────────────────────────────────
-  typos:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: crate-ci/typos@78bc6fb2c0d734235d57a2d6b9de923cc325ebdd # v1.43.4
+      - name: Typo detection
+        uses: crate-ci/typos@78bc6fb2c0d734235d57a2d6b9de923cc325ebdd # v1.43.4
 
   # ──────────────────────────────────────────────
   # Rust - only when crates/ or Cargo.* changed
@@ -113,9 +108,10 @@ jobs:
         run: cargo test --workspace
 
       - name: Unused dependencies
-        run: |
-          cargo install cargo-machete --locked 2>/dev/null || true
-          cargo machete || echo "::warning::Unused dependencies found (non-blocking)"
+        uses: taiki-e/install-action@d4422f254e595ee762a758628fe4f16ce050fa2e # v2.67.28
+        with:
+          tool: cargo-machete
+      - run: cargo machete || echo "::warning::Unused dependencies found (non-blocking)"
 
   # ──────────────────────────────────────────────
   # Go - only when cmd/ changed
@@ -132,13 +128,17 @@ jobs:
           go-version-file: cmd/cortex-gateway/go.mod
           cache-dependency-path: cmd/cortex-gateway/go.sum
 
+      - name: Build
+        working-directory: cmd/cortex-gateway
+        run: go build ./...
+
       - name: Vet
         working-directory: cmd/cortex-gateway
         run: go vet ./...
 
       - name: Tests
         working-directory: cmd/cortex-gateway
-        run: go test ./...
+        run: go test -race -count=1 ./...
 
       - name: Lint
         uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
@@ -197,14 +197,13 @@ jobs:
   # ──────────────────────────────────────────────
   ci-pass:
     if: always()
-    needs: [lint, typos, rust, go, dashboard, schemas]
+    needs: [lint, rust, go, dashboard, schemas]
     runs-on: ubuntu-latest
     steps:
       - name: Evaluate results
         run: |
           results=(
             "${{ needs.lint.result }}"
-            "${{ needs.typos.result }}"
             "${{ needs.rust.result }}"
             "${{ needs.go.result }}"
             "${{ needs.dashboard.result }}"
