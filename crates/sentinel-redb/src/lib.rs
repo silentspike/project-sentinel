@@ -1,12 +1,13 @@
 //! redb ACID KV-store for hot agent state and relationships.
 
 use redb::{Database, ReadableTable, TableDefinition};
+use sentinel_common::{AgentId, RoomId};
 
-// Table definitions
-const AGENT_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("agent_state");
-const RELATIONSHIPS: TableDefinition<&str, &[u8]> = TableDefinition::new("relationships");
-const PERSONALITY: TableDefinition<&str, &[u8]> = TableDefinition::new("personality");
-const ROOM_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("room_state");
+// Table definitions - u16 keys for agent/room IDs, u32 for relationship pairs
+const AGENT_STATE: TableDefinition<u16, &[u8]> = TableDefinition::new("agent_state");
+const RELATIONSHIPS: TableDefinition<u32, &[u8]> = TableDefinition::new("relationships");
+const PERSONALITY: TableDefinition<u16, &[u8]> = TableDefinition::new("personality");
+const ROOM_STATE: TableDefinition<u16, &[u8]> = TableDefinition::new("room_state");
 
 pub struct StateStore {
     db: Database,
@@ -34,60 +35,62 @@ impl StateStore {
 
     // === AGENT STATE ===
 
-    /// Get agent state by name. Returns None if not found.
-    pub fn get_agent_state(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    /// Get agent state by ID. Returns None if not found.
+    pub fn get_agent_state(&self, agent_id: AgentId) -> anyhow::Result<Option<Vec<u8>>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(AGENT_STATE)?;
-        Ok(table.get(name)?.map(|v| v.value().to_vec()))
+        Ok(table.get(agent_id.0)?.map(|v| v.value().to_vec()))
     }
 
     /// Set agent state. Creates or overwrites.
-    pub fn set_agent_state(&self, name: &str, state: &[u8]) -> anyhow::Result<()> {
+    pub fn set_agent_state(&self, agent_id: AgentId, state: &[u8]) -> anyhow::Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(AGENT_STATE)?;
-            table.insert(name, state)?;
+            table.insert(agent_id.0, state)?;
         }
         write_txn.commit()?;
         Ok(())
     }
 
     /// Delete agent state. Returns true if existed.
-    pub fn delete_agent_state(&self, name: &str) -> anyhow::Result<bool> {
+    pub fn delete_agent_state(&self, agent_id: AgentId) -> anyhow::Result<bool> {
         let write_txn = self.db.begin_write()?;
         let existed;
         {
             let mut table = write_txn.open_table(AGENT_STATE)?;
-            existed = table.remove(name)?.is_some();
+            existed = table.remove(agent_id.0)?.is_some();
         }
         write_txn.commit()?;
         Ok(existed)
     }
 
-    /// List all agent names.
-    pub fn list_agents(&self) -> anyhow::Result<Vec<String>> {
+    /// List all stored agent IDs.
+    pub fn list_agents(&self) -> anyhow::Result<Vec<AgentId>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(AGENT_STATE)?;
-        let mut names = Vec::new();
+        let mut ids = Vec::new();
         let iter = table.iter()?;
         for entry in iter {
             let (key, _) = entry?;
-            names.push(key.value().to_string());
+            ids.push(AgentId(key.value()));
         }
-        Ok(names)
+        Ok(ids)
     }
 
     // === RELATIONSHIPS ===
 
-    /// Get relationship between two agents. Key format: "agent_a:agent_b" (alphabetical).
-    pub fn get_relationship(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    /// Get relationship between two agents. Key is automatically canonicalized.
+    pub fn get_relationship(&self, a: AgentId, b: AgentId) -> anyhow::Result<Option<Vec<u8>>> {
+        let key = relationship_key(a, b);
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(RELATIONSHIPS)?;
         Ok(table.get(key)?.map(|v| v.value().to_vec()))
     }
 
-    /// Set relationship data.
-    pub fn set_relationship(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+    /// Set relationship data. Key is automatically canonicalized.
+    pub fn set_relationship(&self, a: AgentId, b: AgentId, data: &[u8]) -> anyhow::Result<()> {
+        let key = relationship_key(a, b);
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(RELATIONSHIPS)?;
@@ -99,19 +102,19 @@ impl StateStore {
 
     // === PERSONALITY ===
 
-    /// Get personality profile by agent name.
-    pub fn get_personality(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    /// Get personality profile by agent ID.
+    pub fn get_personality(&self, agent_id: AgentId) -> anyhow::Result<Option<Vec<u8>>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(PERSONALITY)?;
-        Ok(table.get(name)?.map(|v| v.value().to_vec()))
+        Ok(table.get(agent_id.0)?.map(|v| v.value().to_vec()))
     }
 
     /// Set personality profile.
-    pub fn set_personality(&self, name: &str, data: &[u8]) -> anyhow::Result<()> {
+    pub fn set_personality(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(PERSONALITY)?;
-            table.insert(name, data)?;
+            table.insert(agent_id.0, data)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -120,31 +123,30 @@ impl StateStore {
     // === ROOM STATE ===
 
     /// Get room state by room ID.
-    pub fn get_room_state(&self, room_id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    pub fn get_room_state(&self, room_id: RoomId) -> anyhow::Result<Option<Vec<u8>>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ROOM_STATE)?;
-        Ok(table.get(room_id)?.map(|v| v.value().to_vec()))
+        Ok(table.get(room_id.0)?.map(|v| v.value().to_vec()))
     }
 
     /// Set room state.
-    pub fn set_room_state(&self, room_id: &str, data: &[u8]) -> anyhow::Result<()> {
+    pub fn set_room_state(&self, room_id: RoomId, data: &[u8]) -> anyhow::Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(ROOM_STATE)?;
-            table.insert(room_id, data)?;
+            table.insert(room_id.0, data)?;
         }
         write_txn.commit()?;
         Ok(())
     }
 }
 
-/// Helper: Build a canonical relationship key (alphabetical order).
-pub fn relationship_key(agent_a: &str, agent_b: &str) -> String {
-    if agent_a <= agent_b {
-        format!("{agent_a}:{agent_b}")
-    } else {
-        format!("{agent_b}:{agent_a}")
-    }
+/// Build a canonical relationship key from two AgentIds.
+/// Packs sorted IDs into a u32: `min_id << 16 | max_id`.
+pub fn relationship_key(a: AgentId, b: AgentId) -> u32 {
+    let min = a.0.min(b.0);
+    let max = a.0.max(b.0);
+    (min as u32) << 16 | max as u32
 }
 
 #[cfg(test)]
@@ -158,77 +160,85 @@ mod tests {
         (store, dir)
     }
 
+    fn agent(id: u16) -> AgentId {
+        AgentId::new(id).unwrap()
+    }
+
+    fn room(id: u16) -> RoomId {
+        RoomId::new(id).unwrap()
+    }
+
     #[test]
     fn test_agent_state_crud() {
         let (store, _dir) = temp_store();
 
         // Initially empty
-        assert!(store.get_agent_state("thomas").unwrap().is_none());
+        assert!(store.get_agent_state(agent(1)).unwrap().is_none());
 
         // Write
-        store.set_agent_state("thomas", b"state-data").unwrap();
+        store.set_agent_state(agent(1), b"state-data").unwrap();
 
         // Read
-        let data = store.get_agent_state("thomas").unwrap().unwrap();
+        let data = store.get_agent_state(agent(1)).unwrap().unwrap();
         assert_eq!(data, b"state-data");
 
         // Overwrite
-        store.set_agent_state("thomas", b"new-state").unwrap();
-        let data = store.get_agent_state("thomas").unwrap().unwrap();
+        store.set_agent_state(agent(1), b"new-state").unwrap();
+        let data = store.get_agent_state(agent(1)).unwrap().unwrap();
         assert_eq!(data, b"new-state");
 
         // Delete
-        assert!(store.delete_agent_state("thomas").unwrap());
-        assert!(store.get_agent_state("thomas").unwrap().is_none());
-        assert!(!store.delete_agent_state("thomas").unwrap()); // already deleted
+        assert!(store.delete_agent_state(agent(1)).unwrap());
+        assert!(store.get_agent_state(agent(1)).unwrap().is_none());
+        assert!(!store.delete_agent_state(agent(1)).unwrap()); // already deleted
     }
 
     #[test]
     fn test_list_agents() {
         let (store, _dir) = temp_store();
-        store.set_agent_state("andreas", b"a").unwrap();
-        store.set_agent_state("lisa", b"b").unwrap();
-        store.set_agent_state("thomas", b"c").unwrap();
+        store.set_agent_state(agent(3), b"a").unwrap();
+        store.set_agent_state(agent(7), b"b").unwrap();
+        store.set_agent_state(agent(1), b"c").unwrap();
 
-        let mut names = store.list_agents().unwrap();
-        names.sort();
-        assert_eq!(names, vec!["andreas", "lisa", "thomas"]);
+        let mut ids = store.list_agents().unwrap();
+        ids.sort_by_key(|id| id.0);
+        assert_eq!(ids, vec![AgentId(1), AgentId(3), AgentId(7)]);
     }
 
     #[test]
     fn test_concurrent_reads() {
         let (store, _dir) = temp_store();
-        store.set_agent_state("test", b"data").unwrap();
+        store.set_agent_state(agent(1), b"data").unwrap();
 
         // Multiple concurrent reads should work (MVCC)
-        let r1 = store.get_agent_state("test").unwrap();
-        let r2 = store.get_agent_state("test").unwrap();
+        let r1 = store.get_agent_state(agent(1)).unwrap();
+        let r2 = store.get_agent_state(agent(1)).unwrap();
         assert_eq!(r1, r2);
     }
 
     #[test]
     fn test_relationship_key_ordering() {
-        assert_eq!(relationship_key("lisa", "thomas"), "lisa:thomas");
-        assert_eq!(relationship_key("thomas", "lisa"), "lisa:thomas");
         // Both orderings produce same key
         assert_eq!(
-            relationship_key("a", "b"),
-            relationship_key("b", "a")
+            relationship_key(agent(3), agent(7)),
+            relationship_key(agent(7), agent(3))
         );
+        // Verify the packed format: min << 16 | max
+        assert_eq!(relationship_key(agent(3), agent(7)), (3u32 << 16) | 7);
     }
 
     #[test]
     fn test_room_state() {
         let (store, _dir) = temp_store();
-        store.set_room_state("kueche", b"temp:22.5").unwrap();
-        let data = store.get_room_state("kueche").unwrap().unwrap();
+        store.set_room_state(room(1), b"temp:22.5").unwrap();
+        let data = store.get_room_state(room(1)).unwrap().unwrap();
         assert_eq!(data, b"temp:22.5");
     }
 
     #[test]
     fn test_db_file_size() {
         let (store, dir) = temp_store();
-        store.set_agent_state("test", b"small").unwrap();
+        store.set_agent_state(agent(1), b"small").unwrap();
         let path = dir.path().join("test.redb");
         let size = std::fs::metadata(&path).unwrap().len();
         // redb 2.x mit 4 Tabellen benoetigt ~1.5MB CoW B-Tree Overhead
