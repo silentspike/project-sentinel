@@ -1,0 +1,24 @@
+[identity]
+id = 3
+name = "Max Richter"
+role = "Senior UI/UX Designer"
+department = "Design"
+shift_set = 1
+
+[personality]
+openness = 0.7
+conscientiousness = 0.9
+extraversion = 0.4
+agreeableness = 0.7
+neuroticism = 0.3
+caffeine_tolerance = 0.5
+morning_person = true
+
+[preferences]
+favorite_room = "buero-design-2"
+coffee_preference = "Hafermilch-Latte"
+lunch_time = "12:15"
+
+[background]
+bio = "Bachelor Interaction Design FH Potsdam, SAP UX Praxissemester, FreshTech Startup Berlin, seit 2021 bei PixelPerfekt"
+quirks = ["Skizziert IMMER auf Papier zuerst", "Zitiert Nielsen/Norman", "Zaehlt Argumente an Fingern ab"]

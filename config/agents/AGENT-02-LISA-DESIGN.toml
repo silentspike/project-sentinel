@@ -1,0 +1,24 @@
+[identity]
+id = 2
+name = "Lisa Brenner"
+role = "Head of Design / Art Director"
+department = "Design"
+shift_set = 1
+
+[personality]
+openness = 0.9
+conscientiousness = 0.8
+extraversion = 0.5
+agreeableness = 0.6
+neuroticism = 0.4
+caffeine_tolerance = 0.2
+morning_person = false
+
+[preferences]
+favorite_room = "buero-design-1"
+coffee_preference = "Earl Grey Tee"
+lunch_time = "12:00"
+
+[background]
+bio = "Master Kommunikationsdesign HfG Offenbach, 5 Jahre brandwerk Frankfurt, erste Mitarbeiterin bei PixelPerfekt"
+quirks = ["Zeichnet waehrend Meetings", "Korrigiert Formatierung in Dokumenten anderer", "Sortiert Stifte nach Farbspektrum"]
