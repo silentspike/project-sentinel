@@ -2428,9 +2428,11 @@ dependencies = [
 name = "sentinel-zenoh"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "sentinel-common",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "zenoh",
 ]
 
