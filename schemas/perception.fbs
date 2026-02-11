@@ -1,0 +1,15 @@
+namespace sentinel;
+
+table Perception {
+    agent_name: string (required);
+    circadian_text: string;
+    body_text: string;
+    environment_text: string;
+    acoustic_text: string;
+    presence_text: string;
+    impulse_text: string;
+    timestamp_ms: uint64;
+    tick: uint64;
+}
+
+root_type Perception;
