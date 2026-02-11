@@ -1,0 +1,40 @@
+name: Security Audit
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Montag 06:00 UTC
+  push:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/go.mod'
+      - '**/go.sum'
+      - '**/package.json'
+      - '**/bun.lockb'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  rust-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  go-vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cmd/cortex-gateway/go.mod
+      - name: govulncheck
+        working-directory: cmd/cortex-gateway
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...

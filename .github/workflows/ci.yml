@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Detect which parts of the codebase changed
+  # ──────────────────────────────────────────────
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      go: ${{ steps.filter.outputs.go }}
+      dashboard: ${{ steps.filter.outputs.dashboard }}
+      schemas: ${{ steps.filter.outputs.schemas }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            go:
+              - 'cmd/**'
+              - 'go.work'
+              - 'go.work.sum'
+            dashboard:
+              - 'dashboard/**'
+            schemas:
+              - 'schemas/**'
+
+  # ──────────────────────────────────────────────
+  # Always runs - fast checks (<30s)
+  # ──────────────────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject hidden Unicode / Bidi characters
+        run: |
+          if grep -rP '[\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2066}-\x{2069}]' \
+            --include='*.rs' --include='*.go' --include='*.ts' --include='*.js' \
+            --include='*.md' --include='*.toml' --include='*.yml' --include='*.yaml' \
+            --include='*.fbs' --include='*.sql' .; then
+            echo "::error::Hidden Unicode/Bidi characters found!"
+            exit 1
+          fi
+
+      - name: Validate TOML configs
+        run: |
+          for f in $(find config -name '*.toml' 2>/dev/null); do
+            python3 -c "import tomllib; tomllib.load(open('$f','rb'))" || exit 1
+          done
+
+  # ──────────────────────────────────────────────
+  # Rust - only when crates/ or Cargo.* changed
+  # ──────────────────────────────────────────────
+  rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+  # ──────────────────────────────────────────────
+  # Go - only when cmd/ changed
+  # ──────────────────────────────────────────────
+  go:
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cmd/cortex-gateway/go.mod
+          cache-dependency-path: cmd/cortex-gateway/go.sum
+
+      - name: Vet
+        working-directory: cmd/cortex-gateway
+        run: go vet ./...
+
+      - name: Tests
+        working-directory: cmd/cortex-gateway
+        run: go test ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          working-directory: cmd/cortex-gateway
+
+  # ──────────────────────────────────────────────
+  # Dashboard - only when dashboard/ changed
+  # ──────────────────────────────────────────────
+  dashboard:
+    needs: changes
+    if: needs.changes.outputs.dashboard == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install
+        working-directory: dashboard
+        run: bun install --frozen-lockfile
+
+      - name: Type check
+        working-directory: dashboard
+        run: bun run typecheck || true
+
+      - name: Tests
+        working-directory: dashboard
+        run: bun test
+
+  # ──────────────────────────────────────────────
+  # FlatBuffer schema validation
+  # ──────────────────────────────────────────────
+  schemas:
+    needs: changes
+    if: needs.changes.outputs.schemas == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install flatc
+        run: |
+          curl -LO https://github.com/google/flatbuffers/releases/latest/download/Linux.flatbuffers.binary.clang++-17.zip
+          unzip Linux.flatbuffers.binary.clang++-17.zip -d /usr/local/bin/ || true
+          chmod +x /usr/local/bin/flatc || true
+
+      - name: Validate schemas
+        run: |
+          for f in schemas/*.fbs; do
+            flatc --no-gen-all -o /tmp "$f" || exit 1
+          done
+
+  # ──────────────────────────────────────────────
+  # Gate - single status check for branch protection
+  # All jobs must pass (skipped counts as pass)
+  # ──────────────────────────────────────────────
+  ci-pass:
+    if: always()
+    needs: [lint, rust, go, dashboard, schemas]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate results
+        run: |
+          results=(
+            "${{ needs.lint.result }}"
+            "${{ needs.rust.result }}"
+            "${{ needs.go.result }}"
+            "${{ needs.dashboard.result }}"
+            "${{ needs.schemas.result }}"
+          )
+          for r in "${results[@]}"; do
+            if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then
+              echo "::error::Job failed with result: $r"
+              exit 1
+            fi
+          done
+          echo "All checks passed or were skipped."

@@ -1,0 +1,20 @@
+# Project Sentinel - Code Ownership
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default
+* @obtFusi
+
+# Rust ECS + Hot Path
+/crates/ @obtFusi
+
+# Go Cortex Gateway
+/cmd/ @obtFusi
+
+# Dashboard
+/dashboard/ @obtFusi
+
+# CI/CD
+/.github/ @obtFusi
+
+# Config (Agent-Definitionen, Simulation)
+/config/ @obtFusi

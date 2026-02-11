@@ -1,0 +1,66 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Go
+cmd/cortex-gateway/cortex-gateway
+
+# Bun / Node
+node_modules/
+
+# Build Artifacts
+*.so
+*.dylib
+*.dll
+*.wasm
+*.o
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-journal
+
+# Secrets
+.env
+.env.*
+*.key
+*.pem
+*.p12
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+tmp/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# BitNet Build Artifacts
+bitnet/bitnet-src/
+bitnet/models/*.bin
+bitnet/bitnet-inference
+
+# eBPF
+*.bpf.o
+
+# Local Config
+.cargo-remote.toml
+
+# Sentinel Runtime
+*.db-wal
+*.db-shm
+/ram/
