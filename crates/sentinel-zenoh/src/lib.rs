@@ -90,6 +90,7 @@ impl SentinelBus {
     }
 
     /// Publish a global simulation tick.
+    /// Uses raw numeric tick value for compact topic paths (e.g. sentinel/physics/tick/42).
     pub async fn publish_tick(
         &self,
         tick: Tick,
