@@ -170,7 +170,12 @@ mod tests {
     #[test]
     fn record_request_tracks_metrics() {
         let mut monitor = NetworkMonitor::new();
-        monitor.record_request("api.anthropic.com:443", Duration::from_millis(150), 1024, 4096);
+        monitor.record_request(
+            "api.anthropic.com:443",
+            Duration::from_millis(150),
+            1024,
+            4096,
+        );
         let m = monitor.get_metrics("api.anthropic.com:443").unwrap();
         assert_eq!(m.request_count, 1);
         assert_eq!(m.bytes_sent, 1024);

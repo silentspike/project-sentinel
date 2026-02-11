@@ -50,13 +50,9 @@ impl MetricsExporter {
     /// Produces `sentinel_io_ops_total` counter and `sentinel_io_bytes_total` counter.
     pub fn export_io_profile(profiler: &IoProfiler) -> String {
         let mut output = String::new();
-        output.push_str(
-            "# HELP sentinel_io_ops_total Total I/O operations per cgroup\n",
-        );
+        output.push_str("# HELP sentinel_io_ops_total Total I/O operations per cgroup\n");
         output.push_str("# TYPE sentinel_io_ops_total counter\n");
-        output.push_str(
-            "# HELP sentinel_io_bytes_total Total I/O bytes per cgroup\n",
-        );
+        output.push_str("# HELP sentinel_io_bytes_total Total I/O bytes per cgroup\n");
         output.push_str("# TYPE sentinel_io_bytes_total counter\n");
 
         for (cgroup_id, metrics) in profiler.all_metrics() {
@@ -87,17 +83,11 @@ impl MetricsExporter {
     /// Produces latency, throughput, and error metrics per destination.
     pub fn export_network(monitor: &NetworkMonitor) -> String {
         let mut output = String::new();
-        output.push_str(
-            "# HELP sentinel_llm_request_duration_seconds LLM API request latency\n",
-        );
+        output.push_str("# HELP sentinel_llm_request_duration_seconds LLM API request latency\n");
         output.push_str("# TYPE sentinel_llm_request_duration_seconds summary\n");
-        output.push_str(
-            "# HELP sentinel_llm_requests_total Total LLM API requests\n",
-        );
+        output.push_str("# HELP sentinel_llm_requests_total Total LLM API requests\n");
         output.push_str("# TYPE sentinel_llm_requests_total counter\n");
-        output.push_str(
-            "# HELP sentinel_llm_errors_total Total LLM API errors\n",
-        );
+        output.push_str("# HELP sentinel_llm_errors_total Total LLM API errors\n");
         output.push_str("# TYPE sentinel_llm_errors_total counter\n");
 
         for (dest, metrics) in monitor.all_metrics() {
@@ -181,7 +171,12 @@ mod tests {
     #[test]
     fn export_network_format() {
         let mut monitor = NetworkMonitor::new();
-        monitor.record_request("api.anthropic.com:443", Duration::from_millis(150), 1024, 4096);
+        monitor.record_request(
+            "api.anthropic.com:443",
+            Duration::from_millis(150),
+            1024,
+            4096,
+        );
         let output = MetricsExporter::export_network(&monitor);
         assert!(output.contains("# HELP sentinel_llm_request_duration_seconds"));
         assert!(output.contains("# TYPE sentinel_llm_request_duration_seconds summary"));

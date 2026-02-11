@@ -64,11 +64,7 @@ pub fn psi_to_stress_factor(psi: &PsiMetrics) -> f32 {
 /// Computes a combined stress factor from CPU, memory, and I/O pressure.
 ///
 /// Weights: CPU 0.5, Memory 0.3, I/O 0.2
-pub fn combined_stress_factor(
-    cpu: &PsiMetrics,
-    memory: &PsiMetrics,
-    io: &PsiMetrics,
-) -> f32 {
+pub fn combined_stress_factor(cpu: &PsiMetrics, memory: &PsiMetrics, io: &PsiMetrics) -> f32 {
     let cpu_stress = psi_to_stress_factor(cpu);
     let mem_stress = psi_to_stress_factor(memory);
     let io_stress = psi_to_stress_factor(io);
@@ -128,7 +124,11 @@ mod tests {
             ..Default::default()
         };
         // 0.8*0.5 + 0.4*0.3 + 0.2*0.2 = 0.4 + 0.12 + 0.04 = 0.56
-        assert_relative_eq!(combined_stress_factor(&cpu, &memory, &io), 0.56, epsilon = 0.01);
+        assert_relative_eq!(
+            combined_stress_factor(&cpu, &memory, &io),
+            0.56,
+            epsilon = 0.01
+        );
     }
 
     #[test]

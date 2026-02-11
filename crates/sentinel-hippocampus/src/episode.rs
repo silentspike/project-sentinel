@@ -90,10 +90,7 @@ mod tests {
             tags: vec!["routine".into()],
         };
         let score = nmda_score(&episode);
-        assert!(
-            score < 0.01,
-            "Routine event should have low score: {score}"
-        );
+        assert!(score < 0.01, "Routine event should have low score: {score}");
     }
 
     #[test]
