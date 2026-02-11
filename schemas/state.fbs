@@ -1,0 +1,34 @@
+namespace sentinel;
+
+table BioStateUpdate {
+    agent_name: string (required);
+    hunger: float;
+    energy: float;
+    caffeine_mg: float;
+    bladder: float;
+    stress: float;
+    social_need: float;
+    comfort: float;
+    timestamp_ms: uint64;
+    tick: uint64;
+}
+
+table PositionUpdate {
+    agent_name: string (required);
+    room_id: string (required);
+    in_transit: bool;
+    transit_target: string;
+    timestamp_ms: uint64;
+    tick: uint64;
+}
+
+table MoodUpdate {
+    agent_name: string (required);
+    valence: float;
+    arousal: float;
+    dominant_emotion: string;
+    timestamp_ms: uint64;
+    tick: uint64;
+}
+
+root_type BioStateUpdate;

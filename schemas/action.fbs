@@ -1,0 +1,21 @@
+namespace sentinel;
+
+enum ActionType : byte {
+    Chat = 0,
+    Move = 1,
+    ToolUse = 2,
+    Emote = 3,
+    PhoneCall = 4,
+}
+
+table AgentAction {
+    agent_name: string (required);
+    action_type: ActionType;
+    target_room: string;
+    target_agent: string;
+    content: string;
+    timestamp_ms: uint64;
+    tick: uint64;
+}
+
+root_type AgentAction;

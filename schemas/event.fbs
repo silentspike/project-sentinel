@@ -1,0 +1,24 @@
+namespace sentinel;
+
+enum EventType : byte {
+    PhoneRing = 0,
+    PrinterBroken = 1,
+    PackageDelivery = 2,
+    SBahnDelay = 3,
+    FireAlarmDrill = 4,
+    CakeInKitchen = 5,
+    AirConBroken = 6,
+    InternetOutage = 7,
+}
+
+table ChaosEvent {
+    event_type: EventType;
+    target_room: string;
+    target_agent: string;
+    description: string (required);
+    duration_minutes: uint32;
+    timestamp_ms: uint64;
+    tick: uint64;
+}
+
+root_type ChaosEvent;
