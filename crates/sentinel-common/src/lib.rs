@@ -7,6 +7,7 @@
 
 pub mod agent_config;
 pub mod components;
+pub mod psi;
 pub mod room;
 pub mod types;
 
