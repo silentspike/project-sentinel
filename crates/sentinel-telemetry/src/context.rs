@@ -23,6 +23,10 @@ pub const TELEMETRY_HEALTH: &str = "sentinel/telemetry/health";
 /// Publishing logic will be added with the Dashboard (Phase 6).
 pub const TELEMETRY_TRACES: &str = "sentinel/telemetry/traces";
 
+/// Zenoh topic for classified error events.
+/// Publishing logic will be added with the Dashboard (Phase 6).
+pub const TELEMETRY_ERRORS: &str = "sentinel/telemetry/errors";
+
 // ──────────────────────────────────────────────
 // TraceContext
 // ──────────────────────────────────────────────
@@ -161,6 +165,7 @@ mod tests {
         assert_eq!(TELEMETRY_METRICS, "sentinel/telemetry/metrics");
         assert_eq!(TELEMETRY_HEALTH, "sentinel/telemetry/health");
         assert_eq!(TELEMETRY_TRACES, "sentinel/telemetry/traces");
+        assert_eq!(TELEMETRY_ERRORS, "sentinel/telemetry/errors");
     }
 
     #[test]
