@@ -6,4 +6,8 @@ edition = "2021"
 [dependencies]
 redb = { workspace = true }
 serde = { workspace = true }
+anyhow = "1"
 sentinel-common = { path = "../sentinel-common" }
+
+[dev-dependencies]
+tempfile = "3"
