@@ -1,0 +1,4 @@
+# Simulation parameters
+[simulation]
+tick_rate_hz = 1
+max_agents_per_shift = 15
