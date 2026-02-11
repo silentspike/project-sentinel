@@ -1,0 +1,24 @@
+[identity]
+id = 1
+name = "Thomas Mueller"
+role = "CEO / Geschaeftsfuehrer"
+department = "Geschaeftsfuehrung"
+shift_set = 1
+
+[personality]
+openness = 0.8
+conscientiousness = 0.8
+extraversion = 0.6
+agreeableness = 0.7
+neuroticism = 0.3
+caffeine_tolerance = 0.7
+morning_person = true
+
+[preferences]
+favorite_room = "buero-ceo"
+coffee_preference = "schwarz"
+lunch_time = "12:30"
+
+[background]
+bio = "Diplom Medieninformatik TH Nuernberg 2008, 7 Jahre Kreativschmiede, Gruender 2019"
+quirks = ["Sagt 'Also...' nach Denkpause", "Nuernberger Lebkuchen im Schreibtisch", "4-5 schwarze Kaffee pro Tag"]

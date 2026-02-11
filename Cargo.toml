@@ -12,6 +12,7 @@ members = [
     "crates/sentinel-wasm",
     "crates/sentinel-common",
     "crates/sentinel-telemetry",
+    "crates/sentinel-runtime",
 ]
 
 [workspace.dependencies]

@@ -5,6 +5,7 @@
 //! - Internal (Zenoh Pub/Sub): FlatBuffers (zero-copy)
 //! - External (Dashboard, Logs): MessagePack
 
+pub mod agent_config;
 pub mod components;
 pub mod room;
 pub mod types;
