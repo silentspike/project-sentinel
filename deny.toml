@@ -8,11 +8,11 @@ all-features = true
 # Advisory Database (RustSec)
 # ──────────────────────────────────────────────
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-unsound = "deny"
+# vulnerability + notice: removed in cargo-deny v2 (vulnerabilities always emit errors)
+# unmaintained/unsound: scope of crates to check (all|workspace|transitive|none)
+unmaintained = "workspace"
+unsound = "all"
 yanked = "deny"
-notice = "warn"
 
 # ──────────────────────────────────────────────
 # License Compliance
