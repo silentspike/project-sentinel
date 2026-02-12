@@ -73,6 +73,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sprint 4: 5 agent definition TOML files migrated from Markdown (AGENT-01 through AGENT-05: Thomas CEO, Lisa/Max/Sophie Design, Andreas Dev)
 - Sprint 4: `sentinel-dashboard` backend: Hono-based API (health, agents, rooms, agent state, room chat, metrics endpoints) with WebSocket live events (5 tests)
 - Sprint 4: `sentinel-dashboard` frontend: Dark mode UI with 4 views (Agents with bio-bars, Floorplan with room grouping, Chat with room filter, Metrics), vanilla JS ES modules, textContent-only (no innerHTML)
+- Sprint 5: `sentinel-common::psi` module: PsiMetrics struct and `parse_psi()` moved from sentinel-sandbox for cross-crate reuse
+- Sprint 5: `sentinel-inference` crate: BitNet b1.58 subprocess manager (BitNetConfig, BitNetClient), Multi-LoRA adapter management (scan, swap, cache), Speculative Decoding pipeline (draft+verify), KV-Cache prefix sharing with FIFO eviction (12 tests)
+- Sprint 5: `sentinel-hippocampus` crate: Multi-tier memory system with Episode + NMDA scoring, NarrativeMemory (running summary), FactRetriever (JIT RAG via redb), KvCacheTier (hot/cold tiering) (35 tests)
+- Sprint 5: `sentinel-ebpf` crate extended: Agent-health probe (write-syscall tracking, 30s stall detection), I/O profiling probe (IOPS per cgroup), Network probe (TCP latency for LLM calls), PSI stress reader, Prometheus text exporter
+- Sprint 5: `sentinel-hippocampus::sleep` module: NMDA-based sleep cycle with 6-phase state machine (Awake→Collecting→Scoring→Selecting→Consolidating→WakingUp), episode selection by NMDA score with threshold filtering (5 tests)
+- Sprint 5: `sentinel-judge` Go package: Drift detection (personality consistency), Fatigue detection (repetition patterns), Quality scoring (1-5 scale), Model-swap trigger (thread-safe, consecutive bad scores) (18 tests)
+- Sprint 5: `bitnet/build.sh` and `bitnet/README.md` for BitNet b1.58 build instructions
 
 ### Changed
 

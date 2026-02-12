@@ -10,8 +10,10 @@ pub mod cache_tier;
 pub mod episode;
 pub mod facts;
 pub mod narrative;
+pub mod sleep;
 
 pub use cache_tier::{CacheError, InMemoryKvCache, KvCacheTier};
 pub use episode::{nmda_score, Episode};
 pub use facts::{FactRetriever, FactStore, InMemoryFactStore, FACT_TRIGGERS};
 pub use narrative::NarrativeMemory;
+pub use sleep::{SleepCycle, SleepPhase};
