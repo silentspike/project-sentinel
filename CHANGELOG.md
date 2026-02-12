@@ -80,6 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sprint 5: `sentinel-hippocampus::sleep` module: NMDA-based sleep cycle with 6-phase state machine (Awake→Collecting→Scoring→Selecting→Consolidating→WakingUp), episode selection by NMDA score with threshold filtering (5 tests)
 - Sprint 5: `sentinel-judge` Go package: Drift detection (personality consistency), Fatigue detection (repetition patterns), Quality scoring (1-5 scale), Model-swap trigger (thread-safe, consecutive bad scores) (18 tests)
 - Sprint 5: `bitnet/build.sh` and `bitnet/README.md` for BitNet b1.58 build instructions
+- Sprint 6: `observatory` Go package: MARBLE multi-model benchmark with 6 metrics (InfoPropagation, GroupPolarization, CommunicationScore, PersonalityConsistency, ResponseCreativity, EmotionalRange), judge integration, in-memory observation store, Markdown + JSON report generator (42 tests)
+- Sprint 6: `config/observatory.toml`: Multi-model observatory configuration (3 shifts: Claude, Llama, Qwen; 4 scenarios; feature flag via SENTINEL_OBSERVATORY)
 
 ### Changed
 
