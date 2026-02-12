@@ -4,7 +4,7 @@ import "regexp"
 
 // ExtractedAction represents a parsed agent intention from an LLM response.
 type ExtractedAction struct {
-	Type    string `json:"type"`              // "chat", "move", "emote", "tool_use"
+	Type    string `json:"type"` // "chat", "move", "emote", "tool_use"
 	Content string `json:"content"`
 	Target  string `json:"target,omitempty"`
 	Emotion string `json:"emotion,omitempty"`

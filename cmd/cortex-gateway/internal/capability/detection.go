@@ -7,10 +7,10 @@ type Capability string
 
 const (
 	CapStreaming    Capability = "streaming"
-	CapToolUse     Capability = "tool_use"
-	CapVision      Capability = "vision"
+	CapToolUse      Capability = "tool_use"
+	CapVision       Capability = "vision"
 	CapSystemPrompt Capability = "system_prompt"
-	CapJSONMode    Capability = "json_mode"
+	CapJSONMode     Capability = "json_mode"
 	CapFunctionCall Capability = "function_calling"
 )
 
@@ -26,18 +26,18 @@ func New() *ProviderCapabilities {
 		capabilities: map[string]map[Capability]bool{
 			"claude": {
 				CapStreaming:    true,
-				CapToolUse:     true,
-				CapVision:      true,
+				CapToolUse:      true,
+				CapVision:       true,
 				CapSystemPrompt: true,
-				CapJSONMode:    true,
+				CapJSONMode:     true,
 				CapFunctionCall: true,
 			},
 			"ollama": {
 				CapStreaming:    true,
-				CapToolUse:     false,
-				CapVision:      false,
+				CapToolUse:      false,
+				CapVision:       false,
 				CapSystemPrompt: true,
-				CapJSONMode:    false,
+				CapJSONMode:     false,
 				CapFunctionCall: false,
 			},
 		},
