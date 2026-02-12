@@ -75,11 +75,11 @@ func TestAC_13_03_ProviderInterface(t *testing.T) {
 // AC-13-04: Claude provider sends correct Anthropic API format
 func TestAC_13_04_ClaudeProviderRequest(t *testing.T) {
 	var (
-		receivedAPIKey    string
-		receivedVersion   string
-		receivedPath      string
-		receivedMethod    string
-		receivedBody      []byte
+		receivedAPIKey  string
+		receivedVersion string
+		receivedPath    string
+		receivedMethod  string
+		receivedBody    []byte
 	)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
