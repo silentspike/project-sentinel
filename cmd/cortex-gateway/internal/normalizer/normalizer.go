@@ -39,7 +39,7 @@ type ollamaAPIResponse struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
 	} `json:"message"`
-	Done         bool `json:"done"`
+	Done          bool  `json:"done"`
 	TotalDuration int64 `json:"total_duration"`
 	EvalCount     int   `json:"eval_count"`
 }

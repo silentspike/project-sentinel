@@ -38,12 +38,12 @@ type Provider interface {
 // ProviderConfig holds configuration for a provider.
 type ProviderConfig struct {
 	Name      string `toml:"name"`
-	Type      string `toml:"type"`      // "claude" or "ollama"
+	Type      string `toml:"type"` // "claude" or "ollama"
 	BaseURL   string `toml:"base_url"`
-	APIKey    string `toml:"api_key"`   // From env var, not config file
+	APIKey    string `toml:"api_key"` // From env var, not config file
 	Model     string `toml:"model"`
 	MaxTokens int    `toml:"max_tokens"`
-	Priority  int    `toml:"priority"`  // Lower = higher priority
+	Priority  int    `toml:"priority"` // Lower = higher priority
 }
 
 // Registry manages available LLM providers.

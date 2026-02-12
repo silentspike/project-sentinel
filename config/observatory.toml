@@ -1,0 +1,31 @@
+# MARBLE Observatory Configuration
+# Multi-Agent Runtime Behavioral Lab Environment
+# Compares LLM provider quality across identical scenarios
+
+[observatory]
+enabled = false  # Feature Flag: SENTINEL_OBSERVATORY=true zum Aktivieren
+
+# Schicht 1: Claude (Premium)
+[observatory.shift_1]
+model = "claude-sonnet"
+provider = "claude"
+agents = 15  # AGENT-01 bis AGENT-15
+
+# Schicht 2: Llama (Open Source)
+[observatory.shift_2]
+model = "llama-3.1-70b"
+provider = "ollama"
+agents = 15  # AGENT-16 bis AGENT-30
+
+# Schicht 3: Qwen (Alternative)
+[observatory.shift_3]
+model = "qwen2.5-72b"
+provider = "ollama"
+agents = 15  # AGENT-31 bis AGENT-45
+
+# Identische Szenarien pro Schicht
+[observatory.scenarios]
+daily_routine = true
+crisis_response = true
+creative_task = true
+conflict_resolution = true
