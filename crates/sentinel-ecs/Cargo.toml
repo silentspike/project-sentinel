@@ -8,11 +8,16 @@ publish = false
 [dependencies]
 bevy_ecs = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
 sentinel-bio = { path = "../sentinel-bio" }
 sentinel-physics = { path = "../sentinel-physics" }
+sentinel-redb = { path = "../sentinel-redb" }
+sentinel-limbo = { path = "../sentinel-limbo", default-features = false }
 
 [dev-dependencies]
 sentinel-common = { path = "../sentinel-common" }
+tempfile = "3"

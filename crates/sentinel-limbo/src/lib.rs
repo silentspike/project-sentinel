@@ -1,11 +1,16 @@
-//! Async SQLite for cold storage: chat archive, observations.
+//! Async SQLite for cold storage: chat archive, observations, event store.
 //!
 //! Cold storage tier for Project Sentinel using rusqlite (SQLite binding).
-//! Stores chat messages, meeting logs, observation data, and chaos events.
+//! Stores chat messages, meeting logs, observation data, chaos events,
+//! and the append-only domain event store with outbox pattern.
 //!
 //! Note: Uses rusqlite as fallback for limbo (v0.0.22) which lacks pragma setter
 //! support in its Rust binding. Same tables, same pragmas, sync API wrapped
 //! with tokio::task::spawn_blocking for async compatibility.
+
+pub mod event_store;
+
+pub use event_store::{EventStore, OutboxEntry};
 
 use rusqlite::{params, Connection};
 use sentinel_common::{AgentId, Emotion, EventType, RoomId, Tick, Timestamp};
@@ -80,6 +85,17 @@ pub struct ChatStore {
     conn: Arc<Mutex<Connection>>,
 }
 
+/// Input row for batch message inserts.
+#[derive(Debug, Clone)]
+pub struct NewMessage {
+    pub room_id: RoomId,
+    pub agent_id: AgentId,
+    pub content: String,
+    pub emotion: Option<Emotion>,
+    pub timestamp: Timestamp,
+    pub tick: Tick,
+}
+
 impl ChatStore {
     /// Open or create the chat store at the given path.
     /// Runs performance pragmas and creates all tables.
@@ -151,6 +167,57 @@ impl ChatStore {
             let reg = sentinel_telemetry::MetricsRegistry::global();
             reg.counter("sentinel.limbo.insert.count").increment();
             reg.histogram("sentinel.limbo.insert.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
+        result
+    }
+
+    /// Insert many chat messages in one SQLite transaction.
+    ///
+    /// Returns number of inserted rows.
+    #[instrument(skip(self, messages), level = "debug", fields(batch_size = messages.len()))]
+    pub async fn insert_messages_batch(&self, messages: &[NewMessage]) -> anyhow::Result<usize> {
+        if messages.is_empty() {
+            return Ok(0);
+        }
+
+        let start = std::time::Instant::now();
+        let conn = self.conn.clone();
+        let rows: Vec<(String, String, String, Option<String>, i64, i64)> = messages
+            .iter()
+            .map(|m| {
+                (
+                    m.room_id.to_string(),
+                    m.agent_id.to_string(),
+                    m.content.clone(),
+                    m.emotion.map(emotion_to_str),
+                    m.timestamp.0 as i64,
+                    m.tick.0 as i64,
+                )
+            })
+            .collect();
+
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let mut conn = conn.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+            let tx = conn.transaction()?;
+            let mut stmt = tx.prepare(
+                "INSERT INTO messages (room_id, agent_name, content, emotion, timestamp_ms, tick) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+
+            for (room_id, agent_name, content, emotion, ts, tick) in &rows {
+                stmt.execute(params![room_id, agent_name, content, emotion, ts, tick])?;
+            }
+            drop(stmt);
+            tx.commit()?;
+            Ok(rows.len())
+        })
+        .await?;
+
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.limbo.insert_batch.count").increment();
+            reg.histogram("sentinel.limbo.insert_batch.duration_us", LATENCY_BUCKETS)
                 .observe(start.elapsed().as_micros() as f64);
         }
         result
@@ -459,6 +526,41 @@ mod tests {
         assert_eq!(messages[0].emotion, Some("happy".to_string()));
         assert_eq!(messages[0].timestamp, Timestamp(1000));
         assert_eq!(messages[0].tick, Tick(42));
+    }
+
+    #[tokio::test]
+    async fn test_message_batch_insert_and_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let store = ChatStore::open(path.to_str().unwrap()).await.unwrap();
+
+        let room = RoomId::new(1).unwrap();
+        let msgs = vec![
+            NewMessage {
+                room_id: room,
+                agent_id: AgentId::new(1).unwrap(),
+                content: "eins".to_string(),
+                emotion: Some(Emotion::Neutral),
+                timestamp: Timestamp(1),
+                tick: Tick(1),
+            },
+            NewMessage {
+                room_id: room,
+                agent_id: AgentId::new(2).unwrap(),
+                content: "zwei".to_string(),
+                emotion: Some(Emotion::Happy),
+                timestamp: Timestamp(2),
+                tick: Tick(2),
+            },
+        ];
+
+        let inserted = store.insert_messages_batch(&msgs).await.unwrap();
+        assert_eq!(inserted, 2);
+
+        let rows = store.get_room_messages(room, 10).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].content, "zwei");
+        assert_eq!(rows[1].content, "eins");
     }
 
     #[tokio::test]

@@ -2742,6 +2742,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml",
+ "uuid",
 ]
 
 [[package]]
@@ -2765,10 +2766,15 @@ dependencies = [
  "bevy_ecs",
  "sentinel-bio",
  "sentinel-common",
+ "sentinel-limbo",
  "sentinel-physics",
+ "sentinel-redb",
  "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2805,6 +2811,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

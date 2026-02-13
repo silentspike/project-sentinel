@@ -19,6 +19,7 @@ sentinel-telemetry = { path = "../sentinel-telemetry" }
 rusqlite = { version = "0.38", features = ["bundled"] }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
