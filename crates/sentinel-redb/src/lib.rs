@@ -79,6 +79,35 @@ impl StateStore {
         Ok(())
     }
 
+    /// Batch set for many agent states in a single write transaction.
+    ///
+    /// This is the preferred hot-path API for per-tick persistence because it
+    /// amortizes commit overhead across many entities.
+    #[instrument(skip(self, entries), level = "trace", fields(batch_size = entries.len()))]
+    pub fn set_agent_states_batch(&self, entries: &[(AgentId, Vec<u8>)]) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let start = std::time::Instant::now();
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(AGENT_STATE)?;
+            for (agent_id, state) in entries {
+                table.insert(agent_id.0, state.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.redb.write_batch.count").increment();
+            reg.histogram("sentinel.redb.write_batch.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
+        Ok(())
+    }
+
     /// Delete agent state. Returns true if existed.
     #[instrument(skip(self), level = "trace", fields(agent_id = %agent_id))]
     pub fn delete_agent_state(&self, agent_id: AgentId) -> anyhow::Result<bool> {
@@ -238,6 +267,32 @@ impl StateStore {
         }
         Ok(())
     }
+
+    /// Batch set for room states in a single write transaction.
+    #[instrument(skip(self, entries), level = "trace", fields(batch_size = entries.len()))]
+    pub fn set_room_states_batch(&self, entries: &[(RoomId, Vec<u8>)]) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let start = std::time::Instant::now();
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(ROOM_STATE)?;
+            for (room_id, data) in entries {
+                table.insert(room_id.0, data.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.redb.write_batch.count").increment();
+            reg.histogram("sentinel.redb.write_batch.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+        }
+        Ok(())
+    }
 }
 
 /// Build a canonical relationship key from two AgentIds.
@@ -332,6 +387,21 @@ mod tests {
         store.set_room_state(room(1), b"temp:22.5").unwrap();
         let data = store.get_room_state(room(1)).unwrap().unwrap();
         assert_eq!(data, b"temp:22.5");
+    }
+
+    #[test]
+    fn test_agent_state_batch_write() {
+        let (store, _dir) = temp_store();
+        let batch = vec![
+            (agent(1), b"a".to_vec()),
+            (agent(2), b"bb".to_vec()),
+            (agent(3), b"ccc".to_vec()),
+        ];
+        store.set_agent_states_batch(&batch).unwrap();
+
+        assert_eq!(store.get_agent_state(agent(1)).unwrap().unwrap(), b"a");
+        assert_eq!(store.get_agent_state(agent(2)).unwrap().unwrap(), b"bb");
+        assert_eq!(store.get_agent_state(agent(3)).unwrap().unwrap(), b"ccc");
     }
 
     #[test]
