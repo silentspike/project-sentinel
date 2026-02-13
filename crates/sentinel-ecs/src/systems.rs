@@ -1,20 +1,27 @@
 //! ECS Systems fuer Agent-Simulation.
 //!
 //! Definiert 9 Systems in strikter Ausfuehrungsreihenfolge:
-//! 1. input_system - Empfaengt Agent-Aktionen (via Zenoh) [Phase 3]
+//! 1. input_system - Empfaengt Agent-Aktionen via Channel
 //! 2. bio_system - Aktualisiert biologische Zustaende (sentinel-bio)
 //! 3. physics_system - Berechnet Raum-Physik (sentinel-physics)
-//! 4. transit_system - Verarbeitet Raumwechsel (sentinel-physics)
-//! 5. chaos_system - Generiert Zufallsereignisse (sentinel-physics)
+//! 4. transit_system - Verarbeitet Raumwechsel + Transit-Events
+//! 5. chaos_system - Generiert Zufallsereignisse + Chaos-Events
 //! 6. mood_system - Berechnet Stimmung aus Bio+Kontext
 //! 7. perception_system - Generiert Wahrnehmungstext fuer LLM-Prompt
-//! 8. output_system - Sendet Wahrnehmung via Zenoh [Phase 3]
-//! 9. persist_system - Persistiert Zustand [Phase 3]
+//! 8. output_system - Sendet Wahrnehmung via Channel
+//! 9. persist_system - Persistiert Events (Limbo) + State-Snapshots (redb)
 
 use super::components::*;
-use super::world::SimulationTime;
+use super::world::{
+    ActionReceiver, EventBuffer, LimboEventStore, PersistTelemetry, RedbStateStore,
+};
+use super::world::{PerceptionSender, SimulationTime};
 use bevy_ecs::prelude::*;
-use sentinel_common::Emotion;
+use sentinel_common::{
+    ActionType, DomainEvent, DomainEventPayload, Emotion, Perception, Timestamp,
+};
+use std::time::Instant;
+use tracing::warn;
 
 /// Ausfuehrungsreihenfolge der Simulation-Systems
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -30,12 +37,76 @@ pub enum SimulationPhase {
     Persist,
 }
 
-/// 1. Empfaengt Agent-Aktionen (via Zenoh) - Phase 3 Integration
-pub fn input_system() {
-    // Wird in Phase 3 (LLM Bridge) mit Zenoh verbunden:
-    // - Subscribed auf sentinel/actions/{agent_id}
-    // - Deserialisiert AgentAction
-    // - Aktualisiert WorkContext, Position (Move-Requests)
+/// 1. Empfaengt Agent-Aktionen via Channel (extern: Zenoh-Subscriber fuettert den Channel).
+///
+/// Verarbeitet alle pending Actions in einem Tick:
+/// - Move → Position.transit_target + in_transit setzen
+/// - Chat/ToolUse → WorkContext aktualisieren
+/// - Erzeugt DomainEvent (AgentActionReceived) pro Aktion
+pub fn input_system(
+    receiver: Option<Res<ActionReceiver>>,
+    mut query: Query<(&AgentIdentity, &mut Position, &mut WorkContext)>,
+    mut event_buffer: ResMut<EventBuffer>,
+    time: Res<SimulationTime>,
+) {
+    let Some(receiver) = receiver else { return };
+    let Ok(rx) = receiver.0.lock() else { return };
+
+    while let Ok(action) = rx.try_recv() {
+        // Agent im ECS finden
+        let mut found = false;
+        for (identity, mut position, mut work_ctx) in &mut query {
+            if identity.agent_id != action.agent_id {
+                continue;
+            }
+            found = true;
+
+            match action.action_type {
+                ActionType::Move => {
+                    if let Some(target_room) = &action.target_room {
+                        position.in_transit = true;
+                        position.transit_target = Some(format!("ROOM-{}", target_room.0));
+                        // Default Transit-Dauer: 3000ms (wird spaeter aus rooms.toml berechnet)
+                        position.transit_remaining_ms = 3000;
+                    }
+                }
+                ActionType::Chat => {
+                    if let Some(content) = &action.content {
+                        work_ctx.current_task = Some(content.clone());
+                    }
+                }
+                ActionType::ToolUse => {
+                    if let Some(content) = &action.content {
+                        work_ctx.current_task = Some(content.clone());
+                    }
+                }
+                _ => {}
+            }
+
+            break;
+        }
+
+        if !found {
+            warn!(agent_id = %action.agent_id, "input_system: Agent nicht gefunden");
+            continue;
+        }
+
+        // DomainEvent erzeugen
+        let payload = DomainEventPayload::AgentActionReceived {
+            agent_id: action.agent_id,
+            action_type: format!("{:?}", action.action_type),
+            target_room: action.target_room.map(|r| format!("ROOM-{}", r.0)),
+            content: action.content.clone(),
+        };
+        let event = DomainEvent::new(
+            payload.event_type_str(),
+            &action.agent_id.to_string(),
+            &payload.to_json(),
+            &uuid::Uuid::new_v4().to_string(),
+            time.tick.0,
+        );
+        event_buffer.events.push(event);
+    }
 }
 
 /// 2. Aktualisiert biologische Zustaende via sentinel-bio Differenzialgleichungen
@@ -96,15 +167,36 @@ pub fn physics_system(query: Query<(&Position, Option<&WorkContext>)>) {
 }
 
 /// 4. Verarbeitet Raumwechsel (Transit-Timer runterzaehlen)
-pub fn transit_system(mut query: Query<&mut Position>, time: Res<SimulationTime>) {
+///
+/// Erzeugt TransitCompleted DomainEvents bei abgeschlossenem Transit.
+pub fn transit_system(
+    mut query: Query<(&AgentIdentity, &mut Position)>,
+    time: Res<SimulationTime>,
+    mut event_buffer: ResMut<EventBuffer>,
+) {
     let delta_ms = (time.delta_seconds * 1000.0) as u32;
-    for mut pos in &mut query {
+    for (identity, mut pos) in &mut query {
         if pos.in_transit {
             pos.transit_remaining_ms = pos.transit_remaining_ms.saturating_sub(delta_ms);
             if pos.transit_remaining_ms == 0 {
                 // Transit abgeschlossen: Agent kommt im Zielraum an
-                if let Some(target) = pos.transit_target.take() {
-                    pos.room_id = target;
+                let target_room = pos.transit_target.take();
+                if let Some(target) = target_room {
+                    pos.room_id = target.clone();
+
+                    // DomainEvent: TransitCompleted
+                    let payload = DomainEventPayload::TransitCompleted {
+                        agent_id: identity.agent_id,
+                        room_id: target,
+                    };
+                    let event = DomainEvent::new(
+                        payload.event_type_str(),
+                        &identity.agent_id.to_string(),
+                        &payload.to_json(),
+                        &uuid::Uuid::new_v4().to_string(),
+                        time.tick.0,
+                    );
+                    event_buffer.events.push(event);
                 }
                 pos.in_transit = false;
             }
@@ -114,9 +206,9 @@ pub fn transit_system(mut query: Query<&mut Position>, time: Res<SimulationTime>
 
 /// 5. Generiert Zufallsereignisse (Poisson-verteilt)
 ///
-/// Nutzt Tick-basierte Pseudo-Zufallszahlen. Echte RNG-Resource
-/// wird in Phase 3 injiziert.
-pub fn chaos_system(time: Res<SimulationTime>) {
+/// Nutzt Tick-basierte Pseudo-Zufallszahlen. Erzeugt DomainEvents
+/// fuer getriggerte Chaos-Events.
+pub fn chaos_system(time: Res<SimulationTime>, mut event_buffer: ResMut<EventBuffer>) {
     // Pseudo-RNG basierend auf Tick (einfacher xorshift-Hash)
     let tick = time.tick.0;
     let pseudo_rng = |seed: u64| -> f32 {
@@ -127,24 +219,74 @@ pub fn chaos_system(time: Res<SimulationTime>) {
         (x % 10000) as f32 / 10000.0
     };
 
-    // Alle Chaos-Event-Typen pruefen
-    let event_types = [
-        sentinel_physics::ChaosEventType::PhoneRing,
-        sentinel_physics::ChaosEventType::PrinterBroken,
-        sentinel_physics::ChaosEventType::PackageDelivery,
-        sentinel_physics::ChaosEventType::SBahnDelay,
-        sentinel_physics::ChaosEventType::FireAlarmDrill,
-        sentinel_physics::ChaosEventType::CakeInKitchen,
-        sentinel_physics::ChaosEventType::AirConBroken,
-        sentinel_physics::ChaosEventType::InternetOutage,
+    // Chaos-Event-Typen mit zugehoerigen sentinel_common::EventType Mappings
+    let event_types: [(
+        sentinel_physics::ChaosEventType,
+        sentinel_common::EventType,
+        &str,
+    ); 8] = [
+        (
+            sentinel_physics::ChaosEventType::PhoneRing,
+            sentinel_common::EventType::PhoneRing,
+            "Telefon klingelt",
+        ),
+        (
+            sentinel_physics::ChaosEventType::PrinterBroken,
+            sentinel_common::EventType::PrinterBroken,
+            "Drucker defekt",
+        ),
+        (
+            sentinel_physics::ChaosEventType::PackageDelivery,
+            sentinel_common::EventType::PackageDelivery,
+            "Paketlieferung",
+        ),
+        (
+            sentinel_physics::ChaosEventType::SBahnDelay,
+            sentinel_common::EventType::SBahnDelay,
+            "S-Bahn Verspaetung",
+        ),
+        (
+            sentinel_physics::ChaosEventType::FireAlarmDrill,
+            sentinel_common::EventType::FireAlarmDrill,
+            "Feueralarm-Uebung",
+        ),
+        (
+            sentinel_physics::ChaosEventType::CakeInKitchen,
+            sentinel_common::EventType::CakeInKitchen,
+            "Kuchen in der Kueche",
+        ),
+        (
+            sentinel_physics::ChaosEventType::AirConBroken,
+            sentinel_common::EventType::AirConBroken,
+            "Klimaanlage defekt",
+        ),
+        (
+            sentinel_physics::ChaosEventType::InternetOutage,
+            sentinel_common::EventType::InternetOutage,
+            "Internetausfall",
+        ),
     ];
 
-    for (i, event_type) in event_types.iter().enumerate() {
-        let freq = sentinel_physics::chaos_frequency_per_hour(*event_type);
+    for (i, (physics_type, common_type, description)) in event_types.iter().enumerate() {
+        let freq = sentinel_physics::chaos_frequency_per_hour(*physics_type);
         let rng = pseudo_rng(tick.wrapping_mul(31).wrapping_add(i as u64));
-        let _triggered = sentinel_physics::should_trigger_chaos(freq, time.delta_seconds, rng);
-        // Phase 3: Getriggerte Events in Event-Queue schreiben
-        // und per Zenoh an betroffene Raeume/Agenten dispatchen
+        let triggered = sentinel_physics::should_trigger_chaos(freq, time.delta_seconds, rng);
+
+        if triggered {
+            let payload = DomainEventPayload::ChaosTriggered {
+                event_type: *common_type,
+                target_room: None,
+                description: description.to_string(),
+            };
+            let event = DomainEvent::new(
+                payload.event_type_str(),
+                "building",
+                &payload.to_json(),
+                &uuid::Uuid::new_v4().to_string(),
+                time.tick.0,
+            );
+            event_buffer.events.push(event);
+        }
     }
 }
 
@@ -310,17 +452,129 @@ fn room_id_to_german(room_id: &str) -> String {
     }
 }
 
-/// 8. Sendet Wahrnehmung via Zenoh an LLM - Phase 3 Integration
-pub fn output_system(_query: Query<(&AgentIdentity, &PerceptionState)>) {
-    // Wird in Phase 3 (LLM Bridge) implementiert:
-    // - Serialisiert PerceptionState zu Perception-Message
-    // - Publiziert auf sentinel/perception/{agent_id}
-    // - LLM-Bridge subscribed und generiert Agent-Aktionen
+/// 8. Sendet Wahrnehmung via Channel an externen Zenoh-Publisher.
+///
+/// Serialisiert PerceptionState + Position zu Perception-Message
+/// und sendet sie ueber den PerceptionSender Channel.
+pub fn output_system(
+    sender: Option<Res<PerceptionSender>>,
+    query: Query<(&AgentIdentity, &PerceptionState)>,
+    time: Res<SimulationTime>,
+) {
+    let Some(sender) = sender else { return };
+
+    for (identity, perception) in &query {
+        let msg = Perception {
+            agent_id: identity.agent_id,
+            circadian_text: format!("{:.0}:00 Uhr", time.sim_hour),
+            body_text: perception.body_text.clone(),
+            environment_text: perception.environment_text.clone(),
+            acoustic_text: String::new(),
+            presence_text: perception.social_text.clone(),
+            impulse_text: String::new(),
+            timestamp: Timestamp(time.tick.0),
+            tick: time.tick,
+        };
+        // try_send: Non-blocking. Bei vollem Channel wird die Perception gedroppt
+        // (naechster Tick liefert frische Daten).
+        let _ = sender.0.try_send(msg);
+    }
 }
 
-/// 9. Persistiert Zustand in redb/Limbo (BATCHED) - Phase 3 Integration
-pub fn persist_system() {
-    // Wird in Phase 3 implementiert:
-    // - Batched Write via sentinel-redb (Agent-State Snapshots)
-    // - Event-Log via sentinel-limbo (alle Ticks)
+/// 9. Persistiert Zustand: Events nach Limbo, Snapshots nach redb (BATCHED).
+///
+/// Zwei Schreib-Pfade (Dual-Write):
+/// 1. Events aus EventBuffer → Limbo Event Store (append-only + Outbox)
+/// 2. State-Snapshots → redb (alle N Ticks, wie bisher)
+pub fn persist_system(
+    query: Query<(&AgentIdentity, &Position, &BioState, &Mood)>,
+    time: Res<SimulationTime>,
+    store: Option<Res<RedbStateStore>>,
+    event_store: Option<Res<LimboEventStore>>,
+    mut event_buffer: ResMut<EventBuffer>,
+    mut telemetry: ResMut<PersistTelemetry>,
+) {
+    telemetry.ticks_observed = telemetry.ticks_observed.saturating_add(1);
+
+    // 1. Events aus Buffer nach Limbo schreiben (mit Outbox)
+    if let Some(es) = &event_store {
+        for event in event_buffer.events.drain(..) {
+            let topic = event_topic(&event);
+            if let Err(err) = es.0.append_with_outbox(&event, &topic) {
+                warn!(event_id = %event.event_id, "persist_system: failed to write event: {err}");
+            }
+        }
+    } else {
+        // Kein Event Store: Buffer leeren damit er nicht unendlich waechst
+        event_buffer.events.clear();
+    }
+
+    // 2. Bestehende redb State-Snapshot Logik (unveraendert)
+    let Some(store) = store else {
+        telemetry.enabled = false;
+        telemetry.interval_ticks = 0;
+        return;
+    };
+
+    telemetry.enabled = true;
+    telemetry.interval_ticks = store.persist_every_n_ticks.max(1);
+
+    if !time.tick.0.is_multiple_of(store.persist_every_n_ticks) {
+        telemetry.skipped_ticks = telemetry.skipped_ticks.saturating_add(1);
+        return;
+    }
+
+    let mut batch: Vec<(sentinel_common::AgentId, Vec<u8>)> = Vec::new();
+    for (identity, position, bio, mood) in &query {
+        batch.push((
+            identity.agent_id,
+            encode_agent_snapshot(time.tick.0, position, bio, mood),
+        ));
+    }
+
+    let batch_len = batch.len() as u64;
+    telemetry.batch_size_last = batch_len;
+    telemetry.batch_size_sum = telemetry.batch_size_sum.saturating_add(batch_len);
+    telemetry.batch_size_max = telemetry.batch_size_max.max(batch_len);
+    telemetry.flush_attempts = telemetry.flush_attempts.saturating_add(1);
+
+    let flush_start = Instant::now();
+    if let Err(err) = store.store.set_agent_states_batch(&batch) {
+        telemetry.flush_failures = telemetry.flush_failures.saturating_add(1);
+        let flush_us = flush_start.elapsed().as_secs_f64() * 1_000_000.0;
+        telemetry.flush_latency_us_sum += flush_us;
+        telemetry.flush_latency_us_max = telemetry.flush_latency_us_max.max(flush_us);
+        warn!("persist_system: failed to write redb batch: {err}");
+    } else {
+        telemetry.flush_success = telemetry.flush_success.saturating_add(1);
+        let flush_us = flush_start.elapsed().as_secs_f64() * 1_000_000.0;
+        telemetry.flush_latency_us_sum += flush_us;
+        telemetry.flush_latency_us_max = telemetry.flush_latency_us_max.max(flush_us);
+    }
+}
+
+/// Bestimmt das Zenoh-Topic fuer ein DomainEvent.
+fn event_topic(event: &DomainEvent) -> String {
+    format!(
+        "sentinel/events/{}/{}",
+        event.event_type, event.aggregate_id
+    )
+}
+
+fn encode_agent_snapshot(tick: u64, position: &Position, bio: &BioState, mood: &Mood) -> Vec<u8> {
+    format!(
+        "t={tick};room={};transit={};h={:.2};e={:.2};caf={:.2};b={:.2};s={:.2};sn={:.2};v={:.3};a={:.3};emo={:?}",
+        position.room_id,
+        if position.in_transit { 1 } else { 0 },
+        bio.hunger,
+        bio.energy,
+        bio.caffeine_mg,
+        bio.bladder,
+        bio.stress,
+        bio.social_need,
+        mood.valence,
+        mood.arousal,
+        mood.dominant_emotion
+    )
+    .into_bytes()
 }

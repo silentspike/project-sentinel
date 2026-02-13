@@ -14,12 +14,18 @@ pub mod world;
 pub use components::*;
 pub use perception::{format_injection, generate_perception, PerceptionTexts, SmellEvent};
 pub use systems::SimulationPhase;
-pub use world::{create_simulation_world, spawn_agent, SimulationTime};
+pub use world::{
+    attach_redb_store, create_simulation_world, spawn_agent, ActionReceiver, EventBuffer,
+    LimboEventStore, PerceptionSender, PersistTelemetry, RedbStateStore, SimulationTime,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentinel_common::AgentId;
+    use sentinel_common::{ActionType, AgentAction, AgentId, Tick, Timestamp};
+    use sentinel_limbo::EventStore;
+    use sentinel_redb::StateStore;
+    use std::sync::Arc;
 
     #[test]
     fn test_single_agent_spawn() {
@@ -239,5 +245,305 @@ mod tests {
         let pos = world.get::<Position>(entity).unwrap();
         assert!(!pos.in_transit, "Transit should be complete");
         assert_eq!(pos.room_id, "kueche", "Should be in target room");
+    }
+
+    #[test]
+    fn test_redb_store_default_persist_interval_is_20() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("default-interval.redb");
+        let store = StateStore::open(db_path.to_str().unwrap()).unwrap();
+
+        let mut world = bevy_ecs::prelude::World::new();
+        attach_redb_store(&mut world, store);
+
+        let state = world.resource::<RedbStateStore>();
+        assert_eq!(
+            state.persist_every_n_ticks, 20,
+            "default persist interval should be 20 ticks"
+        );
+    }
+
+    #[test]
+    fn test_persist_telemetry_records_flush_and_batch_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("persist-telemetry.redb");
+        let store = StateStore::open(db_path.to_str().unwrap()).unwrap();
+
+        let (mut world, mut schedule) = create_simulation_world();
+        attach_redb_store(&mut world, store);
+        world.resource_mut::<RedbStateStore>().persist_every_n_ticks = 1;
+
+        for i in 1..=3 {
+            spawn_agent(
+                &mut world,
+                AgentId(i),
+                &format!("Agent-{i:02}"),
+                "Mitarbeiter",
+                1,
+            );
+        }
+
+        for tick in 0..5u64 {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = sentinel_common::Tick(tick);
+            time.tick_count = tick;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 8.0 + (tick as f32 / 3600.0);
+            schedule.run(&mut world);
+        }
+
+        let telemetry = world.resource::<PersistTelemetry>();
+        assert!(telemetry.enabled, "persist telemetry should be enabled");
+        assert_eq!(telemetry.interval_ticks, 1, "persist interval mismatch");
+        assert!(
+            telemetry.flush_attempts >= 5,
+            "expected at least one flush per tick"
+        );
+        assert_eq!(
+            telemetry.flush_attempts, telemetry.flush_success,
+            "all test flushes should succeed"
+        );
+        assert_eq!(telemetry.flush_failures, 0, "unexpected flush failures");
+        assert_eq!(
+            telemetry.batch_size_last, 3,
+            "batch size should match agent count"
+        );
+        assert_eq!(
+            telemetry.batch_size_max, 3,
+            "max batch size should be stable"
+        );
+        assert_eq!(
+            telemetry.queue_depth_current, 0,
+            "queue depth should stay zero"
+        );
+        assert_eq!(telemetry.drop_count, 0, "drop count should stay zero");
+        assert_eq!(
+            telemetry.coalesce_count, 0,
+            "coalesce count should stay zero"
+        );
+        assert!(
+            telemetry.avg_flush_latency_us() >= 0.0,
+            "flush latency average must be non-negative"
+        );
+        assert!(
+            telemetry.avg_batch_size() >= 3.0,
+            "average batch size should reflect full snapshots in this test"
+        );
+    }
+
+    // ── Event-First Integration Tests ──────────────
+
+    /// E2E: AgentAction via Channel → input_system → EventBuffer → persist_system → Event in Limbo
+    #[test]
+    fn test_e2e_action_to_event_to_limbo() {
+        let dir = tempfile::tempdir().unwrap();
+        let event_db_path = dir.path().join("events.db");
+        let redb_path = dir.path().join("state.redb");
+
+        let (mut world, mut schedule) = create_simulation_world();
+
+        // Event Store und redb anbinden
+        let event_store = EventStore::open(event_db_path.to_str().unwrap()).unwrap();
+        world.insert_resource(LimboEventStore(Arc::new(event_store)));
+        attach_redb_store(
+            &mut world,
+            StateStore::open(redb_path.to_str().unwrap()).unwrap(),
+        );
+
+        // Agent spawnen
+        spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+
+        // Action Channel einrichten
+        let (tx, rx) = std::sync::mpsc::channel();
+        world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
+
+        // AgentAction senden
+        tx.send(AgentAction {
+            agent_id: AgentId(1),
+            action_type: ActionType::Chat,
+            target_room: None,
+            target_agent: None,
+            content: Some("Guten Morgen!".to_string()),
+            timestamp: Timestamp(1000),
+            tick: Tick(1),
+        })
+        .unwrap();
+
+        // Einen Tick ausfuehren
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(1);
+            time.tick_count = 1;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 8.0;
+        }
+        schedule.run(&mut world);
+
+        // Verifiziere: Event ist in Limbo
+        let es = world.resource::<LimboEventStore>();
+        let events = es.0.get_events_since(0, 100).unwrap();
+        assert!(
+            !events.is_empty(),
+            "Events should have been written to Limbo"
+        );
+
+        // Mindestens ein AgentActionReceived Event
+        let action_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "agent_action_received")
+            .collect();
+        assert_eq!(
+            action_events.len(),
+            1,
+            "Expected exactly one agent_action_received event"
+        );
+        assert_eq!(action_events[0].aggregate_id, "AGENT-01");
+    }
+
+    /// AC1 (Issue #9): 100+ mutierende Aktionen → alle haben event_id
+    #[test]
+    fn test_100_actions_all_have_event_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let event_db_path = dir.path().join("events-100.db");
+
+        let (mut world, mut schedule) = create_simulation_world();
+
+        let event_store = EventStore::open(event_db_path.to_str().unwrap()).unwrap();
+        world.insert_resource(LimboEventStore(Arc::new(event_store)));
+
+        // 5 Agenten spawnen
+        for i in 1..=5 {
+            spawn_agent(
+                &mut world,
+                AgentId(i),
+                &format!("Agent-{i:02}"),
+                "Tester",
+                1,
+            );
+        }
+
+        // Action Channel
+        let (tx, rx) = std::sync::mpsc::channel();
+        world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
+
+        // 100 Actions senden (20 pro Agent)
+        for i in 0..100 {
+            let agent_id = AgentId((i % 5 + 1) as u16);
+            tx.send(AgentAction {
+                agent_id,
+                action_type: ActionType::Chat,
+                target_room: None,
+                target_agent: None,
+                content: Some(format!("Nachricht {i}")),
+                timestamp: Timestamp(i as u64 * 100),
+                tick: Tick(i as u64),
+            })
+            .unwrap();
+        }
+
+        // Einen Tick ausfuehren (alle 100 Actions werden im selben Tick verarbeitet)
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(1);
+            time.tick_count = 1;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 8.0;
+        }
+        schedule.run(&mut world);
+
+        // Verifiziere: 100 Events in Limbo, alle mit eindeutiger event_id
+        let es = world.resource::<LimboEventStore>();
+        let events = es.0.get_events_since(0, 200).unwrap();
+        let action_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "agent_action_received")
+            .collect();
+
+        assert_eq!(
+            action_events.len(),
+            100,
+            "Expected 100 action events, got {}",
+            action_events.len()
+        );
+
+        // Alle event_ids sind eindeutig
+        let unique_ids: std::collections::HashSet<_> =
+            action_events.iter().map(|e| &e.event_id).collect();
+        assert_eq!(unique_ids.len(), 100, "All 100 event_ids should be unique");
+    }
+
+    /// output_system sendet Perception via Channel
+    #[test]
+    fn test_output_system_sends_perceptions() {
+        let (mut world, mut schedule) = create_simulation_world();
+        spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+
+        // Perception Channel (bound=64)
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        world.insert_resource(PerceptionSender(tx));
+
+        // Einen Tick ausfuehren
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(1);
+            time.delta_seconds = 1.0;
+            time.sim_hour = 10.0;
+        }
+        schedule.run(&mut world);
+
+        // Mindestens eine Perception empfangen
+        let perception = rx.try_recv();
+        assert!(
+            perception.is_ok(),
+            "Should have received a Perception message"
+        );
+        let perception = perception.unwrap();
+        assert_eq!(perception.agent_id, AgentId(1));
+        assert!(!perception.environment_text.is_empty());
+    }
+
+    /// Transit-Completion erzeugt DomainEvent
+    #[test]
+    fn test_transit_completion_creates_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let event_db_path = dir.path().join("transit-events.db");
+
+        let (mut world, mut schedule) = create_simulation_world();
+        let event_store = EventStore::open(event_db_path.to_str().unwrap()).unwrap();
+        world.insert_resource(LimboEventStore(Arc::new(event_store)));
+
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+
+        // Agent in Transit setzen
+        {
+            let mut pos = world.get_mut::<Position>(entity).unwrap();
+            pos.in_transit = true;
+            pos.transit_target = Some("kueche".to_string());
+            pos.transit_remaining_ms = 1000; // 1 Sekunde
+        }
+
+        // 2 Ticks a 1 Sekunde
+        for tick in 0..2u64 {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(tick);
+            time.delta_seconds = 1.0;
+            time.sim_hour = 10.0;
+            schedule.run(&mut world);
+        }
+
+        // Verifiziere: TransitCompleted Event in Limbo
+        let es = world.resource::<LimboEventStore>();
+        let events = es.0.get_events_since(0, 100).unwrap();
+        let transit_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "transit_completed")
+            .collect();
+
+        assert_eq!(
+            transit_events.len(),
+            1,
+            "Expected one transit_completed event"
+        );
+        assert_eq!(transit_events[0].aggregate_id, "AGENT-01");
     }
 }

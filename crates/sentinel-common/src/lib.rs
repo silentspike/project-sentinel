@@ -7,10 +7,12 @@
 
 pub mod agent_config;
 pub mod components;
+pub mod events;
 pub mod psi;
 pub mod room;
 pub mod types;
 
+pub use events::{DomainEvent, DomainEventPayload};
 pub use types::*;
 
 #[cfg(test)]
