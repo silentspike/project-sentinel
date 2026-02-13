@@ -164,6 +164,23 @@ separat = "separat"
 Effekt = "Effekt"
 Explizit = "Explizit"
 
+# Event Store + ECS Systems words (German in Rust doc comments + string literals)
+Aktion = "Aktion"
+Aktionen = "Aktionen"
+Empfaengt = "Empfaengt"
+Verarbeitet = "Verarbeitet"
+Erzeugt = "Erzeugt"
+Persistiert = "Persistiert"
+Generiert = "Generiert"
+Sendet = "Sendet"
+Zufallsereignisse = "Zufallsereignisse"
+Raumwechsel = "Raumwechsel"
+Verspaetung = "Verspaetung"
+Klimaanlage = "Klimaanlage"
+Internetausfall = "Internetausfall"
+Paketlieferung = "Paketlieferung"
+Kuchen = "Kuchen"
+
 # Sprint 4 words (Runtime, Sandbox, Dashboard)
 oder = "oder"
 Finde = "Finde"
