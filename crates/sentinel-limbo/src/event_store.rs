@@ -83,7 +83,7 @@ pub struct OutboxEntry {
 
 /// Sync Event Store mit append-only Semantik.
 ///
-/// Thread-safe via Arc<Mutex<Connection>>. Fuer async-Kontexte:
+/// Thread-safe via `Arc<Mutex<Connection>>`. Fuer async-Kontexte:
 /// in tokio::task::spawn_blocking wrappen.
 pub struct EventStore {
     conn: Arc<Mutex<Connection>>,
