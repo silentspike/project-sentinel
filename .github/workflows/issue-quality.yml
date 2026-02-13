@@ -1,0 +1,152 @@
+name: Issue Quality Gate
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+
+permissions:
+  issues: write
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body = issue.body || "";
+            const labels = (issue.labels || []).map(l => l.name);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issueNumber = issue.number;
+            const marker = "<!-- issue-quality-gate -->";
+
+            // Accept both legacy English templates and current German issue format.
+            const sectionGroups = [
+              { name: "Scope", variants: ["In Scope", "Scope"] },
+              { name: "Out of Scope", variants: ["Out of Scope", "Nicht im Scope", "NICHT im Scope"] },
+              { name: "Acceptance", variants: ["Acceptance Criteria", "Acceptance", "Akzeptanzkriterien"] },
+            ];
+            const sectionMissing = sectionGroups
+              .filter((group) => {
+                return !group.variants.some((variant) => {
+                  const pattern = new RegExp(
+                    `^\\s*#{2,6}\\s*${variant.replace(/\s+/g, "\\s+")}\\s*$`,
+                    "im",
+                  );
+                  return pattern.test(body);
+                });
+              })
+              .map((group) => group.name);
+
+            const hasAcId = /AC-\d+\b/m.test(body);
+            const hasNumberedAcceptance = /^\s*\d+\.\s+/m.test(body);
+            const hasVerify = /verify(\s*-?\s*(method|methode))?\s*:/im.test(body) || /verify/im.test(body);
+            const hasEvidence = /\bevidence\b/im.test(body) || hasVerify;
+
+            const hasType = labels.some((l) => l.startsWith("type:"));
+            const hasPriority = labels.some((l) => l.startsWith("prio:") || l.startsWith("priority:"));
+            const hasSize = labels.some((l) => l.startsWith("size:"));
+            const hasScopeLabel = labels.some((l) => l.startsWith("scope:"));
+
+            const scopeMatch = body.match(/scope:(full|partial|experimental)/i);
+            const scopeFromBody = scopeMatch ? `scope:${scopeMatch[1].toLowerCase()}` : null;
+
+            const failures = [];
+            if (sectionMissing.length) failures.push(`Missing sections: ${sectionMissing.join(", ")}`);
+            if (!hasAcId && !hasNumberedAcceptance)
+              failures.push("Missing AC-ID (AC-1, AC-2, ...) or numbered acceptance list");
+            if (!hasVerify) failures.push("Missing Verify method");
+            if (!hasEvidence) failures.push("Missing Evidence plan");
+            if (!hasType) failures.push("Missing type:* label");
+            if (!hasPriority) failures.push("Missing prio:* or priority:* label");
+            if (!hasSize) failures.push("Missing size:* label");
+
+            async function ensureLabel(name, color, description) {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name });
+              } catch {
+                await github.rest.issues.createLabel({ owner, repo, name, color, description });
+              }
+            }
+
+            async function safeAddLabels(newLabels) {
+              if (!newLabels.length) return;
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                labels: [...new Set(newLabels)],
+              });
+            }
+
+            async function safeRemoveLabel(name) {
+              try {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name });
+              } catch {}
+            }
+
+            async function upsertGateComment(text) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100,
+              });
+              const existing = comments.find((c) => c.body && c.body.includes(marker));
+              const fullBody = `${marker}\n${text}`;
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: existing.id,
+                  body: fullBody,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  body: fullBody,
+                });
+              }
+            }
+
+            await ensureLabel("quality:needs-spec", "b60205", "Specification incomplete, not ready");
+            await ensureLabel("quality:ready", "238636", "Spec + AC + verify complete");
+            await ensureLabel("scope:full", "1f6feb", "Full delivery expected");
+            await ensureLabel("scope:partial", "8250df", "Reduced scope delivery accepted");
+            await ensureLabel("scope:experimental", "db6d28", "Prototype/placeholder accepted");
+
+            // Ensure scope label is always present; default to scope:full for issue-only workflow.
+            if (scopeFromBody && !hasScopeLabel) {
+              await safeAddLabels([scopeFromBody]);
+            } else if (!hasScopeLabel) {
+              await safeAddLabels(["scope:full"]);
+            }
+
+            if (failures.length > 0) {
+              await safeAddLabels(["quality:needs-spec"]);
+              await safeRemoveLabel("quality:ready");
+              await upsertGateComment(
+                [
+                  "Issue Quality Gate: FAILED",
+                  "",
+                  ...failures.map((f) => `- ${f}`),
+                  "",
+                  "Setze das Issue erst auf `status:ready`, wenn alle Punkte erfuellt sind.",
+                ].join("\n"),
+              );
+            } else {
+              await safeAddLabels(["quality:ready"]);
+              await safeRemoveLabel("quality:needs-spec");
+              await upsertGateComment(
+                [
+                  "Issue Quality Gate: PASSED",
+                  "",
+                  "- Spec/Scope/AC/Verify/Evidence sind ausreichend.",
+                  "- Issue ist bereit fuer `status:ready`.",
+                ].join("\n"),
+              );
+            }
