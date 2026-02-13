@@ -15,7 +15,7 @@
 - eval() in jeglicher Sprache
 - Files editieren ohne sie vorher zu lesen (Read before Edit!)
 - "production ready" behaupten ohne Evidence
-- Architektur-Entscheidungen treffen die vom Plan abweichen ohne User-Freigabe
+- Architektur-Entscheidungen treffen die vom aktiven GitHub-Issue abweichen ohne User-Freigabe
 - GitHub Actions auf Tags referenzieren (`@v4`) - IMMER SHA-Pins verwenden
 - `allow(unused)` ohne Kommentar warum
 - Raten bei fehlenden Informationen - FRAGE stattdessen
@@ -31,7 +31,7 @@
 - `cargo update` vor PR (neueste kompatible Dependency-Versionen)
 - Aktuellste Versionen aller Tools/Actions/Libraries verwenden
 - Nach Feature-Install: Updates pruefen, Configs verifizieren, `make ci` ausfuehren
-- IOPS-Impact bedenken (DRAM-lose NVMe! Budget: siehe Plan)
+- IOPS-Impact bedenken (DRAM-lose NVMe! Budget: siehe Issue-Akzeptanzkriterien/Performance-Ziele)
 - Performance-kritischen Code benchmarken
 - FlatBuffer Schema validieren bei Schema-Aenderungen
 - Lessons-Check nach jedem abgeschlossenen Schritt (siehe PROJEKT-LEARNINGS)
@@ -87,7 +87,7 @@ VERBOTEN in Code/Docs:
 
 ## REQUIRED GUIDELINES
 ### Code Quality
-- Hot Path: keine Allocations, Arena-Allokatoren (Details siehe Plan)
+- Hot Path: keine Allocations, Arena-Allokatoren (Details im aktiven Issue + projektspezifischen Rules)
 - Serialisierung intern: Zero-Copy, extern: MessagePack (Dashboard, Logs)
 - Code-Identifier: Englisch, Kommentare: Deutsch erlaubt bei Domain-Logik
 - Keine Magic Numbers - Konstanten definieren
@@ -189,8 +189,9 @@ config/              # Raum-Layout, Agent-Defs, Simulations-Parameter
 ## REFERENCES (SSOT)
 | Was | Authoritative Quelle |
 |-----|---------------------|
-| Architektur + Tech-Entscheidungen | `/home/jan/.claude/plans/peaceful-splashing-willow.md` |
-| Bio-Engine Formeln + Schwellenwerte | Plan Sektion 2b + `.claude/rules/sprint2-domain.md` |
+| Aktive Umsetzungsanforderung | GitHub Issue (Titel + Body + Acceptance + Verify) |
+| Architektur + Tech-Entscheidungen (Hintergrund) | `/home/jan/.claude/plans/peaceful-splashing-willow.md` |
+| Bio-Engine Formeln + Schwellenwerte | `.claude/rules/sprint2-domain.md` + aktives Issue |
 | Sprint 2 Domain Knowledge | `.claude/rules/sprint2-domain.md` |
 | Raum-Layout + Adjacency | `config/rooms.toml` |
 | Agent-Persoenlichkeiten | `config/agents/AGENT-XX-NAME.toml` |
@@ -205,7 +206,7 @@ config/              # Raum-Layout, Agent-Defs, Simulations-Parameter
 | Go Package Layout | `cmd/cortex-gateway/internal/` |
 | Sprint 3 Domain Knowledge | `.claude/rules/sprint3-domain.md` |
 
-**Regel:** Plan ist SSOT fuer Architektur. Wenn Plan und Code divergieren → Plan gewinnt.
+**Regel:** Bei normaler Umsetzung ist das aktive GitHub-Issue SSOT. Plan ist Hintergrundkontext fuer Maintainer. Wenn Issue und Plan divergieren, gilt fuer Worker das Issue; Eskalation an User statt Raten.
 
 ---
 
