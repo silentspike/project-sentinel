@@ -74,20 +74,24 @@ func main() {
 	registry.Register("ollama", ollamaProvider)
 	logger.Info("registered provider", "name", "ollama")
 
-	// 4. Processing pipeline components (wired in Phase 4)
-	norm := normalizer.New()
-	comp := compiler.New()
-	ext := extraction.New()
-	caps := capability.New()
-	_ = norm
-	_ = comp
-	_ = ext
-	_ = caps
+	// 4. Control config (shared between pipeline + control plane)
+	controlConfig := control.NewConfig("claude")
 
-	// 5. HTTP proxy server
-	proxyHandler := proxy.NewHandler(registry, logger)
+	// 5. Processing pipeline (fully wired)
+	pipelineHandler := proxy.NewPipelineHandler(proxy.PipelineConfig{
+		Registry:     registry,
+		Config:       controlConfig,
+		Compiler:     compiler.New(),
+		Normalizer:   normalizer.New(),
+		Extractor:    extraction.New(),
+		Capabilities: capability.New(),
+		Logger:       logger,
+		BreakerCfg:   proxy.BreakerConfigFromEnv(),
+	})
+
+	// 6. HTTP proxy server
 	proxyMux := http.NewServeMux()
-	proxyMux.Handle("POST /v1/chat/completions", proxyHandler)
+	proxyMux.Handle("POST /v1/chat/completions", pipelineHandler)
 	proxyMux.HandleFunc("GET /health", handleHealth)
 	proxyMux.HandleFunc("GET /ready", handleReady)
 	proxyMux.Handle("GET /metrics", promhttp.Handler())
@@ -100,8 +104,7 @@ func main() {
 		IdleTimeout:  idleTimeout,
 	}
 
-	// 6. Control plane server (separate port)
-	controlConfig := control.NewConfig("claude")
+	// 7. Control plane server (shared controlConfig → aenderungen wirken sofort)
 	controlPlane := control.NewPlane(controlConfig, logger)
 	controlMux := controlPlane.Handler()
 
@@ -113,7 +116,7 @@ func main() {
 		IdleTimeout:  idleTimeout,
 	}
 
-	// 7. Start servers
+	// 8. Start servers
 	go func() {
 		logger.Info("proxy server starting", "addr", proxyServer.Addr)
 		if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -130,7 +133,7 @@ func main() {
 		}
 	}()
 
-	// 8. Graceful shutdown on signal
+	// 9. Graceful shutdown on signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit

@@ -8,10 +8,11 @@ import (
 
 // LLMRequest represents a request to an LLM provider.
 type LLMRequest struct {
-	Messages    []Message `json:"messages"`
-	Temperature float64   `json:"temperature"`
-	MaxTokens   int       `json:"max_tokens"`
-	Model       string    `json:"model,omitempty"`
+	Messages    []Message         `json:"messages"`
+	Temperature float64           `json:"temperature"`
+	MaxTokens   int               `json:"max_tokens"`
+	Model       string            `json:"model,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
 // Message represents a single message in an LLM conversation.
