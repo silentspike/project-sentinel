@@ -235,6 +235,25 @@ vergisst = "vergisst"
 Informatikstudium = "Informatikstudium"
 Entwickler = "Entwickler"
 
+# Decision Engine words (Issue #54 - Interrupt-Prioritaeten)
+Notfall = "Notfall"
+Notfaelle = "Notfaelle"
+Prioritaet = "Prioritaet"
+Prioritaeten = "Prioritaeten"
+Priorisiert = "Priorisiert"
+priorisierte = "priorisierte"
+Lebensdauer = "Lebensdauer"
+Verbleibende = "Verbleibende"
+Unerwartetes = "Unerwartetes"
+ueberschritten = "ueberschritten"
+ueberzaehlige = "ueberzaehlige"
+knurrt = "knurrt"
+Augen = "Augen"
+konzentrier = "konzentrier"
+Impuls = "Impuls"
+Interaktion = "Interaktion"
+Modifikation = "Modifikation"
+
 [files]
 extend-exclude = [
     "Cargo.lock",

@@ -1,6 +1,6 @@
 //! ECS Systems fuer Agent-Simulation.
 //!
-//! Definiert 9 Systems in strikter Ausfuehrungsreihenfolge:
+//! Definiert 10 Systems in strikter Ausfuehrungsreihenfolge:
 //! 1. input_system - Empfaengt Agent-Aktionen via Channel
 //! 2. bio_system - Aktualisiert biologische Zustaende (sentinel-bio)
 //! 3. physics_system - Berechnet Raum-Physik (sentinel-physics)
@@ -8,8 +8,9 @@
 //! 5. chaos_system - Generiert Zufallsereignisse + Chaos-Events
 //! 6. mood_system - Berechnet Stimmung aus Bio+Kontext
 //! 7. perception_system - Generiert Wahrnehmungstext fuer LLM-Prompt
-//! 8. output_system - Sendet Wahrnehmung via Channel
-//! 9. persist_system - Persistiert Events (Limbo) + State-Snapshots (redb)
+//! 8. decision_system - Priorisiert Events fuer impulse_text (P0-P3)
+//! 9. output_system - Sendet Wahrnehmung via Channel
+//! 10. persist_system - Persistiert Events (Limbo) + State-Snapshots (redb)
 
 use super::components::*;
 use super::world::{
@@ -33,6 +34,7 @@ pub enum SimulationPhase {
     Chaos,
     Mood,
     Perception,
+    Decision,
     Output,
     Persist,
 }
@@ -452,18 +454,20 @@ fn room_id_to_german(room_id: &str) -> String {
     }
 }
 
-/// 8. Sendet Wahrnehmung via Channel an externen Zenoh-Publisher.
+/// 9. Sendet Wahrnehmung via Channel an externen Zenoh-Publisher.
 ///
-/// Serialisiert PerceptionState + Position zu Perception-Message
+/// Serialisiert PerceptionState + Position + EventQueue zu Perception-Message
 /// und sendet sie ueber den PerceptionSender Channel.
+/// impulse_text wird aus der priorisierten EventQueue generiert.
 pub fn output_system(
     sender: Option<Res<PerceptionSender>>,
-    query: Query<(&AgentIdentity, &PerceptionState)>,
+    query: Query<(&AgentIdentity, &PerceptionState, &EventQueue)>,
     time: Res<SimulationTime>,
 ) {
     let Some(sender) = sender else { return };
 
-    for (identity, perception) in &query {
+    for (identity, perception, queue) in &query {
+        let impulse_text = super::decision::format_impulse_from_queue(queue);
         let msg = Perception {
             agent_id: identity.agent_id,
             circadian_text: format!("{:.0}:00 Uhr", time.sim_hour),
@@ -471,7 +475,7 @@ pub fn output_system(
             environment_text: perception.environment_text.clone(),
             acoustic_text: String::new(),
             presence_text: perception.social_text.clone(),
-            impulse_text: String::new(),
+            impulse_text,
             timestamp: Timestamp(time.tick.0),
             tick: time.tick,
         };

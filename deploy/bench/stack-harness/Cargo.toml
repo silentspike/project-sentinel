@@ -1,0 +1,24 @@
+[package]
+name = "stack-harness"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+sha2 = "0.10"
+
+sentinel-common = { path = "../../../crates/sentinel-common" }
+sentinel-ecs = { path = "../../../crates/sentinel-ecs" }
+sentinel-redb = { path = "../../../crates/sentinel-redb" }
+sentinel-limbo = { path = "../../../crates/sentinel-limbo" }
+sentinel-zenoh = { path = "../../../crates/sentinel-zenoh" }
+sentinel-ebpf = { path = "../../../crates/sentinel-ebpf" }
+sentinel-telemetry = { path = "../../../crates/sentinel-telemetry" }
+sentinel-inference = { path = "../../../crates/sentinel-inference" }
+bevy_ecs = "0.18"

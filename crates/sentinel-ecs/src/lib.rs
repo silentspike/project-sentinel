@@ -1,17 +1,19 @@
 //! ECS world simulation core using bevy_ecs.
 //!
-//! Definiert 10 Components, 9 Systems (in strikter Reihenfolge via SimulationPhase),
+//! Definiert 11 Components, 10 Systems (in strikter Reihenfolge via SimulationPhase),
 //! und die World-Setup-Logik fuer die Agent-Simulation.
 //!
 //! Components liegen in sentinel-common::components (Re-Export hier).
 //! Systems rufen sentinel-bio und sentinel-physics fuer echte Berechnungen auf.
 
 pub mod components;
+pub mod decision;
 pub mod perception;
 pub mod systems;
 pub mod world;
 
 pub use components::*;
+pub use decision::format_impulse_from_queue;
 pub use perception::{format_injection, generate_perception, PerceptionTexts, SmellEvent};
 pub use systems::SimulationPhase;
 pub use world::{
@@ -32,7 +34,7 @@ mod tests {
         let (mut world, _schedule) = create_simulation_world();
         let entity = spawn_agent(&mut world, AgentId(1), "Thomas Mueller", "CEO", 1);
 
-        // Alle 10 Components muessen vorhanden sein
+        // Alle 11 Components muessen vorhanden sein
         assert!(world.get::<AgentIdentity>(entity).is_some());
         assert!(world.get::<Position>(entity).is_some());
         assert!(world.get::<BioState>(entity).is_some());
@@ -43,6 +45,7 @@ mod tests {
         assert!(world.get::<Relationships>(entity).is_some());
         assert!(world.get::<LlmConfig>(entity).is_some());
         assert!(world.get::<ShiftInfo>(entity).is_some());
+        assert!(world.get::<EventQueue>(entity).is_some());
 
         // Shift-Werte pruefen (Set 1 = Frueh 06-14)
         let shift = world.get::<ShiftInfo>(entity).unwrap();
