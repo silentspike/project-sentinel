@@ -1,32 +1,79 @@
 name: Bug Report
-description: Something is broken
-labels: ["type:bug", "status:triage"]
+description: Report a defect with reproducible evidence
+labels: ["type:bug", "status:triage", "prio:high", "size:M", "quality:needs-spec"]
 body:
-  - type: textarea
-    id: description
+  - type: dropdown
+    id: scope_mode
     attributes:
-      label: What happened?
-      description: Clear description of the bug.
+      label: Scope Mode
+      description: Choose the intended delivery scope
+      options:
+        - scope:full
+        - scope:partial
+        - scope:experimental
     validations:
       required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Context
+      description: What is broken and why this issue matters
+      placeholder: |
+        Short problem statement with affected user/system impact.
+    validations:
+      required: true
+
   - type: textarea
     id: reproduction
     attributes:
-      label: Steps to reproduce
-      description: Minimal steps to trigger the bug.
+      label: Steps to Reproduce
+      description: Deterministic steps
       value: |
-        1.
-        2.
-        3.
+        1. ...
+        2. ...
+        3. ...
     validations:
       required: true
+
+  - type: textarea
+    id: in_scope
+    attributes:
+      label: In Scope
+      description: Exact files/components allowed to change
+      placeholder: |
+        - cmd/cortex-gateway/internal/proxy/handler.go
+        - crates/sentinel-ecs/src/systems.rs
+    validations:
+      required: true
+
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: Out of Scope
+      description: Explicitly forbidden changes
+      placeholder: |
+        - No API contract changes
+        - No new dependencies
+    validations:
+      required: true
+
   - type: textarea
     id: expected
     attributes:
-      label: Expected behavior
-      description: What should have happened instead?
+      label: Expected Behavior
+      description: Measurable expected result
     validations:
       required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What happens currently
+    validations:
+      required: true
+
   - type: dropdown
     id: component
     attributes:
@@ -37,11 +84,59 @@ body:
         - Cortex Gateway
         - Dashboard
         - Agent Runtime / Sandbox
-        - BitNet / Inference
+        - Inference / LLM Routing
         - Zenoh / Messaging
         - Other
     validations:
       required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: blocked by #N + required artifact/API (or "none")
+      placeholder: |
+        - none
+        - blocked by #123: requires API X from module Y
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      description: Use AC-IDs (AC-1, AC-2, ...)
+      value: |
+        - AC-1: ...
+          Verify: ...
+          Expected: ...
+        - AC-2: ...
+          Verify: ...
+          Expected: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: negative_acceptance
+    attributes:
+      label: Negative Criteria
+      description: At least one "must not happen" criterion
+      value: |
+        - AC-N1: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence_plan
+    attributes:
+      label: Evidence Plan
+      description: Commands and artifacts that prove each AC
+      value: |
+        - Command: ...
+        - Artifact: path/to/file.log
+    validations:
+      required: true
+
   - type: textarea
     id: logs
     attributes:

@@ -23,19 +23,31 @@ jobs:
 
             // Type detection from title prefix
             if (title.startsWith('[bug]') || title.includes('broken') || title.includes('crash'))
-              labels.push('type:bug', 'prio:high', 'status:triage');
+              labels.push('type:bug', 'prio:high', 'size:M', 'status:triage');
             else if (title.startsWith('[feature]') || title.startsWith('[feat]'))
-              labels.push('type:feature', 'status:backlog');
+              labels.push('type:feature', 'prio:medium', 'size:M', 'status:backlog');
+            else if (title.startsWith('[epic]'))
+              labels.push('type:epic', 'prio:medium', 'size:XL', 'status:backlog');
             else if (title.startsWith('[perf]'))
-              labels.push('type:perf', 'status:backlog');
+              labels.push('type:perf', 'prio:medium', 'size:M', 'status:backlog');
             else if (title.startsWith('[docs]'))
-              labels.push('type:docs', 'status:backlog');
+              labels.push('type:docs', 'prio:low', 'size:S', 'status:backlog');
             else
-              labels.push('status:triage');
+              labels.push('prio:medium', 'size:M', 'status:triage');
 
             // Component detection from body + title
             const body = (context.payload.issue.body || '').toLowerCase();
             const text = title + ' ' + body;
+
+            // Scope detection from template body, fallback to full
+            const scopeMatch = body.match(/scope:(full|partial|experimental)/i);
+            if (scopeMatch)
+              labels.push(`scope:${scopeMatch[1].toLowerCase()}`);
+            else
+              labels.push('scope:full');
+
+            // New issues are not ready by default until issue-quality gate promotes them
+            labels.push('quality:needs-spec');
 
             if (text.includes('ecs') || text.includes('bevy') || text.includes('simulation'))
               labels.push('comp:ecs');
@@ -45,7 +57,13 @@ jobs:
               labels.push('comp:cortex');
             if (text.includes('dashboard') || text.includes('frontend') || text.includes('websocket'))
               labels.push('comp:dashboard');
-            if (text.includes('bitnet') || text.includes('inference') || text.includes('lora'))
+            if (
+              text.includes('inference') ||
+              text.includes('routing') ||
+              text.includes('provider') ||
+              text.includes('model swap') ||
+              text.includes('llm')
+            )
               labels.push('comp:inference');
             if (text.includes('sandbox') || text.includes('bwrap') || text.includes('cgroup'))
               labels.push('comp:sandbox');

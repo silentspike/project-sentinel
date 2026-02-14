@@ -1,5 +1,5 @@
 .PHONY: help lint lint-all test build build-rust build-go build-dashboard \
-       fmt check clean hooks ci deny coverage typos doc machete
+       fmt check clean hooks ci deny coverage typos doc machete safe-merge
 
 # Default target
 help: ## Show this help
@@ -127,14 +127,12 @@ bench: ## Run benchmarks
 # Setup
 # ──────────────────────────────────────────────
 
-hooks: ## Install git hooks
-	@echo '#!/bin/sh' > .git/hooks/pre-commit
-	@echo 'make fmt && make check' >> .git/hooks/pre-commit
-	@chmod +x .git/hooks/pre-commit
-	@echo '#!/bin/sh' > .git/hooks/pre-push
-	@echo 'make lint-all' >> .git/hooks/pre-push
-	@chmod +x .git/hooks/pre-push
-	@echo "Git hooks installed"
+hooks: ## Install repo-managed git hooks (.githooks via core.hooksPath)
+	./scripts/setup-githooks.sh
+
+safe-merge: ## Safely merge PR (usage: make safe-merge PR=123 [METHOD=merge|squash|rebase])
+	@if [ -z "$(PR)" ]; then echo "Usage: make safe-merge PR=<number> [METHOD=merge|squash|rebase]"; exit 1; fi
+	./scripts/safe-merge.sh "$(PR)" "$(if $(METHOD),$(METHOD),merge)"
 
 clean: ## Remove build artifacts
 	cargo clean

@@ -49,6 +49,9 @@
 - name: "status:completed"
   color: "238636"
   description: "Work completed"
+- name: "status:partial"
+  color: "8b949e"
+  description: "Partially delivered, follow-up issue required"
 
 # Component
 - name: "comp:ecs"
@@ -65,7 +68,7 @@
   description: "Dashboard UI"
 - name: "comp:inference"
   color: "e99695"
-  description: "BitNet / Inference"
+  description: "Inference / LLM Routing"
 - name: "comp:sandbox"
   color: "c2e0c6"
   description: "Agent Sandbox"
@@ -77,9 +80,34 @@
 - name: "prio:high"
   color: "d93f0b"
   description: "Important"
+- name: "prio:medium"
+  color: "fbca04"
+  description: "Medium priority"
 - name: "prio:low"
   color: "c5def5"
   description: "Nice to have"
+
+# Scope
+- name: "scope:full"
+  color: "1f6feb"
+  description: "Full delivery expected"
+- name: "scope:partial"
+  color: "8250df"
+  description: "Reduced scope delivery accepted"
+- name: "scope:experimental"
+  color: "db6d28"
+  description: "Prototype/placeholder accepted"
+
+# Issue Quality
+- name: "quality:needs-spec"
+  color: "b60205"
+  description: "Specification incomplete, not ready"
+- name: "quality:ready"
+  color: "238636"
+  description: "Spec + AC + verify complete"
+- name: "quality:needs-evidence"
+  color: "d29922"
+  description: "Implementation present, evidence incomplete"
 
 # Size (Story Points / Estimation)
 - name: "size:S"
