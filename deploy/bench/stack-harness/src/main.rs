@@ -484,8 +484,8 @@ fn bench_telemetry_micro() -> anyhow::Result<()> {
     let snapshot_iters = 500u64;
     let start = Instant::now();
     for _ in 0..snapshot_iters {
-        let (counters, histograms) = registry.snapshot_raw();
-        black_box((counters.len(), histograms.len()));
+        let (counters, histograms, gauges) = registry.snapshot_raw();
+        black_box((counters.len(), histograms.len(), gauges.len()));
     }
     let snapshot_us = start.elapsed().as_micros() as f64 / snapshot_iters as f64;
     print_metric("telemetry.metrics_snapshot_us", snapshot_us, "us/op");
