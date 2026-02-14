@@ -21,6 +21,12 @@ jobs:
             const body = pr.body || "";
             const failures = [];
 
+            const botActors = ["dependabot[bot]", "github-actions[bot]", "renovate[bot]"];
+            if (botActors.includes(pr.user.login)) {
+              core.info(`Bot PR detected (${pr.user.login}). Skipping quality gate.`);
+              return;
+            }
+
             if (pr.draft) {
               core.info("Draft PR detected. Skipping strict quality gate until ready_for_review.");
               return;
