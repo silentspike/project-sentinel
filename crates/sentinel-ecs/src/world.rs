@@ -155,7 +155,7 @@ pub fn create_simulation_world() -> (World, Schedule) {
     world.insert_resource(PersistTelemetry::default());
     world.insert_resource(EventBuffer::default());
 
-    // System-Reihenfolge via configure_sets
+    // System-Reihenfolge via configure_sets (10 Phasen)
     schedule.configure_sets(
         (
             SimulationPhase::Input,
@@ -165,6 +165,7 @@ pub fn create_simulation_world() -> (World, Schedule) {
             SimulationPhase::Chaos,
             SimulationPhase::Mood,
             SimulationPhase::Perception,
+            SimulationPhase::Decision,
             SimulationPhase::Output,
             SimulationPhase::Persist,
         )
@@ -179,13 +180,14 @@ pub fn create_simulation_world() -> (World, Schedule) {
     schedule.add_systems(chaos_system.in_set(SimulationPhase::Chaos));
     schedule.add_systems(mood_system.in_set(SimulationPhase::Mood));
     schedule.add_systems(perception_system.in_set(SimulationPhase::Perception));
+    schedule.add_systems(super::decision::decision_system.in_set(SimulationPhase::Decision));
     schedule.add_systems(output_system.in_set(SimulationPhase::Output));
     schedule.add_systems(persist_system.in_set(SimulationPhase::Persist));
 
     (world, schedule)
 }
 
-/// Spawnt einen Agenten mit allen 10 Components und Default-Werten
+/// Spawnt einen Agenten mit allen 11 Components und Default-Werten
 pub fn spawn_agent(
     world: &mut World,
     agent_id: AgentId,
@@ -264,6 +266,7 @@ pub fn spawn_agent(
                 shift_end_hour: shift_end,
                 is_on_duty: false,
             },
+            EventQueue::default(),
         ))
         .id()
 }

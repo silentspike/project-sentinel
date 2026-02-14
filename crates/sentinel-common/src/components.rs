@@ -1,6 +1,6 @@
 //! ECS Components fuer Agent-Simulation.
 //!
-//! Definiert 10 Components die den Zustand eines Agenten beschreiben.
+//! Definiert 11 Components die den Zustand eines Agenten beschreiben.
 //! Liegt in sentinel-common, damit sentinel-bio und sentinel-physics
 //! diese Typen nutzen koennen OHNE eine zirkulaere Abhaengigkeit
 //! zu sentinel-ecs zu erzeugen.
@@ -8,6 +8,45 @@
 use bevy_ecs::prelude::*;
 
 use crate::{AgentId, Emotion, Tick};
+
+/// Interrupt-Prioritaet fuer Decision Engine (P0 = hoechste Prioritaet)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Priority {
+    /// Sofort: Biologischer Notfall (Blase >90, Energie <15, Hunger >95, Stress >90)
+    P0,
+    /// Naechster Call: Direkte Interaktion (Meeting, angesprochen, Blase >70)
+    P1,
+    /// Bald: Umgebungsaenderung (Stress >60, Social-Need Extremwerte)
+    P2,
+    /// Wenn Platz: Hintergrund (Chaos-Event, Langeweile)
+    P3,
+}
+
+/// Einzelnes Event in der Agent-Queue
+#[derive(Debug, Clone)]
+pub struct PendingEvent {
+    pub priority: Priority,
+    /// Deutscher Impuls-Text
+    pub text: String,
+    /// Verbleibende Lebensdauer in Ticks (P3: 10, P2: 30, P1: 60, P0: 255 = effektiv unbegrenzt)
+    pub ttl_ticks: u16,
+    pub created_tick: u64,
+}
+
+/// Event-Queue Component pro Agent (max 5 Events pro Injection)
+#[derive(Component, Debug, Clone)]
+pub struct EventQueue {
+    /// Sortiert nach Priority (P0 zuerst)
+    pub events: Vec<PendingEvent>,
+}
+
+impl Default for EventQueue {
+    fn default() -> Self {
+        Self {
+            events: Vec::with_capacity(5),
+        }
+    }
+}
 
 /// Identitaet und Metadaten eines Agenten
 #[derive(Component, Debug, Clone)]
