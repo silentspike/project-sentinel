@@ -12,7 +12,7 @@
 
 ### How to Report
 
-Email: security@pixelperfekt.dev
+Use GitHub's [private vulnerability reporting](https://github.com/silentspike/project-sentinel/security/advisories/new).
 
 Include:
 - Description of the vulnerability
