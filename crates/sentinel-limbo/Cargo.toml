@@ -25,3 +25,8 @@ uuid = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 rusqlite = { version = "0.38", features = ["bundled"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "event_store_bench"
+harness = false

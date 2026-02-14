@@ -31,6 +31,8 @@ pub struct DomainEvent {
     pub timestamp_ms: u64,
     /// Schema-Version fuer Forward-Compatibility
     pub schema_version: u32,
+    /// Kompensations-Typ fuer Saga-Pattern (default: "none")
+    pub compensation_type: String,
 }
 
 impl DomainEvent {
@@ -58,6 +60,7 @@ impl DomainEvent {
             tick,
             timestamp_ms: now_ms,
             schema_version: 1,
+            compensation_type: "none".to_string(),
         }
     }
 
@@ -76,6 +79,12 @@ impl DomainEvent {
     /// Setzt eine explizite operation_id (Idempotenz).
     pub fn with_operation_id(mut self, operation_id: &str) -> Self {
         self.operation_id = operation_id.to_string();
+        self
+    }
+
+    /// Setzt den Kompensations-Typ (Saga-Pattern).
+    pub fn with_compensation_type(mut self, compensation_type: &str) -> Self {
+        self.compensation_type = compensation_type.to_string();
         self
     }
 }
