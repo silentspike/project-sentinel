@@ -290,10 +290,10 @@ fn bench_mixed_workload_tick(c: &mut Criterion) {
 
             // 3. Offset erhoehen
             offset += 1;
-            black_box(store.update_offset("bench-projection", offset).unwrap());
+            store.update_offset("bench-projection", offset).unwrap();
 
             // 4. Snapshot alle 10 Ticks
-            if tick % 10 == 0 {
+            if tick.is_multiple_of(10) {
                 black_box(
                     store
                         .save_snapshot(
