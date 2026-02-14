@@ -288,6 +288,21 @@ Konfigurationsdateien = "Konfigurationsdateien"
 Schichtwechsel = "Schichtwechsel"
 Konsolidierung = "Konsolidierung"
 
+# Pre-existing German words (codex-analyse, CONTRIBUTING, etc.)
+Feld = "Feld"
+alternativ = "alternativ"
+Variablen = "Variablen"
+Intervall = "Intervall"
+analyse = "analyse"
+Analyse = "Analyse"
+Dokument = "Dokument"
+Titel = "Titel"
+Ordner = "Ordner"
+separater = "separater"
+persistente = "persistente"
+funktional = "funktional"
+Funktions = "Funktions"
+
 [files]
 extend-exclude = [
     "Cargo.lock",
