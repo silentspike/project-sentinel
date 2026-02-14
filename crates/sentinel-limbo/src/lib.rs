@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{info, instrument};
 
 /// Histogram bucket boundaries for SQLite query latencies (microseconds).
+#[cfg(feature = "telemetry")]
 const LATENCY_BUCKETS: &[f64] = &[50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0];
 
 // ──────────────────────────────────────────────
@@ -144,7 +145,7 @@ impl ChatStore {
         timestamp: Timestamp,
         tick: Tick,
     ) -> anyhow::Result<i64> {
-        let start = std::time::Instant::now();
+        let _telemetry_start = std::time::Instant::now();
         let conn = self.conn.clone();
         let room_str = room_id.to_string();
         let agent_str = agent_id.to_string();
@@ -167,7 +168,7 @@ impl ChatStore {
             let reg = sentinel_telemetry::MetricsRegistry::global();
             reg.counter("sentinel.limbo.insert.count").increment();
             reg.histogram("sentinel.limbo.insert.duration_us", LATENCY_BUCKETS)
-                .observe(start.elapsed().as_micros() as f64);
+                .observe(_telemetry_start.elapsed().as_micros() as f64);
         }
         result
     }
@@ -181,7 +182,7 @@ impl ChatStore {
             return Ok(0);
         }
 
-        let start = std::time::Instant::now();
+        let _telemetry_start = std::time::Instant::now();
         let conn = self.conn.clone();
         let rows: Vec<(String, String, String, Option<String>, i64, i64)> = messages
             .iter()
@@ -218,7 +219,7 @@ impl ChatStore {
             let reg = sentinel_telemetry::MetricsRegistry::global();
             reg.counter("sentinel.limbo.insert_batch.count").increment();
             reg.histogram("sentinel.limbo.insert_batch.duration_us", LATENCY_BUCKETS)
-                .observe(start.elapsed().as_micros() as f64);
+                .observe(_telemetry_start.elapsed().as_micros() as f64);
         }
         result
     }
@@ -230,7 +231,7 @@ impl ChatStore {
         room_id: RoomId,
         limit: u32,
     ) -> anyhow::Result<Vec<MessageRow>> {
-        let start = std::time::Instant::now();
+        let _telemetry_start = std::time::Instant::now();
         let conn = self.conn.clone();
         let room_str = room_id.to_string();
 
@@ -262,7 +263,7 @@ impl ChatStore {
             let reg = sentinel_telemetry::MetricsRegistry::global();
             reg.counter("sentinel.limbo.query.count").increment();
             reg.histogram("sentinel.limbo.query.duration_us", LATENCY_BUCKETS)
-                .observe(start.elapsed().as_micros() as f64);
+                .observe(_telemetry_start.elapsed().as_micros() as f64);
         }
         result
     }
@@ -335,7 +336,7 @@ impl ChatStore {
         context: Option<&str>,
         timestamp: Timestamp,
     ) -> anyhow::Result<i64> {
-        let start = std::time::Instant::now();
+        let _telemetry_start = std::time::Instant::now();
         let conn = self.conn.clone();
         let agent_str = agent_id.to_string();
         let model = model.to_string();
@@ -357,7 +358,7 @@ impl ChatStore {
             let reg = sentinel_telemetry::MetricsRegistry::global();
             reg.counter("sentinel.limbo.insert.count").increment();
             reg.histogram("sentinel.limbo.insert.duration_us", LATENCY_BUCKETS)
-                .observe(start.elapsed().as_micros() as f64);
+                .observe(_telemetry_start.elapsed().as_micros() as f64);
         }
         result
     }
@@ -374,7 +375,7 @@ impl ChatStore {
         description: &str,
         timestamp: Timestamp,
     ) -> anyhow::Result<i64> {
-        let start = std::time::Instant::now();
+        let _telemetry_start = std::time::Instant::now();
         let conn = self.conn.clone();
         let event_str = event_type_to_str(event_type);
         let room_str = target_room.map(|r| r.to_string());
@@ -396,7 +397,7 @@ impl ChatStore {
             let reg = sentinel_telemetry::MetricsRegistry::global();
             reg.counter("sentinel.limbo.insert.count").increment();
             reg.histogram("sentinel.limbo.insert.duration_us", LATENCY_BUCKETS)
-                .observe(start.elapsed().as_micros() as f64);
+                .observe(_telemetry_start.elapsed().as_micros() as f64);
         }
         result
     }

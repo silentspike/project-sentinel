@@ -2,3 +2,5 @@
 [simulation]
 tick_rate_hz = 1
 max_agents_per_shift = 15
+# Interim default from persist-interval ablation (2026-02-13)
+persist_every_n_ticks = 20

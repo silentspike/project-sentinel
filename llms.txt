@@ -30,7 +30,7 @@
 - **Neuro-Symbolic AI**: ECS (symbolic, deterministic) + LLM (neural, probabilistic)
 - **Perception Injection**: `[SYSTEM_INJECTION]...[/SYSTEM_INJECTION]` blocks injected transparently before each LLM call
 - **Fourth-Wall Detection**: Regex + LLM-Judge detects when agent realizes it's AI → re-generation
-- **NMDA Sleep-Cycle**: Nightly memory consolidation via LoRA fine-tuning
+- **NMDA Night-Run**: Shift-change memory consolidation via background service (no model training)
 - **Diegetic Hardware Mapping**: CPU throttling = "afternoon tiredness", API timeout = "migraine"
 
 ## Building
