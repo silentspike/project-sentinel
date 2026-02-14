@@ -2815,6 +2815,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-nightrun"
+version = "0.1.0"
+dependencies = [
+ "sentinel-common",
+]
+
+[[package]]
 name = "sentinel-physics"
 version = "0.1.0"
 dependencies = [
