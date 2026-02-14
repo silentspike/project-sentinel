@@ -82,6 +82,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.config == 'true'
     runs-on: [self-hosted, linux, x64]
+    env:
+      CARGO_BUILD_JOBS: "3"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -155,9 +157,10 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2.1.2
-        with:
-          bun-version: latest
+      - name: Install Bun (baseline for legacy CPU)
+        run: |
+          curl -fsSL https://bun.sh/install | bash
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
 
       - name: Install
         working-directory: dashboard
