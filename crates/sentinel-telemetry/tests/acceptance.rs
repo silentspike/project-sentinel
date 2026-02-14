@@ -45,7 +45,7 @@ fn ac_34_04_metrics_counter() {
     assert_eq!(counter2.get(), initial + 3);
 
     // Verify snapshot contains the counter
-    let (counters, _) = registry.snapshot_raw();
+    let (counters, _, _) = registry.snapshot_raw();
     assert_eq!(
         *counters.get("sentinel.ac_test.34_04.count").unwrap(),
         initial + 3
@@ -165,6 +165,7 @@ fn ac_34_08_snapshots_serializable() {
             health: HealthStatus::Healthy,
             counters: HashMap::from([("sentinel.redb.read.count".to_string(), 42)]),
             histograms: HashMap::new(),
+            gauges: HashMap::new(),
         },
     );
     let metrics_snap = MetricsSnapshot {

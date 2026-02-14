@@ -14,9 +14,15 @@ zenoh = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
 sentinel-telemetry = { path = "../sentinel-telemetry" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+sentinel-common = { path = "../sentinel-common" }

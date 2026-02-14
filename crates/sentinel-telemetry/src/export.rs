@@ -108,9 +108,9 @@ impl<T: TelemetryTransport> TelemetryExporter<T> {
         timestamp: Timestamp,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let registry = MetricsRegistry::global();
-        let (counters, histograms) = registry.snapshot_raw();
+        let (counters, histograms, gauges) = registry.snapshot_raw();
 
-        // Build per-subsystem metrics from flat counter/histogram maps
+        // Build per-subsystem metrics from flat counter/histogram/gauge maps
         let mut subsystems = std::collections::HashMap::new();
         for (name, value) in &counters {
             // Extract subsystem from metric name: sentinel.{subsystem}.{op}.{type}
@@ -120,6 +120,7 @@ impl<T: TelemetryTransport> TelemetryExporter<T> {
                         health: crate::health::HealthStatus::Healthy,
                         counters: std::collections::HashMap::new(),
                         histograms: std::collections::HashMap::new(),
+                        gauges: std::collections::HashMap::new(),
                     }
                 });
                 entry.counters.insert(name.clone(), *value);
@@ -132,9 +133,23 @@ impl<T: TelemetryTransport> TelemetryExporter<T> {
                         health: crate::health::HealthStatus::Healthy,
                         counters: std::collections::HashMap::new(),
                         histograms: std::collections::HashMap::new(),
+                        gauges: std::collections::HashMap::new(),
                     }
                 });
                 entry.histograms.insert(name, snap);
+            }
+        }
+        for (name, value) in &gauges {
+            if let Some(subsystem) = extract_subsystem(name) {
+                let entry = subsystems.entry(subsystem.to_string()).or_insert_with(|| {
+                    crate::metrics::SubsystemMetrics {
+                        health: crate::health::HealthStatus::Healthy,
+                        counters: std::collections::HashMap::new(),
+                        histograms: std::collections::HashMap::new(),
+                        gauges: std::collections::HashMap::new(),
+                    }
+                });
+                entry.gauges.insert(name.clone(), *value);
             }
         }
 

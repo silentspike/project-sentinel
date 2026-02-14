@@ -2887,9 +2887,12 @@ dependencies = [
  "anyhow",
  "sentinel-common",
  "sentinel-telemetry",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "zenoh",
 ]
 
