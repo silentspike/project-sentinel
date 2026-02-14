@@ -6,6 +6,7 @@
 //! zu sentinel-ecs zu erzeugen.
 
 use bevy_ecs::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::{AgentId, Emotion, Tick};
 
@@ -49,7 +50,7 @@ impl Default for EventQueue {
 }
 
 /// Identitaet und Metadaten eines Agenten
-#[derive(Component, Debug, Clone)]
+#[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct AgentIdentity {
     pub agent_id: AgentId,
     pub name: String,
@@ -133,7 +134,7 @@ pub struct LlmConfig {
 }
 
 /// Schichtinformationen
-#[derive(Component, Debug, Clone)]
+#[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct ShiftInfo {
     pub shift_set: u8,        // 0=Sonder, 1=Frueh, 2=Mittel, 3=Spaet
     pub shift_start_hour: u8, // 0-23

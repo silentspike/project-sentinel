@@ -1,11 +1,16 @@
 //! Acceptance Tests fuer Issue #15: sentinel-runtime
 //!
 //! Testet RuntimeOrchestrator: spawn/despawn, max-agents-limit,
-//! Schichtwechsel, Sonder-Set Beibehaltung, Health-Checks.
+//! Schichtwechsel, Sonder-Set Beibehaltung, Health-Checks,
+//! Event-Sourced Lifecycle (AC-2), Resume nach Neustart (AC-4).
+
+use std::sync::Arc;
 
 use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::AgentId;
+use sentinel_limbo::EventStore;
 use sentinel_runtime::{AgentStatus, RuntimeOrchestrator};
+use tempfile::TempDir;
 
 fn create_identity(id: u16, name: &str, role: &str) -> AgentIdentity {
     AgentIdentity {
@@ -22,6 +27,13 @@ fn create_shift(shift_set: u8, start: u8, end: u8) -> ShiftInfo {
         shift_end_hour: end,
         is_on_duty: true,
     }
+}
+
+fn temp_event_store() -> (TempDir, Arc<EventStore>) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("acceptance_runtime.db");
+    let store = EventStore::open(path.to_str().unwrap()).unwrap();
+    (dir, Arc::new(store))
 }
 
 // AC #15.02: spawn, verify active, despawn, verify gone
@@ -56,6 +68,72 @@ fn ac_15_02_spawn_despawn() {
     );
 }
 
+// AC #15.02b: Lifecycle events are event-sourced (AC-2)
+#[test]
+fn ac_15_02_lifecycle_events_sourced() {
+    let (_dir, store) = temp_event_store();
+    let mut orch = RuntimeOrchestrator::new(20).with_event_store(store.clone());
+    orch.set_tick(1);
+
+    // Spawn 3 agents
+    orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
+        .unwrap();
+    orch.spawn_agent(
+        create_identity(2, "Lisa", "Designer"),
+        create_shift(1, 6, 14),
+    )
+    .unwrap();
+    orch.spawn_agent(
+        create_identity(3, "Andreas", "Developer"),
+        create_shift(1, 6, 14),
+    )
+    .unwrap();
+
+    // Verify spawn events in store
+    let events_1 = store.get_events_by_aggregate("AGENT-01", 10).unwrap();
+    assert_eq!(events_1.len(), 1, "Agent 1 should have 1 spawn event");
+    assert_eq!(events_1[0].event_type, "agent_spawned");
+
+    let events_2 = store.get_events_by_aggregate("AGENT-02", 10).unwrap();
+    assert_eq!(events_2.len(), 1, "Agent 2 should have 1 spawn event");
+
+    // Despawn Agent 2
+    orch.despawn_agent(AgentId(2)).unwrap();
+
+    let events_2 = store.get_events_by_aggregate("AGENT-02", 10).unwrap();
+    assert_eq!(
+        events_2.len(),
+        2,
+        "Agent 2 should have 2 events (spawn + despawn)"
+    );
+    assert_eq!(events_2[1].event_type, "agent_despawned");
+
+    // Shift transition
+    orch.set_tick(10);
+    let _ = orch.shift_transition(2);
+
+    let runtime_events = store.get_events_by_aggregate("runtime", 10).unwrap();
+    assert_eq!(
+        runtime_events.len(),
+        1,
+        "Runtime should have 1 shift transition event"
+    );
+    assert_eq!(
+        runtime_events[0].event_type, "shift_transition_completed",
+        "Event type should be shift_transition_completed"
+    );
+    assert_eq!(runtime_events[0].tick, 10, "Event tick should match");
+
+    // All events have outbox entries (for Zenoh)
+    // Total events: 3 spawns + 1 despawn + 1 shift = 5
+    let all_events = store.get_events_since(0, 100).unwrap();
+    assert!(
+        all_events.len() >= 5,
+        "Should have at least 5 lifecycle events, got {}",
+        all_events.len()
+    );
+}
+
 // AC #15.03: spawn max+1 -> Error
 #[test]
 fn ac_15_03_max_agents_limit() {
@@ -86,9 +164,87 @@ fn ac_15_03_max_agents_limit() {
     );
 }
 
-// AC #15.04: Set 1 active, transition to Set 2, verify Set 1 gone
+// AC #15.04: Resume after restart with persisted states
 #[test]
-fn ac_15_04_shift_transition() {
+fn ac_15_04_resume_after_restart() {
+    let (_dir, store) = temp_event_store();
+
+    // Phase 1: Create orchestrator, spawn agents, save state
+    {
+        let mut orch = RuntimeOrchestrator::new(20).with_event_store(store.clone());
+        orch.set_tick(50);
+
+        // Spawn 5 agents across shifts
+        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
+            .unwrap();
+        orch.spawn_agent(
+            create_identity(2, "Lisa", "Designer"),
+            create_shift(1, 6, 14),
+        )
+        .unwrap();
+        orch.spawn_agent(
+            create_identity(3, "Andreas", "Developer"),
+            create_shift(2, 14, 22),
+        )
+        .unwrap();
+        orch.spawn_agent(
+            create_identity(4, "Sandra", "PM"),
+            create_shift(2, 14, 22),
+        )
+        .unwrap();
+        orch.spawn_agent(
+            create_identity(46, "Betriebsrat", "Sonder"),
+            create_shift(0, 0, 23),
+        )
+        .unwrap();
+
+        // Set one to Errored
+        if let Some(h) = orch.get_agent_mut(AgentId(3)) {
+            h.status = AgentStatus::Errored;
+        }
+
+        assert_eq!(orch.agent_count(), 5);
+
+        // Save state (simulates clean shutdown)
+        orch.save_state().unwrap();
+    }
+    // Orchestrator dropped here — simulates process exit
+
+    // Phase 2: Restore from snapshot (simulates restart)
+    let mut restored = RuntimeOrchestrator::restore(store, 20).unwrap();
+
+    // Verify all 5 agents are back
+    assert_eq!(
+        restored.agent_count(),
+        5,
+        "All 5 agents should be restored after restart"
+    );
+
+    // Verify specific agent identities survived
+    let agent1 = restored.get_agent_mut(AgentId(1)).unwrap();
+    assert_eq!(agent1.identity.name, "Thomas");
+    assert_eq!(agent1.identity.role, "CEO");
+    assert_eq!(agent1.status, AgentStatus::Active);
+    assert_eq!(agent1.shift.shift_set, 1);
+
+    // Verify Errored status persisted
+    let agent3 = restored.get_agent_mut(AgentId(3)).unwrap();
+    assert_eq!(
+        agent3.status,
+        AgentStatus::Errored,
+        "Errored status should persist across restart"
+    );
+    assert_eq!(agent3.identity.name, "Andreas");
+
+    // Verify Sonder-Agent persisted
+    let sonder = restored.get_agent_mut(AgentId(46)).unwrap();
+    assert_eq!(sonder.shift.shift_set, 0, "Sonder shift_set should be 0");
+    assert_eq!(sonder.identity.name, "Betriebsrat");
+}
+
+// AC #15.04b: Set 1 active, transition to Set 2, verify Set 1 gone
+#[test]
+fn ac_15_04b_shift_transition() {
     let mut orch = RuntimeOrchestrator::new(20);
 
     // Set 1 Agents (Frueh-Schicht)

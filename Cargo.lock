@@ -3058,7 +3058,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "sentinel-common",
+ "sentinel-limbo",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
