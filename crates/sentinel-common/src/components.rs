@@ -63,6 +63,8 @@ pub struct Position {
     pub in_transit: bool,
     pub transit_target: Option<String>,
     pub transit_remaining_ms: u32,
+    /// Correlation-ID vom Move-Action-Event (fuer Causation-Chain bei TransitCompleted)
+    pub transit_correlation_id: Option<String>,
 }
 
 /// Biologischer Zustand (Hunger, Energie, Koffein, Blase, Stress, Sozial)

@@ -43,11 +43,18 @@ pub enum SimulationPhase {
 ///
 /// Verarbeitet alle pending Actions in einem Tick:
 /// - Move → Position.transit_target + in_transit setzen
-/// - Chat/ToolUse → WorkContext aktualisieren
-/// - Erzeugt DomainEvent (AgentActionReceived) pro Aktion
+/// - Chat → WorkContext aktualisieren
+/// - ToolUse → Bio-Actions (drink_coffee, eat_meal, use_bathroom) oder WorkContext
+/// - Emote/PhoneCall → nur Event-Trail (keine State-Mutation)
+/// - Erzeugt DomainEvent (AgentActionReceived) pro Aktion mit Causation-Chain
 pub fn input_system(
     receiver: Option<Res<ActionReceiver>>,
-    mut query: Query<(&AgentIdentity, &mut Position, &mut WorkContext)>,
+    mut query: Query<(
+        &AgentIdentity,
+        &mut Position,
+        &mut WorkContext,
+        &mut BioState,
+    )>,
     mut event_buffer: ResMut<EventBuffer>,
     time: Res<SimulationTime>,
 ) {
@@ -55,9 +62,13 @@ pub fn input_system(
     let Ok(rx) = receiver.0.lock() else { return };
 
     while let Ok(action) = rx.try_recv() {
+        // Correlation-ID fuer diesen Vorgang (gruppiert Action + Folge-Events)
+        let correlation_id = uuid::Uuid::new_v4().to_string();
+        let mut bio_action: Option<&str> = None;
+
         // Agent im ECS finden
         let mut found = false;
-        for (identity, mut position, mut work_ctx) in &mut query {
+        for (identity, mut position, mut work_ctx, mut bio) in &mut query {
             if identity.agent_id != action.agent_id {
                 continue;
             }
@@ -70,6 +81,7 @@ pub fn input_system(
                         position.transit_target = Some(format!("ROOM-{}", target_room.0));
                         // Default Transit-Dauer: 3000ms (wird spaeter aus rooms.toml berechnet)
                         position.transit_remaining_ms = 3000;
+                        position.transit_correlation_id = Some(correlation_id.clone());
                     }
                 }
                 ActionType::Chat => {
@@ -79,10 +91,28 @@ pub fn input_system(
                 }
                 ActionType::ToolUse => {
                     if let Some(content) = &action.content {
-                        work_ctx.current_task = Some(content.clone());
+                        match content.as_str() {
+                            "drink_coffee" => {
+                                sentinel_bio::drink_coffee(&mut bio);
+                                bio_action = Some("drink_coffee");
+                            }
+                            "eat_meal" => {
+                                sentinel_bio::eat_meal(&mut bio);
+                                bio_action = Some("eat_meal");
+                            }
+                            "use_bathroom" => {
+                                sentinel_bio::use_bathroom(&mut bio);
+                                bio_action = Some("use_bathroom");
+                            }
+                            _ => {
+                                work_ctx.current_task = Some(content.clone());
+                            }
+                        }
                     }
                 }
-                _ => {}
+                ActionType::Emote | ActionType::PhoneCall => {
+                    // Keine State-Mutation, Event wird unten erzeugt
+                }
             }
 
             break;
@@ -93,21 +123,39 @@ pub fn input_system(
             continue;
         }
 
-        // DomainEvent erzeugen
+        // AgentActionReceived-Event erzeugen (fuer JEDE Action)
         let payload = DomainEventPayload::AgentActionReceived {
             agent_id: action.agent_id,
             action_type: format!("{:?}", action.action_type),
             target_room: action.target_room.map(|r| format!("ROOM-{}", r.0)),
             content: action.content.clone(),
         };
-        let event = DomainEvent::new(
+        let action_event = DomainEvent::new(
             payload.event_type_str(),
             &action.agent_id.to_string(),
             &payload.to_json(),
-            &uuid::Uuid::new_v4().to_string(),
+            &correlation_id,
             time.tick.0,
         );
-        event_buffer.events.push(event);
+        let action_event_id = action_event.event_id.clone();
+        event_buffer.events.push(action_event);
+
+        // BioActionPerformed-Event (Causation-Chain: Action → Bio-Effect)
+        if let Some(action_name) = bio_action {
+            let bio_payload = DomainEventPayload::BioActionPerformed {
+                agent_id: action.agent_id,
+                action: action_name.to_string(),
+            };
+            let bio_event = DomainEvent::new(
+                bio_payload.event_type_str(),
+                &action.agent_id.to_string(),
+                &bio_payload.to_json(),
+                &correlation_id,
+                time.tick.0,
+            )
+            .with_causation(&action_event_id);
+            event_buffer.events.push(bio_event);
+        }
     }
 }
 
@@ -186,16 +234,20 @@ pub fn transit_system(
                 if let Some(target) = target_room {
                     pos.room_id = target.clone();
 
-                    // DomainEvent: TransitCompleted
+                    // DomainEvent: TransitCompleted (mit Causation-Chain vom Move-Action)
                     let payload = DomainEventPayload::TransitCompleted {
                         agent_id: identity.agent_id,
                         room_id: target,
                     };
+                    let correlation = pos
+                        .transit_correlation_id
+                        .take()
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                     let event = DomainEvent::new(
                         payload.event_type_str(),
                         &identity.agent_id.to_string(),
                         &payload.to_json(),
-                        &uuid::Uuid::new_v4().to_string(),
+                        &correlation,
                         time.tick.0,
                     );
                     event_buffer.events.push(event);
