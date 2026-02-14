@@ -3,9 +3,11 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -16,7 +18,9 @@ import (
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/compiler"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/detection"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/eventstore"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/mapping"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
 )
 
@@ -54,31 +58,34 @@ type PipelineConfig struct {
 	Capabilities *capability.ProviderCapabilities
 	Logger       *slog.Logger
 	BreakerCfg   BreakerConfig
+	EventStore   *eventstore.Store // optional: nil disables event persistence
 }
 
 // PipelineHandler orchestriert die 7-Step LLM-Pipeline.
 type PipelineHandler struct {
-	registry *Registry
-	config   *control.Config
-	compiler *compiler.Compiler
-	norm     *normalizer.Normalizer
-	ext      *extraction.Extractor
-	caps     *capability.ProviderCapabilities
-	logger   *slog.Logger
+	registry   *Registry
+	config     *control.Config
+	compiler   *compiler.Compiler
+	norm       *normalizer.Normalizer
+	ext        *extraction.Extractor
+	caps       *capability.ProviderCapabilities
+	logger     *slog.Logger
+	eventStore *eventstore.Store
 
-	breakerMu sync.RWMutex
-	breakers  map[string]*CircuitBreaker
+	breakerMu  sync.RWMutex
+	breakers   map[string]*CircuitBreaker
 	breakerCfg BreakerConfig
 }
 
 // PipelineResponse ist die erweiterte Antwort mit extrahierten Aktionen.
 type PipelineResponse struct {
-	Content      string                     `json:"content"`
-	Model        string                     `json:"model"`
-	Provider     string                     `json:"provider"`
-	TokensUsed   int                        `json:"tokens_used"`
-	FinishReason string                     `json:"finish_reason"`
+	Content      string                       `json:"content"`
+	Model        string                       `json:"model"`
+	Provider     string                       `json:"provider"`
+	TokensUsed   int                          `json:"tokens_used"`
+	FinishReason string                       `json:"finish_reason"`
 	Actions      []extraction.ExtractedAction `json:"actions,omitempty"`
+	RequestID    string                       `json:"request_id"`
 }
 
 // NewPipelineHandler erstellt den Pipeline-Handler.
@@ -91,6 +98,7 @@ func NewPipelineHandler(cfg PipelineConfig) *PipelineHandler {
 		ext:        cfg.Extractor,
 		caps:       cfg.Capabilities,
 		logger:     cfg.Logger,
+		eventStore: cfg.EventStore,
 		breakers:   make(map[string]*CircuitBreaker),
 		breakerCfg: cfg.BreakerCfg,
 	}
@@ -125,6 +133,12 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	defer func() { _ = r.Body.Close() }()
 	start := time.Now()
+
+	// Request-ID fuer Traceability + Idempotenz
+	requestID := r.Header.Get("X-Request-ID")
+	if requestID == "" {
+		requestID = eventstore.GenerateUUID()
+	}
 
 	// --- Step 0: Request lesen + validieren ---
 	limited := io.LimitReader(r.Body, maxRequestBodySize+1)
@@ -223,6 +237,26 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// --- Step 8: Action Extraction ---
 	actions := ph.ext.Extract(content)
 
+	// --- Step 8b: Persist extracted actions as events (AC-5) ---
+	if ph.eventStore != nil && len(actions) > 0 && agentName != "" {
+		meta := mapping.ActionMeta{
+			AgentName: agentName,
+			RequestID: requestID,
+			Tick:      parseTick(req.Metadata),
+		}
+		domainEvents := mapping.MapActions(actions, meta)
+		for _, evt := range domainEvents {
+			topic := fmt.Sprintf("sentinel/cortex/events/%s", agentName)
+			if err := ph.eventStore.AppendWithOutbox(evt, topic); err != nil {
+				ph.logger.Warn("event store write failed",
+					"error", err,
+					"request_id", requestID,
+					"agent", agentName,
+				)
+			}
+		}
+	}
+
 	// --- Step 9: Response ---
 	duration := time.Since(start)
 	pipelineRequestsTotal.WithLabelValues(providerName, "ok").Inc()
@@ -242,6 +276,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		TokensUsed:   resp.TokensUsed,
 		FinishReason: resp.FinishReason,
 		Actions:      actions,
+		RequestID:    requestID,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -348,6 +383,16 @@ func appendCorrectionMessage(messages []Message, correction string) []Message {
 	result := make([]Message, len(messages), len(messages)+1)
 	copy(result, messages)
 	return append(result, Message{Role: "system", Content: correction})
+}
+
+// parseTick extrahiert den Tick-Wert aus Request-Metadata.
+func parseTick(metadata map[string]string) int64 {
+	if v, ok := metadata["tick"]; ok {
+		if tick, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return tick
+		}
+	}
+	return 0
 }
 
 // updateBreakerGauge setzt die Prometheus-Gauge fuer den Breaker-State.
