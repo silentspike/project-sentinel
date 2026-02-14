@@ -84,6 +84,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sprint 6: `config/observatory.toml`: Multi-model observatory configuration (3 shifts: Claude, Llama, Qwen; 4 scenarios; feature flag via SENTINEL_OBSERVATORY)
 - `sentinel-zenoh` extended: SHM-Fallback (AC2), Scoped Queries with UUIDv7/deadline/min_tick (AC1/AC3), InFlightTracker with global=128/per-agent=8 Semaphore limits (AC4), BusConfig ENV parsing, query metrics (stale_drop, timeout, duration, inflight gauge)
 - `sentinel-telemetry`: Gauge metric type (AtomicI64) with set/increment/decrement/get, integrated into MetricsRegistry and snapshot_raw
+- `sentinel-limbo` EventStore: `snapshots` table with `save_snapshot()` and `get_latest_snapshot()` (auto-incrementing version)
+- `sentinel-limbo` EventStore: `compensation_type` field (Saga-Pattern, default "none") in events table and DomainEvent
+- `sentinel-limbo` EventStore: Monotonic offset enforcement in `update_offset()` (returns `MonotonicityError` on violation)
+- `sentinel-limbo` EventStore: `event_count()` and `get_all_events()` for rebuild/recovery
+- `sentinel-limbo` EventStore: Telemetry instrumentation (Counter + Histogram for append, query, snapshot, outbox)
+- `sentinel-limbo` EventStore: 7 acceptance tests (AC-1 through AC-7) and 4 new unit tests
+- `sentinel-common` DomainEvent: `compensation_type` field with `with_compensation_type()` builder
 
 ### Changed
 

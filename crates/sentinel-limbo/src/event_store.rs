@@ -10,8 +10,13 @@
 
 use rusqlite::{params, Connection};
 use sentinel_common::DomainEvent;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, instrument};
+
+/// Histogram-Buckets fuer EventStore Latenzen (Mikrosekunden).
+#[cfg(feature = "telemetry")]
+const LATENCY_BUCKETS: &[f64] = &[50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0];
 
 // ──────────────────────────────────────────────
 // SQL Schema
@@ -29,7 +34,8 @@ CREATE TABLE IF NOT EXISTS events (
     operation_id TEXT NOT NULL,
     tick INTEGER NOT NULL,
     timestamp_ms INTEGER NOT NULL,
-    schema_version INTEGER NOT NULL DEFAULT 1
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    compensation_type TEXT NOT NULL DEFAULT 'none'
 )";
 
 const CREATE_IDX_EVENTS_AGGREGATE: &str =
@@ -55,6 +61,20 @@ CREATE TABLE IF NOT EXISTS outbox (
 const CREATE_IDX_OUTBOX_PENDING: &str =
     "CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(status) WHERE status = 'pending'";
 
+const CREATE_SNAPSHOTS: &str = "
+CREATE TABLE IF NOT EXISTS snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    aggregate_id TEXT NOT NULL,
+    snapshot_type TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    last_event_id INTEGER NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL
+)";
+
+const CREATE_IDX_SNAPSHOTS_AGGREGATE: &str =
+    "CREATE INDEX IF NOT EXISTS idx_snapshots_aggregate ON snapshots(aggregate_id, version DESC)";
+
 const CREATE_PROJECTION_OFFSETS: &str = "
 CREATE TABLE IF NOT EXISTS projection_offsets (
     projection_name TEXT PRIMARY KEY,
@@ -66,6 +86,26 @@ CREATE TABLE IF NOT EXISTS projection_offsets (
 // OutboxEntry
 // ──────────────────────────────────────────────
 
+/// Fehler bei Monotonie-Verletzung von projection_offsets.
+#[derive(Debug)]
+pub struct MonotonicityError {
+    pub projection: String,
+    pub current: i64,
+    pub attempted: i64,
+}
+
+impl fmt::Display for MonotonicityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "monotonicity violation for projection '{}': current={}, attempted={}",
+            self.projection, self.current, self.attempted
+        )
+    }
+}
+
+impl std::error::Error for MonotonicityError {}
+
 /// Zeile aus der Outbox-Tabelle fuer den Publisher.
 #[derive(Debug, Clone)]
 pub struct OutboxEntry {
@@ -74,6 +114,18 @@ pub struct OutboxEntry {
     pub topic: String,
     pub payload: String,
     pub status: String,
+    pub created_at: u64,
+}
+
+/// Zeile aus der Snapshots-Tabelle.
+#[derive(Debug, Clone)]
+pub struct SnapshotRow {
+    pub id: i64,
+    pub aggregate_id: String,
+    pub snapshot_type: String,
+    pub payload: String,
+    pub last_event_id: i64,
+    pub version: i32,
     pub created_at: u64,
 }
 
@@ -111,6 +163,8 @@ impl EventStore {
         conn.execute(CREATE_IDX_EVENTS_OPERATION, [])?;
         conn.execute_batch(CREATE_OUTBOX)?;
         conn.execute(CREATE_IDX_OUTBOX_PENDING, [])?;
+        conn.execute_batch(CREATE_SNAPSHOTS)?;
+        conn.execute(CREATE_IDX_SNAPSHOTS_AGGREGATE, [])?;
         conn.execute_batch(CREATE_PROJECTION_OFFSETS)?;
 
         info!("EventStore opened at {path}");
@@ -121,12 +175,13 @@ impl EventStore {
 
     /// Append-only: Fuegt ein Event ein. Gibt die interne Row-ID zurueck.
     pub fn append_event(&self, event: &DomainEvent) -> anyhow::Result<i64> {
+        let _telemetry_start = std::time::Instant::now();
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
         conn.execute(
-            "INSERT OR IGNORE INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT OR IGNORE INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 event.event_id,
                 event.event_type,
@@ -138,9 +193,18 @@ impl EventStore {
                 event.tick as i64,
                 event.timestamp_ms as i64,
                 event.schema_version,
+                event.compensation_type,
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let row_id = conn.last_insert_rowid();
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.limbo.event.append.count").increment();
+            reg.histogram("sentinel.limbo.event.append.duration_us", LATENCY_BUCKETS)
+                .observe(_telemetry_start.elapsed().as_micros() as f64);
+        }
+        Ok(row_id)
     }
 
     /// Atomar: Event + Outbox-Eintrag in einer Transaktion (AC1, AC3).
@@ -148,6 +212,7 @@ impl EventStore {
     /// Nutzt operation_id als Idempotenz-Key (UNIQUE INDEX).
     /// Bei Duplikat (gleiche operation_id) wird kein neuer Eintrag erstellt.
     pub fn append_with_outbox(&self, event: &DomainEvent, topic: &str) -> anyhow::Result<i64> {
+        let _telemetry_start = std::time::Instant::now();
         let mut conn = self
             .conn
             .lock()
@@ -156,7 +221,7 @@ impl EventStore {
 
         // INSERT OR IGNORE: Idempotenz via operation_id UNIQUE INDEX
         let inserted = tx.execute(
-            "INSERT OR IGNORE INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT OR IGNORE INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 event.event_id,
                 event.event_type,
@@ -168,6 +233,7 @@ impl EventStore {
                 event.tick as i64,
                 event.timestamp_ms as i64,
                 event.schema_version,
+                event.compensation_type,
             ],
         )?;
 
@@ -188,6 +254,17 @@ impl EventStore {
         tx.commit()?;
 
         debug!(event_id = %event.event_id, event_type = %event.event_type, "event appended");
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.limbo.event.append_outbox.count")
+                .increment();
+            reg.histogram(
+                "sentinel.limbo.event.append_outbox.duration_us",
+                LATENCY_BUCKETS,
+            )
+            .observe(_telemetry_start.elapsed().as_micros() as f64);
+        }
         Ok(row_id)
     }
 
@@ -197,12 +274,13 @@ impl EventStore {
         after_id: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<DomainEvent>> {
+        let _telemetry_start = std::time::Instant::now();
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
-            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![after_id, limit as i64], |row| {
             Ok(DomainEvent {
@@ -216,11 +294,19 @@ impl EventStore {
                 tick: row.get::<_, i64>(7)? as u64,
                 timestamp_ms: row.get::<_, i64>(8)? as u64,
                 schema_version: row.get::<_, i32>(9)? as u32,
+                compensation_type: row.get(10)?,
             })
         })?;
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
+        }
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.limbo.event.query.count").increment();
+            reg.histogram("sentinel.limbo.event.query.duration_us", LATENCY_BUCKETS)
+                .observe(_telemetry_start.elapsed().as_micros() as f64);
         }
         Ok(results)
     }
@@ -236,7 +322,7 @@ impl EventStore {
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
-            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version FROM events WHERE aggregate_id = ?1 ORDER BY id ASC LIMIT ?2",
+            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE aggregate_id = ?1 ORDER BY id ASC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![aggregate_id, limit as i64], |row| {
             Ok(DomainEvent {
@@ -250,6 +336,7 @@ impl EventStore {
                 tick: row.get::<_, i64>(7)? as u64,
                 timestamp_ms: row.get::<_, i64>(8)? as u64,
                 schema_version: row.get::<_, i32>(9)? as u32,
+                compensation_type: row.get(10)?,
             })
         })?;
         let mut results = Vec::new();
@@ -259,10 +346,92 @@ impl EventStore {
         Ok(results)
     }
 
+    // ── Snapshots ──────────────────────────────────
+
+    /// Speichert einen Snapshot fuer ein Aggregate. Version wird automatisch inkrementiert.
+    pub fn save_snapshot(
+        &self,
+        aggregate_id: &str,
+        snapshot_type: &str,
+        payload: &str,
+        last_event_id: i64,
+    ) -> anyhow::Result<i64> {
+        let _telemetry_start = std::time::Instant::now();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+
+        // Aktuelle Version ermitteln
+        let current_version: i32 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM snapshots WHERE aggregate_id = ?1",
+                params![aggregate_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        conn.execute(
+            "INSERT INTO snapshots (aggregate_id, snapshot_type, payload, last_event_id, version, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                aggregate_id,
+                snapshot_type,
+                payload,
+                last_event_id,
+                current_version + 1,
+                now_ms,
+            ],
+        )?;
+        let row_id = conn.last_insert_rowid();
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.limbo.snapshot.save.count")
+                .increment();
+            reg.histogram("sentinel.limbo.snapshot.save.duration_us", LATENCY_BUCKETS)
+                .observe(_telemetry_start.elapsed().as_micros() as f64);
+        }
+        Ok(row_id)
+    }
+
+    /// Liest den neuesten Snapshot fuer ein Aggregate.
+    pub fn get_latest_snapshot(&self, aggregate_id: &str) -> anyhow::Result<Option<SnapshotRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let result = conn.query_row(
+            "SELECT id, aggregate_id, snapshot_type, payload, last_event_id, version, created_at FROM snapshots WHERE aggregate_id = ?1 ORDER BY version DESC LIMIT 1",
+            params![aggregate_id],
+            |row| {
+                Ok(SnapshotRow {
+                    id: row.get(0)?,
+                    aggregate_id: row.get(1)?,
+                    snapshot_type: row.get(2)?,
+                    payload: row.get(3)?,
+                    last_event_id: row.get(4)?,
+                    version: row.get(5)?,
+                    created_at: row.get::<_, i64>(6)? as u64,
+                })
+            },
+        );
+        match result {
+            Ok(snap) => Ok(Some(snap)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     // ── Outbox ──────────────────────────────────
 
     /// Pollt pending Outbox-Eintraege fuer den Zenoh-Publisher.
     pub fn poll_outbox(&self, limit: usize) -> anyhow::Result<Vec<OutboxEntry>> {
+        let _telemetry_start = std::time::Instant::now();
         let conn = self
             .conn
             .lock()
@@ -283,6 +452,13 @@ impl EventStore {
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
+        }
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.limbo.outbox.poll.count").increment();
+            reg.histogram("sentinel.limbo.outbox.poll.duration_us", LATENCY_BUCKETS)
+                .observe(_telemetry_start.elapsed().as_micros() as f64);
         }
         Ok(results)
     }
@@ -324,12 +500,35 @@ impl EventStore {
         }
     }
 
-    /// Setzt den Offset einer Projection (upsert).
+    /// Setzt den Offset einer Projection (upsert, monoton steigend).
+    ///
+    /// Gibt `MonotonicityError` zurueck wenn der neue Offset <= aktueller Offset ist.
     pub fn update_offset(&self, name: &str, offset: i64) -> anyhow::Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+
+        // Aktuellen Offset pruefen
+        let current: Option<i64> = conn
+            .query_row(
+                "SELECT last_event_id FROM projection_offsets WHERE projection_name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(current_val) = current {
+            if offset <= current_val {
+                return Err(MonotonicityError {
+                    projection: name.to_string(),
+                    current: current_val,
+                    attempted: offset,
+                }
+                .into());
+            }
+        }
+
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -339,6 +538,51 @@ impl EventStore {
             params![name, offset, now_ms],
         )?;
         Ok(())
+    }
+
+    // ── Rebuild / Recovery ──────────────────────
+
+    /// Zaehlt alle Events im Store.
+    pub fn event_count(&self) -> anyhow::Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let count: i64 = conn.query_row("SELECT count(*) FROM events", [], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// Liest ALLE Events geordnet nach interner ID (fuer Rebuild/Recovery).
+    ///
+    /// Achtung: Nur fuer Rebuild/Recovery verwenden, nicht fuer normalen Betrieb.
+    pub fn get_all_events(&self) -> anyhow::Result<Vec<DomainEvent>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DomainEvent {
+                event_id: row.get(0)?,
+                event_type: row.get(1)?,
+                aggregate_id: row.get(2)?,
+                payload: row.get(3)?,
+                correlation_id: row.get(4)?,
+                causation_id: row.get(5)?,
+                operation_id: row.get(6)?,
+                tick: row.get::<_, i64>(7)? as u64,
+                timestamp_ms: row.get::<_, i64>(8)? as u64,
+                schema_version: row.get::<_, i32>(9)? as u32,
+                compensation_type: row.get(10)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
     }
 
     /// Zugriff auf Connection fuer Tests.
@@ -375,6 +619,11 @@ mod tests {
 
         let count: i64 = conn
             .query_row("SELECT count(*) FROM outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM snapshots", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
 
@@ -569,5 +818,131 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    /// AC4: Monotonie-Enforcement fuer projection_offsets.
+    #[test]
+    fn test_monotonic_offset_enforcement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-monotonic.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        // Offset setzen
+        store.update_offset("test-proj", 10).unwrap();
+        assert_eq!(store.get_offset("test-proj").unwrap(), Some(10));
+
+        // Gleicher Wert muss fehlschlagen (nicht strikt groesser)
+        let result = store.update_offset("test-proj", 10);
+        assert!(
+            result.is_err(),
+            "same offset should fail monotonicity check"
+        );
+
+        // Kleinerer Wert muss fehlschlagen
+        let result = store.update_offset("test-proj", 5);
+        assert!(
+            result.is_err(),
+            "smaller offset should fail monotonicity check"
+        );
+
+        // Groesserer Wert muss funktionieren
+        store.update_offset("test-proj", 20).unwrap();
+        assert_eq!(store.get_offset("test-proj").unwrap(), Some(20));
+    }
+
+    /// Snapshot save + get Roundtrip.
+    #[test]
+    fn test_save_and_get_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-snap.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        // Kein Snapshot vorhanden
+        assert!(store.get_latest_snapshot("AGENT-01").unwrap().is_none());
+
+        // Snapshot speichern
+        let id = store
+            .save_snapshot("AGENT-01", "bio_state", r#"{"hunger":50}"#, 5)
+            .unwrap();
+        assert!(id > 0);
+
+        // Snapshot lesen
+        let snap = store.get_latest_snapshot("AGENT-01").unwrap().unwrap();
+        assert_eq!(snap.aggregate_id, "AGENT-01");
+        assert_eq!(snap.snapshot_type, "bio_state");
+        assert_eq!(snap.payload, r#"{"hunger":50}"#);
+        assert_eq!(snap.last_event_id, 5);
+        assert_eq!(snap.version, 1);
+
+        // Zweiter Snapshot = Version 2
+        store
+            .save_snapshot("AGENT-01", "bio_state", r#"{"hunger":80}"#, 10)
+            .unwrap();
+        let snap2 = store.get_latest_snapshot("AGENT-01").unwrap().unwrap();
+        assert_eq!(snap2.version, 2);
+        assert_eq!(snap2.last_event_id, 10);
+        assert_eq!(snap2.payload, r#"{"hunger":80}"#);
+    }
+
+    /// AC5: Rebuild aus Events - Reihenfolge und Daten bleiben erhalten.
+    #[test]
+    fn test_get_all_events_ordered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-rebuild.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        // 5 Events einfuegen
+        for i in 0..5u64 {
+            let event = DomainEvent::new(
+                "transit_started",
+                &format!("AGENT-{:02}", i + 1),
+                &format!(r#"{{"step":{i}}}"#),
+                "corr-rebuild",
+                i * 10,
+            );
+            store.append_event(&event).unwrap();
+        }
+
+        assert_eq!(store.event_count().unwrap(), 5);
+
+        // Alle Events lesen
+        let all = store.get_all_events().unwrap();
+        assert_eq!(all.len(), 5);
+
+        // Reihenfolge = Insertion Order (aufsteigende Ticks)
+        for (idx, event) in all.iter().enumerate() {
+            assert_eq!(event.tick, (idx as u64) * 10);
+            assert_eq!(event.aggregate_id, format!("AGENT-{:02}", idx + 1));
+        }
+
+        // Zweites Lesen = identisch (Reproduzierbarkeit)
+        let all2 = store.get_all_events().unwrap();
+        assert_eq!(all.len(), all2.len());
+        for (a, b) in all.iter().zip(all2.iter()) {
+            assert_eq!(a.event_id, b.event_id);
+            assert_eq!(a.tick, b.tick);
+            assert_eq!(a.payload, b.payload);
+        }
+    }
+
+    /// compensation_type Persistierung und Roundtrip.
+    #[test]
+    fn test_compensation_type_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-compensation.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        // Default compensation_type = "none"
+        let event1 = test_event("transit_started", "AGENT-01");
+        store.append_event(&event1).unwrap();
+
+        // Expliziter compensation_type
+        let event2 = test_event("transit_started", "AGENT-02").with_compensation_type("rollback");
+        store.append_event(&event2).unwrap();
+
+        let events = store.get_events_since(0, 10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].compensation_type, "none");
+        assert_eq!(events[1].compensation_type, "rollback");
     }
 }

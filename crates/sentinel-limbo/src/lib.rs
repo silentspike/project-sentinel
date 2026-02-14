@@ -10,7 +10,7 @@
 
 pub mod event_store;
 
-pub use event_store::{EventStore, OutboxEntry};
+pub use event_store::{EventStore, MonotonicityError, OutboxEntry, SnapshotRow};
 
 use rusqlite::{params, Connection};
 use sentinel_common::{AgentId, Emotion, EventType, RoomId, Tick, Timestamp};
