@@ -15,6 +15,7 @@ members = [
     "crates/sentinel-runtime",
     "crates/sentinel-hippocampus",
     "crates/sentinel-inference",
+    "services/sentinel-nightrun",
 ]
 
 [workspace.dependencies]
