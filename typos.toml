@@ -159,6 +159,7 @@ Funktion = "Funktion"
 unter = "unter"
 
 # Acceptance test German words (doc comments + string literals)
+Szenario = "Szenario"
 Signatur = "Signatur"
 separat = "separat"
 Effekt = "Effekt"
