@@ -60,6 +60,9 @@ bitnet/bitnet-inference
 # Local Config
 .cargo-remote.toml
 
+# Claude Code (internal working files)
+.claude/
+
 # Sentinel Runtime
 *.db-wal
 *.db-shm
