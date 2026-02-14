@@ -423,7 +423,7 @@ func TestAC_13_AC5_CommandEventMapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("eventstore.Open: %v", err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	// 2. Pipeline mit EventStore + Mock-Provider (antwortet mit move-Action)
 	registry := proxy.NewRegistry()
@@ -493,7 +493,7 @@ func TestAC_13_AC5_CommandEventMapping(t *testing.T) {
 		t.Fatal("expected pending outbox entries, got 0")
 	}
 
-	// 7. Verify: operation_id ist deterministisch (gleiche Request-ID → gleiche op_id)
+	// 7. Verify: operation_id is deterministic (same Request-ID -> same op_id)
 	moveEvent, err := store.GetEventByOperationID("test-req-ac5-001-0")
 	if err != nil {
 		t.Fatalf("GetEventByOperationID: %v", err)

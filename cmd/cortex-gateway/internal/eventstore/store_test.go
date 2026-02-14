@@ -15,7 +15,7 @@ func tempDB(t *testing.T) (*Store, string) {
 	if err != nil {
 		t.Fatalf("Open(%q): %v", path, err)
 	}
-	t.Cleanup(func() { store.Close() })
+	t.Cleanup(func() { _ = store.Close() })
 	return store, path
 }
 

@@ -97,23 +97,23 @@ func Open(path string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 
 	if _, err := db.Exec(pragmas); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("eventstore pragmas: %w", err)
 	}
 	if _, err := db.Exec(createEvents); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("eventstore create events: %w", err)
 	}
 	if _, err := db.Exec(createEventsIndices); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("eventstore create events indices: %w", err)
 	}
 	if _, err := db.Exec(createOutbox); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("eventstore create outbox: %w", err)
 	}
 	if _, err := db.Exec(createOutboxIndex); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("eventstore create outbox index: %w", err)
 	}
 
@@ -128,7 +128,7 @@ func (s *Store) AppendWithOutbox(event DomainEvent, topic string) error {
 	if err != nil {
 		return fmt.Errorf("eventstore begin tx: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	now := time.Now().UnixMilli()
 	if event.TimestampMs == 0 {
