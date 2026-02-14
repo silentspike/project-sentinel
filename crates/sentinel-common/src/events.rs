@@ -67,6 +67,12 @@ impl DomainEvent {
         self
     }
 
+    /// Setzt eine explizite correlation_id (Vorgangs-Gruppierung).
+    pub fn with_correlation(mut self, correlation_id: &str) -> Self {
+        self.correlation_id = correlation_id.to_string();
+        self
+    }
+
     /// Setzt eine explizite operation_id (Idempotenz).
     pub fn with_operation_id(mut self, operation_id: &str) -> Self {
         self.operation_id = operation_id.to_string();

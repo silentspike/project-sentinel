@@ -302,6 +302,7 @@ separater = "separater"
 persistente = "persistente"
 funktional = "funktional"
 Funktions = "Funktions"
+signifikant = "signifikant"
 
 [files]
 extend-exclude = [

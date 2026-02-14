@@ -215,6 +215,7 @@ pub fn spawn_agent(
                 in_transit: false,
                 transit_target: None,
                 transit_remaining_ms: 0,
+                transit_correlation_id: None,
             },
             BioState {
                 hunger: 20.0,
