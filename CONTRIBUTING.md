@@ -3,7 +3,7 @@
 ## Quick Start
 
 1. Clone: `git clone https://github.com/obtFusi/project-sentinel.git`
-2. Setup: `make hooks` (installs pre-commit + pre-push hooks)
+2. Setup: `make hooks` (installs repo-managed pre-push hook via `.githooks`)
 3. Build: `make build`
 4. Test: `make test`
 
@@ -26,7 +26,7 @@
 5. Push and create PR (use conventional commit title)
 6. Wait for CI to pass
 7. Address review feedback
-8. Merge
+8. Merge via `make safe-merge PR=<number>`
 
 ### Commit Messages
 
@@ -50,6 +50,8 @@ deps: bump bevy_ecs to 0.15.1
 - [ ] CHANGELOG.md updated (if user-facing)
 - [ ] No secrets committed
 - [ ] PR title follows conventional commits
+- [ ] PR body links issue (`Closes #...`) and includes AC evidence mapping
+- [ ] Linked issue has `quality:ready`
 
 ## Directory Structure
 
@@ -87,3 +89,8 @@ deploy/              VM configuration
 - Never commit secrets, API keys, or credentials
 - All agent input validated via FlatBuffer schemas
 - No eval(), no SQL concatenation, no innerHTML
+
+## Process Guardrails
+
+- See `docs/private-repo-guardrails.md` for the full private-repo enforcement model
+- Direct push to `main` is blocked locally by pre-push hook and monitored in CI

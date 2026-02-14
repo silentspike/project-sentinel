@@ -1,25 +1,107 @@
 name: Feature Request
-description: Suggest a new feature or improvement
-labels: ["type:feature", "status:backlog"]
+description: Propose a feature with explicit scope and acceptance contract
+labels: ["type:feature", "status:backlog", "size:M", "quality:needs-spec"]
 body:
-  - type: textarea
-    id: problem
+  - type: dropdown
+    id: scope_mode
     attributes:
-      label: Problem
-      description: What problem does this solve?
+      label: Scope Mode
+      options:
+        - scope:full
+        - scope:partial
+        - scope:experimental
     validations:
       required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What problem is being solved and why now
+    validations:
+      required: true
+
+  - type: textarea
+    id: target_state
+    attributes:
+      label: Target State
+      description: Concrete end state after merge
+    validations:
+      required: true
+
   - type: textarea
     id: solution
     attributes:
-      label: Proposed solution
-      description: How should it work?
+      label: Proposed Solution
+      description: Specify inputs, outputs, and integration points
     validations:
       required: true
+
+  - type: textarea
+    id: in_scope
+    attributes:
+      label: In Scope
+      description: Exact files/components in scope
+    validations:
+      required: true
+
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: Out of Scope
+      description: Explicitly excluded work
+    validations:
+      required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: blocked by #N + required artifact/API (or "none")
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      description: Use AC-IDs (AC-1, AC-2, ...)
+      value: |
+        - AC-1: ...
+          Verify: ...
+          Expected: ...
+        - AC-2: ...
+          Verify: ...
+          Expected: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: negative_acceptance
+    attributes:
+      label: Negative Criteria
+      description: At least one "must not happen" criterion
+      value: |
+        - AC-N1: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence_plan
+    attributes:
+      label: Evidence Plan
+      description: Commands and artifacts for proving AC completion
+      value: |
+        - Command: ...
+        - Artifact: path/to/file.log
+    validations:
+      required: true
+
   - type: textarea
     id: alternatives
     attributes:
       label: Alternatives considered
+
   - type: dropdown
     id: component
     attributes:
@@ -30,6 +112,6 @@ body:
         - Cortex Gateway
         - Dashboard
         - Agent Runtime / Sandbox
-        - BitNet / Inference
+        - Inference / LLM Routing
         - Zenoh / Messaging
         - Other

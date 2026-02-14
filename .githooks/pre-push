@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+branch="$(git rev-parse --abbrev-ref HEAD)"
+
+if [[ "$branch" == "main" && "${ALLOW_MAIN_PUSH:-0}" != "1" ]]; then
+  echo "ERROR: Direct push to 'main' is blocked by policy."
+  echo "Use a feature branch + PR. Override only with ALLOW_MAIN_PUSH=1."
+  exit 1
+fi
+
+if [[ "${SKIP_LOCAL_CI:-0}" == "1" ]]; then
+  echo "SKIP_LOCAL_CI=1 set, skipping local CI checks."
+  exit 0
+fi
+
+echo "Running local CI before push..."
+make ci

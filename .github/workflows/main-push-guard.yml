@@ -1,0 +1,95 @@
+name: Main Push Guard
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  enforce-pr-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const actor = context.actor;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const commits = context.payload.commits || [];
+            const head = context.payload.head_commit;
+            const marker = "<!-- main-push-guard -->";
+
+            // Ignore bot-driven maintenance pushes
+            if (actor === "github-actions[bot]" || actor === "dependabot[bot]") {
+              core.info(`Skipping main-push guard for bot actor: ${actor}`);
+              return;
+            }
+
+            const commitShas = [...new Set(
+              (commits.map((c) => c.id).filter(Boolean)).concat(head?.id ? [head.id] : [])
+            )];
+
+            if (commitShas.length === 0) {
+              core.info("No commits in payload, nothing to validate.");
+              return;
+            }
+
+            const violations = [];
+
+            for (const sha of commitShas) {
+              try {
+                const response = await github.request(
+                  "GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls",
+                  {
+                    owner,
+                    repo,
+                    commit_sha: sha,
+                    mediaType: { previews: ["groot"] },
+                  },
+                );
+
+                if (!response.data || response.data.length === 0) {
+                  violations.push(sha);
+                }
+              } catch (error) {
+                core.warning(`Could not validate commit ${sha}: ${error.message}`);
+              }
+            }
+
+            if (violations.length === 0) {
+              core.summary.addHeading("Main Push Guard: PASSED");
+              core.summary.addRaw("All pushed commits on main are associated with a PR.");
+              await core.summary.write();
+              return;
+            }
+
+            const body = [
+              marker,
+              "Direct push to `main` detected without PR association.",
+              "",
+              `Actor: @${actor}`,
+              `Violating commits:`,
+              ...violations.map((v) => `- \`${v}\``),
+              "",
+              "Policy: merge via PR only. Use CI + review flow.",
+            ].join("\n");
+
+            // Create one incident issue per push event.
+            await github.rest.issues.create({
+              owner,
+              repo,
+              title: `policy: direct push to main detected (${new Date().toISOString().slice(0, 19)}Z)`,
+              body,
+              labels: ["type:bug", "prio:critical", "status:triage"],
+            });
+
+            core.summary.addHeading("Main Push Guard: FAILED");
+            core.summary.addList([
+              `Direct push commits without PR association: ${violations.join(", ")}`,
+              "Incident issue has been created automatically.",
+            ]);
+            await core.summary.write();
+            core.setFailed("Main branch received commits that are not associated with a PR.");
