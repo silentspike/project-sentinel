@@ -2,19 +2,19 @@
 # https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
 # Default
-* @obtFusi
+* @silentspike/maintainers
 
 # Rust ECS + Hot Path
-/crates/ @obtFusi
+/crates/ @silentspike/maintainers
 
 # Go Cortex Gateway
-/cmd/ @obtFusi
+/cmd/ @silentspike/maintainers
 
 # Dashboard
-/dashboard/ @obtFusi
+/dashboard/ @silentspike/maintainers
 
 # CI/CD
-/.github/ @obtFusi
+/.github/ @silentspike/maintainers
 
 # Config (Agent-Definitionen, Simulation)
-/config/ @obtFusi
+/config/ @silentspike/maintainers
