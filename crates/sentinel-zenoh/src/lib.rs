@@ -2,11 +2,26 @@
 //!
 //! Provides the central communication bus (SentinelBus) that connects
 //! all components: ECS kernel, Cortex Gateway, Dashboard, Monitoring.
+//!
+//! Features:
+//! - SHM transport mit automatischem Fallback auf TCP (AC2)
+//! - Scoped Queries mit UUIDv7, Deadline, min_tick Stale-Filter (AC1, AC3)
+//! - In-Flight Limits: global=128, per-agent=8 (AC4)
+//! - FlatBuffer-kompatible Payloads (AC5)
 
+pub mod config;
+pub mod inflight;
+pub mod query;
 pub mod topics;
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use config::BusConfig;
+use inflight::{InFlightError, InFlightTracker};
+use query::{QueryResponse, QueryScope, ScopedQuery};
 use sentinel_common::{AgentId, RoomId, Tick};
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use zenoh::handlers::FifoChannelHandler;
 use zenoh::pubsub::Subscriber;
 use zenoh::sample::Sample;
@@ -18,6 +33,15 @@ const LATENCY_BUCKETS: &[f64] = &[10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 1000
 /// Type alias for the default Zenoh subscriber (FIFO handler).
 pub type BusSubscriber = Subscriber<FifoChannelHandler<Sample>>;
 
+/// Transport-Modus des Zenoh-Bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportMode {
+    /// Shared Memory transport (niedrige Latenz, lokal).
+    Shm,
+    /// Standard TCP/Unix-Socket transport.
+    Network,
+}
+
 /// Central communication bus wrapping a Zenoh session.
 ///
 /// SentinelBus is Clone (backed by Arc internally) and can be shared
@@ -25,35 +49,88 @@ pub type BusSubscriber = Subscriber<FifoChannelHandler<Sample>>;
 #[derive(Clone)]
 pub struct SentinelBus {
     session: Session,
+    config: Arc<BusConfig>,
+    transport_mode: TransportMode,
+    inflight: Arc<InFlightTracker>,
 }
 
 impl SentinelBus {
-    /// Create a new SentinelBus with default Zenoh config.
-    /// SHM is prepared but not activated (needs runtime validation first).
+    /// Create a new SentinelBus with config from environment variables.
+    ///
+    /// Bei aktiviertem SHM (`SENTINEL_ZENOH_SHM=true`) wird zuerst SHM versucht.
+    /// Bei Fehler automatischer Fallback auf Network-Transport (AC2).
     #[instrument(name = "SentinelBus::new", level = "debug")]
     pub async fn new() -> anyhow::Result<Self> {
-        let mut config = zenoh::Config::default();
+        let config = BusConfig::from_env();
+        Self::with_config(config).await
+    }
 
-        // Optional SHM transport for local low-latency runs.
-        // Enabled via SENTINEL_ZENOH_SHM=1|true|yes|on.
-        let shm_enabled = std::env::var("SENTINEL_ZENOH_SHM")
-            .ok()
-            .map(|v| {
-                let s = v.to_ascii_lowercase();
-                matches!(s.as_str(), "1" | "true" | "yes" | "on")
-            })
-            .unwrap_or(false);
-        if shm_enabled {
-            config
-                .insert_json5("transport/shared_memory/enabled", "true")
-                .map_err(|e| anyhow::anyhow!("Failed to enable zenoh SHM config: {e}"))?;
-            info!("SentinelBus: SHM transport enabled");
+    /// Create a new SentinelBus with explicit config.
+    pub async fn with_config(config: BusConfig) -> anyhow::Result<Self> {
+        let (session, transport_mode) = Self::open_session(&config).await?;
+        let inflight = Arc::new(InFlightTracker::new(
+            config.max_inflight_global,
+            config.max_inflight_per_agent,
+        ));
+        info!(
+            "SentinelBus: session opened, transport={:?}, inflight_global={}, inflight_per_agent={}",
+            transport_mode, config.max_inflight_global, config.max_inflight_per_agent
+        );
+        Ok(Self {
+            session,
+            config: Arc::new(config),
+            transport_mode,
+            inflight,
+        })
+    }
+
+    /// Oeffnet Zenoh Session mit SHM-Fallback (AC2).
+    async fn open_session(config: &BusConfig) -> anyhow::Result<(Session, TransportMode)> {
+        if config.shm_enabled {
+            let mut shm_config = zenoh::Config::default();
+            if let Err(e) = shm_config.insert_json5("transport/shared_memory/enabled", "true") {
+                warn!("SentinelBus: SHM config insertion failed ({e}), using network transport");
+            } else {
+                match zenoh::open(shm_config).await {
+                    Ok(session) => {
+                        info!("SentinelBus: SHM transport active");
+                        return Ok((session, TransportMode::Shm));
+                    }
+                    Err(e) => {
+                        warn!(
+                            "SentinelBus: SHM session open failed ({e}), falling back to network"
+                        );
+                        #[cfg(feature = "telemetry")]
+                        {
+                            sentinel_telemetry::MetricsRegistry::global()
+                                .counter("sentinel.zenoh.shm_fallback.count")
+                                .increment();
+                        }
+                    }
+                }
+            }
         }
-        let session = zenoh::open(config)
+        // Fallback: Standard Network-Transport
+        let default_config = zenoh::Config::default();
+        let session = zenoh::open(default_config)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to open Zenoh session: {e}"))?;
-        info!("SentinelBus: Zenoh session opened");
-        Ok(Self { session })
+        Ok((session, TransportMode::Network))
+    }
+
+    /// Aktueller Transport-Modus (SHM oder Network).
+    pub fn transport_mode(&self) -> TransportMode {
+        self.transport_mode
+    }
+
+    /// Referenz auf die Bus-Konfiguration.
+    pub fn config(&self) -> &BusConfig {
+        &self.config
+    }
+
+    /// Referenz auf den InFlightTracker.
+    pub fn inflight(&self) -> &InFlightTracker {
+        &self.inflight
     }
 
     /// Publish a message to a topic.
@@ -120,7 +197,6 @@ impl SentinelBus {
     }
 
     /// Publish a global simulation tick.
-    /// Uses raw numeric tick value for compact topic paths (e.g. sentinel/physics/tick/42).
     #[instrument(skip(self, payload), level = "trace", fields(tick = %tick))]
     pub async fn publish_tick(&self, tick: Tick, payload: &[u8]) -> anyhow::Result<()> {
         self.publish(&topics::physics_tick(tick.0), payload).await
@@ -130,6 +206,133 @@ impl SentinelBus {
     #[instrument(skip(self, payload), level = "trace")]
     pub async fn publish_chaos_event(&self, payload: &[u8]) -> anyhow::Result<()> {
         self.publish(topics::CHAOS_EVENT, payload).await
+    }
+
+    /// Sende eine Scoped Query und warte auf Response mit Deadline.
+    ///
+    /// Gibt `None` zurueck wenn Deadline ueberschritten oder Query gecancelt.
+    /// Stale Responses (response_tick < min_tick) werden automatisch verworfen (AC3).
+    /// In-Flight Limits werden via InFlightTracker erzwungen (AC4).
+    #[instrument(skip(self, query), level = "debug", fields(
+        query_id = %query.query_id,
+        agent_id = %query.origin_agent,
+        scope = ?query.scope,
+        deadline_ms = query.deadline_ms,
+        min_tick = query.min_tick,
+    ))]
+    pub async fn scoped_query(&self, query: ScopedQuery) -> anyhow::Result<Option<QueryResponse>> {
+        let start = std::time::Instant::now();
+        let deadline = Duration::from_millis(query.deadline_ms);
+        let query_id = query.query_id;
+        let min_tick = query.min_tick;
+        let agent_id = query.origin_agent.0;
+
+        // In-Flight Slot akquirieren (Backpressure, AC4)
+        let guard = self
+            .inflight
+            .try_acquire(query_id, agent_id, min_tick)
+            .await
+            .map_err(|e| match e {
+                InFlightError::GlobalCapacity => {
+                    anyhow::anyhow!(
+                        "global in-flight capacity exceeded ({})",
+                        self.config.max_inflight_global
+                    )
+                }
+                InFlightError::AgentCapacity(id) => {
+                    anyhow::anyhow!(
+                        "per-agent in-flight capacity exceeded for agent {id} ({})",
+                        self.config.max_inflight_per_agent
+                    )
+                }
+            })?;
+
+        #[cfg(feature = "telemetry")]
+        {
+            sentinel_telemetry::MetricsRegistry::global()
+                .gauge("sentinel.zenoh.query.inflight.gauge")
+                .set(self.inflight.active_count_sync() as i64);
+        }
+
+        // Query auf Request-Topic publishen
+        let request_topic = match &query.scope {
+            QueryScope::Agent(id) => topics::query_request_agent(&id.to_string()),
+            QueryScope::Room(room) => topics::query_request_room(room),
+            QueryScope::Global => topics::QUERY_REQUEST_GLOBAL.to_string(),
+        };
+        let payload = serde_json::to_vec(&query)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize query: {e}"))?;
+        self.publish(&request_topic, &payload).await?;
+
+        // Auf Response-Topic subscriben (per-Agent fuer Effizienz)
+        let response_topic = topics::query_response_agent(&query.origin_agent.to_string());
+        let subscriber = self.subscribe(&response_topic).await?;
+
+        // Warten mit Timeout (Query-Cancellation, AC3)
+        let result = tokio::time::timeout(deadline, async {
+            loop {
+                let sample = subscriber
+                    .recv_async()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Recv failed: {e}"))?;
+                let response: QueryResponse =
+                    serde_json::from_slice(sample.payload().to_bytes().as_ref())
+                        .map_err(|e| anyhow::anyhow!("Failed to deserialize response: {e}"))?;
+
+                // Nur Responses fuer diese Query akzeptieren
+                if response.query_id != query_id {
+                    continue;
+                }
+
+                // Stale-Response-Filter (AC3): response_tick muss >= min_tick sein
+                if response.is_stale(min_tick) {
+                    #[cfg(feature = "telemetry")]
+                    {
+                        sentinel_telemetry::MetricsRegistry::global()
+                            .counter("sentinel.zenoh.query.stale_drop.count")
+                            .increment();
+                    }
+                    tracing::debug!(
+                        query_id = %query_id,
+                        response_tick = response.response_tick,
+                        min_tick = min_tick,
+                        "Stale response dropped"
+                    );
+                    continue;
+                }
+
+                return Ok::<_, anyhow::Error>(Some(response));
+            }
+        })
+        .await;
+
+        // Guard droppen → Slot freigeben
+        drop(guard);
+
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.histogram("sentinel.zenoh.query.duration_us", LATENCY_BUCKETS)
+                .observe(start.elapsed().as_micros() as f64);
+            reg.gauge("sentinel.zenoh.query.inflight.gauge")
+                .set(self.inflight.active_count_sync() as i64);
+        }
+
+        match result {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                // Timeout: Query cancelled
+                #[cfg(feature = "telemetry")]
+                {
+                    sentinel_telemetry::MetricsRegistry::global()
+                        .counter("sentinel.zenoh.query.timeout.count")
+                        .increment();
+                }
+                tracing::debug!(query_id = %query_id, "Query timed out after {}ms", query.deadline_ms);
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -160,5 +363,19 @@ mod tests {
         assert!(result.is_ok(), "Should receive message within timeout");
         let sample = result.unwrap().unwrap();
         assert_eq!(sample.payload().to_bytes().as_ref(), payload);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_transport_mode_default_is_network() {
+        let bus = SentinelBus::new().await.expect("Failed to create bus");
+        // Ohne SENTINEL_ZENOH_SHM=true sollte Network-Modus gewaehlt werden
+        assert_eq!(bus.transport_mode(), TransportMode::Network);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_config_accessible() {
+        let bus = SentinelBus::new().await.expect("Failed to create bus");
+        assert_eq!(bus.config().max_inflight_global, 128);
+        assert_eq!(bus.config().max_inflight_per_agent, 8);
     }
 }

@@ -304,6 +304,7 @@ persistente = "persistente"
 funktional = "funktional"
 Funktions = "Funktions"
 signifikant = "signifikant"
+Methode = "Methode"
 
 [files]
 extend-exclude = [
