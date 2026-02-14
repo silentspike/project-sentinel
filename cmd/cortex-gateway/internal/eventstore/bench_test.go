@@ -14,7 +14,7 @@ func BenchmarkAppendWithOutbox(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	b.ResetTimer()
 	for i := range b.N {
@@ -43,7 +43,7 @@ func BenchmarkAppendWithOutbox_15Agents(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	b.ResetTimer()
 	for tick := range b.N {
@@ -73,7 +73,7 @@ func BenchmarkIdempotentRetry(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	// Pre-insert the event
 	event := DomainEvent{

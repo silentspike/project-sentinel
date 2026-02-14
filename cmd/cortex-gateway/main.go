@@ -87,7 +87,7 @@ func main() {
 			logger.Error("failed to open event store", "path", esPath, "error", err)
 			os.Exit(1)
 		}
-		defer evStore.Close()
+		defer func() { _ = evStore.Close() }()
 		logger.Info("event store opened", "path", esPath)
 	} else {
 		logger.Info("event store disabled (SENTINEL_CORTEX_EVENT_STORE_PATH not set)")

@@ -238,24 +238,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	actions := ph.ext.Extract(content)
 
 	// --- Step 8b: Persist extracted actions as events (AC-5) ---
-	if ph.eventStore != nil && len(actions) > 0 && agentName != "" {
-		meta := mapping.ActionMeta{
-			AgentName: agentName,
-			RequestID: requestID,
-			Tick:      parseTick(req.Metadata),
-		}
-		domainEvents := mapping.MapActions(actions, meta)
-		for _, evt := range domainEvents {
-			topic := fmt.Sprintf("sentinel/cortex/events/%s", agentName)
-			if err := ph.eventStore.AppendWithOutbox(evt, topic); err != nil {
-				ph.logger.Warn("event store write failed",
-					"error", err,
-					"request_id", requestID,
-					"agent", agentName,
-				)
-			}
-		}
-	}
+	ph.persistActions(actions, agentName, requestID, &req)
 
 	// --- Step 9: Response ---
 	duration := time.Since(start)
@@ -353,6 +336,29 @@ func (ph *PipelineHandler) fourthWallCheck(ctx context.Context, content string, 
 		content = resp.Content
 	}
 	return content
+}
+
+// persistActions writes extracted actions as domain events to the event store (AC-5).
+func (ph *PipelineHandler) persistActions(actions []extraction.ExtractedAction, agentName, requestID string, req *LLMRequest) {
+	if ph.eventStore == nil || len(actions) == 0 || agentName == "" {
+		return
+	}
+	meta := mapping.ActionMeta{
+		AgentName: agentName,
+		RequestID: requestID,
+		Tick:      parseTick(req.Metadata),
+	}
+	domainEvents := mapping.MapActions(actions, meta)
+	for _, evt := range domainEvents {
+		topic := fmt.Sprintf("sentinel/cortex/events/%s", agentName)
+		if err := ph.eventStore.AppendWithOutbox(evt, topic); err != nil {
+			ph.logger.Warn("event store write failed",
+				"error", err,
+				"request_id", requestID,
+				"agent", agentName,
+			)
+		}
+	}
 }
 
 // modelKey mappt Provider-Namen auf Compiler-Config-Keys.
