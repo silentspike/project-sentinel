@@ -55,6 +55,24 @@ pub fn cortex_inject(name: &str) -> String {
 /// Topic for model swap requests (invisible to agents)
 pub const MODEL_SWAP: &str = "sentinel/meta/model-swap";
 
+/// Build topic for scoped query requests per agent.
+pub fn query_request_agent(name: &str) -> String {
+    format!("{PREFIX}/query/agent/{name}/request")
+}
+
+/// Build topic for scoped query requests per room.
+pub fn query_request_room(room_id: &str) -> String {
+    format!("{PREFIX}/query/room/{room_id}/request")
+}
+
+/// Topic for global scoped query requests.
+pub const QUERY_REQUEST_GLOBAL: &str = "sentinel/query/global/request";
+
+/// Build topic for query responses per agent.
+pub fn query_response_agent(name: &str) -> String {
+    format!("{PREFIX}/query/response/{name}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +114,23 @@ mod tests {
         assert_eq!(CHAOS_EVENT, "sentinel/chaos/event");
         assert_eq!(JUDGE_ALERT, "sentinel/judge/alert");
         assert_eq!(MODEL_SWAP, "sentinel/meta/model-swap");
+        assert_eq!(QUERY_REQUEST_GLOBAL, "sentinel/query/global/request");
         assert_eq!(PREFIX, "sentinel");
+    }
+
+    #[test]
+    fn test_query_topics() {
+        assert_eq!(
+            query_request_agent("thomas"),
+            "sentinel/query/agent/thomas/request"
+        );
+        assert_eq!(
+            query_request_room("kueche"),
+            "sentinel/query/room/kueche/request"
+        );
+        assert_eq!(
+            query_response_agent("thomas"),
+            "sentinel/query/response/thomas"
+        );
     }
 }

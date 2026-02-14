@@ -33,7 +33,7 @@
 //! increment/observe path.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 #[cfg(feature = "telemetry")]
 use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
@@ -71,6 +71,46 @@ impl Counter {
 
     /// Get current value.
     pub fn get(&self) -> u64 {
+        self.value.load(Ordering::Relaxed)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Gauge
+// ──────────────────────────────────────────────
+
+/// Atomic gauge metric. Thread-safe, lock-free.
+///
+/// Unlike Counter, a Gauge can go up and down. Useful for tracking
+/// current values like in-flight queries, active connections, etc.
+pub struct Gauge {
+    value: AtomicI64,
+}
+
+impl Gauge {
+    fn new() -> Self {
+        Self {
+            value: AtomicI64::new(0),
+        }
+    }
+
+    /// Set to an absolute value.
+    pub fn set(&self, val: i64) {
+        self.value.store(val, Ordering::Relaxed);
+    }
+
+    /// Increment by 1.
+    pub fn increment(&self) {
+        self.value.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrement by 1.
+    pub fn decrement(&self) {
+        self.value.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Get current value.
+    pub fn get(&self) -> i64 {
         self.value.load(Ordering::Relaxed)
     }
 }
@@ -192,6 +232,8 @@ pub struct SubsystemMetrics {
     pub counters: HashMap<String, u64>,
     /// Histograms with count > 0 (lazy: unused histograms omitted).
     pub histograms: HashMap<String, HistogramSnapshot>,
+    /// Gauges with value != 0 (lazy: zero-value gauges omitted).
+    pub gauges: HashMap<String, i64>,
 }
 
 /// Serializable snapshot of a single histogram.
@@ -215,6 +257,7 @@ pub struct HistogramSnapshot {
 pub struct MetricsRegistry {
     counters: RwLock<HashMap<String, Arc<Counter>>>,
     histograms: RwLock<HashMap<String, Arc<Histogram>>>,
+    gauges: RwLock<HashMap<String, Arc<Gauge>>>,
 }
 
 #[cfg(feature = "telemetry")]
@@ -229,6 +272,7 @@ impl MetricsRegistry {
         GLOBAL_METRICS.get_or_init(|| MetricsRegistry {
             counters: RwLock::new(HashMap::new()),
             histograms: RwLock::new(HashMap::new()),
+            gauges: RwLock::new(HashMap::new()),
         })
     }
 
@@ -247,6 +291,24 @@ impl MetricsRegistry {
             counters
                 .entry(name.to_string())
                 .or_insert_with(|| Arc::new(Counter::new())),
+        )
+    }
+
+    /// Get or create a gauge by name.
+    pub fn gauge(&self, name: &str) -> Arc<Gauge> {
+        // Fast path: read lock
+        {
+            let gauges = self.gauges.read().unwrap();
+            if let Some(g) = gauges.get(name) {
+                return Arc::clone(g);
+            }
+        }
+        // Slow path: write lock
+        let mut gauges = self.gauges.write().unwrap();
+        Arc::clone(
+            gauges
+                .entry(name.to_string())
+                .or_insert_with(|| Arc::new(Gauge::new())),
         )
     }
 
@@ -275,9 +337,16 @@ impl MetricsRegistry {
     ///
     /// Returns `(counters, histograms)` maps. Use these to build a
     /// [`MetricsSnapshot`] with timestamp, tick, and health data.
-    pub fn snapshot_raw(&self) -> (HashMap<String, u64>, HashMap<String, HistogramSnapshot>) {
+    pub fn snapshot_raw(
+        &self,
+    ) -> (
+        HashMap<String, u64>,
+        HashMap<String, HistogramSnapshot>,
+        HashMap<String, i64>,
+    ) {
         let counters = self.counters.read().unwrap();
         let histograms = self.histograms.read().unwrap();
+        let gauges = self.gauges.read().unwrap();
 
         let filtered_counters: HashMap<String, u64> = counters
             .iter()
@@ -303,7 +372,19 @@ impl MetricsRegistry {
             })
             .collect();
 
-        (filtered_counters, filtered_histograms)
+        let filtered_gauges: HashMap<String, i64> = gauges
+            .iter()
+            .filter_map(|(k, v)| {
+                let val = v.get();
+                if val != 0 {
+                    Some((k.clone(), val))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        (filtered_counters, filtered_histograms, filtered_gauges)
     }
 }
 
@@ -391,10 +472,45 @@ mod tests {
     }
 
     #[test]
+    fn test_gauge_basic() {
+        let gauge = Gauge::new();
+        assert_eq!(gauge.get(), 0);
+        gauge.increment();
+        assert_eq!(gauge.get(), 1);
+        gauge.increment();
+        assert_eq!(gauge.get(), 2);
+        gauge.decrement();
+        assert_eq!(gauge.get(), 1);
+        gauge.set(42);
+        assert_eq!(gauge.get(), 42);
+        gauge.set(-5);
+        assert_eq!(gauge.get(), -5);
+    }
+
+    #[test]
+    fn test_registry_gauge() {
+        let registry = MetricsRegistry {
+            counters: RwLock::new(HashMap::new()),
+            histograms: RwLock::new(HashMap::new()),
+            gauges: RwLock::new(HashMap::new()),
+        };
+
+        let g1 = registry.gauge("test.inflight");
+        g1.increment();
+        let g2 = registry.gauge("test.inflight");
+        g2.increment();
+
+        // Gleiche Gauge-Instanz
+        assert_eq!(g1.get(), 2);
+        assert_eq!(g2.get(), 2);
+    }
+
+    #[test]
     fn test_registry_counter() {
         let registry = MetricsRegistry {
             counters: RwLock::new(HashMap::new()),
             histograms: RwLock::new(HashMap::new()),
+            gauges: RwLock::new(HashMap::new()),
         };
 
         let c1 = registry.counter("test.requests");
@@ -412,17 +528,20 @@ mod tests {
         let registry = MetricsRegistry {
             counters: RwLock::new(HashMap::new()),
             histograms: RwLock::new(HashMap::new()),
+            gauges: RwLock::new(HashMap::new()),
         };
 
         registry.counter("ops").increment_by(42);
         registry
             .histogram("latency", &[1.0, 5.0, 10.0])
             .observe(3.0);
+        registry.gauge("inflight").set(5);
 
-        let (counters, histograms) = registry.snapshot_raw();
+        let (counters, histograms, gauges) = registry.snapshot_raw();
         assert_eq!(*counters.get("ops").unwrap(), 42);
         assert!(histograms.contains_key("latency"));
         assert_eq!(histograms.get("latency").unwrap().count, 1);
+        assert_eq!(*gauges.get("inflight").unwrap(), 5);
     }
 
     #[test]
@@ -446,6 +565,7 @@ mod tests {
         let registry = MetricsRegistry {
             counters: RwLock::new(HashMap::new()),
             histograms: RwLock::new(HashMap::new()),
+            gauges: RwLock::new(HashMap::new()),
         };
 
         // Create metrics but don't increment some
@@ -453,14 +573,18 @@ mod tests {
         registry.counter("inactive"); // value = 0
         registry.histogram("used", &[1.0]).observe(0.5);
         registry.histogram("unused", &[1.0]); // count = 0
+        registry.gauge("nonzero").set(3);
+        registry.gauge("zero"); // value = 0
 
-        let (counters, histograms) = registry.snapshot_raw();
+        let (counters, histograms, gauges) = registry.snapshot_raw();
 
         // Only non-zero metrics appear
         assert!(counters.contains_key("active"));
         assert!(!counters.contains_key("inactive"));
         assert!(histograms.contains_key("used"));
         assert!(!histograms.contains_key("unused"));
+        assert!(gauges.contains_key("nonzero"));
+        assert!(!gauges.contains_key("zero"));
     }
 
     #[test]
@@ -475,6 +599,7 @@ mod tests {
                 health: HealthStatus::Healthy,
                 counters: HashMap::from([("ops".to_string(), 42)]),
                 histograms: HashMap::new(),
+                gauges: HashMap::new(),
             },
         );
 

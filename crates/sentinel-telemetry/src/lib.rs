@@ -20,5 +20,5 @@ pub use health::{HealthRegistry, HealthSnapshot, HealthStatus, SubsystemHealth};
 #[cfg(feature = "telemetry")]
 pub use logging::{init_logging, init_logging_dev};
 pub use metrics::{
-    metric_name, Counter, Histogram, MetricsRegistry, MetricsSnapshot, SubsystemMetrics,
+    metric_name, Counter, Gauge, Histogram, MetricsRegistry, MetricsSnapshot, SubsystemMetrics,
 };
