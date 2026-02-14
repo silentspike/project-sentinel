@@ -15,6 +15,7 @@ import (
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/compiler"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/eventstore"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy"
@@ -77,6 +78,21 @@ func main() {
 	// 4. Control config (shared between pipeline + control plane)
 	controlConfig := control.NewConfig("claude")
 
+	// 4b. Event Store (optional, enabled via SENTINEL_CORTEX_EVENT_STORE_PATH)
+	var evStore *eventstore.Store
+	if esPath := os.Getenv("SENTINEL_CORTEX_EVENT_STORE_PATH"); esPath != "" {
+		var err error
+		evStore, err = eventstore.Open(esPath)
+		if err != nil {
+			logger.Error("failed to open event store", "path", esPath, "error", err)
+			os.Exit(1)
+		}
+		defer func() { _ = evStore.Close() }()
+		logger.Info("event store opened", "path", esPath)
+	} else {
+		logger.Info("event store disabled (SENTINEL_CORTEX_EVENT_STORE_PATH not set)")
+	}
+
 	// 5. Processing pipeline (fully wired)
 	pipelineHandler := proxy.NewPipelineHandler(proxy.PipelineConfig{
 		Registry:     registry,
@@ -87,6 +103,7 @@ func main() {
 		Capabilities: capability.New(),
 		Logger:       logger,
 		BreakerCfg:   proxy.BreakerConfigFromEnv(),
+		EventStore:   evStore,
 	})
 
 	// 6. HTTP proxy server

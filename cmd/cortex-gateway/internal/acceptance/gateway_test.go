@@ -8,10 +8,15 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/compiler"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/eventstore"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy"
 )
@@ -406,6 +411,118 @@ func TestAC_13_10_PromptCompiler(t *testing.T) {
 	}
 	if !strings.Contains(withPerception, perception) {
 		t.Errorf("prompt missing perception text")
+	}
+}
+
+// AC-13-AC5: Command→Event Mapping persistiert Event+Outbox atomar
+func TestAC_13_AC5_CommandEventMapping(t *testing.T) {
+	// 1. Temp-DB
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "ac5_test.db")
+	store, err := eventstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("eventstore.Open: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	// 2. Pipeline mit EventStore + Mock-Provider (antwortet mit move-Action)
+	registry := proxy.NewRegistry()
+	registry.Register("mock", &mockProvider{
+		name: "mock",
+		resp: &proxy.LLMResponse{
+			Content:      "Ich gehe in die Kueche um mir einen Kaffee zu holen.",
+			Model:        "mock-model",
+			TokensUsed:   30,
+			FinishReason: "stop",
+		},
+	})
+
+	controlConfig := control.NewConfig("mock")
+	handler := proxy.NewPipelineHandler(proxy.PipelineConfig{
+		Registry:     registry,
+		Config:       controlConfig,
+		Compiler:     compiler.New(),
+		Normalizer:   normalizer.New(),
+		Extractor:    extraction.New(),
+		Capabilities: capability.New(),
+		Logger:       slog.Default(),
+		BreakerCfg:   proxy.BreakerConfig{},
+		EventStore:   store,
+	})
+
+	// 3. HTTP-Request mit agent_name Metadata und X-Request-ID
+	reqBody := `{
+		"messages":[{"role":"user","content":"Was machst du jetzt?"}],
+		"metadata":{"agent_name":"AGENT-03","agent_role":"Designer","tick":"42"}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Request-ID", "test-req-ac5-001")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	// 4. Verify: Response enthaelt request_id
+	var pipelineResp proxy.PipelineResponse
+	if err := json.NewDecoder(w.Body).Decode(&pipelineResp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if pipelineResp.RequestID != "test-req-ac5-001" {
+		t.Errorf("request_id = %q, want %q", pipelineResp.RequestID, "test-req-ac5-001")
+	}
+
+	// 5. Verify: Event in DB mit event_type="agent_move"
+	eventCount, err := store.EventCount()
+	if err != nil {
+		t.Fatalf("EventCount: %v", err)
+	}
+	if eventCount == 0 {
+		t.Fatal("expected events in store, got 0")
+	}
+
+	// 6. Verify: Outbox-Eintrag mit status="pending"
+	pendingCount, err := store.PendingOutboxCount()
+	if err != nil {
+		t.Fatalf("PendingOutboxCount: %v", err)
+	}
+	if pendingCount == 0 {
+		t.Fatal("expected pending outbox entries, got 0")
+	}
+
+	// 7. Verify: operation_id is deterministic (same Request-ID -> same op_id)
+	moveEvent, err := store.GetEventByOperationID("test-req-ac5-001-0")
+	if err != nil {
+		t.Fatalf("GetEventByOperationID: %v", err)
+	}
+	if moveEvent == nil {
+		// Extraction might create multiple actions; check first action index
+		t.Fatal("expected event with operation_id=test-req-ac5-001-0, got nil")
+	}
+	if moveEvent.AggregateID != "AGENT-03" {
+		t.Errorf("aggregate_id = %q, want %q", moveEvent.AggregateID, "AGENT-03")
+	}
+	if moveEvent.CorrelationID != "test-req-ac5-001" {
+		t.Errorf("correlation_id = %q, want %q", moveEvent.CorrelationID, "test-req-ac5-001")
+	}
+	if moveEvent.Tick != 42 {
+		t.Errorf("tick = %d, want %d", moveEvent.Tick, 42)
+	}
+
+	// 8. Verify: Retry-Idempotenz (gleicher Request nochmal → kein Duplikat)
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("X-Request-ID", "test-req-ac5-001") // gleiche ID
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, req2)
+
+	eventCountAfterRetry, _ := store.EventCount()
+	if eventCountAfterRetry != eventCount {
+		t.Errorf("after retry: event count changed from %d to %d (should be idempotent)",
+			eventCount, eventCountAfterRetry)
 	}
 }
 
