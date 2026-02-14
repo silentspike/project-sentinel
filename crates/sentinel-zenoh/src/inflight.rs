@@ -100,9 +100,9 @@ impl InFlightTracker {
 
         // Per-Agent Semaphore
         let agent_sem = {
-            let mut sems = self.agent_semaphores.lock().await;
+            let mut semaphores = self.agent_semaphores.lock().await;
             Arc::clone(
-                sems.entry(agent_id)
+                semaphores.entry(agent_id)
                     .or_insert_with(|| Arc::new(Semaphore::new(self.max_per_agent))),
             )
         };
