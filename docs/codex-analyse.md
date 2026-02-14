@@ -282,6 +282,29 @@ Im Skill klarstellen:
 - Unit-Test: `crates/sentinel-ecs/src/decision.rs` (Test `test_decision_performance_24_agents`)
 - AC5 Verify-Command: `ssh ubuntu@192.0.2.240 './stack-harness 2>/dev/null | grep decision'`
 
+### Cortex Event-Store Benchmark (Issue #13 AC5)
+
+**Kontext:** Issue #13 AC-5 fordert atomare Event+Outbox Writes im cortex-gateway.
+**Binary:** `go test -bench` (Go 1.25, modernc.org/sqlite pure-Go), ausgefuehrt auf VM 192.0.2.240.
+**Methodik:** 3 Runs, Median.
+
+| Metrik | Wert | Einordnung | Status |
+|--------|------|------------|--------|
+| `cortex.event_store.append_with_outbox_us` | `1360us` (~1.36ms) | Pro LLM-Request (1-3 Events), LLM-Call dauert 5-20s | **PASS** |
+| `cortex.event_store.15_agents_tick_ms` | `22.9ms` | 15 Events/Tick, 43 ticks/s (nicht relevant fuer Gateway) | **INFO** |
+| `cortex.event_store.idempotent_retry_us` | `193us` | INSERT OR IGNORE bei Duplikat | **PASS** |
+| `cortex.event_store.allocs_per_write` | `63` | Pure-Go SQLite overhead | **INFO** |
+
+**Einordnung:**
+- Gateway-Pipeline: 1.36ms Schreib-Overhead bei 5-20s LLM-Latenz = <0.03% der Gesamtlatenz
+- Idempotent Retry: 193us ist 7x schneller als normaler Write (nur Index-Lookup)
+- 15-Agent-Tick FAIL ist irrelevant: Gateway schreibt pro Request, nicht pro Tick
+
+**Artefakte:**
+- Benchmark-Code: `cmd/cortex-gateway/internal/eventstore/bench_test.go`
+- VM-Verify: `ssh ubuntu@192.0.2.240 "cd ~/project-sentinel/cmd/cortex-gateway && go test -bench=. ./internal/eventstore/"`
+
 ### Update-Log
+- 2026-02-14: Cortex Event-Store Benchmark (Issue #13 AC5): AppendWithOutbox 1.36ms, IdempotentRetry 193us auf VM 192.0.2.240.
 - 2026-02-14: Decision Engine Benchmark (Issue #54 AC5) dokumentiert: 1.02us/tick bei 24 Agents (Schwellenwert <50us, 49x Marge).
 - 2026-02-13: VM-Toolchain auf `rustc/cargo 1.93.1` angehoben, 3-Run Stack-Suite auf 1069 durchgefuehrt, Zielwert-Matrix mit PASS/FAIL ergänzt.

@@ -182,14 +182,7 @@ func (r *ReportGenerator) GenerateJSON(filter QueryFilter) ([]byte, error) {
 	}
 
 	for _, s := range summaries {
-		report.Summaries = append(report.Summaries, jsonSummary{
-			Shift:       s.Shift,
-			Model:       s.Model,
-			RecordCount: s.RecordCount,
-			AvgMetrics:  s.AvgMetrics,
-			MinMetrics:  s.MinMetrics,
-			MaxMetrics:  s.MaxMetrics,
-		})
+		report.Summaries = append(report.Summaries, jsonSummary(s))
 	}
 
 	return json.MarshalIndent(report, "", "  ")
