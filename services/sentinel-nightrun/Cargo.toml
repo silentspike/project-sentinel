@@ -1,0 +1,14 @@
+[package]
+name = "sentinel-nightrun"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Schichtwechsel-Konsolidierung (Nightrun Service)"
+
+[[bin]]
+name = "sentinel-nightrun"
+path = "src/main.rs"
+
+[dependencies]
+sentinel-common = { path = "../../crates/sentinel-common" }
