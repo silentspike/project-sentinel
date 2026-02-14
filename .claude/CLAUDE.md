@@ -1,3 +1,5 @@
+Deployed muss alles werden auf der VM ssh ubuntu@192.0.2.240.
+
 # CLAUDE CODE - Project Sentinel
 
 **Sprache:** Deutsch
@@ -21,6 +23,9 @@
 - Raten bei fehlenden Informationen - FRAGE stattdessen
 - Fehler oder Warnungen stillschweigend ignorieren
 - Destructive git commands ohne explizite User-Freigabe (`push --force`, `reset --hard`, `clean -fd`)
+- Issue als "completed" schliessen wenn ACs nur PARTIAL erfuellt sind (stattdessen: `status:partial` + Folge-Issue)
+- "Modul existiert" als Done akzeptieren ohne Nachweis im Runtime-Pfad
+- Stub/Mock/In-Memory-Placeholder als Endzustand in `scope:full` Issues
 
 ### IMMER
 - `make ci` vor Push (lokale CI = Lint + Tests + cargo deny)
@@ -36,6 +41,9 @@
 - FlatBuffer Schema validieren bei Schema-Aenderungen
 - Lessons-Check nach jedem abgeschlossenen Schritt (siehe PROJEKT-LEARNINGS)
 - Neue Features = neue Tests, Bug Fixes = Regression Test
+- Evidence-Block bei Issue-Close: Exakter Command + Output der JEDES AC verifiziert
+- Done = im Runtime-Pfad aktiv (nicht nur "Modul kompiliert" oder "Struct existiert")
+- Bei PARTIAL-Ergebnis: `status:partial` Label + Folge-Issue mit Restscope erstellen
 
 ### Data Exposure Rules (Repo wird public!)
 ERLAUBT in Code/Docs:
@@ -106,6 +114,13 @@ VERBOTEN in Code/Docs:
 - Refactoring = alle bestehenden Tests muessen gruen bleiben
 - Float-Vergleiche: IMMER `approx` Crate (`assert_relative_eq!`)
 - Performance-Tests fuer Hot-Path Code (>100 ticks/s Schwellenwert)
+- **bolero** (Property-Testing + Fuzzing): Fuer alle Invarianten (Bio-Bounds, Physics-Bounds, FlatBuffer-Robustheit)
+  - Ein Harness, vier Engines: libfuzzer, AFL, honggfuzz, Kani (formaler Beweis)
+  - `make fuzz` (libfuzzer, 100K runs), `make verify` (Kani, formale Verifikation)
+  - Neue Bio/Physics-Formeln = neuer bolero-Harness der Bounds prueft
+- **insta** (Snapshot-Testing): Fuer Perception-Texte, Mood-Mapping, Fourth-Wall Regex-Ergebnisse
+  - `make snapshot-test` (alle Snapshots pruefen), `make snapshot-review` (interaktives Diff)
+  - Aenderungen an Perception/Mood-Generation = `cargo insta review` vor Commit
 
 ### Supply-Chain-Security
 - Alle GitHub Actions auf volle Commit-SHAs gepinnt (nie `@v4`, immer `@sha # v4.x.y`)
@@ -127,6 +142,33 @@ VERBOTEN in Code/Docs:
 2. **PLAN**: Aenderungen auflisten, Risiken identifizieren, Erfolgskriterien definieren
 3. **EXECUTE**: Plan Schritt fuer Schritt ausfuehren, nach jeder Aenderung testen
 4. **VERIFY**: Tests + Lints + manuelle Verifikation, Confidence Level angeben
+
+### Issue-Close Policy (PFLICHT)
+Bevor ein Issue als "closed/completed" markiert wird, MUSS folgendes erfuellt sein:
+
+**Evidence-Block (im Close-Kommentar):**
+```
+## Verification
+- [ ] AC1: [Exakter Command] → [Output-Snippet]
+- [ ] AC2: [Exakter Command] → [Output-Snippet]
+- [ ] Integration: Feature ist im Runtime-Pfad aktiv (nicht nur kompiliert)
+- [ ] Tests: Unit + Integration (wo im AC gefordert)
+```
+
+**Harte Regeln:**
+- Titel-Scope == AC-Scope (z.B. "54 Agenten" im Titel → AC muss 54 fordern, nicht ">=5")
+- Jedes AC einzeln verifiziert mit konkretem Beweis
+- "Modul existiert" reicht NICHT - Feature muss im laufenden System aktiv sein
+- In-Memory-Backend ist KEIN Ersatz fuer geforderte Persistenz
+- Userspace-only ist KEIN Ersatz fuer geforderte Kernel-Integration
+- Bei PARTIAL: Issue NICHT schliessen, sondern `status:partial` + Folge-Issue mit Restscope
+
+**Anti-Patterns (blockiert Close):**
+- AC fordert "X Agents deployed" aber nur Structs definiert
+- AC fordert "Dashboard zeigt Y" aber nur Mock-Daten
+- AC fordert "persistent" aber Implementation ist in-memory
+- AC fordert "eBPF Kernel-Probes" aber nur Userspace-Tracing
+- AC fordert "Pipeline end-to-end" aber Komponenten nicht verdrahtet
 
 ### Debug Workflow
 1. Fehler reproduzieren (exakter Command + Output)
@@ -164,6 +206,10 @@ VERBOTEN in Code/Docs:
 | **FlatBuffer Gen** | `make generate` |
 | **Security Audit** | `make security` |
 | **Benchmarks** | `make bench` |
+| **Fuzzing** | `make fuzz` |
+| **Formal Verify** | `make verify` |
+| **Snapshot Test** | `make snapshot-test` |
+| **Snapshot Review** | `make snapshot-review` |
 
 ### Verzeichnisstruktur
 ```
@@ -202,6 +248,8 @@ config/              # Raum-Layout, Agent-Defs, Simulations-Parameter
 | Typos Config | `typos.toml` |
 | Audit Ignores | `.cargo/audit.toml` |
 | Changelog | `CHANGELOG.md` |
+| Issue-Audit (Realstand) | `/work/company/docs/codex-analyse.md` |
+| Gap-Analyse + Prioritaeten | `/work/company/docs/gap-analyse-prioritaeten.md` |
 | Cortex Gateway Config | `config/cortex-gateway.toml` |
 | Go Package Layout | `cmd/cortex-gateway/internal/` |
 | Sprint 3 Domain Knowledge | `.claude/rules/sprint3-domain.md` |
@@ -247,6 +295,13 @@ _Erkenntnisse aus der Implementierung. Format: Datum, Kontext, was gelernt._
 - 2026-02-11: `go.work` im Repo-Root fuer Go Workspace (cmd/cortex-gateway ist ein separates Go Module).
 - 2026-02-11: Deutsche Regex-Patterns in Go-Strings: typos.toml muss ALLE deutschen Woerter enthalten.
 - 2026-02-11: UTF-8-sichere String-Truncation in Go: `string[:N]` kann Multi-Byte Runes kaputt machen. `utf8.Valid` pruefen oder Rune-basiert truncaten.
+
+### Kontext-Wissen (Testing)
+- 2026-02-13: bolero (v0.13+) ersetzt proptest + cargo-fuzz. Ein Harness → 4 Engines (libfuzzer, AFL, honggfuzz, Kani).
+- 2026-02-13: proptest ist in "passive maintenance" (feature-complete), cargo-fuzz basiert auf libfuzzer (maintenance mode).
+- 2026-02-13: insta (v1.x) ist de-facto Standard fuer Snapshot-Testing. Keine echte Alternative.
+- 2026-02-13: bolero dev-dep: `bolero = "0.13"`, CLI: `cargo install cargo-bolero`. Kani braucht separates Setup.
+- 2026-02-13: AWS s2n-quic nutzt bolero mit 30+ Harnesses in Production (Referenz-Implementierung).
 
 ### Kontext-Wissen (Sprint 2)
 - 2026-02-11: Dependency-Graph Sprint 2: common(+bevy_ecs) → bio + physics → ecs. NICHT umgekehrt.

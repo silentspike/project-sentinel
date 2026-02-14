@@ -32,9 +32,23 @@ impl SentinelBus {
     /// SHM is prepared but not activated (needs runtime validation first).
     #[instrument(name = "SentinelBus::new", level = "debug")]
     pub async fn new() -> anyhow::Result<Self> {
-        let config = zenoh::Config::default();
-        // TODO: SHM activation after runtime validation
-        // config.insert_json5("transport/shared_memory/enabled", "true")?;
+        let mut config = zenoh::Config::default();
+
+        // Optional SHM transport for local low-latency runs.
+        // Enabled via SENTINEL_ZENOH_SHM=1|true|yes|on.
+        let shm_enabled = std::env::var("SENTINEL_ZENOH_SHM")
+            .ok()
+            .map(|v| {
+                let s = v.to_ascii_lowercase();
+                matches!(s.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false);
+        if shm_enabled {
+            config
+                .insert_json5("transport/shared_memory/enabled", "true")
+                .map_err(|e| anyhow::anyhow!("Failed to enable zenoh SHM config: {e}"))?;
+            info!("SentinelBus: SHM transport enabled");
+        }
         let session = zenoh::open(config)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to open Zenoh session: {e}"))?;
