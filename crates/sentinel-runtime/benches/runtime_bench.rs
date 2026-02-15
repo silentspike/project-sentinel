@@ -278,6 +278,38 @@ fn bench_full_shift_cycle(c: &mut Criterion) {
     });
 }
 
+// ──────────────────────────────────────────────
+// Pause/Resume Zyklus
+// ──────────────────────────────────────────────
+
+/// Pause + Resume eines Agenten MIT Event-Emission.
+/// Misst State-Machine-Transition + 2x Event-Write.
+fn bench_pause_resume_with_events(c: &mut Criterion) {
+    let (_dir, store) = temp_store();
+
+    c.bench_function("pause_resume_with_event", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for i in 0..iters {
+                let id = (i as u16) + 1;
+                let mut orch = RuntimeOrchestrator::new(1000).with_event_store(store.clone());
+                orch.set_tick(i);
+                orch.spawn_agent(
+                    create_identity(id, &format!("Agent-{id}"), "Worker"),
+                    create_shift(1, 6, 14),
+                )
+                .unwrap();
+
+                let start = std::time::Instant::now();
+                black_box(orch.pause_agent(AgentId(id)).unwrap());
+                black_box(orch.resume_agent(AgentId(id)).unwrap());
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+}
+
 /// Restart-Zyklus: save_state + drop + restore.
 /// Misst die Recovery-Zeit nach simuliertem Neustart.
 fn bench_restart_cycle(c: &mut Criterion) {
@@ -312,6 +344,8 @@ criterion_group!(
     bench_spawn_with_events,
     bench_spawn_without_events,
     bench_despawn_with_events,
+    // Pause/Resume
+    bench_pause_resume_with_events,
     // Shift-Transition
     bench_shift_transition_15_agents,
     // Snapshot (AC-4)

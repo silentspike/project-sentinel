@@ -324,6 +324,83 @@ fn ac_15_05_sonder_set_preserved() {
     assert_eq!(orch.agent_count(), 1);
 }
 
+// AC #15.07: pause_agent() und resume_agent() mit State-Machine-Validierung
+#[test]
+fn ac_15_07_pause_resume_lifecycle() {
+    let (_dir, store) = temp_event_store();
+    let mut orch = RuntimeOrchestrator::new(20).with_event_store(store.clone());
+    orch.set_tick(1);
+
+    orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
+        .unwrap();
+    orch.spawn_agent(
+        create_identity(2, "Lisa", "Designer"),
+        create_shift(1, 6, 14),
+    )
+    .unwrap();
+
+    // Pause Agent 1: Active -> Suspended
+    orch.pause_agent(AgentId(1)).unwrap();
+    assert_eq!(
+        orch.get_agent_mut(AgentId(1)).unwrap().status,
+        AgentStatus::Suspended,
+        "Agent 1 should be Suspended after pause"
+    );
+
+    // Agent 2 bleibt Active
+    assert_eq!(
+        orch.get_agent_mut(AgentId(2)).unwrap().status,
+        AgentStatus::Active,
+        "Agent 2 should still be Active"
+    );
+
+    // Health-Check: Suspended Agent taucht auf
+    let unhealthy = orch.check_health();
+    assert_eq!(unhealthy.len(), 1);
+    assert_eq!(unhealthy[0].1, AgentStatus::Suspended);
+
+    // Resume Agent 1: Suspended -> Active
+    orch.resume_agent(AgentId(1)).unwrap();
+    assert_eq!(
+        orch.get_agent_mut(AgentId(1)).unwrap().status,
+        AgentStatus::Active,
+        "Agent 1 should be Active after resume"
+    );
+
+    // Invalid: Pause already-Suspended -> Error
+    orch.pause_agent(AgentId(1)).unwrap();
+    assert!(
+        orch.pause_agent(AgentId(1)).is_err(),
+        "Double-pause should fail (Suspended -> Suspended invalid)"
+    );
+
+    // Invalid: Resume already-Active -> Error
+    orch.resume_agent(AgentId(1)).unwrap();
+    assert!(
+        orch.resume_agent(AgentId(1)).is_err(),
+        "Resume Active agent should fail (Active -> Active invalid)"
+    );
+
+    // Verify events in store: spawn(1) + spawn(2) + pause + resume + pause + resume = 6 agent events
+    let events_1 = store.get_events_by_aggregate("AGENT-01", 20).unwrap();
+    assert!(
+        events_1.len() >= 5,
+        "Agent 1 should have >= 5 events (spawn + 2x pause + 2x resume), got {}",
+        events_1.len()
+    );
+
+    // Check status_changed events are present
+    let status_events: Vec<_> = events_1
+        .iter()
+        .filter(|e| e.event_type == "agent_status_changed")
+        .collect();
+    assert!(
+        status_events.len() >= 4,
+        "Should have >= 4 status_changed events, got {}",
+        status_events.len()
+    );
+}
+
 // AC #15.06: Agent auf Errored setzen, check_health() findet ihn
 #[test]
 fn ac_15_06_health_check() {
