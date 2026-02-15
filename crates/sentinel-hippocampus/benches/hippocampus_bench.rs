@@ -159,7 +159,7 @@ fn bench_redb_store_load(c: &mut Criterion) {
         c.bench_function("hippocampus.redb_store_1_episode", |b| {
             b.iter(|| {
                 store
-                    .store_episodes("Thomas", black_box(&[episode.clone()]))
+                    .store_episodes("Thomas", black_box(std::slice::from_ref(&episode)))
                     .unwrap();
             })
         });
@@ -210,7 +210,7 @@ fn bench_redb_store_load(c: &mut Criterion) {
                 // Reset to 5 episodes before each append
                 store.store_episodes("Thomas", &episodes).unwrap();
                 store
-                    .append_episodes("Thomas", black_box(&[new_ep.clone()]))
+                    .append_episodes("Thomas", black_box(std::slice::from_ref(&new_ep)))
                     .unwrap();
             })
         });
