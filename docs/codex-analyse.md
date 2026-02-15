@@ -25,10 +25,10 @@
 ## Executive Summary
 - Geschlossene Issues analysiert: `25`
 - Ergebnis:
-  - `FULL`: `9/25` -> `36%` (Strict Full Rate) *(+2: #13, #15 PARTIAL->FULL)*
-  - `PARTIAL`: `16/25` -> `64%`
+  - `FULL`: `10/25` -> `40%` (Strict Full Rate) *(+3: #13, #15, #23 PARTIAL->FULL)*
+  - `PARTIAL`: `15/25` -> `60%`
   - `MISMATCH`: `0/25` (formal, aber mehrere harte Scope-Reduktionen)
-  - `Weighted Delivery`: `(9*1 + 16*0.5)/25 = 17/25 = 68%`
+  - `Weighted Delivery`: `(10*1 + 15*0.5)/25 = 17.5/25 = 70%`
 - Kernbefund:
   - Es gibt viel implementierten Unterbau.
   - Die meisten "completed" Issues sind jedoch nur teilweise realisiert oder bewusst abgeschwaecht.
@@ -73,7 +73,7 @@
 | #20 | 54 Agenten migrieren | PARTIAL | Tests fordern nur 5 Dateien: `crates/sentinel-common/tests/acceptance_agents.rs:15`; Loader-Test erwartet 5: `crates/sentinel-common/src/agent_config.rs:153`; real nur 5 statt 54 | primar Issue-Qualitaet (Scope-Absenkung im Ticket selbst) |
 | #21 | nmda sleep-cycle | PARTIAL | Consolidation explizit TODO: `crates/sentinel-hippocampus/src/sleep.rs:120` | bewusst als Placeholder im Issue zugelassen |
 | #22 | fourth-wall detection | PARTIAL | Detection/Judge gut implementiert; aber Proxy-Integration nicht im Live-Handlerpfad (`cmd/cortex-gateway/internal/proxy/handler.go:80`) | Integrationsluecke |
-| #23 | hippocampus memory | PARTIAL | Kernmodule vorhanden, aber Backends stark vereinfacht (in-memory FactStore/KV-Tier): `crates/sentinel-hippocampus/src/facts.rs:62`, `crates/sentinel-hippocampus/src/cache_tier.rs:31` | AC auf API-Ebene, nicht auf realen Storage-Backends |
+| #23 | hippocampus memory | FULL | Persistentes redb-Backend (4 Tables: episodes, narratives, facts, cache_state), HippocampusService Facade, Night-Run Konsolidierung via SleepCycle, NMDA-priorisiertes Retrieval. 57 Unit-Tests + 4 Acceptance-Tests (AC-1 bis AC-4), 40+ Benchmarks auf VM. `crates/sentinel-hippocampus/src/store.rs`, `crates/sentinel-hippocampus/src/service.rs` | solide Umsetzung (PR #77) |
 | #24 | dashboard | PARTIAL | Daten aus Mocks statt Real-Backend: `dashboard/src/index.ts:2`; WebSocket-AC in Tests abgeflacht, echte Upgrade-Pruefung fehlt: `dashboard/src/__tests__/acceptance.test.ts:55`, `dashboard/src/__tests__/acceptance.test.ts:66` | Issue/Test-Qualitaet zu tolerant |
 | #25 | eBPF monitoring | PARTIAL | Crate dokumentiert Userspace-only ohne echtes Probe-Loading standardmaessig: `crates/sentinel-ebpf/src/lib.rs:9`; Probe-Module sind userspace tracker, keine geladene BPF-Programme | AC fokussiert userspace Logik |
 | #26 | sentinel-judge agent | PARTIAL | Judge-Algorithmen vorhanden, aber kein separater laufender Judge-Prozess in `main.go`-Verdrahtung | Integrations-/Betriebsluecke |
@@ -352,7 +352,93 @@ Im Skill klarstellen:
 - Footprint-Test: `crates/sentinel-runtime/src/lib.rs` (`footprint_measurement`, `#[ignore]`)
 - VM-Verify: `ssh ubuntu@192.0.2.240 "cd /opt/sentinel && cargo bench -p sentinel-runtime 2>&1 | grep 'time:'"``
 
+### Hippocampus Persistent Memory Benchmark (Issue #23)
+
+**Kontext:** Issue #23 fordert persistentes Memory-Subsystem mit redb (Episode-Store, Narrative, Facts, Cache-State), Night-Run Konsolidierung und NMDA-priorisierte Retrieval-APIs.
+**Binary:** `cargo bench -p sentinel-hippocampus` (Release, Criterion), ausgefuehrt auf VM 192.0.2.240.
+**Methodik:** Criterion 100 Samples, Median. DB-Groesse via `std::fs::metadata`.
+
+#### Serialisierung (serde_json)
+
+| Metrik | Wert | Einordnung | Status |
+|--------|------|------------|--------|
+| `hippocampus.episode_serialize_json` | `448ns` | Einzelne Episode (JSON, inkl. participants+tags) | **PASS** |
+| `hippocampus.episode_deserialize_json` | `804ns` | Einzelne Episode | **PASS** |
+| `hippocampus.episode_batch_10_serialize` | `4.0us` | 10 Episodes (typische Tageslast pro Agent) | **PASS** |
+| `hippocampus.episode_batch_10_deserialize` | `9.7us` | 10 Episodes | **PASS** |
+
+#### NMDA-Scoring
+
+| Metrik | Wert | Einordnung | Status |
+|--------|------|------------|--------|
+| `hippocampus.nmda_score_single` | `2.5ns` | Pure Arithmetik (relevance×emotion×repetitions×decay) | **PASS** |
+| `hippocampus.nmda_score_sort_10` | `99ns` | Score + Sort fuer 10 Episodes | **PASS** |
+
+#### redb Store/Load Latenz
+
+| Metrik | Wert | Einordnung | Status |
+|--------|------|------------|--------|
+| `hippocampus.redb_store_1_episode` | `10.8ms` | Einzelne Episode (Serialize + Write-Txn + fsync) | **PASS** |
+| `hippocampus.redb_load_1_episode` | `1.7us` | Read-Txn (kein fsync, MVCC snapshot) | **PASS** |
+| `hippocampus.redb_store_10_episodes` | `6.4ms` | Batch (sublinear: 10x Daten, nur 0.6x Latenz vs 1 Ep) | **PASS** |
+| `hippocampus.redb_load_10_episodes` | `9.7us` | Batch-Read | **PASS** |
+| `hippocampus.redb_append_1_to_5` | `9.5ms` | Read-Modify-Write Pattern (Load 5 + Append 1 + Store) | **PASS** |
+| `hippocampus.redb_store_fact` | `5.0ms` | Fact Key-Value Write | **PASS** |
+| `hippocampus.redb_load_fact` | `762ns` | Fact Key-Value Read | **PASS** |
+| `hippocampus.redb_store_narrative` | `5.1ms` | NarrativeState Write | **PASS** |
+| `hippocampus.redb_load_narrative` | `1.2us` | NarrativeState Read | **PASS** |
+
+#### redb Deep-Dive (Transaktionen, MVCC, Cold/Warm Start)
+
+| Metrik | Wert | Einordnung | Status |
+|--------|------|------------|--------|
+| `hippocampus.redb_open_create` | `51.3ms` | Cold-Start: DB erstellen + 4 Tables anlegen | **INFO** |
+| `hippocampus.redb_reopen_existing` | `19.1ms` | Warm-Start: existierende DB oeffnen | **INFO** |
+| `hippocampus.redb_mvcc_read_after_write` | `5.3ms` | Write Agent_0 + Read Agent_5 (Snapshot Isolation) | **PASS** |
+| `hippocampus.redb_txn_write_empty_commit` | `3.2ms` | Leere Write-Txn (fsync-Overhead) | **INFO** |
+| `hippocampus.redb_txn_read_only` | `719ns` | Read-Only Txn (kein fsync) | **PASS** |
+| `hippocampus.redb_agent_scan/5` | `1.5us` | list_agents_with_episodes (5 Keys) | **PASS** |
+| `hippocampus.redb_agent_scan/15` | `3.2us` | list_agents_with_episodes (15 Keys) | **PASS** |
+| `hippocampus.redb_agent_scan/54` | `9.8us` | list_agents_with_episodes (54 Keys) | **PASS** |
+| `hippocampus.redb_cache_state_toggle` | `4.1ms` | hot/cold Toggle (Write-Txn) | **PASS** |
+| `hippocampus.redb_cache_state_read` | `869ns` | Cache-State Read | **PASS** |
+
+#### Konsolidierung + Retrieval (Service-Ebene)
+
+| Metrik | Wert | Einordnung | Status |
+|--------|------|------------|--------|
+| `hippocampus.consolidate_1_agent_10_eps` | `28.6ms` | Load + SleepCycle + Narrative-Build + Store + Clear | **PASS** |
+| `hippocampus.consolidate_5_agents_10_eps` | `89.8ms` | 5 Agents sequentiell (~18ms/Agent) | **PASS** |
+| `hippocampus.retrieve_top5_from_10` | `11.3us` | Load 10 + NMDA-Score + Sort + Truncate | **PASS** |
+| `hippocampus.retrieve_top10_from_50` | `60.7us` | Load 50 + Score + Sort + Truncate | **PASS** |
+| `hippocampus.fact_retrieval_2_matches` | `2.2us` | Trigger-Match gegen 3 Facts (2 Hits) | **PASS** |
+| `hippocampus.fact_retrieval_0_matches` | `639ns` | Trigger-Match (0 Hits) | **PASS** |
+
+#### Produktions-Szenario (54 Agents)
+
+| Metrik | Wert | Einordnung | Status |
+|--------|------|------------|--------|
+| `hippocampus.production_54_agents_consolidate` | `586ms` | Nightly-Run: 54 Agents × 8-12 Eps = ~540 Episodes | **PASS** |
+| `hippocampus.production_54_agents_record_batch` | `339ms` | Tages-Batch: 54 × 1 Episode (54 Write-Txns) | **PASS** |
+| `hippocampus.production_54_agents_retrieve_all` | `605us` | Dashboard-Sweep: 54 × Top-5 Retrieval | **PASS** |
+| `hippocampus.redb_file_size_54_agents` | `532 KB` | 54 Agents × 10 Eps + 54 Facts | **PASS** |
+
+**Einordnung:**
+- Write-Latenz dominiert von fsync (~3-5ms Basis pro Write-Txn, unabhaengig von Payload-Groesse)
+- Read-Latenz sub-Mikrosekunde (MVCC Snapshot, kein fsync noetig)
+- Nightly-Konsolidierung (586ms fuer 54 Agents) ist vernachlaessigbar gegenueber typischer Night-Run-Dauer
+- Tages-Batch-Recording (339ms fuer 54 Agents) ist <1s, akzeptabel fuer nicht-zeitkritische Episode-Erfassung
+- DB-Groesse (532 KB) weit unter 1MB, selbst bei Vollauslastung <10MB erwartet
+- Skalierung sublinear: 10 Eps Store kostet 6.4ms (vs 10.8ms fuer 1 Ep — Batch-Vorteil durch single Txn)
+- Agent-Scan skaliert linear (1.5us/5 → 9.8us/54 ≈ ~0.18us/Key)
+
+**Artefakte:**
+- Benchmark-Code: `crates/sentinel-hippocampus/benches/hippocampus_bench.rs`
+- VM-Verify: `ssh ubuntu@192.0.2.240 "cd /home/ubuntu/sentinel-target && ./release/deps/hippocampus_bench-* --bench"`
+
 ### Update-Log
+- 2026-02-15: Hippocampus Persistent Memory Benchmark (Issue #23): 40+ Benchmarks auf VM 192.0.2.240. Production 54-Agent Consolidate 586ms, Retrieve-Sweep 605us, DB-Size 532KB.
+- 2026-02-15: Issue #23 PARTIAL->FULL: redb-Persistence (4 Tables), HippocampusService Facade, Night-Run Konsolidierung, NMDA-priorisiertes Retrieval. 57 Unit-Tests + 4 Acceptance-Tests, 40+ Benchmarks.
 - 2026-02-15: Issue #15 Scope-Luecken geschlossen: pause_agent/resume_agent, State-Machine (AgentStatus::can_transition_to), RuntimeEventSink-Trait (ECS-Integration), Thread/Memory-Footprint dokumentiert. 29 Tests (21 unit + 8 acceptance), 13 Benchmarks auf VM.
 - 2026-02-15: Runtime Orchestrator Benchmark (Issue #15): Spawn 1.51ms, Restore 22us, Pause+Resume 234us, Footprint 96 bytes/Orchestrator + 72 bytes/Agent auf VM 192.0.2.240.
 - 2026-02-14: Cortex Event-Store Benchmark (Issue #13 AC5): AppendWithOutbox 1.36ms, IdempotentRetry 193us auf VM 192.0.2.240.

@@ -16,3 +16,8 @@ sentinel-common = { path = "../sentinel-common" }
 [dev-dependencies]
 approx = { workspace = true }
 tempfile = "3"
+criterion = { workspace = true }
+
+[[bench]]
+name = "hippocampus_bench"
+harness = false
