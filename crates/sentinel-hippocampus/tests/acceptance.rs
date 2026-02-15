@@ -158,11 +158,7 @@ fn ac_23_02_consolidation() {
         );
 
         // Verify via store directly
-        let state = service
-            .store()
-            .load_narrative("Thomas")
-            .unwrap()
-            .unwrap();
+        let state = service.store().load_narrative("Thomas").unwrap().unwrap();
         assert_eq!(
             state.episode_count, consolidated_count,
             "AC-2: Episode count must match consolidation result"

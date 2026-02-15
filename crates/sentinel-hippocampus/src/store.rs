@@ -35,8 +35,9 @@ impl HippocampusStore {
     ///
     /// Creates all 4 tables if they don't exist.
     pub fn open(path: &str) -> anyhow::Result<Self> {
-        let db = Database::create(path)
-            .map_err(|e| anyhow::anyhow!("Failed to create/open hippocampus.redb at {path}: {e}"))?;
+        let db = Database::create(path).map_err(|e| {
+            anyhow::anyhow!("Failed to create/open hippocampus.redb at {path}: {e}")
+        })?;
 
         // Initialize all tables
         let write_txn = db.begin_write()?;
@@ -399,9 +400,7 @@ mod tests {
             store
                 .store_episodes("Thomas", &[make_episode(1, "Survivor")])
                 .unwrap();
-            store
-                .store_fact("facts/test", "Persistent Value")
-                .unwrap();
+            store.store_fact("facts/test", "Persistent Value").unwrap();
             store
                 .store_narrative(
                     "Thomas",
