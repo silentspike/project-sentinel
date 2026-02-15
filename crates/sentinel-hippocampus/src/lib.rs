@@ -5,15 +5,21 @@
 //! - **NarrativeMemory**: Running summary of important daily events
 //! - **FactRetriever**: Trigger-based JIT retrieval of company knowledge
 //! - **KvCacheTier**: Hot/cold tiering interface for KV-cache offload
+//! - **HippocampusStore**: Persistent redb storage for all memory data
+//! - **HippocampusService**: Central facade for recording, consolidation, retrieval
 
 pub mod cache_tier;
 pub mod episode;
 pub mod facts;
 pub mod narrative;
+pub mod service;
 pub mod sleep;
+pub mod store;
 
 pub use cache_tier::{CacheError, InMemoryKvCache, KvCacheTier};
 pub use episode::{nmda_score, Episode};
 pub use facts::{FactRetriever, FactStore, InMemoryFactStore, FACT_TRIGGERS};
 pub use narrative::NarrativeMemory;
+pub use service::{ConsolidationResult, HippocampusService};
 pub use sleep::{SleepCycle, SleepPhase};
+pub use store::{HippocampusStore, NarrativeState, RedbFactStore};

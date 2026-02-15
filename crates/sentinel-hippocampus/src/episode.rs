@@ -4,7 +4,7 @@
 ///
 /// NMDA scoring (inspired by biological NMDA receptors / long-term potentiation)
 /// determines which episodes are consolidated into long-term memory.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Episode {
     pub id: u64,
     pub agent_name: String,

@@ -59,13 +59,12 @@ fn bench_spawn_with_events(c: &mut Criterion) {
             id_counter += 1;
             let mut orch = RuntimeOrchestrator::new(1000).with_event_store(store.clone());
             orch.set_tick(id_counter as u64);
-            black_box(
-                orch.spawn_agent(
-                    create_identity(id_counter, &format!("Agent-{id_counter}"), "Worker"),
-                    create_shift(1, 6, 14),
-                )
-                .unwrap(),
-            );
+            orch.spawn_agent(
+                create_identity(id_counter, &format!("Agent-{id_counter}"), "Worker"),
+                create_shift(1, 6, 14),
+            )
+            .unwrap();
+            black_box(());
         });
     });
 }
@@ -78,13 +77,12 @@ fn bench_spawn_without_events(c: &mut Criterion) {
         b.iter(|| {
             id_counter += 1;
             let mut orch = RuntimeOrchestrator::new(1000);
-            black_box(
-                orch.spawn_agent(
-                    create_identity(id_counter, &format!("Agent-{id_counter}"), "Worker"),
-                    create_shift(1, 6, 14),
-                )
-                .unwrap(),
-            );
+            orch.spawn_agent(
+                create_identity(id_counter, &format!("Agent-{id_counter}"), "Worker"),
+                create_shift(1, 6, 14),
+            )
+            .unwrap();
+            black_box(());
         });
     });
 }
@@ -107,7 +105,8 @@ fn bench_despawn_with_events(c: &mut Criterion) {
                 .unwrap();
 
                 let start = std::time::Instant::now();
-                black_box(orch.despawn_agent(AgentId(id)).unwrap());
+                orch.despawn_agent(AgentId(id)).unwrap();
+                black_box(());
                 total += start.elapsed();
             }
             total
@@ -180,7 +179,8 @@ fn bench_save_state(c: &mut Criterion) {
             &agent_count,
             |b, _| {
                 b.iter(|| {
-                    black_box(orch.save_state().unwrap());
+                    orch.save_state().unwrap();
+                    black_box(());
                 });
             },
         );
@@ -301,8 +301,9 @@ fn bench_pause_resume_with_events(c: &mut Criterion) {
                 .unwrap();
 
                 let start = std::time::Instant::now();
-                black_box(orch.pause_agent(AgentId(id)).unwrap());
-                black_box(orch.resume_agent(AgentId(id)).unwrap());
+                orch.pause_agent(AgentId(id)).unwrap();
+                orch.resume_agent(AgentId(id)).unwrap();
+                black_box(());
                 total += start.elapsed();
             }
             total
