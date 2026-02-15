@@ -122,6 +122,27 @@ pub enum DomainEventPayload {
     BioActionPerformed { agent_id: AgentId, action: String },
     /// Periodischer Tick-Snapshot-Marker
     TickSnapshot { tick: u64, agent_count: u32 },
+    /// Agent wurde in der Runtime gespawnt
+    AgentSpawned {
+        agent_id: AgentId,
+        name: String,
+        role: String,
+        shift_set: u8,
+    },
+    /// Agent wurde aus der Runtime entfernt
+    AgentDespawned { agent_id: AgentId, reason: String },
+    /// Schichtwechsel abgeschlossen
+    ShiftTransitionCompleted {
+        new_shift_set: u8,
+        removed_count: u32,
+        removed_agents: Vec<AgentId>,
+    },
+    /// Agent-Status hat sich geaendert
+    AgentStatusChanged {
+        agent_id: AgentId,
+        old_status: String,
+        new_status: String,
+    },
 }
 
 impl DomainEventPayload {
@@ -139,6 +160,10 @@ impl DomainEventPayload {
             Self::ChaosTriggered { .. } => "chaos_triggered",
             Self::BioActionPerformed { .. } => "bio_action_performed",
             Self::TickSnapshot { .. } => "tick_snapshot",
+            Self::AgentSpawned { .. } => "agent_spawned",
+            Self::AgentDespawned { .. } => "agent_despawned",
+            Self::ShiftTransitionCompleted { .. } => "shift_transition_completed",
+            Self::AgentStatusChanged { .. } => "agent_status_changed",
         }
     }
 }

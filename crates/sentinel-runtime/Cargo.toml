@@ -7,8 +7,14 @@ publish = false
 
 [dependencies]
 sentinel-common = { path = "../sentinel-common" }
+sentinel-limbo = { path = "../sentinel-limbo", default-features = false }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 sentinel-common = { path = "../sentinel-common" }
+sentinel-limbo = { path = "../sentinel-limbo", default-features = false }
+tempfile = "3"
