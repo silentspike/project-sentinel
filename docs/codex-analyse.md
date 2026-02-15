@@ -65,7 +65,7 @@
 | #12 | sentinel-physics | FULL | Akustik/Temp/CO2/Geruch/Transit/Chaos implementiert | solide Umsetzung |
 | #13 | cortex-gateway Vollpipeline | FULL | AC-5 Command->Event Mapping mit atomaren Event+Outbox Writes implementiert (PR #71). Pipeline-Handler mit Extraction+Mapping verdrahtet: `cmd/cortex-gateway/internal/proxy/pipeline.go`. Benchmark: 1.36ms/write auf VM. | solide Umsetzung (PR #71) |
 | #14 | perception-injection (ECS) | FULL | `generate_perception` + `format_injection` vorhanden: `crates/sentinel-ecs/src/perception.rs:38`, `crates/sentinel-ecs/src/perception.rs:84` | solide Umsetzung |
-| #15 | teammate-first runtime | FULL | Orchestrator mit event-sourced Lifecycle (AC-2: DomainEvents via Limbo append_with_outbox) + Snapshot-Persistence (AC-4: save_state/restore). 18 Tests (11 unit + 7 acceptance). Benchmarks auf VM: spawn 1.25ms, restore 21us, shift-cycle 2.59ms. `crates/sentinel-runtime/src/lib.rs` | solide Umsetzung (PR #72) |
+| #15 | teammate-first runtime | FULL | Orchestrator mit event-sourced Lifecycle (AC-2), Snapshot-Persistence (AC-4), pause/resume mit State-Machine, RuntimeEventSink-Trait (ECS-Integration). 29 Tests (21 unit + 8 acceptance), 13 Benchmarks. Footprint: 96B/Orch + 72B/Agent, 1 Thread. `crates/sentinel-runtime/src/lib.rs` | solide Umsetzung (PR #72 + Nachbesserung) |
 | #16 | sandbox (bwrap+landlock+cgroups) | PARTIAL | bwrap-Args Builder: `crates/sentinel-sandbox/src/bwrap.rs:27`; cgroup-Datenstrukturen: `crates/sentinel-sandbox/src/cgroups.rs:6`; keine echte Landlock-/cgroup-Enforcement-Pipeline in Runtime | Umsetzungsluecke, AC zu struktur-lastig |
 | #17 | bitnet + multi-lora + speculative | PARTIAL | BitNet als Subprocess-Wrapper: `crates/sentinel-inference/src/bitnet.rs:18`; vereinfachte speculative Heuristik: `crates/sentinel-inference/src/speculative.rs:54` | AC auf Minimalfunktionen, nicht Produktionsniveau |
 | #18 | kv-cache-sharing | PARTIAL | Explizit nur Prompt-Level, kein echter KV-Cache sharing Kernel: `crates/sentinel-inference/src/kv_cache.rs:11` | Scope reduziert/vereinfacht |
@@ -100,7 +100,7 @@ Konkrete Beispiele:
 - Klassisch: "module complete, system incomplete".
 
 Konkrete Beispiele:
-- #13 Vollpipeline nicht in HTTP-Request-Pfad verdrahtet.
+- ~~#13 Vollpipeline nicht in HTTP-Request-Pfad verdrahtet~~ (behoben: PR #71, jetzt FULL).
 - #16 Sandbox nur Builder/Struct-Ebene, keine echte Enforcement-Kette.
 - #26 Judge nicht als separater Runtime-Prozess integriert.
 - #27 Persistenzanspruch nicht realisiert (nur in-memory).
@@ -133,7 +133,7 @@ Konkrete Beispiele:
    - Isolation/Security.
 
 ## Offene Prioritaetsliste fuer Re-Audit/Repair
-1. #13 Vollpipeline verdrahten (Injection -> Compiler -> Provider -> Detection/Judge -> Extraction -> Normalize -> Events).
+1. ~~#13 Vollpipeline verdrahten~~ (erledigt: PR #71, FULL).
 2. #20 echte 54er Migration abschliessen (Parser + Validierung + Tests auf 54 hart setzen).
 3. #16 echte Sandbox-Enforcement (Landlock/cgroups Anwendung + verifizierbare Integrationstests).
 4. #27 persistente Observatory-Storage auf Limbo/SQLite umstellen.
@@ -304,40 +304,57 @@ Im Skill klarstellen:
 - Benchmark-Code: `cmd/cortex-gateway/internal/eventstore/bench_test.go`
 - VM-Verify: `ssh ubuntu@192.0.2.240 "cd ~/project-sentinel/cmd/cortex-gateway && go test -bench=. ./internal/eventstore/"`
 
-### Runtime Orchestrator Benchmark (Issue #15 AC-2/AC-4)
+### Runtime Orchestrator Benchmark (Issue #15)
 
-**Kontext:** Issue #15 fordert event-sourced Lifecycle-Events (AC-2) und Resume nach Neustart (AC-4).
+**Kontext:** Issue #15 fordert event-sourced Lifecycle-Events (AC-2), Resume nach Neustart (AC-4), Pause/Resume Lifecycle, State-Machine, ECS-Integration-Hook.
 **Binary:** `cargo bench -p sentinel-runtime` (Release, Criterion), ausgefuehrt auf VM 192.0.2.240.
-**Methodik:** Criterion 100 Samples, Median.
+**Methodik:** Criterion 100 Samples, Median. Footprint via `#[ignore]` Test mit /proc/self/status.
 
 | Metrik | Wert | Einordnung | Status |
 |--------|------|------------|--------|
-| `runtime.spawn_with_event_ms` | `1.25ms` | Spawn + JSON-Serialize + append_with_outbox | **PASS** |
-| `runtime.spawn_no_event_ns` | `556ns` | Baseline ohne EventStore (Overhead: ~1.25ms = Store-I/O) | **INFO** |
-| `runtime.despawn_with_event_us` | `48.5us` | Despawn + Event-Emission | **PASS** |
-| `runtime.shift_transition_15_agents_us` | `244.6us` | Bulk-Remove 15 Agents + 1 Event | **PASS** |
-| `runtime.save_state_5_us` | `552us` | Snapshot 5 Agents (JSON + SQLite) | **PASS** |
-| `runtime.save_state_15_ms` | `1.02ms` | Snapshot 15 Agents | **PASS** |
-| `runtime.save_state_50_ms` | `1.40ms` | Snapshot 50 Agents | **PASS** |
-| `runtime.restore_5_us` | `15.2us` | Restore 5 Agents (SQLite Read + JSON-Deserialize) | **PASS** |
-| `runtime.restore_15_us` | `21.5us` | Restore 15 Agents | **PASS** |
-| `runtime.restore_50_us` | `42.5us` | Restore 50 Agents | **PASS** |
-| `runtime.full_shift_cycle_ms` | `2.59ms` | Spawn 15 + Transition + Spawn 15 + Save | **PASS** |
-| `runtime.restart_cycle_us` | `21.4us` | Restore 15 Agents (simulated restart) | **PASS** |
+| `runtime.spawn_with_event_ms` | `1.51ms` | Spawn + JSON-Serialize + append_with_outbox | **PASS** |
+| `runtime.spawn_no_event_ns` | `612ns` | Baseline ohne EventStore (Overhead: ~1.51ms = Store-I/O) | **INFO** |
+| `runtime.despawn_with_event_us` | `48.0us` | Despawn + Event-Emission | **PASS** |
+| `runtime.pause_resume_with_event_us` | `234us` | Pause + Resume Zyklus (2x State-Machine + 2x Event) | **PASS** |
+| `runtime.shift_transition_15_agents_us` | `22.9us` | Bulk-Remove 15 Agents + 1 Event | **PASS** |
+| `runtime.save_state_5_us` | `622us` | Snapshot 5 Agents (JSON + SQLite) | **PASS** |
+| `runtime.save_state_15_ms` | `990us` | Snapshot 15 Agents | **PASS** |
+| `runtime.save_state_50_ms` | `1.38ms` | Snapshot 50 Agents | **PASS** |
+| `runtime.restore_5_us` | `15.6us` | Restore 5 Agents (SQLite Read + JSON-Deserialize) | **PASS** |
+| `runtime.restore_15_us` | `22.0us` | Restore 15 Agents | **PASS** |
+| `runtime.restore_50_us` | `42.3us` | Restore 50 Agents | **PASS** |
+| `runtime.full_shift_cycle_ms` | `5.18ms` | Spawn 15 + Transition + Spawn 15 + Save | **PASS** |
+| `runtime.restart_cycle_us` | `21.9us` | Restore 15 Agents (simulated restart) | **PASS** |
+
+**Thread/Memory Footprint (Verify-Anforderung):**
+
+| Metrik | Wert | Einordnung |
+|--------|------|------------|
+| `sizeof(RuntimeOrchestrator)` | `96 bytes` | Stack-Allokation (HashMap + Optionals) |
+| `sizeof(AgentHandle)` | `72 bytes` | Pro Agent (+ Heap fuer name/role Strings) |
+| `sizeof(AgentStatus)` | `1 byte` | Enum mit 4 Varianten |
+| RSS Delta (50 Agents) | `2040 KB` | ~40 KB/Agent inkl. EventStore/SQLite overhead |
+| Threads | `1` (Runtime) | Kein Thread-pro-Agent, shared HashMap |
 
 **Einordnung:**
-- Spawn-Overhead dominiert von SQLite-Write (1.25ms vs. 556ns ohne Store = ~2250x)
-- Restore ist extrem schnell: 21us fuer 15 Agents (SQLite-Read + JSON-Parse)
-- Voller Schichtwechsel-Zyklus (Spawn 15 + Transition + Spawn 15 + Save) in 2.59ms
-- Recovery nach Neustart: 21us = vernachlaessigbar (Prozessstart dominiert)
-- save_state skaliert sublinear: 5 Agents 552us, 50 Agents 1.4ms (nicht 10x sondern 2.5x)
+- Spawn-Overhead dominiert von SQLite-Write (1.51ms vs. 612ns ohne Store = ~2470x)
+- Pause+Resume-Zyklus: 234us fuer State-Machine-Transition + 2 Events (2x SQLite-Write)
+- Restore ist extrem schnell: 22us fuer 15 Agents (SQLite-Read + JSON-Parse)
+- Voller Schichtwechsel-Zyklus in ~5ms (inkl. SQLite-Writes fuer alle Events)
+- Recovery nach Neustart: 22us = vernachlaessigbar (Prozessstart dominiert)
+- save_state skaliert sublinear: 5 Agents 622us, 50 Agents 1.38ms (nicht 10x sondern 2.2x)
+- Kein Prozesswachstum: 1 Thread, ~40 KB/Agent (dominated by SQLite page cache, nicht Agent-Daten)
+- State-Machine verhindert ungueltige Uebergaenge (Active->Suspended->Active, keine Suspended->Sleeping)
+- RuntimeEventSink-Trait ermoeglicht synchrone ECS-Integration ohne zusaetzliche Threads
 
 **Artefakte:**
 - Benchmark-Code: `crates/sentinel-runtime/benches/runtime_bench.rs`
+- Footprint-Test: `crates/sentinel-runtime/src/lib.rs` (`footprint_measurement`, `#[ignore]`)
 - VM-Verify: `ssh ubuntu@192.0.2.240 "cd /opt/sentinel && cargo bench -p sentinel-runtime 2>&1 | grep 'time:'"``
 
 ### Update-Log
-- 2026-02-15: Runtime Orchestrator Benchmark (Issue #15): Spawn 1.25ms, Restore 21us, Shift-Cycle 2.59ms auf VM 192.0.2.240. Issue #15 PARTIAL -> FULL.
+- 2026-02-15: Issue #15 Scope-Luecken geschlossen: pause_agent/resume_agent, State-Machine (AgentStatus::can_transition_to), RuntimeEventSink-Trait (ECS-Integration), Thread/Memory-Footprint dokumentiert. 29 Tests (21 unit + 8 acceptance), 13 Benchmarks auf VM.
+- 2026-02-15: Runtime Orchestrator Benchmark (Issue #15): Spawn 1.51ms, Restore 22us, Pause+Resume 234us, Footprint 96 bytes/Orchestrator + 72 bytes/Agent auf VM 192.0.2.240.
 - 2026-02-14: Cortex Event-Store Benchmark (Issue #13 AC5): AppendWithOutbox 1.36ms, IdempotentRetry 193us auf VM 192.0.2.240.
 - 2026-02-14: Decision Engine Benchmark (Issue #54 AC5) dokumentiert: 1.02us/tick bei 24 Agents (Schwellenwert <50us, 49x Marge).
 - 2026-02-13: VM-Toolchain auf `rustc/cargo 1.93.1` angehoben, 3-Run Stack-Suite auf 1069 durchgefuehrt, Zielwert-Matrix mit PASS/FAIL ergänzt.

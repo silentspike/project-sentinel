@@ -22,6 +22,59 @@ pub enum AgentStatus {
     Errored,
 }
 
+impl AgentStatus {
+    /// Prueft ob ein Statusuebergang gueltig ist (State-Machine).
+    ///
+    /// Gueltige Transitionen:
+    /// - Active -> Suspended, Sleeping, Errored
+    /// - Suspended -> Active, Errored
+    /// - Sleeping -> Active, Errored
+    /// - Errored -> Active
+    pub fn can_transition_to(self, target: AgentStatus) -> bool {
+        if self == target {
+            return false;
+        }
+        matches!(
+            (self, target),
+            (AgentStatus::Active, AgentStatus::Suspended)
+                | (AgentStatus::Active, AgentStatus::Sleeping)
+                | (AgentStatus::Active, AgentStatus::Errored)
+                | (AgentStatus::Suspended, AgentStatus::Active)
+                | (AgentStatus::Suspended, AgentStatus::Errored)
+                | (AgentStatus::Sleeping, AgentStatus::Active)
+                | (AgentStatus::Sleeping, AgentStatus::Errored)
+                | (AgentStatus::Errored, AgentStatus::Active)
+        )
+    }
+
+    /// Gibt den Status als String zurueck (fuer Event-Payload).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentStatus::Active => "active",
+            AgentStatus::Sleeping => "sleeping",
+            AgentStatus::Suspended => "suspended",
+            AgentStatus::Errored => "errored",
+        }
+    }
+}
+
+/// Integration-Hook fuer externe Systeme (ECS, Cortex).
+///
+/// Implementierer werden bei Lifecycle-Events synchron benachrichtigt.
+/// Dies ist der primaere Integrationspunkt fuer sentinel-ecs:
+/// - ECS World kann Entities spawnen/despawnen wenn Runtime-Lifecycle-Events feuern
+/// - Cortex-Gateway empfaengt Events zusaetzlich asynchron via Limbo-Outbox -> Zenoh
+pub trait RuntimeEventSink: Send + Sync {
+    /// Aufgerufen nach erfolgreichem Agent-Spawn.
+    fn on_agent_spawned(&self, agent_id: AgentId, identity: &AgentIdentity, shift: &ShiftInfo);
+    /// Aufgerufen nach Agent-Despawn.
+    fn on_agent_despawned(&self, agent_id: AgentId);
+    /// Aufgerufen bei Statuswechsel (pause, resume, error, recover).
+    fn on_agent_status_changed(&self, agent_id: AgentId, old: AgentStatus, new: AgentStatus);
+    /// Aufgerufen nach Schichtwechsel mit Liste der entfernten Agents.
+    fn on_shift_transition(&self, new_shift_set: u8, removed: &[AgentId]);
+}
+
 /// Handle fuer einen einzelnen Agenten in der Runtime.
 pub struct AgentHandle {
     pub identity: AgentIdentity,
@@ -74,7 +127,9 @@ pub struct RuntimeOrchestrator {
     agents: HashMap<AgentId, AgentHandle>,
     max_agents: usize,
     event_store: Option<Arc<EventStore>>,
+    event_sink: Option<Arc<dyn RuntimeEventSink>>,
     current_tick: u64,
+    event_seq: u64,
 }
 
 const RUNTIME_AGGREGATE: &str = "runtime";
@@ -86,13 +141,21 @@ impl RuntimeOrchestrator {
             agents: HashMap::new(),
             max_agents,
             event_store: None,
+            event_sink: None,
             current_tick: 0,
+            event_seq: 0,
         }
     }
 
     /// Attaches an EventStore for lifecycle event emission and snapshot persistence.
     pub fn with_event_store(mut self, store: Arc<EventStore>) -> Self {
         self.event_store = Some(store);
+        self
+    }
+
+    /// Attaches a RuntimeEventSink for ECS/Cortex integration.
+    pub fn with_event_sink(mut self, sink: Arc<dyn RuntimeEventSink>) -> Self {
+        self.event_sink = Some(sink);
         self
     }
 
@@ -136,8 +199,8 @@ impl RuntimeOrchestrator {
         // Emit lifecycle event (AC-2)
         let payload = DomainEventPayload::AgentSpawned {
             agent_id,
-            name,
-            role,
+            name: name.clone(),
+            role: role.clone(),
             shift_set,
         };
         self.emit_event(
@@ -146,6 +209,12 @@ impl RuntimeOrchestrator {
             &payload.to_json(),
             &format!("spawn-{}", agent_id.0),
         );
+
+        // Notify integration sink (ECS/Cortex)
+        if let Some(sink) = &self.event_sink {
+            let handle = self.agents.get(&agent_id).unwrap();
+            sink.on_agent_spawned(agent_id, &handle.identity, &handle.shift);
+        }
 
         Ok(())
     }
@@ -172,6 +241,91 @@ impl RuntimeOrchestrator {
             &payload.to_json(),
             &format!("despawn-{}", agent_id.0),
         );
+
+        // Notify integration sink
+        if let Some(sink) = &self.event_sink {
+            sink.on_agent_despawned(agent_id);
+        }
+
+        Ok(())
+    }
+
+    /// Pausiert einen Agenten (Active -> Suspended). Fehler bei ungueltigem Uebergang.
+    pub fn pause_agent(&mut self, agent_id: AgentId) -> Result<()> {
+        let handle = self
+            .agents
+            .get_mut(&agent_id)
+            .ok_or_else(|| anyhow!("Agent {} not found", agent_id))?;
+
+        let old_status = handle.status;
+        if !old_status.can_transition_to(AgentStatus::Suspended) {
+            return Err(anyhow!(
+                "Cannot pause agent {} in state {:?}",
+                agent_id,
+                old_status
+            ));
+        }
+
+        handle.status = AgentStatus::Suspended;
+        tracing::info!(agent_id = %agent_id, "Agent paused (suspended)");
+
+        // Emit status change event (AC-2)
+        let payload = DomainEventPayload::AgentStatusChanged {
+            agent_id,
+            old_status: old_status.as_str().to_string(),
+            new_status: AgentStatus::Suspended.as_str().to_string(),
+        };
+        self.emit_event(
+            payload.event_type_str(),
+            &format!("AGENT-{:02}", agent_id.0),
+            &payload.to_json(),
+            &format!("pause-{}", agent_id.0),
+        );
+
+        // Notify integration sink
+        if let Some(sink) = &self.event_sink {
+            sink.on_agent_status_changed(agent_id, old_status, AgentStatus::Suspended);
+        }
+
+        Ok(())
+    }
+
+    /// Reaktiviert einen pausierten/schlafenden Agenten (Suspended/Sleeping -> Active).
+    pub fn resume_agent(&mut self, agent_id: AgentId) -> Result<()> {
+        let handle = self
+            .agents
+            .get_mut(&agent_id)
+            .ok_or_else(|| anyhow!("Agent {} not found", agent_id))?;
+
+        let old_status = handle.status;
+        if !old_status.can_transition_to(AgentStatus::Active) {
+            return Err(anyhow!(
+                "Cannot resume agent {} in state {:?}",
+                agent_id,
+                old_status
+            ));
+        }
+
+        handle.status = AgentStatus::Active;
+        tracing::info!(agent_id = %agent_id, old_status = ?old_status, "Agent resumed");
+
+        // Emit status change event (AC-2)
+        let payload = DomainEventPayload::AgentStatusChanged {
+            agent_id,
+            old_status: old_status.as_str().to_string(),
+            new_status: AgentStatus::Active.as_str().to_string(),
+        };
+        self.emit_event(
+            payload.event_type_str(),
+            &format!("AGENT-{:02}", agent_id.0),
+            &payload.to_json(),
+            &format!("resume-{}", agent_id.0),
+        );
+
+        // Notify integration sink
+        if let Some(sink) = &self.event_sink {
+            sink.on_agent_status_changed(agent_id, old_status, AgentStatus::Active);
+        }
 
         Ok(())
     }
@@ -215,6 +369,11 @@ impl RuntimeOrchestrator {
             &payload.to_json(),
             &format!("shift-{}-tick-{}", new_shift_set, self.current_tick),
         );
+
+        // Notify integration sink
+        if let Some(sink) = &self.event_sink {
+            sink.on_shift_transition(new_shift_set, &to_remove);
+        }
 
         to_remove
     }
@@ -295,18 +454,24 @@ impl RuntimeOrchestrator {
                 snapshot.max_agents
             },
             event_store: Some(store),
+            event_sink: None,
             current_tick: 0,
+            event_seq: 0,
         })
     }
 
     /// Emits a lifecycle event to the event store (best-effort, logs on failure).
-    fn emit_event(&self, event_type: &str, aggregate_id: &str, payload: &str, op_suffix: &str) {
+    fn emit_event(&mut self, event_type: &str, aggregate_id: &str, payload: &str, op_suffix: &str) {
         let store = match &self.event_store {
             Some(s) => s,
             None => return,
         };
 
-        let op_id = format!("runtime-{}-{}", op_suffix, self.current_tick);
+        self.event_seq += 1;
+        let op_id = format!(
+            "runtime-{}-{}-{}",
+            op_suffix, self.current_tick, self.event_seq
+        );
         let event = DomainEvent::new(event_type, aggregate_id, payload, &op_id, self.current_tick)
             .with_operation_id(&op_id);
 
@@ -595,5 +760,327 @@ mod tests {
         let orch = RuntimeOrchestrator::new(10);
         let result = orch.save_state();
         assert!(result.is_err());
+    }
+
+    // ── State Machine Tests ──────────────────────────
+
+    #[test]
+    fn state_machine_valid_transitions() {
+        // Active kann zu Suspended, Sleeping, Errored
+        assert!(AgentStatus::Active.can_transition_to(AgentStatus::Suspended));
+        assert!(AgentStatus::Active.can_transition_to(AgentStatus::Sleeping));
+        assert!(AgentStatus::Active.can_transition_to(AgentStatus::Errored));
+        // Suspended kann zu Active, Errored
+        assert!(AgentStatus::Suspended.can_transition_to(AgentStatus::Active));
+        assert!(AgentStatus::Suspended.can_transition_to(AgentStatus::Errored));
+        // Sleeping kann zu Active, Errored
+        assert!(AgentStatus::Sleeping.can_transition_to(AgentStatus::Active));
+        assert!(AgentStatus::Sleeping.can_transition_to(AgentStatus::Errored));
+        // Errored kann zu Active (Recover)
+        assert!(AgentStatus::Errored.can_transition_to(AgentStatus::Active));
+    }
+
+    #[test]
+    fn state_machine_invalid_transitions() {
+        // Gleicher Status
+        assert!(!AgentStatus::Active.can_transition_to(AgentStatus::Active));
+        // Suspended kann nicht zu Sleeping
+        assert!(!AgentStatus::Suspended.can_transition_to(AgentStatus::Sleeping));
+        // Sleeping kann nicht zu Suspended
+        assert!(!AgentStatus::Sleeping.can_transition_to(AgentStatus::Suspended));
+        // Errored kann nicht zu Suspended/Sleeping
+        assert!(!AgentStatus::Errored.can_transition_to(AgentStatus::Suspended));
+        assert!(!AgentStatus::Errored.can_transition_to(AgentStatus::Sleeping));
+    }
+
+    // ── Pause/Resume Tests ──────────────────────────
+
+    #[test]
+    fn pause_resume_lifecycle() {
+        let mut orch = RuntimeOrchestrator::new(10);
+        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
+            .unwrap();
+
+        // Active -> Suspended (pause)
+        orch.pause_agent(AgentId(1)).unwrap();
+        assert_eq!(
+            orch.get_agent_mut(AgentId(1)).unwrap().status,
+            AgentStatus::Suspended
+        );
+
+        // Suspended -> Active (resume)
+        orch.resume_agent(AgentId(1)).unwrap();
+        assert_eq!(
+            orch.get_agent_mut(AgentId(1)).unwrap().status,
+            AgentStatus::Active
+        );
+    }
+
+    #[test]
+    fn pause_already_suspended_fails() {
+        let mut orch = RuntimeOrchestrator::new(10);
+        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
+            .unwrap();
+        orch.pause_agent(AgentId(1)).unwrap();
+
+        // Suspended -> Suspended: ungueltig
+        let result = orch.pause_agent(AgentId(1));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resume_already_active_fails() {
+        let mut orch = RuntimeOrchestrator::new(10);
+        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
+            .unwrap();
+
+        // Active -> Active via resume: ungueltig
+        let result = orch.resume_agent(AgentId(1));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resume_from_sleeping() {
+        let mut orch = RuntimeOrchestrator::new(10);
+        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
+            .unwrap();
+
+        // Manuell auf Sleeping setzen (Sleep-Cycle)
+        orch.get_agent_mut(AgentId(1)).unwrap().status = AgentStatus::Sleeping;
+
+        // Sleeping -> Active (resume)
+        orch.resume_agent(AgentId(1)).unwrap();
+        assert_eq!(
+            orch.get_agent_mut(AgentId(1)).unwrap().status,
+            AgentStatus::Active
+        );
+    }
+
+    #[test]
+    fn resume_from_errored() {
+        let mut orch = RuntimeOrchestrator::new(10);
+        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
+            .unwrap();
+
+        // Manuell auf Errored setzen
+        orch.get_agent_mut(AgentId(1)).unwrap().status = AgentStatus::Errored;
+
+        // Errored -> Active (recover via resume)
+        orch.resume_agent(AgentId(1)).unwrap();
+        assert_eq!(
+            orch.get_agent_mut(AgentId(1)).unwrap().status,
+            AgentStatus::Active
+        );
+    }
+
+    #[test]
+    fn pause_resume_events_sourced() {
+        let (_dir, store) = temp_event_store();
+        let mut orch = RuntimeOrchestrator::new(10).with_event_store(store.clone());
+        orch.set_tick(1);
+
+        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
+            .unwrap();
+
+        // Pause
+        orch.pause_agent(AgentId(1)).unwrap();
+        let events = store.get_events_by_aggregate("AGENT-01", 10).unwrap();
+        assert_eq!(events.len(), 2); // spawn + status_changed
+        assert_eq!(events[1].event_type, "agent_status_changed");
+
+        // Resume
+        orch.resume_agent(AgentId(1)).unwrap();
+        let events = store.get_events_by_aggregate("AGENT-01", 10).unwrap();
+        assert_eq!(events.len(), 3); // spawn + pause + resume
+        assert_eq!(events[2].event_type, "agent_status_changed");
+    }
+
+    // ── EventSink Integration Tests ──────────────────
+
+    #[test]
+    fn event_sink_receives_lifecycle_events() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct TestSink {
+            spawned: Mutex<Vec<AgentId>>,
+            despawned: Mutex<Vec<AgentId>>,
+            status_changes: Mutex<Vec<(AgentId, AgentStatus, AgentStatus)>>,
+            transitions: Mutex<Vec<(u8, Vec<AgentId>)>>,
+        }
+
+        impl RuntimeEventSink for TestSink {
+            fn on_agent_spawned(
+                &self,
+                agent_id: AgentId,
+                _identity: &AgentIdentity,
+                _shift: &ShiftInfo,
+            ) {
+                self.spawned.lock().unwrap().push(agent_id);
+            }
+            fn on_agent_despawned(&self, agent_id: AgentId) {
+                self.despawned.lock().unwrap().push(agent_id);
+            }
+            fn on_agent_status_changed(
+                &self,
+                agent_id: AgentId,
+                old: AgentStatus,
+                new: AgentStatus,
+            ) {
+                self.status_changes
+                    .lock()
+                    .unwrap()
+                    .push((agent_id, old, new));
+            }
+            fn on_shift_transition(&self, new_shift_set: u8, removed: &[AgentId]) {
+                self.transitions
+                    .lock()
+                    .unwrap()
+                    .push((new_shift_set, removed.to_vec()));
+            }
+        }
+
+        let sink = Arc::new(TestSink::default());
+        let mut orch = RuntimeOrchestrator::new(10).with_event_sink(sink.clone());
+
+        // Spawn
+        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
+            .unwrap();
+        assert_eq!(sink.spawned.lock().unwrap().len(), 1);
+
+        // Pause
+        orch.pause_agent(AgentId(1)).unwrap();
+        assert_eq!(sink.status_changes.lock().unwrap().len(), 1);
+        let (id, old, new) = sink.status_changes.lock().unwrap()[0];
+        assert_eq!(id, AgentId(1));
+        assert_eq!(old, AgentStatus::Active);
+        assert_eq!(new, AgentStatus::Suspended);
+
+        // Resume
+        orch.resume_agent(AgentId(1)).unwrap();
+        assert_eq!(sink.status_changes.lock().unwrap().len(), 2);
+
+        // Shift transition
+        orch.spawn_agent(
+            create_identity(16, "Michael", "CEO"),
+            create_shift(2, 14, 22),
+        )
+        .unwrap();
+        let _ = orch.shift_transition(2);
+        assert_eq!(sink.transitions.lock().unwrap().len(), 1);
+
+        // Despawn
+        orch.despawn_agent(AgentId(16)).unwrap();
+        assert_eq!(sink.despawned.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pause_resume_snapshot_roundtrip() {
+        let (_dir, store) = temp_event_store();
+        let mut orch = RuntimeOrchestrator::new(10).with_event_store(store.clone());
+        orch.set_tick(1);
+
+        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
+            .unwrap();
+        orch.spawn_agent(
+            create_identity(2, "Lisa", "Designer"),
+            create_shift(1, 6, 14),
+        )
+        .unwrap();
+
+        // Pause Agent 1
+        orch.pause_agent(AgentId(1)).unwrap();
+
+        // Save + Restore
+        orch.save_state().unwrap();
+        let mut restored = RuntimeOrchestrator::restore(store, 10).unwrap();
+
+        // Suspended status muss persistiert sein
+        assert_eq!(
+            restored.get_agent_mut(AgentId(1)).unwrap().status,
+            AgentStatus::Suspended
+        );
+        assert_eq!(
+            restored.get_agent_mut(AgentId(2)).unwrap().status,
+            AgentStatus::Active
+        );
+    }
+
+    /// Footprint-Messung (manuell ausfuehrbar via --ignored).
+    #[test]
+    #[ignore]
+    fn footprint_measurement() {
+        println!(
+            "sizeof(AgentHandle):            {} bytes",
+            std::mem::size_of::<AgentHandle>()
+        );
+        println!(
+            "sizeof(AgentStatus):            {} bytes",
+            std::mem::size_of::<AgentStatus>()
+        );
+        println!(
+            "sizeof(AgentIdentity):          {} bytes",
+            std::mem::size_of::<sentinel_common::components::AgentIdentity>()
+        );
+        println!(
+            "sizeof(ShiftInfo):              {} bytes",
+            std::mem::size_of::<sentinel_common::components::ShiftInfo>()
+        );
+        println!(
+            "sizeof(RuntimeOrchestrator):    {} bytes",
+            std::mem::size_of::<RuntimeOrchestrator>()
+        );
+        println!(
+            "sizeof(AgentSnapshot):          {} bytes",
+            std::mem::size_of::<AgentSnapshot>()
+        );
+        println!(
+            "sizeof(RuntimeSnapshot):        {} bytes",
+            std::mem::size_of::<RuntimeSnapshot>()
+        );
+
+        // Measure RSS with 50 agents
+        let rss_before = get_rss_kb();
+        let (_dir, store) = temp_event_store();
+        let mut orch = RuntimeOrchestrator::new(100).with_event_store(store);
+        orch.set_tick(1);
+        for id in 1..=50u16 {
+            orch.spawn_agent(
+                create_identity(id, &format!("Agent-{id}"), "Worker"),
+                create_shift(1, 6, 14),
+            )
+            .unwrap();
+        }
+        let rss_after = get_rss_kb();
+
+        println!("RSS before 50 agents:           {} KB", rss_before);
+        println!("RSS after 50 agents:            {} KB", rss_after);
+        println!(
+            "RSS delta (50 agents):          {} KB",
+            rss_after.saturating_sub(rss_before)
+        );
+        println!("Threads:                        {}", get_thread_count());
+    }
+
+    fn get_rss_kb() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for line in status.lines() {
+            if line.starts_with("VmRSS:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                return parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+        }
+        0
+    }
+
+    fn get_thread_count() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for line in status.lines() {
+            if line.starts_with("Threads:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                return parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+        }
+        0
     }
 }
