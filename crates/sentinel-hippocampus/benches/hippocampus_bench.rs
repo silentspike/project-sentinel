@@ -15,7 +15,15 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use redb::ReadableDatabase;
 use sentinel_hippocampus::{nmda_score, Episode, HippocampusService, HippocampusStore};
 
-fn make_episode(id: u64, agent: &str, summary: &str, relevance: f64, emotion: f64, repetitions: u32, hours_ago: f64) -> Episode {
+fn make_episode(
+    id: u64,
+    agent: &str,
+    summary: &str,
+    relevance: f64,
+    emotion: f64,
+    repetitions: u32,
+    hours_ago: f64,
+) -> Episode {
     Episode {
         id,
         agent_name: agent.to_string(),
@@ -68,7 +76,15 @@ fn temp_service() -> (tempfile::TempDir, HippocampusService) {
 // ──────────────────────────────────────────────
 
 fn bench_episode_serialization(c: &mut Criterion) {
-    let episode = make_episode(1, "Thomas", "Wichtiges Strategiemeeting mit Stakeholdern", 0.9, 0.85, 2, 1.0);
+    let episode = make_episode(
+        1,
+        "Thomas",
+        "Wichtiges Strategiemeeting mit Stakeholdern",
+        0.9,
+        0.85,
+        2,
+        1.0,
+    );
 
     c.bench_function("hippocampus.episode_serialize_json", |b| {
         b.iter(|| {
@@ -122,10 +138,8 @@ fn bench_nmda_scoring(c: &mut Criterion) {
 
     c.bench_function("hippocampus.nmda_score_sort_10", |b| {
         b.iter(|| {
-            let mut scored: Vec<(&Episode, f64)> = episodes
-                .iter()
-                .map(|ep| (ep, nmda_score(ep)))
-                .collect();
+            let mut scored: Vec<(&Episode, f64)> =
+                episodes.iter().map(|ep| (ep, nmda_score(ep))).collect();
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             black_box(scored);
         })
@@ -144,7 +158,9 @@ fn bench_redb_store_load(c: &mut Criterion) {
 
         c.bench_function("hippocampus.redb_store_1_episode", |b| {
             b.iter(|| {
-                store.store_episodes("Thomas", black_box(&[episode.clone()])).unwrap();
+                store
+                    .store_episodes("Thomas", black_box(&[episode.clone()]))
+                    .unwrap();
             })
         });
 
@@ -166,7 +182,9 @@ fn bench_redb_store_load(c: &mut Criterion) {
 
         c.bench_function("hippocampus.redb_store_10_episodes", |b| {
             b.iter(|| {
-                store.store_episodes("Thomas", black_box(&episodes)).unwrap();
+                store
+                    .store_episodes("Thomas", black_box(&episodes))
+                    .unwrap();
             })
         });
 
@@ -191,7 +209,9 @@ fn bench_redb_store_load(c: &mut Criterion) {
             b.iter(|| {
                 // Reset to 5 episodes before each append
                 store.store_episodes("Thomas", &episodes).unwrap();
-                store.append_episodes("Thomas", black_box(&[new_ep.clone()])).unwrap();
+                store
+                    .append_episodes("Thomas", black_box(&[new_ep.clone()]))
+                    .unwrap();
             })
         });
     }
@@ -206,14 +226,21 @@ fn bench_fact_operations(c: &mut Criterion) {
 
     c.bench_function("hippocampus.redb_store_fact", |b| {
         b.iter(|| {
-            store.store_fact(
-                black_box("facts/projects/aurora"),
-                black_box("Projekt Aurora: Webseite Redesign Phase 2"),
-            ).unwrap();
+            store
+                .store_fact(
+                    black_box("facts/projects/aurora"),
+                    black_box("Projekt Aurora: Webseite Redesign Phase 2"),
+                )
+                .unwrap();
         })
     });
 
-    store.store_fact("facts/projects/aurora", "Projekt Aurora: Webseite Redesign Phase 2").unwrap();
+    store
+        .store_fact(
+            "facts/projects/aurora",
+            "Projekt Aurora: Webseite Redesign Phase 2",
+        )
+        .unwrap();
 
     c.bench_function("hippocampus.redb_load_fact", |b| {
         b.iter(|| {
@@ -308,7 +335,9 @@ fn bench_retrieval(c: &mut Criterion) {
 
         c.bench_function("hippocampus.retrieve_top5_from_10", |b| {
             b.iter(|| {
-                let memories = service.retrieve_memories(black_box("Thomas"), black_box(5)).unwrap();
+                let memories = service
+                    .retrieve_memories(black_box("Thomas"), black_box(5))
+                    .unwrap();
                 black_box(memories);
             })
         });
@@ -322,7 +351,9 @@ fn bench_retrieval(c: &mut Criterion) {
 
         c.bench_function("hippocampus.retrieve_top10_from_50", |b| {
             b.iter(|| {
-                let memories = service.retrieve_memories(black_box("Thomas"), black_box(10)).unwrap();
+                let memories = service
+                    .retrieve_memories(black_box("Thomas"), black_box(10))
+                    .unwrap();
                 black_box(memories);
             })
         });
@@ -336,13 +367,23 @@ fn bench_retrieval(c: &mut Criterion) {
 fn bench_fact_retrieval(c: &mut Criterion) {
     let (_dir, service) = temp_service();
     // Store facts that match FACT_TRIGGERS
-    service.store().store_fact("facts/projects/aurora", "Projekt Aurora: Webseite Redesign").unwrap();
-    service.store().store_fact("facts/finance/budget-q1", "Q1 Budget: 150k EUR").unwrap();
-    service.store().store_fact("facts/hr/vacation", "30 Tage pro Jahr").unwrap();
+    service
+        .store()
+        .store_fact("facts/projects/aurora", "Projekt Aurora: Webseite Redesign")
+        .unwrap();
+    service
+        .store()
+        .store_fact("facts/finance/budget-q1", "Q1 Budget: 150k EUR")
+        .unwrap();
+    service
+        .store()
+        .store_fact("facts/hr/vacation", "30 Tage pro Jahr")
+        .unwrap();
 
     c.bench_function("hippocampus.fact_retrieval_2_matches", |b| {
         b.iter(|| {
-            let facts = service.retrieve_facts(black_box("Wir besprechen Projekt Aurora und das Budget"));
+            let facts =
+                service.retrieve_facts(black_box("Wir besprechen Projekt Aurora und das Budget"));
             black_box(facts);
         })
     });
@@ -373,7 +414,9 @@ fn bench_scaling(c: &mut Criterion) {
                 let episodes = make_realistic_episodes("Thomas", count);
 
                 b.iter(|| {
-                    store.store_episodes("Thomas", black_box(&episodes)).unwrap();
+                    store
+                        .store_episodes("Thomas", black_box(&episodes))
+                        .unwrap();
                 });
             },
         );
@@ -406,7 +449,9 @@ fn bench_scaling(c: &mut Criterion) {
                 service.record_episodes("Thomas", &episodes).unwrap();
 
                 b.iter(|| {
-                    let mems = service.retrieve_memories(black_box("Thomas"), black_box(10)).unwrap();
+                    let mems = service
+                        .retrieve_memories(black_box("Thomas"), black_box(10))
+                        .unwrap();
                     black_box(mems);
                 });
             },
@@ -488,7 +533,8 @@ fn bench_redb_deep(c: &mut Criterion) {
         // Initialize table
         {
             let txn = db.begin_write().unwrap();
-            txn.open_table(redb::TableDefinition::<&str, &[u8]>::new("bench")).unwrap();
+            txn.open_table(redb::TableDefinition::<&str, &[u8]>::new("bench"))
+                .unwrap();
             txn.commit().unwrap();
         }
 
@@ -496,7 +542,9 @@ fn bench_redb_deep(c: &mut Criterion) {
             b.iter(|| {
                 let txn = db.begin_write().unwrap();
                 {
-                    let _table = txn.open_table(redb::TableDefinition::<&str, &[u8]>::new("bench")).unwrap();
+                    let _table = txn
+                        .open_table(redb::TableDefinition::<&str, &[u8]>::new("bench"))
+                        .unwrap();
                 }
                 txn.commit().unwrap();
             })
@@ -505,7 +553,9 @@ fn bench_redb_deep(c: &mut Criterion) {
         c.bench_function("hippocampus.redb_txn_read_only", |b| {
             b.iter(|| {
                 let txn = db.begin_read().unwrap();
-                let table = txn.open_table(redb::TableDefinition::<&str, &[u8]>::new("bench")).unwrap();
+                let table = txn
+                    .open_table(redb::TableDefinition::<&str, &[u8]>::new("bench"))
+                    .unwrap();
                 let _ = table.get("nonexistent").unwrap();
                 black_box(());
             })
@@ -524,7 +574,15 @@ fn bench_redb_deep(c: &mut Criterion) {
                     let path = dir.path().join("bench-scan.redb");
                     let store = HippocampusStore::open(path.to_str().unwrap()).unwrap();
                     for i in 0..count {
-                        let ep = make_episode(i as u64, &format!("Agent_{i}"), "Episode", 0.5, 0.5, 1, 1.0);
+                        let ep = make_episode(
+                            i as u64,
+                            &format!("Agent_{i}"),
+                            "Episode",
+                            0.5,
+                            0.5,
+                            1,
+                            1.0,
+                        );
                         store.store_episodes(&format!("Agent_{i}"), &[ep]).unwrap();
                     }
 
@@ -544,7 +602,9 @@ fn bench_redb_deep(c: &mut Criterion) {
         c.bench_function("hippocampus.redb_cache_state_toggle", |b| {
             let mut is_hot = true;
             b.iter(|| {
-                store.store_cache_state("Thomas", black_box(is_hot)).unwrap();
+                store
+                    .store_cache_state("Thomas", black_box(is_hot))
+                    .unwrap();
                 is_hot = !is_hot;
             })
         });
@@ -575,7 +635,9 @@ fn bench_production_scenario(c: &mut Criterion) {
                 for i in 0..54 {
                     let count = 8 + (i % 5); // 8-12 episodes
                     let episodes = make_realistic_episodes(&format!("Agent_{i}"), count);
-                    service.record_episodes(&format!("Agent_{i}"), &episodes).unwrap();
+                    service
+                        .record_episodes(&format!("Agent_{i}"), &episodes)
+                        .unwrap();
                 }
                 (dir, service)
             },
@@ -597,7 +659,8 @@ fn bench_production_scenario(c: &mut Criterion) {
             },
             |(_dir, service)| {
                 for i in 0..54 {
-                    let ep = make_episode(i, &format!("Agent_{i}"), "Tages-Event", 0.7, 0.6, 1, 0.5);
+                    let ep =
+                        make_episode(i, &format!("Agent_{i}"), "Tages-Event", 0.7, 0.6, 1, 0.5);
                     service.record_episode(ep).unwrap();
                 }
             },
@@ -611,7 +674,9 @@ fn bench_production_scenario(c: &mut Criterion) {
         let service = HippocampusService::open(path.to_str().unwrap()).unwrap();
         for i in 0..54 {
             let episodes = make_realistic_episodes(&format!("Agent_{i}"), 10);
-            service.record_episodes(&format!("Agent_{i}"), &episodes).unwrap();
+            service
+                .record_episodes(&format!("Agent_{i}"), &episodes)
+                .unwrap();
         }
 
         c.bench_function("hippocampus.production_54_agents_retrieve_all", |b| {
@@ -632,11 +697,16 @@ fn bench_production_scenario(c: &mut Criterion) {
         let service = HippocampusService::open(path.to_str().unwrap()).unwrap();
         for i in 0..54 {
             let episodes = make_realistic_episodes(&format!("Agent_{i}"), 10);
-            service.record_episodes(&format!("Agent_{i}"), &episodes).unwrap();
-            service.store().store_fact(
-                &format!("facts/agent_{i}/info"),
-                &format!("Agent {i} Fakten und Informationen"),
-            ).unwrap();
+            service
+                .record_episodes(&format!("Agent_{i}"), &episodes)
+                .unwrap();
+            service
+                .store()
+                .store_fact(
+                    &format!("facts/agent_{i}/info"),
+                    &format!("Agent {i} Fakten und Informationen"),
+                )
+                .unwrap();
         }
         drop(service);
         let file_size = std::fs::metadata(&path).unwrap().len();
