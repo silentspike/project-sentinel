@@ -187,11 +187,8 @@ fn ac_15_04_resume_after_restart() {
             create_shift(2, 14, 22),
         )
         .unwrap();
-        orch.spawn_agent(
-            create_identity(4, "Sandra", "PM"),
-            create_shift(2, 14, 22),
-        )
-        .unwrap();
+        orch.spawn_agent(create_identity(4, "Sandra", "PM"), create_shift(2, 14, 22))
+            .unwrap();
         orch.spawn_agent(
             create_identity(46, "Betriebsrat", "Sonder"),
             create_shift(0, 0, 23),

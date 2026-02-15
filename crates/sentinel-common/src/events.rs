@@ -130,10 +130,7 @@ pub enum DomainEventPayload {
         shift_set: u8,
     },
     /// Agent wurde aus der Runtime entfernt
-    AgentDespawned {
-        agent_id: AgentId,
-        reason: String,
-    },
+    AgentDespawned { agent_id: AgentId, reason: String },
     /// Schichtwechsel abgeschlossen
     ShiftTransitionCompleted {
         new_shift_set: u8,

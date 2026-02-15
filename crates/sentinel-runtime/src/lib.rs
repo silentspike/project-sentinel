@@ -7,11 +7,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use serde::{Deserialize, Serialize};
 use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::events::{DomainEvent, DomainEventPayload};
 use sentinel_common::{AgentId, Tick};
 use sentinel_limbo::EventStore;
+use serde::{Deserialize, Serialize};
 
 /// Status eines laufenden Agenten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
