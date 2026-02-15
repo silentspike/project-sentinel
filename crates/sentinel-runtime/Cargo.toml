@@ -18,3 +18,8 @@ uuid = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
 sentinel-limbo = { path = "../sentinel-limbo", default-features = false }
 tempfile = "3"
+criterion = { workspace = true }
+
+[[bench]]
+name = "runtime_bench"
+harness = false

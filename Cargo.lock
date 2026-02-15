@@ -3057,6 +3057,7 @@ name = "sentinel-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "criterion",
  "sentinel-common",
  "sentinel-limbo",
  "serde",
