@@ -33,4 +33,4 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 anyhow = "1"
 toml = "1.0"
 approx = "0.5"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
