@@ -6,10 +6,12 @@ export function renderMetrics(metrics) {
   grid.className = 'metrics-grid';
 
   const cards = [
-    { label: 'Tick Rate', value: metrics.tick_rate.toFixed(1) + ' Hz', id: 'tick-rate' },
-    { label: 'Aktive Agents', value: String(metrics.agent_count), id: 'agent-count' },
+    { label: 'Aktive Agents', value: String(metrics.active_agents), id: 'active-agents' },
+    { label: 'Aktionen', value: String(metrics.total_actions), id: 'total-actions' },
+    { label: 'Transits', value: String(metrics.total_transits), id: 'total-transits' },
+    { label: 'Chaos Events', value: String(metrics.chaos_events), id: 'chaos-events' },
+    { label: 'Schichtwechsel', value: String(metrics.shift_changes), id: 'shift-changes' },
     { label: 'Uptime', value: formatUptime(metrics.uptime), id: 'uptime' },
-    { label: 'Nachrichten/min', value: metrics.messages_per_min.toFixed(1), id: 'msg-rate' },
   ];
 
   for (const card of cards) {
@@ -34,6 +36,7 @@ export function renderMetrics(metrics) {
 }
 
 function formatUptime(seconds) {
+  if (seconds == null) return '--';
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   return h + 'h ' + m + 'm';

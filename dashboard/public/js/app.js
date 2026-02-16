@@ -1,7 +1,7 @@
 // Router und WebSocket Manager
-import { renderAgents, updateAgentBio } from './agents.js';
+import { renderAgents, updateAgents } from './agents.js';
 import { renderFloorplan } from './floorplan.js';
-import { renderChat } from './chat.js';
+import { renderActivity, updateActivity } from './activity.js';
 import { renderMetrics } from './metrics.js';
 
 let ws = null;
@@ -23,6 +23,13 @@ function initNavigation() {
   });
 }
 
+function updateLagDisplay(lag) {
+  const lagEl = document.getElementById('projection-lag');
+  if (!lagEl) return;
+  lagEl.textContent = 'Lag: ' + lag;
+  lagEl.className = lag > 100 ? 'lag-high' : lag > 10 ? 'lag-medium' : 'lag-ok';
+}
+
 function connectWebSocket() {
   const statusEl = document.getElementById('connection-status');
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -36,8 +43,13 @@ function connectWebSocket() {
   ws.onmessage = (event) => {
     try {
       const data = JSON.parse(event.data);
-      if (data.type === 'bio_update') {
-        updateAgentBio(data.agent, data.data);
+      if (data.type === 'agent_update') {
+        updateAgents(data.agents);
+        updateActivity(data.agents);
+      } else if (data.type === 'room_update') {
+        renderFloorplan(data.rooms);
+      } else if (data.type === 'health_update') {
+        updateLagDisplay(data.lag);
       }
     } catch { /* ignore parse errors */ }
   };
@@ -72,7 +84,14 @@ async function init() {
     renderAgents(agents);
     renderFloorplan(rooms);
     renderMetrics(metrics);
-    renderChat([]); // Chat wird on-demand geladen
+    renderActivity(agents);
+
+    // Initiales Lag laden
+    try {
+      const healthRes = await fetch('/api/health');
+      const health = await healthRes.json();
+      updateLagDisplay(health.projection_lag);
+    } catch { /* ignore */ }
   } catch (err) {
     console.error('Failed to load initial data:', err);
   }
