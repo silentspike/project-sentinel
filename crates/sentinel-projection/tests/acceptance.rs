@@ -91,11 +91,7 @@ fn seed_n_lifecycles(store: &EventStore, count: usize) {
 
 /// Verarbeitet alle Events via rebuild.
 fn rebuild_all(event_store: Arc<EventStore>, rm_path: &str) -> ProjectionWorker {
-    let worker = ProjectionWorker::new(
-        Arc::clone(&event_store),
-        make_config(rm_path),
-    )
-    .unwrap();
+    let worker = ProjectionWorker::new(Arc::clone(&event_store), make_config(rm_path)).unwrap();
     worker.rebuild().unwrap();
     worker
 }
@@ -198,11 +194,8 @@ fn ac2_restart_resume_continues_correctly() {
 
     // Phase 1: Seed 10 Lifecycles (40 Events), rebuild
     seed_n_lifecycles(&store, 10);
-    let worker1 = ProjectionWorker::new(
-        Arc::clone(&store),
-        make_config(rm_path.to_str().unwrap()),
-    )
-    .unwrap();
+    let worker1 =
+        ProjectionWorker::new(Arc::clone(&store), make_config(rm_path.to_str().unwrap())).unwrap();
     let count1 = worker1.rebuild().unwrap();
     assert_eq!(count1, 40);
 
@@ -213,24 +206,23 @@ fn ac2_restart_resume_continues_correctly() {
     seed_n_lifecycles(&store, 10);
 
     // Neuer Worker mit gleicher DB — muss ab Offset fortsetzen
-    let worker2 = ProjectionWorker::new(
-        Arc::clone(&store),
-        make_config(rm_path.to_str().unwrap()),
-    )
-    .unwrap();
+    let worker2 =
+        ProjectionWorker::new(Arc::clone(&store), make_config(rm_path.to_str().unwrap())).unwrap();
 
     // Process remaining events via rebuild (startet ab Offset)
     // Da rebuild() clear+reset macht, nutzen wir stattdessen eine
     // manuelle Verarbeitung der neuen Events
-    let offset = store.get_offset("sentinel-projection").unwrap().unwrap_or(0);
+    let offset = store
+        .get_offset("sentinel-projection")
+        .unwrap()
+        .unwrap_or(0);
     let remaining = store.get_events_since_with_id(offset, 1000).unwrap();
 
     if !remaining.is_empty() {
         let txn = worker2.read_store().begin_transaction().unwrap();
         txn.begin().unwrap();
         for (row_id, event) in &remaining {
-            let payload: DomainEventPayload =
-                serde_json::from_str(&event.payload).unwrap();
+            let payload: DomainEventPayload = serde_json::from_str(&event.payload).unwrap();
             // Manuell die Handler aufrufen (via worker internals nicht direkt)
             // Stattdessen: verifizieren dass der Offset korrekt gesetzt ist
             let _ = (row_id, &payload);
@@ -424,7 +416,11 @@ fn chaos_and_shift_events_project_correctly() {
     assert_eq!(a3.status, "active");
 
     // Room buero-dev-1 muss Chaos-Daten haben
-    let room = worker.read_store().get_room("buero-dev-1").unwrap().unwrap();
+    let room = worker
+        .read_store()
+        .get_room("buero-dev-1")
+        .unwrap()
+        .unwrap();
     assert!(
         room.active_chaos.is_some(),
         "Room must have active chaos data"

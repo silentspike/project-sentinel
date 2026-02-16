@@ -28,7 +28,11 @@ impl ProjectionHandler for RoomLiveViewHandler {
             DomainEventPayload::TransitStarted {
                 from_room, to_room, ..
             } => {
-                debug!(from = from_room, to = to_room, "Projecting transit_started (room)");
+                debug!(
+                    from = from_room,
+                    to = to_room,
+                    "Projecting transit_started (room)"
+                );
                 txn.update_room_occupancy(from_room, -1, event.tick, row_id)?;
                 txn.update_room_transit(to_room, 1, row_id)?;
             }
@@ -54,17 +58,21 @@ impl ProjectionHandler for RoomLiveViewHandler {
             DomainEventPayload::AgentDespawned { agent_id, .. } => {
                 // Agent despawned: Raum-Belegung anpassen
                 if let Some(room) = txn.get_agent_room(agent_id.0)? {
-                    debug!(agent_id = agent_id.0, room, "Projecting agent_despawned (room occupancy)");
+                    debug!(
+                        agent_id = agent_id.0,
+                        room, "Projecting agent_despawned (room occupancy)"
+                    );
                     txn.update_room_occupancy(&room, -1, event.tick, row_id)?;
                 }
             }
 
-            DomainEventPayload::ShiftTransitionCompleted {
-                removed_agents, ..
-            } => {
+            DomainEventPayload::ShiftTransitionCompleted { removed_agents, .. } => {
                 // Gruppiere Decrements pro Raum um den Idempotenz-Guard
                 // nicht auszuhebeln (gleiche row_id, gleicher Raum).
-                debug!(count = removed_agents.len(), "Projecting shift_transition (room occupancy)");
+                debug!(
+                    count = removed_agents.len(),
+                    "Projecting shift_transition (room occupancy)"
+                );
                 let mut room_decrements: std::collections::HashMap<String, i64> =
                     std::collections::HashMap::new();
                 for agent_id in removed_agents {
@@ -73,7 +81,10 @@ impl ProjectionHandler for RoomLiveViewHandler {
                             *room_decrements.entry(room).or_insert(0) -= 1;
                         }
                         None => {
-                            warn!(agent_id = agent_id.0, "Agent has no current_room during shift transition");
+                            warn!(
+                                agent_id = agent_id.0,
+                                "Agent has no current_room during shift transition"
+                            );
                         }
                     }
                 }

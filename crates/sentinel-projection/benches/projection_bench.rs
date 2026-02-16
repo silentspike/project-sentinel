@@ -83,10 +83,7 @@ fn seed_events(store: &EventStore, count: u64) {
     }
 }
 
-fn make_worker(
-    event_store: Arc<EventStore>,
-    db_path: &str,
-) -> ProjectionWorker {
+fn make_worker(event_store: Arc<EventStore>, db_path: &str) -> ProjectionWorker {
     let config = ProjectionConfig {
         poll_interval: Duration::from_millis(1),
         batch_size: 100,
@@ -108,11 +105,10 @@ fn bench_event_processing_rate(c: &mut Criterion) {
     c.bench_function("event_processing_10k", |b| {
         b.iter(|| {
             // Frischen Worker pro Iteration (cleane DB)
-            let rm_iter_path = dir.path().join(format!("bench_rate_rm_{}.db", rand_suffix()));
-            let worker = make_worker(
-                Arc::clone(&store),
-                rm_iter_path.to_str().unwrap(),
-            );
+            let rm_iter_path = dir
+                .path()
+                .join(format!("bench_rate_rm_{}.db", rand_suffix()));
+            let worker = make_worker(Arc::clone(&store), rm_iter_path.to_str().unwrap());
             black_box(worker.rebuild().unwrap());
         });
     });
@@ -129,7 +125,9 @@ fn bench_rebuild_duration(c: &mut Criterion) {
 
     c.bench_function("rebuild_10k_events", |b| {
         b.iter(|| {
-            let rm_path = dir.path().join(format!("bench_rebuild_rm_{}.db", rand_suffix()));
+            let rm_path = dir
+                .path()
+                .join(format!("bench_rebuild_rm_{}.db", rand_suffix()));
             let worker = make_worker(Arc::clone(&store), rm_path.to_str().unwrap());
             let count = black_box(worker.rebuild().unwrap());
             assert_eq!(count, 10_000);
@@ -168,7 +166,8 @@ fn bench_idempotency_check(c: &mut Criterion) {
     {
         let txn = store.begin_transaction().unwrap();
         txn.begin().unwrap();
-        txn.upsert_agent(1, "Klaus", "Developer", 1, "active", 1000).unwrap();
+        txn.upsert_agent(1, "Klaus", "Developer", 1, "active", 1000)
+            .unwrap();
         txn.commit().unwrap();
     }
 
@@ -178,7 +177,8 @@ fn bench_idempotency_check(c: &mut Criterion) {
             let txn = store.begin_transaction().unwrap();
             txn.begin().unwrap();
             black_box(
-                txn.upsert_agent(1, "KlausNeu", "Designer", 2, "paused", 500).unwrap(),
+                txn.upsert_agent(1, "KlausNeu", "Designer", 2, "paused", 500)
+                    .unwrap(),
             );
             txn.commit().unwrap();
         });

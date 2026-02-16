@@ -54,10 +54,11 @@ impl ProjectionHandler for KpiHandler {
                 txn.increment_kpi(ts, KpiField::TickCount, row_id)?;
             }
 
-            DomainEventPayload::ShiftTransitionCompleted {
-                removed_count, ..
-            } => {
-                debug!(removed = removed_count, "KPI: shift_changes++ & active_agents -= N");
+            DomainEventPayload::ShiftTransitionCompleted { removed_count, .. } => {
+                debug!(
+                    removed = removed_count,
+                    "KPI: shift_changes++ & active_agents -= N"
+                );
                 txn.increment_kpi(ts, KpiField::ShiftChanges, row_id)?;
                 txn.increment_kpi(ts, KpiField::ActiveAgents(-(*removed_count as i64)), row_id)?;
             }

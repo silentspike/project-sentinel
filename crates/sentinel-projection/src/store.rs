@@ -443,11 +443,9 @@ impl<'a> ReadModelTransaction<'a> {
     ) -> anyhow::Result<()> {
         let bucket_start = (timestamp_ms / 60_000) * 60_000;
         let (col, inc_sql, initial_val) = match field {
-            KpiField::ActiveAgents(delta) => (
-                "active_agents",
-                format!("active_agents + {delta}"),
-                delta,
-            ),
+            KpiField::ActiveAgents(delta) => {
+                ("active_agents", format!("active_agents + {delta}"), delta)
+            }
             KpiField::TotalActions => ("total_actions", "total_actions + 1".to_string(), 1i64),
             KpiField::TotalTransits => ("total_transits", "total_transits + 1".to_string(), 1),
             KpiField::ChaosEvents => ("chaos_events", "chaos_events + 1".to_string(), 1),
@@ -463,7 +461,8 @@ impl<'a> ReadModelTransaction<'a> {
                last_event_id = MAX(kpi_1m.last_event_id, ?2),
                updated_at = ?3"
         );
-        self.guard.execute(&sql, params![bucket_start as i64, row_id, now_ms()])?;
+        self.guard
+            .execute(&sql, params![bucket_start as i64, row_id, now_ms()])?;
         Ok(())
     }
 }
@@ -519,7 +518,9 @@ mod tests {
         let path = dir.path().join("test-rooms.db");
         let store = ReadModelStore::open(path.to_str().unwrap()).unwrap();
 
-        store.initialize_rooms(&["empfang", "kueche", "buero-dev-1"]).unwrap();
+        store
+            .initialize_rooms(&["empfang", "kueche", "buero-dev-1"])
+            .unwrap();
 
         let room = store.get_room("empfang").unwrap().unwrap();
         assert_eq!(room.occupant_count, 0);
@@ -553,7 +554,8 @@ mod tests {
         {
             let txn = store.begin_transaction().unwrap();
             txn.begin().unwrap();
-            txn.upsert_agent(1, "Klaus", "Developer", 1, "active", 10).unwrap();
+            txn.upsert_agent(1, "Klaus", "Developer", 1, "active", 10)
+                .unwrap();
             txn.commit().unwrap();
         } // txn dropped -> Mutex released
 
@@ -565,7 +567,8 @@ mod tests {
         {
             let txn = store.begin_transaction().unwrap();
             txn.begin().unwrap();
-            txn.upsert_agent(1, "KlausNeu", "Designer", 2, "paused", 10).unwrap();
+            txn.upsert_agent(1, "KlausNeu", "Designer", 2, "paused", 10)
+                .unwrap();
             txn.commit().unwrap();
         }
 
@@ -577,7 +580,8 @@ mod tests {
         {
             let txn = store.begin_transaction().unwrap();
             txn.begin().unwrap();
-            txn.upsert_agent(1, "KlausNeu", "Designer", 2, "paused", 20).unwrap();
+            txn.upsert_agent(1, "KlausNeu", "Designer", 2, "paused", 20)
+                .unwrap();
             txn.commit().unwrap();
         }
 
