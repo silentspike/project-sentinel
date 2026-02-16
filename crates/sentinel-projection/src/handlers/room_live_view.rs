@@ -1,0 +1,101 @@
+//! Handler fuer die `room_live_view` Projektion.
+//!
+//! Verarbeitet 5 Event-Varianten:
+//! - TransitStarted -> from_room occupancy--, transit_count++
+//! - TransitCompleted -> to_room occupancy++, transit_count--
+//! - ChaosTriggered -> active_chaos auf target_room
+//! - AgentDespawned -> current_room occupancy--
+//! - ShiftTransitionCompleted -> pro removed_agent: current_room occupancy--
+
+use sentinel_common::{DomainEvent, DomainEventPayload};
+use tracing::{debug, warn};
+
+use crate::store::ReadModelTransaction;
+
+use super::ProjectionHandler;
+
+pub struct RoomLiveViewHandler;
+
+impl ProjectionHandler for RoomLiveViewHandler {
+    fn handle(
+        &self,
+        row_id: i64,
+        event: &DomainEvent,
+        payload: &DomainEventPayload,
+        txn: &ReadModelTransaction<'_>,
+    ) -> anyhow::Result<()> {
+        match payload {
+            DomainEventPayload::TransitStarted {
+                from_room, to_room, ..
+            } => {
+                debug!(
+                    from = from_room,
+                    to = to_room,
+                    "Projecting transit_started (room)"
+                );
+                txn.update_room_occupancy(from_room, -1, event.tick, row_id)?;
+                txn.update_room_transit(to_room, 1, row_id)?;
+            }
+
+            DomainEventPayload::TransitCompleted { room_id, .. } => {
+                debug!(room = room_id, "Projecting transit_completed (room)");
+                txn.update_room_occupancy(room_id, 1, event.tick, row_id)?;
+                txn.update_room_transit(room_id, -1, row_id)?;
+            }
+
+            DomainEventPayload::ChaosTriggered {
+                event_type,
+                target_room: Some(room),
+                description,
+            } => {
+                let chaos_json =
+                    serde_json::json!({"type": format!("{:?}", event_type), "description": description})
+                        .to_string();
+                debug!(room, "Projecting chaos_triggered (room)");
+                txn.update_room_chaos(room, &chaos_json, event.tick, row_id)?;
+            }
+
+            DomainEventPayload::AgentDespawned { agent_id, .. } => {
+                // Agent despawned: Raum-Belegung anpassen
+                if let Some(room) = txn.get_agent_room(agent_id.0)? {
+                    debug!(
+                        agent_id = agent_id.0,
+                        room, "Projecting agent_despawned (room occupancy)"
+                    );
+                    txn.update_room_occupancy(&room, -1, event.tick, row_id)?;
+                }
+            }
+
+            DomainEventPayload::ShiftTransitionCompleted { removed_agents, .. } => {
+                // Gruppiere Decrements pro Raum um den Idempotenz-Guard
+                // nicht auszuhebeln (gleiche row_id, gleicher Raum).
+                debug!(
+                    count = removed_agents.len(),
+                    "Projecting shift_transition (room occupancy)"
+                );
+                let mut room_decrements: std::collections::HashMap<String, i64> =
+                    std::collections::HashMap::new();
+                for agent_id in removed_agents {
+                    match txn.get_agent_room(agent_id.0)? {
+                        Some(room) => {
+                            *room_decrements.entry(room).or_insert(0) -= 1;
+                        }
+                        None => {
+                            warn!(
+                                agent_id = agent_id.0,
+                                "Agent has no current_room during shift transition"
+                            );
+                        }
+                    }
+                }
+                for (room, delta) in &room_decrements {
+                    txn.update_room_occupancy(room, *delta, event.tick, row_id)?;
+                }
+            }
+
+            // Andere Events sind nicht relevant fuer room_live_view
+            _ => {}
+        }
+        Ok(())
+    }
+}
