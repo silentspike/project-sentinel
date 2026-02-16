@@ -7,5 +7,13 @@ publish = false
 
 [dependencies]
 anyhow = { workspace = true }
+landlock = "0.4"
 sentinel-common = { path = "../sentinel-common" }
 tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "sandbox_bench"
+harness = false
