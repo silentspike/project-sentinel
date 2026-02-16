@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn sandbox_warning_variants() {
         // Verify all warning variants exist and are distinct
-        let warnings = vec![
+        let warnings = [
             SandboxWarning::LandlockNotAvailable,
             SandboxWarning::CgroupNotDelegated("io".into()),
             SandboxWarning::BwrapUsernsDenied,
