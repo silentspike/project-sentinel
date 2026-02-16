@@ -191,11 +191,7 @@ impl SandboxEnforcer {
     /// The bwrap process runs in isolated namespaces.
     /// Landlock is applied inside the bwrap child (not yet implemented — TODO).
     /// Returns the bwrap PID on success.
-    pub fn start_agent_process(
-        &self,
-        name: &str,
-        command: &[String],
-    ) -> Result<u32> {
+    pub fn start_agent_process(&self, name: &str, command: &[String]) -> Result<u32> {
         if !self.bwrap_available {
             anyhow::bail!("bwrap not available — cannot start agent process");
         }
@@ -232,10 +228,7 @@ impl SandboxEnforcer {
         // Remove cgroup (may fail if processes still in it)
         if handle.cgroup_created {
             if let Err(e) = cgroups::remove_cgroup(&handle.agent_name) {
-                warn!(
-                    "Failed to remove cgroup for {}: {e}",
-                    handle.agent_name
-                );
+                warn!("Failed to remove cgroup for {}: {e}", handle.agent_name);
             }
         }
 

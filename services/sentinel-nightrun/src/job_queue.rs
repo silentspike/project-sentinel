@@ -77,8 +77,8 @@ pub struct JobQueue {
 
 impl JobQueue {
     pub fn open(path: &str) -> Result<Self> {
-        let conn = Connection::open(path)
-            .with_context(|| format!("Failed to open job queue: {path}"))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("Failed to open job queue: {path}"))?;
 
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -127,7 +127,9 @@ impl JobQueue {
             Ok(JobEntry {
                 run_id: row.get(0)?,
                 agent_name: row.get(1)?,
-                status: status_str.parse::<JobStatus>().unwrap_or(JobStatus::Pending),
+                status: status_str
+                    .parse::<JobStatus>()
+                    .unwrap_or(JobStatus::Pending),
                 error: row.get(3)?,
                 episodes_processed: row.get(4)?,
                 episodes_consolidated: row.get(5)?,
@@ -172,7 +174,13 @@ impl JobQueue {
             "UPDATE nightrun_jobs SET status = 'completed', completed_at = ?3,
              episodes_processed = ?4, episodes_consolidated = ?5
              WHERE run_id = ?1 AND agent_name = ?2",
-            params![run_id, agent, now_secs(), episodes_processed, episodes_consolidated],
+            params![
+                run_id,
+                agent,
+                now_secs(),
+                episodes_processed,
+                episodes_consolidated
+            ],
         )?;
         Ok(())
     }
@@ -308,7 +316,8 @@ mod tests {
         let q = temp_queue();
         q.create_run("run-1", &["Thomas".into()]).unwrap();
         q.mark_in_progress("run-1", "Thomas").unwrap();
-        q.mark_failed("run-1", "Thomas", "redb write error").unwrap();
+        q.mark_failed("run-1", "Thomas", "redb write error")
+            .unwrap();
 
         let mut stmt = q
             .conn

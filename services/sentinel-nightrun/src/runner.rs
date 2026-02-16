@@ -136,7 +136,12 @@ impl NightrunRunner {
                     "Backlog zu gross: {episode_count} > {}",
                     self.config.max_episodes_per_agent
                 );
-                warn!(agent, episode_count, max = self.config.max_episodes_per_agent, "Agent uebersprungen");
+                warn!(
+                    agent,
+                    episode_count,
+                    max = self.config.max_episodes_per_agent,
+                    "Agent uebersprungen"
+                );
                 self.job_queue.mark_skipped(&self.run_id, agent, &reason)?;
                 self.emit_failed(&self.run_id.clone(), agent, &reason)?;
                 skipped += 1;
@@ -145,14 +150,14 @@ impl NightrunRunner {
 
             if self.dry_run {
                 info!(agent, episode_count, "DRY-RUN: wuerde konsolidieren");
-                self.job_queue.mark_skipped(&self.run_id, agent, "dry-run")?;
+                self.job_queue
+                    .mark_skipped(&self.run_id, agent, "dry-run")?;
                 skipped += 1;
                 continue;
             }
 
             // Konsolidierung
-            self.job_queue
-                .mark_in_progress(&self.run_id, agent)?;
+            self.job_queue.mark_in_progress(&self.run_id, agent)?;
 
             let agent_start = Instant::now();
             match self.consolidate_single_agent(agent) {
@@ -228,8 +233,8 @@ impl NightrunRunner {
     ///
     /// Agents ohne TOML-Definition werden IMMER inkludiert (konservativ).
     fn filter_by_shift(&self, agents: &[String], trigger_shift_set: u8) -> Vec<String> {
-        let agent_configs = load_all_agents(Path::new(&self.config.agent_config_dir))
-            .unwrap_or_default();
+        let agent_configs =
+            load_all_agents(Path::new(&self.config.agent_config_dir)).unwrap_or_default();
 
         // Shift-Set Lookup: name → shift_set
         let shift_map: std::collections::HashMap<String, u8> = agent_configs

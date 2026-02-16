@@ -100,11 +100,10 @@ fn run(cli: Cli) -> Result<sentinel_nightrun::runner::NightrunResult> {
     let hippocampus = HippocampusService::open(&settings.hippocampus_db)
         .context("Failed to open HippocampusService")?;
 
-    let event_store = EventStore::open(&settings.event_store_db)
-        .context("Failed to open EventStore")?;
+    let event_store =
+        EventStore::open(&settings.event_store_db).context("Failed to open EventStore")?;
 
-    let job_queue = JobQueue::open(&settings.job_queue_path)
-        .context("Failed to open JobQueue")?;
+    let job_queue = JobQueue::open(&settings.job_queue_path).context("Failed to open JobQueue")?;
 
     // Run-ID bestimmen (resume oder neu)
     let run_id = if cli.resume {

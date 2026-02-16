@@ -68,8 +68,8 @@ fn bench_cgroup_create_remove(c: &mut Criterion) {
 }
 
 fn bench_enforcer_setup_teardown(c: &mut Criterion) {
-    use std::sync::Arc;
     use sentinel_sandbox::{CgroupLimits, SandboxEnforcer};
+    use std::sync::Arc;
 
     let (enforcer, _) = SandboxEnforcer::detect();
 

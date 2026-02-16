@@ -51,7 +51,11 @@ impl BwrapConfig {
         let mut args = self.to_args();
         args.extend(command.iter().cloned());
 
-        info!("Spawning bwrap: {} args, command: {:?}", args.len(), command);
+        info!(
+            "Spawning bwrap: {} args, command: {:?}",
+            args.len(),
+            command
+        );
 
         Command::new("bwrap")
             .args(&args)

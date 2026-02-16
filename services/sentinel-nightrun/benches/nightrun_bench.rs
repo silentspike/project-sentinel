@@ -151,19 +151,14 @@ fn bench_runner_pipeline(c: &mut Criterion) {
                             let name = format!("Agent-{i:02}");
                             let episodes: Vec<Episode> = (0..8)
                                 .map(|j| {
-                                    make_episode(
-                                        (i * 10 + j) as u64,
-                                        &name,
-                                        &format!("Event {j}"),
-                                    )
+                                    make_episode((i * 10 + j) as u64, &name, &format!("Event {j}"))
                                 })
                                 .collect();
                             hc.record_episodes(&name, &episodes).unwrap();
                         }
 
                         let run_id = format!("bench-{count}");
-                        let runner =
-                            NightrunRunner::new(hc, es, jq, settings, run_id, false);
+                        let runner = NightrunRunner::new(hc, es, jq, settings, run_id, false);
                         (runner, dir)
                     },
                     |(runner, _dir)| {

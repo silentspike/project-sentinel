@@ -84,8 +84,8 @@ mod tests {
 
     #[test]
     fn boundary_hours() {
-        assert_eq!(shift_set_for_hour(5), 3);  // 05:59 → Spaet
-        assert_eq!(shift_set_for_hour(6), 1);  // 06:00 → Frueh
+        assert_eq!(shift_set_for_hour(5), 3); // 05:59 → Spaet
+        assert_eq!(shift_set_for_hour(6), 1); // 06:00 → Frueh
         assert_eq!(shift_set_for_hour(13), 1); // 13:59 → Frueh
         assert_eq!(shift_set_for_hour(14), 2); // 14:00 → Mittel
         assert_eq!(shift_set_for_hour(21), 2); // 21:59 → Mittel

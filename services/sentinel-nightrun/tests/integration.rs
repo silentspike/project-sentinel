@@ -69,7 +69,11 @@ impl TestHarness {
         self.hippocampus.record_episodes(name, &episodes).unwrap();
     }
 
-    fn runner(self, run_id: &str, dry_run: bool) -> (NightrunRunner, EventStore, tempfile::TempDir) {
+    fn runner(
+        self,
+        run_id: &str,
+        dry_run: bool,
+    ) -> (NightrunRunner, EventStore, tempfile::TempDir) {
         let event_store_check = EventStore::open(&self.settings.event_store_db).unwrap();
         let runner = NightrunRunner::new(
             self.hippocampus,
@@ -142,7 +146,10 @@ fn ac2_narratives_persist_after_consolidation() {
 
         // Episodes muessen geloescht sein
         let remaining = hc.store().load_episodes("Thomas").unwrap();
-        assert!(remaining.is_empty(), "Episodes muessen nach Konsolidierung geloescht sein");
+        assert!(
+            remaining.is_empty(),
+            "Episodes muessen nach Konsolidierung geloescht sein"
+        );
     }
 }
 
@@ -164,7 +171,8 @@ fn ac3_no_weight_files_created() {
         if let Some(ext) = path.extension() {
             assert!(
                 !weight_extensions.contains(&ext.to_str().unwrap_or("")),
-                "Gewichtsdatei gefunden: {}", path.display()
+                "Gewichtsdatei gefunden: {}",
+                path.display()
             );
         }
     }
@@ -202,7 +210,10 @@ fn ac4_backlog_skip_enforced() {
     let runner = NightrunRunner::new(hc, es, jq, settings, "run-ac4".into(), false);
     let result = runner.run(1).unwrap();
 
-    assert_eq!(result.agents_skipped, 1, "Agent mit zu grossem Backlog muss uebersprungen werden");
+    assert_eq!(
+        result.agents_skipped, 1,
+        "Agent mit zu grossem Backlog muss uebersprungen werden"
+    );
     assert_eq!(result.agents_consolidated, 0);
 }
 
@@ -316,5 +327,8 @@ fn events_emitted_to_event_store() {
         .unwrap();
 
     // Mindestens: NightRunStarted + AgentConsolidated + NightRunCompleted = 3
-    assert!(count >= 3, "Mindestens 3 Nightrun-Events erwartet, gefunden: {count}");
+    assert!(
+        count >= 3,
+        "Mindestens 3 Nightrun-Events erwartet, gefunden: {count}"
+    );
 }
