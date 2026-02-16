@@ -11,7 +11,9 @@
 //! 2. Throughput-Szenario: 100 Ticks × 15 Agents (>100 ticks/s Schwellenwert)
 //! 3. Realistisches Mixed-Workload Szenario
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use sentinel_common::DomainEvent;
 use sentinel_limbo::EventStore;
 
