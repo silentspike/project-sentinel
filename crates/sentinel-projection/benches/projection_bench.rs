@@ -147,7 +147,8 @@ fn bench_offset_write(c: &mut Criterion) {
     c.bench_function("offset_write", |b| {
         b.iter(|| {
             offset += 1;
-            black_box(store.update_offset("sentinel-projection", offset).unwrap());
+            store.update_offset("sentinel-projection", offset).unwrap();
+            black_box(());
         });
     });
 }
@@ -176,10 +177,9 @@ fn bench_idempotency_check(c: &mut Criterion) {
         b.iter(|| {
             let txn = store.begin_transaction().unwrap();
             txn.begin().unwrap();
-            black_box(
-                txn.upsert_agent(1, "KlausNeu", "Designer", 2, "paused", 500)
-                    .unwrap(),
-            );
+            txn.upsert_agent(1, "KlausNeu", "Designer", 2, "paused", 500)
+                .unwrap();
+            black_box(());
             txn.commit().unwrap();
         });
     });
