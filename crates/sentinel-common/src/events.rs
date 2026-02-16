@@ -143,6 +143,36 @@ pub enum DomainEventPayload {
         old_status: String,
         new_status: String,
     },
+    /// Nightrun-Konsolidierung gestartet
+    NightRunStarted {
+        run_id: String,
+        trigger_shift_set: u8,
+        agents_queued: u32,
+    },
+    /// Nightrun-Konsolidierung abgeschlossen
+    NightRunCompleted {
+        run_id: String,
+        trigger_shift_set: u8,
+        agents_consolidated: u32,
+        agents_failed: u32,
+        agents_skipped: u32,
+        total_episodes: u32,
+        duration_ms: u64,
+    },
+    /// Einzelner Agent konsolidiert
+    AgentConsolidated {
+        run_id: String,
+        agent_name: String,
+        episodes_processed: u32,
+        episodes_consolidated: u32,
+        duration_ms: u64,
+    },
+    /// Agent-Konsolidierung fehlgeschlagen
+    AgentConsolidationFailed {
+        run_id: String,
+        agent_name: String,
+        error: String,
+    },
 }
 
 impl DomainEventPayload {
@@ -164,6 +194,10 @@ impl DomainEventPayload {
             Self::AgentDespawned { .. } => "agent_despawned",
             Self::ShiftTransitionCompleted { .. } => "shift_transition_completed",
             Self::AgentStatusChanged { .. } => "agent_status_changed",
+            Self::NightRunStarted { .. } => "nightrun_started",
+            Self::NightRunCompleted { .. } => "nightrun_completed",
+            Self::AgentConsolidated { .. } => "agent_consolidated",
+            Self::AgentConsolidationFailed { .. } => "agent_consolidation_failed",
         }
     }
 }

@@ -37,6 +37,7 @@ jobs:
               "## Changes",
               "## Linked Issues",
               "## Test Plan",
+              "## Benchmarks",
               "## Evidence (AC Mapping)",
               "## Checklist",
             ];
