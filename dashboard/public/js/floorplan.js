@@ -42,6 +42,7 @@ export function renderFloorplan(rooms) {
 function createRoomCard(room) {
   const card = document.createElement('div');
   card.className = 'room-card';
+  card.setAttribute('data-room-id', room.id);
 
   const h4 = document.createElement('h4');
   h4.textContent = room.name;
@@ -52,24 +53,29 @@ function createRoomCard(room) {
   type.textContent = room.room_type;
   card.appendChild(type);
 
-  if (room.occupants && room.occupants.length > 0) {
-    const occ = document.createElement('div');
-    occ.className = 'room-occupants';
-    for (const name of room.occupants) {
-      const dot = document.createElement('span');
-      dot.className = 'occupant-dot';
-      occ.appendChild(dot);
-      const nameSpan = document.createElement('span');
-      nameSpan.textContent = name + ' ';
-      occ.appendChild(nameSpan);
-    }
-    card.appendChild(occ);
+  // Belegung
+  const occ = document.createElement('div');
+  occ.className = 'room-occupancy';
+  occ.textContent = room.occupant_count + ' Personen';
+  if (room.occupant_count > 0) occ.classList.add('occupied');
+  card.appendChild(occ);
+
+  // Transit
+  if (room.transit_count > 0) {
+    const transit = document.createElement('div');
+    transit.className = 'transit-indicator';
+    transit.textContent = room.transit_count + ' unterwegs';
+    card.appendChild(transit);
   }
 
-  const env = document.createElement('div');
-  env.className = 'room-env';
-  env.textContent = room.temperature + '\u00B0C | ' + room.noise_db + 'dB | ' + room.co2_ppm + 'ppm';
-  card.appendChild(env);
+  // Chaos
+  if (room.active_chaos) {
+    const chaos = document.createElement('div');
+    chaos.className = 'chaos-badge';
+    const chaosData = typeof room.active_chaos === 'object' ? room.active_chaos : null;
+    chaos.textContent = chaosData ? (chaosData.type || 'Chaos') : 'Chaos aktiv';
+    card.appendChild(chaos);
+  }
 
   return card;
 }

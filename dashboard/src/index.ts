@@ -1,92 +1,51 @@
 import { Hono } from "hono";
-import { mockAgents, mockRooms, mockChat, mockMetrics } from "./data/mock";
+import { serveStatic } from "hono/bun";
+import { openDatabases } from "./db";
+import { agentRoutes } from "./routes/agents";
+import { roomRoutes } from "./routes/rooms";
+import { metricRoutes } from "./routes/metrics";
+import { createWsHandler, startPolling } from "./ws";
 
 const app = new Hono();
-const startTime = Date.now();
 
-// Health
-app.get("/api/health", (c) =>
-  c.json({ status: "ok", uptime: Math.floor((Date.now() - startTime) / 1000) })
-);
+// API Routes
+app.route("/api", agentRoutes);
+app.route("/api", roomRoutes);
+app.route("/api", metricRoutes);
 
-// Agents
-app.get("/api/agents", (c) =>
-  c.json(mockAgents.map((a) => ({
-    id: a.id,
-    name: a.name,
-    role: a.role,
-    status: a.status,
-    room: a.room,
-    mood: a.mood,
-  })))
-);
+// Statische Dateien
+app.use("/public/*", serveStatic({ root: "./" }));
+app.get("/", serveStatic({ path: "./public/index.html" }));
 
-// Agent state (by name, lowercase + hyphenated)
-app.get("/api/agents/:name/state", (c) => {
-  const name = c.req.param("name");
-  const agent = mockAgents.find(
-    (a) => a.name.toLowerCase().replace(/\s+/g, "-") === name
-  );
-  if (!agent) return c.json({ error: "Agent not found" }, 404);
-  return c.json(agent);
-});
+// Named export fuer Tests (app.request() Pattern)
+export { app };
 
-// Rooms
-app.get("/api/rooms", (c) => c.json(mockRooms));
-
-// Room chat
-app.get("/api/rooms/:id/chat", (c) => {
-  const roomId = c.req.param("id");
-  const messages = mockChat.filter((m) => m.room === roomId);
-  return c.json(messages);
-});
-
-// Metrics
-app.get("/api/metrics", (c) =>
-  c.json({
-    ...mockMetrics,
-    uptime: Math.floor((Date.now() - startTime) / 1000),
-  })
-);
-
-export default app;
-
-// Server start only when executed directly
+// Server start bei direkter Ausfuehrung
 if (import.meta.main) {
-  const port = 8000;
-  console.log(`Starting dashboard server on http://localhost:${port}`);
+  const projDbPath =
+    process.env.PROJECTION_DB_PATH || "data/projection.db";
+  const esDbPath =
+    process.env.EVENT_STORE_DB_PATH || "data/events.db";
+  const port = parseInt(process.env.PORT || "3001", 10);
+
+  try {
+    openDatabases(projDbPath, esDbPath);
+  } catch (err) {
+    console.error(
+      `Failed to open databases:\n  projection: ${projDbPath}\n  eventstore: ${esDbPath}\n`,
+      err,
+    );
+    process.exit(1);
+  }
+
+  const wsHandler = createWsHandler();
 
   Bun.serve({
     port,
     fetch: app.fetch,
-    websocket: {
-      open(ws) {
-        console.log("WebSocket client connected");
-        const interval = setInterval(() => {
-          const randomAgent = mockAgents[Math.floor(Math.random() * mockAgents.length)];
-          ws.send(JSON.stringify({
-            type: "bio_update",
-            agent: randomAgent.name,
-            data: {
-              ...randomAgent.bio,
-              hunger: Math.min(100, randomAgent.bio.hunger + Math.random() * 2),
-            },
-            tick: Date.now(),
-          }));
-        }, 5000);
-        // @ts-expect-error Bun WebSocket extras
-        ws.data = { interval };
-      },
-      message(_ws, _message) {
-        // Client messages ignored (read-only dashboard)
-      },
-      close(ws) {
-        // @ts-expect-error Bun WebSocket extras
-        clearInterval(ws.data?.interval);
-        console.log("WebSocket client disconnected");
-      },
-    },
+    websocket: wsHandler,
   });
 
+  startPolling();
   console.log(`Dashboard running on http://localhost:${port}`);
 }

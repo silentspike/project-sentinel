@@ -12,15 +12,16 @@
     <nav id="main-nav">
       <button class="nav-btn active" data-view="agents">Agents</button>
       <button class="nav-btn" data-view="floorplan">Büroplan</button>
-      <button class="nav-btn" data-view="chat">Chat</button>
+      <button class="nav-btn" data-view="activity">Aktivität</button>
       <button class="nav-btn" data-view="metrics">Metriken</button>
     </nav>
+    <div id="projection-lag">Lag: --</div>
     <div id="connection-status">Verbinde...</div>
   </header>
   <main>
     <section id="view-agents" class="view active"></section>
     <section id="view-floorplan" class="view"></section>
-    <section id="view-chat" class="view"></section>
+    <section id="view-activity" class="view"></section>
     <section id="view-metrics" class="view"></section>
   </main>
   <script type="module" src="/public/js/app.js"></script>
