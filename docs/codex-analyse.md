@@ -125,12 +125,13 @@ Konkrete Beispiele:
    - erwarteter Output,
    - Artefakt-Pfad,
    - Datum.
-7. CI muss AC hart pruefen (Issue-Quality Gate + AC-Linter + Mindest-Evidence).
+7. CI muss AC hart pruefen (Issue-Quality Gate + AC-Linter + Mindest-Evidence). **[UMGESETZT: issue-quality.yml + pr-quality.yml]**
 8. Non-Functional AC verpflichtend bei Architektur-Issues:
    - Latenz,
    - Speicher,
    - I/O,
    - Isolation/Security.
+   **[UMGESETZT: `## Benchmarks` Pflicht-Sektion in allen 20 offenen Issues + CI Gate]**
 
 ## Offene Prioritaetsliste fuer Re-Audit/Repair
 1. ~~#13 Vollpipeline verdrahten~~ (erledigt: PR #71, FULL).
@@ -192,9 +193,9 @@ follow_up_issue: <id|null>
 
 ### 5) CI-Kopplung im Skill erzwingen
 Skill muss fuer neue Repos standardmaessig erzeugen/aktivieren:
-- `issue-quality.yml`: lintet neue/edierte Issues auf Pflichtsektionen
-- `pr-quality.yml`: verweigert Merge bei fehlender AC-Evidence
-- `main-push-guard.yml`: blockt direkte Pushes auf `main`
+- `issue-quality.yml`: lintet neue/edierte Issues auf Pflichtsektionen **[UMGESETZT 2026-02-16: Benchmarks-Sektion als Pflicht hinzugefuegt]**
+- `pr-quality.yml`: verweigert Merge bei fehlender AC-Evidence **[UMGESETZT 2026-02-16: ## Benchmarks als Pflicht-Sektion hinzugefuegt]**
+- `main-push-guard.yml`: blockt direkte Pushes auf `main` **[UMGESETZT]**
 
 ### 6) Placeholder-Policy
 Wenn Placeholder noetig:
@@ -436,7 +437,55 @@ Im Skill klarstellen:
 - Benchmark-Code: `crates/sentinel-hippocampus/benches/hippocampus_bench.rs`
 - VM-Verify: `ssh ubuntu@10.0.0.240 "cd /home/ubuntu/sentinel-target && ./release/deps/hippocampus_bench-* --bench"`
 
+### Benchmark-Governance (Two-Tier Architektur, Enterprise SOTA 2026)
+
+**Kontext:** Benchmark-Strategie fuer das Gesamtprojekt etabliert. Codex (gpt-5.3-codex) Session `019c655c-d997-70b1-a7f7-b9da63f47465` hat Option D (Criterion CI + Production Binary VM) als besten Enterprise-Ansatz bestaetigt.
+
+| Tier | Zweck | Wo | Tool |
+|------|-------|----|------|
+| **Tier 1** | Component-Level Regression | CI (Build-Server 10.0.0.155) | Criterion.rs, Go testing.B, Bun bench |
+| **Tier 2** | System-Level E2E | VM 10.0.0.240 (ext4 /data) | `deploy/bench/stack-harness` + Runner-Scripts |
+
+**Governance-Massnahmen (umgesetzt 2026-02-16):**
+- `issue-quality.yml`: Benchmarks-Sektion als Pflichtfeld (Varianten: Benchmarks, Benchmark, Performance)
+- `pr-quality.yml`: `## Benchmarks` als Pflicht-Sektion in PR-Body
+- Alle 20 offenen Feature-Issues (#17-#76) mit `## Benchmarks` Sektion versehen (Neue Metriken, Performance-Budget, Tier, Betroffene Sprachen, Bestehende Benchmarks betroffen)
+- Polyglot-Coverage: Rust, Go, TypeScript, C++, Bash beruecksichtigt
+
+**Erkenntnisse:**
+- Criterion.rs ist ein Microbenchmark-Tool — nicht geeignet fuer systemische Effekte (Storage, Scheduler, Kernel, I/O-Stack)
+- tmpfs-Benchmarks sind nicht vergleichbar mit ext4-Produktion (fsync-Kosten fehlen)
+- `deploy/bench/stack-harness` + `run-stack-suite-guest.sh` existieren bereits als Tier 2 Prototyp
+
+### Nightrun Benchmark (Issue #17, Criterion auf Build-Server)
+
+**Kontext:** Issue #17 implementiert sentinel-nightrun (Schichtwechsel-Konsolidierung). Benchmarks auf Build-Server 10.0.0.155 (tmpfs, Tier 1).
+**Binary:** `cargo bench -p sentinel-nightrun` (Release, Criterion).
+
+| Metrik | Wert | Einordnung | Status |
+|--------|------|------------|--------|
+| `nightrun.shift/shift_set_for_hour` | `7.06ns` | Pure Arithmetik (Hour -> Shift-Set) | **PASS** |
+| `nightrun.shift/outgoing_shift_set` | `882ps` | Lookup (New Shift -> Outgoing) | **PASS** |
+| `nightrun.job_queue/create_run_15` | `1.72ms` | SQLite: 15 Jobs anlegen | **PASS** |
+| `nightrun.job_queue/create_run_54` | `3.91ms` | SQLite: 54 Jobs anlegen | **PASS** |
+| `nightrun.job_queue/mark_transitions` | `596us` | Status-Updates (pending->completed) | **PASS** |
+| `nightrun.job_queue/get_pending_15` | `51.3us` | 15 pending Jobs abfragen | **PASS** |
+| `nightrun.pipeline/consolidate/1` | `12.4ms` | 1 Agent konsolidieren (E2E) | **PASS** |
+| `nightrun.pipeline/consolidate/5` | `43.9ms` | 5 Agents konsolidieren | **PASS** |
+| `nightrun.pipeline/consolidate/15` | `82.9ms` | 15 Agents konsolidieren | **PASS** |
+
+**Einordnung:**
+- Pipeline skaliert sublinear: 15 Agents in 82.9ms (nicht 15x 12.4ms = 186ms)
+- Job-Queue create_run skaliert linear: 54 Jobs in 3.91ms (~72us/Job)
+- Shift-Detection ist vernachlaessigbar (<10ns)
+- **Achtung:** Benchmarks auf tmpfs (Build-Server), nicht auf ext4 (Produktion). Tier 2 Benchmarks auf VM 10.0.0.240 stehen noch aus.
+
+**Artefakte:**
+- Benchmark-Code: `services/sentinel-nightrun/benches/nightrun_bench.rs`
+
 ### Update-Log
+- 2026-02-16: Benchmark-Governance etabliert (Two-Tier Architektur). 20 offene Issues mit ## Benchmarks Sektion versehen. CI Quality Gates (issue-quality.yml, pr-quality.yml) um Benchmarks-Pflichtsektion erweitert.
+- 2026-02-16: Nightrun Benchmark (Issue #17): 9 Benchmarks auf Build-Server. Pipeline 15 Agents 82.9ms, Job-Queue 54 Jobs 3.91ms, Shift-Detection 7ns.
 - 2026-02-15: Hippocampus Persistent Memory Benchmark (Issue #23): 40+ Benchmarks auf VM 10.0.0.240. Production 54-Agent Consolidate 586ms, Retrieve-Sweep 605us, DB-Size 532KB.
 - 2026-02-15: Issue #23 PARTIAL->FULL: redb-Persistence (4 Tables), HippocampusService Facade, Night-Run Konsolidierung, NMDA-priorisiertes Retrieval. 57 Unit-Tests + 4 Acceptance-Tests, 40+ Benchmarks.
 - 2026-02-15: Issue #15 Scope-Luecken geschlossen: pause_agent/resume_agent, State-Machine (AgentStatus::can_transition_to), RuntimeEventSink-Trait (ECS-Integration), Thread/Memory-Footprint dokumentiert. 29 Tests (21 unit + 8 acceptance), 13 Benchmarks auf VM.

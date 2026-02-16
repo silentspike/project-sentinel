@@ -1,0 +1,26 @@
+[Unit]
+Description=Sentinel Nightrun — Schichtwechsel-Konsolidierung
+Documentation=https://github.com/obtFusi/project-sentinel/issues/17
+After=network.target
+Wants=sentinel-nightrun.timer
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel-nightrun --config /opt/sentinel/config/nightrun.toml
+TimeoutStartSec=7200
+MemoryMax=2G
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-nightrun
+
+# Security Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/sentinel/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

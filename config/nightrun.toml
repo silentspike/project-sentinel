@@ -1,0 +1,26 @@
+# Sentinel Nightrun — Schichtwechsel-Konsolidierung
+#
+# Getriggert via systemd Timer bei 06:00, 14:00, 22:00.
+# Konsolidiert episodische Erinnerungen der abgehenden Schicht.
+
+[nightrun]
+# Pfad zur Hippocampus redb-Datenbank
+hippocampus_db = "data/hippocampus.redb"
+
+# Pfad zur Limbo Event-Store SQLite-Datenbank
+event_store_db = "data/events.db"
+
+# Verzeichnis mit Agent-TOML-Definitionen (fuer shift_set Filter)
+agent_config_dir = "config/agents"
+
+# Pfad zur Job-Queue SQLite-Datenbank (Crash-Recovery)
+job_queue_path = "data/nightrun-jobs.db"
+
+# Timeout pro Agent in Sekunden (default: 300)
+timeout_per_agent_secs = 300
+
+# Gesamt-Timeout in Sekunden (default: 7200 = 2h)
+timeout_total_secs = 7200
+
+# Max Episodes pro Agent bevor Skip (Backlog-Schutz)
+max_episodes_per_agent = 1000

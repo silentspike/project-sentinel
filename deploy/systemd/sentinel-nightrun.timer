@@ -1,0 +1,12 @@
+[Unit]
+Description=Sentinel Nightrun Timer — Schichtwechsel 06:00/14:00/22:00
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+OnCalendar=*-*-* 14:00:00
+OnCalendar=*-*-* 22:00:00
+Persistent=true
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target
