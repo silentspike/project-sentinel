@@ -35,10 +35,7 @@ impl LandlockRuleset {
     /// - /etc/resolv.conf -> DNS resolution
     pub fn for_agent(name: &str) -> Self {
         Self {
-            read_paths: vec![
-                PathBuf::from("/company"),
-                PathBuf::from("/etc/resolv.conf"),
-            ],
+            read_paths: vec![PathBuf::from("/company"), PathBuf::from("/etc/resolv.conf")],
             write_paths: vec![
                 PathBuf::from(format!("/home/{name}")),
                 PathBuf::from("/tmp"),

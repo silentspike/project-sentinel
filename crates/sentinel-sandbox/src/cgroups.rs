@@ -56,8 +56,11 @@ pub fn create_cgroup(name: &str, limits: &CgroupLimits) -> Result<CgroupSetup> {
     info!("cgroup {name}: cpu.max = {cpu_max}");
 
     // Memory limit
-    std::fs::write(format!("{path}/memory.max"), limits.memory_bytes.to_string())
-        .with_context(|| format!("Failed to write memory.max for {name}"))?;
+    std::fs::write(
+        format!("{path}/memory.max"),
+        limits.memory_bytes.to_string(),
+    )
+    .with_context(|| format!("Failed to write memory.max for {name}"))?;
 
     // IO limits (best-effort — controller may not be delegated)
     let io_max_path = format!("{path}/io.max");
@@ -93,8 +96,7 @@ pub fn create_cgroup(name: &str, limits: &CgroupLimits) -> Result<CgroupSetup> {
 pub fn remove_cgroup(name: &str) -> Result<()> {
     let path = cgroup_path(name);
     if std::path::Path::new(&path).exists() {
-        std::fs::remove_dir(&path)
-            .with_context(|| format!("Failed to remove cgroup {path}"))?;
+        std::fs::remove_dir(&path).with_context(|| format!("Failed to remove cgroup {path}"))?;
         info!("Removed cgroup for {name}");
     }
     Ok(())
@@ -123,8 +125,7 @@ pub fn read_psi_from_cgroup(name: &str, resource: &str) -> Result<PsiMetrics> {
     let path = format!("{}/{resource}.pressure", cgroup_path(name));
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read PSI {resource} for cgroup {name}"))?;
-    parse_psi(&content)
-        .with_context(|| format!("Failed to parse PSI {resource} for cgroup {name}"))
+    parse_psi(&content).with_context(|| format!("Failed to parse PSI {resource} for cgroup {name}"))
 }
 
 #[cfg(test)]
