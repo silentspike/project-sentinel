@@ -1,5 +1,10 @@
 //! Bubblewrap sandbox configuration.
 
+use std::process::{Child, Command};
+
+use anyhow::{Context, Result};
+use tracing::info;
+
 /// Bubblewrap sandbox configuration fuer einen einzelnen Agenten.
 #[derive(Debug, Clone)]
 pub struct BwrapConfig {
@@ -22,6 +27,40 @@ impl BwrapConfig {
             share_net: true,
             die_with_parent: true,
         }
+    }
+
+    /// Tests whether bwrap user namespace creation works.
+    ///
+    /// Some systems (e.g. AppArmor) block unprivileged user namespaces.
+    /// Returns true if bwrap can create a minimal sandbox.
+    pub fn test_userns() -> bool {
+        Command::new("bwrap")
+            .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Spawns a bwrap sandbox process with the configured isolation.
+    ///
+    /// Returns the Child handle. Caller is responsible for managing the child
+    /// (e.g. adding to cgroup, forgetting handle for --die-with-parent).
+    pub fn spawn(&self, command: &[String]) -> Result<Child> {
+        let mut args = self.to_args();
+        args.extend(command.iter().cloned());
+
+        info!(
+            "Spawning bwrap: {} args, command: {:?}",
+            args.len(),
+            command
+        );
+
+        Command::new("bwrap")
+            .args(&args)
+            .spawn()
+            .context("Failed to spawn bwrap process")
     }
 
     /// Generiert bwrap CLI-Argumente.

@@ -27,6 +27,7 @@ jobs:
               { name: "Scope", variants: ["In Scope", "Scope"] },
               { name: "Out of Scope", variants: ["Out of Scope", "Nicht im Scope", "NICHT im Scope"] },
               { name: "Acceptance", variants: ["Acceptance Criteria", "Acceptance", "Akzeptanzkriterien"] },
+              { name: "Benchmarks", variants: ["Benchmarks", "Benchmark", "Performance"] },
             ];
             const sectionMissing = sectionGroups
               .filter((group) => {
