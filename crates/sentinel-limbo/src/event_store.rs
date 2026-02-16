@@ -1048,7 +1048,10 @@ mod tests {
 
         // Row-IDs muessen strikt aufsteigend sein
         for window in results.windows(2) {
-            assert!(window[1].0 > window[0].0, "row_ids must be strictly ascending");
+            assert!(
+                window[1].0 > window[0].0,
+                "row_ids must be strictly ascending"
+            );
         }
 
         // Cursor: ab letzter ID lesen ergibt leer

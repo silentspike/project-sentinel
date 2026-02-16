@@ -331,6 +331,12 @@ Konfigurationsdateien = "Konfigurationsdateien"
 Schichtwechsel = "Schichtwechsel"
 Konsolidierung = "Konsolidierung"
 
+# Projection Worker words (Issue #53 - German in doc comments)
+Projektion = "Projektion"
+Verifikation = "Verifikation"
+Methoden = "Methoden"
+passt = "passt"
+
 # Pre-existing German words (codex-analyse, CONTRIBUTING, etc.)
 Feld = "Feld"
 alternativ = "alternativ"
