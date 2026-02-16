@@ -6,9 +6,35 @@ license = "MIT"
 publish = false
 description = "Schichtwechsel-Konsolidierung (Nightrun Service)"
 
+[lib]
+name = "sentinel_nightrun"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sentinel-nightrun"
 path = "src/main.rs"
 
 [dependencies]
 sentinel-common = { path = "../../crates/sentinel-common" }
+sentinel-hippocampus = { path = "../../crates/sentinel-hippocampus" }
+sentinel-limbo = { path = "../../crates/sentinel-limbo" }
+sentinel-telemetry = { path = "../../crates/sentinel-telemetry" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+uuid = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { workspace = true }
+
+[[bench]]
+name = "nightrun_bench"
+harness = false
