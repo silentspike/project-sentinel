@@ -48,12 +48,21 @@ impl ProjectionHandler for AgentLiveViewHandler {
                 to_room,
                 ..
             } => {
-                debug!(agent_id = agent_id.0, from = from_room, to = to_room, "Projecting transit_started");
+                debug!(
+                    agent_id = agent_id.0,
+                    from = from_room,
+                    to = to_room,
+                    "Projecting transit_started"
+                );
                 txn.update_agent_transit_start(agent_id.0, from_room, to_room, row_id)?;
             }
 
             DomainEventPayload::TransitCompleted { agent_id, room_id } => {
-                debug!(agent_id = agent_id.0, room = room_id, "Projecting transit_completed");
+                debug!(
+                    agent_id = agent_id.0,
+                    room = room_id,
+                    "Projecting transit_completed"
+                );
                 txn.update_agent_transit_complete(agent_id.0, room_id, row_id)?;
             }
 
@@ -62,7 +71,11 @@ impl ProjectionHandler for AgentLiveViewHandler {
                 action_type,
                 ..
             } => {
-                debug!(agent_id = agent_id.0, action = action_type, "Projecting agent_action");
+                debug!(
+                    agent_id = agent_id.0,
+                    action = action_type,
+                    "Projecting agent_action"
+                );
                 txn.update_agent_last_action(agent_id.0, action_type, event.tick, row_id)?;
             }
 
@@ -71,14 +84,19 @@ impl ProjectionHandler for AgentLiveViewHandler {
                 new_status,
                 ..
             } => {
-                debug!(agent_id = agent_id.0, status = new_status, "Projecting status_changed");
+                debug!(
+                    agent_id = agent_id.0,
+                    status = new_status,
+                    "Projecting status_changed"
+                );
                 txn.update_agent_status(agent_id.0, new_status, row_id)?;
             }
 
-            DomainEventPayload::ShiftTransitionCompleted {
-                removed_agents, ..
-            } => {
-                debug!(count = removed_agents.len(), "Projecting shift_transition (agent despawn)");
+            DomainEventPayload::ShiftTransitionCompleted { removed_agents, .. } => {
+                debug!(
+                    count = removed_agents.len(),
+                    "Projecting shift_transition (agent despawn)"
+                );
                 for agent_id in removed_agents {
                     txn.update_agent_status(agent_id.0, "despawned", row_id)?;
                 }

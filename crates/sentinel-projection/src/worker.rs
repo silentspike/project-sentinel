@@ -89,10 +89,7 @@ impl ProjectionWorker {
         );
 
         loop {
-            let offset = self
-                .event_store
-                .get_offset(PROJECTION_NAME)?
-                .unwrap_or(0);
+            let offset = self.event_store.get_offset(PROJECTION_NAME)?.unwrap_or(0);
 
             let batch = self
                 .event_store
