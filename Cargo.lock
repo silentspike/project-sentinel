@@ -3168,6 +3168,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-projection"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "criterion",
+ "rusqlite",
+ "sentinel-common",
+ "sentinel-limbo",
+ "sentinel-telemetry",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "sentinel-redb"
 version = "0.1.0"
 dependencies = [
