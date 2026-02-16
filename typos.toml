@@ -243,6 +243,13 @@ manuell = "manuell"
 zusaetzlich = "zusaetzlich"
 ausfuehrbar = "ausfuehrbar"
 
+# Nightrun / Sandbox words (Issue #16, #17 - German in doc comments + SQL patterns)
+consol = "consol"             # SQL LIKE pattern: agent_consol% (matches agent_consolidated)
+Produktion = "Produktion"     # German: production
+lokale = "lokale"             # German: local
+Restriktion = "Restriktion"   # German: restriction
+Selektion = "Selektion"       # German: selection
+
 # Hippocampus Memory words (Issue #23 - Persistent Memory)
 Tage = "Tage"
 Tages = "Tages"
