@@ -185,6 +185,7 @@ Kuchen = "Kuchen"
 oder = "oder"
 Finde = "Finde"
 initiale = "initiale"
+Initiales = "Initiales"       # German: initial (neuter nominative)
 Aktive = "Aktive"
 Lade = "Lade"
 Spawnt = "Spawnt"
@@ -247,6 +248,7 @@ ausfuehrbar = "ausfuehrbar"
 consol = "consol"             # SQL LIKE pattern: agent_consol% (matches agent_consolidated)
 Produktion = "Produktion"     # German: production
 lokale = "lokale"             # German: local
+lokales = "lokales"           # German: local (neuter)
 Restriktion = "Restriktion"   # German: restriction
 Selektion = "Selektion"       # German: selection
 
