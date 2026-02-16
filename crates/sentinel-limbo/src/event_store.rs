@@ -311,6 +311,59 @@ impl EventStore {
         Ok(results)
     }
 
+    /// Liest Events mit interner Row-ID (fuer Projection-Cursor-Tracking).
+    ///
+    /// Wie `get_events_since`, gibt aber zusaetzlich die SQLite `id`-Spalte
+    /// zurueck, die Projection-Worker fuer `update_offset()` benoetigen.
+    pub fn get_events_since_with_id(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(i64, DomainEvent)>> {
+        let _telemetry_start = std::time::Instant::now();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![after_id, limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                DomainEvent {
+                    event_id: row.get(1)?,
+                    event_type: row.get(2)?,
+                    aggregate_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    correlation_id: row.get(5)?,
+                    causation_id: row.get(6)?,
+                    operation_id: row.get(7)?,
+                    tick: row.get::<_, i64>(8)? as u64,
+                    timestamp_ms: row.get::<_, i64>(9)? as u64,
+                    schema_version: row.get::<_, i32>(10)? as u32,
+                    compensation_type: row.get(11)?,
+                },
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.limbo.event.query_with_id.count")
+                .increment();
+            reg.histogram(
+                "sentinel.limbo.event.query_with_id.duration_us",
+                LATENCY_BUCKETS,
+            )
+            .observe(_telemetry_start.elapsed().as_micros() as f64);
+        }
+        Ok(results)
+    }
+
     /// Liest Events fuer ein bestimmtes Aggregate (z.B. Agent oder Raum).
     pub fn get_events_by_aggregate(
         &self,
@@ -536,6 +589,23 @@ impl EventStore {
         conn.execute(
             "INSERT INTO projection_offsets (projection_name, last_event_id, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(projection_name) DO UPDATE SET last_event_id = ?2, updated_at = ?3",
             params![name, offset, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Setzt den Offset einer Projection zurueck (fuer Rebuild-Modus).
+    ///
+    /// Loescht den Eintrag aus `projection_offsets`, sodass der naechste
+    /// `get_offset()` Call `None` zurueckgibt. Umgeht die Monotonitaetspruefung
+    /// von `update_offset()`.
+    pub fn reset_offset(&self, name: &str) -> anyhow::Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        conn.execute(
+            "DELETE FROM projection_offsets WHERE projection_name = ?1",
+            params![name],
         )?;
         Ok(())
     }
@@ -944,5 +1014,110 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].compensation_type, "none");
         assert_eq!(events[1].compensation_type, "rollback");
+    }
+
+    /// get_events_since_with_id gibt Row-IDs mit zurueck.
+    #[test]
+    fn test_get_events_since_with_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-with-id.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        // 5 Events einfuegen
+        for i in 0..5u64 {
+            let event = DomainEvent::new(
+                "transit_started",
+                &format!("AGENT-{:02}", i + 1),
+                &format!(r#"{{"step":{i}}}"#),
+                "corr-with-id",
+                i * 10,
+            );
+            store.append_event(&event).unwrap();
+        }
+
+        // Alle Events mit IDs lesen
+        let results = store.get_events_since_with_id(0, 100).unwrap();
+        assert_eq!(results.len(), 5);
+
+        // Row-IDs muessen aufsteigend und >0 sein
+        for (idx, (row_id, event)) in results.iter().enumerate() {
+            assert!(*row_id > 0, "row_id must be positive");
+            assert_eq!(event.tick, (idx as u64) * 10);
+            assert_eq!(event.aggregate_id, format!("AGENT-{:02}", idx + 1));
+        }
+
+        // Row-IDs muessen strikt aufsteigend sein
+        for window in results.windows(2) {
+            assert!(window[1].0 > window[0].0, "row_ids must be strictly ascending");
+        }
+
+        // Cursor: ab letzter ID lesen ergibt leer
+        let last_id = results.last().unwrap().0;
+        let empty = store.get_events_since_with_id(last_id, 100).unwrap();
+        assert!(empty.is_empty());
+
+        // Cursor: ab Mitte lesen ergibt Rest
+        let mid_id = results[2].0;
+        let rest = store.get_events_since_with_id(mid_id, 100).unwrap();
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0].1.aggregate_id, "AGENT-04");
+        assert_eq!(rest[1].1.aggregate_id, "AGENT-05");
+    }
+
+    /// Konsistenz: get_events_since und get_events_since_with_id liefern gleiche Events.
+    #[test]
+    fn test_with_id_consistent_with_without() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-consistent.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        for i in 0..3u64 {
+            let event = test_event("agent_spawned", &format!("AGENT-{:02}", i + 1));
+            store.append_event(&event).unwrap();
+        }
+
+        let without_id = store.get_events_since(0, 100).unwrap();
+        let with_id = store.get_events_since_with_id(0, 100).unwrap();
+
+        assert_eq!(without_id.len(), with_id.len());
+        for (a, (_, b)) in without_id.iter().zip(with_id.iter()) {
+            assert_eq!(a.event_id, b.event_id);
+            assert_eq!(a.event_type, b.event_type);
+            assert_eq!(a.aggregate_id, b.aggregate_id);
+            assert_eq!(a.payload, b.payload);
+            assert_eq!(a.tick, b.tick);
+        }
+    }
+
+    /// reset_offset loescht den Offset und ermoeglicht Neustart bei 0.
+    #[test]
+    fn test_reset_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-reset.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        // Offset setzen
+        store.update_offset("test-proj", 42).unwrap();
+        assert_eq!(store.get_offset("test-proj").unwrap(), Some(42));
+
+        // Offset zuruecksetzen
+        store.reset_offset("test-proj").unwrap();
+        assert_eq!(store.get_offset("test-proj").unwrap(), None);
+
+        // Nach Reset kann ab 1 neu gestartet werden (kein MonotonicityError)
+        store.update_offset("test-proj", 1).unwrap();
+        assert_eq!(store.get_offset("test-proj").unwrap(), Some(1));
+    }
+
+    /// reset_offset auf nicht-existierenden Namen ist kein Fehler.
+    #[test]
+    fn test_reset_offset_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-reset-nonexist.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        // Reset auf nicht-existierenden Namen — kein Fehler
+        store.reset_offset("does-not-exist").unwrap();
+        assert_eq!(store.get_offset("does-not-exist").unwrap(), None);
     }
 }
