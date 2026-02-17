@@ -18,6 +18,7 @@ import (
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/eventstore"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/observatory"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy"
 )
 
@@ -93,6 +94,24 @@ func main() {
 		logger.Info("event store disabled (SENTINEL_CORTEX_EVENT_STORE_PATH not set)")
 	}
 
+	// 4c. Observatory (optional, enabled via config or SENTINEL_OBSERVATORY env)
+	var obsHandler *observatory.Handler
+	obsConfigPath := envOrDefault("SENTINEL_OBSERVATORY_CONFIG", "config/observatory.toml")
+	obsCfg, obsErr := observatory.LoadConfig(obsConfigPath)
+	if obsErr != nil {
+		logger.Info("observatory disabled", "reason", obsErr)
+	} else if obsCfg.IsEnabled() {
+		obsDBPath := envOrDefault("SENTINEL_OBSERVATORY_DB", "data/observatory.db")
+		obsStore, err := observatory.OpenSqliteStore(obsDBPath)
+		if err != nil {
+			logger.Error("failed to open observatory store", "path", obsDBPath, "error", err)
+			os.Exit(1)
+		}
+		defer func() { _ = obsStore.Close() }()
+		obsHandler = observatory.NewHandler(obsStore, obsCfg, logger)
+		logger.Info("observatory enabled", "db", obsDBPath)
+	}
+
 	// 5. Processing pipeline (fully wired)
 	pipelineHandler := proxy.NewPipelineHandler(proxy.PipelineConfig{
 		Registry:     registry,
@@ -124,6 +143,11 @@ func main() {
 	// 7. Control plane server (shared controlConfig → aenderungen wirken sofort)
 	controlPlane := control.NewPlane(controlConfig, logger)
 	controlMux := controlPlane.Handler()
+
+	// 7b. Register observatory routes on control plane (if enabled)
+	if obsHandler != nil {
+		obsHandler.RegisterRoutes(controlMux)
+	}
 
 	controlServer := &http.Server{
 		Addr:         ":" + controlPort,
