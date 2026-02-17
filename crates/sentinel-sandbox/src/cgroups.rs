@@ -52,7 +52,7 @@ pub fn cgroup_path(name: &str) -> String {
 /// resolves it to the whole disk device (e.g. `8:0` = sda) because cgroup v2
 /// `io.max` only accepts whole-disk devices.
 ///
-/// Falls back to [`FALLBACK_STORAGE_PATH`] if `mount_path` is not found.
+/// Falls back to `/` if `mount_path` is not found.
 pub fn discover_block_device(mount_path: &str) -> Option<String> {
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
     let dev = discover_device_from_mountinfo(&mountinfo, mount_path)
