@@ -114,11 +114,20 @@ impl SandboxEnforcer {
             }
         };
 
-        // 3. IO controller check
-        let io_delegated = std::fs::read_to_string("/sys/fs/cgroup/cgroup.subtree_control")
-            .map(|s| s.contains("io"))
-            .unwrap_or(false);
-        if !io_delegated {
+        // 3. IO controller check — must be enabled at root AND sentinel level
+        let root_has_io = cgroups::io_controller_enabled("/sys/fs/cgroup");
+        let sentinel_has_io = if root_has_io && cgroup_available {
+            // Root has IO, try to enable it in sentinel subtree too
+            if cgroups::io_controller_enabled("/sys/fs/cgroup/sentinel") {
+                true
+            } else {
+                // Attempt to enable — may work if cgroup is owned by current user
+                cgroups::enable_io_controller("/sys/fs/cgroup/sentinel")
+            }
+        } else {
+            false
+        };
+        if !sentinel_has_io {
             warnings.push(SandboxWarning::IoNotDelegated);
         }
 
