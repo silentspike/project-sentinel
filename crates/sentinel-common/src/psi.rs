@@ -3,9 +3,10 @@
 //! Shared between sentinel-sandbox (cgroups) and sentinel-ebpf (monitoring).
 
 use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 
 /// PSI (Pressure Stall Information) Metriken.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PsiMetrics {
     pub avg10: f64,
     pub avg60: f64,
