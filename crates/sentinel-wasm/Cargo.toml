@@ -5,8 +5,21 @@ edition = "2021"
 license = "MIT"
 publish = false
 
+[features]
+default = []
+wasm = ["dep:wasmtime"]
+
 [dependencies]
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sentinel-common = { path = "../sentinel-common" }
+wasmtime = { version = "29", optional = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 tempfile = "3"
+
+[[bench]]
+name = "wasm_benchmarks"
+harness = false
