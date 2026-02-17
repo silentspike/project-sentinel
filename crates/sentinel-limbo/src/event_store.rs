@@ -399,6 +399,41 @@ impl EventStore {
         Ok(results)
     }
 
+    /// Liest Events mit einer bestimmten correlation_id (z.B. run_id fuer Replay).
+    pub fn get_events_by_correlation(
+        &self,
+        correlation_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<DomainEvent>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE correlation_id = ?1 ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![correlation_id, limit as i64], |row| {
+            Ok(DomainEvent {
+                event_id: row.get(0)?,
+                event_type: row.get(1)?,
+                aggregate_id: row.get(2)?,
+                payload: row.get(3)?,
+                correlation_id: row.get(4)?,
+                causation_id: row.get(5)?,
+                operation_id: row.get(6)?,
+                tick: row.get::<_, i64>(7)? as u64,
+                timestamp_ms: row.get::<_, i64>(8)? as u64,
+                schema_version: row.get::<_, i32>(9)? as u32,
+                compensation_type: row.get(10)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     // ── Snapshots ──────────────────────────────────
 
     /// Speichert einen Snapshot fuer ein Aggregate. Version wird automatisch inkrementiert.
