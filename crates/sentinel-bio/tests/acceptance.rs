@@ -3,7 +3,7 @@
 //! Tests fuer Bio-Formeln, Action-Funktionen und Koffein-Halbwertszeit.
 
 use approx::assert_relative_eq;
-use sentinel_bio::{drink_coffee, eat_meal, update_bio_state, use_bathroom};
+use sentinel_bio::{apply_psi_stress, drink_coffee, eat_meal, update_bio_state, use_bathroom};
 use sentinel_common::components::{BioState, Personality, WorkContext};
 
 // ── Helper ──
@@ -120,4 +120,51 @@ fn ac_10_04_caffeine_halflife() {
 
     // Nach einer Halbwertszeit: ~47.5mg
     assert_relative_eq!(bio.caffeine_mg, 47.5, epsilon = 2.0);
+}
+
+// ── #74 AC2: PSI CPU Stress ──
+
+/// AC #74.2: CPU PSI avg10 > 50 erhoht Stress um 10
+#[test]
+fn ac_74_02_psi_cpu_stress() {
+    let mut bio = default_bio();
+    bio.stress = 25.0;
+
+    // CPU PSI ueber Schwelle (50), Memory unter Schwelle
+    apply_psi_stress(&mut bio, 60.0, 30.0);
+
+    assert_relative_eq!(bio.stress, 35.0, epsilon = 0.01);
+    // Comfort unveraendert (Memory unter Schwelle)
+    assert_relative_eq!(bio.comfort, 70.0, epsilon = 0.01);
+}
+
+// ── #74 AC3: PSI Memory Comfort ──
+
+/// AC #74.3: Memory PSI avg10 > 70 senkt Comfort um 15, erhoht Stress um 20
+#[test]
+fn ac_74_03_psi_mem_comfort() {
+    let mut bio = default_bio();
+    bio.stress = 10.0;
+    bio.comfort = 80.0;
+
+    // Memory PSI ueber Schwelle (70), CPU unter Schwelle
+    apply_psi_stress(&mut bio, 20.0, 85.0);
+
+    assert_relative_eq!(bio.stress, 30.0, epsilon = 0.01); // +20
+    assert_relative_eq!(bio.comfort, 65.0, epsilon = 0.01); // -15
+}
+
+// ── #74 AC-N1: PSI unter Schwelle keine Aenderung ──
+
+/// AC #74.N1: Keine Aenderung wenn beide PSI-Werte unter Schwelle
+#[test]
+fn ac_74_n1_psi_no_change_below_threshold() {
+    let mut bio = default_bio();
+    bio.stress = 40.0;
+    bio.comfort = 60.0;
+
+    apply_psi_stress(&mut bio, 30.0, 50.0);
+
+    assert_relative_eq!(bio.stress, 40.0, epsilon = 0.01);
+    assert_relative_eq!(bio.comfort, 60.0, epsilon = 0.01);
 }

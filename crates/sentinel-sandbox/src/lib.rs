@@ -4,6 +4,7 @@ pub mod bwrap;
 pub mod cgroups;
 pub mod enforcer;
 pub mod landlock;
+pub mod psi_publisher;
 
 pub use bwrap::BwrapConfig;
 pub use cgroups::{CgroupLimits, PsiMetrics};

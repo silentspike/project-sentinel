@@ -9,6 +9,10 @@ publish = false
 anyhow = { workspace = true }
 landlock = "0.4"
 sentinel-common = { path = "../sentinel-common" }
+sentinel-zenoh = { path = "../sentinel-zenoh" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

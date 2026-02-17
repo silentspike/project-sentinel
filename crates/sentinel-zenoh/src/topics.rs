@@ -47,6 +47,11 @@ pub const CHAOS_EVENT: &str = "sentinel/chaos/event";
 /// Topic for sentinel judge alerts
 pub const JUDGE_ALERT: &str = "sentinel/judge/alert";
 
+/// Build topic for agent PSI (Pressure Stall Information) metrics
+pub fn agent_psi(name: &str) -> String {
+    format!("{PREFIX}/agent/{name}/psi")
+}
+
 /// Build topic for cortex gateway injection per agent
 pub fn cortex_inject(name: &str) -> String {
     format!("{PREFIX}/cortex/inject/{name}")
@@ -102,6 +107,12 @@ mod tests {
             physics_tick(u64::MAX),
             format!("sentinel/physics/tick/{}", u64::MAX)
         );
+    }
+
+    #[test]
+    fn test_agent_psi() {
+        assert_eq!(agent_psi("thomas"), "sentinel/agent/thomas/psi");
+        assert_eq!(agent_psi("lisa"), "sentinel/agent/lisa/psi");
     }
 
     #[test]
