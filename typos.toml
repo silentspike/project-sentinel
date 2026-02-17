@@ -246,6 +246,10 @@ ausfuehrbar = "ausfuehrbar"
 
 # Nightrun / Sandbox words (Issue #16, #17 - German in doc comments + SQL patterns)
 consol = "consol"             # SQL LIKE pattern: agent_consol% (matches agent_consolidated)
+
+# nftables keywords (Issue #75 - Network Namespace Isolation)
+iif = "iif"                   # nftables: input interface filter
+oif = "oif"                   # nftables: output interface filter
 Produktion = "Produktion"     # German: production
 lokale = "lokale"             # German: local
 lokales = "lokales"           # German: local (neuter)
