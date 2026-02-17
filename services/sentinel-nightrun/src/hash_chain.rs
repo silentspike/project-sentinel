@@ -86,8 +86,7 @@ mod tests {
     use super::*;
 
     fn test_event(id: &str, payload: &str, tick: u64) -> DomainEvent {
-        DomainEvent::new("test_event", "test-agent", payload, "corr-1", tick)
-            .with_operation_id(id)
+        DomainEvent::new("test_event", "test-agent", payload, "corr-1", tick).with_operation_id(id)
     }
 
     #[test]
