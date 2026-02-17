@@ -158,6 +158,9 @@ pub enum DomainEventPayload {
         agents_skipped: u32,
         total_episodes: u32,
         duration_ms: u64,
+        /// Final hash of the deterministic event chain (for replay verification).
+        #[serde(default)]
+        hash_chain: Option<String>,
     },
     /// Einzelner Agent konsolidiert
     AgentConsolidated {

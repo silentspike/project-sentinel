@@ -15,6 +15,8 @@ use sentinel_hippocampus::HippocampusService;
 use sentinel_limbo::EventStore;
 
 use crate::config::NightrunSettings;
+use crate::guardrails::{GuardrailController, GuardrailDecision};
+use crate::hash_chain::HashChain;
 use crate::job_queue::JobQueue;
 
 /// Ergebnis eines Nightrun-Durchlaufs.
@@ -26,6 +28,8 @@ pub struct NightrunResult {
     pub agents_skipped: u32,
     pub total_episodes: u32,
     pub duration_ms: u64,
+    /// Final hash of the deterministic event chain (for replay verification).
+    pub hash_chain_final: String,
 }
 
 /// Kern-Pipeline fuer Schichtwechsel-Konsolidierung.
@@ -66,6 +70,9 @@ impl NightrunRunner {
     /// 5. Events emittieren
     pub fn run(&self, trigger_shift_set: u8) -> Result<NightrunResult> {
         let start = Instant::now();
+        let guardrails = GuardrailController::from_settings(&self.config);
+        let mut hash_chain = HashChain::new(&self.run_id, &self.run_id);
+
         info!(run_id = %self.run_id, shift = trigger_shift_set, "Nightrun gestartet");
 
         // 1. Agents mit pending Episodes
@@ -84,6 +91,7 @@ impl NightrunRunner {
                 agents_skipped: 0,
                 total_episodes: 0,
                 duration_ms: start.elapsed().as_millis() as u64,
+                hash_chain_final: hash_chain.current_hash(),
             });
         }
 
@@ -99,7 +107,8 @@ impl NightrunRunner {
         );
 
         // 3. NightRunStarted Event
-        self.emit_started(trigger_shift_set, agent_count)?;
+        let started_event = self.emit_started(trigger_shift_set, agent_count)?;
+        hash_chain.extend(&started_event);
 
         // 4. Job-Queue befuellen (nur bei neuem Run, nicht bei Resume)
         if self.job_queue.get_pending(&self.run_id)?.is_empty() {
@@ -116,34 +125,25 @@ impl NightrunRunner {
 
         let pending_jobs = self.job_queue.get_pending(&self.run_id)?;
         for job in &pending_jobs {
-            // Total-Timeout Check
-            if start.elapsed().as_secs() >= self.config.timeout_total_secs {
-                warn!(
-                    run_id = %self.run_id,
-                    elapsed_secs = start.elapsed().as_secs(),
-                    "Total-Timeout erreicht, breche ab"
-                );
-                // Remaining jobs bleiben pending fuer --resume
+            // Total-Timeout Check (via GuardrailController)
+            if let GuardrailDecision::Abort { reason } =
+                guardrails.check_total_timeout(start.elapsed().as_secs())
+            {
+                warn!(run_id = %self.run_id, reason = %reason, "Guardrail: Abort");
                 break;
             }
 
             let agent = &job.agent_name;
 
-            // Episode-Count pruefen (Backlog-Limit)
+            // Episode-Count pruefen (via GuardrailController)
             let episode_count = self.get_episode_count(agent)?;
-            if episode_count > self.config.max_episodes_per_agent {
-                let reason = format!(
-                    "Backlog zu gross: {episode_count} > {}",
-                    self.config.max_episodes_per_agent
-                );
-                warn!(
-                    agent,
-                    episode_count,
-                    max = self.config.max_episodes_per_agent,
-                    "Agent uebersprungen"
-                );
+            if let GuardrailDecision::Skip { reason } =
+                guardrails.check_agent_backlog(episode_count)
+            {
+                warn!(agent, episode_count, reason = %reason, "Guardrail: Skip");
                 self.job_queue.mark_skipped(&self.run_id, agent, &reason)?;
-                self.emit_failed(&self.run_id.clone(), agent, &reason)?;
+                let ev = self.emit_failed(&self.run_id.clone(), agent, &reason)?;
+                hash_chain.extend(&ev);
                 skipped += 1;
                 continue;
             }
@@ -172,7 +172,8 @@ impl NightrunRunner {
                     );
                     self.job_queue
                         .mark_completed(&self.run_id, agent, processed, cons)?;
-                    self.emit_consolidated(agent, processed, cons, duration_ms)?;
+                    let ev = self.emit_consolidated(agent, processed, cons, duration_ms)?;
+                    hash_chain.extend(&ev);
                     consolidated += 1;
                     total_episodes += processed;
                 }
@@ -180,24 +181,24 @@ impl NightrunRunner {
                     let err_msg = format!("{e:#}");
                     error!(agent, error = %err_msg, "Konsolidierung fehlgeschlagen");
                     self.job_queue.mark_failed(&self.run_id, agent, &err_msg)?;
-                    self.emit_failed(&self.run_id.clone(), agent, &err_msg)?;
+                    let ev = self.emit_failed(&self.run_id.clone(), agent, &err_msg)?;
+                    hash_chain.extend(&ev);
                     failed += 1;
                 }
             }
 
-            // Per-Agent Timeout Check (warnung, kein Abbruch)
-            if agent_start.elapsed().as_secs() >= self.config.timeout_per_agent_secs {
-                warn!(
-                    agent,
-                    elapsed_secs = agent_start.elapsed().as_secs(),
-                    "Agent-Timeout ueberschritten"
-                );
+            // Per-Agent Timeout Check (warning via GuardrailController)
+            if let GuardrailDecision::Skip { reason } =
+                guardrails.check_agent_timeout(agent_start.elapsed().as_secs())
+            {
+                warn!(agent, reason = %reason, "Guardrail: Agent-Timeout warning");
             }
         }
 
         let duration_ms = start.elapsed().as_millis() as u64;
+        let hash_chain_final = hash_chain.current_hash();
 
-        // 6. NightRunCompleted Event
+        // 6. NightRunCompleted Event (with hash chain)
         self.emit_completed(
             trigger_shift_set,
             consolidated,
@@ -205,6 +206,7 @@ impl NightrunRunner {
             skipped,
             total_episodes,
             duration_ms,
+            &hash_chain_final,
         )?;
 
         let result = NightrunResult {
@@ -214,6 +216,7 @@ impl NightrunRunner {
             agents_skipped: skipped,
             total_episodes,
             duration_ms,
+            hash_chain_final,
         };
 
         info!(
@@ -223,6 +226,7 @@ impl NightrunRunner {
             skipped,
             total_episodes,
             duration_ms,
+            hash_chain = %result.hash_chain_final,
             "Nightrun abgeschlossen"
         );
 
@@ -282,7 +286,7 @@ impl NightrunRunner {
 
     // === Event Emission ===
 
-    fn emit_started(&self, trigger_shift_set: u8, agents_queued: u32) -> Result<()> {
+    fn emit_started(&self, trigger_shift_set: u8, agents_queued: u32) -> Result<DomainEvent> {
         let payload = DomainEventPayload::NightRunStarted {
             run_id: self.run_id.clone(),
             trigger_shift_set,
@@ -298,7 +302,7 @@ impl NightrunRunner {
         self.event_store
             .append_with_outbox(&event, "nightrun")
             .context("Failed to emit NightRunStarted")?;
-        Ok(())
+        Ok(event)
     }
 
     fn emit_completed(
@@ -309,6 +313,7 @@ impl NightrunRunner {
         agents_skipped: u32,
         total_episodes: u32,
         duration_ms: u64,
+        hash_chain_final: &str,
     ) -> Result<()> {
         let payload = DomainEventPayload::NightRunCompleted {
             run_id: self.run_id.clone(),
@@ -318,6 +323,7 @@ impl NightrunRunner {
             agents_skipped,
             total_episodes,
             duration_ms,
+            hash_chain: Some(hash_chain_final.to_string()),
         };
         let event = DomainEvent::new(
             payload.event_type_str(),
@@ -338,7 +344,7 @@ impl NightrunRunner {
         episodes_processed: u32,
         episodes_consolidated: u32,
         duration_ms: u64,
-    ) -> Result<()> {
+    ) -> Result<DomainEvent> {
         let payload = DomainEventPayload::AgentConsolidated {
             run_id: self.run_id.clone(),
             agent_name: agent_name.to_string(),
@@ -356,10 +362,10 @@ impl NightrunRunner {
         self.event_store
             .append_with_outbox(&event, "nightrun")
             .context("Failed to emit AgentConsolidated")?;
-        Ok(())
+        Ok(event)
     }
 
-    fn emit_failed(&self, run_id: &str, agent_name: &str, error: &str) -> Result<()> {
+    fn emit_failed(&self, run_id: &str, agent_name: &str, error: &str) -> Result<DomainEvent> {
         let payload = DomainEventPayload::AgentConsolidationFailed {
             run_id: run_id.to_string(),
             agent_name: agent_name.to_string(),
@@ -375,6 +381,6 @@ impl NightrunRunner {
         self.event_store
             .append_with_outbox(&event, "nightrun")
             .context("Failed to emit AgentConsolidationFailed")?;
-        Ok(())
+        Ok(event)
     }
 }
