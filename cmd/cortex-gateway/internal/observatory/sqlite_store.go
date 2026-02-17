@@ -92,7 +92,7 @@ func (s *SqliteStore) loadRecords() error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var records []ObservationRecord
 	for rows.Next() {
@@ -192,7 +192,7 @@ func (s *SqliteStore) SubmitRun(runID, configHash string, records []ObservationR
 	if err != nil {
 		return fmt.Errorf("observatory prepare obs: %w", err)
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 
 	for _, r := range records {
 		if _, err := stmt.Exec(runID, r.Timestamp.UnixMilli(), r.Shift, r.Model,
@@ -222,7 +222,7 @@ func (s *SqliteStore) ListRuns() ([]RunSummary, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var runs []RunSummary
 	for rows.Next() {
@@ -250,7 +250,7 @@ func (s *SqliteStore) GetRunRecords(runID string, filter QueryFilter) ([]Observa
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var records []ObservationRecord
 	for rows.Next() {
