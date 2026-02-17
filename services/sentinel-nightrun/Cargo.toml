@@ -29,6 +29,7 @@ toml = { workspace = true }
 uuid = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
+sha2 = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
