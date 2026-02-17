@@ -19,7 +19,7 @@ func TestOpenSqliteStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSqliteStore: %v", err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	if store.Len() != 0 {
 		t.Errorf("empty store Len = %d, want 0", store.Len())
@@ -37,7 +37,7 @@ func TestSqliteStoreAdd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSqliteStore: %v", err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	rec := ObservationRecord{
 		Timestamp: time.Now(),
@@ -109,7 +109,7 @@ func TestSqliteStoreReload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open 2: %v", err)
 	}
-	defer store2.Close()
+	defer func() { _ = store2.Close() }()
 
 	if store2.Len() != 5 {
 		t.Errorf("store2 Len after reload = %d, want 5", store2.Len())
@@ -130,7 +130,7 @@ func TestSqliteStoreSubmitRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSqliteStore: %v", err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	runID := "test-run-001"
 	configHash := "abc123"
@@ -177,7 +177,7 @@ func TestSqliteStoreGetRunRecords(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSqliteStore: %v", err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	records := []ObservationRecord{
 		{Timestamp: time.Now(), Shift: 1, Model: "claude-sonnet", Agent: "A1", Scenario: "daily_routine",
@@ -228,7 +228,7 @@ func TestSqliteStoreQueryFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSqliteStore: %v", err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	now := time.Now()
 	store.Add(ObservationRecord{Timestamp: now, Shift: 1, Model: "claude", Agent: "A1", Scenario: "daily"})
@@ -254,7 +254,7 @@ func TestSqliteStoreConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSqliteStore: %v", err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	var wg sync.WaitGroup
 	const writers = 5
@@ -304,7 +304,7 @@ func TestSqliteStoreListRunsEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSqliteStore: %v", err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	runs, err := store.ListRuns()
 	if err != nil {

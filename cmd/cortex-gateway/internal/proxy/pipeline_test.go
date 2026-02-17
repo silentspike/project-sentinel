@@ -20,12 +20,12 @@ import (
 // pipelineMockProvider implementiert Provider fuer Pipeline-Tests.
 // Kann Requests aufzeichnen und konfigurierbare Responses/Errors liefern.
 type pipelineMockProvider struct {
-	name      string
-	resp      *LLMResponse
-	err       error
-	calls     int
-	lastReq   *LLMRequest
-	sendFunc  func(ctx context.Context, req *LLMRequest) (*LLMResponse, error)
+	name     string
+	resp     *LLMResponse
+	err      error
+	calls    int
+	lastReq  *LLMRequest
+	sendFunc func(ctx context.Context, req *LLMRequest) (*LLMResponse, error)
 }
 
 func (p *pipelineMockProvider) Name() string { return p.name }

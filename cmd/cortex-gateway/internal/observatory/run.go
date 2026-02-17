@@ -24,10 +24,10 @@ func ConfigHash(cfg *ObservatoryConfig) string {
 	h := sha256.New()
 	shifts := cfg.Shifts()
 	for i, s := range shifts {
-		fmt.Fprintf(h, "shift_%d:%s:%s:%d;", i+1, s.Model, s.Provider, s.Agents)
+		_, _ = fmt.Fprintf(h, "shift_%d:%s:%s:%d;", i+1, s.Model, s.Provider, s.Agents)
 	}
 	sc := cfg.Observatory.Scenarios
-	fmt.Fprintf(h, "daily=%t;crisis=%t;creative=%t;conflict=%t",
+	_, _ = fmt.Fprintf(h, "daily=%t;crisis=%t;creative=%t;conflict=%t",
 		sc.DailyRoutine, sc.CrisisResponse, sc.CreativeTask, sc.ConflictResolution)
 	return hex.EncodeToString(h.Sum(nil))
 }
