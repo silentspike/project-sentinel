@@ -357,14 +357,24 @@ fn ac18_1_replay_same_hash() {
     // Replay: Events aus dem EventStore laden und Hash-Kette nachbauen
     let es_check = EventStore::open(&es_path).unwrap();
     let replay_engine = ReplayEngine::new(&es_check);
-    let (captured_hash, event_count) = replay_engine.capture_hash("run-replay-1", "run-replay-1").unwrap();
+    let (captured_hash, event_count) = replay_engine
+        .capture_hash("run-replay-1", "run-replay-1")
+        .unwrap();
 
     // Mindestens Started + Consolidated*N + Completed Events
-    assert!(event_count >= 3, "Mindestens 3 Events erwartet, gefunden: {event_count}");
+    assert!(
+        event_count >= 3,
+        "Mindestens 3 Events erwartet, gefunden: {event_count}"
+    );
 
     // Hash muss konsistent sein (gleicher Seed + gleiche Events = gleicher Hash)
-    let (captured_hash_2, _) = replay_engine.capture_hash("run-replay-1", "run-replay-1").unwrap();
-    assert_eq!(captured_hash, captured_hash_2, "Replay muss deterministisch sein");
+    let (captured_hash_2, _) = replay_engine
+        .capture_hash("run-replay-1", "run-replay-1")
+        .unwrap();
+    assert_eq!(
+        captured_hash, captured_hash_2,
+        "Replay muss deterministisch sein"
+    );
 }
 
 // AC-2: Idempotenz — Duplicate event_id hat keine doppelte Wirkung
@@ -388,7 +398,11 @@ fn ac18_2_idempotent_events() {
 
     // Nur 1 Event im Store
     let events = es.get_events_by_aggregate("agent-1", 100).unwrap();
-    assert_eq!(events.len(), 1, "Duplikat darf nicht doppelt gespeichert werden");
+    assert_eq!(
+        events.len(),
+        1,
+        "Duplikat darf nicht doppelt gespeichert werden"
+    );
 }
 
 // AC-3: Guardrails greifen deterministisch bei Ueberschreitung
@@ -464,15 +478,17 @@ fn ac18_4_degradation_documented() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(skip_count >= 1, "Skip-Event muss im EventStore dokumentiert sein");
+    assert!(
+        skip_count >= 1,
+        "Skip-Event muss im EventStore dokumentiert sein"
+    );
 }
 
 // AC-N1: Kein Mock/Stub im Produktionspfad
 #[test]
 fn ac18_n1_hash_chain_produces_real_sha256() {
-    let events = vec![
-        DomainEvent::new("test", "a", r#"{"x":1}"#, "c", 1).with_operation_id("op-1"),
-    ];
+    let events =
+        vec![DomainEvent::new("test", "a", r#"{"x":1}"#, "c", 1).with_operation_id("op-1")];
     let hash = HashChain::compute(&events, "seed", "run-1");
 
     // SHA-256 = 64 hex chars, kein Placeholder

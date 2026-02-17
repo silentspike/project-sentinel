@@ -45,12 +45,7 @@ impl<'a> ReplayEngine<'a> {
     /// 1. Load all events correlated with `run_id`
     /// 2. Build hash chain from seed
     /// 3. Compare final hash with `expected_hash`
-    pub fn replay(
-        &self,
-        run_id: &str,
-        seed: &str,
-        expected_hash: &str,
-    ) -> Result<ReplayResult> {
+    pub fn replay(&self, run_id: &str, seed: &str, expected_hash: &str) -> Result<ReplayResult> {
         // Load events by correlation_id (run_id is used as correlation)
         let events = self
             .event_store
@@ -108,8 +103,7 @@ mod tests {
     use super::*;
 
     fn test_event(id: &str, payload: &str, tick: u64) -> DomainEvent {
-        DomainEvent::new("test_event", "run-1", payload, "run-1", tick)
-            .with_operation_id(id)
+        DomainEvent::new("test_event", "run-1", payload, "run-1", tick).with_operation_id(id)
     }
 
     #[test]
@@ -120,8 +114,7 @@ mod tests {
         ];
         let expected = HashChain::compute(&events, "seed-1", "run-1");
 
-        let result =
-            ReplayEngine::replay_from_events(&events, "run-1", "seed-1", &expected);
+        let result = ReplayEngine::replay_from_events(&events, "run-1", "seed-1", &expected);
 
         assert!(result.hash_chain_valid);
         assert_eq!(result.events_replayed, 2);
@@ -142,8 +135,7 @@ mod tests {
             test_event("op-2", r#"{"b":TAMPERED}"#, 2),
         ];
 
-        let result =
-            ReplayEngine::replay_from_events(&tampered, "run-1", "seed-1", &expected);
+        let result = ReplayEngine::replay_from_events(&tampered, "run-1", "seed-1", &expected);
 
         assert!(!result.hash_chain_valid);
         assert_ne!(result.final_hash, expected);
@@ -174,8 +166,7 @@ mod tests {
         let events: Vec<DomainEvent> = vec![];
         let expected = HashChain::compute(&events, "seed", "run-1");
 
-        let result =
-            ReplayEngine::replay_from_events(&events, "run-1", "seed", &expected);
+        let result = ReplayEngine::replay_from_events(&events, "run-1", "seed", &expected);
 
         assert!(result.hash_chain_valid);
         assert_eq!(result.events_replayed, 0);
