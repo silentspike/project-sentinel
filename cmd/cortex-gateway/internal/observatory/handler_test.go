@@ -41,7 +41,7 @@ crisis_response = true
 creative_task = true
 conflict_resolution = true
 `
-	if err := os.WriteFile(cfgFile, []byte(cfgContent), 0644); err != nil {
+	if err := os.WriteFile(cfgFile, []byte(cfgContent), 0600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	cfg, err := LoadConfig(cfgFile)
