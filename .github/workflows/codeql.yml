@@ -10,6 +10,7 @@ on:
     - cron: '0 4 * * 3'  # Mittwoch 04:00 UTC
 
 permissions:
+  contents: read
   security-events: write
 
 jobs:
