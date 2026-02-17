@@ -14,6 +14,8 @@ pub struct BwrapConfig {
     pub tmpfs: Vec<String>,
     pub share_net: bool,
     pub die_with_parent: bool,
+    /// Mount /proc inside the sandbox (needed for PID/UTS namespace tests).
+    pub proc_mount: Option<String>,
 }
 
 impl BwrapConfig {
@@ -26,6 +28,7 @@ impl BwrapConfig {
             tmpfs: vec!["/tmp".to_string()],
             share_net: false,
             die_with_parent: true,
+            proc_mount: None,
         }
     }
 
@@ -104,6 +107,12 @@ impl BwrapConfig {
             args.push(path.clone());
         }
 
+        // proc mount (needed for PID namespace visibility)
+        if let Some(ref p) = self.proc_mount {
+            args.push("--proc".to_string());
+            args.push(p.clone());
+        }
+
         args
     }
 }
@@ -152,5 +161,25 @@ mod tests {
         assert!(config.share_net);
         let args = config.to_args();
         assert!(args.contains(&"--share-net".to_string()));
+    }
+
+    #[test]
+    fn proc_mount_default_none() {
+        let config = BwrapConfig::for_agent("test");
+        assert!(config.proc_mount.is_none());
+        let args = config.to_args();
+        assert!(!args.contains(&"--proc".to_string()));
+    }
+
+    #[test]
+    fn proc_mount_to_args() {
+        let mut config = BwrapConfig::for_agent("test");
+        config.proc_mount = Some("/proc".to_string());
+        let args = config.to_args();
+        let idx = args
+            .iter()
+            .position(|a| a == "--proc")
+            .expect("--proc missing");
+        assert_eq!(args[idx + 1], "/proc");
     }
 }
