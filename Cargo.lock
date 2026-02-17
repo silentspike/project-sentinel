@@ -3221,6 +3221,10 @@ dependencies = [
  "criterion",
  "landlock",
  "sentinel-common",
+ "sentinel-zenoh",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 

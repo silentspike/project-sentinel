@@ -143,6 +143,38 @@ fn update_energy(bio: &mut BioState, personality: &Personality, sim_hour: f32) {
     bio.energy = (base - hunger_penalty - stress_penalty + caffeine_boost).clamp(0.0, 100.0);
 }
 
+// ── PSI-Stress Konstanten ──
+
+/// CPU PSI avg10 Schwellenwert fuer Stress-Erhoehung
+const PSI_CPU_STRESS_THRESHOLD: f64 = 50.0;
+
+/// Stress-Erhoehung bei CPU-Pressure ueber Schwelle
+const PSI_CPU_STRESS_ADDITION: f32 = 10.0;
+
+/// Memory PSI avg10 Schwellenwert fuer Stress + Comfort-Reduktion
+const PSI_MEM_STRESS_THRESHOLD: f64 = 70.0;
+
+/// Stress-Erhoehung bei Memory-Pressure ueber Schwelle
+const PSI_MEM_STRESS_ADDITION: f32 = 20.0;
+
+/// Comfort-Reduktion bei Memory-Pressure ueber Schwelle
+const PSI_MEM_COMFORT_REDUCTION: f32 = 15.0;
+
+/// Wendet PSI-basierte Stress/Comfort-Aenderungen auf BioState an.
+///
+/// Mappt cgroup PSI-Metriken auf biologische Reaktionen:
+/// - CPU avg10 > 50 → stress += 10 (Kopfschmerzen, Konzentrationsprobleme)
+/// - Memory avg10 > 70 → stress += 20, comfort -= 15 (Systemueberlastung)
+pub fn apply_psi_stress(bio: &mut BioState, cpu_avg10: f64, mem_avg10: f64) {
+    if cpu_avg10 > PSI_CPU_STRESS_THRESHOLD {
+        bio.stress = (bio.stress + PSI_CPU_STRESS_ADDITION).clamp(0.0, 100.0);
+    }
+    if mem_avg10 > PSI_MEM_STRESS_THRESHOLD {
+        bio.stress = (bio.stress + PSI_MEM_STRESS_ADDITION).clamp(0.0, 100.0);
+        bio.comfort = (bio.comfort - PSI_MEM_COMFORT_REDUCTION).clamp(0.0, 100.0);
+    }
+}
+
 /// Agent trinkt Kaffee: +95mg Koffein
 pub fn drink_coffee(bio: &mut BioState) {
     bio.caffeine_mg += COFFEE_CAFFEINE_MG;
@@ -320,5 +352,60 @@ mod tests {
             bio_fed.energy,
             bio_hungry.energy
         );
+    }
+
+    #[test]
+    fn test_psi_cpu_stress_above_threshold() {
+        let mut bio = default_bio();
+        bio.stress = 30.0;
+        apply_psi_stress(&mut bio, 60.0, 0.0);
+        assert_relative_eq!(bio.stress, 40.0, epsilon = 0.01);
+        assert_relative_eq!(bio.comfort, 70.0, epsilon = 0.01); // unchanged
+    }
+
+    #[test]
+    fn test_psi_mem_stress_above_threshold() {
+        let mut bio = default_bio();
+        bio.stress = 20.0;
+        bio.comfort = 80.0;
+        apply_psi_stress(&mut bio, 0.0, 80.0);
+        assert_relative_eq!(bio.stress, 40.0, epsilon = 0.01); // +20
+        assert_relative_eq!(bio.comfort, 65.0, epsilon = 0.01); // -15
+    }
+
+    #[test]
+    fn test_psi_below_threshold_no_change() {
+        let mut bio = default_bio();
+        bio.stress = 30.0;
+        bio.comfort = 70.0;
+        apply_psi_stress(&mut bio, 30.0, 40.0);
+        assert_relative_eq!(bio.stress, 30.0, epsilon = 0.01);
+        assert_relative_eq!(bio.comfort, 70.0, epsilon = 0.01);
+    }
+
+    #[test]
+    fn test_psi_both_thresholds() {
+        let mut bio = default_bio();
+        bio.stress = 10.0;
+        bio.comfort = 90.0;
+        apply_psi_stress(&mut bio, 60.0, 80.0);
+        assert_relative_eq!(bio.stress, 40.0, epsilon = 0.01); // +10 +20
+        assert_relative_eq!(bio.comfort, 75.0, epsilon = 0.01); // -15
+    }
+
+    #[test]
+    fn test_psi_stress_clamps_at_100() {
+        let mut bio = default_bio();
+        bio.stress = 95.0;
+        apply_psi_stress(&mut bio, 60.0, 80.0);
+        assert_relative_eq!(bio.stress, 100.0, epsilon = 0.01);
+    }
+
+    #[test]
+    fn test_psi_comfort_clamps_at_0() {
+        let mut bio = default_bio();
+        bio.comfort = 5.0;
+        apply_psi_stress(&mut bio, 0.0, 80.0);
+        assert_relative_eq!(bio.comfort, 0.0, epsilon = 0.01);
     }
 }
