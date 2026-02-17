@@ -9,11 +9,11 @@ import (
 
 // ReportGenerator creates comparison reports from observatory data.
 type ReportGenerator struct {
-	store *ObservationStore
+	store ObservationStorer
 }
 
 // NewReportGenerator creates a ReportGenerator backed by the given store.
-func NewReportGenerator(store *ObservationStore) *ReportGenerator {
+func NewReportGenerator(store ObservationStorer) *ReportGenerator {
 	return &ReportGenerator{store: store}
 }
 
