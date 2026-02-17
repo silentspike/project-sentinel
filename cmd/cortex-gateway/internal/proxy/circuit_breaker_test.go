@@ -13,7 +13,7 @@ func testConfig() BreakerConfig {
 		MinRequests:      5,
 		FailureRatio:     0.5,
 		FailureThreshold: 3,
-		OpenSeconds:       5,
+		OpenSeconds:      5,
 		HalfOpenProbes:   2,
 	}
 }
