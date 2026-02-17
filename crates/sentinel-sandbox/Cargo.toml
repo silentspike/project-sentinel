@@ -18,6 +18,10 @@ tracing = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 
+[[bin]]
+name = "breakout-helper"
+path = "src/bin/breakout_helper.rs"
+
 [[bench]]
 name = "sandbox_bench"
 harness = false
