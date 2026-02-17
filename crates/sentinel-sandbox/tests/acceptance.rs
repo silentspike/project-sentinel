@@ -126,3 +126,74 @@ fn ac_16_06_cgroup_path() {
         path
     );
 }
+
+// AC #73.01: discover_block_device findet whole-disk Device fuer Root-Filesystem
+#[test]
+fn ac_73_01_discover_block_device() {
+    // /proc/self/mountinfo exists on all Linux systems
+    if std::path::Path::new("/proc/self/mountinfo").exists() {
+        let device = sentinel_sandbox::cgroups::discover_block_device("/");
+        assert!(
+            device.is_some(),
+            "discover_block_device('/') should find a device"
+        );
+        let dev = device.unwrap();
+        assert!(
+            dev.contains(':'),
+            "device should be in MAJ:MIN format, got: '{dev}'"
+        );
+        // Must be a whole-disk device (not a partition) for io.max compatibility
+        let sysfs_partition = format!("/sys/dev/block/{dev}/partition");
+        assert!(
+            !std::path::Path::new(&sysfs_partition).exists(),
+            "device {dev} must be a whole-disk device (not a partition) for io.max"
+        );
+    }
+}
+
+// AC #73.02: format_io_max erzeugt korrektes cgroup v2 io.max Format mit Device-Prefix
+#[test]
+fn ac_73_02_io_max_format() {
+    let limits = CgroupLimits::default();
+    let io_max = sentinel_sandbox::cgroups::format_io_max("8:0", &limits);
+
+    // Must start with device
+    assert!(
+        io_max.starts_with("8:0 "),
+        "io.max must start with device prefix, got: '{io_max}'"
+    );
+    // Must contain all four limit fields
+    assert!(io_max.contains("rbps="), "missing rbps in: {io_max}");
+    assert!(io_max.contains("wbps="), "missing wbps in: {io_max}");
+    assert!(io_max.contains("riops="), "missing riops in: {io_max}");
+    assert!(io_max.contains("wiops="), "missing wiops in: {io_max}");
+    // Verify actual values match defaults
+    assert!(
+        io_max.contains("riops=300"),
+        "riops should be 300, got: {io_max}"
+    );
+    assert!(
+        io_max.contains("rbps=10485760"),
+        "rbps should be 10MB/s, got: {io_max}"
+    );
+}
+
+// AC #73.N1: Bestehende CPU/Memory Limits in CgroupLimits::default() unveraendert
+#[test]
+fn ac_73_n1_existing_limits_unchanged() {
+    let limits = CgroupLimits::default();
+    // These must match Issue #16 AC values exactly
+    assert_eq!(limits.cpu_quota_us, 100_000, "CPU quota must stay 100000");
+    assert_eq!(limits.cpu_period_us, 100_000, "CPU period must stay 100000");
+    assert_eq!(
+        limits.memory_bytes,
+        256 * 1024 * 1024,
+        "Memory must stay 256MB"
+    );
+    assert_eq!(limits.io_max_iops, 300, "IO IOPS must stay 300");
+    assert_eq!(
+        limits.io_max_bps,
+        10 * 1024 * 1024,
+        "IO BPS must stay 10MB/s"
+    );
+}
