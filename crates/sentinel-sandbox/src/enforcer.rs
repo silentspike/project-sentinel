@@ -20,6 +20,7 @@ use tracing::{info, warn};
 use crate::bwrap::BwrapConfig;
 use crate::cgroups::{self, CgroupLimits, PsiMetrics};
 use crate::landlock;
+use crate::netns::{self, NetworkNsConfig};
 
 /// Warnings about degraded sandbox capabilities.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +35,8 @@ pub enum SandboxWarning {
     IoNotDelegated,
     /// Failed to set OOM score for ECS core process.
     OomScoreFailed(String),
+    /// Network namespace isolation not available (no CAP_NET_ADMIN).
+    NetnsNotAvailable,
 }
 
 /// Handle returned by setup_agent() — tracks what was created.
@@ -44,6 +47,10 @@ pub struct SandboxHandle {
     pub io_available: bool,
     pub bwrap_pid: Option<u32>,
     pub landlock_applied: bool,
+    /// Whether this agent has network namespace isolation active.
+    pub network_isolated: bool,
+    /// Network namespace config (set after setup_network()).
+    pub netns_config: Option<NetworkNsConfig>,
 }
 
 /// Central sandbox enforcement facade.
@@ -59,6 +66,8 @@ pub struct SandboxEnforcer {
     cgroup_available: bool,
     /// Whether bwrap with user namespaces works.
     bwrap_available: bool,
+    /// Whether network namespace isolation is available (CAP_NET_ADMIN).
+    netns_available: bool,
     /// Whether OOM score has been set for ECS core.
     oom_set: AtomicBool,
 }
@@ -70,6 +79,7 @@ impl std::fmt::Debug for SandboxEnforcer {
             .field("cgroup_root", &self.cgroup_root)
             .field("cgroup_available", &self.cgroup_available)
             .field("bwrap_available", &self.bwrap_available)
+            .field("netns_available", &self.netns_available)
             .finish()
     }
 }
@@ -151,11 +161,18 @@ impl SandboxEnforcer {
             }
         };
 
+        // 6. Network namespace support (CAP_NET_ADMIN + ip + nft)
+        let netns_available = netns::detect_netns_support();
+        if !netns_available {
+            warnings.push(SandboxWarning::NetnsNotAvailable);
+        }
+
         let enforcer = Self {
             landlock_abi,
             cgroup_root,
             cgroup_available,
             bwrap_available,
+            netns_available,
             oom_set,
         };
 
@@ -173,6 +190,8 @@ impl SandboxEnforcer {
             io_available: false,
             bwrap_pid: None,
             landlock_applied: false,
+            network_isolated: false,
+            netns_config: None,
         };
 
         // 1. Create cgroup with resource limits
@@ -205,7 +224,12 @@ impl SandboxEnforcer {
             anyhow::bail!("bwrap not available — cannot start agent process");
         }
 
-        let config = BwrapConfig::for_agent(name);
+        let config = if self.netns_available {
+            BwrapConfig::for_agent(name)
+        } else {
+            // Fallback: share host network when netns is not available
+            BwrapConfig::for_agent(name).with_shared_net()
+        };
         let child = config.spawn(command)?;
         let pid = child.id();
 
@@ -222,9 +246,44 @@ impl SandboxEnforcer {
         Ok(pid)
     }
 
+    /// Sets up network namespace isolation for a running agent.
+    ///
+    /// Creates bridge (idempotent), veth pair, and loads nftables rules.
+    /// Must be called AFTER start_agent_process() (needs PID).
+    ///
+    /// Returns true if network isolation was applied, false if skipped.
+    pub fn setup_network(
+        &self,
+        handle: &mut SandboxHandle,
+        pid: u32,
+        agent_index: u8,
+    ) -> Result<bool> {
+        if !self.netns_available {
+            return Ok(false);
+        }
+
+        let config = NetworkNsConfig::for_agent(&handle.agent_name, agent_index);
+
+        // Ensure bridge exists
+        netns::setup_bridge(&config).context("Failed to setup sentinel bridge")?;
+
+        // Setup veth + nftables inside agent NS
+        netns::setup_netns(pid, &config).with_context(|| {
+            format!(
+                "Failed to setup network namespace for agent {}",
+                handle.agent_name
+            )
+        })?;
+
+        handle.network_isolated = true;
+        handle.netns_config = Some(config);
+        Ok(true)
+    }
+
     /// Tears down sandbox resources for an agent.
     ///
-    /// Kills the bwrap process (if running) and removes the cgroup.
+    /// Kills the bwrap process (if running), removes network namespace
+    /// resources, and removes the cgroup.
     /// Called by RuntimeOrchestrator::despawn_agent().
     pub fn teardown_agent(&self, handle: &SandboxHandle) -> Result<()> {
         // Kill bwrap process if running
@@ -232,6 +291,15 @@ impl SandboxEnforcer {
             let _ = std::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .status();
+        }
+
+        // Remove network namespace resources BEFORE cgroup cleanup
+        if handle.network_isolated {
+            if let Some(ref config) = handle.netns_config {
+                if let Err(e) = netns::teardown_netns(config) {
+                    warn!("Failed to teardown netns for {}: {e}", handle.agent_name);
+                }
+            }
         }
 
         // Remove cgroup (may fail if processes still in it)
@@ -272,6 +340,11 @@ impl SandboxEnforcer {
         self.bwrap_available
     }
 
+    /// Whether network namespace isolation is available.
+    pub fn has_netns(&self) -> bool {
+        self.netns_available
+    }
+
     /// Whether OOM score was set for the ECS core process.
     pub fn oom_score_set(&self) -> bool {
         self.oom_set.load(Ordering::Relaxed)
@@ -291,8 +364,9 @@ mod tests {
             SandboxWarning::BwrapUsernsDenied,
             SandboxWarning::IoNotDelegated,
             SandboxWarning::OomScoreFailed("test".into()),
+            SandboxWarning::NetnsNotAvailable,
         ];
-        assert_eq!(warnings.len(), 5);
+        assert_eq!(warnings.len(), 6);
         assert_ne!(warnings[0], warnings[1]);
     }
 
@@ -304,10 +378,31 @@ mod tests {
             io_available: false,
             bwrap_pid: None,
             landlock_applied: false,
+            network_isolated: false,
+            netns_config: None,
         };
         assert_eq!(handle.agent_name, "test");
         assert!(!handle.cgroup_created);
         assert!(handle.bwrap_pid.is_none());
+        assert!(!handle.network_isolated);
+        assert!(handle.netns_config.is_none());
+    }
+
+    #[test]
+    fn sandbox_handle_with_netns() {
+        let config = NetworkNsConfig::for_agent("test", 5);
+        let handle = SandboxHandle {
+            agent_name: "test".into(),
+            cgroup_created: false,
+            io_available: false,
+            bwrap_pid: Some(12345),
+            landlock_applied: false,
+            network_isolated: true,
+            netns_config: Some(config),
+        };
+        assert!(handle.network_isolated);
+        assert!(handle.netns_config.is_some());
+        assert_eq!(handle.netns_config.unwrap().agent_ip(), "10.42.0.7");
     }
 
     #[test]

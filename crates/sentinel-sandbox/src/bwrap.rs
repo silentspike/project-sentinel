@@ -24,9 +24,15 @@ impl BwrapConfig {
             readonly_binds: vec![("/work/company".to_string(), "/company".to_string())],
             writable_binds: vec![(format!("/ram/agents/{name}"), format!("/home/{name}"))],
             tmpfs: vec!["/tmp".to_string()],
-            share_net: true,
+            share_net: false,
             die_with_parent: true,
         }
+    }
+
+    /// Returns a config with shared network (fallback when netns is not available).
+    pub fn with_shared_net(mut self) -> Self {
+        self.share_net = true;
+        self
     }
 
     /// Tests whether bwrap user namespace creation works.
@@ -132,11 +138,19 @@ mod tests {
     }
 
     #[test]
-    fn no_network() {
-        let mut config = BwrapConfig::for_agent("test");
-        config.share_net = false;
+    fn default_network_isolated() {
+        let config = BwrapConfig::for_agent("test");
+        assert!(!config.share_net, "Default should be network-isolated");
         let args = config.to_args();
         assert!(!args.contains(&"--share-net".to_string()));
         assert!(args.contains(&"--unshare-all".to_string()));
+    }
+
+    #[test]
+    fn with_shared_net_fallback() {
+        let config = BwrapConfig::for_agent("test").with_shared_net();
+        assert!(config.share_net);
+        let args = config.to_args();
+        assert!(args.contains(&"--share-net".to_string()));
     }
 }
