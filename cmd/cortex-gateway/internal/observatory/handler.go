@@ -51,10 +51,10 @@ type submitRecord struct {
 }
 
 type submitRunResponse struct {
-	RunID        string `json:"run_id"`
-	ConfigHash   string `json:"config_hash"`
-	RecordsStored int   `json:"records_stored"`
-	Status       string `json:"status"`
+	RunID         string `json:"run_id"`
+	ConfigHash    string `json:"config_hash"`
+	RecordsStored int    `json:"records_stored"`
+	Status        string `json:"status"`
 }
 
 func (h *Handler) handleSubmitRun(w http.ResponseWriter, r *http.Request) {
@@ -120,10 +120,10 @@ func (h *Handler) handleSubmitRun(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(submitRunResponse{
-		RunID:        runID,
-		ConfigHash:   configHash,
+		RunID:         runID,
+		ConfigHash:    configHash,
 		RecordsStored: len(records),
-		Status:       "completed",
+		Status:        "completed",
 	})
 }
 
