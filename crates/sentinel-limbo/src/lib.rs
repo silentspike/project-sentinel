@@ -9,8 +9,10 @@
 //! with tokio::task::spawn_blocking for async compatibility.
 
 pub mod event_store;
+pub mod outbox_publisher;
 
-pub use event_store::{EventStore, MonotonicityError, OutboxEntry, SnapshotRow};
+pub use event_store::{EventStore, MonotonicityError, OutboxEntry, OutboxTransport, SnapshotRow};
+pub use outbox_publisher::{OutboxPublisher, OutboxPublisherConfig, PublishCycleStats};
 
 use rusqlite::{params, Connection};
 use sentinel_common::{AgentId, Emotion, EventType, RoomId, Tick, Timestamp};

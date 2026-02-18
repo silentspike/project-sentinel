@@ -355,3 +355,76 @@ fn ac_08_07_compensation_type() {
     assert_eq!(events[0].compensation_type, "none");
     assert_eq!(events[1].compensation_type, "rollback");
 }
+
+// ──────────────────────────────────────────────
+// Issue #57: OutboxPublisher Acceptance Tests
+// ──────────────────────────────────────────────
+
+type PublishedPayloads = Vec<(String, Vec<u8>)>;
+
+/// Mock-Transport fuer Acceptance Tests.
+struct AcceptanceMockTransport {
+    published: std::sync::Arc<std::sync::Mutex<PublishedPayloads>>,
+}
+
+impl AcceptanceMockTransport {
+    fn new() -> Self {
+        Self {
+            published: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl sentinel_limbo::OutboxTransport for AcceptanceMockTransport {
+    async fn publish(&self, topic: &str, payload: &[u8]) -> anyhow::Result<()> {
+        self.published
+            .lock()
+            .unwrap()
+            .push((topic.to_string(), payload.to_vec()));
+        Ok(())
+    }
+}
+
+/// AC-6 (Issue #57): E2E Flow — Event append → Outbox poll → Publish → Mark published → Offset update.
+#[tokio::test]
+async fn ac_57_06_e2e_outbox_publish_flow() {
+    use sentinel_limbo::{OutboxPublisher, OutboxPublisherConfig};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ac57_06.db");
+    let store = EventStore::open(path.to_str().unwrap()).unwrap();
+    let transport = AcceptanceMockTransport::new();
+    let published = transport.published.clone();
+
+    // 1. Agent-Action als Event mit Outbox persistieren
+    let event = test_event("agent_action_received", "AGENT-05");
+    let row_id = store
+        .append_with_outbox(&event, "sentinel/agent/AGENT-05/action")
+        .unwrap();
+    assert!(row_id > 0, "event should be persisted");
+
+    // 2. OutboxPublisher verarbeitet pending entries
+    let publisher =
+        OutboxPublisher::new(store.clone(), transport, OutboxPublisherConfig::default());
+    let stats = publisher.process_batch().await;
+    assert_eq!(stats.published, 1, "one entry should be published");
+    assert_eq!(stats.failed, 0, "no failures expected");
+
+    // 3. Transport hat das Event empfangen
+    let msgs = published.lock().unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].0, "sentinel/agent/AGENT-05/action");
+
+    // 4. Outbox ist leer (alle published)
+    let pending = store.poll_outbox(10).unwrap();
+    assert!(pending.is_empty(), "outbox should be drained");
+
+    // 5. Projection-Offset aktualisieren (monoton)
+    store.update_offset("agent_projection", row_id).unwrap();
+    let offset = store.get_offset("agent_projection").unwrap();
+    assert_eq!(offset, Some(row_id), "offset should match row_id");
+
+    // 6. Monotonie-Verletzung wird abgefangen
+    let result = store.update_offset("agent_projection", row_id - 1);
+    assert!(result.is_err(), "backward offset should fail");
+}
