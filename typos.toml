@@ -181,6 +181,11 @@ Internetausfall = "Internetausfall"
 Paketlieferung = "Paketlieferung"
 Kuchen = "Kuchen"
 
+# sentinel-wasm words (Issue #19 - German in Rust doc comments)
+Modul = "Modul"
+Mechanismus = "Mechanismus"
+Restriktive = "Restriktive"
+
 # Sprint 4 words (Runtime, Sandbox, Dashboard)
 oder = "oder"
 Finde = "Finde"
