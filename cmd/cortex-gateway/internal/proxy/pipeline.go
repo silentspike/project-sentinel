@@ -28,12 +28,6 @@ import (
 // defaultProviderDeadline ist die maximale Wartezeit pro LLM-Call (ENV-konfigurierbar).
 const defaultProviderDeadline = 20 * time.Second
 
-// minProviderDeadline und maxProviderDeadline begrenzen den konfigurierbaren Bereich.
-const (
-	minProviderDeadline = 10 * time.Second
-	maxProviderDeadline = 30 * time.Second
-)
-
 // maxRegenAttempts limitiert Fourth-Wall Re-Generierungs-Versuche.
 const maxRegenAttempts = 2
 
