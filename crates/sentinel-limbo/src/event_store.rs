@@ -137,6 +137,7 @@ pub struct SnapshotRow {
 ///
 /// Thread-safe via `Arc<Mutex<Connection>>`. Fuer async-Kontexte:
 /// in tokio::task::spawn_blocking wrappen.
+#[derive(Clone)]
 pub struct EventStore {
     conn: Arc<Mutex<Connection>>,
 }
@@ -695,6 +696,23 @@ impl EventStore {
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap()
     }
+}
+
+// ──────────────────────────────────────────────
+// OutboxTransport Trait
+// ──────────────────────────────────────────────
+
+/// Transport backend for outbox event publishing.
+///
+/// Implementiert von Zenoh-Adapter (sentinel-runtime) oder Mock (Tests).
+/// Generisch gehalten damit sentinel-limbo NICHT von sentinel-zenoh abhaengt.
+pub trait OutboxTransport: Send + Sync + 'static {
+    /// Publiziert ein Event an den angegebenen Topic.
+    fn publish<'a>(
+        &'a self,
+        topic: &'a str,
+        payload: &'a [u8],
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a;
 }
 
 // ──────────────────────────────────────────────

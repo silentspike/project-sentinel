@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `OutboxPublisher<T>` background task: polls outbox entries and publishes via generic `OutboxTransport` trait
+- `OutboxTransport` trait in sentinel-limbo for transport abstraction (no zenoh dependency)
+- `OutboxPublisherConfig` with env-based configuration (`SENTINEL_OUTBOX_POLL_INTERVAL_MS`, `SENTINEL_OUTBOX_BATCH_SIZE`)
+- Graceful shutdown support via `tokio::sync::watch` channel with drain-on-exit
+- 6 unit tests for OutboxPublisher (publish, retry, empty, shutdown, batch-size, config)
+- E2E acceptance test `ac_57_06` covering full outbox publish flow
+- `Clone` derive on `EventStore` (was already `Arc<Mutex>` internally)
 - Configurable provider deadline via `SENTINEL_CORTEX_PROVIDER_DEADLINE_SECONDS` (10-30s, default 20s)
 - `resilience` package: Zenoh query deadline with InFlightMap and stale-drop logic
 - Configurable Zenoh query deadline via `SENTINEL_CORTEX_ZENOH_DEADLINE_MS` (50-120ms, default 100ms)
