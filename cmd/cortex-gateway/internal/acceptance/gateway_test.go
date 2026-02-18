@@ -114,7 +114,7 @@ func TestAC_13_04_ClaudeProviderRequest(t *testing.T) {
 	p := proxy.NewClaudeProvider(proxy.ProviderConfig{
 		Name:    "claude-test",
 		BaseURL: server.URL,
-		APIKey:  "sk-test-key-123",
+		APIKey:  "sk-test-key-123", //nolint:gosec // test credential, not real
 		Model:   "claude-sonnet-4-5-20250929",
 	})
 

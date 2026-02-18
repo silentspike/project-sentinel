@@ -115,7 +115,7 @@ func (p *OllamaProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	resp, err := p.client.Do(httpReq)
+	resp, err := p.client.Do(httpReq) //nolint:gosec // URL from trusted config
 	if err != nil {
 		return nil, fmt.Errorf("ollama API call: %w", err)
 	}
@@ -153,7 +153,7 @@ func (p *OllamaProvider) HealthCheck(ctx context.Context) error {
 		return fmt.Errorf("create health check request: %w", err)
 	}
 
-	resp, err := p.client.Do(httpReq)
+	resp, err := p.client.Do(httpReq) //nolint:gosec // URL from trusted config
 	if err != nil {
 		return fmt.Errorf("ollama health check: %w", err)
 	}

@@ -93,8 +93,8 @@ func (r *ReportGenerator) GenerateMarkdown(filter QueryFilter) string {
 	var b strings.Builder
 
 	b.WriteString("# MARBLE Observatory Report\n\n")
-	b.WriteString(fmt.Sprintf("Generated: %s\n", time.Now().UTC().Format(time.RFC3339)))
-	b.WriteString(fmt.Sprintf("Records: %d\n\n", len(records)))
+	fmt.Fprintf(&b, "Generated: %s\n", time.Now().UTC().Format(time.RFC3339))
+	fmt.Fprintf(&b, "Records: %d\n\n", len(records))
 
 	if len(summaries) == 0 {
 		b.WriteString("No data available.\n")
@@ -105,7 +105,7 @@ func (r *ReportGenerator) GenerateMarkdown(filter QueryFilter) string {
 	b.WriteString("## Shift Comparison\n\n")
 	b.WriteString("| Metric |")
 	for _, s := range summaries {
-		b.WriteString(fmt.Sprintf(" %s (Shift %d) |", s.Model, s.Shift))
+		fmt.Fprintf(&b, " %s (Shift %d) |", s.Model, s.Shift)
 	}
 	b.WriteString("\n|--------|")
 	for range summaries {
@@ -127,9 +127,9 @@ func (r *ReportGenerator) GenerateMarkdown(filter QueryFilter) string {
 	}
 
 	for _, row := range rows {
-		b.WriteString(fmt.Sprintf("| %s |", row.name))
+		fmt.Fprintf(&b, "| %s |", row.name)
 		for _, s := range summaries {
-			b.WriteString(fmt.Sprintf(" %.2f |", row.get(s.AvgMetrics)))
+			fmt.Fprintf(&b, " %.2f |", row.get(s.AvgMetrics))
 		}
 		b.WriteString("\n")
 	}
