@@ -1,0 +1,29 @@
+[Unit]
+Description=Sentinel Daemon — ECS Orchestrator
+Documentation=https://github.com/obtFusi/project-sentinel/issues/94
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel-daemon --config /opt/sentinel/config/daemon.toml
+Restart=on-failure
+RestartSec=5
+MemoryMax=2G
+CPUAffinity=0-3
+OOMScoreAdjust=-1000
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-daemon
+
+# Security Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/sentinel/data /ram/sentinel
+PrivateTmp=true
+
+[Install]
+WantedBy=sentinel.target
