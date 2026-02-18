@@ -137,16 +137,16 @@ func (r *ReportGenerator) GenerateMarkdown(filter QueryFilter) string {
 	// Per-shift details
 	b.WriteString("\n## Per-Shift Details\n\n")
 	for _, s := range summaries {
-		b.WriteString(fmt.Sprintf("### Shift %d: %s (%d records)\n\n", s.Shift, s.Model, s.RecordCount))
+		fmt.Fprintf(&b, "### Shift %d: %s (%d records)\n\n", s.Shift, s.Model, s.RecordCount)
 		b.WriteString("| Metric | Avg | Min | Max |\n")
 		b.WriteString("|--------|-----|-----|-----|\n")
 		for _, row := range rows {
-			b.WriteString(fmt.Sprintf("| %s | %.2f | %.2f | %.2f |\n",
+			fmt.Fprintf(&b, "| %s | %.2f | %.2f | %.2f |\n",
 				row.name,
 				row.get(s.AvgMetrics),
 				row.get(s.MinMetrics),
 				row.get(s.MaxMetrics),
-			))
+			)
 		}
 		b.WriteString("\n")
 	}
