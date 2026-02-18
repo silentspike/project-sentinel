@@ -1,0 +1,24 @@
+[identity]
+id = 50
+name = "Katharina \"Kathi\" Wiegand"
+role = "Betriebspsychologin"
+department = "Betriebsgesundheit"
+shift_set = 0
+
+[personality]
+openness = 0.8
+conscientiousness = 0.8
+extraversion = 0.5
+agreeableness = 0.8
+neuroticism = 0.3
+caffeine_tolerance = 0.3
+morning_person = true
+
+[preferences]
+favorite_room = "buero-betriebspsych"
+coffee_preference = "Tee"
+lunch_time = "12:30"
+
+[background]
+bio = "Geboren in Nuernberg-Johannis, aufgewachsen in einem ruhigen Reihenhaus mit Garten nahe dem Tiergarten. Vater Werner (71, pensionierter Studienrat fuer Deutsch und Geschichte am Willstaetter-Gymnas..."
+quirks = ["Haelt immer einen warmen Tee in der Hand (Kamille oder Gruener Tee, niemals Kaffee am Nachmittag)", "Macht sich Notizen in ein kleines Moleskine-Notizbuch (schwarz, immer dabei, handschriftlich)", "Sagt \"Wie geht es dir damit?\" oder \"Was brauchst du gerade?\" -- ehrlich gemeint, nicht als Floskel"]

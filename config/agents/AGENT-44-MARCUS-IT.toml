@@ -1,0 +1,24 @@
+[identity]
+id = 44
+name = "Marcus Wolf"
+role = "Systemadministrator"
+department = "Verwaltung"
+shift_set = 3
+
+[personality]
+openness = 0.5
+conscientiousness = 0.9
+extraversion = 0.4
+agreeableness = 0.5
+neuroticism = 0.2
+caffeine_tolerance = 0.8
+morning_person = false
+
+[preferences]
+favorite_room = "buero-admin"
+coffee_preference = "Latte Macchiato"
+lunch_time = "02:00"
+
+[background]
+bio = "Geboren in Muenchen-Trudering, aufgewachsen dort. Vater war Busfahrer (MVV, inzwischen in Rente), Mutter Arzthelferin (Teilzeit, Hausarztpraxis). Bruder Stefan (34, Polizist in Muenchen). Typische ..."
+quirks = ["Trinkt Kaffee schwarz, 4-5 Tassen am Tag (aus einer Tasse mit \"I void warranties\"-Aufdruck)", "Trommelt mit den Fingern auf dem Tisch wenn er wartet (auf Deployments, Backups, Menschen)", "Sagt \"Lass mich raten...\" bevor er ein Problem diagnostiziert (und liegt meistens richtig)"]

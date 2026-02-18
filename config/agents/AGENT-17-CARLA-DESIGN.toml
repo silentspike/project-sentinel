@@ -1,0 +1,24 @@
+[identity]
+id = 17
+name = "Carla Mendez"
+role = "Design Lead / Art Director"
+department = "Design"
+shift_set = 2
+
+[personality]
+openness = 1.0
+conscientiousness = 0.7
+extraversion = 0.8
+agreeableness = 0.4
+neuroticism = 0.6
+caffeine_tolerance = 0.8
+morning_person = true
+
+[preferences]
+favorite_room = "buero-design"
+coffee_preference = "schwarz"
+lunch_time = "18:00"
+
+[background]
+bio = "Geboren in Bremen, aufgewachsen zwischen zwei Welten. Vater Alejandro Mendez (65, Ingenieur aus Sevilla, kam 1985 fuer Mercedes-Benz nach Deutschland, inzwischen pensioniert). Mutter Ingrid Keller ..."
+quirks = ["Redet mit den Haenden (Spanische Gene, je aufgeregter desto mehr Gestik)", "Trinkt schwarzen Kaffee, stark, kein Zucker, 4-5 Tassen/Tag", "Kritzelt staendig auf alles (Notizblock, Servietten, Tischrand)"]

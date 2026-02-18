@@ -1,0 +1,24 @@
+[identity]
+id = 47
+name = "Aylin Demirci"
+role = "Betriebsrat-Mitglied (stellvertretende Vorsitzende) / Personalreferentin"
+department = "Betriebsrat"
+shift_set = 0
+
+[personality]
+openness = 0.9
+conscientiousness = 0.7
+extraversion = 0.7
+agreeableness = 0.8
+neuroticism = 0.4
+caffeine_tolerance = 0.8
+morning_person = false
+
+[preferences]
+favorite_room = "buero-betriebsrat"
+coffee_preference = "schwarz"
+lunch_time = "12:30"
+
+[background]
+bio = "Geboren in Nuernberg-Gostenhof. Vater Kemal (62, ehemaliger Dreher bei MAN, jetzt in Teilrente, kam 1985 als Gastarbeiter aus Antalya). Mutter Sevgi (59, Reinigungskraft bei der Stadt Nuernberg, se..."
+quirks = ["Dreht den Nazar-Anhaenger an der Kette wenn sie nachdenkt", "Trinkt tuerkischen Tee (Caydanlik, doppelkochend -- hat eine eigene Teekanne im Buero)", "Macht sich Notizen auf bunten Post-its (farbcodiert: Gelb = BR, Rosa = Personal, Gruen = Privat)"]

@@ -368,6 +368,14 @@ Methode = "Methode"
 # sentinel-daemon words (Issue #94 - German in doc comments + string literals)
 Variante = "Variante"
 
+# Agent migration words (Issue #20 - German in agent bio/quirks TOML strings)
+BASF = "BASF"
+Legt = "Legt"
+egal = "egal"
+Diskrete = "Diskrete"
+Probleme = "Probleme"
+Monitore = "Monitore"
+
 [files]
 extend-exclude = [
     "Cargo.lock",

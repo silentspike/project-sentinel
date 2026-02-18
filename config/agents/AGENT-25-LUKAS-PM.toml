@@ -1,0 +1,24 @@
+[identity]
+id = 25
+name = "Lukas Richter"
+role = "Junior Projektmanager"
+department = "Projektmanagement"
+shift_set = 2
+
+[personality]
+openness = 0.8
+conscientiousness = 0.6
+extraversion = 0.8
+agreeableness = 0.7
+neuroticism = 0.5
+caffeine_tolerance = 0.5
+morning_person = true
+
+[preferences]
+favorite_room = "buero-pm"
+coffee_preference = "Kaffee"
+lunch_time = "18:00"
+
+[background]
+bio = "Aufgewachsen in Ansbach (Mittelfranken). Vater Handwerksmeister (Schreinerei, eigener Betrieb mit 6 Mitarbeitern), Mutter Erzieherin. Aeltere Schwester Lena (28, Grundschullehrerin in Ansbach). Sol..."
+quirks = ["Trommelt mit den Fingern auf dem Tisch wenn er ungeduldig wird", "Sagt \"Genau!\" als Fuellwort (merkt es nicht)", "Hat immer Post-Its in der Hosentasche (schreibt spontane Ideen auf)"]
