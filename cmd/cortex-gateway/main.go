@@ -113,16 +113,20 @@ func main() {
 	}
 
 	// 5. Processing pipeline (fully wired)
+	providerDeadline := proxy.ProviderDeadlineFromEnv()
+	logger.Info("provider deadline configured", "deadline", providerDeadline)
+
 	pipelineHandler := proxy.NewPipelineHandler(proxy.PipelineConfig{
-		Registry:     registry,
-		Config:       controlConfig,
-		Compiler:     compiler.New(),
-		Normalizer:   normalizer.New(),
-		Extractor:    extraction.New(),
-		Capabilities: capability.New(),
-		Logger:       logger,
-		BreakerCfg:   proxy.BreakerConfigFromEnv(),
-		EventStore:   evStore,
+		Registry:         registry,
+		Config:           controlConfig,
+		Compiler:         compiler.New(),
+		Normalizer:       normalizer.New(),
+		Extractor:        extraction.New(),
+		Capabilities:     capability.New(),
+		Logger:           logger,
+		BreakerCfg:       proxy.BreakerConfigFromEnv(),
+		EventStore:       evStore,
+		ProviderDeadline: providerDeadline,
 	})
 
 	// 6. HTTP proxy server
