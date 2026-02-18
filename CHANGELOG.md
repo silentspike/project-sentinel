@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Configurable provider deadline via `SENTINEL_CORTEX_PROVIDER_DEADLINE_SECONDS` (10-30s, default 20s)
+- `resilience` package: Zenoh query deadline with InFlightMap and stale-drop logic
+- Configurable Zenoh query deadline via `SENTINEL_CORTEX_ZENOH_DEADLINE_MS` (50-120ms, default 100ms)
+- Prometheus metrics: `sentinel_breaker_trips_total`, `sentinel_query_cancelled_total`, `sentinel_query_stale_dropped_total`
+- E2E integration test for circuit breaker lifecycle (trip → failover → half-open → recovery)
+
+### Changed
+
+- Provider deadline now configurable instead of hardcoded 20s in pipeline handler
+
+### Added
+
 - Project scaffolding and GitHub infrastructure
 - CI/CD with path-based filtering (Rust, Go, Bun, FlatBuffer)
 - Security audit workflow (cargo audit, govulncheck)
