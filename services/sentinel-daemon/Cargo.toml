@@ -1,0 +1,38 @@
+[package]
+name = "sentinel-daemon"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Sentinel Daemon — ECS Orchestrator Binary"
+
+[lib]
+name = "sentinel_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sentinel-daemon"
+path = "src/main.rs"
+
+[dependencies]
+sentinel-common = { path = "../../crates/sentinel-common" }
+sentinel-ecs = { path = "../../crates/sentinel-ecs" }
+sentinel-runtime = { path = "../../crates/sentinel-runtime" }
+sentinel-zenoh = { path = "../../crates/sentinel-zenoh" }
+sentinel-limbo = { path = "../../crates/sentinel-limbo" }
+sentinel-redb = { path = "../../crates/sentinel-redb" }
+sentinel-telemetry = { path = "../../crates/sentinel-telemetry" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+
+[features]
+telemetry = ["sentinel-telemetry/telemetry"]
+
+[dev-dependencies]
+tempfile = "3"
