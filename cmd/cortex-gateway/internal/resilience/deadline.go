@@ -137,7 +137,7 @@ func (m *InFlightMap) Cancel(queryID string) {
 }
 
 // Prune entfernt alle abgelaufenen Queries aus der Map.
-// Sollte periodisch aufgerufen werden um Memory-Leaks zu vermeiden.
+// Sollte regelmaessig aufgerufen werden um Memory-Leaks zu vermeiden.
 func (m *InFlightMap) Prune() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
