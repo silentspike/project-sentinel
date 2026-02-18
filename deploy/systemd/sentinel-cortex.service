@@ -1,0 +1,29 @@
+[Unit]
+Description=Sentinel Cortex Gateway — LLM Pipeline Proxy
+Documentation=https://github.com/obtFusi/project-sentinel/issues/28
+After=sentinel-daemon.service
+Requires=sentinel-daemon.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/cortex-gateway
+Restart=on-failure
+RestartSec=5
+MemoryMax=1G
+CPUAffinity=0-3
+Environment=CORTEX_PORT=8080
+Environment=CORTEX_CONTROL_PORT=8081
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-cortex
+
+# Security Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=sentinel.target

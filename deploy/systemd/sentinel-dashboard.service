@@ -1,0 +1,26 @@
+[Unit]
+Description=Sentinel Dashboard — Web UI + WebSocket
+Documentation=https://github.com/obtFusi/project-sentinel/issues/28
+After=sentinel-cortex.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sentinel/dashboard
+ExecStart=/usr/local/bin/bun run start
+Restart=on-failure
+RestartSec=5
+MemoryMax=512M
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-dashboard
+
+# Security Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/sentinel/dashboard
+PrivateTmp=true
+
+[Install]
+WantedBy=sentinel.target

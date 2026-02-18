@@ -1,0 +1,7 @@
+[Unit]
+Description=Sentinel Simulation Stack
+Documentation=https://github.com/obtFusi/project-sentinel/issues/28
+Wants=sentinel-daemon.service sentinel-cortex.service sentinel-dashboard.service sentinel-nightrun.timer
+
+[Install]
+WantedBy=multi-user.target
