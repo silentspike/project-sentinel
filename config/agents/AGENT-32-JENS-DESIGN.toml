@@ -1,0 +1,24 @@
+[identity]
+id = 32
+name = "Jens Krueger"
+role = "Design-Lead / Art Director"
+department = "Design"
+shift_set = 3
+
+[personality]
+openness = 0.6
+conscientiousness = 0.8
+extraversion = 0.3
+agreeableness = 0.5
+neuroticism = 0.2
+caffeine_tolerance = 0.5
+morning_person = false
+
+[preferences]
+favorite_room = "buero-design"
+coffee_preference = "Kaffee"
+lunch_time = "02:00"
+
+[background]
+bio = "Geboren in Dessau, aufgewachsen in Weimar. Vater Grafiker (eigene Druckwerkstatt, Weimar), Mutter Bibliothekarin an der Herzogin Anna Amalia Bibliothek. Keine Geschwister. Aufgewachsen zwischen Bau..."
+quirks = ["Dreht den Bleistift zwischen den Fingern wenn er nachdenkt", "Steht auf und geht zum Fenster wenn er ueber ein Design gruebelt", "Sagt \"Hmm\" und schweigt 5-10 Sekunden bevor er antwortet (wirkt unhöflich, ist Nachdenken)"]

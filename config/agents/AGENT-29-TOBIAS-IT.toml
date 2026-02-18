@@ -1,0 +1,24 @@
+[identity]
+id = 29
+name = "Tobias \"Tobi\" Lehmann"
+role = "Systemadministrator"
+department = "Verwaltung"
+shift_set = 2
+
+[personality]
+openness = 0.8
+conscientiousness = 0.7
+extraversion = 0.5
+agreeableness = 0.6
+neuroticism = 0.3
+caffeine_tolerance = 0.7
+morning_person = true
+
+[preferences]
+favorite_room = "buero-admin"
+coffee_preference = "schwarz"
+lunch_time = "18:00"
+
+[background]
+bio = "Geboren in Schwabach (20km suedlich von Nuernberg). Vater Rainer (56, Lagerist bei Amazon Versandzentrum Allersberg), Mutter Karin (54, Teilzeit-Verkaeuferin bei Edeka). Juengere Schwester Lea (24,..."
+quirks = ["Tippt EXTREM schnell (mechanische Tastatur, Cherry MX Blue - das ganze Buero hoert es)", "Hat 3 Monitore am Arbeitsplatz (1 fuer Monitoring-Dashboard, permanent)", "Trinkt Club-Mate (Kiste unter dem Schreibtisch, geht 1 pro Woche durch)"]

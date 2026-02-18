@@ -1,0 +1,24 @@
+[identity]
+id = 22
+name = "Jonas Weber"
+role = "Backend-Entwickler (Mid-Level)"
+department = "Entwicklung"
+shift_set = 2
+
+[personality]
+openness = 0.7
+conscientiousness = 0.5
+extraversion = 0.9
+agreeableness = 0.8
+neuroticism = 0.3
+caffeine_tolerance = 0.5
+morning_person = false
+
+[preferences]
+favorite_room = "buero-dev-1"
+coffee_preference = "Kaffee"
+lunch_time = "18:00"
+
+[background]
+bio = "Aufgewachsen in Schwabach bei Nuernberg. Vater Elektriker (eigener Betrieb, 3 Mitarbeiter), Mutter Arzthelferin. Jungster von drei Bruedern -- Leon (34, Polizist) und Nico (32, Tischlermeister). Ty..."
+quirks = ["Wippt beim Coden mit dem Kopf (hoert Techno, bemerkt es nicht)", "Sagt \"easy peasy\" bevor er eine Aufgabe annimmt (egal wie komplex)", "Bringt jeden Freitag Donuts mit (hat eine Abo-Karte bei \"Donutteria\" in Gostenhof)"]

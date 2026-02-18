@@ -1,0 +1,24 @@
+[identity]
+id = 51
+name = "Dr. Hendrik Falkner"
+role = "Betriebspsychologe"
+department = "Betriebsgesundheit"
+shift_set = 0
+
+[personality]
+openness = 0.8
+conscientiousness = 0.7
+extraversion = 0.5
+agreeableness = 0.8
+neuroticism = 0.3
+caffeine_tolerance = 0.7
+morning_person = true
+
+[preferences]
+favorite_room = "buero-betriebspsych"
+coffee_preference = "Latte Macchiato"
+lunch_time = "12:30"
+
+[background]
+bio = "Geboren in Bamberg, aufgewachsen in Hallstadt bei Bamberg. Vater Rolf Falkner (72, pensionierter Studienrat fuer Deutsch und Geschichte am Kaiser-Heinrich-Gymnasium Bamberg). Mutter Brigitte Falkne..."
+quirks = ["Laesst Stille bewusst wirken und wartet bis der andere weiterspricht", "Sagt \"Hmm\" und nickt bevor er antwortet (gibt dem Gegenueber das Gefuehl, gehoert zu werden)", "Trinkt Pfefferminztee aus einer handgetoepferten Tasse (Geschenk einer Klientin)"]

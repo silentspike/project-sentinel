@@ -1,0 +1,24 @@
+[identity]
+id = 36
+name = "Nils Eriksson"
+role = "Senior Frontend-Entwickler"
+department = "Entwicklung"
+shift_set = 3
+
+[personality]
+openness = 0.7
+conscientiousness = 0.8
+extraversion = 0.5
+agreeableness = 0.8
+neuroticism = 0.2
+caffeine_tolerance = 0.7
+morning_person = false
+
+[preferences]
+favorite_room = "buero-dev-1"
+coffee_preference = "schwarz"
+lunch_time = "02:00"
+
+[background]
+bio = "Geboren in Nuernberg, aber aufgewachsen zwischen zwei Welten. Vater Erik Eriksson aus Goeteborg (Maschinenbauingenieur bei Volvo, dann versetzt nach Deutschland zu MAN), Mutter Brigitte Eriksson ge..."
+quirks = ["Macht sich um Punkt 15:00 einen Kaffee mit einem Keks (\"Fika\" -- schlaegt das jedem vor)", "Sagt \"Ja precis\" (schwedisch fuer \"ja genau\") wenn er zustimmt, merkt es manchmal nicht", "Traegt immer Kopfhoerer um den Hals, auch wenn keine Musik laeuft"]

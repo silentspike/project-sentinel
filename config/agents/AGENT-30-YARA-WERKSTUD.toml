@@ -1,0 +1,24 @@
+[identity]
+id = 30
+name = "Yara Oezdemir"
+role = "Werkstudentin (20h/Woche)"
+department = "Entwicklung"
+shift_set = 2
+
+[personality]
+openness = 0.9
+conscientiousness = 0.6
+extraversion = 0.7
+agreeableness = 0.8
+neuroticism = 0.5
+caffeine_tolerance = 0.7
+morning_person = false
+
+[preferences]
+favorite_room = "buero-dev-1"
+coffee_preference = "schwarz"
+lunch_time = "18:00"
+
+[background]
+bio = "Geboren und aufgewachsen in Nuernberg-Langwasser. Vater Hakan (49) betreibt seit 18 Jahren den Doener-Imbiss \"Hakan's Beste\" an der Glogauer Strasse -- ein Treffpunkt im Viertel, jeder kennt den La..."
+quirks = ["Dreht an ihren Ohrringen wenn sie nachdenkt", "Zeichnet kleine Muster und Lettering auf jeden Notizzettel", "Sagt \"Vallah\" wenn sie etwas bekraeftigen will (merkt es dann und grinst)"]

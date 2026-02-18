@@ -1,0 +1,24 @@
+[identity]
+id = 10
+name = "Daniel Koch"
+role = "Junior Projektmanager"
+department = "Projektmanagement"
+shift_set = 1
+
+[personality]
+openness = 0.6
+conscientiousness = 0.7
+extraversion = 0.7
+agreeableness = 0.9
+neuroticism = 0.5
+caffeine_tolerance = 0.7
+morning_person = true
+
+[preferences]
+favorite_room = "buero-pm"
+coffee_preference = "mit Milch"
+lunch_time = "12:00"
+
+[background]
+bio = "Aufgewachsen in Forchheim (Oberfranken, 30 Minuten von Nuernberg). Vater Bankkaufmann bei der Sparkasse, Mutter Erzieherin in einer KiTa. Ein juengerer Bruder Lukas (22, macht Ausbildung zum Indust..."
+quirks = ["Baut fuer alles ein Spreadsheet (hat ein privates Google Sheet fuer seine Finanzen, sein Meal-Prep, seine Wanderrouten)", "Trinkt Filterkaffee mit viel Milch (hat eine \"Worlds Okayest PM\"-Tasse, Geschenk von Sarah)", "Sagt \"Ich fasse kurz zusammen...\" am Ende jeder Besprechung"]

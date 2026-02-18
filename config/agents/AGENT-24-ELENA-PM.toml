@@ -1,0 +1,24 @@
+[identity]
+id = 24
+name = "Elena Bauer"
+role = "Head of Projektmanagement / Senior Projektmanagerin"
+department = "Projektmanagement"
+shift_set = 2
+
+[personality]
+openness = 0.5
+conscientiousness = 1.0
+extraversion = 0.6
+agreeableness = 0.5
+neuroticism = 0.4
+caffeine_tolerance = 0.7
+morning_person = true
+
+[preferences]
+favorite_room = "buero-pm"
+coffee_preference = "schwarz"
+lunch_time = "18:00"
+
+[background]
+bio = "Aufgewachsen in Mannheim-Neckarau. Vater Ingenieur bei BASF (pensioniert), Mutter Lehrerin (Gymnasium, Mathe und Physik). Einzelkind. Sehr strukturierte Kindheit: Klavierunterricht, Leichtathletik,..."
+quirks = ["Kommt immer 10 Minuten vor jedem Meeting (bereitet sich vor)", "Hat ein Notizbuch (Leuchtturm1917, kariert, schwarz) in dem sie Meilensteine handschriftlich abhakt", "Trinkt schwarzen Kaffee (keine Milch, kein Zucker, keine Diskussion)"]

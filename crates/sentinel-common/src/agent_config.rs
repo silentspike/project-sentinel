@@ -115,7 +115,7 @@ mod tests {
         let path = config_dir().join("AGENT-01-THOMAS-CEO.toml");
         let config = load_agent_config(&path).unwrap();
         assert_eq!(config.identity.name, "Thomas Mueller");
-        assert_eq!(config.identity.role, "CEO / Geschaeftsfuehrer");
+        assert_eq!(config.identity.role, "CEO / Geschaeftsfuehrer / Gruender");
         assert_eq!(config.identity.id, 1);
     }
 
@@ -150,13 +150,94 @@ mod tests {
     #[test]
     fn load_all_agents_sorted() {
         let agents = load_all_agents(&config_dir()).unwrap();
-        assert_eq!(agents.len(), 5);
-        // Check sorted by ID
+        assert_eq!(agents.len(), 54);
+        // Check sorted by ID - first and last
         assert_eq!(agents[0].identity.id, 1);
-        assert_eq!(agents[1].identity.id, 2);
-        assert_eq!(agents[2].identity.id, 3);
-        assert_eq!(agents[3].identity.id, 4);
-        assert_eq!(agents[4].identity.id, 5);
+        assert_eq!(agents[53].identity.id, 54);
+        // Check monotonically increasing
+        for i in 1..agents.len() {
+            assert!(agents[i].identity.id > agents[i - 1].identity.id);
+        }
+    }
+
+    #[test]
+    fn no_id_gaps_or_duplicates() {
+        let agents = load_all_agents(&config_dir()).unwrap();
+        let ids: Vec<u16> = agents.iter().map(|a| a.identity.id).collect();
+        let expected: Vec<u16> = (1..=54).collect();
+        assert_eq!(ids, expected, "Agent IDs must be 1..=54 without gaps");
+    }
+
+    #[test]
+    fn shift_distribution() {
+        let agents = load_all_agents(&config_dir()).unwrap();
+        let set0: Vec<_> = agents
+            .iter()
+            .filter(|a| a.identity.shift_set == 0)
+            .collect();
+        let set1: Vec<_> = agents
+            .iter()
+            .filter(|a| a.identity.shift_set == 1)
+            .collect();
+        let set2: Vec<_> = agents
+            .iter()
+            .filter(|a| a.identity.shift_set == 2)
+            .collect();
+        let set3: Vec<_> = agents
+            .iter()
+            .filter(|a| a.identity.shift_set == 3)
+            .collect();
+        assert_eq!(set0.len(), 9, "Sonder-Set (0) should have 9 agents");
+        assert_eq!(set1.len(), 15, "Frueh-Set (1) should have 15 agents");
+        assert_eq!(set2.len(), 15, "Mittel-Set (2) should have 15 agents");
+        assert_eq!(set3.len(), 15, "Spaet-Set (3) should have 15 agents");
+    }
+
+    #[test]
+    fn all_personality_values_valid() {
+        let agents = load_all_agents(&config_dir()).unwrap();
+        for agent in &agents {
+            agent.personality.validate().unwrap_or_else(|e| {
+                panic!("Agent {} personality invalid: {}", agent.identity.id, e);
+            });
+        }
+    }
+
+    #[test]
+    fn required_fields_not_empty() {
+        let agents = load_all_agents(&config_dir()).unwrap();
+        for agent in &agents {
+            assert!(
+                !agent.identity.name.is_empty(),
+                "Agent {} has empty name",
+                agent.identity.id
+            );
+            assert!(
+                !agent.identity.role.is_empty(),
+                "Agent {} has empty role",
+                agent.identity.id
+            );
+            assert!(
+                !agent.identity.department.is_empty(),
+                "Agent {} has empty department",
+                agent.identity.id
+            );
+            assert!(
+                !agent.preferences.favorite_room.is_empty(),
+                "Agent {} has empty favorite_room",
+                agent.identity.id
+            );
+            assert!(
+                !agent.background.bio.is_empty(),
+                "Agent {} has empty bio",
+                agent.identity.id
+            );
+            assert!(
+                !agent.background.quirks.is_empty(),
+                "Agent {} has no quirks",
+                agent.identity.id
+            );
+        }
     }
 
     #[test]

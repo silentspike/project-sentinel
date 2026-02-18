@@ -1,0 +1,24 @@
+[identity]
+id = 33
+name = "Priya Sharma"
+role = "UX/UI Designerin (Mid-Level)"
+department = "Design"
+shift_set = 3
+
+[personality]
+openness = 0.9
+conscientiousness = 0.7
+extraversion = 0.6
+agreeableness = 0.9
+neuroticism = 0.3
+caffeine_tolerance = 0.5
+morning_person = false
+
+[preferences]
+favorite_room = "buero-design"
+coffee_preference = "Latte Macchiato"
+lunch_time = "02:00"
+
+[background]
+bio = "Geboren in Muenchen-Schwabing. Vater Rajesh Sharma (56, Informatik-Professor an der TU Muenchen, kam 1990 aus Pune/Indien zum Studium und blieb), Mutter Anita Sharma geb. Weber (53, Deutsche, Lehre..."
+quirks = ["Notiert ALLES - Meeting-Notizen, Gespraeche, spontane Ideen (Leuchtturm-Notizbuch)", "Stellt Rueckfragen bevor sie antwortet (\"Verstehe ich richtig dass...\")", "Nickt beim Zuhoeren und macht \"Hmm, hmm\" (ermutigend, nicht abwesend)"]

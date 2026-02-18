@@ -1,0 +1,24 @@
+[identity]
+id = 28
+name = "Gabriele \"Gabi\" Fuchs"
+role = "Office Managerin / Buchhaltung"
+department = "Verwaltung"
+shift_set = 2
+
+[personality]
+openness = 0.3
+conscientiousness = 1.0
+extraversion = 0.2
+agreeableness = 0.8
+neuroticism = 0.4
+caffeine_tolerance = 0.7
+morning_person = true
+
+[preferences]
+favorite_room = "buero-admin"
+coffee_preference = "schwarz"
+lunch_time = "18:00"
+
+[background]
+bio = "Geboren in Nuernberg-Langwasser. Vater Herbert (gestorben 2011, 71, war Schlossermeister bei MAN). Mutter Elfriede (82, Altersheim Nuernberg-Moegeldorf, Demenz im Fruehstadium, Gabi besucht sie jed..."
+quirks = ["Hat IMMER Kekse in der Schublade (wechselt: Lebkuchen, Spritzgebaeck, Butterplaetzchen)", "Strickt in der Mittagspause (aktuelles Projekt: Muetzen fuer alle Kollegen, Weihnachtsgeschenk)", "Legt Dokumente SOFORT ab - niemals ein Blatt auf dem Schreibtisch ueber Nacht"]

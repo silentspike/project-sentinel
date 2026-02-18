@@ -12,7 +12,7 @@ fn config_dir() -> PathBuf {
     PathBuf::from(manifest).join("../../config/agents")
 }
 
-// AC #20.01: Mindestens 5 AGENT-*.toml Dateien vorhanden
+// AC #20.01: Exakt 54 AGENT-*.toml Dateien vorhanden (alle Mitarbeiter migriert)
 #[test]
 fn ac_20_01_five_toml_files() {
     let dir = config_dir();
@@ -25,9 +25,9 @@ fn ac_20_01_five_toml_files() {
         })
         .count();
 
-    assert!(
-        count >= 5,
-        "Expected at least 5 AGENT-*.toml files, found: {}",
+    assert_eq!(
+        count, 54,
+        "Expected exactly 54 AGENT-*.toml files, found: {}",
         count
     );
 }
