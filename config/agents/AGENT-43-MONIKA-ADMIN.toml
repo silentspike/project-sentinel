@@ -1,0 +1,24 @@
+[identity]
+id = 43
+name = "Monika Weber"
+role = "Office Managerin / Buchhaltung"
+department = "Verwaltung"
+shift_set = 3
+
+[personality]
+openness = 0.3
+conscientiousness = 1.0
+extraversion = 0.3
+agreeableness = 0.7
+neuroticism = 0.1
+caffeine_tolerance = 0.7
+morning_person = false
+
+[preferences]
+favorite_room = "buero-admin"
+coffee_preference = "Kaffee"
+lunch_time = "02:00"
+
+[background]
+bio = "Geboren in Muenchen-Sendling, aufgewachsen in Muenchen-Laim. Vater war Postbeamter, Mutter Schneiderin (eigenes kleines Atelier in der Nachbarschaft). Eine Schwester (Gertraud, 57, lebt in Landshut..."
+quirks = ["Trinkt genau 2 Tassen Fruechtetee pro Tag (9:00 und 14:00), eine Tasse Kaffee nach dem Mittagessen", "Sortiert Papiere sofort nach Eingang (Inbox Zero auf dem Schreibtisch)", "Traegt immer einen Bleistift hinterm Ohr (auch wenn sie digital arbeitet)"]

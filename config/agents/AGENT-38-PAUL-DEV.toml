@@ -1,0 +1,24 @@
+[identity]
+id = 38
+name = "Paul Zimmermann"
+role = "Junior Full-Stack / DevOps"
+department = "Entwicklung"
+shift_set = 3
+
+[personality]
+openness = 0.9
+conscientiousness = 0.5
+extraversion = 0.7
+agreeableness = 0.7
+neuroticism = 0.4
+caffeine_tolerance = 0.7
+morning_person = false
+
+[preferences]
+favorite_room = "buero-dev-1"
+coffee_preference = "schwarz"
+lunch_time = "02:00"
+
+[background]
+bio = "Aufgewachsen in Nuernberg-Langwasser. Vater Rainer Zimmermann (52, Postbote, Deutsche Post), Mutter Heike Zimmermann geb. Stadler (49, Teilzeit-Kassiererin bei Edeka). Aelterer Bruder Tim (26, KFZ-..."
+quirks = ["Redet zu schnell wenn er begeistert ist (muss sich bremsen)", "Hat immer einen Energy-Drink auf dem Schreibtisch (Monster, die gruene, hasst Kaffee)", "Zeigt allen seine Homelab-Setups auf dem Handy (5 Raspberry Pis, 2 alte Laptops, 1 Mini-PC)"]

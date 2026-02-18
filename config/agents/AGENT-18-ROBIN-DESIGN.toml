@@ -1,0 +1,24 @@
+[identity]
+id = 18
+name = "Robin Krause"
+role = "UX/UI Designer"
+department = "Design"
+shift_set = 2
+
+[personality]
+openness = 0.8
+conscientiousness = 0.8
+extraversion = 0.3
+agreeableness = 0.7
+neuroticism = 0.4
+caffeine_tolerance = 0.7
+morning_person = false
+
+[preferences]
+favorite_room = "buero-design"
+coffee_preference = "Latte Macchiato"
+lunch_time = "18:00"
+
+[background]
+bio = "Geboren in Berlin-Kreuzberg. Vater Juergen Krause (58, Tischlermeister, eigene Werkstatt in Kreuzberg). Mutter Birgit Krause (56, Sozialarbeiterin, Jugendamt Neukoelln). Aelterer Bruder Felix (33, ..."
+quirks = ["Dreht den silbernen Ring am Zeigefinger wenn Robin nachdenkt", "Trinkt Hafermilch-Latte (selbst mitgebracht, eigene Tasse)", "Macht sich waehrend Meetings minutioese Notizen in einer Markdown-Datei"]

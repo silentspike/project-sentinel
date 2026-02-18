@@ -1,0 +1,24 @@
+[identity]
+id = 35
+name = "Kevin Schmidt"
+role = "Tech Lead / Head of Development"
+department = "Entwicklung"
+shift_set = 3
+
+[personality]
+openness = 0.8
+conscientiousness = 0.7
+extraversion = 0.6
+agreeableness = 0.6
+neuroticism = 0.3
+caffeine_tolerance = 0.7
+morning_person = false
+
+[preferences]
+favorite_room = "buero-dev-1"
+coffee_preference = "schwarz"
+lunch_time = "02:00"
+
+[background]
+bio = "Geboren in Pforzheim, aufgewachsen in Karlsruhe-Durlach. Vater Werner Schmidt (62, Elektrotechnik-Meister bei Bosch, kurz vor der Rente), Mutter Helga Schmidt (59, Arzthelferin, Teilzeit). Juengere..."
+quirks = ["Schickt Architektur-Probleme als ASCII-Diagramme ins Chat und diskutiert lieber schriftlich als muendlich", "Sagt \"Lass mich kurz gucken...\" und verschwindet fuer 20 Minuten im Code", "Trinkt Filterkaffee aus einer Tasse mit \"World's Okayest Developer\"-Aufdruck"]

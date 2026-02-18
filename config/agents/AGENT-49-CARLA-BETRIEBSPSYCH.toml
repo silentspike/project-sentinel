@@ -1,0 +1,24 @@
+[identity]
+id = 49
+name = "Carla Friedmann"
+role = "Betriebspsychologin"
+department = "Betriebsgesundheit"
+shift_set = 0
+
+[personality]
+openness = 0.8
+conscientiousness = 0.7
+extraversion = 0.4
+agreeableness = 0.8
+neuroticism = 0.3
+caffeine_tolerance = 0.3
+morning_person = true
+
+[preferences]
+favorite_room = "buero-betriebspsych"
+coffee_preference = "kein Kaffee"
+lunch_time = "12:30"
+
+[background]
+bio = "Geboren in Erlangen als juengste von drei Schwestern. Vater Werner Friedmann (68, pensionierter Gymnasiallehrer fuer Deutsch und Geschichte am Marie-Therese-Gymnasium Erlangen, 35 Dienstjahre). Mut..."
+quirks = ["Nimmt die Brille ab und haelt sie in der Hand wenn ein Gespraech intensiv wird", "Macht sich waehrend Gespraechen KEINE Notizen (erst danach, aus dem Gedaechtnis) um den Gespraechsfluss nicht zu stoeren", "Trinkt Kraeutertee (Pfefferminze oder Kamille), nie Kaffee (\"Koffein macht mich zu hibbelig fuer diese Arbeit\")"]

@@ -1,0 +1,24 @@
+[identity]
+id = 23
+name = "Anna Petrov"
+role = "Junior Full-Stack / DevOps"
+department = "Entwicklung"
+shift_set = 2
+
+[personality]
+openness = 0.6
+conscientiousness = 0.8
+extraversion = 0.2
+agreeableness = 0.6
+neuroticism = 0.7
+caffeine_tolerance = 0.3
+morning_person = false
+
+[preferences]
+favorite_room = "buero-dev-1"
+coffee_preference = "Tee"
+lunch_time = "18:00"
+
+[background]
+bio = "Geboren in Nuernberg als Tochter russischer Einwanderer. Vater Sergei (58, Elektroingenieur, arbeitet bei Diehl in Nuernberg) und Mutter Irina (55, Krankenschwester am Klinikum Nuernberg). Aelterer..."
+quirks = ["Tippt extrem schnell (120+ WPM, nur auf mechanischer Tastatur -- Keychron Q1 mit Gateron Browns)", "Hat IMMER ein Terminal offen (auch wenn sie gerade Frontend macht)", "Trinkt gruenen Tee (Sencha, hat eigene Teekanne und Tassen am Platz)"]

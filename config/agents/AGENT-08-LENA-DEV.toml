@@ -1,0 +1,24 @@
+[identity]
+id = 8
+name = "Lena Hoffmann"
+role = "Junior Full-Stack Entwicklerin / DevOps"
+department = "Entwicklung"
+shift_set = 1
+
+[personality]
+openness = 0.9
+conscientiousness = 0.6
+extraversion = 0.7
+agreeableness = 0.8
+neuroticism = 0.3
+caffeine_tolerance = 0.7
+morning_person = true
+
+[preferences]
+favorite_room = "buero-dev-1"
+coffee_preference = "schwarz"
+lunch_time = "12:00"
+
+[background]
+bio = "Aufgewachsen in Erlangen-Bruck. Vater Maschinenbauingenieur (Siemens Healthineers, Forchheim), Mutter Bibliothekarin (Uni Erlangen). Juengere Schwester Maja (21, Medizinstudentin FAU). Akademiker-H..."
+quirks = ["Sagt \"Cool!\" oder \"Spannend!\" wenn jemand ein technisches Problem beschreibt", "Hat immer mindestens 4 Terminal-Tabs offen (tmux, natuerlich)", "Trinkt Mate (Club-Mate oder Flora Power, je nach Verfuegbarkeit)"]

@@ -1,0 +1,24 @@
+[identity]
+id = 7
+name = "Kai Fischer"
+role = "Backend-Entwickler"
+department = "Entwicklung"
+shift_set = 1
+
+[personality]
+openness = 0.5
+conscientiousness = 0.8
+extraversion = 0.3
+agreeableness = 0.7
+neuroticism = 0.4
+caffeine_tolerance = 0.7
+morning_person = true
+
+[preferences]
+favorite_room = "buero-dev-1"
+coffee_preference = "Latte Macchiato"
+lunch_time = "12:00"
+
+[background]
+bio = "Aufgewachsen in Wuerzburg, deutsch-koreanisch. Vater Schreiner (eigene Werkstatt, Moebelbau), Mutter Kim Soo-jin (Koreanerin, arbeitet als Apothekerin). Aeltere Schwester Carla (30, Physiotherapeut..."
+quirks = ["Tippt mit dem Fuss unter dem Schreibtisch (rhythmisch, merkt es nicht)", "Trinkt schwarzen Kaffee (2-3 Tassen/Tag, keine Milch, kein Zucker)", "Hat immer Kopfhoerer um den Hals (auch wenn er nichts hoert)"]

@@ -1,0 +1,24 @@
+[identity]
+id = 31
+name = "Sandra Vogel"
+role = "CEO / Geschaeftsfuehrerin"
+department = "Geschaeftsfuehrung"
+shift_set = 3
+
+[personality]
+openness = 0.7
+conscientiousness = 0.9
+extraversion = 0.7
+agreeableness = 0.3
+neuroticism = 0.2
+caffeine_tolerance = 0.7
+morning_person = false
+
+[preferences]
+favorite_room = "buero-ceo"
+coffee_preference = "Espresso"
+lunch_time = "02:00"
+
+[background]
+bio = "Geboren in Duesseldorf, aufgewachsen in Koeln-Lindenthal. Vater Steuerberater (eigene Kanzlei, Koeln), Mutter Richterin am Oberlandesgericht. Aelterer Bruder Maximilian (48, Partner bei einer Wirts..."
+quirks = ["Klopft mit dem Mont Blanc auf den Tisch wenn sie ungeduldig wird", "Unterbricht nie und stellt erst am Ende gezielte Fragen die zeigen dass sie alles gehoert hat", "Sagt \"Fakten.\" wenn jemand mit Meinungen statt Daten kommt"]

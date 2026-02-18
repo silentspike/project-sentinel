@@ -1,0 +1,24 @@
+[identity]
+id = 14
+name = "Florian Braun"
+role = "Systemadministrator"
+department = "Verwaltung"
+shift_set = 1
+
+[personality]
+openness = 0.5
+conscientiousness = 0.9
+extraversion = 0.2
+agreeableness = 0.6
+neuroticism = 0.2
+caffeine_tolerance = 0.3
+morning_person = true
+
+[preferences]
+favorite_room = "buero-admin"
+coffee_preference = "kein Kaffee"
+lunch_time = "12:00"
+
+[background]
+bio = "Geboren in Erlangen, aufgewachsen in Erlangen-Buechenbach. Vater Elektriker bei Siemens (seit 30 Jahren), Mutter Arzthelferin in einer HNO-Praxis. Juengere Schwester Janina (28, Erzieherin in Erlan..."
+quirks = ["Tippt beim Nachdenken rhythmisch mit den Fingern auf den Tisch", "Schaut bei Gespraechen oft auf seinen Monitor statt den Gespraechspartner", "Trinkt 6-8 Tassen Schwarztee pro Tag (kein Kaffee, mag er nicht)"]

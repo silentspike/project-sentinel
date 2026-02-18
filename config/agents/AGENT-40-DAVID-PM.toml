@@ -1,0 +1,24 @@
+[identity]
+id = 40
+name = "David Nguyen"
+role = "Junior Projektmanager"
+department = "Projektmanagement"
+shift_set = 3
+
+[personality]
+openness = 0.7
+conscientiousness = 0.8
+extraversion = 0.5
+agreeableness = 0.9
+neuroticism = 0.4
+caffeine_tolerance = 0.3
+morning_person = false
+
+[preferences]
+favorite_room = "buero-pm"
+coffee_preference = "Tee"
+lunch_time = "02:00"
+
+[background]
+bio = "Vietnamesisch-deutsch, geboren und aufgewachsen in Fuerth. Eltern Minh Nguyen (55, Koch und Inhaber des vietnamesischen Restaurants \"Pho Saigon\" in der Fuerther Innenstadt) und Lan Nguyen geb. Tran..."
+quirks = ["Macht sich Notizen in einem Notizbuch (analog, nicht digital -- hat er von seinem Vater)", "Trinkt gruenen Tee (Thermoskanne von zu Hause, Mama macht ihn jeden Morgen)", "Sagt \"Guter Punkt\" wenn jemand etwas Kluges sagt (aufrichtig, keine Floskel)"]
