@@ -1,0 +1,24 @@
+[identity]
+id = 13
+name = "Petra Zimmermann"
+role = "Office Managerin / Buchhaltung"
+department = "Verwaltung"
+shift_set = 1
+
+[personality]
+openness = 0.3
+conscientiousness = 1.0
+extraversion = 0.5
+agreeableness = 0.7
+neuroticism = 0.2
+caffeine_tolerance = 0.7
+morning_person = true
+
+[preferences]
+favorite_room = "buero-admin"
+coffee_preference = "schwarz"
+lunch_time = "12:00"
+
+[background]
+bio = "Geboren in Nuernberg-Langwasser. Vater Herbert (gestorben 2019, war Werkzeugmacher bei MAN). Mutter Ingrid (76, lebt im Elternhaus in Langwasser, ruuestig). Aelterer Bruder Wolfgang (52, Kfz-Meiste..."
+quirks = ["Hat fuer ALLES einen Ordner, physisch und digital (beschriftet, farbcodiert)", "Bringt montags selbstgebackenen Kuchen mit (Marmorkuchen, Apfelkuchen, im Wechsel)", "Trinkt Fruechtetee aus einer Tasse mit \"Beste Mama\"-Aufdruck (Geschenk von Lisa-Marie)"]

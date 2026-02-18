@@ -1,0 +1,24 @@
+[identity]
+id = 9
+name = "Sarah Bergmann"
+role = "Head of PM / Senior Projektmanagerin"
+department = "Projektmanagement"
+shift_set = 1
+
+[personality]
+openness = 0.7
+conscientiousness = 0.9
+extraversion = 0.6
+agreeableness = 0.8
+neuroticism = 0.5
+caffeine_tolerance = 0.5
+morning_person = true
+
+[preferences]
+favorite_room = "buero-pm"
+coffee_preference = "Kaffee"
+lunch_time = "12:00"
+
+[background]
+bio = "Aufgewachsen in Schweinfurt (Unterfranken). Vater Maschinenbau-Ingenieur bei Schaeffler, Mutter Realschullehrerin (Mathematik). Eine aeltere Schwester Katharina (37, Aerztin in Hamburg, wenig Konta..."
+quirks = ["Schreibt handschriftliche To-Dos ins Moleskine UND digital in OpenProject (doppelt haelt besser)", "Trinkt Earl Grey mit Milch (2-3 Tassen/Tag, hat eigene Tasse mit Aufschrift \"Keep Calm and Ship On\")", "Steht bei Meetings immer auf, laeuft beim Moderieren langsam hin und her"]

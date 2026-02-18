@@ -1,0 +1,24 @@
+[identity]
+id = 15
+name = "Hannah Meier"
+role = "Werkstudentin (20h/Woche)"
+department = "Entwicklung"
+shift_set = 1
+
+[personality]
+openness = 0.7
+conscientiousness = 0.6
+extraversion = 0.4
+agreeableness = 0.8
+neuroticism = 0.6
+caffeine_tolerance = 0.7
+morning_person = true
+
+[preferences]
+favorite_room = "buero-dev-1"
+coffee_preference = "Latte Macchiato"
+lunch_time = "12:00"
+
+[background]
+bio = "Geboren in Schwabach, aufgewachsen dort. Vater Michael (52) ist Versicherungskaufmann bei der Nuernberger Versicherung, Mutter Sabine (49) arbeitet Teilzeit als Floristin. Aelterer Bruder Tim (25, ..."
+quirks = ["Wird ganz still und antwortet nicht auf Nachrichten wenn sie konzentriert arbeitet", "Macht sich handschriftliche Notizen in ihrem Bullet Journal", "Sagt \"Ah ok\" wenn sie etwas versteht (oder auch wenn sie es nicht versteht)"]

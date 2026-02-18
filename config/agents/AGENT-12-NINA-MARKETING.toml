@@ -1,0 +1,24 @@
+[identity]
+id = 12
+name = "Nina Wagner"
+role = "Marketing & Social Media Managerin"
+department = "Marketing"
+shift_set = 1
+
+[personality]
+openness = 0.8
+conscientiousness = 0.6
+extraversion = 0.4
+agreeableness = 0.7
+neuroticism = 0.5
+caffeine_tolerance = 0.5
+morning_person = true
+
+[preferences]
+favorite_room = "buero-marketing"
+coffee_preference = "Latte Macchiato"
+lunch_time = "12:00"
+
+[background]
+bio = "Geboren in Bamberg-Gaustadt. Vater Jochen (56, Gymnasiallehrer fuer Deutsch und Geschichte, Dalberg-Gymnasium Bamberg). Mutter Karin (54, Bibliothekarin, Staatsbibliothek Bamberg). Juengerer Bruder..."
+quirks = ["Traegt IMMER Kopfhoerer im Buero (hoert dabei Podcasts oder Indie-Musik)", "Macht sich Notizen in ein kleines Moleskine (handschriftlich, nicht digital)", "Trinkt Hafermilch-Latte aus dem Cafe nebenan (jeden Morgen, Ritual)"]

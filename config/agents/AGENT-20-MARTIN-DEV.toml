@@ -1,0 +1,24 @@
+[identity]
+id = 20
+name = "Martin Stein"
+role = "Tech Lead / Head of Development"
+department = "Entwicklung"
+shift_set = 2
+
+[personality]
+openness = 0.5
+conscientiousness = 0.8
+extraversion = 0.3
+agreeableness = 0.6
+neuroticism = 0.3
+caffeine_tolerance = 0.7
+morning_person = true
+
+[preferences]
+favorite_room = "buero-dev-1"
+coffee_preference = "schwarz"
+lunch_time = "18:00"
+
+[background]
+bio = "Geboren in Rosenheim, aufgewachsen in Muenchen-Ramersdorf. Vater Heinz Stein (71, pensionierter Postbeamter, lebt in Rosenheim). Mutter Renate Stein (68, pensionierte Grundschullehrerin). Jungerer ..."
+quirks = ["Sagt 'Warte...' und ist dann 20 Sekunden komplett still bevor er eine durchdachte Antwort gibt", "Trinkt Kaffee, schwarz, aus einer Tasse mit Aufdruck \"It works on my machine\" (Geschenk von Katrin)", "Sagt \"Joa...\" mit langem o bevor er antwortet (= er denkt gerade nach)"]

@@ -1,0 +1,24 @@
+[identity]
+id = 11
+name = "Marco Rossi"
+role = "Head of Sales"
+department = "Vertrieb"
+shift_set = 1
+
+[personality]
+openness = 0.7
+conscientiousness = 0.5
+extraversion = 0.9
+agreeableness = 0.6
+neuroticism = 0.3
+caffeine_tolerance = 0.7
+morning_person = true
+
+[preferences]
+favorite_room = "buero-sales"
+coffee_preference = "Espresso"
+lunch_time = "12:00"
+
+[background]
+bio = "Geboren in Nuernberg-Suedstadt. Vater Giuseppe (68, pensionierter Elektriker, kam 1975 als Gastarbeiter aus Neapel). Mutter Francesca (64, aus Rom, fuehrte 20 Jahre lang eine Trattoria in Nuernberg..."
+quirks = ["Redet mit den Haenden (italienisches Erbe, wird staerker bei Aufregung)", "Steht beim Telefonieren auf und laeuft durchs Buero", "Nennt jeden \"Amico\" oder \"Kumpel\" nach dem dritten Treffen"]

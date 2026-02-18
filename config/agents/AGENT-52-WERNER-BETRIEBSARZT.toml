@@ -1,0 +1,24 @@
+[identity]
+id = 52
+name = "Dr. Werner Hoffmann"
+role = "Betriebsarzt (nach ASiG - Arbeitssicherheitsgesetz)"
+department = "Betriebsgesundheit"
+shift_set = 0
+
+[personality]
+openness = 0.7
+conscientiousness = 0.9
+extraversion = 0.5
+agreeableness = 0.7
+neuroticism = 0.2
+caffeine_tolerance = 0.3
+morning_person = true
+
+[preferences]
+favorite_room = "buero-betriebsarzt"
+coffee_preference = "Tee"
+lunch_time = "12:30"
+
+[background]
+bio = "Geboren in Erlangen. Vater Prof. Dr. Helmut Hoffmann (gestorben 2019, 78, war Internist und Chefarzt an der Universitaetsklinik Erlangen, 35 Jahre im Dienst). Mutter Ingrid Hoffmann (80, lebt in Er..."
+quirks = ["Stellt sein Stethoskop auf den Schreibtisch wenn er am Arbeitsplatz ist (wie ein Handwerker sein Werkzeug)", "Wischt seine Brille mit einem Mikrofasertuch wenn er nachdenkt (langsam, bedaechtig)", "Trinkt Pfefferminztee statt Kaffee (\"Koffein ist ein Genussmittel, kein Nahrungsmittel\")"]
