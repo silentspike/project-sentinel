@@ -132,7 +132,7 @@ func (p *ClaudeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 	httpReq.Header.Set("x-api-key", p.apiKey)
 	httpReq.Header.Set("anthropic-version", anthropicVersion)
 
-	resp, err := p.client.Do(httpReq)
+	resp, err := p.client.Do(httpReq) //nolint:gosec // URL from trusted config
 	if err != nil {
 		return nil, fmt.Errorf("claude API call: %w", err)
 	}
@@ -179,7 +179,7 @@ func (p *ClaudeProvider) HealthCheck(ctx context.Context) error {
 	httpReq.Header.Set("x-api-key", p.apiKey)
 	httpReq.Header.Set("anthropic-version", anthropicVersion)
 
-	resp, err := p.client.Do(httpReq)
+	resp, err := p.client.Do(httpReq) //nolint:gosec // URL from trusted config
 	if err != nil {
 		return fmt.Errorf("claude health check: %w", err)
 	}
