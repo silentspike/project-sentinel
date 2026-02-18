@@ -3550,6 +3550,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-fs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "criterion",
+ "redb",
+ "sentinel-common",
+ "sentinel-telemetry",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
 name = "sentinel-hippocampus"
 version = "0.1.0"
 dependencies = [
