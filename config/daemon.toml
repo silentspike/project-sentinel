@@ -1,0 +1,6 @@
+[daemon]
+config_dir = "/opt/sentinel/config"
+data_dir = "/opt/sentinel/data"
+tick_rate_ms = 1000
+max_agents = 15
+zenoh_prefix = "sentinel"
