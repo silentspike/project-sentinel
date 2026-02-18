@@ -197,12 +197,12 @@ func (h *Handler) handleReport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(data)
+		_, _ = w.Write(data) //nolint:gosec // data from internal report generator
 
 	case "markdown":
 		md := report.GenerateMarkdown(filter)
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
-		_, _ = fmt.Fprint(w, md)
+		_, _ = fmt.Fprint(w, md) //nolint:gosec // markdown from internal report generator
 
 	default:
 		http.Error(w, "format must be 'json' or 'markdown'", http.StatusBadRequest)

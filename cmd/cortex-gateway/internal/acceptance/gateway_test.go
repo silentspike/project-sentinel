@@ -111,7 +111,7 @@ func TestAC_13_04_ClaudeProviderRequest(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := proxy.NewClaudeProvider(proxy.ProviderConfig{
+	p := proxy.NewClaudeProvider(proxy.ProviderConfig{ //nolint:gosec // G101: test credential, not real
 		Name:    "claude-test",
 		BaseURL: server.URL,
 		APIKey:  "sk-test-key-123",

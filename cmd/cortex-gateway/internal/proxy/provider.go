@@ -41,7 +41,7 @@ type ProviderConfig struct {
 	Name      string `toml:"name"`
 	Type      string `toml:"type"` // "claude" or "ollama"
 	BaseURL   string `toml:"base_url"`
-	APIKey    string `toml:"api_key"` // From env var, not config file
+	APIKey    string `toml:"api_key"` //nolint:gosec // field name, not a credential
 	Model     string `toml:"model"`
 	MaxTokens int    `toml:"max_tokens"`
 	Priority  int    `toml:"priority"` // Lower = higher priority
