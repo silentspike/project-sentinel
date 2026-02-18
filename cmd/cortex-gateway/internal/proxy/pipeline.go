@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -24,8 +25,14 @@ import (
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
 )
 
-// Provider-Deadline: maximale Wartezeit pro LLM-Call.
+// defaultProviderDeadline ist die maximale Wartezeit pro LLM-Call (ENV-konfigurierbar).
 const defaultProviderDeadline = 20 * time.Second
+
+// minProviderDeadline und maxProviderDeadline begrenzen den konfigurierbaren Bereich.
+const (
+	minProviderDeadline = 10 * time.Second
+	maxProviderDeadline = 30 * time.Second
+)
 
 // maxRegenAttempts limitiert Fourth-Wall Re-Generierungs-Versuche.
 const maxRegenAttempts = 2
@@ -46,31 +53,52 @@ var (
 		Name: "sentinel_circuit_breaker_state",
 		Help: "Circuit breaker state (0=closed, 1=open, 2=half-open)",
 	}, []string{"provider"})
+
+	breakerTripsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sentinel_breaker_trips_total",
+		Help: "Total circuit breaker trips to open state by provider",
+	}, []string{"provider"})
 )
 
 // PipelineConfig haelt alle Abhaengigkeiten fuer den PipelineHandler.
 type PipelineConfig struct {
-	Registry     *Registry
-	Config       *control.Config
-	Compiler     *compiler.Compiler
-	Normalizer   *normalizer.Normalizer
-	Extractor    *extraction.Extractor
-	Capabilities *capability.ProviderCapabilities
-	Logger       *slog.Logger
-	BreakerCfg   BreakerConfig
-	EventStore   *eventstore.Store // optional: nil disables event persistence
+	Registry         *Registry
+	Config           *control.Config
+	Compiler         *compiler.Compiler
+	Normalizer       *normalizer.Normalizer
+	Extractor        *extraction.Extractor
+	Capabilities     *capability.ProviderCapabilities
+	Logger           *slog.Logger
+	BreakerCfg       BreakerConfig
+	EventStore       *eventstore.Store // optional: nil disables event persistence
+	ProviderDeadline time.Duration     // 0 = defaultProviderDeadline (20s)
+}
+
+// ProviderDeadlineFromEnv liest die Provider-Deadline aus ENV.
+// Range: 10-30s, Default: 20s.
+func ProviderDeadlineFromEnv() time.Duration {
+	v := os.Getenv("SENTINEL_CORTEX_PROVIDER_DEADLINE_SECONDS")
+	if v == "" {
+		return defaultProviderDeadline
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 10 || n > 30 {
+		return defaultProviderDeadline
+	}
+	return time.Duration(n) * time.Second
 }
 
 // PipelineHandler orchestriert die 7-Step LLM-Pipeline.
 type PipelineHandler struct {
-	registry   *Registry
-	config     *control.Config
-	compiler   *compiler.Compiler
-	norm       *normalizer.Normalizer
-	ext        *extraction.Extractor
-	caps       *capability.ProviderCapabilities
-	logger     *slog.Logger
-	eventStore *eventstore.Store
+	registry         *Registry
+	config           *control.Config
+	compiler         *compiler.Compiler
+	norm             *normalizer.Normalizer
+	ext              *extraction.Extractor
+	caps             *capability.ProviderCapabilities
+	logger           *slog.Logger
+	eventStore       *eventstore.Store
+	providerDeadline time.Duration
 
 	breakerMu  sync.RWMutex
 	breakers   map[string]*CircuitBreaker
@@ -90,17 +118,22 @@ type PipelineResponse struct {
 
 // NewPipelineHandler erstellt den Pipeline-Handler.
 func NewPipelineHandler(cfg PipelineConfig) *PipelineHandler {
+	deadline := cfg.ProviderDeadline
+	if deadline == 0 {
+		deadline = defaultProviderDeadline
+	}
 	return &PipelineHandler{
-		registry:   cfg.Registry,
-		config:     cfg.Config,
-		compiler:   cfg.Compiler,
-		norm:       cfg.Normalizer,
-		ext:        cfg.Extractor,
-		caps:       cfg.Capabilities,
-		logger:     cfg.Logger,
-		eventStore: cfg.EventStore,
-		breakers:   make(map[string]*CircuitBreaker),
-		breakerCfg: cfg.BreakerCfg,
+		registry:         cfg.Registry,
+		config:           cfg.Config,
+		compiler:         cfg.Compiler,
+		norm:             cfg.Normalizer,
+		ext:              cfg.Extractor,
+		caps:             cfg.Capabilities,
+		logger:           cfg.Logger,
+		eventStore:       cfg.EventStore,
+		providerDeadline: deadline,
+		breakers:         make(map[string]*CircuitBreaker),
+		breakerCfg:       cfg.BreakerCfg,
 	}
 }
 
@@ -209,11 +242,17 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// --- Step 6: Provider.Send() mit Deadline ---
-	ctx, cancel := context.WithTimeout(r.Context(), defaultProviderDeadline)
+	ctx, cancel := context.WithTimeout(r.Context(), ph.providerDeadline)
 	defer cancel()
 
+	prevState := breaker.State()
 	resp, err := provider.Send(ctx, &req)
 	breaker.Record(err)
+
+	// Track breaker trips (Closed/HalfOpen → Open)
+	if newState := breaker.State(); newState == "open" && prevState != "open" {
+		breakerTripsTotal.WithLabelValues(providerName).Inc()
+	}
 
 	if err != nil {
 		duration := time.Since(start)
