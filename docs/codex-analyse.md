@@ -483,7 +483,42 @@ Im Skill klarstellen:
 **Artefakte:**
 - Benchmark-Code: `services/sentinel-nightrun/benches/nightrun_bench.rs`
 
+### Phase D: tmpfs Benchmarks (Issue #28 vm-deploy)
+
+**Datum:** 2026-02-18
+**Umgebung:** VM 10.0.0.240 (Proxmox/KVM, 12 Cores, 24GB RAM)
+**Methodik:** `TMPDIR=/ram/sentinel/bench` (4GB tmpfs), alle 7 Suiten via `cargo bench`
+
+| Suite | Metrik | Phase C (Disk) | Phase D (tmpfs) | Delta |
+|-------|--------|---------------|-----------------|-------|
+| **hippocampus** | consolidate_54_agents | ~586ms | 4.26ms | **-99.3%** |
+| **hippocampus** | record_batch_54_agents | ~400ms | 1.70ms | **-99.6%** |
+| **hippocampus** | retrieve_all | ~628us | 616us | -1.6% (noise) |
+| **nightrun** | pipeline (large) | ~194ms | 3.98ms | **-97.9%** |
+| **nightrun** | consolidate | ~31ms | 0.87ms | **-97.2%** |
+| **nightrun** | job_enqueue | ~224us | 103us | **-53.7%** |
+| **projection** | event_processing_10k | ~327ms | 190ms | **-41.7%** |
+| **projection** | rebuild_10k_events | ~299ms | 191ms | **-34.2%** |
+| **projection** | offset_write | ~204us | 21us | **-89.7%** |
+| **runtime** | spawn_agent_with_event | ~1120us | 19.3us | **-98.3%** |
+| **runtime** | save_state/15 | ~850us | 44.5us | **-95.2%** |
+| **runtime** | save_state/50 | ~2250us | 65.2us | **-97.1%** |
+| **runtime** | pause_resume_with_event | ~376us | 39.4us | **-89.5%** |
+| **limbo** | append_event | ~39us | 39.3us | ~0% (noise) |
+| **limbo** | append_with_outbox | ~55us | 54.0us | -2.2% |
+| **limbo** | get_events_since/500 | ~507us | 476us | -6.3% |
+| **sandbox** | cgroup_create_remove | ~186us | 186us | ~0% (noise) |
+| **wasm** | tool_execution_p50 | ~5.8us | 8.0us | +38% (CPU-bound, HW-diff) |
+
+**Analyse:**
+- **redb-basierte Crates** (hippocampus, runtime save_state): Massive Gewinne (-93% bis -99.6%). mmap auf tmpfs eliminiert fsync und Disk-I/O vollstaendig.
+- **SQLite-basierte Crates** (nightrun, projection): Grosse Gewinne (-34% bis -98%). fdatasync auf tmpfs ist ein no-op.
+- **limbo (EventStore)**: Minimal (SQLite WAL bereits effizient, einzelne appends kaum I/O-bound).
+- **CPU-bound Crates** (wasm, sandbox): Keine signifikante Aenderung, wie erwartet.
+- **Fazit:** tmpfs als Hot-Tier fuer Working-State ist der wichtigste einzelne Performance-Hebel. Fuer die NVMe-DRAM-lose Samsung 980 ist das existenziell.
+
 ### Update-Log
+- 2026-02-18: Phase D tmpfs Benchmarks (Issue #28): 7 Suiten auf VM 10.0.0.240 mit TMPDIR=/ram/sentinel/bench. Hippocampus -99.3%, Nightrun -97.9%, Runtime save_state -95%, Projection -42%. tmpfs als Hot-Tier validiert.
 - 2026-02-16: Benchmark-Governance etabliert (Two-Tier Architektur). 20 offene Issues mit ## Benchmarks Sektion versehen. CI Quality Gates (issue-quality.yml, pr-quality.yml) um Benchmarks-Pflichtsektion erweitert.
 - 2026-02-16: Nightrun Benchmark (Issue #17): 9 Benchmarks auf Build-Server. Pipeline 15 Agents 82.9ms, Job-Queue 54 Jobs 3.91ms, Shift-Detection 7ns.
 - 2026-02-15: Hippocampus Persistent Memory Benchmark (Issue #23): 40+ Benchmarks auf VM 10.0.0.240. Production 54-Agent Consolidate 586ms, Retrieve-Sweep 605us, DB-Size 532KB.

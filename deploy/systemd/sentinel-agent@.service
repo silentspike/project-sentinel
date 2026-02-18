@@ -1,0 +1,27 @@
+[Unit]
+Description=Sentinel Agent %i
+Documentation=https://github.com/obtFusi/project-sentinel/issues/28
+After=sentinel-cortex.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel-agent --agent-id %i
+Restart=on-failure
+RestartSec=5
+MemoryMax=256M
+CPUQuota=100%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-agent-%i
+
+# Security Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/sentinel/data
+PrivateTmp=true
+
+[Install]
+WantedBy=sentinel.target
