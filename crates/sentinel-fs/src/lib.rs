@@ -4,5 +4,6 @@
 //! Architecture: CAS Store (blobs) + redb Metadata + Layer Manager (base/agent CoW) + FUSE.
 
 pub mod cas;
+pub mod fuse;
 pub mod layer;
 pub mod metadata;

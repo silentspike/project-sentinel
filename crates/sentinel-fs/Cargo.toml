@@ -8,7 +8,7 @@ publish = false
 [features]
 default = ["telemetry"]
 telemetry = ["sentinel-telemetry/telemetry"]
-fuse-tests = []
+fuse-tests = ["fuser", "libc"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -19,6 +19,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
+fuser = { version = "0.15", optional = true }
+libc = { version = "0.2", optional = true }
 zstd = "0.13"
 
 [dev-dependencies]
