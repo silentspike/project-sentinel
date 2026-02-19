@@ -14,6 +14,7 @@ import (
 
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/compiler"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/guardrails"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/eventstore"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
@@ -94,7 +95,22 @@ func main() {
 		logger.Info("event store disabled (SENTINEL_CORTEX_EVENT_STORE_PATH not set)")
 	}
 
-	// 4c. Observatory (optional, enabled via config or SENTINEL_OBSERVATORY env)
+	// 4c. Guardrails (optional, enabled via SENTINEL_GUARDRAILS_ENABLED)
+	var guardrailsEnforcer *guardrails.Enforcer
+	guardrailsCfg := guardrails.ConfigFromEnv()
+	if guardrailsCfg.Enabled {
+		guardrailsEnforcer = guardrails.New(guardrailsCfg)
+		logger.Info("guardrails enabled",
+			"rate_agent_rpm", guardrailsCfg.RateLimitPerAgent,
+			"rate_global_rpm", guardrailsCfg.RateLimitGlobal,
+			"budget_hourly", guardrailsCfg.BudgetHourlyTokens,
+			"budget_daily", guardrailsCfg.BudgetDailyTokens,
+		)
+	} else {
+		logger.Info("guardrails disabled (SENTINEL_GUARDRAILS_ENABLED not set)")
+	}
+
+	// 4d. Observatory (optional, enabled via config or SENTINEL_OBSERVATORY env)
 	var obsHandler *observatory.Handler
 	obsConfigPath := envOrDefault("SENTINEL_OBSERVATORY_CONFIG", "config/observatory.toml")
 	obsCfg, obsErr := observatory.LoadConfig(obsConfigPath)
@@ -126,6 +142,7 @@ func main() {
 		Logger:           logger,
 		BreakerCfg:       proxy.BreakerConfigFromEnv(),
 		EventStore:       evStore,
+		Guardrails:       guardrailsEnforcer,
 		ProviderDeadline: providerDeadline,
 	})
 
@@ -148,7 +165,13 @@ func main() {
 	controlPlane := control.NewPlane(controlConfig, logger)
 	controlMux := controlPlane.Handler()
 
-	// 7b. Register observatory routes on control plane (if enabled)
+	// 7b. Register guardrails routes on control plane (if enabled)
+	if guardrailsEnforcer != nil {
+		guardrailsHandler := guardrails.NewHandler(guardrailsEnforcer)
+		guardrailsHandler.RegisterRoutes(controlMux)
+	}
+
+	// 7c. Register observatory routes on control plane (if enabled)
 	if obsHandler != nil {
 		obsHandler.RegisterRoutes(controlMux)
 	}

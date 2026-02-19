@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **LLM Guardrails: Cost & Throughput Limits** (#59)
+  - Token-bucket rate limiter with per-agent and global limits (configurable RPM)
+  - Budget tracker with hourly/daily token limits and automatic window reset
+  - Cost tracker with per-provider pricing (USD/1M tokens)
+  - Automatic fallback to Ollama when cloud budget is exhausted
+  - Enforcer facade combining rate limiter, budget, cost, and fallback
+  - Pipeline integration: pre-flight Check() + post-call Record()
+  - Dashboard endpoint: GET /api/guardrails/status (budget, cost, rate info)
+  - Prometheus metrics: sentinel_tokens_total, sentinel_cost_usd_total, sentinel_rate_limited_total, sentinel_budget_used_tokens
+  - LLMResponse extended with InputTokens/OutputTokens for accurate cost tracking
+  - Environment-based configuration (SENTINEL_GUARDRAILS_*)
+  - 46 tests, 5 benchmarks (EnforcerCheck <500ns, RateLimitCheck <300ns)
 - **Prompt Compiler: 3-Source Assembly** (#58)
   - TOML DNA loader with in-memory cache (Big Five, Bio, Quirks)
   - Evolution data integration from redb (Voice Style, Behavioral Notes, Narrative, Relationships)
