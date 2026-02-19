@@ -28,6 +28,12 @@ enable_fourth_wall_detection = true
 enable_perception_injection = true
 enable_action_extraction = true
 
+[compiler]
+agent_config_dir = "config/agents"
+enable_cache_ordering = true
+enable_distillation = true
+distillation_max_tokens = 2000
+
 [metrics]
 enabled = true
 path = "/metrics"

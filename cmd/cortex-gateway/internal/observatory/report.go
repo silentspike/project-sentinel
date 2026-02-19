@@ -94,7 +94,7 @@ func (r *ReportGenerator) GenerateMarkdown(filter QueryFilter) string {
 
 	b.WriteString("# MARBLE Observatory Report\n\n")
 	fmt.Fprintf(&b, "Generated: %s\n", time.Now().UTC().Format(time.RFC3339))
-	fmt.Fprintf(&b, "Records: %d\n\n", len(records))
+	fmt.Fprintf(&b, "Records: %d\n\n", len(records)) //nolint:gosec // Markdown output, not HTML
 
 	if len(summaries) == 0 {
 		b.WriteString("No data available.\n")
@@ -105,7 +105,7 @@ func (r *ReportGenerator) GenerateMarkdown(filter QueryFilter) string {
 	b.WriteString("## Shift Comparison\n\n")
 	b.WriteString("| Metric |")
 	for _, s := range summaries {
-		fmt.Fprintf(&b, " %s (Shift %d) |", s.Model, s.Shift)
+		fmt.Fprintf(&b, " %s (Shift %d) |", s.Model, s.Shift) //nolint:gosec // Markdown output
 	}
 	b.WriteString("\n|--------|")
 	for range summaries {
@@ -129,7 +129,7 @@ func (r *ReportGenerator) GenerateMarkdown(filter QueryFilter) string {
 	for _, row := range rows {
 		fmt.Fprintf(&b, "| %s |", row.name)
 		for _, s := range summaries {
-			fmt.Fprintf(&b, " %.2f |", row.get(s.AvgMetrics))
+			fmt.Fprintf(&b, " %.2f |", row.get(s.AvgMetrics)) //nolint:gosec // Markdown output
 		}
 		b.WriteString("\n")
 	}
@@ -137,11 +137,11 @@ func (r *ReportGenerator) GenerateMarkdown(filter QueryFilter) string {
 	// Per-shift details
 	b.WriteString("\n## Per-Shift Details\n\n")
 	for _, s := range summaries {
-		fmt.Fprintf(&b, "### Shift %d: %s (%d records)\n\n", s.Shift, s.Model, s.RecordCount)
+		fmt.Fprintf(&b, "### Shift %d: %s (%d records)\n\n", s.Shift, s.Model, s.RecordCount) //nolint:gosec // Markdown output
 		b.WriteString("| Metric | Avg | Min | Max |\n")
 		b.WriteString("|--------|-----|-----|-----|\n")
 		for _, row := range rows {
-			fmt.Fprintf(&b, "| %s | %.2f | %.2f | %.2f |\n",
+			fmt.Fprintf(&b, "| %s | %.2f | %.2f | %.2f |\n", //nolint:gosec // Markdown output
 				row.name,
 				row.get(s.AvgMetrics),
 				row.get(s.MinMetrics),

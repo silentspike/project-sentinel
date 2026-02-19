@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"unicode/utf8"
+
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
 )
 
 // PromptConfig defines how to compile a prompt for a specific model.
@@ -39,8 +41,9 @@ var DefaultConfigs = map[string]PromptConfig{
 
 // Compiler creates model-optimized prompts.
 type Compiler struct {
-	mu      sync.RWMutex
-	configs map[string]PromptConfig
+	mu        sync.RWMutex
+	configs   map[string]PromptConfig
+	assembler *Assembler
 }
 
 // New creates a new Compiler with default configurations.
@@ -50,6 +53,18 @@ func New() *Compiler {
 		configs[k] = v
 	}
 	return &Compiler{configs: configs}
+}
+
+// NewWithAssembler creates a Compiler with 3-source assembly support.
+func NewWithAssembler(loader *TOMLLoader, caps *capability.ProviderCapabilities) *Compiler {
+	configs := make(map[string]PromptConfig, len(DefaultConfigs))
+	for k, v := range DefaultConfigs {
+		configs[k] = v
+	}
+	return &Compiler{
+		configs:   configs,
+		assembler: NewAssembler(loader, caps),
+	}
 }
 
 // Compile creates a model-optimized system prompt.
@@ -102,6 +117,57 @@ func truncateUTF8(s string, maxBytes int) string {
 		maxBytes--
 	}
 	return s[:maxBytes]
+}
+
+// CompileFromSources creates a prompt using the 3-source assembly pipeline.
+// Falls back to the basic Compile() if assembler is not configured.
+func (c *Compiler) CompileFromSources(agentID int, providerName string, evolution EvolutionData, perception string) (string, error) {
+	if c.assembler == nil {
+		return "", fmt.Errorf("assembler not configured, use NewWithAssembler")
+	}
+
+	blocks, err := c.assembler.Assemble(agentID, providerName, evolution, perception)
+	if err != nil {
+		return "", fmt.Errorf("assemble prompt: %w", err)
+	}
+
+	// Distill for small models
+	c.mu.RLock()
+	modelKey := providerModelKey(providerName)
+	cfg, ok := c.configs[modelKey]
+	if !ok {
+		cfg = c.configs["claude"]
+	}
+	c.mu.RUnlock()
+
+	if cfg.SystemPromptMax > 0 && cfg.SystemPromptMax < 8000 {
+		blocks = Distill(blocks, cfg.SystemPromptMax/4) // chars to ~tokens
+	}
+
+	// Order for cache optimization
+	blocks = OrderForCache(blocks)
+
+	// Format for provider
+	result := FormatForProvider(blocks, providerName, c.assembler.caps)
+
+	// Truncate if needed
+	if cfg.SystemPromptMax > 0 && len(result) > cfg.SystemPromptMax {
+		result = truncateUTF8(result, cfg.SystemPromptMax)
+	}
+
+	return result, nil
+}
+
+// providerModelKey maps provider names to compiler config keys.
+func providerModelKey(providerName string) string {
+	switch providerName {
+	case "claude":
+		return "claude"
+	case "ollama":
+		return "ollama-7b"
+	default:
+		return "claude"
+	}
 }
 
 // SetConfig allows runtime configuration changes for a model.
