@@ -139,6 +139,8 @@ func (p *OllamaProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 		Content:      oResp.Message.Content,
 		Model:        oResp.Model,
 		TokensUsed:   oResp.PromptEvalCount + oResp.EvalCount,
+		InputTokens:  oResp.PromptEvalCount,
+		OutputTokens: oResp.EvalCount,
 		FinishReason: oResp.DoneReason,
 	}, nil
 }
