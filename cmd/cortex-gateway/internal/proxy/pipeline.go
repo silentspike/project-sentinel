@@ -223,12 +223,10 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ph.updateBreakerGauge(providerName, breaker)
 
 	// --- Step 3b: Guardrails Check ---
-	if ph.guardrails != nil {
-		var rejected bool
-		provider, providerName, rejected = ph.applyGuardrails(w, &req, snap.MaxTokens, provider, providerName)
-		if rejected {
-			return
-		}
+	var guardrailsRejected bool
+	provider, providerName, guardrailsRejected = ph.applyGuardrails(w, &req, snap.MaxTokens, provider, providerName)
+	if guardrailsRejected {
+		return
 	}
 
 	// --- Step 4: Config-Werte anwenden ---
@@ -348,7 +346,11 @@ func (ph *PipelineHandler) buildSystemPrompt(req *LLMRequest, agentName, agentRo
 
 // applyGuardrails runs rate-limit and budget checks. Returns the (possibly replaced)
 // provider/name and whether the request was rejected (HTTP 429 already sent).
+// Safe to call when guardrails is nil (returns inputs unchanged).
 func (ph *PipelineHandler) applyGuardrails(w http.ResponseWriter, req *LLMRequest, maxTokens int, provider Provider, providerName string) (Provider, string, bool) {
+	if ph.guardrails == nil {
+		return provider, providerName, false
+	}
 	agentID := req.Metadata["agent_id"]
 	result := ph.guardrails.Check(agentID, maxTokens)
 	if result.RateLimited {

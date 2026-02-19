@@ -1,7 +1,6 @@
 package guardrails
 
 import (
-	"os"
 	"testing"
 )
 
@@ -39,7 +38,7 @@ func TestConfigFromEnv_Defaults(t *testing.T) {
 		"SENTINEL_GUARDRAILS_BURST_MULTIPLE",
 		"SENTINEL_GUARDRAILS_FALLBACK",
 	} {
-		os.Unsetenv(key)
+		t.Setenv(key, "") // t.Setenv restores after test
 	}
 
 	cfg := ConfigFromEnv()
