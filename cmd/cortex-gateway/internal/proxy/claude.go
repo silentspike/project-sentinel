@@ -163,6 +163,8 @@ func (p *ClaudeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 		Content:      content,
 		Model:        cResp.Model,
 		TokensUsed:   cResp.Usage.InputTokens + cResp.Usage.OutputTokens,
+		InputTokens:  cResp.Usage.InputTokens,
+		OutputTokens: cResp.Usage.OutputTokens,
 		FinishReason: cResp.StopReason,
 	}, nil
 }

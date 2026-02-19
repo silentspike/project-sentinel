@@ -34,6 +34,24 @@ enable_cache_ordering = true
 enable_distillation = true
 distillation_max_tokens = 2000
 
+[guardrails]
+# Enable via SENTINEL_GUARDRAILS_ENABLED=true env var
+enabled = false
+budget_hourly_tokens = 5000000   # 5M tokens/hour
+budget_daily_tokens = 50000000   # 50M tokens/day
+rate_limit_per_agent_rpm = 20    # 20 calls/min per agent
+rate_limit_global_rpm = 300      # 300 calls/min global
+burst_multiple = 2
+fallback_provider = "ollama"
+
+[guardrails.provider_prices.claude]
+input_price_per_m_token = 3.0    # USD per 1M input tokens
+output_price_per_m_token = 15.0  # USD per 1M output tokens
+
+[guardrails.provider_prices.ollama]
+input_price_per_m_token = 0.0
+output_price_per_m_token = 0.0
+
 [metrics]
 enabled = true
 path = "/metrics"

@@ -17,6 +17,7 @@ import (
 
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/compiler"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/guardrails"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/detection"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/eventstore"
@@ -64,8 +65,9 @@ type PipelineConfig struct {
 	Capabilities     *capability.ProviderCapabilities
 	Logger           *slog.Logger
 	BreakerCfg       BreakerConfig
-	EventStore       *eventstore.Store // optional: nil disables event persistence
-	ProviderDeadline time.Duration     // 0 = defaultProviderDeadline (20s)
+	EventStore       *eventstore.Store    // optional: nil disables event persistence
+	Guardrails       *guardrails.Enforcer // optional: nil disables guardrails
+	ProviderDeadline time.Duration        // 0 = defaultProviderDeadline (20s)
 }
 
 // ProviderDeadlineFromEnv liest die Provider-Deadline aus ENV.
@@ -92,6 +94,7 @@ type PipelineHandler struct {
 	caps             *capability.ProviderCapabilities
 	logger           *slog.Logger
 	eventStore       *eventstore.Store
+	guardrails       *guardrails.Enforcer
 	providerDeadline time.Duration
 
 	breakerMu  sync.RWMutex
@@ -125,6 +128,7 @@ func NewPipelineHandler(cfg PipelineConfig) *PipelineHandler {
 		caps:             cfg.Capabilities,
 		logger:           cfg.Logger,
 		eventStore:       cfg.EventStore,
+		guardrails:       cfg.Guardrails,
 		providerDeadline: deadline,
 		breakers:         make(map[string]*CircuitBreaker),
 		breakerCfg:       cfg.BreakerCfg,
@@ -218,6 +222,22 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	ph.updateBreakerGauge(providerName, breaker)
 
+	// --- Step 3b: Guardrails Check ---
+	if ph.guardrails != nil {
+		agentID := req.Metadata["agent_id"]
+		result := ph.guardrails.Check(agentID, snap.MaxTokens)
+		if result.RateLimited {
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+		if result.BudgetExhausted && result.FallbackProvider != "" {
+			if fbProvider, ok := ph.registry.Get(result.FallbackProvider); ok {
+				provider = fbProvider
+				providerName = result.FallbackProvider
+			}
+		}
+	}
+
 	// --- Step 4: Config-Werte anwenden ---
 	req.Temperature = snap.Temperature
 	if snap.MaxTokens > 0 {
@@ -259,6 +279,11 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		)
 		http.Error(w, "provider request failed", http.StatusBadGateway)
 		return
+	}
+
+	// --- Step 6b: Guardrails Record ---
+	if ph.guardrails != nil {
+		ph.guardrails.Record(providerName, resp.InputTokens, resp.OutputTokens)
 	}
 
 	// --- Step 7: Fourth-Wall Detection ---
