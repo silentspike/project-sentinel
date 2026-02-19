@@ -224,15 +224,15 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		req.MaxTokens = snap.MaxTokens
 	}
 
-	// --- Step 5: Perception Injection ---
+	// --- Step 5: Perception Injection (3-Source Assembly) ---
 	agentName := req.Metadata["agent_name"]
 	agentRole := req.Metadata["agent_role"]
-	perception := req.Metadata["perception"]
 
-	if perception != "" && agentName != "" {
-		modelKey := ph.modelKey(providerName)
-		systemPrompt := ph.compiler.Compile(modelKey, agentName, agentRole, perception)
-		req.Messages = prependSystemMessage(req.Messages, systemPrompt)
+	if agentName != "" {
+		systemPrompt := ph.buildSystemPrompt(&req, agentName, agentRole, providerName)
+		if systemPrompt != "" {
+			req.Messages = prependSystemMessage(req.Messages, systemPrompt)
+		}
 	}
 
 	// --- Step 6: Provider.Send() mit Deadline ---
@@ -299,6 +299,33 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(pipelineResp); err != nil {
 		ph.logger.Error("failed to encode response", "error", err)
 	}
+}
+
+// buildSystemPrompt assembles the system prompt via 3-source assembly or fallback.
+func (ph *PipelineHandler) buildSystemPrompt(req *LLMRequest, agentName, agentRole, providerName string) string {
+	perception := req.Metadata["perception"]
+	agentIDStr := req.Metadata["agent_id"]
+	agentID, parseErr := strconv.Atoi(agentIDStr)
+
+	if parseErr == nil && agentID > 0 {
+		evolution := compiler.EvolutionFromMetadata(req.Metadata)
+		compiled, compileErr := ph.compiler.CompileFromSources(agentID, providerName, evolution, perception)
+		if compileErr != nil {
+			ph.logger.Warn("3-source assembly failed, using fallback",
+				"agent_id", agentID,
+				"error", compileErr,
+			)
+			modelKey := ph.modelKey(providerName)
+			return ph.compiler.Compile(modelKey, agentName, agentRole, perception)
+		}
+		return compiled
+	}
+
+	if perception != "" {
+		modelKey := ph.modelKey(providerName)
+		return ph.compiler.Compile(modelKey, agentName, agentRole, perception)
+	}
+	return ""
 }
 
 // resolveProvider holt den Provider nach Name, mit Fallback auf Primary.
