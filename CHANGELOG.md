@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New `CompileFromSources()` entry point with fallback to basic `Compile()`
   - Pipeline Step 5 upgraded to 3-source assembly with automatic fallback
   - 52 compiler tests, 23 capability tests, 6 benchmarks (Assembly: <5µs)
+- `sentinel-fs` crate: CAS-FUSE agent filesystem with SHA-256 dedup and zstd compression (#56)
+  - Content-Addressed Storage (CAS) with atomic writes, 2-char prefix subdirs, zstd level-3 compression
+  - redb metadata store with agent-scoped composite keys (FS_INODES, FS_DIRENTS, CAS_REFCOUNT)
+  - Layer manager: shared base (readonly) + per-agent CoW layers with whiteout markers
+  - FUSE handler (feature-gated): single mount for all agents, path-based Agent-ID extraction
+  - CLI: stats, gc, populate commands
+  - 49 tests (unit + integration), 7 criterion benchmarks
+  - Integration tests verify >87% dedup rate, agent isolation, crash recovery
 - `OutboxPublisher<T>` background task: polls outbox entries and publishes via generic `OutboxTransport` trait
 - `OutboxTransport` trait in sentinel-limbo for transport abstraction (no zenoh dependency)
 - `OutboxPublisherConfig` with env-based configuration (`SENTINEL_OUTBOX_POLL_INTERVAL_MS`, `SENTINEL_OUTBOX_BATCH_SIZE`)
