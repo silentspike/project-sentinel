@@ -224,17 +224,10 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// --- Step 3b: Guardrails Check ---
 	if ph.guardrails != nil {
-		agentID := req.Metadata["agent_id"]
-		result := ph.guardrails.Check(agentID, snap.MaxTokens)
-		if result.RateLimited {
-			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		var rejected bool
+		provider, providerName, rejected = ph.applyGuardrails(w, &req, snap.MaxTokens, provider, providerName)
+		if rejected {
 			return
-		}
-		if result.BudgetExhausted && result.FallbackProvider != "" {
-			if fbProvider, ok := ph.registry.Get(result.FallbackProvider); ok {
-				provider = fbProvider
-				providerName = result.FallbackProvider
-			}
 		}
 	}
 
@@ -351,6 +344,23 @@ func (ph *PipelineHandler) buildSystemPrompt(req *LLMRequest, agentName, agentRo
 		return ph.compiler.Compile(modelKey, agentName, agentRole, perception)
 	}
 	return ""
+}
+
+// applyGuardrails runs rate-limit and budget checks. Returns the (possibly replaced)
+// provider/name and whether the request was rejected (HTTP 429 already sent).
+func (ph *PipelineHandler) applyGuardrails(w http.ResponseWriter, req *LLMRequest, maxTokens int, provider Provider, providerName string) (Provider, string, bool) {
+	agentID := req.Metadata["agent_id"]
+	result := ph.guardrails.Check(agentID, maxTokens)
+	if result.RateLimited {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return nil, "", true
+	}
+	if result.BudgetExhausted && result.FallbackProvider != "" {
+		if fbProvider, ok := ph.registry.Get(result.FallbackProvider); ok {
+			return fbProvider, result.FallbackProvider, false
+		}
+	}
+	return provider, providerName, false
 }
 
 // resolveProvider holt den Provider nach Name, mit Fallback auf Primary.
