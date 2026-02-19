@@ -2,4 +2,9 @@ go 1.25.0
 
 toolchain go1.25.7
 
-use ./cmd/cortex-gateway
+use (
+	./cmd/cortex-gateway
+	./pkg/sentinel-go
+	./services/sentinel-judge
+	./services/sentinel-nats-bridge
+)

@@ -47,8 +47,8 @@ func TestCostTracker_AccumulatesAcrossRecords(t *testing.T) {
 	}
 	ct := NewCostTracker(prices)
 
-	ct.Record("claude", 1_000_000, 0)  // $3.0
-	ct.Record("claude", 0, 1_000_000)  // $15.0
+	ct.Record("claude", 1_000_000, 0) // $3.0
+	ct.Record("claude", 0, 1_000_000) // $15.0
 	total := ct.TotalCost()
 	expected := 18.0
 	if math.Abs(total-expected) > 1e-9 {
@@ -63,7 +63,7 @@ func TestCostTracker_CostByProvider(t *testing.T) {
 	}
 	ct := NewCostTracker(prices)
 
-	ct.Record("claude", 1_000_000, 0) // $3.0
+	ct.Record("claude", 1_000_000, 0)         // $3.0
 	ct.Record("ollama", 1_000_000, 1_000_000) // $0
 
 	claudeCost := ct.CostByProvider("claude")

@@ -1,7 +1,7 @@
 [Unit]
 Description=Sentinel Simulation Stack
 Documentation=https://github.com/obtFusi/project-sentinel/issues/28
-Wants=sentinel-daemon.service sentinel-cortex.service sentinel-dashboard.service sentinel-nightrun.timer
+Wants=sentinel-daemon.service sentinel-cortex.service sentinel-dashboard.service sentinel-nightrun.timer nats-server.service sentinel-nats-bridge.service sentinel-judge.service
 
 [Install]
 WantedBy=multi-user.target

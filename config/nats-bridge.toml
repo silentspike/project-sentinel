@@ -1,0 +1,10 @@
+[eventstore]
+path = "/opt/sentinel/data/events.db"
+poll_interval_ms = 1000
+batch_size = 100
+
+[nats]
+url = "nats://127.0.0.1:4222"
+
+[server]
+health_port = 8083

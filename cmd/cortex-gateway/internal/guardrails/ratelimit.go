@@ -9,7 +9,7 @@ import (
 type bucket struct {
 	tokens    float64
 	max       float64
-	rate      float64   // tokens/sec refill
+	rate      float64 // tokens/sec refill
 	lastCheck time.Time
 }
 

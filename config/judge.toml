@@ -1,0 +1,21 @@
+[server]
+port = 8082
+
+[nats]
+url = "nats://127.0.0.1:4222"
+consumer_name = "judge-heuristic"
+
+[thresholds]
+drift_alert_severity = "moderate"
+quality_alert_min_score = 2
+fatigue_alert_min_score = 0.6
+
+[evolution]
+path = "/opt/sentinel/data/evolution.db"
+
+[gateway]
+url = "http://localhost:8080"
+model = "qwen3:7b"
+temperature = 0.2
+max_tokens = 500
+timeout_seconds = 30

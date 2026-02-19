@@ -1,0 +1,28 @@
+[Unit]
+Description=Sentinel NATS Bridge — Limbo EventStore to NATS JetStream
+Documentation=https://github.com/obtFusi/project-sentinel/issues/26
+After=nats-server.service sentinel-daemon.service
+Requires=nats-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel-nats-bridge
+Restart=on-failure
+RestartSec=5
+MemoryMax=256M
+Environment=SENTINEL_BRIDGE_CONFIG=/opt/sentinel/config/nats-bridge.toml
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-nats-bridge
+
+# Security Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ReadWritePaths=/opt/sentinel/data
+
+[Install]
+WantedBy=sentinel.target
