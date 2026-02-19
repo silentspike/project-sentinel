@@ -35,7 +35,7 @@ func DefaultConfig() Config {
 }
 
 // ConfigFromEnv creates a Config from environment variables with sensible defaults.
-// Recognised variables:
+// Recognized variables:
 //
 //	SENTINEL_GUARDRAILS_ENABLED          (bool, default: false)
 //	SENTINEL_GUARDRAILS_BUDGET_HOURLY    (int64, tokens/hour, default: 5000000)
