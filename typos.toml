@@ -368,6 +368,9 @@ Methode = "Methode"
 # sentinel-daemon words (Issue #94 - German in doc comments + string literals)
 Variante = "Variante"
 
+# Judge Benchmark words (Issue #26 - German personality traits in Go bench test data)
+enthusiastisch = "enthusiastisch"
+
 # Prompt Compiler words (Issue #58 - German personality traits in Go string literals)
 pragmatisch = "pragmatisch"
 flexibel = "flexibel"
