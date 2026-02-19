@@ -1,0 +1,32 @@
+[package]
+name = "sentinel-fs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[features]
+default = ["telemetry"]
+telemetry = ["sentinel-telemetry/telemetry"]
+fuse-tests = ["fuser", "libc"]
+
+[dependencies]
+anyhow = { workspace = true }
+redb = { workspace = true }
+sentinel-common = { path = "../sentinel-common" }
+sentinel-telemetry = { path = "../sentinel-telemetry" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+fuser = { version = "0.16", optional = true }
+libc = { version = "0.2", optional = true }
+zstd = "0.13"
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = "3"
+
+[[bench]]
+name = "sentinel_fs_bench"
+harness = false
