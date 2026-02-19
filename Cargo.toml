@@ -16,6 +16,7 @@ members = [
     "crates/sentinel-hippocampus",
     "crates/sentinel-inference",
     "crates/sentinel-projection",
+    "crates/sentinel-fs",
     "services/sentinel-nightrun",
     "services/sentinel-daemon",
 ]
