@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sentinel Judge: Enterprise Quality Analysis Service** (#26)
+  - New Go service `services/sentinel-judge/` with NATS JetStream consumer + LLM analysis
+  - NATS JetStream integration: durable pull consumers for realtime heuristic pipeline
+  - Dual-mode operation: streaming (NATS realtime, <5s) + batch (HTTP Night-Run API, <60s/agent)
+  - LLM voice pattern analysis via Cortex Gateway HTTP API (structured JSON output)
+  - `personality_evolution` persistence layer (Limbo SQLite, CQRS pattern)
+  - Multi-target alerter: Prometheus metrics + slog + NATS `sentinel.judge.alert` publish
+  - 7 Prometheus metric families (drift/quality/fatigue scores, alerts, events, consumer lag, LLM duration)
+  - HTTP API: `/health`, `/ready`, `/metrics`, `POST /api/v1/analyze`
+  - Graceful shutdown with NATS drain and HTTP server timeout
+  - 14 tests across 5 packages (api, alerter, analyzer, gateway, persistence)
+- **Sentinel NATS Bridge: Event Bridge Service** (#26)
+  - New Go service `services/sentinel-nats-bridge/` polling Limbo EventStore to NATS JetStream
+  - Exactly-once delivery via `Nats-Msg-Id` header (maps to `operation_id`)
+  - Health endpoint on port 8083
+  - Temporary bridge — will be replaced by daemon Zenoh-to-NATS bridge
+- **Shared Go Package** (`pkg/sentinel-go/`) (#26)
+  - Extracted `judge/` (4 algorithms: Drift, Quality, Fatigue, Swap) from gateway internal
+  - Extracted `eventstore/` from gateway internal, added `GetEventsSince()` for bridge polling
+  - New `messaging/` package: NATS connection factory, stream definitions (SSOT), subject helpers
+  - Go workspace module importable by all Go services (gateway, judge, bridge)
+  - 24 tests (18 judge + 5 eventstore + 5 messaging, all moved/new)
+- **NATS JetStream Infrastructure** (#26)
+  - `config/nats.conf`: JetStream server config (localhost-only, 512MB mem, 2GB disk)
+  - `config/judge.toml`: Judge service configuration (thresholds, gateway, evolution)
+  - `config/nats-bridge.toml`: Bridge service configuration (poll interval, batch size)
+  - systemd units: `nats-server.service`, `sentinel-nats-bridge.service`, `sentinel-judge.service`
+  - `sentinel.target` updated with new services
+
+### Changed
+
+- Gateway imports refactored: `internal/judge/` and `internal/eventstore/` now imported from `pkg/sentinel-go/`
+- `go.work` extended with 3 new modules (pkg/sentinel-go, services/sentinel-judge, services/sentinel-nats-bridge)
+
 - **LLM Guardrails: Cost & Throughput Limits** (#59)
   - Token-bucket rate limiter with per-agent and global limits (configurable RPM)
   - Budget tracker with hourly/daily token limits and automatic window reset

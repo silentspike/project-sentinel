@@ -6,15 +6,15 @@ import "sync"
 type Capability string
 
 const (
-	CapStreaming     Capability = "streaming"
-	CapToolUse       Capability = "tool_use"
-	CapVision        Capability = "vision"
-	CapSystemPrompt  Capability = "system_prompt"
-	CapJSONMode      Capability = "json_mode"
-	CapFunctionCall  Capability = "function_calling"
-	CapCaching       Capability = "caching"
-	CapPredictedOut  Capability = "predicted_output"
-	CapKVRetention   Capability = "kv_retention"
+	CapStreaming    Capability = "streaming"
+	CapToolUse      Capability = "tool_use"
+	CapVision       Capability = "vision"
+	CapSystemPrompt Capability = "system_prompt"
+	CapJSONMode     Capability = "json_mode"
+	CapFunctionCall Capability = "function_calling"
+	CapCaching      Capability = "caching"
+	CapPredictedOut Capability = "predicted_output"
+	CapKVRetention  Capability = "kv_retention"
 )
 
 // ProviderCapabilities maps providers to their supported capabilities.

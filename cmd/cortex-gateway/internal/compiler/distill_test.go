@@ -141,8 +141,8 @@ func TestDistillDNAFromAgent(t *testing.T) {
 	dna := &AgentDNA{
 		Identity: AgentIdentity{Name: "Thomas Mueller", Role: "CEO"},
 		Personality: AgentPersonality{
-			Openness:      0.8,
-			Extraversion:  0.2,
+			Openness:     0.8,
+			Extraversion: 0.2,
 		},
 		Background: AgentBackground{
 			Quirks: []string{"trinkt nur Espresso"},

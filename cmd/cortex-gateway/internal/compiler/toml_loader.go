@@ -20,13 +20,13 @@ type AgentIdentity struct {
 
 // AgentPersonality holds Big Five and related traits.
 type AgentPersonality struct {
-	Openness           float64 `toml:"openness"`
-	Conscientiousness  float64 `toml:"conscientiousness"`
-	Extraversion       float64 `toml:"extraversion"`
-	Agreeableness      float64 `toml:"agreeableness"`
-	Neuroticism        float64 `toml:"neuroticism"`
-	CaffeineTolerance  float64 `toml:"caffeine_tolerance"`
-	MorningPerson      bool    `toml:"morning_person"`
+	Openness          float64 `toml:"openness"`
+	Conscientiousness float64 `toml:"conscientiousness"`
+	Extraversion      float64 `toml:"extraversion"`
+	Agreeableness     float64 `toml:"agreeableness"`
+	Neuroticism       float64 `toml:"neuroticism"`
+	CaffeineTolerance float64 `toml:"caffeine_tolerance"`
+	MorningPerson     bool    `toml:"morning_person"`
 }
 
 // AgentBackground holds bio and quirks.
