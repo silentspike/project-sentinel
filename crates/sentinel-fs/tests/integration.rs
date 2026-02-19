@@ -256,7 +256,9 @@ fn refcount_integrity_across_operations() {
 
     // Remove one agent's file
     let a1_inode = lm.lookup_dirent("AGENT-01", 1, "f.txt").unwrap().unwrap();
-    lm.meta().remove_file("AGENT-01", 1, "f.txt", a1_inode).unwrap();
+    lm.meta()
+        .remove_file("AGENT-01", 1, "f.txt", a1_inode)
+        .unwrap();
     assert_eq!(lm.meta().get_refcount(&hash).unwrap(), 2);
 
     // Content still accessible by other agents
@@ -274,7 +276,8 @@ fn scale_100_agents_with_shared_content() {
 
     for i in 1..=100 {
         let agent = format!("AGENT-{i:04}");
-        lm.write_file(&agent, 1, "lock.json", content, 0o644).unwrap();
+        lm.write_file(&agent, 1, "lock.json", content, 0o644)
+            .unwrap();
     }
 
     // Only 1 blob despite 100 writes
