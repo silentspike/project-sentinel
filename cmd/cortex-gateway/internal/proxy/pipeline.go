@@ -224,15 +224,37 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		req.MaxTokens = snap.MaxTokens
 	}
 
-	// --- Step 5: Perception Injection ---
+	// --- Step 5: Perception Injection (3-Source Assembly) ---
 	agentName := req.Metadata["agent_name"]
 	agentRole := req.Metadata["agent_role"]
 	perception := req.Metadata["perception"]
 
-	if perception != "" && agentName != "" {
-		modelKey := ph.modelKey(providerName)
-		systemPrompt := ph.compiler.Compile(modelKey, agentName, agentRole, perception)
-		req.Messages = prependSystemMessage(req.Messages, systemPrompt)
+	if agentName != "" {
+		var systemPrompt string
+		agentIDStr := req.Metadata["agent_id"]
+		agentID, parseErr := strconv.Atoi(agentIDStr)
+
+		if parseErr == nil && agentID > 0 {
+			evolution := compiler.EvolutionFromMetadata(req.Metadata)
+			compiled, compileErr := ph.compiler.CompileFromSources(agentID, providerName, evolution, perception)
+			if compileErr != nil {
+				ph.logger.Warn("3-source assembly failed, using fallback",
+					"agent_id", agentID,
+					"error", compileErr,
+				)
+				modelKey := ph.modelKey(providerName)
+				systemPrompt = ph.compiler.Compile(modelKey, agentName, agentRole, perception)
+			} else {
+				systemPrompt = compiled
+			}
+		} else if perception != "" {
+			modelKey := ph.modelKey(providerName)
+			systemPrompt = ph.compiler.Compile(modelKey, agentName, agentRole, perception)
+		}
+
+		if systemPrompt != "" {
+			req.Messages = prependSystemMessage(req.Messages, systemPrompt)
+		}
 	}
 
 	// --- Step 6: Provider.Send() mit Deadline ---

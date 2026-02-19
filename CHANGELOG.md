@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Prompt Compiler: 3-Source Assembly** (#58)
+  - TOML DNA loader with in-memory cache (Big Five, Bio, Quirks)
+  - Evolution data integration from redb (Voice Style, Behavioral Notes, Narrative, Relationships)
+  - Cache-optimized block ordering (static before dynamic for Anthropic prefix caching)
+  - Prompt distillation for 7B models (<2000 tokens)
+  - Extended capability detection: `caching`, `predicted_output`, `kv_retention`
+  - Added `openai` provider to capability registry
+  - New `CompileFromSources()` entry point with fallback to basic `Compile()`
+  - Pipeline Step 5 upgraded to 3-source assembly with automatic fallback
+  - 52 compiler tests, 23 capability tests, 6 benchmarks (Assembly: <5µs)
 - `OutboxPublisher<T>` background task: polls outbox entries and publishes via generic `OutboxTransport` trait
 - `OutboxTransport` trait in sentinel-limbo for transport abstraction (no zenoh dependency)
 - `OutboxPublisherConfig` with env-based configuration (`SENTINEL_OUTBOX_POLL_INTERVAL_MS`, `SENTINEL_OUTBOX_BATCH_SIZE`)

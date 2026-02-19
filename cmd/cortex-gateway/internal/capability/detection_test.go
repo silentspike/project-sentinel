@@ -48,7 +48,7 @@ func TestHasCapability_Ollama_SystemPrompt(t *testing.T) {
 
 func TestHasCapability_UnknownProvider(t *testing.T) {
 	pc := New()
-	if pc.HasCapability("openai", CapToolUse) {
+	if pc.HasCapability("mistral", CapToolUse) {
 		t.Error("unknown provider should not have any capabilities")
 	}
 }
@@ -123,8 +123,8 @@ func TestListCapabilities(t *testing.T) {
 	if caps == nil {
 		t.Fatal("expected non-nil capabilities for claude")
 	}
-	if len(caps) != 6 {
-		t.Errorf("expected 6 capabilities for claude, got %d", len(caps))
+	if len(caps) != 9 {
+		t.Errorf("expected 9 capabilities for claude, got %d", len(caps))
 	}
 }
 
@@ -134,6 +134,93 @@ func TestListCapabilities_UnknownProvider(t *testing.T) {
 
 	if caps != nil {
 		t.Errorf("expected nil capabilities for unknown provider, got %v", caps)
+	}
+}
+
+// AC-3: Extended capability detection for all providers
+func TestHasCapability_Claude_Caching(t *testing.T) {
+	pc := New()
+	if !pc.HasCapability("claude", CapCaching) {
+		t.Error("claude should support caching")
+	}
+}
+
+func TestHasCapability_Claude_NoPredictedOut(t *testing.T) {
+	pc := New()
+	if pc.HasCapability("claude", CapPredictedOut) {
+		t.Error("claude should NOT support predicted_output")
+	}
+}
+
+func TestHasCapability_OpenAI_AllCapabilities(t *testing.T) {
+	pc := New()
+
+	expected := map[Capability]bool{
+		CapStreaming:    true,
+		CapToolUse:      true,
+		CapVision:       true,
+		CapSystemPrompt: true,
+		CapJSONMode:     true,
+		CapFunctionCall: true,
+		CapCaching:      false,
+		CapPredictedOut: true,
+		CapKVRetention:  false,
+	}
+
+	for cap, want := range expected {
+		got := pc.HasCapability("openai", cap)
+		if got != want {
+			t.Errorf("openai %s = %v, want %v", cap, got, want)
+		}
+	}
+}
+
+func TestHasCapability_Ollama_KVRetention(t *testing.T) {
+	pc := New()
+	if !pc.HasCapability("ollama", CapKVRetention) {
+		t.Error("ollama should support kv_retention")
+	}
+}
+
+func TestHasCapability_Ollama_NoCaching(t *testing.T) {
+	pc := New()
+	if pc.HasCapability("ollama", CapCaching) {
+		t.Error("ollama should NOT support caching")
+	}
+}
+
+func TestGetFallback_NoCaching(t *testing.T) {
+	pc := New()
+	fb := pc.GetFallback("ollama", CapCaching)
+	if fb == "" {
+		t.Error("expected non-empty fallback for missing caching")
+	}
+}
+
+func TestGetFallback_NoPredictedOut(t *testing.T) {
+	pc := New()
+	fb := pc.GetFallback("claude", CapPredictedOut)
+	if fb == "" {
+		t.Error("expected non-empty fallback for missing predicted_output")
+	}
+}
+
+func TestGetFallback_NoKVRetention(t *testing.T) {
+	pc := New()
+	fb := pc.GetFallback("claude", CapKVRetention)
+	if fb == "" {
+		t.Error("expected non-empty fallback for missing kv_retention")
+	}
+}
+
+func TestListCapabilities_OpenAI(t *testing.T) {
+	pc := New()
+	caps := pc.ListCapabilities("openai")
+	if caps == nil {
+		t.Fatal("expected non-nil capabilities for openai")
+	}
+	if len(caps) != 9 {
+		t.Errorf("expected 9 capabilities for openai, got %d", len(caps))
 	}
 }
 
