@@ -19,7 +19,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
-fuser = { version = "0.15", optional = true }
+fuser = { version = "0.16", optional = true }
 libc = { version = "0.2", optional = true }
 zstd = "0.13"
 
