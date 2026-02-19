@@ -26,6 +26,8 @@ type LLMResponse struct {
 	Content      string `json:"content"`
 	Model        string `json:"model"`
 	TokensUsed   int    `json:"tokens_used"`
+	InputTokens  int    `json:"input_tokens"`
+	OutputTokens int    `json:"output_tokens"`
 	FinishReason string `json:"finish_reason"`
 }
 
