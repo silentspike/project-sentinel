@@ -23,7 +23,10 @@ fn ac1_dedup_15_identical_trees() {
 
     // Simulate 15 agents each with identical file trees
     let files = [
-        ("package.json", br#"{"name":"app","version":"1.0.0"}"#.as_slice()),
+        (
+            "package.json",
+            br#"{"name":"app","version":"1.0.0"}"#.as_slice(),
+        ),
         ("index.js", b"console.log('hello world');"),
         ("README.md", b"# My App\n\nA sample application."),
         ("config.toml", b"[server]\nport = 8080\nhost = '0.0.0.0'"),
@@ -96,18 +99,26 @@ fn ac3_agent_01_writes_agent_02_cannot_see() {
 fn ac3_agent_isolation_readdir() {
     let (lm, _dir) = setup();
 
-    lm.write_file("AGENT-01", 1, "a01.txt", b"a", 0o644).unwrap();
-    lm.write_file("AGENT-02", 1, "a02.txt", b"b", 0o644).unwrap();
+    lm.write_file("AGENT-01", 1, "a01.txt", b"a", 0o644)
+        .unwrap();
+    lm.write_file("AGENT-02", 1, "a02.txt", b"b", 0o644)
+        .unwrap();
 
     let a01_entries = lm.readdir("AGENT-01", 1).unwrap();
     let a01_names: Vec<&str> = a01_entries.iter().map(|(n, _, _)| n.as_str()).collect();
     assert!(a01_names.contains(&"a01.txt"));
-    assert!(!a01_names.contains(&"a02.txt"), "AGENT-01 must not see AGENT-02's file");
+    assert!(
+        !a01_names.contains(&"a02.txt"),
+        "AGENT-01 must not see AGENT-02's file"
+    );
 
     let a02_entries = lm.readdir("AGENT-02", 1).unwrap();
     let a02_names: Vec<&str> = a02_entries.iter().map(|(n, _, _)| n.as_str()).collect();
     assert!(a02_names.contains(&"a02.txt"));
-    assert!(!a02_names.contains(&"a01.txt"), "AGENT-02 must not see AGENT-01's file");
+    assert!(
+        !a02_names.contains(&"a01.txt"),
+        "AGENT-02 must not see AGENT-01's file"
+    );
 }
 
 // === AC-4: Crash Recovery (redb ACID) ===
@@ -143,9 +154,7 @@ fn ac4_crash_recovery_redb_acid() {
         let content = lm.read_file("AGENT-01", inode).unwrap();
         assert_eq!(content, b"persistent data");
 
-        let base_dirent = lm
-            .lookup_dirent("AGENT-01", 1, "base.txt")
-            .unwrap();
+        let base_dirent = lm.lookup_dirent("AGENT-01", 1, "base.txt").unwrap();
         assert!(base_dirent.is_some(), "Base file should survive restart");
     }
 }
@@ -166,7 +175,10 @@ fn cow_agent_override_does_not_modify_base() {
         .unwrap();
 
     // Agent sees their version
-    let agent_dirent = lm.lookup_dirent("AGENT-01", 1, "config.txt").unwrap().unwrap();
+    let agent_dirent = lm
+        .lookup_dirent("AGENT-01", 1, "config.txt")
+        .unwrap()
+        .unwrap();
     let agent_content = lm.read_file("AGENT-01", agent_dirent).unwrap();
     assert_eq!(agent_content, b"custom config");
 
@@ -192,13 +204,18 @@ fn whiteout_and_readdir_complex() {
     // Base: 4 files
     lm.populate_base_file(1, "keep1.txt", b"k1", 0o644).unwrap();
     lm.populate_base_file(1, "keep2.txt", b"k2", 0o644).unwrap();
-    let del1_inode = lm.populate_base_file(1, "delete1.txt", b"d1", 0o644).unwrap();
-    let del2_inode = lm.populate_base_file(1, "delete2.txt", b"d2", 0o644).unwrap();
+    let del1_inode = lm
+        .populate_base_file(1, "delete1.txt", b"d1", 0o644)
+        .unwrap();
+    let del2_inode = lm
+        .populate_base_file(1, "delete2.txt", b"d2", 0o644)
+        .unwrap();
 
     // Agent: delete 2, add 1
     lm.unlink("AGENT-01", 1, "delete1.txt", del1_inode).unwrap();
     lm.unlink("AGENT-01", 1, "delete2.txt", del2_inode).unwrap();
-    lm.write_file("AGENT-01", 1, "new.txt", b"new", 0o644).unwrap();
+    lm.write_file("AGENT-01", 1, "new.txt", b"new", 0o644)
+        .unwrap();
 
     let entries = lm.readdir("AGENT-01", 1).unwrap();
     let names: Vec<&str> = entries.iter().map(|(n, _, _)| n.as_str()).collect();
@@ -227,7 +244,10 @@ fn nested_directory_structure() {
     let found_src = lm.lookup_dirent("AGENT-01", 1, "src").unwrap().unwrap();
     assert_eq!(found_src, src_inode);
 
-    let found_main = lm.lookup_dirent("AGENT-01", src_inode, "main.rs").unwrap().unwrap();
+    let found_main = lm
+        .lookup_dirent("AGENT-01", src_inode, "main.rs")
+        .unwrap()
+        .unwrap();
     assert_eq!(found_main, main_inode);
 
     let content = lm.read_file("AGENT-01", main_inode).unwrap();

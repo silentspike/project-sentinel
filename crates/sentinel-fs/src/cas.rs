@@ -103,8 +103,8 @@ impl CasStore {
     #[instrument(skip(self), level = "trace")]
     pub fn read(&self, hash: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
         let blob_path = self.blob_path(hash);
-        let encoded = fs::read(&blob_path)
-            .map_err(|e| anyhow::anyhow!("Blob {}: {e}", hex_encode(hash)))?;
+        let encoded =
+            fs::read(&blob_path).map_err(|e| anyhow::anyhow!("Blob {}: {e}", hex_encode(hash)))?;
         decode_blob(&encoded)
     }
 
@@ -393,7 +393,13 @@ mod tests {
 
         // Should be cas_dir / XX / YYYY...YY (2-char prefix subdir)
         let hex = hex_encode(&hash);
-        let parent_name = path.parent().unwrap().file_name().unwrap().to_str().unwrap();
+        let parent_name = path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(parent_name, &hex[..2]);
 
         let file_name = path.file_name().unwrap().to_str().unwrap();

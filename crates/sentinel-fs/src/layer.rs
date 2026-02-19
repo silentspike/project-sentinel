@@ -208,12 +208,14 @@ impl LayerManager {
         self.meta.remove_file(agent_id, parent_inode, name, inode)?;
 
         // If entry exists in base layer, place whiteout
-        if self.meta.get_dirent(BASE_LAYER, parent_inode, name)?.is_some() {
+        if self
+            .meta
+            .get_dirent(BASE_LAYER, parent_inode, name)?
+            .is_some()
+        {
             let wo = whiteout_marker();
-            self.meta
-                .set_inode(agent_id, inode, &wo)?;
-            self.meta
-                .set_dirent(agent_id, parent_inode, name, inode)?;
+            self.meta.set_inode(agent_id, inode, &wo)?;
+            self.meta.set_dirent(agent_id, parent_inode, name, inode)?;
         }
 
         Ok(())
@@ -310,7 +312,10 @@ mod tests {
         assert_eq!(base_content, b"base content");
 
         // Other agent doesn't see AGENT-01's file
-        assert!(lm.lookup_dirent("AGENT-02", 1, "agent.txt").unwrap().is_none());
+        assert!(lm
+            .lookup_dirent("AGENT-02", 1, "agent.txt")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -322,8 +327,14 @@ mod tests {
         lm.write_file("AGENT-02", 1, "secret.txt", b"agent-02 data", 0o600)
             .unwrap();
 
-        let a1 = lm.lookup_dirent("AGENT-01", 1, "secret.txt").unwrap().unwrap();
-        let a2 = lm.lookup_dirent("AGENT-02", 1, "secret.txt").unwrap().unwrap();
+        let a1 = lm
+            .lookup_dirent("AGENT-01", 1, "secret.txt")
+            .unwrap()
+            .unwrap();
+        let a2 = lm
+            .lookup_dirent("AGENT-02", 1, "secret.txt")
+            .unwrap()
+            .unwrap();
 
         assert_eq!(lm.read_file("AGENT-01", a1).unwrap(), b"agent-01 data");
         assert_eq!(lm.read_file("AGENT-02", a2).unwrap(), b"agent-02 data");
@@ -338,20 +349,33 @@ mod tests {
             .unwrap();
 
         // Agent can see it before delete
-        assert!(lm.lookup_dirent("AGENT-01", 1, "deleteme.txt").unwrap().is_some());
+        assert!(lm
+            .lookup_dirent("AGENT-01", 1, "deleteme.txt")
+            .unwrap()
+            .is_some());
 
         // Agent deletes it
         lm.unlink("AGENT-01", 1, "deleteme.txt", base_inode)
             .unwrap();
 
         // Agent no longer sees it
-        assert!(lm.lookup_dirent("AGENT-01", 1, "deleteme.txt").unwrap().is_none());
+        assert!(lm
+            .lookup_dirent("AGENT-01", 1, "deleteme.txt")
+            .unwrap()
+            .is_none());
 
         // Other agent still sees it
-        assert!(lm.lookup_dirent("AGENT-02", 1, "deleteme.txt").unwrap().is_some());
+        assert!(lm
+            .lookup_dirent("AGENT-02", 1, "deleteme.txt")
+            .unwrap()
+            .is_some());
 
         // Base layer untouched
-        assert!(lm.meta().get_dirent(BASE_LAYER, 1, "deleteme.txt").unwrap().is_some());
+        assert!(lm
+            .meta()
+            .get_dirent(BASE_LAYER, 1, "deleteme.txt")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -363,9 +387,14 @@ mod tests {
         lm.populate_base_file(1, "base2.txt", b"b2", 0o644).unwrap();
 
         // Agent adds one, deletes one base file
-        lm.write_file("AGENT-01", 1, "agent1.txt", b"a1", 0o644).unwrap();
+        lm.write_file("AGENT-01", 1, "agent1.txt", b"a1", 0o644)
+            .unwrap();
 
-        let base2_inode = lm.meta().get_dirent(BASE_LAYER, 1, "base2.txt").unwrap().unwrap();
+        let base2_inode = lm
+            .meta()
+            .get_dirent(BASE_LAYER, 1, "base2.txt")
+            .unwrap()
+            .unwrap();
         lm.unlink("AGENT-01", 1, "base2.txt", base2_inode).unwrap();
 
         let entries = lm.readdir("AGENT-01", 1).unwrap();
@@ -397,9 +426,12 @@ mod tests {
         let (lm, _dir) = temp_layer();
         let content = b"identical content for all agents";
 
-        lm.write_file("AGENT-01", 1, "same.txt", content, 0o644).unwrap();
-        lm.write_file("AGENT-02", 1, "same.txt", content, 0o644).unwrap();
-        lm.write_file("AGENT-03", 1, "same.txt", content, 0o644).unwrap();
+        lm.write_file("AGENT-01", 1, "same.txt", content, 0o644)
+            .unwrap();
+        lm.write_file("AGENT-02", 1, "same.txt", content, 0o644)
+            .unwrap();
+        lm.write_file("AGENT-03", 1, "same.txt", content, 0o644)
+            .unwrap();
 
         // Only one blob in CAS
         let stats = lm.cas().stats().unwrap();

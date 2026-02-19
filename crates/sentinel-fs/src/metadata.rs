@@ -157,11 +157,7 @@ impl MetadataStore {
     }
 
     /// Remove an inode. Returns the old data if it existed.
-    pub fn remove_inode(
-        &self,
-        agent_id: &str,
-        inode: u64,
-    ) -> anyhow::Result<Option<InodeData>> {
+    pub fn remove_inode(&self, agent_id: &str, inode: u64) -> anyhow::Result<Option<InodeData>> {
         let write_txn = self.db.begin_write()?;
         let old = {
             let mut table = write_txn.open_table(FS_INODES)?;
@@ -231,11 +227,7 @@ impl MetadataStore {
     }
 
     /// List all entries in a directory for an agent.
-    pub fn list_dirents(
-        &self,
-        agent_id: &str,
-        parent: u64,
-    ) -> anyhow::Result<Vec<(String, u64)>> {
+    pub fn list_dirents(&self, agent_id: &str, parent: u64) -> anyhow::Result<Vec<(String, u64)>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(FS_DIRENTS)?;
 
@@ -571,8 +563,12 @@ mod tests {
         let hash = [0xEE; 32];
 
         let data = InodeData::regular(hash, 100, 0o644);
-        store.create_file("AGENT-01", 1, "shared.txt", 2, &data).unwrap();
-        store.create_file("AGENT-02", 1, "shared.txt", 2, &data).unwrap();
+        store
+            .create_file("AGENT-01", 1, "shared.txt", 2, &data)
+            .unwrap();
+        store
+            .create_file("AGENT-02", 1, "shared.txt", 2, &data)
+            .unwrap();
 
         // Both agents reference the same hash
         assert_eq!(store.get_refcount(&hash).unwrap(), 2);
