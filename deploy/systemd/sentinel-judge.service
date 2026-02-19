@@ -1,0 +1,28 @@
+[Unit]
+Description=Sentinel Judge — Quality Analysis Service (NATS + LLM)
+Documentation=https://github.com/obtFusi/project-sentinel/issues/26
+After=nats-server.service sentinel-nats-bridge.service sentinel-cortex.service
+Requires=nats-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel-judge
+Restart=on-failure
+RestartSec=5
+MemoryMax=512M
+Environment=SENTINEL_JUDGE_CONFIG=/opt/sentinel/config/judge.toml
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-judge
+
+# Security Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ReadWritePaths=/opt/sentinel/data
+
+[Install]
+WantedBy=sentinel.target
