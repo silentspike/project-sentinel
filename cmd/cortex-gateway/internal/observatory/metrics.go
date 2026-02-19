@@ -4,7 +4,7 @@ import (
 	"math"
 	"strings"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/judge"
+	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/judge"
 )
 
 // CalcInfoPropagation calculates how well information spreads through the agent network.

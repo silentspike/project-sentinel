@@ -14,13 +14,13 @@ import (
 
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/compiler"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/guardrails"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/eventstore"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/guardrails"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/observatory"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy"
+	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/eventstore"
 )
 
 // version is set at build time via ldflags.

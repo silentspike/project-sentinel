@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/judge"
+	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/judge"
 )
 
 const floatTolerance = 0.01

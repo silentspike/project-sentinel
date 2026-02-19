@@ -172,6 +172,46 @@ func (s *Store) AppendWithOutbox(event DomainEvent, topic string) error {
 	return tx.Commit()
 }
 
+// GetEventsSince returns up to limit events with id > afterID, ordered by id ascending.
+// Used by the NATS bridge to poll for new events.
+func (s *Store) GetEventsSince(afterID int64, limit int) ([]DomainEvent, int64, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`SELECT id, event_id, event_type, aggregate_id, payload,
+		correlation_id, causation_id, operation_id, tick, timestamp_ms,
+		schema_version, compensation_type
+		FROM events WHERE id > ? ORDER BY id ASC LIMIT ?`, afterID, limit)
+	if err != nil {
+		return nil, afterID, fmt.Errorf("eventstore get events since: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var events []DomainEvent
+	var maxID int64 = afterID
+	for rows.Next() {
+		var rowID int64
+		var e DomainEvent
+		var causation sql.NullString
+		if err := rows.Scan(&rowID, &e.EventID, &e.EventType, &e.AggregateID, &e.Payload,
+			&e.CorrelationID, &causation, &e.OperationID, &e.Tick, &e.TimestampMs,
+			&e.SchemaVersion, &e.CompensationType); err != nil {
+			return nil, afterID, fmt.Errorf("eventstore scan row: %w", err)
+		}
+		if causation.Valid {
+			e.CausationID = causation.String
+		}
+		events = append(events, e)
+		if rowID > maxID {
+			maxID = rowID
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, afterID, fmt.Errorf("eventstore rows iteration: %w", err)
+	}
+	return events, maxID, nil
+}
+
 // EventCount returns the number of events in the store.
 func (s *Store) EventCount() (int64, error) {
 	var count int64
