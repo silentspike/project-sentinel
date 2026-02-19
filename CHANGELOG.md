@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Sentinel Judge: Enterprise Quality Analysis Service** (#26)
+  - Bridge unit tests (6 tests: publish, dedup, subject mapping, config defaults, GetEventsSince)
+  - Go benchmarks: judge (7), messaging (4), all passing with HeuristicPipeline at ~1µs (target <5ms)
   - New Go service `services/sentinel-judge/` with NATS JetStream consumer + LLM analysis
   - NATS JetStream integration: durable pull consumers for realtime heuristic pipeline
   - Dual-mode operation: streaming (NATS realtime, <5s) + batch (HTTP Night-Run API, <60s/agent)
