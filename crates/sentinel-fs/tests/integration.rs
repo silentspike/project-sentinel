@@ -249,9 +249,12 @@ fn refcount_integrity_across_operations() {
     let hash = CasStore::hash(content);
 
     // Multiple agents reference same content
-    lm.write_file("AGENT-01", 1, "f.txt", content, 0o644).unwrap();
-    lm.write_file("AGENT-02", 1, "f.txt", content, 0o644).unwrap();
-    lm.write_file("AGENT-03", 1, "f.txt", content, 0o644).unwrap();
+    lm.write_file("AGENT-01", 1, "f.txt", content, 0o644)
+        .unwrap();
+    lm.write_file("AGENT-02", 1, "f.txt", content, 0o644)
+        .unwrap();
+    lm.write_file("AGENT-03", 1, "f.txt", content, 0o644)
+        .unwrap();
     assert_eq!(lm.meta().get_refcount(&hash).unwrap(), 3);
 
     // Remove one agent's file
