@@ -103,13 +103,13 @@ func formatPersonalityTraits(p AgentPersonality) string {
 	if p.Openness > 0.7 {
 		traits = append(traits, "kreativ und aufgeschlossen")
 	} else if p.Openness < 0.3 {
-		traits = append(traits, "konservativ und pragmatisch")
+		traits = append(traits, "konservativ und pragmatisch") //nolint:misspell // German word
 	}
 
 	if p.Conscientiousness > 0.7 {
 		traits = append(traits, "gewissenhaft und organisiert")
 	} else if p.Conscientiousness < 0.3 {
-		traits = append(traits, "spontan und flexibel")
+		traits = append(traits, "spontan und flexibel") //nolint:misspell // German word
 	}
 
 	if p.Extraversion > 0.7 {
@@ -125,7 +125,7 @@ func formatPersonalityTraits(p AgentPersonality) string {
 	}
 
 	if p.Neuroticism > 0.7 {
-		traits = append(traits, "emotional und sensibel")
+		traits = append(traits, "emotional und sensibel") //nolint:misspell // German word
 	} else if p.Neuroticism < 0.3 {
 		traits = append(traits, "gelassen und stressresistent")
 	}
