@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Zenoh Query Bridge — InFlightMap Consumer** (#99)
+  - Wired `InFlightMap` into Cortex Gateway pipeline around `provider.Send()` (Step 6)
+  - Query lifecycle tracking: Track before Send, Accept/Cancel after response/error
+  - Stale-drop: responses with `response_tick < min_tick` rejected with 504
+  - `sentinel_query_inflight` Prometheus gauge for current in-flight queries
+  - `sentinel_query_cancelled_total` and `sentinel_query_stale_dropped_total` counters now active in production path
+  - Prune goroutine (5s interval) prevents unbounded map growth
+  - 5 integration tests + 4 Go benchmarks in `resilience/bench_test.go`
+  - Bench-dashboard updated: Go benchmark parser + InFlightMap group (20 total benchmarks)
+
 - **VM-Deploy FULL Closure** (#28)
   - `deploy/smoke-test.sh` + `deploy/smoke-test-remote.py`: post-deploy smoke test (health endpoints + systemd services, single SSH roundtrip, configurable timeout)
   - `make deploy`: full deploy workflow with mandatory preflight verification
