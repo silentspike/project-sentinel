@@ -16,16 +16,19 @@ type BatchRequest struct {
 	ShiftStartTick int64    `json:"shift_start_tick"`
 	ShiftEndTick   int64    `json:"shift_end_tick"`
 	Messages       []string `json:"messages"`
-	AnalysisTypes  []string `json:"analysis_types"` // ["voice_style", "drift", "quality", "fatigue"]
+	AnalysisTypes  []string `json:"analysis_types"` // ["voice_style", "behavioral_notes", "narrative_arc", "relationship_dynamics", "drift", "quality", "fatigue"]
 }
 
 // BatchResponse is the result of a batch analysis.
 type BatchResponse struct {
 	AgentID         string                  `json:"agent_id"`
-	VoiceStyle      *analyzer.VoiceResult   `json:"voice_style,omitempty"`
-	Drift           *judge.DriftResult      `json:"drift,omitempty"`
-	Quality         *judge.QualityResult    `json:"quality,omitempty"`
-	Fatigue         *judge.FatigueResult    `json:"fatigue,omitempty"`
+	VoiceStyle      *analyzer.VoiceResult        `json:"voice_style,omitempty"`
+	BehavioralNotes *analyzer.BehavioralResult   `json:"behavioral_notes,omitempty"`
+	NarrativeArc    *analyzer.NarrativeResult    `json:"narrative_arc,omitempty"`
+	Relationships   *analyzer.RelationshipResult `json:"relationship_dynamics,omitempty"`
+	Drift           *judge.DriftResult           `json:"drift,omitempty"`
+	Quality         *judge.QualityResult         `json:"quality,omitempty"`
+	Fatigue         *judge.FatigueResult         `json:"fatigue,omitempty"`
 	EvolutionEvents int                     `json:"evolution_events"`
 	Alerts          []string                `json:"alerts"`
 }
@@ -102,6 +105,36 @@ func (bh *BatchHandler) Analyze(ctx context.Context, req BatchRequest) (*BatchRe
 			bh.logger.Error("voice analysis failed", "agent", req.AgentID, "error", err)
 		} else {
 			resp.VoiceStyle = result
+			resp.EvolutionEvents++
+		}
+	}
+
+	if typesSet["behavioral_notes"] && bh.analyzer != nil {
+		result, err := bh.analyzer.AnalyzeBehavior(ctx, req.AgentID, req.AgentRole, req.Messages, req.ShiftEndTick)
+		if err != nil {
+			bh.logger.Error("behavioral analysis failed", "agent", req.AgentID, "error", err)
+		} else {
+			resp.BehavioralNotes = result
+			resp.EvolutionEvents++
+		}
+	}
+
+	if typesSet["narrative_arc"] && bh.analyzer != nil {
+		result, err := bh.analyzer.AnalyzeNarrative(ctx, req.AgentID, req.AgentRole, req.Messages, req.ShiftEndTick)
+		if err != nil {
+			bh.logger.Error("narrative analysis failed", "agent", req.AgentID, "error", err)
+		} else {
+			resp.NarrativeArc = result
+			resp.EvolutionEvents++
+		}
+	}
+
+	if typesSet["relationship_dynamics"] && bh.analyzer != nil {
+		result, err := bh.analyzer.AnalyzeRelationships(ctx, req.AgentID, req.AgentRole, req.Messages, req.ShiftEndTick)
+		if err != nil {
+			bh.logger.Error("relationship analysis failed", "agent", req.AgentID, "error", err)
+		} else {
+			resp.Relationships = result
 			resp.EvolutionEvents++
 		}
 	}
