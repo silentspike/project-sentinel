@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New Go service `services/sentinel-judge/` with NATS JetStream consumer + LLM analysis
   - NATS JetStream integration: durable pull consumers for realtime heuristic pipeline
   - Dual-mode operation: streaming (NATS realtime, <5s) + batch (HTTP Night-Run API, <60s/agent)
-  - LLM voice pattern analysis via Cortex Gateway HTTP API (structured JSON output)
+  - 4 LLM analysis types via Cortex Gateway: voice_style, behavioral_notes, narrative_arc, relationship_dynamics
   - `personality_evolution` persistence layer (Limbo SQLite, CQRS pattern)
   - Multi-target alerter: Prometheus metrics + slog + NATS `sentinel.judge.alert` publish
   - 7 Prometheus metric families (drift/quality/fatigue scores, alerts, events, consumer lag, LLM duration)
