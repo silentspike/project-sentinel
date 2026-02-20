@@ -1,5 +1,6 @@
 .PHONY: help lint lint-all test build build-rust build-go build-dashboard \
-       fmt check clean hooks ci deny coverage typos doc machete safe-merge
+       fmt check clean hooks ci deny coverage typos doc machete safe-merge \
+       manifest preflight smoke-test deploy
 
 # Default target
 help: ## Show this help
@@ -133,6 +134,42 @@ hooks: ## Install repo-managed git hooks (.githooks via core.hooksPath)
 safe-merge: ## Safely merge PR (usage: make safe-merge PR=123 [METHOD=merge|squash|rebase])
 	@if [ -z "$(PR)" ]; then echo "Usage: make safe-merge PR=<number> [METHOD=merge|squash|rebase]"; exit 1; fi
 	./scripts/safe-merge.sh "$(PR)" "$(if $(METHOD),$(METHOD),merge)"
+
+# ──────────────────────────────────────────────
+# Deploy (VM: ubuntu@192.0.2.240)
+# ──────────────────────────────────────────────
+
+SSH ?= ubuntu@192.0.2.240
+
+manifest: ## Generate release manifest (requires built artifacts)
+	bash deploy/generate-manifest.sh
+
+preflight: ## Verify manifest hashes against VM (usage: make preflight [SSH=ubuntu@192.0.2.240])
+	bash deploy/deploy-preflight.sh "$(SSH)"
+
+smoke-test: ## Post-deploy smoke test (usage: make smoke-test [SSH=ubuntu@192.0.2.240])
+	bash deploy/smoke-test.sh "$(SSH)"
+
+deploy: preflight ## Deploy to VM: preflight + sync + smoke (usage: make deploy [SSH=ubuntu@192.0.2.240])
+	@echo ""
+	@echo "=== Preflight passed, deploying artifacts ==="
+	@echo "Syncing configs..."
+	@scp -q config/*.toml "$(SSH)":/opt/sentinel/config/
+	@scp -q config/nats.conf "$(SSH)":/etc/nats/nats.conf
+	@echo "Syncing systemd units..."
+	@scp -q deploy/systemd/*.service deploy/systemd/*.timer deploy/systemd/*.target "$(SSH)":/etc/systemd/system/
+	@ssh "$(SSH)" "sudo systemctl daemon-reload"
+	@echo "Syncing init scripts..."
+	@scp -q deploy/scripts/*.sh "$(SSH)":/opt/sentinel/scripts/
+	@echo ""
+	@echo "=== Running smoke test ==="
+	bash deploy/smoke-test.sh "$(SSH)"
+	@echo ""
+	@echo "Deploy: OK"
+
+# ──────────────────────────────────────────────
+# Cleanup
+# ──────────────────────────────────────────────
 
 clean: ## Remove build artifacts
 	cargo clean
