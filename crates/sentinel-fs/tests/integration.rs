@@ -311,3 +311,290 @@ fn scale_100_agents_with_shared_content() {
     let hash = CasStore::hash(content);
     assert_eq!(lm.meta().get_refcount(&hash).unwrap(), 100);
 }
+
+// ============================================================================
+// Artifact Plane Integration Tests (AC-4: Dedup, AC-5: Multi-Format)
+// ============================================================================
+
+use sentinel_fs::artifact::ArtifactPlane;
+use sentinel_fs::gc::{gc_chunks, release_object};
+use sentinel_fs::ingest::{begin_ingest, commit_ingest};
+use sentinel_fs::read_planner::read_object;
+
+/// Generate pseudo-random data with high entropy using xorshift64.
+/// High entropy ensures CDC gear-hash hits boundaries near the 64KB target.
+fn xorshift_data(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let bytes = state.to_le_bytes();
+        let remaining = len - out.len();
+        let take = remaining.min(8);
+        out.extend_from_slice(&bytes[..take]);
+    }
+    out
+}
+
+fn artifact_plane(name: &str) -> (ArtifactPlane, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let plane =
+        ArtifactPlane::open(dir.path().join(format!("{name}.redb"))).unwrap();
+    (plane, dir)
+}
+
+/// Identical data ingested twice: zero net-new chunks on second ingest.
+#[test]
+fn ac4_dedup_identical_zero_net_new_chunks() {
+    let (plane, _dir) = artifact_plane("dedup_identical");
+    let data: Vec<u8> = (0..1_048_576u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+
+    let mut s1 = begin_ingest(&plane, "application/octet-stream");
+    s1.write(&data);
+    let id1 = commit_ingest(s1).unwrap();
+    let chunks_after_first = plane.chunk_count().unwrap();
+    let manifest1 = plane.get_manifest(id1).unwrap().unwrap();
+
+    let mut s2 = begin_ingest(&plane, "application/octet-stream");
+    s2.write(&data);
+    let id2 = commit_ingest(s2).unwrap();
+    let chunks_after_second = plane.chunk_count().unwrap();
+    let manifest2 = plane.get_manifest(id2).unwrap().unwrap();
+
+    assert_eq!(chunks_after_first, chunks_after_second,
+        "ZERO net-new chunks (before={chunks_after_first}, after={chunks_after_second})");
+    assert_eq!(manifest1, manifest2, "identical manifests");
+    for hash in &manifest1 {
+        assert_eq!(plane.get_chunk_refcount(hash).unwrap(), 2);
+    }
+    assert_eq!(read_object(&plane, id1).unwrap(), data);
+    assert_eq!(read_object(&plane, id2).unwrap(), data);
+}
+
+/// 10 identical ingests: zero net-new chunks after first.
+#[test]
+fn ac4_dedup_10x_identical_no_growth() {
+    let (plane, _dir) = artifact_plane("dedup_10x");
+    let data: Vec<u8> = (0..512_000u32)
+        .map(|i| (i.wrapping_mul(1664525).wrapping_add(1013904223) >> 16) as u8)
+        .collect();
+
+    let mut s = begin_ingest(&plane, "application/octet-stream");
+    s.write(&data);
+    commit_ingest(s).unwrap();
+    let baseline = plane.chunk_count().unwrap();
+
+    for _ in 1..10 {
+        let mut s = begin_ingest(&plane, "application/octet-stream");
+        s.write(&data);
+        commit_ingest(s).unwrap();
+    }
+    assert_eq!(baseline, plane.chunk_count().unwrap(),
+        "10 identical ingests: no chunk growth");
+}
+
+/// Similar data (1 byte changed): most chunks deduped.
+#[test]
+fn ac4_dedup_similar_data_high_ratio() {
+    let (plane, _dir) = artifact_plane("dedup_similar");
+    let base: Vec<u8> = xorshift_data(524_288, 0xDEAD_BEEF);
+
+    let mut s1 = begin_ingest(&plane, "application/octet-stream");
+    s1.write(&base);
+    let id1 = commit_ingest(s1).unwrap();
+    let chunks_after_base = plane.chunk_count().unwrap();
+    let manifest1 = plane.get_manifest(id1).unwrap().unwrap();
+
+    let mut variant = base.clone();
+    *variant.last_mut().unwrap() ^= 0xFF;
+    let mut s2 = begin_ingest(&plane, "application/octet-stream");
+    s2.write(&variant);
+    let id2 = commit_ingest(s2).unwrap();
+    let manifest2 = plane.get_manifest(id2).unwrap().unwrap();
+
+    let net_new = plane.chunk_count().unwrap() - chunks_after_base;
+    assert!(net_new <= 2, "1-byte change: at most 2 net-new, got {net_new}");
+
+    let shared = manifest2.iter().filter(|h| manifest1.contains(h)).count();
+    let ratio = shared as f64 / manifest2.len() as f64;
+    assert!(ratio >= 0.75, "dedup ratio >= 75%, got {:.1}%", ratio * 100.0);
+    assert_eq!(read_object(&plane, id1).unwrap(), base);
+    assert_eq!(read_object(&plane, id2).unwrap(), variant);
+}
+
+/// Prepending data: CDC boundary stability.
+#[test]
+fn ac4_dedup_prepend_boundary_stability() {
+    let (plane, _dir) = artifact_plane("dedup_prepend");
+    let base: Vec<u8> = xorshift_data(1_048_576, 0xCAFE_BABE);
+
+    let mut s1 = begin_ingest(&plane, "application/octet-stream");
+    s1.write(&base);
+    commit_ingest(s1).unwrap();
+    let chunks_base = plane.chunk_count().unwrap();
+
+    let mut with_header = vec![0xAA; 1024];
+    with_header.extend_from_slice(&base);
+    let mut s2 = begin_ingest(&plane, "application/octet-stream");
+    s2.write(&with_header);
+    let id2 = commit_ingest(s2).unwrap();
+
+    let net_new = plane.chunk_count().unwrap() - chunks_base;
+    let m2 = plane.get_manifest(id2).unwrap().unwrap();
+    let ratio = net_new as f64 / m2.len() as f64;
+    assert!(ratio < 0.5, "prepend 1KB to 1MB: net-new <50%, got {:.1}%", ratio * 100.0);
+    assert_eq!(read_object(&plane, id2).unwrap(), with_header);
+}
+
+/// Dedup + GC lifecycle: ingest, release, GC.
+#[test]
+fn ac4_dedup_gc_full_lifecycle() {
+    let (plane, _dir) = artifact_plane("dedup_gc");
+    let data: Vec<u8> = (0..256_000u32)
+        .map(|i| (i.wrapping_mul(31337) >> 16) as u8)
+        .collect();
+
+    let mut s1 = begin_ingest(&plane, "application/octet-stream");
+    s1.write(&data);
+    let id1 = commit_ingest(s1).unwrap();
+    let mut s2 = begin_ingest(&plane, "application/octet-stream");
+    s2.write(&data);
+    let id2 = commit_ingest(s2).unwrap();
+    let baseline = plane.chunk_count().unwrap();
+
+    release_object(&plane, id1).unwrap();
+    assert_eq!(gc_chunks(&plane).unwrap().removed, 0, "shared: no GC");
+    assert_eq!(plane.chunk_count().unwrap(), baseline);
+
+    release_object(&plane, id2).unwrap();
+    let gc2 = gc_chunks(&plane).unwrap();
+    assert_eq!(gc2.removed, baseline, "orphans: all GC'd");
+    assert_eq!(plane.chunk_count().unwrap(), 0);
+    assert!(gc2.freed_bytes > 0);
+}
+
+/// Compression: compressible data smaller on disk.
+#[test]
+fn ac4_compression_ratio() {
+    let (plane, _dir) = artifact_plane("compression");
+    let data: Vec<u8> = "Hello World! Repeating text pattern. "
+        .repeat(50_000)
+        .into_bytes();
+    let raw_size = data.len();
+
+    let mut s = begin_ingest(&plane, "text/plain");
+    s.write(&data);
+    let id = commit_ingest(s).unwrap();
+
+    let manifest = plane.get_manifest(id).unwrap().unwrap();
+    let compressed: usize = manifest
+        .iter()
+        .map(|h| plane.read_chunk_raw(h).unwrap().len())
+        .sum();
+    let ratio = 1.0 - (compressed as f64 / raw_size as f64);
+    assert!(ratio > 0.5, ">50% compression, got {:.1}%", ratio * 100.0);
+    assert_eq!(read_object(&plane, id).unwrap(), data);
+}
+
+/// Chunk size distribution near 64KB target.
+#[test]
+fn ac4_chunk_size_distribution() {
+    let (plane, _dir) = artifact_plane("chunk_dist");
+    let data: Vec<u8> = xorshift_data(4_194_304, 0x1234_5678);
+
+    let mut s = begin_ingest(&plane, "application/octet-stream");
+    s.write(&data);
+    let id = commit_ingest(s).unwrap();
+    let manifest = plane.get_manifest(id).unwrap().unwrap();
+
+    assert!(manifest.len() >= 10 && manifest.len() <= 256,
+        "4MB/64KB: 10-256 chunks, got {}", manifest.len());
+
+    let sizes: Vec<usize> = manifest.iter().map(|h| {
+        sentinel_fs::ingest::decompress_chunk(
+            &plane.read_chunk_raw(h).unwrap(),
+        ).unwrap().len()
+    }).collect();
+    let avg = sizes.iter().sum::<usize>() as f64 / sizes.len() as f64;
+    let max_s = *sizes.iter().max().unwrap();
+
+    assert!(avg > 32_000.0 && avg < 128_000.0, "avg ~64KB, got {avg:.0}");
+    assert!(max_s <= 262_144, "max <= 256KB, got {max_s}");
+    assert_eq!(sizes.iter().sum::<usize>(), data.len());
+}
+
+/// 10MB dedup scaling.
+#[test]
+fn ac4_scaling_10mb_dedup() {
+    let (plane, _dir) = artifact_plane("scaling_10mb");
+    let data: Vec<u8> = (0..10_485_760u32)
+        .map(|i| (i.wrapping_mul(1664525).wrapping_add(1013904223) >> 24) as u8)
+        .collect();
+
+    let mut s1 = begin_ingest(&plane, "application/octet-stream");
+    s1.write(&data);
+    let id1 = commit_ingest(s1).unwrap();
+    let baseline = plane.chunk_count().unwrap();
+
+    let mut s2 = begin_ingest(&plane, "application/octet-stream");
+    s2.write(&data);
+    let id2 = commit_ingest(s2).unwrap();
+    assert_eq!(plane.chunk_count().unwrap(), baseline, "10MB: zero net-new");
+    assert_eq!(read_object(&plane, id1).unwrap(), data);
+    assert_eq!(read_object(&plane, id2).unwrap(), data);
+}
+
+/// Multi-format round-trip (AC-5).
+#[test]
+fn ac5_multi_format_ingest_roundtrip() {
+    let (plane, _dir) = artifact_plane("multi_format");
+
+    let iso: Vec<u8> = (0..500_000u32)
+        .map(|i| ((i.wrapping_mul(7919).wrapping_add(12347)) % 256) as u8)
+        .collect();
+    let html = b"<!DOCTYPE html><html><body><p>X</p></body></html>".repeat(5000);
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    pdf.extend((0..300_000u32).map(|i| (i % 256) as u8));
+    let bin = vec![0u8; 200_000];
+
+    for (mime, data) in &[
+        ("application/x-iso9660-image", iso.as_slice()),
+        ("text/html", html.as_slice()),
+        ("application/pdf", pdf.as_slice()),
+        ("application/octet-stream", bin.as_slice()),
+    ] {
+        let mut s = begin_ingest(&plane, *mime);
+        s.write(data);
+        let id = commit_ingest(s).unwrap();
+        let rb = read_object(&plane, id).unwrap();
+        assert_eq!(rb.len(), data.len(), "{mime}: size");
+        assert_eq!(&rb, data, "{mime}: content");
+        assert_eq!(plane.get_object(id).unwrap().unwrap().size, data.len() as u64);
+    }
+}
+
+/// Named references lifecycle.
+#[test]
+fn artifact_named_refs_lifecycle() {
+    let (plane, _dir) = artifact_plane("named_refs");
+
+    let mut s1 = begin_ingest(&plane, "text/plain");
+    s1.write(b"version 1");
+    let id1 = commit_ingest(s1).unwrap();
+    let mut s2 = begin_ingest(&plane, "text/plain");
+    s2.write(b"version 2");
+    let id2 = commit_ingest(s2).unwrap();
+
+    plane.set_ref("latest", id1).unwrap();
+    assert_eq!(plane.resolve_ref("latest").unwrap(), Some(id1));
+    plane.set_ref("latest", id2).unwrap();
+    assert_eq!(plane.resolve_ref("latest").unwrap(), Some(id2));
+    assert_eq!(
+        read_object(&plane, plane.resolve_ref("latest").unwrap().unwrap()).unwrap(),
+        b"version 2"
+    );
+}
