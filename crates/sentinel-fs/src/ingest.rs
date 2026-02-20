@@ -11,7 +11,7 @@
 
 use crate::artifact::{ArtifactPlane, ChunkHash, ObjectMetadata, FS_CHUNK_REFCOUNT, FS_CHUNKS, FS_MANIFESTS, FS_OBJECTS};
 use crate::chunker::chunk_data;
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 use std::io::Cursor;
 
 /// zstd compression level for chunk storage.
@@ -68,11 +68,29 @@ pub fn commit_ingest(session: IngestSession<'_>) -> anyhow::Result<u64> {
     let total_size = buffer.len() as u64;
     let chunk_count = chunks.len() as u32;
 
-    // Collect chunk hashes and compressed data
-    let mut chunk_entries: Vec<(ChunkHash, Vec<u8>)> = Vec::with_capacity(chunks.len());
+    // Pre-check which chunks already exist (read-only transaction, no fsync).
+    // This avoids expensive zstd compression for chunks that are already stored.
+    let existing_chunks = {
+        let rtxn = plane.db.begin_read()?;
+        let chunks_table = rtxn.open_table(FS_CHUNKS)?;
+        let mut set = std::collections::HashSet::with_capacity(chunks.len());
+        for chunk in &chunks {
+            if chunks_table.get(&chunk.hash)?.is_some() {
+                set.insert(chunk.hash);
+            }
+        }
+        set
+    };
+
+    // Compress only NEW chunks — skip compression entirely for dedup hits
+    let mut chunk_entries: Vec<(ChunkHash, Option<Vec<u8>>)> = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
-        let compressed = compress_chunk(&chunk.data);
-        chunk_entries.push((chunk.hash, compressed));
+        if existing_chunks.contains(&chunk.hash) {
+            chunk_entries.push((chunk.hash, None)); // dedup hit: no compressed data needed
+        } else {
+            let compressed = compress_chunk(&chunk.data);
+            chunk_entries.push((chunk.hash, Some(compressed)));
+        }
     }
     let manifest: Vec<ChunkHash> = chunk_entries.iter().map(|(h, _)| *h).collect();
     let manifest_bytes = serde_json::to_vec(&manifest)
@@ -92,11 +110,11 @@ pub fn commit_ingest(session: IngestSession<'_>) -> anyhow::Result<u64> {
         let mut manifests_table = wtxn.open_table(FS_MANIFESTS)?;
         let mut objects_table = wtxn.open_table(FS_OBJECTS)?;
 
-        // 1. Store chunks (skip existing = dedup) + 2. Increment refcounts
+        // 1. Store new chunks + 2. Increment refcounts for all
         for (hash, compressed) in &chunk_entries {
-            // Store chunk data only if not already present
-            if chunks_table.get(hash)?.is_none() {
-                chunks_table.insert(hash, compressed.as_slice())?;
+            if let Some(data) = compressed {
+                // New chunk: store compressed data
+                chunks_table.insert(hash, data.as_slice())?;
             }
             // Always increment refcount (even for deduplicated chunks)
             let current = refcount_table.get(hash)?.map(|g| g.value()).unwrap_or(0);
