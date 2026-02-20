@@ -57,6 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Adaptive parallel compression via rayon: serial for < 32 new chunks, parallel above
       - `chunk_data_parallel()` in chunker: serial CDC boundaries + parallel BLAKE3 hashing
       - Dedup paths 23-36% faster, eventual ingest 14.7ms (-35% vs 22.5ms)
+    - `FS_INGEST_SESSIONS` table (6th redb table): tracks in-progress ingests as `.part` files
+      - Pre-allocated ObjectId doubles as session ID for FUSE visibility
+      - Throttled progress updates (every 256 KB) to avoid DB thrashing on streaming writes
+      - Atomic session cleanup: commit removes entry in same write txn, abort removes separately
   - Streaming read planner (`src/read_planner.rs`): `read_object` + `read_object_streaming`
     - Manifest lookup → chunk decompression → sequential reassembly
   - Refcount GC (`src/gc.rs`): `gc_chunks` + `release_object`
@@ -68,7 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Dedup: identical files, 10x identical, similar data, prepend boundary stability, scaling 10MB
     - Multi-format: binary, HTML, PDF, JSON in single ingest pipeline
     - GC lifecycle, compression ratio, chunk size distribution verification
-  - 65 unit tests across 4 new modules + 19 integration tests, all green
+  - 73 unit tests across 4 new modules + 19 integration tests, all green
 - **Sentinel Judge: Enterprise Quality Analysis Service** (#26)
   - Bridge unit tests (6 tests: publish, dedup, subject mapping, config defaults, GetEventsSince)
   - Go benchmarks: judge (7), messaging (4), all passing with HeuristicPipeline at ~1µs (target <5ms)
