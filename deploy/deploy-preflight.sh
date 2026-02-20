@@ -51,7 +51,8 @@ MISSING=0
 
 while IFS=$'\t' read -r path expected_hash; do
   # Get hash from remote; SSH errors or missing files both result in "MISSING"
-  actual_output="$(ssh "${SSH_TARGET}" "sha256sum '${path}' 2>/dev/null || echo MISSING" 2>/dev/null || echo MISSING)"
+  # -n prevents SSH from consuming stdin (classic "ssh eats while-read stdin" bug)
+  actual_output="$(ssh -n "${SSH_TARGET}" "sha256sum '${path}' 2>/dev/null || echo MISSING" 2>/dev/null || echo MISSING)"
 
   if echo "${actual_output}" | grep -q "^MISSING$"; then
     printf "%-60s %-14s %-14s %s\n" \
