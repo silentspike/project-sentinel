@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VM-Deploy FULL Closure** (#28)
+  - `deploy/smoke-test.sh` + `deploy/smoke-test-remote.py`: post-deploy smoke test (health endpoints + systemd services, single SSH roundtrip, configurable timeout)
+  - `make deploy`: full deploy workflow with mandatory preflight verification
+  - `make preflight`: manifest hash verification against target VM
+  - `make smoke-test`: standalone smoke test target
+  - `deploy/generate-manifest.sh`: added `controlplane.toml` to artifact list (29 total artifacts)
+  - `deploy/release-manifest.json`: regenerated with all 5 binaries + 10 configs + 9 systemd units + 5 scripts
+
 - **Native Controlplane Kernel C1-C4** (#107)
   - Full observe/decide/act/verify cycle integrated into ECS tick-loop
   - 7 new modules in `services/sentinel-daemon/src/controlplane/`:

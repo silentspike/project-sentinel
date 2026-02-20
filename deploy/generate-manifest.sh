@@ -26,6 +26,7 @@ ARTIFACT_DEFS=(
   "config/simulation.toml|/opt/sentinel/config/simulation.toml|config"
   "config/rooms.toml|/opt/sentinel/config/rooms.toml|config"
   "config/company.toml|/opt/sentinel/config/company.toml|config"
+  "config/controlplane.toml|/opt/sentinel/config/controlplane.toml|config"
   "config/nats.conf|/etc/nats/nats.conf|config"
   # systemd units
   "deploy/systemd/sentinel-daemon.service|/etc/systemd/system/sentinel-daemon.service|systemd"
