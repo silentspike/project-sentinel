@@ -3,6 +3,7 @@ import { renderAgents, updateAgents } from './agents.js';
 import { renderFloorplan } from './floorplan.js';
 import { renderActivity, updateActivity } from './activity.js';
 import { renderMetrics } from './metrics.js';
+import { renderCockpit, updateCockpit } from './cockpit.js';
 
 let ws = null;
 
@@ -50,6 +51,8 @@ function connectWebSocket() {
         renderFloorplan(data.rooms);
       } else if (data.type === 'health_update') {
         updateLagDisplay(data.lag);
+      } else if (data.type === 'cockpit_update') {
+        updateCockpit();
       }
     } catch { /* ignore parse errors */ }
   };
@@ -71,20 +74,23 @@ async function init() {
 
   // Lade initiale Daten parallel
   try {
-    const [agentsRes, roomsRes, metricsRes] = await Promise.all([
+    const [agentsRes, roomsRes, metricsRes, cockpitRes] = await Promise.all([
       fetch('/api/agents'),
       fetch('/api/rooms'),
-      fetch('/api/metrics')
+      fetch('/api/metrics'),
+      fetch('/api/cockpit')
     ]);
 
     const agents = await agentsRes.json();
     const rooms = await roomsRes.json();
     const metrics = await metricsRes.json();
+    const cockpit = await cockpitRes.json();
 
     renderAgents(agents);
     renderFloorplan(rooms);
     renderMetrics(metrics);
     renderActivity(agents);
+    renderCockpit(cockpit);
 
     // Initiales Lag laden
     try {

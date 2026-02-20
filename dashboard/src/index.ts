@@ -4,6 +4,7 @@ import { openDatabases } from "./db";
 import { agentRoutes } from "./routes/agents";
 import { roomRoutes } from "./routes/rooms";
 import { metricRoutes } from "./routes/metrics";
+import { cockpitRoutes } from "./routes/cockpit";
 import { createWsHandler, startPolling } from "./ws";
 
 const app = new Hono();
@@ -12,6 +13,7 @@ const app = new Hono();
 app.route("/api", agentRoutes);
 app.route("/api", roomRoutes);
 app.route("/api", metricRoutes);
+app.route("/api", cockpitRoutes);
 
 // Statische Dateien
 app.use("/public/*", serveStatic({ root: "./" }));
