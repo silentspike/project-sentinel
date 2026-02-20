@@ -93,11 +93,9 @@ impl ControlplaneKernel {
         let observation = observe::observe(world, tick, timestamp_ms);
         let incidents = observe::detect_incidents(&observation, &self.config);
 
-        // Incidents persistieren
-        for incident in &incidents {
-            if let Err(e) = self.store.log_incident(incident) {
-                warn!(incident_id = %incident.id, error = %e, "Incident-Logging fehlgeschlagen");
-            }
+        // Incidents batch-persistieren
+        if let Err(e) = self.store.log_incidents_batch(&incidents) {
+            warn!(error = %e, "Incident-Batch-Logging fehlgeschlagen");
         }
 
         // Phase 2: Decide

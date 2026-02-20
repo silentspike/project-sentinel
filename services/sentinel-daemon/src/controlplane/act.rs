@@ -20,7 +20,6 @@ pub fn execute_actions(actions: &mut [ControlAction], store: &ControlplaneStore)
         match execute_single(action) {
             Ok(()) => {
                 action.status = ActionStatus::Executed;
-                store.log_action(action)?;
                 executed_count += 1;
             }
             Err(e) => {
@@ -29,10 +28,17 @@ pub fn execute_actions(actions: &mut [ControlAction], store: &ControlplaneStore)
                     error = %e,
                     "Action-Ausfuehrung fehlgeschlagen, bleibt Pending"
                 );
-                // Status bleibt Pending, wird im naechsten Zyklus erneut versucht
             }
         }
     }
+
+    // Batch-Write: alle ausgefuehrten Actions in einer Transaktion persistieren
+    let executed: Vec<_> = actions
+        .iter()
+        .filter(|a| a.status == ActionStatus::Executed)
+        .cloned()
+        .collect();
+    store.log_actions_batch(&executed)?;
 
     debug!(
         total = actions.len(),
