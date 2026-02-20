@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Verified
+
+- **sentinel-daemon 4f FULL gate closure** (#94)
+  - AC-1: Clippy zero warnings, 6 unit tests pass (orchestrator, shift mapping)
+  - AC-2: `--dry-run` exit 0 — loads 54 agents (24 active: 15 shift-1 + 9 shift-0)
+  - AC-3: Tick-loop stable 21+ hours on VM (tick 76080, 61.7MB memory, ~42s CPU)
+  - AC-4: SIGTERM graceful shutdown — `signal: SIGTERM empfangen`, `Shutdown eingeleitet`, no panic
+  - AC-5: implemented/deployed/verified evidence documented
+
 ### Added
 
 - **Sentinel Judge: Enterprise Quality Analysis Service** (#26)
