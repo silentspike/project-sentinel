@@ -53,7 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `release_object` decrements all chunk refcounts atomically before removal
   - Config: `config/storage.toml` (chunking params, compression level, GC interval)
   - 7 new Criterion benchmarks: chunker throughput, 1 MB/100 MB ingest, dedup identical/similar files, read planner, GC
-  - 56 new unit tests across 4 new modules; all 65 unit tests + 9 integration tests green
+  - 10 new integration tests for AC-4 (dedup effectiveness) and AC-5 (multi-format ingest)
+    - Dedup: identical files, 10x identical, similar data, prepend boundary stability, scaling 10MB
+    - Multi-format: binary, HTML, PDF, JSON in single ingest pipeline
+    - GC lifecycle, compression ratio, chunk size distribution verification
+  - 65 unit tests across 4 new modules + 19 integration tests, all green
 - **Sentinel Judge: Enterprise Quality Analysis Service** (#26)
   - Bridge unit tests (6 tests: publish, dedup, subject mapping, config defaults, GetEventsSince)
   - Go benchmarks: judge (7), messaging (4), all passing with HeuristicPipeline at ~1µs (target <5ms)
