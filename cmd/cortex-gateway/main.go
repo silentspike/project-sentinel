@@ -20,6 +20,7 @@ import (
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/observatory"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/resilience"
 	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/eventstore"
 )
 
@@ -132,6 +133,19 @@ func main() {
 	providerDeadline := proxy.ProviderDeadlineFromEnv()
 	logger.Info("provider deadline configured", "deadline", providerDeadline)
 
+	// 5b. InFlightMap for query lifecycle tracking
+	inflightMap := resilience.NewInFlightMap(providerDeadline)
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if n := inflightMap.Prune(); n > 0 {
+				logger.Debug("inflight prune", "pruned", n)
+			}
+		}
+	}()
+	logger.Info("inflight map enabled", "deadline", providerDeadline)
+
 	pipelineHandler := proxy.NewPipelineHandler(proxy.PipelineConfig{
 		Registry:         registry,
 		Config:           controlConfig,
@@ -143,6 +157,7 @@ func main() {
 		BreakerCfg:       proxy.BreakerConfigFromEnv(),
 		EventStore:       evStore,
 		Guardrails:       guardrailsEnforcer,
+		InFlight:         inflightMap,
 		ProviderDeadline: providerDeadline,
 	})
 

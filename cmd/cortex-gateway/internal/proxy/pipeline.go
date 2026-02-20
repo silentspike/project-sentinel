@@ -23,6 +23,7 @@ import (
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/guardrails"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/mapping"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/resilience"
 	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/eventstore"
 )
 
@@ -65,9 +66,10 @@ type PipelineConfig struct {
 	Capabilities     *capability.ProviderCapabilities
 	Logger           *slog.Logger
 	BreakerCfg       BreakerConfig
-	EventStore       *eventstore.Store    // optional: nil disables event persistence
-	Guardrails       *guardrails.Enforcer // optional: nil disables guardrails
-	ProviderDeadline time.Duration        // 0 = defaultProviderDeadline (20s)
+	EventStore       *eventstore.Store        // optional: nil disables event persistence
+	Guardrails       *guardrails.Enforcer     // optional: nil disables guardrails
+	InFlight         *resilience.InFlightMap  // optional: nil disables query tracking
+	ProviderDeadline time.Duration            // 0 = defaultProviderDeadline (20s)
 }
 
 // ProviderDeadlineFromEnv liest die Provider-Deadline aus ENV.
@@ -95,6 +97,7 @@ type PipelineHandler struct {
 	logger           *slog.Logger
 	eventStore       *eventstore.Store
 	guardrails       *guardrails.Enforcer
+	inflight         *resilience.InFlightMap
 	providerDeadline time.Duration
 
 	breakerMu  sync.RWMutex
@@ -129,6 +132,7 @@ func NewPipelineHandler(cfg PipelineConfig) *PipelineHandler {
 		logger:           cfg.Logger,
 		eventStore:       cfg.EventStore,
 		guardrails:       cfg.Guardrails,
+		inflight:         cfg.InFlight,
 		providerDeadline: deadline,
 		breakers:         make(map[string]*CircuitBreaker),
 		breakerCfg:       cfg.BreakerCfg,
@@ -250,6 +254,14 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), ph.providerDeadline)
 	defer cancel()
 
+	// Track query in InFlightMap (if enabled)
+	var queryTracked bool
+	if ph.inflight != nil {
+		tick := parseTick(req.Metadata)
+		ph.inflight.Track(requestID, tick)
+		queryTracked = true
+	}
+
 	prevState := breaker.State()
 	resp, err := provider.Send(ctx, &req)
 	breaker.Record(err)
@@ -260,6 +272,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
+		if queryTracked {
+			ph.inflight.Cancel(requestID)
+		}
 		duration := time.Since(start)
 		pipelineRequestsTotal.WithLabelValues(providerName, "error").Inc()
 		pipelineLatency.WithLabelValues(providerName).Observe(duration.Seconds())
@@ -272,7 +287,22 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Step 6b: Guardrails Record ---
+	// --- Step 6b: InFlight Accept (stale/expired check) ---
+	if queryTracked {
+		responseTick := parseTick(req.Metadata)
+		if !ph.inflight.Accept(requestID, responseTick) {
+			pipelineRequestsTotal.WithLabelValues(providerName, "stale").Inc()
+			pipelineLatency.WithLabelValues(providerName).Observe(time.Since(start).Seconds())
+			ph.logger.Warn("query response rejected (stale/expired)",
+				"request_id", requestID,
+				"provider", providerName,
+			)
+			http.Error(w, "query expired or stale response", http.StatusGatewayTimeout)
+			return
+		}
+	}
+
+	// --- Step 6c: Guardrails Record ---
 	if ph.guardrails != nil {
 		ph.guardrails.Record(providerName, resp.InputTokens, resp.OutputTokens)
 	}
