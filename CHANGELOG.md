@@ -71,6 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       - FIFO eviction, 64 MB default capacity, oversized chunk rejection (>25% of cache)
       - `read_chunk_decompressed()` on ArtifactPlane: cache-first path avoids redundant I/O + zstd
       - `cache_stats()` for observability (hits, misses, entries, bytes)
+    - io_uring batch reads for segment data path (feature-gated `iouring`)
+      - `SegmentStore::read_batch()`: submit N pread SQEs in one syscall, reap CQEs
+      - `ArtifactPlane::read_chunks_decompressed()`: cache-first batch path, single redb txn for misses
+      - `read_object()` now uses batch reads for full manifest fetch in one pass
+      - Sync fallback: cached file handles per segment_id, sequential pread (no io_uring)
   - Streaming read planner (`src/read_planner.rs`): `read_object` + `read_object_streaming`
     - Manifest lookup → chunk decompression → sequential reassembly (L1 cache accelerated)
   - Refcount GC (`src/gc.rs`): `gc_chunks` + `release_object`

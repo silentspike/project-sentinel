@@ -9,8 +9,8 @@ use crate::artifact::{ArtifactPlane, ChunkHash};
 
 /// Read an object's full content by ObjectId.
 ///
-/// Reads the manifest, then for each chunk: looks up ChunkLocation in redb,
-/// reads compressed data from the segment store, decompresses, and concatenates.
+/// Uses batch reads (io_uring when available) to fetch all chunks in one pass,
+/// then concatenates the decompressed data. Cache-first for each chunk.
 pub fn read_object(plane: &ArtifactPlane, object_id: u64) -> anyhow::Result<Vec<u8>> {
     let meta = plane
         .get_object(object_id)?
@@ -20,10 +20,10 @@ pub fn read_object(plane: &ArtifactPlane, object_id: u64) -> anyhow::Result<Vec<
         .get_manifest(object_id)?
         .ok_or_else(|| anyhow::anyhow!("Manifest for object {object_id} not found"))?;
 
-    let mut result = Vec::with_capacity(meta.size as usize);
+    let chunks = plane.read_chunks_decompressed(&manifest)?;
 
-    for hash in &manifest {
-        let chunk_data = plane.read_chunk_decompressed(hash)?;
+    let mut result = Vec::with_capacity(meta.size as usize);
+    for chunk_data in chunks {
         result.extend_from_slice(&chunk_data);
     }
 

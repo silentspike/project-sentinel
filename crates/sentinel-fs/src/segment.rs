@@ -9,8 +9,11 @@
 //! If the process crashes between appending and committing the redb index,
 //! the appended bytes become dead space. Segment compaction reclaims it.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(feature = "iouring")]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// Segment file magic bytes.
@@ -128,6 +131,129 @@ impl SegmentStore {
         file.seek(SeekFrom::Start(loc.offset))?;
         file.read_exact(&mut buf)?;
         Ok(buf)
+    }
+
+    /// Batch read multiple chunks from segment files.
+    ///
+    /// Uses io_uring when the `iouring` feature is enabled for reduced syscall
+    /// overhead (one submission for N reads). Falls back to sequential pread()
+    /// otherwise. Results are returned in the same order as `locations`.
+    pub fn read_batch(&self, locations: &[ChunkLocation]) -> Vec<anyhow::Result<Vec<u8>>> {
+        if locations.is_empty() {
+            return Vec::new();
+        }
+        #[cfg(feature = "iouring")]
+        {
+            if let Ok(results) = self.read_batch_uring(locations) {
+                return results;
+            }
+        }
+        self.read_batch_sync(locations)
+    }
+
+    /// Sync fallback: sequential reads with cached file handles.
+    fn read_batch_sync(&self, locations: &[ChunkLocation]) -> Vec<anyhow::Result<Vec<u8>>> {
+        // Cache open file handles by segment_id to avoid reopening
+        let mut open_files: HashMap<u32, File> = HashMap::new();
+        let mut results = Vec::with_capacity(locations.len());
+
+        for loc in locations {
+            let result = (|| -> anyhow::Result<Vec<u8>> {
+                let file = match open_files.get_mut(&loc.segment_id) {
+                    Some(f) => f,
+                    None => {
+                        let path = self.segment_path(loc.segment_id);
+                        let f = File::open(&path).map_err(|e| {
+                            anyhow::anyhow!("Segment {} not found: {e}", loc.segment_id)
+                        })?;
+                        open_files.entry(loc.segment_id).or_insert(f)
+                    }
+                };
+                let mut buf = vec![0u8; loc.compressed_len as usize];
+                file.seek(SeekFrom::Start(loc.offset))?;
+                file.read_exact(&mut buf)?;
+                Ok(buf)
+            })();
+            results.push(result);
+        }
+        results
+    }
+
+    /// io_uring batch read: submit all pread SQEs, reap CQEs.
+    #[cfg(feature = "iouring")]
+    fn read_batch_uring(
+        &self,
+        locations: &[ChunkLocation],
+    ) -> anyhow::Result<Vec<anyhow::Result<Vec<u8>>>> {
+        use io_uring::{opcode, types, IoUring};
+
+        let count = locations.len();
+        let mut ring = IoUring::new(count.min(256) as u32)?;
+
+        // Pre-open segment files (deduplicated by segment_id)
+        let mut open_files: HashMap<u32, File> = HashMap::new();
+        for loc in locations {
+            use std::collections::hash_map::Entry;
+            if let Entry::Vacant(e) = open_files.entry(loc.segment_id) {
+                let path = self.segment_path(loc.segment_id);
+                let f = File::open(&path).map_err(|err| {
+                    anyhow::anyhow!("Segment {} not found: {err}", loc.segment_id)
+                })?;
+                e.insert(f);
+            }
+        }
+
+        // Allocate buffers for all reads
+        let mut buffers: Vec<Vec<u8>> = locations
+            .iter()
+            .map(|loc| vec![0u8; loc.compressed_len as usize])
+            .collect();
+
+        // Submit all pread SQEs
+        for (i, loc) in locations.iter().enumerate() {
+            let file = &open_files[&loc.segment_id];
+            let fd = types::Fd(file.as_raw_fd());
+            let buf = &mut buffers[i];
+
+            let entry = opcode::Read::new(fd, buf.as_mut_ptr(), buf.len() as _)
+                .offset(loc.offset)
+                .build()
+                .user_data(i as u64);
+
+            // Safety: buffer outlives the SQE (both live until reap below)
+            unsafe {
+                ring.submission()
+                    .push(&entry)
+                    .map_err(|_| anyhow::anyhow!("io_uring SQ full"))?;
+            }
+        }
+
+        // Submit and wait for all completions
+        ring.submit_and_wait(count)?;
+
+        // Reap completions
+        let mut results: Vec<anyhow::Result<Vec<u8>>> = (0..count).map(|_| Ok(Vec::new())).collect();
+        for cqe in ring.completion() {
+            let idx = cqe.user_data() as usize;
+            let ret = cqe.result();
+            if ret < 0 {
+                results[idx] = Err(anyhow::anyhow!(
+                    "io_uring read failed for location {:?}: errno {}",
+                    locations[idx],
+                    -ret
+                ));
+            } else if (ret as u32) != locations[idx].compressed_len {
+                results[idx] = Err(anyhow::anyhow!(
+                    "io_uring short read: got {} expected {}",
+                    ret,
+                    locations[idx].compressed_len
+                ));
+            } else {
+                results[idx] = Ok(std::mem::take(&mut buffers[idx]));
+            }
+        }
+
+        Ok(results)
     }
 
     /// Fsync the current active segment to disk.
