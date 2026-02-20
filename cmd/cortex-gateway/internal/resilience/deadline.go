@@ -27,6 +27,11 @@ var (
 		Name: "sentinel_query_stale_dropped_total",
 		Help: "Total Zenoh responses dropped because query_id expired or response_tick < min_tick",
 	})
+
+	queryInflightGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "sentinel_query_inflight",
+		Help: "Current number of in-flight queries in the InFlightMap",
+	})
 )
 
 // QueryCancelledTotal returns the Prometheus counter for cancelled queries.
@@ -34,6 +39,9 @@ func QueryCancelledTotal() prometheus.Counter { return queryCancelledTotal }
 
 // QueryStaleDroppedTotal returns the Prometheus counter for stale-dropped responses.
 func QueryStaleDroppedTotal() prometheus.Counter { return queryStaleDroppedTotal }
+
+// QueryInflightGauge returns the Prometheus gauge for current in-flight queries.
+func QueryInflightGauge() prometheus.Gauge { return queryInflightGauge }
 
 // ZenohDeadlineFromEnv liest die Zenoh Query Deadline aus ENV.
 // Range: 50-120ms, Default: 100ms.
@@ -85,6 +93,7 @@ func (m *InFlightMap) Track(queryID string, minTick int64) time.Time {
 		deadline: dl,
 		minTick:  minTick,
 	}
+	queryInflightGauge.Inc()
 	return dl
 }
 
@@ -110,6 +119,7 @@ func (m *InFlightMap) Accept(queryID string, responseTick int64) bool {
 	if now.After(entry.deadline) {
 		delete(m.entries, queryID)
 		queryCancelledTotal.Inc()
+		queryInflightGauge.Dec()
 		return false
 	}
 
@@ -117,11 +127,13 @@ func (m *InFlightMap) Accept(queryID string, responseTick int64) bool {
 	if responseTick < entry.minTick {
 		delete(m.entries, queryID)
 		queryStaleDroppedTotal.Inc()
+		queryInflightGauge.Dec()
 		return false
 	}
 
 	// Akzeptiert — Query aus Map entfernen
 	delete(m.entries, queryID)
+	queryInflightGauge.Dec()
 	return true
 }
 
@@ -133,6 +145,7 @@ func (m *InFlightMap) Cancel(queryID string) {
 	if _, ok := m.entries[queryID]; ok {
 		delete(m.entries, queryID)
 		queryCancelledTotal.Inc()
+		queryInflightGauge.Dec()
 	}
 }
 
@@ -151,6 +164,7 @@ func (m *InFlightMap) Prune() int {
 			pruned++
 		}
 	}
+	queryInflightGauge.Sub(float64(pruned))
 	return pruned
 }
 
