@@ -129,7 +129,9 @@ fn concurrent_writes(c: &mut Criterion) {
 
 fn chunker_64kb_target(c: &mut Criterion) {
     // 8 MB of pseudo-random data — measures chunker throughput
-    let data: Vec<u8> = (0..8_388_608u32).map(|i| ((i.wrapping_mul(1664525).wrapping_add(1013904223)) >> 24) as u8).collect();
+    let data: Vec<u8> = (0..8_388_608u32)
+        .map(|i| ((i.wrapping_mul(1664525).wrapping_add(1013904223)) >> 24) as u8)
+        .collect();
 
     c.bench_function("chunker_64kb_target", |b| {
         b.iter(|| {
@@ -141,15 +143,15 @@ fn chunker_64kb_target(c: &mut Criterion) {
 
 fn ingest_1mb_file(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
-    let data: Vec<u8> = (0..1_048_576u32).map(|i| (i * 1664525 + 1013904223) as u8).collect();
+    let data: Vec<u8> = (0..1_048_576u32)
+        .map(|i| (i * 1664525 + 1013904223) as u8)
+        .collect();
 
     c.bench_function("ingest_1mb_file", |b| {
         b.iter_batched(
             || {
-                ArtifactPlane::open(
-                    dir.path().join(format!("ingest1mb_{}.redb", uuid_simple())),
-                )
-                .unwrap()
+                ArtifactPlane::open(dir.path().join(format!("ingest1mb_{}.redb", uuid_simple())))
+                    .unwrap()
             },
             |plane| {
                 let mut s = begin_ingest(&plane, "application/octet-stream");
@@ -163,7 +165,7 @@ fn ingest_1mb_file(c: &mut Criterion) {
 
 fn ingest_100mb_file(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
-    // 100 MB — tests scaling behaviour
+    // 100 MB — tests scaling behavior
     let data: Vec<u8> = (0..104_857_600u32)
         .map(|i| (i.wrapping_mul(1664525u32).wrapping_add(1013904223u32) >> 24) as u8)
         .collect();
@@ -174,7 +176,8 @@ fn ingest_100mb_file(c: &mut Criterion) {
         b.iter_batched(
             || {
                 ArtifactPlane::open(
-                    dir.path().join(format!("ingest100mb_{}.redb", uuid_simple())),
+                    dir.path()
+                        .join(format!("ingest100mb_{}.redb", uuid_simple())),
                 )
                 .unwrap()
             },
@@ -243,9 +246,7 @@ fn read_planner_1mb(c: &mut Criterion) {
 
     c.bench_function("read_planner_1mb", |b| {
         b.iter(|| {
-            std::hint::black_box(
-                read_object(&plane, std::hint::black_box(object_id)).unwrap(),
-            )
+            std::hint::black_box(read_object(&plane, std::hint::black_box(object_id)).unwrap())
         })
     });
 }
@@ -275,9 +276,7 @@ fn gc_1000_orphans(c: &mut Criterion) {
     let mut group = c.benchmark_group("gc");
     group.sample_size(10);
     group.bench_function("gc_1000_orphans", |b| {
-        b.iter(|| {
-            std::hint::black_box(gc_chunks(&plane).unwrap())
-        })
+        b.iter(|| std::hint::black_box(gc_chunks(&plane).unwrap()))
     });
     group.finish();
 }
