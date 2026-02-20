@@ -17,8 +17,13 @@
 
 use crate::artifact::{ArtifactPlane, ChunkHash, ObjectMetadata, FS_CHUNK_REFCOUNT, FS_CHUNKS, FS_MANIFESTS, FS_OBJECTS};
 use crate::chunker::chunk_data;
+use rayon::prelude::*;
 use redb::{ReadableDatabase, ReadableTable};
 use std::io::Cursor;
+
+/// Minimum number of new (non-dedup) chunks to justify rayon parallel compression.
+/// Below this threshold, serial compression is faster due to thread-pool overhead.
+const PARALLEL_COMPRESS_THRESHOLD: usize = 32;
 
 /// zstd compression level for chunk storage.
 const ZSTD_LEVEL: i32 = 3;
@@ -88,16 +93,8 @@ pub fn commit_ingest(session: IngestSession<'_>) -> anyhow::Result<u64> {
         set
     };
 
-    // Compress only NEW chunks — skip compression entirely for dedup hits
-    let mut chunk_entries: Vec<(ChunkHash, Option<Vec<u8>>)> = Vec::with_capacity(chunks.len());
-    for chunk in &chunks {
-        if existing_chunks.contains(&chunk.hash) {
-            chunk_entries.push((chunk.hash, None)); // dedup hit: no compressed data needed
-        } else {
-            let compressed = compress_chunk(&chunk.data);
-            chunk_entries.push((chunk.hash, Some(compressed)));
-        }
-    }
+    // Compress new chunks — parallel if enough work to justify thread-pool overhead
+    let chunk_entries = compress_chunks_adaptive(&chunks, &existing_chunks);
     let manifest: Vec<ChunkHash> = chunk_entries.iter().map(|(h, _)| *h).collect();
     let manifest_bytes = serde_json::to_vec(&manifest)
         .map_err(|e| anyhow::anyhow!("manifest serialize: {e}"))?;
@@ -191,15 +188,7 @@ impl<'a> BatchIngest<'a> {
             set
         };
 
-        let mut chunk_entries: Vec<(ChunkHash, Option<Vec<u8>>)> = Vec::with_capacity(chunks.len());
-        for chunk in &chunks {
-            if existing_chunks.contains(&chunk.hash) {
-                chunk_entries.push((chunk.hash, None));
-            } else {
-                let compressed = compress_chunk(&chunk.data);
-                chunk_entries.push((chunk.hash, Some(compressed)));
-            }
-        }
+        let chunk_entries = compress_chunks_adaptive(&chunks, &existing_chunks);
 
         let manifest: Vec<ChunkHash> = chunk_entries.iter().map(|(h, _)| *h).collect();
         let manifest_bytes = serde_json::to_vec(&manifest)
@@ -255,6 +244,45 @@ impl<'a> BatchIngest<'a> {
         wtxn.commit()?;
 
         Ok(object_ids)
+    }
+}
+
+/// Compress chunks adaptively: parallel via rayon if enough new chunks, serial otherwise.
+///
+/// For small files (< 32 new chunks), the rayon thread-pool overhead exceeds
+/// the compression time. For large files (hundreds of chunks), parallel zstd
+/// on multiple cores gives significant speedup.
+fn compress_chunks_adaptive(
+    chunks: &[crate::chunker::Chunk],
+    existing: &std::collections::HashSet<ChunkHash>,
+) -> Vec<(ChunkHash, Option<Vec<u8>>)> {
+    // Count how many chunks actually need compression
+    let new_count = chunks.iter().filter(|c| !existing.contains(&c.hash)).count();
+
+    if new_count >= PARALLEL_COMPRESS_THRESHOLD {
+        // Parallel: enough work to justify rayon overhead
+        chunks
+            .par_iter()
+            .map(|chunk| {
+                if existing.contains(&chunk.hash) {
+                    (chunk.hash, None)
+                } else {
+                    (chunk.hash, Some(compress_chunk(&chunk.data)))
+                }
+            })
+            .collect()
+    } else {
+        // Serial: fast path for small files or mostly-dedup
+        chunks
+            .iter()
+            .map(|chunk| {
+                if existing.contains(&chunk.hash) {
+                    (chunk.hash, None)
+                } else {
+                    (chunk.hash, Some(compress_chunk(&chunk.data)))
+                }
+            })
+            .collect()
     }
 }
 
