@@ -67,3 +67,6 @@ bitnet/bitnet-inference
 *.db-wal
 *.db-shm
 /ram/
+
+# Generated deploy artifacts (created by deploy/generate-manifest.sh)
+deploy/release-manifest.json

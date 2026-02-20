@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# generate-manifest.sh — Generates deploy/release-manifest.json with SHA-256 hashes
+# for all deployment artifacts. Run from the repo root before deploying.
+# Usage: bash deploy/generate-manifest.sh
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+OUTPUT="${REPO_ROOT}/deploy/release-manifest.json"
+
+# Artifact mapping: source (repo-relative) -> destination (VM path) -> type
+# Format: "source|dest|type"
+ARTIFACT_DEFS=(
+  # Binaries
+  "target/release/sentinel-daemon|/opt/sentinel/bin/sentinel-daemon|binary"
+  "target/release/cortex-gateway|/opt/sentinel/bin/cortex-gateway|binary"
+  "target/release/sentinel-judge|/opt/sentinel/bin/sentinel-judge|binary"
+  "target/release/sentinel-nats-bridge|/opt/sentinel/bin/sentinel-nats-bridge|binary"
+  # Configs
+  "config/daemon.toml|/opt/sentinel/config/daemon.toml|config"
+  "config/cortex-gateway.toml|/opt/sentinel/config/cortex-gateway.toml|config"
+  "config/nightrun.toml|/opt/sentinel/config/nightrun.toml|config"
+  "config/judge.toml|/opt/sentinel/config/judge.toml|config"
+  "config/nats-bridge.toml|/opt/sentinel/config/nats-bridge.toml|config"
+  "config/simulation.toml|/opt/sentinel/config/simulation.toml|config"
+  "config/rooms.toml|/opt/sentinel/config/rooms.toml|config"
+  "config/company.toml|/opt/sentinel/config/company.toml|config"
+  "config/nats.conf|/opt/sentinel/config/nats.conf|config"
+  # systemd units
+  "deploy/systemd/sentinel-daemon.service|/etc/systemd/system/sentinel-daemon.service|systemd"
+  "deploy/systemd/sentinel-cortex.service|/etc/systemd/system/sentinel-cortex.service|systemd"
+  "deploy/systemd/sentinel-judge.service|/etc/systemd/system/sentinel-judge.service|systemd"
+  "deploy/systemd/sentinel-nats-bridge.service|/etc/systemd/system/sentinel-nats-bridge.service|systemd"
+  "deploy/systemd/sentinel-nightrun.service|/etc/systemd/system/sentinel-nightrun.service|systemd"
+  "deploy/systemd/sentinel-nightrun.timer|/etc/systemd/system/sentinel-nightrun.timer|systemd"
+  "deploy/systemd/sentinel-dashboard.service|/etc/systemd/system/sentinel-dashboard.service|systemd"
+  "deploy/systemd/nats-server.service|/etc/systemd/system/nats-server.service|systemd"
+  "deploy/systemd/sentinel.target|/etc/systemd/system/sentinel.target|systemd"
+  # Init scripts
+  "deploy/scripts/init-cgroups.sh|/opt/sentinel/scripts/init-cgroups.sh|script"
+  "deploy/scripts/init-dirs.sh|/opt/sentinel/scripts/init-dirs.sh|script"
+  "deploy/scripts/init-hugepages.sh|/opt/sentinel/scripts/init-hugepages.sh|script"
+  "deploy/scripts/init-sysctl.sh|/opt/sentinel/scripts/init-sysctl.sh|script"
+  "deploy/scripts/init-tmpfs.sh|/opt/sentinel/scripts/init-tmpfs.sh|script"
+)
+
+cd "${REPO_ROOT}"
+
+GIT_SHA="$(git rev-parse HEAD)"
+CREATED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+echo "Generating release manifest..."
+echo "  Git SHA:    ${GIT_SHA}"
+echo "  Created at: ${CREATED_AT}"
+echo ""
+
+# Start JSON
+{
+  printf '{\n'
+  printf '  "version": "1.0",\n'
+  printf '  "created_at": "%s",\n' "${CREATED_AT}"
+  printf '  "git_sha": "%s",\n' "${GIT_SHA}"
+  printf '  "artifacts": [\n'
+} > "${OUTPUT}"
+
+FIRST=1
+MISSING=0
+
+for def in "${ARTIFACT_DEFS[@]}"; do
+  IFS='|' read -r source dest type <<< "${def}"
+
+  if [ ! -f "${source}" ]; then
+    echo "  SKIP (not found): ${source}" >&2
+    MISSING=$((MISSING + 1))
+    continue
+  fi
+
+  HASH="$(sha256sum "${source}" | awk '{print $1}')"
+
+  if [ "${FIRST}" -eq 1 ]; then
+    FIRST=0
+  else
+    printf ',\n' >> "${OUTPUT}"
+  fi
+
+  {
+    printf '    {\n'
+    printf '      "path": "%s",\n' "${dest}"
+    printf '      "source": "%s",\n' "${source}"
+    printf '      "sha256": "%s",\n' "${HASH}"
+    printf '      "type": "%s"\n' "${type}"
+    printf '    }'
+  } >> "${OUTPUT}"
+
+  echo "  OK: ${source} -> ${dest} [${HASH:0:12}...]"
+done
+
+{
+  printf '\n  ]\n'
+  printf '}\n'
+} >> "${OUTPUT}"
+
+echo ""
+echo "Manifest written to: ${OUTPUT}"
+
+if [ "${MISSING}" -gt 0 ]; then
+  echo "WARNING: ${MISSING} artifact(s) not found (binaries not built yet?)" >&2
+fi

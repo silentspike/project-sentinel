@@ -49,8 +49,13 @@ jobs:
           format: cyclonedx-json
           output-file: sbom.cdx.json
 
-      - name: Attach SBOM to Release
+      - name: Generate release manifest
+        run: bash deploy/generate-manifest.sh
+
+      - name: Attach SBOM and manifest to Release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
         with:
           tag_name: ${{ steps.version.outputs.VERSION }}
-          files: sbom.cdx.json
+          files: |
+            sbom.cdx.json
+            deploy/release-manifest.json
