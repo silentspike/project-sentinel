@@ -372,6 +372,9 @@ Inspektion = "Inspektion"
 # Dashboard Cockpit words (Issue #108 - German in TypeScript string literals)
 Kompensation = "Kompensation"
 
+# Governance Docs words (Issue #111 - German in Markdown)
+Modells = "Modells"
+
 # Judge Benchmark + LLM Analyzer words (Issue #26 - German in Go bench/analyzer data)
 enthusiastisch = "enthusiastisch"
 Verhaltensanalyst = "Verhaltensanalyst"
