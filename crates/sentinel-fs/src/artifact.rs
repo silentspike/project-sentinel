@@ -295,6 +295,68 @@ impl ArtifactPlane {
         Ok(decompressed)
     }
 
+    /// Batch read + decompress multiple chunks. Cache-first, then batch I/O for misses.
+    ///
+    /// Uses `SegmentStore::read_batch()` (io_uring when available) for cache misses,
+    /// reducing syscall overhead when reading many chunks (e.g. full object reassembly).
+    pub fn read_chunks_decompressed(&self, hashes: &[ChunkHash]) -> anyhow::Result<Vec<Vec<u8>>> {
+        let mut results: Vec<Option<Vec<u8>>> = vec![None; hashes.len()];
+
+        // Phase 1: Check cache for each hash, collect miss indices
+        let mut miss_indices: Vec<usize> = Vec::new();
+        {
+            let mut cache = self.cache.lock().map_err(|e| anyhow::anyhow!("cache lock: {e}"))?;
+            for (i, hash) in hashes.iter().enumerate() {
+                if let Some(data) = cache.get(hash) {
+                    results[i] = Some(data.to_vec());
+                } else {
+                    miss_indices.push(i);
+                }
+            }
+        }
+
+        if miss_indices.is_empty() {
+            return Ok(results.into_iter().map(|r| r.unwrap()).collect());
+        }
+
+        // Phase 2: Look up ChunkLocations for all misses in one redb read txn
+        let miss_locations: Vec<(usize, ChunkLocation)> = {
+            let rtxn = self.db.begin_read()?;
+            let table = rtxn.open_table(FS_CHUNKS)?;
+            let mut locs = Vec::with_capacity(miss_indices.len());
+            for &idx in &miss_indices {
+                let hash = &hashes[idx];
+                let loc_bytes = table.get(hash)?.ok_or_else(|| {
+                    anyhow::anyhow!("Chunk {} not found", crate::cas::hex_encode(hash))
+                })?;
+                let loc = ChunkLocation::from_bytes(loc_bytes.value())?;
+                locs.push((idx, loc));
+            }
+            locs
+        };
+
+        // Phase 3: Batch read from segment store
+        let locations_only: Vec<_> = miss_locations.iter().map(|(_, loc)| *loc).collect();
+        let compressed_results = {
+            let segments = self.segments.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+            segments.read_batch(&locations_only)
+        };
+
+        // Phase 4: Decompress and insert into cache
+        {
+            let mut cache = self.cache.lock().map_err(|e| anyhow::anyhow!("cache lock: {e}"))?;
+            for (batch_idx, compressed_result) in compressed_results.into_iter().enumerate() {
+                let (result_idx, _) = miss_locations[batch_idx];
+                let compressed = compressed_result?;
+                let decompressed = crate::ingest::decompress_chunk(&compressed)?;
+                cache.insert(hashes[result_idx], decompressed.clone());
+                results[result_idx] = Some(decompressed);
+            }
+        }
+
+        Ok(results.into_iter().map(|r| r.unwrap()).collect())
+    }
+
     /// Get L1 cache statistics (for observability/benchmarks).
     pub fn cache_stats(&self) -> crate::chunk_cache::CacheStats {
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).stats()
