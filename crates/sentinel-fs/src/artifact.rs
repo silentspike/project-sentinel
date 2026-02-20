@@ -7,9 +7,23 @@
 //! - `FS_CHUNK_REFCOUNT`: `[u8;16]` -> u32 (how many manifests reference this chunk)
 //! - `FS_OBJECT_REFS`: &str (name) -> u64 (ObjectId, named references)
 
-use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
+
+/// Durability level for ArtifactPlane write transactions.
+///
+/// Controls the fsync behavior on commit:
+/// - `Immediate` (default): every commit fsyncs to disk — safe against VM crashes.
+/// - `Eventual`: commits skip fsync — significantly faster on VMs but data written
+///   since the last `Immediate` commit may be lost on crash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityLevel {
+    /// Every commit is durable on disk (fsync). Default.
+    Immediate,
+    /// Commits skip fsync. Much faster on VMs, but not crash-safe.
+    Eventual,
+}
 
 // --- Table Definitions ---
 
@@ -75,15 +89,24 @@ pub type ChunkHash = [u8; 16];
 /// The Artifact Plane: wraps a redb Database and provides access to all 5 tables.
 pub struct ArtifactPlane {
     pub(crate) db: Database,
+    durability: DurabilityLevel,
 }
 
 impl ArtifactPlane {
-    /// Open or create an ArtifactPlane database.
+    /// Open or create an ArtifactPlane database with `Immediate` durability.
     pub fn open(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+        Self::open_with_durability(path, DurabilityLevel::Immediate)
+    }
+
+    /// Open or create an ArtifactPlane database with a specific durability level.
+    pub fn open_with_durability(
+        path: impl AsRef<std::path::Path>,
+        durability: DurabilityLevel,
+    ) -> anyhow::Result<Self> {
         let db = Database::create(path.as_ref())
             .map_err(|e| anyhow::anyhow!("ArtifactPlane open: {e}"))?;
 
-        // Initialize all tables in one transaction.
+        // Initialize all tables in one transaction (always Immediate for schema init).
         let wtxn = db.begin_write()?;
         {
             wtxn.open_table(FS_OBJECTS)?;
@@ -94,13 +117,25 @@ impl ArtifactPlane {
         }
         wtxn.commit()?;
 
-        Ok(Self { db })
+        Ok(Self { db, durability })
+    }
+
+    /// Start a write transaction with the configured durability level.
+    pub(crate) fn begin_write(&self) -> anyhow::Result<WriteTransaction> {
+        let mut wtxn = self.db.begin_write()?;
+        match self.durability {
+            DurabilityLevel::Immediate => {} // redb default
+            DurabilityLevel::Eventual => {
+                wtxn.set_durability(redb::Durability::None)?;
+            }
+        }
+        Ok(wtxn)
     }
 
     /// Allocate the next ObjectId (monotonic counter stored at key 0 in FS_OBJECTS using a
     /// separate counter key convention: we use u64::MAX as the counter slot).
     pub fn next_object_id(&self) -> anyhow::Result<u64> {
-        let wtxn = self.db.begin_write()?;
+        let wtxn = self.begin_write()?;
         let id = {
             let mut table = wtxn.open_table(FS_OBJECTS)?;
             // Use key u64::MAX as counter slot (never a real ObjectId)
@@ -183,7 +218,7 @@ impl ArtifactPlane {
 
     /// Set a named reference.
     pub fn set_ref(&self, name: &str, object_id: u64) -> anyhow::Result<()> {
-        let wtxn = self.db.begin_write()?;
+        let wtxn = self.begin_write()?;
         {
             let mut table = wtxn.open_table(FS_OBJECT_REFS)?;
             table.insert(name, object_id)?;
@@ -253,5 +288,19 @@ mod tests {
         plane.set_ref("latest", 42).unwrap();
         assert_eq!(plane.resolve_ref("latest").unwrap(), Some(42));
         assert_eq!(plane.resolve_ref("unknown").unwrap(), None);
+    }
+
+    #[test]
+    fn open_with_eventual_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let plane = ArtifactPlane::open_with_durability(
+            dir.path().join("eventual.redb"),
+            DurabilityLevel::Eventual,
+        )
+        .unwrap();
+        assert_eq!(plane.durability, DurabilityLevel::Eventual);
+        // Writes still work (just without fsync)
+        let id = plane.next_object_id().unwrap();
+        assert_eq!(id, 1);
     }
 }

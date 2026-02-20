@@ -24,7 +24,7 @@ pub fn gc_chunks(plane: &ArtifactPlane) -> anyhow::Result<ChunkGcStats> {
     let mut stats = ChunkGcStats::default();
 
     // Delete in a write transaction
-    let wtxn = plane.db.begin_write()?;
+    let wtxn = plane.begin_write()?;
     {
         let mut chunks_table = wtxn.open_table(FS_CHUNKS)?;
         // Also clean up any zero-value refcount entries that might exist
@@ -57,7 +57,7 @@ pub fn release_object(plane: &ArtifactPlane, object_id: u64) -> anyhow::Result<(
         None => return Ok(()), // already gone
     };
 
-    let wtxn = plane.db.begin_write()?;
+    let wtxn = plane.begin_write()?;
     {
         let mut refcount_table = wtxn.open_table(FS_CHUNK_REFCOUNT)?;
         let mut manifests_table = wtxn.open_table(crate::artifact::FS_MANIFESTS)?;

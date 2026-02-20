@@ -109,7 +109,7 @@ pub fn commit_ingest(session: IngestSession<'_>) -> anyhow::Result<u64> {
     let meta_bytes = meta.serialize()?;
 
     // Atomic write transaction: all-or-nothing
-    let wtxn = plane.db.begin_write()?;
+    let wtxn = plane.begin_write()?;
     {
         let mut chunks_table = wtxn.open_table(FS_CHUNKS)?;
         let mut refcount_table = wtxn.open_table(FS_CHUNK_REFCOUNT)?;
@@ -230,7 +230,7 @@ impl<'a> BatchIngest<'a> {
         }
 
         // Single write transaction for everything
-        let wtxn = self.plane.db.begin_write()?;
+        let wtxn = self.plane.begin_write()?;
         {
             let mut chunks_table = wtxn.open_table(FS_CHUNKS)?;
             let mut refcount_table = wtxn.open_table(FS_CHUNK_REFCOUNT)?;

@@ -1,7 +1,7 @@
 //! Benchmarks for sentinel-fs: CAS, metadata, layer operations, and Artifact Plane.
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use sentinel_fs::artifact::ArtifactPlane;
+use sentinel_fs::artifact::{ArtifactPlane, DurabilityLevel};
 use sentinel_fs::cas::CasStore;
 use sentinel_fs::chunker::chunk_data;
 use sentinel_fs::gc::{gc_chunks, release_object};
@@ -152,6 +152,31 @@ fn ingest_1mb_file(c: &mut Criterion) {
             || {
                 ArtifactPlane::open(dir.path().join(format!("ingest1mb_{}.redb", uuid_simple())))
                     .unwrap()
+            },
+            |plane| {
+                let mut s = begin_ingest(&plane, "application/octet-stream");
+                s.write(std::hint::black_box(&data));
+                std::hint::black_box(commit_ingest(s).unwrap())
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+}
+
+fn ingest_1mb_eventual(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let data: Vec<u8> = (0..1_048_576u32)
+        .map(|i| (i * 1664525 + 1013904223) as u8)
+        .collect();
+
+    c.bench_function("ingest_1mb_eventual", |b| {
+        b.iter_batched(
+            || {
+                ArtifactPlane::open_with_durability(
+                    dir.path().join(format!("eventual_{}.redb", uuid_simple())),
+                    DurabilityLevel::Eventual,
+                )
+                .unwrap()
             },
             |plane| {
                 let mut s = begin_ingest(&plane, "application/octet-stream");
@@ -326,6 +351,7 @@ criterion_group!(
     // New Artifact Plane benchmarks
     chunker_64kb_target,
     ingest_1mb_file,
+    ingest_1mb_eventual,
     ingest_100mb_file,
     dedup_identical_files,
     dedup_similar_files,
