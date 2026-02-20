@@ -1,12 +1,18 @@
 //! Transactional ingest pipeline for the Artifact Plane.
 //!
-//! Usage:
+//! Single ingest:
 //! ```ignore
-//! let session = begin_ingest(&plane);
-//! session.write(data);          // can call multiple times (streaming)
-//! let object_id = commit_ingest(session)?;  // atomic redb transaction
-//! // -- or --
-//! abort_ingest(session);        // temp cleanup, no DB changes
+//! let session = begin_ingest(&plane, "text/plain");
+//! session.write(data);
+//! let object_id = commit_ingest(session)?;  // 1 redb txn + 1 fsync
+//! ```
+//!
+//! Batch ingest (amortizes fsync across N objects):
+//! ```ignore
+//! let mut batch = BatchIngest::new(&plane);
+//! batch.add(data1, "text/plain");
+//! batch.add(data2, "application/pdf");
+//! let ids = batch.commit()?;  // 1 redb txn + 1 fsync for all N objects
 //! ```
 
 use crate::artifact::{ArtifactPlane, ChunkHash, ObjectMetadata, FS_CHUNK_REFCOUNT, FS_CHUNKS, FS_MANIFESTS, FS_OBJECTS};
@@ -137,6 +143,119 @@ pub fn commit_ingest(session: IngestSession<'_>) -> anyhow::Result<u64> {
 pub fn abort_ingest(session: IngestSession<'_>) {
     // Simply drop the session — buffer is on the heap, no DB changes were made.
     drop(session);
+}
+
+/// Prepared data for one object in a batch (post-chunking, pre-commit).
+struct PreparedIngest {
+    chunk_entries: Vec<(ChunkHash, Option<Vec<u8>>)>,
+    manifest_bytes: Vec<u8>,
+    meta_bytes: Vec<u8>,
+}
+
+/// Batch ingest: accumulate multiple objects, commit all in one transaction.
+///
+/// This amortizes the fsync cost across N objects: instead of N separate
+/// write transactions (each with its own fsync), we do chunking + compression
+/// up front, then write everything in a single atomic transaction.
+pub struct BatchIngest<'a> {
+    plane: &'a ArtifactPlane,
+    prepared: Vec<PreparedIngest>,
+}
+
+impl<'a> BatchIngest<'a> {
+    pub fn new(plane: &'a ArtifactPlane) -> Self {
+        Self {
+            plane,
+            prepared: Vec::new(),
+        }
+    }
+
+    /// Add data to the batch. Chunking and compression happen immediately;
+    /// the DB write is deferred until `commit()`.
+    pub fn add(&mut self, data: &[u8], mime: impl Into<String>) -> anyhow::Result<()> {
+        let mime = mime.into();
+        let chunks: Vec<_> = chunk_data(data).collect();
+        let total_size = data.len() as u64;
+        let chunk_count = chunks.len() as u32;
+
+        // Pre-check existing chunks
+        let existing_chunks = {
+            let rtxn = self.plane.db.begin_read()?;
+            let chunks_table = rtxn.open_table(FS_CHUNKS)?;
+            let mut set = std::collections::HashSet::with_capacity(chunks.len());
+            for chunk in &chunks {
+                if chunks_table.get(&chunk.hash)?.is_some() {
+                    set.insert(chunk.hash);
+                }
+            }
+            set
+        };
+
+        let mut chunk_entries: Vec<(ChunkHash, Option<Vec<u8>>)> = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            if existing_chunks.contains(&chunk.hash) {
+                chunk_entries.push((chunk.hash, None));
+            } else {
+                let compressed = compress_chunk(&chunk.data);
+                chunk_entries.push((chunk.hash, Some(compressed)));
+            }
+        }
+
+        let manifest: Vec<ChunkHash> = chunk_entries.iter().map(|(h, _)| *h).collect();
+        let manifest_bytes = serde_json::to_vec(&manifest)
+            .map_err(|e| anyhow::anyhow!("manifest serialize: {e}"))?;
+
+        let meta = ObjectMetadata::new(total_size, &mime, chunk_count);
+        let meta_bytes = meta.serialize()?;
+
+        self.prepared.push(PreparedIngest {
+            chunk_entries,
+            manifest_bytes,
+            meta_bytes,
+        });
+        Ok(())
+    }
+
+    /// Commit all prepared objects in a single write transaction (one fsync).
+    /// Returns the ObjectIds in the same order as `add()` calls.
+    pub fn commit(self) -> anyhow::Result<Vec<u64>> {
+        if self.prepared.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Allocate all ObjectIds first
+        let mut object_ids = Vec::with_capacity(self.prepared.len());
+        for _ in &self.prepared {
+            object_ids.push(self.plane.next_object_id()?);
+        }
+
+        // Single write transaction for everything
+        let wtxn = self.plane.db.begin_write()?;
+        {
+            let mut chunks_table = wtxn.open_table(FS_CHUNKS)?;
+            let mut refcount_table = wtxn.open_table(FS_CHUNK_REFCOUNT)?;
+            let mut manifests_table = wtxn.open_table(FS_MANIFESTS)?;
+            let mut objects_table = wtxn.open_table(FS_OBJECTS)?;
+
+            for (i, prep) in self.prepared.iter().enumerate() {
+                let oid = object_ids[i];
+
+                for (hash, compressed) in &prep.chunk_entries {
+                    if let Some(data) = compressed {
+                        chunks_table.insert(hash, data.as_slice())?;
+                    }
+                    let current = refcount_table.get(hash)?.map(|g| g.value()).unwrap_or(0);
+                    refcount_table.insert(hash, current + 1)?;
+                }
+
+                manifests_table.insert(oid, prep.manifest_bytes.as_slice())?;
+                objects_table.insert(oid, prep.meta_bytes.as_slice())?;
+            }
+        }
+        wtxn.commit()?;
+
+        Ok(object_ids)
+    }
 }
 
 /// Compress a chunk with zstd, falling back to raw if compression doesn't help.
@@ -290,6 +409,64 @@ mod tests {
 
         for hash in &manifest {
             assert_eq!(plane.get_chunk_refcount(hash).unwrap(), 2);
+        }
+    }
+
+    #[test]
+    fn batch_ingest_multiple_objects() {
+        let (plane, _dir) = temp_plane();
+        let data1 = vec![0xDD; 100_000];
+        let data2 = vec![0xEE; 150_000];
+        let data3 = b"short text".to_vec();
+
+        let mut batch = BatchIngest::new(&plane);
+        batch.add(&data1, "application/octet-stream").unwrap();
+        batch.add(&data2, "application/octet-stream").unwrap();
+        batch.add(&data3, "text/plain").unwrap();
+        let ids = batch.commit().unwrap();
+
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], 1);
+        assert_eq!(ids[1], 2);
+        assert_eq!(ids[2], 3);
+
+        // Verify each object's metadata
+        let m1 = plane.get_object(ids[0]).unwrap().unwrap();
+        assert_eq!(m1.size, 100_000);
+        let m2 = plane.get_object(ids[1]).unwrap().unwrap();
+        assert_eq!(m2.size, 150_000);
+        let m3 = plane.get_object(ids[2]).unwrap().unwrap();
+        assert_eq!(m3.size, 10);
+        assert_eq!(m3.mime, "text/plain");
+    }
+
+    #[test]
+    fn batch_ingest_empty_is_noop() {
+        let (plane, _dir) = temp_plane();
+        let batch = BatchIngest::new(&plane);
+        let ids = batch.commit().unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn batch_ingest_dedup_across_objects() {
+        let (plane, _dir) = temp_plane();
+        let data = vec![0xFF; 200_000];
+
+        let mut batch = BatchIngest::new(&plane);
+        batch.add(&data, "application/octet-stream").unwrap();
+        batch.add(&data, "application/octet-stream").unwrap();
+        let ids = batch.commit().unwrap();
+
+        assert_ne!(ids[0], ids[1]);
+
+        let m1 = plane.get_manifest(ids[0]).unwrap().unwrap();
+        let m2 = plane.get_manifest(ids[1]).unwrap().unwrap();
+        assert_eq!(m1, m2, "identical data must have identical manifests");
+
+        for hash in &m1 {
+            let rc = plane.get_chunk_refcount(hash).unwrap();
+            assert_eq!(rc, 2, "batch dedup must increment refcount for each object");
         }
     }
 
