@@ -365,8 +365,9 @@ Funktions = "Funktions"
 signifikant = "signifikant"
 Methode = "Methode"
 
-# sentinel-daemon words (Issue #94 - German in doc comments + string literals)
+# sentinel-daemon words (Issue #94, #107 - German in doc comments + string literals)
 Variante = "Variante"
+Inspektion = "Inspektion"
 
 # Judge Benchmark + LLM Analyzer words (Issue #26 - German in Go bench/analyzer data)
 enthusiastisch = "enthusiastisch"
