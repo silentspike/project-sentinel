@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use crate::chunk_cache::{ChunkCache, DEFAULT_CACHE_BYTES};
+use crate::commit_scheduler::{CommitScheduler, SchedulerConfig};
 use crate::segment::{ChunkLocation, SegmentStore};
 
 /// Durability level for ArtifactPlane write transactions.
@@ -145,6 +146,8 @@ pub struct ArtifactPlane {
     pub(crate) segments: Mutex<SegmentStore>,
     /// L1 RAM cache for decompressed chunk data (avoids redundant segment reads + zstd).
     cache: Mutex<ChunkCache>,
+    /// Adaptive commit scheduler: smooths write spikes under I/O pressure.
+    scheduler: Mutex<CommitScheduler>,
 }
 
 impl ArtifactPlane {
@@ -184,11 +187,18 @@ impl ArtifactPlane {
             durability,
             segments: Mutex::new(segments),
             cache: Mutex::new(ChunkCache::new(DEFAULT_CACHE_BYTES)),
+            scheduler: Mutex::new(CommitScheduler::new(SchedulerConfig::default())),
         })
     }
 
     /// Start a write transaction with the configured durability level.
+    /// The commit scheduler may inject a short delay if IOPS budget is exceeded.
     pub(crate) fn begin_write(&self) -> anyhow::Result<WriteTransaction> {
+        // Adaptive throttle: delay if commit rate exceeds IOPS budget
+        if let Ok(mut sched) = self.scheduler.lock() {
+            sched.pre_commit();
+        }
+
         let mut wtxn = self.db.begin_write()?;
         match self.durability {
             DurabilityLevel::Immediate => {} // redb default
@@ -197,6 +207,11 @@ impl ArtifactPlane {
             }
         }
         Ok(wtxn)
+    }
+
+    /// Get commit scheduler statistics.
+    pub fn scheduler_stats(&self) -> crate::commit_scheduler::SchedulerStats {
+        self.scheduler.lock().unwrap_or_else(|e| e.into_inner()).stats()
     }
 
     /// Allocate the next ObjectId (monotonic counter stored at key 0 in FS_OBJECTS using a
