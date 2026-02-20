@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Statusmodell + DoD Gate Audit** (#111)
+  - `docs/STATUS_MODEL.md`: Statusmodell-Dokumentation (implemented/deployed/verified Lifecycle)
+  - `docs/DEFINITION_OF_DONE.md`: Definition of Done Checklisten (Feature, Gate, Docs)
+  - `docs/GATE_AUDIT_2026-02-20.md`: Label-Hygiene Audit (5 Fixes, 0 Governance-Verstoesse)
+  - Label-Fixes: #108, #107, #99, #28, #94 von falschem Status auf `status:completed`
+
 - **Dashboard Operator Cockpit** (#108)
   - New "Cockpit" view: priorisierte Incident-Liste statt Metric Wall (anti-Metric-Wall Design)
   - Incidents aus EventStore (chaos_triggered, consolidation_failed, despawned, nightrun failures)
