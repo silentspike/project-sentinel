@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+use crate::chunk_cache::{ChunkCache, DEFAULT_CACHE_BYTES};
 use crate::segment::{ChunkLocation, SegmentStore};
 
 /// Durability level for ArtifactPlane write transactions.
@@ -142,6 +143,8 @@ pub struct ArtifactPlane {
     /// Segment pack storage for chunk data (append-only files).
     /// Wrapped in Mutex for interior mutability (SegmentStore::append needs &mut).
     pub(crate) segments: Mutex<SegmentStore>,
+    /// L1 RAM cache for decompressed chunk data (avoids redundant segment reads + zstd).
+    cache: Mutex<ChunkCache>,
 }
 
 impl ArtifactPlane {
@@ -180,6 +183,7 @@ impl ArtifactPlane {
             db,
             durability,
             segments: Mutex::new(segments),
+            cache: Mutex::new(ChunkCache::new(DEFAULT_CACHE_BYTES)),
         })
     }
 
@@ -264,6 +268,36 @@ impl ArtifactPlane {
         let loc = ChunkLocation::from_bytes(loc_bytes.value())?;
         let segments = self.segments.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         segments.read(&loc)
+    }
+
+    /// Read and decompress a chunk, using the L1 cache to avoid redundant I/O + zstd.
+    ///
+    /// Cache flow: check cache → (hit: return) | (miss: segment read → decompress → insert → return)
+    pub fn read_chunk_decompressed(&self, hash: &ChunkHash) -> anyhow::Result<Vec<u8>> {
+        // Fast path: cache hit
+        {
+            let mut cache = self.cache.lock().map_err(|e| anyhow::anyhow!("cache lock: {e}"))?;
+            if let Some(data) = cache.get(hash) {
+                return Ok(data.to_vec());
+            }
+        }
+
+        // Slow path: read from segment + decompress
+        let compressed = self.read_chunk_raw(hash)?;
+        let decompressed = crate::ingest::decompress_chunk(&compressed)?;
+
+        // Insert into cache (subject to admission policy)
+        {
+            let mut cache = self.cache.lock().map_err(|e| anyhow::anyhow!("cache lock: {e}"))?;
+            cache.insert(*hash, decompressed.clone());
+        }
+
+        Ok(decompressed)
+    }
+
+    /// Get L1 cache statistics (for observability/benchmarks).
+    pub fn cache_stats(&self) -> crate::chunk_cache::CacheStats {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).stats()
     }
 
     /// Get the ChunkLocation for an index entry (for direct segment reads).

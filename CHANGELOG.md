@@ -66,8 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       - `SegmentStore`: append-only ~64 MB segment files on NVMe
       - Two-phase commit: append to segment (crash-safe dead space) → atomic redb index
       - Less redb bloat, better I/O patterns for sequential reads, enables future io_uring
+    - L1 RAM chunk cache (`src/chunk_cache.rs`): decompressed data cache with anti-pollution
+      - Two-hit admission policy: chunks only cached after 2nd read (prevents scan pollution)
+      - FIFO eviction, 64 MB default capacity, oversized chunk rejection (>25% of cache)
+      - `read_chunk_decompressed()` on ArtifactPlane: cache-first path avoids redundant I/O + zstd
+      - `cache_stats()` for observability (hits, misses, entries, bytes)
   - Streaming read planner (`src/read_planner.rs`): `read_object` + `read_object_streaming`
-    - Manifest lookup → chunk decompression → sequential reassembly
+    - Manifest lookup → chunk decompression → sequential reassembly (L1 cache accelerated)
   - Refcount GC (`src/gc.rs`): `gc_chunks` + `release_object`
     - Orphan chunk detection via FS_CHUNKS vs FS_CHUNK_REFCOUNT diff
     - `release_object` decrements all chunk refcounts atomically before removal
@@ -77,7 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Dedup: identical files, 10x identical, similar data, prepend boundary stability, scaling 10MB
     - Multi-format: binary, HTML, PDF, JSON in single ingest pipeline
     - GC lifecycle, compression ratio, chunk size distribution verification
-  - 78 unit tests across 5 new modules + 19 integration tests, all green
+  - 82 unit tests across 6 new modules + 19 integration tests, all green
 - **Sentinel Judge: Enterprise Quality Analysis Service** (#26)
   - Bridge unit tests (6 tests: publish, dedup, subject mapping, config defaults, GetEventsSince)
   - Go benchmarks: judge (7), messaging (4), all passing with HeuristicPipeline at ~1µs (target <5ms)
