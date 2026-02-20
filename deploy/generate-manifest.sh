@@ -11,11 +11,12 @@ OUTPUT="${REPO_ROOT}/deploy/release-manifest.json"
 # Artifact mapping: source (repo-relative) -> destination (VM path) -> type
 # Format: "source|dest|type"
 ARTIFACT_DEFS=(
-  # Binaries
+  # Binaries (Rust: target/release/, Go: per-module build output)
   "target/release/sentinel-daemon|/opt/sentinel/bin/sentinel-daemon|binary"
-  "target/release/cortex-gateway|/opt/sentinel/bin/cortex-gateway|binary"
-  "target/release/sentinel-judge|/opt/sentinel/bin/sentinel-judge|binary"
-  "target/release/sentinel-nats-bridge|/opt/sentinel/bin/sentinel-nats-bridge|binary"
+  "target/release/sentinel-nightrun|/opt/sentinel/bin/sentinel-nightrun|binary"
+  "cmd/cortex-gateway/cortex-gateway|/opt/sentinel/bin/cortex-gateway|binary"
+  "services/sentinel-judge/sentinel-judge|/opt/sentinel/bin/sentinel-judge|binary"
+  "services/sentinel-nats-bridge/sentinel-nats-bridge|/opt/sentinel/bin/sentinel-nats-bridge|binary"
   # Configs
   "config/daemon.toml|/opt/sentinel/config/daemon.toml|config"
   "config/cortex-gateway.toml|/opt/sentinel/config/cortex-gateway.toml|config"
@@ -25,7 +26,7 @@ ARTIFACT_DEFS=(
   "config/simulation.toml|/opt/sentinel/config/simulation.toml|config"
   "config/rooms.toml|/opt/sentinel/config/rooms.toml|config"
   "config/company.toml|/opt/sentinel/config/company.toml|config"
-  "config/nats.conf|/opt/sentinel/config/nats.conf|config"
+  "config/nats.conf|/etc/nats/nats.conf|config"
   # systemd units
   "deploy/systemd/sentinel-daemon.service|/etc/systemd/system/sentinel-daemon.service|systemd"
   "deploy/systemd/sentinel-cortex.service|/etc/systemd/system/sentinel-cortex.service|systemd"
