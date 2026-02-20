@@ -1,4 +1,4 @@
-//! Artifact Plane data model: 5 redb tables for content-defined chunked storage.
+//! Artifact Plane data model: 6 redb tables for content-defined chunked storage.
 //!
 //! Tables:
 //! - `FS_OBJECTS`: ObjectId -> ObjectMetadata (size, mime, created_at, chunk_count)
@@ -6,6 +6,7 @@
 //! - `FS_CHUNKS`: `[u8;16]` (BLAKE3-128) -> zstd-compressed chunk data
 //! - `FS_CHUNK_REFCOUNT`: `[u8;16]` -> u32 (how many manifests reference this chunk)
 //! - `FS_OBJECT_REFS`: &str (name) -> u64 (ObjectId, named references)
+//! - `FS_INGEST_SESSIONS`: session_id (u64) -> JSON-serialized IngestSessionState
 
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
@@ -43,7 +44,50 @@ pub const FS_CHUNK_REFCOUNT: TableDefinition<&[u8; 16], u32> =
 /// Named object references: name -> ObjectId.
 pub const FS_OBJECT_REFS: TableDefinition<&str, u64> = TableDefinition::new("fs_object_refs");
 
+/// Ingest session tracking: session_id -> JSON-serialized IngestSessionState.
+/// Shows active downloads as .part files in the FUSE layer.
+pub const FS_INGEST_SESSIONS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("fs_ingest_sessions");
+
 // --- Types ---
+
+/// State of an active ingest session, stored in FS_INGEST_SESSIONS.
+/// Visible as `.part` files in the FUSE layer while streaming is in progress.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IngestSessionState {
+    /// MIME type hint for the in-progress object.
+    pub mime: String,
+    /// Filename hint (shown as `{name}.part` in FUSE).
+    pub name: String,
+    /// Bytes received so far.
+    pub bytes_received: u64,
+    /// Unix epoch seconds when the session started.
+    pub started_at: u64,
+}
+
+impl IngestSessionState {
+    pub fn new(mime: impl Into<String>, name: impl Into<String>) -> Self {
+        let started_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            mime: mime.into(),
+            name: name.into(),
+            bytes_received: 0,
+            started_at,
+        }
+    }
+
+    pub fn serialize(&self) -> anyhow::Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(|e| anyhow::anyhow!("IngestSessionState serialize: {e}"))
+    }
+
+    pub fn deserialize(data: &[u8]) -> anyhow::Result<Self> {
+        serde_json::from_slice(data)
+            .map_err(|e| anyhow::anyhow!("IngestSessionState deserialize: {e}"))
+    }
+}
 
 /// Metadata stored per object in FS_OBJECTS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,7 +150,7 @@ impl ArtifactPlane {
         let db = Database::create(path.as_ref())
             .map_err(|e| anyhow::anyhow!("ArtifactPlane open: {e}"))?;
 
-        // Initialize all tables in one transaction (always Immediate for schema init).
+        // Initialize all 6 tables in one transaction (always Immediate for schema init).
         let wtxn = db.begin_write()?;
         {
             wtxn.open_table(FS_OBJECTS)?;
@@ -114,6 +158,7 @@ impl ArtifactPlane {
             wtxn.open_table(FS_CHUNKS)?;
             wtxn.open_table(FS_CHUNK_REFCOUNT)?;
             wtxn.open_table(FS_OBJECT_REFS)?;
+            wtxn.open_table(FS_INGEST_SESSIONS)?;
         }
         wtxn.commit()?;
 
@@ -232,6 +277,79 @@ impl ArtifactPlane {
         let rtxn = self.db.begin_read()?;
         let table = rtxn.open_table(FS_CHUNKS)?;
         Ok(table.len()?)
+    }
+
+    // --- Ingest Session Tracking ---
+
+    /// Register a new ingest session (shown as .part in FUSE).
+    pub fn register_session(&self, session_id: u64, state: &IngestSessionState) -> anyhow::Result<()> {
+        let wtxn = self.begin_write()?;
+        {
+            let mut table = wtxn.open_table(FS_INGEST_SESSIONS)?;
+            table.insert(session_id, state.serialize()?.as_slice())?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Update bytes_received for an active session.
+    pub fn update_session_progress(&self, session_id: u64, bytes_received: u64) -> anyhow::Result<()> {
+        // Read current state first (separate scope to drop borrow)
+        let updated = {
+            let rtxn = self.db.begin_read()?;
+            let table = rtxn.open_table(FS_INGEST_SESSIONS)?;
+            match table.get(session_id)? {
+                Some(g) => {
+                    let mut state = IngestSessionState::deserialize(g.value())?;
+                    state.bytes_received = bytes_received;
+                    Some(state)
+                }
+                None => None,
+            }
+        };
+        if let Some(state) = updated {
+            let wtxn = self.begin_write()?;
+            {
+                let mut table = wtxn.open_table(FS_INGEST_SESSIONS)?;
+                table.insert(session_id, state.serialize()?.as_slice())?;
+            }
+            wtxn.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Remove a session (on commit or abort).
+    pub fn remove_session(&self, session_id: u64) -> anyhow::Result<()> {
+        let wtxn = self.begin_write()?;
+        {
+            let mut table = wtxn.open_table(FS_INGEST_SESSIONS)?;
+            table.remove(session_id)?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// List all active ingest sessions (for FUSE .part visibility).
+    pub fn active_sessions(&self) -> anyhow::Result<Vec<(u64, IngestSessionState)>> {
+        let rtxn = self.db.begin_read()?;
+        let table = rtxn.open_table(FS_INGEST_SESSIONS)?;
+        let mut sessions = Vec::new();
+        for entry in table.iter()? {
+            let (key, val) = entry?;
+            let state = IngestSessionState::deserialize(val.value())?;
+            sessions.push((key.value(), state));
+        }
+        Ok(sessions)
+    }
+
+    /// Get a specific session's state.
+    pub fn get_session(&self, session_id: u64) -> anyhow::Result<Option<IngestSessionState>> {
+        let rtxn = self.db.begin_read()?;
+        let table = rtxn.open_table(FS_INGEST_SESSIONS)?;
+        match table.get(session_id)? {
+            Some(g) => Ok(Some(IngestSessionState::deserialize(g.value())?)),
+            None => Ok(None),
+        }
     }
 
     /// Get all chunk hashes with refcount == 0 (GC candidates).

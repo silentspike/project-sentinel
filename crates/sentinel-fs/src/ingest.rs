@@ -15,7 +15,7 @@
 //! let ids = batch.commit()?;  // 1 redb txn + 1 fsync for all N objects
 //! ```
 
-use crate::artifact::{ArtifactPlane, ChunkHash, ObjectMetadata, FS_CHUNK_REFCOUNT, FS_CHUNKS, FS_MANIFESTS, FS_OBJECTS};
+use crate::artifact::{ArtifactPlane, ChunkHash, IngestSessionState, ObjectMetadata, FS_CHUNK_REFCOUNT, FS_CHUNKS, FS_INGEST_SESSIONS, FS_MANIFESTS, FS_OBJECTS};
 use crate::chunker::chunk_data;
 use rayon::prelude::*;
 use redb::{ReadableDatabase, ReadableTable};
@@ -31,34 +31,62 @@ const ZSTD_LEVEL: i32 = 3;
 /// Minimum chunk size before we try zstd compression.
 const MIN_COMPRESS_BYTES: usize = 256;
 
+/// Minimum byte delta before we flush progress to FS_INGEST_SESSIONS.
+/// Prevents thrashing the DB on small streaming writes.
+const PROGRESS_FLUSH_BYTES: u64 = 262_144; // 256 KB
+
 /// An in-progress ingest session. Holds buffered data before commit.
 /// Created via `begin_ingest`, finalized via `commit_ingest` or `abort_ingest`.
+///
+/// The session pre-allocates its ObjectId and registers in `FS_INGEST_SESSIONS`
+/// so the FUSE layer can show it as a `.part` file during streaming downloads.
 pub struct IngestSession<'a> {
     plane: &'a ArtifactPlane,
     /// Accumulated input data (streaming writes are buffered here).
     buffer: Vec<u8>,
     /// MIME type hint.
     mime: String,
+    /// Pre-allocated ObjectId (doubles as session ID in FS_INGEST_SESSIONS).
+    object_id: u64,
+    /// Bytes received at last DB flush (for throttled progress updates).
+    last_flushed_bytes: u64,
 }
 
-/// Start a new ingest session.
+/// Start a new ingest session. Pre-allocates ObjectId and registers in FS_INGEST_SESSIONS.
 pub fn begin_ingest<'a>(plane: &'a ArtifactPlane, mime: impl Into<String>) -> IngestSession<'a> {
+    let mime = mime.into();
+    let object_id = plane.next_object_id().unwrap_or(0);
+    let state = IngestSessionState::new(&mime, format!("ingest-{object_id}"));
+    let _ = plane.register_session(object_id, &state);
     IngestSession {
         plane,
         buffer: Vec::new(),
-        mime: mime.into(),
+        mime,
+        object_id,
+        last_flushed_bytes: 0,
     }
 }
 
 impl IngestSession<'_> {
     /// Append data to this session. Can be called multiple times for streaming ingest.
+    /// Throttled progress updates to FS_INGEST_SESSIONS (every 256KB) for .part visibility.
     pub fn write(&mut self, data: &[u8]) {
         self.buffer.extend_from_slice(data);
+        let current = self.buffer.len() as u64;
+        if current - self.last_flushed_bytes >= PROGRESS_FLUSH_BYTES {
+            let _ = self.plane.update_session_progress(self.object_id, current);
+            self.last_flushed_bytes = current;
+        }
     }
 
     /// Total bytes buffered so far.
     pub fn buffered_len(&self) -> usize {
         self.buffer.len()
+    }
+
+    /// Pre-allocated ObjectId (also the session ID for .part tracking).
+    pub fn object_id(&self) -> u64 {
+        self.object_id
     }
 }
 
@@ -72,7 +100,7 @@ impl IngestSession<'_> {
 /// 5. Write object metadata to FS_OBJECTS
 /// 6. Commit write transaction
 pub fn commit_ingest(session: IngestSession<'_>) -> anyhow::Result<u64> {
-    let IngestSession { plane, buffer, mime } = session;
+    let IngestSession { plane, buffer, mime, object_id, .. } = session;
 
     // Chunk the data
     let chunks: Vec<_> = chunk_data(&buffer).collect();
@@ -99,27 +127,23 @@ pub fn commit_ingest(session: IngestSession<'_>) -> anyhow::Result<u64> {
     let manifest_bytes = serde_json::to_vec(&manifest)
         .map_err(|e| anyhow::anyhow!("manifest serialize: {e}"))?;
 
-    // Allocate ObjectId (separate small transaction — this is idempotent if we crash after)
-    let object_id = plane.next_object_id()?;
-
     let meta = ObjectMetadata::new(total_size, &mime, chunk_count);
     let meta_bytes = meta.serialize()?;
 
-    // Atomic write transaction: all-or-nothing
+    // Atomic write transaction: chunks + manifest + metadata + session cleanup
     let wtxn = plane.begin_write()?;
     {
         let mut chunks_table = wtxn.open_table(FS_CHUNKS)?;
         let mut refcount_table = wtxn.open_table(FS_CHUNK_REFCOUNT)?;
         let mut manifests_table = wtxn.open_table(FS_MANIFESTS)?;
         let mut objects_table = wtxn.open_table(FS_OBJECTS)?;
+        let mut sessions_table = wtxn.open_table(FS_INGEST_SESSIONS)?;
 
         // 1. Store new chunks + 2. Increment refcounts for all
         for (hash, compressed) in &chunk_entries {
             if let Some(data) = compressed {
-                // New chunk: store compressed data
                 chunks_table.insert(hash, data.as_slice())?;
             }
-            // Always increment refcount (even for deduplicated chunks)
             let current = refcount_table.get(hash)?.map(|g| g.value()).unwrap_or(0);
             refcount_table.insert(hash, current + 1)?;
         }
@@ -129,17 +153,20 @@ pub fn commit_ingest(session: IngestSession<'_>) -> anyhow::Result<u64> {
 
         // 4. Write object metadata
         objects_table.insert(object_id, meta_bytes.as_slice())?;
+
+        // 5. Remove session entry (no longer .part, now fully committed)
+        sessions_table.remove(object_id)?;
     }
     wtxn.commit()?;
 
     Ok(object_id)
 }
 
-/// Abort the session. Drops the buffered data without touching the database.
-/// No cleanup needed — nothing was written.
+/// Abort the session. Removes the FS_INGEST_SESSIONS entry and drops buffered data.
+/// The .part file disappears from the FUSE layer.
 pub fn abort_ingest(session: IngestSession<'_>) {
-    // Simply drop the session — buffer is on the heap, no DB changes were made.
-    drop(session);
+    let _ = session.plane.remove_session(session.object_id);
+    // Buffer is dropped automatically — no chunk data was written to DB.
 }
 
 /// Prepared data for one object in a batch (post-chunking, pre-commit).
@@ -337,7 +364,7 @@ mod tests {
         session.write(b"hello world");
         let object_id = commit_ingest(session).unwrap();
 
-        assert_eq!(object_id, 1);
+        assert!(object_id > 0, "ObjectId must be positive");
 
         let meta = plane.get_object(object_id).unwrap().unwrap();
         assert_eq!(meta.size, 11);
@@ -504,5 +531,87 @@ mod tests {
         let compressed = compress_chunk(&data);
         let decompressed = decompress_chunk(&compressed).unwrap();
         assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn session_visible_during_ingest() {
+        let (plane, _dir) = temp_plane();
+
+        let mut session = begin_ingest(&plane, "text/plain");
+        let oid = session.object_id();
+
+        // Session should be visible in active_sessions
+        let sessions = plane.active_sessions().unwrap();
+        assert_eq!(sessions.len(), 1, "one active session expected");
+        assert_eq!(sessions[0].0, oid);
+        assert_eq!(sessions[0].1.mime, "text/plain");
+
+        session.write(b"data");
+        commit_ingest(session).unwrap();
+
+        // After commit, no active sessions
+        let sessions = plane.active_sessions().unwrap();
+        assert!(sessions.is_empty(), "sessions must be empty after commit");
+    }
+
+    #[test]
+    fn session_removed_after_abort() {
+        let (plane, _dir) = temp_plane();
+
+        let mut session = begin_ingest(&plane, "application/pdf");
+        session.write(&vec![0xAA; 1000]);
+
+        let sessions = plane.active_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+
+        abort_ingest(session);
+
+        let sessions = plane.active_sessions().unwrap();
+        assert!(sessions.is_empty(), "sessions must be empty after abort");
+    }
+
+    #[test]
+    fn session_progress_throttled() {
+        let (plane, _dir) = temp_plane();
+
+        let mut session = begin_ingest(&plane, "text/plain");
+        let oid = session.object_id();
+
+        // Small writes should NOT update the DB (below PROGRESS_FLUSH_BYTES threshold)
+        session.write(&vec![0x11; 1000]);
+        let state = plane.get_session(oid).unwrap().unwrap();
+        assert_eq!(state.bytes_received, 0, "small write should not flush progress");
+
+        // Writing past threshold should flush
+        session.write(&vec![0x22; PROGRESS_FLUSH_BYTES as usize]);
+        let state = plane.get_session(oid).unwrap().unwrap();
+        assert!(state.bytes_received > 0, "large write should flush progress");
+
+        commit_ingest(session).unwrap();
+    }
+
+    #[test]
+    fn multiple_concurrent_sessions() {
+        let (plane, _dir) = temp_plane();
+
+        let mut s1 = begin_ingest(&plane, "text/plain");
+        let mut s2 = begin_ingest(&plane, "application/pdf");
+
+        s1.write(b"data1");
+        s2.write(b"data2");
+
+        let sessions = plane.active_sessions().unwrap();
+        assert_eq!(sessions.len(), 2, "two concurrent sessions expected");
+
+        let id1 = commit_ingest(s1).unwrap();
+        let sessions = plane.active_sessions().unwrap();
+        assert_eq!(sessions.len(), 1, "one session after first commit");
+
+        abort_ingest(s2);
+        let sessions = plane.active_sessions().unwrap();
+        assert!(sessions.is_empty(), "no sessions after abort");
+
+        // Only s1's object should exist
+        assert!(plane.get_object(id1).unwrap().is_some());
     }
 }
