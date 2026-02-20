@@ -10,6 +10,7 @@ pub mod artifact;
 pub mod cas;
 pub mod chunk_cache;
 pub mod chunker;
+pub mod commit_scheduler;
 pub mod cli;
 pub mod fuse;
 pub mod gc;

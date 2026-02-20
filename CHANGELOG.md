@@ -76,6 +76,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       - `ArtifactPlane::read_chunks_decompressed()`: cache-first batch path, single redb txn for misses
       - `read_object()` now uses batch reads for full manifest fetch in one pass
       - Sync fallback: cached file handles per segment_id, sequential pread (no io_uring)
+    - Adaptive Commit Scheduler (`src/commit_scheduler.rs`): IOPS-aware write throttling
+      - Rate tracking with sliding window, configurable max_iops (default: 500)
+      - PSI-aware: reads `/proc/pressure/io` avg10 for system-wide I/O backpressure
+      - PSI pressure multiplier: 3x delay when avg10 > 10%
+      - Integrated into `ArtifactPlane::begin_write()` — transparent to callers
+      - `scheduler_stats()` for observability
   - Streaming read planner (`src/read_planner.rs`): `read_object` + `read_object_streaming`
     - Manifest lookup → chunk decompression → sequential reassembly (L1 cache accelerated)
   - Refcount GC (`src/gc.rs`): `gc_chunks` + `release_object`
@@ -87,7 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Dedup: identical files, 10x identical, similar data, prepend boundary stability, scaling 10MB
     - Multi-format: binary, HTML, PDF, JSON in single ingest pipeline
     - GC lifecycle, compression ratio, chunk size distribution verification
-  - 82 unit tests across 6 new modules + 19 integration tests, all green
+  - 87 unit tests across 7 new modules + 19 integration tests, all green
 - **Sentinel Judge: Enterprise Quality Analysis Service** (#26)
   - Bridge unit tests (6 tests: publish, dedup, subject mapping, config defaults, GetEventsSince)
   - Go benchmarks: judge (7), messaging (4), all passing with HeuristicPipeline at ~1µs (target <5ms)
