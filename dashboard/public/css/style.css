@@ -166,3 +166,101 @@ main { padding: 2rem; }
 }
 .metric-card .value { font-size: 2rem; font-weight: 700; color: var(--accent); }
 .metric-card .label { font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.3rem; }
+
+/* Cockpit */
+.cockpit-slo-container { margin-bottom: 1.5rem; }
+.cockpit-slo-bar {
+  display: flex;
+  gap: 1.5rem;
+  background: var(--bg-card);
+  border-radius: 8px;
+  padding: 0.8rem 1.2rem;
+  border: 1px solid var(--border);
+}
+.cockpit-slo-item { font-size: 0.85rem; white-space: nowrap; }
+.cockpit-slo-label { color: var(--text-secondary); }
+.cockpit-slo-value { font-weight: 600; }
+.cockpit-slo-ok { color: var(--success); }
+.cockpit-slo-violation { color: var(--danger); }
+
+.cockpit-summary {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  margin-bottom: 1rem;
+}
+
+.cockpit-section-header {
+  font-size: 1rem;
+  color: var(--accent);
+  margin-bottom: 0.8rem;
+  margin-top: 1.5rem;
+}
+.cockpit-section-header:first-child { margin-top: 0; }
+.cockpit-resolved-header { color: var(--text-secondary); }
+
+.cockpit-incident-list { display: flex; flex-direction: column; gap: 0.5rem; }
+.cockpit-empty { color: var(--text-secondary); font-style: italic; padding: 1rem 0; }
+
+.cockpit-incident-item {
+  background: var(--bg-card);
+  border-radius: 6px;
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+}
+.cockpit-incident-item[data-severity="critical"] { border-left-color: var(--danger); }
+.cockpit-incident-item[data-severity="high"] { border-left-color: var(--danger); }
+.cockpit-incident-item[data-severity="medium"] { border-left-color: var(--warning); }
+.cockpit-incident-item[data-status="resolved"] { opacity: 0.7; }
+
+.cockpit-incident-header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+.cockpit-severity-badge {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  min-width: 3rem;
+}
+.cockpit-incident-summary {
+  flex: 1;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+}
+.cockpit-incident-status {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 10px;
+}
+.cockpit-status-active { background: var(--warning); color: #1a1b2e; }
+.cockpit-status-pending { background: var(--border); color: var(--text-primary); }
+.cockpit-status-resolved { background: var(--success); color: white; }
+.cockpit-status-failed { background: var(--danger); color: white; }
+
+.cockpit-incident-meta {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-top: 0.3rem;
+}
+
+.cockpit-actions {
+  margin-top: 0.5rem;
+  padding-left: 1rem;
+  border-left: 1px solid var(--border);
+}
+.cockpit-action-item {
+  font-size: 0.8rem;
+  color: var(--accent);
+  padding: 0.2rem 0;
+}
+
+.cockpit-outcome {
+  font-size: 0.8rem;
+  color: var(--success);
+  margin-top: 0.3rem;
+  padding-left: 1rem;
+}
+.cockpit-outcome-pending { color: var(--text-secondary); font-style: italic; }
