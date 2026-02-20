@@ -21,12 +21,12 @@ pub fn verify_actions(
 ) -> Result<VerifyStats> {
     let pending = store.get_pending_actions()?;
     let mut stats = VerifyStats::default();
+    let mut updated = Vec::new();
 
     for mut action in pending {
         match action.status {
             ActionStatus::Executed => {
                 verify_single(&mut action, observation, current_tick);
-                store.update_action(&action)?;
 
                 match action.status {
                     ActionStatus::Verified => stats.verified += 1,
@@ -34,6 +34,7 @@ pub fn verify_actions(
                     ActionStatus::RolledBack => stats.rolled_back += 1,
                     _ => {}
                 }
+                updated.push(action);
             }
             ActionStatus::Pending => {
                 // TTL-Check fuer nie-ausgefuehrte Actions
@@ -44,17 +45,20 @@ pub fn verify_actions(
                         success: false,
                         reason: "Pending action TTL expired without execution".into(),
                     });
-                    store.update_action(&action)?;
                     stats.expired += 1;
                     warn!(
                         action_id = %action.id,
                         "Pending Action TTL abgelaufen"
                     );
+                    updated.push(action);
                 }
             }
             _ => {} // Verified, RolledBack, Expired — nichts tun
         }
     }
+
+    // Batch-Write: alle geaenderten Actions in einer Transaktion persistieren
+    store.update_actions_batch(&updated)?;
 
     debug!(
         verified = stats.verified,

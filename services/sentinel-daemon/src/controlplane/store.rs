@@ -94,6 +94,23 @@ impl ControlplaneStore {
         Ok(())
     }
 
+    /// Speichert mehrere Incidents in einer Transaktion.
+    pub fn log_incidents_batch(&self, incidents: &[Incident]) -> Result<()> {
+        if incidents.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(CONTROL_INCIDENTS)?;
+            for incident in incidents {
+                let bytes = serde_json::to_vec(incident).context("Incident batch serialisieren")?;
+                table.insert(incident.id.as_str(), bytes.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     /// Laedt die letzten N Incidents (nach ID sortiert, neueste zuerst).
     pub fn get_recent_incidents(&self, limit: usize) -> Result<Vec<Incident>> {
         let read_txn = self.db.begin_read()?;
@@ -127,9 +144,32 @@ impl ControlplaneStore {
         Ok(())
     }
 
+    /// Speichert mehrere Actions in einer Transaktion (Batch-Write).
+    pub fn log_actions_batch(&self, actions: &[ControlAction]) -> Result<()> {
+        if actions.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(CONTROL_ACTION_LOG)?;
+            for action in actions {
+                let bytes =
+                    serde_json::to_vec(action).context("ControlAction batch serialisieren")?;
+                table.insert(action.id.as_str(), bytes.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     /// Aktualisiert eine bestehende Action (z.B. Status-Update nach Verify).
     pub fn update_action(&self, action: &ControlAction) -> Result<()> {
         self.log_action(action) // Upsert via redb insert
+    }
+
+    /// Aktualisiert mehrere Actions in einer Transaktion (Batch-Write).
+    pub fn update_actions_batch(&self, actions: &[ControlAction]) -> Result<()> {
+        self.log_actions_batch(actions)
     }
 
     /// Laedt alle Actions mit Status Pending oder Executed (fuer Verify-Phase).
