@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/obtFusi/project-sentinel/deploy/release-manifest.schema.json",
+  "title": "Release Manifest",
+  "description": "Deployment artifact manifest with SHA-256 hashes for deploy-gate parity checks",
+  "type": "object",
+  "required": ["version", "created_at", "git_sha", "artifacts"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Schema version",
+      "const": "1.0"
+    },
+    "created_at": {
+      "type": "string",
+      "description": "ISO 8601 timestamp when this manifest was generated",
+      "format": "date-time",
+      "examples": ["2024-01-15T12:00:00Z"]
+    },
+    "git_sha": {
+      "type": "string",
+      "description": "Full 40-character Git commit SHA",
+      "pattern": "^[0-9a-f]{40}$",
+      "examples": ["a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"]
+    },
+    "artifacts": {
+      "type": "array",
+      "description": "List of deployment artifacts with their hashes",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["path", "source", "sha256", "type"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute destination path on the target VM",
+            "examples": ["/opt/sentinel/bin/sentinel-daemon"]
+          },
+          "source": {
+            "type": "string",
+            "description": "Repo-relative source path",
+            "examples": ["target/release/sentinel-daemon"]
+          },
+          "sha256": {
+            "type": "string",
+            "description": "SHA-256 hex digest of the artifact",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "type": {
+            "type": "string",
+            "description": "Artifact category",
+            "enum": ["binary", "config", "systemd", "script"]
+          }
+        }
+      }
+    }
+  }
+}
