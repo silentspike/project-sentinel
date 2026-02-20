@@ -10,7 +10,11 @@
 
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::sync::Mutex;
 use std::time::SystemTime;
+
+use crate::segment::{ChunkLocation, SegmentStore};
 
 /// Durability level for ArtifactPlane write transactions.
 ///
@@ -34,7 +38,8 @@ pub const FS_OBJECTS: TableDefinition<u64, &[u8]> = TableDefinition::new("fs_obj
 /// Manifests: ObjectId -> JSON-serialized list of chunk hashes (ordered).
 pub const FS_MANIFESTS: TableDefinition<u64, &[u8]> = TableDefinition::new("fs_manifests");
 
-/// Chunk data: BLAKE3-128 fingerprint -> zstd-compressed chunk bytes.
+/// Chunk index: BLAKE3-128 fingerprint -> ChunkLocation (segment_id + offset + len).
+/// Actual compressed data is stored in segment pack files, not in redb.
 pub const FS_CHUNKS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("fs_chunks");
 
 /// Chunk reference counts: BLAKE3-128 fingerprint -> refcount.
@@ -130,25 +135,34 @@ pub type ChunkHash = [u8; 16];
 
 // --- ArtifactPlane ---
 
-/// The Artifact Plane: wraps a redb Database and provides access to all 5 tables.
+/// The Artifact Plane: wraps a redb Database + SegmentStore for chunk storage.
 pub struct ArtifactPlane {
     pub(crate) db: Database,
     durability: DurabilityLevel,
+    /// Segment pack storage for chunk data (append-only files).
+    /// Wrapped in Mutex for interior mutability (SegmentStore::append needs &mut).
+    pub(crate) segments: Mutex<SegmentStore>,
 }
 
 impl ArtifactPlane {
     /// Open or create an ArtifactPlane database with `Immediate` durability.
-    pub fn open(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+    /// Segment packs are stored in a `segments/` subdirectory next to the redb file.
+    pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         Self::open_with_durability(path, DurabilityLevel::Immediate)
     }
 
     /// Open or create an ArtifactPlane database with a specific durability level.
     pub fn open_with_durability(
-        path: impl AsRef<std::path::Path>,
+        path: impl AsRef<Path>,
         durability: DurabilityLevel,
     ) -> anyhow::Result<Self> {
-        let db = Database::create(path.as_ref())
+        let path = path.as_ref();
+        let db = Database::create(path)
             .map_err(|e| anyhow::anyhow!("ArtifactPlane open: {e}"))?;
+
+        // Segment packs dir: sibling to the redb file
+        let seg_dir = path.with_extension("segments");
+        let segments = SegmentStore::open(&seg_dir)?;
 
         // Initialize all 6 tables in one transaction (always Immediate for schema init).
         let wtxn = db.begin_write()?;
@@ -162,7 +176,11 @@ impl ArtifactPlane {
         }
         wtxn.commit()?;
 
-        Ok(Self { db, durability })
+        Ok(Self {
+            db,
+            durability,
+            segments: Mutex::new(segments),
+        })
     }
 
     /// Start a write transaction with the configured durability level.
@@ -227,23 +245,34 @@ impl ArtifactPlane {
         }
     }
 
-    /// Check if a chunk exists.
+    /// Check if a chunk exists in the index.
     pub fn has_chunk(&self, hash: &ChunkHash) -> anyhow::Result<bool> {
         let rtxn = self.db.begin_read()?;
         let table = rtxn.open_table(FS_CHUNKS)?;
         Ok(table.get(hash)?.is_some())
     }
 
-    /// Read raw (compressed) chunk bytes.
+    /// Read raw (compressed) chunk bytes from the segment store.
     pub fn read_chunk_raw(&self, hash: &ChunkHash) -> anyhow::Result<Vec<u8>> {
         let rtxn = self.db.begin_read()?;
         let table = rtxn.open_table(FS_CHUNKS)?;
+        let loc_bytes = table
+            .get(hash)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Chunk {} not found", crate::cas::hex_encode(hash))
+            })?;
+        let loc = ChunkLocation::from_bytes(loc_bytes.value())?;
+        let segments = self.segments.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        segments.read(&loc)
+    }
+
+    /// Get the ChunkLocation for an index entry (for direct segment reads).
+    pub fn get_chunk_location(&self, hash: &ChunkHash) -> anyhow::Result<Option<ChunkLocation>> {
+        let rtxn = self.db.begin_read()?;
+        let table = rtxn.open_table(FS_CHUNKS)?;
         match table.get(hash)? {
-            Some(g) => Ok(g.value().to_vec()),
-            None => Err(anyhow::anyhow!(
-                "Chunk {} not found",
-                crate::cas::hex_encode(hash)
-            )),
+            Some(g) => Ok(Some(ChunkLocation::from_bytes(g.value())?)),
+            None => Ok(None),
         }
     }
 

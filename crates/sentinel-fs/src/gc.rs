@@ -6,13 +6,17 @@
 
 use crate::artifact::{ArtifactPlane, FS_CHUNK_REFCOUNT, FS_CHUNKS};
 use crate::cas::ChunkGcStats;
+use crate::segment::ChunkLocation;
 use redb::ReadableTable;
 
-/// Run GC on the Artifact Plane: delete all chunks with refcount == 0.
+/// Run GC on the Artifact Plane: delete orphan chunk index entries.
 ///
 /// Since zero-refcount entries are removed from FS_CHUNK_REFCOUNT on
 /// decrement, "orphan" chunks are those present in FS_CHUNKS but absent
 /// from FS_CHUNK_REFCOUNT.
+///
+/// Note: this removes the index entries from redb. The actual data in
+/// segment pack files becomes dead space, reclaimed by segment compaction.
 pub fn gc_chunks(plane: &ArtifactPlane) -> anyhow::Result<ChunkGcStats> {
     // Collect orphans in a read transaction first
     let orphans = plane.zero_ref_chunks()?;
@@ -23,21 +27,20 @@ pub fn gc_chunks(plane: &ArtifactPlane) -> anyhow::Result<ChunkGcStats> {
 
     let mut stats = ChunkGcStats::default();
 
-    // Delete in a write transaction
+    // Delete index entries in a write transaction
     let wtxn = plane.begin_write()?;
     {
         let mut chunks_table = wtxn.open_table(FS_CHUNKS)?;
-        // Also clean up any zero-value refcount entries that might exist
         let mut refcount_table = wtxn.open_table(FS_CHUNK_REFCOUNT)?;
 
         for hash in &orphans {
-            // Measure the on-disk size before deletion (approximation: compressed bytes)
+            // Read ChunkLocation to track freed bytes
             if let Some(g) = chunks_table.get(hash)? {
-                let data: &[u8] = g.value();
-                stats.freed_bytes += data.len() as u64;
+                if let Ok(loc) = ChunkLocation::from_bytes(g.value()) {
+                    stats.freed_bytes += loc.compressed_len as u64;
+                }
             }
             chunks_table.remove(hash)?;
-            // Also remove any stale zero-refcount entry if present
             refcount_table.remove(hash)?;
             stats.removed += 1;
         }

@@ -5,14 +5,13 @@
 //! are decompressed one at a time), keeping peak memory proportional to the
 //! largest single chunk rather than the full object size.
 
-use crate::artifact::{ArtifactPlane, ChunkHash, FS_CHUNKS};
+use crate::artifact::{ArtifactPlane, ChunkHash};
 use crate::ingest::decompress_chunk;
-use redb::ReadableDatabase;
 
 /// Read an object's full content by ObjectId.
 ///
-/// Reads the manifest, decompresses each chunk in order, and returns
-/// the concatenated result.
+/// Reads the manifest, then for each chunk: looks up ChunkLocation in redb,
+/// reads compressed data from the segment store, decompresses, and concatenates.
 pub fn read_object(plane: &ArtifactPlane, object_id: u64) -> anyhow::Result<Vec<u8>> {
     let meta = plane
         .get_object(object_id)?
@@ -24,19 +23,9 @@ pub fn read_object(plane: &ArtifactPlane, object_id: u64) -> anyhow::Result<Vec<
 
     let mut result = Vec::with_capacity(meta.size as usize);
 
-    let rtxn = plane.db.begin_read()?;
-    let chunks_table = rtxn.open_table(FS_CHUNKS)?;
-
     for hash in &manifest {
-        let compressed = chunks_table
-            .get(hash)?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Chunk {} missing for object {object_id}",
-                    crate::cas::hex_encode(hash)
-                )
-            })?;
-        let chunk_data = decompress_chunk(compressed.value())?;
+        let compressed = plane.read_chunk_raw(hash)?;
+        let chunk_data = decompress_chunk(&compressed)?;
         result.extend_from_slice(&chunk_data);
     }
 

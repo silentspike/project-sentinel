@@ -61,6 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       - Pre-allocated ObjectId doubles as session ID for FUSE visibility
       - Throttled progress updates (every 256 KB) to avoid DB thrashing on streaming writes
       - Atomic session cleanup: commit removes entry in same write txn, abort removes separately
+    - Segment Pack storage (`src/segment.rs`): chunk data in append-only files, not redb
+      - `FS_CHUNKS` stores 16-byte `ChunkLocation` index instead of inline compressed data
+      - `SegmentStore`: append-only ~64 MB segment files on NVMe
+      - Two-phase commit: append to segment (crash-safe dead space) → atomic redb index
+      - Less redb bloat, better I/O patterns for sequential reads, enables future io_uring
   - Streaming read planner (`src/read_planner.rs`): `read_object` + `read_object_streaming`
     - Manifest lookup → chunk decompression → sequential reassembly
   - Refcount GC (`src/gc.rs`): `gc_chunks` + `release_object`
@@ -72,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Dedup: identical files, 10x identical, similar data, prepend boundary stability, scaling 10MB
     - Multi-format: binary, HTML, PDF, JSON in single ingest pipeline
     - GC lifecycle, compression ratio, chunk size distribution verification
-  - 73 unit tests across 4 new modules + 19 integration tests, all green
+  - 78 unit tests across 5 new modules + 19 integration tests, all green
 - **Sentinel Judge: Enterprise Quality Analysis Service** (#26)
   - Bridge unit tests (6 tests: publish, dedup, subject mapping, config defaults, GetEventsSince)
   - Go benchmarks: judge (7), messaging (4), all passing with HeuristicPipeline at ~1µs (target <5ms)

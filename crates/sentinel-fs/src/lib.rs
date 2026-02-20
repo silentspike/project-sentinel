@@ -16,3 +16,4 @@ pub mod ingest;
 pub mod layer;
 pub mod metadata;
 pub mod read_planner;
+pub mod segment;
