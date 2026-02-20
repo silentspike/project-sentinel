@@ -3599,6 +3599,7 @@ dependencies = [
  "criterion",
  "fuser",
  "libc",
+ "rayon",
  "redb",
  "sentinel-common",
  "sentinel-telemetry",

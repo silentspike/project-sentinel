@@ -59,6 +59,58 @@ pub fn chunk_data(data: &[u8]) -> ChunkIter<'_> {
     ChunkIter::new(data, MIN_CHUNK_BYTES, TARGET_CHUNK_BYTES, MAX_CHUNK_BYTES)
 }
 
+/// Split `data` into content-defined chunks with **parallel** BLAKE3 hashing.
+///
+/// CDC boundary detection is serial (rolling hash), but the expensive BLAKE3
+/// fingerprinting runs in parallel across all chunks via rayon.
+pub fn chunk_data_parallel(data: &[u8]) -> Vec<Chunk> {
+    use rayon::prelude::*;
+
+    // Phase 1: Serial CDC boundary detection (no hashing)
+    let mut boundaries = Vec::new();
+    let mut pos = 0;
+    let min_size = MIN_CHUNK_BYTES;
+    let mask = make_mask(TARGET_CHUNK_BYTES);
+    let max_size = MAX_CHUNK_BYTES;
+
+    while pos < data.len() {
+        let start = pos;
+        let remaining = data.len() - start;
+
+        if remaining <= max_size {
+            boundaries.push((start, start + remaining));
+            break;
+        }
+
+        let mut fp: u64 = 0;
+        let end = std::cmp::min(start + max_size, data.len());
+        let min_end = start + min_size;
+        let mut split = end;
+        for i in start..end {
+            fp = (fp << 1).wrapping_add(GEAR[data[i] as usize]);
+            if i >= min_end && (fp & mask) == 0 {
+                split = i + 1;
+                break;
+            }
+        }
+        boundaries.push((start, split));
+        pos = split;
+    }
+
+    // Phase 2: Parallel BLAKE3 hashing + data copy
+    boundaries
+        .par_iter()
+        .map(|&(start, end)| {
+            let chunk_data = data[start..end].to_vec();
+            let hash = blake3_hash_128(&chunk_data);
+            Chunk {
+                hash,
+                data: chunk_data,
+            }
+        })
+        .collect()
+}
+
 /// CDC iterator over a byte slice.
 pub struct ChunkIter<'a> {
     data: &'a [u8],

@@ -54,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Configurable `DurabilityLevel` for ArtifactPlane (`Immediate` / `Eventual`)
       - `Eventual` skips fsync: 1MB ingest 55ms → 22ms (-59%), not crash-safe
       - Config: `config/storage.toml` `[artifact] durability = "immediate" | "eventual"`
+    - Adaptive parallel compression via rayon: serial for < 32 new chunks, parallel above
+      - `chunk_data_parallel()` in chunker: serial CDC boundaries + parallel BLAKE3 hashing
+      - Dedup paths 23-36% faster, eventual ingest 14.7ms (-35% vs 22.5ms)
   - Streaming read planner (`src/read_planner.rs`): `read_object` + `read_object_streaming`
     - Manifest lookup → chunk decompression → sequential reassembly
   - Refcount GC (`src/gc.rs`): `gc_chunks` + `release_object`
