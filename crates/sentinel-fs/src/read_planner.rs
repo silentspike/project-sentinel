@@ -6,7 +6,6 @@
 //! largest single chunk rather than the full object size.
 
 use crate::artifact::{ArtifactPlane, ChunkHash};
-use crate::ingest::decompress_chunk;
 
 /// Read an object's full content by ObjectId.
 ///
@@ -24,8 +23,7 @@ pub fn read_object(plane: &ArtifactPlane, object_id: u64) -> anyhow::Result<Vec<
     let mut result = Vec::with_capacity(meta.size as usize);
 
     for hash in &manifest {
-        let compressed = plane.read_chunk_raw(hash)?;
-        let chunk_data = decompress_chunk(&compressed)?;
+        let chunk_data = plane.read_chunk_decompressed(hash)?;
         result.extend_from_slice(&chunk_data);
     }
 
@@ -68,10 +66,7 @@ impl Iterator for ChunkStream<'_> {
         let hash = &self.manifest[self.index];
         self.index += 1;
 
-        let result = (|| {
-            let compressed = self.plane.read_chunk_raw(hash)?;
-            decompress_chunk(&compressed)
-        })();
+        let result = self.plane.read_chunk_decompressed(hash);
         Some(result)
     }
 }

@@ -8,6 +8,7 @@
 
 pub mod artifact;
 pub mod cas;
+pub mod chunk_cache;
 pub mod chunker;
 pub mod cli;
 pub mod fuse;
