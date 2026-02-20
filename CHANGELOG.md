@@ -26,6 +26,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `deploy/release-manifest.json` excluded from git via `.gitignore` (generated artifact)
   - Benchmark: manifest generation ~124ms, preflight parsing ~43ms; full preflight well under 5s target
 
+- **NATS Infrastructure Verification Gate N1-N3** (#109)
+  - Deployed nats-server v2.12.4 on deploy-VM: binary + /etc/nats/nats.conf + nats-server.service
+  - Deployed sentinel-nats-bridge: /opt/sentinel/bin/ + sentinel-nats-bridge.service (active, running)
+  - Deployed sentinel-judge: /opt/sentinel/bin/ + sentinel-judge.service (active, running)
+  - Deployed judge.toml to /opt/sentinel/config/judge.toml
+  - Verified: SENTINEL_EVENTS + SENTINEL_JUDGE streams with correct SSOT subjects
+  - Verified: Nats-Msg-Id dedup with 10min window (AC-3)
+  - Verified: Durable consumer resume without data loss (AC-4)
+  - Verified: Bridge latency p50=2.2ms, p95=2.7ms, p99=3.2ms (AC-5, threshold <2s)
+  - Verified: Empty store poll 30s soak — no crash, no busy-loop (AC-N1)
+  - Benchmarks: Batch=50 13737 evt/s, Batch=100 16719 evt/s, Batch=200 9980 evt/s
+  - Added Go binaries and release-manifest.json to .gitignore
+
 - **Sentinel Judge: Enterprise Quality Analysis Service** (#26)
   - Bridge unit tests (6 tests: publish, dedup, subject mapping, config defaults, GetEventsSince)
   - Go benchmarks: judge (7), messaging (4), all passing with HeuristicPipeline at ~1µs (target <5ms)
