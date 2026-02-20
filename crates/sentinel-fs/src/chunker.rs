@@ -275,10 +275,16 @@ mod tests {
         let shift_chunks: Vec<_> = chunk_data(&shifted).collect();
 
         // Both must reassemble correctly.
-        let orig_reassembled: Vec<u8> = orig_chunks.iter().flat_map(|c| c.data.iter().copied()).collect();
+        let orig_reassembled: Vec<u8> = orig_chunks
+            .iter()
+            .flat_map(|c| c.data.iter().copied())
+            .collect();
         assert_eq!(orig_reassembled, data);
 
-        let shift_reassembled: Vec<u8> = shift_chunks.iter().flat_map(|c| c.data.iter().copied()).collect();
+        let shift_reassembled: Vec<u8> = shift_chunks
+            .iter()
+            .flat_map(|c| c.data.iter().copied())
+            .collect();
         assert_eq!(shift_reassembled, shifted);
     }
 }

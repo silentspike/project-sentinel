@@ -340,8 +340,7 @@ fn xorshift_data(len: usize, seed: u64) -> Vec<u8> {
 
 fn artifact_plane(name: &str) -> (ArtifactPlane, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let plane =
-        ArtifactPlane::open(dir.path().join(format!("{name}.redb"))).unwrap();
+    let plane = ArtifactPlane::open(dir.path().join(format!("{name}.redb"))).unwrap();
     (plane, dir)
 }
 
@@ -365,8 +364,10 @@ fn ac4_dedup_identical_zero_net_new_chunks() {
     let chunks_after_second = plane.chunk_count().unwrap();
     let manifest2 = plane.get_manifest(id2).unwrap().unwrap();
 
-    assert_eq!(chunks_after_first, chunks_after_second,
-        "ZERO net-new chunks (before={chunks_after_first}, after={chunks_after_second})");
+    assert_eq!(
+        chunks_after_first, chunks_after_second,
+        "ZERO net-new chunks (before={chunks_after_first}, after={chunks_after_second})"
+    );
     assert_eq!(manifest1, manifest2, "identical manifests");
     for hash in &manifest1 {
         assert_eq!(plane.get_chunk_refcount(hash).unwrap(), 2);
@@ -393,8 +394,11 @@ fn ac4_dedup_10x_identical_no_growth() {
         s.write(&data);
         commit_ingest(s).unwrap();
     }
-    assert_eq!(baseline, plane.chunk_count().unwrap(),
-        "10 identical ingests: no chunk growth");
+    assert_eq!(
+        baseline,
+        plane.chunk_count().unwrap(),
+        "10 identical ingests: no chunk growth"
+    );
 }
 
 /// Similar data (1 byte changed): most chunks deduped.
@@ -417,11 +421,18 @@ fn ac4_dedup_similar_data_high_ratio() {
     let manifest2 = plane.get_manifest(id2).unwrap().unwrap();
 
     let net_new = plane.chunk_count().unwrap() - chunks_after_base;
-    assert!(net_new <= 2, "1-byte change: at most 2 net-new, got {net_new}");
+    assert!(
+        net_new <= 2,
+        "1-byte change: at most 2 net-new, got {net_new}"
+    );
 
     let shared = manifest2.iter().filter(|h| manifest1.contains(h)).count();
     let ratio = shared as f64 / manifest2.len() as f64;
-    assert!(ratio >= 0.75, "dedup ratio >= 75%, got {:.1}%", ratio * 100.0);
+    assert!(
+        ratio >= 0.75,
+        "dedup ratio >= 75%, got {:.1}%",
+        ratio * 100.0
+    );
     assert_eq!(read_object(&plane, id1).unwrap(), base);
     assert_eq!(read_object(&plane, id2).unwrap(), variant);
 }
@@ -446,7 +457,11 @@ fn ac4_dedup_prepend_boundary_stability() {
     let net_new = plane.chunk_count().unwrap() - chunks_base;
     let m2 = plane.get_manifest(id2).unwrap().unwrap();
     let ratio = net_new as f64 / m2.len() as f64;
-    assert!(ratio < 0.5, "prepend 1KB to 1MB: net-new <50%, got {:.1}%", ratio * 100.0);
+    assert!(
+        ratio < 0.5,
+        "prepend 1KB to 1MB: net-new <50%, got {:.1}%",
+        ratio * 100.0
+    );
     assert_eq!(read_object(&plane, id2).unwrap(), with_header);
 }
 
@@ -511,14 +526,20 @@ fn ac4_chunk_size_distribution() {
     let id = commit_ingest(s).unwrap();
     let manifest = plane.get_manifest(id).unwrap().unwrap();
 
-    assert!(manifest.len() >= 10 && manifest.len() <= 256,
-        "4MB/64KB: 10-256 chunks, got {}", manifest.len());
+    assert!(
+        manifest.len() >= 10 && manifest.len() <= 256,
+        "4MB/64KB: 10-256 chunks, got {}",
+        manifest.len()
+    );
 
-    let sizes: Vec<usize> = manifest.iter().map(|h| {
-        sentinel_fs::ingest::decompress_chunk(
-            &plane.read_chunk_raw(h).unwrap(),
-        ).unwrap().len()
-    }).collect();
+    let sizes: Vec<usize> = manifest
+        .iter()
+        .map(|h| {
+            sentinel_fs::ingest::decompress_chunk(&plane.read_chunk_raw(h).unwrap())
+                .unwrap()
+                .len()
+        })
+        .collect();
     let avg = sizes.iter().sum::<usize>() as f64 / sizes.len() as f64;
     let max_s = *sizes.iter().max().unwrap();
 
@@ -573,7 +594,10 @@ fn ac5_multi_format_ingest_roundtrip() {
         let rb = read_object(&plane, id).unwrap();
         assert_eq!(rb.len(), data.len(), "{mime}: size");
         assert_eq!(&rb, data, "{mime}: content");
-        assert_eq!(plane.get_object(id).unwrap().unwrap().size, data.len() as u64);
+        assert_eq!(
+            plane.get_object(id).unwrap().unwrap().size,
+            data.len() as u64
+        );
     }
 }
 

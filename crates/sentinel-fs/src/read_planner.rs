@@ -141,7 +141,9 @@ mod tests {
         let (plane, _dir) = temp_plane();
 
         // Simulate ISO: incompressible high-entropy data
-        let iso_data: Vec<u8> = (0..200_000u32).map(|i| ((i * 7919 + 12347) % 256) as u8).collect();
+        let iso_data: Vec<u8> = (0..200_000u32)
+            .map(|i| ((i * 7919 + 12347) % 256) as u8)
+            .collect();
         let mut s = begin_ingest(&plane, "application/x-iso9660-image");
         s.write(&iso_data);
         let iso_id = commit_ingest(s).unwrap();

@@ -265,7 +265,10 @@ mod tests {
 
         let stats = sched.stats();
         assert!(stats.delays_injected > 0, "should have injected delays");
-        assert!(elapsed >= Duration::from_millis(3), "should have slept at least 3ms");
+        assert!(
+            elapsed >= Duration::from_millis(3),
+            "should have slept at least 3ms"
+        );
     }
 
     #[test]

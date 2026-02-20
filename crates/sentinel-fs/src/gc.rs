@@ -4,7 +4,7 @@
 //! `FS_CHUNK_REFCOUNT` is zero (i.e., no manifest references them).
 //! This integrates with the existing CasStore GC pattern.
 
-use crate::artifact::{ArtifactPlane, FS_CHUNK_REFCOUNT, FS_CHUNKS};
+use crate::artifact::{ArtifactPlane, FS_CHUNKS, FS_CHUNK_REFCOUNT};
 use crate::cas::ChunkGcStats;
 use crate::segment::ChunkLocation;
 use redb::ReadableTable;
@@ -178,7 +178,10 @@ mod tests {
         // Release id2 too — now chunks become orphans
         release_object(&plane, id2).unwrap();
         let stats = gc_chunks(&plane).unwrap();
-        assert!(stats.removed > 0, "after releasing both, GC must find orphans");
+        assert!(
+            stats.removed > 0,
+            "after releasing both, GC must find orphans"
+        );
     }
 
     #[test]
