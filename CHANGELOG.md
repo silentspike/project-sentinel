@@ -47,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Streaming multi-write support before commit
     - `abort_ingest` leaves zero DB artifacts
     - Dedup optimization: skip zstd compression for chunks already in DB (read-only pre-check)
+    - BLAKE3-128 chunk fingerprinting (16-byte keys, ~3-5x faster than SHA-256 for hashing)
+    - SHA-256 retained for object-level integrity (compliance)
   - Streaming read planner (`src/read_planner.rs`): `read_object` + `read_object_streaming`
     - Manifest lookup → chunk decompression → sequential reassembly
   - Refcount GC (`src/gc.rs`): `gc_chunks` + `release_object`

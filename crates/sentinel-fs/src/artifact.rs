@@ -2,9 +2,9 @@
 //!
 //! Tables:
 //! - `FS_OBJECTS`: ObjectId -> ObjectMetadata (size, mime, created_at, chunk_count)
-//! - `FS_MANIFESTS`: ObjectId -> JSON-serialized Vec<[u8;32]> (ordered chunk list)
-//! - `FS_CHUNKS`: &[u8;32] (SHA-256) -> zstd-compressed chunk data
-//! - `FS_CHUNK_REFCOUNT`: &[u8;32] -> u32 (how many manifests reference this chunk)
+//! - `FS_MANIFESTS`: ObjectId -> JSON-serialized `Vec<[u8;16]>` (ordered chunk list)
+//! - `FS_CHUNKS`: `[u8;16]` (BLAKE3-128) -> zstd-compressed chunk data
+//! - `FS_CHUNK_REFCOUNT`: `[u8;16]` -> u32 (how many manifests reference this chunk)
 //! - `FS_OBJECT_REFS`: &str (name) -> u64 (ObjectId, named references)
 
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -19,11 +19,11 @@ pub const FS_OBJECTS: TableDefinition<u64, &[u8]> = TableDefinition::new("fs_obj
 /// Manifests: ObjectId -> JSON-serialized list of chunk hashes (ordered).
 pub const FS_MANIFESTS: TableDefinition<u64, &[u8]> = TableDefinition::new("fs_manifests");
 
-/// Chunk data: SHA-256 hash -> zstd-compressed chunk bytes.
-pub const FS_CHUNKS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("fs_chunks");
+/// Chunk data: BLAKE3-128 fingerprint -> zstd-compressed chunk bytes.
+pub const FS_CHUNKS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("fs_chunks");
 
-/// Chunk reference counts: SHA-256 hash -> refcount.
-pub const FS_CHUNK_REFCOUNT: TableDefinition<&[u8; 32], u32> =
+/// Chunk reference counts: BLAKE3-128 fingerprint -> refcount.
+pub const FS_CHUNK_REFCOUNT: TableDefinition<&[u8; 16], u32> =
     TableDefinition::new("fs_chunk_refcount");
 
 /// Named object references: name -> ObjectId.
@@ -67,8 +67,8 @@ impl ObjectMetadata {
     }
 }
 
-/// A chunk hash (SHA-256, 32 bytes).
-pub type ChunkHash = [u8; 32];
+/// A chunk fingerprint (BLAKE3-128, 16 bytes).
+pub type ChunkHash = [u8; 16];
 
 // --- ArtifactPlane ---
 
