@@ -7,7 +7,7 @@
 //! - `FS_CHUNK_REFCOUNT`: &[u8;32] -> u32 (how many manifests reference this chunk)
 //! - `FS_OBJECT_REFS`: &str (name) -> u64 (ObjectId, named references)
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
@@ -190,6 +190,13 @@ impl ArtifactPlane {
         }
         wtxn.commit()?;
         Ok(())
+    }
+
+    /// Count total unique chunks in FS_CHUNKS.
+    pub fn chunk_count(&self) -> anyhow::Result<u64> {
+        let rtxn = self.db.begin_read()?;
+        let table = rtxn.open_table(FS_CHUNKS)?;
+        Ok(table.len()?)
     }
 
     /// Get all chunk hashes with refcount == 0 (GC candidates).
