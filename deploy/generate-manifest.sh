@@ -66,13 +66,14 @@ echo ""
 
 FIRST=1
 MISSING=0
+MISSING_LIST=()
 
 for def in "${ARTIFACT_DEFS[@]}"; do
   IFS='|' read -r source dest type <<< "${def}"
 
   if [ ! -f "${source}" ]; then
-    echo "  SKIP (not found): ${source}" >&2
     MISSING=$((MISSING + 1))
+    MISSING_LIST+=("${source}")
     continue
   fi
 
@@ -105,5 +106,21 @@ echo ""
 echo "Manifest written to: ${OUTPUT}"
 
 if [ "${MISSING}" -gt 0 ]; then
-  echo "WARNING: ${MISSING} artifact(s) not found (binaries not built yet?)" >&2
+  echo "" >&2
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+  echo "WARNING: MANIFEST IS INCOMPLETE — ${MISSING} artifact(s) not found:" >&2
+  for missing_src in "${MISSING_LIST[@]}"; do
+    echo "  MISSING: ${missing_src}" >&2
+  done
+  echo "" >&2
+  echo "  Build missing artifacts before generating the manifest." >&2
+  echo "  Rust: cargo remote -- build --workspace --release" >&2
+  echo "  Go:   cd cmd/cortex-gateway && go build -o cortex-gateway ./..." >&2
+  echo "        cd services/sentinel-judge && go build -o sentinel-judge ./..." >&2
+  echo "        cd services/sentinel-nats-bridge && go build -o sentinel-nats-bridge ./..." >&2
+  echo "" >&2
+  echo "  Do NOT use this manifest for deploy-preflight — it will" >&2
+  echo "  report false MISSING for every skipped artifact." >&2
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+  exit 1
 fi
