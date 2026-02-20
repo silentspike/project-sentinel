@@ -8,7 +8,10 @@
 //! - `FS_OBJECT_REFS`: &str (name) -> u64 (ObjectId, named references)
 //! - `FS_INGEST_SESSIONS`: session_id (u64) -> JSON-serialized IngestSessionState
 
-use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
+use redb::{
+    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    WriteTransaction,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
@@ -163,8 +166,7 @@ impl ArtifactPlane {
         durability: DurabilityLevel,
     ) -> anyhow::Result<Self> {
         let path = path.as_ref();
-        let db = Database::create(path)
-            .map_err(|e| anyhow::anyhow!("ArtifactPlane open: {e}"))?;
+        let db = Database::create(path).map_err(|e| anyhow::anyhow!("ArtifactPlane open: {e}"))?;
 
         // Segment packs dir: sibling to the redb file
         let seg_dir = path.with_extension("segments");
@@ -220,7 +222,10 @@ impl ArtifactPlane {
 
     /// Get commit scheduler statistics.
     pub fn scheduler_stats(&self) -> crate::commit_scheduler::SchedulerStats {
-        self.scheduler.lock().unwrap_or_else(|e| e.into_inner()).stats()
+        self.scheduler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stats()
     }
 
     /// Allocate the next ObjectId (monotonic counter stored at key 0 in FS_OBJECTS using a
@@ -286,11 +291,12 @@ impl ArtifactPlane {
         let table = rtxn.open_table(FS_CHUNKS)?;
         let loc_bytes = table
             .get(hash)?
-            .ok_or_else(|| {
-                anyhow::anyhow!("Chunk {} not found", crate::cas::hex_encode(hash))
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("Chunk {} not found", crate::cas::hex_encode(hash)))?;
         let loc = ChunkLocation::from_bytes(loc_bytes.value())?;
-        let segments = self.segments.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let segments = self
+            .segments
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         segments.read(&loc)
     }
 
@@ -300,7 +306,10 @@ impl ArtifactPlane {
     pub fn read_chunk_decompressed(&self, hash: &ChunkHash) -> anyhow::Result<Vec<u8>> {
         // Fast path: cache hit
         {
-            let mut cache = self.cache.lock().map_err(|e| anyhow::anyhow!("cache lock: {e}"))?;
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|e| anyhow::anyhow!("cache lock: {e}"))?;
             if let Some(data) = cache.get(hash) {
                 return Ok(data.to_vec());
             }
@@ -312,7 +321,10 @@ impl ArtifactPlane {
 
         // Insert into cache (subject to admission policy)
         {
-            let mut cache = self.cache.lock().map_err(|e| anyhow::anyhow!("cache lock: {e}"))?;
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|e| anyhow::anyhow!("cache lock: {e}"))?;
             cache.insert(*hash, decompressed.clone());
         }
 
@@ -329,7 +341,10 @@ impl ArtifactPlane {
         // Phase 1: Check cache for each hash, collect miss indices
         let mut miss_indices: Vec<usize> = Vec::new();
         {
-            let mut cache = self.cache.lock().map_err(|e| anyhow::anyhow!("cache lock: {e}"))?;
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|e| anyhow::anyhow!("cache lock: {e}"))?;
             for (i, hash) in hashes.iter().enumerate() {
                 if let Some(data) = cache.get(hash) {
                     results[i] = Some(data.to_vec());
@@ -362,13 +377,19 @@ impl ArtifactPlane {
         // Phase 3: Batch read from segment store
         let locations_only: Vec<_> = miss_locations.iter().map(|(_, loc)| *loc).collect();
         let compressed_results = {
-            let segments = self.segments.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+            let segments = self
+                .segments
+                .lock()
+                .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
             segments.read_batch(&locations_only)
         };
 
         // Phase 4: Decompress and insert into cache
         {
-            let mut cache = self.cache.lock().map_err(|e| anyhow::anyhow!("cache lock: {e}"))?;
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|e| anyhow::anyhow!("cache lock: {e}"))?;
             for (batch_idx, compressed_result) in compressed_results.into_iter().enumerate() {
                 let (result_idx, _) = miss_locations[batch_idx];
                 let compressed = compressed_result?;
@@ -431,7 +452,11 @@ impl ArtifactPlane {
     // --- Ingest Session Tracking ---
 
     /// Register a new ingest session (shown as .part in FUSE).
-    pub fn register_session(&self, session_id: u64, state: &IngestSessionState) -> anyhow::Result<()> {
+    pub fn register_session(
+        &self,
+        session_id: u64,
+        state: &IngestSessionState,
+    ) -> anyhow::Result<()> {
         let wtxn = self.begin_write()?;
         {
             let mut table = wtxn.open_table(FS_INGEST_SESSIONS)?;
@@ -442,7 +467,11 @@ impl ArtifactPlane {
     }
 
     /// Update bytes_received for an active session.
-    pub fn update_session_progress(&self, session_id: u64, bytes_received: u64) -> anyhow::Result<()> {
+    pub fn update_session_progress(
+        &self,
+        session_id: u64,
+        bytes_received: u64,
+    ) -> anyhow::Result<()> {
         // Read current state first (separate scope to drop borrow)
         let updated = {
             let rtxn = self.db.begin_read()?;

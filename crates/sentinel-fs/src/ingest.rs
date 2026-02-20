@@ -15,7 +15,10 @@
 //! let ids = batch.commit()?;  // 1 redb txn + 1 fsync for all N objects
 //! ```
 
-use crate::artifact::{ArtifactPlane, ChunkHash, IngestSessionState, ObjectMetadata, FS_CHUNK_REFCOUNT, FS_CHUNKS, FS_INGEST_SESSIONS, FS_MANIFESTS, FS_OBJECTS};
+use crate::artifact::{
+    ArtifactPlane, ChunkHash, IngestSessionState, ObjectMetadata, FS_CHUNKS, FS_CHUNK_REFCOUNT,
+    FS_INGEST_SESSIONS, FS_MANIFESTS, FS_OBJECTS,
+};
 use crate::chunker::chunk_data;
 use crate::segment::ChunkLocation;
 use rayon::prelude::*;
@@ -101,7 +104,13 @@ impl IngestSession<'_> {
 /// 5. Write object metadata to FS_OBJECTS
 /// 6. Commit write transaction
 pub fn commit_ingest(session: IngestSession<'_>) -> anyhow::Result<u64> {
-    let IngestSession { plane, buffer, mime, object_id, .. } = session;
+    let IngestSession {
+        plane,
+        buffer,
+        mime,
+        object_id,
+        ..
+    } = session;
 
     // Chunk the data
     let chunks: Vec<_> = chunk_data(&buffer).collect();
@@ -125,17 +134,21 @@ pub fn commit_ingest(session: IngestSession<'_>) -> anyhow::Result<u64> {
     // Compress new chunks — parallel if enough work to justify thread-pool overhead
     let chunk_entries = compress_chunks_adaptive(&chunks, &existing_chunks);
     let manifest: Vec<ChunkHash> = chunk_entries.iter().map(|(h, _)| *h).collect();
-    let manifest_bytes = serde_json::to_vec(&manifest)
-        .map_err(|e| anyhow::anyhow!("manifest serialize: {e}"))?;
+    let manifest_bytes =
+        serde_json::to_vec(&manifest).map_err(|e| anyhow::anyhow!("manifest serialize: {e}"))?;
 
     let meta = ObjectMetadata::new(total_size, &mime, chunk_count);
     let meta_bytes = meta.serialize()?;
 
     // Phase 1: Append new chunks to segment store (outside redb txn).
     // If we crash here, dead bytes in the segment file — GC reclaims them.
-    let mut chunk_locations: Vec<(ChunkHash, Option<ChunkLocation>)> = Vec::with_capacity(chunk_entries.len());
+    let mut chunk_locations: Vec<(ChunkHash, Option<ChunkLocation>)> =
+        Vec::with_capacity(chunk_entries.len());
     {
-        let mut segments = plane.segments.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut segments = plane
+            .segments
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         for (hash, compressed) in &chunk_entries {
             if let Some(data) = compressed {
                 let loc = segments.append(data)?;
@@ -266,7 +279,10 @@ impl<'a> BatchIngest<'a> {
         let mut all_locations: Vec<Vec<(ChunkHash, Option<ChunkLocation>)>> =
             Vec::with_capacity(self.prepared.len());
         {
-            let mut segments = self.plane.segments.lock()
+            let mut segments = self
+                .plane
+                .segments
+                .lock()
                 .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
             for prep in &self.prepared {
                 let mut locs = Vec::with_capacity(prep.chunk_entries.len());
@@ -322,7 +338,10 @@ fn compress_chunks_adaptive(
     existing: &std::collections::HashSet<ChunkHash>,
 ) -> Vec<(ChunkHash, Option<Vec<u8>>)> {
     // Count how many chunks actually need compression
-    let new_count = chunks.iter().filter(|c| !existing.contains(&c.hash)).count();
+    let new_count = chunks
+        .iter()
+        .filter(|c| !existing.contains(&c.hash))
+        .count();
 
     if new_count >= PARALLEL_COMPRESS_THRESHOLD {
         // Parallel: enough work to justify rayon overhead
@@ -479,7 +498,10 @@ mod tests {
         // Both should produce the same manifest
         let m1 = plane.get_manifest(id1).unwrap().unwrap();
         let m2 = plane.get_manifest(id2).unwrap().unwrap();
-        assert_eq!(m1, m2, "streaming write must produce same chunks as single write");
+        assert_eq!(
+            m1, m2,
+            "streaming write must produce same chunks as single write"
+        );
     }
 
     #[test]
@@ -618,12 +640,18 @@ mod tests {
         // Small writes should NOT update the DB (below PROGRESS_FLUSH_BYTES threshold)
         session.write(&vec![0x11; 1000]);
         let state = plane.get_session(oid).unwrap().unwrap();
-        assert_eq!(state.bytes_received, 0, "small write should not flush progress");
+        assert_eq!(
+            state.bytes_received, 0,
+            "small write should not flush progress"
+        );
 
         // Writing past threshold should flush
         session.write(&vec![0x22; PROGRESS_FLUSH_BYTES as usize]);
         let state = plane.get_session(oid).unwrap().unwrap();
-        assert!(state.bytes_received > 0, "large write should flush progress");
+        assert!(
+            state.bytes_received > 0,
+            "large write should flush progress"
+        );
 
         commit_ingest(session).unwrap();
     }

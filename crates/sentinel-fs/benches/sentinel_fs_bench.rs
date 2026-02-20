@@ -322,7 +322,9 @@ fn batch_ingest_10_files(c: &mut Criterion) {
             |plane| {
                 let mut batch = BatchIngest::new(&plane);
                 for file_data in &files {
-                    batch.add(std::hint::black_box(file_data), "application/octet-stream").unwrap();
+                    batch
+                        .add(std::hint::black_box(file_data), "application/octet-stream")
+                        .unwrap();
                 }
                 std::hint::black_box(batch.commit().unwrap())
             },

@@ -232,7 +232,8 @@ impl SegmentStore {
         ring.submit_and_wait(count)?;
 
         // Reap completions
-        let mut results: Vec<anyhow::Result<Vec<u8>>> = (0..count).map(|_| Ok(Vec::new())).collect();
+        let mut results: Vec<anyhow::Result<Vec<u8>>> =
+            (0..count).map(|_| Ok(Vec::new())).collect();
         for cqe in ring.completion() {
             let idx = cqe.user_data() as usize;
             let ret = cqe.result();
@@ -271,7 +272,10 @@ impl SegmentStore {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(id_str) = name.strip_prefix("seg_").and_then(|s| s.strip_suffix(".pack")) {
+            if let Some(id_str) = name
+                .strip_prefix("seg_")
+                .and_then(|s| s.strip_suffix(".pack"))
+            {
                 if let Ok(id) = u32::from_str_radix(id_str, 16) {
                     ids.push(id);
                 }
@@ -405,8 +409,7 @@ mod tests {
     fn segment_rotation() {
         let dir = tempfile::tempdir().unwrap();
         // Target 64 bytes: header=16 + 80 data = 96 > 64 → seal after first append
-        let mut store =
-            SegmentStore::open_with_target(dir.path().join("segments"), 64).unwrap();
+        let mut store = SegmentStore::open_with_target(dir.path().join("segments"), 64).unwrap();
 
         let data = vec![0xDD; 80];
         let loc1 = store.append(&data).unwrap();
@@ -428,8 +431,7 @@ mod tests {
     fn segment_list_and_remove() {
         let dir = tempfile::tempdir().unwrap();
         // Target 64: first 80-byte append fills past target, second goes to new segment
-        let mut store =
-            SegmentStore::open_with_target(dir.path().join("segments"), 64).unwrap();
+        let mut store = SegmentStore::open_with_target(dir.path().join("segments"), 64).unwrap();
 
         store.append(&[1; 80]).unwrap();
         store.append(&[2; 80]).unwrap(); // triggers rotation
