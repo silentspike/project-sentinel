@@ -5,6 +5,7 @@
 //! `tokio::Runtime` fuer async I/O (Zenoh, Limbo).
 
 pub mod config;
+pub mod controlplane;
 pub mod orchestrator;
 pub mod shift;
 pub mod signal;

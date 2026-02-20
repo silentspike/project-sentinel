@@ -22,11 +22,14 @@ sentinel-zenoh = { path = "../../crates/sentinel-zenoh" }
 sentinel-limbo = { path = "../../crates/sentinel-limbo" }
 sentinel-redb = { path = "../../crates/sentinel-redb" }
 sentinel-telemetry = { path = "../../crates/sentinel-telemetry" }
+bevy_ecs = { workspace = true }
+redb = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
