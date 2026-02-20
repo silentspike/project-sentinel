@@ -17,6 +17,7 @@
 
 use crate::artifact::{ArtifactPlane, ChunkHash, IngestSessionState, ObjectMetadata, FS_CHUNK_REFCOUNT, FS_CHUNKS, FS_INGEST_SESSIONS, FS_MANIFESTS, FS_OBJECTS};
 use crate::chunker::chunk_data;
+use crate::segment::ChunkLocation;
 use rayon::prelude::*;
 use redb::{ReadableDatabase, ReadableTable};
 use std::io::Cursor;
@@ -130,7 +131,22 @@ pub fn commit_ingest(session: IngestSession<'_>) -> anyhow::Result<u64> {
     let meta = ObjectMetadata::new(total_size, &mime, chunk_count);
     let meta_bytes = meta.serialize()?;
 
-    // Atomic write transaction: chunks + manifest + metadata + session cleanup
+    // Phase 1: Append new chunks to segment store (outside redb txn).
+    // If we crash here, dead bytes in the segment file — GC reclaims them.
+    let mut chunk_locations: Vec<(ChunkHash, Option<ChunkLocation>)> = Vec::with_capacity(chunk_entries.len());
+    {
+        let mut segments = plane.segments.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        for (hash, compressed) in &chunk_entries {
+            if let Some(data) = compressed {
+                let loc = segments.append(data)?;
+                chunk_locations.push((*hash, Some(loc)));
+            } else {
+                chunk_locations.push((*hash, None)); // already exists (dedup)
+            }
+        }
+    }
+
+    // Phase 2: Atomic redb transaction: index entries + manifest + metadata + session cleanup
     let wtxn = plane.begin_write()?;
     {
         let mut chunks_table = wtxn.open_table(FS_CHUNKS)?;
@@ -139,10 +155,11 @@ pub fn commit_ingest(session: IngestSession<'_>) -> anyhow::Result<u64> {
         let mut objects_table = wtxn.open_table(FS_OBJECTS)?;
         let mut sessions_table = wtxn.open_table(FS_INGEST_SESSIONS)?;
 
-        // 1. Store new chunks + 2. Increment refcounts for all
-        for (hash, compressed) in &chunk_entries {
-            if let Some(data) = compressed {
-                chunks_table.insert(hash, data.as_slice())?;
+        // 1. Store new chunk index entries + 2. Increment refcounts for all
+        for (hash, loc) in &chunk_locations {
+            if let Some(loc) = loc {
+                let loc_bytes = loc.to_bytes();
+                chunks_table.insert(hash, loc_bytes.as_slice())?;
             }
             let current = refcount_table.get(hash)?.map(|g| g.value()).unwrap_or(0);
             refcount_table.insert(hash, current + 1)?;
@@ -245,7 +262,27 @@ impl<'a> BatchIngest<'a> {
             object_ids.push(self.plane.next_object_id()?);
         }
 
-        // Single write transaction for everything
+        // Phase 1: Append new chunks to segment store
+        let mut all_locations: Vec<Vec<(ChunkHash, Option<ChunkLocation>)>> =
+            Vec::with_capacity(self.prepared.len());
+        {
+            let mut segments = self.plane.segments.lock()
+                .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+            for prep in &self.prepared {
+                let mut locs = Vec::with_capacity(prep.chunk_entries.len());
+                for (hash, compressed) in &prep.chunk_entries {
+                    if let Some(data) = compressed {
+                        let loc = segments.append(data)?;
+                        locs.push((*hash, Some(loc)));
+                    } else {
+                        locs.push((*hash, None));
+                    }
+                }
+                all_locations.push(locs);
+            }
+        }
+
+        // Phase 2: Single redb write transaction for index + metadata
         let wtxn = self.plane.begin_write()?;
         {
             let mut chunks_table = wtxn.open_table(FS_CHUNKS)?;
@@ -253,19 +290,20 @@ impl<'a> BatchIngest<'a> {
             let mut manifests_table = wtxn.open_table(FS_MANIFESTS)?;
             let mut objects_table = wtxn.open_table(FS_OBJECTS)?;
 
-            for (i, prep) in self.prepared.iter().enumerate() {
+            for (i, locs) in all_locations.iter().enumerate() {
                 let oid = object_ids[i];
 
-                for (hash, compressed) in &prep.chunk_entries {
-                    if let Some(data) = compressed {
-                        chunks_table.insert(hash, data.as_slice())?;
+                for (hash, loc) in locs {
+                    if let Some(loc) = loc {
+                        let loc_bytes = loc.to_bytes();
+                        chunks_table.insert(hash, loc_bytes.as_slice())?;
                     }
                     let current = refcount_table.get(hash)?.map(|g| g.value()).unwrap_or(0);
                     refcount_table.insert(hash, current + 1)?;
                 }
 
-                manifests_table.insert(oid, prep.manifest_bytes.as_slice())?;
-                objects_table.insert(oid, prep.meta_bytes.as_slice())?;
+                manifests_table.insert(oid, self.prepared[i].manifest_bytes.as_slice())?;
+                objects_table.insert(oid, self.prepared[i].meta_bytes.as_slice())?;
             }
         }
         wtxn.commit()?;
