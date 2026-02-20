@@ -9,6 +9,7 @@ publish = false
 default = ["telemetry"]
 telemetry = ["sentinel-telemetry/telemetry"]
 fuse-tests = ["fuser", "libc"]
+iouring = ["io-uring"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -18,10 +19,13 @@ sentinel-telemetry = { path = "../sentinel-telemetry" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+blake3 = { workspace = true }
 tracing = { workspace = true }
 fuser = { version = "0.16", optional = true }
 libc = { version = "0.2", optional = true }
 zstd = "0.13"
+rayon = { workspace = true }
+io-uring = { version = "0.7", optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

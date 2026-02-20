@@ -37,8 +37,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Verified: Bridge latency p50=2.2ms, p95=2.7ms, p99=3.2ms (AC-5, threshold <2s)
   - Verified: Empty store poll 30s soak — no crash, no busy-loop (AC-N1)
   - Benchmarks: Batch=50 13737 evt/s, Batch=100 16719 evt/s, Batch=200 9980 evt/s
-  - Added Go binaries and release-manifest.json to .gitignore
 
+- **sentinel-fs Artifact Plane** (#56)
+  - 5 new redb tables: `FS_OBJECTS`, `FS_MANIFESTS`, `FS_CHUNKS`, `FS_CHUNK_REFCOUNT`, `FS_OBJECT_REFS`
+  - Content-Defined Chunking (CDC) with gear-hash based Rabin-style rolling hash (`src/chunker.rs`)
+    - Target: 64 KB chunks (min 16 KB, max 256 KB), fully deterministic
+  - Transactional ingest pipeline (`src/ingest.rs`): `begin_ingest` / `commit_ingest` / `abort_ingest`
+    - Atomic redb write transaction: chunk storage, refcount increment, manifest, object metadata
+    - Streaming multi-write support before commit
+    - `abort_ingest` leaves zero DB artifacts
+    - Dedup optimization: skip zstd compression for chunks already in DB (read-only pre-check)
+    - BLAKE3-128 chunk fingerprinting (16-byte keys, ~3-5x faster than SHA-256 for hashing)
+    - SHA-256 retained for object-level integrity (compliance)
+    - `BatchIngest` API: amortize fsync across N objects in single redb transaction
+      - `BatchIngest::new()` / `add()` / `commit()` — chunking+compression up front, one write txn
+    - Configurable `DurabilityLevel` for ArtifactPlane (`Immediate` / `Eventual`)
+      - `Eventual` skips fsync: 1MB ingest 55ms → 22ms (-59%), not crash-safe
+      - Config: `config/storage.toml` `[artifact] durability = "immediate" | "eventual"`
+    - Adaptive parallel compression via rayon: serial for < 32 new chunks, parallel above
+      - `chunk_data_parallel()` in chunker: serial CDC boundaries + parallel BLAKE3 hashing
+      - Dedup paths 23-36% faster, eventual ingest 14.7ms (-35% vs 22.5ms)
+    - `FS_INGEST_SESSIONS` table (6th redb table): tracks in-progress ingests as `.part` files
+      - Pre-allocated ObjectId doubles as session ID for FUSE visibility
+      - Throttled progress updates (every 256 KB) to avoid DB thrashing on streaming writes
+      - Atomic session cleanup: commit removes entry in same write txn, abort removes separately
+    - Segment Pack storage (`src/segment.rs`): chunk data in append-only files, not redb
+      - `FS_CHUNKS` stores 16-byte `ChunkLocation` index instead of inline compressed data
+      - `SegmentStore`: append-only ~64 MB segment files on NVMe
+      - Two-phase commit: append to segment (crash-safe dead space) → atomic redb index
+      - Less redb bloat, better I/O patterns for sequential reads, enables future io_uring
+    - L1 RAM chunk cache (`src/chunk_cache.rs`): decompressed data cache with anti-pollution
+      - Two-hit admission policy: chunks only cached after 2nd read (prevents scan pollution)
+      - FIFO eviction, 64 MB default capacity, oversized chunk rejection (>25% of cache)
+      - `read_chunk_decompressed()` on ArtifactPlane: cache-first path avoids redundant I/O + zstd
+      - `cache_stats()` for observability (hits, misses, entries, bytes)
+    - io_uring batch reads for segment data path (feature-gated `iouring`)
+      - `SegmentStore::read_batch()`: submit N pread SQEs in one syscall, reap CQEs
+      - `ArtifactPlane::read_chunks_decompressed()`: cache-first batch path, single redb txn for misses
+      - `read_object()` now uses batch reads for full manifest fetch in one pass
+      - Sync fallback: cached file handles per segment_id, sequential pread (no io_uring)
+    - Adaptive Commit Scheduler (`src/commit_scheduler.rs`): IOPS-aware write throttling
+      - Rate tracking with sliding window, configurable max_iops (default: 500)
+      - PSI-aware: reads `/proc/pressure/io` avg10 for system-wide I/O backpressure
+      - PSI pressure multiplier: 3x delay when avg10 > 10%
+      - Integrated into `ArtifactPlane::begin_write()` — transparent to callers
+      - `scheduler_stats()` for observability
+  - Streaming read planner (`src/read_planner.rs`): `read_object` + `read_object_streaming`
+    - Manifest lookup → chunk decompression → sequential reassembly (L1 cache accelerated)
+  - Refcount GC (`src/gc.rs`): `gc_chunks` + `release_object`
+    - Orphan chunk detection via FS_CHUNKS vs FS_CHUNK_REFCOUNT diff
+    - `release_object` decrements all chunk refcounts atomically before removal
+  - Config: `config/storage.toml` (chunking params, compression level, GC interval)
+  - 7 new Criterion benchmarks: chunker throughput, 1 MB/100 MB ingest, dedup identical/similar files, read planner, GC
+  - 10 new integration tests for AC-4 (dedup effectiveness) and AC-5 (multi-format ingest)
+    - Dedup: identical files, 10x identical, similar data, prepend boundary stability, scaling 10MB
+    - Multi-format: binary, HTML, PDF, JSON in single ingest pipeline
+    - GC lifecycle, compression ratio, chunk size distribution verification
+  - 87 unit tests across 7 new modules + 19 integration tests, all green
 - **Sentinel Judge: Enterprise Quality Analysis Service** (#26)
   - Bridge unit tests (6 tests: publish, dedup, subject mapping, config defaults, GetEventsSince)
   - Go benchmarks: judge (7), messaging (4), all passing with HeuristicPipeline at ~1µs (target <5ms)

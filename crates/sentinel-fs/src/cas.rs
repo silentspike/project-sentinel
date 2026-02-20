@@ -216,10 +216,17 @@ fn decode_blob(encoded: &[u8]) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-/// Encode 32 bytes as lowercase hex string.
-pub fn hex_encode(bytes: &[u8; 32]) -> String {
+/// GC statistics for the Artifact Plane chunk store.
+#[derive(Debug, Clone, Default)]
+pub struct ChunkGcStats {
+    pub removed: u64,
+    pub freed_bytes: u64,
+}
+
+/// Encode bytes as lowercase hex string.
+pub fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
-    let mut s = String::with_capacity(64);
+    let mut s = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         write!(s, "{byte:02x}").unwrap();
     }

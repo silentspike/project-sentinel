@@ -1,0 +1,26 @@
+# sentinel-fs Artifact Plane storage configuration
+# SSOT for chunking, compression, and GC parameters.
+
+[chunking]
+# Minimum chunk size in bytes (16 KB)
+min_chunk_bytes = 16384
+# Target chunk size in bytes (64 KB) — actual boundaries are content-defined
+target_chunk_bytes = 65536
+# Maximum chunk size in bytes (256 KB)
+max_chunk_bytes = 262144
+
+[compression]
+# zstd compression level (1=fastest, 22=best ratio; 3=good balance)
+level = 3
+# Minimum size in bytes before attempting compression
+min_compress_bytes = 256
+
+[artifact]
+# Durability level for ArtifactPlane write transactions.
+# "immediate" = fsync on every commit (crash-safe, default)
+# "eventual"  = skip fsync (faster on VMs, data since last fsync may be lost on crash)
+durability = "immediate"
+
+[gc]
+# How often to run GC in seconds (3600 = 1 hour)
+interval_seconds = 3600
