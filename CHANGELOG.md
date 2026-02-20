@@ -37,8 +37,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Verified: Bridge latency p50=2.2ms, p95=2.7ms, p99=3.2ms (AC-5, threshold <2s)
   - Verified: Empty store poll 30s soak — no crash, no busy-loop (AC-N1)
   - Benchmarks: Batch=50 13737 evt/s, Batch=100 16719 evt/s, Batch=200 9980 evt/s
-  - Added Go binaries and release-manifest.json to .gitignore
 
+- **sentinel-fs Artifact Plane** (#56)
+  - 5 new redb tables: `FS_OBJECTS`, `FS_MANIFESTS`, `FS_CHUNKS`, `FS_CHUNK_REFCOUNT`, `FS_OBJECT_REFS`
+  - Content-Defined Chunking (CDC) with gear-hash based Rabin-style rolling hash (`src/chunker.rs`)
+    - Target: 64 KB chunks (min 16 KB, max 256 KB), fully deterministic
+  - Transactional ingest pipeline (`src/ingest.rs`): `begin_ingest` / `commit_ingest` / `abort_ingest`
+    - Atomic redb write transaction: chunk storage, refcount increment, manifest, object metadata
+    - Streaming multi-write support before commit
+    - `abort_ingest` leaves zero DB artifacts
+  - Streaming read planner (`src/read_planner.rs`): `read_object` + `read_object_streaming`
+    - Manifest lookup → chunk decompression → sequential reassembly
+  - Refcount GC (`src/gc.rs`): `gc_chunks` + `release_object`
+    - Orphan chunk detection via FS_CHUNKS vs FS_CHUNK_REFCOUNT diff
+    - `release_object` decrements all chunk refcounts atomically before removal
+  - Config: `config/storage.toml` (chunking params, compression level, GC interval)
+  - 7 new Criterion benchmarks: chunker throughput, 1 MB/100 MB ingest, dedup identical/similar files, read planner, GC
+  - 56 new unit tests across 4 new modules; all 65 unit tests + 9 integration tests green
 - **Sentinel Judge: Enterprise Quality Analysis Service** (#26)
   - Bridge unit tests (6 tests: publish, dedup, subject mapping, config defaults, GetEventsSince)
   - Go benchmarks: judge (7), messaging (4), all passing with HeuristicPipeline at ~1µs (target <5ms)
