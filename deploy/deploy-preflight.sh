@@ -4,7 +4,10 @@
 # Usage: bash deploy/deploy-preflight.sh <SSH_TARGET> [MANIFEST_PATH]
 #   SSH_TARGET:    e.g. ubuntu@10.0.0.240
 #   MANIFEST_PATH: optional, defaults to deploy/release-manifest.json
-set -euo pipefail
+# Note: intentionally no `set -e` — the while-loop handles each artifact's
+# exit codes manually. `set -e` would abort the script on the first grep
+# non-match or SSH error instead of continuing to the next artifact.
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -47,8 +50,8 @@ FAIL=0
 MISSING=0
 
 while IFS=$'\t' read -r path expected_hash; do
-  # Get hash from remote; file may not exist yet
-  actual_output="$(ssh "${SSH_TARGET}" "sha256sum '${path}' 2>/dev/null || echo MISSING" 2>/dev/null)"
+  # Get hash from remote; SSH errors or missing files both result in "MISSING"
+  actual_output="$(ssh "${SSH_TARGET}" "sha256sum '${path}' 2>/dev/null || echo MISSING" 2>/dev/null || echo MISSING)"
 
   if echo "${actual_output}" | grep -q "^MISSING$"; then
     printf "%-60s %-14s %-14s %s\n" \
