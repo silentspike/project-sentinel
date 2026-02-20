@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - SHA-256 retained for object-level integrity (compliance)
     - `BatchIngest` API: amortize fsync across N objects in single redb transaction
       - `BatchIngest::new()` / `add()` / `commit()` — chunking+compression up front, one write txn
+    - Configurable `DurabilityLevel` for ArtifactPlane (`Immediate` / `Eventual`)
+      - `Eventual` skips fsync: 1MB ingest 55ms → 22ms (-59%), not crash-safe
+      - Config: `config/storage.toml` `[artifact] durability = "immediate" | "eventual"`
   - Streaming read planner (`src/read_planner.rs`): `read_object` + `read_object_streaming`
     - Manifest lookup → chunk decompression → sequential reassembly
   - Refcount GC (`src/gc.rs`): `gc_chunks` + `release_object`

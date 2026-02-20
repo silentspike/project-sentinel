@@ -15,6 +15,12 @@ level = 3
 # Minimum size in bytes before attempting compression
 min_compress_bytes = 256
 
+[artifact]
+# Durability level for ArtifactPlane write transactions.
+# "immediate" = fsync on every commit (crash-safe, default)
+# "eventual"  = skip fsync (faster on VMs, data since last fsync may be lost on crash)
+durability = "immediate"
+
 [gc]
 # How often to run GC in seconds (3600 = 1 hour)
 interval_seconds = 3600
