@@ -242,25 +242,13 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// --- Step 5: Perception Injection (3-Source Assembly) ---
 	agentName := req.Metadata["agent_name"]
 	agentRole := req.Metadata["agent_role"]
-
-	if agentName != "" {
-		systemPrompt := ph.buildSystemPrompt(&req, agentName, agentRole, providerName)
-		if systemPrompt != "" {
-			req.Messages = prependSystemMessage(req.Messages, systemPrompt)
-		}
-	}
+	ph.injectPerception(&req, agentName, agentRole, providerName)
 
 	// --- Step 6: Provider.Send() mit Deadline ---
 	ctx, cancel := context.WithTimeout(r.Context(), ph.providerDeadline)
 	defer cancel()
 
-	// Track query in InFlightMap (if enabled)
-	var queryTracked bool
-	if ph.inflight != nil {
-		tick := parseTick(req.Metadata)
-		ph.inflight.Track(requestID, tick)
-		queryTracked = true
-	}
+	ph.trackInflight(requestID, req.Metadata)
 
 	prevState := breaker.State()
 	resp, err := provider.Send(ctx, &req)
@@ -272,9 +260,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		if queryTracked {
-			ph.inflight.Cancel(requestID)
-		}
+		ph.cancelInflight(requestID)
 		duration := time.Since(start)
 		pipelineRequestsTotal.WithLabelValues(providerName, "error").Inc()
 		pipelineLatency.WithLabelValues(providerName).Observe(duration.Seconds())
@@ -288,18 +274,15 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// --- Step 6b: InFlight Accept (stale/expired check) ---
-	if queryTracked {
-		responseTick := parseTick(req.Metadata)
-		if !ph.inflight.Accept(requestID, responseTick) {
-			pipelineRequestsTotal.WithLabelValues(providerName, "stale").Inc()
-			pipelineLatency.WithLabelValues(providerName).Observe(time.Since(start).Seconds())
-			ph.logger.Warn("query response rejected (stale/expired)",
-				"request_id", requestID,
-				"provider", providerName,
-			)
-			http.Error(w, "query expired or stale response", http.StatusGatewayTimeout)
-			return
-		}
+	if !ph.acceptInflight(requestID, req.Metadata) {
+		pipelineRequestsTotal.WithLabelValues(providerName, "stale").Inc()
+		pipelineLatency.WithLabelValues(providerName).Observe(time.Since(start).Seconds())
+		ph.logger.Warn("query response rejected (stale/expired)",
+			"request_id", requestID,
+			"provider", providerName,
+		)
+		http.Error(w, "query expired or stale response", http.StatusGatewayTimeout)
+		return
 	}
 
 	// --- Step 6c: Guardrails Record ---
@@ -393,6 +376,39 @@ func (ph *PipelineHandler) applyGuardrails(w http.ResponseWriter, req *LLMReques
 		}
 	}
 	return provider, providerName, false
+}
+
+// injectPerception assembles and prepends the system prompt when an agent name is present.
+func (ph *PipelineHandler) injectPerception(req *LLMRequest, agentName, agentRole, providerName string) {
+	if agentName == "" {
+		return
+	}
+	if systemPrompt := ph.buildSystemPrompt(req, agentName, agentRole, providerName); systemPrompt != "" {
+		req.Messages = prependSystemMessage(req.Messages, systemPrompt)
+	}
+}
+
+// trackInflight records a query in the InFlightMap if enabled. No-op when inflight is nil.
+func (ph *PipelineHandler) trackInflight(requestID string, metadata map[string]string) {
+	if ph.inflight != nil {
+		ph.inflight.Track(requestID, parseTick(metadata))
+	}
+}
+
+// cancelInflight cancels an in-flight query on provider error. No-op when inflight is nil.
+func (ph *PipelineHandler) cancelInflight(requestID string) {
+	if ph.inflight != nil {
+		ph.inflight.Cancel(requestID)
+	}
+}
+
+// acceptInflight accepts a query response, returning false if the response is stale/expired.
+// Returns true (accept) when inflight tracking is disabled (nil).
+func (ph *PipelineHandler) acceptInflight(requestID string, metadata map[string]string) bool {
+	if ph.inflight == nil {
+		return true
+	}
+	return ph.inflight.Accept(requestID, parseTick(metadata))
 }
 
 // resolveProvider holt den Provider nach Name, mit Fallback auf Primary.
