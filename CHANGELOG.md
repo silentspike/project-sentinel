@@ -49,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Dedup optimization: skip zstd compression for chunks already in DB (read-only pre-check)
     - BLAKE3-128 chunk fingerprinting (16-byte keys, ~3-5x faster than SHA-256 for hashing)
     - SHA-256 retained for object-level integrity (compliance)
+    - `BatchIngest` API: amortize fsync across N objects in single redb transaction
+      - `BatchIngest::new()` / `add()` / `commit()` — chunking+compression up front, one write txn
   - Streaming read planner (`src/read_planner.rs`): `read_object` + `read_object_streaming`
     - Manifest lookup → chunk decompression → sequential reassembly
   - Refcount GC (`src/gc.rs`): `gc_chunks` + `release_object`

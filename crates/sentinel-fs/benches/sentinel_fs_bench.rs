@@ -5,7 +5,7 @@ use sentinel_fs::artifact::ArtifactPlane;
 use sentinel_fs::cas::CasStore;
 use sentinel_fs::chunker::chunk_data;
 use sentinel_fs::gc::{gc_chunks, release_object};
-use sentinel_fs::ingest::{begin_ingest, commit_ingest};
+use sentinel_fs::ingest::{begin_ingest, commit_ingest, BatchIngest};
 use sentinel_fs::layer::LayerManager;
 use sentinel_fs::metadata::MetadataStore;
 use sentinel_fs::read_planner::read_object;
@@ -281,6 +281,31 @@ fn gc_1000_orphans(c: &mut Criterion) {
     group.finish();
 }
 
+fn batch_ingest_10_files(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    // 10 files of 100KB each — batch vs individual fsync comparison
+    let files: Vec<Vec<u8>> = (0..10u32)
+        .map(|f| (0..102_400u32).map(|i| (i * 7 + f * 13) as u8).collect())
+        .collect();
+
+    c.bench_function("batch_ingest_10_files", |b| {
+        b.iter_batched(
+            || {
+                ArtifactPlane::open(dir.path().join(format!("batch10_{}.redb", uuid_simple())))
+                    .unwrap()
+            },
+            |plane| {
+                let mut batch = BatchIngest::new(&plane);
+                for file_data in &files {
+                    batch.add(std::hint::black_box(file_data), "application/octet-stream").unwrap();
+                }
+                std::hint::black_box(batch.commit().unwrap())
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+}
+
 /// Generate a simple monotonic unique suffix for temp DB names.
 fn uuid_simple() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -306,5 +331,6 @@ criterion_group!(
     dedup_similar_files,
     read_planner_1mb,
     gc_1000_orphans,
+    batch_ingest_10_files,
 );
 criterion_main!(benches);
