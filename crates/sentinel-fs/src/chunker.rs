@@ -6,15 +6,15 @@
 //!
 //! Typical settings: min=16KB, target=64KB, max=256KB.
 
-use sha2::{Digest, Sha256};
-
 /// Default chunking parameters.
 pub const MIN_CHUNK_BYTES: usize = 16_384; // 16 KB
 pub const TARGET_CHUNK_BYTES: usize = 65_536; // 64 KB
 pub const MAX_CHUNK_BYTES: usize = 262_144; // 256 KB
 
-/// SHA-256 hash of a chunk's uncompressed content.
-pub type ChunkHash = [u8; 32];
+/// BLAKE3-128 fingerprint of a chunk's uncompressed content.
+/// Truncated to 16 bytes for fast index keys; SHA-256 is kept at the object
+/// level for compliance/integrity.
+pub type ChunkHash = [u8; 16];
 
 /// A single chunk produced by the CDC.
 #[derive(Debug, Clone)]
@@ -95,7 +95,7 @@ impl Iterator for ChunkIter<'_> {
         if remaining <= self.max_size {
             let end = start + remaining;
             let chunk_data = self.data[start..end].to_vec();
-            let hash = sha256_hash(&chunk_data);
+            let hash = blake3_hash_128(&chunk_data);
             self.pos = end;
             return Some(Chunk {
                 hash,
@@ -118,7 +118,7 @@ impl Iterator for ChunkIter<'_> {
         }
 
         let chunk_data = self.data[start..split].to_vec();
-        let hash = sha256_hash(&chunk_data);
+        let hash = blake3_hash_128(&chunk_data);
         self.pos = split;
         Some(Chunk {
             hash,
@@ -127,11 +127,14 @@ impl Iterator for ChunkIter<'_> {
     }
 }
 
-/// Compute SHA-256 hash of data.
-pub fn sha256_hash(data: &[u8]) -> ChunkHash {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hasher.finalize().into()
+/// Compute BLAKE3-128 fingerprint: full BLAKE3 hash truncated to 16 bytes.
+/// Fast enough that parallelism is rarely needed at chunk level.
+pub fn blake3_hash_128(data: &[u8]) -> ChunkHash {
+    let full = blake3::hash(data);
+    let bytes = full.as_bytes();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&bytes[..16]);
+    out
 }
 
 #[cfg(test)]

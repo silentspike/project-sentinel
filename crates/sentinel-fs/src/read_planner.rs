@@ -5,7 +5,7 @@
 //! are decompressed one at a time), keeping peak memory proportional to the
 //! largest single chunk rather than the full object size.
 
-use crate::artifact::{ArtifactPlane, FS_CHUNKS};
+use crate::artifact::{ArtifactPlane, ChunkHash, FS_CHUNKS};
 use crate::ingest::decompress_chunk;
 use redb::ReadableDatabase;
 
@@ -65,7 +65,7 @@ pub fn read_object_streaming(
 /// Iterator that decompresses one chunk at a time.
 struct ChunkStream<'a> {
     plane: &'a ArtifactPlane,
-    manifest: Vec<[u8; 32]>,
+    manifest: Vec<ChunkHash>,
     index: usize,
 }
 

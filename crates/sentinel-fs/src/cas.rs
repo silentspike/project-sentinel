@@ -223,10 +223,10 @@ pub struct ChunkGcStats {
     pub freed_bytes: u64,
 }
 
-/// Encode 32 bytes as lowercase hex string.
-pub fn hex_encode(bytes: &[u8; 32]) -> String {
+/// Encode bytes as lowercase hex string.
+pub fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
-    let mut s = String::with_capacity(64);
+    let mut s = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         write!(s, "{byte:02x}").unwrap();
     }
