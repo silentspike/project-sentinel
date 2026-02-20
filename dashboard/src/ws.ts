@@ -8,6 +8,7 @@ import {
   getAllRooms,
   getMaxAgentEventId,
   getMaxRoomEventId,
+  getMaxIncidentEventId,
   getProjectionLag,
 } from "./db";
 import { ROOM_METADATA } from "./rooms-meta";
@@ -17,6 +18,7 @@ const clients = new Set<ServerWebSocket<unknown>>();
 
 let lastAgentEventId = 0;
 let lastRoomEventId = 0;
+let lastIncidentEventId = 0;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -96,6 +98,12 @@ function pollForChanges(): void {
       const rooms = getAllRooms();
       broadcast({ type: "room_update", rooms: rooms.map(toRoomResponse) });
       lastRoomEventId = currentRoomMax;
+    }
+
+    const currentIncidentMax = getMaxIncidentEventId();
+    if (currentIncidentMax > lastIncidentEventId) {
+      broadcast({ type: "cockpit_update" });
+      lastIncidentEventId = currentIncidentMax;
     }
   } catch {
     // DB-Fehler beim Poll — skip, naechster Versuch in 1s

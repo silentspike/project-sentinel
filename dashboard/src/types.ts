@@ -102,3 +102,77 @@ export interface HealthResponse {
   uptime: number;
   projection_lag: number;
 }
+
+// ── EventStore Row (raw) ──────────────────────────
+
+export interface EventRow {
+  id: number;
+  event_id: string;
+  event_type: string;
+  aggregate_id: string;
+  payload: string;
+  correlation_id: string;
+  causation_id: string | null;
+  tick: number;
+  timestamp_ms: number;
+  compensation_type: string;
+}
+
+// ── Personality Evolution Row ─────────────────────
+
+export interface EvolutionRow {
+  id: number;
+  agent_id: string;
+  tick: number;
+  field: string;
+  change_type: string;
+  old_value: string | null;
+  new_value: string;
+  reason: string;
+  nmda_score: number | null;
+  source: string;
+  created_at_ms: number;
+}
+
+// ── Cockpit Types ─────────────────────────────────
+
+export type IncidentSeverity = "critical" | "high" | "medium" | "low";
+export type IncidentStatus = "active" | "resolved" | "pending" | "failed";
+
+export interface CockpitAction {
+  event_id: string;
+  event_type: string;
+  agent_id: string;
+  summary: string;
+  tick: number;
+}
+
+export interface CockpitIncident {
+  id: string;
+  source: "event" | "evolution";
+  incident_type: string;
+  severity: IncidentSeverity;
+  status: IncidentStatus;
+  agent_id: string | null;
+  room_id: string | null;
+  summary: string;
+  tick: number;
+  timestamp_ms: number;
+  actions: CockpitAction[];
+  outcome: string | null;
+}
+
+export interface SloViolation {
+  name: string;
+  current_value: number;
+  threshold: number;
+  severity: IncidentSeverity;
+  description: string;
+}
+
+export interface CockpitResponse {
+  incidents: CockpitIncident[];
+  slo_violations: SloViolation[];
+  total_active: number;
+  total_resolved_24h: number;
+}

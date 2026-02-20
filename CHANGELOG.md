@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dashboard Operator Cockpit** (#108)
+  - New "Cockpit" view: priorisierte Incident-Liste statt Metric Wall (anti-Metric-Wall Design)
+  - Incidents aus EventStore (chaos_triggered, consolidation_failed, despawned, nightrun failures)
+  - Incidents aus personality_evolution (drift, fatigue_spike, quality_shift)
+  - Korrelierte Actions pro Incident via correlation_id/causation_id Ketten
+  - Outcome-Detection: resolved/active/pending/failed basierend auf Folge-Events
+  - SLO-Verletzungen: Projection Lag, Nightrun Failure Rate, Chaos-Frequenz, Despawn-Rate
+  - `GET /api/cockpit` + `GET /api/cockpit/incident/:id` API-Endpunkte
+  - WebSocket cockpit_update Ping bei neuen Incident-Events
+  - 8 neue Tests (erste Dashboard-Tests ueberhaupt)
+
 - **Zenoh Query Bridge — InFlightMap Consumer** (#99)
   - Wired `InFlightMap` into Cortex Gateway pipeline around `provider.Send()` (Step 6)
   - Query lifecycle tracking: Track before Send, Accept/Cancel after response/error
