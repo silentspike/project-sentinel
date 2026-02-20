@@ -28,6 +28,9 @@ use sentinel_redb::StateStore;
 use sentinel_runtime::RuntimeOrchestrator;
 
 use crate::config::DaemonConfig;
+use crate::controlplane::config::ControlplaneConfig;
+use crate::controlplane::store::ControlplaneStore;
+use crate::controlplane::ControlplaneKernel;
 use crate::shift::{agents_for_shift, detect_current_shift};
 use crate::signal::wait_for_shutdown;
 
@@ -76,6 +79,22 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let runtime_orch =
         RuntimeOrchestrator::new(config.max_agents).with_event_store(Arc::clone(&event_store));
 
+    // -- Controlplane-Kernel laden --
+    let cp_config_path = config.config_dir.join("controlplane.toml");
+    let cp_config = if cp_config_path.exists() {
+        ControlplaneConfig::load(&cp_config_path)
+            .with_context(|| format!("Controlplane-Config laden: {}", cp_config_path.display()))?
+    } else {
+        info!("Keine controlplane.toml gefunden, verwende Defaults");
+        ControlplaneConfig::default_config()
+    };
+
+    let cp_store_path = data_dir.join("controlplane.redb");
+    let cp_store = ControlplaneStore::open(&cp_store_path).context("ControlplaneStore oeffnen")?;
+
+    let controlplane =
+        ControlplaneKernel::new(cp_config, cp_store).context("Controlplane-Kernel erstellen")?;
+
     // -- Channels fuer ECS <-> Async Bridge --
     let (action_tx, action_rx) = mpsc::channel();
     let (perception_tx, _perception_rx) = mpsc::sync_channel::<Perception>(64);
@@ -110,6 +129,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 shift_agent_ids,
                 tick_rate,
                 shutdown_ecs,
+                controlplane,
             )
         })
         .context("ECS Thread spawnen")?;
@@ -160,6 +180,7 @@ fn ecs_tick_loop(
     agents: Vec<(u16, String, String, u8)>,
     tick_rate: Duration,
     shutdown: Arc<AtomicBool>,
+    mut controlplane: ControlplaneKernel,
 ) -> Result<u64> {
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
@@ -192,6 +213,13 @@ fn ecs_tick_loop(
         // ECS Schedule ausfuehren (alle 10 Systems in Reihenfolge)
         schedule.run(&mut world);
 
+        // Controlplane-Zyklus (alle N Ticks)
+        if controlplane.should_run(tick_count) {
+            if let Err(e) = controlplane.cycle(&mut world, tick_count) {
+                error!(error = %e, tick = tick_count, "Controlplane-Zyklus fehlgeschlagen");
+            }
+        }
+
         tick_count += 1;
 
         if tick_count.is_multiple_of(60) {
@@ -207,8 +235,17 @@ fn ecs_tick_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controlplane::config::ControlplaneConfig;
+    use crate::controlplane::store::ControlplaneStore;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+
+    fn test_controlplane(tmp: &tempfile::TempDir) -> ControlplaneKernel {
+        let cp_path = tmp.path().join("controlplane.redb");
+        let cp_store = ControlplaneStore::open(&cp_path).unwrap();
+        let cp_config = ControlplaneConfig::default_config();
+        ControlplaneKernel::new(cp_config, cp_store).unwrap()
+    }
 
     #[test]
     fn test_ecs_tick_loop_shutdown_immediate() {
@@ -225,6 +262,8 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         let (ptx, _prx) = mpsc::sync_channel(64);
 
+        let controlplane = test_controlplane(&tmp);
+
         let result = ecs_tick_loop(
             state_store,
             event_store,
@@ -233,6 +272,7 @@ mod tests {
             vec![],
             Duration::from_millis(100),
             shutdown,
+            controlplane,
         );
 
         assert!(result.is_ok());
@@ -255,6 +295,8 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         let (ptx, _prx) = mpsc::sync_channel(64);
 
+        let controlplane = test_controlplane(&tmp);
+
         // Shutdown nach 250ms
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(250));
@@ -269,6 +311,7 @@ mod tests {
             vec![(1, "Test Agent".into(), "Tester".into(), 1)],
             Duration::from_millis(50),
             shutdown,
+            controlplane,
         );
 
         assert!(result.is_ok());

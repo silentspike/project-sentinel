@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Native Controlplane Kernel C1-C4** (#107)
+  - Full observe/decide/act/verify cycle integrated into ECS tick-loop
+  - 7 new modules in `services/sentinel-daemon/src/controlplane/`:
+    - `types.rs`: Observation, Incident, ControlAction, VerifyOutcome, RuntimeState
+    - `store.rs`: ControlplaneStore (redb, 4 tables: config, runtime_state, action_log, incidents)
+    - `observe.rs`: ECS World query (BioState/Position/Mood), threshold-based incident detection, stress-cluster detection
+    - `decide.rs`: Rule-based policy engine, guarded mode, cooldown tracking, TTL+rollback per action (AC-5)
+    - `act.rs`: Action execution with store persistence
+    - `verify.rs`: TTL expiry, rollback condition evaluation (field/op/value parser)
+    - `config.rs`: TOML deserialization with serde defaults
+  - `config/controlplane.toml`: cycle_interval=10, thresholds (hunger/energy/stress/bladder)
+  - No LLM in real-time path (AC-N1), cycle timing guard <200ms (AC-2)
+  - 42 unit tests, clippy -D warnings clean
+
 ### Verified
 
 - **sentinel-daemon 4f FULL gate closure** (#94)

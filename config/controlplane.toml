@@ -1,0 +1,35 @@
+# Controlplane-Kernel Konfiguration
+# Deterministischer observe/decide/act/verify Zyklus im sentinel-daemon.
+
+[controlplane]
+# Alle N ECS-Ticks laeuft ein Controlplane-Zyklus.
+# Bei tick_rate_ms=1000 und cycle_interval_ticks=10 -> alle 10 Sekunden.
+cycle_interval_ticks = 10
+
+# Guarded Mode: Nur beobachten und loggen, keine Aktionen ausfuehren.
+# Aktivieren zum sicheren Einfahren oder bei Policy-Tuning.
+guarded_mode = false
+
+# Default-TTL fuer Auto-Actions (in Ticks).
+# Nach Ablauf wird die Action als Expired markiert.
+default_ttl_ticks = 30
+
+# Cooldown zwischen gleichen Action-Typen pro Agent (in Ticks).
+# Verhindert Action-Spam bei persistenten Problemen.
+cooldown_ticks = 60
+
+[controlplane.thresholds]
+# Bio-Schwellenwerte fuer Incident-Erkennung.
+# Werte sind normalisiert [0.0, 1.0].
+
+# Hunger ueber diesem Wert -> HungerCritical Incident
+hunger_critical = 0.9
+
+# Energy unter diesem Wert -> EnergyDepleted Incident
+energy_critical = 0.15
+
+# Stress ueber diesem Wert -> StressCritical Incident
+stress_critical = 0.85
+
+# Bladder ueber diesem Wert -> BladderCritical Incident
+bladder_critical = 0.9
