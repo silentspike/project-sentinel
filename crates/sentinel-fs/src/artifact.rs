@@ -187,7 +187,7 @@ impl ArtifactPlane {
             durability,
             segments: Mutex::new(segments),
             cache: Mutex::new(ChunkCache::new(DEFAULT_CACHE_BYTES)),
-            scheduler: Mutex::new(CommitScheduler::new(SchedulerConfig::default())),
+            scheduler: Mutex::new(CommitScheduler::noop()),
         })
     }
 
@@ -207,6 +207,15 @@ impl ArtifactPlane {
             }
         }
         Ok(wtxn)
+    }
+
+    /// Configure the adaptive commit scheduler for IOPS protection.
+    /// By default, the scheduler is a noop (pass-through). Call this with
+    /// a `SchedulerConfig` to enable rate-limited commits in production.
+    pub fn set_scheduler(&self, config: SchedulerConfig) {
+        if let Ok(mut sched) = self.scheduler.lock() {
+            *sched = CommitScheduler::new(config);
+        }
     }
 
     /// Get commit scheduler statistics.
