@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Release Manifest + Hash-Parity Deploy-Gate** (#110)
+  - JSON Schema `deploy/release-manifest.schema.json` (v1.0) for deployment artifact manifests
+  - Generator `deploy/generate-manifest.sh`: hashes all deploy artifacts (binaries, configs, systemd units, init scripts) with SHA-256
+  - Preflight `deploy/deploy-preflight.sh`: verifies hash parity via SSH before deploy; hard-aborts (exit 1) on mismatch or missing artifacts
+  - CI: `release.yml` generates manifest after build and attaches it as release artifact alongside SBOM
+  - `deploy/release-manifest.json` excluded from git via `.gitignore` (generated artifact)
+  - Benchmark: manifest generation ~124ms, preflight parsing ~43ms; full preflight well under 5s target
+
 - **Sentinel Judge: Enterprise Quality Analysis Service** (#26)
   - Bridge unit tests (6 tests: publish, dedup, subject mapping, config defaults, GetEventsSince)
   - Go benchmarks: judge (7), messaging (4), all passing with HeuristicPipeline at ~1µs (target <5ms)
