@@ -134,18 +134,19 @@ const INCIDENT_EVENT_TYPES = [
 
 const INCIDENT_TYPES_SQL = INCIDENT_EVENT_TYPES.map((t) => `'${t}'`).join(",");
 
-export function getRecentIncidentEvents(hours: number): EventRow[] {
+export function getRecentIncidentEvents(hours: number, limit = 200): EventRow[] {
   const cutoff = Date.now() - hours * 3600_000;
   return eventStoreDb
-    .query<EventRow, [number]>(
+    .query<EventRow, [number, number]>(
       `SELECT id, event_id, event_type, aggregate_id, payload,
               correlation_id, causation_id, tick, timestamp_ms, compensation_type
        FROM events
        WHERE event_type IN (${INCIDENT_TYPES_SQL})
          AND timestamp_ms > ?
-       ORDER BY id DESC`,
+       ORDER BY id DESC
+       LIMIT ?`,
     )
-    .all(cutoff);
+    .all(cutoff, limit);
 }
 
 export function getRecentEvolutionAlerts(hours: number): EvolutionRow[] {

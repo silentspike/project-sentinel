@@ -44,6 +44,8 @@ const CREATE_IDX_EVENTS_TYPE: &str =
     "CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type, id)";
 const CREATE_IDX_EVENTS_CORRELATION: &str =
     "CREATE INDEX IF NOT EXISTS idx_events_correlation ON events(correlation_id)";
+const CREATE_IDX_EVENTS_CAUSATION: &str =
+    "CREATE INDEX IF NOT EXISTS idx_events_causation ON events(causation_id)";
 const CREATE_IDX_EVENTS_OPERATION: &str =
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_operation ON events(operation_id)";
 
@@ -161,6 +163,7 @@ impl EventStore {
         conn.execute(CREATE_IDX_EVENTS_AGGREGATE, [])?;
         conn.execute(CREATE_IDX_EVENTS_TYPE, [])?;
         conn.execute(CREATE_IDX_EVENTS_CORRELATION, [])?;
+        conn.execute(CREATE_IDX_EVENTS_CAUSATION, [])?;
         conn.execute(CREATE_IDX_EVENTS_OPERATION, [])?;
         conn.execute_batch(CREATE_OUTBOX)?;
         conn.execute(CREATE_IDX_OUTBOX_PENDING, [])?;
