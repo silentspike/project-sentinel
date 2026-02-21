@@ -216,21 +216,47 @@ impl SandboxEnforcer {
 
     /// Starts a bwrap process for the agent.
     ///
-    /// The bwrap process runs in isolated namespaces.
-    /// Landlock is applied inside the bwrap child (not yet implemented — TODO).
+    /// The bwrap process runs in isolated namespaces with Landlock FS restrictions.
+    /// If Landlock is available, a wrapper binary is injected between bwrap and the
+    /// agent command that applies irreversible Landlock rules before exec.
     /// Returns the bwrap PID on success.
     pub fn start_agent_process(&self, name: &str, command: &[String]) -> Result<u32> {
         if !self.bwrap_available {
             anyhow::bail!("bwrap not available — cannot start agent process");
         }
 
-        let config = if self.netns_available {
+        let mut config = if self.netns_available {
             BwrapConfig::for_agent(name)
         } else {
             // Fallback: share host network when netns is not available
             BwrapConfig::for_agent(name).with_shared_net()
         };
-        let child = config.spawn(command)?;
+
+        // Wrap command with Landlock enforcement if available
+        let wrapped_command = if self.landlock_abi.is_some() {
+            // Bind the wrapper binary into the namespace
+            let wrapper_path = landlock_wrapper_path();
+            if wrapper_path.exists() {
+                config
+                    .readonly_binds
+                    .push((wrapper_path.to_string_lossy().into_owned(), "/landlock-wrapper".to_string()));
+                let mut cmd = vec![
+                    "/landlock-wrapper".to_string(),
+                    name.to_string(),
+                    "--".to_string(),
+                ];
+                cmd.extend_from_slice(command);
+                info!("Landlock wrapper injected for agent {name}");
+                cmd
+            } else {
+                warn!("landlock-wrapper binary not found at {}, skipping Landlock", wrapper_path.display());
+                command.to_vec()
+            }
+        } else {
+            command.to_vec()
+        };
+
+        let child = config.spawn(&wrapped_command)?;
         let pid = child.id();
 
         // Add bwrap process to agent's cgroup
@@ -349,6 +375,28 @@ impl SandboxEnforcer {
     pub fn oom_score_set(&self) -> bool {
         self.oom_set.load(Ordering::Relaxed)
     }
+}
+
+/// Returns the expected path for the landlock-wrapper binary.
+///
+/// Checks (in order): next to current executable, /opt/sentinel/bin/, /usr/local/bin/.
+fn landlock_wrapper_path() -> PathBuf {
+    // 1. Same directory as current executable
+    if let Ok(exe) = std::env::current_exe() {
+        let candidate = exe.parent().unwrap_or(std::path::Path::new(".")).join("landlock-wrapper");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    // 2. Standard deployment path
+    let deploy = PathBuf::from("/opt/sentinel/bin/landlock-wrapper");
+    if deploy.exists() {
+        return deploy;
+    }
+
+    // 3. System path (fallback)
+    PathBuf::from("/usr/local/bin/landlock-wrapper")
 }
 
 #[cfg(test)]
