@@ -9,6 +9,8 @@ import {
   getMaxAgentEventId,
   getMaxRoomEventId,
   getMaxIncidentEventId,
+  getMaxChaosEventId,
+  getOccupantsByRoom,
   getProjectionLag,
 } from "./db";
 import { ROOM_METADATA } from "./rooms-meta";
@@ -19,6 +21,7 @@ const clients = new Set<ServerWebSocket<unknown>>();
 let lastAgentEventId = 0;
 let lastRoomEventId = 0;
 let lastIncidentEventId = 0;
+let lastChaosEventId = 0;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -50,7 +53,7 @@ function toAgentListItem(row: {
   };
 }
 
-function toRoomResponse(row: RoomRow): RoomResponse {
+function toRoomResponse(row: RoomRow, occupants: string[]): RoomResponse {
   const meta = ROOM_METADATA[row.room_id];
   let chaos: unknown | null = null;
   if (row.active_chaos) {
@@ -70,6 +73,7 @@ function toRoomResponse(row: RoomRow): RoomResponse {
     transit_count: row.transit_count,
     active_chaos: chaos,
     last_event_tick: row.last_event_tick,
+    occupants,
   };
 }
 
@@ -96,7 +100,8 @@ function pollForChanges(): void {
     const currentRoomMax = getMaxRoomEventId();
     if (currentRoomMax > lastRoomEventId) {
       const rooms = getAllRooms();
-      broadcast({ type: "room_update", rooms: rooms.map(toRoomResponse) });
+      const occupantsMap = getOccupantsByRoom();
+      broadcast({ type: "room_update", rooms: rooms.map((r) => toRoomResponse(r, occupantsMap[r.room_id] ?? [])) });
       lastRoomEventId = currentRoomMax;
     }
 
@@ -104,6 +109,12 @@ function pollForChanges(): void {
     if (currentIncidentMax > lastIncidentEventId) {
       broadcast({ type: "cockpit_update" });
       lastIncidentEventId = currentIncidentMax;
+    }
+
+    const currentChaosMax = getMaxChaosEventId();
+    if (currentChaosMax > lastChaosEventId) {
+      broadcast({ type: "chaos_update" });
+      lastChaosEventId = currentChaosMax;
     }
   } catch {
     // DB-Fehler beim Poll — skip, naechster Versuch in 1s

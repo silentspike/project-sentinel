@@ -56,9 +56,22 @@ function createRoomCard(room) {
   // Belegung
   const occ = document.createElement('div');
   occ.className = 'room-occupancy';
-  occ.textContent = room.occupant_count + ' Personen';
+  occ.textContent = room.occupant_count + '/' + room.capacity + ' Personen';
   if (room.occupant_count > 0) occ.classList.add('occupied');
   card.appendChild(occ);
+
+  // Agent-Positionen: Zeige welche Agents im Raum sind
+  if (room.occupants && room.occupants.length > 0) {
+    const agentList = document.createElement('div');
+    agentList.className = 'room-agents';
+    for (const name of room.occupants) {
+      const tag = document.createElement('span');
+      tag.className = 'room-agent-tag';
+      tag.textContent = name;
+      agentList.appendChild(tag);
+    }
+    card.appendChild(agentList);
+  }
 
   // Transit
   if (room.transit_count > 0) {

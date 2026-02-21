@@ -6,6 +6,8 @@ import { roomRoutes } from "./routes/rooms";
 import { metricRoutes } from "./routes/metrics";
 import { cockpitRoutes } from "./routes/cockpit";
 import { healthRoutes } from "./routes/health";
+import { chaosRoutes } from "./routes/chaos";
+import { chatRoutes } from "./routes/chat";
 import { createWsHandler, startPolling } from "./ws";
 
 const app = new Hono();
@@ -16,6 +18,8 @@ app.route("/api", agentRoutes);
 app.route("/api", roomRoutes);
 app.route("/api", metricRoutes);
 app.route("/api", cockpitRoutes);
+app.route("/api", chaosRoutes);
+app.route("/api", chatRoutes);
 
 // Statische Dateien
 app.use("/public/*", serveStatic({ root: "./" }));
@@ -49,7 +53,7 @@ if (import.meta.main) {
     fetch(req, server) {
       const url = new URL(req.url);
       if (url.pathname === "/ws") {
-        if (server.upgrade(req)) return undefined;
+        if (server.upgrade(req, { data: {} })) return undefined;
         return new Response("WebSocket upgrade failed", { status: 500 });
       }
       return app.fetch(req, server);

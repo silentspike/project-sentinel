@@ -42,10 +42,52 @@ function createAgentCard(agent) {
   }
   card.appendChild(room);
 
-  // Detail-Daten async laden
+  // Bio-State Bars (async geladen)
   loadAgentDetail(agent.id, card);
 
   return card;
+}
+
+function createBioBar(label, value) {
+  const bar = document.createElement('div');
+  bar.className = 'bio-bar';
+
+  const labelEl = document.createElement('span');
+  labelEl.className = 'bio-bar-label';
+  labelEl.textContent = label;
+  bar.appendChild(labelEl);
+
+  const track = document.createElement('div');
+  track.className = 'bio-bar-track';
+
+  const fill = document.createElement('div');
+  fill.className = 'bio-bar-fill';
+
+  if (value != null && !isNaN(value)) {
+    const pct = Math.round(value * 100);
+    fill.style.width = pct + '%';
+    // Color based on value: green (low) -> yellow (mid) -> red (high)
+    if (pct > 70) {
+      fill.classList.add('bio-bar-high');
+    } else if (pct > 40) {
+      fill.classList.add('bio-bar-mid');
+    } else {
+      fill.classList.add('bio-bar-low');
+    }
+  } else {
+    fill.style.width = '0%';
+    fill.classList.add('bio-bar-empty');
+  }
+
+  track.appendChild(fill);
+  bar.appendChild(track);
+
+  const valueEl = document.createElement('span');
+  valueEl.className = 'bio-bar-value';
+  valueEl.textContent = value != null ? Math.round(value * 100) + '%' : '--';
+  bar.appendChild(valueEl);
+
+  return bar;
 }
 
 async function loadAgentDetail(agentId, card) {
@@ -65,6 +107,20 @@ async function loadAgentDetail(agentId, card) {
     meta.className = 'agent-meta';
     meta.textContent = 'Schicht ' + data.shift_set;
     card.appendChild(meta);
+
+    // Bio-State Bars (nur anzeigen wenn mindestens ein Wert vorhanden)
+    const hasBio = data.hunger != null || data.energy != null || data.stress != null;
+    if (hasBio) {
+      const bioSection = document.createElement('div');
+      bioSection.className = 'bio-section';
+      bioSection.appendChild(createBioBar('Hunger', data.hunger));
+      bioSection.appendChild(createBioBar('Energie', data.energy));
+      bioSection.appendChild(createBioBar('Stress', data.stress));
+      bioSection.appendChild(createBioBar('Koffein', data.caffeine));
+      bioSection.appendChild(createBioBar('Blase', data.bladder));
+      bioSection.appendChild(createBioBar('Sozial', data.social_need));
+      card.appendChild(bioSection);
+    }
   } catch { /* silently ignore */ }
 }
 
