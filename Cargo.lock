@@ -3718,6 +3718,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-projection-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "sentinel-common",
+ "sentinel-limbo",
+ "sentinel-projection",
+ "sentinel-telemetry",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sentinel-redb"
 version = "0.1.0"
 dependencies = [

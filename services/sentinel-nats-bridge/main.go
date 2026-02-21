@@ -81,6 +81,12 @@ func main() {
 	}
 	defer func() { _ = store.Close() }()
 
+	// Ensure outbox migration (adds retry_count, last_error columns if missing)
+	if err := store.EnsureOutboxMigration(); err != nil {
+		logger.Error("failed to migrate outbox schema", "error", err)
+		os.Exit(1)
+	}
+
 	// Connect to NATS
 	nc, err := messaging.Connect(messaging.ConnectOpts{
 		URL:    cfg.NATS.URL,
@@ -109,6 +115,15 @@ func main() {
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":"ok","service":"sentinel-nats-bridge"}`)
+	})
+	healthMux.HandleFunc("GET /ready", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !nc.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, `{"status":"not_ready","reason":"nats disconnected"}`)
+			return
+		}
 		fmt.Fprint(w, `{"status":"ok","service":"sentinel-nats-bridge"}`)
 	})
 	healthServer := &http.Server{
@@ -149,12 +164,14 @@ func main() {
 	logger.Info("sentinel-nats-bridge stopped")
 }
 
-// pollLoop continuously polls Limbo for new events and publishes them to NATS.
+// maxRetries is the maximum number of publish attempts before marking an outbox entry as failed.
+const maxRetries = 5
+
+// pollLoop continuously polls the outbox for pending entries and publishes them to NATS.
 func pollLoop(ctx context.Context, logger *slog.Logger, store *eventstore.Store, nc *nats.Conn, cfg Config) {
 	ticker := time.NewTicker(time.Duration(cfg.EventStore.PollIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
 
-	var lastID int64
 	totalPublished := int64(0)
 
 	for {
@@ -162,46 +179,59 @@ func pollLoop(ctx context.Context, logger *slog.Logger, store *eventstore.Store,
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			events, maxID, err := store.GetEventsSince(lastID, cfg.EventStore.BatchSize)
+			entries, err := store.GetOutboxBatch(cfg.EventStore.BatchSize)
 			if err != nil {
-				logger.Error("poll failed", "error", err, "last_id", lastID)
+				logger.Error("outbox poll failed", "error", err)
 				continue
 			}
-			if len(events) == 0 {
+			if len(entries) == 0 {
 				continue
 			}
 
-			published := 0
-			for _, evt := range events {
-				subject := messaging.BuildEventSubject(evt.EventType, evt.AggregateID)
+			var publishedIDs []int64
+			for _, entry := range entries {
+				subject := messaging.BuildEventSubject(entry.EventType, entry.AggregateID)
 
-				// Nats-Msg-Id header for exactly-once dedup in JetStream
 				msg := &nats.Msg{
 					Subject: subject,
-					Data:    []byte(evt.Payload),
+					Data:    []byte(entry.Payload),
 					Header:  nats.Header{},
 				}
-				msg.Header.Set("Nats-Msg-Id", evt.OperationID)
-				msg.Header.Set("X-Event-ID", evt.EventID)
-				msg.Header.Set("X-Event-Type", evt.EventType)
-				msg.Header.Set("X-Aggregate-ID", evt.AggregateID)
-				msg.Header.Set("X-Tick", strconv.FormatInt(evt.Tick, 10))
-				msg.Header.Set("X-Correlation-ID", evt.CorrelationID)
+				msg.Header.Set("Nats-Msg-Id", entry.OperationID)
+				msg.Header.Set("X-Event-ID", entry.EventID)
+				msg.Header.Set("X-Event-Type", entry.EventType)
+				msg.Header.Set("X-Aggregate-ID", entry.AggregateID)
+				msg.Header.Set("X-Tick", strconv.FormatInt(entry.Tick, 10))
+				msg.Header.Set("X-Correlation-ID", entry.CorrelationID)
 
 				if err := nc.PublishMsg(msg); err != nil {
-					logger.Error("publish failed", "subject", subject, "error", err)
+					logger.Error("publish failed",
+						"subject", subject,
+						"outbox_id", entry.OutboxID,
+						"retry", entry.RetryCount,
+						"error", err,
+					)
+					if entry.RetryCount+1 >= maxRetries {
+						if markErr := store.MarkFailed(entry.OutboxID); markErr != nil {
+							logger.Error("mark failed error", "outbox_id", entry.OutboxID, "error", markErr)
+						}
+					} else {
+						if markErr := store.MarkRetry(entry.OutboxID, err.Error()); markErr != nil {
+							logger.Error("mark retry error", "outbox_id", entry.OutboxID, "error", markErr)
+						}
+					}
 					continue
 				}
-				published++
+				publishedIDs = append(publishedIDs, entry.OutboxID)
 			}
 
-			lastID = maxID
-			totalPublished += int64(published)
-
-			if published > 0 {
-				logger.Info("events published",
-					"count", published,
-					"last_id", lastID,
+			if len(publishedIDs) > 0 {
+				if err := store.MarkPublished(publishedIDs); err != nil {
+					logger.Error("mark published failed", "count", len(publishedIDs), "error", err)
+				}
+				totalPublished += int64(len(publishedIDs))
+				logger.Info("outbox entries published",
+					"count", len(publishedIDs),
 					"total", totalPublished,
 				)
 			}
