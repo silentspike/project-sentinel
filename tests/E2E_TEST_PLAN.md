@@ -2,7 +2,7 @@
 
 > **Zweck:** Vollstaendige End-to-End-Validierung aller implementierten Features gegen den Masterplan.
 > **Tool:** Playwright (Browser-Tests) + curl/SSH (Service-Tests)
-> **Target:** Deploy-VM `192.0.2.240` (Dashboard: Port 8000, Cortex: 8080/8081, Judge: 8082, Bridge: 8083, NATS: 4222)
+> **Target:** Deploy-VM `192.0.2.240` (Dashboard: Port 3001, Cortex: 8080/8081, Judge: 8082, Bridge: 8083, NATS: 4222)
 > **Erstellt:** 2026-02-21
 
 ---
@@ -30,7 +30,7 @@
 Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 
 ### T1.1 — Dashboard erreichbar [P0] [HTTP]
-- **Aktion:** `GET http://192.0.2.240:8000/`
+- **Aktion:** `GET http://192.0.2.240:3001/`
 - **Erwartung:** HTTP 200, Response enthaelt `<title>` mit "Project Sentinel"
 - **Fail-Kriterium:** Kein Response oder Status != 200
 
@@ -109,14 +109,14 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 ## T2: Dashboard — Navigation & Layout
 
 ### T2.1 — Seite laed komplett [P0] [PW]
-- **Aktion:** Playwright `open http://192.0.2.240:8000`, warte auf DOM ready
+- **Aktion:** Playwright `open http://192.0.2.240:3001`, warte auf DOM ready
 - **Erwartung:** Titel enthaelt "Project Sentinel", keine Console-Errors
 - **Pruefung:** `document.title`, Console-Log auf Errors pruefen
 
-### T2.2 — 5 Navigationsbuttons sichtbar [P0] [PW]
+### T2.2 — 7 Navigationsbuttons sichtbar [P0] [PW]
 - **Aktion:** Alle `.nav-btn` Elemente zaehlen
-- **Erwartung:** Genau 5 Buttons: "Agents", "Bueroplan", "Aktivitaet", "Metriken", "Cockpit"
-- **Pruefung:** `querySelectorAll('.nav-btn').length === 5`
+- **Erwartung:** Genau 7 Buttons: "Agents", "Bueroplan", "Aktivitaet", "Chaos", "Chat", "Metriken", "Cockpit"
+- **Pruefung:** `querySelectorAll('.nav-btn').length === 7`
 
 ### T2.3 — Navigation: Agents-View [P0] [PW]
 - **Aktion:** Klick auf Button `[data-view="agents"]`
@@ -143,10 +143,20 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 - **Erwartung:** `#view-cockpit` sichtbar, Rest hidden
 - **Pruefung:** Analog T2.3
 
+### T2.7a — Navigation: Chaos-View [P0] [PW]
+- **Aktion:** Klick auf Button `[data-view="chaos"]`
+- **Erwartung:** `#view-chaos` sichtbar, Rest hidden
+- **Pruefung:** Analog T2.3
+
+### T2.7b — Navigation: Chat-View [P0] [PW]
+- **Aktion:** Klick auf Button `[data-view="chat"]`
+- **Erwartung:** `#view-chat` sichtbar, Rest hidden
+- **Pruefung:** Analog T2.3
+
 ### T2.8 — Nur ein View gleichzeitig sichtbar [P0] [PW]
-- **Aktion:** Nacheinander alle 5 Buttons klicken, nach jedem Klick pruefen
+- **Aktion:** Nacheinander alle 7 Buttons klicken, nach jedem Klick pruefen
 - **Erwartung:** Zu jedem Zeitpunkt genau 1 View sichtbar
-- **Pruefung:** `querySelectorAll('section[id^="view-"]:not([style*="none"])').length === 1`
+- **Pruefung:** `querySelectorAll('.view.active').length === 1`
 
 ### T2.9 — Projection Lag Anzeige [P0] [PW]
 - **Aktion:** Element `#projection-lag` lesen
@@ -281,6 +291,21 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 - **Erwartung:** 1 Raum: treppenhaus
 - **Pruefung:** Genau 1 Room-Card
 
+### T4.13 — Agent-Positionen in Room-Cards [P0] [PW]
+- **Aktion:** `.room-agents` Container in Room-Cards pruefen
+- **Erwartung:** Belegte Raeume zeigen `.room-agent-tag` Elemente mit Agent-Namen
+- **Pruefung:** Raum mit `occupant_count > 0` hat `.room-agent-tag` Kinder
+
+### T4.14 — Kapazitaet angezeigt [P1] [PW]
+- **Aktion:** `.room-occupancy` Text lesen
+- **Erwartung:** Format "X/Y Personen" (Belegung/Kapazitaet)
+- **Pruefung:** Regex `\d+/\d+ Personen`
+
+### T4.15 — API occupants Feld vorhanden [P0] [HTTP]
+- **Aktion:** `GET /api/rooms`, Response-Schema pruefen
+- **Erwartung:** Jeder Raum hat `occupants` Array (kann leer sein)
+- **Pruefung:** `Array.isArray(room.occupants)`
+
 ---
 
 ## T5: Dashboard — Aktivitaet (Activity) View
@@ -317,12 +342,80 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 
 ---
 
+## T5a: Dashboard — Chaos Event Feed View
+
+### T5a.1 — Chaos-View navigierbar [P0] [PW]
+- **Aktion:** Klick auf Button `[data-view="chaos"]`
+- **Erwartung:** `#view-chaos` sichtbar, Header "Chaos Event Feed" vorhanden
+- **Pruefung:** `.chaos-header h2.textContent` enthaelt "Chaos"
+
+### T5a.2 — Chaos-Events geladen [P0] [PW]
+- **Aktion:** `.chaos-item` Elemente zaehlen
+- **Erwartung:** Mindestens 1 Event (221k chaos_triggered in events.db)
+- **Pruefung:** `querySelectorAll('.chaos-item').length > 0`
+
+### T5a.3 — Chaos-Item Struktur korrekt [P0] [PW]
+- **Aktion:** Erstes `.chaos-item` untersuchen
+- **Erwartung:** Enthaelt `.chaos-type-badge`, `.chaos-description`, `.chaos-meta`
+- **Pruefung:** Alle Sub-Elemente vorhanden
+
+### T5a.4 — Chaos-Count Badge [P1] [PW]
+- **Aktion:** `.chaos-count` Element lesen
+- **Erwartung:** Zeigt "N Events" mit N > 0
+- **Pruefung:** Regex `\d+ Events`
+
+### T5a.5 — Chaos-API Contract [P0] [HTTP]
+- **Aktion:** `GET /api/chaos?limit=10`
+- **Erwartung:** JSON Array, jedes Element hat `id`, `event_id`, `chaos_type`, `room_id`, `description`, `tick`, `timestamp_ms`
+- **Pruefung:** Schema-Validierung
+
+### T5a.6 — Chaos-API Room Filter [P1] [HTTP]
+- **Aktion:** `GET /api/chaos/buero-dev-1`
+- **Erwartung:** JSON Array, alle Eintraege haben `room_id === "buero-dev-1"` oder sind leer
+- **Pruefung:** Filter funktioniert
+
+### T5a.7 — Chaos WebSocket Update [P1] [PW]
+- **Aktion:** WebSocket auf `chaos_update` Message warten
+- **Erwartung:** Message mit `type: "chaos_update"` empfangen
+- **Pruefung:** WS-Event Typ pruefen
+
+---
+
+## T5b: Dashboard — Chat View
+
+### T5b.1 — Chat-View navigierbar [P0] [PW]
+- **Aktion:** Klick auf Button `[data-view="chat"]`
+- **Erwartung:** `#view-chat` sichtbar
+- **Pruefung:** `#view-chat.classList.contains('active')`
+
+### T5b.2 — Chat-Filter-Bar vorhanden [P0] [PW]
+- **Aktion:** `.chat-filter-bar` Element suchen
+- **Erwartung:** Filter-Bar mit "Alle" Button sichtbar
+- **Pruefung:** `.chat-filter-btn` mit Text "Alle" existiert
+
+### T5b.3 — Chat-API Contract [P0] [HTTP]
+- **Aktion:** `GET /api/chat?limit=10`
+- **Erwartung:** JSON Array (kann leer sein wenn keine Simulation laeuft)
+- **Pruefung:** Valides JSON Array
+
+### T5b.4 — Chat Room-Filter API [P1] [HTTP]
+- **Aktion:** `GET /api/chat/buero-dev-1`
+- **Erwartung:** JSON Array gefiltert nach Raum
+- **Pruefung:** Valides JSON Array
+
+### T5b.5 — Empty State bei fehlenden Nachrichten [P0] [PW]
+- **Aktion:** Chat-View oeffnen (ohne laufende Simulation)
+- **Erwartung:** "Keine Nachrichten vorhanden" Text sichtbar
+- **Pruefung:** `.chat-empty` Element vorhanden
+
+---
+
 ## T6: Dashboard — Metriken View
 
-### T6.1 — 6 Metrik-Cards sichtbar [P0] [PW]
+### T6.1 — 8 Metrik-Cards sichtbar [P0] [PW]
 - **Aktion:** Metriken-View oeffnen, `.metric-card` zaehlen
-- **Erwartung:** Exakt 6 Cards
-- **Pruefung:** `querySelectorAll('.metric-card').length === 6`
+- **Erwartung:** Exakt 8 Cards (inkl. Events Gesamt und Events/Min)
+- **Pruefung:** `querySelectorAll('.metric-card').length === 8`
 
 ### T6.2 — Aktive Agents Metrik [P0] [PW]
 - **Aktion:** Card "Aktive Agents" finden
@@ -356,8 +449,18 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 
 ### T6.8 — Metriken stimmen mit API ueberein [P0] [PW]
 - **Aktion:** `/api/metrics` abfragen, mit DOM-Werten vergleichen
-- **Erwartung:** Alle 6 Werte identisch
+- **Erwartung:** Alle 8 Werte identisch
 - **Pruefung:** API-Response === DOM-Values
+
+### T6.9 — Events Gesamt Metrik [P1] [PW]
+- **Aktion:** Card "Events Gesamt" finden
+- **Erwartung:** Numerischer Wert > 0 (z.B. "221.9k")
+- **Pruefung:** Wert ist formatierte Zahl
+
+### T6.10 — Events/Min Metrik [P1] [PW]
+- **Aktion:** Card "Events/Min" finden
+- **Erwartung:** Numerischer Wert >= 0
+- **Pruefung:** Wert ist Zahl
 
 ---
 
@@ -1139,11 +1242,13 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 | Kategorie | Anzahl Tests | P0 | P1 | P2 |
 |-----------|-------------|-----|-----|-----|
 | T1: Infrastruktur Health | 15 | 14 | 1 | 0 |
-| T2: Dashboard Navigation | 12 | 9 | 2 | 1 |
+| T2: Dashboard Navigation | 14 | 11 | 2 | 1 |
 | T3: Dashboard Agents | 9 | 6 | 3 | 0 |
-| T4: Dashboard Floorplan | 12 | 5 | 7 | 0 |
+| T4: Dashboard Floorplan | 15 | 7 | 8 | 0 |
 | T5: Dashboard Activity | 6 | 3 | 3 | 0 |
-| T6: Dashboard Metriken | 8 | 7 | 1 | 0 |
+| T5a: Dashboard Chaos Feed | 7 | 4 | 3 | 0 |
+| T5b: Dashboard Chat | 5 | 3 | 2 | 0 |
+| T6: Dashboard Metriken | 10 | 7 | 3 | 0 |
 | T7: Dashboard Cockpit | 17 | 11 | 6 | 0 |
 | T8: Dashboard API | 14 | 11 | 3 | 0 |
 | T9: Dashboard WebSocket | 7 | 5 | 2 | 0 |
@@ -1162,7 +1267,7 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 | T20b: Outbox Drain | 4 | 4 | 0 | 0 |
 | T21: E2E Flow | 5 | 4 | 1 | 0 |
 | T22: Security | 5 | 3 | 2 | 0 |
-| **TOTAL** | **199** | **142** | **69** | **2** |
+| **TOTAL** | **218** | **155** | **75** | **2** |
 
 ### Ausfuehrungsreihenfolge
 1. **T1** (Health) — Gate: Wenn ein T1-Test failt, ALLE anderen Tests abbrechen

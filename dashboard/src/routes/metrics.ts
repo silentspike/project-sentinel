@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { getLatestKpi, getProjectionLag, getActiveAgents } from "../db";
+import { getLatestKpi, getProjectionLag, getActiveAgents, getTotalEventCount, getEventRatePerMinute } from "../db";
 import type { MetricsResponse, HealthResponse } from "../types";
 
 export const metricRoutes = new Hono();
@@ -19,6 +19,8 @@ metricRoutes.get("/metrics", (c) => {
     nightrun_events: kpi?.nightrun_events ?? 0,
     bucket_start: kpi?.bucket_start ?? null,
     uptime: Math.floor((Date.now() - startTime) / 1000),
+    total_events: getTotalEventCount(),
+    event_rate_per_min: getEventRatePerMinute(),
   };
   return c.json(response);
 });

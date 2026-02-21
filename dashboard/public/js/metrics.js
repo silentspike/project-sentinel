@@ -6,12 +6,14 @@ export function renderMetrics(metrics) {
   grid.className = 'metrics-grid';
 
   const cards = [
-    { label: 'Aktive Agents', value: String(metrics.active_agents), id: 'active-agents' },
-    { label: 'Aktionen', value: String(metrics.total_actions), id: 'total-actions' },
-    { label: 'Transits', value: String(metrics.total_transits), id: 'total-transits' },
-    { label: 'Chaos Events', value: String(metrics.chaos_events), id: 'chaos-events' },
-    { label: 'Schichtwechsel', value: String(metrics.shift_changes), id: 'shift-changes' },
-    { label: 'Uptime', value: formatUptime(metrics.uptime), id: 'uptime' },
+    { label: 'Aktive Agents', value: String(metrics.active_agents), id: 'active-agents', icon: 'agent' },
+    { label: 'Aktionen', value: String(metrics.total_actions), id: 'total-actions', icon: 'action' },
+    { label: 'Transits', value: String(metrics.total_transits), id: 'total-transits', icon: 'transit' },
+    { label: 'Chaos Events', value: String(metrics.chaos_events), id: 'chaos-events', icon: 'chaos' },
+    { label: 'Schichtwechsel', value: String(metrics.shift_changes), id: 'shift-changes', icon: 'shift' },
+    { label: 'Uptime', value: formatUptime(metrics.uptime), id: 'uptime', icon: 'uptime' },
+    { label: 'Events Gesamt', value: formatNumber(metrics.total_events), id: 'total-events', icon: 'event' },
+    { label: 'Events/Min', value: String(metrics.event_rate_per_min ?? 0), id: 'event-rate', icon: 'rate' },
   ];
 
   for (const card of cards) {
@@ -40,4 +42,11 @@ function formatUptime(seconds) {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   return h + 'h ' + m + 'm';
+}
+
+function formatNumber(n) {
+  if (n == null) return '0';
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'k';
+  return String(n);
 }

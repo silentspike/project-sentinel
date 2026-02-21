@@ -4,6 +4,8 @@ import { renderFloorplan } from './floorplan.js';
 import { renderActivity, updateActivity } from './activity.js';
 import { renderMetrics } from './metrics.js';
 import { renderCockpit, updateCockpit } from './cockpit.js';
+import { renderChaos, updateChaos } from './chaos.js';
+import { renderChat, initChat } from './chat.js';
 
 let ws = null;
 
@@ -53,6 +55,8 @@ function connectWebSocket() {
         updateLagDisplay(data.lag);
       } else if (data.type === 'cockpit_update') {
         updateCockpit();
+      } else if (data.type === 'chaos_update') {
+        updateChaos();
       }
     } catch { /* ignore parse errors */ }
   };
@@ -74,23 +78,29 @@ async function init() {
 
   // Lade initiale Daten parallel
   try {
-    const [agentsRes, roomsRes, metricsRes, cockpitRes] = await Promise.all([
+    const [agentsRes, roomsRes, metricsRes, cockpitRes, chaosRes] = await Promise.all([
       fetch('/api/agents'),
       fetch('/api/rooms'),
       fetch('/api/metrics'),
-      fetch('/api/cockpit')
+      fetch('/api/cockpit'),
+      fetch('/api/chaos?limit=100'),
     ]);
 
     const agents = await agentsRes.json();
     const rooms = await roomsRes.json();
     const metrics = await metricsRes.json();
     const cockpit = await cockpitRes.json();
+    const chaos = await chaosRes.json();
 
     renderAgents(agents);
     renderFloorplan(rooms);
     renderMetrics(metrics);
     renderActivity(agents);
     renderCockpit(cockpit);
+    renderChaos(chaos);
+
+    // Chat async laden (eigener Fetch)
+    initChat();
 
     // Initiales Lag laden
     try {
