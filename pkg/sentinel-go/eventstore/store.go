@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -31,12 +32,15 @@ type DomainEvent struct {
 
 // OutboxEntry represents a pending publish in the outbox table.
 type OutboxEntry struct {
-	ID        int64
-	EventID   string
-	Topic     string
-	Payload   string
-	Status    string
-	CreatedAt int64
+	ID          int64
+	EventID     string
+	Topic       string
+	Payload     string
+	Status      string
+	CreatedAt   int64
+	PublishedAt sql.NullInt64
+	RetryCount  int
+	LastError   sql.NullString
 }
 
 // Store wraps a SQLite database with the sentinel-limbo event store schema.
@@ -63,6 +67,7 @@ const createEventsIndices = `
 CREATE INDEX IF NOT EXISTS idx_events_aggregate ON events(aggregate_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type, id);
 CREATE INDEX IF NOT EXISTS idx_events_correlation ON events(correlation_id);
+CREATE INDEX IF NOT EXISTS idx_events_causation ON events(causation_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_operation ON events(operation_id)
 `
 
@@ -249,6 +254,106 @@ func (s *Store) GetEventByOperationID(opID string) (*DomainEvent, error) {
 		e.CausationID = causation.String
 	}
 	return &e, nil
+}
+
+// EnsureOutboxMigration adds retry_count and last_error columns if missing.
+// Idempotent — safe to call on every startup.
+func (s *Store) EnsureOutboxMigration() error {
+	// SQLite ALTER TABLE ADD COLUMN is idempotent-safe: errors on duplicate column.
+	// We ignore "duplicate column" errors.
+	for _, stmt := range []string{
+		"ALTER TABLE outbox ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE outbox ADD COLUMN last_error TEXT",
+	} {
+		if _, err := s.db.Exec(stmt); err != nil {
+			// Ignore "duplicate column name" error (format varies by SQLite driver).
+			if !strings.Contains(err.Error(), "duplicate column name") {
+				return fmt.Errorf("outbox migration: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// OutboxPublishEntry is an outbox entry enriched with event metadata for NATS publishing.
+type OutboxPublishEntry struct {
+	OutboxID      int64
+	EventID       string
+	EventType     string
+	AggregateID   string
+	OperationID   string
+	CorrelationID string
+	Tick          int64
+	Topic         string
+	Payload       string
+	RetryCount    int
+}
+
+// GetOutboxBatch returns up to limit pending outbox entries joined with event metadata.
+func (s *Store) GetOutboxBatch(limit int) ([]OutboxPublishEntry, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`SELECT o.id, o.event_id, e.event_type, e.aggregate_id,
+		e.operation_id, e.correlation_id, e.tick, o.topic, o.payload, o.retry_count
+		FROM outbox o JOIN events e ON o.event_id = e.event_id
+		WHERE o.status = 'pending' ORDER BY o.id ASC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("outbox get batch: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var entries []OutboxPublishEntry
+	for rows.Next() {
+		var e OutboxPublishEntry
+		if err := rows.Scan(&e.OutboxID, &e.EventID, &e.EventType, &e.AggregateID,
+			&e.OperationID, &e.CorrelationID, &e.Tick, &e.Topic, &e.Payload,
+			&e.RetryCount); err != nil {
+			return nil, fmt.Errorf("outbox scan row: %w", err)
+		}
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// MarkPublished sets status='published' and published_at=now for the given IDs.
+func (s *Store) MarkPublished(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("outbox mark published begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := time.Now().UnixMilli()
+	for _, id := range ids {
+		if _, err := tx.Exec(`UPDATE outbox SET status = 'published', published_at = ?
+			WHERE id = ?`, now, id); err != nil {
+			return fmt.Errorf("outbox mark published id=%d: %w", id, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// MarkRetry increments retry_count and sets last_error for a failed publish attempt.
+func (s *Store) MarkRetry(id int64, errMsg string) error {
+	_, err := s.db.Exec(`UPDATE outbox SET retry_count = retry_count + 1, last_error = ?
+		WHERE id = ?`, errMsg, id)
+	if err != nil {
+		return fmt.Errorf("outbox mark retry id=%d: %w", id, err)
+	}
+	return nil
+}
+
+// MarkFailed sets status='failed' for an outbox entry that exceeded max retries.
+func (s *Store) MarkFailed(id int64) error {
+	_, err := s.db.Exec(`UPDATE outbox SET status = 'failed' WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("outbox mark failed id=%d: %w", id, err)
+	}
+	return nil
 }
 
 // Close closes the underlying database connection.

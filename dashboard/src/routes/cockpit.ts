@@ -308,9 +308,9 @@ function buildSloViolations(): SloViolation[] {
 
 // ── Main Endpoint ─────────────────────────────────
 
-function buildCockpitResponse(hours: number): CockpitResponse {
-  // Collect incidents from events
-  const eventIncidents = getRecentIncidentEvents(hours)
+function buildCockpitResponse(hours: number, limit = 200): CockpitResponse {
+  // Collect incidents from events (limited to prevent N+1 query explosion)
+  const eventIncidents = getRecentIncidentEvents(hours, limit)
     .map(buildEventIncident)
     .filter((i) => i.severity !== "low");
 
@@ -348,7 +348,11 @@ cockpitRoutes.get("/cockpit", (c) => {
     Math.max(parseInt(c.req.query("hours") || "24", 10), 1),
     168,
   );
-  return c.json(buildCockpitResponse(hours));
+  const limit = Math.min(
+    Math.max(parseInt(c.req.query("limit") || "200", 10), 1),
+    1000,
+  );
+  return c.json(buildCockpitResponse(hours, limit));
 });
 
 cockpitRoutes.get("/cockpit/incident/:id", (c) => {
