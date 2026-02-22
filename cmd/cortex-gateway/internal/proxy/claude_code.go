@@ -20,28 +20,9 @@ const (
 	// defaultClaudeCodeModel is the default model for the claude-code provider.
 	defaultClaudeCodeModel = "claude-opus-4-6"
 
-	// claudeCodeStartTimeout is how long we wait for the subprocess to become ready.
-	claudeCodeStartTimeout = 30 * time.Second
-
-	// claudeCodeResponseTimeout is the maximum time to wait for a response.
-	// LLM responses can take minutes for complex prompts.
-	claudeCodeResponseTimeout = 5 * time.Minute
-
 	// claudeCodeHealthTimeout is the timeout for health checks.
 	claudeCodeHealthTimeout = 10 * time.Second
 )
-
-// claudeCodeInput is the NDJSON input format for claude -p --output-format stream-json.
-type claudeCodeInput struct {
-	Type    string             `json:"type"`
-	Message claudeCodeInputMsg `json:"message"`
-}
-
-// claudeCodeInputMsg is the message payload sent to claude subprocess.
-type claudeCodeInputMsg struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
 
 // claudeCodeEvent is a single NDJSON event from the claude subprocess output.
 type claudeCodeEvent struct {
