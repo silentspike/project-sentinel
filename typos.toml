@@ -457,6 +457,12 @@ Diskrete = "Diskrete"
 Probleme = "Probleme"
 Monitore = "Monitore"
 
+# E2E Test Plan + Dashboard words (German in Markdown + JS)
+Legende = "Legende"
+Elemente = "Elemente"
+Klick = "Klick"
+plausibel = "plausibel"
+
 [files]
 extend-exclude = [
     "Cargo.lock",
@@ -464,4 +470,5 @@ extend-exclude = [
     "target/",
     "node_modules/",
     "*.min.js",
+    "docs/",
 ]
