@@ -2,6 +2,7 @@
 // Raum-Filter und chronologische Darstellung.
 
 let currentRoom = null;
+let cachedRooms = [];
 
 export function renderChat(messages) {
   const container = document.getElementById('view-chat');
@@ -28,15 +29,13 @@ export function renderChat(messages) {
   });
   filterBar.appendChild(allBtn);
 
-  // Extract unique rooms from messages
-  const rooms = [...new Set(messages.filter(m => m.target_room).map(m => m.target_room))];
-  rooms.sort();
-  for (const room of rooms) {
+  // Room buttons from cached /api/rooms data
+  for (const room of cachedRooms) {
     const btn = document.createElement('button');
-    btn.className = 'chat-filter-btn' + (currentRoom === room ? ' active' : '');
-    btn.textContent = room;
+    btn.className = 'chat-filter-btn' + (currentRoom === room.id ? ' active' : '');
+    btn.textContent = room.name || room.id;
     btn.addEventListener('click', () => {
-      currentRoom = room;
+      currentRoom = room.id;
       loadChat();
     });
     filterBar.appendChild(btn);
@@ -124,5 +123,12 @@ export async function updateChat() {
 }
 
 export async function initChat() {
+  try {
+    const res = await fetch('/api/rooms');
+    if (res.ok) {
+      const rooms = await res.json();
+      cachedRooms = rooms.sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+    }
+  } catch { /* rooms fetch failed, filter stays empty */ }
   await loadChat();
 }

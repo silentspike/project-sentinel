@@ -75,7 +75,7 @@ function summarizeEvent(
 ): string {
   switch (eventType) {
     case "chaos_triggered":
-      return `Chaos: ${String(payload.type ?? "unknown")} in ${aggregateId}`;
+      return `Chaos: ${String(payload.event_type ?? "unknown")} in ${aggregateId}`;
     case "agent_consolidation_failed":
       return `Konsolidierung fehlgeschlagen: ${String(payload.agent_name ?? aggregateId)} — ${String(payload.error ?? "unknown")}`;
     case "agent_despawned":
@@ -317,6 +317,16 @@ function buildCockpitResponse(hours: number, limit = 200): CockpitResponse {
   // Collect incidents from personality evolution
   const evolutionIncidents = getRecentEvolutionAlerts(hours)
     .map(buildEvolutionIncident);
+
+  // Auto-resolve: pending chaos/despawn events older than 30 minutes
+  const autoResolveMs = 30 * 60 * 1000;
+  const now = Date.now();
+  for (const inc of eventIncidents) {
+    if (inc.status === "pending" && now - inc.timestamp_ms > autoResolveMs) {
+      inc.status = "resolved";
+      inc.outcome = inc.outcome ?? "Automatisch abgeschlossen";
+    }
+  }
 
   // Merge and sort by severity (high first), then by timestamp (newest first)
   const allIncidents = [...eventIncidents, ...evolutionIncidents].sort(

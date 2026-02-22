@@ -11,6 +11,13 @@ export interface AgentRow {
   transit_target: string | null;
   last_action: string | null;
   last_action_tick: number | null;
+  hunger: number;
+  energy: number;
+  stress: number;
+  bladder: number;
+  social_need: number;
+  caffeine_mg: number;
+  mood: string | null;
   last_event_id: number;
   updated_at: number;
 }
@@ -20,6 +27,9 @@ export interface RoomRow {
   occupant_count: number;
   transit_count: number;
   active_chaos: string | null;
+  temperature: number | null;
+  co2_ppm: number | null;
+  noise_db: number | null;
   last_event_tick: number | null;
   last_event_id: number;
   updated_at: number;
@@ -64,6 +74,13 @@ export interface AgentListItem {
   transit_target: string | null;
   last_action: string | null;
   last_action_tick: number | null;
+  hunger: number;
+  energy: number;
+  stress: number;
+  bladder: number;
+  social_need: number;
+  caffeine_mg: number;
+  mood: string | null;
 }
 
 export interface AgentDetail extends AgentListItem {
@@ -82,6 +99,9 @@ export interface RoomResponse {
   occupant_count: number;
   transit_count: number;
   active_chaos: unknown | null;
+  temperature: number | null;
+  co2_ppm: number | null;
+  noise_db: number | null;
   last_event_tick: number | null;
   occupants: string[];
 }

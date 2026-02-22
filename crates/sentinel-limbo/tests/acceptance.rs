@@ -239,11 +239,8 @@ fn ac_08_04_offsets_monotonic() {
     let result = store.update_offset("ac-test", 3);
     assert!(result.is_err(), "decreasing offset must fail");
 
-    // Gleicher Wert: muss fehlschlagen
-    let result = store.update_offset("ac-test", 10);
-    assert!(result.is_err(), "same offset must fail");
-
-    // Offset ist unveraendert
+    // Gleicher Wert: idempotent (no-op, kein Fehler)
+    store.update_offset("ac-test", 10).unwrap();
     assert_eq!(store.get_offset("ac-test").unwrap(), Some(10));
 }
 

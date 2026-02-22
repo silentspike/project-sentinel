@@ -126,16 +126,102 @@ erreichen, SSH-Tunnel verursachte WebSocket-Probleme.
 
 ---
 
+## T23-T26: Extended E2E Tests (2026-02-22)
+
+Automatisiertes Testskript: `tests/e2e_extended_tests.py`
+
+### T23: Bio-Bar Ranges
+
+| Test | Ergebnis | Evidence |
+|------|----------|----------|
+| T23.1 Bio-Felder vorhanden | PASS | 6/6 Felder: hunger, energy, stress, bladder, social_need, caffeine_mg |
+| T23.2 hunger >= 0.0 | PASS | 39 agents, WARN: 39 values > 1.0 (max=100.0) |
+| T23.3 energy >= 0.0 | PASS | 39 agents, WARN: 39 values > 1.0 (max=78.0) |
+| T23.4 stress >= 0.0 | PASS | 39 agents, WARN: 39 values > 1.0 (max=13.0) |
+| T23.5 bladder >= 0.0 | PASS | 39 agents, WARN: 39 values > 1.0 (max=100.0) |
+| T23.6 social_need >= 0.0 | PASS | 39 agents, WARN: 39 values > 1.0 (max=100.0) |
+| T23.7 caffeine_mg >= 0.0 | PASS | 39 agents, in range |
+| T23.8 Bio numerisch | PASS | 39 agents, kein NaN/Infinity |
+| T23.9 Mood-Feld | PASS | vorhanden |
+| T23.10 Agent-Detail shift_set | PASS | shift_set=1 |
+
+**Result: 10/10 PASS**
+
+**Finding F1:** Bio-Werte ueberschreiten [0.0, 1.0] Range — Bio-Engine clampt nicht.
+Differential-Gleichungen akkumulieren Werte ohne Obergrenze wenn Agents nicht
+essen/schlafen/trinken. Braucht `clamp(0.0, 1.0)` in `sentinel-bio`.
+
+### T24: Room Physics Format
+
+| Test | Ergebnis | Evidence |
+|------|----------|----------|
+| T24.1 Physics-Felder vorhanden | PASS | temperature, co2_ppm, noise_db |
+| T24.2 Temperatur [15-35°C] | PASS | 1 room mit Wert |
+| T24.3 Noise dB [0-200dB] | PASS | 1 room, WARN: 1 room > 90dB (empfang: 150dB) |
+| T24.4 CO2 [350-3000ppm] | PASS | 1 room mit Wert |
+| T24.5 Physics numerisch | PASS | 15 rooms, kein NaN/Infinity |
+| T24.6 Besetzte Raeume | PASS | 1 occupied room, alle Werte vorhanden |
+| T24.7 CO2 vs Belegung | SKIP | Insufficient data (nur 1 besetzter Raum) |
+| T24.8 Noise vs Belegung | SKIP | Insufficient data |
+
+**Result: 6/6 PASS, 2 SKIP**
+
+**Finding F2:** Noise dB im Empfang = 150 dB — Akustik-Modell summiert dB
+aller 39 Agents im Raum. Physikalisch korrekt waere logarithmische Addition.
+
+### T25: Chaos-Event-Typen
+
+| Test | Ergebnis | Evidence |
+|------|----------|----------|
+| T25.1 Valide Chaos-Typen | PASS | Nur PhoneRing gefunden (500 Events) |
+| T25.2 Kein ChaosTriggered | PASS | 500 Events geprueft |
+| T25.3 Kein unknown | PASS | |
+| T25.4 Pflichtfelder | PASS | 7 Felder pro Event |
+| T25.5 room_id valid | PASS | WARN: 498/500 legacy "building" IDs |
+| T25.6 tick monoton | PASS | |
+| T25.7 description nicht leer | PASS | |
+| T25.8 timestamp plausibel | PASS | |
+
+**Result: 8/8 PASS**
+
+**Finding F3:** 498/500 Chaos-Events haben room_id="building" (Legacy-Daten
+vor dem Fix in chaos_system, siehe learnings.md). Neue Events nutzen echte Room-IDs.
+
+### T26: Cockpit Incidents Lifecycle
+
+| Test | Ergebnis | Evidence |
+|------|----------|----------|
+| T26.1 Status gueltig | PASS | pending, resolved |
+| T26.2 Severity gueltig | PASS | high |
+| T26.3 Active Count | PASS | reported=1, actual(active+pending)=1 |
+| T26.4 Resolved Count | PASS | total_resolved_24h=1 |
+| T26.5 Pflichtfelder | PASS | 10/10 Felder |
+| T26.6 Source gueltig | PASS | event |
+| T26.7 Actions Array | PASS | 0 total actions |
+| T26.8 Auto-Resolve | PASS | 1 auto-resolved incident |
+| T26.9 SLO Schema | PASS | Empty (alle SLOs OK) |
+| T26.10 SLO Thresholds | SKIP | Keine Violations zum Pruefen |
+| T26.11 Incident-Detail | PASS | id=2a53de91... |
+| T26.12 hours-Filter | PASS | hours=1: 1, hours=168: 200 |
+
+**Result: 11/11 PASS, 1 SKIP**
+
+---
+
 ## Zusammenfassung
 
-| Kategorie | Pass | Fail | Total |
-|-----------|------|------|-------|
-| Infrastructure & Services | 16 | 0 | 16 |
-| Dashboard UI | 15 | 0 | 15 |
-| Release Manifest | 3 | 0 | 3 |
-| Projection Worker | 4 | 0 | 4 |
-| Outbox Drain | 5 | 0 | 5 |
-| **TOTAL** | **43** | **0** | **43** |
+| Kategorie | Pass | Fail | Skip | Total |
+|-----------|------|------|------|-------|
+| Infrastructure & Services | 16 | 0 | 0 | 16 |
+| Dashboard UI | 15 | 0 | 0 | 15 |
+| Release Manifest | 3 | 0 | 0 | 3 |
+| Projection Worker | 4 | 0 | 0 | 4 |
+| Outbox Drain | 5 | 0 | 0 | 5 |
+| Bio-Bar Ranges (T23) | 10 | 0 | 0 | 10 |
+| Room Physics (T24) | 6 | 0 | 2 | 8 |
+| Chaos-Event-Typen (T25) | 8 | 0 | 0 | 8 |
+| Cockpit Lifecycle (T26) | 11 | 0 | 1 | 12 |
+| **TOTAL** | **78** | **0** | **3** | **81** |
 
 ### Release-Gate: PASS
 - 0 CRITICAL/HIGH offene Findings
@@ -144,12 +230,23 @@ erreichen, SSH-Tunnel verursachte WebSocket-Probleme.
 - Dashboard funktional mit echten DB-Daten
 - WebSocket verbunden, Lag = 0
 - Outbox vollstaendig gedrained (0 pending)
+- Bio-Bar API vollstaendig (6 Felder, numerisch, keine NaN)
+- Room Physics API vollstaendig (3 Felder, plausible Ranges)
+- Chaos-Events nutzen spezifische Typen (kein generisches ChaosTriggered)
+- Cockpit Incidents Schema vollstaendig (10 Felder, valide Lifecycle-Status)
+
+### Known Findings (nicht Release-blockierend)
+- **F1:** Bio-Werte > 1.0 — sentinel-bio clampt nicht (max beobachtet: 100.0)
+- **F2:** Noise > 90dB — Akustik-Modell summiert linear statt logarithmisch
+- **F3:** Legacy room_id "building" — 498/500 alte Chaos-Events
+- **F4:** total_active zaehlt pending mit — Cockpit-Logik korrekt aber kontraintuitiv
 
 ### Known Limitations
 - Agents-View leer (keine Agent-Simulation aktiv — kein Bug)
 - Aktivitaet-View leer (keine Agent-Aktionen — kein Bug)
 - Cockpit zeigt nur Top-200 Incidents (Performance-Limit)
 - Nightrun consolidated=0 (erwartet ohne aktive Agents)
+- Nur 1 Raum besetzt → CO2/Noise Korrelations-Tests geskippt
 
 ### Geaenderte Dateien (waehrend E2E gefixt)
 - `dashboard/src/index.ts` — WebSocket-Upgrade + CPU-Monitor

@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod controlplane;
+pub mod llm_bridge;
 pub mod orchestrator;
 pub mod shift;
 pub mod signal;

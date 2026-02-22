@@ -8,6 +8,7 @@ import { cockpitRoutes } from "./routes/cockpit";
 import { healthRoutes } from "./routes/health";
 import { chaosRoutes } from "./routes/chaos";
 import { chatRoutes } from "./routes/chat";
+import { activityRoutes } from "./routes/activity";
 import { createWsHandler, startPolling } from "./ws";
 
 const app = new Hono();
@@ -20,6 +21,7 @@ app.route("/api", metricRoutes);
 app.route("/api", cockpitRoutes);
 app.route("/api", chaosRoutes);
 app.route("/api", chatRoutes);
+app.route("/api", activityRoutes);
 
 // Statische Dateien
 app.use("/public/*", serveStatic({ root: "./" }));

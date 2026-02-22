@@ -74,6 +74,11 @@ bitnet/bitnet-inference
 
 # Stray Go binaries (root-level)
 /sentinel-nats-bridge
+/cortex-gateway
+
+# Evidence screenshots (root-level, not in docs/)
+/evidence-*.png
+/dashboard-*.png
 
 # Sentinel Runtime
 *.db-wal
