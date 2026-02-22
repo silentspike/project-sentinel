@@ -79,8 +79,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         db_path: cli.projection_db.clone(),
     };
 
-    let worker = ProjectionWorker::new(event_store, config)
-        .context("Failed to create ProjectionWorker")?;
+    let worker =
+        ProjectionWorker::new(event_store, config).context("Failed to create ProjectionWorker")?;
 
     if cli.rebuild {
         info!("Running full rebuild...");
