@@ -18,13 +18,10 @@ type ActionMeta struct {
 	Tick      int64  // simulation tick from metadata, 0 if unknown
 }
 
-// actionTypeToEventType maps extraction action types to domain event types.
-var actionTypeToEventType = map[string]string{
-	"move":     "agent_move",
-	"emote":    "agent_emote",
-	"tool_use": "agent_tool_use",
-	"chat":     "agent_chat",
-}
+// allActionsEventType is the unified event type for all LLM-generated agent actions.
+// The dashboard activity feed filters for this type; the specific action kind
+// (chat, move, emote, work, break, think) is stored in the payload's "action_type" field.
+const allActionsEventType = "agent_action_received"
 
 // MapActions converts extracted actions into domain events ready for persistence.
 // Each action becomes one DomainEvent with a deterministic operation_id
@@ -38,16 +35,11 @@ func MapActions(actions []extraction.ExtractedAction, meta ActionMeta) []eventst
 	events := make([]eventstore.DomainEvent, 0, len(actions))
 
 	for i, action := range actions {
-		eventType, ok := actionTypeToEventType[action.Type]
-		if !ok {
-			eventType = "agent_action"
-		}
-
 		payload := buildPayload(action)
 
 		events = append(events, eventstore.DomainEvent{
 			EventID:          eventstore.GenerateUUID(),
-			EventType:        eventType,
+			EventType:        allActionsEventType,
 			AggregateID:      meta.AgentName,
 			Payload:          payload,
 			CorrelationID:    meta.RequestID,
@@ -65,7 +57,7 @@ func MapActions(actions []extraction.ExtractedAction, meta ActionMeta) []eventst
 // buildPayload creates a JSON payload from the extracted action fields.
 func buildPayload(action extraction.ExtractedAction) string {
 	m := map[string]string{
-		"type": action.Type,
+		"action_type": action.Type,
 	}
 	if action.Content != "" {
 		m["content"] = action.Content
@@ -83,7 +75,7 @@ func buildPayload(action extraction.ExtractedAction) string {
 	b, err := json.Marshal(m)
 	if err != nil {
 		// Fallback: never fail on serialization.
-		return fmt.Sprintf(`{"type":%q,"error":"marshal failed"}`, action.Type)
+		return fmt.Sprintf(`{"action_type":%q,"error":"marshal failed"}`, action.Type)
 	}
 	return string(b)
 }

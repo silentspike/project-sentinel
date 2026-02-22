@@ -192,6 +192,28 @@ export function getEventsByCausation(eventId: string): EventRow[] {
     .all(eventId);
 }
 
+// Proximity-based event correlation: finds agent actions in the same room
+// within a tick window after a given event (e.g., chaos → agent reactions).
+export function getEventsNearby(
+  roomId: string,
+  afterTick: number,
+  windowTicks: number,
+  limit = 20,
+): EventRow[] {
+  return eventStoreDb
+    .query<EventRow, [number, number, string, number]>(
+      `SELECT id, event_id, event_type, aggregate_id, payload,
+              correlation_id, causation_id, tick, timestamp_ms, compensation_type
+       FROM events
+       WHERE tick BETWEEN ? AND ?
+         AND event_type = 'agent_action_received'
+         AND payload LIKE ?
+       ORDER BY tick ASC
+       LIMIT ?`,
+    )
+    .all(afterTick, afterTick + windowTicks, `%"target_room":"${roomId}"%`, limit);
+}
+
 export function getEventById(eventId: string): EventRow | null {
   return eventStoreDb
     .query<EventRow, [string]>(

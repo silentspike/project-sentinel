@@ -4,6 +4,91 @@ import (
 	"testing"
 )
 
+func TestExtract_JSONChat(t *testing.T) {
+	e := New()
+	actions := e.Extract(`{"action_type":"Chat","target":"Lisa","content":"Hey, wie laueft das Projekt?"}`)
+
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(actions))
+	}
+	if actions[0].Type != "chat" {
+		t.Errorf("type = %q, want %q", actions[0].Type, "chat")
+	}
+	if actions[0].Target != "Lisa" {
+		t.Errorf("target = %q, want %q", actions[0].Target, "Lisa")
+	}
+	if actions[0].Content != "Hey, wie laueft das Projekt?" {
+		t.Errorf("content = %q", actions[0].Content)
+	}
+}
+
+func TestExtract_JSONMove(t *testing.T) {
+	e := New()
+	actions := e.Extract(`{"action_type":"Move","target":"Kueche","content":"Ich brauche einen Kaffee"}`)
+
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(actions))
+	}
+	if actions[0].Type != "move" {
+		t.Errorf("type = %q, want %q", actions[0].Type, "move")
+	}
+	if actions[0].Target != "Kueche" {
+		t.Errorf("target = %q, want %q", actions[0].Target, "Kueche")
+	}
+}
+
+func TestExtract_JSONWork(t *testing.T) {
+	e := New()
+	actions := e.Extract(`{"action_type":"Work","target":"Website Redesign","content":"Arbeite am Wireframe fuer die neue Homepage"}`)
+
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(actions))
+	}
+	if actions[0].Type != "work" {
+		t.Errorf("type = %q, want %q", actions[0].Type, "work")
+	}
+}
+
+func TestExtract_JSONEmote(t *testing.T) {
+	e := New()
+	actions := e.Extract(`{"action_type":"Emote","target":"","content":"*streckt sich und gaehnt*"}`)
+
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(actions))
+	}
+	if actions[0].Type != "emote" {
+		t.Errorf("type = %q, want %q", actions[0].Type, "emote")
+	}
+}
+
+func TestExtract_JSONWithSurroundingText(t *testing.T) {
+	e := New()
+	// LLM might wrap JSON in text
+	actions := e.Extract(`Hier ist meine Antwort: {"action_type":"Chat","target":"Max","content":"Alles klar"} Ende.`)
+
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(actions))
+	}
+	if actions[0].Type != "chat" {
+		t.Errorf("type = %q, want %q", actions[0].Type, "chat")
+	}
+}
+
+func TestExtract_InvalidJSONFallsBackToRegex(t *testing.T) {
+	e := New()
+	actions := e.Extract("Ich gehe in die Kueche, ich brauche Kaffee.")
+
+	found := false
+	for _, a := range actions {
+		if a.Type == "move" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected regex fallback to detect move")
+	}
+}
+
 func TestExtract_ChatMessage(t *testing.T) {
 	e := New()
 	actions := e.Extract("Ok, mache ich. Kein Problem.")
@@ -165,6 +250,99 @@ func TestDetectEmotion_CaseInsensitive(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("DetectEmotion(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestExtract_EmoteMoveRichtung(t *testing.T) {
+	e := New()
+	actions := e.Extract("*geht zielstrebig Richtung Kueche*")
+
+	found := false
+	for _, a := range actions {
+		if a.Type == "move" {
+			found = true
+			if a.Target != "Kueche" {
+				t.Errorf("target = %q, want %q", a.Target, "Kueche")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected move action for '*geht Richtung Kueche*', got %+v", actions)
+	}
+}
+
+func TestExtract_EmoteMoveVerlasst(t *testing.T) {
+	e := New()
+	actions := e.Extract("*waescht sich die Haende und verlasst die Toilette*")
+
+	found := false
+	for _, a := range actions {
+		if a.Type == "move" {
+			found = true
+			if a.Target != "Toilette" {
+				t.Errorf("target = %q, want %q", a.Target, "Toilette")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected move action for 'verlasst', got %+v", actions)
+	}
+}
+
+func TestExtract_EmoteMoveVerlaesst(t *testing.T) {
+	e := New()
+	actions := e.Extract("*verlaesst den Meetingraum*")
+
+	found := false
+	for _, a := range actions {
+		if a.Type == "move" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected move action for 'verlaesst', got %+v", actions)
+	}
+}
+
+func TestExtract_EmoteMoveBetritt(t *testing.T) {
+	e := New()
+	actions := e.Extract("*betritt die Kueche*")
+
+	found := false
+	for _, a := range actions {
+		if a.Type == "move" {
+			found = true
+			if a.Target != "Kueche" {
+				t.Errorf("target = %q, want %q", a.Target, "Kueche")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected move action for 'betritt', got %+v", actions)
+	}
+}
+
+func TestExtract_PureEmoteNoMove(t *testing.T) {
+	e := New()
+	actions := e.Extract("*lacht und klopft auf den Tisch*")
+
+	for _, a := range actions {
+		if a.Type == "move" {
+			t.Error("should NOT be classified as move")
+		}
+	}
+	found := false
+	for _, a := range actions {
+		if a.Type == "emote" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected emote action")
 	}
 }
 

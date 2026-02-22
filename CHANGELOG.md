@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Lazy init, `sync.Mutex` serialized, auto-restart on crash
   - Provider registration in `provider.go` (Case "claude-code") and `main.go`
   - Config: `CLAUDE_CODE_ENABLED`, `CLAUDE_CODE_MODEL`, `CLAUDE_CODE_PATH` env vars
+  - `--system-prompt` flag support: system messages now override Claude Code's default persona via `splitMessages()`, fixing the Fourth-Wall break where agents refused to roleplay
 
 - **Wasm Tool Implementations** (sentinel-wasm)
   - `execute_chat()`: JSON input `{"target":"AGENT-XX","message":"text"}`, agent ID validation

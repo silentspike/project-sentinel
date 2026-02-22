@@ -40,8 +40,10 @@ function toActivityItem(row: EventRow): ActivityItem {
         detail = p.reason ? `Grund: ${p.reason}` : null;
         break;
       case "agent_action_received":
-        summary = `${agentId}: ${p.action_type || "Aktion"}`;
-        detail = p.content ? String(p.content) : null;
+        summary = p.content
+          ? `${agentId}: ${String(p.content)}`
+          : `${agentId}: ${p.action_type || "Aktion"}`;
+        detail = p.action_type || null;
         room = p.target_room || null;
         break;
       case "transit_started":
