@@ -75,17 +75,16 @@ impl HippocampusService {
             });
         }
 
-        // Run sleep cycle (scoring + selection)
+        // Run sleep cycle (scoring + selection + consolidation)
         let mut cycle = SleepCycle::new(agent);
         let selected = cycle.run_full_cycle(episodes)?;
         let episodes_consolidated = selected.len();
 
-        // Build narrative from consolidated summaries
-        let summary = selected
-            .iter()
-            .map(|(s, score)| format!("- {} (Score: {:.2})", s, score))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Use the narrative built during the consolidation phase
+        let summary = cycle
+            .consolidated_narrative()
+            .unwrap_or_default()
+            .to_string();
 
         // Persist narrative
         let narrative_state = NarrativeState {

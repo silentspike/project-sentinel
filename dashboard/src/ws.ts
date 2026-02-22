@@ -9,6 +9,9 @@ import {
   getMaxAgentEventId,
   getMaxRoomEventId,
   getMaxIncidentEventId,
+  getMaxChaosEventId,
+  getMaxActivityEventId,
+  getOccupantsByRoom,
   getProjectionLag,
 } from "./db";
 import { ROOM_METADATA } from "./rooms-meta";
@@ -19,6 +22,8 @@ const clients = new Set<ServerWebSocket<unknown>>();
 let lastAgentEventId = 0;
 let lastRoomEventId = 0;
 let lastIncidentEventId = 0;
+let lastChaosEventId = 0;
+let lastActivityEventId = 0;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -34,6 +39,13 @@ function toAgentListItem(row: {
   transit_target: string | null;
   last_action: string | null;
   last_action_tick: number | null;
+  hunger: number | null;
+  energy: number | null;
+  stress: number | null;
+  bladder: number | null;
+  social_need: number | null;
+  caffeine_mg: number | null;
+  mood: string | null;
 }): AgentListItem {
   const meta = row.current_room ? ROOM_METADATA[row.current_room] : null;
   return {
@@ -47,10 +59,17 @@ function toAgentListItem(row: {
     transit_target: row.transit_target,
     last_action: row.last_action,
     last_action_tick: row.last_action_tick,
+    hunger: row.hunger ?? 0,
+    energy: row.energy ?? 1,
+    stress: row.stress ?? 0,
+    bladder: row.bladder ?? 0,
+    social_need: row.social_need ?? 0,
+    caffeine_mg: row.caffeine_mg ?? 0,
+    mood: row.mood ?? null,
   };
 }
 
-function toRoomResponse(row: RoomRow): RoomResponse {
+function toRoomResponse(row: RoomRow, occupants: string[]): RoomResponse {
   const meta = ROOM_METADATA[row.room_id];
   let chaos: unknown | null = null;
   if (row.active_chaos) {
@@ -69,7 +88,11 @@ function toRoomResponse(row: RoomRow): RoomResponse {
     occupant_count: row.occupant_count,
     transit_count: row.transit_count,
     active_chaos: chaos,
+    temperature: row.temperature,
+    co2_ppm: row.co2_ppm,
+    noise_db: row.noise_db,
     last_event_tick: row.last_event_tick,
+    occupants,
   };
 }
 
@@ -96,7 +119,8 @@ function pollForChanges(): void {
     const currentRoomMax = getMaxRoomEventId();
     if (currentRoomMax > lastRoomEventId) {
       const rooms = getAllRooms();
-      broadcast({ type: "room_update", rooms: rooms.map(toRoomResponse) });
+      const occupantsMap = getOccupantsByRoom();
+      broadcast({ type: "room_update", rooms: rooms.map((r) => toRoomResponse(r, occupantsMap[r.room_id] ?? [])) });
       lastRoomEventId = currentRoomMax;
     }
 
@@ -104,6 +128,18 @@ function pollForChanges(): void {
     if (currentIncidentMax > lastIncidentEventId) {
       broadcast({ type: "cockpit_update" });
       lastIncidentEventId = currentIncidentMax;
+    }
+
+    const currentChaosMax = getMaxChaosEventId();
+    if (currentChaosMax > lastChaosEventId) {
+      broadcast({ type: "chaos_update" });
+      lastChaosEventId = currentChaosMax;
+    }
+
+    const currentActivityMax = getMaxActivityEventId();
+    if (currentActivityMax > lastActivityEventId) {
+      broadcast({ type: "activity_update" });
+      lastActivityEventId = currentActivityMax;
     }
   } catch {
     // DB-Fehler beim Poll — skip, naechster Versuch in 1s

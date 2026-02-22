@@ -1,9 +1,11 @@
 //! Handler fuer die `room_live_view` Projektion.
 //!
-//! Verarbeitet 5 Event-Varianten:
+//! Verarbeitet 7 Event-Varianten:
+//! - AgentSpawned -> room_id occupancy++
 //! - TransitStarted -> from_room occupancy--, transit_count++
 //! - TransitCompleted -> to_room occupancy++, transit_count--
 //! - ChaosTriggered -> active_chaos auf target_room
+//! - RoomPhysicsUpdated -> temperature, co2_ppm, noise_db
 //! - AgentDespawned -> current_room occupancy--
 //! - ShiftTransitionCompleted -> pro removed_agent: current_room occupancy--
 
@@ -25,6 +27,11 @@ impl ProjectionHandler for RoomLiveViewHandler {
         txn: &ReadModelTransaction<'_>,
     ) -> anyhow::Result<()> {
         match payload {
+            DomainEventPayload::AgentSpawned { room_id, .. } => {
+                debug!(room = room_id, "Projecting agent_spawned (room occupancy)");
+                txn.update_room_occupancy(room_id, 1, event.tick, row_id)?;
+            }
+
             DomainEventPayload::TransitStarted {
                 from_room, to_room, ..
             } => {
@@ -53,6 +60,24 @@ impl ProjectionHandler for RoomLiveViewHandler {
                         .to_string();
                 debug!(room, "Projecting chaos_triggered (room)");
                 txn.update_room_chaos(room, &chaos_json, event.tick, row_id)?;
+            }
+
+            DomainEventPayload::RoomPhysicsUpdated {
+                room_id,
+                temperature,
+                co2_ppm,
+                noise_db,
+                ..
+            } => {
+                debug!(room = room_id, "Projecting room_physics_updated");
+                txn.update_room_physics(
+                    room_id,
+                    *temperature as f64,
+                    *co2_ppm as f64,
+                    *noise_db as f64,
+                    event.tick,
+                    row_id,
+                )?;
             }
 
             DomainEventPayload::AgentDespawned { agent_id, .. } => {

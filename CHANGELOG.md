@@ -9,6 +9,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Claude Code Subprocess Provider** (Cortex Gateway)
+  - New `ClaudeCodeProvider` in `claude_code.go`: subprocess management for `claude -p --output-format stream-json`
+  - NDJSON protocol parsing with content block extraction and result deduplication
+  - Lazy init, `sync.Mutex` serialized, auto-restart on crash
+  - Provider registration in `provider.go` (Case "claude-code") and `main.go`
+  - Config: `CLAUDE_CODE_ENABLED`, `CLAUDE_CODE_MODEL`, `CLAUDE_CODE_PATH` env vars
+
+- **Wasm Tool Implementations** (sentinel-wasm)
+  - `execute_chat()`: JSON input `{"target":"AGENT-XX","message":"text"}`, agent ID validation
+  - `execute_calendar()`: create/query/cancel actions with date, time, subject, attendees
+  - `execute_search()`: query with scope (documents/agents/rooms) validation
+  - 15 new tests covering all 3 tool types (happy path + error cases)
+
+- **Extended E2E Test Suite** (tests/)
+  - `tests/e2e_extended_tests.py`: automated API validation script (35 tests)
+  - T23: Bio-Bar Ranges (10 tests) — 6 bio fields, numeric validation
+  - T24: Room Physics Format (8 tests) — temperature, CO2, noise dB plausibility
+  - T25: Chaos-Event-Typen (8 tests) — specific types, no generic ChaosTriggered
+  - T26: Cockpit Incidents Lifecycle (12 tests) — status/severity, SLO schema
+  - E2E_TEST_PLAN.md expanded from 218 to 256 tests
+
+- **LLM Bridge** (sentinel-daemon)
+  - `llm_bridge.rs`: async HTTP bridge to Cortex Gateway for agent LLM decisions
+  - Autonomy system `autonomy.rs`: agent action cycle integration
+
+- **Dashboard Enhancements**
+  - Agent cards: bio-bar visualization (hunger, energy, stress, bladder, social_need, caffeine)
+  - Agent cards: "Letzte Aktion" field from LLM-generated events
+  - Activity feed: Transit/Action events alongside Spawn/Chaos
+  - Chaos badge: specific event types (PhoneRing, PrinterBroken etc.) instead of generic
+  - Chat view: room-filtered chat log with WebSocket updates
+  - Cockpit: incident action correlation and outcome display
+
+- **User-Manual Guide** (docs/project-sentinel-guide.html)
+  - New Section 13: API-Referenz (Dashboard REST, WebSocket, Cortex Gateway, Observatory)
+  - Extended Section 14: Fehlerbehebung (LLM-Provider, idle agents troubleshooting)
+
+- **TOGAF HTML Guide v18.0** (docs/togaf-llm-architecture-guide.html)
+  - Crate count corrected: 11 → 16
+  - NATS JetStream Dual-Bus architecture section
+  - Claude Code Provider in Cortex Gateway section
+  - Go Services in architecture overview
+  - Stack reference table extended
+
+### Fixed
+
+- **Dashboard Chaos Badge**: uses `event_type` from payload instead of generic `type` (serde tag)
+- **Dashboard Activity**: shows Transit/Action events, not just Spawn/Chaos
+- **Cockpit Incidents**: empty action lists and never-visible resolved incidents
+
+### Changed
+
+- **Implementation Plan** (peaceful-splashing-willow.md): API Key → Subscription, claude-code Provider section, NATS JetStream
+- **E2E Results**: expanded from 43 to 78 total verified tests
+
+### Verified
+
+- **Agent Migration**: 54/54 TOML files present, all acceptance tests pass
+- **MARBLE Observatory**: SQLite persistence fully implemented (73 tests pass), relabeled scope:full
+- **sentinel-nightrun**: 52 tests pass, verify report posted on GH#17, #18
+- **sentinel-hippocampus**: 4 acceptance tests pass, verify report posted on GH#23
+- **sentinel-judge**: all ACs pass per verify report, label updated on GH#26
+- **eBPF Kernel-Probes**: implementation plan posted on GH#25 (userspace complete, kernel probes planned)
+
+- **Room Physics Events + Dashboard Integration**
+  - New `RoomPhysicsUpdated` DomainEvent variant (temperature, co2_ppm, noise_db, occupant_count)
+  - `physics_system` emits events every 20 ticks for occupied rooms
+  - Projection: `room_live_view` extended with temperature, co2_ppm, noise_db columns
+  - Room API response includes physics data; floorplan.js renders inline
+  - CSS: `.room-physics` styling for compact physics display
+
+- **Activity-View EventStore Integration**
+  - New `/api/activity` endpoint reads directly from EventStore (replaces agent-state derivation)
+  - 13 event types mapped to German-language summaries with type badges
+  - WebSocket `activity_update` for live pushes
+  - Frontend rewritten as async self-loading module
+
+- **Metrics MARBLE Extension**
+  - Metrics API extended with evolution_count, evolution_drifts, evolution_fatigue, evolution_quality
+  - Nightrun stats: nightrun_consolidated, nightrun_failed
+  - Frontend: 4 new metric cards (Nightrun OK, Nightrun Fail, Drift-Alerts, Fatigue-Alerts)
+
+### Fixed
+
+- **Tick counter not advancing**: `orchestrator.rs` only set `time.tick_count` but not `time.tick` (Tick newtype), causing all events to have tick=0
+- **Bio-Values display**: Changed `Math.round(value * 100)` to `Math.min(100, Math.max(0, Math.round(value)))` — values are 0-100 range, not 0.0-1.0
+- **Projection Worker monotonicity crash**: `update_offset()` changed from strict `<=` to idempotent `==` (no-op) + `<` (error), plus guard in worker.rs
+- **NATS JetStream storage**: Fixed `ReadWritePaths` mismatch in systemd unit (was `/var/lib/nats`, needed `/opt/sentinel/data/nats`)
+- **Service enablement**: All services now `systemctl enable`d for auto-start on reboot
+
 - **Statusmodell + DoD Gate Audit** (#111)
   - `docs/STATUS_MODEL.md`: Statusmodell-Dokumentation (implemented/deployed/verified Lifecycle)
   - `docs/DEFINITION_OF_DONE.md`: Definition of Done Checklisten (Feature, Gate, Docs)

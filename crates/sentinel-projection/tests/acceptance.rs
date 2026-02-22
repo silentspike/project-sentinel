@@ -45,6 +45,7 @@ fn seed_lifecycle(store: &EventStore, agent_num: u16, base_tick: u64) {
             name: format!("Agent-{agent_num}"),
             role: "Developer".to_string(),
             shift_set: 1,
+            room_id: "empfang".to_string(),
         },
     );
 
@@ -312,6 +313,7 @@ fn unknown_event_type_is_skipped_gracefully() {
             name: "Klaus".to_string(),
             role: "Developer".to_string(),
             shift_set: 1,
+            room_id: "empfang".to_string(),
         },
     );
 
@@ -366,6 +368,7 @@ fn chaos_and_shift_events_project_correctly() {
                 name: format!("Agent-{i}"),
                 role: "Developer".to_string(),
                 shift_set: 1,
+                room_id: "empfang".to_string(),
             },
         );
     }

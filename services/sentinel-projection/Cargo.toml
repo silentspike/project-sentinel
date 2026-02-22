@@ -1,0 +1,25 @@
+[package]
+name = "sentinel-projection-service"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Sentinel Projection Worker — CQRS Read-Model Service"
+
+[[bin]]
+name = "sentinel-projection"
+path = "src/main.rs"
+
+[dependencies]
+sentinel-common = { path = "../../crates/sentinel-common" }
+sentinel-limbo = { path = "../../crates/sentinel-limbo" }
+sentinel-projection = { path = "../../crates/sentinel-projection" }
+sentinel-telemetry = { path = "../../crates/sentinel-telemetry" }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+telemetry = ["sentinel-telemetry/telemetry"]

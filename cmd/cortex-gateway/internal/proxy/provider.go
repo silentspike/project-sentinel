@@ -41,7 +41,7 @@ type Provider interface {
 // ProviderConfig holds configuration for a provider.
 type ProviderConfig struct {
 	Name      string `toml:"name"`
-	Type      string `toml:"type"` // "claude" or "ollama"
+	Type      string `toml:"type"` // "claude", "ollama", or "claude-code"
 	BaseURL   string `toml:"base_url"`
 	APIKey    string `toml:"api_key"` //nolint:gosec // field name, not a credential
 	Model     string `toml:"model"`
@@ -124,6 +124,8 @@ func NewProviderFromConfig(cfg ProviderConfig) (Provider, error) {
 		return NewClaudeProvider(cfg), nil
 	case "ollama":
 		return NewOllamaProvider(cfg), nil
+	case "claude-code":
+		return NewClaudeCodeProvider(cfg, nil), nil
 	default:
 		return nil, fmt.Errorf("unknown provider type: %q", cfg.Type)
 	}

@@ -78,8 +78,24 @@ func main() {
 	registry.Register("ollama", ollamaProvider)
 	logger.Info("registered provider", "name", "ollama")
 
+	// 3b. Claude Code provider (subprocess, no API key required)
+	if os.Getenv("CLAUDE_CODE_ENABLED") == "1" {
+		claudeCodeProvider := proxy.NewClaudeCodeProvider(proxy.ProviderConfig{
+			Name:    "claude-code",
+			Type:    "claude-code",
+			BaseURL: envOrDefault("CLAUDE_CODE_BINARY", "claude"), // binary path
+			Model:   envOrDefault("CLAUDE_CODE_MODEL", "claude-opus-4-6"),
+		}, logger)
+		registry.Register("claude-code", claudeCodeProvider)
+		logger.Info("registered provider", "name", "claude-code", "model", envOrDefault("CLAUDE_CODE_MODEL", "claude-opus-4-6"))
+	}
+
 	// 4. Control config (shared between pipeline + control plane)
-	controlConfig := control.NewConfig("claude")
+	defaultProvider := "claude"
+	if os.Getenv("CLAUDE_CODE_ENABLED") == "1" {
+		defaultProvider = "claude-code"
+	}
+	controlConfig := control.NewConfig(defaultProvider)
 
 	// 4b. Event Store (optional, enabled via SENTINEL_CORTEX_EVENT_STORE_PATH)
 	var evStore *eventstore.Store

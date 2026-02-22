@@ -1,6 +1,6 @@
 //! Handler fuer die `agent_live_view` Projektion.
 //!
-//! Verarbeitet 7 Event-Varianten:
+//! Verarbeitet 8 Event-Varianten:
 //! - AgentSpawned -> INSERT agent
 //! - AgentDespawned -> status=despawned
 //! - TransitStarted -> in_transit=1, rooms
@@ -8,11 +8,12 @@
 //! - AgentActionReceived -> last_action
 //! - AgentStatusChanged -> status update
 //! - ShiftTransitionCompleted -> bulk despawn
+//! - BioStateUpdated -> hunger, energy, stress, bladder, social_need, caffeine_mg, mood
 
 use sentinel_common::{DomainEvent, DomainEventPayload};
 use tracing::debug;
 
-use crate::store::ReadModelTransaction;
+use crate::store::{BioUpdate, ReadModelTransaction};
 
 use super::ProjectionHandler;
 
@@ -32,9 +33,16 @@ impl ProjectionHandler for AgentLiveViewHandler {
                 name,
                 role,
                 shift_set,
+                room_id,
             } => {
-                debug!(agent_id = agent_id.0, name, "Projecting agent_spawned");
+                debug!(
+                    agent_id = agent_id.0,
+                    name,
+                    room = room_id,
+                    "Projecting agent_spawned"
+                );
                 txn.upsert_agent(agent_id.0, name, role, *shift_set, "active", row_id)?;
+                txn.update_agent_room(agent_id.0, room_id, row_id)?;
             }
 
             DomainEventPayload::AgentDespawned { agent_id, .. } => {
@@ -100,6 +108,37 @@ impl ProjectionHandler for AgentLiveViewHandler {
                 for agent_id in removed_agents {
                     txn.update_agent_status(agent_id.0, "despawned", row_id)?;
                 }
+            }
+
+            DomainEventPayload::BioStateUpdated {
+                agent_id,
+                hunger,
+                energy,
+                stress,
+                bladder,
+                social_need,
+                caffeine_mg,
+                room_id,
+                mood,
+            } => {
+                debug!(
+                    agent_id = agent_id.0,
+                    hunger, energy, stress, "Projecting bio_state_updated"
+                );
+                txn.update_agent_bio(
+                    &BioUpdate {
+                        agent_id: agent_id.0,
+                        hunger: f64::from(*hunger),
+                        energy: f64::from(*energy),
+                        stress: f64::from(*stress),
+                        bladder: f64::from(*bladder),
+                        social_need: f64::from(*social_need),
+                        caffeine_mg: f64::from(*caffeine_mg),
+                        mood,
+                        room_id,
+                    },
+                    row_id,
+                )?;
             }
 
             // Andere Events sind nicht relevant fuer agent_live_view

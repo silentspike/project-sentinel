@@ -153,10 +153,30 @@ func NewPlane(config *Config, logger *slog.Logger) *Plane {
 // Handler returns an http.ServeMux with control plane routes.
 func (p *Plane) Handler() *http.ServeMux {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", p.handleHealth)
+	mux.HandleFunc("GET /ready", p.handleReady)
 	mux.HandleFunc("GET /control/config", p.handleGetConfig)
 	mux.HandleFunc("PATCH /control/config", p.handleUpdateConfig)
 	mux.HandleFunc("POST /control/provider", p.handleSwitchProvider)
 	return mux
+}
+
+// handleHealth returns liveness status.
+func (p *Plane) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+// handleReady returns readiness status (config loaded).
+func (p *Plane) handleReady(w http.ResponseWriter, _ *http.Request) {
+	snapshot := p.config.Get()
+	if snapshot.PrimaryProvider == "" {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"status":"not_ready","reason":"no primary provider configured"}`))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
 // handleGetConfig returns the current config as JSON.

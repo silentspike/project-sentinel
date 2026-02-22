@@ -18,6 +18,13 @@ function toListItem(row: AgentRow): AgentListItem {
     transit_target: row.transit_target,
     last_action: row.last_action,
     last_action_tick: row.last_action_tick,
+    hunger: row.hunger ?? 0,
+    energy: row.energy ?? 1,
+    stress: row.stress ?? 0,
+    bladder: row.bladder ?? 0,
+    social_need: row.social_need ?? 0,
+    caffeine_mg: row.caffeine_mg ?? 0,
+    mood: row.mood ?? null,
   };
 }
 

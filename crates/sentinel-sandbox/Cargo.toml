@@ -22,6 +22,10 @@ criterion = { workspace = true }
 name = "breakout-helper"
 path = "src/bin/breakout_helper.rs"
 
+[[bin]]
+name = "landlock-wrapper"
+path = "src/bin/landlock_wrapper.rs"
+
 [[bench]]
 name = "sandbox_bench"
 harness = false

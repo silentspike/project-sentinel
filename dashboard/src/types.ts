@@ -11,6 +11,13 @@ export interface AgentRow {
   transit_target: string | null;
   last_action: string | null;
   last_action_tick: number | null;
+  hunger: number;
+  energy: number;
+  stress: number;
+  bladder: number;
+  social_need: number;
+  caffeine_mg: number;
+  mood: string | null;
   last_event_id: number;
   updated_at: number;
 }
@@ -20,6 +27,9 @@ export interface RoomRow {
   occupant_count: number;
   transit_count: number;
   active_chaos: string | null;
+  temperature: number | null;
+  co2_ppm: number | null;
+  noise_db: number | null;
   last_event_tick: number | null;
   last_event_id: number;
   updated_at: number;
@@ -64,6 +74,13 @@ export interface AgentListItem {
   transit_target: string | null;
   last_action: string | null;
   last_action_tick: number | null;
+  hunger: number;
+  energy: number;
+  stress: number;
+  bladder: number;
+  social_need: number;
+  caffeine_mg: number;
+  mood: string | null;
 }
 
 export interface AgentDetail extends AgentListItem {
@@ -82,7 +99,11 @@ export interface RoomResponse {
   occupant_count: number;
   transit_count: number;
   active_chaos: unknown | null;
+  temperature: number | null;
+  co2_ppm: number | null;
+  noise_db: number | null;
   last_event_tick: number | null;
+  occupants: string[];
 }
 
 export interface MetricsResponse {
@@ -95,6 +116,34 @@ export interface MetricsResponse {
   nightrun_events: number;
   bucket_start: number | null;
   uptime: number;
+  total_events: number;
+  event_rate_per_min: number;
+}
+
+// ── Chaos Event Feed ────────────────────────────
+
+export interface ChaosEventItem {
+  id: number;
+  event_id: string;
+  chaos_type: string;
+  room_id: string | null;
+  description: string;
+  tick: number;
+  timestamp_ms: number;
+}
+
+// ── Chat Messages ───────────────────────────────
+
+export interface ChatMessage {
+  id: number;
+  event_id: string;
+  agent_id: string;
+  agent_name: string;
+  action_type: string;
+  content: string | null;
+  target_room: string | null;
+  tick: number;
+  timestamp_ms: number;
 }
 
 export interface HealthResponse {

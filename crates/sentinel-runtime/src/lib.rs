@@ -165,7 +165,12 @@ impl RuntimeOrchestrator {
     }
 
     /// Spawnt einen neuen Agenten. Fehler bei Duplikat oder max erreicht.
-    pub fn spawn_agent(&mut self, identity: AgentIdentity, shift: ShiftInfo) -> Result<()> {
+    pub fn spawn_agent(
+        &mut self,
+        identity: AgentIdentity,
+        shift: ShiftInfo,
+        room_id: &str,
+    ) -> Result<()> {
         if self.agents.contains_key(&identity.agent_id) {
             return Err(anyhow!("Agent {} already exists", identity.agent_id));
         }
@@ -202,6 +207,7 @@ impl RuntimeOrchestrator {
             name: name.clone(),
             role: role.clone(),
             shift_set,
+            room_id: room_id.to_string(),
         };
         self.emit_event(
             payload.event_type_str(),
@@ -524,7 +530,9 @@ mod tests {
         let identity = create_identity(1, "Thomas", "CEO");
         let shift = create_shift(1, 6, 14);
 
-        orchestrator.spawn_agent(identity, shift).unwrap();
+        orchestrator
+            .spawn_agent(identity, shift, "empfang")
+            .unwrap();
         assert_eq!(orchestrator.agent_count(), 1);
 
         orchestrator.despawn_agent(AgentId(1)).unwrap();
@@ -537,16 +545,20 @@ mod tests {
 
         let identity1 = create_identity(1, "Thomas", "CEO");
         let shift1 = create_shift(1, 6, 14);
-        orchestrator.spawn_agent(identity1, shift1).unwrap();
+        orchestrator
+            .spawn_agent(identity1, shift1, "empfang")
+            .unwrap();
 
         let identity2 = create_identity(2, "Lisa", "Designer");
         let shift2 = create_shift(1, 6, 14);
-        orchestrator.spawn_agent(identity2, shift2).unwrap();
+        orchestrator
+            .spawn_agent(identity2, shift2, "empfang")
+            .unwrap();
 
         // Dritter Agent sollte fehlschlagen
         let identity3 = create_identity(3, "Andreas", "Developer");
         let shift3 = create_shift(1, 6, 14);
-        let result = orchestrator.spawn_agent(identity3, shift3);
+        let result = orchestrator.spawn_agent(identity3, shift3, "empfang");
 
         assert!(result.is_err());
         assert_eq!(orchestrator.agent_count(), 2);
@@ -559,12 +571,16 @@ mod tests {
         // Set 1 Agent (Frueh-Schicht)
         let identity1 = create_identity(1, "Thomas", "CEO");
         let shift1 = create_shift(1, 6, 14);
-        orchestrator.spawn_agent(identity1, shift1).unwrap();
+        orchestrator
+            .spawn_agent(identity1, shift1, "empfang")
+            .unwrap();
 
         // Set 2 Agent (Mittel-Schicht)
         let identity2 = create_identity(16, "Michael", "CEO");
         let shift2 = create_shift(2, 14, 22);
-        orchestrator.spawn_agent(identity2, shift2).unwrap();
+        orchestrator
+            .spawn_agent(identity2, shift2, "empfang")
+            .unwrap();
 
         assert_eq!(orchestrator.agent_count(), 2);
 
@@ -588,13 +604,15 @@ mod tests {
         let identity_sonder = create_identity(46, "Betriebsrat", "Sonder");
         let shift_sonder = create_shift(0, 0, 23);
         orchestrator
-            .spawn_agent(identity_sonder, shift_sonder)
+            .spawn_agent(identity_sonder, shift_sonder, "empfang")
             .unwrap();
 
         // Set 1 Agent
         let identity1 = create_identity(1, "Thomas", "CEO");
         let shift1 = create_shift(1, 6, 14);
-        orchestrator.spawn_agent(identity1, shift1).unwrap();
+        orchestrator
+            .spawn_agent(identity1, shift1, "empfang")
+            .unwrap();
 
         assert_eq!(orchestrator.agent_count(), 2);
 
@@ -616,11 +634,15 @@ mod tests {
 
         let identity1 = create_identity(1, "Thomas", "CEO");
         let shift1 = create_shift(1, 6, 14);
-        orchestrator.spawn_agent(identity1, shift1).unwrap();
+        orchestrator
+            .spawn_agent(identity1, shift1, "empfang")
+            .unwrap();
 
         let identity2 = create_identity(2, "Lisa", "Designer");
         let shift2 = create_shift(1, 6, 14);
-        orchestrator.spawn_agent(identity2, shift2).unwrap();
+        orchestrator
+            .spawn_agent(identity2, shift2, "empfang")
+            .unwrap();
 
         // Setze einen auf Errored
         if let Some(handle) = orchestrator.get_agent_mut(AgentId(1)) {
@@ -639,15 +661,21 @@ mod tests {
 
         let identity1 = create_identity(1, "Thomas", "CEO");
         let shift1 = create_shift(1, 6, 14);
-        orchestrator.spawn_agent(identity1, shift1).unwrap();
+        orchestrator
+            .spawn_agent(identity1, shift1, "empfang")
+            .unwrap();
 
         let identity2 = create_identity(2, "Lisa", "Designer");
         let shift2 = create_shift(1, 6, 14);
-        orchestrator.spawn_agent(identity2, shift2).unwrap();
+        orchestrator
+            .spawn_agent(identity2, shift2, "empfang")
+            .unwrap();
 
         let identity3 = create_identity(3, "Andreas", "Developer");
         let shift3 = create_shift(1, 6, 14);
-        orchestrator.spawn_agent(identity3, shift3).unwrap();
+        orchestrator
+            .spawn_agent(identity3, shift3, "empfang")
+            .unwrap();
 
         assert_eq!(orchestrator.agent_count(), 3);
 
@@ -666,8 +694,12 @@ mod tests {
         let mut orch = RuntimeOrchestrator::new(10).with_event_store(store.clone());
         orch.set_tick(42);
 
-        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-            .unwrap();
+        orch.spawn_agent(
+            create_identity(1, "Thomas", "CEO"),
+            create_shift(1, 6, 14),
+            "empfang",
+        )
+        .unwrap();
 
         // Verify spawn event in store
         let events = store.get_events_by_aggregate("AGENT-01", 10).unwrap();
@@ -689,11 +721,16 @@ mod tests {
         let mut orch = RuntimeOrchestrator::new(10).with_event_store(store.clone());
         orch.set_tick(100);
 
-        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-            .unwrap();
+        orch.spawn_agent(
+            create_identity(1, "Thomas", "CEO"),
+            create_shift(1, 6, 14),
+            "empfang",
+        )
+        .unwrap();
         orch.spawn_agent(
             create_identity(16, "Michael", "CEO"),
             create_shift(2, 14, 22),
+            "empfang",
         )
         .unwrap();
 
@@ -717,6 +754,7 @@ mod tests {
             orch.spawn_agent(
                 create_identity(i, &format!("Agent-{}", i), "Worker"),
                 create_shift(1, 6, 14),
+                "empfang",
             )
             .unwrap();
         }
@@ -748,8 +786,12 @@ mod tests {
         // Without event store, operations should still work (no panic)
         let mut orch = RuntimeOrchestrator::new(10);
 
-        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-            .unwrap();
+        orch.spawn_agent(
+            create_identity(1, "Thomas", "CEO"),
+            create_shift(1, 6, 14),
+            "empfang",
+        )
+        .unwrap();
         orch.despawn_agent(AgentId(1)).unwrap();
         let _ = orch.shift_transition(2);
         // No panic = success
@@ -798,8 +840,12 @@ mod tests {
     #[test]
     fn pause_resume_lifecycle() {
         let mut orch = RuntimeOrchestrator::new(10);
-        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-            .unwrap();
+        orch.spawn_agent(
+            create_identity(1, "Thomas", "CEO"),
+            create_shift(1, 6, 14),
+            "empfang",
+        )
+        .unwrap();
 
         // Active -> Suspended (pause)
         orch.pause_agent(AgentId(1)).unwrap();
@@ -819,8 +865,12 @@ mod tests {
     #[test]
     fn pause_already_suspended_fails() {
         let mut orch = RuntimeOrchestrator::new(10);
-        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-            .unwrap();
+        orch.spawn_agent(
+            create_identity(1, "Thomas", "CEO"),
+            create_shift(1, 6, 14),
+            "empfang",
+        )
+        .unwrap();
         orch.pause_agent(AgentId(1)).unwrap();
 
         // Suspended -> Suspended: ungueltig
@@ -831,8 +881,12 @@ mod tests {
     #[test]
     fn resume_already_active_fails() {
         let mut orch = RuntimeOrchestrator::new(10);
-        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-            .unwrap();
+        orch.spawn_agent(
+            create_identity(1, "Thomas", "CEO"),
+            create_shift(1, 6, 14),
+            "empfang",
+        )
+        .unwrap();
 
         // Active -> Active via resume: ungueltig
         let result = orch.resume_agent(AgentId(1));
@@ -842,8 +896,12 @@ mod tests {
     #[test]
     fn resume_from_sleeping() {
         let mut orch = RuntimeOrchestrator::new(10);
-        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-            .unwrap();
+        orch.spawn_agent(
+            create_identity(1, "Thomas", "CEO"),
+            create_shift(1, 6, 14),
+            "empfang",
+        )
+        .unwrap();
 
         // Manuell auf Sleeping setzen (Sleep-Cycle)
         orch.get_agent_mut(AgentId(1)).unwrap().status = AgentStatus::Sleeping;
@@ -859,8 +917,12 @@ mod tests {
     #[test]
     fn resume_from_errored() {
         let mut orch = RuntimeOrchestrator::new(10);
-        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-            .unwrap();
+        orch.spawn_agent(
+            create_identity(1, "Thomas", "CEO"),
+            create_shift(1, 6, 14),
+            "empfang",
+        )
+        .unwrap();
 
         // Manuell auf Errored setzen
         orch.get_agent_mut(AgentId(1)).unwrap().status = AgentStatus::Errored;
@@ -879,8 +941,12 @@ mod tests {
         let mut orch = RuntimeOrchestrator::new(10).with_event_store(store.clone());
         orch.set_tick(1);
 
-        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-            .unwrap();
+        orch.spawn_agent(
+            create_identity(1, "Thomas", "CEO"),
+            create_shift(1, 6, 14),
+            "empfang",
+        )
+        .unwrap();
 
         // Pause
         orch.pause_agent(AgentId(1)).unwrap();
@@ -944,8 +1010,12 @@ mod tests {
         let mut orch = RuntimeOrchestrator::new(10).with_event_sink(sink.clone());
 
         // Spawn
-        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-            .unwrap();
+        orch.spawn_agent(
+            create_identity(1, "Thomas", "CEO"),
+            create_shift(1, 6, 14),
+            "empfang",
+        )
+        .unwrap();
         assert_eq!(sink.spawned.lock().unwrap().len(), 1);
 
         // Pause
@@ -964,6 +1034,7 @@ mod tests {
         orch.spawn_agent(
             create_identity(16, "Michael", "CEO"),
             create_shift(2, 14, 22),
+            "empfang",
         )
         .unwrap();
         let _ = orch.shift_transition(2);
@@ -980,11 +1051,16 @@ mod tests {
         let mut orch = RuntimeOrchestrator::new(10).with_event_store(store.clone());
         orch.set_tick(1);
 
-        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-            .unwrap();
+        orch.spawn_agent(
+            create_identity(1, "Thomas", "CEO"),
+            create_shift(1, 6, 14),
+            "empfang",
+        )
+        .unwrap();
         orch.spawn_agent(
             create_identity(2, "Lisa", "Designer"),
             create_shift(1, 6, 14),
+            "empfang",
         )
         .unwrap();
 
@@ -1048,6 +1124,7 @@ mod tests {
             orch.spawn_agent(
                 create_identity(id, &format!("Agent-{id}"), "Worker"),
                 create_shift(1, 6, 14),
+                "empfang",
             )
             .unwrap();
         }

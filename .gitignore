@@ -66,6 +66,23 @@ bitnet/bitnet-inference
 # Claude Code (internal working files)
 .claude/
 
+# Audit working files
+.audit/
+
+# Playwright CLI session files
+.playwright-cli/
+
+# Stray Go binaries (root-level)
+/sentinel-nats-bridge
+/cortex-gateway
+
+# Docs (local-only, not for Git)
+docs/
+
+# Evidence screenshots (binary, not for Git)
+/evidence-*.png
+/dashboard-*.png
+
 # Sentinel Runtime
 *.db-wal
 *.db-shm

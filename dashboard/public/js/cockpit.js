@@ -108,19 +108,24 @@ function renderIncidentItem(incident) {
   item.appendChild(meta);
 
   // Actions (AC-3)
-  if (incident.actions.length > 0) {
-    const actionsContainer = document.createElement('div');
-    actionsContainer.className = 'cockpit-actions';
+  const actionsContainer = document.createElement('div');
+  actionsContainer.className = 'cockpit-actions';
 
+  if (incident.actions.length > 0) {
     for (const action of incident.actions) {
       const actionEl = document.createElement('div');
       actionEl.className = 'cockpit-action-item';
-      actionEl.textContent = 'Action: ' + action.summary;
+      actionEl.textContent = 'Aktion: ' + action.summary;
       actionsContainer.appendChild(actionEl);
     }
-
-    item.appendChild(actionsContainer);
+  } else {
+    const noActions = document.createElement('div');
+    noActions.className = 'cockpit-action-empty';
+    noActions.textContent = 'Keine Massnahmen eingeleitet';
+    actionsContainer.appendChild(noActions);
   }
+
+  item.appendChild(actionsContainer);
 
   // Outcome (AC-4)
   if (incident.outcome != null) {
