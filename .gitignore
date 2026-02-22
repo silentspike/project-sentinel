@@ -76,10 +76,12 @@ bitnet/bitnet-inference
 /sentinel-nats-bridge
 /cortex-gateway
 
+# Docs (local-only, not for Git)
+docs/
+
 # Evidence screenshots (binary, not for Git)
 /evidence-*.png
 /dashboard-*.png
-docs/screenshots/
 
 # Sentinel Runtime
 *.db-wal
