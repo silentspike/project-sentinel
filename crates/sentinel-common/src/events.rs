@@ -120,6 +120,26 @@ pub enum DomainEventPayload {
     },
     /// Bio-Aktion (essen, trinken, Toilette)
     BioActionPerformed { agent_id: AgentId, action: String },
+    /// Periodischer Bio-State Snapshot pro Agent (alle N Ticks)
+    BioStateUpdated {
+        agent_id: AgentId,
+        hunger: f32,
+        energy: f32,
+        stress: f32,
+        bladder: f32,
+        social_need: f32,
+        caffeine_mg: f32,
+        room_id: String,
+        mood: String,
+    },
+    /// Periodischer Raum-Physik Snapshot (Temperatur, CO2, Laerm)
+    RoomPhysicsUpdated {
+        room_id: String,
+        temperature: f32,
+        co2_ppm: f32,
+        noise_db: f32,
+        occupant_count: u32,
+    },
     /// Periodischer Tick-Snapshot-Marker
     TickSnapshot { tick: u64, agent_count: u32 },
     /// Agent wurde in der Runtime gespawnt
@@ -128,6 +148,7 @@ pub enum DomainEventPayload {
         name: String,
         role: String,
         shift_set: u8,
+        room_id: String,
     },
     /// Agent wurde aus der Runtime entfernt
     AgentDespawned { agent_id: AgentId, reason: String },
@@ -192,6 +213,8 @@ impl DomainEventPayload {
             Self::TransitCompleted { .. } => "transit_completed",
             Self::ChaosTriggered { .. } => "chaos_triggered",
             Self::BioActionPerformed { .. } => "bio_action_performed",
+            Self::BioStateUpdated { .. } => "bio_state_updated",
+            Self::RoomPhysicsUpdated { .. } => "room_physics_updated",
             Self::TickSnapshot { .. } => "tick_snapshot",
             Self::AgentSpawned { .. } => "agent_spawned",
             Self::AgentDespawned { .. } => "agent_despawned",

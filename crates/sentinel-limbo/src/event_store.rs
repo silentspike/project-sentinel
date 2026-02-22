@@ -594,7 +594,10 @@ impl EventStore {
 
     /// Setzt den Offset einer Projection (upsert, monoton steigend).
     ///
-    /// Gibt `MonotonicityError` zurueck wenn der neue Offset <= aktueller Offset ist.
+    /// Verhalten:
+    /// - `offset > current` → Normal-Update (Fortschritt)
+    /// - `offset == current` → No-op (idempotent, kein Fehler)
+    /// - `offset < current` → `MonotonicityError` (Rueckwaerts-Drift)
     pub fn update_offset(&self, name: &str, offset: i64) -> anyhow::Result<()> {
         let conn = self
             .conn
@@ -611,7 +614,11 @@ impl EventStore {
             .ok();
 
         if let Some(current_val) = current {
-            if offset <= current_val {
+            if offset == current_val {
+                // Idempotent: gleicher Offset = kein Update noetig
+                return Ok(());
+            }
+            if offset < current_val {
                 return Err(MonotonicityError {
                     projection: name.to_string(),
                     current: current_val,
@@ -957,12 +964,9 @@ mod tests {
         store.update_offset("test-proj", 10).unwrap();
         assert_eq!(store.get_offset("test-proj").unwrap(), Some(10));
 
-        // Gleicher Wert muss fehlschlagen (nicht strikt groesser)
-        let result = store.update_offset("test-proj", 10);
-        assert!(
-            result.is_err(),
-            "same offset should fail monotonicity check"
-        );
+        // Gleicher Wert ist idempotent (no-op, kein Fehler)
+        store.update_offset("test-proj", 10).unwrap();
+        assert_eq!(store.get_offset("test-proj").unwrap(), Some(10));
 
         // Kleinerer Wert muss fehlschlagen
         let result = store.update_offset("test-proj", 5);

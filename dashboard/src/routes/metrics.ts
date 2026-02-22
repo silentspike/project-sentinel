@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { getLatestKpi, getProjectionLag, getActiveAgents, getTotalEventCount, getEventRatePerMinute } from "../db";
+import { getLatestKpi, getProjectionLag, getActiveAgents, getTotalEventCount, getEventRatePerMinute, getRecentEvolutionAlerts, getLastNightrunStats } from "../db";
 import type { MetricsResponse, HealthResponse } from "../types";
 
 export const metricRoutes = new Hono();
@@ -22,7 +22,18 @@ metricRoutes.get("/metrics", (c) => {
     total_events: getTotalEventCount(),
     event_rate_per_min: getEventRatePerMinute(),
   };
-  return c.json(response);
+  // Evolution/MARBLE Daten anhaengen
+  const evolution = getRecentEvolutionAlerts(24);
+  const nightrun = getLastNightrunStats();
+  return c.json({
+    ...response,
+    evolution_count: evolution.length,
+    evolution_drifts: evolution.filter((e) => e.change_type === "drift").length,
+    evolution_fatigue: evolution.filter((e) => e.change_type === "fatigue_spike").length,
+    evolution_quality: evolution.filter((e) => e.change_type === "quality_shift").length,
+    nightrun_consolidated: nightrun?.consolidated ?? 0,
+    nightrun_failed: nightrun?.failed ?? 0,
+  });
 });
 
 metricRoutes.get("/health", (c) => {

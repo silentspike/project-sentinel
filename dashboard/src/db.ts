@@ -278,7 +278,7 @@ export function getRecentChaosEvents(limit = 100): ChaosEventItem[] {
       let roomId: string | null = row.aggregate_id;
       try {
         const p = JSON.parse(row.payload);
-        chaosType = String(p.type ?? p.event_type ?? "unknown");
+        chaosType = String(p.event_type ?? "unknown");
         description = String(p.description ?? "");
         if (p.target_room) roomId = String(p.target_room);
       } catch { /* ignore parse errors */ }
@@ -310,7 +310,7 @@ export function getChaosEventsByRoom(roomId: string, limit = 50): ChaosEventItem
       let description = "";
       try {
         const p = JSON.parse(row.payload);
-        chaosType = String(p.type ?? p.event_type ?? "unknown");
+        chaosType = String(p.event_type ?? "unknown");
         description = String(p.description ?? "");
       } catch { /* ignore */ }
       return {
@@ -404,6 +404,50 @@ export function getOccupantsByRoom(): Record<string, string[]> {
     result[row.current_room].push(row.name);
   }
   return result;
+}
+
+// ── Activity Feed (EventStore Timeline) ─────────
+
+/** Event-Typen die im Activity-Feed angezeigt werden (ohne bio_state_updated + tick_snapshot = zu hochfrequent) */
+const ACTIVITY_EVENT_TYPES = [
+  "agent_spawned",
+  "agent_despawned",
+  "agent_action_received",
+  "agent_status_changed",
+  "transit_started",
+  "transit_completed",
+  "chaos_triggered",
+  "bio_action_performed",
+  "shift_transition_completed",
+  "nightrun_started",
+  "nightrun_completed",
+  "agent_consolidated",
+  "agent_consolidation_failed",
+] as const;
+
+const ACTIVITY_TYPES_SQL = ACTIVITY_EVENT_TYPES.map((t) => `'${t}'`).join(",");
+
+export function getRecentActivityEvents(limit = 200): EventRow[] {
+  return eventStoreDb
+    .query<EventRow, [number]>(
+      `SELECT id, event_id, event_type, aggregate_id, payload,
+              correlation_id, causation_id, tick, timestamp_ms, compensation_type
+       FROM events
+       WHERE event_type IN (${ACTIVITY_TYPES_SQL})
+       ORDER BY id DESC
+       LIMIT ?`,
+    )
+    .all(limit);
+}
+
+export function getMaxActivityEventId(): number {
+  const row = eventStoreDb
+    .query<{ max_id: number | null }, []>(
+      `SELECT MAX(id) as max_id FROM events
+       WHERE event_type IN (${ACTIVITY_TYPES_SQL})`,
+    )
+    .get();
+  return row?.max_id ?? 0;
 }
 
 // ── Total Event Count ───────────────────────────

@@ -27,9 +27,10 @@ function createAgentCard(agent) {
   role.textContent = agent.role;
   card.appendChild(role);
 
+  const STATUS_LABELS = { active: 'Aktiv', suspended: 'Pausiert', errored: 'Fehler', despawned: 'Despawned' };
   const status = document.createElement('div');
   status.className = 'status-badge status-' + agent.status;
-  status.textContent = agent.status;
+  status.textContent = STATUS_LABELS[agent.status] || agent.status;
   card.appendChild(status);
 
   const room = document.createElement('div');
@@ -64,9 +65,9 @@ function createBioBar(label, value) {
   fill.className = 'bio-bar-fill';
 
   if (value != null && !isNaN(value)) {
-    const pct = Math.round(value * 100);
+    // Bio values are already 0-100 from the API
+    const pct = Math.min(100, Math.max(0, Math.round(value)));
     fill.style.width = pct + '%';
-    // Color based on value: green (low) -> yellow (mid) -> red (high)
     if (pct > 70) {
       fill.classList.add('bio-bar-high');
     } else if (pct > 40) {
@@ -84,7 +85,7 @@ function createBioBar(label, value) {
 
   const valueEl = document.createElement('span');
   valueEl.className = 'bio-bar-value';
-  valueEl.textContent = value != null ? Math.round(value * 100) + '%' : '--';
+  valueEl.textContent = value != null ? Math.min(100, Math.max(0, Math.round(value))) + '%' : '--';
   bar.appendChild(valueEl);
 
   return bar;
@@ -96,17 +97,22 @@ async function loadAgentDetail(agentId, card) {
     if (!res.ok) return;
     const data = await res.json();
 
-    if (data.last_action) {
-      const action = document.createElement('div');
-      action.className = 'last-action';
-      action.textContent = data.last_action;
-      card.appendChild(action);
-    }
+    const action = document.createElement('div');
+    action.className = 'last-action';
+    action.textContent = data.last_action || '\u2014';
+    card.appendChild(action);
 
     const meta = document.createElement('div');
     meta.className = 'agent-meta';
-    meta.textContent = 'Schicht ' + data.shift_set;
+    const agentIdStr = 'AGENT-' + String(agentId).padStart(2, '0');
+    meta.textContent = agentIdStr + ' | Schicht ' + data.shift_set;
     card.appendChild(meta);
+
+    // Mood
+    const moodEl = document.createElement('div');
+    moodEl.className = 'agent-mood';
+    moodEl.textContent = 'Stimmung: ' + (data.mood || '\u2014');
+    card.appendChild(moodEl);
 
     // Bio-State Bars (nur anzeigen wenn mindestens ein Wert vorhanden)
     const hasBio = data.hunger != null || data.energy != null || data.stress != null;
@@ -125,5 +131,54 @@ async function loadAgentDetail(agentId, card) {
 }
 
 export function updateAgents(agents) {
-  renderAgents(agents);
+  const container = document.getElementById('view-agents');
+  const grid = container.querySelector('.agents-grid');
+
+  // Fallback: full render if grid doesn't exist yet
+  if (!grid) {
+    renderAgents(agents);
+    return;
+  }
+
+  const existingCards = new Map();
+  for (const card of grid.querySelectorAll('.agent-card')) {
+    existingCards.set(card.getAttribute('data-agent-id'), card);
+  }
+
+  for (const agent of agents) {
+    const card = existingCards.get(String(agent.id));
+    if (!card) {
+      // New agent — append card
+      const newCard = createAgentCard(agent);
+      grid.appendChild(newCard);
+      continue;
+    }
+
+    // Differential update: only touch changed fields
+    const STATUS_LABELS_U = { active: 'Aktiv', suspended: 'Pausiert', errored: 'Fehler', despawned: 'Despawned' };
+    const statusBadge = card.querySelector('.status-badge');
+    const statusLabel = STATUS_LABELS_U[agent.status] || agent.status;
+    if (statusBadge && statusBadge.textContent !== statusLabel) {
+      statusBadge.textContent = statusLabel;
+      statusBadge.className = 'status-badge status-' + agent.status;
+    }
+
+    const roomEl = card.querySelector('.room');
+    if (roomEl) {
+      let newText;
+      let isTransit = false;
+      if (agent.in_transit) {
+        newText = 'Unterwegs' + (agent.transit_target ? ' \u2192 ' + agent.transit_target : '');
+        isTransit = true;
+      } else {
+        newText = agent.room_name || agent.current_room || '\u2014';
+      }
+      if (roomEl.textContent !== newText) {
+        roomEl.textContent = newText;
+        roomEl.classList.toggle('transit', isTransit);
+      }
+    }
+
+    existingCards.delete(String(agent.id));
+  }
 }

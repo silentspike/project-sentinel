@@ -64,6 +64,7 @@ fn bench_spawn_with_events(c: &mut Criterion) {
             orch.spawn_agent(
                 create_identity(id_counter, &format!("Agent-{id_counter}"), "Worker"),
                 create_shift(1, 6, 14),
+                "empfang",
             )
             .unwrap();
             black_box(());
@@ -82,6 +83,7 @@ fn bench_spawn_without_events(c: &mut Criterion) {
             orch.spawn_agent(
                 create_identity(id_counter, &format!("Agent-{id_counter}"), "Worker"),
                 create_shift(1, 6, 14),
+                "empfang",
             )
             .unwrap();
             black_box(());
@@ -103,6 +105,7 @@ fn bench_despawn_with_events(c: &mut Criterion) {
                 orch.spawn_agent(
                     create_identity(id, &format!("Agent-{id}"), "Worker"),
                     create_shift(1, 6, 14),
+                    "empfang",
                 )
                 .unwrap();
 
@@ -136,12 +139,14 @@ fn bench_shift_transition_15_agents(c: &mut Criterion) {
                     orch.spawn_agent(
                         create_identity(id, &format!("S1-{id}"), "Worker"),
                         create_shift(1, 6, 14),
+                        "empfang",
                     )
                     .unwrap();
                 }
                 orch.spawn_agent(
                     create_identity(46, "Betriebsrat", "Sonder"),
                     create_shift(0, 0, 23),
+                    "empfang",
                 )
                 .unwrap();
 
@@ -172,6 +177,7 @@ fn bench_save_state(c: &mut Criterion) {
             orch.spawn_agent(
                 create_identity(id, &format!("Agent-{id}"), "Worker"),
                 create_shift(1, 6, 14),
+                "empfang",
             )
             .unwrap();
         }
@@ -203,6 +209,7 @@ fn bench_restore(c: &mut Criterion) {
             orch.spawn_agent(
                 create_identity(id, &format!("Agent-{id}"), "Worker"),
                 create_shift(1, 6, 14),
+                "empfang",
             )
             .unwrap();
         }
@@ -247,12 +254,14 @@ fn bench_full_shift_cycle(c: &mut Criterion) {
                     orch.spawn_agent(
                         create_identity(id, &format!("S1-{id}"), "Worker"),
                         create_shift(1, 6, 14),
+                        "empfang",
                     )
                     .unwrap();
                 }
                 orch.spawn_agent(
                     create_identity(46, "Betriebsrat", "Sonder"),
                     create_shift(0, 0, 23),
+                    "empfang",
                 )
                 .unwrap();
 
@@ -266,6 +275,7 @@ fn bench_full_shift_cycle(c: &mut Criterion) {
                     orch.spawn_agent(
                         create_identity(id, &format!("S2-{id}"), "Worker"),
                         create_shift(2, 14, 22),
+                        "empfang",
                     )
                     .unwrap();
                 }
@@ -299,6 +309,7 @@ fn bench_pause_resume_with_events(c: &mut Criterion) {
                 orch.spawn_agent(
                     create_identity(id, &format!("Agent-{id}"), "Worker"),
                     create_shift(1, 6, 14),
+                    "empfang",
                 )
                 .unwrap();
 
@@ -326,6 +337,7 @@ fn bench_restart_cycle(c: &mut Criterion) {
             orch.spawn_agent(
                 create_identity(id, &format!("Agent-{id}"), "Worker"),
                 create_shift(1, 6, 14),
+                "empfang",
             )
             .unwrap();
         }

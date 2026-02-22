@@ -50,7 +50,7 @@ function createRoomCard(room) {
 
   const type = document.createElement('div');
   type.className = 'room-type';
-  type.textContent = room.room_type;
+  type.textContent = (room.room_type || '').toUpperCase();
   card.appendChild(type);
 
   // Belegung
@@ -73,6 +73,18 @@ function createRoomCard(room) {
     card.appendChild(agentList);
   }
 
+  // Room Physics (Temperatur, CO2, Laerm)
+  if (room.temperature != null || room.noise_db != null || room.co2_ppm != null) {
+    const physics = document.createElement('div');
+    physics.className = 'room-physics';
+    const parts = [];
+    if (room.temperature != null) parts.push(Math.round(room.temperature * 10) / 10 + ' \u00B0C');
+    if (room.co2_ppm != null) parts.push(Math.round(room.co2_ppm) + ' ppm');
+    if (room.noise_db != null) parts.push(Math.round(room.noise_db) + ' dB');
+    physics.textContent = parts.join(' | ');
+    card.appendChild(physics);
+  }
+
   // Transit
   if (room.transit_count > 0) {
     const transit = document.createElement('div');
@@ -86,7 +98,8 @@ function createRoomCard(room) {
     const chaos = document.createElement('div');
     chaos.className = 'chaos-badge';
     const chaosData = typeof room.active_chaos === 'object' ? room.active_chaos : null;
-    chaos.textContent = chaosData ? (chaosData.type || 'Chaos') : 'Chaos aktiv';
+    // Use event_type (e.g. "PhoneRing") not type (serde tag "ChaosTriggered")
+    chaos.textContent = chaosData ? (chaosData.event_type || chaosData.type || 'Chaos') : 'Chaos aktiv';
     card.appendChild(chaos);
   }
 

@@ -122,6 +122,14 @@ main { padding: 2rem; }
 .room-card .room-occupancy { margin-top: 0.5rem; font-size: 0.8rem; color: var(--text-secondary); }
 .room-card .room-occupancy.occupied { color: var(--success); }
 
+/* Room Physics */
+.room-physics {
+  margin-top: 0.4rem;
+  font-size: 0.75rem;
+  color: var(--info, #4dabf7);
+  font-family: 'JetBrains Mono', monospace;
+}
+
 /* Transit + Chaos */
 .transit-indicator {
   margin-top: 0.3rem;

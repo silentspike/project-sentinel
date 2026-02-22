@@ -2,7 +2,7 @@
 
 > **Zweck:** Vollstaendige End-to-End-Validierung aller implementierten Features gegen den Masterplan.
 > **Tool:** Playwright (Browser-Tests) + curl/SSH (Service-Tests)
-> **Target:** Deploy-VM `10.0.0.240` (Dashboard: Port 3001, Cortex: 8080/8081, Judge: 8082, Bridge: 8083, NATS: 4222)
+> **Target:** Deploy-VM `10.0.0.240` (Dashboard: Port 8000, Cortex: 8080/8081, Judge: 8082, Bridge: 8083, NATS: 4222)
 > **Erstellt:** 2026-02-21
 
 ---
@@ -30,7 +30,7 @@
 Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 
 ### T1.1 — Dashboard erreichbar [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:3001/`
+- **Aktion:** `GET http://10.0.0.240:8000/`
 - **Erwartung:** HTTP 200, Response enthaelt `<title>` mit "Project Sentinel"
 - **Fail-Kriterium:** Kein Response oder Status != 200
 
@@ -109,7 +109,7 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 ## T2: Dashboard — Navigation & Layout
 
 ### T2.1 — Seite laed komplett [P0] [PW]
-- **Aktion:** Playwright `open http://10.0.0.240:3001`, warte auf DOM ready
+- **Aktion:** Playwright `open http://10.0.0.240:8000`, warte auf DOM ready
 - **Erwartung:** Titel enthaelt "Project Sentinel", keine Console-Errors
 - **Pruefung:** `document.title`, Console-Log auf Errors pruefen
 
@@ -1237,6 +1237,212 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 
 ---
 
+## T23: Bio-Bar Ranges (Agent-Vitalwerte)
+
+### T23.1 — Bio-Felder in API vorhanden [P0] [HTTP]
+- **Aktion:** `GET /api/agents`, Response-Schema pruefen
+- **Erwartung:** Jeder Agent hat Felder: `hunger`, `energy`, `stress`, `bladder`, `social_need`, `caffeine_mg`
+- **Pruefung:** Alle 6 Bio-Felder existieren in jedem Agent-Objekt
+
+### T23.2 — Hunger Range [0.0, 1.0] [P0] [HTTP]
+- **Aktion:** Alle `hunger` Werte aus `/api/agents` extrahieren
+- **Erwartung:** Jeder Wert >= 0.0 und <= 1.0
+- **Pruefung:** `0.0 <= hunger <= 1.0` fuer jeden Agent
+
+### T23.3 — Energy Range [0.0, 1.0] [P0] [HTTP]
+- **Aktion:** Alle `energy` Werte aus `/api/agents` extrahieren
+- **Erwartung:** Jeder Wert >= 0.0 und <= 1.0
+- **Pruefung:** `0.0 <= energy <= 1.0` fuer jeden Agent
+
+### T23.4 — Stress Range [0.0, 1.0] [P0] [HTTP]
+- **Aktion:** Alle `stress` Werte aus `/api/agents` extrahieren
+- **Erwartung:** Jeder Wert >= 0.0 und <= 1.0
+- **Pruefung:** `0.0 <= stress <= 1.0` fuer jeden Agent
+
+### T23.5 — Bladder Range [0.0, 1.0] [P0] [HTTP]
+- **Aktion:** Alle `bladder` Werte aus `/api/agents` extrahieren
+- **Erwartung:** Jeder Wert >= 0.0 und <= 1.0
+- **Pruefung:** `0.0 <= bladder <= 1.0` fuer jeden Agent
+
+### T23.6 — Social Need Range [0.0, 1.0] [P0] [HTTP]
+- **Aktion:** Alle `social_need` Werte aus `/api/agents` extrahieren
+- **Erwartung:** Jeder Wert >= 0.0 und <= 1.0
+- **Pruefung:** `0.0 <= social_need <= 1.0` fuer jeden Agent
+
+### T23.7 — Caffeine Range [0.0, 1.0] [P0] [HTTP]
+- **Aktion:** Alle `caffeine_mg` Werte aus `/api/agents` extrahieren
+- **Erwartung:** Jeder Wert >= 0.0 und <= 1.0
+- **Pruefung:** `0.0 <= caffeine_mg <= 1.0` fuer jeden Agent
+
+### T23.8 — Bio-Werte numerisch (kein NaN/Infinity) [P0] [HTTP]
+- **Aktion:** Alle Bio-Felder pruefen
+- **Erwartung:** Alle Werte sind endliche Zahlen (kein NaN, kein Infinity, kein null)
+- **Pruefung:** `typeof val === 'number' && isFinite(val)` fuer alle 6 Felder
+
+### T23.9 — Mood-Feld vorhanden [P1] [HTTP]
+- **Aktion:** `mood` Feld jedes Agents pruefen
+- **Erwartung:** String oder null (z.B. "neutral", "happy", "stressed")
+- **Pruefung:** `typeof mood === 'string' || mood === null`
+
+### T23.10 — Bio-Defaults bei Spawn korrekt [P0] [HTTP]
+- **Aktion:** Agent-Detail `/api/agents/:id/state` fuer neu gespawnten Agent pruefen
+- **Erwartung:** Default-Werte: hunger=0, energy=1, stress=0, bladder=0, social_need=0, caffeine_mg=0
+- **Pruefung:** Exakte Default-Werte bei frischem Agent
+
+---
+
+## T24: Room Physics Format
+
+### T24.1 — Physics-Felder in API vorhanden [P0] [HTTP]
+- **Aktion:** `GET /api/rooms`, Response-Schema pruefen
+- **Erwartung:** Jeder Raum hat Felder: `temperature`, `co2_ppm`, `noise_db`
+- **Pruefung:** Alle 3 Physics-Felder existieren (Wert oder null)
+
+### T24.2 — Temperatur plausibel [P0] [HTTP]
+- **Aktion:** Alle `temperature` Werte aus `/api/rooms` extrahieren (nicht-null)
+- **Erwartung:** Bereich 15.0-35.0 Grad Celsius (Buero-Range)
+- **Pruefung:** `15.0 <= temperature <= 35.0` fuer jeden Raum mit Wert
+
+### T24.3 — Noise dB plausibel [P0] [HTTP]
+- **Aktion:** Alle `noise_db` Werte aus `/api/rooms` extrahieren (nicht-null)
+- **Erwartung:** Bereich 20.0-90.0 dB (Buero-Pegel: Fluestern bis lauter Grossraum)
+- **Pruefung:** `20.0 <= noise_db <= 90.0` fuer jeden Raum mit Wert
+
+### T24.4 — CO2 ppm plausibel [P0] [HTTP]
+- **Aktion:** Alle `co2_ppm` Werte aus `/api/rooms` extrahieren (nicht-null)
+- **Erwartung:** Bereich 350-3000 ppm (Aussenluft bis schlechte Raumluft)
+- **Pruefung:** `350 <= co2_ppm <= 3000` fuer jeden Raum mit Wert
+
+### T24.5 — Physics-Werte numerisch [P0] [HTTP]
+- **Aktion:** Alle nicht-null Physics-Werte pruefen
+- **Erwartung:** Endliche Zahlen (kein NaN/Infinity)
+- **Pruefung:** `typeof val === 'number' && isFinite(val)`
+
+### T24.6 — Besetzte Raeume haben Physics-Werte [P1] [HTTP]
+- **Aktion:** Raeume mit `occupant_count > 0` pruefen
+- **Erwartung:** temperature, co2_ppm, noise_db sind nicht-null
+- **Pruefung:** Alle 3 Werte vorhanden bei besetzten Raeumen
+
+### T24.7 — CO2 steigt mit Belegung [P1] [HTTP]
+- **Aktion:** co2_ppm von leeren vs. belegten Raeumen vergleichen
+- **Erwartung:** Belegte Raeume tendieren zu hoeherem CO2
+- **Pruefung:** Durchschnitt(belegt) >= Durchschnitt(leer) (wenn Daten vorhanden)
+
+### T24.8 — Noise steigt mit Belegung [P1] [HTTP]
+- **Aktion:** noise_db von leeren vs. belegten Raeumen vergleichen
+- **Erwartung:** Belegte Raeume tendieren zu hoeherer Lautstaerke
+- **Pruefung:** Durchschnitt(belegt) >= Durchschnitt(leer) (wenn Daten vorhanden)
+
+---
+
+## T25: Chaos-Event-Typen (spezifisch statt generisch)
+
+### T25.1 — 8 Chaos-Typen definiert [P0] [HTTP]
+- **Aktion:** `GET /api/chaos?limit=1000`, alle `chaos_type` Werte sammeln
+- **Erwartung:** Nur Werte aus dem Set: PhoneRing, PrinterBroken, PackageDelivery, SBahnDelay, FireAlarmDrill, CakeInKitchen, AirConBroken, InternetOutage
+- **Pruefung:** `chaos_type in VALID_TYPES` fuer jeden Event
+
+### T25.2 — Kein generisches "ChaosTriggered" [P0] [HTTP]
+- **Aktion:** Alle `chaos_type` Werte pruefen
+- **Erwartung:** KEIN Event hat `chaos_type === "ChaosTriggered"` oder `chaos_type === "chaos_triggered"`
+- **Pruefung:** Kein einziger generischer Typ in der Response
+
+### T25.3 — Kein "unknown" Chaos-Typ [P0] [HTTP]
+- **Aktion:** Alle `chaos_type` Werte pruefen
+- **Erwartung:** KEIN Event hat `chaos_type === "unknown"`
+- **Pruefung:** Payload-Parsing funktioniert korrekt
+
+### T25.4 — Chaos-Events haben Pflichtfelder [P0] [HTTP]
+- **Aktion:** Jedes Chaos-Event-Objekt pruefen
+- **Erwartung:** Felder `id`, `event_id`, `chaos_type`, `room_id`, `description`, `tick`, `timestamp_ms` vorhanden
+- **Pruefung:** Alle 7 Pflichtfelder existieren
+
+### T25.5 — Chaos room_id ist valider Raum [P0] [HTTP]
+- **Aktion:** `room_id` jedes Chaos-Events gegen `/api/rooms` Liste pruefen
+- **Erwartung:** Jede room_id existiert in der Room-Liste (oder ist null)
+- **Pruefung:** Cross-Referenz Rooms ↔ Chaos Events
+
+### T25.6 — Chaos tick monoton steigend [P1] [HTTP]
+- **Aktion:** Events nach ID sortiert, Tick-Werte pruefen
+- **Erwartung:** Spaetere Events haben >= Tick (monoton)
+- **Pruefung:** `events[i].tick <= events[i+1].tick` fuer benachbarte Events
+
+### T25.7 — Chaos description nicht leer [P0] [HTTP]
+- **Aktion:** `description` Feld jedes Events pruefen
+- **Erwartung:** Nicht-leerer String mit deutschem Beschreibungstext
+- **Pruefung:** `description.length > 0`
+
+### T25.8 — Chaos timestamp_ms plausibel [P1] [HTTP]
+- **Aktion:** `timestamp_ms` Werte pruefen
+- **Erwartung:** Alle Timestamps > 0 und <= aktuelle Zeit
+- **Pruefung:** `0 < timestamp_ms <= Date.now()`
+
+---
+
+## T26: Cockpit Incidents Lifecycle
+
+### T26.1 — Incident Status-Werte gueltig [P0] [HTTP]
+- **Aktion:** `GET /api/cockpit`, alle `incidents[].status` pruefen
+- **Erwartung:** Nur Werte aus: "active", "resolved", "pending", "failed"
+- **Pruefung:** `status in VALID_STATUSES`
+
+### T26.2 — Incident Severity-Werte gueltig [P0] [HTTP]
+- **Aktion:** Alle `incidents[].severity` pruefen
+- **Erwartung:** Nur Werte aus: "critical", "high", "medium", "low"
+- **Pruefung:** `severity in VALID_SEVERITIES`
+
+### T26.3 — Aktive Incidents Count stimmt [P0] [HTTP]
+- **Aktion:** `total_active` mit tatsaechlicher Anzahl status=active vergleichen
+- **Erwartung:** `total_active === incidents.filter(i => i.status === 'active').length`
+- **Pruefung:** Konsistenz-Check
+
+### T26.4 — Resolved Count plausibel [P0] [HTTP]
+- **Aktion:** `total_resolved_24h` pruefen
+- **Erwartung:** Numerisch >= 0
+- **Pruefung:** `total_resolved_24h >= 0`
+
+### T26.5 — Incident hat Pflichtfelder [P0] [HTTP]
+- **Aktion:** Jedes Incident-Objekt inspizieren
+- **Erwartung:** Felder `id`, `source`, `incident_type`, `severity`, `status`, `summary`, `tick`, `timestamp_ms`, `actions`, `outcome` vorhanden
+- **Pruefung:** Alle 10 Pflichtfelder existieren
+
+### T26.6 — Incident Source gueltig [P0] [HTTP]
+- **Aktion:** Alle `incidents[].source` pruefen
+- **Erwartung:** Nur "event" oder "evolution"
+- **Pruefung:** `source in ["event", "evolution"]`
+
+### T26.7 — Incident Actions Array [P0] [HTTP]
+- **Aktion:** Alle `incidents[].actions` pruefen
+- **Erwartung:** Array (kann leer sein), jede Action hat `event_id`, `event_type`, `agent_id`, `summary`, `tick`
+- **Pruefung:** Schema-Validierung der Action-Objekte
+
+### T26.8 — Incident Auto-Resolve nach 30 Minuten [P1] [HTTP]
+- **Aktion:** Incidents mit `outcome === "Automatisch abgeschlossen"` finden
+- **Erwartung:** Diese Incidents haben status "resolved" und sind > 30min alt
+- **Pruefung:** Auto-Resolve-Logik funktioniert korrekt
+
+### T26.9 — SLO Violations Schema [P0] [HTTP]
+- **Aktion:** `slo_violations` Array pruefen
+- **Erwartung:** Jedes SLO hat `name`, `current_value`, `threshold`, `severity`, `description`
+- **Pruefung:** Alle 5 Felder vorhanden
+
+### T26.10 — SLO Threshold-Werte korrekt [P0] [HTTP]
+- **Aktion:** Bekannte SLO-Thresholds pruefen
+- **Erwartung:** Projection Lag=100, Chaos-Frequenz=3, Despawn-Rate=2, Nightrun Failure=10
+- **Pruefung:** Threshold-Werte matchen Konfiguration
+
+### T26.11 — Incident-Detail via ID abrufbar [P0] [HTTP]
+- **Aktion:** Erste Incident-ID nehmen, `GET /api/cockpit/incident/:id`
+- **Erwartung:** Gleiches Incident-Objekt mit vollstaendigen Daten
+- **Pruefung:** Response-Schema identisch, alle Felder vorhanden
+
+### T26.12 — Cockpit hours-Parameter filtert korrekt [P1] [HTTP]
+- **Aktion:** `/api/cockpit?hours=1` vs `/api/cockpit?hours=168`
+- **Erwartung:** hours=1 liefert weniger oder gleich viele Incidents wie hours=168
+- **Pruefung:** `count(hours=1) <= count(hours=168)`
+
+---
+
 ## Zusammenfassung
 
 | Kategorie | Anzahl Tests | P0 | P1 | P2 |
@@ -1267,7 +1473,11 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 | T20b: Outbox Drain | 4 | 4 | 0 | 0 |
 | T21: E2E Flow | 5 | 4 | 1 | 0 |
 | T22: Security | 5 | 3 | 2 | 0 |
-| **TOTAL** | **218** | **155** | **75** | **2** |
+| T23: Bio-Bar Ranges | 10 | 8 | 2 | 0 |
+| T24: Room Physics Format | 8 | 5 | 3 | 0 |
+| T25: Chaos-Event-Typen | 8 | 6 | 2 | 0 |
+| T26: Cockpit Incidents Lifecycle | 12 | 9 | 3 | 0 |
+| **TOTAL** | **256** | **183** | **85** | **2** |
 
 ### Ausfuehrungsreihenfolge
 1. **T1** (Health) — Gate: Wenn ein T1-Test failt, ALLE anderen Tests abbrechen
@@ -1275,18 +1485,22 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 3. **T14** (Daemon) — Kern-Service laeuft
 4. **T12** (NATS) — Message-Bus funktioniert
 5. **T8** (API) — Dashboard-Backend erreichbar
-6. **T2-T7, T9-T10** (Dashboard UI) — Frontend-Tests
-7. **T11** (Cortex) — LLM-Pipeline
-8. **T13** (Judge) — Quality-Service
-9. **T15** (Manifest) — Deployment-Artefakte
-10. **T17-T18** (Docs/CI) — Governance
-11. **T19** (FS) — Artifact Plane
-12. **T20** (Nightrun) — Memory Consolidation
-13. **T21** (E2E Flow) — Integration
-14. **T22** (Security) — Haertung
+6. **T23** (Bio-Bar) — Agent-Vitalwerte validieren
+7. **T24** (Room Physics) — Raum-Physik-Werte validieren
+8. **T25** (Chaos-Typen) — Spezifische Chaos-Typen pruefen
+9. **T2-T7, T9-T10** (Dashboard UI) — Frontend-Tests
+10. **T26** (Cockpit Lifecycle) — Incident-Lifecycle validieren
+11. **T11** (Cortex) — LLM-Pipeline
+12. **T13** (Judge) — Quality-Service
+13. **T15** (Manifest) — Deployment-Artefakte
+14. **T17-T18** (Docs/CI) — Governance
+15. **T19** (FS) — Artifact Plane
+16. **T20** (Nightrun) — Memory Consolidation
+17. **T21** (E2E Flow) — Integration
+18. **T22** (Security) — Haertung
 
 ### Exit-Kriterien fuer Release
-- **MUST:** Alle P0 Tests bestanden (130 Tests)
-- **SHOULD:** Alle P1 Tests bestanden (69 Tests)
+- **MUST:** Alle P0 Tests bestanden (183 Tests)
+- **SHOULD:** Alle P1 Tests bestanden (85 Tests)
 - **MAY:** P2 Tests koennen nachgereicht werden (2 Tests)
 - **Release-Blocker:** Jeder P0-Fail stoppt das Release

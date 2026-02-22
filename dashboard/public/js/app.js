@@ -48,7 +48,7 @@ function connectWebSocket() {
       const data = JSON.parse(event.data);
       if (data.type === 'agent_update') {
         updateAgents(data.agents);
-        updateActivity(data.agents);
+        updateActivity();
       } else if (data.type === 'room_update') {
         renderFloorplan(data.rooms);
       } else if (data.type === 'health_update') {
@@ -57,6 +57,8 @@ function connectWebSocket() {
         updateCockpit();
       } else if (data.type === 'chaos_update') {
         updateChaos();
+      } else if (data.type === 'activity_update') {
+        updateActivity();
       }
     } catch { /* ignore parse errors */ }
   };
@@ -95,7 +97,7 @@ async function init() {
     renderAgents(agents);
     renderFloorplan(rooms);
     renderMetrics(metrics);
-    renderActivity(agents);
+    renderActivity();
     renderCockpit(cockpit);
     renderChaos(chaos);
 

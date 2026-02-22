@@ -24,6 +24,9 @@ function toResponse(row: RoomRow, occupants: string[]): RoomResponse {
     occupant_count: row.occupant_count,
     transit_count: row.transit_count,
     active_chaos: chaos,
+    temperature: row.temperature,
+    co2_ppm: row.co2_ppm,
+    noise_db: row.noise_db,
     last_event_tick: row.last_event_tick,
     occupants,
   };

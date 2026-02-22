@@ -97,7 +97,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
     // -- Channels fuer ECS <-> Async Bridge --
     let (action_tx, action_rx) = mpsc::channel();
-    let (perception_tx, _perception_rx) = mpsc::sync_channel::<Perception>(64);
+    let (perception_tx, perception_rx) = mpsc::sync_channel::<Perception>(64);
 
     // -- Shutdown Flag --
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -133,6 +133,30 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             )
         })
         .context("ECS Thread spawnen")?;
+
+    // -- LLM Bridge starten (Perception → Cortex Gateway → Action) --
+    #[cfg(feature = "llm")]
+    let _llm_bridge_handle = {
+        let bridge_config = crate::llm_bridge::bridge::LlmBridgeConfig {
+            gateway_url: std::env::var("CORTEX_GATEWAY_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".to_string()),
+            ..Default::default()
+        };
+        let bridge_telemetry =
+            std::sync::Arc::new(crate::llm_bridge::bridge::BridgeTelemetry::default());
+        let bridge_action_tx = action_tx.clone();
+        let bridge_telem = std::sync::Arc::clone(&bridge_telemetry);
+        info!(
+            gateway_url = %bridge_config.gateway_url,
+            "LLM Bridge wird gestartet"
+        );
+        tokio::spawn(crate::llm_bridge::bridge::run_llm_bridge(
+            bridge_config,
+            perception_rx,
+            bridge_action_tx,
+            bridge_telem,
+        ))
+    };
 
     info!(
         tick_rate_ms = config.tick_rate_ms,
@@ -206,6 +230,7 @@ fn ecs_tick_loop(
 
         // SimulationTime aktualisieren
         if let Some(mut time) = world.get_resource_mut::<SimulationTime>() {
+            time.tick = sentinel_common::Tick(tick_count);
             time.tick_count = tick_count;
             time.delta_seconds = tick_rate.as_secs_f32();
         }

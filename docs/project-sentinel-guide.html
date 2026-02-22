@@ -455,6 +455,26 @@ kbd {
   color: var(--text-primary);
 }
 
+/* ---- SCREENSHOTS ---- */
+.screenshot {
+  margin: 1.2rem 0;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-light);
+  overflow: hidden;
+  box-shadow: var(--shadow-lg);
+}
+.screenshot img {
+  width: 100%;
+  display: block;
+}
+.screenshot-caption {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  padding: 0.5rem 0.8rem;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+}
+
 /* ---- RESPONSIVE ---- */
 @media (max-width: 900px) {
   .sidebar { display: none; }
@@ -491,8 +511,9 @@ kbd {
     <a href="#realtime"><span class="nav-num">10</span> Echtzeit-Updates</a>
     <a href="#shifts"><span class="nav-num">11</span> Schichtbetrieb</a>
     <a href="#system-status"><span class="nav-num">12</span> Systemstatus</a>
-    <a href="#troubleshooting"><span class="nav-num">13</span> Fehlerbehebung</a>
-    <a href="#glossary"><span class="nav-num">14</span> Glossar</a>
+    <a href="#api"><span class="nav-num">13</span> API-Referenz</a>
+    <a href="#troubleshooting"><span class="nav-num">14</span> Fehlerbehebung</a>
+    <a href="#glossary"><span class="nav-num">15</span> Glossar</a>
   </div>
 </nav>
 
@@ -576,12 +597,12 @@ kbd {
   <h3>Dashboard oeffnen</h3>
   <p>
     Oeffnen Sie das Dashboard im Browser unter der URL des Sentinel-Servers
-    auf Port <code>3001</code>:
+    auf Port <code>8000</code>:
   </p>
 
   <div class="card">
     <div class="card-title">Dashboard-URL</div>
-    <p><code>http://&lt;server-ip&gt;:3001</code></p>
+    <p><code>http://&lt;server-ip&gt;:8000</code></p>
   </div>
 
   <h3>Oberflaeche im Ueberblick</h3>
@@ -633,8 +654,10 @@ kbd {
   <h2><span class="section-num">03</span> Agents</h2>
 
   <p>
-    Die Agents-View zeigt alle 54 KI-Agenten als Karten in einem responsiven Grid.
-    Jede Agent-Karte enthaelt die wichtigsten Informationen auf einen Blick.
+    Die Agents-View zeigt alle KI-Agenten der aktiven Schicht als Karten in einem
+    responsiven Grid. Waehrend der Fruehschicht sehen Sie z.B. 15 Agenten (Set 1)
+    plus die 9 Sonder-Agenten (Set 0) — insgesamt bis zu 24 Karten gleichzeitig.
+    Jede Karte zeigt Status, Rolle, Position, letzte Aktion und biologische Zustaende.
   </p>
 
   <h3>Agent-Karte</h3>
@@ -750,16 +773,21 @@ kbd {
     Agenten sich wo befinden.
   </p>
 
+  <div class="screenshot">
+    <img src="screenshots/e2e-02-bueroplan.png" alt="Bueroplan mit 15 Raeumen auf 3 Etagen">
+    <div class="screenshot-caption">Bueroplan: 15 Raeume auf 3 Ebenen mit Typ, Kapazitaet und Agent-Tags</div>
+  </div>
+
   <h3>Etagen-Aufteilung</h3>
 
   <div class="grid-2">
     <div class="card">
       <div class="card-title">Erdgeschoss (EG)</div>
-      <p>Eingang, Kueche, Toiletten, Konferenzraeume und allgemeine Bereiche.</p>
+      <p>Entwicklungsbueros, Empfang, Kueche/Pausenraum, Meetingraeume, Toiletten und Flur.</p>
     </div>
     <div class="card">
       <div class="card-title">Obergeschoss (OG)</div>
-      <p>Bueros (Dev, Design, Management), Pausenraum und weitere Arbeitsraeume.</p>
+      <p>Geschaeftsfuehrung, Designbueros, Meetingraeume (Tesla, Edison), Flur und Toiletten.</p>
     </div>
   </div>
 
@@ -788,8 +816,11 @@ kbd {
 
   <p>
     Die Aktivitaets-View zeigt einen chronologischen Feed der letzten
-    Agent-Aktionen und Raum-Transitionen. Die neuesten Eintraege stehen
-    oben.
+    Agent-Aktionen und Raum-Transitionen. Wenn Thomas Mueller vom
+    Buero in die Kueche geht, erscheint ein Transit-Eintrag. Wenn Lisa
+    Schmidt an einem Design arbeitet, erscheint ein Aktions-Eintrag.
+    Die neuesten Eintraege stehen oben — maximal 200, sortiert nach
+    Simulations-Tick.
   </p>
 
   <h3>Eintragstypen</h3>
@@ -814,7 +845,7 @@ kbd {
 
   <p>
     Jeder Eintrag zeigt den Agent-Namen (violett hervorgehoben) und eine
-    Beschreibung der Aktivitaet. Es werden maximal 50 Eintraege angezeigt,
+    Beschreibung der Aktivitaet. Es werden maximal 200 Eintraege angezeigt,
     sortiert nach Simulation-Tick (neueste zuerst).
   </p>
 </div>
@@ -831,6 +862,11 @@ kbd {
     Chaos Events sind zufaellige oder geplante Vorfaelle, die den
     normalen Buero-Ablauf unterbrechen.
   </p>
+
+  <div class="screenshot">
+    <img src="screenshots/e2e-04-chaos.png" alt="Chaos Event Feed mit Live-Events">
+    <div class="screenshot-caption">Chaos Feed: Scrollbare Liste mit Typ-Badge, Raum, Beschreibung und Zeitstempel</div>
+  </div>
 
   <h3>Anzeige-Elemente</h3>
   <ul>
@@ -892,8 +928,10 @@ kbd {
 
   <p>
     Der Chat Log zeigt alle Agent-Aktionsnachrichten in chronologischer
-    Reihenfolge. Sie koennen nach Raum filtern um nur Nachrichten
-    aus einem bestimmten Bereich zu sehen.
+    Reihenfolge. Wenn Agenten sprechen, arbeiten oder mit Kolleginnen
+    interagieren, erscheinen ihre Nachrichten hier in Echtzeit.
+    Sie koennen nach Raum filtern um z.B. nur Gespraeche in der Kueche
+    oder im Meetingraum zu verfolgen.
   </p>
 
   <h3>Raum-Filter</h3>
@@ -939,9 +977,14 @@ kbd {
   <h2><span class="section-num">08</span> Metriken</h2>
 
   <p>
-    Die Metriken-View zeigt 8 System-Kennzahlen als grosse Karten
+    Die Metriken-View zeigt 12 System-Kennzahlen als grosse Karten
     in einem Grid-Layout. Die Werte werden beim Laden der Seite aktualisiert.
   </p>
+
+  <div class="screenshot">
+    <img src="screenshots/e2e-06-metriken.png" alt="12 Metrik-Karten im Grid">
+    <div class="screenshot-caption">Metriken: 12 Kennzahlen-Karten mit Echtzeit-Werten</div>
+  </div>
 
   <h3>Verfuegbare Metriken</h3>
 
@@ -990,6 +1033,26 @@ kbd {
         <td>Aktuelle Event-Rate pro Minute (Durchschnitt der letzten 5 Minuten)</td>
         <td>42</td>
       </tr>
+      <tr>
+        <td><strong>Nightrun OK</strong></td>
+        <td>Anzahl erfolgreich konsolidierter Agents im letzten Nightrun</td>
+        <td>45</td>
+      </tr>
+      <tr>
+        <td><strong>Nightrun Fail</strong></td>
+        <td>Anzahl fehlgeschlagener Konsolidierungen im letzten Nightrun</td>
+        <td>0</td>
+      </tr>
+      <tr>
+        <td><strong>Drift-Alerts</strong></td>
+        <td>Persoenlichkeits-Drift-Warnungen (Judge-Analyse)</td>
+        <td>3</td>
+      </tr>
+      <tr>
+        <td><strong>Fatigue-Alerts</strong></td>
+        <td>Ermuedungs-Spitzen-Warnungen (Judge-Analyse)</td>
+        <td>1</td>
+      </tr>
     </tbody>
   </table>
 
@@ -1011,6 +1074,11 @@ kbd {
     Das Cockpit ist die Leitstand-Ansicht fuer den Operator. Es zeigt
     priorisierte Incidents, deren Aktionen und SLO-Verletzungen auf einen Blick.
   </p>
+
+  <div class="screenshot">
+    <img src="screenshots/e2e-07b-cockpit-top.png" alt="Cockpit mit SLO-Leiste und Incident-Liste">
+    <div class="screenshot-caption">Cockpit: SLO-Leiste (Chaos-Schwelle ueberschritten), 200 aktive Incidents mit Schweregrad und Status</div>
+  </div>
 
   <h3>SLO-Statusleiste</h3>
   <p>
@@ -1252,11 +1320,125 @@ kbd {
 </div>
 
 <!-- ============================================
-     13 - FEHLERBEHEBUNG
+     13 - API-REFERENZ
+     ============================================ -->
+<span class="section-anchor" id="api"></span>
+<div class="section">
+  <h2><span class="section-num">13</span> API-Referenz</h2>
+  <p>
+    Das Dashboard stellt eine REST API bereit, die auch programmatisch
+    abgefragt werden kann. Alle Endpunkte sind unter <code>/api/</code> erreichbar.
+  </p>
+
+  <h3>Agent-Endpunkte</h3>
+  <table>
+    <thead>
+      <tr><th>Methode</th><th>Pfad</th><th>Beschreibung</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>GET</code></td><td><code>/api/agents</code></td><td>Alle aktiven Agenten mit Status, Raum und Bio-State</td></tr>
+      <tr><td><code>GET</code></td><td><code>/api/agents/:id/state</code></td><td>Einzelnen Agenten nach ID oder Name-Slug abfragen</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Raum-Endpunkte</h3>
+  <table>
+    <thead>
+      <tr><th>Methode</th><th>Pfad</th><th>Beschreibung</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>GET</code></td><td><code>/api/rooms</code></td><td>Alle Raeume mit Belegung, Temperatur, CO2, Laerm</td></tr>
+      <tr><td><code>GET</code></td><td><code>/api/rooms/:id</code></td><td>Einzelnen Raum nach Room-ID abfragen</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Event-Endpunkte</h3>
+  <table>
+    <thead>
+      <tr><th>Methode</th><th>Pfad</th><th>Parameter</th><th>Beschreibung</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>GET</code></td><td><code>/api/activity</code></td><td><code>?limit=200</code></td><td>Aktivitaets-Feed (Spawns, Transits, Chaos, Konsolidierung)</td></tr>
+      <tr><td><code>GET</code></td><td><code>/api/chaos</code></td><td><code>?limit=100</code> (max 500)</td><td>Chaos-Events (alle Raeume)</td></tr>
+      <tr><td><code>GET</code></td><td><code>/api/chaos/:room</code></td><td><code>?limit=50</code> (max 200)</td><td>Chaos-Events fuer einen bestimmten Raum</td></tr>
+      <tr><td><code>GET</code></td><td><code>/api/chat</code></td><td><code>?limit=100</code> (max 500)</td><td>Chat-Nachrichten (alle Raeume)</td></tr>
+      <tr><td><code>GET</code></td><td><code>/api/chat/:room</code></td><td><code>?limit=50</code> (max 200)</td><td>Chat-Nachrichten fuer einen bestimmten Raum</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Monitoring-Endpunkte</h3>
+  <table>
+    <thead>
+      <tr><th>Methode</th><th>Pfad</th><th>Parameter</th><th>Beschreibung</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>GET</code></td><td><code>/api/metrics</code></td><td>-</td><td>KPI-Metriken (Aktionen, Transits, Chaos, Uptime, Evolution Alerts)</td></tr>
+      <tr><td><code>GET</code></td><td><code>/api/health</code></td><td>-</td><td>Health Check mit Projection Lag und Uptime</td></tr>
+      <tr><td><code>GET</code></td><td><code>/api/cockpit</code></td><td><code>?hours=24&amp;limit=200</code></td><td>Incidents mit SLO-Verletzungen, sortiert nach Schweregrad</td></tr>
+      <tr><td><code>GET</code></td><td><code>/api/cockpit/incident/:id</code></td><td>-</td><td>Einzelnes Incident mit Aktionen und Outcome</td></tr>
+    </tbody>
+  </table>
+
+  <h3>WebSocket-Protokoll</h3>
+  <p>
+    Verbindung ueber <code>ws://&lt;host&gt;:8000/ws</code>.
+    Der Server sendet JSON-Nachrichten bei Zustandsaenderungen:
+  </p>
+  <table>
+    <thead>
+      <tr><th>Typ</th><th>Payload</th><th>Ausloeser</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>agent_update</code></td><td>Vollstaendige Agenten-Liste</td><td>Agent-Status geaendert</td></tr>
+      <tr><td><code>room_update</code></td><td>Vollstaendige Raum-Liste</td><td>Belegung/Chaos/Physik geaendert</td></tr>
+      <tr><td><code>cockpit_update</code></td><td>Signal (Client fetcht neu)</td><td>Neues Incident oder Alert</td></tr>
+      <tr><td><code>chaos_update</code></td><td>Signal (Client fetcht neu)</td><td>Neues Chaos-Event</td></tr>
+      <tr><td><code>activity_update</code></td><td>Signal (Client fetcht neu)</td><td>Neues Aktivitaets-Event</td></tr>
+      <tr><td><code>health_update</code></td><td>Lag + Uptime</td><td>Alle 5 Sekunden</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Die Verbindung wird automatisch nach 3 Sekunden wiederhergestellt.
+    Das Dashboard ist read-only &mdash; Client-Nachrichten werden ignoriert.
+  </p>
+
+  <h3>Cortex Gateway API</h3>
+  <p>
+    Der Cortex Gateway (Port 8080) stellt die LLM-Bridge bereit:
+  </p>
+  <table>
+    <thead>
+      <tr><th>Methode</th><th>Pfad</th><th>Beschreibung</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>POST</code></td><td><code>/v1/chat/completions</code></td><td>LLM-Request (OpenAI-kompatibel)</td></tr>
+      <tr><td><code>GET</code></td><td><code>/health</code></td><td>Provider Health Check</td></tr>
+      <tr><td><code>GET</code></td><td><code>/ready</code></td><td>Readiness Check</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Die Control Plane (Port 8081) bietet Konfigurations-Endpunkte:
+  </p>
+  <table>
+    <thead>
+      <tr><th>Methode</th><th>Pfad</th><th>Beschreibung</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>GET</code></td><td><code>/config</code></td><td>Aktuelle Gateway-Konfiguration</td></tr>
+      <tr><td><code>PATCH</code></td><td><code>/config</code></td><td>Konfiguration aendern (Provider-Switch etc.)</td></tr>
+      <tr><td><code>POST</code></td><td><code>/observatory/runs</code></td><td>MARBLE Benchmark-Run einsenden</td></tr>
+      <tr><td><code>GET</code></td><td><code>/observatory/runs</code></td><td>Alle Benchmark-Runs auflisten</td></tr>
+      <tr><td><code>GET</code></td><td><code>/observatory/report</code></td><td>MARBLE Vergleichsreport (JSON/Markdown)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================
+     14 - FEHLERBEHEBUNG
      ============================================ -->
 <span class="section-anchor" id="troubleshooting"></span>
 <div class="section">
-  <h2><span class="section-num">13</span> Fehlerbehebung</h2>
+  <h2><span class="section-num">14</span> Fehlerbehebung</h2>
 
   <h3>Haeufige Probleme</h3>
 
@@ -1281,7 +1463,7 @@ kbd {
       <li>Dashboard-Service ist gestoppt</li>
       <li>Proxy blockiert WebSocket-Upgrades</li>
     </ul>
-    <p><strong>Loesung:</strong> Pruefen Sie ob der Server unter Port 3001 erreichbar ist.
+    <p><strong>Loesung:</strong> Pruefen Sie ob der Server unter Port 8000 erreichbar ist.
     Das Dashboard versucht automatisch alle 3 Sekunden die Verbindung wiederherzustellen.</p>
   </div>
 
@@ -1306,14 +1488,38 @@ kbd {
     sind die Metriken initial bei 0. Die Werte steigen, sobald Agenten spawnen und
     Aktionen ausfuehren. Pruefen Sie ob der Daemon laeuft.</p>
   </div>
+
+  <div class="card">
+    <div class="card-title">LLM-Provider antwortet nicht (502 Gateway)</div>
+    <p><strong>Moegliche Ursachen:</strong></p>
+    <ul>
+      <li>Cortex Gateway ist gestoppt (<code>systemctl status sentinel-cortex</code>)</li>
+      <li>Claude Code Subprocess ist nicht verfuegbar (<code>claude --version</code>)</li>
+      <li>Auth-Token abgelaufen (erneut <code>claude</code> starten und OAuth-Login durchfuehren)</li>
+    </ul>
+    <p><strong>Loesung:</strong> Gateway-Logs pruefen mit
+    <code>journalctl -u sentinel-cortex -f</code>. Bei Auth-Problemen:
+    <code>claude</code> interaktiv starten und neu einloggen.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Agenten sind idle (keine Aktionen)</div>
+    <p><strong>Erklaerung:</strong> Agenten fuehren nur Aktionen aus wenn die LLM Bridge
+    funktioniert. Pruefen Sie:</p>
+    <ul>
+      <li>Gateway erreichbar: <code>curl http://localhost:8080/health</code></li>
+      <li>Provider registriert: <code>curl http://localhost:8081/config</code></li>
+      <li>Daemon laeuft: <code>systemctl status sentinel-daemon</code></li>
+    </ul>
+  </div>
 </div>
 
 <!-- ============================================
-     14 - GLOSSAR
+     15 - GLOSSAR
      ============================================ -->
 <span class="section-anchor" id="glossary"></span>
 <div class="section">
-  <h2><span class="section-num">14</span> Glossar</h2>
+  <h2><span class="section-num">15</span> Glossar</h2>
 
   <table>
     <thead>
