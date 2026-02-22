@@ -21,6 +21,9 @@ linters:
       min-complexity: 20
     gosec:
       severity: medium
+    misspell:
+      ignore-words:
+        - tust
 
 issues:
   max-issues-per-linter: 50

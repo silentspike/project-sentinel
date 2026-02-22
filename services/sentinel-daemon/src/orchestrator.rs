@@ -15,13 +15,14 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use sentinel_common::agent_config::load_all_agents;
+use sentinel_common::agent_config::{AgentConfig, load_all_agents};
+use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::{AgentId, Perception};
 use sentinel_ecs::{
-    attach_redb_store, create_simulation_world, spawn_agent, ActionReceiver, LimboEventStore,
-    PerceptionSender, SimulationTime,
+    attach_redb_store, create_simulation_world, despawn_agent_from_world, spawn_agent,
+    ActionReceiver, EventBuffer, LimboEventStore, PerceptionSender, SimulationTime,
 };
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
@@ -34,12 +35,58 @@ use crate::controlplane::ControlplaneKernel;
 use crate::shift::{agents_for_shift, detect_current_shift};
 use crate::signal::wait_for_shutdown;
 
+/// Mapping von shift_set auf (start_hour, end_hour).
+fn shift_hours(shift_set: u8) -> (u8, u8) {
+    match shift_set {
+        1 => (6, 14),  // Fruehschicht
+        2 => (14, 22), // Mittelschicht
+        3 => (22, 6),  // Spaetschicht
+        0 => (0, 0),   // Sonder (24/7)
+        _ => (6, 14),  // Fallback
+    }
+}
+
+/// Spawnt einen Agenten sowohl im RuntimeOrchestrator als auch in der ECS World.
+/// Gibt `true` zurueck wenn erfolgreich.
+fn spawn_agent_full(
+    runtime_orch: &mut RuntimeOrchestrator,
+    world: &mut bevy_ecs::prelude::World,
+    agent_cfg: &AgentConfig,
+) -> bool {
+    let agent_id = AgentId(agent_cfg.identity.id);
+    let identity = AgentIdentity {
+        agent_id,
+        name: agent_cfg.identity.name.clone(),
+        role: agent_cfg.identity.role.clone(),
+    };
+    let (start, end) = shift_hours(agent_cfg.identity.shift_set);
+    let shift = ShiftInfo {
+        shift_set: agent_cfg.identity.shift_set,
+        shift_start_hour: start,
+        shift_end_hour: end,
+        is_on_duty: true,
+    };
+    if let Err(e) = runtime_orch.spawn_agent(identity, shift, "empfang") {
+        warn!(agent_id = agent_cfg.identity.id, error = %e, "Agent-Spawn fehlgeschlagen");
+        return false;
+    }
+    spawn_agent(
+        world,
+        agent_id,
+        &agent_cfg.identity.name,
+        &agent_cfg.identity.role,
+        agent_cfg.identity.shift_set,
+    );
+    true
+}
+
 /// Startet den Daemon-Hauptloop.
 ///
 /// 1. Oeffnet EventStore + StateStore
-/// 2. Spawnt ECS Tick-Loop auf dediziertem Thread
-/// 3. Wartet auf Shutdown-Signal
-/// 4. Setzt AtomicBool, joined ECS-Thread
+/// 2. RuntimeOrchestrator: Restore aus Snapshot oder frisch
+/// 3. Spawnt ECS Tick-Loop auf dediziertem Thread (mit Orchestrator)
+/// 4. Wartet auf Shutdown-Signal
+/// 5. ECS-Thread speichert State-Snapshot vor Beendigung
 pub async fn run(config: DaemonConfig) -> Result<()> {
     // -- Datenbanken oeffnen (sync) --
     let data_dir = &config.data_dir;
@@ -66,7 +113,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         "Agent-Definitionen geladen"
     );
 
-    // -- Schicht erkennen + filtern --
+    // -- Schicht erkennen --
     let current_shift = detect_current_shift();
     let shift_agents = agents_for_shift(&all_agents, current_shift);
     info!(
@@ -75,9 +122,22 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         "Schicht erkannt"
     );
 
-    // -- Runtime Orchestrator --
+    // -- Runtime Orchestrator (Restore oder Neu) --
     let runtime_orch =
-        RuntimeOrchestrator::new(config.max_agents).with_event_store(Arc::clone(&event_store));
+        match RuntimeOrchestrator::restore(Arc::clone(&event_store), config.max_agents) {
+            Ok(restored) => {
+                info!(
+                    agent_count = restored.agent_count(),
+                    "Runtime State aus Snapshot wiederhergestellt"
+                );
+                restored
+            }
+            Err(_) => {
+                info!("Kein Runtime-Snapshot vorhanden, starte frisch");
+                RuntimeOrchestrator::new(config.max_agents)
+                    .with_event_store(Arc::clone(&event_store))
+            }
+        };
 
     // -- Controlplane-Kernel laden --
     let cp_config_path = config.config_dir.join("controlplane.toml");
@@ -103,19 +163,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_ecs = Arc::clone(&shutdown);
 
-    // Werte fuer den ECS-Thread klonen
+    // Werte fuer den ECS-Thread
     let tick_rate = Duration::from_millis(config.tick_rate_ms);
-    let shift_agent_ids: Vec<_> = shift_agents
-        .iter()
-        .map(|a| {
-            (
-                a.identity.id,
-                a.identity.name.clone(),
-                a.identity.role.clone(),
-                a.identity.shift_set,
-            )
-        })
-        .collect();
+    let all_agents_clone = all_agents.clone();
 
     // -- ECS Tick Loop (dedizierter Thread, bevy_ecs World ist Send+Sync) --
     let ecs_handle = std::thread::Builder::new()
@@ -126,10 +176,12 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 event_store,
                 action_rx,
                 perception_tx,
-                shift_agent_ids,
+                all_agents_clone,
+                current_shift,
                 tick_rate,
                 shutdown_ecs,
                 controlplane,
+                runtime_orch,
             )
         })
         .context("ECS Thread spawnen")?;
@@ -186,25 +238,27 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         }
     }
 
-    // RuntimeOrchestrator State speichern
-    drop(runtime_orch);
     info!("Daemon heruntergefahren");
 
     Ok(())
 }
 
 /// ECS Tick-Loop auf dediziertem Thread.
-/// Laeuft bis `shutdown` auf true gesetzt wird.
-/// Gibt die Anzahl ausgefuehrter Ticks zurueck.
+///
+/// Verwaltet den RuntimeOrchestrator (Lifecycle-Events, Shift-Wechsel, Snapshots)
+/// UND die ECS World (Entity-Spawning, Simulation). Laeuft bis `shutdown` gesetzt wird.
+/// Speichert Runtime-Snapshot vor Beendigung (AC-4).
 fn ecs_tick_loop(
     state_store: StateStore,
     event_store: Arc<EventStore>,
     action_rx: mpsc::Receiver<sentinel_common::AgentAction>,
     perception_tx: mpsc::SyncSender<Perception>,
-    agents: Vec<(u16, String, String, u8)>,
+    all_agents: Vec<AgentConfig>,
+    initial_shift: u8,
     tick_rate: Duration,
     shutdown: Arc<AtomicBool>,
     mut controlplane: ControlplaneKernel,
+    mut runtime_orch: RuntimeOrchestrator,
 ) -> Result<u64> {
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
@@ -215,13 +269,72 @@ fn ecs_tick_loop(
     world.insert_resource(ActionReceiver(std::sync::Mutex::new(action_rx)));
     world.insert_resource(PerceptionSender(perception_tx));
 
-    // Agents spawnen
-    for (id, name, role, shift_set) in &agents {
-        spawn_agent(&mut world, AgentId(*id), name, role, *shift_set);
+    // -- Agent-Spawning (Orchestrator + ECS) --
+    let is_restored = runtime_orch.agent_count() > 0;
+    let shift_agents = agents_for_shift(&all_agents, initial_shift);
+
+    if is_restored {
+        // Nach Restore: Shift-Transition durchfuehren falls Schicht gewechselt hat
+        // (z.B. Daemon um 13:59 gestoppt, um 14:05 neu gestartet)
+        let removed = runtime_orch.shift_transition(initial_shift);
+        if !removed.is_empty() {
+            info!(
+                removed_count = removed.len(),
+                "Stale Agents nach Restore entfernt (Schichtwechsel waehrend Downtime)"
+            );
+        }
     }
-    info!(agent_count = agents.len(), "ECS World initialisiert");
+
+    // Agents spawnen: Orchestrator registriert (falls nicht via Restore), ECS erstellt Entity
+    for agent_cfg in &shift_agents {
+        let agent_id = AgentId(agent_cfg.identity.id);
+
+        if runtime_orch.get_agent_mut(agent_id).is_none() {
+            // Nicht im Orchestrator → neu registrieren (emittiert Lifecycle-Events)
+            let identity = AgentIdentity {
+                agent_id,
+                name: agent_cfg.identity.name.clone(),
+                role: agent_cfg.identity.role.clone(),
+            };
+            let (start, end) = shift_hours(agent_cfg.identity.shift_set);
+            let shift = ShiftInfo {
+                shift_set: agent_cfg.identity.shift_set,
+                shift_start_hour: start,
+                shift_end_hour: end,
+                is_on_duty: true,
+            };
+            if let Err(e) = runtime_orch.spawn_agent(identity, shift, "empfang") {
+                warn!(agent_id = agent_cfg.identity.id, error = %e, "Agent-Spawn fehlgeschlagen");
+                continue;
+            }
+        }
+
+        // ECS Entity erstellen
+        spawn_agent(
+            &mut world,
+            agent_id,
+            &agent_cfg.identity.name,
+            &agent_cfg.identity.role,
+            agent_cfg.identity.shift_set,
+        );
+    }
+
+    // EventBuffer leeren: ECS spawn_agent emittiert eigene Events, aber der
+    // RuntimeOrchestrator ist SSOT fuer Lifecycle-Events (vermeidet Duplikate)
+    if let Some(mut event_buffer) = world.get_resource_mut::<EventBuffer>() {
+        event_buffer.events.clear();
+    }
+
+    info!(
+        agent_count = shift_agents.len(),
+        orchestrator_count = runtime_orch.agent_count(),
+        restored = is_restored,
+        shift_set = initial_shift,
+        "ECS World initialisiert"
+    );
 
     let mut tick_count: u64 = 0;
+    let mut current_shift = initial_shift;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -235,6 +348,9 @@ fn ecs_tick_loop(
             time.delta_seconds = tick_rate.as_secs_f32();
         }
 
+        // RuntimeOrchestrator Tick synchronisieren
+        runtime_orch.set_tick(tick_count);
+
         // ECS Schedule ausfuehren (alle 10 Systems in Reihenfolge)
         schedule.run(&mut world);
 
@@ -242,6 +358,50 @@ fn ecs_tick_loop(
         if controlplane.should_run(tick_count) {
             if let Err(e) = controlplane.cycle(&mut world, tick_count) {
                 error!(error = %e, tick = tick_count, "Controlplane-Zyklus fehlgeschlagen");
+            }
+        }
+
+        // Shift-Erkennung (alle 60 Ticks = ~1 Minute bei 1s Tick-Rate)
+        if tick_count > 0 && tick_count.is_multiple_of(60) {
+            let new_shift = detect_current_shift();
+            if new_shift != current_shift {
+                info!(old = current_shift, new = new_shift, "Schichtwechsel erkannt");
+
+                // Alte Schicht-Agents entfernen (Orchestrator entfernt + emittiert Events)
+                let removed = runtime_orch.shift_transition(new_shift);
+                for agent_id in &removed {
+                    if !despawn_agent_from_world(&mut world, *agent_id) {
+                        warn!(agent_id = %agent_id, "ECS Entity fuer entfernten Agent nicht gefunden");
+                    }
+                }
+
+                // Neue Schicht-Agents spawnen
+                let new_agents = agents_for_shift(&all_agents, new_shift);
+                let mut spawned_count = 0u32;
+                for agent_cfg in &new_agents {
+                    let agent_id = AgentId(agent_cfg.identity.id);
+                    // Set 0 (Sonder) bleibt, nicht nochmal spawnen
+                    if runtime_orch.get_agent_mut(agent_id).is_some() {
+                        continue;
+                    }
+                    if spawn_agent_full(&mut runtime_orch, &mut world, agent_cfg) {
+                        spawned_count += 1;
+                    }
+                }
+
+                // EventBuffer leeren (spawn_agent_full → ECS spawn Events, Orchestrator ist SSOT)
+                if let Some(mut event_buffer) = world.get_resource_mut::<EventBuffer>() {
+                    event_buffer.events.clear();
+                }
+
+                info!(
+                    removed = removed.len(),
+                    spawned = spawned_count,
+                    active = runtime_orch.agent_count(),
+                    "Schichtwechsel abgeschlossen"
+                );
+
+                current_shift = new_shift;
             }
         }
 
@@ -254,6 +414,16 @@ fn ecs_tick_loop(
         std::thread::sleep(tick_rate);
     }
 
+    // -- Graceful Shutdown: Runtime-Snapshot speichern (AC-4) --
+    if let Err(e) = runtime_orch.save_state() {
+        error!(error = %e, "Runtime State Snapshot fehlgeschlagen");
+    } else {
+        info!(
+            agent_count = runtime_orch.agent_count(),
+            "Runtime State Snapshot gespeichert"
+        );
+    }
+
     Ok(tick_count)
 }
 
@@ -262,6 +432,9 @@ mod tests {
     use super::*;
     use crate::controlplane::config::ControlplaneConfig;
     use crate::controlplane::store::ControlplaneStore;
+    use sentinel_common::agent_config::{
+        BackgroundConfig, IdentityConfig, PersonalityConfig, PreferencesConfig,
+    };
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -270,6 +443,36 @@ mod tests {
         let cp_store = ControlplaneStore::open(&cp_path).unwrap();
         let cp_config = ControlplaneConfig::default_config();
         ControlplaneKernel::new(cp_config, cp_store).unwrap()
+    }
+
+    fn test_agent_config(id: u16, name: &str, role: &str, shift_set: u8) -> AgentConfig {
+        AgentConfig {
+            identity: IdentityConfig {
+                id,
+                name: name.to_string(),
+                role: role.to_string(),
+                department: "Test".to_string(),
+                shift_set,
+            },
+            personality: PersonalityConfig {
+                openness: 0.5,
+                conscientiousness: 0.5,
+                extraversion: 0.5,
+                agreeableness: 0.5,
+                neuroticism: 0.3,
+                caffeine_tolerance: 0.5,
+                morning_person: true,
+            },
+            preferences: PreferencesConfig {
+                favorite_room: "empfang".to_string(),
+                coffee_preference: "schwarz".to_string(),
+                lunch_time: "12:00".to_string(),
+            },
+            background: BackgroundConfig {
+                bio: "Test Agent".to_string(),
+                quirks: vec!["testing".to_string()],
+            },
+        }
     }
 
     #[test]
@@ -288,6 +491,8 @@ mod tests {
         let (ptx, _prx) = mpsc::sync_channel(64);
 
         let controlplane = test_controlplane(&tmp);
+        let runtime_orch =
+            RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
 
         let result = ecs_tick_loop(
             state_store,
@@ -295,9 +500,11 @@ mod tests {
             rx,
             ptx,
             vec![],
+            1,
             Duration::from_millis(100),
             shutdown,
             controlplane,
+            runtime_orch,
         );
 
         assert!(result.is_ok());
@@ -321,6 +528,9 @@ mod tests {
         let (ptx, _prx) = mpsc::sync_channel(64);
 
         let controlplane = test_controlplane(&tmp);
+        let runtime_orch =
+            RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
+        let all_agents = vec![test_agent_config(1, "Test Agent", "Tester", 1)];
 
         // Shutdown nach 250ms
         std::thread::spawn(move || {
@@ -333,14 +543,117 @@ mod tests {
             event_store,
             rx,
             ptx,
-            vec![(1, "Test Agent".into(), "Tester".into(), 1)],
+            all_agents,
+            1,
             Duration::from_millis(50),
             shutdown,
             controlplane,
+            runtime_orch,
         );
 
         assert!(result.is_ok());
         let ticks = result.unwrap();
         assert!(ticks >= 1, "Mindestens 1 Tick erwartet, bekam {ticks}");
+    }
+
+    #[test]
+    fn test_save_state_on_shutdown() {
+        // Verifiziert dass Runtime-Snapshot nach Loop-Exit existiert
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.db");
+        let state_path = tmp.path().join("state.redb");
+
+        let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
+        let state_store = StateStore::open(state_path.to_str().unwrap()).unwrap();
+
+        let (_tx, rx) = mpsc::channel();
+        let (ptx, _prx) = mpsc::sync_channel(64);
+
+        let controlplane = test_controlplane(&tmp);
+        let runtime_orch =
+            RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
+        let all_agents = vec![
+            test_agent_config(1, "Thomas", "CEO", 1),
+            test_agent_config(2, "Lisa", "Designer", 1),
+        ];
+
+        // Shutdown nach 200ms
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            shutdown_clone.store(true, Ordering::SeqCst);
+        });
+
+        let es_clone = Arc::clone(&event_store);
+        let result = ecs_tick_loop(
+            state_store,
+            event_store,
+            rx,
+            ptx,
+            all_agents,
+            1,
+            Duration::from_millis(50),
+            shutdown,
+            controlplane,
+            runtime_orch,
+        );
+
+        assert!(result.is_ok());
+
+        // Snapshot muss existieren
+        let snapshot = es_clone.get_latest_snapshot("runtime");
+        assert!(
+            snapshot.is_ok() && snapshot.unwrap().is_some(),
+            "Runtime-Snapshot muss nach Shutdown existieren"
+        );
+    }
+
+    #[test]
+    fn test_restore_on_startup() {
+        // Verifiziert dass Agents aus Snapshot wiederhergestellt werden
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.db");
+
+        let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
+
+        // Orchestrator erstellen, 3 Agents spawnen, Snapshot speichern
+        let mut orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
+        orch.set_tick(100);
+        for i in 1..=3 {
+            let identity = AgentIdentity {
+                agent_id: AgentId(i),
+                name: format!("Agent-{i}"),
+                role: "Worker".to_string(),
+            };
+            let shift = ShiftInfo {
+                shift_set: 1,
+                shift_start_hour: 6,
+                shift_end_hour: 14,
+                is_on_duty: true,
+            };
+            orch.spawn_agent(identity, shift, "empfang").unwrap();
+        }
+        orch.save_state().unwrap();
+        drop(orch);
+
+        // Restore verifizieren
+        let restored =
+            RuntimeOrchestrator::restore(Arc::clone(&event_store), 10).unwrap();
+        assert_eq!(
+            restored.agent_count(),
+            3,
+            "Restored Orchestrator muss 3 Agents haben"
+        );
+    }
+
+    #[test]
+    fn test_shift_hours_mapping() {
+        assert_eq!(shift_hours(0), (0, 0));
+        assert_eq!(shift_hours(1), (6, 14));
+        assert_eq!(shift_hours(2), (14, 22));
+        assert_eq!(shift_hours(3), (22, 6));
+        assert_eq!(shift_hours(99), (6, 14)); // Fallback
     }
 }

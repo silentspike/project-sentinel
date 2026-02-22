@@ -24,7 +24,7 @@ pub struct DaemonConfig {
     #[serde(default = "default_tick_rate")]
     pub tick_rate_ms: u64,
 
-    /// Maximale Anzahl gleichzeitiger Agents (default: 15).
+    /// Maximale Anzahl gleichzeitiger Agents (default: 30, mind. 24 fuer 15 Schicht + 9 Sonder).
     #[serde(default = "default_max_agents")]
     pub max_agents: usize,
 
@@ -38,7 +38,7 @@ fn default_tick_rate() -> u64 {
 }
 
 fn default_max_agents() -> usize {
-    15
+    30
 }
 
 fn default_zenoh_prefix() -> String {
@@ -85,7 +85,7 @@ data_dir = "/tmp/data"
 "#;
         let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
         assert_eq!(file.daemon.tick_rate_ms, 1000);
-        assert_eq!(file.daemon.max_agents, 15);
+        assert_eq!(file.daemon.max_agents, 30);
         assert_eq!(file.daemon.zenoh_prefix, "sentinel");
     }
 }
