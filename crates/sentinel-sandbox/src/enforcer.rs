@@ -237,9 +237,10 @@ impl SandboxEnforcer {
             // Bind the wrapper binary into the namespace
             let wrapper_path = landlock_wrapper_path();
             if wrapper_path.exists() {
-                config
-                    .readonly_binds
-                    .push((wrapper_path.to_string_lossy().into_owned(), "/landlock-wrapper".to_string()));
+                config.readonly_binds.push((
+                    wrapper_path.to_string_lossy().into_owned(),
+                    "/landlock-wrapper".to_string(),
+                ));
                 let mut cmd = vec![
                     "/landlock-wrapper".to_string(),
                     name.to_string(),
@@ -249,7 +250,10 @@ impl SandboxEnforcer {
                 info!("Landlock wrapper injected for agent {name}");
                 cmd
             } else {
-                warn!("landlock-wrapper binary not found at {}, skipping Landlock", wrapper_path.display());
+                warn!(
+                    "landlock-wrapper binary not found at {}, skipping Landlock",
+                    wrapper_path.display()
+                );
                 command.to_vec()
             }
         } else {
@@ -383,7 +387,10 @@ impl SandboxEnforcer {
 fn landlock_wrapper_path() -> PathBuf {
     // 1. Same directory as current executable
     if let Ok(exe) = std::env::current_exe() {
-        let candidate = exe.parent().unwrap_or(std::path::Path::new(".")).join("landlock-wrapper");
+        let candidate = exe
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("landlock-wrapper");
         if candidate.exists() {
             return candidate;
         }

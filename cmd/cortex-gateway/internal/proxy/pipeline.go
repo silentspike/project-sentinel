@@ -66,10 +66,10 @@ type PipelineConfig struct {
 	Capabilities     *capability.ProviderCapabilities
 	Logger           *slog.Logger
 	BreakerCfg       BreakerConfig
-	EventStore       *eventstore.Store        // optional: nil disables event persistence
-	Guardrails       *guardrails.Enforcer     // optional: nil disables guardrails
-	InFlight         *resilience.InFlightMap  // optional: nil disables query tracking
-	ProviderDeadline time.Duration            // 0 = defaultProviderDeadline (20s)
+	EventStore       *eventstore.Store       // optional: nil disables event persistence
+	Guardrails       *guardrails.Enforcer    // optional: nil disables guardrails
+	InFlight         *resilience.InFlightMap // optional: nil disables query tracking
+	ProviderDeadline time.Duration           // 0 = defaultProviderDeadline (20s)
 }
 
 // ProviderDeadlineFromEnv liest die Provider-Deadline aus ENV.
