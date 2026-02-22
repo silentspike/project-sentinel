@@ -7,6 +7,7 @@ import {
   getRecentEvolutionAlerts,
   getEventsByCorrelation,
   getEventsByCausation,
+  getEventsNearby,
   getEventById,
   getChaosCountLastHour,
   getUnexpectedDespawnCount,
@@ -109,8 +110,12 @@ function summarizeEvolution(row: EvolutionRow): string {
 
 // ── Action Resolution ─────────────────────────────
 
+// PROXIMITY_WINDOW_TICKS is the tick range to search for correlated agent actions
+// after an incident event (e.g., agent reactions to a chaos event in the same room).
+const PROXIMITY_WINDOW_TICKS = 200;
+
 function resolveActions(event: EventRow): CockpitAction[] {
-  // Prefer correlation chain (groups all events in a transaction/run)
+  // 1. Prefer correlation chain (groups all events in a transaction/run)
   if (event.correlation_id) {
     const correlated = getEventsByCorrelation(event.correlation_id);
     const actions = correlated
@@ -118,9 +123,29 @@ function resolveActions(event: EventRow): CockpitAction[] {
       .map(toAction);
     if (actions.length > 0) return actions;
   }
-  // Fallback: direct causation (single-level children)
+
+  // 2. Direct causation (single-level children)
   const caused = getEventsByCausation(event.event_id);
-  return caused.map(toAction);
+  if (caused.length > 0) return caused.map(toAction);
+
+  // 3. Proximity-based: agent actions in the same room within a tick window.
+  //    Used when correlation/causation IDs are not set (e.g., chaos → nearby agent reactions).
+  const roomId = extractRoomId(event);
+  if (roomId) {
+    const nearby = getEventsNearby(roomId, event.tick, PROXIMITY_WINDOW_TICKS);
+    if (nearby.length > 0) return nearby.map(toAction);
+  }
+
+  return [];
+}
+
+// extractRoomId derives the room from an incident event.
+function extractRoomId(event: EventRow): string | null {
+  const payload = parsePayload(event.payload);
+  if (event.event_type === "chaos_triggered") {
+    return (payload.target_room as string | null) ?? event.aggregate_id;
+  }
+  return null;
 }
 
 function toAction(e: EventRow): CockpitAction {
@@ -150,12 +175,13 @@ function determineOutcome(
 
   const last = actions[actions.length - 1];
 
-  // Resolved if follow-up is a completion event
+  // Resolved if follow-up is a completion or response event
   const resolvedTypes = [
     "transit_completed",
     "agent_consolidated",
     "bio_action_performed",
     "agent_spawned",
+    "agent_action_received",
   ];
   if (resolvedTypes.includes(last.event_type)) {
     return { status: "resolved", outcome: last.summary };

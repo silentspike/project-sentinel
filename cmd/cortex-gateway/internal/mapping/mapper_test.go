@@ -19,8 +19,8 @@ func TestMapActions_Move(t *testing.T) {
 	}
 
 	e := events[0]
-	if e.EventType != "agent_move" {
-		t.Errorf("expected event_type=agent_move, got %q", e.EventType)
+	if e.EventType != "agent_action_received" {
+		t.Errorf("expected event_type=agent_action_received, got %q", e.EventType)
 	}
 	if e.AggregateID != "AGENT-01" {
 		t.Errorf("expected aggregate_id=AGENT-01, got %q", e.AggregateID)
@@ -61,7 +61,7 @@ func TestMapActions_MultipleActions(t *testing.T) {
 		t.Fatalf("expected 3 events, got %d", len(events))
 	}
 
-	expectedTypes := []string{"agent_emote", "agent_move", "agent_chat"}
+	expectedTypes := []string{"agent_action_received", "agent_action_received", "agent_action_received"}
 	expectedOpIDs := []string{"req-multi-0", "req-multi-1", "req-multi-2"}
 
 	for i, e := range events {
@@ -117,7 +117,34 @@ func TestMapActions_UnknownType(t *testing.T) {
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
 	}
-	if events[0].EventType != "agent_action" {
-		t.Errorf("expected fallback event_type=agent_action, got %q", events[0].EventType)
+	// All actions use unified event type now
+	if events[0].EventType != "agent_action_received" {
+		t.Errorf("expected event_type=agent_action_received, got %q", events[0].EventType)
+	}
+}
+
+func TestBuildPayload_ActionTypeField(t *testing.T) {
+	actions := []extraction.ExtractedAction{
+		{Type: "chat", Content: "Hallo!", Target: "Lisa"},
+	}
+	meta := ActionMeta{AgentName: "AGENT-01", RequestID: "req-field"}
+
+	events := MapActions(actions, meta)
+	var payload map[string]string
+	if err := json.Unmarshal([]byte(events[0].Payload), &payload); err != nil {
+		t.Fatalf("payload unmarshal: %v", err)
+	}
+	// Must use "action_type" (not "type") for dashboard compatibility
+	if payload["action_type"] != "chat" {
+		t.Errorf("expected action_type=chat, got %q", payload["action_type"])
+	}
+	if _, hasOldKey := payload["type"]; hasOldKey {
+		t.Errorf("payload should not have 'type' key, found %q", payload["type"])
+	}
+	if payload["content"] != "Hallo!" {
+		t.Errorf("expected content=Hallo!, got %q", payload["content"])
+	}
+	if payload["target"] != "Lisa" {
+		t.Errorf("expected target=Lisa, got %q", payload["target"])
 	}
 }

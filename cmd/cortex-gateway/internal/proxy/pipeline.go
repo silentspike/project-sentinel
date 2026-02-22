@@ -241,6 +241,13 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// --- Step 5: Perception Injection (3-Source Assembly) ---
 	agentName := req.Metadata["agent_name"]
+	if agentName == "" {
+		// Daemon sends "agent_id" (numeric, e.g. "8") — convert to AGENT-XX format.
+		if id := req.Metadata["agent_id"]; id != "" {
+			n, _ := strconv.Atoi(id)
+			agentName = fmt.Sprintf("AGENT-%02d", n)
+		}
+	}
 	agentRole := req.Metadata["agent_role"]
 	ph.injectPerception(&req, agentName, agentRole, providerName)
 

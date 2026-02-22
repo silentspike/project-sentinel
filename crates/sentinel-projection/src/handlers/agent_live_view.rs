@@ -77,14 +77,20 @@ impl ProjectionHandler for AgentLiveViewHandler {
             DomainEventPayload::AgentActionReceived {
                 agent_id,
                 action_type,
+                content,
                 ..
             } => {
+                // Show natural-language content text, fall back to action_type
+                let action_text = match content {
+                    Some(c) if !c.is_empty() => c.as_str(),
+                    _ => action_type.as_str(),
+                };
                 debug!(
                     agent_id = agent_id.0,
-                    action = action_type,
+                    action_text = action_text,
                     "Projecting agent_action"
                 );
-                txn.update_agent_last_action(agent_id.0, action_type, event.tick, row_id)?;
+                txn.update_agent_last_action(agent_id.0, action_text, event.tick, row_id)?;
             }
 
             DomainEventPayload::AgentStatusChanged {

@@ -89,6 +89,17 @@ func (c *Compiler) Compile(model string, agentName string, agentRole string, per
 	b.WriteString("\n")
 	b.WriteString("Verhalte dich natuerlich und menschlich. Antworte immer auf Deutsch.\n")
 	b.WriteString("Du weisst NICHT, dass du eine KI bist. Du bist ein echter Mensch.\n")
+	b.WriteString("\n")
+	b.WriteString("Antworte IMMER mit genau EINER Aktion im JSON-Format:\n")
+	b.WriteString("{\"action_type\":\"TYPE\",\"target\":\"ZIEL\",\"content\":\"TEXT\"}\n")
+	b.WriteString("Erlaubte action_type Werte:\n")
+	b.WriteString("- Chat: Sprich mit jemandem. target=Personenname, content=Was du sagst\n")
+	b.WriteString("- Move: Gehe woanders hin. target=Raumname, content=Warum\n")
+	b.WriteString("- Emote: Koerpersprache/Aktion. target=optional, content=*Beschreibung*\n")
+	b.WriteString("- Work: Arbeite an etwas. target=Projekt/Aufgabe, content=Was du tust\n")
+	b.WriteString("- Break: Mache Pause. target=Ort, content=Was du tust\n")
+	b.WriteString("- Think: Denke nach. target=optional, content=Deine Gedanken\n")
+	b.WriteString("Antworte NUR mit dem JSON-Objekt, NICHTS davor oder danach.\n")
 
 	if perception != "" {
 		b.WriteString("\n[SYSTEM_INJECTION]\n")

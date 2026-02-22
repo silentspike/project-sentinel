@@ -733,6 +733,70 @@ func TestBuildPrompt_MultiMessage(t *testing.T) {
 	}
 }
 
+func TestSplitMessages_SystemAndUser(t *testing.T) {
+	msgs := []Message{
+		{Role: "system", Content: "Du bist Thomas Mueller, CEO."},
+		{Role: "user", Content: "Was machst du?"},
+	}
+	sys, usr := splitMessages(msgs)
+	if sys != "Du bist Thomas Mueller, CEO." {
+		t.Errorf("expected system prompt, got %q", sys)
+	}
+	if usr != "Was machst du?" {
+		t.Errorf("expected user prompt, got %q", usr)
+	}
+}
+
+func TestSplitMessages_OnlyUser(t *testing.T) {
+	msgs := []Message{
+		{Role: "user", Content: "Hello world"},
+	}
+	sys, usr := splitMessages(msgs)
+	if sys != "" {
+		t.Errorf("expected empty system prompt, got %q", sys)
+	}
+	if usr != "Hello world" {
+		t.Errorf("expected user prompt, got %q", usr)
+	}
+}
+
+func TestSplitMessages_OnlySystem(t *testing.T) {
+	msgs := []Message{
+		{Role: "system", Content: "You are a persona."},
+	}
+	sys, usr := splitMessages(msgs)
+	// When only system message exists, it becomes the user prompt
+	if sys != "" {
+		t.Errorf("expected empty system prompt for single-message case, got %q", sys)
+	}
+	if usr != "You are a persona." {
+		t.Errorf("expected system content as user prompt, got %q", usr)
+	}
+}
+
+func TestSplitMessages_MultiSystemAndAssistant(t *testing.T) {
+	msgs := []Message{
+		{Role: "system", Content: "Persona prompt."},
+		{Role: "system", Content: "Perception injection."},
+		{Role: "user", Content: "What do you do?"},
+		{Role: "assistant", Content: "I chat."},
+		{Role: "user", Content: "Tell me more."},
+	}
+	sys, usr := splitMessages(msgs)
+	if !strings.Contains(sys, "Persona prompt.") || !strings.Contains(sys, "Perception injection.") {
+		t.Errorf("expected both system messages in system prompt, got %q", sys)
+	}
+	if !strings.Contains(usr, "What do you do?") {
+		t.Error("expected user message in user prompt")
+	}
+	if !strings.Contains(usr, "[Previous response: I chat.]") {
+		t.Error("expected assistant message in user prompt")
+	}
+	if !strings.Contains(usr, "Tell me more.") {
+		t.Error("expected second user message in user prompt")
+	}
+}
+
 func TestClaudeCodeProvider_ParseOutputStream_Success(t *testing.T) {
 	// Simulate NDJSON output from claude subprocess (real format: content is array of blocks)
 	ndjson := strings.Join([]string{

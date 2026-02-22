@@ -99,7 +99,18 @@ async function loadAgentDetail(agentId, card) {
 
     const action = document.createElement('div');
     action.className = 'last-action';
-    action.textContent = data.last_action || '\u2014';
+    if (data.last_action) {
+      action.textContent = data.last_action;
+      if (data.last_action_tick != null) {
+        const tickSpan = document.createElement('span');
+        tickSpan.className = 'last-action-tick';
+        tickSpan.textContent = ' T' + data.last_action_tick;
+        action.appendChild(tickSpan);
+      }
+    } else {
+      action.textContent = 'Keine Aktion';
+      action.classList.add('last-action-empty');
+    }
     card.appendChild(action);
 
     const meta = document.createElement('div');
@@ -176,6 +187,30 @@ export function updateAgents(agents) {
       if (roomEl.textContent !== newText) {
         roomEl.textContent = newText;
         roomEl.classList.toggle('transit', isTransit);
+      }
+    }
+
+    // Differential update: last_action
+    const actionEl = card.querySelector('.last-action');
+    if (actionEl) {
+      const newAction = agent.last_action || '';
+      const oldAction = actionEl.getAttribute('data-action') || '';
+      if (newAction !== oldAction) {
+        actionEl.textContent = '';
+        actionEl.setAttribute('data-action', newAction);
+        actionEl.classList.remove('last-action-empty');
+        if (newAction) {
+          actionEl.textContent = newAction;
+          if (agent.last_action_tick != null) {
+            const tickSpan = document.createElement('span');
+            tickSpan.className = 'last-action-tick';
+            tickSpan.textContent = ' T' + agent.last_action_tick;
+            actionEl.appendChild(tickSpan);
+          }
+        } else {
+          actionEl.textContent = 'Keine Aktion';
+          actionEl.classList.add('last-action-empty');
+        }
       }
     }
 

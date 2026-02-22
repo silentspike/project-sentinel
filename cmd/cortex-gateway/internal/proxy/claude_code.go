@@ -101,21 +101,28 @@ func (p *ClaudeCodeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRes
 		model = req.Model
 	}
 
-	// Build the prompt from messages
-	prompt := buildPrompt(req.Messages)
+	// Split messages into system prompt and user prompt
+	systemPrompt, userPrompt := splitMessages(req.Messages)
 
 	// Spawn subprocess per request
 	args := []string{
-		"-p", prompt,
+		"-p", userPrompt,
 		"--output-format", "stream-json",
 		"--verbose",
 		"--model", model,
+	}
+	if systemPrompt != "" {
+		args = append(args, "--system-prompt", systemPrompt)
 	}
 	if req.MaxTokens > 0 {
 		args = append(args, "--max-turns", "1")
 	}
 
-	p.logger.Debug("spawning claude subprocess", "model", model, "prompt_len", len(prompt))
+	p.logger.Debug("spawning claude subprocess",
+		"model", model,
+		"system_prompt_len", len(systemPrompt),
+		"user_prompt_len", len(userPrompt),
+	)
 
 	cmd := exec.CommandContext(ctx, p.binary, args...) //nolint:gosec // binary from trusted config
 	stdout, err := cmd.StdoutPipe()
@@ -254,8 +261,40 @@ func (p *ClaudeCodeProvider) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
+// splitMessages separates messages into a system prompt (passed via --system-prompt
+// to override Claude Code's default coding assistant persona) and a user prompt
+// (passed via -p). System messages become the system prompt; user/assistant
+// messages become the user prompt.
+func splitMessages(messages []Message) (systemPrompt, userPrompt string) {
+	var sysParts []string
+	var userParts []string
+
+	for _, m := range messages {
+		switch m.Role {
+		case "system":
+			sysParts = append(sysParts, m.Content)
+		case "user":
+			userParts = append(userParts, m.Content)
+		case "assistant":
+			userParts = append(userParts, "[Previous response: "+m.Content+"]")
+		}
+	}
+
+	systemPrompt = strings.Join(sysParts, "\n\n")
+	userPrompt = strings.Join(userParts, "\n\n")
+
+	// If no user messages, use system prompt as user prompt (single-message case)
+	if userPrompt == "" && systemPrompt != "" {
+		userPrompt = systemPrompt
+		systemPrompt = ""
+	}
+
+	return systemPrompt, userPrompt
+}
+
 // buildPrompt concatenates messages into a single prompt string.
 // For claude -p, we join all messages with role prefixes for context.
+// Deprecated: Use splitMessages instead for proper --system-prompt support.
 func buildPrompt(messages []Message) string {
 	if len(messages) == 1 {
 		return messages[0].Content
