@@ -44,6 +44,8 @@ const CREATE_IDX_EVENTS_TYPE: &str =
     "CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type, id)";
 const CREATE_IDX_EVENTS_CORRELATION: &str =
     "CREATE INDEX IF NOT EXISTS idx_events_correlation ON events(correlation_id)";
+const CREATE_IDX_EVENTS_CAUSATION: &str =
+    "CREATE INDEX IF NOT EXISTS idx_events_causation ON events(causation_id)";
 const CREATE_IDX_EVENTS_OPERATION: &str =
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_operation ON events(operation_id)";
 
@@ -161,6 +163,7 @@ impl EventStore {
         conn.execute(CREATE_IDX_EVENTS_AGGREGATE, [])?;
         conn.execute(CREATE_IDX_EVENTS_TYPE, [])?;
         conn.execute(CREATE_IDX_EVENTS_CORRELATION, [])?;
+        conn.execute(CREATE_IDX_EVENTS_CAUSATION, [])?;
         conn.execute(CREATE_IDX_EVENTS_OPERATION, [])?;
         conn.execute_batch(CREATE_OUTBOX)?;
         conn.execute(CREATE_IDX_OUTBOX_PENDING, [])?;
@@ -591,7 +594,10 @@ impl EventStore {
 
     /// Setzt den Offset einer Projection (upsert, monoton steigend).
     ///
-    /// Gibt `MonotonicityError` zurueck wenn der neue Offset <= aktueller Offset ist.
+    /// Verhalten:
+    /// - `offset > current` → Normal-Update (Fortschritt)
+    /// - `offset == current` → No-op (idempotent, kein Fehler)
+    /// - `offset < current` → `MonotonicityError` (Rueckwaerts-Drift)
     pub fn update_offset(&self, name: &str, offset: i64) -> anyhow::Result<()> {
         let conn = self
             .conn
@@ -608,7 +614,11 @@ impl EventStore {
             .ok();
 
         if let Some(current_val) = current {
-            if offset <= current_val {
+            if offset == current_val {
+                // Idempotent: gleicher Offset = kein Update noetig
+                return Ok(());
+            }
+            if offset < current_val {
                 return Err(MonotonicityError {
                     projection: name.to_string(),
                     current: current_val,
@@ -954,12 +964,9 @@ mod tests {
         store.update_offset("test-proj", 10).unwrap();
         assert_eq!(store.get_offset("test-proj").unwrap(), Some(10));
 
-        // Gleicher Wert muss fehlschlagen (nicht strikt groesser)
-        let result = store.update_offset("test-proj", 10);
-        assert!(
-            result.is_err(),
-            "same offset should fail monotonicity check"
-        );
+        // Gleicher Wert ist idempotent (no-op, kein Fehler)
+        store.update_offset("test-proj", 10).unwrap();
+        assert_eq!(store.get_offset("test-proj").unwrap(), Some(10));
 
         // Kleinerer Wert muss fehlschlagen
         let result = store.update_offset("test-proj", 5);

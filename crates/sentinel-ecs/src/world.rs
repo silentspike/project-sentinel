@@ -3,10 +3,13 @@
 //! Erstellt die ECS World mit allen Systems in korrekter Reihenfolge
 //! und bietet die Funktion zum Spawnen von Agenten.
 
+use super::autonomy::AutonomyCooldown;
 use super::components::*;
 use super::systems::*;
 use bevy_ecs::prelude::*;
-use sentinel_common::{AgentAction, AgentId, DomainEvent, Emotion, Perception, Tick};
+use sentinel_common::{
+    AgentAction, AgentId, DomainEvent, DomainEventPayload, Emotion, Perception, Tick,
+};
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
 use std::sync::Arc;
@@ -181,13 +184,21 @@ pub fn create_simulation_world() -> (World, Schedule) {
     schedule.add_systems(mood_system.in_set(SimulationPhase::Mood));
     schedule.add_systems(perception_system.in_set(SimulationPhase::Perception));
     schedule.add_systems(super::decision::decision_system.in_set(SimulationPhase::Decision));
+    schedule.add_systems(
+        super::autonomy::autonomy_system
+            .in_set(SimulationPhase::Decision)
+            .after(super::decision::decision_system),
+    );
     schedule.add_systems(output_system.in_set(SimulationPhase::Output));
     schedule.add_systems(persist_system.in_set(SimulationPhase::Persist));
 
     (world, schedule)
 }
 
-/// Spawnt einen Agenten mit allen 11 Components und Default-Werten
+/// Spawnt einen Agenten mit allen 11 Components und Default-Werten.
+///
+/// Erzeugt ein `AgentSpawned` DomainEvent im EventBuffer (wenn vorhanden),
+/// damit Dashboard/Projection Worker ueber neue Agents informiert werden.
 pub fn spawn_agent(
     world: &mut World,
     agent_id: AgentId,
@@ -203,7 +214,7 @@ pub fn spawn_agent(
         _ => (6, 14),  // Fallback: Fruehschicht
     };
 
-    world
+    let entity = world
         .spawn((
             AgentIdentity {
                 agent_id,
@@ -268,6 +279,32 @@ pub fn spawn_agent(
                 is_on_duty: false,
             },
             EventQueue::default(),
+            AutonomyCooldown::default(),
         ))
-        .id()
+        .id();
+
+    // AgentSpawned Event erzeugen (damit Dashboard/Projection Agent kennt)
+    let tick = world
+        .get_resource::<SimulationTime>()
+        .map(|t| t.tick.0)
+        .unwrap_or(0);
+    let payload = DomainEventPayload::AgentSpawned {
+        agent_id,
+        name: name.to_string(),
+        role: role.to_string(),
+        shift_set,
+        room_id: "empfang".to_string(),
+    };
+    let event = DomainEvent::new(
+        payload.event_type_str(),
+        &agent_id.to_string(),
+        &payload.to_json(),
+        &uuid::Uuid::new_v4().to_string(),
+        tick,
+    );
+    if let Some(mut event_buffer) = world.get_resource_mut::<EventBuffer>() {
+        event_buffer.events.push(event);
+    }
+
+    entity
 }

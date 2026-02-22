@@ -1,0 +1,29 @@
+[Unit]
+Description=Sentinel Projection Worker — CQRS Read-Model Service
+Documentation=https://github.com/obtFusi/project-sentinel/issues/53
+After=sentinel-daemon.service
+Requires=sentinel-daemon.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel-projection \
+  --event-store /opt/sentinel/data/events.db \
+  --projection-db /opt/sentinel/data/projection.db
+Restart=on-failure
+RestartSec=5
+MemoryMax=512M
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-projection
+
+# Security Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/sentinel/data
+PrivateTmp=true
+
+[Install]
+WantedBy=sentinel.target

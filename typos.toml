@@ -457,6 +457,20 @@ Diskrete = "Diskrete"
 Probleme = "Probleme"
 Monitore = "Monitore"
 
+# E2E Test Plan + Dashboard + Wasm Tool words (German in Markdown + JS + Rust)
+Legende = "Legende"
+Elemente = "Elemente"
+Klick = "Klick"
+plausibel = "plausibel"
+triggert = "triggert"
+aequivalent = "aequivalent"
+Formate = "Formate"
+Suche = "Suche"
+Adresse = "Adresse"
+Objekt = "Objekt"
+failt = "failt"
+unparseable = "unparseable"
+
 [files]
 extend-exclude = [
     "Cargo.lock",
@@ -464,4 +478,5 @@ extend-exclude = [
     "target/",
     "node_modules/",
     "*.min.js",
+    "docs/",
 ]

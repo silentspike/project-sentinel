@@ -50,15 +50,40 @@ function createRoomCard(room) {
 
   const type = document.createElement('div');
   type.className = 'room-type';
-  type.textContent = room.room_type;
+  type.textContent = (room.room_type || '').toUpperCase();
   card.appendChild(type);
 
   // Belegung
   const occ = document.createElement('div');
   occ.className = 'room-occupancy';
-  occ.textContent = room.occupant_count + ' Personen';
+  occ.textContent = room.occupant_count + '/' + room.capacity + ' Personen';
   if (room.occupant_count > 0) occ.classList.add('occupied');
   card.appendChild(occ);
+
+  // Agent-Positionen: Zeige welche Agents im Raum sind
+  if (room.occupants && room.occupants.length > 0) {
+    const agentList = document.createElement('div');
+    agentList.className = 'room-agents';
+    for (const name of room.occupants) {
+      const tag = document.createElement('span');
+      tag.className = 'room-agent-tag';
+      tag.textContent = name;
+      agentList.appendChild(tag);
+    }
+    card.appendChild(agentList);
+  }
+
+  // Room Physics (Temperatur, CO2, Laerm)
+  if (room.temperature != null || room.noise_db != null || room.co2_ppm != null) {
+    const physics = document.createElement('div');
+    physics.className = 'room-physics';
+    const parts = [];
+    if (room.temperature != null) parts.push(Math.round(room.temperature * 10) / 10 + ' \u00B0C');
+    if (room.co2_ppm != null) parts.push(Math.round(room.co2_ppm) + ' ppm');
+    if (room.noise_db != null) parts.push(Math.round(room.noise_db) + ' dB');
+    physics.textContent = parts.join(' | ');
+    card.appendChild(physics);
+  }
 
   // Transit
   if (room.transit_count > 0) {
@@ -73,7 +98,8 @@ function createRoomCard(room) {
     const chaos = document.createElement('div');
     chaos.className = 'chaos-badge';
     const chaosData = typeof room.active_chaos === 'object' ? room.active_chaos : null;
-    chaos.textContent = chaosData ? (chaosData.type || 'Chaos') : 'Chaos aktiv';
+    // Use event_type (e.g. "PhoneRing") not type (serde tag "ChaosTriggered")
+    chaos.textContent = chaosData ? (chaosData.event_type || chaosData.type || 'Chaos') : 'Chaos aktiv';
     card.appendChild(chaos);
   }
 

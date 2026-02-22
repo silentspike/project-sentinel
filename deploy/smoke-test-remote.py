@@ -9,7 +9,10 @@ import sys
 import time
 
 HEALTH_ENDPOINTS = [
-    (8080, "/health", "sentinel-daemon"),
+    (8080, "/health", "cortex-proxy"),
+    (8081, "/health", "cortex-control"),
+    (8082, "/health", "sentinel-judge"),
+    (8083, "/health", "sentinel-nats-bridge"),
     (8000, "/api/health", "sentinel-dashboard"),
 ]
 
@@ -17,6 +20,7 @@ SERVICES = [
     "sentinel-daemon",
     "sentinel-cortex",
     "sentinel-dashboard",
+    "sentinel-projection",
     "sentinel-nightrun.timer",
     "nats-server",
     "sentinel-nats-bridge",

@@ -26,9 +26,26 @@ CREATE TABLE IF NOT EXISTS agent_live_view (
     transit_target TEXT,
     last_action TEXT,
     last_action_tick INTEGER,
+    hunger REAL NOT NULL DEFAULT 0.0,
+    energy REAL NOT NULL DEFAULT 1.0,
+    stress REAL NOT NULL DEFAULT 0.0,
+    bladder REAL NOT NULL DEFAULT 0.0,
+    social_need REAL NOT NULL DEFAULT 0.0,
+    caffeine_mg REAL NOT NULL DEFAULT 0.0,
+    mood TEXT,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
 )";
+
+const MIGRATE_AGENT_BIO_COLUMNS: &str = "
+ALTER TABLE agent_live_view ADD COLUMN hunger REAL NOT NULL DEFAULT 0.0;
+ALTER TABLE agent_live_view ADD COLUMN energy REAL NOT NULL DEFAULT 1.0;
+ALTER TABLE agent_live_view ADD COLUMN stress REAL NOT NULL DEFAULT 0.0;
+ALTER TABLE agent_live_view ADD COLUMN bladder REAL NOT NULL DEFAULT 0.0;
+ALTER TABLE agent_live_view ADD COLUMN social_need REAL NOT NULL DEFAULT 0.0;
+ALTER TABLE agent_live_view ADD COLUMN caffeine_mg REAL NOT NULL DEFAULT 0.0;
+ALTER TABLE agent_live_view ADD COLUMN mood TEXT;
+";
 
 const CREATE_ROOM_LIVE_VIEW: &str = "
 CREATE TABLE IF NOT EXISTS room_live_view (
@@ -40,6 +57,12 @@ CREATE TABLE IF NOT EXISTS room_live_view (
     last_event_id INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
 )";
+
+const MIGRATE_ROOM_PHYSICS_COLUMNS: &str = "
+ALTER TABLE room_live_view ADD COLUMN temperature REAL;
+ALTER TABLE room_live_view ADD COLUMN co2_ppm REAL;
+ALTER TABLE room_live_view ADD COLUMN noise_db REAL;
+";
 
 const CREATE_KPI_1M: &str = "
 CREATE TABLE IF NOT EXISTS kpi_1m (
@@ -77,6 +100,22 @@ impl ReadModelStore {
         conn.execute_batch(CREATE_AGENT_LIVE_VIEW)?;
         conn.execute_batch(CREATE_ROOM_LIVE_VIEW)?;
         conn.execute_batch(CREATE_KPI_1M)?;
+
+        // Migration: Bio-Spalten hinzufuegen (idempotent, ignoriert "duplicate column" Fehler)
+        for line in MIGRATE_AGENT_BIO_COLUMNS.lines() {
+            let line = line.trim();
+            if line.starts_with("ALTER") {
+                let _ = conn.execute_batch(line);
+            }
+        }
+
+        // Migration: Room-Physics-Spalten hinzufuegen (idempotent)
+        for line in MIGRATE_ROOM_PHYSICS_COLUMNS.lines() {
+            let line = line.trim();
+            if line.starts_with("ALTER") {
+                let _ = conn.execute_batch(line);
+            }
+        }
 
         info!(path, "ReadModelStore opened");
         Ok(Self {
@@ -136,7 +175,7 @@ impl ReadModelStore {
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
         let result = conn.query_row(
-            "SELECT agent_id, name, role, shift_set, status, current_room, in_transit, transit_target, last_action, last_action_tick, last_event_id, updated_at FROM agent_live_view WHERE agent_id = ?1",
+            "SELECT agent_id, name, role, shift_set, status, current_room, in_transit, transit_target, last_action, last_action_tick, hunger, energy, stress, bladder, social_need, caffeine_mg, mood, last_event_id, updated_at FROM agent_live_view WHERE agent_id = ?1",
             params![agent_id],
             |row| {
                 Ok(AgentView {
@@ -150,8 +189,15 @@ impl ReadModelStore {
                     transit_target: row.get(7)?,
                     last_action: row.get(8)?,
                     last_action_tick: row.get(9)?,
-                    last_event_id: row.get(10)?,
-                    updated_at: row.get(11)?,
+                    hunger: row.get(10)?,
+                    energy: row.get(11)?,
+                    stress: row.get(12)?,
+                    bladder: row.get(13)?,
+                    social_need: row.get(14)?,
+                    caffeine_mg: row.get(15)?,
+                    mood: row.get(16)?,
+                    last_event_id: row.get(17)?,
+                    updated_at: row.get(18)?,
                 })
             },
         );
@@ -169,7 +215,7 @@ impl ReadModelStore {
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
         let result = conn.query_row(
-            "SELECT room_id, occupant_count, transit_count, active_chaos, last_event_tick, last_event_id, updated_at FROM room_live_view WHERE room_id = ?1",
+            "SELECT room_id, occupant_count, transit_count, active_chaos, temperature, co2_ppm, noise_db, last_event_tick, last_event_id, updated_at FROM room_live_view WHERE room_id = ?1",
             params![room_id],
             |row| {
                 Ok(RoomView {
@@ -177,9 +223,12 @@ impl ReadModelStore {
                     occupant_count: row.get(1)?,
                     transit_count: row.get(2)?,
                     active_chaos: row.get(3)?,
-                    last_event_tick: row.get(4)?,
-                    last_event_id: row.get(5)?,
-                    updated_at: row.get(6)?,
+                    temperature: row.get(4)?,
+                    co2_ppm: row.get(5)?,
+                    noise_db: row.get(6)?,
+                    last_event_tick: row.get(7)?,
+                    last_event_id: row.get(8)?,
+                    updated_at: row.get(9)?,
                 })
             },
         );
@@ -220,6 +269,13 @@ pub struct AgentView {
     pub transit_target: Option<String>,
     pub last_action: Option<String>,
     pub last_action_tick: Option<i64>,
+    pub hunger: f64,
+    pub energy: f64,
+    pub stress: f64,
+    pub bladder: f64,
+    pub social_need: f64,
+    pub caffeine_mg: f64,
+    pub mood: Option<String>,
     pub last_event_id: i64,
     pub updated_at: i64,
 }
@@ -231,6 +287,9 @@ pub struct RoomView {
     pub occupant_count: i64,
     pub transit_count: i64,
     pub active_chaos: Option<String>,
+    pub temperature: Option<f64>,
+    pub co2_ppm: Option<f64>,
+    pub noise_db: Option<f64>,
     pub last_event_tick: Option<i64>,
     pub last_event_id: i64,
     pub updated_at: i64,
@@ -368,6 +427,47 @@ impl<'a> ReadModelTransaction<'a> {
         }
     }
 
+    /// UPDATE: Agent initial room (aus AgentSpawned Events).
+    pub fn update_agent_room(
+        &self,
+        agent_id: u16,
+        room_id: &str,
+        row_id: i64,
+    ) -> anyhow::Result<()> {
+        self.guard.execute(
+            "UPDATE agent_live_view SET
+               current_room = ?1, last_event_id = ?2, updated_at = ?3
+             WHERE agent_id = ?4 AND ?2 > last_event_id",
+            params![room_id, row_id, now_ms(), agent_id],
+        )?;
+        Ok(())
+    }
+
+    /// UPDATE: Agent Bio-State aktualisieren (aus BioStateUpdated Events).
+    pub fn update_agent_bio(&self, bio: &BioUpdate<'_>, row_id: i64) -> anyhow::Result<()> {
+        self.guard.execute(
+            "UPDATE agent_live_view SET
+               hunger = ?1, energy = ?2, stress = ?3, bladder = ?4,
+               social_need = ?5, caffeine_mg = ?6, mood = ?7, current_room = ?8,
+               last_event_id = ?9, updated_at = ?10
+             WHERE agent_id = ?11 AND ?9 > last_event_id",
+            params![
+                bio.hunger,
+                bio.energy,
+                bio.stress,
+                bio.bladder,
+                bio.social_need,
+                bio.caffeine_mg,
+                bio.mood,
+                bio.room_id,
+                row_id,
+                now_ms(),
+                bio.agent_id,
+            ],
+        )?;
+        Ok(())
+    }
+
     // ── room_live_view ──
 
     /// Raum-Belegung aendern (delta: +1 oder -1).
@@ -423,6 +523,34 @@ impl<'a> ReadModelTransaction<'a> {
         Ok(())
     }
 
+    /// Room-Physik aktualisieren (Temperatur, CO2, Laerm).
+    pub fn update_room_physics(
+        &self,
+        room_id: &str,
+        temperature: f64,
+        co2_ppm: f64,
+        noise_db: f64,
+        tick: u64,
+        row_id: i64,
+    ) -> anyhow::Result<()> {
+        self.guard.execute(
+            "UPDATE room_live_view SET
+               temperature = ?1, co2_ppm = ?2, noise_db = ?3,
+               last_event_tick = ?4, last_event_id = ?5, updated_at = ?6
+             WHERE room_id = ?7 AND ?5 > last_event_id",
+            params![
+                temperature,
+                co2_ppm,
+                noise_db,
+                tick as i64,
+                row_id,
+                now_ms(),
+                room_id
+            ],
+        )?;
+        Ok(())
+    }
+
     // ── kpi_1m ──
 
     /// KPI-Bucket UPSERT mit Inkrement-Feldern.
@@ -465,6 +593,19 @@ impl<'a> ReadModelTransaction<'a> {
             .execute(&sql, params![bucket_start as i64, row_id, now_ms()])?;
         Ok(())
     }
+}
+
+/// Bio-State Update fuer einen Agenten.
+pub struct BioUpdate<'a> {
+    pub agent_id: u16,
+    pub hunger: f64,
+    pub energy: f64,
+    pub stress: f64,
+    pub bladder: f64,
+    pub social_need: f64,
+    pub caffeine_mg: f64,
+    pub mood: &'a str,
+    pub room_id: &'a str,
 }
 
 /// KPI-Felder fuer Inkrement-Operationen.

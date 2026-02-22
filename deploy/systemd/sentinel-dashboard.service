@@ -7,6 +7,9 @@ After=sentinel-cortex.service
 Type=simple
 WorkingDirectory=/opt/sentinel/dashboard
 ExecStart=/usr/local/bin/bun run start
+Environment=PORT=8000
+Environment=PROJECTION_DB_PATH=/opt/sentinel/data/projection.db
+Environment=EVENT_STORE_DB_PATH=/opt/sentinel/data/events.db
 Restart=on-failure
 RestartSec=5
 MemoryMax=512M

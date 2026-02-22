@@ -45,7 +45,7 @@ fn ac_15_02_spawn_despawn() {
     let shift = create_shift(1, 6, 14);
 
     // Spawn
-    orch.spawn_agent(identity, shift).unwrap();
+    orch.spawn_agent(identity, shift, "empfang").unwrap();
     assert_eq!(orch.agent_count(), 1, "After spawn: 1 agent expected");
 
     // Verify active (get_agent_mut returns Some)
@@ -76,16 +76,22 @@ fn ac_15_02_lifecycle_events_sourced() {
     orch.set_tick(1);
 
     // Spawn 3 agents
-    orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-        .unwrap();
+    orch.spawn_agent(
+        create_identity(1, "Thomas", "CEO"),
+        create_shift(1, 6, 14),
+        "empfang",
+    )
+    .unwrap();
     orch.spawn_agent(
         create_identity(2, "Lisa", "Designer"),
         create_shift(1, 6, 14),
+        "empfang",
     )
     .unwrap();
     orch.spawn_agent(
         create_identity(3, "Andreas", "Developer"),
         create_shift(1, 6, 14),
+        "empfang",
     )
     .unwrap();
 
@@ -139,11 +145,16 @@ fn ac_15_02_lifecycle_events_sourced() {
 fn ac_15_03_max_agents_limit() {
     let mut orch = RuntimeOrchestrator::new(2);
 
-    orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-        .unwrap();
+    orch.spawn_agent(
+        create_identity(1, "Thomas", "CEO"),
+        create_shift(1, 6, 14),
+        "empfang",
+    )
+    .unwrap();
     orch.spawn_agent(
         create_identity(2, "Lisa", "Designer"),
         create_shift(1, 6, 14),
+        "empfang",
     )
     .unwrap();
 
@@ -151,6 +162,7 @@ fn ac_15_03_max_agents_limit() {
     let result = orch.spawn_agent(
         create_identity(3, "Andreas", "Developer"),
         create_shift(1, 6, 14),
+        "empfang",
     );
 
     assert!(
@@ -175,23 +187,34 @@ fn ac_15_04_resume_after_restart() {
         orch.set_tick(50);
 
         // Spawn 5 agents across shifts
-        orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-            .unwrap();
+        orch.spawn_agent(
+            create_identity(1, "Thomas", "CEO"),
+            create_shift(1, 6, 14),
+            "empfang",
+        )
+        .unwrap();
         orch.spawn_agent(
             create_identity(2, "Lisa", "Designer"),
             create_shift(1, 6, 14),
+            "empfang",
         )
         .unwrap();
         orch.spawn_agent(
             create_identity(3, "Andreas", "Developer"),
             create_shift(2, 14, 22),
+            "empfang",
         )
         .unwrap();
-        orch.spawn_agent(create_identity(4, "Sandra", "PM"), create_shift(2, 14, 22))
-            .unwrap();
+        orch.spawn_agent(
+            create_identity(4, "Sandra", "PM"),
+            create_shift(2, 14, 22),
+            "empfang",
+        )
+        .unwrap();
         orch.spawn_agent(
             create_identity(46, "Betriebsrat", "Sonder"),
             create_shift(0, 0, 23),
+            "empfang",
         )
         .unwrap();
 
@@ -245,11 +268,16 @@ fn ac_15_04b_shift_transition() {
     let mut orch = RuntimeOrchestrator::new(20);
 
     // Set 1 Agents (Frueh-Schicht)
-    orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-        .unwrap();
+    orch.spawn_agent(
+        create_identity(1, "Thomas", "CEO"),
+        create_shift(1, 6, 14),
+        "empfang",
+    )
+    .unwrap();
     orch.spawn_agent(
         create_identity(2, "Lisa", "Designer"),
         create_shift(1, 6, 14),
+        "empfang",
     )
     .unwrap();
 
@@ -257,6 +285,7 @@ fn ac_15_04b_shift_transition() {
     orch.spawn_agent(
         create_identity(16, "Michael", "CEO"),
         create_shift(2, 14, 22),
+        "empfang",
     )
     .unwrap();
 
@@ -297,12 +326,17 @@ fn ac_15_05_sonder_set_preserved() {
     orch.spawn_agent(
         create_identity(46, "Betriebsrat", "Sonder"),
         create_shift(0, 0, 23),
+        "empfang",
     )
     .unwrap();
 
     // Set 1 Agent
-    orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-        .unwrap();
+    orch.spawn_agent(
+        create_identity(1, "Thomas", "CEO"),
+        create_shift(1, 6, 14),
+        "empfang",
+    )
+    .unwrap();
 
     assert_eq!(orch.agent_count(), 2);
 
@@ -331,11 +365,16 @@ fn ac_15_07_pause_resume_lifecycle() {
     let mut orch = RuntimeOrchestrator::new(20).with_event_store(store.clone());
     orch.set_tick(1);
 
-    orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-        .unwrap();
+    orch.spawn_agent(
+        create_identity(1, "Thomas", "CEO"),
+        create_shift(1, 6, 14),
+        "empfang",
+    )
+    .unwrap();
     orch.spawn_agent(
         create_identity(2, "Lisa", "Designer"),
         create_shift(1, 6, 14),
+        "empfang",
     )
     .unwrap();
 
@@ -406,11 +445,16 @@ fn ac_15_07_pause_resume_lifecycle() {
 fn ac_15_06_health_check() {
     let mut orch = RuntimeOrchestrator::new(10);
 
-    orch.spawn_agent(create_identity(1, "Thomas", "CEO"), create_shift(1, 6, 14))
-        .unwrap();
+    orch.spawn_agent(
+        create_identity(1, "Thomas", "CEO"),
+        create_shift(1, 6, 14),
+        "empfang",
+    )
+    .unwrap();
     orch.spawn_agent(
         create_identity(2, "Lisa", "Designer"),
         create_shift(1, 6, 14),
+        "empfang",
     )
     .unwrap();
 

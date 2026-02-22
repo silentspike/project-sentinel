@@ -77,11 +77,29 @@ pub fn input_system(
             match action.action_type {
                 ActionType::Move => {
                     if let Some(target_room) = &action.target_room {
+                        let from_room = position.room_id.clone();
+                        let to_room = format!("ROOM-{}", target_room.0);
+                        let duration_ms: u32 = 3000;
                         position.in_transit = true;
-                        position.transit_target = Some(format!("ROOM-{}", target_room.0));
-                        // Default Transit-Dauer: 3000ms (wird spaeter aus rooms.toml berechnet)
-                        position.transit_remaining_ms = 3000;
+                        position.transit_target = Some(to_room.clone());
+                        position.transit_remaining_ms = duration_ms;
                         position.transit_correlation_id = Some(correlation_id.clone());
+
+                        // TransitStarted Event (Causation-Chain wird unten via action_event gesetzt)
+                        let transit_payload = DomainEventPayload::TransitStarted {
+                            agent_id: identity.agent_id,
+                            from_room,
+                            to_room,
+                            duration_ms,
+                        };
+                        let transit_event = DomainEvent::new(
+                            transit_payload.event_type_str(),
+                            &identity.agent_id.to_string(),
+                            &transit_payload.to_json(),
+                            &correlation_id,
+                            time.tick.0,
+                        );
+                        event_buffer.events.push(transit_event);
                     }
                 }
                 ActionType::Chat => {
@@ -159,12 +177,24 @@ pub fn input_system(
     }
 }
 
-/// 2. Aktualisiert biologische Zustaende via sentinel-bio Differenzialgleichungen
+/// 2. Aktualisiert biologische Zustaende via sentinel-bio Differenzialgleichungen.
+///
+/// Erzeugt BioStateUpdated DomainEvents alle 20 Ticks (periodischer Snapshot).
 pub fn bio_system(
-    mut query: Query<(&mut BioState, &Personality, &WorkContext)>,
+    mut query: Query<(
+        &AgentIdentity,
+        &mut BioState,
+        &Personality,
+        &WorkContext,
+        &Position,
+        &Mood,
+    )>,
     time: Res<SimulationTime>,
+    mut event_buffer: ResMut<EventBuffer>,
 ) {
-    for (mut bio, personality, work) in &mut query {
+    let tick = time.tick.0;
+
+    for (identity, mut bio, personality, work, position, mood) in &mut query {
         sentinel_bio::update_bio_state(
             &mut bio,
             personality,
@@ -172,15 +202,43 @@ pub fn bio_system(
             time.delta_seconds,
             time.sim_hour,
         );
+
+        // Periodischer Bio-State Snapshot alle 20 Ticks (~20 Sekunden bei 1Hz)
+        if tick.is_multiple_of(20) {
+            let payload = DomainEventPayload::BioStateUpdated {
+                agent_id: identity.agent_id,
+                hunger: bio.hunger,
+                energy: bio.energy,
+                stress: bio.stress,
+                bladder: bio.bladder,
+                social_need: bio.social_need,
+                caffeine_mg: bio.caffeine_mg,
+                room_id: position.room_id.clone(),
+                mood: format!("{:?}", mood.dominant_emotion),
+            };
+            let event = DomainEvent::new(
+                payload.event_type_str(),
+                &identity.agent_id.to_string(),
+                &payload.to_json(),
+                &uuid::Uuid::new_v4().to_string(),
+                tick,
+            );
+            event_buffer.events.push(event);
+        }
     }
 }
 
 /// 3. Berechnet Raum-Physik (Akustik, Temperatur, CO2)
 ///
 /// Zaehlt Agenten pro Raum und berechnet physikalische Parameter.
-/// Ergebnisse werden aktuell nicht persistiert - perception_system liest
-/// direkt aus den Queries. Raum-State-Resource kommt in Phase 3.
-pub fn physics_system(query: Query<(&Position, Option<&WorkContext>)>) {
+/// Emittiert RoomPhysicsUpdated Events alle 20 Ticks fuer die Projection.
+pub fn physics_system(
+    query: Query<(&Position, Option<&WorkContext>)>,
+    time: Res<SimulationTime>,
+    mut event_buffer: ResMut<EventBuffer>,
+) {
+    let tick = time.tick.0;
+
     // Agenten pro Raum zaehlen und Meeting-Status ermitteln
     let mut room_agents: std::collections::HashMap<&str, (usize, bool)> =
         std::collections::HashMap::new();
@@ -198,21 +256,32 @@ pub fn physics_system(query: Query<(&Position, Option<&WorkContext>)>) {
         }
     }
 
-    // Physik pro Raum berechnen (Ergebnisse via tracing geloggt)
+    // Physik pro Raum berechnen
     for (room_id, (agent_count, has_meeting)) in &room_agents {
         let noise_db =
             sentinel_physics::calculate_noise_level(*agent_count, *has_meeting, false, &[]);
-        let temperature = sentinel_physics::calculate_temperature(
-            21.0,
-            *agent_count,
-            false,
-            15.0, // Default-Aussentemperatur
-            0.3,  // Mittlere Sonnenexposition
-        );
-        let _co2 = sentinel_physics::calculate_co2(400.0, *agent_count, 0.5, 1.0);
-        let _noise_text = sentinel_physics::noise_to_text(noise_db);
-        let _temp = temperature; // Wird in perception_system genutzt via Room-State (Phase 3)
-        let _ = room_id; // Compiler-Hint: Room-ID wird in Phase 3 fuer Room-State genutzt
+        let temperature =
+            sentinel_physics::calculate_temperature(21.0, *agent_count, false, 15.0, 0.3);
+        let co2 = sentinel_physics::calculate_co2(400.0, *agent_count, 0.5, 1.0);
+
+        // Alle 20 Ticks Physics-Snapshot als Event emittieren
+        if tick > 0 && tick.is_multiple_of(20) {
+            let payload = DomainEventPayload::RoomPhysicsUpdated {
+                room_id: room_id.to_string(),
+                temperature,
+                co2_ppm: co2,
+                noise_db,
+                occupant_count: *agent_count as u32,
+            };
+            let event = DomainEvent::new(
+                payload.event_type_str(),
+                room_id,
+                &payload.to_json(),
+                &uuid::Uuid::new_v4().to_string(),
+                tick,
+            );
+            event_buffer.events.push(event);
+        }
     }
 }
 
@@ -260,16 +329,39 @@ pub fn transit_system(
 
 /// 5. Generiert Zufallsereignisse (Poisson-verteilt)
 ///
-/// Nutzt Tick-basierte Pseudo-Zufallszahlen. Erzeugt DomainEvents
-/// fuer getriggerte Chaos-Events.
-pub fn chaos_system(time: Res<SimulationTime>, mut event_buffer: ResMut<EventBuffer>) {
-    // Pseudo-RNG basierend auf Tick (einfacher xorshift-Hash)
+/// Nutzt splitmix64-basierte Pseudo-Zufallszahlen fuer gleichmaessige Verteilung.
+/// Globaler Cooldown verhindert Event-Flut: max 1 Chaos-Event alle 30 Ticks.
+pub fn chaos_system(
+    time: Res<SimulationTime>,
+    mut event_buffer: ResMut<EventBuffer>,
+    positions: Query<&Position>,
+) {
     let tick = time.tick.0;
+
+    // Globaler Cooldown: max 1 Chaos-Event alle 30 Ticks (~30 Sekunden bei 1Hz)
+    // Ueber Tick-Modulo gesteuert — kein zusaetzlicher State noetig
+    if !tick.is_multiple_of(30) {
+        return;
+    }
+
+    // Besetzte Raeume sammeln fuer realistische Chaos-Zuweisung
+    let occupied_rooms: Vec<String> = {
+        let mut rooms: Vec<String> = positions
+            .iter()
+            .filter(|p| !p.in_transit)
+            .map(|p| p.room_id.clone())
+            .collect();
+        rooms.sort();
+        rooms.dedup();
+        rooms
+    };
+
+    // splitmix64-basierte Hash-Funktion (gut verteilt, auch fuer kleine Seeds)
     let pseudo_rng = |seed: u64| -> f32 {
-        let mut x = seed;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
+        let mut x = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^= x >> 31;
         (x % 10000) as f32 / 10000.0
     };
 
@@ -321,20 +413,32 @@ pub fn chaos_system(time: Res<SimulationTime>, mut event_buffer: ResMut<EventBuf
         ),
     ];
 
+    // delta_seconds korrigiert fuer den Cooldown-Faktor (30 Ticks gebuendelt)
+    let effective_delta = time.delta_seconds * 30.0;
+
     for (i, (physics_type, common_type, description)) in event_types.iter().enumerate() {
         let freq = sentinel_physics::chaos_frequency_per_hour(*physics_type);
         let rng = pseudo_rng(tick.wrapping_mul(31).wrapping_add(i as u64));
-        let triggered = sentinel_physics::should_trigger_chaos(freq, time.delta_seconds, rng);
+        let triggered = sentinel_physics::should_trigger_chaos(freq, effective_delta, rng);
 
         if triggered {
+            // Zufaelligen besetzten Raum waehlen (Fallback: "empfang")
+            let target = if occupied_rooms.is_empty() {
+                "empfang".to_string()
+            } else {
+                let room_rng = pseudo_rng(tick.wrapping_mul(97).wrapping_add(i as u64));
+                let idx = (room_rng * occupied_rooms.len() as f32) as usize;
+                occupied_rooms[idx.min(occupied_rooms.len() - 1)].clone()
+            };
+
             let payload = DomainEventPayload::ChaosTriggered {
                 event_type: *common_type,
-                target_room: None,
+                target_room: Some(target.clone()),
                 description: description.to_string(),
             };
             let event = DomainEvent::new(
                 payload.event_type_str(),
-                "building",
+                &target,
                 &payload.to_json(),
                 &uuid::Uuid::new_v4().to_string(),
                 time.tick.0,
@@ -551,6 +655,21 @@ pub fn persist_system(
     mut telemetry: ResMut<PersistTelemetry>,
 ) {
     telemetry.ticks_observed = telemetry.ticks_observed.saturating_add(1);
+
+    // TickSnapshot-Marker alle 60 Ticks (~1 Minute bei 1Hz)
+    let tick = time.tick.0;
+    if tick.is_multiple_of(60) && tick > 0 {
+        let agent_count = query.iter().count() as u32;
+        let payload = DomainEventPayload::TickSnapshot { tick, agent_count };
+        let event = DomainEvent::new(
+            payload.event_type_str(),
+            "simulation",
+            &payload.to_json(),
+            &uuid::Uuid::new_v4().to_string(),
+            tick,
+        );
+        event_buffer.events.push(event);
+    }
 
     // 1. Events aus Buffer nach Limbo schreiben (mit Outbox)
     if let Some(es) = &event_store {

@@ -33,6 +33,8 @@ pub struct SleepCycle {
     pub selected: Vec<Episode>,
     pub consolidation_threshold: f64,
     pub max_consolidation_episodes: usize,
+    /// Narrative built during consolidation phase, survives wake_up().
+    consolidated_narrative: Option<String>,
 }
 
 impl SleepCycle {
@@ -47,6 +49,7 @@ impl SleepCycle {
             selected: Vec::new(),
             consolidation_threshold: 0.1,
             max_consolidation_episodes: 10,
+            consolidated_narrative: None,
         }
     }
 
@@ -59,6 +62,7 @@ impl SleepCycle {
             selected: Vec::new(),
             consolidation_threshold: threshold,
             max_consolidation_episodes: max_episodes,
+            consolidated_narrative: None,
         }
     }
 
@@ -115,18 +119,40 @@ impl SleepCycle {
         result
     }
 
-    /// Consolidate selected episodes into long-term memory.
+    /// Consolidate selected episodes into a narrative summary.
     ///
-    /// TODO: Implement actual consolidation (write to NarrativeMemory, etc.)
-    /// Transitions to WakingUp phase.
+    /// Builds a consolidated narrative from `self.selected` episodes scored by NMDA.
+    /// The narrative is stored internally and accessible via `consolidated_narrative()`
+    /// after the cycle completes (survives `wake_up()`).
+    ///
+    /// The service layer is responsible for persisting the narrative to the store.
     pub fn consolidate(&mut self) -> anyhow::Result<()> {
         self.phase = SleepPhase::Consolidating;
-        // TODO: Actual consolidation logic
-        // - Write to NarrativeMemory
-        // - Update agent's long-term knowledge base
-        // - Clear working memory
+
+        if self.selected.is_empty() {
+            self.consolidated_narrative = None;
+        } else {
+            let narrative = self
+                .selected
+                .iter()
+                .map(|ep| {
+                    let score = nmda_score(ep);
+                    format!("- {} (Score: {:.2})", ep.summary, score)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.consolidated_narrative = Some(narrative);
+        }
+
         self.phase = SleepPhase::WakingUp;
         Ok(())
+    }
+
+    /// Returns the narrative built during consolidation.
+    ///
+    /// Available after `consolidate()` has run, persists through `wake_up()`.
+    pub fn consolidated_narrative(&self) -> Option<&str> {
+        self.consolidated_narrative.as_deref()
     }
 
     /// Wake up and clear cycle state.

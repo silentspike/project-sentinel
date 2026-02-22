@@ -30,6 +30,7 @@ fn make_payload(i: u64) -> DomainEventPayload {
             name: format!("Agent-{}", i % 15 + 1),
             role: "Developer".to_string(),
             shift_set: 1,
+            room_id: "empfang".to_string(),
         },
         1 => DomainEventPayload::TransitStarted {
             agent_id: AgentId((i % 15 + 1) as u16),

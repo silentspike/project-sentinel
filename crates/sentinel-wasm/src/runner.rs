@@ -5,6 +5,7 @@
 //! WASM module execution via wasmtime (behind `wasm` feature flag).
 
 use anyhow::{anyhow, Result};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -146,9 +147,9 @@ impl ToolRuntime {
                     ));
                 }
             }
-            other => {
-                return Err(anyhow!("Tool type {:?} not yet implemented", other));
-            }
+            ToolType::Chat => self.execute_chat(input, &ctx.agent_id)?,
+            ToolType::Calendar => self.execute_calendar(input, &ctx.agent_id)?,
+            ToolType::Search => self.execute_search(input)?,
         };
 
         let duration = start.elapsed();
@@ -203,6 +204,156 @@ impl ToolRuntime {
             "Written {} bytes to {}",
             content.len(),
             path_str.trim()
+        ))
+    }
+
+    /// Sendet eine Nachricht an einen anderen Agenten.
+    ///
+    /// Input: JSON `{"target":"AGENT-XX","message":"text"}`
+    /// Output: Bestaetigungs-String mit Absender, Empfaenger und Nachricht.
+    /// Die tatsaechliche Zustellung erfolgt durch den Orchestrator.
+    fn execute_chat(&self, input: &str, sender_id: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct ChatInput {
+            target: String,
+            message: String,
+        }
+
+        let parsed: ChatInput = serde_json::from_str(input.trim()).map_err(|e| {
+            anyhow!("Chat input must be JSON {{\"target\":\"AGENT-XX\",\"message\":\"text\"}}: {e}")
+        })?;
+
+        if parsed.target.is_empty() {
+            return Err(anyhow!("Chat target must not be empty"));
+        }
+        if parsed.message.is_empty() {
+            return Err(anyhow!("Chat message must not be empty"));
+        }
+        // Agent-ID Format validieren (AGENT-XX)
+        if !parsed.target.starts_with("AGENT-") {
+            return Err(anyhow!(
+                "Chat target must be a valid agent ID (AGENT-XX), got '{}'",
+                parsed.target
+            ));
+        }
+
+        Ok(format!(
+            "Message from {} to {}: {}",
+            sender_id, parsed.target, parsed.message
+        ))
+    }
+
+    /// Verwaltet Kalendereintraege fuer einen Agenten.
+    ///
+    /// Input: JSON `{"action":"query"|"create"|"cancel","date":"YYYY-MM-DD","time":"HH:MM","subject":"...","attendees":["AGENT-XX"]}`
+    /// Output: Bestaetigungs-String oder Abfrageergebnis.
+    /// Die tatsaechliche Kalender-Persistenz erfolgt durch den Orchestrator.
+    fn execute_calendar(&self, input: &str, agent_id: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct CalendarInput {
+            action: String,
+            #[serde(default)]
+            date: String,
+            #[serde(default)]
+            time: String,
+            #[serde(default)]
+            subject: String,
+            #[serde(default)]
+            attendees: Vec<String>,
+        }
+
+        let parsed: CalendarInput = serde_json::from_str(input.trim())
+            .map_err(|e| anyhow!("Calendar input must be JSON {{\"action\":\"create\",\"date\":\"...\",\"subject\":\"...\"}}: {e}"))?;
+
+        match parsed.action.as_str() {
+            "create" => {
+                if parsed.date.is_empty() || parsed.subject.is_empty() {
+                    return Err(anyhow!("Calendar create requires 'date' and 'subject'"));
+                }
+                let time_str = if parsed.time.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", parsed.time)
+                };
+                let attendees_str = if parsed.attendees.is_empty() {
+                    String::new()
+                } else {
+                    format!(" with {}", parsed.attendees.join(", "))
+                };
+                Ok(format!(
+                    "Calendar entry created for {}: {}{} - {}{}",
+                    agent_id, parsed.date, time_str, parsed.subject, attendees_str
+                ))
+            }
+            "query" => {
+                let scope = if parsed.date.is_empty() {
+                    "today".to_string()
+                } else {
+                    parsed.date.clone()
+                };
+                Ok(format!(
+                    "Calendar query for {}: showing entries for {}",
+                    agent_id, scope
+                ))
+            }
+            "cancel" => {
+                if parsed.subject.is_empty() && parsed.date.is_empty() {
+                    return Err(anyhow!("Calendar cancel requires 'subject' or 'date'"));
+                }
+                let identifier = if !parsed.subject.is_empty() {
+                    &parsed.subject
+                } else {
+                    &parsed.date
+                };
+                Ok(format!(
+                    "Calendar entry cancelled for {}: {}",
+                    agent_id, identifier
+                ))
+            }
+            other => Err(anyhow!(
+                "Unknown calendar action '{}'. Expected 'create', 'query', or 'cancel'",
+                other
+            )),
+        }
+    }
+
+    /// Durchsucht Dokumente und Wissen innerhalb der Simulation.
+    ///
+    /// Input: JSON `{"query":"search terms","scope":"documents"|"agents"|"rooms"}`
+    /// Output: Suchergebnis-String. Die tatsaechliche Suche wird vom Orchestrator
+    /// mit Zugriff auf den ECS-World-State durchgefuehrt.
+    fn execute_search(&self, input: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct SearchInput {
+            query: String,
+            #[serde(default = "default_search_scope")]
+            scope: String,
+        }
+
+        fn default_search_scope() -> String {
+            "documents".to_string()
+        }
+
+        let parsed: SearchInput = serde_json::from_str(input.trim()).map_err(|e| {
+            anyhow!("Search input must be JSON {{\"query\":\"...\",\"scope\":\"documents\"}}: {e}")
+        })?;
+
+        if parsed.query.is_empty() {
+            return Err(anyhow!("Search query must not be empty"));
+        }
+
+        let valid_scopes = ["documents", "agents", "rooms"];
+        if !valid_scopes.contains(&parsed.scope.as_str()) {
+            return Err(anyhow!(
+                "Search scope must be one of {:?}, got '{}'",
+                valid_scopes,
+                parsed.scope
+            ));
+        }
+
+        Ok(format!(
+            "Search results for '{}' in {}: query dispatched",
+            parsed.query, parsed.scope
         ))
     }
 
@@ -472,20 +623,234 @@ mod tests {
         assert!(event.payload.contains("AGENT-01"));
     }
 
+    // ---- Chat Tool Tests ----
+
     #[test]
-    fn unimplemented_tool_type_error() {
+    fn chat_sends_message() {
         let mut runtime = ToolRuntime::new();
         runtime
             .register_tool(make_tool("chat", ToolType::Chat))
             .unwrap();
         let sandbox = SandboxConfig::restrictive();
         let ctx = test_ctx(sandbox);
-        let result = runtime.execute("chat", "", &ctx);
+        let input = r#"{"target":"AGENT-05","message":"Hallo Lisa!"}"#;
+        let result = runtime.execute("chat", input, &ctx).unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("AGENT-01"));
+        assert!(result.output.contains("AGENT-05"));
+        assert!(result.output.contains("Hallo Lisa!"));
+    }
+
+    #[test]
+    fn chat_invalid_json_error() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("chat", ToolType::Chat))
+            .unwrap();
+        let sandbox = SandboxConfig::restrictive();
+        let ctx = test_ctx(sandbox);
+        let result = runtime.execute("chat", "not json", &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Chat input"));
+    }
+
+    #[test]
+    fn chat_empty_target_error() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("chat", ToolType::Chat))
+            .unwrap();
+        let sandbox = SandboxConfig::restrictive();
+        let ctx = test_ctx(sandbox);
+        let input = r#"{"target":"","message":"hi"}"#;
+        let result = runtime.execute("chat", input, &ctx);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("not yet implemented"));
+            .contains("must not be empty"));
+    }
+
+    #[test]
+    fn chat_invalid_agent_id_error() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("chat", ToolType::Chat))
+            .unwrap();
+        let sandbox = SandboxConfig::restrictive();
+        let ctx = test_ctx(sandbox);
+        let input = r#"{"target":"Lisa","message":"hi"}"#;
+        let result = runtime.execute("chat", input, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("AGENT-XX"));
+    }
+
+    // ---- Calendar Tool Tests ----
+
+    #[test]
+    fn calendar_create_entry() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("calendar", ToolType::Calendar))
+            .unwrap();
+        let sandbox = SandboxConfig::restrictive();
+        let ctx = test_ctx(sandbox);
+        let input = r#"{"action":"create","date":"2026-02-22","time":"14:00","subject":"Sprint Review","attendees":["AGENT-05","AGENT-10"]}"#;
+        let result = runtime.execute("calendar", input, &ctx).unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Calendar entry created"));
+        assert!(result.output.contains("2026-02-22"));
+        assert!(result.output.contains("14:00"));
+        assert!(result.output.contains("Sprint Review"));
+        assert!(result.output.contains("AGENT-05"));
+    }
+
+    #[test]
+    fn calendar_query() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("calendar", ToolType::Calendar))
+            .unwrap();
+        let sandbox = SandboxConfig::restrictive();
+        let ctx = test_ctx(sandbox);
+        let input = r#"{"action":"query","date":"2026-02-22"}"#;
+        let result = runtime.execute("calendar", input, &ctx).unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Calendar query"));
+        assert!(result.output.contains("2026-02-22"));
+    }
+
+    #[test]
+    fn calendar_query_default_today() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("calendar", ToolType::Calendar))
+            .unwrap();
+        let sandbox = SandboxConfig::restrictive();
+        let ctx = test_ctx(sandbox);
+        let input = r#"{"action":"query"}"#;
+        let result = runtime.execute("calendar", input, &ctx).unwrap();
+        assert!(result.output.contains("today"));
+    }
+
+    #[test]
+    fn calendar_cancel() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("calendar", ToolType::Calendar))
+            .unwrap();
+        let sandbox = SandboxConfig::restrictive();
+        let ctx = test_ctx(sandbox);
+        let input = r#"{"action":"cancel","subject":"Sprint Review"}"#;
+        let result = runtime.execute("calendar", input, &ctx).unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("cancelled"));
+        assert!(result.output.contains("Sprint Review"));
+    }
+
+    #[test]
+    fn calendar_create_missing_fields_error() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("calendar", ToolType::Calendar))
+            .unwrap();
+        let sandbox = SandboxConfig::restrictive();
+        let ctx = test_ctx(sandbox);
+        let input = r#"{"action":"create"}"#;
+        let result = runtime.execute("calendar", input, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("requires"));
+    }
+
+    #[test]
+    fn calendar_unknown_action_error() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("calendar", ToolType::Calendar))
+            .unwrap();
+        let sandbox = SandboxConfig::restrictive();
+        let ctx = test_ctx(sandbox);
+        let input = r#"{"action":"delete"}"#;
+        let result = runtime.execute("calendar", input, &ctx);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown calendar action"));
+    }
+
+    // ---- Search Tool Tests ----
+
+    #[test]
+    fn search_documents() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("search", ToolType::Search))
+            .unwrap();
+        let sandbox = SandboxConfig::restrictive();
+        let ctx = test_ctx(sandbox);
+        let input = r#"{"query":"Projektplan Q1","scope":"documents"}"#;
+        let result = runtime.execute("search", input, &ctx).unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Projektplan Q1"));
+        assert!(result.output.contains("documents"));
+    }
+
+    #[test]
+    fn search_default_scope() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("search", ToolType::Search))
+            .unwrap();
+        let sandbox = SandboxConfig::restrictive();
+        let ctx = test_ctx(sandbox);
+        let input = r#"{"query":"meeting notes"}"#;
+        let result = runtime.execute("search", input, &ctx).unwrap();
+        assert!(result.output.contains("documents"));
+    }
+
+    #[test]
+    fn search_agents_scope() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("search", ToolType::Search))
+            .unwrap();
+        let sandbox = SandboxConfig::restrictive();
+        let ctx = test_ctx(sandbox);
+        let input = r#"{"query":"Lisa","scope":"agents"}"#;
+        let result = runtime.execute("search", input, &ctx).unwrap();
+        assert!(result.output.contains("agents"));
+    }
+
+    #[test]
+    fn search_invalid_scope_error() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("search", ToolType::Search))
+            .unwrap();
+        let sandbox = SandboxConfig::restrictive();
+        let ctx = test_ctx(sandbox);
+        let input = r#"{"query":"test","scope":"internet"}"#;
+        let result = runtime.execute("search", input, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must be one of"));
+    }
+
+    #[test]
+    fn search_empty_query_error() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("search", ToolType::Search))
+            .unwrap();
+        let sandbox = SandboxConfig::restrictive();
+        let ctx = test_ctx(sandbox);
+        let input = r#"{"query":""}"#;
+        let result = runtime.execute("search", input, &ctx);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must not be empty"));
     }
 
     #[test]

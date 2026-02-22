@@ -6,6 +6,7 @@
 //! Components liegen in sentinel-common::components (Re-Export hier).
 //! Systems rufen sentinel-bio und sentinel-physics fuer echte Berechnungen auf.
 
+pub mod autonomy;
 pub mod components;
 pub mod decision;
 pub mod perception;

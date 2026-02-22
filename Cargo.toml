@@ -19,6 +19,7 @@ members = [
     "crates/sentinel-fs",
     "services/sentinel-nightrun",
     "services/sentinel-daemon",
+    "services/sentinel-projection",
 ]
 
 [workspace.dependencies]

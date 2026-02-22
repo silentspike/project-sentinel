@@ -103,8 +103,12 @@ impl ProjectionWorker {
             let count = self.process_batch(&batch)?;
             let last_row_id = batch.last().unwrap().0;
 
-            self.event_store
-                .update_offset(PROJECTION_NAME, last_row_id)?;
+            // Guard: nur updaten wenn tatsaechlich Fortschritt (schuetzt vor
+            // Race Conditions bei Auto-Restart und idempotenten Batches)
+            if last_row_id > offset {
+                self.event_store
+                    .update_offset(PROJECTION_NAME, last_row_id)?;
+            }
 
             debug!(events = count, offset = last_row_id, "Batch processed");
         }
@@ -136,10 +140,12 @@ impl ProjectionWorker {
             total_processed += count;
 
             let last_row_id = batch.last().unwrap().0;
-            offset = last_row_id;
 
-            self.event_store
-                .update_offset(PROJECTION_NAME, last_row_id)?;
+            if last_row_id > offset {
+                self.event_store
+                    .update_offset(PROJECTION_NAME, last_row_id)?;
+            }
+            offset = last_row_id;
 
             debug!(
                 events = count,
