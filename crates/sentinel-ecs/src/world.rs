@@ -308,3 +308,19 @@ pub fn spawn_agent(
 
     entity
 }
+
+/// Entfernt einen Agenten aus der ECS World anhand seiner AgentId.
+/// Gibt `true` zurueck wenn der Agent gefunden und despawned wurde.
+pub fn despawn_agent_from_world(world: &mut World, agent_id: AgentId) -> bool {
+    let mut query = world.query::<(Entity, &AgentIdentity)>();
+    let entity = query
+        .iter(world)
+        .find(|(_, identity)| identity.agent_id == agent_id)
+        .map(|(entity, _)| entity);
+    if let Some(entity) = entity {
+        world.despawn(entity);
+        true
+    } else {
+        false
+    }
+}

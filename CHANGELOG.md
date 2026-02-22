@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **RuntimeOrchestrator Integration in Daemon** (#15)
+  - RuntimeOrchestrator moved into ECS thread (was dead code in tokio context)
+  - Agent spawning now goes through RuntimeOrchestrator (lifecycle event emission)
+  - `save_state()` on graceful shutdown, `restore()` on startup (snapshot persistence)
+  - Periodic shift detection every 60 ticks with `shift_transition()` + ECS despawn/spawn
+  - New `despawn_agent_from_world()` in sentinel-ecs for runtime shift transitions
+  - `max_agents` default increased from 15 to 30 (accommodates 15 shift + 9 sonder agents)
+  - EventBuffer cleared after agent spawning to prevent duplicate lifecycle events
+
 ### Added
 
 - **Claude Code Subprocess Provider** (Cortex Gateway)

@@ -159,6 +159,38 @@ func (ph *PipelineHandler) getBreaker(name string) *CircuitBreaker {
 	return cb
 }
 
+// parseRequest reads, validates and decodes the incoming LLM request body.
+// Returns the decoded request and a request ID, or writes an HTTP error and returns false.
+func (ph *PipelineHandler) parseRequest(w http.ResponseWriter, r *http.Request) (LLMRequest, string, bool) {
+	// Request-ID fuer Traceability + Idempotenz
+	requestID := r.Header.Get("X-Request-ID")
+	if requestID == "" {
+		requestID = eventstore.GenerateUUID()
+	}
+
+	limited := io.LimitReader(r.Body, maxRequestBodySize+1)
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		ph.logger.Error("failed to read request body", "error", err)
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		return LLMRequest{}, "", false
+	}
+	if len(body) > maxRequestBodySize {
+		ph.logger.Warn("request body too large", "size", len(body))
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return LLMRequest{}, "", false
+	}
+
+	var req LLMRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		ph.logger.Error("failed to decode request", "error", err)
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return LLMRequest{}, "", false
+	}
+
+	return req, requestID, true
+}
+
 // ServeHTTP implementiert die vollstaendige 7-Step Pipeline.
 func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -169,30 +201,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = r.Body.Close() }()
 	start := time.Now()
 
-	// Request-ID fuer Traceability + Idempotenz
-	requestID := r.Header.Get("X-Request-ID")
-	if requestID == "" {
-		requestID = eventstore.GenerateUUID()
-	}
-
 	// --- Step 0: Request lesen + validieren ---
-	limited := io.LimitReader(r.Body, maxRequestBodySize+1)
-	body, err := io.ReadAll(limited)
-	if err != nil {
-		ph.logger.Error("failed to read request body", "error", err)
-		http.Error(w, "failed to read request body", http.StatusBadRequest)
-		return
-	}
-	if len(body) > maxRequestBodySize {
-		ph.logger.Warn("request body too large", "size", len(body))
-		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-
-	var req LLMRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		ph.logger.Error("failed to decode request", "error", err)
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	req, requestID, ok := ph.parseRequest(w, r)
+	if !ok {
 		return
 	}
 
