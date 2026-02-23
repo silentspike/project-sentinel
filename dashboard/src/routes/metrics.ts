@@ -36,6 +36,23 @@ metricRoutes.get("/metrics", (c) => {
   });
 });
 
+metricRoutes.get("/ebpf/status", async (c) => {
+  try {
+    const resp = await fetch("http://localhost:9090/metrics", {
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!resp.ok) {
+      return c.json({ mode: "unavailable" });
+    }
+    const text = await resp.text();
+    // Parse sentinel_ebpf_monitoring_mode{mode="kernel"} 1
+    const match = text.match(/sentinel_ebpf_monitoring_mode\{mode="(\w+)"\}\s+1/);
+    return c.json({ mode: match ? match[1] : "unknown" });
+  } catch {
+    return c.json({ mode: "unavailable" });
+  }
+});
+
 metricRoutes.get("/health", (c) => {
   let lag = 0;
   try {

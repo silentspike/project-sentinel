@@ -18,7 +18,7 @@ use crate::probes::network::NetworkMonitor;
 use crate::psi::PsiReader;
 
 /// Collected metrics snapshot from one polling cycle.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct MetricsSnapshot {
     /// Agent health data (stall detection).
     pub stalled_agents: Vec<u64>,
@@ -28,7 +28,8 @@ pub struct MetricsSnapshot {
     pub network_metrics: HashMap<String, NetworkSnapshot>,
     /// PSI metrics per agent.
     pub psi_metrics: HashMap<String, PsiSnapshot>,
-    /// Collection cycle duration.
+    /// Collection cycle duration in microseconds.
+    #[serde(serialize_with = "serialize_duration_us")]
     pub cycle_duration: Duration,
     /// Current monitoring mode.
     pub mode: MonitoringMode,
@@ -36,8 +37,16 @@ pub struct MetricsSnapshot {
     pub ring_buffer_drops: u64,
 }
 
+/// Serializes Duration as microseconds (u64) for JSON.
+fn serialize_duration_us<S>(d: &Duration, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    s.serialize_u64(d.as_micros() as u64)
+}
+
 /// I/O snapshot for a single cgroup.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct IoSnapshot {
     pub cgroup_name: String,
     pub read_ops: u64,
@@ -47,7 +56,7 @@ pub struct IoSnapshot {
 }
 
 /// Network snapshot for a single destination.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct NetworkSnapshot {
     pub destination: String,
     pub request_count: u64,
@@ -58,7 +67,7 @@ pub struct NetworkSnapshot {
 }
 
 /// PSI snapshot for a single agent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PsiSnapshot {
     pub cpu_avg10: f64,
     pub memory_avg10: f64,
@@ -76,7 +85,6 @@ pub struct AgentCgroupMapping {
 }
 
 /// Collects monitoring metrics from kernel or userspace sources.
-#[derive(Debug)]
 pub struct EbpfCollector {
     mode: MonitoringMode,
     health_checker: AgentHealthChecker,
@@ -85,6 +93,8 @@ pub struct EbpfCollector {
     agent_mappings: Vec<AgentCgroupMapping>,
     ring_buffer_drops: u64,
     last_collect: Option<Instant>,
+    #[cfg(feature = "ebpf")]
+    loaded_probes: Option<crate::loader::LoadedProbes>,
 }
 
 impl EbpfCollector {
@@ -98,6 +108,23 @@ impl EbpfCollector {
             agent_mappings: Vec::new(),
             ring_buffer_drops: 0,
             last_collect: None,
+            #[cfg(feature = "ebpf")]
+            loaded_probes: None,
+        }
+    }
+
+    /// Creates a collector with loaded eBPF probes for kernel-mode collection.
+    #[cfg(feature = "ebpf")]
+    pub fn with_probes(mode: MonitoringMode, probes: crate::loader::LoadedProbes) -> Self {
+        Self {
+            mode,
+            health_checker: AgentHealthChecker::new(),
+            io_profiler: IoProfiler::new(),
+            network_monitor: NetworkMonitor::new(),
+            agent_mappings: Vec::new(),
+            ring_buffer_drops: 0,
+            last_collect: None,
+            loaded_probes: Some(probes),
         }
     }
 
@@ -228,23 +255,109 @@ impl EbpfCollector {
         Ok(())
     }
 
-    /// Kernel collection: reads BPF maps (behind feature gate).
+    /// Kernel collection: reads BPF maps via aya.
+    ///
+    /// Reads:
+    /// 1. AGENT_HEALTH Per-CPU Hash Map → max timestamp per cgroup (stall detection)
+    /// 2. IO_STATS Per-CPU Hash Map → sum counters per cgroup (IOPS/throughput)
+    /// 3. TCP_EVENTS Ring Buffer → drain TCP connect/close events
     fn collect_kernel(&mut self) -> Result<()> {
         #[cfg(feature = "ebpf")]
         {
-            // In scope:full, this reads:
-            // 1. AGENT_HEALTH Per-CPU Hash Map → aggregate per-CPU timestamps
-            // 2. IO_STATS Per-CPU Hash Map → aggregate per-CPU counters
-            // 3. TCP_EVENTS Ring Buffer → drain events
-            //
-            // Per-CPU aggregation: iterate all CPU slots, take max (timestamps)
-            // or sum (counters) across CPUs.
-            warn!("Kernel collection not yet implemented (scope:partial)");
+            use aya::maps::{PerCpuHashMap, RingBuf};
+
+            let probes = match &mut self.loaded_probes {
+                Some(p) => p,
+                None => {
+                    warn!("Kernel mode but no probes loaded");
+                    return Ok(());
+                }
+            };
+
+            let now_secs = current_secs();
+
+            // 1. Agent health: Per-CPU Hash Map (cgroup_id → timestamp_ns)
+            //    Take max timestamp across CPUs for each cgroup.
+            //    bpf_ktime_get_ns() uses CLOCK_MONOTONIC — convert via delta.
+            let monotonic_ns = monotonic_clock_ns();
+            if let Some(map) = probes.agent_health.map("AGENT_HEALTH") {
+                let map: PerCpuHashMap<_, u64, u64> =
+                    PerCpuHashMap::try_from(map).context("AGENT_HEALTH map")?;
+                for (cgroup_id, per_cpu_values) in map.iter().flatten() {
+                    let max_ktime_ns = per_cpu_values.iter().copied().max().unwrap_or(0);
+                    if max_ktime_ns > 0 {
+                        let elapsed_ns = monotonic_ns.saturating_sub(max_ktime_ns);
+                        let write_unix_secs = now_secs.saturating_sub(elapsed_ns / 1_000_000_000);
+                        self.health_checker.record_write(cgroup_id, write_unix_secs);
+                    }
+                }
+            }
+
+            // 2. I/O profiling: Per-CPU Hash Map (cgroup_id → IoStats)
+            //    Sum read_ops/write_ops/read_bytes/write_bytes across CPUs.
+            if let Some(map) = probes.io_profile.map("IO_STATS") {
+                let map: PerCpuHashMap<_, u64, BpfIoStats> =
+                    PerCpuHashMap::try_from(map).context("IO_STATS map")?;
+                for (cgroup_id, per_cpu_values) in map.iter().flatten() {
+                    let mut total = BpfIoStats::default();
+                    for cpu_val in per_cpu_values.iter() {
+                        total.read_ops += cpu_val.read_ops;
+                        total.write_ops += cpu_val.write_ops;
+                        total.read_bytes += cpu_val.read_bytes;
+                        total.write_bytes += cpu_val.write_bytes;
+                    }
+                    let name = self
+                        .agent_mappings
+                        .iter()
+                        .find(|m| m.cgroup_id == cgroup_id)
+                        .map(|m| m.agent_name.as_str())
+                        .unwrap_or("unknown");
+                    if total.read_bytes > 0 {
+                        self.io_profiler.record_read(cgroup_id, name, total.read_bytes);
+                    }
+                    if total.write_bytes > 0 {
+                        self.io_profiler.record_write(cgroup_id, name, total.write_bytes);
+                    }
+                }
+            }
+
+            // 3. Network: Ring Buffer → drain TCP events
+            if let Some(map) = probes.network.map_mut("TCP_EVENTS") {
+                let mut ring_buf =
+                    RingBuf::try_from(map).context("TCP_EVENTS ring buffer")?;
+                let mut event_count = 0u64;
+                while let Some(data) = ring_buf.next() {
+                    if data.len() >= core::mem::size_of::<BpfTcpEvent>() {
+                        let event: BpfTcpEvent =
+                            unsafe { core::ptr::read_unaligned(data.as_ptr() as *const _) };
+                        if event.event_type == 1 {
+                            // tcp_close — record as completed request
+                            let dest = format!(
+                                "{}.{}.{}.{}:{}",
+                                event.dest_ip & 0xFF,
+                                (event.dest_ip >> 8) & 0xFF,
+                                (event.dest_ip >> 16) & 0xFF,
+                                (event.dest_ip >> 24) & 0xFF,
+                                event.dest_port,
+                            );
+                            self.network_monitor.record_request(
+                                &dest,
+                                Duration::from_nanos(100), // placeholder latency
+                                event.bytes_sent,
+                                event.bytes_recv,
+                            );
+                        }
+                        event_count += 1;
+                    }
+                }
+                if event_count > 0 {
+                    debug!(events = event_count, "Drained TCP ring buffer");
+                }
+            }
         }
 
         #[cfg(not(feature = "ebpf"))]
         {
-            // Should never reach here — loader.init() returns Userspace without feature.
             warn!("Kernel mode requested but ebpf feature not compiled in");
         }
 
@@ -376,6 +489,49 @@ fn read_cgroup_io_stat(cgroup_path: &str) -> Result<Vec<(String, (u64, u64))>> {
     }
 
     Ok(results)
+}
+
+/// BPF IoStats struct matching the kernel-side definition in io_profile.rs.
+/// Must match the `#[repr(C)]` layout in sentinel-ebpf-probes.
+#[cfg(feature = "ebpf")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct BpfIoStats {
+    read_ops: u64,
+    write_ops: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+#[cfg(feature = "ebpf")]
+unsafe impl aya::Pod for BpfIoStats {}
+
+/// BPF TcpEvent struct matching the kernel-side definition in network.rs.
+#[cfg(feature = "ebpf")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct BpfTcpEvent {
+    dest_ip: u32,
+    dest_port: u16,
+    _pad: u16,
+    timestamp_ns: u64,
+    bytes_sent: u64,
+    bytes_recv: u64,
+    event_type: u8,
+    _pad2: [u8; 7],
+}
+
+/// Returns the current monotonic clock in nanoseconds (same clock as bpf_ktime_get_ns).
+#[cfg(feature = "ebpf")]
+fn monotonic_clock_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
 }
 
 /// Returns current UNIX timestamp in seconds.

@@ -56,7 +56,7 @@ fn try_io_profile(ctx: TracePointContext) -> Result<u32, u32> {
     let is_write = rwbs == b'W' || rwbs == b'w';
 
     // Get or create entry for this cgroup.
-    if let Some(stats) = unsafe { IO_STATS.get_ptr_mut(&cgroup_id) } {
+    if let Some(stats) = IO_STATS.get_ptr_mut(&cgroup_id) {
         let stats = unsafe { &mut *stats };
         if is_write {
             stats.write_ops += 1;

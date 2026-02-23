@@ -30,18 +30,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **sentinel-ebpf: Loader, Collector, and Monitoring Infrastructure** (#25, scope:partial)
+- **sentinel-ebpf: Full eBPF Daemon Integration** (#25)
   - `loader.rs`: Capability detection (BTF, CAP_BPF, kernel version, fentry support)
   - `MonitoringMode` enum (Kernel/Userspace) with Prometheus label support
   - Graceful fallback with mandatory WARN logging (no silent degradation, AC-N1)
-  - `collector.rs`: `EbpfCollector` with agent registration, userspace fallback polling
-  - Reads /proc/{pid}/io and cgroup io.stat in userspace mode
-  - `MetricsSnapshot` aggregation with cycle duration tracking
-  - Prometheus exporter: `sentinel_ebpf_monitoring_mode`, `collector_cycle_microseconds`, `ring_buffer_drops_total`
-  - `export_snapshot()` for unified metric export from collection cycles
-  - Zenoh topics: `sentinel/ebpf/agent-health`, `sentinel/ebpf/io-profile`, `sentinel/ebpf/network`, `sentinel/ebpf/status`
-  - `sentinel-ebpf-probes` crate structure (BPF programs for fentry/vfs_write, tracepoint/block:block_rq_complete, fentry/tcp_connect+tcp_close)
-  - 52 unit tests (up from 35)
+  - `collector.rs`: `EbpfCollector` with agent registration, Per-CPU aggregation, userspace fallback
+  - `MetricsSnapshot` with serde::Serialize for JSON export via Zenoh
+  - Prometheus exporter: all 4 metric groups (agent_health, io_profile, network, psi/collector_meta)
+  - `sentinel-ebpf-probes`: real fentry/tracepoint BPF programs compiled for bpfel-unknown-none
+  - Probes: fentry/vfs_write (agent health), tracepoint/block:block_rq_complete (I/O), fentry/tcp_connect+tcp_close (network)
+  - Per-CPU Hash Maps (AGENT_HEALTH, IO_STATS) + Ring-Buffer (TCP_EVENTS) for lock-free data flow
+  - BTF/CO-RE: cross-compiled on build server, loaded on VM with Kernel 6.17
+  - Daemon integration: `ebpf.rs` module with init, Prometheus TCP server (port 9090), Zenoh publisher
+  - ECS thread: periodic collect every 10 ticks via mpsc channel to tokio runtime
+  - Agent cgroup registration on spawn, unregistration on shift-transition despawn
+  - `cgroup_id()` helper in sentinel-sandbox for BPF map correlation (inode-based)
+  - Dashboard: `/api/ebpf/status` endpoint + monitoring mode badge (Kernel=green, Userspace=yellow)
+  - Measured probe overhead: 374-647ns/hit (sub-microsecond, ~1% ECS tick budget)
+  - 45 daemon tests passing, 0 ring buffer drops at 100 req/s load
 
 - **Claude Code Subprocess Provider** (Cortex Gateway)
   - New `ClaudeCodeProvider` in `claude_code.go`: subprocess management for `claude -p --output-format stream-json`

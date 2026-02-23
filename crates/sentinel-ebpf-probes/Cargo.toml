@@ -6,15 +6,21 @@ license = "MIT"
 publish = false
 description = "eBPF probe programs for sentinel monitoring (target: bpfel-unknown-none)"
 
-# NOTE: This crate is NOT part of the workspace.
-# It must be built separately with:
-#   cargo +nightly build -Z build-std=core --target bpfel-unknown-none
-# or via aya-bpf-linker toolchain.
-# The compiled .o files are loaded by sentinel-ebpf at runtime.
+# This crate is excluded from the workspace (see root Cargo.toml).
+# Build separately with:
+#   cargo +nightly build -Z build-std=core --target bpfel-unknown-none --release
+# The compiled binaries are embedded into sentinel-ebpf via include_bytes!.
+[workspace]
 
 [dependencies]
-aya-ebpf = "0.1"
-aya-log-ebpf = "0.1"
+# Git main required: crates.io aya-ebpf 0.1.x generates incompatible BTF map
+# definitions (UnsafeCell wrapper with 'def' field). Git main uses flat repr(C)
+# structs that both aya-obj and libbpf can parse. See aya-rs/aya#903, #913.
+aya-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
+aya-log-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
+
+[profile.release]
+codegen-units = 1
 
 [[bin]]
 name = "agent-health"

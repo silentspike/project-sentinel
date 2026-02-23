@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+exclude = [
+    "crates/sentinel-ebpf-probes",
+]
 members = [
     "crates/sentinel-ecs",
     "crates/sentinel-bio",

@@ -26,6 +26,8 @@ pub mod psi;
 
 pub use collector::{AgentCgroupMapping, EbpfCollector, MetricsSnapshot};
 pub use exporter::MetricsExporter;
-pub use loader::{CapabilityReport, MonitoringMode};
+pub use loader::{CapabilityReport, InitResult, MonitoringMode};
+#[cfg(feature = "ebpf")]
+pub use loader::LoadedProbes;
 pub use probes::{AgentHealthChecker, IoMetrics, IoProfiler, NetworkMetrics, NetworkMonitor};
 pub use psi::PsiReader;

@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -21,6 +21,8 @@ use tracing::{error, info, warn};
 use sentinel_common::agent_config::{AgentConfig, load_all_agents};
 use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::{AgentId, Perception};
+use sentinel_ebpf::collector::MetricsSnapshot;
+use sentinel_ebpf::EbpfCollector;
 use sentinel_ecs::{
     attach_redb_store, create_simulation_world, despawn_agent_from_world, spawn_agent,
     ActionReceiver, EventBuffer, LimboEventStore, PerceptionSender, SimulationTime,
@@ -223,6 +225,14 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let controlplane =
         ControlplaneKernel::new(cp_config, cp_store).context("Controlplane-Kernel erstellen")?;
 
+    // -- eBPF Monitoring initialisieren --
+    let (ebpf_collector, ebpf_mode) = crate::ebpf::init_ebpf();
+    info!(mode = %ebpf_mode, "eBPF Monitoring initialisiert");
+
+    // -- eBPF Bridge: mpsc + shared Prometheus Text --
+    let (ebpf_tx, ebpf_rx) = tokio::sync::mpsc::channel::<MetricsSnapshot>(4);
+    let prometheus_text = Arc::new(RwLock::new(String::new()));
+
     // -- Channels fuer ECS <-> Async Bridge --
     let (action_tx, action_rx) = mpsc::channel();
     let (perception_tx, perception_rx) = mpsc::sync_channel::<Perception>(64);
@@ -251,9 +261,19 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 controlplane,
                 runtime_orch,
                 sandbox,
+                ebpf_collector,
+                ebpf_tx,
             )
         })
         .context("ECS Thread spawnen")?;
+
+    // -- Prometheus eBPF Metrics Server (Port 9090) --
+    let prom_text = Arc::clone(&prometheus_text);
+    tokio::spawn(crate::ebpf::prometheus_server(prom_text, 9090));
+
+    // -- eBPF Zenoh Publisher + Prometheus Text Renderer --
+    let prom_text = Arc::clone(&prometheus_text);
+    tokio::spawn(crate::ebpf::ebpf_publisher(ebpf_rx, prom_text));
 
     // -- LLM Bridge starten (Perception → Cortex Gateway → Action) --
     #[cfg(feature = "llm")]
@@ -330,6 +350,8 @@ fn ecs_tick_loop(
     mut controlplane: ControlplaneKernel,
     mut runtime_orch: RuntimeOrchestrator,
     sandbox: SandboxEnforcer,
+    mut ebpf_collector: EbpfCollector,
+    ebpf_tx: tokio::sync::mpsc::Sender<MetricsSnapshot>,
 ) -> Result<u64> {
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
@@ -396,6 +418,17 @@ fn ecs_tick_loop(
                     elapsed_us = elapsed.as_micros(),
                     "Sandbox setup abgeschlossen"
                 );
+                // eBPF Agent-Registrierung (cgroup_id fuer BPF Map Correlation)
+                if handle.cgroup_created {
+                    if let Some(cid) = sentinel_sandbox::cgroup_id(&agent_cfg.identity.name) {
+                        ebpf_collector.register_agent(sentinel_ebpf::AgentCgroupMapping {
+                            agent_name: agent_cfg.identity.name.clone(),
+                            cgroup_path: sentinel_sandbox::cgroup_path(&agent_cfg.identity.name),
+                            cgroup_id: cid,
+                            pid: None,
+                        });
+                    }
+                }
                 sandbox_handles.insert(agent_id, handle);
             }
             Err(e) => {
@@ -470,6 +503,12 @@ fn ecs_tick_loop(
                 for agent_id in &removed {
                     // Sandbox teardown VOR ECS despawn
                     if let Some(handle) = sandbox_handles.remove(agent_id) {
+                        // eBPF Agent-Unregistrierung
+                        if handle.cgroup_created {
+                            if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
+                                ebpf_collector.unregister_agent(cid);
+                            }
+                        }
                         if let Err(e) = sandbox.teardown_agent(&handle) {
                             warn!(agent_id = %agent_id, error = %e, "Sandbox teardown fehlgeschlagen");
                         }
@@ -515,6 +554,19 @@ fn ecs_tick_loop(
             }
         }
 
+        // eBPF Metrics Collection (alle 10 Ticks = ~10s bei 1s Tick-Rate)
+        if tick_count > 0 && tick_count.is_multiple_of(10) {
+            match ebpf_collector.collect() {
+                Ok(snapshot) => {
+                    // try_send: Non-blocking, dropped wenn Buffer voll (kein Backpressure)
+                    let _ = ebpf_tx.try_send(snapshot);
+                }
+                Err(e) => {
+                    warn!(error = %e, tick = tick_count, "eBPF collect fehlgeschlagen");
+                }
+            }
+        }
+
         tick_count += 1;
 
         if tick_count.is_multiple_of(60) {
@@ -556,8 +608,16 @@ mod tests {
     use sentinel_common::agent_config::{
         BackgroundConfig, IdentityConfig, PersonalityConfig, PreferencesConfig,
     };
+    use sentinel_ebpf::loader::MonitoringMode;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+
+    /// Erstellt EbpfCollector + tokio mpsc Sender fuer Tests (Userspace mode, kein tokio noetig).
+    fn test_ebpf() -> (EbpfCollector, tokio::sync::mpsc::Sender<MetricsSnapshot>) {
+        let collector = EbpfCollector::new(MonitoringMode::Userspace);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        (collector, tx)
+    }
 
     fn test_controlplane(tmp: &tempfile::TempDir) -> ControlplaneKernel {
         let cp_path = tmp.path().join("controlplane.redb");
@@ -621,6 +681,7 @@ mod tests {
         let runtime_orch =
             RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
 
+        let (ebpf_collector, ebpf_tx) = test_ebpf();
         let result = ecs_tick_loop(
             state_store,
             event_store,
@@ -633,6 +694,8 @@ mod tests {
             controlplane,
             runtime_orch,
             test_sandbox(),
+            ebpf_collector,
+            ebpf_tx,
         );
 
         assert!(result.is_ok());
@@ -660,12 +723,13 @@ mod tests {
             RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
         let all_agents = vec![test_agent_config(1, "Test Agent", "Tester", 1)];
 
-        // Shutdown nach 250ms
+        // Shutdown nach 500ms (genug Spielraum fuer Build-Server unter Last)
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(250));
+            std::thread::sleep(Duration::from_millis(500));
             shutdown_clone.store(true, Ordering::SeqCst);
         });
 
+        let (ebpf_collector, ebpf_tx) = test_ebpf();
         let result = ecs_tick_loop(
             state_store,
             event_store,
@@ -678,6 +742,8 @@ mod tests {
             controlplane,
             runtime_orch,
             test_sandbox(),
+            ebpf_collector,
+            ebpf_tx,
         );
 
         assert!(result.is_ok());
@@ -716,6 +782,7 @@ mod tests {
         });
 
         let es_clone = Arc::clone(&event_store);
+        let (ebpf_collector, ebpf_tx) = test_ebpf();
         let result = ecs_tick_loop(
             state_store,
             event_store,
@@ -728,6 +795,8 @@ mod tests {
             controlplane,
             runtime_orch,
             test_sandbox(),
+            ebpf_collector,
+            ebpf_tx,
         );
 
         assert!(result.is_ok());

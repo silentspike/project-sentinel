@@ -164,6 +164,18 @@ main { padding: 2rem; }
 .activity-empty { color: var(--text-secondary); font-style: italic; padding: 2rem 0; }
 
 /* Metrics */
+.ebpf-badge {
+  display: inline-block;
+  padding: 0.4rem 1rem;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+  border: 1px solid var(--border);
+}
+.ebpf-badge.kernel { background: rgba(76, 175, 80, 0.2); color: var(--success); border-color: var(--success); }
+.ebpf-badge.userspace { background: rgba(255, 152, 0, 0.2); color: var(--warning); border-color: var(--warning); }
+.ebpf-badge.unavailable, .ebpf-badge.loading { background: var(--bg-card); color: var(--text-secondary); }
 .metrics-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem; }
 .metric-card {
   background: var(--bg-card);
