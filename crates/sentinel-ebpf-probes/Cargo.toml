@@ -1,0 +1,29 @@
+[package]
+name = "sentinel-ebpf-probes"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "eBPF probe programs for sentinel monitoring (target: bpfel-unknown-none)"
+
+# NOTE: This crate is NOT part of the workspace.
+# It must be built separately with:
+#   cargo +nightly build -Z build-std=core --target bpfel-unknown-none
+# or via aya-bpf-linker toolchain.
+# The compiled .o files are loaded by sentinel-ebpf at runtime.
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+
+[[bin]]
+name = "agent-health"
+path = "src/agent_health.rs"
+
+[[bin]]
+name = "io-profile"
+path = "src/io_profile.rs"
+
+[[bin]]
+name = "network"
+path = "src/network.rs"

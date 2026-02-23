@@ -13,6 +13,8 @@ ebpf = ["aya", "aya-log"]
 [dependencies]
 anyhow = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

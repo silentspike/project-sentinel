@@ -5,7 +5,10 @@
 //! - I/O profiling (ops and bytes per cgroup)
 //! - Network monitoring (latency, throughput, errors)
 //! - PSI stress factors
+//! - Collector meta-metrics (cycle time, mode, drops)
 
+use crate::collector::MetricsSnapshot;
+use crate::loader::MonitoringMode;
 use crate::probes::agent_health::AgentHealthChecker;
 use crate::probes::io_profile::IoProfiler;
 use crate::probes::network::NetworkMonitor;
@@ -125,7 +128,40 @@ impl MetricsExporter {
         output
     }
 
-    /// Exports all metrics combined.
+    /// Exports collector meta-metrics (monitoring mode, cycle time, drop rate).
+    pub fn export_collector_meta(mode: MonitoringMode, cycle_us: u64, drops: u64) -> String {
+        let mut output = String::new();
+
+        output
+            .push_str("# HELP sentinel_ebpf_monitoring_mode Current monitoring mode (1=active)\n");
+        output.push_str("# TYPE sentinel_ebpf_monitoring_mode gauge\n");
+        output.push_str(&format!(
+            "sentinel_ebpf_monitoring_mode{{mode=\"{}\"}} 1\n",
+            mode.as_str()
+        ));
+
+        output.push_str(
+            "# HELP sentinel_ebpf_collector_cycle_microseconds Collection cycle duration\n",
+        );
+        output.push_str("# TYPE sentinel_ebpf_collector_cycle_microseconds gauge\n");
+        output.push_str(&format!(
+            "sentinel_ebpf_collector_cycle_microseconds {}\n",
+            cycle_us
+        ));
+
+        output.push_str(
+            "# HELP sentinel_ebpf_ring_buffer_drops_total Ring buffer events dropped\n",
+        );
+        output.push_str("# TYPE sentinel_ebpf_ring_buffer_drops_total counter\n");
+        output.push_str(&format!(
+            "sentinel_ebpf_ring_buffer_drops_total {}\n",
+            drops
+        ));
+
+        output
+    }
+
+    /// Exports all metrics combined (legacy API).
     pub fn export_all(
         checker: &AgentHealthChecker,
         profiler: &IoProfiler,
@@ -136,6 +172,94 @@ impl MetricsExporter {
         output.push_str(&Self::export_agent_health(checker, now_secs));
         output.push_str(&Self::export_io_profile(profiler));
         output.push_str(&Self::export_network(monitor));
+        output
+    }
+
+    /// Exports all metrics from a collected snapshot.
+    pub fn export_snapshot(snapshot: &MetricsSnapshot) -> String {
+        let mut output = String::new();
+
+        // Collector meta-metrics.
+        output.push_str(&Self::export_collector_meta(
+            snapshot.mode,
+            snapshot.cycle_duration.as_micros() as u64,
+            snapshot.ring_buffer_drops,
+        ));
+
+        // Stalled agents.
+        output.push_str(
+            "# HELP sentinel_agent_stalled Whether agent is stalled (1=stalled)\n",
+        );
+        output.push_str("# TYPE sentinel_agent_stalled gauge\n");
+        for cgroup_id in &snapshot.stalled_agents {
+            output.push_str(&format!(
+                "sentinel_agent_stalled{{cgroup_id=\"{}\"}} 1\n",
+                cgroup_id
+            ));
+        }
+
+        // I/O metrics from snapshot.
+        output.push_str("# HELP sentinel_io_ops_total Total I/O operations per cgroup\n");
+        output.push_str("# TYPE sentinel_io_ops_total counter\n");
+        output.push_str("# HELP sentinel_io_bytes_total Total I/O bytes per cgroup\n");
+        output.push_str("# TYPE sentinel_io_bytes_total counter\n");
+        for (cgroup_id, io) in &snapshot.io_metrics {
+            let name = &io.cgroup_name;
+            output.push_str(&format!(
+                "sentinel_io_ops_total{{cgroup_id=\"{}\",cgroup_name=\"{}\",direction=\"read\"}} {}\n",
+                cgroup_id, name, io.read_ops
+            ));
+            output.push_str(&format!(
+                "sentinel_io_ops_total{{cgroup_id=\"{}\",cgroup_name=\"{}\",direction=\"write\"}} {}\n",
+                cgroup_id, name, io.write_ops
+            ));
+            output.push_str(&format!(
+                "sentinel_io_bytes_total{{cgroup_id=\"{}\",cgroup_name=\"{}\",direction=\"read\"}} {}\n",
+                cgroup_id, name, io.read_bytes
+            ));
+            output.push_str(&format!(
+                "sentinel_io_bytes_total{{cgroup_id=\"{}\",cgroup_name=\"{}\",direction=\"write\"}} {}\n",
+                cgroup_id, name, io.write_bytes
+            ));
+        }
+
+        // Network metrics from snapshot.
+        output.push_str("# HELP sentinel_llm_request_duration_seconds LLM API request latency\n");
+        output.push_str("# TYPE sentinel_llm_request_duration_seconds summary\n");
+        output.push_str("# HELP sentinel_llm_requests_total Total LLM API requests\n");
+        output.push_str("# TYPE sentinel_llm_requests_total counter\n");
+        output.push_str("# HELP sentinel_llm_errors_total Total LLM API errors\n");
+        output.push_str("# TYPE sentinel_llm_errors_total counter\n");
+        for net in snapshot.network_metrics.values() {
+            if net.avg_latency_us > 0 {
+                output.push_str(&format!(
+                    "sentinel_llm_request_duration_seconds{{destination=\"{}\"}} {:.6}\n",
+                    net.destination,
+                    net.avg_latency_us as f64 / 1_000_000.0
+                ));
+            }
+            output.push_str(&format!(
+                "sentinel_llm_requests_total{{destination=\"{}\"}} {}\n",
+                net.destination, net.request_count
+            ));
+            output.push_str(&format!(
+                "sentinel_llm_errors_total{{destination=\"{}\"}} {}\n",
+                net.destination, net.error_count
+            ));
+        }
+
+        // PSI metrics from snapshot.
+        output.push_str(
+            "# HELP sentinel_agent_cpu_pressure_stress CPU pressure stress factor (0-1)\n",
+        );
+        output.push_str("# TYPE sentinel_agent_cpu_pressure_stress gauge\n");
+        for (agent, psi) in &snapshot.psi_metrics {
+            output.push_str(&format!(
+                "sentinel_agent_cpu_pressure_stress{{agent=\"{}\"}} {:.4}\n",
+                agent, psi.combined_stress
+            ));
+        }
+
         output
     }
 }
@@ -219,5 +343,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn export_collector_meta_format() {
+        let output =
+            MetricsExporter::export_collector_meta(MonitoringMode::Userspace, 5000, 0);
+        assert!(output.contains("sentinel_ebpf_monitoring_mode{mode=\"userspace\"} 1"));
+        assert!(output.contains("sentinel_ebpf_collector_cycle_microseconds 5000"));
+        assert!(output.contains("sentinel_ebpf_ring_buffer_drops_total 0"));
+    }
+
+    #[test]
+    fn export_collector_meta_kernel_mode() {
+        let output =
+            MetricsExporter::export_collector_meta(MonitoringMode::Kernel, 50, 3);
+        assert!(output.contains("sentinel_ebpf_monitoring_mode{mode=\"kernel\"} 1"));
+        assert!(output.contains("sentinel_ebpf_collector_cycle_microseconds 50"));
+        assert!(output.contains("sentinel_ebpf_ring_buffer_drops_total 3"));
+    }
+
+    #[test]
+    fn export_snapshot_empty() {
+        use crate::collector::MetricsSnapshot;
+        use std::collections::HashMap;
+
+        let snapshot = MetricsSnapshot {
+            stalled_agents: vec![],
+            io_metrics: HashMap::new(),
+            network_metrics: HashMap::new(),
+            psi_metrics: HashMap::new(),
+            cycle_duration: Duration::from_micros(100),
+            mode: MonitoringMode::Userspace,
+            ring_buffer_drops: 0,
+        };
+        let output = MetricsExporter::export_snapshot(&snapshot);
+        assert!(output.contains("sentinel_ebpf_monitoring_mode{mode=\"userspace\"} 1"));
+        assert!(output.contains("sentinel_ebpf_collector_cycle_microseconds 100"));
+    }
+
+    #[test]
+    fn export_snapshot_with_data() {
+        use crate::collector::{IoSnapshot, MetricsSnapshot, NetworkSnapshot, PsiSnapshot};
+        use std::collections::HashMap;
+
+        let mut io_metrics = HashMap::new();
+        io_metrics.insert(
+            1,
+            IoSnapshot {
+                cgroup_name: "agent-01".to_string(),
+                read_ops: 100,
+                write_ops: 50,
+                read_bytes: 409600,
+                write_bytes: 204800,
+            },
+        );
+
+        let mut network_metrics = HashMap::new();
+        network_metrics.insert(
+            "api.anthropic.com:443".to_string(),
+            NetworkSnapshot {
+                destination: "api.anthropic.com:443".to_string(),
+                request_count: 10,
+                avg_latency_us: 150_000,
+                bytes_sent: 10240,
+                bytes_received: 40960,
+                error_count: 1,
+            },
+        );
+
+        let mut psi_metrics = HashMap::new();
+        psi_metrics.insert(
+            "AGENT-01".to_string(),
+            PsiSnapshot {
+                cpu_avg10: 25.0,
+                memory_avg10: 10.0,
+                io_avg10: 5.0,
+                combined_stress: 0.175,
+            },
+        );
+
+        let snapshot = MetricsSnapshot {
+            stalled_agents: vec![42],
+            io_metrics,
+            network_metrics,
+            psi_metrics,
+            cycle_duration: Duration::from_micros(500),
+            mode: MonitoringMode::Userspace,
+            ring_buffer_drops: 0,
+        };
+
+        let output = MetricsExporter::export_snapshot(&snapshot);
+        assert!(output.contains("sentinel_agent_stalled{cgroup_id=\"42\"} 1"));
+        assert!(output.contains("cgroup_name=\"agent-01\""));
+        assert!(output.contains("sentinel_llm_requests_total{destination=\"api.anthropic.com:443\"} 10"));
+        assert!(output.contains("sentinel_agent_cpu_pressure_stress{agent=\"AGENT-01\"}"));
     }
 }
