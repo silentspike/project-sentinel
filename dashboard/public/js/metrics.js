@@ -2,6 +2,14 @@ export function renderMetrics(metrics) {
   const container = document.getElementById('view-metrics');
   while (container.firstChild) container.removeChild(container.firstChild);
 
+  // eBPF Monitoring Mode Badge
+  const badge = document.createElement('div');
+  badge.id = 'ebpf-mode-badge';
+  badge.className = 'ebpf-badge loading';
+  badge.textContent = 'eBPF: ...';
+  container.appendChild(badge);
+  fetchEbpfStatus(badge);
+
   const grid = document.createElement('div');
   grid.className = 'metrics-grid';
 
@@ -53,4 +61,17 @@ function formatNumber(n) {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
   if (n >= 1_000) return (n / 1_000).toFixed(1) + 'k';
   return String(n);
+}
+
+function fetchEbpfStatus(badge) {
+  fetch('/api/ebpf/status')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      badge.className = 'ebpf-badge ' + (data.mode === 'kernel' ? 'kernel' : data.mode === 'userspace' ? 'userspace' : 'unavailable');
+      badge.textContent = 'eBPF: ' + (data.mode === 'kernel' ? 'Kernel' : data.mode === 'userspace' ? 'Userspace' : 'N/A');
+    })
+    .catch(function() {
+      badge.className = 'ebpf-badge unavailable';
+      badge.textContent = 'eBPF: N/A';
+    });
 }

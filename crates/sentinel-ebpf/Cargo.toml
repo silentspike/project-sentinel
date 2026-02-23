@@ -8,7 +8,7 @@ publish = false
 [features]
 default = []
 # Feature-gate for real eBPF probe loading (requires CAP_BPF)
-ebpf = ["aya", "aya-log"]
+ebpf = ["aya", "aya-log", "libc", "object"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -18,10 +18,26 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 # eBPF framework (behind feature gate - requires CAP_BPF at runtime)
-aya = { version = "0.13", optional = true }
-aya-log = { version = "0.2", optional = true }
+# Git main required: crates.io versions have incompatible BTF map format.
+# See aya-rs/aya#903, #913, #351.
+aya = { git = "https://github.com/aya-rs/aya", default-features = false, optional = true }
+aya-log = { git = "https://github.com/aya-rs/aya", default-features = false, optional = true }
+libc = { version = "0.2", optional = true }
+object = { version = "0.38", optional = true, default-features = false, features = ["elf", "read_core"] }
+
+[[bin]]
+name = "ebpf-verify"
+path = "src/bin/ebpf-verify.rs"
+required-features = ["ebpf"]
+
+[[bin]]
+name = "elf-debug"
+path = "src/bin/elf-debug.rs"
+required-features = ["ebpf"]
 
 [dev-dependencies]
 approx = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -8,7 +8,7 @@ use std::path::Path;
 use tracing::{info, warn};
 
 /// Monitoring mode determined at startup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum MonitoringMode {
     /// eBPF probes loaded in kernel. Near-zero overhead.
     Kernel,
@@ -99,28 +99,43 @@ pub fn detect_capabilities() -> CapabilityReport {
     report
 }
 
+/// Result of monitoring initialization.
+pub struct InitResult {
+    /// The active monitoring mode.
+    pub mode: MonitoringMode,
+    /// Loaded eBPF probes (only Some in kernel mode with `ebpf` feature).
+    #[cfg(feature = "ebpf")]
+    pub probes: Option<LoadedProbes>,
+}
+
 /// Initializes monitoring in the determined mode.
 ///
 /// In kernel mode (with `ebpf` feature): loads BPF programs via aya.
 /// In userspace mode: sets up /proc and cgroup polling.
 ///
-/// Returns the active monitoring mode.
-pub fn init() -> MonitoringMode {
+/// Returns the active monitoring mode and loaded probes (if any).
+pub fn init() -> InitResult {
     let report = detect_capabilities();
 
     #[cfg(feature = "ebpf")]
     if report.mode == MonitoringMode::Kernel {
         match load_ebpf_probes() {
-            Ok(()) => {
-                info!("eBPF probes loaded successfully");
-                return MonitoringMode::Kernel;
+            Ok(probes) => {
+                info!("eBPF probes loaded successfully (kernel mode)");
+                return InitResult {
+                    mode: MonitoringMode::Kernel,
+                    probes: Some(probes),
+                };
             }
             Err(e) => {
                 warn!(
                     error = %e,
                     "eBPF probe loading failed, falling back to userspace monitoring"
                 );
-                return MonitoringMode::Userspace;
+                return InitResult {
+                    mode: MonitoringMode::Userspace,
+                    probes: None,
+                };
             }
         }
     }
@@ -133,7 +148,11 @@ pub fn init() -> MonitoringMode {
         );
     }
 
-    MonitoringMode::Userspace
+    InitResult {
+        mode: MonitoringMode::Userspace,
+        #[cfg(feature = "ebpf")]
+        probes: None,
+    }
 }
 
 /// Checks whether /sys/kernel/btf/vmlinux exists.
@@ -207,18 +226,99 @@ fn determine_mode(btf: bool, cap_bpf: bool, fentry: bool) -> (MonitoringMode, St
     )
 }
 
-/// Loads eBPF probes via aya (only with `ebpf` feature).
+/// Compiled BPF probe bytecode (embedded at compile time).
 #[cfg(feature = "ebpf")]
-fn load_ebpf_probes() -> anyhow::Result<()> {
-    // In scope:full, this will:
-    // 1. Load compiled BPF .o files from embedded bytes or filesystem
-    // 2. Attach fentry probes to vfs_write, tcp_connect, tcp_close
-    // 3. Attach tracepoint to block:block_rq_complete
-    // 4. Return handles for map access
-    //
-    // For scope:partial, we detect capabilities but don't load probes.
-    // The aya dependency is compiled but probe objects are not yet available.
-    anyhow::bail!("Probe objects not yet available (scope:partial)")
+const AGENT_HEALTH_PROBE: &[u8] = include_bytes!("../probes/agent-health.o");
+#[cfg(feature = "ebpf")]
+const IO_PROFILE_PROBE: &[u8] = include_bytes!("../probes/io-profile.o");
+#[cfg(feature = "ebpf")]
+const NETWORK_PROBE: &[u8] = include_bytes!("../probes/network.o");
+
+/// Loaded eBPF programs with attached probes and accessible maps.
+///
+/// Holds the `Ebpf` objects that own the BPF programs. Dropping this
+/// struct detaches all probes and frees BPF maps.
+#[cfg(feature = "ebpf")]
+pub struct LoadedProbes {
+    /// Agent health probe (fentry/vfs_write). Owns the AGENT_HEALTH BPF map.
+    pub agent_health: aya::Ebpf,
+    /// I/O profiling probe (tracepoint/block:block_rq_complete). Owns the IO_STATS BPF map.
+    pub io_profile: aya::Ebpf,
+    /// Network probe (fentry/tcp_connect + tcp_close). Owns the TCP_EVENTS ring buffer.
+    pub network: aya::Ebpf,
+}
+
+/// Loads and attaches all eBPF probes via aya.
+///
+/// Probes loaded:
+/// - `fentry/vfs_write` → Agent health (stall detection)
+/// - `tracepoint/block:block_rq_complete` → I/O profiling
+/// - `fentry/tcp_connect` + `fentry/tcp_close` → Network monitoring
+#[cfg(feature = "ebpf")]
+pub fn load_ebpf_probes() -> anyhow::Result<LoadedProbes> {
+    use aya::{
+        programs::{FEntry, TracePoint},
+        Btf, Ebpf,
+    };
+
+    // include_bytes! produces &[u8] with arbitrary alignment (often not 8-byte aligned).
+    // object crate 0.38+ requires 8-byte alignment for ELF64 parsing.
+    // Heap-allocated Vec<u8> is always at least pointer-aligned (8 bytes on 64-bit).
+    fn aligned_copy(data: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(data.len());
+        buf.extend_from_slice(data);
+        buf
+    }
+
+    let btf = Btf::from_sys_fs()?;
+
+    // 1. Agent health: fentry/vfs_write → Per-CPU Hash Map
+    let agent_health_data = aligned_copy(AGENT_HEALTH_PROBE);
+    let mut agent_health = Ebpf::load(&agent_health_data)?;
+    let prog: &mut FEntry = agent_health
+        .program_mut("agent_health_probe")
+        .ok_or_else(|| anyhow::anyhow!("BPF program 'agent_health_probe' not found"))?
+        .try_into()?;
+    prog.load("vfs_write", &btf)?;
+    prog.attach()?;
+    info!("Attached fentry/vfs_write probe (agent health)");
+
+    // 2. I/O profiling: tracepoint/block:block_rq_complete → Per-CPU Hash Map
+    let io_profile_data = aligned_copy(IO_PROFILE_PROBE);
+    let mut io_profile = Ebpf::load(&io_profile_data)?;
+    let prog: &mut TracePoint = io_profile
+        .program_mut("io_profile_probe")
+        .ok_or_else(|| anyhow::anyhow!("BPF program 'io_profile_probe' not found"))?
+        .try_into()?;
+    prog.load()?;
+    prog.attach("block", "block_rq_complete")?;
+    info!("Attached tracepoint/block:block_rq_complete probe (I/O profiling)");
+
+    // 3. Network: fentry/tcp_connect + fentry/tcp_close → Ring Buffer
+    let network_data = aligned_copy(NETWORK_PROBE);
+    let mut network = Ebpf::load(&network_data)?;
+
+    let prog: &mut FEntry = network
+        .program_mut("tcp_connect_probe")
+        .ok_or_else(|| anyhow::anyhow!("BPF program 'tcp_connect_probe' not found"))?
+        .try_into()?;
+    prog.load("tcp_connect", &btf)?;
+    prog.attach()?;
+    info!("Attached fentry/tcp_connect probe (network)");
+
+    let prog: &mut FEntry = network
+        .program_mut("tcp_close_probe")
+        .ok_or_else(|| anyhow::anyhow!("BPF program 'tcp_close_probe' not found"))?
+        .try_into()?;
+    prog.load("tcp_close", &btf)?;
+    prog.attach()?;
+    info!("Attached fentry/tcp_close probe (network)");
+
+    Ok(LoadedProbes {
+        agent_health,
+        io_profile,
+        network,
+    })
 }
 
 #[cfg(test)]
@@ -287,7 +387,7 @@ mod tests {
     fn init_returns_userspace_without_feature() {
         // Without the ebpf feature, init() always returns Userspace
         // (even if kernel has capabilities, probes aren't compiled in).
-        let mode = init();
-        assert_eq!(mode, MonitoringMode::Userspace);
+        let result = init();
+        assert_eq!(result.mode, MonitoringMode::Userspace);
     }
 }

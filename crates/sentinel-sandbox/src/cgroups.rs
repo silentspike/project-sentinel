@@ -45,6 +45,16 @@ pub fn cgroup_path(name: &str) -> String {
     format!("/sys/fs/cgroup/sentinel/{name}")
 }
 
+/// Returns the cgroup inode (used as cgroup_id key in eBPF maps).
+///
+/// eBPF helper `bpf_get_current_cgroup_id()` returns the inode of the
+/// cgroup directory. We use `stat().ino()` to get the same value from userspace.
+pub fn cgroup_id(name: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let path = cgroup_path(name);
+    std::fs::metadata(&path).ok().map(|m| m.ino())
+}
+
 /// Discovers the whole-disk block device (major:minor) backing a given mount path.
 ///
 /// Parses `/proc/self/mountinfo` to find the device for the filesystem
