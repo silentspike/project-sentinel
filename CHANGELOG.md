@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sentinel-ebpf: Loader, Collector, and Monitoring Infrastructure** (#25, scope:partial)
+  - `loader.rs`: Capability detection (BTF, CAP_BPF, kernel version, fentry support)
+  - `MonitoringMode` enum (Kernel/Userspace) with Prometheus label support
+  - Graceful fallback with mandatory WARN logging (no silent degradation, AC-N1)
+  - `collector.rs`: `EbpfCollector` with agent registration, userspace fallback polling
+  - Reads /proc/{pid}/io and cgroup io.stat in userspace mode
+  - `MetricsSnapshot` aggregation with cycle duration tracking
+  - Prometheus exporter: `sentinel_ebpf_monitoring_mode`, `collector_cycle_microseconds`, `ring_buffer_drops_total`
+  - `export_snapshot()` for unified metric export from collection cycles
+  - Zenoh topics: `sentinel/ebpf/agent-health`, `sentinel/ebpf/io-profile`, `sentinel/ebpf/network`, `sentinel/ebpf/status`
+  - `sentinel-ebpf-probes` crate structure (BPF programs for fentry/vfs_write, tracepoint/block:block_rq_complete, fentry/tcp_connect+tcp_close)
+  - 52 unit tests (up from 35)
+
 - **Claude Code Subprocess Provider** (Cortex Gateway)
   - New `ClaudeCodeProvider` in `claude_code.go`: subprocess management for `claude -p --output-format stream-json`
   - NDJSON protocol parsing with content block extraction and result deduplication

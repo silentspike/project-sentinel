@@ -60,6 +60,18 @@ pub fn cortex_inject(name: &str) -> String {
 /// Topic for model swap requests (invisible to agents)
 pub const MODEL_SWAP: &str = "sentinel/meta/model-swap";
 
+/// Topic for eBPF agent health metrics.
+pub const EBPF_AGENT_HEALTH: &str = "sentinel/ebpf/agent-health";
+
+/// Topic for eBPF I/O profiling metrics.
+pub const EBPF_IO_PROFILE: &str = "sentinel/ebpf/io-profile";
+
+/// Topic for eBPF network monitoring metrics.
+pub const EBPF_NETWORK: &str = "sentinel/ebpf/network";
+
+/// Topic for eBPF monitoring mode status.
+pub const EBPF_STATUS: &str = "sentinel/ebpf/status";
+
 /// Build topic for scoped query requests per agent.
 pub fn query_request_agent(name: &str) -> String {
     format!("{PREFIX}/query/agent/{name}/request")
@@ -127,6 +139,14 @@ mod tests {
         assert_eq!(MODEL_SWAP, "sentinel/meta/model-swap");
         assert_eq!(QUERY_REQUEST_GLOBAL, "sentinel/query/global/request");
         assert_eq!(PREFIX, "sentinel");
+    }
+
+    #[test]
+    fn test_ebpf_topics() {
+        assert_eq!(EBPF_AGENT_HEALTH, "sentinel/ebpf/agent-health");
+        assert_eq!(EBPF_IO_PROFILE, "sentinel/ebpf/io-profile");
+        assert_eq!(EBPF_NETWORK, "sentinel/ebpf/network");
+        assert_eq!(EBPF_STATUS, "sentinel/ebpf/status");
     }
 
     #[test]
