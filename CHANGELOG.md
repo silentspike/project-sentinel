@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sentinel-nightrun: Schichtwechsel-Konsolidierung produktiv** (#17)
+  - Run-to-completion Service mit NMDA SleepCycle-basierter Memory-Konsolidierung
+  - systemd Timer 06:00/14:00/22:00 UTC (Persistent=true, RandomizedDelaySec=30)
+  - 6-Step Pipeline: Agent Discovery → Shift Filter → Event Emit → Job Queue → Consolidation → Complete
+  - Persistente SQLite Job-Queue (WAL mode) mit Crash-Recovery (`--resume`)
+  - SHA-256 Hash Chain fuer deterministische Replay-Verifikation
+  - Deterministic Guardrails: Backlog-Skip (>1000 episodes), Total-Timeout (7200s), Agent-Timeout (300s)
+  - Shift-Detection via `libc::localtime_r`, outgoing_shift_set Mapping (Frueh→Spaet, Mittel→Frueh, Spaet→Mittel)
+  - Event Emission: NightRunStarted, NightRunCompleted, AgentConsolidated, AgentConsolidationFailed
+  - Security-gehaertetes systemd Unit (NoNewPrivileges, ProtectSystem=strict, MemoryMax=2G)
+  - 13 Integration-Tests + Criterion Benchmarks (3 Gruppen: shift, job_queue, pipeline)
+  - VM-verifiziert: 3 Schichtwechsel, 46 Agents konsolidiert, 0 Fehler, 96-624ms Laufzeit
+
 - **Sandbox Enforcer Integration in Daemon** (#16)
   - `SandboxEnforcer::detect()` during daemon startup with per-variant warning logging
   - cgroups v2 resource limits enforced per agent: CPU 100000/100000 (1 core), Memory 256MB, IO 300 IOPS + 10MB/s
