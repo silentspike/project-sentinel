@@ -40,7 +40,7 @@ jobs:
             const text = title + ' ' + body;
 
             // Scope detection from template body, fallback to full
-            const scopeMatch = body.match(/scope:(full|partial|experimental)/i);
+            const scopeMatch = body.match(/scope:(full|experimental)/i);
             if (scopeMatch)
               labels.push(`scope:${scopeMatch[1].toLowerCase()}`);
             else

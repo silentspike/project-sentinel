@@ -9,7 +9,6 @@ body:
       description: Choose the intended delivery scope
       options:
         - scope:full
-        - scope:partial
         - scope:experimental
     validations:
       required: true
