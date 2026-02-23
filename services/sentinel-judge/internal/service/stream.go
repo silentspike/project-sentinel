@@ -121,16 +121,16 @@ func (sc *StreamConsumer) processMessage(msg jetstream.Msg) {
 		return
 	}
 
-	// Extract message content from payload
-	var payload map[string]string
+	// Extract message content from payload (values can be strings, numbers, or null)
+	var payload map[string]any
 	if err := json.Unmarshal(msg.Data(), &payload); err != nil {
 		sc.logger.Warn("failed to parse event payload", "error", err)
 		_ = msg.Ack()
 		return
 	}
-	content := payload["content"]
+	content, _ := payload["content"].(string)
 	if content == "" {
-		content = payload["msg"]
+		content, _ = payload["msg"].(string)
 	}
 	if content == "" {
 		_ = msg.Ack()
