@@ -1,0 +1,83 @@
+name: Issue Close Quality Gate
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  issues: write
+
+jobs:
+  close-gate:
+    # Only enforce on feature and bug issues, not chores/docs/deps
+    if: >
+      contains(github.event.issue.labels.*.name, 'type:feature') ||
+      contains(github.event.issue.labels.*.name, 'type:bug') ||
+      contains(github.event.issue.labels.*.name, 'type:perf')
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const labels = (issue.labels || []).map(l => l.name);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issueNumber = issue.number;
+
+            // Skip if closed as not_planned (won't fix, duplicate, etc.)
+            if (issue.state_reason === "not_planned") {
+              core.info("Issue closed as not_planned. Skipping close gate.");
+              return;
+            }
+
+            // Check: Has status:verified label?
+            if (!labels.includes("status:verified")) {
+              // Reopen the issue
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                state: "open",
+              });
+
+              const marker = "<!-- issue-close-gate -->";
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100,
+              });
+              const existing = comments.find((c) => c.body && c.body.includes(marker));
+              const body = [
+                marker,
+                "**Issue Close Gate: BLOCKED**",
+                "",
+                "Dieses Issue wurde ohne `status:verified` Label geschlossen und automatisch wieder geoeffnet.",
+                "",
+                "Bevor ein Issue geschlossen werden kann:",
+                "1. ALLE ACs muessen mit Evidence (Command + Output) verifiziert sein",
+                "2. Das Label `status:verified` muss gesetzt werden",
+                "3. Erst dann kann das Issue geschlossen werden",
+                "",
+                "Es gibt kein 'teilweise erledigt'. Entweder 100% done oder das Issue bleibt offen.",
+              ].join("\n");
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  body,
+                });
+              }
+
+              core.setFailed(`Issue #${issueNumber} closed without status:verified label. Reopened.`);
+            }

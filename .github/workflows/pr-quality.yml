@@ -60,6 +60,18 @@ jobs:
               failures.push("Missing AC evidence table rows (expected at least one '| AC-<n> | ...').");
             }
 
+            // Evidence must contain concrete commands/outputs, not just assertions
+            const evidenceParts = body.split("## Evidence (AC Mapping)");
+            if (evidenceParts.length > 1) {
+              const evidenceSection = evidenceParts[1].split(/^## /m)[0] || "";
+              const hasConcreteEvidence = /```/.test(evidenceSection)
+                || /\$\s+\S/.test(evidenceSection)
+                || /ssh\s|curl\s|journalctl|systemctl|cargo\s/.test(evidenceSection);
+              if (!hasConcreteEvidence) {
+                failures.push("Evidence section must contain concrete commands or outputs (code blocks, shell commands). Assertions like 'implemented' or 'done' are not evidence.");
+              }
+            }
+
             for (const issueNumber of uniqueIssueIds) {
               try {
                 const { data: issue } = await github.rest.issues.get({

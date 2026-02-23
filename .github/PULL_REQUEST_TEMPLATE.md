@@ -12,7 +12,7 @@
 
 <!-- Mandatory: use closing keywords -->
 - Closes #
-- Partially addresses # <!-- optional -->
+- Partially addresses # <!-- optional: Issue bleibt OFFEN, wird NICHT geschlossen -->
 
 ## Linked Issue Contract
 

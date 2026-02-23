@@ -51,7 +51,7 @@ jobs:
             const hasSize = labels.some((l) => l.startsWith("size:"));
             const hasScopeLabel = labels.some((l) => l.startsWith("scope:"));
 
-            const scopeMatch = body.match(/scope:(full|partial|experimental)/i);
+            const scopeMatch = body.match(/scope:(full|experimental)/i);
             const scopeFromBody = scopeMatch ? `scope:${scopeMatch[1].toLowerCase()}` : null;
 
             const failures = [];
@@ -117,8 +117,8 @@ jobs:
             await ensureLabel("quality:needs-spec", "b60205", "Specification incomplete, not ready");
             await ensureLabel("quality:ready", "238636", "Spec + AC + verify complete");
             await ensureLabel("scope:full", "1f6feb", "Full delivery expected");
-            await ensureLabel("scope:partial", "8250df", "Reduced scope delivery accepted");
             await ensureLabel("scope:experimental", "db6d28", "Prototype/placeholder accepted");
+            await ensureLabel("status:verified", "238636", "All ACs verified with evidence on target system");
 
             // Ensure scope label is always present; default to scope:full for issue-only workflow.
             if (scopeFromBody && !hasScopeLabel) {

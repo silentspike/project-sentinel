@@ -49,9 +49,9 @@
 - name: "status:completed"
   color: "238636"
   description: "Work completed"
-- name: "status:partial"
-  color: "8b949e"
-  description: "Partially delivered, follow-up issue required"
+- name: "status:verified"
+  color: "238636"
+  description: "All ACs verified with evidence on target system"
 
 # Component
 - name: "comp:ecs"
@@ -91,9 +91,6 @@
 - name: "scope:full"
   color: "1f6feb"
   description: "Full delivery expected"
-- name: "scope:partial"
-  color: "8250df"
-  description: "Reduced scope delivery accepted"
 - name: "scope:experimental"
   color: "db6d28"
   description: "Prototype/placeholder accepted"
