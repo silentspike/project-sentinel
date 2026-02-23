@@ -21,6 +21,7 @@ sentinel-runtime = { path = "../../crates/sentinel-runtime" }
 sentinel-zenoh = { path = "../../crates/sentinel-zenoh" }
 sentinel-limbo = { path = "../../crates/sentinel-limbo" }
 sentinel-redb = { path = "../../crates/sentinel-redb" }
+sentinel-sandbox = { path = "../../crates/sentinel-sandbox" }
 sentinel-telemetry = { path = "../../crates/sentinel-telemetry" }
 bevy_ecs = { workspace = true }
 redb = { workspace = true }

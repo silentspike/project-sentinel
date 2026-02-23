@@ -104,7 +104,7 @@ impl SandboxEnforcer {
             warnings.push(SandboxWarning::LandlockNotAvailable);
         }
 
-        // 2. cgroup root
+        // 2. cgroup root + controller delegation
         let cgroup_root = PathBuf::from("/sys/fs/cgroup/sentinel");
         let cgroup_available = if cgroup_root.exists() {
             true
@@ -124,19 +124,18 @@ impl SandboxEnforcer {
             }
         };
 
-        // 3. IO controller check — must be enabled at root AND sentinel level
-        let root_has_io = cgroups::io_controller_enabled("/sys/fs/cgroup");
-        let sentinel_has_io = if root_has_io && cgroup_available {
-            // Root has IO, try to enable it in sentinel subtree too
-            if cgroups::io_controller_enabled("/sys/fs/cgroup/sentinel") {
-                true
-            } else {
-                // Attempt to enable — may work if cgroup is owned by current user
-                cgroups::enable_io_controller("/sys/fs/cgroup/sentinel")
-            }
-        } else {
-            false
-        };
+        // 2b. Delegate controllers (cpu, memory, pids, io) from root cgroup to sentinel
+        // This enables cpu.max, memory.max, etc. in agent child cgroups.
+        if cgroup_available {
+            // First enable controllers at /sys/fs/cgroup level (root → sentinel)
+            cgroups::delegate_controllers("/sys/fs/cgroup");
+            // Then enable at sentinel level (sentinel → agent children)
+            cgroups::delegate_controllers("/sys/fs/cgroup/sentinel");
+        }
+
+        // 3. IO controller check — verify IO is now available in sentinel subtree
+        let sentinel_has_io = cgroup_available
+            && cgroups::io_controller_enabled("/sys/fs/cgroup/sentinel");
         if !sentinel_has_io {
             warnings.push(SandboxWarning::IoNotDelegated);
         }

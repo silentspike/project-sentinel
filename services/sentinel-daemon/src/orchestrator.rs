@@ -10,9 +10,10 @@
 //! └─────────────────────┘                       └──────────────────┘
 //! ```
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tracing::{error, info, warn};
@@ -27,6 +28,7 @@ use sentinel_ecs::{
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
 use sentinel_runtime::RuntimeOrchestrator;
+use sentinel_sandbox::{CgroupLimits, SandboxEnforcer, SandboxHandle, SandboxWarning};
 
 use crate::config::DaemonConfig;
 use crate::controlplane::config::ControlplaneConfig;
@@ -46,12 +48,21 @@ fn shift_hours(shift_set: u8) -> (u8, u8) {
     }
 }
 
+/// Default cgroup limits fuer Agents (Issue #16 Spec).
+/// CPU: 1 core, Memory: 256MB, IO: 300 IOPS + 10MB/s.
+fn default_agent_limits() -> CgroupLimits {
+    CgroupLimits::default()
+}
+
 /// Spawnt einen Agenten sowohl im RuntimeOrchestrator als auch in der ECS World.
+/// Richtet die Sandbox (cgroup + home dir) ein wenn `sandbox` verfuegbar.
 /// Gibt `true` zurueck wenn erfolgreich.
 fn spawn_agent_full(
     runtime_orch: &mut RuntimeOrchestrator,
     world: &mut bevy_ecs::prelude::World,
     agent_cfg: &AgentConfig,
+    sandbox: &SandboxEnforcer,
+    sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
 ) -> bool {
     let agent_id = AgentId(agent_cfg.identity.id);
     let identity = AgentIdentity {
@@ -70,6 +81,30 @@ fn spawn_agent_full(
         warn!(agent_id = agent_cfg.identity.id, error = %e, "Agent-Spawn fehlgeschlagen");
         return false;
     }
+
+    // Sandbox setup (cgroup + agent home) — AC-3: < 10ms, AC-4: bei jedem Spawn
+    let t0 = Instant::now();
+    match sandbox.setup_agent(&agent_cfg.identity.name, &default_agent_limits()) {
+        Ok(handle) => {
+            let elapsed = t0.elapsed();
+            info!(
+                agent = %agent_cfg.identity.name,
+                cgroup = handle.cgroup_created,
+                io = handle.io_available,
+                elapsed_us = elapsed.as_micros(),
+                "Sandbox setup abgeschlossen"
+            );
+            sandbox_handles.insert(agent_id, handle);
+        }
+        Err(e) => {
+            warn!(
+                agent = %agent_cfg.identity.name,
+                error = %e,
+                "Sandbox setup fehlgeschlagen (Agent laeuft ohne Isolation)"
+            );
+        }
+    }
+
     spawn_agent(
         world,
         agent_id,
@@ -139,6 +174,39 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             }
         };
 
+    // -- Sandbox Enforcer (Landlock + cgroups v2 + bwrap) --
+    let (sandbox, sandbox_warnings) = SandboxEnforcer::detect();
+    for w in &sandbox_warnings {
+        match w {
+            SandboxWarning::LandlockNotAvailable => {
+                warn!("Landlock LSM nicht verfuegbar — Agent-FS-Isolation eingeschraenkt");
+            }
+            SandboxWarning::CgroupNotDelegated(msg) => {
+                warn!(detail = %msg, "cgroup v2 nicht delegiert — Resource-Limits deaktiviert");
+            }
+            SandboxWarning::BwrapUsernsDenied => {
+                warn!("bwrap User-Namespaces blockiert — Agent-Namespace-Isolation deaktiviert");
+            }
+            SandboxWarning::IoNotDelegated => {
+                warn!("IO-Controller nicht delegiert — IO-Limits nicht erzwingbar");
+            }
+            SandboxWarning::OomScoreFailed(msg) => {
+                warn!(detail = %msg, "OOM-Score fuer ECS-Core konnte nicht gesetzt werden");
+            }
+            SandboxWarning::NetnsNotAvailable => {
+                warn!("Network-Namespace nicht verfuegbar — Agent-Netzwerk-Isolation deaktiviert");
+            }
+        }
+    }
+    info!(
+        landlock = sandbox.has_landlock(),
+        cgroups = sandbox.has_cgroups(),
+        bwrap = sandbox.has_bwrap(),
+        netns = sandbox.has_netns(),
+        warnings = sandbox_warnings.len(),
+        "Sandbox Enforcer initialisiert"
+    );
+
     // -- Controlplane-Kernel laden --
     let cp_config_path = config.config_dir.join("controlplane.toml");
     let cp_config = if cp_config_path.exists() {
@@ -182,6 +250,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 shutdown_ecs,
                 controlplane,
                 runtime_orch,
+                sandbox,
             )
         })
         .context("ECS Thread spawnen")?;
@@ -248,6 +317,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 /// Verwaltet den RuntimeOrchestrator (Lifecycle-Events, Shift-Wechsel, Snapshots)
 /// UND die ECS World (Entity-Spawning, Simulation). Laeuft bis `shutdown` gesetzt wird.
 /// Speichert Runtime-Snapshot vor Beendigung (AC-4).
+#[allow(clippy::too_many_arguments)]
 fn ecs_tick_loop(
     state_store: StateStore,
     event_store: Arc<EventStore>,
@@ -259,6 +329,7 @@ fn ecs_tick_loop(
     shutdown: Arc<AtomicBool>,
     mut controlplane: ControlplaneKernel,
     mut runtime_orch: RuntimeOrchestrator,
+    sandbox: SandboxEnforcer,
 ) -> Result<u64> {
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
@@ -269,7 +340,10 @@ fn ecs_tick_loop(
     world.insert_resource(ActionReceiver(std::sync::Mutex::new(action_rx)));
     world.insert_resource(PerceptionSender(perception_tx));
 
-    // -- Agent-Spawning (Orchestrator + ECS) --
+    // -- Sandbox Handles (cgroup + bwrap tracking pro Agent) --
+    let mut sandbox_handles: HashMap<AgentId, SandboxHandle> = HashMap::new();
+
+    // -- Agent-Spawning (Orchestrator + ECS + Sandbox) --
     let is_restored = runtime_orch.agent_count() > 0;
     let shift_agents = agents_for_shift(&all_agents, initial_shift);
 
@@ -285,7 +359,8 @@ fn ecs_tick_loop(
         }
     }
 
-    // Agents spawnen: Orchestrator registriert (falls nicht via Restore), ECS erstellt Entity
+    // Agents spawnen: Orchestrator registriert (falls nicht via Restore), ECS erstellt Entity,
+    // Sandbox Setup (cgroup + home dir) bei jedem Spawn (AC-4).
     for agent_cfg in &shift_agents {
         let agent_id = AgentId(agent_cfg.identity.id);
 
@@ -306,6 +381,29 @@ fn ecs_tick_loop(
             if let Err(e) = runtime_orch.spawn_agent(identity, shift, "empfang") {
                 warn!(agent_id = agent_cfg.identity.id, error = %e, "Agent-Spawn fehlgeschlagen");
                 continue;
+            }
+        }
+
+        // Sandbox setup (cgroup + agent home) — AC-3: < 10ms, AC-4: bei jedem Spawn
+        let t0 = Instant::now();
+        match sandbox.setup_agent(&agent_cfg.identity.name, &default_agent_limits()) {
+            Ok(handle) => {
+                let elapsed = t0.elapsed();
+                info!(
+                    agent = %agent_cfg.identity.name,
+                    cgroup = handle.cgroup_created,
+                    io = handle.io_available,
+                    elapsed_us = elapsed.as_micros(),
+                    "Sandbox setup abgeschlossen"
+                );
+                sandbox_handles.insert(agent_id, handle);
+            }
+            Err(e) => {
+                warn!(
+                    agent = %agent_cfg.identity.name,
+                    error = %e,
+                    "Sandbox setup fehlgeschlagen (Agent laeuft ohne Isolation)"
+                );
             }
         }
 
@@ -370,12 +468,18 @@ fn ecs_tick_loop(
                 // Alte Schicht-Agents entfernen (Orchestrator entfernt + emittiert Events)
                 let removed = runtime_orch.shift_transition(new_shift);
                 for agent_id in &removed {
+                    // Sandbox teardown VOR ECS despawn
+                    if let Some(handle) = sandbox_handles.remove(agent_id) {
+                        if let Err(e) = sandbox.teardown_agent(&handle) {
+                            warn!(agent_id = %agent_id, error = %e, "Sandbox teardown fehlgeschlagen");
+                        }
+                    }
                     if !despawn_agent_from_world(&mut world, *agent_id) {
                         warn!(agent_id = %agent_id, "ECS Entity fuer entfernten Agent nicht gefunden");
                     }
                 }
 
-                // Neue Schicht-Agents spawnen
+                // Neue Schicht-Agents spawnen (mit Sandbox-Setup)
                 let new_agents = agents_for_shift(&all_agents, new_shift);
                 let mut spawned_count = 0u32;
                 for agent_cfg in &new_agents {
@@ -384,7 +488,13 @@ fn ecs_tick_loop(
                     if runtime_orch.get_agent_mut(agent_id).is_some() {
                         continue;
                     }
-                    if spawn_agent_full(&mut runtime_orch, &mut world, agent_cfg) {
+                    if spawn_agent_full(
+                        &mut runtime_orch,
+                        &mut world,
+                        agent_cfg,
+                        &sandbox,
+                        &mut sandbox_handles,
+                    ) {
                         spawned_count += 1;
                     }
                 }
@@ -414,7 +524,18 @@ fn ecs_tick_loop(
         std::thread::sleep(tick_rate);
     }
 
-    // -- Graceful Shutdown: Runtime-Snapshot speichern (AC-4) --
+    // -- Graceful Shutdown: Sandbox teardown fuer alle Agents --
+    let teardown_count = sandbox_handles.len();
+    for (agent_id, handle) in sandbox_handles.drain() {
+        if let Err(e) = sandbox.teardown_agent(&handle) {
+            warn!(agent_id = %agent_id, error = %e, "Sandbox teardown bei Shutdown fehlgeschlagen");
+        }
+    }
+    if teardown_count > 0 {
+        info!(count = teardown_count, "Sandbox teardown abgeschlossen");
+    }
+
+    // -- Graceful Shutdown: Runtime-Snapshot speichern (AC-4 Issue #15) --
     if let Err(e) = runtime_orch.save_state() {
         error!(error = %e, "Runtime State Snapshot fehlgeschlagen");
     } else {
@@ -443,6 +564,12 @@ mod tests {
         let cp_store = ControlplaneStore::open(&cp_path).unwrap();
         let cp_config = ControlplaneConfig::default_config();
         ControlplaneKernel::new(cp_config, cp_store).unwrap()
+    }
+
+    /// Erstellt SandboxEnforcer fuer Tests (degraded mode — keine Kernel-Features noetig).
+    fn test_sandbox() -> SandboxEnforcer {
+        let (enforcer, _warnings) = SandboxEnforcer::detect();
+        enforcer
     }
 
     fn test_agent_config(id: u16, name: &str, role: &str, shift_set: u8) -> AgentConfig {
@@ -505,6 +632,7 @@ mod tests {
             shutdown,
             controlplane,
             runtime_orch,
+            test_sandbox(),
         );
 
         assert!(result.is_ok());
@@ -549,6 +677,7 @@ mod tests {
             shutdown,
             controlplane,
             runtime_orch,
+            test_sandbox(),
         );
 
         assert!(result.is_ok());
@@ -598,6 +727,7 @@ mod tests {
             shutdown,
             controlplane,
             runtime_orch,
+            test_sandbox(),
         );
 
         assert!(result.is_ok());

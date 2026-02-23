@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Sandbox Enforcer Integration in Daemon** (#16)
+  - `SandboxEnforcer::detect()` during daemon startup with per-variant warning logging
+  - cgroups v2 resource limits enforced per agent: CPU 100000/100000 (1 core), Memory 256MB, IO 300 IOPS + 10MB/s
+  - `delegate_controllers()` enables +cpu +memory +pids +io in cgroup subtree_control at both root and sentinel levels
+  - Sandbox setup with per-agent timing during spawn (~200us per agent after initial 30ms device discovery)
+  - Sandbox teardown on shift transitions and graceful shutdown
+  - `SandboxHandle` tracking per agent in `HashMap<AgentId, SandboxHandle>`
+
 ### Changed
 
 - **RuntimeOrchestrator Integration in Daemon** (#15)

@@ -93,6 +93,28 @@ fn discover_device_from_mountinfo(mountinfo: &str, mount_point: &str) -> Option<
     None
 }
 
+/// Delegates required controllers (cpu, memory, pids, io) to child cgroups.
+///
+/// Must be called on the sentinel cgroup root BEFORE creating agent child cgroups.
+/// Each controller is enabled individually (some may fail, e.g. IO not delegated from root).
+pub fn delegate_controllers(cgroup_path: &str) -> bool {
+    let subtree_path = format!("{cgroup_path}/cgroup.subtree_control");
+    let mut any_ok = false;
+    // Enable one at a time — kernel may reject combined writes if one controller is unavailable
+    for controller in ["+cpu", "+memory", "+pids", "+io"] {
+        match std::fs::write(&subtree_path, controller) {
+            Ok(_) => {
+                info!("Enabled {controller} controller in {cgroup_path}");
+                any_ok = true;
+            }
+            Err(e) => {
+                warn!("Failed to enable {controller} controller in {subtree_path}: {e}");
+            }
+        }
+    }
+    any_ok
+}
+
 /// Enables the IO controller in a cgroup's subtree_control.
 ///
 /// Writes `"+io"` to `{cgroup_path}/cgroup.subtree_control`.
