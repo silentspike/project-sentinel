@@ -336,4 +336,53 @@ mod tests {
         );
         assert_eq!(selected[0].0, "High score");
     }
+
+    #[test]
+    fn test_deterministic_rerun() {
+        // AC-4: Re-run with identical input must produce identical output
+        let episodes = vec![
+            make_episode(1, "Konflikt mit Kunde", 0.95, 0.9, 1, 0.5),
+            make_episode(2, "Wichtiges Meeting", 0.9, 0.8, 2, 1.0),
+            make_episode(3, "Kaffee getrunken", 0.1, 0.1, 1, 3.0),
+            make_episode(4, "Design Review", 0.7, 0.6, 1, 2.0),
+        ];
+
+        let mut cycle1 = SleepCycle::new("Thomas");
+        let result1 = cycle1.run_full_cycle(episodes.clone()).unwrap();
+        let narrative1 = cycle1.consolidated_narrative().map(String::from);
+
+        let mut cycle2 = SleepCycle::new("Thomas");
+        let result2 = cycle2.run_full_cycle(episodes).unwrap();
+        let narrative2 = cycle2.consolidated_narrative().map(String::from);
+
+        assert_eq!(result1.len(), result2.len(), "Same selection count");
+        for (a, b) in result1.iter().zip(result2.iter()) {
+            assert_eq!(a.0, b.0, "Same episode selected");
+            assert_relative_eq!(a.1, b.1, epsilon = 1e-10);
+        }
+        assert_eq!(narrative1, narrative2, "Same narrative produced");
+    }
+
+    #[test]
+    fn test_consolidation_builds_narrative() {
+        // AC-2/AC-5: consolidate() builds a narrative (no TODO)
+        let mut cycle = SleepCycle::new("Thomas");
+        let episodes = vec![
+            make_episode(1, "Wichtiges Meeting", 0.9, 0.8, 2, 1.0),
+            make_episode(2, "Konflikt", 0.95, 0.9, 1, 0.5),
+        ];
+        cycle.begin_sleep();
+        cycle.add_episodes(episodes);
+        cycle.score_and_select();
+        cycle.consolidate().unwrap();
+
+        let narrative = cycle.consolidated_narrative();
+        assert!(narrative.is_some(), "Narrative must be built");
+        let text = narrative.unwrap();
+        assert!(text.contains("Score:"), "Narrative must contain scores");
+        assert!(
+            text.contains("Konflikt") || text.contains("Meeting"),
+            "Narrative must contain episode summaries"
+        );
+    }
 }
