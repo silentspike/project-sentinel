@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tracing::{error, info, warn};
 
-use sentinel_common::agent_config::{AgentConfig, load_all_agents};
+use sentinel_common::agent_config::{load_all_agents, AgentConfig};
 use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::{AgentId, Perception};
 use sentinel_ebpf::collector::MetricsSnapshot;
@@ -496,7 +496,11 @@ fn ecs_tick_loop(
         if tick_count > 0 && tick_count.is_multiple_of(60) {
             let new_shift = detect_current_shift();
             if new_shift != current_shift {
-                info!(old = current_shift, new = new_shift, "Schichtwechsel erkannt");
+                info!(
+                    old = current_shift,
+                    new = new_shift,
+                    "Schichtwechsel erkannt"
+                );
 
                 // Alte Schicht-Agents entfernen (Orchestrator entfernt + emittiert Events)
                 let removed = runtime_orch.shift_transition(new_shift);
@@ -678,8 +682,7 @@ mod tests {
         let (ptx, _prx) = mpsc::sync_channel(64);
 
         let controlplane = test_controlplane(&tmp);
-        let runtime_orch =
-            RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
+        let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
 
         let (ebpf_collector, ebpf_tx) = test_ebpf();
         let result = ecs_tick_loop(
@@ -719,8 +722,7 @@ mod tests {
         let (ptx, _prx) = mpsc::sync_channel(64);
 
         let controlplane = test_controlplane(&tmp);
-        let runtime_orch =
-            RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
+        let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
         let all_agents = vec![test_agent_config(1, "Test Agent", "Tester", 1)];
 
         // Shutdown nach 500ms (genug Spielraum fuer Build-Server unter Last)
@@ -768,8 +770,7 @@ mod tests {
         let (ptx, _prx) = mpsc::sync_channel(64);
 
         let controlplane = test_controlplane(&tmp);
-        let runtime_orch =
-            RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
+        let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
         let all_agents = vec![
             test_agent_config(1, "Thomas", "CEO", 1),
             test_agent_config(2, "Lisa", "Designer", 1),
@@ -838,8 +839,7 @@ mod tests {
         drop(orch);
 
         // Restore verifizieren
-        let restored =
-            RuntimeOrchestrator::restore(Arc::clone(&event_store), 10).unwrap();
+        let restored = RuntimeOrchestrator::restore(Arc::clone(&event_store), 10).unwrap();
         assert_eq!(
             restored.agent_count(),
             3,

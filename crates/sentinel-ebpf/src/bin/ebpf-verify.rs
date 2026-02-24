@@ -45,8 +45,7 @@ fn main() -> anyhow::Result<()> {
     // Step 4: Read maps
     println!("\n=== AGENT_HEALTH Map (Per-CPU Hash) ===");
     if let Some(map) = probes.agent_health.map("AGENT_HEALTH") {
-        let map: aya::maps::PerCpuHashMap<_, u64, u64> =
-            aya::maps::PerCpuHashMap::try_from(map)?;
+        let map: aya::maps::PerCpuHashMap<_, u64, u64> = aya::maps::PerCpuHashMap::try_from(map)?;
         let mut count = 0;
         for (cgroup_id, per_cpu_values) in map.iter().flatten() {
             let max_ts = per_cpu_values.iter().copied().max().unwrap_or(0);

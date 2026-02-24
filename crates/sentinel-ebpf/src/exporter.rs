@@ -149,9 +149,8 @@ impl MetricsExporter {
             cycle_us
         ));
 
-        output.push_str(
-            "# HELP sentinel_ebpf_ring_buffer_drops_total Ring buffer events dropped\n",
-        );
+        output
+            .push_str("# HELP sentinel_ebpf_ring_buffer_drops_total Ring buffer events dropped\n");
         output.push_str("# TYPE sentinel_ebpf_ring_buffer_drops_total counter\n");
         output.push_str(&format!(
             "sentinel_ebpf_ring_buffer_drops_total {}\n",
@@ -187,9 +186,7 @@ impl MetricsExporter {
         ));
 
         // Stalled agents.
-        output.push_str(
-            "# HELP sentinel_agent_stalled Whether agent is stalled (1=stalled)\n",
-        );
+        output.push_str("# HELP sentinel_agent_stalled Whether agent is stalled (1=stalled)\n");
         output.push_str("# TYPE sentinel_agent_stalled gauge\n");
         for cgroup_id in &snapshot.stalled_agents {
             output.push_str(&format!(
@@ -347,8 +344,7 @@ mod tests {
 
     #[test]
     fn export_collector_meta_format() {
-        let output =
-            MetricsExporter::export_collector_meta(MonitoringMode::Userspace, 5000, 0);
+        let output = MetricsExporter::export_collector_meta(MonitoringMode::Userspace, 5000, 0);
         assert!(output.contains("sentinel_ebpf_monitoring_mode{mode=\"userspace\"} 1"));
         assert!(output.contains("sentinel_ebpf_collector_cycle_microseconds 5000"));
         assert!(output.contains("sentinel_ebpf_ring_buffer_drops_total 0"));
@@ -356,8 +352,7 @@ mod tests {
 
     #[test]
     fn export_collector_meta_kernel_mode() {
-        let output =
-            MetricsExporter::export_collector_meta(MonitoringMode::Kernel, 50, 3);
+        let output = MetricsExporter::export_collector_meta(MonitoringMode::Kernel, 50, 3);
         assert!(output.contains("sentinel_ebpf_monitoring_mode{mode=\"kernel\"} 1"));
         assert!(output.contains("sentinel_ebpf_collector_cycle_microseconds 50"));
         assert!(output.contains("sentinel_ebpf_ring_buffer_drops_total 3"));
@@ -436,7 +431,8 @@ mod tests {
         let output = MetricsExporter::export_snapshot(&snapshot);
         assert!(output.contains("sentinel_agent_stalled{cgroup_id=\"42\"} 1"));
         assert!(output.contains("cgroup_name=\"agent-01\""));
-        assert!(output.contains("sentinel_llm_requests_total{destination=\"api.anthropic.com:443\"} 10"));
+        assert!(output
+            .contains("sentinel_llm_requests_total{destination=\"api.anthropic.com:443\"} 10"));
         assert!(output.contains("sentinel_agent_cpu_pressure_stress{agent=\"AGENT-01\"}"));
     }
 }

@@ -313,18 +313,19 @@ impl EbpfCollector {
                         .map(|m| m.agent_name.as_str())
                         .unwrap_or("unknown");
                     if total.read_bytes > 0 {
-                        self.io_profiler.record_read(cgroup_id, name, total.read_bytes);
+                        self.io_profiler
+                            .record_read(cgroup_id, name, total.read_bytes);
                     }
                     if total.write_bytes > 0 {
-                        self.io_profiler.record_write(cgroup_id, name, total.write_bytes);
+                        self.io_profiler
+                            .record_write(cgroup_id, name, total.write_bytes);
                     }
                 }
             }
 
             // 3. Network: Ring Buffer → drain TCP events
             if let Some(map) = probes.network.map_mut("TCP_EVENTS") {
-                let mut ring_buf =
-                    RingBuf::try_from(map).context("TCP_EVENTS ring buffer")?;
+                let mut ring_buf = RingBuf::try_from(map).context("TCP_EVENTS ring buffer")?;
                 let mut event_count = 0u64;
                 while let Some(data) = ring_buf.next() {
                     if data.len() >= core::mem::size_of::<BpfTcpEvent>() {
@@ -395,10 +396,7 @@ impl EbpfCollector {
                     NetworkSnapshot {
                         destination: m.destination.clone(),
                         request_count: m.request_count,
-                        avg_latency_us: m
-                            .avg_latency()
-                            .map(|d| d.as_micros() as u64)
-                            .unwrap_or(0),
+                        avg_latency_us: m.avg_latency().map(|d| d.as_micros() as u64).unwrap_or(0),
                         bytes_sent: m.bytes_sent,
                         bytes_received: m.bytes_received,
                         error_count: m.error_count,
@@ -447,8 +445,8 @@ struct ProcIoData {
 /// Reads /proc/{pid}/io for a process.
 fn read_proc_io(pid: u32) -> Result<ProcIoData> {
     let path = format!("/proc/{pid}/io");
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("Reading /proc/{pid}/io"))?;
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("Reading /proc/{pid}/io"))?;
 
     let mut data = ProcIoData::default();
     for line in content.lines() {
@@ -466,8 +464,7 @@ fn read_proc_io(pid: u32) -> Result<ProcIoData> {
 /// Returns Vec<(device, (rbytes, wbytes))>.
 fn read_cgroup_io_stat(cgroup_path: &str) -> Result<Vec<(String, (u64, u64))>> {
     let path = format!("{cgroup_path}/io.stat");
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("Reading {path}"))?;
+    let content = std::fs::read_to_string(&path).with_context(|| format!("Reading {path}"))?;
 
     let mut results = Vec::new();
     for line in content.lines() {
