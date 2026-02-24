@@ -22,7 +22,7 @@ linters:
     gosec:
       severity: medium
     misspell:
-      ignore-words:
+      ignore-rules:
         - tust
 
 issues:
