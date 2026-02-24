@@ -123,6 +123,7 @@ kannst = "kannst"
 stehst = "stehst"
 
 # Sprint 3 fourth-wall + control plane words (German in Go string literals)
+tust = "tust"
 Toleranz = "Toleranz"
 offen = "offen"
 deine = "deine"

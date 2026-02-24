@@ -69,10 +69,13 @@ pub async fn prometheus_server(metrics_text: Arc<RwLock<String>>, port: u16) {
     loop {
         match listener.accept().await {
             Ok((mut stream, _addr)) => {
-                let text = metrics_text.read().unwrap_or_else(|e| {
-                    warn!(error = %e, "RwLock poisoned, leerer Metrics-Text");
-                    e.into_inner()
-                }).clone();
+                let text = metrics_text
+                    .read()
+                    .unwrap_or_else(|e| {
+                        warn!(error = %e, "RwLock poisoned, leerer Metrics-Text");
+                        e.into_inner()
+                    })
+                    .clone();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\n\
                      Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\

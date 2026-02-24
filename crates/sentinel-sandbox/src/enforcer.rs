@@ -134,8 +134,8 @@ impl SandboxEnforcer {
         }
 
         // 3. IO controller check — verify IO is now available in sentinel subtree
-        let sentinel_has_io = cgroup_available
-            && cgroups::io_controller_enabled("/sys/fs/cgroup/sentinel");
+        let sentinel_has_io =
+            cgroup_available && cgroups::io_controller_enabled("/sys/fs/cgroup/sentinel");
         if !sentinel_has_io {
             warnings.push(SandboxWarning::IoNotDelegated);
         }
