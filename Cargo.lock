@@ -1466,15 +1466,20 @@ dependencies = [
 
 [[package]]
 name = "fuser"
-version = "0.16.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bb29a3ae32279fe3e79a958fe01899f5fb23eadccee919cf88e145b54ed9367"
+checksum = "80a5eca878900c2e39e9e52fd797954b7fc39eeefc8558257114bfea6a698fcf"
 dependencies = [
+ "bitflags",
  "libc",
  "log",
  "memchr",
- "nix",
+ "nix 0.30.1",
+ "num_enum",
  "page_size",
+ "parking_lot",
+ "pkg-config",
+ "ref-cast",
  "smallvec",
  "zerocopy",
 ]
@@ -2391,6 +2396,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2436,6 +2450,19 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -2566,6 +2593,7 @@ version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff32365de1b6743cb203b710788263c44a03de03802daf96092f2da4fe6ba4d7"
 dependencies = [
+ "proc-macro-crate",
  "proc-macro2",
  "quote",
  "syn 2.0.115",
@@ -6364,7 +6392,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac46470a17af5861e07ed9d2440277e7a3dea55109b0988866b635f7daf29ac4"
 dependencies = [
  "async-trait",
- "nix",
+ "nix 0.29.0",
  "tokio",
  "tokio-util",
  "tracing",
