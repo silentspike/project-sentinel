@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use sentinel_common::events::DomainEventPayload;
 use sentinel_hippocampus::{Episode, HippocampusService};
 use sentinel_limbo::EventStore;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Intervall in Ticks zwischen Episode-Produktionslaeufen.
 /// Bei 1s Tick-Rate = alle 30 Sekunden.
@@ -127,6 +127,19 @@ impl EpisodeProducer {
         let mut total = 0;
         for (agent, episodes) in &episodes_by_agent {
             let count = episodes.len();
+            // Erste Episode pro Agent loggen (Diagnose)
+            if let Some(ep) = episodes.first() {
+                debug!(
+                    agent = %agent,
+                    id = ep.id,
+                    summary = %ep.summary,
+                    relevance = ep.relevance,
+                    emotion = ep.emotion,
+                    hours_ago = ep.hours_ago,
+                    tags = ?ep.tags,
+                    "Episode sample"
+                );
+            }
             if let Err(e) = self.hippocampus.record_episodes(agent, episodes) {
                 warn!(agent = %agent, error = %e, "Episoden speichern fehlgeschlagen");
             } else {
