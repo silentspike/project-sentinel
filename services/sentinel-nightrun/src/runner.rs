@@ -177,8 +177,7 @@ impl NightrunRunner {
                     );
                     self.job_queue
                         .mark_completed(&self.run_id, agent, processed, cons)?;
-                    let ev =
-                        self.emit_consolidated(agent, agg_id, processed, cons, duration_ms)?;
+                    let ev = self.emit_consolidated(agent, agg_id, processed, cons, duration_ms)?;
                     hash_chain.extend(&ev);
                     consolidated += 1;
                     total_episodes += processed;
