@@ -1,22 +1,29 @@
 :root {
-  --bg-primary: #1a1b2e;
-  --bg-secondary: #252640;
-  --bg-card: #2d2e4a;
-  --text-primary: #e0e0e0;
-  --text-secondary: #a0a0b0;
-  --accent: #6c63ff;
-  --accent-hover: #7c74ff;
-  --success: #4caf50;
-  --warning: #ff9800;
-  --danger: #f44336;
-  --border: #3a3b5c;
-  --bar-bg: #1a1b2e;
+  --bg-primary: #080810;
+  --bg-secondary: #0e0e18;
+  --bg-card: #161622;
+  --text-primary: #c8c8d0;
+  --text-secondary: #68687a;
+  --accent: #00ff9d;
+  --accent-hover: #00b8ff;
+  --success: #00ff9d;
+  --warning: #f59e0b;
+  --danger: #ff4444;
+  --error: #ff4444;
+  --border: #252535;
+  --bar-bg: #0e0e18;
+  --neon-green: #00ff9d;
+  --neon-blue: #00b8ff;
+  --neon-purple: #a855f7;
+  --surface-3: #1e1e2e;
+  --glow: #353548;
+  --bright: #f0f0f5;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 body {
-  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
   background: var(--bg-primary);
   color: var(--text-primary);
   min-height: 100vh;
@@ -31,7 +38,15 @@ header {
   border-bottom: 1px solid var(--border);
 }
 
-header h1 { font-size: 1.4rem; font-weight: 600; }
+header h1 {
+  font-size: 1.4rem;
+  font-weight: 700;
+  font-family: 'JetBrains Mono', monospace;
+  background: linear-gradient(135deg, var(--neon-green), var(--neon-blue));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
 
 nav { display: flex; gap: 0.5rem; flex: 1; }
 
@@ -46,7 +61,7 @@ nav { display: flex; gap: 0.5rem; flex: 1; }
   transition: all 0.2s;
 }
 .nav-btn:hover { border-color: var(--accent); color: var(--text-primary); }
-.nav-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
+.nav-btn.active { background: var(--accent); color: var(--bg-primary); border-color: var(--accent); font-weight: 600; }
 
 #connection-status {
   font-size: 0.85rem;
@@ -101,9 +116,9 @@ main { padding: 2rem; }
   border-radius: 10px;
   margin-bottom: 0.5rem;
 }
-.status-active { background: var(--success); color: white; }
+.status-active { background: var(--success); color: var(--bg-primary); font-weight: 600; }
 .status-despawned { background: var(--border); color: var(--text-secondary); }
-.status-paused { background: var(--warning); color: #1a1b2e; }
+.status-paused { background: var(--warning); color: var(--bg-primary); }
 
 /* Floorplan */
 .floorplan-container { display: flex; flex-direction: column; gap: 2rem; }
@@ -126,7 +141,7 @@ main { padding: 2rem; }
 .room-physics {
   margin-top: 0.4rem;
   font-size: 0.75rem;
-  color: var(--info, #4dabf7);
+  color: var(--neon-blue);
   font-family: 'JetBrains Mono', monospace;
 }
 
@@ -156,11 +171,31 @@ main { padding: 2rem; }
   padding: 0.8rem;
   border: 1px solid var(--border);
   font-size: 0.85rem;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
 }
 .activity-item.activity-transit { border-left: 3px solid var(--warning); }
 .activity-item.activity-action { border-left: 3px solid var(--accent); }
+.activity-badge {
+  flex-shrink: 0;
+  font-weight: 600;
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  background: rgba(0, 255, 157, 0.15);
+  color: var(--accent);
+}
+.badge-transit { background: rgba(245, 158, 11, 0.15); color: var(--warning); }
+.badge-chaos { background: rgba(255, 68, 68, 0.15); color: var(--error); }
+.badge-lifecycle { background: rgba(0, 255, 157, 0.15); color: var(--success); }
+.badge-system { background: rgba(104, 104, 122, 0.2); color: var(--text-secondary); }
+.badge-memory { background: rgba(0, 184, 255, 0.15); color: var(--neon-blue); }
+.badge-bio { background: rgba(168, 85, 247, 0.15); color: var(--neon-purple); }
+.activity-summary { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.activity-detail { color: var(--text-secondary); flex-shrink: 0; }
+.activity-tick { color: var(--text-secondary); font-size: 0.75rem; flex-shrink: 0; }
 .activity-agent { color: var(--accent); font-weight: 600; }
-.activity-detail { color: var(--text-secondary); }
 .activity-empty { color: var(--text-secondary); font-style: italic; padding: 2rem 0; }
 
 /* Metrics */
@@ -255,10 +290,10 @@ main { padding: 2rem; }
   padding: 0.15rem 0.5rem;
   border-radius: 10px;
 }
-.cockpit-status-active { background: var(--warning); color: #1a1b2e; }
+.cockpit-status-active { background: var(--warning); color: var(--bg-primary); }
 .cockpit-status-pending { background: var(--border); color: var(--text-primary); }
-.cockpit-status-resolved { background: var(--success); color: white; }
-.cockpit-status-failed { background: var(--danger); color: white; }
+.cockpit-status-resolved { background: var(--success); color: var(--bg-primary); font-weight: 600; }
+.cockpit-status-failed { background: var(--danger); color: var(--bright); font-weight: 600; }
 
 .cockpit-incident-meta {
   font-size: 0.75rem;
@@ -348,8 +383,9 @@ main { padding: 2rem; }
   font-size: 0.7rem;
   padding: 0.1rem 0.4rem;
   background: var(--accent);
-  color: white;
+  color: var(--bg-primary);
   border-radius: 3px;
+  font-weight: 600;
   white-space: nowrap;
 }
 
@@ -453,7 +489,7 @@ main { padding: 2rem; }
   transition: all 0.2s;
 }
 .chat-filter-btn:hover { border-color: var(--accent); color: var(--text-primary); }
-.chat-filter-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
+.chat-filter-btn.active { background: var(--accent); color: var(--bg-primary); border-color: var(--accent); font-weight: 600; }
 
 .chat-list {
   display: flex;
