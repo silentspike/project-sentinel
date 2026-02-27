@@ -222,7 +222,11 @@ fn start_transit(
 /// Bestimmt die naechste Toilette basierend auf der aktuellen Position und Agent-ID.
 /// Gerade Agent-IDs → Damen, ungerade → Herren (deterministische Zuweisung).
 fn nearest_toilet(current_room: &str, agent_id: u32) -> String {
-    let gender_suffix = if agent_id.is_multiple_of(2) { "damen" } else { "herren" };
+    let gender_suffix = if agent_id.is_multiple_of(2) {
+        "damen"
+    } else {
+        "herren"
+    };
     if current_room.contains("og")
         || current_room.contains("design")
         || current_room == "meetingraum-02"

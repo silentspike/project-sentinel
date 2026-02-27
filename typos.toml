@@ -15,6 +15,8 @@ zenoh = "zenoh"   # Zenoh pub/sub
 
 # German words used in code comments (CLAUDE.md, deny.toml, Rust doc comments)
 ist = "ist"
+periodisch = "periodisch"
+ue = "ue"               # Umlaut replacement: .replace("ü", "ue")
 Prozess = "Prozess"
 Hierarchie = "Hierarchie"
 initialisiert = "initialisiert"
