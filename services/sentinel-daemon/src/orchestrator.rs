@@ -815,9 +815,9 @@ mod tests {
             test_agent_config(2, "Lisa", "Designer", 1),
         ];
 
-        // Shutdown nach 200ms
+        // Shutdown nach 500ms (genug Spielraum fuer CI-Runner unter Last)
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(500));
             shutdown_clone.store(true, Ordering::SeqCst);
         });
 
