@@ -658,6 +658,19 @@ impl EventStore {
 
     // ── Rebuild / Recovery ──────────────────────
 
+    /// Liefert die maximale interne Row-ID (SQLite rowid) im Event Store.
+    /// Fuer Cursor-Initialisierung bei neuen Consumern (z.B. EpisodeProducer).
+    pub fn max_event_rowid(&self) -> anyhow::Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let max: i64 = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+            row.get(0)
+        })?;
+        Ok(max)
+    }
+
     /// Zaehlt alle Events im Store.
     pub fn event_count(&self) -> anyhow::Result<i64> {
         let conn = self
