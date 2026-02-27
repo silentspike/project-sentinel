@@ -17,6 +17,11 @@ ignore = [
     # rsa 0.9.x Marvin Attack (RUSTSEC-2023-0071): No fix available, transitive via zenoh.
     # We don't use RSA directly. Track: https://github.com/RustCrypto/RSA/issues/19
     { id = "RUSTSEC-2023-0071", reason = "transitive via zenoh, no safe upgrade available" },
+    # Wasmtime WASI advisories (RUSTSEC-2026-0020/0021/0022): Requires wasmtime major upgrade.
+    # sentinel-wasm uses wasmtime 41, fix likely in 42+. Tracked as separate deps issue.
+    { id = "RUSTSEC-2026-0020", reason = "wasmtime 41 -> 42+ upgrade needed, separate issue" },
+    { id = "RUSTSEC-2026-0021", reason = "wasmtime 41 -> 42+ upgrade needed, separate issue" },
+    { id = "RUSTSEC-2026-0022", reason = "wasmtime 41 -> 42+ upgrade needed, separate issue" },
 ]
 
 # ──────────────────────────────────────────────
