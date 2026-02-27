@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **eBPF Kernel-Modus Regression** (#139)
+  - Daemon-Binary wird jetzt mit `--features ebpf` gebaut
+  - CI prueft eBPF-Feature-Kompilierung (Clippy + Tests)
+  - Kernel-Probes (fentry/vfs_write, tcp_connect, tcp_close) wieder aktiv
+
 ### Added
 
 - **Episode Producer im Daemon** (#137)
