@@ -7,6 +7,7 @@
 pub mod config;
 pub mod controlplane;
 pub mod ebpf;
+pub mod episode_producer;
 pub mod llm_bridge;
 pub mod orchestrator;
 pub mod shift;
