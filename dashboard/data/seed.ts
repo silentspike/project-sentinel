@@ -93,9 +93,9 @@ for (const a of agents) insertAgent.run(...a);
 // ── Seed Rooms ──────────────────────────────────
 const roomIds = [
   "empfang", "flur-eg", "kueche", "buero-dev-1", "buero-dev-2",
-  "meetingraum-01", "toilette-eg", "treppenhaus", "flur-og",
+  "meetingraum-01", "toilette-eg-damen", "toilette-eg-herren", "treppenhaus", "flur-og",
   "buero-design-1", "buero-design-2", "buero-ceo",
-  "meetingraum-02", "meetingraum-03", "toilette-og",
+  "meetingraum-02", "meetingraum-03", "toilette-og-damen", "toilette-og-herren",
 ];
 
 const insertRoom = projDb.prepare(
