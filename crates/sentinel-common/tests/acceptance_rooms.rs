@@ -1,7 +1,7 @@
 //! Acceptance Tests fuer config/rooms.toml (Issue #11)
 //!
-//! Tests fuer Room-Layout: 15 Raeume, bidirektionale Adjacency,
-//! Rust-Types-Parsing, Kapazitaets-Summe und Validierung.
+//! Tests fuer Room-Layout: 17 Raeume (4 Toiletten: Damen/Herren je EG+OG),
+//! bidirektionale Adjacency, Rust-Types-Parsing, Kapazitaets-Summe und Validierung.
 
 use sentinel_common::room::BuildingConfig;
 use std::collections::{HashMap, HashSet};
@@ -19,16 +19,16 @@ fn load_rooms_config() -> BuildingConfig {
     BuildingConfig::load(&config_path).expect("Failed to load config/rooms.toml")
 }
 
-// ── #11 AC1: 15 Raeume ──
+// ── #11 AC1: 17 Raeume ──
 
-/// AC #11.1: rooms.toml enthaelt genau 15 Raeume
+/// AC #11.1: rooms.toml enthaelt genau 17 Raeume (4 Toiletten: Damen/Herren je EG+OG)
 #[test]
-fn ac_11_01_15_rooms() {
+fn ac_11_01_17_rooms() {
     let config = load_rooms_config();
     assert_eq!(
         config.rooms.len(),
-        15,
-        "Expected exactly 15 rooms, got {}",
+        17,
+        "Expected exactly 17 rooms, got {}",
         config.rooms.len()
     );
 }
@@ -104,10 +104,10 @@ fn ac_11_04_capacity_sum() {
 #[test]
 fn ac_11_06_validate() {
     let config = load_rooms_config();
-    let result = config.validate(15);
+    let result = config.validate(17);
     assert!(
         result.is_ok(),
-        "BuildingConfig::validate(15) failed: {:?}",
+        "BuildingConfig::validate(17) failed: {:?}",
         result.err()
     );
 }

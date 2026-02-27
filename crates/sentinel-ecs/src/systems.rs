@@ -603,8 +603,10 @@ fn room_id_to_german(room_id: &str) -> String {
         "meetingraum-01" => "im Meetingraum 1 (EG)".to_string(),
         "meetingraum-02" => "im Meetingraum 2 (OG)".to_string(),
         "meetingraum-03" => "im Meetingraum 3 (OG)".to_string(),
-        "toilette-eg" => "auf der Toilette (EG)".to_string(),
-        "toilette-og" => "auf der Toilette (OG)".to_string(),
+        "toilette-eg-damen" => "auf der Damentoilette (EG)".to_string(),
+        "toilette-eg-herren" => "auf der Herrentoilette (EG)".to_string(),
+        "toilette-og-damen" => "auf der Damentoilette (OG)".to_string(),
+        "toilette-og-herren" => "auf der Herrentoilette (OG)".to_string(),
         "treppenhaus" => "im Treppenhaus".to_string(),
         other => format!("im Raum '{}'", other),
     }

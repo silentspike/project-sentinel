@@ -174,8 +174,8 @@ mod tests {
     fn test_parse_rooms_toml() {
         let config = load_test_config();
 
-        // 15 Räume
-        assert_eq!(config.rooms.len(), 15);
+        // 17 Räume (4 Toiletten: EG Damen/Herren + OG Damen/Herren)
+        assert_eq!(config.rooms.len(), 17);
 
         // Gebäudename korrekt
         assert_eq!(config.building.name, "PixelPerfekt GmbH");
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn test_all_adjacent_references_valid() {
         let config = load_test_config();
-        let result = config.validate(15);
+        let result = config.validate(17);
         assert!(
             result.is_ok(),
             "Validation failed: {:?}",
@@ -201,9 +201,9 @@ mod tests {
     }
 
     #[test]
-    fn test_exactly_15_rooms() {
+    fn test_exactly_17_rooms() {
         let config = load_test_config();
-        assert_eq!(config.rooms.len(), 15);
+        assert_eq!(config.rooms.len(), 17);
     }
 
     #[test]

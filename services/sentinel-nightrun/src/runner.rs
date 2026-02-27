@@ -96,7 +96,7 @@ impl NightrunRunner {
         }
 
         // 2. Optional shift_set Filter (best-effort, TOML nicht fuer alle vorhanden)
-        let agents = self.filter_by_shift(&all_agents, trigger_shift_set);
+        let (agents, name_to_id) = self.filter_by_shift(&all_agents, trigger_shift_set);
         let agent_count = agents.len() as u32;
 
         info!(
@@ -134,6 +134,11 @@ impl NightrunRunner {
             }
 
             let agent = &job.agent_name;
+            // AGENT-XX ID fuer aggregate_id (NATS-kompatibel, keine Spaces)
+            let agg_id = name_to_id
+                .get(agent.as_str())
+                .map(String::as_str)
+                .unwrap_or("nightrun");
 
             // Episode-Count pruefen (via GuardrailController)
             let episode_count = self.get_episode_count(agent)?;
@@ -142,7 +147,7 @@ impl NightrunRunner {
             {
                 warn!(agent, episode_count, reason = %reason, "Guardrail: Skip");
                 self.job_queue.mark_skipped(&self.run_id, agent, &reason)?;
-                let ev = self.emit_failed(&self.run_id.clone(), agent, &reason)?;
+                let ev = self.emit_failed(&self.run_id.clone(), agent, agg_id, &reason)?;
                 hash_chain.extend(&ev);
                 skipped += 1;
                 continue;
@@ -172,7 +177,8 @@ impl NightrunRunner {
                     );
                     self.job_queue
                         .mark_completed(&self.run_id, agent, processed, cons)?;
-                    let ev = self.emit_consolidated(agent, processed, cons, duration_ms)?;
+                    let ev =
+                        self.emit_consolidated(agent, agg_id, processed, cons, duration_ms)?;
                     hash_chain.extend(&ev);
                     consolidated += 1;
                     total_episodes += processed;
@@ -181,7 +187,7 @@ impl NightrunRunner {
                     let err_msg = format!("{e:#}");
                     error!(agent, error = %err_msg, "Konsolidierung fehlgeschlagen");
                     self.job_queue.mark_failed(&self.run_id, agent, &err_msg)?;
-                    let ev = self.emit_failed(&self.run_id.clone(), agent, &err_msg)?;
+                    let ev = self.emit_failed(&self.run_id.clone(), agent, agg_id, &err_msg)?;
                     hash_chain.extend(&ev);
                     failed += 1;
                 }
@@ -236,9 +242,25 @@ impl NightrunRunner {
     /// Filtert Agents nach shift_set (best-effort via Agent-TOMLs).
     ///
     /// Agents ohne TOML-Definition werden IMMER inkludiert (konservativ).
-    fn filter_by_shift(&self, agents: &[String], trigger_shift_set: u8) -> Vec<String> {
+    /// Gibt zusaetzlich eine name→AGENT-XX Mapping-Map zurueck fuer korrekte aggregate_ids.
+    fn filter_by_shift(
+        &self,
+        agents: &[String],
+        trigger_shift_set: u8,
+    ) -> (Vec<String>, std::collections::HashMap<String, String>) {
         let agent_configs =
             load_all_agents(Path::new(&self.config.agent_config_dir)).unwrap_or_default();
+
+        // Name → AGENT-XX Mapping (fuer NATS-kompatible aggregate_ids)
+        let name_to_id: std::collections::HashMap<String, String> = agent_configs
+            .iter()
+            .map(|c| {
+                (
+                    c.identity.name.clone(),
+                    format!("AGENT-{:02}", c.identity.id),
+                )
+            })
+            .collect();
 
         // Shift-Set Lookup: name → shift_set
         let shift_map: std::collections::HashMap<String, u8> = agent_configs
@@ -246,7 +268,7 @@ impl NightrunRunner {
             .map(|c| (c.identity.name.clone(), c.identity.shift_set))
             .collect();
 
-        agents
+        let filtered = agents
             .iter()
             .filter(|name| {
                 match shift_map.get(*name) {
@@ -262,7 +284,9 @@ impl NightrunRunner {
                 }
             })
             .cloned()
-            .collect()
+            .collect();
+
+        (filtered, name_to_id)
     }
 
     /// Konsolidiert einen einzelnen Agent ueber HippocampusService.
@@ -341,6 +365,7 @@ impl NightrunRunner {
     fn emit_consolidated(
         &self,
         agent_name: &str,
+        aggregate_id: &str,
         episodes_processed: u32,
         episodes_consolidated: u32,
         duration_ms: u64,
@@ -354,7 +379,7 @@ impl NightrunRunner {
         };
         let event = DomainEvent::new(
             payload.event_type_str(),
-            agent_name,
+            aggregate_id,
             &payload.to_json(),
             &self.run_id,
             0,
@@ -365,7 +390,13 @@ impl NightrunRunner {
         Ok(event)
     }
 
-    fn emit_failed(&self, run_id: &str, agent_name: &str, error: &str) -> Result<DomainEvent> {
+    fn emit_failed(
+        &self,
+        run_id: &str,
+        agent_name: &str,
+        aggregate_id: &str,
+        error: &str,
+    ) -> Result<DomainEvent> {
         let payload = DomainEventPayload::AgentConsolidationFailed {
             run_id: run_id.to_string(),
             agent_name: agent_name.to_string(),
@@ -373,7 +404,7 @@ impl NightrunRunner {
         };
         let event = DomainEvent::new(
             payload.event_type_str(),
-            agent_name,
+            aggregate_id,
             &payload.to_json(),
             &self.run_id,
             0,
