@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Episode Producer im Daemon** (#137)
+  - Neues Modul `episode_producer.rs`: Konvertiert DomainEvents aus Limbo zu Hippocampus-Episoden
+  - Verarbeitet `AgentActionReceived`, `BioActionPerformed`, `ChaosTriggered` Events
+  - Cursor-Persistierung via Limbo `projection_offsets` (restart-sicher)
+  - Skip-History beim ersten Start via `max_event_rowid()` (verhindert 40h Aufhol-Phase bei 2.7M Events)
+  - Alle 30 Ticks (~30s) Batch-Verarbeitung mit 500 Events pro Batch
+  - NMDA-Score-Berechnung (Relevanz + Emotion + Recency) fuer Episode-Selektion
+  - `EventStore::max_event_rowid()` Methode in sentinel-limbo hinzugefuegt
+  - 12 Unit Tests + 3 Orchestrator-Integrationstests
+
 - **sentinel-nightrun: Schichtwechsel-Konsolidierung produktiv** (#17)
   - Run-to-completion Service mit NMDA SleepCycle-basierter Memory-Konsolidierung
   - systemd Timer 06:00/14:00/22:00 UTC (Persistent=true, RandomizedDelaySec=30)
