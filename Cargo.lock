@@ -3686,6 +3686,7 @@ dependencies = [
  "sentinel-common",
  "sentinel-ebpf",
  "sentinel-ecs",
+ "sentinel-hippocampus",
  "sentinel-limbo",
  "sentinel-redb",
  "sentinel-runtime",

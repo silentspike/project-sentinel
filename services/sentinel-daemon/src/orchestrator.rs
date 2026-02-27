@@ -36,6 +36,7 @@ use crate::config::DaemonConfig;
 use crate::controlplane::config::ControlplaneConfig;
 use crate::controlplane::store::ControlplaneStore;
 use crate::controlplane::ControlplaneKernel;
+use crate::episode_producer::EpisodeProducer;
 use crate::shift::{agents_for_shift, detect_current_shift};
 use crate::signal::wait_for_shutdown;
 
@@ -225,6 +226,23 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let controlplane =
         ControlplaneKernel::new(cp_config, cp_store).context("Controlplane-Kernel erstellen")?;
 
+    // -- Hippocampus Memory Service oeffnen --
+    let hippocampus_path = data_dir.join("hippocampus.redb");
+    let hippocampus = sentinel_hippocampus::HippocampusService::open(
+        hippocampus_path
+            .to_str()
+            .context("hippocampus.redb Pfad nicht UTF-8")?,
+    )
+    .context("HippocampusService oeffnen")?;
+
+    // Agent-Name-Mapping fuer Episode Producer
+    let agent_name_pairs: Vec<(u16, String)> = all_agents
+        .iter()
+        .map(|a| (a.identity.id, a.identity.name.clone()))
+        .collect();
+    let episode_producer = EpisodeProducer::new(hippocampus, &agent_name_pairs, &event_store);
+    info!("Episode Producer initialisiert");
+
     // -- eBPF Monitoring initialisieren --
     let (ebpf_collector, ebpf_mode) = crate::ebpf::init_ebpf();
     info!(mode = %ebpf_mode, "eBPF Monitoring initialisiert");
@@ -263,6 +281,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 sandbox,
                 ebpf_collector,
                 ebpf_tx,
+                episode_producer,
             )
         })
         .context("ECS Thread spawnen")?;
@@ -352,12 +371,14 @@ fn ecs_tick_loop(
     sandbox: SandboxEnforcer,
     mut ebpf_collector: EbpfCollector,
     ebpf_tx: tokio::sync::mpsc::Sender<MetricsSnapshot>,
+    mut episode_producer: EpisodeProducer,
 ) -> Result<u64> {
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
 
     // Stores als Resources einfuegen
     attach_redb_store(&mut world, state_store);
+    let event_store_for_episodes = Arc::clone(&event_store);
     world.insert_resource(LimboEventStore(event_store));
     world.insert_resource(ActionReceiver(std::sync::Mutex::new(action_rx)));
     world.insert_resource(PerceptionSender(perception_tx));
@@ -571,6 +592,12 @@ fn ecs_tick_loop(
             }
         }
 
+        // Episode Producer (alle 30 Ticks = ~30s bei 1s Tick-Rate)
+        if episode_producer.should_run(tick_count) {
+            let tick_rate_s = tick_rate.as_secs_f64();
+            episode_producer.tick(&event_store_for_episodes, tick_count, tick_rate_s);
+        }
+
         tick_count += 1;
 
         if tick_count.is_multiple_of(60) {
@@ -636,6 +663,14 @@ mod tests {
         enforcer
     }
 
+    /// Erstellt EpisodeProducer fuer Tests (tempfile-basiert).
+    fn test_episode_producer(tmp: &tempfile::TempDir, event_store: &EventStore) -> EpisodeProducer {
+        let path = tmp.path().join("test-hippocampus.redb");
+        let hippocampus =
+            sentinel_hippocampus::HippocampusService::open(path.to_str().unwrap()).unwrap();
+        EpisodeProducer::new(hippocampus, &[], event_store)
+    }
+
     fn test_agent_config(id: u16, name: &str, role: &str, shift_set: u8) -> AgentConfig {
         AgentConfig {
             identity: IdentityConfig {
@@ -684,6 +719,7 @@ mod tests {
         let controlplane = test_controlplane(&tmp);
         let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
 
+        let ep = test_episode_producer(&tmp, &event_store);
         let (ebpf_collector, ebpf_tx) = test_ebpf();
         let result = ecs_tick_loop(
             state_store,
@@ -699,6 +735,7 @@ mod tests {
             test_sandbox(),
             ebpf_collector,
             ebpf_tx,
+            ep,
         );
 
         assert!(result.is_ok());
@@ -732,6 +769,7 @@ mod tests {
         });
 
         let (ebpf_collector, ebpf_tx) = test_ebpf();
+        let ep = test_episode_producer(&tmp, &event_store);
         let result = ecs_tick_loop(
             state_store,
             event_store,
@@ -746,6 +784,7 @@ mod tests {
             test_sandbox(),
             ebpf_collector,
             ebpf_tx,
+            ep,
         );
 
         assert!(result.is_ok());
@@ -783,6 +822,7 @@ mod tests {
         });
 
         let es_clone = Arc::clone(&event_store);
+        let ep = test_episode_producer(&tmp, &event_store);
         let (ebpf_collector, ebpf_tx) = test_ebpf();
         let result = ecs_tick_loop(
             state_store,
@@ -798,6 +838,7 @@ mod tests {
             test_sandbox(),
             ebpf_collector,
             ebpf_tx,
+            ep,
         );
 
         assert!(result.is_ok());
