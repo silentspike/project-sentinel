@@ -83,12 +83,7 @@ impl EpisodeProducer {
     /// Verarbeitet neue Events aus Limbo und erzeugt Episoden.
     ///
     /// Gibt die Anzahl produzierter Episoden zurueck.
-    pub fn tick(
-        &mut self,
-        event_store: &EventStore,
-        current_tick: u64,
-        tick_rate_s: f64,
-    ) -> usize {
+    pub fn tick(&mut self, event_store: &EventStore, current_tick: u64, tick_rate_s: f64) -> usize {
         let events = match event_store.get_events_since_with_id(self.last_event_id, BATCH_LIMIT) {
             Ok(events) => events,
             Err(e) => {
@@ -159,8 +154,7 @@ impl EpisodeProducer {
         current_tick: u64,
         tick_rate_s: f64,
     ) -> Option<(String, Episode)> {
-        let hours_ago =
-            (current_tick.saturating_sub(event_tick) as f64 * tick_rate_s) / 3600.0;
+        let hours_ago = (current_tick.saturating_sub(event_tick) as f64 * tick_rate_s) / 3600.0;
 
         match payload {
             DomainEventPayload::AgentActionReceived {
@@ -170,8 +164,7 @@ impl EpisodeProducer {
                 target_room,
             } => {
                 let name = self.agent_names.get(&agent_id.0)?.clone();
-                let (relevance, emotion, tags) =
-                    classify_action(action_type, content.as_deref());
+                let (relevance, emotion, tags) = classify_action(action_type, content.as_deref());
                 let summary = format_action_summary(
                     &name,
                     action_type,
@@ -310,9 +303,7 @@ fn format_action_summary(
         })
         .unwrap_or_default();
 
-    let room_part = target_room
-        .map(|r| format!(" in {r}"))
-        .unwrap_or_default();
+    let room_part = target_room.map(|r| format!(" in {r}")).unwrap_or_default();
 
     if content_part.is_empty() {
         format!("{agent_name}: {action_type}{room_part}")
@@ -506,7 +497,8 @@ mod tests {
 
     #[test]
     fn test_format_action_summary() {
-        let summary = format_action_summary("Thomas", "talk", Some("Hallo Welt"), Some("kueche-eg"));
+        let summary =
+            format_action_summary("Thomas", "talk", Some("Hallo Welt"), Some("kueche-eg"));
         assert_eq!(summary, "Thomas: talk in kueche-eg - Hallo Welt");
 
         let summary = format_action_summary("Lisa", "work", None, None);
