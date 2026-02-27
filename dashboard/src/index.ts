@@ -25,6 +25,7 @@ app.route("/api", activityRoutes);
 
 // Statische Dateien
 app.use("/public/*", serveStatic({ root: "./" }));
+app.get("/favicon.ico", serveStatic({ path: "./public/favicon.png" }));
 app.get("/", serveStatic({ path: "./public/index.html" }));
 
 // Named export fuer Tests (app.request() Pattern)
