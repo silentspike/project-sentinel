@@ -57,7 +57,7 @@ pub fn autonomy_system(
 
         // P0: Blase > 90 → Zur naechsten Toilette
         if bio.bladder > 90.0 {
-            let target = nearest_toilet(&position.room_id);
+            let target = nearest_toilet(&position.room_id, identity.agent_id.0 as u32);
             if position.room_id == target {
                 // Bereits auf der Toilette → use_bathroom
                 sentinel_bio::use_bathroom(&mut bio);
@@ -219,17 +219,22 @@ fn start_transit(
     event_buffer.events.push(transit_event);
 }
 
-/// Bestimmt die naechste Toilette basierend auf der aktuellen Position.
-fn nearest_toilet(current_room: &str) -> String {
-    // Einfache Heuristik: EG-Raeume → toilette-eg, OG-Raeume → toilette-og
+/// Bestimmt die naechste Toilette basierend auf der aktuellen Position und Agent-ID.
+/// Gerade Agent-IDs → Damen, ungerade → Herren (deterministische Zuweisung).
+fn nearest_toilet(current_room: &str, agent_id: u32) -> String {
+    let gender_suffix = if agent_id.is_multiple_of(2) {
+        "damen"
+    } else {
+        "herren"
+    };
     if current_room.contains("og")
         || current_room.contains("design")
         || current_room == "meetingraum-02"
         || current_room == "meetingraum-03"
     {
-        "toilette-og".to_string()
+        format!("toilette-og-{}", gender_suffix)
     } else {
-        "toilette-eg".to_string()
+        format!("toilette-eg-{}", gender_suffix)
     }
 }
 
@@ -314,7 +319,7 @@ mod tests {
         {
             let mut pos = world.get_mut::<Position>(entity).unwrap();
             pos.in_transit = false;
-            pos.room_id = "toilette-eg".to_string();
+            pos.room_id = "toilette-eg-herren".to_string();
             pos.transit_target = None;
         }
 
@@ -338,8 +343,8 @@ mod tests {
         let entity = spawn_agent(&mut world, AgentId(1), "Test", "Dev", 1);
         world.entity_mut(entity).insert(AutonomyCooldown::default());
 
-        // Agent ist bereits auf der Toilette mit voller Blase
-        world.get_mut::<Position>(entity).unwrap().room_id = "toilette-eg".to_string();
+        // Agent ist bereits auf der Toilette mit voller Blase (AgentId(1) = ungerade → herren)
+        world.get_mut::<Position>(entity).unwrap().room_id = "toilette-eg-herren".to_string();
         world.get_mut::<BioState>(entity).unwrap().bladder = 95.0;
 
         let mut schedule = bevy_ecs::schedule::Schedule::default();

@@ -174,14 +174,14 @@ describe("Acceptance Tests - Issue #24: Dashboard Live-Daten", () => {
     expect(res.status).toBe(404);
   });
 
-  // AC-3: GET /api/rooms liefert 15 Raeume
-  test("AC-3: /api/rooms returns 15 rooms with metadata", async () => {
+  // AC-3: GET /api/rooms liefert 17 Raeume (15 original + 2 gendered toilets)
+  test("AC-3: /api/rooms returns 17 rooms with metadata", async () => {
     const res = await app.request("/api/rooms");
     expect(res.status).toBe(200);
 
     const data = await res.json();
     expect(Array.isArray(data)).toBe(true);
-    expect(data.length).toBe(15);
+    expect(data.length).toBe(17);
 
     for (const room of data) {
       expect(room).toHaveProperty("id");

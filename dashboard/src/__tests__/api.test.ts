@@ -121,12 +121,12 @@ describe("Dashboard API", () => {
     expect(data[0].in_transit).toBe(false);
   });
 
-  it("GET /api/rooms returns 15 rooms from DB", async () => {
+  it("GET /api/rooms returns 17 rooms from DB", async () => {
     const res = await app.request("/api/rooms");
     expect(res.status).toBe(200);
     const data = await res.json();
     expect(Array.isArray(data)).toBe(true);
-    expect(data.length).toBe(15);
+    expect(data.length).toBe(17);
     // Rooms haben Metadata aus rooms-meta.ts
     const buero = data.find((r: { id: string }) => r.id === "buero-dev-1");
     expect(buero).toBeDefined();

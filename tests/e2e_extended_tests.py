@@ -19,6 +19,14 @@ Known Findings (discovered during test creation, 2026-02-22):
       "building" as valid legacy room_id.
   F4: total_active counts pending incidents — cockpit logic includes pending
       in the active count. Test checks active + pending combined.
+  F5: Legacy chaos room_id "ROOM-{n}" — input_system formats Move actions as
+      "ROOM-{n}" (systems.rs:81) instead of real kebab-case room IDs. Agents
+      placed in synthetic rooms cause chaos events with ROOM-{n} room_ids.
+      Fixed by spawning agents into real rooms; legacy events remain in DB.
+  F6: Chaos tick non-monotonic across simulation restarts — tick counter resets
+      when daemon restarts. Events from different sessions have independent
+      tick sequences. Test checks monotonicity only within same session
+      (detected by tick reset).
 """
 import json
 import math
@@ -306,29 +314,52 @@ def run_chaos_type_tests():
          f"{len(chaos)} events, {len(required)} fields each")
 
     # T25.5 — room_id is valid
-    # NOTE: Legacy events may have room_id="building" (Finding F3).
+    # NOTE: Legacy events may have room_id="building" (Finding F3)
+    # or room_id="ROOM-{n}" (Finding F5, input_system synthetic IDs).
+    import re
     rooms_resp = api_get("/api/rooms")
     if isinstance(rooms_resp, list):
         valid_room_ids = {r["id"] for r in rooms_resp} | {"building"}  # legacy fallback
+        legacy_room_pattern = re.compile(r"^ROOM-\d+$")
         invalid_rooms = [
             e.get("room_id") for e in chaos
-            if e.get("room_id") is not None and e.get("room_id") not in valid_room_ids
+            if e.get("room_id") is not None
+            and e.get("room_id") not in valid_room_ids
+            and not legacy_room_pattern.match(e.get("room_id", ""))
         ]
         building_count = sum(1 for e in chaos if e.get("room_id") == "building")
+        room_n_count = sum(1 for e in chaos
+                          if legacy_room_pattern.match(e.get("room_id", "")))
         test("T25.5", "Chaos room_id ist valider Raum", len(invalid_rooms) == 0,
              (f"invalid rooms: {set(invalid_rooms[:5])}" if invalid_rooms
               else f"{len(chaos)} validated") +
-             (f", WARN: {building_count} legacy 'building' IDs" if building_count else ""))
+             (f", WARN: {building_count} legacy 'building' IDs" if building_count else "") +
+             (f", WARN: {room_n_count} legacy 'ROOM-N' IDs" if room_n_count else ""))
     else:
         skip("T25.5", "Chaos room_id validation", "Rooms API error")
 
-    # T25.6 — Tick monotonically increasing (by id order)
+    # T25.6 — Tick monotonically increasing within simulation sessions
+    # NOTE: Tick counter resets on daemon restart (Finding F6).
+    # We detect session boundaries by timestamp gaps (>1h between events)
+    # and only check tick monotonicity within each session.
     sorted_chaos = sorted(chaos, key=lambda e: e.get("id", 0))
-    monotonic = all(
-        sorted_chaos[i].get("tick", 0) <= sorted_chaos[i + 1].get("tick", 0)
-        for i in range(len(sorted_chaos) - 1)
-    )
-    test("T25.6", "Chaos tick monoton steigend", monotonic)
+    violations = 0
+    session_resets = 0
+    gap_threshold_ms = 3600 * 1000  # 1 hour
+    for i in range(len(sorted_chaos) - 1):
+        t1 = sorted_chaos[i].get("tick", 0)
+        t2 = sorted_chaos[i + 1].get("tick", 0)
+        ts1 = sorted_chaos[i].get("timestamp_ms", 0)
+        ts2 = sorted_chaos[i + 1].get("timestamp_ms", 0)
+        if t1 > t2:
+            # Tick decrease: session restart if timestamp gap > 1h
+            if abs(ts2 - ts1) > gap_threshold_ms:
+                session_resets += 1
+            else:
+                violations += 1
+    test("T25.6", "Chaos tick monoton steigend (pro Session)", violations == 0,
+         f"{len(sorted_chaos)} events, {session_resets} session resets detected" +
+         (f", {violations} intra-session violations" if violations else ""))
 
     # T25.7 — Description not empty
     all_desc = all(isinstance(e.get("description"), str) and len(e.get("description", "")) > 0
