@@ -59,6 +59,8 @@ bitnet/bitnet-inference
 
 # eBPF
 *.bpf.o
+# Keep pre-compiled BPF probes (embedded via include_bytes! at compile time)
+!crates/sentinel-ebpf/probes/*.o
 
 # Local Config
 .cargo-remote.toml

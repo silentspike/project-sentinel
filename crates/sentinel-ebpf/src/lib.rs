@@ -17,6 +17,7 @@
 //!   Cortex Gateway metrics scraping. Higher overhead (~10ms per cycle).
 //!
 //! Mode is determined at startup and logged (never silent degradation).
+//! CI verifies compilation with `--features ebpf` on every PR.
 
 pub mod collector;
 pub mod exporter;

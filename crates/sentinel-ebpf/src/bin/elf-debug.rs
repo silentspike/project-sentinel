@@ -26,8 +26,6 @@ fn main() {
 
     // Test with aligned copy
     println!("\n=== Test 2: Aligned copy (8-byte aligned) ===");
-    #[repr(C, align(8))]
-    struct AlignedBuf(Vec<u8>);
     let mut aligned = vec![0u8; probe_bytes.len()];
     // Ensure alignment by using a Vec (which is heap-allocated and typically aligned)
     aligned.copy_from_slice(probe_bytes);
