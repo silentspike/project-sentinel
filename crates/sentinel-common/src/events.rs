@@ -148,6 +148,8 @@ pub enum DomainEventPayload {
         name: String,
         role: String,
         shift_set: u8,
+        /// Raum-ID bei Spawn. Alte Events (vor room_id-Einfuehrung) haben Default "".
+        #[serde(default)]
         room_id: String,
     },
     /// Agent wurde aus der Runtime entfernt
