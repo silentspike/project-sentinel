@@ -175,17 +175,24 @@ impl ProjectionWorker {
         let mut processed = 0usize;
 
         for (row_id, event) in batch {
-            // Payload deserialisieren
+            // Payload deserialisieren (mit Fallback fuer alte Events ohne "type" Tag)
             let payload: DomainEventPayload = match serde_json::from_str(&event.payload) {
                 Ok(p) => p,
-                Err(e) => {
-                    warn!(
-                        row_id,
-                        event_type = event.event_type,
-                        error = %e,
-                        "Unknown or malformed event payload, skipping"
-                    );
-                    continue;
+                Err(_first_err) => {
+                    // Fallback: Alte Events (vor serde tag="type") haben kein "type" Feld.
+                    // Wir injizieren den Tag aus event.event_type (DB-Spalte).
+                    match deserialize_legacy_payload(&event.event_type, &event.payload) {
+                        Some(p) => p,
+                        None => {
+                            warn!(
+                                row_id,
+                                event_type = event.event_type,
+                                error = %_first_err,
+                                "Unknown or malformed event payload, skipping"
+                            );
+                            continue;
+                        }
+                    }
                 }
             };
 
@@ -208,4 +215,48 @@ impl ProjectionWorker {
         txn.commit()?;
         Ok(processed)
     }
+}
+
+/// Fallback-Deserializer fuer Legacy-Events (vor `serde(tag = "type")` Einfuehrung).
+///
+/// Alte Events haben kein `"type"` Discriminator-Feld im JSON-Payload.
+/// Diese Funktion mappt `event_type` (DB-Spalte) auf den serde-Tag und
+/// konvertiert abweichende Feldnamen (z.B. `"target"` → `"target_room"`).
+fn deserialize_legacy_payload(event_type: &str, payload: &str) -> Option<DomainEventPayload> {
+    // event_type (DB) → serde tag name Mapping
+    let serde_tag = match event_type {
+        "agent_action_received" => "AgentActionReceived",
+        "transit_started" => "TransitStarted",
+        "transit_completed" => "TransitCompleted",
+        "chaos_triggered" => "ChaosTriggered",
+        "bio_action_performed" => "BioActionPerformed",
+        "bio_state_updated" => "BioStateUpdated",
+        "room_physics_updated" => "RoomPhysicsUpdated",
+        "tick_snapshot" => "TickSnapshot",
+        "agent_spawned" => "AgentSpawned",
+        "agent_despawned" => "AgentDespawned",
+        _ => return None,
+    };
+
+    // JSON parsen, Tag injizieren, Legacy-Felder remappen
+    let mut value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let obj = value.as_object_mut()?;
+
+    // Discriminator-Tag setzen
+    obj.insert("type".to_string(), serde_json::Value::String(serde_tag.to_string()));
+
+    // Legacy-Feld-Remapping fuer agent_action_received
+    if event_type == "agent_action_received" {
+        // "target" → "target_room"
+        if let Some(target) = obj.remove("target") {
+            obj.entry("target_room".to_string()).or_insert(target);
+        }
+        // "emotion" existierte in alten Events, wird ignoriert (nicht im Struct)
+        obj.remove("emotion");
+        // agent_id fehlte in alten Events → Default 0
+        obj.entry("agent_id".to_string())
+            .or_insert(serde_json::Value::Number(0.into()));
+    }
+
+    serde_json::from_value(value).ok()
 }
