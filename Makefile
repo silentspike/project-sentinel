@@ -69,8 +69,8 @@ build-rust: ## Build Rust workspace
 build-rust-remote: ## Build Rust on remote build server
 	cargo remote -- build --workspace
 
-build-rust-release: ## Build Rust release (remote)
-	cargo remote -- build --workspace --release
+build-rust-release: ## Build Rust release (remote, includes eBPF kernel probes)
+	cargo remote -- build --workspace --release --features ebpf
 
 build-go: ## Build Cortex Gateway
 	cd cmd/cortex-gateway && go build -o cortex-gateway ./...
