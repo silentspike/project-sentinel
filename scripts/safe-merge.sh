@@ -81,7 +81,7 @@ for ISSUE in "${LINKED_ISSUES[@]}"; do
   fi
 done
 
-RUNS_JSON="$(gh run list -R "$REPO" --commit "$PR_SHA" --json name,status,conclusion,event --limit 100)"
+RUNS_JSON="$(gh run list -R "$REPO" --commit "$PR_SHA" --json name,status,conclusion,event,databaseId --limit 100)"
 
 required_workflows=(
   "CI"
@@ -90,15 +90,18 @@ required_workflows=(
 )
 
 for WORKFLOW in "${required_workflows[@]}"; do
-  COUNT="$(printf '%s' "$RUNS_JSON" | jq --arg n "$WORKFLOW" '[.[] | select(.name == $n and .event == "pull_request")] | length')"
-  if [[ "$COUNT" -eq 0 ]]; then
+  # Pick only the most recent run per workflow (highest databaseId = newest)
+  LATEST="$(printf '%s' "$RUNS_JSON" | jq --arg n "$WORKFLOW" \
+    '[.[] | select(.name == $n and .event == "pull_request")] | sort_by(.databaseId) | last')"
+
+  if [[ "$LATEST" == "null" || -z "$LATEST" ]]; then
     echo "ERROR: Required workflow '$WORKFLOW' has no run for this PR head commit."
     exit 1
   fi
 
-  BAD_COUNT="$(printf '%s' "$RUNS_JSON" | jq --arg n "$WORKFLOW" '[.[] | select(.name == $n and .event == "pull_request" and .conclusion != "success")] | length')"
-  if [[ "$BAD_COUNT" -gt 0 ]]; then
-    echo "ERROR: Required workflow '$WORKFLOW' is not successful."
+  CONCLUSION="$(printf '%s' "$LATEST" | jq -r '.conclusion')"
+  if [[ "$CONCLUSION" != "success" ]]; then
+    echo "ERROR: Required workflow '$WORKFLOW' latest run is not successful (conclusion: $CONCLUSION)."
     exit 1
   fi
 done
