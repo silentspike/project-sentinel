@@ -180,6 +180,11 @@ pub fn create_simulation_world() -> (World, Schedule) {
     schedule.add_systems(bio_system.in_set(SimulationPhase::Biology));
     schedule.add_systems(physics_system.in_set(SimulationPhase::Physics));
     schedule.add_systems(transit_system.in_set(SimulationPhase::Transit));
+    schedule.add_systems(
+        work_context_system
+            .in_set(SimulationPhase::Transit)
+            .after(transit_system),
+    );
     schedule.add_systems(chaos_system.in_set(SimulationPhase::Chaos));
     schedule.add_systems(mood_system.in_set(SimulationPhase::Mood));
     schedule.add_systems(perception_system.in_set(SimulationPhase::Perception));
@@ -262,6 +267,7 @@ pub fn spawn_agent(
                 in_meeting: false,
                 has_deadline: false,
                 has_conflict: false,
+                conflict_cooldown: 0,
             },
             Relationships {
                 affinity: Vec::new(),

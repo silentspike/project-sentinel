@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Bio-Engine Dynamics: Stress, Energy, Caffeine reagieren dynamisch** (#148)
+  - Root Cause: WorkContext-Flags (`in_meeting`, `has_deadline`, `has_conflict`) wurden NIRGENDS gesetzt,
+    Energy hatte keinen Arbeitsdrain, Kaffee wurde nie automatisch getrunken
+  - Neues `work_context_system`: Deriviert WorkContext automatisch aus Raum-Belegung (Meeting),
+    Tageszeit (Deadline-Druck 14-17h) und Chaos-Events (Conflict-Cooldown 120 Ticks)
+  - Energy Work-Drain: Muedigkeit akkumuliert waehrend Arbeitszeit (06-22h), Conscientiousness
+    reduziert den Drain (gewissenhafte Agents halten laenger durch)
+  - Caffeine-Tolerance: Personality-Feld moduliert jetzt den Koffein-Boost (0.5x bis 1.0x)
+  - Auto-Coffee: Agents trinken automatisch Kaffee bei Energy < 50 und Caffeine < 10mg
+    (08-16h, max 1x/5min) — unabhaengig von LLM-Responses
+  - Chaos→Conflict: Stressausloesende Events (PrinterBroken, FireAlarm, AirCon, Internet)
+    setzen conflict_cooldown auf Agents im betroffenen Raum
+  - sim_hour Fortschritt: Daemon aktualisiert jetzt SimulationTime.sim_hour korrekt
+    (vorher war sim_hour=8.0 statisch, jetzt schreitet mit Echtzeit voran und wraps 0-24)
+
 - **Episoden-Pipeline im Daemon reaktiviert** (#137)
   - Root Cause: Cortex Gateway war seit 27.02. inaktiv → keine `agent_action_received` Events
   - Episode Producer Starvation-Diagnostik: Warnt alle 10 leeren Laeufe (~5 Min) wenn keine

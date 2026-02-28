@@ -30,6 +30,7 @@ fn main() {
         in_meeting: false,
         has_deadline: false,
         has_conflict: false,
+        conflict_cooldown: 0,
     };
 
     println!("=== 8-Stunden-Arbeitstag-Simulation ===\n");
