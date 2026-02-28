@@ -33,6 +33,9 @@ const SOCIAL_INTROVERT_RATE: f32 = -5.0;
 /// Extroversion-Schwellenwert (>=0.5 = extrovertiert)
 const EXTROVERSION_THRESHOLD: f32 = 0.5;
 
+/// Arbeitsdrain pro Stunde seit Schichtbeginn (Energy-Penalty waehrend Arbeitszeit)
+const WORK_DRAIN_PER_HOUR: f32 = 3.0;
+
 /// Aktualisiert alle Bio-Zustaende fuer einen Tick
 ///
 /// # Arguments
@@ -120,7 +123,11 @@ fn update_social_need(bio: &mut BioState, personality: &Personality, dt_hours: f
     bio.social_need = (bio.social_need + rate * dt_hours).clamp(0.0, 100.0);
 }
 
-/// Aktualisiert Energie (circadian + Penalties + Koffein-Boost)
+/// Aktualisiert Energie (circadian + Work-Drain + Penalties + Koffein-Boost)
+///
+/// Work-Drain: Arbeitsmuedigkeit steigt linear waehrend Arbeitszeit (06-22 Uhr).
+/// Conscientiousness reduziert den Drain (gewissenhafte Agents ermuerden langsamer).
+/// Caffeine-Tolerance moduliert den Koffein-Boost (hohe Toleranz = weniger Wirkung).
 fn update_energy(bio: &mut BioState, personality: &Personality, sim_hour: f32) {
     use std::f32::consts::PI;
 
@@ -137,10 +144,23 @@ fn update_energy(bio: &mut BioState, personality: &Personality, sim_hour: f32) {
     let hunger_penalty = (bio.hunger - 70.0).max(0.0) / 30.0 * 20.0; // >70 Hunger -> max -20
     let stress_penalty = bio.stress / 100.0 * 15.0; // Stress -> max -15
 
-    // Koffein-Boost
-    let caffeine_boost = (bio.caffeine_mg / 95.0).min(1.0) * 10.0; // Max +10
+    // Koffein-Boost mit Toleranz-Modifier
+    // Hohe Toleranz (1.0) → weniger Wirkung (0.5x), niedrige (0.0) → volle Wirkung (1.0x)
+    let tolerance_modifier = 1.0 - personality.caffeine_tolerance * 0.5;
+    let caffeine_boost = (bio.caffeine_mg / 95.0).min(1.0) * 10.0 * tolerance_modifier;
 
-    bio.energy = (base - hunger_penalty - stress_penalty + caffeine_boost).clamp(0.0, 100.0);
+    // Work-Drain: Muedigkeit akkumuliert waehrend Arbeitszeit (06-22 Uhr)
+    let work_drain = if (6.0_f32..22.0).contains(&sim_hour) {
+        let hours_worked = sim_hour - 6.0;
+        // Conscientiousness reduziert Drain: 0.5x (sehr gewissenhaft) bis 1.5x (nachlässig)
+        let drain_modifier = 1.5 - personality.conscientiousness;
+        hours_worked * WORK_DRAIN_PER_HOUR * drain_modifier
+    } else {
+        0.0
+    };
+
+    bio.energy =
+        (base - hunger_penalty - stress_penalty + caffeine_boost - work_drain).clamp(0.0, 100.0);
 }
 
 // ── PSI-Stress Konstanten ──
@@ -227,6 +247,7 @@ mod tests {
             in_meeting: false,
             has_deadline: false,
             has_conflict: false,
+            conflict_cooldown: 0,
         }
     }
 
@@ -407,5 +428,94 @@ mod tests {
         bio.comfort = 5.0;
         apply_psi_stress(&mut bio, 0.0, 80.0);
         assert_relative_eq!(bio.comfort, 0.0, epsilon = 0.01);
+    }
+
+    #[test]
+    fn test_work_drain_reduces_energy_during_work_hours() {
+        let personality = default_personality();
+        let work = default_work();
+
+        // Energie um 6:00 (Arbeitsbeginn, kein Drain) vs 14:00 (8h Drain)
+        let mut bio_early = default_bio();
+        let mut bio_afternoon = default_bio();
+        update_bio_state(&mut bio_early, &personality, &work, 60.0, 6.0);
+        update_bio_state(&mut bio_afternoon, &personality, &work, 60.0, 14.0);
+
+        // 14:00 hat 8h Work-Drain (8*3*1.0=24), 6:00 hat 0 Drain
+        assert!(
+            bio_early.energy > bio_afternoon.energy,
+            "Energy at 6:00 ({}) should be > energy at 14:00 ({})",
+            bio_early.energy,
+            bio_afternoon.energy
+        );
+    }
+
+    #[test]
+    fn test_conscientiousness_reduces_work_drain() {
+        let mut high_c = default_personality();
+        high_c.conscientiousness = 1.0; // Sehr gewissenhaft → weniger Drain
+        let mut low_c = default_personality();
+        low_c.conscientiousness = 0.0; // Nachlässig → mehr Drain
+
+        let work = default_work();
+        let mut bio_high = default_bio();
+        let mut bio_low = default_bio();
+
+        // 14:00 = 8h in die Schicht
+        update_bio_state(&mut bio_high, &high_c, &work, 60.0, 14.0);
+        update_bio_state(&mut bio_low, &low_c, &work, 60.0, 14.0);
+
+        // high_c Drain: 8*3*0.5=12, low_c Drain: 8*3*1.5=36
+        assert!(
+            bio_high.energy > bio_low.energy,
+            "Conscientious agent energy ({}) should be > careless agent energy ({})",
+            bio_high.energy,
+            bio_low.energy
+        );
+    }
+
+    #[test]
+    fn test_no_work_drain_outside_work_hours() {
+        let personality = default_personality();
+        let work = default_work();
+        let mut bio = default_bio();
+
+        // 23:00 = ausserhalb Arbeitszeit → kein Work-Drain
+        update_bio_state(&mut bio, &personality, &work, 60.0, 23.0);
+
+        // Circadian base at 23:00 fuer Morning Person: 80+15*sin((23-2)*PI/12)
+        // = 80+15*sin(21*PI/12) = 80+15*sin(7*PI/4) ≈ 80-10.6 ≈ 69.4
+        // Kein Drain, kein Hunger/Stress-Penalty → Energie = reine circadian Basis
+        assert!(
+            bio.energy > 60.0,
+            "Energy at 23:00 with no drain should be > 60 (got {})",
+            bio.energy
+        );
+    }
+
+    #[test]
+    fn test_caffeine_tolerance_modulates_boost() {
+        let mut low_tol = default_personality();
+        low_tol.caffeine_tolerance = 0.0; // Koffein wirkt voll (modifier=1.0)
+        let mut high_tol = default_personality();
+        high_tol.caffeine_tolerance = 1.0; // Koffein wirkt halb (modifier=0.5)
+
+        let work = default_work();
+        let mut bio_low = default_bio();
+        bio_low.caffeine_mg = 95.0;
+        let mut bio_high = default_bio();
+        bio_high.caffeine_mg = 95.0;
+
+        // Gleicher Zeitpunkt ausserhalb Arbeitszeit um Work-Drain zu eliminieren
+        update_bio_state(&mut bio_low, &low_tol, &work, 60.0, 4.0);
+        update_bio_state(&mut bio_high, &high_tol, &work, 60.0, 4.0);
+
+        // Niedrige Toleranz → voller Boost → mehr Energie
+        assert!(
+            bio_low.energy > bio_high.energy,
+            "Low tolerance energy ({}) should be > high tolerance energy ({})",
+            bio_low.energy,
+            bio_high.energy
+        );
     }
 }
