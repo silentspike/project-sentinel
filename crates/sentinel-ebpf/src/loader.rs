@@ -10,9 +10,9 @@ use tracing::{info, warn};
 /// Monitoring mode determined at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum MonitoringMode {
-    /// eBPF probes loaded in kernel. Near-zero overhead.
+    /// eBPF probes loaded in kernel. ~540ns per probe hit, ~333us collection cycle.
     Kernel,
-    /// Userspace fallback. Reads /proc and cgroup files. Higher overhead (~10ms).
+    /// Userspace fallback. Reads /proc and cgroup files. ~10ms per collection cycle.
     Userspace,
 }
 
