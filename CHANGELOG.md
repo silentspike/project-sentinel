@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Episoden-Pipeline im Daemon reaktiviert** (#137)
+  - Root Cause: Cortex Gateway war seit 27.02. inaktiv → keine `agent_action_received` Events
+  - Episode Producer Starvation-Diagnostik: Warnt alle 10 leeren Laeufe (~5 Min) wenn keine
+    konvertierbaren Events ankommen (verhindert stilles Verhungern der Pipeline)
+  - Cortex Gateway operationell reaktiviert → Agent-Action-Events fliessen wieder
+
 - **Event Snapshots: last_event_id Fix + periodischer Snapshot** (#150)
   - `save_state()` speichert jetzt `max_event_rowid()` statt hardcoded `0` als `last_event_id`
   - Periodischer Runtime-Snapshot alle 600 Ticks (~10 Minuten) im Daemon Tick-Loop
