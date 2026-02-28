@@ -424,7 +424,12 @@ impl RuntimeOrchestrator {
         let json = serde_json::to_string(&snapshot)?;
 
         let last_event_id = store.max_event_rowid().unwrap_or(0);
-        store.save_snapshot(RUNTIME_AGGREGATE, RUNTIME_SNAPSHOT_TYPE, &json, last_event_id)?;
+        store.save_snapshot(
+            RUNTIME_AGGREGATE,
+            RUNTIME_SNAPSHOT_TYPE,
+            &json,
+            last_event_id,
+        )?;
 
         tracing::info!(
             agent_count = self.agents.len(),

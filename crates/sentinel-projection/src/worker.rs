@@ -243,7 +243,10 @@ fn deserialize_legacy_payload(event_type: &str, payload: &str) -> Option<DomainE
     let obj = value.as_object_mut()?;
 
     // Discriminator-Tag setzen
-    obj.insert("type".to_string(), serde_json::Value::String(serde_tag.to_string()));
+    obj.insert(
+        "type".to_string(),
+        serde_json::Value::String(serde_tag.to_string()),
+    );
 
     // Legacy-Feld-Remapping fuer agent_action_received
     if event_type == "agent_action_received" {

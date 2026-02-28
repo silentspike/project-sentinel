@@ -603,7 +603,10 @@ fn ecs_tick_loop(
             if let Err(e) = runtime_orch.save_state() {
                 warn!(error = %e, tick = tick_count, "Periodischer Snapshot fehlgeschlagen");
             } else {
-                info!(tick = tick_count, "Periodischer Runtime-Snapshot gespeichert");
+                info!(
+                    tick = tick_count,
+                    "Periodischer Runtime-Snapshot gespeichert"
+                );
             }
         }
 
