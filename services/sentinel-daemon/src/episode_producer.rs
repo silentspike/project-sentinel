@@ -18,6 +18,10 @@ const PRODUCE_INTERVAL_TICKS: u64 = 30;
 /// Maximale Anzahl Events pro Batch (verhindert zu grosse Queries).
 const BATCH_LIMIT: usize = 500;
 
+/// Anzahl aufeinanderfolgender Laeufe ohne konvertierbare Events,
+/// ab der eine Warnung geloggt wird.
+const STARVATION_WARN_INTERVAL: u32 = 10;
+
 /// Produziert Episoden aus DomainEvents fuer den HippocampusService.
 pub struct EpisodeProducer {
     hippocampus: HippocampusService,
@@ -27,6 +31,8 @@ pub struct EpisodeProducer {
     agent_names: HashMap<u16, String>,
     /// Monoton steigender Episode-ID-Zaehler.
     next_episode_id: u64,
+    /// Zaehler fuer aufeinanderfolgende Laeufe ohne konvertierbare Events (Starvation-Diagnostik).
+    empty_runs: u32,
 }
 
 /// Offset-Name fuer die Limbo-Offset-Tabelle (Cursor-Persistierung).
@@ -62,6 +68,7 @@ impl EpisodeProducer {
             last_event_id,
             agent_names,
             next_episode_id: 1,
+            empty_runs: 0,
         }
     }
 
@@ -148,12 +155,24 @@ impl EpisodeProducer {
         }
 
         if total > 0 {
+            self.empty_runs = 0;
             info!(
                 episodes = total,
                 agents = episodes_by_agent.len(),
                 cursor = self.last_event_id,
                 "Episoden produziert"
             );
+        } else {
+            self.empty_runs += 1;
+            if self.empty_runs.is_multiple_of(STARVATION_WARN_INTERVAL) {
+                warn!(
+                    empty_runs = self.empty_runs,
+                    cursor = self.last_event_id,
+                    events_checked = events.len(),
+                    "Episode Producer: Keine konvertierbaren Events seit {} Laeufen",
+                    self.empty_runs
+                );
+            }
         }
 
         total
