@@ -12,7 +12,7 @@
 //! ## Monitoring Modes
 //!
 //! - **Kernel mode** (`ebpf` feature + `CAP_BPF`): fentry probes, Per-CPU Hash Maps,
-//!   Ring Buffer. Near-zero overhead (~50ns per probe hit).
+//!   Ring Buffer. Near-zero overhead (~540ns per probe hit, measured on 6.17 kernel).
 //! - **Userspace mode** (fallback): /proc/{pid}/io polling, cgroup io.stat,
 //!   Cortex Gateway metrics scraping. Higher overhead (~10ms per cycle).
 //!
