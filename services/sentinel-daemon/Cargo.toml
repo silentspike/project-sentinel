@@ -40,7 +40,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 uuid = { workspace = true }
 
 [features]
-default = ["llm"]
+default = ["llm", "ebpf"]
 telemetry = ["sentinel-telemetry/telemetry"]
 llm = ["reqwest"]
 ebpf = ["sentinel-ebpf/ebpf"]
