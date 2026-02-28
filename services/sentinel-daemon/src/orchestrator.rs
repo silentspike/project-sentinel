@@ -498,6 +498,9 @@ fn ecs_tick_loop(
             time.tick = sentinel_common::Tick(tick_count);
             time.tick_count = tick_count;
             time.delta_seconds = tick_rate.as_secs_f32();
+            // sim_hour: Startet bei 08:00, schreitet mit Echtzeit voran,
+            // wraps um 0-24 fuer korrekten Circadian-Rhythmus.
+            time.sim_hour = (8.0 + tick_count as f32 * tick_rate.as_secs_f32() / 3600.0) % 24.0;
         }
 
         // RuntimeOrchestrator Tick synchronisieren
