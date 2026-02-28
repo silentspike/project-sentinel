@@ -598,6 +598,15 @@ fn ecs_tick_loop(
             episode_producer.tick(&event_store_for_episodes, tick_count, tick_rate_s);
         }
 
+        // Periodischer Runtime-Snapshot (alle 600 Ticks = ~10 Minuten bei 1s Tick-Rate)
+        if tick_count > 0 && tick_count.is_multiple_of(600) {
+            if let Err(e) = runtime_orch.save_state() {
+                warn!(error = %e, tick = tick_count, "Periodischer Snapshot fehlgeschlagen");
+            } else {
+                info!(tick = tick_count, "Periodischer Runtime-Snapshot gespeichert");
+            }
+        }
+
         tick_count += 1;
 
         if tick_count.is_multiple_of(60) {

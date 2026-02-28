@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Event Snapshots: last_event_id Fix + periodischer Snapshot** (#150)
+  - `save_state()` speichert jetzt `max_event_rowid()` statt hardcoded `0` als `last_event_id`
+  - Periodischer Runtime-Snapshot alle 600 Ticks (~10 Minuten) im Daemon Tick-Loop
+  - Vorher: 2.9M Events, alle 11 Snapshots mit `last_event_id = 0` → Full-Replay bei Recovery
+  - Nachher: Snapshots referenzieren korrekte Event-Position, Recovery ab letztem Snapshot
+
 - **eBPF Kernel-Modus Regression** (#139)
   - Daemon-Binary wird jetzt mit `--features ebpf` gebaut
   - CI prueft eBPF-Feature-Kompilierung (Clippy + Tests)
