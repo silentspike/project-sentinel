@@ -318,6 +318,7 @@ mod tests {
             in_meeting: false,
             has_deadline: false,
             has_conflict: false,
+            conflict_cooldown: 0,
         }
     }
 

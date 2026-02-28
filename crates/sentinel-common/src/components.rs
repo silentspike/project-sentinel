@@ -116,6 +116,8 @@ pub struct WorkContext {
     pub in_meeting: bool,
     pub has_deadline: bool,
     pub has_conflict: bool,
+    /// Verbleibende Ticks mit Conflict-Stress (gesetzt durch Chaos-Events, zerfaellt pro Tick)
+    pub conflict_cooldown: u32,
 }
 
 /// Beziehungen zu anderen Agenten

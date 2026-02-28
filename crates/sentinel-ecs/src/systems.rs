@@ -1,11 +1,12 @@
 //! ECS Systems fuer Agent-Simulation.
 //!
-//! Definiert 10 Systems in strikter Ausfuehrungsreihenfolge:
+//! Definiert 11 Systems in strikter Ausfuehrungsreihenfolge:
 //! 1. input_system - Empfaengt Agent-Aktionen via Channel
-//! 2. bio_system - Aktualisiert biologische Zustaende (sentinel-bio)
+//! 2. bio_system - Aktualisiert biologische Zustaende (sentinel-bio) + Auto-Coffee
 //! 3. physics_system - Berechnet Raum-Physik (sentinel-physics)
 //! 4. transit_system - Verarbeitet Raumwechsel + Transit-Events
-//! 5. chaos_system - Generiert Zufallsereignisse + Chaos-Events
+//!    4b. work_context_system - Deriviert WorkContext (Meeting/Deadline/Conflict)
+//! 5. chaos_system - Generiert Zufallsereignisse + setzt Conflict-Cooldown
 //! 6. mood_system - Berechnet Stimmung aus Bio+Kontext
 //! 7. perception_system - Generiert Wahrnehmungstext fuer LLM-Prompt
 //! 8. decision_system - Priorisiert Events fuer impulse_text (P0-P3)
@@ -180,6 +181,7 @@ pub fn input_system(
 /// 2. Aktualisiert biologische Zustaende via sentinel-bio Differenzialgleichungen.
 ///
 /// Erzeugt BioStateUpdated DomainEvents alle 20 Ticks (periodischer Snapshot).
+/// Auto-Coffee: Agents trinken automatisch Kaffee wenn Energy < 50 und kein Koffein im System.
 pub fn bio_system(
     mut query: Query<(
         &AgentIdentity,
@@ -202,6 +204,29 @@ pub fn bio_system(
             time.delta_seconds,
             time.sim_hour,
         );
+
+        // Auto-Coffee: Agent trinkt automatisch Kaffee bei niedrigem Energy-Level
+        // Bedingungen: Energy < 50, Koffein < 10mg, Arbeitszeit (08-16h), max 1x/5min
+        if bio.energy < 50.0
+            && bio.caffeine_mg < 10.0
+            && (8.0..16.0).contains(&time.sim_hour)
+            && tick > 0
+            && tick.is_multiple_of(300)
+        {
+            sentinel_bio::drink_coffee(&mut bio);
+            let bio_payload = DomainEventPayload::BioActionPerformed {
+                agent_id: identity.agent_id,
+                action: "drink_coffee".to_string(),
+            };
+            let bio_event = DomainEvent::new(
+                bio_payload.event_type_str(),
+                &identity.agent_id.to_string(),
+                &bio_payload.to_json(),
+                &uuid::Uuid::new_v4().to_string(),
+                tick,
+            );
+            event_buffer.events.push(bio_event);
+        }
 
         // Periodischer Bio-State Snapshot alle 20 Ticks (~20 Sekunden bei 1Hz)
         if tick.is_multiple_of(20) {
@@ -327,14 +352,68 @@ pub fn transit_system(
     }
 }
 
+/// Cooldown-Dauer in Ticks fuer Conflict-Stress nach stressausloesendem Chaos-Event
+const CONFLICT_COOLDOWN_TICKS: u32 = 120;
+
+/// 4b. Deriviert WorkContext automatisch aus Raum, Zeit und Conflict-State.
+///
+/// - `in_meeting`: Agent in Meetingraum mit >= 2 Agents
+/// - `has_deadline`: Nachmittagsdruck 14-17 Uhr
+/// - `has_conflict`: Zerfallender Cooldown nach Chaos-Events (gesetzt im chaos_system)
+pub fn work_context_system(
+    mut agents: Query<(&Position, &mut WorkContext)>,
+    time: Res<SimulationTime>,
+) {
+    // Raum-Belegung zaehlen (immutabler Pass)
+    let room_counts: std::collections::HashMap<String, usize> = {
+        let mut counts = std::collections::HashMap::new();
+        for (pos, _) in agents.iter() {
+            if !pos.in_transit {
+                *counts.entry(pos.room_id.clone()).or_insert(0) += 1;
+            }
+        }
+        counts
+    };
+
+    // WorkContext aktualisieren (mutabler Pass)
+    for (pos, mut work) in &mut agents {
+        // in_meeting: Agent in meetingraum-* mit >= 2 Agents im selben Raum
+        let is_meetingroom = pos.room_id.starts_with("meetingraum");
+        let occupancy = room_counts.get(&pos.room_id).copied().unwrap_or(0);
+        work.in_meeting = is_meetingroom && occupancy >= 2;
+
+        // has_deadline: Nachmittagsdruck 14-17 Uhr
+        work.has_deadline = (14.0..17.0).contains(&time.sim_hour);
+
+        // conflict_cooldown Decay + has_conflict Flag
+        if work.conflict_cooldown > 0 {
+            work.conflict_cooldown -= 1;
+        }
+        work.has_conflict = work.conflict_cooldown > 0;
+    }
+}
+
+/// Prueft ob ein Chaos-EventType stressausloesend ist
+fn is_stressful_chaos(event_type: sentinel_common::EventType) -> bool {
+    matches!(
+        event_type,
+        sentinel_common::EventType::PrinterBroken
+            | sentinel_common::EventType::FireAlarmDrill
+            | sentinel_common::EventType::AirConBroken
+            | sentinel_common::EventType::InternetOutage
+    )
+}
+
 /// 5. Generiert Zufallsereignisse (Poisson-verteilt)
 ///
 /// Nutzt splitmix64-basierte Pseudo-Zufallszahlen fuer gleichmaessige Verteilung.
 /// Globaler Cooldown verhindert Event-Flut: max 1 Chaos-Event alle 30 Ticks.
+/// Stressausloesende Events (PrinterBroken, FireAlarm, AirCon, Internet) setzen
+/// conflict_cooldown auf Agents im betroffenen Raum.
 pub fn chaos_system(
     time: Res<SimulationTime>,
     mut event_buffer: ResMut<EventBuffer>,
-    positions: Query<&Position>,
+    mut agents: Query<(&Position, &mut WorkContext)>,
 ) {
     let tick = time.tick.0;
 
@@ -346,10 +425,10 @@ pub fn chaos_system(
 
     // Besetzte Raeume sammeln fuer realistische Chaos-Zuweisung
     let occupied_rooms: Vec<String> = {
-        let mut rooms: Vec<String> = positions
+        let mut rooms: Vec<String> = agents
             .iter()
-            .filter(|p| !p.in_transit)
-            .map(|p| p.room_id.clone())
+            .filter(|(p, _)| !p.in_transit)
+            .map(|(p, _)| p.room_id.clone())
             .collect();
         rooms.sort();
         rooms.dedup();
@@ -444,6 +523,15 @@ pub fn chaos_system(
                 time.tick.0,
             );
             event_buffer.events.push(event);
+
+            // Stressausloesende Chaos-Events setzen conflict_cooldown auf Agents im Raum
+            if is_stressful_chaos(*common_type) {
+                for (pos, mut work) in &mut agents {
+                    if !pos.in_transit && pos.room_id == target {
+                        work.conflict_cooldown = CONFLICT_COOLDOWN_TICKS;
+                    }
+                }
+            }
         }
     }
 }

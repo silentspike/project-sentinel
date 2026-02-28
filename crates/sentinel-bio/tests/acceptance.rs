@@ -38,6 +38,7 @@ fn default_work() -> WorkContext {
         in_meeting: false,
         has_deadline: false,
         has_conflict: false,
+        conflict_cooldown: 0,
     }
 }
 
