@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Daemon-Binary wird jetzt mit `--features ebpf` gebaut
   - CI prueft eBPF-Feature-Kompilierung (Clippy + Tests)
   - Kernel-Probes (fentry/vfs_write, tcp_connect, tcp_close) wieder aktiv
+  - Probe-Overhead gemessen: ~540ns/hit (vorher unbelegte ~50ns Behauptung korrigiert)
+  - Collection Cycle: ~333us fuer 109 Cgroups, 0 Ring Buffer Drops, 0.007% CPU
 
 ### Added
 
