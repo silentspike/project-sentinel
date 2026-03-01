@@ -263,18 +263,19 @@ fn ac_75_04_only_bridge_ip() {
     );
 }
 
-// AC #75.N1: BwrapConfig::for_agent() default ist jetzt network-isolated
+// AC #75.N1 / #173: BwrapConfig::for_agent() default ist share_net=true
+// (TOGAF: Agent braucht Cortex Gateway API-Zugang, Enforcer setzt share_net=false wenn netns verfuegbar)
 #[test]
 fn ac_75_n1_bwrap_default_isolated() {
     let config = BwrapConfig::for_agent("thomas");
     assert!(
-        !config.share_net,
-        "BwrapConfig::for_agent() default must be network-isolated (share_net=false)"
+        config.share_net,
+        "BwrapConfig::for_agent() default must be share_net=true (TOGAF: Cortex Gateway API-Zugang)"
     );
     let args = config.to_args();
     assert!(
-        !args.contains(&"--share-net".to_string()),
-        "Default config must NOT contain --share-net"
+        args.contains(&"--share-net".to_string()),
+        "Default config must contain --share-net (TOGAF: Cortex Gateway API-Zugang)"
     );
 }
 

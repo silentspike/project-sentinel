@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sandbox Agent Spawning — TOGAF-konform (bwrap + cgroups v2)** (#173)
+  - `SandboxEnforcer::start_agent_process()` wird jetzt vom Orchestrator aufgerufen:
+    echte bwrap-Prozesse pro Agent (statt nur cgroup/home-dir Setup)
+  - `AgentProcess` Struct: Haelt Child-Handle, Drop-Impl reaps Zombies
+  - `EbpfCollector::update_agent_pid()`: PID-Tracking fuer `/proc/{pid}/io` Monitoring
+  - Orchestrator verdrahtet: Initial-Spawn + Shift-Transition + Graceful Shutdown
+  - Network-Namespace Isolation nach Prozess-Start (optional, via `setup_network()`)
+  - `agent_command` konfigurierbar in `daemon.toml` (Default: `/usr/bin/agent-runtime`)
+  - TOGAF-konforme bwrap Config: `/usr`, `/lib`, `/lib64` readonly, `/etc/resolv.conf`,
+    `/work/company` → `/company` readonly, Agent-Home writable, Landlock Defense-in-Depth
+  - cgroup Cleanup bei Schichtwechsel und Shutdown
+
 - **Closed-Loop Personality Evolution (TOGAF-vollstaendig)** (#138)
   - **Judge → Drift Detection (Go):** Agent-Profile aus TOML laden, Drift-Score > 0
     fuer alle aktiven Agents, Evolution-Writes (drift/quality/fatigue) in personality_evolution
