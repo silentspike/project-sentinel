@@ -66,6 +66,7 @@ function toAgentListItem(row: {
     social_need: row.social_need ?? 0,
     caffeine_mg: row.caffeine_mg ?? 0,
     mood: row.mood ?? null,
+    stalled: false, // WebSocket updates don't include stall data (polled via REST)
   };
 }
 

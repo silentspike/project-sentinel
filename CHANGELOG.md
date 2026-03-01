@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **eBPF Functional Fixes — Ende-zu-Ende Datenkette repariert** (#139)
+  - **Stall-Detection false positives:** BPF Map enthielt ALLE System-cgroups (sshd,
+    systemd etc.), nur registrierte Sentinel-Agents werden jetzt getrackt
+  - **cgroup_name = "unknown":** System-cgroups korrekt rausgefiltert, Agent-Namen
+    in Prometheus Labels und Stall-Reports aufgenommen
+  - **I/O writes = 0:** Delta-Tracking fuer /proc/PID/io und cgroup io.stat eingebaut,
+    cgroup io.stat Daten werden jetzt tatsaechlich aufgezeichnet (nicht nur getraced)
+  - **PSI cpu_pressure = 0.0:** Silent `.ok()` durch diagnostisches Error-Logging ersetzt
+  - **Zenoh Publisher Lifecycle:** info→error Logging bei Publisher-Tod,
+    periodisches Alive-Logging, PSI-Daten auf Zenoh publiziert
+  - **Dashboard eBPF-Metriken:** Neuer `/api/ebpf/metrics` Endpoint mit Stalled Count,
+    Collection Cycle, Ring Buffer Drops, I/O Bytes, Avg PSI Stress
+  - **Dashboard Agent-Stall-Indikator:** Stalled-Badge in Agent-View mit rotem Rahmen,
+    Stall-Daten via Prometheus mit 10s Cache-TTL
+
 ### Added
 
 - **Sandbox Agent Spawning — TOGAF-konform (bwrap + cgroups v2)** (#173)

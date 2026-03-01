@@ -185,15 +185,32 @@ impl MetricsExporter {
             snapshot.ring_buffer_drops,
         ));
 
-        // Stalled agents.
+        // Stalled agents (with agent name and seconds since last write).
         output.push_str("# HELP sentinel_agent_stalled Whether agent is stalled (1=stalled)\n");
         output.push_str("# TYPE sentinel_agent_stalled gauge\n");
-        for cgroup_id in &snapshot.stalled_agents {
+        output.push_str(
+            "# HELP sentinel_agent_last_write_seconds Seconds since last write syscall\n",
+        );
+        output.push_str("# TYPE sentinel_agent_last_write_seconds gauge\n");
+        for agent in &snapshot.stalled_agents {
             output.push_str(&format!(
-                "sentinel_agent_stalled{{cgroup_id=\"{}\"}} 1\n",
-                cgroup_id
+                "sentinel_agent_stalled{{cgroup_id=\"{}\",agent=\"{}\"}} 1\n",
+                agent.cgroup_id, agent.agent_name
+            ));
+            output.push_str(&format!(
+                "sentinel_agent_last_write_seconds{{cgroup_id=\"{}\",agent=\"{}\"}} {}\n",
+                agent.cgroup_id, agent.agent_name, agent.seconds_since_write
             ));
         }
+        // Non-stalled agents count
+        output.push_str(
+            "# HELP sentinel_agent_stalled_total Total number of stalled agents\n",
+        );
+        output.push_str("# TYPE sentinel_agent_stalled_total gauge\n");
+        output.push_str(&format!(
+            "sentinel_agent_stalled_total {}\n",
+            snapshot.stalled_agents.len()
+        ));
 
         // I/O metrics from snapshot.
         output.push_str("# HELP sentinel_io_ops_total Total I/O operations per cgroup\n");
@@ -375,11 +392,14 @@ mod tests {
         let output = MetricsExporter::export_snapshot(&snapshot);
         assert!(output.contains("sentinel_ebpf_monitoring_mode{mode=\"userspace\"} 1"));
         assert!(output.contains("sentinel_ebpf_collector_cycle_microseconds 100"));
+        assert!(output.contains("sentinel_agent_stalled_total 0"));
     }
 
     #[test]
     fn export_snapshot_with_data() {
-        use crate::collector::{IoSnapshot, MetricsSnapshot, NetworkSnapshot, PsiSnapshot};
+        use crate::collector::{
+            IoSnapshot, MetricsSnapshot, NetworkSnapshot, PsiSnapshot, StalledAgent,
+        };
         use std::collections::HashMap;
 
         let mut io_metrics = HashMap::new();
@@ -419,7 +439,11 @@ mod tests {
         );
 
         let snapshot = MetricsSnapshot {
-            stalled_agents: vec![42],
+            stalled_agents: vec![StalledAgent {
+                cgroup_id: 42,
+                agent_name: "AGENT-07".to_string(),
+                seconds_since_write: 65,
+            }],
             io_metrics,
             network_metrics,
             psi_metrics,
@@ -429,7 +453,11 @@ mod tests {
         };
 
         let output = MetricsExporter::export_snapshot(&snapshot);
-        assert!(output.contains("sentinel_agent_stalled{cgroup_id=\"42\"} 1"));
+        assert!(output.contains("sentinel_agent_stalled{cgroup_id=\"42\",agent=\"AGENT-07\"} 1"));
+        assert!(output.contains(
+            "sentinel_agent_last_write_seconds{cgroup_id=\"42\",agent=\"AGENT-07\"} 65"
+        ));
+        assert!(output.contains("sentinel_agent_stalled_total 1"));
         assert!(output.contains("cgroup_name=\"agent-01\""));
         assert!(output
             .contains("sentinel_llm_requests_total{destination=\"api.anthropic.com:443\"} 10"));

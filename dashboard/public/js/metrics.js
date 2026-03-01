@@ -64,14 +64,87 @@ function formatNumber(n) {
 }
 
 function fetchEbpfStatus(badge) {
-  fetch('/api/ebpf/status')
+  fetch('/api/ebpf/metrics')
     .then(function(r) { return r.json(); })
     .then(function(data) {
+      if (!data.available) {
+        badge.className = 'ebpf-badge unavailable';
+        badge.textContent = 'eBPF: N/A';
+        return;
+      }
       badge.className = 'ebpf-badge ' + (data.mode === 'kernel' ? 'kernel' : data.mode === 'userspace' ? 'userspace' : 'unavailable');
       badge.textContent = 'eBPF: ' + (data.mode === 'kernel' ? 'Kernel' : data.mode === 'userspace' ? 'Userspace' : 'N/A');
+
+      // Render eBPF detail cards after badge
+      renderEbpfCards(badge.parentElement, data);
     })
     .catch(function() {
       badge.className = 'ebpf-badge unavailable';
       badge.textContent = 'eBPF: N/A';
     });
+}
+
+function renderEbpfCards(container, data) {
+  // Remove previous eBPF grid if exists
+  var prev = container.querySelector('.ebpf-grid');
+  if (prev) prev.remove();
+
+  var grid = document.createElement('div');
+  grid.className = 'ebpf-grid';
+
+  var ebpfCards = [
+    { label: 'Stalled Agents', value: String(data.stalled_count), id: 'ebpf-stalled', warn: data.stalled_count > 0 },
+    { label: 'Collection Cycle', value: data.collection_cycle_us + ' \u00b5s', id: 'ebpf-cycle', warn: false },
+    { label: 'Ring Buffer Drops', value: String(data.ring_buffer_drops), id: 'ebpf-drops', warn: data.ring_buffer_drops > 0 },
+    { label: 'I/O Read', value: formatBytes(data.io_read_bytes), id: 'ebpf-io-read', warn: false },
+    { label: 'I/O Write', value: formatBytes(data.io_write_bytes), id: 'ebpf-io-write', warn: false },
+    { label: 'Avg PSI Stress', value: (data.avg_stress * 100).toFixed(1) + '%', id: 'ebpf-stress', warn: data.avg_stress > 0.5 },
+  ];
+
+  for (var i = 0; i < ebpfCards.length; i++) {
+    var c = ebpfCards[i];
+    var el = document.createElement('div');
+    el.className = 'metric-card ebpf-card' + (c.warn ? ' ebpf-warn' : '');
+    el.id = 'metric-' + c.id;
+
+    var val = document.createElement('div');
+    val.className = 'value';
+    val.textContent = c.value;
+    el.appendChild(val);
+
+    var lab = document.createElement('div');
+    lab.className = 'label';
+    lab.textContent = c.label;
+    el.appendChild(lab);
+
+    grid.appendChild(el);
+  }
+
+  // Stalled agent details (if any)
+  if (data.stalled_agents && data.stalled_agents.length > 0) {
+    var detail = document.createElement('div');
+    detail.className = 'ebpf-stalled-detail';
+    var heading = document.createElement('div');
+    heading.className = 'ebpf-stalled-heading';
+    heading.textContent = 'Stalled Agents:';
+    detail.appendChild(heading);
+    for (var j = 0; j < data.stalled_agents.length; j++) {
+      var sa = data.stalled_agents[j];
+      var line = document.createElement('div');
+      line.className = 'ebpf-stalled-agent';
+      line.textContent = sa.agent + ' (' + sa.seconds + 's)';
+      detail.appendChild(line);
+    }
+    grid.appendChild(detail);
+  }
+
+  container.appendChild(grid);
+}
+
+function formatBytes(bytes) {
+  if (bytes == null || bytes === 0) return '0 B';
+  if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(1) + ' GB';
+  if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return bytes + ' B';
 }
