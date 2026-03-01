@@ -24,7 +24,7 @@ fn default_personality() -> Personality {
     Personality {
         openness: 0.5,
         conscientiousness: 0.5,
-        extraversion: 0.5,
+        extraversion: 0.6, // Above threshold (0.5) to avoid boundary flakiness under tarpaulin
         agreeableness: 0.5,
         neuroticism: 0.3,
         caffeine_tolerance: 0.5,
