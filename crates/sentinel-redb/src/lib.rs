@@ -533,9 +533,7 @@ mod tests {
     fn test_evolution_voice_style() {
         let (store, _dir) = temp_store();
         assert!(store.get_voice_style(agent(1)).unwrap().is_none());
-        store
-            .set_voice_style(agent(1), b"formal, precise")
-            .unwrap();
+        store.set_voice_style(agent(1), b"formal, precise").unwrap();
         let data = store.get_voice_style(agent(1)).unwrap().unwrap();
         assert_eq!(data, b"formal, precise");
     }

@@ -403,9 +403,7 @@ pub mod bridge {
                 }
             }
         }
-        let version = store
-            .get_evolution_version(agent_id)
-            .unwrap_or(0);
+        let version = store.get_evolution_version(agent_id).unwrap_or(0);
         if version > 0 {
             metadata.insert("evolution_version".to_string(), version.to_string());
         }
