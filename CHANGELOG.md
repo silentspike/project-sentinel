@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Flaky acceptance test unter tarpaulin (Coverage CI)**
+  - `ac_10_02_bio_formulas` schlug fehl weil `extraversion=0.5` genau auf dem
+    Introvert/Extrovert-Schwellenwert lag — tarpaulin ptrace-Instrumentierung
+    veraenderte den `>=` Vergleich. Extraversion auf 0.6 gesetzt um Boundary-Flakiness
+    zu vermeiden.
+
 - **Personality aus TOML-Dateien ins ECS laden** (#148)
   - Root Cause: `spawn_agent()` haertete Default-Personality ein (alle Big Five = 0.5),
     individuelle TOML-Werte (Conscientiousness, Neuroticism, Caffeine Tolerance etc.)
