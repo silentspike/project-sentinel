@@ -72,6 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Nachher: Snapshots referenzieren korrekte Event-Position, Recovery ab letztem Snapshot
   - Projection Worker: Legacy-Event-Fallback fuer Events ohne `"type"` Discriminator-Tag
   - Alte Events mit abweichenden Feldnamen (`target` → `target_room`) werden korrekt remapped
+  - Projection Worker systemd Unit: `Restart=always` statt `on-failure` (Auto-Restart nach SIGTERM)
+  - Legacy-Deserializer: 6 fehlende Event-Typen hinzugefuegt (ShiftTransitionCompleted,
+    AgentStatusChanged, NightRunStarted/Completed, AgentConsolidated/ConsolidationFailed)
 
 - **eBPF Kernel-Modus Regression** (#139)
   - Daemon-Binary wird jetzt mit `--features ebpf` gebaut

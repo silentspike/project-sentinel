@@ -235,6 +235,12 @@ fn deserialize_legacy_payload(event_type: &str, payload: &str) -> Option<DomainE
         "tick_snapshot" => "TickSnapshot",
         "agent_spawned" => "AgentSpawned",
         "agent_despawned" => "AgentDespawned",
+        "shift_transition_completed" => "ShiftTransitionCompleted",
+        "agent_status_changed" => "AgentStatusChanged",
+        "nightrun_started" => "NightRunStarted",
+        "nightrun_completed" => "NightRunCompleted",
+        "agent_consolidated" => "AgentConsolidated",
+        "agent_consolidation_failed" => "AgentConsolidationFailed",
         _ => return None,
     };
 
