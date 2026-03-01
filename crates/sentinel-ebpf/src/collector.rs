@@ -281,10 +281,7 @@ impl EbpfCollector {
                     self.health_checker.record_write(mapping.cgroup_id, now);
 
                     // Delta tracking: only record the difference since last read.
-                    let prev = self
-                        .prev_proc_io
-                        .entry(mapping.cgroup_id)
-                        .or_default();
+                    let prev = self.prev_proc_io.entry(mapping.cgroup_id).or_default();
                     let delta_read = io_data.read_bytes.saturating_sub(prev.read_bytes);
                     let delta_write = io_data.write_bytes.saturating_sub(prev.write_bytes);
                     *prev = io_data;
@@ -323,10 +320,7 @@ impl EbpfCollector {
                 }
 
                 // Delta tracking for cgroup io.stat
-                let prev = self
-                    .prev_cgroup_io
-                    .entry(mapping.cgroup_id)
-                    .or_insert((0, 0));
+                let prev = self.prev_cgroup_io.entry(mapping.cgroup_id).or_insert((0, 0));
                 let delta_read = total_rbytes.saturating_sub(prev.0);
                 let delta_write = total_wbytes.saturating_sub(prev.1);
                 *prev = (total_rbytes, total_wbytes);
@@ -497,10 +491,7 @@ impl EbpfCollector {
                 let total_wbytes: u64 = io_stat.iter().map(|(_, (_, w))| w).sum();
 
                 // Delta tracking for cgroup io.stat
-                let prev = self
-                    .prev_cgroup_io
-                    .entry(mapping.cgroup_id)
-                    .or_insert((0, 0));
+                let prev = self.prev_cgroup_io.entry(mapping.cgroup_id).or_insert((0, 0));
                 let delta_read = total_rbytes.saturating_sub(prev.0);
                 let delta_write = total_wbytes.saturating_sub(prev.1);
                 *prev = (total_rbytes, total_wbytes);
@@ -524,10 +515,7 @@ impl EbpfCollector {
             // Also try /proc/PID/io if pid is known (supplements BPF block I/O)
             if let Some(pid) = mapping.pid {
                 if let Ok(io_data) = read_proc_io(pid) {
-                    let prev = self
-                        .prev_proc_io
-                        .entry(mapping.cgroup_id)
-                        .or_default();
+                    let prev = self.prev_proc_io.entry(mapping.cgroup_id).or_default();
                     let delta_read = io_data.read_bytes.saturating_sub(prev.read_bytes);
                     let delta_write = io_data.write_bytes.saturating_sub(prev.write_bytes);
                     *prev = io_data;

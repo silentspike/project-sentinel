@@ -454,9 +454,8 @@ mod tests {
 
         let output = MetricsExporter::export_snapshot(&snapshot);
         assert!(output.contains("sentinel_agent_stalled{cgroup_id=\"42\",agent=\"AGENT-07\"} 1"));
-        assert!(output.contains(
-            "sentinel_agent_last_write_seconds{cgroup_id=\"42\",agent=\"AGENT-07\"} 65"
-        ));
+        assert!(output
+            .contains("sentinel_agent_last_write_seconds{cgroup_id=\"42\",agent=\"AGENT-07\"} 65"));
         assert!(output.contains("sentinel_agent_stalled_total 1"));
         assert!(output.contains("cgroup_name=\"agent-01\""));
         assert!(output
