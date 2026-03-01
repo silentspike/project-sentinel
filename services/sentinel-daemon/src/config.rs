@@ -32,6 +32,11 @@ pub struct DaemonConfig {
     #[serde(default = "default_zenoh_prefix")]
     pub zenoh_prefix: String,
 
+    /// Simulations-Zeitskala (default: 1.0 = Echtzeit).
+    /// 60.0 = 1 Sim-Minute pro Echtzeit-Sekunde, 0.5 = halbe Geschwindigkeit.
+    #[serde(default = "default_time_scale")]
+    pub time_scale: f32,
+
     /// NATS-Konfiguration fuer Judge-Alert-Consumption.
     #[serde(default)]
     pub nats: NatsConfig,
@@ -63,6 +68,10 @@ fn default_tick_rate() -> u64 {
 
 fn default_max_agents() -> usize {
     30
+}
+
+fn default_time_scale() -> f32 {
+    1.0
 }
 
 fn default_zenoh_prefix() -> String {
@@ -111,5 +120,18 @@ data_dir = "/tmp/data"
         assert_eq!(file.daemon.tick_rate_ms, 1000);
         assert_eq!(file.daemon.max_agents, 30);
         assert_eq!(file.daemon.zenoh_prefix, "sentinel");
+        assert_eq!(file.daemon.time_scale, 1.0);
+    }
+
+    #[test]
+    fn test_time_scale_custom() {
+        let toml_str = r#"
+[daemon]
+config_dir = "/tmp/cfg"
+data_dir = "/tmp/data"
+time_scale = 60.0
+"#;
+        let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(file.daemon.time_scale, 60.0);
     }
 }

@@ -59,6 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - sim_hour Fortschritt: Daemon aktualisiert jetzt SimulationTime.sim_hour korrekt
     (vorher war sim_hour=8.0 statisch, jetzt schreitet mit Echtzeit voran und wraps 0-24)
 
+- **sim_hour Zeitvirtualisierung + Persistenz** (#148)
+  - Root Cause: `sim_hour = (8.0 + tick_count/3600.0) % 24.0` — tick_count startete bei 0
+    nach jedem Restart, sim_hour war de facto immer ~8.0, Deadline-Druck [14,17) unerreichbar
+  - Fix: sim_hour wird inkrementell berechnet und in redb SIM_META Table persistiert
+  - Neuer `time_scale` Config-Parameter (default 1.0 = Echtzeit, 60.0 = 60x Speedup)
+  - `delta_seconds = tick_rate * time_scale` — entkoppelt Simulationsgeschwindigkeit von Tick-Rate
+  - work_context_system von Phase::Transit nach Phase::Input verschoben (vor bio_system)
+  - sim_hour in Tick Checkpoint Log fuer Observability
+  - `drink_water` Bio-Action hinzugefuegt (+5 Energy, -10 Bladder)
+
 - **Episoden-Pipeline im Daemon reaktiviert** (#137)
   - Root Cause: Cortex Gateway war seit 27.02. inaktiv → keine `agent_action_received` Events
   - Episode Producer Starvation-Diagnostik: Warnt alle 10 leeren Laeufe (~5 Min) wenn keine

@@ -206,6 +206,12 @@ pub fn eat_meal(bio: &mut BioState) {
     bio.energy = (bio.energy + 15.0).min(100.0);
 }
 
+/// Agent trinkt Wasser: +5 Energie, -10 Blasendrang
+pub fn drink_water(bio: &mut BioState) {
+    bio.energy = (bio.energy + 5.0).min(100.0);
+    bio.bladder = (bio.bladder - 10.0).max(0.0);
+}
+
 /// Agent geht auf Toilette: Blasendrang auf 0
 pub fn use_bathroom(bio: &mut BioState) {
     bio.bladder = 0.0;
@@ -314,6 +320,26 @@ mod tests {
 
         // +10/h → 50 + 10 = 60
         assert_relative_eq!(bio.social_need, 60.0, epsilon = 1.0);
+    }
+
+    #[test]
+    fn test_drink_water() {
+        let mut bio = default_bio();
+        bio.energy = 70.0;
+        bio.bladder = 30.0;
+        drink_water(&mut bio);
+        assert_relative_eq!(bio.energy, 75.0, epsilon = 0.01);
+        assert_relative_eq!(bio.bladder, 20.0, epsilon = 0.01);
+    }
+
+    #[test]
+    fn test_drink_water_clamps() {
+        let mut bio = default_bio();
+        bio.energy = 98.0;
+        bio.bladder = 5.0;
+        drink_water(&mut bio);
+        assert_relative_eq!(bio.energy, 100.0, epsilon = 0.01); // Clamped
+        assert_relative_eq!(bio.bladder, 0.0, epsilon = 0.01); // Clamped to 0
     }
 
     #[test]
