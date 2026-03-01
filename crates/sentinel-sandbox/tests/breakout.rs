@@ -45,7 +45,7 @@ fn breakout_bwrap_config(name: &str) -> BwrapConfig {
     // Start with production config
     let mut config = BwrapConfig::for_agent(name);
 
-    // Add system binds needed to run the helper binary
+    // Add system binds needed to run the helper binary (skip if already in production config)
     let system_ro_binds = [
         ("/usr", "/usr"),
         ("/lib", "/lib"),
@@ -56,7 +56,12 @@ fn breakout_bwrap_config(name: &str) -> BwrapConfig {
     ];
 
     for (host, guest) in &system_ro_binds {
-        if std::path::Path::new(host).exists() {
+        if std::path::Path::new(host).exists()
+            && !config
+                .readonly_binds
+                .iter()
+                .any(|(h, g)| h == host && g == guest)
+        {
             config
                 .readonly_binds
                 .push((host.to_string(), guest.to_string()));
@@ -174,22 +179,29 @@ fn spawn_and_wait(config: &BwrapConfig, cmd: &[&str], timeout: Duration) -> Spaw
 // ---------------------------------------------------------------------------
 
 /// AC-N1: Verifies that BwrapConfig, CgroupLimits, LandlockRuleset APIs are unchanged.
-/// proc_mount defaults to None in for_agent().
+/// TOGAF-konform: proc_mount=/proc, dev_mount=/dev, share_net=true.
 #[test]
 fn ac_76_n1_existing_apis_unchanged() {
     // BwrapConfig::for_agent still works
     let bwrap = BwrapConfig::for_agent("test-n1");
     assert_eq!(bwrap.hostname, "sentinel-test-n1");
-    assert!(!bwrap.share_net);
+    assert!(bwrap.share_net, "TOGAF: default is --share-net");
     assert!(bwrap.die_with_parent);
-    assert!(
-        bwrap.proc_mount.is_none(),
-        "for_agent() must default to proc_mount: None"
+    assert_eq!(
+        bwrap.proc_mount,
+        Some("/proc".to_string()),
+        "TOGAF: default is --proc /proc"
+    );
+    assert_eq!(
+        bwrap.dev_mount,
+        Some("/dev".to_string()),
+        "TOGAF: default is --dev /dev"
     );
 
-    // to_args must NOT contain --proc by default
+    // to_args must contain --proc and --dev by default (TOGAF)
     let args = bwrap.to_args();
-    assert!(!args.contains(&"--proc".to_string()));
+    assert!(args.contains(&"--proc".to_string()));
+    assert!(args.contains(&"--dev".to_string()));
 
     // CgroupLimits::default still works
     let cgroups = CgroupLimits::default();
@@ -255,18 +267,23 @@ fn ac_76_config_breakout_extends_production() {
     );
 }
 
-/// Verifies proc_mount appears in args when set.
+/// Verifies proc_mount and dev_mount appear in args (TOGAF defaults).
 #[test]
-fn ac_76_config_proc_mount_in_args() {
-    let mut config = BwrapConfig::for_agent("test-proc");
-    config.proc_mount = Some("/proc".to_string());
+fn ac_76_config_proc_and_dev_mount_in_args() {
+    let config = BwrapConfig::for_agent("test-proc");
     let args = config.to_args();
 
-    let idx = args
+    let proc_idx = args
         .iter()
         .position(|a| a == "--proc")
-        .expect("--proc must be in args when proc_mount is set");
-    assert_eq!(args[idx + 1], "/proc");
+        .expect("--proc must be in args (TOGAF default)");
+    assert_eq!(args[proc_idx + 1], "/proc");
+
+    let dev_idx = args
+        .iter()
+        .position(|a| a == "--dev")
+        .expect("--dev must be in args (TOGAF default)");
+    assert_eq!(args[dev_idx + 1], "/dev");
 }
 
 // ---------------------------------------------------------------------------
@@ -490,8 +507,8 @@ fn ac_76_07_res_cpu_burn() {
 fn ac_76_08_ns_pid_namespace() {
     require_bwrap();
     let _guard = BreakoutGuard::new("brk-ns1");
-    let mut config = breakout_bwrap_config("brk-ns1");
-    config.proc_mount = Some("/proc".to_string());
+    let config = breakout_bwrap_config("brk-ns1");
+    // proc_mount is already Some("/proc") by default (TOGAF)
 
     let result = spawn_and_wait(
         &config,
@@ -523,8 +540,8 @@ fn ac_76_08_ns_pid_namespace() {
 fn ac_76_09_ns_hostname() {
     require_bwrap();
     let _guard = BreakoutGuard::new("brk-ns2");
-    let mut config = breakout_bwrap_config("brk-ns2");
-    config.proc_mount = Some("/proc".to_string());
+    let config = breakout_bwrap_config("brk-ns2");
+    // proc_mount is already Some("/proc") by default (TOGAF)
 
     let result = spawn_and_wait(
         &config,

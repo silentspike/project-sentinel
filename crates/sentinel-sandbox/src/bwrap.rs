@@ -14,21 +14,52 @@ pub struct BwrapConfig {
     pub tmpfs: Vec<String>,
     pub share_net: bool,
     pub die_with_parent: bool,
-    /// Mount /proc inside the sandbox (needed for PID/UTS namespace tests).
+    /// Mount /proc inside the sandbox (TOGAF: --proc /proc).
     pub proc_mount: Option<String>,
+    /// Mount /dev inside the sandbox (TOGAF: --dev /dev).
+    pub dev_mount: Option<String>,
 }
 
 impl BwrapConfig {
-    /// Standard-Sandbox-Config fuer einen Agenten.
+    /// Standard-Sandbox-Config fuer einen Agenten (TOGAF-konform).
+    ///
+    /// Minimale Namespace-Isolation:
+    /// - System-Binaries readonly (/usr, /lib, /lib64 — noetig fuer agent-runtime + Deps)
+    /// - Firmendaten readonly unter /company (TOGAF: --ro-bind /work/company /company)
+    /// - DNS-Resolution readonly (/etc/resolv.conf)
+    /// - Agent-Home writable (TOGAF: --bind /ram/agents/{name} /home/{name})
+    /// - /tmp als tmpfs, /proc und /dev gemountet
+    /// - Shared Network fuer Cortex Gateway API-Zugang
+    ///
+    /// Landlock (Defense-in-Depth) schraenkt Zugriff innerhalb des Namespace weiter ein.
     pub fn for_agent(name: &str) -> Self {
         Self {
             hostname: format!("sentinel-{name}"),
-            readonly_binds: vec![("/work/company".to_string(), "/company".to_string())],
-            writable_binds: vec![(format!("/ram/agents/{name}"), format!("/home/{name}"))],
+            readonly_binds: vec![
+                // System-Binaries + Libraries (noetig fuer agent-runtime Execution)
+                ("/usr".to_string(), "/usr".to_string()),
+                ("/lib".to_string(), "/lib".to_string()),
+                ("/lib64".to_string(), "/lib64".to_string()),
+                // DNS-Resolution (Landlock: read /etc/resolv.conf)
+                (
+                    "/etc/resolv.conf".to_string(),
+                    "/etc/resolv.conf".to_string(),
+                ),
+                // Firmendaten readonly (TOGAF: --ro-bind /work/company /company)
+                ("/work/company".to_string(), "/company".to_string()),
+            ],
+            writable_binds: vec![
+                // Agent-Home writable (TOGAF: --bind /ram/agents/{name} /home/{name})
+                (format!("/ram/agents/{name}"), format!("/home/{name}")),
+            ],
             tmpfs: vec!["/tmp".to_string()],
-            share_net: false,
+            // TOGAF: --share-net (Agent braucht Cortex Gateway API-Zugang)
+            share_net: true,
             die_with_parent: true,
-            proc_mount: None,
+            // TOGAF: --proc /proc
+            proc_mount: Some("/proc".to_string()),
+            // TOGAF: --dev /dev
+            dev_mount: Some("/dev".to_string()),
         }
     }
 
@@ -68,6 +99,7 @@ impl BwrapConfig {
 
         Command::new("bwrap")
             .args(&args)
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .context("Failed to spawn bwrap process")
     }
@@ -107,10 +139,16 @@ impl BwrapConfig {
             args.push(path.clone());
         }
 
-        // proc mount (needed for PID namespace visibility)
+        // proc mount (TOGAF: --proc /proc)
         if let Some(ref p) = self.proc_mount {
             args.push("--proc".to_string());
             args.push(p.clone());
+        }
+
+        // dev mount (TOGAF: --dev /dev)
+        if let Some(ref d) = self.dev_mount {
+            args.push("--dev".to_string());
+            args.push(d.clone());
         }
 
         args
@@ -126,19 +164,29 @@ mod tests {
         let config = BwrapConfig::for_agent("test");
         let args = config.to_args();
         assert!(args.contains(&"--unshare-all".to_string()));
+        assert!(args.contains(&"--die-with-parent".to_string()));
     }
 
     #[test]
-    fn readonly_binds() {
+    fn togaf_readonly_binds() {
+        // TOGAF: --ro-bind /work/company /company + System-Binaries
         let config = BwrapConfig::for_agent("test");
         let args = config.to_args();
         assert!(args.contains(&"--ro-bind".to_string()));
+        // Firmendaten
         assert!(args.contains(&"/work/company".to_string()));
         assert!(args.contains(&"/company".to_string()));
+        // System-Binaries (noetig fuer agent-runtime Execution)
+        assert!(args.contains(&"/usr".to_string()));
+        assert!(args.contains(&"/lib".to_string()));
+        assert!(args.contains(&"/lib64".to_string()));
+        // DNS
+        assert!(args.contains(&"/etc/resolv.conf".to_string()));
     }
 
     #[test]
-    fn writable_binds() {
+    fn togaf_writable_binds() {
+        // TOGAF: --bind /ram/agents/{name} /home/{name}
         let config = BwrapConfig::for_agent("test");
         let args = config.to_args();
         assert!(args.contains(&"--bind".to_string()));
@@ -147,16 +195,17 @@ mod tests {
     }
 
     #[test]
-    fn default_network_isolated() {
+    fn togaf_shared_net_default() {
+        // TOGAF: --share-net (Agent braucht Cortex Gateway API-Zugang)
         let config = BwrapConfig::for_agent("test");
-        assert!(!config.share_net, "Default should be network-isolated");
+        assert!(config.share_net, "TOGAF: Default should be --share-net");
         let args = config.to_args();
-        assert!(!args.contains(&"--share-net".to_string()));
+        assert!(args.contains(&"--share-net".to_string()));
         assert!(args.contains(&"--unshare-all".to_string()));
     }
 
     #[test]
-    fn with_shared_net_fallback() {
+    fn with_shared_net_builder() {
         let config = BwrapConfig::for_agent("test").with_shared_net();
         assert!(config.share_net);
         let args = config.to_args();
@@ -164,22 +213,51 @@ mod tests {
     }
 
     #[test]
-    fn proc_mount_default_none() {
+    fn togaf_proc_mount_default() {
+        // TOGAF: --proc /proc
         let config = BwrapConfig::for_agent("test");
-        assert!(config.proc_mount.is_none());
-        let args = config.to_args();
-        assert!(!args.contains(&"--proc".to_string()));
-    }
-
-    #[test]
-    fn proc_mount_to_args() {
-        let mut config = BwrapConfig::for_agent("test");
-        config.proc_mount = Some("/proc".to_string());
+        assert_eq!(config.proc_mount, Some("/proc".to_string()));
         let args = config.to_args();
         let idx = args
             .iter()
             .position(|a| a == "--proc")
             .expect("--proc missing");
         assert_eq!(args[idx + 1], "/proc");
+    }
+
+    #[test]
+    fn togaf_dev_mount_default() {
+        // TOGAF: --dev /dev
+        let config = BwrapConfig::for_agent("test");
+        assert_eq!(config.dev_mount, Some("/dev".to_string()));
+        let args = config.to_args();
+        let idx = args
+            .iter()
+            .position(|a| a == "--dev")
+            .expect("--dev missing");
+        assert_eq!(args[idx + 1], "/dev");
+    }
+
+    #[test]
+    fn togaf_hostname() {
+        let config = BwrapConfig::for_agent("thomas");
+        assert_eq!(config.hostname, "sentinel-thomas");
+        let args = config.to_args();
+        let idx = args
+            .iter()
+            .position(|a| a == "--hostname")
+            .expect("--hostname missing");
+        assert_eq!(args[idx + 1], "sentinel-thomas");
+    }
+
+    #[test]
+    fn togaf_tmpfs() {
+        let config = BwrapConfig::for_agent("test");
+        let args = config.to_args();
+        let idx = args
+            .iter()
+            .position(|a| a == "--tmpfs")
+            .expect("--tmpfs missing");
+        assert_eq!(args[idx + 1], "/tmp");
     }
 }
