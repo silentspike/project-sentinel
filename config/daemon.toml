@@ -4,3 +4,6 @@ data_dir = "/opt/sentinel/data"
 tick_rate_ms = 1000
 max_agents = 30
 zenoh_prefix = "sentinel"
+
+[daemon.nats]
+url = "nats://127.0.0.1:4222"

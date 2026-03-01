@@ -4,6 +4,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -56,6 +57,11 @@ func NewStreamConsumer(
 		logger:   logger,
 		messages: make(map[string][]string),
 	}
+}
+
+// DriftDetector returns the underlying drift detector for profile registration.
+func (sc *StreamConsumer) DriftDetector() *judge.DriftDetector {
+	return sc.drift
 }
 
 const maxMessagesPerAgent = 20
@@ -155,6 +161,8 @@ func (sc *StreamConsumer) processMessage(msg jetstream.Msg) {
 
 // runHeuristics executes the 4-algorithm heuristic pipeline on agent messages.
 func (sc *StreamConsumer) runHeuristics(agentID, latestMessage string, recentMessages []string) {
+	now := time.Now().UnixMilli()
+
 	// 1. Drift Detection
 	driftResult := sc.drift.CheckDrift(agentID, recentMessages)
 	metrics.DriftScore.WithLabelValues(agentID).Set(driftResult.DriftScore)
@@ -167,6 +175,19 @@ func (sc *StreamConsumer) runHeuristics(agentID, latestMessage string, recentMes
 			Score:    driftResult.DriftScore,
 			Details:  driftResult.Details,
 		})
+	}
+
+	// Write drift evolution entry
+	if err := sc.evol.Write(persistence.EvolutionEntry{
+		AgentID:    agentID,
+		Tick:       now,
+		Field:      "drift_score",
+		ChangeType: "drift",
+		NewValue:   fmt.Sprintf("%.4f", driftResult.DriftScore),
+		Reason:     driftResult.Details,
+		Source:     "realtime_judge",
+	}); err != nil {
+		sc.logger.Warn("failed to write drift evolution", "agent", agentID, "error", err)
 	}
 
 	// 2. Quality Scoring
@@ -183,6 +204,19 @@ func (sc *StreamConsumer) runHeuristics(agentID, latestMessage string, recentMes
 		})
 	}
 
+	// Write quality evolution entry
+	if err := sc.evol.Write(persistence.EvolutionEntry{
+		AgentID:    agentID,
+		Tick:       now,
+		Field:      "quality_score",
+		ChangeType: "quality",
+		NewValue:   fmt.Sprintf("%d", qualityResult.Score),
+		Reason:     qualityResult.Details,
+		Source:     "realtime_judge",
+	}); err != nil {
+		sc.logger.Warn("failed to write quality evolution", "agent", agentID, "error", err)
+	}
+
 	// 3. Fatigue Detection
 	fatigueResult := sc.fatigue.CheckFatigue(agentID, recentMessages)
 	metrics.FatigueScore.WithLabelValues(agentID).Set(fatigueResult.FatigueScore)
@@ -195,6 +229,19 @@ func (sc *StreamConsumer) runHeuristics(agentID, latestMessage string, recentMes
 			Score:    fatigueResult.FatigueScore,
 			Details:  fatigueResult.Details,
 		})
+	}
+
+	// Write fatigue evolution entry
+	if err := sc.evol.Write(persistence.EvolutionEntry{
+		AgentID:    agentID,
+		Tick:       now,
+		Field:      "fatigue_score",
+		ChangeType: "fatigue",
+		NewValue:   fmt.Sprintf("%.4f", fatigueResult.FatigueScore),
+		Reason:     fatigueResult.Details,
+		Source:     "realtime_judge",
+	}); err != nil {
+		sc.logger.Warn("failed to write fatigue evolution", "agent", agentID, "error", err)
 	}
 
 	// 4. Swap Decision

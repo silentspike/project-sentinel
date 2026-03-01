@@ -38,12 +38,15 @@ clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 uuid = { workspace = true }
+async-nats = { workspace = true, optional = true }
+futures = { version = "0.3", optional = true }
 
 [features]
-default = ["llm", "ebpf"]
+default = ["llm", "ebpf", "nats"]
 telemetry = ["sentinel-telemetry/telemetry"]
 llm = ["reqwest"]
 ebpf = ["sentinel-ebpf/ebpf"]
+nats = ["async-nats", "futures"]
 
 [dev-dependencies]
 tempfile = "3"
