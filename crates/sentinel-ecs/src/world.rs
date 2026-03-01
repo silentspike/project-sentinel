@@ -8,7 +8,8 @@ use super::components::*;
 use super::systems::*;
 use bevy_ecs::prelude::*;
 use sentinel_common::{
-    AgentAction, AgentId, DomainEvent, DomainEventPayload, Emotion, Perception, Tick,
+    agent_config::PersonalityConfig, AgentAction, AgentId, DomainEvent, DomainEventPayload,
+    Emotion, Perception, Tick,
 };
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
@@ -313,6 +314,22 @@ pub fn spawn_agent(
     }
 
     entity
+}
+
+/// Ueberschreibt die Default-Personality eines gespawnten Agents mit TOML-Werten.
+///
+/// Muss nach `spawn_agent()` aufgerufen werden. Aendert NUR die ECS Personality-Component,
+/// nicht die TOML-Datei (readonly SSOT / "DNA" laut TOGAF-Guide).
+pub fn apply_personality(world: &mut World, entity: Entity, cfg: &PersonalityConfig) {
+    if let Some(mut p) = world.get_mut::<Personality>(entity) {
+        p.openness = cfg.openness;
+        p.conscientiousness = cfg.conscientiousness;
+        p.extraversion = cfg.extraversion;
+        p.agreeableness = cfg.agreeableness;
+        p.neuroticism = cfg.neuroticism;
+        p.caffeine_tolerance = cfg.caffeine_tolerance;
+        p.is_morning_person = cfg.morning_person;
+    }
 }
 
 /// Entfernt einen Agenten aus der ECS World anhand seiner AgentId.
