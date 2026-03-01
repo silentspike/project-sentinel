@@ -10,7 +10,7 @@ WorkingDirectory=/opt/sentinel
 ExecStart=/opt/sentinel/bin/sentinel-projection \
   --event-store /opt/sentinel/data/events.db \
   --projection-db /opt/sentinel/data/projection.db
-Restart=on-failure
+Restart=always
 RestartSec=5
 MemoryMax=512M
 
