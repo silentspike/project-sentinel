@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Personality aus TOML-Dateien ins ECS laden** (#148)
+  - Root Cause: `spawn_agent()` haertete Default-Personality ein (alle Big Five = 0.5),
+    individuelle TOML-Werte (Conscientiousness, Neuroticism, Caffeine Tolerance etc.)
+    wurden ignoriert — alle Agents im selben Schicht-Set hatten identische Bio-Werte
+  - Neue `apply_personality()` Funktion ueberschreibt Defaults mit TOML-Werten nach Spawn
+  - TOGAF-Konformitaet: TOML = readonly SSOT ("DNA"), Big Five individualisieren Bio-Engine
+
 - **Bio-Engine Dynamics: Stress, Energy, Caffeine reagieren dynamisch** (#148)
   - Root Cause: WorkContext-Flags (`in_meeting`, `has_deadline`, `has_conflict`) wurden NIRGENDS gesetzt,
     Energy hatte keinen Arbeitsdrain, Kaffee wurde nie automatisch getrunken
