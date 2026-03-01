@@ -123,6 +123,10 @@ pub fn input_system(
                                 sentinel_bio::use_bathroom(&mut bio);
                                 bio_action = Some("use_bathroom");
                             }
+                            "drink_water" => {
+                                sentinel_bio::drink_water(&mut bio);
+                                bio_action = Some("drink_water");
+                            }
                             _ => {
                                 work_ctx.current_task = Some(content.clone());
                             }

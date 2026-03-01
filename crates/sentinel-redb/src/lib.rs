@@ -19,6 +19,9 @@ const BEHAVIORAL_NOTES: TableDefinition<u16, &[u8]> = TableDefinition::new("beha
 const NARRATIVE_SUMMARY: TableDefinition<u16, &[u8]> = TableDefinition::new("narrative_summary");
 const EVOLUTION_VERSION: TableDefinition<u16, u64> = TableDefinition::new("evolution_version");
 
+// Simulation metadata (sim_hour persistence, time virtualization)
+const SIM_META: TableDefinition<&str, &[u8]> = TableDefinition::new("sim_meta");
+
 pub struct StateStore {
     db: Database,
 }
@@ -42,6 +45,7 @@ impl StateStore {
             write_txn.open_table(BEHAVIORAL_NOTES)?;
             write_txn.open_table(NARRATIVE_SUMMARY)?;
             write_txn.open_table(EVOLUTION_VERSION)?;
+            write_txn.open_table(SIM_META)?;
         }
         write_txn.commit()?;
 
@@ -393,6 +397,41 @@ impl StateStore {
         Ok(new_version)
     }
 
+    // === SIMULATION METADATA ===
+
+    /// Get persisted sim_hour. Returns None on first start.
+    pub fn get_sim_hour(&self) -> anyhow::Result<Option<f32>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SIM_META)?;
+        match table.get("sim_hour")? {
+            Some(guard) => {
+                let bytes: &[u8] = guard.value();
+                if bytes.len() == 4 {
+                    let hour = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    if (0.0..24.0).contains(&hour) {
+                        Ok(Some(hour))
+                    } else {
+                        Ok(None) // Corrupted value, treat as missing
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist sim_hour for restart recovery.
+    pub fn set_sim_hour(&self, hour: f32) -> anyhow::Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SIM_META)?;
+            table.insert("sim_hour", hour.to_le_bytes().as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     /// Batch set for room states in a single write transaction.
     #[instrument(skip(self, entries), level = "trace", fields(batch_size = entries.len()))]
     pub fn set_room_states_batch(&self, entries: &[(RoomId, Vec<u8>)]) -> anyhow::Result<()> {
@@ -608,6 +647,38 @@ mod tests {
             store.get_behavioral_notes(agent(5)).unwrap().unwrap(),
             b"reliable worker"
         );
+    }
+
+    #[test]
+    fn test_sim_hour_crud() {
+        let (store, _dir) = temp_store();
+
+        // Initially None
+        assert!(store.get_sim_hour().unwrap().is_none());
+
+        // Set
+        store.set_sim_hour(14.5).unwrap();
+        let hour = store.get_sim_hour().unwrap().unwrap();
+        assert!((hour - 14.5).abs() < f32::EPSILON);
+
+        // Overwrite
+        store.set_sim_hour(22.75).unwrap();
+        let hour = store.get_sim_hour().unwrap().unwrap();
+        assert!((hour - 22.75).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_sim_hour_invalid_returns_none() {
+        let (store, _dir) = temp_store();
+
+        // Write an out-of-range value directly (simulating corruption)
+        store.set_sim_hour(25.0).unwrap();
+        // get_sim_hour validates range [0, 24) — corrupted returns None
+        assert!(store.get_sim_hour().unwrap().is_none());
+
+        // Negative value
+        store.set_sim_hour(-1.0).unwrap();
+        assert!(store.get_sim_hour().unwrap().is_none());
     }
 
     #[test]

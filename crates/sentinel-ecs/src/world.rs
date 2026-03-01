@@ -177,15 +177,17 @@ pub fn create_simulation_world() -> (World, Schedule) {
     );
 
     // Systems in ihre Sets einsortieren
+    // work_context_system in Input-Phase (VOR Biology), damit bio_system
+    // aktuelle WorkContext-Werte (has_deadline, in_meeting) sieht.
     schedule.add_systems(input_system.in_set(SimulationPhase::Input));
+    schedule.add_systems(
+        work_context_system
+            .in_set(SimulationPhase::Input)
+            .after(input_system),
+    );
     schedule.add_systems(bio_system.in_set(SimulationPhase::Biology));
     schedule.add_systems(physics_system.in_set(SimulationPhase::Physics));
     schedule.add_systems(transit_system.in_set(SimulationPhase::Transit));
-    schedule.add_systems(
-        work_context_system
-            .in_set(SimulationPhase::Transit)
-            .after(transit_system),
-    );
     schedule.add_systems(chaos_system.in_set(SimulationPhase::Chaos));
     schedule.add_systems(mood_system.in_set(SimulationPhase::Mood));
     schedule.add_systems(perception_system.in_set(SimulationPhase::Perception));
