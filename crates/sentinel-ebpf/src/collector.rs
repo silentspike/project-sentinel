@@ -320,7 +320,10 @@ impl EbpfCollector {
                 }
 
                 // Delta tracking for cgroup io.stat
-                let prev = self.prev_cgroup_io.entry(mapping.cgroup_id).or_insert((0, 0));
+                let prev = self
+                    .prev_cgroup_io
+                    .entry(mapping.cgroup_id)
+                    .or_insert((0, 0));
                 let delta_read = total_rbytes.saturating_sub(prev.0);
                 let delta_write = total_wbytes.saturating_sub(prev.1);
                 *prev = (total_rbytes, total_wbytes);
@@ -491,7 +494,10 @@ impl EbpfCollector {
                 let total_wbytes: u64 = io_stat.iter().map(|(_, (_, w))| w).sum();
 
                 // Delta tracking for cgroup io.stat
-                let prev = self.prev_cgroup_io.entry(mapping.cgroup_id).or_insert((0, 0));
+                let prev = self
+                    .prev_cgroup_io
+                    .entry(mapping.cgroup_id)
+                    .or_insert((0, 0));
                 let delta_read = total_rbytes.saturating_sub(prev.0);
                 let delta_write = total_wbytes.saturating_sub(prev.1);
                 *prev = (total_rbytes, total_wbytes);
