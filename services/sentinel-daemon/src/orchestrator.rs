@@ -264,6 +264,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
     // Werte fuer den ECS-Thread
     let tick_rate = Duration::from_millis(config.tick_rate_ms);
+    let time_scale = config.time_scale;
     let all_agents_clone = all_agents.clone();
 
     // -- ECS Tick Loop (dedizierter Thread, bevy_ecs World ist Send+Sync) --
@@ -279,6 +280,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 all_agents_clone,
                 current_shift,
                 tick_rate,
+                time_scale,
                 shutdown_ecs,
                 controlplane,
                 runtime_orch,
@@ -415,6 +417,7 @@ fn ecs_tick_loop(
     all_agents: Vec<AgentConfig>,
     initial_shift: u8,
     tick_rate: Duration,
+    time_scale: f32,
     shutdown: Arc<AtomicBool>,
     mut controlplane: ControlplaneKernel,
     mut runtime_orch: RuntimeOrchestrator,
@@ -427,6 +430,7 @@ fn ecs_tick_loop(
     let (mut world, mut schedule) = create_simulation_world();
 
     // Stores als Resources einfuegen (Arc<StateStore> direkt verwenden)
+    let state_store_for_sim = Arc::clone(&state_store);
     world.insert_resource(sentinel_ecs::RedbStateStore {
         store: state_store,
         persist_every_n_ticks: 20,
@@ -545,19 +549,31 @@ fn ecs_tick_loop(
     let mut tick_count: u64 = 0;
     let mut current_shift = initial_shift;
 
+    // sim_hour aus redb restaurieren (Fallback: 8.0 fuer Erststart)
+    let mut sim_hour: f32 = state_store_for_sim
+        .get_sim_hour()
+        .ok()
+        .flatten()
+        .unwrap_or(8.0);
+    info!(
+        restored_sim_hour = format!("{:.2}", sim_hour),
+        time_scale, "sim_hour initialisiert"
+    );
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
 
-        // SimulationTime aktualisieren
+        // SimulationTime aktualisieren (Zeitvirtualisierung via time_scale)
         if let Some(mut time) = world.get_resource_mut::<SimulationTime>() {
             time.tick = sentinel_common::Tick(tick_count);
             time.tick_count = tick_count;
-            time.delta_seconds = tick_rate.as_secs_f32();
-            // sim_hour: Startet bei 08:00, schreitet mit Echtzeit voran,
-            // wraps um 0-24 fuer korrekten Circadian-Rhythmus.
-            time.sim_hour = (8.0 + tick_count as f32 * tick_rate.as_secs_f32() / 3600.0) % 24.0;
+            // delta_seconds = echte Tick-Dauer * time_scale (Zeitvirtualisierung)
+            time.delta_seconds = tick_rate.as_secs_f32() * time_scale;
+            // sim_hour inkrementell (persistiert in redb, ueberlebt Restart)
+            sim_hour = (sim_hour + time.delta_seconds / 3600.0) % 24.0;
+            time.sim_hour = sim_hour;
         }
 
         // RuntimeOrchestrator Tick synchronisieren
@@ -734,7 +750,15 @@ fn ecs_tick_loop(
         tick_count += 1;
 
         if tick_count.is_multiple_of(60) {
-            info!(tick = tick_count, "Tick Checkpoint");
+            // sim_hour periodisch persistieren
+            if let Err(e) = state_store_for_sim.set_sim_hour(sim_hour) {
+                warn!(error = %e, "sim_hour persist fehlgeschlagen");
+            }
+            info!(
+                tick = tick_count,
+                sim_hour = format!("{:.2}", sim_hour),
+                "Tick Checkpoint"
+            );
         }
 
         std::thread::sleep(tick_rate);
@@ -749,6 +773,11 @@ fn ecs_tick_loop(
     }
     if teardown_count > 0 {
         info!(count = teardown_count, "Sandbox teardown abgeschlossen");
+    }
+
+    // sim_hour vor Shutdown persistieren
+    if let Err(e) = state_store_for_sim.set_sim_hour(sim_hour) {
+        warn!(error = %e, "sim_hour Shutdown-Persist fehlgeschlagen");
     }
 
     // -- Graceful Shutdown: Runtime-Snapshot speichern (AC-4 Issue #15) --
@@ -862,6 +891,7 @@ mod tests {
             vec![],
             1,
             Duration::from_millis(100),
+            1.0, // time_scale
             shutdown,
             controlplane,
             runtime_orch,
@@ -911,6 +941,7 @@ mod tests {
             all_agents,
             1,
             Duration::from_millis(50),
+            1.0, // time_scale
             shutdown,
             controlplane,
             runtime_orch,
@@ -965,6 +996,7 @@ mod tests {
             all_agents,
             1,
             Duration::from_millis(50),
+            1.0, // time_scale
             shutdown,
             controlplane,
             runtime_orch,
