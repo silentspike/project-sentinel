@@ -117,7 +117,11 @@ pub async fn ebpf_publisher(
         }
     };
 
+    let mut snapshot_count = 0u64;
+
     while let Some(snapshot) = rx.recv().await {
+        snapshot_count += 1;
+
         // 1. Prometheus Text rendern + speichern
         let text = MetricsExporter::export_snapshot(&snapshot);
         match metrics_text.write() {
@@ -150,6 +154,13 @@ pub async fn ebpf_publisher(
                 }
             }
 
+            // PSI Stress
+            if let Ok(payload) = serde_json::to_vec(&snapshot.psi_metrics) {
+                if let Err(e) = bus.publish(topics::EBPF_STATUS, &payload).await {
+                    warn!(error = %e, "Zenoh publish psi-stress fehlgeschlagen");
+                }
+            }
+
             // Status (Monitoring Mode)
             let status = EbpfStatus {
                 mode: snapshot.mode,
@@ -160,7 +171,22 @@ pub async fn ebpf_publisher(
                 }
             }
         }
+
+        // Periodic logging to confirm publisher is alive
+        if snapshot_count.is_multiple_of(60) {
+            info!(
+                snapshots = snapshot_count,
+                mode = %snapshot.mode,
+                stalled = snapshot.stalled_agents.len(),
+                "eBPF Publisher alive"
+            );
+        }
     }
 
-    info!("eBPF Publisher beendet (mpsc Sender gedroppt)");
+    // mpsc sender was dropped — ECS thread exited or daemon is shutting down.
+    // This is an ERROR if it happens unexpectedly (daemon crash/restart).
+    error!(
+        snapshots_processed = snapshot_count,
+        "eBPF Publisher beendet: mpsc Sender gedroppt (ECS-Thread beendet)"
+    );
 }

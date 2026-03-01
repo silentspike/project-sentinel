@@ -53,6 +53,83 @@ metricRoutes.get("/ebpf/status", async (c) => {
   }
 });
 
+// eBPF Metrics Endpoint — parses Prometheus text from daemon :9090
+metricRoutes.get("/ebpf/metrics", async (c) => {
+  try {
+    const resp = await fetch("http://localhost:9090/metrics", {
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!resp.ok) {
+      return c.json({ available: false, mode: "unavailable" });
+    }
+    const text = await resp.text();
+
+    // Parse mode
+    const modeMatch = text.match(/sentinel_ebpf_monitoring_mode\{mode="(\w+)"\}\s+1/);
+    const mode = modeMatch ? modeMatch[1] : "unknown";
+
+    // Parse stalled count
+    const stalledMatch = text.match(/sentinel_agent_stalled_total\s+(\d+)/);
+    const stalledCount = stalledMatch ? parseInt(stalledMatch[1], 10) : 0;
+
+    // Parse stalled agent names
+    const stalledAgents: { agent: string; seconds: number }[] = [];
+    const stalledRe = /sentinel_agent_stalled\{cgroup_id="[^"]*",agent="([^"]*)"\}\s+1/g;
+    const secsRe = /sentinel_agent_last_write_seconds\{cgroup_id="[^"]*",agent="([^"]*)"\}\s+(\d+)/g;
+    const secsMap = new Map<string, number>();
+    let m;
+    while ((m = secsRe.exec(text)) !== null) {
+      secsMap.set(m[1], parseInt(m[2], 10));
+    }
+    while ((m = stalledRe.exec(text)) !== null) {
+      stalledAgents.push({ agent: m[1], seconds: secsMap.get(m[1]) ?? 0 });
+    }
+
+    // Parse collection cycle
+    const cycleMatch = text.match(/sentinel_ebpf_collector_cycle_microseconds\s+(\d+)/);
+    const cycleUs = cycleMatch ? parseInt(cycleMatch[1], 10) : 0;
+
+    // Parse ring buffer drops
+    const dropsMatch = text.match(/sentinel_ebpf_ring_buffer_drops_total\s+(\d+)/);
+    const drops = dropsMatch ? parseInt(dropsMatch[1], 10) : 0;
+
+    // Parse I/O totals (sum across all cgroups)
+    let ioReadBytes = 0;
+    let ioWriteBytes = 0;
+    const ioReadRe = /sentinel_io_bytes_total\{[^}]*direction="read"\}\s+(\d+)/g;
+    const ioWriteRe = /sentinel_io_bytes_total\{[^}]*direction="write"\}\s+(\d+)/g;
+    while ((m = ioReadRe.exec(text)) !== null) {
+      ioReadBytes += parseInt(m[1], 10);
+    }
+    while ((m = ioWriteRe.exec(text)) !== null) {
+      ioWriteBytes += parseInt(m[1], 10);
+    }
+
+    // Parse PSI stress
+    let totalStress = 0;
+    let stressCount = 0;
+    const psiRe = /sentinel_agent_cpu_pressure_stress\{agent="[^"]*"\}\s+([\d.]+)/g;
+    while ((m = psiRe.exec(text)) !== null) {
+      totalStress += parseFloat(m[1]);
+      stressCount++;
+    }
+
+    return c.json({
+      available: true,
+      mode,
+      stalled_count: stalledCount,
+      stalled_agents: stalledAgents,
+      collection_cycle_us: cycleUs,
+      ring_buffer_drops: drops,
+      io_read_bytes: ioReadBytes,
+      io_write_bytes: ioWriteBytes,
+      avg_stress: stressCount > 0 ? totalStress / stressCount : 0,
+    });
+  } catch {
+    return c.json({ available: false, mode: "unavailable" });
+  }
+});
+
 metricRoutes.get("/health", (c) => {
   let lag = 0;
   try {

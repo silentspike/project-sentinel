@@ -25,7 +25,7 @@ pub mod loader;
 pub mod probes;
 pub mod psi;
 
-pub use collector::{AgentCgroupMapping, EbpfCollector, MetricsSnapshot};
+pub use collector::{AgentCgroupMapping, EbpfCollector, MetricsSnapshot, StalledAgent};
 pub use exporter::MetricsExporter;
 #[cfg(feature = "ebpf")]
 pub use loader::LoadedProbes;
