@@ -58,14 +58,18 @@ fn default_agent_limits() -> CgroupLimits {
 }
 
 /// Spawnt einen Agenten sowohl im RuntimeOrchestrator als auch in der ECS World.
-/// Richtet die Sandbox (cgroup + home dir) ein wenn `sandbox` verfuegbar.
+/// Richtet die Sandbox (cgroup + home dir + bwrap-Prozess) ein wenn verfuegbar.
 /// Gibt `true` zurueck wenn erfolgreich.
+#[allow(clippy::too_many_arguments)]
 fn spawn_agent_full(
     runtime_orch: &mut RuntimeOrchestrator,
     world: &mut bevy_ecs::prelude::World,
     agent_cfg: &AgentConfig,
     sandbox: &SandboxEnforcer,
     sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &mut EbpfCollector,
+    agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    agent_command: &[String],
 ) -> bool {
     let agent_id = AgentId(agent_cfg.identity.id);
     let identity = AgentIdentity {
@@ -97,7 +101,68 @@ fn spawn_agent_full(
                 elapsed_us = elapsed.as_micros(),
                 "Sandbox setup abgeschlossen"
             );
+
+            // eBPF Agent-Registrierung (cgroup_id fuer BPF Map Correlation)
+            if handle.cgroup_created {
+                if let Some(cid) = sentinel_sandbox::cgroup_id(&agent_cfg.identity.name) {
+                    ebpf_collector.register_agent(sentinel_ebpf::AgentCgroupMapping {
+                        agent_name: agent_cfg.identity.name.clone(),
+                        cgroup_path: sentinel_sandbox::cgroup_path(&agent_cfg.identity.name),
+                        cgroup_id: cid,
+                        pid: None,
+                    });
+                }
+            }
+
             sandbox_handles.insert(agent_id, handle);
+
+            // Agent-Prozess in bwrap starten (TOGAF: agent-runtime)
+            if let Some(handle) = sandbox_handles.get_mut(&agent_id) {
+                if handle.cgroup_created {
+                    match sandbox.start_agent_process(&agent_cfg.identity.name, agent_command) {
+                        Ok(proc) => {
+                            let pid = proc.pid;
+                            info!(
+                                agent = %agent_cfg.identity.name,
+                                pid,
+                                "Agent-Prozess in bwrap gestartet"
+                            );
+                            handle.bwrap_pid = Some(pid);
+
+                            // PID im eBPF Mapping aktualisieren (fuer /proc/{pid}/io Tracking)
+                            if let Some(cid) = sentinel_sandbox::cgroup_id(&agent_cfg.identity.name)
+                            {
+                                ebpf_collector.update_agent_pid(cid, pid);
+                            }
+
+                            // AgentProcess aufbewahren (haelt Child am Leben, Drop reaps Zombie)
+                            agent_processes.insert(agent_id, proc);
+
+                            // Network-Namespace Isolation (optional)
+                            let agent_index = (agent_cfg.identity.id % 255) as u8;
+                            match sandbox.setup_network(handle, pid, agent_index) {
+                                Ok(true) => info!(
+                                    agent = %agent_cfg.identity.name,
+                                    "Network isolation aktiv"
+                                ),
+                                Ok(false) => {}
+                                Err(e) => warn!(
+                                    agent = %agent_cfg.identity.name,
+                                    error = %e,
+                                    "Netns setup fehlgeschlagen (Agent laeuft ohne Netzwerk-Isolation)"
+                                ),
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                agent = %agent_cfg.identity.name,
+                                error = %e,
+                                "Agent-Prozess konnte nicht gestartet werden (ECS-only Fallback)"
+                            );
+                        }
+                    }
+                }
+            }
         }
         Err(e) => {
             warn!(
@@ -265,6 +330,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // Werte fuer den ECS-Thread
     let tick_rate = Duration::from_millis(config.tick_rate_ms);
     let time_scale = config.time_scale;
+    let agent_command_cfg = config.agent_command.clone();
     let all_agents_clone = all_agents.clone();
 
     // -- ECS Tick Loop (dedizierter Thread, bevy_ecs World ist Send+Sync) --
@@ -288,6 +354,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 ebpf_collector,
                 ebpf_tx,
                 episode_producer,
+                agent_command_cfg,
             )
         })
         .context("ECS Thread spawnen")?;
@@ -425,6 +492,7 @@ fn ecs_tick_loop(
     mut ebpf_collector: EbpfCollector,
     ebpf_tx: tokio::sync::mpsc::Sender<MetricsSnapshot>,
     mut episode_producer: EpisodeProducer,
+    agent_command_cfg: Vec<String>,
 ) -> Result<u64> {
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
@@ -445,6 +513,10 @@ fn ecs_tick_loop(
 
     // -- Sandbox Handles (cgroup + bwrap tracking pro Agent) --
     let mut sandbox_handles: HashMap<AgentId, SandboxHandle> = HashMap::new();
+
+    // -- Agent-Prozesse (bwrap Child Handles, Drop reaps Zombies) --
+    let mut agent_processes: HashMap<AgentId, sentinel_sandbox::AgentProcess> = HashMap::new();
+    let agent_command = agent_command_cfg;
 
     // -- Agent-Spawning (Orchestrator + ECS + Sandbox) --
     let is_restored = runtime_orch.agent_count() > 0;
@@ -511,6 +583,56 @@ fn ecs_tick_loop(
                     }
                 }
                 sandbox_handles.insert(agent_id, handle);
+
+                // Agent-Prozess in bwrap starten (TOGAF: agent-runtime)
+                if let Some(h) = sandbox_handles.get_mut(&agent_id) {
+                    if h.cgroup_created {
+                        match sandbox.start_agent_process(&agent_cfg.identity.name, &agent_command)
+                        {
+                            Ok(proc) => {
+                                let pid = proc.pid;
+                                info!(
+                                    agent = %agent_cfg.identity.name,
+                                    pid,
+                                    "Agent-Prozess in bwrap gestartet"
+                                );
+                                h.bwrap_pid = Some(pid);
+
+                                // PID im eBPF Mapping aktualisieren
+                                if let Some(cid) =
+                                    sentinel_sandbox::cgroup_id(&agent_cfg.identity.name)
+                                {
+                                    ebpf_collector.update_agent_pid(cid, pid);
+                                }
+
+                                // AgentProcess aufbewahren (Drop reaps Zombie)
+                                agent_processes.insert(agent_id, proc);
+
+                                // Network-Namespace Isolation (optional)
+                                let agent_index = (agent_cfg.identity.id % 255) as u8;
+                                match sandbox.setup_network(h, pid, agent_index) {
+                                    Ok(true) => info!(
+                                        agent = %agent_cfg.identity.name,
+                                        "Network isolation aktiv"
+                                    ),
+                                    Ok(false) => {}
+                                    Err(e) => warn!(
+                                        agent = %agent_cfg.identity.name,
+                                        error = %e,
+                                        "Netns setup fehlgeschlagen"
+                                    ),
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    agent = %agent_cfg.identity.name,
+                                    error = %e,
+                                    "Agent-Prozess konnte nicht gestartet werden (ECS-only Fallback)"
+                                );
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => {
                 warn!(
@@ -614,6 +736,9 @@ fn ecs_tick_loop(
                             warn!(agent_id = %agent_id, error = %e, "Sandbox teardown fehlgeschlagen");
                         }
                     }
+                    // AgentProcess droppen (reaps Zombie via Drop impl)
+                    agent_processes.remove(agent_id);
+
                     if !despawn_agent_from_world(&mut world, *agent_id) {
                         warn!(agent_id = %agent_id, "ECS Entity fuer entfernten Agent nicht gefunden");
                     }
@@ -695,6 +820,9 @@ fn ecs_tick_loop(
                         agent_cfg,
                         &sandbox,
                         &mut sandbox_handles,
+                        &mut ebpf_collector,
+                        &mut agent_processes,
+                        &agent_command,
                     ) {
                         spawned_count += 1;
                     }
@@ -763,6 +891,9 @@ fn ecs_tick_loop(
 
         std::thread::sleep(tick_rate);
     }
+
+    // -- Graceful Shutdown: Agent-Prozesse droppen (reaps Zombies via Drop impl) --
+    agent_processes.clear();
 
     // -- Graceful Shutdown: Sandbox teardown fuer alle Agents --
     let teardown_count = sandbox_handles.len();
@@ -899,6 +1030,7 @@ mod tests {
             ebpf_collector,
             ebpf_tx,
             ep,
+            vec!["true".to_string()],
         );
 
         assert!(result.is_ok());
@@ -949,6 +1081,7 @@ mod tests {
             ebpf_collector,
             ebpf_tx,
             ep,
+            vec!["true".to_string()],
         );
 
         assert!(result.is_ok());
@@ -1004,6 +1137,7 @@ mod tests {
             ebpf_collector,
             ebpf_tx,
             ep,
+            vec!["true".to_string()],
         );
 
         assert!(result.is_ok());

@@ -164,6 +164,24 @@ impl EbpfCollector {
         self.agent_mappings.push(mapping);
     }
 
+    /// Updates the PID for a registered agent (after process start).
+    ///
+    /// Enables userspace I/O tracking via `/proc/{pid}/io`.
+    pub fn update_agent_pid(&mut self, cgroup_id: u64, pid: u32) {
+        if let Some(mapping) = self
+            .agent_mappings
+            .iter_mut()
+            .find(|m| m.cgroup_id == cgroup_id)
+        {
+            mapping.pid = Some(pid);
+            debug!(
+                agent = %mapping.agent_name,
+                pid,
+                "Agent PID updated for eBPF monitoring"
+            );
+        }
+    }
+
     /// Unregisters an agent from monitoring.
     pub fn unregister_agent(&mut self, cgroup_id: u64) {
         self.agent_mappings.retain(|m| m.cgroup_id != cgroup_id);

@@ -37,6 +37,11 @@ pub struct DaemonConfig {
     #[serde(default = "default_time_scale")]
     pub time_scale: f32,
 
+    /// Command das im bwrap-Sandbox pro Agent ausgefuehrt wird.
+    /// Default: agent-runtime (TOGAF: leichtgewichtiger Sandbox-Prozess).
+    #[serde(default = "default_agent_command")]
+    pub agent_command: Vec<String>,
+
     /// NATS-Konfiguration fuer Judge-Alert-Consumption.
     #[serde(default)]
     pub nats: NatsConfig,
@@ -72,6 +77,12 @@ fn default_max_agents() -> usize {
 
 fn default_time_scale() -> f32 {
     1.0
+}
+
+fn default_agent_command() -> Vec<String> {
+    // TOGAF: /usr/bin/agent-runtime (leichtgewichtiger Sandbox-Prozess)
+    // LLM-Calls gehen NICHT ueber diesen Prozess, sondern via Cortex Gateway.
+    vec!["/usr/bin/agent-runtime".to_string()]
 }
 
 fn default_zenoh_prefix() -> String {
@@ -121,6 +132,7 @@ data_dir = "/tmp/data"
         assert_eq!(file.daemon.max_agents, 30);
         assert_eq!(file.daemon.zenoh_prefix, "sentinel");
         assert_eq!(file.daemon.time_scale, 1.0);
+        assert_eq!(file.daemon.agent_command, vec!["/usr/bin/agent-runtime"]);
     }
 
     #[test]
@@ -133,5 +145,17 @@ time_scale = 60.0
 "#;
         let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
         assert_eq!(file.daemon.time_scale, 60.0);
+    }
+
+    #[test]
+    fn test_agent_command_custom() {
+        let toml_str = r#"
+[daemon]
+config_dir = "/tmp/cfg"
+data_dir = "/tmp/data"
+agent_command = ["sleep", "infinity"]
+"#;
+        let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(file.daemon.agent_command, vec!["sleep", "infinity"]);
     }
 }

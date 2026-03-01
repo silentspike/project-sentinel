@@ -12,15 +12,65 @@
 //! 4. `teardown_agent()` — killt bwrap + entfernt cgroup
 
 use std::path::PathBuf;
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::bwrap::BwrapConfig;
 use crate::cgroups::{self, CgroupLimits, PsiMetrics};
 use crate::landlock;
 use crate::netns::{self, NetworkNsConfig};
+
+/// Handle fuer einen laufenden Agent-Prozess in bwrap.
+///
+/// Haelt den Child-Handle am Leben (bwrap hat --die-with-parent,
+/// stirbt also wenn der Daemon stirbt). stdin ist piped fuer
+/// stream-json Kommunikation mit dem Agent.
+pub struct AgentProcess {
+    /// PID des bwrap-Prozesses.
+    pub pid: u32,
+    /// Child handle — NICHT droppen solange Agent laufen soll.
+    child: Child,
+}
+
+impl AgentProcess {
+    /// Nimmt den stdin-Handle fuer stream-json Kommunikation (einmalig).
+    pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    /// Prueft ob der Prozess noch laeuft.
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+impl Drop for AgentProcess {
+    fn drop(&mut self) {
+        // Reap the child process to prevent zombies.
+        // try_wait() is non-blocking — if the child is still running,
+        // --die-with-parent will handle cleanup when the daemon exits.
+        match self.child.try_wait() {
+            Ok(Some(_status)) => {} // Already exited, reaped by try_wait
+            Ok(None) => {
+                // Still running — let --die-with-parent handle it.
+                // We intentionally do NOT kill the child here, because
+                // the daemon might be shutting down gracefully.
+            }
+            Err(_) => {} // Error checking status, nothing we can do
+        }
+    }
+}
+
+impl std::fmt::Debug for AgentProcess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentProcess")
+            .field("pid", &self.pid)
+            .finish()
+    }
+}
 
 /// Warnings about degraded sandbox capabilities.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,18 +268,19 @@ impl SandboxEnforcer {
     /// The bwrap process runs in isolated namespaces with Landlock FS restrictions.
     /// If Landlock is available, a wrapper binary is injected between bwrap and the
     /// agent command that applies irreversible Landlock rules before exec.
-    /// Returns the bwrap PID on success.
-    pub fn start_agent_process(&self, name: &str, command: &[String]) -> Result<u32> {
+    /// Returns an [`AgentProcess`] with PID and Child handle.
+    /// The Child's stdin is piped for stream-json communication.
+    pub fn start_agent_process(&self, name: &str, command: &[String]) -> Result<AgentProcess> {
         if !self.bwrap_available {
             anyhow::bail!("bwrap not available — cannot start agent process");
         }
 
-        let mut config = if self.netns_available {
-            BwrapConfig::for_agent(name)
-        } else {
-            // Fallback: share host network when netns is not available
-            BwrapConfig::for_agent(name).with_shared_net()
-        };
+        let mut config = BwrapConfig::for_agent(name);
+        // TOGAF default: share_net=true (Cortex Gateway API-Zugang)
+        // Wenn netns verfuegbar: isoliertes Netzwerk via veth-Pair (spaeter)
+        if self.netns_available {
+            config.share_net = false;
+        }
 
         // Wrap command with Landlock enforcement if available
         let wrapped_command = if self.landlock_abi.is_some() {
@@ -269,10 +320,12 @@ impl SandboxEnforcer {
             }
         }
 
-        // Release child handle — bwrap has --die-with-parent
-        std::mem::forget(child);
+        debug!(
+            name,
+            pid, "bwrap process started, returning AgentProcess handle"
+        );
 
-        Ok(pid)
+        Ok(AgentProcess { pid, child })
     }
 
     /// Sets up network namespace isolation for a running agent.
