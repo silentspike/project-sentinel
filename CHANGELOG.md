@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Closed-Loop Personality Evolution (TOGAF-vollstaendig)** (#138)
+  - **Judge → Drift Detection (Go):** Agent-Profile aus TOML laden, Drift-Score > 0
+    fuer alle aktiven Agents, Evolution-Writes (drift/quality/fatigue) in personality_evolution
+  - **Judge → NATS Alerts:** Drift-, Quality-, Fatigue- und Model-Swap-Alerts auf
+    `sentinel.judge.alert.{agent}` (1295+ Messages, Consumer `sentinel-daemon`)
+  - **Daemon NATS Consumer (Rust):** async-nats Dependency, Durable Pull Consumer,
+    Alert-Handler fuer Drift/Quality/Fatigue/Swap mit `alert_ref` Tracking
+  - **Daemon LLM Bridge Evolution-Metadata:** Liest VOICE_STYLE, BEHAVIORAL_NOTES,
+    NARRATIVE_SUMMARY, EVOLUTION_VERSION aus redb und sendet als Gateway Metadata-Headers
+  - **Night-Run graceful Lock-Handling:** Erkennt redb Lock durch Daemon, WARN statt Crash,
+    delegiert Konsolidierung an Daemon-Schichtwechsel
+  - **redb Personality-Tabellen:** VOICE_STYLE, BEHAVIORAL_NOTES, NARRATIVE_SUMMARY,
+    EVOLUTION_VERSION Tabellen mit get/set Methoden
+  - **Gateway 3-Source Assembly Fix:** `compiler.NewWithAssembler()` statt `compiler.New()`,
+    TOML DNA + Evolution + Perception korrekt verdrahtet, 0 Fallback-Warnings
+
 ### Fixed
+
+- **UTF-8 String-Slicing Panic in Episode Producer** (#138)
+  - `&c[..77]` konnte in Multi-Byte UTF-8 Zeichen (Umlaute) schneiden → Panic
+  - Fix: UTF-8-safe Truncation via `char_indices().take_while()`
 
 - **Flaky acceptance test unter tarpaulin (Coverage CI)**
   - `ac_10_02_bio_formulas` schlug fehl weil `extraversion=0.5` genau auf dem

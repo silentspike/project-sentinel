@@ -13,7 +13,12 @@ type Config struct {
 	NATS       NATSConfig       `toml:"nats"`
 	Thresholds ThresholdConfig  `toml:"thresholds"`
 	Evolution  EvolutionConfig  `toml:"evolution"`
+	Agents     AgentsConfig     `toml:"agents"`
 	Gateway    GatewayConfig    `toml:"gateway"`
+}
+
+type AgentsConfig struct {
+	ConfigDir string `toml:"config_dir"`
 }
 
 type ServerConfig struct {

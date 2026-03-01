@@ -23,6 +23,7 @@ pub mod bridge {
     use tracing::{debug, error, info, instrument, warn};
 
     use sentinel_common::{ActionType, AgentAction, AgentId, Perception, RoomId, Tick, Timestamp};
+    use sentinel_redb::StateStore;
 
     /// LLM Bridge Konfiguration.
     #[derive(Debug, Clone)]
@@ -171,6 +172,7 @@ pub mod bridge {
         perception_rx: mpsc::Receiver<Perception>,
         action_tx: mpsc::Sender<AgentAction>,
         telemetry: Arc<BridgeTelemetry>,
+        state_store: Arc<StateStore>,
     ) {
         info!(
             max_concurrent = config.max_concurrent,
@@ -259,8 +261,8 @@ pub mod bridge {
             let action_tx = action_tx.clone();
             let telemetry = Arc::clone(&telemetry);
 
-            // Gateway Request bauen
-            let request = build_gateway_request(&perception);
+            // Gateway Request bauen (mit Evolution-Daten aus redb)
+            let request = build_gateway_request(&perception, &state_store);
 
             telemetry.calls_total.fetch_add(1, Ordering::Relaxed);
 
@@ -341,8 +343,8 @@ pub mod bridge {
         info!("LLM Bridge beendet");
     }
 
-    /// Baut den Gateway-Request aus einer Perception.
-    fn build_gateway_request(perception: &Perception) -> GatewayRequest {
+    /// Baut den Gateway-Request aus einer Perception + Evolution-Daten aus redb.
+    fn build_gateway_request(perception: &Perception, store: &StateStore) -> GatewayRequest {
         // System-Injection Block (wie in architecture.md definiert)
         let system_injection = format!(
             "[SYSTEM_INJECTION]\n\
@@ -376,6 +378,35 @@ pub mod bridge {
         );
         metadata.insert("tick".to_string(), perception.tick.0.to_string());
         metadata.insert("request_id".to_string(), uuid::Uuid::new_v4().to_string());
+
+        // Evolution-Daten aus redb lesen und als Metadata-Keys hinzufuegen.
+        // Gateway parst diese via EvolutionFromMetadata() fuer 3-Source Assembly.
+        let agent_id = perception.agent_id;
+        if let Ok(Some(voice)) = store.get_voice_style(agent_id) {
+            if let Ok(voice_str) = String::from_utf8(voice) {
+                if !voice_str.is_empty() {
+                    metadata.insert("evolution_voice".to_string(), voice_str);
+                }
+            }
+        }
+        if let Ok(Some(notes)) = store.get_behavioral_notes(agent_id) {
+            if let Ok(notes_str) = String::from_utf8(notes) {
+                if !notes_str.is_empty() {
+                    metadata.insert("evolution_notes".to_string(), notes_str);
+                }
+            }
+        }
+        if let Ok(Some(narrative)) = store.get_narrative_summary(agent_id) {
+            if let Ok(narrative_str) = String::from_utf8(narrative) {
+                if !narrative_str.is_empty() {
+                    metadata.insert("evolution_narrative".to_string(), narrative_str);
+                }
+            }
+        }
+        let version = store.get_evolution_version(agent_id).unwrap_or(0);
+        if version > 0 {
+            metadata.insert("evolution_version".to_string(), version.to_string());
+        }
 
         GatewayRequest {
             messages: vec![

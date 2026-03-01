@@ -31,6 +31,30 @@ pub struct DaemonConfig {
     /// Zenoh Key-Space Prefix.
     #[serde(default = "default_zenoh_prefix")]
     pub zenoh_prefix: String,
+
+    /// NATS-Konfiguration fuer Judge-Alert-Consumption.
+    #[serde(default)]
+    pub nats: NatsConfig,
+}
+
+/// NATS JetStream Konfiguration fuer den Daemon.
+#[derive(Debug, Deserialize)]
+pub struct NatsConfig {
+    /// NATS server URL (default: nats://127.0.0.1:4222).
+    #[serde(default = "default_nats_url")]
+    pub url: String,
+}
+
+impl Default for NatsConfig {
+    fn default() -> Self {
+        Self {
+            url: default_nats_url(),
+        }
+    }
+}
+
+fn default_nats_url() -> String {
+    "nats://127.0.0.1:4222".to_string()
 }
 
 fn default_tick_rate() -> u64 {
