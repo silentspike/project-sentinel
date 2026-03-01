@@ -4049,6 +4049,7 @@ dependencies = [
  "sentinel-common",
  "sentinel-telemetry",
  "serde",
+ "serde_json",
  "tempfile",
  "tracing",
 ]
