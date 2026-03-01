@@ -110,6 +110,18 @@ func main() {
 	// Create streaming consumer (NATS realtime heuristic)
 	streamConsumer := service.NewStreamConsumer(js, cfg, evol, alert, logger)
 
+	// Load agent personality profiles for drift detection
+	if cfg.Agents.ConfigDir != "" {
+		n, err := service.LoadProfiles(cfg.Agents.ConfigDir, streamConsumer.DriftDetector(), logger)
+		if err != nil {
+			logger.Error("failed to load agent profiles", "dir", cfg.Agents.ConfigDir, "error", err)
+			os.Exit(1)
+		}
+		logger.Info("agent profiles loaded", "count", n, "dir", cfg.Agents.ConfigDir)
+	} else {
+		logger.Warn("no agents.config_dir set, drift detection will report 0 for all agents")
+	}
+
 	// HTTP server
 	mux := http.NewServeMux()
 	httpHandler.RegisterRoutes(mux)

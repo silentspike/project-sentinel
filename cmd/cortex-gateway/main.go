@@ -149,6 +149,13 @@ func main() {
 	providerDeadline := proxy.ProviderDeadlineFromEnv()
 	logger.Info("provider deadline configured", "deadline", providerDeadline)
 
+	// 5a. Capabilities + TOML Loader + Compiler with 3-source Assembly
+	caps := capability.New()
+	agentsDir := envOrDefault("SENTINEL_AGENTS_DIR", "agents")
+	tomlLoader := compiler.NewTOMLLoader(agentsDir)
+	promptCompiler := compiler.NewWithAssembler(tomlLoader, caps)
+	logger.Info("3-source assembly enabled", "agents_dir", agentsDir)
+
 	// 5b. InFlightMap for query lifecycle tracking
 	inflightMap := resilience.NewInFlightMap(providerDeadline)
 	go func() {
@@ -165,10 +172,10 @@ func main() {
 	pipelineHandler := proxy.NewPipelineHandler(proxy.PipelineConfig{
 		Registry:         registry,
 		Config:           controlConfig,
-		Compiler:         compiler.New(),
+		Compiler:         promptCompiler,
 		Normalizer:       normalizer.New(),
 		Extractor:        extraction.New(),
-		Capabilities:     capability.New(),
+		Capabilities:     caps,
 		Logger:           logger,
 		BreakerCfg:       proxy.BreakerConfigFromEnv(),
 		EventStore:       evStore,

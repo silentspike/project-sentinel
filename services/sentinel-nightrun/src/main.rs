@@ -8,11 +8,11 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use sentinel_nightrun::config::NightrunConfig;
 use sentinel_nightrun::job_queue::JobQueue;
-use sentinel_nightrun::runner::NightrunRunner;
+use sentinel_nightrun::runner::{NightrunResult, NightrunRunner};
 use sentinel_nightrun::shift::{current_shift_set, outgoing_shift_set};
 
 use sentinel_hippocampus::HippocampusService;
@@ -96,9 +96,29 @@ fn run(cli: Cli) -> Result<sentinel_nightrun::runner::NightrunResult> {
         "Schicht-Erkennung"
     );
 
-    // Services oeffnen
-    let hippocampus = HippocampusService::open(&settings.hippocampus_db)
-        .context("Failed to open HippocampusService")?;
+    // Services oeffnen — HippocampusService kann fehlschlagen wenn der Daemon
+    // den redb Lock haelt. In dem Fall ueberspringt Night-Run die
+    // Hippocampus-Konsolidierung (Daemon erledigt sie beim Schichtwechsel).
+    let hippocampus = match HippocampusService::open(&settings.hippocampus_db) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "HippocampusService nicht oeffenbar (Daemon haelt Lock?) — \
+                 Konsolidierung wird vom Daemon beim Schichtwechsel durchgefuehrt"
+            );
+            info!("Nightrun beendet (Daemon-Konsolidierung aktiv)");
+            return Ok(NightrunResult {
+                run_id: uuid::Uuid::new_v4().to_string(),
+                agents_consolidated: 0,
+                agents_failed: 0,
+                agents_skipped: 0,
+                total_episodes: 0,
+                duration_ms: 0,
+                hash_chain_final: String::new(),
+            });
+        }
+    };
 
     let event_store =
         EventStore::open(&settings.event_store_db).context("Failed to open EventStore")?;

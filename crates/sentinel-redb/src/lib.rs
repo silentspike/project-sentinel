@@ -13,6 +13,12 @@ const RELATIONSHIPS: TableDefinition<u32, &[u8]> = TableDefinition::new("relatio
 const PERSONALITY: TableDefinition<u16, &[u8]> = TableDefinition::new("personality");
 const ROOM_STATE: TableDefinition<u16, &[u8]> = TableDefinition::new("room_state");
 
+// Evolution tables — written by Night-Run/Daemon consolidation, read by LLM Bridge
+const VOICE_STYLE: TableDefinition<u16, &[u8]> = TableDefinition::new("voice_style");
+const BEHAVIORAL_NOTES: TableDefinition<u16, &[u8]> = TableDefinition::new("behavioral_notes");
+const NARRATIVE_SUMMARY: TableDefinition<u16, &[u8]> = TableDefinition::new("narrative_summary");
+const EVOLUTION_VERSION: TableDefinition<u16, u64> = TableDefinition::new("evolution_version");
+
 pub struct StateStore {
     db: Database,
 }
@@ -32,6 +38,10 @@ impl StateStore {
             write_txn.open_table(RELATIONSHIPS)?;
             write_txn.open_table(PERSONALITY)?;
             write_txn.open_table(ROOM_STATE)?;
+            write_txn.open_table(VOICE_STYLE)?;
+            write_txn.open_table(BEHAVIORAL_NOTES)?;
+            write_txn.open_table(NARRATIVE_SUMMARY)?;
+            write_txn.open_table(EVOLUTION_VERSION)?;
         }
         write_txn.commit()?;
 
@@ -268,6 +278,121 @@ impl StateStore {
         Ok(())
     }
 
+    // === EVOLUTION (Personality Evolution from Night-Run/Daemon) ===
+
+    /// Get voice style for an agent (JSON bytes from consolidation).
+    pub fn get_voice_style(&self, agent_id: AgentId) -> anyhow::Result<Option<Vec<u8>>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(VOICE_STYLE)?;
+        Ok(table
+            .get(agent_id.0)?
+            .map(|v: redb::AccessGuard<'_, &[u8]>| v.value().to_vec()))
+    }
+
+    /// Set voice style for an agent.
+    pub fn set_voice_style(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(VOICE_STYLE)?;
+            table.insert(agent_id.0, data)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Get behavioral notes for an agent.
+    pub fn get_behavioral_notes(&self, agent_id: AgentId) -> anyhow::Result<Option<Vec<u8>>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(BEHAVIORAL_NOTES)?;
+        Ok(table
+            .get(agent_id.0)?
+            .map(|v: redb::AccessGuard<'_, &[u8]>| v.value().to_vec()))
+    }
+
+    /// Set behavioral notes for an agent.
+    pub fn set_behavioral_notes(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(BEHAVIORAL_NOTES)?;
+            table.insert(agent_id.0, data)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Get narrative summary for an agent.
+    pub fn get_narrative_summary(&self, agent_id: AgentId) -> anyhow::Result<Option<Vec<u8>>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(NARRATIVE_SUMMARY)?;
+        Ok(table
+            .get(agent_id.0)?
+            .map(|v: redb::AccessGuard<'_, &[u8]>| v.value().to_vec()))
+    }
+
+    /// Set narrative summary for an agent.
+    pub fn set_narrative_summary(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(NARRATIVE_SUMMARY)?;
+            table.insert(agent_id.0, data)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Get evolution version counter for an agent.
+    pub fn get_evolution_version(&self, agent_id: AgentId) -> anyhow::Result<u64> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(EVOLUTION_VERSION)?;
+        Ok(table.get(agent_id.0)?.map(|v| v.value()).unwrap_or(0))
+    }
+
+    /// Increment evolution version for an agent, returns the new version.
+    pub fn increment_evolution_version(&self, agent_id: AgentId) -> anyhow::Result<u64> {
+        let write_txn = self.db.begin_write()?;
+        let new_version;
+        {
+            let mut table = write_txn.open_table(EVOLUTION_VERSION)?;
+            let current = table.get(agent_id.0)?.map(|v| v.value()).unwrap_or(0);
+            new_version = current + 1;
+            table.insert(agent_id.0, new_version)?;
+        }
+        write_txn.commit()?;
+        Ok(new_version)
+    }
+
+    /// Batch write all evolution fields for an agent in a single transaction.
+    pub fn set_evolution_batch(
+        &self,
+        agent_id: AgentId,
+        voice_style: Option<&[u8]>,
+        behavioral_notes: Option<&[u8]>,
+        narrative_summary: Option<&[u8]>,
+    ) -> anyhow::Result<u64> {
+        let write_txn = self.db.begin_write()?;
+        let new_version;
+        {
+            if let Some(data) = voice_style {
+                let mut table = write_txn.open_table(VOICE_STYLE)?;
+                table.insert(agent_id.0, data)?;
+            }
+            if let Some(data) = behavioral_notes {
+                let mut table = write_txn.open_table(BEHAVIORAL_NOTES)?;
+                table.insert(agent_id.0, data)?;
+            }
+            if let Some(data) = narrative_summary {
+                let mut table = write_txn.open_table(NARRATIVE_SUMMARY)?;
+                table.insert(agent_id.0, data)?;
+            }
+            let mut ver_table = write_txn.open_table(EVOLUTION_VERSION)?;
+            let current = ver_table.get(agent_id.0)?.map(|v| v.value()).unwrap_or(0);
+            new_version = current + 1;
+            ver_table.insert(agent_id.0, new_version)?;
+        }
+        write_txn.commit()?;
+        Ok(new_version)
+    }
+
     /// Batch set for room states in a single write transaction.
     #[instrument(skip(self, entries), level = "trace", fields(batch_size = entries.len()))]
     pub fn set_room_states_batch(&self, entries: &[(RoomId, Vec<u8>)]) -> anyhow::Result<()> {
@@ -405,15 +530,98 @@ mod tests {
     }
 
     #[test]
+    fn test_evolution_voice_style() {
+        let (store, _dir) = temp_store();
+        assert!(store.get_voice_style(agent(1)).unwrap().is_none());
+        store
+            .set_voice_style(agent(1), b"formal, precise")
+            .unwrap();
+        let data = store.get_voice_style(agent(1)).unwrap().unwrap();
+        assert_eq!(data, b"formal, precise");
+    }
+
+    #[test]
+    fn test_evolution_behavioral_notes() {
+        let (store, _dir) = temp_store();
+        store
+            .set_behavioral_notes(agent(2), b"tends to interrupt")
+            .unwrap();
+        let data = store.get_behavioral_notes(agent(2)).unwrap().unwrap();
+        assert_eq!(data, b"tends to interrupt");
+    }
+
+    #[test]
+    fn test_evolution_narrative_summary() {
+        let (store, _dir) = temp_store();
+        store
+            .set_narrative_summary(agent(3), b"had a productive meeting")
+            .unwrap();
+        let data = store.get_narrative_summary(agent(3)).unwrap().unwrap();
+        assert_eq!(data, b"had a productive meeting");
+    }
+
+    #[test]
+    fn test_evolution_version() {
+        let (store, _dir) = temp_store();
+        assert_eq!(store.get_evolution_version(agent(1)).unwrap(), 0);
+        let v1 = store.increment_evolution_version(agent(1)).unwrap();
+        assert_eq!(v1, 1);
+        let v2 = store.increment_evolution_version(agent(1)).unwrap();
+        assert_eq!(v2, 2);
+        assert_eq!(store.get_evolution_version(agent(1)).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_evolution_batch() {
+        let (store, _dir) = temp_store();
+        let version = store
+            .set_evolution_batch(
+                agent(5),
+                Some(b"casual tone"),
+                Some(b"reliable worker"),
+                Some(b"had a quiet shift"),
+            )
+            .unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(
+            store.get_voice_style(agent(5)).unwrap().unwrap(),
+            b"casual tone"
+        );
+        assert_eq!(
+            store.get_behavioral_notes(agent(5)).unwrap().unwrap(),
+            b"reliable worker"
+        );
+        assert_eq!(
+            store.get_narrative_summary(agent(5)).unwrap().unwrap(),
+            b"had a quiet shift"
+        );
+
+        // Second batch increments version
+        let v2 = store
+            .set_evolution_batch(agent(5), Some(b"updated tone"), None, None)
+            .unwrap();
+        assert_eq!(v2, 2);
+        assert_eq!(
+            store.get_voice_style(agent(5)).unwrap().unwrap(),
+            b"updated tone"
+        );
+        // Notes unchanged
+        assert_eq!(
+            store.get_behavioral_notes(agent(5)).unwrap().unwrap(),
+            b"reliable worker"
+        );
+    }
+
+    #[test]
     fn test_db_file_size() {
         let (store, dir) = temp_store();
         store.set_agent_state(agent(1), b"small").unwrap();
         let path = dir.path().join("test.redb");
         let size = std::fs::metadata(&path).unwrap().len();
-        // redb 3.x mit 4 Tabellen: ~1MB (CoW B-Tree Overhead)
+        // redb 3.x mit 8 Tabellen: ~2MB (CoW B-Tree Overhead)
         assert!(
-            size < 2_097_152,
-            "DB should be <2MB initially, was {size} bytes"
+            size < 4_194_304,
+            "DB should be <4MB initially, was {size} bytes"
         );
     }
 }

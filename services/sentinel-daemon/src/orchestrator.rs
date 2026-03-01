@@ -24,8 +24,8 @@ use sentinel_common::{AgentId, Perception};
 use sentinel_ebpf::collector::MetricsSnapshot;
 use sentinel_ebpf::EbpfCollector;
 use sentinel_ecs::{
-    apply_personality, attach_redb_store, create_simulation_world, despawn_agent_from_world,
-    spawn_agent, ActionReceiver, EventBuffer, LimboEventStore, PerceptionSender, SimulationTime,
+    apply_personality, create_simulation_world, despawn_agent_from_world, spawn_agent,
+    ActionReceiver, EventBuffer, LimboEventStore, PerceptionSender, SimulationTime,
 };
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
@@ -138,8 +138,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let event_store = EventStore::open(events_path.to_str().context("events.db Pfad nicht UTF-8")?)
         .context("EventStore oeffnen")?;
 
-    let state_store = StateStore::open(state_path.to_str().context("state.redb Pfad nicht UTF-8")?)
-        .context("StateStore oeffnen")?;
+    let state_store = Arc::new(
+        StateStore::open(state_path.to_str().context("state.redb Pfad nicht UTF-8")?)
+            .context("StateStore oeffnen")?,
+    );
 
     let event_store = Arc::new(event_store);
 
@@ -265,11 +267,12 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let all_agents_clone = all_agents.clone();
 
     // -- ECS Tick Loop (dedizierter Thread, bevy_ecs World ist Send+Sync) --
+    let ecs_state_store = Arc::clone(&state_store);
     let ecs_handle = std::thread::Builder::new()
         .name("ecs-tick-loop".into())
         .spawn(move || {
             ecs_tick_loop(
-                state_store,
+                ecs_state_store,
                 event_store,
                 action_rx,
                 perception_tx,
@@ -316,8 +319,54 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             perception_rx,
             bridge_action_tx,
             bridge_telem,
+            Arc::clone(&state_store),
         ))
     };
+
+    // -- NATS Consumer fuer Judge-Alerts --
+    #[cfg(feature = "nats")]
+    {
+        let nats_url = config.nats.url.clone();
+        let (alert_tx, mut alert_rx) =
+            tokio::sync::mpsc::channel::<crate::nats_consumer::JudgeAlert>(64);
+
+        tokio::spawn(async move {
+            crate::nats_consumer::run(&nats_url, alert_tx).await;
+        });
+
+        // Alert-Receiver im Hintergrund: Alerts loggen und Model-Swap-Praeferenzen speichern
+        tokio::spawn(async move {
+            while let Some(alert) = alert_rx.recv().await {
+                match alert.alert_type.as_str() {
+                    "swap" => {
+                        info!(
+                            agent_id = %alert.agent_id,
+                            severity = %alert.severity,
+                            details = %alert.details,
+                            alert_ref = "judge_swap_alert",
+                            "Model-Swap Alert empfangen"
+                        );
+                    }
+                    "drift" => {
+                        info!(
+                            agent_id = %alert.agent_id,
+                            score = alert.score,
+                            severity = %alert.severity,
+                            "Drift Alert empfangen"
+                        );
+                    }
+                    _ => {
+                        info!(
+                            agent_id = %alert.agent_id,
+                            alert_type = %alert.alert_type,
+                            score = alert.score,
+                            "Judge Alert empfangen"
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     info!(
         tick_rate_ms = config.tick_rate_ms,
@@ -359,7 +408,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 /// Speichert Runtime-Snapshot vor Beendigung (AC-4).
 #[allow(clippy::too_many_arguments)]
 fn ecs_tick_loop(
-    state_store: StateStore,
+    state_store: Arc<StateStore>,
     event_store: Arc<EventStore>,
     action_rx: mpsc::Receiver<sentinel_common::AgentAction>,
     perception_tx: mpsc::SyncSender<Perception>,
@@ -377,8 +426,14 @@ fn ecs_tick_loop(
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
 
-    // Stores als Resources einfuegen
-    attach_redb_store(&mut world, state_store);
+    // Stores als Resources einfuegen (Arc<StateStore> direkt verwenden)
+    world.insert_resource(sentinel_ecs::RedbStateStore {
+        store: state_store,
+        persist_every_n_ticks: 20,
+    });
+    if let Some(mut telemetry) = world.get_resource_mut::<sentinel_ecs::PersistTelemetry>() {
+        telemetry.enabled = true;
+    }
     let event_store_for_episodes = Arc::clone(&event_store);
     world.insert_resource(LimboEventStore(event_store));
     world.insert_resource(ActionReceiver(std::sync::Mutex::new(action_rx)));
@@ -545,6 +600,67 @@ fn ecs_tick_loop(
                     }
                     if !despawn_agent_from_world(&mut world, *agent_id) {
                         warn!(agent_id = %agent_id, "ECS Entity fuer entfernten Agent nicht gefunden");
+                    }
+                }
+
+                // Memory-Konsolidierung fuer entfernte Agents (nutzt den
+                // bereits geoeffneten HippocampusService Handle, vermeidet
+                // redb Lock-Konflikte mit Night-Run)
+                let redb_store = world
+                    .get_resource::<sentinel_ecs::RedbStateStore>()
+                    .map(|r| r.store.clone());
+                for agent_id in &removed {
+                    let agent_name = all_agents
+                        .iter()
+                        .find(|a| AgentId(a.identity.id) == *agent_id)
+                        .map(|a| a.identity.name.as_str());
+                    if let Some(name) = agent_name {
+                        match episode_producer.hippocampus().consolidate_agent(name) {
+                            Ok(result) => {
+                                if result.episodes_processed > 0 {
+                                    info!(
+                                        agent = name,
+                                        episodes_processed = result.episodes_processed,
+                                        episodes_consolidated = result.episodes_consolidated,
+                                        "Schichtwechsel-Konsolidierung abgeschlossen"
+                                    );
+
+                                    // Evolution-Daten nach redb schreiben
+                                    if let Some(ref store) = redb_store {
+                                        let narrative: String = result
+                                            .consolidated_summaries
+                                            .iter()
+                                            .map(|(s, _score)| s.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join("; ");
+                                        match store.set_evolution_batch(
+                                            *agent_id,
+                                            None, // voice_style: wird von LLM-Analyse gesetzt
+                                            None, // behavioral_notes: wird von LLM-Analyse gesetzt
+                                            Some(narrative.as_bytes()),
+                                        ) {
+                                            Ok(version) => {
+                                                info!(
+                                                    agent = name,
+                                                    version,
+                                                    "Evolution nach redb geschrieben, EVOLUTION_VERSION = {version}"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    agent = name,
+                                                    error = %e,
+                                                    "Evolution redb-Write fehlgeschlagen"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(agent = name, error = %e, "Schichtwechsel-Konsolidierung fehlgeschlagen");
+                            }
+                        }
                     }
                 }
 
@@ -728,7 +844,7 @@ mod tests {
         let state_path = tmp.path().join("state.redb");
 
         let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
-        let state_store = StateStore::open(state_path.to_str().unwrap()).unwrap();
+        let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
 
         let (_tx, rx) = mpsc::channel();
         let (ptx, _prx) = mpsc::sync_channel(64);
@@ -770,7 +886,7 @@ mod tests {
         let state_path = tmp.path().join("state.redb");
 
         let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
-        let state_store = StateStore::open(state_path.to_str().unwrap()).unwrap();
+        let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
 
         let (_tx, rx) = mpsc::channel();
         let (ptx, _prx) = mpsc::sync_channel(64);
@@ -820,7 +936,7 @@ mod tests {
         let state_path = tmp.path().join("state.redb");
 
         let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
-        let state_store = StateStore::open(state_path.to_str().unwrap()).unwrap();
+        let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
 
         let (_tx, rx) = mpsc::channel();
         let (ptx, _prx) = mpsc::sync_channel(64);

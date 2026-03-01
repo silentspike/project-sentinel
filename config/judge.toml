@@ -13,6 +13,9 @@ fatigue_alert_min_score = 0.6
 [evolution]
 path = "/opt/sentinel/data/evolution.db"
 
+[agents]
+config_dir = "/opt/sentinel/config/agents"
+
 [gateway]
 url = "http://localhost:8080"
 model = "qwen3:7b"

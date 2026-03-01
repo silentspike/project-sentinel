@@ -328,7 +328,14 @@ fn format_action_summary(
     let content_part = content
         .map(|c| {
             if c.len() > 80 {
-                format!("{}...", &c[..77])
+                // UTF-8 safe truncation: find char boundary at or before byte 77
+                let truncate_at = c
+                    .char_indices()
+                    .take_while(|(i, _)| *i <= 77)
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                format!("{}...", &c[..truncate_at])
             } else {
                 c.to_string()
             }
