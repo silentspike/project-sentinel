@@ -203,9 +203,7 @@ impl MetricsExporter {
             ));
         }
         // Non-stalled agents count
-        output.push_str(
-            "# HELP sentinel_agent_stalled_total Total number of stalled agents\n",
-        );
+        output.push_str("# HELP sentinel_agent_stalled_total Total number of stalled agents\n");
         output.push_str("# TYPE sentinel_agent_stalled_total gauge\n");
         output.push_str(&format!(
             "sentinel_agent_stalled_total {}\n",
