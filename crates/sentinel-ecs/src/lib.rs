@@ -18,8 +18,8 @@ pub use decision::format_impulse_from_queue;
 pub use perception::{format_injection, generate_perception, PerceptionTexts, SmellEvent};
 pub use systems::SimulationPhase;
 pub use world::{
-    attach_redb_store, create_simulation_world, despawn_agent_from_world, spawn_agent,
-    ActionReceiver, EventBuffer, LimboEventStore, PerceptionSender, PersistTelemetry,
+    apply_personality, attach_redb_store, create_simulation_world, despawn_agent_from_world,
+    spawn_agent, ActionReceiver, EventBuffer, LimboEventStore, PerceptionSender, PersistTelemetry,
     RedbStateStore, SimulationTime,
 };
 
