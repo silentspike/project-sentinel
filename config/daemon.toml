@@ -2,6 +2,7 @@
 config_dir = "/opt/sentinel/config"
 data_dir = "/opt/sentinel/data"
 tick_rate_ms = 1000
+time_scale = 1.0
 max_agents = 30
 zenoh_prefix = "sentinel"
 
