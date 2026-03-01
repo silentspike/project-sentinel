@@ -557,8 +557,7 @@ fn ecs_tick_loop(
         .unwrap_or(8.0);
     info!(
         restored_sim_hour = format!("{:.2}", sim_hour),
-        time_scale,
-        "sim_hour initialisiert"
+        time_scale, "sim_hour initialisiert"
     );
 
     loop {
@@ -755,7 +754,11 @@ fn ecs_tick_loop(
             if let Err(e) = state_store_for_sim.set_sim_hour(sim_hour) {
                 warn!(error = %e, "sim_hour persist fehlgeschlagen");
             }
-            info!(tick = tick_count, sim_hour = format!("{:.2}", sim_hour), "Tick Checkpoint");
+            info!(
+                tick = tick_count,
+                sim_hour = format!("{:.2}", sim_hour),
+                "Tick Checkpoint"
+            );
         }
 
         std::thread::sleep(tick_rate);
