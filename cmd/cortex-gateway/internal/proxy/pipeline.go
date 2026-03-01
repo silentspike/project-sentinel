@@ -365,6 +365,14 @@ func (ph *PipelineHandler) buildSystemPrompt(req *LLMRequest, agentName, agentRo
 			modelKey := ph.modelKey(providerName)
 			return ph.compiler.Compile(modelKey, agentName, agentRole, perception)
 		}
+		if !evolution.IsEmpty() {
+			ph.logger.Info("evolution injected",
+				"agent_id", agentID,
+				"has_voice", evolution.VoiceStyle != "",
+				"has_notes", evolution.BehavioralNotes != "",
+				"has_narrative", evolution.NarrativeSummary != "",
+			)
+		}
 		return compiled
 	}
 

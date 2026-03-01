@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     EVOLUTION_VERSION Tabellen mit get/set Methoden
   - **Gateway 3-Source Assembly Fix:** `compiler.NewWithAssembler()` statt `compiler.New()`,
     TOML DNA + Evolution + Perception korrekt verdrahtet, 0 Fallback-Warnings
+  - **NMDA Scores in redb:** Neue NMDA_SCORES Tabelle, Daemon schreibt Scores waehrend
+    Schichtwechsel-Konsolidierung (set_nmda_scores/get_nmda_scores mit JSON-Serialisierung)
+  - **Gateway "evolution injected" Logging:** Info-Log wenn Evolution-Daten (Voice, Notes,
+    Narrative) in Agent-Prompt injiziert werden (AC-8 Observability)
 
 ### Fixed
 

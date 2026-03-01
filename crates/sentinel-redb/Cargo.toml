@@ -12,6 +12,7 @@ telemetry = ["sentinel-telemetry/telemetry"]
 [dependencies]
 redb = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
