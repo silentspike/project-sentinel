@@ -24,8 +24,8 @@ use sentinel_common::{AgentId, Perception};
 use sentinel_ebpf::collector::MetricsSnapshot;
 use sentinel_ebpf::EbpfCollector;
 use sentinel_ecs::{
-    attach_redb_store, create_simulation_world, despawn_agent_from_world, spawn_agent,
-    ActionReceiver, EventBuffer, LimboEventStore, PerceptionSender, SimulationTime,
+    apply_personality, attach_redb_store, create_simulation_world, despawn_agent_from_world,
+    spawn_agent, ActionReceiver, EventBuffer, LimboEventStore, PerceptionSender, SimulationTime,
 };
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
@@ -108,13 +108,14 @@ fn spawn_agent_full(
         }
     }
 
-    spawn_agent(
+    let entity = spawn_agent(
         world,
         agent_id,
         &agent_cfg.identity.name,
         &agent_cfg.identity.role,
         agent_cfg.identity.shift_set,
     );
+    apply_personality(world, entity, &agent_cfg.personality);
     true
 }
 
@@ -462,13 +463,14 @@ fn ecs_tick_loop(
         }
 
         // ECS Entity erstellen
-        spawn_agent(
+        let entity = spawn_agent(
             &mut world,
             agent_id,
             &agent_cfg.identity.name,
             &agent_cfg.identity.role,
             agent_cfg.identity.shift_set,
         );
+        apply_personality(&mut world, entity, &agent_cfg.personality);
     }
 
     // EventBuffer leeren: ECS spawn_agent emittiert eigene Events, aber der
