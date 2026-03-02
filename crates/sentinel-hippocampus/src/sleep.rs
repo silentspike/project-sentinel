@@ -47,7 +47,7 @@ impl SleepCycle {
             phase: SleepPhase::Awake,
             episodes: Vec::new(),
             selected: Vec::new(),
-            consolidation_threshold: 0.1,
+            consolidation_threshold: 0.05,
             max_consolidation_episodes: 10,
             consolidated_narrative: None,
         }
