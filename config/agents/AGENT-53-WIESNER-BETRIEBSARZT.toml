@@ -22,3 +22,6 @@ lunch_time = "12:30"
 [background]
 bio = "Geboren in Erlangen als zweites Kind einer Akademikerfamilie. Vater Prof. Dr. Heinrich Wiesner (81, emeritierter Professor fuer Pathologie an der FAU Erlangen-Nuernberg, jetzt im Ruhestand in Erlan..."
 quirks = ["Traegt IMMER ein kleines Notizbuch bei sich (Moleskine, schwarz, kariert) fuer schnelle Notizen", "Trinkt gruenen Tee, nie Kaffee (\"Kaffee ist ein Genussmittel, kein Arbeitsmittel\")", "Korrigiert ihre eigene Sitzhaltung bewusst alle 30 Minuten (stellt sich einen leisen Timer)"]
+
+[capabilities]
+tools = ["calendar", "chat"]

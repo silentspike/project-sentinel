@@ -18,9 +18,9 @@ pub use decision::format_impulse_from_queue;
 pub use perception::{format_injection, generate_perception, PerceptionTexts, SmellEvent};
 pub use systems::SimulationPhase;
 pub use world::{
-    apply_personality, attach_redb_store, create_simulation_world, despawn_agent_from_world,
-    spawn_agent, ActionReceiver, EventBuffer, LimboEventStore, PerceptionSender, PersistTelemetry,
-    RedbStateStore, SimulationTime,
+    apply_capabilities, apply_personality, attach_redb_store, create_simulation_world,
+    despawn_agent_from_world, spawn_agent, ActionReceiver, EventBuffer, LimboEventStore,
+    PerceptionSender, PersistTelemetry, RedbStateStore, SimulationTime, ToolRuntimeResource,
 };
 
 #[cfg(test)]
@@ -550,5 +550,188 @@ mod tests {
             "Expected one transit_completed event"
         );
         assert_eq!(transit_events[0].aggregate_id, "AGENT-01");
+    }
+
+    /// ToolUse-Dispatch: tool:NAME:INPUT → ToolRuntime → tool_result Event
+    #[test]
+    fn test_tool_dispatch_creates_tool_result_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let event_db_path = dir.path().join("tool-events.db");
+
+        let (mut world, mut schedule) = create_simulation_world();
+        let event_store = EventStore::open(event_db_path.to_str().unwrap()).unwrap();
+        world.insert_resource(LimboEventStore(Arc::new(event_store)));
+
+        let entity = spawn_agent(&mut world, AgentId(1), "Dev Agent", "Developer", 1);
+
+        // Capabilities setzen (Agent benoetigt "search" fuer den Tool-Call)
+        if let Some(mut caps) = world.get_mut::<AgentCapabilities>(entity) {
+            caps.tools = vec!["search".into()];
+        }
+
+        // ToolRuntime mit search registrieren
+        let mut tool_runtime = sentinel_wasm::ToolRuntime::new();
+        tool_runtime
+            .register_tool(sentinel_wasm::ToolDefinition {
+                name: "search".into(),
+                description: "Suche".into(),
+                wasm_path: None,
+                tool_type: sentinel_wasm::ToolType::Search,
+                required_capabilities: vec!["search".into()],
+            })
+            .unwrap();
+        world.insert_resource(ToolRuntimeResource(tool_runtime));
+
+        // Action Channel einrichten
+        let (tx, rx) = std::sync::mpsc::channel();
+        world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
+
+        // ToolUse-Action im tool:NAME:INPUT Format senden
+        tx.send(AgentAction {
+            agent_id: AgentId(1),
+            action_type: ActionType::ToolUse,
+            target_room: None,
+            target_agent: None,
+            content: Some(r#"tool:search:{"query":"project status"}"#.to_string()),
+            timestamp: Timestamp(1000),
+            tick: Tick(1),
+        })
+        .unwrap();
+
+        // Einen Tick ausfuehren
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(1);
+            time.tick_count = 1;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 8.0;
+        }
+        schedule.run(&mut world);
+
+        // Verifiziere: tool_result Event in Limbo
+        let es = world.resource::<LimboEventStore>();
+        let events = es.0.get_events_since(0, 100).unwrap();
+        let tool_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "tool_result")
+            .collect();
+
+        assert_eq!(
+            tool_events.len(),
+            1,
+            "Expected one tool_result event, got {}",
+            tool_events.len()
+        );
+        assert_eq!(tool_events[0].aggregate_id, "AGENT-01");
+    }
+
+    /// ToolUse-Dispatch: JSON Format {"tool":"NAME","input":"..."} → tool_result
+    #[test]
+    fn test_tool_dispatch_json_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let event_db_path = dir.path().join("tool-json.db");
+
+        let (mut world, mut schedule) = create_simulation_world();
+        let event_store = EventStore::open(event_db_path.to_str().unwrap()).unwrap();
+        world.insert_resource(LimboEventStore(Arc::new(event_store)));
+
+        let entity = spawn_agent(&mut world, AgentId(5), "Dev Agent", "Developer", 1);
+
+        // Capabilities setzen
+        if let Some(mut caps) = world.get_mut::<AgentCapabilities>(entity) {
+            caps.tools = vec!["chat".into()];
+        }
+
+        // ToolRuntime mit chat registrieren
+        let mut tool_runtime = sentinel_wasm::ToolRuntime::new();
+        tool_runtime
+            .register_tool(sentinel_wasm::ToolDefinition {
+                name: "chat".into(),
+                description: "Chat".into(),
+                wasm_path: None,
+                tool_type: sentinel_wasm::ToolType::Chat,
+                required_capabilities: vec!["chat".into()],
+            })
+            .unwrap();
+        world.insert_resource(ToolRuntimeResource(tool_runtime));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
+
+        // JSON-Format ToolUse
+        tx.send(AgentAction {
+            agent_id: AgentId(5),
+            action_type: ActionType::ToolUse,
+            target_room: None,
+            target_agent: None,
+            content: Some(r#"{"tool":"chat","input":"{\"target\":\"AGENT-02\",\"message\":\"Hallo Team!\"}"}"#.to_string()),
+            timestamp: Timestamp(2000),
+            tick: Tick(2),
+        })
+        .unwrap();
+
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(2);
+            time.tick_count = 2;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 8.0;
+        }
+        schedule.run(&mut world);
+
+        let es = world.resource::<LimboEventStore>();
+        let events = es.0.get_events_since(0, 100).unwrap();
+        let tool_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "tool_result")
+            .collect();
+
+        assert_eq!(
+            tool_events.len(),
+            1,
+            "Expected one tool_result from JSON format"
+        );
+        assert_eq!(tool_events[0].aggregate_id, "AGENT-05");
+    }
+
+    /// ToolUse ohne ToolRuntime: Fallback auf WorkContext
+    #[test]
+    fn test_tool_dispatch_fallback_without_runtime() {
+        let (mut world, mut schedule) = create_simulation_world();
+        spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+
+        // Kein ToolRuntimeResource eingefuegt!
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
+
+        tx.send(AgentAction {
+            agent_id: AgentId(1),
+            action_type: ActionType::ToolUse,
+            target_room: None,
+            target_agent: None,
+            content: Some("tool:search:test query".to_string()),
+            timestamp: Timestamp(1000),
+            tick: Tick(1),
+        })
+        .unwrap();
+
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(1);
+            time.tick_count = 1;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 8.0;
+        }
+        schedule.run(&mut world);
+
+        // Ohne ToolRuntime: Content landet im WorkContext
+        let mut query = world.query::<&WorkContext>();
+        let work_ctx = query.single(&world).unwrap();
+        assert_eq!(
+            work_ctx.current_task,
+            Some("tool:search:test query".to_string()),
+            "Without ToolRuntime, tool content should fall back to WorkContext"
+        );
     }
 }

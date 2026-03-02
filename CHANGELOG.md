@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **sentinel-wasm Integration in laufendes System** (#19)
+  - `ToolRuntimeResource` als ECS Resource (wraps sentinel-wasm `ToolRuntime`)
+  - `AgentCapabilities` Component fuer Capability-basierte Tool-Zugriffskontrolle
+  - `parse_tool_content()` Parser fuer `tool:NAME:INPUT` und JSON-Format
+  - Tool-Dispatch im `input_system` ToolUse-Branch via ToolRuntime
+  - `apply_capabilities()` Funktion zum Setzen der Capabilities aus TOML-Config
+  - Tool Registry im Daemon mit 5 nativen Tools (file_read, file_write, chat, calendar, search)
+  - `[capabilities]` Sektion in allen 54 Agent-TOMLs mit rollenbasierten Tool-Zuweisungen
+  - sentinel-wasm als Dependency in sentinel-ecs und sentinel-daemon
+  - 3 neue Integrationstests: Tool-Dispatch (text + JSON), Fallback ohne Runtime
+
 ### Fixed
 
 - **Flaky Test `test_ecs_tick_loop_runs_ticks` deterministisch gemacht** (#135)

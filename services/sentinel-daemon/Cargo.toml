@@ -25,6 +25,7 @@ sentinel-sandbox = { path = "../../crates/sentinel-sandbox" }
 sentinel-telemetry = { path = "../../crates/sentinel-telemetry" }
 sentinel-ebpf = { path = "../../crates/sentinel-ebpf" }
 sentinel-hippocampus = { path = "../../crates/sentinel-hippocampus" }
+sentinel-wasm = { path = "../../crates/sentinel-wasm" }
 bevy_ecs = { workspace = true }
 redb = { workspace = true }
 tokio = { workspace = true }

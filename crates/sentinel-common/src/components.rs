@@ -143,3 +143,11 @@ pub struct ShiftInfo {
     pub shift_end_hour: u8,   // 0-23
     pub is_on_duty: bool,
 }
+
+/// Tool-Capabilities des Agents (aus AgentConfig `[capabilities]` Sektion).
+/// Leere tools-Liste = kein Tool-Zugriff (sicherer Default).
+#[derive(Component, Debug, Clone, Default)]
+pub struct AgentCapabilities {
+    pub tools: Vec<String>,
+    pub sandbox_allowed_paths: Vec<String>,
+}

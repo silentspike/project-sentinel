@@ -141,6 +141,10 @@ pub struct EventBuffer {
 #[derive(Resource, Clone)]
 pub struct LimboEventStore(pub Arc<EventStore>);
 
+/// ECS Resource: Wraps sentinel-wasm ToolRuntime fuer Tool-Dispatch im input_system.
+#[derive(Resource)]
+pub struct ToolRuntimeResource(pub sentinel_wasm::ToolRuntime);
+
 /// Attach a redb persistence backend to the simulation world.
 pub fn attach_redb_store(world: &mut World, store: StateStore) {
     world.insert_resource(RedbStateStore::new(store));
@@ -289,6 +293,7 @@ pub fn spawn_agent(
             },
             EventQueue::default(),
             AutonomyCooldown::default(),
+            AgentCapabilities::default(),
         ))
         .id();
 
@@ -331,6 +336,20 @@ pub fn apply_personality(world: &mut World, entity: Entity, cfg: &PersonalityCon
         p.neuroticism = cfg.neuroticism;
         p.caffeine_tolerance = cfg.caffeine_tolerance;
         p.is_morning_person = cfg.morning_person;
+    }
+}
+
+/// Ueberschreibt die Default-Capabilities eines gespawnten Agents mit TOML-Werten.
+///
+/// Muss nach `spawn_agent()` aufgerufen werden.
+pub fn apply_capabilities(
+    world: &mut World,
+    entity: Entity,
+    cfg: &sentinel_common::agent_config::CapabilitiesConfig,
+) {
+    if let Some(mut caps) = world.get_mut::<AgentCapabilities>(entity) {
+        caps.tools = cfg.tools.clone();
+        caps.sandbox_allowed_paths = cfg.sandbox_allowed_paths.clone();
     }
 }
 
