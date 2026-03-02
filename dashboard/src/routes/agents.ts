@@ -5,7 +5,34 @@ import type { AgentRow, AgentListItem, AgentDetail } from "../types";
 
 export const agentRoutes = new Hono();
 
-function toListItem(row: AgentRow): AgentListItem {
+// Cached stall data from Prometheus (refreshed every 10s)
+let stalledAgentSet = new Set<string>();
+let stallCacheTime = 0;
+const STALL_CACHE_TTL_MS = 10_000;
+
+async function refreshStallData(): Promise<void> {
+  const now = Date.now();
+  if (now - stallCacheTime < STALL_CACHE_TTL_MS) return;
+  try {
+    const resp = await fetch("http://localhost:9090/metrics", {
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!resp.ok) return;
+    const text = await resp.text();
+    const newSet = new Set<string>();
+    const re = /sentinel_agent_stalled\{cgroup_id="[^"]*",agent="([^"]*)"\}\s+1/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      newSet.add(m[1]);
+    }
+    stalledAgentSet = newSet;
+    stallCacheTime = now;
+  } catch {
+    // Keep previous cache on error
+  }
+}
+
+function toListItem(row: AgentRow, stalled: boolean): AgentListItem {
   const meta = row.current_room ? ROOM_METADATA[row.current_room] : null;
   return {
     id: row.agent_id,
@@ -25,12 +52,13 @@ function toListItem(row: AgentRow): AgentListItem {
     social_need: row.social_need ?? 0,
     caffeine_mg: row.caffeine_mg ?? 0,
     mood: row.mood ?? null,
+    stalled,
   };
 }
 
-function toDetail(row: AgentRow): AgentDetail {
+function toDetail(row: AgentRow, stalled: boolean): AgentDetail {
   return {
-    ...toListItem(row),
+    ...toListItem(row, stalled),
     shift_set: row.shift_set,
     last_action: row.last_action,
     last_action_tick: row.last_action_tick,
@@ -38,12 +66,22 @@ function toDetail(row: AgentRow): AgentDetail {
   };
 }
 
-agentRoutes.get("/agents", (c) => {
+function agentIdToName(agentId: number): string {
+  return "AGENT-" + String(agentId).padStart(2, "0");
+}
+
+agentRoutes.get("/agents", async (c) => {
+  await refreshStallData();
   const agents = getActiveAgents();
-  return c.json(agents.map(toListItem));
+  return c.json(
+    agents.map((a) =>
+      toListItem(a, stalledAgentSet.has(agentIdToName(a.agent_id))),
+    ),
+  );
 });
 
-agentRoutes.get("/agents/:id/state", (c) => {
+agentRoutes.get("/agents/:id/state", async (c) => {
+  await refreshStallData();
   const idParam = c.req.param("id");
   const id = parseInt(idParam, 10);
 
@@ -55,10 +93,12 @@ agentRoutes.get("/agents/:id/state", (c) => {
       (a) => a.name.toLowerCase().replace(/\s+/g, "-") === slug,
     );
     if (!agent) return c.json({ error: "Agent not found" }, 404);
-    return c.json(toDetail(agent));
+    return c.json(
+      toDetail(agent, stalledAgentSet.has(agentIdToName(agent.agent_id))),
+    );
   }
 
   const agent = getAgentById(id);
   if (!agent) return c.json({ error: "Agent not found" }, 404);
-  return c.json(toDetail(agent));
+  return c.json(toDetail(agent, stalledAgentSet.has(agentIdToName(id))));
 });
