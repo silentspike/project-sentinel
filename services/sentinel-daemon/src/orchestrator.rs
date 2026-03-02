@@ -20,6 +20,7 @@ use tracing::{error, info, warn};
 
 use sentinel_common::agent_config::{load_all_agents, AgentConfig};
 use sentinel_common::components::{AgentIdentity, ShiftInfo};
+use sentinel_common::events::{DomainEvent, DomainEventPayload};
 use sentinel_common::{AgentId, Perception};
 use sentinel_ebpf::collector::MetricsSnapshot;
 use sentinel_ebpf::EbpfCollector;
@@ -334,6 +335,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let agent_command_cfg = config.agent_command.clone();
     let all_agents_clone = all_agents.clone();
 
+    // -- Arc::clone fuer Alert-Handler (NATS) bevor event_store in ECS-Thread moved wird --
+    #[cfg(feature = "nats")]
+    let alert_event_store = Arc::clone(&event_store);
+
     // -- ECS Tick Loop (dedizierter Thread, bevy_ecs World ist Send+Sync) --
     let ecs_state_store = Arc::clone(&state_store);
     let ecs_handle = std::thread::Builder::new()
@@ -404,17 +409,50 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             crate::nats_consumer::run(&nats_url, alert_tx).await;
         });
 
-        // Alert-Receiver im Hintergrund: Alerts loggen und Model-Swap-Praeferenzen speichern
+        // Alert-Receiver: DomainEvent persistieren + Prometheus Counter + Log
+        let es = Arc::clone(&alert_event_store);
         tokio::spawn(async move {
+            let counter = sentinel_telemetry::MetricsRegistry::global()
+                .counter("sentinel_daemon_judge_alerts_total");
+
             while let Some(alert) = alert_rx.recv().await {
+                counter.increment();
+
+                // DomainEvent in Limbo persistieren
+                // Parse "AGENT-XX" → u16 → AgentId
+                let agent_num: u16 = alert
+                    .agent_id
+                    .strip_prefix("AGENT-")
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+                let agent_id = AgentId::new(agent_num).unwrap_or(AgentId(1));
+                let payload = DomainEventPayload::JudgeAlertReceived {
+                    agent_id,
+                    alert_type: alert.alert_type.clone(),
+                    severity: alert.severity.clone(),
+                    score: alert.score,
+                    details: alert.details.clone(),
+                };
+                let event = DomainEvent::new(
+                    payload.event_type_str(),
+                    &alert.agent_id,
+                    &payload.to_json(),
+                    &format!("judge_alert_{}", alert.agent_id),
+                    0, // kein Simulations-Tick im async Context
+                );
+
+                if let Err(e) = es.append_event(&event) {
+                    warn!(error = %e, agent = %alert.agent_id, "Judge Alert DomainEvent speichern fehlgeschlagen");
+                }
+
                 match alert.alert_type.as_str() {
                     "swap" => {
                         info!(
                             agent_id = %alert.agent_id,
                             severity = %alert.severity,
                             details = %alert.details,
-                            alert_ref = "judge_swap_alert",
-                            "Model-Swap Alert empfangen"
+                            alert_ref = "model_swap_requested",
+                            "Model-Swap Alert empfangen — DomainEvent persistiert"
                         );
                     }
                     "drift" => {
@@ -422,7 +460,17 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                             agent_id = %alert.agent_id,
                             score = alert.score,
                             severity = %alert.severity,
-                            "Drift Alert empfangen"
+                            alert_ref = "judge_alert_received",
+                            "Drift Alert empfangen — DomainEvent persistiert"
+                        );
+                    }
+                    "fatigue" => {
+                        info!(
+                            agent_id = %alert.agent_id,
+                            score = alert.score,
+                            severity = %alert.severity,
+                            alert_ref = "judge_alert_received",
+                            "Fatigue Alert empfangen — DomainEvent persistiert"
                         );
                     }
                     _ => {
@@ -430,7 +478,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                             agent_id = %alert.agent_id,
                             alert_type = %alert.alert_type,
                             score = alert.score,
-                            "Judge Alert empfangen"
+                            alert_ref = "judge_alert_received",
+                            "Judge Alert empfangen — DomainEvent persistiert"
                         );
                     }
                 }
@@ -819,16 +868,28 @@ fn ecs_tick_loop(
                                             .map(|(s, _score)| s.as_str())
                                             .collect::<Vec<_>>()
                                             .join("; ");
+
+                                        // LLM-basierte Voice-Style + Behavioral-Notes Generierung
+                                        let agent_role = all_agents
+                                            .iter()
+                                            .find(|a| AgentId(a.identity.id) == *agent_id)
+                                            .map(|a| a.identity.role.as_str())
+                                            .unwrap_or("Mitarbeiter");
+                                        let (voice_style, behavioral_notes) =
+                                            generate_evolution_fields(name, agent_role, &narrative);
+
                                         match store.set_evolution_batch(
                                             *agent_id,
-                                            None, // voice_style: wird von LLM-Analyse gesetzt
-                                            None, // behavioral_notes: wird von LLM-Analyse gesetzt
+                                            voice_style.as_deref(),
+                                            behavioral_notes.as_deref(),
                                             Some(narrative.as_bytes()),
                                         ) {
                                             Ok(version) => {
                                                 info!(
                                                     agent = name,
                                                     version,
+                                                    voice_style = voice_style.is_some(),
+                                                    behavioral_notes = behavioral_notes.is_some(),
                                                     "Evolution nach redb geschrieben, EVOLUTION_VERSION = {version}"
                                                 );
                                             }
@@ -995,6 +1056,136 @@ fn ecs_tick_loop(
     }
 
     Ok(tick_count)
+}
+
+/// Generiert voice_style und behavioral_notes via LLM (Cortex Gateway).
+///
+/// Laeuft im ECS std::thread — nutzt `reqwest::blocking` (kein Tokio).
+/// Fail-safe: Bei jedem Fehler wird `(None, None)` zurueckgegeben,
+/// die Konsolidierung laeuft trotzdem durch.
+#[cfg(feature = "llm")]
+fn generate_evolution_fields(
+    agent_name: &str,
+    agent_role: &str,
+    narrative: &str,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let gateway_url = std::env::var("CORTEX_GATEWAY_URL")
+        .unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let url = format!("{gateway_url}/v1/chat/completions");
+
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "Evolution LLM Client erstellen fehlgeschlagen");
+            return (None, None);
+        }
+    };
+
+    // Voice-Style Analyse
+    let voice_style = llm_evolution_call(
+        &client,
+        &url,
+        agent_name,
+        "Du bist ein linguistischer Analyst fuer eine Firmen-Simulation. \
+         Analysiere den Sprachstil des Agenten basierend auf seiner Schicht-Zusammenfassung. \
+         Antworte AUSSCHLIESSLICH als valides JSON.",
+        &format!(
+            "Agent \"{agent_name}\" (Rolle: {agent_role}) hatte folgende Schicht-Erfahrungen:\n\n\
+             {narrative}\n\n\
+             Analysiere den Sprachstil. Antwort als JSON:\n\
+             {{\"phrases\": [\"phrase1\"], \"sentence_style\": \"kurz|mittel|lang\", \"formality\": 0.X}}"
+        ),
+    );
+
+    // Behavioral-Notes Analyse
+    let behavioral_notes = llm_evolution_call(
+        &client,
+        &url,
+        agent_name,
+        "Du bist ein Verhaltensanalyst fuer eine Firmen-Simulation. \
+         Analysiere Verhaltensmuster des Agenten basierend auf seiner Schicht-Zusammenfassung. \
+         Antworte AUSSCHLIESSLICH als valides JSON.",
+        &format!(
+            "Agent \"{agent_name}\" (Rolle: {agent_role}) hatte folgende Schicht-Erfahrungen:\n\n\
+             {narrative}\n\n\
+             Identifiziere Verhaltensmuster. Antwort als JSON:\n\
+             {{\"habits\": [\"habit1\"], \"interaction_style\": \"proaktiv|reaktiv|gemischt\", \
+             \"decision_style\": \"schnell|zoegerlich|ausgewogen\", \"anomalies\": []}}"
+        ),
+    );
+
+    (voice_style, behavioral_notes)
+}
+
+/// Einzelner LLM-Call fuer Evolution-Feld-Generierung.
+#[cfg(feature = "llm")]
+fn llm_evolution_call(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    agent_name: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Option<Vec<u8>> {
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 500,
+        "model": "default",
+        "metadata": {
+            "agent_id": agent_name,
+            "request_type": "evolution_analysis"
+        }
+    });
+
+    match client.post(url).json(&body).send() {
+        Ok(resp) => {
+            if !resp.status().is_success() {
+                warn!(
+                    agent = agent_name,
+                    status = %resp.status(),
+                    "Evolution LLM Call fehlgeschlagen (HTTP)"
+                );
+                return None;
+            }
+            match resp.json::<serde_json::Value>() {
+                Ok(json) => {
+                    let content = json
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if content.is_empty() {
+                        warn!(agent = agent_name, "Evolution LLM Response leer");
+                        return None;
+                    }
+                    Some(content.as_bytes().to_vec())
+                }
+                Err(e) => {
+                    warn!(agent = agent_name, error = %e, "Evolution LLM Response parse fehlgeschlagen");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            warn!(agent = agent_name, error = %e, "Evolution LLM Call fehlgeschlagen");
+            None
+        }
+    }
+}
+
+/// Fallback wenn LLM-Feature deaktiviert ist.
+#[cfg(not(feature = "llm"))]
+fn generate_evolution_fields(
+    _agent_name: &str,
+    _agent_role: &str,
+    _narrative: &str,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    (None, None)
 }
 
 #[cfg(test)]
