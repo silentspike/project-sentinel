@@ -17,6 +17,7 @@ sentinel-bio = { path = "../sentinel-bio" }
 sentinel-physics = { path = "../sentinel-physics" }
 sentinel-redb = { path = "../sentinel-redb" }
 sentinel-limbo = { path = "../sentinel-limbo", default-features = false }
+sentinel-wasm = { path = "../sentinel-wasm" }
 
 [dev-dependencies]
 sentinel-common = { path = "../sentinel-common" }

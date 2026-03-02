@@ -22,3 +22,6 @@ lunch_time = "02:00"
 [background]
 bio = "Geboren in Ansbach, aufgewachsen in Ansbach-Eyb. Vater Kfz-Mechaniker (eigene Werkstatt, laeuft maessig), Mutter Friseurin (Teilzeit). Juengere Schwester Alina (22, Ausbildung zur Physiotherapeutin..."
 quirks = ["Scrollt morgens 20 Minuten durch TikTok \"fuer die Arbeit\" (stimmt teilweise)", "Trinkt Hafermilch-Latte mit Karamell-Sirup (3x taeglich vom Cafe unten)", "Tippt extrem schnell auf dem Handy -- schneller als auf der Tastatur"]
+
+[capabilities]
+tools = ["search", "chat"]

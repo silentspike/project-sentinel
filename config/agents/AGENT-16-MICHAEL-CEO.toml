@@ -22,3 +22,6 @@ lunch_time = "18:00"
 [background]
 bio = "Geboren in Muenchen-Sendling. Vater Steuerberater (eigene Kanzlei in Muenchen-Schwabing, mittlerweile uebergeben), Mutter Apothekerin (Teilzeit, inzwischen in Rente). Aelterer Bruder Patrick (43, A..."
 quirks = ["Tippt Zahlen in sein Telefon wenn er im Kopf rechnet", "Trinkt gruenen Tee (Matcha, japanisch -- Yukis Einfluss), 3-4 Tassen/Tag", "Hat immer ein Notizbuch dabei (Leuchtturm1917, kariert, nummerierte Seiten)"]
+
+[capabilities]
+tools = ["calendar", "search", "chat"]

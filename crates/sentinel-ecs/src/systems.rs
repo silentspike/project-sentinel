@@ -16,6 +16,7 @@
 use super::components::*;
 use super::world::{
     ActionReceiver, EventBuffer, LimboEventStore, PersistTelemetry, RedbStateStore,
+    ToolRuntimeResource,
 };
 use super::world::{PerceptionSender, SimulationTime};
 use bevy_ecs::prelude::*;
@@ -50,11 +51,13 @@ pub enum SimulationPhase {
 /// - Erzeugt DomainEvent (AgentActionReceived) pro Aktion mit Causation-Chain
 pub fn input_system(
     receiver: Option<Res<ActionReceiver>>,
+    tool_runtime: Option<Res<ToolRuntimeResource>>,
     mut query: Query<(
         &AgentIdentity,
         &mut Position,
         &mut WorkContext,
         &mut BioState,
+        &AgentCapabilities,
     )>,
     mut event_buffer: ResMut<EventBuffer>,
     time: Res<SimulationTime>,
@@ -69,7 +72,7 @@ pub fn input_system(
 
         // Agent im ECS finden
         let mut found = false;
-        for (identity, mut position, mut work_ctx, mut bio) in &mut query {
+        for (identity, mut position, mut work_ctx, mut bio, capabilities) in &mut query {
             if identity.agent_id != action.agent_id {
                 continue;
             }
@@ -128,7 +131,45 @@ pub fn input_system(
                                 bio_action = Some("drink_water");
                             }
                             _ => {
-                                work_ctx.current_task = Some(content.clone());
+                                // Tool-Dispatch: Versuche via ToolRuntime
+                                if let Some(ref runtime) = tool_runtime {
+                                    if let Some((tool_name, tool_input)) =
+                                        parse_tool_content(content)
+                                    {
+                                        let sandbox = sentinel_wasm::SandboxConfig::restrictive();
+                                        let ctx = sentinel_wasm::ExecutionContext {
+                                            agent_id: format!("AGENT-{:02}", identity.agent_id.0),
+                                            agent_capabilities: capabilities.tools.clone(),
+                                            sandbox,
+                                            correlation_id: correlation_id.clone(),
+                                            tick: time.tick.0,
+                                        };
+                                        match runtime.0.execute(&tool_name, &tool_input, &ctx) {
+                                            Ok(result) => {
+                                                let tool_event = result
+                                                    .to_domain_event(&correlation_id, time.tick.0);
+                                                event_buffer.events.push(tool_event);
+                                                tracing::info!(
+                                                    agent = %identity.agent_id.0,
+                                                    tool = %tool_name,
+                                                    "Tool ausgefuehrt"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    agent = %identity.agent_id.0,
+                                                    tool = %tool_name,
+                                                    error = %e,
+                                                    "Tool-Fehler"
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        work_ctx.current_task = Some(content.clone());
+                                    }
+                                } else {
+                                    work_ctx.current_task = Some(content.clone());
+                                }
                             }
                         }
                     }
@@ -395,6 +436,30 @@ pub fn work_context_system(
         }
         work.has_conflict = work.conflict_cooldown > 0;
     }
+}
+
+/// Parst Tool-Content. Format: `tool:NAME:INPUT` oder JSON `{"tool":"NAME","input":"..."}`.
+///
+/// Gibt `None` zurueck wenn der Content kein Tool-Call ist (normaler WorkContext-Text).
+fn parse_tool_content(content: &str) -> Option<(String, String)> {
+    // Versuche JSON zuerst
+    if content.starts_with('{') {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+            let tool = parsed.get("tool")?.as_str()?.to_string();
+            let input = parsed
+                .get("input")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            return Some((tool, input));
+        }
+    }
+    // Fallback: "tool:NAME:INPUT"
+    if let Some(rest) = content.strip_prefix("tool:") {
+        let (name, input) = rest.split_once(':').unwrap_or((rest, ""));
+        return Some((name.to_string(), input.to_string()));
+    }
+    None
 }
 
 /// Prueft ob ein Chaos-EventType stressausloesend ist

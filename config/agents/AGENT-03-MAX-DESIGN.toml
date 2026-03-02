@@ -22,3 +22,6 @@ lunch_time = "12:15"
 [background]
 bio = "Bachelor Interaction Design FH Potsdam, SAP UX Praxissemester, FreshTech Startup Berlin, seit 2021 bei PixelPerfekt"
 quirks = ["Skizziert IMMER auf Papier zuerst", "Zitiert Nielsen/Norman", "Zaehlt Argumente an Fingern ab"]
+
+[capabilities]
+tools = ["file_read", "search", "chat"]
