@@ -20,8 +20,8 @@ use crate::psi::PsiReader;
 /// Collected metrics snapshot from one polling cycle.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MetricsSnapshot {
-    /// Agent health data (stall detection).
-    pub stalled_agents: Vec<u64>,
+    /// Agent health data (stall detection, filtered to registered agents only).
+    pub stalled_agents: Vec<StalledAgent>,
     /// I/O metrics per cgroup.
     pub io_metrics: HashMap<u64, IoSnapshot>,
     /// Network metrics per destination.
@@ -75,7 +75,15 @@ pub struct PsiSnapshot {
     pub combined_stress: f32,
 }
 
-/// Maps agent name to cgroup path for userspace fallback.
+/// Agent stall info for a single agent.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StalledAgent {
+    pub cgroup_id: u64,
+    pub agent_name: String,
+    pub seconds_since_write: u64,
+}
+
+/// Maps agent name to cgroup path for monitoring.
 #[derive(Debug, Clone)]
 pub struct AgentCgroupMapping {
     pub agent_name: String,
@@ -93,6 +101,10 @@ pub struct EbpfCollector {
     agent_mappings: Vec<AgentCgroupMapping>,
     ring_buffer_drops: u64,
     last_collect: Option<Instant>,
+    /// Previous /proc/PID/io values for delta tracking.
+    prev_proc_io: HashMap<u64, ProcIoData>,
+    /// Previous cgroup io.stat values for delta tracking (cgroup_id -> (rbytes, wbytes)).
+    prev_cgroup_io: HashMap<u64, (u64, u64)>,
     #[cfg(feature = "ebpf")]
     loaded_probes: Option<crate::loader::LoadedProbes>,
 }
@@ -108,6 +120,8 @@ impl EbpfCollector {
             agent_mappings: Vec::new(),
             ring_buffer_drops: 0,
             last_collect: None,
+            prev_proc_io: HashMap::new(),
+            prev_cgroup_io: HashMap::new(),
             #[cfg(feature = "ebpf")]
             loaded_probes: None,
         }
@@ -124,6 +138,8 @@ impl EbpfCollector {
             agent_mappings: Vec::new(),
             ring_buffer_drops: 0,
             last_collect: None,
+            prev_proc_io: HashMap::new(),
+            prev_cgroup_io: HashMap::new(),
             loaded_probes: Some(probes),
         }
     }
@@ -187,6 +203,8 @@ impl EbpfCollector {
         self.agent_mappings.retain(|m| m.cgroup_id != cgroup_id);
         self.health_checker.untrack(cgroup_id);
         self.io_profiler.untrack(cgroup_id);
+        self.prev_proc_io.remove(&cgroup_id);
+        self.prev_cgroup_io.remove(&cgroup_id);
     }
 
     /// Collects one cycle of metrics.
@@ -211,7 +229,28 @@ impl EbpfCollector {
             "Collection cycle completed"
         );
 
-        let stalled = self.health_checker.stalled_agents(current_secs());
+        let now_secs = current_secs();
+        let stalled_ids = self.health_checker.stalled_agents(now_secs);
+        let stalled = stalled_ids
+            .into_iter()
+            .filter_map(|cgroup_id| {
+                // Only report stalled agents that are registered (skip orphaned entries)
+                let agent_name = self
+                    .agent_mappings
+                    .iter()
+                    .find(|m| m.cgroup_id == cgroup_id)
+                    .map(|m| m.agent_name.clone())?;
+                let seconds = self
+                    .health_checker
+                    .seconds_since_last_write(cgroup_id, now_secs)
+                    .unwrap_or(0);
+                Some(StalledAgent {
+                    cgroup_id,
+                    agent_name,
+                    seconds_since_write: seconds,
+                })
+            })
+            .collect();
         let io_metrics = self.snapshot_io();
         let network_metrics = self.snapshot_network();
         let psi_metrics = self.collect_psi();
@@ -227,30 +266,38 @@ impl EbpfCollector {
         })
     }
 
-    /// Userspace collection: reads /proc/{pid}/io for each agent.
+    /// Userspace collection: reads /proc/{pid}/io and cgroup io.stat for each agent.
     fn collect_userspace(&mut self) -> Result<()> {
         let now = current_secs();
 
-        for mapping in &self.agent_mappings {
+        // Collect into a vec first to satisfy borrow checker (self.prev_* is mutated below)
+        let mappings: Vec<_> = self.agent_mappings.clone();
+
+        for mapping in &mappings {
             // Agent health: check if process is alive and writing.
             if let Some(pid) = mapping.pid {
                 if let Ok(io_data) = read_proc_io(pid) {
                     // If write_bytes changed, agent is alive.
                     self.health_checker.record_write(mapping.cgroup_id, now);
 
-                    // Record I/O metrics.
-                    if io_data.read_bytes > 0 {
+                    // Delta tracking: only record the difference since last read.
+                    let prev = self.prev_proc_io.entry(mapping.cgroup_id).or_default();
+                    let delta_read = io_data.read_bytes.saturating_sub(prev.read_bytes);
+                    let delta_write = io_data.write_bytes.saturating_sub(prev.write_bytes);
+                    *prev = io_data;
+
+                    if delta_read > 0 {
                         self.io_profiler.record_read(
                             mapping.cgroup_id,
                             &mapping.agent_name,
-                            io_data.read_bytes,
+                            delta_read,
                         );
                     }
-                    if io_data.write_bytes > 0 {
+                    if delta_write > 0 {
                         self.io_profiler.record_write(
                             mapping.cgroup_id,
                             &mapping.agent_name,
-                            io_data.write_bytes,
+                            delta_write,
                         );
                     }
                 }
@@ -258,13 +305,41 @@ impl EbpfCollector {
 
             // I/O from cgroup io.stat (if available).
             if let Ok(io_stat) = read_cgroup_io_stat(&mapping.cgroup_path) {
-                for (device, stats) in io_stat {
+                // Aggregate across devices
+                let total_rbytes: u64 = io_stat.iter().map(|(_, (r, _))| r).sum();
+                let total_wbytes: u64 = io_stat.iter().map(|(_, (_, w))| w).sum();
+
+                for (device, stats) in &io_stat {
                     trace!(
                         cgroup = %mapping.agent_name,
                         device = %device,
                         rbytes = stats.0,
                         wbytes = stats.1,
                         "cgroup io.stat"
+                    );
+                }
+
+                // Delta tracking for cgroup io.stat
+                let prev = self
+                    .prev_cgroup_io
+                    .entry(mapping.cgroup_id)
+                    .or_insert((0, 0));
+                let delta_read = total_rbytes.saturating_sub(prev.0);
+                let delta_write = total_wbytes.saturating_sub(prev.1);
+                *prev = (total_rbytes, total_wbytes);
+
+                if delta_read > 0 {
+                    self.io_profiler.record_read(
+                        mapping.cgroup_id,
+                        &mapping.agent_name,
+                        delta_read,
+                    );
+                }
+                if delta_write > 0 {
+                    self.io_profiler.record_write(
+                        mapping.cgroup_id,
+                        &mapping.agent_name,
+                        delta_write,
                     );
                 }
             }
@@ -279,10 +354,14 @@ impl EbpfCollector {
     /// 1. AGENT_HEALTH Per-CPU Hash Map → max timestamp per cgroup (stall detection)
     /// 2. IO_STATS Per-CPU Hash Map → sum counters per cgroup (IOPS/throughput)
     /// 3. TCP_EVENTS Ring Buffer → drain TCP connect/close events
+    ///
+    /// BPF maps contain ALL system cgroups. Only registered Sentinel agents
+    /// are processed — system cgroups (sshd, systemd, etc.) are filtered out.
     fn collect_kernel(&mut self) -> Result<()> {
         #[cfg(feature = "ebpf")]
         {
             use aya::maps::{PerCpuHashMap, RingBuf};
+            use std::collections::HashSet;
 
             let probes = match &mut self.loaded_probes {
                 Some(p) => p,
@@ -294,6 +373,11 @@ impl EbpfCollector {
 
             let now_secs = current_secs();
 
+            // Build registered cgroup set for O(1) lookup.
+            // Only cgroup_ids registered via register_agent() are processed.
+            let registered_cgroups: HashSet<u64> =
+                self.agent_mappings.iter().map(|m| m.cgroup_id).collect();
+
             // 1. Agent health: Per-CPU Hash Map (cgroup_id → timestamp_ns)
             //    Take max timestamp across CPUs for each cgroup.
             //    bpf_ktime_get_ns() uses CLOCK_MONOTONIC — convert via delta.
@@ -301,7 +385,15 @@ impl EbpfCollector {
             if let Some(map) = probes.agent_health.map("AGENT_HEALTH") {
                 let map: PerCpuHashMap<_, u64, u64> =
                     PerCpuHashMap::try_from(map).context("AGENT_HEALTH map")?;
+                let mut total_entries = 0u64;
+                let mut matched_entries = 0u64;
                 for (cgroup_id, per_cpu_values) in map.iter().flatten() {
+                    total_entries += 1;
+                    // Skip system cgroups — only track registered Sentinel agents
+                    if !registered_cgroups.contains(&cgroup_id) {
+                        continue;
+                    }
+                    matched_entries += 1;
                     let max_ktime_ns = per_cpu_values.iter().copied().max().unwrap_or(0);
                     if max_ktime_ns > 0 {
                         let elapsed_ns = monotonic_ns.saturating_sub(max_ktime_ns);
@@ -309,14 +401,25 @@ impl EbpfCollector {
                         self.health_checker.record_write(cgroup_id, write_unix_secs);
                     }
                 }
+                debug!(
+                    total = total_entries,
+                    matched = matched_entries,
+                    registered = registered_cgroups.len(),
+                    "AGENT_HEALTH BPF map iterated"
+                );
             }
 
             // 2. I/O profiling: Per-CPU Hash Map (cgroup_id → IoStats)
             //    Sum read_ops/write_ops/read_bytes/write_bytes across CPUs.
+            //    Only processes registered agent cgroups.
             if let Some(map) = probes.io_profile.map("IO_STATS") {
                 let map: PerCpuHashMap<_, u64, BpfIoStats> =
                     PerCpuHashMap::try_from(map).context("IO_STATS map")?;
                 for (cgroup_id, per_cpu_values) in map.iter().flatten() {
+                    // Skip system cgroups
+                    if !registered_cgroups.contains(&cgroup_id) {
+                        continue;
+                    }
                     let mut total = BpfIoStats::default();
                     for cpu_val in per_cpu_values.iter() {
                         total.read_ops += cpu_val.read_ops;
@@ -324,6 +427,7 @@ impl EbpfCollector {
                         total.read_bytes += cpu_val.read_bytes;
                         total.write_bytes += cpu_val.write_bytes;
                     }
+                    // Safe unwrap: cgroup_id is in registered_cgroups, so it's in agent_mappings
                     let name = self
                         .agent_mappings
                         .iter()
@@ -380,6 +484,66 @@ impl EbpfCollector {
             warn!("Kernel mode requested but ebpf feature not compiled in");
         }
 
+        // 4. Supplement with cgroup io.stat (available in both modes).
+        //    BPF block:block_rq_complete only tracks block device I/O.
+        //    cgroup io.stat provides cgroup-level I/O regardless of BPF.
+        let mappings: Vec<_> = self.agent_mappings.clone();
+        for mapping in &mappings {
+            if let Ok(io_stat) = read_cgroup_io_stat(&mapping.cgroup_path) {
+                let total_rbytes: u64 = io_stat.iter().map(|(_, (r, _))| r).sum();
+                let total_wbytes: u64 = io_stat.iter().map(|(_, (_, w))| w).sum();
+
+                // Delta tracking for cgroup io.stat
+                let prev = self
+                    .prev_cgroup_io
+                    .entry(mapping.cgroup_id)
+                    .or_insert((0, 0));
+                let delta_read = total_rbytes.saturating_sub(prev.0);
+                let delta_write = total_wbytes.saturating_sub(prev.1);
+                *prev = (total_rbytes, total_wbytes);
+
+                if delta_read > 0 {
+                    self.io_profiler.record_read(
+                        mapping.cgroup_id,
+                        &mapping.agent_name,
+                        delta_read,
+                    );
+                }
+                if delta_write > 0 {
+                    self.io_profiler.record_write(
+                        mapping.cgroup_id,
+                        &mapping.agent_name,
+                        delta_write,
+                    );
+                }
+            }
+
+            // Also try /proc/PID/io if pid is known (supplements BPF block I/O)
+            if let Some(pid) = mapping.pid {
+                if let Ok(io_data) = read_proc_io(pid) {
+                    let prev = self.prev_proc_io.entry(mapping.cgroup_id).or_default();
+                    let delta_read = io_data.read_bytes.saturating_sub(prev.read_bytes);
+                    let delta_write = io_data.write_bytes.saturating_sub(prev.write_bytes);
+                    *prev = io_data;
+
+                    if delta_read > 0 {
+                        self.io_profiler.record_read(
+                            mapping.cgroup_id,
+                            &mapping.agent_name,
+                            delta_read,
+                        );
+                    }
+                    if delta_write > 0 {
+                        self.io_profiler.record_write(
+                            mapping.cgroup_id,
+                            &mapping.agent_name,
+                            delta_write,
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -431,9 +595,40 @@ impl EbpfCollector {
         for mapping in &self.agent_mappings {
             let reader = PsiReader::new(&mapping.cgroup_path);
 
-            let cpu = reader.read_cpu_pressure().ok();
-            let memory = reader.read_memory_pressure().ok();
-            let io = reader.read_io_pressure().ok();
+            let cpu = match reader.read_cpu_pressure() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    debug!(
+                        agent = %mapping.agent_name,
+                        path = %mapping.cgroup_path,
+                        error = %e,
+                        "PSI cpu.pressure nicht lesbar"
+                    );
+                    None
+                }
+            };
+            let memory = match reader.read_memory_pressure() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    debug!(
+                        agent = %mapping.agent_name,
+                        error = %e,
+                        "PSI memory.pressure nicht lesbar"
+                    );
+                    None
+                }
+            };
+            let io = match reader.read_io_pressure() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    debug!(
+                        agent = %mapping.agent_name,
+                        error = %e,
+                        "PSI io.pressure nicht lesbar"
+                    );
+                    None
+                }
+            };
 
             if let (Some(cpu), Some(memory), Some(io)) = (&cpu, &memory, &io) {
                 let stress = crate::psi::combined_stress_factor(cpu, memory, io);
@@ -454,7 +649,7 @@ impl EbpfCollector {
 }
 
 /// Data from /proc/{pid}/io.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct ProcIoData {
     read_bytes: u64,
     write_bytes: u64,
@@ -593,6 +788,47 @@ mod tests {
         assert!(snapshot.psi_metrics.is_empty());
         assert_eq!(snapshot.mode, MonitoringMode::Userspace);
         assert_eq!(snapshot.ring_buffer_drops, 0);
+    }
+
+    #[test]
+    fn stalled_agents_only_registered() {
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        // Register only one agent
+        collector.register_agent(AgentCgroupMapping {
+            agent_name: "AGENT-01".to_string(),
+            cgroup_path: "/sys/fs/cgroup/sentinel/agent-01".to_string(),
+            cgroup_id: 100,
+            pid: None,
+        });
+        // Record writes for both registered and unregistered cgroups
+        let old_time = current_secs().saturating_sub(60);
+        collector.health_checker.record_write(100, old_time); // registered, stalled
+        collector.health_checker.record_write(999, old_time); // unregistered, stalled
+
+        let snapshot = collector.collect().unwrap();
+        // Only registered agent should appear in stalled list
+        assert_eq!(snapshot.stalled_agents.len(), 1);
+        assert_eq!(snapshot.stalled_agents[0].agent_name, "AGENT-01");
+        assert_eq!(snapshot.stalled_agents[0].cgroup_id, 100);
+        assert!(snapshot.stalled_agents[0].seconds_since_write >= 30);
+    }
+
+    #[test]
+    fn delta_tracking_prevents_double_counting() {
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        // Simulate cgroup io.stat delta tracking
+        let prev = collector.prev_cgroup_io.entry(1).or_insert((0, 0));
+        assert_eq!(*prev, (0, 0));
+
+        // First "read": cumulative = 1000
+        let delta = 1000u64.saturating_sub(prev.0);
+        assert_eq!(delta, 1000);
+        *prev = (1000, 0);
+
+        // Second "read": cumulative = 1500
+        let delta = 1500u64.saturating_sub(prev.0);
+        assert_eq!(delta, 500); // Only 500 new bytes
+        *prev = (1500, 0);
     }
 
     #[test]

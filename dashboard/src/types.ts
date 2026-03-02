@@ -81,6 +81,7 @@ export interface AgentListItem {
   social_need: number;
   caffeine_mg: number;
   mood: string | null;
+  stalled: boolean;
 }
 
 export interface AgentDetail extends AgentListItem {
