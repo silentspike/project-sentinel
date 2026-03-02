@@ -53,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     EVOLUTION_VERSION Tabellen mit get/set Methoden
   - **Gateway 3-Source Assembly Fix:** `compiler.NewWithAssembler()` statt `compiler.New()`,
     TOML DNA + Evolution + Perception korrekt verdrahtet, 0 Fallback-Warnings
+  - **NMDA Scores in redb:** Neue NMDA_SCORES Tabelle, Daemon schreibt Scores waehrend
+    Schichtwechsel-Konsolidierung (set_nmda_scores/get_nmda_scores mit JSON-Serialisierung)
+  - **NMDA Consolidation Threshold gesenkt (0.1 → 0.05):** Autonomie-generierte Actions
+    (move, emote) scoren 0.06 via classify_action() Default. Mit Threshold 0.1 wurden
+    diese nie konsolidiert. Threshold 0.05 ermoeglicht realistische Konsolidierung.
+  - **Gateway "evolution injected" Logging:** Info-Log wenn Evolution-Daten (Voice, Notes,
+    Narrative) in Agent-Prompt injiziert werden (AC-8 Observability)
 
 ### Fixed
 
