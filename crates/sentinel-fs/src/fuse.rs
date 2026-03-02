@@ -10,8 +10,8 @@ mod inner {
     use crate::layer::LayerManager;
     use crate::metadata::{FileKind, InodeData, MetadataStore};
     use fuser::{
-        FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory,
-        ReplyEntry, Request,
+        Config, Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, LockOwner,
+        MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
     };
     use std::collections::HashMap;
     use std::ffi::OsStr;
@@ -80,13 +80,14 @@ mod inner {
 
         /// Mount the filesystem. Blocks until unmounted.
         pub fn mount(self, mountpoint: &Path) -> anyhow::Result<()> {
-            let options = vec![
+            let mut config = Config::default();
+            config.mount_options = vec![
                 MountOption::RW,
                 MountOption::FSName("sentinel-fs".to_string()),
                 MountOption::AutoUnmount,
-                MountOption::AllowOther,
+                MountOption::CUSTOM("allow_other".to_string()),
             ];
-            fuser::mount2(self, mountpoint, &options)
+            fuser::mount2(self, mountpoint, &config)
                 .map_err(|e| anyhow::anyhow!("FUSE mount failed: {e}"))
         }
 
@@ -97,7 +98,7 @@ mod inner {
                 FileKind::Symlink => FileType::Symlink,
             };
             FileAttr {
-                ino,
+                ino: INodeNo(ino),
                 size: data.size,
                 blocks: data.size.div_ceil(512),
                 atime: UNIX_EPOCH + Duration::from_secs(data.atime),
@@ -117,7 +118,7 @@ mod inner {
 
         fn root_attr() -> FileAttr {
             FileAttr {
-                ino: 1,
+                ino: INodeNo(1),
                 size: 0,
                 blocks: 0,
                 atime: UNIX_EPOCH,
@@ -137,39 +138,41 @@ mod inner {
     }
 
     impl Filesystem for SentinelFuse {
-        fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-            if ino == 1 {
+        fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+            let ino_val: u64 = ino.into();
+            if ino_val == 1 {
                 reply.attr(&TTL, &Self::root_attr());
                 return;
             }
 
             let agents = self.agents.lock().unwrap();
-            if let Some((agent_id, real_inode)) = agents.find_agent(ino) {
+            if let Some((agent_id, real_inode)) = agents.find_agent(ino_val) {
                 let agent_id = agent_id.to_string();
                 drop(agents);
                 match self.layer.lookup_inode(&agent_id, real_inode) {
-                    Ok(Some(data)) => reply.attr(&TTL, &Self::inode_to_attr(&data, ino)),
-                    Ok(None) => reply.error(libc::ENOENT),
+                    Ok(Some(data)) => reply.attr(&TTL, &Self::inode_to_attr(&data, ino_val)),
+                    Ok(None) => reply.error(Errno::ENOENT),
                     Err(e) => {
                         warn!("getattr error: {e}");
-                        reply.error(libc::EIO);
+                        reply.error(Errno::EIO);
                     }
                 }
             } else {
-                // Could be an agent root dir inode
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
             }
         }
 
         fn readdir(
-            &mut self,
+            &self,
             _req: &Request,
-            ino: u64,
-            _fh: u64,
-            offset: i64,
+            ino: INodeNo,
+            _fh: FileHandle,
+            offset: u64,
             mut reply: ReplyDirectory,
         ) {
-            if ino == 1 {
+            let ino_val: u64 = ino.into();
+
+            if ino_val == 1 {
                 // Root: list agent directories
                 let agents = self.agents.lock().unwrap();
                 let mut entries: Vec<(String, u64)> = agents
@@ -180,21 +183,26 @@ mod inner {
                 entries.sort_by(|a, b| a.0.cmp(&b.0));
                 drop(agents);
 
-                if offset <= 0 && reply.add(1, 1, FileType::Directory, ".") {
+                if offset == 0 && reply.add(INodeNo(1), 1, FileType::Directory, ".") {
                     reply.ok();
                     return;
                 }
-                if offset <= 1 && reply.add(1, 2, FileType::Directory, "..") {
+                if offset <= 1 && reply.add(INodeNo(1), 2, FileType::Directory, "..") {
                     reply.ok();
                     return;
                 }
 
                 for (i, (name, base_ino)) in entries.iter().enumerate() {
-                    let entry_offset = (i as i64) + 2;
+                    let entry_offset = (i as u64) + 2;
                     if entry_offset < offset {
                         continue;
                     }
-                    if reply.add(*base_ino, entry_offset + 1, FileType::Directory, name) {
+                    if reply.add(
+                        INodeNo(*base_ino),
+                        entry_offset + 1,
+                        FileType::Directory,
+                        name,
+                    ) {
                         break;
                     }
                 }
@@ -203,23 +211,24 @@ mod inner {
             }
 
             let agents = self.agents.lock().unwrap();
-            if let Some((agent_id, real_inode)) = agents.find_agent(ino) {
+            if let Some((agent_id, real_inode)) = agents.find_agent(ino_val) {
                 let agent_id = agent_id.to_string();
                 let base_offset = agents.map.get(&agent_id).copied().unwrap_or(2);
                 drop(agents);
 
                 match self.layer.readdir(&agent_id, real_inode) {
                     Ok(entries) => {
-                        if offset <= 0 && reply.add(ino, 1, FileType::Directory, ".") {
+                        if offset == 0 && reply.add(INodeNo(ino_val), 1, FileType::Directory, ".") {
                             reply.ok();
                             return;
                         }
-                        if offset <= 1 && reply.add(ino, 2, FileType::Directory, "..") {
+                        if offset <= 1 && reply.add(INodeNo(ino_val), 2, FileType::Directory, "..")
+                        {
                             reply.ok();
                             return;
                         }
                         for (i, (name, child_inode, kind)) in entries.iter().enumerate() {
-                            let entry_offset = (i as i64) + 2;
+                            let entry_offset = (i as u64) + 2;
                             if entry_offset < offset {
                                 continue;
                             }
@@ -229,7 +238,7 @@ mod inner {
                                 FileKind::Directory => FileType::Directory,
                                 FileKind::Symlink => FileType::Symlink,
                             };
-                            if reply.add(fuse_ino, entry_offset + 1, ft, name) {
+                            if reply.add(INodeNo(fuse_ino), entry_offset + 1, ft, name) {
                                 break;
                             }
                         }
@@ -237,24 +246,25 @@ mod inner {
                     }
                     Err(e) => {
                         warn!("readdir error: {e}");
-                        reply.error(libc::EIO);
+                        reply.error(Errno::EIO);
                     }
                 }
             } else {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
             }
         }
 
-        fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+            let parent_val: u64 = parent.into();
             let name_str = match name.to_str() {
                 Some(s) => s,
                 None => {
-                    reply.error(libc::EINVAL);
+                    reply.error(Errno::EINVAL);
                     return;
                 }
             };
 
-            if parent == 1 {
+            if parent_val == 1 {
                 // Looking up an agent directory
                 let mut agents = self.agents.lock().unwrap();
                 if name_str.starts_with("AGENT-") {
@@ -263,11 +273,11 @@ mod inner {
                     drop(agents);
                     if let Err(e) = self.layer.ensure_agent_root(name_str) {
                         warn!("ensure_agent_root error: {e}");
-                        reply.error(libc::EIO);
+                        reply.error(Errno::EIO);
                         return;
                     }
                     let attr = FileAttr {
-                        ino: base,
+                        ino: INodeNo(base),
                         size: 0,
                         blocks: 0,
                         atime: UNIX_EPOCH,
@@ -283,15 +293,15 @@ mod inner {
                         blksize: 4096,
                         flags: 0,
                     };
-                    reply.entry(&TTL, &attr, 0);
+                    reply.entry(&TTL, &attr, Generation(0));
                 } else {
-                    reply.error(libc::ENOENT);
+                    reply.error(Errno::ENOENT);
                 }
                 return;
             }
 
             let agents = self.agents.lock().unwrap();
-            if let Some((agent_id, real_parent)) = agents.find_agent(parent) {
+            if let Some((agent_id, real_parent)) = agents.find_agent(parent_val) {
                 let agent_id = agent_id.to_string();
                 let base_offset = agents.map.get(&agent_id).copied().unwrap_or(2);
                 drop(agents);
@@ -301,39 +311,44 @@ mod inner {
                         let fuse_ino = base_offset + child_inode - 1;
                         match self.layer.lookup_inode(&agent_id, child_inode) {
                             Ok(Some(data)) => {
-                                reply.entry(&TTL, &Self::inode_to_attr(&data, fuse_ino), 0);
+                                reply.entry(
+                                    &TTL,
+                                    &Self::inode_to_attr(&data, fuse_ino),
+                                    Generation(0),
+                                );
                             }
-                            Ok(None) => reply.error(libc::ENOENT),
+                            Ok(None) => reply.error(Errno::ENOENT),
                             Err(e) => {
                                 warn!("lookup inode error: {e}");
-                                reply.error(libc::EIO);
+                                reply.error(Errno::EIO);
                             }
                         }
                     }
-                    Ok(None) => reply.error(libc::ENOENT),
+                    Ok(None) => reply.error(Errno::ENOENT),
                     Err(e) => {
                         warn!("lookup dirent error: {e}");
-                        reply.error(libc::EIO);
+                        reply.error(Errno::EIO);
                     }
                 }
             } else {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
             }
         }
 
         fn read(
-            &mut self,
+            &self,
             _req: &Request,
-            ino: u64,
-            _fh: u64,
-            offset: i64,
+            ino: INodeNo,
+            _fh: FileHandle,
+            offset: u64,
             size: u32,
-            _flags: i32,
-            _lock_owner: Option<u64>,
+            _flags: OpenFlags,
+            _lock_owner: Option<LockOwner>,
             reply: ReplyData,
         ) {
+            let ino_val: u64 = ino.into();
             let agents = self.agents.lock().unwrap();
-            if let Some((agent_id, real_inode)) = agents.find_agent(ino) {
+            if let Some((agent_id, real_inode)) = agents.find_agent(ino_val) {
                 let agent_id = agent_id.to_string();
                 drop(agents);
 
@@ -349,11 +364,11 @@ mod inner {
                     }
                     Err(e) => {
                         warn!("read error: {e}");
-                        reply.error(libc::EIO);
+                        reply.error(Errno::EIO);
                     }
                 }
             } else {
-                reply.error(libc::ENOENT);
+                reply.error(Errno::ENOENT);
             }
         }
     }
