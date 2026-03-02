@@ -1069,8 +1069,8 @@ fn generate_evolution_fields(
     agent_role: &str,
     narrative: &str,
 ) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-    let gateway_url = std::env::var("CORTEX_GATEWAY_URL")
-        .unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let gateway_url =
+        std::env::var("CORTEX_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
     let url = format!("{gateway_url}/v1/chat/completions");
 
     let client = match reqwest::blocking::Client::builder()
