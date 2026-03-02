@@ -222,6 +222,43 @@ main { padding: 2rem; }
 .metric-card .value { font-size: 2rem; font-weight: 700; color: var(--accent); }
 .metric-card .label { font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.3rem; }
 
+/* eBPF Metrics Grid */
+.ebpf-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 0.75rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+.ebpf-card .value { font-size: 1.4rem; }
+.ebpf-card.ebpf-warn { border-color: var(--error); }
+.ebpf-card.ebpf-warn .value { color: var(--error); }
+.ebpf-stalled-detail {
+  grid-column: 1 / -1;
+  background: rgba(244, 67, 54, 0.08);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--error);
+}
+.ebpf-stalled-heading { font-weight: 600; font-size: 0.85rem; color: var(--error); margin-bottom: 0.3rem; }
+.ebpf-stalled-agent { font-size: 0.8rem; color: var(--text-secondary); padding: 0.15rem 0; }
+
+/* Agent Stall Indicator */
+.stall-indicator {
+  display: inline-block;
+  background: var(--error);
+  color: var(--bg);
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 0.15rem 0.5rem;
+  border-radius: 3px;
+  margin-top: 0.3rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.agent-card.agent-stalled { border-color: var(--error); }
+
 /* Cockpit */
 .cockpit-slo-container { margin-bottom: 1.5rem; }
 .cockpit-slo-bar {

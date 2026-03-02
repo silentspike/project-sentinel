@@ -43,6 +43,15 @@ function createAgentCard(agent) {
   }
   card.appendChild(room);
 
+  // Stall indicator (from eBPF monitoring)
+  if (agent.stalled) {
+    card.classList.add('agent-stalled');
+    var stall = document.createElement('div');
+    stall.className = 'stall-indicator';
+    stall.textContent = 'Stalled';
+    card.appendChild(stall);
+  }
+
   // Bio-State Bars (async geladen)
   loadAgentDetail(agent.id, card);
 
