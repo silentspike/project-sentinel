@@ -144,7 +144,7 @@ pub struct ShiftInfo {
     pub is_on_duty: bool,
 }
 
-/// Tool-Capabilities des Agents (aus AgentConfig [capabilities] Sektion).
+/// Tool-Capabilities des Agents (aus AgentConfig `[capabilities]` Sektion).
 /// Leere tools-Liste = kein Tool-Zugriff (sicherer Default).
 #[derive(Component, Debug, Clone, Default)]
 pub struct AgentCapabilities {
