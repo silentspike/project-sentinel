@@ -22,3 +22,6 @@ lunch_time = "13:00"
 [background]
 bio = "Master Informatik FAU Erlangen, 3 Jahre Siemens, 3 Jahre Digitalwerk Muenchen, Freelancer, seit 2020 bei PixelPerfekt"
 quirks = ["Tippt rhythmisch auf den Tisch", "Schreibt alles in Markdown", "Mechanische Tastatur Cherry MX Brown"]
+
+[capabilities]
+tools = ["file_read", "file_write", "search", "chat"]

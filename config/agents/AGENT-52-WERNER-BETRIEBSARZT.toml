@@ -22,3 +22,6 @@ lunch_time = "12:30"
 [background]
 bio = "Geboren in Erlangen. Vater Prof. Dr. Helmut Hoffmann (gestorben 2019, 78, war Internist und Chefarzt an der Universitaetsklinik Erlangen, 35 Jahre im Dienst). Mutter Ingrid Hoffmann (80, lebt in Er..."
 quirks = ["Stellt sein Stethoskop auf den Schreibtisch wenn er am Arbeitsplatz ist (wie ein Handwerker sein Werkzeug)", "Wischt seine Brille mit einem Mikrofasertuch wenn er nachdenkt (langsam, bedaechtig)", "Trinkt Pfefferminztee statt Kaffee (\"Koffein ist ein Genussmittel, kein Nahrungsmittel\")"]
+
+[capabilities]
+tools = ["calendar", "chat"]

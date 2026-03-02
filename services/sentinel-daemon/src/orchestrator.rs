@@ -181,6 +181,7 @@ fn spawn_agent_full(
         agent_cfg.identity.shift_set,
     );
     apply_personality(world, entity, &agent_cfg.personality);
+    sentinel_ecs::apply_capabilities(world, entity, &agent_cfg.capabilities);
     true
 }
 
@@ -511,6 +512,49 @@ fn ecs_tick_loop(
     world.insert_resource(ActionReceiver(std::sync::Mutex::new(action_rx)));
     world.insert_resource(PerceptionSender(perception_tx));
 
+    // -- Tool Registry (sentinel-wasm native handlers) --
+    let mut tool_runtime = sentinel_wasm::ToolRuntime::new();
+    let _ = tool_runtime.register_tool(sentinel_wasm::ToolDefinition {
+        name: "file_read".into(),
+        description: "Liest Dateien aus dem Agent-Home".into(),
+        wasm_path: None,
+        tool_type: sentinel_wasm::ToolType::FileRead,
+        required_capabilities: vec!["file_read".into()],
+    });
+    let _ = tool_runtime.register_tool(sentinel_wasm::ToolDefinition {
+        name: "file_write".into(),
+        description: "Schreibt Dateien ins Agent-Home".into(),
+        wasm_path: None,
+        tool_type: sentinel_wasm::ToolType::FileWrite,
+        required_capabilities: vec!["file_write".into()],
+    });
+    let _ = tool_runtime.register_tool(sentinel_wasm::ToolDefinition {
+        name: "chat".into(),
+        description: "Sendet Nachricht an anderen Agent".into(),
+        wasm_path: None,
+        tool_type: sentinel_wasm::ToolType::Chat,
+        required_capabilities: vec!["chat".into()],
+    });
+    let _ = tool_runtime.register_tool(sentinel_wasm::ToolDefinition {
+        name: "calendar".into(),
+        description: "Kalender-Verwaltung".into(),
+        wasm_path: None,
+        tool_type: sentinel_wasm::ToolType::Calendar,
+        required_capabilities: vec!["calendar".into()],
+    });
+    let _ = tool_runtime.register_tool(sentinel_wasm::ToolDefinition {
+        name: "search".into(),
+        description: "Suche in Dokumenten/Agents/Raeumen".into(),
+        wasm_path: None,
+        tool_type: sentinel_wasm::ToolType::Search,
+        required_capabilities: vec!["search".into()],
+    });
+    info!(
+        tools = tool_runtime.tool_count(),
+        "Tool Registry initialisiert"
+    );
+    world.insert_resource(sentinel_ecs::ToolRuntimeResource(tool_runtime));
+
     // -- Sandbox Handles (cgroup + bwrap tracking pro Agent) --
     let mut sandbox_handles: HashMap<AgentId, SandboxHandle> = HashMap::new();
 
@@ -652,6 +696,7 @@ fn ecs_tick_loop(
             agent_cfg.identity.shift_set,
         );
         apply_personality(&mut world, entity, &agent_cfg.personality);
+        sentinel_ecs::apply_capabilities(&mut world, entity, &agent_cfg.capabilities);
     }
 
     // EventBuffer leeren: ECS spawn_agent emittiert eigene Events, aber der
@@ -1019,6 +1064,7 @@ mod tests {
                 bio: "Test Agent".to_string(),
                 quirks: vec!["testing".to_string()],
             },
+            capabilities: Default::default(),
         }
     }
 
