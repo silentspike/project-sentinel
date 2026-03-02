@@ -14,7 +14,7 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
-wasmtime = { version = "41", optional = true }
+wasmtime = { version = "42", optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
