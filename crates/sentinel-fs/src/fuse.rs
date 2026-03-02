@@ -10,9 +10,8 @@ mod inner {
     use crate::layer::LayerManager;
     use crate::metadata::{FileKind, InodeData, MetadataStore};
     use fuser::{
-        Config, Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo,
-        LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-        Request,
+        Config, Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, LockOwner,
+        MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
     };
     use std::collections::HashMap;
     use std::ffi::OsStr;
@@ -139,13 +138,7 @@ mod inner {
     }
 
     impl Filesystem for SentinelFuse {
-        fn getattr(
-            &self,
-            _req: &Request,
-            ino: INodeNo,
-            _fh: Option<FileHandle>,
-            reply: ReplyAttr,
-        ) {
+        fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
             let ino_val: u64 = ino.into();
             if ino_val == 1 {
                 reply.attr(&TTL, &Self::root_attr());
@@ -225,14 +218,11 @@ mod inner {
 
                 match self.layer.readdir(&agent_id, real_inode) {
                     Ok(entries) => {
-                        if offset == 0
-                            && reply.add(INodeNo(ino_val), 1, FileType::Directory, ".")
-                        {
+                        if offset == 0 && reply.add(INodeNo(ino_val), 1, FileType::Directory, ".") {
                             reply.ok();
                             return;
                         }
-                        if offset <= 1
-                            && reply.add(INodeNo(ino_val), 2, FileType::Directory, "..")
+                        if offset <= 1 && reply.add(INodeNo(ino_val), 2, FileType::Directory, "..")
                         {
                             reply.ok();
                             return;
