@@ -50,9 +50,9 @@ pub async fn run(nats_url: &str, alert_tx: mpsc::Sender<JudgeAlert>) {
             storage: async_nats::jetstream::stream::StorageType::File,
             retention: async_nats::jetstream::stream::RetentionPolicy::Limits,
             max_age: std::time::Duration::from_secs(30 * 24 * 60 * 60), // 30 days
-            max_bytes: 100 * 1024 * 1024,                                // 100 MB
+            max_bytes: 100 * 1024 * 1024,                               // 100 MB
             num_replicas: 1,
-            duplicate_window: std::time::Duration::from_secs(600),       // 10 min
+            duplicate_window: std::time::Duration::from_secs(600), // 10 min
             ..Default::default()
         })
         .await
