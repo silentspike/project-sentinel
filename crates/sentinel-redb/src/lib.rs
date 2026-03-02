@@ -18,6 +18,8 @@ const VOICE_STYLE: TableDefinition<u16, &[u8]> = TableDefinition::new("voice_sty
 const BEHAVIORAL_NOTES: TableDefinition<u16, &[u8]> = TableDefinition::new("behavioral_notes");
 const NARRATIVE_SUMMARY: TableDefinition<u16, &[u8]> = TableDefinition::new("narrative_summary");
 const EVOLUTION_VERSION: TableDefinition<u16, u64> = TableDefinition::new("evolution_version");
+// NMDA scores from last consolidation — JSON-serialized Vec<f64>
+const NMDA_SCORES: TableDefinition<u16, &[u8]> = TableDefinition::new("nmda_scores");
 
 // Simulation metadata (sim_hour persistence, time virtualization)
 const SIM_META: TableDefinition<&str, &[u8]> = TableDefinition::new("sim_meta");
@@ -45,6 +47,7 @@ impl StateStore {
             write_txn.open_table(BEHAVIORAL_NOTES)?;
             write_txn.open_table(NARRATIVE_SUMMARY)?;
             write_txn.open_table(EVOLUTION_VERSION)?;
+            write_txn.open_table(NMDA_SCORES)?;
             write_txn.open_table(SIM_META)?;
         }
         write_txn.commit()?;
@@ -395,6 +398,29 @@ impl StateStore {
         }
         write_txn.commit()?;
         Ok(new_version)
+    }
+
+    /// Store NMDA scores from consolidation for an agent.
+    /// Scores are serialized as JSON array of f64.
+    pub fn set_nmda_scores(&self, agent_id: AgentId, scores: &[f64]) -> anyhow::Result<()> {
+        let json = serde_json::to_vec(scores)?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(NMDA_SCORES)?;
+            table.insert(agent_id.0, json.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Get NMDA scores from last consolidation for an agent.
+    pub fn get_nmda_scores(&self, agent_id: AgentId) -> anyhow::Result<Vec<f64>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(NMDA_SCORES)?;
+        match table.get(agent_id.0)? {
+            Some(guard) => Ok(serde_json::from_slice(guard.value())?),
+            None => Ok(Vec::new()),
+        }
     }
 
     // === SIMULATION METADATA ===

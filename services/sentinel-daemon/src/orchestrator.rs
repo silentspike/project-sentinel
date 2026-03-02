@@ -795,6 +795,34 @@ fn ecs_tick_loop(
                                                 );
                                             }
                                         }
+
+                                        // NMDA scores nach redb schreiben
+                                        let scores: Vec<f64> = result
+                                            .consolidated_summaries
+                                            .iter()
+                                            .map(|(_s, score)| *score)
+                                            .collect();
+                                        if !scores.is_empty() {
+                                            let avg_score: f64 =
+                                                scores.iter().sum::<f64>() / scores.len() as f64;
+                                            match store.set_nmda_scores(*agent_id, &scores) {
+                                                Ok(()) => {
+                                                    info!(
+                                                        agent = name,
+                                                        nmda_count = scores.len(),
+                                                        nmda_avg = format!("{avg_score:.4}"),
+                                                        "NMDA scores nach redb geschrieben"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        agent = name,
+                                                        error = %e,
+                                                        "NMDA scores redb-Write fehlgeschlagen"
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
