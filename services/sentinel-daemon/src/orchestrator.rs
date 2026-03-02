@@ -1079,15 +1079,15 @@ mod tests {
         let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
 
         let (_tx, rx) = mpsc::channel();
-        let (ptx, _prx) = mpsc::sync_channel(64);
+        let (ptx, prx) = mpsc::sync_channel(64);
 
         let controlplane = test_controlplane(&tmp);
         let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
         let all_agents = vec![test_agent_config(1, "Test Agent", "Tester", 1)];
 
-        // Shutdown nach 500ms (genug Spielraum fuer Build-Server unter Last)
+        // Deterministisch: Warte auf erste Perception (= mindestens 1 Tick abgeschlossen)
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(500));
+            let _ = prx.recv_timeout(Duration::from_secs(30));
             shutdown_clone.store(true, Ordering::SeqCst);
         });
 
@@ -1131,7 +1131,7 @@ mod tests {
         let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
 
         let (_tx, rx) = mpsc::channel();
-        let (ptx, _prx) = mpsc::sync_channel(64);
+        let (ptx, prx) = mpsc::sync_channel(64);
 
         let controlplane = test_controlplane(&tmp);
         let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
@@ -1140,9 +1140,9 @@ mod tests {
             test_agent_config(2, "Lisa", "Designer", 1),
         ];
 
-        // Shutdown nach 500ms (genug Spielraum fuer CI-Runner unter Last)
+        // Deterministisch: Warte auf erste Perception (= mindestens 1 Tick abgeschlossen)
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(500));
+            let _ = prx.recv_timeout(Duration::from_secs(30));
             shutdown_clone.store(true, Ordering::SeqCst);
         });
 
