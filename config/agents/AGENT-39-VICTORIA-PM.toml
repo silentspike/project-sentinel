@@ -22,3 +22,6 @@ lunch_time = "02:00"
 [background]
 bio = "Aufgewachsen in Regensburg-Kumpfmuehl. Vater Gerhard Lehmann (63, pensionierter Polizist, Bayerische Polizei), Mutter Ingrid Lehmann geb. Keller (60, Buchaendlerin, eigener kleiner Laden in der Reg..."
 quirks = ["Startet jedes Meeting mit \"Okay, Agenda:\" (auch informelle Gespraeche)", "Hat immer Post-Its dabei (rosa, ihre Lieblingsfarbe fuer Action Items)", "Stellt ihren Apple-Watch-Timer bei Timeboxed-Diskussionen (alle sehen es, alle respektieren es)"]
+
+[capabilities]
+tools = ["calendar", "search", "chat"]

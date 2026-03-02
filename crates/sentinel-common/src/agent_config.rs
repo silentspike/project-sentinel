@@ -11,6 +11,20 @@ pub struct AgentConfig {
     pub personality: PersonalityConfig,
     pub preferences: PreferencesConfig,
     pub background: BackgroundConfig,
+    #[serde(default)]
+    pub capabilities: CapabilitiesConfig,
+}
+
+/// Tool-Capabilities und Sandbox-Einschraenkungen pro Agent.
+/// Leere Capabilities = kein Tool-Zugriff (sicherer Default).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CapabilitiesConfig {
+    /// Tool-Namen die der Agent nutzen darf (z.B. "file_read", "chat", "calendar").
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Erlaubte Dateisystem-Pfade fuer FileRead/FileWrite.
+    #[serde(default)]
+    pub sandbox_allowed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
