@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 
@@ -242,6 +243,21 @@ func (sc *StreamConsumer) runHeuristics(agentID, latestMessage string, recentMes
 		Source:     "realtime_judge",
 	}); err != nil {
 		sc.logger.Warn("failed to write fatigue evolution", "agent", agentID, "error", err)
+	}
+
+	// Write NMDA relevance score (max of drift + fatigue as proxy)
+	nmdaVal := math.Max(driftResult.DriftScore, fatigueResult.FatigueScore)
+	if err := sc.evol.Write(persistence.EvolutionEntry{
+		AgentID:    agentID,
+		Tick:       now,
+		Field:      "nmda_score",
+		ChangeType: "nmda_relevance",
+		NewValue:   fmt.Sprintf("%.4f", nmdaVal),
+		Reason:     "max(drift, fatigue) as NMDA relevance proxy",
+		Source:     "realtime_judge",
+		NMDAScore:  &nmdaVal,
+	}); err != nil {
+		sc.logger.Warn("failed to write nmda_score", "agent", agentID, "error", err)
 	}
 
 	// 4. Swap Decision
