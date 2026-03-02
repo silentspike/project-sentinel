@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Flaky Test `test_ecs_tick_loop_runs_ticks` deterministisch gemacht** (#135)
+  - `sleep(500ms)` durch `perception_rx.recv_timeout(30s)` ersetzt
+  - Wartet auf tatsaechlichen Tick-Abschluss statt blindem Timer
+  - Gleiches Fix fuer `test_save_state_on_shutdown`
+
 - **eBPF Functional Fixes — Ende-zu-Ende Datenkette repariert** (#139)
   - **Stall-Detection false positives:** BPF Map enthielt ALLE System-cgroups (sshd,
     systemd etc.), nur registrierte Sentinel-Agents werden jetzt getrackt
