@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Dependencies
+
+- **fuser 0.16 → 0.17** (#136)
+  - Migrated all `Filesystem` trait method signatures (`&mut self` → `&self`)
+  - Adapted to newtype wrappers: `INodeNo`, `FileHandle`, `Generation`, `LockOwner`, `OpenFlags`, `Errno`
+  - `mount2()` now takes `&Config` instead of `&[MountOption]`
+  - `reply.add()` / `reply.entry()` use typed parameters instead of raw integers
+
 ### Added
 
 - **sentinel-wasm Integration in laufendes System** (#19)
