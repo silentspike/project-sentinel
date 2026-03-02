@@ -21,7 +21,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 blake3 = { workspace = true }
 tracing = { workspace = true }
-fuser = { version = "0.16", optional = true }
+fuser = { version = "0.17", optional = true }
 libc = { version = "0.2", optional = true }
 zstd = "0.13"
 rayon = { workspace = true }
