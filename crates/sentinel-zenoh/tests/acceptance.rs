@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 /// AC 6.2: Topic string format is correct for all TopicType variants
 #[test]
+#[allow(deprecated)]
 fn ac_06_02_topic_generation() {
     // Agent topics
     assert_eq!(

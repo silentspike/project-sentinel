@@ -12,6 +12,7 @@ import (
 const (
 	StreamEvents = "SENTINEL_EVENTS"
 	StreamJudge  = "SENTINEL_JUDGE"
+	StreamEBPF   = "SENTINEL_EBPF"
 )
 
 // EventsStreamConfig returns the JetStream config for the main event stream.
@@ -46,11 +47,29 @@ func JudgeStreamConfig() jetstream.StreamConfig {
 	}
 }
 
+// EBPFStreamConfig returns the JetStream config for eBPF metrics (daemon bridge).
+// Memory storage: eBPF metrics are ephemeral, no persistence needed.
+// Retention: 1 day, 50MB max. Subjects: sentinel.ebpf.>
+// ADR-001: Daemon bridges Zenoh eBPF topics to NATS for Go consumers (Judge).
+func EBPFStreamConfig() jetstream.StreamConfig {
+	return jetstream.StreamConfig{
+		Name:        StreamEBPF,
+		Description: "Sentinel eBPF metrics (daemon Zenoh→NATS bridge, ADR-001)",
+		Subjects:    []string{"sentinel.ebpf.>"},
+		Storage:     jetstream.MemoryStorage,
+		Retention:   jetstream.LimitsPolicy,
+		MaxAge:      24 * time.Hour, // 1 day
+		MaxBytes:    50 << 20,       // 50 MB
+		Replicas:    1,
+	}
+}
+
 // EnsureStreams idempotently creates or updates all required JetStream streams.
 func EnsureStreams(ctx context.Context, js jetstream.JetStream) error {
 	configs := []jetstream.StreamConfig{
 		EventsStreamConfig(),
 		JudgeStreamConfig(),
+		EBPFStreamConfig(),
 	}
 	for _, cfg := range configs {
 		if _, err := js.CreateOrUpdateStream(ctx, cfg); err != nil {

@@ -23,10 +23,11 @@ const (
 
 // ConfigSnapshot is a mutex-free copy of Config for serialization and reads.
 type ConfigSnapshot struct {
-	PrimaryProvider string  `json:"primary_provider"`
-	Temperature     float64 `json:"temperature"`
-	MaxTokens       int     `json:"max_tokens"`
-	RateLimit       float64 `json:"rate_limit_rps"`
+	PrimaryProvider string            `json:"primary_provider"`
+	Temperature     float64           `json:"temperature"`
+	MaxTokens       int               `json:"max_tokens"`
+	RateLimit       float64           `json:"rate_limit_rps"`
+	AgentOverrides  map[string]string `json:"agent_overrides"`
 }
 
 // Config holds the current gateway configuration (mutable at runtime).
@@ -36,6 +37,7 @@ type Config struct {
 	temperature     float64
 	maxTokens       int
 	rateLimit       float64
+	agentOverrides  map[string]string // agent_id -> provider_name
 }
 
 // NewConfig creates a Config with sensible defaults.
@@ -45,18 +47,47 @@ func NewConfig(primaryProvider string) *Config {
 		temperature:     0.7,
 		maxTokens:       4096,
 		rateLimit:       0,
+		agentOverrides:  make(map[string]string),
 	}
+}
+
+// AgentProvider returns the override provider for a specific agent, if any.
+func (c *Config) AgentProvider(agentID string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	p, ok := c.agentOverrides[agentID]
+	return p, ok
+}
+
+// SetAgentProvider sets a provider override for a specific agent.
+func (c *Config) SetAgentProvider(agentID, provider string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.agentOverrides[agentID] = provider
+}
+
+// ClearAgentProvider removes a provider override for a specific agent.
+func (c *Config) ClearAgentProvider(agentID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.agentOverrides, agentID)
 }
 
 // Get returns a snapshot of the current config (safe for concurrent use).
 func (c *Config) Get() ConfigSnapshot {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	// Copy agent overrides to prevent external mutation
+	overrides := make(map[string]string, len(c.agentOverrides))
+	for k, v := range c.agentOverrides {
+		overrides[k] = v
+	}
 	return ConfigSnapshot{
 		PrimaryProvider: c.primaryProvider,
 		Temperature:     c.temperature,
 		MaxTokens:       c.maxTokens,
 		RateLimit:       c.rateLimit,
+		AgentOverrides:  overrides,
 	}
 }
 
@@ -158,6 +189,8 @@ func (p *Plane) Handler() *http.ServeMux {
 	mux.HandleFunc("GET /control/config", p.handleGetConfig)
 	mux.HandleFunc("PATCH /control/config", p.handleUpdateConfig)
 	mux.HandleFunc("POST /control/provider", p.handleSwitchProvider)
+	mux.HandleFunc("POST /control/agent-provider", p.handleSetAgentProvider)
+	mux.HandleFunc("DELETE /control/agent-provider", p.handleClearAgentProvider)
 	return mux
 }
 
@@ -263,4 +296,80 @@ func (p *Plane) handleSwitchProvider(w http.ResponseWriter, r *http.Request) {
 	p.logger.Info("primary provider switched", "provider", req.Provider)
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = fmt.Fprintf(w, `{"primary_provider":%q}`, req.Provider)
+}
+
+// agentProviderRequest is the JSON body for POST/DELETE /control/agent-provider.
+type agentProviderRequest struct {
+	AgentID  string `json:"agent_id"`
+	Provider string `json:"provider"` // only needed for POST
+}
+
+// handleSetAgentProvider sets a per-agent provider override.
+func (p *Plane) handleSetAgentProvider(w http.ResponseWriter, r *http.Request) {
+	defer func() { _ = r.Body.Close() }()
+
+	limited := io.LimitReader(r.Body, maxConfigBodySize+1)
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		return
+	}
+	if len(body) > maxConfigBodySize {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	var req agentProviderRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	if req.AgentID == "" {
+		http.Error(w, "agent_id field is required", http.StatusBadRequest)
+		return
+	}
+	if req.Provider == "" {
+		http.Error(w, "provider field is required", http.StatusBadRequest)
+		return
+	}
+
+	p.config.SetAgentProvider(req.AgentID, req.Provider)
+	p.logger.Info("agent provider override set", "agent_id", req.AgentID, "provider", req.Provider)
+
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = fmt.Fprintf(w, `{"agent_id":%q,"provider":%q}`, req.AgentID, req.Provider)
+}
+
+// handleClearAgentProvider removes a per-agent provider override.
+func (p *Plane) handleClearAgentProvider(w http.ResponseWriter, r *http.Request) {
+	defer func() { _ = r.Body.Close() }()
+
+	limited := io.LimitReader(r.Body, maxConfigBodySize+1)
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		return
+	}
+	if len(body) > maxConfigBodySize {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	var req agentProviderRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	if req.AgentID == "" {
+		http.Error(w, "agent_id field is required", http.StatusBadRequest)
+		return
+	}
+
+	p.config.ClearAgentProvider(req.AgentID)
+	p.logger.Info("agent provider override cleared", "agent_id", req.AgentID)
+
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = fmt.Fprintf(w, `{"agent_id":%q,"provider":null}`, req.AgentID)
 }
