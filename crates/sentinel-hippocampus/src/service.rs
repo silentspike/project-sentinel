@@ -5,6 +5,7 @@
 
 use crate::episode::{nmda_score, Episode};
 use crate::facts::FactRetriever;
+use crate::golf::Goal;
 use crate::sleep::SleepCycle;
 use crate::store::{HippocampusStore, NarrativeState, RedbFactStore};
 
@@ -24,6 +25,7 @@ pub struct ConsolidationResult {
 /// - Night-run consolidation (scoring + narrative building + persistence)
 /// - Prioritized memory retrieval (NMDA-sorted)
 /// - Fact retrieval (trigger-based)
+/// - GOLF goal management (create, update progress, query)
 pub struct HippocampusService {
     store: HippocampusStore,
 }
@@ -150,6 +152,45 @@ impl HippocampusService {
     pub fn get_narrative(&self, agent: &str) -> anyhow::Result<Option<String>> {
         let state = self.store.load_narrative(agent)?;
         Ok(state.map(|s| s.summary))
+    }
+
+    // === GOLF (Goal-Oriented Life Tasks) ===
+
+    /// Create goals for an agent (replaces any existing goals).
+    pub fn create_goals(&self, agent: &str, goals: &[Goal]) -> anyhow::Result<()> {
+        self.store.store_goals(agent, goals)
+    }
+
+    /// Append goals to an agent's existing goal list.
+    pub fn append_goals(&self, agent: &str, goals: &[Goal]) -> anyhow::Result<()> {
+        self.store.append_goals(agent, goals)
+    }
+
+    /// Update progress for a specific goal. Returns true if the goal was found.
+    pub fn update_goal_progress(
+        &self,
+        agent: &str,
+        goal_id: u64,
+        progress: f64,
+        tick: u64,
+    ) -> anyhow::Result<bool> {
+        self.store.update_goal_progress(agent, goal_id, progress, tick)
+    }
+
+    /// Load all goals for an agent.
+    pub fn get_goals(&self, agent: &str) -> anyhow::Result<Vec<Goal>> {
+        self.store.load_goals(agent)
+    }
+
+    /// Load only active goals for an agent.
+    pub fn get_active_goals(&self, agent: &str) -> anyhow::Result<Vec<Goal>> {
+        let goals = self.store.load_goals(agent)?;
+        Ok(goals.into_iter().filter(|g| g.is_active()).collect())
+    }
+
+    /// List all agents that have stored goals.
+    pub fn list_agents_with_goals(&self) -> anyhow::Result<Vec<String>> {
+        self.store.list_agents_with_goals()
     }
 }
 
@@ -319,5 +360,135 @@ mod tests {
         let loaded = service.store().load_episodes("Thomas").unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].summary, "Solo event");
+    }
+
+    // === GOLF Service Tests ===
+
+    #[test]
+    fn test_goal_create_and_retrieve() {
+        use crate::golf::{Goal, GoalType};
+
+        let (service, _dir) = temp_service();
+        let goals = vec![
+            Goal::new(1, "Thomas", GoalType::Career, "Befoerderung", 0, None),
+            Goal::new(2, "Thomas", GoalType::Project, "Feature liefern", 0, Some(5000)),
+        ];
+        service.create_goals("Thomas", &goals).unwrap();
+
+        let loaded = service.get_goals("Thomas").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].description, "Befoerderung");
+        assert_eq!(loaded[1].deadline_tick, Some(5000));
+    }
+
+    #[test]
+    fn test_goal_append() {
+        use crate::golf::{Goal, GoalType};
+
+        let (service, _dir) = temp_service();
+        service
+            .create_goals(
+                "Thomas",
+                &[Goal::new(1, "Thomas", GoalType::Career, "Goal A", 0, None)],
+            )
+            .unwrap();
+        service
+            .append_goals(
+                "Thomas",
+                &[Goal::new(2, "Thomas", GoalType::Skill, "Goal B", 100, None)],
+            )
+            .unwrap();
+
+        let loaded = service.get_goals("Thomas").unwrap();
+        assert_eq!(loaded.len(), 2);
+    }
+
+    #[test]
+    fn test_goal_progress_update_via_service() {
+        use crate::golf::{Goal, GoalStatus, GoalType};
+
+        let (service, _dir) = temp_service();
+        service
+            .create_goals(
+                "Lisa",
+                &[Goal::new(1, "Lisa", GoalType::Skill, "Rust lernen", 0, None)],
+            )
+            .unwrap();
+
+        let found = service.update_goal_progress("Lisa", 1, 0.75, 500).unwrap();
+        assert!(found);
+
+        let goals = service.get_goals("Lisa").unwrap();
+        assert_eq!(goals[0].progress, 0.75);
+        assert_eq!(goals[0].status, GoalStatus::Active);
+        assert_eq!(goals[0].last_updated_tick, 500);
+    }
+
+    #[test]
+    fn test_goal_auto_complete_via_service() {
+        use crate::golf::{Goal, GoalStatus, GoalType};
+
+        let (service, _dir) = temp_service();
+        service
+            .create_goals(
+                "Thomas",
+                &[Goal::new(1, "Thomas", GoalType::Project, "Feature X", 0, None)],
+            )
+            .unwrap();
+
+        service.update_goal_progress("Thomas", 1, 1.0, 1000).unwrap();
+
+        let goals = service.get_goals("Thomas").unwrap();
+        assert_eq!(goals[0].status, GoalStatus::Completed);
+    }
+
+    #[test]
+    fn test_get_active_goals_filters_completed() {
+        use crate::golf::{Goal, GoalType};
+
+        let (service, _dir) = temp_service();
+        let goals = vec![
+            Goal::new(1, "Thomas", GoalType::Career, "Active goal", 0, None),
+            Goal::new(2, "Thomas", GoalType::Project, "Will complete", 0, None),
+        ];
+        service.create_goals("Thomas", &goals).unwrap();
+
+        // Complete one goal
+        service.update_goal_progress("Thomas", 2, 1.0, 500).unwrap();
+
+        let active = service.get_active_goals("Thomas").unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].description, "Active goal");
+    }
+
+    #[test]
+    fn test_list_agents_with_goals() {
+        use crate::golf::{Goal, GoalType};
+
+        let (service, _dir) = temp_service();
+        service
+            .create_goals(
+                "Thomas",
+                &[Goal::new(1, "Thomas", GoalType::Career, "Goal T", 0, None)],
+            )
+            .unwrap();
+        service
+            .create_goals(
+                "Lisa",
+                &[Goal::new(1, "Lisa", GoalType::Skill, "Goal L", 0, None)],
+            )
+            .unwrap();
+
+        let agents = service.list_agents_with_goals().unwrap();
+        assert_eq!(agents.len(), 2);
+        assert!(agents.contains(&"Thomas".to_string()));
+        assert!(agents.contains(&"Lisa".to_string()));
+    }
+
+    #[test]
+    fn test_goal_nonexistent_agent() {
+        let (service, _dir) = temp_service();
+        let goals = service.get_goals("Nobody").unwrap();
+        assert!(goals.is_empty());
     }
 }
