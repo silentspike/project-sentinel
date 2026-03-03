@@ -9,6 +9,7 @@ import (
 const (
 	SubjectEventsPrefix = "sentinel.events"
 	SubjectJudgePrefix  = "sentinel.judge"
+	SubjectEBPFPrefix   = "sentinel.ebpf"
 )
 
 // BuildEventSubject creates a NATS subject for a domain event.
@@ -22,6 +23,14 @@ func BuildEventSubject(eventType, agentID string) string {
 // Format: sentinel.judge.alert.{agent_id}
 func BuildAlertSubject(agentID string) string {
 	return fmt.Sprintf("%s.alert.%s", SubjectJudgePrefix, agentID)
+}
+
+// BuildEBPFSubject creates a NATS subject for an eBPF metric type.
+// Format: sentinel.ebpf.{metric_type}
+// Example: sentinel.ebpf.agent-health
+// Metric types: agent-health, io-profile, network, psi, status
+func BuildEBPFSubject(metricType string) string {
+	return fmt.Sprintf("%s.%s", SubjectEBPFPrefix, metricType)
 }
 
 // ParseEventSubject extracts event_type and agent_id from a NATS subject.

@@ -15,6 +15,14 @@ type Config struct {
 	Evolution  EvolutionConfig  `toml:"evolution"`
 	Agents     AgentsConfig     `toml:"agents"`
 	Gateway    GatewayConfig    `toml:"gateway"`
+	EBPF       EBPFConfig       `toml:"ebpf"`
+}
+
+// EBPFConfig configures the eBPF metrics consumer (ADR-001: daemon bridges eBPF→NATS).
+type EBPFConfig struct {
+	Enabled          bool   `toml:"enabled"`
+	ConsumerName     string `toml:"consumer_name"`
+	StallThresholdMs int    `toml:"stall_threshold_ms"`
 }
 
 type AgentsConfig struct {
@@ -83,6 +91,12 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Gateway.TimeoutSeconds <= 0 {
 		cfg.Gateway.TimeoutSeconds = 30
+	}
+	if cfg.EBPF.ConsumerName == "" {
+		cfg.EBPF.ConsumerName = "judge-ebpf"
+	}
+	if cfg.EBPF.StallThresholdMs <= 0 {
+		cfg.EBPF.StallThresholdMs = 60000
 	}
 	return &cfg, nil
 }

@@ -97,14 +97,30 @@ pub async fn prometheus_server(metrics_text: Arc<RwLock<String>>, port: u16) {
     }
 }
 
-/// Empfaengt MetricsSnapshots via mpsc und publiziert auf Zenoh + Prometheus.
+/// NATS subjects fuer eBPF metrics bridge (ADR-001: Daemon bridged Zenoh→NATS).
+#[cfg(feature = "nats")]
+mod nats_subjects {
+    pub const AGENT_HEALTH: &str = "sentinel.ebpf.agent-health";
+    pub const IO_PROFILE: &str = "sentinel.ebpf.io-profile";
+    pub const NETWORK: &str = "sentinel.ebpf.network";
+    pub const PSI: &str = "sentinel.ebpf.psi";
+    pub const STATUS: &str = "sentinel.ebpf.status";
+}
+
+/// Empfaengt MetricsSnapshots via mpsc und publiziert auf Zenoh + NATS + Prometheus.
 ///
 /// 1. Rendert Prometheus-Text und speichert ihn im shared RwLock
 /// 2. Publiziert JSON-Daten auf sentinel/ebpf/* Zenoh-Topics
+/// 3. Bridged dieselben Daten auf sentinel.ebpf.* NATS-Subjects (ADR-001)
 pub async fn ebpf_publisher(
     mut rx: tokio::sync::mpsc::Receiver<MetricsSnapshot>,
     metrics_text: Arc<RwLock<String>>,
+    nats_url: Option<String>,
 ) {
+    // Suppress unused warning when nats feature is disabled
+    #[cfg(not(feature = "nats"))]
+    let _ = &nats_url;
+
     // SentinelBus fuer Zenoh-Publishing erstellen
     let bus = match SentinelBus::new().await {
         Ok(b) => {
@@ -115,6 +131,23 @@ pub async fn ebpf_publisher(
             warn!(error = %e, "eBPF Zenoh Publisher: SentinelBus nicht verfuegbar, nur Prometheus aktiv");
             None
         }
+    };
+
+    // NATS Client fuer eBPF→NATS Bridge (ADR-001: Daemon bridged fuer Go-Services)
+    #[cfg(feature = "nats")]
+    let nats = if let Some(ref url) = nats_url {
+        match async_nats::connect(url.as_str()).await {
+            Ok(client) => {
+                info!(url = url.as_str(), "eBPF NATS Bridge verbunden");
+                Some(client)
+            }
+            Err(e) => {
+                warn!(error = %e, "eBPF NATS Bridge: Verbindung fehlgeschlagen, nur Zenoh aktiv");
+                None
+            }
+        }
+    } else {
+        None
     };
 
     let mut snapshot_count = 0u64;
@@ -156,7 +189,7 @@ pub async fn ebpf_publisher(
 
             // PSI Stress
             if let Ok(payload) = serde_json::to_vec(&snapshot.psi_metrics) {
-                if let Err(e) = bus.publish(topics::EBPF_STATUS, &payload).await {
+                if let Err(e) = bus.publish(topics::EBPF_PSI, &payload).await {
                     warn!(error = %e, "Zenoh publish psi-stress fehlgeschlagen");
                 }
             }
@@ -168,6 +201,42 @@ pub async fn ebpf_publisher(
             if let Ok(payload) = serde_json::to_vec(&status) {
                 if let Err(e) = bus.publish(topics::EBPF_STATUS, &payload).await {
                     warn!(error = %e, "Zenoh publish status fehlgeschlagen");
+                }
+            }
+        }
+
+        // 3. NATS Bridge publish (fire-and-forget, ADR-001)
+        #[cfg(feature = "nats")]
+        if let Some(ref nc) = nats {
+            if let Ok(payload) = serde_json::to_vec(&snapshot.stalled_agents) {
+                if let Err(e) = nc
+                    .publish(nats_subjects::AGENT_HEALTH, payload.into())
+                    .await
+                {
+                    warn!(error = %e, "NATS publish agent-health fehlgeschlagen");
+                }
+            }
+            if let Ok(payload) = serde_json::to_vec(&snapshot.io_metrics) {
+                if let Err(e) = nc.publish(nats_subjects::IO_PROFILE, payload.into()).await {
+                    warn!(error = %e, "NATS publish io-profile fehlgeschlagen");
+                }
+            }
+            if let Ok(payload) = serde_json::to_vec(&snapshot.network_metrics) {
+                if let Err(e) = nc.publish(nats_subjects::NETWORK, payload.into()).await {
+                    warn!(error = %e, "NATS publish network fehlgeschlagen");
+                }
+            }
+            if let Ok(payload) = serde_json::to_vec(&snapshot.psi_metrics) {
+                if let Err(e) = nc.publish(nats_subjects::PSI, payload.into()).await {
+                    warn!(error = %e, "NATS publish psi fehlgeschlagen");
+                }
+            }
+            let status = EbpfStatus {
+                mode: snapshot.mode,
+            };
+            if let Ok(payload) = serde_json::to_vec(&status) {
+                if let Err(e) = nc.publish(nats_subjects::STATUS, payload.into()).await {
+                    warn!(error = %e, "NATS publish status fehlgeschlagen");
                 }
             }
         }

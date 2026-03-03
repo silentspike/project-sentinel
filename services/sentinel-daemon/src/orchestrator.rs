@@ -369,9 +369,17 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let prom_text = Arc::clone(&prometheus_text);
     tokio::spawn(crate::ebpf::prometheus_server(prom_text, 9090));
 
-    // -- eBPF Zenoh Publisher + Prometheus Text Renderer --
+    // -- eBPF Zenoh Publisher + NATS Bridge + Prometheus Text Renderer --
     let prom_text = Arc::clone(&prometheus_text);
-    tokio::spawn(crate::ebpf::ebpf_publisher(ebpf_rx, prom_text));
+    #[cfg(feature = "nats")]
+    let ebpf_nats_url = Some(config.nats.url.clone());
+    #[cfg(not(feature = "nats"))]
+    let ebpf_nats_url: Option<String> = None;
+    tokio::spawn(crate::ebpf::ebpf_publisher(
+        ebpf_rx,
+        prom_text,
+        ebpf_nats_url,
+    ));
 
     // -- LLM Bridge starten (Perception → Cortex Gateway → Action) --
     #[cfg(feature = "llm")]
@@ -411,6 +419,14 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
         // Alert-Receiver: DomainEvent persistieren + Prometheus Counter + Log
         let es = Arc::clone(&alert_event_store);
+        // Gateway URL for model-swap HTTP calls (ADR-001: swap via NATS alert → HTTP to Gateway)
+        let gateway_url = std::env::var("CORTEX_GATEWAY_URL")
+            .unwrap_or_else(|_| "http://localhost:8081".to_string());
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("reqwest Client build");
+
         tokio::spawn(async move {
             let counter = sentinel_telemetry::MetricsRegistry::global()
                 .counter("sentinel_daemon_judge_alerts_total");
@@ -454,6 +470,31 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                             alert_ref = "model_swap_requested",
                             "Model-Swap Alert empfangen — DomainEvent persistiert"
                         );
+
+                        // ADR-001: HTTP POST to Gateway Control Plane for model-swap
+                        let target_provider = extract_swap_provider(&alert.details);
+                        let url = format!("{}/control/agent-provider", gateway_url);
+                        let body = serde_json::json!({
+                            "agent_id": alert.agent_id,
+                            "provider": target_provider,
+                        });
+                        match http_client.post(&url).json(&body).send().await {
+                            Ok(resp) => {
+                                info!(
+                                    status = %resp.status(),
+                                    agent_id = %alert.agent_id,
+                                    provider = %target_provider,
+                                    "Model-Swap an Gateway gesendet"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    agent_id = %alert.agent_id,
+                                    "Model-Swap Gateway-Call fehlgeschlagen"
+                                );
+                            }
+                        }
                     }
                     "drift" => {
                         info!(
@@ -518,6 +559,22 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     info!("Daemon heruntergefahren");
 
     Ok(())
+}
+
+/// Extrahiert den Ziel-Provider aus den Swap-Alert Details.
+///
+/// Falls die Details einen bekannten Provider-Namen enthalten (z.B. "claude", "ollama"),
+/// wird dieser zurueckgegeben. Fallback: "claude" (hoechstqualitaetiger Provider).
+#[cfg(feature = "nats")]
+fn extract_swap_provider(details: &str) -> String {
+    let lower = details.to_lowercase();
+    for provider in ["claude", "ollama", "claude-code", "qwen3"] {
+        if lower.contains(provider) {
+            return provider.to_string();
+        }
+    }
+    // Default: upgrade to claude (the highest-quality provider)
+    "claude".to_string()
 }
 
 /// ECS Tick-Loop auf dediziertem Thread.

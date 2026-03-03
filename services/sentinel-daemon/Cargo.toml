@@ -47,7 +47,7 @@ default = ["llm", "ebpf", "nats"]
 telemetry = ["sentinel-telemetry/telemetry"]
 llm = ["reqwest"]
 ebpf = ["sentinel-ebpf/ebpf"]
-nats = ["async-nats", "futures"]
+nats = ["async-nats", "futures", "reqwest"]
 
 [dev-dependencies]
 tempfile = "3"
