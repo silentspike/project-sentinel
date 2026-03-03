@@ -42,4 +42,20 @@ var (
 		Help:    "LLM analysis duration by type",
 		Buckets: []float64{0.5, 1, 2, 5, 10, 30, 60},
 	}, []string{"type"})
+
+	// eBPF metrics (ADR-001: Judge consumes daemon-bridged eBPF data via NATS)
+	EBPFStallCount = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "judge_ebpf_stall_count",
+		Help: "Number of stalled agents from eBPF agent-health data",
+	}, []string{"agent"})
+
+	EBPFIOBytes = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "judge_ebpf_io_bytes",
+		Help: "I/O bytes from eBPF profiling",
+	}, []string{"direction"})
+
+	EBPFEventsProcessed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "judge_ebpf_events_processed_total",
+		Help: "Total eBPF metric events processed from NATS",
+	})
 )

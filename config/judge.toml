@@ -22,3 +22,9 @@ model = "qwen3:7b"
 temperature = 0.2
 max_tokens = 500
 timeout_seconds = 30
+
+# eBPF metrics consumer (ADR-001: daemon bridges eBPF data Zenoh→NATS)
+[ebpf]
+enabled = true
+consumer_name = "judge-ebpf"
+stall_threshold_ms = 60000

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Judge-Daemon Zenoh/NATS Integration** (#140)
+  - **ADR-001:** NATS-First Communication for Go Services documented
+  - **eBPF→NATS Bridge:** Daemon publishes eBPF metrics on NATS subjects
+    (`sentinel.ebpf.*`) alongside Zenoh (ADR-001: Dual-Bus bridge for Go consumers)
+  - **SENTINEL_EBPF JetStream Stream:** Memory-backed, 1-day retention, 50MB max
+  - **Judge eBPF Consumer:** Subscribes to `sentinel.ebpf.agent-health`, feeds
+    stall data into heuristic pipeline as drift-score weight factor
+    (`finalDrift = 0.7*textDrift + 0.3*ebpfSignal`)
+  - **Gateway per-Agent Provider Routing:** `POST /control/agent-provider` endpoint
+    for per-agent model overrides; pipeline checks overrides before global primary
+  - **Daemon Model-Swap Handler:** Swap alerts from NATS trigger HTTP POST to
+    Gateway Control Plane (`/control/agent-provider`) instead of just logging
+  - **TOGAF Deviation Register:** `docs/togaf-deviations.md` with 3 documented deviations
+  - **Functional Audit Judge:** `docs/functional-audit-judge.md` (B-5, M-17-M-20)
+  - **Zenoh Wiring Status:** `docs/zenoh-wiring-status.md` cataloging all 22 topics
+
+### Fixed
+
+- **EBPF_STATUS Double-Publish Bug** (#140)
+  - PSI metrics were published on `EBPF_STATUS` topic (overwriting mode status);
+    now correctly published on dedicated `EBPF_PSI` topic
+  - New `EBPF_PSI` Zenoh topic constant added to sentinel-zenoh
+
+### Deprecated
+
+- `JUDGE_ALERT` Zenoh topic (ADR-001: alerts flow via NATS)
+- `MODEL_SWAP` Zenoh topic (ADR-001: swap via NATS alert + HTTP)
+
 ### Fixed
 
 - **eBPF Kernel-Modus Funktionale Korrektheit** (#139)

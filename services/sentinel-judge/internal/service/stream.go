@@ -31,6 +31,7 @@ type StreamConsumer struct {
 	alerter  *alerter.Alerter
 	evol     *persistence.EvolutionStore
 	logger   *slog.Logger
+	ebpf     *EBPFStore // ADR-001: eBPF enrichment for drift-detection
 
 	// Message buffer per agent for heuristic analysis
 	mu       sync.RWMutex
@@ -43,6 +44,7 @@ func NewStreamConsumer(
 	cfg *config.Config,
 	evol *persistence.EvolutionStore,
 	alerter *alerter.Alerter,
+	ebpfStore *EBPFStore,
 	logger *slog.Logger,
 ) *StreamConsumer {
 	drift := judge.NewDriftDetector()
@@ -56,6 +58,7 @@ func NewStreamConsumer(
 		alerter:  alerter,
 		evol:     evol,
 		logger:   logger,
+		ebpf:     ebpfStore,
 		messages: make(map[string][]string),
 	}
 }
@@ -164,27 +167,43 @@ func (sc *StreamConsumer) processMessage(msg jetstream.Msg) {
 func (sc *StreamConsumer) runHeuristics(agentID, latestMessage string, recentMessages []string) {
 	now := time.Now().UnixMilli()
 
-	// 1. Drift Detection
+	// 1. Drift Detection (enriched with eBPF signal per ADR-001)
 	driftResult := sc.drift.CheckDrift(agentID, recentMessages)
-	metrics.DriftScore.WithLabelValues(agentID).Set(driftResult.DriftScore)
+	driftScore := driftResult.DriftScore
+
+	// eBPF enrichment: if agent is stalled, lower the effective drift score
+	// because the drift may be caused by technical issues, not personality change.
+	// Formula: finalDrift = 0.7*textDrift + 0.3*ebpfSignal
+	// ebpfSignal: 0.0 = agent stalled (technical issue), 1.0 = agent healthy
+	if sc.ebpf != nil {
+		ebpfState := sc.ebpf.Get(agentID)
+		if !ebpfState.UpdatedAt.IsZero() {
+			ebpfSignal := 1.0
+			if ebpfState.Stalled {
+				ebpfSignal = 0.0
+			}
+			driftScore = 0.7*driftResult.DriftScore + 0.3*ebpfSignal
+		}
+	}
+	metrics.DriftScore.WithLabelValues(agentID).Set(driftScore)
 
 	if severityAtLeast(driftResult.Severity, sc.cfg.Thresholds.DriftAlertSeverity) {
 		sc.alerter.Emit(alerter.Alert{
 			AgentID:  agentID,
 			Type:     "drift",
 			Severity: driftResult.Severity,
-			Score:    driftResult.DriftScore,
+			Score:    driftScore,
 			Details:  driftResult.Details,
 		})
 	}
 
-	// Write drift evolution entry
+	// Write drift evolution entry (enriched score)
 	if err := sc.evol.Write(persistence.EvolutionEntry{
 		AgentID:    agentID,
 		Tick:       now,
 		Field:      "drift_score",
 		ChangeType: "drift",
-		NewValue:   fmt.Sprintf("%.4f", driftResult.DriftScore),
+		NewValue:   fmt.Sprintf("%.4f", driftScore),
 		Reason:     driftResult.Details,
 		Source:     "realtime_judge",
 	}); err != nil {
