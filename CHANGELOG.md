@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Closed-Loop Personality Evolution E2E Integration** (#138)
+  - **NATS Consumer Silent-Failure:** `get_stream("SENTINEL_JUDGE")` durch
+    `get_or_create_stream()` mit vollstaendiger Stream-Config ersetzt — Daemon
+    empfaengt jetzt zuverlaessig Judge-Alerts auch wenn Stream noch nicht existiert
+  - **DomainEvent-Persistierung bei Alerts:** Judge-Alerts (drift, quality, fatigue, swap)
+    erzeugen jetzt `JudgeAlertReceived` DomainEvents in Limbo + Prometheus Counter
+    `sentinel_daemon_judge_alerts_total`
+  - **nmda_score in Evolution-DB:** Judge schreibt `max(drift, fatigue)` als
+    NMDA-Relevanz-Proxy in `personality_evolution` Tabelle
+
+### Added
+
+- **LLM-basierte Voice-Style und Behavioral-Notes Generierung** (#138)
+  - Bei Schichtwechsel-Konsolidierung: LLM-Call an Cortex Gateway fuer
+    `voice_style` und `behavioral_notes` pro Agent
+  - Fail-safe: Bei Gateway-Fehler laeuft Konsolidierung ohne voice/behavioral weiter
+  - `reqwest::blocking` Feature fuer HTTP-Calls im ECS std::thread
+
 ### Dependencies
 
 - **fuser 0.16 → 0.17** (#136)
