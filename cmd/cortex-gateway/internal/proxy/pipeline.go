@@ -211,24 +211,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	snap := ph.config.Get()
 
 	// --- Step 2: Provider bestimmen (Runtime-switchable via Control Plane) ---
-	// Per-Agent override check: daemon sends agent_id (numeric) or agent_name
-	resolvedProviderName := snap.PrimaryProvider
-	if agentID := req.Metadata["agent_id"]; agentID != "" {
-		// Convert numeric agent_id (e.g. "8") to AGENT-XX format for override lookup
-		if n, err := strconv.Atoi(agentID); err == nil {
-			canonicalID := fmt.Sprintf("AGENT-%02d", n)
-			if override, ok := snap.AgentOverrides[canonicalID]; ok {
-				resolvedProviderName = override
-				ph.logger.Info("per-agent provider override active", "agent", canonicalID, "provider", override)
-			}
-		}
-	}
-	if agentName := req.Metadata["agent_name"]; agentName != "" {
-		if override, ok := snap.AgentOverrides[agentName]; ok {
-			resolvedProviderName = override
-			ph.logger.Info("per-agent provider override active", "agent", agentName, "provider", override)
-		}
-	}
+	resolvedProviderName := ph.resolveAgentProvider(snap, req.Metadata)
 	provider, providerName := ph.resolveProvider(resolvedProviderName)
 	if provider == nil {
 		ph.logger.Error("no provider available", "requested", resolvedProviderName)
@@ -364,6 +347,28 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(pipelineResp); err != nil {
 		ph.logger.Error("failed to encode response", "error", err)
 	}
+}
+
+// resolveAgentProvider checks for per-agent provider overrides via Control Plane config.
+// Returns the overridden provider name, or the primary provider if no override exists.
+func (ph *PipelineHandler) resolveAgentProvider(snap control.ConfigSnapshot, metadata map[string]string) string {
+	primary := snap.PrimaryProvider
+	if agentID := metadata["agent_id"]; agentID != "" {
+		if n, err := strconv.Atoi(agentID); err == nil {
+			canonicalID := fmt.Sprintf("AGENT-%02d", n)
+			if override, ok := snap.AgentOverrides[canonicalID]; ok {
+				ph.logger.Info("per-agent provider override active", "agent", canonicalID, "provider", override)
+				return override
+			}
+		}
+	}
+	if agentName := metadata["agent_name"]; agentName != "" {
+		if override, ok := snap.AgentOverrides[agentName]; ok {
+			ph.logger.Info("per-agent provider override active", "agent", agentName, "provider", override)
+			return override
+		}
+	}
+	return primary
 }
 
 // buildSystemPrompt assembles the system prompt via 3-source assembly or fallback.
