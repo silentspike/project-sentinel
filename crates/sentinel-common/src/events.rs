@@ -199,6 +199,14 @@ pub enum DomainEventPayload {
         agent_name: String,
         error: String,
     },
+    /// Judge-Alert empfangen (drift, quality, fatigue, swap)
+    JudgeAlertReceived {
+        agent_id: AgentId,
+        alert_type: String,
+        severity: String,
+        score: f64,
+        details: String,
+    },
 }
 
 impl DomainEventPayload {
@@ -226,6 +234,7 @@ impl DomainEventPayload {
             Self::NightRunCompleted { .. } => "nightrun_completed",
             Self::AgentConsolidated { .. } => "agent_consolidated",
             Self::AgentConsolidationFailed { .. } => "agent_consolidation_failed",
+            Self::JudgeAlertReceived { .. } => "judge_alert_received",
         }
     }
 }

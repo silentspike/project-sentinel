@@ -41,11 +41,28 @@ pub async fn run(nats_url: &str, alert_tx: mpsc::Sender<JudgeAlert>) {
 
     let jetstream = async_nats::jetstream::new(client);
 
-    // Stream holen
-    let stream = match jetstream.get_stream("SENTINEL_JUDGE").await {
-        Ok(s) => s,
+    // Stream erstellen oder holen (idempotent, verhindert silent-fail wenn Stream noch nicht existiert)
+    let stream = match jetstream
+        .get_or_create_stream(async_nats::jetstream::stream::Config {
+            name: "SENTINEL_JUDGE".to_string(),
+            description: Some("Sentinel judge alerts and results".to_string()),
+            subjects: vec!["sentinel.judge.>".to_string()],
+            storage: async_nats::jetstream::stream::StorageType::File,
+            retention: async_nats::jetstream::stream::RetentionPolicy::Limits,
+            max_age: std::time::Duration::from_secs(30 * 24 * 60 * 60), // 30 days
+            max_bytes: 100 * 1024 * 1024,                               // 100 MB
+            num_replicas: 1,
+            duplicate_window: std::time::Duration::from_secs(600), // 10 min
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(s) => {
+            info!("NATS Stream SENTINEL_JUDGE ready");
+            s
+        }
         Err(e) => {
-            error!(error = %e, "NATS Stream SENTINEL_JUDGE nicht gefunden");
+            error!(error = %e, "NATS Stream SENTINEL_JUDGE konnte nicht erstellt/geholt werden");
             return;
         }
     };
