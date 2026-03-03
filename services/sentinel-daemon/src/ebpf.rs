@@ -217,10 +217,7 @@ pub async fn ebpf_publisher(
                 }
             }
             if let Ok(payload) = serde_json::to_vec(&snapshot.io_metrics) {
-                if let Err(e) = nc
-                    .publish(nats_subjects::IO_PROFILE, payload.into())
-                    .await
-                {
+                if let Err(e) = nc.publish(nats_subjects::IO_PROFILE, payload.into()).await {
                     warn!(error = %e, "NATS publish io-profile fehlgeschlagen");
                 }
             }
