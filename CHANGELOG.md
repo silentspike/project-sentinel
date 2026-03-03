@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **eBPF Kernel-Modus Funktionale Korrektheit** (#139)
+  - **Stall-Detection False Positives (AC-4):** TCP Ring Buffer Events aktualisieren
+    jetzt den Health-Checker fuer alle registrierten Agents — LLM-Agent-Prozesse
+    die via HTTP/TCP kommunizieren werden nicht mehr faelschlich als stalled gemeldet
+  - **/proc/PID/io VFS-Level Metriken (AC-6):** `rchar`/`wchar` (VFS-Level) statt
+    nur `read_bytes`/`write_bytes` (Block-Level) fuer I/O-Tracking — erfasst auch
+    buffered I/O das nie den Block-Layer erreicht
+  - **/proc/PID/io Permission Warning:** Einmalige `warn!()` Meldung wenn
+    `/proc/PID/io` wegen fehlender `CAP_SYS_PTRACE` Capability nicht lesbar ist
+  - **PSI Error-Handling (AC-7):** Differenzierte Fehlerbehandlung —
+    PermissionDenied → `warn!()`, NotFound → `debug!()`, andere → `warn!()`
+  - **Dashboard Stall-Indikator Name-Mismatch (AC-10):** Agent-Name Matching
+    korrigiert — Prometheus nutzt echten Namen, Dashboard verglich mit AGENT-XX Format
+  - **Dashboard Stall Differential-Update:** Stall-Status wird bei WebSocket-Updates
+    korrekt hinzugefuegt/entfernt ohne Full-Rerender
+
 - **Closed-Loop Personality Evolution E2E Integration** (#138)
   - **NATS Consumer Silent-Failure:** `get_stream("SENTINEL_JUDGE")` durch
     `get_or_create_stream()` mit vollstaendiger Stream-Config ersetzt — Daemon

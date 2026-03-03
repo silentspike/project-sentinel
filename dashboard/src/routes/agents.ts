@@ -66,16 +66,12 @@ function toDetail(row: AgentRow, stalled: boolean): AgentDetail {
   };
 }
 
-function agentIdToName(agentId: number): string {
-  return "AGENT-" + String(agentId).padStart(2, "0");
-}
-
 agentRoutes.get("/agents", async (c) => {
   await refreshStallData();
   const agents = getActiveAgents();
   return c.json(
     agents.map((a) =>
-      toListItem(a, stalledAgentSet.has(agentIdToName(a.agent_id))),
+      toListItem(a, stalledAgentSet.has(a.name)),
     ),
   );
 });
@@ -94,11 +90,11 @@ agentRoutes.get("/agents/:id/state", async (c) => {
     );
     if (!agent) return c.json({ error: "Agent not found" }, 404);
     return c.json(
-      toDetail(agent, stalledAgentSet.has(agentIdToName(agent.agent_id))),
+      toDetail(agent, stalledAgentSet.has(agent.name)),
     );
   }
 
   const agent = getAgentById(id);
   if (!agent) return c.json({ error: "Agent not found" }, 404);
-  return c.json(toDetail(agent, stalledAgentSet.has(agentIdToName(id))));
+  return c.json(toDetail(agent, stalledAgentSet.has(agent.name)));
 });
