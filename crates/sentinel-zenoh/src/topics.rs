@@ -44,7 +44,11 @@ pub fn physics_tick(tick_number: u64) -> String {
 /// Topic for chaos monkey events
 pub const CHAOS_EVENT: &str = "sentinel/chaos/event";
 
-/// Topic for sentinel judge alerts
+/// Topic for sentinel judge alerts.
+///
+/// ADR-001: Judge publishes alerts via NATS (`sentinel.judge.alert.*`), not Zenoh.
+/// This constant is retained for type-signature compatibility; no active subscribers.
+#[deprecated(note = "ADR-001: Judge alerts flow via NATS, not Zenoh")]
 pub const JUDGE_ALERT: &str = "sentinel/judge/alert";
 
 /// Build topic for agent PSI (Pressure Stall Information) metrics
@@ -57,7 +61,11 @@ pub fn cortex_inject(name: &str) -> String {
     format!("{PREFIX}/cortex/inject/{name}")
 }
 
-/// Topic for model swap requests (invisible to agents)
+/// Topic for model swap requests (invisible to agents).
+///
+/// ADR-001: Model-swap flows via NATS alert (type: "swap") + Daemon HTTP to Gateway.
+/// This constant is retained for type-signature compatibility; no active subscribers.
+#[deprecated(note = "ADR-001: Model-swap flows via NATS + HTTP, not Zenoh")]
 pub const MODEL_SWAP: &str = "sentinel/meta/model-swap";
 
 /// Topic for eBPF agent health metrics.
@@ -68,6 +76,9 @@ pub const EBPF_IO_PROFILE: &str = "sentinel/ebpf/io-profile";
 
 /// Topic for eBPF network monitoring metrics.
 pub const EBPF_NETWORK: &str = "sentinel/ebpf/network";
+
+/// Topic for eBPF PSI (Pressure Stall Information) metrics.
+pub const EBPF_PSI: &str = "sentinel/ebpf/psi";
 
 /// Topic for eBPF monitoring mode status.
 pub const EBPF_STATUS: &str = "sentinel/ebpf/status";
@@ -133,6 +144,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_constants() {
         assert_eq!(CHAOS_EVENT, "sentinel/chaos/event");
         assert_eq!(JUDGE_ALERT, "sentinel/judge/alert");
@@ -146,6 +158,7 @@ mod tests {
         assert_eq!(EBPF_AGENT_HEALTH, "sentinel/ebpf/agent-health");
         assert_eq!(EBPF_IO_PROFILE, "sentinel/ebpf/io-profile");
         assert_eq!(EBPF_NETWORK, "sentinel/ebpf/network");
+        assert_eq!(EBPF_PSI, "sentinel/ebpf/psi");
         assert_eq!(EBPF_STATUS, "sentinel/ebpf/status");
     }
 

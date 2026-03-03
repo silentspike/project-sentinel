@@ -211,9 +211,27 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	snap := ph.config.Get()
 
 	// --- Step 2: Provider bestimmen (Runtime-switchable via Control Plane) ---
-	provider, providerName := ph.resolveProvider(snap.PrimaryProvider)
+	// Per-Agent override check: daemon sends agent_id (numeric) or agent_name
+	resolvedProviderName := snap.PrimaryProvider
+	if agentID := req.Metadata["agent_id"]; agentID != "" {
+		// Convert numeric agent_id (e.g. "8") to AGENT-XX format for override lookup
+		if n, err := strconv.Atoi(agentID); err == nil {
+			canonicalID := fmt.Sprintf("AGENT-%02d", n)
+			if override, ok := snap.AgentOverrides[canonicalID]; ok {
+				resolvedProviderName = override
+				ph.logger.Info("per-agent provider override active", "agent", canonicalID, "provider", override)
+			}
+		}
+	}
+	if agentName := req.Metadata["agent_name"]; agentName != "" {
+		if override, ok := snap.AgentOverrides[agentName]; ok {
+			resolvedProviderName = override
+			ph.logger.Info("per-agent provider override active", "agent", agentName, "provider", override)
+		}
+	}
+	provider, providerName := ph.resolveProvider(resolvedProviderName)
 	if provider == nil {
-		ph.logger.Error("no provider available", "requested", snap.PrimaryProvider)
+		ph.logger.Error("no provider available", "requested", resolvedProviderName)
 		http.Error(w, "no provider available", http.StatusServiceUnavailable)
 		return
 	}

@@ -107,8 +107,11 @@ func main() {
 	// Create HTTP handler
 	httpHandler := api.NewHandler(batchHandler, logger)
 
+	// Create shared eBPF state store (ADR-001: daemon bridges eBPF→NATS)
+	ebpfStore := service.NewEBPFStore()
+
 	// Create streaming consumer (NATS realtime heuristic)
-	streamConsumer := service.NewStreamConsumer(js, cfg, evol, alert, logger)
+	streamConsumer := service.NewStreamConsumer(js, cfg, evol, alert, ebpfStore, logger)
 
 	// Load agent personality profiles for drift detection
 	if cfg.Agents.ConfigDir != "" {
@@ -154,9 +157,24 @@ func main() {
 		}
 	}()
 
+	// Start eBPF consumer if enabled (ADR-001)
+	if cfg.EBPF.Enabled {
+		ebpfConsumer := service.NewEBPFConsumer(js, cfg, ebpfStore, logger)
+		go func() {
+			if err := ebpfConsumer.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("ebpf consumer failed", "error", err)
+			}
+		}()
+		logger.Info("ebpf consumer enabled",
+			"consumer", cfg.EBPF.ConsumerName,
+			"stall_threshold_ms", cfg.EBPF.StallThresholdMs,
+		)
+	}
+
 	logger.Info("sentinel-judge ready",
 		"http", fmt.Sprintf(":%d", cfg.Server.Port),
 		"nats_consumer", cfg.NATS.ConsumerName,
+		"ebpf_enabled", cfg.EBPF.Enabled,
 	)
 
 	// Wait for shutdown signal
