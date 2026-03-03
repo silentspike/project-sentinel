@@ -199,6 +199,20 @@ export function updateAgents(agents) {
       }
     }
 
+    // Differential update: stall indicator
+    const wasStalled = card.classList.contains('agent-stalled');
+    if (agent.stalled && !wasStalled) {
+      card.classList.add('agent-stalled');
+      var stallEl = document.createElement('div');
+      stallEl.className = 'stall-indicator';
+      stallEl.textContent = 'Stalled';
+      card.appendChild(stallEl);
+    } else if (!agent.stalled && wasStalled) {
+      card.classList.remove('agent-stalled');
+      var stallInd = card.querySelector('.stall-indicator');
+      if (stallInd) stallInd.remove();
+    }
+
     // Differential update: last_action
     const actionEl = card.querySelector('.last-action');
     if (actionEl) {

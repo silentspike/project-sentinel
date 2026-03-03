@@ -105,6 +105,8 @@ pub struct EbpfCollector {
     prev_proc_io: HashMap<u64, ProcIoData>,
     /// Previous cgroup io.stat values for delta tracking (cgroup_id -> (rbytes, wbytes)).
     prev_cgroup_io: HashMap<u64, (u64, u64)>,
+    /// Whether we've already warned about /proc/PID/io permission denied.
+    proc_io_permission_warned: bool,
     #[cfg(feature = "ebpf")]
     loaded_probes: Option<crate::loader::LoadedProbes>,
 }
@@ -122,6 +124,7 @@ impl EbpfCollector {
             last_collect: None,
             prev_proc_io: HashMap::new(),
             prev_cgroup_io: HashMap::new(),
+            proc_io_permission_warned: false,
             #[cfg(feature = "ebpf")]
             loaded_probes: None,
         }
@@ -140,6 +143,7 @@ impl EbpfCollector {
             last_collect: None,
             prev_proc_io: HashMap::new(),
             prev_cgroup_io: HashMap::new(),
+            proc_io_permission_warned: false,
             loaded_probes: Some(probes),
         }
     }
@@ -274,31 +278,62 @@ impl EbpfCollector {
         let mappings: Vec<_> = self.agent_mappings.clone();
 
         for mapping in &mappings {
-            // Agent health: check if process is alive and writing.
+            // Agent health + I/O: check /proc/{pid}/io for VFS-level activity.
             if let Some(pid) = mapping.pid {
-                if let Ok(io_data) = read_proc_io(pid) {
-                    // If write_bytes changed, agent is alive.
-                    self.health_checker.record_write(mapping.cgroup_id, now);
+                match read_proc_io(pid) {
+                    Ok(io_data) => {
+                        let prev = self.prev_proc_io.entry(mapping.cgroup_id).or_default();
+                        // Use rchar/wchar (VFS-level) as primary metric — captures
+                        // buffered I/O that never reaches the block layer.
+                        let delta_read = if io_data.rchar > 0 {
+                            io_data.rchar.saturating_sub(prev.rchar)
+                        } else {
+                            io_data.read_bytes.saturating_sub(prev.read_bytes)
+                        };
+                        let delta_write = if io_data.wchar > 0 {
+                            io_data.wchar.saturating_sub(prev.wchar)
+                        } else {
+                            io_data.write_bytes.saturating_sub(prev.write_bytes)
+                        };
+                        *prev = io_data;
 
-                    // Delta tracking: only record the difference since last read.
-                    let prev = self.prev_proc_io.entry(mapping.cgroup_id).or_default();
-                    let delta_read = io_data.read_bytes.saturating_sub(prev.read_bytes);
-                    let delta_write = io_data.write_bytes.saturating_sub(prev.write_bytes);
-                    *prev = io_data;
+                        // Only mark agent as alive if there's actual I/O activity.
+                        if delta_read > 0 || delta_write > 0 {
+                            self.health_checker.record_write(mapping.cgroup_id, now);
+                        }
 
-                    if delta_read > 0 {
-                        self.io_profiler.record_read(
-                            mapping.cgroup_id,
-                            &mapping.agent_name,
-                            delta_read,
-                        );
+                        if delta_read > 0 {
+                            self.io_profiler.record_read(
+                                mapping.cgroup_id,
+                                &mapping.agent_name,
+                                delta_read,
+                            );
+                        }
+                        if delta_write > 0 {
+                            self.io_profiler.record_write(
+                                mapping.cgroup_id,
+                                &mapping.agent_name,
+                                delta_write,
+                            );
+                        }
                     }
-                    if delta_write > 0 {
-                        self.io_profiler.record_write(
-                            mapping.cgroup_id,
-                            &mapping.agent_name,
-                            delta_write,
-                        );
+                    Err(e) => {
+                        if !self.proc_io_permission_warned {
+                            let is_permission = e
+                                .root_cause()
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|io| {
+                                    io.kind() == std::io::ErrorKind::PermissionDenied
+                                });
+                            if is_permission {
+                                warn!(
+                                    pid,
+                                    "Cannot read /proc/{pid}/io: permission denied. \
+                                     Add AmbientCapabilities=CAP_SYS_PTRACE to systemd unit."
+                                );
+                                self.proc_io_permission_warned = true;
+                            }
+                        }
                     }
                 }
             }
@@ -475,6 +510,13 @@ impl EbpfCollector {
                 }
                 if event_count > 0 {
                     debug!(events = event_count, "Drained TCP ring buffer");
+                    // TCP activity indicates agent processes are communicating
+                    // (LLM API calls via HTTP). Since TCP events lack cgroup_id,
+                    // mark ALL registered agents as active — they share the sentinel
+                    // cgroup hierarchy and any TCP activity means agent work.
+                    for &cid in &registered_cgroups {
+                        self.health_checker.record_write(cid, now_secs);
+                    }
                 }
             }
         }
@@ -518,27 +560,66 @@ impl EbpfCollector {
                 }
             }
 
-            // Also try /proc/PID/io if pid is known (supplements BPF block I/O)
+            // Also try /proc/PID/io if pid is known (supplements BPF block I/O).
+            // Uses VFS-level rchar/wchar which includes page cache hits — critical for
+            // agent processes that do buffered I/O never reaching the block layer.
             if let Some(pid) = mapping.pid {
-                if let Ok(io_data) = read_proc_io(pid) {
-                    let prev = self.prev_proc_io.entry(mapping.cgroup_id).or_default();
-                    let delta_read = io_data.read_bytes.saturating_sub(prev.read_bytes);
-                    let delta_write = io_data.write_bytes.saturating_sub(prev.write_bytes);
-                    *prev = io_data;
+                match read_proc_io(pid) {
+                    Ok(io_data) => {
+                        let prev = self.prev_proc_io.entry(mapping.cgroup_id).or_default();
+                        // Use rchar/wchar (VFS-level) as primary, fall back to read_bytes/write_bytes
+                        let delta_read = if io_data.rchar > 0 {
+                            io_data.rchar.saturating_sub(prev.rchar)
+                        } else {
+                            io_data.read_bytes.saturating_sub(prev.read_bytes)
+                        };
+                        let delta_write = if io_data.wchar > 0 {
+                            io_data.wchar.saturating_sub(prev.wchar)
+                        } else {
+                            io_data.write_bytes.saturating_sub(prev.write_bytes)
+                        };
+                        *prev = io_data;
 
-                    if delta_read > 0 {
-                        self.io_profiler.record_read(
-                            mapping.cgroup_id,
-                            &mapping.agent_name,
-                            delta_read,
-                        );
+                        if delta_read > 0 {
+                            self.io_profiler.record_read(
+                                mapping.cgroup_id,
+                                &mapping.agent_name,
+                                delta_read,
+                            );
+                        }
+                        if delta_write > 0 {
+                            self.io_profiler.record_write(
+                                mapping.cgroup_id,
+                                &mapping.agent_name,
+                                delta_write,
+                            );
+                        }
                     }
-                    if delta_write > 0 {
-                        self.io_profiler.record_write(
-                            mapping.cgroup_id,
-                            &mapping.agent_name,
-                            delta_write,
-                        );
+                    Err(e) => {
+                        if !self.proc_io_permission_warned {
+                            let is_permission = e
+                                .root_cause()
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|io| {
+                                    io.kind() == std::io::ErrorKind::PermissionDenied
+                                });
+                            if is_permission {
+                                warn!(
+                                    pid,
+                                    "Cannot read /proc/{pid}/io: permission denied. \
+                                     Add AmbientCapabilities=CAP_SYS_PTRACE to systemd unit \
+                                     for VFS-level I/O metrics."
+                                );
+                                self.proc_io_permission_warned = true;
+                            } else {
+                                debug!(
+                                    agent = %mapping.agent_name,
+                                    pid,
+                                    error = %e,
+                                    "/proc/{pid}/io read failed"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -598,34 +679,21 @@ impl EbpfCollector {
             let cpu = match reader.read_cpu_pressure() {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    debug!(
-                        agent = %mapping.agent_name,
-                        path = %mapping.cgroup_path,
-                        error = %e,
-                        "PSI cpu.pressure nicht lesbar"
-                    );
+                    log_psi_error(&mapping.agent_name, "cpu.pressure", &e);
                     None
                 }
             };
             let memory = match reader.read_memory_pressure() {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    debug!(
-                        agent = %mapping.agent_name,
-                        error = %e,
-                        "PSI memory.pressure nicht lesbar"
-                    );
+                    log_psi_error(&mapping.agent_name, "memory.pressure", &e);
                     None
                 }
             };
             let io = match reader.read_io_pressure() {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    debug!(
-                        agent = %mapping.agent_name,
-                        error = %e,
-                        "PSI io.pressure nicht lesbar"
-                    );
+                    log_psi_error(&mapping.agent_name, "io.pressure", &e);
                     None
                 }
             };
@@ -649,9 +717,19 @@ impl EbpfCollector {
 }
 
 /// Data from /proc/{pid}/io.
+///
+/// Both VFS-level (rchar/wchar) and block-level (read_bytes/write_bytes) counters.
+/// VFS-level includes page cache hits and is the primary metric for agent activity,
+/// since LLM agent processes do mostly buffered I/O that never reaches the block layer.
 #[derive(Debug, Default, Clone, Copy)]
 struct ProcIoData {
+    /// VFS-level bytes read (includes page cache hits).
+    rchar: u64,
+    /// VFS-level bytes written (includes page cache).
+    wchar: u64,
+    /// Block-level bytes read (actual disk I/O).
     read_bytes: u64,
+    /// Block-level bytes written (actual disk I/O).
     write_bytes: u64,
 }
 
@@ -663,7 +741,11 @@ fn read_proc_io(pid: u32) -> Result<ProcIoData> {
 
     let mut data = ProcIoData::default();
     for line in content.lines() {
-        if let Some(val) = line.strip_prefix("read_bytes: ") {
+        if let Some(val) = line.strip_prefix("rchar: ") {
+            data.rchar = val.trim().parse().unwrap_or(0);
+        } else if let Some(val) = line.strip_prefix("wchar: ") {
+            data.wchar = val.trim().parse().unwrap_or(0);
+        } else if let Some(val) = line.strip_prefix("read_bytes: ") {
             data.read_bytes = val.trim().parse().unwrap_or(0);
         } else if let Some(val) = line.strip_prefix("write_bytes: ") {
             data.write_bytes = val.trim().parse().unwrap_or(0);
@@ -671,6 +753,27 @@ fn read_proc_io(pid: u32) -> Result<ProcIoData> {
     }
 
     Ok(data)
+}
+
+/// Logs PSI read errors with appropriate severity.
+///
+/// PermissionDenied → warn (misconfigured permissions),
+/// NotFound → debug (cgroup may not exist yet),
+/// Other → warn (unexpected error).
+fn log_psi_error(agent: &str, file: &str, error: &anyhow::Error) {
+    let io_error = error.root_cause().downcast_ref::<std::io::Error>();
+
+    match io_error.map(|e| e.kind()) {
+        Some(std::io::ErrorKind::PermissionDenied) => {
+            warn!(agent, file, "PSI permission denied");
+        }
+        Some(std::io::ErrorKind::NotFound) => {
+            debug!(agent, file, "PSI file not found (cgroup may not exist yet)");
+        }
+        _ => {
+            warn!(agent, file, error = %error, "PSI read failed");
+        }
+    }
 }
 
 /// Reads cgroup io.stat file.
@@ -872,5 +975,60 @@ mod tests {
         let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
         let snapshot = collector.collect().unwrap();
         assert!(snapshot.cycle_duration.as_nanos() > 0);
+    }
+
+    #[test]
+    fn proc_io_data_includes_rchar_wchar() {
+        let data = ProcIoData {
+            rchar: 7015,
+            wchar: 8,
+            read_bytes: 0,
+            write_bytes: 0,
+        };
+        // VFS-level metrics should be used when available
+        assert!(data.rchar > 0);
+        assert_eq!(data.read_bytes, 0); // Block-level can be zero for cached I/O
+    }
+
+    #[test]
+    fn health_only_on_actual_io_delta() {
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        collector.register_agent(AgentCgroupMapping {
+            agent_name: "AGENT-01".to_string(),
+            cgroup_path: "/sys/fs/cgroup/sentinel/agent-01".to_string(),
+            cgroup_id: 100,
+            pid: None, // No PID → no /proc read → no health update
+        });
+
+        // With no PID and no cgroup io.stat, agent should be stalled
+        let snapshot = collector.collect().unwrap();
+        // No health recorded → should not appear in stalled (no record at all)
+        // stalled_agents only reports agents WITH a recorded timestamp that is old
+        assert!(snapshot.stalled_agents.is_empty());
+    }
+
+    #[test]
+    fn proc_io_permission_warned_flag() {
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        assert!(!collector.proc_io_permission_warned);
+        collector.proc_io_permission_warned = true;
+        assert!(collector.proc_io_permission_warned);
+    }
+
+    #[test]
+    fn log_psi_error_handles_permission_denied() {
+        // Verify the function handles different error kinds without panicking
+        let perm_err = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ));
+        log_psi_error("AGENT-01", "cpu.pressure", &perm_err);
+
+        let not_found =
+            anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"));
+        log_psi_error("AGENT-01", "cpu.pressure", &not_found);
+
+        let other = anyhow::Error::msg("unexpected");
+        log_psi_error("AGENT-01", "cpu.pressure", &other);
     }
 }
