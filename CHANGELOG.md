@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **GOLF Framework — Goal-Oriented Life Tasks** (#141)
+  - `golf.rs`: Goal struct, GoalType (Career/Project/Social/Skill), GoalStatus enums
+  - `store.rs`: GOALS redb table (5th table), CRUD methods (store/load/append/update/list)
+  - `service.rs`: Goal-CRUD facade on HippocampusService (create, append, update_progress, get, get_active, list)
+  - `orchestrator.rs`: Default-Goals created at agent spawn based on role (CEO→Career+Project, Dev→Project+Skill, HR→Social+Career, Designer→Skill+Project)
+  - `default_goals_for_role()`: Role-based goal initialization (initial + shift-change spawn)
+  - 29 new unit tests (13 golf, 9 store, 7 service)
+  - Issue #141 ACs corrected: redb instead of SQLite, log/test-based verification
+
 - **Judge-Daemon Zenoh/NATS Integration** (#140)
   - **ADR-001:** NATS-First Communication for Go Services documented
   - **eBPF→NATS Bridge:** Daemon publishes eBPF metrics on NATS subjects
