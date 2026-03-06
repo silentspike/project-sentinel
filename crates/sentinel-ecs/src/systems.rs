@@ -828,8 +828,8 @@ pub fn encounter_system(
 ) {
     let tick = time.tick.0;
 
-    // Nur alle 10 Ticks pruefen (reduziert O(n^2) Kosten)
-    if tick == 0 || !tick.is_multiple_of(10) {
+    // Alle 3 Ticks pruefen (typisch n<5 in Transit, O(n^2) bei max 105 Paaren ist guenstig)
+    if tick == 0 || !tick.is_multiple_of(3) {
         return;
     }
 
