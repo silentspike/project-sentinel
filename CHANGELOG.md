@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **PSI-basierte adaptive Tick-Rate** (#147)
+  - `adaptive_tick.rs`: Neues Modul `AdaptiveTickRate` — liest `/proc/pressure/{cpu,memory,io}` und moduliert Tick-Rate dynamisch (TOGAF Adaptive Scheduling)
+  - CPU avg10 > 85% → Tick-Rate × 0.5 (halbe Frequenz), Memory avg10 > 80% → Agent-Spawn blockiert, IO avg10 > 70% → Batching 500ms
+  - `config.rs`: `AdaptiveConfig` mit 6 konfigurierbaren Schwellwerten unter `[daemon.adaptive]`
+  - `orchestrator.rs`: Statisches `sleep(tick_rate)` ersetzt durch adaptive Rate mit PSI-basierter Modulation
+  - `ebpf.rs`: Prometheus-Endpoint (:9090) exportiert nun auch `sentinel_tick_duration_ms`, `sentinel_tick_rate_effective_ms`, `sentinel_psi_{cpu,mem,io}_avg10`
+  - `metrics.ts`: Dashboard API exponiert Tick-Dauer und PSI-Werte via `/api/metrics` und `/api/metrics/tick`
+  - `metrics.js`: 4 neue Dashboard-Karten (Tick Duration, Effective Rate, PSI CPU, PSI IO)
+  - `daemon.toml`: `[daemon.adaptive]` Konfigurationssektion mit TOGAF-konformen Schwellwerten
+  - 15 neue Unit Tests (13 adaptive_tick + 2 config), 77 Daemon Tests gesamt
+  - Graceful Fallback auf statische Rate wenn PSI nicht verfuegbar
+
 - **Dashboard Control Plane Write-Path** (#146)
   - `control.ts`: Proxy-Routen zu Cortex Gateway :8081 (GET/PATCH config, POST provider, POST/DELETE agent-provider, POST pause/resume, GET status)
   - `events.ts`: Durchsuchbare Event-Historie mit Typ/Agent/Since-Filter, Pagination, Typ-Auflistung

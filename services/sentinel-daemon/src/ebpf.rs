@@ -156,7 +156,25 @@ pub async fn ebpf_publisher(
         snapshot_count += 1;
 
         // 1. Prometheus Text rendern + speichern
-        let text = MetricsExporter::export_snapshot(&snapshot);
+        let mut text = MetricsExporter::export_snapshot(&snapshot);
+
+        // Global MetricsRegistry Gauges anhaengen (Tick-Dauer, PSI, etc.)
+        // Explizit alle Daemon-Gauges rendern (inkl. Nullwerte, damit Dashboard sie findet).
+        {
+            use std::fmt::Write;
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            for name in &[
+                "sentinel_tick_duration_ms",
+                "sentinel_tick_rate_effective_ms",
+                "sentinel_psi_cpu_avg10",
+                "sentinel_psi_mem_avg10",
+                "sentinel_psi_io_avg10",
+            ] {
+                let g = reg.gauge(name);
+                let _ = writeln!(text, "{} {}", name, g.get());
+            }
+        }
+
         match metrics_text.write() {
             Ok(mut guard) => *guard = text,
             Err(e) => {

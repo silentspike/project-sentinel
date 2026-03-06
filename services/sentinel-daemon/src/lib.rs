@@ -4,6 +4,7 @@
 //! Daemon zusammenfuegt. Dedicated `std::thread` fuer ECS Tick Loop,
 //! `tokio::Runtime` fuer async I/O (Zenoh, Limbo).
 
+pub mod adaptive_tick;
 pub mod config;
 pub mod controlplane;
 pub mod ebpf;
