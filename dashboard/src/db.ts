@@ -20,6 +20,10 @@ export function setDatabases(proj: Database, es: Database): void {
   eventStoreDb = es;
 }
 
+export function getEventStoreDb(): Database {
+  return eventStoreDb;
+}
+
 export function closeDatabases(): void {
   projectionDb?.close();
   eventStoreDb?.close();

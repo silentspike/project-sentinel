@@ -6,6 +6,7 @@ import { renderMetrics } from './metrics.js';
 import { renderCockpit, updateCockpit } from './cockpit.js';
 import { renderChaos, updateChaos } from './chaos.js';
 import { renderChat, initChat } from './chat.js';
+import { initControl } from './control.js';
 
 let ws = null;
 
@@ -103,6 +104,9 @@ async function init() {
 
     // Chat async laden (eigener Fetch)
     initChat();
+
+    // Control Panel async laden
+    initControl();
 
     // Initiales Lag laden
     try {
