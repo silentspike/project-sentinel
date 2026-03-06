@@ -6,5 +6,14 @@ time_scale = 1.0
 max_agents = 30
 zenoh_prefix = "sentinel"
 
+# PSI-basierte adaptive Tick-Rate (TOGAF Adaptive Scheduling)
+[daemon.adaptive]
+enabled = true
+cpu_threshold = 85.0     # PSI avg10 % → Tick-Rate × 0.5
+mem_threshold = 80.0     # PSI avg10 % → Agent-Spawn blockiert
+io_threshold = 70.0      # PSI avg10 % → Batching 500ms
+min_tick_rate_ms = 2000  # Floor: nie langsamer als 0.5 Hz
+psi_sample_interval = 10 # Alle N Ticks PSI lesen
+
 [daemon.nats]
 url = "nats://127.0.0.1:4222"
