@@ -68,18 +68,35 @@ impl wasmtime_wasi::WasiView for PluginState {
     }
 }
 
+/// Resolves a plugin-provided path safely within agent_home.
+///
+/// Rejects absolute paths and `..` components to prevent directory traversal.
+fn safe_resolve(agent_home: &std::path::Path, path: &str) -> Result<PathBuf, String> {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        return Err(format!("absolute path not allowed: '{}'", path));
+    }
+    for component in p.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(format!("path traversal not allowed: '{}'", path));
+        }
+    }
+    Ok(agent_home.join(p))
+}
+
 /// Host-API implementation: bridges ECS world-state to WASM plugins.
 ///
 /// Each function maps a WIT host-api call to operations on `PluginState`.
-/// FS operations use the agent's home directory.
+/// FS operations use the agent's home directory. Paths are sandboxed:
+/// absolute paths and `..` traversal are rejected.
 impl sentinel::plugin::host_api::Host for PluginState {
     fn fs_read(&mut self, path: String) -> Result<Vec<u8>, String> {
-        let full_path = self.agent_home.join(&path);
+        let full_path = safe_resolve(&self.agent_home, &path)?;
         std::fs::read(&full_path).map_err(|e| format!("fs-read '{}': {}", path, e))
     }
 
     fn fs_write(&mut self, path: String, data: Vec<u8>) -> Result<u64, String> {
-        let full_path = self.agent_home.join(&path);
+        let full_path = safe_resolve(&self.agent_home, &path)?;
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("fs-write mkdir '{}': {}", path, e))?;
@@ -90,7 +107,7 @@ impl sentinel::plugin::host_api::Host for PluginState {
     }
 
     fn fs_list(&mut self, path: String) -> Result<Vec<String>, String> {
-        let full_path = self.agent_home.join(&path);
+        let full_path = safe_resolve(&self.agent_home, &path)?;
         let entries = std::fs::read_dir(&full_path)
             .map_err(|e| format!("fs-list '{}': {}", path, e))?;
         let mut names = Vec::new();
@@ -277,5 +294,52 @@ mod tests {
         state.log(sentinel::plugin::types::LogLevel::Info, "info msg".to_string());
         state.log(sentinel::plugin::types::LogLevel::Warn, "warn msg".to_string());
         state.log(sentinel::plugin::types::LogLevel::Error, "error msg".to_string());
+    }
+
+    #[test]
+    fn host_fs_write_creates_subdirectories() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_state(dir.path().to_path_buf());
+        let result = state.fs_write("sub/dir/file.txt".to_string(), b"nested".to_vec());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 6);
+        let read_back = state.fs_read("sub/dir/file.txt".to_string());
+        assert_eq!(read_back.unwrap(), b"nested");
+    }
+
+    #[test]
+    fn host_fs_absolute_path_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_state(dir.path().to_path_buf());
+        let result = state.fs_read("/etc/passwd".to_string());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("absolute path not allowed"));
+    }
+
+    #[test]
+    fn host_fs_traversal_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_state(dir.path().to_path_buf());
+        let result = state.fs_read("../../../etc/passwd".to_string());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("path traversal not allowed"));
+    }
+
+    #[test]
+    fn host_fs_write_absolute_path_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_state(dir.path().to_path_buf());
+        let result = state.fs_write("/tmp/evil.txt".to_string(), b"hack".to_vec());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("absolute path not allowed"));
+    }
+
+    #[test]
+    fn host_fs_list_traversal_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_state(dir.path().to_path_buf());
+        let result = state.fs_list("../../".to_string());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("path traversal not allowed"));
     }
 }

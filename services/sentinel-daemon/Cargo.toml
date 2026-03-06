@@ -43,11 +43,12 @@ async-nats = { workspace = true, optional = true }
 futures = { version = "0.3", optional = true }
 
 [features]
-default = ["llm", "ebpf", "nats"]
+default = ["llm", "ebpf", "nats", "wasm"]
 telemetry = ["sentinel-telemetry/telemetry"]
 llm = ["reqwest"]
 ebpf = ["sentinel-ebpf/ebpf"]
 nats = ["async-nats", "futures", "reqwest"]
+wasm = ["sentinel-wasm/wasm", "sentinel-ecs/wasm"]
 
 [dev-dependencies]
 tempfile = "3"
