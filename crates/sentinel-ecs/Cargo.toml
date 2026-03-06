@@ -5,6 +5,10 @@ edition = "2021"
 license = "MIT"
 publish = false
 
+[features]
+default = []
+wasm = ["sentinel-wasm/wasm"]
+
 [dependencies]
 bevy_ecs = { workspace = true }
 serde = { workspace = true }
