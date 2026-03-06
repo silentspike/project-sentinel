@@ -15,8 +15,8 @@
 
 use super::components::*;
 use super::world::{
-    ActionReceiver, EventBuffer, LimboEventStore, PersistTelemetry, RedbStateStore,
-    ToolRuntimeResource,
+    ActionReceiver, EventBuffer, LimboEventStore, PersistTelemetry, PsiMetrics, RedbStateStore,
+    RoomDistanceMap, ToolRuntimeResource,
 };
 use super::world::{PerceptionSender, SimulationTime};
 use bevy_ecs::prelude::*;
@@ -52,6 +52,7 @@ pub enum SimulationPhase {
 pub fn input_system(
     receiver: Option<Res<ActionReceiver>>,
     tool_runtime: Option<Res<ToolRuntimeResource>>,
+    room_distances: Option<Res<RoomDistanceMap>>,
     mut query: Query<(
         &AgentIdentity,
         &mut Position,
@@ -83,7 +84,14 @@ pub fn input_system(
                     if let Some(target_room) = &action.target_room {
                         let from_room = position.room_id.clone();
                         let to_room = format!("ROOM-{}", target_room.0);
-                        let duration_ms: u32 = 3000;
+                        // Distance-basierte Transit-Dauer: 1500ms Basis + 800ms pro Hop
+                        // Clamp auf 2000-5000ms (TRANSIT_MIN/MAX aus sentinel-physics)
+                        let hops = room_distances
+                            .as_ref()
+                            .map(|rd| rd.distance(&from_room, &to_room))
+                            .unwrap_or(2);
+                        let raw_ms = 1500 + hops * 800;
+                        let duration_ms: u32 = raw_ms.clamp(2000, 5000);
                         position.in_transit = true;
                         position.transit_target = Some(to_room.clone());
                         position.transit_remaining_ms = duration_ms;
@@ -237,6 +245,7 @@ pub fn bio_system(
         &Mood,
     )>,
     time: Res<SimulationTime>,
+    psi: Option<Res<PsiMetrics>>,
     mut event_buffer: ResMut<EventBuffer>,
 ) {
     let tick = time.tick.0;
@@ -249,6 +258,11 @@ pub fn bio_system(
             time.delta_seconds,
             time.sim_hour,
         );
+
+        // PSI→Bio Integration: Hardware-Druck wird zu Agent-Stress/Comfort
+        if let Some(ref psi) = psi {
+            sentinel_bio::apply_psi_stress(&mut bio, psi.cpu_avg10, psi.mem_avg10);
+        }
 
         // Auto-Coffee: Agent trinkt Kaffee bei moderater Muedigkeit
         // Threshold: energy<70 (realistisch — Menschen trinken Kaffee bevor sie erschoepft sind)
@@ -803,7 +817,101 @@ pub fn output_system(
     }
 }
 
-/// 9. Persistiert Zustand: Events nach Limbo, Snapshots nach redb (BATCHED).
+/// 10. Erkennt Flurbegegnungen zwischen Agents die gleichzeitig in Transit sind.
+///
+/// Paarweise Pruefung aller in-transit Agents (splitmix64-basierte Zufallsentscheidung,
+/// 30% Wahrscheinlichkeit). Laeuft alle 10 Ticks um Event-Flut zu vermeiden.
+pub fn encounter_system(
+    query: Query<(&AgentIdentity, &Position)>,
+    time: Res<SimulationTime>,
+    mut event_buffer: ResMut<EventBuffer>,
+) {
+    let tick = time.tick.0;
+
+    // Nur alle 10 Ticks pruefen (reduziert O(n^2) Kosten)
+    if tick == 0 || !tick.is_multiple_of(10) {
+        return;
+    }
+
+    // Sammle alle in-transit Agents
+    let in_transit: Vec<_> = query
+        .iter()
+        .filter(|(_, pos)| pos.in_transit)
+        .map(|(id, _)| id.agent_id)
+        .collect();
+
+    // Paarweise Encounter-Check (O(n^2/2), typisch n<5 in Transit)
+    for i in 0..in_transit.len() {
+        for j in (i + 1)..in_transit.len() {
+            // splitmix64 deterministische RNG basierend auf Tick + Agent-IDs
+            let seed = tick
+                .wrapping_mul(31)
+                .wrapping_add(in_transit[i].0 as u64 * 97)
+                .wrapping_add(in_transit[j].0 as u64 * 53);
+            let mut x = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            x ^= x >> 31;
+            let rng = (x % 10000) as f32 / 10000.0;
+
+            if sentinel_physics::transit::check_hallway_encounter(true, true, rng) {
+                let payload = DomainEventPayload::HallwayEncounterDetected {
+                    agent_a: in_transit[i],
+                    agent_b: in_transit[j],
+                    location: "flur".to_string(),
+                };
+                let event = DomainEvent::new(
+                    payload.event_type_str(),
+                    &format!("{}-{}", in_transit[i], in_transit[j]),
+                    &payload.to_json(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    tick,
+                );
+                event_buffer.events.push(event);
+            }
+        }
+    }
+}
+
+/// 11. Generiert und verwaltet Geruchsereignisse in Raeumen.
+///
+/// Erzeugt SmellEvents bei Bio-Aktionen (drink_coffee → Coffee-Smell in aktuellem Raum).
+/// Laeuft alle 20 Ticks synchron mit BioStateUpdated-Snapshots.
+pub fn smell_system(
+    query: Query<(&AgentIdentity, &Position, &BioState)>,
+    time: Res<SimulationTime>,
+    mut event_buffer: ResMut<EventBuffer>,
+) {
+    let tick = time.tick.0;
+
+    // Kaffee-Geruch erzeugen wenn Auto-Coffee getriggert hat (gleicher Tick-Modulo wie bio_system)
+    if tick == 0 || !tick.is_multiple_of(180) {
+        return;
+    }
+
+    for (_identity, position, bio) in &query {
+        // Wenn Agent gerade Kaffee getrunken hat (caffeine > 90 = frisch getrunken)
+        // UND im passenden Raum ist (nicht in Transit)
+        if bio.caffeine_mg > 90.0 && !position.in_transit {
+            let payload = DomainEventPayload::SmellEventTriggered {
+                room_id: position.room_id.clone(),
+                smell_type: "coffee".to_string(),
+                intensity: 0.8,
+                duration_ticks: 120, // 2 Minuten bei 1Hz
+            };
+            let event = DomainEvent::new(
+                payload.event_type_str(),
+                &position.room_id,
+                &payload.to_json(),
+                &uuid::Uuid::new_v4().to_string(),
+                tick,
+            );
+            event_buffer.events.push(event);
+        }
+    }
+}
+
+/// 12. Persistiert Zustand: Events nach Limbo, Snapshots nach redb (BATCHED).
 ///
 /// Zwei Schreib-Pfade (Dual-Write):
 /// 1. Events aus EventBuffer → Limbo Event Store (append-only + Outbox)

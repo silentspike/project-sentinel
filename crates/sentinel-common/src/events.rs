@@ -209,6 +209,19 @@ pub enum DomainEventPayload {
         score: f64,
         details: String,
     },
+    /// Zwei Agents begegnen sich im Flur waehrend Transit
+    HallwayEncounterDetected {
+        agent_a: AgentId,
+        agent_b: AgentId,
+        location: String,
+    },
+    /// Geruchsereignis in einem Raum (Coffee, Food, etc.)
+    SmellEventTriggered {
+        room_id: String,
+        smell_type: String,
+        intensity: f32,
+        duration_ticks: u64,
+    },
 }
 
 impl DomainEventPayload {
@@ -237,6 +250,8 @@ impl DomainEventPayload {
             Self::AgentConsolidated { .. } => "agent_consolidated",
             Self::AgentConsolidationFailed { .. } => "agent_consolidation_failed",
             Self::JudgeAlertReceived { .. } => "judge_alert_received",
+            Self::HallwayEncounterDetected { .. } => "hallway_encounter_detected",
+            Self::SmellEventTriggered { .. } => "smell_event_triggered",
         }
     }
 }
