@@ -174,7 +174,8 @@ impl HippocampusService {
         progress: f64,
         tick: u64,
     ) -> anyhow::Result<bool> {
-        self.store.update_goal_progress(agent, goal_id, progress, tick)
+        self.store
+            .update_goal_progress(agent, goal_id, progress, tick)
     }
 
     /// Load all goals for an agent.
@@ -371,7 +372,14 @@ mod tests {
         let (service, _dir) = temp_service();
         let goals = vec![
             Goal::new(1, "Thomas", GoalType::Career, "Befoerderung", 0, None),
-            Goal::new(2, "Thomas", GoalType::Project, "Feature liefern", 0, Some(5000)),
+            Goal::new(
+                2,
+                "Thomas",
+                GoalType::Project,
+                "Feature liefern",
+                0,
+                Some(5000),
+            ),
         ];
         service.create_goals("Thomas", &goals).unwrap();
 
@@ -411,7 +419,14 @@ mod tests {
         service
             .create_goals(
                 "Lisa",
-                &[Goal::new(1, "Lisa", GoalType::Skill, "Rust lernen", 0, None)],
+                &[Goal::new(
+                    1,
+                    "Lisa",
+                    GoalType::Skill,
+                    "Rust lernen",
+                    0,
+                    None,
+                )],
             )
             .unwrap();
 
@@ -432,11 +447,20 @@ mod tests {
         service
             .create_goals(
                 "Thomas",
-                &[Goal::new(1, "Thomas", GoalType::Project, "Feature X", 0, None)],
+                &[Goal::new(
+                    1,
+                    "Thomas",
+                    GoalType::Project,
+                    "Feature X",
+                    0,
+                    None,
+                )],
             )
             .unwrap();
 
-        service.update_goal_progress("Thomas", 1, 1.0, 1000).unwrap();
+        service
+            .update_goal_progress("Thomas", 1, 1.0, 1000)
+            .unwrap();
 
         let goals = service.get_goals("Thomas").unwrap();
         assert_eq!(goals[0].status, GoalStatus::Completed);
