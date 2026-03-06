@@ -31,9 +31,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `services/sentinel-daemon/src/orchestrator.rs`: `extract_swap_provider()` setzte Fallback auf "claude" (API) statt "claude-code" (Subscription) — alle Agent-Overrides zeigten auf nicht-registrierten Provider → 502
   - Match-Reihenfolge korrigiert: "claude-code" vor "claude" (laengster Match zuerst)
 
-- **Evolution LLM-Calls schlagen bei Schichtwechsel-Last fehl** (#138)
-  - `services/sentinel-daemon/src/orchestrator.rs`: `llm_evolution_call()` Retry-Logik mit Exponential Backoff (2s, 4s, 8s) bei 5xx/429 — Schichtwechsel mit 15 Agents erzeugt Gateway-Lastspitzen die ohne Retry zu voice_style=false fuehren
-
 - **Bio-Engine Dynamics flach** (#148)
   - `sentinel-bio/src/lib.rs`: Stress-Berechnung mit Traegheit (Exponential Smoothing: Anstieg alpha=0.3, Abfall alpha=0.1) + Baseline-Arbeitsstress der ueber den Tag akkumuliert (max 25)
   - `sentinel-ecs/src/systems.rs`: Auto-Coffee Threshold von energy<50 auf energy<70 gesenkt, Frequenz von 300 auf 180 Ticks erhoehen — Agents trinken nun realistisch Kaffee am Vormittag
