@@ -130,6 +130,102 @@ metricRoutes.get("/ebpf/metrics", async (c) => {
   }
 });
 
+// ── Pipeline Metrics — Latenz + Tokens + Requests aus Cortex :8080 ──
+
+const CORTEX_PROXY_URL =
+  process.env.CORTEX_PROXY_URL || "http://localhost:8080";
+
+interface PipelineProvider {
+  provider: string;
+  latency_avg_s: number;
+  latency_count: number;
+  requests_ok: number;
+  requests_error: number;
+  tokens_input: number;
+  tokens_output: number;
+}
+
+metricRoutes.get("/metrics/pipeline", async (c) => {
+  try {
+    const resp = await fetch(`${CORTEX_PROXY_URL}/metrics`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!resp.ok) {
+      return c.json({ available: false });
+    }
+    const text = await resp.text();
+
+    // Collect providers from latency histogram
+    const providers = new Map<string, PipelineProvider>();
+
+    const ensureProvider = (name: string): PipelineProvider => {
+      if (!providers.has(name)) {
+        providers.set(name, {
+          provider: name,
+          latency_avg_s: 0,
+          latency_count: 0,
+          requests_ok: 0,
+          requests_error: 0,
+          tokens_input: 0,
+          tokens_output: 0,
+        });
+      }
+      return providers.get(name)!;
+    };
+
+    // Parse latency: sentinel_pipeline_latency_seconds_sum{provider="X"} N
+    let m: RegExpExecArray | null;
+    const sumRe =
+      /sentinel_pipeline_latency_seconds_sum\{provider="([^"]+)"\}\s+([\d.e+-]+)/g;
+    const countRe =
+      /sentinel_pipeline_latency_seconds_count\{provider="([^"]+)"\}\s+(\d+)/g;
+
+    while ((m = sumRe.exec(text)) !== null) {
+      const p = ensureProvider(m[1]);
+      p.latency_avg_s = parseFloat(m[2]);
+    }
+    while ((m = countRe.exec(text)) !== null) {
+      const p = ensureProvider(m[1]);
+      const count = parseInt(m[2], 10);
+      if (count > 0) {
+        p.latency_avg_s = p.latency_avg_s / count;
+      }
+      p.latency_count = count;
+    }
+
+    // Parse requests: sentinel_pipeline_requests_total{provider="X",status="ok|error"} N
+    const reqRe =
+      /sentinel_pipeline_requests_total\{provider="([^"]+)",status="([^"]+)"\}\s+(\d+)/g;
+    while ((m = reqRe.exec(text)) !== null) {
+      const p = ensureProvider(m[1]);
+      if (m[2] === "ok") {
+        p.requests_ok = parseInt(m[3], 10);
+      } else {
+        p.requests_error = parseInt(m[3], 10);
+      }
+    }
+
+    // Parse tokens: sentinel_pipeline_tokens_total{direction="input|output",provider="X"} N
+    const tokRe =
+      /sentinel_pipeline_tokens_total\{direction="([^"]+)",provider="([^"]+)"\}\s+(\d+)/g;
+    while ((m = tokRe.exec(text)) !== null) {
+      const p = ensureProvider(m[2]);
+      if (m[1] === "input") {
+        p.tokens_input = parseInt(m[3], 10);
+      } else {
+        p.tokens_output = parseInt(m[3], 10);
+      }
+    }
+
+    return c.json({
+      available: true,
+      providers: Array.from(providers.values()),
+    });
+  } catch {
+    return c.json({ available: false, providers: [] });
+  }
+});
+
 metricRoutes.get("/health", (c) => {
   let lag = 0;
   try {

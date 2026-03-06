@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dashboard Control Plane Write-Path** (#146)
+  - `control.ts`: Proxy-Routen zu Cortex Gateway :8081 (GET/PATCH config, POST provider, POST/DELETE agent-provider, POST pause/resume, GET status)
+  - `events.ts`: Durchsuchbare Event-Historie mit Typ/Agent/Since-Filter, Pagination, Typ-Auflistung
+  - `metrics.ts`: Neuer `/api/metrics/pipeline` Endpoint — Pipeline-Latenz, Request-Counts, Token-Usage pro Provider aus Cortex Prometheus
+  - `auth.ts`: Bearer Token Middleware fuer Write-Endpoints (SENTINEL_DASHBOARD_API_KEY)
+  - `control.js`: Eigener "Control"-Tab mit 6 Sektionen (Quick Actions, Provider, LLM Params, Pipeline Hardening, Guardrails Status, Live Config)
+  - `index.html`: Control-Tab Navigation und View-Section
+  - 16 neue Unit Tests (control + events), 41 Dashboard Tests gesamt
+
 - **Pipeline Hardening: Personality Guard, Quality Gate, Narrative Nudge** (#144)
   - `pipeline.go`: Post-response `personalityGuardCheck()` — DriftDetector on LLM response, re-gen on critical drift
   - `pipeline.go`: Post-response `qualityGateCheck()` — QualityScorer (1-5), re-gen on score <= threshold
