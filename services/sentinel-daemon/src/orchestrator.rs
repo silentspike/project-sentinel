@@ -805,6 +805,37 @@ fn ecs_tick_loop(
         sentinel_ecs::apply_capabilities(&mut world, entity, &agent_cfg.capabilities);
     }
 
+    // GOLF: Default-Goals fuer alle gespawnten Agents erstellen
+    for agent_cfg in &shift_agents {
+        let existing = episode_producer
+            .hippocampus()
+            .get_goals(&agent_cfg.identity.name)
+            .unwrap_or_default();
+        if existing.is_empty() {
+            let goals = sentinel_hippocampus::default_goals_for_role(
+                &agent_cfg.identity.name,
+                &agent_cfg.identity.role,
+                0, // initial tick
+            );
+            if let Err(e) = episode_producer
+                .hippocampus()
+                .create_goals(&agent_cfg.identity.name, &goals)
+            {
+                warn!(
+                    agent = %agent_cfg.identity.name,
+                    error = %e,
+                    "GOLF: Default-Goals konnten nicht erstellt werden"
+                );
+            } else {
+                info!(
+                    agent = %agent_cfg.identity.name,
+                    goal_count = goals.len(),
+                    "GOLF: Default-Goals erstellt"
+                );
+            }
+        }
+    }
+
     // EventBuffer leeren: ECS spawn_agent emittiert eigene Events, aber der
     // RuntimeOrchestrator ist SSOT fuer Lifecycle-Events (vermeidet Duplikate)
     if let Some(mut event_buffer) = world.get_resource_mut::<EventBuffer>() {
@@ -1015,6 +1046,34 @@ fn ecs_tick_loop(
                         &mut agent_processes,
                         &agent_command,
                     ) {
+                        // GOLF: Default-Goals fuer neuen Schicht-Agent erstellen
+                        let existing = episode_producer
+                            .hippocampus()
+                            .get_goals(&agent_cfg.identity.name)
+                            .unwrap_or_default();
+                        if existing.is_empty() {
+                            let goals = sentinel_hippocampus::default_goals_for_role(
+                                &agent_cfg.identity.name,
+                                &agent_cfg.identity.role,
+                                tick_count,
+                            );
+                            if let Err(e) = episode_producer
+                                .hippocampus()
+                                .create_goals(&agent_cfg.identity.name, &goals)
+                            {
+                                warn!(
+                                    agent = %agent_cfg.identity.name,
+                                    error = %e,
+                                    "GOLF: Default-Goals konnten nicht erstellt werden"
+                                );
+                            } else {
+                                info!(
+                                    agent = %agent_cfg.identity.name,
+                                    goal_count = goals.len(),
+                                    "GOLF: Default-Goals erstellt"
+                                );
+                            }
+                        }
                         spawned_count += 1;
                     }
                 }

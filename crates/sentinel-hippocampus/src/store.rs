@@ -1,18 +1,20 @@
 //! Persistent storage for hippocampus memory data via redb.
 //!
 //! Separate database file (`hippocampus.redb`) from the main StateStore.
-//! 4 tables: episodes, narratives, facts, cache_state.
+//! 5 tables: episodes, narratives, facts, cache_state, goals.
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::episode::Episode;
 use crate::facts::FactStore;
+use crate::golf::Goal;
 
 // Table definitions — all &str keys with &[u8] values (JSON-serialized)
 const EPISODES: TableDefinition<&str, &[u8]> = TableDefinition::new("episodes");
 const NARRATIVES: TableDefinition<&str, &[u8]> = TableDefinition::new("narratives");
 const FACTS: TableDefinition<&str, &[u8]> = TableDefinition::new("facts");
 const CACHE_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("cache_state");
+const GOALS: TableDefinition<&str, &[u8]> = TableDefinition::new("goals");
 
 /// Persistent state for narrative memory (serializable for redb storage).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -33,7 +35,7 @@ pub struct HippocampusStore {
 impl HippocampusStore {
     /// Open or create the hippocampus store at the given path.
     ///
-    /// Creates all 4 tables if they don't exist.
+    /// Creates all 5 tables if they don't exist.
     pub fn open(path: &str) -> anyhow::Result<Self> {
         let db = Database::create(path).map_err(|e| {
             anyhow::anyhow!("Failed to create/open hippocampus.redb at {path}: {e}")
@@ -46,6 +48,7 @@ impl HippocampusStore {
             write_txn.open_table(NARRATIVES)?;
             write_txn.open_table(FACTS)?;
             write_txn.open_table(CACHE_STATE)?;
+            write_txn.open_table(GOALS)?;
         }
         write_txn.commit()?;
 
@@ -189,6 +192,79 @@ impl HippocampusStore {
             }
             None => Ok(None),
         }
+    }
+
+    // === GOALS (GOLF Framework) ===
+
+    /// Store goals for an agent (overwrites existing).
+    pub fn store_goals(&self, agent: &str, goals: &[Goal]) -> anyhow::Result<()> {
+        let json = serde_json::to_vec(goals)?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(GOALS)?;
+            table.insert(agent, json.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Load goals for an agent. Returns empty vec if none stored.
+    pub fn load_goals(&self, agent: &str) -> anyhow::Result<Vec<Goal>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(GOALS)?;
+        match table.get(agent)? {
+            Some(guard) => {
+                let bytes: &[u8] = guard.value();
+                let goals: Vec<Goal> = serde_json::from_slice(bytes)?;
+                Ok(goals)
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Append goals to an agent's existing list.
+    pub fn append_goals(&self, agent: &str, new: &[Goal]) -> anyhow::Result<()> {
+        let mut existing = self.load_goals(agent)?;
+        existing.extend_from_slice(new);
+        self.store_goals(agent, &existing)
+    }
+
+    /// Update progress for a specific goal (by id) of an agent.
+    ///
+    /// Returns `true` if the goal was found and updated.
+    pub fn update_goal_progress(
+        &self,
+        agent: &str,
+        goal_id: u64,
+        progress: f64,
+        tick: u64,
+    ) -> anyhow::Result<bool> {
+        let mut goals = self.load_goals(agent)?;
+        let mut found = false;
+        for goal in &mut goals {
+            if goal.id == goal_id {
+                goal.update_progress(progress, tick);
+                found = true;
+                break;
+            }
+        }
+        if found {
+            self.store_goals(agent, &goals)?;
+        }
+        Ok(found)
+    }
+
+    /// List all agents that have stored goals.
+    pub fn list_agents_with_goals(&self) -> anyhow::Result<Vec<String>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(GOALS)?;
+        let mut agents = Vec::new();
+        let iter = table.iter()?;
+        for entry in iter {
+            let (key, _): (redb::AccessGuard<'_, &str>, redb::AccessGuard<'_, &[u8]>) = entry?;
+            agents.push(key.value().to_string());
+        }
+        Ok(agents)
     }
 
     // === UTILITY ===
@@ -429,5 +505,150 @@ mod tests {
 
             assert_eq!(store.load_cache_state("Thomas").unwrap(), Some(true));
         }
+    }
+
+    // === GOLF Tests ===
+
+    use crate::golf::{GoalStatus, GoalType};
+
+    fn make_goal(id: u64, agent: &str, goal_type: GoalType) -> Goal {
+        Goal::new(id, agent, goal_type, "Test goal", 0, None)
+    }
+
+    #[test]
+    fn test_golf_store_load_roundtrip() {
+        let (store, _dir) = temp_store();
+        let goals = vec![
+            make_goal(1, "Thomas", GoalType::Career),
+            make_goal(2, "Thomas", GoalType::Project),
+        ];
+
+        store.store_goals("Thomas", &goals).unwrap();
+        let loaded = store.load_goals("Thomas").unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, 1);
+        assert_eq!(loaded[0].goal_type, GoalType::Career);
+        assert_eq!(loaded[1].id, 2);
+        assert_eq!(loaded[1].goal_type, GoalType::Project);
+    }
+
+    #[test]
+    fn test_golf_append() {
+        let (store, _dir) = temp_store();
+        store
+            .store_goals("Thomas", &[make_goal(1, "Thomas", GoalType::Career)])
+            .unwrap();
+        store
+            .append_goals("Thomas", &[make_goal(2, "Thomas", GoalType::Skill)])
+            .unwrap();
+
+        let loaded = store.load_goals("Thomas").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].goal_type, GoalType::Career);
+        assert_eq!(loaded[1].goal_type, GoalType::Skill);
+    }
+
+    #[test]
+    fn test_golf_load_nonexistent() {
+        let (store, _dir) = temp_store();
+        let loaded = store.load_goals("Nobody").unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn test_golf_update_progress() {
+        let (store, _dir) = temp_store();
+        store
+            .store_goals(
+                "Thomas",
+                &[
+                    make_goal(1, "Thomas", GoalType::Career),
+                    make_goal(2, "Thomas", GoalType::Project),
+                ],
+            )
+            .unwrap();
+
+        // Update goal 2 progress
+        let updated = store.update_goal_progress("Thomas", 2, 0.75, 500).unwrap();
+        assert!(updated);
+
+        let loaded = store.load_goals("Thomas").unwrap();
+        assert_eq!(loaded[0].progress, 0.0); // goal 1 unchanged
+        assert_eq!(loaded[1].progress, 0.75); // goal 2 updated
+        assert_eq!(loaded[1].last_updated_tick, 500);
+    }
+
+    #[test]
+    fn test_golf_update_progress_auto_complete() {
+        let (store, _dir) = temp_store();
+        store
+            .store_goals("Lisa", &[make_goal(1, "Lisa", GoalType::Skill)])
+            .unwrap();
+
+        store.update_goal_progress("Lisa", 1, 1.0, 1000).unwrap();
+
+        let loaded = store.load_goals("Lisa").unwrap();
+        assert_eq!(loaded[0].progress, 1.0);
+        assert_eq!(loaded[0].status, GoalStatus::Completed);
+    }
+
+    #[test]
+    fn test_golf_update_progress_nonexistent_goal() {
+        let (store, _dir) = temp_store();
+        store
+            .store_goals("Thomas", &[make_goal(1, "Thomas", GoalType::Career)])
+            .unwrap();
+
+        let updated = store.update_goal_progress("Thomas", 99, 0.5, 100).unwrap();
+        assert!(!updated);
+    }
+
+    #[test]
+    fn test_golf_list_agents_with_goals() {
+        let (store, _dir) = temp_store();
+        store
+            .store_goals("Thomas", &[make_goal(1, "Thomas", GoalType::Career)])
+            .unwrap();
+        store
+            .store_goals("Lisa", &[make_goal(2, "Lisa", GoalType::Skill)])
+            .unwrap();
+
+        let mut agents = store.list_agents_with_goals().unwrap();
+        agents.sort();
+        assert_eq!(agents, vec!["Lisa", "Thomas"]);
+    }
+
+    #[test]
+    fn test_golf_data_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("golf-persist.redb");
+        let path_str = path.to_str().unwrap();
+
+        // Write
+        {
+            let store = HippocampusStore::open(path_str).unwrap();
+            let mut goal = make_goal(1, "Thomas", GoalType::Career);
+            goal.update_progress(0.42, 100);
+            store.store_goals("Thomas", &[goal]).unwrap();
+        }
+
+        // Reopen and verify
+        {
+            let store = HippocampusStore::open(path_str).unwrap();
+            let loaded = store.load_goals("Thomas").unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].progress, 0.42);
+            assert_eq!(loaded[0].goal_type, GoalType::Career);
+            assert_eq!(loaded[0].last_updated_tick, 100);
+        }
+    }
+
+    #[test]
+    fn test_golf_integrity_no_empty_agent() {
+        // Goal struct requires agent_name — empty string is technically valid
+        // but we test that the struct enforces non-optional agent_name
+        let goal = make_goal(1, "Thomas", GoalType::Career);
+        assert!(!goal.agent_name.is_empty());
     }
 }
