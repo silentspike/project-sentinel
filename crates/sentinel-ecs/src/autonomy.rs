@@ -163,6 +163,24 @@ pub fn autonomy_system(
                 );
                 cooldown.last_action_tick = tick;
             }
+            continue;
+        }
+
+        // Kein P0-Notfall aktiv → zurueck zum Arbeitsraum wenn in Utility-Raum
+        // (Toilette, Kueche, Flur). Verhindert dass Agents nach Notfall stecken bleiben.
+        if is_utility_room(&position.room_id) {
+            let home_room = default_work_room(&identity.role, identity.agent_id.0);
+            if position.room_id != home_room {
+                start_transit(
+                    identity,
+                    &mut position,
+                    &home_room,
+                    &correlation_id,
+                    tick,
+                    &mut event_buffer,
+                );
+                cooldown.last_action_tick = tick;
+            }
         }
     }
 }
@@ -235,6 +253,38 @@ fn nearest_toilet(current_room: &str, agent_id: u32) -> String {
         format!("toilette-og-{}", gender_suffix)
     } else {
         format!("toilette-eg-{}", gender_suffix)
+    }
+}
+
+/// Prueft ob ein Raum ein Utility-Raum ist (Toilette, Kueche, Flur).
+/// Agents sollen nach P0-Notfaellen nicht in diesen Raeumen verweilen.
+fn is_utility_room(room_id: &str) -> bool {
+    room_id.starts_with("toilette")
+        || room_id.starts_with("flur")
+        || room_id == "kueche"
+        || room_id == "empfang"
+}
+
+/// Bestimmt den Standard-Arbeitsraum eines Agents basierend auf Rolle und ID.
+/// Deterministisch: gleiche Inputs → gleicher Raum.
+fn default_work_room(role: &str, agent_id: u16) -> String {
+    let role_lower = role.to_lowercase();
+    if role_lower.contains("ceo") || role_lower.contains("geschaeft") {
+        "buero-ceo".to_string()
+    } else if role_lower.contains("design") {
+        // Design-Agents: auf buero-design-1 und buero-design-2 verteilen
+        if agent_id.is_multiple_of(2) {
+            "buero-design-1".to_string()
+        } else {
+            "buero-design-2".to_string()
+        }
+    } else {
+        // Dev und alle anderen: auf buero-dev-1 und buero-dev-2 verteilen
+        if agent_id.is_multiple_of(2) {
+            "buero-dev-1".to_string()
+        } else {
+            "buero-dev-2".to_string()
+        }
     }
 }
 
@@ -372,5 +422,82 @@ mod tests {
             !bio_events.is_empty(),
             "BioActionPerformed Event sollte erzeugt werden"
         );
+    }
+
+    #[test]
+    fn test_return_to_work_from_toilet() {
+        let (mut world, _) = create_simulation_world();
+        let entity = spawn_agent(&mut world, AgentId(1), "Test", "Dev", 1);
+        world.entity_mut(entity).insert(AutonomyCooldown::default());
+
+        // Agent auf Toilette, KEIN P0-Notfall (bladder=10, hunger=20, energy=80, stress=0)
+        world.get_mut::<Position>(entity).unwrap().room_id = "toilette-eg-herren".to_string();
+        world.get_mut::<BioState>(entity).unwrap().bladder = 10.0;
+        world.get_mut::<BioState>(entity).unwrap().hunger = 20.0;
+
+        let mut schedule = bevy_ecs::schedule::Schedule::default();
+        schedule.add_systems(autonomy_system);
+
+        world.resource_mut::<SimulationTime>().tick = Tick(31);
+        schedule.run(&mut world);
+
+        // Agent sollte Transit zum Arbeitsraum starten
+        let pos = world.get::<Position>(entity).unwrap();
+        assert!(
+            pos.in_transit,
+            "Agent sollte nach P0-Abschluss zum Arbeitsraum zurueckkehren"
+        );
+        assert!(
+            pos.transit_target.as_ref().unwrap().starts_with("buero-"),
+            "Ziel sollte ein Buero sein, got: {:?}",
+            pos.transit_target
+        );
+    }
+
+    #[test]
+    fn test_no_return_during_p0() {
+        let (mut world, _) = create_simulation_world();
+        let entity = spawn_agent(&mut world, AgentId(1), "Test", "Dev", 1);
+        world.entity_mut(entity).insert(AutonomyCooldown::default());
+
+        // Agent auf Toilette MIT P0-Notfall (bladder=95)
+        world.get_mut::<Position>(entity).unwrap().room_id = "toilette-eg-herren".to_string();
+        world.get_mut::<BioState>(entity).unwrap().bladder = 95.0;
+
+        let mut schedule = bevy_ecs::schedule::Schedule::default();
+        schedule.add_systems(autonomy_system);
+
+        world.resource_mut::<SimulationTime>().tick = Tick(31);
+        schedule.run(&mut world);
+
+        // P0 hat Prioritaet: Agent bleibt (use_bathroom wird ausgefuehrt)
+        let bio = world.get::<BioState>(entity).unwrap();
+        assert!(
+            bio.bladder < 30.0,
+            "P0 sollte use_bathroom ausfuehren: bladder={}",
+            bio.bladder
+        );
+    }
+
+    #[test]
+    fn test_is_utility_room() {
+        assert!(is_utility_room("toilette-eg-herren"));
+        assert!(is_utility_room("toilette-og-damen"));
+        assert!(is_utility_room("kueche"));
+        assert!(is_utility_room("flur-eg"));
+        assert!(is_utility_room("empfang"));
+        assert!(!is_utility_room("buero-dev-1"));
+        assert!(!is_utility_room("buero-ceo"));
+        assert!(!is_utility_room("meetingraum-01"));
+    }
+
+    #[test]
+    fn test_default_work_room() {
+        assert_eq!(default_work_room("CEO", 1), "buero-ceo");
+        assert_eq!(default_work_room("Design", 2), "buero-design-1");
+        assert_eq!(default_work_room("Design", 3), "buero-design-2");
+        assert_eq!(default_work_room("Dev", 2), "buero-dev-1");
+        assert_eq!(default_work_room("Dev", 3), "buero-dev-2");
+        assert_eq!(default_work_room("HR", 1), "buero-dev-2"); // Default
     }
 }
