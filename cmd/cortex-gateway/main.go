@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -187,7 +188,7 @@ func main() {
 	// 6. HTTP proxy server
 	proxyMux := http.NewServeMux()
 	proxyMux.Handle("POST /v1/chat/completions", pipelineHandler)
-	proxyMux.HandleFunc("GET /health", handleHealth)
+	proxyMux.HandleFunc("GET /health", handleHealth(pipelineHandler))
 	proxyMux.HandleFunc("GET /ready", handleReady)
 	proxyMux.Handle("GET /metrics", promhttp.Handler())
 
@@ -259,9 +260,22 @@ func main() {
 	logger.Info("cortex-gateway stopped")
 }
 
-func handleHealth(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`, version)
+func handleHealth(pipeline *proxy.PipelineHandler) http.HandlerFunc {
+	type healthResponse struct {
+		Status          string            `json:"status"`
+		Version         string            `json:"version"`
+		CircuitBreakers map[string]string `json:"circuit_breakers"`
+	}
+
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		resp := healthResponse{
+			Status:          "ok",
+			Version:         version,
+			CircuitBreakers: pipeline.BreakerStates(),
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}
 }
 
 func handleReady(w http.ResponseWriter, _ *http.Request) {
