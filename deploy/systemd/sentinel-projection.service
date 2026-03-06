@@ -3,6 +3,8 @@ Description=Sentinel Projection Worker — CQRS Read-Model Service
 Documentation=https://github.com/obtFusi/project-sentinel/issues/53
 After=sentinel-daemon.service
 Requires=sentinel-daemon.service
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple

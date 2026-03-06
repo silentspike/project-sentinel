@@ -3,6 +3,8 @@ Description=Sentinel Cortex Gateway — LLM Pipeline Proxy
 Documentation=https://github.com/obtFusi/project-sentinel/issues/28
 After=sentinel-daemon.service
 Requires=sentinel-daemon.service
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
