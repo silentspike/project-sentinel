@@ -747,12 +747,16 @@ mod tests {
         assert!(store.get_agent_facts(agent(1)).unwrap().is_none());
 
         // Write
-        store.set_agent_facts(agent(1), b"[\"Projekt Aurora: Redesign\"]").unwrap();
+        store
+            .set_agent_facts(agent(1), b"[\"Projekt Aurora: Redesign\"]")
+            .unwrap();
         let data = store.get_agent_facts(agent(1)).unwrap().unwrap();
         assert_eq!(data, b"[\"Projekt Aurora: Redesign\"]");
 
         // Overwrite
-        store.set_agent_facts(agent(1), b"[\"Budget: 150k\"]").unwrap();
+        store
+            .set_agent_facts(agent(1), b"[\"Budget: 150k\"]")
+            .unwrap();
         let data = store.get_agent_facts(agent(1)).unwrap().unwrap();
         assert_eq!(data, b"[\"Budget: 150k\"]");
     }

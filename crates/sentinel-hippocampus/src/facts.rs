@@ -259,10 +259,8 @@ mod tests {
         let mut store = test_store();
         store.insert("facts/custom/server", "Server: 10 VMs im Cluster");
 
-        let retriever = FactRetriever::with_triggers(
-            store,
-            &[("Serverraum", "facts/custom/server")],
-        );
+        let retriever =
+            FactRetriever::with_triggers(store, &[("Serverraum", "facts/custom/server")]);
 
         let facts = retriever.check_triggers("Wartung im Serverraum geplant");
         assert_eq!(facts.len(), 1);
@@ -295,10 +293,7 @@ mod tests {
         let mut store = test_store();
         store.insert("facts/custom/meeting", "Meeting: Raum 3, 14 Uhr");
 
-        let retriever = FactRetriever::with_triggers(
-            store,
-            &[("Standup", "facts/custom/meeting")],
-        );
+        let retriever = FactRetriever::with_triggers(store, &[("Standup", "facts/custom/meeting")]);
 
         // Context hits both a default ("Sprint") and custom ("Standup") trigger
         let facts = retriever.check_triggers("Sprint Standup morgen frueh");
