@@ -4,7 +4,7 @@
 //! Projektabschluss). Goals werden in einer dedizierten redb-Tabelle
 //! persistiert und ueberleben Schichtwechsel und Daemon-Neustarts.
 //!
-//! TOGAF Reference: Memory Tier "Goal Memory" (GOLF Framework [25]).
+//! TOGAF Reference: Memory Tier "Goal Memory" (GOLF Framework \[25\]).
 
 use std::fmt;
 
