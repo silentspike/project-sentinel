@@ -124,6 +124,12 @@ solltest = "solltest"
 kannst = "kannst"
 stehst = "stehst"
 
+# Pipeline Hardening words (Issue #144 - German in Go string literals)
+Charakter = "Charakter"
+Persoenlichkeitsprofil = "Persoenlichkeitsprofil"
+antworte = "antworte"
+staerker = "staerker"
+
 # Sprint 3 fourth-wall + control plane words (German in Go string literals)
 tust = "tust"
 Toleranz = "Toleranz"
