@@ -145,6 +145,57 @@ pub struct LimboEventStore(pub Arc<EventStore>);
 #[derive(Resource)]
 pub struct ToolRuntimeResource(pub sentinel_wasm::ToolRuntime);
 
+/// Vorberechnete Raum-Distanzen fuer Transit-Dauer und Smell-Propagation.
+///
+/// Wird einmal beim Start aus rooms.toml geladen.
+/// Key: (from_room, to_room), Value: hop_count
+#[derive(Resource, Default, Clone)]
+pub struct RoomDistanceMap {
+    distances: std::collections::HashMap<(String, String), u32>,
+}
+
+impl RoomDistanceMap {
+    /// Erstellt die Distance-Map aus einer BuildingConfig (BFS fuer alle Paare).
+    pub fn from_building_config(config: &sentinel_common::room::BuildingConfig) -> Self {
+        let mut distances = std::collections::HashMap::new();
+        for room in &config.rooms {
+            for other in &config.rooms {
+                if let Some(dist) = config.shortest_distance(&room.id, &other.id) {
+                    distances.insert((room.id.clone(), other.id.clone()), dist);
+                }
+            }
+        }
+        Self { distances }
+    }
+
+    /// Gibt die Distanz zwischen zwei Raeumen zurueck (0 = selber Raum).
+    pub fn distance(&self, from: &str, to: &str) -> u32 {
+        self.distances
+            .get(&(from.to_string(), to.to_string()))
+            .copied()
+            .unwrap_or(2) // Fallback: 2 Hops (mittlere Distanz)
+    }
+
+    /// Gibt alle Raeume zurueck die max `max_hops` entfernt sind.
+    pub fn rooms_within(&self, from: &str, max_hops: u32) -> Vec<(&str, u32)> {
+        self.distances
+            .iter()
+            .filter(|((f, _), &d)| f == from && d > 0 && d <= max_hops)
+            .map(|((_, t), &d)| (t.as_str(), d))
+            .collect()
+    }
+}
+
+/// PSI-Metriken als ECS-Resource fuer Bio-Engine Integration.
+///
+/// Wird vom Daemon mit aktuellen cgroup-PSI-Werten befuellt.
+/// Default: 0.0 (kein Druck = kein Bio-Effekt).
+#[derive(Resource, Debug, Clone, Default)]
+pub struct PsiMetrics {
+    pub cpu_avg10: f64,
+    pub mem_avg10: f64,
+}
+
 /// Attach a redb persistence backend to the simulation world.
 pub fn attach_redb_store(world: &mut World, store: StateStore) {
     world.insert_resource(RedbStateStore::new(store));
@@ -192,7 +243,17 @@ pub fn create_simulation_world() -> (World, Schedule) {
     schedule.add_systems(bio_system.in_set(SimulationPhase::Biology));
     schedule.add_systems(physics_system.in_set(SimulationPhase::Physics));
     schedule.add_systems(transit_system.in_set(SimulationPhase::Transit));
+    schedule.add_systems(
+        encounter_system
+            .in_set(SimulationPhase::Transit)
+            .after(transit_system),
+    );
     schedule.add_systems(chaos_system.in_set(SimulationPhase::Chaos));
+    schedule.add_systems(
+        smell_system
+            .in_set(SimulationPhase::Chaos)
+            .after(chaos_system),
+    );
     schedule.add_systems(mood_system.in_set(SimulationPhase::Mood));
     schedule.add_systems(perception_system.in_set(SimulationPhase::Perception));
     schedule.add_systems(super::decision::decision_system.in_set(SimulationPhase::Decision));

@@ -330,6 +330,28 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_ecs = Arc::clone(&shutdown);
 
+    // -- Room Distance Map (BFS-vorberechnet fuer Transit-Dauer + Smell-Propagation) --
+    let rooms_toml_path = config.config_dir.join("rooms.toml");
+    let room_distances = if rooms_toml_path.exists() {
+        match sentinel_common::room::BuildingConfig::load(&rooms_toml_path) {
+            Ok(building_cfg) => {
+                let map = sentinel_ecs::RoomDistanceMap::from_building_config(&building_cfg);
+                info!(
+                    rooms = building_cfg.rooms.len(),
+                    "RoomDistanceMap aus rooms.toml geladen"
+                );
+                map
+            }
+            Err(e) => {
+                warn!(error = %e, "rooms.toml konnte nicht geladen werden — Fallback auf Default-Distanzen");
+                sentinel_ecs::RoomDistanceMap::default()
+            }
+        }
+    } else {
+        warn!("rooms.toml nicht gefunden — Transit-Dauer nutzt Default-Distanzen");
+        sentinel_ecs::RoomDistanceMap::default()
+    };
+
     // Werte fuer den ECS-Thread
     let tick_rate = Duration::from_millis(config.tick_rate_ms);
     let time_scale = config.time_scale;
@@ -364,6 +386,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 episode_producer,
                 agent_command_cfg,
                 adaptive_config,
+                room_distances,
             )
         })
         .context("ECS Thread spawnen")?;
@@ -604,12 +627,18 @@ fn ecs_tick_loop(
     mut episode_producer: EpisodeProducer,
     agent_command_cfg: Vec<String>,
     adaptive_config: crate::adaptive_tick::AdaptiveConfig,
+    room_distances: sentinel_ecs::RoomDistanceMap,
 ) -> Result<u64> {
     // Adaptive Tick-Rate Controller (PSI-basiert, TOGAF Adaptive Scheduling)
     let mut adaptive_tick = AdaptiveTickRate::new(adaptive_config);
 
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
+
+    // Diegetisches HW-Mapping: PSI-Metriken als ECS Resource (bio_system liest diese)
+    world.insert_resource(sentinel_ecs::PsiMetrics::default());
+    // Room-Distanzen fuer Transit-Dauer und Smell-Propagation
+    world.insert_resource(room_distances);
 
     // Stores als Resources einfuegen (Arc<StateStore> direkt verwenden)
     let state_store_for_sim = Arc::clone(&state_store);
@@ -903,10 +932,16 @@ fn ecs_tick_loop(
             time.sim_hour = sim_hour;
         }
 
+        // PSI-Metriken in ECS World injizieren (fuer bio_system → apply_psi_stress)
+        if let Some(mut psi) = world.get_resource_mut::<sentinel_ecs::PsiMetrics>() {
+            psi.cpu_avg10 = adaptive_tick.cpu_avg10();
+            psi.mem_avg10 = adaptive_tick.mem_avg10();
+        }
+
         // RuntimeOrchestrator Tick synchronisieren
         runtime_orch.set_tick(tick_count);
 
-        // ECS Schedule ausfuehren (alle 10 Systems in Reihenfolge)
+        // ECS Schedule ausfuehren (alle 12 Systems in Reihenfolge)
         schedule.run(&mut world);
 
         // Controlplane-Zyklus (alle N Ticks)
@@ -1491,6 +1526,7 @@ mod tests {
             ep,
             vec!["true".to_string()],
             crate::adaptive_tick::AdaptiveConfig::default(),
+            sentinel_ecs::RoomDistanceMap::default(),
         );
 
         assert!(result.is_ok());
@@ -1543,6 +1579,7 @@ mod tests {
             ep,
             vec!["true".to_string()],
             crate::adaptive_tick::AdaptiveConfig::default(),
+            sentinel_ecs::RoomDistanceMap::default(),
         );
 
         assert!(result.is_ok());
@@ -1600,6 +1637,7 @@ mod tests {
             ep,
             vec!["true".to_string()],
             crate::adaptive_tick::AdaptiveConfig::default(),
+            sentinel_ecs::RoomDistanceMap::default(),
         );
 
         assert!(result.is_ok());
