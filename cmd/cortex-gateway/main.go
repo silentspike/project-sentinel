@@ -23,6 +23,7 @@ import (
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/resilience"
 	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/eventstore"
+	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/judge"
 )
 
 // version is set at build time via ldflags.
@@ -157,7 +158,12 @@ func main() {
 	promptCompiler := compiler.NewWithAssembler(tomlLoader, caps)
 	logger.Info("3-source assembly enabled", "agents_dir", agentsDir)
 
-	// 5b. InFlightMap for query lifecycle tracking
+	// 5b. DriftDetector + QualityScorer for Pipeline Hardening (#144)
+	driftDetector := judge.NewDriftDetector()
+	loadAgentProfiles(tomlLoader, driftDetector, agentsDir, logger)
+	qualityScorer := judge.NewQualityScorer(driftDetector)
+
+	// 5c. InFlightMap for query lifecycle tracking
 	inflightMap := resilience.NewInFlightMap(providerDeadline)
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
@@ -183,6 +189,8 @@ func main() {
 		Guardrails:       guardrailsEnforcer,
 		InFlight:         inflightMap,
 		ProviderDeadline: providerDeadline,
+		Drift:            driftDetector,
+		Quality:          qualityScorer,
 	})
 
 	// 6. HTTP proxy server
@@ -288,4 +296,24 @@ func envOrDefault(key, defaultVal string) string {
 		return val
 	}
 	return defaultVal
+}
+
+// loadAgentProfiles reads all agent TOMLs and registers their Big Five profiles
+// with the DriftDetector for personality guard checks.
+func loadAgentProfiles(loader *compiler.TOMLLoader, detector *judge.DriftDetector, agentsDir string, logger *slog.Logger) {
+	loaded := 0
+	for id := 1; id <= 54; id++ {
+		dna, err := loader.Load(id)
+		if err != nil {
+			continue // agent TOML not found, skip
+		}
+		agentName := fmt.Sprintf("AGENT-%02d", id)
+		detector.RegisterProfile(agentName, judge.PersonalityProfile{
+			Role:         dna.Identity.Role,
+			Extraversion: dna.Personality.Extraversion,
+			Neuroticism:  dna.Personality.Neuroticism,
+		})
+		loaded++
+	}
+	logger.Info("agent personality profiles loaded", "count", loaded, "agents_dir", agentsDir)
 }

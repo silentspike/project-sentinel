@@ -28,6 +28,14 @@ type ConfigSnapshot struct {
 	MaxTokens       int               `json:"max_tokens"`
 	RateLimit       float64           `json:"rate_limit_rps"`
 	AgentOverrides  map[string]string `json:"agent_overrides"`
+
+	// Pipeline Hardening (#144)
+	PersonalityGuardEnabled bool    `json:"personality_guard_enabled"`
+	DriftThreshold          float64 `json:"drift_threshold"`
+	QualityGateEnabled      bool    `json:"quality_gate_enabled"`
+	QualityThreshold        int     `json:"quality_threshold"`
+	QualityMaxRegen         int     `json:"quality_max_regen"`
+	NarrativeNudge          string  `json:"narrative_nudge"`
 }
 
 // Config holds the current gateway configuration (mutable at runtime).
@@ -38,6 +46,14 @@ type Config struct {
 	maxTokens       int
 	rateLimit       float64
 	agentOverrides  map[string]string // agent_id -> provider_name
+
+	// Pipeline Hardening (#144)
+	personalityGuardEnabled bool
+	driftThreshold          float64
+	qualityGateEnabled      bool
+	qualityThreshold        int
+	qualityMaxRegen         int
+	narrativeNudge          string
 }
 
 // NewConfig creates a Config with sensible defaults.
@@ -48,6 +64,13 @@ func NewConfig(primaryProvider string) *Config {
 		maxTokens:       4096,
 		rateLimit:       0,
 		agentOverrides:  make(map[string]string),
+
+		personalityGuardEnabled: false,
+		driftThreshold:          0.7,
+		qualityGateEnabled:      false,
+		qualityThreshold:        2,
+		qualityMaxRegen:         1,
+		narrativeNudge:          "",
 	}
 }
 
@@ -88,6 +111,13 @@ func (c *Config) Get() ConfigSnapshot {
 		MaxTokens:       c.maxTokens,
 		RateLimit:       c.rateLimit,
 		AgentOverrides:  overrides,
+
+		PersonalityGuardEnabled: c.personalityGuardEnabled,
+		DriftThreshold:          c.driftThreshold,
+		QualityGateEnabled:      c.qualityGateEnabled,
+		QualityThreshold:        c.qualityThreshold,
+		QualityMaxRegen:         c.qualityMaxRegen,
+		NarrativeNudge:          c.narrativeNudge,
 	}
 }
 
@@ -138,6 +168,57 @@ func (c *Config) Update(updates map[string]interface{}) error {
 				return errors.New("primary_provider must not be empty")
 			}
 			c.primaryProvider = v
+
+		case "personality_guard_enabled":
+			v, ok := val.(bool)
+			if !ok {
+				return fmt.Errorf("personality_guard_enabled must be a boolean, got %T", val)
+			}
+			c.personalityGuardEnabled = v
+
+		case "drift_threshold":
+			v, ok := toFloat64(val)
+			if !ok {
+				return fmt.Errorf("drift_threshold must be a number, got %T", val)
+			}
+			if v < 0.0 || v > 1.0 {
+				return fmt.Errorf("drift_threshold must be between 0.0 and 1.0, got %f", v)
+			}
+			c.driftThreshold = v
+
+		case "quality_gate_enabled":
+			v, ok := val.(bool)
+			if !ok {
+				return fmt.Errorf("quality_gate_enabled must be a boolean, got %T", val)
+			}
+			c.qualityGateEnabled = v
+
+		case "quality_threshold":
+			v, ok := toInt(val)
+			if !ok {
+				return fmt.Errorf("quality_threshold must be an integer, got %T", val)
+			}
+			if v < 1 || v > 5 {
+				return fmt.Errorf("quality_threshold must be between 1 and 5, got %d", v)
+			}
+			c.qualityThreshold = v
+
+		case "quality_max_regen":
+			v, ok := toInt(val)
+			if !ok {
+				return fmt.Errorf("quality_max_regen must be an integer, got %T", val)
+			}
+			if v < 0 || v > 3 {
+				return fmt.Errorf("quality_max_regen must be between 0 and 3, got %d", v)
+			}
+			c.qualityMaxRegen = v
+
+		case "narrative_nudge":
+			v, ok := val.(string)
+			if !ok {
+				return fmt.Errorf("narrative_nudge must be a string, got %T", val)
+			}
+			c.narrativeNudge = v
 
 		default:
 			return fmt.Errorf("unknown config key: %q", key)

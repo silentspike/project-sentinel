@@ -286,3 +286,143 @@ func TestConfig_ConcurrentUpdate(t *testing.T) {
 		t.Errorf("expected temperature 1.0 after concurrent updates, got %f", snapshot.Temperature)
 	}
 }
+
+// TestConfig_Defaults_PipelineHardening verifies hardening defaults (#144).
+func TestConfig_Defaults_PipelineHardening(t *testing.T) {
+	cfg := NewConfig("claude")
+	snap := cfg.Get()
+
+	if snap.PersonalityGuardEnabled {
+		t.Error("personality_guard_enabled should default to false")
+	}
+	if snap.DriftThreshold != 0.7 {
+		t.Errorf("drift_threshold default: want 0.7, got %f", snap.DriftThreshold)
+	}
+	if snap.QualityGateEnabled {
+		t.Error("quality_gate_enabled should default to false")
+	}
+	if snap.QualityThreshold != 2 {
+		t.Errorf("quality_threshold default: want 2, got %d", snap.QualityThreshold)
+	}
+	if snap.QualityMaxRegen != 1 {
+		t.Errorf("quality_max_regen default: want 1, got %d", snap.QualityMaxRegen)
+	}
+	if snap.NarrativeNudge != "" {
+		t.Errorf("narrative_nudge default: want empty, got %q", snap.NarrativeNudge)
+	}
+}
+
+// TestPlane_PatchPersonalityGuard tests PATCH + GET roundtrip for personality guard config.
+func TestPlane_PatchPersonalityGuard(t *testing.T) {
+	cfg := NewConfig("claude")
+	plane := NewPlane(cfg, testLogger())
+	handler := plane.Handler()
+
+	body := `{"personality_guard_enabled": true, "drift_threshold": 0.5}`
+	req := httptest.NewRequest(http.MethodPatch, "/control/config", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH status: want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result ConfigSnapshot
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !result.PersonalityGuardEnabled {
+		t.Error("personality_guard_enabled: want true")
+	}
+	if result.DriftThreshold != 0.5 {
+		t.Errorf("drift_threshold: want 0.5, got %f", result.DriftThreshold)
+	}
+}
+
+// TestPlane_PatchQualityGate tests PATCH + GET roundtrip for quality gate config.
+func TestPlane_PatchQualityGate(t *testing.T) {
+	cfg := NewConfig("claude")
+	plane := NewPlane(cfg, testLogger())
+	handler := plane.Handler()
+
+	body := `{"quality_gate_enabled": true, "quality_threshold": 3.0, "quality_max_regen": 2.0}`
+	req := httptest.NewRequest(http.MethodPatch, "/control/config", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH status: want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result ConfigSnapshot
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !result.QualityGateEnabled {
+		t.Error("quality_gate_enabled: want true")
+	}
+	if result.QualityThreshold != 3 {
+		t.Errorf("quality_threshold: want 3, got %d", result.QualityThreshold)
+	}
+	if result.QualityMaxRegen != 2 {
+		t.Errorf("quality_max_regen: want 2, got %d", result.QualityMaxRegen)
+	}
+}
+
+// TestPlane_PatchNarrativeNudge tests PATCH + GET roundtrip for narrative nudge.
+func TestPlane_PatchNarrativeNudge(t *testing.T) {
+	cfg := NewConfig("claude")
+	plane := NewPlane(cfg, testLogger())
+	handler := plane.Handler()
+
+	body := `{"narrative_nudge": "Fokus heute: Teamwork"}`
+	req := httptest.NewRequest(http.MethodPatch, "/control/config", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH status: want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result ConfigSnapshot
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if result.NarrativeNudge != "Fokus heute: Teamwork" {
+		t.Errorf("narrative_nudge: want %q, got %q", "Fokus heute: Teamwork", result.NarrativeNudge)
+	}
+
+	// Clear nudge
+	body2 := `{"narrative_nudge": ""}`
+	req2 := httptest.NewRequest(http.MethodPatch, "/control/config", strings.NewReader(body2))
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("PATCH clear status: want 200, got %d", rec2.Code)
+	}
+	var result2 ConfigSnapshot
+	_ = json.NewDecoder(rec2.Body).Decode(&result2)
+	if result2.NarrativeNudge != "" {
+		t.Errorf("narrative_nudge after clear: want empty, got %q", result2.NarrativeNudge)
+	}
+}
+
+// TestPlane_PatchDriftThreshold_Invalid tests validation for drift_threshold.
+func TestPlane_PatchDriftThreshold_Invalid(t *testing.T) {
+	cfg := NewConfig("claude")
+	plane := NewPlane(cfg, testLogger())
+	handler := plane.Handler()
+
+	body := `{"drift_threshold": 1.5}`
+	req := httptest.NewRequest(http.MethodPatch, "/control/config", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422 for invalid drift_threshold, got %d", rec.Code)
+	}
+}

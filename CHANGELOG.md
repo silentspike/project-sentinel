@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Pipeline Hardening: Personality Guard, Quality Gate, Narrative Nudge** (#144)
+  - `pipeline.go`: Post-response `personalityGuardCheck()` — DriftDetector on LLM response, re-gen on critical drift
+  - `pipeline.go`: Post-response `qualityGateCheck()` — QualityScorer (1-5), re-gen on score <= threshold
+  - `pipeline.go`: Narrative Nudge injection in `buildSystemPrompt()` via `[NARRATIVE_NUDGE]` tags
+  - `plane.go`: 6 new runtime-switchable config fields (personality_guard_enabled, drift_threshold, quality_gate_enabled, quality_threshold, quality_max_regen, narrative_nudge)
+  - `main.go`: Load 54 agent personality profiles from TOML into DriftDetector at startup
+  - 3 new Prometheus metrics (drift_total, regen_total, score histogram)
+  - All features disabled by default, controllable via `PATCH /control/config`
+  - 12 new Go tests (7 pipeline + 5 control plane)
+
 ### Fixed
 
 - **Health Endpoint zeigt Circuit Breaker State** (#143)

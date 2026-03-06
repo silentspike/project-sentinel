@@ -25,6 +25,7 @@ import (
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/resilience"
 	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/eventstore"
+	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/judge"
 )
 
 // defaultProviderDeadline ist die maximale Wartezeit pro LLM-Call (ENV-konfigurierbar).
@@ -54,6 +55,22 @@ var (
 		Name: "sentinel_breaker_trips_total",
 		Help: "Total circuit breaker trips to open state by provider",
 	}, []string{"provider"})
+
+	personalityGuardDriftTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sentinel_personality_guard_drift_total",
+		Help: "Personality drift events by agent and severity",
+	}, []string{"agent", "severity"})
+
+	qualityGateRegenTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sentinel_quality_gate_regen_total",
+		Help: "Quality gate re-generation attempts by agent",
+	}, []string{"agent"})
+
+	qualityGateScore = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "sentinel_quality_gate_score",
+		Help:    "Quality gate scores by agent",
+		Buckets: []float64{1, 2, 3, 4, 5},
+	}, []string{"agent"})
 )
 
 // PipelineConfig haelt alle Abhaengigkeiten fuer den PipelineHandler.
@@ -70,6 +87,8 @@ type PipelineConfig struct {
 	Guardrails       *guardrails.Enforcer    // optional: nil disables guardrails
 	InFlight         *resilience.InFlightMap // optional: nil disables query tracking
 	ProviderDeadline time.Duration           // 0 = defaultProviderDeadline (20s)
+	Drift            *judge.DriftDetector    // optional: nil disables personality guard
+	Quality          *judge.QualityScorer    // optional: nil disables quality gate
 }
 
 // ProviderDeadlineFromEnv liest die Provider-Deadline aus ENV.
@@ -99,6 +118,8 @@ type PipelineHandler struct {
 	guardrails       *guardrails.Enforcer
 	inflight         *resilience.InFlightMap
 	providerDeadline time.Duration
+	drift            *judge.DriftDetector
+	quality          *judge.QualityScorer
 
 	breakerMu  sync.RWMutex
 	breakers   map[string]*CircuitBreaker
@@ -146,6 +167,8 @@ func NewPipelineHandler(cfg PipelineConfig) *PipelineHandler {
 		guardrails:       cfg.Guardrails,
 		inflight:         cfg.InFlight,
 		providerDeadline: deadline,
+		drift:            cfg.Drift,
+		quality:          cfg.Quality,
 		breakers:         make(map[string]*CircuitBreaker),
 		breakerCfg:       cfg.BreakerCfg,
 	}
@@ -273,7 +296,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	agentRole := req.Metadata["agent_role"]
-	ph.injectPerception(&req, agentName, agentRole, providerName)
+	ph.injectPerception(&req, agentName, agentRole, providerName, snap)
 
 	// --- Step 6: Provider.Send() mit Deadline ---
 	ctx, cancel := context.WithTimeout(r.Context(), ph.providerDeadline)
@@ -321,8 +344,18 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ph.guardrails.Record(providerName, resp.InputTokens, resp.OutputTokens)
 	}
 
-	// --- Step 7: Fourth-Wall Detection ---
+	// --- Step 6d: Personality Guard Check ---
 	content := resp.Content
+	if agentName != "" {
+		content = ph.personalityGuardCheck(ctx, content, agentName, provider, &req, snap)
+	}
+
+	// --- Step 6e: Quality Gate Check ---
+	if agentName != "" {
+		content = ph.qualityGateCheck(ctx, content, agentName, provider, &req, snap)
+	}
+
+	// --- Step 7: Fourth-Wall Detection ---
 	if agentName != "" {
 		content = ph.fourthWallCheck(ctx, content, agentName, agentRole, provider, &req)
 	}
@@ -384,38 +417,46 @@ func (ph *PipelineHandler) resolveAgentProvider(snap control.ConfigSnapshot, met
 }
 
 // buildSystemPrompt assembles the system prompt via 3-source assembly or fallback.
-func (ph *PipelineHandler) buildSystemPrompt(req *LLMRequest, agentName, agentRole, providerName string) string {
+func (ph *PipelineHandler) buildSystemPrompt(req *LLMRequest, agentName, agentRole, providerName string, snap control.ConfigSnapshot) string {
 	perception := req.Metadata["perception"]
 	agentIDStr := req.Metadata["agent_id"]
 	agentID, parseErr := strconv.Atoi(agentIDStr)
 
+	var compiled string
+
 	if parseErr == nil && agentID > 0 {
 		evolution := compiler.EvolutionFromMetadata(req.Metadata)
-		compiled, compileErr := ph.compiler.CompileFromSources(agentID, providerName, evolution, perception)
+		result, compileErr := ph.compiler.CompileFromSources(agentID, providerName, evolution, perception)
 		if compileErr != nil {
 			ph.logger.Warn("3-source assembly failed, using fallback",
 				"agent_id", agentID,
 				"error", compileErr,
 			)
 			modelKey := ph.modelKey(providerName)
-			return ph.compiler.Compile(modelKey, agentName, agentRole, perception)
+			compiled = ph.compiler.Compile(modelKey, agentName, agentRole, perception)
+		} else {
+			if !evolution.IsEmpty() {
+				ph.logger.Info("evolution injected",
+					"agent_id", agentID,
+					"has_voice", evolution.VoiceStyle != "",
+					"has_notes", evolution.BehavioralNotes != "",
+					"has_narrative", evolution.NarrativeSummary != "",
+				)
+			}
+			compiled = result
 		}
-		if !evolution.IsEmpty() {
-			ph.logger.Info("evolution injected",
-				"agent_id", agentID,
-				"has_voice", evolution.VoiceStyle != "",
-				"has_notes", evolution.BehavioralNotes != "",
-				"has_narrative", evolution.NarrativeSummary != "",
-			)
-		}
-		return compiled
+	} else if perception != "" {
+		modelKey := ph.modelKey(providerName)
+		compiled = ph.compiler.Compile(modelKey, agentName, agentRole, perception)
 	}
 
-	if perception != "" {
-		modelKey := ph.modelKey(providerName)
-		return ph.compiler.Compile(modelKey, agentName, agentRole, perception)
+	// Narrative Nudge injection (#144 AC-1)
+	if nudge := snap.NarrativeNudge; nudge != "" && compiled != "" {
+		compiled += "\n\n[NARRATIVE_NUDGE]\n" + nudge + "\n[/NARRATIVE_NUDGE]"
+		ph.logger.Debug("narrative nudge injected", "agent", agentName)
 	}
-	return ""
+
+	return compiled
 }
 
 // applyGuardrails runs rate-limit and budget checks. Returns the (possibly replaced)
@@ -440,11 +481,11 @@ func (ph *PipelineHandler) applyGuardrails(w http.ResponseWriter, req *LLMReques
 }
 
 // injectPerception assembles and prepends the system prompt when an agent name is present.
-func (ph *PipelineHandler) injectPerception(req *LLMRequest, agentName, agentRole, providerName string) {
+func (ph *PipelineHandler) injectPerception(req *LLMRequest, agentName, agentRole, providerName string, snap control.ConfigSnapshot) {
 	if agentName == "" {
 		return
 	}
-	if systemPrompt := ph.buildSystemPrompt(req, agentName, agentRole, providerName); systemPrompt != "" {
+	if systemPrompt := ph.buildSystemPrompt(req, agentName, agentRole, providerName, snap); systemPrompt != "" {
 		req.Messages = prependSystemMessage(req.Messages, systemPrompt)
 	}
 }
@@ -540,6 +581,98 @@ func (ph *PipelineHandler) fourthWallCheck(ctx context.Context, content string, 
 		content = resp.Content
 	}
 	return content
+}
+
+// personalityGuardCheck runs the DriftDetector on the LLM response.
+// Returns the original or re-generated content.
+func (ph *PipelineHandler) personalityGuardCheck(ctx context.Context, content, agentName string, provider Provider, req *LLMRequest, snap control.ConfigSnapshot) string {
+	if ph.drift == nil || !snap.PersonalityGuardEnabled {
+		return content
+	}
+
+	result := ph.drift.CheckDrift(agentName, []string{content})
+	personalityGuardDriftTotal.WithLabelValues(agentName, result.Severity).Inc()
+
+	if result.DriftScore < snap.DriftThreshold {
+		return content
+	}
+
+	ph.logger.Warn("personality drift detected",
+		"agent", agentName,
+		"drift_score", result.DriftScore,
+		"severity", result.Severity,
+		"details", result.Details,
+	)
+
+	// Attempt re-generation with personality correction hint
+	correction := fmt.Sprintf("Deine Antwort weicht von deinem Persoenlichkeitsprofil ab (Drift: %.2f, Severity: %s). Bitte antworte staerker im Charakter.", result.DriftScore, result.Severity)
+	regenReq := &LLMRequest{
+		Messages:    appendCorrectionMessage(req.Messages, correction),
+		Temperature: req.Temperature * 0.8, // slightly lower temperature for consistency
+		MaxTokens:   req.MaxTokens,
+	}
+
+	resp, err := provider.Send(ctx, regenReq)
+	if err != nil {
+		ph.logger.Error("personality guard re-generation failed", "error", err)
+		return content
+	}
+
+	ph.logger.Info("personality guard re-generated response", "agent", agentName)
+	return resp.Content
+}
+
+// qualityGateCheck runs the QualityScorer on the LLM response.
+// Returns the original or re-generated content.
+func (ph *PipelineHandler) qualityGateCheck(ctx context.Context, content, agentName string, provider Provider, req *LLMRequest, snap control.ConfigSnapshot) string {
+	if ph.quality == nil || !snap.QualityGateEnabled {
+		return content
+	}
+
+	result := ph.quality.ScoreMessage(agentName, content, nil)
+	qualityGateScore.WithLabelValues(agentName).Observe(float64(result.Score))
+
+	if result.Score > snap.QualityThreshold {
+		return content
+	}
+
+	ph.logger.Warn("low quality response detected",
+		"agent", agentName,
+		"score", result.Score,
+		"factors", fmt.Sprintf("len=%d spec=%d cons=%d", result.Factors.LengthScore, result.Factors.SpecificityScore, result.Factors.ConsistencyScore),
+		"details", result.Details,
+	)
+
+	// Re-generation loop (limited by QualityMaxRegen)
+	current := content
+	for attempt := 0; attempt < snap.QualityMaxRegen; attempt++ {
+		qualityGateRegenTotal.WithLabelValues(agentName).Inc()
+
+		correction := fmt.Sprintf("Deine Antwort war zu kurz oder unspezifisch (Qualitaet: %d/5). Bitte antworte ausfuehrlicher und konkreter.", result.Score)
+		regenReq := &LLMRequest{
+			Messages:    appendCorrectionMessage(req.Messages, correction),
+			Temperature: req.Temperature,
+			MaxTokens:   req.MaxTokens,
+		}
+
+		resp, err := provider.Send(ctx, regenReq)
+		if err != nil {
+			ph.logger.Error("quality gate re-generation failed", "error", err, "attempt", attempt+1)
+			return current
+		}
+
+		current = resp.Content
+		recheck := ph.quality.ScoreMessage(agentName, current, nil)
+		qualityGateScore.WithLabelValues(agentName).Observe(float64(recheck.Score))
+
+		if recheck.Score > snap.QualityThreshold {
+			ph.logger.Info("quality gate re-generation succeeded", "agent", agentName, "new_score", recheck.Score, "attempt", attempt+1)
+			return current
+		}
+	}
+
+	ph.logger.Warn("quality gate max regen reached", "agent", agentName, "max_regen", snap.QualityMaxRegen)
+	return current
 }
 
 // persistActions writes extracted actions as domain events to the event store (AC-5).
