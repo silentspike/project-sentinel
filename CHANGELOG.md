@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **WASM Component Model Runtime** (#19)
+  - `crates/sentinel-wasm/wit/world.wit`: WIT Interface Definition (`sentinel:plugin@0.1.0`) mit Host-API (fs-read/write/list, get-agent-info, get-room-info, log, get-tick) und Plugin-Exports (execute, tool-name, tool-description)
+  - `crates/sentinel-wasm/src/host.rs`: `bindgen!`-basierte Host-Implementation, `PluginState` mit WASI 0.2 Context, `AgentSnapshot`/`RoomSnapshot` ECS-Bridges, 7 Host-Function Traits
+  - `crates/sentinel-wasm/src/plugin.rs`: `PluginHost` (Engine + Linker + Component Cache), `PluginConfig` (Memory 64MB, Fuel 10M, WASI preopened dirs), Lifecycle: compile-once/instantiate-per-call
+  - `crates/sentinel-wasm/src/runner.rs`: `execute_component()` ersetzt `execute_wasm()`, `ExecutionContext` mit optionalen ECS-Snapshots (`agent_snapshot`, `rooms`) hinter `cfg(feature = "wasm")`
+  - wasmtime 42 mit Component Model + WASI 0.2 (`wasmtime-wasi` 42), Fuel-Metering, `StoreLimitsBuilder`
+  - 19 Acceptance Tests (9 native + 10 Component Model), 0 Failures
+  - Benchmarks: `component_host_cold_start`, `component_runtime_new`
+
 - **Transit-Varianz + Flurbegegnungen** (#194)
   - `sentinel-common/src/room.rs`: `shortest_distance()` BFS-Methode fuer Raum-Distanzen + 5 Tests
   - `sentinel-ecs/src/systems.rs`: Transit-Dauer von hart-codiertem 3000ms auf `(1500 + hops * 800).clamp(2000, 5000)` umgestellt (distanz-basiert)
