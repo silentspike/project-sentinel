@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::adaptive_tick::AdaptiveConfig;
+
 /// Top-level Config-Wrapper (TOML hat `[daemon]` Section).
 #[derive(Debug, Deserialize)]
 pub struct DaemonConfigFile {
@@ -45,6 +47,10 @@ pub struct DaemonConfig {
     /// NATS-Konfiguration fuer Judge-Alert-Consumption.
     #[serde(default)]
     pub nats: NatsConfig,
+
+    /// PSI-basierte adaptive Tick-Rate (TOGAF Adaptive Scheduling).
+    #[serde(default)]
+    pub adaptive: AdaptiveConfig,
 }
 
 /// NATS JetStream Konfiguration fuer den Daemon.
@@ -157,5 +163,45 @@ agent_command = ["sleep", "infinity"]
 "#;
         let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
         assert_eq!(file.daemon.agent_command, vec!["sleep", "infinity"]);
+    }
+
+    #[test]
+    fn test_adaptive_defaults() {
+        let toml_str = r#"
+[daemon]
+config_dir = "/tmp/cfg"
+data_dir = "/tmp/data"
+"#;
+        let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
+        assert!(file.daemon.adaptive.enabled);
+        assert_eq!(file.daemon.adaptive.cpu_threshold, 85.0);
+        assert_eq!(file.daemon.adaptive.mem_threshold, 80.0);
+        assert_eq!(file.daemon.adaptive.io_threshold, 70.0);
+        assert_eq!(file.daemon.adaptive.min_tick_rate_ms, 2000);
+        assert_eq!(file.daemon.adaptive.psi_sample_interval, 10);
+    }
+
+    #[test]
+    fn test_adaptive_custom() {
+        let toml_str = r#"
+[daemon]
+config_dir = "/tmp/cfg"
+data_dir = "/tmp/data"
+
+[daemon.adaptive]
+enabled = false
+cpu_threshold = 50.0
+mem_threshold = 60.0
+io_threshold = 40.0
+min_tick_rate_ms = 3000
+psi_sample_interval = 5
+"#;
+        let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
+        assert!(!file.daemon.adaptive.enabled);
+        assert_eq!(file.daemon.adaptive.cpu_threshold, 50.0);
+        assert_eq!(file.daemon.adaptive.mem_threshold, 60.0);
+        assert_eq!(file.daemon.adaptive.io_threshold, 40.0);
+        assert_eq!(file.daemon.adaptive.min_tick_rate_ms, 3000);
+        assert_eq!(file.daemon.adaptive.psi_sample_interval, 5);
     }
 }

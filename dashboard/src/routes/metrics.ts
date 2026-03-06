@@ -6,7 +6,7 @@ export const metricRoutes = new Hono();
 
 const startTime = Date.now();
 
-metricRoutes.get("/metrics", (c) => {
+metricRoutes.get("/metrics", async (c) => {
   const kpi = getLatestKpi();
   const agents = getActiveAgents();
   const response: MetricsResponse = {
@@ -25,6 +25,33 @@ metricRoutes.get("/metrics", (c) => {
   // Evolution/MARBLE Daten anhaengen
   const evolution = getRecentEvolutionAlerts(24);
   const nightrun = getLastNightrunStats();
+
+  // Tick-Dauer + PSI aus Daemon Prometheus (:9090)
+  let tick_duration_ms = 0;
+  let tick_rate_effective_ms = 0;
+  let psi_cpu = 0;
+  let psi_mem = 0;
+  let psi_io = 0;
+  try {
+    const promResp = await fetch("http://localhost:9090/metrics", {
+      signal: AbortSignal.timeout(1000),
+    });
+    if (promResp.ok) {
+      const text = await promResp.text();
+      const p = (name: string): number => {
+        const m = text.match(new RegExp(`${name}\\s+(\\d+)`));
+        return m ? parseInt(m[1], 10) : 0;
+      };
+      tick_duration_ms = p("sentinel_tick_duration_ms");
+      tick_rate_effective_ms = p("sentinel_tick_rate_effective_ms");
+      psi_cpu = p("sentinel_psi_cpu_avg10");
+      psi_mem = p("sentinel_psi_mem_avg10");
+      psi_io = p("sentinel_psi_io_avg10");
+    }
+  } catch {
+    // Daemon Prometheus nicht erreichbar — Defaults (0)
+  }
+
   return c.json({
     ...response,
     evolution_count: evolution.length,
@@ -33,6 +60,11 @@ metricRoutes.get("/metrics", (c) => {
     evolution_quality: evolution.filter((e) => e.change_type === "quality_shift").length,
     nightrun_consolidated: nightrun?.consolidated ?? 0,
     nightrun_failed: nightrun?.failed ?? 0,
+    tick_duration_ms,
+    tick_rate_effective_ms,
+    psi_cpu: psi_cpu / 1000,
+    psi_mem: psi_mem / 1000,
+    psi_io: psi_io / 1000,
   });
 });
 
@@ -223,6 +255,37 @@ metricRoutes.get("/metrics/pipeline", async (c) => {
     });
   } catch {
     return c.json({ available: false, providers: [] });
+  }
+});
+
+// ── Tick Duration + PSI Metrics aus Daemon :9090 Prometheus ──
+
+metricRoutes.get("/metrics/tick", async (c) => {
+  try {
+    const resp = await fetch("http://localhost:9090/metrics", {
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!resp.ok) {
+      return c.json({ available: false });
+    }
+    const text = await resp.text();
+
+    const parse = (name: string): number => {
+      const re = new RegExp(`${name}\\s+(\\d+)`);
+      const m = text.match(re);
+      return m ? parseInt(m[1], 10) : 0;
+    };
+
+    return c.json({
+      available: true,
+      tick_duration_ms: parse("sentinel_tick_duration_ms"),
+      tick_rate_effective_ms: parse("sentinel_tick_rate_effective_ms"),
+      psi_cpu_avg10: parse("sentinel_psi_cpu_avg10") / 1000,
+      psi_mem_avg10: parse("sentinel_psi_mem_avg10") / 1000,
+      psi_io_avg10: parse("sentinel_psi_io_avg10") / 1000,
+    });
+  } catch {
+    return c.json({ available: false });
   }
 });
 

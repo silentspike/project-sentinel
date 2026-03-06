@@ -26,6 +26,10 @@ export function renderMetrics(metrics) {
     { label: 'Nightrun Fail', value: String(metrics.nightrun_failed ?? 0), id: 'nightrun-fail', icon: 'alert' },
     { label: 'Drift-Alerts', value: String(metrics.evolution_drifts ?? 0), id: 'evo-drift', icon: 'evolution' },
     { label: 'Fatigue-Alerts', value: String(metrics.evolution_fatigue ?? 0), id: 'evo-fatigue', icon: 'evolution' },
+    { label: 'Tick Duration', value: (metrics.tick_duration_ms ?? 0) + 'ms', id: 'tick-duration', icon: 'uptime' },
+    { label: 'Effective Rate', value: (metrics.tick_rate_effective_ms ?? 0) + 'ms', id: 'tick-effective', icon: 'rate' },
+    { label: 'PSI CPU', value: ((metrics.psi_cpu ?? 0) * 100).toFixed(1) + '%', id: 'psi-cpu', icon: 'agent' },
+    { label: 'PSI IO', value: ((metrics.psi_io ?? 0) * 100).toFixed(1) + '%', id: 'psi-io', icon: 'action' },
   ];
 
   for (const card of cards) {
