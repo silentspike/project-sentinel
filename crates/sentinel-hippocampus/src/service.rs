@@ -542,7 +542,10 @@ mod tests {
 
         // Episodes should be cleared
         let remaining = service.store().load_episodes("Thomas").unwrap();
-        assert!(remaining.is_empty(), "Episodes should be cleared after consolidation");
+        assert!(
+            remaining.is_empty(),
+            "Episodes should be cleared after consolidation"
+        );
 
         // But archive should contain them
         let archived = service.get_archive("Thomas").unwrap();
@@ -591,7 +594,11 @@ mod tests {
         service.consolidate_agent("Thomas").unwrap();
 
         let archived = service.get_archive("Thomas").unwrap();
-        assert_eq!(archived.len(), 2, "Archive should accumulate across consolidations");
+        assert_eq!(
+            archived.len(),
+            2,
+            "Archive should accumulate across consolidations"
+        );
     }
 
     #[test]

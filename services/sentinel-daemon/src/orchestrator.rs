@@ -896,7 +896,7 @@ fn ecs_tick_loop(
         // Shift-Erkennung (alle 60 Ticks = ~1 Minute bei 1s Tick-Rate)
         if tick_count > 0 && tick_count.is_multiple_of(60) {
             let new_shift = if (time_scale - 1.0).abs() < f32::EPSILON {
-                detect_current_shift()              // Production: System-Uhrzeit
+                detect_current_shift() // Production: System-Uhrzeit
             } else {
                 detect_shift_from_sim_hour(sim_hour) // Beschleunigt: sim_hour
             };
