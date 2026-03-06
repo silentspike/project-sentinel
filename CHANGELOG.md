@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Transit-Varianz + Flurbegegnungen** (#194)
+  - `sentinel-common/src/room.rs`: `shortest_distance()` BFS-Methode fuer Raum-Distanzen + 5 Tests
+  - `sentinel-ecs/src/systems.rs`: Transit-Dauer von hart-codiertem 3000ms auf `(1500 + hops * 800).clamp(2000, 5000)` umgestellt (distanz-basiert)
+  - `sentinel-ecs/src/systems.rs`: `encounter_system()` — Flurbegegnungen zwischen in-Transit Agents (splitmix64 RNG, 30% Wahrscheinlichkeit, alle 10 Ticks)
+  - `sentinel-ecs/src/world.rs`: `RoomDistanceMap` ECS Resource (vorberechnete BFS-Distanzen aus rooms.toml)
+  - `sentinel-common/src/events.rs`: `HallwayEncounterDetected` DomainEventPayload-Variante
+
+- **SmellEvents End-to-End** (#195)
+  - `sentinel-ecs/src/systems.rs`: `smell_system()` — generiert Coffee-SmellEvents bei Auto-Coffee (caffeine > 90mg)
+  - `sentinel-common/src/events.rs`: `SmellEventTriggered` DomainEventPayload-Variante (room_id, smell_type, intensity, duration_ticks)
+
+- **PSI→Bio Integration** (#196)
+  - `sentinel-ecs/src/systems.rs`: `bio_system()` ruft `apply_psi_stress()` auf via `PsiMetrics` ECS Resource
+  - `sentinel-ecs/src/world.rs`: `PsiMetrics` ECS Resource (cpu_avg10, mem_avg10)
+  - `services/sentinel-daemon/src/orchestrator.rs`: PSI-Metriken aus AdaptiveTickRate in ECS World injiziert vor jedem Schedule-Run
+
 ### Fixed
 
 - **Bio-Engine Dynamics flach** (#148)
