@@ -15,6 +15,7 @@ import (
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
+	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/judge"
 )
 
 // pipelineMockProvider implementiert Provider fuer Pipeline-Tests.
@@ -511,5 +512,288 @@ func TestBreakerStatesReflectsState(t *testing.T) {
 	states = ph.BreakerStates()
 	if got := states["test-provider"]; got != "open" {
 		t.Errorf("BreakerStates()[test-provider] = %q, want %q after trip", got, "open")
+	}
+}
+
+// newTestPipelineHandlerWithDrift creates a PipelineHandler with DriftDetector + QualityScorer.
+func newTestPipelineHandlerWithDrift(registry *Registry, controlCfg *control.Config, drift *judge.DriftDetector, quality *judge.QualityScorer) *PipelineHandler {
+	if controlCfg == nil {
+		controlCfg = control.NewConfig("mock")
+	}
+	return NewPipelineHandler(PipelineConfig{
+		Registry:     registry,
+		Config:       controlCfg,
+		Compiler:     compiler.New(),
+		Normalizer:   normalizer.New(),
+		Extractor:    extraction.New(),
+		Capabilities: capability.New(),
+		Logger:       slog.Default(),
+		BreakerCfg:   testConfig(),
+		Drift:        drift,
+		Quality:      quality,
+	})
+}
+
+func TestPersonalityGuardDisabledByDefault(t *testing.T) {
+	reg := NewRegistry()
+	mock := &pipelineMockProvider{
+		name: "mock",
+		resp: &LLMResponse{Content: "!!!!!!! SUPER EXCITED !!!!!!!", Model: "m", TokensUsed: 10, FinishReason: "stop"},
+	}
+	reg.Register("mock", mock)
+
+	drift := judge.NewDriftDetector()
+	drift.RegisterProfile("AGENT-01", judge.PersonalityProfile{
+		Role:         "Developer",
+		Extraversion: 0.1, // introvert — exclamations = high drift
+		Neuroticism:  0.3,
+	})
+	quality := judge.NewQualityScorer(drift)
+
+	// Guard disabled by default
+	ph := newTestPipelineHandlerWithDrift(reg, nil, drift, quality)
+
+	body := `{"messages":[{"role":"user","content":"test"}],"metadata":{"agent_id":"1","agent_name":"AGENT-01"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	ph.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Provider should have been called exactly once (no re-gen since guard is disabled)
+	if mock.calls != 1 {
+		t.Errorf("provider calls: want 1, got %d", mock.calls)
+	}
+}
+
+func TestPersonalityGuardDetectsDrift(t *testing.T) {
+	reg := NewRegistry()
+	callCount := 0
+	mock := &pipelineMockProvider{
+		name: "mock",
+		sendFunc: func(_ context.Context, _ *LLMRequest) (*LLMResponse, error) {
+			callCount++
+			if callCount == 1 {
+				// First call: high-drift response (many exclamations for an introvert)
+				return &LLMResponse{Content: "!!!!!!! SUPER AUFGEREGT !!!! WOW !!!!", Model: "m", TokensUsed: 10, FinishReason: "stop"}, nil
+			}
+			// Re-gen call: calmer response
+			return &LLMResponse{Content: "Ich arbeite ruhig an meinem Schreibtisch.", Model: "m", TokensUsed: 10, FinishReason: "stop"}, nil
+		},
+	}
+	reg.Register("mock", mock)
+
+	drift := judge.NewDriftDetector()
+	drift.RegisterProfile("AGENT-01", judge.PersonalityProfile{
+		Role:         "Developer",
+		Extraversion: 0.1, // introvert
+		Neuroticism:  0.3,
+	})
+	quality := judge.NewQualityScorer(drift)
+
+	cfg := control.NewConfig("mock")
+	_ = cfg.Update(map[string]interface{}{"personality_guard_enabled": true, "drift_threshold": 0.5})
+
+	ph := newTestPipelineHandlerWithDrift(reg, cfg, drift, quality)
+
+	body := `{"messages":[{"role":"user","content":"Was machst du?"}],"metadata":{"agent_id":"1","agent_name":"AGENT-01"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	ph.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Should have called provider twice (original + re-gen)
+	if callCount < 2 {
+		t.Errorf("expected at least 2 provider calls (original + re-gen), got %d", callCount)
+	}
+
+	var resp PipelineResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// Response should be the re-generated calmer version
+	if !strings.Contains(resp.Content, "ruhig") {
+		t.Errorf("expected re-generated content with 'ruhig', got %q", resp.Content)
+	}
+}
+
+func TestQualityGateDisabledByDefault(t *testing.T) {
+	reg := NewRegistry()
+	mock := &pipelineMockProvider{
+		name: "mock",
+		resp: &LLMResponse{Content: "ok", Model: "m", TokensUsed: 1, FinishReason: "stop"},
+	}
+	reg.Register("mock", mock)
+
+	drift := judge.NewDriftDetector()
+	quality := judge.NewQualityScorer(drift)
+
+	ph := newTestPipelineHandlerWithDrift(reg, nil, drift, quality)
+
+	body := `{"messages":[{"role":"user","content":"test"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	ph.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", w.Code)
+	}
+	// "ok" is very short (score=1) but gate is disabled, so no re-gen
+	if mock.calls != 1 {
+		t.Errorf("provider calls: want 1, got %d", mock.calls)
+	}
+}
+
+func TestQualityGateTriggersRegen(t *testing.T) {
+	reg := NewRegistry()
+	callCount := 0
+	mock := &pipelineMockProvider{
+		name: "mock",
+		sendFunc: func(_ context.Context, _ *LLMRequest) (*LLMResponse, error) {
+			callCount++
+			if callCount == 1 {
+				return &LLMResponse{Content: "ja", Model: "m", TokensUsed: 1, FinishReason: "stop"}, nil
+			}
+			return &LLMResponse{Content: "Ja, ich werde das Projekt-Meeting um 14:00 Uhr vorbereiten und die Praesentation fuer den Kunden fertigstellen.", Model: "m", TokensUsed: 20, FinishReason: "stop"}, nil
+		},
+	}
+	reg.Register("mock", mock)
+
+	drift := judge.NewDriftDetector()
+	quality := judge.NewQualityScorer(drift)
+
+	cfg := control.NewConfig("mock")
+	_ = cfg.Update(map[string]interface{}{"quality_gate_enabled": true, "quality_threshold": float64(2)})
+
+	ph := newTestPipelineHandlerWithDrift(reg, cfg, drift, quality)
+
+	body := `{"messages":[{"role":"user","content":"Was hast du vor?"}],"metadata":{"agent_id":"1","agent_name":"AGENT-01"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	ph.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Should have re-generated (original "ja" scores very low)
+	if callCount < 2 {
+		t.Errorf("expected at least 2 provider calls (original + re-gen), got %d", callCount)
+	}
+}
+
+func TestQualityGateMaxRegen(t *testing.T) {
+	reg := NewRegistry()
+	callCount := 0
+	mock := &pipelineMockProvider{
+		name: "mock",
+		sendFunc: func(_ context.Context, _ *LLMRequest) (*LLMResponse, error) {
+			callCount++
+			// Always return a short response (low quality)
+			return &LLMResponse{Content: "ja", Model: "m", TokensUsed: 1, FinishReason: "stop"}, nil
+		},
+	}
+	reg.Register("mock", mock)
+
+	drift := judge.NewDriftDetector()
+	quality := judge.NewQualityScorer(drift)
+
+	cfg := control.NewConfig("mock")
+	_ = cfg.Update(map[string]interface{}{
+		"quality_gate_enabled": true,
+		"quality_threshold":    float64(2),
+		"quality_max_regen":    float64(1),
+	})
+
+	ph := newTestPipelineHandlerWithDrift(reg, cfg, drift, quality)
+
+	body := `{"messages":[{"role":"user","content":"test"}],"metadata":{"agent_id":"1","agent_name":"AGENT-01"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	ph.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", w.Code)
+	}
+
+	// 1 original + 1 re-gen = 2 calls max (max_regen=1)
+	if callCount > 2 {
+		t.Errorf("expected max 2 provider calls (1 original + 1 re-gen), got %d", callCount)
+	}
+}
+
+func TestNarrativeNudgeInjection(t *testing.T) {
+	reg := NewRegistry()
+	mock := &pipelineMockProvider{
+		name: "mock",
+		resp: &LLMResponse{Content: "Alles klar.", Model: "m", TokensUsed: 5, FinishReason: "stop"},
+	}
+	reg.Register("mock", mock)
+
+	cfg := control.NewConfig("mock")
+	_ = cfg.Update(map[string]interface{}{"narrative_nudge": "Fokus heute: Teamwork"})
+
+	ph := newTestPipelineHandlerWithDrift(reg, cfg, nil, nil)
+
+	body := `{"messages":[{"role":"user","content":"Was machst du?"}],"metadata":{"agent_name":"Max Mueller","agent_role":"Developer","perception":"CIRCADIAN: 11:42"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	ph.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Check that system prompt contains the nudge
+	if mock.lastReq == nil {
+		t.Fatal("provider received no request")
+	}
+	if len(mock.lastReq.Messages) == 0 {
+		t.Fatal("no messages in request")
+	}
+	systemMsg := mock.lastReq.Messages[0]
+	if systemMsg.Role != "system" {
+		t.Fatalf("first message role: want 'system', got %q", systemMsg.Role)
+	}
+	if !strings.Contains(systemMsg.Content, "[NARRATIVE_NUDGE]") {
+		t.Error("system prompt should contain [NARRATIVE_NUDGE] tag")
+	}
+	if !strings.Contains(systemMsg.Content, "Fokus heute: Teamwork") {
+		t.Error("system prompt should contain nudge text")
+	}
+}
+
+func TestNarrativeNudgeEmpty(t *testing.T) {
+	reg := NewRegistry()
+	mock := &pipelineMockProvider{
+		name: "mock",
+		resp: &LLMResponse{Content: "Alles klar.", Model: "m", TokensUsed: 5, FinishReason: "stop"},
+	}
+	reg.Register("mock", mock)
+
+	// No nudge configured (default empty)
+	ph := newTestPipelineHandlerWithDrift(reg, nil, nil, nil)
+
+	body := `{"messages":[{"role":"user","content":"Was machst du?"}],"metadata":{"agent_name":"Max Mueller","agent_role":"Developer","perception":"CIRCADIAN: 11:42"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	ph.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if mock.lastReq == nil {
+		t.Fatal("provider received no request")
+	}
+	for _, msg := range mock.lastReq.Messages {
+		if msg.Role == "system" && strings.Contains(msg.Content, "[NARRATIVE_NUDGE]") {
+			t.Error("system prompt should NOT contain NARRATIVE_NUDGE when nudge is empty")
+		}
 	}
 }
