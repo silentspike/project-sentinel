@@ -196,7 +196,7 @@ func main() {
 	// 6. HTTP proxy server
 	proxyMux := http.NewServeMux()
 	proxyMux.Handle("POST /v1/chat/completions", pipelineHandler)
-	proxyMux.HandleFunc("GET /health", handleHealth(pipelineHandler))
+	proxyMux.HandleFunc("GET /health", handleHealth(pipelineHandler, guardrailsEnforcer != nil))
 	proxyMux.HandleFunc("GET /ready", handleReady)
 	proxyMux.Handle("GET /metrics", promhttp.Handler())
 
@@ -268,19 +268,21 @@ func main() {
 	logger.Info("cortex-gateway stopped")
 }
 
-func handleHealth(pipeline *proxy.PipelineHandler) http.HandlerFunc {
+func handleHealth(pipeline *proxy.PipelineHandler, guardrailsEnabled bool) http.HandlerFunc {
 	type healthResponse struct {
-		Status          string            `json:"status"`
-		Version         string            `json:"version"`
-		CircuitBreakers map[string]string `json:"circuit_breakers"`
+		Status            string            `json:"status"`
+		Version           string            `json:"version"`
+		CircuitBreakers   map[string]string `json:"circuit_breakers"`
+		GuardrailsEnabled bool              `json:"guardrails_enabled"`
 	}
 
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		resp := healthResponse{
-			Status:          "ok",
-			Version:         version,
-			CircuitBreakers: pipeline.BreakerStates(),
+			Status:            "ok",
+			Version:           version,
+			CircuitBreakers:   pipeline.BreakerStates(),
+			GuardrailsEnabled: guardrailsEnabled,
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}
