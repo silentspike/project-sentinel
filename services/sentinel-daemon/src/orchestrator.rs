@@ -880,8 +880,7 @@ fn ecs_tick_loop(
         sentinel_telemetry::MetricsRegistry::global().gauge("sentinel_psi_cpu_avg10");
     let psi_mem_gauge =
         sentinel_telemetry::MetricsRegistry::global().gauge("sentinel_psi_mem_avg10");
-    let psi_io_gauge =
-        sentinel_telemetry::MetricsRegistry::global().gauge("sentinel_psi_io_avg10");
+    let psi_io_gauge = sentinel_telemetry::MetricsRegistry::global().gauge("sentinel_psi_io_avg10");
 
     loop {
         let tick_start = Instant::now();
