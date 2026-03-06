@@ -160,6 +160,14 @@ func NewPipelineHandler(cfg PipelineConfig) *PipelineHandler {
 	if deadline == 0 {
 		deadline = defaultProviderDeadline
 	}
+
+	// Pre-initialize token counter for all registered providers so the metric
+	// appears in /metrics immediately (not only after the first successful call).
+	for _, name := range cfg.Registry.List() {
+		pipelineTokensTotal.WithLabelValues(name, "input")
+		pipelineTokensTotal.WithLabelValues(name, "output")
+	}
+
 	return &PipelineHandler{
 		registry:         cfg.Registry,
 		config:           cfg.Config,
