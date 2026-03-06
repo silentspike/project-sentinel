@@ -154,6 +154,53 @@ impl BuildingConfig {
             .filter(|r| r.department.as_deref() == Some(department))
             .collect()
     }
+
+    /// Berechnet kuerzesten Pfad (Hop-Count) zwischen zwei Raeumen via BFS.
+    ///
+    /// Gibt `None` zurueck wenn einer der Raeume nicht existiert oder
+    /// kein Pfad vorhanden ist (sollte bei validem rooms.toml nicht vorkommen).
+    pub fn shortest_distance(&self, from: &str, to: &str) -> Option<u32> {
+        if from == to {
+            return Some(0);
+        }
+
+        // Build adjacency map
+        let adjacency: HashMap<&str, Vec<&str>> = self
+            .rooms
+            .iter()
+            .map(|r| {
+                (
+                    r.id.as_str(),
+                    r.adjacent.iter().map(|a| a.as_str()).collect(),
+                )
+            })
+            .collect();
+
+        if !adjacency.contains_key(from) || !adjacency.contains_key(to) {
+            return None;
+        }
+
+        // BFS
+        let mut visited: HashSet<&str> = HashSet::new();
+        let mut queue: std::collections::VecDeque<(&str, u32)> = std::collections::VecDeque::new();
+        visited.insert(from);
+        queue.push_back((from, 0));
+
+        while let Some((current, dist)) = queue.pop_front() {
+            if let Some(neighbors) = adjacency.get(current) {
+                for &neighbor in neighbors {
+                    if neighbor == to {
+                        return Some(dist + 1);
+                    }
+                    if visited.insert(neighbor) {
+                        queue.push_back((neighbor, dist + 1));
+                    }
+                }
+            }
+        }
+
+        None // Kein Pfad gefunden
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +284,44 @@ mod tests {
 
         let design_rooms = config.rooms_by_department("Design");
         assert_eq!(design_rooms.len(), 2, "Expected 2 Design rooms");
+    }
+
+    #[test]
+    fn test_shortest_distance_same_room() {
+        let config = load_test_config();
+        assert_eq!(config.shortest_distance("kueche", "kueche"), Some(0));
+    }
+
+    #[test]
+    fn test_shortest_distance_adjacent() {
+        let config = load_test_config();
+        // kueche <-> flur-eg: 1 hop
+        assert_eq!(config.shortest_distance("kueche", "flur-eg"), Some(1));
+        assert_eq!(config.shortest_distance("flur-eg", "kueche"), Some(1));
+    }
+
+    #[test]
+    fn test_shortest_distance_two_hops() {
+        let config = load_test_config();
+        // buero-dev-1 -> flur-eg -> kueche: 2 hops
+        assert_eq!(config.shortest_distance("buero-dev-1", "kueche"), Some(2));
+    }
+
+    #[test]
+    fn test_shortest_distance_cross_floor() {
+        let config = load_test_config();
+        // buero-dev-1 -> flur-eg -> treppenhaus -> flur-og -> buero-design-1: 4 hops
+        assert_eq!(
+            config.shortest_distance("buero-dev-1", "buero-design-1"),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn test_shortest_distance_nonexistent_room() {
+        let config = load_test_config();
+        assert_eq!(config.shortest_distance("kueche", "nonexistent"), None);
+        assert_eq!(config.shortest_distance("nonexistent", "kueche"), None);
     }
 
     #[test]
