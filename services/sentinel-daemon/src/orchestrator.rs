@@ -33,6 +33,7 @@ use sentinel_redb::StateStore;
 use sentinel_runtime::RuntimeOrchestrator;
 use sentinel_sandbox::{CgroupLimits, SandboxEnforcer, SandboxHandle, SandboxWarning};
 
+use crate::adaptive_tick::AdaptiveTickRate;
 use crate::config::DaemonConfig;
 use crate::controlplane::config::ControlplaneConfig;
 use crate::controlplane::store::ControlplaneStore;
@@ -332,6 +333,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // Werte fuer den ECS-Thread
     let tick_rate = Duration::from_millis(config.tick_rate_ms);
     let time_scale = config.time_scale;
+    let adaptive_config = config.adaptive.clone();
     let agent_command_cfg = config.agent_command.clone();
     let all_agents_clone = all_agents.clone();
 
@@ -361,6 +363,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 ebpf_tx,
                 episode_producer,
                 agent_command_cfg,
+                adaptive_config,
             )
         })
         .context("ECS Thread spawnen")?;
@@ -600,7 +603,11 @@ fn ecs_tick_loop(
     ebpf_tx: tokio::sync::mpsc::Sender<MetricsSnapshot>,
     mut episode_producer: EpisodeProducer,
     agent_command_cfg: Vec<String>,
+    adaptive_config: crate::adaptive_tick::AdaptiveConfig,
 ) -> Result<u64> {
+    // Adaptive Tick-Rate Controller (PSI-basiert, TOGAF Adaptive Scheduling)
+    let mut adaptive_tick = AdaptiveTickRate::new(adaptive_config);
+
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
 
@@ -864,10 +871,27 @@ fn ecs_tick_loop(
         time_scale, "sim_hour initialisiert"
     );
 
+    // Telemetrie-Gauge fuer Dashboard/Prometheus (TOGAF: tick_duration_ms)
+    let tick_duration_gauge =
+        sentinel_telemetry::MetricsRegistry::global().gauge("sentinel_tick_duration_ms");
+    let tick_rate_effective_gauge =
+        sentinel_telemetry::MetricsRegistry::global().gauge("sentinel_tick_rate_effective_ms");
+    let psi_cpu_gauge =
+        sentinel_telemetry::MetricsRegistry::global().gauge("sentinel_psi_cpu_avg10");
+    let psi_mem_gauge =
+        sentinel_telemetry::MetricsRegistry::global().gauge("sentinel_psi_mem_avg10");
+    let psi_io_gauge =
+        sentinel_telemetry::MetricsRegistry::global().gauge("sentinel_psi_io_avg10");
+
     loop {
+        let tick_start = Instant::now();
+
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
+
+        // PSI-basierte adaptive Tick-Rate aktualisieren (alle N Ticks)
+        adaptive_tick.update(tick_count);
 
         // SimulationTime aktualisieren (Zeitvirtualisierung via time_scale)
         if let Some(mut time) = world.get_resource_mut::<SimulationTime>() {
@@ -1056,6 +1080,17 @@ fn ecs_tick_loop(
                     }
                 }
 
+                // Memory-Pressure Check: Agent-Spawn blockieren wenn Mem PSI > Threshold
+                if adaptive_tick.should_block_spawn() {
+                    warn!(
+                        mem_psi = format!("{:.1}", adaptive_tick.mem_avg10()),
+                        "Memory PSI ueber Schwellwert — Agent-Spawn verzoegert bis Druck sinkt"
+                    );
+                    // Schichtwechsel registrieren aber Spawn auf naechsten Zyklus verschieben
+                    current_shift = new_shift;
+                    continue;
+                }
+
                 // Neue Schicht-Agents spawnen (mit Sandbox-Setup)
                 let new_agents = agents_for_shift(&all_agents, new_shift);
                 let mut spawned_count = 0u32;
@@ -1168,7 +1203,22 @@ fn ecs_tick_loop(
             );
         }
 
-        std::thread::sleep(tick_rate);
+        // Adaptive Tick-Rate: PSI-basiert (TOGAF Adaptive Scheduling)
+        let effective_rate = adaptive_tick.compute_effective_rate(tick_rate);
+        let tick_elapsed = tick_start.elapsed();
+        if effective_rate > tick_elapsed {
+            std::thread::sleep(effective_rate - tick_elapsed);
+        }
+
+        // Telemetrie: Tick-Dauer + PSI-Werte fuer Dashboard/Prometheus
+        let total_tick_ms = tick_start.elapsed().as_millis() as i64;
+        tick_duration_gauge.set(total_tick_ms);
+        tick_rate_effective_gauge.set(effective_rate.as_millis() as i64);
+        // PSI avg10 in Promille (×10) um eine Dezimalstelle Praezision zu erhalten.
+        // Dashboard teilt durch 1000 fuer Fraktion [0,1].
+        psi_cpu_gauge.set((adaptive_tick.cpu_avg10() * 10.0) as i64);
+        psi_mem_gauge.set((adaptive_tick.mem_avg10() * 10.0) as i64);
+        psi_io_gauge.set((adaptive_tick.io_avg10() * 10.0) as i64);
     }
 
     // -- Graceful Shutdown: Agent-Prozesse droppen (reaps Zombies via Drop impl) --
@@ -1441,6 +1491,7 @@ mod tests {
             ebpf_tx,
             ep,
             vec!["true".to_string()],
+            crate::adaptive_tick::AdaptiveConfig::default(),
         );
 
         assert!(result.is_ok());
@@ -1492,6 +1543,7 @@ mod tests {
             ebpf_tx,
             ep,
             vec!["true".to_string()],
+            crate::adaptive_tick::AdaptiveConfig::default(),
         );
 
         assert!(result.is_ok());
@@ -1548,6 +1600,7 @@ mod tests {
             ebpf_tx,
             ep,
             vec!["true".to_string()],
+            crate::adaptive_tick::AdaptiveConfig::default(),
         );
 
         assert!(result.is_ok());
