@@ -174,12 +174,19 @@ fn bench_capability_check(c: &mut Criterion) {
     });
 }
 
-/// Component Model Benchmarks (nur mit wasm-Feature)
-///
-/// Misst PluginHost-Erstellung (Engine + Linker + WASI) — das ist der "Cold Start"
-/// fuer die Component Model Pipeline.
-/// Echte Component-Execution Benchmarks benoetigen .wasm Fixtures
-/// (via cargo-component oder wasm-tools) und gehoeren auf die Deploy-VM.
+// ---- Component Model Benchmarks (nur mit wasm-Feature) ----
+
+#[cfg(feature = "wasm")]
+use sentinel_wasm::{AgentSnapshot, PluginConfig};
+
+#[cfg(feature = "wasm")]
+fn echo_fixture() -> std::path::PathBuf {
+    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("tests/fixtures/echo-plugin.wasm");
+    path
+}
+
+/// Cold Start: PluginHost::new() — Engine + Linker + WASI Registration.
 #[cfg(feature = "wasm")]
 fn bench_component_host_cold_start(c: &mut Criterion) {
     c.bench_function("wasm.component_host_cold_start", |b| {
@@ -190,13 +197,175 @@ fn bench_component_host_cold_start(c: &mut Criterion) {
     });
 }
 
-/// Warm Start: ToolRuntime::new() mit PluginHost (bereits integriert)
+/// Cold Start: ToolRuntime::new() mit PluginHost.
 #[cfg(feature = "wasm")]
 fn bench_component_runtime_new(c: &mut Criterion) {
     c.bench_function("wasm.component_runtime_new", |b| {
         b.iter(|| {
             let runtime = ToolRuntime::new();
             black_box(runtime)
+        })
+    });
+}
+
+/// Component Load: Component::from_file() + Cache (einmalig pro .wasm).
+#[cfg(feature = "wasm")]
+fn bench_component_load(c: &mut Criterion) {
+    c.bench_function("wasm.component_load", |b| {
+        b.iter(|| {
+            let mut host = sentinel_wasm::PluginHost::new().unwrap();
+            host.load(PluginConfig {
+                wasm_path: echo_fixture(),
+                ..Default::default()
+            })
+            .unwrap();
+            black_box(host)
+        })
+    });
+}
+
+/// Warm Execute: Plugin ist geladen, neuer Store pro Call.
+/// Das ist der Hot-Path im Betrieb (Budget: < 10ms p50).
+#[cfg(feature = "wasm")]
+fn bench_component_warm_execute(c: &mut Criterion) {
+    let mut host = sentinel_wasm::PluginHost::new().unwrap();
+    host.load(PluginConfig {
+        wasm_path: echo_fixture(),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent = AgentSnapshot {
+        agent_id: "AGENT-01".to_string(),
+        name: "Bench Agent".to_string(),
+        ..Default::default()
+    };
+
+    c.bench_function("wasm.component_warm_execute", |b| {
+        b.iter(|| {
+            let result = host.execute(
+                &echo_fixture(),
+                black_box("benchmark input"),
+                agent.clone(),
+                std::collections::HashMap::new(),
+                black_box(42),
+                dir.path().to_path_buf(),
+            );
+            black_box(result)
+        })
+    });
+}
+
+/// Host-Function Roundtrip: Plugin ruft get_agent_info() + get_tick() + log() auf.
+/// Misst den Overhead der Host-Funktion-Aufrufe vom Plugin aus.
+#[cfg(feature = "wasm")]
+fn bench_component_host_roundtrip(c: &mut Criterion) {
+    let mut host = sentinel_wasm::PluginHost::new().unwrap();
+    host.load(PluginConfig {
+        wasm_path: echo_fixture(),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent = AgentSnapshot {
+        agent_id: "AGENT-42".to_string(),
+        name: "Roundtrip Agent".to_string(),
+        role: "Developer".to_string(),
+        hunger: 0.5,
+        energy: 0.6,
+        stress: 0.3,
+        social_need: 0.4,
+        caffeine: 0.7,
+        bladder: 0.2,
+        room_id: "buero-dev-1".to_string(),
+    };
+    let mut rooms = std::collections::HashMap::new();
+    rooms.insert(
+        "buero-dev-1".to_string(),
+        sentinel_wasm::RoomSnapshot {
+            room_id: "buero-dev-1".to_string(),
+            name: "Dev Buero 1".to_string(),
+            floor: 1,
+            temperature: 22.0,
+            noise_db: 40.0,
+            occupant_count: 3,
+        },
+    );
+
+    c.bench_function("wasm.component_host_roundtrip", |b| {
+        b.iter(|| {
+            let result = host.execute(
+                &echo_fixture(),
+                black_box("roundtrip"),
+                agent.clone(),
+                rooms.clone(),
+                black_box(9999),
+                dir.path().to_path_buf(),
+            );
+            black_box(result)
+        })
+    });
+}
+
+/// ToolRuntime E2E: Registrierung + Capability-Check + WASM-Execute.
+/// Misst den vollen Pfad wie er im Daemon ausgefuehrt wird.
+#[cfg(feature = "wasm")]
+fn bench_runtime_e2e_execute(c: &mut Criterion) {
+    let mut runtime = ToolRuntime::new();
+    runtime
+        .plugin_host_mut()
+        .load(PluginConfig {
+            wasm_path: echo_fixture(),
+            ..Default::default()
+        })
+        .unwrap();
+    runtime
+        .register_tool(ToolDefinition {
+            name: "echo".to_string(),
+            description: "Echo WASM tool".to_string(),
+            wasm_path: Some(echo_fixture().to_str().unwrap().to_string()),
+            tool_type: ToolType::Wasm,
+            required_capabilities: Vec::new(),
+        })
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ExecutionContext {
+        agent_id: "AGENT-01".to_string(),
+        agent_capabilities: vec!["file_read".to_string()],
+        sandbox: SandboxConfig::with_paths(vec![dir.path().to_path_buf()]),
+        correlation_id: "bench".to_string(),
+        tick: 100,
+        agent_snapshot: Some(AgentSnapshot::default()),
+        rooms: Some(std::collections::HashMap::new()),
+    };
+
+    c.bench_function("wasm.runtime_e2e_execute", |b| {
+        b.iter(|| {
+            let result = runtime.execute(black_box("echo"), black_box("bench input"), &ctx);
+            black_box(result)
+        })
+    });
+}
+
+/// query_meta: Tool-Name + Tool-Description abfragen.
+#[cfg(feature = "wasm")]
+fn bench_component_query_meta(c: &mut Criterion) {
+    let mut host = sentinel_wasm::PluginHost::new().unwrap();
+    host.load(PluginConfig {
+        wasm_path: echo_fixture(),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+
+    c.bench_function("wasm.component_query_meta", |b| {
+        b.iter(|| {
+            let meta = host.query_meta(&echo_fixture(), dir.path().to_path_buf());
+            black_box(meta)
         })
     });
 }
@@ -217,6 +386,11 @@ criterion_group!(
     wasm_benches,
     bench_component_host_cold_start,
     bench_component_runtime_new,
+    bench_component_load,
+    bench_component_warm_execute,
+    bench_component_host_roundtrip,
+    bench_runtime_e2e_execute,
+    bench_component_query_meta,
 );
 
 #[cfg(not(feature = "wasm"))]

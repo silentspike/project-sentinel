@@ -1,0 +1,70 @@
+package sentinel:plugin@0.1.0;
+
+interface types {
+    record agent-info {
+        agent-id: string,
+        name: string,
+        role: string,
+        hunger: f32,
+        energy: f32,
+        stress: f32,
+        social-need: f32,
+        caffeine: f32,
+        bladder: f32,
+        room-id: string,
+    }
+
+    record room-info {
+        room-id: string,
+        name: string,
+        floor: u32,
+        temperature: f32,
+        noise-db: f32,
+        occupant-count: u32,
+    }
+
+    enum log-level {
+        debug,
+        info,
+        warn,
+        error,
+    }
+}
+
+interface host-api {
+    use types.{agent-info, room-info, log-level};
+
+    /// Datei lesen aus Agent-Home (sentinel-fs CoW-Layer).
+    fs-read: func(path: string) -> result<list<u8>, string>;
+
+    /// Datei schreiben ins Agent-Home (sentinel-fs CoW-Layer).
+    fs-write: func(path: string, data: list<u8>) -> result<u64, string>;
+
+    /// Verzeichnis auflisten.
+    fs-list: func(path: string) -> result<list<string>, string>;
+
+    /// Eigene Agent-Daten (Bio-State, Position).
+    get-agent-info: func() -> agent-info;
+
+    /// Raum-Informationen abfragen.
+    get-room-info: func(room-id: string) -> option<room-info>;
+
+    /// Structured Logging.
+    log: func(level: log-level, msg: string);
+
+    /// Aktueller Simulation-Tick.
+    get-tick: func() -> u64;
+}
+
+world sentinel-tool {
+    import host-api;
+
+    /// Tool ausfuehren mit Input-String, gibt Output oder Fehler zurueck.
+    export execute: func(input: string) -> result<string, string>;
+
+    /// Tool-Name (fuer Registry).
+    export tool-name: func() -> string;
+
+    /// Tool-Beschreibung (fuer Agent-Prompt).
+    export tool-description: func() -> string;
+}

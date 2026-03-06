@@ -15,8 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `crates/sentinel-wasm/src/plugin.rs`: `PluginHost` (Engine + Linker + Component Cache), `PluginConfig` (Memory 64MB, Fuel 10M, WASI preopened dirs), Lifecycle: compile-once/instantiate-per-call
   - `crates/sentinel-wasm/src/runner.rs`: `execute_component()` ersetzt `execute_wasm()`, `ExecutionContext` mit optionalen ECS-Snapshots (`agent_snapshot`, `rooms`) hinter `cfg(feature = "wasm")`
   - wasmtime 42 mit Component Model + WASI 0.2 (`wasmtime-wasi` 42), Fuel-Metering, `StoreLimitsBuilder`
-  - 19 Acceptance Tests (9 native + 10 Component Model), 0 Failures
-  - Benchmarks: `component_host_cold_start`, `component_runtime_new`
+  - `services/sentinel-daemon/src/orchestrator.rs`: WASM-Plugin Auto-Load aus `config/tools/*.wasm` mit `query_meta()` fuer Tool-Name/Description
+  - `crates/sentinel-ecs/tests/wasm_ecs_integration.rs`: 7 ECS-Integrationstests (voller bevy_ecs World+Schedule Pipeline: Agent→input_system→WASM→DomainEvent)
+  - Test-Fixtures: `echo-plugin.wasm` (Rust Component, `wasm32-wasip2`), `loop-plugin.wasm` (Fuel-Exhaustion mit `black_box`)
+  - 94 sentinel-wasm Tests (51 Unit + 16 E2E + 20 Acceptance + 7 Security), 0 Failures
+  - 7 sentinel-ecs WASM Integration Tests (Multi-Agent, Native+WASM Koexistenz, Fehlerfaelle)
+  - 13 Benchmarks (6 native + 7 Component Model: cold/warm start, host roundtrip, E2E, query_meta)
 
 - **Transit-Varianz + Flurbegegnungen** (#194)
   - `sentinel-common/src/room.rs`: `shortest_distance()` BFS-Methode fuer Raum-Distanzen + 5 Tests
