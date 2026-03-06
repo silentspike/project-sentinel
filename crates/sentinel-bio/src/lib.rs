@@ -36,6 +36,15 @@ const EXTROVERSION_THRESHOLD: f32 = 0.5;
 /// Arbeitsdrain pro Stunde seit Schichtbeginn (Energy-Penalty waehrend Arbeitszeit)
 const WORK_DRAIN_PER_HOUR: f32 = 3.0;
 
+/// Maximaler Baseline-Arbeitsstress am Ende eines vollen Arbeitstages
+const BASELINE_STRESS_MAX: f32 = 25.0;
+
+/// Stress-Anstiegs-Rate (Exponential Smoothing Alpha fuer steigende Tendenz)
+const STRESS_RISE_ALPHA: f32 = 0.3;
+
+/// Stress-Abfall-Rate (Exponential Smoothing Alpha fuer fallende Tendenz)
+const STRESS_FALL_ALPHA: f32 = 0.1;
+
 /// Aktualisiert alle Bio-Zustaende fuer einen Tick
 ///
 /// # Arguments
@@ -56,7 +65,7 @@ pub fn update_bio_state(
     update_hunger(bio, dt_hours);
     update_caffeine(bio, dt_seconds);
     update_bladder(bio, dt_hours);
-    update_stress(bio, personality, work);
+    update_stress(bio, personality, work, sim_hour);
     update_social_need(bio, personality, dt_hours);
     update_energy(bio, personality, sim_hour);
 }
@@ -88,8 +97,12 @@ fn update_bladder(bio: &mut BioState, dt_hours: f32) {
     bio.bladder = (bio.bladder + BLADDER_RATE_PER_HOUR * dt_hours * multiplier).clamp(0.0, 100.0);
 }
 
-/// Aktualisiert Stress (gewichteter Multi-Faktor)
-fn update_stress(bio: &mut BioState, personality: &Personality, work: &WorkContext) {
+/// Aktualisiert Stress (gewichteter Multi-Faktor mit Traegheit).
+///
+/// Stress wird als Exponential Smoothing berechnet: schneller Anstieg (alpha=0.3),
+/// langsamer Abfall (alpha=0.1). Zusaetzlich: Baseline-Arbeitsstress der ueber den
+/// Arbeitstag akkumuliert (max 25 bei Schichtende).
+fn update_stress(bio: &mut BioState, personality: &Personality, work: &WorkContext, sim_hour: f32) {
     // Meeting-Stress
     let meeting_stress = if work.in_meeting { 60.0 } else { 0.0 };
 
@@ -102,14 +115,32 @@ fn update_stress(bio: &mut BioState, personality: &Personality, work: &WorkConte
     // Bio-Stress (Hunger >50 erzeugt Stress)
     let bio_stress = (bio.hunger - 50.0).max(0.0) / 50.0 * 100.0;
 
-    // Gewichtete Summe
-    let raw =
-        0.3 * meeting_stress + 0.3 * deadline_stress + 0.2 * conflict_stress + 0.2 * bio_stress;
+    // Baseline-Arbeitsstress: Leichter Stress-Aufbau ueber den Arbeitstag (max 25)
+    let work_hours = if (6.0..22.0).contains(&sim_hour) {
+        sim_hour - 6.0
+    } else {
+        0.0
+    };
+    let baseline_stress = (work_hours / 16.0 * BASELINE_STRESS_MAX).min(BASELINE_STRESS_MAX);
+
+    // Gewichtete Summe (normalisiert auf 1.0)
+    let raw = 0.27 * meeting_stress
+        + 0.27 * deadline_stress
+        + 0.18 * conflict_stress
+        + 0.18 * bio_stress
+        + 0.10 * baseline_stress;
 
     // Neurotizismus skaliert Stress-Sensitivitaet
     let neuroticism_scale = 0.5 + personality.neuroticism * 0.5;
+    let target_stress = (raw * neuroticism_scale).clamp(0.0, 100.0);
 
-    bio.stress = (raw * neuroticism_scale).clamp(0.0, 100.0);
+    // Traegheit: Stress steigt schnell (alpha=0.3), faellt langsam ab (alpha=0.1)
+    let alpha = if target_stress > bio.stress {
+        STRESS_RISE_ALPHA
+    } else {
+        STRESS_FALL_ALPHA
+    };
+    bio.stress = (bio.stress + alpha * (target_stress - bio.stress)).clamp(0.0, 100.0);
 }
 
 /// Aktualisiert soziale Beduerfnisse (persoenlichkeitsabhaengig)
@@ -516,6 +547,82 @@ mod tests {
             bio.energy > 60.0,
             "Energy at 23:00 with no drain should be > 60 (got {})",
             bio.energy
+        );
+    }
+
+    #[test]
+    fn test_stress_inertia_rises_gradually() {
+        let mut bio = default_bio();
+        bio.stress = 0.0;
+        let personality = default_personality();
+        let mut work = default_work();
+        work.in_meeting = true;
+
+        // Erster Tick: Stress steigt, aber nicht sofort auf Maximum
+        update_stress(&mut bio, &personality, &work, 10.0);
+        let stress_after_1 = bio.stress;
+        assert!(
+            stress_after_1 > 0.0,
+            "Stress should rise above 0 with meeting: {}",
+            stress_after_1
+        );
+
+        // Mehrere Ticks: Stress naehert sich Target graduell an
+        for _ in 0..20 {
+            update_stress(&mut bio, &personality, &work, 10.0);
+        }
+        let stress_after_20 = bio.stress;
+        assert!(
+            stress_after_20 > stress_after_1,
+            "Stress should keep rising: {} > {}",
+            stress_after_20,
+            stress_after_1
+        );
+    }
+
+    #[test]
+    fn test_stress_inertia_falls_slowly() {
+        let mut bio = default_bio();
+        bio.stress = 30.0; // Startwert: vorher gestresst
+        let personality = default_personality();
+        let work = default_work(); // Kein Meeting, kein Stress-Treiber
+
+        // Stress soll langsam fallen, NICHT sofort auf 0
+        update_stress(&mut bio, &personality, &work, 10.0);
+        assert!(
+            bio.stress > 0.0,
+            "Stress should not drop to 0 instantly: {}",
+            bio.stress
+        );
+
+        // Nach vielen Ticks faellt Stress weiter aber langsam
+        let stress_before = bio.stress;
+        for _ in 0..10 {
+            update_stress(&mut bio, &personality, &work, 10.0);
+        }
+        assert!(
+            bio.stress < stress_before,
+            "Stress should decrease over time: {} < {}",
+            bio.stress,
+            stress_before
+        );
+    }
+
+    #[test]
+    fn test_baseline_work_stress() {
+        let mut bio = default_bio();
+        bio.stress = 0.0;
+        let personality = default_personality();
+        let work = default_work(); // Kein Meeting, kein Deadline
+
+        // Nachmittag (14h): 8h gearbeitet → Baseline-Stress > 0
+        for _ in 0..50 {
+            update_stress(&mut bio, &personality, &work, 14.0);
+        }
+        assert!(
+            bio.stress > 0.0,
+            "Baseline work stress at 14h should be > 0: {}",
+            bio.stress
         );
     }
 

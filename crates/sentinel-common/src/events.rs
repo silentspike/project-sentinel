@@ -131,6 +131,8 @@ pub enum DomainEventPayload {
         caffeine_mg: f32,
         room_id: String,
         mood: String,
+        valence: f32,
+        arousal: f32,
     },
     /// Periodischer Raum-Physik Snapshot (Temperatur, CO2, Laerm)
     RoomPhysicsUpdated {
