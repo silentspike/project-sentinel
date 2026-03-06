@@ -403,6 +403,18 @@ pub mod bridge {
                 }
             }
         }
+        if let Ok(Some(facts)) = store.get_agent_facts(agent_id) {
+            if let Ok(facts_str) = String::from_utf8(facts) {
+                if !facts_str.is_empty() {
+                    tracing::debug!(
+                        agent_id = %agent_id,
+                        len = facts_str.len(),
+                        "evolution_facts in Metadata eingefuegt"
+                    );
+                    metadata.insert("evolution_facts".to_string(), facts_str);
+                }
+            }
+        }
         let version = store.get_evolution_version(agent_id).unwrap_or(0);
         if version > 0 {
             metadata.insert("evolution_version".to_string(), version.to_string());
