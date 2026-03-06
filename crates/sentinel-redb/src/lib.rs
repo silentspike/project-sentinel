@@ -21,6 +21,9 @@ const EVOLUTION_VERSION: TableDefinition<u16, u64> = TableDefinition::new("evolu
 // NMDA scores from last consolidation — JSON-serialized Vec<f64>
 const NMDA_SCORES: TableDefinition<u16, &[u8]> = TableDefinition::new("nmda_scores");
 
+// Agent facts from hippocampus FactRetriever — JIT context injection for LLM Bridge
+const AGENT_FACTS: TableDefinition<u16, &[u8]> = TableDefinition::new("agent_facts");
+
 // Simulation metadata (sim_hour persistence, time virtualization)
 const SIM_META: TableDefinition<&str, &[u8]> = TableDefinition::new("sim_meta");
 
@@ -48,6 +51,7 @@ impl StateStore {
             write_txn.open_table(NARRATIVE_SUMMARY)?;
             write_txn.open_table(EVOLUTION_VERSION)?;
             write_txn.open_table(NMDA_SCORES)?;
+            write_txn.open_table(AGENT_FACTS)?;
             write_txn.open_table(SIM_META)?;
         }
         write_txn.commit()?;
@@ -375,6 +379,7 @@ impl StateStore {
         voice_style: Option<&[u8]>,
         behavioral_notes: Option<&[u8]>,
         narrative_summary: Option<&[u8]>,
+        agent_facts: Option<&[u8]>,
     ) -> anyhow::Result<u64> {
         let write_txn = self.db.begin_write()?;
         let new_version;
@@ -391,6 +396,10 @@ impl StateStore {
                 let mut table = write_txn.open_table(NARRATIVE_SUMMARY)?;
                 table.insert(agent_id.0, data)?;
             }
+            if let Some(data) = agent_facts {
+                let mut table = write_txn.open_table(AGENT_FACTS)?;
+                table.insert(agent_id.0, data)?;
+            }
             let mut ver_table = write_txn.open_table(EVOLUTION_VERSION)?;
             let current = ver_table.get(agent_id.0)?.map(|v| v.value()).unwrap_or(0);
             new_version = current + 1;
@@ -398,6 +407,28 @@ impl StateStore {
         }
         write_txn.commit()?;
         Ok(new_version)
+    }
+
+    // === AGENT FACTS ===
+
+    /// Get agent facts (JSON bytes from FactRetriever bridge).
+    pub fn get_agent_facts(&self, agent_id: AgentId) -> anyhow::Result<Option<Vec<u8>>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(AGENT_FACTS)?;
+        Ok(table
+            .get(agent_id.0)?
+            .map(|v: redb::AccessGuard<'_, &[u8]>| v.value().to_vec()))
+    }
+
+    /// Set agent facts (JSON bytes).
+    pub fn set_agent_facts(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(AGENT_FACTS)?;
+            table.insert(agent_id.0, data)?;
+        }
+        write_txn.commit()?;
+        Ok(())
     }
 
     /// Store NMDA scores from consolidation for an agent.
@@ -643,6 +674,7 @@ mod tests {
                 Some(b"casual tone"),
                 Some(b"reliable worker"),
                 Some(b"had a quiet shift"),
+                None,
             )
             .unwrap();
         assert_eq!(version, 1);
@@ -661,7 +693,7 @@ mod tests {
 
         // Second batch increments version
         let v2 = store
-            .set_evolution_batch(agent(5), Some(b"updated tone"), None, None)
+            .set_evolution_batch(agent(5), Some(b"updated tone"), None, None, None)
             .unwrap();
         assert_eq!(v2, 2);
         assert_eq!(
@@ -705,6 +737,53 @@ mod tests {
         // Negative value
         store.set_sim_hour(-1.0).unwrap();
         assert!(store.get_sim_hour().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_agent_facts_crud() {
+        let (store, _dir) = temp_store();
+
+        // Initially empty
+        assert!(store.get_agent_facts(agent(1)).unwrap().is_none());
+
+        // Write
+        store.set_agent_facts(agent(1), b"[\"Projekt Aurora: Redesign\"]").unwrap();
+        let data = store.get_agent_facts(agent(1)).unwrap().unwrap();
+        assert_eq!(data, b"[\"Projekt Aurora: Redesign\"]");
+
+        // Overwrite
+        store.set_agent_facts(agent(1), b"[\"Budget: 150k\"]").unwrap();
+        let data = store.get_agent_facts(agent(1)).unwrap().unwrap();
+        assert_eq!(data, b"[\"Budget: 150k\"]");
+    }
+
+    #[test]
+    fn test_evolution_batch_with_facts() {
+        let (store, _dir) = temp_store();
+        let version = store
+            .set_evolution_batch(
+                agent(8),
+                Some(b"direct tone"),
+                None,
+                Some(b"productive day"),
+                Some(b"[\"Sprint 12: Dashboard\"]"),
+            )
+            .unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(
+            store.get_voice_style(agent(8)).unwrap().unwrap(),
+            b"direct tone"
+        );
+        assert_eq!(
+            store.get_narrative_summary(agent(8)).unwrap().unwrap(),
+            b"productive day"
+        );
+        assert_eq!(
+            store.get_agent_facts(agent(8)).unwrap().unwrap(),
+            b"[\"Sprint 12: Dashboard\"]"
+        );
+        // behavioral_notes was None — should remain empty
+        assert!(store.get_behavioral_notes(agent(8)).unwrap().is_none());
     }
 
     #[test]
