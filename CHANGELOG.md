@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cortex Control Plane + Guardrails + Token Tracking** (#145)
+  - `pipeline.go`: Standalone `sentinel_pipeline_tokens_total` Prometheus counter (fires regardless of guardrails config)
+  - `main.go`: Health endpoint includes `guardrails_enabled` field, wired to enforcer presence
+  - VM systemd unit: Guardrails env vars added (rate limits, budget caps)
+
 - **Health Endpoint zeigt Circuit Breaker State** (#143)
   - `main.go`: Health endpoint (`/health`) includes `circuit_breakers` map with per-provider state
   - `pipeline.go`: New `BreakerStates()` method exposes CB states (closed/open/half-open)
