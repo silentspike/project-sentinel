@@ -1352,9 +1352,6 @@ fn generate_evolution_fields(
 }
 
 /// Einzelner LLM-Call fuer Evolution-Feld-Generierung.
-///
-/// Retry bei 5xx/429 mit Exponential Backoff (2s, 4s, 8s), max 3 Versuche.
-/// Schichtwechsel erzeugt Lastspitzen am Gateway — ohne Retry schlagen Voice/Notes fehl.
 #[cfg(feature = "llm")]
 fn llm_evolution_call(
     client: &reqwest::blocking::Client,
@@ -1363,9 +1360,6 @@ fn llm_evolution_call(
     system_prompt: &str,
     user_prompt: &str,
 ) -> Option<Vec<u8>> {
-    const MAX_RETRIES: u32 = 3;
-    const BASE_DELAY_SECS: u64 = 2;
-
     let body = serde_json::json!({
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -1380,70 +1374,39 @@ fn llm_evolution_call(
         }
     });
 
-    for attempt in 0..=MAX_RETRIES {
-        match client.post(url).json(&body).send() {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    return match resp.json::<serde_json::Value>() {
-                        Ok(json) => {
-                            let content = json
-                                .get("content")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default();
-                            if content.is_empty() {
-                                warn!(agent = agent_name, "Evolution LLM Response leer");
-                                None
-                            } else {
-                                Some(content.as_bytes().to_vec())
-                            }
-                        }
-                        Err(e) => {
-                            warn!(agent = agent_name, error = %e, "Evolution LLM Response parse fehlgeschlagen");
-                            None
-                        }
-                    };
-                }
-                // Retryable: 5xx (Server-Error) oder 429 (Rate-Limit)
-                let retryable = status.is_server_error() || status.as_u16() == 429;
-                if retryable && attempt < MAX_RETRIES {
-                    let delay = Duration::from_secs(BASE_DELAY_SECS * 2u64.pow(attempt));
-                    warn!(
-                        agent = agent_name,
-                        status = %status,
-                        attempt = attempt + 1,
-                        retry_in_secs = delay.as_secs(),
-                        "Evolution LLM Call fehlgeschlagen (HTTP), Retry"
-                    );
-                    std::thread::sleep(delay);
-                    continue;
-                }
+    match client.post(url).json(&body).send() {
+        Ok(resp) => {
+            if !resp.status().is_success() {
                 warn!(
                     agent = agent_name,
-                    status = %status,
-                    "Evolution LLM Call fehlgeschlagen (HTTP), kein Retry"
+                    status = %resp.status(),
+                    "Evolution LLM Call fehlgeschlagen (HTTP)"
                 );
                 return None;
             }
-            Err(e) => {
-                if attempt < MAX_RETRIES {
-                    let delay = Duration::from_secs(BASE_DELAY_SECS * 2u64.pow(attempt));
-                    warn!(
-                        agent = agent_name,
-                        error = %e,
-                        attempt = attempt + 1,
-                        retry_in_secs = delay.as_secs(),
-                        "Evolution LLM Call fehlgeschlagen, Retry"
-                    );
-                    std::thread::sleep(delay);
-                    continue;
+            match resp.json::<serde_json::Value>() {
+                Ok(json) => {
+                    let content = json
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if content.is_empty() {
+                        warn!(agent = agent_name, "Evolution LLM Response leer");
+                        return None;
+                    }
+                    Some(content.as_bytes().to_vec())
                 }
-                warn!(agent = agent_name, error = %e, "Evolution LLM Call fehlgeschlagen, kein Retry");
-                return None;
+                Err(e) => {
+                    warn!(agent = agent_name, error = %e, "Evolution LLM Response parse fehlgeschlagen");
+                    None
+                }
             }
         }
+        Err(e) => {
+            warn!(agent = agent_name, error = %e, "Evolution LLM Call fehlgeschlagen");
+            None
+        }
     }
-    None
 }
 
 /// Fallback wenn LLM-Feature deaktiviert ist.
