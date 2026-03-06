@@ -71,6 +71,11 @@ var (
 		Help:    "Quality gate scores by agent",
 		Buckets: []float64{1, 2, 3, 4, 5},
 	}, []string{"agent"})
+
+	pipelineTokensTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sentinel_pipeline_tokens_total",
+		Help: "Total tokens consumed per provider and direction (always emitted)",
+	}, []string{"provider", "direction"})
 )
 
 // PipelineConfig haelt alle Abhaengigkeiten fuer den PipelineHandler.
@@ -155,6 +160,14 @@ func NewPipelineHandler(cfg PipelineConfig) *PipelineHandler {
 	if deadline == 0 {
 		deadline = defaultProviderDeadline
 	}
+
+	// Pre-initialize token counter for all registered providers so the metric
+	// appears in /metrics immediately (not only after the first successful call).
+	for _, name := range cfg.Registry.List() {
+		pipelineTokensTotal.WithLabelValues(name, "input")
+		pipelineTokensTotal.WithLabelValues(name, "output")
+	}
+
 	return &PipelineHandler{
 		registry:         cfg.Registry,
 		config:           cfg.Config,
@@ -339,7 +352,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Step 6c: Guardrails Record ---
+	// --- Step 6c: Token Tracking + Guardrails Record ---
+	pipelineTokensTotal.WithLabelValues(providerName, "input").Add(float64(resp.InputTokens))
+	pipelineTokensTotal.WithLabelValues(providerName, "output").Add(float64(resp.OutputTokens))
 	if ph.guardrails != nil {
 		ph.guardrails.Record(providerName, resp.InputTokens, resp.OutputTokens)
 	}

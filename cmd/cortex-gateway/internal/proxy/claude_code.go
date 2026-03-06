@@ -24,6 +24,14 @@ const (
 	claudeCodeHealthTimeout = 10 * time.Second
 )
 
+// claudeCodeUsage holds token usage from claude CLI result events.
+type claudeCodeUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
+}
+
 // claudeCodeEvent is a single NDJSON event from the claude subprocess output.
 type claudeCodeEvent struct {
 	Type      string `json:"type"`
@@ -32,10 +40,11 @@ type claudeCodeEvent struct {
 	// For assistant messages
 	Message *claudeCodeAssistantMsg `json:"message,omitempty"`
 	// For result events
-	Result     string  `json:"result,omitempty"`
-	CostUSD    float64 `json:"total_cost_usd,omitempty"`
-	DurationMs int     `json:"duration_ms,omitempty"`
-	IsError    bool    `json:"is_error,omitempty"`
+	Result     string           `json:"result,omitempty"`
+	CostUSD    float64          `json:"total_cost_usd,omitempty"`
+	DurationMs int              `json:"duration_ms,omitempty"`
+	IsError    bool             `json:"is_error,omitempty"`
+	Usage      *claudeCodeUsage `json:"usage,omitempty"`
 }
 
 // claudeCodeContentBlock represents a content block in a claude assistant message.
@@ -225,10 +234,19 @@ func (p *ClaudeCodeProvider) parseOutputStream(r io.Reader) (*LLMResponse, error
 			if event.IsError {
 				return nil, fmt.Errorf("claude-code result error: %s", event.Result)
 			}
+			// Extract token usage from the result event
+			var inputTokens, outputTokens int
+			if event.Usage != nil {
+				inputTokens = event.Usage.InputTokens + event.Usage.CacheReadInputTokens + event.Usage.CacheCreationInputTokens
+				outputTokens = event.Usage.OutputTokens
+			}
 			// Result is the final event, stop reading
 			return &LLMResponse{
 				Content:      strings.Join(contentParts, ""),
 				FinishReason: finishReason,
+				InputTokens:  inputTokens,
+				OutputTokens: outputTokens,
+				TokensUsed:   inputTokens + outputTokens,
 			}, nil
 		}
 	}
