@@ -468,3 +468,48 @@ func TestAppendCorrectionMessage(t *testing.T) {
 		t.Error("original slice was modified")
 	}
 }
+
+func TestBreakerStatesEmpty(t *testing.T) {
+	reg := NewRegistry()
+	ph := newTestPipelineHandler(reg, nil)
+
+	states := ph.BreakerStates()
+	if len(states) != 0 {
+		t.Errorf("BreakerStates() = %v, want empty map", states)
+	}
+}
+
+func TestBreakerStatesReflectsState(t *testing.T) {
+	reg := NewRegistry()
+	mock := &pipelineMockProvider{
+		name: "test-provider",
+		resp: &LLMResponse{Content: "ok", Model: "m", TokensUsed: 1, FinishReason: "end_turn"},
+	}
+	reg.Register("test-provider", mock)
+	ph := newTestPipelineHandler(reg, nil)
+
+	// Trigger breaker creation by calling getBreaker
+	cb := ph.getBreaker("test-provider")
+	if cb == nil {
+		t.Fatal("getBreaker returned nil")
+	}
+
+	states := ph.BreakerStates()
+	if len(states) != 1 {
+		t.Fatalf("BreakerStates() has %d entries, want 1", len(states))
+	}
+	if got := states["test-provider"]; got != "closed" {
+		t.Errorf("BreakerStates()[test-provider] = %q, want %q", got, "closed")
+	}
+
+	// Trip the breaker
+	for i := 0; i < 3; i++ {
+		cb.Allow()
+		cb.Record(errors.New("fail"))
+	}
+
+	states = ph.BreakerStates()
+	if got := states["test-provider"]; got != "open" {
+		t.Errorf("BreakerStates()[test-provider] = %q, want %q after trip", got, "open")
+	}
+}

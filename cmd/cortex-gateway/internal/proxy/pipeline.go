@@ -105,6 +105,18 @@ type PipelineHandler struct {
 	breakerCfg BreakerConfig
 }
 
+// BreakerStates gibt den aktuellen State aller bekannten Circuit Breaker zurueck.
+func (ph *PipelineHandler) BreakerStates() map[string]string {
+	ph.breakerMu.RLock()
+	defer ph.breakerMu.RUnlock()
+
+	states := make(map[string]string, len(ph.breakers))
+	for name, cb := range ph.breakers {
+		states[name] = cb.State()
+	}
+	return states
+}
+
 // PipelineResponse ist die erweiterte Antwort mit extrahierten Aktionen.
 type PipelineResponse struct {
 	Content      string                       `json:"content"`
