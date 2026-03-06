@@ -589,18 +589,20 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
 /// Extrahiert den Ziel-Provider aus den Swap-Alert Details.
 ///
-/// Falls die Details einen bekannten Provider-Namen enthalten (z.B. "claude", "ollama"),
-/// wird dieser zurueckgegeben. Fallback: "claude" (hoechstqualitaetiger Provider).
+/// Falls die Details einen bekannten Provider-Namen enthalten, wird dieser zurueckgegeben.
+/// "claude-code" wird VOR "claude" geprueft (laengster Match zuerst).
+/// Fallback: "claude-code" (Subscription-basiert, kein API Key noetig).
 #[cfg(feature = "nats")]
 fn extract_swap_provider(details: &str) -> String {
     let lower = details.to_lowercase();
-    for provider in ["claude", "ollama", "claude-code", "qwen3"] {
+    // Laengste Matches zuerst pruefen ("claude-code" vor "claude")
+    for provider in ["claude-code", "claude", "ollama", "qwen3"] {
         if lower.contains(provider) {
             return provider.to_string();
         }
     }
-    // Default: upgrade to claude (the highest-quality provider)
-    "claude".to_string()
+    // Default: claude-code (Subscription-basiert, immer verfuegbar)
+    "claude-code".to_string()
 }
 
 /// ECS Tick-Loop auf dediziertem Thread.
