@@ -250,13 +250,14 @@ pub fn bio_system(
             time.sim_hour,
         );
 
-        // Auto-Coffee: Agent trinkt automatisch Kaffee bei niedrigem Energy-Level
-        // Bedingungen: Energy < 50, Koffein < 10mg, Arbeitszeit (08-16h), max 1x/5min
-        if bio.energy < 50.0
+        // Auto-Coffee: Agent trinkt Kaffee bei moderater Muedigkeit
+        // Threshold: energy<70 (realistisch — Menschen trinken Kaffee bevor sie erschoepft sind)
+        // Frequenz: alle 3 Minuten (180 Ticks bei 1Hz)
+        if bio.energy < 70.0
             && bio.caffeine_mg < 10.0
             && (8.0..16.0).contains(&time.sim_hour)
             && tick > 0
-            && tick.is_multiple_of(300)
+            && tick.is_multiple_of(180)
         {
             sentinel_bio::drink_coffee(&mut bio);
             let bio_payload = DomainEventPayload::BioActionPerformed {
@@ -285,6 +286,8 @@ pub fn bio_system(
                 caffeine_mg: bio.caffeine_mg,
                 room_id: position.room_id.clone(),
                 mood: format!("{:?}", mood.dominant_emotion),
+                valence: mood.valence,
+                arousal: mood.arousal,
             };
             let event = DomainEvent::new(
                 payload.event_type_str(),
