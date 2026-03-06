@@ -3,6 +3,8 @@ Description=Sentinel Daemon — ECS Orchestrator
 Documentation=https://github.com/obtFusi/project-sentinel/issues/94
 After=network-online.target
 Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple

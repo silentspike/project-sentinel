@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Bio-Engine Dynamics flach** (#148)
+  - `sentinel-bio/src/lib.rs`: Stress-Berechnung mit Traegheit (Exponential Smoothing: Anstieg alpha=0.3, Abfall alpha=0.1) + Baseline-Arbeitsstress der ueber den Tag akkumuliert (max 25)
+  - `sentinel-ecs/src/systems.rs`: Auto-Coffee Threshold von energy<50 auf energy<70 gesenkt, Frequenz von 300 auf 180 Ticks erhoehen — Agents trinken nun realistisch Kaffee am Vormittag
+  - `sentinel-ecs/src/autonomy.rs`: Return-to-Work nach P0-Notfaellen — Agents kehren automatisch zum Arbeitsraum zurueck wenn kein Notfall mehr aktiv ist (verhindert Deadlock auf Toilette/Kueche)
+  - `sentinel-common/src/events.rs`: BioStateUpdated Events enthalten nun Valence/Arousal Zahlenwerte (nicht nur kategorisches Mood-Label)
+  - 7 neue Tests (3 Stress-Traegheit, 4 Autonomy Return-to-Work)
+
 ### Added
+
+- **Service Health Monitor** — Aktive Ueberwachung aller Sentinel-Dienste
+  - `deploy/scripts/sentinel-health-monitor.sh`: Shell-Script prueft alle 60s via systemd-Timer: systemd-Status, HTTP /health Endpoints, NATS Health, Projection-Lag
+  - ntfy Alerts bei Statuswechsel (DOWN/RECOVERED), kein Spam durch State-File Deduplizierung
+  - Auto-Restart bei toten Services (max 3 Versuche pro Ausfall-Episode)
+  - Projection-Lag Monitoring: Warning >500, Critical >5000 Events
+  - `deploy/systemd/sentinel-health-monitor.timer`: 60s Intervall, persistent
+  - Alle 7 Service-Units gehaertet mit `StartLimitBurst=5` / `StartLimitIntervalSec=300`
+  - `sentinel.target` erweitert um Health-Monitor Timer
 
 - **PSI-basierte adaptive Tick-Rate** (#147)
   - `adaptive_tick.rs`: Neues Modul `AdaptiveTickRate` — liest `/proc/pressure/{cpu,memory,io}` und moduliert Tick-Rate dynamisch (TOGAF Adaptive Scheduling)

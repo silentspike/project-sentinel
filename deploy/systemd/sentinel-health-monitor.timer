@@ -1,0 +1,12 @@
+[Unit]
+Description=Sentinel Health Monitor Timer — Check every 60s
+Documentation=https://github.com/obtFusi/project-sentinel
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+AccuracySec=5
+Persistent=true
+
+[Install]
+WantedBy=timers.target

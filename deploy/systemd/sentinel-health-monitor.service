@@ -1,0 +1,12 @@
+[Unit]
+Description=Sentinel Health Monitor — Service Health Check
+Documentation=https://github.com/obtFusi/project-sentinel
+
+[Service]
+Type=oneshot
+ExecStart=/opt/sentinel/scripts/sentinel-health-monitor.sh
+TimeoutStartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-health-monitor
+ReadWritePaths=/opt/sentinel/data
