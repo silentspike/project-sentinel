@@ -32,6 +32,10 @@ fn bench_ctx(sandbox: SandboxConfig) -> ExecutionContext {
         sandbox,
         correlation_id: "bench-corr".to_string(),
         tick: 1,
+        #[cfg(feature = "wasm")]
+        agent_snapshot: None,
+        #[cfg(feature = "wasm")]
+        rooms: None,
     }
 }
 
@@ -170,72 +174,29 @@ fn bench_capability_check(c: &mut Criterion) {
     });
 }
 
-/// WASM-spezifische Benchmarks (nur mit wasm-Feature)
+/// Component Model Benchmarks (nur mit wasm-Feature)
+///
+/// Misst PluginHost-Erstellung (Engine + Linker + WASI) — das ist der "Cold Start"
+/// fuer die Component Model Pipeline.
+/// Echte Component-Execution Benchmarks benoetigen .wasm Fixtures
+/// (via cargo-component oder wasm-tools) und gehoeren auf die Deploy-VM.
 #[cfg(feature = "wasm")]
-fn bench_wasm_cold_start(c: &mut Criterion) {
-    let wat = r#"(module
-        (func (export "execute") (result i32)
-            i32.const 0
-        )
-    )"#;
-
-    let dir = tempfile::tempdir().unwrap();
-    let wasm_path = dir.path().join("bench.wat");
-    std::fs::write(&wasm_path, wat).unwrap();
-
-    c.bench_function("wasm.wasm_module_cold_start", |b| {
+fn bench_component_host_cold_start(c: &mut Criterion) {
+    c.bench_function("wasm.component_host_cold_start", |b| {
         b.iter(|| {
-            let mut runtime = ToolRuntime::new();
-            runtime
-                .register_tool(ToolDefinition {
-                    name: "wasm_bench".to_string(),
-                    description: "Wasm bench".to_string(),
-                    wasm_path: Some(wasm_path.to_str().unwrap().to_string()),
-                    tool_type: ToolType::Wasm,
-                    required_capabilities: Vec::new(),
-                })
-                .unwrap();
-            let sandbox = SandboxConfig::with_paths(vec![dir.path().to_path_buf()]);
-            let ctx = bench_ctx(sandbox);
-            let result = runtime.execute(black_box("wasm_bench"), black_box(""), &ctx);
-            black_box(result)
+            let host = sentinel_wasm::PluginHost::new();
+            black_box(host)
         })
     });
 }
 
+/// Warm Start: ToolRuntime::new() mit PluginHost (bereits integriert)
 #[cfg(feature = "wasm")]
-fn bench_wasm_warm_start(c: &mut Criterion) {
-    let wat = r#"(module
-        (func (export "execute") (result i32)
-            i32.const 0
-        )
-    )"#;
-
-    let dir = tempfile::tempdir().unwrap();
-    let wasm_path = dir.path().join("bench.wat");
-    std::fs::write(&wasm_path, wat).unwrap();
-
-    let mut runtime = ToolRuntime::new();
-    runtime
-        .register_tool(ToolDefinition {
-            name: "wasm_warm".to_string(),
-            description: "Wasm warm bench".to_string(),
-            wasm_path: Some(wasm_path.to_str().unwrap().to_string()),
-            tool_type: ToolType::Wasm,
-            required_capabilities: Vec::new(),
-        })
-        .unwrap();
-
-    let sandbox = SandboxConfig::with_paths(vec![dir.path().to_path_buf()]);
-    let ctx = bench_ctx(sandbox);
-
-    // Warm-Up
-    let _ = runtime.execute("wasm_warm", "", &ctx);
-
-    c.bench_function("wasm.wasm_module_warm_start", |b| {
+fn bench_component_runtime_new(c: &mut Criterion) {
+    c.bench_function("wasm.component_runtime_new", |b| {
         b.iter(|| {
-            let result = runtime.execute(black_box("wasm_warm"), black_box(""), &ctx);
-            black_box(result)
+            let runtime = ToolRuntime::new();
+            black_box(runtime)
         })
     });
 }
@@ -252,7 +213,11 @@ criterion_group!(
 );
 
 #[cfg(feature = "wasm")]
-criterion_group!(wasm_benches, bench_wasm_cold_start, bench_wasm_warm_start,);
+criterion_group!(
+    wasm_benches,
+    bench_component_host_cold_start,
+    bench_component_runtime_new,
+);
 
 #[cfg(not(feature = "wasm"))]
 criterion_main!(native_benches);

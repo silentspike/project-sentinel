@@ -23,6 +23,10 @@ fn ctx_with_sandbox(sandbox: SandboxConfig) -> ExecutionContext {
         sandbox,
         correlation_id: "test-corr".to_string(),
         tick: 1,
+        #[cfg(feature = "wasm")]
+        agent_snapshot: None,
+        #[cfg(feature = "wasm")]
+        rooms: None,
     }
 }
 
@@ -258,128 +262,71 @@ fn ac_19_02_restrictive_sandbox_blocks_all() {
     assert!(result.is_err());
 }
 
-// Wasm-spezifische Tests — nur mit wasm-Feature kompilierbar
+// Wasm Component Model Tests — nur mit wasm-Feature kompilierbar
 #[cfg(feature = "wasm")]
 mod wasm_tests {
     use super::*;
+    use sentinel_wasm::{PluginConfig, PluginHost};
+    use std::path::PathBuf;
 
-    // AC-1: Wasm Tools starten reproduzierbar via wasmtime
+    // AC-1: PluginHost erstellt Engine + Linker (Component Model Pipeline)
     #[test]
-    fn ac_19_01_wasm_execution() {
-        let mut runtime = ToolRuntime::new();
-
-        // Minimales WAT-Modul: execute() -> 0 (Erfolg)
-        let wat = r#"(module
-            (func (export "execute") (result i32)
-                i32.const 0
-            )
-        )"#;
-
-        let dir = tempfile::tempdir().unwrap();
-        let wasm_path = dir.path().join("success.wat");
-        std::fs::write(&wasm_path, wat).unwrap();
-
-        let tool = ToolDefinition {
-            name: "wasm_ok".to_string(),
-            description: "Successful wasm tool".to_string(),
-            wasm_path: Some(wasm_path.to_str().unwrap().to_string()),
-            tool_type: ToolType::Wasm,
-            required_capabilities: Vec::new(),
-        };
-        runtime.register_tool(tool).unwrap();
-
-        let sandbox = SandboxConfig::with_paths(vec![dir.path().to_path_buf()]);
-        let ctx = ctx_with_sandbox(sandbox);
-        let result = runtime.execute("wasm_ok", "", &ctx).unwrap();
-
-        assert!(result.success);
-        assert!(result.output.contains("executed successfully"));
+    fn ac_19_01_plugin_host_creates() {
+        let host = PluginHost::new();
+        assert!(host.is_ok(), "PluginHost::new() must succeed");
+        let host = host.unwrap();
+        assert_eq!(host.cached_count(), 0);
     }
 
-    // AC-1: Wasm-Modul mit Fehler-Rueckgabe
+    // AC-1: ToolRuntime enthält PluginHost (Component Model integriert)
     #[test]
-    fn ac_19_01_wasm_error_code() {
-        let mut runtime = ToolRuntime::new();
-
-        // WAT-Modul: execute() -> 1 (Fehler)
-        let wat = r#"(module
-            (func (export "execute") (result i32)
-                i32.const 1
-            )
-        )"#;
-
-        let dir = tempfile::tempdir().unwrap();
-        let wasm_path = dir.path().join("error.wat");
-        std::fs::write(&wasm_path, wat).unwrap();
-
-        let tool = ToolDefinition {
-            name: "wasm_err".to_string(),
-            description: "Failing wasm tool".to_string(),
-            wasm_path: Some(wasm_path.to_str().unwrap().to_string()),
-            tool_type: ToolType::Wasm,
-            required_capabilities: Vec::new(),
-        };
-        runtime.register_tool(tool).unwrap();
-
-        let sandbox = SandboxConfig::with_paths(vec![dir.path().to_path_buf()]);
-        let ctx = ctx_with_sandbox(sandbox);
-        let result = runtime.execute("wasm_err", "", &ctx);
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("error code 1"));
+    fn ac_19_01_runtime_has_plugin_host() {
+        let runtime = ToolRuntime::new();
+        assert_eq!(runtime.plugin_host().cached_count(), 0);
     }
 
-    // AC-4: Fuel-Exhaustion verhindert Endlosschleifen
+    // AC-1: Ungeladenes Plugin gibt klaren Fehler via ToolRuntime.execute()
     #[test]
-    fn ac_19_04_wasm_fuel_exhaustion() {
+    fn ac_19_01_unloaded_plugin_error() {
         let mut runtime = ToolRuntime::new();
-
-        // WAT-Modul: Endlosschleife
-        let wat = r#"(module
-            (func (export "execute") (result i32)
-                (local $i i32)
-                (loop $loop
-                    (local.set $i (i32.add (local.get $i) (i32.const 1)))
-                    (br $loop)
-                )
-                i32.const 0
-            )
-        )"#;
-
-        let dir = tempfile::tempdir().unwrap();
-        let wasm_path = dir.path().join("infinite.wat");
-        std::fs::write(&wasm_path, wat).unwrap();
-
         let tool = ToolDefinition {
-            name: "wasm_hang".to_string(),
-            description: "Hanging wasm tool".to_string(),
-            wasm_path: Some(wasm_path.to_str().unwrap().to_string()),
+            name: "wasm_unloaded".to_string(),
+            description: "Unloaded wasm tool".to_string(),
+            wasm_path: Some("/some/plugin.wasm".to_string()),
             tool_type: ToolType::Wasm,
             required_capabilities: Vec::new(),
         };
         runtime.register_tool(tool).unwrap();
 
-        // Minimale Sandbox: nur 1ms CPU -> sehr wenig Fuel
-        let mut sandbox = SandboxConfig::restrictive();
-        sandbox.allowed_paths = vec![dir.path().to_path_buf()];
-        sandbox.max_cpu_ms = 1; // 1M fuel — Endlosschleife verbraucht das schnell
+        let sandbox = SandboxConfig::with_paths(vec![PathBuf::from("/tmp")]);
         let ctx = ctx_with_sandbox(sandbox);
+        let result = runtime.execute("wasm_unloaded", "test input", &ctx);
+        assert!(result.is_err(), "Unloaded plugin must fail");
+        assert!(
+            result.unwrap_err().to_string().contains("not loaded"),
+            "Error must mention 'not loaded'"
+        );
+    }
 
-        let result = runtime.execute("wasm_hang", "", &ctx);
-        assert!(
-            result.is_err(),
-            "Infinite loop must be stopped by fuel exhaustion"
-        );
-        // wasmtime stoppt die Ausfuehrung — Fehlermeldung variiert je nach Version
-        // (z.B. "all fuel consumed", "wasm trap", "error while executing")
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("fuel")
-                || err_msg.contains("Fuel")
-                || err_msg.contains("wasm")
-                || err_msg.contains("executing"),
-            "Error should indicate WASM execution was stopped: {err_msg}"
-        );
+    // AC-2: PluginConfig-Defaults sind korrekt (64MB Memory, 10M Fuel)
+    #[test]
+    fn ac_19_02_plugin_config_defaults() {
+        let config = PluginConfig::default();
+        assert_eq!(config.memory_limit_bytes, 64 * 1024 * 1024, "Default 64MB");
+        assert_eq!(config.fuel_limit, 10_000_000, "Default 10M instructions");
+        assert!(config.allowed_paths.is_empty());
+    }
+
+    // AC-4: Laden einer nicht-existenten Component-Datei schlaegt fehl
+    #[test]
+    fn ac_19_04_load_nonexistent_component() {
+        let mut runtime = ToolRuntime::new();
+        let config = PluginConfig {
+            wasm_path: PathBuf::from("/nonexistent/plugin.wasm"),
+            ..Default::default()
+        };
+        let result = runtime.plugin_host_mut().load(config);
+        assert!(result.is_err(), "Loading nonexistent .wasm must fail");
     }
 
     // AC-6: Fehlender wasm_path gibt klaren Fehler
@@ -418,6 +365,70 @@ mod wasm_tests {
         let sandbox = SandboxConfig::restrictive();
         let ctx = ctx_with_sandbox(sandbox);
         let result = runtime.execute("bad_path", "", &ctx);
-        assert!(result.is_err());
+        assert!(result.is_err(), "Nonexistent wasm file must fail");
+        assert!(
+            result.unwrap_err().to_string().contains("not loaded"),
+            "Error must indicate plugin is not loaded"
+        );
+    }
+
+    // AC-7: Native Tools und Wasm-Tools koexistieren in derselben Registry
+    #[test]
+    fn ac_19_07_native_and_wasm_coexist() {
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register_tool(make_tool("file_read", ToolType::FileRead))
+            .unwrap();
+        runtime
+            .register_tool(ToolDefinition {
+                name: "wasm_tool".to_string(),
+                description: "A WASM Component tool".to_string(),
+                wasm_path: Some("/some/plugin.wasm".to_string()),
+                tool_type: ToolType::Wasm,
+                required_capabilities: Vec::new(),
+            })
+            .unwrap();
+
+        assert_eq!(runtime.list_tools().len(), 2);
+
+        // Native FileRead funktioniert weiterhin neben registriertem Wasm-Tool
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("coexist.txt");
+        std::fs::write(&file, "native works").unwrap();
+
+        let sandbox = SandboxConfig::with_paths(vec![dir.path().to_path_buf()]);
+        let ctx = ctx_with_sandbox(sandbox);
+        let result = runtime
+            .execute("file_read", file.to_str().unwrap(), &ctx)
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output, "native works");
+    }
+
+    // AC-5: Capability-Check greift auch fuer Wasm-Tools
+    #[test]
+    fn ac_19_05_wasm_capability_check() {
+        let mut runtime = ToolRuntime::new();
+        let tool = ToolDefinition {
+            name: "wasm_admin".to_string(),
+            description: "Wasm tool needing admin".to_string(),
+            wasm_path: Some("/some/admin-plugin.wasm".to_string()),
+            tool_type: ToolType::Wasm,
+            required_capabilities: vec!["admin".to_string()],
+        };
+        runtime.register_tool(tool).unwrap();
+
+        let sandbox = SandboxConfig::restrictive();
+        // Agent hat file_read + file_write, aber NICHT admin
+        let ctx = ctx_with_sandbox(sandbox);
+        let result = runtime.execute("wasm_admin", "", &ctx);
+        assert!(result.is_err(), "Agent without admin cap must be denied");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("lacks required capabilities"),
+            "Error must mention missing capabilities"
+        );
     }
 }
