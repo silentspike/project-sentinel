@@ -245,7 +245,14 @@ mod tests {
 
     #[test]
     fn test_goal_new() {
-        let goal = Goal::new(1, "Thomas", GoalType::Career, "Befoerderung", 100, Some(5000));
+        let goal = Goal::new(
+            1,
+            "Thomas",
+            GoalType::Career,
+            "Befoerderung",
+            100,
+            Some(5000),
+        );
         assert_eq!(goal.id, 1);
         assert_eq!(goal.agent_name, "Thomas");
         assert_eq!(goal.goal_type, GoalType::Career);
@@ -358,7 +365,14 @@ mod tests {
 
     #[test]
     fn test_goal_serialization_roundtrip() {
-        let goal = Goal::new(42, "Thomas", GoalType::Career, "Befoerderung zum CTO", 1000, Some(50000));
+        let goal = Goal::new(
+            42,
+            "Thomas",
+            GoalType::Career,
+            "Befoerderung zum CTO",
+            1000,
+            Some(50000),
+        );
         let json = serde_json::to_string(&goal).unwrap();
         let deserialized: Goal = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.id, 42);
