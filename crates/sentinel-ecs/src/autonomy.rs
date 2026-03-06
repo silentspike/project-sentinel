@@ -13,7 +13,7 @@
 //! Cooldown: 30 Ticks pro Agent (verhindert wiederholte Aktionen).
 
 use super::components::*;
-use super::world::{EventBuffer, SimulationTime};
+use super::world::{EventBuffer, RoomDistanceMap, SimulationTime};
 use bevy_ecs::prelude::*;
 use sentinel_common::{DomainEvent, DomainEventPayload};
 
@@ -37,6 +37,7 @@ pub fn autonomy_system(
         &mut BioState,
         &mut AutonomyCooldown,
     )>,
+    room_distances: Option<Res<RoomDistanceMap>>,
     time: Res<SimulationTime>,
     mut event_buffer: ResMut<EventBuffer>,
 ) {
@@ -81,6 +82,7 @@ pub fn autonomy_system(
                     &correlation_id,
                     tick,
                     &mut event_buffer,
+                    &room_distances,
                 );
             }
             cooldown.last_action_tick = tick;
@@ -112,6 +114,7 @@ pub fn autonomy_system(
                     &correlation_id,
                     tick,
                     &mut event_buffer,
+                    &room_distances,
                 );
             }
             cooldown.last_action_tick = tick;
@@ -143,6 +146,7 @@ pub fn autonomy_system(
                     &correlation_id,
                     tick,
                     &mut event_buffer,
+                    &room_distances,
                 );
             }
             cooldown.last_action_tick = tick;
@@ -160,6 +164,7 @@ pub fn autonomy_system(
                     &correlation_id,
                     tick,
                     &mut event_buffer,
+                    &room_distances,
                 );
                 cooldown.last_action_tick = tick;
             }
@@ -178,6 +183,7 @@ pub fn autonomy_system(
                     &correlation_id,
                     tick,
                     &mut event_buffer,
+                    &room_distances,
                 );
                 cooldown.last_action_tick = tick;
             }
@@ -193,9 +199,16 @@ fn start_transit(
     correlation_id: &str,
     tick: u64,
     event_buffer: &mut EventBuffer,
+    room_distances: &Option<Res<RoomDistanceMap>>,
 ) {
     let from_room = position.room_id.clone();
-    let duration_ms: u32 = 3000;
+    // Distance-basierte Transit-Dauer: 1500ms Basis + 800ms pro Hop
+    let hops = room_distances
+        .as_ref()
+        .map(|rd| rd.distance(&from_room, target))
+        .unwrap_or(2);
+    let raw_ms = 1500 + hops * 800;
+    let duration_ms: u32 = raw_ms.clamp(2000, 5000);
 
     position.in_transit = true;
     position.transit_target = Some(target.to_string());
