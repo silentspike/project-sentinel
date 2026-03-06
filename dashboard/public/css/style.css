@@ -576,3 +576,227 @@ main { padding: 2rem; }
   font-style: italic;
   padding: 2rem 0;
 }
+
+/* ── Control Panel ──────────────────────────────── */
+
+.control-section {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.2rem;
+  margin-bottom: 1rem;
+}
+
+.control-section.compact { padding: 0.8rem; }
+
+.control-section-title {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 0.8rem;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.control-subtitle {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin: 0.8rem 0 0.4rem;
+}
+
+.control-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.control-row.compact { gap: 0.5rem; margin-bottom: 0.3rem; }
+
+.control-label {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  min-width: 120px;
+}
+
+.control-label-inline {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.control-value {
+  font-size: 0.85rem;
+  color: var(--text-primary);
+}
+
+.control-value.mono {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+}
+
+.control-input {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  padding: 0.4rem 0.6rem;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  width: 120px;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.control-input:focus { border-color: var(--accent); outline: none; }
+
+.control-select {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  padding: 0.4rem 0.6rem;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.control-select:focus { border-color: var(--accent); outline: none; }
+
+.control-textarea {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  padding: 0.5rem;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  width: 100%;
+  resize: vertical;
+  font-family: 'Inter', sans-serif;
+}
+
+.control-textarea:focus { border-color: var(--accent); outline: none; }
+
+.control-toggle {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.control-slider {
+  width: 150px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.control-btn {
+  padding: 0.5rem 1.2rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+  transition: all 0.2s;
+}
+
+.control-btn.pause {
+  background: var(--warning);
+  color: #000;
+  border-color: var(--warning);
+}
+
+.control-btn.resume {
+  background: var(--success);
+  color: #000;
+  border-color: var(--success);
+}
+
+.control-btn.primary {
+  background: var(--accent);
+  color: #000;
+  border-color: var(--accent);
+}
+
+.control-btn:hover { opacity: 0.85; }
+.control-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.control-btn-small {
+  padding: 0.2rem 0.6rem;
+  font-size: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  background: transparent;
+  color: var(--text-primary);
+}
+
+.control-btn-small.danger { color: var(--danger); border-color: var(--danger); }
+
+.control-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.status-dot.running { background: var(--success); box-shadow: 0 0 6px var(--success); }
+.status-dot.paused { background: var(--warning); box-shadow: 0 0 6px var(--warning); }
+
+.status-text {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.control-connection {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  margin-left: auto;
+}
+
+.control-connection.connected { color: var(--success); }
+.control-connection.disconnected { color: var(--danger); }
+
+.control-json {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.8rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--text-primary);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.control-no-data {
+  color: var(--text-secondary);
+  font-style: italic;
+  font-size: 0.85rem;
+}
+
+.control-feedback {
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  margin-bottom: 0.8rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.control-feedback.success {
+  background: rgba(0, 255, 157, 0.1);
+  color: var(--success);
+  border: 1px solid rgba(0, 255, 157, 0.3);
+}
+
+.control-feedback.error {
+  background: rgba(255, 68, 68, 0.1);
+  color: var(--danger);
+  border: 1px solid rgba(255, 68, 68, 0.3);
+}
