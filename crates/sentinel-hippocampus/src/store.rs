@@ -1,7 +1,7 @@
 //! Persistent storage for hippocampus memory data via redb.
 //!
 //! Separate database file (`hippocampus.redb`) from the main StateStore.
-//! 5 tables: episodes, narratives, facts, cache_state, goals.
+//! 6 tables: episodes, narratives, facts, cache_state, goals, archive.
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
@@ -15,6 +15,7 @@ const NARRATIVES: TableDefinition<&str, &[u8]> = TableDefinition::new("narrative
 const FACTS: TableDefinition<&str, &[u8]> = TableDefinition::new("facts");
 const CACHE_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("cache_state");
 const GOALS: TableDefinition<&str, &[u8]> = TableDefinition::new("goals");
+const ARCHIVE: TableDefinition<&str, &[u8]> = TableDefinition::new("archive");
 
 /// Persistent state for narrative memory (serializable for redb storage).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -35,7 +36,7 @@ pub struct HippocampusStore {
 impl HippocampusStore {
     /// Open or create the hippocampus store at the given path.
     ///
-    /// Creates all 5 tables if they don't exist.
+    /// Creates all 6 tables if they don't exist.
     pub fn open(path: &str) -> anyhow::Result<Self> {
         let db = Database::create(path).map_err(|e| {
             anyhow::anyhow!("Failed to create/open hippocampus.redb at {path}: {e}")
@@ -49,6 +50,7 @@ impl HippocampusStore {
             write_txn.open_table(FACTS)?;
             write_txn.open_table(CACHE_STATE)?;
             write_txn.open_table(GOALS)?;
+            write_txn.open_table(ARCHIVE)?;
         }
         write_txn.commit()?;
 
@@ -258,6 +260,59 @@ impl HippocampusStore {
     pub fn list_agents_with_goals(&self) -> anyhow::Result<Vec<String>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(GOALS)?;
+        let mut agents = Vec::new();
+        let iter = table.iter()?;
+        for entry in iter {
+            let (key, _): (redb::AccessGuard<'_, &str>, redb::AccessGuard<'_, &[u8]>) = entry?;
+            agents.push(key.value().to_string());
+        }
+        Ok(agents)
+    }
+
+    // === ARCHIVE (consolidated episode preservation) ===
+
+    /// Store archived episodes for an agent (overwrites existing).
+    pub fn store_archive(&self, agent: &str, eps: &[Episode]) -> anyhow::Result<()> {
+        let json = serde_json::to_vec(eps)?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(ARCHIVE)?;
+            table.insert(agent, json.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Load archived episodes for an agent. Returns empty vec if none stored.
+    pub fn load_archive(&self, agent: &str) -> anyhow::Result<Vec<Episode>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(ARCHIVE)?;
+        match table.get(agent)? {
+            Some(guard) => {
+                let bytes: &[u8] = guard.value();
+                let episodes: Vec<Episode> = serde_json::from_slice(bytes)?;
+                Ok(episodes)
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Append episodes to an agent's archive. Caps at 1000 episodes per agent.
+    pub fn append_archive(&self, agent: &str, new: &[Episode]) -> anyhow::Result<()> {
+        let mut existing = self.load_archive(agent)?;
+        existing.extend_from_slice(new);
+        // Cap at 1000 episodes — drop oldest if exceeding
+        if existing.len() > 1000 {
+            let excess = existing.len() - 1000;
+            existing.drain(..excess);
+        }
+        self.store_archive(agent, &existing)
+    }
+
+    /// List all agents that have archived episodes.
+    pub fn list_agents_with_archive(&self) -> anyhow::Result<Vec<String>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(ARCHIVE)?;
         let mut agents = Vec::new();
         let iter = table.iter()?;
         for entry in iter {
@@ -650,5 +705,97 @@ mod tests {
         // but we test that the struct enforces non-optional agent_name
         let goal = make_goal(1, "Thomas", GoalType::Career);
         assert!(!goal.agent_name.is_empty());
+    }
+
+    // === ARCHIVE Tests ===
+
+    #[test]
+    fn test_archive_store_load_roundtrip() {
+        let (store, _dir) = temp_store();
+        let episodes = vec![
+            make_episode(1, "Konsolidiert A"),
+            make_episode(2, "Konsolidiert B"),
+        ];
+
+        store.store_archive("Thomas", &episodes).unwrap();
+        let loaded = store.load_archive("Thomas").unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].summary, "Konsolidiert A");
+        assert_eq!(loaded[1].summary, "Konsolidiert B");
+    }
+
+    #[test]
+    fn test_archive_append() {
+        let (store, _dir) = temp_store();
+        store
+            .store_archive("Thomas", &[make_episode(1, "Erste Konsolidierung")])
+            .unwrap();
+        store
+            .append_archive("Thomas", &[make_episode(2, "Zweite Konsolidierung")])
+            .unwrap();
+
+        let loaded = store.load_archive("Thomas").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].summary, "Erste Konsolidierung");
+        assert_eq!(loaded[1].summary, "Zweite Konsolidierung");
+    }
+
+    #[test]
+    fn test_archive_load_nonexistent() {
+        let (store, _dir) = temp_store();
+        let loaded = store.load_archive("Nobody").unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn test_archive_caps_at_1000() {
+        let (store, _dir) = temp_store();
+        let many: Vec<Episode> = (0..1100)
+            .map(|i| make_episode(i, &format!("Episode {i}")))
+            .collect();
+
+        store.append_archive("Thomas", &many).unwrap();
+        let loaded = store.load_archive("Thomas").unwrap();
+        assert_eq!(loaded.len(), 1000);
+        // Oldest should be pruned, newest kept
+        assert_eq!(loaded[0].summary, "Episode 100");
+        assert_eq!(loaded[999].summary, "Episode 1099");
+    }
+
+    #[test]
+    fn test_archive_data_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive-persist.redb");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let store = HippocampusStore::open(path_str).unwrap();
+            store
+                .store_archive("Thomas", &[make_episode(1, "Archived")])
+                .unwrap();
+        }
+
+        {
+            let store = HippocampusStore::open(path_str).unwrap();
+            let loaded = store.load_archive("Thomas").unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].summary, "Archived");
+        }
+    }
+
+    #[test]
+    fn test_archive_list_agents() {
+        let (store, _dir) = temp_store();
+        store
+            .store_archive("Thomas", &[make_episode(1, "A")])
+            .unwrap();
+        store
+            .store_archive("Lisa", &[make_episode(2, "B")])
+            .unwrap();
+
+        let mut agents = store.list_agents_with_archive().unwrap();
+        agents.sort();
+        assert_eq!(agents, vec!["Lisa", "Thomas"]);
     }
 }

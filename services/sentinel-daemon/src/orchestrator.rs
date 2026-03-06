@@ -38,7 +38,7 @@ use crate::controlplane::config::ControlplaneConfig;
 use crate::controlplane::store::ControlplaneStore;
 use crate::controlplane::ControlplaneKernel;
 use crate::episode_producer::EpisodeProducer;
-use crate::shift::{agents_for_shift, detect_current_shift};
+use crate::shift::{agents_for_shift, detect_current_shift, detect_shift_from_sim_hour};
 use crate::signal::wait_for_shutdown;
 
 /// Mapping von shift_set auf (start_hour, end_hour).
@@ -895,7 +895,11 @@ fn ecs_tick_loop(
 
         // Shift-Erkennung (alle 60 Ticks = ~1 Minute bei 1s Tick-Rate)
         if tick_count > 0 && tick_count.is_multiple_of(60) {
-            let new_shift = detect_current_shift();
+            let new_shift = if (time_scale - 1.0).abs() < f32::EPSILON {
+                detect_current_shift()              // Production: System-Uhrzeit
+            } else {
+                detect_shift_from_sim_hour(sim_hour) // Beschleunigt: sim_hour
+            };
             if new_shift != current_shift {
                 info!(
                     old = current_shift,
@@ -971,6 +975,7 @@ fn ecs_tick_loop(
                                             voice_style.as_deref(),
                                             behavioral_notes.as_deref(),
                                             Some(narrative.as_bytes()),
+                                            None, // agent_facts bridged separately
                                         ) {
                                             Ok(version) => {
                                                 info!(
@@ -1013,6 +1018,31 @@ fn ecs_tick_loop(
                                                         agent = name,
                                                         error = %e,
                                                         "NMDA scores redb-Write fehlgeschlagen"
+                                                    );
+                                                }
+                                            }
+                                        }
+
+                                        // Facts aus Hippocampus FactRetriever nach state.redb bridgen
+                                        let facts = episode_producer
+                                            .hippocampus()
+                                            .retrieve_facts(name);
+                                        if !facts.is_empty() {
+                                            let facts_json = serde_json::to_vec(&facts)
+                                                .unwrap_or_default();
+                                            match store.set_agent_facts(*agent_id, &facts_json) {
+                                                Ok(()) => {
+                                                    info!(
+                                                        agent = name,
+                                                        facts_count = facts.len(),
+                                                        "AGENT_FACTS nach state.redb geschrieben"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        agent = name,
+                                                        error = %e,
+                                                        "AGENT_FACTS redb-Write fehlgeschlagen"
                                                     );
                                                 }
                                             }
