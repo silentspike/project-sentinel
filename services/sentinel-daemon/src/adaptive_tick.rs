@@ -115,7 +115,12 @@ impl AdaptiveTickRate {
 
     /// Erstellt einen Controller mit expliziten PSI-Werten (fuer Tests).
     #[cfg(test)]
-    pub fn with_psi(config: AdaptiveConfig, cpu: PsiMetrics, mem: PsiMetrics, io: PsiMetrics) -> Self {
+    pub fn with_psi(
+        config: AdaptiveConfig,
+        cpu: PsiMetrics,
+        mem: PsiMetrics,
+        io: PsiMetrics,
+    ) -> Self {
         Self {
             config,
             cpu_psi: cpu,
@@ -205,7 +210,8 @@ impl AdaptiveTickRate {
     /// TOGAF: IO PSI avg10 > 70% → Batching 500ms.
     /// Sonst: 0 (kein Batching).
     pub fn batching_window_ms(&self) -> u64 {
-        if self.config.enabled && self.psi_available && self.io_psi.avg10 > self.config.io_threshold {
+        if self.config.enabled && self.psi_available && self.io_psi.avg10 > self.config.io_threshold
+        {
             500
         } else {
             0
@@ -243,12 +249,8 @@ mod tests {
 
     #[test]
     fn test_normal_rate_no_pressure() {
-        let at = AdaptiveTickRate::with_psi(
-            AdaptiveConfig::default(),
-            psi(0.0),
-            psi(0.0),
-            psi(0.0),
-        );
+        let at =
+            AdaptiveTickRate::with_psi(AdaptiveConfig::default(), psi(0.0), psi(0.0), psi(0.0));
         let base = Duration::from_millis(1000);
         assert_eq!(at.compute_effective_rate(base), base);
     }
@@ -351,12 +353,8 @@ mod tests {
     #[test]
     fn test_floor_with_higher_base_rate() {
         // Base rate 1500ms * 2 = 3000ms, aber Floor ist 2000ms
-        let at = AdaptiveTickRate::with_psi(
-            AdaptiveConfig::default(),
-            psi(90.0),
-            psi(0.0),
-            psi(0.0),
-        );
+        let at =
+            AdaptiveTickRate::with_psi(AdaptiveConfig::default(), psi(90.0), psi(0.0), psi(0.0));
         let base = Duration::from_millis(1500);
         assert_eq!(at.compute_effective_rate(base), Duration::from_millis(2000));
     }
