@@ -441,6 +441,18 @@ fertig = "fertig"
 schaue = "schaue"
 Satzlaenge = "Satzlaenge"
 
+# Bio-Engine dynamics words (Issue #148 - German in Rust doc comments)
+realistisch = "realistisch"
+realistische = "realistische"
+realistischen = "realistischen"
+realistischer = "realistischer"
+Muedigkeit = "Muedigkeit"
+Traegheit = "Traegheit"
+Erschoepft = "Erschoepft"
+Akkumuliert = "Akkumuliert"
+akkumuliert = "akkumuliert"
+Arbeitstages = "Arbeitstages"
+
 # Prompt Compiler words (Issue #58 - German personality traits in Go string literals)
 pragmatisch = "pragmatisch"
 flexibel = "flexibel"

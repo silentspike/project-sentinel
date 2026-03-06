@@ -126,6 +126,8 @@ impl ProjectionHandler for AgentLiveViewHandler {
                 caffeine_mg,
                 room_id,
                 mood,
+                valence: _,
+                arousal: _,
             } => {
                 debug!(
                     agent_id = agent_id.0,
