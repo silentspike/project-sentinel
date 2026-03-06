@@ -1024,12 +1024,11 @@ fn ecs_tick_loop(
                                         }
 
                                         // Facts aus Hippocampus FactRetriever nach state.redb bridgen
-                                        let facts = episode_producer
-                                            .hippocampus()
-                                            .retrieve_facts(name);
+                                        let facts =
+                                            episode_producer.hippocampus().retrieve_facts(name);
                                         if !facts.is_empty() {
-                                            let facts_json = serde_json::to_vec(&facts)
-                                                .unwrap_or_default();
+                                            let facts_json =
+                                                serde_json::to_vec(&facts).unwrap_or_default();
                                             match store.set_agent_facts(*agent_id, &facts_json) {
                                                 Ok(()) => {
                                                     info!(
