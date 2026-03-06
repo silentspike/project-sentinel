@@ -133,6 +133,44 @@ func TestTomlReadonly(t *testing.T) {
 	t.Log("TOML readonly verified: compiler package only uses os.ReadFile + filepath.Glob")
 }
 
+func TestEvolutionFromMetadata_WithFacts(t *testing.T) {
+	meta := map[string]string{
+		"evolution_voice": "direkt",
+		"evolution_facts": "[\"Projekt Aurora: Redesign\",\"Budget: 150k\"]",
+	}
+	evo := EvolutionFromMetadata(meta)
+	if evo.VoiceStyle != "direkt" {
+		t.Errorf("VoiceStyle = %q, want %q", evo.VoiceStyle, "direkt")
+	}
+	if evo.AgentFacts != "[\"Projekt Aurora: Redesign\",\"Budget: 150k\"]" {
+		t.Errorf("AgentFacts not parsed from metadata: %q", evo.AgentFacts)
+	}
+}
+
+func TestFormatEvolution_WithFacts(t *testing.T) {
+	evo := EvolutionData{
+		VoiceStyle: "sachlich",
+		AgentFacts: "[\"Sprint 12: Dashboard\"]",
+	}
+	result := formatEvolution(evo)
+	if !strings.Contains(result, "Sprechstil: sachlich") {
+		t.Error("should contain voice style")
+	}
+	if !strings.Contains(result, "Unternehmens-Fakten:") {
+		t.Error("should contain Unternehmens-Fakten section")
+	}
+	if !strings.Contains(result, "Sprint 12") {
+		t.Error("should contain facts content")
+	}
+}
+
+func TestIsEmpty_WithOnlyFacts(t *testing.T) {
+	evo := EvolutionData{AgentFacts: "some facts"}
+	if evo.IsEmpty() {
+		t.Error("IsEmpty() should return false when only AgentFacts is set")
+	}
+}
+
 func TestNewWithAssembler(t *testing.T) {
 	dir := setupTestAgent(t)
 	loader := NewTOMLLoader(dir)

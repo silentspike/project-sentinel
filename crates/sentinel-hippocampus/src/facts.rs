@@ -27,22 +27,52 @@ pub trait FactStore {
 }
 
 /// Trigger-based fact retriever with a generic storage backend.
+///
+/// Combines the 8 default `FACT_TRIGGERS` with dynamically added custom triggers.
+/// Custom triggers are checked AFTER defaults, allowing agent-specific or
+/// night-run-derived facts to be injected at runtime.
 pub struct FactRetriever<S: FactStore> {
     store: S,
+    custom_triggers: Vec<(String, String)>,
 }
 
 impl<S: FactStore> FactRetriever<S> {
     pub fn new(store: S) -> Self {
-        Self { store }
+        Self {
+            store,
+            custom_triggers: Vec::new(),
+        }
+    }
+
+    /// Create a retriever with initial custom triggers on top of the defaults.
+    pub fn with_triggers(store: S, triggers: &[(&str, &str)]) -> Self {
+        let custom_triggers = triggers
+            .iter()
+            .map(|(t, k)| (t.to_string(), k.to_string()))
+            .collect();
+        Self {
+            store,
+            custom_triggers,
+        }
+    }
+
+    /// Add custom triggers (extends, does not replace defaults or existing custom triggers).
+    pub fn add_triggers(&mut self, triggers: &[(&str, &str)]) {
+        for (trigger, key) in triggers {
+            self.custom_triggers
+                .push((trigger.to_string(), key.to_string()));
+        }
     }
 
     /// Check if the current context triggers any fact retrieval.
     ///
     /// Returns a list of facts whose trigger words were found in the context.
-    /// Matching is case-insensitive.
+    /// Matching is case-insensitive. Checks default triggers first, then custom.
     pub fn check_triggers(&self, context: &str) -> Vec<String> {
         let lower = context.to_lowercase();
         let mut facts = Vec::new();
+
+        // Default triggers
         for (trigger, key) in FACT_TRIGGERS {
             if lower.contains(&trigger.to_lowercase()) {
                 if let Ok(Some(fact)) = self.store.get_fact(key) {
@@ -50,12 +80,27 @@ impl<S: FactStore> FactRetriever<S> {
                 }
             }
         }
+
+        // Custom triggers
+        for (trigger, key) in &self.custom_triggers {
+            if lower.contains(&trigger.to_lowercase()) {
+                if let Ok(Some(fact)) = self.store.get_fact(key) {
+                    facts.push(fact);
+                }
+            }
+        }
+
         facts
     }
 
     /// Get the underlying store reference.
     pub fn store(&self) -> &S {
         &self.store
+    }
+
+    /// Number of custom triggers (excludes the 8 defaults).
+    pub fn custom_trigger_count(&self) -> usize {
+        self.custom_triggers.len()
     }
 }
 
@@ -205,5 +250,53 @@ mod tests {
         let retriever = FactRetriever::new(store);
         let facts = retriever.check_triggers("Scrum Sprint Review morgen");
         assert!(facts.len() >= 2);
+    }
+
+    // === Extensible Trigger Tests ===
+
+    #[test]
+    fn test_custom_triggers() {
+        let mut store = test_store();
+        store.insert("facts/custom/server", "Server: 10 VMs im Cluster");
+
+        let retriever =
+            FactRetriever::with_triggers(store, &[("Serverraum", "facts/custom/server")]);
+
+        let facts = retriever.check_triggers("Wartung im Serverraum geplant");
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].contains("10 VMs"));
+    }
+
+    #[test]
+    fn test_add_triggers_extends_defaults() {
+        let mut store = test_store();
+        store.insert("facts/custom/deploy", "Deploy: freitags 16 Uhr");
+
+        let mut retriever = FactRetriever::new(store);
+        assert_eq!(retriever.custom_trigger_count(), 0);
+
+        retriever.add_triggers(&[("Deployment", "facts/custom/deploy")]);
+        assert_eq!(retriever.custom_trigger_count(), 1);
+
+        // Custom trigger works
+        let facts = retriever.check_triggers("Deployment Pipeline laeuft");
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].contains("freitags"));
+
+        // Default triggers still work
+        let facts2 = retriever.check_triggers("Budget fuer Projekt Aurora pruefen");
+        assert_eq!(facts2.len(), 2);
+    }
+
+    #[test]
+    fn test_custom_and_default_triggers_combine() {
+        let mut store = test_store();
+        store.insert("facts/custom/meeting", "Meeting: Raum 3, 14 Uhr");
+
+        let retriever = FactRetriever::with_triggers(store, &[("Standup", "facts/custom/meeting")]);
+
+        // Context hits both a default ("Sprint") and custom ("Standup") trigger
+        let facts = retriever.check_triggers("Sprint Standup morgen frueh");
+        assert_eq!(facts.len(), 2);
     }
 }

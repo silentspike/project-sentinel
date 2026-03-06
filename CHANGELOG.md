@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Archive Layer + FactRetriever Full-Stack Integration** (#142)
+  - `store.rs`: ARCHIVE redb table (6th table in hippocampus.redb), append_archive/load_archive CRUD
+  - `service.rs`: Consolidation archives episodes BEFORE clearing (data preservation)
+  - `facts.rs`: FactRetriever extensible with custom triggers (add_triggers, with_triggers)
+  - `sentinel-redb/lib.rs`: AGENT_FACTS table in state.redb, set_evolution_batch 5th parameter
+  - `orchestrator.rs`: Facts Bridge (hippocampus FactRetriever → state.redb AGENT_FACTS)
+  - `llm_bridge.rs`: evolution_facts read from state.redb into LLM metadata
+  - `evolution.go`: AgentFacts field in EvolutionData, EvolutionFromMetadata, IsEmpty
+  - `assembler.go`: formatEvolution includes Unternehmens-Fakten block
+  - `shift.rs`: detect_shift_from_sim_hour() for virtualized shift detection (time_scale != 1.0)
+  - `orchestrator.rs`: Conditional shift detection (system clock at time_scale=1.0, sim_hour otherwise)
+  - 15 new Rust tests (archive, facts, agent_facts, shift) + 3 new Go tests
+
 - **GOLF Framework — Goal-Oriented Life Tasks** (#141)
   - `golf.rs`: Goal struct, GoalType (Career/Project/Social/Skill), GoalStatus enums
   - `store.rs`: GOALS redb table (5th table), CRUD methods (store/load/append/update/list)

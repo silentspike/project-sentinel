@@ -63,7 +63,8 @@ impl HippocampusService {
     /// 2. Run SleepCycle scoring + selection
     /// 3. Build narrative from selected episodes
     /// 4. Store narrative persistently
-    /// 5. Clear processed episodes
+    /// 5. Archive all processed episodes (preserve before clearing)
+    /// 6. Clear processed episodes
     pub fn consolidate_agent(&self, agent: &str) -> anyhow::Result<ConsolidationResult> {
         let episodes = self.store.load_episodes(agent)?;
         let episodes_processed = episodes.len();
@@ -79,7 +80,7 @@ impl HippocampusService {
 
         // Run sleep cycle (scoring + selection + consolidation)
         let mut cycle = SleepCycle::new(agent);
-        let selected = cycle.run_full_cycle(episodes)?;
+        let selected = cycle.run_full_cycle(episodes.clone())?;
         let episodes_consolidated = selected.len();
 
         // Use the narrative built during the consolidation phase
@@ -96,7 +97,10 @@ impl HippocampusService {
         };
         self.store.store_narrative(agent, &narrative_state)?;
 
-        // Clear processed episodes
+        // Archive all processed episodes BEFORE clearing (preserve for long-term)
+        self.store.append_archive(agent, &episodes)?;
+
+        // Clear processed episodes (safe — already archived above)
         self.store.clear_episodes(agent)?;
 
         Ok(ConsolidationResult {
@@ -152,6 +156,11 @@ impl HippocampusService {
     pub fn get_narrative(&self, agent: &str) -> anyhow::Result<Option<String>> {
         let state = self.store.load_narrative(agent)?;
         Ok(state.map(|s| s.summary))
+    }
+
+    /// Get archived episodes for an agent (long-term memory).
+    pub fn get_archive(&self, agent: &str) -> anyhow::Result<Vec<crate::episode::Episode>> {
+        self.store.load_archive(agent)
     }
 
     // === GOLF (Goal-Oriented Life Tasks) ===
@@ -514,5 +523,88 @@ mod tests {
         let (service, _dir) = temp_service();
         let goals = service.get_goals("Nobody").unwrap();
         assert!(goals.is_empty());
+    }
+
+    // === ARCHIVE Service Tests ===
+
+    #[test]
+    fn test_consolidation_archives_episodes() {
+        let (service, _dir) = temp_service();
+
+        let episodes = vec![
+            make_episode(1, "Thomas", "Wichtiges Meeting", 0.9, 0.8, 2, 1.0),
+            make_episode(2, "Thomas", "Kaffee getrunken", 0.1, 0.1, 1, 3.0),
+        ];
+        service.record_episodes("Thomas", &episodes).unwrap();
+
+        // Consolidate — should archive before clearing
+        service.consolidate_agent("Thomas").unwrap();
+
+        // Episodes should be cleared
+        let remaining = service.store().load_episodes("Thomas").unwrap();
+        assert!(
+            remaining.is_empty(),
+            "Episodes should be cleared after consolidation"
+        );
+
+        // But archive should contain them
+        let archived = service.get_archive("Thomas").unwrap();
+        assert_eq!(archived.len(), 2, "All episodes should be archived");
+        assert_eq!(archived[0].summary, "Wichtiges Meeting");
+        assert_eq!(archived[1].summary, "Kaffee getrunken");
+    }
+
+    #[test]
+    fn test_archive_preserves_episode_data() {
+        let (service, _dir) = temp_service();
+
+        let ep = make_episode(42, "Lisa", "Design Review mit Kunde", 0.85, 0.7, 2, 0.5);
+        service.record_episode(ep).unwrap();
+
+        service.consolidate_agent("Lisa").unwrap();
+
+        let archived = service.get_archive("Lisa").unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, 42);
+        assert_eq!(archived[0].agent_name, "Lisa");
+        assert_eq!(archived[0].summary, "Design Review mit Kunde");
+        assert_eq!(archived[0].relevance, 0.85);
+    }
+
+    #[test]
+    fn test_archive_accumulates_across_consolidations() {
+        let (service, _dir) = temp_service();
+
+        // First consolidation
+        service
+            .record_episodes(
+                "Thomas",
+                &[make_episode(1, "Thomas", "Runde 1", 0.9, 0.8, 1, 0.5)],
+            )
+            .unwrap();
+        service.consolidate_agent("Thomas").unwrap();
+
+        // Second consolidation
+        service
+            .record_episodes(
+                "Thomas",
+                &[make_episode(2, "Thomas", "Runde 2", 0.9, 0.8, 1, 0.5)],
+            )
+            .unwrap();
+        service.consolidate_agent("Thomas").unwrap();
+
+        let archived = service.get_archive("Thomas").unwrap();
+        assert_eq!(
+            archived.len(),
+            2,
+            "Archive should accumulate across consolidations"
+        );
+    }
+
+    #[test]
+    fn test_archive_empty_on_no_consolidation() {
+        let (service, _dir) = temp_service();
+        let archived = service.get_archive("Nobody").unwrap();
+        assert!(archived.is_empty());
     }
 }

@@ -151,6 +151,9 @@ func formatEvolution(evo EvolutionData) string {
 	if evo.Relationships != "" {
 		fmt.Fprintf(&b, "Beziehungen: %s\n", evo.Relationships)
 	}
+	if evo.AgentFacts != "" {
+		fmt.Fprintf(&b, "Unternehmens-Fakten: %s\n", evo.AgentFacts)
+	}
 	return b.String()
 }
 
