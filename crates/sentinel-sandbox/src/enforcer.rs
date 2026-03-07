@@ -120,6 +120,9 @@ pub struct SandboxEnforcer {
     netns_available: bool,
     /// Whether OOM score has been set for ECS core.
     oom_set: AtomicBool,
+    /// Optional sentinel-fs FUSE mount path.
+    /// When set, bwrap binds `{fs_mount}/{name}` instead of `/ram/agents/{name}`.
+    fs_mount: Option<String>,
 }
 
 impl std::fmt::Debug for SandboxEnforcer {
@@ -223,9 +226,18 @@ impl SandboxEnforcer {
             bwrap_available,
             netns_available,
             oom_set,
+            fs_mount: None,
         };
 
         (enforcer, warnings)
+    }
+
+    /// Sets the sentinel-fs FUSE mount path.
+    ///
+    /// When set, `start_agent_process()` binds `{fs_mount}/{name}` instead
+    /// of the default `/ram/agents/{name}` as the agent's writable home.
+    pub fn set_fs_mount(&mut self, path: String) {
+        self.fs_mount = Some(path);
     }
 
     /// Creates sandbox resources for an agent (cgroup + home directory).
@@ -276,6 +288,12 @@ impl SandboxEnforcer {
         }
 
         let mut config = BwrapConfig::for_agent(name);
+
+        // sentinel-fs FUSE mount: replace /ram/agents/ with FUSE mount path
+        if let Some(ref fs_mount) = self.fs_mount {
+            config = config.with_fs_mount(fs_mount, name);
+        }
+
         // TOGAF default: share_net=true (Cortex Gateway API-Zugang)
         // Wenn netns verfuegbar: isoliertes Netzwerk via veth-Pair (spaeter)
         if self.netns_available {

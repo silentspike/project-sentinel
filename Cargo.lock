@@ -4055,6 +4055,7 @@ dependencies = [
  "sentinel-common",
  "sentinel-ebpf",
  "sentinel-ecs",
+ "sentinel-fs",
  "sentinel-hippocampus",
  "sentinel-limbo",
  "sentinel-redb",

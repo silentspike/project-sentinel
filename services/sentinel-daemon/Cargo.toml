@@ -26,6 +26,7 @@ sentinel-telemetry = { path = "../../crates/sentinel-telemetry" }
 sentinel-ebpf = { path = "../../crates/sentinel-ebpf" }
 sentinel-hippocampus = { path = "../../crates/sentinel-hippocampus" }
 sentinel-wasm = { path = "../../crates/sentinel-wasm" }
+sentinel-fs = { path = "../../crates/sentinel-fs", optional = true }
 bevy_ecs = { workspace = true }
 redb = { workspace = true }
 tokio = { workspace = true }
@@ -49,6 +50,7 @@ llm = ["reqwest"]
 ebpf = ["sentinel-ebpf/ebpf"]
 nats = ["async-nats", "futures", "reqwest"]
 wasm = ["sentinel-wasm/wasm", "sentinel-ecs/wasm"]
+fuse = ["sentinel-fs/fuse-tests"]
 
 [dev-dependencies]
 tempfile = "3"

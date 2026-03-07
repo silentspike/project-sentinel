@@ -51,6 +51,12 @@ pub struct DaemonConfig {
     /// PSI-basierte adaptive Tick-Rate (TOGAF Adaptive Scheduling).
     #[serde(default)]
     pub adaptive: AdaptiveConfig,
+
+    /// sentinel-fs FUSE Mountpoint (default: None = kein FUSE, nutzt /ram/agents/).
+    /// Wenn gesetzt: FUSE-Mount wird beim Start initialisiert, bwrap bindet
+    /// `{fs_mount}/{agent_name}` → `/home/{agent_name}`.
+    #[serde(default)]
+    pub fs_mount: Option<String>,
 }
 
 /// NATS JetStream Konfiguration fuer den Daemon.
