@@ -441,6 +441,9 @@ fertig = "fertig"
 schaue = "schaue"
 Satzlaenge = "Satzlaenge"
 
+# Transit-Varianz words (Issue #194 - German in Rust test comments)
+statistisch = "statistisch"
+
 # Bio-Engine dynamics words (Issue #148 - German in Rust doc comments)
 realistisch = "realistisch"
 realistische = "realistische"
