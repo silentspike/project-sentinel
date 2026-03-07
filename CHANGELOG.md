@@ -50,6 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Flaky Test `test_ecs_tick_loop_runs_ticks`** (#135)
+  - `services/sentinel-daemon/src/orchestrator.rs`: Threading invertiert — `ecs_tick_loop` laeuft im Background-Thread, Perception-Warten im Main-Thread. Eliminiert Race Condition bei der `recv_timeout(30s)` vor Loop-Start zurueckkehren konnte (Setup-Dauer auf belastetem CI Runner). Gleiches Fix fuer `test_save_state_on_shutdown`.
+
 - **Gateway Provider-Routing Bug** (#138)
   - `services/sentinel-daemon/src/orchestrator.rs`: `extract_swap_provider()` setzte Fallback auf "claude" (API) statt "claude-code" (Subscription) — alle Agent-Overrides zeigten auf nicht-registrierten Provider → 502
   - Match-Reihenfolge korrigiert: "claude-code" vor "claude" (laengster Match zuerst)
