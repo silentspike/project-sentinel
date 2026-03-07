@@ -2,7 +2,7 @@ module github.com/obtFusi/project-sentinel/services/sentinel-nats-bridge
 
 go 1.25.0
 
-toolchain go1.25.7
+toolchain go1.25.8
 
 require (
 	github.com/BurntSushi/toml v1.6.0
