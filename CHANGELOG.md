@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **WASM Component Model Runtime** (#19)
+  - `crates/sentinel-wasm/wit/world.wit`: WIT Interface Definition (`sentinel:plugin@0.1.0`) mit Host-API (fs-read/write/list, get-agent-info, get-room-info, log, get-tick) und Plugin-Exports (execute, tool-name, tool-description)
+  - `crates/sentinel-wasm/src/host.rs`: `bindgen!`-basierte Host-Implementation, `PluginState` mit WASI 0.2 Context, `AgentSnapshot`/`RoomSnapshot` ECS-Bridges, 7 Host-Function Traits
+  - `crates/sentinel-wasm/src/plugin.rs`: `PluginHost` (Engine + Linker + Component Cache), `PluginConfig` (Memory 64MB, Fuel 10M, WASI preopened dirs), Lifecycle: compile-once/instantiate-per-call
+  - `crates/sentinel-wasm/src/runner.rs`: `execute_component()` ersetzt `execute_wasm()`, `ExecutionContext` mit optionalen ECS-Snapshots (`agent_snapshot`, `rooms`) hinter `cfg(feature = "wasm")`
+  - wasmtime 42 mit Component Model + WASI 0.2 (`wasmtime-wasi` 42), Fuel-Metering, `StoreLimitsBuilder`
+  - `services/sentinel-daemon/src/orchestrator.rs`: WASM-Plugin Auto-Load aus `config/tools/*.wasm` mit `query_meta()` fuer Tool-Name/Description
+  - `crates/sentinel-ecs/tests/wasm_ecs_integration.rs`: 7 ECS-Integrationstests (voller bevy_ecs World+Schedule Pipeline: Agent→input_system→WASM→DomainEvent)
+  - Test-Fixtures: `echo-plugin.wasm`, `loop-plugin.wasm`, `fs-plugin.wasm` (alle Rust `wasm32-wasip2` Components)
+  - `fs-plugin`: Nutzt alle 7 Host-API Functions (fs-read/write/list, get-agent-info, get-room-info, get-tick, log) — beweist "Fake OS" E2E
+  - `crates/sentinel-sandbox/src/bwrap.rs`: `with_fs_mount()` Builder — optionaler sentinel-fs FUSE-Mount statt `/ram/agents/`
+  - `crates/sentinel-sandbox/src/enforcer.rs`: `set_fs_mount()` — SandboxEnforcer nutzt FUSE-Mount fuer Agent-Homes
+  - `services/sentinel-daemon/src/config.rs`: `fs_mount` Config-Feld (Optional, Default: None)
+  - `services/sentinel-daemon/src/orchestrator.rs`: FUSE-Mount Initialisierung beim Daemon-Start (Feature `fuse`), WASM-Plugin Auto-Load
+  - 113 sentinel-wasm Tests (51 Unit + 35 E2E + 20 Acceptance + 7 Security), 0 Failures
+  - 7 sentinel-ecs WASM Integration Tests (Multi-Agent, Native+WASM Koexistenz, Fehlerfaelle)
+  - 13 Benchmarks (6 native + 7 Component Model: cold/warm start, host roundtrip, E2E, query_meta)
+
 - **Transit-Varianz + Flurbegegnungen** (#194)
   - `sentinel-common/src/room.rs`: `shortest_distance()` BFS-Methode fuer Raum-Distanzen + 5 Tests
   - `sentinel-ecs/src/systems.rs`: Transit-Dauer von hart-codiertem 3000ms auf `(1500 + hops * 800).clamp(2000, 5000)` umgestellt (distanz-basiert)
@@ -24,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `sentinel-ecs/src/systems.rs`: `bio_system()` ruft `apply_psi_stress()` auf via `PsiMetrics` ECS Resource
   - `sentinel-ecs/src/world.rs`: `PsiMetrics` ECS Resource (cpu_avg10, mem_avg10)
   - `services/sentinel-daemon/src/orchestrator.rs`: PSI-Metriken aus AdaptiveTickRate in ECS World injiziert vor jedem Schedule-Run
+
+### Security
+
+- **Go Toolchain Update** go1.25.7 → go1.25.8 (GO-2026-4600, GO-2026-4601, GO-2026-4602)
+  - `go.work`: `toolchain go1.25.8` — fixes FileInfo escape from Root in os, IPv6 host literal parsing in net/url, panic in x509 name constraint checking
 
 ### Fixed
 

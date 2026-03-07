@@ -144,13 +144,26 @@ pub fn input_system(
                                     if let Some((tool_name, tool_input)) =
                                         parse_tool_content(content)
                                     {
-                                        let sandbox = sentinel_wasm::SandboxConfig::restrictive();
+                                        // Agent-Home als allowed_path setzen (mapped auf
+                                        // sentinel-fs CoW-Layer via bwrap Bind-Mount).
+                                        let agent_home = std::path::PathBuf::from(format!(
+                                            "/home/AGENT-{:02}",
+                                            identity.agent_id.0
+                                        ));
+                                        let sandbox = sentinel_wasm::SandboxConfig {
+                                            allowed_paths: vec![agent_home],
+                                            ..sentinel_wasm::SandboxConfig::restrictive()
+                                        };
                                         let ctx = sentinel_wasm::ExecutionContext {
                                             agent_id: format!("AGENT-{:02}", identity.agent_id.0),
                                             agent_capabilities: capabilities.tools.clone(),
                                             sandbox,
                                             correlation_id: correlation_id.clone(),
                                             tick: time.tick.0,
+                                            #[cfg(feature = "wasm")]
+                                            agent_snapshot: None,
+                                            #[cfg(feature = "wasm")]
+                                            rooms: None,
                                         };
                                         match runtime.0.execute(&tool_name, &tool_input, &ctx) {
                                             Ok(result) => {
