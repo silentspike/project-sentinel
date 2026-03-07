@@ -43,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `sentinel-ecs/src/world.rs`: `PsiMetrics` ECS Resource (cpu_avg10, mem_avg10)
   - `services/sentinel-daemon/src/orchestrator.rs`: PSI-Metriken aus AdaptiveTickRate in ECS World injiziert vor jedem Schedule-Run
 
+### Security
+
+- **Go Toolchain Update** go1.25.7 → go1.25.8 (GO-2026-4600, GO-2026-4601, GO-2026-4602)
+  - `go.work`: `toolchain go1.25.8` — fixes FileInfo escape from Root in os, IPv6 host literal parsing in net/url, panic in x509 name constraint checking
+
 ### Fixed
 
 - **Gateway Provider-Routing Bug** (#138)
