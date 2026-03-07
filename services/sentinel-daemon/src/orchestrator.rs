@@ -248,8 +248,42 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             }
         };
 
+    // -- sentinel-fs FUSE Mount (optional, konfigurierbar) --
+    #[cfg(feature = "fuse")]
+    if let Some(ref fs_mount) = config.fs_mount {
+        let mountpoint = std::path::PathBuf::from(fs_mount);
+        let data_dir_clone = data_dir.clone();
+        if !mountpoint.exists() {
+            std::fs::create_dir_all(&mountpoint)
+                .with_context(|| format!("FUSE mountpoint erstellen: {}", mountpoint.display()))?;
+        }
+        info!(
+            mountpoint = %mountpoint.display(),
+            data_dir = %data_dir_clone.display(),
+            "sentinel-fs FUSE-Mount starten"
+        );
+        std::thread::spawn(move || {
+            if let Err(e) = sentinel_fs::start_fuse(&data_dir_clone, &mountpoint) {
+                error!(error = %e, "sentinel-fs FUSE-Mount fehlgeschlagen");
+            }
+        });
+        // Kurz warten bis FUSE mounted ist
+        std::thread::sleep(Duration::from_millis(200));
+        if mountpoint.join("__BASE__").exists() || mountpoint.read_dir().is_ok() {
+            info!(mountpoint = %mountpoint.display(), "sentinel-fs FUSE-Mount aktiv");
+        } else {
+            warn!(mountpoint = %mountpoint.display(), "sentinel-fs FUSE-Mount moeglicherweise nicht bereit");
+        }
+    }
+
     // -- Sandbox Enforcer (Landlock + cgroups v2 + bwrap) --
-    let (sandbox, sandbox_warnings) = SandboxEnforcer::detect();
+    let (mut sandbox, sandbox_warnings) = SandboxEnforcer::detect();
+
+    // Wenn sentinel-fs FUSE konfiguriert: bwrap nutzt FUSE-Mount statt /ram/agents/
+    if let Some(ref fs_mount) = config.fs_mount {
+        sandbox.set_fs_mount(fs_mount.clone());
+        info!(fs_mount = %fs_mount, "Sandbox nutzt sentinel-fs FUSE-Mount fuer Agent-Homes");
+    }
     for w in &sandbox_warnings {
         match w {
             SandboxWarning::LandlockNotAvailable => {

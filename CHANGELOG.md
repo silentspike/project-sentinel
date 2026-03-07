@@ -17,8 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - wasmtime 42 mit Component Model + WASI 0.2 (`wasmtime-wasi` 42), Fuel-Metering, `StoreLimitsBuilder`
   - `services/sentinel-daemon/src/orchestrator.rs`: WASM-Plugin Auto-Load aus `config/tools/*.wasm` mit `query_meta()` fuer Tool-Name/Description
   - `crates/sentinel-ecs/tests/wasm_ecs_integration.rs`: 7 ECS-Integrationstests (voller bevy_ecs World+Schedule Pipeline: Agent→input_system→WASM→DomainEvent)
-  - Test-Fixtures: `echo-plugin.wasm` (Rust Component, `wasm32-wasip2`), `loop-plugin.wasm` (Fuel-Exhaustion mit `black_box`)
-  - 94 sentinel-wasm Tests (51 Unit + 16 E2E + 20 Acceptance + 7 Security), 0 Failures
+  - Test-Fixtures: `echo-plugin.wasm`, `loop-plugin.wasm`, `fs-plugin.wasm` (alle Rust `wasm32-wasip2` Components)
+  - `fs-plugin`: Nutzt alle 7 Host-API Functions (fs-read/write/list, get-agent-info, get-room-info, get-tick, log) — beweist "Fake OS" E2E
+  - `crates/sentinel-sandbox/src/bwrap.rs`: `with_fs_mount()` Builder — optionaler sentinel-fs FUSE-Mount statt `/ram/agents/`
+  - `crates/sentinel-sandbox/src/enforcer.rs`: `set_fs_mount()` — SandboxEnforcer nutzt FUSE-Mount fuer Agent-Homes
+  - `services/sentinel-daemon/src/config.rs`: `fs_mount` Config-Feld (Optional, Default: None)
+  - `services/sentinel-daemon/src/orchestrator.rs`: FUSE-Mount Initialisierung beim Daemon-Start (Feature `fuse`), WASM-Plugin Auto-Load
+  - 113 sentinel-wasm Tests (51 Unit + 35 E2E + 20 Acceptance + 7 Security), 0 Failures
   - 7 sentinel-ecs WASM Integration Tests (Multi-Agent, Native+WASM Koexistenz, Fehlerfaelle)
   - 13 Benchmarks (6 native + 7 Component Model: cold/warm start, host roundtrip, E2E, query_meta)
 
