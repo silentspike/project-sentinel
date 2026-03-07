@@ -1,8 +1,8 @@
 module github.com/obtFusi/project-sentinel/pkg/sentinel-go
 
-go 1.25.0
+go 1.26.0
 
-toolchain go1.25.8
+toolchain go1.26.1
 
 require (
 	github.com/nats-io/nats.go v1.48.0
