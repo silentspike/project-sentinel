@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Transit-Varianz: RoomId-Typ-Mismatch** (#194)
+  - `crates/sentinel-common/src/types.rs`: `AgentAction.target_room` von `Option<RoomId>` auf `Option<String>` geaendert
+  - `crates/sentinel-ecs/src/systems.rs`: `input_system()` nutzt jetzt echte Raumnamen statt `format!("ROOM-{}")` — Distance-Lookup funktioniert endlich
+  - `services/sentinel-daemon/src/llm_bridge.rs`: Echter Raumname statt Dummy `RoomId(1)`
+  - Vorher: Alle Transits hatten identische Dauer (3100ms), Room-IDs waren nach erstem Transit kaputt
+  - 5 neue Integration-Tests: Distance-Varianz, Bounds-Check, Room-ID nach Transit, Encounter-Events, RoomDistanceMap-Lookup
+
 - **Landlock Detection auf Kernel 6.11+** (#173)
   - `crates/sentinel-sandbox/src/landlock.rs`: `detect_abi()` prueft nun auch `/sys/kernel/security/lsm` als Fallback
   - Kernel 6.11+ entfernte `/sys/kernel/security/landlock/` securityfs-Directory

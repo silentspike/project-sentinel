@@ -83,7 +83,7 @@ pub fn input_system(
                 ActionType::Move => {
                     if let Some(target_room) = &action.target_room {
                         let from_room = position.room_id.clone();
-                        let to_room = format!("ROOM-{}", target_room.0);
+                        let to_room = target_room.clone();
                         // Distance-basierte Transit-Dauer: 1500ms Basis + 800ms pro Hop
                         // Clamp auf 2000-5000ms (TRANSIT_MIN/MAX aus sentinel-physics)
                         let hops = room_distances
@@ -212,7 +212,7 @@ pub fn input_system(
         let payload = DomainEventPayload::AgentActionReceived {
             agent_id: action.agent_id,
             action_type: format!("{:?}", action.action_type),
-            target_room: action.target_room.map(|r| format!("ROOM-{}", r.0)),
+            target_room: action.target_room.clone(),
             content: action.content.clone(),
         };
         let action_event = DomainEvent::new(

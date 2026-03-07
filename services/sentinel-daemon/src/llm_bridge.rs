@@ -22,7 +22,7 @@ pub mod bridge {
     use tokio::sync::Semaphore;
     use tracing::{debug, error, info, instrument, warn};
 
-    use sentinel_common::{ActionType, AgentAction, AgentId, Perception, RoomId, Tick, Timestamp};
+    use sentinel_common::{ActionType, AgentAction, AgentId, Perception, Tick, Timestamp};
     use sentinel_redb::StateStore;
 
     /// LLM Bridge Konfiguration.
@@ -461,11 +461,8 @@ pub mod bridge {
             }
         };
 
-        // Target Room: Versuche aus dem target-Feld eine RoomId zu parsen
         let target_room = if !extracted.target.is_empty() {
-            // Gateway liefert Room-Name (z.B. "kueche"), RoomId braucht u16
-            // Fuer jetzt: Dummy-RoomId 1 — rooms.toml Mapping kommt spaeter
-            Some(RoomId(1))
+            Some(extracted.target.clone())
         } else {
             None
         };
