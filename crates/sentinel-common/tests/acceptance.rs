@@ -44,7 +44,7 @@ fn ac_05_04_serde_roundtrip_all_types() {
     let action = AgentAction {
         agent_id: AgentId(1),
         action_type: ActionType::Chat,
-        target_room: Some(RoomId(3)),
+        target_room: Some("konferenz-1".to_string()),
         target_agent: Some(AgentId(5)),
         content: Some("Hallo Welt".to_string()),
         timestamp: Timestamp(1000),

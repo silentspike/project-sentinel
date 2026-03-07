@@ -6,7 +6,7 @@
 //! AC3: Event+Outbox atomar (via append_with_outbox, hier indirekt geprueft)
 //! AC4: E2E: Action rein → Event in Limbo → State veraendert
 
-use sentinel_common::{ActionType, AgentAction, AgentId, RoomId, Tick, Timestamp};
+use sentinel_common::{ActionType, AgentAction, AgentId, Tick, Timestamp};
 use sentinel_ecs::{
     attach_redb_store, create_simulation_world, spawn_agent, ActionReceiver, BioState, EventBuffer,
     LimboEventStore, SimulationTime,
@@ -244,7 +244,7 @@ fn test_e2e_move_action_transit_with_correlation() {
     tx.send(AgentAction {
         agent_id: AgentId(1),
         action_type: ActionType::Move,
-        target_room: Some(RoomId(5)),
+        target_room: Some("buero-dev-1".to_string()),
         target_agent: None,
         content: None,
         timestamp: Timestamp(1000),
@@ -303,7 +303,7 @@ fn test_all_action_types_generate_events() {
     // 5 verschiedene ActionTypes senden
     let actions = vec![
         (ActionType::Chat, None, Some("Hallo".to_string())),
-        (ActionType::Move, Some(RoomId(3)), None),
+        (ActionType::Move, Some("kueche".to_string()), None),
         (ActionType::ToolUse, None, Some("drink_coffee".to_string())),
         (ActionType::Emote, None, Some("lacht".to_string())),
         (
