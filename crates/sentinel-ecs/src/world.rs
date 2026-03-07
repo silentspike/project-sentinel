@@ -13,7 +13,70 @@ use sentinel_common::{
 };
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Aktive Gerueche pro Raum (ephemere ECS Resource).
+///
+/// Wird von input_system/autonomy_system/smell_system befuellt und von
+/// perception_system gelesen. Cleanup abgelaufener Smells bei jedem Tick.
+#[derive(Resource, Default, Debug, Clone)]
+pub struct ActiveSmells {
+    /// Key: room_id, Value: Liste aktiver Gerueche
+    pub smells: HashMap<String, Vec<ActiveSmell>>,
+}
+
+/// Ein einzelner aktiver Geruch in einem Raum.
+#[derive(Debug, Clone)]
+pub struct ActiveSmell {
+    pub smell_type: String,
+    pub intensity: f32,
+    pub created_tick: u64,
+    pub duration_ticks: u64,
+}
+
+impl ActiveSmells {
+    /// Fuegt einen neuen Geruch in einen Raum ein.
+    pub fn add(
+        &mut self,
+        room_id: &str,
+        smell_type: String,
+        intensity: f32,
+        created_tick: u64,
+        duration_ticks: u64,
+    ) {
+        self.smells
+            .entry(room_id.to_string())
+            .or_default()
+            .push(ActiveSmell {
+                smell_type,
+                intensity,
+                created_tick,
+                duration_ticks,
+            });
+    }
+
+    /// Gibt alle noch aktiven Gerueche fuer einen Raum zurueck.
+    pub fn get_active(&self, room_id: &str, current_tick: u64) -> Vec<&ActiveSmell> {
+        self.smells
+            .get(room_id)
+            .map(|smells| {
+                smells
+                    .iter()
+                    .filter(|s| current_tick < s.created_tick + s.duration_ticks)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Entfernt abgelaufene Gerueche aus allen Raeumen.
+    pub fn cleanup(&mut self, current_tick: u64) {
+        self.smells.retain(|_, smells| {
+            smells.retain(|s| current_tick < s.created_tick + s.duration_ticks);
+            !smells.is_empty()
+        });
+    }
+}
 
 /// Simulationszeit-Resource (muss vor jedem Schedule::run() aktualisiert werden)
 #[derive(Resource, Debug, Clone)]
@@ -213,6 +276,7 @@ pub fn create_simulation_world() -> (World, Schedule) {
     world.insert_resource(SimulationTime::default());
     world.insert_resource(PersistTelemetry::default());
     world.insert_resource(EventBuffer::default());
+    world.insert_resource(ActiveSmells::default());
 
     // System-Reihenfolge via configure_sets (10 Phasen)
     schedule.configure_sets(

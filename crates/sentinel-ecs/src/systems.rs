@@ -62,6 +62,7 @@ pub fn input_system(
     )>,
     mut event_buffer: ResMut<EventBuffer>,
     time: Res<SimulationTime>,
+    mut active_smells: ResMut<super::world::ActiveSmells>,
 ) {
     let Some(receiver) = receiver else { return };
     let Ok(rx) = receiver.0.lock() else { return };
@@ -70,6 +71,7 @@ pub fn input_system(
         // Correlation-ID fuer diesen Vorgang (gruppiert Action + Folge-Events)
         let correlation_id = uuid::Uuid::new_v4().to_string();
         let mut bio_action: Option<&str> = None;
+        let mut bio_room: Option<String> = None;
 
         // Agent im ECS finden
         let mut found = false;
@@ -125,10 +127,16 @@ pub fn input_system(
                             "drink_coffee" => {
                                 sentinel_bio::drink_coffee(&mut bio);
                                 bio_action = Some("drink_coffee");
+                                if !position.in_transit {
+                                    bio_room = Some(position.room_id.clone());
+                                }
                             }
                             "eat_meal" => {
                                 sentinel_bio::eat_meal(&mut bio);
                                 bio_action = Some("eat_meal");
+                                if !position.in_transit {
+                                    bio_room = Some(position.room_id.clone());
+                                }
                             }
                             "use_bathroom" => {
                                 sentinel_bio::use_bathroom(&mut bio);
@@ -240,6 +248,37 @@ pub fn input_system(
             )
             .with_causation(&action_event_id);
             event_buffer.events.push(bio_event);
+
+            // SmellEvent bei drink_coffee/eat_meal (nur wenn Agent nicht in Transit)
+            if let Some(ref room) = bio_room {
+                let (smell_type, intensity, duration) = match action_name {
+                    "drink_coffee" => ("coffee", 0.8f32, 120u64),
+                    "eat_meal" => ("food", 0.6, 90),
+                    _ => continue,
+                };
+                let smell_payload = DomainEventPayload::SmellEventTriggered {
+                    room_id: room.clone(),
+                    smell_type: smell_type.to_string(),
+                    intensity,
+                    duration_ticks: duration,
+                };
+                let smell_event = DomainEvent::new(
+                    smell_payload.event_type_str(),
+                    room,
+                    &smell_payload.to_json(),
+                    &correlation_id,
+                    time.tick.0,
+                )
+                .with_causation(&action_event_id);
+                event_buffer.events.push(smell_event);
+                active_smells.add(
+                    room,
+                    smell_type.to_string(),
+                    intensity,
+                    time.tick.0,
+                    duration,
+                );
+            }
         }
     }
 }
@@ -690,6 +729,7 @@ fn valence_arousal_to_emotion(valence: f32, arousal: f32) -> Emotion {
 pub fn perception_system(
     mut query: Query<(&BioState, &Position, &Mood, &mut PerceptionState)>,
     time: Res<SimulationTime>,
+    active_smells: Res<super::world::ActiveSmells>,
 ) {
     for (bio, position, mood, mut perception) in &mut query {
         // Koerper-Wahrnehmung
@@ -744,6 +784,23 @@ pub fn perception_system(
         } else {
             format!("Du bist {}.", room_desc)
         };
+
+        // Aktive Gerueche im aktuellen Raum in die Umgebungswahrnehmung injizieren
+        if !position.in_transit {
+            let current_smells = active_smells.get_active(&position.room_id, time.tick.0);
+            for smell in &current_smells {
+                if smell.intensity > 0.3 {
+                    let text = match smell.smell_type.as_str() {
+                        "coffee" => " Du riechst Kaffeeduft.",
+                        "food" => " Es riecht nach Essen.",
+                        _ => "",
+                    };
+                    if !text.is_empty() {
+                        perception.environment_text.push_str(text);
+                    }
+                }
+            }
+        }
 
         // Stimmungs-basierte soziale Wahrnehmung
         perception.social_text = if bio.social_need > 70.0 {
@@ -894,8 +951,12 @@ pub fn smell_system(
     query: Query<(&AgentIdentity, &Position, &BioState)>,
     time: Res<SimulationTime>,
     mut event_buffer: ResMut<EventBuffer>,
+    mut active_smells: ResMut<super::world::ActiveSmells>,
 ) {
     let tick = time.tick.0;
+
+    // Cleanup abgelaufener Smells bei JEDEM Tick
+    active_smells.cleanup(tick);
 
     // Kaffee-Geruch erzeugen wenn Auto-Coffee getriggert hat (gleicher Tick-Modulo wie bio_system)
     if tick == 0 || !tick.is_multiple_of(180) {
@@ -906,20 +967,22 @@ pub fn smell_system(
         // Wenn Agent gerade Kaffee getrunken hat (caffeine > 90 = frisch getrunken)
         // UND im passenden Raum ist (nicht in Transit)
         if bio.caffeine_mg > 90.0 && !position.in_transit {
+            let room = &position.room_id;
             let payload = DomainEventPayload::SmellEventTriggered {
-                room_id: position.room_id.clone(),
+                room_id: room.clone(),
                 smell_type: "coffee".to_string(),
                 intensity: 0.8,
                 duration_ticks: 120, // 2 Minuten bei 1Hz
             };
             let event = DomainEvent::new(
                 payload.event_type_str(),
-                &position.room_id,
+                room,
                 &payload.to_json(),
                 &uuid::Uuid::new_v4().to_string(),
                 tick,
             );
             event_buffer.events.push(event);
+            active_smells.add(room, "coffee".to_string(), 0.8, tick, 120);
         }
     }
 }
