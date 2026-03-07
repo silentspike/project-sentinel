@@ -26,6 +26,7 @@ members = [
     "services/sentinel-nightrun",
     "services/sentinel-daemon",
     "services/sentinel-projection",
+    "services/agent-runtime",
 ]
 
 [workspace.dependencies]
