@@ -1,0 +1,11 @@
+[package]
+name = "agent-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Lightweight sandbox process for sentinel agents (runs inside bwrap)"
+
+# Intentionally zero external dependencies.
+# agent-runtime runs inside bwrap with minimal footprint.
+[dependencies]

@@ -114,13 +114,24 @@ impl LandlockRuleset {
 
 /// Detects whether Landlock is available on this kernel.
 /// Returns the ABI version (1-4) or None if not available.
+///
+/// Detection order:
+/// 1. `/sys/kernel/security/landlock` (securityfs, kernel < 6.11)
+/// 2. `/sys/kernel/security/lsm` contains "landlock" (kernel 6.11+ removed securityfs dir)
 pub fn detect_abi() -> Option<u8> {
-    if !std::path::Path::new("/sys/kernel/security/landlock").exists() {
-        return None;
+    // Kernel < 6.11: securityfs exposes landlock directory.
+    if std::path::Path::new("/sys/kernel/security/landlock").exists() {
+        return Some(4);
     }
-    // VM kernel 6.8 supports ABI v4.
-    // The landlock crate handles ABI negotiation via BestEffort compat level.
-    Some(4)
+
+    // Kernel 6.11+: securityfs directory removed, check LSM list instead.
+    if let Ok(lsm) = std::fs::read_to_string("/sys/kernel/security/lsm") {
+        if lsm.contains("landlock") {
+            return Some(4);
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]

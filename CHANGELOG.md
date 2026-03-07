@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **agent-runtime Binary** (#173)
+  - `services/agent-runtime/`: Leichtgewichtiger Sandbox-Prozess (Zero Dependencies, nur std)
+  - Stdin-Reader-Thread fuer zukuenftige Command-Dispatch, Heartbeat-Loop (30s) fuer VFS I/O
+  - Laeuft innerhalb bwrap-Namespace als `/usr/bin/agent-runtime`
+
+### Fixed
+
+- **Landlock Detection auf Kernel 6.11+** (#173)
+  - `crates/sentinel-sandbox/src/landlock.rs`: `detect_abi()` prueft nun auch `/sys/kernel/security/lsm` als Fallback
+  - Kernel 6.11+ entfernte `/sys/kernel/security/landlock/` securityfs-Directory
+  - Landlock war im Kernel aktiv aber wurde nicht erkannt — jetzt korrekt: "Landlock ABI v4 detected"
+
 - **WASM Component Model Runtime** (#19)
   - `crates/sentinel-wasm/wit/world.wit`: WIT Interface Definition (`sentinel:plugin@0.1.0`) mit Host-API (fs-read/write/list, get-agent-info, get-room-info, log, get-tick) und Plugin-Exports (execute, tool-name, tool-description)
   - `crates/sentinel-wasm/src/host.rs`: `bindgen!`-basierte Host-Implementation, `PluginState` mit WASI 0.2 Context, `AgentSnapshot`/`RoomSnapshot` ECS-Bridges, 7 Host-Function Traits
