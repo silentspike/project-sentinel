@@ -50,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **eBPF Kernel-Modus Regression: funktionale Korrektheit** (#139)
+  - `crates/sentinel-ebpf/src/collector.rs`: Initial Health-Timestamp bei Agent-Registrierung — verhindert False-Positive Stalls fuer frisch registrierte Agents
+  - `crates/sentinel-ebpf/src/collector.rs`: Health-Updates aus `/proc/{pid}/io` und cgroup `io.stat` Supplement — VFS-level I/O als Stall-Detection Supplement im Kernel-Modus
+  - `crates/sentinel-ebpf/src/collector.rs`: PSI Partial statt All-or-Nothing — wenn nur eine PSI-Datei fehlt, wird der Agent nicht mehr komplett uebersprungen
+
 - **Flaky Test `test_ecs_tick_loop_runs_ticks`** (#135)
   - `services/sentinel-daemon/src/orchestrator.rs`: Threading invertiert — `ecs_tick_loop` laeuft im Background-Thread, Perception-Warten im Main-Thread. Eliminiert Race Condition bei der `recv_timeout(30s)` vor Loop-Start zurueckkehren konnte (Setup-Dauer auf belastetem CI Runner). Gleiches Fix fuer `test_save_state_on_shutdown`.
 
