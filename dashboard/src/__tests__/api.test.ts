@@ -31,6 +31,7 @@ beforeAll(() => {
       occupant_count INTEGER NOT NULL DEFAULT 0,
       transit_count INTEGER NOT NULL DEFAULT 0,
       active_chaos TEXT,
+      active_smells TEXT,
       last_event_tick INTEGER,
       last_event_id INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL
@@ -58,7 +59,7 @@ beforeAll(() => {
 
   // 15 Rooms aus ROOM_METADATA
   const insertRoom = projDb.prepare(
-    "INSERT INTO room_live_view VALUES (?,0,0,null,null,0,1000)",
+    "INSERT INTO room_live_view VALUES (?,0,0,null,null,null,0,1000)",
   );
   for (const id of ALL_ROOM_IDS) {
     insertRoom.run(id);

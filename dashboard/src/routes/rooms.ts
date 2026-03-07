@@ -15,6 +15,14 @@ function toResponse(row: RoomRow, occupants: string[]): RoomResponse {
       chaos = null;
     }
   }
+  let smells: unknown | null = null;
+  if (row.active_smells) {
+    try {
+      smells = JSON.parse(row.active_smells);
+    } catch {
+      smells = null;
+    }
+  }
   return {
     id: row.room_id,
     name: meta?.name ?? row.room_id,
@@ -24,6 +32,7 @@ function toResponse(row: RoomRow, occupants: string[]): RoomResponse {
     occupant_count: row.occupant_count,
     transit_count: row.transit_count,
     active_chaos: chaos,
+    active_smells: smells,
     temperature: row.temperature,
     co2_ppm: row.co2_ppm,
     noise_db: row.noise_db,

@@ -118,6 +118,26 @@ impl ProjectionHandler for RoomLiveViewHandler {
                 }
             }
 
+            DomainEventPayload::SmellEventTriggered {
+                room_id,
+                smell_type,
+                intensity,
+                duration_ticks,
+            } => {
+                let smell_json = serde_json::json!({
+                    "smell_type": smell_type,
+                    "intensity": intensity,
+                    "duration_ticks": duration_ticks,
+                    "tick": event.tick,
+                })
+                .to_string();
+                debug!(
+                    room = room_id,
+                    smell_type, "Projecting smell_event_triggered (room)"
+                );
+                txn.update_room_smells(room_id, &smell_json, event.tick, row_id)?;
+            }
+
             // Andere Events sind nicht relevant fuer room_live_view
             _ => {}
         }
