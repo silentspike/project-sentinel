@@ -747,17 +747,12 @@ fn ecs_tick_loop(
                                     let agent_home =
                                         std::path::PathBuf::from("/tmp/plugin-meta-query");
                                     let _ = std::fs::create_dir_all(&agent_home);
-                                    match tool_runtime
-                                        .plugin_host()
-                                        .query_meta(&path, agent_home)
-                                    {
+                                    match tool_runtime.plugin_host().query_meta(&path, agent_home) {
                                         Ok(meta) => {
                                             let tool_def = sentinel_wasm::ToolDefinition {
                                                 name: meta.tool_name.clone(),
                                                 description: meta.tool_description,
-                                                wasm_path: Some(
-                                                    path.to_string_lossy().to_string(),
-                                                ),
+                                                wasm_path: Some(path.to_string_lossy().to_string()),
                                                 tool_type: sentinel_wasm::ToolType::Wasm,
                                                 required_capabilities: Vec::new(),
                                             };

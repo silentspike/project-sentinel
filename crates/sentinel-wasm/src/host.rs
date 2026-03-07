@@ -108,8 +108,8 @@ impl sentinel::plugin::host_api::Host for PluginState {
 
     fn fs_list(&mut self, path: String) -> Result<Vec<String>, String> {
         let full_path = safe_resolve(&self.agent_home, &path)?;
-        let entries = std::fs::read_dir(&full_path)
-            .map_err(|e| format!("fs-list '{}': {}", path, e))?;
+        let entries =
+            std::fs::read_dir(&full_path).map_err(|e| format!("fs-list '{}': {}", path, e))?;
         let mut names = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| format!("fs-list entry: {}", e))?;
@@ -137,14 +137,16 @@ impl sentinel::plugin::host_api::Host for PluginState {
     }
 
     fn get_room_info(&mut self, room_id: String) -> Option<sentinel::plugin::types::RoomInfo> {
-        self.rooms.get(&room_id).map(|r| sentinel::plugin::types::RoomInfo {
-            room_id: r.room_id.clone(),
-            name: r.name.clone(),
-            floor: r.floor,
-            temperature: r.temperature,
-            noise_db: r.noise_db,
-            occupant_count: r.occupant_count,
-        })
+        self.rooms
+            .get(&room_id)
+            .map(|r| sentinel::plugin::types::RoomInfo {
+                room_id: r.room_id.clone(),
+                name: r.name.clone(),
+                floor: r.floor,
+                temperature: r.temperature,
+                noise_db: r.noise_db,
+                occupant_count: r.occupant_count,
+            })
     }
 
     fn log(&mut self, level: sentinel::plugin::types::LogLevel, msg: String) {
@@ -290,10 +292,22 @@ mod tests {
     fn host_log_does_not_panic() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = make_state(dir.path().to_path_buf());
-        state.log(sentinel::plugin::types::LogLevel::Debug, "debug msg".to_string());
-        state.log(sentinel::plugin::types::LogLevel::Info, "info msg".to_string());
-        state.log(sentinel::plugin::types::LogLevel::Warn, "warn msg".to_string());
-        state.log(sentinel::plugin::types::LogLevel::Error, "error msg".to_string());
+        state.log(
+            sentinel::plugin::types::LogLevel::Debug,
+            "debug msg".to_string(),
+        );
+        state.log(
+            sentinel::plugin::types::LogLevel::Info,
+            "info msg".to_string(),
+        );
+        state.log(
+            sentinel::plugin::types::LogLevel::Warn,
+            "warn msg".to_string(),
+        );
+        state.log(
+            sentinel::plugin::types::LogLevel::Error,
+            "error msg".to_string(),
+        );
     }
 
     #[test]

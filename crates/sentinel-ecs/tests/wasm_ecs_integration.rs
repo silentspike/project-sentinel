@@ -10,10 +10,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sentinel_common::{AgentAction, AgentId, ActionType, Tick, Timestamp};
+use sentinel_common::{ActionType, AgentAction, AgentId, Tick, Timestamp};
 use sentinel_ecs::{
-    create_simulation_world, spawn_agent, ActionReceiver, AgentCapabilities,
-    LimboEventStore, SimulationTime, ToolRuntimeResource,
+    create_simulation_world, spawn_agent, ActionReceiver, AgentCapabilities, LimboEventStore,
+    SimulationTime, ToolRuntimeResource,
 };
 use sentinel_limbo::EventStore;
 
@@ -82,7 +82,11 @@ fn setup_wasm_world() -> (
     (world, schedule, tx, dir)
 }
 
-fn run_tick(world: &mut bevy_ecs::world::World, schedule: &mut bevy_ecs::schedule::Schedule, tick: u64) {
+fn run_tick(
+    world: &mut bevy_ecs::world::World,
+    schedule: &mut bevy_ecs::schedule::Schedule,
+    tick: u64,
+) {
     {
         let mut time = world.resource_mut::<SimulationTime>();
         time.tick = Tick(tick);
@@ -255,7 +259,10 @@ fn ecs_multiple_agents_wasm_tools_same_tick() {
     );
 
     // Prüfe dass die richtigen Agents zugeordnet sind
-    let agent_ids: Vec<&str> = tool_events.iter().map(|e| e.aggregate_id.as_str()).collect();
+    let agent_ids: Vec<&str> = tool_events
+        .iter()
+        .map(|e| e.aggregate_id.as_str())
+        .collect();
     assert!(agent_ids.contains(&"AGENT-01"), "Agent-01 must have result");
     assert!(agent_ids.contains(&"AGENT-02"), "Agent-02 must have result");
     assert!(agent_ids.contains(&"AGENT-03"), "Agent-03 must have result");
@@ -309,7 +316,9 @@ fn ecs_wasm_and_native_tools_coexist() {
 
     assert_eq!(tool_events.len(), 2, "Expected 2 tool_result events");
     // Eins ist WASM echo, eins ist native search
-    let has_echo = tool_events.iter().any(|e| e.payload.contains("echo: wasm call"));
+    let has_echo = tool_events
+        .iter()
+        .any(|e| e.payload.contains("echo: wasm call"));
     let has_search = tool_events
         .iter()
         .any(|e| e.payload.contains("meeting notes"));

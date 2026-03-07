@@ -72,10 +72,8 @@ impl BwrapConfig {
     pub fn with_fs_mount(mut self, fs_mount: &str, name: &str) -> Self {
         self.writable_binds
             .retain(|(_, guest)| !guest.starts_with("/home/"));
-        self.writable_binds.push((
-            format!("{fs_mount}/{name}"),
-            format!("/home/{name}"),
-        ));
+        self.writable_binds
+            .push((format!("{fs_mount}/{name}"), format!("/home/{name}")));
         self
     }
 
