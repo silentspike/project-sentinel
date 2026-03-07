@@ -9,7 +9,6 @@ use uuid::Uuid;
 
 /// AC 6.2: Topic string format is correct for all TopicType variants
 #[test]
-#[allow(deprecated)]
 fn ac_06_02_topic_generation() {
     // Agent topics
     assert_eq!(
@@ -37,16 +36,8 @@ fn ac_06_02_topic_generation() {
     assert_eq!(topics::physics_tick(0), "sentinel/physics/tick/0");
     assert_eq!(topics::physics_tick(42), "sentinel/physics/tick/42");
 
-    // Cortex inject
-    assert_eq!(
-        topics::cortex_inject("thomas"),
-        "sentinel/cortex/inject/thomas"
-    );
-
     // Constants
     assert_eq!(topics::CHAOS_EVENT, "sentinel/chaos/event");
-    assert_eq!(topics::JUDGE_ALERT, "sentinel/judge/alert");
-    assert_eq!(topics::MODEL_SWAP, "sentinel/meta/model-swap");
     assert_eq!(topics::PREFIX, "sentinel");
 
     // Query topics (neu)
