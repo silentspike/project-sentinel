@@ -26,3 +26,4 @@ sentinel-wasm = { path = "../sentinel-wasm" }
 [dev-dependencies]
 sentinel-common = { path = "../sentinel-common" }
 tempfile = "3"
+toml = { workspace = true }

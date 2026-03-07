@@ -135,7 +135,7 @@ pub enum EventType {
 pub struct AgentAction {
     pub agent_id: AgentId,
     pub action_type: ActionType,
-    pub target_room: Option<RoomId>,
+    pub target_room: Option<String>,
     pub target_agent: Option<AgentId>,
     pub content: Option<String>,
     pub timestamp: Timestamp,

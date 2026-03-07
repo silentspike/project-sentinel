@@ -695,6 +695,351 @@ mod tests {
         assert_eq!(tool_events[0].aggregate_id, "AGENT-05");
     }
 
+    /// Transit-Dauer variiert mit Raum-Distanz (nicht hardcoded!)
+    #[test]
+    fn test_transit_duration_varies_with_distance() {
+        let dir = tempfile::tempdir().unwrap();
+        let event_db_path = dir.path().join("transit-distance.db");
+        let event_store = Arc::new(EventStore::open(event_db_path.to_str().unwrap()).unwrap());
+
+        let (mut world, mut schedule) = create_simulation_world();
+        world.insert_resource(LimboEventStore(event_store.clone()));
+
+        let rooms_toml = include_str!("../../../config/rooms.toml");
+        let building_config: sentinel_common::room::BuildingConfig =
+            toml::from_str(rooms_toml).expect("rooms.toml parse error");
+        world.insert_resource(RoomDistanceMap::from_building_config(&building_config));
+
+        spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
+
+        // Move zu nahem Raum: empfang → flur-eg (1 hop → 2300ms)
+        tx.send(AgentAction {
+            agent_id: AgentId(1),
+            action_type: ActionType::Move,
+            target_room: Some("flur-eg".to_string()),
+            target_agent: None,
+            content: None,
+            timestamp: Timestamp(1000),
+            tick: Tick(1),
+        })
+        .unwrap();
+
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(1);
+            time.tick_count = 1;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 8.0;
+        }
+        schedule.run(&mut world);
+
+        let events = event_store.get_events_since(0, 100).unwrap();
+        let transit_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "transit_started")
+            .collect();
+        assert_eq!(transit_events.len(), 1);
+
+        let payload1: serde_json::Value = serde_json::from_str(&transit_events[0].payload).unwrap();
+        let duration_near = payload1["duration_ms"].as_u64().unwrap();
+        assert_eq!(duration_near, 2300, "1-hop transit should be 2300ms");
+
+        // Transit abschliessen (manuell Position resetten)
+        {
+            let entity_id = world
+                .query_filtered::<bevy_ecs::prelude::Entity, bevy_ecs::prelude::With<AgentIdentity>>()
+                .iter(&world)
+                .next()
+                .unwrap();
+            let mut pos = world.get_mut::<Position>(entity_id).unwrap();
+            pos.in_transit = false;
+            pos.transit_target = None;
+            pos.transit_remaining_ms = 0;
+            pos.room_id = "empfang".to_string();
+        }
+
+        // Move zu fernem Raum: empfang → buero-ceo (4 hops → 4700ms)
+        tx.send(AgentAction {
+            agent_id: AgentId(1),
+            action_type: ActionType::Move,
+            target_room: Some("buero-ceo".to_string()),
+            target_agent: None,
+            content: None,
+            timestamp: Timestamp(2000),
+            tick: Tick(2),
+        })
+        .unwrap();
+
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(2);
+            time.tick_count = 2;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 8.0;
+        }
+        schedule.run(&mut world);
+
+        let events = event_store.get_events_since(0, 100).unwrap();
+        let transit_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "transit_started")
+            .collect();
+        assert_eq!(transit_events.len(), 2);
+
+        let payload2: serde_json::Value = serde_json::from_str(&transit_events[1].payload).unwrap();
+        let duration_far = payload2["duration_ms"].as_u64().unwrap();
+        assert_eq!(duration_far, 4700, "4-hop transit should be 4700ms");
+
+        assert!(
+            duration_far > duration_near,
+            "Far room ({duration_far}ms) must take longer than near room ({duration_near}ms)"
+        );
+    }
+
+    /// Transit-Dauer bleibt immer in [2000, 5000]ms Bounds
+    #[test]
+    fn test_transit_duration_within_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let event_db_path = dir.path().join("transit-bounds.db");
+        let event_store = Arc::new(EventStore::open(event_db_path.to_str().unwrap()).unwrap());
+
+        let (mut world, mut schedule) = create_simulation_world();
+        world.insert_resource(LimboEventStore(event_store.clone()));
+
+        let rooms_toml = include_str!("../../../config/rooms.toml");
+        let building_config: sentinel_common::room::BuildingConfig =
+            toml::from_str(rooms_toml).expect("rooms.toml parse error");
+        world.insert_resource(RoomDistanceMap::from_building_config(&building_config));
+
+        spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
+
+        let targets = [
+            "flur-eg",        // 1 hop
+            "kueche",         // 2 hops
+            "treppenhaus",    // 2 hops
+            "buero-ceo",      // 4 hops
+            "buero-design-1", // 4 hops
+        ];
+
+        for (i, target) in targets.iter().enumerate() {
+            {
+                let entity = world
+                    .query_filtered::<bevy_ecs::prelude::Entity, bevy_ecs::prelude::With<AgentIdentity>>()
+                    .iter(&world)
+                    .next()
+                    .unwrap();
+                let mut pos = world.get_mut::<Position>(entity).unwrap();
+                pos.in_transit = false;
+                pos.transit_target = None;
+                pos.transit_remaining_ms = 0;
+                pos.room_id = "empfang".to_string();
+            }
+
+            tx.send(AgentAction {
+                agent_id: AgentId(1),
+                action_type: ActionType::Move,
+                target_room: Some(target.to_string()),
+                target_agent: None,
+                content: None,
+                timestamp: Timestamp(i as u64 * 1000),
+                tick: Tick(i as u64 + 10),
+            })
+            .unwrap();
+
+            {
+                let mut time = world.resource_mut::<SimulationTime>();
+                time.tick = Tick(i as u64 + 10);
+                time.tick_count = i as u64 + 10;
+                time.delta_seconds = 1.0;
+                time.sim_hour = 8.0;
+            }
+            schedule.run(&mut world);
+        }
+
+        let events = event_store.get_events_since(0, 200).unwrap();
+        let transit_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "transit_started")
+            .collect();
+
+        assert_eq!(transit_events.len(), targets.len());
+
+        for event in &transit_events {
+            let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+            let duration = payload["duration_ms"].as_u64().unwrap();
+            assert!(
+                (2000..=5000).contains(&duration),
+                "Duration {duration}ms outside bounds [2000, 5000]"
+            );
+        }
+    }
+
+    /// Room-ID nach Transit ist der echte Raumname (nicht "ROOM-1")
+    #[test]
+    fn test_room_id_correct_after_transit() {
+        let (mut world, mut schedule) = create_simulation_world();
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+
+        // Agent manuell in Transit nach "kueche" setzen
+        {
+            let mut pos = world.get_mut::<Position>(entity).unwrap();
+            pos.in_transit = true;
+            pos.transit_target = Some("kueche".to_string());
+            pos.transit_remaining_ms = 1000;
+        }
+
+        // 2 Ticks a 1s (1000ms Transit → abgeschlossen)
+        for tick in 0..2u64 {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(tick);
+            time.delta_seconds = 1.0;
+            time.sim_hour = 10.0;
+            schedule.run(&mut world);
+        }
+
+        let pos = world.get::<Position>(entity).unwrap();
+        assert!(!pos.in_transit);
+        assert_eq!(
+            pos.room_id, "kueche",
+            "Room ID must be real room name, not ROOM-X format"
+        );
+        assert!(
+            !pos.room_id.starts_with("ROOM-"),
+            "Room ID must not use ROOM-X format"
+        );
+    }
+
+    /// Encounter-System erzeugt HallwayEncounterDetected Events
+    #[test]
+    fn test_encounter_system_generates_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let event_db_path = dir.path().join("encounter.db");
+        let event_store = Arc::new(EventStore::open(event_db_path.to_str().unwrap()).unwrap());
+
+        let (mut world, mut schedule) = create_simulation_world();
+        world.insert_resource(LimboEventStore(event_store.clone()));
+
+        // 3 Agents spawnen, alle manuell in Transit setzen
+        for i in 1..=3 {
+            let entity = spawn_agent(
+                &mut world,
+                AgentId(i),
+                &format!("Agent-{i:02}"),
+                "Tester",
+                1,
+            );
+            let mut pos = world.get_mut::<Position>(entity).unwrap();
+            pos.in_transit = true;
+            pos.transit_target = Some("kueche".to_string());
+            pos.transit_remaining_ms = 600_000; // 10min — lang genug damit Transit nicht endet
+        }
+
+        // Mehrere Ticks laufen (encounter_system laeuft alle 3 Ticks)
+        // Bei 30% Wahrscheinlichkeit und 3 Paaren pro Check: ~0.9 Events pro Check
+        // 30 Ticks = 10 Checks → statistisch ~9 Events
+        for tick in 1..=30u64 {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(tick);
+            time.tick_count = tick;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 8.0;
+            schedule.run(&mut world);
+        }
+
+        let events = event_store.get_events_since(0, 500).unwrap();
+        let encounter_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "hallway_encounter_detected")
+            .collect();
+
+        assert!(
+            !encounter_events.is_empty(),
+            "Encounter system must generate HallwayEncounterDetected events \
+             when multiple agents are in transit (got 0 events after 30 ticks \
+             with 3 agents in transit)"
+        );
+    }
+
+    /// Move-Action mit echtem Raumnamen → korrekte Transit-Duration via RoomDistanceMap
+    #[test]
+    fn test_move_action_uses_room_distance_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let event_db_path = dir.path().join("move-rdm.db");
+        let event_store = Arc::new(EventStore::open(event_db_path.to_str().unwrap()).unwrap());
+
+        let (mut world, mut schedule) = create_simulation_world();
+        world.insert_resource(LimboEventStore(event_store.clone()));
+
+        let rooms_toml = include_str!("../../../config/rooms.toml");
+        let building_config: sentinel_common::room::BuildingConfig =
+            toml::from_str(rooms_toml).expect("rooms.toml parse error");
+        let rdm = RoomDistanceMap::from_building_config(&building_config);
+
+        // Verifiziere: Distanzen sind nicht alle gleich
+        let d1 = rdm.distance("empfang", "flur-eg"); // 1 hop
+        let d2 = rdm.distance("empfang", "kueche"); // 2 hops
+        let d3 = rdm.distance("empfang", "buero-ceo"); // 4 hops
+        assert_eq!(d1, 1);
+        assert_eq!(d2, 2);
+        assert_eq!(d3, 4);
+
+        world.insert_resource(rdm);
+
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
+
+        // Move nach kueche (2 hops → 3100ms)
+        tx.send(AgentAction {
+            agent_id: AgentId(1),
+            action_type: ActionType::Move,
+            target_room: Some("kueche".to_string()),
+            target_agent: None,
+            content: None,
+            timestamp: Timestamp(1000),
+            tick: Tick(1),
+        })
+        .unwrap();
+
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(1);
+            time.tick_count = 1;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 8.0;
+        }
+        schedule.run(&mut world);
+
+        // Position muss in Transit sein
+        let pos = world.get::<Position>(entity).unwrap();
+        assert!(pos.in_transit, "Agent should be in transit");
+        assert_eq!(pos.transit_target, Some("kueche".to_string()));
+
+        // TransitStarted Event muss korrekte Duration haben
+        let events = event_store.get_events_since(0, 100).unwrap();
+        let transit_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "transit_started")
+            .collect();
+        assert_eq!(transit_events.len(), 1);
+
+        let payload: serde_json::Value = serde_json::from_str(&transit_events[0].payload).unwrap();
+        assert_eq!(
+            payload["duration_ms"].as_u64().unwrap(),
+            3100,
+            "empfang→kueche = 2 hops → 1500+1600=3100ms"
+        );
+        assert_eq!(payload["to_room"].as_str().unwrap(), "kueche");
+        assert_eq!(payload["from_room"].as_str().unwrap(), "empfang");
+    }
+
     /// ToolUse ohne ToolRuntime: Fallback auf WorkContext
     #[test]
     fn test_tool_dispatch_fallback_without_runtime() {
