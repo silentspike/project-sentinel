@@ -743,8 +743,7 @@ mod tests {
             .collect();
         assert_eq!(transit_events.len(), 1);
 
-        let payload1: serde_json::Value =
-            serde_json::from_str(&transit_events[0].payload).unwrap();
+        let payload1: serde_json::Value = serde_json::from_str(&transit_events[0].payload).unwrap();
         let duration_near = payload1["duration_ms"].as_u64().unwrap();
         assert_eq!(duration_near, 2300, "1-hop transit should be 2300ms");
 
@@ -790,8 +789,7 @@ mod tests {
             .collect();
         assert_eq!(transit_events.len(), 2);
 
-        let payload2: serde_json::Value =
-            serde_json::from_str(&transit_events[1].payload).unwrap();
+        let payload2: serde_json::Value = serde_json::from_str(&transit_events[1].payload).unwrap();
         let duration_far = payload2["duration_ms"].as_u64().unwrap();
         assert_eq!(duration_far, 4700, "4-hop transit should be 4700ms");
 
@@ -873,8 +871,7 @@ mod tests {
         assert_eq!(transit_events.len(), targets.len());
 
         for event in &transit_events {
-            let payload: serde_json::Value =
-                serde_json::from_str(&event.payload).unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
             let duration = payload["duration_ms"].as_u64().unwrap();
             assert!(
                 (2000..=5000).contains(&duration),
@@ -1033,8 +1030,7 @@ mod tests {
             .collect();
         assert_eq!(transit_events.len(), 1);
 
-        let payload: serde_json::Value =
-            serde_json::from_str(&transit_events[0].payload).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&transit_events[0].payload).unwrap();
         assert_eq!(
             payload["duration_ms"].as_u64().unwrap(),
             3100,
