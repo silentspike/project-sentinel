@@ -43,6 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `sentinel-ecs/src/world.rs`: `PsiMetrics` ECS Resource (cpu_avg10, mem_avg10)
   - `services/sentinel-daemon/src/orchestrator.rs`: PSI-Metriken aus AdaptiveTickRate in ECS World injiziert vor jedem Schedule-Run
 
+- **Cortex Pipeline Hardening: Config Persistence** (#144)
+  - `cmd/cortex-gateway/main.go`: `applyHardeningDefaults()` laedt Personality Guard, Quality Gate und Narrative Nudge Defaults aus Environment-Variablen beim Start
+  - `config/cortex-gateway.toml`: Hardening-Dokumentation mit Env-Var-Referenzen
+  - systemd Drop-in (`hardening.conf`): Guards sind im Production-Betrieb by-default aktiviert
+  - systemd Drop-in (`user.conf`): Gateway laeuft als `ubuntu` User (Claude CLI Auth)
+
 ### Security
 
 - **Go Toolchain Update** go1.25.7 → go1.25.8 (GO-2026-4600, GO-2026-4601, GO-2026-4602)

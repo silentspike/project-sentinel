@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -76,6 +77,7 @@ func main() {
 
 	// 4. Control config (shared between pipeline + control plane)
 	controlConfig := control.NewConfig("claude-code")
+	applyHardeningDefaults(controlConfig, logger)
 
 	// 4b. Event Store (optional, enabled via SENTINEL_CORTEX_EVENT_STORE_PATH)
 	var evStore *eventstore.Store
@@ -276,6 +278,45 @@ func envOrDefault(key, defaultVal string) string {
 		return val
 	}
 	return defaultVal
+}
+
+// applyHardeningDefaults reads pipeline hardening settings from environment
+// variables and applies them to the control config so they survive restarts.
+func applyHardeningDefaults(cfg *control.Config, logger *slog.Logger) {
+	updates := make(map[string]interface{})
+
+	if v := os.Getenv("SENTINEL_PERSONALITY_GUARD_ENABLED"); v == "true" || v == "1" {
+		updates["personality_guard_enabled"] = true
+	}
+	if v := os.Getenv("SENTINEL_DRIFT_THRESHOLD"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			updates["drift_threshold"] = f
+		}
+	}
+	if v := os.Getenv("SENTINEL_QUALITY_GATE_ENABLED"); v == "true" || v == "1" {
+		updates["quality_gate_enabled"] = true
+	}
+	if v := os.Getenv("SENTINEL_QUALITY_THRESHOLD"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			updates["quality_threshold"] = float64(i)
+		}
+	}
+	if v := os.Getenv("SENTINEL_QUALITY_MAX_REGEN"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			updates["quality_max_regen"] = float64(i)
+		}
+	}
+	if v := os.Getenv("SENTINEL_NARRATIVE_NUDGE"); v != "" {
+		updates["narrative_nudge"] = v
+	}
+
+	if len(updates) > 0 {
+		if err := cfg.Update(updates); err != nil {
+			logger.Error("failed to apply hardening defaults", "error", err)
+		} else {
+			logger.Info("pipeline hardening defaults applied", "updates", updates)
+		}
+	}
 }
 
 // loadAgentProfiles reads all agent TOMLs and registers their Big Five profiles
