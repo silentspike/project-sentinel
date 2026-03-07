@@ -241,6 +241,9 @@ fn deserialize_legacy_payload(event_type: &str, payload: &str) -> Option<DomainE
         "nightrun_completed" => "NightRunCompleted",
         "agent_consolidated" => "AgentConsolidated",
         "agent_consolidation_failed" => "AgentConsolidationFailed",
+        "smell_event_triggered" => "SmellEventTriggered",
+        "hallway_encounter_detected" => "HallwayEncounterDetected",
+        "judge_alert_received" => "JudgeAlertReceived",
         _ => return None,
     };
 

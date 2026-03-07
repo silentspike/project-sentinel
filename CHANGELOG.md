@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SmellEvents End-to-End Pipeline** (#195)
+  - `crates/sentinel-ecs/src/world.rs`: Neue `ActiveSmells` ECS Resource (HashMap pro Raum, Decay-Logik)
+  - `crates/sentinel-ecs/src/systems.rs`: `input_system` + `smell_system` + `perception_system` erzeugen/injizieren Smells
+  - `crates/sentinel-ecs/src/autonomy.rs`: Autonomie-System erzeugt SmellEvents bei Coffee/Meal
+  - `crates/sentinel-projection/src/store.rs`: Schema-Migration `active_smells` Spalte + `update_room_smells()`
+  - `crates/sentinel-projection/src/handlers/room_live_view.rs`: SmellEventTriggered Handler
+  - `crates/sentinel-projection/src/worker.rs`: Legacy-Mapper fuer `smell_event_triggered`
+  - `dashboard/src/types.ts`, `routes/rooms.ts`, `ws.ts`: `active_smells` Feld in API + WebSocket
+  - 5 neue Integration-Tests: Coffee E2E, Perception Injection, Smell Decay, Raum-Isolation, Food E2E
+
 - **agent-runtime Binary** (#173)
   - `services/agent-runtime/`: Leichtgewichtiger Sandbox-Prozess (Zero Dependencies, nur std)
   - Stdin-Reader-Thread fuer zukuenftige Command-Dispatch, Heartbeat-Loop (30s) fuer VFS I/O

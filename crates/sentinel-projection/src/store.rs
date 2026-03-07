@@ -64,6 +64,10 @@ ALTER TABLE room_live_view ADD COLUMN co2_ppm REAL;
 ALTER TABLE room_live_view ADD COLUMN noise_db REAL;
 ";
 
+const MIGRATE_ROOM_SMELLS_COLUMN: &str = "
+ALTER TABLE room_live_view ADD COLUMN active_smells TEXT;
+";
+
 const CREATE_KPI_1M: &str = "
 CREATE TABLE IF NOT EXISTS kpi_1m (
     bucket_start INTEGER PRIMARY KEY,
@@ -111,6 +115,14 @@ impl ReadModelStore {
 
         // Migration: Room-Physics-Spalten hinzufuegen (idempotent)
         for line in MIGRATE_ROOM_PHYSICS_COLUMNS.lines() {
+            let line = line.trim();
+            if line.starts_with("ALTER") {
+                let _ = conn.execute_batch(line);
+            }
+        }
+
+        // Migration: Room-Smells-Spalte hinzufuegen (idempotent)
+        for line in MIGRATE_ROOM_SMELLS_COLUMN.lines() {
             let line = line.trim();
             if line.starts_with("ALTER") {
                 let _ = conn.execute_batch(line);
@@ -215,7 +227,7 @@ impl ReadModelStore {
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
         let result = conn.query_row(
-            "SELECT room_id, occupant_count, transit_count, active_chaos, temperature, co2_ppm, noise_db, last_event_tick, last_event_id, updated_at FROM room_live_view WHERE room_id = ?1",
+            "SELECT room_id, occupant_count, transit_count, active_chaos, active_smells, temperature, co2_ppm, noise_db, last_event_tick, last_event_id, updated_at FROM room_live_view WHERE room_id = ?1",
             params![room_id],
             |row| {
                 Ok(RoomView {
@@ -223,12 +235,13 @@ impl ReadModelStore {
                     occupant_count: row.get(1)?,
                     transit_count: row.get(2)?,
                     active_chaos: row.get(3)?,
-                    temperature: row.get(4)?,
-                    co2_ppm: row.get(5)?,
-                    noise_db: row.get(6)?,
-                    last_event_tick: row.get(7)?,
-                    last_event_id: row.get(8)?,
-                    updated_at: row.get(9)?,
+                    active_smells: row.get(4)?,
+                    temperature: row.get(5)?,
+                    co2_ppm: row.get(6)?,
+                    noise_db: row.get(7)?,
+                    last_event_tick: row.get(8)?,
+                    last_event_id: row.get(9)?,
+                    updated_at: row.get(10)?,
                 })
             },
         );
@@ -287,6 +300,7 @@ pub struct RoomView {
     pub occupant_count: i64,
     pub transit_count: i64,
     pub active_chaos: Option<String>,
+    pub active_smells: Option<String>,
     pub temperature: Option<f64>,
     pub co2_ppm: Option<f64>,
     pub noise_db: Option<f64>,
@@ -519,6 +533,24 @@ impl<'a> ReadModelTransaction<'a> {
                last_event_id = ?3, updated_at = ?4
              WHERE room_id = ?5 AND ?3 > last_event_id",
             params![chaos_json, tick as i64, row_id, now_ms(), room_id],
+        )?;
+        Ok(())
+    }
+
+    /// Aktive Smells aktualisieren (JSON-Text).
+    pub fn update_room_smells(
+        &self,
+        room_id: &str,
+        smells_json: &str,
+        tick: u64,
+        row_id: i64,
+    ) -> anyhow::Result<()> {
+        self.guard.execute(
+            "UPDATE room_live_view SET
+               active_smells = ?1, last_event_tick = ?2,
+               last_event_id = ?3, updated_at = ?4
+             WHERE room_id = ?5 AND ?3 > last_event_id",
+            params![smells_json, tick as i64, row_id, now_ms(), room_id],
         )?;
         Ok(())
     }

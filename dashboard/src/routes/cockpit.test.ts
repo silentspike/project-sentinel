@@ -47,6 +47,7 @@ const PROJECTION_SCHEMA = `
     occupant_count INTEGER DEFAULT 0,
     transit_count INTEGER DEFAULT 0,
     active_chaos TEXT,
+    active_smells TEXT,
     last_event_tick INTEGER,
     last_event_id INTEGER DEFAULT 0,
     updated_at INTEGER DEFAULT 0

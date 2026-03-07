@@ -32,6 +32,7 @@ beforeAll(() => {
       occupant_count INTEGER NOT NULL DEFAULT 0,
       transit_count INTEGER NOT NULL DEFAULT 0,
       active_chaos TEXT,
+      active_smells TEXT,
       last_event_tick INTEGER,
       last_event_id INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL
@@ -65,13 +66,13 @@ beforeAll(() => {
 
   // Seed alle 15 Rooms aus ROOM_METADATA
   const insertRoom = projDb.prepare(
-    "INSERT INTO room_live_view VALUES (?,?,?,?,?,?,?)",
+    "INSERT INTO room_live_view VALUES (?,?,?,?,?,?,?,?)",
   );
   for (const id of ALL_ROOM_IDS) {
     const occ = id === "buero-dev-1" ? 1 : id === "kueche" ? 1 : 0;
     const transit = id === "buero-design-1" ? 1 : 0;
     const chaos = id === "treppenhaus" ? '{"type":"fire_alarm","severity":"medium"}' : null;
-    insertRoom.run(id, occ, transit, chaos, 42, 30, 1000);
+    insertRoom.run(id, occ, transit, chaos, null, 42, 30, 1000);
   }
 
   // Seed 1 KPI bucket

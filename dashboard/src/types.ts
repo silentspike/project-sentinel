@@ -27,6 +27,7 @@ export interface RoomRow {
   occupant_count: number;
   transit_count: number;
   active_chaos: string | null;
+  active_smells: string | null;
   temperature: number | null;
   co2_ppm: number | null;
   noise_db: number | null;
@@ -100,6 +101,7 @@ export interface RoomResponse {
   occupant_count: number;
   transit_count: number;
   active_chaos: unknown | null;
+  active_smells: unknown | null;
   temperature: number | null;
   co2_ppm: number | null;
   noise_db: number | null;
