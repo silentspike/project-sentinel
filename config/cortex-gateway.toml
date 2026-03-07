@@ -50,6 +50,17 @@ output_price_per_m_token = 15.0  # USD per 1M output tokens
 input_price_per_m_token = 0.0
 output_price_per_m_token = 0.0
 
+[hardening]
+# Pipeline Hardening (#144): Personality Guard, Quality Gate, Narrative Nudge
+# These are loaded via environment variables (see systemd unit):
+#   SENTINEL_PERSONALITY_GUARD_ENABLED=true
+#   SENTINEL_DRIFT_THRESHOLD=0.7
+#   SENTINEL_QUALITY_GATE_ENABLED=true
+#   SENTINEL_QUALITY_THRESHOLD=2
+#   SENTINEL_QUALITY_MAX_REGEN=1
+#   SENTINEL_NARRATIVE_NUDGE=""
+# All settings are also changeable at runtime via PATCH /control/config
+
 [metrics]
 enabled = true
 path = "/metrics"
