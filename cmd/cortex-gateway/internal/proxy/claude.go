@@ -128,7 +128,7 @@ func (p *ClaudeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 	if err != nil {
 		return nil, fmt.Errorf("build claude endpoint URL: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body)) //nolint:gosec // G704: baseURL is from trusted daemon config, not user input
 	if err != nil {
 		return nil, fmt.Errorf("create http request: %w", err)
 	}
