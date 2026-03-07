@@ -7,14 +7,16 @@ publish = false
 
 [features]
 default = []
-wasm = ["dep:wasmtime"]
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
-wasmtime = { version = "42", optional = true }
+wasmtime = { version = "42", features = ["component-model"], optional = true }
+wasmtime-wasi = { version = "42", optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

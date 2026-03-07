@@ -479,6 +479,9 @@ Diskrete = "Diskrete"
 Probleme = "Probleme"
 Monitore = "Monitore"
 
+# WASM Component Model words (Issue #19 - German in Rust doc comments)
+relativ = "relativ"
+
 # E2E Test Plan + Dashboard + Wasm Tool words (German in Markdown + JS + Rust)
 Legende = "Legende"
 Elemente = "Elemente"

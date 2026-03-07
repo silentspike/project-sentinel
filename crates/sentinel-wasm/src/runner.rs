@@ -65,13 +65,19 @@ pub struct ExecutionContext {
     pub sandbox: SandboxConfig,
     pub correlation_id: String,
     pub tick: u64,
+    /// ECS agent snapshot for WASM Component Model plugins.
+    #[cfg(feature = "wasm")]
+    pub agent_snapshot: Option<crate::host::AgentSnapshot>,
+    /// Room data for WASM Component Model plugins.
+    #[cfg(feature = "wasm")]
+    pub rooms: Option<std::collections::HashMap<String, crate::host::RoomSnapshot>>,
 }
 
 /// Registry und Executor fuer Agent-Tools.
 pub struct ToolRuntime {
     tools: HashMap<String, ToolDefinition>,
     #[cfg(feature = "wasm")]
-    wasm_engine: wasmtime::Engine,
+    plugin_host: crate::plugin::PluginHost,
 }
 
 impl ToolRuntime {
@@ -79,12 +85,20 @@ impl ToolRuntime {
         Self {
             tools: HashMap::new(),
             #[cfg(feature = "wasm")]
-            wasm_engine: {
-                let mut config = wasmtime::Config::new();
-                config.consume_fuel(true);
-                wasmtime::Engine::new(&config).expect("Failed to create Wasm engine")
-            },
+            plugin_host: crate::plugin::PluginHost::new().expect("Failed to create PluginHost"),
         }
+    }
+
+    /// Returns a mutable reference to the PluginHost (for loading plugins).
+    #[cfg(feature = "wasm")]
+    pub fn plugin_host_mut(&mut self) -> &mut crate::plugin::PluginHost {
+        &mut self.plugin_host
+    }
+
+    /// Returns a reference to the PluginHost.
+    #[cfg(feature = "wasm")]
+    pub fn plugin_host(&self) -> &crate::plugin::PluginHost {
+        &self.plugin_host
     }
 
     /// Registriert ein neues Tool. Fehler bei Duplikat.
@@ -138,7 +152,7 @@ impl ToolRuntime {
             ToolType::Wasm => {
                 #[cfg(feature = "wasm")]
                 {
-                    self.execute_wasm(tool, input, &ctx.sandbox)?
+                    self.execute_component(tool, input, ctx)?
                 }
                 #[cfg(not(feature = "wasm"))]
                 {
@@ -357,48 +371,58 @@ impl ToolRuntime {
         ))
     }
 
-    /// Fuehrt ein WASM-Modul via wasmtime aus.
+    /// Fuehrt ein WASM Component Model Plugin aus.
     ///
-    /// Nutzt fuel-Mechanismus fuer CPU-Begrenzung.
-    /// Modul muss `execute() -> i32` exportieren (0 = Erfolg).
+    /// Nutzt fuel-Mechanismus fuer deterministische CPU-Begrenzung.
+    /// Plugin muss `execute(input: string) -> result<string, string>` exportieren.
+    /// Input wird an das Plugin weitergegeben, Output kommt aus Plugin-Return.
     #[cfg(feature = "wasm")]
-    fn execute_wasm(
+    fn execute_component(
         &self,
         tool: &ToolDefinition,
-        _input: &str,
-        sandbox: &SandboxConfig,
+        input: &str,
+        ctx: &ExecutionContext,
     ) -> Result<String> {
-        let wasm_path = tool
+        let wasm_path_str = tool
             .wasm_path
             .as_ref()
             .ok_or_else(|| anyhow!("Wasm tool '{}' has no wasm_path", tool.name))?;
+        let wasm_path = std::path::PathBuf::from(wasm_path_str);
 
-        // Lade Modul (unterstuetzt .wasm und .wat)
-        let module = wasmtime::Module::from_file(&self.wasm_engine, wasm_path)?;
-        let mut store = wasmtime::Store::new(&self.wasm_engine, ());
+        if !self.plugin_host.is_loaded(&wasm_path) {
+            return Err(anyhow!(
+                "Plugin '{}' not loaded. Call plugin_host.load() first.",
+                tool.name
+            ));
+        }
 
-        // Fuel-basiertes CPU-Limit (1ms ~ 1M fuel units)
-        let fuel = sandbox.max_cpu_ms.saturating_mul(1_000_000);
-        store.set_fuel(fuel)?;
+        // Build agent snapshot from context.
+        let agent_snapshot = ctx.agent_snapshot.clone().unwrap_or_default();
 
-        let linker = wasmtime::Linker::new(&self.wasm_engine);
-        let instance = linker.instantiate(&mut store, &module)?;
+        let rooms = ctx.rooms.clone().unwrap_or_default();
 
-        // Modul muss `execute() -> i32` exportieren
-        let execute_fn = instance
-            .get_typed_func::<(), i32>(&mut store, "execute")
-            .map_err(|_| anyhow!("Wasm module must export 'execute() -> i32'"))?;
+        // Agent home: use first allowed path or a temp directory.
+        let agent_home = ctx
+            .sandbox
+            .allowed_paths
+            .first()
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
 
-        let result_code = execute_fn.call(&mut store, ())?;
-
-        if result_code == 0 {
-            Ok(format!("Wasm module '{}' executed successfully", tool.name))
-        } else {
-            Err(anyhow!(
-                "Wasm module '{}' returned error code {}",
+        match self.plugin_host.execute(
+            &wasm_path,
+            input,
+            agent_snapshot,
+            rooms,
+            ctx.tick,
+            agent_home,
+        )? {
+            Ok(output) => Ok(output),
+            Err(plugin_err) => Err(anyhow!(
+                "Plugin '{}' returned error: {}",
                 tool.name,
-                result_code
-            ))
+                plugin_err
+            )),
         }
     }
 }
@@ -432,6 +456,10 @@ mod tests {
             sandbox,
             correlation_id: "test-correlation".to_string(),
             tick: 1,
+            #[cfg(feature = "wasm")]
+            agent_snapshot: None,
+            #[cfg(feature = "wasm")]
+            rooms: None,
         }
     }
 

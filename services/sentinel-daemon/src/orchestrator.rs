@@ -16,7 +16,7 @@ use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use sentinel_common::agent_config::{load_all_agents, AgentConfig};
 use sentinel_common::components::{AgentIdentity, ShiftInfo};
@@ -248,8 +248,42 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             }
         };
 
+    // -- sentinel-fs FUSE Mount (optional, konfigurierbar) --
+    #[cfg(feature = "fuse")]
+    if let Some(ref fs_mount) = config.fs_mount {
+        let mountpoint = std::path::PathBuf::from(fs_mount);
+        let data_dir_clone = data_dir.clone();
+        if !mountpoint.exists() {
+            std::fs::create_dir_all(&mountpoint)
+                .with_context(|| format!("FUSE mountpoint erstellen: {}", mountpoint.display()))?;
+        }
+        info!(
+            mountpoint = %mountpoint.display(),
+            data_dir = %data_dir_clone.display(),
+            "sentinel-fs FUSE-Mount starten"
+        );
+        std::thread::spawn(move || {
+            if let Err(e) = sentinel_fs::start_fuse(&data_dir_clone, &mountpoint) {
+                error!(error = %e, "sentinel-fs FUSE-Mount fehlgeschlagen");
+            }
+        });
+        // Kurz warten bis FUSE mounted ist
+        std::thread::sleep(Duration::from_millis(200));
+        if mountpoint.join("__BASE__").exists() || mountpoint.read_dir().is_ok() {
+            info!(mountpoint = %mountpoint.display(), "sentinel-fs FUSE-Mount aktiv");
+        } else {
+            warn!(mountpoint = %mountpoint.display(), "sentinel-fs FUSE-Mount moeglicherweise nicht bereit");
+        }
+    }
+
     // -- Sandbox Enforcer (Landlock + cgroups v2 + bwrap) --
-    let (sandbox, sandbox_warnings) = SandboxEnforcer::detect();
+    let (mut sandbox, sandbox_warnings) = SandboxEnforcer::detect();
+
+    // Wenn sentinel-fs FUSE konfiguriert: bwrap nutzt FUSE-Mount statt /ram/agents/
+    if let Some(ref fs_mount) = config.fs_mount {
+        sandbox.set_fs_mount(fs_mount.clone());
+        info!(fs_mount = %fs_mount, "Sandbox nutzt sentinel-fs FUSE-Mount fuer Agent-Homes");
+    }
     for w in &sandbox_warnings {
         match w {
             SandboxWarning::LandlockNotAvailable => {
@@ -693,6 +727,73 @@ fn ecs_tick_loop(
         tool_type: sentinel_wasm::ToolType::Search,
         required_capabilities: vec!["search".into()],
     });
+    // -- WASM Plugin Auto-Load aus config/tools/ --
+    #[cfg(feature = "wasm")]
+    {
+        let tools_dir = std::path::Path::new("config/tools");
+        if tools_dir.is_dir() {
+            match std::fs::read_dir(tools_dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().is_some_and(|ext| ext == "wasm") {
+                            let config = sentinel_wasm::PluginConfig {
+                                wasm_path: path.clone(),
+                                ..Default::default()
+                            };
+                            match tool_runtime.plugin_host_mut().load(config) {
+                                Ok(()) => {
+                                    // Query plugin metadata (tool-name, tool-description)
+                                    let agent_home =
+                                        std::path::PathBuf::from("/tmp/plugin-meta-query");
+                                    let _ = std::fs::create_dir_all(&agent_home);
+                                    match tool_runtime.plugin_host().query_meta(&path, agent_home) {
+                                        Ok(meta) => {
+                                            let tool_def = sentinel_wasm::ToolDefinition {
+                                                name: meta.tool_name.clone(),
+                                                description: meta.tool_description,
+                                                wasm_path: Some(path.to_string_lossy().to_string()),
+                                                tool_type: sentinel_wasm::ToolType::Wasm,
+                                                required_capabilities: Vec::new(),
+                                            };
+                                            match tool_runtime.register_tool(tool_def) {
+                                                Ok(()) => info!(
+                                                    tool = %meta.tool_name,
+                                                    path = %path.display(),
+                                                    "WASM Plugin geladen"
+                                                ),
+                                                Err(e) => warn!(
+                                                    path = %path.display(),
+                                                    error = %e,
+                                                    "WASM Plugin Registrierung fehlgeschlagen"
+                                                ),
+                                            }
+                                        }
+                                        Err(e) => warn!(
+                                            path = %path.display(),
+                                            error = %e,
+                                            "WASM Plugin Meta-Query fehlgeschlagen"
+                                        ),
+                                    }
+                                }
+                                Err(e) => warn!(
+                                    path = %path.display(),
+                                    error = %e,
+                                    "WASM Plugin laden fehlgeschlagen"
+                                ),
+                            }
+                        }
+                    }
+                }
+                Err(e) => debug!(
+                    path = %tools_dir.display(),
+                    error = %e,
+                    "config/tools/ nicht lesbar"
+                ),
+            }
+        }
+    }
+
     info!(
         tools = tool_runtime.tool_count(),
         "Tool Registry initialisiert"

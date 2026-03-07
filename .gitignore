@@ -62,6 +62,9 @@ bitnet/bitnet-inference
 # Keep pre-compiled BPF probes (embedded via include_bytes! at compile time)
 !crates/sentinel-ebpf/probes/*.o
 
+# Keep pre-compiled WASM test fixtures (needed for CI/test execution)
+!crates/sentinel-wasm/tests/fixtures/*.wasm
+
 # Local Config
 .cargo-remote.toml
 
