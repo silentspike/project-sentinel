@@ -42,7 +42,7 @@ describe("Events Routes", () => {
     projDb.run(`CREATE TABLE room_live_view (
       room_id TEXT PRIMARY KEY,
       occupant_count INTEGER DEFAULT 0, transit_count INTEGER DEFAULT 0,
-      active_chaos TEXT, temperature REAL, co2_ppm REAL, noise_db REAL,
+      active_chaos TEXT, active_smells TEXT, temperature REAL, co2_ppm REAL, noise_db REAL,
       last_event_tick INTEGER, last_event_id INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0
     )`);
 

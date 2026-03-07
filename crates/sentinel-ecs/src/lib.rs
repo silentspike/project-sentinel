@@ -19,9 +19,9 @@ pub use perception::{format_injection, generate_perception, PerceptionTexts, Sme
 pub use systems::SimulationPhase;
 pub use world::{
     apply_capabilities, apply_personality, attach_redb_store, create_simulation_world,
-    despawn_agent_from_world, spawn_agent, ActionReceiver, EventBuffer, LimboEventStore,
-    PerceptionSender, PersistTelemetry, PsiMetrics, RedbStateStore, RoomDistanceMap,
-    SimulationTime, ToolRuntimeResource,
+    despawn_agent_from_world, spawn_agent, ActionReceiver, ActiveSmell, ActiveSmells, EventBuffer,
+    LimboEventStore, PerceptionSender, PersistTelemetry, PsiMetrics, RedbStateStore,
+    RoomDistanceMap, SimulationTime, ToolRuntimeResource,
 };
 
 #[cfg(test)]
@@ -1079,5 +1079,234 @@ mod tests {
             Some("tool:search:test query".to_string()),
             "Without ToolRuntime, tool content should fall back to WorkContext"
         );
+    }
+
+    // ── SmellEvent End-to-End Tests (Issue #195) ─────
+
+    /// Coffee E2E: drink_coffee → SmellEventTriggered in Limbo + ActiveSmells Resource
+    #[test]
+    fn test_smell_coffee_e2e_event_and_resource() {
+        let dir = tempfile::tempdir().unwrap();
+        let event_db_path = dir.path().join("smell-coffee.db");
+        let event_store = Arc::new(EventStore::open(event_db_path.to_str().unwrap()).unwrap());
+
+        let (mut world, mut schedule) = create_simulation_world();
+        world.insert_resource(LimboEventStore(event_store.clone()));
+
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        // Agent in Kueche platzieren
+        world.get_mut::<Position>(entity).unwrap().room_id = "kueche".to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
+
+        // drink_coffee Action senden
+        tx.send(AgentAction {
+            agent_id: AgentId(1),
+            action_type: ActionType::ToolUse,
+            target_room: None,
+            target_agent: None,
+            content: Some("drink_coffee".to_string()),
+            timestamp: Timestamp(1000),
+            tick: Tick(1),
+        })
+        .unwrap();
+
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(1);
+            time.tick_count = 1;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 10.0;
+        }
+        schedule.run(&mut world);
+
+        // SmellEventTriggered muss in Limbo sein
+        let events = event_store.get_events_since(0, 200).unwrap();
+        let smell_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "smell_event_triggered")
+            .collect();
+        assert_eq!(
+            smell_events.len(),
+            1,
+            "Expected 1 smell_event_triggered, got {}",
+            smell_events.len()
+        );
+        let payload: serde_json::Value = serde_json::from_str(&smell_events[0].payload).unwrap();
+        assert_eq!(payload["smell_type"], "coffee");
+        assert_eq!(payload["room_id"], "kueche");
+
+        // ActiveSmells Resource muss coffee in kueche haben
+        let active = world.resource::<world::ActiveSmells>();
+        let smells = active.get_active("kueche", 1);
+        assert_eq!(smells.len(), 1, "ActiveSmells should have 1 entry");
+        assert_eq!(smells[0].smell_type, "coffee");
+    }
+
+    /// Perception Injection: ActiveSmells coffee → environment_text "Kaffeeduft"
+    #[test]
+    fn test_smell_perception_injection() {
+        let (mut world, mut schedule) = create_simulation_world();
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        world.get_mut::<Position>(entity).unwrap().room_id = "kueche".to_string();
+
+        // Manuell einen Smell in ActiveSmells einfuegen
+        world.resource_mut::<world::ActiveSmells>().add(
+            "kueche",
+            "coffee".to_string(),
+            0.8,
+            0,
+            200,
+        );
+
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(1);
+            time.delta_seconds = 1.0;
+            time.sim_hour = 10.0;
+        }
+        schedule.run(&mut world);
+
+        let perception = world.get::<PerceptionState>(entity).unwrap();
+        assert!(
+            perception.environment_text.contains("Kaffeeduft"),
+            "Perception should contain 'Kaffeeduft' when coffee smell active, got: {}",
+            perception.environment_text
+        );
+    }
+
+    /// Smell Decay: abgelaufener Smell wird nicht mehr wahrgenommen
+    #[test]
+    fn test_smell_decay_removes_from_perception() {
+        let (mut world, mut schedule) = create_simulation_world();
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        world.get_mut::<Position>(entity).unwrap().room_id = "kueche".to_string();
+
+        // Smell mit duration_ticks=5, erstellt bei Tick 0
+        world
+            .resource_mut::<world::ActiveSmells>()
+            .add("kueche", "coffee".to_string(), 0.8, 0, 5);
+
+        // Tick 3: Smell noch aktiv
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(3);
+            time.delta_seconds = 1.0;
+            time.sim_hour = 10.0;
+        }
+        schedule.run(&mut world);
+        let perception = world.get::<PerceptionState>(entity).unwrap();
+        assert!(
+            perception.environment_text.contains("Kaffeeduft"),
+            "At tick 3 smell should still be active"
+        );
+
+        // Tick 6: Smell abgelaufen (0 + 5 = 5, tick 6 > 5)
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(6);
+            time.delta_seconds = 1.0;
+            time.sim_hour = 10.0;
+        }
+        schedule.run(&mut world);
+        let perception = world.get::<PerceptionState>(entity).unwrap();
+        assert!(
+            !perception.environment_text.contains("Kaffeeduft"),
+            "At tick 6 smell should have decayed, got: {}",
+            perception.environment_text
+        );
+    }
+
+    /// Kein Smell in fremdem Raum: coffee in kueche, Agent in empfang
+    #[test]
+    fn test_smell_not_in_different_room() {
+        let (mut world, mut schedule) = create_simulation_world();
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        // Agent im Empfang, Smell in Kueche
+        world.get_mut::<Position>(entity).unwrap().room_id = "empfang".to_string();
+
+        world.resource_mut::<world::ActiveSmells>().add(
+            "kueche",
+            "coffee".to_string(),
+            0.8,
+            0,
+            200,
+        );
+
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(1);
+            time.delta_seconds = 1.0;
+            time.sim_hour = 10.0;
+        }
+        schedule.run(&mut world);
+
+        let perception = world.get::<PerceptionState>(entity).unwrap();
+        assert!(
+            !perception.environment_text.contains("Kaffeeduft"),
+            "Agent in empfang should NOT smell coffee from kueche, got: {}",
+            perception.environment_text
+        );
+    }
+
+    /// Food E2E: eat_meal → SmellEventTriggered mit "food" in Limbo
+    #[test]
+    fn test_smell_food_e2e() {
+        let dir = tempfile::tempdir().unwrap();
+        let event_db_path = dir.path().join("smell-food.db");
+        let event_store = Arc::new(EventStore::open(event_db_path.to_str().unwrap()).unwrap());
+
+        let (mut world, mut schedule) = create_simulation_world();
+        world.insert_resource(LimboEventStore(event_store.clone()));
+
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        world.get_mut::<Position>(entity).unwrap().room_id = "kueche".to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
+
+        // eat_meal Action senden
+        tx.send(AgentAction {
+            agent_id: AgentId(1),
+            action_type: ActionType::ToolUse,
+            target_room: None,
+            target_agent: None,
+            content: Some("eat_meal".to_string()),
+            timestamp: Timestamp(2000),
+            tick: Tick(1),
+        })
+        .unwrap();
+
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(1);
+            time.tick_count = 1;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 12.0;
+        }
+        schedule.run(&mut world);
+
+        // SmellEventTriggered mit "food" muss in Limbo sein
+        let events = event_store.get_events_since(0, 200).unwrap();
+        let smell_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "smell_event_triggered")
+            .collect();
+        assert_eq!(
+            smell_events.len(),
+            1,
+            "Expected 1 food smell_event_triggered, got {}",
+            smell_events.len()
+        );
+        let payload: serde_json::Value = serde_json::from_str(&smell_events[0].payload).unwrap();
+        assert_eq!(payload["smell_type"], "food");
+        assert_eq!(payload["room_id"], "kueche");
+
+        // ActiveSmells Resource muss food in kueche haben
+        let active = world.resource::<world::ActiveSmells>();
+        let smells = active.get_active("kueche", 1);
+        assert_eq!(smells.len(), 1);
+        assert_eq!(smells[0].smell_type, "food");
     }
 }

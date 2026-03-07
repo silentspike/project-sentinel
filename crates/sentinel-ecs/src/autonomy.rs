@@ -40,6 +40,7 @@ pub fn autonomy_system(
     room_distances: Option<Res<RoomDistanceMap>>,
     time: Res<SimulationTime>,
     mut event_buffer: ResMut<EventBuffer>,
+    mut active_smells: ResMut<super::world::ActiveSmells>,
 ) {
     let tick = time.tick.0;
 
@@ -106,6 +107,22 @@ pub fn autonomy_system(
                     tick,
                 );
                 event_buffer.events.push(event);
+                // Food-Smell erzeugen
+                let smell_payload = DomainEventPayload::SmellEventTriggered {
+                    room_id: target.clone(),
+                    smell_type: "food".to_string(),
+                    intensity: 0.6,
+                    duration_ticks: 90,
+                };
+                let smell_event = DomainEvent::new(
+                    smell_payload.event_type_str(),
+                    &target,
+                    &smell_payload.to_json(),
+                    &correlation_id,
+                    tick,
+                );
+                event_buffer.events.push(smell_event);
+                active_smells.add(&target, "food".to_string(), 0.6, tick, 90);
             } else {
                 start_transit(
                     identity,
@@ -138,6 +155,22 @@ pub fn autonomy_system(
                     tick,
                 );
                 event_buffer.events.push(event);
+                // Coffee-Smell erzeugen
+                let smell_payload = DomainEventPayload::SmellEventTriggered {
+                    room_id: target.clone(),
+                    smell_type: "coffee".to_string(),
+                    intensity: 0.8,
+                    duration_ticks: 120,
+                };
+                let smell_event = DomainEvent::new(
+                    smell_payload.event_type_str(),
+                    &target,
+                    &smell_payload.to_json(),
+                    &correlation_id,
+                    tick,
+                );
+                event_buffer.events.push(smell_event);
+                active_smells.add(&target, "coffee".to_string(), 0.8, tick, 120);
             } else {
                 start_transit(
                     identity,
