@@ -1230,8 +1230,7 @@ fn ecs_tick_loop(
                             .hippocampus()
                             .get_goals(name)
                             .unwrap_or_default();
-                        let active_goals: Vec<_> =
-                            goals.iter().filter(|g| g.is_active()).collect();
+                        let active_goals: Vec<_> = goals.iter().filter(|g| g.is_active()).collect();
                         for goal in &active_goals {
                             let new_progress = (goal.progress + 0.05).min(1.0);
                             match episode_producer.hippocampus().update_goal_progress(
