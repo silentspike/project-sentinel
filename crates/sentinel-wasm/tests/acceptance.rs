@@ -1569,7 +1569,11 @@ mod wasm_fs {
             )
             .unwrap();
 
-        assert!(result.is_ok(), "get-room-info must succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "get-room-info must succeed: {:?}",
+            result.err()
+        );
         let output = result.unwrap();
         assert!(output.contains("room:buero-design"), "Output: {output}");
         assert!(output.contains("name:Design Buero"), "Output: {output}");
@@ -1705,7 +1709,11 @@ mod wasm_fs {
             )
             .unwrap();
 
-        assert!(result.is_ok(), "write to subdir must succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "write to subdir must succeed: {:?}",
+            result.err()
+        );
 
         // Host-Side: Subdirectory + Datei existiert
         let content = std::fs::read_to_string(dir.path().join("sub/deep/file.txt")).unwrap();
@@ -1822,10 +1830,7 @@ mod wasm_fs {
             )
             .unwrap();
         assert!(read_result.is_ok(), "read: {:?}", read_result.err());
-        assert_eq!(
-            read_result.unwrap(),
-            "Binary-safe content: abc-xyz-123"
-        );
+        assert_eq!(read_result.unwrap(), "Binary-safe content: abc-xyz-123");
     }
 
     // ---- Zwei Agents sehen verschiedene Fake-Filesysteme ----
@@ -1912,7 +1917,10 @@ mod wasm_fs {
 
         assert!(result.is_ok(), "list empty dir: {:?}", result.err());
         let output = result.unwrap();
-        assert!(output.is_empty(), "empty dir should return empty string, got: '{output}'");
+        assert!(
+            output.is_empty(),
+            "empty dir should return empty string, got: '{output}'"
+        );
     }
 
     // ---- Zweiter Room in der Map ----
@@ -1972,7 +1980,9 @@ mod wasm_fs {
         let host = load_fs_plugin();
         let dir = tempfile::tempdir().unwrap();
 
-        let meta = host.query_meta(&fs_fixture(), dir.path().to_path_buf()).unwrap();
+        let meta = host
+            .query_meta(&fs_fixture(), dir.path().to_path_buf())
+            .unwrap();
         assert_eq!(meta.tool_name, "fs-processor");
         assert!(
             meta.tool_description.contains("File processor"),
@@ -2053,7 +2063,9 @@ mod wasm_fs {
             rooms: Some(make_rooms()),
         };
 
-        let result = runtime.execute("fs-processor", "read data.txt", &ctx).unwrap();
+        let result = runtime
+            .execute("fs-processor", "read data.txt", &ctx)
+            .unwrap();
         assert!(result.success, "ToolResult.success must be true");
         assert_eq!(result.output, "Runtime Test Daten");
         assert_eq!(result.agent_id, "AGENT-07");

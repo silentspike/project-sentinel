@@ -397,10 +397,7 @@ impl ToolRuntime {
         }
 
         // Build agent snapshot from context.
-        let agent_snapshot = ctx
-            .agent_snapshot
-            .clone()
-            .unwrap_or_default();
+        let agent_snapshot = ctx.agent_snapshot.clone().unwrap_or_default();
 
         let rooms = ctx.rooms.clone().unwrap_or_default();
 

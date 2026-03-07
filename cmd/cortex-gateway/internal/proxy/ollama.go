@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 )
 
 const defaultOllamaBaseURL = "http://localhost:11434"
@@ -109,7 +110,11 @@ func (p *OllamaProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 		return nil, fmt.Errorf("marshal ollama request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/api/chat", bytes.NewReader(body))
+	endpoint, err := url.JoinPath(p.baseURL, "/api/chat")
+	if err != nil {
+		return nil, fmt.Errorf("build ollama endpoint URL: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create http request: %w", err)
 	}

@@ -30,7 +30,7 @@ impl Default for PluginConfig {
         Self {
             wasm_path: PathBuf::new(),
             memory_limit_bytes: 64 * 1024 * 1024, // 64 MB
-            fuel_limit: 10_000_000,                // 10M instructions
+            fuel_limit: 10_000_000,               // 10M instructions
             allowed_paths: Vec::new(),
         }
     }
@@ -70,7 +70,10 @@ impl PluginHost {
         // Register WASI host functions (sync mode).
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
         // Register sentinel:plugin host-api functions.
-        SentinelTool::add_to_linker::<PluginState, wasmtime::component::HasSelf<PluginState>>(&mut linker, |state: &mut PluginState| state)?;
+        SentinelTool::add_to_linker::<PluginState, wasmtime::component::HasSelf<PluginState>>(
+            &mut linker,
+            |state: &mut PluginState| state,
+        )?;
 
         Ok(Self {
             engine,
@@ -124,7 +127,13 @@ impl PluginHost {
             .get(wasm_path)
             .ok_or_else(|| wasmtime::Error::msg("Plugin config not found"))?;
 
-        let state = self.build_state(config, AgentSnapshot::default(), HashMap::new(), 0, agent_home)?;
+        let state = self.build_state(
+            config,
+            AgentSnapshot::default(),
+            HashMap::new(),
+            0,
+            agent_home,
+        )?;
         let mut store = self.build_store(state, config)?;
 
         let bindings = SentinelTool::instantiate(&mut store, component, &self.linker)?;

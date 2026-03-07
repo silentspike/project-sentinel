@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -123,7 +124,11 @@ func (p *ClaudeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 		return nil, fmt.Errorf("marshal claude request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/v1/messages", bytes.NewReader(body))
+	endpoint, err := url.JoinPath(p.baseURL, "/v1/messages")
+	if err != nil {
+		return nil, fmt.Errorf("build claude endpoint URL: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create http request: %w", err)
 	}
