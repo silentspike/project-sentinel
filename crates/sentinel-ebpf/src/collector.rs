@@ -174,13 +174,21 @@ impl EbpfCollector {
     }
 
     /// Registers an agent for monitoring.
+    ///
+    /// Sets an initial health timestamp so the agent has a 30s grace period
+    /// before stall detection kicks in. Without this, agents that haven't
+    /// produced any I/O yet would never appear as stalled (no entry in
+    /// `last_write`), but the first recorded write followed by 30s inactivity
+    /// would immediately trigger a false stall.
     pub fn register_agent(&mut self, mapping: AgentCgroupMapping) {
+        let now = current_secs();
         debug!(
             agent = %mapping.agent_name,
             cgroup = %mapping.cgroup_path,
             cgroup_id = mapping.cgroup_id,
             "Registered agent for eBPF monitoring"
         );
+        self.health_checker.record_write(mapping.cgroup_id, now);
         self.agent_mappings.push(mapping);
     }
 
@@ -526,9 +534,14 @@ impl EbpfCollector {
             warn!("Kernel mode requested but ebpf feature not compiled in");
         }
 
-        // 4. Supplement with cgroup io.stat (available in both modes).
+        // 4. Supplement with cgroup io.stat + /proc/{pid}/io (available in both modes).
         //    BPF block:block_rq_complete only tracks block device I/O.
         //    cgroup io.stat provides cgroup-level I/O regardless of BPF.
+        //    /proc/{pid}/io provides VFS-level I/O (buffered, pipes, page cache).
+        //    Both also update health_checker for stall detection — critical because
+        //    the BPF fentry/vfs_write probe may not see activity for agents doing
+        //    only buffered I/O through pipes.
+        let supplement_now = current_secs();
         let mappings: Vec<_> = self.agent_mappings.clone();
         for mapping in &mappings {
             if let Ok(io_stat) = read_cgroup_io_stat(&mapping.cgroup_path) {
@@ -557,6 +570,11 @@ impl EbpfCollector {
                         &mapping.agent_name,
                         delta_write,
                     );
+                }
+                // cgroup I/O activity → agent is alive (supplements BPF stall detection)
+                if delta_read > 0 || delta_write > 0 {
+                    self.health_checker
+                        .record_write(mapping.cgroup_id, supplement_now);
                 }
             }
 
@@ -593,6 +611,11 @@ impl EbpfCollector {
                                 &mapping.agent_name,
                                 delta_write,
                             );
+                        }
+                        // VFS-level I/O activity → agent is alive
+                        if delta_read > 0 || delta_write > 0 {
+                            self.health_checker
+                                .record_write(mapping.cgroup_id, supplement_now);
                         }
                     }
                     Err(e) => {
@@ -698,14 +721,21 @@ impl EbpfCollector {
                 }
             };
 
-            if let (Some(cpu), Some(memory), Some(io)) = (&cpu, &memory, &io) {
-                let stress = crate::psi::combined_stress_factor(cpu, memory, io);
+            // Partial PSI: use whatever is available, default missing values to 0.
+            // Previously required ALL three (cpu+mem+io) to succeed — a single
+            // missing file caused the entire agent to be skipped (P4 regression).
+            if cpu.is_some() || memory.is_some() || io.is_some() {
+                let zero = sentinel_common::psi::PsiMetrics::default();
+                let cpu_ref = cpu.as_ref().unwrap_or(&zero);
+                let mem_ref = memory.as_ref().unwrap_or(&zero);
+                let io_ref = io.as_ref().unwrap_or(&zero);
+                let stress = crate::psi::combined_stress_factor(cpu_ref, mem_ref, io_ref);
                 psi_map.insert(
                     mapping.agent_name.clone(),
                     PsiSnapshot {
-                        cpu_avg10: cpu.avg10,
-                        memory_avg10: memory.avg10,
-                        io_avg10: io.avg10,
+                        cpu_avg10: cpu_ref.avg10,
+                        memory_avg10: mem_ref.avg10,
+                        io_avg10: io_ref.avg10,
                         combined_stress: stress,
                     },
                 );
@@ -1000,10 +1030,9 @@ mod tests {
             pid: None, // No PID → no /proc read → no health update
         });
 
-        // With no PID and no cgroup io.stat, agent should be stalled
+        // With no PID and no cgroup io.stat, agent has only the initial timestamp
+        // from register_agent() — which is fresh (now), so not stalled yet.
         let snapshot = collector.collect().unwrap();
-        // No health recorded → should not appear in stalled (no record at all)
-        // stalled_agents only reports agents WITH a recorded timestamp that is old
         assert!(snapshot.stalled_agents.is_empty());
     }
 
@@ -1030,5 +1059,22 @@ mod tests {
 
         let other = anyhow::Error::msg("unexpected");
         log_psi_error("AGENT-01", "cpu.pressure", &other);
+    }
+
+    #[test]
+    fn register_sets_initial_health_timestamp() {
+        let mut collector = EbpfCollector::new(MonitoringMode::Userspace);
+        collector.register_agent(AgentCgroupMapping {
+            agent_name: "AGENT-01".to_string(),
+            cgroup_path: "/sys/fs/cgroup/sentinel/agent-01".to_string(),
+            cgroup_id: 100,
+            pid: None,
+        });
+        // Agent has initial timestamp → not stalled immediately
+        let snapshot = collector.collect().unwrap();
+        assert!(
+            snapshot.stalled_agents.is_empty(),
+            "Freshly registered agent must not be stalled"
+        );
     }
 }
