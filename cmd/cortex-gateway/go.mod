@@ -1,8 +1,8 @@
 module github.com/obtFusi/project-sentinel/cmd/cortex-gateway
 
-go 1.25.0
+go 1.26.0
 
-toolchain go1.25.8
+toolchain go1.26.1
 
 require (
 	github.com/BurntSushi/toml v1.6.0
