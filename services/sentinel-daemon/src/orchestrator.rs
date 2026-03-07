@@ -1638,7 +1638,9 @@ mod tests {
 
     #[test]
     fn test_ecs_tick_loop_runs_ticks() {
-        // Shutdown nach kurzer Zeit -> sollte mindestens 1 Tick laufen
+        // Deterministisch: ecs_tick_loop laeuft im Background-Thread, Main-Thread wartet
+        // auf erste Perception (beweist mindestens 1 Tick). Kein Race moeglich, da Shutdown
+        // erst NACH Perception-Empfang gesetzt wird.
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
 
@@ -1656,35 +1658,44 @@ mod tests {
         let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
         let all_agents = vec![test_agent_config(1, "Test Agent", "Tester", 1)];
 
-        // Deterministisch: Warte auf erste Perception (= mindestens 1 Tick abgeschlossen)
-        std::thread::spawn(move || {
-            let _ = prx.recv_timeout(Duration::from_secs(30));
-            shutdown_clone.store(true, Ordering::SeqCst);
-        });
-
         let (ebpf_collector, ebpf_tx) = test_ebpf();
         let ep = test_episode_producer(&tmp, &event_store);
-        let result = ecs_tick_loop(
-            state_store,
-            event_store,
-            rx,
-            ptx,
-            all_agents,
-            1,
-            Duration::from_millis(50),
-            1.0, // time_scale
-            shutdown,
-            controlplane,
-            runtime_orch,
-            test_sandbox(),
-            ebpf_collector,
-            ebpf_tx,
-            ep,
-            vec!["true".to_string()],
-            crate::adaptive_tick::AdaptiveConfig::default(),
-            sentinel_ecs::RoomDistanceMap::default(),
+
+        // ecs_tick_loop in Background-Thread (Setup-Dauer irrelevant)
+        let handle = std::thread::spawn(move || {
+            ecs_tick_loop(
+                state_store,
+                event_store,
+                rx,
+                ptx,
+                all_agents,
+                1,
+                Duration::from_millis(50),
+                1.0, // time_scale
+                shutdown,
+                controlplane,
+                runtime_orch,
+                test_sandbox(),
+                ebpf_collector,
+                ebpf_tx,
+                ep,
+                vec!["true".to_string()],
+                crate::adaptive_tick::AdaptiveConfig::default(),
+                sentinel_ecs::RoomDistanceMap::default(),
+            )
+        });
+
+        // Warte auf erste Perception (event-driven, nicht zeit-basiert)
+        let perception = prx.recv_timeout(Duration::from_secs(30));
+        assert!(
+            perception.is_ok(),
+            "Erste Perception muss innerhalb 30s ankommen"
         );
 
+        // Shutdown erst NACH Perception-Empfang → garantiert tick_count >= 1
+        shutdown_clone.store(true, Ordering::SeqCst);
+
+        let result = handle.join().expect("ecs_tick_loop thread panicked");
         assert!(result.is_ok());
         let ticks = result.unwrap();
         assert!(ticks >= 1, "Mindestens 1 Tick erwartet, bekam {ticks}");
@@ -1692,7 +1703,9 @@ mod tests {
 
     #[test]
     fn test_save_state_on_shutdown() {
-        // Verifiziert dass Runtime-Snapshot nach Loop-Exit existiert
+        // Verifiziert dass Runtime-Snapshot nach Loop-Exit existiert.
+        // Gleiche deterministische Struktur wie test_ecs_tick_loop_runs_ticks:
+        // ecs_tick_loop im Background-Thread, Perception-Warten im Main-Thread.
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
 
@@ -1713,36 +1726,45 @@ mod tests {
             test_agent_config(2, "Lisa", "Designer", 1),
         ];
 
-        // Deterministisch: Warte auf erste Perception (= mindestens 1 Tick abgeschlossen)
-        std::thread::spawn(move || {
-            let _ = prx.recv_timeout(Duration::from_secs(30));
-            shutdown_clone.store(true, Ordering::SeqCst);
-        });
-
         let es_clone = Arc::clone(&event_store);
         let ep = test_episode_producer(&tmp, &event_store);
         let (ebpf_collector, ebpf_tx) = test_ebpf();
-        let result = ecs_tick_loop(
-            state_store,
-            event_store,
-            rx,
-            ptx,
-            all_agents,
-            1,
-            Duration::from_millis(50),
-            1.0, // time_scale
-            shutdown,
-            controlplane,
-            runtime_orch,
-            test_sandbox(),
-            ebpf_collector,
-            ebpf_tx,
-            ep,
-            vec!["true".to_string()],
-            crate::adaptive_tick::AdaptiveConfig::default(),
-            sentinel_ecs::RoomDistanceMap::default(),
+
+        // ecs_tick_loop in Background-Thread (Setup-Dauer irrelevant)
+        let handle = std::thread::spawn(move || {
+            ecs_tick_loop(
+                state_store,
+                event_store,
+                rx,
+                ptx,
+                all_agents,
+                1,
+                Duration::from_millis(50),
+                1.0, // time_scale
+                shutdown,
+                controlplane,
+                runtime_orch,
+                test_sandbox(),
+                ebpf_collector,
+                ebpf_tx,
+                ep,
+                vec!["true".to_string()],
+                crate::adaptive_tick::AdaptiveConfig::default(),
+                sentinel_ecs::RoomDistanceMap::default(),
+            )
+        });
+
+        // Warte auf erste Perception (event-driven, nicht zeit-basiert)
+        let perception = prx.recv_timeout(Duration::from_secs(30));
+        assert!(
+            perception.is_ok(),
+            "Erste Perception muss innerhalb 30s ankommen"
         );
 
+        // Shutdown erst NACH Perception-Empfang
+        shutdown_clone.store(true, Ordering::SeqCst);
+
+        let result = handle.join().expect("ecs_tick_loop thread panicked");
         assert!(result.is_ok());
 
         // Snapshot muss existieren
