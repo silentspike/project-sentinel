@@ -3,6 +3,8 @@ resolver = "2"
 exclude = [
     "crates/sentinel-ebpf-probes",
     "crates/sentinel-wasm/tests/fixtures/echo-plugin",
+    "crates/sentinel-wasm/tests/fixtures/loop-plugin",
+    "crates/sentinel-wasm/tests/fixtures/fs-plugin",
 ]
 members = [
     "crates/sentinel-ecs",

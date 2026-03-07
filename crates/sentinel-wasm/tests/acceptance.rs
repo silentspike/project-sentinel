@@ -1392,3 +1392,671 @@ mod wasm_security {
         assert_eq!(r3.unwrap(), "echo: host2 now works");
     }
 }
+
+// ============================================================================
+// Fake-OS / Fake-Filesystem E2E Tests
+// ============================================================================
+// Tests die beweisen dass ein WASM-Plugin das komplette "Fake OS" erlebt:
+// - fs-read/fs-write/fs-list durch die WASM-Boundary
+// - get-room-info durch die WASM-Boundary
+// - Komplette Pipeline: Datei lesen → verarbeiten → Ergebnis schreiben
+// - Isolation: Plugin sieht NUR sein Agent-Home
+// - Fehlerbehandlung durch die WASM-Boundary
+// ============================================================================
+
+#[cfg(feature = "wasm")]
+mod wasm_fs {
+    use sentinel_wasm::{AgentSnapshot, PluginConfig, RoomSnapshot};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn fs_fixture() -> PathBuf {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests/fixtures/fs-plugin.wasm");
+        path
+    }
+
+    fn make_agent_snapshot() -> AgentSnapshot {
+        AgentSnapshot {
+            agent_id: "AGENT-07".to_string(),
+            name: "Lisa Bergmann".to_string(),
+            role: "Designer".to_string(),
+            hunger: 0.45,
+            energy: 0.82,
+            stress: 0.15,
+            social_need: 0.60,
+            caffeine: 0.33,
+            bladder: 0.20,
+            room_id: "buero-design".to_string(),
+        }
+    }
+
+    fn make_rooms() -> HashMap<String, RoomSnapshot> {
+        let mut rooms = HashMap::new();
+        rooms.insert(
+            "buero-design".to_string(),
+            RoomSnapshot {
+                room_id: "buero-design".to_string(),
+                name: "Design Buero".to_string(),
+                floor: 1,
+                temperature: 21.5,
+                noise_db: 40.0,
+                occupant_count: 3,
+            },
+        );
+        rooms.insert(
+            "kueche-eg".to_string(),
+            RoomSnapshot {
+                room_id: "kueche-eg".to_string(),
+                name: "Kueche EG".to_string(),
+                floor: 0,
+                temperature: 23.0,
+                noise_db: 55.0,
+                occupant_count: 2,
+            },
+        );
+        rooms
+    }
+
+    fn load_fs_plugin() -> sentinel_wasm::PluginHost {
+        let mut host = sentinel_wasm::PluginHost::new().unwrap();
+        host.load(PluginConfig {
+            wasm_path: fs_fixture(),
+            ..Default::default()
+        })
+        .unwrap();
+        host
+    }
+
+    // ---- fs-write durch WASM-Boundary ----
+
+    #[test]
+    fn fs_e2e_write_through_wasm() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = host
+            .execute(
+                &fs_fixture(),
+                "write hello.txt Hallo aus dem WASM Plugin!",
+                make_agent_snapshot(),
+                make_rooms(),
+                100,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        assert!(result.is_ok(), "fs-write must succeed: {:?}", result.err());
+        let output = result.unwrap();
+        assert!(output.contains("written:"), "Output: {output}");
+        assert!(output.contains("hello.txt"), "Output: {output}");
+
+        // Host-Side Verifikation: Datei muss im tempdir existieren
+        let content = std::fs::read_to_string(dir.path().join("hello.txt")).unwrap();
+        assert_eq!(content, "Hallo aus dem WASM Plugin!");
+    }
+
+    // ---- fs-read durch WASM-Boundary ----
+
+    #[test]
+    fn fs_e2e_read_through_wasm() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Host-Side: Datei vorbefuellen BEVOR Plugin sie liest
+        std::fs::write(dir.path().join("input.txt"), "Geheimer Inhalt 42").unwrap();
+
+        let result = host
+            .execute(
+                &fs_fixture(),
+                "read input.txt",
+                make_agent_snapshot(),
+                make_rooms(),
+                200,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        assert!(result.is_ok(), "fs-read must succeed: {:?}", result.err());
+        assert_eq!(result.unwrap(), "Geheimer Inhalt 42");
+    }
+
+    // ---- fs-list durch WASM-Boundary ----
+
+    #[test]
+    fn fs_e2e_list_through_wasm() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Mehrere Dateien vorbefuellen
+        std::fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+        std::fs::write(dir.path().join("beta.txt"), "b").unwrap();
+        std::fs::write(dir.path().join("gamma.txt"), "c").unwrap();
+
+        let result = host
+            .execute(
+                &fs_fixture(),
+                "list .",
+                make_agent_snapshot(),
+                make_rooms(),
+                300,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        assert!(result.is_ok(), "fs-list must succeed: {:?}", result.err());
+        let output = result.unwrap();
+        let mut entries: Vec<&str> = output.lines().collect();
+        entries.sort();
+        assert_eq!(entries, vec!["alpha.txt", "beta.txt", "gamma.txt"]);
+    }
+
+    // ---- get-room-info durch WASM-Boundary ----
+
+    #[test]
+    fn fs_e2e_room_info_through_wasm() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = host
+            .execute(
+                &fs_fixture(),
+                "room buero-design",
+                make_agent_snapshot(),
+                make_rooms(),
+                400,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        assert!(result.is_ok(), "get-room-info must succeed: {:?}", result.err());
+        let output = result.unwrap();
+        assert!(output.contains("room:buero-design"), "Output: {output}");
+        assert!(output.contains("name:Design Buero"), "Output: {output}");
+        assert!(output.contains("floor:1"), "Output: {output}");
+        assert!(output.contains("temp:21.5"), "Output: {output}");
+        assert!(output.contains("noise:40.0"), "Output: {output}");
+        assert!(output.contains("occupants:3"), "Output: {output}");
+    }
+
+    // ---- get-room-info fuer nicht-existenten Raum ----
+
+    #[test]
+    fn fs_e2e_room_info_not_found() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = host
+            .execute(
+                &fs_fixture(),
+                "room fantasy-raum",
+                make_agent_snapshot(),
+                make_rooms(),
+                400,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        assert!(result.is_err(), "nonexistent room must return Err");
+        let err = result.unwrap_err();
+        assert!(err.contains("not found"), "Error: {err}");
+    }
+
+    // ---- status: ALLE Host-Functions in einem Aufruf ----
+
+    #[test]
+    fn fs_e2e_status_uses_all_host_functions() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = host
+            .execute(
+                &fs_fixture(),
+                "status",
+                make_agent_snapshot(),
+                make_rooms(),
+                500,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        assert!(result.is_ok(), "status must succeed: {:?}", result.err());
+        let output = result.unwrap();
+
+        // get-agent-info verifizieren
+        assert!(output.contains("agent:Lisa Bergmann"), "Output: {output}");
+        assert!(output.contains("role:Designer"), "Output: {output}");
+
+        // get-tick verifizieren
+        assert!(output.contains("tick:500"), "Output: {output}");
+
+        // Bio-Werte verifizieren
+        assert!(output.contains("hunger:0.45"), "Output: {output}");
+        assert!(output.contains("energy:0.82"), "Output: {output}");
+        assert!(output.contains("stress:0.15"), "Output: {output}");
+        assert!(output.contains("social:0.60"), "Output: {output}");
+        assert!(output.contains("caffeine:0.33"), "Output: {output}");
+        assert!(output.contains("bladder:0.20"), "Output: {output}");
+
+        // get-room-info verifizieren (room-id aus Agent-Snapshot)
+        assert!(output.contains("room:Design Buero"), "Output: {output}");
+        assert!(output.contains("temp:21.5"), "Output: {output}");
+    }
+
+    // ---- process: Volle Pipeline (read -> verarbeiten -> write -> list -> verify) ----
+
+    #[test]
+    fn fs_e2e_process_full_pipeline() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Input-Datei vorbefuellen
+        let input_content = "Dies ist ein Test\nmit mehreren Zeilen\nund einigen Woertern darin";
+        std::fs::write(dir.path().join("input.md"), input_content).unwrap();
+
+        let result = host
+            .execute(
+                &fs_fixture(),
+                "process input.md report.txt",
+                make_agent_snapshot(),
+                make_rooms(),
+                600,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        assert!(result.is_ok(), "process must succeed: {:?}", result.err());
+        let output = result.unwrap();
+
+        // Plugin-Output: Woerter, Zeilen, Bytes
+        assert!(output.contains("11 words"), "Output: {output}");
+        assert!(output.contains("3 lines"), "Output: {output}");
+        let expected_bytes = input_content.len();
+        assert!(
+            output.contains(&format!("{expected_bytes} bytes")),
+            "Output: {output}"
+        );
+
+        // Host-Side Verifikation: Report-Datei muss existieren
+        let report = std::fs::read_to_string(dir.path().join("report.txt")).unwrap();
+        assert!(report.contains("File Analysis Report"), "Report: {report}");
+        assert!(report.contains("Source: input.md"), "Report: {report}");
+        assert!(report.contains("Agent: Lisa Bergmann"), "Report: {report}");
+        assert!(report.contains("Tick: 600"), "Report: {report}");
+        assert!(report.contains("Words: 11"), "Report: {report}");
+        assert!(report.contains("Lines: 3"), "Report: {report}");
+    }
+
+    // ---- fs-write in Subdirectory durch WASM ----
+
+    #[test]
+    fn fs_e2e_write_subdirectory() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = host
+            .execute(
+                &fs_fixture(),
+                "write sub/deep/file.txt nested content",
+                make_agent_snapshot(),
+                make_rooms(),
+                700,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        assert!(result.is_ok(), "write to subdir must succeed: {:?}", result.err());
+
+        // Host-Side: Subdirectory + Datei existiert
+        let content = std::fs::read_to_string(dir.path().join("sub/deep/file.txt")).unwrap();
+        assert_eq!(content, "nested content");
+    }
+
+    // ---- fs-read auf nicht-existente Datei durch WASM ----
+
+    #[test]
+    fn fs_e2e_read_nonexistent_file() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = host
+            .execute(
+                &fs_fixture(),
+                "read does_not_exist.txt",
+                make_agent_snapshot(),
+                make_rooms(),
+                800,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        assert!(result.is_err(), "reading nonexistent file must return Err");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("fs-read") || err.contains("No such file"),
+            "Error must be descriptive: {err}"
+        );
+    }
+
+    // ---- Path-Traversal durch WASM geblockt ----
+
+    #[test]
+    fn fs_e2e_path_traversal_blocked() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = host
+            .execute(
+                &fs_fixture(),
+                "read ../../../etc/passwd",
+                make_agent_snapshot(),
+                make_rooms(),
+                900,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        assert!(result.is_err(), "path traversal must be blocked");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("traversal") || err.contains("not allowed"),
+            "Error must mention traversal: {err}"
+        );
+    }
+
+    // ---- Absolute Pfade durch WASM geblockt ----
+
+    #[test]
+    fn fs_e2e_absolute_path_blocked() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = host
+            .execute(
+                &fs_fixture(),
+                "read /etc/passwd",
+                make_agent_snapshot(),
+                make_rooms(),
+                900,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        assert!(result.is_err(), "absolute path must be blocked");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("absolute") || err.contains("not allowed"),
+            "Error must mention absolute: {err}"
+        );
+    }
+
+    // ---- fs-write + fs-read Roundtrip durch WASM ----
+
+    #[test]
+    fn fs_e2e_write_then_read_roundtrip() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Erst schreiben
+        let write_result = host
+            .execute(
+                &fs_fixture(),
+                "write roundtrip.dat Binary-safe content: abc-xyz-123",
+                make_agent_snapshot(),
+                make_rooms(),
+                1000,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+        assert!(write_result.is_ok(), "write: {:?}", write_result.err());
+
+        // Dann lesen
+        let read_result = host
+            .execute(
+                &fs_fixture(),
+                "read roundtrip.dat",
+                make_agent_snapshot(),
+                make_rooms(),
+                1001,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+        assert!(read_result.is_ok(), "read: {:?}", read_result.err());
+        assert_eq!(
+            read_result.unwrap(),
+            "Binary-safe content: abc-xyz-123"
+        );
+    }
+
+    // ---- Zwei Agents sehen verschiedene Fake-Filesysteme ----
+
+    #[test]
+    fn fs_e2e_agents_have_isolated_filesystems() {
+        let host = load_fs_plugin();
+
+        let agent1_home = tempfile::tempdir().unwrap();
+        let agent2_home = tempfile::tempdir().unwrap();
+
+        let agent1 = AgentSnapshot {
+            agent_id: "AGENT-01".to_string(),
+            name: "Thomas Mueller".to_string(),
+            role: "CEO".to_string(),
+            ..make_agent_snapshot()
+        };
+
+        let agent2 = AgentSnapshot {
+            agent_id: "AGENT-16".to_string(),
+            name: "Michael Weber".to_string(),
+            role: "CEO".to_string(),
+            ..make_agent_snapshot()
+        };
+
+        // Agent 1 schreibt eine Datei
+        let r1 = host
+            .execute(
+                &fs_fixture(),
+                "write secret.txt Agent 1 geheime Daten",
+                agent1.clone(),
+                make_rooms(),
+                1,
+                agent1_home.path().to_path_buf(),
+            )
+            .unwrap();
+        assert!(r1.is_ok());
+
+        // Agent 2 versucht dieselbe Datei zu lesen — sieht sie NICHT
+        let r2 = host
+            .execute(
+                &fs_fixture(),
+                "read secret.txt",
+                agent2,
+                make_rooms(),
+                1,
+                agent2_home.path().to_path_buf(),
+            )
+            .unwrap();
+        assert!(r2.is_err(), "Agent 2 must NOT see Agent 1's files");
+
+        // Agent 1 kann seine eigene Datei lesen
+        let r3 = host
+            .execute(
+                &fs_fixture(),
+                "read secret.txt",
+                agent1,
+                make_rooms(),
+                1,
+                agent1_home.path().to_path_buf(),
+            )
+            .unwrap();
+        assert!(r3.is_ok());
+        assert_eq!(r3.unwrap(), "Agent 1 geheime Daten");
+    }
+
+    // ---- fs-list leeres Verzeichnis ----
+
+    #[test]
+    fn fs_e2e_list_empty_directory() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = host
+            .execute(
+                &fs_fixture(),
+                "list .",
+                make_agent_snapshot(),
+                make_rooms(),
+                1100,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        assert!(result.is_ok(), "list empty dir: {:?}", result.err());
+        let output = result.unwrap();
+        assert!(output.is_empty(), "empty dir should return empty string, got: '{output}'");
+    }
+
+    // ---- Zweiter Room in der Map ----
+
+    #[test]
+    fn fs_e2e_room_info_second_room() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = host
+            .execute(
+                &fs_fixture(),
+                "room kueche-eg",
+                make_agent_snapshot(),
+                make_rooms(),
+                1200,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        assert!(result.is_ok(), "kueche-eg: {:?}", result.err());
+        let output = result.unwrap();
+        assert!(output.contains("room:kueche-eg"), "Output: {output}");
+        assert!(output.contains("name:Kueche EG"), "Output: {output}");
+        assert!(output.contains("floor:0"), "Output: {output}");
+        assert!(output.contains("temp:23.0"), "Output: {output}");
+        assert!(output.contains("noise:55.0"), "Output: {output}");
+        assert!(output.contains("occupants:2"), "Output: {output}");
+    }
+
+    // ---- Unbekanntes Kommando ----
+
+    #[test]
+    fn fs_e2e_unknown_command() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = host
+            .execute(
+                &fs_fixture(),
+                "delete everything",
+                make_agent_snapshot(),
+                make_rooms(),
+                1300,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown command"));
+    }
+
+    // ---- query_meta fuer fs-plugin ----
+
+    #[test]
+    fn fs_e2e_query_meta() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        let meta = host.query_meta(&fs_fixture(), dir.path().to_path_buf()).unwrap();
+        assert_eq!(meta.tool_name, "fs-processor");
+        assert!(
+            meta.tool_description.contains("File processor"),
+            "Description: {}",
+            meta.tool_description
+        );
+    }
+
+    // ---- Grosse Datei durch WASM (10KB) ----
+
+    #[test]
+    fn fs_e2e_large_file_roundtrip() {
+        let host = load_fs_plugin();
+        let dir = tempfile::tempdir().unwrap();
+
+        // 10KB Datei vorbefuellen
+        let large_content: String = (0..500)
+            .map(|i| format!("Zeile {i}: Lorem ipsum dolor sit amet\n"))
+            .collect();
+        std::fs::write(dir.path().join("large.txt"), &large_content).unwrap();
+
+        // Plugin liest die grosse Datei
+        let result = host
+            .execute(
+                &fs_fixture(),
+                "read large.txt",
+                make_agent_snapshot(),
+                make_rooms(),
+                1400,
+                dir.path().to_path_buf(),
+            )
+            .unwrap();
+
+        assert!(result.is_ok(), "large file read: {:?}", result.err());
+        assert_eq!(result.unwrap(), large_content);
+    }
+
+    // ---- ToolRuntime E2E: fs-plugin als registriertes WASM-Tool ----
+
+    #[test]
+    fn fs_e2e_tool_runtime_integration() {
+        use sentinel_wasm::{ExecutionContext, SandboxConfig, ToolDefinition, ToolType};
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Datei vorbefuellen
+        std::fs::write(dir.path().join("data.txt"), "Runtime Test Daten").unwrap();
+
+        let mut runtime = sentinel_wasm::ToolRuntime::new();
+
+        // FS-Plugin laden
+        runtime
+            .plugin_host_mut()
+            .load(PluginConfig {
+                wasm_path: fs_fixture(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Als WASM-Tool registrieren
+        runtime
+            .register_tool(ToolDefinition {
+                name: "fs-processor".to_string(),
+                description: "FS Processor".to_string(),
+                wasm_path: Some(fs_fixture().to_string_lossy().to_string()),
+                tool_type: ToolType::Wasm,
+                required_capabilities: Vec::new(),
+            })
+            .unwrap();
+
+        let ctx = ExecutionContext {
+            agent_id: "AGENT-07".to_string(),
+            agent_capabilities: vec![],
+            sandbox: SandboxConfig::with_paths(vec![dir.path().to_path_buf()]),
+            correlation_id: "test-fs-runtime".to_string(),
+            tick: 700,
+            agent_snapshot: Some(make_agent_snapshot()),
+            rooms: Some(make_rooms()),
+        };
+
+        let result = runtime.execute("fs-processor", "read data.txt", &ctx).unwrap();
+        assert!(result.success, "ToolResult.success must be true");
+        assert_eq!(result.output, "Runtime Test Daten");
+        assert_eq!(result.agent_id, "AGENT-07");
+        assert_eq!(result.tool_name, "fs-processor");
+    }
+}
