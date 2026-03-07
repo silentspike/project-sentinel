@@ -163,17 +163,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Functional Audit Judge:** `docs/functional-audit-judge.md` (B-5, M-17-M-20)
   - **Zenoh Wiring Status:** `docs/zenoh-wiring-status.md` cataloging all 22 topics
 
-### Fixed
+### Removed
 
-- **EBPF_STATUS Double-Publish Bug** (#140)
-  - PSI metrics were published on `EBPF_STATUS` topic (overwriting mode status);
-    now correctly published on dedicated `EBPF_PSI` topic
-  - New `EBPF_PSI` Zenoh topic constant added to sentinel-zenoh
-
-### Deprecated
-
-- `JUDGE_ALERT` Zenoh topic (ADR-001: alerts flow via NATS)
-- `MODEL_SWAP` Zenoh topic (ADR-001: swap via NATS alert + HTTP)
+- `JUDGE_ALERT` Zenoh constant (ADR-001: alerts flow via NATS, was deprecated)
+- `MODEL_SWAP` Zenoh constant (ADR-001: swap via NATS alert + HTTP, was deprecated)
+- `cortex_inject()` topic function (no active subscribers)
+- Claude API provider registration block from Cortex Gateway — Claude Code
+  (subscription-based subprocess) is the default, no API key needed
 
 ### Fixed
 

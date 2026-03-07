@@ -44,29 +44,10 @@ pub fn physics_tick(tick_number: u64) -> String {
 /// Topic for chaos monkey events
 pub const CHAOS_EVENT: &str = "sentinel/chaos/event";
 
-/// Topic for sentinel judge alerts.
-///
-/// ADR-001: Judge publishes alerts via NATS (`sentinel.judge.alert.*`), not Zenoh.
-/// This constant is retained for type-signature compatibility; no active subscribers.
-#[deprecated(note = "ADR-001: Judge alerts flow via NATS, not Zenoh")]
-pub const JUDGE_ALERT: &str = "sentinel/judge/alert";
-
 /// Build topic for agent PSI (Pressure Stall Information) metrics
 pub fn agent_psi(name: &str) -> String {
     format!("{PREFIX}/agent/{name}/psi")
 }
-
-/// Build topic for cortex gateway injection per agent
-pub fn cortex_inject(name: &str) -> String {
-    format!("{PREFIX}/cortex/inject/{name}")
-}
-
-/// Topic for model swap requests (invisible to agents).
-///
-/// ADR-001: Model-swap flows via NATS alert (type: "swap") + Daemon HTTP to Gateway.
-/// This constant is retained for type-signature compatibility; no active subscribers.
-#[deprecated(note = "ADR-001: Model-swap flows via NATS + HTTP, not Zenoh")]
-pub const MODEL_SWAP: &str = "sentinel/meta/model-swap";
 
 /// Topic for eBPF agent health metrics.
 pub const EBPF_AGENT_HEALTH: &str = "sentinel/ebpf/agent-health";
@@ -139,16 +120,8 @@ mod tests {
     }
 
     #[test]
-    fn test_cortex_inject() {
-        assert_eq!(cortex_inject("thomas"), "sentinel/cortex/inject/thomas");
-    }
-
-    #[test]
-    #[allow(deprecated)]
     fn test_constants() {
         assert_eq!(CHAOS_EVENT, "sentinel/chaos/event");
-        assert_eq!(JUDGE_ALERT, "sentinel/judge/alert");
-        assert_eq!(MODEL_SWAP, "sentinel/meta/model-swap");
         assert_eq!(QUERY_REQUEST_GLOBAL, "sentinel/query/global/request");
         assert_eq!(PREFIX, "sentinel");
     }

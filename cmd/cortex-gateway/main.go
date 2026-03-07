@@ -51,23 +51,17 @@ func main() {
 	// 3. Provider registry
 	registry := proxy.NewRegistry()
 
-	claudeAPIKey := os.Getenv("ANTHROPIC_API_KEY")
-	if claudeAPIKey != "" {
-		claudeProvider := proxy.NewClaudeProvider(proxy.ProviderConfig{
-			Name:      "claude",
-			Type:      "claude",
-			BaseURL:   envOrDefault("CLAUDE_BASE_URL", "https://api.anthropic.com"),
-			APIKey:    claudeAPIKey,
-			Model:     envOrDefault("CLAUDE_MODEL", "claude-sonnet-4-5-20250929"),
-			MaxTokens: 4096,
-			Priority:  1,
-		})
-		registry.Register("claude", claudeProvider)
-		logger.Info("registered provider", "name", "claude")
-	} else {
-		logger.Warn("ANTHROPIC_API_KEY not set, claude provider not registered")
-	}
+	// Default provider: Claude Code (subprocess, uses existing subscription)
+	claudeCodeProvider := proxy.NewClaudeCodeProvider(proxy.ProviderConfig{
+		Name:    "claude-code",
+		Type:    "claude-code",
+		BaseURL: envOrDefault("CLAUDE_CODE_BINARY", "claude"), // binary path
+		Model:   envOrDefault("CLAUDE_CODE_MODEL", "claude-opus-4-6"),
+	}, logger)
+	registry.Register("claude-code", claudeCodeProvider)
+	logger.Info("registered provider", "name", "claude-code", "model", envOrDefault("CLAUDE_CODE_MODEL", "claude-opus-4-6"))
 
+	// Optional provider: Ollama (local models)
 	ollamaURL := envOrDefault("OLLAMA_BASE_URL", "http://localhost:11434")
 	ollamaProvider := proxy.NewOllamaProvider(proxy.ProviderConfig{
 		Name:      "ollama",
@@ -80,24 +74,8 @@ func main() {
 	registry.Register("ollama", ollamaProvider)
 	logger.Info("registered provider", "name", "ollama")
 
-	// 3b. Claude Code provider (subprocess, no API key required)
-	if os.Getenv("CLAUDE_CODE_ENABLED") == "1" {
-		claudeCodeProvider := proxy.NewClaudeCodeProvider(proxy.ProviderConfig{
-			Name:    "claude-code",
-			Type:    "claude-code",
-			BaseURL: envOrDefault("CLAUDE_CODE_BINARY", "claude"), // binary path
-			Model:   envOrDefault("CLAUDE_CODE_MODEL", "claude-opus-4-6"),
-		}, logger)
-		registry.Register("claude-code", claudeCodeProvider)
-		logger.Info("registered provider", "name", "claude-code", "model", envOrDefault("CLAUDE_CODE_MODEL", "claude-opus-4-6"))
-	}
-
 	// 4. Control config (shared between pipeline + control plane)
-	defaultProvider := "claude"
-	if os.Getenv("CLAUDE_CODE_ENABLED") == "1" {
-		defaultProvider = "claude-code"
-	}
-	controlConfig := control.NewConfig(defaultProvider)
+	controlConfig := control.NewConfig("claude-code")
 
 	// 4b. Event Store (optional, enabled via SENTINEL_CORTEX_EVENT_STORE_PATH)
 	var evStore *eventstore.Store
