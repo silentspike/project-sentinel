@@ -1217,6 +1217,52 @@ fn ecs_tick_loop(
                     }
                 }
 
+                // GOLF: Goal-Progress fuer konsolidierte Agents aktualisieren
+                // Pro ueberlebte Schicht erhoehen wir den Progress aktiver Goals
+                // um einen kleinen Betrag (0.05 = ~20 Schichten bis Completion).
+                for agent_id in &removed {
+                    let agent_name = all_agents
+                        .iter()
+                        .find(|a| AgentId(a.identity.id) == *agent_id)
+                        .map(|a| a.identity.name.as_str());
+                    if let Some(name) = agent_name {
+                        let goals = episode_producer
+                            .hippocampus()
+                            .get_goals(name)
+                            .unwrap_or_default();
+                        let active_goals: Vec<_> =
+                            goals.iter().filter(|g| g.is_active()).collect();
+                        for goal in &active_goals {
+                            let new_progress = (goal.progress + 0.05).min(1.0);
+                            match episode_producer.hippocampus().update_goal_progress(
+                                name,
+                                goal.id,
+                                new_progress,
+                                tick_count,
+                            ) {
+                                Ok(true) => {
+                                    info!(
+                                        agent = name,
+                                        goal_id = goal.id,
+                                        goal_type = %goal.goal_type,
+                                        progress = format!("{:.2}", new_progress),
+                                        "GOLF: Goal-Progress aktualisiert"
+                                    );
+                                }
+                                Ok(false) => {} // Goal not found (unlikely)
+                                Err(e) => {
+                                    warn!(
+                                        agent = name,
+                                        goal_id = goal.id,
+                                        error = %e,
+                                        "GOLF: Goal-Progress Update fehlgeschlagen"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Memory-Pressure Check: Agent-Spawn blockieren wenn Mem PSI > Threshold
                 if adaptive_tick.should_block_spawn() {
                     warn!(

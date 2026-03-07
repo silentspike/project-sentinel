@@ -144,6 +144,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `service.rs`: Goal-CRUD facade on HippocampusService (create, append, update_progress, get, get_active, list)
   - `orchestrator.rs`: Default-Goals created at agent spawn based on role (CEO→Career+Project, Dev→Project+Skill, HR→Social+Career, Designer→Skill+Project)
   - `default_goals_for_role()`: Role-based goal initialization (initial + shift-change spawn)
+  - `orchestrator.rs`: Goal-Progress Updates bei Schichtwechsel-Konsolidierung (+0.05 pro ueberlebte Schicht, auto-Completed bei >= 1.0)
   - 29 new unit tests (13 golf, 9 store, 7 service)
   - Issue #141 ACs corrected: redb instead of SQLite, log/test-based verification
 
