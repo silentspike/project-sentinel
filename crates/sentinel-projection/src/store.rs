@@ -186,9 +186,8 @@ impl ReadModelStore {
             .collect();
 
         if !expired.is_empty() {
-            let mut update = conn.prepare(
-                "UPDATE room_live_view SET active_smells = NULL WHERE room_id = ?1",
-            )?;
+            let mut update =
+                conn.prepare("UPDATE room_live_view SET active_smells = NULL WHERE room_id = ?1")?;
             for room_id in &expired {
                 update.execute(params![room_id])?;
             }

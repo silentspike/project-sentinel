@@ -357,13 +357,7 @@ pub fn bio_system(
                     tick,
                 );
                 event_buffer.events.push(smell_event);
-                active_smells.add(
-                    &position.room_id,
-                    "coffee".to_string(),
-                    0.8,
-                    tick,
-                    120,
-                );
+                active_smells.add(&position.room_id, "coffee".to_string(), 0.8, tick, 120);
             }
         }
 
