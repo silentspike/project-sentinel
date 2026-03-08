@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Projection Legacy-Kompatibilitaet** (#53)
+  - `crates/sentinel-common/src/events.rs`: `#[serde(default)]` fuer `valence`/`arousal` in `BioStateUpdated` — 3.4M Legacy-Events werden nicht mehr uebersprungen
+  - `crates/sentinel-projection/src/worker.rs`: Rebuild setzt Offset nur einmal am Ende statt pro Batch — verhindert Monotonicity-Fehler bei konkurrierenden Consumern
+
 - **Transit-Varianz: RoomId-Typ-Mismatch** (#194)
   - `crates/sentinel-common/src/types.rs`: `AgentAction.target_room` von `Option<RoomId>` auf `Option<String>` geaendert
   - `crates/sentinel-ecs/src/systems.rs`: `input_system()` nutzt jetzt echte Raumnamen statt `format!("ROOM-{}")` — Distance-Lookup funktioniert endlich
