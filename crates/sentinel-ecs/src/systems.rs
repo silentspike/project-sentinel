@@ -24,7 +24,7 @@ use sentinel_common::{
     ActionType, DomainEvent, DomainEventPayload, Emotion, Perception, Timestamp,
 };
 use std::time::Instant;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Ausfuehrungsreihenfolge der Simulation-Systems
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -299,6 +299,7 @@ pub fn bio_system(
     time: Res<SimulationTime>,
     psi: Option<Res<PsiMetrics>>,
     mut event_buffer: ResMut<EventBuffer>,
+    mut active_smells: ResMut<super::world::ActiveSmells>,
 ) {
     let tick = time.tick.0;
 
@@ -326,6 +327,7 @@ pub fn bio_system(
             && tick.is_multiple_of(180)
         {
             sentinel_bio::drink_coffee(&mut bio);
+            let correlation_id = uuid::Uuid::new_v4().to_string();
             let bio_payload = DomainEventPayload::BioActionPerformed {
                 agent_id: identity.agent_id,
                 action: "drink_coffee".to_string(),
@@ -334,10 +336,29 @@ pub fn bio_system(
                 bio_payload.event_type_str(),
                 &identity.agent_id.to_string(),
                 &bio_payload.to_json(),
-                &uuid::Uuid::new_v4().to_string(),
+                &correlation_id,
                 tick,
             );
             event_buffer.events.push(bio_event);
+
+            // SmellEvent bei Auto-Coffee (nur wenn Agent nicht in Transit)
+            if !position.in_transit {
+                let smell_payload = DomainEventPayload::SmellEventTriggered {
+                    room_id: position.room_id.clone(),
+                    smell_type: "coffee".to_string(),
+                    intensity: 0.8,
+                    duration_ticks: 120,
+                };
+                let smell_event = DomainEvent::new(
+                    smell_payload.event_type_str(),
+                    &position.room_id,
+                    &smell_payload.to_json(),
+                    &correlation_id,
+                    tick,
+                );
+                event_buffer.events.push(smell_event);
+                active_smells.add(&position.room_id, "coffee".to_string(), 0.8, tick, 120);
+            }
         }
 
         // Periodischer Bio-State Snapshot alle 20 Ticks (~20 Sekunden bei 1Hz)
@@ -796,6 +817,12 @@ pub fn perception_system(
                         _ => "",
                     };
                     if !text.is_empty() {
+                        debug!(
+                            room = %position.room_id,
+                            smell_type = %smell.smell_type,
+                            intensity = smell.intensity,
+                            "Smell injected into perception"
+                        );
                         perception.environment_text.push_str(text);
                     }
                 }
