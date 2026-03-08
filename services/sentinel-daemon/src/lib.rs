@@ -9,7 +9,9 @@ pub mod config;
 pub mod controlplane;
 pub mod ebpf;
 pub mod episode_producer;
+pub mod fanout;
 pub mod llm_bridge;
+pub mod query_responder;
 #[cfg(feature = "nats")]
 pub mod nats_consumer;
 pub mod orchestrator;

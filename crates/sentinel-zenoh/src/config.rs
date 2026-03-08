@@ -8,6 +8,11 @@ const DEFAULT_QUERY_DEADLINE_MS: u64 = 100;
 const DEFAULT_MAX_INFLIGHT_GLOBAL: usize = 128;
 /// Default maximum in-flight queries per agent.
 const DEFAULT_MAX_INFLIGHT_PER_AGENT: usize = 8;
+/// Default SHM buffer size in bytes (1 MB).
+const DEFAULT_SHM_BUFFER_SIZE_BYTES: usize = 1_048_576;
+/// Default fan-out channel capacity.
+const DEFAULT_FANOUT_CHANNEL_CAPACITY: usize = 256;
+
 
 /// Zenoh bus configuration.
 ///
@@ -27,6 +32,12 @@ pub struct BusConfig {
     pub max_inflight_global: usize,
     /// Maximum in-flight queries per agent (`SENTINEL_ZENOH_MAX_INFLIGHT_PER_AGENT`, default: 8)
     pub max_inflight_per_agent: usize,
+    /// SHM buffer size in bytes (`SENTINEL_ZENOH_SHM_BUFFER_SIZE`, default: 1MB)
+    pub shm_buffer_size_bytes: usize,
+    /// Fan-out channel capacity (`SENTINEL_ZENOH_FANOUT_CAPACITY`, default: 256)
+    pub fanout_channel_capacity: usize,
+    /// Enable query responder (`SENTINEL_ZENOH_QUERY_RESPONDER`, default: true)
+    pub query_responder_enabled: bool,
 }
 
 impl Default for BusConfig {
@@ -38,6 +49,9 @@ impl Default for BusConfig {
             query_cancel_enabled: true,
             max_inflight_global: DEFAULT_MAX_INFLIGHT_GLOBAL,
             max_inflight_per_agent: DEFAULT_MAX_INFLIGHT_PER_AGENT,
+            shm_buffer_size_bytes: DEFAULT_SHM_BUFFER_SIZE_BYTES,
+            fanout_channel_capacity: DEFAULT_FANOUT_CHANNEL_CAPACITY,
+            query_responder_enabled: true,
         }
     }
 }
@@ -64,6 +78,15 @@ impl BusConfig {
                 "SENTINEL_ZENOH_MAX_INFLIGHT_PER_AGENT",
                 DEFAULT_MAX_INFLIGHT_PER_AGENT,
             ),
+            shm_buffer_size_bytes: parse_usize_env(
+                "SENTINEL_ZENOH_SHM_BUFFER_SIZE",
+                DEFAULT_SHM_BUFFER_SIZE_BYTES,
+            ),
+            fanout_channel_capacity: parse_usize_env(
+                "SENTINEL_ZENOH_FANOUT_CAPACITY",
+                DEFAULT_FANOUT_CHANNEL_CAPACITY,
+            ),
+            query_responder_enabled: parse_bool_env("SENTINEL_ZENOH_QUERY_RESPONDER", true),
         }
     }
 }

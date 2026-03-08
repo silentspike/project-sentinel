@@ -21,7 +21,7 @@ pub use world::{
     apply_capabilities, apply_personality, attach_redb_store, create_simulation_world,
     despawn_agent_from_world, spawn_agent, ActionReceiver, ActiveSmell, ActiveSmells, EventBuffer,
     LimboEventStore, PerceptionSender, PersistTelemetry, PsiMetrics, RedbStateStore,
-    RoomDistanceMap, SimulationTime, ToolRuntimeResource,
+    RoomDistanceMap, SimulationTime, ToolRuntimeResource, ZenohFanoutSender,
 };
 
 #[cfg(test)]
