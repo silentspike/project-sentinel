@@ -90,7 +90,10 @@ pub async fn query_responder_task(bus: SentinelBus, state_store: Arc<StateStore>
                         }
                     },
                     Err(_) => {
-                        debug!(room_id, "Room-ID nicht numerisch, keine redb-Abfrage moeglich");
+                        debug!(
+                            room_id,
+                            "Room-ID nicht numerisch, keine redb-Abfrage moeglich"
+                        );
                         vec![]
                     }
                 }
@@ -142,9 +145,10 @@ pub async fn query_responder_task(bus: SentinelBus, state_store: Arc<StateStore>
         }
 
         // Response auf das Response-Topic publishen
-        let response_topic = sentinel_zenoh::topics::query_response_agent(
-            &format!("AGENT-{:02}", query.origin_agent.0),
-        );
+        let response_topic = sentinel_zenoh::topics::query_response_agent(&format!(
+            "AGENT-{:02}",
+            query.origin_agent.0
+        ));
 
         match serde_json::to_vec(&response) {
             Ok(bytes) => {

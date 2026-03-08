@@ -14,10 +14,7 @@ use tracing::warn;
 ///
 /// Laeuft im tokio Runtime. Beendet sich automatisch wenn der Sender
 /// (im ECS-Thread) gedroppt wird.
-pub async fn zenoh_fanout_task(
-    bus: SentinelBus,
-    mut rx: tokio::sync::mpsc::Receiver<DomainEvent>,
-) {
+pub async fn zenoh_fanout_task(bus: SentinelBus, mut rx: tokio::sync::mpsc::Receiver<DomainEvent>) {
     let mut publish_count: u64 = 0;
     let mut error_count: u64 = 0;
 
@@ -64,48 +61,52 @@ pub async fn zenoh_fanout_task(
 ///
 /// Nutzt die bestehenden Topic-Funktionen aus sentinel_zenoh::topics.
 fn fanout_topic(event: &DomainEvent) -> Option<String> {
+    // event_type ist snake_case (aus DomainEventPayload::event_type_str())
     match event.event_type.as_str() {
         // Room Events
-        "RoomPhysicsUpdated" => Some(sentinel_zenoh::topics::room_audio(&event.aggregate_id)),
-        "SmellEventTriggered" => Some(sentinel_zenoh::topics::room_smell(&event.aggregate_id)),
-        "TransitCompleted" => Some(sentinel_zenoh::topics::room_presence(&event.aggregate_id)),
+        "room_physics_updated" => Some(sentinel_zenoh::topics::room_audio(&event.aggregate_id)),
+        "smell_event_triggered" => Some(sentinel_zenoh::topics::room_smell(&event.aggregate_id)),
+        "transit_completed" => Some(sentinel_zenoh::topics::room_presence(&event.aggregate_id)),
 
         // Agent State Events
-        "AgentSpawned" | "AgentDespawned" | "BioStateUpdated" | "AgentStatusChanged" => {
+        "agent_spawned" | "agent_despawned" | "bio_state_updated" | "agent_status_changed" => {
             Some(sentinel_zenoh::topics::agent_state(&event.aggregate_id))
         }
 
         // Agent Actions
-        "AgentActionReceived" => Some(sentinel_zenoh::topics::agent_action(&event.aggregate_id)),
+        "agent_action_received" => Some(sentinel_zenoh::topics::agent_action(&event.aggregate_id)),
 
         // Chaos Events
-        "ChaosTriggered" => Some(sentinel_zenoh::topics::CHAOS_EVENT.to_string()),
+        "chaos_triggered" => Some(sentinel_zenoh::topics::CHAOS_EVENT.to_string()),
 
         // Tick Snapshots
-        "TickSnapshot" => {
+        "tick_snapshot" => {
             // tick Feld aus dem Event extrahieren (aggregate_id ist "simulation")
             // Verwende eine stabile Topic-ID statt den Tick-Wert
             Some(sentinel_zenoh::topics::physics_tick(0))
         }
 
         // Transit Events
-        "TransitStarted" => Some(sentinel_zenoh::topics::room_presence(&event.aggregate_id)),
+        "transit_started" => Some(sentinel_zenoh::topics::room_presence(&event.aggregate_id)),
 
         // Shift Events
-        "ShiftTransitionCompleted" => {
-            Some(format!("{}/shift/transition", sentinel_zenoh::topics::PREFIX))
-        }
+        "shift_transition_completed" => Some(format!(
+            "{}/shift/transition",
+            sentinel_zenoh::topics::PREFIX
+        )),
 
         // Nightrun/Judge/Consolidation — NICHT auf Zenoh (Limbo-only, Determinismus)
-        "NightRunStarted" | "NightRunCompleted" | "AgentConsolidated"
-        | "AgentConsolidationFailed" => None,
+        "nightrun_started"
+        | "nightrun_completed"
+        | "agent_consolidated"
+        | "agent_consolidation_failed" => None,
 
         // Judge Alerts — bereits ueber NATS verteilt
-        "JudgeAlertReceived" => None,
+        "judge_alert_received" => None,
 
         // Bio Actions, Hallway Encounters
-        "BioActionPerformed" => Some(sentinel_zenoh::topics::agent_state(&event.aggregate_id)),
-        "HallwayEncounterDetected" => {
+        "bio_action_performed" => Some(sentinel_zenoh::topics::agent_state(&event.aggregate_id)),
+        "hallway_encounter_detected" => {
             Some(sentinel_zenoh::topics::room_presence(&event.aggregate_id))
         }
 
@@ -125,13 +126,13 @@ mod tests {
 
     #[test]
     fn test_fanout_topic_room_events() {
-        let event = test_event("RoomPhysicsUpdated", "kueche-eg");
+        let event = test_event("room_physics_updated", "kueche-eg");
         assert_eq!(
             fanout_topic(&event),
             Some("sentinel/room/kueche-eg/audio".to_string())
         );
 
-        let event = test_event("SmellEventTriggered", "kueche-eg");
+        let event = test_event("smell_event_triggered", "kueche-eg");
         assert_eq!(
             fanout_topic(&event),
             Some("sentinel/room/kueche-eg/smell".to_string())
@@ -140,13 +141,13 @@ mod tests {
 
     #[test]
     fn test_fanout_topic_agent_events() {
-        let event = test_event("AgentSpawned", "AGENT-01");
+        let event = test_event("agent_spawned", "AGENT-01");
         assert_eq!(
             fanout_topic(&event),
             Some("sentinel/agent/AGENT-01/state".to_string())
         );
 
-        let event = test_event("BioStateUpdated", "AGENT-05");
+        let event = test_event("bio_state_updated", "AGENT-05");
         assert_eq!(
             fanout_topic(&event),
             Some("sentinel/agent/AGENT-05/state".to_string())
@@ -155,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_fanout_topic_chaos() {
-        let event = test_event("ChaosTriggered", "buero-dev-1");
+        let event = test_event("chaos_triggered", "buero-dev-1");
         assert_eq!(
             fanout_topic(&event),
             Some("sentinel/chaos/event".to_string())
@@ -164,20 +165,20 @@ mod tests {
 
     #[test]
     fn test_fanout_topic_tick_snapshot() {
-        let event = test_event("TickSnapshot", "simulation");
+        let event = test_event("tick_snapshot", "simulation");
         assert!(fanout_topic(&event).is_some());
     }
 
     #[test]
     fn test_fanout_topic_nightrun_excluded() {
-        assert!(fanout_topic(&test_event("NightRunStarted", "run-1")).is_none());
-        assert!(fanout_topic(&test_event("NightRunCompleted", "run-1")).is_none());
-        assert!(fanout_topic(&test_event("AgentConsolidated", "run-1")).is_none());
+        assert!(fanout_topic(&test_event("nightrun_started", "run-1")).is_none());
+        assert!(fanout_topic(&test_event("nightrun_completed", "run-1")).is_none());
+        assert!(fanout_topic(&test_event("agent_consolidated", "run-1")).is_none());
     }
 
     #[test]
     fn test_fanout_topic_judge_excluded() {
-        assert!(fanout_topic(&test_event("JudgeAlertReceived", "AGENT-01")).is_none());
+        assert!(fanout_topic(&test_event("judge_alert_received", "AGENT-01")).is_none());
     }
 
     #[test]
