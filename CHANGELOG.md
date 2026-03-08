@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `crates/sentinel-zenoh/src/config.rs`: 3 neue Config-Felder (`shm_buffer_size_bytes`, `fanout_channel_capacity`, `query_responder_enabled`)
   - `crates/sentinel-zenoh/benches/shm_benchmark.rs`: 6 Criterion Benchmarks (Latenz, Throughput, Concurrency, Fanout, Query, Buffer Sizing)
 
+### Fixed
+
+- **Zenoh Fan-Out Event Matching** (#6)
+  - `services/sentinel-daemon/src/fanout.rs`: Event-Type Match-Arms von PascalCase auf snake_case korrigiert (passend zu `DomainEventPayload::event_type_str()`)
+  - `crates/sentinel-wasm/src/plugin.rs`: Path Canonicalization fuer konsistente Cache-Key Lookups (behebt flaky Test)
+
 - **SmellEvents End-to-End Pipeline** (#195)
   - `crates/sentinel-ecs/src/world.rs`: Neue `ActiveSmells` ECS Resource (HashMap pro Raum, Decay-Logik)
   - `crates/sentinel-ecs/src/systems.rs`: `input_system` + `smell_system` + `perception_system` erzeugen/injizieren Smells

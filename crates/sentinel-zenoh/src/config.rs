@@ -13,7 +13,6 @@ const DEFAULT_SHM_BUFFER_SIZE_BYTES: usize = 1_048_576;
 /// Default fan-out channel capacity.
 const DEFAULT_FANOUT_CHANNEL_CAPACITY: usize = 256;
 
-
 /// Zenoh bus configuration.
 ///
 /// All values are parsed from environment variables with sensible defaults.

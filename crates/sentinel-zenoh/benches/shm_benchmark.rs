@@ -50,13 +50,11 @@ fn shm_pub_sub_latency(c: &mut Criterion) {
                         // Subscribe muss vor Publish stehen
                         let sub = bus_s.subscribe(&t).await.expect("subscribe");
                         bus_p.publish(&t, &p).await.expect("publish");
-                        let sample = tokio::time::timeout(
-                            Duration::from_millis(500),
-                            sub.recv_async(),
-                        )
-                        .await
-                        .expect("timeout")
-                        .expect("recv");
+                        let sample =
+                            tokio::time::timeout(Duration::from_millis(500), sub.recv_async())
+                                .await
+                                .expect("timeout")
+                                .expect("recv");
                         black_box(sample.payload().to_bytes().len());
                     }
                 });
@@ -131,9 +129,7 @@ fn shm_fanout_overhead(c: &mut Criterion) {
 
     // Drain receiver im Hintergrund
     let rt = bench_runtime();
-    rt.spawn(async move {
-        while rx.recv().await.is_some() {}
-    });
+    rt.spawn(async move { while rx.recv().await.is_some() {} });
 
     let payload = vec![0xEFu8; 512];
 
@@ -207,9 +203,7 @@ fn shm_buffer_sizing(c: &mut Criterion) {
             &capacity,
             |b, &cap| {
                 let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(cap);
-                rt.spawn(async move {
-                    while rx.recv().await.is_some() {}
-                });
+                rt.spawn(async move { while rx.recv().await.is_some() {} });
 
                 let payload = vec![0xABu8; 1024];
 

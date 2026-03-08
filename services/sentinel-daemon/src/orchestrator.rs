@@ -31,8 +31,8 @@ use sentinel_ecs::{
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
 use sentinel_runtime::RuntimeOrchestrator;
-use sentinel_zenoh::SentinelBus;
 use sentinel_sandbox::{CgroupLimits, SandboxEnforcer, SandboxHandle, SandboxWarning};
+use sentinel_zenoh::SentinelBus;
 
 use crate::adaptive_tick::AdaptiveTickRate;
 use crate::config::DaemonConfig;
