@@ -131,7 +131,11 @@ pub enum DomainEventPayload {
         caffeine_mg: f32,
         room_id: String,
         mood: String,
+        /// Valence-Wert aus Mood-System. Alte Events (vor Einfuehrung) haben Default 0.0.
+        #[serde(default)]
         valence: f32,
+        /// Arousal-Wert aus Mood-System. Alte Events (vor Einfuehrung) haben Default 0.0.
+        #[serde(default)]
         arousal: f32,
     },
     /// Periodischer Raum-Physik Snapshot (Temperatur, CO2, Laerm)

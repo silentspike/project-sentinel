@@ -124,6 +124,8 @@ impl ProjectionWorker {
     /// Rebuild-Modus: Loescht alle Views und verarbeitet alle Events von Anfang.
     ///
     /// Gibt Anzahl verarbeiteter Events zurueck.
+    /// Offset wird nur EINMAL am Ende gesetzt (verhindert Monotonicity-Konflikte
+    /// falls ein anderer Prozess gleichzeitig den EventStore nutzt).
     pub fn rebuild(&self) -> anyhow::Result<usize> {
         info!("Starting full rebuild");
 
@@ -133,6 +135,7 @@ impl ProjectionWorker {
 
         let mut total_processed = 0usize;
         let mut offset = 0i64;
+        let mut final_offset = 0i64;
 
         loop {
             let batch = self
@@ -147,11 +150,7 @@ impl ProjectionWorker {
             total_processed += count;
 
             let last_row_id = batch.last().unwrap().0;
-
-            if last_row_id > offset {
-                self.event_store
-                    .update_offset(PROJECTION_NAME, last_row_id)?;
-            }
+            final_offset = last_row_id;
             offset = last_row_id;
 
             debug!(
@@ -160,6 +159,12 @@ impl ProjectionWorker {
                 offset = last_row_id,
                 "Rebuild batch processed"
             );
+        }
+
+        // Offset einmalig am Ende setzen — kein Risiko fuer Monotonicity-Konflikte
+        if final_offset > 0 {
+            self.event_store
+                .update_offset(PROJECTION_NAME, final_offset)?;
         }
 
         info!(total = total_processed, "Full rebuild complete");
