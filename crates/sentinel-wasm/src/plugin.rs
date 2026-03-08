@@ -94,14 +94,26 @@ impl PluginHost {
     /// Call once per `.wasm` file, then reuse via `execute()`.
     pub fn load(&mut self, config: PluginConfig) -> wasmtime::Result<()> {
         let component = Component::from_file(&self.engine, &config.wasm_path)?;
-        self.cache.insert(config.wasm_path.clone(), component);
-        self.configs.insert(config.wasm_path.clone(), config);
+        // Kanonischen Pfad als Cache-Key verwenden, damit PathBuf<->String
+        // Roundtrips (z.B. in ToolDefinition::wasm_path) keinen Cache-Miss verursachen.
+        let canonical = Self::canonical(&config.wasm_path);
+        self.cache.insert(canonical.clone(), component);
+        let canonical_config = PluginConfig {
+            wasm_path: canonical.clone(),
+            ..config
+        };
+        self.configs.insert(canonical, canonical_config);
         Ok(())
     }
 
     /// Checks if a plugin is loaded (cached).
     pub fn is_loaded(&self, wasm_path: &Path) -> bool {
-        self.cache.contains_key(wasm_path)
+        self.cache.contains_key(&Self::canonical(wasm_path))
+    }
+
+    /// Kanonisiert einen Pfad fuer konsistente Cache-Key-Lookups.
+    fn canonical(path: &Path) -> PathBuf {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
     }
 
     /// Returns the number of cached plugins.
@@ -117,14 +129,15 @@ impl PluginHost {
         wasm_path: &Path,
         agent_home: PathBuf,
     ) -> wasmtime::Result<PluginMeta> {
+        let canonical = Self::canonical(wasm_path);
         let component = self
             .cache
-            .get(wasm_path)
+            .get(&canonical)
             .ok_or_else(|| wasmtime::Error::msg("Plugin not loaded"))?;
 
         let config = self
             .configs
-            .get(wasm_path)
+            .get(&canonical)
             .ok_or_else(|| wasmtime::Error::msg("Plugin config not found"))?;
 
         let state = self.build_state(
@@ -159,14 +172,15 @@ impl PluginHost {
         tick: u64,
         agent_home: PathBuf,
     ) -> wasmtime::Result<Result<String, String>> {
+        let canonical = Self::canonical(wasm_path);
         let component = self
             .cache
-            .get(wasm_path)
+            .get(&canonical)
             .ok_or_else(|| wasmtime::Error::msg("Plugin not loaded"))?;
 
         let config = self
             .configs
-            .get(wasm_path)
+            .get(&canonical)
             .ok_or_else(|| wasmtime::Error::msg("Plugin config not found"))?;
 
         let state = self.build_state(config, agent_snapshot, rooms, tick, agent_home)?;

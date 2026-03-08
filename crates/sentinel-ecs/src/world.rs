@@ -249,6 +249,15 @@ impl RoomDistanceMap {
     }
 }
 
+/// Zenoh Fan-Out Bridge: Events nach Limbo-Write an async Fanout-Task senden.
+///
+/// `try_send()` ist non-blocking und sicher aus dem sync ECS-Thread.
+/// Wenn der Channel voll ist, werden Events gedroppt (Limbo ist SSOT).
+#[derive(Resource, Clone)]
+pub struct ZenohFanoutSender {
+    pub sender: tokio::sync::mpsc::Sender<DomainEvent>,
+}
+
 /// PSI-Metriken als ECS-Resource fuer Bio-Engine Integration.
 ///
 /// Wird vom Daemon mit aktuellen cgroup-PSI-Werten befuellt.
