@@ -16,7 +16,7 @@
 use super::components::*;
 use super::world::{
     ActionReceiver, EventBuffer, LimboEventStore, PersistTelemetry, PsiMetrics, RedbStateStore,
-    RoomDistanceMap, ToolRuntimeResource,
+    RoomDistanceMap, ToolRuntimeResource, ZenohFanoutSender,
 };
 use super::world::{PerceptionSender, SimulationTime};
 use bevy_ecs::prelude::*;
@@ -1026,6 +1026,7 @@ pub fn persist_system(
     event_store: Option<Res<LimboEventStore>>,
     mut event_buffer: ResMut<EventBuffer>,
     mut telemetry: ResMut<PersistTelemetry>,
+    fanout_sender: Option<Res<ZenohFanoutSender>>,
 ) {
     telemetry.ticks_observed = telemetry.ticks_observed.saturating_add(1);
 
@@ -1044,12 +1045,18 @@ pub fn persist_system(
         event_buffer.events.push(event);
     }
 
-    // 1. Events aus Buffer nach Limbo schreiben (mit Outbox)
+    // 1. Events aus Buffer nach Limbo schreiben (mit Outbox) + Zenoh Fan-Out
     if let Some(es) = &event_store {
         for event in event_buffer.events.drain(..) {
             let topic = event_topic(&event);
             if let Err(err) = es.0.append_with_outbox(&event, &topic) {
                 warn!(event_id = %event.event_id, "persist_system: failed to write event: {err}");
+            }
+            // Nach erfolgreichem Limbo-Write: Event an Zenoh Fan-Out Bridge senden
+            if let Some(ref fanout) = fanout_sender {
+                if fanout.sender.try_send(event).is_err() {
+                    // Channel voll — Event droppen (Limbo ist SSOT, Zenoh ist best-effort)
+                }
             }
         }
     } else {

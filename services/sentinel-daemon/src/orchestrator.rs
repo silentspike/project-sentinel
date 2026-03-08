@@ -31,6 +31,7 @@ use sentinel_ecs::{
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
 use sentinel_runtime::RuntimeOrchestrator;
+use sentinel_zenoh::SentinelBus;
 use sentinel_sandbox::{CgroupLimits, SandboxEnforcer, SandboxHandle, SandboxWarning};
 
 use crate::adaptive_tick::AdaptiveTickRate;
@@ -360,6 +361,38 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let (action_tx, action_rx) = mpsc::channel();
     let (perception_tx, perception_rx) = mpsc::sync_channel::<Perception>(64);
 
+    // -- Zenoh SentinelBus (Core-Bus fuer Real-Time Event-Verteilung) --
+    let bus = match SentinelBus::new().await {
+        Ok(b) => {
+            info!(transport = ?b.transport_mode(), "SentinelBus ready");
+            Some(b)
+        }
+        Err(e) => {
+            warn!(error = %e, "SentinelBus nicht verfuegbar — Zenoh Fan-Out deaktiviert");
+            None
+        }
+    };
+
+    // -- Zenoh Fan-Out Bridge (Events nach Limbo-Write auf Zenoh publizieren) --
+    let fanout_sender = if let Some(ref b) = bus {
+        let (fanout_tx, fanout_rx) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(crate::fanout::zenoh_fanout_task(b.clone(), fanout_rx));
+        info!("Zenoh Fan-Out Bridge gestartet (channel capacity=256)");
+        Some(sentinel_ecs::ZenohFanoutSender { sender: fanout_tx })
+    } else {
+        None
+    };
+
+    // -- Zenoh Scoped Query Responder (beantwortet Queries mit redb State) --
+    if let Some(ref b) = bus {
+        let qr_bus = b.clone();
+        let qr_store = Arc::clone(&state_store);
+        tokio::spawn(crate::query_responder::query_responder_task(
+            qr_bus, qr_store,
+        ));
+        info!("Zenoh Query Responder gestartet");
+    }
+
     // -- Shutdown Flag --
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_ecs = Arc::clone(&shutdown);
@@ -421,6 +454,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 agent_command_cfg,
                 adaptive_config,
                 room_distances,
+                fanout_sender,
             )
         })
         .context("ECS Thread spawnen")?;
@@ -439,6 +473,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         ebpf_rx,
         prom_text,
         ebpf_nats_url,
+        bus.clone(),
     ));
 
     // -- LLM Bridge starten (Perception → Cortex Gateway → Action) --
@@ -664,6 +699,7 @@ fn ecs_tick_loop(
     agent_command_cfg: Vec<String>,
     adaptive_config: crate::adaptive_tick::AdaptiveConfig,
     room_distances: sentinel_ecs::RoomDistanceMap,
+    fanout_sender: Option<sentinel_ecs::ZenohFanoutSender>,
 ) -> Result<u64> {
     // Adaptive Tick-Rate Controller (PSI-basiert, TOGAF Adaptive Scheduling)
     let mut adaptive_tick = AdaptiveTickRate::new(adaptive_config);
@@ -689,6 +725,11 @@ fn ecs_tick_loop(
     world.insert_resource(LimboEventStore(event_store));
     world.insert_resource(ActionReceiver(std::sync::Mutex::new(action_rx)));
     world.insert_resource(PerceptionSender(perception_tx));
+
+    // Zenoh Fan-Out Sender als ECS Resource (persist_system nutzt try_send)
+    if let Some(sender) = fanout_sender {
+        world.insert_resource(sender);
+    }
 
     // -- Tool Registry (sentinel-wasm native handlers) --
     let mut tool_runtime = sentinel_wasm::ToolRuntime::new();
@@ -1675,6 +1716,7 @@ mod tests {
             vec!["true".to_string()],
             crate::adaptive_tick::AdaptiveConfig::default(),
             sentinel_ecs::RoomDistanceMap::default(),
+            None, // Kein Zenoh Fan-Out in Tests
         );
 
         assert!(result.is_ok());
@@ -1727,6 +1769,7 @@ mod tests {
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
                 sentinel_ecs::RoomDistanceMap::default(),
+                None, // Kein Zenoh Fan-Out in Tests
             )
         });
 
@@ -1796,6 +1839,7 @@ mod tests {
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
                 sentinel_ecs::RoomDistanceMap::default(),
+                None, // Kein Zenoh Fan-Out in Tests
             )
         });
 
