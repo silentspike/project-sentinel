@@ -105,6 +105,11 @@ impl ProjectionWorker {
             let count = self.process_batch(&batch)?;
             let last_row_id = batch.last().unwrap().0;
 
+            // Abgelaufene Smells bereinigen (basierend auf dem hoechsten Tick im Batch)
+            if let Some(max_tick) = batch.iter().map(|(_, e)| e.tick).max() {
+                self.read_store.cleanup_expired_smells(max_tick)?;
+            }
+
             // Guard: nur updaten wenn tatsaechlich Fortschritt (schuetzt vor
             // Race Conditions bei Auto-Restart und idempotenten Batches)
             if last_row_id > offset {

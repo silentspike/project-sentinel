@@ -153,6 +153,50 @@ impl ReadModelStore {
         Ok(())
     }
 
+    /// Entfernt abgelaufene Smells aus room_live_view.
+    ///
+    /// Prueft alle Rooms mit active_smells und setzt auf NULL wenn
+    /// `current_tick > smell.tick + smell.duration_ticks`.
+    pub fn cleanup_expired_smells(&self, current_tick: u64) -> anyhow::Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+
+        let mut stmt = conn.prepare(
+            "SELECT room_id, active_smells FROM room_live_view WHERE active_smells IS NOT NULL",
+        )?;
+        let expired: Vec<String> = stmt
+            .query_map([], |row| {
+                let room_id: String = row.get(0)?;
+                let json: String = row.get(1)?;
+                Ok((room_id, json))
+            })?
+            .filter_map(|r| r.ok())
+            .filter(|(_, json)| {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
+                    let tick = v["tick"].as_u64().unwrap_or(0);
+                    let duration = v["duration_ticks"].as_u64().unwrap_or(0);
+                    current_tick > tick + duration
+                } else {
+                    true // Malformed JSON → cleanup
+                }
+            })
+            .map(|(room_id, _)| room_id)
+            .collect();
+
+        if !expired.is_empty() {
+            let mut update =
+                conn.prepare("UPDATE room_live_view SET active_smells = NULL WHERE room_id = ?1")?;
+            for room_id in &expired {
+                update.execute(params![room_id])?;
+            }
+            tracing::debug!(count = expired.len(), "Expired smells cleaned up");
+        }
+
+        Ok(())
+    }
+
     /// Loescht alle Daten aus allen drei View-Tabellen (fuer Rebuild).
     pub fn clear_all(&self) -> anyhow::Result<()> {
         let conn = self
