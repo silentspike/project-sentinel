@@ -116,22 +116,17 @@ pub async fn ebpf_publisher(
     mut rx: tokio::sync::mpsc::Receiver<MetricsSnapshot>,
     metrics_text: Arc<RwLock<String>>,
     nats_url: Option<String>,
+    bus: Option<SentinelBus>,
 ) {
     // Suppress unused warning when nats feature is disabled
     #[cfg(not(feature = "nats"))]
     let _ = &nats_url;
 
-    // SentinelBus fuer Zenoh-Publishing erstellen
-    let bus = match SentinelBus::new().await {
-        Ok(b) => {
-            info!("eBPF Zenoh Publisher: SentinelBus verbunden");
-            Some(b)
-        }
-        Err(e) => {
-            warn!(error = %e, "eBPF Zenoh Publisher: SentinelBus nicht verfuegbar, nur Prometheus aktiv");
-            None
-        }
-    };
+    if bus.is_some() {
+        info!("eBPF Zenoh Publisher: SentinelBus verbunden (shared)");
+    } else {
+        warn!("eBPF Zenoh Publisher: SentinelBus nicht verfuegbar, nur Prometheus aktiv");
+    }
 
     // NATS Client fuer eBPF→NATS Bridge (ADR-001: Daemon bridged fuer Go-Services)
     #[cfg(feature = "nats")]
