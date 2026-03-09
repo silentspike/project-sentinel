@@ -23,11 +23,9 @@ fn bench_runtime() -> Runtime {
 /// Vergleicht implizit SHM vs Network (abhaengig von SENTINEL_ZENOH_SHM ENV).
 fn shm_pub_sub_latency(c: &mut Criterion) {
     let rt = bench_runtime();
-    let (bus_pub, bus_sub) = rt.block_on(async {
-        let bp = SentinelBus::new().await.expect("Publisher Bus");
-        let bs = SentinelBus::new().await.expect("Subscriber Bus");
-        (bp, bs)
-    });
+    // Eine Bus-Instanz fuer Publish UND Subscribe (Self-Loopback).
+    // Entspricht dem echten Daemon-Betrieb (ein SentinelBus).
+    let bus = rt.block_on(SentinelBus::new()).expect("Bus fuer Latency");
 
     let mut group = c.benchmark_group("shm_pub_sub_latency");
     group.measurement_time(Duration::from_secs(10));
@@ -37,21 +35,38 @@ fn shm_pub_sub_latency(c: &mut Criterion) {
         let payload = vec![0xABu8; payload_size];
         let topic = format!("sentinel/bench/latency/{payload_size}");
 
+        // Subscribe EINMAL vor dem Benchmark-Loop.
+        let sub = rt.block_on(bus.subscribe(&topic)).expect("subscribe");
+        // Warm-up mit Retry — Self-Loopback sollte sofort funktionieren,
+        // aber sicherheitshalber retry fuer Zenoh-interne Propagation.
+        rt.block_on(async {
+            for attempt in 0..5 {
+                std::thread::sleep(Duration::from_millis(100));
+                bus.publish(&topic, &[0u8]).await.expect("warmup pub");
+                match tokio::time::timeout(Duration::from_millis(500), sub.recv_async()).await {
+                    Ok(Ok(_)) => break,
+                    _ => {
+                        if attempt == 4 {
+                            panic!("Subscription warmup failed for {topic}");
+                        }
+                    }
+                }
+            }
+        });
+
         group.bench_with_input(
             BenchmarkId::from_parameter(payload_size),
             &payload_size,
             |b, _| {
                 b.to_async(&rt).iter(|| {
-                    let bus_p = bus_pub.clone();
-                    let bus_s = bus_sub.clone();
+                    let bus = bus.clone();
+                    let sub_ref = &sub;
                     let p = payload.clone();
                     let t = topic.clone();
                     async move {
-                        // Subscribe muss vor Publish stehen
-                        let sub = bus_s.subscribe(&t).await.expect("subscribe");
-                        bus_p.publish(&t, &p).await.expect("publish");
+                        bus.publish(&t, &p).await.expect("publish");
                         let sample =
-                            tokio::time::timeout(Duration::from_millis(500), sub.recv_async())
+                            tokio::time::timeout(Duration::from_millis(500), sub_ref.recv_async())
                                 .await
                                 .expect("timeout")
                                 .expect("recv");
@@ -99,22 +114,30 @@ fn shm_concurrent_publishers(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(15));
     group.sample_size(50);
 
+    // Eine Bus-Instanz, gecloned an 24 Tasks (wie im Daemon — Clone ist billig).
+    let bus = rt
+        .block_on(SentinelBus::new())
+        .expect("Bus fuer Concurrency");
+
     group.bench_function("24_publishers_x100_msgs", |b| {
-        b.to_async(&rt).iter(|| async {
-            let mut handles = Vec::new();
-            for i in 0..24u8 {
-                let handle = tokio::spawn(async move {
-                    let bus = SentinelBus::new().await.expect("Bus");
-                    let topic = format!("sentinel/bench/concurrent/{i}");
-                    let payload = vec![i; 256];
-                    for _ in 0..100 {
-                        bus.publish(&topic, &payload).await.expect("publish");
-                    }
-                });
-                handles.push(handle);
-            }
-            for h in handles {
-                h.await.expect("join");
+        b.to_async(&rt).iter(|| {
+            let bus = bus.clone();
+            async move {
+                let mut handles = Vec::new();
+                for i in 0..24u8 {
+                    let bus = bus.clone();
+                    let handle = tokio::spawn(async move {
+                        let topic = format!("sentinel/bench/concurrent/{i}");
+                        let payload = vec![i; 256];
+                        for _ in 0..100 {
+                            bus.publish(&topic, &payload).await.expect("publish");
+                        }
+                    });
+                    handles.push(handle);
+                }
+                for h in handles {
+                    h.await.expect("join");
+                }
             }
         });
     });
@@ -150,41 +173,67 @@ fn shm_fanout_overhead(c: &mut Criterion) {
 fn shm_query_roundtrip(c: &mut Criterion) {
     let rt = bench_runtime();
 
+    // Eine Bus-Instanz (Self-Loopback) — wie im echten Daemon.
+    let bus = rt.block_on(SentinelBus::new()).expect("Bus fuer Query");
+
+    let request_topic = "sentinel/bench/query/request";
+    let response_topic = "sentinel/bench/query/response";
+
+    // Subscriptions erstellen.
+    let request_sub = rt
+        .block_on(bus.subscribe(request_topic))
+        .expect("request subscribe");
+    let response_sub = rt
+        .block_on(bus.subscribe(response_topic))
+        .expect("response subscribe");
+
+    // Responder-Task laeuft dauerhaft im Hintergrund.
+    let resp_bus = bus.clone();
+    rt.spawn(async move {
+        loop {
+            match request_sub.recv_async().await {
+                Ok(_) => {
+                    let _ = resp_bus.publish(response_topic, b"OK").await;
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Warm-up mit Retry.
+    rt.block_on(async {
+        for attempt in 0..5 {
+            std::thread::sleep(Duration::from_millis(100));
+            bus.publish(request_topic, b"WARMUP")
+                .await
+                .expect("warmup req");
+            match tokio::time::timeout(Duration::from_secs(1), response_sub.recv_async()).await {
+                Ok(Ok(_)) => break,
+                _ => {
+                    if attempt == 4 {
+                        panic!("Query roundtrip warmup failed");
+                    }
+                }
+            }
+        }
+    });
+
     let mut group = c.benchmark_group("shm_query_roundtrip");
     group.measurement_time(Duration::from_secs(10));
     group.sample_size(200);
 
     group.bench_function("query_response_roundtrip", |b| {
-        b.to_async(&rt).iter(|| async {
-            let bus_req = SentinelBus::new().await.expect("Requester Bus");
-            let bus_resp = SentinelBus::new().await.expect("Responder Bus");
-
-            let request_topic = "sentinel/bench/query/request";
-            let response_topic = "sentinel/bench/query/response";
-
-            // Responder
-            let sub = bus_resp.subscribe(request_topic).await.expect("subscribe");
-            let resp_bus = bus_resp.clone();
-            let responder = tokio::spawn(async move {
-                let _ = sub.recv_async().await;
-                resp_bus
-                    .publish(response_topic, b"OK")
+        b.to_async(&rt).iter(|| {
+            let bus = bus.clone();
+            let sub_ref = &response_sub;
+            async move {
+                bus.publish(request_topic, b"QUERY").await.expect("request");
+                let resp = tokio::time::timeout(Duration::from_secs(1), sub_ref.recv_async())
                     .await
-                    .expect("response");
-            });
-
-            // Request
-            let response_sub = bus_req.subscribe(response_topic).await.expect("sub");
-            bus_req
-                .publish(request_topic, b"QUERY")
-                .await
-                .expect("request");
-            let resp = tokio::time::timeout(Duration::from_secs(1), response_sub.recv_async())
-                .await
-                .expect("timeout")
-                .expect("recv");
-            black_box(resp.payload().to_bytes().len());
-            responder.await.expect("responder join");
+                    .expect("timeout")
+                    .expect("recv");
+                black_box(resp.payload().to_bytes().len());
+            }
         });
     });
     group.finish();
