@@ -1,0 +1,64 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "group:monorepos",
+    ":semanticCommits"
+  ],
+  "labels": ["type:deps"],
+  "schedule": ["before 8am on monday"],
+  "timezone": "Europe/Berlin",
+  "platformCommit": "enabled",
+  "packageRules": [
+    {
+      "description": "Rust minor/patch updates grouped",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "rust-minor",
+      "commitMessagePrefix": "deps(rust):",
+      "automerge": true
+    },
+    {
+      "description": "Rust major updates separate",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["major"],
+      "commitMessagePrefix": "deps(rust):",
+      "automerge": false
+    },
+    {
+      "description": "Rust toolchain updates",
+      "matchManagers": ["rust-toolchain"],
+      "commitMessagePrefix": "deps(rust):",
+      "automerge": false
+    },
+    {
+      "description": "Go minor/patch updates grouped",
+      "matchManagers": ["gomod"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "go-minor",
+      "commitMessagePrefix": "deps(go):",
+      "automerge": true
+    },
+    {
+      "description": "npm/bun minor/patch updates grouped",
+      "matchManagers": ["npm"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "bun-minor",
+      "commitMessagePrefix": "deps(bun):",
+      "automerge": true
+    },
+    {
+      "description": "GitHub Actions updates",
+      "matchManagers": ["github-actions"],
+      "commitMessagePrefix": "ci:",
+      "automerge": true,
+      "schedule": ["before 8am on the first day of the month"]
+    }
+  ],
+  "prConcurrentLimit": 10,
+  "prHourlyLimit": 5,
+  "vulnerabilityAlerts": {
+    "labels": ["type:security"],
+    "automerge": false
+  }
+}

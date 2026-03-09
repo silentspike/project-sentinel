@@ -1,0 +1,27 @@
+name: Renovate
+
+on:
+  # Montags 06:00 UTC (07:00 CET / 08:00 CEST)
+  schedule:
+    - cron: '0 6 * * 1'
+  # Manuell auslösbar
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  renovate:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run Renovate
+        uses: renovatebot/github-action@e084b5eafaed19a7e98eb3a36e6998e1be1e6e86 # v41.0.15
+        with:
+          configurationFile: renovate.json
+          token: ${{ secrets.RENOVATE_TOKEN }}
+        env:
+          LOG_LEVEL: info
