@@ -190,13 +190,8 @@ fn shm_query_roundtrip(c: &mut Criterion) {
     // Responder-Task laeuft dauerhaft im Hintergrund.
     let resp_bus = bus.clone();
     rt.spawn(async move {
-        loop {
-            match request_sub.recv_async().await {
-                Ok(_) => {
-                    let _ = resp_bus.publish(response_topic, b"OK").await;
-                }
-                Err(_) => break,
-            }
+        while let Ok(_) = request_sub.recv_async().await {
+            let _ = resp_bus.publish(response_topic, b"OK").await;
         }
     });
 
