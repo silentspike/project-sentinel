@@ -25,13 +25,11 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config = zenoh::Config::default();
     config
-        .insert_json5(
-            "connect/endpoints",
-            &format!("[\"{connect_endpoint}\"]"),
-        )
+        .insert_json5("connect/endpoints", &format!("[\"{connect_endpoint}\"]"))
         .map_err(|e| anyhow::anyhow!("Config error: {e}"))?;
 
-    let session = zenoh::open(config).await
+    let session = zenoh::open(config)
+        .await
         .map_err(|e| anyhow::anyhow!("Zenoh open failed: {e}"))?;
     println!("Session opened, waiting for connection (1s)...");
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -50,12 +48,19 @@ async fn main() -> anyhow::Result<()> {
     let response_topic = "sentinel/query/response/AGENT-99";
 
     println!("Subscribing to {response_topic}...");
-    let sub = session.declare_subscriber(response_topic).await
+    let sub = session
+        .declare_subscriber(response_topic)
+        .await
         .map_err(|e| anyhow::anyhow!("Subscribe failed: {e}"))?;
 
     let payload = serde_json::to_vec(&query)?;
-    println!("Publishing query to {request_topic} (query_id={})", query.query_id);
-    session.put(&request_topic, payload).await
+    println!(
+        "Publishing query to {request_topic} (query_id={})",
+        query.query_id
+    );
+    session
+        .put(&request_topic, payload)
+        .await
         .map_err(|e| anyhow::anyhow!("Publish failed: {e}"))?;
 
     let start = std::time::Instant::now();
@@ -73,7 +78,9 @@ async fn main() -> anyhow::Result<()> {
                 let elapsed = start.elapsed();
                 let bytes = sample.payload().to_bytes();
                 println!("Response received in {elapsed:?} ({} bytes)", bytes.len());
-                if let Ok(resp) = serde_json::from_slice::<sentinel_zenoh::query::QueryResponse>(&bytes) {
+                if let Ok(resp) =
+                    serde_json::from_slice::<sentinel_zenoh::query::QueryResponse>(&bytes)
+                {
                     println!("  query_id:      {}", resp.query_id);
                     println!("  response_tick: {}", resp.response_tick);
                     println!("  payload_len:   {} bytes", resp.payload.len());
