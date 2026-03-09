@@ -15,5 +15,14 @@ io_threshold = 70.0      # PSI avg10 % → Batching 500ms
 min_tick_rate_ms = 2000  # Floor: nie langsamer als 0.5 Hz
 psi_sample_interval = 10 # Alle N Ticks PSI lesen
 
+[daemon.zenoh]
+shm_enabled = true
+shm_buffer_size_bytes = 1048576    # 1 MB SHM ring buffer
+fanout_channel_capacity = 256      # mpsc channel fuer ECS → Zenoh Fan-Out
+query_responder_enabled = true     # Scoped Query Responder aktivieren
+query_deadline_ms = 100            # Query Timeout
+max_inflight_global = 128          # Gleichzeitige Queries global
+max_inflight_per_agent = 8         # Gleichzeitige Queries pro Agent
+
 [daemon.nats]
 url = "nats://127.0.0.1:4222"
