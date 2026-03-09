@@ -49,3 +49,4 @@ sha2 = "0.10"
 blake3 = "1"
 rayon = "1"
 async-nats = "0.38"
+# workspace dependencies above — keep sorted alphabetically when adding new entries

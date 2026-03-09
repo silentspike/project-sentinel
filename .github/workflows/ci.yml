@@ -84,6 +84,10 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     env:
       CARGO_BUILD_JOBS: "3"
+      # Persistent local cache on self-hosted runner — avoids GitHub API
+      # upload/download overhead (~1.3GB per run). Each runner instance
+      # gets its own target dir via RUNNER_NAME to prevent lock contention.
+      CARGO_TARGET_DIR: /opt/cargo-cache/${{ runner.name }}/target
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -91,9 +95,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
-        with:
-          cache-on-failure: true
+      - name: Ensure local cache dir
+        run: mkdir -p "$CARGO_TARGET_DIR"
 
       - name: Format check
         run: cargo fmt --all -- --check
