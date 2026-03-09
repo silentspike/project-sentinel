@@ -66,37 +66,26 @@ async fn main() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let deadline = std::time::Duration::from_millis(2000);
 
-    loop {
-        let remaining = deadline.saturating_sub(start.elapsed());
-        if remaining.is_zero() {
-            println!("No response within deadline ({:?})", start.elapsed());
-            println!("AC-5 FAIL: Query timed out");
-            break;
+    match tokio::time::timeout(deadline, sub.recv_async()).await {
+        Ok(Ok(sample)) => {
+            let elapsed = start.elapsed();
+            let bytes = sample.payload().to_bytes();
+            println!("Response received in {elapsed:?} ({} bytes)", bytes.len());
+            if let Ok(resp) =
+                serde_json::from_slice::<sentinel_zenoh::query::QueryResponse>(&bytes)
+            {
+                println!("  query_id:      {}", resp.query_id);
+                println!("  response_tick: {}", resp.response_tick);
+                println!("  payload_len:   {} bytes", resp.payload.len());
+            }
+            println!("AC-5 PASS: Response within deadline");
         }
-        match tokio::time::timeout(remaining, sub.recv_async()).await {
-            Ok(Ok(sample)) => {
-                let elapsed = start.elapsed();
-                let bytes = sample.payload().to_bytes();
-                println!("Response received in {elapsed:?} ({} bytes)", bytes.len());
-                if let Ok(resp) =
-                    serde_json::from_slice::<sentinel_zenoh::query::QueryResponse>(&bytes)
-                {
-                    println!("  query_id:      {}", resp.query_id);
-                    println!("  response_tick: {}", resp.response_tick);
-                    println!("  payload_len:   {} bytes", resp.payload.len());
-                }
-                println!("AC-5 PASS: Response within deadline");
-                break;
-            }
-            Ok(Err(_)) => {
-                println!("Subscriber closed");
-                break;
-            }
-            Err(_) => {
-                println!("Timeout after {deadline:?}");
-                println!("AC-5 FAIL: Query timed out");
-                break;
-            }
+        Ok(Err(_)) => {
+            println!("Subscriber closed");
+        }
+        Err(_) => {
+            println!("Timeout after {deadline:?}");
+            println!("AC-5 FAIL: Query timed out");
         }
     }
 
