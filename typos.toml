@@ -499,6 +499,10 @@ Objekt = "Objekt"
 failt = "failt"
 unparseable = "unparseable"
 
+# Zenoh Config words (Issue #6 - German in Rust doc comments)
+matcht = "matcht"
+Segmente = "Segmente"
+
 [files]
 extend-exclude = [
     "Cargo.lock",
