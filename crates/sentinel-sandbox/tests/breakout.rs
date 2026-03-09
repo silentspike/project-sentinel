@@ -17,23 +17,26 @@ use sentinel_sandbox::{BwrapConfig, CgroupLimits, LandlockRuleset};
 // Utilities
 // ---------------------------------------------------------------------------
 
-/// Finds the breakout-helper binary in the target directory.
+/// Returns the expected path of the breakout-helper binary in the target directory.
+/// Does NOT check existence — Tier-2 tests call `require_helper()` for that.
 fn helper_binary_path() -> PathBuf {
-    // cargo test builds binaries in target/debug/ or target/release/
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.pop(); // crates/
     path.pop(); // project root
     path.push("target");
     path.push("debug");
     path.push("breakout-helper");
-
-    if !path.exists() {
-        panic!(
-            "breakout-helper binary not found at {}. Run `cargo build -p sentinel-sandbox` first.",
-            path.display()
-        );
-    }
     path
+}
+
+/// Panics if the breakout-helper binary is missing. Called by Tier-2 (VM) tests.
+fn require_helper() {
+    let path = helper_binary_path();
+    assert!(
+        path.exists(),
+        "breakout-helper binary not found at {}. Run `cargo build -p sentinel-sandbox` first.",
+        path.display()
+    );
 }
 
 /// Creates an extended BwrapConfig for breakout tests.
@@ -292,6 +295,7 @@ fn ac_76_config_proc_and_dev_mount_in_args() {
 
 /// Checks if bwrap is available on this system.
 fn require_bwrap() {
+    require_helper();
     if !BwrapConfig::test_userns() {
         panic!("bwrap user namespace not available — run on VM (10.0.0.240)");
     }
