@@ -115,15 +115,10 @@ impl ZenohConfig {
         BusConfig {
             shm_enabled: std::env::var("SENTINEL_ZENOH_SHM")
                 .ok()
-                .map(|v| {
-                    matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-                })
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
                 .unwrap_or(self.shm_enabled),
             shm_p99_target_us: env.shm_p99_target_us,
-            query_deadline_ms: env_or(
-                "SENTINEL_ZENOH_QUERY_DEADLINE_MS",
-                self.query_deadline_ms,
-            ),
+            query_deadline_ms: env_or("SENTINEL_ZENOH_QUERY_DEADLINE_MS", self.query_deadline_ms),
             query_cancel_enabled: env.query_cancel_enabled,
             max_inflight_global: env_or_usize(
                 "SENTINEL_ZENOH_MAX_INFLIGHT_GLOBAL",
