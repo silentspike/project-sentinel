@@ -84,7 +84,7 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     env:
       CARGO_BUILD_JOBS: "3"
-      # Persistent local cache on self-hosted runner — avoids GitHub API
+      # Persistent local cache on self-hosted runner - avoids GitHub API
       # upload/download overhead (~1.3GB per run). Each runner instance
       # gets its own target dir via RUNNER_NAME to prevent lock contention.
       CARGO_TARGET_DIR: /opt/cargo-cache/${{ runner.name }}/target
