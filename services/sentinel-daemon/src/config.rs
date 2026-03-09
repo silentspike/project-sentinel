@@ -113,9 +113,12 @@ impl ZenohConfig {
         use sentinel_zenoh::config::BusConfig;
         let env = BusConfig::from_env();
         BusConfig {
-            shm_enabled: std::env::var("SENTINEL_ZENOH_SHM").ok().map(|v| {
-                matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-            }).unwrap_or(self.shm_enabled),
+            shm_enabled: std::env::var("SENTINEL_ZENOH_SHM")
+                .ok()
+                .map(|v| {
+                    matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+                })
+                .unwrap_or(self.shm_enabled),
             shm_p99_target_us: env.shm_p99_target_us,
             query_deadline_ms: env_or(
                 "SENTINEL_ZENOH_QUERY_DEADLINE_MS",
@@ -138,9 +141,10 @@ impl ZenohConfig {
                 "SENTINEL_ZENOH_FANOUT_CAPACITY",
                 self.fanout_channel_capacity,
             ),
-            query_responder_enabled: std::env::var("SENTINEL_ZENOH_QUERY_RESPONDER").ok().map(|v| {
-                matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-            }).unwrap_or(self.query_responder_enabled),
+            query_responder_enabled: std::env::var("SENTINEL_ZENOH_QUERY_RESPONDER")
+                .ok()
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(self.query_responder_enabled),
         }
     }
 }
