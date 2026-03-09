@@ -362,7 +362,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let (perception_tx, perception_rx) = mpsc::sync_channel::<Perception>(64);
 
     // -- Zenoh SentinelBus (Core-Bus fuer Real-Time Event-Verteilung) --
-    let bus = match SentinelBus::new().await {
+    let bus_config = config.zenoh.to_bus_config();
+    let bus = match SentinelBus::with_config(bus_config).await {
         Ok(b) => {
             info!(transport = ?b.transport_mode(), "SentinelBus ready");
             Some(b)
@@ -374,23 +375,26 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     };
 
     // -- Zenoh Fan-Out Bridge (Events nach Limbo-Write auf Zenoh publizieren) --
+    let fanout_capacity = config.zenoh.fanout_channel_capacity;
     let fanout_sender = if let Some(ref b) = bus {
-        let (fanout_tx, fanout_rx) = tokio::sync::mpsc::channel(256);
+        let (fanout_tx, fanout_rx) = tokio::sync::mpsc::channel(fanout_capacity);
         tokio::spawn(crate::fanout::zenoh_fanout_task(b.clone(), fanout_rx));
-        info!("Zenoh Fan-Out Bridge gestartet (channel capacity=256)");
+        info!(capacity = fanout_capacity, "Zenoh Fan-Out Bridge gestartet");
         Some(sentinel_ecs::ZenohFanoutSender { sender: fanout_tx })
     } else {
         None
     };
 
     // -- Zenoh Scoped Query Responder (beantwortet Queries mit redb State) --
-    if let Some(ref b) = bus {
-        let qr_bus = b.clone();
-        let qr_store = Arc::clone(&state_store);
-        tokio::spawn(crate::query_responder::query_responder_task(
-            qr_bus, qr_store,
-        ));
-        info!("Zenoh Query Responder gestartet");
+    if config.zenoh.query_responder_enabled {
+        if let Some(ref b) = bus {
+            let qr_bus = b.clone();
+            let qr_store = Arc::clone(&state_store);
+            tokio::spawn(crate::query_responder::query_responder_task(
+                qr_bus, qr_store,
+            ));
+            info!("Zenoh Query Responder gestartet");
+        }
     }
 
     // -- Shutdown Flag --

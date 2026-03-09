@@ -18,8 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `crates/sentinel-ecs/src/systems.rs`: `persist_system` sendet Events nach Limbo-Write an Zenoh Fan-Out
   - `crates/sentinel-zenoh/src/config.rs`: 3 neue Config-Felder (`shm_buffer_size_bytes`, `fanout_channel_capacity`, `query_responder_enabled`)
   - `crates/sentinel-zenoh/benches/shm_benchmark.rs`: 6 Criterion Benchmarks (Latenz, Throughput, Concurrency, Fanout, Query, Buffer Sizing)
+  - `services/sentinel-daemon/src/config.rs`: TOML-basierte `ZenohConfig` Sektion mit ENV-Override-Pattern (ENV > TOML > Hardcoded Default)
+  - `config/daemon.toml`: `[daemon.zenoh]` Sektion mit SHM, Fanout, Query Responder Konfiguration
+  - `crates/sentinel-zenoh/examples/query_test.rs`: Diagnose-Tool fuer Scoped Query Verifizierung
 
 ### Fixed
+
+- **Zenoh Query Responder Wildcard** (#6)
+  - `services/sentinel-daemon/src/query_responder.rs`: Subscription Pattern von `*/request` auf `**/request` korrigiert (matcht jetzt Agent/Room/Global Topics korrekt)
 
 - **Zenoh Fan-Out Event Matching** (#6)
   - `services/sentinel-daemon/src/fanout.rs`: Event-Type Match-Arms von PascalCase auf snake_case korrigiert (passend zu `DomainEventPayload::event_type_str()`)
