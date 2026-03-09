@@ -71,8 +71,7 @@ async fn main() -> anyhow::Result<()> {
             let elapsed = start.elapsed();
             let bytes = sample.payload().to_bytes();
             println!("Response received in {elapsed:?} ({} bytes)", bytes.len());
-            if let Ok(resp) =
-                serde_json::from_slice::<sentinel_zenoh::query::QueryResponse>(&bytes)
+            if let Ok(resp) = serde_json::from_slice::<sentinel_zenoh::query::QueryResponse>(&bytes)
             {
                 println!("  query_id:      {}", resp.query_id);
                 println!("  response_tick: {}", resp.response_tick);
