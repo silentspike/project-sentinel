@@ -1,6 +1,6 @@
 //! Scoped Query Responder fuer Zenoh.
 //!
-//! Subscribes auf `sentinel/query/*/request` Topics und beantwortet Queries
+//! Subscribes auf `sentinel/query/**/request` Topics und beantwortet Queries
 //! mit State aus dem redb StateStore. Laeuft als async Task im tokio Runtime.
 //!
 //! Nutzt den bestehenden `ScopedQuery`/`QueryResponse` Typ aus sentinel-zenoh
@@ -26,7 +26,8 @@ pub async fn query_responder_task(bus: SentinelBus, state_store: Arc<StateStore>
     info!("Query Responder gestartet");
 
     // Subscribe auf alle Query-Request-Topics (Wildcard)
-    let request_topic = "sentinel/query/*/request";
+    // `**` matcht mehrere Segmente: agent/AGENT-01, room/kueche, global
+    let request_topic = "sentinel/query/**/request";
     let subscriber = match bus.subscribe(request_topic).await {
         Ok(sub) => sub,
         Err(e) => {

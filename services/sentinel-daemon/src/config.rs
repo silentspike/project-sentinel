@@ -44,6 +44,10 @@ pub struct DaemonConfig {
     #[serde(default = "default_agent_command")]
     pub agent_command: Vec<String>,
 
+    /// Zenoh SHM Core-Bus Konfiguration.
+    #[serde(default)]
+    pub zenoh: ZenohConfig,
+
     /// NATS-Konfiguration fuer Judge-Alert-Consumption.
     #[serde(default)]
     pub nats: NatsConfig,
@@ -57,6 +61,120 @@ pub struct DaemonConfig {
     /// `{fs_mount}/{agent_name}` → `/home/{agent_name}`.
     #[serde(default)]
     pub fs_mount: Option<String>,
+}
+
+/// Zenoh SHM Core-Bus Konfiguration.
+///
+/// TOML-Werte dienen als Defaults. ENV-Variablen ueberschreiben TOML-Werte
+/// (via `BusConfig::from_env()` Fallback). Reihenfolge: ENV > TOML > Hardcoded Default.
+#[derive(Debug, Deserialize)]
+pub struct ZenohConfig {
+    /// SHM Transport aktivieren (default: false).
+    #[serde(default)]
+    pub shm_enabled: bool,
+    /// SHM Buffer-Groesse in Bytes (default: 1MB).
+    #[serde(default = "default_shm_buffer_size")]
+    pub shm_buffer_size_bytes: usize,
+    /// Fan-Out Channel Kapazitaet (default: 256).
+    #[serde(default = "default_fanout_capacity")]
+    pub fanout_channel_capacity: usize,
+    /// Query Responder aktivieren (default: true).
+    #[serde(default = "default_true")]
+    pub query_responder_enabled: bool,
+    /// Query Deadline in Millisekunden (default: 100).
+    #[serde(default = "default_query_deadline")]
+    pub query_deadline_ms: u64,
+    /// Max gleichzeitige Queries global (default: 128).
+    #[serde(default = "default_max_inflight_global")]
+    pub max_inflight_global: usize,
+    /// Max gleichzeitige Queries pro Agent (default: 8).
+    #[serde(default = "default_max_inflight_per_agent")]
+    pub max_inflight_per_agent: usize,
+}
+
+impl Default for ZenohConfig {
+    fn default() -> Self {
+        Self {
+            shm_enabled: false,
+            shm_buffer_size_bytes: default_shm_buffer_size(),
+            fanout_channel_capacity: default_fanout_capacity(),
+            query_responder_enabled: true,
+            query_deadline_ms: default_query_deadline(),
+            max_inflight_global: default_max_inflight_global(),
+            max_inflight_per_agent: default_max_inflight_per_agent(),
+        }
+    }
+}
+
+impl ZenohConfig {
+    /// Konvertiert in `BusConfig` fuer sentinel-zenoh.
+    /// ENV-Variablen ueberschreiben TOML-Werte.
+    pub fn to_bus_config(&self) -> sentinel_zenoh::config::BusConfig {
+        use sentinel_zenoh::config::BusConfig;
+        let env = BusConfig::from_env();
+        BusConfig {
+            shm_enabled: std::env::var("SENTINEL_ZENOH_SHM")
+                .ok()
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(self.shm_enabled),
+            shm_p99_target_us: env.shm_p99_target_us,
+            query_deadline_ms: env_or("SENTINEL_ZENOH_QUERY_DEADLINE_MS", self.query_deadline_ms),
+            query_cancel_enabled: env.query_cancel_enabled,
+            max_inflight_global: env_or_usize(
+                "SENTINEL_ZENOH_MAX_INFLIGHT_GLOBAL",
+                self.max_inflight_global,
+            ),
+            max_inflight_per_agent: env_or_usize(
+                "SENTINEL_ZENOH_MAX_INFLIGHT_PER_AGENT",
+                self.max_inflight_per_agent,
+            ),
+            shm_buffer_size_bytes: env_or_usize(
+                "SENTINEL_ZENOH_SHM_BUFFER_SIZE",
+                self.shm_buffer_size_bytes,
+            ),
+            fanout_channel_capacity: env_or_usize(
+                "SENTINEL_ZENOH_FANOUT_CAPACITY",
+                self.fanout_channel_capacity,
+            ),
+            query_responder_enabled: std::env::var("SENTINEL_ZENOH_QUERY_RESPONDER")
+                .ok()
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(self.query_responder_enabled),
+        }
+    }
+}
+
+fn env_or(key: &str, toml_val: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(toml_val)
+}
+
+fn env_or_usize(key: &str, toml_val: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(toml_val)
+}
+
+fn default_shm_buffer_size() -> usize {
+    1_048_576
+}
+fn default_fanout_capacity() -> usize {
+    256
+}
+fn default_true() -> bool {
+    true
+}
+fn default_query_deadline() -> u64 {
+    100
+}
+fn default_max_inflight_global() -> usize {
+    128
+}
+fn default_max_inflight_per_agent() -> usize {
+    8
 }
 
 /// NATS JetStream Konfiguration fuer den Daemon.
@@ -209,5 +327,48 @@ psi_sample_interval = 5
         assert_eq!(file.daemon.adaptive.io_threshold, 40.0);
         assert_eq!(file.daemon.adaptive.min_tick_rate_ms, 3000);
         assert_eq!(file.daemon.adaptive.psi_sample_interval, 5);
+    }
+
+    #[test]
+    fn test_zenoh_defaults() {
+        let toml_str = r#"
+[daemon]
+config_dir = "/tmp/cfg"
+data_dir = "/tmp/data"
+"#;
+        let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
+        assert!(!file.daemon.zenoh.shm_enabled);
+        assert_eq!(file.daemon.zenoh.shm_buffer_size_bytes, 1_048_576);
+        assert_eq!(file.daemon.zenoh.fanout_channel_capacity, 256);
+        assert!(file.daemon.zenoh.query_responder_enabled);
+        assert_eq!(file.daemon.zenoh.query_deadline_ms, 100);
+        assert_eq!(file.daemon.zenoh.max_inflight_global, 128);
+        assert_eq!(file.daemon.zenoh.max_inflight_per_agent, 8);
+    }
+
+    #[test]
+    fn test_zenoh_custom() {
+        let toml_str = r#"
+[daemon]
+config_dir = "/tmp/cfg"
+data_dir = "/tmp/data"
+
+[daemon.zenoh]
+shm_enabled = true
+shm_buffer_size_bytes = 2097152
+fanout_channel_capacity = 512
+query_responder_enabled = false
+query_deadline_ms = 200
+max_inflight_global = 64
+max_inflight_per_agent = 4
+"#;
+        let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
+        assert!(file.daemon.zenoh.shm_enabled);
+        assert_eq!(file.daemon.zenoh.shm_buffer_size_bytes, 2_097_152);
+        assert_eq!(file.daemon.zenoh.fanout_channel_capacity, 512);
+        assert!(!file.daemon.zenoh.query_responder_enabled);
+        assert_eq!(file.daemon.zenoh.query_deadline_ms, 200);
+        assert_eq!(file.daemon.zenoh.max_inflight_global, 64);
+        assert_eq!(file.daemon.zenoh.max_inflight_per_agent, 4);
     }
 }
