@@ -159,12 +159,24 @@ fn env_or_usize(key: &str, toml_val: usize) -> usize {
         .unwrap_or(toml_val)
 }
 
-fn default_shm_buffer_size() -> usize { 1_048_576 }
-fn default_fanout_capacity() -> usize { 256 }
-fn default_true() -> bool { true }
-fn default_query_deadline() -> u64 { 100 }
-fn default_max_inflight_global() -> usize { 128 }
-fn default_max_inflight_per_agent() -> usize { 8 }
+fn default_shm_buffer_size() -> usize {
+    1_048_576
+}
+fn default_fanout_capacity() -> usize {
+    256
+}
+fn default_true() -> bool {
+    true
+}
+fn default_query_deadline() -> u64 {
+    100
+}
+fn default_max_inflight_global() -> usize {
+    128
+}
+fn default_max_inflight_per_agent() -> usize {
+    8
+}
 
 /// NATS JetStream Konfiguration fuer den Daemon.
 #[derive(Debug, Deserialize)]
