@@ -16,3 +16,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "telemetry_bench"
+harness = false

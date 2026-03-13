@@ -14,9 +14,12 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "telemetry")]
 use sentinel_common::Timestamp;
 
-use crate::context::{TELEMETRY_ERRORS, TELEMETRY_HEALTH, TELEMETRY_METRICS};
+use crate::context::TELEMETRY_ERRORS;
+#[cfg(feature = "telemetry")]
+use crate::context::{TELEMETRY_HEALTH, TELEMETRY_METRICS};
 use crate::errors::ErrorEvent;
 #[cfg(feature = "telemetry")]
 use crate::health::HealthRegistry;
@@ -192,6 +195,7 @@ impl<T: TelemetryTransport> TelemetryExporter<T> {
 
 /// Extract subsystem name from a metric following the naming convention.
 /// Format: `sentinel.{subsystem}.{operation}.{type}`
+#[cfg(feature = "telemetry")]
 fn extract_subsystem(metric_name: &str) -> Option<&str> {
     let parts: Vec<&str> = metric_name.splitn(3, '.').collect();
     if parts.len() >= 2 && parts[0] == "sentinel" {
