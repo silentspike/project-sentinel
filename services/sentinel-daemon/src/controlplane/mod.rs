@@ -82,6 +82,8 @@ impl ControlplaneKernel {
     /// Fuehrt einen vollstaendigen observe/decide/act/verify Zyklus aus.
     ///
     /// Wird vom ECS Tick-Loop aufgerufen wenn `should_run()` true ist.
+    /// Alle Phasen arbeiten in-memory, am Ende wird EINE redb-Transaktion
+    /// ausgefuehrt (statt 4 separate — reduziert fsync-Kosten um ~75%).
     pub fn cycle(&mut self, world: &mut World, tick: u64) -> Result<()> {
         let start = Instant::now();
         let timestamp_ms = std::time::SystemTime::now()
@@ -89,21 +91,22 @@ impl ControlplaneKernel {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        // Phase 1: Observe
+        // Phase 1: Observe (in-memory, kein I/O)
+        let t_observe = Instant::now();
         let observation = observe::observe(world, tick, timestamp_ms);
         let incidents = observe::detect_incidents(&observation, &self.config);
+        let observe_ms = t_observe.elapsed().as_micros() as f64 / 1000.0;
 
-        // Incidents batch-persistieren
-        if let Err(e) = self.store.log_incidents_batch(&incidents) {
-            warn!(error = %e, "Incident-Batch-Logging fehlgeschlagen");
-        }
-
-        // Phase 2: Decide
+        // Phase 2: Decide (in-memory, kein I/O)
+        let t_decide = Instant::now();
         self.cleanup_cooldowns(tick);
         let mut actions = decide::decide(&incidents, &self.config, &self.recent_action_keys);
+        let decide_ms = t_decide.elapsed().as_micros() as f64 / 1000.0;
 
-        // Phase 3: Act
-        let executed = act::execute_actions(&mut actions, &self.store)?;
+        // Phase 3: Act (in-memory: execute_single ist rein logging, kein Store-Write)
+        let t_act = Instant::now();
+        let executed = act::execute_actions_no_store(&mut actions)?;
+        let act_ms = t_act.elapsed().as_micros() as f64 / 1000.0;
 
         // Cooldown-Keys fuer ausgefuehrte Actions registrieren
         for action in &actions {
@@ -120,15 +123,31 @@ impl ControlplaneKernel {
             }
         }
 
-        // Phase 4: Verify (prueft VORHERIGE Actions, nicht die gerade erstellten)
-        let verify_stats = verify::verify_actions(&self.store, &observation, tick)?;
+        // Phase 4: Verify (liest Pending aus Store — 1 Read-Txn, kein Write)
+        let t_verify = Instant::now();
+        let pending = self.store.get_pending_actions()?;
+        let (verify_stats, updated_actions) =
+            verify::verify_actions_from_cache(pending, &observation, tick);
+        let verify_ms = t_verify.elapsed().as_micros() as f64 / 1000.0;
+
+        // Executed Actions fuer Batch-Write sammeln
+        let new_actions: Vec<_> = actions
+            .iter()
+            .filter(|a| a.status == types::ActionStatus::Executed)
+            .cloned()
+            .collect();
 
         // State aktualisieren
         self.state.last_cycle_tick = tick;
         self.state.total_cycles += 1;
         self.state.total_incidents += incidents.len() as u64;
         self.state.total_actions += executed as u64;
-        self.store.set_runtime_state(&self.state)?;
+
+        // SINGLE WRITE TRANSACTION: alles in einem Commit
+        let t_store = Instant::now();
+        self.store
+            .write_cycle_batch(&incidents, &new_actions, &updated_actions, &self.state)?;
+        let store_ms = t_store.elapsed().as_micros() as f64 / 1000.0;
 
         let elapsed = start.elapsed();
         debug!(
@@ -138,6 +157,11 @@ impl ControlplaneKernel {
             actions_executed = executed,
             verified = verify_stats.verified,
             expired = verify_stats.expired,
+            observe_ms,
+            decide_ms,
+            act_ms,
+            verify_ms,
+            store_ms,
             elapsed_ms = elapsed.as_millis(),
             "Controlplane-Zyklus abgeschlossen"
         );
@@ -146,6 +170,11 @@ impl ControlplaneKernel {
         if elapsed.as_millis() > 200 {
             warn!(
                 elapsed_ms = elapsed.as_millis(),
+                observe_ms,
+                decide_ms,
+                act_ms,
+                verify_ms,
+                store_ms,
                 "Controlplane-Zyklus ueberschreitet 200ms Budget!"
             );
         }
