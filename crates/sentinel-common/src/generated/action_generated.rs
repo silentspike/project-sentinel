@@ -6,372 +6,436 @@ extern crate alloc;
 #[allow(unused_imports, dead_code)]
 pub mod sentinel {
 
-extern crate alloc;
+    extern crate alloc;
 
-#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
-pub const ENUM_MIN_ACTION_TYPE: i8 = 0;
-#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
-pub const ENUM_MAX_ACTION_TYPE: i8 = 4;
-#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
-#[allow(non_camel_case_types)]
-pub const ENUM_VALUES_ACTION_TYPE: [ActionType; 5] = [
-  ActionType::Chat,
-  ActionType::Move,
-  ActionType::ToolUse,
-  ActionType::Emote,
-  ActionType::PhoneCall,
-];
+    #[deprecated(
+        since = "2.0.0",
+        note = "Use associated constants instead. This will no longer be generated in 2021."
+    )]
+    pub const ENUM_MIN_ACTION_TYPE: i8 = 0;
+    #[deprecated(
+        since = "2.0.0",
+        note = "Use associated constants instead. This will no longer be generated in 2021."
+    )]
+    pub const ENUM_MAX_ACTION_TYPE: i8 = 4;
+    #[deprecated(
+        since = "2.0.0",
+        note = "Use associated constants instead. This will no longer be generated in 2021."
+    )]
+    #[allow(non_camel_case_types)]
+    pub const ENUM_VALUES_ACTION_TYPE: [ActionType; 5] = [
+        ActionType::Chat,
+        ActionType::Move,
+        ActionType::ToolUse,
+        ActionType::Emote,
+        ActionType::PhoneCall,
+    ];
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-#[repr(transparent)]
-pub struct ActionType(pub i8);
-#[allow(non_upper_case_globals)]
-impl ActionType {
-  pub const Chat: Self = Self(0);
-  pub const Move: Self = Self(1);
-  pub const ToolUse: Self = Self(2);
-  pub const Emote: Self = Self(3);
-  pub const PhoneCall: Self = Self(4);
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+    #[repr(transparent)]
+    pub struct ActionType(pub i8);
+    #[allow(non_upper_case_globals)]
+    impl ActionType {
+        pub const Chat: Self = Self(0);
+        pub const Move: Self = Self(1);
+        pub const ToolUse: Self = Self(2);
+        pub const Emote: Self = Self(3);
+        pub const PhoneCall: Self = Self(4);
 
-  pub const ENUM_MIN: i8 = 0;
-  pub const ENUM_MAX: i8 = 4;
-  pub const ENUM_VALUES: &'static [Self] = &[
-    Self::Chat,
-    Self::Move,
-    Self::ToolUse,
-    Self::Emote,
-    Self::PhoneCall,
-  ];
-  /// Returns the variant's name or "" if unknown.
-  pub fn variant_name(self) -> Option<&'static str> {
-    match self {
-      Self::Chat => Some("Chat"),
-      Self::Move => Some("Move"),
-      Self::ToolUse => Some("ToolUse"),
-      Self::Emote => Some("Emote"),
-      Self::PhoneCall => Some("PhoneCall"),
-      _ => None,
+        pub const ENUM_MIN: i8 = 0;
+        pub const ENUM_MAX: i8 = 4;
+        pub const ENUM_VALUES: &'static [Self] = &[
+            Self::Chat,
+            Self::Move,
+            Self::ToolUse,
+            Self::Emote,
+            Self::PhoneCall,
+        ];
+        /// Returns the variant's name or "" if unknown.
+        pub fn variant_name(self) -> Option<&'static str> {
+            match self {
+                Self::Chat => Some("Chat"),
+                Self::Move => Some("Move"),
+                Self::ToolUse => Some("ToolUse"),
+                Self::Emote => Some("Emote"),
+                Self::PhoneCall => Some("PhoneCall"),
+                _ => None,
+            }
+        }
     }
-  }
-}
-impl ::core::fmt::Debug for ActionType {
-  fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-    if let Some(name) = self.variant_name() {
-      f.write_str(name)
-    } else {
-      f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
+    impl ::core::fmt::Debug for ActionType {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+            if let Some(name) = self.variant_name() {
+                f.write_str(name)
+            } else {
+                f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
+            }
+        }
     }
-  }
-}
-impl<'a> ::flatbuffers::Follow<'a> for ActionType {
-  type Inner = Self;
-  #[inline]
-  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-    let b = unsafe { ::flatbuffers::read_scalar_at::<i8>(buf, loc) };
-    Self(b)
-  }
-}
+    impl<'a> ::flatbuffers::Follow<'a> for ActionType {
+        type Inner = Self;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            let b = unsafe { ::flatbuffers::read_scalar_at::<i8>(buf, loc) };
+            Self(b)
+        }
+    }
 
-impl ::flatbuffers::Push for ActionType {
-    type Output = ActionType;
+    impl ::flatbuffers::Push for ActionType {
+        type Output = ActionType;
+        #[inline]
+        unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
+            unsafe { ::flatbuffers::emplace_scalar::<i8>(dst, self.0) };
+        }
+    }
+
+    impl ::flatbuffers::EndianScalar for ActionType {
+        type Scalar = i8;
+        #[inline]
+        fn to_little_endian(self) -> i8 {
+            self.0.to_le()
+        }
+        #[inline]
+        #[allow(clippy::wrong_self_convention)]
+        fn from_little_endian(v: i8) -> Self {
+            let b = i8::from_le(v);
+            Self(b)
+        }
+    }
+
+    impl<'a> ::flatbuffers::Verifiable for ActionType {
+        #[inline]
+        fn run_verifier(
+            v: &mut ::flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+            i8::run_verifier(v, pos)
+        }
+    }
+
+    impl ::flatbuffers::SimpleToVerifyInSlice for ActionType {}
+    pub enum AgentActionOffset {}
+    #[derive(Copy, Clone, PartialEq)]
+
+    pub struct AgentAction<'a> {
+        pub _tab: ::flatbuffers::Table<'a>,
+    }
+
+    impl<'a> ::flatbuffers::Follow<'a> for AgentAction<'a> {
+        type Inner = AgentAction<'a>;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                _tab: unsafe { ::flatbuffers::Table::new(buf, loc) },
+            }
+        }
+    }
+
+    impl<'a> AgentAction<'a> {
+        pub const VT_AGENT_ID: ::flatbuffers::VOffsetT = 4;
+        pub const VT_ACTION_TYPE: ::flatbuffers::VOffsetT = 6;
+        pub const VT_TARGET_ROOM: ::flatbuffers::VOffsetT = 8;
+        pub const VT_TARGET_AGENT: ::flatbuffers::VOffsetT = 10;
+        pub const VT_CONTENT: ::flatbuffers::VOffsetT = 12;
+        pub const VT_TIMESTAMP: ::flatbuffers::VOffsetT = 14;
+        pub const VT_TICK: ::flatbuffers::VOffsetT = 16;
+
+        #[inline]
+        pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+            AgentAction { _tab: table }
+        }
+        #[allow(unused_mut)]
+        pub fn create<
+            'bldr: 'args,
+            'args: 'mut_bldr,
+            'mut_bldr,
+            A: ::flatbuffers::Allocator + 'bldr,
+        >(
+            _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+            args: &'args AgentActionArgs<'args>,
+        ) -> ::flatbuffers::WIPOffset<AgentAction<'bldr>> {
+            let mut builder = AgentActionBuilder::new(_fbb);
+            builder.add_tick(args.tick);
+            builder.add_timestamp(args.timestamp);
+            if let Some(x) = args.content {
+                builder.add_content(x);
+            }
+            builder.add_target_agent(args.target_agent);
+            builder.add_target_room(args.target_room);
+            builder.add_agent_id(args.agent_id);
+            builder.add_action_type(args.action_type);
+            builder.finish()
+        }
+
+        #[inline]
+        pub fn agent_id(&self) -> u16 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<u16>(AgentAction::VT_AGENT_ID, Some(0))
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn action_type(&self) -> ActionType {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<ActionType>(AgentAction::VT_ACTION_TYPE, Some(ActionType::Chat))
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn target_room(&self) -> u16 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<u16>(AgentAction::VT_TARGET_ROOM, Some(0))
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn target_agent(&self) -> u16 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<u16>(AgentAction::VT_TARGET_AGENT, Some(0))
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn content(&self) -> Option<&'a str> {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<::flatbuffers::ForwardsUOffset<&str>>(AgentAction::VT_CONTENT, None)
+            }
+        }
+        #[inline]
+        pub fn timestamp(&self) -> u64 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<u64>(AgentAction::VT_TIMESTAMP, Some(0))
+                    .unwrap()
+            }
+        }
+        #[inline]
+        pub fn tick(&self) -> u64 {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe { self._tab.get::<u64>(AgentAction::VT_TICK, Some(0)).unwrap() }
+        }
+    }
+
+    impl ::flatbuffers::Verifiable for AgentAction<'_> {
+        #[inline]
+        fn run_verifier(
+            v: &mut ::flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+            v.visit_table(pos)?
+                .visit_field::<u16>("agent_id", Self::VT_AGENT_ID, false)?
+                .visit_field::<ActionType>("action_type", Self::VT_ACTION_TYPE, false)?
+                .visit_field::<u16>("target_room", Self::VT_TARGET_ROOM, false)?
+                .visit_field::<u16>("target_agent", Self::VT_TARGET_AGENT, false)?
+                .visit_field::<::flatbuffers::ForwardsUOffset<&str>>(
+                    "content",
+                    Self::VT_CONTENT,
+                    false,
+                )?
+                .visit_field::<u64>("timestamp", Self::VT_TIMESTAMP, false)?
+                .visit_field::<u64>("tick", Self::VT_TICK, false)?
+                .finish();
+            Ok(())
+        }
+    }
+    pub struct AgentActionArgs<'a> {
+        pub agent_id: u16,
+        pub action_type: ActionType,
+        pub target_room: u16,
+        pub target_agent: u16,
+        pub content: Option<::flatbuffers::WIPOffset<&'a str>>,
+        pub timestamp: u64,
+        pub tick: u64,
+    }
+    impl<'a> Default for AgentActionArgs<'a> {
+        #[inline]
+        fn default() -> Self {
+            AgentActionArgs {
+                agent_id: 0,
+                action_type: ActionType::Chat,
+                target_room: 0,
+                target_agent: 0,
+                content: None,
+                timestamp: 0,
+                tick: 0,
+            }
+        }
+    }
+
+    pub struct AgentActionBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+        fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+        start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+    }
+    impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> AgentActionBuilder<'a, 'b, A> {
+        #[inline]
+        pub fn add_agent_id(&mut self, agent_id: u16) {
+            self.fbb_
+                .push_slot::<u16>(AgentAction::VT_AGENT_ID, agent_id, 0);
+        }
+        #[inline]
+        pub fn add_action_type(&mut self, action_type: ActionType) {
+            self.fbb_.push_slot::<ActionType>(
+                AgentAction::VT_ACTION_TYPE,
+                action_type,
+                ActionType::Chat,
+            );
+        }
+        #[inline]
+        pub fn add_target_room(&mut self, target_room: u16) {
+            self.fbb_
+                .push_slot::<u16>(AgentAction::VT_TARGET_ROOM, target_room, 0);
+        }
+        #[inline]
+        pub fn add_target_agent(&mut self, target_agent: u16) {
+            self.fbb_
+                .push_slot::<u16>(AgentAction::VT_TARGET_AGENT, target_agent, 0);
+        }
+        #[inline]
+        pub fn add_content(&mut self, content: ::flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<::flatbuffers::WIPOffset<_>>(AgentAction::VT_CONTENT, content);
+        }
+        #[inline]
+        pub fn add_timestamp(&mut self, timestamp: u64) {
+            self.fbb_
+                .push_slot::<u64>(AgentAction::VT_TIMESTAMP, timestamp, 0);
+        }
+        #[inline]
+        pub fn add_tick(&mut self, tick: u64) {
+            self.fbb_.push_slot::<u64>(AgentAction::VT_TICK, tick, 0);
+        }
+        #[inline]
+        pub fn new(
+            _fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+        ) -> AgentActionBuilder<'a, 'b, A> {
+            let start = _fbb.start_table();
+            AgentActionBuilder {
+                fbb_: _fbb,
+                start_: start,
+            }
+        }
+        #[inline]
+        pub fn finish(self) -> ::flatbuffers::WIPOffset<AgentAction<'a>> {
+            let o = self.fbb_.end_table(self.start_);
+            ::flatbuffers::WIPOffset::new(o.value())
+        }
+    }
+
+    impl ::core::fmt::Debug for AgentAction<'_> {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+            let mut ds = f.debug_struct("AgentAction");
+            ds.field("agent_id", &self.agent_id());
+            ds.field("action_type", &self.action_type());
+            ds.field("target_room", &self.target_room());
+            ds.field("target_agent", &self.target_agent());
+            ds.field("content", &self.content());
+            ds.field("timestamp", &self.timestamp());
+            ds.field("tick", &self.tick());
+            ds.finish()
+        }
+    }
     #[inline]
-    unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
-        unsafe { ::flatbuffers::emplace_scalar::<i8>(dst, self.0) };
+    /// Verifies that a buffer of bytes contains a `AgentAction`
+    /// and returns it.
+    /// Note that verification is still experimental and may not
+    /// catch every error, or be maximally performant. For the
+    /// previous, unchecked, behavior use
+    /// `root_as_agent_action_unchecked`.
+    pub fn root_as_agent_action(
+        buf: &[u8],
+    ) -> Result<AgentAction<'_>, ::flatbuffers::InvalidFlatbuffer> {
+        ::flatbuffers::root::<AgentAction>(buf)
     }
-}
-
-impl ::flatbuffers::EndianScalar for ActionType {
-  type Scalar = i8;
-  #[inline]
-  fn to_little_endian(self) -> i8 {
-    self.0.to_le()
-  }
-  #[inline]
-  #[allow(clippy::wrong_self_convention)]
-  fn from_little_endian(v: i8) -> Self {
-    let b = i8::from_le(v);
-    Self(b)
-  }
-}
-
-impl<'a> ::flatbuffers::Verifiable for ActionType {
-  #[inline]
-  fn run_verifier(
-    v: &mut ::flatbuffers::Verifier, pos: usize
-  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
-    i8::run_verifier(v, pos)
-  }
-}
-
-impl ::flatbuffers::SimpleToVerifyInSlice for ActionType {}
-pub enum AgentActionOffset {}
-#[derive(Copy, Clone, PartialEq)]
-
-pub struct AgentAction<'a> {
-  pub _tab: ::flatbuffers::Table<'a>,
-}
-
-impl<'a> ::flatbuffers::Follow<'a> for AgentAction<'a> {
-  type Inner = AgentAction<'a>;
-  #[inline]
-  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-    Self { _tab: unsafe { ::flatbuffers::Table::new(buf, loc) } }
-  }
-}
-
-impl<'a> AgentAction<'a> {
-  pub const VT_AGENT_ID: ::flatbuffers::VOffsetT = 4;
-  pub const VT_ACTION_TYPE: ::flatbuffers::VOffsetT = 6;
-  pub const VT_TARGET_ROOM: ::flatbuffers::VOffsetT = 8;
-  pub const VT_TARGET_AGENT: ::flatbuffers::VOffsetT = 10;
-  pub const VT_CONTENT: ::flatbuffers::VOffsetT = 12;
-  pub const VT_TIMESTAMP: ::flatbuffers::VOffsetT = 14;
-  pub const VT_TICK: ::flatbuffers::VOffsetT = 16;
-
-  #[inline]
-  pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
-    AgentAction { _tab: table }
-  }
-  #[allow(unused_mut)]
-  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
-    _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
-    args: &'args AgentActionArgs<'args>
-  ) -> ::flatbuffers::WIPOffset<AgentAction<'bldr>> {
-    let mut builder = AgentActionBuilder::new(_fbb);
-    builder.add_tick(args.tick);
-    builder.add_timestamp(args.timestamp);
-    if let Some(x) = args.content { builder.add_content(x); }
-    builder.add_target_agent(args.target_agent);
-    builder.add_target_room(args.target_room);
-    builder.add_agent_id(args.agent_id);
-    builder.add_action_type(args.action_type);
-    builder.finish()
-  }
-
-
-  #[inline]
-  pub fn agent_id(&self) -> u16 {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<u16>(AgentAction::VT_AGENT_ID, Some(0)).unwrap()}
-  }
-  #[inline]
-  pub fn action_type(&self) -> ActionType {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<ActionType>(AgentAction::VT_ACTION_TYPE, Some(ActionType::Chat)).unwrap()}
-  }
-  #[inline]
-  pub fn target_room(&self) -> u16 {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<u16>(AgentAction::VT_TARGET_ROOM, Some(0)).unwrap()}
-  }
-  #[inline]
-  pub fn target_agent(&self) -> u16 {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<u16>(AgentAction::VT_TARGET_AGENT, Some(0)).unwrap()}
-  }
-  #[inline]
-  pub fn content(&self) -> Option<&'a str> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(AgentAction::VT_CONTENT, None)}
-  }
-  #[inline]
-  pub fn timestamp(&self) -> u64 {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<u64>(AgentAction::VT_TIMESTAMP, Some(0)).unwrap()}
-  }
-  #[inline]
-  pub fn tick(&self) -> u64 {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<u64>(AgentAction::VT_TICK, Some(0)).unwrap()}
-  }
-}
-
-impl ::flatbuffers::Verifiable for AgentAction<'_> {
-  #[inline]
-  fn run_verifier(
-    v: &mut ::flatbuffers::Verifier, pos: usize
-  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
-    v.visit_table(pos)?
-     .visit_field::<u16>("agent_id", Self::VT_AGENT_ID, false)?
-     .visit_field::<ActionType>("action_type", Self::VT_ACTION_TYPE, false)?
-     .visit_field::<u16>("target_room", Self::VT_TARGET_ROOM, false)?
-     .visit_field::<u16>("target_agent", Self::VT_TARGET_AGENT, false)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("content", Self::VT_CONTENT, false)?
-     .visit_field::<u64>("timestamp", Self::VT_TIMESTAMP, false)?
-     .visit_field::<u64>("tick", Self::VT_TICK, false)?
-     .finish();
-    Ok(())
-  }
-}
-pub struct AgentActionArgs<'a> {
-    pub agent_id: u16,
-    pub action_type: ActionType,
-    pub target_room: u16,
-    pub target_agent: u16,
-    pub content: Option<::flatbuffers::WIPOffset<&'a str>>,
-    pub timestamp: u64,
-    pub tick: u64,
-}
-impl<'a> Default for AgentActionArgs<'a> {
-  #[inline]
-  fn default() -> Self {
-    AgentActionArgs {
-      agent_id: 0,
-      action_type: ActionType::Chat,
-      target_room: 0,
-      target_agent: 0,
-      content: None,
-      timestamp: 0,
-      tick: 0,
+    #[inline]
+    /// Verifies that a buffer of bytes contains a size prefixed
+    /// `AgentAction` and returns it.
+    /// Note that verification is still experimental and may not
+    /// catch every error, or be maximally performant. For the
+    /// previous, unchecked, behavior use
+    /// `size_prefixed_root_as_agent_action_unchecked`.
+    pub fn size_prefixed_root_as_agent_action(
+        buf: &[u8],
+    ) -> Result<AgentAction<'_>, ::flatbuffers::InvalidFlatbuffer> {
+        ::flatbuffers::size_prefixed_root::<AgentAction>(buf)
     }
-  }
-}
-
-pub struct AgentActionBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
-  fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
-  start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
-}
-impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> AgentActionBuilder<'a, 'b, A> {
-  #[inline]
-  pub fn add_agent_id(&mut self, agent_id: u16) {
-    self.fbb_.push_slot::<u16>(AgentAction::VT_AGENT_ID, agent_id, 0);
-  }
-  #[inline]
-  pub fn add_action_type(&mut self, action_type: ActionType) {
-    self.fbb_.push_slot::<ActionType>(AgentAction::VT_ACTION_TYPE, action_type, ActionType::Chat);
-  }
-  #[inline]
-  pub fn add_target_room(&mut self, target_room: u16) {
-    self.fbb_.push_slot::<u16>(AgentAction::VT_TARGET_ROOM, target_room, 0);
-  }
-  #[inline]
-  pub fn add_target_agent(&mut self, target_agent: u16) {
-    self.fbb_.push_slot::<u16>(AgentAction::VT_TARGET_AGENT, target_agent, 0);
-  }
-  #[inline]
-  pub fn add_content(&mut self, content: ::flatbuffers::WIPOffset<&'b  str>) {
-    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(AgentAction::VT_CONTENT, content);
-  }
-  #[inline]
-  pub fn add_timestamp(&mut self, timestamp: u64) {
-    self.fbb_.push_slot::<u64>(AgentAction::VT_TIMESTAMP, timestamp, 0);
-  }
-  #[inline]
-  pub fn add_tick(&mut self, tick: u64) {
-    self.fbb_.push_slot::<u64>(AgentAction::VT_TICK, tick, 0);
-  }
-  #[inline]
-  pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> AgentActionBuilder<'a, 'b, A> {
-    let start = _fbb.start_table();
-    AgentActionBuilder {
-      fbb_: _fbb,
-      start_: start,
+    #[inline]
+    /// Verifies, with the given options, that a buffer of bytes
+    /// contains a `AgentAction` and returns it.
+    /// Note that verification is still experimental and may not
+    /// catch every error, or be maximally performant. For the
+    /// previous, unchecked, behavior use
+    /// `root_as_agent_action_unchecked`.
+    pub fn root_as_agent_action_with_opts<'b, 'o>(
+        opts: &'o ::flatbuffers::VerifierOptions,
+        buf: &'b [u8],
+    ) -> Result<AgentAction<'b>, ::flatbuffers::InvalidFlatbuffer> {
+        ::flatbuffers::root_with_opts::<AgentAction<'b>>(opts, buf)
     }
-  }
-  #[inline]
-  pub fn finish(self) -> ::flatbuffers::WIPOffset<AgentAction<'a>> {
-    let o = self.fbb_.end_table(self.start_);
-    ::flatbuffers::WIPOffset::new(o.value())
-  }
-}
+    #[inline]
+    /// Verifies, with the given verifier options, that a buffer of
+    /// bytes contains a size prefixed `AgentAction` and returns
+    /// it. Note that verification is still experimental and may not
+    /// catch every error, or be maximally performant. For the
+    /// previous, unchecked, behavior use
+    /// `root_as_agent_action_unchecked`.
+    pub fn size_prefixed_root_as_agent_action_with_opts<'b, 'o>(
+        opts: &'o ::flatbuffers::VerifierOptions,
+        buf: &'b [u8],
+    ) -> Result<AgentAction<'b>, ::flatbuffers::InvalidFlatbuffer> {
+        ::flatbuffers::size_prefixed_root_with_opts::<AgentAction<'b>>(opts, buf)
+    }
+    #[inline]
+    /// Assumes, without verification, that a buffer of bytes contains a AgentAction and returns it.
+    /// # Safety
+    /// Callers must trust the given bytes do indeed contain a valid `AgentAction`.
+    pub unsafe fn root_as_agent_action_unchecked(buf: &[u8]) -> AgentAction<'_> {
+        unsafe { ::flatbuffers::root_unchecked::<AgentAction>(buf) }
+    }
+    #[inline]
+    /// Assumes, without verification, that a buffer of bytes contains a size prefixed AgentAction and returns it.
+    /// # Safety
+    /// Callers must trust the given bytes do indeed contain a valid size prefixed `AgentAction`.
+    pub unsafe fn size_prefixed_root_as_agent_action_unchecked(buf: &[u8]) -> AgentAction<'_> {
+        unsafe { ::flatbuffers::size_prefixed_root_unchecked::<AgentAction>(buf) }
+    }
+    #[inline]
+    pub fn finish_agent_action_buffer<'a, 'b, A: ::flatbuffers::Allocator + 'a>(
+        fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+        root: ::flatbuffers::WIPOffset<AgentAction<'a>>,
+    ) {
+        fbb.finish(root, None);
+    }
 
-impl ::core::fmt::Debug for AgentAction<'_> {
-  fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-    let mut ds = f.debug_struct("AgentAction");
-      ds.field("agent_id", &self.agent_id());
-      ds.field("action_type", &self.action_type());
-      ds.field("target_room", &self.target_room());
-      ds.field("target_agent", &self.target_agent());
-      ds.field("content", &self.content());
-      ds.field("timestamp", &self.timestamp());
-      ds.field("tick", &self.tick());
-      ds.finish()
-  }
-}
-#[inline]
-/// Verifies that a buffer of bytes contains a `AgentAction`
-/// and returns it.
-/// Note that verification is still experimental and may not
-/// catch every error, or be maximally performant. For the
-/// previous, unchecked, behavior use
-/// `root_as_agent_action_unchecked`.
-pub fn root_as_agent_action(buf: &[u8]) -> Result<AgentAction<'_>, ::flatbuffers::InvalidFlatbuffer> {
-  ::flatbuffers::root::<AgentAction>(buf)
-}
-#[inline]
-/// Verifies that a buffer of bytes contains a size prefixed
-/// `AgentAction` and returns it.
-/// Note that verification is still experimental and may not
-/// catch every error, or be maximally performant. For the
-/// previous, unchecked, behavior use
-/// `size_prefixed_root_as_agent_action_unchecked`.
-pub fn size_prefixed_root_as_agent_action(buf: &[u8]) -> Result<AgentAction<'_>, ::flatbuffers::InvalidFlatbuffer> {
-  ::flatbuffers::size_prefixed_root::<AgentAction>(buf)
-}
-#[inline]
-/// Verifies, with the given options, that a buffer of bytes
-/// contains a `AgentAction` and returns it.
-/// Note that verification is still experimental and may not
-/// catch every error, or be maximally performant. For the
-/// previous, unchecked, behavior use
-/// `root_as_agent_action_unchecked`.
-pub fn root_as_agent_action_with_opts<'b, 'o>(
-  opts: &'o ::flatbuffers::VerifierOptions,
-  buf: &'b [u8],
-) -> Result<AgentAction<'b>, ::flatbuffers::InvalidFlatbuffer> {
-  ::flatbuffers::root_with_opts::<AgentAction<'b>>(opts, buf)
-}
-#[inline]
-/// Verifies, with the given verifier options, that a buffer of
-/// bytes contains a size prefixed `AgentAction` and returns
-/// it. Note that verification is still experimental and may not
-/// catch every error, or be maximally performant. For the
-/// previous, unchecked, behavior use
-/// `root_as_agent_action_unchecked`.
-pub fn size_prefixed_root_as_agent_action_with_opts<'b, 'o>(
-  opts: &'o ::flatbuffers::VerifierOptions,
-  buf: &'b [u8],
-) -> Result<AgentAction<'b>, ::flatbuffers::InvalidFlatbuffer> {
-  ::flatbuffers::size_prefixed_root_with_opts::<AgentAction<'b>>(opts, buf)
-}
-#[inline]
-/// Assumes, without verification, that a buffer of bytes contains a AgentAction and returns it.
-/// # Safety
-/// Callers must trust the given bytes do indeed contain a valid `AgentAction`.
-pub unsafe fn root_as_agent_action_unchecked(buf: &[u8]) -> AgentAction<'_> {
-  unsafe { ::flatbuffers::root_unchecked::<AgentAction>(buf) }
-}
-#[inline]
-/// Assumes, without verification, that a buffer of bytes contains a size prefixed AgentAction and returns it.
-/// # Safety
-/// Callers must trust the given bytes do indeed contain a valid size prefixed `AgentAction`.
-pub unsafe fn size_prefixed_root_as_agent_action_unchecked(buf: &[u8]) -> AgentAction<'_> {
-  unsafe { ::flatbuffers::size_prefixed_root_unchecked::<AgentAction>(buf) }
-}
-#[inline]
-pub fn finish_agent_action_buffer<'a, 'b, A: ::flatbuffers::Allocator + 'a>(
-    fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
-    root: ::flatbuffers::WIPOffset<AgentAction<'a>>) {
-  fbb.finish(root, None);
-}
-
-#[inline]
-pub fn finish_size_prefixed_agent_action_buffer<'a, 'b, A: ::flatbuffers::Allocator + 'a>(fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>, root: ::flatbuffers::WIPOffset<AgentAction<'a>>) {
-  fbb.finish_size_prefixed(root, None);
-}
-}  // pub mod sentinel
-
+    #[inline]
+    pub fn finish_size_prefixed_agent_action_buffer<'a, 'b, A: ::flatbuffers::Allocator + 'a>(
+        fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+        root: ::flatbuffers::WIPOffset<AgentAction<'a>>,
+    ) {
+        fbb.finish_size_prefixed(root, None);
+    }
+} // pub mod sentinel

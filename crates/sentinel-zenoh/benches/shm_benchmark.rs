@@ -423,11 +423,10 @@ fn flatbuffer_shm_roundtrip(c: &mut Criterion) {
             let payload = fb_payload.clone();
             async move {
                 bus.publish(topic, &payload).await.expect("publish");
-                let sample =
-                    tokio::time::timeout(Duration::from_millis(500), sub_ref.recv_async())
-                        .await
-                        .expect("timeout")
-                        .expect("recv");
+                let sample = tokio::time::timeout(Duration::from_millis(500), sub_ref.recv_async())
+                    .await
+                    .expect("timeout")
+                    .expect("recv");
                 let bytes = sample.payload().to_bytes();
                 let decoded = flatbuf::decode_bio_state(bytes.as_ref()).expect("decode");
                 black_box(decoded.hunger);
