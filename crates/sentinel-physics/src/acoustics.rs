@@ -93,8 +93,14 @@ mod tests {
         // 5 Agents: 10*log10(10^(30/10) + 5*10^(5/10)) = 10*log10(1000 + 5*3.16)
         // = 10*log10(1000 + 15.81) = 10*log10(1015.81) ≈ 30.07 dB
         let noise = calculate_noise_level(5, false, false, &[]);
-        assert!(noise > 30.0, "noise should be > 30 with agents, got {noise}");
-        assert!(noise < 35.0, "noise should be < 35 with 5 agents (log), got {noise}");
+        assert!(
+            noise > 30.0,
+            "noise should be > 30 with agents, got {noise}"
+        );
+        assert!(
+            noise < 35.0,
+            "noise should be < 35 with 5 agents (log), got {noise}"
+        );
     }
 
     #[test]
@@ -102,7 +108,10 @@ mod tests {
         // 10 Agents: should be around 31 dB (not 80 dB like linear)
         let noise = calculate_noise_level(10, false, false, &[]);
         assert!(noise > 30.0, "noise should be > 30, got {noise}");
-        assert!(noise < 40.0, "noise should be < 40 with 10 agents (log), got {noise}");
+        assert!(
+            noise < 40.0,
+            "noise should be < 40 with 10 agents (log), got {noise}"
+        );
     }
 
     #[test]
@@ -120,7 +129,10 @@ mod tests {
         // Nachbarraum mit 60dB: 60 - 20 (Wanddaempfung) = 40dB durchgelassen
         let noise = calculate_noise_level(0, false, false, &[60.0]);
         // 10*log10(10^(30/10) + 10^(40/10)) = 10*log10(1000 + 10000) = 10*log10(11000) ≈ 40.4
-        assert!(noise > 40.0, "adjacent 60dB room should raise noise, got {noise}");
+        assert!(
+            noise > 40.0,
+            "adjacent 60dB room should raise noise, got {noise}"
+        );
         assert!(noise < 42.0, "should be around 40.4dB, got {noise}");
     }
 
