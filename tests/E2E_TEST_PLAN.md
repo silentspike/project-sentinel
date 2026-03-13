@@ -241,10 +241,10 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 - **Erwartung:** OG (floor=1) → EG (floor=0) → Treppenhaus (floor=-1)
 - **Pruefung:** DOM-Reihenfolge der Gruppen
 
-### T4.3 — 15 Raum-Cards total [P0] [PW]
+### T4.3 — 17 Raum-Cards total [P0] [PW]
 - **Aktion:** Alle `.room-card` zaehlen
-- **Erwartung:** Exakt 15 Raeume
-- **Pruefung:** `querySelectorAll('.room-card').length === 15`
+- **Erwartung:** Exakt 17 Raeume
+- **Pruefung:** `querySelectorAll('.room-card').length === 17`
 
 ### T4.4 — Raum-Card zeigt Name [P0] [PW]
 - **Aktion:** `.room-card h4` lesen
@@ -956,10 +956,10 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 - **Erwartung:** Schicht 1: 15, Schicht 2: 15, Schicht 3: 15, Schicht 0: 9
 - **Pruefung:** Verteilung stimmt
 
-### T16.5 — rooms.toml hat 15 Raeume [P0] [CLI]
+### T16.5 — rooms.toml hat 17 Raeume [P0] [CLI]
 - **Aktion:** `config/rooms.toml` parsen, Raum-Count pruefen
-- **Erwartung:** 15 Raeume mit id, name, floor, capacity, room_type, adjacent
-- **Pruefung:** Count === 15
+- **Erwartung:** 17 Raeume mit id, name, floor, capacity, room_type, adjacent
+- **Pruefung:** Count === 17
 
 ### T16.6 — nats.conf valide [P0] [SSH]
 - **Aktion:** `ssh ubuntu@192.0.2.240 "/opt/sentinel/bin/nats-server --config /etc/nats/nats.conf -t"`
@@ -1126,9 +1126,9 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 - **Erwartung:** Tabellen `agent_live_view`, `room_live_view`, `kpi_1m` vorhanden
 - **Pruefung:** Alle 3 Tabellen in der Liste
 
-### T20a.2 — room_live_view hat 15 Raeume [P0] [SSH]
+### T20a.2 — room_live_view hat 17 Raeume [P0] [SSH]
 - **Aktion:** `ssh ubuntu@192.0.2.240 "python3 -c \"import sqlite3; c=sqlite3.connect('/opt/sentinel/data/projection.db'); print(c.execute('SELECT COUNT(*) FROM room_live_view').fetchone()[0]); c.close()\""`
-- **Erwartung:** 15 Eintraege (alle Raeume)
+- **Erwartung:** 17 Eintraege (alle Raeume)
 - **Pruefung:** Count === 15
 
 ### T20a.3 — kpi_1m wird befuellt [P0] [SSH]
