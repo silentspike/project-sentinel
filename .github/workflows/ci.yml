@@ -117,7 +117,7 @@ jobs:
       - name: Snapshot tests
         run: |
           command -v cargo-insta >/dev/null 2>&1 || cargo install cargo-insta --locked
-          cargo insta test --workspace --review=false
+          cargo insta test --workspace --check
 
       - name: Clippy (eBPF feature)
         run: cargo clippy -p sentinel-daemon -p sentinel-ebpf --features ebpf -- -D warnings
