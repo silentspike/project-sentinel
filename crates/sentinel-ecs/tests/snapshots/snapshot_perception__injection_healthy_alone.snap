@@ -1,0 +1,11 @@
+---
+source: crates/sentinel-ecs/tests/snapshot_perception.rs
+expression: injection
+---
+[SYSTEM_INJECTION]
+CIRCADIAN: 09:30 (Du arbeitest seit 2h konzentriert)
+KOERPER: Du fuehlst dich gut.
+ENVIRONMENT: Die Temperatur ist angenehm.
+AKUSTIK: Stille.
+ANWESEND: Du bist allein.
+[/SYSTEM_INJECTION]

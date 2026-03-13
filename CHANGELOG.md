@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Testing-Infrastruktur: bolero + insta** (#223)
+  - `bolero` v0.13 Property-Based Testing in sentinel-bio (3 Harnesses: hunger/energy/bladder bounds) und sentinel-physics (2 Harnesses: noise_db/co2_ppm lower bounds)
+  - `insta` v1.42 Snapshot Testing fuer Wahrnehmungs-Mappings (noise_to_text, co2_to_text) und Perception Injection Format ([SYSTEM_INJECTION] Block)
+  - Makefile Targets: `make fuzz`, `make verify`, `make snapshot-test`, `make snapshot-review`
+  - CI: Snapshot-Test Step in ci.yml rust Job
+
 - **sentinel-telemetry Criterion Benchmarks** (#34)
   - `crates/sentinel-telemetry/benches/telemetry_bench.rs`: 5 Benchmark-Gruppen (Counter, Histogram, Gauge, Registry Lookup, Snapshot) mit Criterion
   - Verifiziert Performance-Budget auf Deploy-VM: Counter ~6.5ns, Histogram ~21ns, Gauge ~5.5ns, Snapshot 36µs (< 100µs Budget)
