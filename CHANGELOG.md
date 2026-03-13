@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Raum-Anzahl Dokumentationsfehler** (#11)
+  - `.claude/rules/domain.md`: "15 Raeume" → "17 Raeume" (2 Stellen)
+  - `llms.txt`: "16 rooms" → "17 rooms"
+  - `tests/E2E_TEST_PLAN.md`: 3 Test-Cases von 15 auf 17 Raeume korrigiert (T4.3, T16.5, T20a.2)
+
 - **sentinel-telemetry dead-code Warnings** (#34)
   - `crates/sentinel-telemetry/src/export.rs`: `#[cfg(feature = "telemetry")]` Guards auf `Timestamp` Import, `TELEMETRY_HEALTH`/`TELEMETRY_METRICS` Imports und `extract_subsystem()` — eliminiert Warnings bei `--no-default-features`
 
