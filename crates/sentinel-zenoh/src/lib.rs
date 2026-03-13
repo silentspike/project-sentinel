@@ -10,6 +10,7 @@
 //! - FlatBuffer-kompatible Payloads (AC5)
 
 pub mod config;
+pub mod flatbuf;
 pub mod inflight;
 pub mod query;
 pub mod topics;
