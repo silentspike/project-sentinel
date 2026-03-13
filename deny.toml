@@ -22,6 +22,8 @@ ignore = [
     { id = "RUSTSEC-2026-0020", reason = "wasmtime 41 -> 42+ upgrade needed, separate issue" },
     { id = "RUSTSEC-2026-0021", reason = "wasmtime 41 -> 42+ upgrade needed, separate issue" },
     { id = "RUSTSEC-2026-0022", reason = "wasmtime 41 -> 42+ upgrade needed, separate issue" },
+    # Quinn DoS (RUSTSEC-2026-0037): Transitive via zenoh -> quinn. No safe upgrade yet.
+    { id = "RUSTSEC-2026-0037", reason = "transitive via zenoh, awaiting zenoh update" },
 ]
 
 # ──────────────────────────────────────────────
