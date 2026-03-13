@@ -141,7 +141,7 @@ verify: ## Formal verification via bolero kani engine (if available)
 
 snapshot-test: ## Run insta snapshot tests (CI mode, fails on mismatch)
 	@echo "=== Snapshot Tests ==="
-	cargo insta test --workspace --review=false
+	cargo insta test --workspace --check
 	@echo "Snapshot tests: OK"
 
 snapshot-review: ## Review pending insta snapshot changes
