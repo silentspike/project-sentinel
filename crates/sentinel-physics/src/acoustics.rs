@@ -1,9 +1,9 @@
-//! Akustik-Simulation: Laermpegel pro Raum
+//! Akustik-Simulation: Laermpegel pro Raum (logarithmische dB-Addition)
 
-/// Basis-Laermpegel in dB fuer leeren Raum
+/// Basis-Laermpegel in dB fuer leeren Raum (Klimaanlage, PC-Luefter)
 const BASE_NOISE_DB: f32 = 30.0;
 
-/// dB pro Agent im Raum
+/// dB-Beitrag pro Agent (einzelne Schallquelle)
 const DB_PER_AGENT: f32 = 5.0;
 
 /// Zusaetzliche dB bei Meeting
@@ -12,29 +12,58 @@ const MEETING_BONUS_DB: f32 = 10.0;
 /// Zusaetzliche dB bei Telefonat
 const PHONE_CALL_BONUS_DB: f32 = 5.0;
 
-/// Daempfung fuer Adjacent-Room-Laerm (Multiplikator)
-const ADJACENT_DAMPING: f32 = 0.3;
+/// Daempfung fuer Adjacent-Room-Laerm in dB
+const ADJACENT_WALL_DAMPING_DB: f32 = 20.0;
 
-/// Berechnet Laermpegel eines Raums in dB
+/// Konvertiert dB in lineare Leistung: 10^(db/10)
+fn db_to_power(db: f32) -> f32 {
+    10.0_f32.powf(db / 10.0)
+}
+
+/// Konvertiert lineare Leistung in dB: 10 * log10(power)
+fn power_to_db(power: f32) -> f32 {
+    if power <= 0.0 {
+        0.0
+    } else {
+        10.0 * power.log10()
+    }
+}
+
+/// Berechnet Laermpegel eines Raums in dB (logarithmische Addition)
+///
+/// Physikalisch korrekte dB-Addition: Schallquellen werden als
+/// Leistungen addiert, nicht als dB-Werte.
 pub fn calculate_noise_level(
     room_agents_count: usize,
     has_meeting: bool,
     has_phone_call: bool,
     adjacent_rooms_noise: &[f32],
 ) -> f32 {
-    let mut noise = BASE_NOISE_DB + DB_PER_AGENT * room_agents_count as f32;
-    if has_meeting {
-        noise += MEETING_BONUS_DB;
-    }
-    if has_phone_call {
-        noise += PHONE_CALL_BONUS_DB;
+    // Basis-Leistung (leerer Raum)
+    let mut total_power = db_to_power(BASE_NOISE_DB);
+
+    // Jeder Agent als separate Schallquelle
+    for _ in 0..room_agents_count {
+        total_power += db_to_power(DB_PER_AGENT);
     }
 
-    // Laerm aus Nachbarraeumen (gedaempft)
-    let adjacent_noise: f32 = adjacent_rooms_noise.iter().sum::<f32>() * ADJACENT_DAMPING
-        / adjacent_rooms_noise.len().max(1) as f32;
-    noise += adjacent_noise;
-    noise
+    // Activity-Bonus als eigene Schallquelle
+    if has_meeting {
+        total_power += db_to_power(MEETING_BONUS_DB);
+    }
+    if has_phone_call {
+        total_power += db_to_power(PHONE_CALL_BONUS_DB);
+    }
+
+    // Nachbarraum-Laerm (Wanddaempfung abziehen)
+    for &adj_db in adjacent_rooms_noise {
+        let damped = adj_db - ADJACENT_WALL_DAMPING_DB;
+        if damped > 0.0 {
+            total_power += db_to_power(damped);
+        }
+    }
+
+    power_to_db(total_power)
 }
 
 /// Mappt dB auf Wahrnehmungstext
@@ -56,27 +85,62 @@ mod tests {
     #[test]
     fn test_empty_room_base_noise() {
         let noise = calculate_noise_level(0, false, false, &[]);
-        assert_relative_eq!(noise, 30.0, epsilon = 1.0);
+        assert_relative_eq!(noise, 30.0, epsilon = 0.1);
     }
 
     #[test]
-    fn test_agents_add_noise() {
+    fn test_agents_add_noise_logarithmic() {
+        // 5 Agents: 10*log10(10^(30/10) + 5*10^(5/10)) = 10*log10(1000 + 5*3.16)
+        // = 10*log10(1000 + 15.81) = 10*log10(1015.81) ≈ 30.07 dB
         let noise = calculate_noise_level(5, false, false, &[]);
-        assert_relative_eq!(noise, 30.0 + 25.0, epsilon = 1.0);
+        assert!(
+            noise > 30.0,
+            "noise should be > 30 with agents, got {noise}"
+        );
+        assert!(
+            noise < 35.0,
+            "noise should be < 35 with 5 agents (log), got {noise}"
+        );
     }
 
     #[test]
-    fn test_meeting_and_phone_bonuses() {
-        let noise = calculate_noise_level(10, true, true, &[]);
-        // 30 + 50 (10 agents) + 10 (meeting) + 5 (phone) = 95
-        assert_relative_eq!(noise, 95.0, epsilon = 1.0);
+    fn test_many_agents_still_reasonable() {
+        // 10 Agents: should be around 31 dB (not 80 dB like linear)
+        let noise = calculate_noise_level(10, false, false, &[]);
+        assert!(noise > 30.0, "noise should be > 30, got {noise}");
+        assert!(
+            noise < 40.0,
+            "noise should be < 40 with 10 agents (log), got {noise}"
+        );
     }
 
     #[test]
-    fn test_adjacent_room_noise() {
-        // Adjacent rooms: [60.0, 50.0] → avg = 55.0, damped = 55 * 0.3 = 16.5
-        let noise = calculate_noise_level(0, false, false, &[60.0, 50.0]);
-        assert_relative_eq!(noise, 30.0 + 16.5, epsilon = 1.0);
+    fn test_meeting_adds_noise() {
+        let without = calculate_noise_level(5, false, false, &[]);
+        let with_meeting = calculate_noise_level(5, true, false, &[]);
+        assert!(
+            with_meeting > without,
+            "meeting should increase noise: {with_meeting} > {without}"
+        );
+    }
+
+    #[test]
+    fn test_adjacent_room_noise_damped() {
+        // Nachbarraum mit 60dB: 60 - 20 (Wanddaempfung) = 40dB durchgelassen
+        let noise = calculate_noise_level(0, false, false, &[60.0]);
+        // 10*log10(10^(30/10) + 10^(40/10)) = 10*log10(1000 + 10000) = 10*log10(11000) ≈ 40.4
+        assert!(
+            noise > 40.0,
+            "adjacent 60dB room should raise noise, got {noise}"
+        );
+        assert!(noise < 42.0, "should be around 40.4dB, got {noise}");
+    }
+
+    #[test]
+    fn test_adjacent_room_quiet_no_effect() {
+        // Nachbarraum mit 15dB: 15 - 20 = -5 (negativ, wird ignoriert)
+        let noise = calculate_noise_level(0, false, false, &[15.0]);
+        assert_relative_eq!(noise, 30.0, epsilon = 0.1);
     }
 
     #[test]

@@ -134,3 +134,72 @@ fn bladder_always_in_bounds() {
             );
         });
 }
+
+#[test]
+fn stress_always_in_bounds() {
+    check!()
+        .with_type::<(
+            (f32, f32, f32, f32, f32, f32, f32),
+            (f32, f32, f32, f32, f32, bool, bool, bool, bool, f32, f32),
+        )>()
+        .for_each(|(bio_vals, ctx_vals)| {
+            let mut bio = make_bio(bio_vals);
+            let (personality, work, dt_sec, sim_hour) = make_context(ctx_vals);
+
+            update_bio_state(&mut bio, &personality, &work, dt_sec, sim_hour);
+
+            assert!(
+                bio.stress >= 0.0 && bio.stress <= 100.0,
+                "stress out of bounds: {} (dt={}, sim_hour={})",
+                bio.stress,
+                dt_sec,
+                sim_hour
+            );
+        });
+}
+
+#[test]
+fn social_need_always_in_bounds() {
+    check!()
+        .with_type::<(
+            (f32, f32, f32, f32, f32, f32, f32),
+            (f32, f32, f32, f32, f32, bool, bool, bool, bool, f32, f32),
+        )>()
+        .for_each(|(bio_vals, ctx_vals)| {
+            let mut bio = make_bio(bio_vals);
+            let (personality, work, dt_sec, sim_hour) = make_context(ctx_vals);
+
+            update_bio_state(&mut bio, &personality, &work, dt_sec, sim_hour);
+
+            assert!(
+                bio.social_need >= 0.0 && bio.social_need <= 100.0,
+                "social_need out of bounds: {} (dt={}, sim_hour={})",
+                bio.social_need,
+                dt_sec,
+                sim_hour
+            );
+        });
+}
+
+#[test]
+fn caffeine_always_in_bounds() {
+    check!()
+        .with_type::<(
+            (f32, f32, f32, f32, f32, f32, f32),
+            (f32, f32, f32, f32, f32, bool, bool, bool, bool, f32, f32),
+        )>()
+        .for_each(|(bio_vals, ctx_vals)| {
+            let mut bio = make_bio(bio_vals);
+            let (personality, work, dt_sec, sim_hour) = make_context(ctx_vals);
+
+            update_bio_state(&mut bio, &personality, &work, dt_sec, sim_hour);
+
+            assert!(
+                bio.caffeine_mg >= 0.0 && bio.caffeine_mg <= 500.0,
+                "caffeine_mg out of bounds: {} (dt={}, sim_hour={})",
+                bio.caffeine_mg,
+                dt_sec,
+                sim_hour
+            );
+        });
+}

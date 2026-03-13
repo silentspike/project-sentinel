@@ -250,8 +250,8 @@ impl ControlplaneStore {
             if !incidents.is_empty() {
                 let mut table = write_txn.open_table(CONTROL_INCIDENTS)?;
                 for incident in incidents {
-                    let bytes = serde_json::to_vec(incident)
-                        .context("Incident batch serialisieren")?;
+                    let bytes =
+                        serde_json::to_vec(incident).context("Incident batch serialisieren")?;
                     table.insert(incident.id.as_str(), bytes.as_slice())?;
                 }
             }
@@ -260,8 +260,8 @@ impl ControlplaneStore {
             if !new_actions.is_empty() {
                 let mut table = write_txn.open_table(CONTROL_ACTION_LOG)?;
                 for action in new_actions {
-                    let bytes = serde_json::to_vec(action)
-                        .context("ControlAction batch serialisieren")?;
+                    let bytes =
+                        serde_json::to_vec(action).context("ControlAction batch serialisieren")?;
                     table.insert(action.id.as_str(), bytes.as_slice())?;
                 }
             }
@@ -283,8 +283,7 @@ impl ControlplaneStore {
 
             // Runtime State
             {
-                let bytes =
-                    serde_json::to_vec(state).context("RuntimeState serialisieren")?;
+                let bytes = serde_json::to_vec(state).context("RuntimeState serialisieren")?;
                 let mut table = write_txn.open_table(CONTROL_RUNTIME_STATE)?;
                 table.insert(RUNTIME_STATE_KEY, bytes.as_slice())?;
             }
