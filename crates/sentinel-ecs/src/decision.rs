@@ -85,8 +85,8 @@ fn generate_bio_events(
     queue: &mut EventQueue,
     tick: u64,
 ) {
-    // P0: Biologische Notfaelle
-    if bio.bladder > 90.0 {
+    // P0: Biologische Notfaelle (Spec: Blasendrang >95, Energie <10)
+    if bio.bladder > 95.0 {
         push_event(
             queue,
             PendingEvent {
@@ -97,7 +97,7 @@ fn generate_bio_events(
             },
         );
     }
-    if bio.energy < 15.0 {
+    if bio.energy < 10.0 {
         push_event(
             queue,
             PendingEvent {
@@ -132,7 +132,7 @@ fn generate_bio_events(
     }
 
     // P1: Dringende Bio-Signale
-    if bio.bladder > 70.0 && bio.bladder <= 90.0 {
+    if bio.bladder > 70.0 && bio.bladder <= 95.0 {
         push_event(
             queue,
             PendingEvent {
@@ -154,7 +154,7 @@ fn generate_bio_events(
             },
         );
     }
-    if bio.energy < 30.0 && bio.energy >= 15.0 {
+    if bio.energy < 30.0 && bio.energy >= 10.0 {
         push_event(
             queue,
             PendingEvent {
@@ -349,11 +349,11 @@ mod tests {
         );
     }
 
-    /// AC1: P0 bei energy < 15
+    /// AC1: P0 bei energy < 10
     #[test]
     fn test_p0_energy_emergency() {
         let mut bio = default_bio();
-        bio.energy = 10.0;
+        bio.energy = 9.0;
         let personality = default_personality();
         let mut queue = default_queue();
 
@@ -364,7 +364,7 @@ mod tests {
             .iter()
             .filter(|e| e.priority == Priority::P0)
             .collect();
-        assert!(!p0_events.is_empty(), "energy=10 muss P0 Event erzeugen");
+        assert!(!p0_events.is_empty(), "energy=9 muss P0 Event erzeugen");
         assert!(
             p0_events[0].text.contains("schwarz vor Augen"),
             "P0 Text soll 'schwarz vor Augen' enthalten"
