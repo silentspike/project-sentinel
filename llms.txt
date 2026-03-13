@@ -22,7 +22,7 @@
 
 ## Configuration
 - [config/agents](config/agents/): 54 agent personality definitions (TOML).
-- [config/rooms.toml](config/rooms.toml): Office layout (16 rooms, 2 floors, adjacency graph).
+- [config/rooms.toml](config/rooms.toml): Office layout (17 rooms, 2 floors, adjacency graph).
 - [config/simulation.toml](config/simulation.toml): Simulation parameters (tick rate, thresholds).
 - [schemas](schemas/): FlatBuffer schemas for zero-copy serialization.
 
