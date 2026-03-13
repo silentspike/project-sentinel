@@ -20,6 +20,29 @@ pub fn verify_actions(
     current_tick: u64,
 ) -> Result<VerifyStats> {
     let pending = store.get_pending_actions()?;
+    let (stats, _updated) = verify_actions_from_cache(pending, observation, current_tick);
+
+    // Legacy-Pfad: schreibt selbst (fuer bestehende Tests)
+    store.update_actions_batch(&_updated)?;
+
+    debug!(
+        verified = stats.verified,
+        expired = stats.expired,
+        rolled_back = stats.rolled_back,
+        "Verify-Phase abgeschlossen"
+    );
+    Ok(stats)
+}
+
+/// Verifiziert Actions aus einem In-Memory Cache (kein Store-Read).
+///
+/// Gibt (Stats, updated_actions) zurueck. Der Caller ist fuer die
+/// Persistierung verantwortlich (Single-Transaction in cycle()).
+pub fn verify_actions_from_cache(
+    pending: Vec<ControlAction>,
+    observation: &Observation,
+    current_tick: u64,
+) -> (VerifyStats, Vec<ControlAction>) {
     let mut stats = VerifyStats::default();
     let mut updated = Vec::new();
 
@@ -57,16 +80,13 @@ pub fn verify_actions(
         }
     }
 
-    // Batch-Write: alle geaenderten Actions in einer Transaktion persistieren
-    store.update_actions_batch(&updated)?;
-
     debug!(
         verified = stats.verified,
         expired = stats.expired,
         rolled_back = stats.rolled_back,
         "Verify-Phase abgeschlossen"
     );
-    Ok(stats)
+    (stats, updated)
 }
 
 /// Statistiken der Verify-Phase.

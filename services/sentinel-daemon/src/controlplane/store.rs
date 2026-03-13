@@ -191,6 +191,62 @@ impl ControlplaneStore {
         Ok(actions)
     }
 
+    // -- Batch Cycle Write (Single Transaction) --
+
+    /// Schreibt alle Daten eines Controlplane-Zyklus in EINER Transaktion.
+    ///
+    /// Reduziert redb I/O von 4 Transaktionen auf 1 (fsync-Kosten dominieren).
+    pub fn write_cycle_batch(
+        &self,
+        incidents: &[Incident],
+        new_actions: &[ControlAction],
+        updated_actions: &[ControlAction],
+        state: &RuntimeState,
+    ) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            // Incidents
+            if !incidents.is_empty() {
+                let mut table = write_txn.open_table(CONTROL_INCIDENTS)?;
+                for incident in incidents {
+                    let bytes = serde_json::to_vec(incident)
+                        .context("Incident batch serialisieren")?;
+                    table.insert(incident.id.as_str(), bytes.as_slice())?;
+                }
+            }
+
+            // Neue Actions (aus Act-Phase)
+            if !new_actions.is_empty() {
+                let mut table = write_txn.open_table(CONTROL_ACTION_LOG)?;
+                for action in new_actions {
+                    let bytes = serde_json::to_vec(action)
+                        .context("ControlAction batch serialisieren")?;
+                    table.insert(action.id.as_str(), bytes.as_slice())?;
+                }
+            }
+
+            // Updated Actions (aus Verify-Phase)
+            if !updated_actions.is_empty() {
+                let mut table = write_txn.open_table(CONTROL_ACTION_LOG)?;
+                for action in updated_actions {
+                    let bytes = serde_json::to_vec(action)
+                        .context("ControlAction update serialisieren")?;
+                    table.insert(action.id.as_str(), bytes.as_slice())?;
+                }
+            }
+
+            // Runtime State
+            {
+                let bytes =
+                    serde_json::to_vec(state).context("RuntimeState serialisieren")?;
+                let mut table = write_txn.open_table(CONTROL_RUNTIME_STATE)?;
+                table.insert(RUNTIME_STATE_KEY, bytes.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     // -- Config --
 
     /// Speichert einen Config-Eintrag.
