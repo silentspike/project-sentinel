@@ -241,19 +241,19 @@ async fn ac_06_05_flatbuffer_zenoh_roundtrip() {
 
     // Step 1: Encode als FlatBuffer
     let fb_bytes = flatbuf::encode_bio_state(&original);
-    assert!(flatbuf::is_flatbuffer(&fb_bytes), "Muss mit Marker beginnen");
+    assert!(
+        flatbuf::is_flatbuffer(&fb_bytes),
+        "Muss mit Marker beginnen"
+    );
 
     // Step 2: Ueber Zenoh publishen
     bus.publish(topic, &fb_bytes).await.expect("publish");
 
     // Step 3: Subscribe und empfangen
-    let sample = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        sub.recv_async(),
-    )
-    .await
-    .expect("timeout")
-    .expect("recv");
+    let sample = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv_async())
+        .await
+        .expect("timeout")
+        .expect("recv");
 
     let received_bytes = sample.payload().to_bytes();
 
@@ -262,8 +262,7 @@ async fn ac_06_05_flatbuffer_zenoh_roundtrip() {
         flatbuf::is_flatbuffer(received_bytes.as_ref()),
         "Empfangene Bytes muessen FlatBuffer sein"
     );
-    let decoded = flatbuf::decode_bio_state(received_bytes.as_ref())
-        .expect("FlatBuffer decode");
+    let decoded = flatbuf::decode_bio_state(received_bytes.as_ref()).expect("FlatBuffer decode");
 
     // Step 5: Identisches Struct
     assert_eq!(decoded.agent_id, original.agent_id);
@@ -302,16 +301,13 @@ async fn ac_06_05_flatbuffer_chaos_event_roundtrip() {
     let fb_bytes = flatbuf::encode_chaos_event(&original);
     bus.publish(topic, &fb_bytes).await.expect("publish");
 
-    let sample = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        sub.recv_async(),
-    )
-    .await
-    .expect("timeout")
-    .expect("recv");
+    let sample = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv_async())
+        .await
+        .expect("timeout")
+        .expect("recv");
 
-    let decoded = flatbuf::decode_chaos_event(sample.payload().to_bytes().as_ref())
-        .expect("decode");
+    let decoded =
+        flatbuf::decode_chaos_event(sample.payload().to_bytes().as_ref()).expect("decode");
     assert_eq!(decoded.event_type, original.event_type);
     assert_eq!(decoded.target_room, original.target_room);
     assert_eq!(decoded.description, original.description);

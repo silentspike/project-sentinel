@@ -287,8 +287,8 @@ pub fn encode_position_update(pos: &PositionUpdate) -> Vec<u8> {
 /// Decode FlatBuffer bytes (with marker prefix) into a BioStateUpdate.
 pub fn decode_bio_state(bytes: &[u8]) -> Result<BioStateUpdate> {
     let fb_bytes = strip_marker(bytes)?;
-    let bio = fb::root_as_bio_state_update(fb_bytes)
-        .context("invalid FlatBuffer: BioStateUpdate")?;
+    let bio =
+        fb::root_as_bio_state_update(fb_bytes).context("invalid FlatBuffer: BioStateUpdate")?;
     Ok(BioStateUpdate {
         agent_id: AgentId(bio.agent_id()),
         hunger: bio.hunger(),
@@ -309,8 +309,7 @@ pub fn decode_bio_state(bytes: &[u8]) -> Result<BioStateUpdate> {
 /// String in domain type). The room name is available from JSON event store.
 pub fn decode_agent_action(bytes: &[u8]) -> Result<AgentAction> {
     let fb_bytes = strip_marker(bytes)?;
-    let action = fb::root_as_agent_action(fb_bytes)
-        .context("invalid FlatBuffer: AgentAction")?;
+    let action = fb::root_as_agent_action(fb_bytes).context("invalid FlatBuffer: AgentAction")?;
     Ok(AgentAction {
         agent_id: AgentId(action.agent_id()),
         action_type: fb_to_action_type(action.action_type()),
@@ -329,8 +328,7 @@ pub fn decode_agent_action(bytes: &[u8]) -> Result<AgentAction> {
 /// Decode FlatBuffer bytes (with marker prefix) into a ChaosEvent.
 pub fn decode_chaos_event(bytes: &[u8]) -> Result<ChaosEvent> {
     let fb_bytes = strip_marker(bytes)?;
-    let chaos = fb::root_as_chaos_event(fb_bytes)
-        .context("invalid FlatBuffer: ChaosEvent")?;
+    let chaos = fb::root_as_chaos_event(fb_bytes).context("invalid FlatBuffer: ChaosEvent")?;
     Ok(ChaosEvent {
         event_type: fb_to_event_type(chaos.event_type()),
         target_room: if chaos.target_room() == 0 {
@@ -357,8 +355,7 @@ pub fn decode_chaos_event(bytes: &[u8]) -> Result<ChaosEvent> {
 /// Decode FlatBuffer bytes (with marker prefix) into a Perception.
 pub fn decode_perception(bytes: &[u8]) -> Result<Perception> {
     let fb_bytes = strip_marker(bytes)?;
-    let perc = fb::root_as_perception(fb_bytes)
-        .context("invalid FlatBuffer: Perception")?;
+    let perc = fb::root_as_perception(fb_bytes).context("invalid FlatBuffer: Perception")?;
     Ok(Perception {
         agent_id: AgentId(perc.agent_id()),
         circadian_text: perc.circadian_text().unwrap_or_default().to_string(),
@@ -375,8 +372,8 @@ pub fn decode_perception(bytes: &[u8]) -> Result<Perception> {
 /// Decode FlatBuffer bytes (with marker prefix) into a MoodUpdate.
 pub fn decode_mood_update(bytes: &[u8]) -> Result<MoodUpdate> {
     let fb_bytes = strip_marker(bytes)?;
-    let mood = flatbuffers::root::<fb::MoodUpdate>(fb_bytes)
-        .context("invalid FlatBuffer: MoodUpdate")?;
+    let mood =
+        flatbuffers::root::<fb::MoodUpdate>(fb_bytes).context("invalid FlatBuffer: MoodUpdate")?;
     Ok(MoodUpdate {
         agent_id: AgentId(mood.agent_id()),
         valence: mood.valence(),
@@ -431,10 +428,7 @@ fn encode_bio_state_from_event(event: &DomainEvent) -> Option<Vec<u8>> {
         bladder: v.get("bladder").and_then(|x| x.as_f64())? as f32,
         stress: v.get("stress").and_then(|x| x.as_f64())? as f32,
         social_need: v.get("social_need").and_then(|x| x.as_f64())? as f32,
-        comfort: v
-            .get("comfort")
-            .and_then(|x| x.as_f64())
-            .unwrap_or(0.0) as f32,
+        comfort: v.get("comfort").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
         timestamp: Timestamp(event.timestamp_ms),
         tick: Tick(event.tick),
     };
