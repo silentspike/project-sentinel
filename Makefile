@@ -1,6 +1,6 @@
 .PHONY: help lint lint-all test build build-rust build-go build-dashboard \
        fmt check clean hooks ci deny coverage typos doc machete safe-merge \
-       manifest preflight smoke-test deploy
+       manifest preflight smoke-test deploy fuzz verify snapshot-test snapshot-review
 
 # Default target
 help: ## Show this help
@@ -123,6 +123,29 @@ machete: ## Find unused Rust dependencies
 bench: ## Run benchmarks
 	cargo bench --workspace
 	@echo "Benchmarks: DONE"
+
+# ──────────────────────────────────────────────
+# Property-Based / Snapshot Testing
+# ──────────────────────────────────────────────
+
+fuzz: ## Run bolero fuzzing (requires cargo-bolero)
+	@echo "=== Bolero Fuzzing (sentinel-bio) ==="
+	cargo bolero test -p sentinel-bio --all-targets --time 60
+	@echo "=== Bolero Fuzzing (sentinel-physics) ==="
+	cargo bolero test -p sentinel-physics --all-targets --time 60
+	@echo "Fuzzing: DONE (60s per crate)"
+
+verify: ## Formal verification via bolero kani engine (if available)
+	@command -v cargo-kani >/dev/null 2>&1 && cargo kani --workspace \
+		|| echo "WARN: cargo-kani not installed. Install with: cargo install --locked kani-verifier && cargo kani setup"
+
+snapshot-test: ## Run insta snapshot tests (CI mode, fails on mismatch)
+	@echo "=== Snapshot Tests ==="
+	cargo insta test --workspace --check
+	@echo "Snapshot tests: OK"
+
+snapshot-review: ## Review pending insta snapshot changes
+	cargo insta review
 
 # ──────────────────────────────────────────────
 # Setup
