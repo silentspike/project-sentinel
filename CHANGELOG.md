@@ -9,9 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Controlplane-Zyklus Latenz: 872ms → <50ms** (#227)
-  - Root Cause: 4 separate redb Write-Transaktionen pro Zyklus (je ~150ms fsync)
+- **Controlplane-Zyklus Latenz: 872ms → <200ms** (#227)
+  - Root Cause 1: 4 separate redb Write-Transaktionen pro Zyklus (je ~150ms fsync)
+  - Root Cause 2: 750k+ Terminal-State Actions in ACTION_LOG Tabelle (full table scan bei jedem Zyklus)
   - Fix: Single-Transaction via `write_cycle_batch()` — alle Incidents, Actions, State in einem Commit
+  - Fix: Garbage Collection — Terminal Actions (Verified/Expired/RolledBack) werden geloescht statt behalten
+  - Startup-GC bereinigt historische Altlasten, per-Cycle-GC haelt Tabelle kompakt
+  - `ActionStatus::is_terminal()` Methode fuer GC-Entscheidung
   - `execute_actions_no_store()` fuer in-memory Action-Execution ohne I/O
   - `verify_actions_from_cache()` fuer Store-unabhaengige Verification
   - Per-Phase Timing in debug-Log: observe_ms, decide_ms, act_ms, verify_ms, store_ms

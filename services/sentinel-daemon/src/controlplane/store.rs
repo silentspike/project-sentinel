@@ -191,6 +191,47 @@ impl ControlplaneStore {
         Ok(actions)
     }
 
+    // -- Garbage Collection --
+
+    /// Entfernt alle Actions in Terminal-States aus der Tabelle.
+    ///
+    /// Wird einmalig beim Kernel-Start aufgerufen um historische
+    /// Altlasten zu bereinigen. Danach haelt write_cycle_batch()
+    /// die Tabelle inkrementell sauber.
+    pub fn gc_terminal_actions(&self) -> Result<usize> {
+        // Erst lesen, dann loeschen (redb erlaubt kein Mutieren waehrend Iteration)
+        let ids_to_remove: Vec<String> = {
+            let read_txn = self.db.begin_read()?;
+            let table = read_txn.open_table(CONTROL_ACTION_LOG)?;
+            let mut ids = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                let action: ControlAction = serde_json::from_slice(value.value())?;
+                if action.status.is_terminal() {
+                    ids.push(key.value().to_string());
+                }
+            }
+            ids
+        };
+
+        if ids_to_remove.is_empty() {
+            return Ok(0);
+        }
+
+        let count = ids_to_remove.len();
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(CONTROL_ACTION_LOG)?;
+            for id in &ids_to_remove {
+                table.remove(id.as_str())?;
+            }
+        }
+        write_txn.commit()?;
+
+        debug!(removed = count, "Terminal Actions bereinigt (GC)");
+        Ok(count)
+    }
+
     // -- Batch Cycle Write (Single Transaction) --
 
     /// Schreibt alle Daten eines Controlplane-Zyklus in EINER Transaktion.
@@ -225,13 +266,18 @@ impl ControlplaneStore {
                 }
             }
 
-            // Updated Actions (aus Verify-Phase)
+            // Updated Actions (aus Verify-Phase): Terminal-State Actions loeschen,
+            // nicht-terminale updaten. Haelt die Tabelle klein fuer schnelles Scannen.
             if !updated_actions.is_empty() {
                 let mut table = write_txn.open_table(CONTROL_ACTION_LOG)?;
                 for action in updated_actions {
-                    let bytes = serde_json::to_vec(action)
-                        .context("ControlAction update serialisieren")?;
-                    table.insert(action.id.as_str(), bytes.as_slice())?;
+                    if action.status.is_terminal() {
+                        table.remove(action.id.as_str())?;
+                    } else {
+                        let bytes = serde_json::to_vec(action)
+                            .context("ControlAction update serialisieren")?;
+                        table.insert(action.id.as_str(), bytes.as_slice())?;
+                    }
                 }
             }
 
