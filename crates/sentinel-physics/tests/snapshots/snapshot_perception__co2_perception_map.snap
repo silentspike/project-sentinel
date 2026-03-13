@@ -1,0 +1,12 @@
+---
+source: crates/sentinel-physics/tests/snapshot_perception.rs
+expression: output
+---
+    400 ppm => Frische Luft
+    599 ppm => Frische Luft
+    600 ppm => Normale Raumluft
+    999 ppm => Normale Raumluft
+   1000 ppm => Es wird stickig
+   1499 ppm => Es wird stickig
+   1500 ppm => Kopfschmerzen und Schwindel
+   2000 ppm => Kopfschmerzen und Schwindel
