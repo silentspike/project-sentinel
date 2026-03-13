@@ -64,12 +64,12 @@ fn ac_09_02_spawn_agent_10_components() {
     assert_eq!(shift.shift_end_hour, 14);
 }
 
-// ── #9 AC4: SimulationPhase hat 9 Varianten in korrekter Reihenfolge ──
+// ── #9 AC4: SimulationPhase hat 10 Varianten in korrekter Reihenfolge ──
 
-/// AC #9.4: SimulationPhase enum hat 9 Varianten in korrekter Reihenfolge
+/// AC #9.4: SimulationPhase enum hat 10 Varianten in korrekter Reihenfolge
 #[test]
 fn ac_09_04_system_execution_order() {
-    // Alle 9 Varianten muessen existieren und kompilieren
+    // Alle 10 Varianten muessen existieren und kompilieren
     let phases = [
         SimulationPhase::Input,
         SimulationPhase::Biology,
@@ -78,13 +78,14 @@ fn ac_09_04_system_execution_order() {
         SimulationPhase::Chaos,
         SimulationPhase::Mood,
         SimulationPhase::Perception,
+        SimulationPhase::Decision,
         SimulationPhase::Output,
         SimulationPhase::Persist,
     ];
     assert_eq!(
         phases.len(),
-        9,
-        "SimulationPhase must have exactly 9 variants"
+        10,
+        "SimulationPhase must have exactly 10 variants"
     );
 
     // Varianten muessen unterschiedlich sein (PartialEq)

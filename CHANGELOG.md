@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Nacharbeit aus Verification Findings** (#9, #10, #12, #54)
+  - #9: `ac_09_04` Test zaehlt jetzt alle 10 SimulationPhases (Decision fehlte)
+  - #10: 3 neue bolero Property-Tests (stress, social_need, caffeine) — alle 6 Bio-Variablen abgedeckt
+  - #12: `calculate_noise_level()` nutzt logarithmische dB-Addition statt linearer (physikalisch korrekt)
+  - #54: P0-Thresholds an Spec angepasst (bladder >95 statt >90, energy <10 statt <15)
+
 - **Controlplane-Zyklus Latenz: 872ms → <200ms** (#227)
   - Root Cause 1: 4 separate redb Write-Transaktionen pro Zyklus (je ~150ms fsync)
   - Root Cause 2: 750k+ Terminal-State Actions in ACTION_LOG Tabelle (full table scan bei jedem Zyklus)
