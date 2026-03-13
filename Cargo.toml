@@ -45,6 +45,8 @@ anyhow = "1"
 toml = "1.0"
 approx = "0.5"
 criterion = { version = "0.8", features = ["html_reports"] }
+bolero = "0.13"
+insta = { version = "1.42", features = ["yaml"] }
 sha2 = "0.10"
 blake3 = "1"
 rayon = "1"

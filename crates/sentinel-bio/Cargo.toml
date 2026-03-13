@@ -10,3 +10,4 @@ sentinel-common = { path = "../sentinel-common" }
 
 [dev-dependencies]
 approx = { workspace = true }
+bolero = { workspace = true }

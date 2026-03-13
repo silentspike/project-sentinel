@@ -1,0 +1,14 @@
+---
+source: crates/sentinel-physics/tests/snapshot_perception.rs
+expression: output
+---
+  30.0 dB => Angenehme Stille
+  34.9 dB => Angenehme Stille
+  35.0 dB => Normales Buerogeraeusch
+  49.9 dB => Normales Buerogeraeusch
+  50.0 dB => Lebhafte Unterhaltungen
+  64.9 dB => Lebhafte Unterhaltungen
+  65.0 dB => Es ist laut
+  79.9 dB => Es ist laut
+  80.0 dB => Unertraeglicher Laerm
+ 100.0 dB => Unertraeglicher Laerm
