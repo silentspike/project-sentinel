@@ -58,6 +58,12 @@ impl ControlplaneKernel {
         let config_json = serde_json::to_vec(&config)?;
         store.set_config("active_config", &config_json)?;
 
+        // GC: Historische Terminal-Actions entfernen (Altlast-Bereinigung)
+        let gc_count = store.gc_terminal_actions()?;
+        if gc_count > 0 {
+            info!(removed = gc_count, "Startup GC: Terminal Actions bereinigt");
+        }
+
         info!(
             cycle_interval = config.cycle_interval_ticks,
             guarded_mode = config.guarded_mode,
