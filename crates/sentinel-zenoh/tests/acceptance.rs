@@ -213,6 +213,108 @@ fn ac_06_05_payload_roundtrip() {
     assert_eq!(deserialized.tick, sentinel_common::Tick(42));
 }
 
+/// AC 6.5 (FlatBuffer roundtrip): encode → Zenoh publish → subscribe → decode = identisches Struct
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac_06_05_flatbuffer_zenoh_roundtrip() {
+    use sentinel_common::{AgentId, BioStateUpdate, Tick, Timestamp};
+    use sentinel_zenoh::flatbuf;
+
+    let bus = SentinelBus::new().await.expect("Bus erstellen");
+    let topic = "sentinel/test/flatbuffer_roundtrip";
+    let sub = bus.subscribe(topic).await.expect("subscribe");
+
+    // Subscription-Propagation abwarten
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let original = BioStateUpdate {
+        agent_id: AgentId(7),
+        hunger: 45.5,
+        energy: 72.0,
+        caffeine_mg: 95.0,
+        bladder: 30.0,
+        stress: 55.0,
+        social_need: 20.0,
+        comfort: 80.0,
+        timestamp: Timestamp(2000),
+        tick: Tick(100),
+    };
+
+    // Step 1: Encode als FlatBuffer
+    let fb_bytes = flatbuf::encode_bio_state(&original);
+    assert!(
+        flatbuf::is_flatbuffer(&fb_bytes),
+        "Muss mit Marker beginnen"
+    );
+
+    // Step 2: Ueber Zenoh publishen
+    bus.publish(topic, &fb_bytes).await.expect("publish");
+
+    // Step 3: Subscribe und empfangen
+    let sample = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv_async())
+        .await
+        .expect("timeout")
+        .expect("recv");
+
+    let received_bytes = sample.payload().to_bytes();
+
+    // Step 4: Decode
+    assert!(
+        flatbuf::is_flatbuffer(received_bytes.as_ref()),
+        "Empfangene Bytes muessen FlatBuffer sein"
+    );
+    let decoded = flatbuf::decode_bio_state(received_bytes.as_ref()).expect("FlatBuffer decode");
+
+    // Step 5: Identisches Struct
+    assert_eq!(decoded.agent_id, original.agent_id);
+    assert!((decoded.hunger - original.hunger).abs() < f32::EPSILON);
+    assert!((decoded.energy - original.energy).abs() < f32::EPSILON);
+    assert!((decoded.caffeine_mg - original.caffeine_mg).abs() < f32::EPSILON);
+    assert!((decoded.bladder - original.bladder).abs() < f32::EPSILON);
+    assert!((decoded.stress - original.stress).abs() < f32::EPSILON);
+    assert!((decoded.social_need - original.social_need).abs() < f32::EPSILON);
+    assert!((decoded.comfort - original.comfort).abs() < f32::EPSILON);
+    assert_eq!(decoded.timestamp, original.timestamp);
+    assert_eq!(decoded.tick, original.tick);
+}
+
+/// AC 6.5 (FlatBuffer roundtrip): ChaosEvent encode → Zenoh → decode = identisches Struct
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac_06_05_flatbuffer_chaos_event_roundtrip() {
+    use sentinel_common::{ChaosEvent, EventType, RoomId, Tick, Timestamp};
+    use sentinel_zenoh::flatbuf;
+
+    let bus = SentinelBus::new().await.expect("Bus erstellen");
+    let topic = "sentinel/test/flatbuffer_chaos_roundtrip";
+    let sub = bus.subscribe(topic).await.expect("subscribe");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let original = ChaosEvent {
+        event_type: EventType::PrinterBroken,
+        target_room: Some(RoomId(5)),
+        target_agent: None,
+        description: "Drucker zeigt Papierstau an".to_string(),
+        duration_minutes: Some(30),
+        timestamp: Timestamp(5000),
+        tick: Tick(200),
+    };
+
+    let fb_bytes = flatbuf::encode_chaos_event(&original);
+    bus.publish(topic, &fb_bytes).await.expect("publish");
+
+    let sample = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv_async())
+        .await
+        .expect("timeout")
+        .expect("recv");
+
+    let decoded =
+        flatbuf::decode_chaos_event(sample.payload().to_bytes().as_ref()).expect("decode");
+    assert_eq!(decoded.event_type, original.event_type);
+    assert_eq!(decoded.target_room, original.target_room);
+    assert_eq!(decoded.description, original.description);
+    assert_eq!(decoded.duration_minutes, original.duration_minutes);
+    assert_eq!(decoded.tick, original.tick);
+}
+
 /// BusConfig Defaults stimmen mit Issue-Anforderungen ueberein
 #[test]
 fn config_defaults_match_issue_requirements() {

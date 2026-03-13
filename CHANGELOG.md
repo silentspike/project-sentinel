@@ -11,16 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Zenoh SHM Core-Bus Integration** (#6)
   - `services/sentinel-daemon/src/orchestrator.rs`: Shared `SentinelBus` Instanz im Daemon, verteilt an alle Subsysteme
-  - `services/sentinel-daemon/src/fanout.rs`: Event Fan-Out Bridge — Events nach Limbo-Write auf Zenoh Topics publizieren
+  - `services/sentinel-daemon/src/fanout.rs`: Event Fan-Out Bridge — Events nach Limbo-Write auf Zenoh Topics publizieren (FlatBuffer mit JSON-Fallback)
   - `services/sentinel-daemon/src/query_responder.rs`: Scoped Query Responder — beantwortet Queries ueber Zenoh mit redb State
   - `services/sentinel-daemon/src/ebpf.rs`: `ebpf_publisher` nimmt shared `SentinelBus` statt eigener Instanz
   - `crates/sentinel-ecs/src/world.rs`: Neue `ZenohFanoutSender` ECS Resource
   - `crates/sentinel-ecs/src/systems.rs`: `persist_system` sendet Events nach Limbo-Write an Zenoh Fan-Out
   - `crates/sentinel-zenoh/src/config.rs`: 3 neue Config-Felder (`shm_buffer_size_bytes`, `fanout_channel_capacity`, `query_responder_enabled`)
-  - `crates/sentinel-zenoh/benches/shm_benchmark.rs`: 6 Criterion Benchmarks (Latenz, Throughput, Concurrency, Fanout, Query, Buffer Sizing)
+  - `crates/sentinel-zenoh/src/flatbuf.rs`: FlatBuffer encode/decode fuer 6 Typen (BioStateUpdate, AgentAction, ChaosEvent, Perception, MoodUpdate, PositionUpdate) mit Zero-Copy SHM Transport
+  - `crates/sentinel-zenoh/benches/shm_benchmark.rs`: 9 Criterion Benchmarks (Latenz, Throughput, Concurrency, Fanout, Query, Buffer Sizing, FlatBuffer encode/decode, JSON vs FlatBuffer, FlatBuffer SHM Roundtrip)
+  - `crates/sentinel-zenoh/tests/acceptance.rs`: FlatBuffer Zenoh Roundtrip Tests (BioStateUpdate + ChaosEvent encode → publish → subscribe → decode)
   - `services/sentinel-daemon/src/config.rs`: TOML-basierte `ZenohConfig` Sektion mit ENV-Override-Pattern (ENV > TOML > Hardcoded Default)
   - `config/daemon.toml`: `[daemon.zenoh]` Sektion mit SHM, Fanout, Query Responder Konfiguration
   - `crates/sentinel-zenoh/examples/query_test.rs`: Diagnose-Tool fuer Scoped Query Verifizierung
+  - `crates/sentinel-common/src/generated/`: FlatBuffer-generierter Rust-Code aus 4 .fbs Schemas (action, event, perception, state)
 
 ### Fixed
 

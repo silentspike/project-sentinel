@@ -24,27 +24,32 @@ pub async fn zenoh_fanout_task(bus: SentinelBus, mut rx: tokio::sync::mpsc::Rece
             None => continue, // Event-Typ nicht fuer Fan-Out vorgesehen
         };
 
-        match serde_json::to_vec(&event) {
-            Ok(payload) => {
-                if let Err(e) = bus.publish(&topic, &payload).await {
-                    error_count += 1;
-                    if error_count <= 10 || error_count.is_power_of_two() {
-                        warn!(
-                            error = %e,
-                            topic,
-                            error_count,
-                            "Zenoh fanout publish failed"
-                        );
-                    }
-                } else {
-                    publish_count += 1;
-                    if publish_count.is_power_of_two() && publish_count <= 1024 {
-                        tracing::debug!(publish_count, topic, "Zenoh fanout milestone");
-                    }
+        // FlatBuffer encoding if schema available, JSON fallback otherwise
+        let payload = match sentinel_zenoh::flatbuf::encode_domain_event(&event) {
+            Some(fb_bytes) => fb_bytes,
+            None => match serde_json::to_vec(&event) {
+                Ok(json) => json,
+                Err(e) => {
+                    warn!(error = %e, event_type = %event.event_type, "Zenoh fanout serialization failed");
+                    continue;
                 }
+            },
+        };
+
+        if let Err(e) = bus.publish(&topic, &payload).await {
+            error_count += 1;
+            if error_count <= 10 || error_count.is_power_of_two() {
+                warn!(
+                    error = %e,
+                    topic,
+                    error_count,
+                    "Zenoh fanout publish failed"
+                );
             }
-            Err(e) => {
-                warn!(error = %e, event_type = %event.event_type, "Zenoh fanout serialization failed");
+        } else {
+            publish_count += 1;
+            if publish_count.is_power_of_two() && publish_count <= 1024 {
+                tracing::debug!(publish_count, topic, "Zenoh fanout milestone");
             }
         }
     }
