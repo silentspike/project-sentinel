@@ -91,6 +91,13 @@ pub enum ActionStatus {
     Expired,
 }
 
+impl ActionStatus {
+    /// Terminal States werden aus der Action-Tabelle entfernt (GC).
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Verified | Self::RolledBack | Self::Expired)
+    }
+}
+
 /// Ergebnis der Verify-Phase.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyOutcome {
