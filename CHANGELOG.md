@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Controlplane-Zyklus Latenz: 872ms → <50ms** (#227)
+  - Root Cause: 4 separate redb Write-Transaktionen pro Zyklus (je ~150ms fsync)
+  - Fix: Single-Transaction via `write_cycle_batch()` — alle Incidents, Actions, State in einem Commit
+  - `execute_actions_no_store()` fuer in-memory Action-Execution ohne I/O
+  - `verify_actions_from_cache()` fuer Store-unabhaengige Verification
+  - Per-Phase Timing in debug-Log: observe_ms, decide_ms, act_ms, verify_ms, store_ms
+
 ### Added
 
 - **Testing-Infrastruktur: bolero + insta** (#223)

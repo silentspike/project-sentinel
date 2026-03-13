@@ -14,6 +14,24 @@ use super::types::{ActionStatus, ControlAction, ControlActionType};
 /// Actions werden sequentiell ausgefuehrt. Bei Fehler wird die
 /// Action als `Pending` belassen (retry im naechsten Zyklus).
 pub fn execute_actions(actions: &mut [ControlAction], store: &ControlplaneStore) -> Result<usize> {
+    let executed_count = execute_actions_no_store(actions)?;
+
+    // Batch-Write: alle ausgefuehrten Actions in einer Transaktion persistieren
+    let executed: Vec<_> = actions
+        .iter()
+        .filter(|a| a.status == ActionStatus::Executed)
+        .cloned()
+        .collect();
+    store.log_actions_batch(&executed)?;
+
+    Ok(executed_count)
+}
+
+/// Fuehrt Actions in-memory aus OHNE Store-Write.
+///
+/// Fuer den Single-Transaction-Pfad: cycle() sammelt alle Writes
+/// und persistiert sie in einer einzigen redb-Transaktion.
+pub fn execute_actions_no_store(actions: &mut [ControlAction]) -> Result<usize> {
     let mut executed_count = 0;
 
     for action in actions.iter_mut() {
@@ -31,14 +49,6 @@ pub fn execute_actions(actions: &mut [ControlAction], store: &ControlplaneStore)
             }
         }
     }
-
-    // Batch-Write: alle ausgefuehrten Actions in einer Transaktion persistieren
-    let executed: Vec<_> = actions
-        .iter()
-        .filter(|a| a.status == ActionStatus::Executed)
-        .cloned()
-        .collect();
-    store.log_actions_batch(&executed)?;
 
     debug!(
         total = actions.len(),
