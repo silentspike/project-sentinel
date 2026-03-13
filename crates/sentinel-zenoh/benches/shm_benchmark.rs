@@ -4,6 +4,8 @@
 //! NUR auf Deploy-VM (192.0.2.240) ausfuehren — NIEMALS auf cargo remote oder lokal!
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use sentinel_common::{AgentId, BioStateUpdate, ChaosEvent, EventType, RoomId, Tick, Timestamp};
+use sentinel_zenoh::flatbuf;
 use sentinel_zenoh::SentinelBus;
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -269,6 +271,173 @@ fn shm_buffer_sizing(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark 7: FlatBuffer encode + decode (ohne Zenoh, reine Serialisierung).
+fn flatbuffer_encode_decode(c: &mut Criterion) {
+    let bio = BioStateUpdate {
+        agent_id: AgentId(7),
+        hunger: 45.5,
+        energy: 72.0,
+        caffeine_mg: 95.0,
+        bladder: 30.0,
+        stress: 55.0,
+        social_need: 20.0,
+        comfort: 80.0,
+        timestamp: Timestamp(2000),
+        tick: Tick(100),
+    };
+
+    let chaos = ChaosEvent {
+        event_type: EventType::PrinterBroken,
+        target_room: Some(RoomId(5)),
+        target_agent: None,
+        description: "Drucker zeigt Papierstau an".to_string(),
+        duration_minutes: Some(30),
+        timestamp: Timestamp(5000),
+        tick: Tick(200),
+    };
+
+    let mut group = c.benchmark_group("flatbuffer_encode_decode");
+    group.measurement_time(Duration::from_secs(5));
+
+    group.bench_function("bio_state_encode", |b| {
+        b.iter(|| black_box(flatbuf::encode_bio_state(black_box(&bio))))
+    });
+
+    let bio_bytes = flatbuf::encode_bio_state(&bio);
+    group.bench_function("bio_state_decode", |b| {
+        b.iter(|| black_box(flatbuf::decode_bio_state(black_box(&bio_bytes)).unwrap()))
+    });
+
+    group.bench_function("bio_state_roundtrip", |b| {
+        b.iter(|| {
+            let bytes = flatbuf::encode_bio_state(black_box(&bio));
+            black_box(flatbuf::decode_bio_state(&bytes).unwrap())
+        })
+    });
+
+    group.bench_function("chaos_event_encode", |b| {
+        b.iter(|| black_box(flatbuf::encode_chaos_event(black_box(&chaos))))
+    });
+
+    let chaos_bytes = flatbuf::encode_chaos_event(&chaos);
+    group.bench_function("chaos_event_decode", |b| {
+        b.iter(|| black_box(flatbuf::decode_chaos_event(black_box(&chaos_bytes)).unwrap()))
+    });
+
+    group.finish();
+}
+
+/// Benchmark 8: JSON vs FlatBuffer Encode-Vergleich.
+fn json_vs_flatbuffer_encode(c: &mut Criterion) {
+    let bio = BioStateUpdate {
+        agent_id: AgentId(7),
+        hunger: 45.5,
+        energy: 72.0,
+        caffeine_mg: 95.0,
+        bladder: 30.0,
+        stress: 55.0,
+        social_need: 20.0,
+        comfort: 80.0,
+        timestamp: Timestamp(2000),
+        tick: Tick(100),
+    };
+
+    let mut group = c.benchmark_group("json_vs_flatbuffer");
+    group.measurement_time(Duration::from_secs(5));
+
+    group.bench_function("json_encode", |b| {
+        b.iter(|| black_box(serde_json::to_vec(black_box(&bio)).unwrap()))
+    });
+
+    group.bench_function("flatbuffer_encode", |b| {
+        b.iter(|| black_box(flatbuf::encode_bio_state(black_box(&bio))))
+    });
+
+    // Decode-Vergleich
+    let json_bytes = serde_json::to_vec(&bio).unwrap();
+    let fb_bytes = flatbuf::encode_bio_state(&bio);
+
+    group.bench_function("json_decode", |b| {
+        b.iter(|| {
+            black_box(serde_json::from_slice::<BioStateUpdate>(black_box(&json_bytes)).unwrap())
+        })
+    });
+
+    group.bench_function("flatbuffer_decode", |b| {
+        b.iter(|| black_box(flatbuf::decode_bio_state(black_box(&fb_bytes)).unwrap()))
+    });
+
+    group.finish();
+}
+
+/// Benchmark 9: FlatBuffer-Payload durch Zenoh SHM Pub/Sub Roundtrip.
+///
+/// Dies ist der EIGENTLICHE AC-1 Beweis: p99 Roundtrip < 200us.
+fn flatbuffer_shm_roundtrip(c: &mut Criterion) {
+    let rt = bench_runtime();
+    let bus = rt
+        .block_on(SentinelBus::new())
+        .expect("Bus fuer FB roundtrip");
+
+    let bio = BioStateUpdate {
+        agent_id: AgentId(7),
+        hunger: 45.5,
+        energy: 72.0,
+        caffeine_mg: 95.0,
+        bladder: 30.0,
+        stress: 55.0,
+        social_need: 20.0,
+        comfort: 80.0,
+        timestamp: Timestamp(2000),
+        tick: Tick(100),
+    };
+    let fb_payload = flatbuf::encode_bio_state(&bio);
+    let topic = "sentinel/bench/fb_roundtrip/state";
+
+    let sub = rt.block_on(bus.subscribe(topic)).expect("subscribe");
+
+    // Warmup
+    rt.block_on(async {
+        for attempt in 0..5 {
+            std::thread::sleep(Duration::from_millis(100));
+            bus.publish(topic, &fb_payload).await.expect("warmup pub");
+            match tokio::time::timeout(Duration::from_millis(500), sub.recv_async()).await {
+                Ok(Ok(_)) => break,
+                _ => {
+                    if attempt == 4 {
+                        panic!("FB roundtrip warmup failed");
+                    }
+                }
+            }
+        }
+    });
+
+    let mut group = c.benchmark_group("flatbuffer_shm_roundtrip");
+    group.measurement_time(Duration::from_secs(10));
+    group.sample_size(1000);
+
+    group.bench_function("bio_state_pub_sub_decode", |b| {
+        b.to_async(&rt).iter(|| {
+            let bus = bus.clone();
+            let sub_ref = &sub;
+            let payload = fb_payload.clone();
+            async move {
+                bus.publish(topic, &payload).await.expect("publish");
+                let sample =
+                    tokio::time::timeout(Duration::from_millis(500), sub_ref.recv_async())
+                        .await
+                        .expect("timeout")
+                        .expect("recv");
+                let bytes = sample.payload().to_bytes();
+                let decoded = flatbuf::decode_bio_state(bytes.as_ref()).expect("decode");
+                black_box(decoded.hunger);
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     shm_pub_sub_latency,
@@ -277,5 +446,8 @@ criterion_group!(
     shm_fanout_overhead,
     shm_query_roundtrip,
     shm_buffer_sizing,
+    flatbuffer_encode_decode,
+    json_vs_flatbuffer_encode,
+    flatbuffer_shm_roundtrip,
 );
 criterion_main!(benches);
