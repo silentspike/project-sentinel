@@ -21,7 +21,10 @@ fn ac_12_02_acoustics() {
     // 5 Agents: logarithmisch addiert, ~30.07dB (NICHT 55dB wie linear)
     let noise_5 = calculate_noise_level(5, false, false, &[]);
     assert!(noise_5 > 30.0, "5 agents should raise noise, got {noise_5}");
-    assert!(noise_5 < 35.0, "5 agents logarithmic should stay < 35dB, got {noise_5}");
+    assert!(
+        noise_5 < 35.0,
+        "5 agents logarithmic should stay < 35dB, got {noise_5}"
+    );
 }
 
 // ── #12 AC3: Temperatur ──
