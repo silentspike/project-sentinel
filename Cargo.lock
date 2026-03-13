@@ -4362,6 +4362,7 @@ dependencies = [
 name = "sentinel-telemetry"
 version = "0.1.0"
 dependencies = [
+ "criterion 0.5.1",
  "sentinel-common",
  "serde",
  "serde_json",

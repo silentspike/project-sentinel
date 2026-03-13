@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sentinel-telemetry Criterion Benchmarks** (#34)
+  - `crates/sentinel-telemetry/benches/telemetry_bench.rs`: 5 Benchmark-Gruppen (Counter, Histogram, Gauge, Registry Lookup, Snapshot) mit Criterion
+  - Verifiziert Performance-Budget auf Deploy-VM: Counter ~6.5ns, Histogram ~21ns, Gauge ~5.5ns, Snapshot 36µs (< 100µs Budget)
+
+### Fixed
+
+- **sentinel-telemetry dead-code Warnings** (#34)
+  - `crates/sentinel-telemetry/src/export.rs`: `#[cfg(feature = "telemetry")]` Guards auf `Timestamp` Import, `TELEMETRY_HEALTH`/`TELEMETRY_METRICS` Imports und `extract_subsystem()` — eliminiert Warnings bei `--no-default-features`
+
 - **Zenoh SHM Core-Bus Integration** (#6)
   - `services/sentinel-daemon/src/orchestrator.rs`: Shared `SentinelBus` Instanz im Daemon, verteilt an alle Subsysteme
   - `services/sentinel-daemon/src/fanout.rs`: Event Fan-Out Bridge — Events nach Limbo-Write auf Zenoh Topics publizieren (FlatBuffer mit JSON-Fallback)
