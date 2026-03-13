@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 bevy_ecs = { workspace = true }
+flatbuffers = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
