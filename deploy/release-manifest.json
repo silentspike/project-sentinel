@@ -160,6 +160,24 @@
       "type": "systemd"
     },
     {
+      "path": "/etc/systemd/system/sentinel-health-monitor.service",
+      "source": "deploy/systemd/sentinel-health-monitor.service",
+      "sha256": "237e9fc0047932f8b3b23946606228af7f71785456aa3669fe1848e4b828df98",
+      "type": "systemd"
+    },
+    {
+      "path": "/etc/systemd/system/sentinel-health-monitor.timer",
+      "source": "deploy/systemd/sentinel-health-monitor.timer",
+      "sha256": "a2d5bba97f39ea0c9a9800db91e2aca1aa4b7a29a148a888cbda83577c6c9368",
+      "type": "systemd"
+    },
+    {
+      "path": "/etc/systemd/system/sentinel-agent@.service",
+      "source": "deploy/systemd/sentinel-agent@.service",
+      "sha256": "9676c608c7f507ea8144993ceba6a63646ca3c861ff4e5ba47b388e3e78421e1",
+      "type": "systemd"
+    },
+    {
       "path": "/opt/sentinel/scripts/init-cgroups.sh",
       "source": "deploy/scripts/init-cgroups.sh",
       "sha256": "e078f7f9059cdeb7727f9393910f617f682e1f0d9707db1de55e3d75b504ee33",
