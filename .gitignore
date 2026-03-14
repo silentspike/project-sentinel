@@ -83,6 +83,7 @@ bitnet/bitnet-inference
 
 # Docs (local-only, not for Git)
 docs/
+!docs/security-test-report.md
 
 # Evidence screenshots (binary, not for Git)
 /evidence-*.png
