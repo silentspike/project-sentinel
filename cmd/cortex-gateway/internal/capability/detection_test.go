@@ -224,6 +224,48 @@ func TestListCapabilities_OpenAI(t *testing.T) {
 	}
 }
 
+func TestHasCapability_ClaudeCode_AllCapabilities(t *testing.T) {
+	pc := New()
+
+	expected := map[Capability]bool{
+		CapStreaming:    true,
+		CapToolUse:      true,
+		CapVision:       true,
+		CapSystemPrompt: true,
+		CapJSONMode:     true,
+		CapFunctionCall: true,
+		CapCaching:      false,
+		CapPredictedOut: false,
+		CapKVRetention:  false,
+	}
+
+	for cap, want := range expected {
+		got := pc.HasCapability("claude-code", cap)
+		if got != want {
+			t.Errorf("claude-code %s = %v, want %v", cap, got, want)
+		}
+	}
+}
+
+func TestListCapabilities_ClaudeCode(t *testing.T) {
+	pc := New()
+	caps := pc.ListCapabilities("claude-code")
+	if caps == nil {
+		t.Fatal("expected non-nil capabilities for claude-code")
+	}
+	if len(caps) != 9 {
+		t.Errorf("expected 9 capabilities for claude-code, got %d", len(caps))
+	}
+}
+
+func TestGetFallback_ClaudeCode_NoCaching(t *testing.T) {
+	pc := New()
+	fb := pc.GetFallback("claude-code", CapCaching)
+	if fb == "" {
+		t.Error("expected non-empty fallback for claude-code missing caching")
+	}
+}
+
 func TestListCapabilities_IsCopy(t *testing.T) {
 	pc := New()
 	caps := pc.ListCapabilities("claude")

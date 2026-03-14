@@ -49,6 +49,17 @@ func New() *ProviderCapabilities {
 				CapPredictedOut: true,
 				CapKVRetention:  false,
 			},
+			"claude-code": {
+				CapStreaming:    true,
+				CapToolUse:      true,
+				CapVision:       true,
+				CapSystemPrompt: true,
+				CapJSONMode:     true,
+				CapFunctionCall: true,
+				CapCaching:      false,
+				CapPredictedOut: false,
+				CapKVRetention:  false,
+			},
 			"ollama": {
 				CapStreaming:    true,
 				CapToolUse:      false,
