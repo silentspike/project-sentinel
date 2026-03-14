@@ -80,6 +80,21 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<sentinel_nightrun::runner::NightrunResult> {
+    // Runtime Feature Flags (Issue #233 AC-4)
+    let flags = sentinel_common::feature_flags::RuntimeFlags::init();
+    if !flags.nightrun_enabled {
+        warn!("SENTINEL_NIGHTRUN_ENABLED=false — Nightrun uebersprungen");
+        return Ok(NightrunResult {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            agents_consolidated: 0,
+            agents_failed: 0,
+            agents_skipped: 0,
+            total_episodes: 0,
+            duration_ms: 0,
+            hash_chain_final: String::new(),
+        });
+    }
+
     // Config
     let config = NightrunConfig::load(Path::new(&cli.config))
         .with_context(|| format!("Config laden fehlgeschlagen: {}", cli.config))?;

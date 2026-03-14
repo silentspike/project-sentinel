@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -45,6 +47,7 @@ type BreakerConfig struct {
 	FailureThreshold int     // Consecutive failures fuer Open-Transition (default: 5)
 	OpenSeconds      int     // Wartezeit bis Half-Open (default: 30)
 	HalfOpenProbes   int     // Probe-Requests im Half-Open State (default: 3)
+	Enabled          bool    // SENTINEL_CORTEX_CB_ENABLED runtime gate (default: true)
 }
 
 // DefaultBreakerConfig gibt die Issue-spezifizierten Defaults zurueck.
@@ -56,6 +59,7 @@ func DefaultBreakerConfig() BreakerConfig {
 		FailureThreshold: 5,
 		OpenSeconds:      30,
 		HalfOpenProbes:   3,
+		Enabled:          true,
 	}
 }
 
@@ -91,6 +95,13 @@ func BreakerConfigFromEnv() BreakerConfig {
 	if v := os.Getenv("SENTINEL_CORTEX_CB_HALFOPEN_PROBES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.HalfOpenProbes = n
+		}
+	}
+	if v := os.Getenv("SENTINEL_CORTEX_CB_ENABLED"); v != "" {
+		lower := strings.ToLower(v)
+		if lower == "false" || lower == "0" || lower == "no" || lower == "off" {
+			cfg.Enabled = false
+			slog.Warn("Feature deaktiviert via ENV", "flag", "SENTINEL_CORTEX_CB_ENABLED")
 		}
 	}
 	return cfg

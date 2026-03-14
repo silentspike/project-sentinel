@@ -574,6 +574,11 @@ pub fn chaos_system(
     mut event_buffer: ResMut<EventBuffer>,
     mut agents: Query<(&Position, &mut WorkContext)>,
 ) {
+    // SENTINEL_CHAOS_ENABLED runtime gate (Issue #233 AC-3)
+    if !sentinel_common::feature_flags::RuntimeFlags::global().chaos_enabled {
+        return;
+    }
+
     let tick = time.tick.0;
 
     // Globaler Cooldown: max 1 Chaos-Event alle 30 Ticks (~30 Sekunden bei 1Hz)

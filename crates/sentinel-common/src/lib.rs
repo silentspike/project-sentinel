@@ -8,6 +8,7 @@
 pub mod agent_config;
 pub mod components;
 pub mod events;
+pub mod feature_flags;
 pub mod generated;
 pub mod psi;
 pub mod room;
