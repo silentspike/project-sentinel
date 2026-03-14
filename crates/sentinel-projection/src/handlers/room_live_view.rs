@@ -27,9 +27,35 @@ impl ProjectionHandler for RoomLiveViewHandler {
         txn: &ReadModelTransaction<'_>,
     ) -> anyhow::Result<()> {
         match payload {
-            DomainEventPayload::AgentSpawned { room_id, .. } => {
-                debug!(room = room_id, "Projecting agent_spawned (room occupancy)");
-                txn.update_room_occupancy(room_id, 1, event.tick, row_id)?;
+            DomainEventPayload::AgentSpawned {
+                agent_id,
+                room_id,
+                ..
+            } => {
+                // Only increment occupancy if agent was not already active.
+                // Without this guard, daemon restarts (re-spawn without prior despawn)
+                // cause occupant_count to drift upward monotonically.
+                let was_active = txn
+                    .get_agent_status(agent_id.0)?
+                    .map(|s| s != "despawned")
+                    .unwrap_or(false);
+                if was_active {
+                    // Agent already counted — update room but don't increment
+                    if let Some(old_room) = txn.get_agent_room(agent_id.0)? {
+                        if old_room != *room_id {
+                            txn.update_room_occupancy(&old_room, -1, event.tick, row_id)?;
+                            txn.update_room_occupancy(room_id, 1, event.tick, row_id)?;
+                        }
+                    }
+                    debug!(
+                        agent_id = agent_id.0,
+                        room = room_id,
+                        "Re-spawn: agent already active, no occupancy increment"
+                    );
+                } else {
+                    debug!(room = room_id, "Projecting agent_spawned (room occupancy)");
+                    txn.update_room_occupancy(room_id, 1, event.tick, row_id)?;
+                }
             }
 
             DomainEventPayload::TransitStarted {

@@ -1467,6 +1467,14 @@ fn ecs_tick_loop(
         warn!(error = %e, "sim_hour Shutdown-Persist fehlgeschlagen");
     }
 
+    // -- Graceful Shutdown: Despawn-Events fuer alle aktiven Agents emittieren --
+    // Ohne diese Events zaehlt die Projection occupant_count nur hoch (Spawn +1)
+    // aber nie runter (kein Despawn -1), was bei jedem Restart zu Drift fuehrt.
+    let despawned = runtime_orch.despawn_all_for_shutdown();
+    if despawned > 0 {
+        info!(count = despawned, "Shutdown-Despawn Events emittiert");
+    }
+
     // -- Graceful Shutdown: Runtime-Snapshot speichern (AC-4 Issue #15) --
     if let Err(e) = runtime_orch.save_state() {
         error!(error = %e, "Runtime State Snapshot fehlgeschlagen");
