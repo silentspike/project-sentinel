@@ -235,6 +235,36 @@ fn bench_nftables_load(c: &mut Criterion) {
     });
 }
 
+// --- Tier 2: bwrap spawn latency (VM only) ---
+
+fn bench_bwrap_spawn_latency(c: &mut Criterion) {
+    if !BwrapConfig::test_userns() {
+        c.bench_function("bwrap_spawn_latency [no bwrap — config only]", |b| {
+            b.iter(|| {
+                std::hint::black_box(BwrapConfig::for_agent("bench-spawn").to_args());
+            });
+        });
+        return;
+    }
+
+    // Budget: < 10ms for bwrap spawn + "true" + exit
+    let config = BwrapConfig::for_agent("bench-spawn");
+    c.bench_function("bwrap_spawn_latency", |b| {
+        b.iter(|| {
+            let mut args = config.to_args();
+            args.push("true".to_string());
+            let child = std::process::Command::new("bwrap")
+                .args(&args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("bwrap spawn failed");
+            let status = child.wait_with_output().expect("bwrap wait failed");
+            std::hint::black_box(status.status);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_bwrap_config_to_args,
@@ -250,5 +280,7 @@ criterion_group!(
     bench_netns_setup_teardown,
     bench_veth_creation,
     bench_nftables_load,
+    // Tier 2 — bwrap spawn latency (VM only)
+    bench_bwrap_spawn_latency,
 );
 criterion_main!(benches);
