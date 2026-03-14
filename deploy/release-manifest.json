@@ -6,7 +6,7 @@
     {
       "path": "/opt/sentinel/bin/sentinel-daemon",
       "source": "target/release/sentinel-daemon",
-      "sha256": "c99aca7dff5112a8b2d2d47c4478a92b39ca32981c58ff93afc53a5ff20d8ee7",
+      "sha256": "7dab17eef01e35a172338e530d2ab80778859692e06371d1211145ba167f70eb",
       "type": "binary"
     },
     {
@@ -18,7 +18,7 @@
     {
       "path": "/opt/sentinel/bin/sentinel-projection",
       "source": "target/release/sentinel-projection",
-      "sha256": "61dec6ab0e39f8b1c63d41d1240b04a7499529326ba88022961093c36567b46f",
+      "sha256": "ed2ce46f79eba9874dcdc72751ebdeb88470d37bab13e0454a591e2a03eb5882",
       "type": "binary"
     },
     {
@@ -48,7 +48,7 @@
     {
       "path": "/opt/sentinel/config/cortex-gateway.toml",
       "source": "config/cortex-gateway.toml",
-      "sha256": "33ffa11d9180dbf38a0e131001f01e872cbcba876cb05f06a22704a586aa1295",
+      "sha256": "df84cc1212ea7ac50274d90bb22823598ac788802ab8a506b78e5987aa5d5b66",
       "type": "config"
     },
     {
@@ -108,7 +108,7 @@
     {
       "path": "/etc/systemd/system/sentinel-cortex.service",
       "source": "deploy/systemd/sentinel-cortex.service",
-      "sha256": "8a294ac55fd21e4bf719f5f54fcc2e8a5637e0cfe33a623348679c8740ee47ee",
+      "sha256": "8da5900ba36e873b894b60cba200e1e2fcd6e8a80b78abfcea4c61c1bd0bfc96",
       "type": "systemd"
     },
     {
