@@ -267,17 +267,18 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             data_dir = %data_dir_clone.display(),
             "sentinel-fs FUSE-Mount starten"
         );
+        let mountpoint_check = mountpoint.clone();
         std::thread::spawn(move || {
-            if let Err(e) = sentinel_fs::start_fuse(&data_dir_clone, &mountpoint) {
+            if let Err(e) = sentinel_fs::fuse::start_fuse(&data_dir_clone, &mountpoint) {
                 error!(error = %e, "sentinel-fs FUSE-Mount fehlgeschlagen");
             }
         });
         // Kurz warten bis FUSE mounted ist
         std::thread::sleep(Duration::from_millis(200));
-        if mountpoint.join("__BASE__").exists() || mountpoint.read_dir().is_ok() {
-            info!(mountpoint = %mountpoint.display(), "sentinel-fs FUSE-Mount aktiv");
+        if mountpoint_check.join("__BASE__").exists() || mountpoint_check.read_dir().is_ok() {
+            info!(mountpoint = %mountpoint_check.display(), "sentinel-fs FUSE-Mount aktiv");
         } else {
-            warn!(mountpoint = %mountpoint.display(), "sentinel-fs FUSE-Mount moeglicherweise nicht bereit");
+            warn!(mountpoint = %mountpoint_check.display(), "sentinel-fs FUSE-Mount moeglicherweise nicht bereit");
         }
     }
 
