@@ -25,6 +25,7 @@ SyslogIdentifier=sentinel-cortex
 # Security Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
+ReadWritePaths=/opt/sentinel/data
 PrivateTmp=true
 
 [Install]
