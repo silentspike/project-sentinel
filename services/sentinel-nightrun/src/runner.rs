@@ -124,6 +124,14 @@ impl NightrunRunner {
         let mut total_episodes = 0u32;
 
         let pending_jobs = self.job_queue.get_pending(&self.run_id)?;
+
+        // Max-Jobs-per-Run Guardrail (Issue #18 AC-3)
+        if let GuardrailDecision::Abort { reason } =
+            guardrails.check_job_count(pending_jobs.len())
+        {
+            warn!(run_id = %self.run_id, jobs = pending_jobs.len(), reason = %reason, "Guardrail: Max Jobs pro Run");
+        }
+
         for job in &pending_jobs {
             // Total-Timeout Check (via GuardrailController)
             if let GuardrailDecision::Abort { reason } =
