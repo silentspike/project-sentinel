@@ -55,6 +55,7 @@ impl TestHarness {
             timeout_per_agent_secs: 300,
             timeout_total_secs: 7200,
             max_episodes_per_agent: 1000,
+            max_jobs_per_run: 100,
         };
 
         Self {
@@ -129,6 +130,7 @@ fn ac2_narratives_persist_after_consolidation() {
             timeout_per_agent_secs: 300,
             timeout_total_secs: 7200,
             max_episodes_per_agent: 1000,
+            max_jobs_per_run: 100,
         };
 
         let eps = vec![
@@ -264,6 +266,7 @@ fn resume_continues_partial_run() {
             timeout_per_agent_secs: 300,
             timeout_total_secs: 7200,
             max_episodes_per_agent: 1000,
+            max_jobs_per_run: 100,
         };
 
         let runner = NightrunRunner::new(hc, es, jq, settings, "run-resume".into(), false);
@@ -416,6 +419,7 @@ fn ac18_3_guardrails_deterministic() {
         timeout_per_agent_secs: 300,
         timeout_total_secs: 7200,
         max_episodes_per_agent: 100,
+        max_jobs_per_run: 100,
     };
     let gc = GuardrailController::from_settings(&settings);
 
@@ -461,6 +465,7 @@ fn ac18_4_degradation_documented() {
         timeout_per_agent_secs: 300,
         timeout_total_secs: 7200,
         max_episodes_per_agent: 3,
+        max_jobs_per_run: 100,
     };
 
     let runner = NightrunRunner::new(hc, es, jq, settings, "run-degrade".into(), false);
