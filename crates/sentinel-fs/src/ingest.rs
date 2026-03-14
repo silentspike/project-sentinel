@@ -23,6 +23,7 @@ use crate::chunker::chunk_data;
 use crate::segment::ChunkLocation;
 use rayon::prelude::*;
 use redb::{ReadableDatabase, ReadableTable};
+use sha2::{Digest, Sha256};
 use std::io::Cursor;
 
 /// Minimum number of new (non-dedup) chunks to justify rayon parallel compression.
@@ -137,7 +138,9 @@ pub fn commit_ingest(session: IngestSession<'_>) -> anyhow::Result<u64> {
     let manifest_bytes =
         serde_json::to_vec(&manifest).map_err(|e| anyhow::anyhow!("manifest serialize: {e}"))?;
 
-    let meta = ObjectMetadata::new(total_size, &mime, chunk_count);
+    // SHA-256 of the original source data (pre-chunking)
+    let sha256: [u8; 32] = Sha256::digest(&buffer).into();
+    let meta = ObjectMetadata::new(total_size, &mime, chunk_count, sha256);
     let meta_bytes = meta.serialize()?;
 
     // Phase 1: Append new chunks to segment store (outside redb txn).
@@ -251,7 +254,8 @@ impl<'a> BatchIngest<'a> {
         let manifest_bytes = serde_json::to_vec(&manifest)
             .map_err(|e| anyhow::anyhow!("manifest serialize: {e}"))?;
 
-        let meta = ObjectMetadata::new(total_size, &mime, chunk_count);
+        let sha256: [u8; 32] = Sha256::digest(data).into();
+        let meta = ObjectMetadata::new(total_size, &mime, chunk_count, sha256);
         let meta_bytes = meta.serialize()?;
 
         self.prepared.push(PreparedIngest {
@@ -583,6 +587,48 @@ mod tests {
             let rc = plane.get_chunk_refcount(hash).unwrap();
             assert_eq!(rc, 2, "batch dedup must increment refcount for each object");
         }
+    }
+
+    #[test]
+    fn object_sha256_matches_source_data() {
+        let (plane, _dir) = temp_plane();
+        let data = b"The quick brown fox jumps over the lazy dog";
+
+        let mut session = begin_ingest(&plane, "text/plain");
+        session.write(data);
+        let object_id = commit_ingest(session).unwrap();
+
+        let meta = plane.get_object(object_id).unwrap().unwrap();
+        let expected: [u8; 32] = Sha256::digest(data).into();
+        assert_eq!(
+            meta.sha256, expected,
+            "ObjectMetadata SHA-256 must match source data digest"
+        );
+    }
+
+    #[test]
+    fn sha256_streaming_matches_single_write() {
+        let (plane, _dir) = temp_plane();
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i * 7 + 3) as u8).collect();
+
+        // Single write
+        let mut s1 = begin_ingest(&plane, "application/octet-stream");
+        s1.write(&data);
+        let id1 = commit_ingest(s1).unwrap();
+
+        // Streaming write (3 pieces)
+        let mut s2 = begin_ingest(&plane, "application/octet-stream");
+        s2.write(&data[..80_000]);
+        s2.write(&data[80_000..150_000]);
+        s2.write(&data[150_000..]);
+        let id2 = commit_ingest(s2).unwrap();
+
+        let m1 = plane.get_object(id1).unwrap().unwrap();
+        let m2 = plane.get_object(id2).unwrap().unwrap();
+        assert_eq!(
+            m1.sha256, m2.sha256,
+            "SHA-256 must be identical for same data regardless of write pattern"
+        );
     }
 
     #[test]
