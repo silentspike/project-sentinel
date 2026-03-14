@@ -196,6 +196,10 @@ fn spawn_agent_full(
 /// 4. Wartet auf Shutdown-Signal
 /// 5. ECS-Thread speichert State-Snapshot vor Beendigung
 pub async fn run(config: DaemonConfig) -> Result<()> {
+    // -- Runtime Feature Flags initialisieren (Issue #233) --
+    let flags = sentinel_common::feature_flags::RuntimeFlags::init();
+    info!(?flags, "Runtime Feature Flags geladen");
+
     // -- Datenbanken oeffnen (sync) --
     let data_dir = &config.data_dir;
     std::fs::create_dir_all(data_dir)
@@ -1092,8 +1096,10 @@ fn ecs_tick_loop(
         // ECS Schedule ausfuehren (alle 12 Systems in Reihenfolge)
         schedule.run(&mut world);
 
-        // Controlplane-Zyklus (alle N Ticks)
-        if controlplane.should_run(tick_count) {
+        // Controlplane-Zyklus (alle N Ticks) — SENTINEL_CONTROLPLANE_ENABLED gate (AC-6)
+        if sentinel_common::feature_flags::RuntimeFlags::global().controlplane_enabled
+            && controlplane.should_run(tick_count)
+        {
             if let Err(e) = controlplane.cycle(&mut world, tick_count) {
                 error!(error = %e, tick = tick_count, "Controlplane-Zyklus fehlgeschlagen");
             }

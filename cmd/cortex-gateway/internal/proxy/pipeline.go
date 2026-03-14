@@ -267,9 +267,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Step 3: Circuit Breaker ---
+	// --- Step 3: Circuit Breaker (SENTINEL_CORTEX_CB_ENABLED gate, AC-5) ---
 	breaker := ph.getBreaker(providerName)
-	if !breaker.Allow() {
+	if ph.breakerCfg.Enabled && !breaker.Allow() {
 		// Failover: versuche anderen Provider
 		provider, providerName = ph.failover(providerName)
 		if provider == nil {
