@@ -1,0 +1,193 @@
+{
+  "version": "1.1",
+  "created_at": "2026-03-14T09:22:00Z",
+  "git_sha": "4c2d6b9a8e655f620e89b3550180d1810cc46fc7",
+  "artifacts": [
+    {
+      "path": "/opt/sentinel/bin/sentinel-daemon",
+      "source": "target/release/sentinel-daemon",
+      "sha256": "c99aca7dff5112a8b2d2d47c4478a92b39ca32981c58ff93afc53a5ff20d8ee7",
+      "type": "binary"
+    },
+    {
+      "path": "/opt/sentinel/bin/sentinel-nightrun",
+      "source": "target/release/sentinel-nightrun",
+      "sha256": "9ad7ffa8dff64b6ea4b80e2b1e9fe2d7690e3a95914b440d7058d332fbdb590c",
+      "type": "binary"
+    },
+    {
+      "path": "/opt/sentinel/bin/sentinel-projection",
+      "source": "target/release/sentinel-projection",
+      "sha256": "61dec6ab0e39f8b1c63d41d1240b04a7499529326ba88022961093c36567b46f",
+      "type": "binary"
+    },
+    {
+      "path": "/opt/sentinel/bin/cortex-gateway",
+      "source": "cmd/cortex-gateway/cortex-gateway",
+      "sha256": "365acf63a85457decd5deaf60ea5645186ba0652588353f26dd7339c40c390a1",
+      "type": "binary"
+    },
+    {
+      "path": "/opt/sentinel/bin/sentinel-judge",
+      "source": "services/sentinel-judge/sentinel-judge",
+      "sha256": "ec61cb259730ff4334b11145491b9e8a9cb856589517875b94b3d9976a56070b",
+      "type": "binary"
+    },
+    {
+      "path": "/opt/sentinel/bin/sentinel-nats-bridge",
+      "source": "services/sentinel-nats-bridge/sentinel-nats-bridge",
+      "sha256": "c0d872633e2ed078dddaebce68ed83515d647216111bd451a020823f03e51eba",
+      "type": "binary"
+    },
+    {
+      "path": "/opt/sentinel/config/daemon.toml",
+      "source": "config/daemon.toml",
+      "sha256": "d8b264e2f47bd1598e3e1d4f384ed46037217dce7d7417ce434fb5a003ebfad0",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/cortex-gateway.toml",
+      "source": "config/cortex-gateway.toml",
+      "sha256": "33ffa11d9180dbf38a0e131001f01e872cbcba876cb05f06a22704a586aa1295",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/nightrun.toml",
+      "source": "config/nightrun.toml",
+      "sha256": "298b7c55a2a0da8bc571b5a6a5bedffbdeade0926620db0d29c9886346f39e23",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/judge.toml",
+      "source": "config/judge.toml",
+      "sha256": "5480918785b15b5b6f4ade863cb6f93f1f02dd5c700047feadc09256d70b9236",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/nats-bridge.toml",
+      "source": "config/nats-bridge.toml",
+      "sha256": "676be7a30c8033395f7fa1dbf83b378bc90b8efd8cde25b7f4498a415b6734a1",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/simulation.toml",
+      "source": "config/simulation.toml",
+      "sha256": "adbd4c4a4c9c92a5756bda9557fe2421b39bde18f7b8da53df2ce78fa38f3132",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/rooms.toml",
+      "source": "config/rooms.toml",
+      "sha256": "1600a4e520a98fabc08c240a57ed29420d9d18ecca00a4350be10cdc359d25fc",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/company.toml",
+      "source": "config/company.toml",
+      "sha256": "4144d94e2a2aad9495e83aeeabbec8c6520deeea0f197248ce9267109547da0c",
+      "type": "config"
+    },
+    {
+      "path": "/opt/sentinel/config/controlplane.toml",
+      "source": "config/controlplane.toml",
+      "sha256": "19b0d8d2460b13e61fad6dc8022e6f1ecb886d48cd515cf32d70c539b7f47fad",
+      "type": "config"
+    },
+    {
+      "path": "/etc/nats/nats.conf",
+      "source": "config/nats.conf",
+      "sha256": "3ab5bb5d9fa5a1b51dc4f4d575be81ecd568a4b16a2b157b7d38d3242f6d309f",
+      "type": "config"
+    },
+    {
+      "path": "/etc/systemd/system/sentinel-daemon.service",
+      "source": "deploy/systemd/sentinel-daemon.service",
+      "sha256": "b1f7eb5aac0f2a73f6e017882bf04110d8c715a926ec09e30c5240dc0bc1ab52",
+      "type": "systemd"
+    },
+    {
+      "path": "/etc/systemd/system/sentinel-cortex.service",
+      "source": "deploy/systemd/sentinel-cortex.service",
+      "sha256": "8a294ac55fd21e4bf719f5f54fcc2e8a5637e0cfe33a623348679c8740ee47ee",
+      "type": "systemd"
+    },
+    {
+      "path": "/etc/systemd/system/sentinel-judge.service",
+      "source": "deploy/systemd/sentinel-judge.service",
+      "sha256": "f2debaeb71e9fb8bc228a6e214701f74ab96114e5fa3396774b6b3aeef8c72e2",
+      "type": "systemd"
+    },
+    {
+      "path": "/etc/systemd/system/sentinel-nats-bridge.service",
+      "source": "deploy/systemd/sentinel-nats-bridge.service",
+      "sha256": "03eaedee79846d21b3badb31917d137e663fe28d92cedefa7978161a91810e5b",
+      "type": "systemd"
+    },
+    {
+      "path": "/etc/systemd/system/sentinel-nightrun.service",
+      "source": "deploy/systemd/sentinel-nightrun.service",
+      "sha256": "43bb81138fe86c9a1c8593a4db25f0a04caf175bc0ceed752c6208924fb8a8c7",
+      "type": "systemd"
+    },
+    {
+      "path": "/etc/systemd/system/sentinel-nightrun.timer",
+      "source": "deploy/systemd/sentinel-nightrun.timer",
+      "sha256": "6ab0ca2a9d380cb144d5aa5cdaf3f81a71f3b336257e9071e05052ed8b030def",
+      "type": "systemd"
+    },
+    {
+      "path": "/etc/systemd/system/sentinel-projection.service",
+      "source": "deploy/systemd/sentinel-projection.service",
+      "sha256": "184d0707a6271241ad01dcbbf3825a85ca1ed8917f19088089ba9e7e6371e316",
+      "type": "systemd"
+    },
+    {
+      "path": "/etc/systemd/system/sentinel-dashboard.service",
+      "source": "deploy/systemd/sentinel-dashboard.service",
+      "sha256": "de6897898cd1d8ab08559711accb330422d137067bea5b1a7f623423e1c217e9",
+      "type": "systemd"
+    },
+    {
+      "path": "/etc/systemd/system/nats-server.service",
+      "source": "deploy/systemd/nats-server.service",
+      "sha256": "9bf27f70073cede1728b979bf3621f5ff9416d0a8e7ceb8da8fbe6f7f361973b",
+      "type": "systemd"
+    },
+    {
+      "path": "/etc/systemd/system/sentinel.target",
+      "source": "deploy/systemd/sentinel.target",
+      "sha256": "6a080b400fe951311eb80c8d3ad3ac2556d844a3e9ff0d62cd76a57c4751fa49",
+      "type": "systemd"
+    },
+    {
+      "path": "/opt/sentinel/scripts/init-cgroups.sh",
+      "source": "deploy/scripts/init-cgroups.sh",
+      "sha256": "e078f7f9059cdeb7727f9393910f617f682e1f0d9707db1de55e3d75b504ee33",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/init-dirs.sh",
+      "source": "deploy/scripts/init-dirs.sh",
+      "sha256": "0d4e24c001728ee54bf24fe05fa5d8b74929ebd37fcefc5bf489bb688f0eaa0c",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/init-hugepages.sh",
+      "source": "deploy/scripts/init-hugepages.sh",
+      "sha256": "e2ddb4d7fb6c4f955e4dcd84358df37ec007fd558196dbc37cc47fa9a75d267e",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/init-sysctl.sh",
+      "source": "deploy/scripts/init-sysctl.sh",
+      "sha256": "b0139ddc99ea6ab243652b7dcc9ebe93003a265ea3125113372808b50624cc3f",
+      "type": "script"
+    },
+    {
+      "path": "/opt/sentinel/scripts/init-tmpfs.sh",
+      "source": "deploy/scripts/init-tmpfs.sh",
+      "sha256": "30ff0d51aa1778644a5697848525ca6103bddfc9c3df9feb6f368b37f33a30d6",
+      "type": "script"
+    }
+  ]
+}
