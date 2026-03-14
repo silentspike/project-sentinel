@@ -167,6 +167,11 @@ impl ProjectionWorker {
                 .update_offset(PROJECTION_NAME, final_offset)?;
         }
 
+        // Post-rebuild consistency: recompute occupant_count from agent_live_view.
+        // Delta-based counting drifts when the event stream has gaps (e.g. daemon
+        // restarts without despawn events in historical data).
+        self.read_store.recompute_occupant_counts()?;
+
         info!(total = total_processed, "Full rebuild complete");
         Ok(total_processed)
     }

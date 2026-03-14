@@ -210,6 +210,27 @@ impl ReadModelStore {
         Ok(())
     }
 
+    /// Recomputes occupant_count from agent_live_view (post-rebuild consistency).
+    ///
+    /// Delta-based counting drifts when the event stream has gaps (daemon restarts
+    /// without despawn events). This sets occupant_count = COUNT of active agents
+    /// currently assigned to each room — the ground truth.
+    pub fn recompute_occupant_counts(&self) -> anyhow::Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        conn.execute_batch(
+            "UPDATE room_live_view SET occupant_count = (
+                SELECT COUNT(*) FROM agent_live_view
+                WHERE agent_live_view.current_room = room_live_view.room_id
+                  AND agent_live_view.status = 'active'
+            )",
+        )?;
+        info!("Occupant counts recomputed from agent_live_view");
+        Ok(())
+    }
+
     /// Startet eine Transaktion fuer Batch-Verarbeitung.
     ///
     /// Der Caller erhaelt ein `ReadModelTransaction` das typed Methoden
@@ -469,6 +490,20 @@ impl<'a> ReadModelTransaction<'a> {
             params![action, tick as i64, row_id, now_ms(), agent_id],
         )?;
         Ok(())
+    }
+
+    /// Liest den status eines Agenten (fuer Re-Spawn-Erkennung).
+    pub fn get_agent_status(&self, agent_id: u16) -> anyhow::Result<Option<String>> {
+        let result = self.guard.query_row(
+            "SELECT status FROM agent_live_view WHERE agent_id = ?1",
+            params![agent_id],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(status) => Ok(status),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Liest die current_room eines Agenten (fuer ShiftTransition).
