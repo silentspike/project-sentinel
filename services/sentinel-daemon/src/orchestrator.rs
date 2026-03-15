@@ -1744,6 +1744,9 @@ mod tests {
 
     #[test]
     fn test_ecs_tick_loop_runs_ticks() {
+        // RuntimeFlags must be initialized before ECS systems run (#233)
+        sentinel_common::feature_flags::RuntimeFlags::init();
+
         // Deterministisch: ecs_tick_loop laeuft im Background-Thread, Main-Thread wartet
         // auf erste Perception (beweist mindestens 1 Tick). Kein Race moeglich, da Shutdown
         // erst NACH Perception-Empfang gesetzt wird.
@@ -1810,6 +1813,9 @@ mod tests {
 
     #[test]
     fn test_save_state_on_shutdown() {
+        // RuntimeFlags must be initialized before ECS systems run (#233)
+        sentinel_common::feature_flags::RuntimeFlags::init();
+
         // Verifiziert dass Runtime-Snapshot nach Loop-Exit existiert.
         // Gleiche deterministische Struktur wie test_ecs_tick_loop_runs_ticks:
         // ecs_tick_loop im Background-Thread, Perception-Warten im Main-Thread.
