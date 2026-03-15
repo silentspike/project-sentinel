@@ -53,7 +53,10 @@ impl RuntimeFlags {
             log_disabled("SENTINEL_CQRS", flags.cqrs);
             log_disabled("SENTINEL_CORTEX_CB_ENABLED", flags.cortex_cb_enabled);
             log_disabled("SENTINEL_EBPF_ENABLED", flags.ebpf_enabled);
-            log_disabled("SENTINEL_STORAGE_INGEST_ENABLED", flags.storage_ingest_enabled);
+            log_disabled(
+                "SENTINEL_STORAGE_INGEST_ENABLED",
+                flags.storage_ingest_enabled,
+            );
             log_disabled("SENTINEL_STORAGE_CHUNK_CAS", flags.storage_chunk_cas);
 
             flags
