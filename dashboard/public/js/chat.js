@@ -62,6 +62,32 @@ export function renderChat(messages) {
   }
 
   wrapper.appendChild(list);
+
+  // Operator input section
+  const inputSection = document.createElement('div');
+  inputSection.className = 'chat-input-section';
+
+  const input = document.createElement('textarea');
+  input.id = 'chat-input';
+  input.className = 'chat-input';
+  input.placeholder = 'Nachricht an Agents eingeben...';
+  input.rows = 2;
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendChatMessage();
+    }
+  });
+
+  const sendBtn = document.createElement('button');
+  sendBtn.className = 'chat-send-btn';
+  sendBtn.textContent = 'Senden';
+  sendBtn.addEventListener('click', sendChatMessage);
+
+  inputSection.appendChild(input);
+  inputSection.appendChild(sendBtn);
+  wrapper.appendChild(inputSection);
+
   container.appendChild(wrapper);
 
   // Scroll to bottom (newest messages)
@@ -105,6 +131,32 @@ function createChatMessage(msg) {
   item.appendChild(meta);
 
   return item;
+}
+
+async function sendChatMessage() {
+  const input = document.getElementById('chat-input');
+  if (!input) return;
+  const message = input.value.trim();
+  if (!message) return;
+
+  input.disabled = true;
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, room: currentRoom }),
+    });
+    if (res.ok) {
+      input.value = '';
+      // Reload chat to show new message
+      await loadChat();
+    }
+  } catch {
+    // Send failed
+  } finally {
+    input.disabled = false;
+    input.focus();
+  }
 }
 
 async function loadChat() {

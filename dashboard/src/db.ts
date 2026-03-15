@@ -372,6 +372,35 @@ export function getMaxChaosEventId(): number {
   return row?.max_id ?? 0;
 }
 
+// ── Operator Messages (Chat Input) ──────────────
+
+// Operator chat uses its own SQLite DB (EventStore is read-only for dashboard)
+let _chatDb: InstanceType<typeof Database> | null = null;
+function getChatDb(): InstanceType<typeof Database> {
+  if (!_chatDb) {
+    const chatDbPath = process.env.CHAT_DB || "./operator-chat.db";
+    _chatDb = new Database(chatDbPath, { create: true });
+    _chatDb.run(`CREATE TABLE IF NOT EXISTS operator_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      message TEXT NOT NULL,
+      room TEXT,
+      gateway_status TEXT DEFAULT 'pending',
+      created_at INTEGER NOT NULL
+    )`);
+  }
+  return _chatDb;
+}
+
+export function insertOperatorMessage(message: string, room: string | null): number {
+  const db = getChatDb();
+  db.query("INSERT INTO operator_messages (message, room, created_at) VALUES (?, ?, ?)")
+    .run(message, room, Date.now());
+  const row = db
+    .query<{ id: number }, []>("SELECT last_insert_rowid() as id")
+    .get();
+  return row?.id ?? 0;
+}
+
 // ── Chat Messages (Agent Actions) ───────────────
 
 export function getRecentChatMessages(limit = 100): ChatMessage[] {
