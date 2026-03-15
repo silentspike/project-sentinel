@@ -22,6 +22,9 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=sentinel-cortex
 
+User=ubuntu
+Group=ubuntu
+
 # Security Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
