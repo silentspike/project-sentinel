@@ -91,6 +91,16 @@ function toActivityItem(row: EventRow): ActivityItem {
       case "agent_status_changed":
         summary = `${agentId} Status: ${p.new_status || "?"}`;
         break;
+      case "bio_state_updated":
+        summary = `${agentId} Bio-Update`;
+        detail = `H:${(p.hunger * 100).toFixed(0)}% E:${(p.energy * 100).toFixed(0)}% S:${(p.stress * 100).toFixed(0)}%`;
+        room = p.room_id || null;
+        break;
+      case "room_physics_updated":
+        summary = `Raum ${p.room_id || agentId} Physik`;
+        detail = `${p.temperature?.toFixed(1) || "?"}°C CO2:${p.co2_ppm?.toFixed(0) || "?"}ppm`;
+        room = p.room_id || null;
+        break;
     }
   } catch {
     /* payload parse error — use defaults */

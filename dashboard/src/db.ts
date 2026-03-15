@@ -456,6 +456,8 @@ const ACTIVITY_EVENT_TYPES = [
   "transit_completed",
   "chaos_triggered",
   "bio_action_performed",
+  "bio_state_updated",
+  "room_physics_updated",
   "shift_transition_completed",
   "nightrun_started",
   "nightrun_completed",
