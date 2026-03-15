@@ -63,9 +63,21 @@ impl RuntimeFlags {
         })
     }
 
-    /// Returns the global flags (panics if init() was not called).
+    /// Returns the global flags. Auto-initializes with defaults if init() was not called.
     pub fn global() -> &'static RuntimeFlags {
-        FLAGS.get().expect("RuntimeFlags::init() not called")
+        FLAGS.get_or_init(|| RuntimeFlags {
+            chaos_enabled: true,
+            nightrun_enabled: true,
+            controlplane_enabled: true,
+            cloud_enabled: true,
+            sleep_cycle: true,
+            event_sourcing: true,
+            cqrs: true,
+            cortex_cb_enabled: true,
+            ebpf_enabled: true,
+            storage_ingest_enabled: true,
+            storage_chunk_cas: true,
+        })
     }
 }
 
