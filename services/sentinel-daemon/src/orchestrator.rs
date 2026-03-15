@@ -196,6 +196,10 @@ fn spawn_agent_full(
 /// 4. Wartet auf Shutdown-Signal
 /// 5. ECS-Thread speichert State-Snapshot vor Beendigung
 pub async fn run(config: DaemonConfig) -> Result<()> {
+    // -- Runtime Feature Flags initialisieren (Issue #233) --
+    let flags = sentinel_common::feature_flags::RuntimeFlags::init();
+    info!(?flags, "Runtime Feature Flags geladen");
+
     // -- Datenbanken oeffnen (sync) --
     let data_dir = &config.data_dir;
     std::fs::create_dir_all(data_dir)
@@ -263,17 +267,18 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             data_dir = %data_dir_clone.display(),
             "sentinel-fs FUSE-Mount starten"
         );
+        let mountpoint_check = mountpoint.clone();
         std::thread::spawn(move || {
-            if let Err(e) = sentinel_fs::start_fuse(&data_dir_clone, &mountpoint) {
+            if let Err(e) = sentinel_fs::fuse::start_fuse(&data_dir_clone, &mountpoint) {
                 error!(error = %e, "sentinel-fs FUSE-Mount fehlgeschlagen");
             }
         });
         // Kurz warten bis FUSE mounted ist
         std::thread::sleep(Duration::from_millis(200));
-        if mountpoint.join("__BASE__").exists() || mountpoint.read_dir().is_ok() {
-            info!(mountpoint = %mountpoint.display(), "sentinel-fs FUSE-Mount aktiv");
+        if mountpoint_check.join("__BASE__").exists() || mountpoint_check.read_dir().is_ok() {
+            info!(mountpoint = %mountpoint_check.display(), "sentinel-fs FUSE-Mount aktiv");
         } else {
-            warn!(mountpoint = %mountpoint.display(), "sentinel-fs FUSE-Mount moeglicherweise nicht bereit");
+            warn!(mountpoint = %mountpoint_check.display(), "sentinel-fs FUSE-Mount moeglicherweise nicht bereit");
         }
     }
 
@@ -1092,8 +1097,10 @@ fn ecs_tick_loop(
         // ECS Schedule ausfuehren (alle 12 Systems in Reihenfolge)
         schedule.run(&mut world);
 
-        // Controlplane-Zyklus (alle N Ticks)
-        if controlplane.should_run(tick_count) {
+        // Controlplane-Zyklus (alle N Ticks) — SENTINEL_CONTROLPLANE_ENABLED gate (AC-6)
+        if sentinel_common::feature_flags::RuntimeFlags::global().controlplane_enabled
+            && controlplane.should_run(tick_count)
+        {
             if let Err(e) = controlplane.cycle(&mut world, tick_count) {
                 error!(error = %e, tick = tick_count, "Controlplane-Zyklus fehlgeschlagen");
             }
@@ -1467,6 +1474,14 @@ fn ecs_tick_loop(
         warn!(error = %e, "sim_hour Shutdown-Persist fehlgeschlagen");
     }
 
+    // -- Graceful Shutdown: Despawn-Events fuer alle aktiven Agents emittieren --
+    // Ohne diese Events zaehlt die Projection occupant_count nur hoch (Spawn +1)
+    // aber nie runter (kein Despawn -1), was bei jedem Restart zu Drift fuehrt.
+    let despawned = runtime_orch.despawn_all_for_shutdown();
+    if despawned > 0 {
+        info!(count = despawned, "Shutdown-Despawn Events emittiert");
+    }
+
     // -- Graceful Shutdown: Runtime-Snapshot speichern (AC-4 Issue #15) --
     if let Err(e) = runtime_orch.save_state() {
         error!(error = %e, "Runtime State Snapshot fehlgeschlagen");
@@ -1729,6 +1744,9 @@ mod tests {
 
     #[test]
     fn test_ecs_tick_loop_runs_ticks() {
+        // RuntimeFlags must be initialized before ECS systems run (#233)
+        sentinel_common::feature_flags::RuntimeFlags::init();
+
         // Deterministisch: ecs_tick_loop laeuft im Background-Thread, Main-Thread wartet
         // auf erste Perception (beweist mindestens 1 Tick). Kein Race moeglich, da Shutdown
         // erst NACH Perception-Empfang gesetzt wird.
@@ -1795,6 +1813,9 @@ mod tests {
 
     #[test]
     fn test_save_state_on_shutdown() {
+        // RuntimeFlags must be initialized before ECS systems run (#233)
+        sentinel_common::feature_flags::RuntimeFlags::init();
+
         // Verifiziert dass Runtime-Snapshot nach Loop-Exit existiert.
         // Gleiche deterministische Struktur wie test_ecs_tick_loop_runs_ticks:
         // ecs_tick_loop im Background-Thread, Perception-Warten im Main-Thread.

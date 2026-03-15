@@ -409,6 +409,31 @@ impl RuntimeOrchestrator {
         self.agents.len()
     }
 
+    /// Emits AgentDespawned events for all active agents during graceful shutdown.
+    ///
+    /// This ensures the Projection Worker can decrement occupant_count for each
+    /// agent's current room. Without these events, daemon restarts cause
+    /// monotonically growing occupant counts (no matching -1 for the +1 at spawn).
+    pub fn despawn_all_for_shutdown(&mut self) -> usize {
+        let agent_ids: Vec<AgentId> = self.agents.keys().copied().collect();
+        let count = agent_ids.len();
+        for agent_id in agent_ids {
+            let payload = DomainEventPayload::AgentDespawned {
+                agent_id,
+                reason: "daemon_shutdown".to_string(),
+            };
+            self.emit_event(
+                payload.event_type_str(),
+                &format!("AGENT-{:02}", agent_id.0),
+                &payload.to_json(),
+                &format!("shutdown-despawn-{}", agent_id.0),
+            );
+        }
+        // Clear the agent map — they're all despawned now
+        self.agents.clear();
+        count
+    }
+
     /// Saves the full runtime state as a snapshot to the event store (AC-4).
     pub fn save_state(&self) -> Result<()> {
         let store = self

@@ -15,6 +15,9 @@ import { createWsHandler, startPolling } from "./ws";
 
 const app = new Hono();
 
+// Root-level /health alias (for sentinel-health-monitor.timer compatibility)
+app.route("/", healthRoutes);
+
 // API Routes
 app.route("/api", healthRoutes);
 app.route("/api", agentRoutes);

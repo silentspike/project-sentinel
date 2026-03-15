@@ -15,6 +15,7 @@ func testConfig() BreakerConfig {
 		FailureThreshold: 3,
 		OpenSeconds:      5,
 		HalfOpenProbes:   2,
+		Enabled:          true,
 	}
 }
 

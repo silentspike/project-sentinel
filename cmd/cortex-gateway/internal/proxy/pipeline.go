@@ -129,6 +129,9 @@ type PipelineHandler struct {
 	breakerMu  sync.RWMutex
 	breakers   map[string]*CircuitBreaker
 	breakerCfg BreakerConfig
+
+	regenMu       sync.Mutex
+	regenCooldown map[string]time.Time // agent → last regen time (#240)
 }
 
 // BreakerStates gibt den aktuellen State aller bekannten Circuit Breaker zurueck.
@@ -184,6 +187,7 @@ func NewPipelineHandler(cfg PipelineConfig) *PipelineHandler {
 		quality:          cfg.Quality,
 		breakers:         make(map[string]*CircuitBreaker),
 		breakerCfg:       cfg.BreakerCfg,
+		regenCooldown:    make(map[string]time.Time),
 	}
 }
 
@@ -240,7 +244,7 @@ func (ph *PipelineHandler) parseRequest(w http.ResponseWriter, r *http.Request) 
 }
 
 // ServeHTTP implementiert die vollstaendige 7-Step Pipeline.
-func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { //nolint:gocyclo // Pipeline orchestration is genuinely complex
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -267,9 +271,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Step 3: Circuit Breaker ---
+	// --- Step 3: Circuit Breaker (SENTINEL_CORTEX_CB_ENABLED gate, AC-5) ---
 	breaker := ph.getBreaker(providerName)
-	if !breaker.Allow() {
+	if ph.breakerCfg.Enabled && !breaker.Allow() {
 		// Failover: versuche anderen Provider
 		provider, providerName = ph.failover(providerName)
 		if provider == nil {
@@ -611,6 +615,17 @@ func (ph *PipelineHandler) personalityGuardCheck(ctx context.Context, content, a
 	if result.DriftScore < snap.DriftThreshold {
 		return content
 	}
+
+	// Cooldown: max 1 re-generation per agent per 5 minutes (#240)
+	ph.regenMu.Lock()
+	lastRegen, hasRegen := ph.regenCooldown[agentName]
+	if hasRegen && time.Since(lastRegen) < 5*time.Minute {
+		ph.regenMu.Unlock()
+		ph.logger.Debug("personality guard cooldown active", "agent", agentName)
+		return content
+	}
+	ph.regenCooldown[agentName] = time.Now()
+	ph.regenMu.Unlock()
 
 	ph.logger.Warn("personality drift detected",
 		"agent", agentName,

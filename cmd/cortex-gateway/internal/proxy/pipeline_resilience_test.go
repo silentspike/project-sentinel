@@ -61,6 +61,7 @@ func TestCircuitBreakerE2E(t *testing.T) {
 		FailureThreshold: 3,
 		OpenSeconds:      5,
 		HalfOpenProbes:   2,
+		Enabled:          true,
 	}
 	ph := NewPipelineHandler(PipelineConfig{
 		Registry:         reg,
@@ -222,6 +223,7 @@ func TestBreakerTripsMetric(t *testing.T) {
 		FailureThreshold: 3,
 		OpenSeconds:      5,
 		HalfOpenProbes:   2,
+		Enabled:          true,
 	}
 	ph := NewPipelineHandler(PipelineConfig{
 		Registry:         reg,

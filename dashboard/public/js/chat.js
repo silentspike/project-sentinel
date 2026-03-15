@@ -62,6 +62,32 @@ export function renderChat(messages) {
   }
 
   wrapper.appendChild(list);
+
+  // Operator input section
+  const inputSection = document.createElement('div');
+  inputSection.className = 'chat-input-section';
+
+  const input = document.createElement('textarea');
+  input.id = 'chat-input';
+  input.className = 'chat-input';
+  input.placeholder = 'Nachricht an Agents eingeben...';
+  input.rows = 2;
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendChatMessage();
+    }
+  });
+
+  const sendBtn = document.createElement('button');
+  sendBtn.className = 'chat-send-btn';
+  sendBtn.textContent = 'Senden';
+  sendBtn.addEventListener('click', sendChatMessage);
+
+  inputSection.appendChild(input);
+  inputSection.appendChild(sendBtn);
+  wrapper.appendChild(inputSection);
+
   container.appendChild(wrapper);
 
   // Scroll to bottom (newest messages)
@@ -70,16 +96,25 @@ export function renderChat(messages) {
 
 function createChatMessage(msg) {
   const item = document.createElement('div');
-  item.className = 'chat-message';
 
-  // Agent name
+  // Distinguish operator, gateway, and agent messages via CSS class
+  const isOperator = msg.action_type === 'operator_message';
+  const isGateway = msg.action_type === 'gateway_response';
+  const isError = msg.action_type === 'error';
+  let extraClass = '';
+  if (isOperator) extraClass = ' chat-message-operator';
+  else if (isGateway) extraClass = ' chat-message-gateway';
+  else if (isError) extraClass = ' chat-message-error';
+  item.className = 'chat-message' + extraClass;
+
+  // Agent/Operator name
   const agent = document.createElement('span');
   agent.className = 'chat-agent';
   agent.textContent = msg.agent_name || msg.agent_id;
   item.appendChild(agent);
 
-  // Action type badge
-  if (msg.action_type) {
+  // Action type badge (skip for operator/gateway — the CSS class handles that)
+  if (msg.action_type && !isOperator && !isGateway && !isError) {
     const badge = document.createElement('span');
     badge.className = 'chat-action-badge';
     badge.textContent = msg.action_type;
@@ -100,11 +135,77 @@ function createChatMessage(msg) {
   const date = new Date(msg.timestamp_ms);
   let metaText = date.toLocaleString('de-DE');
   if (msg.target_room) metaText += ' — ' + msg.target_room;
-  metaText += ' — Tick ' + msg.tick;
+  if (msg.tick) metaText += ' — Tick ' + msg.tick;
   meta.textContent = metaText;
   item.appendChild(meta);
 
   return item;
+}
+
+async function sendChatMessage() {
+  const input = document.getElementById('chat-input');
+  if (!input) return;
+  const message = input.value.trim();
+  if (!message) return;
+
+  // Clear input immediately for responsive UX
+  input.value = '';
+  input.disabled = true;
+
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, room: currentRoom }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const list = document.getElementById('chat-list');
+      if (list) {
+        // Append operator message immediately
+        list.appendChild(createChatMessage({
+          agent_id: 'operator',
+          agent_name: 'Operator',
+          action_type: 'operator_message',
+          content: data.message,
+          target_room: data.room,
+          tick: 0,
+          timestamp_ms: Date.now(),
+        }));
+
+        // Append gateway response if available
+        if (data.gateway_content) {
+          list.appendChild(createChatMessage({
+            agent_id: 'gateway',
+            agent_name: 'Agent (Gateway)',
+            action_type: 'gateway_response',
+            content: data.gateway_content,
+            target_room: data.room,
+            tick: 0,
+            timestamp_ms: Date.now(),
+          }));
+        } else if (data.gateway_response && data.gateway_response.error) {
+          list.appendChild(createChatMessage({
+            agent_id: 'gateway',
+            agent_name: 'Gateway',
+            action_type: 'error',
+            content: data.gateway_response.error,
+            target_room: data.room,
+            tick: 0,
+            timestamp_ms: Date.now(),
+          }));
+        }
+
+        list.scrollTop = list.scrollHeight;
+      }
+    }
+  } catch {
+    // Send failed — restore message so user can retry
+    if (input.value === '') input.value = message;
+  } finally {
+    input.disabled = false;
+    input.focus();
+  }
 }
 
 async function loadChat() {

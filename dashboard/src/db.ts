@@ -80,9 +80,21 @@ export function getRoom(roomId: string): RoomRow | null {
 // ── KPI Queries ──────────────────────────────────
 
 export function getLatestKpi(): KpiRow | null {
+  // Aggregate KPI across ALL buckets for cumulative counters (chaos_events,
+  // shift_changes, nightrun_events), and use latest values for gauges
+  // (active_agents, tick_count). Single-bucket query missed sparse events.
   return projectionDb
     .query<KpiRow, []>(
-      "SELECT * FROM kpi_1m ORDER BY bucket_start DESC LIMIT 1",
+      `SELECT
+         MAX(bucket_start) as bucket_start,
+         (SELECT active_agents FROM kpi_1m ORDER BY bucket_start DESC LIMIT 1) as active_agents,
+         SUM(total_actions) as total_actions,
+         SUM(total_transits) as total_transits,
+         SUM(chaos_events) as chaos_events,
+         (SELECT tick_count FROM kpi_1m ORDER BY bucket_start DESC LIMIT 1) as tick_count,
+         SUM(shift_changes) as shift_changes,
+         SUM(nightrun_events) as nightrun_events
+       FROM kpi_1m`,
     )
     .get();
 }
@@ -105,6 +117,27 @@ export function getProjectionLag(): number {
   const maxId = maxRow?.max_id ?? 0;
   const offset = offsetRow?.last_event_id ?? 0;
   return Math.max(0, maxId - offset);
+}
+
+// ── Agent Name Lookup (cached) ───────────────────
+
+let _agentNameCache: Map<number, string> | null = null;
+let _agentNameCacheTime = 0;
+
+export function getAgentNameMap(): Map<number, string> {
+  const now = Date.now();
+  // Refresh cache every 60s
+  if (_agentNameCache && now - _agentNameCacheTime < 60_000) {
+    return _agentNameCache;
+  }
+  const rows = projectionDb
+    .query<{ agent_id: number; name: string }, []>(
+      "SELECT agent_id, name FROM agent_live_view",
+    )
+    .all();
+  _agentNameCache = new Map(rows.map((r) => [r.agent_id, r.name]));
+  _agentNameCacheTime = now;
+  return _agentNameCache;
 }
 
 // ── Change Detection (fuer WebSocket) ────────────
@@ -360,10 +393,151 @@ export function getMaxChaosEventId(): number {
   return row?.max_id ?? 0;
 }
 
+// ── Operator Messages (Chat Input) ──────────────
+
+// Operator chat uses its own SQLite DB (EventStore is read-only for dashboard)
+let _chatDb: InstanceType<typeof Database> | null = null;
+function getChatDb(): InstanceType<typeof Database> {
+  if (!_chatDb) {
+    const chatDbPath = process.env.CHAT_DB || "./operator-chat.db";
+    _chatDb = new Database(chatDbPath, { create: true });
+    _chatDb.run(`CREATE TABLE IF NOT EXISTS operator_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      message TEXT NOT NULL,
+      room TEXT,
+      gateway_status TEXT DEFAULT 'pending',
+      gateway_response TEXT,
+      created_at INTEGER NOT NULL
+    )`);
+    // Migrate: add gateway_response column if missing (existing DBs)
+    try {
+      _chatDb.run("ALTER TABLE operator_messages ADD COLUMN gateway_response TEXT");
+    } catch { /* column already exists */ }
+  }
+  return _chatDb;
+}
+
+export function insertOperatorMessage(message: string, room: string | null): number {
+  const db = getChatDb();
+  db.query("INSERT INTO operator_messages (message, room, created_at) VALUES (?, ?, ?)")
+    .run(message, room, Date.now());
+  const row = db
+    .query<{ id: number }, []>("SELECT last_insert_rowid() as id")
+    .get();
+  return row?.id ?? 0;
+}
+
+export function updateOperatorMessageGateway(
+  id: number,
+  status: string,
+  responseContent: string | null,
+): void {
+  const db = getChatDb();
+  db.query("UPDATE operator_messages SET gateway_status = ?, gateway_response = ? WHERE id = ?")
+    .run(status, responseContent, id);
+}
+
+interface OperatorMessageRow {
+  id: number;
+  message: string;
+  room: string | null;
+  gateway_status: string;
+  gateway_response: string | null;
+  created_at: number;
+}
+
+/** Returns operator messages (both outgoing + gateway responses) as ChatMessages for merging. */
+export function getOperatorChatMessages(limit = 100): ChatMessage[] {
+  const db = getChatDb();
+  const rows = db
+    .query<OperatorMessageRow, [number]>(
+      `SELECT id, message, room, gateway_status, gateway_response, created_at
+       FROM operator_messages
+       ORDER BY id DESC
+       LIMIT ?`,
+    )
+    .all(limit);
+
+  const result: ChatMessage[] = [];
+  for (const row of rows) {
+    // Operator's outgoing message
+    result.push({
+      id: -(row.id * 2),  // negative IDs to avoid collision with EventStore IDs
+      event_id: `operator-msg-${row.id}`,
+      agent_id: "operator",
+      agent_name: "Operator",
+      action_type: "operator_message",
+      content: row.message,
+      target_room: row.room,
+      tick: 0,
+      timestamp_ms: row.created_at,
+    });
+
+    // Gateway (agent) response, if available
+    if (row.gateway_response && row.gateway_status === "ok") {
+      result.push({
+        id: -(row.id * 2 + 1),
+        event_id: `operator-resp-${row.id}`,
+        agent_id: "gateway",
+        agent_name: "Agent (Gateway)",
+        action_type: "gateway_response",
+        content: row.gateway_response,
+        target_room: row.room,
+        tick: 0,
+        timestamp_ms: row.created_at + 1,  // +1ms to sort after the operator message
+      });
+    }
+  }
+  return result;
+}
+
+/** Returns operator messages filtered by room. */
+export function getOperatorChatMessagesByRoom(roomId: string, limit = 50): ChatMessage[] {
+  const db = getChatDb();
+  const rows = db
+    .query<OperatorMessageRow, [string, number]>(
+      `SELECT id, message, room, gateway_status, gateway_response, created_at
+       FROM operator_messages
+       WHERE room = ?
+       ORDER BY id DESC
+       LIMIT ?`,
+    )
+    .all(roomId, limit);
+
+  const result: ChatMessage[] = [];
+  for (const row of rows) {
+    result.push({
+      id: -(row.id * 2),
+      event_id: `operator-msg-${row.id}`,
+      agent_id: "operator",
+      agent_name: "Operator",
+      action_type: "operator_message",
+      content: row.message,
+      target_room: row.room,
+      tick: 0,
+      timestamp_ms: row.created_at,
+    });
+    if (row.gateway_response && row.gateway_status === "ok") {
+      result.push({
+        id: -(row.id * 2 + 1),
+        event_id: `operator-resp-${row.id}`,
+        agent_id: "gateway",
+        agent_name: "Agent (Gateway)",
+        action_type: "gateway_response",
+        content: row.gateway_response,
+        target_room: row.room,
+        tick: 0,
+        timestamp_ms: row.created_at + 1,
+      });
+    }
+  }
+  return result;
+}
+
 // ── Chat Messages (Agent Actions) ───────────────
 
 export function getRecentChatMessages(limit = 100): ChatMessage[] {
-  return eventStoreDb
+  const agentMessages = eventStoreDb
     .query<{ id: number; event_id: string; aggregate_id: string; payload: string; tick: number; timestamp_ms: number }, [number]>(
       `SELECT id, event_id, aggregate_id, payload, tick, timestamp_ms
        FROM events
@@ -373,10 +547,17 @@ export function getRecentChatMessages(limit = 100): ChatMessage[] {
     )
     .all(limit)
     .map(toChatMessage);
+
+  const operatorMessages = getOperatorChatMessages(limit);
+
+  // Merge and sort by timestamp descending, take top N
+  return [...agentMessages, ...operatorMessages]
+    .sort((a, b) => b.timestamp_ms - a.timestamp_ms)
+    .slice(0, limit);
 }
 
 export function getChatMessagesByRoom(roomId: string, limit = 50): ChatMessage[] {
-  return eventStoreDb
+  const agentMessages = eventStoreDb
     .query<{ id: number; event_id: string; aggregate_id: string; payload: string; tick: number; timestamp_ms: number }, [string, number]>(
       `SELECT id, event_id, aggregate_id, payload, tick, timestamp_ms
        FROM events
@@ -387,6 +568,12 @@ export function getChatMessagesByRoom(roomId: string, limit = 50): ChatMessage[]
     )
     .all(`%"target_room":"${roomId}"%`, limit)
     .map(toChatMessage);
+
+  const operatorMessages = getOperatorChatMessagesByRoom(roomId, limit);
+
+  return [...agentMessages, ...operatorMessages]
+    .sort((a, b) => b.timestamp_ms - a.timestamp_ms)
+    .slice(0, limit);
 }
 
 function toChatMessage(row: { id: number; event_id: string; aggregate_id: string; payload: string; tick: number; timestamp_ms: number }): ChatMessage {
@@ -398,7 +585,9 @@ function toChatMessage(row: { id: number; event_id: string; aggregate_id: string
   try {
     const p = JSON.parse(row.payload);
     if (p.agent_id) agentId = String(typeof p.agent_id === "object" ? p.agent_id[0] ?? p.agent_id : p.agent_id);
-    agentName = agentId;
+    const nameMap = getAgentNameMap();
+    const numId = parseInt(agentId, 10);
+    agentName = (!isNaN(numId) && nameMap.get(numId)) || p.name || agentId;
     actionType = String(p.action_type ?? "");
     content = p.content ? String(p.content) : null;
     targetRoom = p.target_room ? String(p.target_room) : null;
@@ -444,6 +633,8 @@ const ACTIVITY_EVENT_TYPES = [
   "transit_completed",
   "chaos_triggered",
   "bio_action_performed",
+  "bio_state_updated",
+  "room_physics_updated",
   "shift_transition_completed",
   "nightrun_started",
   "nightrun_completed",

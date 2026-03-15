@@ -24,3 +24,6 @@ timeout_total_secs = 7200
 
 # Max Episodes pro Agent bevor Skip (Backlog-Schutz)
 max_episodes_per_agent = 1000
+
+# Max Jobs pro Run bevor Abbruch (Endlos-Run-Schutz)
+max_jobs_per_run = 100
