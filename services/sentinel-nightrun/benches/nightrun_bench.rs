@@ -37,6 +37,7 @@ fn make_settings(dir: &std::path::Path) -> NightrunSettings {
         timeout_per_agent_secs: 300,
         timeout_total_secs: 7200,
         max_episodes_per_agent: 1000,
+        max_jobs_per_run: 100,
     }
 }
 

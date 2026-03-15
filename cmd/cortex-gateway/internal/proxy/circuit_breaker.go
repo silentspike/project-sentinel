@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -45,6 +47,7 @@ type BreakerConfig struct {
 	FailureThreshold int     // Consecutive failures fuer Open-Transition (default: 5)
 	OpenSeconds      int     // Wartezeit bis Half-Open (default: 30)
 	HalfOpenProbes   int     // Probe-Requests im Half-Open State (default: 3)
+	Enabled          bool    // SENTINEL_CORTEX_CB_ENABLED runtime gate (default: true)
 }
 
 // DefaultBreakerConfig gibt die Issue-spezifizierten Defaults zurueck.
@@ -56,42 +59,37 @@ func DefaultBreakerConfig() BreakerConfig {
 		FailureThreshold: 5,
 		OpenSeconds:      30,
 		HalfOpenProbes:   3,
+		Enabled:          true,
 	}
+}
+
+// envPositiveInt reads an ENV variable as positive int, returning fallback if unset or invalid.
+func envPositiveInt(name string, fallback int) int {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
 }
 
 // BreakerConfigFromEnv liest Circuit-Breaker-Config aus ENV-Variablen.
 // Fehlende/ungueltige Werte fallen auf Defaults zurueck.
 func BreakerConfigFromEnv() BreakerConfig {
 	cfg := DefaultBreakerConfig()
-	if v := os.Getenv("SENTINEL_CORTEX_CB_WINDOW_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.WindowSeconds = n
-		}
-	}
-	if v := os.Getenv("SENTINEL_CORTEX_CB_MIN_REQUESTS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.MinRequests = n
-		}
-	}
+	cfg.WindowSeconds = envPositiveInt("SENTINEL_CORTEX_CB_WINDOW_SECONDS", cfg.WindowSeconds)
+	cfg.MinRequests = envPositiveInt("SENTINEL_CORTEX_CB_MIN_REQUESTS", cfg.MinRequests)
+	cfg.FailureThreshold = envPositiveInt("SENTINEL_CORTEX_CB_FAILURE_THRESHOLD", cfg.FailureThreshold)
+	cfg.OpenSeconds = envPositiveInt("SENTINEL_CORTEX_CB_OPEN_SECONDS", cfg.OpenSeconds)
+	cfg.HalfOpenProbes = envPositiveInt("SENTINEL_CORTEX_CB_HALFOPEN_PROBES", cfg.HalfOpenProbes)
 	if v := os.Getenv("SENTINEL_CORTEX_CB_FAILURE_RATIO"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 && f <= 1 {
 			cfg.FailureRatio = f
 		}
 	}
-	if v := os.Getenv("SENTINEL_CORTEX_CB_FAILURE_THRESHOLD"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.FailureThreshold = n
-		}
-	}
-	if v := os.Getenv("SENTINEL_CORTEX_CB_OPEN_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.OpenSeconds = n
-		}
-	}
-	if v := os.Getenv("SENTINEL_CORTEX_CB_HALFOPEN_PROBES"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.HalfOpenProbes = n
-		}
+	if v := os.Getenv("SENTINEL_CORTEX_CB_ENABLED"); strings.EqualFold(v, "false") || v == "0" {
+		cfg.Enabled = false
+		slog.Warn("Feature deaktiviert via ENV", "flag", "SENTINEL_CORTEX_CB_ENABLED")
 	}
 	return cfg
 }

@@ -24,6 +24,7 @@ pub struct GuardrailController {
     max_episodes_per_agent: usize,
     timeout_total_secs: u64,
     timeout_per_agent_secs: u64,
+    max_jobs_per_run: usize,
 }
 
 impl GuardrailController {
@@ -33,6 +34,7 @@ impl GuardrailController {
             max_episodes_per_agent: settings.max_episodes_per_agent,
             timeout_total_secs: settings.timeout_total_secs,
             timeout_per_agent_secs: settings.timeout_per_agent_secs,
+            max_jobs_per_run: settings.max_jobs_per_run,
         }
     }
 
@@ -57,6 +59,20 @@ impl GuardrailController {
                 reason: format!(
                     "Total-Timeout erreicht: {elapsed_secs}s >= {}s",
                     self.timeout_total_secs
+                ),
+            }
+        } else {
+            GuardrailDecision::Proceed
+        }
+    }
+
+    /// Check whether the job count has exceeded max_jobs_per_run.
+    pub fn check_job_count(&self, current_jobs: usize) -> GuardrailDecision {
+        if current_jobs >= self.max_jobs_per_run {
+            GuardrailDecision::Abort {
+                reason: format!(
+                    "Max Jobs pro Run erreicht: {current_jobs} >= {}",
+                    self.max_jobs_per_run
                 ),
             }
         } else {
@@ -94,6 +110,7 @@ mod tests {
             timeout_per_agent_secs: 300,
             timeout_total_secs: 7200,
             max_episodes_per_agent: 1000,
+            max_jobs_per_run: 100,
         }
     }
 
@@ -165,6 +182,32 @@ mod tests {
         assert!(matches!(
             gc.check_agent_timeout(300),
             GuardrailDecision::Skip { .. }
+        ));
+    }
+
+    #[test]
+    fn job_count_proceed() {
+        let gc = GuardrailController::from_settings(&test_settings());
+        assert_eq!(gc.check_job_count(50), GuardrailDecision::Proceed);
+    }
+
+    #[test]
+    fn job_count_abort_at_limit() {
+        let gc = GuardrailController::from_settings(&test_settings());
+        match gc.check_job_count(100) {
+            GuardrailDecision::Abort { reason } => {
+                assert!(reason.contains("100"));
+            }
+            other => panic!("expected Abort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn job_count_abort_over_limit() {
+        let gc = GuardrailController::from_settings(&test_settings());
+        assert!(matches!(
+            gc.check_job_count(150),
+            GuardrailDecision::Abort { .. }
         ));
     }
 

@@ -29,6 +29,10 @@ pub struct NightrunSettings {
     /// Max Episodes pro Agent bevor Skip (default: 1000).
     #[serde(default = "default_max_episodes")]
     pub max_episodes_per_agent: usize,
+    /// Max Jobs pro Run bevor Abbruch (default: 100).
+    /// Verhindert Endlos-Runs bei grossen Agent-Pools.
+    #[serde(default = "default_max_jobs_per_run")]
+    pub max_jobs_per_run: usize,
 }
 
 fn default_timeout_per_agent() -> u64 {
@@ -39,6 +43,9 @@ fn default_timeout_total() -> u64 {
 }
 fn default_max_episodes() -> usize {
     1000
+}
+fn default_max_jobs_per_run() -> usize {
+    100
 }
 
 impl NightrunConfig {
@@ -66,11 +73,13 @@ job_queue_path = "data/nightrun-jobs.db"
 timeout_per_agent_secs = 120
 timeout_total_secs = 3600
 max_episodes_per_agent = 500
+max_jobs_per_run = 50
 "#;
         let config: NightrunConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.nightrun.hippocampus_db, "data/hippocampus.redb");
         assert_eq!(config.nightrun.timeout_per_agent_secs, 120);
         assert_eq!(config.nightrun.max_episodes_per_agent, 500);
+        assert_eq!(config.nightrun.max_jobs_per_run, 50);
     }
 
     #[test]
@@ -86,5 +95,6 @@ job_queue_path = "data/nightrun-jobs.db"
         assert_eq!(config.nightrun.timeout_per_agent_secs, 300);
         assert_eq!(config.nightrun.timeout_total_secs, 7200);
         assert_eq!(config.nightrun.max_episodes_per_agent, 1000);
+        assert_eq!(config.nightrun.max_jobs_per_run, 100);
     }
 }

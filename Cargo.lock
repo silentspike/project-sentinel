@@ -4260,6 +4260,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml 1.0.3+spec-1.1.0",
+ "tracing",
  "uuid",
 ]
 
@@ -4372,16 +4373,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "sentinel-inference"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "sentinel-common",
- "tempfile",
- "tracing",
 ]
 
 [[package]]

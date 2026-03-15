@@ -110,10 +110,14 @@ pub struct ObjectMetadata {
     pub created_at: u64,
     /// Number of chunks in the manifest.
     pub chunk_count: u32,
+    /// SHA-256 digest of the original (uncompressed) source data.
+    /// Enables post-hoc integrity verification without chunk recomputation.
+    #[serde(default)]
+    pub sha256: [u8; 32],
 }
 
 impl ObjectMetadata {
-    pub fn new(size: u64, mime: impl Into<String>, chunk_count: u32) -> Self {
+    pub fn new(size: u64, mime: impl Into<String>, chunk_count: u32, sha256: [u8; 32]) -> Self {
         let created_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -123,6 +127,7 @@ impl ObjectMetadata {
             mime: mime.into(),
             created_at,
             chunk_count,
+            sha256,
         }
     }
 
@@ -570,12 +575,14 @@ mod tests {
 
     #[test]
     fn object_metadata_roundtrip() {
-        let meta = ObjectMetadata::new(1024, "text/plain", 16);
+        let sha256 = [0xABu8; 32];
+        let meta = ObjectMetadata::new(1024, "text/plain", 16, sha256);
         let bytes = meta.serialize().unwrap();
         let decoded = ObjectMetadata::deserialize(&bytes).unwrap();
         assert_eq!(decoded.size, 1024);
         assert_eq!(decoded.mime, "text/plain");
         assert_eq!(decoded.chunk_count, 16);
+        assert_eq!(decoded.sha256, sha256);
     }
 
     #[test]
