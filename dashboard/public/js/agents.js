@@ -142,7 +142,7 @@ async function loadAgentDetail(agentId, card) {
       bioSection.appendChild(createBioBar('Hunger', data.hunger));
       bioSection.appendChild(createBioBar('Energie', data.energy));
       bioSection.appendChild(createBioBar('Stress', data.stress));
-      bioSection.appendChild(createBioBar('Koffein', data.caffeine));
+      bioSection.appendChild(createBioBar('Koffein', data.caffeine_mg));
       bioSection.appendChild(createBioBar('Blase', data.bladder));
       bioSection.appendChild(createBioBar('Sozial', data.social_need));
       card.appendChild(bioSection);
