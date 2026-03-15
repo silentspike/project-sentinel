@@ -129,6 +129,9 @@ type PipelineHandler struct {
 	breakerMu  sync.RWMutex
 	breakers   map[string]*CircuitBreaker
 	breakerCfg BreakerConfig
+
+	regenMu       sync.Mutex
+	regenCooldown map[string]time.Time // agent → last regen time (#240)
 }
 
 // BreakerStates gibt den aktuellen State aller bekannten Circuit Breaker zurueck.
@@ -184,6 +187,7 @@ func NewPipelineHandler(cfg PipelineConfig) *PipelineHandler {
 		quality:          cfg.Quality,
 		breakers:         make(map[string]*CircuitBreaker),
 		breakerCfg:       cfg.BreakerCfg,
+		regenCooldown:    make(map[string]time.Time),
 	}
 }
 
@@ -611,6 +615,17 @@ func (ph *PipelineHandler) personalityGuardCheck(ctx context.Context, content, a
 	if result.DriftScore < snap.DriftThreshold {
 		return content
 	}
+
+	// Cooldown: max 1 re-generation per agent per 5 minutes (#240)
+	ph.regenMu.Lock()
+	lastRegen, hasRegen := ph.regenCooldown[agentName]
+	if hasRegen && time.Since(lastRegen) < 5*time.Minute {
+		ph.regenMu.Unlock()
+		ph.logger.Debug("personality guard cooldown active", "agent", agentName)
+		return content
+	}
+	ph.regenCooldown[agentName] = time.Now()
+	ph.regenMu.Unlock()
 
 	ph.logger.Warn("personality drift detected",
 		"agent", agentName,

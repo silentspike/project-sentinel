@@ -295,8 +295,8 @@ func TestConfig_Defaults_PipelineHardening(t *testing.T) {
 	if snap.PersonalityGuardEnabled {
 		t.Error("personality_guard_enabled should default to false")
 	}
-	if snap.DriftThreshold != 0.7 {
-		t.Errorf("drift_threshold default: want 0.7, got %f", snap.DriftThreshold)
+	if snap.DriftThreshold != 0.95 {
+		t.Errorf("drift_threshold default: want 0.95, got %f", snap.DriftThreshold)
 	}
 	if snap.QualityGateEnabled {
 		t.Error("quality_gate_enabled should default to false")

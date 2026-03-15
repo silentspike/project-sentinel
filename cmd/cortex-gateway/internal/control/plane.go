@@ -66,7 +66,7 @@ func NewConfig(primaryProvider string) *Config {
 		agentOverrides:  make(map[string]string),
 
 		personalityGuardEnabled: false,
-		driftThreshold:          0.7,
+		driftThreshold:          0.95,
 		qualityGateEnabled:      false,
 		qualityThreshold:        2,
 		qualityMaxRegen:         1,

@@ -119,6 +119,27 @@ export function getProjectionLag(): number {
   return Math.max(0, maxId - offset);
 }
 
+// ── Agent Name Lookup (cached) ───────────────────
+
+let _agentNameCache: Map<number, string> | null = null;
+let _agentNameCacheTime = 0;
+
+export function getAgentNameMap(): Map<number, string> {
+  const now = Date.now();
+  // Refresh cache every 60s
+  if (_agentNameCache && now - _agentNameCacheTime < 60_000) {
+    return _agentNameCache;
+  }
+  const rows = projectionDb
+    .query<{ agent_id: number; name: string }, []>(
+      "SELECT agent_id, name FROM agent_live_view",
+    )
+    .all();
+  _agentNameCache = new Map(rows.map((r) => [r.agent_id, r.name]));
+  _agentNameCacheTime = now;
+  return _agentNameCache;
+}
+
 // ── Change Detection (fuer WebSocket) ────────────
 
 export function getMaxAgentEventId(): number {
