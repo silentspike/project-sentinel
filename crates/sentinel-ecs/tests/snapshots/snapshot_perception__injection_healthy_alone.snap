@@ -5,7 +5,7 @@ expression: injection
 [SYSTEM_INJECTION]
 CIRCADIAN: 09:30 (Du arbeitest seit 2h konzentriert)
 KOERPER: Du fuehlst dich gut.
-ENVIRONMENT: Die Temperatur ist angenehm.
-AKUSTIK: Stille.
+ENVIRONMENT: Die Temperatur ist angenehm (21.5 °C).
+AKUSTIK: Stille (32 dB).
 ANWESEND: Du bist allein.
 [/SYSTEM_INJECTION]

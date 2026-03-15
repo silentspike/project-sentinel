@@ -113,6 +113,57 @@ beforeAll(() => {
       i, `evt-${i}`, "AgentActed", `agent-${i % 3}`, "{}", `corr-${i}`, null, `op-${i}`, i, Date.now(),
     );
   }
+  insertEvent.run(
+    101,
+    "room-physics-1",
+    "room_physics_updated",
+    "buero-dev-1",
+    JSON.stringify({
+      room_id: "buero-dev-1",
+      temperature: 23.4,
+      co2_ppm: 520,
+      noise_db: 48.2,
+      occupant_count: 1,
+    }),
+    "corr-room-1",
+    null,
+    "op-room-1",
+    101,
+    Date.now(),
+  );
+  insertEvent.run(
+    102,
+    "chaos-room-1",
+    "chaos_triggered",
+    "buero-dev-1",
+    JSON.stringify({
+      event_type: "PrinterBroken",
+      target_room: "buero-dev-1",
+      description: "Drucker defekt",
+    }),
+    "corr-room-2",
+    null,
+    "op-room-2",
+    102,
+    Date.now(),
+  );
+  insertEvent.run(
+    103,
+    "action-room-1",
+    "agent_action_received",
+    "agent-1",
+    JSON.stringify({
+      agent_id: 1,
+      action_type: "Move",
+      target_room: "buero-dev-1",
+      content: "Lueften",
+    }),
+    "corr-room-3",
+    null,
+    "op-room-3",
+    103,
+    Date.now(),
+  );
   esDb.prepare(
     "INSERT INTO projection_offsets VALUES (?, ?, ?)",
   ).run("sentinel-projection", 95, Date.now());
@@ -208,6 +259,22 @@ describe("Acceptance Tests - Issue #24: Dashboard Live-Daten", () => {
     expect(data.active_chaos).toEqual({ type: "fire_alarm", severity: "medium" });
   });
 
+  test("AC-3d: /api/rooms/:id/detail returns history and reactions", async () => {
+    const res = await app.request("/api/rooms/buero-dev-1/detail");
+    expect(res.status).toBe(200);
+
+    const data = await res.json();
+    expect(data.id).toBe("buero-dev-1");
+    expect(Array.isArray(data.physics_history)).toBe(true);
+    expect(data.physics_history.length).toBeGreaterThan(0);
+    expect(Array.isArray(data.chaos_history)).toBe(true);
+    expect(Array.isArray(data.stimulus_history)).toBe(true);
+    expect(data.chaos_history[0].chaos_type).toBe("PrinterBroken");
+    expect(Array.isArray(data.recent_reactions)).toBe(true);
+    expect(data.recent_reactions[0].target_room).toBe("buero-dev-1");
+    expect(data.reaction_window_ticks).toBe(60);
+  });
+
   // AC-3c: Unknown room returns 404
   test("AC-3c: /api/rooms/unknown returns 404", async () => {
     const res = await app.request("/api/rooms/nonexistent");
@@ -236,7 +303,7 @@ describe("Acceptance Tests - Issue #24: Dashboard Live-Daten", () => {
     const data = await res.json();
     expect(data.status).toBe("ok");
     expect(typeof data.uptime).toBe("number");
-    expect(data.projection_lag).toBe(5); // 100 events - offset 95
+    expect(data.projection_lag).toBe(8); // 103 events - offset 95
   });
 
   // AC-N1: Kein Mock-Import im Produktionscode

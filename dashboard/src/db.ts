@@ -2,10 +2,43 @@
 // Lag-Berechnung: MAX(events.id) - projection_offsets.last_event_id
 
 import { Database } from "bun:sqlite";
-import type { AgentRow, RoomRow, KpiRow, EventRow, EvolutionRow, ChaosEventItem, ChatMessage } from "./types";
+import type {
+  AgentRow,
+  RoomRow,
+  KpiRow,
+  EventRow,
+  EvolutionRow,
+  ChaosEventItem,
+  ChatMessage,
+  RoomPhysicsHistoryPoint,
+  RoomReactionItem,
+  RoomStimulusHistoryItem,
+} from "./types";
 
 let projectionDb: Database;
 let eventStoreDb: Database;
+export const ROOM_REACTION_WINDOW_TICKS = 60;
+
+interface ProjectedRoomOccupants {
+  [roomId: string]: {
+    agentIds: number[];
+    names: string[];
+  };
+}
+
+interface StoredEventRow {
+  event_id: string;
+  aggregate_id: string;
+  payload: string;
+  correlation_id: string;
+  tick: number;
+  timestamp_ms: number;
+}
+
+function resetCaches(): void {
+  _agentNameCache = null;
+  _agentNameCacheTime = 0;
+}
 
 export function openDatabases(
   projectionPath: string,
@@ -13,11 +46,13 @@ export function openDatabases(
 ): void {
   projectionDb = new Database(projectionPath, { readonly: true });
   eventStoreDb = new Database(eventStorePath, { readonly: true });
+  resetCaches();
 }
 
 export function setDatabases(proj: Database, es: Database): void {
   projectionDb = proj;
   eventStoreDb = es;
+  resetCaches();
 }
 
 export function getEventStoreDb(): Database {
@@ -27,16 +62,81 @@ export function getEventStoreDb(): Database {
 export function closeDatabases(): void {
   projectionDb?.close();
   eventStoreDb?.close();
+  resetCaches();
 }
 
-// ── Agent Queries ────────────────────────────────
-
-export function getActiveAgents(): AgentRow[] {
+function getExplicitActiveAgents(): AgentRow[] {
   return projectionDb
     .query<AgentRow, []>(
       "SELECT * FROM agent_live_view WHERE status = 'active' ORDER BY agent_id",
     )
     .all();
+}
+
+function getProjectedLiveAgents(): AgentRow[] {
+  const explicitActive = getExplicitActiveAgents();
+  if (explicitActive.length > 0) return explicitActive;
+
+  const occupancyLimitByRoom = new Map(
+    getAllRooms().map((room) => [room.room_id, Math.max(0, room.occupant_count)]),
+  );
+  const selectedByRoom = new Map<string, number>();
+  const projectedRows = projectionDb
+    .query<AgentRow, []>(
+      `SELECT *
+       FROM agent_live_view
+       WHERE current_room IS NOT NULL
+       ORDER BY last_event_id DESC, updated_at DESC, agent_id ASC`,
+    )
+    .all();
+
+  const liveAgents: AgentRow[] = [];
+  for (const row of projectedRows) {
+    const roomId = row.current_room;
+    if (!roomId) continue;
+    const limit = occupancyLimitByRoom.get(roomId);
+    if (limit == null || limit <= 0) continue;
+    const selected = selectedByRoom.get(roomId) ?? 0;
+    if (selected >= limit) continue;
+    selectedByRoom.set(roomId, selected + 1);
+    liveAgents.push(row.status === "active" ? row : { ...row, status: "active" });
+  }
+
+  return liveAgents.sort((a, b) => a.agent_id - b.agent_id);
+}
+
+function getProjectedOccupantsByRoom(): ProjectedRoomOccupants {
+  const result: ProjectedRoomOccupants = {};
+  for (const agent of getProjectedLiveAgents()) {
+    if (!agent.current_room) continue;
+    if (!result[agent.current_room]) {
+      result[agent.current_room] = { agentIds: [], names: [] };
+    }
+    result[agent.current_room].agentIds.push(agent.agent_id);
+    result[agent.current_room].names.push(agent.name);
+  }
+  return result;
+}
+
+function normalizeAgentId(rawAgentId: unknown, fallback: string): {
+  agentId: string;
+  numericId: number | null;
+} {
+  const agentId =
+    typeof rawAgentId === "object" && Array.isArray(rawAgentId)
+      ? String(rawAgentId[0] ?? fallback)
+      : String(rawAgentId ?? fallback);
+  const match = agentId.match(/(\d+)/);
+  return {
+    agentId,
+    numericId: match ? parseInt(match[1], 10) : null,
+  };
+}
+
+// ── Agent Queries ────────────────────────────────
+
+export function getActiveAgents(): AgentRow[] {
+  return getProjectedLiveAgents();
 }
 
 export function getAllAgents(): AgentRow[] {
@@ -75,6 +175,369 @@ export function getRoom(roomId: string): RoomRow | null {
       "SELECT * FROM room_live_view WHERE room_id = ?",
     )
     .get(roomId);
+}
+
+export function getRoomPhysicsHistory(
+  roomId: string,
+  limit = 30,
+): RoomPhysicsHistoryPoint[] {
+  const rows = eventStoreDb
+    .query<
+      {
+        payload: string;
+        tick: number;
+        timestamp_ms: number;
+      },
+      [string, number]
+    >(
+      `SELECT payload, tick, timestamp_ms
+       FROM events
+       WHERE event_type = 'room_physics_updated'
+         AND aggregate_id = ?
+       ORDER BY id DESC
+       LIMIT ?`,
+    )
+    .all(roomId, limit);
+
+  return rows
+    .map((row) => {
+      try {
+        const payload = JSON.parse(row.payload) as {
+          temperature?: number | null;
+          co2_ppm?: number | null;
+          noise_db?: number | null;
+          occupant_count?: number;
+        };
+        return {
+          tick: row.tick,
+          timestamp_ms: row.timestamp_ms,
+          temperature: payload.temperature ?? null,
+          co2_ppm: payload.co2_ppm ?? null,
+          noise_db: payload.noise_db ?? null,
+          occupant_count: payload.occupant_count ?? 0,
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter((row): row is RoomPhysicsHistoryPoint => row !== null)
+    .reverse();
+}
+
+export function getRoomRecentReactions(
+  roomId: string,
+  limit = 20,
+): RoomReactionItem[] {
+  const room = getRoom(roomId);
+  const roomLastTick = room?.last_event_tick ?? null;
+  const chaosEventsAsc = getChaosEventsByRoom(roomId, 100)
+    .slice()
+    .sort((a, b) => a.tick - b.tick)
+    .filter((event) => roomLastTick == null || event.tick <= roomLastTick);
+  const stimulusEventsAsc = getRoomStimulusEventsByRoom(roomId, 100)
+    .slice()
+    .sort((a, b) => a.tick - b.tick)
+    .filter((event) => roomLastTick == null || event.tick <= roomLastTick);
+  const occupantsByRoom = getProjectedOccupantsByRoom();
+  const occupantIds = new Set(occupantsByRoom[roomId]?.agentIds ?? []);
+  const knownRoomIds = new Set(getAllRooms().map((room) => room.room_id));
+  const recentTickFloor = Math.max(
+    0,
+    (roomLastTick ?? ROOM_REACTION_WINDOW_TICKS) - ROOM_REACTION_WINDOW_TICKS,
+  );
+  const latestStimulus = stimulusEventsAsc.at(-1) ?? null;
+  const latestChaos = chaosEventsAsc.at(-1) ?? null;
+  const latestContextTick = Math.max(latestStimulus?.tick ?? -1, latestChaos?.tick ?? -1);
+
+  if (latestContextTick >= 0) {
+    const windowStartTick = latestContextTick;
+    const windowEndTick = latestContextTick + ROOM_REACTION_WINDOW_TICKS;
+    const transitRows = eventStoreDb
+      .query<StoredEventRow, [number, number, string, number]>(
+        `SELECT event_id, aggregate_id, payload, correlation_id, tick, timestamp_ms
+         FROM events
+         WHERE event_type = 'transit_started'
+           AND tick BETWEEN ? AND ?
+           AND payload LIKE ?
+         ORDER BY id DESC
+         LIMIT ?`,
+      )
+      .all(windowStartTick, windowEndTick, `%"from_room":"${roomId}"%`, limit * 50);
+    const transitAgentIds = new Set<number>();
+    for (const row of transitRows) {
+      const { numericId } = normalizeAgentId(undefined, row.aggregate_id);
+      if (numericId != null) transitAgentIds.add(numericId);
+    }
+    const candidateAgentIds = new Set<number>([...occupantIds, ...transitAgentIds]);
+    const windowActions = eventStoreDb
+      .query<StoredEventRow, [number, number, number]>(
+        `SELECT event_id, aggregate_id, payload, correlation_id, tick, timestamp_ms
+         FROM events
+         WHERE event_type = 'agent_action_received'
+           AND tick BETWEEN ? AND ?
+         ORDER BY id DESC
+         LIMIT ?`,
+      )
+      .all(windowStartTick, windowEndTick, limit * 100);
+    const correlatedReactions = [
+      ...windowActions
+        .map((row) =>
+          toRoomReactionItem(row, {
+            roomId,
+            occupantIds: candidateAgentIds,
+            knownRoomIds,
+            chaosEventsAsc,
+            stimulusEventsAsc,
+            allowAnyCandidateTarget: true,
+          }),
+        )
+        .filter((row): row is RoomReactionItem => row !== null),
+      ...transitRows
+        .map((row) =>
+          toTransitReactionItem(row, {
+            roomId,
+            latestChaos,
+            latestStimulus,
+          }),
+        )
+        .filter((row): row is RoomReactionItem => row !== null),
+    ];
+    if (correlatedReactions.length > 0) {
+      return finalizeRoomReactions(correlatedReactions, limit);
+    }
+  }
+
+  const fallbackReactions = eventStoreDb
+    .query<StoredEventRow, [number, number]>(
+      `SELECT event_id, aggregate_id, payload, correlation_id, tick, timestamp_ms
+       FROM events
+       WHERE event_type = 'agent_action_received'
+         AND tick >= ?
+       ORDER BY id DESC
+       LIMIT ?`,
+    )
+    .all(recentTickFloor, limit * 25)
+    .map((row) =>
+      toRoomReactionItem(row, {
+        roomId,
+        occupantIds,
+        knownRoomIds,
+        chaosEventsAsc,
+        stimulusEventsAsc,
+      }),
+    )
+    .filter((row): row is RoomReactionItem => row !== null);
+
+  return finalizeRoomReactions(fallbackReactions, limit);
+}
+
+function toRoomReactionItem(
+  row: StoredEventRow,
+  options: {
+    roomId: string;
+    occupantIds: Set<number>;
+    knownRoomIds: Set<string>;
+    chaosEventsAsc: ChaosEventItem[];
+    stimulusEventsAsc: RoomStimulusHistoryItem[];
+    allowAnyCandidateTarget?: boolean;
+  },
+): RoomReactionItem | null {
+  const matchingChaos = [...options.chaosEventsAsc]
+    .reverse()
+    .find((chaos) => {
+      const delta = row.tick - chaos.tick;
+      return delta >= 0 && delta <= ROOM_REACTION_WINDOW_TICKS;
+    }) ?? null;
+  const matchingStimulus = [...options.stimulusEventsAsc]
+    .reverse()
+    .find((stimulus) => {
+      const delta = row.tick - stimulus.tick;
+      return delta >= 0 && delta <= ROOM_REACTION_WINDOW_TICKS;
+    }) ?? null;
+  try {
+    const payload = JSON.parse(row.payload) as {
+      agent_id?: unknown;
+      action_type?: string;
+      content?: string | null;
+      target_room?: string | null;
+    };
+    const { agentId, numericId } = normalizeAgentId(
+      payload.agent_id,
+      row.aggregate_id,
+    );
+    const targetRoom = payload.target_room ? String(payload.target_room) : null;
+    const candidateMatch =
+      numericId != null && options.occupantIds.has(numericId);
+    const belongsToRoom =
+      targetRoom === options.roomId ||
+      (options.allowAnyCandidateTarget
+        ? candidateMatch
+        : candidateMatch && (!targetRoom || !options.knownRoomIds.has(targetRoom)));
+    if (!belongsToRoom) return null;
+    const agentNameMap = getAgentNameMap();
+    return {
+      event_id: row.event_id,
+      agent_id: agentId,
+      agent_name:
+        (numericId != null && agentNameMap.get(numericId)) || agentId,
+      action_type: String(payload.action_type ?? ""),
+      content: payload.content ? String(payload.content) : null,
+      target_room: targetRoom,
+      tick: row.tick,
+      timestamp_ms: row.timestamp_ms,
+      correlation_id: row.correlation_id,
+      chaos_event_id: matchingChaos?.event_id ?? null,
+      chaos_type: matchingChaos?.chaos_type ?? null,
+      chaos_description: matchingChaos?.description ?? null,
+      chaos_tick: matchingChaos?.tick ?? null,
+      stimulus_event_id: matchingStimulus?.event_id ?? null,
+      stimulus_type: matchingStimulus?.stimulus_type ?? null,
+      stimulus_description: matchingStimulus?.description ?? null,
+      stimulus_tick: matchingStimulus?.tick ?? null,
+    };
+  } catch {
+    const { agentId, numericId } = normalizeAgentId(undefined, row.aggregate_id);
+    if (numericId == null || !options.occupantIds.has(numericId)) return null;
+    return {
+      event_id: row.event_id,
+      agent_id: agentId,
+      agent_name: row.aggregate_id,
+      action_type: "",
+      content: null,
+      target_room: options.roomId,
+      tick: row.tick,
+      timestamp_ms: row.timestamp_ms,
+      correlation_id: row.correlation_id,
+      chaos_event_id: matchingChaos?.event_id ?? null,
+      chaos_type: matchingChaos?.chaos_type ?? null,
+      chaos_description: matchingChaos?.description ?? null,
+      chaos_tick: matchingChaos?.tick ?? null,
+      stimulus_event_id: matchingStimulus?.event_id ?? null,
+      stimulus_type: matchingStimulus?.stimulus_type ?? null,
+      stimulus_description: matchingStimulus?.description ?? null,
+      stimulus_tick: matchingStimulus?.tick ?? null,
+    };
+  }
+}
+
+function toTransitReactionItem(
+  row: StoredEventRow,
+  options: {
+    roomId: string;
+    latestChaos: ChaosEventItem | null;
+    latestStimulus: RoomStimulusHistoryItem | null;
+  },
+): RoomReactionItem | null {
+  try {
+    const payload = JSON.parse(row.payload) as {
+      from_room?: string | null;
+      to_room?: string | null;
+    };
+    if (payload.from_room !== options.roomId) return null;
+    const { agentId, numericId } = normalizeAgentId(undefined, row.aggregate_id);
+    const agentNameMap = getAgentNameMap();
+    const toRoom = payload.to_room ? String(payload.to_room) : null;
+    const content = toRoom ? `wechselt nach ${toRoom}` : "verlaesst den Raum";
+    return {
+      event_id: row.event_id,
+      agent_id: agentId,
+      agent_name:
+        (numericId != null && agentNameMap.get(numericId)) || agentId,
+      action_type: "Transit",
+      content,
+      target_room: toRoom,
+      tick: row.tick,
+      timestamp_ms: row.timestamp_ms,
+      correlation_id: row.correlation_id,
+      chaos_event_id: options.latestChaos?.event_id ?? null,
+      chaos_type: options.latestChaos?.chaos_type ?? null,
+      chaos_description: options.latestChaos?.description ?? null,
+      chaos_tick: options.latestChaos?.tick ?? null,
+      stimulus_event_id: options.latestStimulus?.event_id ?? null,
+      stimulus_type: options.latestStimulus?.stimulus_type ?? null,
+      stimulus_description: options.latestStimulus?.description ?? null,
+      stimulus_tick: options.latestStimulus?.tick ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function finalizeRoomReactions(
+  items: RoomReactionItem[],
+  limit: number,
+): RoomReactionItem[] {
+  const deduped = new Map<string, RoomReactionItem>();
+  for (const item of items) {
+    deduped.set(item.event_id, item);
+  }
+  return [...deduped.values()]
+    .sort((a, b) => {
+      const aContextScore = (a.stimulus_event_id ? 2 : 0) + (a.chaos_event_id ? 1 : 0);
+      const bContextScore = (b.stimulus_event_id ? 2 : 0) + (b.chaos_event_id ? 1 : 0);
+      if (aContextScore !== bContextScore) {
+        return bContextScore - aContextScore;
+      }
+      if (a.timestamp_ms !== b.timestamp_ms) {
+        return b.timestamp_ms - a.timestamp_ms;
+      }
+      return b.tick - a.tick;
+    })
+    .slice(0, limit)
+    .reverse();
+}
+
+export function getRoomStimulusEventsByRoom(
+  roomId: string,
+  limit = 50,
+): RoomStimulusHistoryItem[] {
+  return eventStoreDb
+    .query<
+      {
+        event_id: string;
+        aggregate_id: string;
+        payload: string;
+        tick: number;
+        timestamp_ms: number;
+      },
+      [string, number]
+    >(
+      `SELECT event_id, aggregate_id, payload, tick, timestamp_ms
+       FROM events
+       WHERE event_type = 'room_stimulus_applied'
+         AND aggregate_id = ?
+       ORDER BY id DESC
+       LIMIT ?`,
+    )
+    .all(roomId, limit)
+    .map((row) => {
+      let stimulusType = "unknown";
+      let delta = 0;
+      let description = "";
+      try {
+        const payload = JSON.parse(row.payload) as {
+          room_id?: string;
+          stimulus_type?: string;
+          delta?: number;
+          description?: string;
+        };
+        stimulusType = String(payload.stimulus_type ?? "unknown");
+        delta = typeof payload.delta === "number" ? payload.delta : 0;
+        description = String(payload.description ?? "");
+      } catch {
+        // ignore parse errors
+      }
+      return {
+        event_id: row.event_id,
+        room_id: row.aggregate_id,
+        stimulus_type: stimulusType,
+        delta,
+        description,
+        tick: row.tick,
+        timestamp_ms: row.timestamp_ms,
+      };
+    })
+    .reverse();
 }
 
 // ── KPI Queries ──────────────────────────────────
@@ -608,15 +1071,9 @@ function toChatMessage(row: { id: number; event_id: string; aggregate_id: string
 // ── Room Occupants ──────────────────────────────
 
 export function getOccupantsByRoom(): Record<string, string[]> {
-  const rows = projectionDb
-    .query<{ name: string; current_room: string }, []>(
-      "SELECT name, current_room FROM agent_live_view WHERE status = 'active' AND current_room IS NOT NULL",
-    )
-    .all();
   const result: Record<string, string[]> = {};
-  for (const row of rows) {
-    if (!result[row.current_room]) result[row.current_room] = [];
-    result[row.current_room].push(row.name);
+  for (const [roomId, data] of Object.entries(getProjectedOccupantsByRoom())) {
+    result[roomId] = data.names.slice();
   }
   return result;
 }

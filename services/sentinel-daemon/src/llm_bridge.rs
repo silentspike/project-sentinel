@@ -345,20 +345,6 @@ pub mod bridge {
 
     /// Baut den Gateway-Request aus einer Perception + Evolution-Daten aus redb.
     fn build_gateway_request(perception: &Perception, store: &StateStore) -> GatewayRequest {
-        // System-Injection Block (wie in architecture.md definiert)
-        let system_injection = format!(
-            "[SYSTEM_INJECTION]\n\
-             Koerperwahrnehmung: {}\n\
-             Umgebungswahrnehmung: {}\n\
-             Soziale Wahrnehmung: {}\n\
-             Tageszeit: {}\n\
-             [/SYSTEM_INJECTION]",
-            perception.body_text,
-            perception.environment_text,
-            perception.presence_text,
-            perception.circadian_text,
-        );
-
         let user_prompt = if perception.impulse_text.is_empty() {
             "Was machst du als naechstes? Reagiere natuerlich auf deine aktuelle Situation."
                 .to_string()
@@ -370,11 +356,18 @@ pub mod bridge {
             )
         };
 
+        let formatted_perception = format_perception_metadata(perception);
         let mut metadata = HashMap::new();
         metadata.insert("agent_id".to_string(), perception.agent_id.0.to_string());
+        metadata.insert("circadian".to_string(), perception.circadian_text.clone());
+        metadata.insert("body".to_string(), perception.body_text.clone());
+        metadata.insert("environment".to_string(), perception.environment_text.clone());
+        metadata.insert("acoustic".to_string(), perception.acoustic_text.clone());
+        metadata.insert("presence".to_string(), perception.presence_text.clone());
+        metadata.insert("impulse".to_string(), perception.impulse_text.clone());
         metadata.insert(
             "perception".to_string(),
-            serde_json::to_string(perception).unwrap_or_default(),
+            formatted_perception,
         );
         metadata.insert("tick".to_string(), perception.tick.0.to_string());
         metadata.insert("request_id".to_string(), uuid::Uuid::new_v4().to_string());
@@ -421,21 +414,40 @@ pub mod bridge {
         }
 
         GatewayRequest {
-            messages: vec![
-                GatewayMessage {
-                    role: "system".to_string(),
-                    content: system_injection,
-                },
-                GatewayMessage {
-                    role: "user".to_string(),
-                    content: user_prompt,
-                },
-            ],
+            messages: vec![GatewayMessage {
+                role: "user".to_string(),
+                content: user_prompt,
+            }],
             temperature: 0.7,
             max_tokens: 1024,
             model: String::new(), // Gateway waehlt default
             metadata,
         }
+    }
+
+    fn format_perception_metadata(perception: &Perception) -> String {
+        let mut lines = Vec::new();
+
+        if !perception.circadian_text.is_empty() {
+            lines.push(format!("CIRCADIAN: {}", perception.circadian_text));
+        }
+        if !perception.body_text.is_empty() {
+            lines.push(format!("KOERPER: {}", perception.body_text));
+        }
+        if !perception.environment_text.is_empty() {
+            lines.push(format!("ENVIRONMENT: {}", perception.environment_text));
+        }
+        if !perception.acoustic_text.is_empty() {
+            lines.push(format!("AKUSTIK: {}", perception.acoustic_text));
+        }
+        if !perception.presence_text.is_empty() {
+            lines.push(format!("ANWESEND: {}", perception.presence_text));
+        }
+        if !perception.impulse_text.is_empty() {
+            lines.push(format!("IMPULS: {}", perception.impulse_text));
+        }
+
+        lines.join("\n")
     }
 
     /// Mappt eine ExtractedAction (Gateway) auf eine AgentAction (ECS).
@@ -485,5 +497,53 @@ pub mod bridge {
             timestamp: Timestamp(now_ms),
             tick: Tick(tick),
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn build_gateway_request_formats_perception_for_gateway_compiler() {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("state.redb");
+            let store = StateStore::open(store_path.to_str().unwrap()).unwrap();
+            let perception = Perception {
+                agent_id: AgentId(7),
+                circadian_text: "10:00 Uhr".to_string(),
+                body_text: "Du fuehlst dich wach.".to_string(),
+                environment_text: "Du bist im Designbuero. Es ist deutlich zu warm (27.5 °C). Die Luft ist sehr stickig (1600 ppm CO2).".to_string(),
+                acoustic_text: "Es ist laut (72 dB). Konzentration faellt schwer.".to_string(),
+                presence_text: "Lisa (Konzept), Thomas (Review)".to_string(),
+                impulse_text: "Du willst kurz frische Luft.".to_string(),
+                timestamp: Timestamp(1234),
+                tick: Tick(55),
+            };
+
+            let request = build_gateway_request(&perception, &store);
+
+            assert_eq!(request.messages.len(), 1);
+            assert_eq!(request.messages[0].role, "user");
+            assert!(
+                request.messages[0]
+                    .content
+                    .contains("Folgende Impulse sind gerade wichtig"),
+            );
+            assert!(
+                request.messages[0]
+                    .content
+                    .contains("Was machst du als naechstes? Reagiere natuerlich."),
+            );
+
+            let metadata = &request.metadata;
+            let formatted = metadata.get("perception").unwrap();
+            assert!(formatted.contains("CIRCADIAN: 10:00 Uhr"));
+            assert!(formatted.contains("ENVIRONMENT: Du bist im Designbuero. Es ist deutlich zu warm"));
+            assert!(formatted.contains("AKUSTIK: Es ist laut (72 dB)."));
+            assert!(formatted.contains("ANWESEND: Lisa (Konzept), Thomas (Review)"));
+            assert!(!formatted.trim_start().starts_with('{'));
+            assert_eq!(metadata.get("environment").unwrap(), &perception.environment_text);
+            assert_eq!(metadata.get("acoustic").unwrap(), &perception.acoustic_text);
+        }
     }
 }

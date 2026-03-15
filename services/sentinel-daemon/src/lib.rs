@@ -13,6 +13,7 @@ pub mod fanout;
 pub mod llm_bridge;
 #[cfg(feature = "nats")]
 pub mod nats_consumer;
+pub mod operator_api;
 pub mod orchestrator;
 pub mod query_responder;
 pub mod shift;

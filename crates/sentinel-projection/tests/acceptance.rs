@@ -433,3 +433,59 @@ fn chaos_and_shift_events_project_correctly() {
     let count = worker.read_store().active_agent_count().unwrap();
     assert_eq!(count, 1);
 }
+
+#[test]
+fn expired_chaos_is_cleared_by_room_physics_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let es_path = dir.path().join("chaos_expiry_es.db");
+    let rm_path = dir.path().join("chaos_expiry_rm.db");
+
+    let store = Arc::new(EventStore::open(es_path.to_str().unwrap()).unwrap());
+    let room_id = "buero-dev-1";
+    let start_tick = 10;
+    let expiry_tick =
+        start_tick + sentinel_physics::default_chaos_duration_ticks(EventType::PrinterBroken);
+
+    append_event(
+        &store,
+        1,
+        &DomainEventPayload::AgentSpawned {
+            agent_id: AgentId(1),
+            name: "Klaus".to_string(),
+            role: "Developer".to_string(),
+            shift_set: 1,
+            room_id: room_id.to_string(),
+        },
+    );
+
+    append_event(
+        &store,
+        start_tick,
+        &DomainEventPayload::ChaosTriggered {
+            event_type: EventType::PrinterBroken,
+            target_room: Some(room_id.to_string()),
+            description: "Drucker zeigt Papierstau".to_string(),
+        },
+    );
+
+    append_event(
+        &store,
+        expiry_tick,
+        &DomainEventPayload::RoomPhysicsUpdated {
+            room_id: room_id.to_string(),
+            temperature: 21.0,
+            co2_ppm: 430.0,
+            noise_db: 34.0,
+            occupant_count: 1,
+        },
+    );
+
+    let worker = rebuild_all(Arc::clone(&store), rm_path.to_str().unwrap());
+    let room = worker.read_store().get_room(room_id).unwrap().unwrap();
+
+    assert_eq!(room.temperature, Some(21.0));
+    assert!(
+        room.active_chaos.is_none(),
+        "expired chaos should be cleared on room physics updates"
+    );
+}

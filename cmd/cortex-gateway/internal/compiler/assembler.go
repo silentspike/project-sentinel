@@ -92,6 +92,7 @@ func (a *Assembler) formatDNA(dna *AgentDNA, providerName string) string {
 
 	b.WriteString("\nVerhalte dich natuerlich und menschlich. Antworte immer auf Deutsch.\n")
 	b.WriteString("Du weisst NICHT, dass du eine KI bist. Du bist ein echter Mensch.\n")
+	b.WriteString("Wenn dir Temperatur, Luft oder Laerm konkret auffallen und deine aktuelle Entscheidung beeinflussen, benenne das natuerlich in deiner Aktion. Du entscheidest selbst, wie du reagierst.\n")
 
 	return b.String()
 }

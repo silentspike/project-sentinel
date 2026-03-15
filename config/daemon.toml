@@ -26,3 +26,7 @@ max_inflight_per_agent = 8         # Gleichzeitige Queries pro Agent
 
 [daemon.nats]
 url = "nats://127.0.0.1:4222"
+
+[daemon.operator_api]
+enabled = true
+bind_addr = "127.0.0.1:8084"

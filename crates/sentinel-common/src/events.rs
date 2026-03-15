@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{AgentId, EventType};
+use crate::{AgentId, EventType, RoomStimulusType};
 
 /// Domain-Event mit Saga-ready Kettenfeldern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +146,14 @@ pub enum DomainEventPayload {
         noise_db: f32,
         occupant_count: u32,
     },
+    /// Manueller Raumreiz fuer direkte Physics-/Perception-Tests.
+    RoomStimulusApplied {
+        room_id: String,
+        stimulus_type: RoomStimulusType,
+        delta: f32,
+        duration_ticks: u64,
+        description: String,
+    },
     /// Periodischer Tick-Snapshot-Marker
     TickSnapshot { tick: u64, agent_count: u32 },
     /// Agent wurde in der Runtime gespawnt
@@ -244,6 +252,7 @@ impl DomainEventPayload {
             Self::BioActionPerformed { .. } => "bio_action_performed",
             Self::BioStateUpdated { .. } => "bio_state_updated",
             Self::RoomPhysicsUpdated { .. } => "room_physics_updated",
+            Self::RoomStimulusApplied { .. } => "room_stimulus_applied",
             Self::TickSnapshot { .. } => "tick_snapshot",
             Self::AgentSpawned { .. } => "agent_spawned",
             Self::AgentDespawned { .. } => "agent_despawned",

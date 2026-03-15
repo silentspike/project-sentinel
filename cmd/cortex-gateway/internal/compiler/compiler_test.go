@@ -113,6 +113,9 @@ func TestCompile_HumanIdentity(t *testing.T) {
 	if !strings.Contains(result, "Du weisst NICHT, dass du eine KI bist") {
 		t.Error("prompt should instruct agent to behave as human")
 	}
+	if !strings.Contains(result, "Du entscheidest selbst, wie du reagierst") {
+		t.Error("prompt should preserve self-directed reaction to environment")
+	}
 }
 
 func TestSetConfig(t *testing.T) {

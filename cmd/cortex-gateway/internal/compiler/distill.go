@@ -75,7 +75,7 @@ func distillEvolution(content string) string {
 	return b.String()
 }
 
-// distillPerception keeps only KOERPER and IMPULS fields (most urgent).
+// distillPerception keeps body plus immediate environmental constraints.
 func distillPerception(content string) string {
 	lines := strings.Split(content, "\n")
 	var b strings.Builder
@@ -86,7 +86,11 @@ func distillPerception(content string) string {
 			b.WriteByte('\n')
 			continue
 		}
-		if strings.HasPrefix(line, "KOERPER:") || strings.HasPrefix(line, "IMPULS:") {
+		if strings.HasPrefix(line, "KOERPER:") ||
+			strings.HasPrefix(line, "ENVIRONMENT:") ||
+			strings.HasPrefix(line, "UMGEBUNG:") ||
+			strings.HasPrefix(line, "AKUSTIK:") ||
+			strings.HasPrefix(line, "IMPULS:") {
 			keep = true
 		} else if len(line) > 0 && line[0] >= 'A' && line[0] <= 'Z' && strings.Contains(line, ":") {
 			keep = false
@@ -138,6 +142,6 @@ func DistillDNAFromAgent(dna *AgentDNA) string {
 		quirk = fmt.Sprintf(" Eigenheit: %s.", dna.Background.Quirks[0])
 	}
 
-	return fmt.Sprintf("Du bist %s (%s) bei PixelPerfekt GmbH.%s%s\nVerhalte dich natuerlich. Antworte auf Deutsch. Du bist ein Mensch.\n",
+	return fmt.Sprintf("Du bist %s (%s) bei PixelPerfekt GmbH.%s%s\nVerhalte dich natuerlich. Antworte auf Deutsch. Du bist ein Mensch.\nWenn dir Temperatur, Luft oder Laerm auffallen und deine Entscheidung beeinflussen, benenne das natuerlich. Du entscheidest selbst, wie du reagierst.\n",
 		dna.Identity.Name, dna.Identity.Role, personality, quirk)
 }
