@@ -28,9 +28,7 @@ impl ProjectionHandler for RoomLiveViewHandler {
     ) -> anyhow::Result<()> {
         match payload {
             DomainEventPayload::AgentSpawned {
-                agent_id,
-                room_id,
-                ..
+                agent_id, room_id, ..
             } => {
                 // Only increment occupancy if agent was not already active.
                 // Without this guard, daemon restarts (re-spawn without prior despawn)
