@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { getRecentChatMessages, getChatMessagesByRoom, insertOperatorMessage } from "../db";
+import { getRecentChatMessages, getChatMessagesByRoom, insertOperatorMessage, updateOperatorMessageGateway } from "../db";
 
 const CORTEX_GATEWAY_URL = process.env.CORTEX_GATEWAY_URL || "http://localhost:8080";
 
@@ -25,6 +25,7 @@ chatRoutes.post("/chat", async (c) => {
 
   // 2. Forward to Cortex Gateway for LLM processing
   let gatewayResponse = null;
+  let gatewayContent: string | null = null;
   try {
     const gatewayReq = {
       messages: [
@@ -33,7 +34,7 @@ chatRoutes.post("/chat", async (c) => {
       ],
       metadata: {
         source: "operator_chat",
-        room: room,
+        room: room ?? "",
       },
     };
     const resp = await fetch(`${CORTEX_GATEWAY_URL}/v1/chat/completions`, {
@@ -44,14 +45,20 @@ chatRoutes.post("/chat", async (c) => {
     });
     if (resp.ok) {
       gatewayResponse = await resp.json();
+      // Extract the response content from the LLMResponse
+      gatewayContent = gatewayResponse?.content ?? null;
+      // Persist the gateway response alongside the operator message
+      updateOperatorMessageGateway(eventId, "ok", gatewayContent);
     } else {
       const errorText = await resp.text().catch(() => "unknown");
       console.error(`Gateway error ${resp.status}: ${errorText.slice(0, 200)}`);
       gatewayResponse = { error: `Gateway ${resp.status}`, detail: errorText.slice(0, 200) };
+      updateOperatorMessageGateway(eventId, "error", null);
     }
   } catch (e) {
     console.error("Gateway unavailable:", e);
     gatewayResponse = { error: "Gateway unavailable" };
+    updateOperatorMessageGateway(eventId, "error", null);
   }
 
   return c.json({
@@ -59,6 +66,7 @@ chatRoutes.post("/chat", async (c) => {
     message,
     room,
     gateway_response: gatewayResponse,
+    gateway_content: gatewayContent,
   });
 });
 

@@ -96,16 +96,25 @@ export function renderChat(messages) {
 
 function createChatMessage(msg) {
   const item = document.createElement('div');
-  item.className = 'chat-message';
 
-  // Agent name
+  // Distinguish operator, gateway, and agent messages via CSS class
+  const isOperator = msg.action_type === 'operator_message';
+  const isGateway = msg.action_type === 'gateway_response';
+  const isError = msg.action_type === 'error';
+  let extraClass = '';
+  if (isOperator) extraClass = ' chat-message-operator';
+  else if (isGateway) extraClass = ' chat-message-gateway';
+  else if (isError) extraClass = ' chat-message-error';
+  item.className = 'chat-message' + extraClass;
+
+  // Agent/Operator name
   const agent = document.createElement('span');
   agent.className = 'chat-agent';
   agent.textContent = msg.agent_name || msg.agent_id;
   item.appendChild(agent);
 
-  // Action type badge
-  if (msg.action_type) {
+  // Action type badge (skip for operator/gateway — the CSS class handles that)
+  if (msg.action_type && !isOperator && !isGateway && !isError) {
     const badge = document.createElement('span');
     badge.className = 'chat-action-badge';
     badge.textContent = msg.action_type;
@@ -126,7 +135,7 @@ function createChatMessage(msg) {
   const date = new Date(msg.timestamp_ms);
   let metaText = date.toLocaleString('de-DE');
   if (msg.target_room) metaText += ' — ' + msg.target_room;
-  metaText += ' — Tick ' + msg.tick;
+  if (msg.tick) metaText += ' — Tick ' + msg.tick;
   meta.textContent = metaText;
   item.appendChild(meta);
 
@@ -139,7 +148,10 @@ async function sendChatMessage() {
   const message = input.value.trim();
   if (!message) return;
 
+  // Clear input immediately for responsive UX
+  input.value = '';
   input.disabled = true;
+
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
@@ -147,23 +159,49 @@ async function sendChatMessage() {
       body: JSON.stringify({ message, room: currentRoom }),
     });
     if (res.ok) {
-      input.value = '';
-      // Reload only message list (not full re-render which would destroy input)
-      const url = currentRoom ? '/api/chat/' + currentRoom : '/api/chat';
-      const chatRes = await fetch(url);
-      const messages = await chatRes.json();
+      const data = await res.json();
       const list = document.getElementById('chat-list');
       if (list) {
-        while (list.firstChild) list.removeChild(list.firstChild);
-        const sorted = [...messages].reverse();
-        for (const msg of sorted) {
-          list.appendChild(createChatMessage(msg));
+        // Append operator message immediately
+        list.appendChild(createChatMessage({
+          agent_id: 'operator',
+          agent_name: 'Operator',
+          action_type: 'operator_message',
+          content: data.message,
+          target_room: data.room,
+          tick: 0,
+          timestamp_ms: Date.now(),
+        }));
+
+        // Append gateway response if available
+        if (data.gateway_content) {
+          list.appendChild(createChatMessage({
+            agent_id: 'gateway',
+            agent_name: 'Agent (Gateway)',
+            action_type: 'gateway_response',
+            content: data.gateway_content,
+            target_room: data.room,
+            tick: 0,
+            timestamp_ms: Date.now(),
+          }));
+        } else if (data.gateway_response && data.gateway_response.error) {
+          list.appendChild(createChatMessage({
+            agent_id: 'gateway',
+            agent_name: 'Gateway',
+            action_type: 'error',
+            content: data.gateway_response.error,
+            target_room: data.room,
+            tick: 0,
+            timestamp_ms: Date.now(),
+          }));
         }
+
         list.scrollTop = list.scrollHeight;
       }
     }
   } catch {
-    // Send failed
+    // Send failed — restore message so user can retry
+    if (input.value === '') input.value = message;
   } finally {
     input.disabled = false;
     input.focus();
