@@ -35,6 +35,8 @@ chatRoutes.post("/chat", async (c) => {
       metadata: {
         source: "operator_chat",
         room: room ?? "",
+        agent_name: "Operator",
+        agent_role: "Operator",
       },
     };
     const resp = await fetch(`${CORTEX_GATEWAY_URL}/v1/chat/completions`, {
