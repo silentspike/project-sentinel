@@ -97,12 +97,9 @@ func BreakerConfigFromEnv() BreakerConfig {
 			cfg.HalfOpenProbes = n
 		}
 	}
-	if v := os.Getenv("SENTINEL_CORTEX_CB_ENABLED"); v != "" {
-		lower := strings.ToLower(v)
-		if lower == "false" || lower == "0" || lower == "no" || lower == "off" {
-			cfg.Enabled = false
-			slog.Warn("Feature deaktiviert via ENV", "flag", "SENTINEL_CORTEX_CB_ENABLED")
-		}
+	if v := os.Getenv("SENTINEL_CORTEX_CB_ENABLED"); strings.EqualFold(v, "false") || v == "0" {
+		cfg.Enabled = false
+		slog.Warn("Feature deaktiviert via ENV", "flag", "SENTINEL_CORTEX_CB_ENABLED")
 	}
 	return cfg
 }

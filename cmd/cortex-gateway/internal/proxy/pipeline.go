@@ -244,7 +244,7 @@ func (ph *PipelineHandler) parseRequest(w http.ResponseWriter, r *http.Request) 
 }
 
 // ServeHTTP implementiert die vollstaendige 7-Step Pipeline.
-func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { //nolint:gocyclo // Pipeline orchestration is genuinely complex
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
