@@ -460,7 +460,9 @@ function toChatMessage(row: { id: number; event_id: string; aggregate_id: string
   try {
     const p = JSON.parse(row.payload);
     if (p.agent_id) agentId = String(typeof p.agent_id === "object" ? p.agent_id[0] ?? p.agent_id : p.agent_id);
-    agentName = agentId;
+    const nameMap = getAgentNameMap();
+    const numId = parseInt(agentId, 10);
+    agentName = (!isNaN(numId) && nameMap.get(numId)) || p.name || agentId;
     actionType = String(p.action_type ?? "");
     content = p.content ? String(p.content) : null;
     targetRoom = p.target_room ? String(p.target_room) : null;
