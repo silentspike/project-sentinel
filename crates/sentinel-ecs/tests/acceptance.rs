@@ -3,12 +3,14 @@
 //! Tests fuer ECS World Setup, Agent Spawning, System-Reihenfolge,
 //! 100-Tick-Simulation und Tick-Rate-Performance.
 
-use sentinel_common::{AgentId, Tick};
+use sentinel_common::{room::BuildingConfig, AgentId, DomainEventPayload, EventType, Tick};
 use sentinel_ecs::{
-    create_simulation_world, spawn_agent, AgentIdentity, BioState, LlmConfig, Mood,
-    PerceptionState, Personality, Position, Relationships, ShiftInfo, SimulationPhase,
-    SimulationTime, WorkContext,
+    create_simulation_world, spawn_agent, ActiveChaos, AgentIdentity, BioState, LimboEventStore,
+    LlmConfig, Mood, PerceptionState, Personality, Position, Relationships, RoomDistanceMap,
+    ShiftInfo, SimulationPhase, SimulationTime, WorkContext,
 };
+use sentinel_limbo::EventStore;
+use std::{path::Path, sync::Arc};
 
 // ── #9 AC2: spawn_agent() erstellt Entity mit allen 10 Components ──
 
@@ -175,5 +177,176 @@ fn ac_09_06_tick_rate() {
         elapsed.as_secs_f64() < 1.0,
         "100 ticks took {:.3}s (must be < 1.0s for >100 ticks/s)",
         elapsed.as_secs_f64()
+    );
+}
+
+fn load_room_distances() -> RoomDistanceMap {
+    let config_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("config/rooms.toml");
+    let config = BuildingConfig::load(&config_path).expect("rooms.toml must load");
+    RoomDistanceMap::from_building_config(&config)
+}
+
+#[test]
+fn regression_printer_broken_emits_physics_for_empty_room() {
+    let dir = tempfile::tempdir().unwrap();
+    let event_db_path = dir.path().join("printer-empty-room.db");
+    let event_store = EventStore::open(event_db_path.to_str().unwrap()).unwrap();
+
+    let (mut world, mut schedule) = create_simulation_world();
+    world.insert_resource(LimboEventStore(Arc::new(event_store)));
+    world.insert_resource(load_room_distances());
+    world.resource_mut::<ActiveChaos>().set(
+        "buero-dev-1",
+        EventType::PrinterBroken,
+        "Drucker defekt".to_string(),
+        0,
+        sentinel_physics::default_chaos_duration_ticks(EventType::PrinterBroken),
+    );
+
+    {
+        let mut time = world.resource_mut::<SimulationTime>();
+        time.tick = Tick(20);
+        time.tick_count = 20;
+        time.delta_seconds = 1.0;
+        time.sim_hour = 8.0;
+    }
+    schedule.run(&mut world);
+
+    let events = world
+        .resource::<LimboEventStore>()
+        .0
+        .get_events_since(0, 200)
+        .unwrap();
+    let room_event = events
+        .iter()
+        .find_map(
+            |event| match serde_json::from_str::<DomainEventPayload>(&event.payload).ok() {
+                Some(DomainEventPayload::RoomPhysicsUpdated {
+                    room_id,
+                    noise_db,
+                    occupant_count,
+                    ..
+                }) if room_id == "buero-dev-1" => Some((noise_db, occupant_count)),
+                _ => None,
+            },
+        )
+        .expect("expected room_physics_updated for empty chaos room");
+
+    assert_eq!(room_event.1, 0);
+    assert!(
+        room_event.0 > 50.0,
+        "printer chaos should be clearly audible"
+    );
+}
+
+#[test]
+fn regression_aircon_broken_raises_temperature_in_physics_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let event_db_path = dir.path().join("aircon-room.db");
+    let event_store = EventStore::open(event_db_path.to_str().unwrap()).unwrap();
+
+    let (mut world, mut schedule) = create_simulation_world();
+    world.insert_resource(LimboEventStore(Arc::new(event_store)));
+    world.insert_resource(load_room_distances());
+    world.resource_mut::<ActiveChaos>().set(
+        "meetingraum-alpha",
+        EventType::AirConBroken,
+        "Klimaanlage defekt".to_string(),
+        0,
+        sentinel_physics::default_chaos_duration_ticks(EventType::AirConBroken),
+    );
+
+    {
+        let mut time = world.resource_mut::<SimulationTime>();
+        time.tick = Tick(3600);
+        time.tick_count = 3600;
+        time.delta_seconds = 1.0;
+        time.sim_hour = 9.0;
+    }
+    schedule.run(&mut world);
+
+    let events = world
+        .resource::<LimboEventStore>()
+        .0
+        .get_events_since(0, 200)
+        .unwrap();
+    let temperature = events
+        .iter()
+        .find_map(
+            |event| match serde_json::from_str::<DomainEventPayload>(&event.payload).ok() {
+                Some(DomainEventPayload::RoomPhysicsUpdated {
+                    room_id,
+                    temperature,
+                    ..
+                }) if room_id == "meetingraum-alpha" => Some(temperature),
+                _ => None,
+            },
+        )
+        .expect("expected room_physics_updated for aircon chaos room");
+
+    assert!(
+        temperature > 23.0,
+        "aircon failure should raise room temperature"
+    );
+}
+
+#[test]
+fn regression_flur_noise_drops_after_chaos_expires() {
+    let dir = tempfile::tempdir().unwrap();
+    let event_db_path = dir.path().join("flur-noise-reset.db");
+    let event_store = EventStore::open(event_db_path.to_str().unwrap()).unwrap();
+
+    let (mut world, mut schedule) = create_simulation_world();
+    world.insert_resource(LimboEventStore(Arc::new(event_store)));
+    world.insert_resource(load_room_distances());
+    world.resource_mut::<ActiveChaos>().set(
+        "flur-eg",
+        EventType::PrinterBroken,
+        "Druckerchaos im Flur".to_string(),
+        0,
+        30,
+    );
+
+    for tick in [20_u64, 40_u64] {
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(tick);
+            time.tick_count = tick;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 8.0;
+        }
+        schedule.run(&mut world);
+    }
+
+    let events = world
+        .resource::<LimboEventStore>()
+        .0
+        .get_events_since(0, 400)
+        .unwrap();
+    let flur_noise: Vec<(u64, f32)> = events
+        .iter()
+        .filter_map(
+            |event| match serde_json::from_str::<DomainEventPayload>(&event.payload).ok() {
+                Some(DomainEventPayload::RoomPhysicsUpdated {
+                    room_id, noise_db, ..
+                }) if room_id == "flur-eg" => Some((event.tick, noise_db)),
+                _ => None,
+            },
+        )
+        .collect();
+
+    assert_eq!(flur_noise.len(), 2, "expected two flur snapshots");
+    assert!(
+        flur_noise[0].1 > 50.0,
+        "active chaos should raise hallway noise first"
+    );
+    assert!(
+        flur_noise[1].1 < 35.0,
+        "expired chaos should reset hallway noise instead of staying stale"
     );
 }

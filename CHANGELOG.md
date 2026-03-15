@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Chaos-gebundene Physics-Korrekturen + Operator-Floorplan** (#242, #243, #244, #245)
+  - `sentinel-ecs`: `ActiveChaos` Resource, gemeinsamer Chaos-Injektionspfad, Cleanup und Physics fuer Raeume mit aktivem Chaos
+  - `sentinel-physics`: `AirConBroken` erhoeht Temperatur messbar, `PrinterBroken` erhoeht Laerm mit begrenztem Bonus
+  - `sentinel-ecs`: Hallway-Noise faellt nach Chaos-Ende wieder auf plausible Werte zurueck statt stale hoch zu bleiben
+  - `sentinel-daemon`: lokale `operator_api` fuer `POST /operator/chaos` inkl. Validierung, Auth und ECS-Weitergabe
+  - Dashboard Backend: `GET /api/rooms/:id/detail`, `POST /api/control/chaos`, Reaktions-Korrelation und `reaction_window_ticks`
+  - Dashboard Backend: Room-Reaction-Korrelation ignoriert jetzt zukuenftige Chaos-Historie ueber `last_event_tick`, so dass aktuelle Temperatur-/Laerm-/CO2-Reize im Drawer nicht mehr von stale Kontext ueberschrieben werden
+  - Dashboard Frontend: klickbare Raumkarten, Room-Drawer, Physics-/Chaos-Historie, Trigger-Form und Live-Refresh
+  - Dashboard Frontend: Aktivitaets-Tab mit Eventgruppen-Filtern und Textsuche, damit Reaktionsketten trotz `room_physics_updated`-Flut sichtbar bleiben
+  - Live-Verifikation mit `playwright-cli`: Temperatur (`31.1 °C`, `Es ist warm`), Laerm (`75 dB`, `Es ist laut`) und CO2 (`1920 ppm`, `Die Luft ist stickig`) sind in belegten Raeumen sichtbar und zeigen korrelierte Agentenreaktionen
+  - Floorplan-Badge synchronisiert nach Trigger sofort lokal; Drawer zieht nach echtem Detail-Reload nach
+  - Neue Tests fuer Daemon-Weitergabe, Room-Detail-API, Trigger-Proxy, klickbare Floorplan-Karten und Reaktions-Kontext
+
 - **Nacharbeit aus Verification Findings** (#9, #10, #12, #54)
   - #9: `ac_09_04` Test zaehlt jetzt alle 10 SimulationPhases (Decision fehlte)
   - #10: 3 neue bolero Property-Tests (stress, social_need, caffeine) — alle 6 Bio-Variablen abgedeckt

@@ -11,6 +11,7 @@ telemetry = ["sentinel-telemetry/telemetry"]
 
 [dependencies]
 sentinel-common = { path = "../sentinel-common" }
+sentinel-physics = { path = "../sentinel-physics" }
 sentinel-limbo = { path = "../sentinel-limbo" }
 sentinel-telemetry = { path = "../sentinel-telemetry" }
 rusqlite = { version = "0.38", features = ["bundled"] }

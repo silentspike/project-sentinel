@@ -162,17 +162,23 @@ fn generate_environment_text(temp_c: f32, co2_ppm: f32, smells: &[SmellEvent]) -
     let mut parts: Vec<String> = Vec::new();
 
     // Temperatur
-    if temp_c > 24.0 {
-        parts.push("Es ist warm.".to_string());
+    if temp_c > 26.0 {
+        parts.push(format!("Es ist deutlich zu warm ({temp_c:.1} °C)."));
+    } else if temp_c > 24.0 {
+        parts.push(format!("Es ist warm ({temp_c:.1} °C)."));
+    } else if temp_c < 17.0 {
+        parts.push(format!("Es ist unangenehm kuehl ({temp_c:.1} °C)."));
     } else if temp_c < 19.0 {
-        parts.push("Es ist kuehl.".to_string());
+        parts.push(format!("Es ist kuehl ({temp_c:.1} °C)."));
     } else {
-        parts.push("Die Temperatur ist angenehm.".to_string());
+        parts.push(format!("Die Temperatur ist angenehm ({temp_c:.1} °C)."));
     }
 
     // CO2
-    if co2_ppm > 1000.0 {
-        parts.push("Stickig.".to_string());
+    if co2_ppm > 1400.0 {
+        parts.push(format!("Die Luft ist sehr stickig ({co2_ppm:.0} ppm CO2)."));
+    } else if co2_ppm > 1000.0 {
+        parts.push(format!("Die Luft ist stickig ({co2_ppm:.0} ppm CO2)."));
     }
 
     // Gerueche (nur intensity > 0.3)
@@ -195,10 +201,10 @@ fn generate_environment_text(temp_c: f32, co2_ppm: f32, smells: &[SmellEvent]) -
 /// Generiert Akustiktext aus Laermpegel
 fn generate_acoustic_text(noise_db: f32) -> String {
     match noise_db as u32 {
-        0..=35 => "Stille.".to_string(),
-        36..=50 => "Normales Buerogeraeusch.".to_string(),
-        51..=65 => "Lebhafte Unterhaltungen.".to_string(),
-        _ => "Es ist laut. Konzentration faellt schwer.".to_string(),
+        0..=35 => format!("Stille ({noise_db:.0} dB)."),
+        36..=50 => format!("Normales Buerogeraeusch ({noise_db:.0} dB)."),
+        51..=65 => format!("Lebhafte Unterhaltungen ({noise_db:.0} dB)."),
+        _ => format!("Es ist laut ({noise_db:.0} dB). Konzentration faellt schwer."),
     }
 }
 
@@ -545,8 +551,8 @@ mod tests {
         let perception = PerceptionTexts {
             circadian_text: "10:00 (Du arbeitest seit 2h konzentriert)".to_string(),
             body_text: "Du fuehlst dich gut.".to_string(),
-            environment_text: "Die Temperatur ist angenehm.".to_string(),
-            acoustic_text: "Normales Buerogeraeusch.".to_string(),
+            environment_text: "Die Temperatur ist angenehm (22.0 °C).".to_string(),
+            acoustic_text: "Normales Buerogeraeusch (40 dB).".to_string(),
             presence_text: "Lisa (Design), Andreas (Coding)".to_string(),
             impulse_text: String::new(),
         };

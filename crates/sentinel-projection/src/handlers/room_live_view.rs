@@ -16,6 +16,21 @@ use crate::store::ReadModelTransaction;
 
 use super::ProjectionHandler;
 
+fn is_chaos_expired(chaos_json: &str, current_tick: u64) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(chaos_json) else {
+        return true;
+    };
+    let created_tick = value
+        .get("created_tick")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let duration_ticks = value
+        .get("duration_ticks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    current_tick >= created_tick.saturating_add(duration_ticks)
+}
+
 pub struct RoomLiveViewHandler;
 
 impl ProjectionHandler for RoomLiveViewHandler {
@@ -79,9 +94,14 @@ impl ProjectionHandler for RoomLiveViewHandler {
                 target_room: Some(room),
                 description,
             } => {
-                let chaos_json =
-                    serde_json::json!({"type": format!("{:?}", event_type), "description": description})
-                        .to_string();
+                let chaos_json = serde_json::json!({
+                    "type": format!("{:?}", event_type),
+                    "event_type": format!("{:?}", event_type),
+                    "description": description,
+                    "created_tick": event.tick,
+                    "duration_ticks": sentinel_physics::default_chaos_duration_ticks(*event_type),
+                })
+                .to_string();
                 debug!(room, "Projecting chaos_triggered (room)");
                 txn.update_room_chaos(room, &chaos_json, event.tick, row_id)?;
             }
@@ -94,11 +114,17 @@ impl ProjectionHandler for RoomLiveViewHandler {
                 ..
             } => {
                 debug!(room = room_id, "Projecting room_physics_updated");
+                let clear_active_chaos = txn
+                    .get_room_active_chaos(room_id)?
+                    .as_deref()
+                    .map(|json| is_chaos_expired(json, event.tick))
+                    .unwrap_or(false);
                 txn.update_room_physics(
                     room_id,
                     *temperature as f64,
                     *co2_ppm as f64,
                     *noise_db as f64,
+                    clear_active_chaos,
                     event.tick,
                     row_id,
                 )?;

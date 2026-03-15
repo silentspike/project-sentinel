@@ -1,7 +1,8 @@
 //! ECS Systems fuer Agent-Simulation.
 //!
-//! Definiert 11 Systems in strikter Ausfuehrungsreihenfolge:
+//! Definiert 12 Systems in strikter Ausfuehrungsreihenfolge:
 //! 1. input_system - Empfaengt Agent-Aktionen via Channel
+//!    1b. operator_command_system - Injiziert manuelles Chaos aus der Operator-API
 //! 2. bio_system - Aktualisiert biologische Zustaende (sentinel-bio) + Auto-Coffee
 //! 3. physics_system - Berechnet Raum-Physik (sentinel-physics)
 //! 4. transit_system - Verarbeitet Raumwechsel + Transit-Events
@@ -15,14 +16,17 @@
 
 use super::components::*;
 use super::world::{
-    ActionReceiver, EventBuffer, LimboEventStore, PersistTelemetry, PsiMetrics, RedbStateStore,
-    RoomDistanceMap, ToolRuntimeResource, ZenohFanoutSender,
+    ActionReceiver, ActiveChaos, ActiveChaosEvent, ActiveRoomStimuli, EventBuffer,
+    LimboEventStore, OperatorCommandReceiver, PersistTelemetry, PsiMetrics, RedbStateStore,
+    RoomDistanceMap, RoomPhysicsState, ToolRuntimeResource, ZenohFanoutSender,
 };
 use super::world::{PerceptionSender, SimulationTime};
 use bevy_ecs::prelude::*;
 use sentinel_common::{
-    ActionType, DomainEvent, DomainEventPayload, Emotion, Perception, Timestamp,
+    ActionType, DomainEvent, DomainEventPayload, Emotion, EventType, OperatorCommand,
+    Perception, RoomStimulusType, Timestamp,
 };
+use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{debug, warn};
 
@@ -283,6 +287,67 @@ pub fn input_system(
     }
 }
 
+/// 1b. Empfaengt Operator-Kommandos und injiziert manuelles Chaos.
+pub fn operator_command_system(
+    receiver: Option<Res<OperatorCommandReceiver>>,
+    time: Res<SimulationTime>,
+    mut event_buffer: ResMut<EventBuffer>,
+    mut active_chaos: ResMut<ActiveChaos>,
+    mut active_room_stimuli: ResMut<ActiveRoomStimuli>,
+    mut agents: Query<(&Position, &mut WorkContext)>,
+) {
+    let Some(receiver) = receiver else { return };
+    let Ok(rx) = receiver.0.lock() else { return };
+
+    while let Ok(command) = rx.try_recv() {
+        match command {
+            OperatorCommand::Chaos(command) => {
+                let duration_ticks = command.duration_ticks.unwrap_or_else(|| {
+                    sentinel_physics::default_chaos_duration_ticks(command.chaos_type)
+                });
+                let metadata = InjectedChaosMetadata {
+                    event_id: command.event_id.as_str(),
+                    correlation_id: command.correlation_id.as_str(),
+                    operation_id: command.operation_id.as_str(),
+                };
+
+                inject_chaos_event(
+                    command.chaos_type,
+                    &command.room_id,
+                    &command.description,
+                    time.tick.0,
+                    duration_ticks,
+                    &mut event_buffer,
+                    &mut active_chaos,
+                    &mut agents,
+                    Some(metadata),
+                );
+            }
+            OperatorCommand::RoomStimulus(command) => {
+                let duration_ticks = command
+                    .duration_ticks
+                    .unwrap_or(DEFAULT_ROOM_STIMULUS_DURATION_TICKS);
+                let metadata = InjectedStimulusMetadata {
+                    event_id: command.event_id.as_str(),
+                    correlation_id: command.correlation_id.as_str(),
+                    operation_id: command.operation_id.as_str(),
+                };
+                inject_room_stimulus(
+                    &command.room_id,
+                    command.stimulus_type,
+                    command.delta,
+                    &command.description,
+                    time.tick.0,
+                    duration_ticks,
+                    &mut event_buffer,
+                    &mut active_room_stimuli,
+                    Some(metadata),
+                );
+            }
+        }
+    }
+}
+
 /// 2. Aktualisiert biologische Zustaende via sentinel-bio Differenzialgleichungen.
 ///
 /// Erzeugt BioStateUpdated DomainEvents alle 20 Ticks (periodischer Snapshot).
@@ -395,18 +460,41 @@ pub fn bio_system(
 pub fn physics_system(
     query: Query<(&Position, Option<&WorkContext>)>,
     time: Res<SimulationTime>,
+    room_distances: Option<Res<RoomDistanceMap>>,
+    active_chaos: Option<Res<ActiveChaos>>,
+    mut active_room_stimuli: ResMut<ActiveRoomStimuli>,
+    mut room_physics_state: ResMut<RoomPhysicsState>,
     mut event_buffer: ResMut<EventBuffer>,
 ) {
     let tick = time.tick.0;
+    active_room_stimuli.cleanup(tick);
 
     // Agenten pro Raum zaehlen und Meeting-Status ermitteln
-    let mut room_agents: std::collections::HashMap<&str, (usize, bool)> =
+    let mut room_agents: std::collections::HashMap<String, (usize, bool)> =
         std::collections::HashMap::new();
+
+    // Initialisiere alle bekannten Raeume, damit leere Transit-Raeume keine
+    // veralteten Physics-Werte im Read Model behalten.
+    if let Some(distances) = room_distances.as_ref() {
+        for room_id in distances.all_rooms() {
+            room_agents.entry(room_id.clone()).or_insert((0, false));
+        }
+    }
+
+    // Raeume mit aktivem Chaos muessen ebenfalls weiter berechnet werden,
+    // auch wenn aktuell niemand darin sitzt.
+    if let Some(chaos) = active_chaos.as_ref() {
+        for room_id in chaos.active_rooms(tick) {
+            room_agents.entry(room_id.to_string()).or_insert((0, false));
+        }
+    }
+    for room_id in active_room_stimuli.active_rooms(tick) {
+        room_agents.entry(room_id.to_string()).or_insert((0, false));
+    }
+
     for (pos, work) in &query {
         if !pos.in_transit {
-            let entry = room_agents
-                .entry(pos.room_id.as_str())
-                .or_insert((0, false));
+            let entry = room_agents.entry(pos.room_id.clone()).or_insert((0, false));
             entry.0 += 1;
             if let Some(w) = work {
                 if w.in_meeting {
@@ -416,16 +504,87 @@ pub fn physics_system(
         }
     }
 
+    // Seed-Laerm ohne Nachbarraum-Einfluesse vorberechnen.
+    let mut seed_noise: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
+    for (room_id, (agent_count, has_meeting)) in &room_agents {
+        let chaos_bonus = active_chaos
+            .as_ref()
+            .and_then(|chaos| chaos.get_active(room_id, tick))
+            .map(|event| sentinel_physics::chaos_noise_bonus_db(event.event_type))
+            .unwrap_or(0.0);
+        let stimulus_noise =
+            active_room_stimuli.delta_for(room_id, RoomStimulusType::Noise, tick);
+        let local_noise =
+            sentinel_physics::calculate_noise_level(*agent_count, *has_meeting, false, &[])
+                + chaos_bonus
+                + stimulus_noise;
+        seed_noise.insert(room_id.as_str(), local_noise);
+    }
+
     // Physik pro Raum berechnen
     for (room_id, (agent_count, has_meeting)) in &room_agents {
-        let noise_db =
-            sentinel_physics::calculate_noise_level(*agent_count, *has_meeting, false, &[]);
+        let adjacent_noise = room_distances
+            .as_ref()
+            .map(|distances| {
+                distances
+                    .rooms_within(room_id, 1)
+                    .into_iter()
+                    .filter_map(|(adjacent_room, _)| seed_noise.get(adjacent_room).copied())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let active_chaos_event = active_chaos
+            .as_ref()
+            .and_then(|chaos| chaos.get_active(room_id, tick));
+        let active_stimulus_delta_temperature =
+            active_room_stimuli.delta_for(room_id, RoomStimulusType::Temperature, tick);
+        let active_stimulus_delta_noise =
+            active_room_stimuli.delta_for(room_id, RoomStimulusType::Noise, tick);
+        let active_stimulus_delta_co2 =
+            active_room_stimuli.delta_for(room_id, RoomStimulusType::Co2, tick);
+        let chaos_elapsed_hours = active_chaos_event
+            .map(|event| chaos_elapsed_hours(event, &time))
+            .unwrap_or(0.0);
+
+        let noise_db = sentinel_physics::calculate_noise_level(
+            *agent_count,
+            *has_meeting,
+            false,
+            &adjacent_noise,
+        ) + active_chaos_event
+            .map(|event| sentinel_physics::chaos_noise_bonus_db(event.event_type))
+            .unwrap_or(0.0)
+            + active_stimulus_delta_noise;
+
         let temperature =
-            sentinel_physics::calculate_temperature(21.0, *agent_count, false, 15.0, 0.3);
-        let co2 = sentinel_physics::calculate_co2(400.0, *agent_count, 0.5, 1.0);
+            sentinel_physics::calculate_temperature(21.0, *agent_count, false, 15.0, 0.3)
+                + active_chaos_event
+                    .map(|event| {
+                        sentinel_physics::chaos_temperature_delta_celsius(
+                            event.event_type,
+                            chaos_elapsed_hours,
+                        )
+                    })
+                    .unwrap_or(0.0)
+                + active_stimulus_delta_temperature;
+        let co2 = sentinel_physics::calculate_co2(400.0, *agent_count, 0.5, 1.0)
+            + active_stimulus_delta_co2;
+        let has_active_stimulus = active_stimulus_delta_temperature.abs() > f32::EPSILON
+            || active_stimulus_delta_noise.abs() > f32::EPSILON
+            || active_stimulus_delta_co2.abs() > f32::EPSILON;
+
+        room_physics_state.set(
+            room_id,
+            tick,
+            *agent_count as u32,
+            temperature,
+            co2,
+            noise_db,
+        );
 
         // Alle 20 Ticks Physics-Snapshot als Event emittieren
-        if tick > 0 && tick.is_multiple_of(20) {
+        if tick > 0 && (tick.is_multiple_of(20) || has_active_stimulus) {
             let payload = DomainEventPayload::RoomPhysicsUpdated {
                 room_id: room_id.to_string(),
                 temperature,
@@ -489,6 +648,7 @@ pub fn transit_system(
 
 /// Cooldown-Dauer in Ticks fuer Conflict-Stress nach stressausloesendem Chaos-Event
 const CONFLICT_COOLDOWN_TICKS: u32 = 120;
+const DEFAULT_ROOM_STIMULUS_DURATION_TICKS: u64 = 120;
 
 /// 4b. Deriviert WorkContext automatisch aus Raum, Zeit und Conflict-State.
 ///
@@ -563,6 +723,121 @@ fn is_stressful_chaos(event_type: sentinel_common::EventType) -> bool {
     )
 }
 
+struct InjectedChaosMetadata<'a> {
+    event_id: &'a str,
+    correlation_id: &'a str,
+    operation_id: &'a str,
+}
+
+struct InjectedStimulusMetadata<'a> {
+    event_id: &'a str,
+    correlation_id: &'a str,
+    operation_id: &'a str,
+}
+
+/// Wendet ein Chaos-Event einheitlich auf ECS-State und Event-Trail an.
+fn inject_chaos_event(
+    event_type: EventType,
+    target_room: &str,
+    description: &str,
+    tick: u64,
+    duration_ticks: u64,
+    event_buffer: &mut EventBuffer,
+    active_chaos: &mut ActiveChaos,
+    agents: &mut Query<(&Position, &mut WorkContext)>,
+    metadata: Option<InjectedChaosMetadata<'_>>,
+) {
+    active_chaos.set(
+        target_room,
+        event_type,
+        description.to_string(),
+        tick,
+        duration_ticks,
+    );
+
+    let payload = DomainEventPayload::ChaosTriggered {
+        event_type,
+        target_room: Some(target_room.to_string()),
+        description: description.to_string(),
+    };
+    let correlation_id = metadata
+        .as_ref()
+        .map(|meta| meta.correlation_id.to_string())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let mut event = DomainEvent::new(
+        payload.event_type_str(),
+        target_room,
+        &payload.to_json(),
+        &correlation_id,
+        tick,
+    );
+    if let Some(meta) = metadata {
+        event.event_id = meta.event_id.to_string();
+        event = event.with_operation_id(meta.operation_id);
+    }
+    event_buffer.events.push(event);
+
+    // Stressausloesende Chaos-Events setzen conflict_cooldown auf Agents im Raum
+    if is_stressful_chaos(event_type) {
+        for (pos, mut work) in agents.iter_mut() {
+            if !pos.in_transit && pos.room_id == target_room {
+                work.conflict_cooldown = CONFLICT_COOLDOWN_TICKS;
+            }
+        }
+    }
+}
+
+/// Wendet einen direkten Raumreiz einheitlich auf Physics-State und Event-Trail an.
+fn inject_room_stimulus(
+    room_id: &str,
+    stimulus_type: RoomStimulusType,
+    delta: f32,
+    description: &str,
+    tick: u64,
+    duration_ticks: u64,
+    event_buffer: &mut EventBuffer,
+    active_room_stimuli: &mut ActiveRoomStimuli,
+    metadata: Option<InjectedStimulusMetadata<'_>>,
+) {
+    active_room_stimuli.set(
+        room_id,
+        stimulus_type,
+        delta,
+        description.to_string(),
+        tick,
+        duration_ticks,
+    );
+
+    let payload = DomainEventPayload::RoomStimulusApplied {
+        room_id: room_id.to_string(),
+        stimulus_type,
+        delta,
+        duration_ticks,
+        description: description.to_string(),
+    };
+    let correlation_id = metadata
+        .as_ref()
+        .map(|meta| meta.correlation_id.to_string())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let mut event = DomainEvent::new(
+        payload.event_type_str(),
+        room_id,
+        &payload.to_json(),
+        &correlation_id,
+        tick,
+    );
+    if let Some(meta) = metadata {
+        event.event_id = meta.event_id.to_string();
+        event = event.with_operation_id(meta.operation_id);
+    }
+    event_buffer.events.push(event);
+}
+
+fn chaos_elapsed_hours(active_chaos: &ActiveChaosEvent, time: &SimulationTime) -> f32 {
+    let elapsed_ticks = time.tick.0.saturating_sub(active_chaos.created_tick) as f32;
+    (elapsed_ticks * time.delta_seconds.max(0.0)) / 3600.0
+}
+
 /// 5. Generiert Zufallsereignisse (Poisson-verteilt)
 ///
 /// Nutzt splitmix64-basierte Pseudo-Zufallszahlen fuer gleichmaessige Verteilung.
@@ -572,8 +847,11 @@ fn is_stressful_chaos(event_type: sentinel_common::EventType) -> bool {
 pub fn chaos_system(
     time: Res<SimulationTime>,
     mut event_buffer: ResMut<EventBuffer>,
+    mut active_chaos: ResMut<ActiveChaos>,
     mut agents: Query<(&Position, &mut WorkContext)>,
 ) {
+    active_chaos.cleanup(time.tick.0);
+
     // SENTINEL_CHAOS_ENABLED runtime gate (Issue #233 AC-3)
     if !sentinel_common::feature_flags::RuntimeFlags::global().chaos_enabled {
         return;
@@ -673,29 +951,17 @@ pub fn chaos_system(
                 let idx = (room_rng * occupied_rooms.len() as f32) as usize;
                 occupied_rooms[idx.min(occupied_rooms.len() - 1)].clone()
             };
-
-            let payload = DomainEventPayload::ChaosTriggered {
-                event_type: *common_type,
-                target_room: Some(target.clone()),
-                description: description.to_string(),
-            };
-            let event = DomainEvent::new(
-                payload.event_type_str(),
+            inject_chaos_event(
+                *common_type,
                 &target,
-                &payload.to_json(),
-                &uuid::Uuid::new_v4().to_string(),
+                description,
                 time.tick.0,
+                sentinel_physics::default_chaos_duration_ticks(*common_type),
+                &mut event_buffer,
+                &mut active_chaos,
+                &mut agents,
+                None,
             );
-            event_buffer.events.push(event);
-
-            // Stressausloesende Chaos-Events setzen conflict_cooldown auf Agents im Raum
-            if is_stressful_chaos(*common_type) {
-                for (pos, mut work) in &mut agents {
-                    if !pos.in_transit && pos.room_id == target {
-                        work.conflict_cooldown = CONFLICT_COOLDOWN_TICKS;
-                    }
-                }
-            }
         }
     }
 }
@@ -895,20 +1161,118 @@ fn room_id_to_german(room_id: &str) -> String {
 /// impulse_text wird aus der priorisierten EventQueue generiert.
 pub fn output_system(
     sender: Option<Res<PerceptionSender>>,
-    query: Query<(&AgentIdentity, &PerceptionState, &EventQueue)>,
+    active_smells: Res<super::world::ActiveSmells>,
+    room_physics_state: Res<RoomPhysicsState>,
+    query: Query<(
+        &AgentIdentity,
+        &BioState,
+        &Position,
+        &Personality,
+        &ShiftInfo,
+        &PerceptionState,
+        &WorkContext,
+        &EventQueue,
+    )>,
     time: Res<SimulationTime>,
 ) {
     let Some(sender) = sender else { return };
 
-    for (identity, perception, queue) in &query {
+    let present_agents_by_room: HashMap<String, Vec<(String, String)>> = query
+        .iter()
+        .filter(|(_, _, position, _, _, _, _, _)| !position.in_transit)
+        .fold(HashMap::new(), |mut acc, (identity, _, position, _, _, _, work_ctx, _)| {
+            let activity = work_ctx
+                .current_task
+                .clone()
+                .unwrap_or_else(|| "anwesend".to_string());
+            acc.entry(position.room_id.clone())
+                .or_default()
+                .push((identity.name.clone(), activity));
+            acc
+        });
+
+    for (identity, bio, position, personality, shift, perception, work_ctx, queue) in &query {
         let impulse_text = super::decision::format_impulse_from_queue(queue);
+        let focus_hours = focus_hours_since_shift_start(time.sim_hour, shift);
+        let sim_time = format!("{:02.0}:00 Uhr", time.sim_hour.floor());
+
+        let room_snapshot = room_physics_state.get(&position.room_id);
+        let room_noise_db = room_snapshot.map(|snapshot| snapshot.noise_db).unwrap_or(30.0);
+        let room_temp_c = room_snapshot
+            .map(|snapshot| snapshot.temperature)
+            .unwrap_or(21.6);
+        let room_co2_ppm = room_snapshot.map(|snapshot| snapshot.co2_ppm).unwrap_or(400.0);
+
+        let smells = if position.in_transit {
+            Vec::new()
+        } else {
+            active_smells
+                .get_active(&position.room_id, time.tick.0)
+                .into_iter()
+                .map(|smell| super::perception::SmellEvent {
+                    source_room: position.room_id.clone(),
+                    smell_type: smell.smell_type.clone(),
+                    intensity: smell.intensity,
+                    radius_rooms: 0,
+                    decay_per_room: 0.0,
+                    created_tick: smell.created_tick,
+                    duration_ticks: smell.duration_ticks,
+                })
+                .collect()
+        };
+
+        let present_agents = present_agents_by_room
+            .get(&position.room_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(name, _)| name != &identity.name)
+            .collect::<Vec<_>>();
+
+        let prompt_perception = super::perception::generate_perception(
+            bio,
+            position,
+            personality,
+            room_noise_db,
+            room_temp_c,
+            room_co2_ppm,
+            &smells,
+            &present_agents,
+            &sim_time,
+            focus_hours,
+        );
+
+        let mut environment_text = perception.environment_text.clone();
+        if !position.in_transit {
+            environment_text = format!("Du bist {}.", room_id_to_german(&position.room_id));
+            if !prompt_perception.environment_text.is_empty() {
+                environment_text.push(' ');
+                environment_text.push_str(&prompt_perception.environment_text);
+            }
+        }
+
+        let body_text = if perception.body_text.is_empty() {
+            prompt_perception.body_text.clone()
+        } else {
+            perception.body_text.clone()
+        };
+
+        let presence_text = if prompt_perception.presence_text.is_empty() {
+            work_ctx
+                .current_task
+                .clone()
+                .unwrap_or_else(|| "Du bist allein.".to_string())
+        } else {
+            prompt_perception.presence_text.clone()
+        };
+
         let msg = Perception {
             agent_id: identity.agent_id,
-            circadian_text: format!("{:.0}:00 Uhr", time.sim_hour),
-            body_text: perception.body_text.clone(),
-            environment_text: perception.environment_text.clone(),
-            acoustic_text: String::new(),
-            presence_text: perception.social_text.clone(),
+            circadian_text: prompt_perception.circadian_text,
+            body_text,
+            environment_text,
+            acoustic_text: prompt_perception.acoustic_text,
+            presence_text,
             impulse_text,
             timestamp: Timestamp(time.tick.0),
             tick: time.tick,
@@ -917,6 +1281,28 @@ pub fn output_system(
         // (naechster Tick liefert frische Daten).
         let _ = sender.0.try_send(msg);
     }
+}
+
+fn focus_hours_since_shift_start(sim_hour: f32, shift: &ShiftInfo) -> f32 {
+    if !shift.is_on_duty {
+        return 0.0;
+    }
+
+    let current = sim_hour.rem_euclid(24.0);
+    let start = f32::from(shift.shift_start_hour);
+    let duration = if shift.shift_end_hour >= shift.shift_start_hour {
+        f32::from(shift.shift_end_hour - shift.shift_start_hour)
+    } else {
+        f32::from((24 - shift.shift_start_hour) + shift.shift_end_hour)
+    };
+
+    let elapsed = if current >= start {
+        current - start
+    } else {
+        current + 24.0 - start
+    };
+
+    elapsed.clamp(0.0, duration.max(0.0))
 }
 
 /// 10. Erkennt Flurbegegnungen zwischen Agents die gleichzeitig in Transit sind.

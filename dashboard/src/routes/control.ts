@@ -16,16 +16,35 @@ controlRoutes.use("/control/*", async (c, next) => {
   await next();
 });
 
-const CORTEX_CONTROL_URL =
-  process.env.CORTEX_GATEWAY_URL || "http://localhost:8081";
+const DEFAULT_CORTEX_CONTROL_URL = "http://localhost:8081";
+const DEFAULT_OPERATOR_API_URL = "http://127.0.0.1:8084";
 
 // Timeout fuer Proxy-Requests zum Cortex Gateway (ms).
 const PROXY_TIMEOUT_MS = 5000;
 
 // ── Helpers ──────────────────────────────────────────
 
-async function proxyGet(path: string): Promise<Response> {
-  const resp = await fetch(`${CORTEX_CONTROL_URL}${path}`, {
+function getCortexControlUrl(): string {
+  return process.env.CORTEX_GATEWAY_URL || DEFAULT_CORTEX_CONTROL_URL;
+}
+
+function getOperatorApiUrl(): string {
+  return process.env.SENTINEL_OPERATOR_API_URL || DEFAULT_OPERATOR_API_URL;
+}
+
+function getOperatorHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  const operatorKey = process.env.SENTINEL_OPERATOR_API_KEY || "";
+  if (operatorKey) {
+    headers["x-sentinel-operator-key"] = operatorKey;
+  }
+  return headers;
+}
+
+async function proxyGet(baseUrl: string, path: string): Promise<Response> {
+  const resp = await fetch(`${baseUrl}${path}`, {
     signal: AbortSignal.timeout(PROXY_TIMEOUT_MS),
   });
   const body = await resp.text();
@@ -36,13 +55,15 @@ async function proxyGet(path: string): Promise<Response> {
 }
 
 async function proxyJson(
+  baseUrl: string,
   method: string,
   path: string,
   body: unknown,
+  headers: Record<string, string> = { "Content-Type": "application/json" },
 ): Promise<Response> {
-  const resp = await fetch(`${CORTEX_CONTROL_URL}${path}`, {
+  const resp = await fetch(`${baseUrl}${path}`, {
     method,
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(PROXY_TIMEOUT_MS),
   });
@@ -57,7 +78,7 @@ async function proxyJson(
 
 controlRoutes.get("/control/config", async (c) => {
   try {
-    return await proxyGet("/control/config");
+    return await proxyGet(getCortexControlUrl(), "/control/config");
   } catch (err) {
     return c.json(
       { error: "Cortex Gateway nicht erreichbar", detail: String(err) },
@@ -71,7 +92,7 @@ controlRoutes.get("/control/config", async (c) => {
 controlRoutes.patch("/control/config", async (c) => {
   try {
     const body = await c.req.json();
-    return await proxyJson("PATCH", "/control/config", body);
+    return await proxyJson(getCortexControlUrl(), "PATCH", "/control/config", body);
   } catch (err) {
     return c.json(
       { error: "Cortex Gateway nicht erreichbar", detail: String(err) },
@@ -88,7 +109,7 @@ let savedRateLimit: number | null = null;
 controlRoutes.post("/control/pause", async (c) => {
   try {
     // Aktuellen Wert lesen und merken
-    const configResp = await fetch(`${CORTEX_CONTROL_URL}/control/config`, {
+    const configResp = await fetch(`${getCortexControlUrl()}/control/config`, {
       signal: AbortSignal.timeout(PROXY_TIMEOUT_MS),
     });
     if (!configResp.ok) {
@@ -103,7 +124,7 @@ controlRoutes.post("/control/pause", async (c) => {
     }
 
     // Rate auf 0 setzen
-    return await proxyJson("PATCH", "/control/config", {
+    return await proxyJson(getCortexControlUrl(), "PATCH", "/control/config", {
       rate_limit_rps: 0,
     });
   } catch (err) {
@@ -120,7 +141,7 @@ controlRoutes.post("/control/resume", async (c) => {
   try {
     const restoreRate = savedRateLimit ?? 10;
     savedRateLimit = null;
-    return await proxyJson("PATCH", "/control/config", {
+    return await proxyJson(getCortexControlUrl(), "PATCH", "/control/config", {
       rate_limit_rps: restoreRate,
     });
   } catch (err) {
@@ -136,7 +157,7 @@ controlRoutes.post("/control/resume", async (c) => {
 controlRoutes.post("/control/provider", async (c) => {
   try {
     const body = await c.req.json();
-    return await proxyJson("POST", "/control/provider", body);
+    return await proxyJson(getCortexControlUrl(), "POST", "/control/provider", body);
   } catch (err) {
     return c.json(
       { error: "Cortex Gateway nicht erreichbar", detail: String(err) },
@@ -150,7 +171,7 @@ controlRoutes.post("/control/provider", async (c) => {
 controlRoutes.post("/control/agent-provider", async (c) => {
   try {
     const body = await c.req.json();
-    return await proxyJson("POST", "/control/agent-provider", body);
+    return await proxyJson(getCortexControlUrl(), "POST", "/control/agent-provider", body);
   } catch (err) {
     return c.json(
       { error: "Cortex Gateway nicht erreichbar", detail: String(err) },
@@ -164,10 +185,46 @@ controlRoutes.post("/control/agent-provider", async (c) => {
 controlRoutes.delete("/control/agent-provider", async (c) => {
   try {
     const body = await c.req.json();
-    return await proxyJson("DELETE", "/control/agent-provider", body);
+    return await proxyJson(getCortexControlUrl(), "DELETE", "/control/agent-provider", body);
   } catch (err) {
     return c.json(
       { error: "Cortex Gateway nicht erreichbar", detail: String(err) },
+      502,
+    );
+  }
+});
+
+controlRoutes.post("/control/chaos", async (c) => {
+  try {
+    const body = await c.req.json();
+    return await proxyJson(
+      getOperatorApiUrl(),
+      "POST",
+      "/operator/chaos",
+      body,
+      getOperatorHeaders(),
+    );
+  } catch (err) {
+    return c.json(
+      { error: "Operator-API nicht erreichbar", detail: String(err) },
+      502,
+    );
+  }
+});
+
+controlRoutes.post("/control/stimulus", async (c) => {
+  try {
+    const body = await c.req.json();
+    return await proxyJson(
+      getOperatorApiUrl(),
+      "POST",
+      "/operator/stimulus",
+      body,
+      getOperatorHeaders(),
+    );
+  } catch (err) {
+    return c.json(
+      { error: "Operator-API nicht erreichbar", detail: String(err) },
       502,
     );
   }
@@ -179,10 +236,10 @@ controlRoutes.delete("/control/agent-provider", async (c) => {
 controlRoutes.get("/control/status", async (c) => {
   try {
     const [configResp, healthResp] = await Promise.all([
-      fetch(`${CORTEX_CONTROL_URL}/control/config`, {
+      fetch(`${getCortexControlUrl()}/control/config`, {
         signal: AbortSignal.timeout(PROXY_TIMEOUT_MS),
       }),
-      fetch(`${CORTEX_CONTROL_URL}/health`, {
+      fetch(`${getCortexControlUrl()}/health`, {
         signal: AbortSignal.timeout(PROXY_TIMEOUT_MS),
       }),
     ]);
@@ -213,4 +270,8 @@ controlRoutes.get("/control/status", async (c) => {
 });
 
 // Export for testing
-export { savedRateLimit, CORTEX_CONTROL_URL };
+export {
+  savedRateLimit,
+  getCortexControlUrl,
+  getOperatorApiUrl,
+};

@@ -97,12 +97,18 @@ func TestDistillEvolution(t *testing.T) {
 	}
 }
 
-func TestDistillPerception_KeepsUrgent(t *testing.T) {
-	content := "[SYSTEM_INJECTION]\nCIRCADIAN: Morgen\nKOERPER: Du bist muede.\nUMGEBUNG: Es riecht nach Kaffee.\nIMPULS: Du willst Kaffee.\n[/SYSTEM_INJECTION]\n"
+func TestDistillPerception_KeepsUrgentEnvironment(t *testing.T) {
+	content := "[SYSTEM_INJECTION]\nCIRCADIAN: Morgen\nKOERPER: Du bist muede.\nUMGEBUNG: Es ist stickig und riecht nach Kaffee.\nAKUSTIK: Es ist laut.\nIMPULS: Du willst Kaffee.\n[/SYSTEM_INJECTION]\n"
 	result := distillPerception(content)
 
 	if !strings.Contains(result, "KOERPER:") {
 		t.Error("should keep KOERPER field")
+	}
+	if !strings.Contains(result, "UMGEBUNG:") {
+		t.Error("should keep UMGEBUNG field")
+	}
+	if !strings.Contains(result, "AKUSTIK:") {
+		t.Error("should keep AKUSTIK field")
 	}
 	if !strings.Contains(result, "IMPULS:") {
 		t.Error("should keep IMPULS field")
@@ -112,9 +118,6 @@ func TestDistillPerception_KeepsUrgent(t *testing.T) {
 	}
 	if strings.Contains(result, "CIRCADIAN:") {
 		t.Error("should drop CIRCADIAN field")
-	}
-	if strings.Contains(result, "UMGEBUNG:") {
-		t.Error("should drop UMGEBUNG field")
 	}
 }
 

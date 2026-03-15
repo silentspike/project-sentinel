@@ -5,7 +5,7 @@ expression: injection
 [SYSTEM_INJECTION]
 CIRCADIAN: 14:30 (Du arbeitest seit 6h konzentriert)
 KOERPER: Du koenntest etwas essen. Du solltest bald eine Pause einlegen. Leichte Kopfschmerzen - du brauchst Kaffee.
-ENVIRONMENT: Die Temperatur ist angenehm. Stickig. Kaffeeduft.
-AKUSTIK: Lebhafte Unterhaltungen.
+ENVIRONMENT: Die Temperatur ist angenehm (23.5 °C). Die Luft ist stickig (1100 ppm CO2). Kaffeeduft.
+AKUSTIK: Lebhafte Unterhaltungen (55 dB).
 ANWESEND: Lisa (Design-Review), Andreas (Coding)
 [/SYSTEM_INJECTION]
