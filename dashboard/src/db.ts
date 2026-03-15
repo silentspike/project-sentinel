@@ -80,9 +80,21 @@ export function getRoom(roomId: string): RoomRow | null {
 // ── KPI Queries ──────────────────────────────────
 
 export function getLatestKpi(): KpiRow | null {
+  // Aggregate KPI across ALL buckets for cumulative counters (chaos_events,
+  // shift_changes, nightrun_events), and use latest values for gauges
+  // (active_agents, tick_count). Single-bucket query missed sparse events.
   return projectionDb
     .query<KpiRow, []>(
-      "SELECT * FROM kpi_1m ORDER BY bucket_start DESC LIMIT 1",
+      `SELECT
+         MAX(bucket_start) as bucket_start,
+         (SELECT active_agents FROM kpi_1m ORDER BY bucket_start DESC LIMIT 1) as active_agents,
+         SUM(total_actions) as total_actions,
+         SUM(total_transits) as total_transits,
+         SUM(chaos_events) as chaos_events,
+         (SELECT tick_count FROM kpi_1m ORDER BY bucket_start DESC LIMIT 1) as tick_count,
+         SUM(shift_changes) as shift_changes,
+         SUM(nightrun_events) as nightrun_events
+       FROM kpi_1m`,
     )
     .get();
 }
