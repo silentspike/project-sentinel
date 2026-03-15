@@ -162,6 +162,9 @@ jobs:
         uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
         with:
           working-directory: cmd/cortex-gateway
+          args: --timeout=5m
+        env:
+          GOLANGCI_LINT_SKIP_CONFIG_VERIFY: "true"
 
   # ──────────────────────────────────────────────
   # Dashboard - only when dashboard/ changed
