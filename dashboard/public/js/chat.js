@@ -198,6 +198,8 @@ async function sendChatMessage() {
 
         list.scrollTop = list.scrollHeight;
       }
+      // Reload full chat after 1s to sync with DB (operator messages persist there)
+      setTimeout(() => loadChat(), 1000);
     }
   } catch {
     // Send failed — restore message so user can retry
