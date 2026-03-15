@@ -148,8 +148,19 @@ async function sendChatMessage() {
     });
     if (res.ok) {
       input.value = '';
-      // Reload chat to show new message
-      await loadChat();
+      // Reload only message list (not full re-render which would destroy input)
+      const url = currentRoom ? '/api/chat/' + currentRoom : '/api/chat';
+      const chatRes = await fetch(url);
+      const messages = await chatRes.json();
+      const list = document.getElementById('chat-list');
+      if (list) {
+        while (list.firstChild) list.removeChild(list.firstChild);
+        const sorted = [...messages].reverse();
+        for (const msg of sorted) {
+          list.appendChild(createChatMessage(msg));
+        }
+        list.scrollTop = list.scrollHeight;
+      }
     }
   } catch {
     // Send failed

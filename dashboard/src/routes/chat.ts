@@ -44,9 +44,14 @@ chatRoutes.post("/chat", async (c) => {
     });
     if (resp.ok) {
       gatewayResponse = await resp.json();
+    } else {
+      const errorText = await resp.text().catch(() => "unknown");
+      console.error(`Gateway error ${resp.status}: ${errorText.slice(0, 200)}`);
+      gatewayResponse = { error: `Gateway ${resp.status}`, detail: errorText.slice(0, 200) };
     }
-  } catch {
-    // Gateway unavailable — message still persisted
+  } catch (e) {
+    console.error("Gateway unavailable:", e);
+    gatewayResponse = { error: "Gateway unavailable" };
   }
 
   return c.json({
