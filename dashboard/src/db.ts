@@ -406,8 +406,13 @@ function getChatDb(): InstanceType<typeof Database> {
       message TEXT NOT NULL,
       room TEXT,
       gateway_status TEXT DEFAULT 'pending',
+      gateway_response TEXT,
       created_at INTEGER NOT NULL
     )`);
+    // Migrate: add gateway_response column if missing (existing DBs)
+    try {
+      _chatDb.run("ALTER TABLE operator_messages ADD COLUMN gateway_response TEXT");
+    } catch { /* column already exists */ }
   }
   return _chatDb;
 }
@@ -422,10 +427,117 @@ export function insertOperatorMessage(message: string, room: string | null): num
   return row?.id ?? 0;
 }
 
+export function updateOperatorMessageGateway(
+  id: number,
+  status: string,
+  responseContent: string | null,
+): void {
+  const db = getChatDb();
+  db.query("UPDATE operator_messages SET gateway_status = ?, gateway_response = ? WHERE id = ?")
+    .run(status, responseContent, id);
+}
+
+interface OperatorMessageRow {
+  id: number;
+  message: string;
+  room: string | null;
+  gateway_status: string;
+  gateway_response: string | null;
+  created_at: number;
+}
+
+/** Returns operator messages (both outgoing + gateway responses) as ChatMessages for merging. */
+export function getOperatorChatMessages(limit = 100): ChatMessage[] {
+  const db = getChatDb();
+  const rows = db
+    .query<OperatorMessageRow, [number]>(
+      `SELECT id, message, room, gateway_status, gateway_response, created_at
+       FROM operator_messages
+       ORDER BY id DESC
+       LIMIT ?`,
+    )
+    .all(limit);
+
+  const result: ChatMessage[] = [];
+  for (const row of rows) {
+    // Operator's outgoing message
+    result.push({
+      id: -(row.id * 2),  // negative IDs to avoid collision with EventStore IDs
+      event_id: `operator-msg-${row.id}`,
+      agent_id: "operator",
+      agent_name: "Operator",
+      action_type: "operator_message",
+      content: row.message,
+      target_room: row.room,
+      tick: 0,
+      timestamp_ms: row.created_at,
+    });
+
+    // Gateway (agent) response, if available
+    if (row.gateway_response && row.gateway_status === "ok") {
+      result.push({
+        id: -(row.id * 2 + 1),
+        event_id: `operator-resp-${row.id}`,
+        agent_id: "gateway",
+        agent_name: "Agent (Gateway)",
+        action_type: "gateway_response",
+        content: row.gateway_response,
+        target_room: row.room,
+        tick: 0,
+        timestamp_ms: row.created_at + 1,  // +1ms to sort after the operator message
+      });
+    }
+  }
+  return result;
+}
+
+/** Returns operator messages filtered by room. */
+export function getOperatorChatMessagesByRoom(roomId: string, limit = 50): ChatMessage[] {
+  const db = getChatDb();
+  const rows = db
+    .query<OperatorMessageRow, [string, number]>(
+      `SELECT id, message, room, gateway_status, gateway_response, created_at
+       FROM operator_messages
+       WHERE room = ?
+       ORDER BY id DESC
+       LIMIT ?`,
+    )
+    .all(roomId, limit);
+
+  const result: ChatMessage[] = [];
+  for (const row of rows) {
+    result.push({
+      id: -(row.id * 2),
+      event_id: `operator-msg-${row.id}`,
+      agent_id: "operator",
+      agent_name: "Operator",
+      action_type: "operator_message",
+      content: row.message,
+      target_room: row.room,
+      tick: 0,
+      timestamp_ms: row.created_at,
+    });
+    if (row.gateway_response && row.gateway_status === "ok") {
+      result.push({
+        id: -(row.id * 2 + 1),
+        event_id: `operator-resp-${row.id}`,
+        agent_id: "gateway",
+        agent_name: "Agent (Gateway)",
+        action_type: "gateway_response",
+        content: row.gateway_response,
+        target_room: row.room,
+        tick: 0,
+        timestamp_ms: row.created_at + 1,
+      });
+    }
+  }
+  return result;
+}
+
 // ── Chat Messages (Agent Actions) ───────────────
 
 export function getRecentChatMessages(limit = 100): ChatMessage[] {
-  return eventStoreDb
+  const agentMessages = eventStoreDb
     .query<{ id: number; event_id: string; aggregate_id: string; payload: string; tick: number; timestamp_ms: number }, [number]>(
       `SELECT id, event_id, aggregate_id, payload, tick, timestamp_ms
        FROM events
@@ -435,10 +547,17 @@ export function getRecentChatMessages(limit = 100): ChatMessage[] {
     )
     .all(limit)
     .map(toChatMessage);
+
+  const operatorMessages = getOperatorChatMessages(limit);
+
+  // Merge and sort by timestamp descending, take top N
+  return [...agentMessages, ...operatorMessages]
+    .sort((a, b) => b.timestamp_ms - a.timestamp_ms)
+    .slice(0, limit);
 }
 
 export function getChatMessagesByRoom(roomId: string, limit = 50): ChatMessage[] {
-  return eventStoreDb
+  const agentMessages = eventStoreDb
     .query<{ id: number; event_id: string; aggregate_id: string; payload: string; tick: number; timestamp_ms: number }, [string, number]>(
       `SELECT id, event_id, aggregate_id, payload, tick, timestamp_ms
        FROM events
@@ -449,6 +568,12 @@ export function getChatMessagesByRoom(roomId: string, limit = 50): ChatMessage[]
     )
     .all(`%"target_room":"${roomId}"%`, limit)
     .map(toChatMessage);
+
+  const operatorMessages = getOperatorChatMessagesByRoom(roomId, limit);
+
+  return [...agentMessages, ...operatorMessages]
+    .sort((a, b) => b.timestamp_ms - a.timestamp_ms)
+    .slice(0, limit);
 }
 
 function toChatMessage(row: { id: number; event_id: string; aggregate_id: string; payload: string; tick: number; timestamp_ms: number }): ChatMessage {

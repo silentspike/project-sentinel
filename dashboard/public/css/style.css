@@ -612,6 +612,30 @@ main { padding: 2rem; }
 }
 .chat-send-btn:hover { opacity: 0.9; }
 
+.chat-message-operator {
+  background: rgba(59, 130, 246, 0.08);
+  border-color: rgba(59, 130, 246, 0.3);
+}
+.chat-message-operator .chat-agent {
+  color: #3b82f6;
+}
+
+.chat-message-gateway {
+  background: rgba(34, 197, 94, 0.08);
+  border-color: rgba(34, 197, 94, 0.3);
+}
+.chat-message-gateway .chat-agent {
+  color: #22c55e;
+}
+
+.chat-message-error {
+  background: rgba(239, 68, 68, 0.08);
+  border-color: rgba(239, 68, 68, 0.3);
+}
+.chat-message-error .chat-agent {
+  color: #ef4444;
+}
+
 /* ── Control Panel ──────────────────────────────── */
 
 .control-section {
