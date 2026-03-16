@@ -109,6 +109,53 @@ export interface RoomResponse {
   occupants: string[];
 }
 
+export interface RoomPhysicsHistoryPoint {
+  tick: number;
+  timestamp_ms: number;
+  temperature: number | null;
+  co2_ppm: number | null;
+  noise_db: number | null;
+  occupant_count: number;
+}
+
+export interface RoomStimulusHistoryItem {
+  event_id: string;
+  room_id: string;
+  stimulus_type: string;
+  delta: number;
+  description: string;
+  tick: number;
+  timestamp_ms: number;
+}
+
+export interface RoomReactionItem {
+  event_id: string;
+  agent_id: string;
+  agent_name: string;
+  action_type: string;
+  content: string | null;
+  target_room: string | null;
+  tick: number;
+  timestamp_ms: number;
+  correlation_id: string;
+  chaos_event_id: string | null;
+  chaos_type: string | null;
+  chaos_description: string | null;
+  chaos_tick: number | null;
+  stimulus_event_id: string | null;
+  stimulus_type: string | null;
+  stimulus_description: string | null;
+  stimulus_tick: number | null;
+}
+
+export interface RoomDetailResponse extends RoomResponse {
+  physics_history: RoomPhysicsHistoryPoint[];
+  chaos_history: ChaosEventItem[];
+  stimulus_history: RoomStimulusHistoryItem[];
+  recent_reactions: RoomReactionItem[];
+  reaction_window_ticks: number;
+}
+
 export interface MetricsResponse {
   active_agents: number;
   total_actions: number;

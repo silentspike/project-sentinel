@@ -52,6 +52,10 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub nats: NatsConfig,
 
+    /// Lokale Operator-API fuer manuelle Chaos-Trigger aus dem Dashboard.
+    #[serde(default)]
+    pub operator_api: OperatorApiConfig,
+
     /// PSI-basierte adaptive Tick-Rate (TOGAF Adaptive Scheduling).
     #[serde(default)]
     pub adaptive: AdaptiveConfig,
@@ -61,6 +65,30 @@ pub struct DaemonConfig {
     /// `{fs_mount}/{agent_name}` → `/home/{agent_name}`.
     #[serde(default)]
     pub fs_mount: Option<String>,
+}
+
+/// Lokale Loopback-API fuer manuelle Operator-Eingriffe.
+#[derive(Debug, Deserialize, Clone)]
+pub struct OperatorApiConfig {
+    /// API aktivieren.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Bind-Adresse fuer den lokalen HTTP-Listener.
+    #[serde(default = "default_operator_bind_addr")]
+    pub bind_addr: String,
+    /// Optionales Shared Secret fuer Dashboard-Proxy -> Daemon.
+    #[serde(default)]
+    pub shared_secret: Option<String>,
+}
+
+impl Default for OperatorApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind_addr: default_operator_bind_addr(),
+            shared_secret: None,
+        }
+    }
 }
 
 /// Zenoh SHM Core-Bus Konfiguration.
@@ -177,6 +205,10 @@ fn default_max_inflight_per_agent() -> usize {
     8
 }
 
+fn default_operator_bind_addr() -> String {
+    "127.0.0.1:8084".to_string()
+}
+
 /// NATS JetStream Konfiguration fuer den Daemon.
 #[derive(Debug, Deserialize)]
 pub struct NatsConfig {
@@ -243,11 +275,22 @@ data_dir = "/opt/sentinel/data"
 tick_rate_ms = 500
 max_agents = 10
 zenoh_prefix = "test"
+
+[daemon.operator_api]
+enabled = true
+bind_addr = "127.0.0.1:9999"
+shared_secret = "secret"
 "#;
         let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
         assert_eq!(file.daemon.tick_rate_ms, 500);
         assert_eq!(file.daemon.max_agents, 10);
         assert_eq!(file.daemon.zenoh_prefix, "test");
+        assert!(file.daemon.operator_api.enabled);
+        assert_eq!(file.daemon.operator_api.bind_addr, "127.0.0.1:9999");
+        assert_eq!(
+            file.daemon.operator_api.shared_secret.as_deref(),
+            Some("secret")
+        );
     }
 
     #[test]
@@ -258,6 +301,9 @@ config_dir = "/tmp/cfg"
 data_dir = "/tmp/data"
 "#;
         let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
+        assert!(file.daemon.operator_api.enabled);
+        assert_eq!(file.daemon.operator_api.bind_addr, "127.0.0.1:8084");
+        assert!(file.daemon.operator_api.shared_secret.is_none());
         assert_eq!(file.daemon.tick_rate_ms, 1000);
         assert_eq!(file.daemon.max_agents, 30);
         assert_eq!(file.daemon.zenoh_prefix, "sentinel");

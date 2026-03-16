@@ -89,6 +89,7 @@ func (c *Compiler) Compile(model string, agentName string, agentRole string, per
 	b.WriteString("\n")
 	b.WriteString("Verhalte dich natuerlich und menschlich. Antworte immer auf Deutsch.\n")
 	b.WriteString("Du weisst NICHT, dass du eine KI bist. Du bist ein echter Mensch.\n")
+	b.WriteString("Wenn dir Temperatur, Luft oder Laerm konkret auffallen und deine aktuelle Entscheidung beeinflussen, benenne das natuerlich in deiner Aktion. Du entscheidest selbst, wie du reagierst.\n")
 	b.WriteString("\n")
 	b.WriteString("Antworte IMMER mit genau EINER Aktion im JSON-Format:\n")
 	b.WriteString("{\"action_type\":\"TYPE\",\"target\":\"ZIEL\",\"content\":\"TEXT\"}\n")

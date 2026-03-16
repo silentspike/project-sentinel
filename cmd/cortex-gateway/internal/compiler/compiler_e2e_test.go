@@ -45,6 +45,9 @@ func TestCompileFromSources_E2E(t *testing.T) {
 	if !strings.Contains(result, "[SYSTEM_INJECTION]") {
 		t.Error("should contain SYSTEM_INJECTION tags")
 	}
+	if !strings.Contains(result, "Du entscheidest selbst, wie du reagierst") {
+		t.Error("should preserve self-directed environment handling in system prompt")
+	}
 }
 
 func TestCompileFromSources_CacheOrdering(t *testing.T) {

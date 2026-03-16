@@ -1,6 +1,6 @@
 // Router und WebSocket Manager
 import { renderAgents, updateAgents } from './agents.js';
-import { renderFloorplan } from './floorplan.js';
+import { renderFloorplan, refreshActiveRoomDetail } from './floorplan.js';
 import { renderActivity, updateActivity } from './activity.js';
 import { renderMetrics } from './metrics.js';
 import { renderCockpit, updateCockpit } from './cockpit.js';
@@ -52,12 +52,14 @@ function connectWebSocket() {
         updateActivity();
       } else if (data.type === 'room_update') {
         renderFloorplan(data.rooms);
+        refreshActiveRoomDetail();
       } else if (data.type === 'health_update') {
         updateLagDisplay(data.lag);
       } else if (data.type === 'cockpit_update') {
         updateCockpit();
       } else if (data.type === 'chaos_update') {
         updateChaos();
+        refreshActiveRoomDetail();
       } else if (data.type === 'activity_update') {
         updateActivity();
       }

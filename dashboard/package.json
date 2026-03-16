@@ -13,6 +13,7 @@
   },
   "devDependencies": {
     "bun-types": "latest",
+    "linkedom": "^0.18.12",
     "typescript": "^5.9.3"
   }
 }

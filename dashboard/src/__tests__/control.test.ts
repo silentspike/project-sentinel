@@ -1,8 +1,11 @@
-import { describe, it, expect, beforeAll, afterAll, mock, beforeEach } from "bun:test";
+import { describe, it, expect, afterAll, beforeEach } from "bun:test";
 import { app } from "../index";
 
 // Mock fetch fuer Cortex Gateway Proxy-Tests
 const originalFetch = globalThis.fetch;
+const originalDashboardApiKey = process.env.SENTINEL_DASHBOARD_API_KEY;
+const originalOperatorApiKey = process.env.SENTINEL_OPERATOR_API_KEY;
+const originalOperatorApiUrl = process.env.SENTINEL_OPERATOR_API_URL;
 
 function mockFetch(handler: (url: string, init?: RequestInit) => Response | Promise<Response>) {
   globalThis.fetch = handler as typeof fetch;
@@ -13,7 +16,19 @@ function restoreFetch() {
 }
 
 describe("Control Routes", () => {
-  afterAll(() => restoreFetch());
+  beforeEach(() => {
+    restoreFetch();
+    process.env.SENTINEL_DASHBOARD_API_KEY = originalDashboardApiKey || "";
+    process.env.SENTINEL_OPERATOR_API_KEY = originalOperatorApiKey || "";
+    process.env.SENTINEL_OPERATOR_API_URL = originalOperatorApiUrl || "";
+  });
+
+  afterAll(() => {
+    restoreFetch();
+    process.env.SENTINEL_DASHBOARD_API_KEY = originalDashboardApiKey || "";
+    process.env.SENTINEL_OPERATOR_API_KEY = originalOperatorApiKey || "";
+    process.env.SENTINEL_OPERATOR_API_URL = originalOperatorApiUrl || "";
+  });
 
   describe("GET /api/control/config", () => {
     it("proxies to Cortex Gateway and returns config", async () => {
@@ -107,6 +122,7 @@ describe("Control Routes", () => {
   describe("POST /api/control/pause (auth required)", () => {
     it("returns 403 when no API key configured", async () => {
       // SENTINEL_DASHBOARD_API_KEY not set → 403
+      process.env.SENTINEL_DASHBOARD_API_KEY = "";
       const res = await app.request("/api/control/pause", {
         method: "POST",
       });
@@ -114,19 +130,11 @@ describe("Control Routes", () => {
     });
 
     it("returns 401 when no Authorization header", async () => {
-      // Set API key for this test
-      const origKey = process.env.SENTINEL_DASHBOARD_API_KEY;
       process.env.SENTINEL_DASHBOARD_API_KEY = "test-key-123";
-
-      // Re-import to pick up env change — auth reads at module level
-      // Since auth.ts reads env at import time, we need to account for that
       const res = await app.request("/api/control/pause", {
         method: "POST",
       });
-      // Will be 403 since module already loaded with empty key
-      expect([401, 403]).toContain(res.status);
-
-      process.env.SENTINEL_DASHBOARD_API_KEY = origKey || "";
+      expect(res.status).toBe(401);
     });
   });
 
@@ -149,6 +157,133 @@ describe("Control Routes", () => {
         body: JSON.stringify({ provider: "ollama" }),
       });
       expect(res.status).toBe(403);
+    });
+  });
+
+  describe("POST /api/control/chaos", () => {
+    it("proxies chaos trigger to the local operator API", async () => {
+      process.env.SENTINEL_DASHBOARD_API_KEY = "dash-key";
+      process.env.SENTINEL_OPERATOR_API_KEY = "operator-key";
+
+      mockFetch(async (url: string, init?: RequestInit) => {
+        expect(url).toBe("http://127.0.0.1:8084/operator/chaos");
+        expect(init?.method).toBe("POST");
+        const headers = new Headers(init?.headers);
+        expect(headers.get("x-sentinel-operator-key")).toBe("operator-key");
+        expect(headers.get("content-type")).toContain("application/json");
+        expect(JSON.parse(String(init?.body))).toEqual({
+          room_id: "kueche",
+          chaos_type: "AirConBroken",
+          duration_ticks: 45,
+        });
+        return new Response(
+          JSON.stringify({
+            accepted: true,
+            event_id: "evt-1",
+            room_id: "kueche",
+            chaos_type: "AirConBroken",
+          }),
+          {
+            status: 202,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      });
+
+      const res = await app.request("/api/control/chaos", {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer dash-key",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          room_id: "kueche",
+          chaos_type: "AirConBroken",
+          duration_ticks: 45,
+        }),
+      });
+
+      expect(res.status).toBe(202);
+      const body = await res.json();
+      expect(body.accepted).toBe(true);
+      expect(body.room_id).toBe("kueche");
+    });
+
+    it("returns 502 when the operator API is unreachable", async () => {
+      process.env.SENTINEL_DASHBOARD_API_KEY = "dash-key";
+
+      mockFetch(async () => {
+        throw new Error("connect ECONNREFUSED 127.0.0.1:8084");
+      });
+
+      const res = await app.request("/api/control/chaos", {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer dash-key",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          room_id: "kueche",
+          chaos_type: "PrinterBroken",
+        }),
+      });
+
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body.error).toContain("Operator-API");
+    });
+  });
+
+  describe("POST /api/control/stimulus", () => {
+    it("proxies room stimulus trigger to the local operator API", async () => {
+      process.env.SENTINEL_DASHBOARD_API_KEY = "dash-key";
+      process.env.SENTINEL_OPERATOR_API_KEY = "operator-key";
+
+      mockFetch(async (url: string, init?: RequestInit) => {
+        expect(url).toBe("http://127.0.0.1:8084/operator/stimulus");
+        expect(init?.method).toBe("POST");
+        const headers = new Headers(init?.headers);
+        expect(headers.get("x-sentinel-operator-key")).toBe("operator-key");
+        expect(headers.get("content-type")).toContain("application/json");
+        expect(JSON.parse(String(init?.body))).toEqual({
+          room_id: "kueche",
+          stimulus_type: "co2",
+          delta: 900,
+          duration_ticks: 90,
+        });
+        return new Response(
+          JSON.stringify({
+            accepted: true,
+            event_id: "evt-stim-1",
+            room_id: "kueche",
+            stimulus_type: "co2",
+            delta: 900,
+          }),
+          {
+            status: 202,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      });
+
+      const res = await app.request("/api/control/stimulus", {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer dash-key",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          room_id: "kueche",
+          stimulus_type: "co2",
+          delta: 900,
+          duration_ticks: 90,
+        }),
+      });
+
+      expect(res.status).toBe(202);
+      const body = await res.json();
+      expect(body.accepted).toBe(true);
+      expect(body.stimulus_type).toBe("co2");
     });
   });
 });

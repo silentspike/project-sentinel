@@ -126,6 +126,83 @@ pub enum EventType {
     InternetOutage,
 }
 
+/// User-steuerbarer Raumreiz fuer direkte Physics-/Perception-Tests.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomStimulusType {
+    Temperature,
+    Noise,
+    Co2,
+}
+
+impl RoomStimulusType {
+    /// Standard-Delta fuer UI-seitige Schnelltests.
+    pub fn default_delta(self) -> f32 {
+        match self {
+            Self::Temperature => 4.0,
+            Self::Noise => 24.0,
+            Self::Co2 => 900.0,
+        }
+    }
+
+    /// Menschlich lesbare Standardbeschreibung fuer Event-Trail und UI.
+    pub fn default_description(self, delta: f32) -> String {
+        match self {
+            Self::Temperature => format!("Temperaturreiz {delta:+.1} °C"),
+            Self::Noise => format!("Laermreiz {delta:+.0} dB"),
+            Self::Co2 => format!("CO2-Reiz {delta:+.0} ppm"),
+        }
+    }
+}
+
+impl EventType {
+    /// Default-Beschreibung fuer Operator- und Zufalls-Chaos.
+    pub fn default_description(self) -> &'static str {
+        match self {
+            Self::PhoneRing => "Telefon klingelt",
+            Self::PrinterBroken => "Drucker defekt",
+            Self::PackageDelivery => "Paketlieferung",
+            Self::SBahnDelay => "S-Bahn Verspaetung",
+            Self::FireAlarmDrill => "Feueralarm-Uebung",
+            Self::CakeInKitchen => "Kuchen in der Kueche",
+            Self::AirConBroken => "Klimaanlage defekt",
+            Self::InternetOutage => "Internetausfall",
+        }
+    }
+}
+
+/// Schreibender Operator-Command fuer manuelles Chaos in der Runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorChaosCommand {
+    pub event_id: String,
+    pub correlation_id: String,
+    pub operation_id: String,
+    pub room_id: String,
+    pub chaos_type: EventType,
+    pub description: String,
+    pub duration_ticks: Option<u64>,
+}
+
+/// Schreibender Operator-Command fuer direkte Raumreize in der Runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRoomStimulusCommand {
+    pub event_id: String,
+    pub correlation_id: String,
+    pub operation_id: String,
+    pub room_id: String,
+    pub stimulus_type: RoomStimulusType,
+    pub delta: f32,
+    pub description: String,
+    pub duration_ticks: Option<u64>,
+}
+
+/// Gemeinsamer Runtime-Schreibpfad fuer Operator-Kommandos.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OperatorCommand {
+    Chaos(OperatorChaosCommand),
+    RoomStimulus(OperatorRoomStimulusCommand),
+}
+
 // ──────────────────────────────────────────────
 // Domain Structs
 // ──────────────────────────────────────────────
