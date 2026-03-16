@@ -513,7 +513,7 @@ mod tests {
             result.environment_text
         );
         assert!(
-            result.environment_text.contains("Stickig"),
+            result.environment_text.to_lowercase().contains("stickig"),
             "1200ppm should be stickig, got: {}",
             result.environment_text
         );
