@@ -1153,6 +1153,17 @@ fn room_id_to_german(room_id: &str) -> String {
     }
 }
 
+type OutputAgentQueryData = (
+    &'static AgentIdentity,
+    &'static BioState,
+    &'static Position,
+    &'static Personality,
+    &'static ShiftInfo,
+    &'static PerceptionState,
+    &'static WorkContext,
+    &'static EventQueue,
+);
+
 /// 9. Sendet Wahrnehmung via Channel an externen Zenoh-Publisher.
 ///
 /// Serialisiert PerceptionState + Position + EventQueue zu Perception-Message
@@ -1162,16 +1173,7 @@ pub fn output_system(
     sender: Option<Res<PerceptionSender>>,
     active_smells: Res<super::world::ActiveSmells>,
     room_physics_state: Res<RoomPhysicsState>,
-    query: Query<(
-        &AgentIdentity,
-        &BioState,
-        &Position,
-        &Personality,
-        &ShiftInfo,
-        &PerceptionState,
-        &WorkContext,
-        &EventQueue,
-    )>,
+    query: Query<OutputAgentQueryData>,
     time: Res<SimulationTime>,
 ) {
     let Some(sender) = sender else { return };
