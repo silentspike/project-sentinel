@@ -19,15 +19,17 @@ pub use perception::{format_injection, generate_perception, PerceptionTexts, Sme
 pub use systems::SimulationPhase;
 pub use world::{
     apply_capabilities, apply_personality, attach_redb_store, create_simulation_world,
-    despawn_agent_from_world, spawn_agent, ActionReceiver, ActiveSmell, ActiveSmells, EventBuffer,
-    LimboEventStore, PerceptionSender, PersistTelemetry, PsiMetrics, RedbStateStore,
-    RoomDistanceMap, SimulationTime, ToolRuntimeResource, ZenohFanoutSender,
+    despawn_agent_from_world, spawn_agent, ActionReceiver, ActiveChaos, ActiveChaosEvent,
+    ActiveRoomStimuli, ActiveSmell, ActiveSmells, EventBuffer, LimboEventStore,
+    OperatorCommandReceiver, PerceptionSender, PersistTelemetry, PsiMetrics, RedbStateStore,
+    RoomDistanceMap, RoomPhysicsSnapshot, RoomPhysicsState, SimulationTime, ToolRuntimeResource,
+    ZenohFanoutSender,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentinel_common::{ActionType, AgentAction, AgentId, Tick, Timestamp};
+    use sentinel_common::{ActionType, AgentAction, AgentId, RoomStimulusType, Tick, Timestamp};
     use sentinel_limbo::EventStore;
     use sentinel_redb::StateStore;
     use std::sync::Arc;
@@ -506,6 +508,94 @@ mod tests {
         let perception = perception.unwrap();
         assert_eq!(perception.agent_id, AgentId(1));
         assert!(!perception.environment_text.is_empty());
+    }
+
+    #[test]
+    fn test_output_system_includes_room_physics_and_presence() {
+        let (mut world, mut schedule) = create_simulation_world();
+        let entity_a = spawn_agent(&mut world, AgentId(1), "Lisa Bergmann", "Design", 1);
+        let entity_b = spawn_agent(&mut world, AgentId(2), "Thomas Mueller", "Entwicklung", 1);
+
+        world.get_mut::<Position>(entity_a).unwrap().room_id = "buero-design-1".to_string();
+        world.get_mut::<Position>(entity_b).unwrap().room_id = "buero-design-1".to_string();
+        world.resource_mut::<ActiveRoomStimuli>().set(
+            "buero-design-1",
+            RoomStimulusType::Temperature,
+            6.0,
+            "Temperaturreiz +6.0 °C".to_string(),
+            1,
+            120,
+        );
+        world.resource_mut::<ActiveRoomStimuli>().set(
+            "buero-design-1",
+            RoomStimulusType::Co2,
+            1300.0,
+            "CO2-Reiz +1300 ppm".to_string(),
+            1,
+            120,
+        );
+        world.resource_mut::<ActiveRoomStimuli>().set(
+            "buero-design-1",
+            RoomStimulusType::Noise,
+            42.0,
+            "Laermreiz +42 dB".to_string(),
+            1,
+            120,
+        );
+        world.resource_mut::<ActiveSmells>().add(
+            "buero-design-1",
+            "coffee".to_string(),
+            0.8,
+            1,
+            20,
+        );
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        world.insert_resource(PerceptionSender(tx));
+
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(1);
+            time.delta_seconds = 1.0;
+            time.sim_hour = 10.0;
+        }
+        schedule.run(&mut world);
+
+        let perceptions: Vec<_> = rx.try_iter().collect();
+        let perception = perceptions
+            .iter()
+            .find(|msg| msg.agent_id == AgentId(1))
+            .expect("perception for Lisa must exist");
+
+        assert!(
+            perception.environment_text.contains("warm")
+                || perception.environment_text.contains("zu warm"),
+            "environment should mention warmth, got: {}",
+            perception.environment_text
+        );
+        assert!(
+            perception
+                .environment_text
+                .to_lowercase()
+                .contains("stickig"),
+            "environment should mention CO2 discomfort, got: {}",
+            perception.environment_text
+        );
+        assert!(
+            perception.environment_text.contains("Kaffeeduft"),
+            "environment should mention coffee smell, got: {}",
+            perception.environment_text
+        );
+        assert!(
+            perception.acoustic_text.to_lowercase().contains("laut"),
+            "acoustic text should mention loudness, got: {}",
+            perception.acoustic_text
+        );
+        assert!(
+            perception.presence_text.contains("Thomas Mueller"),
+            "presence should list other agents, got: {}",
+            perception.presence_text
+        );
     }
 
     /// Transit-Completion erzeugt DomainEvent

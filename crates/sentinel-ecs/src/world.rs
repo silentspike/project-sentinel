@@ -9,7 +9,7 @@ use super::systems::*;
 use bevy_ecs::prelude::*;
 use sentinel_common::{
     agent_config::PersonalityConfig, AgentAction, AgentId, DomainEvent, DomainEventPayload,
-    Emotion, Perception, Tick,
+    Emotion, EventType, OperatorCommand, Perception, RoomStimulusType, Tick,
 };
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
@@ -75,6 +75,206 @@ impl ActiveSmells {
             smells.retain(|s| current_tick < s.created_tick + s.duration_ticks);
             !smells.is_empty()
         });
+    }
+}
+
+/// Aktive Chaos-Events pro Raum (ephemere ECS Resource).
+///
+/// Wird vom Zufalls-Chaos und spaeter auch vom Operator-Pfad befuellt.
+/// Pro Raum ist zunaechst genau ein aktives Chaos erlaubt.
+#[derive(Resource, Default, Debug, Clone)]
+pub struct ActiveChaos {
+    /// Key: room_id, Value: aktives Chaos-Event
+    pub events: HashMap<String, ActiveChaosEvent>,
+}
+
+/// Ein einzelnes aktives Chaos-Event in einem Raum.
+#[derive(Debug, Clone)]
+pub struct ActiveChaosEvent {
+    pub event_type: EventType,
+    pub description: String,
+    pub created_tick: u64,
+    pub duration_ticks: u64,
+}
+
+impl ActiveChaos {
+    /// Setzt oder ersetzt das aktive Chaos fuer einen Raum.
+    pub fn set(
+        &mut self,
+        room_id: &str,
+        event_type: EventType,
+        description: String,
+        created_tick: u64,
+        duration_ticks: u64,
+    ) {
+        self.events.insert(
+            room_id.to_string(),
+            ActiveChaosEvent {
+                event_type,
+                description,
+                created_tick,
+                duration_ticks,
+            },
+        );
+    }
+
+    /// Gibt das noch aktive Chaos fuer einen Raum zurueck.
+    pub fn get_active(&self, room_id: &str, current_tick: u64) -> Option<&ActiveChaosEvent> {
+        self.events
+            .get(room_id)
+            .filter(|event| current_tick < event.created_tick.saturating_add(event.duration_ticks))
+    }
+
+    /// Gibt alle Raeume mit noch aktivem Chaos zurueck.
+    pub fn active_rooms(&self, current_tick: u64) -> Vec<&str> {
+        self.events
+            .iter()
+            .filter_map(|(room_id, event)| {
+                (current_tick < event.created_tick.saturating_add(event.duration_ticks))
+                    .then_some(room_id.as_str())
+            })
+            .collect()
+    }
+
+    /// Entfernt abgelaufene Chaos-Events aus allen Raeumen.
+    pub fn cleanup(&mut self, current_tick: u64) {
+        self.events.retain(|_, event| {
+            current_tick < event.created_tick.saturating_add(event.duration_ticks)
+        });
+    }
+}
+
+/// Aktive manuelle Raumreize pro Raum und Reiztyp.
+#[derive(Resource, Default, Debug, Clone)]
+pub struct ActiveRoomStimuli {
+    /// Key: room_id, Value: aktiver Reiz je Typ
+    pub entries: HashMap<String, HashMap<RoomStimulusType, ActiveRoomStimulus>>,
+}
+
+/// Ein einzelner aktiver Raumreiz.
+#[derive(Debug, Clone)]
+pub struct ActiveRoomStimulus {
+    pub stimulus_type: RoomStimulusType,
+    pub delta: f32,
+    pub description: String,
+    pub created_tick: u64,
+    pub duration_ticks: u64,
+}
+
+impl ActiveRoomStimuli {
+    /// Setzt oder ersetzt einen aktiven Raumreiz fuer Raum+Typ.
+    pub fn set(
+        &mut self,
+        room_id: &str,
+        stimulus_type: RoomStimulusType,
+        delta: f32,
+        description: String,
+        created_tick: u64,
+        duration_ticks: u64,
+    ) {
+        self.entries.entry(room_id.to_string()).or_default().insert(
+            stimulus_type,
+            ActiveRoomStimulus {
+                stimulus_type,
+                delta,
+                description,
+                created_tick,
+                duration_ticks,
+            },
+        );
+    }
+
+    /// Gibt den noch aktiven Reiz fuer Raum+Typ zurueck.
+    pub fn get_active(
+        &self,
+        room_id: &str,
+        stimulus_type: RoomStimulusType,
+        current_tick: u64,
+    ) -> Option<&ActiveRoomStimulus> {
+        self.entries
+            .get(room_id)
+            .and_then(|room| room.get(&stimulus_type))
+            .filter(|event| current_tick < event.created_tick.saturating_add(event.duration_ticks))
+    }
+
+    /// Summiert die aktuell aktiven Deltas fuer einen Raum und Typ.
+    pub fn delta_for(
+        &self,
+        room_id: &str,
+        stimulus_type: RoomStimulusType,
+        current_tick: u64,
+    ) -> f32 {
+        self.get_active(room_id, stimulus_type, current_tick)
+            .map(|event| event.delta)
+            .unwrap_or(0.0)
+    }
+
+    /// Gibt alle Raeume mit mindestens einem aktiven Reiz zurueck.
+    pub fn active_rooms(&self, current_tick: u64) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter_map(|(room_id, stimuli)| {
+                stimuli
+                    .values()
+                    .any(|event| {
+                        current_tick < event.created_tick.saturating_add(event.duration_ticks)
+                    })
+                    .then_some(room_id.as_str())
+            })
+            .collect()
+    }
+
+    /// Entfernt abgelaufene Raumreize.
+    pub fn cleanup(&mut self, current_tick: u64) {
+        self.entries.retain(|_, stimuli| {
+            stimuli.retain(|_, event| {
+                current_tick < event.created_tick.saturating_add(event.duration_ticks)
+            });
+            !stimuli.is_empty()
+        });
+    }
+}
+
+/// Letzter berechneter Physics-Snapshot pro Raum fuer echte Reaktionslogik.
+#[derive(Resource, Default, Debug, Clone)]
+pub struct RoomPhysicsState {
+    pub rooms: HashMap<String, RoomPhysicsSnapshot>,
+}
+
+/// Physik-Snapshot eines Raums im aktuellen Tick.
+#[derive(Debug, Clone)]
+pub struct RoomPhysicsSnapshot {
+    pub tick: u64,
+    pub occupant_count: u32,
+    pub temperature: f32,
+    pub co2_ppm: f32,
+    pub noise_db: f32,
+}
+
+impl RoomPhysicsState {
+    pub fn set(
+        &mut self,
+        room_id: &str,
+        tick: u64,
+        occupant_count: u32,
+        temperature: f32,
+        co2_ppm: f32,
+        noise_db: f32,
+    ) {
+        self.rooms.insert(
+            room_id.to_string(),
+            RoomPhysicsSnapshot {
+                tick,
+                occupant_count,
+                temperature,
+                co2_ppm,
+                noise_db,
+            },
+        );
+    }
+
+    pub fn get(&self, room_id: &str) -> Option<&RoomPhysicsSnapshot> {
+        self.rooms.get(room_id)
     }
 }
 
@@ -190,6 +390,12 @@ impl PersistTelemetry {
 #[derive(Resource)]
 pub struct ActionReceiver(pub std::sync::Mutex<std::sync::mpsc::Receiver<AgentAction>>);
 
+/// Empfaengt Operator-Kommandos fuer manuelles Chaos aus dem Daemon.
+#[derive(Resource)]
+pub struct OperatorCommandReceiver(
+    pub std::sync::Mutex<std::sync::mpsc::Receiver<OperatorCommand>>,
+);
+
 /// Sendet Perceptions an den externen Zenoh-Publisher (oder Test-Code).
 #[derive(Resource)]
 pub struct PerceptionSender(pub std::sync::mpsc::SyncSender<Perception>);
@@ -215,12 +421,14 @@ pub struct ToolRuntimeResource(pub sentinel_wasm::ToolRuntime);
 #[derive(Resource, Default, Clone)]
 pub struct RoomDistanceMap {
     distances: std::collections::HashMap<(String, String), u32>,
+    room_ids: Vec<String>,
 }
 
 impl RoomDistanceMap {
     /// Erstellt die Distance-Map aus einer BuildingConfig (BFS fuer alle Paare).
     pub fn from_building_config(config: &sentinel_common::room::BuildingConfig) -> Self {
         let mut distances = std::collections::HashMap::new();
+        let room_ids = config.rooms.iter().map(|room| room.id.clone()).collect();
         for room in &config.rooms {
             for other in &config.rooms {
                 if let Some(dist) = config.shortest_distance(&room.id, &other.id) {
@@ -228,7 +436,10 @@ impl RoomDistanceMap {
                 }
             }
         }
-        Self { distances }
+        Self {
+            distances,
+            room_ids,
+        }
     }
 
     /// Gibt die Distanz zwischen zwei Raeumen zurueck (0 = selber Raum).
@@ -246,6 +457,11 @@ impl RoomDistanceMap {
             .filter(|((f, _), &d)| f == from && d > 0 && d <= max_hops)
             .map(|((_, t), &d)| (t.as_str(), d))
             .collect()
+    }
+
+    /// Gibt die bekannte Liste aller Raum-IDs aus `rooms.toml` zurueck.
+    pub fn all_rooms(&self) -> &[String] {
+        &self.room_ids
     }
 }
 
@@ -286,6 +502,9 @@ pub fn create_simulation_world() -> (World, Schedule) {
     world.insert_resource(PersistTelemetry::default());
     world.insert_resource(EventBuffer::default());
     world.insert_resource(ActiveSmells::default());
+    world.insert_resource(ActiveChaos::default());
+    world.insert_resource(ActiveRoomStimuli::default());
+    world.insert_resource(RoomPhysicsState::default());
 
     // System-Reihenfolge via configure_sets (10 Phasen)
     schedule.configure_sets(
@@ -306,12 +525,17 @@ pub fn create_simulation_world() -> (World, Schedule) {
 
     // Systems in ihre Sets einsortieren
     // work_context_system in Input-Phase (VOR Biology), damit bio_system
-    // aktuelle WorkContext-Werte (has_deadline, in_meeting) sieht.
+    // aktuelle WorkContext-Werte (has_deadline, in_meeting, conflict flags) sieht.
     schedule.add_systems(input_system.in_set(SimulationPhase::Input));
+    schedule.add_systems(
+        operator_command_system
+            .in_set(SimulationPhase::Input)
+            .after(input_system),
+    );
     schedule.add_systems(
         work_context_system
             .in_set(SimulationPhase::Input)
-            .after(input_system),
+            .after(operator_command_system),
     );
     schedule.add_systems(bio_system.in_set(SimulationPhase::Biology));
     schedule.add_systems(physics_system.in_set(SimulationPhase::Physics));

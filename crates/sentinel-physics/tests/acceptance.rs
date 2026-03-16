@@ -4,9 +4,11 @@
 //! Transit-Lifecycle und Flurbegegnungen.
 
 use approx::assert_relative_eq;
+use sentinel_common::EventType;
 use sentinel_physics::{
-    calculate_co2, calculate_noise_level, calculate_temperature, check_hallway_encounter,
-    smell_intensity_at_distance, start_transit, tick_transit, SmellEvent, SmellType,
+    calculate_co2, calculate_noise_level, calculate_temperature, chaos_noise_bonus_db,
+    chaos_temperature_delta_celsius, check_hallway_encounter, smell_intensity_at_distance,
+    start_transit, tick_transit, SmellEvent, SmellType,
 };
 
 // ── #12 AC2: Akustik ──
@@ -25,6 +27,17 @@ fn ac_12_02_acoustics() {
         noise_5 < 35.0,
         "5 agents logarithmic should stay < 35dB, got {noise_5}"
     );
+}
+
+/// Regression #244 groundwork: PrinterBroken muss lokalen Laerm klar erhoehen,
+/// ohne absurde Werte zu erzeugen.
+#[test]
+fn regression_printer_broken_noise_bonus_is_bounded() {
+    let quiet_room = calculate_noise_level(2, false, false, &[]);
+    let broken_printer_room = quiet_room + chaos_noise_bonus_db(EventType::PrinterBroken);
+
+    assert!(broken_printer_room > quiet_room + 20.0);
+    assert!(broken_printer_room < 90.0);
 }
 
 // ── #12 AC3: Temperatur ──
@@ -47,6 +60,17 @@ fn ac_12_03_temperature() {
     // Sonne (max): 21 + 1.0*2.0 = 23.0
     let temp_sun = calculate_temperature(21.0, 0, false, 15.0, 1.0);
     assert_relative_eq!(temp_sun, 23.0, epsilon = 0.5);
+}
+
+/// Regression #243: AirConBroken muss einen messbaren Temperaturanstieg liefern.
+#[test]
+fn regression_aircon_broken_increases_temperature() {
+    let base = calculate_temperature(21.0, 2, false, 15.0, 0.3);
+    let after_hour = base + chaos_temperature_delta_celsius(EventType::AirConBroken, 1.0);
+    let after_two_hours = base + chaos_temperature_delta_celsius(EventType::AirConBroken, 2.0);
+
+    assert!(after_hour > base + 2.0, "expected visible heatup after 1h");
+    assert!(after_two_hours > after_hour, "heat should continue rising");
 }
 
 // ── #12 AC4: CO2 ──

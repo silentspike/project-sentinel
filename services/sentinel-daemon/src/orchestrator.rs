@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 use sentinel_common::agent_config::{load_all_agents, AgentConfig};
 use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::events::{DomainEvent, DomainEventPayload};
-use sentinel_common::{AgentId, Perception};
+use sentinel_common::{AgentId, OperatorCommand, Perception};
 use sentinel_ebpf::collector::MetricsSnapshot;
 use sentinel_ebpf::EbpfCollector;
 use sentinel_ecs::{
@@ -40,6 +40,7 @@ use crate::controlplane::config::ControlplaneConfig;
 use crate::controlplane::store::ControlplaneStore;
 use crate::controlplane::ControlplaneKernel;
 use crate::episode_producer::EpisodeProducer;
+use crate::operator_api;
 use crate::shift::{agents_for_shift, detect_current_shift, detect_shift_from_sim_hour};
 use crate::signal::wait_for_shutdown;
 
@@ -364,6 +365,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
     // -- Channels fuer ECS <-> Async Bridge --
     let (action_tx, action_rx) = mpsc::channel();
+    let (operator_tx, operator_rx) = mpsc::channel::<OperatorCommand>();
     let (perception_tx, perception_rx) = mpsc::sync_channel::<Perception>(64);
 
     // -- Zenoh SentinelBus (Core-Bus fuer Real-Time Event-Verteilung) --
@@ -427,6 +429,20 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         warn!("rooms.toml nicht gefunden — Transit-Dauer nutzt Default-Distanzen");
         sentinel_ecs::RoomDistanceMap::default()
     };
+    let operator_room_ids = room_distances.all_rooms().to_vec();
+    let operator_api_handle = if config.operator_api.enabled {
+        Some(
+            operator_api::start_server(
+                config.operator_api.clone(),
+                operator_room_ids,
+                operator_tx.clone(),
+            )
+            .await?,
+        )
+    } else {
+        info!("Operator-API deaktiviert");
+        None
+    };
 
     // Werte fuer den ECS-Thread
     let tick_rate = Duration::from_millis(config.tick_rate_ms);
@@ -448,6 +464,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 ecs_state_store,
                 event_store,
                 action_rx,
+                operator_rx,
                 perception_tx,
                 all_agents_clone,
                 current_shift,
@@ -644,9 +661,13 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // -- Graceful Shutdown --
     info!("Shutdown eingeleitet...");
     shutdown.store(true, Ordering::SeqCst);
+    if let Some(handle) = operator_api_handle {
+        handle.abort();
+    }
 
     // Action-Channel schliessen damit ECS-Thread aufwacht falls er blockt
     drop(action_tx);
+    drop(operator_tx);
 
     match ecs_handle.join() {
         Ok(Ok(tick_count)) => {
@@ -693,6 +714,7 @@ fn ecs_tick_loop(
     state_store: Arc<StateStore>,
     event_store: Arc<EventStore>,
     action_rx: mpsc::Receiver<sentinel_common::AgentAction>,
+    operator_rx: mpsc::Receiver<sentinel_common::OperatorCommand>,
     perception_tx: mpsc::SyncSender<Perception>,
     all_agents: Vec<AgentConfig>,
     initial_shift: u8,
@@ -733,6 +755,9 @@ fn ecs_tick_loop(
     let event_store_for_episodes = Arc::clone(&event_store);
     world.insert_resource(LimboEventStore(event_store));
     world.insert_resource(ActionReceiver(std::sync::Mutex::new(action_rx)));
+    world.insert_resource(sentinel_ecs::OperatorCommandReceiver(
+        std::sync::Mutex::new(operator_rx),
+    ));
     world.insert_resource(PerceptionSender(perception_tx));
 
     // Zenoh Fan-Out Sender als ECS Resource (persist_system nutzt try_send)
@@ -1633,6 +1658,7 @@ mod tests {
     use sentinel_common::agent_config::{
         BackgroundConfig, IdentityConfig, PersonalityConfig, PreferencesConfig,
     };
+    use sentinel_common::{DomainEventPayload, EventType, OperatorChaosCommand, OperatorCommand};
     use sentinel_ebpf::loader::MonitoringMode;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -1709,6 +1735,7 @@ mod tests {
         let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
 
         let (_tx, rx) = mpsc::channel();
+        let (_operator_tx, operator_rx) = mpsc::channel();
         let (ptx, _prx) = mpsc::sync_channel(64);
 
         let controlplane = test_controlplane(&tmp);
@@ -1720,6 +1747,7 @@ mod tests {
             state_store,
             event_store,
             rx,
+            operator_rx,
             ptx,
             vec![],
             1,
@@ -1761,6 +1789,7 @@ mod tests {
         let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
 
         let (_tx, rx) = mpsc::channel();
+        let (_operator_tx, operator_rx) = mpsc::channel();
         let (ptx, prx) = mpsc::sync_channel(64);
 
         let controlplane = test_controlplane(&tmp);
@@ -1776,6 +1805,7 @@ mod tests {
                 state_store,
                 event_store,
                 rx,
+                operator_rx,
                 ptx,
                 all_agents,
                 1,
@@ -1830,6 +1860,7 @@ mod tests {
         let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
 
         let (_tx, rx) = mpsc::channel();
+        let (_operator_tx, operator_rx) = mpsc::channel();
         let (ptx, prx) = mpsc::sync_channel(64);
 
         let controlplane = test_controlplane(&tmp);
@@ -1849,6 +1880,7 @@ mod tests {
                 state_store,
                 event_store,
                 rx,
+                operator_rx,
                 ptx,
                 all_agents,
                 1,
@@ -1887,6 +1919,106 @@ mod tests {
             snapshot.is_ok() && snapshot.unwrap().is_some(),
             "Runtime-Snapshot muss nach Shutdown existieren"
         );
+    }
+
+    #[test]
+    fn test_operator_command_is_forwarded_to_ecs_and_persisted() {
+        sentinel_common::feature_flags::RuntimeFlags::init();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.db");
+        let state_path = tmp.path().join("state.redb");
+
+        let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
+        let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
+        let es_clone = Arc::clone(&event_store);
+
+        let (_tx, rx) = mpsc::channel();
+        let (operator_tx, operator_rx) = mpsc::channel();
+        let (ptx, prx) = mpsc::sync_channel(64);
+
+        operator_tx
+            .send(OperatorCommand::Chaos(OperatorChaosCommand {
+                event_id: "evt-operator-test".to_string(),
+                correlation_id: "corr-operator-test".to_string(),
+                operation_id: "op-operator-test".to_string(),
+                room_id: "empfang".to_string(),
+                chaos_type: EventType::AirConBroken,
+                description: "Manueller Operator-Test".to_string(),
+                duration_ticks: Some(45),
+            }))
+            .unwrap();
+
+        let controlplane = test_controlplane(&tmp);
+        let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
+        let all_agents = vec![test_agent_config(1, "Test Agent", "Tester", 1)];
+        let ep = test_episode_producer(&tmp, &event_store);
+        let (ebpf_collector, ebpf_tx) = test_ebpf();
+
+        let handle = std::thread::spawn(move || {
+            ecs_tick_loop(
+                state_store,
+                event_store,
+                rx,
+                operator_rx,
+                ptx,
+                all_agents,
+                1,
+                Duration::from_millis(50),
+                1.0,
+                shutdown,
+                controlplane,
+                runtime_orch,
+                test_sandbox(),
+                ebpf_collector,
+                ebpf_tx,
+                ep,
+                vec!["true".to_string()],
+                crate::adaptive_tick::AdaptiveConfig::default(),
+                sentinel_ecs::RoomDistanceMap::default(),
+                None, // Kein Zenoh Fan-Out in Tests
+            )
+        });
+
+        let perception = prx.recv_timeout(Duration::from_secs(30));
+        assert!(
+            perception.is_ok(),
+            "Erste Perception muss innerhalb 30s ankommen"
+        );
+
+        shutdown_clone.store(true, Ordering::SeqCst);
+
+        let result = handle.join().expect("ecs_tick_loop thread panicked");
+        assert!(result.is_ok());
+
+        let operator_event = es_clone
+            .get_all_events()
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_id == "evt-operator-test")
+            .expect("operator command should create a persisted chaos event");
+
+        assert_eq!(operator_event.event_type, "chaos_triggered");
+        assert_eq!(operator_event.aggregate_id, "empfang");
+        assert_eq!(operator_event.correlation_id, "corr-operator-test");
+        assert_eq!(operator_event.operation_id, "op-operator-test");
+
+        let payload: DomainEventPayload = serde_json::from_str(&operator_event.payload).unwrap();
+        match payload {
+            DomainEventPayload::ChaosTriggered {
+                event_type,
+                target_room,
+                description,
+            } => {
+                assert_eq!(event_type, EventType::AirConBroken);
+                assert_eq!(target_room.as_deref(), Some("empfang"));
+                assert_eq!(description, "Manueller Operator-Test");
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
     }
 
     #[test]

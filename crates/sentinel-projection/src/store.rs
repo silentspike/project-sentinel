@@ -520,6 +520,20 @@ impl<'a> ReadModelTransaction<'a> {
         }
     }
 
+    /// Liest das aktuell projizierte Chaos-JSON eines Raums.
+    pub fn get_room_active_chaos(&self, room_id: &str) -> anyhow::Result<Option<String>> {
+        let result = self.guard.query_row(
+            "SELECT active_chaos FROM room_live_view WHERE room_id = ?1",
+            params![room_id],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(chaos) => Ok(chaos),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// UPDATE: Agent initial room (aus AgentSpawned Events).
     pub fn update_agent_room(
         &self,
@@ -641,18 +655,21 @@ impl<'a> ReadModelTransaction<'a> {
         temperature: f64,
         co2_ppm: f64,
         noise_db: f64,
+        clear_active_chaos: bool,
         tick: u64,
         row_id: i64,
     ) -> anyhow::Result<()> {
         self.guard.execute(
             "UPDATE room_live_view SET
                temperature = ?1, co2_ppm = ?2, noise_db = ?3,
-               last_event_tick = ?4, last_event_id = ?5, updated_at = ?6
-             WHERE room_id = ?7 AND ?5 > last_event_id",
+               active_chaos = CASE WHEN ?4 = 1 THEN NULL ELSE active_chaos END,
+               last_event_tick = ?5, last_event_id = ?6, updated_at = ?7
+             WHERE room_id = ?8 AND ?6 > last_event_id",
             params![
                 temperature,
                 co2_ppm,
                 noise_db,
+                if clear_active_chaos { 1 } else { 0 },
                 tick as i64,
                 row_id,
                 now_ms(),

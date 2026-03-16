@@ -4435,6 +4435,7 @@ dependencies = [
  "rusqlite",
  "sentinel-common",
  "sentinel-limbo",
+ "sentinel-physics",
  "sentinel-telemetry",
  "serde",
  "serde_json",
