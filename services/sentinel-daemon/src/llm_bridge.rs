@@ -361,14 +361,14 @@ pub mod bridge {
         metadata.insert("agent_id".to_string(), perception.agent_id.0.to_string());
         metadata.insert("circadian".to_string(), perception.circadian_text.clone());
         metadata.insert("body".to_string(), perception.body_text.clone());
-        metadata.insert("environment".to_string(), perception.environment_text.clone());
+        metadata.insert(
+            "environment".to_string(),
+            perception.environment_text.clone(),
+        );
         metadata.insert("acoustic".to_string(), perception.acoustic_text.clone());
         metadata.insert("presence".to_string(), perception.presence_text.clone());
         metadata.insert("impulse".to_string(), perception.impulse_text.clone());
-        metadata.insert(
-            "perception".to_string(),
-            formatted_perception,
-        );
+        metadata.insert("perception".to_string(), formatted_perception);
         metadata.insert("tick".to_string(), perception.tick.0.to_string());
         metadata.insert("request_id".to_string(), uuid::Uuid::new_v4().to_string());
 
@@ -524,25 +524,26 @@ pub mod bridge {
 
             assert_eq!(request.messages.len(), 1);
             assert_eq!(request.messages[0].role, "user");
-            assert!(
-                request.messages[0]
-                    .content
-                    .contains("Folgende Impulse sind gerade wichtig"),
-            );
-            assert!(
-                request.messages[0]
-                    .content
-                    .contains("Was machst du als naechstes? Reagiere natuerlich."),
-            );
+            assert!(request.messages[0]
+                .content
+                .contains("Folgende Impulse sind gerade wichtig"),);
+            assert!(request.messages[0]
+                .content
+                .contains("Was machst du als naechstes? Reagiere natuerlich."),);
 
             let metadata = &request.metadata;
             let formatted = metadata.get("perception").unwrap();
             assert!(formatted.contains("CIRCADIAN: 10:00 Uhr"));
-            assert!(formatted.contains("ENVIRONMENT: Du bist im Designbuero. Es ist deutlich zu warm"));
+            assert!(
+                formatted.contains("ENVIRONMENT: Du bist im Designbuero. Es ist deutlich zu warm")
+            );
             assert!(formatted.contains("AKUSTIK: Es ist laut (72 dB)."));
             assert!(formatted.contains("ANWESEND: Lisa (Konzept), Thomas (Review)"));
             assert!(!formatted.trim_start().starts_with('{'));
-            assert_eq!(metadata.get("environment").unwrap(), &perception.environment_text);
+            assert_eq!(
+                metadata.get("environment").unwrap(),
+                &perception.environment_text
+            );
             assert_eq!(metadata.get("acoustic").unwrap(), &perception.acoustic_text);
         }
     }

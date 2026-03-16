@@ -216,7 +216,9 @@ impl ActiveRoomStimuli {
             .filter_map(|(room_id, stimuli)| {
                 stimuli
                     .values()
-                    .any(|event| current_tick < event.created_tick.saturating_add(event.duration_ticks))
+                    .any(|event| {
+                        current_tick < event.created_tick.saturating_add(event.duration_ticks)
+                    })
                     .then_some(room_id.as_str())
             })
             .collect()

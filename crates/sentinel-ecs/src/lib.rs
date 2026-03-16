@@ -22,8 +22,8 @@ pub use world::{
     despawn_agent_from_world, spawn_agent, ActionReceiver, ActiveChaos, ActiveChaosEvent,
     ActiveRoomStimuli, ActiveSmell, ActiveSmells, EventBuffer, LimboEventStore,
     OperatorCommandReceiver, PerceptionSender, PersistTelemetry, PsiMetrics, RedbStateStore,
-    RoomDistanceMap, RoomPhysicsSnapshot, RoomPhysicsState, SimulationTime,
-    ToolRuntimeResource, ZenohFanoutSender,
+    RoomDistanceMap, RoomPhysicsSnapshot, RoomPhysicsState, SimulationTime, ToolRuntimeResource,
+    ZenohFanoutSender,
 };
 
 #[cfg(test)]
@@ -574,7 +574,10 @@ mod tests {
             perception.environment_text
         );
         assert!(
-            perception.environment_text.to_lowercase().contains("stickig"),
+            perception
+                .environment_text
+                .to_lowercase()
+                .contains("stickig"),
             "environment should mention CO2 discomfort, got: {}",
             perception.environment_text
         );

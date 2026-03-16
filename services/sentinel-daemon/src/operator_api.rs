@@ -15,8 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 use sentinel_common::{
-    EventType, OperatorChaosCommand, OperatorCommand, OperatorRoomStimulusCommand,
-    RoomStimulusType,
+    EventType, OperatorChaosCommand, OperatorCommand, OperatorRoomStimulusCommand, RoomStimulusType,
 };
 
 use crate::config::OperatorApiConfig;
@@ -277,7 +276,9 @@ fn dispatch_stimulus_trigger(
         return Err(ApiError::BadRequest("duration_ticks muss > 0 sein"));
     }
     if !payload.delta.is_finite() || payload.delta.abs() < f32::EPSILON {
-        return Err(ApiError::BadRequest("delta muss ungleich 0 und endlich sein"));
+        return Err(ApiError::BadRequest(
+            "delta muss ungleich 0 und endlich sein",
+        ));
     }
 
     let event_id = uuid::Uuid::new_v4().to_string();
@@ -480,11 +481,14 @@ mod tests {
     fn valid_trigger_request_is_accepted_and_forwarded() {
         let (state, rx) = test_state(None);
         let response = handle_http_request(
-            test_request(OPERATOR_CHAOS_PATH, serde_json::json!({
-                "room_id": "empfang",
-                "chaos_type": "AirConBroken",
-                "duration_ticks": 45
-            })),
+            test_request(
+                OPERATOR_CHAOS_PATH,
+                serde_json::json!({
+                    "room_id": "empfang",
+                    "chaos_type": "AirConBroken",
+                    "duration_ticks": 45
+                }),
+            ),
             &state,
         );
 
@@ -511,10 +515,13 @@ mod tests {
     fn invalid_room_returns_not_found() {
         let (state, _rx) = test_state(None);
         let response = handle_http_request(
-            test_request(OPERATOR_CHAOS_PATH, serde_json::json!({
-                "room_id": "unbekannt",
-                "chaos_type": "PrinterBroken"
-            })),
+            test_request(
+                OPERATOR_CHAOS_PATH,
+                serde_json::json!({
+                    "room_id": "unbekannt",
+                    "chaos_type": "PrinterBroken"
+                }),
+            ),
             &state,
         );
 
@@ -525,10 +532,13 @@ mod tests {
     fn missing_shared_secret_is_rejected() {
         let (state, _rx) = test_state(Some("topsecret"));
         let response = handle_http_request(
-            test_request(OPERATOR_CHAOS_PATH, serde_json::json!({
-                "room_id": "empfang",
-                "chaos_type": "PrinterBroken"
-            })),
+            test_request(
+                OPERATOR_CHAOS_PATH,
+                serde_json::json!({
+                    "room_id": "empfang",
+                    "chaos_type": "PrinterBroken"
+                }),
+            ),
             &state,
         );
 
@@ -538,11 +548,14 @@ mod tests {
     #[test]
     fn valid_shared_secret_via_header_is_accepted() {
         let (state, rx) = test_state(Some("topsecret"));
-        let mut request = test_request(OPERATOR_CHAOS_PATH, serde_json::json!({
-            "room_id": "flur_eg",
-            "chaos_type": "PrinterBroken",
-            "description": "Manuell getestet"
-        }));
+        let mut request = test_request(
+            OPERATOR_CHAOS_PATH,
+            serde_json::json!({
+                "room_id": "flur_eg",
+                "chaos_type": "PrinterBroken",
+                "description": "Manuell getestet"
+            }),
+        );
         request
             .headers
             .insert(OPERATOR_KEY_HEADER.to_string(), "topsecret".to_string());
@@ -563,12 +576,15 @@ mod tests {
     fn valid_stimulus_request_is_accepted_and_forwarded() {
         let (state, rx) = test_state(None);
         let response = handle_http_request(
-            test_request(OPERATOR_STIMULUS_PATH, serde_json::json!({
-                "room_id": "empfang",
-                "stimulus_type": "co2",
-                "delta": 900,
-                "duration_ticks": 90
-            })),
+            test_request(
+                OPERATOR_STIMULUS_PATH,
+                serde_json::json!({
+                    "room_id": "empfang",
+                    "stimulus_type": "co2",
+                    "delta": 900,
+                    "duration_ticks": 90
+                }),
+            ),
             &state,
         );
 
@@ -595,11 +611,14 @@ mod tests {
     fn zero_delta_stimulus_is_rejected() {
         let (state, _rx) = test_state(None);
         let response = handle_http_request(
-            test_request(OPERATOR_STIMULUS_PATH, serde_json::json!({
-                "room_id": "empfang",
-                "stimulus_type": "temperature",
-                "delta": 0
-            })),
+            test_request(
+                OPERATOR_STIMULUS_PATH,
+                serde_json::json!({
+                    "room_id": "empfang",
+                    "stimulus_type": "temperature",
+                    "delta": 0
+                }),
+            ),
             &state,
         );
 
