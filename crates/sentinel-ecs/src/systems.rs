@@ -16,15 +16,15 @@
 
 use super::components::*;
 use super::world::{
-    ActionReceiver, ActiveChaos, ActiveChaosEvent, ActiveRoomStimuli, EventBuffer,
-    LimboEventStore, OperatorCommandReceiver, PersistTelemetry, PsiMetrics, RedbStateStore,
-    RoomDistanceMap, RoomPhysicsState, ToolRuntimeResource, ZenohFanoutSender,
+    ActionReceiver, ActiveChaos, ActiveChaosEvent, ActiveRoomStimuli, EventBuffer, LimboEventStore,
+    OperatorCommandReceiver, PersistTelemetry, PsiMetrics, RedbStateStore, RoomDistanceMap,
+    RoomPhysicsState, ToolRuntimeResource, ZenohFanoutSender,
 };
 use super::world::{PerceptionSender, SimulationTime};
 use bevy_ecs::prelude::*;
 use sentinel_common::{
-    ActionType, DomainEvent, DomainEventPayload, Emotion, EventType, OperatorCommand,
-    Perception, RoomStimulusType, Timestamp,
+    ActionType, DomainEvent, DomainEventPayload, Emotion, EventType, OperatorCommand, Perception,
+    RoomStimulusType, Timestamp,
 };
 use std::collections::HashMap;
 use std::time::Instant;
@@ -512,8 +512,7 @@ pub fn physics_system(
             .and_then(|chaos| chaos.get_active(room_id, tick))
             .map(|event| sentinel_physics::chaos_noise_bonus_db(event.event_type))
             .unwrap_or(0.0);
-        let stimulus_noise =
-            active_room_stimuli.delta_for(room_id, RoomStimulusType::Noise, tick);
+        let stimulus_noise = active_room_stimuli.delta_for(room_id, RoomStimulusType::Noise, tick);
         let local_noise =
             sentinel_physics::calculate_noise_level(*agent_count, *has_meeting, false, &[])
                 + chaos_bonus
@@ -1180,16 +1179,19 @@ pub fn output_system(
     let present_agents_by_room: HashMap<String, Vec<(String, String)>> = query
         .iter()
         .filter(|(_, _, position, _, _, _, _, _)| !position.in_transit)
-        .fold(HashMap::new(), |mut acc, (identity, _, position, _, _, _, work_ctx, _)| {
-            let activity = work_ctx
-                .current_task
-                .clone()
-                .unwrap_or_else(|| "anwesend".to_string());
-            acc.entry(position.room_id.clone())
-                .or_default()
-                .push((identity.name.clone(), activity));
-            acc
-        });
+        .fold(
+            HashMap::new(),
+            |mut acc, (identity, _, position, _, _, _, work_ctx, _)| {
+                let activity = work_ctx
+                    .current_task
+                    .clone()
+                    .unwrap_or_else(|| "anwesend".to_string());
+                acc.entry(position.room_id.clone())
+                    .or_default()
+                    .push((identity.name.clone(), activity));
+                acc
+            },
+        );
 
     for (identity, bio, position, personality, shift, perception, work_ctx, queue) in &query {
         let impulse_text = super::decision::format_impulse_from_queue(queue);
@@ -1197,11 +1199,15 @@ pub fn output_system(
         let sim_time = format!("{:02.0}:00 Uhr", time.sim_hour.floor());
 
         let room_snapshot = room_physics_state.get(&position.room_id);
-        let room_noise_db = room_snapshot.map(|snapshot| snapshot.noise_db).unwrap_or(30.0);
+        let room_noise_db = room_snapshot
+            .map(|snapshot| snapshot.noise_db)
+            .unwrap_or(30.0);
         let room_temp_c = room_snapshot
             .map(|snapshot| snapshot.temperature)
             .unwrap_or(21.6);
-        let room_co2_ppm = room_snapshot.map(|snapshot| snapshot.co2_ppm).unwrap_or(400.0);
+        let room_co2_ppm = room_snapshot
+            .map(|snapshot| snapshot.co2_ppm)
+            .unwrap_or(400.0);
 
         let smells = if position.in_transit {
             Vec::new()
