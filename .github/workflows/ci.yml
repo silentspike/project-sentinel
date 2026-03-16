@@ -78,12 +78,10 @@ jobs:
   # ──────────────────────────────────────────────
   # Rust - only when crates/ or Cargo.* changed
   # ──────────────────────────────────────────────
-  rust:
+  rust-lint:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.config == 'true'
     runs-on: [self-hosted, linux, x64]
-    env:
-      CARGO_BUILD_JOBS: "3"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -91,14 +89,14 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # Persistent local cache on self-hosted runner without requiring
-      # root-owned system paths. Each runner instance gets its own target
-      # dir via runner name to prevent lock contention.
-      - name: Configure local cache
+      # Self-hosted runners should use all local cores and keep job-local
+      # targets separate so concurrent Rust jobs do not contend on locks.
+      - name: Configure local Rust cache and parallelism
         run: |
-          export CARGO_TARGET_DIR="$HOME/.cache/project-sentinel/cargo-target/${{ runner.name }}/target"
+          export CARGO_TARGET_DIR="$HOME/.cache/project-sentinel/cargo-target/${{ runner.name }}/${{ github.job }}"
           mkdir -p "$CARGO_TARGET_DIR"
           echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_JOBS=$(nproc)" >> "$GITHUB_ENV"
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -106,10 +104,48 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Unused dependencies
+        uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131 # v2.67.30
+        with:
+          tool: cargo-machete
+      - run: cargo machete || echo "::warning::Unused dependencies found (non-blocking)"
+
+  rust-doc:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.config == 'true'
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+
+      - name: Configure local Rust cache and parallelism
+        run: |
+          export CARGO_TARGET_DIR="$HOME/.cache/project-sentinel/cargo-target/${{ runner.name }}/${{ github.job }}"
+          mkdir -p "$CARGO_TARGET_DIR"
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_JOBS=$(nproc)" >> "$GITHUB_ENV"
+
       - name: Rustdoc warnings
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --workspace --no-deps --document-private-items
+
+  rust-test:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.config == 'true'
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+
+      - name: Configure local Rust cache and parallelism
+        run: |
+          export CARGO_TARGET_DIR="$HOME/.cache/project-sentinel/cargo-target/${{ runner.name }}/${{ github.job }}"
+          mkdir -p "$CARGO_TARGET_DIR"
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_JOBS=$(nproc)" >> "$GITHUB_ENV"
 
       - name: Tests
         run: cargo test --workspace
@@ -119,17 +155,29 @@ jobs:
           command -v cargo-insta >/dev/null 2>&1 || cargo install cargo-insta --locked
           cargo insta test --workspace --check
 
+  rust-ebpf:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.config == 'true'
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          components: clippy
+
+      - name: Configure local Rust cache and parallelism
+        run: |
+          export CARGO_TARGET_DIR="$HOME/.cache/project-sentinel/cargo-target/${{ runner.name }}/${{ github.job }}"
+          mkdir -p "$CARGO_TARGET_DIR"
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_JOBS=$(nproc)" >> "$GITHUB_ENV"
+
       - name: Clippy (eBPF feature)
         run: cargo clippy -p sentinel-daemon -p sentinel-ebpf --features ebpf -- -D warnings
 
       - name: Tests (eBPF feature)
         run: cargo test -p sentinel-ebpf --features ebpf
-
-      - name: Unused dependencies
-        uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131 # v2.67.30
-        with:
-          tool: cargo-machete
-      - run: cargo machete || echo "::warning::Unused dependencies found (non-blocking)"
 
   # ──────────────────────────────────────────────
   # Go - only when cmd/ changed
@@ -144,7 +192,17 @@ jobs:
       - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
         with:
           go-version-file: cmd/cortex-gateway/go.mod
-          cache-dependency-path: cmd/cortex-gateway/go.sum
+          cache: false
+
+      - name: Configure local Go cache
+        run: |
+          export GOMODCACHE="$HOME/.cache/project-sentinel/go/${{ runner.name }}/pkg/mod"
+          export GOCACHE="$HOME/.cache/project-sentinel/go/${{ runner.name }}/build"
+          export GOLANGCI_LINT_CACHE="$HOME/.cache/project-sentinel/go/${{ runner.name }}/golangci-lint"
+          mkdir -p "$GOMODCACHE" "$GOCACHE" "$GOLANGCI_LINT_CACHE"
+          echo "GOMODCACHE=$GOMODCACHE" >> "$GITHUB_ENV"
+          echo "GOCACHE=$GOCACHE" >> "$GITHUB_ENV"
+          echo "GOLANGCI_LINT_CACHE=$GOLANGCI_LINT_CACHE" >> "$GITHUB_ENV"
 
       - name: Build
         working-directory: cmd/cortex-gateway
@@ -221,14 +279,17 @@ jobs:
   # ──────────────────────────────────────────────
   ci-pass:
     if: always()
-    needs: [lint, rust, go, dashboard, schemas]
+    needs: [lint, rust-lint, rust-doc, rust-test, rust-ebpf, go, dashboard, schemas]
     runs-on: [self-hosted, linux, x64]
     steps:
       - name: Evaluate results
         run: |
           results=(
             "${{ needs.lint.result }}"
-            "${{ needs.rust.result }}"
+            "${{ needs['rust-lint'].result }}"
+            "${{ needs['rust-doc'].result }}"
+            "${{ needs['rust-test'].result }}"
+            "${{ needs['rust-ebpf'].result }}"
             "${{ needs.go.result }}"
             "${{ needs.dashboard.result }}"
             "${{ needs.schemas.result }}"

@@ -57,6 +57,7 @@ pub fn input_system(
     receiver: Option<Res<ActionReceiver>>,
     tool_runtime: Option<Res<ToolRuntimeResource>>,
     room_distances: Option<Res<RoomDistanceMap>>,
+    _room_physics_state: Option<Res<RoomPhysicsState>>,
     mut query: Query<(
         &AgentIdentity,
         &mut Position,
@@ -166,6 +167,10 @@ pub fn input_system(
                                             allowed_paths: vec![agent_home],
                                             ..sentinel_wasm::SandboxConfig::restrictive()
                                         };
+                                        #[cfg(feature = "wasm")]
+                                        let room_physics_state = _room_physics_state.as_deref();
+                                        #[cfg(not(feature = "wasm"))]
+                                        let _ = &_room_physics_state;
                                         let ctx = sentinel_wasm::ExecutionContext {
                                             agent_id: format!("AGENT-{:02}", identity.agent_id.0),
                                             agent_capabilities: capabilities.tools.clone(),
@@ -173,10 +178,16 @@ pub fn input_system(
                                             correlation_id: correlation_id.clone(),
                                             tick: time.tick.0,
                                             #[cfg(feature = "wasm")]
-                                            agent_snapshot: None,
+                                            agent_snapshot: Some(build_agent_snapshot(
+                                                identity, &bio, &position,
+                                            )),
                                             #[cfg(feature = "wasm")]
-                                            rooms: None,
+                                            rooms: Some(build_room_snapshots(
+                                                room_physics_state,
+                                                &position,
+                                            )),
                                         };
+
                                         match runtime.0.execute(&tool_name, &tool_input, &ctx) {
                                             Ok(result) => {
                                                 let tool_event = result
@@ -711,6 +722,63 @@ fn parse_tool_content(content: &str) -> Option<(String, String)> {
     None
 }
 
+#[cfg(feature = "wasm")]
+fn build_agent_snapshot(
+    identity: &AgentIdentity,
+    bio: &BioState,
+    position: &Position,
+) -> sentinel_wasm::AgentSnapshot {
+    sentinel_wasm::AgentSnapshot {
+        agent_id: format!("AGENT-{:02}", identity.agent_id.0),
+        name: identity.name.clone(),
+        role: identity.role.clone(),
+        hunger: bio.hunger,
+        energy: bio.energy,
+        stress: bio.stress,
+        social_need: bio.social_need,
+        caffeine: bio.caffeine_mg,
+        bladder: bio.bladder,
+        room_id: position.room_id.clone(),
+    }
+}
+
+#[cfg(feature = "wasm")]
+fn build_room_snapshots(
+    room_physics_state: Option<&RoomPhysicsState>,
+    position: &Position,
+) -> HashMap<String, sentinel_wasm::RoomSnapshot> {
+    let mut rooms = HashMap::new();
+
+    if let Some(state) = room_physics_state {
+        for (room_id, snapshot) in &state.rooms {
+            rooms.insert(
+                room_id.clone(),
+                sentinel_wasm::RoomSnapshot {
+                    room_id: room_id.clone(),
+                    name: room_id_to_german(room_id),
+                    floor: room_floor(room_id),
+                    temperature: snapshot.temperature,
+                    noise_db: snapshot.noise_db,
+                    occupant_count: snapshot.occupant_count,
+                },
+            );
+        }
+    }
+
+    rooms
+        .entry(position.room_id.clone())
+        .or_insert_with(|| sentinel_wasm::RoomSnapshot {
+            room_id: position.room_id.clone(),
+            name: room_id_to_german(&position.room_id),
+            floor: room_floor(&position.room_id),
+            temperature: 21.6,
+            noise_db: 30.0,
+            occupant_count: 0,
+        });
+
+    rooms
+}
+
 /// Prueft ob ein Chaos-EventType stressausloesend ist
 fn is_stressful_chaos(event_type: sentinel_common::EventType) -> bool {
     matches!(
@@ -1150,6 +1218,15 @@ fn room_id_to_german(room_id: &str) -> String {
         "toilette-og-herren" => "auf der Herrentoilette (OG)".to_string(),
         "treppenhaus" => "im Treppenhaus".to_string(),
         other => format!("im Raum '{}'", other),
+    }
+}
+
+#[cfg(feature = "wasm")]
+fn room_floor(room_id: &str) -> u32 {
+    if room_id.ends_with("-og") || room_id.contains("ceo") {
+        1
+    } else {
+        0
     }
 }
 
