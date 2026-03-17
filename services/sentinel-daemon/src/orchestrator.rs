@@ -367,8 +367,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let (action_tx, action_rx) = mpsc::channel();
     let (operator_tx, operator_rx) = mpsc::channel::<OperatorCommand>();
     let (nightrun_tx, nightrun_rx) = mpsc::channel::<sentinel_common::OperatorNightrunCommand>();
-    let (snapshot_tx, _snapshot_rx) = mpsc::channel::<sentinel_common::OperatorSnapshotCommand>();
-    let (restore_tx, _restore_rx) = mpsc::channel::<sentinel_common::OperatorRestoreCommand>();
+    let (snapshot_tx, snapshot_rx) = mpsc::channel::<sentinel_common::OperatorSnapshotCommand>();
+    let (restore_tx, restore_rx) = mpsc::channel::<sentinel_common::OperatorRestoreCommand>();
     let (perception_tx, perception_rx) = mpsc::sync_channel::<Perception>(64);
 
     // -- Zenoh SentinelBus (Core-Bus fuer Real-Time Event-Verteilung) --
@@ -490,6 +490,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 ebpf_tx,
                 episode_producer,
                 nightrun_rx,
+                snapshot_rx,
+                restore_rx,
                 evolution_db_path_clone,
                 agent_command_cfg,
                 adaptive_config,
@@ -742,6 +744,8 @@ fn ecs_tick_loop(
     ebpf_tx: tokio::sync::mpsc::Sender<MetricsSnapshot>,
     mut episode_producer: EpisodeProducer,
     nightrun_rx: mpsc::Receiver<sentinel_common::OperatorNightrunCommand>,
+    snapshot_rx: mpsc::Receiver<sentinel_common::OperatorSnapshotCommand>,
+    restore_rx: mpsc::Receiver<sentinel_common::OperatorRestoreCommand>,
     evolution_db_path: String,
     agent_command_cfg: Vec<String>,
     adaptive_config: crate::adaptive_tick::AdaptiveConfig,
@@ -1566,6 +1570,91 @@ fn ecs_tick_loop(
             }
         }
 
+        // Time Machine: Manuelle Snapshot-Trigger via Operator-API
+        while let Ok(_snap_cmd) = snapshot_rx.try_recv() {
+            let event_store_for_snap = world
+                .get_resource::<sentinel_ecs::LimboEventStore>()
+                .map(|es| Arc::clone(&es.0));
+            let state_store_for_snap = world
+                .get_resource::<sentinel_ecs::RedbStateStore>()
+                .map(|rs| rs.store.clone());
+            if let (Some(es), Some(ss)) = (event_store_for_snap, state_store_for_snap) {
+                match snapshot_manager.create_and_store(&mut world, &ss, &es, tick_count, sim_hour)
+                {
+                    Ok(id) => info!(snapshot_id = %id, "Manueller World Snapshot erstellt"),
+                    Err(e) => warn!(error = %e, "Manueller Snapshot fehlgeschlagen"),
+                }
+            }
+        }
+
+        // Time Machine: Hot-Swap Restore via Operator-API
+        while let Ok(restore_cmd) = restore_rx.try_recv() {
+            info!(snapshot_id = %restore_cmd.snapshot_id, "Hot-Swap Restore gestartet");
+            let event_store_for_restore = world
+                .get_resource::<sentinel_ecs::LimboEventStore>()
+                .map(|es| Arc::clone(&es.0));
+            let state_store_for_restore = world
+                .get_resource::<sentinel_ecs::RedbStateStore>()
+                .map(|rs| rs.store.clone());
+
+            if let (Some(es), Some(ss)) = (event_store_for_restore, state_store_for_restore) {
+                // 1. Snapshot laden
+                match es.load_world_snapshot(&restore_cmd.snapshot_id) {
+                    Ok(Some(bytes)) => {
+                        match bincode::deserialize::<sentinel_common::WorldSnapshot>(&bytes) {
+                            Ok(snapshot) => {
+                                // 2. redb restore (atomare Transaktion)
+                                if let Err(e) = ss.restore_all_tables(&snapshot.redb) {
+                                    error!(error = %e, "redb Restore fehlgeschlagen");
+                                    continue;
+                                }
+
+                                // 3. ECS Restore
+                                sentinel_ecs::restore_ecs_state(&mut world, &snapshot.ecs);
+
+                                // 4. Tick/SimHour zuruecksetzen
+                                tick_count = snapshot.tick;
+                                sim_hour = snapshot.sim_hour;
+                                if let Some(mut sim_time) =
+                                    world.get_resource_mut::<sentinel_ecs::SimulationTime>()
+                                {
+                                    sim_time.tick = sentinel_common::Tick(snapshot.tick);
+                                    sim_time.tick_count = snapshot.tick;
+                                    sim_time.sim_hour = snapshot.sim_hour;
+                                }
+
+                                // 5. Projection Offsets zuruecksetzen
+                                for (name, _) in &snapshot.projection_offsets {
+                                    // Force-Reset: loescht und setzt neu
+                                    let _ = es.force_reset_offset(name, snapshot.last_event_id);
+                                }
+
+                                info!(
+                                    snapshot_id = %restore_cmd.snapshot_id,
+                                    tick = snapshot.tick,
+                                    sim_hour = snapshot.sim_hour,
+                                    agents = snapshot.ecs.identities.len(),
+                                    "Hot-Swap Restore abgeschlossen"
+                                );
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Snapshot bincode-Deserialisierung fehlgeschlagen");
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        warn!(
+                            snapshot_id = %restore_cmd.snapshot_id,
+                            "Snapshot nicht gefunden"
+                        );
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Snapshot laden fehlgeschlagen");
+                    }
+                }
+            }
+        }
+
         // eBPF Metrics Collection (alle 10 Ticks = ~10s bei 1s Tick-Rate)
         if tick_count > 0 && tick_count.is_multiple_of(10) {
             match ebpf_collector.collect() {
@@ -1910,6 +1999,8 @@ mod tests {
             ebpf_tx,
             ep,
             mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+            mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
+            mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
             String::new(),
             vec!["true".to_string()],
             crate::adaptive_tick::AdaptiveConfig::default(),
@@ -1970,6 +2061,8 @@ mod tests {
                 ebpf_tx,
                 ep,
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
                 String::new(),
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
@@ -2047,6 +2140,8 @@ mod tests {
                 ebpf_tx,
                 ep,
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
                 String::new(),
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
@@ -2132,6 +2227,8 @@ mod tests {
                 ebpf_tx,
                 ep,
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
                 String::new(),
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
