@@ -1,0 +1,13 @@
+./assembler.go
+./cache_order.go
+./compiler.go
+./distill.go
+./evolution.go
+./toml_loader.go
+./assembler_test.go
+./bench_test.go
+./cache_order_test.go
+./compiler_e2e_test.go
+./compiler_test.go
+./distill_test.go
+./toml_loader_test.go
