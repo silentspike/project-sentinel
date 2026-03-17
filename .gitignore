@@ -97,3 +97,4 @@ docs/
 # Generated deploy artifacts (created by deploy/generate-manifest.sh)
 deploy/release-manifest.json
 cortex-gateway-linux
+.cache/ >> .gitignore

@@ -230,6 +230,24 @@ controlRoutes.post("/control/stimulus", async (c) => {
   }
 });
 
+controlRoutes.post("/control/nightrun", async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    return await proxyJson(
+      getOperatorApiUrl(),
+      "POST",
+      "/operator/nightrun",
+      body,
+      getOperatorHeaders(),
+    );
+  } catch (err) {
+    return c.json(
+      { error: "Operator-API nicht erreichbar", detail: String(err) },
+      502,
+    );
+  }
+});
+
 // ── GET /api/control/status — Aggregierter Status ──
 // Kombiniert Config + Cortex Health + Guardrails fuer das Frontend.
 
