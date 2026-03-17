@@ -15,6 +15,10 @@ const PHONE_CALL_BONUS_DB: f32 = 5.0;
 /// Daempfung fuer Adjacent-Room-Laerm in dB
 const ADJACENT_WALL_DAMPING_DB: f32 = 20.0;
 
+/// Realistische Obergrenze fuer Buero-Laermpegel in dB.
+/// 85 dB = Staubsauger, alles darueber ist unrealistisch fuer Bueros.
+const MAX_OFFICE_NOISE_DB: f32 = 85.0;
+
 /// Konvertiert dB in lineare Leistung: 10^(db/10)
 fn db_to_power(db: f32) -> f32 {
     10.0_f32.powf(db / 10.0)
@@ -63,7 +67,7 @@ pub fn calculate_noise_level(
         }
     }
 
-    power_to_db(total_power)
+    power_to_db(total_power).min(MAX_OFFICE_NOISE_DB)
 }
 
 /// Mappt dB auf Wahrnehmungstext
@@ -155,5 +159,12 @@ mod tests {
         assert_eq!(noise_to_text(79.9), "Es ist laut");
         assert_eq!(noise_to_text(80.0), "Unertraeglicher Laerm");
         assert_eq!(noise_to_text(100.0), "Unertraeglicher Laerm");
+    }
+
+    #[test]
+    fn noise_never_exceeds_85db() {
+        // Extremszenario: 50 Agents, Meeting, Telefonat, 3 laute Nachbarraeume
+        let noise = calculate_noise_level(50, true, true, &[80.0, 80.0, 80.0]);
+        assert!(noise <= 85.0, "noise must be capped at 85 dB, got {noise}");
     }
 }
