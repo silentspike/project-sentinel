@@ -65,6 +65,67 @@ pub struct DaemonConfig {
     /// `{fs_mount}/{agent_name}` → `/home/{agent_name}`.
     #[serde(default)]
     pub fs_mount: Option<String>,
+
+    /// Time Machine: Tiered Snapshot + Event Retention.
+    #[serde(default)]
+    pub retention: RetentionConfig,
+}
+
+/// Konfiguration fuer World Snapshots und Event Retention (Time Machine).
+#[derive(Debug, Deserialize, Clone)]
+pub struct RetentionConfig {
+    /// Intervall in Ticks fuer Hourly Snapshots (default: 3600 = 1h bei 1s Tick).
+    #[serde(default = "default_hourly_interval")]
+    pub hourly_interval_ticks: u64,
+
+    /// Wie viele Stunden Hourly Snapshots behalten (default: 24).
+    #[serde(default = "default_daily_keep")]
+    pub daily_keep_hours: u32,
+
+    /// Wie viele Tage Daily Snapshots behalten (default: 7).
+    #[serde(default = "default_weekly_keep")]
+    pub weekly_keep_days: u32,
+
+    /// Wie viele Wochen Weekly Snapshots behalten (default: 4).
+    #[serde(default = "default_monthly_keep")]
+    pub monthly_keep_weeks: u32,
+
+    /// Wie viele Stunden Live-Events behalten bevor Pruning (default: 2, 1h Puffer).
+    #[serde(default = "default_event_retention")]
+    pub event_retention_hours: u32,
+
+    /// Automatisches Pruning nach Snapshot-Erstellung.
+    #[serde(default = "default_true")]
+    pub auto_prune: bool,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            hourly_interval_ticks: 3600,
+            daily_keep_hours: 24,
+            weekly_keep_days: 7,
+            monthly_keep_weeks: 4,
+            event_retention_hours: 2,
+            auto_prune: true,
+        }
+    }
+}
+
+fn default_hourly_interval() -> u64 {
+    3600
+}
+fn default_daily_keep() -> u32 {
+    24
+}
+fn default_weekly_keep() -> u32 {
+    7
+}
+fn default_monthly_keep() -> u32 {
+    4
+}
+fn default_event_retention() -> u32 {
+    2
 }
 
 /// Lokale Loopback-API fuer manuelle Operator-Eingriffe.
