@@ -583,6 +583,7 @@ pub fn physics_system(
         let has_active_stimulus = active_stimulus_delta_temperature.abs() > f32::EPSILON
             || active_stimulus_delta_noise.abs() > f32::EPSILON
             || active_stimulus_delta_co2.abs() > f32::EPSILON;
+        let has_active_chaos = active_chaos_event.is_some();
 
         room_physics_state.set(
             room_id,
@@ -594,7 +595,8 @@ pub fn physics_system(
         );
 
         // Alle 20 Ticks Physics-Snapshot als Event emittieren
-        if tick > 0 && (tick.is_multiple_of(20) || has_active_stimulus) {
+        // Bei aktivem Chaos/Stimulus: jeden Tick emittieren (Echtzeit-Feedback)
+        if tick > 0 && (tick.is_multiple_of(20) || has_active_stimulus || has_active_chaos) {
             let payload = DomainEventPayload::RoomPhysicsUpdated {
                 room_id: room_id.to_string(),
                 temperature,
