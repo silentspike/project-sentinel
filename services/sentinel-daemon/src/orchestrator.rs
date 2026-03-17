@@ -746,6 +746,10 @@ fn ecs_tick_loop(
     // Adaptive Tick-Rate Controller (PSI-basiert, TOGAF Adaptive Scheduling)
     let mut adaptive_tick = AdaptiveTickRate::new(adaptive_config);
 
+    // Time Machine: SnapshotManager (erstellt World Snapshots alle hourly_interval_ticks)
+    let mut snapshot_manager =
+        crate::snapshot::SnapshotManager::new(crate::config::RetentionConfig::default());
+
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
 
@@ -1527,6 +1531,34 @@ fn ecs_tick_loop(
                 dry_run = nightrun_cmd.dry_run,
                 "Nightrun abgeschlossen"
             );
+        }
+
+        // Time Machine: Periodische World Snapshots
+        if snapshot_manager.should_create_snapshot(tick_count) {
+            let event_store_for_snapshot = world
+                .get_resource::<sentinel_ecs::LimboEventStore>()
+                .map(|es| Arc::clone(&es.0));
+            if let Some(es) = event_store_for_snapshot {
+                let state_store_for_snapshot = world
+                    .get_resource::<sentinel_ecs::RedbStateStore>()
+                    .map(|rs| rs.store.clone());
+                if let Some(ss) = state_store_for_snapshot {
+                    match snapshot_manager
+                        .create_and_store(&mut world, &ss, &es, tick_count, sim_hour)
+                    {
+                        Ok(id) => {
+                            debug!(snapshot_id = %id, "World Snapshot erstellt");
+                            // Maintenance: Promotion + Cleanup
+                            if let Err(e) = snapshot_manager.maintain(&es) {
+                                warn!(error = %e, "Snapshot Maintenance fehlgeschlagen");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "World Snapshot Erstellung fehlgeschlagen");
+                        }
+                    }
+                }
+            }
         }
 
         // eBPF Metrics Collection (alle 10 Ticks = ~10s bei 1s Tick-Rate)

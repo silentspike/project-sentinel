@@ -19,11 +19,11 @@ pub use perception::{format_injection, generate_perception, PerceptionTexts, Sme
 pub use systems::SimulationPhase;
 pub use world::{
     apply_capabilities, apply_personality, attach_redb_store, create_simulation_world,
-    despawn_agent_from_world, spawn_agent, ActionReceiver, ActiveChaos, ActiveChaosEvent,
-    ActiveRoomStimuli, ActiveSmell, ActiveSmells, EventBuffer, LimboEventStore,
-    OperatorCommandReceiver, PerceptionSender, PersistTelemetry, PsiMetrics, RedbStateStore,
-    RoomDistanceMap, RoomPhysicsSnapshot, RoomPhysicsState, SimulationTime, ToolRuntimeResource,
-    ZenohFanoutSender,
+    despawn_agent_from_world, restore_ecs_state, snapshot_ecs_state, spawn_agent, ActionReceiver,
+    ActiveChaos, ActiveChaosEvent, ActiveRoomStimuli, ActiveSmell, ActiveSmells, EventBuffer,
+    LimboEventStore, OperatorCommandReceiver, PerceptionSender, PersistTelemetry, PsiMetrics,
+    RedbStateStore, RoomDistanceMap, RoomPhysicsSnapshot, RoomPhysicsState, SimulationTime,
+    ToolRuntimeResource, ZenohFanoutSender,
 };
 
 #[cfg(test)]

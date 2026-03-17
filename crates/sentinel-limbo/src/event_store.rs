@@ -609,6 +609,33 @@ impl EventStore {
         }
     }
 
+    /// Gibt alle Projection-Offsets zurueck (fuer World Snapshot).
+    pub fn get_all_offsets(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT projection_name, last_event_id FROM projection_offsets ORDER BY projection_name",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Gibt die hoechste Event-ID zurueck (fuer Snapshot cursor).
+    pub fn get_latest_event_id(&self) -> anyhow::Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let result = conn.query_row("SELECT MAX(id) FROM events", [], |row| row.get(0));
+        match result {
+            Ok(id) => Ok(id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Setzt den Offset einer Projection (upsert, monoton steigend).
     ///
     /// Verhalten:

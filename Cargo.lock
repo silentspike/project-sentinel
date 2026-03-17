@@ -4281,6 +4281,7 @@ dependencies = [
  "anyhow",
  "async-nats",
  "bevy_ecs",
+ "bincode",
  "chrono",
  "clap",
  "futures",
