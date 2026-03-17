@@ -1442,7 +1442,7 @@ fn ecs_tick_loop(
                     if set == 0 {
                         return false; // Sonder-Set nie konsolidieren
                     }
-                    nightrun_cmd.shift_set.map_or(true, |s| set == s)
+                    nightrun_cmd.shift_set.is_none_or(|s| set == s)
                 })
                 .collect();
             let mut consolidated_total = 0u32;
