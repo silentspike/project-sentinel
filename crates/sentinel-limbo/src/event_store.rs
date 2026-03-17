@@ -77,6 +77,21 @@ CREATE TABLE IF NOT EXISTS snapshots (
 const CREATE_IDX_SNAPSHOTS_AGGREGATE: &str =
     "CREATE INDEX IF NOT EXISTS idx_snapshots_aggregate ON snapshots(aggregate_id, version DESC)";
 
+const CREATE_WORLD_SNAPSHOTS: &str = "
+CREATE TABLE IF NOT EXISTS world_snapshots (
+    id TEXT PRIMARY KEY,
+    tier TEXT NOT NULL,
+    tick INTEGER NOT NULL,
+    sim_hour REAL NOT NULL,
+    last_event_id INTEGER NOT NULL,
+    payload_size INTEGER NOT NULL DEFAULT 0,
+    payload BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+)";
+
+const CREATE_IDX_WORLD_SNAPSHOTS_TIER: &str =
+    "CREATE INDEX IF NOT EXISTS idx_world_snapshots_tier ON world_snapshots(tier, tick DESC)";
+
 const CREATE_PROJECTION_OFFSETS: &str = "
 CREATE TABLE IF NOT EXISTS projection_offsets (
     projection_name TEXT PRIMARY KEY,
@@ -169,6 +184,8 @@ impl EventStore {
         conn.execute(CREATE_IDX_OUTBOX_PENDING, [])?;
         conn.execute_batch(CREATE_SNAPSHOTS)?;
         conn.execute(CREATE_IDX_SNAPSHOTS_AGGREGATE, [])?;
+        conn.execute_batch(CREATE_WORLD_SNAPSHOTS)?;
+        conn.execute(CREATE_IDX_WORLD_SNAPSHOTS_TIER, [])?;
         conn.execute_batch(CREATE_PROJECTION_OFFSETS)?;
 
         info!("EventStore opened at {path}");
@@ -592,6 +609,85 @@ impl EventStore {
         }
     }
 
+    /// Gibt alle Projection-Offsets zurueck (fuer World Snapshot).
+    pub fn get_all_offsets(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT projection_name, last_event_id FROM projection_offsets ORDER BY projection_name",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Gibt die hoechste Event-ID zurueck (fuer Snapshot cursor).
+    pub fn get_latest_event_id(&self) -> anyhow::Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let result = conn.query_row("SELECT MAX(id) FROM events", [], |row| row.get(0));
+        match result {
+            Ok(id) => Ok(id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Loescht alle Events mit id < cutoff_event_id.
+    /// Safety: Prueft ob alle Projection-Offsets >= cutoff_event_id sind.
+    pub fn prune_events_before(&self, cutoff_event_id: i64) -> anyhow::Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+
+        // Safety Guard: Pruefe ob alle Projections ueber dem Cutoff sind
+        let min_offset: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(last_event_id) FROM projection_offsets",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(min) = min_offset {
+            if min < cutoff_event_id {
+                return Err(anyhow::anyhow!(
+                    "Prune blockiert: Projection-Offset ({min}) < Cutoff ({cutoff_event_id})"
+                ));
+            }
+        }
+
+        // Safety Guard: Pruefe Outbox-Backlog
+        let pending_outbox: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbox WHERE status = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if pending_outbox > 0 {
+            return Err(anyhow::anyhow!(
+                "Prune blockiert: {pending_outbox} ausstehende Outbox-Eintraege"
+            ));
+        }
+
+        let deleted = conn.execute("DELETE FROM events WHERE id < ?1", params![cutoff_event_id])?;
+        Ok(deleted as u64)
+    }
+
+    /// Fuehrt SQLite VACUUM aus um Speicherplatz freizugeben.
+    pub fn vacuum(&self) -> anyhow::Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        conn.execute_batch("VACUUM")?;
+        Ok(())
+    }
+
     /// Setzt den Offset einer Projection (upsert, monoton steigend).
     ///
     /// Verhalten:
@@ -644,6 +740,23 @@ impl EventStore {
     /// Loescht den Eintrag aus `projection_offsets`, sodass der naechste
     /// `get_offset()` Call `None` zurueckgibt. Umgeht die Monotonitaetspruefung
     /// von `update_offset()`.
+    /// Erzwingt einen Offset-Wert (umgeht Monotonie-Pruefung, fuer Restore).
+    pub fn force_reset_offset(&self, name: &str, offset: i64) -> anyhow::Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        conn.execute(
+            "INSERT OR REPLACE INTO projection_offsets (projection_name, last_event_id, updated_at) VALUES (?1, ?2, ?3)",
+            params![name, offset, now_ms],
+        )?;
+        Ok(())
+    }
+
     pub fn reset_offset(&self, name: &str) -> anyhow::Result<()> {
         let conn = self
             .conn
@@ -718,6 +831,98 @@ impl EventStore {
     #[cfg(test)]
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap()
+    }
+
+    // ── World Snapshots (Time Machine) ──
+
+    /// Speichert einen World Snapshot als bincode BLOB.
+    pub fn save_world_snapshot(
+        &self,
+        id: &str,
+        tier: &str,
+        tick: u64,
+        sim_hour: f32,
+        last_event_id: i64,
+        payload: &[u8],
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        conn.execute(
+            "INSERT INTO world_snapshots (id, tier, tick, sim_hour, last_event_id, payload_size, payload, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id,
+                tier,
+                tick as i64,
+                sim_hour as f64,
+                last_event_id,
+                payload.len() as i64,
+                payload,
+                now_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Laedt einen World Snapshot (bincode BLOB) anhand seiner ID.
+    pub fn load_world_snapshot(&self, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT payload FROM world_snapshots WHERE id = ?1")?;
+        let result = stmt.query_row(params![id], |row| row.get::<_, Vec<u8>>(0));
+        match result {
+            Ok(payload) => Ok(Some(payload)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Listet alle World Snapshots (Metadaten ohne Payload), sortiert nach Tick DESC.
+    pub fn list_world_snapshots(&self) -> anyhow::Result<Vec<sentinel_common::SnapshotMeta>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, tier, tick, sim_hour, last_event_id, payload_size, created_at \
+             FROM world_snapshots ORDER BY tick DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let tier_str: String = row.get(1)?;
+            let tier = match tier_str.as_str() {
+                "hourly" => sentinel_common::SnapshotTier::Hourly,
+                "daily" => sentinel_common::SnapshotTier::Daily,
+                "weekly" => sentinel_common::SnapshotTier::Weekly,
+                "monthly" => sentinel_common::SnapshotTier::Monthly,
+                _ => sentinel_common::SnapshotTier::Hourly,
+            };
+            Ok(sentinel_common::SnapshotMeta {
+                id: row.get(0)?,
+                tier,
+                tick: row.get::<_, i64>(2)? as u64,
+                sim_hour: row.get::<_, f64>(3)? as f32,
+                last_event_id: row.get(4)?,
+                payload_size_bytes: row.get::<_, i64>(5)? as u64,
+                created_at_ms: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Loescht einen World Snapshot anhand seiner ID.
+    pub fn delete_world_snapshot(&self, id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute("DELETE FROM world_snapshots WHERE id = ?1", params![id])?;
+        Ok(deleted > 0)
+    }
+
+    /// Aktualisiert den Tier eines World Snapshots (fuer Promotion).
+    pub fn promote_world_snapshot(&self, id: &str, new_tier: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE world_snapshots SET tier = ?1 WHERE id = ?2",
+            params![new_tier, id],
+        )?;
+        Ok(updated > 0)
     }
 }
 

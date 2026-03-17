@@ -30,3 +30,12 @@ url = "nats://127.0.0.1:4222"
 [daemon.operator_api]
 enabled = true
 bind_addr = "127.0.0.1:8084"
+
+# Time Machine: World Snapshots + Event Retention
+[daemon.retention]
+hourly_interval_ticks = 3600  # 1h bei 1s Tick-Rate
+daily_keep_hours = 24         # Hourly Snapshots 24h behalten
+weekly_keep_days = 7          # Daily Snapshots 7 Tage behalten
+monthly_keep_weeks = 4        # Weekly Snapshots 4 Wochen behalten
+event_retention_hours = 2     # Live-Events 2h behalten (1h Puffer nach Snapshot)
+auto_prune = true             # Automatisches Pruning nach Snapshot

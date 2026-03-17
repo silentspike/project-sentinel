@@ -80,6 +80,7 @@ func (sc *StreamConsumer) Run(ctx context.Context) error {
 		FilterSubjects: []string{
 			"sentinel.events.agent_action_received.*",
 			"sentinel.events.agent_chat.*",
+			"sentinel.events.snapshot_restored.*",
 		},
 	})
 	if err != nil {
@@ -119,6 +120,15 @@ func (sc *StreamConsumer) Run(ctx context.Context) error {
 // processMessage handles a single NATS message through the heuristic pipeline.
 func (sc *StreamConsumer) processMessage(msg jetstream.Msg) {
 	metrics.EventsProcessed.Inc()
+
+	// Handle snapshot_restored: reset internal state
+	eventType, _, _ := messaging.ParseEventSubject(msg.Subject())
+	if eventType == "snapshot_restored" {
+		sc.logger.Warn("snapshot_restored received — resetting heuristic state")
+		sc.drift.Reset()
+		_ = msg.Ack()
+		return
+	}
 
 	// Parse event metadata from headers
 	agentID := msg.Headers().Get("X-Aggregate-ID")

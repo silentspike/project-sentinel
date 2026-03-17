@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{AgentId, Emotion, Tick};
 
 /// Interrupt-Prioritaet fuer Decision Engine (P0 = hoechste Prioritaet)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Priority {
     /// Sofort: Biologischer Notfall (Blase >90, Energie <15, Hunger >95, Stress >90)
     P0,
@@ -24,7 +24,7 @@ pub enum Priority {
 }
 
 /// Einzelnes Event in der Agent-Queue
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingEvent {
     pub priority: Priority,
     /// Deutscher Impuls-Text
@@ -35,7 +35,7 @@ pub struct PendingEvent {
 }
 
 /// Event-Queue Component pro Agent (max 5 Events pro Injection)
-#[derive(Component, Debug, Clone)]
+#[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct EventQueue {
     /// Sortiert nach Priority (P0 zuerst)
     pub events: Vec<PendingEvent>,
@@ -58,7 +58,7 @@ pub struct AgentIdentity {
 }
 
 /// Position im Buerogebaeude (String-basierte Raum-IDs aus rooms.toml)
-#[derive(Component, Debug, Clone)]
+#[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub room_id: String, // z.B. "buero-dev-1", "kueche"
     pub in_transit: bool,
@@ -69,7 +69,7 @@ pub struct Position {
 }
 
 /// Biologischer Zustand (Hunger, Energie, Koffein, Blase, Stress, Sozial)
-#[derive(Component, Debug, Clone)]
+#[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct BioState {
     pub hunger: f32,      // 0-100
     pub energy: f32,      // 0-100
@@ -81,7 +81,7 @@ pub struct BioState {
 }
 
 /// Persoenlichkeit (Big Five + chronotype + Koffein-Toleranz)
-#[derive(Component, Debug, Clone)]
+#[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct Personality {
     pub openness: f32,           // 0-1
     pub conscientiousness: f32,  // 0-1
@@ -93,7 +93,7 @@ pub struct Personality {
 }
 
 /// Stimmung (Valenz-Arousal-Modell)
-#[derive(Component, Debug, Clone)]
+#[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct Mood {
     pub valence: f32, // -1.0 (negativ) bis 1.0 (positiv)
     pub arousal: f32, // 0.0 (ruhig) bis 1.0 (erregt)
@@ -101,7 +101,7 @@ pub struct Mood {
 }
 
 /// Wahrnehmung (wird pro Tick neu generiert fuer LLM-Prompt)
-#[derive(Component, Debug, Clone)]
+#[derive(Component, Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PerceptionState {
     pub environment_text: String,
     pub body_text: String,
@@ -110,7 +110,7 @@ pub struct PerceptionState {
 }
 
 /// Arbeitskontext
-#[derive(Component, Debug, Clone)]
+#[derive(Component, Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkContext {
     pub current_task: Option<String>,
     pub in_meeting: bool,
@@ -121,13 +121,13 @@ pub struct WorkContext {
 }
 
 /// Beziehungen zu anderen Agenten
-#[derive(Component, Debug, Clone)]
+#[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct Relationships {
     pub affinity: Vec<(AgentId, f32)>, // -1.0 bis 1.0 pro Agent
 }
 
 /// LLM-Konfiguration
-#[derive(Component, Debug, Clone)]
+#[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     pub provider: String, // z.B. "claude", "bitnet"
     pub model: String,    // z.B. "claude-sonnet-4-5-20250929"
@@ -146,7 +146,7 @@ pub struct ShiftInfo {
 
 /// Tool-Capabilities des Agents (aus AgentConfig `[capabilities]` Sektion).
 /// Leere tools-Liste = kein Tool-Zugriff (sicherer Default).
-#[derive(Component, Debug, Clone, Default)]
+#[derive(Component, Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentCapabilities {
     pub tools: Vec<String>,
     pub sandbox_allowed_paths: Vec<String>,

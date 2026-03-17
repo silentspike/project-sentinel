@@ -18,3 +18,4 @@ pub mod orchestrator;
 pub mod query_responder;
 pub mod shift;
 pub mod signal;
+pub mod snapshot;
