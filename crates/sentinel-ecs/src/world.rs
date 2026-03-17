@@ -13,6 +13,7 @@ use sentinel_common::{
 };
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -20,14 +21,14 @@ use std::sync::Arc;
 ///
 /// Wird von input_system/autonomy_system/smell_system befuellt und von
 /// perception_system gelesen. Cleanup abgelaufener Smells bei jedem Tick.
-#[derive(Resource, Default, Debug, Clone)]
+#[derive(Resource, Default, Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveSmells {
     /// Key: room_id, Value: Liste aktiver Gerueche
     pub smells: HashMap<String, Vec<ActiveSmell>>,
 }
 
 /// Ein einzelner aktiver Geruch in einem Raum.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveSmell {
     pub smell_type: String,
     pub intensity: f32,
@@ -82,14 +83,14 @@ impl ActiveSmells {
 ///
 /// Wird vom Zufalls-Chaos und spaeter auch vom Operator-Pfad befuellt.
 /// Pro Raum ist zunaechst genau ein aktives Chaos erlaubt.
-#[derive(Resource, Default, Debug, Clone)]
+#[derive(Resource, Default, Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveChaos {
     /// Key: room_id, Value: aktives Chaos-Event
     pub events: HashMap<String, ActiveChaosEvent>,
 }
 
 /// Ein einzelnes aktives Chaos-Event in einem Raum.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveChaosEvent {
     pub event_type: EventType,
     pub description: String,
@@ -145,14 +146,14 @@ impl ActiveChaos {
 }
 
 /// Aktive manuelle Raumreize pro Raum und Reiztyp.
-#[derive(Resource, Default, Debug, Clone)]
+#[derive(Resource, Default, Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveRoomStimuli {
     /// Key: room_id, Value: aktiver Reiz je Typ
     pub entries: HashMap<String, HashMap<RoomStimulusType, ActiveRoomStimulus>>,
 }
 
 /// Ein einzelner aktiver Raumreiz.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveRoomStimulus {
     pub stimulus_type: RoomStimulusType,
     pub delta: f32,
@@ -236,13 +237,13 @@ impl ActiveRoomStimuli {
 }
 
 /// Letzter berechneter Physics-Snapshot pro Raum fuer echte Reaktionslogik.
-#[derive(Resource, Default, Debug, Clone)]
+#[derive(Resource, Default, Debug, Clone, Serialize, Deserialize)]
 pub struct RoomPhysicsState {
     pub rooms: HashMap<String, RoomPhysicsSnapshot>,
 }
 
 /// Physik-Snapshot eines Raums im aktuellen Tick.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomPhysicsSnapshot {
     pub tick: u64,
     pub occupant_count: u32,
@@ -279,7 +280,7 @@ impl RoomPhysicsState {
 }
 
 /// Simulationszeit-Resource (muss vor jedem Schedule::run() aktualisiert werden)
-#[derive(Resource, Debug, Clone)]
+#[derive(Resource, Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationTime {
     pub tick: Tick,
     pub tick_count: u64,
