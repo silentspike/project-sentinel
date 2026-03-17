@@ -355,9 +355,10 @@ pub fn operator_command_system(
                     Some(metadata),
                 );
             }
-            OperatorCommand::Nightrun(_) => {
-                // Nightrun wird vom Orchestrator gehandelt, nicht vom ECS.
-                // Command kommt hier nie an (Orchestrator faengt ihn vorher ab).
+            OperatorCommand::Nightrun(_)
+            | OperatorCommand::Snapshot(_)
+            | OperatorCommand::Restore(_) => {
+                // Orchestrator-Commands: werden im Tick-Loop gehandelt, nicht im ECS.
             }
         }
     }

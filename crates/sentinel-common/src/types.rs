@@ -212,6 +212,8 @@ pub enum OperatorCommand {
     Chaos(OperatorChaosCommand),
     RoomStimulus(OperatorRoomStimulusCommand),
     Nightrun(OperatorNightrunCommand),
+    Snapshot(OperatorSnapshotCommand),
+    Restore(OperatorRestoreCommand),
 }
 
 // ──────────────────────────────────────────────

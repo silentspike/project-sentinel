@@ -367,6 +367,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let (action_tx, action_rx) = mpsc::channel();
     let (operator_tx, operator_rx) = mpsc::channel::<OperatorCommand>();
     let (nightrun_tx, nightrun_rx) = mpsc::channel::<sentinel_common::OperatorNightrunCommand>();
+    let (snapshot_tx, _snapshot_rx) = mpsc::channel::<sentinel_common::OperatorSnapshotCommand>();
+    let (restore_tx, _restore_rx) = mpsc::channel::<sentinel_common::OperatorRestoreCommand>();
     let (perception_tx, perception_rx) = mpsc::sync_channel::<Perception>(64);
 
     // -- Zenoh SentinelBus (Core-Bus fuer Real-Time Event-Verteilung) --
@@ -438,6 +440,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 operator_room_ids,
                 operator_tx.clone(),
                 nightrun_tx.clone(),
+                snapshot_tx.clone(),
+                restore_tx.clone(),
+                Arc::clone(&event_store),
             )
             .await?,
         )
