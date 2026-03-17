@@ -9,7 +9,7 @@ use std::time::SystemTime;
 use sentinel_common::{SnapshotMeta, SnapshotTier, WorldSnapshot};
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::RetentionConfig;
 
@@ -180,6 +180,32 @@ impl SnapshotManager {
 
         if promoted > 0 || deleted > 0 {
             info!(promoted, deleted, "Snapshot Maintenance abgeschlossen");
+        }
+
+        // Auto-Prune: Events vor zweitaeltestem Snapshot loeschen (1h Puffer)
+        if self.config.auto_prune {
+            let current_snapshots = event_store.list_world_snapshots().unwrap_or_default();
+            if current_snapshots.len() >= 2 {
+                let prune_point = current_snapshots[current_snapshots.len() - 2].last_event_id;
+                match event_store.prune_events_before(prune_point) {
+                    Ok(pruned) if pruned > 0 => {
+                        info!(pruned, "Auto-Prune: Events geloescht");
+                        // VACUUM asynchron — blockiert nicht den Tick-Loop
+                        let es = Arc::clone(event_store);
+                        std::thread::spawn(move || {
+                            if let Err(e) = es.vacuum() {
+                                warn!(error = %e, "Auto-VACUUM fehlgeschlagen");
+                            } else {
+                                info!("Auto-VACUUM abgeschlossen");
+                            }
+                        });
+                    }
+                    Ok(_) => {} // Nichts zu prunen
+                    Err(e) => {
+                        debug!(error = %e, "Auto-Prune uebersprungen (Safety Guard)");
+                    }
+                }
+            }
         }
 
         Ok(MaintenanceReport { promoted, deleted })
