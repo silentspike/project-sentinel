@@ -328,6 +328,15 @@ main { padding: 2rem; }
   background: rgba(8, 8, 16, 0.56);
   border: 1px dashed var(--border);
 }
+.room-detail-auth {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+.room-detail-auth .room-trigger-input {
+  max-width: 280px;
+}
 .room-detail-state.error,
 .room-trigger-feedback.error {
   color: #ffd1d1;
