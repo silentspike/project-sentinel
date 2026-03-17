@@ -292,6 +292,20 @@ controlRoutes.post("/control/restore", async (c) => {
   }
 });
 
+controlRoutes.post("/control/prune", async (c) => {
+  try {
+    return await proxyJson(
+      getOperatorApiUrl(),
+      "POST",
+      "/operator/prune",
+      {},
+      getOperatorHeaders(),
+    );
+  } catch (err) {
+    return c.json({ error: "Operator-API nicht erreichbar", detail: String(err) }, 502);
+  }
+});
+
 // ── GET /api/control/status — Aggregierter Status ──
 // Kombiniert Config + Cortex Health + Guardrails fuer das Frontend.
 
