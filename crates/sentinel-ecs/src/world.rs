@@ -727,3 +727,205 @@ pub fn despawn_agent_from_world(world: &mut World, agent_id: AgentId) -> bool {
         false
     }
 }
+
+// ──────────────────────────────────────────────
+// Time Machine: ECS Snapshot / Restore
+// ──────────────────────────────────────────────
+
+/// Erstellt einen Snapshot des gesamten ECS-Zustands (alle Agent-Entities + Resources).
+pub fn snapshot_ecs_state(world: &mut World) -> sentinel_common::EcsSnapshot {
+    let mut positions = Vec::new();
+    let mut bio_states = Vec::new();
+    let mut personalities = Vec::new();
+    let mut moods = Vec::new();
+    let mut perception_states = Vec::new();
+    let mut work_contexts = Vec::new();
+    let mut agent_capabilities = Vec::new();
+    let mut event_queues = Vec::new();
+    let mut identities = Vec::new();
+    let mut shift_infos = Vec::new();
+
+    // Alle Agents via AgentIdentity Query (jeder Agent hat diese Component)
+    let mut query = world.query::<(
+        &AgentIdentity,
+        &Position,
+        &BioState,
+        &Personality,
+        &Mood,
+        &PerceptionState,
+        &WorkContext,
+        &AgentCapabilities,
+        &EventQueue,
+        &ShiftInfo,
+    )>();
+
+    for (identity, pos, bio, personality, mood, perception, work, caps, events, shift) in
+        query.iter(world)
+    {
+        let id = identity.agent_id.0;
+        identities.push((id, identity.clone()));
+        positions.push((id, pos.clone()));
+        bio_states.push((id, bio.clone()));
+        personalities.push((id, personality.clone()));
+        moods.push((id, mood.clone()));
+        perception_states.push((id, perception.clone()));
+        work_contexts.push((id, work.clone()));
+        agent_capabilities.push((id, caps.clone()));
+        event_queues.push((id, events.clone()));
+        shift_infos.push((id, shift.clone()));
+    }
+
+    let sim_time = world.get_resource::<SimulationTime>();
+
+    sentinel_common::EcsSnapshot {
+        positions,
+        bio_states,
+        personalities,
+        moods,
+        perception_states,
+        work_contexts,
+        agent_capabilities,
+        event_queues,
+        identities,
+        shift_infos,
+        sim_tick: sim_time.map(|t| t.tick.0).unwrap_or(0),
+        sim_hour: sim_time.map(|t| t.sim_hour).unwrap_or(0.0),
+        sim_delta_seconds: sim_time.map(|t| t.delta_seconds).unwrap_or(1.0),
+    }
+}
+
+/// Restored den ECS-Zustand aus einem Snapshot.
+/// Despawnt ALLE bestehenden Agent-Entities und erstellt neue aus dem Snapshot.
+pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnapshot) {
+    // 1. Alle existierenden Agent-Entities finden und despawnen
+    let mut existing: Vec<Entity> = Vec::new();
+    {
+        let mut query = world.query::<(Entity, &AgentIdentity)>();
+        for (entity, _) in query.iter(world) {
+            existing.push(entity);
+        }
+    }
+    for entity in existing {
+        world.despawn(entity);
+    }
+
+    // 2. Agents aus Snapshot respawnen (mit allen Components)
+    for (id, identity) in &snapshot.identities {
+        let pos = snapshot
+            .positions
+            .iter()
+            .find(|(aid, _)| aid == id)
+            .map(|(_, p)| p.clone())
+            .unwrap_or(Position {
+                room_id: "empfang".to_string(),
+                in_transit: false,
+                transit_target: None,
+                transit_remaining_ms: 0,
+                transit_correlation_id: None,
+            });
+        let bio = snapshot
+            .bio_states
+            .iter()
+            .find(|(aid, _)| aid == id)
+            .map(|(_, b)| b.clone())
+            .unwrap_or(BioState {
+                hunger: 20.0,
+                energy: 80.0,
+                caffeine_mg: 0.0,
+                bladder: 10.0,
+                stress: 15.0,
+                social_need: 50.0,
+                comfort: 70.0,
+            });
+        let personality = snapshot
+            .personalities
+            .iter()
+            .find(|(aid, _)| aid == id)
+            .map(|(_, p)| p.clone())
+            .unwrap_or(Personality {
+                openness: 0.5,
+                conscientiousness: 0.5,
+                extraversion: 0.5,
+                agreeableness: 0.5,
+                neuroticism: 0.3,
+                caffeine_tolerance: 0.5,
+                is_morning_person: true,
+            });
+        let mood = snapshot
+            .moods
+            .iter()
+            .find(|(aid, _)| aid == id)
+            .map(|(_, m)| m.clone())
+            .unwrap_or(Mood {
+                valence: 0.2,
+                arousal: 0.3,
+                dominant_emotion: Emotion::Neutral,
+            });
+        let perception = snapshot
+            .perception_states
+            .iter()
+            .find(|(aid, _)| aid == id)
+            .map(|(_, p)| p.clone())
+            .unwrap_or_default();
+        let work = snapshot
+            .work_contexts
+            .iter()
+            .find(|(aid, _)| aid == id)
+            .map(|(_, w)| w.clone())
+            .unwrap_or_default();
+        let caps = snapshot
+            .agent_capabilities
+            .iter()
+            .find(|(aid, _)| aid == id)
+            .map(|(_, c)| c.clone())
+            .unwrap_or_default();
+        let events = snapshot
+            .event_queues
+            .iter()
+            .find(|(aid, _)| aid == id)
+            .map(|(_, e)| e.clone())
+            .unwrap_or_default();
+        let shift = snapshot
+            .shift_infos
+            .iter()
+            .find(|(aid, _)| aid == id)
+            .map(|(_, s)| s.clone())
+            .unwrap_or(ShiftInfo {
+                shift_set: 1,
+                shift_start_hour: 6,
+                shift_end_hour: 14,
+                is_on_duty: false,
+            });
+
+        world.spawn((
+            identity.clone(),
+            pos,
+            bio,
+            personality,
+            mood,
+            perception,
+            work,
+            Relationships {
+                affinity: Vec::new(),
+            },
+            LlmConfig {
+                provider: "claude".to_string(),
+                model: "claude-sonnet-4-5-20250929".to_string(),
+                temperature: 0.7,
+                max_tokens: 4096,
+            },
+            shift,
+            events,
+            AutonomyCooldown::default(),
+            caps,
+        ));
+    }
+
+    // 3. SimulationTime Resource ueberschreiben
+    if let Some(mut sim_time) = world.get_resource_mut::<SimulationTime>() {
+        sim_time.tick = Tick(snapshot.sim_tick);
+        sim_time.tick_count = snapshot.sim_tick;
+        sim_time.sim_hour = snapshot.sim_hour;
+        sim_time.delta_seconds = snapshot.sim_delta_seconds;
+    }
+}
