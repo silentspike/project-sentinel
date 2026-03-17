@@ -520,11 +520,148 @@ function renderControl() {
   renderPipelineHardening(container);
   renderGuardrailsStatus(container);
   renderLiveConfig(container);
+  renderSnapshotSection(container);
 }
 
 async function initControl() {
   await loadControlStatus();
   renderControl();
+}
+
+// ── Time Machine: Snapshot-Sektion ──
+
+async function loadSnapshots() {
+  try {
+    var res = await fetch('/api/control/snapshots');
+    if (res.ok) return await res.json();
+  } catch (_) { /* ignore */ }
+  return [];
+}
+
+function renderSnapshotSection(container) {
+  var section = document.createElement('div');
+  section.className = 'control-section';
+  section.id = 'snapshot-section';
+
+  var h3 = document.createElement('h3');
+  h3.textContent = 'Time Machine — World Snapshots';
+  section.appendChild(h3);
+
+  var createBtn = document.createElement('button');
+  createBtn.className = 'control-btn';
+  createBtn.textContent = 'Jetzt Snapshot erstellen';
+  createBtn.addEventListener('click', async function() {
+    createBtn.disabled = true;
+    createBtn.textContent = 'Erstelle...';
+    try {
+      await fetch('/api/control/snapshot', {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+        body: '{}',
+      });
+      await refreshSnapshotList(section);
+    } catch (_) { /* ignore */ }
+    createBtn.disabled = false;
+    createBtn.textContent = 'Jetzt Snapshot erstellen';
+  });
+  section.appendChild(createBtn);
+
+  var listDiv = document.createElement('div');
+  listDiv.id = 'snapshot-list';
+  listDiv.textContent = 'Lade Snapshots...';
+  section.appendChild(listDiv);
+
+  container.appendChild(section);
+  refreshSnapshotList(section);
+}
+
+async function refreshSnapshotList(section) {
+  var listDiv = section.querySelector('#snapshot-list');
+  if (!listDiv) return;
+  var snapshots = await loadSnapshots();
+  while (listDiv.firstChild) listDiv.removeChild(listDiv.firstChild);
+
+  if (snapshots.length === 0) {
+    listDiv.textContent = 'Keine Snapshots vorhanden';
+    return;
+  }
+
+  var table = document.createElement('table');
+  table.className = 'snapshot-table';
+  var thead = document.createElement('thead');
+  var headerRow = document.createElement('tr');
+  ['Tier', 'Tick', 'Sim Hour', 'Groesse', 'Erstellt', 'Aktion'].forEach(function(text) {
+    var th = document.createElement('th');
+    th.textContent = text;
+    headerRow.appendChild(th);
+  });
+  thead.appendChild(headerRow);
+  table.appendChild(thead);
+
+  var tbody = document.createElement('tbody');
+  for (var i = 0; i < snapshots.length; i++) {
+    var snap = snapshots[i];
+    var row = document.createElement('tr');
+
+    var tdTier = document.createElement('td');
+    var badge = document.createElement('span');
+    badge.className = 'tier-badge tier-' + snap.tier;
+    badge.textContent = snap.tier;
+    tdTier.appendChild(badge);
+    row.appendChild(tdTier);
+
+    var tdTick = document.createElement('td');
+    tdTick.textContent = String(snap.tick);
+    row.appendChild(tdTick);
+
+    var tdHour = document.createElement('td');
+    tdHour.textContent = (snap.sim_hour || 0).toFixed(1) + 'h';
+    row.appendChild(tdHour);
+
+    var tdSize = document.createElement('td');
+    tdSize.textContent = formatKB(snap.payload_size_bytes);
+    row.appendChild(tdSize);
+
+    var tdCreated = document.createElement('td');
+    tdCreated.textContent = new Date(snap.created_at_ms).toLocaleString('de-DE');
+    row.appendChild(tdCreated);
+
+    var tdAction = document.createElement('td');
+    var restoreBtn = document.createElement('button');
+    restoreBtn.className = 'control-btn control-btn-small';
+    restoreBtn.textContent = 'Restore';
+    restoreBtn.setAttribute('data-snapshot-id', snap.id);
+    restoreBtn.addEventListener('click', function() {
+      var id = this.getAttribute('data-snapshot-id');
+      if (confirm('Simulation auf diesen Snapshot zuruecksetzen?\n\nSnapshot ID: ' + id)) {
+        fetch('/api/control/restore', {
+          method: 'POST',
+          headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+          body: JSON.stringify({ snapshot_id: id }),
+        }).then(function() {
+          alert('Restore gestartet');
+        });
+      }
+    });
+    tdAction.appendChild(restoreBtn);
+    row.appendChild(tdAction);
+
+    tbody.appendChild(row);
+  }
+  table.appendChild(tbody);
+  listDiv.appendChild(table);
+}
+
+function formatKB(bytes) {
+  if (bytes == null) return '--';
+  if (bytes > 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+  if (bytes > 1024) return (bytes / 1024).toFixed(0) + ' KB';
+  return bytes + ' B';
+}
+
+function authHeaders() {
+  var key = getApiKey();
+  return key ? { Authorization: 'Bearer ' + key } : {};
 }
 
 // Auto-refresh alle 10s wenn Control-Tab aktiv

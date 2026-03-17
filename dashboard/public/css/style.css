@@ -1177,3 +1177,36 @@ main { padding: 2rem; }
   color: var(--danger);
   border: 1px solid rgba(255, 68, 68, 0.3);
 }
+
+/* Time Machine: Snapshot Table */
+.snapshot-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.75rem;
+  font-size: 0.82rem;
+}
+.snapshot-table th,
+.snapshot-table td {
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.snapshot-table th {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.tier-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+.tier-hourly { background: rgba(0, 200, 150, 0.15); color: var(--accent); }
+.tier-daily { background: rgba(100, 150, 255, 0.15); color: #6496ff; }
+.tier-weekly { background: rgba(200, 120, 255, 0.15); color: #c878ff; }
+.tier-monthly { background: rgba(255, 180, 50, 0.15); color: #ffb432; }
+.control-btn-small {
+  padding: 4px 10px;
+  font-size: 0.75rem;
+}
