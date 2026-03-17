@@ -1666,23 +1666,153 @@ fn ecs_tick_loop(
                                     sim_time.sim_hour = snapshot.sim_hour;
                                 }
 
-                                // 7. Projection Rebuild: Tables clearen + Offsets zuruecksetzen
-                                //    Worker pollt get_events_since(offset) und rebuilt organisch.
+                                // 7. CQRS Snapshot-Seeding: Projection direkt aus Snapshot befuellen.
+                                //    NICHT Events replayen — das wuerde den Jetzt-State reproduzieren.
                                 {
-                                    let conn = sentinel_limbo::rusqlite::Connection::open(
-                                        evolution_db_path.replace("evolution.db", "projection.db"),
-                                    );
-                                    if let Ok(db) = conn {
-                                        let _ = db.execute_batch(
-                                            "DELETE FROM room_live_view; \
-                                             DELETE FROM agent_live_view; \
-                                             DELETE FROM kpi;",
-                                        );
-                                        info!("Projection Tables gecleart fuer Rebuild");
+                                    let proj_path =
+                                        evolution_db_path.replace("evolution.db", "projection.db");
+                                    match sentinel_limbo::rusqlite::Connection::open(&proj_path) {
+                                        Ok(db) => {
+                                            // 7a. Tables clearen
+                                            let _ = db.execute_batch(
+                                                "DELETE FROM agent_live_view; \
+                                                 DELETE FROM room_live_view; \
+                                                 DELETE FROM kpi;",
+                                            );
+
+                                            let now_ms = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis()
+                                                as i64;
+
+                                            // 7b. Agent-Daten aus Snapshot in Projection seeden
+                                            let mut agents_seeded = 0u32;
+                                            for (id, identity) in &snapshot.ecs.identities {
+                                                let bio = snapshot
+                                                    .ecs
+                                                    .bio_states
+                                                    .iter()
+                                                    .find(|(aid, _)| aid == id)
+                                                    .map(|(_, b)| b);
+                                                let pos = snapshot
+                                                    .ecs
+                                                    .positions
+                                                    .iter()
+                                                    .find(|(aid, _)| aid == id)
+                                                    .map(|(_, p)| p);
+                                                let mood = snapshot
+                                                    .ecs
+                                                    .moods
+                                                    .iter()
+                                                    .find(|(aid, _)| aid == id)
+                                                    .map(|(_, m)| m);
+                                                let shift = snapshot
+                                                    .ecs
+                                                    .shift_infos
+                                                    .iter()
+                                                    .find(|(aid, _)| aid == id)
+                                                    .map(|(_, s)| s);
+
+                                                let agent_id_num = *id as i64;
+                                                let name = &identity.name;
+                                                let role = &identity.role;
+                                                let shift_set =
+                                                    shift.map(|s| s.shift_set as i64).unwrap_or(1);
+                                                let room = pos
+                                                    .map(|p| p.room_id.as_str())
+                                                    .unwrap_or("empfang");
+                                                let in_transit =
+                                                    pos.map(|p| p.in_transit as i64).unwrap_or(0);
+                                                let hunger =
+                                                    bio.map(|b| b.hunger as f64).unwrap_or(20.0);
+                                                let energy =
+                                                    bio.map(|b| b.energy as f64).unwrap_or(80.0);
+                                                let stress =
+                                                    bio.map(|b| b.stress as f64).unwrap_or(15.0);
+                                                let bladder =
+                                                    bio.map(|b| b.bladder as f64).unwrap_or(10.0);
+                                                let social = bio
+                                                    .map(|b| b.social_need as f64)
+                                                    .unwrap_or(50.0);
+                                                let caffeine = bio
+                                                    .map(|b| b.caffeine_mg as f64)
+                                                    .unwrap_or(0.0);
+                                                let mood_str = mood
+                                                    .map(|m| format!("{:?}", m.dominant_emotion))
+                                                    .unwrap_or_else(|| "Neutral".to_string());
+
+                                                if db.execute(
+                                                    "INSERT OR REPLACE INTO agent_live_view \
+                                                     (agent_id, name, role, shift_set, status, current_room, in_transit, \
+                                                      hunger, energy, stress, bladder, social_need, caffeine_mg, mood, \
+                                                      last_event_id, updated_at) \
+                                                     VALUES (?1,?2,?3,?4,'active',?5,?6,?7,?8,?9,?10,?11,?12,?13,0,?14)",
+                                                    sentinel_limbo::rusqlite::params![
+                                                        agent_id_num, name, role, shift_set, room, in_transit,
+                                                        hunger, energy, stress, bladder, social, caffeine,
+                                                        mood_str, now_ms,
+                                                    ],
+                                                ).is_ok() {
+                                                    agents_seeded += 1;
+                                                }
+                                            }
+
+                                            // 7c. Room-Daten aus ECS RoomPhysicsState seeden
+                                            let mut rooms_seeded = 0u32;
+                                            if let Ok(physics) = serde_json::from_slice::<
+                                                std::collections::HashMap<
+                                                    String,
+                                                    sentinel_ecs::RoomPhysicsSnapshot,
+                                                >,
+                                            >(
+                                                // RoomPhysicsState nicht im Snapshot — nutze Position-Daten fuer Occupancy
+                                                b"{}",
+                                            ) {
+                                                // Leeres HashMap — Rooms werden aus Position-Daten berechnet
+                                                let _ = physics;
+                                            }
+                                            // Room occupancy aus Agent-Positionen berechnen
+                                            let mut room_occupancy: std::collections::HashMap<
+                                                String,
+                                                u32,
+                                            > = std::collections::HashMap::new();
+                                            for (_, pos) in &snapshot.ecs.positions {
+                                                if !pos.in_transit {
+                                                    *room_occupancy
+                                                        .entry(pos.room_id.clone())
+                                                        .or_default() += 1;
+                                                }
+                                            }
+                                            for (room_id, count) in &room_occupancy {
+                                                if db.execute(
+                                                    "INSERT OR REPLACE INTO room_live_view \
+                                                     (room_id, occupant_count, transit_count, updated_at) \
+                                                     VALUES (?1, ?2, 0, ?3)",
+                                                    sentinel_limbo::rusqlite::params![room_id, *count as i64, now_ms],
+                                                ).is_ok() {
+                                                    rooms_seeded += 1;
+                                                }
+                                            }
+
+                                            info!(
+                                                agents_seeded,
+                                                rooms_seeded,
+                                                "Projection Snapshot-Seeding abgeschlossen"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, "projection.db nicht oeffenbar — Seeding uebersprungen");
+                                        }
                                     }
                                 }
+
+                                // 7d. Offset auf max(event_id) setzen — NICHT snapshot.last_event_id!
+                                //     snapshot.last_event_id wuerde alle Events danach replayen
+                                //     und den Jetzt-State reproduzieren. max(id) ueberspringt alles.
+                                let max_event_id = es.get_latest_event_id().unwrap_or(0);
                                 for (name, _) in &snapshot.projection_offsets {
-                                    let _ = es.force_reset_offset(name, snapshot.last_event_id);
+                                    let _ = es.force_reset_offset(name, max_event_id);
                                 }
 
                                 // 8. SnapshotRestored Event emittieren
