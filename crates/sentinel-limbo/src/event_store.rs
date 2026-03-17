@@ -636,6 +636,58 @@ impl EventStore {
         }
     }
 
+    /// Loescht alle Events mit id < cutoff_event_id.
+    /// Safety: Prueft ob alle Projection-Offsets >= cutoff_event_id sind.
+    pub fn prune_events_before(&self, cutoff_event_id: i64) -> anyhow::Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+
+        // Safety Guard: Pruefe ob alle Projections ueber dem Cutoff sind
+        let min_offset: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(last_event_id) FROM projection_offsets",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(min) = min_offset {
+            if min < cutoff_event_id {
+                return Err(anyhow::anyhow!(
+                    "Prune blockiert: Projection-Offset ({min}) < Cutoff ({cutoff_event_id})"
+                ));
+            }
+        }
+
+        // Safety Guard: Pruefe Outbox-Backlog
+        let pending_outbox: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbox WHERE status = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if pending_outbox > 0 {
+            return Err(anyhow::anyhow!(
+                "Prune blockiert: {pending_outbox} ausstehende Outbox-Eintraege"
+            ));
+        }
+
+        let deleted = conn.execute("DELETE FROM events WHERE id < ?1", params![cutoff_event_id])?;
+        Ok(deleted as u64)
+    }
+
+    /// Fuehrt SQLite VACUUM aus um Speicherplatz freizugeben.
+    pub fn vacuum(&self) -> anyhow::Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        conn.execute_batch("VACUUM")?;
+        Ok(())
+    }
+
     /// Setzt den Offset einer Projection (upsert, monoton steigend).
     ///
     /// Verhalten:

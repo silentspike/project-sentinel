@@ -27,6 +27,7 @@ const OPERATOR_NIGHTRUN_PATH: &str = "/operator/nightrun";
 const OPERATOR_SNAPSHOTS_PATH: &str = "/operator/snapshots";
 const OPERATOR_SNAPSHOT_PATH: &str = "/operator/snapshot";
 const OPERATOR_RESTORE_PATH: &str = "/operator/restore";
+const OPERATOR_PRUNE_PATH: &str = "/operator/prune";
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024;
 const OPERATOR_KEY_HEADER: &str = "x-sentinel-operator-key";
@@ -308,6 +309,32 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Err(_) => {
                     ApiError::ServiceUnavailable("Restore-Channel nicht verfuegbar").to_response()
                 }
+            }
+        }
+        OPERATOR_PRUNE_PATH => {
+            info!("Manuelles Pruning via Operator-API angefordert");
+            let snapshots = state.event_store.list_world_snapshots().unwrap_or_default();
+            if snapshots.len() < 2 {
+                return json_response(
+                    200,
+                    serde_json::json!({"pruned": 0, "message": "Zu wenige Snapshots fuer Pruning"}),
+                );
+            }
+            // Prune vor zweitaeltestem Snapshot (1h Puffer)
+            let prune_point = snapshots[snapshots.len() - 2].last_event_id;
+            match state.event_store.prune_events_before(prune_point) {
+                Ok(deleted) => {
+                    let _ = state.event_store.vacuum();
+                    info!(deleted, "Pruning + VACUUM abgeschlossen");
+                    json_response(
+                        200,
+                        serde_json::json!({"pruned": deleted, "vacuumed": true}),
+                    )
+                }
+                Err(e) => json_response(
+                    409,
+                    serde_json::json!({"error": format!("{e}"), "pruned": 0}),
+                ),
             }
         }
         _ => ApiError::NotFound("Endpoint unbekannt").to_response(),
