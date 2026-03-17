@@ -196,11 +196,22 @@ pub struct OperatorRoomStimulusCommand {
     pub duration_ticks: Option<u64>,
 }
 
+/// Operator-Trigger fuer Nightrun-Konsolidierung via Daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNightrunCommand {
+    /// Optionale Schicht-Nummer (1-3). None = letzte abgelaufene Schicht.
+    pub shift_set: Option<u8>,
+    /// Nur simulieren, nicht persistieren.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
 /// Gemeinsamer Runtime-Schreibpfad fuer Operator-Kommandos.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OperatorCommand {
     Chaos(OperatorChaosCommand),
     RoomStimulus(OperatorRoomStimulusCommand),
+    Nightrun(OperatorNightrunCommand),
 }
 
 // ──────────────────────────────────────────────

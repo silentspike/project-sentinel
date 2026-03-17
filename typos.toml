@@ -446,6 +446,7 @@ statistisch = "statistisch"
 
 # Bio-Engine dynamics words (Issue #148 - German in Rust doc comments)
 realistisch = "realistisch"
+unrealistisch = "unrealistisch"
 realistische = "realistische"
 realistischen = "realistischen"
 realistischer = "realistischer"
