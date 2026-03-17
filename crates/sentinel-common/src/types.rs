@@ -450,6 +450,10 @@ pub struct EcsSnapshot {
     pub sim_tick: u64,
     pub sim_hour: f32,
     pub sim_delta_seconds: f32,
+    /// Serialisierte ephemere Resources (ActiveChaos, ActiveRoomStimuli)
+    /// als JSON-Bytes — vermeidet zirkulaere Dependency zu sentinel-ecs.
+    pub active_chaos_json: Vec<u8>,
+    pub active_stimuli_json: Vec<u8>,
 }
 
 /// Vollstaendiger World Snapshot (redb + ECS + Cursor).

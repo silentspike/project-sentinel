@@ -492,6 +492,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 nightrun_rx,
                 snapshot_rx,
                 restore_rx,
+                config.retention.clone(),
                 evolution_db_path_clone,
                 agent_command_cfg,
                 adaptive_config,
@@ -746,6 +747,7 @@ fn ecs_tick_loop(
     nightrun_rx: mpsc::Receiver<sentinel_common::OperatorNightrunCommand>,
     snapshot_rx: mpsc::Receiver<sentinel_common::OperatorSnapshotCommand>,
     restore_rx: mpsc::Receiver<sentinel_common::OperatorRestoreCommand>,
+    retention_config: crate::config::RetentionConfig,
     evolution_db_path: String,
     agent_command_cfg: Vec<String>,
     adaptive_config: crate::adaptive_tick::AdaptiveConfig,
@@ -755,10 +757,8 @@ fn ecs_tick_loop(
     // Adaptive Tick-Rate Controller (PSI-basiert, TOGAF Adaptive Scheduling)
     let mut adaptive_tick = AdaptiveTickRate::new(adaptive_config);
 
-    // Time Machine: SnapshotManager
-    // TODO: RetentionConfig aus daemon.toml durchreichen (aktuell Defaults, identisch mit Config)
-    let mut snapshot_manager =
-        crate::snapshot::SnapshotManager::new(crate::config::RetentionConfig::default());
+    // Time Machine: SnapshotManager (Config aus daemon.toml)
+    let mut snapshot_manager = crate::snapshot::SnapshotManager::new(retention_config);
 
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
@@ -1651,11 +1651,12 @@ fn ecs_tick_loop(
                                 // 4. ECS Restore
                                 sentinel_ecs::restore_ecs_state(&mut world, &snapshot.ecs);
 
-                                // 6. Tick/SimHour zuruecksetzen
-                                tick_count = snapshot.tick;
+                                // 6. Tick/SimHour zuruecksetzen + sofortiger Agent-Respawn
+                                // Align tick to next multiple of 60 so shift-check
+                                // fires immediately on next tick (< 1 second, not 60s).
+                                let aligned_tick = ((snapshot.tick / 60) + 1) * 60;
+                                tick_count = aligned_tick;
                                 sim_hour = snapshot.sim_hour;
-                                // Shift zuruecksetzen damit Schicht-Erkennung
-                                // neue Agents spawnt beim naechsten Check
                                 current_shift = 0;
                                 if let Some(mut sim_time) =
                                     world.get_resource_mut::<sentinel_ecs::SimulationTime>()
@@ -1714,6 +1715,21 @@ fn ecs_tick_loop(
                                     es.append_with_outbox(&restore_event, "sentinel.events")
                                 {
                                     warn!(error = %e, "SnapshotRestored Event schreiben fehlgeschlagen");
+                                }
+
+                                // 9. Action-Channel leeren (Zukunfts-Events verwerfen)
+                                if let Some(receiver) =
+                                    world.get_resource::<sentinel_ecs::ActionReceiver>()
+                                {
+                                    if let Ok(rx) = receiver.0.lock() {
+                                        let mut drained = 0u32;
+                                        while rx.try_recv().is_ok() {
+                                            drained += 1;
+                                        }
+                                        if drained > 0 {
+                                            info!(drained, "Action-Channel geleert (Zukunfts-Events verworfen)");
+                                        }
+                                    }
                                 }
 
                                 info!(
@@ -2088,6 +2104,7 @@ mod tests {
             mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
             mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
             mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+            crate::config::RetentionConfig::default(),
             String::new(),
             vec!["true".to_string()],
             crate::adaptive_tick::AdaptiveConfig::default(),
@@ -2150,6 +2167,7 @@ mod tests {
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+                crate::config::RetentionConfig::default(),
                 String::new(),
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
@@ -2229,6 +2247,7 @@ mod tests {
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+                crate::config::RetentionConfig::default(),
                 String::new(),
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
@@ -2316,6 +2335,7 @@ mod tests {
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+                crate::config::RetentionConfig::default(),
                 String::new(),
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
