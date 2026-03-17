@@ -740,6 +740,23 @@ impl EventStore {
     /// Loescht den Eintrag aus `projection_offsets`, sodass der naechste
     /// `get_offset()` Call `None` zurueckgibt. Umgeht die Monotonitaetspruefung
     /// von `update_offset()`.
+    /// Erzwingt einen Offset-Wert (umgeht Monotonie-Pruefung, fuer Restore).
+    pub fn force_reset_offset(&self, name: &str, offset: i64) -> anyhow::Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        conn.execute(
+            "INSERT OR REPLACE INTO projection_offsets (projection_name, last_event_id, updated_at) VALUES (?1, ?2, ?3)",
+            params![name, offset, now_ms],
+        )?;
+        Ok(())
+    }
+
     pub fn reset_offset(&self, name: &str) -> anyhow::Result<()> {
         let conn = self
             .conn
