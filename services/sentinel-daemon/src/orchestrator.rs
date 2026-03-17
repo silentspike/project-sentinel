@@ -755,7 +755,8 @@ fn ecs_tick_loop(
     // Adaptive Tick-Rate Controller (PSI-basiert, TOGAF Adaptive Scheduling)
     let mut adaptive_tick = AdaptiveTickRate::new(adaptive_config);
 
-    // Time Machine: SnapshotManager (erstellt World Snapshots alle hourly_interval_ticks)
+    // Time Machine: SnapshotManager
+    // TODO: RetentionConfig aus daemon.toml durchreichen (aktuell Defaults, identisch mit Config)
     let mut snapshot_manager =
         crate::snapshot::SnapshotManager::new(crate::config::RetentionConfig::default());
 
@@ -1598,6 +1599,17 @@ fn ecs_tick_loop(
                 .map(|rs| rs.store.clone());
 
             if let (Some(es), Some(ss)) = (event_store_for_restore, state_store_for_restore) {
+                // 0. Pre-Restore Snapshot (Rollback-Punkt)
+                match snapshot_manager.create_and_store(&mut world, &ss, &es, tick_count, sim_hour)
+                {
+                    Ok(id) => {
+                        info!(snapshot_id = %id, "Pre-Restore Snapshot erstellt (Rollback-Punkt)")
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Pre-Restore Snapshot fehlgeschlagen (Restore wird fortgesetzt)")
+                    }
+                }
+
                 // 1. Snapshot laden
                 match es.load_world_snapshot(&restore_cmd.snapshot_id) {
                     Ok(Some(bytes)) => {
@@ -1653,7 +1665,21 @@ fn ecs_tick_loop(
                                     sim_time.sim_hour = snapshot.sim_hour;
                                 }
 
-                                // 7. Projection Offsets zuruecksetzen
+                                // 7. Projection Rebuild: Tables clearen + Offsets zuruecksetzen
+                                //    Worker pollt get_events_since(offset) und rebuilt organisch.
+                                {
+                                    let conn = sentinel_limbo::rusqlite::Connection::open(
+                                        &evolution_db_path.replace("evolution.db", "projection.db"),
+                                    );
+                                    if let Ok(db) = conn {
+                                        let _ = db.execute_batch(
+                                            "DELETE FROM room_live_view; \
+                                             DELETE FROM agent_live_view; \
+                                             DELETE FROM kpi;",
+                                        );
+                                        info!("Projection Tables gecleart fuer Rebuild");
+                                    }
+                                }
                                 for (name, _) in &snapshot.projection_offsets {
                                     let _ = es.force_reset_offset(name, snapshot.last_event_id);
                                 }
