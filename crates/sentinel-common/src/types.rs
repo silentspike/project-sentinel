@@ -212,6 +212,8 @@ pub enum OperatorCommand {
     Chaos(OperatorChaosCommand),
     RoomStimulus(OperatorRoomStimulusCommand),
     Nightrun(OperatorNightrunCommand),
+    Snapshot(OperatorSnapshotCommand),
+    Restore(OperatorRestoreCommand),
 }
 
 // ──────────────────────────────────────────────
@@ -375,4 +377,113 @@ pub struct ChaosEvent {
     pub duration_minutes: Option<u32>,
     pub timestamp: Timestamp,
     pub tick: Tick,
+}
+
+// ──────────────────────────────────────────────
+// Time Machine: World Snapshots
+// ──────────────────────────────────────────────
+
+/// Granularitaets-Tier fuer World Snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotTier {
+    Hourly,
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl fmt::Display for SnapshotTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hourly => write!(f, "hourly"),
+            Self::Daily => write!(f, "daily"),
+            Self::Weekly => write!(f, "weekly"),
+            Self::Monthly => write!(f, "monthly"),
+        }
+    }
+}
+
+/// Metadaten eines World Snapshots (ohne Payload — fuer Listings).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotMeta {
+    pub id: String,
+    pub tier: SnapshotTier,
+    pub tick: u64,
+    pub sim_hour: f32,
+    pub last_event_id: i64,
+    pub payload_size_bytes: u64,
+    pub created_at_ms: i64,
+}
+
+/// Dump aller 11 redb-Tables (Key-Value Paare als Bytes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedbDump {
+    pub agent_states: Vec<(u16, Vec<u8>)>,
+    pub room_states: Vec<(u16, Vec<u8>)>,
+    pub personalities: Vec<(u16, Vec<u8>)>,
+    pub relationships: Vec<(u32, Vec<u8>)>,
+    pub voice_styles: Vec<(u16, Vec<u8>)>,
+    pub behavioral_notes: Vec<(u16, Vec<u8>)>,
+    pub narrative_summaries: Vec<(u16, Vec<u8>)>,
+    pub evolution_versions: Vec<(u16, u64)>,
+    pub nmda_scores: Vec<(u16, Vec<u8>)>,
+    pub agent_facts: Vec<(u16, Vec<u8>)>,
+    pub sim_meta: Vec<(String, Vec<u8>)>,
+}
+
+/// ECS World-State Snapshot (alle Components + Resources).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcsSnapshot {
+    pub positions: Vec<(u16, crate::components::Position)>,
+    pub bio_states: Vec<(u16, crate::components::BioState)>,
+    pub personalities: Vec<(u16, crate::components::Personality)>,
+    pub moods: Vec<(u16, crate::components::Mood)>,
+    pub perception_states: Vec<(u16, crate::components::PerceptionState)>,
+    pub work_contexts: Vec<(u16, crate::components::WorkContext)>,
+    pub agent_capabilities: Vec<(u16, crate::components::AgentCapabilities)>,
+    pub event_queues: Vec<(u16, crate::components::EventQueue)>,
+    pub identities: Vec<(u16, crate::components::AgentIdentity)>,
+    pub shift_infos: Vec<(u16, crate::components::ShiftInfo)>,
+    pub relationships: Vec<(u16, crate::components::Relationships)>,
+    pub llm_configs: Vec<(u16, crate::components::LlmConfig)>,
+    pub sim_tick: u64,
+    pub sim_hour: f32,
+    pub sim_delta_seconds: f32,
+    /// Serialisierte ephemere Resources (ActiveChaos, ActiveRoomStimuli)
+    /// als JSON-Bytes — vermeidet zirkulaere Dependency zu sentinel-ecs.
+    pub active_chaos_json: Vec<u8>,
+    pub active_stimuli_json: Vec<u8>,
+}
+
+/// Vollstaendiger World Snapshot (redb + ECS + Cursor).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldSnapshot {
+    pub snapshot_id: String,
+    pub schema_version: u32,
+    pub tick: u64,
+    pub sim_hour: f32,
+    pub timestamp_ms: u64,
+    pub tier: SnapshotTier,
+    pub last_event_id: i64,
+    pub redb: RedbDump,
+    pub ecs: EcsSnapshot,
+    pub projection_offsets: Vec<(String, i64)>,
+}
+
+impl WorldSnapshot {
+    /// Aktuelle Schema-Version fuer bincode Kompatibilitaet.
+    pub const SCHEMA_VERSION: u32 = 1;
+}
+
+/// Operator-Trigger fuer Point-in-Time Restore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRestoreCommand {
+    pub snapshot_id: String,
+}
+
+/// Operator-Trigger fuer manuellen Snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorSnapshotCommand {
+    pub tier: Option<SnapshotTier>,
 }

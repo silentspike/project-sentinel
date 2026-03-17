@@ -248,6 +248,64 @@ controlRoutes.post("/control/nightrun", async (c) => {
   }
 });
 
+// ── Time Machine: Snapshots + Restore ──
+
+controlRoutes.get("/control/snapshots", async (c) => {
+  try {
+    const resp = await fetch(`${getOperatorApiUrl()}/operator/snapshots`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) return c.json({ error: `Operator ${resp.status}` }, resp.status as any);
+    return c.json(await resp.json());
+  } catch (err) {
+    return c.json({ error: "Operator-API nicht erreichbar", detail: String(err) }, 502);
+  }
+});
+
+controlRoutes.post("/control/snapshot", async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    return await proxyJson(
+      getOperatorApiUrl(),
+      "POST",
+      "/operator/snapshot",
+      body,
+      getOperatorHeaders(),
+    );
+  } catch (err) {
+    return c.json({ error: "Operator-API nicht erreichbar", detail: String(err) }, 502);
+  }
+});
+
+controlRoutes.post("/control/restore", async (c) => {
+  try {
+    const body = await c.req.json();
+    return await proxyJson(
+      getOperatorApiUrl(),
+      "POST",
+      "/operator/restore",
+      body,
+      getOperatorHeaders(),
+    );
+  } catch (err) {
+    return c.json({ error: "Operator-API nicht erreichbar", detail: String(err) }, 502);
+  }
+});
+
+controlRoutes.post("/control/prune", async (c) => {
+  try {
+    return await proxyJson(
+      getOperatorApiUrl(),
+      "POST",
+      "/operator/prune",
+      {},
+      getOperatorHeaders(),
+    );
+  } catch (err) {
+    return c.json({ error: "Operator-API nicht erreichbar", detail: String(err) }, 502);
+  }
+});
+
 // ── GET /api/control/status — Aggregierter Status ──
 // Kombiniert Config + Cortex Health + Guardrails fuer das Frontend.
 
