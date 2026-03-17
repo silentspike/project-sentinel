@@ -14,6 +14,9 @@ pub mod outbox_publisher;
 pub use event_store::{EventStore, MonotonicityError, OutboxEntry, OutboxTransport, SnapshotRow};
 pub use outbox_publisher::{OutboxPublisher, OutboxPublisherConfig, PublishCycleStats};
 
+// Re-export rusqlite fuer Daemon-seitige DB-Zugriffe (evolution.db)
+pub use rusqlite;
+
 use rusqlite::{params, Connection};
 use sentinel_common::{AgentId, Emotion, EventType, RoomId, Tick, Timestamp};
 use std::sync::{Arc, Mutex};
