@@ -312,30 +312,32 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
             }
         }
         OPERATOR_PRUNE_PATH => {
-            info!("Manuelles Pruning via Operator-API angefordert");
+            info!("Manuelles Pruning via Operator-API angefordert — wird asynchron ausgefuehrt");
+            // Prune + VACUUM laeuft im Tick-Loop Thread (nicht im HTTP-Thread!)
+            // um den HTTP-Handler nicht zu blockieren (VACUUM auf GB-DBs dauert Minuten).
             let snapshots = state.event_store.list_world_snapshots().unwrap_or_default();
             if snapshots.len() < 2 {
                 return json_response(
                     200,
-                    serde_json::json!({"pruned": 0, "message": "Zu wenige Snapshots fuer Pruning"}),
+                    serde_json::json!({"accepted": false, "message": "Zu wenige Snapshots fuer Pruning"}),
                 );
             }
-            // Prune vor zweitaeltestem Snapshot (1h Puffer)
             let prune_point = snapshots[snapshots.len() - 2].last_event_id;
-            match state.event_store.prune_events_before(prune_point) {
+            let es = Arc::clone(&state.event_store);
+            std::thread::spawn(move || match es.prune_events_before(prune_point) {
                 Ok(deleted) => {
-                    let _ = state.event_store.vacuum();
-                    info!(deleted, "Pruning + VACUUM abgeschlossen");
-                    json_response(
-                        200,
-                        serde_json::json!({"pruned": deleted, "vacuumed": true}),
-                    )
+                    info!(deleted, "Pruning abgeschlossen, starte VACUUM");
+                    match es.vacuum() {
+                        Ok(()) => info!("VACUUM abgeschlossen"),
+                        Err(e) => warn!(error = %e, "VACUUM fehlgeschlagen"),
+                    }
                 }
-                Err(e) => json_response(
-                    409,
-                    serde_json::json!({"error": format!("{e}"), "pruned": 0}),
-                ),
-            }
+                Err(e) => warn!(error = %e, "Pruning fehlgeschlagen"),
+            });
+            json_response(
+                202,
+                serde_json::json!({"accepted": true, "message": "Pruning + VACUUM gestartet (asynchron)"}),
+            )
         }
         _ => ApiError::NotFound("Endpoint unbekannt").to_response(),
     }
