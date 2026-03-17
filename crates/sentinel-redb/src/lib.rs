@@ -514,6 +514,177 @@ impl StateStore {
         }
         Ok(())
     }
+
+    /// Dumpt alle 11 Tables in einer Read-Transaktion.
+    pub fn dump_all_tables(&self) -> anyhow::Result<sentinel_common::RedbDump> {
+        let txn = self.db.begin_read()?;
+        Ok(sentinel_common::RedbDump {
+            agent_states: Self::dump_u16_bytes(&txn, AGENT_STATE)?,
+            room_states: Self::dump_u16_bytes(&txn, ROOM_STATE)?,
+            personalities: Self::dump_u16_bytes(&txn, PERSONALITY)?,
+            relationships: Self::dump_u32_bytes(&txn, RELATIONSHIPS)?,
+            voice_styles: Self::dump_u16_bytes(&txn, VOICE_STYLE)?,
+            behavioral_notes: Self::dump_u16_bytes(&txn, BEHAVIORAL_NOTES)?,
+            narrative_summaries: Self::dump_u16_bytes(&txn, NARRATIVE_SUMMARY)?,
+            evolution_versions: Self::dump_u16_u64(&txn, EVOLUTION_VERSION)?,
+            nmda_scores: Self::dump_u16_bytes(&txn, NMDA_SCORES)?,
+            agent_facts: Self::dump_u16_bytes(&txn, AGENT_FACTS)?,
+            sim_meta: Self::dump_str_bytes(&txn, SIM_META)?,
+        })
+    }
+
+    /// Restored alle 11 Tables aus einem Dump in einer atomaren Write-Transaktion.
+    pub fn restore_all_tables(&self, dump: &sentinel_common::RedbDump) -> anyhow::Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            Self::restore_u16_bytes(&txn, AGENT_STATE, &dump.agent_states)?;
+            Self::restore_u16_bytes(&txn, ROOM_STATE, &dump.room_states)?;
+            Self::restore_u16_bytes(&txn, PERSONALITY, &dump.personalities)?;
+            Self::restore_u32_bytes(&txn, RELATIONSHIPS, &dump.relationships)?;
+            Self::restore_u16_bytes(&txn, VOICE_STYLE, &dump.voice_styles)?;
+            Self::restore_u16_bytes(&txn, BEHAVIORAL_NOTES, &dump.behavioral_notes)?;
+            Self::restore_u16_bytes(&txn, NARRATIVE_SUMMARY, &dump.narrative_summaries)?;
+            Self::restore_u16_u64(&txn, EVOLUTION_VERSION, &dump.evolution_versions)?;
+            Self::restore_u16_bytes(&txn, NMDA_SCORES, &dump.nmda_scores)?;
+            Self::restore_u16_bytes(&txn, AGENT_FACTS, &dump.agent_facts)?;
+            Self::restore_str_bytes(&txn, SIM_META, &dump.sim_meta)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    // ── Dump Helpers ──
+
+    fn dump_u16_bytes(
+        txn: &redb::ReadTransaction,
+        table_def: TableDefinition<u16, &[u8]>,
+    ) -> anyhow::Result<Vec<(u16, Vec<u8>)>> {
+        let table = txn.open_table(table_def)?;
+        let mut entries = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            entries.push((k.value(), v.value().to_vec()));
+        }
+        Ok(entries)
+    }
+
+    fn dump_u32_bytes(
+        txn: &redb::ReadTransaction,
+        table_def: TableDefinition<u32, &[u8]>,
+    ) -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
+        let table = txn.open_table(table_def)?;
+        let mut entries = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            entries.push((k.value(), v.value().to_vec()));
+        }
+        Ok(entries)
+    }
+
+    fn dump_u16_u64(
+        txn: &redb::ReadTransaction,
+        table_def: TableDefinition<u16, u64>,
+    ) -> anyhow::Result<Vec<(u16, u64)>> {
+        let table = txn.open_table(table_def)?;
+        let mut entries = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            entries.push((k.value(), v.value()));
+        }
+        Ok(entries)
+    }
+
+    fn dump_str_bytes(
+        txn: &redb::ReadTransaction,
+        table_def: TableDefinition<&str, &[u8]>,
+    ) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+        let table = txn.open_table(table_def)?;
+        let mut entries = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            entries.push((k.value().to_string(), v.value().to_vec()));
+        }
+        Ok(entries)
+    }
+
+    // ── Restore Helpers ──
+
+    fn restore_u16_bytes(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<u16, &[u8]>,
+        entries: &[(u16, Vec<u8>)],
+    ) -> anyhow::Result<()> {
+        let mut table = txn.open_table(table_def)?;
+        // Clear existing entries
+        let keys: Vec<u16> = table
+            .iter()?
+            .filter_map(|e| e.ok().map(|(k, _)| k.value()))
+            .collect();
+        for key in keys {
+            table.remove(key)?;
+        }
+        for (key, value) in entries {
+            table.insert(*key, value.as_slice())?;
+        }
+        Ok(())
+    }
+
+    fn restore_u32_bytes(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<u32, &[u8]>,
+        entries: &[(u32, Vec<u8>)],
+    ) -> anyhow::Result<()> {
+        let mut table = txn.open_table(table_def)?;
+        let keys: Vec<u32> = table
+            .iter()?
+            .filter_map(|e| e.ok().map(|(k, _)| k.value()))
+            .collect();
+        for key in keys {
+            table.remove(key)?;
+        }
+        for (key, value) in entries {
+            table.insert(*key, value.as_slice())?;
+        }
+        Ok(())
+    }
+
+    fn restore_u16_u64(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<u16, u64>,
+        entries: &[(u16, u64)],
+    ) -> anyhow::Result<()> {
+        let mut table = txn.open_table(table_def)?;
+        let keys: Vec<u16> = table
+            .iter()?
+            .filter_map(|e| e.ok().map(|(k, _)| k.value()))
+            .collect();
+        for key in keys {
+            table.remove(key)?;
+        }
+        for (key, value) in entries {
+            table.insert(*key, *value)?;
+        }
+        Ok(())
+    }
+
+    fn restore_str_bytes(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<&str, &[u8]>,
+        entries: &[(String, Vec<u8>)],
+    ) -> anyhow::Result<()> {
+        let mut table = txn.open_table(table_def)?;
+        let keys: Vec<String> = table
+            .iter()?
+            .filter_map(|e| e.ok().map(|(k, _)| k.value().to_string()))
+            .collect();
+        for key in &keys {
+            table.remove(key.as_str())?;
+        }
+        for (key, value) in entries {
+            table.insert(key.as_str(), value.as_slice())?;
+        }
+        Ok(())
+    }
 }
 
 /// Build a canonical relationship key from two AgentIds.
