@@ -31,6 +31,13 @@ func NewDriftDetector() *DriftDetector {
 	}
 }
 
+// Reset clears all accumulated state (called after snapshot restore).
+// Profiles are kept — only runtime state is reset.
+func (d *DriftDetector) Reset() {
+	// DriftDetector is stateless between calls (no message history stored).
+	// Reset is a no-op but provided for forward compatibility.
+}
+
 // CheckDrift compares recent messages against the agent's personality profile.
 // Returns DriftResult with score and severity.
 func (d *DriftDetector) CheckDrift(agentName string, recentMessages []string) DriftResult {

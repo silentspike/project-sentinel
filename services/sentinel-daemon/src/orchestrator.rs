@@ -1709,7 +1709,10 @@ fn ecs_tick_loop(
                                     schema_version: 1,
                                     compensation_type: "none".to_string(),
                                 };
-                                if let Err(e) = es.append_event(&restore_event) {
+                                // append_with_outbox: Bridge pollt Outbox → NATS → Judge
+                                if let Err(e) =
+                                    es.append_with_outbox(&restore_event, "sentinel.events")
+                                {
                                     warn!(error = %e, "SnapshotRestored Event schreiben fehlgeschlagen");
                                 }
 
