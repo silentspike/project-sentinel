@@ -1,8 +1,0 @@
-./config.go
-./handler.go
-./metrics.go
-./report.go
-./run.go
-./sqlite_store.go
-./storage.go
-./store_iface.go
