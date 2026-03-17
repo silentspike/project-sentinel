@@ -24,6 +24,9 @@ use crate::config::OperatorApiConfig;
 const OPERATOR_CHAOS_PATH: &str = "/operator/chaos";
 const OPERATOR_STIMULUS_PATH: &str = "/operator/stimulus";
 const OPERATOR_NIGHTRUN_PATH: &str = "/operator/nightrun";
+const OPERATOR_SNAPSHOTS_PATH: &str = "/operator/snapshots";
+const OPERATOR_SNAPSHOT_PATH: &str = "/operator/snapshot";
+const OPERATOR_RESTORE_PATH: &str = "/operator/restore";
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024;
 const OPERATOR_KEY_HEADER: &str = "x-sentinel-operator-key";
@@ -88,6 +91,9 @@ struct AppState {
     shared_secret: Option<String>,
     command_tx: mpsc::Sender<OperatorCommand>,
     nightrun_tx: mpsc::Sender<OperatorNightrunCommand>,
+    snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
+    restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
+    event_store: Arc<sentinel_limbo::EventStore>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -152,6 +158,9 @@ pub async fn start_server(
     allowed_rooms: Vec<String>,
     command_tx: mpsc::Sender<OperatorCommand>,
     nightrun_tx: mpsc::Sender<OperatorNightrunCommand>,
+    snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
+    restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
+    event_store: Arc<sentinel_limbo::EventStore>,
 ) -> AnyResult<tokio::task::JoinHandle<()>> {
     let listener = TcpListener::bind(&config.bind_addr)
         .await
@@ -162,6 +171,9 @@ pub async fn start_server(
         shared_secret: config.shared_secret,
         command_tx,
         nightrun_tx,
+        snapshot_tx,
+        restore_tx,
+        event_store,
     };
 
     info!(
@@ -199,6 +211,18 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> AnyResult<
 }
 
 fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
+    // GET-Endpoints ohne Auth (read-only)
+    if request.method == "GET" {
+        return match request.path.as_str() {
+            OPERATOR_SNAPSHOTS_PATH => match state.event_store.list_world_snapshots() {
+                Ok(snapshots) => json_response(200, snapshots),
+                Err(_e) => {
+                    ApiError::ServiceUnavailable("Snapshot-Liste nicht verfuegbar").to_response()
+                }
+            },
+            _ => ApiError::NotFound("Endpoint unbekannt").to_response(),
+        };
+    }
     if request.method != "POST" {
         return ApiError::MethodNotAllowed.to_response();
     }
@@ -243,6 +267,47 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
             match dispatch_nightrun_trigger(payload, state) {
                 Ok(response) => json_response(202, response),
                 Err(err) => err.to_response(),
+            }
+        }
+        OPERATOR_SNAPSHOT_PATH => {
+            let payload: sentinel_common::OperatorSnapshotCommand =
+                serde_json::from_slice(&request.body)
+                    .unwrap_or(sentinel_common::OperatorSnapshotCommand { tier: None });
+            info!("Manueller Snapshot via Operator-API angefordert");
+            match state.snapshot_tx.send(payload) {
+                Ok(()) => json_response(
+                    202,
+                    TriggerNightrunResponse {
+                        accepted: true,
+                        message: "Snapshot-Erstellung gestartet".to_string(),
+                    },
+                ),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Snapshot-Channel nicht verfuegbar").to_response()
+                }
+            }
+        }
+        OPERATOR_RESTORE_PATH => {
+            let payload: sentinel_common::OperatorRestoreCommand =
+                match serde_json::from_slice(&request.body) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return ApiError::BadRequest("Request-JSON ungueltig (snapshot_id fehlt)")
+                            .to_response();
+                    }
+                };
+            info!(snapshot_id = %payload.snapshot_id, "Restore via Operator-API angefordert");
+            match state.restore_tx.send(payload) {
+                Ok(()) => json_response(
+                    202,
+                    TriggerNightrunResponse {
+                        accepted: true,
+                        message: "Restore gestartet".to_string(),
+                    },
+                ),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Restore-Channel nicht verfuegbar").to_response()
+                }
             }
         }
         _ => ApiError::NotFound("Endpoint unbekannt").to_response(),
@@ -531,6 +596,12 @@ mod tests {
             shared_secret: secret.map(str::to_string),
             command_tx: tx,
             nightrun_tx,
+            snapshot_tx: mpsc::channel().0,
+            restore_tx: mpsc::channel().0,
+            event_store: Arc::new(
+                sentinel_limbo::EventStore::open(":memory:")
+                    .expect("in-memory EventStore fuer Tests"),
+            ),
         };
         (state, rx)
     }
