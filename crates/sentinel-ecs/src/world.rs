@@ -803,6 +803,14 @@ pub fn snapshot_ecs_state(world: &mut World) -> sentinel_common::EcsSnapshot {
         sim_tick: sim_time.map(|t| t.tick.0).unwrap_or(0),
         sim_hour: sim_time.map(|t| t.sim_hour).unwrap_or(0.0),
         sim_delta_seconds: sim_time.map(|t| t.delta_seconds).unwrap_or(1.0),
+        active_chaos_json: world
+            .get_resource::<ActiveChaos>()
+            .and_then(|c| serde_json::to_vec(c).ok())
+            .unwrap_or_default(),
+        active_stimuli_json: world
+            .get_resource::<ActiveRoomStimuli>()
+            .and_then(|s| serde_json::to_vec(s).ok())
+            .unwrap_or_default(),
     }
 }
 
@@ -952,5 +960,19 @@ pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnaps
         sim_time.tick_count = snapshot.sim_tick;
         sim_time.sim_hour = snapshot.sim_hour;
         sim_time.delta_seconds = snapshot.sim_delta_seconds;
+    }
+
+    // 4. Ephemere Resources restoren (ActiveChaos, ActiveRoomStimuli)
+    if !snapshot.active_chaos_json.is_empty() {
+        if let Ok(chaos) = serde_json::from_slice::<ActiveChaos>(&snapshot.active_chaos_json) {
+            world.insert_resource(chaos);
+        }
+    }
+    if !snapshot.active_stimuli_json.is_empty() {
+        if let Ok(stimuli) =
+            serde_json::from_slice::<ActiveRoomStimuli>(&snapshot.active_stimuli_json)
+        {
+            world.insert_resource(stimuli);
+        }
     }
 }
