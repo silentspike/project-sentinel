@@ -98,3 +98,4 @@ docs/
 deploy/release-manifest.json
 cortex-gateway-linux
 .cache/ >> .gitignore
+.cache/
