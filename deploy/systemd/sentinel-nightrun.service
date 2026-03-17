@@ -7,9 +7,11 @@ Wants=sentinel-nightrun.timer
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/sentinel
-ExecStart=/opt/sentinel/bin/sentinel-nightrun --config /opt/sentinel/config/nightrun.toml
-TimeoutStartSec=7200
-MemoryMax=2G
+# Trigger Nightrun via Daemon Operator-API (vermeidet redb Lock-Konflikt).
+# Der Daemon fuehrt die Konsolidierung mit seinem bestehenden DB-Handle aus.
+ExecStart=/usr/bin/curl -sf -X POST http://127.0.0.1:8084/operator/nightrun -H "Content-Type: application/json" -d "{}"
+TimeoutStartSec=60
+MemoryMax=64M
 
 # Logging
 StandardOutput=journal

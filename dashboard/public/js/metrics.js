@@ -67,11 +67,16 @@ function formatNumber(n) {
   return String(n);
 }
 
-function fetchEbpfStatus(badge) {
+function fetchEbpfStatus(badge, retries) {
+  retries = retries || 0;
   fetch('/api/ebpf/metrics')
     .then(function(r) { return r.json(); })
     .then(function(data) {
       if (!data.available) {
+        if (retries < 3) {
+          setTimeout(function() { fetchEbpfStatus(badge, retries + 1); }, 2000);
+          return;
+        }
         badge.className = 'ebpf-badge unavailable';
         badge.textContent = 'eBPF: N/A';
         return;
@@ -83,6 +88,10 @@ function fetchEbpfStatus(badge) {
       renderEbpfCards(badge.parentElement, data);
     })
     .catch(function() {
+      if (retries < 3) {
+        setTimeout(function() { fetchEbpfStatus(badge, retries + 1); }, 2000);
+        return;
+      }
       badge.className = 'ebpf-badge unavailable';
       badge.textContent = 'eBPF: N/A';
     });

@@ -15,13 +15,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 use sentinel_common::{
-    EventType, OperatorChaosCommand, OperatorCommand, OperatorRoomStimulusCommand, RoomStimulusType,
+    EventType, OperatorChaosCommand, OperatorCommand, OperatorNightrunCommand,
+    OperatorRoomStimulusCommand, RoomStimulusType,
 };
 
 use crate::config::OperatorApiConfig;
 
 const OPERATOR_CHAOS_PATH: &str = "/operator/chaos";
 const OPERATOR_STIMULUS_PATH: &str = "/operator/stimulus";
+const OPERATOR_NIGHTRUN_PATH: &str = "/operator/nightrun";
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024;
 const OPERATOR_KEY_HEADER: &str = "x-sentinel-operator-key";
@@ -64,11 +66,28 @@ pub struct TriggerStimulusResponse {
     pub delta: f32,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct TriggerNightrunRequest {
+    /// Optionale Schicht-Nummer (1-3). None = letzte abgelaufene Schicht.
+    #[serde(default)]
+    pub shift_set: Option<u8>,
+    /// Nur simulieren, nicht persistieren.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TriggerNightrunResponse {
+    pub accepted: bool,
+    pub message: String,
+}
+
 #[derive(Clone)]
 struct AppState {
     allowed_rooms: Arc<HashSet<String>>,
     shared_secret: Option<String>,
     command_tx: mpsc::Sender<OperatorCommand>,
+    nightrun_tx: mpsc::Sender<OperatorNightrunCommand>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -132,6 +151,7 @@ pub async fn start_server(
     config: OperatorApiConfig,
     allowed_rooms: Vec<String>,
     command_tx: mpsc::Sender<OperatorCommand>,
+    nightrun_tx: mpsc::Sender<OperatorNightrunCommand>,
 ) -> AnyResult<tokio::task::JoinHandle<()>> {
     let listener = TcpListener::bind(&config.bind_addr)
         .await
@@ -141,6 +161,7 @@ pub async fn start_server(
         allowed_rooms: Arc::new(allowed_rooms.into_iter().collect()),
         shared_secret: config.shared_secret,
         command_tx,
+        nightrun_tx,
     };
 
     info!(
@@ -208,6 +229,18 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
             };
 
             match dispatch_stimulus_trigger(payload, state) {
+                Ok(response) => json_response(202, response),
+                Err(err) => err.to_response(),
+            }
+        }
+        OPERATOR_NIGHTRUN_PATH => {
+            let payload: TriggerNightrunRequest =
+                serde_json::from_slice(&request.body).unwrap_or(TriggerNightrunRequest {
+                    shift_set: None,
+                    dry_run: false,
+                });
+
+            match dispatch_nightrun_trigger(payload, state) {
                 Ok(response) => json_response(202, response),
                 Err(err) => err.to_response(),
             }
@@ -311,6 +344,38 @@ fn dispatch_stimulus_trigger(
         room_id: room_id.to_string(),
         stimulus_type: payload.stimulus_type,
         delta: payload.delta,
+    })
+}
+
+fn dispatch_nightrun_trigger(
+    payload: TriggerNightrunRequest,
+    state: &AppState,
+) -> std::result::Result<TriggerNightrunResponse, ApiError> {
+    if let Some(shift) = payload.shift_set {
+        if !(1..=3).contains(&shift) {
+            return Err(ApiError::BadRequest("shift_set muss 1, 2 oder 3 sein"));
+        }
+    }
+
+    let command = OperatorNightrunCommand {
+        shift_set: payload.shift_set,
+        dry_run: payload.dry_run,
+    };
+
+    info!(
+        shift_set = ?command.shift_set,
+        dry_run = command.dry_run,
+        "Nightrun-Trigger via Operator-API empfangen"
+    );
+
+    state
+        .nightrun_tx
+        .send(command)
+        .map_err(|_| ApiError::ServiceUnavailable("Nightrun-Channel nicht verfuegbar"))?;
+
+    Ok(TriggerNightrunResponse {
+        accepted: true,
+        message: "Nightrun-Konsolidierung gestartet".to_string(),
     })
 }
 
@@ -456,6 +521,7 @@ mod tests {
 
     fn test_state(secret: Option<&str>) -> (AppState, mpsc::Receiver<OperatorCommand>) {
         let (tx, rx) = mpsc::channel();
+        let (nightrun_tx, _nightrun_rx) = mpsc::channel();
         let state = AppState {
             allowed_rooms: Arc::new(
                 ["empfang".to_string(), "flur_eg".to_string()]
@@ -464,6 +530,7 @@ mod tests {
             ),
             shared_secret: secret.map(str::to_string),
             command_tx: tx,
+            nightrun_tx,
         };
         (state, rx)
     }

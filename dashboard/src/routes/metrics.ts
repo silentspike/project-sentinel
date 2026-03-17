@@ -89,7 +89,7 @@ metricRoutes.get("/ebpf/status", async (c) => {
 metricRoutes.get("/ebpf/metrics", async (c) => {
   try {
     const resp = await fetch("http://localhost:9090/metrics", {
-      signal: AbortSignal.timeout(2000),
+      signal: AbortSignal.timeout(5000),
     });
     if (!resp.ok) {
       return c.json({ available: false, mode: "unavailable" });
@@ -100,8 +100,8 @@ metricRoutes.get("/ebpf/metrics", async (c) => {
     const modeMatch = text.match(/sentinel_ebpf_monitoring_mode\{mode="(\w+)"\}\s+1/);
     const mode = modeMatch ? modeMatch[1] : "unknown";
 
-    // Parse stalled count
-    const stalledMatch = text.match(/sentinel_agent_stalled_total\s+(\d+)/);
+    // Parse stalled count (handle optional labels)
+    const stalledMatch = text.match(/sentinel_agent_stalled_total(?:\{[^}]*\})?\s+(\d+)/);
     const stalledCount = stalledMatch ? parseInt(stalledMatch[1], 10) : 0;
 
     // Parse stalled agent names
@@ -118,11 +118,11 @@ metricRoutes.get("/ebpf/metrics", async (c) => {
     }
 
     // Parse collection cycle
-    const cycleMatch = text.match(/sentinel_ebpf_collector_cycle_microseconds\s+(\d+)/);
+    const cycleMatch = text.match(/sentinel_ebpf_collector_cycle_microseconds(?:\{[^}]*\})?\s+(\d+)/);
     const cycleUs = cycleMatch ? parseInt(cycleMatch[1], 10) : 0;
 
     // Parse ring buffer drops
-    const dropsMatch = text.match(/sentinel_ebpf_ring_buffer_drops_total\s+(\d+)/);
+    const dropsMatch = text.match(/sentinel_ebpf_ring_buffer_drops_total(?:\{[^}]*\})?\s+(\d+)/);
     const drops = dropsMatch ? parseInt(dropsMatch[1], 10) : 0;
 
     // Parse I/O totals (sum across all cgroups)

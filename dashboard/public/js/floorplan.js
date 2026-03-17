@@ -279,16 +279,30 @@ async function submitStimulusTrigger(event) {
 
 function getPerceptionHints(detail) {
   const hints = [];
+  // Temperatur — Agents reagieren ab leichter Abweichung
   if (detail.temperature != null) {
-    if (detail.temperature > 24) hints.push('Prompt-Hinweis: Es ist warm');
-    else if (detail.temperature < 19) hints.push('Prompt-Hinweis: Es ist kuehl');
+    if (detail.temperature > 25) hints.push('Agents spueren deutliche Waerme (' + detail.temperature.toFixed(1) + ' °C)');
+    else if (detail.temperature > 22.5) hints.push('Agents spueren leichte Waerme (' + detail.temperature.toFixed(1) + ' °C)');
+    else if (detail.temperature < 19) hints.push('Agents frieren leicht (' + detail.temperature.toFixed(1) + ' °C)');
   }
-  if (detail.co2_ppm != null && detail.co2_ppm > 1000) {
-    hints.push('Prompt-Hinweis: Die Luft ist stickig');
+  // CO2 — ab 600 ppm spuerbar
+  if (detail.co2_ppm != null) {
+    if (detail.co2_ppm > 1000) hints.push('Agents bemerken stickige Luft (' + Math.round(detail.co2_ppm) + ' ppm)');
+    else if (detail.co2_ppm > 600) hints.push('Agents spueren leicht verbrauchte Luft (' + Math.round(detail.co2_ppm) + ' ppm)');
   }
+  // Laerm — ab 40 dB wahrnehmbar
   if (detail.noise_db != null) {
-    if (detail.noise_db > 65) hints.push('Prompt-Hinweis: Es ist laut');
-    else if (detail.noise_db > 50) hints.push('Prompt-Hinweis: Lebhafte Unterhaltungen');
+    if (detail.noise_db > 65) hints.push('Agents empfinden den Raum als laut (' + Math.round(detail.noise_db) + ' dB)');
+    else if (detail.noise_db > 50) hints.push('Agents hoeren lebhafte Unterhaltungen (' + Math.round(detail.noise_db) + ' dB)');
+    else if (detail.noise_db > 40) hints.push('Agents nehmen Hintergrundgeraeusche wahr (' + Math.round(detail.noise_db) + ' dB)');
+  }
+  // Belegung — Gedraenge ab 4 Personen
+  if (detail.occupant_count != null && detail.occupant_count > 3) {
+    hints.push('Agents nehmen belebten Raum wahr (' + detail.occupant_count + ' Personen)');
+  }
+  // Chaos — aktive Events beeinflussen Wahrnehmung
+  if (detail.active_chaos) {
+    hints.push('Aktives Chaos beeinflusst Umgebung: ' + (detail.active_chaos.description || detail.active_chaos.type || 'unbekannt'));
   }
   return hints;
 }
@@ -418,8 +432,12 @@ function renderDetailSnapshot(detail) {
     }
     perception.appendChild(list);
   } else {
+    const summary = (detail.temperature != null ? detail.temperature.toFixed(1) + ' °C' : '') +
+      (detail.co2_ppm != null ? ' | ' + Math.round(detail.co2_ppm) + ' ppm' : '') +
+      (detail.noise_db != null ? ' | ' + Math.round(detail.noise_db) + ' dB' : '') +
+      (detail.occupant_count != null ? ' — ' + detail.occupant_count + ' Personen' : '');
     perception.appendChild(
-      createEl('div', 'room-detail-empty', 'Aktuell keine auffaelligen Umweltreize im Prompt'),
+      createEl('div', 'room-detail-empty', 'Umgebung normal: ' + summary),
     );
   }
   section.appendChild(perception);
@@ -517,13 +535,22 @@ function renderStimulusSection(detail) {
   section.appendChild(createEl('h3', 'room-detail-heading', 'Raumreiz testen'));
 
   if (!getApiKey()) {
-    section.appendChild(
-      createEl(
-        'div',
-        'room-detail-note',
-        'Schreibzugriff nicht aktiviert. Raumreize und Chaos lassen sich erst nach Operator-Anmeldung ausloesen.',
-      ),
+    const authBox = createEl('div', 'room-detail-auth');
+    authBox.appendChild(
+      createEl('div', 'room-detail-note', 'API-Key eingeben um Raumreize auszuloesen:'),
     );
+    const keyInput = document.createElement('input');
+    keyInput.type = 'password';
+    keyInput.className = 'room-trigger-input';
+    keyInput.placeholder = 'Operator API-Key';
+    keyInput.addEventListener('change', () => {
+      if (keyInput.value.trim()) {
+        sessionStorage.setItem('sentinel_api_key', keyInput.value.trim());
+        renderFloorplan(latestRooms);
+      }
+    });
+    authBox.appendChild(keyInput);
+    section.appendChild(authBox);
   }
 
   section.appendChild(
@@ -603,7 +630,7 @@ function renderStimulusSection(detail) {
     stimulusTriggerState.pending ? 'Reiz laeuft...' : 'Raumreiz ausloesen',
   );
   submit.type = 'submit';
-  submit.disabled = stimulusTriggerState.pending;
+  submit.disabled = stimulusTriggerState.pending || !getApiKey();
   form.appendChild(submit);
 
   if (stimulusTriggerState.message) {
@@ -625,12 +652,22 @@ function renderChaosTriggerSection() {
   section.appendChild(createEl('h3', 'room-detail-heading', 'Chaos triggern'));
 
   if (!getApiKey()) {
-    const note = createEl(
-      'div',
-      'room-detail-note',
-      'Schreibzugriff nicht aktiviert. Raumreize und Chaos lassen sich erst nach Operator-Anmeldung ausloesen.',
+    const authBox = createEl('div', 'room-detail-auth');
+    authBox.appendChild(
+      createEl('div', 'room-detail-note', 'API-Key eingeben um Chaos zu triggern:'),
     );
-    section.appendChild(note);
+    const keyInput = document.createElement('input');
+    keyInput.type = 'password';
+    keyInput.className = 'room-trigger-input';
+    keyInput.placeholder = 'Operator API-Key';
+    keyInput.addEventListener('change', () => {
+      if (keyInput.value.trim()) {
+        sessionStorage.setItem('sentinel_api_key', keyInput.value.trim());
+        renderFloorplan(latestRooms);
+      }
+    });
+    authBox.appendChild(keyInput);
+    section.appendChild(authBox);
   }
 
   const form = createEl('form', 'room-trigger-form');
@@ -678,7 +715,7 @@ function renderChaosTriggerSection() {
     chaosTriggerState.pending ? 'Trigger laeuft...' : 'Chaos ausloesen',
   );
   submit.type = 'submit';
-  submit.disabled = chaosTriggerState.pending;
+  submit.disabled = chaosTriggerState.pending || !getApiKey();
   form.appendChild(submit);
 
   if (chaosTriggerState.message) {

@@ -366,6 +366,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // -- Channels fuer ECS <-> Async Bridge --
     let (action_tx, action_rx) = mpsc::channel();
     let (operator_tx, operator_rx) = mpsc::channel::<OperatorCommand>();
+    let (nightrun_tx, nightrun_rx) = mpsc::channel::<sentinel_common::OperatorNightrunCommand>();
     let (perception_tx, perception_rx) = mpsc::sync_channel::<Perception>(64);
 
     // -- Zenoh SentinelBus (Core-Bus fuer Real-Time Event-Verteilung) --
@@ -436,6 +437,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 config.operator_api.clone(),
                 operator_room_ids,
                 operator_tx.clone(),
+                nightrun_tx.clone(),
             )
             .await?,
         )
@@ -456,6 +458,11 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let alert_event_store = Arc::clone(&event_store);
 
     // -- ECS Tick Loop (dedizierter Thread, bevy_ecs World ist Send+Sync) --
+    let evolution_db_path_clone = data_dir
+        .join("evolution.db")
+        .to_str()
+        .unwrap_or("data/evolution.db")
+        .to_string();
     let ecs_state_store = Arc::clone(&state_store);
     let ecs_handle = std::thread::Builder::new()
         .name("ecs-tick-loop".into())
@@ -477,6 +484,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 ebpf_collector,
                 ebpf_tx,
                 episode_producer,
+                nightrun_rx,
+                evolution_db_path_clone,
                 agent_command_cfg,
                 adaptive_config,
                 room_distances,
@@ -727,6 +736,8 @@ fn ecs_tick_loop(
     mut ebpf_collector: EbpfCollector,
     ebpf_tx: tokio::sync::mpsc::Sender<MetricsSnapshot>,
     mut episode_producer: EpisodeProducer,
+    nightrun_rx: mpsc::Receiver<sentinel_common::OperatorNightrunCommand>,
+    evolution_db_path: String,
     agent_command_cfg: Vec<String>,
     adaptive_config: crate::adaptive_tick::AdaptiveConfig,
     room_distances: sentinel_ecs::RoomDistanceMap,
@@ -1417,6 +1428,107 @@ fn ecs_tick_loop(
             }
         }
 
+        // Nightrun-Trigger verarbeiten (via Operator-API)
+        while let Ok(nightrun_cmd) = nightrun_rx.try_recv() {
+            info!(
+                shift_set = ?nightrun_cmd.shift_set,
+                dry_run = nightrun_cmd.dry_run,
+                "Nightrun-Trigger empfangen, starte Konsolidierung"
+            );
+            let target_agents: Vec<_> = all_agents
+                .iter()
+                .filter(|a| {
+                    let set = a.identity.shift_set;
+                    if set == 0 {
+                        return false; // Sonder-Set nie konsolidieren
+                    }
+                    nightrun_cmd.shift_set.is_none_or(|s| set == s)
+                })
+                .collect();
+            let mut consolidated_total = 0u32;
+            let mut evolution_entries: Vec<(String, u32)> = Vec::new();
+            for agent_cfg in &target_agents {
+                let name = &agent_cfg.identity.name;
+                if nightrun_cmd.dry_run {
+                    info!(agent = %name, "Nightrun dry-run: wuerde konsolidieren");
+                    continue;
+                }
+                match episode_producer.hippocampus().consolidate_agent(name) {
+                    Ok(result) if result.episodes_processed > 0 => {
+                        consolidated_total += result.episodes_processed as u32;
+                        evolution_entries
+                            .push((name.to_string(), result.episodes_processed as u32));
+                        info!(
+                            agent = %name,
+                            episodes = result.episodes_processed,
+                            "Nightrun: Agent konsolidiert"
+                        );
+                    }
+                    Ok(_) => {} // Keine Episodes = nichts zu tun
+                    Err(e) => {
+                        warn!(agent = %name, error = %e, "Nightrun-Konsolidierung fehlgeschlagen");
+                    }
+                }
+            }
+
+            // personality_evolution Eintraege fuer konsolidierte Agents schreiben
+            if !evolution_entries.is_empty() && !nightrun_cmd.dry_run {
+                match sentinel_limbo::rusqlite::Connection::open(&evolution_db_path) {
+                    Ok(evo_db) => {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64;
+                        let mut written = 0u32;
+                        for (agent_name, episodes) in &evolution_entries {
+                            let agent_id = format!(
+                                "AGENT-{:02}",
+                                all_agents
+                                    .iter()
+                                    .find(|a| &a.identity.name == agent_name)
+                                    .map(|a| a.identity.id)
+                                    .unwrap_or(0)
+                            );
+                            if evo_db.execute(
+                                "INSERT INTO personality_evolution \
+                                 (agent_id, tick, field, change_type, old_value, new_value, reason, nmda_score, source, created_at_ms) \
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                sentinel_limbo::rusqlite::params![
+                                    agent_id,
+                                    tick_count as i64,
+                                    "memory_consolidation",
+                                    "night_run",
+                                    "",
+                                    format!("{episodes} episodes consolidated"),
+                                    format!("Nightrun-Konsolidierung: {episodes} Episoden verarbeitet"),
+                                    0.0_f64,
+                                    "night_run",
+                                    now_ms,
+                                ],
+                            ).is_ok() {
+                                written += 1;
+                            }
+                        }
+                        info!(
+                            written,
+                            total = evolution_entries.len(),
+                            "personality_evolution: night_run Eintraege geschrieben"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "evolution.db nicht oeffenbar — Eintraege uebersprungen");
+                    }
+                }
+            }
+
+            info!(
+                agents = target_agents.len(),
+                consolidated = consolidated_total,
+                dry_run = nightrun_cmd.dry_run,
+                "Nightrun abgeschlossen"
+            );
+        }
+
         // eBPF Metrics Collection (alle 10 Ticks = ~10s bei 1s Tick-Rate)
         if tick_count > 0 && tick_count.is_multiple_of(10) {
             match ebpf_collector.collect() {
@@ -1760,6 +1872,8 @@ mod tests {
             ebpf_collector,
             ebpf_tx,
             ep,
+            mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+            String::new(),
             vec!["true".to_string()],
             crate::adaptive_tick::AdaptiveConfig::default(),
             sentinel_ecs::RoomDistanceMap::default(),
@@ -1818,6 +1932,8 @@ mod tests {
                 ebpf_collector,
                 ebpf_tx,
                 ep,
+                mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+                String::new(),
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
                 sentinel_ecs::RoomDistanceMap::default(),
@@ -1893,6 +2009,8 @@ mod tests {
                 ebpf_collector,
                 ebpf_tx,
                 ep,
+                mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+                String::new(),
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
                 sentinel_ecs::RoomDistanceMap::default(),
@@ -1976,6 +2094,8 @@ mod tests {
                 ebpf_collector,
                 ebpf_tx,
                 ep,
+                mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+                String::new(),
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
                 sentinel_ecs::RoomDistanceMap::default(),
