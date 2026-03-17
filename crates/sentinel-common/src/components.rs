@@ -101,7 +101,7 @@ pub struct Mood {
 }
 
 /// Wahrnehmung (wird pro Tick neu generiert fuer LLM-Prompt)
-#[derive(Component, Debug, Clone, Serialize, Deserialize)]
+#[derive(Component, Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PerceptionState {
     pub environment_text: String,
     pub body_text: String,
@@ -110,7 +110,7 @@ pub struct PerceptionState {
 }
 
 /// Arbeitskontext
-#[derive(Component, Debug, Clone, Serialize, Deserialize)]
+#[derive(Component, Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkContext {
     pub current_task: Option<String>,
     pub in_meeting: bool,
