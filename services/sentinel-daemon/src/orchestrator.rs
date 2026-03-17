@@ -1609,12 +1609,42 @@ fn ecs_tick_loop(
                                     continue;
                                 }
 
-                                // 3. ECS Restore
+                                // 3. Agent-Prozesse terminieren (Sandbox Teardown)
+                                let agent_ids: Vec<sentinel_common::AgentId> =
+                                    agent_processes.keys().copied().collect();
+                                for agent_id in &agent_ids {
+                                    if let Some(handle) = sandbox_handles.remove(agent_id) {
+                                        if handle.cgroup_created {
+                                            if let Some(cid) =
+                                                sentinel_sandbox::cgroup_id(&handle.agent_name)
+                                            {
+                                                ebpf_collector.unregister_agent(cid);
+                                            }
+                                        }
+                                        if let Err(e) = sandbox.teardown_agent(&handle) {
+                                            warn!(
+                                                agent_id = %agent_id,
+                                                error = %e,
+                                                "Sandbox teardown bei Restore fehlgeschlagen"
+                                            );
+                                        }
+                                    }
+                                    agent_processes.remove(agent_id);
+                                }
+                                info!(
+                                    terminated = agent_ids.len(),
+                                    "Agent-Prozesse fuer Restore terminiert"
+                                );
+
+                                // 4. ECS Restore
                                 sentinel_ecs::restore_ecs_state(&mut world, &snapshot.ecs);
 
-                                // 4. Tick/SimHour zuruecksetzen
+                                // 6. Tick/SimHour zuruecksetzen
                                 tick_count = snapshot.tick;
                                 sim_hour = snapshot.sim_hour;
+                                // Shift zuruecksetzen damit Schicht-Erkennung
+                                // neue Agents spawnt beim naechsten Check
+                                current_shift = 0;
                                 if let Some(mut sim_time) =
                                     world.get_resource_mut::<sentinel_ecs::SimulationTime>()
                                 {
@@ -1623,10 +1653,38 @@ fn ecs_tick_loop(
                                     sim_time.sim_hour = snapshot.sim_hour;
                                 }
 
-                                // 5. Projection Offsets zuruecksetzen
+                                // 7. Projection Offsets zuruecksetzen
                                 for (name, _) in &snapshot.projection_offsets {
-                                    // Force-Reset: loescht und setzt neu
                                     let _ = es.force_reset_offset(name, snapshot.last_event_id);
+                                }
+
+                                // 8. SnapshotRestored Event emittieren
+                                //    (Bridge leitet an NATS weiter → Judge/Consumer reagieren)
+                                let restore_event = sentinel_common::DomainEvent {
+                                    event_id: uuid::Uuid::new_v4().to_string(),
+                                    event_type: "snapshot_restored".to_string(),
+                                    aggregate_id: "system".to_string(),
+                                    payload: serde_json::json!({
+                                        "snapshot_id": restore_cmd.snapshot_id,
+                                        "restored_tick": snapshot.tick,
+                                        "restored_sim_hour": snapshot.sim_hour,
+                                        "agents_count": snapshot.ecs.identities.len(),
+                                    })
+                                    .to_string(),
+                                    correlation_id: restore_cmd.snapshot_id.clone(),
+                                    causation_id: None,
+                                    operation_id: uuid::Uuid::new_v4().to_string(),
+                                    tick: snapshot.tick,
+                                    timestamp_ms: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                        as u64,
+                                    schema_version: 1,
+                                    compensation_type: "none".to_string(),
+                                };
+                                if let Err(e) = es.append_event(&restore_event) {
+                                    warn!(error = %e, "SnapshotRestored Event schreiben fehlgeschlagen");
                                 }
 
                                 info!(
