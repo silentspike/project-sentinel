@@ -445,6 +445,8 @@ pub struct EcsSnapshot {
     pub event_queues: Vec<(u16, crate::components::EventQueue)>,
     pub identities: Vec<(u16, crate::components::AgentIdentity)>,
     pub shift_infos: Vec<(u16, crate::components::ShiftInfo)>,
+    pub relationships: Vec<(u16, crate::components::Relationships)>,
+    pub llm_configs: Vec<(u16, crate::components::LlmConfig)>,
     pub sim_tick: u64,
     pub sim_hour: f32,
     pub sim_delta_seconds: f32,

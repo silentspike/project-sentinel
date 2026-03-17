@@ -775,6 +775,16 @@ pub fn snapshot_ecs_state(world: &mut World) -> sentinel_common::EcsSnapshot {
         shift_infos.push((id, shift.clone()));
     }
 
+    // Zweite Query fuer Relationships + LlmConfig (bevy tuple limit = 12)
+    let mut relationships_vec = Vec::new();
+    let mut llm_configs_vec = Vec::new();
+    let mut query2 = world.query::<(&AgentIdentity, &Relationships, &LlmConfig)>();
+    for (identity, rels, llm) in query2.iter(world) {
+        let id = identity.agent_id.0;
+        relationships_vec.push((id, rels.clone()));
+        llm_configs_vec.push((id, llm.clone()));
+    }
+
     let sim_time = world.get_resource::<SimulationTime>();
 
     sentinel_common::EcsSnapshot {
@@ -788,6 +798,8 @@ pub fn snapshot_ecs_state(world: &mut World) -> sentinel_common::EcsSnapshot {
         event_queues,
         identities,
         shift_infos,
+        relationships: relationships_vec,
+        llm_configs: llm_configs_vec,
         sim_tick: sim_time.map(|t| t.tick.0).unwrap_or(0),
         sim_hour: sim_time.map(|t| t.sim_hour).unwrap_or(0.0),
         sim_delta_seconds: sim_time.map(|t| t.delta_seconds).unwrap_or(1.0),
@@ -897,6 +909,26 @@ pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnaps
                 is_on_duty: false,
             });
 
+        let rels = snapshot
+            .relationships
+            .iter()
+            .find(|(aid, _)| aid == id)
+            .map(|(_, r)| r.clone())
+            .unwrap_or(Relationships {
+                affinity: Vec::new(),
+            });
+        let llm = snapshot
+            .llm_configs
+            .iter()
+            .find(|(aid, _)| aid == id)
+            .map(|(_, l)| l.clone())
+            .unwrap_or(LlmConfig {
+                provider: "claude".to_string(),
+                model: "claude-sonnet-4-5-20250929".to_string(),
+                temperature: 0.7,
+                max_tokens: 4096,
+            });
+
         world.spawn((
             identity.clone(),
             pos,
@@ -905,15 +937,8 @@ pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnaps
             mood,
             perception,
             work,
-            Relationships {
-                affinity: Vec::new(),
-            },
-            LlmConfig {
-                provider: "claude".to_string(),
-                model: "claude-sonnet-4-5-20250929".to_string(),
-                temperature: 0.7,
-                max_tokens: 4096,
-            },
+            rels,
+            llm,
             shift,
             events,
             AutonomyCooldown::default(),
