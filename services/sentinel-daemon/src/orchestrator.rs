@@ -1669,7 +1669,7 @@ fn ecs_tick_loop(
                                 //    Worker pollt get_events_since(offset) und rebuilt organisch.
                                 {
                                     let conn = sentinel_limbo::rusqlite::Connection::open(
-                                        &evolution_db_path.replace("evolution.db", "projection.db"),
+                                        evolution_db_path.replace("evolution.db", "projection.db"),
                                     );
                                     if let Ok(db) = conn {
                                         let _ = db.execute_batch(
