@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result as AnyResult};
 use serde::{Deserialize, Serialize};
@@ -95,6 +95,7 @@ struct AppState {
     snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
     event_store: Arc<sentinel_limbo::EventStore>,
+    vacuum_handle: Arc<Mutex<Option<sentinel_limbo::VacuumHandle>>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -175,6 +176,7 @@ pub async fn start_server(
         snapshot_tx,
         restore_tx,
         event_store,
+        vacuum_handle: Arc::new(Mutex::new(None)),
     };
 
     info!(
@@ -323,17 +325,16 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 );
             }
             let prune_point = snapshots[snapshots.len() - 2].last_event_id;
-            let es = Arc::clone(&state.event_store);
-            std::thread::spawn(move || match es.prune_events_before(prune_point) {
+            // Prune synchron (schnell, <1s) — VACUUM asynchron via VacuumHandle
+            match state.event_store.prune_events_before(prune_point) {
                 Ok(deleted) => {
-                    info!(deleted, "Pruning abgeschlossen, starte VACUUM");
-                    match es.vacuum() {
-                        Ok(()) => info!("VACUUM abgeschlossen"),
-                        Err(e) => warn!(error = %e, "VACUUM fehlgeschlagen"),
-                    }
+                    info!(deleted, "Pruning abgeschlossen, starte VACUUM auf separatem Thread");
+                    let handle =
+                        sentinel_limbo::VacuumHandle::spawn(Arc::clone(&state.event_store));
+                    *state.vacuum_handle.lock().unwrap() = Some(handle);
                 }
                 Err(e) => warn!(error = %e, "Pruning fehlgeschlagen"),
-            });
+            }
             json_response(
                 202,
                 serde_json::json!({"accepted": true, "message": "Pruning + VACUUM gestartet (asynchron)"}),
@@ -631,6 +632,7 @@ mod tests {
                 sentinel_limbo::EventStore::open(":memory:")
                     .expect("in-memory EventStore fuer Tests"),
             ),
+            vacuum_handle: Arc::new(Mutex::new(None)),
         };
         (state, rx)
     }

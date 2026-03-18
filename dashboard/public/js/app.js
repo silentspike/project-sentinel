@@ -62,6 +62,13 @@ function connectWebSocket() {
         refreshActiveRoomDetail();
       } else if (data.type === 'activity_update') {
         updateActivity();
+      } else if (data.type === 'snapshot_restored') {
+        // Restore hat World-State ersetzt — alles neu laden
+        loadAgents();
+        loadRooms();
+        updateCockpit();
+        updateChaos();
+        updateActivity();
       }
     } catch { /* ignore parse errors */ }
   };

@@ -35,7 +35,7 @@ interface StoredEventRow {
   timestamp_ms: number;
 }
 
-function resetCaches(): void {
+export function resetCaches(): void {
   _agentNameCache = null;
   _agentNameCacheTime = 0;
 }
@@ -589,8 +589,8 @@ let _agentNameCacheTime = 0;
 
 export function getAgentNameMap(): Map<number, string> {
   const now = Date.now();
-  // Refresh cache every 60s
-  if (_agentNameCache && now - _agentNameCacheTime < 60_000) {
+  // Refresh cache every 5s (war 60s — #253 stale cache fix)
+  if (_agentNameCache && now - _agentNameCacheTime < 5_000) {
     return _agentNameCache;
   }
   const rows = projectionDb
