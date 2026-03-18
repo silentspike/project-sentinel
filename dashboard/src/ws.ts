@@ -106,7 +106,7 @@ function toRoomResponse(row: RoomRow, occupants: string[]): RoomResponse {
   };
 }
 
-function broadcast(data: unknown): void {
+export function broadcast(data: unknown): void {
   const msg = JSON.stringify(data);
   for (const ws of clients) {
     try {
@@ -168,6 +168,14 @@ function sendHealthUpdate(): void {
     lag,
     uptime: Math.floor((Date.now() - startTime) / 1000),
   });
+}
+
+export function resetWatermarks(): void {
+  lastAgentEventId = 0;
+  lastRoomEventId = 0;
+  lastIncidentEventId = 0;
+  lastChaosEventId = 0;
+  lastActivityEventId = 0;
 }
 
 export function startPolling(): void {
