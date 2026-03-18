@@ -4,6 +4,8 @@
 
 import { Hono } from "hono";
 import { requireAuth } from "../middleware/auth";
+import { resetCaches } from "../db";
+import { resetWatermarks, broadcast } from "../ws";
 
 export const controlRoutes = new Hono();
 
@@ -280,13 +282,22 @@ controlRoutes.post("/control/snapshot", async (c) => {
 controlRoutes.post("/control/restore", async (c) => {
   try {
     const body = await c.req.json();
-    return await proxyJson(
+    const result = await proxyJson(
       getOperatorApiUrl(),
       "POST",
       "/operator/restore",
       body,
       getOperatorHeaders(),
     );
+
+    // Cache-Invalidierung nach erfolgreichem Restore (#253)
+    if (result.status < 400) {
+      resetCaches();
+      resetWatermarks();
+      broadcast({ type: "snapshot_restored" });
+    }
+
+    return result;
   } catch (err) {
     return c.json({ error: "Operator-API nicht erreichbar", detail: String(err) }, 502);
   }

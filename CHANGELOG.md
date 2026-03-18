@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **VACUUM Daemon-Hang behoben** (#252)
+  - `sentinel-limbo`: `vacuum()` nutzt jetzt eine eigene `rusqlite::Connection` statt die shared Writer-Mutex — blockiert keine anderen DB-Operationen mehr
+  - `sentinel-limbo`: `VacuumHandle` struct mit Cancel-Flag (`AtomicBool`) und `progress_handler` fuer saubere Unterbrechung via SIGTERM
+  - `sentinel-limbo`: `PRAGMA busy_timeout = 5000` beim DB-Open fuer bessere Contention-Behandlung
+  - `sentinel-daemon`: VACUUM-Thread wird bei Shutdown via `cancel_and_join(5s)` sauber beendet — kein `deactivating` Hang mehr
+  - `sentinel-daemon`: `snapshot.rs` und `operator_api.rs` nutzen `VacuumHandle::spawn` statt detachtem `std::thread::spawn`
+  - 4 neue Tests: `test_vacuum_does_not_block_append`, `test_vacuum_cancel_flag`, `test_vacuum_handle_spawn_and_cancel`, `test_db_path`
+
+- **Dashboard stale Cache nach Restart/Restore behoben** (#253)
+  - Dashboard API: Agent Name Cache TTL von 60s auf 5s reduziert
+  - Dashboard API: Stall Cache TTL von 10s auf 3s reduziert, Error-Handling cleared jetzt den Cache statt alten Wert zu behalten
+  - Dashboard API: `resetCaches()` und `resetWatermarks()` als exportierte Funktionen
+  - Dashboard Backend: Restore-Proxy invalidiert alle Caches sofort und broadcastet `snapshot_restored` WebSocket-Event
+  - Dashboard Frontend: neuer `snapshot_restored` Handler laedt alle Daten (Agents, Rooms, Cockpit, Chaos, Activity) sofort neu
+  - 2 neue Tests: Cache-Invalidierung und Cache-Hit Verhalten
+
 - **Chaos-gebundene Physics-Korrekturen + Operator-Floorplan** (#242, #243, #244, #245)
   - `sentinel-ecs`: `ActiveChaos` Resource, gemeinsamer Chaos-Injektionspfad, Cleanup und Physics fuer Raeume mit aktivem Chaos
   - `sentinel-physics`: `AirConBroken` erhoeht Temperatur messbar, `PrinterBroken` erhoeht Laerm mit begrenztem Bonus
