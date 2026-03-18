@@ -8,7 +8,7 @@ export const agentRoutes = new Hono();
 // Cached stall data from Prometheus (refreshed every 10s)
 let stalledAgentSet = new Set<string>();
 let stallCacheTime = 0;
-const STALL_CACHE_TTL_MS = 10_000;
+const STALL_CACHE_TTL_MS = 3_000; // war 10_000 — #253 stale cache fix
 
 async function refreshStallData(): Promise<void> {
   const now = Date.now();
@@ -28,7 +28,9 @@ async function refreshStallData(): Promise<void> {
     stalledAgentSet = newSet;
     stallCacheTime = now;
   } catch {
-    // Keep previous cache on error
+    // Clear stale cache on error (#253) statt alten Wert behalten
+    stalledAgentSet = new Set();
+    stallCacheTime = now;
   }
 }
 

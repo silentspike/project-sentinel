@@ -759,6 +759,7 @@ fn ecs_tick_loop(
 
     // Time Machine: SnapshotManager (Config aus daemon.toml)
     let mut snapshot_manager = crate::snapshot::SnapshotManager::new(retention_config);
+    let mut active_vacuum: Option<sentinel_limbo::VacuumHandle> = None;
 
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
@@ -1559,8 +1560,15 @@ fn ecs_tick_loop(
                         Ok(id) => {
                             debug!(snapshot_id = %id, "World Snapshot erstellt");
                             // Maintenance: Promotion + Cleanup
-                            if let Err(e) = snapshot_manager.maintain(&es) {
-                                warn!(error = %e, "Snapshot Maintenance fehlgeschlagen");
+                            match snapshot_manager.maintain(&es) {
+                                Ok((_, vac)) => {
+                                    if let Some(v) = vac {
+                                        active_vacuum = Some(v);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Snapshot Maintenance fehlgeschlagen");
+                                }
                             }
                         }
                         Err(e) => {
@@ -1949,6 +1957,13 @@ fn ecs_tick_loop(
         psi_cpu_gauge.set((adaptive_tick.cpu_avg10() * 10.0) as i64);
         psi_mem_gauge.set((adaptive_tick.mem_avg10() * 10.0) as i64);
         psi_io_gauge.set((adaptive_tick.io_avg10() * 10.0) as i64);
+    }
+
+    // -- Graceful Shutdown: VACUUM-Thread abbrechen (AC-3 Issue #252) --
+    if let Some(mut vac) = active_vacuum.take() {
+        info!("VACUUM-Thread wird abgebrochen...");
+        vac.cancel_and_join(std::time::Duration::from_secs(5));
+        info!("VACUUM-Thread beendet");
     }
 
     // -- Graceful Shutdown: Agent-Prozesse droppen (reaps Zombies via Drop impl) --

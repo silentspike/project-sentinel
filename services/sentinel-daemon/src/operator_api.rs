@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result as AnyResult};
 use serde::{Deserialize, Serialize};
@@ -95,6 +95,7 @@ struct AppState {
     snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
     event_store: Arc<sentinel_limbo::EventStore>,
+    vacuum_handle: Arc<Mutex<Option<sentinel_limbo::VacuumHandle>>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -175,6 +176,7 @@ pub async fn start_server(
         snapshot_tx,
         restore_tx,
         event_store,
+        vacuum_handle: Arc::new(Mutex::new(None)),
     };
 
     info!(
@@ -312,32 +314,41 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
             }
         }
         OPERATOR_PRUNE_PATH => {
-            info!("Manuelles Pruning via Operator-API angefordert — wird asynchron ausgefuehrt");
-            // Prune + VACUUM laeuft im Tick-Loop Thread (nicht im HTTP-Thread!)
-            // um den HTTP-Handler nicht zu blockieren (VACUUM auf GB-DBs dauert Minuten).
-            let snapshots = state.event_store.list_world_snapshots().unwrap_or_default();
-            if snapshots.len() < 2 {
-                return json_response(
-                    200,
-                    serde_json::json!({"accepted": false, "message": "Zu wenige Snapshots fuer Pruning"}),
-                );
-            }
-            let prune_point = snapshots[snapshots.len() - 2].last_event_id;
+            info!("Manuelles Pruning via Operator-API angefordert");
             let es = Arc::clone(&state.event_store);
-            std::thread::spawn(move || match es.prune_events_before(prune_point) {
-                Ok(deleted) => {
-                    info!(deleted, "Pruning abgeschlossen, starte VACUUM");
-                    match es.vacuum() {
-                        Ok(()) => info!("VACUUM abgeschlossen"),
-                        Err(e) => warn!(error = %e, "VACUUM fehlgeschlagen"),
+            let vac_handle = Arc::clone(&state.vacuum_handle);
+            info!("Prune-Worker Thread wird gestartet...");
+            let spawn_result = std::thread::Builder::new()
+                .name("prune-worker".into())
+                .spawn(move || {
+                    let snapshots = es.list_world_snapshots().unwrap_or_default();
+                    if snapshots.len() < 2 {
+                        info!("Zu wenige Snapshots fuer Pruning");
+                        return;
                     }
+                    let prune_point = snapshots[snapshots.len() - 2].last_event_id;
+                    match es.prune_events_before(prune_point) {
+                        Ok(deleted) => {
+                            info!(deleted, "Pruning abgeschlossen, starte VACUUM");
+                            let handle = sentinel_limbo::VacuumHandle::spawn(Arc::clone(&es));
+                            *vac_handle.lock().unwrap() = Some(handle);
+                        }
+                        Err(e) => warn!(error = %e, "Pruning fehlgeschlagen"),
+                    }
+                });
+            match spawn_result {
+                Ok(_) => {
+                    info!("Prune-Worker Thread gestartet, sende 202");
+                    json_response(
+                        202,
+                        serde_json::json!({"accepted": true, "message": "Pruning + VACUUM gestartet (asynchron)"}),
+                    )
                 }
-                Err(e) => warn!(error = %e, "Pruning fehlgeschlagen"),
-            });
-            json_response(
-                202,
-                serde_json::json!({"accepted": true, "message": "Pruning + VACUUM gestartet (asynchron)"}),
-            )
+                Err(e) => {
+                    warn!(error = %e, "Prune-Worker Thread konnte nicht gestartet werden");
+                    ApiError::ServiceUnavailable("Thread-Start fehlgeschlagen").to_response()
+                }
+            }
         }
         _ => ApiError::NotFound("Endpoint unbekannt").to_response(),
     }
@@ -631,6 +642,7 @@ mod tests {
                 sentinel_limbo::EventStore::open(":memory:")
                     .expect("in-memory EventStore fuer Tests"),
             ),
+            vacuum_handle: Arc::new(Mutex::new(None)),
         };
         (state, rx)
     }
