@@ -197,8 +197,7 @@ impl SnapshotManager {
                 match event_store.prune_events_before(prune_point) {
                     Ok(pruned) if pruned > 0 => {
                         info!(pruned, "Auto-Prune: Events geloescht, starte VACUUM");
-                        vacuum_handle =
-                            Some(VacuumHandle::spawn(Arc::clone(event_store)));
+                        vacuum_handle = Some(VacuumHandle::spawn(Arc::clone(event_store)));
                     }
                     Ok(_) => {} // Nichts zu prunen
                     Err(e) => {
