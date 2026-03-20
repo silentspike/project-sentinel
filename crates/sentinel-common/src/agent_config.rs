@@ -87,10 +87,10 @@ pub fn load_agent_config(path: &Path) -> Result<AgentConfig> {
     let config: AgentConfig = toml::from_str(&content)
         .with_context(|| format!("Failed to parse agent config: {}", path.display()))?;
     config.personality.validate()?;
-    // Validiere id Bereich 1-54
-    if config.identity.id == 0 || config.identity.id > 54 {
+    // Validiere id Bereich 1-60
+    if config.identity.id == 0 || config.identity.id > 60 {
         return Err(anyhow!(
-            "Agent id {} out of range (1-54)",
+            "Agent id {} out of range (1-60)",
             config.identity.id
         ));
     }
@@ -164,10 +164,10 @@ mod tests {
     #[test]
     fn load_all_agents_sorted() {
         let agents = load_all_agents(&config_dir()).unwrap();
-        assert_eq!(agents.len(), 54);
+        assert_eq!(agents.len(), 60);
         // Check sorted by ID - first and last
         assert_eq!(agents[0].identity.id, 1);
-        assert_eq!(agents[53].identity.id, 54);
+        assert_eq!(agents[59].identity.id, 60);
         // Check monotonically increasing
         for i in 1..agents.len() {
             assert!(agents[i].identity.id > agents[i - 1].identity.id);
@@ -178,8 +178,8 @@ mod tests {
     fn no_id_gaps_or_duplicates() {
         let agents = load_all_agents(&config_dir()).unwrap();
         let ids: Vec<u16> = agents.iter().map(|a| a.identity.id).collect();
-        let expected: Vec<u16> = (1..=54).collect();
-        assert_eq!(ids, expected, "Agent IDs must be 1..=54 without gaps");
+        let expected: Vec<u16> = (1..=60).collect();
+        assert_eq!(ids, expected, "Agent IDs must be 1..=60 without gaps");
     }
 
     #[test]
@@ -202,9 +202,9 @@ mod tests {
             .filter(|a| a.identity.shift_set == 3)
             .collect();
         assert_eq!(set0.len(), 9, "Sonder-Set (0) should have 9 agents");
-        assert_eq!(set1.len(), 15, "Frueh-Set (1) should have 15 agents");
-        assert_eq!(set2.len(), 15, "Mittel-Set (2) should have 15 agents");
-        assert_eq!(set3.len(), 15, "Spaet-Set (3) should have 15 agents");
+        assert_eq!(set1.len(), 17, "Frueh-Set (1) should have 17 agents");
+        assert_eq!(set2.len(), 17, "Mittel-Set (2) should have 17 agents");
+        assert_eq!(set3.len(), 17, "Spaet-Set (3) should have 17 agents");
     }
 
     #[test]
@@ -268,11 +268,11 @@ mod tests {
         let result = load_agent_config(tmpfile.path());
         assert!(result.is_err());
 
-        // Test id = 55 (invalid)
+        // Test id = 61 (invalid)
         let mut tmpfile = NamedTempFile::new().unwrap();
         std::io::Write::write_all(
             &mut tmpfile,
-            b"[identity]\nid = 55\nname = \"Test\"\nrole = \"Test\"\ndepartment = \"Test\"\nshift_set = 1\n[personality]\nopenness = 0.5\nconscientiousness = 0.5\nextraversion = 0.5\nagreeableness = 0.5\nneuroticism = 0.5\ncaffeine_tolerance = 0.5\nmorning_person = true\n[preferences]\nfavorite_room = \"test\"\ncoffee_preference = \"test\"\nlunch_time = \"12:00\"\n[background]\nbio = \"test\"\nquirks = []\n",
+            b"[identity]\nid = 61\nname = \"Test\"\nrole = \"Test\"\ndepartment = \"Test\"\nshift_set = 1\n[personality]\nopenness = 0.5\nconscientiousness = 0.5\nextraversion = 0.5\nagreeableness = 0.5\nneuroticism = 0.5\ncaffeine_tolerance = 0.5\nmorning_person = true\n[preferences]\nfavorite_room = \"test\"\ncoffee_preference = \"test\"\nlunch_time = \"12:00\"\n[background]\nbio = \"test\"\nquirks = []\n",
         )
         .unwrap();
         let result = load_agent_config(tmpfile.path());

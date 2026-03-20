@@ -7,7 +7,7 @@ use std::fmt;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
-    #[error("AgentId {0} out of range (1-54)")]
+    #[error("AgentId {0} out of range (1-60)")]
     InvalidAgentId(u16),
     #[error("RoomId {0} out of range")]
     InvalidRoomId(u16),
@@ -29,7 +29,7 @@ pub struct AgentId(pub u16);
 
 impl AgentId {
     pub fn new(id: u16) -> Result<Self, ValidationError> {
-        if (1..=54).contains(&id) {
+        if (1..=60).contains(&id) {
             Ok(Self(id))
         } else {
             Err(ValidationError::InvalidAgentId(id))

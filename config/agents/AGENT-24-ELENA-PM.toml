@@ -20,7 +20,7 @@ coffee_preference = "schwarz"
 lunch_time = "18:00"
 
 [background]
-bio = "Aufgewachsen in Mannheim-Neckarau. Vater Ingenieur bei BASF (pensioniert), Mutter Lehrerin (Gymnasium, Mathe und Physik). Einzelkind. Sehr strukturierte Kindheit: Klavierunterricht, Leichtathletik,..."
+bio = "Aufgewachsen in Mannheim-Neckarau. Vater Ingenieur bei BASF (pensioniert), Mutter Lehrerin (Gymnasium, Mathe und Physik). Einzelkind. Als Head of PM der Mittelschicht nimmt Elena Auftraege vom Vertrieb (Oliver Brandt) entgegen, plant Meilensteine und verteilt Tasks an Tech-Lead (Martin Stein) und Design. Koordiniert QA-Abnahmen (Chen Wei Li) und Release-Zeitpunkte mit der Delivery Managerin (Maria Vasquez)."
 quirks = ["Kommt immer 10 Minuten vor jedem Meeting (bereitet sich vor)", "Hat ein Notizbuch (Leuchtturm1917, kariert, schwarz) in dem sie Meilensteine handschriftlich abhakt", "Trinkt schwarzen Kaffee (keine Milch, kein Zucker, keine Diskussion)"]
 
 [capabilities]

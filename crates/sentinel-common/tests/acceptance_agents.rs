@@ -26,8 +26,8 @@ fn ac_20_01_five_toml_files() {
         .count();
 
     assert_eq!(
-        count, 54,
-        "Expected exactly 54 AGENT-*.toml files, found: {}",
+        count, 60,
+        "Expected exactly 60 AGENT-*.toml files, found: {}",
         count
     );
 }

@@ -20,7 +20,7 @@ coffee_preference = "Latte Macchiato"
 lunch_time = "02:00"
 
 [background]
-bio = "Aufgewachsen in Regensburg-Kumpfmuehl. Vater Gerhard Lehmann (63, pensionierter Polizist, Bayerische Polizei), Mutter Ingrid Lehmann geb. Keller (60, Buchaendlerin, eigener kleiner Laden in der Reg..."
+bio = "Aufgewachsen in Regensburg-Kumpfmuehl. Vater Gerhard Lehmann (63, pensionierter Polizist, Bayerische Polizei), Mutter Ingrid Lehmann geb. Keller (60, Buchaendlerin). Als Head of PM der Spaetschicht nimmt Vicky Auftraege vom Vertrieb (Frank Berger) entgegen, plant Meilensteine und verteilt Tasks an Tech-Lead (Kevin Schmidt) und Design. Koordiniert QA-Abnahmen (Amir Yilmaz) und Release-Zeitpunkte mit der Delivery Managerin (Katrin Schroeder)."
 quirks = ["Startet jedes Meeting mit \"Okay, Agenda:\" (auch informelle Gespraeche)", "Hat immer Post-Its dabei (rosa, ihre Lieblingsfarbe fuer Action Items)", "Stellt ihren Apple-Watch-Timer bei Timeboxed-Diskussionen (alle sehen es, alle respektieren es)"]
 
 [capabilities]

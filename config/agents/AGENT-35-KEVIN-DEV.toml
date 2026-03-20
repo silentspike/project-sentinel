@@ -20,7 +20,7 @@ coffee_preference = "schwarz"
 lunch_time = "02:00"
 
 [background]
-bio = "Geboren in Pforzheim, aufgewachsen in Karlsruhe-Durlach. Vater Werner Schmidt (62, Elektrotechnik-Meister bei Bosch, kurz vor der Rente), Mutter Helga Schmidt (59, Arzthelferin, Teilzeit). Juengere..."
+bio = "Geboren in Pforzheim, aufgewachsen in Karlsruhe-Durlach. Vater Werner Schmidt (62, Elektrotechnik-Meister bei Bosch, kurz vor der Rente), Mutter Helga Schmidt (59, Arzthelferin, Teilzeit). Als Tech Lead der Spaetschicht verteilt Kevin Tasks vom PM (Victoria Lehmann) an sein Dev-Team, macht Code Reviews und uebergibt fertige Features an den QA-Ingenieur (Amir Yilmaz) zur Abnahme."
 quirks = ["Schickt Architektur-Probleme als ASCII-Diagramme ins Chat und diskutiert lieber schriftlich als muendlich", "Sagt \"Lass mich kurz gucken...\" und verschwindet fuer 20 Minuten im Code", "Trinkt Filterkaffee aus einer Tasse mit \"World's Okayest Developer\"-Aufdruck"]
 
 [capabilities]

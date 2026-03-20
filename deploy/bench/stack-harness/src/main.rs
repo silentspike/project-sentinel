@@ -165,7 +165,7 @@ fn bench_redb() -> anyhow::Result<()> {
     let n = 5000u16;
     let mut entries = Vec::with_capacity(n as usize);
     for i in 0..n {
-        let id = AgentId::new((i % 54) + 1)?;
+        let id = AgentId::new((i % 60) + 1)?;
         let payload = format!("state-{i}");
         entries.push((id, payload.into_bytes()));
     }
@@ -175,7 +175,7 @@ fn bench_redb() -> anyhow::Result<()> {
 
     let start_r = Instant::now();
     for i in 0..n {
-        let id = AgentId::new((i % 54) + 1)?;
+        let id = AgentId::new((i % 60) + 1)?;
         let _ = store.get_agent_state(id)?;
     }
     let read_elapsed = start_r.elapsed();
@@ -263,7 +263,7 @@ async fn bench_limbo() -> anyhow::Result<()> {
     let room = RoomId::new(1)?;
     let mut messages = Vec::with_capacity(n as usize);
     for i in 0..n {
-        let agent = AgentId::new((i as u16 % 54) + 1)?;
+        let agent = AgentId::new((i as u16 % 60) + 1)?;
         let content = format!("msg-{i}");
         messages.push(NewMessage {
             room_id: room,
@@ -323,7 +323,7 @@ async fn bench_limbo_concurrent_writes() -> anyhow::Result<()> {
             let mut batch = Vec::with_capacity(batch_size);
             for i in 0..batch_size {
                 let n = (worker * batch_size + i) as u64;
-                let agent = AgentId::new(((n as u16) % 54) + 1)?;
+                let agent = AgentId::new(((n as u16) % 60) + 1)?;
                 batch.push(NewMessage {
                     room_id: room,
                     agent_id: agent,

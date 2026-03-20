@@ -33,7 +33,7 @@ mod tests {
     #[test]
     fn test_agent_id_invalid() {
         assert!(AgentId::new(0).is_err());
-        assert!(AgentId::new(55).is_err());
+        assert!(AgentId::new(61).is_err());
         assert!(AgentId::new(u16::MAX).is_err());
     }
 

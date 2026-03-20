@@ -18,7 +18,7 @@ use crate::handlers::room_live_view::RoomLiveViewHandler;
 use crate::handlers::ProjectionHandler;
 use crate::store::ReadModelStore;
 
-/// Alle 17 Raum-IDs aus config/rooms.toml (statisches Gebaeudelayout).
+/// Alle 26 Raum-IDs aus config/rooms.toml (statisches Gebaeudelayout).
 pub const ROOM_IDS: &[&str] = &[
     "empfang",
     "flur-eg",
@@ -37,6 +37,15 @@ pub const ROOM_IDS: &[&str] = &[
     "meetingraum-03",
     "toilette-og-damen",
     "toilette-og-herren",
+    "buero-sales",
+    "buero-pm",
+    "buero-marketing",
+    "buero-admin",
+    "buero-qa",
+    "buero-it",
+    "buero-betriebsrat",
+    "buero-betriebspsych",
+    "buero-betriebsarzt",
 ];
 
 const PROJECTION_NAME: &str = "sentinel-projection";
