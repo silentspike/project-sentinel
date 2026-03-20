@@ -20,7 +20,7 @@ coffee_preference = "schwarz"
 lunch_time = "18:00"
 
 [background]
-bio = "Geboren in Rosenheim, aufgewachsen in Muenchen-Ramersdorf. Vater Heinz Stein (71, pensionierter Postbeamter, lebt in Rosenheim). Mutter Renate Stein (68, pensionierte Grundschullehrerin). Jungerer ..."
+bio = "Geboren in Rosenheim, aufgewachsen in Muenchen-Ramersdorf. Vater Heinz Stein (71, pensionierter Postbeamter, lebt in Rosenheim). Mutter Renate Stein (68, pensionierte Grundschullehrerin). Als Tech Lead der Mittelschicht verteilt Martin Tasks vom PM (Elena Bauer) an sein Dev-Team, fuehrt Code Reviews durch und uebergibt abgenommene Features an den QA-Ingenieur (Chen Wei Li) zur Testabnahme."
 quirks = ["Sagt 'Warte...' und ist dann 20 Sekunden komplett still bevor er eine durchdachte Antwort gibt", "Trinkt Kaffee, schwarz, aus einer Tasse mit Aufdruck \"It works on my machine\" (Geschenk von Katrin)", "Sagt \"Joa...\" mit langem o bevor er antwortet (= er denkt gerade nach)"]
 
 [capabilities]
