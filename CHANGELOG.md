@@ -15,8 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - systemd TimeoutStopSec auf 15s (war default 90s)
   - Shutdown-Timing-Logs fuer jeden Schritt (VACUUM, Agent-Teardown, Sandbox, Persist, Snapshot)
 
-- **VACUUM Daemon-Hang behoben** (#252)
-  - `sentinel-limbo`: `vacuum()` nutzt jetzt eine eigene `rusqlite::Connection` statt die shared Writer-Mutex — blockiert keine anderen DB-Operationen mehr
+- **VACUUM komplett entfernt — Freelist-Reuse statt EXCLUSIVE Lock** (#252)
+  - `vacuum()` und `VacuumHandle` entfernt — SQLite VACUUM holt EXCLUSIVE Lock der alle Connections blockiert
+  - Prune (batched DELETE) reicht: geloeschte Pages gehen in SQLite Freelist, neue Writes fuellen Freelist-Pages zuerst
+  - DB-Datei schrumpft nicht, stabilisiert sich aber (4.8 GB File, davon nur 7 Tage Inhalt, Rest = Freelist)
   - `sentinel-limbo`: `VacuumHandle` struct mit Cancel-Flag (`AtomicBool`) und `progress_handler` fuer saubere Unterbrechung via SIGTERM
   - `sentinel-limbo`: `PRAGMA busy_timeout = 5000` beim DB-Open fuer bessere Contention-Behandlung
   - `sentinel-daemon`: VACUUM-Thread wird bei Shutdown via `cancel_and_join(5s)` sauber beendet — kein `deactivating` Hang mehr
