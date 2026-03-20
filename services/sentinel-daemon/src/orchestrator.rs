@@ -686,16 +686,28 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     drop(action_tx);
     drop(operator_tx);
 
-    match ecs_handle.join() {
-        Ok(Ok(tick_count)) => {
-            info!(total_ticks = tick_count, "ECS Thread sauber beendet");
+    // ECS-Thread mit 8s Timeout joinen (AC-3 #255)
+    let join_deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if ecs_handle.is_finished() {
+            match ecs_handle.join() {
+                Ok(Ok(tick_count)) => {
+                    info!(total_ticks = tick_count, "ECS Thread sauber beendet");
+                }
+                Ok(Err(e)) => {
+                    error!(error = %e, "ECS Thread mit Fehler beendet");
+                }
+                Err(_) => {
+                    error!("ECS Thread panicked");
+                }
+            }
+            break;
         }
-        Ok(Err(e)) => {
-            error!(error = %e, "ECS Thread mit Fehler beendet");
+        if Instant::now() > join_deadline {
+            warn!("ECS-Thread Shutdown-Timeout (8s) — erzwinge Beendigung");
+            break; // Daemon exits, --die-with-parent kills agents
         }
-        Err(_) => {
-            error!("ECS Thread panicked");
-        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 
     info!("Daemon heruntergefahren");
@@ -1959,49 +1971,81 @@ fn ecs_tick_loop(
         psi_io_gauge.set((adaptive_tick.io_avg10() * 10.0) as i64);
     }
 
-    // -- Graceful Shutdown: VACUUM-Thread abbrechen (AC-3 Issue #252) --
+    // ── Graceful Shutdown mit Timing-Instrumentierung (AC-4 #255) ──
+    let shutdown_start = Instant::now();
+
+    // 1. VACUUM-Thread abbrechen (AC-3 #252)
+    let t = Instant::now();
     if let Some(mut vac) = active_vacuum.take() {
-        info!("VACUUM-Thread wird abgebrochen...");
         vac.cancel_and_join(std::time::Duration::from_secs(5));
-        info!("VACUUM-Thread beendet");
     }
+    info!(duration_ms = t.elapsed().as_millis() as u64, "Shutdown: VACUUM cancel");
 
-    // -- Graceful Shutdown: Agent-Prozesse droppen (reaps Zombies via Drop impl) --
+    // 2. SIGTERM an alle Agent-Prozesse senden BEVOR Drop (AC-2 #255)
+    let t = Instant::now();
+    let agent_count = agent_processes.len();
+    for proc in agent_processes.values() {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &proc.pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    if agent_count > 0 {
+        // Kurz warten damit Agents auf SIGTERM reagieren koennen
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Drop reaps exitierte Prozesse via try_wait()
     agent_processes.clear();
+    info!(
+        agents = agent_count,
+        duration_ms = t.elapsed().as_millis() as u64,
+        "Shutdown: Agent-Teardown"
+    );
 
-    // -- Graceful Shutdown: Sandbox teardown fuer alle Agents --
+    // 3. Sandbox teardown (cgroups, netns)
+    let t = Instant::now();
     let teardown_count = sandbox_handles.len();
     for (agent_id, handle) in sandbox_handles.drain() {
         if let Err(e) = sandbox.teardown_agent(&handle) {
-            warn!(agent_id = %agent_id, error = %e, "Sandbox teardown bei Shutdown fehlgeschlagen");
+            warn!(agent_id = %agent_id, error = %e, "Sandbox teardown fehlgeschlagen");
         }
     }
-    if teardown_count > 0 {
-        info!(count = teardown_count, "Sandbox teardown abgeschlossen");
-    }
+    info!(
+        count = teardown_count,
+        duration_ms = t.elapsed().as_millis() as u64,
+        "Shutdown: Sandbox teardown"
+    );
 
-    // sim_hour vor Shutdown persistieren
+    // 4. sim_hour persistieren
+    let t = Instant::now();
     if let Err(e) = state_store_for_sim.set_sim_hour(sim_hour) {
         warn!(error = %e, "sim_hour Shutdown-Persist fehlgeschlagen");
     }
+    info!(duration_ms = t.elapsed().as_millis() as u64, "Shutdown: sim_hour persist");
 
-    // -- Graceful Shutdown: Despawn-Events fuer alle aktiven Agents emittieren --
-    // Ohne diese Events zaehlt die Projection occupant_count nur hoch (Spawn +1)
-    // aber nie runter (kein Despawn -1), was bei jedem Restart zu Drift fuehrt.
+    // 5. Despawn-Events emittieren (Projection occupant_count Drift vermeiden)
+    let t = Instant::now();
     let despawned = runtime_orch.despawn_all_for_shutdown();
-    if despawned > 0 {
-        info!(count = despawned, "Shutdown-Despawn Events emittiert");
-    }
+    info!(
+        agents = despawned,
+        duration_ms = t.elapsed().as_millis() as u64,
+        "Shutdown: Despawn-Events"
+    );
 
-    // -- Graceful Shutdown: Runtime-Snapshot speichern (AC-4 Issue #15) --
+    // 6. Runtime-Snapshot speichern
+    let t = Instant::now();
     if let Err(e) = runtime_orch.save_state() {
         error!(error = %e, "Runtime State Snapshot fehlgeschlagen");
     } else {
-        info!(
-            agent_count = runtime_orch.agent_count(),
-            "Runtime State Snapshot gespeichert"
-        );
+        info!(agent_count = runtime_orch.agent_count(), "Runtime State Snapshot gespeichert");
     }
+    info!(duration_ms = t.elapsed().as_millis() as u64, "Shutdown: Runtime-Snapshot");
+
+    info!(
+        total_ms = shutdown_start.elapsed().as_millis() as u64,
+        "Shutdown abgeschlossen"
+    );
 
     Ok(tick_count)
 }
