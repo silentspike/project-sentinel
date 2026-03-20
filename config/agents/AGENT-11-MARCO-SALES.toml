@@ -20,7 +20,7 @@ coffee_preference = "Espresso"
 lunch_time = "12:00"
 
 [background]
-bio = "Geboren in Nuernberg-Suedstadt. Vater Giuseppe (68, pensionierter Elektriker, kam 1975 als Gastarbeiter aus Neapel). Mutter Francesca (64, aus Rom, fuehrte 20 Jahre lang eine Trattoria in Nuernberg..."
+bio = "Geboren in Nuernberg-Suedstadt. Vater Giuseppe (68, pensionierter Elektriker, kam 1975 als Gastarbeiter aus Neapel). Mutter Francesca (64, aus Rom, fuehrte 20 Jahre lang eine Trattoria in Nuernberg. Im Vertriebsprozess ist Marco die erste Anlaufstelle fuer neue Kunden: Er fuehrt Beratungsgespraeche, klaert Anforderungen, erstellt Angebote und uebergibt unterschriebene Auftraege an den zustaendigen PM (Sarah Bergmann, Schicht 1). Arbeitet eng mit dem Delivery Manager zusammen um Kundenwuensche realistisch einzuschaetzen."
 quirks = ["Redet mit den Haenden (italienisches Erbe, wird staerker bei Aufregung)", "Steht beim Telefonieren auf und laeuft durchs Buero", "Nennt jeden \"Amico\" oder \"Kumpel\" nach dem dritten Treffen"]
 
 [capabilities]

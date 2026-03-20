@@ -27,8 +27,8 @@ fn ac_11_01_17_rooms() {
     let config = load_rooms_config();
     assert_eq!(
         config.rooms.len(),
-        17,
-        "Expected exactly 17 rooms, got {}",
+        26,
+        "Expected exactly 26 rooms, got {}",
         config.rooms.len()
     );
 }
@@ -104,7 +104,7 @@ fn ac_11_04_capacity_sum() {
 #[test]
 fn ac_11_06_validate() {
     let config = load_rooms_config();
-    let result = config.validate(17);
+    let result = config.validate(26);
     assert!(
         result.is_ok(),
         "BuildingConfig::validate(17) failed: {:?}",

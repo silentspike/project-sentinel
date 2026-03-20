@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Vollbetriebs-Vorbereitung: 9 Raeume, 6 Agents, Workflow-Infrastruktur** (#260)
+  - 9 neue Raeume in rooms.toml: buero-sales, buero-pm, buero-marketing, buero-admin, buero-qa, buero-it, buero-betriebsrat, buero-betriebspsych, buero-betriebsarzt (17 → 26 Raeume)
+  - Bidirektionale Adjacency fuer alle neuen Raeume (flur-eg + flur-og erweitert)
+  - 6 neue Agents (AGENT-55 bis AGENT-60): 3 QA Engineers + 3 Delivery Manager (1 pro Schicht)
+  - AgentId Range erweitert von 1-54 auf 1-60
+  - Workflow-Kontext in bestehenden Sales/PM/Tech-Lead Bios (9 Agents)
+  - daemon.toml max_agents von 30 auf 60 erhoeht
+  - Projection ROOM_IDS und Dashboard rooms-meta.ts um 9 Raeume erweitert
+  - Schichtverteilung: Set 1/2/3 je 15 → 17 Agents (+ QA + Delivery)
+
 ### Fixed
 
 - **Shutdown-Hang behoben + Timing-Instrumentierung** (#255)
