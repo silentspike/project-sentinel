@@ -34,10 +34,14 @@ jobs:
           filters: |
             rust:
               - 'crates/**'
+              - 'services/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
             go:
               - 'cmd/**'
+              - 'services/sentinel-judge/**'
+              - 'services/sentinel-nats-bridge/**'
+              - 'pkg/**'
               - 'go.work'
               - 'go.work.sum'
             dashboard:
