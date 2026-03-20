@@ -17,6 +17,9 @@ use crate::config::RetentionConfig;
 pub struct SnapshotManager {
     config: RetentionConfig,
     last_snapshot_tick: u64,
+    /// Aktiver Prune-Cutoff: wenn > 0, loescht prune_tick() 1 Batch pro Tick.
+    prune_cutoff: i64,
+    prune_total: u64,
 }
 
 impl SnapshotManager {
@@ -24,7 +27,50 @@ impl SnapshotManager {
         Self {
             config,
             last_snapshot_tick: 0,
+            prune_cutoff: 0,
+            prune_total: 0,
         }
+    }
+
+    /// Loescht einen kleinen Batch alle 10 Ticks. Aufgerufen aus dem Tick-Loop.
+    /// Nutzt die shared Connection — kein Lock-Konflikt, kein separater Thread.
+    pub fn prune_tick(&mut self, event_store: &EventStore, tick: u64) {
+        if self.prune_cutoff <= 0 {
+            return;
+        }
+        // Nur alle 10 Ticks einen Batch — gibt der API genug Fenster
+        if !tick.is_multiple_of(10) {
+            return;
+        }
+        match event_store.prune_batch(self.prune_cutoff, 500) {
+            Ok(0) => {
+                info!(total = self.prune_total, "Prune abgeschlossen");
+                self.prune_cutoff = 0;
+                self.prune_total = 0;
+            }
+            Ok(deleted) => {
+                self.prune_total += deleted;
+            }
+            Err(e) => {
+                debug!(error = %e, "Prune-Batch fehlgeschlagen");
+            }
+        }
+    }
+
+    /// Startet einen neuen Prune-Lauf (setzt Cutoff, prune_tick() arbeitet ab).
+    pub fn start_prune(&mut self, cutoff_event_id: i64) {
+        if self.prune_cutoff > 0 {
+            info!("Prune laeuft bereits — neuer Cutoff ignoriert");
+            return;
+        }
+        self.prune_cutoff = cutoff_event_id;
+        self.prune_total = 0;
+        info!(cutoff = cutoff_event_id, "Prune gestartet (1000 Rows/Tick)");
+    }
+
+    /// Gibt true zurueck wenn gerade ein Prune laeuft.
+    pub fn is_pruning(&self) -> bool {
+        self.prune_cutoff > 0
     }
 
     /// Prueft ob ein neuer Snapshot erstellt werden soll.
@@ -107,7 +153,7 @@ impl SnapshotManager {
     ///
     /// Promoted Snapshots durch die Tiers und loescht abgelaufene.
     /// Auto-Prune loescht Events vor dem zweitaeltesten Snapshot.
-    pub fn maintain(&self, event_store: &Arc<EventStore>) -> anyhow::Result<MaintenanceReport> {
+    pub fn maintain(&mut self, event_store: &Arc<EventStore>) -> anyhow::Result<MaintenanceReport> {
         let snapshots = event_store.list_world_snapshots()?;
         if snapshots.is_empty() {
             return Ok(MaintenanceReport::default());
@@ -185,19 +231,13 @@ impl SnapshotManager {
             info!(promoted, deleted, "Snapshot Maintenance abgeschlossen");
         }
 
-        // Auto-Prune: Events vor zweitaeltestem Snapshot loeschen
-        if self.config.auto_prune {
+        // Auto-Prune: Cutoff setzen, prune_tick() arbeitet 1 Batch/Tick ab
+        if self.config.auto_prune && !self.is_pruning() {
             let current_snapshots = event_store.list_world_snapshots().unwrap_or_default();
             if current_snapshots.len() >= 2 {
                 let prune_point = current_snapshots[current_snapshots.len() - 2].last_event_id;
-                match event_store.prune_events_before(prune_point) {
-                    Ok(pruned) if pruned > 0 => {
-                        info!(pruned, "Auto-Prune: Events geloescht");
-                    }
-                    Ok(_) => {} // Nichts zu prunen
-                    Err(e) => {
-                        debug!(error = %e, "Auto-Prune uebersprungen (Safety Guard)");
-                    }
+                if event_store.can_prune(prune_point).unwrap_or(false) {
+                    self.start_prune(prune_point);
                 }
             }
         }
