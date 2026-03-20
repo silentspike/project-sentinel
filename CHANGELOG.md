@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Shutdown-Hang behoben + Timing-Instrumentierung** (#255)
+  - Explizites SIGTERM an alle Agent-Prozesse vor Drop (kein Warten auf --die-with-parent)
+  - ECS-Thread Join mit 8s Timeout statt unbegrenztem Wait
+  - systemd TimeoutStopSec auf 15s (war default 90s)
+  - Shutdown-Timing-Logs fuer jeden Schritt (VACUUM, Agent-Teardown, Sandbox, Persist, Snapshot)
+
 - **VACUUM Daemon-Hang behoben** (#252)
   - `sentinel-limbo`: `vacuum()` nutzt jetzt eine eigene `rusqlite::Connection` statt die shared Writer-Mutex — blockiert keine anderen DB-Operationen mehr
   - `sentinel-limbo`: `VacuumHandle` struct mit Cancel-Flag (`AtomicBool`) und `progress_handler` fuer saubere Unterbrechung via SIGTERM
