@@ -12,6 +12,7 @@ WorkingDirectory=/opt/sentinel
 ExecStart=/opt/sentinel/bin/sentinel-daemon --config /opt/sentinel/config/daemon.toml
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=15
 MemoryMax=2G
 CPUAffinity=0-3
 OOMScoreAdjust=-1000
