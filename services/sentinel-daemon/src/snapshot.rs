@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use sentinel_common::{SnapshotMeta, SnapshotTier, WorldSnapshot};
-use sentinel_limbo::{EventStore, VacuumHandle};
+use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
 use tracing::{debug, info};
 
@@ -105,15 +105,12 @@ impl SnapshotManager {
 
     /// Promoted Snapshots durch die Tiers und loescht abgelaufene.
     ///
-    /// Gibt optional einen VacuumHandle zurueck wenn Auto-Prune VACUUM gestartet wurde.
-    /// Der Caller muss den Handle speichern und beim Shutdown canceln.
-    pub fn maintain(
-        &self,
-        event_store: &Arc<EventStore>,
-    ) -> anyhow::Result<(MaintenanceReport, Option<VacuumHandle>)> {
+    /// Promoted Snapshots durch die Tiers und loescht abgelaufene.
+    /// Auto-Prune loescht Events vor dem zweitaeltesten Snapshot.
+    pub fn maintain(&self, event_store: &Arc<EventStore>) -> anyhow::Result<MaintenanceReport> {
         let snapshots = event_store.list_world_snapshots()?;
         if snapshots.is_empty() {
-            return Ok((MaintenanceReport::default(), None));
+            return Ok(MaintenanceReport::default());
         }
 
         let now_ms = SystemTime::now()
@@ -188,16 +185,14 @@ impl SnapshotManager {
             info!(promoted, deleted, "Snapshot Maintenance abgeschlossen");
         }
 
-        // Auto-Prune: Events vor zweitaeltestem Snapshot loeschen (1h Puffer)
-        let mut vacuum_handle = None;
+        // Auto-Prune: Events vor zweitaeltestem Snapshot loeschen
         if self.config.auto_prune {
             let current_snapshots = event_store.list_world_snapshots().unwrap_or_default();
             if current_snapshots.len() >= 2 {
                 let prune_point = current_snapshots[current_snapshots.len() - 2].last_event_id;
                 match event_store.prune_events_before(prune_point) {
                     Ok(pruned) if pruned > 0 => {
-                        info!(pruned, "Auto-Prune: Events geloescht, starte VACUUM");
-                        vacuum_handle = Some(VacuumHandle::spawn(Arc::clone(event_store)));
+                        info!(pruned, "Auto-Prune: Events geloescht");
                     }
                     Ok(_) => {} // Nichts zu prunen
                     Err(e) => {
@@ -207,7 +202,7 @@ impl SnapshotManager {
             }
         }
 
-        Ok((MaintenanceReport { promoted, deleted }, vacuum_handle))
+        Ok(MaintenanceReport { promoted, deleted })
     }
 
     fn has_snapshot_for_day(

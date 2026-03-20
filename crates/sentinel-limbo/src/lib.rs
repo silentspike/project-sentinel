@@ -11,9 +11,7 @@
 pub mod event_store;
 pub mod outbox_publisher;
 
-pub use event_store::{
-    EventStore, MonotonicityError, OutboxEntry, OutboxTransport, SnapshotRow, VacuumHandle,
-};
+pub use event_store::{EventStore, MonotonicityError, OutboxEntry, OutboxTransport, SnapshotRow};
 pub use outbox_publisher::{OutboxPublisher, OutboxPublisherConfig, PublishCycleStats};
 
 // Re-export rusqlite fuer Daemon-seitige DB-Zugriffe (evolution.db)
