@@ -39,7 +39,7 @@ impl SnapshotManager {
             return;
         }
         // Nur alle 10 Ticks einen Batch — gibt der API genug Fenster
-        if tick % 10 != 0 {
+        if !tick.is_multiple_of(10) {
             return;
         }
         match event_store.prune_batch(self.prune_cutoff, 500) {
