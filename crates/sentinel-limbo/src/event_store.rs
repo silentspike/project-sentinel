@@ -13,7 +13,6 @@ use sentinel_common::DomainEvent;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tracing::{debug, info, instrument};
 
 /// Histogram-Buckets fuer EventStore Latenzen (Mikrosekunden).
@@ -641,17 +640,14 @@ impl EventStore {
         }
     }
 
-    /// Loescht alle Events mit id < cutoff_event_id.
-    ///
-    /// Safety: Prueft ob alle Projection-Offsets >= cutoff_event_id sind.
-    /// Nutzt eine separate Connection fuer Safety-Checks (read-only) und
-    /// batched DELETE (10.000 Rows pro Batch). Blockiert NICHT die shared Mutex.
-    pub fn prune_events_before(&self, cutoff_event_id: i64) -> anyhow::Result<u64> {
-        // Separate Connection — blockiert weder Tick-Loop noch API
-        let conn = Connection::open(&self.path)?;
-        conn.execute_batch("PRAGMA busy_timeout = 30000")?;
+    /// Prueft ob Pruning sicher ist (Projection-Offsets, Outbox-Backlog).
+    /// Gibt `Ok(true)` zurueck wenn Pruning erlaubt, `Ok(false)` bei Safety-Guard.
+    pub fn can_prune(&self, cutoff_event_id: i64) -> anyhow::Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
 
-        // Safety Guard: Pruefe ob alle Projections ueber dem Cutoff sind
         let min_offset: Option<i64> = conn
             .query_row(
                 "SELECT MIN(last_event_id) FROM projection_offsets",
@@ -661,13 +657,10 @@ impl EventStore {
             .ok();
         if let Some(min) = min_offset {
             if min < cutoff_event_id {
-                return Err(anyhow::anyhow!(
-                    "Prune blockiert: Projection-Offset ({min}) < Cutoff ({cutoff_event_id})"
-                ));
+                return Ok(false);
             }
         }
 
-        // Safety Guard: Pruefe Outbox-Backlog
         let pending_outbox: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM outbox WHERE status = 'pending'",
@@ -676,27 +669,27 @@ impl EventStore {
             )
             .unwrap_or(0);
         if pending_outbox > 0 {
-            return Err(anyhow::anyhow!(
-                "Prune blockiert: {pending_outbox} ausstehende Outbox-Eintraege"
-            ));
+            return Ok(false);
         }
 
-        // Batched DELETE: 10.000 Rows pro Batch, SQLite Writer-Lock nur pro Batch gehalten
-        const BATCH_SIZE: i64 = 10_000;
-        let mut total_deleted: u64 = 0;
-        loop {
-            let deleted = conn.execute(
-                "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE id < ?1 LIMIT ?2)",
-                params![cutoff_event_id, BATCH_SIZE],
-            )? as u64;
-            total_deleted += deleted;
-            if deleted == 0 {
-                break;
-            }
-            // Tick-Loop atmen lassen — WAL Writer-Lock kurz freigeben
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        Ok(total_deleted)
+        Ok(true)
+    }
+
+    /// Loescht einen einzelnen Batch von Events mit id < cutoff_event_id.
+    ///
+    /// Designed fuer Aufruf aus dem Tick-Loop: 1 Batch (1000 Rows) pro Tick.
+    /// Nutzt die shared Connection — kein separater Thread, kein Lock-Konflikt.
+    /// Gibt die Anzahl geloeschter Rows zurueck (0 = fertig).
+    pub fn prune_batch(&self, cutoff_event_id: i64, batch_size: i64) -> anyhow::Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let deleted = conn.execute(
+            "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE id < ?1 LIMIT ?2)",
+            params![cutoff_event_id, batch_size],
+        )? as u64;
+        Ok(deleted)
     }
 
     /// Gibt den DB-Pfad zurueck (fuer Tests / Diagnostik).
