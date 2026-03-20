@@ -3,7 +3,7 @@ config_dir = "/opt/sentinel/config"
 data_dir = "/opt/sentinel/data"
 tick_rate_ms = 1000
 time_scale = 1.0
-max_agents = 30
+max_agents = 60
 zenoh_prefix = "sentinel"
 
 # PSI-basierte adaptive Tick-Rate (TOGAF Adaptive Scheduling)
