@@ -12,10 +12,9 @@ use rusqlite::{params, Connection};
 use sentinel_common::DomainEvent;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tracing::{debug, info, instrument, warn};
+use std::time::Duration;
+use tracing::{debug, info, instrument};
 
 /// Histogram-Buckets fuer EventStore Latenzen (Mikrosekunden).
 #[cfg(feature = "telemetry")]
@@ -700,28 +699,6 @@ impl EventStore {
         Ok(total_deleted)
     }
 
-    /// VACUUM auf separater Connection — blockiert NICHT die shared Writer.
-    ///
-    /// Oeffnet eine eigene `rusqlite::Connection` zum gleichen DB-File.
-    /// `cancel` flag wird via `progress_handler` alle 10_000 VM-Instructions
-    /// geprueft; bei `true` wird VACUUM mit SQLITE_INTERRUPT abgebrochen.
-    pub fn vacuum(&self, cancel: Arc<AtomicBool>) -> anyhow::Result<()> {
-        let conn = Connection::open(&self.path)?;
-        conn.execute_batch("PRAGMA busy_timeout = 5000")?;
-        let _ = conn.progress_handler(10_000, Some(move || cancel.load(Ordering::Relaxed)));
-        match conn.execute_batch("VACUUM") {
-            Ok(()) => {
-                info!("VACUUM abgeschlossen");
-                Ok(())
-            }
-            Err(e) if e.to_string().contains("interrupted") => {
-                info!("VACUUM abgebrochen (Cancel-Signal)");
-                Ok(())
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-
     /// Gibt den DB-Pfad zurueck (fuer Tests / Diagnostik).
     pub fn db_path(&self) -> &Path {
         &self.path
@@ -962,70 +939,6 @@ impl EventStore {
             params![new_tier, id],
         )?;
         Ok(updated > 0)
-    }
-}
-
-// ──────────────────────────────────────────────
-// VacuumHandle — Thread-Lifecycle fuer VACUUM
-// ──────────────────────────────────────────────
-
-/// Handle fuer einen laufenden VACUUM-Thread.
-///
-/// Startet VACUUM auf separatem Thread mit Cancel-Flag.
-/// Drop-Impl cancelt und joint den Thread automatisch.
-pub struct VacuumHandle {
-    cancel: Arc<AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl VacuumHandle {
-    /// Startet VACUUM auf separatem Thread.
-    pub fn spawn(event_store: Arc<EventStore>) -> Self {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_clone = Arc::clone(&cancel);
-        let handle = std::thread::Builder::new()
-            .name("vacuum-worker".into())
-            .spawn(move || match event_store.vacuum(cancel_clone) {
-                Ok(()) => info!("VACUUM-Thread beendet"),
-                Err(e) => warn!(error = %e, "VACUUM-Thread Fehler"),
-            })
-            .expect("VACUUM-Thread starten");
-        Self {
-            cancel,
-            handle: Some(handle),
-        }
-    }
-
-    /// Bricht VACUUM ab und wartet max `timeout` auf Thread-Ende.
-    pub fn cancel_and_join(&mut self, timeout: Duration) {
-        self.cancel.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
-            let start = Instant::now();
-            loop {
-                if handle.is_finished() {
-                    let _ = handle.join();
-                    return;
-                }
-                if start.elapsed() > timeout {
-                    warn!(
-                        "VACUUM-Thread Timeout nach {:?} — Thread laeuft weiter",
-                        timeout
-                    );
-                    // Leak the handle — thread will finish eventually
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-    }
-}
-
-impl Drop for VacuumHandle {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
     }
 }
 
@@ -1503,65 +1416,6 @@ mod tests {
         // Reset auf nicht-existierenden Namen — kein Fehler
         store.reset_offset("does-not-exist").unwrap();
         assert_eq!(store.get_offset("does-not-exist").unwrap(), None);
-    }
-
-    /// AC-5 #252: vacuum() nutzt eigene Connection, blockiert nicht die shared Writer.
-    #[test]
-    fn test_vacuum_does_not_block_append() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test-vacuum-nonblock.db");
-        let store = Arc::new(EventStore::open(path.to_str().unwrap()).unwrap());
-
-        // Daten einfuegen damit VACUUM etwas zu tun hat
-        for i in 0..50u64 {
-            store
-                .append_event(&test_event("test_event", &format!("AGENT-{i:02}")))
-                .unwrap();
-        }
-
-        // VACUUM auf separatem Thread starten
-        let cancel = Arc::new(AtomicBool::new(false));
-        let store2 = Arc::clone(&store);
-        let cancel2 = Arc::clone(&cancel);
-        let t = std::thread::spawn(move || store2.vacuum(cancel2));
-
-        // Waehrenddessen append_event — DARF NICHT blockieren (< 1s)
-        let start = Instant::now();
-        store
-            .append_event(&test_event("concurrent_event", "AGENT-99"))
-            .unwrap();
-        assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "append_event blockiert waehrend VACUUM"
-        );
-
-        cancel.store(true, Ordering::SeqCst);
-        let _ = t.join();
-    }
-
-    /// AC-4 #252: Cancel-Flag beendet VACUUM sofort.
-    #[test]
-    fn test_vacuum_cancel_flag() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test-vacuum-cancel.db");
-        let store = EventStore::open(path.to_str().unwrap()).unwrap();
-
-        // Cancel sofort gesetzt — VACUUM muss trotzdem Ok zurueckgeben
-        let cancel = Arc::new(AtomicBool::new(true));
-        let result = store.vacuum(cancel);
-        assert!(result.is_ok(), "VACUUM mit sofortigem Cancel muss Ok sein");
-    }
-
-    /// #252: VacuumHandle startet und stoppt sauber.
-    #[test]
-    fn test_vacuum_handle_spawn_and_cancel() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test-vacuum-handle.db");
-        let store = Arc::new(EventStore::open(path.to_str().unwrap()).unwrap());
-
-        let mut handle = VacuumHandle::spawn(store);
-        handle.cancel_and_join(Duration::from_secs(2));
-        // Kein Hang, kein Panic — Test besteht wenn er zurueckkehrt
     }
 
     /// #252: db_path() gibt den korrekten Pfad zurueck.
