@@ -628,7 +628,7 @@ mod tests {
                 sentinel_limbo::EventStore::open(":memory:")
                     .expect("in-memory EventStore fuer Tests"),
             ),
-            };
+        };
         (state, rx)
     }
 
