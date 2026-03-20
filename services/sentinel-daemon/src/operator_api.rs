@@ -95,6 +95,7 @@ struct AppState {
     snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
     event_store: Arc<sentinel_limbo::EventStore>,
+    prune_tx: mpsc::Sender<i64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -162,6 +163,7 @@ pub async fn start_server(
     snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
     event_store: Arc<sentinel_limbo::EventStore>,
+    prune_tx: mpsc::Sender<i64>,
 ) -> AnyResult<tokio::task::JoinHandle<()>> {
     let listener = TcpListener::bind(&config.bind_addr)
         .await
@@ -175,6 +177,7 @@ pub async fn start_server(
         snapshot_tx,
         restore_tx,
         event_store,
+        prune_tx,
     };
 
     info!(
@@ -313,28 +316,29 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
         }
         OPERATOR_PRUNE_PATH => {
             info!("Manuelles Pruning via Operator-API angefordert");
-            let es = Arc::clone(&state.event_store);
-            std::thread::Builder::new()
-                .name("prune-worker".into())
-                .spawn(move || {
-                    let snapshots = es.list_world_snapshots().unwrap_or_default();
-                    if snapshots.len() < 2 {
-                        info!("Zu wenige Snapshots fuer Pruning");
-                        return;
-                    }
-                    let prune_point = snapshots[snapshots.len() - 2].last_event_id;
-                    match es.prune_events_before(prune_point) {
-                        Ok(deleted) => {
-                            info!(deleted, "Pruning abgeschlossen");
-                        }
-                        Err(e) => warn!(error = %e, "Pruning fehlgeschlagen"),
-                    }
-                })
-                .expect("prune-worker Thread starten");
-            json_response(
-                202,
-                serde_json::json!({"accepted": true, "message": "Pruning gestartet (asynchron)"}),
-            )
+            let snapshots = state.event_store.list_world_snapshots().unwrap_or_default();
+            if snapshots.len() < 2 {
+                return json_response(
+                    200,
+                    serde_json::json!({"accepted": false, "message": "Zu wenige Snapshots fuer Pruning"}),
+                );
+            }
+            let prune_point = snapshots[snapshots.len() - 2].last_event_id;
+            if !state.event_store.can_prune(prune_point).unwrap_or(false) {
+                return json_response(
+                    200,
+                    serde_json::json!({"accepted": false, "message": "Safety Guard: Projection-Offset oder Outbox blockiert Pruning"}),
+                );
+            }
+            match state.prune_tx.send(prune_point) {
+                Ok(()) => json_response(
+                    202,
+                    serde_json::json!({"accepted": true, "message": "Pruning gestartet (1000 Rows/Tick)"}),
+                ),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Prune-Channel nicht verfuegbar").to_response()
+                }
+            }
         }
         _ => ApiError::NotFound("Endpoint unbekannt").to_response(),
     }
@@ -628,6 +632,7 @@ mod tests {
                 sentinel_limbo::EventStore::open(":memory:")
                     .expect("in-memory EventStore fuer Tests"),
             ),
+            prune_tx: mpsc::channel().0,
         };
         (state, rx)
     }
