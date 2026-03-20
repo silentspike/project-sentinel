@@ -771,7 +771,6 @@ fn ecs_tick_loop(
 
     // Time Machine: SnapshotManager (Config aus daemon.toml)
     let mut snapshot_manager = crate::snapshot::SnapshotManager::new(retention_config);
-    let mut active_vacuum: Option<sentinel_limbo::VacuumHandle> = None;
 
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
@@ -1572,15 +1571,8 @@ fn ecs_tick_loop(
                         Ok(id) => {
                             debug!(snapshot_id = %id, "World Snapshot erstellt");
                             // Maintenance: Promotion + Cleanup
-                            match snapshot_manager.maintain(&es) {
-                                Ok((_, vac)) => {
-                                    if let Some(v) = vac {
-                                        active_vacuum = Some(v);
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "Snapshot Maintenance fehlgeschlagen");
-                                }
+                            if let Err(e) = snapshot_manager.maintain(&es) {
+                                warn!(error = %e, "Snapshot Maintenance fehlgeschlagen");
                             }
                         }
                         Err(e) => {
@@ -1974,17 +1966,7 @@ fn ecs_tick_loop(
     // ── Graceful Shutdown mit Timing-Instrumentierung (AC-4 #255) ──
     let shutdown_start = Instant::now();
 
-    // 1. VACUUM-Thread abbrechen (AC-3 #252)
-    let t = Instant::now();
-    if let Some(mut vac) = active_vacuum.take() {
-        vac.cancel_and_join(std::time::Duration::from_secs(5));
-    }
-    info!(
-        duration_ms = t.elapsed().as_millis() as u64,
-        "Shutdown: VACUUM cancel"
-    );
-
-    // 2. SIGTERM an alle Agent-Prozesse senden BEVOR Drop (AC-2 #255)
+    // 1. SIGTERM an alle Agent-Prozesse senden BEVOR Drop (AC-2 #255)
     let t = Instant::now();
     let agent_count = agent_processes.len();
     for proc in agent_processes.values() {
