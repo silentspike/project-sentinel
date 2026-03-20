@@ -504,6 +504,12 @@ unparseable = "unparseable"
 matcht = "matcht"
 Segmente = "Segmente"
 
+# Issue #260 - Agent bios (German words in TOML string literals)
+Reste = "Reste"
+GTI = "GTI"
+Perspektive = "Perspektive"
+Spanisch = "Spanisch"
+
 [files]
 extend-exclude = [
     "Cargo.lock",
