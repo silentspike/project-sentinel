@@ -44,10 +44,7 @@ impl SnapshotManager {
         }
         match event_store.prune_batch(self.prune_cutoff, 500) {
             Ok(0) => {
-                info!(
-                    total = self.prune_total,
-                    "Prune abgeschlossen"
-                );
+                info!(total = self.prune_total, "Prune abgeschlossen");
                 self.prune_cutoff = 0;
                 self.prune_total = 0;
             }
