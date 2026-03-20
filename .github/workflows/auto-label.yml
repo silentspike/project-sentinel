@@ -67,6 +67,14 @@ jobs:
               labels.push('comp:inference');
             if (text.includes('sandbox') || text.includes('bwrap') || text.includes('cgroup'))
               labels.push('comp:sandbox');
+            if (text.includes('controlplane') || text.includes('self-healing') || text.includes('platform'))
+              labels.push('comp:daemon');
+            if (text.includes('security') || text.includes('ransomware') || text.includes('landlock'))
+              labels.push('type:security');
+            if (text.includes('gaia') || text.includes('konfigurator') || text.includes('wizard'))
+              labels.push('comp:runtime');
+            if (text.includes('resource') || text.includes('scheduling') || text.includes('dynamic') && text.includes('limit'))
+              labels.push('comp:sandbox');
 
             if (labels.length > 0) {
               await github.rest.issues.addLabels({
