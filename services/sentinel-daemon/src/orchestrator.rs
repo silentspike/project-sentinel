@@ -369,6 +369,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let (nightrun_tx, nightrun_rx) = mpsc::channel::<sentinel_common::OperatorNightrunCommand>();
     let (snapshot_tx, snapshot_rx) = mpsc::channel::<sentinel_common::OperatorSnapshotCommand>();
     let (restore_tx, restore_rx) = mpsc::channel::<sentinel_common::OperatorRestoreCommand>();
+    let (prune_tx, prune_rx) = mpsc::channel::<i64>();
     let (perception_tx, perception_rx) = mpsc::sync_channel::<Perception>(64);
 
     // -- Zenoh SentinelBus (Core-Bus fuer Real-Time Event-Verteilung) --
@@ -443,6 +444,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 snapshot_tx.clone(),
                 restore_tx.clone(),
                 Arc::clone(&event_store),
+                prune_tx.clone(),
             )
             .await?,
         )
@@ -492,6 +494,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 nightrun_rx,
                 snapshot_rx,
                 restore_rx,
+                prune_rx,
                 config.retention.clone(),
                 evolution_db_path_clone,
                 agent_command_cfg,
@@ -759,6 +762,7 @@ fn ecs_tick_loop(
     nightrun_rx: mpsc::Receiver<sentinel_common::OperatorNightrunCommand>,
     snapshot_rx: mpsc::Receiver<sentinel_common::OperatorSnapshotCommand>,
     restore_rx: mpsc::Receiver<sentinel_common::OperatorRestoreCommand>,
+    prune_rx: mpsc::Receiver<i64>,
     retention_config: crate::config::RetentionConfig,
     evolution_db_path: String,
     agent_command_cfg: Vec<String>,
@@ -790,6 +794,7 @@ fn ecs_tick_loop(
         telemetry.enabled = true;
     }
     let event_store_for_episodes = Arc::clone(&event_store);
+    let event_store_for_prune = Arc::clone(&event_store);
     world.insert_resource(LimboEventStore(event_store));
     world.insert_resource(ActionReceiver(std::sync::Mutex::new(action_rx)));
     world.insert_resource(sentinel_ecs::OperatorCommandReceiver(
@@ -1158,6 +1163,12 @@ fn ecs_tick_loop(
 
         // ECS Schedule ausfuehren (alle 12 Systems in Reihenfolge)
         schedule.run(&mut world);
+
+        // Prune: Empfange Cutoff von Operator-API, arbeite 1 Batch/Tick ab
+        while let Ok(cutoff) = prune_rx.try_recv() {
+            snapshot_manager.start_prune(cutoff);
+        }
+        snapshot_manager.prune_tick(&event_store_for_prune, tick_count);
 
         // Controlplane-Zyklus (alle N Ticks) — SENTINEL_CONTROLPLANE_ENABLED gate (AC-6)
         if sentinel_common::feature_flags::RuntimeFlags::global().controlplane_enabled
@@ -2287,6 +2298,7 @@ mod tests {
             mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
             mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
             mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+            mpsc::channel::<i64>().1,
             crate::config::RetentionConfig::default(),
             String::new(),
             vec!["true".to_string()],
@@ -2350,6 +2362,7 @@ mod tests {
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+                mpsc::channel::<i64>().1,
                 crate::config::RetentionConfig::default(),
                 String::new(),
                 vec!["true".to_string()],
@@ -2430,6 +2443,7 @@ mod tests {
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+                mpsc::channel::<i64>().1,
                 crate::config::RetentionConfig::default(),
                 String::new(),
                 vec!["true".to_string()],
@@ -2518,6 +2532,7 @@ mod tests {
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+                mpsc::channel::<i64>().1,
                 crate::config::RetentionConfig::default(),
                 String::new(),
                 vec!["true".to_string()],
