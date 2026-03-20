@@ -1979,7 +1979,10 @@ fn ecs_tick_loop(
     if let Some(mut vac) = active_vacuum.take() {
         vac.cancel_and_join(std::time::Duration::from_secs(5));
     }
-    info!(duration_ms = t.elapsed().as_millis() as u64, "Shutdown: VACUUM cancel");
+    info!(
+        duration_ms = t.elapsed().as_millis() as u64,
+        "Shutdown: VACUUM cancel"
+    );
 
     // 2. SIGTERM an alle Agent-Prozesse senden BEVOR Drop (AC-2 #255)
     let t = Instant::now();
@@ -2022,7 +2025,10 @@ fn ecs_tick_loop(
     if let Err(e) = state_store_for_sim.set_sim_hour(sim_hour) {
         warn!(error = %e, "sim_hour Shutdown-Persist fehlgeschlagen");
     }
-    info!(duration_ms = t.elapsed().as_millis() as u64, "Shutdown: sim_hour persist");
+    info!(
+        duration_ms = t.elapsed().as_millis() as u64,
+        "Shutdown: sim_hour persist"
+    );
 
     // 5. Despawn-Events emittieren (Projection occupant_count Drift vermeiden)
     let t = Instant::now();
@@ -2038,9 +2044,15 @@ fn ecs_tick_loop(
     if let Err(e) = runtime_orch.save_state() {
         error!(error = %e, "Runtime State Snapshot fehlgeschlagen");
     } else {
-        info!(agent_count = runtime_orch.agent_count(), "Runtime State Snapshot gespeichert");
+        info!(
+            agent_count = runtime_orch.agent_count(),
+            "Runtime State Snapshot gespeichert"
+        );
     }
-    info!(duration_ms = t.elapsed().as_millis() as u64, "Shutdown: Runtime-Snapshot");
+    info!(
+        duration_ms = t.elapsed().as_millis() as u64,
+        "Shutdown: Runtime-Snapshot"
+    );
 
     info!(
         total_ms = shutdown_start.elapsed().as_millis() as u64,
