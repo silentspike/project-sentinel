@@ -51,6 +51,10 @@ pub const FS_CHUNKS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("f
 pub const FS_CHUNK_REFCOUNT: TableDefinition<&[u8; 16], u32> =
     TableDefinition::new("fs_chunk_refcount");
 
+/// Trash queue for GC grace period: chunk_hash → trashed_at_ms (Unix epoch).
+/// Chunks mit Refcount 0 werden hier zwischengespeichert statt sofort geloescht.
+pub const FS_TRASH_QUEUE: TableDefinition<&[u8; 16], u64> = TableDefinition::new("fs_trash_queue");
+
 /// Named object references: name -> ObjectId.
 pub const FS_OBJECT_REFS: TableDefinition<&str, u64> = TableDefinition::new("fs_object_refs");
 

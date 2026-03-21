@@ -391,6 +391,10 @@ pub struct PlatformControlplaneConfig {
     pub memory_pressure_threshold: f64,
     #[serde(default = "default_pcp_max_escalation")]
     pub max_escalation: u32,
+    #[serde(default = "default_pcp_write_anomaly_threshold")]
+    pub write_anomaly_threshold_bytes_per_sec: u64,
+    #[serde(default = "default_pcp_write_anomaly_cooldown")]
+    pub write_anomaly_cooldown_ticks: u64,
 }
 
 fn default_pcp_enabled() -> bool {
@@ -417,6 +421,12 @@ fn default_pcp_memory_pressure() -> f64 {
 fn default_pcp_max_escalation() -> u32 {
     3
 }
+fn default_pcp_write_anomaly_threshold() -> u64 {
+    5_000_000 // 5 MB/s
+}
+fn default_pcp_write_anomaly_cooldown() -> u64 {
+    60
+}
 
 impl Default for PlatformControlplaneConfig {
     fn default() -> Self {
@@ -429,6 +439,8 @@ impl Default for PlatformControlplaneConfig {
             max_projection_lag: default_pcp_max_projection_lag(),
             memory_pressure_threshold: default_pcp_memory_pressure(),
             max_escalation: default_pcp_max_escalation(),
+            write_anomaly_threshold_bytes_per_sec: default_pcp_write_anomaly_threshold(),
+            write_anomaly_cooldown_ticks: default_pcp_write_anomaly_cooldown(),
         }
     }
 }

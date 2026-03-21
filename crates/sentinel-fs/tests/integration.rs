@@ -482,14 +482,20 @@ fn ac4_dedup_gc_full_lifecycle() {
     let baseline = plane.chunk_count().unwrap();
 
     release_object(&plane, id1).unwrap();
-    assert_eq!(gc_chunks(&plane).unwrap().removed, 0, "shared: no GC");
+    assert_eq!(gc_chunks(&plane).unwrap().trashed, 0, "shared: no trash");
     assert_eq!(plane.chunk_count().unwrap(), baseline);
 
     release_object(&plane, id2).unwrap();
     let gc2 = gc_chunks(&plane).unwrap();
-    assert_eq!(gc2.removed, baseline, "orphans: all GC'd");
+    assert_eq!(gc2.trashed, baseline, "orphans: all trashed");
+    // Chunks still in index (trash queue, not yet freed)
+    assert_eq!(plane.chunk_count().unwrap(), baseline);
+
+    // gc_trash with 0 grace → immediate free
+    let trash_stats = sentinel_fs::gc::gc_trash(&plane, 0).unwrap();
+    assert_eq!(trash_stats.freed_from_trash, baseline);
     assert_eq!(plane.chunk_count().unwrap(), 0);
-    assert!(gc2.freed_bytes > 0);
+    assert!(trash_stats.freed_bytes > 0);
 }
 
 /// Compression: compressible data smaller on disk.

@@ -221,6 +221,10 @@ fn decode_blob(encoded: &[u8]) -> anyhow::Result<Vec<u8>> {
 pub struct ChunkGcStats {
     pub removed: u64,
     pub freed_bytes: u64,
+    /// Chunks moved to trash queue (grace period before deletion).
+    pub trashed: u64,
+    /// Chunks freed from trash queue after grace period expired.
+    pub freed_from_trash: u64,
 }
 
 /// Encode bytes as lowercase hex string.
