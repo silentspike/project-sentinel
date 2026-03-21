@@ -391,6 +391,13 @@ impl PersistTelemetry {
 #[derive(Resource)]
 pub struct ActionReceiver(pub std::sync::Mutex<std::sync::mpsc::Receiver<AgentAction>>);
 
+/// Sammelt Agent-IDs die in diesem Tick eine Action ausgefuehrt haben.
+///
+/// Befuellt von input_system (LLM-Actions) und autonomy_system (Bio-P0-Actions).
+/// Orchestrator liest nach schedule.run() und synct zu RuntimeOrchestrator.record_activity().
+#[derive(Resource, Default)]
+pub struct ActiveAgentsThisTick(pub Vec<AgentId>);
+
 /// Empfaengt Operator-Kommandos fuer manuelles Chaos aus dem Daemon.
 #[derive(Resource)]
 pub struct OperatorCommandReceiver(
@@ -511,6 +518,7 @@ pub fn create_simulation_world() -> (World, Schedule) {
     world.insert_resource(ActiveChaos::default());
     world.insert_resource(ActiveRoomStimuli::default());
     world.insert_resource(RoomPhysicsState::default());
+    world.insert_resource(ActiveAgentsThisTick::default());
 
     // System-Reihenfolge via configure_sets (10 Phasen)
     schedule.configure_sets(

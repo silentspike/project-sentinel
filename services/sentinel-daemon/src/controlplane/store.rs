@@ -232,6 +232,47 @@ impl ControlplaneStore {
         Ok(count)
     }
 
+    /// Entfernt Incidents wenn mehr als `keep` vorhanden sind (aelteste zuerst).
+    ///
+    /// Behaelt die `keep` neuesten Incidents (nach Tick sortiert).
+    /// Wird periodisch vom Controlplane-Zyklus aufgerufen.
+    pub fn gc_old_incidents(&self, keep: usize) -> Result<usize> {
+        let mut entries: Vec<(String, u64)> = {
+            let read_txn = self.db.begin_read()?;
+            let table = read_txn.open_table(CONTROL_INCIDENTS)?;
+
+            let mut entries = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                let incident: Incident = serde_json::from_slice(value.value())
+                    .context("Incident deserialisieren (GC)")?;
+                entries.push((key.value().to_string(), incident.tick));
+            }
+            if entries.len() <= keep {
+                return Ok(0);
+            }
+            entries
+        };
+
+        // Aelteste zuerst sortieren, die zu loeschenden bestimmen
+        entries.sort_by_key(|(_, tick)| *tick);
+        let to_remove = entries.len() - keep;
+        let ids_to_remove: Vec<String> =
+            entries.into_iter().take(to_remove).map(|(id, _)| id).collect();
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(CONTROL_INCIDENTS)?;
+            for id in &ids_to_remove {
+                table.remove(id.as_str())?;
+            }
+        }
+        write_txn.commit()?;
+
+        debug!(removed = ids_to_remove.len(), kept = keep, "Alte Incidents bereinigt (GC)");
+        Ok(ids_to_remove.len())
+    }
+
     // -- Batch Cycle Write (Single Transaction) --
 
     /// Schreibt alle Daten eines Controlplane-Zyklus in EINER Transaktion.
@@ -434,5 +475,62 @@ mod tests {
         store.set_config("policy_a", b"test_value").unwrap();
         let val = store.get_config("policy_a").unwrap();
         assert_eq!(val, Some(b"test_value".to_vec()));
+    }
+
+    #[test]
+    fn test_gc_old_incidents_removes_oldest() {
+        let (_tmp, store) = temp_store();
+
+        // 5 Incidents einfuegen mit aufsteigenden Ticks
+        for i in 0..5u64 {
+            let incident = Incident {
+                id: format!("inc-{i:03}"),
+                tick: (i + 1) * 100,
+                timestamp_ms: (i + 1) * 1000,
+                incident_type: IncidentType::HungerCritical,
+                severity: Severity::Medium,
+                agent_id: Some(1),
+                description: format!("Incident {i}"),
+            };
+            store.log_incident(&incident).unwrap();
+        }
+
+        // keep=3 → 2 aelteste loeschen
+        let removed = store.gc_old_incidents(3).unwrap();
+        assert_eq!(removed, 2);
+
+        let remaining = store.get_recent_incidents(10).unwrap();
+        assert_eq!(remaining.len(), 3);
+        // Neueste muessen uebrig sein (Ticks 300, 400, 500)
+        let ticks: Vec<u64> = remaining.iter().map(|i| i.tick).collect();
+        assert!(ticks.contains(&300));
+        assert!(ticks.contains(&400));
+        assert!(ticks.contains(&500));
+    }
+
+    #[test]
+    fn test_gc_old_incidents_noop_when_below_keep() {
+        let (_tmp, store) = temp_store();
+
+        // 2 Incidents einfuegen
+        for i in 0..2u64 {
+            let incident = Incident {
+                id: format!("inc-{i:03}"),
+                tick: (i + 1) * 100,
+                timestamp_ms: (i + 1) * 1000,
+                incident_type: IncidentType::HungerCritical,
+                severity: Severity::Low,
+                agent_id: None,
+                description: format!("Incident {i}"),
+            };
+            store.log_incident(&incident).unwrap();
+        }
+
+        // keep=5 → nichts loeschen (nur 2 vorhanden)
+        let removed = store.gc_old_incidents(5).unwrap();
+        assert_eq!(removed, 0);
+
+        let remaining = store.get_recent_incidents(10).unwrap();
+        assert_eq!(remaining.len(), 2);
     }
 }

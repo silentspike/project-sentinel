@@ -68,6 +68,7 @@ pub fn input_system(
     mut event_buffer: ResMut<EventBuffer>,
     time: Res<SimulationTime>,
     mut active_smells: ResMut<super::world::ActiveSmells>,
+    mut active_agents: ResMut<super::world::ActiveAgentsThisTick>,
 ) {
     let Some(receiver) = receiver else { return };
     let Ok(rx) = receiver.0.lock() else { return };
@@ -85,6 +86,7 @@ pub fn input_system(
                 continue;
             }
             found = true;
+            active_agents.0.push(action.agent_id);
 
             match action.action_type {
                 ActionType::Move => {

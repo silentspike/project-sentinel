@@ -192,7 +192,7 @@ impl RuntimeOrchestrator {
             identity,
             shift,
             status: AgentStatus::Active,
-            last_activity_tick: Tick(0),
+            last_activity_tick: Tick(self.current_tick),
         };
 
         self.agents.insert(agent_id, handle);
@@ -412,6 +412,16 @@ impl RuntimeOrchestrator {
     /// Read-only Zugriff auf alle Agent-Handles (fuer Resource Manager).
     pub fn agents(&self) -> &std::collections::HashMap<AgentId, AgentHandle> {
         &self.agents
+    }
+
+    /// Aktualisiert last_activity_tick fuer einen Agent.
+    ///
+    /// Aufgerufen wenn ein Agent eine Action ausfuehrt (LLM-driven oder autonom).
+    /// Ermoeglicht dem Resource Manager korrekte Idle/Normal-Erkennung.
+    pub fn record_activity(&mut self, agent_id: AgentId, tick: u64) {
+        if let Some(handle) = self.agents.get_mut(&agent_id) {
+            handle.last_activity_tick = Tick(tick);
+        }
     }
 
     /// Emits AgentDespawned events for all active agents during graceful shutdown.

@@ -41,6 +41,7 @@ pub fn autonomy_system(
     time: Res<SimulationTime>,
     mut event_buffer: ResMut<EventBuffer>,
     mut active_smells: ResMut<super::world::ActiveSmells>,
+    mut active_agents: ResMut<super::world::ActiveAgentsThisTick>,
 ) {
     let tick = time.tick.0;
 
@@ -87,6 +88,7 @@ pub fn autonomy_system(
                 );
             }
             cooldown.last_action_tick = tick;
+            active_agents.0.push(identity.agent_id);
             continue;
         }
 
@@ -135,6 +137,7 @@ pub fn autonomy_system(
                 );
             }
             cooldown.last_action_tick = tick;
+            active_agents.0.push(identity.agent_id);
             continue;
         }
 
@@ -183,6 +186,7 @@ pub fn autonomy_system(
                 );
             }
             cooldown.last_action_tick = tick;
+            active_agents.0.push(identity.agent_id);
             continue;
         }
 
@@ -200,6 +204,7 @@ pub fn autonomy_system(
                     &room_distances,
                 );
                 cooldown.last_action_tick = tick;
+                active_agents.0.push(identity.agent_id);
             }
             continue;
         }
@@ -219,6 +224,7 @@ pub fn autonomy_system(
                     &room_distances,
                 );
                 cooldown.last_action_tick = tick;
+                active_agents.0.push(identity.agent_id);
             }
         }
     }
