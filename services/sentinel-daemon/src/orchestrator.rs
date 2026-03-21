@@ -792,6 +792,8 @@ fn ecs_tick_loop(
     let mut platform_cp =
         crate::platform_controlplane::PlatformControlplane::new(platform_cp_config);
     let mut last_ebpf_snapshot: Option<sentinel_ebpf::collector::MetricsSnapshot> = None;
+    let mut pcp_metrics_collector =
+        crate::platform_controlplane::metrics::PlatformMetricsCollector::default();
 
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
@@ -1202,6 +1204,7 @@ fn ecs_tick_loop(
                 .map(|h| h.identity.name.clone())
                 .collect();
             let pcp_metrics = crate::platform_controlplane::metrics::collect(
+                &mut pcp_metrics_collector,
                 &last_ebpf_snapshot,
                 &event_store_for_prune,
                 &events_db_path_str,

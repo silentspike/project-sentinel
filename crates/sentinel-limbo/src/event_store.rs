@@ -191,6 +191,18 @@ impl EventStore {
         conn.execute(CREATE_IDX_WORLD_SNAPSHOTS_TIER, [])?;
         conn.execute_batch(CREATE_PROJECTION_OFFSETS)?;
 
+        // Security: Immutable Snapshots — Schutz vor Loeschung junger Snapshots
+        let immutable_ms: i64 = 7 * 86400 * 1000; // 7 Tage
+        conn.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS protect_recent_snapshots;
+             CREATE TRIGGER protect_recent_snapshots
+             BEFORE DELETE ON world_snapshots
+             WHEN (CAST(strftime('%s','now') AS INTEGER) * 1000 - OLD.created_at) < {immutable_ms}
+             BEGIN
+                 SELECT RAISE(ABORT, 'Cannot delete snapshot younger than 7 days');
+             END;"
+        ))?;
+
         info!("EventStore opened at {path}");
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -1418,5 +1430,53 @@ mod tests {
         let path = dir.path().join("test-path.db");
         let store = EventStore::open(path.to_str().unwrap()).unwrap();
         assert_eq!(store.db_path(), path);
+    }
+
+    /// #264: Immutable Snapshots — DELETE auf jungen Snapshot wird blockiert.
+    #[test]
+    fn test_snapshot_delete_blocked_within_7_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-immutable.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        // Snapshot speichern (created_at = jetzt → innerhalb 7 Tage)
+        store
+            .save_world_snapshot("snap-1", "hourly", 100, 8.0, 50, b"test-payload")
+            .unwrap();
+
+        // DELETE muss fehlschlagen (Trigger blockiert)
+        let result = store.delete_world_snapshot("snap-1");
+        assert!(
+            result.is_err(),
+            "DELETE auf jungen Snapshot sollte vom Trigger blockiert werden"
+        );
+    }
+
+    /// #264: Immutable Snapshots — DELETE auf alten Snapshot funktioniert.
+    #[test]
+    fn test_snapshot_delete_allowed_after_7_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-immutable-old.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        // Snapshot mit altem created_at direkt einfuegen (> 7 Tage alt)
+        let old_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - (8 * 86400 * 1000); // 8 Tage alt
+
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO world_snapshots (id, tier, tick, sim_hour, last_event_id, payload_size, payload, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params!["snap-old", "hourly", 50, 4.0, 25, 4, b"old", old_ts],
+        )
+        .unwrap();
+
+        // DELETE auf alten Snapshot muss funktionieren
+        let deleted = conn
+            .execute("DELETE FROM world_snapshots WHERE id = 'snap-old'", [])
+            .unwrap();
+        assert_eq!(deleted, 1, "DELETE auf alten Snapshot sollte funktionieren");
     }
 }
