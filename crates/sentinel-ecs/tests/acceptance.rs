@@ -18,7 +18,14 @@ use std::{path::Path, sync::Arc};
 #[test]
 fn ac_09_02_spawn_agent_10_components() {
     let (mut world, _schedule) = create_simulation_world();
-    let entity = spawn_agent(&mut world, AgentId(1), "Thomas Mueller", "CEO", 1, "empfang");
+    let entity = spawn_agent(
+        &mut world,
+        AgentId(1),
+        "Thomas Mueller",
+        "CEO",
+        1,
+        "empfang",
+    );
 
     // Alle 10 Components muessen vorhanden sein
     assert!(

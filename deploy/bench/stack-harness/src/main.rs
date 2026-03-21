@@ -1,7 +1,9 @@
 use anyhow::Context;
 use sentinel_common::{AgentId, Emotion, RoomId, Tick, Timestamp};
 use sentinel_ebpf::{AgentHealthChecker, IoProfiler, NetworkMonitor, PsiReader};
-use sentinel_ecs::{attach_redb_store, create_simulation_world, spawn_agent, RedbStateStore, SimulationTime};
+use sentinel_ecs::{
+    attach_redb_store, create_simulation_world, spawn_agent, RedbStateStore, SimulationTime,
+};
 use sentinel_inference::{BitNetClient, BitNetConfig};
 use sentinel_limbo::{ChatStore, NewMessage};
 use sentinel_redb::StateStore;
@@ -554,10 +556,10 @@ fn bench_decision() -> anyhow::Result<()> {
     for (idx, &entity) in entities.iter().enumerate() {
         let mut bio = world.get_mut::<BioState>(entity).unwrap();
         match idx % 6 {
-            0 => bio.bladder = 92.0,    // P0: Toilette-Notfall
-            1 => bio.energy = 12.0,     // P0: Energie-Notfall
-            2 => bio.hunger = 85.0,     // P1: Hunger
-            3 => bio.stress = 75.0,     // P2: Stress
+            0 => bio.bladder = 92.0,     // P0: Toilette-Notfall
+            1 => bio.energy = 12.0,      // P0: Energie-Notfall
+            2 => bio.hunger = 85.0,      // P1: Hunger
+            3 => bio.stress = 75.0,      // P2: Stress
             4 => bio.caffeine_mg = 10.0, // P2: Koffein-Entzug
             _ => {}                      // Default: keine Events
         }
@@ -597,7 +599,8 @@ fn bench_decision() -> anyhow::Result<()> {
 }
 
 fn bench_bitnet() {
-    let binary = std::env::var("BITNET_BINARY").unwrap_or_else(|_| "bitnet/bitnet-inference".into());
+    let binary =
+        std::env::var("BITNET_BINARY").unwrap_or_else(|_| "bitnet/bitnet-inference".into());
     let model = std::env::var("BITNET_MODEL").unwrap_or_else(|_| "bitnet/model.gguf".into());
     let threads = std::env::var("BITNET_THREADS")
         .ok()
