@@ -1,3 +1,4 @@
+// Sentinel Dashboard — Hono API + Vanilla JS Frontend.
 import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
 import { openDatabases } from "./db";
@@ -80,4 +81,3 @@ if (import.meta.main) {
   }, 30000);
   console.log(`Dashboard running on http://localhost:${port}`);
 }
-// CI hosted runner validation test

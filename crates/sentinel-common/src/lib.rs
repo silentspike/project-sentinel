@@ -1,5 +1,6 @@
 //! Shared types and FlatBuffer schemas for Project Sentinel.
 //!
+//! Core library for the Sentinel neuro-symbolic AI platform.
 //! This crate defines the common data structures used across all sentinel crates.
 //! Serialization strategy:
 //! - Internal (Zenoh Pub/Sub): FlatBuffers (zero-copy)
@@ -300,4 +301,3 @@ mod tests {
         assert_eq!(deserialized.target_room, Some(RoomId(5)));
     }
 }
-// CI hosted runner validation test

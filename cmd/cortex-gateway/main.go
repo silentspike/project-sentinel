@@ -1,3 +1,4 @@
+// Cortex Gateway — transparent LLM proxy for the Sentinel simulation.
 package main
 
 import (
@@ -338,4 +339,3 @@ func loadAgentProfiles(loader *compiler.TOMLLoader, detector *judge.DriftDetecto
 	}
 	logger.Info("agent personality profiles loaded", "count", loaded, "agents_dir", agentsDir)
 }
-// CI hosted runner validation test
