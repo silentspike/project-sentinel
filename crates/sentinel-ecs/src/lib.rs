@@ -1171,6 +1171,95 @@ mod tests {
         assert_eq!(payload["from_room"].as_str().unwrap(), "empfang");
     }
 
+    /// Move zu ungueltigem Raum wird ignoriert (kein Transit)
+    #[test]
+    fn test_move_to_invalid_room_ignored() {
+        let (mut world, mut schedule) = create_simulation_world();
+
+        let rooms_toml = include_str!("../../../config/rooms.toml");
+        let building_config: sentinel_common::room::BuildingConfig =
+            toml::from_str(rooms_toml).expect("rooms.toml parse error");
+        let rdm = RoomDistanceMap::from_building_config(&building_config);
+        world.insert_resource(rdm);
+
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
+
+        // Move nach "Tuer" — existiert NICHT in rooms.toml
+        tx.send(AgentAction {
+            agent_id: AgentId(1),
+            action_type: ActionType::Move,
+            target_room: Some("Tuer".to_string()),
+            target_agent: None,
+            content: None,
+            timestamp: Timestamp(1000),
+            tick: Tick(1),
+        })
+        .unwrap();
+
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(1);
+            time.tick_count = 1;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 8.0;
+        }
+        schedule.run(&mut world);
+
+        // Agent darf NICHT in Transit sein — Action wurde ignoriert
+        let pos = world.get::<Position>(entity).unwrap();
+        assert!(
+            !pos.in_transit,
+            "Agent should NOT be in transit after invalid room move"
+        );
+        assert_eq!(pos.room_id, "empfang", "Agent should still be in empfang");
+        assert!(pos.transit_target.is_none());
+    }
+
+    /// Move zu gueltigem Raum funktioniert weiterhin
+    #[test]
+    fn test_move_to_valid_room_works() {
+        let (mut world, mut schedule) = create_simulation_world();
+
+        let rooms_toml = include_str!("../../../config/rooms.toml");
+        let building_config: sentinel_common::room::BuildingConfig =
+            toml::from_str(rooms_toml).expect("rooms.toml parse error");
+        let rdm = RoomDistanceMap::from_building_config(&building_config);
+        world.insert_resource(rdm);
+
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
+
+        // Move nach "kueche" — gueltig
+        tx.send(AgentAction {
+            agent_id: AgentId(1),
+            action_type: ActionType::Move,
+            target_room: Some("kueche".to_string()),
+            target_agent: None,
+            content: None,
+            timestamp: Timestamp(1000),
+            tick: Tick(1),
+        })
+        .unwrap();
+
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(1);
+            time.tick_count = 1;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 8.0;
+        }
+        schedule.run(&mut world);
+
+        let pos = world.get::<Position>(entity).unwrap();
+        assert!(pos.in_transit, "Agent should be in transit to valid room");
+        assert_eq!(pos.transit_target, Some("kueche".to_string()));
+    }
+
     /// ToolUse ohne ToolRuntime: Fallback auf WorkContext
     #[test]
     fn test_tool_dispatch_fallback_without_runtime() {
