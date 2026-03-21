@@ -8,7 +8,9 @@ pub mod netns;
 pub mod psi_publisher;
 
 pub use bwrap::BwrapConfig;
-pub use cgroups::{cgroup_id, cgroup_path, resize_cgroup, CgroupLimits, PsiMetrics, ResourceProfile};
+pub use cgroups::{
+    cgroup_id, cgroup_path, resize_cgroup, CgroupLimits, PsiMetrics, ResourceProfile,
+};
 pub use enforcer::{AgentProcess, SandboxEnforcer, SandboxHandle, SandboxWarning};
 pub use landlock::LandlockRuleset;
 pub use netns::NetworkNsConfig;
