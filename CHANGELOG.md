@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Move-Action zu ungueltigem Raum validiert** — Agent konnte in nicht-existierenden Raum (z.B. "Tuer") wechseln. Fix: input_system validiert target_room gegen RoomDistanceMap.
+
 - **Agents spawnen nicht in favorite_room** (#272)
   - ECS `spawn_agent()` hardcoded `"empfang"` statt `favorite_room` aus Agent-Config
   - Fix: `room_id` Parameter hinzugefuegt, Orchestrator uebergibt `preferences.favorite_room`
