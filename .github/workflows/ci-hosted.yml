@@ -98,7 +98,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - uses: actions/cache@5a3ec84eff668545956fd18022fa3e4de14837ab # v4.2.3
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -191,7 +191,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install Bun
-        uses: oven-sh/setup-bun@735343b667d3e6a283af8ee3a6a014bd69e0be58 # v2.1.1
+        uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
