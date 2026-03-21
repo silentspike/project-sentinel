@@ -18,7 +18,7 @@ use std::{path::Path, sync::Arc};
 #[test]
 fn ac_09_02_spawn_agent_10_components() {
     let (mut world, _schedule) = create_simulation_world();
-    let entity = spawn_agent(&mut world, AgentId(1), "Thomas Mueller", "CEO", 1);
+    let entity = spawn_agent(&mut world, AgentId(1), "Thomas Mueller", "CEO", 1, "empfang");
 
     // Alle 10 Components muessen vorhanden sein
     assert!(
@@ -104,7 +104,7 @@ fn ac_09_04_system_execution_order() {
     // Reihenfolge wird durch create_simulation_world() via .chain() garantiert.
     // Wir testen indirekt: 100 Ticks laufen ohne Panic = Systems greifen korrekt ineinander.
     let (mut world, mut schedule) = create_simulation_world();
-    spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+    spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
     for tick in 0..10u64 {
         let mut time = world.resource_mut::<SimulationTime>();
@@ -131,6 +131,7 @@ fn ac_09_05_100_ticks_15_agents() {
             &format!("Agent-{:02}", i),
             "Mitarbeiter",
             1,
+            "empfang",
         );
     }
 
@@ -159,6 +160,7 @@ fn ac_09_06_tick_rate() {
             &format!("Agent-{:02}", i),
             "Mitarbeiter",
             1,
+            "empfang",
         );
     }
 

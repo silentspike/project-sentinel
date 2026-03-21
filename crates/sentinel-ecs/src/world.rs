@@ -576,6 +576,7 @@ pub fn spawn_agent(
     name: &str,
     role: &str,
     shift_set: u8,
+    room_id: &str,
 ) -> Entity {
     let (shift_start, shift_end) = match shift_set {
         1 => (6, 14),  // Fruehschicht
@@ -593,7 +594,7 @@ pub fn spawn_agent(
                 role: role.to_string(),
             },
             Position {
-                room_id: "empfang".to_string(),
+                room_id: room_id.to_string(),
                 in_transit: false,
                 transit_target: None,
                 transit_remaining_ms: 0,
@@ -666,7 +667,7 @@ pub fn spawn_agent(
         name: name.to_string(),
         role: role.to_string(),
         shift_set,
-        room_id: "empfang".to_string(),
+        room_id: room_id.to_string(),
     };
     let event = DomainEvent::new(
         payload.event_type_str(),

@@ -573,6 +573,7 @@ mod tests {
                 &format!("Agent-{i:02}"),
                 "Mitarbeiter",
                 shift_set,
+                "empfang",
             );
             entities.push(entity);
         }
@@ -626,7 +627,7 @@ mod tests {
         use sentinel_common::AgentId;
 
         let (mut world, mut schedule) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
         // BioState auf Notfall setzen
         {

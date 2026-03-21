@@ -130,6 +130,7 @@ fn bench_ecs() -> anyhow::Result<()> {
             &format!("Agent-{i:02}"),
             "Mitarbeiter",
             1,
+            "empfang",
         );
     }
 
@@ -544,6 +545,7 @@ fn bench_decision() -> anyhow::Result<()> {
             &format!("Agent-{i:02}"),
             "Mitarbeiter",
             shift_set,
+            "empfang",
         );
         entities.push(entity);
     }
