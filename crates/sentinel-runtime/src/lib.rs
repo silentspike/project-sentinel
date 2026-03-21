@@ -506,9 +506,13 @@ impl RuntimeOrchestrator {
         };
 
         self.event_seq += 1;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
         let op_id = format!(
-            "runtime-{}-{}-{}",
-            op_suffix, self.current_tick, self.event_seq
+            "runtime-{}-{}-{}-{}",
+            op_suffix, self.current_tick, self.event_seq, ts
         );
         let event = DomainEvent::new(event_type, aggregate_id, payload, &op_id, self.current_tick)
             .with_operation_id(&op_id);
