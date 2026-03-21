@@ -503,6 +503,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 adaptive_config,
                 room_distances,
                 fanout_sender,
+                config.resource_manager.clone(),
             )
         })
         .context("ECS Thread spawnen")?;
@@ -771,12 +772,17 @@ fn ecs_tick_loop(
     adaptive_config: crate::adaptive_tick::AdaptiveConfig,
     room_distances: sentinel_ecs::RoomDistanceMap,
     fanout_sender: Option<sentinel_ecs::ZenohFanoutSender>,
+    resource_manager_config: crate::config::ResourceManagerConfig,
 ) -> Result<u64> {
     // Adaptive Tick-Rate Controller (PSI-basiert, TOGAF Adaptive Scheduling)
     let mut adaptive_tick = AdaptiveTickRate::new(adaptive_config);
 
     // Time Machine: SnapshotManager (Config aus daemon.toml)
     let mut snapshot_manager = crate::snapshot::SnapshotManager::new(retention_config);
+
+    // Smart Resource Management: Dynamische cgroup-Limits
+    let mut resource_manager =
+        crate::resource_manager::ResourceManager::new(resource_manager_config);
 
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
@@ -1168,6 +1174,14 @@ fn ecs_tick_loop(
 
         // ECS Schedule ausfuehren (alle 12 Systems in Reihenfolge)
         schedule.run(&mut world);
+
+        // Smart Resource Management: Profil-Erkennung + cgroup Hot-Resize
+        resource_manager.cycle(
+            tick_count,
+            &runtime_orch,
+            &event_store_for_prune,
+            adaptive_tick.should_block_spawn(),
+        );
 
         // Prune: Empfange Cutoff von Operator-API, arbeite 1 Batch/Tick ab
         while let Ok(cutoff) = prune_rx.try_recv() {
@@ -2310,6 +2324,7 @@ mod tests {
             crate::adaptive_tick::AdaptiveConfig::default(),
             sentinel_ecs::RoomDistanceMap::default(),
             None, // Kein Zenoh Fan-Out in Tests
+            crate::config::ResourceManagerConfig::default(),
         );
 
         assert!(result.is_ok());
@@ -2374,6 +2389,7 @@ mod tests {
                 crate::adaptive_tick::AdaptiveConfig::default(),
                 sentinel_ecs::RoomDistanceMap::default(),
                 None, // Kein Zenoh Fan-Out in Tests
+                crate::config::ResourceManagerConfig::default(),
             )
         });
 
@@ -2455,6 +2471,7 @@ mod tests {
                 crate::adaptive_tick::AdaptiveConfig::default(),
                 sentinel_ecs::RoomDistanceMap::default(),
                 None, // Kein Zenoh Fan-Out in Tests
+                crate::config::ResourceManagerConfig::default(),
             )
         });
 
@@ -2544,6 +2561,7 @@ mod tests {
                 crate::adaptive_tick::AdaptiveConfig::default(),
                 sentinel_ecs::RoomDistanceMap::default(),
                 None, // Kein Zenoh Fan-Out in Tests
+                crate::config::ResourceManagerConfig::default(),
             )
         });
 

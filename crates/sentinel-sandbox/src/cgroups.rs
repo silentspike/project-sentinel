@@ -11,6 +11,61 @@ const AGENT_STORAGE_PATH: &str = "/ram";
 /// Fallback mount path when /ram is not available.
 const FALLBACK_STORAGE_PATH: &str = "/";
 
+/// Ressourcen-Profil fuer dynamische cgroup-Limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceProfile {
+    /// Wartet auf LLM-Response, keine Aktivitaet
+    Idle,
+    /// Standard-Arbeit
+    Normal,
+    /// Phase 2: npm install, cargo build, intensive I/O
+    Heavy,
+    /// Phase 2: Bio-Pause (Toilette, Essen)
+    Suspended,
+}
+
+impl ResourceProfile {
+    /// Gibt die cgroup-Limits fuer dieses Profil zurueck.
+    pub fn limits(&self) -> CgroupLimits {
+        match self {
+            Self::Idle => CgroupLimits {
+                cpu_quota_us: 25_000,
+                cpu_period_us: 100_000,
+                memory_bytes: 128 * 1024 * 1024,
+                io_max_iops: 100,
+                io_max_bps: 5 * 1024 * 1024,
+            },
+            Self::Normal => CgroupLimits::default(),
+            Self::Heavy => CgroupLimits {
+                cpu_quota_us: 200_000,
+                cpu_period_us: 100_000,
+                memory_bytes: 512 * 1024 * 1024,
+                io_max_iops: 1000,
+                io_max_bps: 50 * 1024 * 1024,
+            },
+            Self::Suspended => CgroupLimits {
+                cpu_quota_us: 10_000,
+                cpu_period_us: 100_000,
+                memory_bytes: 64 * 1024 * 1024,
+                io_max_iops: 50,
+                io_max_bps: 2 * 1024 * 1024,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for ResourceProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle => write!(f, "idle"),
+            Self::Normal => write!(f, "normal"),
+            Self::Heavy => write!(f, "heavy"),
+            Self::Suspended => write!(f, "suspended"),
+        }
+    }
+}
+
 /// Resource limits fuer cgroups v2.
 #[derive(Debug, Clone)]
 pub struct CgroupLimits {
@@ -214,6 +269,45 @@ pub fn create_cgroup(name: &str, limits: &CgroupLimits) -> Result<CgroupSetup> {
     };
 
     Ok(CgroupSetup { io_available })
+}
+
+/// Resizes cgroup limits for a running agent (Hot-Resize).
+///
+/// Writes directly to cgroup v2 pseudo-files — takes effect immediately
+/// without restarting the agent process. Memory limit is never set below
+/// current usage + 16 MB safety margin to prevent OOM kills.
+pub fn resize_cgroup(name: &str, limits: &CgroupLimits) -> Result<()> {
+    let path = cgroup_path(name);
+    if !std::path::Path::new(&path).exists() {
+        return Err(anyhow::anyhow!("cgroup path does not exist: {path}"));
+    }
+
+    // CPU quota — sofort wirksam
+    std::fs::write(
+        format!("{path}/cpu.max"),
+        format!("{} {}", limits.cpu_quota_us, limits.cpu_period_us),
+    )
+    .with_context(|| format!("Failed to resize cpu.max for {name}"))?;
+
+    // Memory — SICHERHEITS-CHECK: nie unter memory.current + 16MB setzen
+    let current_bytes = std::fs::read_to_string(format!("{path}/memory.current"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let safe_max = limits.memory_bytes.max(current_bytes + 16 * 1024 * 1024);
+    std::fs::write(format!("{path}/memory.max"), safe_max.to_string())
+        .with_context(|| format!("Failed to resize memory.max for {name}"))?;
+
+    // IO — best-effort (Controller muss delegiert sein)
+    let io_max_path = format!("{path}/io.max");
+    if std::path::Path::new(&io_max_path).exists() {
+        if let Some(device) = discover_block_device(AGENT_STORAGE_PATH) {
+            let io_max = format_io_max(&device, limits);
+            let _ = std::fs::write(&io_max_path, &io_max);
+        }
+    }
+
+    Ok(())
 }
 
 /// Removes a cgroup for an agent.

@@ -69,6 +69,34 @@ pub struct DaemonConfig {
     /// Time Machine: Tiered Snapshot + Event Retention.
     #[serde(default)]
     pub retention: RetentionConfig,
+
+    /// Smart Resource Management: Dynamische cgroup-Limits pro Agent.
+    #[serde(default)]
+    pub resource_manager: ResourceManagerConfig,
+}
+
+/// Konfiguration fuer den Resource Manager (dynamische cgroup-Limits).
+#[derive(Debug, Deserialize, Clone)]
+pub struct ResourceManagerConfig {
+    /// Feature-Gate: false = statische Limits wie bisher.
+    #[serde(default = "default_rm_enabled")]
+    pub enabled: bool,
+
+    /// Profil-Check Intervall in Ticks (default: 30).
+    #[serde(default = "default_rm_check_interval")]
+    pub check_interval_ticks: u64,
+
+    /// Ticks ohne Aktivitaet bis ein Agent als Idle gilt (default: 300 = 5 Min).
+    #[serde(default = "default_rm_idle_threshold")]
+    pub idle_threshold_ticks: u64,
+
+    /// Max Agents gleichzeitig im Heavy-Profil (default: 3).
+    #[serde(default = "default_rm_max_heavy")]
+    pub max_heavy: usize,
+
+    /// Mindest-Zyklen im neuen Profil bevor Transition (Hysterese, default: 3).
+    #[serde(default = "default_rm_min_transition")]
+    pub min_transition_cycles: u32,
 }
 
 /// Konfiguration fuer World Snapshots und Event Retention (Time Machine).
@@ -310,6 +338,34 @@ fn default_agent_command() -> Vec<String> {
 
 fn default_zenoh_prefix() -> String {
     "sentinel".to_string()
+}
+
+fn default_rm_enabled() -> bool {
+    true
+}
+fn default_rm_check_interval() -> u64 {
+    30
+}
+fn default_rm_idle_threshold() -> u64 {
+    300
+}
+fn default_rm_max_heavy() -> usize {
+    3
+}
+fn default_rm_min_transition() -> u32 {
+    3
+}
+
+impl Default for ResourceManagerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_rm_enabled(),
+            check_interval_ticks: default_rm_check_interval(),
+            idle_threshold_ticks: default_rm_idle_threshold(),
+            max_heavy: default_rm_max_heavy(),
+            min_transition_cycles: default_rm_min_transition(),
+        }
+    }
 }
 
 impl DaemonConfig {
