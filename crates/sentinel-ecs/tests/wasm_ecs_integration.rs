@@ -128,7 +128,14 @@ fn ecs_wasm_tool_dispatch_creates_tool_result_event() {
         return;
     }
     let (mut world, mut schedule, tx, _dir) = setup_wasm_world();
-    let entity = spawn_agent(&mut world, AgentId(1), "Thomas Mueller", "CEO", 1);
+    let entity = spawn_agent(
+        &mut world,
+        AgentId(1),
+        "Thomas Mueller",
+        "CEO",
+        1,
+        "empfang",
+    );
 
     // Capabilities setzen (echo hat keine required_capabilities, aber Agent braucht sie im System)
     if let Some(mut caps) = world.get_mut::<AgentCapabilities>(entity) {
@@ -182,7 +189,14 @@ fn ecs_wasm_tool_dispatch_json_format() {
         return;
     }
     let (mut world, mut schedule, tx, _dir) = setup_wasm_world();
-    let entity = spawn_agent(&mut world, AgentId(5), "Lisa Weber", "Designer", 1);
+    let entity = spawn_agent(
+        &mut world,
+        AgentId(5),
+        "Lisa Weber",
+        "Designer",
+        1,
+        "empfang",
+    );
 
     if let Some(mut caps) = world.get_mut::<AgentCapabilities>(entity) {
         caps.tools = vec!["echo".into()];
@@ -225,9 +239,9 @@ fn ecs_multiple_agents_wasm_tools_same_tick() {
     let (mut world, mut schedule, tx, _dir) = setup_wasm_world();
 
     // Drei Agents spawnen
-    let e1 = spawn_agent(&mut world, AgentId(1), "Thomas", "CEO", 1);
-    let e2 = spawn_agent(&mut world, AgentId(2), "Lisa", "Designer", 1);
-    let e3 = spawn_agent(&mut world, AgentId(3), "Andreas", "Developer", 1);
+    let e1 = spawn_agent(&mut world, AgentId(1), "Thomas", "CEO", 1, "empfang");
+    let e2 = spawn_agent(&mut world, AgentId(2), "Lisa", "Designer", 1, "empfang");
+    let e3 = spawn_agent(&mut world, AgentId(3), "Andreas", "Developer", 1, "empfang");
 
     for (entity, caps) in [
         (e1, vec!["echo".into(), "search".into()]),
@@ -311,7 +325,7 @@ fn ecs_wasm_and_native_tools_coexist() {
         return;
     }
     let (mut world, mut schedule, tx, _dir) = setup_wasm_world();
-    let entity = spawn_agent(&mut world, AgentId(1), "Thomas", "CEO", 1);
+    let entity = spawn_agent(&mut world, AgentId(1), "Thomas", "CEO", 1, "empfang");
 
     if let Some(mut caps) = world.get_mut::<AgentCapabilities>(entity) {
         caps.tools = vec!["echo".into(), "search".into()];
@@ -373,7 +387,7 @@ fn ecs_wasm_plugin_error_does_not_crash_tick() {
         return;
     }
     let (mut world, mut schedule, tx, _dir) = setup_wasm_world();
-    let entity = spawn_agent(&mut world, AgentId(1), "Thomas", "CEO", 1);
+    let entity = spawn_agent(&mut world, AgentId(1), "Thomas", "CEO", 1, "empfang");
 
     if let Some(mut caps) = world.get_mut::<AgentCapabilities>(entity) {
         caps.tools = vec!["echo".into()];
@@ -444,7 +458,7 @@ fn ecs_capability_check_blocks_wasm_tool() {
             .unwrap();
     }
 
-    let entity = spawn_agent(&mut world, AgentId(1), "Thomas", "CEO", 1);
+    let entity = spawn_agent(&mut world, AgentId(1), "Thomas", "CEO", 1, "empfang");
     if let Some(mut caps) = world.get_mut::<AgentCapabilities>(entity) {
         caps.tools = vec!["echo".into()]; // KEIN "admin"!
     }
@@ -493,7 +507,7 @@ fn ecs_no_tool_runtime_resource_survives() {
     let (tx, rx) = std::sync::mpsc::channel();
     world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
 
-    spawn_agent(&mut world, AgentId(1), "Thomas", "CEO", 1);
+    spawn_agent(&mut world, AgentId(1), "Thomas", "CEO", 1, "empfang");
 
     tx.send(AgentAction {
         agent_id: AgentId(1),

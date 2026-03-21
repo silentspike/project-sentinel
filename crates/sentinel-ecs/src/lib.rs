@@ -37,7 +37,14 @@ mod tests {
     #[test]
     fn test_single_agent_spawn() {
         let (mut world, _schedule) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Thomas Mueller", "CEO", 1);
+        let entity = spawn_agent(
+            &mut world,
+            AgentId(1),
+            "Thomas Mueller",
+            "CEO",
+            1,
+            "empfang",
+        );
 
         // Alle 11 Components muessen vorhanden sein
         assert!(world.get::<AgentIdentity>(entity).is_some());
@@ -76,6 +83,7 @@ mod tests {
                 &format!("Agent-{:02}", i),
                 "Mitarbeiter",
                 1,
+                "empfang",
             );
             entities.push(entity);
         }
@@ -103,6 +111,7 @@ mod tests {
                 &format!("Agent-{:02}", i),
                 "Mitarbeiter",
                 1,
+                "empfang",
             );
         }
 
@@ -128,6 +137,7 @@ mod tests {
                 &format!("Agent-{:02}", i),
                 "Mitarbeiter",
                 1,
+                "empfang",
             );
         }
 
@@ -153,7 +163,7 @@ mod tests {
     #[test]
     fn test_bio_system_updates_hunger() {
         let (mut world, mut schedule) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
         // Initialer Hunger
         let initial_hunger = world.get::<BioState>(entity).unwrap().hunger;
@@ -180,7 +190,7 @@ mod tests {
     #[test]
     fn test_mood_system_calculates_valence() {
         let (mut world, mut schedule) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
         // Einen Tick ausfuehren
         {
@@ -203,7 +213,7 @@ mod tests {
     #[test]
     fn test_perception_generates_text() {
         let (mut world, mut schedule) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
         // Einen Tick ausfuehren
         {
@@ -231,7 +241,7 @@ mod tests {
     #[test]
     fn test_transit_system_completes_movement() {
         let (mut world, mut schedule) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
         // Agent in Transit setzen
         {
@@ -288,6 +298,7 @@ mod tests {
                 &format!("Agent-{i:02}"),
                 "Mitarbeiter",
                 1,
+                "empfang",
             );
         }
 
@@ -359,7 +370,7 @@ mod tests {
         );
 
         // Agent spawnen
-        spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
         // Action Channel einrichten
         let (tx, rx) = std::sync::mpsc::channel();
@@ -427,6 +438,7 @@ mod tests {
                 &format!("Agent-{i:02}"),
                 "Tester",
                 1,
+                "empfang",
             );
         }
 
@@ -484,7 +496,7 @@ mod tests {
     #[test]
     fn test_output_system_sends_perceptions() {
         let (mut world, mut schedule) = create_simulation_world();
-        spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
         // Perception Channel (bound=64)
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
@@ -513,8 +525,22 @@ mod tests {
     #[test]
     fn test_output_system_includes_room_physics_and_presence() {
         let (mut world, mut schedule) = create_simulation_world();
-        let entity_a = spawn_agent(&mut world, AgentId(1), "Lisa Bergmann", "Design", 1);
-        let entity_b = spawn_agent(&mut world, AgentId(2), "Thomas Mueller", "Entwicklung", 1);
+        let entity_a = spawn_agent(
+            &mut world,
+            AgentId(1),
+            "Lisa Bergmann",
+            "Design",
+            1,
+            "empfang",
+        );
+        let entity_b = spawn_agent(
+            &mut world,
+            AgentId(2),
+            "Thomas Mueller",
+            "Entwicklung",
+            1,
+            "empfang",
+        );
 
         world.get_mut::<Position>(entity_a).unwrap().room_id = "buero-design-1".to_string();
         world.get_mut::<Position>(entity_b).unwrap().room_id = "buero-design-1".to_string();
@@ -608,7 +634,7 @@ mod tests {
         let event_store = EventStore::open(event_db_path.to_str().unwrap()).unwrap();
         world.insert_resource(LimboEventStore(Arc::new(event_store)));
 
-        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
         // Agent in Transit setzen
         {
@@ -653,7 +679,14 @@ mod tests {
         let event_store = EventStore::open(event_db_path.to_str().unwrap()).unwrap();
         world.insert_resource(LimboEventStore(Arc::new(event_store)));
 
-        let entity = spawn_agent(&mut world, AgentId(1), "Dev Agent", "Developer", 1);
+        let entity = spawn_agent(
+            &mut world,
+            AgentId(1),
+            "Dev Agent",
+            "Developer",
+            1,
+            "empfang",
+        );
 
         // Capabilities setzen (Agent benoetigt "search" fuer den Tool-Call)
         if let Some(mut caps) = world.get_mut::<AgentCapabilities>(entity) {
@@ -726,7 +759,14 @@ mod tests {
         let event_store = EventStore::open(event_db_path.to_str().unwrap()).unwrap();
         world.insert_resource(LimboEventStore(Arc::new(event_store)));
 
-        let entity = spawn_agent(&mut world, AgentId(5), "Dev Agent", "Developer", 1);
+        let entity = spawn_agent(
+            &mut world,
+            AgentId(5),
+            "Dev Agent",
+            "Developer",
+            1,
+            "empfang",
+        );
 
         // Capabilities setzen
         if let Some(mut caps) = world.get_mut::<AgentCapabilities>(entity) {
@@ -800,7 +840,7 @@ mod tests {
             toml::from_str(rooms_toml).expect("rooms.toml parse error");
         world.insert_resource(RoomDistanceMap::from_building_config(&building_config));
 
-        spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
         let (tx, rx) = std::sync::mpsc::channel();
         world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
@@ -904,7 +944,7 @@ mod tests {
             toml::from_str(rooms_toml).expect("rooms.toml parse error");
         world.insert_resource(RoomDistanceMap::from_building_config(&building_config));
 
-        spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
         let (tx, rx) = std::sync::mpsc::channel();
         world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
@@ -974,7 +1014,7 @@ mod tests {
     #[test]
     fn test_room_id_correct_after_transit() {
         let (mut world, mut schedule) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
         // Agent manuell in Transit nach "kueche" setzen
         {
@@ -1023,6 +1063,7 @@ mod tests {
                 &format!("Agent-{i:02}"),
                 "Tester",
                 1,
+                "empfang",
             );
             let mut pos = world.get_mut::<Position>(entity).unwrap();
             pos.in_transit = true;
@@ -1081,7 +1122,7 @@ mod tests {
 
         world.insert_resource(rdm);
 
-        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
         let (tx, rx) = std::sync::mpsc::channel();
         world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
@@ -1134,7 +1175,7 @@ mod tests {
     #[test]
     fn test_tool_dispatch_fallback_without_runtime() {
         let (mut world, mut schedule) = create_simulation_world();
-        spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
         // Kein ToolRuntimeResource eingefuegt!
 
@@ -1183,7 +1224,7 @@ mod tests {
         let (mut world, mut schedule) = create_simulation_world();
         world.insert_resource(LimboEventStore(event_store.clone()));
 
-        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
         // Agent in Kueche platzieren
         world.get_mut::<Position>(entity).unwrap().room_id = "kueche".to_string();
 
@@ -1238,7 +1279,7 @@ mod tests {
     #[test]
     fn test_smell_perception_injection() {
         let (mut world, mut schedule) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
         world.get_mut::<Position>(entity).unwrap().room_id = "kueche".to_string();
 
         // Manuell einen Smell in ActiveSmells einfuegen
@@ -1270,7 +1311,7 @@ mod tests {
     #[test]
     fn test_smell_decay_removes_from_perception() {
         let (mut world, mut schedule) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
         world.get_mut::<Position>(entity).unwrap().room_id = "kueche".to_string();
 
         // Smell mit duration_ticks=5, erstellt bei Tick 0
@@ -1312,7 +1353,7 @@ mod tests {
     #[test]
     fn test_smell_not_in_different_room() {
         let (mut world, mut schedule) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
         // Agent im Empfang, Smell in Kueche
         world.get_mut::<Position>(entity).unwrap().room_id = "empfang".to_string();
 
@@ -1350,7 +1391,7 @@ mod tests {
         let (mut world, mut schedule) = create_simulation_world();
         world.insert_resource(LimboEventStore(event_store.clone()));
 
-        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
         world.get_mut::<Position>(entity).unwrap().room_id = "kueche".to_string();
 
         let (tx, rx) = std::sync::mpsc::channel();
