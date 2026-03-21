@@ -110,6 +110,28 @@ pub fn evaluate_rules(
         }
     }
 
+    // Regel 5: Write-Rate Anomalie
+    for (agent_name, rate) in &metrics.agent_write_rates {
+        if *rate > config.write_anomaly_threshold_bytes_per_sec as f64 {
+            let key = format!("write_anomaly:{agent_name}");
+            if !is_cooled_down(cooldowns, &key, tick, config.write_anomaly_cooldown_ticks) {
+                continue;
+            }
+            let rate_mb = rate / (1024.0 * 1024.0);
+            let threshold_mb =
+                config.write_anomaly_threshold_bytes_per_sec as f64 / (1024.0 * 1024.0);
+            actions.push(PlatformAction {
+                rule_name: "write_anomaly".to_string(),
+                target: agent_name.clone(),
+                action_label: "alert".to_string(),
+                description: format!(
+                    "Write-Rate {rate_mb:.1} MB/s > {threshold_mb:.1} MB/s Schwellwert"
+                ),
+                side_effect: None, // Phase 2: SIGSTOP
+            });
+        }
+    }
+
     actions
 }
 
@@ -150,6 +172,7 @@ mod tests {
             max_projection_lag: 10_000,
             memory_pressure_threshold: 0.9,
             max_escalation: 3,
+            ..PlatformControlplaneConfig::default()
         }
     }
 
@@ -211,6 +234,27 @@ mod tests {
         let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config());
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "memory_pressure");
+    }
+
+    #[test]
+    fn test_write_anomaly_rule_fires() {
+        let metrics = PlatformMetrics {
+            agent_write_rates: vec![("Test Agent".to_string(), 10_000_000.0)], // 10 MB/s > 5 MB/s
+            ..Default::default()
+        };
+        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config());
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].rule_name, "write_anomaly");
+    }
+
+    #[test]
+    fn test_write_anomaly_rule_healthy() {
+        let metrics = PlatformMetrics {
+            agent_write_rates: vec![("Test Agent".to_string(), 1_000_000.0)], // 1 MB/s < 5 MB/s
+            ..Default::default()
+        };
+        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config());
+        assert!(actions.is_empty());
     }
 
     #[test]

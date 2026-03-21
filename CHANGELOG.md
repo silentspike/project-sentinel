@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Security Hardening: CAS Ransomware-Schutz + Immutable Snapshots** (#264)
+  - SQLite Trigger blockiert DELETE auf Snapshots juenger als 7 Tage
+  - CAS GC Trash-Queue: Chunks mit Refcount 0 bleiben 24h erhalten
+  - Write-Rate Anomalie-Erkennung als Platform-CP Regel (> 5 MB/s Alert)
+  - gc_trash() fuer Grace-Period-Freigabe, restore_from_trash() fuer Recovery
+
 - **Platform-Controlplane: Self-Healing Background Service** (#263)
   - 4 deterministische Regeln: Agent-Stall Detection, Event Store Size, Projection Lag, Memory Pressure
   - OODA Loop mit Verify-Phase und Cooldown-Management

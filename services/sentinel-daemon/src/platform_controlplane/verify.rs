@@ -59,6 +59,7 @@ mod tests {
             max_projection_lag: 10_000,
             memory_pressure_threshold: 0.9,
             max_escalation: 3,
+            ..PlatformControlplaneConfig::default()
         }
     }
 

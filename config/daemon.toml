@@ -58,3 +58,5 @@ max_event_store_bytes = 524288000  # 500 MB Schwellwert
 max_projection_lag = 10000     # Max Lag bevor Alert
 memory_pressure_threshold = 0.9  # 90% cgroup Memory
 max_escalation = 3             # Max Eskalationsstufen
+write_anomaly_threshold_bytes_per_sec = 5000000  # 5 MB/s
+write_anomaly_cooldown_ticks = 60

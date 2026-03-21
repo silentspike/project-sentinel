@@ -4,7 +4,7 @@
 //! `FS_CHUNK_REFCOUNT` is zero (i.e., no manifest references them).
 //! This integrates with the existing CasStore GC pattern.
 
-use crate::artifact::{ArtifactPlane, FS_CHUNKS, FS_CHUNK_REFCOUNT};
+use crate::artifact::{ArtifactPlane, FS_CHUNKS, FS_CHUNK_REFCOUNT, FS_TRASH_QUEUE};
 use crate::cas::ChunkGcStats;
 use crate::segment::ChunkLocation;
 use redb::ReadableTable;
@@ -27,14 +27,66 @@ pub fn gc_chunks(plane: &ArtifactPlane) -> anyhow::Result<ChunkGcStats> {
 
     let mut stats = ChunkGcStats::default();
 
-    // Delete index entries in a write transaction
+    // Move orphans to trash queue instead of deleting immediately
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let wtxn = plane.begin_write()?;
+    {
+        let mut trash_table = wtxn.open_table(FS_TRASH_QUEUE)?;
+
+        for hash in &orphans {
+            // Only trash if not already in trash
+            if trash_table.get(hash)?.is_none() {
+                trash_table.insert(hash, now_ms)?;
+                stats.trashed += 1;
+            }
+        }
+    }
+    wtxn.commit()?;
+
+    Ok(stats)
+}
+
+/// Free chunks from the trash queue that are older than `grace_period_hours`.
+///
+/// This is the second stage of GC: after `gc_chunks()` moves orphans to trash,
+/// `gc_trash()` actually deletes them after the grace period expires.
+pub fn gc_trash(plane: &ArtifactPlane, grace_period_hours: u64) -> anyhow::Result<ChunkGcStats> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let cutoff_ms = now_ms.saturating_sub(grace_period_hours * 3600 * 1000);
+
+    let mut stats = ChunkGcStats::default();
+
+    // Single write transaction: scan trash + delete expired in one pass
     let wtxn = plane.begin_write()?;
     {
         let mut chunks_table = wtxn.open_table(FS_CHUNKS)?;
         let mut refcount_table = wtxn.open_table(FS_CHUNK_REFCOUNT)?;
+        let trash_table = wtxn.open_table(FS_TRASH_QUEUE)?;
 
-        for hash in &orphans {
-            // Read ChunkLocation to track freed bytes
+        // Collect expired hashes first (can't mutate while iterating)
+        let expired: Vec<[u8; 16]> = trash_table
+            .iter()?
+            .filter_map(|entry| {
+                let (hash, trashed_at) = entry.ok()?;
+                if trashed_at.value() <= cutoff_ms {
+                    Some(*hash.value())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        drop(trash_table);
+        let mut trash_table = wtxn.open_table(FS_TRASH_QUEUE)?;
+
+        for hash in &expired {
             if let Some(g) = chunks_table.get(hash)? {
                 if let Ok(loc) = ChunkLocation::from_bytes(g.value()) {
                     stats.freed_bytes += loc.compressed_len as u64;
@@ -42,12 +94,33 @@ pub fn gc_chunks(plane: &ArtifactPlane) -> anyhow::Result<ChunkGcStats> {
             }
             chunks_table.remove(hash)?;
             refcount_table.remove(hash)?;
-            stats.removed += 1;
+            trash_table.remove(hash)?;
+            stats.freed_from_trash += 1;
         }
     }
     wtxn.commit()?;
 
     Ok(stats)
+}
+
+/// Restore a chunk from the trash queue (re-add refcount).
+///
+/// Used after ransomware recovery: metadata restored from snapshot
+/// points to chunks that are in trash. This un-trashes them.
+pub fn restore_from_trash(plane: &ArtifactPlane, hash: &[u8; 16]) -> anyhow::Result<bool> {
+    let wtxn = plane.begin_write()?;
+    let restored = {
+        let mut trash_table = wtxn.open_table(FS_TRASH_QUEUE)?;
+        if trash_table.remove(hash)?.is_some() {
+            let mut refcount_table = wtxn.open_table(FS_CHUNK_REFCOUNT)?;
+            refcount_table.insert(hash, 1u32)?;
+            true
+        } else {
+            false
+        }
+    };
+    wtxn.commit()?;
+    Ok(restored)
 }
 
 /// Decrement the refcount for all chunks in an object's manifest and
@@ -135,15 +208,27 @@ mod tests {
             assert_eq!(plane.get_chunk_refcount(h).unwrap(), 0);
         }
 
-        // GC should remove them
+        // GC should trash them (not delete immediately)
         let stats = gc_chunks(&plane).unwrap();
         assert_eq!(
-            stats.removed, chunk_count as u64,
-            "GC must remove all orphaned chunks"
+            stats.trashed, chunk_count as u64,
+            "GC must trash all orphaned chunks"
         );
-        assert!(stats.freed_bytes > 0);
 
-        // Chunks are gone
+        // Chunks are still in FS_CHUNKS (trash queue, not yet freed)
+        for h in &manifest {
+            assert!(plane.has_chunk(h).unwrap());
+        }
+
+        // gc_trash with 0 grace period → immediate free
+        let trash_stats = gc_trash(&plane, 0).unwrap();
+        assert_eq!(
+            trash_stats.freed_from_trash, chunk_count as u64,
+            "gc_trash must free all expired trash chunks"
+        );
+        assert!(trash_stats.freed_bytes > 0);
+
+        // Now chunks are gone
         for h in &manifest {
             assert!(!plane.has_chunk(h).unwrap());
         }
@@ -179,8 +264,8 @@ mod tests {
         release_object(&plane, id2).unwrap();
         let stats = gc_chunks(&plane).unwrap();
         assert!(
-            stats.removed > 0,
-            "after releasing both, GC must find orphans"
+            stats.trashed > 0,
+            "after releasing both, GC must trash orphans"
         );
     }
 
