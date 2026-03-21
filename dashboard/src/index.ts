@@ -80,3 +80,4 @@ if (import.meta.main) {
   }, 30000);
   console.log(`Dashboard running on http://localhost:${port}`);
 }
+// CI hosted runner validation test

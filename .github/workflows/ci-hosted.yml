@@ -6,6 +6,8 @@ name: CI (Hosted Test)
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read

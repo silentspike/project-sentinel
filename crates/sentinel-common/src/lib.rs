@@ -300,3 +300,4 @@ mod tests {
         assert_eq!(deserialized.target_room, Some(RoomId(5)));
     }
 }
+// CI hosted runner validation test
