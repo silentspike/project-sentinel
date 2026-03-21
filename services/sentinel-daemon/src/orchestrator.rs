@@ -1186,6 +1186,16 @@ fn ecs_tick_loop(
         // ECS Schedule ausfuehren (alle 12 Systems in Reihenfolge)
         schedule.run(&mut world);
 
+        // Activity-Tracking: Agents die eine Action ausgefuehrt haben als aktiv markieren
+        if let Some(active) = world.get_resource::<sentinel_ecs::ActiveAgentsThisTick>() {
+            for agent_id in &active.0 {
+                runtime_orch.record_activity(*agent_id, tick_count);
+            }
+        }
+        if let Some(mut active) = world.get_resource_mut::<sentinel_ecs::ActiveAgentsThisTick>() {
+            active.0.clear();
+        }
+
         // Smart Resource Management: Profil-Erkennung + cgroup Hot-Resize
         resource_manager.cycle(
             tick_count,
