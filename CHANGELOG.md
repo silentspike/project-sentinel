@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Smart Resource Management: Dynamische cgroup-Limits** (#265)
+  - `resize_cgroup()` fuer Hot-Resize ohne Agent-Restart (cpu.max, memory.max, io.max)
+  - `ResourceProfile` Enum (Idle/Normal/Heavy/Suspended) mit profil-spezifischen Limits
+  - `ResourceManager` mit Hysterese-Debouncing (min 3 Zyklen vor Transition)
+  - Idle-Detection via `last_activity_tick` aus RuntimeOrchestrator
+  - Konfigurierbar + deaktivierbar via `[daemon.resource_manager]` in daemon.toml
+
 ### Fixed
 
 - **Agents spawnen nicht in favorite_room** (#272)
