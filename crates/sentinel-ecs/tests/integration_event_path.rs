@@ -68,7 +68,7 @@ fn run_tick(
 #[test]
 fn test_e2e_drink_coffee_state_and_events() {
     let (mut world, mut schedule, tx, _dir) = setup_world_with_stores();
-    let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+    let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
     // Initialer Koffeinwert merken
     let initial_caffeine = world.get::<BioState>(entity).unwrap().caffeine_mg;
@@ -149,7 +149,7 @@ fn test_e2e_drink_coffee_state_and_events() {
 #[test]
 fn test_e2e_eat_meal_resets_hunger() {
     let (mut world, mut schedule, tx, _dir) = setup_world_with_stores();
-    let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+    let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
     // Hunger hochsetzen
     {
@@ -194,7 +194,7 @@ fn test_e2e_eat_meal_resets_hunger() {
 #[test]
 fn test_e2e_use_bathroom_resets_bladder() {
     let (mut world, mut schedule, tx, _dir) = setup_world_with_stores();
-    let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+    let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
     // Blase hochsetzen
     {
@@ -238,7 +238,7 @@ fn test_e2e_use_bathroom_resets_bladder() {
 #[test]
 fn test_e2e_move_action_transit_with_correlation() {
     let (mut world, mut schedule, tx, _dir) = setup_world_with_stores();
-    spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+    spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
     // Move-Action senden
     tx.send(AgentAction {
@@ -298,7 +298,7 @@ fn test_e2e_move_action_transit_with_correlation() {
 #[test]
 fn test_all_action_types_generate_events() {
     let (mut world, mut schedule, tx, _dir) = setup_world_with_stores();
-    spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+    spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
     // 5 verschiedene ActionTypes senden
     let actions = vec![
@@ -365,7 +365,7 @@ fn test_all_action_types_generate_events() {
 #[test]
 fn test_no_bio_mutation_without_event() {
     let (mut world, mut schedule, tx, _dir) = setup_world_with_stores();
-    let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+    let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
     let initial_caffeine = world.get::<BioState>(entity).unwrap().caffeine_mg;
 
@@ -422,7 +422,7 @@ fn test_no_bio_mutation_without_event() {
 #[test]
 fn test_events_persisted_to_limbo_via_persist_system() {
     let (mut world, mut schedule, tx, _dir) = setup_world_with_stores();
-    spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1);
+    spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
     // 3 verschiedene Bio-Actions
     for (i, action_name) in ["drink_coffee", "eat_meal", "use_bathroom"]

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Agents spawnen nicht in favorite_room** (#272)
+  - ECS `spawn_agent()` hardcoded `"empfang"` statt `favorite_room` aus Agent-Config
+  - Fix: `room_id` Parameter hinzugefuegt, Orchestrator uebergibt `preferences.favorite_room`
+
 - **AgentSpawned Events fehlen nach Daemon-Restart** (#267)
   - Root Cause: `operation_id` in `RuntimeOrchestrator.emit_event()` war deterministisch (`runtime-spawn-{id}-{tick}-{seq}`) und identisch ueber Restarts hinweg
   - `INSERT OR IGNORE` mit UNIQUE INDEX auf `operation_id` dropped Events still

@@ -138,7 +138,7 @@ fn simulate() -> anyhow::Result<()> {
 
     for i in 1..=agents {
         let id = AgentId::new(i as u16)?;
-        spawn_agent(&mut world, id, &format!("Agent-{i:02}"), "Mitarbeiter", 1);
+        spawn_agent(&mut world, id, &format!("Agent-{i:02}"), "Mitarbeiter", 1, "empfang");
     }
 
     let start = Instant::now();
