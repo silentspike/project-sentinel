@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **AgentSpawned Events fehlen nach Daemon-Restart** (#267)
+  - Root Cause: `operation_id` in `RuntimeOrchestrator.emit_event()` war deterministisch (`runtime-spawn-{id}-{tick}-{seq}`) und identisch ueber Restarts hinweg
+  - `INSERT OR IGNORE` mit UNIQUE INDEX auf `operation_id` dropped Events still
+  - Fix: Millisekunden-Timestamp in die operation_id eingebaut fuer Restart-Uniqueness
+  - Behebt auch #269 (Dashboard zeigte historische Agents weil Projection keine aktiven hatte)
+
 ### Added
 
 - **Vollbetriebs-Vorbereitung: 9 Raeume, 6 Agents, Workflow-Infrastruktur** (#260)
