@@ -89,6 +89,21 @@ pub fn input_system(
             match action.action_type {
                 ActionType::Move => {
                     if let Some(target_room) = &action.target_room {
+                        // Validierung: Raum muss in rooms.toml existieren
+                        // Ohne RoomDistanceMap (Tests): alle Raeume akzeptieren
+                        let valid_room = room_distances
+                            .as_ref()
+                            .map(|rd| rd.contains(target_room))
+                            .unwrap_or(true);
+                        if !valid_room {
+                            tracing::warn!(
+                                agent = %identity.agent_id,
+                                target = %target_room,
+                                "Move zu ungueltigem Raum ignoriert"
+                            );
+                            continue;
+                        }
+
                         let from_room = position.room_id.clone();
                         let to_room = target_room.clone();
                         // Distance-basierte Transit-Dauer: 1500ms Basis + 800ms pro Hop
