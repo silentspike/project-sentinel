@@ -21,13 +21,13 @@ pub struct SandboxConfig {
 }
 
 impl SandboxConfig {
-    /// Restriktive Sandbox: kein Dateizugriff, 100ms CPU, 10MB RAM.
+    /// Restriktive Sandbox: kein Dateizugriff, 500ms CPU, 10MB RAM.
     pub fn restrictive() -> Self {
         Self {
-            max_cpu_ms: 100,
+            max_cpu_ms: 500,
             max_memory_bytes: 10 * 1024 * 1024,
             allowed_paths: Vec::new(),
-            max_execution_time: Duration::from_millis(100),
+            max_execution_time: Duration::from_millis(500),
         }
     }
 

@@ -88,7 +88,8 @@ fn spawn_agent_full(
         shift_end_hour: end,
         is_on_duty: true,
     };
-    if let Err(e) = runtime_orch.spawn_agent(identity, shift, "empfang") {
+    if let Err(e) = runtime_orch.spawn_agent(identity, shift, &agent_cfg.preferences.favorite_room)
+    {
         warn!(agent_id = agent_cfg.identity.id, error = %e, "Agent-Spawn fehlgeschlagen");
         return false;
     }
@@ -183,6 +184,7 @@ fn spawn_agent_full(
         &agent_cfg.identity.name,
         &agent_cfg.identity.role,
         agent_cfg.identity.shift_set,
+        &agent_cfg.preferences.favorite_room,
     );
     apply_personality(world, entity, &agent_cfg.personality);
     sentinel_ecs::apply_capabilities(world, entity, &agent_cfg.capabilities);
@@ -959,7 +961,9 @@ fn ecs_tick_loop(
                 shift_end_hour: end,
                 is_on_duty: true,
             };
-            if let Err(e) = runtime_orch.spawn_agent(identity, shift, "empfang") {
+            if let Err(e) =
+                runtime_orch.spawn_agent(identity, shift, &agent_cfg.preferences.favorite_room)
+            {
                 warn!(agent_id = agent_cfg.identity.id, error = %e, "Agent-Spawn fehlgeschlagen");
                 continue;
             }
@@ -1056,6 +1060,7 @@ fn ecs_tick_loop(
             &agent_cfg.identity.name,
             &agent_cfg.identity.role,
             agent_cfg.identity.shift_set,
+            &agent_cfg.preferences.favorite_room,
         );
         apply_personality(&mut world, entity, &agent_cfg.personality);
         sentinel_ecs::apply_capabilities(&mut world, entity, &agent_cfg.capabilities);

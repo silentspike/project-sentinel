@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn test_autonomy_bladder_emergency_triggers_transit() {
         let (mut world, _) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Test", "Dev", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test", "Dev", 1, "empfang");
 
         // AutonomyCooldown hinzufuegen
         world.entity_mut(entity).insert(AutonomyCooldown::default());
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn test_autonomy_cooldown_prevents_rapid_actions() {
         let (mut world, _) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Test", "Dev", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test", "Dev", 1, "empfang");
         world.entity_mut(entity).insert(AutonomyCooldown::default());
         world.get_mut::<BioState>(entity).unwrap().bladder = 95.0;
 
@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn test_autonomy_at_target_performs_action() {
         let (mut world, _) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Test", "Dev", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test", "Dev", 1, "empfang");
         world.entity_mut(entity).insert(AutonomyCooldown::default());
 
         // Agent ist bereits auf der Toilette mit voller Blase (AgentId(1) = ungerade → herren)
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn test_return_to_work_from_toilet() {
         let (mut world, _) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Test", "Dev", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test", "Dev", 1, "empfang");
         world.entity_mut(entity).insert(AutonomyCooldown::default());
 
         // Agent auf Toilette, KEIN P0-Notfall (bladder=10, hunger=20, energy=80, stress=0)
@@ -503,7 +503,7 @@ mod tests {
     #[test]
     fn test_no_return_during_p0() {
         let (mut world, _) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Test", "Dev", 1);
+        let entity = spawn_agent(&mut world, AgentId(1), "Test", "Dev", 1, "empfang");
         world.entity_mut(entity).insert(AutonomyCooldown::default());
 
         // Agent auf Toilette MIT P0-Notfall (bladder=95)
