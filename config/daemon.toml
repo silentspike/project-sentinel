@@ -47,3 +47,14 @@ check_interval_ticks = 30     # Profil-Check alle 30 Ticks (~30s)
 idle_threshold_ticks = 300    # 300 Ticks ohne Aktivitaet = Idle (~5 Min)
 max_heavy = 3                 # Max 3 Agents gleichzeitig Heavy
 min_transition_cycles = 3     # 3 konsekutive Zyklen vor Profil-Wechsel (Hysterese)
+
+# Platform-Controlplane: Self-Healing Background Service
+[daemon.platform_controlplane]
+enabled = true
+cycle_interval_ticks = 60      # Regel-Evaluation alle 60 Ticks (~60s)
+stall_cooldown_ticks = 60      # Cooldown pro gestalltem Agent
+prune_cooldown_ticks = 3600    # Max 1 Prune pro Stunde
+max_event_store_bytes = 524288000  # 500 MB Schwellwert
+max_projection_lag = 10000     # Max Lag bevor Alert
+memory_pressure_threshold = 0.9  # 90% cgroup Memory
+max_escalation = 3             # Max Eskalationsstufen

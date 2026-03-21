@@ -73,6 +73,10 @@ pub struct DaemonConfig {
     /// Smart Resource Management: Dynamische cgroup-Limits pro Agent.
     #[serde(default)]
     pub resource_manager: ResourceManagerConfig,
+
+    /// Platform-Controlplane: Self-Healing Background Service.
+    #[serde(default)]
+    pub platform_controlplane: PlatformControlplaneConfig,
 }
 
 /// Konfiguration fuer den Resource Manager (dynamische cgroup-Limits).
@@ -364,6 +368,67 @@ impl Default for ResourceManagerConfig {
             idle_threshold_ticks: default_rm_idle_threshold(),
             max_heavy: default_rm_max_heavy(),
             min_transition_cycles: default_rm_min_transition(),
+        }
+    }
+}
+
+/// Konfiguration fuer den Platform-Controlplane (Self-Healing).
+#[derive(Debug, Deserialize, Clone)]
+pub struct PlatformControlplaneConfig {
+    #[serde(default = "default_pcp_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_pcp_cycle_interval")]
+    pub cycle_interval_ticks: u64,
+    #[serde(default = "default_pcp_stall_cooldown")]
+    pub stall_cooldown_ticks: u64,
+    #[serde(default = "default_pcp_prune_cooldown")]
+    pub prune_cooldown_ticks: u64,
+    #[serde(default = "default_pcp_max_event_store")]
+    pub max_event_store_bytes: u64,
+    #[serde(default = "default_pcp_max_projection_lag")]
+    pub max_projection_lag: i64,
+    #[serde(default = "default_pcp_memory_pressure")]
+    pub memory_pressure_threshold: f64,
+    #[serde(default = "default_pcp_max_escalation")]
+    pub max_escalation: u32,
+}
+
+fn default_pcp_enabled() -> bool {
+    true
+}
+fn default_pcp_cycle_interval() -> u64 {
+    60
+}
+fn default_pcp_stall_cooldown() -> u64 {
+    60
+}
+fn default_pcp_prune_cooldown() -> u64 {
+    3600
+}
+fn default_pcp_max_event_store() -> u64 {
+    500 * 1024 * 1024
+}
+fn default_pcp_max_projection_lag() -> i64 {
+    10_000
+}
+fn default_pcp_memory_pressure() -> f64 {
+    0.9
+}
+fn default_pcp_max_escalation() -> u32 {
+    3
+}
+
+impl Default for PlatformControlplaneConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_pcp_enabled(),
+            cycle_interval_ticks: default_pcp_cycle_interval(),
+            stall_cooldown_ticks: default_pcp_stall_cooldown(),
+            prune_cooldown_ticks: default_pcp_prune_cooldown(),
+            max_event_store_bytes: default_pcp_max_event_store(),
+            max_projection_lag: default_pcp_max_projection_lag(),
+            memory_pressure_threshold: default_pcp_memory_pressure(),
+            max_escalation: default_pcp_max_escalation(),
         }
     }
 }

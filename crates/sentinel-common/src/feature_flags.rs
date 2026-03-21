@@ -21,6 +21,7 @@ pub struct RuntimeFlags {
     pub ebpf_enabled: bool,
     pub storage_ingest_enabled: bool,
     pub storage_chunk_cas: bool,
+    pub platform_controlplane_enabled: bool,
 }
 
 static FLAGS: OnceLock<RuntimeFlags> = OnceLock::new();
@@ -41,6 +42,10 @@ impl RuntimeFlags {
                 ebpf_enabled: env_flag("SENTINEL_EBPF_ENABLED", true),
                 storage_ingest_enabled: env_flag("SENTINEL_STORAGE_INGEST_ENABLED", true),
                 storage_chunk_cas: env_flag("SENTINEL_STORAGE_CHUNK_CAS", true),
+                platform_controlplane_enabled: env_flag(
+                    "SENTINEL_PLATFORM_CONTROLPLANE_ENABLED",
+                    true,
+                ),
             };
 
             // Log disabled features at WARN level (AC-7)
@@ -77,6 +82,7 @@ impl RuntimeFlags {
             ebpf_enabled: true,
             storage_ingest_enabled: true,
             storage_chunk_cas: true,
+            platform_controlplane_enabled: true,
         })
     }
 }

@@ -504,6 +504,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 room_distances,
                 fanout_sender,
                 config.resource_manager.clone(),
+                config.platform_controlplane.clone(),
+                events_path.to_string_lossy().to_string(),
             )
         })
         .context("ECS Thread spawnen")?;
@@ -773,6 +775,8 @@ fn ecs_tick_loop(
     room_distances: sentinel_ecs::RoomDistanceMap,
     fanout_sender: Option<sentinel_ecs::ZenohFanoutSender>,
     resource_manager_config: crate::config::ResourceManagerConfig,
+    platform_cp_config: crate::config::PlatformControlplaneConfig,
+    events_db_path_str: String,
 ) -> Result<u64> {
     // Adaptive Tick-Rate Controller (PSI-basiert, TOGAF Adaptive Scheduling)
     let mut adaptive_tick = AdaptiveTickRate::new(adaptive_config);
@@ -783,6 +787,11 @@ fn ecs_tick_loop(
     // Smart Resource Management: Dynamische cgroup-Limits
     let mut resource_manager =
         crate::resource_manager::ResourceManager::new(resource_manager_config);
+
+    // Platform-Controlplane: Self-Healing
+    let mut platform_cp =
+        crate::platform_controlplane::PlatformControlplane::new(platform_cp_config);
+    let mut last_ebpf_snapshot: Option<sentinel_ebpf::collector::MetricsSnapshot> = None;
 
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
@@ -1182,6 +1191,46 @@ fn ecs_tick_loop(
             &event_store_for_prune,
             adaptive_tick.should_block_spawn(),
         );
+
+        // Platform-Controlplane: Self-Healing (alle N Ticks)
+        if sentinel_common::feature_flags::RuntimeFlags::global().platform_controlplane_enabled
+            && platform_cp.should_run(tick_count)
+        {
+            let agent_names: Vec<String> = runtime_orch
+                .agents()
+                .values()
+                .map(|h| h.identity.name.clone())
+                .collect();
+            let pcp_metrics = crate::platform_controlplane::metrics::collect(
+                &last_ebpf_snapshot,
+                &event_store_for_prune,
+                &events_db_path_str,
+                &agent_names,
+                tick_count,
+            );
+            let side_effects = platform_cp.cycle(&pcp_metrics, &event_store_for_prune, tick_count);
+            for effect in side_effects {
+                match effect {
+                    crate::platform_controlplane::rules::PlatformSideEffect::TriggerPrune(
+                        _cutoff,
+                    ) => {
+                        // Auto-detect cutoff: nutze bestehenden SnapshotManager
+                        if let Ok(snapshots) = event_store_for_prune.list_world_snapshots() {
+                            if snapshots.len() >= 2 {
+                                let prune_point = snapshots[snapshots.len() - 2].last_event_id;
+                                snapshot_manager.start_prune(prune_point);
+                            }
+                        }
+                    }
+                    crate::platform_controlplane::rules::PlatformSideEffect::ForceIdleProfile(
+                        agent_id,
+                    ) => {
+                        resource_manager
+                            .force_profile(agent_id, sentinel_sandbox::ResourceProfile::Idle);
+                    }
+                }
+            }
+        }
 
         // Prune: Empfange Cutoff von Operator-API, arbeite 1 Batch/Tick ab
         while let Ok(cutoff) = prune_rx.try_recv() {
@@ -1934,6 +1983,7 @@ fn ecs_tick_loop(
         if tick_count > 0 && tick_count.is_multiple_of(10) {
             match ebpf_collector.collect() {
                 Ok(snapshot) => {
+                    last_ebpf_snapshot = Some(snapshot.clone());
                     // try_send: Non-blocking, dropped wenn Buffer voll (kein Backpressure)
                     let _ = ebpf_tx.try_send(snapshot);
                 }
@@ -2325,6 +2375,8 @@ mod tests {
             sentinel_ecs::RoomDistanceMap::default(),
             None, // Kein Zenoh Fan-Out in Tests
             crate::config::ResourceManagerConfig::default(),
+            crate::config::PlatformControlplaneConfig::default(),
+            String::new(),
         );
 
         assert!(result.is_ok());
@@ -2390,6 +2442,8 @@ mod tests {
                 sentinel_ecs::RoomDistanceMap::default(),
                 None, // Kein Zenoh Fan-Out in Tests
                 crate::config::ResourceManagerConfig::default(),
+                crate::config::PlatformControlplaneConfig::default(),
+                String::new(),
             )
         });
 
@@ -2472,6 +2526,8 @@ mod tests {
                 sentinel_ecs::RoomDistanceMap::default(),
                 None, // Kein Zenoh Fan-Out in Tests
                 crate::config::ResourceManagerConfig::default(),
+                crate::config::PlatformControlplaneConfig::default(),
+                String::new(),
             )
         });
 
@@ -2562,6 +2618,8 @@ mod tests {
                 sentinel_ecs::RoomDistanceMap::default(),
                 None, // Kein Zenoh Fan-Out in Tests
                 crate::config::ResourceManagerConfig::default(),
+                crate::config::PlatformControlplaneConfig::default(),
+                String::new(),
             )
         });
 

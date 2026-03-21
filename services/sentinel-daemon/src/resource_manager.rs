@@ -154,6 +154,23 @@ impl ResourceManager {
         self.pending_transitions.remove(agent_id);
         // heavy_count wird beim naechsten cycle() korrekt nachgezaehlt
     }
+
+    /// Setzt Profil direkt ohne Hysterese (fuer Platform-Controlplane Interventionen).
+    pub fn force_profile(&mut self, agent_id: AgentId, profile: ResourceProfile) {
+        let old = self
+            .profiles
+            .get(&agent_id)
+            .copied()
+            .unwrap_or(ResourceProfile::Normal);
+        if old == ResourceProfile::Heavy {
+            self.heavy_count = self.heavy_count.saturating_sub(1);
+        }
+        if profile == ResourceProfile::Heavy {
+            self.heavy_count += 1;
+        }
+        self.profiles.insert(agent_id, profile);
+        self.pending_transitions.remove(&agent_id);
+    }
 }
 
 /// Emittiert ein ResourceProfileChanged Event in den Event Store.
@@ -297,6 +314,33 @@ mod tests {
         assert!(normal.cpu_quota_us < heavy.cpu_quota_us);
         assert!(idle.memory_bytes < normal.memory_bytes);
         assert!(normal.memory_bytes < heavy.memory_bytes);
+    }
+
+    #[test]
+    fn test_force_profile_bypasses_hysterese() {
+        let mut rm = ResourceManager::new(test_config());
+        let agent_id = AgentId(1);
+        rm.profiles.insert(agent_id, ResourceProfile::Normal);
+        rm.pending_transitions
+            .insert(agent_id, (ResourceProfile::Idle, 1));
+
+        rm.force_profile(agent_id, ResourceProfile::Idle);
+
+        assert_eq!(rm.get_profile(&agent_id), ResourceProfile::Idle);
+        assert!(!rm.pending_transitions.contains_key(&agent_id));
+    }
+
+    #[test]
+    fn test_force_profile_updates_heavy_count() {
+        let mut rm = ResourceManager::new(test_config());
+        let agent_id = AgentId(1);
+        rm.profiles.insert(agent_id, ResourceProfile::Heavy);
+        rm.heavy_count = 1;
+
+        rm.force_profile(agent_id, ResourceProfile::Idle);
+
+        assert_eq!(rm.heavy_count, 0);
+        assert_eq!(rm.get_profile(&agent_id), ResourceProfile::Idle);
     }
 
     #[test]

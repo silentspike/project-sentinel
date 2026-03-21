@@ -15,6 +15,7 @@ pub mod llm_bridge;
 pub mod nats_consumer;
 pub mod operator_api;
 pub mod orchestrator;
+pub mod platform_controlplane;
 pub mod query_responder;
 pub mod resource_manager;
 pub mod shift;
