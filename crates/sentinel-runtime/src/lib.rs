@@ -409,6 +409,11 @@ impl RuntimeOrchestrator {
         self.agents.len()
     }
 
+    /// Read-only Zugriff auf alle Agent-Handles (fuer Resource Manager).
+    pub fn agents(&self) -> &std::collections::HashMap<AgentId, AgentHandle> {
+        &self.agents
+    }
+
     /// Emits AgentDespawned events for all active agents during graceful shutdown.
     ///
     /// This ensures the Projection Worker can decrement occupant_count for each
