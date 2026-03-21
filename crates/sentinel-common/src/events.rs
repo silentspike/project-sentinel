@@ -234,6 +234,13 @@ pub enum DomainEventPayload {
         intensity: f32,
         duration_ticks: u64,
     },
+    /// Platform-Controlplane Intervention (Self-Healing)
+    PlatformIntervention {
+        rule_name: String,
+        target: String,
+        action: String,
+        description: String,
+    },
     /// Ressourcen-Profil eines Agents hat sich geaendert (cgroup Hot-Resize)
     ResourceProfileChanged {
         agent_id: AgentId,
@@ -271,6 +278,7 @@ impl DomainEventPayload {
             Self::JudgeAlertReceived { .. } => "judge_alert_received",
             Self::HallwayEncounterDetected { .. } => "hallway_encounter_detected",
             Self::SmellEventTriggered { .. } => "smell_event_triggered",
+            Self::PlatformIntervention { .. } => "platform_intervention",
             Self::ResourceProfileChanged { .. } => "resource_profile_changed",
         }
     }

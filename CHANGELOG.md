@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Platform-Controlplane: Self-Healing Background Service** (#263)
+  - 4 deterministische Regeln: Agent-Stall Detection, Event Store Size, Projection Lag, Memory Pressure
+  - OODA Loop mit Verify-Phase und Cooldown-Management
+  - PlatformIntervention DomainEvent fuer Audit-Trail
+  - Side-Effect Pattern: cycle() gibt Vec zurueck, Orchestrator fuehrt aus
+  - Konfigurierbar + deaktivierbar via `[daemon.platform_controlplane]`
+
 - **Smart Resource Management: Dynamische cgroup-Limits** (#265)
   - `resize_cgroup()` fuer Hot-Resize ohne Agent-Restart (cpu.max, memory.max, io.max)
   - `ResourceProfile` Enum (Idle/Normal/Heavy/Suspended) mit profil-spezifischen Limits
