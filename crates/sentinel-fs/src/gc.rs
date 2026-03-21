@@ -75,7 +75,7 @@ pub fn gc_trash(plane: &ArtifactPlane, grace_period_hours: u64) -> anyhow::Resul
             .iter()?
             .filter_map(|entry| {
                 let (hash, trashed_at) = entry.ok()?;
-                if trashed_at.value() < cutoff_ms {
+                if trashed_at.value() <= cutoff_ms {
                     Some(*hash.value())
                 } else {
                     None
