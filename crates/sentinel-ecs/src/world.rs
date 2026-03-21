@@ -464,6 +464,11 @@ impl RoomDistanceMap {
     pub fn all_rooms(&self) -> &[String] {
         &self.room_ids
     }
+
+    /// Prueft ob ein Raum in der Distance-Map existiert (d.h. in rooms.toml definiert ist).
+    pub fn contains(&self, room_id: &str) -> bool {
+        self.room_ids.iter().any(|r| r == room_id)
+    }
 }
 
 /// Zenoh Fan-Out Bridge: Events nach Limbo-Write an async Fanout-Task senden.
