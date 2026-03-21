@@ -37,7 +37,14 @@ mod tests {
     #[test]
     fn test_single_agent_spawn() {
         let (mut world, _schedule) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Thomas Mueller", "CEO", 1, "empfang");
+        let entity = spawn_agent(
+            &mut world,
+            AgentId(1),
+            "Thomas Mueller",
+            "CEO",
+            1,
+            "empfang",
+        );
 
         // Alle 11 Components muessen vorhanden sein
         assert!(world.get::<AgentIdentity>(entity).is_some());
@@ -518,8 +525,22 @@ mod tests {
     #[test]
     fn test_output_system_includes_room_physics_and_presence() {
         let (mut world, mut schedule) = create_simulation_world();
-        let entity_a = spawn_agent(&mut world, AgentId(1), "Lisa Bergmann", "Design", 1, "empfang");
-        let entity_b = spawn_agent(&mut world, AgentId(2), "Thomas Mueller", "Entwicklung", 1, "empfang");
+        let entity_a = spawn_agent(
+            &mut world,
+            AgentId(1),
+            "Lisa Bergmann",
+            "Design",
+            1,
+            "empfang",
+        );
+        let entity_b = spawn_agent(
+            &mut world,
+            AgentId(2),
+            "Thomas Mueller",
+            "Entwicklung",
+            1,
+            "empfang",
+        );
 
         world.get_mut::<Position>(entity_a).unwrap().room_id = "buero-design-1".to_string();
         world.get_mut::<Position>(entity_b).unwrap().room_id = "buero-design-1".to_string();
@@ -658,7 +679,14 @@ mod tests {
         let event_store = EventStore::open(event_db_path.to_str().unwrap()).unwrap();
         world.insert_resource(LimboEventStore(Arc::new(event_store)));
 
-        let entity = spawn_agent(&mut world, AgentId(1), "Dev Agent", "Developer", 1, "empfang");
+        let entity = spawn_agent(
+            &mut world,
+            AgentId(1),
+            "Dev Agent",
+            "Developer",
+            1,
+            "empfang",
+        );
 
         // Capabilities setzen (Agent benoetigt "search" fuer den Tool-Call)
         if let Some(mut caps) = world.get_mut::<AgentCapabilities>(entity) {
@@ -731,7 +759,14 @@ mod tests {
         let event_store = EventStore::open(event_db_path.to_str().unwrap()).unwrap();
         world.insert_resource(LimboEventStore(Arc::new(event_store)));
 
-        let entity = spawn_agent(&mut world, AgentId(5), "Dev Agent", "Developer", 1, "empfang");
+        let entity = spawn_agent(
+            &mut world,
+            AgentId(5),
+            "Dev Agent",
+            "Developer",
+            1,
+            "empfang",
+        );
 
         // Capabilities setzen
         if let Some(mut caps) = world.get_mut::<AgentCapabilities>(entity) {

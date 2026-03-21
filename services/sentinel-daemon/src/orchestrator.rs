@@ -88,8 +88,7 @@ fn spawn_agent_full(
         shift_end_hour: end,
         is_on_duty: true,
     };
-    if let Err(e) =
-        runtime_orch.spawn_agent(identity, shift, &agent_cfg.preferences.favorite_room)
+    if let Err(e) = runtime_orch.spawn_agent(identity, shift, &agent_cfg.preferences.favorite_room)
     {
         warn!(agent_id = agent_cfg.identity.id, error = %e, "Agent-Spawn fehlgeschlagen");
         return false;
@@ -962,8 +961,8 @@ fn ecs_tick_loop(
                 shift_end_hour: end,
                 is_on_duty: true,
             };
-            if let Err(e) = runtime_orch
-                .spawn_agent(identity, shift, &agent_cfg.preferences.favorite_room)
+            if let Err(e) =
+                runtime_orch.spawn_agent(identity, shift, &agent_cfg.preferences.favorite_room)
             {
                 warn!(agent_id = agent_cfg.identity.id, error = %e, "Agent-Spawn fehlgeschlagen");
                 continue;

@@ -128,7 +128,14 @@ fn ecs_wasm_tool_dispatch_creates_tool_result_event() {
         return;
     }
     let (mut world, mut schedule, tx, _dir) = setup_wasm_world();
-    let entity = spawn_agent(&mut world, AgentId(1), "Thomas Mueller", "CEO", 1, "empfang");
+    let entity = spawn_agent(
+        &mut world,
+        AgentId(1),
+        "Thomas Mueller",
+        "CEO",
+        1,
+        "empfang",
+    );
 
     // Capabilities setzen (echo hat keine required_capabilities, aber Agent braucht sie im System)
     if let Some(mut caps) = world.get_mut::<AgentCapabilities>(entity) {
@@ -182,7 +189,14 @@ fn ecs_wasm_tool_dispatch_json_format() {
         return;
     }
     let (mut world, mut schedule, tx, _dir) = setup_wasm_world();
-    let entity = spawn_agent(&mut world, AgentId(5), "Lisa Weber", "Designer", 1, "empfang");
+    let entity = spawn_agent(
+        &mut world,
+        AgentId(5),
+        "Lisa Weber",
+        "Designer",
+        1,
+        "empfang",
+    );
 
     if let Some(mut caps) = world.get_mut::<AgentCapabilities>(entity) {
         caps.tools = vec!["echo".into()];

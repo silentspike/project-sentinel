@@ -138,7 +138,14 @@ fn simulate() -> anyhow::Result<()> {
 
     for i in 1..=agents {
         let id = AgentId::new(i as u16)?;
-        spawn_agent(&mut world, id, &format!("Agent-{i:02}"), "Mitarbeiter", 1, "empfang");
+        spawn_agent(
+            &mut world,
+            id,
+            &format!("Agent-{i:02}"),
+            "Mitarbeiter",
+            1,
+            "empfang",
+        );
     }
 
     let start = Instant::now();
@@ -215,27 +222,71 @@ fn simulate() -> anyhow::Result<()> {
     }
 
     let persist = world.resource::<PersistTelemetry>().clone();
-    metric("persist.enabled", if persist.enabled { 1.0 } else { 0.0 }, "bool");
     metric(
-        "persist.write_behind_enabled",
-        if persist.write_behind_enabled { 1.0 } else { 0.0 },
+        "persist.enabled",
+        if persist.enabled { 1.0 } else { 0.0 },
         "bool",
     );
-    metric("persist.interval_ticks", persist.interval_ticks as f64, "ticks");
-    metric("persist.ticks_observed", persist.ticks_observed as f64, "ticks");
-    metric("persist.skipped_ticks", persist.skipped_ticks as f64, "ticks");
-    metric("persist.flush_attempts", persist.flush_attempts as f64, "count");
-    metric("persist.flush_success", persist.flush_success as f64, "count");
-    metric("persist.flush_failures", persist.flush_failures as f64, "count");
-    metric("persist.batch_size_last", persist.batch_size_last as f64, "agents");
+    metric(
+        "persist.write_behind_enabled",
+        if persist.write_behind_enabled {
+            1.0
+        } else {
+            0.0
+        },
+        "bool",
+    );
+    metric(
+        "persist.interval_ticks",
+        persist.interval_ticks as f64,
+        "ticks",
+    );
+    metric(
+        "persist.ticks_observed",
+        persist.ticks_observed as f64,
+        "ticks",
+    );
+    metric(
+        "persist.skipped_ticks",
+        persist.skipped_ticks as f64,
+        "ticks",
+    );
+    metric(
+        "persist.flush_attempts",
+        persist.flush_attempts as f64,
+        "count",
+    );
+    metric(
+        "persist.flush_success",
+        persist.flush_success as f64,
+        "count",
+    );
+    metric(
+        "persist.flush_failures",
+        persist.flush_failures as f64,
+        "count",
+    );
+    metric(
+        "persist.batch_size_last",
+        persist.batch_size_last as f64,
+        "agents",
+    );
     metric("persist.batch_size_avg", persist.avg_batch_size(), "agents");
-    metric("persist.batch_size_max", persist.batch_size_max as f64, "agents");
+    metric(
+        "persist.batch_size_max",
+        persist.batch_size_max as f64,
+        "agents",
+    );
     metric(
         "persist.flush_latency_us_avg",
         persist.avg_flush_latency_us(),
         "us",
     );
-    metric("persist.flush_latency_us_max", persist.flush_latency_us_max, "us");
+    metric(
+        "persist.flush_latency_us_max",
+        persist.flush_latency_us_max,
+        "us",
+    );
     metric(
         "persist.queue_depth_current",
         persist.queue_depth_current as f64,
@@ -247,7 +298,11 @@ fn simulate() -> anyhow::Result<()> {
         "count",
     );
     metric("persist.drop_count", persist.drop_count as f64, "count");
-    metric("persist.coalesce_count", persist.coalesce_count as f64, "count");
+    metric(
+        "persist.coalesce_count",
+        persist.coalesce_count as f64,
+        "count",
+    );
 
     // Release world/resources first so redb file lock is dropped.
     drop(schedule);
@@ -255,12 +310,16 @@ fn simulate() -> anyhow::Result<()> {
 
     // Reopen store and verify persisted state digest.
     let verify = StateStore::open(&db_path)?;
-    let (digest, state_count, min_tick, max_tick, tick_parse_failures) = compute_state_digest(&verify)?;
+    let (digest, state_count, min_tick, max_tick, tick_parse_failures) =
+        compute_state_digest(&verify)?;
     result("state_hash", &digest);
     result("state_count", &state_count.to_string());
     result("state_tick_min", &min_tick.to_string());
     result("state_tick_max", &max_tick.to_string());
-    result("state_tick_parse_failures", &tick_parse_failures.to_string());
+    result(
+        "state_tick_parse_failures",
+        &tick_parse_failures.to_string(),
+    );
     result("persist_every", &persist_every.to_string());
 
     Ok(())
@@ -302,7 +361,10 @@ fn validate() -> anyhow::Result<()> {
     result("state_count", &state_count.to_string());
     result("state_tick_min", &min_tick.to_string());
     result("state_tick_max", &max_tick.to_string());
-    result("state_tick_parse_failures", &tick_parse_failures.to_string());
+    result(
+        "state_tick_parse_failures",
+        &tick_parse_failures.to_string(),
+    );
     result("missing_rows", &missing.to_string());
     result("invalid_rows", &invalid.to_string());
     result("min_agents_required", &min_agents.to_string());
