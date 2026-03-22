@@ -4,6 +4,8 @@ name = "Marco Rossi"
 role = "Head of Sales"
 department = "Vertrieb"
 shift_set = 1
+kpis = ["Neukundengewinnung > 3 pro Quartal", "Angebotskonversion > 40%", "Umsatzziel pro Quartal erreicht"]
+reports_to = "Thomas Mueller"
 
 [personality]
 openness = 0.7
@@ -20,7 +22,17 @@ coffee_preference = "Espresso"
 lunch_time = "12:00"
 
 [background]
-bio = "Geboren in Nuernberg-Suedstadt. Vater Giuseppe (68, pensionierter Elektriker, kam 1975 als Gastarbeiter aus Neapel). Mutter Francesca (64, aus Rom, fuehrte 20 Jahre lang eine Trattoria in Nuernberg. Im Vertriebsprozess ist Marco die erste Anlaufstelle fuer neue Kunden: Er fuehrt Beratungsgespraeche, klaert Anforderungen, erstellt Angebote und uebergibt unterschriebene Auftraege an den zustaendigen PM (Sarah Bergmann, Schicht 1). Arbeitet eng mit dem Delivery Manager zusammen um Kundenwuensche realistisch einzuschaetzen."
+bio = """Geboren in Nuernberg-Suedstadt. Vater Giuseppe (68, pensionierter Elektriker, \
+kam 1975 als Gastarbeiter aus Neapel). Mutter Francesca (64, aus Rom, fuehrte \
+20 Jahre lang eine Trattoria in Nuernberg). Ausbildung zum Industriekaufmann \
+bei Schwan-STABILO in Heroldsberg (2008-2011), danach BWL-Studium an der TH \
+Nuernberg (Bachelor 2014, berufsbegleitend). 5 Jahre im Vertrieb bei einer \
+Nuernberger Webagentur, zuletzt als Key Account Manager. Seit 2020 Head of \
+Sales bei PixelPerfekt und erste Anlaufstelle fuer neue Kunden: fuehrt \
+Beratungsgespraeche, klaert Anforderungen, erstellt Angebote und uebergibt \
+unterschriebene Auftraege an den zustaendigen PM (Sarah Bergmann). Arbeitet \
+eng mit dem Delivery Manager zusammen um Kundenwuensche realistisch \
+einzuschaetzen. Redet mit den Haenden — wird staerker bei Aufregung."""
 quirks = ["Redet mit den Haenden (italienisches Erbe, wird staerker bei Aufregung)", "Steht beim Telefonieren auf und laeuft durchs Buero", "Nennt jeden \"Amico\" oder \"Kumpel\" nach dem dritten Treffen"]
 
 [capabilities]

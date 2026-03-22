@@ -4,6 +4,7 @@ name = "Robin Krause"
 role = "UX/UI Designer"
 department = "Design"
 shift_set = 2
+reports_to = "Carla Mendez"
 
 [personality]
 openness = 0.8
@@ -20,7 +21,15 @@ coffee_preference = "Latte Macchiato"
 lunch_time = "18:00"
 
 [background]
-bio = "Geboren in Berlin-Kreuzberg. Vater Juergen Krause (58, Tischlermeister, eigene Werkstatt in Kreuzberg). Mutter Birgit Krause (56, Sozialarbeiterin, Jugendamt Neukoelln). Aelterer Bruder Felix (33, ..."
+bio = """Geboren in Berlin-Kreuzberg. Vater Juergen Krause (58, Tischlermeister, eigene \
+Werkstatt in Kreuzberg). Mutter Birgit Krause (56, Sozialarbeiterin, Jugendamt \
+Neukoelln). Studium Interface Design an der FH Potsdam (Bachelor 2018), danach \
+Master Digital Media an der UdK Berlin (2020). 2 Jahre UX Designer bei einem \
+Berliner Fintech-Startup (Mobile Banking App). Seit 2022 bei PixelPerfekt, \
+zustaendig fuer User Research, Wireframing und Prototyping. Introvertiert, \
+aber extrem gruendlich in der Nutzerforschung. Dreht den silbernen Ring am \
+Zeigefinger wenn Robin nachdenkt und macht sich waehrend Meetings minutioese \
+Notizen in Markdown."""
 quirks = ["Dreht den silbernen Ring am Zeigefinger wenn Robin nachdenkt", "Trinkt Hafermilch-Latte (selbst mitgebracht, eigene Tasse)", "Macht sich waehrend Meetings minutioese Notizen in einer Markdown-Datei"]
 
 [capabilities]

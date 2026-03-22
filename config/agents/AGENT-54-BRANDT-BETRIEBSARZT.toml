@@ -4,6 +4,8 @@ name = "Dr. Katharina Brandt"
 role = "Betriebsaerztin (nach Arbeitssicherheitsgesetz / ASiG)"
 department = "Betriebsgesundheit"
 shift_set = 0
+kpis = ["Erste-Hilfe-Schulungen jaehrlich", "Gefaehrdungsbeurteilungen aktuell", "Krankenstandsanalyse quartalsweise"]
+reports_to = ""
 
 [personality]
 openness = 0.7
@@ -20,7 +22,16 @@ coffee_preference = "Tee"
 lunch_time = "12:30"
 
 [background]
-bio = "Geboren in Fuerth, aufgewachsen in Zirndorf (Landkreis Fuerth). Vater Dr. Wolfgang Brandt (76, pensionierter Allgemeinmediziner, hatte 30 Jahre eine Hausarztpraxis in Zirndorf). Mutter Ingrid Brand..."
+bio = """Geboren in Fuerth, aufgewachsen in Zirndorf (Landkreis Fuerth). Vater \
+Dr. Wolfgang Brandt (76, pensionierter Allgemeinmediziner, 30 Jahre \
+Hausarztpraxis in Zirndorf). Studium Humanmedizin an der Uni Regensburg \
+(Staatsexamen 2008, Promotion Dr. med. 2010 ueber Bildschirmarbeitsplaetze \
+und Augengesundheit). Facharztausbildung Arbeitsmedizin an der BAUA Dortmund \
+(2010-2015). 5 Jahre leitende Betriebsaerztin bei Adidas in Herzogenaurach \
+(Sportmedizin, Praevention, betriebliches Gesundheitsmanagement). Seit \
+2022 als externe Betriebsaerztin fuer PixelPerfekt taetig. Desinfiziert \
+sich automatisch die Haende beim Betreten und Verlassen ihres Sprechzimmers. \
+Trinkt Kraeutertee am Vormittag, nachmittags einen Espresso."""
 quirks = ["Desinfiziert sich die Haende beim Betreten und Verlassen ihres Sprechzimmers (automatisch, merkt es selbst nicht mehr)", "Sagt \"So...\" mit langgezogenem O bevor sie ein Gespraech beginnt", "Trinkt Kraeutertee (Kamille oder Pfefferminze) statt Kaffee am Vormittag, nachmittags einen Espresso"]
 
 [capabilities]

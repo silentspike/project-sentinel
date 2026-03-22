@@ -218,13 +218,18 @@ pub mod bridge {
             let agent_id = perception.agent_id;
             let current_tick = perception.tick.0;
 
-            // Rate Limiting pro Agent
-            if let Some(&last_tick) = last_call_tick.get(&agent_id) {
-                if current_tick.saturating_sub(last_tick) < config.min_ticks_between_calls {
-                    telemetry
-                        .calls_skipped_rate_limit
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
+            // P1 Chat (direkt angesprochen) umgeht Rate-Limit
+            let is_urgent_chat = perception.is_directly_addressed;
+
+            // Rate Limiting pro Agent (P1 Chat bypass)
+            if !is_urgent_chat {
+                if let Some(&last_tick) = last_call_tick.get(&agent_id) {
+                    if current_tick.saturating_sub(last_tick) < config.min_ticks_between_calls {
+                        telemetry
+                            .calls_skipped_rate_limit
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                 }
             }
 
@@ -240,8 +245,11 @@ pub mod bridge {
                 continue;
             }
 
-            // Nur Calls mit nicht-leerem impulse_text (Agent hat etwas zu tun)
-            if perception.impulse_text.is_empty() && perception.body_text.is_empty() {
+            // Nur Calls mit nicht-leerem Inhalt (impulse, body ODER heard)
+            if perception.impulse_text.is_empty()
+                && perception.body_text.is_empty()
+                && perception.heard_text.is_empty()
+            {
                 continue;
             }
 
@@ -366,6 +374,7 @@ pub mod bridge {
             perception.environment_text.clone(),
         );
         metadata.insert("acoustic".to_string(), perception.acoustic_text.clone());
+        metadata.insert("heard".to_string(), perception.heard_text.clone());
         metadata.insert("presence".to_string(), perception.presence_text.clone());
         metadata.insert("impulse".to_string(), perception.impulse_text.clone());
         metadata.insert("perception".to_string(), formatted_perception);
@@ -439,6 +448,9 @@ pub mod bridge {
         }
         if !perception.acoustic_text.is_empty() {
             lines.push(format!("AKUSTIK: {}", perception.acoustic_text));
+        }
+        if !perception.heard_text.is_empty() {
+            lines.push(format!("GEHOERT: {}", perception.heard_text));
         }
         if !perception.presence_text.is_empty() {
             lines.push(format!("ANWESEND: {}", perception.presence_text));
@@ -514,8 +526,10 @@ pub mod bridge {
                 body_text: "Du fuehlst dich wach.".to_string(),
                 environment_text: "Du bist im Designbuero. Es ist deutlich zu warm (27.5 °C). Die Luft ist sehr stickig (1600 ppm CO2).".to_string(),
                 acoustic_text: "Es ist laut (72 dB). Konzentration faellt schwer.".to_string(),
+                heard_text: String::new(),
                 presence_text: "Lisa (Konzept), Thomas (Review)".to_string(),
                 impulse_text: "Du willst kurz frische Luft.".to_string(),
+                is_directly_addressed: false,
                 timestamp: Timestamp(1234),
                 tick: Tick(55),
             };

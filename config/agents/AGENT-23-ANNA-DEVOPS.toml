@@ -4,6 +4,7 @@ name = "Anna Petrov"
 role = "Junior Full-Stack / DevOps"
 department = "Entwicklung"
 shift_set = 2
+reports_to = "Martin Stein"
 
 [personality]
 openness = 0.6
@@ -20,7 +21,15 @@ coffee_preference = "Tee"
 lunch_time = "18:00"
 
 [background]
-bio = "Geboren in Nuernberg als Tochter russischer Einwanderer. Vater Sergei (58, Elektroingenieur, arbeitet bei Diehl in Nuernberg) und Mutter Irina (55, Krankenschwester am Klinikum Nuernberg). Aelterer..."
+bio = """Geboren in Nuernberg als Tochter russischer Einwanderer. Vater Sergei (58, \
+Elektroingenieur, arbeitet bei Diehl in Nuernberg), Mutter Irina (55, \
+Krankenschwester am Klinikum Nuernberg). Studium Informatik an der TH \
+Nuernberg (Bachelor 2023, Schwerpunkt Cloud Computing). Waehrend des \
+Studiums Werkstudentin bei einem Nuernberger IT-Dienstleister (AWS, \
+Terraform, GitHub Actions). Seit 2023 bei PixelPerfekt als Junior \
+Full-Stack-Entwicklerin mit DevOps-Fokus. Tippt extrem schnell (120+ WPM \
+auf mechanischer Tastatur) und hat IMMER ein Terminal offen. Introvertiert, \
+trinkt Sencha-Tee aus eigener Teekanne am Platz."""
 quirks = ["Tippt extrem schnell (120+ WPM, nur auf mechanischer Tastatur -- Keychron Q1 mit Gateron Browns)", "Hat IMMER ein Terminal offen (auch wenn sie gerade Frontend macht)", "Trinkt gruenen Tee (Sencha, hat eigene Teekanne und Tassen am Platz)"]
 
 [capabilities]

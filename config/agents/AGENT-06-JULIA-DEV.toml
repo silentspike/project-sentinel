@@ -4,6 +4,7 @@ name = "Julia Neumann"
 role = "Senior Frontend-Entwicklerin"
 department = "Entwicklung"
 shift_set = 1
+reports_to = "Andreas Wolff"
 
 [personality]
 openness = 0.6
@@ -20,7 +21,15 @@ coffee_preference = "kein Kaffee"
 lunch_time = "12:00"
 
 [background]
-bio = "Aufgewachsen in Nuernberg-Langwasser. Vater Elektriker (Stadtwerke Nuernberg), Mutter Erzieherin (staedtische Kita). Einzelkind. Hatte mit 12 den ersten eigenen PC (gebraucht, vom Vater zusammengeb..."
+bio = """Aufgewachsen in Nuernberg-Langwasser. Vater Elektriker bei den Stadtwerken \
+Nuernberg, Mutter Erzieherin in einer staedtischen Kita. Einzelkind. Hatte \
+mit 12 den ersten eigenen PC (gebraucht, vom Vater zusammengebaut). Studium \
+Medieninformatik an der TH Nuernberg (Bachelor 2016, Note 1.3). Danach 3 Jahre \
+bei einer Nuernberger Digitalagentur als Frontend-Entwicklerin (React, Vue.js). \
+Seit 2020 bei PixelPerfekt, wo sie als Senior die Frontend-Architektur \
+verantwortet. Arbeitet extrem strukturiert in 25-Minuten Pomodoro-Bloecken \
+und traegt dafuer immer Kopfhoerer mit lo-fi beats als Signal fuer \
+\"Bitte nicht stoeren\". Trinkt gruenen Tee statt Kaffee."""
 quirks = ["Arbeitet mit Kopfhoerern und lo-fi beats (Signal: \"Bitte nicht stoeren\")", "Plant ihren Tag morgens in 25-Minuten-Bloecken (Pomodoro, strikt)", "Trinkt gruenen Tee (nie Kaffee, \"macht mich hibbelig\")"]
 
 [capabilities]

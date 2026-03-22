@@ -4,6 +4,7 @@ name = "Tim Vogt"
 role = "Motion/Visual Designer"
 department = "Design"
 shift_set = 2
+reports_to = "Carla Mendez"
 
 [personality]
 openness = 0.9
@@ -20,7 +21,14 @@ coffee_preference = "Kaffee"
 lunch_time = "18:00"
 
 [background]
-bio = "Geboren in Augsburg-Lechhausen. Vater Ralf Vogt (52, Elektriker bei den Stadtwerken Augsburg, bodenstaendig). Mutter Sabine Vogt (49, Teilzeit-Verkaeuferin bei Rewe, liebenswuerdig). Aeltere Schwes..."
+bio = """Geboren in Augsburg-Lechhausen. Vater Ralf Vogt (52, Elektriker bei den \
+Stadtwerken Augsburg). Mutter Sabine Vogt (49, Teilzeit-Verkaeuferin bei Rewe). \
+Studium Mediengestaltung an der Hochschule Augsburg (Bachelor 2022, Schwerpunkt \
+Motion Design und Animation). Waehrend des Studiums Freelancer fuer YouTube- \
+Intros und Erklaevideos. Seit 2022 bei PixelPerfekt, zustaendig fuer \
+Animationen, Video-Content und visuelle Effekte. Kreativ und energiegeladen, \
+aber manchmal unorganisiert. Wackelt mit dem Stuhl und hoert Lo-Fi Beats oder \
+Anime-OSTs ueber seine Sony WH-1000XM5. Trinkt Energy Drinks statt Kaffee."""
 quirks = ["Wackelt mit dem Stuhl (kippt hinten, Carla sagt 3x/Woche: \"Tim, der Stuhl!\")", "Trinkt Energy Drinks (Monster oder Club Mate, 2/Tag, Robin schaut missbilligend)", "Hat immer Kopfhoerer um den Hals (Sony WH-1000XM5, hoert Lo-Fi Beats oder Anime-OSTs)"]
 
 [capabilities]

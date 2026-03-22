@@ -60,6 +60,7 @@ pub enum SimulationPhase {
 /// - ToolUse → Bio-Actions (drink_coffee, eat_meal, use_bathroom) oder WorkContext
 /// - Emote/PhoneCall → nur Event-Trail (keine State-Mutation)
 /// - Erzeugt DomainEvent (AgentActionReceived) pro Aktion mit Causation-Chain
+#[allow(clippy::too_many_arguments)]
 pub fn input_system(
     receiver: Option<Res<ActionReceiver>>,
     tool_runtime: Option<Res<ToolRuntimeResource>>,
@@ -76,6 +77,8 @@ pub fn input_system(
     time: Res<SimulationTime>,
     mut active_smells: ResMut<super::world::ActiveSmells>,
     mut active_agents: ResMut<super::world::ActiveAgentsThisTick>,
+    mut room_chat_buffer: ResMut<super::world::RoomChatBuffer>,
+    all_agents_query: Query<&AgentIdentity>,
 ) {
     let Some(receiver) = receiver else { return };
     let Ok(rx) = receiver.0.lock() else { return };
@@ -148,6 +151,20 @@ pub fn input_system(
                 ActionType::Chat => {
                     if let Some(content) = &action.content {
                         work_ctx.current_task = Some(content.clone());
+                        // Chat in RoomChatBuffer fuer Raum-Kommunikation
+                        if !position.in_transit {
+                            let all_names: Vec<String> = all_agents_query
+                                .iter()
+                                .map(|id| id.name.clone())
+                                .collect();
+                            room_chat_buffer.add(
+                                &position.room_id,
+                                identity.name.clone(),
+                                content.clone(),
+                                time.tick.0,
+                                &all_names,
+                            );
+                        }
                     }
                 }
                 ActionType::ToolUse => {
@@ -1283,6 +1300,7 @@ pub fn output_system(
     room_physics_state: Res<RoomPhysicsState>,
     query: Query<OutputAgentQueryData>,
     time: Res<SimulationTime>,
+    mut room_chat_buffer: ResMut<super::world::RoomChatBuffer>,
 ) {
     let Some(sender) = sender else { return };
 
@@ -1382,14 +1400,45 @@ pub fn output_system(
             prompt_perception.presence_text.clone()
         };
 
+        // Room-Chat: heard_text aus RoomChatBuffer
+        let (heard_text, is_directly_addressed) = if !position.in_transit
+            && room_chat_buffer.can_respond(&identity.name, time.tick.0)
+        {
+            let recent = room_chat_buffer.get_recent(
+                &position.room_id,
+                time.tick.0,
+                &identity.name,
+            );
+            if recent.is_empty() {
+                (String::new(), false)
+            } else {
+                let first_name = identity.name.split_whitespace().next().unwrap_or(&identity.name);
+                let is_addressed = recent.iter().any(|m| {
+                    m.addressed_agents.iter().any(|n| n.contains(first_name))
+                });
+                let text = recent
+                    .iter()
+                    .take(5)
+                    .map(|m| format!("{} sagte: \"{}\"", m.agent_name, m.content))
+                    .collect::<Vec<_>>()
+                    .join(". ");
+                room_chat_buffer.set_heard(&identity.name, time.tick.0);
+                (text, is_addressed)
+            }
+        } else {
+            (String::new(), false)
+        };
+
         let msg = Perception {
             agent_id: identity.agent_id,
             circadian_text: prompt_perception.circadian_text,
             body_text,
             environment_text,
             acoustic_text: prompt_perception.acoustic_text,
+            heard_text,
             presence_text,
             impulse_text,
+            is_directly_addressed,
             timestamp: Timestamp(time.tick.0),
             tick: time.tick,
         };
@@ -1397,6 +1446,9 @@ pub fn output_system(
         // (naechster Tick liefert frische Daten).
         let _ = sender.0.try_send(msg);
     }
+
+    // Cleanup abgelaufene Chat-Messages
+    room_chat_buffer.cleanup(time.tick.0);
 }
 
 fn focus_hours_since_shift_start(sim_hour: f32, shift: &ShiftInfo) -> f32 {

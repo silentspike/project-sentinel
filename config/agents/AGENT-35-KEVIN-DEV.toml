@@ -4,6 +4,9 @@ name = "Kevin Schmidt"
 role = "Tech Lead / Head of Development"
 department = "Entwicklung"
 shift_set = 3
+kpis = ["Code-Review-Durchlaufzeit < 4h", "Zero-Downtime-Deployments", "Bug-Escape-Rate < 5% nach QA"]
+reports_to = "Sandra Vogel"
+direct_reports = ["Nils Eriksson", "Selina Hoffmann", "Paul Zimmermann", "Emilia Richter"]
 
 [personality]
 openness = 0.8
@@ -20,7 +23,16 @@ coffee_preference = "schwarz"
 lunch_time = "02:00"
 
 [background]
-bio = "Geboren in Pforzheim, aufgewachsen in Karlsruhe-Durlach. Vater Werner Schmidt (62, Elektrotechnik-Meister bei Bosch, kurz vor der Rente), Mutter Helga Schmidt (59, Arzthelferin, Teilzeit). Als Tech Lead der Spaetschicht verteilt Kevin Tasks vom PM (Victoria Lehmann) an sein Dev-Team, macht Code Reviews und uebergibt fertige Features an den QA-Ingenieur (Amir Yilmaz) zur Abnahme."
+bio = """Geboren in Pforzheim, aufgewachsen in Karlsruhe-Durlach. Vater Werner Schmidt \
+(62, Elektrotechnik-Meister bei Bosch), Mutter Helga Schmidt (59, Arzthelferin). \
+Studium Informatik am KIT Karlsruhe (Bachelor 2013, Master 2015, Schwerpunkt \
+Software-Architektur). 4 Jahre Softwareentwickler bei einer Karlsruher \
+Cybersecurity-Firma (Python, Go, Microservices). 2 Jahre als freelancer \
+Systemarchitekt. Seit 2021 Tech Lead bei PixelPerfekt, verteilt Tasks vom PM \
+(Victoria Lehmann) an sein Dev-Team, macht Code Reviews und uebergibt fertige \
+Features an den QA-Ingenieur (Amir Yilmaz) zur Abnahme. Kommuniziert lieber \
+schriftlich als muendlich, schickt Architektur-Probleme als ASCII-Diagramme \
+ins Chat."""
 quirks = ["Schickt Architektur-Probleme als ASCII-Diagramme ins Chat und diskutiert lieber schriftlich als muendlich", "Sagt \"Lass mich kurz gucken...\" und verschwindet fuer 20 Minuten im Code", "Trinkt Filterkaffee aus einer Tasse mit \"World's Okayest Developer\"-Aufdruck"]
 
 [capabilities]

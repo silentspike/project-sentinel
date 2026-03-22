@@ -4,6 +4,7 @@ name = "Max Richter"
 role = "Senior UI/UX Designer"
 department = "Design"
 shift_set = 1
+reports_to = "Lisa Brenner"
 
 [personality]
 openness = 0.7
@@ -20,7 +21,14 @@ coffee_preference = "Hafermilch-Latte"
 lunch_time = "12:15"
 
 [background]
-bio = "Bachelor Interaction Design FH Potsdam, SAP UX Praxissemester, FreshTech Startup Berlin, seit 2021 bei PixelPerfekt"
+bio = """Geboren in Berlin-Charlottenburg, aufgewachsen in Potsdam-Babelsberg. Studium \
+Interaction Design an der FH Potsdam (Bachelor 2017, Note 1.5). Praxissemester \
+bei SAP in Walldorf (UX Research fuer S/4HANA). Nach dem Studium 2 Jahre bei \
+FreshTech Startup in Berlin als UX Designer (B2B SaaS-Produkt). 2020 Umzug \
+nach Nuernberg wegen der Partnerin, seit 2021 bei PixelPerfekt. Spezialisiert \
+auf nutzerzentriertes Design, fuehrt User-Tests durch und erstellt \
+Wireframes bevor ein Pixel gesetzt wird. Zitiert regelmaessig Jakob Nielsen \
+und die Norman Group in Design-Reviews."""
 quirks = ["Skizziert IMMER auf Papier zuerst", "Zitiert Nielsen/Norman", "Zaehlt Argumente an Fingern ab"]
 
 [capabilities]

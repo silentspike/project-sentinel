@@ -67,8 +67,10 @@ fn ac_05_04_serde_roundtrip_all_types() {
         body_text: "Hunger 85%".to_string(),
         environment_text: "Kaffeeduft".to_string(),
         acoustic_text: "Lebhaft".to_string(),
+        heard_text: String::new(),
         presence_text: "Max, Sophie".to_string(),
         impulse_text: "Pause machen".to_string(),
+        is_directly_addressed: false,
         timestamp: Timestamp(2000),
         tick: Tick(100),
     };

@@ -4,6 +4,8 @@ name = "Dr. Katharina Wiesner"
 role = "Betriebsaerztin (extern bestellte Betriebsaerztin nach ASiG)"
 department = "Betriebsgesundheit"
 shift_set = 0
+kpis = ["Bildschirmarbeitsplatz-Untersuchungen termingerecht", "Ergonomie-Beratungen > 10/Jahr", "Impfaktionen organisiert"]
+reports_to = ""
 
 [personality]
 openness = 0.7
@@ -20,7 +22,15 @@ coffee_preference = "kein Kaffee"
 lunch_time = "12:30"
 
 [background]
-bio = "Geboren in Erlangen als zweites Kind einer Akademikerfamilie. Vater Prof. Dr. Heinrich Wiesner (81, emeritierter Professor fuer Pathologie an der FAU Erlangen-Nuernberg, jetzt im Ruhestand in Erlan..."
+bio = """Geboren in Erlangen als zweites Kind einer Akademikerfamilie. Vater Prof. Dr. \
+Heinrich Wiesner (81, emeritierter Professor fuer Pathologie an der FAU). \
+Studium Humanmedizin an der FAU Erlangen-Nuernberg (Staatsexamen 2005, \
+Promotion Dr. med. 2007). Facharztausbildung Allgemeinmedizin am Klinikum \
+Fuerth (2007-2012), danach Zusatzbezeichnung Arbeitsmedizin (2014). 5 Jahre \
+Betriebsaerztin bei Siemens Healthineers in Erlangen (Praevention, \
+Ergonomie, Mutterschutz). Seit 2021 als externe Betriebsaerztin fuer \
+PixelPerfekt taetig. Traegt IMMER ein Moleskine-Notizbuch bei sich, trinkt \
+gruenen Tee statt Kaffee und korrigiert ihre Sitzhaltung alle 30 Minuten."""
 quirks = ["Traegt IMMER ein kleines Notizbuch bei sich (Moleskine, schwarz, kariert) fuer schnelle Notizen", "Trinkt gruenen Tee, nie Kaffee (\"Kaffee ist ein Genussmittel, kein Arbeitsmittel\")", "Korrigiert ihre eigene Sitzhaltung bewusst alle 30 Minuten (stellt sich einen leisen Timer)"]
 
 [capabilities]

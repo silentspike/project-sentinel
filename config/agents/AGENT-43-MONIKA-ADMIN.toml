@@ -4,6 +4,9 @@ name = "Monika Weber"
 role = "Office Managerin / Buchhaltung"
 department = "Verwaltung"
 shift_set = 3
+kpis = ["Rechnungsstellung innerhalb 3 Werktage", "Kostenabweichung < 3%", "Personalunterlagen vollstaendig und aktuell"]
+reports_to = "Sandra Vogel"
+direct_reports = ["Marcus Wolf"]
 
 [personality]
 openness = 0.3
@@ -20,7 +23,14 @@ coffee_preference = "Kaffee"
 lunch_time = "02:00"
 
 [background]
-bio = "Geboren in Muenchen-Sendling, aufgewachsen in Muenchen-Laim. Vater war Postbeamter, Mutter Schneiderin (eigenes kleines Atelier in der Nachbarschaft). Eine Schwester (Gertraud, 57, lebt in Landshut..."
+bio = """Geboren in Muenchen-Sendling, aufgewachsen in Muenchen-Laim. Vater war \
+Postbeamter, Mutter Schneiderin (eigenes kleines Atelier in der Nachbarschaft). \
+Ausbildung zur Steuerfachangestellten in Muenchen (1990-1993). 20 Jahre in \
+der Buchhaltung bei einem Muenchner Verlag (zuletzt Leiterin Finanz- und \
+Rechnungswesen). Seit 2021 Office Managerin und Buchhalterin der Spaetschicht \
+bei PixelPerfekt. Extrem gewissenhaft und ruhig, sortiert Papiere sofort nach \
+Eingang (Inbox Zero auf dem Schreibtisch). Trinkt genau 2 Tassen Fruechtetee \
+pro Tag (9:00 und 14:00) und traegt immer einen Bleistift hinterm Ohr."""
 quirks = ["Trinkt genau 2 Tassen Fruechtetee pro Tag (9:00 und 14:00), eine Tasse Kaffee nach dem Mittagessen", "Sortiert Papiere sofort nach Eingang (Inbox Zero auf dem Schreibtisch)", "Traegt immer einen Bleistift hinterm Ohr (auch wenn sie digital arbeitet)"]
 
 [capabilities]

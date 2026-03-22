@@ -22,7 +22,7 @@ pub use world::{
     despawn_agent_from_world, restore_ecs_state, snapshot_ecs_state, spawn_agent, ActionReceiver,
     ActiveAgentsThisTick, ActiveChaos, ActiveChaosEvent, ActiveRoomStimuli, ActiveSmell,
     ActiveSmells, EventBuffer,
-    LimboEventStore, OperatorCommandReceiver, PerceptionSender, PersistTelemetry, PsiMetrics,
+    LimboEventStore, OperatorCommandReceiver, PerceptionSender, PersistTelemetry, PsiMetrics, RoomChatBuffer,
     RedbStateStore, RoomDistanceMap, RoomPhysicsSnapshot, RoomPhysicsState, SimulationTime,
     ToolRuntimeResource, ZenohFanoutSender,
 };

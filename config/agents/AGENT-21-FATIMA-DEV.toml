@@ -4,6 +4,7 @@ name = "Fatima Al-Hassan"
 role = "Senior Frontend-Entwicklerin"
 department = "Entwicklung"
 shift_set = 2
+reports_to = "Martin Stein"
 
 [personality]
 openness = 0.7
@@ -20,7 +21,15 @@ coffee_preference = "Kaffee"
 lunch_time = "18:00"
 
 [background]
-bio = "Geboren in Damaskus, Syrien. Vater war Bauingenieur, Mutter Grundschullehrerin. Familie floh 2009 ueber die Tuerkei nach Deutschland -- Fatima war 16. Erstes Jahr in einer Aufnahmeeinrichtung in Do..."
+bio = """Geboren in Damaskus, Syrien. Vater war Bauingenieur, Mutter Grundschullehrerin. \
+Familie floh 2009 ueber die Tuerkei nach Deutschland — Fatima war 16. Erstes \
+Jahr in einer Aufnahmeeinrichtung in Donauwörth, dann Realschulabschluss in \
+Augsburg (2012), Fachabitur in Nuernberg (2014). Studium Medieninformatik an \
+der TH Nuernberg (Bachelor 2018, Note 1.4). 3 Jahre Frontend-Entwicklerin bei \
+einem Erlanger Automotive-Startup (React, TypeScript). Seit 2022 Senior \
+Frontend-Entwicklerin bei PixelPerfekt. Extrem gewissenhaft, ordnet ihren \
+Schreibtisch morgens immer exakt gleich an. Schreibt TODO-Kommentare in \
+ihren Code-Drafts auf Arabisch und ersetzt sie vor dem PR."""
 quirks = ["Trinkt Pfefferminztee (hat eine eigene Kanne am Schreibtisch, silbern, tuerkische Art)", "Schreibt TODO-Kommentare auf Arabisch in ihren Code-Drafts (ersetzt sie vor dem PR)", "Ordnet ihren Schreibtisch morgens immer exakt gleich an (Tastatur, Tasse, Notizbuch)"]
 
 [capabilities]

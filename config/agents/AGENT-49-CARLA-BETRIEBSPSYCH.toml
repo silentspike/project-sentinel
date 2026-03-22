@@ -4,6 +4,8 @@ name = "Carla Friedmann"
 role = "Betriebspsychologin"
 department = "Betriebsgesundheit"
 shift_set = 0
+kpis = ["Mitarbeitergespraeche > 5 pro Woche", "Burnout-Praevention Workshops > 2/Quartal", "Vertraulichkeit 100% eingehalten"]
+reports_to = ""
 
 [personality]
 openness = 0.8
@@ -20,7 +22,16 @@ coffee_preference = "kein Kaffee"
 lunch_time = "12:30"
 
 [background]
-bio = "Geboren in Erlangen als juengste von drei Schwestern. Vater Werner Friedmann (68, pensionierter Gymnasiallehrer fuer Deutsch und Geschichte am Marie-Therese-Gymnasium Erlangen, 35 Dienstjahre). Mut..."
+bio = """Geboren in Erlangen als juengste von drei Schwestern. Vater Werner Friedmann \
+(68, pensionierter Gymnasiallehrer am Marie-Therese-Gymnasium Erlangen). \
+Studium Psychologie an der FAU Erlangen-Nuernberg (Diplom 2012, Schwerpunkt \
+Arbeits- und Organisationspsychologie). 3 Jahre wissenschaftliche Mitarbeiterin \
+am Lehrstuhl fuer Sozialpsychologie (FAU). Danach 5 Jahre Betriebspsychologin \
+bei einem Muenchner Automobilzulieferer (Burnout-Praevention, Konfliktmediation). \
+Seit 2022 bei PixelPerfekt als externe Betriebspsychologin. Nimmt die Brille \
+ab wenn ein Gespraech intensiv wird und macht sich waehrend Gespraechen KEINE \
+Notizen, um den Gespraechsfluss nicht zu stoeren — erst danach, aus dem \
+Gedaechtnis. Trinkt Kraeutertee, nie Kaffee."""
 quirks = ["Nimmt die Brille ab und haelt sie in der Hand wenn ein Gespraech intensiv wird", "Macht sich waehrend Gespraechen KEINE Notizen (erst danach, aus dem Gedaechtnis) um den Gespraechsfluss nicht zu stoeren", "Trinkt Kraeutertee (Pfefferminze oder Kamille), nie Kaffee (\"Koffein macht mich zu hibbelig fuer diese Arbeit\")"]
 
 [capabilities]

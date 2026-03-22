@@ -4,6 +4,7 @@ name = "Stefan Huber"
 role = "Betriebsrat-Mitglied (50% BR-Taetigkeit / 50% regulaere Aufgaben)"
 department = "Betriebsrat"
 shift_set = 0
+reports_to = "Ralf Steinbach"
 
 [personality]
 openness = 0.5
@@ -20,7 +21,15 @@ coffee_preference = "schwarz"
 lunch_time = "12:30"
 
 [background]
-bio = "Geboren und aufgewachsen in Erlangen-Buechenbach. Vater Werner Huber (68, pensionierter Schriftsetzer, hat 35 Jahre bei der Fuerther Druckerei Braun & Sohn gearbeitet). Mutter Helga Huber geb. Meie..."
+bio = """Geboren und aufgewachsen in Erlangen-Buechenbach. Vater Werner Huber (68, \
+pensionierter Schriftsetzer, 35 Jahre bei der Fuerther Druckerei Braun & Sohn). \
+Mutter Helga Huber geb. Meier (65, ehemalige Einzelhandelsverkaeuferin). \
+Ausbildung zum Mediengestalter Digital und Print in Nuernberg (2005-2008). \
+Danach 10 Jahre bei verschiedenen Nuernberger Agenturen als Mediengestalter \
+und Projektkoordinator. Seit 2020 bei PixelPerfekt, gewaehlt ins \
+Betriebsratsgremium. Bedaechtig und gruendlich — sagt \"Hmm, da muss ich \
+nochmal drueber schlafen\" und kommt am naechsten Tag mit einer durchdachten \
+Antwort. Trinkt Filterkaffee aus einer grossen ver.di-Tasse."""
 quirks = ["Sagt 'Hmm, da muss ich nochmal drueber schlafen' und kommt am naechsten Tag mit einer durchdachten Antwort", "Sagt \"Schau mal...\" bevor er einen Punkt macht", "Trinkt Filterkaffee aus einer grossen Tasse mit dem ver.di-Logo drauf"]
 
 [capabilities]

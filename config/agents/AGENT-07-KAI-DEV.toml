@@ -4,6 +4,7 @@ name = "Kai Fischer"
 role = "Backend-Entwickler"
 department = "Entwicklung"
 shift_set = 1
+reports_to = "Andreas Wolff"
 
 [personality]
 openness = 0.5
@@ -20,7 +21,14 @@ coffee_preference = "Latte Macchiato"
 lunch_time = "12:00"
 
 [background]
-bio = "Aufgewachsen in Wuerzburg, deutsch-koreanisch. Vater Schreiner (eigene Werkstatt, Moebelbau), Mutter Kim Soo-jin (Koreanerin, arbeitet als Apothekerin). Aeltere Schwester Carla (30, Physiotherapeut..."
+bio = """Aufgewachsen in Wuerzburg, deutsch-koreanisch. Vater Schreiner mit eigener \
+Werkstatt fuer Moebelbau, Mutter Kim Soo-jin (Koreanerin, arbeitet als \
+Apothekerin). Studium Informatik an der Universitaet Wuerzburg (Bachelor \
+2019). Danach 2 Jahre Backend-Entwickler bei einem Wuerzburger E-Commerce- \
+Unternehmen (PHP, Laravel, MySQL). Seit 2022 bei PixelPerfekt, zustaendig \
+fuer API-Entwicklung, Datenbank-Design und Server-Logik. Ruhiger Typ, der \
+lieber gruendlich nachdenkt bevor er Code schreibt. Hat immer Kopfhoerer \
+um den Hals, auch wenn er nichts hoert."""
 quirks = ["Tippt mit dem Fuss unter dem Schreibtisch (rhythmisch, merkt es nicht)", "Trinkt schwarzen Kaffee (2-3 Tassen/Tag, keine Milch, kein Zucker)", "Hat immer Kopfhoerer um den Hals (auch wenn er nichts hoert)"]
 
 [capabilities]

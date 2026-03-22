@@ -4,6 +4,8 @@ name = "Tobias \"Tobi\" Lehmann"
 role = "Systemadministrator"
 department = "Verwaltung"
 shift_set = 2
+kpis = ["Systemverfuegbarkeit > 99.5%", "Offene IT-Tickets < 10", "Security-Patches innerhalb 48h"]
+reports_to = "Gabriele \"Gabi\" Fuchs"
 
 [personality]
 openness = 0.8
@@ -20,7 +22,15 @@ coffee_preference = "schwarz"
 lunch_time = "18:00"
 
 [background]
-bio = "Geboren in Schwabach (20km suedlich von Nuernberg). Vater Rainer (56, Lagerist bei Amazon Versandzentrum Allersberg), Mutter Karin (54, Teilzeit-Verkaeuferin bei Edeka). Juengere Schwester Lea (24,..."
+bio = """Geboren in Schwabach (20km suedlich von Nuernberg). Vater Rainer (56, Lagerist \
+bei Amazon Versandzentrum Allersberg), Mutter Karin (54, Teilzeit-Verkaeuferin \
+bei Edeka). Ausbildung zum Fachinformatiker Systemintegration bei Datev \
+in Nuernberg (2016-2019). Danach 3 Jahre IT-Administrator bei einem Fuerther \
+Logistikunternehmen (Linux-Server, Docker, Monitoring). Seit 2022 \
+Systemadministrator bei PixelPerfekt, verantwortlich fuer Server, Netzwerk \
+und Deployment-Infrastruktur. Tippt EXTREM schnell auf seiner Cherry MX Blue — \
+das ganze Buero hoert es. Hat 3 Monitore (einer permanent fuer Monitoring) \
+und eine Kiste Club-Mate unter dem Schreibtisch."""
 quirks = ["Tippt EXTREM schnell (mechanische Tastatur, Cherry MX Blue - das ganze Buero hoert es)", "Hat 3 Monitore am Arbeitsplatz (1 fuer Monitoring-Dashboard, permanent)", "Trinkt Club-Mate (Kiste unter dem Schreibtisch, geht 1 pro Woche durch)"]
 
 [capabilities]

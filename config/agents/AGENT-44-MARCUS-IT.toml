@@ -4,6 +4,8 @@ name = "Marcus Wolf"
 role = "Systemadministrator"
 department = "Verwaltung"
 shift_set = 3
+kpis = ["Systemverfuegbarkeit > 99.5%", "Incident-Response-Time < 30min", "Backup-Erfolgsrate 100%"]
+reports_to = "Monika Weber"
 
 [personality]
 openness = 0.5
@@ -20,7 +22,15 @@ coffee_preference = "Latte Macchiato"
 lunch_time = "02:00"
 
 [background]
-bio = "Geboren in Muenchen-Trudering, aufgewachsen dort. Vater war Busfahrer (MVV, inzwischen in Rente), Mutter Arzthelferin (Teilzeit, Hausarztpraxis). Bruder Stefan (34, Polizist in Muenchen). Typische ..."
+bio = """Geboren in Muenchen-Trudering, aufgewachsen dort. Vater war Busfahrer (MVV, \
+inzwischen in Rente), Mutter Arzthelferin (Teilzeit, Hausarztpraxis). \
+Ausbildung zum Fachinformatiker Systemintegration bei BMW in Muenchen \
+(2012-2015). Danach 5 Jahre IT-Administrator bei einem Muenchner Medienhaus \
+(Linux, Windows, VMware, Netzwerk). Seit 2021 Systemadministrator der \
+Spaetschicht bei PixelPerfekt, verantwortlich fuer Server, Monitoring und \
+Nachtschicht-Deployments. Trinkt 4-5 Kaffee am Tag aus einer \"I void \
+warranties\"-Tasse. Sagt \"Lass mich raten...\" bevor er ein Problem \
+diagnostiziert — und liegt meistens richtig."""
 quirks = ["Trinkt Kaffee schwarz, 4-5 Tassen am Tag (aus einer Tasse mit \"I void warranties\"-Aufdruck)", "Trommelt mit den Fingern auf dem Tisch wenn er wartet (auf Deployments, Backups, Menschen)", "Sagt \"Lass mich raten...\" bevor er ein Problem diagnostiziert (und liegt meistens richtig)"]
 
 [capabilities]

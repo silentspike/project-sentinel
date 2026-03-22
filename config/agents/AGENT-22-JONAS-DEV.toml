@@ -4,6 +4,7 @@ name = "Jonas Weber"
 role = "Backend-Entwickler (Mid-Level)"
 department = "Entwicklung"
 shift_set = 2
+reports_to = "Martin Stein"
 
 [personality]
 openness = 0.7
@@ -20,7 +21,15 @@ coffee_preference = "Kaffee"
 lunch_time = "18:00"
 
 [background]
-bio = "Aufgewachsen in Schwabach bei Nuernberg. Vater Elektriker (eigener Betrieb, 3 Mitarbeiter), Mutter Arzthelferin. Jungster von drei Bruedern -- Leon (34, Polizist) und Nico (32, Tischlermeister). Ty..."
+bio = """Aufgewachsen in Schwabach bei Nuernberg. Vater Elektriker (eigener Betrieb, \
+3 Mitarbeiter), Mutter Arzthelferin. Juengster von drei Bruedern. Ausbildung \
+zum Fachinformatiker Anwendungsentwicklung bei Adidas in Herzogenaurach \
+(2017-2020), danach berufsbegleitendes Informatik-Studium an der IU \
+(Bachelor 2023). 2 Jahre Backend-Entwickler bei einem Nuernberger FinTech \
+(Node.js, PostgreSQL). Seit 2023 bei PixelPerfekt, arbeitet an APIs und \
+Datenbank-Backends. Geselliger Typ, wippt beim Coden mit dem Kopf zu Techno \
+und sagt \"easy peasy\" bevor er eine Aufgabe annimmt. Bringt jeden Freitag \
+Donuts mit."""
 quirks = ["Wippt beim Coden mit dem Kopf (hoert Techno, bemerkt es nicht)", "Sagt \"easy peasy\" bevor er eine Aufgabe annimmt (egal wie komplex)", "Bringt jeden Freitag Donuts mit (hat eine Abo-Karte bei \"Donutteria\" in Gostenhof)"]
 
 [capabilities]

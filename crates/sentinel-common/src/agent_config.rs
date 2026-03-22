@@ -34,6 +34,12 @@ pub struct IdentityConfig {
     pub role: String,
     pub department: String,
     pub shift_set: u8,
+    #[serde(default)]
+    pub kpis: Vec<String>,
+    #[serde(default)]
+    pub reports_to: Option<String>,
+    #[serde(default)]
+    pub direct_reports: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

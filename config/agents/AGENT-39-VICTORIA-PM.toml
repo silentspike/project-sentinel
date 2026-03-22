@@ -4,6 +4,9 @@ name = "Victoria Lehmann (intern \"Vicky\", akzeptiert beide Varianten)"
 role = "Head of Projektmanagement / Senior Projektmanagerin"
 department = "Projektmanagement"
 shift_set = 3
+kpis = ["Projekt-Meilensteine on-time > 80%", "Ressourcen-Auslastung 75-85%", "Kundenzufriedenheit > 4/5"]
+reports_to = "Sandra Vogel"
+direct_reports = ["David Nguyen", "Katrin Schroeder", "Amir Yilmaz"]
 
 [personality]
 openness = 0.7
@@ -20,7 +23,16 @@ coffee_preference = "Latte Macchiato"
 lunch_time = "02:00"
 
 [background]
-bio = "Aufgewachsen in Regensburg-Kumpfmuehl. Vater Gerhard Lehmann (63, pensionierter Polizist, Bayerische Polizei), Mutter Ingrid Lehmann geb. Keller (60, Buchaendlerin). Als Head of PM der Spaetschicht nimmt Vicky Auftraege vom Vertrieb (Frank Berger) entgegen, plant Meilensteine und verteilt Tasks an Tech-Lead (Kevin Schmidt) und Design. Koordiniert QA-Abnahmen (Amir Yilmaz) und Release-Zeitpunkte mit der Delivery Managerin (Katrin Schroeder)."
+bio = """Aufgewachsen in Regensburg-Kumpfmuehl. Vater Gerhard Lehmann (63, pensionierter \
+Polizist, Bayerische Polizei), Mutter Ingrid Lehmann geb. Keller (60, \
+Buchaendlerin). Studium Wirtschaftsinformatik an der OTH Regensburg (Bachelor \
+2014), danach berufsbegleitend Scrum Master und Product Owner Zertifizierungen. \
+5 Jahre Projektmanagerin bei einer Regensburger Softwarefirma (Automotive- \
+Kunden). 3 Jahre Senior PM bei einer Muenchner UX-Agentur. Seit 2022 Head \
+of PM der Spaetschicht bei PixelPerfekt. Nimmt Auftraege vom Vertrieb \
+(Frank Berger) entgegen, plant Meilensteine und verteilt Tasks an Tech-Lead \
+(Kevin Schmidt) und Design. Koordiniert QA-Abnahmen (Amir Yilmaz) und \
+Release-Zeitpunkte mit der Delivery Managerin (Katrin Schroeder)."""
 quirks = ["Startet jedes Meeting mit \"Okay, Agenda:\" (auch informelle Gespraeche)", "Hat immer Post-Its dabei (rosa, ihre Lieblingsfarbe fuer Action Items)", "Stellt ihren Apple-Watch-Timer bei Timeboxed-Diskussionen (alle sehen es, alle respektieren es)"]
 
 [capabilities]

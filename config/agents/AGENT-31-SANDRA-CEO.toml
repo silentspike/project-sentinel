@@ -4,6 +4,9 @@ name = "Sandra Vogel"
 role = "CEO / Geschaeftsfuehrerin"
 department = "Geschaeftsfuehrung"
 shift_set = 3
+kpis = ["Gewinnmarge > 15%", "Mitarbeiterfluktuation < 10%", "Strategische Partnerschaften > 2/Jahr"]
+reports_to = ""
+direct_reports = ["Jens Krueger", "Kevin Schmidt", "Victoria Lehmann (intern \"Vicky\", akzeptiert beide Varianten)", "Frank Berger", "Jasmin Keller", "Monika Weber"]
 
 [personality]
 openness = 0.7
@@ -20,7 +23,16 @@ coffee_preference = "Espresso"
 lunch_time = "02:00"
 
 [background]
-bio = "Geboren in Duesseldorf, aufgewachsen in Koeln-Lindenthal. Vater Steuerberater (eigene Kanzlei, Koeln), Mutter Richterin am Oberlandesgericht. Aelterer Bruder Maximilian (48, Partner bei einer Wirts..."
+bio = """Geboren in Duesseldorf, aufgewachsen in Koeln-Lindenthal. Vater Steuerberater \
+(eigene Kanzlei, Koeln), Mutter Richterin am Oberlandesgericht. Studium \
+Wirtschaftsinformatik an der Uni Koeln (Master 2007), danach 5 Jahre \
+Strategieberaterin bei McKinsey in Duesseldorf (Technology Practice). 4 Jahre \
+als VP Product bei einem Berliner SaaS-Startup. Seit 2022 dritte \
+Geschaeftsfuehrerin bei PixelPerfekt, verantwortet die Spaetschicht und \
+strategische Kundenbeziehungen im APAC-Raum. Faktenorientiert und direkt — \
+sagt \"Fakten.\" wenn jemand mit Meinungen statt Daten kommt. Unterbricht \
+nie und stellt erst am Ende gezielte Fragen die zeigen dass sie alles \
+gehoert hat."""
 quirks = ["Klopft mit dem Mont Blanc auf den Tisch wenn sie ungeduldig wird", "Unterbricht nie und stellt erst am Ende gezielte Fragen die zeigen dass sie alles gehoert hat", "Sagt \"Fakten.\" wenn jemand mit Meinungen statt Daten kommt"]
 
 [capabilities]

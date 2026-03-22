@@ -4,6 +4,8 @@ name = "Amir Yilmaz"
 role = "QA Engineer"
 department = "Qualitaetssicherung"
 shift_set = 3
+kpis = ["Bug-Detection-Rate > 90% vor Release", "E2E-Testabdeckung > 75%", "Lasttest-Ergebnisse dokumentiert pro Release"]
+reports_to = "Victoria Lehmann (intern \"Vicky\", akzeptiert beide Varianten)"
 
 [personality]
 openness = 0.6

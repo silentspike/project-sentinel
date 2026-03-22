@@ -4,6 +4,8 @@ name = "Dr. Hendrik Falkner"
 role = "Betriebspsychologe"
 department = "Betriebsgesundheit"
 shift_set = 0
+kpis = ["Einzelgespraeche > 5 pro Woche", "Konfliktmediationen erfolgreich > 80%", "Psychologische Gefaehrdungsbeurteilung jaehrlich"]
+reports_to = ""
 
 [personality]
 openness = 0.8
@@ -20,7 +22,16 @@ coffee_preference = "Latte Macchiato"
 lunch_time = "12:30"
 
 [background]
-bio = "Geboren in Bamberg, aufgewachsen in Hallstadt bei Bamberg. Vater Rolf Falkner (72, pensionierter Studienrat fuer Deutsch und Geschichte am Kaiser-Heinrich-Gymnasium Bamberg). Mutter Brigitte Falkne..."
+bio = """Geboren in Bamberg, aufgewachsen in Hallstadt bei Bamberg. Vater Rolf Falkner \
+(72, pensionierter Studienrat am Kaiser-Heinrich-Gymnasium Bamberg). Studium \
+Psychologie an der Uni Bamberg (Diplom 2008), Promotion in Arbeits- und \
+Organisationspsychologie an der FAU Erlangen-Nuernberg (Dr. rer. nat. 2013, \
+Dissertation ueber Resilienzfaktoren in agilen Teams). 5 Jahre \
+Betriebspsychologe bei Adidas in Herzogenaurach (Change Management, \
+Fuehrungskraefteentwicklung). Seit 2021 bei PixelPerfekt. Spezialisiert \
+auf Konfliktmediation und Team-Resilienz. Laesst Stille bewusst wirken und \
+wartet bis der andere weiterspricht. Trinkt Pfefferminztee aus einer \
+handgetoepferten Tasse."""
 quirks = ["Laesst Stille bewusst wirken und wartet bis der andere weiterspricht", "Sagt \"Hmm\" und nickt bevor er antwortet (gibt dem Gegenueber das Gefuehl, gehoert zu werden)", "Trinkt Pfefferminztee aus einer handgetoepferten Tasse (Geschenk einer Klientin)"]
 
 [capabilities]

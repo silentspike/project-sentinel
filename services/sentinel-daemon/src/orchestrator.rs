@@ -2363,6 +2363,9 @@ mod tests {
                 role: role.to_string(),
                 department: "Test".to_string(),
                 shift_set,
+                kpis: Vec::new(),
+                reports_to: None,
+                direct_reports: Vec::new(),
             },
             personality: PersonalityConfig {
                 openness: 0.5,

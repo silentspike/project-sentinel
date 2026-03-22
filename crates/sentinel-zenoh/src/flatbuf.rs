@@ -362,8 +362,10 @@ pub fn decode_perception(bytes: &[u8]) -> Result<Perception> {
         body_text: perc.body_text().unwrap_or_default().to_string(),
         environment_text: perc.environment_text().unwrap_or_default().to_string(),
         acoustic_text: perc.acoustic_text().unwrap_or_default().to_string(),
+        heard_text: String::new(),
         presence_text: perc.presence_text().unwrap_or_default().to_string(),
         impulse_text: perc.impulse_text().unwrap_or_default().to_string(),
+        is_directly_addressed: false,
         timestamp: Timestamp(perc.timestamp()),
         tick: Tick(perc.tick()),
     })
@@ -655,8 +657,10 @@ mod tests {
             body_text: "Du spuerst leichten Hunger".to_string(),
             environment_text: "Das Buero riecht nach Kaffee".to_string(),
             acoustic_text: "Leises Tippen im Raum".to_string(),
+            heard_text: String::new(),
             presence_text: "Lisa sitzt dir gegenueber".to_string(),
             impulse_text: "Du moechtest einen Kaffee trinken".to_string(),
+            is_directly_addressed: false,
             timestamp: Timestamp(8000),
             tick: Tick(400),
         };

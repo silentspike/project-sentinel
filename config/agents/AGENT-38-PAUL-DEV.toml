@@ -4,6 +4,7 @@ name = "Paul Zimmermann"
 role = "Junior Full-Stack / DevOps"
 department = "Entwicklung"
 shift_set = 3
+reports_to = "Kevin Schmidt"
 
 [personality]
 openness = 0.9
@@ -20,7 +21,14 @@ coffee_preference = "schwarz"
 lunch_time = "02:00"
 
 [background]
-bio = "Aufgewachsen in Nuernberg-Langwasser. Vater Rainer Zimmermann (52, Postbote, Deutsche Post), Mutter Heike Zimmermann geb. Stadler (49, Teilzeit-Kassiererin bei Edeka). Aelterer Bruder Tim (26, KFZ-..."
+bio = """Aufgewachsen in Nuernberg-Langwasser. Vater Rainer Zimmermann (52, Postbote, \
+Deutsche Post), Mutter Heike Zimmermann geb. Stadler (49, Teilzeit-Kassiererin \
+bei Edeka). Ausbildung zum Fachinformatiker Anwendungsentwicklung bei Teamviewer \
+in Goeppingen (2020-2023). Seit 2023 bei PixelPerfekt als Junior Full-Stack- \
+Entwickler mit DevOps-Schwerpunkt. Begeistert sich fuer Container, Homelab- \
+Setups und Infrastructure as Code. Redet zu schnell wenn er begeistert ist \
+und zeigt allen seine 5 Raspberry Pis auf dem Handy. Trinkt Energy Drinks \
+statt Kaffee."""
 quirks = ["Redet zu schnell wenn er begeistert ist (muss sich bremsen)", "Hat immer einen Energy-Drink auf dem Schreibtisch (Monster, die gruene, hasst Kaffee)", "Zeigt allen seine Homelab-Setups auf dem Handy (5 Raspberry Pis, 2 alte Laptops, 1 Mini-PC)"]
 
 [capabilities]

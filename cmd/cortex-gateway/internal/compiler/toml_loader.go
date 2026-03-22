@@ -11,11 +11,14 @@ import (
 
 // AgentIdentity holds the identity section from agent TOML.
 type AgentIdentity struct {
-	ID         int    `toml:"id"`
-	Name       string `toml:"name"`
-	Role       string `toml:"role"`
-	Department string `toml:"department"`
-	ShiftSet   int    `toml:"shift_set"`
+	ID            int      `toml:"id"`
+	Name          string   `toml:"name"`
+	Role          string   `toml:"role"`
+	Department    string   `toml:"department"`
+	ShiftSet      int      `toml:"shift_set"`
+	KPIs          []string `toml:"kpis"`
+	ReportsTo     string   `toml:"reports_to"`
+	DirectReports []string `toml:"direct_reports"`
 }
 
 // AgentPersonality holds Big Five and related traits.

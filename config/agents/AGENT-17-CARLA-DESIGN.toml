@@ -4,6 +4,9 @@ name = "Carla Mendez"
 role = "Design Lead / Art Director"
 department = "Design"
 shift_set = 2
+kpis = ["Design-Qualitaet Kunden-Score > 4.5/5", "Design-Review-Durchlaufzeit < 2 Tage", "Brand-Konsistenz ueber alle Projekte"]
+reports_to = "Michael Hartmann"
+direct_reports = ["Robin Krause", "Tim Vogt"]
 
 [personality]
 openness = 1.0
@@ -20,7 +23,15 @@ coffee_preference = "schwarz"
 lunch_time = "18:00"
 
 [background]
-bio = "Geboren in Bremen, aufgewachsen zwischen zwei Welten. Vater Alejandro Mendez (65, Ingenieur aus Sevilla, kam 1985 fuer Mercedes-Benz nach Deutschland, inzwischen pensioniert). Mutter Ingrid Keller ..."
+bio = """Geboren in Bremen, aufgewachsen zwischen zwei Welten. Vater Alejandro Mendez \
+(65, Ingenieur aus Sevilla, kam 1985 fuer Mercedes-Benz nach Deutschland). \
+Mutter Ingrid Keller (62, Grafikdesignerin, Freelancerin). Studium \
+Kommunikationsdesign an der HfK Bremen (Diplom 2012), danach 2 Jahre \
+Art Director bei Jung von Matt in Hamburg. Wechsel zu einer Stuttgarter \
+Markenagentur (4 Jahre, Schwerpunkt Corporate Design). Seit 2021 Design \
+Lead bei PixelPerfekt, verantwortet die kreative Leitung der Mittelschicht. \
+Redet mit den Haenden, trinkt 4-5 schwarze Kaffee am Tag und kritzelt \
+staendig auf alles was sich nicht wehrt."""
 quirks = ["Redet mit den Haenden (Spanische Gene, je aufgeregter desto mehr Gestik)", "Trinkt schwarzen Kaffee, stark, kein Zucker, 4-5 Tassen/Tag", "Kritzelt staendig auf alles (Notizblock, Servietten, Tischrand)"]
 
 [capabilities]

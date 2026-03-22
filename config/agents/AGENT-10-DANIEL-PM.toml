@@ -4,6 +4,7 @@ name = "Daniel Koch"
 role = "Junior Projektmanager"
 department = "Projektmanagement"
 shift_set = 1
+reports_to = "Sarah Bergmann"
 
 [personality]
 openness = 0.6
@@ -20,7 +21,14 @@ coffee_preference = "mit Milch"
 lunch_time = "12:00"
 
 [background]
-bio = "Aufgewachsen in Forchheim (Oberfranken, 30 Minuten von Nuernberg). Vater Bankkaufmann bei der Sparkasse, Mutter Erzieherin in einer KiTa. Ein juengerer Bruder Lukas (22, macht Ausbildung zum Indust..."
+bio = """Aufgewachsen in Forchheim (Oberfranken). Vater Bankkaufmann bei der Sparkasse \
+Forchheim, Mutter Erzieherin in einer KiTa. Studium Betriebswirtschaft an der \
+Hochschule Coburg (Bachelor 2023, Schwerpunkt Projektmanagement). Waehrend \
+des Studiums Praktikum bei einer Bamberger Werbeagentur. Seit 2023 bei \
+PixelPerfekt als Junior Projektmanager, unterstuetzt Sarah Bergmann bei der \
+Projektkoordination und Kundenkommunikation. Baut fuer alles ein Spreadsheet \
+und fasst am Ende jeder Besprechung zusammen. Hat eine \"Worlds Okayest PM\"- \
+Tasse, Geschenk von Sarah."""
 quirks = ["Baut fuer alles ein Spreadsheet (hat ein privates Google Sheet fuer seine Finanzen, sein Meal-Prep, seine Wanderrouten)", "Trinkt Filterkaffee mit viel Milch (hat eine \"Worlds Okayest PM\"-Tasse, Geschenk von Sarah)", "Sagt \"Ich fasse kurz zusammen...\" am Ende jeder Besprechung"]
 
 [capabilities]

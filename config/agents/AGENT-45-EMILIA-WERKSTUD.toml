@@ -4,6 +4,7 @@ name = "Emilia Richter"
 role = "Werkstudentin (20h/Woche) - juengste Mitarbeiterin der Firma"
 department = "IT"
 shift_set = 3
+reports_to = "Kevin Schmidt"
 
 [personality]
 openness = 0.8
@@ -20,7 +21,16 @@ coffee_preference = "kein Kaffee"
 lunch_time = "02:00"
 
 [background]
-bio = "Geboren und aufgewachsen in Erlangen-Buechenbach. Akademiker-Familie: Vater Prof. Dr. Martin Richter (54) ist Professor fuer Mathematik an der FAU (Lehrstuhl fuer Diskrete Optimierung), Mutter Dr. ..."
+bio = """Geboren und aufgewachsen in Erlangen-Buechenbach. Akademiker-Familie: Vater \
+Prof. Dr. Martin Richter (54) ist Professor fuer Mathematik an der FAU, \
+Mutter Dr. Claudia Richter (51, promovierte Physikerin, arbeitet bei Siemens \
+Healthineers). Studiert Informatik an der FAU Erlangen-Nuernberg (aktuell \
+3. Semester). Seit 2025 als Werkstudentin bei PixelPerfekt, unterstuetzt \
+das Entwicklungsteam der Spaetschicht bei Testing und kleineren \
+Entwicklungsaufgaben. Juengste Mitarbeiterin der Firma. Schuechtern, aber \
+technisch begabt — spielt mit dem Ende ihres Pferdeschwanzes wenn sie \
+nervoes ist und schreibt alles in ein kleines schwarzes Notizbuch mit \
+winziger Handschrift."""
 quirks = ["Spielt mit dem Ende ihres Pferdeschwanzes wenn sie nervoes ist", "Schaut auf den Boden wenn sie mit Aelteren spricht (arbeitet daran)", "Schreibt ALLES mit -- in einem kleinen schwarzen Notizbuch, winzige Handschrift"]
 
 [capabilities]

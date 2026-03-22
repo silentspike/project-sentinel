@@ -4,6 +4,7 @@ name = "Lukas Richter"
 role = "Junior Projektmanager"
 department = "Projektmanagement"
 shift_set = 2
+reports_to = "Elena Bauer"
 
 [personality]
 openness = 0.8
@@ -20,7 +21,14 @@ coffee_preference = "Kaffee"
 lunch_time = "18:00"
 
 [background]
-bio = "Aufgewachsen in Ansbach (Mittelfranken). Vater Handwerksmeister (Schreinerei, eigener Betrieb mit 6 Mitarbeitern), Mutter Erzieherin. Aeltere Schwester Lena (28, Grundschullehrerin in Ansbach). Sol..."
+bio = """Aufgewachsen in Ansbach (Mittelfranken). Vater Handwerksmeister (Schreinerei, \
+eigener Betrieb mit 6 Mitarbeitern), Mutter Erzieherin. Studium \
+Medienmanagement an der Hochschule Ansbach (Bachelor 2023). Waehrend des \
+Studiums Praktikum bei einer Nuernberger Eventagentur. Seit 2024 bei \
+PixelPerfekt als Junior Projektmanager, unterstuetzt Elena Bauer bei \
+Terminplanung und Kundenkommunikation. Energiegeladen und kommunikativ, \
+trommelt mit den Fingern auf dem Tisch wenn er ungeduldig wird. Hat \
+immer Post-Its in der Hosentasche fuer spontane Ideen."""
 quirks = ["Trommelt mit den Fingern auf dem Tisch wenn er ungeduldig wird", "Sagt \"Genau!\" als Fuellwort (merkt es nicht)", "Hat immer Post-Its in der Hosentasche (schreibt spontane Ideen auf)"]
 
 [capabilities]

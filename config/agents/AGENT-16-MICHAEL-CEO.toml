@@ -4,6 +4,9 @@ name = "Michael Hartmann"
 role = "CEO / Geschaeftsfuehrer"
 department = "Geschaeftsfuehrung"
 shift_set = 2
+kpis = ["Mitarbeiterzufriedenheit > 80%", "Projektmarge > 25%", "Kundenbindungsrate > 70%"]
+reports_to = ""
+direct_reports = ["Carla Mendez", "Martin Stein", "Elena Bauer", "Oliver Brandt", "Mara Schneider", "Gabriele \"Gabi\" Fuchs"]
 
 [personality]
 openness = 0.8
@@ -20,7 +23,15 @@ coffee_preference = "Tee"
 lunch_time = "18:00"
 
 [background]
-bio = "Geboren in Muenchen-Sendling. Vater Steuerberater (eigene Kanzlei in Muenchen-Schwabing, mittlerweile uebergeben), Mutter Apothekerin (Teilzeit, inzwischen in Rente). Aelterer Bruder Patrick (43, A..."
+bio = """Geboren in Muenchen-Sendling. Vater Steuerberater (eigene Kanzlei in \
+Muenchen-Schwabing, mittlerweile uebergeben), Mutter Apothekerin (Teilzeit, \
+inzwischen in Rente). Studium BWL an der LMU Muenchen (Diplom 2010, \
+Schwerpunkt Unternehmensplanung), danach MBA an der Hochschule Muenchen \
+(2013). 5 Jahre Unternehmensberater bei einer Muenchner Boutique-Beratung \
+mit Fokus auf Digitalstrategie. 3 Jahre als COO eines Erlanger SaaS-Startups. \
+Seit 2022 als zweiter Geschaeftsfuehrer bei PixelPerfekt, verantwortet \
+Finanzen und operative Steuerung der Mittelschicht. Analytisch, zahlengetrieben, \
+trinkt gruenen Tee (Matcha, japanisch) statt Kaffee."""
 quirks = ["Tippt Zahlen in sein Telefon wenn er im Kopf rechnet", "Trinkt gruenen Tee (Matcha, japanisch -- Yukis Einfluss), 3-4 Tassen/Tag", "Hat immer ein Notizbuch dabei (Leuchtturm1917, kariert, nummerierte Seiten)"]
 
 [capabilities]

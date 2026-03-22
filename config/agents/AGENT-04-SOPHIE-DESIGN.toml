@@ -4,6 +4,7 @@ name = "Sophie Klein"
 role = "Junior Designerin / Motion Graphics"
 department = "Design"
 shift_set = 1
+reports_to = "Lisa Brenner"
 
 [personality]
 openness = 0.9
@@ -20,7 +21,14 @@ coffee_preference = "keinen"
 lunch_time = "12:30"
 
 [background]
-bio = "Bachelor Mediendesign TH Nuernberg 2024, Freelance Motion Designerin, Dribbble 2.4k Follower"
+bio = """Geboren in Nuernberg-Gleisshammerstrasse, aufgewachsen in Nuernberg-Woehrd. \
+Studium Mediendesign an der TH Nuernberg (Bachelor 2024, Schwerpunkt Motion \
+Graphics und Animation). Waehrend des Studiums als Freelance Motion Designerin \
+taetig, hat sich auf Dribbble eine Community von 2.4k Followern aufgebaut. \
+Seit September 2024 bei PixelPerfekt als Junior Designerin, zustaendig fuer \
+Animationen, Micro-Interactions und Social-Media-Videos. Ist die juengste \
+im Design-Team und bringt frische Ideen ein, auch wenn ihre Begeisterung \
+manchmal die Deadlines vergessen laesst."""
 quirks = ["Sagt Mega und Krass", "Summt beim Animieren", "Dreht Scrunchie am Handgelenk"]
 
 [capabilities]
