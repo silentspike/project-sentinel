@@ -395,6 +395,10 @@ pub struct PlatformControlplaneConfig {
     pub write_anomaly_threshold_bytes_per_sec: u64,
     #[serde(default = "default_pcp_write_anomaly_cooldown")]
     pub write_anomaly_cooldown_ticks: u64,
+    #[serde(default = "default_pcp_monitored_services")]
+    pub monitored_services: Vec<String>,
+    #[serde(default = "default_pcp_service_check_interval")]
+    pub service_check_interval_secs: u64,
 }
 
 fn default_pcp_enabled() -> bool {
@@ -427,6 +431,16 @@ fn default_pcp_write_anomaly_threshold() -> u64 {
 fn default_pcp_write_anomaly_cooldown() -> u64 {
     60
 }
+fn default_pcp_monitored_services() -> Vec<String> {
+    vec![
+        "sentinel-judge".into(),
+        "sentinel-projection".into(),
+        "sentinel-cortex".into(),
+    ]
+}
+fn default_pcp_service_check_interval() -> u64 {
+    60
+}
 
 impl Default for PlatformControlplaneConfig {
     fn default() -> Self {
@@ -441,6 +455,8 @@ impl Default for PlatformControlplaneConfig {
             max_escalation: default_pcp_max_escalation(),
             write_anomaly_threshold_bytes_per_sec: default_pcp_write_anomaly_threshold(),
             write_anomaly_cooldown_ticks: default_pcp_write_anomaly_cooldown(),
+            monitored_services: default_pcp_monitored_services(),
+            service_check_interval_secs: default_pcp_service_check_interval(),
         }
     }
 }

@@ -789,11 +789,18 @@ fn ecs_tick_loop(
         crate::resource_manager::ResourceManager::new(resource_manager_config);
 
     // Platform-Controlplane: Self-Healing
+    let platform_cp_config_clone = platform_cp_config.clone();
     let mut platform_cp =
         crate::platform_controlplane::PlatformControlplane::new(platform_cp_config);
     let mut last_ebpf_snapshot: Option<sentinel_ebpf::collector::MetricsSnapshot> = None;
     let mut pcp_metrics_collector =
         crate::platform_controlplane::metrics::PlatformMetricsCollector::default();
+
+    // Service-Health-Checker: Separater Thread fuer systemctl Calls (non-blocking)
+    let service_health_checker = crate::service_health::ServiceHealthChecker::spawn(
+        platform_cp_config_clone.monitored_services.clone(),
+        std::time::Duration::from_secs(platform_cp_config_clone.service_check_interval_secs),
+    );
 
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
@@ -1213,6 +1220,13 @@ fn ecs_tick_loop(
                 .values()
                 .map(|h| h.identity.name.clone())
                 .collect();
+            let agent_name_to_id: std::collections::HashMap<String, sentinel_common::AgentId> =
+                runtime_orch
+                    .agents()
+                    .iter()
+                    .map(|(id, h)| (h.identity.name.clone(), *id))
+                    .collect();
+            let failed_services = service_health_checker.poll_failed();
             let pcp_metrics = crate::platform_controlplane::metrics::collect(
                 &mut pcp_metrics_collector,
                 &last_ebpf_snapshot,
@@ -1220,8 +1234,14 @@ fn ecs_tick_loop(
                 &events_db_path_str,
                 &agent_names,
                 tick_count,
+                failed_services,
             );
-            let side_effects = platform_cp.cycle(&pcp_metrics, &event_store_for_prune, tick_count);
+            let side_effects = platform_cp.cycle(
+                &pcp_metrics,
+                &event_store_for_prune,
+                tick_count,
+                &agent_name_to_id,
+            );
             for effect in side_effects {
                 match effect {
                     crate::platform_controlplane::rules::PlatformSideEffect::TriggerPrune(
@@ -1240,6 +1260,33 @@ fn ecs_tick_loop(
                     ) => {
                         resource_manager
                             .force_profile(agent_id, sentinel_sandbox::ResourceProfile::Idle);
+                    }
+                    crate::platform_controlplane::rules::PlatformSideEffect::RestartAgent(
+                        agent_id,
+                    ) => {
+                        // Sandbox teardown
+                        if let Some(handle) = sandbox_handles.remove(&agent_id) {
+                            if handle.cgroup_created {
+                                if let Some(cid) =
+                                    sentinel_sandbox::cgroup_id(&handle.agent_name)
+                                {
+                                    ebpf_collector.unregister_agent(cid);
+                                }
+                            }
+                            if let Err(e) = sandbox.teardown_agent(&handle) {
+                                warn!(agent_id = %agent_id, error = %e,
+                                    "Sandbox teardown bei Stall-Restart fehlgeschlagen");
+                            }
+                        }
+                        // Agent-Prozess droppen
+                        agent_processes.remove(&agent_id);
+                        // ECS Entity despawnen
+                        despawn_agent_from_world(&mut world, agent_id);
+                        // RuntimeOrchestrator despawn
+                        let _ = runtime_orch.despawn_agent(agent_id);
+                        // Respawn bei naechstem Shift-Check
+                        info!(agent_id = %agent_id,
+                            "Agent nach Stall restartet (despawned, Respawn bei naechstem Shift-Check)");
                     }
                 }
             }

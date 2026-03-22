@@ -24,6 +24,8 @@ pub enum PlatformSideEffect {
     TriggerPrune(i64),
     /// Agent-Profil auf Idle setzen (Memory-Pressure).
     ForceIdleProfile(AgentId),
+    /// Agent-Sandbox teardown + Despawn (Stall-Recovery, Respawn bei naechstem Shift-Check).
+    RestartAgent(AgentId),
 }
 
 /// Evaluiert alle Regeln gegen die aktuellen Metriken.
@@ -34,21 +36,25 @@ pub fn evaluate_rules(
     cooldowns: &HashMap<String, u64>,
     tick: u64,
     config: &PlatformControlplaneConfig,
+    agent_name_to_id: &HashMap<String, AgentId>,
 ) -> Vec<PlatformAction> {
     let mut actions = Vec::new();
 
-    // Regel 1: Agent Stall
+    // Regel 1: Agent Stall → Restart
     for agent_name in &metrics.stalled_agents {
         let key = format!("agent_stall:{agent_name}");
         if !is_cooled_down(cooldowns, &key, tick, config.stall_cooldown_ticks) {
             continue;
         }
+        let side_effect = agent_name_to_id
+            .get(agent_name)
+            .map(|id| PlatformSideEffect::RestartAgent(*id));
         actions.push(PlatformAction {
             rule_name: "agent_stall".to_string(),
             target: agent_name.clone(),
-            action_label: "alert".to_string(),
-            description: format!("Agent {agent_name} ist gestalled — keine I/O seit > 30s"),
-            side_effect: None, // Phase 2: Respawn via #279
+            action_label: "restart_triggered".to_string(),
+            description: format!("Agent {agent_name} ist gestalled — Restart getriggert"),
+            side_effect,
         });
     }
 
@@ -94,8 +100,7 @@ pub fn evaluate_rules(
             if !is_cooled_down(cooldowns, &key, tick, 30) {
                 continue;
             }
-            // Agent-ID aus Name extrahieren (best-effort)
-            let agent_id = extract_agent_id(agent_name);
+            let agent_id = agent_name_to_id.get(agent_name).copied();
             actions.push(PlatformAction {
                 rule_name: "memory_pressure".to_string(),
                 target: agent_name.clone(),
@@ -132,6 +137,23 @@ pub fn evaluate_rules(
         }
     }
 
+    // Regel 6: Service Health (aus ServiceHealthChecker Thread)
+    for service_name in &metrics.failed_services {
+        let key = format!("service_health:{service_name}");
+        if !is_cooled_down(cooldowns, &key, tick, config.stall_cooldown_ticks) {
+            continue;
+        }
+        actions.push(PlatformAction {
+            rule_name: "service_health".to_string(),
+            target: service_name.clone(),
+            action_label: "alert".to_string(),
+            description: format!(
+                "Service {service_name} ist nicht active — Restart wurde vom Health-Checker getriggert"
+            ),
+            side_effect: None, // Restart passiert im ServiceHealthChecker Thread
+        });
+    }
+
     actions
 }
 
@@ -146,16 +168,6 @@ fn is_cooled_down(
         Some(&last_tick) => tick.saturating_sub(last_tick) >= cooldown_ticks,
         None => true,
     }
-}
-
-/// Versucht eine AgentId aus dem Agent-Namen zu extrahieren.
-///
-/// Agents haben keine 1:1 Name→ID Mapping im Platform-CP Scope.
-/// Fuer force_profile() brauchen wir die ID. Fallback: None.
-fn extract_agent_id(_name: &str) -> Option<AgentId> {
-    // Phase 2: Lookup aus RuntimeOrchestrator
-    // Phase 1: Kein Mapping verfuegbar, Side-Effect wird ignoriert
-    None
 }
 
 #[cfg(test)]
@@ -182,7 +194,7 @@ mod tests {
             stalled_agents: vec!["Thomas Mueller".to_string()],
             ..Default::default()
         };
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config());
+        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "agent_stall");
         assert_eq!(actions[0].target, "Thomas Mueller");
@@ -198,7 +210,7 @@ mod tests {
         cooldowns.insert("agent_stall:Thomas Mueller".to_string(), 90);
 
         // Tick 100, Cooldown 60 → last action at 90, diff=10 < 60 → cooled down = false
-        let actions = evaluate_rules(&metrics, &cooldowns, 100, &test_config());
+        let actions = evaluate_rules(&metrics, &cooldowns, 100, &test_config(), &HashMap::new());
         assert!(actions.is_empty(), "Should be cooled down");
     }
 
@@ -208,7 +220,7 @@ mod tests {
             event_store_size_bytes: 600 * 1024 * 1024, // 600 MB > 500 MB
             ..Default::default()
         };
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config());
+        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "event_store_size");
         assert!(actions[0].side_effect.is_some());
@@ -220,7 +232,7 @@ mod tests {
             projection_lag: 15_000, // > 10_000
             ..Default::default()
         };
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config());
+        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "projection_lag");
     }
@@ -231,7 +243,7 @@ mod tests {
             agent_memory_pressure: vec![("Test Agent".to_string(), 0.95)],
             ..Default::default()
         };
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config());
+        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "memory_pressure");
     }
@@ -242,7 +254,7 @@ mod tests {
             agent_write_rates: vec![("Test Agent".to_string(), 10_000_000.0)], // 10 MB/s > 5 MB/s
             ..Default::default()
         };
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config());
+        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "write_anomaly");
     }
@@ -253,8 +265,39 @@ mod tests {
             agent_write_rates: vec![("Test Agent".to_string(), 1_000_000.0)], // 1 MB/s < 5 MB/s
             ..Default::default()
         };
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config());
+        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn test_stall_rule_generates_restart_side_effect() {
+        let metrics = PlatformMetrics {
+            stalled_agents: vec!["Thomas Mueller".to_string()],
+            ..Default::default()
+        };
+        let mut name_to_id = HashMap::new();
+        name_to_id.insert("Thomas Mueller".to_string(), AgentId(1));
+
+        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &name_to_id);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action_label, "restart_triggered");
+        assert!(matches!(
+            &actions[0].side_effect,
+            Some(PlatformSideEffect::RestartAgent(id)) if *id == AgentId(1)
+        ));
+    }
+
+    #[test]
+    fn test_service_health_rule_fires_for_down_service() {
+        let metrics = PlatformMetrics {
+            failed_services: vec!["sentinel-judge".to_string()],
+            ..Default::default()
+        };
+        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].rule_name, "service_health");
+        assert_eq!(actions[0].target, "sentinel-judge");
+        assert!(actions[0].side_effect.is_none()); // Restart passiert im Thread
     }
 
     #[test]
@@ -264,7 +307,7 @@ mod tests {
             projection_lag: 50,                        // < 10_000
             ..Default::default()
         };
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config());
+        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
         assert!(actions.is_empty());
     }
 }

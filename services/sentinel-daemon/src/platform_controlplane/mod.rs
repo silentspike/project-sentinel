@@ -48,13 +48,15 @@ impl PlatformControlplane {
         metrics: &PlatformMetrics,
         event_store: &EventStore,
         tick: u64,
+        agent_name_to_id: &std::collections::HashMap<String, sentinel_common::AgentId>,
     ) -> Vec<PlatformSideEffect> {
         // 1. Verify: Letzte Actions gewirkt?
         let _verify_results =
             verify::verify_last_actions(&self.last_actions, metrics, &self.config);
 
         // 2. Evaluate: Neue Rules
-        let actions = rules::evaluate_rules(metrics, &self.cooldowns, tick, &self.config);
+        let actions =
+            rules::evaluate_rules(metrics, &self.cooldowns, tick, &self.config, agent_name_to_id);
 
         // 3. Execute: Events emittieren + SideEffects sammeln
         let mut side_effects = Vec::new();
@@ -168,7 +170,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db =
             sentinel_limbo::EventStore::open(dir.path().join("test.db").to_str().unwrap()).unwrap();
-        let _ = cp.cycle(&metrics, &db, 500);
+        let _ = cp.cycle(&metrics, &db, 500, &std::collections::HashMap::new());
         assert!(!cp.cooldowns.contains_key("old:entry"));
     }
 }

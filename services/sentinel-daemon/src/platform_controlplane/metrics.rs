@@ -17,6 +17,8 @@ pub struct PlatformMetrics {
     pub agent_write_rates: Vec<(String, f64)>,
     /// Aktueller Tick.
     pub tick: u64,
+    /// Namen von systemd Services die nicht active sind.
+    pub failed_services: Vec<String>,
 }
 
 /// Stateful Metrics Collector (behaelt prev_write_bytes fuer Delta-Berechnung).
@@ -36,9 +38,11 @@ pub fn collect(
     events_db_path: &str,
     agent_names: &[String],
     tick: u64,
+    failed_services: Vec<String>,
 ) -> PlatformMetrics {
     let mut metrics = PlatformMetrics {
         tick,
+        failed_services,
         ..Default::default()
     };
 
