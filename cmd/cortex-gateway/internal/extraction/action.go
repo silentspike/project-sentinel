@@ -46,7 +46,7 @@ func New() *Extractor {
 		},
 		actionPatterns: []actionPattern{
 			{"move", regexp.MustCompile(`(?i)(geh[te]?\s+(?:\w+\s+)*(?:zu|in|nach|Richtung)|lauf[te]?\s+(?:\w+\s+)*(?:zu|in|nach|Richtung)|verlasst|verlaesst|verlasse|betritt|betrete|komm[te]?\s+(?:\w+\s+)*(?:in|zu|an)|unterwegs\s+(?:\w+\s+)*(?:nach|zu|Richtung))`)},
-			{"tool_use", regexp.MustCompile(`(?i)(oeffne?|starte?|benutze?|schreibe?)`)},
+			{"tool_use", regexp.MustCompile(`(?i)(oeffne?\s+\w+|starte?\s+\w+|benutze?\s+\w+|schreibe?\s+(?:eine?\s+)?(?:Datei|File|Code|Script|Programm))`)},
 		},
 		emotePattern: regexp.MustCompile(`\*[^*]+\*`),
 	}
@@ -166,7 +166,26 @@ func (e *Extractor) Extract(response string) []ExtractedAction {
 		}
 	}
 
-	// If no specific action detected, it is a chat message
+	// Remaining text outside emotes/action-patterns = direct speech (Chat)
+	remaining = strings.TrimSpace(remaining)
+	if len(remaining) > 5 {
+		alreadyCovered := false
+		for _, a := range actions {
+			if strings.Contains(a.Content, remaining) {
+				alreadyCovered = true
+				break
+			}
+		}
+		if !alreadyCovered {
+			actions = append(actions, ExtractedAction{
+				Type:    "chat",
+				Content: remaining,
+				Emotion: emotion,
+			})
+		}
+	}
+
+	// If no specific action detected at all, entire response is chat
 	if len(actions) == 0 {
 		actions = append(actions, ExtractedAction{
 			Type:    "chat",

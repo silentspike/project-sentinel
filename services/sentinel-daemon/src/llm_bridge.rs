@@ -475,13 +475,13 @@ pub mod bridge {
 
         let action_type = match extracted.action_type.as_str() {
             "move" => ActionType::Move,
-            "chat" => ActionType::Chat,
+            "chat" | "work" | "break" | "think" => ActionType::Chat,
             "tool_use" => ActionType::ToolUse,
             "emote" => ActionType::Emote,
             "phone_call" => ActionType::PhoneCall,
             other => {
-                debug!(action_type = other, "Unbekannter Action-Typ, uebersprungen");
-                return None;
+                debug!(action_type = other, "Unbekannter Action-Typ als Chat gemappt");
+                ActionType::Chat
             }
         };
 
