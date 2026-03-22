@@ -551,7 +551,7 @@ pub struct OperatorCommandReceiver(
 
 /// Sendet Perceptions an den externen Zenoh-Publisher (oder Test-Code).
 #[derive(Resource)]
-pub struct PerceptionSender(pub std::sync::mpsc::SyncSender<Perception>);
+pub struct PerceptionSender(pub std::sync::mpsc::Sender<Perception>);
 
 /// Sammelt DomainEvents waehrend eines Ticks. persist_system flusht am Ende.
 #[derive(Resource, Default)]

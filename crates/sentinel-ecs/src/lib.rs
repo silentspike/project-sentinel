@@ -499,7 +499,7 @@ mod tests {
         spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
         // Perception Channel (bound=64)
-        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let (tx, rx) = std::sync::mpsc::channel();
         world.insert_resource(PerceptionSender(tx));
 
         // Einen Tick ausfuehren
@@ -576,7 +576,7 @@ mod tests {
             20,
         );
 
-        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let (tx, rx) = std::sync::mpsc::channel();
         world.insert_resource(PerceptionSender(tx));
 
         {

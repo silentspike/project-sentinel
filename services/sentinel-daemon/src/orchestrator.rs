@@ -372,7 +372,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let (snapshot_tx, snapshot_rx) = mpsc::channel::<sentinel_common::OperatorSnapshotCommand>();
     let (restore_tx, restore_rx) = mpsc::channel::<sentinel_common::OperatorRestoreCommand>();
     let (prune_tx, prune_rx) = mpsc::channel::<i64>();
-    let (perception_tx, perception_rx) = mpsc::sync_channel::<Perception>(64);
+    // Unbounded Channel: output_system darf NIEMALS blockieren (ECS Tick-Loop).
+    // Bridge konsumiert async und uebersprigt die meisten Perceptions per Rate-Limit.
+    let (perception_tx, perception_rx) = mpsc::channel::<Perception>();
 
     // -- Zenoh SentinelBus (Core-Bus fuer Real-Time Event-Verteilung) --
     let bus_config = config.zenoh.to_bus_config();
@@ -752,7 +754,7 @@ fn ecs_tick_loop(
     event_store: Arc<EventStore>,
     action_rx: mpsc::Receiver<sentinel_common::AgentAction>,
     operator_rx: mpsc::Receiver<sentinel_common::OperatorCommand>,
-    perception_tx: mpsc::SyncSender<Perception>,
+    perception_tx: mpsc::Sender<Perception>,
     all_agents: Vec<AgentConfig>,
     initial_shift: u8,
     tick_rate: Duration,
@@ -2401,7 +2403,7 @@ mod tests {
 
         let (_tx, rx) = mpsc::channel();
         let (_operator_tx, operator_rx) = mpsc::channel();
-        let (ptx, _prx) = mpsc::sync_channel(64);
+        let (ptx, _prx) = mpsc::channel();
 
         let controlplane = test_controlplane(&tmp);
         let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
@@ -2464,7 +2466,7 @@ mod tests {
 
         let (_tx, rx) = mpsc::channel();
         let (_operator_tx, operator_rx) = mpsc::channel();
-        let (ptx, prx) = mpsc::sync_channel(64);
+        let (ptx, prx) = mpsc::channel();
 
         let controlplane = test_controlplane(&tmp);
         let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
@@ -2544,7 +2546,7 @@ mod tests {
 
         let (_tx, rx) = mpsc::channel();
         let (_operator_tx, operator_rx) = mpsc::channel();
-        let (ptx, prx) = mpsc::sync_channel(64);
+        let (ptx, prx) = mpsc::channel();
 
         let controlplane = test_controlplane(&tmp);
         let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
@@ -2630,7 +2632,7 @@ mod tests {
 
         let (_tx, rx) = mpsc::channel();
         let (operator_tx, operator_rx) = mpsc::channel();
-        let (ptx, prx) = mpsc::sync_channel(64);
+        let (ptx, prx) = mpsc::channel();
 
         operator_tx
             .send(OperatorCommand::Chaos(OperatorChaosCommand {
