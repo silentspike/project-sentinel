@@ -458,8 +458,7 @@ impl RoomChatBuffer {
             .iter()
             .filter(|name| {
                 let first = name.split_whitespace().next().unwrap_or(name);
-                (trimmed.contains(first) || trimmed.contains(name.as_str()))
-                    && *name != &agent_name
+                (trimmed.contains(first) || trimmed.contains(name.as_str())) && *name != &agent_name
             })
             .cloned()
             .collect();

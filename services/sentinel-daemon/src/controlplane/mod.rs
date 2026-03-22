@@ -189,7 +189,10 @@ impl ControlplaneKernel {
         if tick.is_multiple_of(6000) {
             if let Ok(count) = self.store.gc_terminal_actions() {
                 if count > 0 {
-                    info!(removed = count, "Controlplane GC: Terminal Actions bereinigt");
+                    info!(
+                        removed = count,
+                        "Controlplane GC: Terminal Actions bereinigt"
+                    );
                 }
             }
             if let Ok(count) = self.store.gc_old_incidents(1000) {

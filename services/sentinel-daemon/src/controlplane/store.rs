@@ -257,8 +257,11 @@ impl ControlplaneStore {
         // Aelteste zuerst sortieren, die zu loeschenden bestimmen
         entries.sort_by_key(|(_, tick)| *tick);
         let to_remove = entries.len() - keep;
-        let ids_to_remove: Vec<String> =
-            entries.into_iter().take(to_remove).map(|(id, _)| id).collect();
+        let ids_to_remove: Vec<String> = entries
+            .into_iter()
+            .take(to_remove)
+            .map(|(id, _)| id)
+            .collect();
 
         let write_txn = self.db.begin_write()?;
         {
@@ -269,7 +272,11 @@ impl ControlplaneStore {
         }
         write_txn.commit()?;
 
-        debug!(removed = ids_to_remove.len(), kept = keep, "Alte Incidents bereinigt (GC)");
+        debug!(
+            removed = ids_to_remove.len(),
+            kept = keep,
+            "Alte Incidents bereinigt (GC)"
+        );
         Ok(ids_to_remove.len())
     }
 
