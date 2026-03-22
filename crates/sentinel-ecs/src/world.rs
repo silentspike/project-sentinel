@@ -505,6 +505,8 @@ impl RoomChatBuffer {
     }
 
     /// Prueft ob ein Agent noch auf Chat reagieren darf (max 2/120 Ticks).
+    /// Prueft ob ein Agent noch auf Chat reagieren darf (max 2/120 Ticks).
+    /// Inkrementiert den Counter NICHT — dafuer record_response() aufrufen.
     pub fn can_respond(&mut self, agent_name: &str, tick: u64) -> bool {
         let entry = self
             .chat_response_counts
@@ -516,11 +518,20 @@ impl RoomChatBuffer {
             *entry = (tick, 0);
         }
 
-        if entry.1 >= MAX_CHAT_RESPONSES_PER_WINDOW {
-            return false;
+        entry.1 < MAX_CHAT_RESPONSES_PER_WINDOW
+    }
+
+    /// Zaehlt eine Chat-Response fuer das Kaskade-Dampening.
+    /// NUR aufrufen wenn Agent tatsaechlich etwas gehoert hat.
+    pub fn record_response(&mut self, agent_name: &str, tick: u64) {
+        let entry = self
+            .chat_response_counts
+            .entry(agent_name.to_string())
+            .or_insert((tick, 0));
+        if tick.saturating_sub(entry.0) >= CHAT_RESPONSE_WINDOW_TICKS {
+            *entry = (tick, 0);
         }
         entry.1 += 1;
-        true
     }
 
     /// Entfernt abgelaufene Messages.

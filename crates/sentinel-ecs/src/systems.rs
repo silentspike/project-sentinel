@@ -1425,6 +1425,7 @@ pub fn output_system(
                         .collect::<Vec<_>>()
                         .join(". ");
                     room_chat_buffer.set_heard(&identity.name, time.tick.0);
+                    room_chat_buffer.record_response(&identity.name, time.tick.0);
                     (text, is_addressed)
                 }
             } else {
