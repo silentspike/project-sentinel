@@ -446,9 +446,10 @@ impl RoomChatBuffer {
         }
         self.last_chat_tick.insert(room_id.to_string(), tick);
 
-        // Content trimmen
+        // Content trimmen (UTF-8 safe — kein Panic bei Multibyte-Zeichen)
         let trimmed = if content.len() > MAX_CONTENT_LEN {
-            format!("{}...", &content[..MAX_CONTENT_LEN - 3])
+            let boundary = content.floor_char_boundary(MAX_CONTENT_LEN - 3);
+            format!("{}...", &content[..boundary])
         } else {
             content
         };
