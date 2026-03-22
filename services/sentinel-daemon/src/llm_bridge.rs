@@ -480,7 +480,10 @@ pub mod bridge {
             "emote" => ActionType::Emote,
             "phone_call" => ActionType::PhoneCall,
             other => {
-                debug!(action_type = other, "Unbekannter Action-Typ als Chat gemappt");
+                debug!(
+                    action_type = other,
+                    "Unbekannter Action-Typ als Chat gemappt"
+                );
                 ActionType::Chat
             }
         };

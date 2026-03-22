@@ -55,8 +55,13 @@ impl PlatformControlplane {
             verify::verify_last_actions(&self.last_actions, metrics, &self.config);
 
         // 2. Evaluate: Neue Rules
-        let actions =
-            rules::evaluate_rules(metrics, &self.cooldowns, tick, &self.config, agent_name_to_id);
+        let actions = rules::evaluate_rules(
+            metrics,
+            &self.cooldowns,
+            tick,
+            &self.config,
+            agent_name_to_id,
+        );
 
         // 3. Execute: Events emittieren + SideEffects sammeln
         let mut side_effects = Vec::new();

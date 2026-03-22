@@ -1,0 +1,130 @@
+name: Dependency Freshness
+
+on:
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/go.mod'
+      - '**/go.sum'
+      - '**/package.json'
+      - '**/bun.lock'
+      - 'rust-toolchain.toml'
+  schedule:
+    - cron: '0 7 * * 1'  # Montag 07:00 UTC (nach Renovate um 06:00)
+  workflow_dispatch: {}
+
+concurrency:
+  group: deps-freshness-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust-toolchain:
+    name: Rust Toolchain
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: stable
+
+      - name: Check toolchain freshness
+        run: |
+          PINNED=$(grep 'channel' rust-toolchain.toml | sed 's/.*"\(.*\)"/\1/')
+          LATEST=$(rustc +stable --version | awk '{print $2}')
+          echo "## Rust Toolchain" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Pinned:** $PINNED" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Latest stable:** $LATEST" >> "$GITHUB_STEP_SUMMARY"
+
+          PINNED_MINOR=$(echo "$PINNED" | cut -d. -f2)
+          LATEST_MINOR=$(echo "$LATEST" | cut -d. -f2)
+          DIFF=$((LATEST_MINOR - PINNED_MINOR))
+
+          if [ "$DIFF" -ge 3 ]; then
+            echo "::error::rust-toolchain.toml pinnt $PINNED — $DIFF Minor-Versionen hinter stable $LATEST! Bitte aktualisieren."
+            exit 1
+          elif [ "$DIFF" -ge 1 ]; then
+            echo "::warning::rust-toolchain.toml pinnt $PINNED — stable ist $LATEST (Renovate PR pruefen)"
+          else
+            echo "Toolchain ist aktuell."
+          fi
+
+  rust-deps:
+    name: Rust Dependencies
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-outdated
+        run: cargo install cargo-outdated --locked 2>/dev/null || true
+
+      - name: Check outdated dependencies
+        run: |
+          echo "## Rust Dependencies" >> "$GITHUB_STEP_SUMMARY"
+          OUTPUT=$(cargo outdated --root-deps-only --depth 1 2>&1) || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$OUTPUT" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          # Fail nur bei MAJOR version gaps (semver-inkompatibel)
+          MAJOR_OUTDATED=$(echo "$OUTPUT" | grep -E '^\S' | grep -v '^Name' | grep -v '^---' | awk '{
+            split($2, current, ".");
+            split($4, latest, ".");
+            if (latest[1] > current[1]) print $0
+          }') || true
+
+          if [ -n "$MAJOR_OUTDATED" ]; then
+            echo ""
+            echo "::warning::Major-Version Updates verfuegbar:"
+            echo "$MAJOR_OUTDATED"
+            echo ""
+            echo "### Major Updates" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "$MAJOR_OUTDATED" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  go-deps:
+    name: Go Dependencies
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version-file: cmd/cortex-gateway/go.mod
+          cache-dependency-path: cmd/cortex-gateway/go.sum
+
+      - name: Check outdated Go modules
+        run: |
+          echo "## Go Dependencies" >> "$GITHUB_STEP_SUMMARY"
+          cd cmd/cortex-gateway
+          OUTPUT=$(go list -m -u all 2>&1 | grep '\[' || echo "Alle Go-Module aktuell.") || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$OUTPUT" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  bun-deps:
+    name: Dashboard Dependencies
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Bun
+        run: |
+          curl -fsSL https://bun.sh/install | bash
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: Check outdated npm packages
+        working-directory: dashboard
+        run: |
+          echo "## Dashboard Dependencies" >> "$GITHUB_STEP_SUMMARY"
+          bun install --frozen-lockfile
+          OUTPUT=$(bun outdated 2>&1 || echo "Alle Packages aktuell.") || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$OUTPUT" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

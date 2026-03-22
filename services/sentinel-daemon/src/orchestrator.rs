@@ -1267,9 +1267,7 @@ fn ecs_tick_loop(
                         // Sandbox teardown
                         if let Some(handle) = sandbox_handles.remove(&agent_id) {
                             if handle.cgroup_created {
-                                if let Some(cid) =
-                                    sentinel_sandbox::cgroup_id(&handle.agent_name)
-                                {
+                                if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
                                     ebpf_collector.unregister_agent(cid);
                                 }
                             }

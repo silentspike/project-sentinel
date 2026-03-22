@@ -194,7 +194,13 @@ mod tests {
             stalled_agents: vec!["Thomas Mueller".to_string()],
             ..Default::default()
         };
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &test_config(),
+            &HashMap::new(),
+        );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "agent_stall");
         assert_eq!(actions[0].target, "Thomas Mueller");
@@ -220,7 +226,13 @@ mod tests {
             event_store_size_bytes: 600 * 1024 * 1024, // 600 MB > 500 MB
             ..Default::default()
         };
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &test_config(),
+            &HashMap::new(),
+        );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "event_store_size");
         assert!(actions[0].side_effect.is_some());
@@ -232,7 +244,13 @@ mod tests {
             projection_lag: 15_000, // > 10_000
             ..Default::default()
         };
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &test_config(),
+            &HashMap::new(),
+        );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "projection_lag");
     }
@@ -243,7 +261,13 @@ mod tests {
             agent_memory_pressure: vec![("Test Agent".to_string(), 0.95)],
             ..Default::default()
         };
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &test_config(),
+            &HashMap::new(),
+        );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "memory_pressure");
     }
@@ -254,7 +278,13 @@ mod tests {
             agent_write_rates: vec![("Test Agent".to_string(), 10_000_000.0)], // 10 MB/s > 5 MB/s
             ..Default::default()
         };
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &test_config(),
+            &HashMap::new(),
+        );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "write_anomaly");
     }
@@ -265,7 +295,13 @@ mod tests {
             agent_write_rates: vec![("Test Agent".to_string(), 1_000_000.0)], // 1 MB/s < 5 MB/s
             ..Default::default()
         };
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &test_config(),
+            &HashMap::new(),
+        );
         assert!(actions.is_empty());
     }
 
@@ -293,7 +329,13 @@ mod tests {
             failed_services: vec!["sentinel-judge".to_string()],
             ..Default::default()
         };
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &test_config(),
+            &HashMap::new(),
+        );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "service_health");
         assert_eq!(actions[0].target, "sentinel-judge");
@@ -307,7 +349,13 @@ mod tests {
             projection_lag: 50,                        // < 10_000
             ..Default::default()
         };
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &HashMap::new());
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &test_config(),
+            &HashMap::new(),
+        );
         assert!(actions.is_empty());
     }
 }

@@ -153,10 +153,8 @@ pub fn input_system(
                         work_ctx.current_task = Some(content.clone());
                         // Chat in RoomChatBuffer fuer Raum-Kommunikation
                         if !position.in_transit {
-                            let all_names: Vec<String> = all_agents_query
-                                .iter()
-                                .map(|id| id.name.clone())
-                                .collect();
+                            let all_names: Vec<String> =
+                                all_agents_query.iter().map(|id| id.name.clone()).collect();
                             room_chat_buffer.add(
                                 &position.room_id,
                                 identity.name.clone(),
@@ -642,7 +640,11 @@ pub fn physics_system(
 
         // Alle 20 Ticks Physics-Snapshot als Event emittieren
         // Bei aktivem Chaos/Stimulus: jeden Tick emittieren (Echtzeit-Feedback)
-        if tick > 0 && (tick.is_multiple_of(PHYSICS_SAMPLE_INTERVAL) || has_active_stimulus || has_active_chaos) {
+        if tick > 0
+            && (tick.is_multiple_of(PHYSICS_SAMPLE_INTERVAL)
+                || has_active_stimulus
+                || has_active_chaos)
+        {
             let payload = DomainEventPayload::RoomPhysicsUpdated {
                 room_id: room_id.to_string(),
                 temperature,
@@ -1401,33 +1403,33 @@ pub fn output_system(
         };
 
         // Room-Chat: heard_text aus RoomChatBuffer
-        let (heard_text, is_directly_addressed) = if !position.in_transit
-            && room_chat_buffer.can_respond(&identity.name, time.tick.0)
-        {
-            let recent = room_chat_buffer.get_recent(
-                &position.room_id,
-                time.tick.0,
-                &identity.name,
-            );
-            if recent.is_empty() {
-                (String::new(), false)
+        let (heard_text, is_directly_addressed) =
+            if !position.in_transit && room_chat_buffer.can_respond(&identity.name, time.tick.0) {
+                let recent =
+                    room_chat_buffer.get_recent(&position.room_id, time.tick.0, &identity.name);
+                if recent.is_empty() {
+                    (String::new(), false)
+                } else {
+                    let first_name = identity
+                        .name
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or(&identity.name);
+                    let is_addressed = recent
+                        .iter()
+                        .any(|m| m.addressed_agents.iter().any(|n| n.contains(first_name)));
+                    let text = recent
+                        .iter()
+                        .take(5)
+                        .map(|m| format!("{} sagte: \"{}\"", m.agent_name, m.content))
+                        .collect::<Vec<_>>()
+                        .join(". ");
+                    room_chat_buffer.set_heard(&identity.name, time.tick.0);
+                    (text, is_addressed)
+                }
             } else {
-                let first_name = identity.name.split_whitespace().next().unwrap_or(&identity.name);
-                let is_addressed = recent.iter().any(|m| {
-                    m.addressed_agents.iter().any(|n| n.contains(first_name))
-                });
-                let text = recent
-                    .iter()
-                    .take(5)
-                    .map(|m| format!("{} sagte: \"{}\"", m.agent_name, m.content))
-                    .collect::<Vec<_>>()
-                    .join(". ");
-                room_chat_buffer.set_heard(&identity.name, time.tick.0);
-                (text, is_addressed)
-            }
-        } else {
-            (String::new(), false)
-        };
+                (String::new(), false)
+            };
 
         let msg = Perception {
             agent_id: identity.agent_id,
