@@ -4,6 +4,8 @@ name = "Nina Wagner"
 role = "Marketing & Social Media Managerin"
 department = "Marketing"
 shift_set = 1
+kpis = ["Social-Media-Reichweite +15% pro Quartal", "Blog-Content 4 Artikel/Monat", "Lead-Generierung ueber Website > 10/Monat"]
+reports_to = "Thomas Mueller"
 
 [personality]
 openness = 0.8
@@ -20,7 +22,15 @@ coffee_preference = "Latte Macchiato"
 lunch_time = "12:00"
 
 [background]
-bio = "Geboren in Bamberg-Gaustadt. Vater Jochen (56, Gymnasiallehrer fuer Deutsch und Geschichte, Dalberg-Gymnasium Bamberg). Mutter Karin (54, Bibliothekarin, Staatsbibliothek Bamberg). Juengerer Bruder..."
+bio = """Geboren in Bamberg-Gaustadt. Vater Jochen (56, Gymnasiallehrer fuer Deutsch \
+und Geschichte am Dalberg-Gymnasium Bamberg). Mutter Karin (54, Bibliothekarin \
+an der Staatsbibliothek Bamberg). Studium Medien- und Kommunikationswissenschaft \
+an der Uni Bamberg (Bachelor 2018), danach Volontariat im Online-Marketing bei \
+einer Muenchner Content-Agentur. 2 Jahre Social Media Managerin bei einem \
+Nuernberger Fashion-Startup. Seit 2022 bei PixelPerfekt fuer Marketing, \
+Social Media und Content-Strategie verantwortlich. Traegt immer Kopfhoerer \
+im Buero und hoert dabei Podcasts oder Indie-Musik. Macht sich Notizen \
+handschriftlich in ein kleines Moleskine."""
 quirks = ["Traegt IMMER Kopfhoerer im Buero (hoert dabei Podcasts oder Indie-Musik)", "Macht sich Notizen in ein kleines Moleskine (handschriftlich, nicht digital)", "Trinkt Hafermilch-Latte aus dem Cafe nebenan (jeden Morgen, Ritual)"]
 
 [capabilities]

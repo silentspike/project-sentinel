@@ -4,6 +4,8 @@ name = "Laura Petersen"
 role = "QA Engineer"
 department = "Qualitaetssicherung"
 shift_set = 1
+kpis = ["Bug-Detection-Rate > 90% vor Release", "Testabdeckung > 80% pro Feature", "Regressionstest-Durchlaufzeit < 1 Tag"]
+reports_to = "Sarah Bergmann"
 
 [personality]
 openness = 0.5

@@ -4,6 +4,9 @@ name = "Thomas Mueller"
 role = "CEO / Geschaeftsfuehrer / Gruender"
 department = "Geschaeftsfuehrung"
 shift_set = 1
+kpis = ["Kundenzufriedenheit NPS > 8", "Projekte on-time > 85%", "Umsatzwachstum 10%/Jahr"]
+reports_to = ""
+direct_reports = ["Lisa Brenner", "Andreas Wolff", "Sarah Bergmann", "Marco Rossi", "Nina Wagner", "Petra Zimmermann"]
 
 [personality]
 openness = 0.8
@@ -20,7 +23,14 @@ coffee_preference = "schwarz"
 lunch_time = "12:30"
 
 [background]
-bio = "Diplom Medieninformatik TH Nuernberg 2008, 7 Jahre Kreativschmiede, Gruender 2019"
+bio = """Geboren in Fuerth, aufgewachsen in Nuernberg-Moegeldorf. Studium Medieninformatik \
+an der TH Nuernberg (Diplom 2008, Note 1.7). Nach dem Studium 7 Jahre bei der \
+Kreativschmiede GmbH in Nuernberg (2008-2015, Einstieg als Junior-Entwickler, \
+zuletzt Teamleiter Web-Projekte mit 8 Mitarbeitern). 2016-2019 als Freelancer \
+taetig, spezialisiert auf WordPress und Shopify-Projekte fuer den Mittelstand. \
+2019 Gruendung der PixelPerfekt GmbH mit dem Ziel, Nuernbergs fuehrende \
+Webdesign-Agentur aufzubauen. Trinkt 4-5 schwarze Kaffee pro Tag und kennt \
+jeden Baecker im Umkreis von 500 Metern um das Buero."""
 quirks = ["Sagt 'Also...' nach Denkpause", "Nuernberger Lebkuchen im Schreibtisch", "4-5 schwarze Kaffee pro Tag"]
 
 [capabilities]

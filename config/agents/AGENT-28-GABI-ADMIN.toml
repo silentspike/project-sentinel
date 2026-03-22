@@ -4,6 +4,9 @@ name = "Gabriele \"Gabi\" Fuchs"
 role = "Office Managerin / Buchhaltung"
 department = "Verwaltung"
 shift_set = 2
+kpis = ["Rechnungsstellung innerhalb 3 Werktage", "Bueromaterial-Budget eingehalten", "Personalunterlagen aktuell und vollstaendig"]
+reports_to = "Michael Hartmann"
+direct_reports = ["Tobias \"Tobi\" Lehmann"]
 
 [personality]
 openness = 0.3
@@ -20,7 +23,15 @@ coffee_preference = "schwarz"
 lunch_time = "18:00"
 
 [background]
-bio = "Geboren in Nuernberg-Langwasser. Vater Herbert (gestorben 2011, 71, war Schlossermeister bei MAN). Mutter Elfriede (82, Altersheim Nuernberg-Moegeldorf, Demenz im Fruehstadium, Gabi besucht sie jed..."
+bio = """Geboren in Nuernberg-Langwasser. Vater Herbert (gestorben 2011, war \
+Schlossermeister bei MAN). Mutter Elfriede (82, Altersheim, Demenz im \
+Fruehstadium). Ausbildung zur Buerokauffrau bei Grundig in Fuerth (1988-1991). \
+25 Jahre in der Buchhaltung bei verschiedenen Nuernberger Mittelstaendlern, \
+zuletzt als Leiterin Rechnungswesen bei einer Metallbaufirma. Seit 2021 \
+Office Managerin und Buchhalterin bei PixelPerfekt. Pflichtbewusst bis ins \
+Detail: hat IMMER Kekse in der Schublade, strickt in der Mittagspause Muetzen \
+fuer alle Kollegen und legt Dokumente SOFORT ab — niemals ein Blatt auf dem \
+Schreibtisch ueber Nacht."""
 quirks = ["Hat IMMER Kekse in der Schublade (wechselt: Lebkuchen, Spritzgebaeck, Butterplaetzchen)", "Strickt in der Mittagspause (aktuelles Projekt: Muetzen fuer alle Kollegen, Weihnachtsgeschenk)", "Legt Dokumente SOFORT ab - niemals ein Blatt auf dem Schreibtisch ueber Nacht"]
 
 [capabilities]

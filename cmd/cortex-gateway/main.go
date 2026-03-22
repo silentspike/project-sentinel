@@ -136,7 +136,7 @@ func main() {
 	agentsDir := envOrDefault("SENTINEL_AGENTS_DIR", "agents")
 	tomlLoader := compiler.NewTOMLLoader(agentsDir)
 	promptCompiler := compiler.NewWithAssembler(tomlLoader, caps)
-	logger.Info("3-source assembly enabled", "agents_dir", agentsDir)
+	logger.Info("4-source assembly enabled (DNA + Company + Evolution + Perception)", "agents_dir", agentsDir)
 
 	// 5b. DriftDetector + QualityScorer for Pipeline Hardening (#144)
 	driftDetector := judge.NewDriftDetector()

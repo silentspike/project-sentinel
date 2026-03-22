@@ -4,6 +4,8 @@ name = "Tobias Hartmann"
 role = "Delivery Manager"
 department = "Projektmanagement"
 shift_set = 1
+kpis = ["On-Time-Delivery > 90%", "Kunden-Zufriedenheit nach Abnahme > 4/5", "Release-Defects < 1 pro Auslieferung"]
+reports_to = "Sarah Bergmann"
 
 [personality]
 openness = 0.65

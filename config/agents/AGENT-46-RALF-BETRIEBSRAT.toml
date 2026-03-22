@@ -4,6 +4,9 @@ name = "Ralf Steinbach"
 role = "Betriebsratsvorsitzender (50% BR-Taetigkeit, 50% regulaere Aufgaben)"
 department = "Betriebsrat"
 shift_set = 0
+kpis = ["Betriebsvereinbarungen aktuell und eingehalten", "Mitarbeiter-Beschwerden bearbeitet < 5 Werktage", "Betriebsratssitzungen monatlich durchgefuehrt"]
+reports_to = ""
+direct_reports = ["Aylin Demirci", "Stefan Huber"]
 
 [personality]
 openness = 0.4
@@ -20,7 +23,16 @@ coffee_preference = "schwarz"
 lunch_time = "12:30"
 
 [background]
-bio = "Geboren in Nuernberg-Gostenhof. Vater Horst Steinbach (gestorben 2021, 74, war Schlossermeister bei MAN Truck & Bus Nuernberg, 38 Jahre Betriebszugehoerigkeit, selbst 12 Jahre Betriebsrat). Mutter ..."
+bio = """Geboren in Nuernberg-Gostenhof. Vater Horst Steinbach (gestorben 2021, war \
+Schlossermeister bei MAN Truck & Bus Nuernberg, 38 Jahre Betriebszugehoerigkeit, \
+selbst 12 Jahre Betriebsrat). Ausbildung zum Industriemechaniker bei MAN \
+(1995-1998), danach Weiterbildung zum Betriebswirt (IHK Nuernberg 2003). \
+15 Jahre in verschiedenen Nuernberger Firmen im kaufmaennischen Bereich. \
+Seit 2020 bei PixelPerfekt, gewaehlt zum Betriebsratsvorsitzenden. Trockener \
+Humor, klopft mit dem Kugelschreiber auf den Tisch wenn er nachdenkt und \
+trinkt Filterkaffee schwarz — \"Kaffee trinkt man schwarz, sonst ist es \
+Nachtisch.\" Sieht seine Aufgabe als Brueckenbauer zwischen Belegschaft \
+und Geschaeftsfuehrung."""
 quirks = ["Klopft mit dem Kugelschreiber auf den Tisch wenn er nachdenkt", "Steht auf und geht ans Fenster wenn ein Gespraech schwierig wird", "Trinkt Filterkaffee, schwarz, keine Milch, keinen Zucker (\"Kaffee trinkt man schwarz, sonst ist es Nachtisch\")"]
 
 [capabilities]

@@ -398,6 +398,141 @@ pub struct ActionReceiver(pub std::sync::Mutex<std::sync::mpsc::Receiver<AgentAc
 #[derive(Resource, Default)]
 pub struct ActiveAgentsThisTick(pub Vec<AgentId>);
 
+/// In-Memory Buffer fuer gesprochene Nachrichten pro Raum.
+///
+/// ZERO Disk-Writes — Chat ist bereits als AgentActionReceived Event persistiert.
+/// Kaskade-Dampening: Max 1 Chat/Tick/Raum + Max 2 Responses/Agent/120 Ticks.
+#[derive(Resource, Default, Debug, Clone)]
+pub struct RoomChatBuffer {
+    messages: std::collections::HashMap<String, Vec<RoomChatEntry>>,
+    /// Letzter Chat-Tick pro Raum (1 Chat/Tick/Raum Rate-Limit).
+    last_chat_tick: std::collections::HashMap<String, u64>,
+    /// Letzter Tick an dem ein Agent Chat gehoert hat (Cooldown).
+    chat_cooldowns: std::collections::HashMap<String, u64>,
+    /// Chat-Response-Counter pro Agent (window_start_tick, count). Max 2/120 Ticks.
+    chat_response_counts: std::collections::HashMap<String, (u64, u32)>,
+}
+
+/// Eine einzelne Chat-Nachricht in einem Raum.
+#[derive(Debug, Clone)]
+pub struct RoomChatEntry {
+    pub agent_name: String,
+    pub content: String,
+    pub tick: u64,
+    pub ttl_ticks: u64,
+    pub addressed_agents: Vec<String>,
+}
+
+const CHAT_TTL_TICKS: u64 = 120;
+const MAX_CHAT_RESPONSES_PER_WINDOW: u32 = 2;
+const CHAT_RESPONSE_WINDOW_TICKS: u64 = 120;
+const MAX_CONTENT_LEN: usize = 500;
+
+impl RoomChatBuffer {
+    /// Fuegt eine Chat-Nachricht hinzu. Gibt false zurueck bei Rate-Limit (1 Chat/Tick/Raum).
+    pub fn add(
+        &mut self,
+        room_id: &str,
+        agent_name: String,
+        content: String,
+        tick: u64,
+        all_agent_names: &[String],
+    ) -> bool {
+        // Rate-Limit: Max 1 Chat pro Tick pro Raum
+        if let Some(&last_tick) = self.last_chat_tick.get(room_id) {
+            if last_tick == tick {
+                return false;
+            }
+        }
+        self.last_chat_tick.insert(room_id.to_string(), tick);
+
+        // Content trimmen
+        let trimmed = if content.len() > MAX_CONTENT_LEN {
+            format!("{}...", &content[..MAX_CONTENT_LEN - 3])
+        } else {
+            content
+        };
+
+        // Direkt-Ansprache erkennen (Vorname oder voller Name im Text)
+        let addressed: Vec<String> = all_agent_names
+            .iter()
+            .filter(|name| {
+                let first = name.split_whitespace().next().unwrap_or(name);
+                (trimmed.contains(first) || trimmed.contains(name.as_str()))
+                    && *name != &agent_name
+            })
+            .cloned()
+            .collect();
+
+        self.messages
+            .entry(room_id.to_string())
+            .or_default()
+            .push(RoomChatEntry {
+                agent_name,
+                content: trimmed,
+                tick,
+                ttl_ticks: CHAT_TTL_TICKS,
+                addressed_agents: addressed,
+            });
+
+        true
+    }
+
+    /// Gibt aktuelle Messages fuer einen Raum zurueck (exkludiert eigene + bereits gehoerte).
+    pub fn get_recent(
+        &self,
+        room_id: &str,
+        current_tick: u64,
+        exclude_agent: &str,
+    ) -> Vec<&RoomChatEntry> {
+        let cooldown_tick = self.chat_cooldowns.get(exclude_agent).copied().unwrap_or(0);
+        self.messages
+            .get(room_id)
+            .map(|msgs| {
+                msgs.iter()
+                    .filter(|m| {
+                        current_tick < m.tick + m.ttl_ticks
+                            && m.agent_name != exclude_agent
+                            && m.tick > cooldown_tick
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Markiert dass ein Agent Chat gehoert hat (Cooldown-Update).
+    pub fn set_heard(&mut self, agent_name: &str, tick: u64) {
+        self.chat_cooldowns.insert(agent_name.to_string(), tick);
+    }
+
+    /// Prueft ob ein Agent noch auf Chat reagieren darf (max 2/120 Ticks).
+    pub fn can_respond(&mut self, agent_name: &str, tick: u64) -> bool {
+        let entry = self
+            .chat_response_counts
+            .entry(agent_name.to_string())
+            .or_insert((tick, 0));
+
+        // Window abgelaufen → reset
+        if tick.saturating_sub(entry.0) >= CHAT_RESPONSE_WINDOW_TICKS {
+            *entry = (tick, 0);
+        }
+
+        if entry.1 >= MAX_CHAT_RESPONSES_PER_WINDOW {
+            return false;
+        }
+        entry.1 += 1;
+        true
+    }
+
+    /// Entfernt abgelaufene Messages.
+    pub fn cleanup(&mut self, current_tick: u64) {
+        self.messages.retain(|_, msgs| {
+            msgs.retain(|m| current_tick < m.tick + m.ttl_ticks);
+            !msgs.is_empty()
+        });
+    }
+}
+
 /// Empfaengt Operator-Kommandos fuer manuelles Chaos aus dem Daemon.
 #[derive(Resource)]
 pub struct OperatorCommandReceiver(
@@ -519,6 +654,7 @@ pub fn create_simulation_world() -> (World, Schedule) {
     world.insert_resource(ActiveRoomStimuli::default());
     world.insert_resource(RoomPhysicsState::default());
     world.insert_resource(ActiveAgentsThisTick::default());
+    world.insert_resource(RoomChatBuffer::default());
 
     // System-Reihenfolge via configure_sets (10 Phasen)
     schedule.configure_sets(

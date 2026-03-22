@@ -2,7 +2,7 @@ package injection
 
 import "strings"
 
-// PerceptionData haelt die 6 Wahrnehmungsfelder eines Agenten.
+// PerceptionData haelt die Wahrnehmungsfelder eines Agenten.
 // Die Felder entsprechen den Rust-seitigen Perception-Struct-Feldern
 // aus sentinel-common/src/types.rs.
 type PerceptionData struct {
@@ -10,6 +10,7 @@ type PerceptionData struct {
 	BodyText        string
 	EnvironmentText string
 	AcousticText    string
+	HeardText       string // Room-Chat: Was andere im Raum gesagt haben
 	PresenceText    string
 	ImpulseText     string
 }
@@ -29,6 +30,7 @@ func (p *PerceptionData) Format() string {
 		{"KOERPER", &p.BodyText},
 		{"ENVIRONMENT", &p.EnvironmentText},
 		{"AKUSTIK", &p.AcousticText},
+		{"GEHOERT", &p.HeardText},
 		{"ANWESEND", &p.PresenceText},
 		{"IMPULS", &p.ImpulseText},
 	}
@@ -57,6 +59,7 @@ func FromMap(m map[string]string) PerceptionData {
 		BodyText:        m["body"],
 		EnvironmentText: m["environment"],
 		AcousticText:    m["acoustic"],
+		HeardText:       m["heard"],
 		PresenceText:    m["presence"],
 		ImpulseText:     m["impulse"],
 	}

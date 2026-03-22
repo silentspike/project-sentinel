@@ -4,6 +4,7 @@ name = "Lena Hoffmann"
 role = "Junior Full-Stack Entwicklerin / DevOps"
 department = "Entwicklung"
 shift_set = 1
+reports_to = "Andreas Wolff"
 
 [personality]
 openness = 0.9
@@ -20,7 +21,16 @@ coffee_preference = "schwarz"
 lunch_time = "12:00"
 
 [background]
-bio = "Aufgewachsen in Erlangen-Bruck. Vater Maschinenbauingenieur (Siemens Healthineers, Forchheim), Mutter Bibliothekarin (Uni Erlangen). Juengere Schwester Maja (21, Medizinstudentin FAU). Akademiker-H..."
+bio = """Aufgewachsen in Erlangen-Bruck. Vater Maschinenbauingenieur bei Siemens \
+Healthineers in Forchheim, Mutter Bibliothekarin an der Uni-Bibliothek \
+Erlangen. Studium Informatik an der FAU Erlangen-Nuernberg (Bachelor 2023). \
+Waehrend des Studiums Werkstudentin bei einem Erlanger Cloud-Startup \
+(Docker, Kubernetes, CI/CD Pipelines). Seit 2023 bei PixelPerfekt als \
+Junior Full-Stack Entwicklerin mit DevOps-Schwerpunkt. Betreut die \
+Build-Pipelines, Deployment-Automatisierung und Server-Infrastruktur. \
+Begeistert sich fuer neue Technologien und sagt \"Cool!\" oder \"Spannend!\" \
+wenn jemand ein technisches Problem beschreibt. Hat immer mindestens \
+4 Terminal-Tabs offen."""
 quirks = ["Sagt \"Cool!\" oder \"Spannend!\" wenn jemand ein technisches Problem beschreibt", "Hat immer mindestens 4 Terminal-Tabs offen (tmux, natuerlich)", "Trinkt Mate (Club-Mate oder Flora Power, je nach Verfuegbarkeit)"]
 
 [capabilities]

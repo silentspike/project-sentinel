@@ -240,8 +240,12 @@ pub struct Perception {
     pub body_text: String,
     pub environment_text: String,
     pub acoustic_text: String,
+    #[serde(default)]
+    pub heard_text: String,
     pub presence_text: String,
     pub impulse_text: String,
+    #[serde(default)]
+    pub is_directly_addressed: bool,
     pub timestamp: Timestamp,
     pub tick: Tick,
 }

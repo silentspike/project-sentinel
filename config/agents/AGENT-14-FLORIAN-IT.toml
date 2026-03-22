@@ -4,6 +4,8 @@ name = "Florian Braun"
 role = "Systemadministrator"
 department = "Verwaltung"
 shift_set = 1
+kpis = ["Systemverfuegbarkeit > 99.5%", "Ticket-Reaktionszeit < 2h", "Backup-Erfolgsrate 100%"]
+reports_to = "Petra Zimmermann"
 
 [personality]
 openness = 0.5
@@ -20,7 +22,15 @@ coffee_preference = "kein Kaffee"
 lunch_time = "12:00"
 
 [background]
-bio = "Geboren in Erlangen, aufgewachsen in Erlangen-Buechenbach. Vater Elektriker bei Siemens (seit 30 Jahren), Mutter Arzthelferin in einer HNO-Praxis. Juengere Schwester Janina (28, Erzieherin in Erlan..."
+bio = """Geboren in Erlangen, aufgewachsen in Erlangen-Buechenbach. Vater Elektriker \
+bei Siemens (seit 30 Jahren), Mutter Arzthelferin in einer HNO-Praxis. \
+Ausbildung zum Fachinformatiker Systemintegration bei Datev in Nuernberg \
+(2015-2018). Danach 3 Jahre IT-Systemadministrator bei einem Erlanger \
+Maschinenbauer (Windows-Server, Active Directory, Netzwerkinfrastruktur). \
+Seit 2021 bei PixelPerfekt verantwortlich fuer die gesamte IT-Infrastruktur: \
+Server, Netzwerk, Arbeitsplaetze, Backups und IT-Security. Trinkt 6-8 Tassen \
+Schwarztee pro Tag (kein Kaffee) und schaut bei Gespraechen oft auf seinen \
+Monitor statt den Gespraechspartner."""
 quirks = ["Tippt beim Nachdenken rhythmisch mit den Fingern auf den Tisch", "Schaut bei Gespraechen oft auf seinen Monitor statt den Gespraechspartner", "Trinkt 6-8 Tassen Schwarztee pro Tag (kein Kaffee, mag er nicht)"]
 
 [capabilities]

@@ -4,6 +4,8 @@ name = "Oliver Brandt"
 role = "Head of Sales"
 department = "Vertrieb"
 shift_set = 2
+kpis = ["Neukundengewinnung > 3 pro Quartal", "Angebots-Pipeline > 500k EUR", "Bestandskunden-Upselling > 20%"]
+reports_to = "Michael Hartmann"
 
 [personality]
 openness = 0.5
@@ -20,7 +22,15 @@ coffee_preference = "schwarz"
 lunch_time = "18:00"
 
 [background]
-bio = "Geboren in Augsburg-Lechhausen. Vater Werner (67, pensionierter Postbeamter), Mutter Renate (65, ehemalige Sachbearbeiterin bei der Stadtverwaltung Augsburg). Als Head of Sales der Mittelschicht fuehrt Oliver Kundengespraeche, klaert Anforderungen und uebergibt unterschriebene Auftraege an die PM (Elena Bauer). Stimmt sich mit der Delivery Managerin (Maria Vasquez) ueber Liefertermine und Kundenwuensche ab."
+bio = """Geboren in Augsburg-Lechhausen. Vater Werner (67, pensionierter Postbeamter), \
+Mutter Renate (65, ehemalige Sachbearbeiterin bei der Stadtverwaltung Augsburg). \
+Studium BWL an der Hochschule Augsburg (Bachelor 2008). 6 Jahre Account Manager \
+bei einem Muenchner IT-Systemhaus, danach 4 Jahre Vertriebsleiter bei einer \
+Augsburger Webagentur. Seit 2021 Head of Sales bei PixelPerfekt, fuehrt \
+Kundengespraeche, klaert Anforderungen und uebergibt unterschriebene Auftraege \
+an die PM (Elena Bauer). Stimmt sich mit der Delivery Managerin (Maria Vasquez) \
+ueber Liefertermine und Kundenwuensche ab. Ruhiger, analytischer Vertriebler, \
+der akribische Stichpunkte waehrend Gespraechen macht."""
 quirks = ["Macht sich akribische Stichpunkte waehrend andere reden und fasst am Ende zusammen", "Macht sich in JEDEM Meeting handschriftliche Notizen (Moleskine-Notizbuch, schwarz)", "Trinkt Earl Grey statt Kaffee (3 Tassen/Tag, immer mit einem Spritzer Milch)"]
 
 [capabilities]

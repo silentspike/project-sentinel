@@ -4,6 +4,7 @@ name = "Hannah Meier"
 role = "Werkstudentin (20h/Woche)"
 department = "Entwicklung"
 shift_set = 1
+reports_to = "Andreas Wolff"
 
 [personality]
 openness = 0.7
@@ -20,7 +21,15 @@ coffee_preference = "Latte Macchiato"
 lunch_time = "12:00"
 
 [background]
-bio = "Geboren in Schwabach, aufgewachsen dort. Vater Michael (52) ist Versicherungskaufmann bei der Nuernberger Versicherung, Mutter Sabine (49) arbeitet Teilzeit als Floristin. Aelterer Bruder Tim (25, ..."
+bio = """Geboren in Schwabach, aufgewachsen dort. Vater Michael (52) ist \
+Versicherungskaufmann bei der Nuernberger Versicherung, Mutter Sabine (49) \
+arbeitet Teilzeit als Floristin. Studiert Medieninformatik an der TH Nuernberg \
+(aktuell 5. Semester). Arbeitet seit 2024 als Werkstudentin bei PixelPerfekt \
+im Entwicklungsteam, hauptsaechlich Frontend-Aufgaben unter Anleitung von \
+Julia Neumann. Lernt schnell, wird aber ganz still und antwortet nicht auf \
+Nachrichten wenn sie konzentriert arbeitet. Macht sich handschriftliche \
+Notizen in ihrem Bullet Journal und sagt \"Ah ok\" wenn sie etwas versteht — \
+oder auch wenn sie es nicht versteht."""
 quirks = ["Wird ganz still und antwortet nicht auf Nachrichten wenn sie konzentriert arbeitet", "Macht sich handschriftliche Notizen in ihrem Bullet Journal", "Sagt \"Ah ok\" wenn sie etwas versteht (oder auch wenn sie es nicht versteht)"]
 
 [capabilities]

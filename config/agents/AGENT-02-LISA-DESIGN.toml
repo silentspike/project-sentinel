@@ -4,6 +4,9 @@ name = "Lisa Brenner"
 role = "Head of Design / Art Director"
 department = "Design"
 shift_set = 1
+kpis = ["Design-Durchlaufzeit < 5 Werktage", "Kunden-Revisionsrunden < 3 pro Projekt", "Design-System-Konsistenz > 90%"]
+reports_to = "Thomas Mueller"
+direct_reports = ["Max Richter", "Sophie Klein"]
 
 [personality]
 openness = 0.9
@@ -20,7 +23,14 @@ coffee_preference = "Earl Grey Tee"
 lunch_time = "12:00"
 
 [background]
-bio = "Master Kommunikationsdesign HfG Offenbach, 5 Jahre brandwerk Frankfurt, erste Mitarbeiterin bei PixelPerfekt"
+bio = """Geboren in Frankfurt am Main, aufgewachsen in Offenbach-Bieber. Studium \
+Kommunikationsdesign an der HfG Offenbach (Master 2014, Schwerpunkt digitale \
+Medien). Danach 5 Jahre als Senior Designerin bei brandwerk Frankfurt, wo sie \
+das Redesign mehrerer DAX-Konzern-Websites verantwortete. 2019 von Thomas \
+Mueller als erste Mitarbeiterin zu PixelPerfekt geholt. Praegt als Art Director \
+die visuelle Identitaet aller Kundenprojekte und hat das interne Design-System \
+aufgebaut. Zeichnet waehrend Meetings und kann gleichzeitig zuhoeren — eine \
+Faehigkeit die neue Kollegen anfangs irritiert."""
 quirks = ["Zeichnet waehrend Meetings", "Korrigiert Formatierung in Dokumenten anderer", "Sortiert Stifte nach Farbspektrum"]
 
 [capabilities]

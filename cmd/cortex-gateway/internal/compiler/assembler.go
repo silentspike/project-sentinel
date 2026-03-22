@@ -2,6 +2,9 @@ package compiler
 
 import (
 	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
@@ -14,21 +17,37 @@ type PromptBlock struct {
 	Static  bool // true = cacheable (rarely changes)
 }
 
-// Assembler creates prompts from 3 sources: TOML DNA, redb Evolution, live Perception.
+// Assembler creates prompts from 4 sources: TOML DNA, Company Context, redb Evolution, live Perception.
 type Assembler struct {
-	loader *TOMLLoader
-	caps   *capability.ProviderCapabilities
+	loader         *TOMLLoader
+	caps           *capability.ProviderCapabilities
+	companyContext  string
 }
 
-// NewAssembler creates an Assembler with the given loader and capabilities.
+// NewAssembler creates an Assembler with the given loader, capabilities, and company context.
 func NewAssembler(loader *TOMLLoader, caps *capability.ProviderCapabilities) *Assembler {
+	ctx := LoadCompanyContext(loader.agentDir)
 	return &Assembler{
-		loader: loader,
-		caps:   caps,
+		loader:        loader,
+		caps:          caps,
+		companyContext: ctx,
 	}
 }
 
-// Assemble creates prompt blocks from 3 sources for the given agent.
+// LoadCompanyContext reads company-context.md from the config directory.
+func LoadCompanyContext(agentsDir string) string {
+	configDir := filepath.Dir(agentsDir)
+	path := filepath.Join(configDir, "company-context.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		slog.Info("company-context.md not found, company context disabled", "path", path)
+		return ""
+	}
+	slog.Info("company context loaded", "path", path, "bytes", len(data))
+	return string(data)
+}
+
+// Assemble creates prompt blocks from 4 sources for the given agent.
 func (a *Assembler) Assemble(agentID int, providerName string, evolution EvolutionData, perception string) ([]PromptBlock, error) {
 	var blocks []PromptBlock
 
@@ -44,6 +63,15 @@ func (a *Assembler) Assemble(agentID int, providerName string, evolution Evoluti
 		Content: dnaBlock,
 		Static:  true,
 	})
+
+	// Source 1b: Company Context (static, cacheable, shared across all agents)
+	if a.companyContext != "" {
+		blocks = append(blocks, PromptBlock{
+			Label:   "company",
+			Content: a.companyContext,
+			Static:  true,
+		})
+	}
 
 	// Source 2: Evolution (semi-static, changes after Night-Run)
 	if !evolution.IsEmpty() {
@@ -88,6 +116,18 @@ func (a *Assembler) formatDNA(dna *AgentDNA, providerName string) string {
 		}
 
 		b.WriteString(formatPersonalityTraits(dna.Personality))
+	}
+
+	// KPIs (wenn vorhanden)
+	if len(dna.Identity.KPIs) > 0 {
+		fmt.Fprintf(&b, "Deine KPIs: %s\n", strings.Join(dna.Identity.KPIs, "; "))
+	}
+	// Berichtsstruktur
+	if dna.Identity.ReportsTo != "" {
+		fmt.Fprintf(&b, "Du berichtest an: %s\n", dna.Identity.ReportsTo)
+	}
+	if len(dna.Identity.DirectReports) > 0 {
+		fmt.Fprintf(&b, "Dir berichten: %s\n", strings.Join(dna.Identity.DirectReports, ", "))
 	}
 
 	b.WriteString("\nVerhalte dich natuerlich und menschlich. Antworte immer auf Deutsch.\n")

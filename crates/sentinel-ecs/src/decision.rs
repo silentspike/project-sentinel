@@ -7,33 +7,40 @@
 //! Arbeitskontext, Stimmung und Chaos-Events. Max 5 Events pro Injection.
 
 use super::components::*;
-use super::world::{EventBuffer, SimulationTime};
+use super::world::{EventBuffer, RoomChatBuffer, SimulationTime};
 use bevy_ecs::prelude::*;
 use sentinel_common::Emotion;
 
-/// Max Events pro Injection-Zyklus (AC3)
-const MAX_EVENTS: usize = 5;
+/// Max Events pro Injection-Zyklus (erweitert fuer Chat als 5. Quelle)
+const MAX_EVENTS: usize = 8;
+
+/// Max Chat-Events pro Decision-Zyklus
+const MAX_CHAT_EVENTS_PER_TICK: usize = 3;
 
 /// Decision System: Generiert priorisierte EventQueue pro Agent.
 ///
 /// Liest Bio/Work/Mood-Zustand und Chaos-Events aus EventBuffer,
 /// erzeugt PendingEvents mit P0-P3 Prioritaeten, sortiert und
 /// beschraenkt auf MAX_EVENTS.
+#[allow(clippy::type_complexity)]
 pub fn decision_system(
     mut query: Query<(
+        &AgentIdentity,
         &BioState,
         &Personality,
         &Mood,
         &WorkContext,
         &PerceptionState,
+        &Position,
         &mut EventQueue,
     )>,
     time: Res<SimulationTime>,
     event_buffer: Res<EventBuffer>,
+    chat_buffer: Res<RoomChatBuffer>,
 ) {
     let current_tick = time.tick.0;
 
-    for (bio, personality, mood, work, _perception, mut queue) in &mut query {
+    for (identity, bio, personality, mood, work, _perception, position, mut queue) in &mut query {
         // 1. TTL dekrementieren, abgelaufene Events entfernen
         for event in &mut queue.events {
             event.ttl_ticks = event.ttl_ticks.saturating_sub(1);
@@ -61,9 +68,66 @@ pub fn decision_system(
             }
         }
 
-        // 4. Sortieren nach Priority (P0 zuerst), auf max 5 beschraenken
+        // 4. Chat-Events aus RoomChatBuffer (5. Quelle)
+        if !position.in_transit {
+            generate_chat_events(
+                &identity.name,
+                &position.room_id,
+                &chat_buffer,
+                &mut queue,
+                current_tick,
+            );
+        }
+
+        // 5. Sortieren nach Priority (P0 zuerst), auf MAX_EVENTS beschraenken
         queue.events.sort_by_key(|e| e.priority);
         queue.events.truncate(MAX_EVENTS);
+    }
+}
+
+/// Chat-Events aus RoomChatBuffer.
+///
+/// P1 = direkt angesprochen (Name im Text), TTL 60
+/// P3 = allgemeines Gespraech im Raum, TTL 10
+fn generate_chat_events(
+    agent_name: &str,
+    room_id: &str,
+    chat_buffer: &RoomChatBuffer,
+    queue: &mut EventQueue,
+    tick: u64,
+) {
+    let recent = chat_buffer.get_recent(room_id, tick, agent_name);
+    let first_name = agent_name.split_whitespace().next().unwrap_or(agent_name);
+
+    for msg in recent.iter().take(MAX_CHAT_EVENTS_PER_TICK) {
+        let is_addressed = msg
+            .addressed_agents
+            .iter()
+            .any(|name| name.contains(first_name));
+
+        let (priority, ttl, text) = if is_addressed {
+            (
+                Priority::P1,
+                60,
+                format!("{} sagte zu dir: \"{}\"", msg.agent_name, msg.content),
+            )
+        } else {
+            (
+                Priority::P3,
+                10,
+                format!("{} sagte: \"{}\"", msg.agent_name, msg.content),
+            )
+        };
+
+        push_event(
+            queue,
+            PendingEvent {
+                priority,
+                text,
+                ttl_ticks: ttl,
+                created_tick: msg.tick,
+            },
+        );
     }
 }
 

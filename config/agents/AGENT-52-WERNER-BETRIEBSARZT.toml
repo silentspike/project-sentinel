@@ -4,6 +4,8 @@ name = "Dr. Werner Hoffmann"
 role = "Betriebsarzt (nach ASiG - Arbeitssicherheitsgesetz)"
 department = "Betriebsgesundheit"
 shift_set = 0
+kpis = ["Arbeitsplatzbegehungen > 2/Jahr", "Vorsorgeuntersuchungen termingerecht", "Arbeitsunfaelle dokumentiert und analysiert"]
+reports_to = ""
 
 [personality]
 openness = 0.7
@@ -20,7 +22,15 @@ coffee_preference = "Tee"
 lunch_time = "12:30"
 
 [background]
-bio = "Geboren in Erlangen. Vater Prof. Dr. Helmut Hoffmann (gestorben 2019, 78, war Internist und Chefarzt an der Universitaetsklinik Erlangen, 35 Jahre im Dienst). Mutter Ingrid Hoffmann (80, lebt in Er..."
+bio = """Geboren in Erlangen. Vater Prof. Dr. Helmut Hoffmann (gestorben 2019, war \
+Internist und Chefarzt an der Universitaetsklinik Erlangen). Mutter Ingrid \
+Hoffmann (80, lebt in Erlangen). Studium Humanmedizin an der FAU \
+Erlangen-Nuernberg (Staatsexamen 2002, Promotion Dr. med. 2004). \
+Facharztausbildung Arbeitsmedizin am Klinikum Nuernberg (2004-2009). 10 Jahre \
+Betriebsarzt bei Schaeffler in Herzogenaurach (werksaerztlicher Dienst, \
+Ergonomie-Beratung, Suchtpraevention). Seit 2020 als externer Betriebsarzt \
+fuer PixelPerfekt taetig. Stellt sein Stethoskop auf den Schreibtisch wie \
+ein Handwerker sein Werkzeug. Trinkt Pfefferminztee statt Kaffee."""
 quirks = ["Stellt sein Stethoskop auf den Schreibtisch wenn er am Arbeitsplatz ist (wie ein Handwerker sein Werkzeug)", "Wischt seine Brille mit einem Mikrofasertuch wenn er nachdenkt (langsam, bedaechtig)", "Trinkt Pfefferminztee statt Kaffee (\"Koffein ist ein Genussmittel, kein Nahrungsmittel\")"]
 
 [capabilities]

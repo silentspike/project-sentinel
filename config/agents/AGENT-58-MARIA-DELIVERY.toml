@@ -4,6 +4,8 @@ name = "Maria Vasquez"
 role = "Delivery Manager"
 department = "Projektmanagement"
 shift_set = 2
+kpis = ["On-Time-Delivery > 90%", "Kunden-Zufriedenheit nach Abnahme > 4/5", "Stakeholder-Kommunikation woechentlich"]
+reports_to = "Elena Bauer"
 
 [personality]
 openness = 0.75

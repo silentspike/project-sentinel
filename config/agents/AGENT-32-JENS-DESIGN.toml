@@ -4,6 +4,9 @@ name = "Jens Krueger"
 role = "Design-Lead / Art Director"
 department = "Design"
 shift_set = 3
+kpis = ["Design-Qualitaet Kunden-Score > 4.5/5", "Kreativ-Konzept-Abnahme in < 2 Iterationen", "Design-Konsistenz ueber alle Projekte"]
+reports_to = "Sandra Vogel"
+direct_reports = ["Priya Sharma", "Lea Hoffmann"]
 
 [personality]
 openness = 0.6
@@ -20,7 +23,15 @@ coffee_preference = "Kaffee"
 lunch_time = "02:00"
 
 [background]
-bio = "Geboren in Dessau, aufgewachsen in Weimar. Vater Grafiker (eigene Druckwerkstatt, Weimar), Mutter Bibliothekarin an der Herzogin Anna Amalia Bibliothek. Keine Geschwister. Aufgewachsen zwischen Bau..."
+bio = """Geboren in Dessau, aufgewachsen in Weimar. Vater Grafiker (eigene Druckwerkstatt), \
+Mutter Bibliothekarin an der Herzogin Anna Amalia Bibliothek. Aufgewachsen \
+zwischen Bauhaus-Erbe und klassischer Kultur. Studium Visuelle Kommunikation \
+an der Bauhaus-Universitaet Weimar (Diplom 2010, Schwerpunkt Typografie und \
+Editorial Design). 5 Jahre Art Director bei einer Dresdner Designagentur, \
+danach 3 Jahre Creative Director bei einer Leipziger Markenberatung. Seit \
+2020 Design-Lead bei PixelPerfekt, bringt ostdeutsche Gruendlichkeit und \
+Bauhaus-Aesthetik in jedes Projekt. Minimalistisch, praezise, spricht nur \
+wenn er etwas Durchdachtes zu sagen hat."""
 quirks = ["Dreht den Bleistift zwischen den Fingern wenn er nachdenkt", "Steht auf und geht zum Fenster wenn er ueber ein Design gruebelt", "Sagt \"Hmm\" und schweigt 5-10 Sekunden bevor er antwortet (wirkt unhöflich, ist Nachdenken)"]
 
 [capabilities]

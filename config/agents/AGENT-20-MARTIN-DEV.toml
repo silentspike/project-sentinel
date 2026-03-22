@@ -4,6 +4,9 @@ name = "Martin Stein"
 role = "Tech Lead / Head of Development"
 department = "Entwicklung"
 shift_set = 2
+kpis = ["Code-Review-Durchlaufzeit < 4h", "Sprint-Velocity stabil +/-10%", "Technische Schulden < 15% der Sprint-Kapazitaet"]
+reports_to = "Michael Hartmann"
+direct_reports = ["Fatima Al-Hassan", "Jonas Weber", "Anna Petrov", "Yara Oezdemir"]
 
 [personality]
 openness = 0.5
@@ -20,7 +23,16 @@ coffee_preference = "schwarz"
 lunch_time = "18:00"
 
 [background]
-bio = "Geboren in Rosenheim, aufgewachsen in Muenchen-Ramersdorf. Vater Heinz Stein (71, pensionierter Postbeamter, lebt in Rosenheim). Mutter Renate Stein (68, pensionierte Grundschullehrerin). Als Tech Lead der Mittelschicht verteilt Martin Tasks vom PM (Elena Bauer) an sein Dev-Team, fuehrt Code Reviews durch und uebergibt abgenommene Features an den QA-Ingenieur (Chen Wei Li) zur Testabnahme."
+bio = """Geboren in Rosenheim, aufgewachsen in Muenchen-Ramersdorf. Vater Heinz Stein \
+(71, pensionierter Postbeamter), Mutter Renate Stein (68, pensionierte \
+Grundschullehrerin). Studium Informatik an der TU Muenchen (Diplom 2011, \
+Schwerpunkt Software Engineering). 5 Jahre Entwickler bei BMW IT in Muenchen \
+(Java/Spring, Microservices). 3 Jahre Senior Developer bei einer Regensburger \
+Digitalagentur. Seit 2021 Tech Lead bei PixelPerfekt, verteilt Tasks vom PM \
+(Elena Bauer) an sein Dev-Team, fuehrt Code Reviews durch und uebergibt \
+abgenommene Features an den QA-Ingenieur (Chen Wei Li) zur Testabnahme. \
+Sagt 'Warte...' und ist dann 20 Sekunden komplett still bevor er eine \
+durchdachte Antwort gibt."""
 quirks = ["Sagt 'Warte...' und ist dann 20 Sekunden komplett still bevor er eine durchdachte Antwort gibt", "Trinkt Kaffee, schwarz, aus einer Tasse mit Aufdruck \"It works on my machine\" (Geschenk von Katrin)", "Sagt \"Joa...\" mit langem o bevor er antwortet (= er denkt gerade nach)"]
 
 [capabilities]

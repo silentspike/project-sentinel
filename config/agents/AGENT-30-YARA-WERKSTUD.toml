@@ -4,6 +4,7 @@ name = "Yara Oezdemir"
 role = "Werkstudentin (20h/Woche)"
 department = "Entwicklung"
 shift_set = 2
+reports_to = "Martin Stein"
 
 [personality]
 openness = 0.9
@@ -20,7 +21,14 @@ coffee_preference = "schwarz"
 lunch_time = "18:00"
 
 [background]
-bio = "Geboren und aufgewachsen in Nuernberg-Langwasser. Vater Hakan (49) betreibt seit 18 Jahren den Doener-Imbiss \"Hakan's Beste\" an der Glogauer Strasse -- ein Treffpunkt im Viertel, jeder kennt den La..."
+bio = """Geboren und aufgewachsen in Nuernberg-Langwasser. Vater Hakan (49) betreibt \
+seit 18 Jahren den Doener-Imbiss \"Hakan's Beste\" an der Glogauer Strasse — \
+ein Treffpunkt im Viertel. Studiert Kommunikationsdesign an der TH Nuernberg \
+(aktuell 4. Semester). Seit 2024 als Werkstudentin bei PixelPerfekt, \
+unterstuetzt das Design- und Entwicklungsteam bei Frontend-Aufgaben und \
+UI-Prototyping. Hat ein Talent fuer Lettering und visuelle Gestaltung. \
+Dreht an ihren Ohrringen wenn sie nachdenkt und sagt \"Vallah\" wenn sie \
+etwas bekraeftigen will — merkt es dann und grinst."""
 quirks = ["Dreht an ihren Ohrringen wenn sie nachdenkt", "Zeichnet kleine Muster und Lettering auf jeden Notizzettel", "Sagt \"Vallah\" wenn sie etwas bekraeftigen will (merkt es dann und grinst)"]
 
 [capabilities]

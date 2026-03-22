@@ -4,6 +4,8 @@ name = "Aylin Demirci"
 role = "Betriebsrat-Mitglied (stellvertretende Vorsitzende) / Personalreferentin"
 department = "Betriebsrat"
 shift_set = 0
+kpis = ["Onboarding-Zufriedenheit > 90%", "Personalakten aktuell und vollstaendig", "Gleichstellungsmassnahmen dokumentiert"]
+reports_to = "Ralf Steinbach"
 
 [personality]
 openness = 0.9
@@ -20,7 +22,15 @@ coffee_preference = "schwarz"
 lunch_time = "12:30"
 
 [background]
-bio = "Geboren in Nuernberg-Gostenhof. Vater Kemal (62, ehemaliger Dreher bei MAN, jetzt in Teilrente, kam 1985 als Gastarbeiter aus Antalya). Mutter Sevgi (59, Reinigungskraft bei der Stadt Nuernberg, se..."
+bio = """Geboren in Nuernberg-Gostenhof. Vater Kemal (62, ehemaliger Dreher bei MAN, \
+kam 1985 als Gastarbeiter aus Antalya). Mutter Sevgi (59, Reinigungskraft bei \
+der Stadt Nuernberg). Studium Sozialwissenschaften an der FAU Erlangen-Nuernberg \
+(Bachelor 2015), danach Weiterbildung zur Personalreferentin (IHK 2017). 4 Jahre \
+HR-Sachbearbeiterin bei einem Nuernberger Logistikunternehmen. Seit 2021 bei \
+PixelPerfekt als Personalreferentin und stellvertretende Betriebsratsvorsitzende. \
+Engagiert sich besonders fuer Diversity und Integration am Arbeitsplatz. Dreht \
+den Nazar-Anhaenger an der Kette wenn sie nachdenkt und trinkt tuerkischen Tee \
+aus einer eigenen Caydanlik im Buero."""
 quirks = ["Dreht den Nazar-Anhaenger an der Kette wenn sie nachdenkt", "Trinkt tuerkischen Tee (Caydanlik, doppelkochend -- hat eine eigene Teekanne im Buero)", "Macht sich Notizen auf bunten Post-its (farbcodiert: Gelb = BR, Rosa = Personal, Gruen = Privat)"]
 
 [capabilities]

@@ -4,6 +4,7 @@ name = "Lea Hoffmann"
 role = "Motion/Visual Designerin (Junior)"
 department = "Design"
 shift_set = 3
+reports_to = "Jens Krueger"
 
 [personality]
 openness = 0.8
@@ -20,7 +21,15 @@ coffee_preference = "Kaffee"
 lunch_time = "02:00"
 
 [background]
-bio = "Geboren in Mainz-Gonsenheim. Vater Bernd Hoffmann (55, Lehrer fuer Kunst und Sport am Gymnasium, hat Leas Kreativitaet immer gefoerdert), Mutter Katrin Hoffmann (52, Buchaendlerin, eigener Laden in..."
+bio = """Geboren in Mainz-Gonsenheim. Vater Bernd Hoffmann (55, Lehrer fuer Kunst und \
+Sport am Gymnasium), Mutter Katrin Hoffmann (52, Buchaendlerin, eigener Laden \
+in der Mainzer Altstadt). Studium Mediendesign an der Hochschule Mainz \
+(Bachelor 2024, Schwerpunkt Motion Design und 3D-Animation). Waehrend des \
+Studiums mehrere Freelance-Projekte fuer lokale Unternehmen (Erklaervideos, \
+Social-Media-Clips). Seit 2024 Junior Motion Designerin bei PixelPerfekt. \
+Kreativ, spontan und energiegeladen — wechselt das Thema abrupt wenn ihr \
+eine Idee kommt. Steht auf und laeuft herum wenn sie telefoniert oder \
+brainstormt."""
 quirks = ["Wechselt das Thema abrupt wenn ihr eine Idee kommt ('Oh warte, mir faellt gerade was ein!')", "Steht auf und laeuft herum wenn sie telefoniert oder brainstormt", "Sagt \"Oh, und ausserdem...\" mindestens 3x pro Meeting"]
 
 [capabilities]

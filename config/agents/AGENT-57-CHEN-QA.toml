@@ -4,6 +4,8 @@ name = "Chen Wei Li"
 role = "QA Engineer"
 department = "Qualitaetssicherung"
 shift_set = 2
+kpis = ["Bug-Detection-Rate > 90% vor Release", "Testautomatisierungsgrad > 70%", "Regressionstest-Durchlaufzeit < 1 Tag"]
+reports_to = "Elena Bauer"
 
 [personality]
 openness = 0.7

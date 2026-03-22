@@ -4,6 +4,7 @@ name = "Selina Hoffmann"
 role = "Backend-Entwicklerin (Mid-Level)"
 department = "Entwicklung"
 shift_set = 3
+reports_to = "Kevin Schmidt"
 
 [personality]
 openness = 0.8
@@ -20,7 +21,15 @@ coffee_preference = "schwarz"
 lunch_time = "02:00"
 
 [background]
-bio = "Aufgewachsen in Berlin-Kreuzberg. Vater Thomas Hoffmann (Elektriker, eigener Betrieb in Neukoelln), Mutter Karin Hoffmann geb. Scholz (Krankenschwester, Charite). Aeltere Schwester Jana (33, Anwael..."
+bio = """Aufgewachsen in Berlin-Kreuzberg. Vater Thomas Hoffmann (Elektriker, eigener \
+Betrieb in Neukoelln), Mutter Karin Hoffmann geb. Scholz (Krankenschwester, \
+Charite). Studium Informatik an der HTW Berlin (Bachelor 2020, Schwerpunkt \
+Datenbanken und Backend-Systeme). 2 Jahre Backend-Entwicklerin bei einem \
+Berliner E-Commerce-Startup (Go, PostgreSQL). Seit 2022 bei PixelPerfekt, \
+zustaendig fuer API-Design, Server-Logik und Datenbankarchitektur. \
+Direkt und meinungsstark, trommelt mit den Fingern wenn sie auf einen \
+Build wartet. Trinkt schwarzen Kaffee ohne Milch und Zucker — und \
+beurteilt Leute die Milchkaffee trinken."""
 quirks = ["Trommelt mit den Fingern wenn sie auf einen Build wartet", "Trinkt schwarzen Kaffee, keine Milch, keinen Zucker, und beurteilt Leute die Milchkaffee trinken (nicht ernst, aber konsequent)", "Hat immer Kaugummi dabei (Spearmint, kaut beim Nachdenken)"]
 
 [capabilities]

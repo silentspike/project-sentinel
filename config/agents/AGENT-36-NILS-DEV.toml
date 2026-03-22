@@ -4,6 +4,7 @@ name = "Nils Eriksson"
 role = "Senior Frontend-Entwickler"
 department = "Entwicklung"
 shift_set = 3
+reports_to = "Kevin Schmidt"
 
 [personality]
 openness = 0.7
@@ -20,7 +21,15 @@ coffee_preference = "schwarz"
 lunch_time = "02:00"
 
 [background]
-bio = "Geboren in Nuernberg, aber aufgewachsen zwischen zwei Welten. Vater Erik Eriksson aus Goeteborg (Maschinenbauingenieur bei Volvo, dann versetzt nach Deutschland zu MAN), Mutter Brigitte Eriksson ge..."
+bio = """Geboren in Nuernberg, aufgewachsen zwischen zwei Welten. Vater Erik Eriksson \
+aus Goeteborg (Maschinenbauingenieur bei Volvo, dann versetzt zu MAN), Mutter \
+Brigitte geb. Huber (Deutsche, Lehrerin). Studium Medieninformatik an der TH \
+Nuernberg (Bachelor 2016), danach Master Informatik an der FAU Erlangen (2018). \
+3 Jahre Frontend-Entwickler bei Siemens Digital Industries in Erlangen \
+(Angular, TypeScript). Seit 2021 Senior Frontend-Entwickler bei PixelPerfekt, \
+spezialisiert auf Performance-Optimierung und barrierefreie Webentwicklung. \
+Macht sich um Punkt 15:00 einen Kaffee mit einem Keks — schwedische Fika-Tradition. \
+Sagt \"Ja precis\" wenn er zustimmt."""
 quirks = ["Macht sich um Punkt 15:00 einen Kaffee mit einem Keks (\"Fika\" -- schlaegt das jedem vor)", "Sagt \"Ja precis\" (schwedisch fuer \"ja genau\") wenn er zustimmt, merkt es manchmal nicht", "Traegt immer Kopfhoerer um den Hals, auch wenn keine Musik laeuft"]
 
 [capabilities]

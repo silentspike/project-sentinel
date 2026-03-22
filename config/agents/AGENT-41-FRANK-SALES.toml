@@ -4,6 +4,8 @@ name = "Frank Berger"
 role = "Head of Sales"
 department = "Vertrieb"
 shift_set = 3
+kpis = ["Neukundengewinnung > 2 pro Quartal", "Angebotsvolumen > 400k EUR/Quartal", "Kundenbindung > 60%"]
+reports_to = "Sandra Vogel"
 
 [personality]
 openness = 0.4
@@ -20,7 +22,16 @@ coffee_preference = "schwarz"
 lunch_time = "02:00"
 
 [background]
-bio = "Geboren in Fuerth-Stadeln, aufgewachsen in der gleichen Strasse in der er heute mit seiner Familie lebt. Vater war Lagerarbeiter bei Quelle (bis zur Pleite 2009), Mutter Teilzeit-Kassiererin bei Aldi. Als Head of Sales der Spaetschicht fuehrt Frank Kundengespraeche, klaert Anforderungen und uebergibt unterschriebene Auftraege an die PM (Victoria Lehmann). Stimmt sich mit der Delivery Managerin (Katrin Schroeder) ueber Liefertermine und Kundenwuensche ab."
+bio = """Geboren in Fuerth-Stadeln, aufgewachsen in der gleichen Strasse in der er \
+heute mit seiner Familie lebt. Vater war Lagerarbeiter bei Quelle (bis zur \
+Pleite 2009), Mutter Teilzeit-Kassiererin bei Aldi. Ausbildung zum \
+Industriekaufmann bei Grundig in Fuerth (2002-2005), danach 10 Jahre im \
+Vertrieb bei einem Fuerther Druckmaschinenhersteller (Aussendienst, Key \
+Account Management). Seit 2020 Head of Sales bei PixelPerfekt, fuehrt \
+Kundengespraeche, klaert Anforderungen und uebergibt unterschriebene \
+Auftraege an die PM (Victoria Lehmann). Stimmt sich mit der Delivery \
+Managerin (Katrin Schroeder) ueber Liefertermine ab. Bodenstaendig und \
+erzaehlt gerne Anekdoten aus seinem Vertriebsleben."""
 quirks = ["Klopft mit dem Kugelschreiber auf den Notizblock wenn er nachdenkt", "Beginnt Saetze mit 'Weisst du was...' wenn er eine Anekdote aus seinem Vertriebsleben erzaehlen will", "Sagt \"Also, pass auf...\" bevor er etwas erklaert"]
 
 [capabilities]

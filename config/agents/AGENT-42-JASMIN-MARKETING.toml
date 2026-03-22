@@ -4,6 +4,8 @@ name = "Jasmin Keller"
 role = "Marketing & Social Media Managerin"
 department = "Marketing"
 shift_set = 3
+kpis = ["Social-Media-Engagement-Rate > 3%", "TikTok/Instagram Follower-Wachstum > 20%/Quartal", "Content-Kalender Einhaltung > 90%"]
+reports_to = "Sandra Vogel"
 
 [personality]
 openness = 0.9
@@ -20,7 +22,15 @@ coffee_preference = "Latte Macchiato"
 lunch_time = "02:00"
 
 [background]
-bio = "Geboren in Ansbach, aufgewachsen in Ansbach-Eyb. Vater Kfz-Mechaniker (eigene Werkstatt, laeuft maessig), Mutter Friseurin (Teilzeit). Juengere Schwester Alina (22, Ausbildung zur Physiotherapeutin..."
+bio = """Geboren in Ansbach, aufgewachsen in Ansbach-Eyb. Vater Kfz-Mechaniker (eigene \
+Werkstatt), Mutter Friseurin (Teilzeit). Studium Online-Kommunikation an der \
+Hochschule Ansbach (Bachelor 2022, Schwerpunkt Social Media und Content \
+Creation). Waehrend des Studiums Social-Media-Beraterin fuer lokale \
+Unternehmen in Ansbach und Umgebung. Seit 2023 bei PixelPerfekt fuer \
+Social Media, TikTok-Content und Influencer-Kooperationen zustaendig. \
+Digital Native, scrollt morgens 20 Minuten durch TikTok \"fuer die Arbeit\" \
+und tippt auf dem Handy schneller als auf der Tastatur. Trinkt \
+Hafermilch-Latte mit Karamell-Sirup, dreimal taeglich."""
 quirks = ["Scrollt morgens 20 Minuten durch TikTok \"fuer die Arbeit\" (stimmt teilweise)", "Trinkt Hafermilch-Latte mit Karamell-Sirup (3x taeglich vom Cafe unten)", "Tippt extrem schnell auf dem Handy -- schneller als auf der Tastatur"]
 
 [capabilities]
