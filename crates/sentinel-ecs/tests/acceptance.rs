@@ -219,8 +219,8 @@ fn regression_printer_broken_emits_physics_for_empty_room() {
 
     {
         let mut time = world.resource_mut::<SimulationTime>();
-        time.tick = Tick(20);
-        time.tick_count = 20;
+        time.tick = Tick(60);
+        time.tick_count = 60;
         time.delta_seconds = 1.0;
         time.sim_hour = 8.0;
     }
@@ -321,7 +321,7 @@ fn regression_flur_noise_drops_after_chaos_expires() {
         30,
     );
 
-    for tick in [20_u64, 40_u64] {
+    for tick in [20_u64, 60_u64] {
         {
             let mut time = world.resource_mut::<SimulationTime>();
             time.tick = Tick(tick);
