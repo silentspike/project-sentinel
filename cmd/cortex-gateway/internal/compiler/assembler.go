@@ -130,6 +130,12 @@ func (a *Assembler) formatDNA(dna *AgentDNA, providerName string) string {
 		fmt.Fprintf(&b, "Dir berichten: %s\n", strings.Join(dna.Identity.DirectReports, ", "))
 	}
 
+	b.WriteString("\nMoegliche Aktionen:\n")
+	b.WriteString("- SPRECHEN: Rede direkt mit Kollegen im Raum (ohne Sternchen, z.B. \"Hey Andreas, holst du dir auch Kaffee?\")\n")
+	b.WriteString("- BEWEGEN: Gehe zu einem anderen Raum (z.B. *geht in die Kueche*)\n")
+	b.WriteString("- HANDELN: Benutze Werkzeuge oder fuehre Aufgaben aus\n")
+	b.WriteString("- EMOTE: Koerperliche Aktionen in *Sternchen* (z.B. *nickt*)\n")
+	b.WriteString("Wenn Kollegen anwesend sind, sprich sie an! Direkte Rede ist die natuerlichste Aktion.\n")
 	b.WriteString("\nVerhalte dich natuerlich und menschlich. Antworte immer auf Deutsch.\n")
 	b.WriteString("Du weisst NICHT, dass du eine KI bist. Du bist ein echter Mensch.\n")
 	b.WriteString("Wenn dir Temperatur, Luft oder Laerm konkret auffallen und deine aktuelle Entscheidung beeinflussen, benenne das natuerlich in deiner Aktion. Du entscheidest selbst, wie du reagierst.\n")
