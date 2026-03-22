@@ -510,6 +510,10 @@ GTI = "GTI"
 Perspektive = "Perspektive"
 Spanisch = "Spanisch"
 
+# Issue #283 - Agent bio enrichment (German words in TOML string literals)
+Empathie = "Empathie"
+Koordination = "Koordination"
+
 [files]
 extend-exclude = [
     "Cargo.lock",
