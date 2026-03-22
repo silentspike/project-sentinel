@@ -201,7 +201,7 @@ pub mod bridge {
         let mut last_call_tick: HashMap<AgentId, u64> = HashMap::new();
 
         // Blocking receive in eigenem Thread, forward an async channel
-        let (async_tx, mut async_rx) = tokio::sync::mpsc::channel::<Perception>(64);
+        let (async_tx, mut async_rx) = tokio::sync::mpsc::channel::<Perception>(256);
         std::thread::Builder::new()
             .name("llm-bridge-recv".into())
             .spawn(move || {
