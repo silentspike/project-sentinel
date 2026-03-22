@@ -1445,9 +1445,8 @@ pub fn output_system(
             timestamp: Timestamp(time.tick.0),
             tick: time.tick,
         };
-        // try_send: Non-blocking. Bei vollem Channel wird die Perception gedroppt
-        // (naechster Tick liefert frische Daten).
-        let _ = sender.0.try_send(msg);
+        // try_send: Non-blocking. Bei vollem Channel wird die Perception gedroppt.
+        let _ = sender.0.send(msg);
     }
 
     // Cleanup abgelaufene Chat-Messages
