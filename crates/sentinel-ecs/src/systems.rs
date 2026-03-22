@@ -30,6 +30,13 @@ use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{debug, warn};
 
+/// Bio-State Event Sampling-Intervall (Ticks). Simulation rechnet jeden Tick, Events nur alle N.
+const BIO_SAMPLE_INTERVAL: u64 = 60;
+/// Room-Physics Event Sampling-Intervall (Ticks).
+const PHYSICS_SAMPLE_INTERVAL: u64 = 60;
+/// Auto-Coffee Trigger-Intervall (Ticks). Auch von smell_system() referenziert.
+const AUTO_COFFEE_INTERVAL: u64 = 600;
+
 /// Ausfuehrungsreihenfolge der Simulation-Systems
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SimulationPhase {
@@ -422,7 +429,7 @@ pub fn bio_system(
             && bio.caffeine_mg < 10.0
             && (8.0..16.0).contains(&time.sim_hour)
             && tick > 0
-            && tick.is_multiple_of(180)
+            && tick.is_multiple_of(AUTO_COFFEE_INTERVAL)
         {
             sentinel_bio::drink_coffee(&mut bio);
             let correlation_id = uuid::Uuid::new_v4().to_string();
@@ -459,8 +466,8 @@ pub fn bio_system(
             }
         }
 
-        // Periodischer Bio-State Snapshot alle 20 Ticks (~20 Sekunden bei 1Hz)
-        if tick.is_multiple_of(20) {
+        // Periodischer Bio-State Snapshot (Simulation rechnet jeden Tick, Events nur alle N)
+        if tick.is_multiple_of(BIO_SAMPLE_INTERVAL) {
             let payload = DomainEventPayload::BioStateUpdated {
                 agent_id: identity.agent_id,
                 hunger: bio.hunger,
@@ -618,7 +625,7 @@ pub fn physics_system(
 
         // Alle 20 Ticks Physics-Snapshot als Event emittieren
         // Bei aktivem Chaos/Stimulus: jeden Tick emittieren (Echtzeit-Feedback)
-        if tick > 0 && (tick.is_multiple_of(20) || has_active_stimulus || has_active_chaos) {
+        if tick > 0 && (tick.is_multiple_of(PHYSICS_SAMPLE_INTERVAL) || has_active_stimulus || has_active_chaos) {
             let payload = DomainEventPayload::RoomPhysicsUpdated {
                 room_id: room_id.to_string(),
                 temperature,
@@ -1486,7 +1493,7 @@ pub fn smell_system(
     active_smells.cleanup(tick);
 
     // Kaffee-Geruch erzeugen wenn Auto-Coffee getriggert hat (gleicher Tick-Modulo wie bio_system)
-    if tick == 0 || !tick.is_multiple_of(180) {
+    if tick == 0 || !tick.is_multiple_of(AUTO_COFFEE_INTERVAL) {
         return;
     }
 
