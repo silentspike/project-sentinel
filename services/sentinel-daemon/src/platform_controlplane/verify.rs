@@ -37,6 +37,19 @@ pub fn verify_last_actions(
                 // Agent nicht mehr in stalled_agents
                 !current_metrics.stalled_agents.contains(&action.target)
             }
+            "write_anomaly" => {
+                // Pruefe ob der spezifische Agent noch anomale Write-Rate hat
+                current_metrics
+                    .agent_write_rates
+                    .iter()
+                    .find(|(name, _)| *name == action.target)
+                    .map(|(_, rate)| *rate <= config.write_anomaly_threshold_bytes_per_sec as f64)
+                    .unwrap_or(true) // Agent nicht mehr da = resolved
+            }
+            "service_health" => {
+                // Service laeuft wieder
+                !current_metrics.failed_services.contains(&action.target)
+            }
             _ => true, // Unbekannte Regeln gelten als resolved
         };
         results.insert(key, resolved);
@@ -95,5 +108,73 @@ mod tests {
         };
         let results = verify_last_actions(&actions, &metrics, &test_config());
         assert_eq!(results.get("event_store_size:system"), Some(&false));
+    }
+
+    #[test]
+    fn test_verify_write_anomaly_resolved() {
+        let actions = vec![PlatformAction {
+            rule_name: "write_anomaly".to_string(),
+            target: "Test Agent".to_string(),
+            action_label: "alert".to_string(),
+            description: String::new(),
+            side_effect: None,
+        }];
+        let metrics = PlatformMetrics {
+            agent_write_rates: vec![("Test Agent".to_string(), 1_000_000.0)], // 1 MB/s < 5 MB/s
+            ..Default::default()
+        };
+        let results = verify_last_actions(&actions, &metrics, &test_config());
+        assert_eq!(results.get("write_anomaly:Test Agent"), Some(&true));
+    }
+
+    #[test]
+    fn test_verify_write_anomaly_unresolved() {
+        let actions = vec![PlatformAction {
+            rule_name: "write_anomaly".to_string(),
+            target: "Test Agent".to_string(),
+            action_label: "alert".to_string(),
+            description: String::new(),
+            side_effect: None,
+        }];
+        let metrics = PlatformMetrics {
+            agent_write_rates: vec![("Test Agent".to_string(), 10_000_000.0)], // 10 MB/s > 5 MB/s
+            ..Default::default()
+        };
+        let results = verify_last_actions(&actions, &metrics, &test_config());
+        assert_eq!(results.get("write_anomaly:Test Agent"), Some(&false));
+    }
+
+    #[test]
+    fn test_verify_service_health_resolved() {
+        let actions = vec![PlatformAction {
+            rule_name: "service_health".to_string(),
+            target: "sentinel-judge".to_string(),
+            action_label: "alert".to_string(),
+            description: String::new(),
+            side_effect: None,
+        }];
+        let metrics = PlatformMetrics {
+            failed_services: vec![], // Keine failed services → resolved
+            ..Default::default()
+        };
+        let results = verify_last_actions(&actions, &metrics, &test_config());
+        assert_eq!(results.get("service_health:sentinel-judge"), Some(&true));
+    }
+
+    #[test]
+    fn test_verify_service_health_unresolved() {
+        let actions = vec![PlatformAction {
+            rule_name: "service_health".to_string(),
+            target: "sentinel-judge".to_string(),
+            action_label: "alert".to_string(),
+            description: String::new(),
+            side_effect: None,
+        }];
+        let metrics = PlatformMetrics {
+            failed_services: vec!["sentinel-judge".to_string()],
+            ..Default::default()
+        };
+        let results = verify_last_actions(&actions, &metrics, &test_config());
+        assert_eq!(results.get("service_health:sentinel-judge"), Some(&false));
     }
 }
