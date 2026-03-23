@@ -21,9 +21,10 @@ pub use world::{
     apply_capabilities, apply_personality, attach_redb_store, create_simulation_world,
     despawn_agent_from_world, restore_ecs_state, snapshot_ecs_state, spawn_agent, ActionReceiver,
     ActiveAgentsThisTick, ActiveChaos, ActiveChaosEvent, ActiveRoomStimuli, ActiveSmell,
-    ActiveSmells, EventBuffer, LimboEventStore, OperatorCommandReceiver, PerceptionSender,
-    PersistTelemetry, PsiMetrics, RedbStateStore, RoomChatBuffer, RoomDistanceMap,
-    RoomPhysicsSnapshot, RoomPhysicsState, SimulationTime, ToolRuntimeResource, ZenohFanoutSender,
+    ActiveSmells, BroadcastBuffer, EventBuffer, GaiaBuffer, LimboEventStore,
+    OperatorCommandReceiver, PerceptionSender, PersistTelemetry, PsiMetrics, RedbStateStore,
+    RoomChatBuffer, RoomDistanceMap, RoomPhysicsSnapshot, RoomPhysicsState, SimulationTime,
+    ToolRuntimeResource, ZenohFanoutSender,
 };
 
 #[cfg(test)]
@@ -498,8 +499,8 @@ mod tests {
         let (mut world, mut schedule) = create_simulation_world();
         spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
 
-        // Perception Channel (bound=64)
-        let (tx, rx) = std::sync::mpsc::channel();
+        // Perception Channel (bound=128)
+        let (tx, rx) = std::sync::mpsc::sync_channel(128);
         world.insert_resource(PerceptionSender(tx));
 
         // Einen Tick ausfuehren
@@ -576,7 +577,7 @@ mod tests {
             20,
         );
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(128);
         world.insert_resource(PerceptionSender(tx));
 
         {

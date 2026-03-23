@@ -338,6 +338,7 @@ pub fn input_system(
 }
 
 /// 1b. Empfaengt Operator-Kommandos und injiziert manuelles Chaos.
+#[allow(clippy::too_many_arguments)]
 pub fn operator_command_system(
     receiver: Option<Res<OperatorCommandReceiver>>,
     time: Res<SimulationTime>,
@@ -345,6 +346,10 @@ pub fn operator_command_system(
     mut active_chaos: ResMut<ActiveChaos>,
     mut active_room_stimuli: ResMut<ActiveRoomStimuli>,
     mut agents: Query<(&Position, &mut WorkContext)>,
+    mut room_chat_buffer: ResMut<super::world::RoomChatBuffer>,
+    mut gaia_buffer: ResMut<super::world::GaiaBuffer>,
+    mut broadcast_buffer: ResMut<super::world::BroadcastBuffer>,
+    all_agents_query: Query<&AgentIdentity>,
 ) {
     let Some(receiver) = receiver else { return };
     let Ok(rx) = receiver.0.lock() else { return };
@@ -393,6 +398,35 @@ pub fn operator_command_system(
                     &mut active_room_stimuli,
                     Some(metadata),
                 );
+            }
+            OperatorCommand::Chat(cmd) => {
+                let all_names: Vec<String> =
+                    all_agents_query.iter().map(|id| id.name.clone()).collect();
+                room_chat_buffer.add(
+                    &cmd.room_id,
+                    cmd.sender_name.clone(),
+                    cmd.message.clone(),
+                    time.tick.0,
+                    &all_names,
+                );
+                tracing::info!(room = %cmd.room_id, sender = %cmd.sender_name,
+                    "Operator-Chat in RoomChatBuffer eingefuegt");
+            }
+            OperatorCommand::Gaia(cmd) => {
+                gaia_buffer.add(
+                    sentinel_common::AgentId(cmd.target_agent_id),
+                    cmd.thought.clone(),
+                    time.tick.0,
+                );
+                tracing::info!(
+                    agent_id = cmd.target_agent_id,
+                    "Voice of Gaia: Gedanke eingepflanzt"
+                );
+            }
+            OperatorCommand::Broadcast(cmd) => {
+                broadcast_buffer.add(cmd.message.clone(), cmd.broadcast_type.clone(), time.tick.0);
+                tracing::info!(broadcast_type = %cmd.broadcast_type,
+                    "Broadcast: Durchsage gesendet");
             }
             OperatorCommand::Nightrun(_)
             | OperatorCommand::Snapshot(_)
@@ -1432,10 +1466,14 @@ pub fn output_system(
                 (String::new(), false)
             };
 
-        // Nur Perceptions mit Inhalt senden — leere Perceptions verstopfen den Channel
-        // und verhindern dass heard_text-Perceptions rechtzeitig bei der Bridge ankommen.
-        let has_content =
-            !impulse_text.is_empty() || !body_text.is_empty() || !heard_text.is_empty();
+        // Perceptions senden wenn Inhalt vorhanden ODER als Heartbeat (alle 5 Ticks).
+        // Heartbeat = Bridge Rate-Limit interval → kein Channel-Backlog, aber idle Agents
+        // bekommen periodisch LLM-Calls (sonst frieren sie ein: AC-11).
+        let is_heartbeat = time.tick.0 > 0 && time.tick.0.is_multiple_of(5);
+        let has_content = !impulse_text.is_empty()
+            || !body_text.is_empty()
+            || !heard_text.is_empty()
+            || is_heartbeat;
         if has_content {
             let msg = Perception {
                 agent_id: identity.agent_id,
@@ -1450,7 +1488,9 @@ pub fn output_system(
                 timestamp: Timestamp(time.tick.0),
                 tick: time.tick,
             };
-            let _ = sender.0.send(msg);
+            if sender.0.try_send(msg).is_err() {
+                tracing::warn!(agent = %identity.name, "Perception gedroppt (Channel voll)");
+            }
         }
     }
 

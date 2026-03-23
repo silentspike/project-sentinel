@@ -7,7 +7,7 @@
 //! Arbeitskontext, Stimmung und Chaos-Events. Max 5 Events pro Injection.
 
 use super::components::*;
-use super::world::{EventBuffer, RoomChatBuffer, SimulationTime};
+use super::world::{BroadcastBuffer, EventBuffer, GaiaBuffer, RoomChatBuffer, SimulationTime};
 use bevy_ecs::prelude::*;
 use sentinel_common::Emotion;
 
@@ -37,6 +37,8 @@ pub fn decision_system(
     time: Res<SimulationTime>,
     event_buffer: Res<EventBuffer>,
     chat_buffer: Res<RoomChatBuffer>,
+    gaia_buffer: Res<GaiaBuffer>,
+    broadcast_buffer: Res<BroadcastBuffer>,
 ) {
     let current_tick = time.tick.0;
 
@@ -79,7 +81,13 @@ pub fn decision_system(
             );
         }
 
-        // 5. Sortieren nach Priority (P0 zuerst), auf MAX_EVENTS beschraenken
+        // 5. Voice of Gaia (raum-unabhaengig)
+        generate_gaia_events(identity.agent_id, &gaia_buffer, &mut queue, current_tick);
+
+        // 6. Broadcast (alle Agents)
+        generate_broadcast_events(&broadcast_buffer, &mut queue, current_tick);
+
+        // 7. Sortieren nach Priority (P0 zuerst), auf MAX_EVENTS beschraenken
         queue.events.sort_by_key(|e| e.priority);
         queue.events.truncate(MAX_EVENTS);
     }
@@ -125,6 +133,47 @@ fn generate_chat_events(
                 priority,
                 text,
                 ttl_ticks: ttl,
+                created_tick: msg.tick,
+            },
+        );
+    }
+}
+
+/// Gaia-Events: Raum-unabhaengige Gedanken-Injection. P2, max 1/Tick.
+fn generate_gaia_events(
+    agent_id: sentinel_common::AgentId,
+    gaia_buffer: &GaiaBuffer,
+    queue: &mut EventQueue,
+    tick: u64,
+) {
+    let thoughts = gaia_buffer.get_active(&agent_id, tick);
+    for thought in thoughts.iter().take(1) {
+        push_event(
+            queue,
+            PendingEvent {
+                priority: Priority::P2,
+                text: format!("Dir faellt ein: {}", thought.content),
+                ttl_ticks: 60,
+                created_tick: thought.tick,
+            },
+        );
+    }
+}
+
+/// Broadcast-Events: System-weite Durchsagen. P2, max 1/Tick.
+fn generate_broadcast_events(
+    broadcast_buffer: &BroadcastBuffer,
+    queue: &mut EventQueue,
+    tick: u64,
+) {
+    let messages = broadcast_buffer.get_active(tick);
+    for msg in messages.iter().take(1) {
+        push_event(
+            queue,
+            PendingEvent {
+                priority: Priority::P2,
+                text: format!("Durchsage: {}", msg.content),
+                ttl_ticks: 30,
                 created_tick: msg.tick,
             },
         );

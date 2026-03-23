@@ -214,6 +214,32 @@ pub enum OperatorCommand {
     Nightrun(OperatorNightrunCommand),
     Snapshot(OperatorSnapshotCommand),
     Restore(OperatorRestoreCommand),
+    Chat(OperatorChatCommand),
+    Gaia(OperatorGaiaCommand),
+    Broadcast(OperatorBroadcastCommand),
+}
+
+/// Besucher-Chat: Operator redet mit Agents im selben Raum (asynchron via RoomChatBuffer).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorChatCommand {
+    pub room_id: String,
+    pub message: String,
+    pub sender_name: String,
+}
+
+/// Voice of Gaia: Raum-unabhaengige Gedanken-Injection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorGaiaCommand {
+    pub target_agent_id: u16,
+    pub thought: String,
+}
+
+/// Broadcast: System-weite Durchsage an alle Agents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorBroadcastCommand {
+    pub message: String,
+    #[serde(rename = "type", default)]
+    pub broadcast_type: String,
 }
 
 // ──────────────────────────────────────────────
