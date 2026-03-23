@@ -1432,21 +1432,26 @@ pub fn output_system(
                 (String::new(), false)
             };
 
-        let msg = Perception {
-            agent_id: identity.agent_id,
-            circadian_text: prompt_perception.circadian_text,
-            body_text,
-            environment_text,
-            acoustic_text: prompt_perception.acoustic_text,
-            heard_text,
-            presence_text,
-            impulse_text,
-            is_directly_addressed,
-            timestamp: Timestamp(time.tick.0),
-            tick: time.tick,
-        };
-        // try_send: Non-blocking. Bei vollem Channel wird die Perception gedroppt.
-        let _ = sender.0.send(msg);
+        // Nur Perceptions mit Inhalt senden — leere Perceptions verstopfen den Channel
+        // und verhindern dass heard_text-Perceptions rechtzeitig bei der Bridge ankommen.
+        let has_content =
+            !impulse_text.is_empty() || !body_text.is_empty() || !heard_text.is_empty();
+        if has_content {
+            let msg = Perception {
+                agent_id: identity.agent_id,
+                circadian_text: prompt_perception.circadian_text,
+                body_text,
+                environment_text,
+                acoustic_text: prompt_perception.acoustic_text,
+                heard_text,
+                presence_text,
+                impulse_text,
+                is_directly_addressed,
+                timestamp: Timestamp(time.tick.0),
+                tick: time.tick,
+            };
+            let _ = sender.0.send(msg);
+        }
     }
 
     // Cleanup abgelaufene Chat-Messages
