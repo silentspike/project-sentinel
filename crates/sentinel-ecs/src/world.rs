@@ -423,8 +423,8 @@ pub struct RoomChatEntry {
     pub addressed_agents: Vec<String>,
 }
 
-const CHAT_TTL_TICKS: u64 = 120;
-const MAX_CHAT_RESPONSES_PER_WINDOW: u32 = 2;
+const CHAT_TTL_TICKS: u64 = 600;
+const MAX_CHAT_RESPONSES_PER_WINDOW: u32 = 10;
 const CHAT_RESPONSE_WINDOW_TICKS: u64 = 120;
 const MAX_CONTENT_LEN: usize = 500;
 
@@ -560,7 +560,7 @@ pub struct GaiaThought {
     pub ttl_ticks: u64,
 }
 
-const GAIA_TTL_TICKS: u64 = 60;
+const GAIA_TTL_TICKS: u64 = 300;
 
 impl GaiaBuffer {
     pub fn add(&mut self, agent_id: AgentId, content: String, tick: u64) {
