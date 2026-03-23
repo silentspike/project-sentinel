@@ -544,6 +544,98 @@ impl RoomChatBuffer {
     }
 }
 
+/// Voice of Gaia: Raum-unabhaengige Gedanken-Injection.
+///
+/// Operator pflanzt einem Agent einen "Gedanken" ein. Agent merkt NICHT woher.
+/// In Perception als "INNERER IMPULS: Dir faellt ein: ...".
+#[derive(Resource, Default, Debug, Clone)]
+pub struct GaiaBuffer {
+    thoughts: std::collections::HashMap<AgentId, Vec<GaiaThought>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GaiaThought {
+    pub content: String,
+    pub tick: u64,
+    pub ttl_ticks: u64,
+}
+
+const GAIA_TTL_TICKS: u64 = 60;
+
+impl GaiaBuffer {
+    pub fn add(&mut self, agent_id: AgentId, content: String, tick: u64) {
+        self.thoughts
+            .entry(agent_id)
+            .or_default()
+            .push(GaiaThought {
+                content,
+                tick,
+                ttl_ticks: GAIA_TTL_TICKS,
+            });
+    }
+
+    pub fn get_active(&self, agent_id: &AgentId, current_tick: u64) -> Vec<&GaiaThought> {
+        self.thoughts
+            .get(agent_id)
+            .map(|thoughts| {
+                thoughts
+                    .iter()
+                    .filter(|t| current_tick < t.tick + t.ttl_ticks)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn cleanup(&mut self, current_tick: u64) {
+        self.thoughts.retain(|_, thoughts| {
+            thoughts.retain(|t| current_tick < t.tick + t.ttl_ticks);
+            !thoughts.is_empty()
+        });
+    }
+}
+
+/// Broadcast: System-weite Durchsagen an alle Agents.
+///
+/// "Achtung: Feueralarm-Uebung in 5 Minuten."
+/// In Perception als "DURCHSAGE: ...".
+#[derive(Resource, Default, Debug, Clone)]
+pub struct BroadcastBuffer {
+    messages: Vec<BroadcastMessage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BroadcastMessage {
+    pub content: String,
+    pub broadcast_type: String,
+    pub tick: u64,
+    pub ttl_ticks: u64,
+}
+
+const BROADCAST_TTL_TICKS: u64 = 300;
+
+impl BroadcastBuffer {
+    pub fn add(&mut self, content: String, broadcast_type: String, tick: u64) {
+        self.messages.push(BroadcastMessage {
+            content,
+            broadcast_type,
+            tick,
+            ttl_ticks: BROADCAST_TTL_TICKS,
+        });
+    }
+
+    pub fn get_active(&self, current_tick: u64) -> Vec<&BroadcastMessage> {
+        self.messages
+            .iter()
+            .filter(|m| current_tick < m.tick + m.ttl_ticks)
+            .collect()
+    }
+
+    pub fn cleanup(&mut self, current_tick: u64) {
+        self.messages
+            .retain(|m| current_tick < m.tick + m.ttl_ticks);
+    }
+}
+
 /// Empfaengt Operator-Kommandos fuer manuelles Chaos aus dem Daemon.
 #[derive(Resource)]
 pub struct OperatorCommandReceiver(
@@ -552,7 +644,7 @@ pub struct OperatorCommandReceiver(
 
 /// Sendet Perceptions an den externen Zenoh-Publisher (oder Test-Code).
 #[derive(Resource)]
-pub struct PerceptionSender(pub std::sync::mpsc::Sender<Perception>);
+pub struct PerceptionSender(pub std::sync::mpsc::SyncSender<Perception>);
 
 /// Sammelt DomainEvents waehrend eines Ticks. persist_system flusht am Ende.
 #[derive(Resource, Default)]
@@ -666,6 +758,8 @@ pub fn create_simulation_world() -> (World, Schedule) {
     world.insert_resource(RoomPhysicsState::default());
     world.insert_resource(ActiveAgentsThisTick::default());
     world.insert_resource(RoomChatBuffer::default());
+    world.insert_resource(GaiaBuffer::default());
+    world.insert_resource(BroadcastBuffer::default());
 
     // System-Reihenfolge via configure_sets (10 Phasen)
     schedule.configure_sets(

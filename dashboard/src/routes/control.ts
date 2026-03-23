@@ -356,6 +356,25 @@ controlRoutes.get("/control/status", async (c) => {
   }
 });
 
+// ── Operator-API Reverse-Proxy ──────────────────────────
+// Proxied /api/operator/* an den Daemon Operator-API Port.
+// Besucher-Chat, Voice of Gaia, Broadcast.
+
+controlRoutes.post("/operator/chat", async (c) => {
+  const body = await c.req.json();
+  return proxyJson(getOperatorApiUrl(), "POST", "/operator/chat", body, getOperatorHeaders());
+});
+
+controlRoutes.post("/operator/gaia", async (c) => {
+  const body = await c.req.json();
+  return proxyJson(getOperatorApiUrl(), "POST", "/operator/gaia", body, getOperatorHeaders());
+});
+
+controlRoutes.post("/operator/broadcast", async (c) => {
+  const body = await c.req.json();
+  return proxyJson(getOperatorApiUrl(), "POST", "/operator/broadcast", body, getOperatorHeaders());
+});
+
 // Export for testing
 export {
   savedRateLimit,

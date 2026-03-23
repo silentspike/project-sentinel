@@ -214,141 +214,156 @@ pub mod bridge {
             })
             .expect("LLM Bridge Receiver Thread spawnen");
 
-        while let Some(perception) = async_rx.recv().await {
-            let agent_id = perception.agent_id;
-            let current_tick = perception.tick.0;
+        while let Some(first) = async_rx.recv().await {
+            // Drain: Alle sofort verfuegbaren Perceptions lesen.
+            // Pro Agent: neueste behalten, heard_text bevorzugen.
+            let mut batch: HashMap<AgentId, Perception> = HashMap::new();
+            insert_prefer_heard(&mut batch, first);
+            while let Ok(p) = async_rx.try_recv() {
+                insert_prefer_heard(&mut batch, p);
+            }
 
-            // P1 Chat (direkt angesprochen) umgeht Rate-Limit
-            let is_urgent_chat = perception.is_directly_addressed;
+            // Batch verarbeiten — jede Perception durch Rate-Limit/Filter/Call
+            for perception in batch.into_values() {
+                let agent_id = perception.agent_id;
+                let current_tick = perception.tick.0;
 
-            // Rate Limiting pro Agent (P1 Chat bypass)
-            if !is_urgent_chat {
-                if let Some(&last_tick) = last_call_tick.get(&agent_id) {
-                    if current_tick.saturating_sub(last_tick) < config.min_ticks_between_calls {
-                        telemetry
-                            .calls_skipped_rate_limit
-                            .fetch_add(1, Ordering::Relaxed);
-                        continue;
+                // heard_text oder direkt angesprochen → Rate-Limit bypass
+                let has_heard = !perception.heard_text.is_empty();
+                let is_urgent = perception.is_directly_addressed || has_heard;
+
+                // Rate Limiting pro Agent (urgent bypass)
+                if !is_urgent {
+                    if let Some(&last_tick) = last_call_tick.get(&agent_id) {
+                        if current_tick.saturating_sub(last_tick) < config.min_ticks_between_calls {
+                            telemetry
+                                .calls_skipped_rate_limit
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                     }
                 }
-            }
 
-            // Circuit Breaker
-            if circuit_breaker.is_open() {
-                telemetry
-                    .calls_skipped_circuit_open
-                    .fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    agent = %agent_id,
-                    "LLM Call uebersprungen: Circuit Breaker offen"
-                );
-                continue;
-            }
-
-            // Nur Calls mit nicht-leerem Inhalt (impulse, body ODER heard)
-            if perception.impulse_text.is_empty()
-                && perception.body_text.is_empty()
-                && perception.heard_text.is_empty()
-            {
-                continue;
-            }
-
-            last_call_tick.insert(agent_id, current_tick);
-
-            // Semaphore fuer Concurrency Limiting
-            let permit = match semaphore.clone().try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    debug!(agent = %agent_id, "LLM Call uebersprungen: max concurrent erreicht");
+                // Circuit Breaker
+                if circuit_breaker.is_open() {
+                    telemetry
+                        .calls_skipped_circuit_open
+                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-            };
 
-            let client = client.clone();
-            let url = format!("{}/v1/chat/completions", config.gateway_url);
-            let action_tx = action_tx.clone();
-            let telemetry = Arc::clone(&telemetry);
+                // Nur Calls mit nicht-leerem Inhalt
+                if perception.impulse_text.is_empty()
+                    && perception.body_text.is_empty()
+                    && perception.heard_text.is_empty()
+                {
+                    continue;
+                }
 
-            // Gateway Request bauen (mit Evolution-Daten aus redb)
-            let request = build_gateway_request(&perception, &state_store);
+                last_call_tick.insert(agent_id, current_tick);
 
-            telemetry.calls_total.fetch_add(1, Ordering::Relaxed);
+                info!(agent = %agent_id,
+                    priority = if perception.is_directly_addressed { "P1" } else { "normal" },
+                    has_heard = !perception.heard_text.is_empty(),
+                    "LLM call triggered");
 
-            // Async HTTP Call
-            let call_start = Instant::now();
-            match client.post(&url).json(&request).send().await {
-                Ok(response) => {
-                    let status = response.status();
-                    if status.is_success() {
-                        match response.json::<GatewayResponse>().await {
-                            Ok(gateway_resp) => {
-                                let latency_ms = call_start.elapsed().as_millis();
-                                telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
-                                telemetry
-                                    .tokens_total
-                                    .fetch_add(gateway_resp.tokens_used as u64, Ordering::Relaxed);
-                                circuit_breaker.record_success();
+                // Semaphore fuer Concurrency Limiting
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        debug!(agent = %agent_id, "LLM Call uebersprungen: max concurrent erreicht");
+                        continue;
+                    }
+                };
 
-                                debug!(
-                                    agent = %agent_id,
-                                    request_id = %gateway_resp.request_id,
-                                    tokens = gateway_resp.tokens_used,
-                                    actions = gateway_resp.actions.len(),
-                                    content_len = gateway_resp.content.len(),
-                                    latency_ms = latency_ms,
-                                    "LLM Response erhalten"
-                                );
+                let client = client.clone();
+                let url = format!("{}/v1/chat/completions", config.gateway_url);
+                let action_tx = action_tx.clone();
+                let telemetry = Arc::clone(&telemetry);
+                let request = build_gateway_request(&perception, &state_store);
 
-                                // Actions in AgentActions umwandeln und senden
-                                for extracted in &gateway_resp.actions {
-                                    if let Some(agent_action) =
-                                        map_extracted_to_action(agent_id, extracted, current_tick)
-                                    {
-                                        if action_tx.send(agent_action).is_err() {
-                                            debug!("Action Channel geschlossen, Bridge beendet");
-                                            drop(permit);
-                                            return;
+                telemetry.calls_total.fetch_add(1, Ordering::Relaxed);
+
+                // Async HTTP Call
+                let call_start = Instant::now();
+                match client.post(&url).json(&request).send().await {
+                    Ok(response) => {
+                        let status = response.status();
+                        if status.is_success() {
+                            match response.json::<GatewayResponse>().await {
+                                Ok(gateway_resp) => {
+                                    let latency_ms = call_start.elapsed().as_millis();
+                                    telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
+                                    telemetry.tokens_total.fetch_add(
+                                        gateway_resp.tokens_used as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                    circuit_breaker.record_success();
+
+                                    debug!(
+                                        agent = %agent_id,
+                                        request_id = %gateway_resp.request_id,
+                                        tokens = gateway_resp.tokens_used,
+                                        actions = gateway_resp.actions.len(),
+                                        content_len = gateway_resp.content.len(),
+                                        latency_ms = latency_ms,
+                                        "LLM Response erhalten"
+                                    );
+
+                                    for extracted in &gateway_resp.actions {
+                                        if let Some(agent_action) = map_extracted_to_action(
+                                            agent_id,
+                                            extracted,
+                                            current_tick,
+                                        ) {
+                                            if action_tx.send(agent_action).is_err() {
+                                                debug!(
+                                                    "Action Channel geschlossen, Bridge beendet"
+                                                );
+                                                drop(permit);
+                                                return;
+                                            }
                                         }
                                     }
                                 }
+                                Err(e) => {
+                                    warn!(agent = %agent_id, error = %e, "Gateway Response Parse-Fehler");
+                                    telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
+                                    circuit_breaker.record_failure();
+                                }
                             }
-                            Err(e) => {
-                                warn!(
-                                    agent = %agent_id,
-                                    error = %e,
-                                    "Gateway Response Parse-Fehler"
-                                );
-                                telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
-                                circuit_breaker.record_failure();
-                            }
+                        } else {
+                            warn!(agent = %agent_id, status = status.as_u16(), "Gateway HTTP Fehler");
+                            telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
+                            circuit_breaker.record_failure();
                         }
-                    } else {
-                        warn!(
-                            agent = %agent_id,
-                            status = status.as_u16(),
-                            "Gateway HTTP Fehler"
-                        );
+                    }
+                    Err(e) => {
+                        let is_timeout = e.is_timeout();
+                        warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, "Gateway Request fehlgeschlagen");
                         telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                         circuit_breaker.record_failure();
                     }
                 }
-                Err(e) => {
-                    let is_timeout = e.is_timeout();
-                    warn!(
-                        agent = %agent_id,
-                        error = %e,
-                        is_timeout = is_timeout,
-                        "Gateway Request fehlgeschlagen"
-                    );
-                    telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
-                    circuit_breaker.record_failure();
-                }
-            }
 
-            drop(permit);
+                drop(permit);
+            }
         }
 
         info!("LLM Bridge beendet");
+    }
+
+    /// Fuegt Perception in Batch ein. Bevorzugt Versionen MIT heard_text.
+    fn insert_prefer_heard(batch: &mut HashMap<AgentId, Perception>, p: Perception) {
+        batch
+            .entry(p.agent_id)
+            .and_modify(|existing| {
+                // Behalte Version MIT heard_text, sonst neueste
+                if !p.heard_text.is_empty() || existing.heard_text.is_empty() {
+                    *existing = p.clone();
+                }
+            })
+            .or_insert(p);
     }
 
     /// Baut den Gateway-Request aus einer Perception + Evolution-Daten aus redb.

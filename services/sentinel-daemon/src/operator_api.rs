@@ -15,8 +15,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 use sentinel_common::{
-    EventType, OperatorChaosCommand, OperatorCommand, OperatorNightrunCommand,
-    OperatorRoomStimulusCommand, RoomStimulusType,
+    EventType, OperatorBroadcastCommand, OperatorChaosCommand, OperatorChatCommand,
+    OperatorCommand, OperatorGaiaCommand, OperatorNightrunCommand, OperatorRoomStimulusCommand,
+    RoomStimulusType,
 };
 
 use crate::config::OperatorApiConfig;
@@ -28,6 +29,9 @@ const OPERATOR_SNAPSHOTS_PATH: &str = "/operator/snapshots";
 const OPERATOR_SNAPSHOT_PATH: &str = "/operator/snapshot";
 const OPERATOR_RESTORE_PATH: &str = "/operator/restore";
 const OPERATOR_PRUNE_PATH: &str = "/operator/prune";
+const OPERATOR_CHAT_PATH: &str = "/operator/chat";
+const OPERATOR_GAIA_PATH: &str = "/operator/gaia";
+const OPERATOR_BROADCAST_PATH: &str = "/operator/broadcast";
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024;
 const OPERATOR_KEY_HEADER: &str = "x-sentinel-operator-key";
@@ -337,6 +341,66 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 ),
                 Err(_) => {
                     ApiError::ServiceUnavailable("Prune-Channel nicht verfuegbar").to_response()
+                }
+            }
+        }
+        OPERATOR_CHAT_PATH => {
+            let cmd: OperatorChatCommand = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest(
+                        "JSON ungueltig (room_id, message, sender_name noetig)",
+                    )
+                    .to_response();
+                }
+            };
+            info!(room = %cmd.room_id, sender = %cmd.sender_name, "Operator-Chat empfangen");
+            match state.command_tx.send(OperatorCommand::Chat(cmd)) {
+                Ok(()) => json_response(
+                    202,
+                    serde_json::json!({"accepted": true, "message": "Chat in RoomChatBuffer eingefuegt"}),
+                ),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Command-Channel nicht verfuegbar").to_response()
+                }
+            }
+        }
+        OPERATOR_GAIA_PATH => {
+            let cmd: OperatorGaiaCommand = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest(
+                        "JSON ungueltig (target_agent_id, thought noetig)",
+                    )
+                    .to_response();
+                }
+            };
+            info!(agent_id = cmd.target_agent_id, "Voice of Gaia empfangen");
+            match state.command_tx.send(OperatorCommand::Gaia(cmd)) {
+                Ok(()) => json_response(
+                    202,
+                    serde_json::json!({"accepted": true, "message": "Gedanke eingepflanzt"}),
+                ),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Command-Channel nicht verfuegbar").to_response()
+                }
+            }
+        }
+        OPERATOR_BROADCAST_PATH => {
+            let cmd: OperatorBroadcastCommand = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest("JSON ungueltig (message noetig)").to_response();
+                }
+            };
+            info!(broadcast_type = %cmd.broadcast_type, "Broadcast empfangen");
+            match state.command_tx.send(OperatorCommand::Broadcast(cmd)) {
+                Ok(()) => json_response(
+                    202,
+                    serde_json::json!({"accepted": true, "message": "Durchsage gesendet"}),
+                ),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Command-Channel nicht verfuegbar").to_response()
                 }
             }
         }
