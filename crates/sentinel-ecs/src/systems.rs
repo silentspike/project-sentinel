@@ -1467,9 +1467,9 @@ pub fn output_system(
             };
 
         // Perceptions senden wenn Inhalt vorhanden ODER als Heartbeat (alle 5 Ticks).
-        // Heartbeat alle 30 Ticks: Idle Agents bekommen periodisch LLM-Calls.
-        // 26 Agents / 30 Ticks = 0.87 Perceptions/s → Channel(128) nicht ueberlastet.
-        let is_heartbeat = time.tick.0 > 0 && time.tick.0.is_multiple_of(30);
+        // Heartbeat alle 10 Ticks: Idle Agents bekommen periodisch LLM-Calls.
+        // 26 Agents / 10 Ticks = 2.6 Perceptions/s. Bridge drainet non-blocking (tokio::spawn).
+        let is_heartbeat = time.tick.0 > 0 && time.tick.0.is_multiple_of(10);
         let has_content = !impulse_text.is_empty()
             || !body_text.is_empty()
             || !heard_text.is_empty()

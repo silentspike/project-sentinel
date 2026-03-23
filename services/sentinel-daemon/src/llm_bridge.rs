@@ -46,7 +46,7 @@ pub mod bridge {
         fn default() -> Self {
             Self {
                 gateway_url: "http://localhost:8080".to_string(),
-                max_concurrent: 4,
+                max_concurrent: 8,
                 min_ticks_between_calls: 5,
                 request_timeout: Duration::from_secs(25),
                 circuit_breaker_threshold: 3,
