@@ -194,10 +194,10 @@ pub mod bridge {
         };
 
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
-        let mut circuit_breaker = CircuitBreaker::new(
+        let circuit_breaker = Arc::new(std::sync::Mutex::new(CircuitBreaker::new(
             config.circuit_breaker_threshold,
             config.circuit_breaker_reset,
-        );
+        )));
         let mut last_call_tick: HashMap<AgentId, u64> = HashMap::new();
 
         // Blocking receive in eigenem Thread, forward an async channel
@@ -245,7 +245,7 @@ pub mod bridge {
                 }
 
                 // Circuit Breaker
-                if circuit_breaker.is_open() {
+                if circuit_breaker.lock().unwrap().is_open() {
                     telemetry
                         .calls_skipped_circuit_open
                         .fetch_add(1, Ordering::Relaxed);
@@ -280,73 +280,69 @@ pub mod bridge {
                 let url = format!("{}/v1/chat/completions", config.gateway_url);
                 let action_tx = action_tx.clone();
                 let telemetry = Arc::clone(&telemetry);
+                let cb = Arc::clone(&circuit_breaker);
                 let request = build_gateway_request(&perception, &state_store);
 
                 telemetry.calls_total.fetch_add(1, Ordering::Relaxed);
 
-                // Async HTTP Call
-                let call_start = Instant::now();
-                match client.post(&url).json(&request).send().await {
-                    Ok(response) => {
-                        let status = response.status();
-                        if status.is_success() {
-                            match response.json::<GatewayResponse>().await {
-                                Ok(gateway_resp) => {
-                                    let latency_ms = call_start.elapsed().as_millis();
-                                    telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
-                                    telemetry.tokens_total.fetch_add(
-                                        gateway_resp.tokens_used as u64,
-                                        Ordering::Relaxed,
-                                    );
-                                    circuit_breaker.record_success();
+                // Non-blocking: HTTP Call in tokio::spawn damit die Bridge
+                // sofort weiter drainen kann (verhindert Channel-Overflow).
+                tokio::spawn(async move {
+                    let call_start = Instant::now();
+                    match client.post(&url).json(&request).send().await {
+                        Ok(response) => {
+                            let status = response.status();
+                            if status.is_success() {
+                                match response.json::<GatewayResponse>().await {
+                                    Ok(gateway_resp) => {
+                                        let latency_ms = call_start.elapsed().as_millis();
+                                        telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
+                                        telemetry.tokens_total.fetch_add(
+                                            gateway_resp.tokens_used as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                        cb.lock().unwrap().record_success();
 
-                                    debug!(
-                                        agent = %agent_id,
-                                        request_id = %gateway_resp.request_id,
-                                        tokens = gateway_resp.tokens_used,
-                                        actions = gateway_resp.actions.len(),
-                                        content_len = gateway_resp.content.len(),
-                                        latency_ms = latency_ms,
-                                        "LLM Response erhalten"
-                                    );
+                                        debug!(
+                                            agent = %agent_id,
+                                            request_id = %gateway_resp.request_id,
+                                            tokens = gateway_resp.tokens_used,
+                                            actions = gateway_resp.actions.len(),
+                                            latency_ms = latency_ms,
+                                            "LLM Response erhalten"
+                                        );
 
-                                    for extracted in &gateway_resp.actions {
-                                        if let Some(agent_action) = map_extracted_to_action(
-                                            agent_id,
-                                            extracted,
-                                            current_tick,
-                                        ) {
-                                            if action_tx.send(agent_action).is_err() {
-                                                debug!(
-                                                    "Action Channel geschlossen, Bridge beendet"
-                                                );
-                                                drop(permit);
-                                                return;
+                                        for extracted in &gateway_resp.actions {
+                                            if let Some(agent_action) = map_extracted_to_action(
+                                                agent_id,
+                                                extracted,
+                                                current_tick,
+                                            ) {
+                                                let _ = action_tx.send(agent_action);
                                             }
                                         }
                                     }
+                                    Err(e) => {
+                                        warn!(agent = %agent_id, error = %e, "Gateway Response Parse-Fehler");
+                                        telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
+                                        cb.lock().unwrap().record_failure();
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!(agent = %agent_id, error = %e, "Gateway Response Parse-Fehler");
-                                    telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
-                                    circuit_breaker.record_failure();
-                                }
+                            } else {
+                                warn!(agent = %agent_id, status = status.as_u16(), "Gateway HTTP Fehler");
+                                telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
+                                cb.lock().unwrap().record_failure();
                             }
-                        } else {
-                            warn!(agent = %agent_id, status = status.as_u16(), "Gateway HTTP Fehler");
+                        }
+                        Err(e) => {
+                            let is_timeout = e.is_timeout();
+                            warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, "Gateway Request fehlgeschlagen");
                             telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
-                            circuit_breaker.record_failure();
+                            cb.lock().unwrap().record_failure();
                         }
                     }
-                    Err(e) => {
-                        let is_timeout = e.is_timeout();
-                        warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, "Gateway Request fehlgeschlagen");
-                        telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
-                        circuit_breaker.record_failure();
-                    }
-                }
-
-                drop(permit);
+                    drop(permit);
+                });
             }
         }
 
