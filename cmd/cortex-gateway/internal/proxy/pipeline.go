@@ -23,7 +23,10 @@ import (
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/guardrails"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/mapping"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/apicp"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/resilience"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/sequencing"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/synthesis"
 	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/eventstore"
 	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/judge"
 )
@@ -94,6 +97,9 @@ type PipelineConfig struct {
 	ProviderDeadline time.Duration           // 0 = defaultProviderDeadline (20s)
 	Drift            *judge.DriftDetector    // optional: nil disables personality guard
 	Quality          *judge.QualityScorer    // optional: nil disables quality gate
+	Synthesis        *synthesis.Engine       // optional: nil disables synthesis
+	Sequencer        *sequencing.Sequencer  // optional: nil disables chat-sequencing
+	Observer         *apicp.Observer       // optional: nil disables API-CP learning
 }
 
 // ProviderDeadlineFromEnv liest die Provider-Deadline aus ENV.
@@ -125,6 +131,9 @@ type PipelineHandler struct {
 	providerDeadline time.Duration
 	drift            *judge.DriftDetector
 	quality          *judge.QualityScorer
+	synthesis        *synthesis.Engine
+	sequencer        *sequencing.Sequencer
+	observer         *apicp.Observer
 
 	breakerMu  sync.RWMutex
 	breakers   map[string]*CircuitBreaker
@@ -185,6 +194,9 @@ func NewPipelineHandler(cfg PipelineConfig) *PipelineHandler {
 		providerDeadline: deadline,
 		drift:            cfg.Drift,
 		quality:          cfg.Quality,
+		synthesis:        cfg.Synthesis,
+		sequencer:        cfg.Sequencer,
+		observer:         cfg.Observer,
 		breakers:         make(map[string]*CircuitBreaker),
 		breakerCfg:       cfg.BreakerCfg,
 		regenCooldown:    make(map[string]time.Time),
@@ -315,7 +327,73 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	agentRole := req.Metadata["agent_role"]
 	ph.injectPerception(&req, agentName, agentRole, providerName, snap)
 
-	// --- Step 6: Provider.Send() mit Deadline ---
+	// --- Step 7.5: Traffic Control — Synthesis Check ---
+	if ph.synthesis != nil && ph.synthesis.Enabled() {
+		result := ph.synthesis.Decide(req.Metadata, agentName)
+		if result.Decision == synthesis.Synthesize {
+			// Synthetisierte Response durchlaeuft Outbound-Pipeline (AC-2):
+			// Fourth-Wall Regex-Check → wenn Match: Synthesis abbrechen, Forward
+			content := result.Content
+			if matched, _ := detection.DetectFourthWall(content); matched {
+				ph.logger.Warn("synthesis aborted: fourth-wall regex match",
+					"agent", agentName, "rule", result.Rule)
+				// Fall through to normal Provider.Send()
+			} else {
+				// Action Extraction + Persist
+				actions := ph.ext.Extract(content)
+				ph.persistActions(actions, agentName, requestID, &req)
+				duration := time.Since(start)
+				pipelineRequestsTotal.WithLabelValues("synthesis", "ok").Inc()
+				pipelineLatency.WithLabelValues("synthesis").Observe(duration.Seconds())
+				ph.logger.Info("pipeline request completed",
+					"provider", "synthesis",
+					"duration", duration,
+					"tokens", 0,
+					"actions", len(actions),
+					"rule", result.Rule,
+				)
+				w.Header().Set("Content-Type", "application/json")
+				if err := json.NewEncoder(w).Encode(PipelineResponse{
+					Content:      content,
+					Model:        "sentinel-synth-v1",
+					Provider:     "synthesis",
+					TokensUsed:   0,
+					FinishReason: "synthetic",
+					Actions:      actions,
+					RequestID:    requestID,
+				}); err != nil {
+					ph.logger.Error("failed to encode synthesis response", "error", err)
+				}
+				return
+			}
+		}
+	}
+
+	// --- Step 7.6: Chat-Sequencing (P1/P3) ---
+	var sequencingRoomID string
+	if ph.sequencer != nil && ph.sequencer.Enabled() {
+		sequencingRoomID = req.Metadata["room_id"]
+		isP1 := req.Metadata["is_directly_addressed"] == "true"
+		hasHeard := req.Metadata["heard"] != ""
+
+		if isP1 && hasHeard {
+			ph.sequencer.MarkP1Active(sequencingRoomID, agentName)
+			// Provider.Send() runs below — defer CompleteP1 with closure (captures content by ref)
+		} else if hasHeard && !isP1 && ph.sequencer.HasActiveP1(sequencingRoomID) {
+			// P3: wait for P1 response (max timeout), then inject context (AC-8, AC-9)
+			p1Content, p1Agent, gotP1 := ph.sequencer.WaitForP1(sequencingRoomID)
+			if gotP1 && p1Content != "" {
+				contextMsg := fmt.Sprintf("\n[KONTEXT] %s hat gerade gesagt: \"%s\" [/KONTEXT]",
+					p1Agent, p1Content)
+				if len(req.Messages) > 0 {
+					req.Messages[len(req.Messages)-1].Content += contextMsg
+				}
+			}
+			// P3 continues to Provider.Send() with injected context (or without if timeout)
+		}
+	}
+
+	// --- Step 8: Provider.Send() mit Deadline ---
 	ctx, cancel := context.WithTimeout(r.Context(), ph.providerDeadline)
 	defer cancel()
 
@@ -384,6 +462,24 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 
 	// --- Step 8b: Persist extracted actions as events (AC-5) ---
 	ph.persistActions(actions, agentName, requestID, &req)
+
+	// --- Step 8c: API-CP Observation (record call for learning) ---
+	if ph.observer != nil {
+		fp := req.Metadata["synth_fp"]
+		agentID := req.Metadata["agent_id"]
+		ph.observer.Record(fp, agentID, content, false)
+		if ev := req.Metadata["evolution_version"]; ev != "" {
+			ph.observer.CheckEvolutionDegradation(agentID, ev)
+		}
+	}
+
+	// --- Step 8d: Complete P1 for Chat-Sequencing (unblocks waiting P3s) ---
+	if ph.sequencer != nil && sequencingRoomID != "" {
+		isP1 := req.Metadata["is_directly_addressed"] == "true"
+		if isP1 {
+			ph.sequencer.CompleteP1(sequencingRoomID, content)
+		}
+	}
 
 	// --- Step 9: Response ---
 	duration := time.Since(start)

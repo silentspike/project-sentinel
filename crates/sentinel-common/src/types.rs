@@ -274,6 +274,22 @@ pub struct Perception {
     pub is_directly_addressed: bool,
     pub timestamp: Timestamp,
     pub tick: Tick,
+    /// Room ID where this agent is located (for Chat-Sequencing)
+    #[serde(default)]
+    pub room_id: String,
+    /// Highest priority from EventQueue ("P0"/"P1"/"P2"/"P3"/"NONE")
+    #[serde(default)]
+    pub max_priority: String,
+    /// Synthesis fingerprint: Bio-Buckets + Room + Stimuli-Flags + Hour + Temp + Personality
+    #[serde(default)]
+    pub synth_fingerprint: String,
+    /// Personality type based on Big Five Extraversion ("I" or "E")
+    #[serde(default)]
+    pub personality_type: String,
+    /// True when GaiaBuffer or BroadcastBuffer has active content for this agent.
+    /// Used by Synthesis to bypass templates and forward to real LLM.
+    #[serde(default)]
+    pub has_operator_impulse: bool,
 }
 
 /// Biological state of an agent

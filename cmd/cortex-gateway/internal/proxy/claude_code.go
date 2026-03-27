@@ -9,8 +9,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
-	"sync"
-	"time"
+"time"
 )
 
 const (
@@ -64,12 +63,16 @@ type claudeCodeAssistantMsg struct {
 // It runs `claude -p --output-format stream-json` and communicates via NDJSON
 // on stdin/stdout. Authentication is handled by the claude binary itself
 // (OAuth token stored in ~/.claude/, no API key required).
+// maxConcurrentClaude limits parallel claude subprocess spawns to prevent OOM.
+// Each subprocess uses ~60-100 MB, systemd MemoryMax is 1 GB.
+const maxConcurrentClaude = 3
+
 type ClaudeCodeProvider struct {
-	mu     sync.Mutex
 	name   string
 	model  string
 	binary string
 	logger *slog.Logger
+	sem    chan struct{} // counting semaphore (buffered channel)
 }
 
 // NewClaudeCodeProvider creates a new Claude Code subprocess provider.
@@ -90,6 +93,7 @@ func NewClaudeCodeProvider(cfg ProviderConfig, logger *slog.Logger) *ClaudeCodeP
 		model:  model,
 		binary: binary,
 		logger: logger,
+		sem:    make(chan struct{}, maxConcurrentClaude),
 	}
 }
 
@@ -102,8 +106,13 @@ func (p *ClaudeCodeProvider) Name() string {
 // Each call runs: claude -p --output-format stream-json --model <model>
 // The prompt is piped via stdin, and the response is read from stdout as NDJSON.
 func (p *ClaudeCodeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	// Acquire semaphore slot (respects context deadline)
+	select {
+	case p.sem <- struct{}{}:
+		defer func() { <-p.sem }()
+	case <-ctx.Done():
+		return nil, fmt.Errorf("claude-code semaphore wait: %w", ctx.Err())
+	}
 
 	model := p.model
 	if req.Model != "" {
