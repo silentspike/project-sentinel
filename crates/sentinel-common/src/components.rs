@@ -58,14 +58,30 @@ pub struct AgentIdentity {
 }
 
 /// Position im Buerogebaeude (String-basierte Raum-IDs aus rooms.toml)
+///
+/// Waehrend Transit wird `room_id` auf den aktuellen Zwischen-Raum gesetzt
+/// (z.B. "flur-eg" wenn Agent durch EG-Flur geht). `in_transit` bleibt `true`
+/// um "durchgehend" von "stationaer" zu unterscheiden.
 #[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
-    pub room_id: String, // z.B. "buero-dev-1", "kueche"
+    pub room_id: String, // z.B. "buero-dev-1", "kueche", waehrend Transit: aktueller Zwischen-Raum
     pub in_transit: bool,
     pub transit_target: Option<String>,
     pub transit_remaining_ms: u32,
     /// Correlation-ID vom Move-Action-Event (fuer Causation-Chain bei TransitCompleted)
     pub transit_correlation_id: Option<String>,
+    /// BFS Zwischen-Raeume (ohne Start/Ziel). Leer wenn nicht in Transit.
+    #[serde(default)]
+    pub transit_route: Vec<String>,
+    /// Original-Gesamtdauer in ms (fuer elapsed_ratio Berechnung des Zwischen-Raums).
+    #[serde(default)]
+    pub transit_total_ms: u32,
+    /// Transit pausiert fuer Encounter-Chat. remaining_ms stoppt.
+    #[serde(default)]
+    pub transit_paused: bool,
+    /// Urspruenglicher Start-Raum (fuer Perception "Du bist auf dem Weg von X").
+    #[serde(default)]
+    pub transit_source: Option<String>,
 }
 
 /// Biologischer Zustand (Hunger, Energie, Koffein, Blase, Stress, Sozial)

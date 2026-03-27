@@ -535,6 +535,26 @@ impl RoomChatBuffer {
         entry.1 += 1;
     }
 
+    /// Letzter Chat-Tick in einem Raum (fuer Encounter Auto-Resume).
+    pub fn last_chat_tick_for_room(&self, room_id: &str) -> Option<u64> {
+        self.last_chat_tick.get(room_id).copied()
+    }
+
+    /// Zaehlt aktive (nicht abgelaufene) Messages in einem Raum innerhalb eines Tick-Fensters.
+    pub fn recent_count(&self, room_id: &str, current_tick: u64, window: u64) -> u64 {
+        self.messages
+            .get(room_id)
+            .map(|msgs| {
+                msgs.iter()
+                    .filter(|m| {
+                        current_tick < m.tick + m.ttl_ticks
+                            && current_tick.saturating_sub(m.tick) < window
+                    })
+                    .count() as u64
+            })
+            .unwrap_or(0)
+    }
+
     /// Entfernt abgelaufene Messages.
     pub fn cleanup(&mut self, current_tick: u64) {
         self.messages.retain(|_, msgs| {
@@ -669,6 +689,7 @@ pub struct ToolRuntimeResource(pub sentinel_wasm::ToolRuntime);
 #[derive(Resource, Default, Clone)]
 pub struct RoomDistanceMap {
     distances: std::collections::HashMap<(String, String), u32>,
+    adjacency: std::collections::HashMap<String, Vec<String>>,
     room_ids: Vec<String>,
 }
 
@@ -676,7 +697,12 @@ impl RoomDistanceMap {
     /// Erstellt die Distance-Map aus einer BuildingConfig (BFS fuer alle Paare).
     pub fn from_building_config(config: &sentinel_common::room::BuildingConfig) -> Self {
         let mut distances = std::collections::HashMap::new();
-        let room_ids = config.rooms.iter().map(|room| room.id.clone()).collect();
+        let room_ids: Vec<String> = config.rooms.iter().map(|room| room.id.clone()).collect();
+        let adjacency: std::collections::HashMap<String, Vec<String>> = config
+            .rooms
+            .iter()
+            .map(|r| (r.id.clone(), r.adjacent.clone()))
+            .collect();
         for room in &config.rooms {
             for other in &config.rooms {
                 if let Some(dist) = config.shortest_distance(&room.id, &other.id) {
@@ -686,6 +712,7 @@ impl RoomDistanceMap {
         }
         Self {
             distances,
+            adjacency,
             room_ids,
         }
     }
@@ -696,6 +723,67 @@ impl RoomDistanceMap {
             .get(&(from.to_string(), to.to_string()))
             .copied()
             .unwrap_or(2) // Fallback: 2 Hops (mittlere Distanz)
+    }
+
+    /// BFS-Pfad zwischen zwei Raeumen (Zwischen-Raeume, ohne Start/Ziel).
+    ///
+    /// Gibt die Raum-IDs zurueck durch die der Agent laufen muss.
+    /// Leer wenn Start==Ziel oder direkt benachbart (1 Hop, kein Zwischen-Raum).
+    pub fn route(&self, from: &str, to: &str) -> Vec<String> {
+        if from == to {
+            return Vec::new();
+        }
+        if self.adjacency.is_empty() {
+            return Vec::new();
+        }
+
+        // BFS mit Parent-Tracking
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut parent: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
+
+        visited.insert(from);
+        queue.push_back(from);
+
+        let mut found = false;
+        while let Some(current) = queue.pop_front() {
+            if current == to {
+                found = true;
+                break;
+            }
+            if let Some(neighbors) = self.adjacency.get(current) {
+                for neighbor in neighbors {
+                    if visited.insert(neighbor.as_str()) {
+                        parent.insert(neighbor.as_str(), current);
+                        queue.push_back(neighbor.as_str());
+                    }
+                }
+            }
+        }
+
+        if !found {
+            return Vec::new();
+        }
+
+        // Pfad rekonstruieren (rueckwaerts von to nach from)
+        let mut path = Vec::new();
+        let mut current = to;
+        while let Some(&prev) = parent.get(current) {
+            path.push(current.to_string());
+            current = prev;
+        }
+        path.reverse();
+
+        // Start und Ziel strippen — nur Zwischen-Raeume
+        if path.len() >= 2 {
+            // path enthaelt: [hop1, hop2, ..., to]. Start (from) ist nicht drin.
+            // Ziel (to) entfernen = letztes Element
+            path.pop();
+            path
+        } else {
+            // 1 Hop = direkt benachbart, kein Zwischen-Raum
+            Vec::new()
+        }
     }
 
     /// Gibt alle Raeume zurueck die max `max_hops` entfernt sind.
@@ -715,6 +803,44 @@ impl RoomDistanceMap {
     /// Prueft ob ein Raum in der Distance-Map existiert (d.h. in rooms.toml definiert ist).
     pub fn contains(&self, room_id: &str) -> bool {
         self.room_ids.iter().any(|r| r == room_id)
+    }
+}
+
+/// Raum-Metadaten (Floor + Capacity) aus rooms.toml.
+///
+/// EINE Resource fuer Floor-Lookup (Encounter-Filterung) und Capacity-Lookup (max_occupants).
+#[derive(Resource, Default, Clone)]
+pub struct RoomInfoMap {
+    floors: std::collections::HashMap<String, i8>,
+    capacities: std::collections::HashMap<String, u16>,
+}
+
+impl RoomInfoMap {
+    /// Erstellt die RoomInfoMap aus einer BuildingConfig.
+    pub fn from_building_config(config: &sentinel_common::room::BuildingConfig) -> Self {
+        let mut floors = std::collections::HashMap::new();
+        let mut capacities = std::collections::HashMap::new();
+        for room in &config.rooms {
+            floors.insert(room.id.clone(), room.floor);
+            capacities.insert(room.id.clone(), room.capacity);
+        }
+        Self { floors, capacities }
+    }
+
+    /// Floor eines Raums (-1=Treppenhaus, 0=EG, 1=OG).
+    pub fn get_floor(&self, room_id: &str) -> Option<i8> {
+        self.floors.get(room_id).copied()
+    }
+
+    /// Kapazitaet eines Raums (aus rooms.toml capacity Feld).
+    pub fn get_capacity(&self, room_id: &str) -> Option<u16> {
+        self.capacities.get(room_id).copied()
+    }
+
+    /// Setzt Kapazitaet fuer einen Raum (fuer Tests).
+    #[cfg(test)]
+    pub fn set_capacity(&mut self, room_id: &str, capacity: u16) {
+        self.capacities.insert(room_id.to_string(), capacity);
     }
 }
 
@@ -762,6 +888,7 @@ pub fn create_simulation_world() -> (World, Schedule) {
     world.insert_resource(RoomChatBuffer::default());
     world.insert_resource(GaiaBuffer::default());
     world.insert_resource(BroadcastBuffer::default());
+    world.insert_resource(RoomInfoMap::default());
 
     // System-Reihenfolge via configure_sets (10 Phasen)
     schedule.configure_sets(
@@ -855,6 +982,10 @@ pub fn spawn_agent(
                 transit_target: None,
                 transit_remaining_ms: 0,
                 transit_correlation_id: None,
+                transit_route: Vec::new(),
+                transit_total_ms: 0,
+                transit_paused: false,
+                transit_source: None,
             },
             BioState {
                 hunger: 20.0,
@@ -1099,6 +1230,10 @@ pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnaps
                 transit_target: None,
                 transit_remaining_ms: 0,
                 transit_correlation_id: None,
+                transit_route: Vec::new(),
+                transit_total_ms: 0,
+                transit_paused: false,
+                transit_source: None,
             });
         let bio = snapshot
             .bio_states

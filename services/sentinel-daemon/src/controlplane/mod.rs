@@ -285,6 +285,10 @@ mod tests {
                 transit_target: None,
                 transit_remaining_ms: 0,
                 transit_correlation_id: None,
+                transit_route: Vec::new(),
+                transit_total_ms: 0,
+                transit_paused: false,
+                transit_source: None,
             },
             Mood {
                 valence: 0.5,
@@ -329,6 +333,10 @@ mod tests {
                 transit_target: None,
                 transit_remaining_ms: 0,
                 transit_correlation_id: None,
+                transit_route: Vec::new(),
+                transit_total_ms: 0,
+                transit_paused: false,
+                transit_source: None,
             },
             Mood {
                 valence: 0.5,
@@ -373,6 +381,10 @@ mod tests {
                 transit_target: None,
                 transit_remaining_ms: 0,
                 transit_correlation_id: None,
+                transit_route: Vec::new(),
+                transit_total_ms: 0,
+                transit_paused: false,
+                transit_source: None,
             },
             Mood {
                 valence: 0.5,

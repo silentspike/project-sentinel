@@ -255,10 +255,10 @@ fn test_e2e_move_action_transit_with_correlation() {
     // Tick 1: input_system setzt Transit + erzeugt AgentActionReceived
     run_tick(&mut world, &mut schedule, 1);
 
-    // Tick 2-4: transit_system zaehlt runter (3000ms bei 1s/tick)
-    run_tick(&mut world, &mut schedule, 2);
-    run_tick(&mut world, &mut schedule, 3);
-    run_tick(&mut world, &mut schedule, 4);
+    // Tick 2-41: transit_system zaehlt runter (40000ms bei 1s/tick, 2 Hops * 20s)
+    for tick in 2..=41u64 {
+        run_tick(&mut world, &mut schedule, tick);
+    }
 
     // Events pruefen
     let es = world.resource::<LimboEventStore>();
