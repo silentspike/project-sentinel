@@ -26,7 +26,7 @@ use sentinel_ebpf::collector::MetricsSnapshot;
 use sentinel_ebpf::EbpfCollector;
 use sentinel_ecs::{
     apply_personality, create_simulation_world, despawn_agent_from_world, spawn_agent,
-    ActionReceiver, EventBuffer, LimboEventStore, PerceptionSender, SimulationTime,
+    ActionReceiver, LimboEventStore, PerceptionSender, SimulationTime,
 };
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
@@ -416,26 +416,27 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_ecs = Arc::clone(&shutdown);
 
-    // -- Room Distance Map (BFS-vorberechnet fuer Transit-Dauer + Smell-Propagation) --
+    // -- Room Distance Map + Room Info Map (BFS-vorberechnet fuer Transit-Dauer + Capacity + Floor) --
     let rooms_toml_path = config.config_dir.join("rooms.toml");
-    let room_distances = if rooms_toml_path.exists() {
+    let (room_distances, room_info) = if rooms_toml_path.exists() {
         match sentinel_common::room::BuildingConfig::load(&rooms_toml_path) {
             Ok(building_cfg) => {
                 let map = sentinel_ecs::RoomDistanceMap::from_building_config(&building_cfg);
+                let info = sentinel_ecs::RoomInfoMap::from_building_config(&building_cfg);
                 info!(
                     rooms = building_cfg.rooms.len(),
-                    "RoomDistanceMap aus rooms.toml geladen"
+                    "RoomDistanceMap + RoomInfoMap aus rooms.toml geladen"
                 );
-                map
+                (map, info)
             }
             Err(e) => {
-                warn!(error = %e, "rooms.toml konnte nicht geladen werden — Fallback auf Default-Distanzen");
-                sentinel_ecs::RoomDistanceMap::default()
+                warn!(error = %e, "rooms.toml konnte nicht geladen werden — Fallback auf Defaults");
+                (sentinel_ecs::RoomDistanceMap::default(), sentinel_ecs::RoomInfoMap::default())
             }
         }
     } else {
         warn!("rooms.toml nicht gefunden — Transit-Dauer nutzt Default-Distanzen");
-        sentinel_ecs::RoomDistanceMap::default()
+        (sentinel_ecs::RoomDistanceMap::default(), sentinel_ecs::RoomInfoMap::default())
     };
     let operator_room_ids = room_distances.all_rooms().to_vec();
     let operator_api_handle = if config.operator_api.enabled {
@@ -504,6 +505,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 agent_command_cfg,
                 adaptive_config,
                 room_distances,
+                room_info,
                 fanout_sender,
                 config.resource_manager.clone(),
                 config.platform_controlplane.clone(),
@@ -775,6 +777,7 @@ fn ecs_tick_loop(
     agent_command_cfg: Vec<String>,
     adaptive_config: crate::adaptive_tick::AdaptiveConfig,
     room_distances: sentinel_ecs::RoomDistanceMap,
+    room_info: sentinel_ecs::RoomInfoMap,
     fanout_sender: Option<sentinel_ecs::ZenohFanoutSender>,
     resource_manager_config: crate::config::ResourceManagerConfig,
     platform_cp_config: crate::config::PlatformControlplaneConfig,
@@ -811,6 +814,8 @@ fn ecs_tick_loop(
     world.insert_resource(sentinel_ecs::PsiMetrics::default());
     // Room-Distanzen fuer Transit-Dauer und Smell-Propagation
     world.insert_resource(room_distances);
+    // Room-Info fuer Capacity-Checks und Floor-Lookup
+    world.insert_resource(room_info);
 
     // Stores als Resources einfuegen (Arc<StateStore> direkt verwenden)
     let state_store_for_sim = Arc::clone(&state_store);
@@ -2444,6 +2449,7 @@ mod tests {
             vec!["true".to_string()],
             crate::adaptive_tick::AdaptiveConfig::default(),
             sentinel_ecs::RoomDistanceMap::default(),
+            sentinel_ecs::RoomInfoMap::default(),
             None, // Kein Zenoh Fan-Out in Tests
             crate::config::ResourceManagerConfig::default(),
             crate::config::PlatformControlplaneConfig::default(),
@@ -2511,6 +2517,7 @@ mod tests {
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
                 sentinel_ecs::RoomDistanceMap::default(),
+                sentinel_ecs::RoomInfoMap::default(),
                 None, // Kein Zenoh Fan-Out in Tests
                 crate::config::ResourceManagerConfig::default(),
                 crate::config::PlatformControlplaneConfig::default(),
@@ -2595,6 +2602,7 @@ mod tests {
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
                 sentinel_ecs::RoomDistanceMap::default(),
+                sentinel_ecs::RoomInfoMap::default(),
                 None, // Kein Zenoh Fan-Out in Tests
                 crate::config::ResourceManagerConfig::default(),
                 crate::config::PlatformControlplaneConfig::default(),
@@ -2687,6 +2695,7 @@ mod tests {
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
                 sentinel_ecs::RoomDistanceMap::default(),
+                sentinel_ecs::RoomInfoMap::default(),
                 None, // Kein Zenoh Fan-Out in Tests
                 crate::config::ResourceManagerConfig::default(),
                 crate::config::PlatformControlplaneConfig::default(),

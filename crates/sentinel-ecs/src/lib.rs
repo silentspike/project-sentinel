@@ -23,7 +23,8 @@ pub use world::{
     ActiveAgentsThisTick, ActiveChaos, ActiveChaosEvent, ActiveRoomStimuli, ActiveSmell,
     ActiveSmells, BroadcastBuffer, EventBuffer, GaiaBuffer, LimboEventStore,
     OperatorCommandReceiver, PerceptionSender, PersistTelemetry, PsiMetrics, RedbStateStore,
-    RoomChatBuffer, RoomDistanceMap, RoomPhysicsSnapshot, RoomPhysicsState, SimulationTime,
+    RoomChatBuffer, RoomDistanceMap, RoomInfoMap, RoomPhysicsSnapshot, RoomPhysicsState,
+    SimulationTime,
     ToolRuntimeResource, ZenohFanoutSender,
 };
 
@@ -249,11 +250,12 @@ mod tests {
             let mut pos = world.get_mut::<Position>(entity).unwrap();
             pos.in_transit = true;
             pos.transit_target = Some("kueche".to_string());
-            pos.transit_remaining_ms = 2000; // 2 Sekunden
+            pos.transit_remaining_ms = 20_000; // 20 Sekunden (1 Hop)
+            pos.transit_total_ms = 20_000;
         }
 
-        // 3 Ticks a 1 Sekunde (= 3000ms > 2000ms Transit)
-        for tick in 0..3u64 {
+        // 21 Ticks a 1 Sekunde (= 21000ms > 20000ms Transit)
+        for tick in 0..21u64 {
             let mut time = world.resource_mut::<SimulationTime>();
             time.tick = sentinel_common::Tick(tick);
             time.delta_seconds = 1.0;
@@ -642,11 +644,12 @@ mod tests {
             let mut pos = world.get_mut::<Position>(entity).unwrap();
             pos.in_transit = true;
             pos.transit_target = Some("kueche".to_string());
-            pos.transit_remaining_ms = 1000; // 1 Sekunde
+            pos.transit_remaining_ms = 20_000; // 20 Sekunden
+            pos.transit_total_ms = 20_000;
         }
 
-        // 2 Ticks a 1 Sekunde
-        for tick in 0..2u64 {
+        // 21 Ticks a 1 Sekunde (> 20s Transit)
+        for tick in 0..21u64 {
             let mut time = world.resource_mut::<SimulationTime>();
             time.tick = Tick(tick);
             time.delta_seconds = 1.0;
@@ -846,7 +849,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
 
-        // Move zu nahem Raum: empfang → flur-eg (1 hop → 2300ms)
+        // Move zu nahem Raum: empfang → flur-eg (1 hop → 20000ms)
         tx.send(AgentAction {
             agent_id: AgentId(1),
             action_type: ActionType::Move,
@@ -876,7 +879,7 @@ mod tests {
 
         let payload1: serde_json::Value = serde_json::from_str(&transit_events[0].payload).unwrap();
         let duration_near = payload1["duration_ms"].as_u64().unwrap();
-        assert_eq!(duration_near, 2300, "1-hop transit should be 2300ms");
+        assert_eq!(duration_near, 20000, "1-hop transit should be 20000ms (clamped to min 15000, 1*20000=20000)");
 
         // Transit abschliessen (manuell Position resetten)
         {
@@ -892,7 +895,7 @@ mod tests {
             pos.room_id = "empfang".to_string();
         }
 
-        // Move zu fernem Raum: empfang → buero-ceo (4 hops → 4700ms)
+        // Move zu fernem Raum: empfang → buero-ceo (4 hops → 80000ms)
         tx.send(AgentAction {
             agent_id: AgentId(1),
             action_type: ActionType::Move,
@@ -922,7 +925,7 @@ mod tests {
 
         let payload2: serde_json::Value = serde_json::from_str(&transit_events[1].payload).unwrap();
         let duration_far = payload2["duration_ms"].as_u64().unwrap();
-        assert_eq!(duration_far, 4700, "4-hop transit should be 4700ms");
+        assert_eq!(duration_far, 80000, "4-hop transit should be 80000ms (4*20s)");
 
         assert!(
             duration_far > duration_near,
@@ -930,7 +933,7 @@ mod tests {
         );
     }
 
-    /// Transit-Dauer bleibt immer in [2000, 5000]ms Bounds
+    /// Transit-Dauer bleibt immer in [15000, 120000]ms Bounds
     #[test]
     fn test_transit_duration_within_bounds() {
         let dir = tempfile::tempdir().unwrap();
@@ -1005,8 +1008,8 @@ mod tests {
             let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
             let duration = payload["duration_ms"].as_u64().unwrap();
             assert!(
-                (2000..=5000).contains(&duration),
-                "Duration {duration}ms outside bounds [2000, 5000]"
+                (15000..=120000).contains(&duration),
+                "Duration {duration}ms outside bounds [15000, 120000]"
             );
         }
     }
@@ -1022,11 +1025,12 @@ mod tests {
             let mut pos = world.get_mut::<Position>(entity).unwrap();
             pos.in_transit = true;
             pos.transit_target = Some("kueche".to_string());
-            pos.transit_remaining_ms = 1000;
+            pos.transit_remaining_ms = 20_000;
+            pos.transit_total_ms = 20_000;
         }
 
-        // 2 Ticks a 1s (1000ms Transit → abgeschlossen)
-        for tick in 0..2u64 {
+        // 21 Ticks a 1s (20000ms Transit → abgeschlossen)
+        for tick in 0..21u64 {
             let mut time = world.resource_mut::<SimulationTime>();
             time.tick = Tick(tick);
             time.delta_seconds = 1.0;
@@ -1070,6 +1074,8 @@ mod tests {
             pos.in_transit = true;
             pos.transit_target = Some("kueche".to_string());
             pos.transit_remaining_ms = 600_000; // 10min — lang genug damit Transit nicht endet
+            pos.transit_total_ms = 600_000;
+            pos.transit_route = vec!["flur-eg".to_string()]; // Encounter braucht Zwischen-Raum
         }
 
         // Mehrere Ticks laufen (encounter_system laeuft alle 3 Ticks)
@@ -1128,7 +1134,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
 
-        // Move nach kueche (2 hops → 3100ms)
+        // Move nach kueche (2 hops → 40000ms)
         tx.send(AgentAction {
             agent_id: AgentId(1),
             action_type: ActionType::Move,
@@ -1165,11 +1171,123 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&transit_events[0].payload).unwrap();
         assert_eq!(
             payload["duration_ms"].as_u64().unwrap(),
-            3100,
-            "empfang→kueche = 2 hops → 1500+1600=3100ms"
+            40000,
+            "empfang→kueche = 2 hops → 2*20000=40000ms"
         );
         assert_eq!(payload["to_room"].as_str().unwrap(), "kueche");
         assert_eq!(payload["from_room"].as_str().unwrap(), "empfang");
+    }
+
+    /// TR5/TR6: room_id wechselt auf Zwischen-Raeume waehrend Transit (Cross-Floor)
+    #[test]
+    fn test_transit_room_id_changes_to_intermediate_rooms() {
+        let dir = tempfile::tempdir().unwrap();
+        let event_db_path = dir.path().join("tr5-tr6.db");
+        let event_store = Arc::new(EventStore::open(event_db_path.to_str().unwrap()).unwrap());
+
+        let (mut world, mut schedule) = create_simulation_world();
+        world.insert_resource(LimboEventStore(event_store.clone()));
+
+        let rooms_toml = include_str!("../../../config/rooms.toml");
+        let building_config: sentinel_common::room::BuildingConfig =
+            toml::from_str(rooms_toml).expect("rooms.toml parse error");
+        let rdm = RoomDistanceMap::from_building_config(&building_config);
+        let room_info = RoomInfoMap::from_building_config(&building_config);
+        world.insert_resource(rdm);
+        world.insert_resource(room_info);
+
+        // Agent in buero-ceo (OG) → kueche (EG) = 4 Hops, ~80s
+        // Route: buero-ceo → flur-og → treppenhaus → flur-eg → kueche
+        let entity = spawn_agent(&mut world, AgentId(1), "CEO", "Tester", 1, "buero-ceo");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        world.insert_resource(ActionReceiver(std::sync::Mutex::new(rx)));
+
+        tx.send(AgentAction {
+            agent_id: AgentId(1),
+            action_type: ActionType::Move,
+            target_room: Some("kueche".to_string()),
+            target_agent: None,
+            content: None,
+            timestamp: Timestamp(1000),
+            tick: Tick(1),
+        })
+        .unwrap();
+
+        // Tick 1: Transit starten
+        {
+            let mut time = world.resource_mut::<SimulationTime>();
+            time.tick = Tick(1);
+            time.tick_count = 1;
+            time.delta_seconds = 1.0;
+            time.sim_hour = 8.0;
+        }
+        schedule.run(&mut world);
+
+        let pos = world.get::<Position>(entity).unwrap();
+        assert!(pos.in_transit, "Agent should be in transit");
+        assert_eq!(pos.transit_target, Some("kueche".to_string()));
+        let total_ms = pos.transit_total_ms;
+        // Distanz haengt von der Adjacency in rooms.toml ab
+        assert!(total_ms > 0, "Transit must have non-zero duration, got {total_ms}");
+        assert!(!pos.transit_route.is_empty(), "Route must not be empty");
+
+        // Tick vorrücken und Zwischen-Raum prüfen
+        let mut seen_rooms: Vec<String> = Vec::new();
+        for tick in 2..=90u64 {
+            {
+                let mut time = world.resource_mut::<SimulationTime>();
+                time.tick = Tick(tick);
+                time.tick_count = tick;
+                time.delta_seconds = 1.0;
+                time.sim_hour = 8.0;
+            }
+            schedule.run(&mut world);
+
+            let pos = world.get::<Position>(entity).unwrap();
+            let room = pos.room_id.clone();
+            if seen_rooms.last() != Some(&room) {
+                seen_rooms.push(room);
+            }
+        }
+
+        // Agent sollte durch verschiedene Raeume gegangen sein
+        assert!(
+            seen_rooms.len() >= 3,
+            "Agent muss durch mind. 3 verschiedene Raeume gehen (Start + Zwischen + Ziel), \
+             saw: {:?}",
+            seen_rooms
+        );
+
+        // Endposition muss kueche sein
+        let pos = world.get::<Position>(entity).unwrap();
+        // Agent muss angekommen sein ODER einen neuen Transit (Autonomy) gestartet haben.
+        // Wichtig ist: seen_rooms zeigt Zwischen-Raeume (TR5/TR6 Beweis).
+
+        // TR5: Agent war im Flur sichtbar (room_id wechselte auf Zwischen-Raum)
+        assert!(
+            seen_rooms.iter().any(|r| r.starts_with("flur-") || r == "treppenhaus"),
+            "Agent muss in mind. einem Flur/Treppenhaus gewesen sein: {:?}",
+            seen_rooms
+        );
+
+        // TR6: Bei Cross-Floor Transit wechselt der Zwischen-Raum
+        let intermediate_count = seen_rooms
+            .iter()
+            .filter(|r| r.starts_with("flur-") || r.as_str() == "treppenhaus")
+            .count();
+        assert!(
+            intermediate_count >= 2,
+            "Cross-Floor Transit muss mind. 2 verschiedene Zwischen-Raeume haben: {:?}",
+            seen_rooms
+        );
+
+        // Agent muss irgendwann in kueche angekommen sein
+        assert!(
+            seen_rooms.contains(&"kueche".to_string()),
+            "Agent muss kueche erreicht haben: {:?}",
+            seen_rooms
+        );
     }
 
     /// Move zu ungueltigem Raum wird ignoriert (kein Transit)

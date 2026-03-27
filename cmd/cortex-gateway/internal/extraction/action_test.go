@@ -1,8 +1,40 @@
 package extraction
 
 import (
+	"os"
 	"testing"
 )
+
+func TestMain(m *testing.M) {
+	// Initialize room aliases for all tests
+	SetRoomAliases([]RoomDef{
+		{ID: "kueche", Name: "Kueche / Pausenraum"},
+		{ID: "empfang", Name: "Empfang"},
+		{ID: "buero-dev-1", Name: "Entwicklungsbuero 1"},
+		{ID: "buero-dev-2", Name: "Entwicklungsbuero 2"},
+		{ID: "buero-design-1", Name: "Designbuero 1"},
+		{ID: "buero-design-2", Name: "Designbuero 2"},
+		{ID: "buero-ceo", Name: "Geschaeftsfuehrung"},
+		{ID: "buero-sales", Name: "Vertriebsbuero"},
+		{ID: "buero-pm", Name: "Projektmanagement-Buero"},
+		{ID: "buero-marketing", Name: "Marketingbuero"},
+		{ID: "buero-admin", Name: "Verwaltungsbuero"},
+		{ID: "buero-qa", Name: "QA-Buero"},
+		{ID: "buero-it", Name: "IT-Buero"},
+		{ID: "meetingraum-01", Name: "Meetingraum Galileo"},
+		{ID: "meetingraum-02", Name: "Meetingraum Tesla"},
+		{ID: "meetingraum-03", Name: "Meetingraum Edison"},
+		{ID: "toilette-eg-damen", Name: "Toilette EG Damen"},
+		{ID: "toilette-eg-herren", Name: "Toilette EG Herren"},
+		{ID: "treppenhaus", Name: "Treppenhaus"},
+		{ID: "flur-eg", Name: "Flur Erdgeschoss"},
+		{ID: "flur-og", Name: "Flur Obergeschoss"},
+		{ID: "buero-betriebsrat", Name: "Betriebsratsbuero"},
+		{ID: "buero-betriebspsych", Name: "Betriebspsychologie"},
+		{ID: "buero-betriebsarzt", Name: "Betriebsmedizin"},
+	})
+	os.Exit(m.Run())
+}
 
 func TestExtract_JSONChat(t *testing.T) {
 	e := New()
@@ -32,8 +64,8 @@ func TestExtract_JSONMove(t *testing.T) {
 	if actions[0].Type != "move" {
 		t.Errorf("type = %q, want %q", actions[0].Type, "move")
 	}
-	if actions[0].Target != "Kueche" {
-		t.Errorf("target = %q, want %q", actions[0].Target, "Kueche")
+	if actions[0].Target != "kueche" {
+		t.Errorf("target = %q, want %q", actions[0].Target, "kueche")
 	}
 }
 
@@ -112,8 +144,8 @@ func TestExtract_MoveAction(t *testing.T) {
 	for _, a := range actions {
 		if a.Type == "move" {
 			found = true
-			if a.Target != "Kueche" {
-				t.Errorf("target = %q, want %q", a.Target, "Kueche")
+			if a.Target != "kueche" {
+				t.Errorf("target = %q, want %q", a.Target, "kueche")
 			}
 			break
 		}
@@ -131,8 +163,8 @@ func TestExtract_MoveAction_Laufe(t *testing.T) {
 	for _, a := range actions {
 		if a.Type == "move" {
 			found = true
-			if a.Target != "Meetingraum" {
-				t.Errorf("target = %q, want %q", a.Target, "Meetingraum")
+			if a.Target != "meetingraum-01" {
+				t.Errorf("target = %q, want %q", a.Target, "meetingraum-01")
 			}
 			break
 		}
@@ -261,8 +293,8 @@ func TestExtract_EmoteMoveRichtung(t *testing.T) {
 	for _, a := range actions {
 		if a.Type == "move" {
 			found = true
-			if a.Target != "Kueche" {
-				t.Errorf("target = %q, want %q", a.Target, "Kueche")
+			if a.Target != "kueche" {
+				t.Errorf("target = %q, want %q", a.Target, "kueche")
 			}
 			break
 		}
@@ -280,8 +312,8 @@ func TestExtract_EmoteMoveVerlasst(t *testing.T) {
 	for _, a := range actions {
 		if a.Type == "move" {
 			found = true
-			if a.Target != "Toilette" {
-				t.Errorf("target = %q, want %q", a.Target, "Toilette")
+			if a.Target != "toilette-eg-herren" {
+				t.Errorf("target = %q, want %q", a.Target, "toilette-eg-herren")
 			}
 			break
 		}
@@ -315,8 +347,8 @@ func TestExtract_EmoteMoveBetritt(t *testing.T) {
 	for _, a := range actions {
 		if a.Type == "move" {
 			found = true
-			if a.Target != "Kueche" {
-				t.Errorf("target = %q, want %q", a.Target, "Kueche")
+			if a.Target != "kueche" {
+				t.Errorf("target = %q, want %q", a.Target, "kueche")
 			}
 			break
 		}

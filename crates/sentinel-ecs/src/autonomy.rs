@@ -241,18 +241,26 @@ fn start_transit(
     room_distances: &Option<Res<RoomDistanceMap>>,
 ) {
     let from_room = position.room_id.clone();
-    // Distance-basierte Transit-Dauer: 1500ms Basis + 800ms pro Hop
+    // Realistische Transit-Dauer: 20s/Hop, clamped 15-120s
     let hops = room_distances
         .as_ref()
         .map(|rd| rd.distance(&from_room, target))
         .unwrap_or(2);
-    let raw_ms = 1500 + hops * 800;
-    let duration_ms: u32 = raw_ms.clamp(2000, 5000);
+    let duration_ms = sentinel_physics::transit::transit_duration_ms(hops);
+    // BFS Route (Zwischen-Raeume ohne Start/Ziel)
+    let route = room_distances
+        .as_ref()
+        .map(|rd| rd.route(&from_room, target))
+        .unwrap_or_default();
 
     position.in_transit = true;
     position.transit_target = Some(target.to_string());
     position.transit_remaining_ms = duration_ms;
     position.transit_correlation_id = Some(correlation_id.to_string());
+    position.transit_route = route;
+    position.transit_total_ms = duration_ms;
+    position.transit_paused = false;
+    position.transit_source = Some(from_room.clone());
 
     // AgentActionReceived Event (autonome Aktion)
     let action_payload = DomainEventPayload::AgentActionReceived {

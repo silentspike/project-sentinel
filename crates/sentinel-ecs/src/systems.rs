@@ -23,8 +23,8 @@ use super::world::{
 use super::world::{PerceptionSender, SimulationTime};
 use bevy_ecs::prelude::*;
 use sentinel_common::{
-    ActionType, DomainEvent, DomainEventPayload, Emotion, EventType, OperatorCommand, Perception,
-    RoomStimulusType, Timestamp,
+    ActionType, AgentId, DomainEvent, DomainEventPayload, Emotion, EventType, OperatorCommand,
+    Perception, RoomStimulusType, Timestamp,
 };
 use std::collections::HashMap;
 use std::time::Instant;
@@ -118,18 +118,25 @@ pub fn input_system(
 
                         let from_room = position.room_id.clone();
                         let to_room = target_room.clone();
-                        // Distance-basierte Transit-Dauer: 1500ms Basis + 800ms pro Hop
-                        // Clamp auf 2000-5000ms (TRANSIT_MIN/MAX aus sentinel-physics)
+                        // Realistische Transit-Dauer: 20s/Hop, clamped 15-120s
                         let hops = room_distances
                             .as_ref()
                             .map(|rd| rd.distance(&from_room, &to_room))
                             .unwrap_or(2);
-                        let raw_ms = 1500 + hops * 800;
-                        let duration_ms: u32 = raw_ms.clamp(2000, 5000);
+                        let duration_ms = sentinel_physics::transit::transit_duration_ms(hops);
+                        // BFS Route (Zwischen-Raeume ohne Start/Ziel)
+                        let route = room_distances
+                            .as_ref()
+                            .map(|rd| rd.route(&from_room, &to_room))
+                            .unwrap_or_default();
                         position.in_transit = true;
                         position.transit_target = Some(to_room.clone());
                         position.transit_remaining_ms = duration_ms;
                         position.transit_correlation_id = Some(correlation_id.clone());
+                        position.transit_route = route;
+                        position.transit_total_ms = duration_ms;
+                        position.transit_paused = false;
+                        position.transit_source = Some(from_room.clone());
 
                         // TransitStarted Event (Causation-Chain wird unten via action_event gesetzt)
                         let transit_payload = DomainEventPayload::TransitStarted {
@@ -782,44 +789,81 @@ pub fn physics_system(
     }
 }
 
-/// 4. Verarbeitet Raumwechsel (Transit-Timer runterzaehlen)
+/// Auto-Resume Timeout: Nach 120 Ticks ohne Chat im Flur wird Transit fortgesetzt.
+const ENCOUNTER_AUTO_RESUME_TICKS: u64 = 120;
+
+/// 4. Verarbeitet Raumwechsel (Transit-Timer runterzaehlen, room_id auf Zwischen-Raum setzen)
 ///
 /// Erzeugt TransitCompleted DomainEvents bei abgeschlossenem Transit.
+/// Bei `transit_paused` (Encounter): remaining_ms stoppt, Auto-Resume nach 120 Ticks idle.
 pub fn transit_system(
     mut query: Query<(&AgentIdentity, &mut Position)>,
     time: Res<SimulationTime>,
     mut event_buffer: ResMut<EventBuffer>,
+    room_chat_buffer: Res<super::world::RoomChatBuffer>,
 ) {
     let delta_ms = (time.delta_seconds * 1000.0) as u32;
+    let tick = time.tick.0;
     for (identity, mut pos) in &mut query {
-        if pos.in_transit {
-            pos.transit_remaining_ms = pos.transit_remaining_ms.saturating_sub(delta_ms);
-            if pos.transit_remaining_ms == 0 {
-                // Transit abgeschlossen: Agent kommt im Zielraum an
-                let target_room = pos.transit_target.take();
-                if let Some(target) = target_room {
-                    pos.room_id = target.clone();
+        if !pos.in_transit {
+            continue;
+        }
 
-                    // DomainEvent: TransitCompleted (mit Causation-Chain vom Move-Action)
-                    let payload = DomainEventPayload::TransitCompleted {
-                        agent_id: identity.agent_id,
-                        room_id: target,
-                    };
-                    let correlation = pos
-                        .transit_correlation_id
-                        .take()
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                    let event = DomainEvent::new(
-                        payload.event_type_str(),
-                        &identity.agent_id.to_string(),
-                        &payload.to_json(),
-                        &correlation,
-                        time.tick.0,
-                    );
-                    event_buffer.events.push(event);
-                }
-                pos.in_transit = false;
+        // Encounter-Pause: remaining_ms stoppt, Auto-Resume wenn Flur-Chat idle
+        if pos.transit_paused {
+            let last_chat = room_chat_buffer.last_chat_tick_for_room(&pos.room_id);
+            let idle_ticks = last_chat
+                .map(|t| tick.saturating_sub(t))
+                .unwrap_or(ENCOUNTER_AUTO_RESUME_TICKS + 1);
+            if idle_ticks >= ENCOUNTER_AUTO_RESUME_TICKS {
+                pos.transit_paused = false;
+                tracing::info!(
+                    agent = %identity.name,
+                    room = %pos.room_id,
+                    "Transit resumed nach Encounter (idle {}+ Ticks)", ENCOUNTER_AUTO_RESUME_TICKS
+                );
             }
+            continue; // remaining_ms nicht dekrementieren waehrend Pause
+        }
+
+        // room_id auf aktuellen Zwischen-Raum updaten
+        if let Some(current_room) = sentinel_physics::transit::current_transit_room(
+            &pos.transit_route,
+            pos.transit_remaining_ms,
+            pos.transit_total_ms,
+        ) {
+            pos.room_id = current_room.to_string();
+        }
+
+        pos.transit_remaining_ms = pos.transit_remaining_ms.saturating_sub(delta_ms);
+        if pos.transit_remaining_ms == 0 {
+            // Transit abgeschlossen: Agent kommt im Zielraum an
+            let target_room = pos.transit_target.take();
+            if let Some(target) = target_room {
+                pos.room_id = target.clone();
+
+                // DomainEvent: TransitCompleted (mit Causation-Chain vom Move-Action)
+                let payload = DomainEventPayload::TransitCompleted {
+                    agent_id: identity.agent_id,
+                    room_id: target,
+                };
+                let correlation = pos
+                    .transit_correlation_id
+                    .take()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let event = DomainEvent::new(
+                    payload.event_type_str(),
+                    &identity.agent_id.to_string(),
+                    &payload.to_json(),
+                    &correlation,
+                    time.tick.0,
+                );
+                event_buffer.events.push(event);
+            }
+            pos.in_transit = false;
+            pos.transit_route.clear();
+            pos.transit_total_ms = 0;
+            pos.transit_source = None;
         }
     }
 }
@@ -1385,6 +1429,15 @@ fn room_id_to_german(room_id: &str) -> String {
         "toilette-og-damen" => "auf der Damentoilette (OG)".to_string(),
         "toilette-og-herren" => "auf der Herrentoilette (OG)".to_string(),
         "treppenhaus" => "im Treppenhaus".to_string(),
+        "buero-sales" => "im Vertriebsbuero".to_string(),
+        "buero-pm" => "im Projektmanagement-Buero".to_string(),
+        "buero-marketing" => "im Marketingbuero".to_string(),
+        "buero-admin" => "im Verwaltungsbuero".to_string(),
+        "buero-qa" => "im QA-Buero".to_string(),
+        "buero-it" => "im IT-Buero".to_string(),
+        "buero-betriebsrat" => "im Betriebsratsbuero".to_string(),
+        "buero-betriebspsych" => "in der Betriebspsychologie".to_string(),
+        "buero-betriebsarzt" => "in der Betriebsmedizin".to_string(),
         other => format!("im Raum '{}'", other),
     }
 }
@@ -1428,17 +1481,24 @@ pub fn output_system(
 
     let present_agents_by_room: HashMap<String, Vec<(String, String)>> = query
         .iter()
-        .filter(|(_, _, position, _, _, _, _, _)| !position.in_transit)
         .fold(
             HashMap::new(),
             |mut acc, (identity, _, position, _, _, _, work_ctx, _)| {
-                let activity = work_ctx
-                    .current_task
-                    .clone()
-                    .unwrap_or_else(|| "anwesend".to_string());
-                acc.entry(position.room_id.clone())
-                    .or_default()
-                    .push((identity.name.clone(), activity));
+                if !position.in_transit || position.transit_paused {
+                    // Stationaer oder Encounter-Pause: normal anzeigen
+                    let activity = work_ctx
+                        .current_task
+                        .clone()
+                        .unwrap_or_else(|| "anwesend".to_string());
+                    acc.entry(position.room_id.clone())
+                        .or_default()
+                        .push((identity.name.clone(), activity));
+                } else if position.in_transit {
+                    // Durchgehend: mit Annotation
+                    acc.entry(position.room_id.clone())
+                        .or_default()
+                        .push((identity.name.clone(), "geht durch".to_string()));
+                }
                 acc
             },
         );
@@ -1499,7 +1559,25 @@ pub fn output_system(
         );
 
         let mut environment_text = perception.environment_text.clone();
-        if !position.in_transit {
+        if position.in_transit && !position.transit_paused {
+            // Transit-Perception: "Du bist auf dem Weg von X nach Y. Du gehst gerade durch Z."
+            let source = position
+                .transit_source
+                .as_deref()
+                .map(room_id_to_german)
+                .unwrap_or_else(|| "einem Raum".to_string());
+            let target = position
+                .transit_target
+                .as_deref()
+                .map(room_id_to_german)
+                .unwrap_or_else(|| "einem Raum".to_string());
+            let current = room_id_to_german(&position.room_id);
+            environment_text = format!(
+                "Du bist auf dem Weg von {} nach {}. Du gehst gerade durch {}.",
+                source, target, current
+            );
+        } else if !position.in_transit || position.transit_paused {
+            // Stationaer oder Encounter-Pause: normaler Raum-Text
             environment_text = format!("Du bist {}.", room_id_to_german(&position.room_id));
             if !prompt_perception.environment_text.is_empty() {
                 environment_text.push(' ');
@@ -1533,7 +1611,7 @@ pub fn output_system(
             );
         }
         let (heard_text, is_directly_addressed) =
-            if !position.in_transit && can_respond_result {
+            if (!position.in_transit || position.transit_paused) && can_respond_result {
                 let recent =
                     room_chat_buffer.get_recent(&position.room_id, time.tick.0, &identity.name);
                 if !recent.is_empty() {
@@ -1569,10 +1647,15 @@ pub fn output_system(
                 (String::new(), false)
             };
 
-        // Perceptions senden wenn Inhalt vorhanden ODER als Heartbeat (alle 5 Ticks).
-        // Heartbeat alle 10 Ticks: Idle Agents bekommen periodisch LLM-Calls.
-        // 26 Agents / 10 Ticks = 2.6 Perceptions/s. Bridge drainet non-blocking (tokio::spawn).
-        let is_heartbeat = time.tick.0 > 0 && time.tick.0.is_multiple_of(10);
+        // Adaptiver Heartbeat: Raeume mit Chat-Aktivitaet bekommen hoehere Frequenz.
+        // Standard: 10 Ticks. Mit Chat: min 2 Ticks (skaliert mit Anzahl aktiver Chats).
+        let recent_chats = room_chat_buffer.recent_count(&position.room_id, time.tick.0, 30);
+        let heartbeat_interval = if recent_chats > 0 {
+            (10u64 / (1 + recent_chats)).max(2)
+        } else {
+            10
+        };
+        let is_heartbeat = time.tick.0 > 0 && time.tick.0.is_multiple_of(heartbeat_interval);
         let has_content = !impulse_text.is_empty()
             || !body_text.is_empty()
             || !heard_text.is_empty()
@@ -1663,58 +1746,106 @@ fn focus_hours_since_shift_start(sim_hour: f32, shift: &ShiftInfo) -> f32 {
     elapsed.clamp(0.0, duration.max(0.0))
 }
 
-/// 10. Erkennt Flurbegegnungen zwischen Agents die gleichzeitig in Transit sind.
+/// 10. Erkennt Flurbegegnungen zwischen Agents im SELBEN Zwischen-Raum.
 ///
-/// Paarweise Pruefung aller in-transit Agents (splitmix64-basierte Zufallsentscheidung,
-/// 30% Wahrscheinlichkeit). Laeuft alle 10 Ticks um Event-Flut zu vermeiden.
+/// Gruppiert Transit-Agents nach aktuellem Zwischen-Raum (via current_transit_room).
+/// Nur Agents im selben Raum koennen sich begegnen (30% Wahrscheinlichkeit).
+/// Bei Encounter: transit_paused = true fuer beide Agents.
 pub fn encounter_system(
-    query: Query<(&AgentIdentity, &Position)>,
+    mut query: Query<(Entity, &AgentIdentity, &mut Position)>,
     time: Res<SimulationTime>,
     mut event_buffer: ResMut<EventBuffer>,
 ) {
     let tick = time.tick.0;
 
-    // Alle 3 Ticks pruefen (typisch n<5 in Transit, O(n^2) bei max 105 Paaren ist guenstig)
+    // Alle 3 Ticks pruefen
     if tick == 0 || !tick.is_multiple_of(3) {
         return;
     }
 
-    // Sammle alle in-transit Agents
-    let in_transit: Vec<_> = query
-        .iter()
-        .filter(|(_, pos)| pos.in_transit)
-        .map(|(id, _)| id.agent_id)
-        .collect();
-
-    // Paarweise Encounter-Check (O(n^2/2), typisch n<5 in Transit)
-    for i in 0..in_transit.len() {
-        for j in (i + 1)..in_transit.len() {
-            // splitmix64 deterministische RNG basierend auf Tick + Agent-IDs
-            let seed = tick
-                .wrapping_mul(31)
-                .wrapping_add(in_transit[i].0 as u64 * 97)
-                .wrapping_add(in_transit[j].0 as u64 * 53);
-            let mut x = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            x ^= x >> 31;
-            let rng = (x % 10000) as f32 / 10000.0;
-
-            if sentinel_physics::transit::check_hallway_encounter(true, true, rng) {
-                let payload = DomainEventPayload::HallwayEncounterDetected {
-                    agent_a: in_transit[i],
-                    agent_b: in_transit[j],
-                    location: "flur".to_string(),
-                };
-                let event = DomainEvent::new(
-                    payload.event_type_str(),
-                    &format!("{}-{}", in_transit[i], in_transit[j]),
-                    &payload.to_json(),
-                    &uuid::Uuid::new_v4().to_string(),
-                    tick,
-                );
-                event_buffer.events.push(event);
+    // Pass 1: Sammle Transit-Agents mit ihrem aktuellen Zwischen-Raum (immutabler Read)
+    let mut agents_by_room: HashMap<String, Vec<(Entity, AgentId)>> = HashMap::new();
+    for (entity, identity, pos) in query.iter() {
+        if pos.in_transit && !pos.transit_paused {
+            // Aktuellen Zwischen-Raum bestimmen
+            let current = sentinel_physics::transit::current_transit_room(
+                &pos.transit_route,
+                pos.transit_remaining_ms,
+                pos.transit_total_ms,
+            );
+            if let Some(room) = current {
+                agents_by_room
+                    .entry(room.to_string())
+                    .or_default()
+                    .push((entity, identity.agent_id));
             }
+        }
+    }
+
+    // Pass 2: Paarweise Encounter-Check pro Zwischen-Raum
+    let mut encounters: Vec<(Entity, Entity, AgentId, AgentId, String)> = Vec::new();
+    for (room, agents) in agents_by_room.iter() {
+        let agents: &Vec<(Entity, AgentId)> = agents;
+        for i in 0..agents.len() {
+            for j in (i + 1)..agents.len() {
+                let (_, id_a) = agents[i];
+                let (_, id_b) = agents[j];
+                // splitmix64 deterministische RNG
+                let seed = tick
+                    .wrapping_mul(31)
+                    .wrapping_add(id_a.0 as u64 * 97)
+                    .wrapping_add(id_b.0 as u64 * 53);
+                let mut x = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                x ^= x >> 31;
+                let rng = (x % 10000) as f32 / 10000.0;
+
+                if sentinel_physics::transit::check_hallway_encounter(true, true, rng) {
+                    encounters.push((
+                        agents[i].0,
+                        agents[j].0,
+                        id_a,
+                        id_b,
+                        room.clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Pass 3: Encounter-Events emittieren + transit_paused setzen
+    for (entity_a, entity_b, id_a, id_b, location) in &encounters {
+        let payload = DomainEventPayload::HallwayEncounterDetected {
+            agent_a: *id_a,
+            agent_b: *id_b,
+            location: location.clone(),
+        };
+        let event = DomainEvent::new(
+            payload.event_type_str(),
+            &format!("{}-{}", id_a, id_b),
+            &payload.to_json(),
+            &uuid::Uuid::new_v4().to_string(),
+            tick,
+        );
+        event_buffer.events.push(event);
+
+        // Transit pausieren fuer beide Agents
+        if let Ok((_, identity_a, mut pos_a)) = query.get_mut(*entity_a) {
+            pos_a.transit_paused = true;
+            tracing::info!(
+                agent = %identity_a.name,
+                room = %location,
+                "Transit pausiert fuer Encounter"
+            );
+        }
+        if let Ok((_, identity_b, mut pos_b)) = query.get_mut(*entity_b) {
+            pos_b.transit_paused = true;
+            tracing::info!(
+                agent = %identity_b.name,
+                room = %location,
+                "Transit pausiert fuer Encounter"
+            );
         }
     }
 }

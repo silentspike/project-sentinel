@@ -202,6 +202,15 @@ func main() {
 		logger.Info("api-cp learning agent enabled", "dump_path", dumpPath)
 	}
 
+	// Room aliases for move target resolution (rooms.toml → room_id mapping)
+	roomsPath := envOrDefault("SENTINEL_ROOMS_CONFIG", "config/rooms.toml")
+	if roomDefs, err := loadRoomDefs(roomsPath); err != nil {
+		logger.Warn("rooms.toml not loaded, move targets will not be resolved", "error", err)
+	} else {
+		extraction.SetRoomAliases(roomDefs)
+		logger.Info("room aliases loaded", "rooms", len(roomDefs), "path", roomsPath)
+	}
+
 	pipelineHandler := proxy.NewPipelineHandler(proxy.PipelineConfig{
 		Registry:         registry,
 		Config:           controlConfig,
@@ -402,4 +411,105 @@ func loadAgentProfiles(loader *compiler.TOMLLoader, detector *judge.DriftDetecto
 		loaded++
 	}
 	logger.Info("agent personality profiles loaded", "count", loaded, "agents_dir", agentsDir)
+}
+
+// roomToml is the minimal TOML structure for rooms.toml parsing.
+type roomToml struct {
+	Rooms []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"rooms"`
+}
+
+// loadRoomDefs loads room definitions from rooms.toml for move target resolution.
+func loadRoomDefs(path string) ([]extraction.RoomDef, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	// Simple TOML parsing: extract id and name from [[rooms]] entries.
+	// We use a line-by-line parser since we only need id/name fields.
+	var defs []extraction.RoomDef
+	var currentID, currentName string
+	inRoom := false
+
+	for _, line := range splitLines(string(data)) {
+		trimmed := trimLine(line)
+		if trimmed == "[[rooms]]" {
+			if inRoom && currentID != "" {
+				defs = append(defs, extraction.RoomDef{ID: currentID, Name: currentName})
+			}
+			currentID = ""
+			currentName = ""
+			inRoom = true
+			continue
+		}
+		if !inRoom {
+			continue
+		}
+		if key, val, ok := parseTomlKV(trimmed); ok {
+			switch key {
+			case "id":
+				currentID = val
+			case "name":
+				currentName = val
+			}
+		}
+	}
+	// Last room
+	if inRoom && currentID != "" {
+		defs = append(defs, extraction.RoomDef{ID: currentID, Name: currentName})
+	}
+
+	return defs, nil
+}
+
+func splitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			lines = append(lines, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
+}
+
+func trimLine(s string) string {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r') {
+		i++
+	}
+	j := len(s)
+	for j > i && (s[j-1] == ' ' || s[j-1] == '\t' || s[j-1] == '\r') {
+		j--
+	}
+	return s[i:j]
+}
+
+func parseTomlKV(line string) (key, val string, ok bool) {
+	eq := -1
+	for i := 0; i < len(line); i++ {
+		if line[i] == '=' {
+			eq = i
+			break
+		}
+	}
+	if eq < 0 {
+		return "", "", false
+	}
+	key = trimLine(line[:eq])
+	raw := trimLine(line[eq+1:])
+	// Strip quotes
+	if len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"' {
+		val = raw[1 : len(raw)-1]
+	} else {
+		val = raw
+	}
+	return key, val, true
 }
