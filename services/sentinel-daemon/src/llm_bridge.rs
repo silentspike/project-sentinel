@@ -6,7 +6,7 @@
 //! Enterprise Features:
 //! - Circuit Breaker (3 Failures → Open, 30s Reset)
 //! - Rate Limiting pro Agent (min 5 Ticks zwischen Calls)
-//! - Concurrency Limiter (max 4 parallele LLM Calls)
+//! - Concurrency Limiter (urgent: 8 Slots mit await, normal: 8 Slots mit try_acquire)
 //! - Graceful Degradation (autonomy_system uebernimmt bei Gateway-Ausfall)
 //! - Structured Logging mit Tracing Spans
 
@@ -48,7 +48,7 @@ pub mod bridge {
                 gateway_url: "http://localhost:8080".to_string(),
                 max_concurrent: 8,
                 min_ticks_between_calls: 5,
-                request_timeout: Duration::from_secs(25),
+                request_timeout: Duration::from_secs(35),
                 circuit_breaker_threshold: 3,
                 circuit_breaker_reset: Duration::from_secs(30),
             }
@@ -116,6 +116,7 @@ pub mod bridge {
 
     #[derive(Debug, Deserialize)]
     struct GatewayResponse {
+        #[allow(dead_code)]
         #[serde(default)]
         content: String,
         #[serde(default)]
@@ -193,12 +194,17 @@ pub mod bridge {
             }
         };
 
-        let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
+        // 2 Semaphores: urgent (heard_text/P1) wartet IMMER, normal (Heartbeats) darf droppen
+        let urgent_semaphore = Arc::new(Semaphore::new(8));
+        let normal_semaphore = Arc::new(Semaphore::new(8));
         let circuit_breaker = Arc::new(std::sync::Mutex::new(CircuitBreaker::new(
             config.circuit_breaker_threshold,
             config.circuit_breaker_reset,
         )));
         let mut last_call_tick: HashMap<AgentId, u64> = HashMap::new();
+        // Debounce: Operator-Impulse (Gaia/Broadcast) nur beim ERSTEN Tick urgent,
+        // danach 60 Ticks Cooldown. Verhindert Semaphore-Starvation bei 300-Tick TTL.
+        let mut impulse_acked: HashMap<AgentId, u64> = HashMap::new();
 
         // Blocking receive in eigenem Thread, forward an async channel
         let (async_tx, mut async_rx) = tokio::sync::mpsc::channel::<Perception>(256);
@@ -230,7 +236,22 @@ pub mod bridge {
 
                 // heard_text oder direkt angesprochen → Rate-Limit bypass
                 let has_heard = !perception.heard_text.is_empty();
-                let is_urgent = perception.is_directly_addressed || has_heard;
+                let mut is_urgent = perception.is_directly_addressed
+                    || has_heard
+                    || perception.has_operator_impulse;
+
+                // Debounce: Operator-Impulse (Gaia/Broadcast) nur beim ERSTEN Tick urgent.
+                // IM:1 bleibt im Fingerprint → Synthesis bypassed im Gateway.
+                // Aber nur 1 urgent Call pro 60 Ticks pro Agent.
+                if is_urgent && perception.has_operator_impulse && !has_heard && !perception.is_directly_addressed {
+                    let last_ack = impulse_acked.get(&agent_id).copied().unwrap_or(0);
+                    if current_tick.saturating_sub(last_ack) < 60 {
+                        // Bereits innerhalb der letzten 60 Ticks acknowledged
+                        is_urgent = false;
+                    } else {
+                        impulse_acked.insert(agent_id, current_tick);
+                    }
+                }
 
                 // Rate Limiting pro Agent (urgent bypass)
                 if !is_urgent {
@@ -267,15 +288,6 @@ pub mod bridge {
                     has_heard = !perception.heard_text.is_empty(),
                     "LLM call triggered");
 
-                // Semaphore fuer Concurrency Limiting
-                let permit = match semaphore.clone().try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        debug!(agent = %agent_id, "LLM Call uebersprungen: max concurrent erreicht");
-                        continue;
-                    }
-                };
-
                 let client = client.clone();
                 let url = format!("{}/v1/chat/completions", config.gateway_url);
                 let action_tx = action_tx.clone();
@@ -285,64 +297,166 @@ pub mod bridge {
 
                 telemetry.calls_total.fetch_add(1, Ordering::Relaxed);
 
-                // Non-blocking: HTTP Call in tokio::spawn damit die Bridge
-                // sofort weiter drainen kann (verhindert Channel-Overflow).
-                tokio::spawn(async move {
-                    let call_start = Instant::now();
-                    match client.post(&url).json(&request).send().await {
-                        Ok(response) => {
-                            let status = response.status();
-                            if status.is_success() {
-                                match response.json::<GatewayResponse>().await {
-                                    Ok(gateway_resp) => {
-                                        let latency_ms = call_start.elapsed().as_millis();
-                                        telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
-                                        telemetry.tokens_total.fetch_add(
-                                            gateway_resp.tokens_used as u64,
-                                            Ordering::Relaxed,
-                                        );
-                                        cb.lock().unwrap().record_success();
+                if is_urgent {
+                    // Urgent (heard_text/P1): acquire_owned().await INNERHALB tokio::spawn.
+                    // Wartet auf Permit im eigenen Task — Drain-Loop blockiert NICHT,
+                    // urgent Calls werden NIEMALS gedroppt.
+                    let sem = urgent_semaphore.clone();
+                    tokio::spawn(async move {
+                        // Timeout: Chat-Kontext wird nach 15s zu alt, Starvation vermeiden
+                        let permit = match tokio::time::timeout(
+                            std::time::Duration::from_secs(15),
+                            sem.acquire_owned(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(permit)) => permit,
+                            Ok(Err(_)) => {
+                                warn!(agent = %agent_id, "URGENT Semaphore closed");
+                                return;
+                            }
+                            Err(_) => {
+                                warn!(agent = %agent_id, "URGENT Semaphore timeout (15s)");
+                                return;
+                            }
+                        };
+                        let call_start = Instant::now();
+                        match client.post(&url).json(&request).send().await {
+                            Ok(response) => {
+                                let status = response.status();
+                                if status.is_success() {
+                                    match response.json::<GatewayResponse>().await {
+                                        Ok(gateway_resp) => {
+                                            let latency_ms = call_start.elapsed().as_millis();
+                                            telemetry
+                                                .calls_success
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            telemetry.tokens_total.fetch_add(
+                                                gateway_resp.tokens_used as u64,
+                                                Ordering::Relaxed,
+                                            );
+                                            cb.lock().unwrap().record_success();
 
-                                        debug!(
-                                            agent = %agent_id,
-                                            request_id = %gateway_resp.request_id,
-                                            tokens = gateway_resp.tokens_used,
-                                            actions = gateway_resp.actions.len(),
-                                            latency_ms = latency_ms,
-                                            "LLM Response erhalten"
-                                        );
+                                            info!(
+                                                agent = %agent_id,
+                                                request_id = %gateway_resp.request_id,
+                                                tokens = gateway_resp.tokens_used,
+                                                actions = gateway_resp.actions.len(),
+                                                latency_ms = latency_ms,
+                                                "URGENT LLM Response erhalten"
+                                            );
 
-                                        for extracted in &gateway_resp.actions {
-                                            if let Some(agent_action) = map_extracted_to_action(
-                                                agent_id,
-                                                extracted,
-                                                current_tick,
-                                            ) {
-                                                let _ = action_tx.send(agent_action);
+                                            let is_synthesis = gateway_resp.tokens_used == 0;
+                                            for extracted in &gateway_resp.actions {
+                                                if let Some(agent_action) =
+                                                    map_extracted_to_action(
+                                                        agent_id,
+                                                        extracted,
+                                                        current_tick,
+                                                        is_synthesis,
+                                                    )
+                                                {
+                                                    let _ = action_tx.send(agent_action);
+                                                }
                                             }
                                         }
+                                        Err(e) => {
+                                            warn!(agent = %agent_id, error = %e, "Gateway Response Parse-Fehler");
+                                            telemetry
+                                                .calls_failed
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            cb.lock().unwrap().record_failure();
+                                        }
                                     }
-                                    Err(e) => {
-                                        warn!(agent = %agent_id, error = %e, "Gateway Response Parse-Fehler");
-                                        telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
-                                        cb.lock().unwrap().record_failure();
-                                    }
+                                } else {
+                                    warn!(agent = %agent_id, status = status.as_u16(), "Gateway HTTP Fehler");
+                                    telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
+                                    cb.lock().unwrap().record_failure();
                                 }
-                            } else {
-                                warn!(agent = %agent_id, status = status.as_u16(), "Gateway HTTP Fehler");
+                            }
+                            Err(e) => {
+                                let is_timeout = e.is_timeout();
+                                warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, "Gateway Request fehlgeschlagen");
                                 telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                 cb.lock().unwrap().record_failure();
                             }
                         }
-                        Err(e) => {
-                            let is_timeout = e.is_timeout();
-                            warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, "Gateway Request fehlgeschlagen");
-                            telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
-                            cb.lock().unwrap().record_failure();
+                        drop(permit);
+                    });
+                } else {
+                    // Normal (Heartbeats): try_acquire — droppen OK, Heartbeats sind nicht kritisch.
+                    let permit = match normal_semaphore.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            debug!(agent = %agent_id, "Heartbeat LLM Call uebersprungen: max concurrent erreicht");
+                            continue;
                         }
-                    }
-                    drop(permit);
-                });
+                    };
+                    tokio::spawn(async move {
+                        let call_start = Instant::now();
+                        match client.post(&url).json(&request).send().await {
+                            Ok(response) => {
+                                let status = response.status();
+                                if status.is_success() {
+                                    match response.json::<GatewayResponse>().await {
+                                        Ok(gateway_resp) => {
+                                            let latency_ms = call_start.elapsed().as_millis();
+                                            telemetry
+                                                .calls_success
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            telemetry.tokens_total.fetch_add(
+                                                gateway_resp.tokens_used as u64,
+                                                Ordering::Relaxed,
+                                            );
+                                            cb.lock().unwrap().record_success();
+
+                                            info!(
+                                                agent = %agent_id,
+                                                request_id = %gateway_resp.request_id,
+                                                tokens = gateway_resp.tokens_used,
+                                                actions = gateway_resp.actions.len(),
+                                                latency_ms = latency_ms,
+                                                "LLM Response erhalten"
+                                            );
+
+                                            let is_synthesis = gateway_resp.tokens_used == 0;
+                                            for extracted in &gateway_resp.actions {
+                                                if let Some(agent_action) =
+                                                    map_extracted_to_action(
+                                                        agent_id,
+                                                        extracted,
+                                                        current_tick,
+                                                        is_synthesis,
+                                                    )
+                                                {
+                                                    let _ = action_tx.send(agent_action);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(agent = %agent_id, error = %e, "Gateway Response Parse-Fehler");
+                                            telemetry
+                                                .calls_failed
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            cb.lock().unwrap().record_failure();
+                                        }
+                                    }
+                                } else {
+                                    warn!(agent = %agent_id, status = status.as_u16(), "Gateway HTTP Fehler");
+                                    telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
+                                    cb.lock().unwrap().record_failure();
+                                }
+                            }
+                            Err(e) => {
+                                let is_timeout = e.is_timeout();
+                                warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, "Gateway Request fehlgeschlagen");
+                                telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
+                                cb.lock().unwrap().record_failure();
+                            }
+                        }
+                        drop(permit);
+                    });
+                }
             }
         }
 
@@ -391,6 +505,19 @@ pub mod bridge {
         metadata.insert("perception".to_string(), formatted_perception);
         metadata.insert("tick".to_string(), perception.tick.0.to_string());
         metadata.insert("request_id".to_string(), uuid::Uuid::new_v4().to_string());
+
+        // Traffic Control Metadata (Synthesis, Chat-Sequencing)
+        metadata.insert("room_id".to_string(), perception.room_id.clone());
+        metadata.insert("max_priority".to_string(), perception.max_priority.clone());
+        metadata.insert("synth_fp".to_string(), perception.synth_fingerprint.clone());
+        metadata.insert(
+            "is_directly_addressed".to_string(),
+            perception.is_directly_addressed.to_string(),
+        );
+        metadata.insert(
+            "personality_type".to_string(),
+            perception.personality_type.clone(),
+        );
 
         // Evolution-Daten aus redb lesen und als Metadata-Keys hinzufuegen.
         // Gateway parst diese via EvolutionFromMetadata() fuer 3-Source Assembly.
@@ -474,10 +601,13 @@ pub mod bridge {
     }
 
     /// Mappt eine ExtractedAction (Gateway) auf eine AgentAction (ECS).
+    /// `is_synthesis`: true wenn Gateway Synthesis-Template geliefert hat (tokens=0).
+    /// Synthesis-Chat wird zu Emote remappt um Chat-Kaskaden zu vermeiden.
     fn map_extracted_to_action(
         agent_id: AgentId,
         extracted: &ExtractedAction,
         tick: u64,
+        is_synthesis: bool,
     ) -> Option<AgentAction> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -486,7 +616,16 @@ pub mod bridge {
 
         let action_type = match extracted.action_type.as_str() {
             "move" => ActionType::Move,
-            "chat" | "work" | "break" | "think" => ActionType::Chat,
+            "chat" | "work" | "break" | "think" => {
+                // Synthesis-generierte Chat-Aktionen als Emote behandeln,
+                // damit sie NICHT in den RoomChatBuffer fliessen und
+                // keine Chat-Kaskade ausloesen (P3 Fix)
+                if is_synthesis {
+                    ActionType::Emote
+                } else {
+                    ActionType::Chat
+                }
+            }
             "tool_use" => ActionType::ToolUse,
             "emote" => ActionType::Emote,
             "phone_call" => ActionType::PhoneCall,
@@ -546,6 +685,11 @@ pub mod bridge {
                 is_directly_addressed: false,
                 timestamp: Timestamp(1234),
                 tick: Tick(55),
+                room_id: "buero-design".to_string(),
+                max_priority: "P2".to_string(),
+                synth_fingerprint: "H3|E7|B2|S4|C1|SN5|R:buero-design|P:2|CH:0|HR:0|T:10|TMP:1|PE:E|IM:0".to_string(),
+                personality_type: "E".to_string(),
+                has_operator_impulse: false,
             };
 
             let request = build_gateway_request(&perception, &store);
@@ -573,6 +717,13 @@ pub mod bridge {
                 &perception.environment_text
             );
             assert_eq!(metadata.get("acoustic").unwrap(), &perception.acoustic_text);
+
+            // Traffic Control Metadata
+            assert_eq!(metadata.get("room_id").unwrap(), "buero-design");
+            assert_eq!(metadata.get("max_priority").unwrap(), "P2");
+            assert!(metadata.get("synth_fp").unwrap().starts_with("H3|E7|"));
+            assert_eq!(metadata.get("is_directly_addressed").unwrap(), "false");
+            assert_eq!(metadata.get("personality_type").unwrap(), "E");
         }
     }
 }

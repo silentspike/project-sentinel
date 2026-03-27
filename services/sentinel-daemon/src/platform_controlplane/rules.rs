@@ -41,7 +41,16 @@ pub fn evaluate_rules(
     let mut actions = Vec::new();
 
     // Regel 1: Agent Stall → Restart
+    // Agents mit kuerzlicher Activity (letzte 120 Ticks) ueberspringen:
+    // Synthesis-Agents machen 0 Kernel-Syscalls → eBPF meldet sie als "stalled",
+    // aber sie produzieren aktiv Actions. Erst despawnen wenn WIRKLICH tot.
     for agent_name in &metrics.stalled_agents {
+        // Agent hat kuerzlich eine Action ausgefuehrt → nicht stalled
+        if let Some(&last_tick) = metrics.last_action_ticks.get(agent_name) {
+            if tick.saturating_sub(last_tick) < 120 {
+                continue;
+            }
+        }
         let key = format!("agent_stall:{agent_name}");
         if !is_cooled_down(cooldowns, &key, tick, config.stall_cooldown_ticks) {
             continue;

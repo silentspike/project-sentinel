@@ -350,6 +350,9 @@ pub fn operator_command_system(
     mut gaia_buffer: ResMut<super::world::GaiaBuffer>,
     mut broadcast_buffer: ResMut<super::world::BroadcastBuffer>,
     all_agents_query: Query<&AgentIdentity>,
+    // PUSH-Perception: Sofort Perception fuer Chat-Empfaenger senden
+    perception_sender: Option<Res<PerceptionSender>>,
+    chat_agents: Query<(&AgentIdentity, &Position, &Personality)>,
 ) {
     let Some(receiver) = receiver else { return };
     let Ok(rx) = receiver.0.lock() else { return };
@@ -411,6 +414,63 @@ pub fn operator_command_system(
                 );
                 tracing::info!(room = %cmd.room_id, sender = %cmd.sender_name,
                     "Operator-Chat in RoomChatBuffer eingefuegt");
+
+                // PUSH: Sofort Perception fuer alle Agents im Raum senden.
+                // Chat ist ein Event das sofortige Propagation braucht — nicht auf
+                // output_system Polling warten (1-Tick Fenster ist zu schmal).
+                if let Some(ref sender) = perception_sender {
+                    let msg_text = &cmd.message[..cmd.message.len().min(500)];
+                    let heard = format!("{} sagte: \"{}\"", cmd.sender_name, msg_text);
+
+                    for (identity, position, personality) in &chat_agents {
+                        if position.room_id == cmd.room_id && !position.in_transit {
+                            let first_name = identity
+                                .name
+                                .split_whitespace()
+                                .next()
+                                .unwrap_or(&identity.name);
+                            let is_addressed = cmd.message.contains(first_name);
+                            let pe = if personality.extraversion > 0.5 { "E" } else { "I" };
+
+                            let perception = Perception {
+                                agent_id: identity.agent_id,
+                                circadian_text: String::new(),
+                                body_text: String::new(),
+                                environment_text: String::new(),
+                                acoustic_text: String::new(),
+                                heard_text: heard.clone(),
+                                presence_text: String::new(),
+                                impulse_text: String::new(),
+                                is_directly_addressed: is_addressed,
+                                timestamp: Timestamp(time.tick.0),
+                                tick: time.tick,
+                                room_id: cmd.room_id.clone(),
+                                max_priority: "P1".to_string(),
+                                synth_fingerprint: format!(
+                                    "H0|E0|B0|S0|C0|SN0|R:{}|P:0|CH:0|HR:1|T:0|TMP:0|PE:{}|IM:0",
+                                    cmd.room_id, pe
+                                ),
+                                personality_type: pe.to_string(),
+                                has_operator_impulse: false,
+                            };
+                            // Blockierend senden — Chat darf NICHT verloren gehen
+                            if sender.0.send(perception).is_err() {
+                                tracing::error!(
+                                    agent = %identity.name,
+                                    room = %cmd.room_id,
+                                    "Chat-Push-Perception send fehlgeschlagen"
+                                );
+                            } else {
+                                tracing::info!(
+                                    agent = %identity.name,
+                                    room = %cmd.room_id,
+                                    is_addressed,
+                                    "Chat-Push-Perception gesendet"
+                                );
+                            }
+                        }
+                    }
+                }
             }
             OperatorCommand::Gaia(cmd) => {
                 gaia_buffer.add(
@@ -418,15 +478,39 @@ pub fn operator_command_system(
                     cmd.thought.clone(),
                     time.tick.0,
                 );
+                let payload = DomainEventPayload::OperatorGaiaSent {
+                    target_agent_id: cmd.target_agent_id,
+                    thought: cmd.thought.clone(),
+                };
+                let event = DomainEvent::new(
+                    payload.event_type_str(),
+                    &format!("AGENT-{:02}", cmd.target_agent_id),
+                    &payload.to_json(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    time.tick.0,
+                );
+                event_buffer.events.push(event);
                 tracing::info!(
                     agent_id = cmd.target_agent_id,
-                    "Voice of Gaia: Gedanke eingepflanzt"
+                    "Voice of Gaia: Gedanke eingepflanzt + Event emittiert"
                 );
             }
             OperatorCommand::Broadcast(cmd) => {
                 broadcast_buffer.add(cmd.message.clone(), cmd.broadcast_type.clone(), time.tick.0);
+                let payload = DomainEventPayload::OperatorBroadcastSent {
+                    message: cmd.message.clone(),
+                    broadcast_type: cmd.broadcast_type.clone(),
+                };
+                let event = DomainEvent::new(
+                    payload.event_type_str(),
+                    "SYSTEM",
+                    &payload.to_json(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    time.tick.0,
+                );
+                event_buffer.events.push(event);
                 tracing::info!(broadcast_type = %cmd.broadcast_type,
-                    "Broadcast: Durchsage gesendet");
+                    "Broadcast: Durchsage gesendet + Event emittiert");
             }
             OperatorCommand::Nightrun(_)
             | OperatorCommand::Snapshot(_)
@@ -1337,6 +1421,8 @@ pub fn output_system(
     query: Query<OutputAgentQueryData>,
     time: Res<SimulationTime>,
     mut room_chat_buffer: ResMut<super::world::RoomChatBuffer>,
+    gaia_buffer: Res<super::world::GaiaBuffer>,
+    broadcast_buffer: Res<super::world::BroadcastBuffer>,
 ) {
     let Some(sender) = sender else { return };
 
@@ -1437,10 +1523,27 @@ pub fn output_system(
         };
 
         // Room-Chat: heard_text aus RoomChatBuffer
+        let can_respond_result = room_chat_buffer.can_respond(&identity.name, time.tick.0);
+        if !can_respond_result && present_agents.is_empty() {
+            // P3 Debug: Single-Agent-Room self-block detection
+            tracing::warn!(
+                agent = %identity.name,
+                room = %position.room_id,
+                "can_respond=false in Single-Agent-Room (self-block?)"
+            );
+        }
         let (heard_text, is_directly_addressed) =
-            if !position.in_transit && room_chat_buffer.can_respond(&identity.name, time.tick.0) {
+            if !position.in_transit && can_respond_result {
                 let recent =
                     room_chat_buffer.get_recent(&position.room_id, time.tick.0, &identity.name);
+                if !recent.is_empty() {
+                    tracing::info!(
+                        agent = %identity.name,
+                        room = %position.room_id,
+                        recent_count = recent.len(),
+                        "output_system: heard_text gefunden"
+                    );
+                }
                 if recent.is_empty() {
                     (String::new(), false)
                 } else {
@@ -1475,6 +1578,41 @@ pub fn output_system(
             || !heard_text.is_empty()
             || is_heartbeat;
         if has_content {
+            // Synthesis Fingerprint: Bio-Buckets + Room + Stimuli + Hour + Temp + Personality
+            let bio_bucket = |v: f32| -> u8 { (v / 10.0).floor().clamp(0.0, 9.0) as u8 };
+            let has_chaos = queue.events.iter().any(|e| {
+                e.text.contains("Chaos") || e.text.contains("Alarm") || e.text.contains("Notfall")
+            });
+            let pe = if personality.extraversion < 0.5 { "I" } else { "E" };
+            let sim_hour = time.sim_hour.floor() as u8;
+            let temp_high = room_temp_c > 26.0;
+            // Operator-Impulse: Gaia/Broadcast aktiv → Synthesis MUSS bypassed werden
+            let has_operator_impulse =
+                !gaia_buffer.get_active(&identity.agent_id, time.tick.0).is_empty()
+                    || !broadcast_buffer.get_active(time.tick.0).is_empty();
+            let synth_fingerprint = format!(
+                "H{}|E{}|B{}|S{}|C{}|SN{}|R:{}|P:{}|CH:{}|HR:{}|T:{}|TMP:{}|PE:{}|IM:{}",
+                bio_bucket(bio.hunger),
+                bio_bucket(bio.energy),
+                bio_bucket(bio.bladder),
+                bio_bucket(bio.stress),
+                bio_bucket(bio.caffeine_mg.clamp(0.0, 100.0)),
+                bio_bucket(bio.social_need),
+                position.room_id,
+                present_agents.len(),
+                if has_chaos { 1 } else { 0 },
+                if !heard_text.is_empty() { 1 } else { 0 },
+                sim_hour,
+                if temp_high { 1 } else { 0 },
+                pe,
+                if has_operator_impulse { 1 } else { 0 },
+            );
+            let max_priority = queue
+                .events
+                .first()
+                .map(|e| format!("{:?}", e.priority))
+                .unwrap_or_else(|| "NONE".to_string());
+
             let msg = Perception {
                 agent_id: identity.agent_id,
                 circadian_text: prompt_perception.circadian_text,
@@ -1487,6 +1625,11 @@ pub fn output_system(
                 is_directly_addressed,
                 timestamp: Timestamp(time.tick.0),
                 tick: time.tick,
+                room_id: position.room_id.clone(),
+                max_priority,
+                synth_fingerprint,
+                personality_type: pe.to_string(),
+                has_operator_impulse,
             };
             if sender.0.try_send(msg).is_err() {
                 tracing::warn!(agent = %identity.name, "Perception gedroppt (Channel voll)");

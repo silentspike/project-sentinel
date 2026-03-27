@@ -22,7 +22,11 @@ import (
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/observatory"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/apicp"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/resilience"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/sequencing"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/synthesis"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/ticksync"
 	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/eventstore"
 	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/judge"
 )
@@ -156,6 +160,48 @@ func main() {
 	}()
 	logger.Info("inflight map enabled", "deadline", providerDeadline)
 
+	// 5d. Traffic Control: Synthesis, Sequencing, Tick-Sync, API-CP
+	var synthEngine *synthesis.Engine
+	if os.Getenv("SENTINEL_SYNTHESIS_ENABLED") == "true" {
+		synthEngine = synthesis.NewEngine(true, logger)
+		logger.Info("synthesis engine enabled", "rules", 8)
+	}
+
+	var chatSequencer *sequencing.Sequencer
+	if os.Getenv("SENTINEL_SEQUENCING_ENABLED") == "true" {
+		chatSequencer = sequencing.NewSequencer(10*time.Second, true, logger)
+		logger.Info("chat sequencing enabled", "timeout", "10s")
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				chatSequencer.Cleanup()
+			}
+		}()
+	}
+
+	var tickSync *ticksync.Buffer
+	if os.Getenv("SENTINEL_TICK_SYNC_ENABLED") == "true" {
+		timeout := 2 * time.Second
+		if v := os.Getenv("SENTINEL_TICK_SYNC_TIMEOUT_MS"); v != "" {
+			if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+				timeout = time.Duration(ms) * time.Millisecond
+			}
+		}
+		tickSync = ticksync.NewBuffer(timeout, true, logger)
+		logger.Info("tick sync enabled", "timeout", timeout)
+	}
+
+	var apicpObserver *apicp.Observer
+	if os.Getenv("SENTINEL_APICP_ENABLED") == "true" {
+		dumpPath := "data/apicp-patterns.json"
+		if v := os.Getenv("SENTINEL_APICP_DUMP_PATH"); v != "" {
+			dumpPath = v
+		}
+		apicpObserver = apicp.NewObserver(dumpPath, 5*time.Minute, logger)
+		logger.Info("api-cp learning agent enabled", "dump_path", dumpPath)
+	}
+
 	pipelineHandler := proxy.NewPipelineHandler(proxy.PipelineConfig{
 		Registry:         registry,
 		Config:           controlConfig,
@@ -171,6 +217,9 @@ func main() {
 		ProviderDeadline: providerDeadline,
 		Drift:            driftDetector,
 		Quality:          qualityScorer,
+		Synthesis:        synthEngine,
+		Sequencer:        chatSequencer,
+		Observer:         apicpObserver,
 	})
 
 	// 6. HTTP proxy server
@@ -202,6 +251,22 @@ func main() {
 	if obsHandler != nil {
 		obsHandler.RegisterRoutes(controlMux)
 	}
+
+	// 7d. Traffic Control stats on control plane (AC-19)
+	controlMux.HandleFunc("GET /control/traffic-stats", func(w http.ResponseWriter, r *http.Request) {
+		stats := map[string]interface{}{
+			"synthesis_enabled":   synthEngine != nil && synthEngine.Enabled(),
+			"sequencing_enabled":  chatSequencer != nil && chatSequencer.Enabled(),
+			"tick_sync_enabled":   tickSync != nil && tickSync.Enabled(),
+			"apicp_enabled":       apicpObserver != nil,
+		}
+		if apicpObserver != nil {
+			stats["apicp"] = apicpObserver.Stats()
+			stats["apicp_suggestions"] = apicpObserver.Suggestions()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(stats)
+	})
 
 	controlServer := &http.Server{
 		Addr:         ":" + controlPort,

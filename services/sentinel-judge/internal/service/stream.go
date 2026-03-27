@@ -197,7 +197,7 @@ func (sc *StreamConsumer) runHeuristics(agentID, latestMessage string, recentMes
 	}
 	metrics.DriftScore.WithLabelValues(agentID).Set(driftScore)
 
-	if severityAtLeast(driftResult.Severity, sc.cfg.Thresholds.DriftAlertSeverity) {
+	if sc.cfg.Thresholds.DriftAlertSeverity != "none" && severityAtLeast(driftResult.Severity, sc.cfg.Thresholds.DriftAlertSeverity) {
 		sc.alerter.Emit(alerter.Alert{
 			AgentID:  agentID,
 			Type:     "drift",

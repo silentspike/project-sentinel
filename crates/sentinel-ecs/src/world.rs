@@ -611,7 +611,9 @@ pub struct BroadcastMessage {
     pub ttl_ticks: u64,
 }
 
-const BROADCAST_TTL_TICKS: u64 = 300;
+// 60 Ticks (~1 Minute): Durchsagen sollen kurz wirken, nicht 5 Min den Kontext dominieren.
+// Vorher 300 (5 Min) → hat_operator_impulse blieb zu lange true → Semaphore-Starvation.
+const BROADCAST_TTL_TICKS: u64 = 60;
 
 impl BroadcastBuffer {
     pub fn add(&mut self, content: String, broadcast_type: String, tick: u64) {

@@ -19,6 +19,9 @@ pub struct PlatformMetrics {
     pub tick: u64,
     /// Namen von systemd Services die nicht active sind.
     pub failed_services: Vec<String>,
+    /// Letzter Tick mit Action pro Agent (Agent-Name → Tick).
+    /// Agents mit kuerzlicher Activity sollen NICHT als stalled despawnt werden.
+    pub last_action_ticks: std::collections::HashMap<String, u64>,
 }
 
 /// Stateful Metrics Collector (behaelt prev_write_bytes fuer Delta-Berechnung).

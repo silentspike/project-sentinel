@@ -317,6 +317,18 @@ controlRoutes.post("/control/prune", async (c) => {
   }
 });
 
+// ── GET /api/control/traffic-stats — Traffic Control Stats (AC-19) ──
+controlRoutes.get("/control/traffic-stats", async (c) => {
+  try {
+    return await proxyGet(getCortexControlUrl(), "/control/traffic-stats");
+  } catch (err) {
+    return c.json(
+      { error: "Cortex Gateway nicht erreichbar", detail: String(err) },
+      502,
+    );
+  }
+});
+
 // ── GET /api/control/status — Aggregierter Status ──
 // Kombiniert Config + Cortex Health + Guardrails fuer das Frontend.
 

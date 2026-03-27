@@ -139,7 +139,7 @@ fn generate_chat_events(
     }
 }
 
-/// Gaia-Events: Raum-unabhaengige Gedanken-Injection. P2, max 1/Tick.
+/// Gaia-Events: Raum-unabhaengige Gedanken-Injection. P1 (hoeher als Broadcast).
 fn generate_gaia_events(
     agent_id: sentinel_common::AgentId,
     gaia_buffer: &GaiaBuffer,
@@ -151,7 +151,7 @@ fn generate_gaia_events(
         push_event(
             queue,
             PendingEvent {
-                priority: Priority::P2,
+                priority: Priority::P1,
                 text: format!("Dir faellt ein: {}", thought.content),
                 ttl_ticks: 60,
                 created_tick: thought.tick,
@@ -160,7 +160,8 @@ fn generate_gaia_events(
     }
 }
 
-/// Broadcast-Events: System-weite Durchsagen. P2, max 1/Tick.
+/// Broadcast-Events: System-weite Durchsagen. P3 (niedriger als Gaia/Bio).
+/// Durchsagen sollen den Kontext nicht dominieren.
 fn generate_broadcast_events(
     broadcast_buffer: &BroadcastBuffer,
     queue: &mut EventQueue,
@@ -171,7 +172,7 @@ fn generate_broadcast_events(
         push_event(
             queue,
             PendingEvent {
-                priority: Priority::P2,
+                priority: Priority::P3,
                 text: format!("Durchsage: {}", msg.content),
                 ttl_ticks: 30,
                 created_tick: msg.tick,

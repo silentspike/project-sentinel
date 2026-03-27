@@ -247,6 +247,16 @@ pub enum DomainEventPayload {
         old_profile: String,
         new_profile: String,
     },
+    /// Voice of Gaia: Operator hat Gedanke eingepflanzt
+    OperatorGaiaSent {
+        target_agent_id: u16,
+        thought: String,
+    },
+    /// Broadcast: Operator hat Durchsage gesendet
+    OperatorBroadcastSent {
+        message: String,
+        broadcast_type: String,
+    },
 }
 
 impl DomainEventPayload {
@@ -280,6 +290,8 @@ impl DomainEventPayload {
             Self::SmellEventTriggered { .. } => "smell_event_triggered",
             Self::PlatformIntervention { .. } => "platform_intervention",
             Self::ResourceProfileChanged { .. } => "resource_profile_changed",
+            Self::OperatorGaiaSent { .. } => "operator_gaia_sent",
+            Self::OperatorBroadcastSent { .. } => "operator_broadcast_sent",
         }
     }
 }

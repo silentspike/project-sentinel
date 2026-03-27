@@ -1123,11 +1123,10 @@ fn ecs_tick_loop(
         }
     }
 
-    // EventBuffer leeren: ECS spawn_agent emittiert eigene Events, aber der
-    // RuntimeOrchestrator ist SSOT fuer Lifecycle-Events (vermeidet Duplikate)
-    if let Some(mut event_buffer) = world.get_resource_mut::<EventBuffer>() {
-        event_buffer.events.clear();
-    }
+    // AgentSpawned Events BEHALTEN — Projection braucht sie nach Restore.
+    // spawn_agent() emittiert AgentSpawned, upsert_agent() in Projection ist idempotent.
+    // Vorher wurden ALLE Events hier geloescht, was nach Restore dazu fuehrte dass
+    // die Projection 0 aktive Agents zeigte (Dashboard-API leer).
 
     info!(
         agent_count = shift_agents.len(),
@@ -1229,7 +1228,7 @@ fn ecs_tick_loop(
                     .map(|(id, h)| (h.identity.name.clone(), *id))
                     .collect();
             let failed_services = service_health_checker.poll_failed();
-            let pcp_metrics = crate::platform_controlplane::metrics::collect(
+            let mut pcp_metrics = crate::platform_controlplane::metrics::collect(
                 &mut pcp_metrics_collector,
                 &last_ebpf_snapshot,
                 &event_store_for_prune,
@@ -1238,6 +1237,15 @@ fn ecs_tick_loop(
                 tick_count,
                 failed_services,
             );
+            // last_action_ticks aus RuntimeOrchestrator befuellen —
+            // Agents mit kuerzlicher Activity sollen nicht als stalled despawnt werden.
+            for (id, handle) in runtime_orch.agents() {
+                let _ = id; // Agent-Name ist im Handle
+                pcp_metrics.last_action_ticks.insert(
+                    handle.identity.name.clone(),
+                    handle.last_activity_tick.0,
+                );
+            }
             let side_effects = platform_cp.cycle(
                 &pcp_metrics,
                 &event_store_for_prune,
@@ -1577,10 +1585,8 @@ fn ecs_tick_loop(
                     }
                 }
 
-                // EventBuffer leeren (spawn_agent_full → ECS spawn Events, Orchestrator ist SSOT)
-                if let Some(mut event_buffer) = world.get_resource_mut::<EventBuffer>() {
-                    event_buffer.events.clear();
-                }
+                // AgentSpawned Events BEHALTEN — Projection braucht sie bei Schichtwechsel.
+                // upsert_agent() in Projection ist idempotent.
 
                 info!(
                     removed = removed.len(),
@@ -2152,16 +2158,9 @@ fn ecs_tick_loop(
         "Shutdown: sim_hour persist"
     );
 
-    // 5. Despawn-Events emittieren (Projection occupant_count Drift vermeiden)
-    let t = Instant::now();
-    let despawned = runtime_orch.despawn_all_for_shutdown();
-    info!(
-        agents = despawned,
-        duration_ms = t.elapsed().as_millis() as u64,
-        "Shutdown: Despawn-Events"
-    );
-
-    // 6. Runtime-Snapshot speichern
+    // 5. Runtime-Snapshot speichern (VOR Despawn! Snapshot muss aktuelle Agents enthalten,
+    //    nicht 0. Beim Restart erkennt shift_transition() ob Schichtwechsel stattfand
+    //    und entfernt/spawnt Agents entsprechend.)
     let t = Instant::now();
     if let Err(e) = runtime_orch.save_state() {
         error!(error = %e, "Runtime State Snapshot fehlgeschlagen");
@@ -2174,6 +2173,15 @@ fn ecs_tick_loop(
     info!(
         duration_ms = t.elapsed().as_millis() as u64,
         "Shutdown: Runtime-Snapshot"
+    );
+
+    // 6. Despawn-Events emittieren (Projection occupant_count Drift vermeiden)
+    let t = Instant::now();
+    let despawned = runtime_orch.despawn_all_for_shutdown();
+    info!(
+        agents = despawned,
+        duration_ms = t.elapsed().as_millis() as u64,
+        "Shutdown: Despawn-Events"
     );
 
     info!(
