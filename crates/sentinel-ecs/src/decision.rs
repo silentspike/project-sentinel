@@ -448,9 +448,9 @@ fn generate_encounter_events(
                 push_event(
                     queue,
                     PendingEvent {
-                        priority: Priority::P3,
+                        priority: Priority::P1,
                         text: format!(
-                            "Du triffst {} ({}) {}.",
+                            "Du triffst {} ({}) {}. Begruesst du die Person kurz?",
                             other_name, other_role, location_german
                         ),
                         ttl_ticks: 30,

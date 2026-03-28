@@ -996,6 +996,7 @@ pub fn spawn_agent(
                 transit_route: Vec::new(),
                 transit_total_ms: 0,
                 transit_paused: false,
+                transit_pause_tick: 0,
                 transit_source: None,
             },
             BioState {
@@ -1244,6 +1245,7 @@ pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnaps
                 transit_route: Vec::new(),
                 transit_total_ms: 0,
                 transit_paused: false,
+                transit_pause_tick: 0,
                 transit_source: None,
             });
         let bio = snapshot

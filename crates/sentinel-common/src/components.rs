@@ -79,6 +79,9 @@ pub struct Position {
     /// Transit pausiert fuer Encounter-Chat. remaining_ms stoppt.
     #[serde(default)]
     pub transit_paused: bool,
+    /// Tick bei dem Encounter-Pause begann (Mindest-Pause: 30 Ticks).
+    #[serde(default)]
+    pub transit_pause_tick: u64,
     /// Urspruenglicher Start-Raum (fuer Perception "Du bist auf dem Weg von X").
     #[serde(default)]
     pub transit_source: Option<String>,
