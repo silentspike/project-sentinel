@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -284,8 +285,14 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	}
 
 	// --- Step 3: Circuit Breaker (SENTINEL_CORTEX_CB_ENABLED gate, AC-5) ---
+	// IM:1 (operator impulse) Requests bypassen den Circuit Breaker.
+	// Gaia/Broadcast/Encounter MUESSEN durchkommen — der CB schuetzt vor Provider-Ueberlast,
+	// aber Operator-Aktionen haben Vorrang (Enterprise: Operator > Automation).
+	isUrgent := strings.Contains(req.Metadata["synth_fp"], "|IM:1") ||
+		req.Metadata["is_directly_addressed"] == "true" ||
+		req.Metadata["heard"] != ""
 	breaker := ph.getBreaker(providerName)
-	if ph.breakerCfg.Enabled && !breaker.Allow() {
+	if ph.breakerCfg.Enabled && !isUrgent && !breaker.Allow() {
 		// Failover: versuche anderen Provider
 		provider, providerName = ph.failover(providerName)
 		if provider == nil {
@@ -351,6 +358,8 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 					"tokens", 0,
 					"actions", len(actions),
 					"rule", result.Rule,
+					"agent_id", req.Metadata["agent_id"],
+					"agent_name", agentName,
 				)
 				w.Header().Set("Content-Type", "application/json")
 				if err := json.NewEncoder(w).Encode(PipelineResponse{
@@ -491,6 +500,8 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		"duration", duration,
 		"tokens", resp.TokensUsed,
 		"actions", len(actions),
+		"agent_id", req.Metadata["agent_id"],
+		"agent_name", agentName,
 	)
 
 	pipelineResp := PipelineResponse{
