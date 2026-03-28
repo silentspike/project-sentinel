@@ -403,3 +403,60 @@ func TestExtract_MultipleActions(t *testing.T) {
 		t.Error("expected move action")
 	}
 }
+
+func TestExtract_AktionMove(t *testing.T) {
+	e := New()
+	actions := e.Extract("AKTION: Move\nZIEL: kueche-eg\nINHALT: Ich hab Hunger und gehe jetzt in die Kueche.")
+
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 action, got %d: %+v", len(actions), actions)
+	}
+	if actions[0].Type != "move" {
+		t.Errorf("type = %q, want %q", actions[0].Type, "move")
+	}
+	if actions[0].Target != "kueche" {
+		t.Errorf("target = %q, want %q (room resolver should map kueche-eg to kueche)", actions[0].Target, "kueche")
+	}
+}
+
+func TestExtract_AktionChat(t *testing.T) {
+	e := New()
+	actions := e.Extract("AKTION: Chat\nZIEL: Lisa Brenner\nINHALT: Hey Lisa, hast du die Designs fertig?")
+
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(actions))
+	}
+	if actions[0].Type != "chat" {
+		t.Errorf("type = %q, want %q", actions[0].Type, "chat")
+	}
+	if actions[0].Target != "Lisa Brenner" {
+		t.Errorf("target = %q, want %q", actions[0].Target, "Lisa Brenner")
+	}
+}
+
+func TestExtract_AktionMoveWithProseTarget(t *testing.T) {
+	e := New()
+	actions := e.Extract("AKTION: Move\nZIEL: Kueche\nINHALT: Brauche dringend Kaffee.")
+
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(actions))
+	}
+	if actions[0].Type != "move" {
+		t.Errorf("type = %q, want %q", actions[0].Type, "move")
+	}
+	if actions[0].Target != "kueche" {
+		t.Errorf("target = %q, want %q (room resolver should map Kueche)", actions[0].Target, "kueche")
+	}
+}
+
+func TestExtract_AktionMoveToToilette(t *testing.T) {
+	e := New()
+	actions := e.Extract("AKTION: Move\nZIEL: Toilette\nINHALT: Muss dringend.")
+
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(actions))
+	}
+	if actions[0].Target != "toilette-eg-herren" {
+		t.Errorf("target = %q, want %q", actions[0].Target, "toilette-eg-herren")
+	}
+}

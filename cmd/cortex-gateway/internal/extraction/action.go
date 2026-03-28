@@ -112,9 +112,41 @@ func tryParseJSON(response string) *ExtractedAction {
 	}
 }
 
+// aktionPattern parses the German "AKTION: X\nZIEL: Y\nINHALT: Z" format
+// that the LLM produces when responding to structured prompts.
+var aktionPattern = regexp.MustCompile(`(?i)AKTION:\s*(\w+)\s*\nZIEL:\s*(.*?)\s*\nINHALT:\s*(.*)`)
+
+// tryParseAktion attempts to parse the German structured action format.
+func tryParseAktion(response string) *ExtractedAction {
+	matches := aktionPattern.FindStringSubmatch(response)
+	if len(matches) < 4 {
+		return nil
+	}
+	actionType := normalizeActionType(matches[1])
+	target := strings.TrimSpace(matches[2])
+	content := strings.TrimSpace(matches[3])
+
+	// Resolve room target for move actions
+	if actionType == "move" && target != "" && target != "-" {
+		target = resolveRoomID(target)
+	}
+
+	return &ExtractedAction{
+		Type:    actionType,
+		Content: content,
+		Target:  target,
+	}
+}
+
 // Extract parses an LLM response for actions and emotions.
 func (e *Extractor) Extract(response string) []ExtractedAction {
-	// Try structured JSON first (preferred)
+	// Try German structured AKTION format first (most reliable for sentinel agents)
+	if parsed := tryParseAktion(response); parsed != nil {
+		parsed.Emotion = e.DetectEmotion(parsed.Content)
+		return []ExtractedAction{*parsed}
+	}
+
+	// Try structured JSON (preferred for generic responses)
 	if parsed := tryParseJSON(response); parsed != nil {
 		parsed.Emotion = e.DetectEmotion(parsed.Content)
 		return []ExtractedAction{*parsed}
@@ -252,9 +284,12 @@ func SetRoomAliases(rooms []RoomDef) {
 	// Common German aliases that LLMs use
 	staticAliases := map[string]string{
 		"kueche":                "kueche",
+		"kueche-eg":             "kueche",
 		"küche":                 "kueche",
+		"küche eg":              "kueche",
 		"pausenraum":            "kueche",
 		"toilette":              "toilette-eg-herren",
+		"toilette-eg":           "toilette-eg-herren",
 		"klo":                   "toilette-eg-herren",
 		"wc":                    "toilette-eg-herren",
 		"treppenhaus":           "treppenhaus",
