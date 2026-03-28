@@ -243,10 +243,12 @@ pub mod bridge {
                 // Debounce: Operator-Impulse (Gaia/Broadcast) nur beim ERSTEN Tick urgent.
                 // IM:1 bleibt im Fingerprint → Synthesis bypassed im Gateway.
                 // Aber nur 1 urgent Call pro 60 Ticks pro Agent.
+                // Debounce: Operator-Impulse max 1x pro 5 Ticks pro Agent.
+                // 60 Ticks war zu aggressiv — bei Gateway-Fehler kein Retry fuer 1 Minute.
+                // 5 Ticks gibt dem LLM-Call genug Zeit (12-20s) und verhindert trotzdem Spam.
                 if is_urgent && perception.has_operator_impulse && !has_heard && !perception.is_directly_addressed {
                     let last_ack = impulse_acked.get(&agent_id).copied().unwrap_or(0);
-                    if current_tick.saturating_sub(last_ack) < 60 {
-                        // Bereits innerhalb der letzten 60 Ticks acknowledged
+                    if current_tick.saturating_sub(last_ack) < 5 {
                         is_urgent = false;
                     } else {
                         impulse_acked.insert(agent_id, current_tick);
@@ -464,13 +466,22 @@ pub mod bridge {
     }
 
     /// Fuegt Perception in Batch ein. Bevorzugt Versionen MIT heard_text.
+    /// #295 Fix: Bewahrt has_operator_impulse (IM-Flag) beim Merge,
+    /// damit Gaia/Broadcast-Bypass nicht verloren geht wenn heard_text-Version gewinnt.
     fn insert_prefer_heard(batch: &mut HashMap<AgentId, Perception>, p: Perception) {
         batch
             .entry(p.agent_id)
             .and_modify(|existing| {
                 // Behalte Version MIT heard_text, sonst neueste
                 if !p.heard_text.is_empty() || existing.heard_text.is_empty() {
+                    let preserve_impulse = existing.has_operator_impulse;
                     *existing = p.clone();
+                    // IM-Flag aus alter Perception bewahren (Gaia/Broadcast darf nicht verloren gehen)
+                    if preserve_impulse && !existing.has_operator_impulse {
+                        existing.has_operator_impulse = true;
+                        existing.synth_fingerprint =
+                            existing.synth_fingerprint.replace("|IM:0", "|IM:1");
+                    }
                 }
             })
             .or_insert(p);
@@ -724,6 +735,103 @@ pub mod bridge {
             assert!(metadata.get("synth_fp").unwrap().starts_with("H3|E7|"));
             assert_eq!(metadata.get("is_directly_addressed").unwrap(), "false");
             assert_eq!(metadata.get("personality_type").unwrap(), "E");
+        }
+
+        fn make_perception(agent_id: u16, heard: &str, impulse: bool) -> Perception {
+            let im = if impulse { 1 } else { 0 };
+            let hr = if heard.is_empty() { 0 } else { 1 };
+            Perception {
+                agent_id: AgentId(agent_id),
+                circadian_text: String::new(),
+                body_text: "wach".to_string(),
+                environment_text: String::new(),
+                acoustic_text: String::new(),
+                heard_text: heard.to_string(),
+                presence_text: String::new(),
+                impulse_text: String::new(),
+                is_directly_addressed: false,
+                timestamp: Timestamp(100),
+                tick: Tick(100),
+                room_id: "buero-dev-1".to_string(),
+                max_priority: "NONE".to_string(),
+                synth_fingerprint: format!(
+                    "H5|E5|B3|S3|C5|SN5|R:buero-dev-1|P:2|CH:0|HR:{}|T:10|TMP:0|PE:E|IM:{}",
+                    hr, im
+                ),
+                personality_type: "E".to_string(),
+                has_operator_impulse: impulse,
+            }
+        }
+
+        #[test]
+        fn insert_prefer_heard_preserves_im_flag_on_merge() {
+            // #295: Wenn Perception A (IM:1, Gaia) und B (HR:1, Chat) gemerged werden,
+            // darf der IM-Flag NICHT verloren gehen.
+            let mut batch: HashMap<AgentId, Perception> = HashMap::new();
+
+            // Erst: Gaia-Perception (IM:1, kein heard_text)
+            let gaia = make_perception(16, "", true);
+            assert!(gaia.has_operator_impulse);
+            assert!(gaia.synth_fingerprint.contains("|IM:1"));
+            insert_prefer_heard(&mut batch, gaia);
+
+            // Dann: Chat-Perception (HR:1, kein IM)
+            let chat = make_perception(16, "Thomas sagte: Hallo", false);
+            assert!(!chat.has_operator_impulse);
+            assert!(chat.synth_fingerprint.contains("|IM:0"));
+            insert_prefer_heard(&mut batch, chat);
+
+            // Resultat: BEIDE Flags muessen gesetzt sein
+            let merged = batch.get(&AgentId(16)).unwrap();
+            assert!(
+                !merged.heard_text.is_empty(),
+                "heard_text muss aus Chat-Perception uebernommen werden"
+            );
+            assert!(
+                merged.has_operator_impulse,
+                "has_operator_impulse muss aus Gaia-Perception bewahrt werden"
+            );
+            assert!(
+                merged.synth_fingerprint.contains("|IM:1"),
+                "Fingerprint IM-Flag muss auf 1 korrigiert werden, got: {}",
+                merged.synth_fingerprint
+            );
+        }
+
+        #[test]
+        fn insert_prefer_heard_keeps_heard_text_over_empty() {
+            let mut batch: HashMap<AgentId, Perception> = HashMap::new();
+
+            // Erst: leere Perception (heartbeat)
+            let heartbeat = make_perception(20, "", false);
+            insert_prefer_heard(&mut batch, heartbeat);
+
+            // Dann: Perception mit heard_text (Chat)
+            let chat = make_perception(20, "Besucher sagte: Hallo", false);
+            insert_prefer_heard(&mut batch, chat);
+
+            let merged = batch.get(&AgentId(20)).unwrap();
+            assert_eq!(merged.heard_text, "Besucher sagte: Hallo");
+            assert!(merged.synth_fingerprint.contains("|HR:1"));
+        }
+
+        #[test]
+        fn insert_prefer_heard_does_not_replace_heard_with_empty() {
+            let mut batch: HashMap<AgentId, Perception> = HashMap::new();
+
+            // Erst: Perception mit heard_text
+            let chat = make_perception(20, "Besucher sagte: Hallo", false);
+            insert_prefer_heard(&mut batch, chat);
+
+            // Dann: leere heartbeat Perception
+            let heartbeat = make_perception(20, "", false);
+            insert_prefer_heard(&mut batch, heartbeat);
+
+            let merged = batch.get(&AgentId(20)).unwrap();
+            assert_eq!(
+                merged.heard_text, "Besucher sagte: Hallo",
+                "heard_text darf nicht durch leere Perception ueberschrieben werden"
+            );
         }
     }
 }
