@@ -578,6 +578,7 @@ pub struct GaiaThought {
     pub content: String,
     pub tick: u64,
     pub ttl_ticks: u64,
+    pub consumed: bool,
 }
 
 const GAIA_TTL_TICKS: u64 = 300;
@@ -591,6 +592,7 @@ impl GaiaBuffer {
                 content,
                 tick,
                 ttl_ticks: GAIA_TTL_TICKS,
+                consumed: false,
             });
     }
 
@@ -600,10 +602,19 @@ impl GaiaBuffer {
             .map(|thoughts| {
                 thoughts
                     .iter()
-                    .filter(|t| current_tick < t.tick + t.ttl_ticks)
+                    .filter(|t| !t.consumed && current_tick < t.tick + t.ttl_ticks)
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Markiert alle aktiven Thoughts eines Agents als consumed (one-shot).
+    pub fn consume(&mut self, agent_id: &AgentId) {
+        if let Some(thoughts) = self.thoughts.get_mut(agent_id) {
+            for t in thoughts.iter_mut() {
+                t.consumed = true;
+            }
+        }
     }
 
     pub fn cleanup(&mut self, current_tick: u64) {
@@ -1366,5 +1377,79 @@ pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnaps
         {
             world.insert_resource(stimuli);
         }
+    }
+}
+
+#[cfg(test)]
+mod room_chat_tests {
+    use super::*;
+
+    /// #295 Fix 1: get_recent gibt Chat zurueck auch wenn can_respond=false.
+    /// has_pending_chat im output_system nutzt get_recent() UNABHAENGIG von can_respond.
+    /// Dieser Test beweist dass get_recent korrekt arbeitet wenn can_respond exhausted ist.
+    #[test]
+    fn get_recent_returns_chat_even_when_can_respond_exhausted() {
+        let mut buf = RoomChatBuffer::default();
+        let all_names = vec!["Michael Hartmann".to_string(), "Lisa Mueller".to_string()];
+
+        // Chat in den Buffer einfuegen
+        buf.add("buero-ceo", "Besucher".to_string(), "Geh in die Kueche".to_string(), 100, &all_names);
+
+        // can_respond exhausten: 10x record_response → can_respond wird false
+        for _ in 0..10 {
+            buf.record_response("Michael Hartmann", 100);
+        }
+        assert!(
+            !buf.can_respond("Michael Hartmann", 100),
+            "can_respond muss nach 10 Responses false sein"
+        );
+
+        // CRITICAL: get_recent muss Chat trotzdem zurueckgeben!
+        // Das ist die Basis fuer has_pending_chat im output_system.
+        let recent = buf.get_recent("buero-ceo", 100, "Michael Hartmann");
+        assert!(
+            !recent.is_empty(),
+            "get_recent MUSS Chat zurueckgeben auch wenn can_respond=false — \
+             darauf basiert has_pending_chat (HR:1 im Fingerprint)"
+        );
+        assert_eq!(recent[0].content, "Geh in die Kueche");
+    }
+
+    /// #295: Nach set_heard darf get_recent fuer denselben Chat NICHT mehr zurueckgeben.
+    /// Das stellt sicher dass has_pending_chat false wird nachdem der Chat verarbeitet wurde.
+    #[test]
+    fn get_recent_empty_after_set_heard() {
+        let mut buf = RoomChatBuffer::default();
+        let all_names = vec!["Michael Hartmann".to_string()];
+
+        buf.add("buero-ceo", "Besucher".to_string(), "Hallo".to_string(), 100, &all_names);
+
+        // Vor set_heard: Chat sichtbar
+        assert!(!buf.get_recent("buero-ceo", 100, "Michael Hartmann").is_empty());
+
+        // Nach set_heard: Chat nicht mehr sichtbar
+        buf.set_heard("Michael Hartmann", 100);
+        assert!(
+            buf.get_recent("buero-ceo", 101, "Michael Hartmann").is_empty(),
+            "Nach set_heard darf get_recent denselben Chat nicht mehr zurueckgeben"
+        );
+    }
+
+    /// #295: Neuer Chat NACH set_heard muss wieder sichtbar sein.
+    #[test]
+    fn new_chat_visible_after_set_heard() {
+        let mut buf = RoomChatBuffer::default();
+        let all_names = vec!["Michael Hartmann".to_string()];
+
+        // Erster Chat + set_heard
+        buf.add("buero-ceo", "Besucher".to_string(), "Hallo".to_string(), 100, &all_names);
+        buf.set_heard("Michael Hartmann", 100);
+
+        // Zweiter Chat auf spaeterem Tick
+        buf.add("buero-ceo", "Besucher".to_string(), "Noch da?".to_string(), 105, &all_names);
+
+        let recent = buf.get_recent("buero-ceo", 105, "Michael Hartmann");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].content, "Noch da?");
     }
 }

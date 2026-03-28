@@ -359,7 +359,7 @@ pub fn operator_command_system(
     all_agents_query: Query<&AgentIdentity>,
     // PUSH-Perception: Sofort Perception fuer Chat-Empfaenger senden
     perception_sender: Option<Res<PerceptionSender>>,
-    chat_agents: Query<(&AgentIdentity, &Position, &Personality)>,
+    chat_agents: Query<(&AgentIdentity, &Position, &Personality, &BioState)>,
 ) {
     let Some(receiver) = receiver else { return };
     let Ok(rx) = receiver.0.lock() else { return };
@@ -429,7 +429,7 @@ pub fn operator_command_system(
                     let msg_text = &cmd.message[..cmd.message.len().min(500)];
                     let heard = format!("{} sagte: \"{}\"", cmd.sender_name, msg_text);
 
-                    for (identity, position, personality) in &chat_agents {
+                    for (identity, position, personality, bio) in &chat_agents {
                         if position.room_id == cmd.room_id && !position.in_transit {
                             let first_name = identity
                                 .name
@@ -439,10 +439,15 @@ pub fn operator_command_system(
                             let is_addressed = cmd.message.contains(first_name);
                             let pe = if personality.extraversion > 0.5 { "E" } else { "I" };
 
+                            // #295 Fix: Bio-Kontext in Push-Perception fuer bessere LLM-Antwortqualitaet
+                            let body_text = format!(
+                                "Hunger: {:.0}%, Energy: {:.0}%, Stress: {:.0}%, Koffein: {:.0}mg",
+                                bio.hunger, bio.energy, bio.stress, bio.caffeine_mg
+                            );
                             let perception = Perception {
                                 agent_id: identity.agent_id,
                                 circadian_text: String::new(),
-                                body_text: String::new(),
+                                body_text,
                                 environment_text: String::new(),
                                 acoustic_text: String::new(),
                                 heard_text: heard.clone(),
@@ -1474,7 +1479,7 @@ pub fn output_system(
     query: Query<OutputAgentQueryData>,
     time: Res<SimulationTime>,
     mut room_chat_buffer: ResMut<super::world::RoomChatBuffer>,
-    gaia_buffer: Res<super::world::GaiaBuffer>,
+    mut gaia_buffer: ResMut<super::world::GaiaBuffer>,
     broadcast_buffer: Res<super::world::BroadcastBuffer>,
 ) {
     let Some(sender) = sender else { return };
@@ -1610,6 +1615,15 @@ pub fn output_system(
                 "can_respond=false in Single-Agent-Room (self-block?)"
             );
         }
+        // #295 Fix: Prüfe ob ungelesener Chat existiert UNABHÄNGIG von can_respond.
+        // Setzt HR:1 im Fingerprint → verhindert Synthesis während Chat pending ist.
+        let has_pending_chat = if !position.in_transit || position.transit_paused {
+            !room_chat_buffer
+                .get_recent(&position.room_id, time.tick.0, &identity.name)
+                .is_empty()
+        } else {
+            false
+        };
         let (heard_text, is_directly_addressed) =
             if (!position.in_transit || position.transit_paused) && can_respond_result {
                 let recent =
@@ -1684,7 +1698,7 @@ pub fn output_system(
                 position.room_id,
                 present_agents.len(),
                 if has_chaos { 1 } else { 0 },
-                if !heard_text.is_empty() { 1 } else { 0 },
+                if has_pending_chat || !heard_text.is_empty() { 1 } else { 0 },
                 sim_hour,
                 if temp_high { 1 } else { 0 },
                 pe,
@@ -1716,6 +1730,12 @@ pub fn output_system(
             };
             if sender.0.try_send(msg).is_err() {
                 tracing::warn!(agent = %identity.name, "Perception gedroppt (Channel voll)");
+            }
+
+            // One-shot: Gaia-Thought nach Perception-Send consumen
+            // Verhindert Endlos-Move-Loop bei Gaia-Injection
+            if has_operator_impulse {
+                gaia_buffer.consume(&identity.agent_id);
             }
         }
     }
