@@ -814,18 +814,28 @@ pub fn transit_system(
             continue;
         }
 
-        // Encounter-Pause: remaining_ms stoppt, Auto-Resume wenn Flur-Chat idle
+        // Encounter-Pause: remaining_ms stoppt, Auto-Resume nach Mindest-Pause
         if pos.transit_paused {
+            let ticks_paused = tick.saturating_sub(pos.transit_pause_tick);
+
+            // Mindest-Pause: 30 Ticks (gibt LLM Zeit zu antworten)
+            if ticks_paused < 30 {
+                continue;
+            }
+
+            // Nach Mindest-Pause: Resume wenn Chat im Flur idle (120 Ticks seit letztem Chat)
+            // ODER wenn nie ein Chat kam (Agent hat nicht geantwortet)
             let last_chat = room_chat_buffer.last_chat_tick_for_room(&pos.room_id);
-            let idle_ticks = last_chat
+            let chat_idle = last_chat
                 .map(|t| tick.saturating_sub(t))
-                .unwrap_or(ENCOUNTER_AUTO_RESUME_TICKS + 1);
-            if idle_ticks >= ENCOUNTER_AUTO_RESUME_TICKS {
+                .unwrap_or(ticks_paused); // Kein Chat → idle = gesamte Pause-Dauer
+            if chat_idle >= ENCOUNTER_AUTO_RESUME_TICKS || ticks_paused >= ENCOUNTER_AUTO_RESUME_TICKS {
                 pos.transit_paused = false;
                 tracing::info!(
                     agent = %identity.name,
                     room = %pos.room_id,
-                    "Transit resumed nach Encounter (idle {}+ Ticks)", ENCOUNTER_AUTO_RESUME_TICKS
+                    paused_ticks = ticks_paused,
+                    "Transit resumed nach Encounter"
                 );
             }
             continue; // remaining_ms nicht dekrementieren waehrend Pause
@@ -1683,10 +1693,12 @@ pub fn output_system(
             let pe = if personality.extraversion < 0.5 { "I" } else { "E" };
             let sim_hour = time.sim_hour.floor() as u8;
             let temp_high = room_temp_c > 26.0;
-            // Operator-Impulse: Gaia/Broadcast aktiv → Synthesis MUSS bypassed werden
+            // Operator-Impulse: Gaia/Broadcast/Encounter aktiv → Synthesis MUSS bypassed werden
+            let has_encounter = queue.events.iter().any(|e| e.text.contains("Du triffst"));
             let has_operator_impulse =
                 !gaia_buffer.get_active(&identity.agent_id, time.tick.0).is_empty()
-                    || !broadcast_buffer.get_active(time.tick.0).is_empty();
+                    || !broadcast_buffer.get_active(time.tick.0).is_empty()
+                    || has_encounter;
             let synth_fingerprint = format!(
                 "H{}|E{}|B{}|S{}|C{}|SN{}|R:{}|P:{}|CH:{}|HR:{}|T:{}|TMP:{}|PE:{}|IM:{}",
                 bio_bucket(bio.hunger),
@@ -1853,6 +1865,7 @@ pub fn encounter_system(
         // Transit pausieren fuer beide Agents
         if let Ok((_, identity_a, mut pos_a)) = query.get_mut(*entity_a) {
             pos_a.transit_paused = true;
+            pos_a.transit_pause_tick = tick;
             tracing::info!(
                 agent = %identity_a.name,
                 room = %location,
@@ -1861,6 +1874,7 @@ pub fn encounter_system(
         }
         if let Ok((_, identity_b, mut pos_b)) = query.get_mut(*entity_b) {
             pos_b.transit_paused = true;
+            pos_b.transit_pause_tick = tick;
             tracing::info!(
                 agent = %identity_b.name,
                 room = %location,
