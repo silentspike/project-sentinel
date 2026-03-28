@@ -617,6 +617,24 @@ impl GaiaBuffer {
         }
     }
 
+    /// Verkuerzt die TTL aller aktiven Thoughts auf max_remaining Ticks ab jetzt.
+    /// Verhindert Endlos-Loop (statt sofort consume, da die Bridge
+    /// die IM:1 Perception erst im naechsten Drain-Cycle sieht).
+    /// Verkuerzt die TTL: Thought expired in max_remaining Ticks ab current_tick.
+    pub fn shorten_ttl(&mut self, agent_id: &AgentId, max_remaining: u64, current_tick: u64) {
+        if let Some(thoughts) = self.thoughts.get_mut(agent_id) {
+            for t in thoughts.iter_mut() {
+                if !t.consumed {
+                    // get_active prueft: current_tick < t.tick + t.ttl_ticks
+                    // Setze t.tick = current_tick, t.ttl_ticks = max_remaining
+                    // → expired bei current_tick + max_remaining
+                    t.tick = current_tick;
+                    t.ttl_ticks = max_remaining;
+                }
+            }
+        }
+    }
+
     pub fn cleanup(&mut self, current_tick: u64) {
         self.thoughts.retain(|_, thoughts| {
             thoughts.retain(|t| current_tick < t.tick + t.ttl_ticks);

@@ -1744,10 +1744,13 @@ pub fn output_system(
                 tracing::warn!(agent = %identity.name, "Perception gedroppt (Channel voll)");
             }
 
-            // One-shot: Gaia-Thought nach Perception-Send consumen
-            // Verhindert Endlos-Move-Loop bei Gaia-Injection
+            // Gaia-Thought TTL verkuerzen statt sofort consumen.
+            // Sofortiges consume verhindert dass die Bridge die IM:1 Perception
+            // im naechsten Drain-Cycle sieht (Perception gesendet → consumed →
+            // naechster Tick IM:0 → Synthesis). TTL=3 gibt 3 Ticks fuer den
+            // LLM-Call und verhindert trotzdem Endlos-Loop (300→3 Ticks).
             if has_operator_impulse {
-                gaia_buffer.consume(&identity.agent_id);
+                gaia_buffer.shorten_ttl(&identity.agent_id, 3, time.tick.0);
             }
         }
     }
