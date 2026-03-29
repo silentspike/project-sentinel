@@ -431,12 +431,18 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             }
             Err(e) => {
                 warn!(error = %e, "rooms.toml konnte nicht geladen werden — Fallback auf Defaults");
-                (sentinel_ecs::RoomDistanceMap::default(), sentinel_ecs::RoomInfoMap::default())
+                (
+                    sentinel_ecs::RoomDistanceMap::default(),
+                    sentinel_ecs::RoomInfoMap::default(),
+                )
             }
         }
     } else {
         warn!("rooms.toml nicht gefunden — Transit-Dauer nutzt Default-Distanzen");
-        (sentinel_ecs::RoomDistanceMap::default(), sentinel_ecs::RoomInfoMap::default())
+        (
+            sentinel_ecs::RoomDistanceMap::default(),
+            sentinel_ecs::RoomInfoMap::default(),
+        )
     };
     let operator_room_ids = room_distances.all_rooms().to_vec();
     let operator_api_handle = if config.operator_api.enabled {
@@ -1255,10 +1261,9 @@ fn ecs_tick_loop(
             // Agents mit kuerzlicher Activity sollen nicht als stalled despawnt werden.
             for (id, handle) in runtime_orch.agents() {
                 let _ = id; // Agent-Name ist im Handle
-                pcp_metrics.last_action_ticks.insert(
-                    handle.identity.name.clone(),
-                    handle.last_activity_tick.0,
-                );
+                pcp_metrics
+                    .last_action_ticks
+                    .insert(handle.identity.name.clone(), handle.last_activity_tick.0);
             }
             let side_effects = platform_cp.cycle(
                 &pcp_metrics,

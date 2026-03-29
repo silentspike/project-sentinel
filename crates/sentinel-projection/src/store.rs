@@ -133,11 +133,13 @@ impl ReadModelStore {
         // Nach Daemon-Crash/-Restart kann die Projection in_transit=1 Zeilen enthalten,
         // fuer die kein TransitCompleted Event geschrieben wurde. Der ECS-State (SSOT)
         // hat nach Restore keine stale Transits — die Projection muss nachziehen.
-        let stale_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM agent_live_view WHERE in_transit = 1",
-            [],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let stale_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_live_view WHERE in_transit = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         if stale_count > 0 {
             conn.execute(
                 "UPDATE agent_live_view SET in_transit = 0, transit_target = NULL WHERE in_transit = 1",

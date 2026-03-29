@@ -24,8 +24,7 @@ pub use world::{
     ActiveSmells, BroadcastBuffer, EventBuffer, GaiaBuffer, LimboEventStore,
     OperatorCommandReceiver, PerceptionSender, PersistTelemetry, PsiMetrics, RedbStateStore,
     RoomChatBuffer, RoomDistanceMap, RoomInfoMap, RoomPhysicsSnapshot, RoomPhysicsState,
-    SimulationTime,
-    ToolRuntimeResource, ZenohFanoutSender,
+    SimulationTime, ToolRuntimeResource, ZenohFanoutSender,
 };
 
 #[cfg(test)]
@@ -879,7 +878,10 @@ mod tests {
 
         let payload1: serde_json::Value = serde_json::from_str(&transit_events[0].payload).unwrap();
         let duration_near = payload1["duration_ms"].as_u64().unwrap();
-        assert_eq!(duration_near, 20000, "1-hop transit should be 20000ms (clamped to min 15000, 1*20000=20000)");
+        assert_eq!(
+            duration_near, 20000,
+            "1-hop transit should be 20000ms (clamped to min 15000, 1*20000=20000)"
+        );
 
         // Transit abschliessen (manuell Position resetten)
         {
@@ -925,7 +927,10 @@ mod tests {
 
         let payload2: serde_json::Value = serde_json::from_str(&transit_events[1].payload).unwrap();
         let duration_far = payload2["duration_ms"].as_u64().unwrap();
-        assert_eq!(duration_far, 80000, "4-hop transit should be 80000ms (4*20s)");
+        assert_eq!(
+            duration_far, 80000,
+            "4-hop transit should be 80000ms (4*20s)"
+        );
 
         assert!(
             duration_far > duration_near,
@@ -1229,7 +1234,10 @@ mod tests {
         assert_eq!(pos.transit_target, Some("kueche".to_string()));
         let total_ms = pos.transit_total_ms;
         // Distanz haengt von der Adjacency in rooms.toml ab
-        assert!(total_ms > 0, "Transit must have non-zero duration, got {total_ms}");
+        assert!(
+            total_ms > 0,
+            "Transit must have non-zero duration, got {total_ms}"
+        );
         assert!(!pos.transit_route.is_empty(), "Route must not be empty");
 
         // Tick vorrücken und Zwischen-Raum prüfen
@@ -1266,7 +1274,9 @@ mod tests {
 
         // TR5: Agent war im Flur sichtbar (room_id wechselte auf Zwischen-Raum)
         assert!(
-            seen_rooms.iter().any(|r| r.starts_with("flur-") || r == "treppenhaus"),
+            seen_rooms
+                .iter()
+                .any(|r| r.starts_with("flur-") || r == "treppenhaus"),
             "Agent muss in mind. einem Flur/Treppenhaus gewesen sein: {:?}",
             seen_rooms
         );
