@@ -104,9 +104,9 @@ mod tests {
 
     #[test]
     fn test_transit_duration_ms_realistic() {
-        assert_eq!(transit_duration_ms(1), 20_000);  // 1 Hop = 20s, clamped to 20s
-        assert_eq!(transit_duration_ms(2), 40_000);  // 2 Hops = 40s
-        assert_eq!(transit_duration_ms(4), 80_000);  // 4 Hops = 80s
+        assert_eq!(transit_duration_ms(1), 20_000); // 1 Hop = 20s, clamped to 20s
+        assert_eq!(transit_duration_ms(2), 40_000); // 2 Hops = 40s
+        assert_eq!(transit_duration_ms(4), 80_000); // 4 Hops = 80s
         assert_eq!(transit_duration_ms(5), 100_000); // 5 Hops = 100s
         assert_eq!(transit_duration_ms(7), TRANSIT_MAX_MS); // 7 Hops clamped to 120s
     }
@@ -139,7 +139,10 @@ mod tests {
     fn test_current_transit_room_single_room() {
         let route = vec!["flur-eg".to_string()];
         // Egal wo im Transit — immer in flur-eg
-        assert_eq!(current_transit_room(&route, 15_000, 20_000), Some("flur-eg"));
+        assert_eq!(
+            current_transit_room(&route, 15_000, 20_000),
+            Some("flur-eg")
+        );
         assert_eq!(current_transit_room(&route, 5_000, 20_000), Some("flur-eg"));
     }
 
@@ -151,14 +154,20 @@ mod tests {
             "flur-eg".to_string(),
         ];
         let total = 80_000; // 4 Hops
-        // 0% elapsed → flur-og (idx=0)
+                            // 0% elapsed → flur-og (idx=0)
         assert_eq!(current_transit_room(&route, 80_000, total), Some("flur-og"));
         // 10% elapsed → flur-og (idx=floor(0.1*3)=0)
         assert_eq!(current_transit_room(&route, 72_000, total), Some("flur-og"));
         // 34% elapsed → treppenhaus (idx=floor(0.34*3)=1)
-        assert_eq!(current_transit_room(&route, 52_800, total), Some("treppenhaus"));
+        assert_eq!(
+            current_transit_room(&route, 52_800, total),
+            Some("treppenhaus")
+        );
         // 50% elapsed → treppenhaus (idx=floor(0.5*3)=1)
-        assert_eq!(current_transit_room(&route, 40_000, total), Some("treppenhaus"));
+        assert_eq!(
+            current_transit_room(&route, 40_000, total),
+            Some("treppenhaus")
+        );
         // 67% elapsed → flur-eg (idx=floor(0.67*3)=2)
         assert_eq!(current_transit_room(&route, 26_400, total), Some("flur-eg"));
         // 99% elapsed → flur-eg (idx=min(2,2)=2)

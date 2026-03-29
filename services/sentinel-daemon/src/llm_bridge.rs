@@ -247,7 +247,11 @@ pub mod bridge {
                 // Debounce: Operator-Impulse max 1x pro 5 Ticks pro Agent.
                 // 60 Ticks war zu aggressiv — bei Gateway-Fehler kein Retry fuer 1 Minute.
                 // 5 Ticks gibt dem LLM-Call genug Zeit (12-20s) und verhindert trotzdem Spam.
-                if is_urgent && perception.has_operator_impulse && !has_heard && !perception.is_directly_addressed {
+                if is_urgent
+                    && perception.has_operator_impulse
+                    && !has_heard
+                    && !perception.is_directly_addressed
+                {
                     let last_ack = impulse_acked.get(&agent_id).copied().unwrap_or(0);
                     if current_tick.saturating_sub(last_ack) < 5 {
                         is_urgent = false;
@@ -336,9 +340,7 @@ pub mod bridge {
                                     match response.json::<GatewayResponse>().await {
                                         Ok(gateway_resp) => {
                                             let latency_ms = call_start.elapsed().as_millis();
-                                            telemetry
-                                                .calls_success
-                                                .fetch_add(1, Ordering::Relaxed);
+                                            telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
                                             telemetry.tokens_total.fetch_add(
                                                 gateway_resp.tokens_used as u64,
                                                 Ordering::Relaxed,
@@ -356,23 +358,19 @@ pub mod bridge {
 
                                             let is_synthesis = gateway_resp.tokens_used == 0;
                                             for extracted in &gateway_resp.actions {
-                                                if let Some(agent_action) =
-                                                    map_extracted_to_action(
-                                                        agent_id,
-                                                        extracted,
-                                                        current_tick,
-                                                        is_synthesis,
-                                                    )
-                                                {
+                                                if let Some(agent_action) = map_extracted_to_action(
+                                                    agent_id,
+                                                    extracted,
+                                                    current_tick,
+                                                    is_synthesis,
+                                                ) {
                                                     let _ = action_tx.send(agent_action);
                                                 }
                                             }
                                         }
                                         Err(e) => {
                                             warn!(agent = %agent_id, error = %e, "Gateway Response Parse-Fehler");
-                                            telemetry
-                                                .calls_failed
-                                                .fetch_add(1, Ordering::Relaxed);
+                                            telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                             cb.lock().unwrap().record_failure();
                                         }
                                     }
@@ -409,9 +407,7 @@ pub mod bridge {
                                     match response.json::<GatewayResponse>().await {
                                         Ok(gateway_resp) => {
                                             let latency_ms = call_start.elapsed().as_millis();
-                                            telemetry
-                                                .calls_success
-                                                .fetch_add(1, Ordering::Relaxed);
+                                            telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
                                             telemetry.tokens_total.fetch_add(
                                                 gateway_resp.tokens_used as u64,
                                                 Ordering::Relaxed,
@@ -429,23 +425,19 @@ pub mod bridge {
 
                                             let is_synthesis = gateway_resp.tokens_used == 0;
                                             for extracted in &gateway_resp.actions {
-                                                if let Some(agent_action) =
-                                                    map_extracted_to_action(
-                                                        agent_id,
-                                                        extracted,
-                                                        current_tick,
-                                                        is_synthesis,
-                                                    )
-                                                {
+                                                if let Some(agent_action) = map_extracted_to_action(
+                                                    agent_id,
+                                                    extracted,
+                                                    current_tick,
+                                                    is_synthesis,
+                                                ) {
                                                     let _ = action_tx.send(agent_action);
                                                 }
                                             }
                                         }
                                         Err(e) => {
                                             warn!(agent = %agent_id, error = %e, "Gateway Response Parse-Fehler");
-                                            telemetry
-                                                .calls_failed
-                                                .fetch_add(1, Ordering::Relaxed);
+                                            telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                             cb.lock().unwrap().record_failure();
                                         }
                                     }

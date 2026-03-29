@@ -670,7 +670,8 @@ mod tests {
             tick: Tick(400),
             room_id: "buero-dev-1".to_string(),
             max_priority: "P3".to_string(),
-            synth_fingerprint: "H5|E7|B2|S3|C4|SN6|R:buero-dev-1|P:1|CH:0|HR:0|T:8|TMP:0|PE:E|IM:0".to_string(),
+            synth_fingerprint: "H5|E7|B2|S3|C4|SN6|R:buero-dev-1|P:1|CH:0|HR:0|T:8|TMP:0|PE:E|IM:0"
+                .to_string(),
             personality_type: "E".to_string(),
             has_operator_impulse: false,
         };

@@ -5,14 +5,32 @@
 
 /// Alle gültigen room_ids aus rooms.toml (für Gaia-Move Intent-Erkennung).
 pub const ROOM_IDS: &[&str] = &[
-    "empfang", "flur-eg", "kueche", "buero-dev-1", "buero-dev-2",
-    "meetingraum-01", "toilette-eg-damen", "toilette-eg-herren",
-    "treppenhaus", "flur-og", "buero-design-1", "buero-design-2",
-    "buero-ceo", "meetingraum-02", "meetingraum-03",
-    "toilette-og-damen", "toilette-og-herren",
-    "buero-sales", "buero-pm", "buero-marketing", "buero-admin",
-    "buero-qa", "buero-it", "buero-betriebsrat",
-    "buero-betriebspsych", "buero-betriebsarzt",
+    "empfang",
+    "flur-eg",
+    "kueche",
+    "buero-dev-1",
+    "buero-dev-2",
+    "meetingraum-01",
+    "toilette-eg-damen",
+    "toilette-eg-herren",
+    "treppenhaus",
+    "flur-og",
+    "buero-design-1",
+    "buero-design-2",
+    "buero-ceo",
+    "meetingraum-02",
+    "meetingraum-03",
+    "toilette-og-damen",
+    "toilette-og-herren",
+    "buero-sales",
+    "buero-pm",
+    "buero-marketing",
+    "buero-admin",
+    "buero-qa",
+    "buero-it",
+    "buero-betriebsrat",
+    "buero-betriebspsych",
+    "buero-betriebsarzt",
 ];
 
 use super::autonomy::AutonomyCooldown;
@@ -1425,7 +1443,13 @@ mod room_chat_tests {
         let all_names = vec!["Michael Hartmann".to_string(), "Lisa Mueller".to_string()];
 
         // Chat in den Buffer einfuegen
-        buf.add("buero-ceo", "Besucher".to_string(), "Geh in die Kueche".to_string(), 100, &all_names);
+        buf.add(
+            "buero-ceo",
+            "Besucher".to_string(),
+            "Geh in die Kueche".to_string(),
+            100,
+            &all_names,
+        );
 
         // can_respond exhausten: 10x record_response → can_respond wird false
         for _ in 0..10 {
@@ -1454,15 +1478,24 @@ mod room_chat_tests {
         let mut buf = RoomChatBuffer::default();
         let all_names = vec!["Michael Hartmann".to_string()];
 
-        buf.add("buero-ceo", "Besucher".to_string(), "Hallo".to_string(), 100, &all_names);
+        buf.add(
+            "buero-ceo",
+            "Besucher".to_string(),
+            "Hallo".to_string(),
+            100,
+            &all_names,
+        );
 
         // Vor set_heard: Chat sichtbar
-        assert!(!buf.get_recent("buero-ceo", 100, "Michael Hartmann").is_empty());
+        assert!(!buf
+            .get_recent("buero-ceo", 100, "Michael Hartmann")
+            .is_empty());
 
         // Nach set_heard: Chat nicht mehr sichtbar
         buf.set_heard("Michael Hartmann", 100);
         assert!(
-            buf.get_recent("buero-ceo", 101, "Michael Hartmann").is_empty(),
+            buf.get_recent("buero-ceo", 101, "Michael Hartmann")
+                .is_empty(),
             "Nach set_heard darf get_recent denselben Chat nicht mehr zurueckgeben"
         );
     }
@@ -1474,11 +1507,23 @@ mod room_chat_tests {
         let all_names = vec!["Michael Hartmann".to_string()];
 
         // Erster Chat + set_heard
-        buf.add("buero-ceo", "Besucher".to_string(), "Hallo".to_string(), 100, &all_names);
+        buf.add(
+            "buero-ceo",
+            "Besucher".to_string(),
+            "Hallo".to_string(),
+            100,
+            &all_names,
+        );
         buf.set_heard("Michael Hartmann", 100);
 
         // Zweiter Chat auf spaeterem Tick
-        buf.add("buero-ceo", "Besucher".to_string(), "Noch da?".to_string(), 105, &all_names);
+        buf.add(
+            "buero-ceo",
+            "Besucher".to_string(),
+            "Noch da?".to_string(),
+            105,
+            &all_names,
+        );
 
         let recent = buf.get_recent("buero-ceo", 105, "Michael Hartmann");
         assert_eq!(recent.len(), 1);

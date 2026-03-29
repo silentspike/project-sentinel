@@ -441,7 +441,11 @@ pub fn operator_command_system(
                                 .next()
                                 .unwrap_or(&identity.name);
                             let is_addressed = cmd.message.contains(first_name);
-                            let pe = if personality.extraversion > 0.5 { "E" } else { "I" };
+                            let pe = if personality.extraversion > 0.5 {
+                                "E"
+                            } else {
+                                "I"
+                            };
 
                             // #295 Fix: Bio-Kontext in Push-Perception fuer bessere LLM-Antwortqualitaet
                             let body_text = format!(
@@ -512,9 +516,9 @@ pub fn operator_command_system(
                 // Gaia-Move: Wenn Thought eine room_id enthaelt, Transit direkt starten.
                 // Voice of Gaia ist ein goettlicher Impuls — der Agent MUSS folgen.
                 let thought_lower = cmd.thought.to_lowercase();
-                let target_room = super::world::ROOM_IDS.iter().find(|&&rid| {
-                    thought_lower.contains(rid)
-                });
+                let target_room = super::world::ROOM_IDS
+                    .iter()
+                    .find(|&&rid| thought_lower.contains(rid));
 
                 if let Some(&room_id) = target_room {
                     // Finde den Agent und starte Transit
@@ -868,7 +872,9 @@ pub fn transit_system(
             let chat_idle = last_chat
                 .map(|t| tick.saturating_sub(t))
                 .unwrap_or(ticks_paused); // Kein Chat → idle = gesamte Pause-Dauer
-            if chat_idle >= ENCOUNTER_AUTO_RESUME_TICKS || ticks_paused >= ENCOUNTER_AUTO_RESUME_TICKS {
+            if chat_idle >= ENCOUNTER_AUTO_RESUME_TICKS
+                || ticks_paused >= ENCOUNTER_AUTO_RESUME_TICKS
+            {
                 pos.transit_paused = false;
                 tracing::info!(
                     agent = %identity.name,
@@ -1533,29 +1539,27 @@ pub fn output_system(
 ) {
     let Some(sender) = sender else { return };
 
-    let present_agents_by_room: HashMap<String, Vec<(String, String)>> = query
-        .iter()
-        .fold(
-            HashMap::new(),
-            |mut acc, (identity, _, position, _, _, _, work_ctx, _)| {
-                if !position.in_transit || position.transit_paused {
-                    // Stationaer oder Encounter-Pause: normal anzeigen
-                    let activity = work_ctx
-                        .current_task
-                        .clone()
-                        .unwrap_or_else(|| "anwesend".to_string());
-                    acc.entry(position.room_id.clone())
-                        .or_default()
-                        .push((identity.name.clone(), activity));
-                } else if position.in_transit {
-                    // Durchgehend: mit Annotation
-                    acc.entry(position.room_id.clone())
-                        .or_default()
-                        .push((identity.name.clone(), "geht durch".to_string()));
-                }
-                acc
-            },
-        );
+    let present_agents_by_room: HashMap<String, Vec<(String, String)>> = query.iter().fold(
+        HashMap::new(),
+        |mut acc, (identity, _, position, _, _, _, work_ctx, _)| {
+            if !position.in_transit || position.transit_paused {
+                // Stationaer oder Encounter-Pause: normal anzeigen
+                let activity = work_ctx
+                    .current_task
+                    .clone()
+                    .unwrap_or_else(|| "anwesend".to_string());
+                acc.entry(position.room_id.clone())
+                    .or_default()
+                    .push((identity.name.clone(), activity));
+            } else if position.in_transit {
+                // Durchgehend: mit Annotation
+                acc.entry(position.room_id.clone())
+                    .or_default()
+                    .push((identity.name.clone(), "geht durch".to_string()));
+            }
+            acc
+        },
+    );
 
     for (identity, bio, position, personality, shift, perception, work_ctx, queue) in &query {
         let impulse_text = super::decision::format_impulse_from_queue(queue);
@@ -1729,12 +1733,18 @@ pub fn output_system(
             let has_chaos = queue.events.iter().any(|e| {
                 e.text.contains("Chaos") || e.text.contains("Alarm") || e.text.contains("Notfall")
             });
-            let pe = if personality.extraversion < 0.5 { "I" } else { "E" };
+            let pe = if personality.extraversion < 0.5 {
+                "I"
+            } else {
+                "E"
+            };
             let sim_hour = time.sim_hour.floor() as u8;
             let temp_high = room_temp_c > 26.0;
             // Operator-Impulse: Gaia/Broadcast/Encounter aktiv → Synthesis MUSS bypassed werden
             let has_encounter = queue.events.iter().any(|e| e.text.contains("Du triffst"));
-            let gaia_active = !gaia_buffer.get_active(&identity.agent_id, time.tick.0).is_empty();
+            let gaia_active = !gaia_buffer
+                .get_active(&identity.agent_id, time.tick.0)
+                .is_empty();
             let broadcast_active = !broadcast_buffer.get_active(time.tick.0).is_empty();
             let has_operator_impulse = gaia_active || broadcast_active || has_encounter;
             if gaia_active {
@@ -1756,7 +1766,11 @@ pub fn output_system(
                 position.room_id,
                 present_agents.len(),
                 if has_chaos { 1 } else { 0 },
-                if has_pending_chat || !heard_text.is_empty() { 1 } else { 0 },
+                if has_pending_chat || !heard_text.is_empty() {
+                    1
+                } else {
+                    0
+                },
                 sim_hour,
                 if temp_high { 1 } else { 0 },
                 pe,
@@ -1883,13 +1897,7 @@ pub fn encounter_system(
                 let rng = (x % 10000) as f32 / 10000.0;
 
                 if sentinel_physics::transit::check_hallway_encounter(true, true, rng) {
-                    encounters.push((
-                        agents[i].0,
-                        agents[j].0,
-                        id_a,
-                        id_b,
-                        room.clone(),
-                    ));
+                    encounters.push((agents[i].0, agents[j].0, id_a, id_b, room.clone()));
                 }
             }
         }
