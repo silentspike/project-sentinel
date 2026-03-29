@@ -4,21 +4,37 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // LLMRequest represents a request to an LLM provider.
 type LLMRequest struct {
-	Messages    []Message         `json:"messages"`
-	Temperature float64           `json:"temperature"`
-	MaxTokens   int               `json:"max_tokens"`
-	Model       string            `json:"model,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
+	Messages     []Message         `json:"messages"`
+	SystemBlocks []SystemBlock     `json:"system,omitempty"`
+	Temperature  float64           `json:"temperature"`
+	MaxTokens    int               `json:"max_tokens"`
+	Model        string            `json:"model,omitempty"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+	// ProviderTimeout applies only to the real provider execution, not queue wait.
+	ProviderTimeout time.Duration `json:"-"`
 }
 
 // Message represents a single message in an LLM conversation.
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+}
+
+// CacheControl annotates provider-side content caching hints.
+type CacheControl struct {
+	Type string `json:"type"`
+}
+
+// SystemBlock is a structured system-level content block.
+type SystemBlock struct {
+	Type         string        `json:"type"`
+	Text         string        `json:"text"`
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
 }
 
 // LLMResponse represents a response from an LLM provider.
@@ -38,10 +54,16 @@ type Provider interface {
 	HealthCheck(ctx context.Context) error
 }
 
+// ProviderStatusReporter is an optional provider capability for exposing an
+// already-known runtime status without spawning a new upstream call.
+type ProviderStatusReporter interface {
+	CurrentProviderError() error
+}
+
 // ProviderConfig holds configuration for a provider.
 type ProviderConfig struct {
 	Name      string `toml:"name"`
-	Type      string `toml:"type"` // "claude", "ollama", or "claude-code"
+	Type      string `toml:"type"` // "claude", "anthropic-direct", "ollama", or "claude-code"
 	BaseURL   string `toml:"base_url"`
 	APIKey    string `toml:"api_key"` //nolint:gosec // field name, not a credential
 	Model     string `toml:"model"`
@@ -122,6 +144,8 @@ func NewProviderFromConfig(cfg ProviderConfig) (Provider, error) {
 	switch cfg.Type {
 	case "claude":
 		return NewClaudeProvider(cfg), nil
+	case "anthropic-direct":
+		return NewAnthropicDirectProvider(cfg), nil
 	case "ollama":
 		return NewOllamaProvider(cfg), nil
 	case "claude-code":

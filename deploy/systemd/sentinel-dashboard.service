@@ -1,7 +1,7 @@
 [Unit]
 Description=Sentinel Dashboard — Web UI + WebSocket
 Documentation=https://github.com/obtFusi/project-sentinel/issues/28
-After=sentinel-cortex.service
+After=sentinel-gateway.service
 StartLimitBurst=5
 StartLimitIntervalSec=300
 

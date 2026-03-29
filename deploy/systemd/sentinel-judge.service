@@ -1,7 +1,7 @@
 [Unit]
 Description=Sentinel Judge — Quality Analysis Service (NATS + LLM)
 Documentation=https://github.com/obtFusi/project-sentinel/issues/26
-After=nats-server.service sentinel-nats-bridge.service sentinel-cortex.service
+After=nats-server.service sentinel-nats-bridge.service sentinel-gateway.service
 Requires=nats-server.service
 StartLimitBurst=5
 StartLimitIntervalSec=300

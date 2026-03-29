@@ -288,6 +288,7 @@ mod tests {
                 transit_route: Vec::new(),
                 transit_total_ms: 0,
                 transit_paused: false,
+                transit_pause_tick: 0,
                 transit_source: None,
             },
             Mood {
@@ -336,6 +337,7 @@ mod tests {
                 transit_route: Vec::new(),
                 transit_total_ms: 0,
                 transit_paused: false,
+                transit_pause_tick: 0,
                 transit_source: None,
             },
             Mood {
@@ -384,6 +386,7 @@ mod tests {
                 transit_route: Vec::new(),
                 transit_total_ms: 0,
                 transit_paused: false,
+                transit_pause_tick: 0,
                 transit_source: None,
             },
             Mood {

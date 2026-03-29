@@ -25,6 +25,7 @@ fn world_snapshot_bincode_roundtrip() {
             nmda_scores: vec![],
             agent_facts: vec![],
             sim_meta: vec![("sim_hour".to_string(), vec![0, 0, 0, 0])],
+            api_patterns: vec![("snapshot".to_string(), br#"{"patterns":[]}"#.to_vec())],
         },
         ecs: EcsSnapshot {
             positions: vec![(
@@ -132,6 +133,7 @@ fn empty_world_snapshot_roundtrip() {
             nmda_scores: vec![],
             agent_facts: vec![],
             sim_meta: vec![],
+            api_patterns: vec![],
         },
         ecs: EcsSnapshot {
             positions: vec![],

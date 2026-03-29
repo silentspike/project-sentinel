@@ -32,6 +32,30 @@ func TestNewConfig_Defaults(t *testing.T) {
 	if snapshot.RateLimit != 0 {
 		t.Errorf("expected rate_limit 0, got %f", snapshot.RateLimit)
 	}
+	if snapshot.SynthesisEnabled {
+		t.Error("expected synthesis_enabled false by default")
+	}
+	if snapshot.SequencingEnabled {
+		t.Error("expected sequencing_enabled false by default")
+	}
+	if snapshot.TickSyncEnabled {
+		t.Error("expected tick_sync_enabled false by default")
+	}
+	if snapshot.APICPEnabled {
+		t.Error("expected apicp_enabled false by default")
+	}
+	if snapshot.TickSyncTimeoutMs != 2000 {
+		t.Errorf("expected tick_sync_timeout_ms 2000, got %d", snapshot.TickSyncTimeoutMs)
+	}
+	if snapshot.P3TimeoutMs != 5000 {
+		t.Errorf("expected p3_timeout_ms 5000, got %d", snapshot.P3TimeoutMs)
+	}
+	if snapshot.MaxForwardConcurrency != 3 {
+		t.Errorf("expected max_forward_concurrency 3, got %d", snapshot.MaxForwardConcurrency)
+	}
+	if snapshot.InterceptMode != "auto" {
+		t.Errorf("expected intercept_mode auto, got %q", snapshot.InterceptMode)
+	}
 }
 
 // TestConfig_GetSnapshot verifies that Get returns a snapshot and is concurrent-safe.
@@ -190,6 +214,42 @@ func TestPlane_HandleUpdateConfig(t *testing.T) {
 	}
 	if result.MaxTokens != 2048 {
 		t.Errorf("expected max_tokens 2048, got %d", result.MaxTokens)
+	}
+}
+
+func TestPlane_HandleUpdateConfig_TrafficControlFields(t *testing.T) {
+	cfg := NewConfig("anthropic-direct")
+	plane := NewPlane(cfg, testLogger())
+	handler := plane.Handler()
+
+	body := `{"synthesis_enabled": true, "sequencing_enabled": true, "tick_sync_enabled": true, "apicp_enabled": true, "tick_sync_timeout_ms": 1500, "p3_timeout_ms": 4000, "max_forward_concurrency": 5, "intercept_mode": "manual"}`
+	req := httptest.NewRequest(http.MethodPatch, "/control/config", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result ConfigSnapshot
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if !result.SynthesisEnabled || !result.SequencingEnabled || !result.TickSyncEnabled || !result.APICPEnabled {
+		t.Fatalf("expected traffic toggles to be true, got %+v", result)
+	}
+	if result.TickSyncTimeoutMs != 1500 {
+		t.Errorf("expected tick_sync_timeout_ms 1500, got %d", result.TickSyncTimeoutMs)
+	}
+	if result.P3TimeoutMs != 4000 {
+		t.Errorf("expected p3_timeout_ms 4000, got %d", result.P3TimeoutMs)
+	}
+	if result.MaxForwardConcurrency != 5 {
+		t.Errorf("expected max_forward_concurrency 5, got %d", result.MaxForwardConcurrency)
+	}
+	if result.InterceptMode != "manual" {
+		t.Errorf("expected intercept_mode manual, got %q", result.InterceptMode)
 	}
 }
 

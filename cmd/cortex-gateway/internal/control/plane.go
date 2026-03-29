@@ -29,6 +29,16 @@ type ConfigSnapshot struct {
 	RateLimit       float64           `json:"rate_limit_rps"`
 	AgentOverrides  map[string]string `json:"agent_overrides"`
 
+	// Traffic Control (#288)
+	SynthesisEnabled      bool   `json:"synthesis_enabled"`
+	SequencingEnabled     bool   `json:"sequencing_enabled"`
+	TickSyncEnabled       bool   `json:"tick_sync_enabled"`
+	APICPEnabled          bool   `json:"apicp_enabled"`
+	TickSyncTimeoutMs     int    `json:"tick_sync_timeout_ms"`
+	P3TimeoutMs           int    `json:"p3_timeout_ms"`
+	MaxForwardConcurrency int    `json:"max_forward_concurrency"`
+	InterceptMode         string `json:"intercept_mode"`
+
 	// Pipeline Hardening (#144)
 	PersonalityGuardEnabled bool    `json:"personality_guard_enabled"`
 	DriftThreshold          float64 `json:"drift_threshold"`
@@ -47,6 +57,16 @@ type Config struct {
 	rateLimit       float64
 	agentOverrides  map[string]string // agent_id -> provider_name
 
+	// Traffic Control (#288)
+	synthesisEnabled      bool
+	sequencingEnabled     bool
+	tickSyncEnabled       bool
+	apicpEnabled          bool
+	tickSyncTimeoutMs     int
+	p3TimeoutMs           int
+	maxForwardConcurrency int
+	interceptMode         string
+
 	// Pipeline Hardening (#144)
 	personalityGuardEnabled bool
 	driftThreshold          float64
@@ -64,6 +84,15 @@ func NewConfig(primaryProvider string) *Config {
 		maxTokens:       4096,
 		rateLimit:       0,
 		agentOverrides:  make(map[string]string),
+
+		synthesisEnabled:      false,
+		sequencingEnabled:     false,
+		tickSyncEnabled:       false,
+		apicpEnabled:          false,
+		tickSyncTimeoutMs:     2000,
+		p3TimeoutMs:           5000,
+		maxForwardConcurrency: 3,
+		interceptMode:         "auto",
 
 		personalityGuardEnabled: false,
 		driftThreshold:          0.95,
@@ -111,6 +140,15 @@ func (c *Config) Get() ConfigSnapshot {
 		MaxTokens:       c.maxTokens,
 		RateLimit:       c.rateLimit,
 		AgentOverrides:  overrides,
+
+		SynthesisEnabled:      c.synthesisEnabled,
+		SequencingEnabled:     c.sequencingEnabled,
+		TickSyncEnabled:       c.tickSyncEnabled,
+		APICPEnabled:          c.apicpEnabled,
+		TickSyncTimeoutMs:     c.tickSyncTimeoutMs,
+		P3TimeoutMs:           c.p3TimeoutMs,
+		MaxForwardConcurrency: c.maxForwardConcurrency,
+		InterceptMode:         c.interceptMode,
 
 		PersonalityGuardEnabled: c.personalityGuardEnabled,
 		DriftThreshold:          c.driftThreshold,
@@ -169,6 +207,82 @@ var configUpdaters = map[string]configUpdater{
 			return errors.New("primary_provider must not be empty")
 		}
 		c.primaryProvider = v
+		return nil
+	},
+	"synthesis_enabled": func(c *Config, val interface{}) error {
+		v, ok := val.(bool)
+		if !ok {
+			return fmt.Errorf("synthesis_enabled must be a boolean, got %T", val)
+		}
+		c.synthesisEnabled = v
+		return nil
+	},
+	"sequencing_enabled": func(c *Config, val interface{}) error {
+		v, ok := val.(bool)
+		if !ok {
+			return fmt.Errorf("sequencing_enabled must be a boolean, got %T", val)
+		}
+		c.sequencingEnabled = v
+		return nil
+	},
+	"tick_sync_enabled": func(c *Config, val interface{}) error {
+		v, ok := val.(bool)
+		if !ok {
+			return fmt.Errorf("tick_sync_enabled must be a boolean, got %T", val)
+		}
+		c.tickSyncEnabled = v
+		return nil
+	},
+	"apicp_enabled": func(c *Config, val interface{}) error {
+		v, ok := val.(bool)
+		if !ok {
+			return fmt.Errorf("apicp_enabled must be a boolean, got %T", val)
+		}
+		c.apicpEnabled = v
+		return nil
+	},
+	"tick_sync_timeout_ms": func(c *Config, val interface{}) error {
+		v, ok := toInt(val)
+		if !ok {
+			return fmt.Errorf("tick_sync_timeout_ms must be an integer, got %T", val)
+		}
+		if v < 1 {
+			return fmt.Errorf("tick_sync_timeout_ms must be >= 1, got %d", v)
+		}
+		c.tickSyncTimeoutMs = v
+		return nil
+	},
+	"p3_timeout_ms": func(c *Config, val interface{}) error {
+		v, ok := toInt(val)
+		if !ok {
+			return fmt.Errorf("p3_timeout_ms must be an integer, got %T", val)
+		}
+		if v < 1 {
+			return fmt.Errorf("p3_timeout_ms must be >= 1, got %d", v)
+		}
+		c.p3TimeoutMs = v
+		return nil
+	},
+	"max_forward_concurrency": func(c *Config, val interface{}) error {
+		v, ok := toInt(val)
+		if !ok {
+			return fmt.Errorf("max_forward_concurrency must be an integer, got %T", val)
+		}
+		if v < 1 {
+			return fmt.Errorf("max_forward_concurrency must be >= 1, got %d", v)
+		}
+		c.maxForwardConcurrency = v
+		return nil
+	},
+	"intercept_mode": func(c *Config, val interface{}) error {
+		v, ok := val.(string)
+		if !ok {
+			return fmt.Errorf("intercept_mode must be a string, got %T", val)
+		}
+		if v == "" {
+			return errors.New("intercept_mode must not be empty")
+		}
+		c.interceptMode = v
 		return nil
 	},
 	"personality_guard_enabled": func(c *Config, val interface{}) error {

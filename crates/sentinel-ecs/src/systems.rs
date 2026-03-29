@@ -352,14 +352,17 @@ pub fn operator_command_system(
     mut event_buffer: ResMut<EventBuffer>,
     mut active_chaos: ResMut<ActiveChaos>,
     mut active_room_stimuli: ResMut<ActiveRoomStimuli>,
-    mut agents: Query<(&Position, &mut WorkContext)>,
+    mut agent_queries: ParamSet<(
+        Query<(&Position, &mut WorkContext)>,
+        Query<(&AgentIdentity, &mut Position, &Personality, &BioState)>,
+    )>,
     mut room_chat_buffer: ResMut<super::world::RoomChatBuffer>,
     mut gaia_buffer: ResMut<super::world::GaiaBuffer>,
     mut broadcast_buffer: ResMut<super::world::BroadcastBuffer>,
     all_agents_query: Query<&AgentIdentity>,
     // PUSH-Perception: Sofort Perception fuer Chat-Empfaenger senden
     perception_sender: Option<Res<PerceptionSender>>,
-    chat_agents: Query<(&AgentIdentity, &Position, &Personality, &BioState)>,
+    room_distances: Option<Res<RoomDistanceMap>>,
 ) {
     let Some(receiver) = receiver else { return };
     let Ok(rx) = receiver.0.lock() else { return };
@@ -384,7 +387,7 @@ pub fn operator_command_system(
                     duration_ticks,
                     &mut event_buffer,
                     &mut active_chaos,
-                    &mut agents,
+                    &mut agent_queries.p0(),
                     Some(metadata),
                 );
             }
@@ -428,8 +431,9 @@ pub fn operator_command_system(
                 if let Some(ref sender) = perception_sender {
                     let msg_text = &cmd.message[..cmd.message.len().min(500)];
                     let heard = format!("{} sagte: \"{}\"", cmd.sender_name, msg_text);
+                    let chat_agents = agent_queries.p1();
 
-                    for (identity, position, personality, bio) in &chat_agents {
+                    for (identity, position, personality, bio) in chat_agents.iter() {
                         if position.room_id == cmd.room_id && !position.in_transit {
                             let first_name = identity
                                 .name
@@ -485,11 +489,13 @@ pub fn operator_command_system(
                 }
             }
             OperatorCommand::Gaia(cmd) => {
-                gaia_buffer.add(
-                    sentinel_common::AgentId(cmd.target_agent_id),
-                    cmd.thought.clone(),
-                    time.tick.0,
-                );
+                let agent_id = sentinel_common::AgentId(cmd.target_agent_id);
+                let tick = time.tick.0;
+
+                // Gaia-Thought im Buffer behalten (fuer Perception-Kontext/impulse_text)
+                gaia_buffer.add(agent_id, cmd.thought.clone(), tick);
+
+                // Event emittieren
                 let payload = DomainEventPayload::OperatorGaiaSent {
                     target_agent_id: cmd.target_agent_id,
                     thought: cmd.thought.clone(),
@@ -499,13 +505,46 @@ pub fn operator_command_system(
                     &format!("AGENT-{:02}", cmd.target_agent_id),
                     &payload.to_json(),
                     &uuid::Uuid::new_v4().to_string(),
-                    time.tick.0,
+                    tick,
                 );
                 event_buffer.events.push(event);
-                tracing::info!(
-                    agent_id = cmd.target_agent_id,
-                    "Voice of Gaia: Gedanke eingepflanzt + Event emittiert"
-                );
+
+                // Gaia-Move: Wenn Thought eine room_id enthaelt, Transit direkt starten.
+                // Voice of Gaia ist ein goettlicher Impuls — der Agent MUSS folgen.
+                let thought_lower = cmd.thought.to_lowercase();
+                let target_room = super::world::ROOM_IDS.iter().find(|&&rid| {
+                    thought_lower.contains(rid)
+                });
+
+                if let Some(&room_id) = target_room {
+                    // Finde den Agent und starte Transit
+                    let mut chat_agents = agent_queries.p1();
+                    for (identity, mut pos, _, _) in &mut chat_agents {
+                        if identity.agent_id == agent_id && !pos.in_transit {
+                            let correlation = uuid::Uuid::new_v4().to_string();
+                            super::autonomy::start_transit(
+                                identity,
+                                &mut pos,
+                                room_id,
+                                &correlation,
+                                tick,
+                                &mut event_buffer,
+                                &room_distances,
+                            );
+                            tracing::info!(
+                                agent_id = cmd.target_agent_id,
+                                target = room_id,
+                                "Voice of Gaia: Transit direkt gestartet (goettlicher Impuls)"
+                            );
+                            break;
+                        }
+                    }
+                } else {
+                    tracing::info!(
+                        agent_id = cmd.target_agent_id,
+                        "Voice of Gaia: Gedanke eingepflanzt (kein Move-Intent)"
+                    );
+                }
             }
             OperatorCommand::Broadcast(cmd) => {
                 broadcast_buffer.add(cmd.message.clone(), cmd.broadcast_type.clone(), time.tick.0);
@@ -1695,10 +1734,17 @@ pub fn output_system(
             let temp_high = room_temp_c > 26.0;
             // Operator-Impulse: Gaia/Broadcast/Encounter aktiv → Synthesis MUSS bypassed werden
             let has_encounter = queue.events.iter().any(|e| e.text.contains("Du triffst"));
-            let has_operator_impulse =
-                !gaia_buffer.get_active(&identity.agent_id, time.tick.0).is_empty()
-                    || !broadcast_buffer.get_active(time.tick.0).is_empty()
-                    || has_encounter;
+            let gaia_active = !gaia_buffer.get_active(&identity.agent_id, time.tick.0).is_empty();
+            let broadcast_active = !broadcast_buffer.get_active(time.tick.0).is_empty();
+            let has_operator_impulse = gaia_active || broadcast_active || has_encounter;
+            if gaia_active {
+                tracing::info!(
+                    agent = %identity.name,
+                    agent_id = identity.agent_id.0,
+                    tick = time.tick.0,
+                    "Gaia-Thought AKTIV → IM:1 im Fingerprint"
+                );
+            }
             let synth_fingerprint = format!(
                 "H{}|E{}|B{}|S{}|C{}|SN{}|R:{}|P:{}|CH:{}|HR:{}|T:{}|TMP:{}|PE:{}|IM:{}",
                 bio_bucket(bio.hunger),
@@ -1750,7 +1796,7 @@ pub fn output_system(
             // naechster Tick IM:0 → Synthesis). TTL=3 gibt 3 Ticks fuer den
             // LLM-Call und verhindert trotzdem Endlos-Loop (300→3 Ticks).
             if has_operator_impulse {
-                gaia_buffer.shorten_ttl(&identity.agent_id, 3, time.tick.0);
+                gaia_buffer.shorten_ttl(&identity.agent_id, 120, time.tick.0);
             }
         }
     }

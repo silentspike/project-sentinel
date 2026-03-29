@@ -12,7 +12,7 @@ func TestP1ForwardImmediately(t *testing.T) {
 		t.Error("should not have active P1 initially")
 	}
 
-	s.MarkP1Active("room-1", "AGENT-01")
+	s.MarkP1Active("room-1", "req-1", "AGENT-01")
 
 	if !s.HasActiveP1("room-1") {
 		t.Error("should have active P1 after MarkP1Active")
@@ -24,12 +24,12 @@ func TestP1ForwardImmediately(t *testing.T) {
 
 func TestP3WaitsForP1(t *testing.T) {
 	s := NewSequencer(5*time.Second, true, nil)
-	s.MarkP1Active("room-1", "AGENT-01")
+	s.MarkP1Active("room-1", "req-1", "AGENT-01")
 
 	// Simulate P1 completing after 100ms
 	go func() {
 		time.Sleep(100 * time.Millisecond)
-		s.CompleteP1("room-1", "Hallo, ich bin Thomas und kann helfen.")
+		s.CompleteP1("room-1", "req-1", "Hallo, ich bin Thomas und kann helfen.")
 	}()
 
 	content, agent, ok := s.WaitForP1("room-1")
@@ -46,7 +46,7 @@ func TestP3WaitsForP1(t *testing.T) {
 
 func TestP3TimeoutRelease(t *testing.T) {
 	s := NewSequencer(100*time.Millisecond, true, nil)
-	s.MarkP1Active("room-1", "AGENT-01")
+	s.MarkP1Active("room-1", "req-1", "AGENT-01")
 
 	// P1 never completes — P3 should timeout
 	start := time.Now()
@@ -73,7 +73,7 @@ func TestP3NoActiveP1(t *testing.T) {
 
 func TestMultipleP3sGetSameContext(t *testing.T) {
 	s := NewSequencer(5*time.Second, true, nil)
-	s.MarkP1Active("room-1", "AGENT-01")
+	s.MarkP1Active("room-1", "req-1", "AGENT-01")
 
 	results := make(chan string, 3)
 
@@ -88,7 +88,7 @@ func TestMultipleP3sGetSameContext(t *testing.T) {
 	}
 
 	time.Sleep(50 * time.Millisecond)
-	s.CompleteP1("room-1", "P1 says hello")
+	s.CompleteP1("room-1", "req-1", "P1 says hello")
 
 	for i := 0; i < 3; i++ {
 		select {
@@ -104,11 +104,71 @@ func TestMultipleP3sGetSameContext(t *testing.T) {
 
 func TestCleanup(t *testing.T) {
 	s := NewSequencer(5*time.Second, true, nil)
-	s.MarkP1Active("room-1", "AGENT-01")
-	s.CompleteP1("room-1", "done")
+	s.MarkP1Active("room-1", "req-1", "AGENT-01")
+	s.CompleteP1("room-1", "req-1", "done")
 
 	s.Cleanup()
 	if s.HasActiveP1("room-1") {
 		t.Error("completed room should be cleaned up")
+	}
+}
+
+func TestMultipleP1sDoNotOverwrite(t *testing.T) {
+	s := NewSequencer(5*time.Second, true, nil)
+	s.MarkP1Active("room-1", "req-1", "AGENT-01")
+	s.MarkP1Active("room-1", "req-2", "AGENT-02")
+
+	done := make(chan struct{})
+	var content, agent string
+	var ok bool
+	go func() {
+		content, agent, ok = s.WaitForP1("room-1")
+		close(done)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	s.CompleteP1("room-1", "req-1", "P1 first")
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter timed out")
+	}
+
+	if !ok {
+		t.Fatal("expected first wait to succeed")
+	}
+	if agent != "AGENT-01" {
+		t.Fatalf("agent = %q, want AGENT-01", agent)
+	}
+	if content != "P1 first" {
+		t.Fatalf("content = %q, want P1 first", content)
+	}
+	if s.P1Agent("room-1") != "AGENT-02" {
+		t.Fatalf("remaining active P1 = %q, want AGENT-02", s.P1Agent("room-1"))
+	}
+}
+
+func TestSequencerRuntimeConfig(t *testing.T) {
+	s := NewSequencer(5*time.Second, false, nil)
+	if s.Enabled() {
+		t.Fatal("sequencer should start disabled")
+	}
+
+	s.SetEnabled(true)
+	if !s.Enabled() {
+		t.Fatal("sequencer should be enabled after SetEnabled(true)")
+	}
+
+	s.SetTimeout(25 * time.Millisecond)
+	s.MarkP1Active("room-1", "req-1", "AGENT-01")
+
+	start := time.Now()
+	_, _, ok := s.WaitForP1("room-1")
+	if ok {
+		t.Fatal("expected timeout after runtime timeout update")
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("updated timeout not applied, waited %v", elapsed)
 	}
 }

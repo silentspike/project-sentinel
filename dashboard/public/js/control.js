@@ -1,5 +1,6 @@
 // Control Panel: Steuert das Cortex Gateway via Dashboard Proxy.
-// 6 Sektionen: Quick Actions, Provider, LLM Params, Pipeline Hardening, Guardrails, Live Config.
+// Sektionen: Quick Actions, Provider, LLM Params, Pipeline Hardening, Guardrails,
+// Traffic Control, Live Config, Snapshots.
 // KEIN innerHTML — nur textContent + DOM API.
 
 let controlState = {
@@ -7,6 +8,7 @@ let controlState = {
   paused: false,
   config: null,
   health: null,
+  trafficStats: null,
 };
 
 // API-Key aus sessionStorage (User gibt ihn einmal ein)
@@ -30,12 +32,17 @@ async function controlFetch(url, opts = {}) {
 
 async function loadControlStatus() {
   try {
-    const resp = await fetch('/api/control/status');
-    const data = await resp.json();
-    controlState = data;
+    const [statusResp, trafficResp] = await Promise.all([
+      fetch('/api/control/status'),
+      fetch('/api/control/traffic-stats'),
+    ]);
+    const data = await statusResp.json();
+    const trafficStats = trafficResp.ok ? await trafficResp.json() : null;
+    controlState = { ...data, trafficStats };
     return data;
   } catch {
     controlState.connected = false;
+    controlState.trafficStats = null;
     return controlState;
   }
 }
@@ -114,7 +121,7 @@ function renderProviderSection(container) {
   const providerSelect = document.createElement('select');
   providerSelect.id = 'provider-select';
   providerSelect.className = 'control-select';
-  for (const p of ['claude-code', 'ollama', 'claude']) {
+  for (const p of ['anthropic-direct', 'claude-code']) {
     const opt = document.createElement('option');
     opt.value = p;
     opt.textContent = p;
@@ -406,7 +413,62 @@ async function loadPipelineMetrics(section) {
   } catch { /* ignore */ }
 }
 
-// ── Sektion 6: Live Config ────────────────────────
+// ── Sektion 6: Traffic Control ────────────────────
+
+function renderTrafficControl(container) {
+  const section = el('div', 'control-section');
+  section.appendChild(sectionTitle('Traffic Control'));
+
+  const stats = controlState.trafficStats;
+  if (!stats) {
+    section.appendChild(noDataMsg());
+    container.appendChild(section);
+    return;
+  }
+
+  const items = [
+    ['Primary Provider', stats.primary_provider ?? '--'],
+    ['Kosten heute', formatUSD(stats.current_cost_usd)],
+    ['Ersparnis heute', formatUSD(stats.estimated_savings_usd)],
+    ['Hochrechnung/Tag Kosten', formatUSD(stats.projected_daily_cost_usd)],
+    ['Hochrechnung/Tag Ersparnis', formatUSD(stats.projected_daily_savings_usd)],
+    ['Avg Forward Cost', formatUSD(stats.avg_forward_cost_usd)],
+    ['Forward Calls', formatNum(stats.forward_calls ?? 0)],
+    ['Synthesis Count', formatNum(stats.synthesis_count ?? 0)],
+    ['Synthesis Rate', formatPercent(stats.synthesis_rate)],
+    ['Tick Sync', stats.tick_sync_enabled ? 'Ja' : 'Nein'],
+    ['Tick Sync Runtime', stats.tick_sync_runtime_enabled ? 'Ja' : 'Nein'],
+    ['Tick Sync Pending', formatNum(stats.tick_sync_pending ?? 0)],
+    ['Synthesis aktiv', stats.synthesis_enabled ? 'Ja' : 'Nein'],
+    ['Sequencing aktiv', stats.sequencing_enabled ? 'Ja' : 'Nein'],
+    ['API-CP aktiv', stats.apicp_enabled ? 'Ja' : 'Nein'],
+    ['Active Patterns', formatNum(stats.active_patterns ?? 0)],
+    ['Queue Depth', stats.queue_depth == null ? '--' : formatNum(stats.queue_depth)],
+    ['Active Forward Calls', stats.active_forward_calls == null ? '--' : formatNum(stats.active_forward_calls)],
+    ['Pending Intercepts', formatNum(stats.pending_intercepts ?? 0)],
+    ['Pending Response Intercepts', formatNum(stats.pending_response_intercepts ?? 0)],
+    ['Response Logs', formatNum(stats.response_log_entries ?? 0)],
+    ['Tick Sync Timeout', stats.tick_sync_timeout_ms == null ? '--' : `${stats.tick_sync_timeout_ms} ms`],
+    ['P3 Timeout', stats.p3_timeout_ms == null ? '--' : `${stats.p3_timeout_ms} ms`],
+    ['Intercept Mode', stats.intercept_mode ?? '--'],
+  ];
+
+  for (const [label, value] of items) {
+    const row = el('div', 'control-row compact');
+    const lbl = el('span', 'control-label');
+    lbl.textContent = label + ':';
+    row.appendChild(lbl);
+
+    const val = el('span', 'control-value');
+    val.textContent = String(value);
+    row.appendChild(val);
+    section.appendChild(row);
+  }
+
+  container.appendChild(section);
+}
+
+// ── Sektion 7: Live Config ────────────────────────
 
 function renderLiveConfig(container) {
   const section = el('div', 'control-section');
@@ -501,9 +563,20 @@ function showFeedback(container, msg, isError = false) {
 }
 
 function formatNum(n) {
+  if (n == null) return '--';
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
   if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
   return String(n);
+}
+
+function formatUSD(n) {
+  if (n == null) return '--';
+  return '$' + Number(n).toFixed(2);
+}
+
+function formatPercent(n) {
+  if (n == null) return '--';
+  return (Number(n) * 100).toFixed(1) + '%';
 }
 
 // ── Main Render ───────────────────────────────────
@@ -519,6 +592,7 @@ function renderControl() {
   renderLlmParams(container);
   renderPipelineHardening(container);
   renderGuardrailsStatus(container);
+  renderTrafficControl(container);
   renderLiveConfig(container);
   renderSnapshotSection(container);
 }

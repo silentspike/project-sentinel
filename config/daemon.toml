@@ -31,6 +31,17 @@ url = "nats://127.0.0.1:4222"
 enabled = true
 bind_addr = "127.0.0.1:8084"
 
+[daemon.traffic_control]
+synthesis_enabled = false
+sequencing_enabled = false
+tick_sync_enabled = false
+apicp_enabled = false
+tick_sync_timeout_ms = 2000
+p3_timeout_ms = 5000
+gateway_request_timeout_ms = 150000
+max_forward_concurrency = 3
+intercept_mode = "auto"
+
 # Time Machine: World Snapshots + Event Retention
 [daemon.retention]
 hourly_interval_ticks = 3600  # 1h bei 1s Tick-Rate

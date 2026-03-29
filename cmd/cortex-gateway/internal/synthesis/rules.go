@@ -12,9 +12,10 @@ type Action struct {
 // Each rule matches a fingerprint condition and produces a templated response.
 type Rule struct {
 	Name      string
-	Match     func(fp Fingerprint, isAddressed bool) bool
+	Match     func(fp Fingerprint, ctx Context) bool
 	Templates map[string]string // personality_type ("I"/"E") → response template
 	Actions   []Action
+	Build     func(fp Fingerprint, ctx Context) []Action
 }
 
 // DefaultRules returns the initial set of deterministic synthesis rules.
@@ -23,23 +24,20 @@ type Rule struct {
 func DefaultRules() []Rule {
 	return []Rule{
 		{
-			Name: "bio_bladder_p0",
-			Match: func(fp Fingerprint, isAddressed bool) bool {
-				return fp.Bladder >= 9 && !fp.HasHeard && !isAddressed && !fp.HasChaos && !fp.HasImpulse
+			Name: "bio_bladder",
+			Match: func(fp Fingerprint, ctx Context) bool {
+				return fp.Bladder >= 9 && baseGate(fp, ctx)
 			},
 			Templates: map[string]string{
 				"I": "*steht leise auf und geht schnellen Schrittes zur Tuer*",
 				"E": "*steht hastig auf* Entschuldigung, ich muss dringend... *eilt zur Tuer*",
 			},
-			Actions: []Action{
-				{Type: "emote", Content: "*steht auf*", Emotion: "neutral"},
-				{Type: "move", Content: "Zur Toilette", Target: "toilette-eg"},
-			},
+			Build: bladderActions,
 		},
 		{
-			Name: "bio_hunger_p0",
-			Match: func(fp Fingerprint, isAddressed bool) bool {
-				return fp.Hunger >= 9 && !fp.HasHeard && !isAddressed && !fp.HasChaos && !fp.HasImpulse
+			Name: "bio_hunger",
+			Match: func(fp Fingerprint, ctx Context) bool {
+				return fp.Hunger >= 9 && baseGate(fp, ctx)
 			},
 			Templates: map[string]string{
 				"I": "*haelt sich den Magen und steht leise auf* *geht in Richtung Kueche*",
@@ -47,13 +45,13 @@ func DefaultRules() []Rule {
 			},
 			Actions: []Action{
 				{Type: "emote", Content: "*steht auf*", Emotion: "hungry"},
-				{Type: "move", Content: "Zur Kueche", Target: "kueche-eg"},
+				{Type: "move", Content: "Zur Kueche", Target: "kueche"},
 			},
 		},
 		{
-			Name: "bio_energy_p0",
-			Match: func(fp Fingerprint, isAddressed bool) bool {
-				return fp.Energy <= 1 && !fp.HasHeard && !isAddressed && !fp.HasChaos && !fp.HasImpulse
+			Name: "bio_energy",
+			Match: func(fp Fingerprint, ctx Context) bool {
+				return fp.Energy <= 1 && baseGate(fp, ctx)
 			},
 			Templates: map[string]string{
 				"I": "*lehnt sich zurueck und schliesst kurz die Augen* *atmet tief durch*",
@@ -65,8 +63,8 @@ func DefaultRules() []Rule {
 		},
 		{
 			Name: "bio_caffeine_low",
-			Match: func(fp Fingerprint, isAddressed bool) bool {
-				return fp.Caffeine <= 1 && fp.Energy <= 5 && !fp.HasHeard && !isAddressed && !fp.HasChaos && !fp.HasImpulse
+			Match: func(fp Fingerprint, ctx Context) bool {
+				return fp.Caffeine <= 1 && fp.Energy <= 5 && baseGate(fp, ctx)
 			},
 			Templates: map[string]string{
 				"I": "*steht auf und geht leise Kaffee holen*",
@@ -74,14 +72,13 @@ func DefaultRules() []Rule {
 			},
 			Actions: []Action{
 				{Type: "emote", Content: "*steht auf*", Emotion: "neutral"},
-				{Type: "move", Content: "Kaffee holen", Target: "kueche-eg"},
+				{Type: "move", Content: "Kaffee holen", Target: "kueche"},
 			},
 		},
 		{
 			Name: "circadian_morning",
-			Match: func(fp Fingerprint, isAddressed bool) bool {
-				return fp.SimHour >= 6 && fp.SimHour <= 7 && fp.Energy > 5 &&
-					!fp.HasHeard && !isAddressed && !fp.HasChaos && !fp.HasImpulse
+			Match: func(fp Fingerprint, ctx Context) bool {
+				return fp.SimHour >= 6 && fp.SimHour <= 7 && fp.Energy > 5 && baseGate(fp, ctx)
 			},
 			Templates: map[string]string{
 				"I": "*faehrt leise den Rechner hoch und oeffnet die Mails*",
@@ -93,9 +90,8 @@ func DefaultRules() []Rule {
 		},
 		{
 			Name: "circadian_lunch",
-			Match: func(fp Fingerprint, isAddressed bool) bool {
-				return fp.SimHour >= 12 && fp.SimHour <= 13 && fp.Hunger > 5 &&
-					!fp.HasHeard && !isAddressed && !fp.HasChaos && !fp.HasImpulse
+			Match: func(fp Fingerprint, ctx Context) bool {
+				return fp.SimHour >= 12 && fp.SimHour <= 13 && fp.Hunger > 5 && baseGate(fp, ctx)
 			},
 			Templates: map[string]string{
 				"I": "*packt Sachen zusammen und geht in die Kueche*",
@@ -103,29 +99,39 @@ func DefaultRules() []Rule {
 			},
 			Actions: []Action{
 				{Type: "emote", Content: "*steht auf*", Emotion: "happy"},
-				{Type: "move", Content: "Mittagspause", Target: "kueche-eg"},
+				{Type: "move", Content: "Mittagspause", Target: "kueche"},
 			},
 		},
 		{
 			Name: "physics_temp_high",
-			Match: func(fp Fingerprint, isAddressed bool) bool {
-				return fp.TempHigh && !fp.HasHeard && !isAddressed && !fp.HasChaos && !fp.HasImpulse
+			Match: func(fp Fingerprint, ctx Context) bool {
+				return fp.TempHigh && baseGate(fp, ctx)
 			},
 			Templates: map[string]string{
 				"I": "*steht auf und oeffnet leise das Fenster*",
 				"E": "*steht auf* Boah, ist das warm hier! *oeffnet das Fenster weit* So, besser!",
 			},
 			Actions: []Action{
-				{Type: "emote", Content: "*oeffnet das Fenster*", Emotion: "uncomfortable"},
+				{Type: "tool_use", Content: "Fenster oeffnen", Target: "open_window", Emotion: "uncomfortable"},
 			},
 		},
-		// heartbeat_idle — catch-all for agents without stimuli.
-		// Matches regardless of PresenceCount (agents in shared offices work silently).
-		// MUST be last rule (most general).
 		{
-			Name: "heartbeat_idle",
-			Match: func(fp Fingerprint, isAddressed bool) bool {
-				return !fp.HasHeard && !isAddressed && !fp.HasChaos && !fp.HasImpulse
+			Name: "physics_noise_high",
+			Match: func(fp Fingerprint, ctx Context) bool {
+				return ctx.NoiseHigh && baseGate(fp, ctx)
+			},
+			Templates: map[string]string{
+				"I": "*zieht kurz die Schultern hoch und setzt die Kopfhoerer auf*",
+				"E": "*verzieht das Gesicht* Puh, ist das laut hier. *setzt Kopfhoerer auf und arbeitet weiter*",
+			},
+			Actions: []Action{
+				{Type: "tool_use", Content: "Kopfhoerer aufsetzen", Target: "headphones_on", Emotion: "frustrated"},
+			},
+		},
+		{
+			Name: "routine_idle_alone",
+			Match: func(fp Fingerprint, ctx Context) bool {
+				return fp.PresenceCount == 0 && baseGate(fp, ctx)
 			},
 			Templates: map[string]string{
 				"I": "*arbeitet still und konzentriert am aktuellen Projekt*",
@@ -135,5 +141,36 @@ func DefaultRules() []Rule {
 				{Type: "emote", Content: "*arbeitet konzentriert*", Emotion: "focused"},
 			},
 		},
+		{
+			Name: "routine_idle_with_presence",
+			Match: func(fp Fingerprint, ctx Context) bool {
+				return fp.PresenceCount > 0 && baseGate(fp, ctx)
+			},
+			Templates: map[string]string{
+				"I": "*arbeitet still weiter und nimmt die Anwesenheit der anderen wahr*",
+				"E": "*arbeitet weiter, schaut kurz zu den anderen und bleibt im Flow*",
+			},
+			Actions: []Action{
+				{Type: "emote", Content: "*arbeitet ruhig im Teamkontext weiter*", Emotion: "focused"},
+			},
+		},
 	}
+}
+
+func baseGate(fp Fingerprint, ctx Context) bool {
+	return !fp.HasHeard && !ctx.IsAddressed && !fp.HasChaos && !fp.HasImpulse
+}
+
+func bladderActions(_ Fingerprint, ctx Context) []Action {
+	return []Action{
+		{Type: "emote", Content: "*steht auf*", Emotion: "neutral"},
+		{Type: "move", Content: "Zur Toilette", Target: toiletTarget(ctx.AgentID)},
+	}
+}
+
+func toiletTarget(agentID int) string {
+	if agentID%2 == 0 {
+		return "toilette-eg-damen"
+	}
+	return "toilette-eg-herren"
 }

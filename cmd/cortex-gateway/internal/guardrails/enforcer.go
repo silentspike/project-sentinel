@@ -88,10 +88,9 @@ func (e *Enforcer) Record(provider string, inputTokens, outputTokens int) {
 	}
 
 	e.budget.Record(inputTokens, outputTokens)
-	cost := e.costs.Record(provider, inputTokens, outputTokens)
+	e.costs.Record(provider, inputTokens, outputTokens)
 
 	recordTokenMetrics(provider, inputTokens, outputTokens)
-	recordCostMetric(provider, cost)
 	updateBudgetGauges(e.budget.Status())
 }
 

@@ -3,6 +3,18 @@
 //! Erstellt die ECS World mit allen Systems in korrekter Reihenfolge
 //! und bietet die Funktion zum Spawnen von Agenten.
 
+/// Alle gültigen room_ids aus rooms.toml (für Gaia-Move Intent-Erkennung).
+pub const ROOM_IDS: &[&str] = &[
+    "empfang", "flur-eg", "kueche", "buero-dev-1", "buero-dev-2",
+    "meetingraum-01", "toilette-eg-damen", "toilette-eg-herren",
+    "treppenhaus", "flur-og", "buero-design-1", "buero-design-2",
+    "buero-ceo", "meetingraum-02", "meetingraum-03",
+    "toilette-og-damen", "toilette-og-herren",
+    "buero-sales", "buero-pm", "buero-marketing", "buero-admin",
+    "buero-qa", "buero-it", "buero-betriebsrat",
+    "buero-betriebspsych", "buero-betriebsarzt",
+];
+
 use super::autonomy::AutonomyCooldown;
 use super::components::*;
 use super::systems::*;

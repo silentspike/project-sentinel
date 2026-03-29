@@ -89,21 +89,20 @@ func (e *Engine) Decide(metadata map[string]string, agentName string) Result {
 		return Result{Decision: Forward}
 	}
 
-	fp, err := Parse(fpRaw)
+	fp, ctx, err := PrepareInputs(metadata)
 	if err != nil {
 		e.logger.Warn("fingerprint parse error", "error", err, "raw", fpRaw)
 		forwardedTotal.Inc()
 		return Result{Decision: Forward}
 	}
 
-	isAddressed := metadata["is_directly_addressed"] == "true"
-	personalityType := metadata["personality_type"]
+	personalityType := fp.Personality
 	if personalityType == "" {
 		personalityType = "E" // default extrovert
 	}
 
 	for _, rule := range e.rules {
-		if rule.Match(fp, isAddressed) {
+		if rule.Match(fp, ctx) {
 			template, ok := rule.Templates[personalityType]
 			if !ok {
 				template = rule.Templates["E"] // fallback
@@ -114,18 +113,23 @@ func (e *Engine) Decide(metadata map[string]string, agentName string) Result {
 
 			e.logger.Info("synthesis match",
 				"rule", rule.Name,
-				"agent_id", metadata["agent_id"],
+				"agent_id", ctx.AgentID,
 				"agent_name", agentName,
 				"personality", personalityType,
 				"room", fp.RoomID,
 			)
 			synthesizedTotal.Inc()
 
+			actions := rule.Actions
+			if rule.Build != nil {
+				actions = rule.Build(fp, ctx)
+			}
+
 			return Result{
 				Decision: Synthesize,
 				Content:  content,
 				Rule:     rule.Name,
-				Actions:  rule.Actions,
+				Actions:  actions,
 			}
 		}
 	}
