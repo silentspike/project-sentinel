@@ -476,6 +476,7 @@ pub struct RedbDump {
     pub nmda_scores: Vec<(u16, Vec<u8>)>,
     pub agent_facts: Vec<(u16, Vec<u8>)>,
     pub sim_meta: Vec<(String, Vec<u8>)>,
+    pub api_patterns: Vec<(String, Vec<u8>)>,
 }
 
 /// ECS World-State Snapshot (alle Components + Resources).

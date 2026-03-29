@@ -231,7 +231,7 @@ pub fn autonomy_system(
 }
 
 /// Startet einen Transit und erzeugt TransitStarted + AgentActionReceived Events.
-fn start_transit(
+pub fn start_transit(
     identity: &AgentIdentity,
     position: &mut Position,
     target: &str,

@@ -1,8 +1,6 @@
 package synthesis
 
-import (
-	"testing"
-)
+import "testing"
 
 func TestParseFingerprint(t *testing.T) {
 	fp, err := Parse("H3|E7|B2|S4|C1|SN5|R:buero-dev-1|P:2|CH:0|HR:0|T:10|TMP:1|PE:E|IM:0")
@@ -49,7 +47,6 @@ func TestParseEmpty(t *testing.T) {
 }
 
 func TestParsePartialFields(t *testing.T) {
-	// Partial fingerprints are valid — missing fields default to zero values
 	fp, err := Parse("H3|E7|B0|S0|C0|SN0|R:test|P:0|CH:0|HR:0|T:0|TMP:0|PE:I|IM:0")
 	if err != nil {
 		t.Fatalf("Parse partial: %v", err)
@@ -59,93 +56,142 @@ func TestParsePartialFields(t *testing.T) {
 	}
 }
 
-func TestBioBladderP0(t *testing.T) {
-	meta := map[string]string{
-		"synth_fp":              "H5|E5|B9|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0",
-		"is_directly_addressed": "false",
-		"personality_type":      "I",
-		"agent_id":              "5",
-	}
+func TestBioBladderUsesModuloTarget(t *testing.T) {
 	engine := NewEngine(true, nil)
-	result := engine.Decide(meta, "AGENT-TEST")
-	if result.Decision != Synthesize {
+
+	odd := engine.Decide(testMetadata("H5|E5|B9|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0", map[string]string{
+		"agent_id":         "5",
+		"personality_type": "I",
+	}), "AGENT-05")
+	if odd.Decision != Synthesize {
 		t.Fatal("expected Synthesize for bladder=9")
 	}
-	if result.Rule != "bio_bladder_p0" {
-		t.Errorf("rule = %q, want bio_bladder_p0", result.Rule)
+	if odd.Rule != "bio_bladder" {
+		t.Fatalf("rule = %q, want bio_bladder", odd.Rule)
 	}
-	if result.Content == "" {
-		t.Error("content should not be empty")
+	if target := findActionTarget(odd.Actions, "move"); target != "toilette-eg-herren" {
+		t.Fatalf("odd agent target = %q, want toilette-eg-herren", target)
+	}
+
+	even := engine.Decide(testMetadata("H5|E5|B9|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:E|IM:0", map[string]string{
+		"agent_id":         "6",
+		"personality_type": "E",
+	}), "AGENT-06")
+	if even.Decision != Synthesize {
+		t.Fatal("expected Synthesize for even bladder=9")
+	}
+	if target := findActionTarget(even.Actions, "move"); target != "toilette-eg-damen" {
+		t.Fatalf("even agent target = %q, want toilette-eg-damen", target)
 	}
 }
 
-func TestBioBladderBlockedByHeard(t *testing.T) {
-	meta := map[string]string{
-		"synth_fp":              "H5|E5|B9|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:1|T:10|TMP:0|PE:I|IM:0",
-		"is_directly_addressed": "false",
-		"personality_type":      "I",
-		"agent_id":              "5",
+func TestBioHungerFires(t *testing.T) {
+	meta := testMetadata("H9|E5|B3|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0", map[string]string{
+		"agent_id":         "5",
+		"personality_type": "I",
+	})
+	engine := NewEngine(true, nil)
+	result := engine.Decide(meta, "AGENT-TEST")
+	if result.Decision != Synthesize {
+		t.Fatal("expected Synthesize for hunger=9")
 	}
+	if result.Rule != "bio_hunger" {
+		t.Errorf("rule = %q, want bio_hunger", result.Rule)
+	}
+	if target := findActionTarget(result.Actions, "move"); target != "kueche" {
+		t.Errorf("move target = %q, want kueche", target)
+	}
+}
+
+func TestBioHungerBlockedByHeardMetadata(t *testing.T) {
+	meta := testMetadata("H9|E5|B3|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0", map[string]string{
+		"agent_id":         "5",
+		"personality_type": "I",
+		"heard":            "Lisa sagte: Hallo",
+	})
 	engine := NewEngine(true, nil)
 	result := engine.Decide(meta, "AGENT-TEST")
 	if result.Decision != Forward {
-		t.Error("expected Forward when HasHeard=true (AC-6)")
+		t.Error("expected Forward when heard metadata is present")
+	}
+}
+
+func TestBioHungerBlockedByChaos(t *testing.T) {
+	meta := testMetadata("H9|E5|B3|S3|C5|SN5|R:buero-dev-1|P:0|CH:1|HR:0|T:10|TMP:0|PE:I|IM:0", map[string]string{
+		"agent_id":         "5",
+		"personality_type": "I",
+	})
+	engine := NewEngine(true, nil)
+	result := engine.Decide(meta, "AGENT-TEST")
+	if result.Decision != Forward {
+		t.Error("expected Forward when HasChaos=true")
 	}
 }
 
 func TestBioBladderBlockedByAddressed(t *testing.T) {
-	meta := map[string]string{
-		"synth_fp":              "H5|E5|B9|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0",
+	meta := testMetadata("H5|E5|B9|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0", map[string]string{
 		"is_directly_addressed": "true",
 		"personality_type":      "I",
 		"agent_id":              "5",
-	}
+	})
 	engine := NewEngine(true, nil)
 	result := engine.Decide(meta, "AGENT-TEST")
 	if result.Decision != Forward {
-		t.Error("expected Forward when isAddressed=true (AC-6)")
+		t.Error("expected Forward when isAddressed=true")
 	}
 }
 
-func TestHeartbeatIdle(t *testing.T) {
-	meta := map[string]string{
-		"synth_fp":              "H3|E6|B2|S2|C4|SN3|R:buero-dev-1|P:0|CH:0|HR:0|T:14|TMP:0|PE:E|IM:0",
-		"is_directly_addressed": "false",
-		"personality_type":      "E",
-		"agent_id":              "10",
-	}
+func TestRoutineIdleAlone(t *testing.T) {
+	meta := testMetadata("H3|E6|B2|S2|C4|SN3|R:buero-dev-1|P:0|CH:0|HR:0|T:14|TMP:0|PE:E|IM:0", map[string]string{
+		"agent_id":         "10",
+		"personality_type": "E",
+	})
 	engine := NewEngine(true, nil)
 	result := engine.Decide(meta, "AGENT-TEST")
 	if result.Decision != Synthesize {
-		t.Fatal("expected Synthesize for heartbeat_idle")
+		t.Fatal("expected Synthesize for idle alone")
 	}
-	if result.Rule != "heartbeat_idle" {
-		t.Errorf("rule = %q, want heartbeat_idle", result.Rule)
+	if result.Rule != "routine_idle_alone" {
+		t.Errorf("rule = %q, want routine_idle_alone", result.Rule)
 	}
 }
 
-func TestHeartbeatIdleWithPresence(t *testing.T) {
-	meta := map[string]string{
-		"synth_fp":              "H3|E6|B2|S2|C4|SN3|R:buero-dev-1|P:3|CH:0|HR:0|T:14|TMP:0|PE:E|IM:0",
-		"is_directly_addressed": "false",
-		"personality_type":      "E",
-		"agent_id":              "10",
-	}
+func TestRoutineIdleWithPresenceFromFingerprint(t *testing.T) {
+	meta := testMetadata("H3|E6|B2|S2|C4|SN3|R:buero-dev-1|P:3|CH:0|HR:0|T:14|TMP:0|PE:E|IM:0", map[string]string{
+		"agent_id":         "10",
+		"personality_type": "E",
+	})
 	engine := NewEngine(true, nil)
 	result := engine.Decide(meta, "AGENT-TEST")
-	// heartbeat_idle matches even with PresenceCount > 0 (agents work silently in shared offices)
-	if result.Decision != Synthesize || result.Rule != "heartbeat_idle" {
-		t.Errorf("heartbeat_idle should match with PresenceCount=3, got decision=%d rule=%q", result.Decision, result.Rule)
+	if result.Decision != Synthesize {
+		t.Fatal("expected Synthesize for idle with presence")
+	}
+	if result.Rule != "routine_idle_with_presence" {
+		t.Errorf("rule = %q, want routine_idle_with_presence", result.Rule)
+	}
+}
+
+func TestRoutineIdleWithPresenceFromMetadata(t *testing.T) {
+	meta := testMetadata("H3|E6|B2|S2|C4|SN3|R:buero-dev-1|P:0|CH:0|HR:0|T:14|TMP:0|PE:E|IM:0", map[string]string{
+		"agent_id":         "10",
+		"personality_type": "E",
+		"presence":         "Lisa (Konzept), Thomas (Review)",
+	})
+	engine := NewEngine(true, nil)
+	result := engine.Decide(meta, "AGENT-TEST")
+	if result.Decision != Synthesize {
+		t.Fatal("expected Synthesize for metadata-derived presence")
+	}
+	if result.Rule != "routine_idle_with_presence" {
+		t.Errorf("rule = %q, want routine_idle_with_presence", result.Rule)
 	}
 }
 
 func TestCircadianMorning(t *testing.T) {
-	meta := map[string]string{
-		"synth_fp":              "H3|E7|B2|S2|C4|SN3|R:buero-dev-1|P:0|CH:0|HR:0|T:6|TMP:0|PE:I|IM:0",
-		"is_directly_addressed": "false",
-		"personality_type":      "I",
-		"agent_id":              "1",
-	}
+	meta := testMetadata("H3|E7|B2|S2|C4|SN3|R:buero-dev-1|P:0|CH:0|HR:0|T:6|TMP:0|PE:I|IM:0", map[string]string{
+		"agent_id":         "1",
+		"personality_type": "I",
+	})
 	engine := NewEngine(true, nil)
 	result := engine.Decide(meta, "AGENT-TEST")
 	if result.Decision != Synthesize {
@@ -156,13 +202,27 @@ func TestCircadianMorning(t *testing.T) {
 	}
 }
 
-func TestCircadianLunch(t *testing.T) {
-	meta := map[string]string{
-		"synth_fp":              "H7|E5|B3|S2|C4|SN3|R:buero-dev-1|P:0|CH:0|HR:0|T:12|TMP:0|PE:E|IM:0",
-		"is_directly_addressed": "false",
-		"personality_type":      "E",
-		"agent_id":              "2",
+func TestCircadianFallsBackToMetadata(t *testing.T) {
+	meta := testMetadata("H3|E7|B2|S2|C4|SN3|R:buero-dev-1|P:0|CH:0|HR:0|T:0|TMP:0|PE:I|IM:0", map[string]string{
+		"agent_id":         "1",
+		"personality_type": "I",
+		"circadian":        "06:30 Uhr",
+	})
+	engine := NewEngine(true, nil)
+	result := engine.Decide(meta, "AGENT-TEST")
+	if result.Decision != Synthesize {
+		t.Fatal("expected Synthesize for metadata-derived circadian morning")
 	}
+	if result.Rule != "circadian_morning" {
+		t.Errorf("rule = %q, want circadian_morning", result.Rule)
+	}
+}
+
+func TestCircadianLunch(t *testing.T) {
+	meta := testMetadata("H7|E5|B3|S2|C4|SN3|R:buero-dev-1|P:0|CH:0|HR:0|T:12|TMP:0|PE:E|IM:0", map[string]string{
+		"agent_id":         "2",
+		"personality_type": "E",
+	})
 	engine := NewEngine(true, nil)
 	result := engine.Decide(meta, "AGENT-TEST")
 	if result.Decision != Synthesize {
@@ -171,15 +231,16 @@ func TestCircadianLunch(t *testing.T) {
 	if result.Rule != "circadian_lunch" {
 		t.Errorf("rule = %q, want circadian_lunch", result.Rule)
 	}
+	if target := findActionTarget(result.Actions, "move"); target != "kueche" {
+		t.Errorf("move target = %q, want kueche", target)
+	}
 }
 
 func TestPhysicsTempHigh(t *testing.T) {
-	meta := map[string]string{
-		"synth_fp":              "H3|E6|B2|S2|C4|SN3|R:buero-dev-1|P:0|CH:0|HR:0|T:14|TMP:1|PE:I|IM:0",
-		"is_directly_addressed": "false",
-		"personality_type":      "I",
-		"agent_id":              "3",
-	}
+	meta := testMetadata("H3|E6|B2|S2|C4|SN3|R:buero-dev-1|P:0|CH:0|HR:0|T:14|TMP:1|PE:I|IM:0", map[string]string{
+		"agent_id":         "3",
+		"personality_type": "I",
+	})
 	engine := NewEngine(true, nil)
 	result := engine.Decide(meta, "AGENT-TEST")
 	if result.Decision != Synthesize {
@@ -188,25 +249,38 @@ func TestPhysicsTempHigh(t *testing.T) {
 	if result.Rule != "physics_temp_high" {
 		t.Errorf("rule = %q, want physics_temp_high", result.Rule)
 	}
+	if target := findActionTarget(result.Actions, "tool_use"); target != "open_window" {
+		t.Errorf("tool target = %q, want open_window", target)
+	}
+}
+
+func TestPhysicsNoiseHighFromAcousticMetadata(t *testing.T) {
+	meta := testMetadata("H3|E6|B2|S2|C4|SN3|R:buero-dev-1|P:0|CH:0|HR:0|T:14|TMP:0|PE:I|IM:0", map[string]string{
+		"agent_id":         "3",
+		"personality_type": "I",
+		"acoustic":         "Es ist laut (72 dB). Konzentration faellt schwer.",
+	})
+	engine := NewEngine(true, nil)
+	result := engine.Decide(meta, "AGENT-TEST")
+	if result.Decision != Synthesize {
+		t.Fatal("expected Synthesize for physics_noise_high")
+	}
+	if result.Rule != "physics_noise_high" {
+		t.Errorf("rule = %q, want physics_noise_high", result.Rule)
+	}
 }
 
 func TestPersonalityTemplates(t *testing.T) {
-	metaI := map[string]string{
-		"synth_fp":              "H5|E5|B9|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0",
-		"is_directly_addressed": "false",
-		"personality_type":      "I",
-		"agent_id":              "5",
-	}
-	metaE := map[string]string{
-		"synth_fp":              "H5|E5|B9|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:E|IM:0",
-		"is_directly_addressed": "false",
-		"personality_type":      "E",
-		"agent_id":              "6",
-	}
-
 	engine := NewEngine(true, nil)
-	resultI := engine.Decide(metaI, "AGENT-I")
-	resultE := engine.Decide(metaE, "AGENT-E")
+
+	resultI := engine.Decide(testMetadata("H3|E6|B2|S2|C4|SN3|R:buero-dev-1|P:0|CH:0|HR:0|T:14|TMP:0|PE:I|IM:0", map[string]string{
+		"agent_id":         "5",
+		"personality_type": "I",
+	}), "AGENT-I")
+	resultE := engine.Decide(testMetadata("H3|E6|B2|S2|C4|SN3|R:buero-dev-1|P:0|CH:0|HR:0|T:14|TMP:0|PE:E|IM:0", map[string]string{
+		"agent_id":         "6",
+		"personality_type": "E",
+	}), "AGENT-E")
 
 	if resultI.Content == resultE.Content {
 		t.Errorf("I and E templates should differ, both got: %q", resultI.Content)
@@ -214,19 +288,13 @@ func TestPersonalityTemplates(t *testing.T) {
 }
 
 func TestDisabledEngineForwards(t *testing.T) {
-	meta := map[string]string{
-		"synth_fp":              "H5|E5|B9|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0",
-		"is_directly_addressed": "false",
-		"personality_type":      "I",
-		"agent_id":              "5",
-	}
+	meta := testMetadata("H5|E5|B9|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0", map[string]string{
+		"agent_id":         "5",
+		"personality_type": "I",
+	})
 	engine := NewEngine(false, nil)
 	result := engine.Decide(meta, "AGENT-TEST")
-	// Disabled engine should not synthesize even if rule matches
-	// (Engine.Decide doesn't check Enabled — caller does)
-	// This test documents that the caller must check Enabled()
 	if !engine.Enabled() {
-		// Expected: caller would not call Decide
 		return
 	}
 	if result.Decision != Synthesize {
@@ -235,12 +303,7 @@ func TestDisabledEngineForwards(t *testing.T) {
 }
 
 func TestEmptyFingerprint(t *testing.T) {
-	meta := map[string]string{
-		"synth_fp":              "",
-		"is_directly_addressed": "false",
-		"personality_type":      "I",
-		"agent_id":              "5",
-	}
+	meta := testMetadata("", nil)
 	engine := NewEngine(true, nil)
 	result := engine.Decide(meta, "AGENT-TEST")
 	if result.Decision != Forward {
@@ -249,16 +312,35 @@ func TestEmptyFingerprint(t *testing.T) {
 }
 
 func TestImpulseBypassesSynthesis(t *testing.T) {
-	// IM:1 = Operator-Impulse (Gaia/Broadcast) → MUST Forward, never synthesize
-	meta := map[string]string{
-		"synth_fp":              "H5|E5|B3|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:1",
-		"is_directly_addressed": "false",
-		"personality_type":      "I",
-		"agent_id":              "6",
-	}
+	meta := testMetadata("H5|E5|B3|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:1", map[string]string{
+		"agent_id":         "6",
+		"personality_type": "I",
+	})
 	engine := NewEngine(true, nil)
 	result := engine.Decide(meta, "AGENT-06")
 	if result.Decision != Forward {
 		t.Errorf("expected Forward when HasImpulse=true (Gaia/Broadcast), got Synthesize rule=%s", result.Rule)
 	}
+}
+
+func testMetadata(fp string, overrides map[string]string) map[string]string {
+	meta := map[string]string{
+		"synth_fp":              fp,
+		"is_directly_addressed": "false",
+		"personality_type":      "E",
+		"agent_id":              "1",
+	}
+	for k, v := range overrides {
+		meta[k] = v
+	}
+	return meta
+}
+
+func findActionTarget(actions []Action, actionType string) string {
+	for _, action := range actions {
+		if action.Type == actionType {
+			return action.Target
+		}
+	}
+	return ""
 }

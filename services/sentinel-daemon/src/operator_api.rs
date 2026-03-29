@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use anyhow::{Context, Result as AnyResult};
+use sentinel_redb::{ApiCpSnapshot, StateStore};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -32,8 +33,10 @@ const OPERATOR_PRUNE_PATH: &str = "/operator/prune";
 const OPERATOR_CHAT_PATH: &str = "/operator/chat";
 const OPERATOR_GAIA_PATH: &str = "/operator/gaia";
 const OPERATOR_BROADCAST_PATH: &str = "/operator/broadcast";
+const OPERATOR_APICP_SNAPSHOT_PATH: &str = "/operator/apicp/snapshot";
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024;
+const MAX_APICP_SNAPSHOT_BODY_BYTES: usize = 4 * 1024 * 1024;
 const OPERATOR_KEY_HEADER: &str = "x-sentinel-operator-key";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,6 +103,7 @@ struct AppState {
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
     event_store: Arc<sentinel_limbo::EventStore>,
     prune_tx: mpsc::Sender<i64>,
+    state_store: Arc<StateStore>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -119,6 +123,12 @@ struct HttpResponse {
 #[derive(Debug, Serialize)]
 struct ErrorResponse<'a> {
     error: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ApiCpSnapshotResponse {
+    accepted: bool,
+    patterns: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -168,6 +178,7 @@ pub async fn start_server(
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
     event_store: Arc<sentinel_limbo::EventStore>,
     prune_tx: mpsc::Sender<i64>,
+    state_store: Arc<sentinel_redb::StateStore>,
 ) -> AnyResult<tokio::task::JoinHandle<()>> {
     let listener = TcpListener::bind(&config.bind_addr)
         .await
@@ -182,6 +193,7 @@ pub async fn start_server(
         restore_tx,
         event_store,
         prune_tx,
+        state_store,
     };
 
     info!(
@@ -221,11 +233,33 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> AnyResult<
 fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
     // GET-Endpoints ohne Auth (read-only)
     if request.method == "GET" {
+        if request.path == OPERATOR_APICP_SNAPSHOT_PATH
+            && !is_authorized(&request.headers, state.shared_secret.as_deref())
+        {
+            return ApiError::Unauthorized.to_response();
+        }
         return match request.path.as_str() {
             OPERATOR_SNAPSHOTS_PATH => match state.event_store.list_world_snapshots() {
                 Ok(snapshots) => json_response(200, snapshots),
                 Err(_e) => {
                     ApiError::ServiceUnavailable("Snapshot-Liste nicht verfuegbar").to_response()
+                }
+            },
+            OPERATOR_APICP_SNAPSHOT_PATH => match state.state_store.get_api_patterns_snapshot() {
+                Ok(Some(snapshot)) => HttpResponse {
+                    status: 200,
+                    body: snapshot,
+                },
+                Ok(None) => json_response(
+                    200,
+                    ApiCpSnapshot {
+                        patterns: Vec::new(),
+                        synth_count: 0,
+                        last_evolution_versions: HashMap::new(),
+                    },
+                ),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("API-CP Snapshot nicht verfuegbar").to_response()
                 }
             },
             _ => ApiError::NotFound("Endpoint unbekannt").to_response(),
@@ -401,6 +435,31 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 ),
                 Err(_) => {
                     ApiError::ServiceUnavailable("Command-Channel nicht verfuegbar").to_response()
+                }
+            }
+        }
+        OPERATOR_APICP_SNAPSHOT_PATH => {
+            let payload: ApiCpSnapshot = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                }
+            };
+            let data = match serde_json::to_vec(&payload) {
+                Ok(d) => d,
+                Err(_) => return ApiError::BadRequest("Request-JSON ungueltig").to_response(),
+            };
+            match state.state_store.set_api_patterns_snapshot(&data) {
+                Ok(()) => json_response(
+                    200,
+                    ApiCpSnapshotResponse {
+                        accepted: true,
+                        patterns: payload.patterns.len(),
+                    },
+                ),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("API-CP Snapshot konnte nicht persistiert werden")
+                        .to_response()
                 }
             }
         }
@@ -586,6 +645,7 @@ async fn read_http_request(stream: &mut TcpStream) -> std::result::Result<HttpRe
     let path = parts
         .next()
         .ok_or(ApiError::BadRequest("Request-Pfad fehlt"))?;
+    let max_body_bytes = max_body_bytes_for_path(path);
 
     let mut headers = HashMap::new();
     for line in lines {
@@ -607,7 +667,7 @@ async fn read_http_request(stream: &mut TcpStream) -> std::result::Result<HttpRe
         })
         .transpose()?
         .unwrap_or(0);
-    if content_length > MAX_BODY_BYTES {
+    if content_length > max_body_bytes {
         return Err(ApiError::PayloadTooLarge);
     }
 
@@ -622,7 +682,7 @@ async fn read_http_request(stream: &mut TcpStream) -> std::result::Result<HttpRe
             return Err(ApiError::BadRequest("Request-Body unvollstaendig"));
         }
         body.extend_from_slice(&chunk[..read]);
-        if body.len() > MAX_BODY_BYTES {
+        if body.len() > max_body_bytes {
             return Err(ApiError::PayloadTooLarge);
         }
     }
@@ -634,6 +694,13 @@ async fn read_http_request(stream: &mut TcpStream) -> std::result::Result<HttpRe
         headers,
         body,
     })
+}
+
+fn max_body_bytes_for_path(path: &str) -> usize {
+    match path {
+        OPERATOR_APICP_SNAPSHOT_PATH => MAX_APICP_SNAPSHOT_BODY_BYTES,
+        _ => MAX_BODY_BYTES,
+    }
 }
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
@@ -677,10 +744,16 @@ fn json_response<T: Serialize>(status: u16, payload: T) -> HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sentinel_redb::{ApiCpPatternSnapshot, StateStore};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
 
     fn test_state(secret: Option<&str>) -> (AppState, mpsc::Receiver<OperatorCommand>) {
         let (tx, rx) = mpsc::channel();
         let (nightrun_tx, _nightrun_rx) = mpsc::channel();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+        let state_store = Arc::new(StateStore::open(path.to_str().unwrap()).unwrap());
         let state = AppState {
             allowed_rooms: Arc::new(
                 ["empfang".to_string(), "flur_eg".to_string()]
@@ -697,7 +770,9 @@ mod tests {
                     .expect("in-memory EventStore fuer Tests"),
             ),
             prune_tx: mpsc::channel().0,
+            state_store,
         };
+        std::mem::forget(dir);
         (state, rx)
     }
 
@@ -856,5 +931,130 @@ mod tests {
         );
 
         assert_eq!(response.status, 400);
+    }
+
+    #[test]
+    fn apicp_snapshot_roundtrip_requires_auth_when_configured() {
+        let (state, _rx) = test_state(Some("topsecret"));
+
+        let unauthorized = HttpRequest {
+            method: "GET".to_string(),
+            path: OPERATOR_APICP_SNAPSHOT_PATH.to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let response = handle_http_request(unauthorized, &state);
+        assert_eq!(response.status, 401);
+
+        let mut post = HttpRequest {
+            method: "POST".to_string(),
+            path: OPERATOR_APICP_SNAPSHOT_PATH.to_string(),
+            headers: HashMap::new(),
+            body: serde_json::to_vec(&ApiCpSnapshot {
+                patterns: vec![ApiCpPatternSnapshot {
+                    agent_id: "AGENT-01".to_string(),
+                    fingerprint: "fp1".to_string(),
+                    count: 3,
+                    response_hashes: HashMap::from([(42_u64, 3_usize)]),
+                    top_hash: 42,
+                    top_content: "ok".to_string(),
+                    confidence: 1.0,
+                    last_seen: "2026-03-28T12:00:00Z".to_string(),
+                    promoted: true,
+                }],
+                synth_count: 7,
+                last_evolution_versions: HashMap::from([(
+                    "AGENT-01".to_string(),
+                    "v2".to_string(),
+                )]),
+            })
+            .unwrap(),
+        };
+        post.headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "topsecret".to_string());
+        let post_response = handle_http_request(post, &state);
+        assert_eq!(post_response.status, 200);
+
+        let mut get = HttpRequest {
+            method: "GET".to_string(),
+            path: OPERATOR_APICP_SNAPSHOT_PATH.to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        get.headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "topsecret".to_string());
+        let get_response = handle_http_request(get, &state);
+        assert_eq!(get_response.status, 200);
+
+        let payload: ApiCpSnapshot = serde_json::from_slice(&get_response.body).unwrap();
+        assert_eq!(payload.patterns.len(), 1);
+        assert_eq!(payload.patterns[0].fingerprint, "fp1");
+        assert_eq!(payload.synth_count, 7);
+        assert_eq!(
+            payload.last_evolution_versions.get("AGENT-01"),
+            Some(&"v2".to_string())
+        );
+    }
+
+    #[test]
+    fn apicp_snapshot_path_has_larger_body_limit() {
+        assert_eq!(
+            max_body_bytes_for_path(OPERATOR_APICP_SNAPSHOT_PATH),
+            MAX_APICP_SNAPSHOT_BODY_BYTES
+        );
+        assert_eq!(max_body_bytes_for_path(OPERATOR_CHAT_PATH), MAX_BODY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn read_http_request_accepts_large_apicp_snapshot_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = vec![b'a'; MAX_BODY_BYTES + 512];
+        let request = format!(
+            "POST {} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            OPERATOR_APICP_SNAPSHOT_PATH,
+            body.len()
+        );
+        let (tx, rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let parsed = read_http_request(&mut stream).await;
+            tx.send(parsed).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.write_all(&body).await.unwrap();
+
+        let parsed = rx.await.unwrap().unwrap();
+        assert_eq!(parsed.path, OPERATOR_APICP_SNAPSHOT_PATH);
+        assert_eq!(parsed.body.len(), body.len());
+    }
+
+    #[tokio::test]
+    async fn read_http_request_rejects_large_non_apicp_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = vec![b'a'; MAX_BODY_BYTES + 1];
+        let request = format!(
+            "POST {} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            OPERATOR_CHAT_PATH,
+            body.len()
+        );
+        let (tx, rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let parsed = read_http_request(&mut stream).await;
+            tx.send(parsed).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.write_all(&body).await.unwrap();
+
+        let err = rx.await.unwrap().unwrap_err();
+        assert_eq!(err, ApiError::PayloadTooLarge);
     }
 }

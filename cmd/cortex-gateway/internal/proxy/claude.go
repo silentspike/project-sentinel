@@ -31,16 +31,29 @@ const (
 
 // claudeRequest is the Anthropic Messages API request format.
 type claudeRequest struct {
-	Model       string          `json:"model"`
-	MaxTokens   int             `json:"max_tokens"`
-	Messages    []claudeMessage `json:"messages"`
-	Temperature float64         `json:"temperature,omitempty"`
+	Model       string              `json:"model"`
+	MaxTokens   int                 `json:"max_tokens"`
+	System      []claudeSystemBlock `json:"system,omitempty"`
+	Messages    []claudeMessage     `json:"messages"`
+	Temperature float64             `json:"temperature,omitempty"`
 }
 
 // claudeMessage is a single message in the Anthropic format.
 type claudeMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+}
+
+// claudeSystemBlock is a structured system content block for Anthropic Messages.
+type claudeSystemBlock struct {
+	Type         string              `json:"type"`
+	Text         string              `json:"text"`
+	CacheControl *claudeCacheControl `json:"cache_control,omitempty"`
+}
+
+// claudeCacheControl mirrors Anthropic cache control hints.
+type claudeCacheControl struct {
+	Type string `json:"type"`
 }
 
 // claudeResponse is the Anthropic Messages API response format.
@@ -90,6 +103,11 @@ func NewClaudeProvider(cfg ProviderConfig) *ClaudeProvider {
 	}
 }
 
+// NewAnthropicDirectProvider creates the canonical Anthropic Messages API provider.
+func NewAnthropicDirectProvider(cfg ProviderConfig) *ClaudeProvider {
+	return NewClaudeProvider(cfg)
+}
+
 // Name returns the provider name.
 func (p *ClaudeProvider) Name() string {
 	return p.name
@@ -97,10 +115,13 @@ func (p *ClaudeProvider) Name() string {
 
 // Send forwards an LLMRequest to the Anthropic Messages API.
 func (p *ClaudeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
-	messages := make([]claudeMessage, len(req.Messages))
-	for i, m := range req.Messages {
-		messages[i] = claudeMessage(m)
+	if req != nil && req.ProviderTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, req.ProviderTimeout)
+		defer cancel()
 	}
+
+	systemBlocks, messages := splitAnthropicMessages(req)
 
 	model := p.model
 	if req.Model != "" {
@@ -115,6 +136,7 @@ func (p *ClaudeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 	cReq := claudeRequest{
 		Model:       model,
 		MaxTokens:   maxTokens,
+		System:      systemBlocks,
 		Messages:    messages,
 		Temperature: req.Temperature,
 	}
@@ -172,6 +194,37 @@ func (p *ClaudeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 		OutputTokens: cResp.Usage.OutputTokens,
 		FinishReason: cResp.StopReason,
 	}, nil
+}
+
+func splitAnthropicMessages(req *LLMRequest) ([]claudeSystemBlock, []claudeMessage) {
+	systemBlocks := make([]claudeSystemBlock, 0, len(req.SystemBlocks))
+	for _, block := range req.SystemBlocks {
+		entry := claudeSystemBlock{
+			Type: block.Type,
+			Text: block.Text,
+		}
+		if entry.Type == "" {
+			entry.Type = "text"
+		}
+		if block.CacheControl != nil {
+			entry.CacheControl = &claudeCacheControl{Type: block.CacheControl.Type}
+		}
+		systemBlocks = append(systemBlocks, entry)
+	}
+
+	messages := make([]claudeMessage, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		if m.Role == "system" {
+			systemBlocks = append(systemBlocks, claudeSystemBlock{
+				Type: "text",
+				Text: m.Content,
+			})
+			continue
+		}
+		messages = append(messages, claudeMessage(m))
+	}
+
+	return systemBlocks, messages
 }
 
 // HealthCheck verifies that the Claude API is reachable.

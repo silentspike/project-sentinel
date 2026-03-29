@@ -1260,7 +1260,7 @@ mod tests {
         );
 
         // Endposition muss kueche sein
-        let pos = world.get::<Position>(entity).unwrap();
+        let _pos = world.get::<Position>(entity).unwrap();
         // Agent muss angekommen sein ODER einen neuen Transit (Autonomy) gestartet haben.
         // Wichtig ist: seen_rooms zeigt Zwischen-Raeume (TR5/TR6 Beweis).
 

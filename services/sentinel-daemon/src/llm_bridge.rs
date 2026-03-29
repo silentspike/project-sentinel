@@ -6,7 +6,7 @@
 //! Enterprise Features:
 //! - Circuit Breaker (3 Failures → Open, 30s Reset)
 //! - Rate Limiting pro Agent (min 5 Ticks zwischen Calls)
-//! - Concurrency Limiter (urgent: 8 Slots mit await, normal: 8 Slots mit try_acquire)
+//! - Concurrency Limiter (shared Slots: urgent wartet, normal nutzt try_acquire)
 //! - Graceful Degradation (autonomy_system uebernimmt bei Gateway-Ausfall)
 //! - Structured Logging mit Tracing Spans
 
@@ -194,9 +194,10 @@ pub mod bridge {
             }
         };
 
-        // 2 Semaphores: urgent (heard_text/P1) wartet IMMER, normal (Heartbeats) darf droppen
-        let urgent_semaphore = Arc::new(Semaphore::new(8));
-        let normal_semaphore = Arc::new(Semaphore::new(8));
+        // Ein geteiltes Semaphore fuer alle echten Gateway-Calls.
+        // Urgent Calls warten auf einen Slot, normale Calls droppen bei Ueberlast.
+        // Die Kapazitaet richtet sich an der realen Gateway-Forward-Kapazitaet aus.
+        let llm_semaphore = Arc::new(Semaphore::new(config.max_concurrent.max(1)));
         let circuit_breaker = Arc::new(std::sync::Mutex::new(CircuitBreaker::new(
             config.circuit_breaker_threshold,
             config.circuit_breaker_reset,
@@ -303,11 +304,12 @@ pub mod bridge {
                     // Urgent (heard_text/P1): acquire_owned().await INNERHALB tokio::spawn.
                     // Wartet auf Permit im eigenen Task — Drain-Loop blockiert NICHT,
                     // urgent Calls werden NIEMALS gedroppt.
-                    let sem = urgent_semaphore.clone();
+                    let sem = llm_semaphore.clone();
                     tokio::spawn(async move {
-                        // Timeout: Chat-Kontext wird nach 15s zu alt, Starvation vermeiden
+                        // Urgent Calls duerfen auf Semaphore und Gateway warten, aber nicht ewig.
+                        let acquire_timeout = config.request_timeout;
                         let permit = match tokio::time::timeout(
-                            std::time::Duration::from_secs(15),
+                            acquire_timeout,
                             sem.acquire_owned(),
                         )
                         .await
@@ -318,7 +320,11 @@ pub mod bridge {
                                 return;
                             }
                             Err(_) => {
-                                warn!(agent = %agent_id, "URGENT Semaphore timeout (15s)");
+                                warn!(
+                                    agent = %agent_id,
+                                    timeout_ms = acquire_timeout.as_millis(),
+                                    "URGENT Semaphore timeout"
+                                );
                                 return;
                             }
                         };
@@ -387,7 +393,7 @@ pub mod bridge {
                     });
                 } else {
                     // Normal (Heartbeats): try_acquire — droppen OK, Heartbeats sind nicht kritisch.
-                    let permit = match normal_semaphore.clone().try_acquire_owned() {
+                    let permit = match llm_semaphore.clone().try_acquire_owned() {
                         Ok(p) => p,
                         Err(_) => {
                             debug!(agent = %agent_id, "Heartbeat LLM Call uebersprungen: max concurrent erreicht");

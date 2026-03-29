@@ -190,8 +190,8 @@ fn generate_gaia_events(
         push_event(
             queue,
             PendingEvent {
-                priority: Priority::P1,
-                text: format!("Dir faellt ein: {}", thought.content),
+                priority: Priority::P0,
+                text: format!("Du MUSST jetzt handeln — du kannst nicht anders: {}", thought.content),
                 ttl_ticks: 60,
                 created_tick: thought.tick,
             },

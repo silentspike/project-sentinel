@@ -30,7 +30,7 @@ ARTIFACT_DEFS=(
   "config/nats.conf|/etc/nats/nats.conf|config"
   # systemd units
   "deploy/systemd/sentinel-daemon.service|/etc/systemd/system/sentinel-daemon.service|systemd"
-  "deploy/systemd/sentinel-cortex.service|/etc/systemd/system/sentinel-cortex.service|systemd"
+  "deploy/systemd/sentinel-gateway.service|/etc/systemd/system/sentinel-gateway.service|systemd"
   "deploy/systemd/sentinel-judge.service|/etc/systemd/system/sentinel-judge.service|systemd"
   "deploy/systemd/sentinel-nats-bridge.service|/etc/systemd/system/sentinel-nats-bridge.service|systemd"
   "deploy/systemd/sentinel-nightrun.service|/etc/systemd/system/sentinel-nightrun.service|systemd"

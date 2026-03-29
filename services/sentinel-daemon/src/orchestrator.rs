@@ -450,6 +450,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 restore_tx.clone(),
                 Arc::clone(&event_store),
                 prune_tx.clone(),
+                Arc::clone(&state_store),
             )
             .await?,
         )
@@ -534,9 +535,15 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // -- LLM Bridge starten (Perception → Cortex Gateway → Action) --
     #[cfg(feature = "llm")]
     let _llm_bridge_handle = {
+        let gateway_request_timeout_ms = std::env::var("SENTINEL_LLM_BRIDGE_REQUEST_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(config.traffic_control.gateway_request_timeout_ms);
         let bridge_config = crate::llm_bridge::bridge::LlmBridgeConfig {
             gateway_url: std::env::var("CORTEX_GATEWAY_URL")
                 .unwrap_or_else(|_| "http://localhost:8080".to_string()),
+            max_concurrent: config.traffic_control.max_forward_concurrency.max(1),
+            request_timeout: std::time::Duration::from_millis(gateway_request_timeout_ms),
             ..Default::default()
         };
         let bridge_telemetry =
@@ -545,6 +552,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         let bridge_telem = std::sync::Arc::clone(&bridge_telemetry);
         info!(
             gateway_url = %bridge_config.gateway_url,
+            max_concurrent = bridge_config.max_concurrent,
+            request_timeout_ms = gateway_request_timeout_ms,
             "LLM Bridge wird gestartet"
         );
         tokio::spawn(crate::llm_bridge::bridge::run_llm_bridge(

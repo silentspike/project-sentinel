@@ -18,7 +18,7 @@ HEALTH_ENDPOINTS = [
 
 SERVICES = [
     "sentinel-daemon",
-    "sentinel-cortex",
+    "sentinel-gateway",
     "sentinel-dashboard",
     "sentinel-projection",
     "sentinel-nightrun.timer",

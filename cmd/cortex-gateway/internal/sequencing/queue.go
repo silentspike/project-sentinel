@@ -40,10 +40,14 @@ type Sequencer struct {
 }
 
 type roomState struct {
-	p1Active  bool
-	p1Agent   string
+	active []*p1State
+}
+
+type p1State struct {
+	requestID string
+	agentName string
 	p1Done    chan struct{} // closed when P1 completes
-	p1Content string       // P1's response text (filled on completion)
+	p1Content string        // P1's response text (filled on completion)
 }
 
 // NewSequencer creates a chat sequencer with the given P3 wait timeout.
@@ -61,7 +65,26 @@ func NewSequencer(timeout time.Duration, enabled bool, logger *slog.Logger) *Seq
 
 // Enabled returns whether sequencing is active.
 func (s *Sequencer) Enabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.enabled
+}
+
+// SetEnabled toggles sequencing at runtime.
+func (s *Sequencer) SetEnabled(v bool) {
+	s.mu.Lock()
+	s.enabled = v
+	s.mu.Unlock()
+}
+
+// SetTimeout updates the maximum wait time for pending P3 requests.
+func (s *Sequencer) SetTimeout(timeout time.Duration) {
+	if timeout <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.timeout = timeout
+	s.mu.Unlock()
 }
 
 // HasActiveP1 returns whether a P1 call is currently in progress for this room.
@@ -69,54 +92,73 @@ func (s *Sequencer) HasActiveP1(roomID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state, ok := s.rooms[roomID]
-	return ok && state.p1Active
+	return ok && len(state.active) > 0
 }
 
 // MarkP1Active marks a P1 call as active for a room.
-// Returns the done channel that will be closed when P1 completes.
-func (s *Sequencer) MarkP1Active(roomID, agentName string) {
+func (s *Sequencer) MarkP1Active(roomID, requestID, agentName string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Known limitation: if two agents are both P1 simultaneously,
-	// the second overwrites the first. P3s waiting on the first P1
-	// will get the second P1's response instead. Rare edge case.
-	s.rooms[roomID] = &roomState{
-		p1Active: true,
-		p1Agent:  agentName,
-		p1Done:   make(chan struct{}),
+	state, ok := s.rooms[roomID]
+	if !ok {
+		state = &roomState{}
+		s.rooms[roomID] = state
 	}
+	state.active = append(state.active, &p1State{
+		requestID: requestID,
+		agentName: agentName,
+		p1Done:    make(chan struct{}),
+	})
 	p1ForwardedTotal.Inc()
-	s.logger.Info("p1 active", "room", roomID, "agent", agentName)
+	s.logger.Info("p1 active", "room", roomID, "agent", agentName, "request_id", requestID, "active_p1", len(state.active))
 }
 
 // CompleteP1 marks the P1 call as completed and stores its response content.
 // This unblocks all P3 waiters for this room.
-func (s *Sequencer) CompleteP1(roomID, content string) {
+func (s *Sequencer) CompleteP1(roomID, requestID, content string) {
 	s.mu.Lock()
 	state, ok := s.rooms[roomID]
-	if !ok || !state.p1Active {
+	if !ok || len(state.active) == 0 {
 		s.mu.Unlock()
 		return
 	}
-	state.p1Content = content
-	state.p1Active = false
-	close(state.p1Done) // unblock all P3 waiters
+
+	idx := -1
+	var current *p1State
+	for i, candidate := range state.active {
+		if candidate.requestID == requestID {
+			idx = i
+			current = candidate
+			break
+		}
+	}
+	if current == nil {
+		s.mu.Unlock()
+		return
+	}
+
+	current.p1Content = content
+	close(current.p1Done) // unblock all P3 waiters for this P1
+	state.active = append(state.active[:idx], state.active[idx+1:]...)
+	if len(state.active) == 0 {
+		delete(s.rooms, roomID)
+	}
 	s.mu.Unlock()
 
-	s.logger.Info("p1 completed", "room", roomID, "agent", state.p1Agent,
-		"content_len", len(content))
+	s.logger.Info("p1 completed", "room", roomID, "agent", current.agentName,
+		"request_id", requestID, "content_len", len(content))
 }
 
-// P1Agent returns the name of the P1 agent for a room (if active).
+// P1Agent returns the oldest active P1 agent for a room.
 func (s *Sequencer) P1Agent(roomID string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state, ok := s.rooms[roomID]
-	if !ok {
+	if !ok || len(state.active) == 0 {
 		return ""
 	}
-	return state.p1Agent
+	return state.active[0].agentName
 }
 
 // WaitForP1 blocks until the P1 call for roomID completes or timeout expires.
@@ -125,12 +167,13 @@ func (s *Sequencer) P1Agent(roomID string) string {
 func (s *Sequencer) WaitForP1(roomID string) (content string, p1Agent string, ok bool) {
 	s.mu.Lock()
 	state, exists := s.rooms[roomID]
-	if !exists || !state.p1Active {
+	if !exists || len(state.active) == 0 {
 		s.mu.Unlock()
 		return "", "", false
 	}
-	ch := state.p1Done
-	agent := state.p1Agent
+	active := state.active[0]
+	ch := active.p1Done
+	agent := active.agentName
 	s.mu.Unlock()
 
 	p3QueuedTotal.Inc()
@@ -139,9 +182,7 @@ func (s *Sequencer) WaitForP1(roomID string) (content string, p1Agent string, ok
 	select {
 	case <-ch:
 		// P1 completed — inject context
-		s.mu.Lock()
-		content = state.p1Content
-		s.mu.Unlock()
+		content = active.p1Content
 		p3ReleasedWithContext.Inc()
 		s.logger.Info("p3 released with context", "room", roomID, "p1_agent", agent)
 		return content, agent, true
@@ -159,7 +200,7 @@ func (s *Sequencer) Cleanup() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for roomID, state := range s.rooms {
-		if !state.p1Active {
+		if len(state.active) == 0 {
 			delete(s.rooms, roomID)
 		}
 	}

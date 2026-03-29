@@ -3,13 +3,19 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/forwardqueue"
 )
 
 // mockProvider implements Provider for testing.
@@ -24,6 +30,28 @@ func (m *mockProvider) Send(_ context.Context, _ *LLMRequest) (*LLMResponse, err
 	return m.resp, m.err
 }
 func (m *mockProvider) HealthCheck(_ context.Context) error { return nil }
+
+type timeoutAwareProvider struct {
+	name  string
+	sleep time.Duration
+}
+
+func (p *timeoutAwareProvider) Name() string { return p.name }
+func (p *timeoutAwareProvider) Send(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+	if req != nil && req.ProviderTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, req.ProviderTimeout)
+		defer cancel()
+	}
+
+	select {
+	case <-time.After(p.sleep):
+		return &LLMResponse{Content: "ok", Model: "test-model", FinishReason: "success"}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+func (p *timeoutAwareProvider) HealthCheck(_ context.Context) error { return nil }
 
 // --- Registry Tests ---
 
@@ -154,6 +182,23 @@ func TestNewProviderFromConfig_Claude(t *testing.T) {
 	}
 }
 
+func TestNewProviderFromConfig_AnthropicDirect(t *testing.T) {
+	cfg := ProviderConfig{
+		Name:    "test-anthropic-direct",
+		Type:    "anthropic-direct",
+		BaseURL: "https://api.anthropic.com",
+		APIKey:  "test-key",
+		Model:   "claude-sonnet-4-5-20250929",
+	}
+	p, err := NewProviderFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.Name() != "test-anthropic-direct" {
+		t.Errorf("expected name %q, got %q", "test-anthropic-direct", p.Name())
+	}
+}
+
 func TestNewProviderFromConfig_Ollama(t *testing.T) {
 	cfg := ProviderConfig{
 		Name:    "test-ollama",
@@ -178,6 +223,40 @@ func TestNewProviderFromConfig_Unknown(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unknown provider type") {
 		t.Errorf("expected 'unknown provider type' in error, got: %v", err)
+	}
+}
+
+func TestQueuedProvider_QueueWaitDoesNotConsumeProviderTimeout(t *testing.T) {
+	queue := forwardqueue.NewManager(1)
+	provider := NewQueuedProvider(&timeoutAwareProvider{name: "timeout-aware", sleep: 10 * time.Millisecond}, queue)
+
+	firstDone := make(chan struct{})
+	go func() {
+		release, err := queue.Acquire(context.Background())
+		if err != nil {
+			t.Errorf("pre-acquire queue slot: %v", err)
+			close(firstDone)
+			return
+		}
+		time.Sleep(80 * time.Millisecond)
+		release()
+		close(firstDone)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+
+	resp, err := provider.Send(context.Background(), &LLMRequest{ProviderTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("queued provider send: %v", err)
+	}
+	if resp == nil || resp.Content != "ok" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+
+	select {
+	case <-firstDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("timed out waiting for queued slot holder to finish")
 	}
 }
 
@@ -426,6 +505,111 @@ func TestClaudeProvider_Send_Integration(t *testing.T) {
 	}
 	if resp.FinishReason != "end_turn" {
 		t.Errorf("expected finish_reason %q, got %q", "end_turn", resp.FinishReason)
+	}
+}
+
+func TestClaudeProvider_Send_WithStructuredSystemBlocks(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var cReq claudeRequest
+		if err := json.NewDecoder(r.Body).Decode(&cReq); err != nil {
+			t.Fatalf("failed to decode request body: %v", err)
+		}
+
+		if len(cReq.System) != 2 {
+			t.Fatalf("expected 2 system blocks, got %d", len(cReq.System))
+		}
+		if cReq.System[0].Text != "<agent-identity>\nDu bist Thomas Mueller.\n</agent-identity>" {
+			t.Errorf("unexpected first system block: %+v", cReq.System[0])
+		}
+		if cReq.System[0].CacheControl == nil || cReq.System[0].CacheControl.Type != "ephemeral" {
+			t.Errorf("expected cache_control=ephemeral on first system block, got %+v", cReq.System[0].CacheControl)
+		}
+		if cReq.System[1].Text != "legacy system message" {
+			t.Errorf("unexpected second system block: %+v", cReq.System[1])
+		}
+		if len(cReq.Messages) != 1 || cReq.Messages[0].Role != "user" || cReq.Messages[0].Content != "hello" {
+			t.Errorf("unexpected non-system messages: %+v", cReq.Messages)
+		}
+
+		resp := claudeResponse{
+			Content: []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}{{Type: "text", Text: "world"}},
+			Model:      "claude-sonnet-4-5-20250929",
+			StopReason: "end_turn",
+			Usage:      claudeUsage{InputTokens: 10, OutputTokens: 5},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	p := NewAnthropicDirectProvider(ProviderConfig{
+		Name:    "test-anthropic-direct",
+		BaseURL: server.URL,
+		APIKey:  "test-key",
+		Model:   "claude-sonnet-4-5-20250929",
+	})
+
+	resp, err := p.Send(context.Background(), &LLMRequest{
+		SystemBlocks: []SystemBlock{
+			{
+				Type: "text",
+				Text: "<agent-identity>\nDu bist Thomas Mueller.\n</agent-identity>",
+				CacheControl: &CacheControl{
+					Type: "ephemeral",
+				},
+			},
+		},
+		Messages: []Message{
+			{Role: "system", Content: "legacy system message"},
+			{Role: "user", Content: "hello"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Content != "world" {
+		t.Errorf("expected content %q, got %q", "world", resp.Content)
+	}
+}
+
+func TestSplitAnthropicMessages_PreservesStructuredSystemAndFiltersSystemMessages(t *testing.T) {
+	systemBlocks, messages := splitAnthropicMessages(&LLMRequest{
+		SystemBlocks: []SystemBlock{
+			{
+				Type: "text",
+				Text: "<agent-identity>\nDu bist Thomas Mueller.\n</agent-identity>",
+				CacheControl: &CacheControl{
+					Type: "ephemeral",
+				},
+			},
+		},
+		Messages: []Message{
+			{Role: "system", Content: "legacy system"},
+			{Role: "user", Content: "hello"},
+			{Role: "assistant", Content: "hi"},
+		},
+	})
+
+	if len(systemBlocks) != 2 {
+		t.Fatalf("expected 2 system blocks, got %d", len(systemBlocks))
+	}
+	if systemBlocks[0].Type != "text" || systemBlocks[0].Text == "" {
+		t.Errorf("unexpected structured system block: %+v", systemBlocks[0])
+	}
+	if systemBlocks[0].CacheControl == nil || systemBlocks[0].CacheControl.Type != "ephemeral" {
+		t.Errorf("expected cache_control on structured system block, got %+v", systemBlocks[0].CacheControl)
+	}
+	if systemBlocks[1].Text != "legacy system" {
+		t.Errorf("expected legacy system message to be lifted into system blocks, got %+v", systemBlocks[1])
+	}
+	if len(messages) != 2 {
+		t.Fatalf("expected 2 non-system messages, got %d", len(messages))
+	}
+	if messages[0].Role != "user" || messages[1].Role != "assistant" {
+		t.Errorf("unexpected message roles: %+v", messages)
 	}
 }
 
@@ -797,6 +981,60 @@ func TestSplitMessages_MultiSystemAndAssistant(t *testing.T) {
 	}
 }
 
+func TestSplitRequest_FlattensStructuredSystemBlocksForClaudeCode(t *testing.T) {
+	systemPrompt, userPrompt := splitRequest(&LLMRequest{
+		SystemBlocks: []SystemBlock{
+			{
+				Type: "text",
+				Text: "<agent-identity>\nDu bist Thomas Mueller.\n</agent-identity>",
+			},
+			{
+				Type: "text",
+				Text: "<company-context>\nPixelPerfekt GmbH.\n</company-context>",
+			},
+		},
+		Messages: []Message{
+			{Role: "system", Content: "legacy system"},
+			{Role: "user", Content: "Hallo"},
+			{Role: "assistant", Content: "Servus"},
+		},
+	})
+
+	if !strings.Contains(systemPrompt, "<agent-identity>") {
+		t.Errorf("expected structured system block in flattened system prompt, got %q", systemPrompt)
+	}
+	if !strings.Contains(systemPrompt, "<company-context>") {
+		t.Errorf("expected second structured system block in flattened system prompt, got %q", systemPrompt)
+	}
+	if !strings.Contains(systemPrompt, "legacy system") {
+		t.Errorf("expected legacy system message in flattened system prompt, got %q", systemPrompt)
+	}
+	if !strings.Contains(userPrompt, "Hallo") {
+		t.Errorf("expected user message in user prompt, got %q", userPrompt)
+	}
+	if !strings.Contains(userPrompt, "[Previous response: Servus]") {
+		t.Errorf("expected assistant message in user prompt, got %q", userPrompt)
+	}
+}
+
+func TestSplitRequest_UsesSystemPromptAsUserPromptWhenNoUserMessagesExist(t *testing.T) {
+	systemPrompt, userPrompt := splitRequest(&LLMRequest{
+		SystemBlocks: []SystemBlock{
+			{
+				Type: "text",
+				Text: "<agent-identity>\nDu bist Thomas Mueller.\n</agent-identity>",
+			},
+		},
+	})
+
+	if systemPrompt != "" {
+		t.Errorf("expected empty system prompt in single-payload fallback, got %q", systemPrompt)
+	}
+	if !strings.Contains(userPrompt, "<agent-identity>") {
+		t.Errorf("expected structured system block to become user prompt fallback, got %q", userPrompt)
+	}
+}
+
 func TestClaudeCodeProvider_ParseOutputStream_Success(t *testing.T) {
 	// Simulate NDJSON output from claude subprocess (real format: content is array of blocks)
 	ndjson := strings.Join([]string{
@@ -944,6 +1182,71 @@ func TestClaudeCodeProvider_Send_BinaryNotFound(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "claude-code start") {
 		t.Errorf("expected 'claude-code start' in error, got: %v", err)
+	}
+}
+
+func TestDetectClaudeCodeLimitParsesUTCReset(t *testing.T) {
+	now := time.Date(2026, time.March, 28, 20, 41, 0, 0, time.UTC)
+
+	msg, until, ok := detectClaudeCodeLimit("claude-code result error: You've hit your limit - resets 9pm (UTC)", now)
+	if !ok {
+		t.Fatal("expected limit detection")
+	}
+	if !strings.Contains(msg, "hit your limit") {
+		t.Fatalf("message = %q, want limit message", msg)
+	}
+	want := time.Date(2026, time.March, 28, 21, 0, 0, 0, time.UTC)
+	if !until.Equal(want) {
+		t.Fatalf("until = %s, want %s", until.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+}
+
+func TestClaudeCodeProvider_SendShortCircuitsOnActiveLimitCooldown(t *testing.T) {
+	dir := t.TempDir()
+	counterPath := filepath.Join(dir, "count.txt")
+	scriptPath := filepath.Join(dir, "claude-fake.sh")
+	script := fmt.Sprintf(`#!/bin/sh
+count=0
+if [ -f %q ]; then
+  count=$(cat %q)
+fi
+count=$((count + 1))
+printf '%%s' "$count" > %q
+printf '%%s\n' '{"type":"result","subtype":"error","is_error":true,"result":"You'\''ve hit your limit - resets 9pm (UTC)"}'
+`, counterPath, counterPath, counterPath)
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake claude script: %v", err)
+	}
+
+	p := NewClaudeCodeProvider(ProviderConfig{
+		Name:    "test",
+		BaseURL: scriptPath,
+	}, nil)
+
+	req := &LLMRequest{Messages: []Message{{Role: "user", Content: "hello"}}}
+	_, err := p.Send(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected first send to fail with cooldown error")
+	}
+	var provErr *ProviderError
+	if !errors.As(err, &provErr) || provErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected provider 429 error, got %v", err)
+	}
+
+	_, err = p.Send(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected second send to short-circuit on cooldown")
+	}
+	if !errors.As(err, &provErr) || provErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected provider 429 error on cooldown, got %v", err)
+	}
+
+	data, err := os.ReadFile(counterPath)
+	if err != nil {
+		t.Fatalf("read counter file: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "1" {
+		t.Fatalf("binary spawn count = %q, want 1", got)
 	}
 }
 
