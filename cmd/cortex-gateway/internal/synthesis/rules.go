@@ -82,7 +82,7 @@ func DefaultRules() []Rule {
 			},
 			Templates: map[string]string{
 				"I": "*faehrt leise den Rechner hoch und oeffnet die Mails*",
-				"E": "Guten Morgen! *faehrt den Rechner hoch und checkt die Mails* Mal schauen was heute ansteht...",
+				"E": "Guten Morgen! *faehrt den Rechner hoch und prueft die Mails* Mal schauen was heute ansteht...",
 			},
 			Actions: []Action{
 				{Type: "emote", Content: "*faehrt den Rechner hoch*", Emotion: "neutral"},
@@ -94,7 +94,7 @@ func DefaultRules() []Rule {
 				return fp.SimHour >= 12 && fp.SimHour <= 13 && fp.Hunger > 5 && baseGate(fp, ctx)
 			},
 			Templates: map[string]string{
-				"I": "*packt Sachen zusammen und geht in die Kueche*",
+				"I": "*nimmt die Sachen zusammen und geht in die Kueche*",
 				"E": "Mittagspause! Wer kommt mit? *steht auf und geht zur Kueche*",
 			},
 			Actions: []Action{
