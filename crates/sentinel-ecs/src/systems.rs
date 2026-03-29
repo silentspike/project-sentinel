@@ -346,6 +346,7 @@ pub fn input_system(
 
 /// 1b. Empfaengt Operator-Kommandos und injiziert manuelles Chaos.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub fn operator_command_system(
     receiver: Option<Res<OperatorCommandReceiver>>,
     time: Res<SimulationTime>,
