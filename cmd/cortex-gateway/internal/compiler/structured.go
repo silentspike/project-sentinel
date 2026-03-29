@@ -215,7 +215,7 @@ func buildInnerVoice(perception StructuredPerception) string {
 	if perception.ImpulseText == "" {
 		return "Aktuell gibt es keinen dominanten inneren Zwangsimpuls.\nWenn ein innerer Impuls auftaucht, behandelst du ihn als Teil deiner eigenen Gedankenwelt."
 	}
-	return "Innere Stimme: " + perception.ImpulseText + "\nDieser Gedanke kommt aus dir selbst. Du kannst ihn NICHT ignorieren.\nHandle SOFORT danach, sofern keine noch hoeherrangige direkte Interaktion aktiv ist."
+	return "Innere Stimme: " + perception.ImpulseText + "\nDieser Gedanke kommt aus dir selbst. Du kannst ihn NICHT ignorieren.\nHandle SOFORT danach, sofern keine noch hoeherrangige direkte Ansprache aktiv ist."
 }
 
 func buildActionFormat() string {

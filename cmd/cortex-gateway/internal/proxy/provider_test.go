@@ -1214,7 +1214,7 @@ count=$((count + 1))
 printf '%%s' "$count" > %q
 printf '%%s\n' '{"type":"result","subtype":"error","is_error":true,"result":"You'\''ve hit your limit - resets 9pm (UTC)"}'
 `, counterPath, counterPath, counterPath)
-	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil { //nolint:gosec // temp test script must be executable
 		t.Fatalf("write fake claude script: %v", err)
 	}
 
@@ -1241,7 +1241,7 @@ printf '%%s\n' '{"type":"result","subtype":"error","is_error":true,"result":"You
 		t.Fatalf("expected provider 429 error on cooldown, got %v", err)
 	}
 
-	data, err := os.ReadFile(counterPath)
+	data, err := os.ReadFile(counterPath) //nolint:gosec // temp counter path created by test
 	if err != nil {
 		t.Fatalf("read counter file: %v", err)
 	}

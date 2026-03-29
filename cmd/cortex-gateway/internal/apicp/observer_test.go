@@ -381,7 +381,7 @@ func TestStopFlushesFinalSnapshot(t *testing.T) {
 			return
 		}
 		calls++
-		defer r.Body.Close()
+		defer func() { _ = r.Body.Close() }()
 		if err := json.NewDecoder(r.Body).Decode(&stored); err != nil {
 			t.Fatalf("decode stored snapshot: %v", err)
 		}

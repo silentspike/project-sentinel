@@ -26,6 +26,8 @@ type Fingerprint struct {
 }
 
 // Parse parses a fingerprint string from daemon metadata.
+//
+//nolint:gocyclo // compact field parser intentionally handles all fingerprint tags in one pass
 func Parse(raw string) (Fingerprint, error) {
 	if raw == "" {
 		return Fingerprint{}, fmt.Errorf("empty fingerprint")
@@ -40,16 +42,16 @@ func Parse(raw string) (Fingerprint, error) {
 		switch key {
 		case "R":
 			if !hasColon {
-				return fp, fmt.Errorf("R field missing value")
+				return fp, fmt.Errorf("r field missing value")
 			}
 			fp.RoomID = val
 		case "P":
 			if !hasColon {
-				return fp, fmt.Errorf("P field missing value")
+				return fp, fmt.Errorf("p field missing value")
 			}
 			n, err := strconv.Atoi(val)
 			if err != nil {
-				return fp, fmt.Errorf("P field: %w", err)
+				return fp, fmt.Errorf("p field: %w", err)
 			}
 			fp.PresenceCount = n
 		case "CH":
@@ -64,11 +66,11 @@ func Parse(raw string) (Fingerprint, error) {
 			fp.HasHeard = val == "1"
 		case "T":
 			if !hasColon {
-				return fp, fmt.Errorf("T field missing value")
+				return fp, fmt.Errorf("t field missing value")
 			}
 			n, err := strconv.Atoi(val)
 			if err != nil {
-				return fp, fmt.Errorf("T field: %w", err)
+				return fp, fmt.Errorf("t field: %w", err)
 			}
 			fp.SimHour = n
 		case "TMP":

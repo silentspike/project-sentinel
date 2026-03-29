@@ -44,7 +44,7 @@ p3_timeout_ms = 7000
 max_forward_concurrency = 5
 intercept_mode = "manual"
 `
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 

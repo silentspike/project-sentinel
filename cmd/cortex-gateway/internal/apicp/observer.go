@@ -32,7 +32,7 @@ const (
 var (
 	bootstrapRetryDelay    = 2 * time.Second
 	bootstrapRetryAttempts = 5
-	observerRecordedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	observerRecordedTotal  = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "sentinel_apicp_observations_total",
 		Help: "Total API call observations recorded",
 	})
@@ -93,9 +93,9 @@ type LearnedPattern struct {
 
 // Snapshot is the persisted daemon-owned API-CP state.
 type Snapshot struct {
-	Patterns              []*PatternStats    `json:"patterns"`
-	SynthCount            int64              `json:"synth_count"`
-	LastEvolutionVersions map[string]string  `json:"last_evolution_versions"`
+	Patterns              []*PatternStats   `json:"patterns"`
+	SynthCount            int64             `json:"synth_count"`
+	LastEvolutionVersions map[string]string `json:"last_evolution_versions"`
 }
 
 // Observer watches all API calls and learns synthesis-eligible patterns.
@@ -547,7 +547,7 @@ func (o *Observer) loadRemote() bool {
 		o.logger.Warn("apicp snapshot load failed", "error", err, "url", o.syncURL)
 		return false
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return true
@@ -620,7 +620,7 @@ func (o *Observer) syncToRemote() {
 		o.logger.Warn("apicp snapshot store failed", "error", err, "url", o.syncURL)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		o.logger.Warn("apicp snapshot store rejected", "status", resp.StatusCode, "body", string(respBody))
