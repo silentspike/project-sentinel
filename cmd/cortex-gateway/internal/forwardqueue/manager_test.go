@@ -34,6 +34,20 @@ func TestManagerLimitsConcurrencyAndPreservesFIFO(t *testing.T) {
 		release()
 	}()
 
+	deadline := time.After(100 * time.Millisecond)
+	for {
+		stats := m.Stats()
+		if stats.Depth == 1 && stats.Active == 3 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected depth=1 active=3 before second waiter, got %+v", stats)
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
 	go func() {
 		release, acquireErr := m.Acquire(context.Background())
 		if acquireErr != nil {
@@ -44,7 +58,7 @@ func TestManagerLimitsConcurrencyAndPreservesFIFO(t *testing.T) {
 		release()
 	}()
 
-	deadline := time.After(100 * time.Millisecond)
+	deadline = time.After(100 * time.Millisecond)
 	for {
 		stats := m.Stats()
 		if stats.Depth == 2 && stats.Active == 3 {
