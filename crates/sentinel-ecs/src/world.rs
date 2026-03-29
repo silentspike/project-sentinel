@@ -815,7 +815,7 @@ impl RoomDistanceMap {
         }
         path.reverse();
 
-        // Start und Ziel strippen — nur Zwischen-Raeume
+        // Start und Ziel entfernen — nur Zwischen-Raeume
         if path.len() >= 2 {
             // path enthaelt: [hop1, hop2, ..., to]. Start (from) ist nicht drin.
             // Ziel (to) entfernen = letztes Element

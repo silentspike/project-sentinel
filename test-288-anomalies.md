@@ -262,7 +262,7 @@ Die urspruengliche Testmatrix behauptete 20/22 PASS. Tatsaechlich: 6/22 PASS.
 
 | 157 | 2026-03-28 22:18 | AC-3 Synthesis Toggle | PASS | Live-Control-Plane-Test: `PATCH /control/config {\"synthesis_enabled\":false}` liefert sofort `synthesis_enabled=false`; `GET /control/traffic-stats` spiegelt `synthesis_enabled=false`; anschliessend erfolgreich wieder auf `true` zurueckgesetzt. |
 | 158 | 2026-03-28 22:19 | AC-1 Bio-Synthesis | PASS | Gezielter Live-Request gegen Gateway mit `synth_fp=H9|E6|...` liefert `provider=\"synthesis\"`, Inhalt `*haelt sich den Magen...*` und Actions `move -> kueche`. Bio-Hunger-Synthesis ist damit reproduzierbar auf der VM nachgewiesen. |
-| 159 | 2026-03-28 22:19 | AC-5 Circadian/Physics | PASS | Gezielte Live-Requests gegen Gateway: `T:6` liefert `circadian_morning` (`Guten Morgen! ... checkt die Mails`), und `acoustic=\"72 dB, laut\"` liefert `physics_noise_high` mit `tool_use -> headphones_on`. Circadian- und Physics-Synthesis sind damit reproduzierbar nachgewiesen. |
+| 159 | 2026-03-28 22:19 | AC-5 Circadian/Physics | PASS | Gezielte Live-Requests gegen Gateway: `T:6` liefert `circadian_morning` (`Guten Morgen! ... prueft die Mails`), und `acoustic=\"72 dB, laut\"` liefert `physics_noise_high` mit `tool_use -> headphones_on`. Circadian- und Physics-Synthesis sind damit reproduzierbar nachgewiesen. |
 | 160 | 2026-03-28 22:20 | AC-22 Latenz <5ms | PASS | `/metrics`: `sentinel_pipeline_latency_seconds_sum{provider=\"synthesis\"}=0.005525369`, `count=5` => `~1.105 ms` durchschnittliche Synthese-Pipeline-Latenz. Der Traffic-Control-Hot-Path liegt damit unter dem 5ms-Ziel. |
 
 ### AKTUELLE AC-BEWERTUNG (Abendstand)
