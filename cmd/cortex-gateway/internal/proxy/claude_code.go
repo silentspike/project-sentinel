@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -397,11 +398,16 @@ func detectClaudeCodeLimit(text string, now time.Time) (string, time.Time, bool)
 	}
 
 	if matches := claudeCodeResetTimeRE.FindStringSubmatch(text); len(matches) == 4 {
-		hour := 0
+		hour, err := strconv.Atoi(matches[1])
+		if err != nil {
+			return msg, time.Time{}, false
+		}
 		minute := 0
-		fmt.Sscanf(matches[1], "%d", &hour)
 		if matches[2] != "" {
-			fmt.Sscanf(matches[2], "%d", &minute)
+			minute, err = strconv.Atoi(matches[2])
+			if err != nil {
+				return msg, time.Time{}, false
+			}
 		}
 		meridiem := strings.ToLower(matches[3])
 		if meridiem == "pm" && hour != 12 {

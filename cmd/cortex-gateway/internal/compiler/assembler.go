@@ -21,15 +21,15 @@ type PromptBlock struct {
 type Assembler struct {
 	loader         *TOMLLoader
 	caps           *capability.ProviderCapabilities
-	companyContext  string
+	companyContext string
 }
 
 // NewAssembler creates an Assembler with the given loader, capabilities, and company context.
 func NewAssembler(loader *TOMLLoader, caps *capability.ProviderCapabilities) *Assembler {
 	ctx := LoadCompanyContext(loader.agentDir)
 	return &Assembler{
-		loader:        loader,
-		caps:          caps,
+		loader:         loader,
+		caps:           caps,
 		companyContext: ctx,
 	}
 }
@@ -38,7 +38,7 @@ func NewAssembler(loader *TOMLLoader, caps *capability.ProviderCapabilities) *As
 func LoadCompanyContext(agentsDir string) string {
 	configDir := filepath.Dir(agentsDir)
 	path := filepath.Join(configDir, "company-context.md")
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // path is derived from trusted local config layout
 	if err != nil {
 		slog.Info("company-context.md not found, company context disabled", "path", path)
 		return ""

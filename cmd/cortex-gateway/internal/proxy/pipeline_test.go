@@ -54,7 +54,7 @@ func (p *pipelineMockProvider) Send(ctx context.Context, req *LLMRequest) (*LLMR
 	return resp, err
 }
 func (p *pipelineMockProvider) HealthCheck(_ context.Context) error { return nil }
-func (p *pipelineMockProvider) CurrentProviderError() error        { return p.statusErr }
+func (p *pipelineMockProvider) CurrentProviderError() error         { return p.statusErr }
 
 func newTestPipelineHandler(registry *Registry, controlCfg *control.Config) *PipelineHandler {
 	if controlCfg == nil {
@@ -868,6 +868,7 @@ INHALT: Ich habe Hunger und gehe in die Kueche.`,
 	}
 }
 
+//nolint:gocyclo // integration test intentionally exercises queueing, sequencing, and tick-sync together
 func TestPipelineQueueTickSyncAndSequencingIntegrate(t *testing.T) {
 	reg := NewRegistry()
 	queue := forwardqueue.NewManager(1)
@@ -978,10 +979,7 @@ func TestPipelineQueueTickSyncAndSequencingIntegrate(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if tickBuffer.Stats().Pending == 0 && p1W.Body.Len() > 0 && p3W.Body.Len() > 0 {
-			break
-		}
+	for tickBuffer.Stats().Pending != 0 || p1W.Body.Len() == 0 || p3W.Body.Len() == 0 {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for tick-sync flush: pending=%d p1_body=%d p3_body=%d",
 				tickBuffer.Stats().Pending, p1W.Body.Len(), p3W.Body.Len())

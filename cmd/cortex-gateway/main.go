@@ -44,6 +44,7 @@ const (
 	shutdownTimeout = 10 * time.Second
 )
 
+//nolint:gocyclo // composition root wires many runtime subsystems in one place
 func main() {
 	// 1. Structured logging via slog
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -321,7 +322,9 @@ func main() {
 			stats["apicp_suggestions"] = apicpObserver.Suggestions()
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(stats)
+		if err := json.NewEncoder(w).Encode(stats); err != nil {
+			logger.Warn("encode traffic stats failed", "error", err)
+		}
 	})
 	controlMux.HandleFunc("GET /control/intercepts/pending", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -618,18 +621,6 @@ func applyTrafficRuntimeConfig(
 	}
 }
 
-func envBool(key string, defaultVal bool) bool {
-	if val := os.Getenv(key); val != "" {
-		switch val {
-		case "1", "true", "TRUE", "True":
-			return true
-		case "0", "false", "FALSE", "False":
-			return false
-		}
-	}
-	return defaultVal
-}
-
 func envBoolValue(key string) (bool, bool) {
 	val := os.Getenv(key)
 	if val == "" {
@@ -685,17 +676,9 @@ func loadAgentProfiles(loader *compiler.TOMLLoader, detector *judge.DriftDetecto
 	logger.Info("agent personality profiles loaded", "count", loaded, "agents_dir", agentsDir)
 }
 
-// roomToml is the minimal TOML structure for rooms.toml parsing.
-type roomToml struct {
-	Rooms []struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	} `json:"rooms"`
-}
-
 // loadRoomDefs loads room definitions from rooms.toml for move target resolution.
 func loadRoomDefs(path string) ([]extraction.RoomDef, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // path comes from trusted local config
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
