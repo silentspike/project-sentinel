@@ -131,21 +131,21 @@ fn ac_12_05_smell_propagation() {
 /// AC #12.6: start_transit(), tick(), complete_transit()
 #[test]
 fn ac_12_06_transit_lifecycle() {
-    // Transit starten: buero-dev-1 -> kueche, 3000ms
-    let mut state = start_transit("buero-dev-1", "kueche", 3000);
+    // Transit starten: buero-dev-1 -> kueche, 40000ms (2 Hops * 20s)
+    let mut state = start_transit("buero-dev-1", "kueche", 40_000);
     assert!(state.in_transit);
     assert_eq!(state.origin, "buero-dev-1");
     assert_eq!(state.target, "kueche");
-    assert_eq!(state.remaining_ms, 3000);
+    assert_eq!(state.remaining_ms, 40_000);
 
     // Erster Tick: 1000ms vergangen, nicht fertig
     let finished = tick_transit(&mut state, 1000);
     assert!(!finished);
     assert!(state.in_transit);
-    assert_eq!(state.remaining_ms, 2000);
+    assert_eq!(state.remaining_ms, 39_000);
 
-    // Zweiter Tick: 2000ms vergangen, Transit abgeschlossen
-    let finished = tick_transit(&mut state, 2000);
+    // Restliche Zeit: 39000ms vergangen, Transit abgeschlossen
+    let finished = tick_transit(&mut state, 39_000);
     assert!(finished);
     assert!(!state.in_transit);
     assert_eq!(state.remaining_ms, 0);

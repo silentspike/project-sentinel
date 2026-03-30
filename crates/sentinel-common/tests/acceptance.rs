@@ -73,6 +73,11 @@ fn ac_05_04_serde_roundtrip_all_types() {
         is_directly_addressed: false,
         timestamp: Timestamp(2000),
         tick: Tick(100),
+        room_id: "kueche-eg".to_string(),
+        max_priority: "P2".to_string(),
+        synth_fingerprint: String::new(),
+        personality_type: "I".to_string(),
+        has_operator_impulse: false,
     };
     let json = serde_json::to_string(&perception).unwrap();
     let deserialized: Perception = serde_json::from_str(&json).unwrap();

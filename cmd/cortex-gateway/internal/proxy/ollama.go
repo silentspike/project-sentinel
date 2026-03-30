@@ -74,6 +74,12 @@ func (p *OllamaProvider) Name() string {
 
 // Send forwards an LLMRequest to Ollama's /api/chat endpoint.
 func (p *OllamaProvider) Send(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
+	if req != nil && req.ProviderTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, req.ProviderTimeout)
+		defer cancel()
+	}
+
 	messages := make([]ollamaMessage, len(req.Messages))
 	for i, m := range req.Messages {
 		messages[i] = ollamaMessage(m)

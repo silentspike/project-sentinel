@@ -26,7 +26,7 @@ use sentinel_ebpf::collector::MetricsSnapshot;
 use sentinel_ebpf::EbpfCollector;
 use sentinel_ecs::{
     apply_personality, create_simulation_world, despawn_agent_from_world, spawn_agent,
-    ActionReceiver, EventBuffer, LimboEventStore, PerceptionSender, SimulationTime,
+    ActionReceiver, LimboEventStore, PerceptionSender, SimulationTime,
 };
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
@@ -416,26 +416,33 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_ecs = Arc::clone(&shutdown);
 
-    // -- Room Distance Map (BFS-vorberechnet fuer Transit-Dauer + Smell-Propagation) --
+    // -- Room Distance Map + Room Info Map (BFS-vorberechnet fuer Transit-Dauer + Capacity + Floor) --
     let rooms_toml_path = config.config_dir.join("rooms.toml");
-    let room_distances = if rooms_toml_path.exists() {
+    let (room_distances, room_info) = if rooms_toml_path.exists() {
         match sentinel_common::room::BuildingConfig::load(&rooms_toml_path) {
             Ok(building_cfg) => {
                 let map = sentinel_ecs::RoomDistanceMap::from_building_config(&building_cfg);
+                let info = sentinel_ecs::RoomInfoMap::from_building_config(&building_cfg);
                 info!(
                     rooms = building_cfg.rooms.len(),
-                    "RoomDistanceMap aus rooms.toml geladen"
+                    "RoomDistanceMap + RoomInfoMap aus rooms.toml geladen"
                 );
-                map
+                (map, info)
             }
             Err(e) => {
-                warn!(error = %e, "rooms.toml konnte nicht geladen werden — Fallback auf Default-Distanzen");
-                sentinel_ecs::RoomDistanceMap::default()
+                warn!(error = %e, "rooms.toml konnte nicht geladen werden — Fallback auf Defaults");
+                (
+                    sentinel_ecs::RoomDistanceMap::default(),
+                    sentinel_ecs::RoomInfoMap::default(),
+                )
             }
         }
     } else {
         warn!("rooms.toml nicht gefunden — Transit-Dauer nutzt Default-Distanzen");
-        sentinel_ecs::RoomDistanceMap::default()
+        (
+            sentinel_ecs::RoomDistanceMap::default(),
+            sentinel_ecs::RoomInfoMap::default(),
+        )
     };
     let operator_room_ids = room_distances.all_rooms().to_vec();
     let operator_api_handle = if config.operator_api.enabled {
@@ -449,6 +456,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 restore_tx.clone(),
                 Arc::clone(&event_store),
                 prune_tx.clone(),
+                Arc::clone(&state_store),
             )
             .await?,
         )
@@ -504,6 +512,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 agent_command_cfg,
                 adaptive_config,
                 room_distances,
+                room_info,
                 fanout_sender,
                 config.resource_manager.clone(),
                 config.platform_controlplane.clone(),
@@ -532,9 +541,15 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // -- LLM Bridge starten (Perception → Cortex Gateway → Action) --
     #[cfg(feature = "llm")]
     let _llm_bridge_handle = {
+        let gateway_request_timeout_ms = std::env::var("SENTINEL_LLM_BRIDGE_REQUEST_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(config.traffic_control.gateway_request_timeout_ms);
         let bridge_config = crate::llm_bridge::bridge::LlmBridgeConfig {
             gateway_url: std::env::var("CORTEX_GATEWAY_URL")
                 .unwrap_or_else(|_| "http://localhost:8080".to_string()),
+            max_concurrent: config.traffic_control.max_forward_concurrency.max(1),
+            request_timeout: std::time::Duration::from_millis(gateway_request_timeout_ms),
             ..Default::default()
         };
         let bridge_telemetry =
@@ -543,6 +558,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         let bridge_telem = std::sync::Arc::clone(&bridge_telemetry);
         info!(
             gateway_url = %bridge_config.gateway_url,
+            max_concurrent = bridge_config.max_concurrent,
+            request_timeout_ms = gateway_request_timeout_ms,
             "LLM Bridge wird gestartet"
         );
         tokio::spawn(crate::llm_bridge::bridge::run_llm_bridge(
@@ -775,6 +792,7 @@ fn ecs_tick_loop(
     agent_command_cfg: Vec<String>,
     adaptive_config: crate::adaptive_tick::AdaptiveConfig,
     room_distances: sentinel_ecs::RoomDistanceMap,
+    room_info: sentinel_ecs::RoomInfoMap,
     fanout_sender: Option<sentinel_ecs::ZenohFanoutSender>,
     resource_manager_config: crate::config::ResourceManagerConfig,
     platform_cp_config: crate::config::PlatformControlplaneConfig,
@@ -811,6 +829,8 @@ fn ecs_tick_loop(
     world.insert_resource(sentinel_ecs::PsiMetrics::default());
     // Room-Distanzen fuer Transit-Dauer und Smell-Propagation
     world.insert_resource(room_distances);
+    // Room-Info fuer Capacity-Checks und Floor-Lookup
+    world.insert_resource(room_info);
 
     // Stores als Resources einfuegen (Arc<StateStore> direkt verwenden)
     let state_store_for_sim = Arc::clone(&state_store);
@@ -1123,11 +1143,10 @@ fn ecs_tick_loop(
         }
     }
 
-    // EventBuffer leeren: ECS spawn_agent emittiert eigene Events, aber der
-    // RuntimeOrchestrator ist SSOT fuer Lifecycle-Events (vermeidet Duplikate)
-    if let Some(mut event_buffer) = world.get_resource_mut::<EventBuffer>() {
-        event_buffer.events.clear();
-    }
+    // AgentSpawned Events BEHALTEN — Projection braucht sie nach Restore.
+    // spawn_agent() emittiert AgentSpawned, upsert_agent() in Projection ist idempotent.
+    // Vorher wurden ALLE Events hier geloescht, was nach Restore dazu fuehrte dass
+    // die Projection 0 aktive Agents zeigte (Dashboard-API leer).
 
     info!(
         agent_count = shift_agents.len(),
@@ -1229,7 +1248,7 @@ fn ecs_tick_loop(
                     .map(|(id, h)| (h.identity.name.clone(), *id))
                     .collect();
             let failed_services = service_health_checker.poll_failed();
-            let pcp_metrics = crate::platform_controlplane::metrics::collect(
+            let mut pcp_metrics = crate::platform_controlplane::metrics::collect(
                 &mut pcp_metrics_collector,
                 &last_ebpf_snapshot,
                 &event_store_for_prune,
@@ -1238,6 +1257,14 @@ fn ecs_tick_loop(
                 tick_count,
                 failed_services,
             );
+            // last_action_ticks aus RuntimeOrchestrator befuellen —
+            // Agents mit kuerzlicher Activity sollen nicht als stalled despawnt werden.
+            for (id, handle) in runtime_orch.agents() {
+                let _ = id; // Agent-Name ist im Handle
+                pcp_metrics
+                    .last_action_ticks
+                    .insert(handle.identity.name.clone(), handle.last_activity_tick.0);
+            }
             let side_effects = platform_cp.cycle(
                 &pcp_metrics,
                 &event_store_for_prune,
@@ -1577,10 +1604,8 @@ fn ecs_tick_loop(
                     }
                 }
 
-                // EventBuffer leeren (spawn_agent_full → ECS spawn Events, Orchestrator ist SSOT)
-                if let Some(mut event_buffer) = world.get_resource_mut::<EventBuffer>() {
-                    event_buffer.events.clear();
-                }
+                // AgentSpawned Events BEHALTEN — Projection braucht sie bei Schichtwechsel.
+                // upsert_agent() in Projection ist idempotent.
 
                 info!(
                     removed = removed.len(),
@@ -2152,16 +2177,9 @@ fn ecs_tick_loop(
         "Shutdown: sim_hour persist"
     );
 
-    // 5. Despawn-Events emittieren (Projection occupant_count Drift vermeiden)
-    let t = Instant::now();
-    let despawned = runtime_orch.despawn_all_for_shutdown();
-    info!(
-        agents = despawned,
-        duration_ms = t.elapsed().as_millis() as u64,
-        "Shutdown: Despawn-Events"
-    );
-
-    // 6. Runtime-Snapshot speichern
+    // 5. Runtime-Snapshot speichern (VOR Despawn! Snapshot muss aktuelle Agents enthalten,
+    //    nicht 0. Beim Restart erkennt shift_transition() ob Schichtwechsel stattfand
+    //    und entfernt/spawnt Agents entsprechend.)
     let t = Instant::now();
     if let Err(e) = runtime_orch.save_state() {
         error!(error = %e, "Runtime State Snapshot fehlgeschlagen");
@@ -2174,6 +2192,15 @@ fn ecs_tick_loop(
     info!(
         duration_ms = t.elapsed().as_millis() as u64,
         "Shutdown: Runtime-Snapshot"
+    );
+
+    // 6. Despawn-Events emittieren (Projection occupant_count Drift vermeiden)
+    let t = Instant::now();
+    let despawned = runtime_orch.despawn_all_for_shutdown();
+    info!(
+        agents = despawned,
+        duration_ms = t.elapsed().as_millis() as u64,
+        "Shutdown: Despawn-Events"
     );
 
     info!(
@@ -2436,6 +2463,7 @@ mod tests {
             vec!["true".to_string()],
             crate::adaptive_tick::AdaptiveConfig::default(),
             sentinel_ecs::RoomDistanceMap::default(),
+            sentinel_ecs::RoomInfoMap::default(),
             None, // Kein Zenoh Fan-Out in Tests
             crate::config::ResourceManagerConfig::default(),
             crate::config::PlatformControlplaneConfig::default(),
@@ -2503,6 +2531,7 @@ mod tests {
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
                 sentinel_ecs::RoomDistanceMap::default(),
+                sentinel_ecs::RoomInfoMap::default(),
                 None, // Kein Zenoh Fan-Out in Tests
                 crate::config::ResourceManagerConfig::default(),
                 crate::config::PlatformControlplaneConfig::default(),
@@ -2587,6 +2616,7 @@ mod tests {
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
                 sentinel_ecs::RoomDistanceMap::default(),
+                sentinel_ecs::RoomInfoMap::default(),
                 None, // Kein Zenoh Fan-Out in Tests
                 crate::config::ResourceManagerConfig::default(),
                 crate::config::PlatformControlplaneConfig::default(),
@@ -2679,6 +2709,7 @@ mod tests {
                 vec!["true".to_string()],
                 crate::adaptive_tick::AdaptiveConfig::default(),
                 sentinel_ecs::RoomDistanceMap::default(),
+                sentinel_ecs::RoomInfoMap::default(),
                 None, // Kein Zenoh Fan-Out in Tests
                 crate::config::ResourceManagerConfig::default(),
                 crate::config::PlatformControlplaneConfig::default(),

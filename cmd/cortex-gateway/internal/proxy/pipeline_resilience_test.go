@@ -18,8 +18,8 @@ import (
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
 )
 
-// TestCircuitBreakerE2E simulates: provider failure → breaker opens → failover →
-// time passes → half-open → successful probe → breaker closes (recovery).
+// TestCircuitBreakerE2E simulates: provider failure -> breaker opens -> 503 without
+// failover -> time passes -> half-open -> successful probes -> breaker closes.
 func TestCircuitBreakerE2E(t *testing.T) {
 	reg := NewRegistry()
 
@@ -40,18 +40,6 @@ func TestCircuitBreakerE2E(t *testing.T) {
 		},
 	}
 	reg.Register("primary", primary)
-
-	// Fallback: always works
-	fallback := &pipelineMockProvider{
-		name: "fallback",
-		resp: &LLMResponse{
-			Content:      "fallback ok",
-			Model:        "m",
-			TokensUsed:   1,
-			FinishReason: "stop",
-		},
-	}
-	reg.Register("fallback", fallback)
 
 	cfg := control.NewConfig("primary")
 	breakerCfg := BreakerConfig{
@@ -102,13 +90,13 @@ func TestCircuitBreakerE2E(t *testing.T) {
 		t.Fatalf("phase 1: expected primary breaker %q, got %q", "open", got)
 	}
 
-	// Phase 2: Failover to fallback
+	// Phase 2: Breaker blocks requests with 503, no failover
 	code, provider := doRequest()
-	if code != http.StatusOK {
-		t.Fatalf("phase 2: expected %d (failover), got %d", http.StatusOK, code)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("phase 2: expected %d (breaker open), got %d", http.StatusServiceUnavailable, code)
 	}
-	if provider != "fallback" {
-		t.Errorf("phase 2: expected provider %q, got %q", "fallback", provider)
+	if provider != "" {
+		t.Errorf("phase 2: expected no provider on breaker block, got %q", provider)
 	}
 
 	// Phase 3: Simulate primary recovery
@@ -118,18 +106,25 @@ func TestCircuitBreakerE2E(t *testing.T) {
 	now := time.Now()
 	breaker.now = func() time.Time { return now.Add(6 * time.Second) }
 
-	// Phase 4: Primary should now be half-open, probe should succeed
-	// First, verify breaker transitions to half-open
-	if !breaker.Allow() {
-		t.Fatal("phase 4: expected Allow()=true after open timeout")
+	// Phase 4: Half-open requests should probe the recovered primary
+	code, provider = doRequest()
+	if code != http.StatusOK {
+		t.Fatalf("phase 4 probe 1: expected %d, got %d", http.StatusOK, code)
 	}
 	if got := breaker.State(); got != "half-open" {
-		t.Fatalf("phase 4: expected %q, got %q", "half-open", got)
+		t.Fatalf("phase 4 probe 1: expected %q, got %q", "half-open", got)
+	}
+	if provider != "primary" {
+		t.Fatalf("phase 4 probe 1: expected provider %q, got %q", "primary", provider)
 	}
 
-	// Record successful probes to close breaker
-	breaker.Record(nil) // probe 1: success
-	breaker.Record(nil) // probe 2: success → closes breaker
+	code, provider = doRequest()
+	if code != http.StatusOK {
+		t.Fatalf("phase 4 probe 2: expected %d, got %d", http.StatusOK, code)
+	}
+	if provider != "primary" {
+		t.Fatalf("phase 4 probe 2: expected provider %q, got %q", "primary", provider)
+	}
 
 	if got := breaker.State(); got != "closed" {
 		t.Fatalf("phase 4: expected %q after successful probes, got %q", "closed", got)
@@ -152,56 +147,121 @@ func TestCircuitBreakerE2E(t *testing.T) {
 func TestProviderDeadlineFromEnv(t *testing.T) {
 	t.Run("default", func(t *testing.T) {
 		d := ProviderDeadlineFromEnv()
-		if d != 20*time.Second {
-			t.Errorf("ProviderDeadlineFromEnv() = %v, want 20s", d)
+		if d != 60*time.Second {
+			t.Errorf("ProviderDeadlineFromEnv() = %v, want 60s", d)
 		}
 	})
 
-	t.Run("valid", func(t *testing.T) {
-		t.Setenv("SENTINEL_CORTEX_PROVIDER_DEADLINE_SECONDS", "15")
+	t.Run("valid_new_env", func(t *testing.T) {
+		t.Setenv("SENTINEL_CORTEX_PROVIDER_TIMEOUT_SECONDS", "45")
+		d := ProviderDeadlineFromEnv()
+		if d != 45*time.Second {
+			t.Errorf("ProviderDeadlineFromEnv() = %v, want 45s", d)
+		}
+	})
+
+	t.Run("valid_legacy_env", func(t *testing.T) {
+		t.Setenv("SENTINEL_CORTEX_PROVIDER_DEADLINE_SECONDS", "75")
+		d := ProviderDeadlineFromEnv()
+		if d != 75*time.Second {
+			t.Errorf("ProviderDeadlineFromEnv() = %v, want 75s", d)
+		}
+	})
+
+	t.Run("too_low", func(t *testing.T) {
+		t.Setenv("SENTINEL_CORTEX_PROVIDER_TIMEOUT_SECONDS", "5")
+		d := ProviderDeadlineFromEnv()
+		if d != 60*time.Second {
+			t.Errorf("ProviderDeadlineFromEnv() = %v, want 60s (below min)", d)
+		}
+	})
+
+	t.Run("too_high", func(t *testing.T) {
+		t.Setenv("SENTINEL_CORTEX_PROVIDER_TIMEOUT_SECONDS", "240")
+		d := ProviderDeadlineFromEnv()
+		if d != 60*time.Second {
+			t.Errorf("ProviderDeadlineFromEnv() = %v, want 60s (above max)", d)
+		}
+	})
+
+	t.Run("invalid", func(t *testing.T) {
+		t.Setenv("SENTINEL_CORTEX_PROVIDER_TIMEOUT_SECONDS", "abc")
+		d := ProviderDeadlineFromEnv()
+		if d != 60*time.Second {
+			t.Errorf("ProviderDeadlineFromEnv() = %v, want 60s (invalid)", d)
+		}
+	})
+
+	t.Run("boundary_min", func(t *testing.T) {
+		t.Setenv("SENTINEL_CORTEX_PROVIDER_TIMEOUT_SECONDS", "15")
 		d := ProviderDeadlineFromEnv()
 		if d != 15*time.Second {
 			t.Errorf("ProviderDeadlineFromEnv() = %v, want 15s", d)
 		}
 	})
 
-	t.Run("too_low", func(t *testing.T) {
-		t.Setenv("SENTINEL_CORTEX_PROVIDER_DEADLINE_SECONDS", "5")
+	t.Run("boundary_max", func(t *testing.T) {
+		t.Setenv("SENTINEL_CORTEX_PROVIDER_TIMEOUT_SECONDS", "180")
 		d := ProviderDeadlineFromEnv()
-		if d != 20*time.Second {
-			t.Errorf("ProviderDeadlineFromEnv() = %v, want 20s (below min)", d)
+		if d != 180*time.Second {
+			t.Errorf("ProviderDeadlineFromEnv() = %v, want 180s", d)
+		}
+	})
+}
+
+func TestInflightDeadlineFromEnv(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		d := InflightDeadlineFromEnv()
+		if d != 180*time.Second {
+			t.Errorf("InflightDeadlineFromEnv() = %v, want 180s", d)
+		}
+	})
+
+	t.Run("valid", func(t *testing.T) {
+		t.Setenv("SENTINEL_CORTEX_INFLIGHT_DEADLINE_SECONDS", "240")
+		d := InflightDeadlineFromEnv()
+		if d != 240*time.Second {
+			t.Errorf("InflightDeadlineFromEnv() = %v, want 240s", d)
+		}
+	})
+
+	t.Run("too_low", func(t *testing.T) {
+		t.Setenv("SENTINEL_CORTEX_INFLIGHT_DEADLINE_SECONDS", "10")
+		d := InflightDeadlineFromEnv()
+		if d != 180*time.Second {
+			t.Errorf("InflightDeadlineFromEnv() = %v, want 180s (below min)", d)
 		}
 	})
 
 	t.Run("too_high", func(t *testing.T) {
-		t.Setenv("SENTINEL_CORTEX_PROVIDER_DEADLINE_SECONDS", "60")
-		d := ProviderDeadlineFromEnv()
-		if d != 20*time.Second {
-			t.Errorf("ProviderDeadlineFromEnv() = %v, want 20s (above max)", d)
+		t.Setenv("SENTINEL_CORTEX_INFLIGHT_DEADLINE_SECONDS", "600")
+		d := InflightDeadlineFromEnv()
+		if d != 180*time.Second {
+			t.Errorf("InflightDeadlineFromEnv() = %v, want 180s (above max)", d)
 		}
 	})
 
 	t.Run("invalid", func(t *testing.T) {
-		t.Setenv("SENTINEL_CORTEX_PROVIDER_DEADLINE_SECONDS", "abc")
-		d := ProviderDeadlineFromEnv()
-		if d != 20*time.Second {
-			t.Errorf("ProviderDeadlineFromEnv() = %v, want 20s (invalid)", d)
+		t.Setenv("SENTINEL_CORTEX_INFLIGHT_DEADLINE_SECONDS", "abc")
+		d := InflightDeadlineFromEnv()
+		if d != 180*time.Second {
+			t.Errorf("InflightDeadlineFromEnv() = %v, want 180s (invalid)", d)
 		}
 	})
 
 	t.Run("boundary_min", func(t *testing.T) {
-		t.Setenv("SENTINEL_CORTEX_PROVIDER_DEADLINE_SECONDS", "10")
-		d := ProviderDeadlineFromEnv()
-		if d != 10*time.Second {
-			t.Errorf("ProviderDeadlineFromEnv() = %v, want 10s", d)
+		t.Setenv("SENTINEL_CORTEX_INFLIGHT_DEADLINE_SECONDS", "30")
+		d := InflightDeadlineFromEnv()
+		if d != 30*time.Second {
+			t.Errorf("InflightDeadlineFromEnv() = %v, want 30s", d)
 		}
 	})
 
 	t.Run("boundary_max", func(t *testing.T) {
-		t.Setenv("SENTINEL_CORTEX_PROVIDER_DEADLINE_SECONDS", "30")
-		d := ProviderDeadlineFromEnv()
-		if d != 30*time.Second {
-			t.Errorf("ProviderDeadlineFromEnv() = %v, want 30s", d)
+		t.Setenv("SENTINEL_CORTEX_INFLIGHT_DEADLINE_SECONDS", "300")
+		d := InflightDeadlineFromEnv()
+		if d != 300*time.Second {
+			t.Errorf("InflightDeadlineFromEnv() = %v, want 300s", d)
 		}
 	})
 }
@@ -288,7 +348,7 @@ func TestConfigurableDeadlineDefault(t *testing.T) {
 		// ProviderDeadline: 0 → default
 	})
 
-	if ph.providerDeadline != 20*time.Second {
-		t.Errorf("providerDeadline = %v, want 20s (default)", ph.providerDeadline)
+	if ph.providerDeadline != 60*time.Second {
+		t.Errorf("providerDeadline = %v, want 60s (default)", ph.providerDeadline)
 	}
 }

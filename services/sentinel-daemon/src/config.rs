@@ -77,6 +77,49 @@ pub struct DaemonConfig {
     /// Platform-Controlplane: Self-Healing Background Service.
     #[serde(default)]
     pub platform_controlplane: PlatformControlplaneConfig,
+
+    /// Traffic Control Defaults fuer den Gateway-Start.
+    #[serde(default)]
+    pub traffic_control: TrafficControlConfig,
+}
+
+/// Traffic-Control Defaults fuer den Gateway Bootstrap.
+#[derive(Debug, Deserialize, Clone)]
+pub struct TrafficControlConfig {
+    #[serde(default)]
+    pub synthesis_enabled: bool,
+    #[serde(default)]
+    pub sequencing_enabled: bool,
+    #[serde(default)]
+    pub tick_sync_enabled: bool,
+    #[serde(default)]
+    pub apicp_enabled: bool,
+    #[serde(default = "default_tc_tick_sync_timeout_ms")]
+    pub tick_sync_timeout_ms: u64,
+    #[serde(default = "default_tc_p3_timeout_ms")]
+    pub p3_timeout_ms: u64,
+    #[serde(default = "default_tc_gateway_request_timeout_ms")]
+    pub gateway_request_timeout_ms: u64,
+    #[serde(default = "default_tc_max_forward_concurrency")]
+    pub max_forward_concurrency: usize,
+    #[serde(default = "default_tc_intercept_mode")]
+    pub intercept_mode: String,
+}
+
+impl Default for TrafficControlConfig {
+    fn default() -> Self {
+        Self {
+            synthesis_enabled: false,
+            sequencing_enabled: false,
+            tick_sync_enabled: false,
+            apicp_enabled: false,
+            tick_sync_timeout_ms: default_tc_tick_sync_timeout_ms(),
+            p3_timeout_ms: default_tc_p3_timeout_ms(),
+            gateway_request_timeout_ms: default_tc_gateway_request_timeout_ms(),
+            max_forward_concurrency: default_tc_max_forward_concurrency(),
+            intercept_mode: default_tc_intercept_mode(),
+        }
+    }
 }
 
 /// Konfiguration fuer den Resource Manager (dynamische cgroup-Limits).
@@ -302,6 +345,26 @@ fn default_operator_bind_addr() -> String {
     "127.0.0.1:8084".to_string()
 }
 
+fn default_tc_tick_sync_timeout_ms() -> u64 {
+    2000
+}
+
+fn default_tc_p3_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_tc_gateway_request_timeout_ms() -> u64 {
+    150_000
+}
+
+fn default_tc_max_forward_concurrency() -> usize {
+    3
+}
+
+fn default_tc_intercept_mode() -> String {
+    "auto".to_string()
+}
+
 /// NATS JetStream Konfiguration fuer den Daemon.
 #[derive(Debug, Deserialize)]
 pub struct NatsConfig {
@@ -435,7 +498,7 @@ fn default_pcp_monitored_services() -> Vec<String> {
     vec![
         "sentinel-judge".into(),
         "sentinel-projection".into(),
-        "sentinel-cortex".into(),
+        "sentinel-gateway".into(),
     ]
 }
 fn default_pcp_service_check_interval() -> u64 {
@@ -519,6 +582,18 @@ data_dir = "/tmp/data"
         assert_eq!(file.daemon.zenoh_prefix, "sentinel");
         assert_eq!(file.daemon.time_scale, 1.0);
         assert_eq!(file.daemon.agent_command, vec!["/usr/bin/agent-runtime"]);
+        assert!(!file.daemon.traffic_control.synthesis_enabled);
+        assert!(!file.daemon.traffic_control.sequencing_enabled);
+        assert!(!file.daemon.traffic_control.tick_sync_enabled);
+        assert!(!file.daemon.traffic_control.apicp_enabled);
+        assert_eq!(file.daemon.traffic_control.tick_sync_timeout_ms, 2000);
+        assert_eq!(file.daemon.traffic_control.p3_timeout_ms, 5000);
+        assert_eq!(
+            file.daemon.traffic_control.gateway_request_timeout_ms,
+            150_000
+        );
+        assert_eq!(file.daemon.traffic_control.max_forward_concurrency, 3);
+        assert_eq!(file.daemon.traffic_control.intercept_mode, "auto");
     }
 
     #[test]
@@ -626,5 +701,38 @@ max_inflight_per_agent = 4
         assert_eq!(file.daemon.zenoh.query_deadline_ms, 200);
         assert_eq!(file.daemon.zenoh.max_inflight_global, 64);
         assert_eq!(file.daemon.zenoh.max_inflight_per_agent, 4);
+    }
+
+    #[test]
+    fn test_traffic_control_custom() {
+        let toml_str = r#"
+[daemon]
+config_dir = "/tmp/cfg"
+data_dir = "/tmp/data"
+
+[daemon.traffic_control]
+synthesis_enabled = true
+sequencing_enabled = true
+tick_sync_enabled = true
+apicp_enabled = true
+tick_sync_timeout_ms = 1500
+p3_timeout_ms = 7000
+gateway_request_timeout_ms = 180000
+max_forward_concurrency = 5
+intercept_mode = "manual"
+"#;
+        let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
+        assert!(file.daemon.traffic_control.synthesis_enabled);
+        assert!(file.daemon.traffic_control.sequencing_enabled);
+        assert!(file.daemon.traffic_control.tick_sync_enabled);
+        assert!(file.daemon.traffic_control.apicp_enabled);
+        assert_eq!(file.daemon.traffic_control.tick_sync_timeout_ms, 1500);
+        assert_eq!(file.daemon.traffic_control.p3_timeout_ms, 7000);
+        assert_eq!(
+            file.daemon.traffic_control.gateway_request_timeout_ms,
+            180_000
+        );
+        assert_eq!(file.daemon.traffic_control.max_forward_concurrency, 5);
+        assert_eq!(file.daemon.traffic_control.intercept_mode, "manual");
     }
 }

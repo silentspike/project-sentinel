@@ -37,6 +37,11 @@ fn test_position() -> Position {
         transit_target: None,
         transit_remaining_ms: 0,
         transit_correlation_id: None,
+        transit_route: Vec::new(),
+        transit_total_ms: 0,
+        transit_paused: false,
+        transit_pause_tick: 0,
+        transit_source: None,
     }
 }
 

@@ -251,7 +251,7 @@ main() {
         "daemon:sentinel-daemon.service:systemd:::5"
         "projection:sentinel-projection.service:systemd:::5"
         "nats:nats-server.service:nats:::5"
-        "cortex:sentinel-cortex.service:http:8080:/health:5"
+        "cortex:sentinel-gateway.service:http:8080:/health:5"
         "dashboard:sentinel-dashboard.service:http:8000:/api/health:3"
         "judge:sentinel-judge.service:http:8082:/health:3"
         "nats-bridge:sentinel-nats-bridge.service:http:8083:/health:3"

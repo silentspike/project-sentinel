@@ -3,33 +3,47 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/apicp"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/compiler"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/detection"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/guardrails"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/intercept"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/mapping"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/resilience"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/sequencing"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/synthesis"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/ticksync"
 	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/eventstore"
 	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/judge"
 )
 
-// defaultProviderDeadline ist die maximale Wartezeit pro LLM-Call (ENV-konfigurierbar).
-const defaultProviderDeadline = 20 * time.Second
+const (
+	// defaultProviderDeadline ist die maximale Wartezeit fuer die echte Provider-Ausfuehrung
+	// nach erfolgreichem Queue-Acquire. Claude Code ueber Subscription ist real deutlich
+	// langsamer als die alten 20s-Annahmen.
+	defaultProviderDeadline = 60 * time.Second
+	// defaultInflightDeadline ist die maximale Gesamtlebensdauer eines Requests in der
+	// InFlightMap. Dieser Wert muss Queue-Wartezeit + Provider-Ausfuehrung abdecken.
+	defaultInflightDeadline = 180 * time.Second
+)
 
 // maxRegenAttempts limitiert Fourth-Wall Re-Generierungs-Versuche.
 const maxRegenAttempts = 2
@@ -80,51 +94,93 @@ var (
 
 // PipelineConfig haelt alle Abhaengigkeiten fuer den PipelineHandler.
 type PipelineConfig struct {
-	Registry         *Registry
-	Config           *control.Config
-	Compiler         *compiler.Compiler
-	Normalizer       *normalizer.Normalizer
-	Extractor        *extraction.Extractor
-	Capabilities     *capability.ProviderCapabilities
-	Logger           *slog.Logger
-	BreakerCfg       BreakerConfig
-	EventStore       *eventstore.Store       // optional: nil disables event persistence
-	Guardrails       *guardrails.Enforcer    // optional: nil disables guardrails
-	InFlight         *resilience.InFlightMap // optional: nil disables query tracking
-	ProviderDeadline time.Duration           // 0 = defaultProviderDeadline (20s)
-	Drift            *judge.DriftDetector    // optional: nil disables personality guard
-	Quality          *judge.QualityScorer    // optional: nil disables quality gate
+	Registry            *Registry
+	Config              *control.Config
+	Compiler            *compiler.Compiler
+	Normalizer          *normalizer.Normalizer
+	Extractor           *extraction.Extractor
+	Capabilities        *capability.ProviderCapabilities
+	Logger              *slog.Logger
+	BreakerCfg          BreakerConfig
+	EventStore          *eventstore.Store          // optional: nil disables event persistence
+	Guardrails          *guardrails.Enforcer       // optional: nil disables guardrails
+	InFlight            *resilience.InFlightMap    // optional: nil disables query tracking
+	ProviderDeadline    time.Duration              // 0 = defaultProviderDeadline (60s)
+	Drift               *judge.DriftDetector       // optional: nil disables personality guard
+	Quality             *judge.QualityScorer       // optional: nil disables quality gate
+	Synthesis           *synthesis.Engine          // optional: nil disables synthesis
+	Sequencer           *sequencing.Sequencer      // optional: nil disables chat-sequencing
+	Observer            *apicp.Observer            // optional: nil disables API-CP learning
+	Interceptor         *intercept.Manager         // optional: nil disables manual interception
+	ResponseInterceptor *intercept.ResponseManager // optional: nil disables manual response interception
+	TickSync            *ticksync.Buffer           // optional: nil disables tick sync
+	ResponseLogs        *ResponseLogBuffer         // optional: nil disables response-body ring buffer
 }
 
-// ProviderDeadlineFromEnv liest die Provider-Deadline aus ENV.
-// Range: 10-30s, Default: 20s.
-func ProviderDeadlineFromEnv() time.Duration {
-	v := os.Getenv("SENTINEL_CORTEX_PROVIDER_DEADLINE_SECONDS")
+func durationFromEnvSeconds(primaryKey, legacyKey string, minSeconds, maxSeconds int, fallback time.Duration) time.Duration {
+	v := os.Getenv(primaryKey)
+	if v == "" && legacyKey != "" {
+		v = os.Getenv(legacyKey)
+	}
 	if v == "" {
-		return defaultProviderDeadline
+		return fallback
 	}
 	n, err := strconv.Atoi(v)
-	if err != nil || n < 10 || n > 30 {
-		return defaultProviderDeadline
+	if err != nil || n < minSeconds || n > maxSeconds {
+		return fallback
 	}
 	return time.Duration(n) * time.Second
 }
 
+// ProviderDeadlineFromEnv liest das Timeout fuer die echte Provider-Ausfuehrung aus ENV.
+// Neue ENV: SENTINEL_CORTEX_PROVIDER_TIMEOUT_SECONDS
+// Legacy-ENV: SENTINEL_CORTEX_PROVIDER_DEADLINE_SECONDS
+// Range: 15-180s, Default: 60s.
+func ProviderDeadlineFromEnv() time.Duration {
+	return durationFromEnvSeconds(
+		"SENTINEL_CORTEX_PROVIDER_TIMEOUT_SECONDS",
+		"SENTINEL_CORTEX_PROVIDER_DEADLINE_SECONDS",
+		15,
+		180,
+		defaultProviderDeadline,
+	)
+}
+
+// InflightDeadlineFromEnv liest die maximale Gesamtlebensdauer eines Requests in der InFlightMap.
+// Diese Deadline umfasst Queue-Wartezeit und Provider-Ausfuehrung.
+// Range: 30-300s, Default: 180s.
+func InflightDeadlineFromEnv() time.Duration {
+	return durationFromEnvSeconds(
+		"SENTINEL_CORTEX_INFLIGHT_DEADLINE_SECONDS",
+		"",
+		30,
+		300,
+		defaultInflightDeadline,
+	)
+}
+
 // PipelineHandler orchestriert die 7-Step LLM-Pipeline.
 type PipelineHandler struct {
-	registry         *Registry
-	config           *control.Config
-	compiler         *compiler.Compiler
-	norm             *normalizer.Normalizer
-	ext              *extraction.Extractor
-	caps             *capability.ProviderCapabilities
-	logger           *slog.Logger
-	eventStore       *eventstore.Store
-	guardrails       *guardrails.Enforcer
-	inflight         *resilience.InFlightMap
-	providerDeadline time.Duration
-	drift            *judge.DriftDetector
-	quality          *judge.QualityScorer
+	registry            *Registry
+	config              *control.Config
+	compiler            *compiler.Compiler
+	norm                *normalizer.Normalizer
+	ext                 *extraction.Extractor
+	caps                *capability.ProviderCapabilities
+	logger              *slog.Logger
+	eventStore          *eventstore.Store
+	guardrails          *guardrails.Enforcer
+	inflight            *resilience.InFlightMap
+	providerDeadline    time.Duration
+	drift               *judge.DriftDetector
+	quality             *judge.QualityScorer
+	synthesis           *synthesis.Engine
+	sequencer           *sequencing.Sequencer
+	observer            *apicp.Observer
+	interceptor         *intercept.Manager
+	responseInterceptor *intercept.ResponseManager
+	tickSync            *ticksync.Buffer
+	responseLogs        *ResponseLogBuffer
 
 	breakerMu  sync.RWMutex
 	breakers   map[string]*CircuitBreaker
@@ -172,22 +228,29 @@ func NewPipelineHandler(cfg PipelineConfig) *PipelineHandler {
 	}
 
 	return &PipelineHandler{
-		registry:         cfg.Registry,
-		config:           cfg.Config,
-		compiler:         cfg.Compiler,
-		norm:             cfg.Normalizer,
-		ext:              cfg.Extractor,
-		caps:             cfg.Capabilities,
-		logger:           cfg.Logger,
-		eventStore:       cfg.EventStore,
-		guardrails:       cfg.Guardrails,
-		inflight:         cfg.InFlight,
-		providerDeadline: deadline,
-		drift:            cfg.Drift,
-		quality:          cfg.Quality,
-		breakers:         make(map[string]*CircuitBreaker),
-		breakerCfg:       cfg.BreakerCfg,
-		regenCooldown:    make(map[string]time.Time),
+		registry:            cfg.Registry,
+		config:              cfg.Config,
+		compiler:            cfg.Compiler,
+		norm:                cfg.Normalizer,
+		ext:                 cfg.Extractor,
+		caps:                cfg.Capabilities,
+		logger:              cfg.Logger,
+		eventStore:          cfg.EventStore,
+		guardrails:          cfg.Guardrails,
+		inflight:            cfg.InFlight,
+		providerDeadline:    deadline,
+		drift:               cfg.Drift,
+		quality:             cfg.Quality,
+		synthesis:           cfg.Synthesis,
+		sequencer:           cfg.Sequencer,
+		observer:            cfg.Observer,
+		interceptor:         cfg.Interceptor,
+		responseInterceptor: cfg.ResponseInterceptor,
+		tickSync:            cfg.TickSync,
+		responseLogs:        cfg.ResponseLogs,
+		breakers:            make(map[string]*CircuitBreaker),
+		breakerCfg:          cfg.BreakerCfg,
+		regenCooldown:       make(map[string]time.Time),
 	}
 }
 
@@ -272,20 +335,34 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	}
 
 	// --- Step 3: Circuit Breaker (SENTINEL_CORTEX_CB_ENABLED gate, AC-5) ---
+	// IM:1 (operator impulse) Requests bypassen den Circuit Breaker.
+	// Gaia/Broadcast/Encounter MUESSEN durchkommen — der CB schuetzt vor Provider-Ueberlast,
+	// aber Operator-Aktionen haben Vorrang (Enterprise: Operator > Automation).
+	isUrgent := strings.Contains(req.Metadata["synth_fp"], "|IM:1") ||
+		req.Metadata["is_directly_addressed"] == "true" ||
+		req.Metadata["heard"] != ""
 	breaker := ph.getBreaker(providerName)
-	if ph.breakerCfg.Enabled && !breaker.Allow() {
-		// Failover: versuche anderen Provider
-		provider, providerName = ph.failover(providerName)
-		if provider == nil {
-			ph.logger.Warn("all providers circuit-broken")
-			http.Error(w, "service unavailable (circuit breaker open)", http.StatusServiceUnavailable)
-			return
+	if ph.breakerCfg.Enabled && !isUrgent && !breaker.Allow() {
+		ph.logger.Warn("provider circuit-broken", "provider", providerName)
+		ph.updateBreakerGauge(providerName, breaker)
+		if reporter, ok := provider.(ProviderStatusReporter); ok {
+			if err := reporter.CurrentProviderError(); err != nil {
+				var provErr *ProviderError
+				if errors.As(err, &provErr) && provErr.StatusCode > 0 {
+					errMsg := "provider unavailable"
+					switch provErr.StatusCode {
+					case http.StatusTooManyRequests:
+						errMsg = "provider rate limited"
+					case http.StatusServiceUnavailable:
+						errMsg = "provider unavailable"
+					}
+					http.Error(w, errMsg, provErr.StatusCode)
+					return
+				}
+			}
 		}
-		breaker = ph.getBreaker(providerName)
-		if !breaker.Allow() {
-			http.Error(w, "service unavailable (all circuit breakers open)", http.StatusServiceUnavailable)
-			return
-		}
+		http.Error(w, "service unavailable (circuit breaker open)", http.StatusServiceUnavailable)
+		return
 	}
 
 	ph.updateBreakerGauge(providerName, breaker)
@@ -315,9 +392,152 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	agentRole := req.Metadata["agent_role"]
 	ph.injectPerception(&req, agentName, agentRole, providerName, snap)
 
-	// --- Step 6: Provider.Send() mit Deadline ---
-	ctx, cancel := context.WithTimeout(r.Context(), ph.providerDeadline)
-	defer cancel()
+	// --- Step 7.5: Traffic Control — Synthesis Check ---
+	if ph.synthesis != nil && snap.SynthesisEnabled {
+		result := ph.synthesis.Decide(req.Metadata, agentName)
+		if result.Decision == synthesis.Synthesize {
+			content := result.Content
+			if ph.shouldForwardAfterSynthesisFourthWallCheck(r.Context(), content, agentName, agentRole, provider, result.Rule) {
+				// Fall through to normal Provider.Send()
+			} else {
+				content, dropped := ph.applyOutboundInterception(requestID, agentName, "synthesis", &req, content, snap)
+				if dropped {
+					ph.writePipelineResponse(r.Context(), w, &req, PipelineResponse{
+						Content:      "",
+						Model:        "sentinel-synth-v1",
+						Provider:     "intercept",
+						TokensUsed:   0,
+						FinishReason: "dropped",
+						Actions:      nil,
+						RequestID:    requestID,
+					})
+					return
+				}
+
+				if ph.observer != nil && snap.APICPEnabled {
+					ph.observer.MarkSynthesisCandidate()
+				}
+				guardrails.RecordRuntimeSynthesisSavings()
+
+				// For synthesis, rule-provided actions are authoritative because they
+				// can encode deterministic targets that plain text extraction would lose.
+				actions := buildSynthesisActions(result.Actions, ph.ext, content)
+				ph.persistActions(actions, agentName, requestID, &req)
+				duration := time.Since(start)
+				pipelineRequestsTotal.WithLabelValues("synthesis", "ok").Inc()
+				pipelineLatency.WithLabelValues("synthesis").Observe(duration.Seconds())
+				ph.logger.Info("pipeline request completed",
+					"provider", "synthesis",
+					"duration", duration,
+					"tokens", 0,
+					"actions", len(actions),
+					"rule", result.Rule,
+					"agent_id", req.Metadata["agent_id"],
+					"agent_name", agentName,
+				)
+				ph.writePipelineResponse(r.Context(), w, &req, PipelineResponse{
+					Content:      content,
+					Model:        "sentinel-synth-v1",
+					Provider:     "synthesis",
+					TokensUsed:   0,
+					FinishReason: "synthetic",
+					Actions:      actions,
+					RequestID:    requestID,
+				})
+				return
+			}
+		}
+	}
+	if ph.observer != nil && snap.APICPEnabled {
+		fp, ctx, err := synthesis.PrepareInputs(req.Metadata)
+		if err == nil && synthesis.CanSynthesize(fp, ctx) {
+			agentID := req.Metadata["agent_id"]
+			if learned, ok := ph.observer.LearnedPatternFor(agentID, req.Metadata["synth_fp"]); ok {
+				if ph.observer.ShouldProbeNext() {
+					ph.observer.MarkSynthesisCandidate()
+					req.Metadata["apicp_probe_agent_id"] = learned.AgentID
+					req.Metadata["apicp_probe_fingerprint"] = learned.Fingerprint
+					req.Metadata["apicp_probe_expected_hash"] = strconv.FormatUint(learned.TopHash, 10)
+					ph.logger.Info("apicp probe forcing real forward",
+						"agent_id", learned.AgentID,
+						"fingerprint", learned.Fingerprint,
+						"expected_hash", learned.TopHash,
+					)
+				} else {
+					content := learned.Content
+					content, dropped := ph.applyOutboundInterception(requestID, agentName, "apicp", &req, content, snap)
+					if dropped {
+						ph.writePipelineResponse(r.Context(), w, &req, PipelineResponse{
+							Content:      "",
+							Model:        "sentinel-apicp-v1",
+							Provider:     "intercept",
+							TokensUsed:   0,
+							FinishReason: "dropped",
+							Actions:      nil,
+							RequestID:    requestID,
+						})
+						return
+					}
+
+					ph.observer.MarkSynthesisCandidate()
+					guardrails.RecordRuntimeSynthesisSavings()
+					actions := buildSynthesisActions(nil, ph.ext, content)
+					ph.persistActions(actions, agentName, requestID, &req)
+					duration := time.Since(start)
+					pipelineRequestsTotal.WithLabelValues("apicp", "ok").Inc()
+					pipelineLatency.WithLabelValues("apicp").Observe(duration.Seconds())
+					ph.logger.Info("pipeline request completed",
+						"provider", "apicp",
+						"duration", duration,
+						"tokens", 0,
+						"actions", len(actions),
+						"fingerprint", learned.Fingerprint,
+						"agent_id", req.Metadata["agent_id"],
+						"agent_name", agentName,
+					)
+					ph.writePipelineResponse(r.Context(), w, &req, PipelineResponse{
+						Content:      content,
+						Model:        "sentinel-apicp-v1",
+						Provider:     "apicp",
+						TokensUsed:   0,
+						FinishReason: "synthetic",
+						Actions:      actions,
+						RequestID:    requestID,
+					})
+					return
+				}
+			}
+		}
+	}
+
+	// --- Step 7.6: Chat-Sequencing (P1/P3) ---
+	var sequencingRoomID string
+	var sequencingP1Active bool
+	if intercept.Mode(strings.TrimSpace(snap.InterceptMode)) == intercept.ModeManual || (ph.sequencer != nil && snap.SequencingEnabled) {
+		sequencingRoomID = req.Metadata["room_id"]
+		sequencingP1Active = req.Metadata["is_directly_addressed"] == "true" && strings.TrimSpace(req.Metadata["heard"]) != ""
+
+		decision := ph.interceptInboundRequest(&req, requestID, agentName, snap)
+		switch decision.Action {
+		case intercept.RequestModify:
+			if len(req.Messages) > 0 {
+				req.Messages[len(req.Messages)-1].Content += decision.ContextSuffix
+			}
+			ph.logger.Info("request modified before provider send",
+				"request_id", requestID,
+				"reason", decision.Reason,
+			)
+		case intercept.RequestDrop:
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
+	// --- Step 8: Provider.Send() ---
+	// Queue wait must not consume the provider execution deadline. The wrapped
+	// provider applies req.ProviderTimeout only after it has acquired a queue slot.
+	ctx := r.Context()
+	req.ProviderTimeout = ph.providerDeadline
 
 	ph.trackInflight(requestID, req.Metadata)
 
@@ -340,7 +560,21 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 			"duration", duration,
 			"error", err,
 		)
-		http.Error(w, "provider request failed", http.StatusBadGateway)
+		statusCode := http.StatusBadGateway
+		errMsg := "provider request failed"
+		var provErr *ProviderError
+		if errors.As(err, &provErr) {
+			if provErr.StatusCode > 0 {
+				statusCode = provErr.StatusCode
+			}
+			switch provErr.StatusCode {
+			case http.StatusTooManyRequests:
+				errMsg = "provider rate limited"
+			case http.StatusServiceUnavailable:
+				errMsg = "provider unavailable"
+			}
+		}
+		http.Error(w, errMsg, statusCode)
 		return
 	}
 
@@ -362,6 +596,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	if ph.guardrails != nil {
 		ph.guardrails.Record(providerName, resp.InputTokens, resp.OutputTokens)
 	}
+	guardrails.RecordRuntimeForwardCost(providerName, resp.InputTokens, resp.OutputTokens)
 
 	// --- Step 6d: Personality Guard Check ---
 	content := resp.Content
@@ -379,11 +614,55 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		content = ph.fourthWallCheck(ctx, content, agentName, agentRole, provider, &req)
 	}
 
+	content, dropped := ph.applyOutboundInterception(requestID, agentName, providerName, &req, content, snap)
+	if dropped {
+		ph.writePipelineResponse(r.Context(), w, &req, PipelineResponse{
+			Content:      "",
+			Model:        resp.Model,
+			Provider:     "intercept",
+			TokensUsed:   0,
+			FinishReason: "dropped",
+			Actions:      nil,
+			RequestID:    requestID,
+		})
+		return
+	}
+
 	// --- Step 8: Action Extraction ---
 	actions := ph.ext.Extract(content)
 
 	// --- Step 8b: Persist extracted actions as events (AC-5) ---
 	ph.persistActions(actions, agentName, requestID, &req)
+
+	// --- Step 8c: API-CP Observation (record call for learning) ---
+	if ph.observer != nil && snap.APICPEnabled {
+		fp := req.Metadata["synth_fp"]
+		agentID := req.Metadata["agent_id"]
+		if prepFP, prepCtx, err := synthesis.PrepareInputs(req.Metadata); err == nil && synthesis.CanSynthesize(prepFP, prepCtx) {
+			signature := apicp.BuildResponseSignature(actions, req.Metadata["room_id"], content)
+			ph.observer.Record(fp, agentID, content, false, signature)
+		}
+		if ev := req.Metadata["evolution_version"]; ev != "" {
+			ph.observer.CheckEvolutionDegradation(agentID, ev)
+		}
+		if expected := req.Metadata["apicp_probe_expected_hash"]; expected != "" {
+			if expectedHash, err := strconv.ParseUint(expected, 10, 64); err == nil {
+				probeAgent := req.Metadata["apicp_probe_agent_id"]
+				if probeAgent == "" {
+					probeAgent = agentID
+				}
+				probeFingerprint := req.Metadata["apicp_probe_fingerprint"]
+				if probeFingerprint != "" {
+					ph.observer.ApplyProbeResult(probeAgent, probeFingerprint, expectedHash, content)
+				}
+			}
+		}
+	}
+
+	// --- Step 8d: Complete P1 for Chat-Sequencing (unblocks waiting P3s) ---
+	if ph.sequencer != nil && sequencingRoomID != "" && sequencingP1Active {
+		ph.sequencer.CompleteP1(sequencingRoomID, requestID, content)
+	}
 
 	// --- Step 9: Response ---
 	duration := time.Since(start)
@@ -395,6 +674,8 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		"duration", duration,
 		"tokens", resp.TokensUsed,
 		"actions", len(actions),
+		"agent_id", req.Metadata["agent_id"],
+		"agent_name", agentName,
 	)
 
 	pipelineResp := PipelineResponse{
@@ -406,11 +687,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		Actions:      actions,
 		RequestID:    requestID,
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(pipelineResp); err != nil {
-		ph.logger.Error("failed to encode response", "error", err)
-	}
+	ph.writePipelineResponse(r.Context(), w, &req, pipelineResp)
 }
 
 // resolveAgentProvider checks for per-agent provider overrides via Control Plane config.
@@ -435,7 +712,154 @@ func (ph *PipelineHandler) resolveAgentProvider(snap control.ConfigSnapshot, met
 	return primary
 }
 
-// buildSystemPrompt assembles the system prompt via 3-source assembly or fallback.
+func (ph *PipelineHandler) interceptInboundRequest(req *LLMRequest, requestID, agentName string, snap control.ConfigSnapshot) intercept.RequestDecision {
+	roomID := strings.TrimSpace(req.Metadata["room_id"])
+
+	if mode := intercept.Mode(strings.TrimSpace(snap.InterceptMode)); mode == intercept.ModeManual {
+		if ph.interceptor == nil {
+			return intercept.Forward("manual mode unavailable")
+		}
+		waitCtx, cancel := context.WithTimeout(context.Background(), time.Duration(snap.P3TimeoutMs)*time.Millisecond)
+		defer cancel()
+
+		decision, ok := ph.interceptor.AwaitRequestDecision(waitCtx, intercept.PendingRequest{
+			ID:        requestID,
+			RoomID:    roomID,
+			AgentName: agentName,
+			Reason:    "manual_mode",
+			CreatedAt: time.Now(),
+		})
+		if !ok {
+			ph.logger.Warn("manual intercept timed out, forwarding request",
+				"request_id", requestID,
+				"room", roomID,
+			)
+			return intercept.Forward("manual intercept timeout")
+		}
+		return decision
+	}
+
+	if ph.sequencer == nil || !snap.SequencingEnabled {
+		return intercept.Forward("sequencing disabled")
+	}
+	if roomID == "" {
+		return intercept.Forward("missing room_id")
+	}
+
+	hasHeard := strings.TrimSpace(req.Metadata["heard"]) != ""
+	isP1 := strings.EqualFold(strings.TrimSpace(req.Metadata["is_directly_addressed"]), "true")
+	if !hasHeard {
+		return intercept.Forward("no heard context")
+	}
+
+	if isP1 {
+		ph.sequencer.MarkP1Active(roomID, requestID, agentName)
+		return intercept.Forward("p1 immediate forward")
+	}
+	if !ph.sequencer.HasActiveP1(roomID) {
+		return intercept.Forward("no active p1")
+	}
+
+	p1Content, p1Agent, gotP1 := ph.sequencer.WaitForP1(roomID)
+	if !gotP1 || p1Content == "" {
+		return intercept.Forward("p1 timeout")
+	}
+
+	contextMsg := fmt.Sprintf("\n[KONTEXT] %s hat gerade gesagt: \"%s\" [/KONTEXT]",
+		p1Agent, p1Content)
+	return intercept.Modify("p3 inject p1 context", contextMsg)
+}
+
+func (ph *PipelineHandler) applyOutboundInterception(requestID, agentName, providerName string, req *LLMRequest, content string, snap control.ConfigSnapshot) (string, bool) {
+	if intercept.Mode(strings.TrimSpace(snap.InterceptMode)) != intercept.ModeManual || ph.responseInterceptor == nil {
+		return content, false
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Duration(snap.P3TimeoutMs)*time.Millisecond)
+	defer cancel()
+
+	decision, ok := ph.responseInterceptor.AwaitDecision(waitCtx, intercept.PendingResponse{
+		ID:        requestID,
+		RoomID:    strings.TrimSpace(req.Metadata["room_id"]),
+		AgentName: agentName,
+		Provider:  providerName,
+		Content:   content,
+		CreatedAt: time.Now(),
+	})
+	if !ok {
+		ph.logger.Warn("manual response intercept timed out, forwarding response",
+			"request_id", requestID,
+			"provider", providerName,
+		)
+		return content, false
+	}
+
+	switch decision.Action {
+	case intercept.ResponseModify, intercept.ResponseReplace:
+		if decision.Content != "" {
+			return decision.Content, false
+		}
+		return content, false
+	case intercept.ResponseDrop:
+		return "", true
+	default:
+		return content, false
+	}
+}
+
+// buildStructuredPrompt assembles tagged system blocks for providers that support
+// structured Anthropic-style system arrays.
+func (ph *PipelineHandler) buildStructuredPrompt(req *LLMRequest, agentName, agentRole, providerName string, snap control.ConfigSnapshot) []SystemBlock {
+	perception := compiler.StructuredPerception{
+		CircadianText:   req.Metadata["circadian"],
+		BodyText:        req.Metadata["body"],
+		EnvironmentText: req.Metadata["environment"],
+		AcousticText:    req.Metadata["acoustic"],
+		HeardText:       req.Metadata["heard"],
+		PresenceText:    req.Metadata["presence"],
+		ImpulseText:     req.Metadata["impulse"],
+		RoomID:          req.Metadata["room_id"],
+	}
+	agentIDStr := req.Metadata["agent_id"]
+	agentID, parseErr := strconv.Atoi(agentIDStr)
+
+	var compiled compiler.CompiledPrompt
+	if parseErr == nil && agentID > 0 {
+		evolution := compiler.EvolutionFromMetadata(req.Metadata)
+		result, compileErr := ph.compiler.CompileStructuredFromSources(agentID, providerName, evolution, perception)
+		if compileErr != nil {
+			ph.logger.Warn("structured assembly failed, using fallback",
+				"agent_id", agentID,
+				"error", compileErr,
+			)
+			compiled = ph.compiler.CompileStructured(ph.modelKey(providerName), agentName, agentRole, perception)
+		} else {
+			compiled = result
+		}
+	} else {
+		compiled = ph.compiler.CompileStructured(ph.modelKey(providerName), agentName, agentRole, perception)
+	}
+
+	if nudge := snap.NarrativeNudge; nudge != "" {
+		compiled = compiler.AppendNarrativeNudge(compiled, nudge)
+		ph.logger.Debug("structured narrative nudge injected", "agent", agentName)
+	}
+
+	blocks := make([]SystemBlock, 0, len(compiled.SystemBlocks))
+	for _, block := range compiled.SystemBlocks {
+		entry := SystemBlock{
+			Type: "text",
+			Text: block.Text,
+		}
+		if block.CacheControl != nil {
+			entry.CacheControl = &CacheControl{Type: block.CacheControl.Type}
+		}
+		blocks = append(blocks, entry)
+	}
+	return blocks
+}
+
+// buildSystemPrompt assembles the legacy flat system prompt via 3-source assembly or fallback.
 func (ph *PipelineHandler) buildSystemPrompt(req *LLMRequest, agentName, agentRole, providerName string, snap control.ConfigSnapshot) string {
 	perception := req.Metadata["perception"]
 	agentIDStr := req.Metadata["agent_id"]
@@ -504,6 +928,12 @@ func (ph *PipelineHandler) injectPerception(req *LLMRequest, agentName, agentRol
 	if agentName == "" {
 		return
 	}
+	if ph.caps != nil && ph.caps.HasCapability(providerName, capability.CapStructuredSystem) {
+		if blocks := ph.buildStructuredPrompt(req, agentName, agentRole, providerName, snap); len(blocks) > 0 {
+			req.SystemBlocks = blocks
+			return
+		}
+	}
 	if systemPrompt := ph.buildSystemPrompt(req, agentName, agentRole, providerName, snap); systemPrompt != "" {
 		req.Messages = prependSystemMessage(req.Messages, systemPrompt)
 	}
@@ -546,18 +976,35 @@ func (ph *PipelineHandler) resolveProvider(name string) (Provider, string) {
 	return p, p.Name()
 }
 
-// failover versucht einen alternativen Provider zu finden.
-func (ph *PipelineHandler) failover(exclude string) (Provider, string) {
-	for _, name := range ph.registry.List() {
-		if name == exclude {
-			continue
-		}
-		p, ok := ph.registry.Get(name)
-		if ok {
-			return p, name
-		}
+func (ph *PipelineHandler) shouldForwardAfterSynthesisFourthWallCheck(ctx context.Context, content, agentName, agentRole string, provider Provider, rule string) bool {
+	judgeAdapter := NewJudgeProviderAdapter(provider)
+	result, err := detection.HandleFourthWall(ctx, content, agentName, agentRole, judgeAdapter)
+	if err != nil {
+		ph.logger.Warn("synthesis fourth-wall detection error; falling back to provider",
+			"agent", agentName,
+			"rule", rule,
+			"error", err,
+		)
+		return true
 	}
-	return nil, ""
+
+	if result.Clean {
+		ph.logger.Info("synthesis outbound fourth-wall checked",
+			"agent", agentName,
+			"rule", rule,
+			"clean", true,
+			"judge_override", result.JudgeOverride,
+		)
+		return false
+	}
+
+	ph.logger.Warn("synthesis aborted: fourth-wall detected",
+		"agent", agentName,
+		"rule", rule,
+		"pattern", result.Pattern,
+		"judge_override", result.JudgeOverride,
+	)
+	return true
 }
 
 // fourthWallCheck fuehrt die 2-Stage Detection durch und re-generiert bei Bedarf.
@@ -728,10 +1175,60 @@ func (ph *PipelineHandler) persistActions(actions []extraction.ExtractedAction, 
 	}
 }
 
+func (ph *PipelineHandler) writePipelineResponse(_ context.Context, w http.ResponseWriter, req *LLMRequest, resp PipelineResponse) {
+	if ph.responseLogs != nil {
+		ph.responseLogs.Add(resp.RequestID, resp.Provider, resp.Content)
+	}
+
+	if ph.tickSync != nil && ph.tickSync.Enabled() {
+		if tick := parseTick(req.Metadata); tick > 0 {
+			done := ph.tickSync.Hold(
+				uint64(tick),
+				parseAgentID(req.Metadata),
+				parsePriority(req.Metadata),
+				resp.RequestID,
+				resp,
+				w,
+			)
+			if err := <-done; err != nil {
+				ph.logger.Error("tick_sync response write failed", "request_id", resp.RequestID, "error", err)
+			}
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		ph.logger.Error("failed to encode response", "error", err)
+	}
+}
+
+func buildSynthesisActions(actions []synthesis.Action, ext *extraction.Extractor, content string) []extraction.ExtractedAction {
+	if len(actions) == 0 {
+		if ext == nil {
+			return nil
+		}
+		return ext.Extract(content)
+	}
+
+	result := make([]extraction.ExtractedAction, 0, len(actions))
+	for _, action := range actions {
+		result = append(result, extraction.ExtractedAction{
+			Type:    action.Type,
+			Content: action.Content,
+			Target:  action.Target,
+			Emotion: action.Emotion,
+		})
+	}
+	return result
+}
+
 // modelKey mappt Provider-Namen auf Compiler-Config-Keys.
 func (ph *PipelineHandler) modelKey(providerName string) string {
 	switch providerName {
 	case "claude":
+		return "claude"
+	case "anthropic-direct":
 		return "claude"
 	case "ollama":
 		return "ollama-7b"
@@ -766,6 +1263,30 @@ func parseTick(metadata map[string]string) int64 {
 		}
 	}
 	return 0
+}
+
+func parseAgentID(metadata map[string]string) int {
+	if v, ok := metadata["agent_id"]; ok {
+		if id, err := strconv.Atoi(v); err == nil {
+			return id
+		}
+	}
+	return 0
+}
+
+func parsePriority(metadata map[string]string) int {
+	switch strings.ToUpper(strings.TrimSpace(metadata["max_priority"])) {
+	case "P0":
+		return 0
+	case "P1":
+		return 1
+	case "P2":
+		return 2
+	case "P3":
+		return 3
+	default:
+		return 3
+	}
 }
 
 // updateBreakerGauge setzt die Prometheus-Gauge fuer den Breaker-State.

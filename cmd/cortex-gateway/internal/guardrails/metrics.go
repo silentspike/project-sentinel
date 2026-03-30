@@ -16,6 +16,11 @@ var (
 		Help: "Total accumulated cost in USD by provider",
 	}, []string{"provider"})
 
+	synthesisSavingsUSDTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "sentinel_synthesis_savings_usd_total",
+		Help: "Estimated USD saved by synthesis responses versus real forward calls",
+	})
+
 	rateLimitedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "sentinel_rate_limited_total",
 		Help: "Total rate-limited requests by agent and reason",

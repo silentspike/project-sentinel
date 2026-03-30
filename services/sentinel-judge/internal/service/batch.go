@@ -75,7 +75,7 @@ func (bh *BatchHandler) Analyze(ctx context.Context, req BatchRequest) (*BatchRe
 	if typesSet["drift"] {
 		result := bh.drift.CheckDrift(req.AgentID, req.Messages)
 		resp.Drift = &result
-		if severityAtLeast(result.Severity, bh.cfg.Thresholds.DriftAlertSeverity) {
+		if bh.cfg.Thresholds.DriftAlertSeverity != "none" && severityAtLeast(result.Severity, bh.cfg.Thresholds.DriftAlertSeverity) {
 			resp.Alerts = append(resp.Alerts, "drift: "+result.Severity)
 		}
 	}

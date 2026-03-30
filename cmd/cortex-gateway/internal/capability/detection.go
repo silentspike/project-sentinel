@@ -6,15 +6,16 @@ import "sync"
 type Capability string
 
 const (
-	CapStreaming    Capability = "streaming"
-	CapToolUse      Capability = "tool_use"
-	CapVision       Capability = "vision"
-	CapSystemPrompt Capability = "system_prompt"
-	CapJSONMode     Capability = "json_mode"
-	CapFunctionCall Capability = "function_calling"
-	CapCaching      Capability = "caching"
-	CapPredictedOut Capability = "predicted_output"
-	CapKVRetention  Capability = "kv_retention"
+	CapStreaming        Capability = "streaming"
+	CapToolUse          Capability = "tool_use"
+	CapVision           Capability = "vision"
+	CapSystemPrompt     Capability = "system_prompt"
+	CapJSONMode         Capability = "json_mode"
+	CapFunctionCall     Capability = "function_calling"
+	CapCaching          Capability = "caching"
+	CapPredictedOut     Capability = "predicted_output"
+	CapKVRetention      Capability = "kv_retention"
+	CapStructuredSystem Capability = "structured_system_blocks"
 )
 
 // ProviderCapabilities maps providers to their supported capabilities.
@@ -28,15 +29,28 @@ func New() *ProviderCapabilities {
 	return &ProviderCapabilities{
 		capabilities: map[string]map[Capability]bool{
 			"claude": {
-				CapStreaming:    true,
-				CapToolUse:      true,
-				CapVision:       true,
-				CapSystemPrompt: true,
-				CapJSONMode:     true,
-				CapFunctionCall: true,
-				CapCaching:      true,
-				CapPredictedOut: false,
-				CapKVRetention:  false,
+				CapStreaming:        true,
+				CapToolUse:          true,
+				CapVision:           true,
+				CapSystemPrompt:     true,
+				CapJSONMode:         true,
+				CapFunctionCall:     true,
+				CapCaching:          true,
+				CapPredictedOut:     false,
+				CapKVRetention:      false,
+				CapStructuredSystem: true,
+			},
+			"anthropic-direct": {
+				CapStreaming:        true,
+				CapToolUse:          true,
+				CapVision:           true,
+				CapSystemPrompt:     true,
+				CapJSONMode:         true,
+				CapFunctionCall:     true,
+				CapCaching:          true,
+				CapPredictedOut:     false,
+				CapKVRetention:      false,
+				CapStructuredSystem: true,
 			},
 			"openai": {
 				CapStreaming:    true,
@@ -50,26 +64,28 @@ func New() *ProviderCapabilities {
 				CapKVRetention:  false,
 			},
 			"claude-code": {
-				CapStreaming:    true,
-				CapToolUse:      true,
-				CapVision:       true,
-				CapSystemPrompt: true,
-				CapJSONMode:     true,
-				CapFunctionCall: true,
-				CapCaching:      false,
-				CapPredictedOut: false,
-				CapKVRetention:  false,
+				CapStreaming:        true,
+				CapToolUse:          true,
+				CapVision:           true,
+				CapSystemPrompt:     true,
+				CapJSONMode:         true,
+				CapFunctionCall:     true,
+				CapCaching:          false,
+				CapPredictedOut:     false,
+				CapKVRetention:      false,
+				CapStructuredSystem: false,
 			},
 			"ollama": {
-				CapStreaming:    true,
-				CapToolUse:      false,
-				CapVision:       false,
-				CapSystemPrompt: true,
-				CapJSONMode:     false,
-				CapFunctionCall: false,
-				CapCaching:      false,
-				CapPredictedOut: false,
-				CapKVRetention:  true,
+				CapStreaming:        true,
+				CapToolUse:          false,
+				CapVision:           false,
+				CapSystemPrompt:     true,
+				CapJSONMode:         false,
+				CapFunctionCall:     false,
+				CapCaching:          false,
+				CapPredictedOut:     false,
+				CapKVRetention:      true,
+				CapStructuredSystem: false,
 			},
 		},
 	}
@@ -108,6 +124,8 @@ func (pc *ProviderCapabilities) GetFallback(provider string, cap Capability) str
 		return "prepend system instructions to first user message"
 	case CapCaching:
 		return "no prefix caching available, send full prompt each request"
+	case CapStructuredSystem:
+		return "flatten structured system blocks into a single system prompt"
 	case CapPredictedOut:
 		return "no predicted output, use standard completion"
 	case CapKVRetention:

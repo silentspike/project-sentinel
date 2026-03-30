@@ -1,0 +1,47 @@
+[Unit]
+Description=Sentinel Cortex Gateway — LLM Pipeline + Synthesis Engine
+Documentation=https://github.com/silentspike/project-sentinel/issues/288
+After=network-online.target sentinel-daemon.service
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sentinel
+ExecStartPre=/bin/sh -c 'fuser -k 8080/tcp 2>/dev/null || true'
+ExecStart=/opt/sentinel/bin/cortex-gateway
+Restart=on-failure
+RestartSec=5
+MemoryMax=2G
+OOMScoreAdjust=-900
+
+Environment=CORTEX_PRIMARY_PROVIDER=claude-code
+Environment=CLAUDE_CODE_BINARY=/usr/bin/claude
+Environment=CLAUDE_CODE_MODEL=claude-opus-4-6
+Environment=SENTINEL_CORTEX_EVENT_STORE_PATH=/opt/sentinel/data/events.db
+Environment=SENTINEL_CORTEX_CB_FAILURE_THRESHOLD=15
+Environment=SENTINEL_CORTEX_CB_WINDOW_SECONDS=60
+Environment=SENTINEL_CORTEX_CB_OPEN_SECONDS=15
+Environment=SENTINEL_CORTEX_CB_HALFOPEN_PROBES=2
+Environment=SENTINEL_CORTEX_PROVIDER_TIMEOUT_SECONDS=60
+Environment=SENTINEL_CORTEX_INFLIGHT_DEADLINE_SECONDS=180
+Environment=SENTINEL_SYNTHESIS_ENABLED=1
+Environment=SENTINEL_SEQUENCING_ENABLED=1
+Environment=SENTINEL_TICK_SYNC_ENABLED=1
+Environment=SENTINEL_APICP_ENABLED=1
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-gateway
+
+User=ubuntu
+Group=ubuntu
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/sentinel/data
+PrivateTmp=true
+
+[Install]
+WantedBy=sentinel.target
