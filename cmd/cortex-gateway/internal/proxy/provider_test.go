@@ -199,6 +199,90 @@ func TestNewProviderFromConfig_AnthropicDirect(t *testing.T) {
 	}
 }
 
+func TestClaudeProviderSendUsesPassthroughHeaders(t *testing.T) {
+	t.Helper()
+
+	type capturedRequest struct {
+		Authorization    string
+		APIKey           string
+		AnthropicVersion string
+		AnthropicBeta    string
+		SystemCount      int
+	}
+
+	captured := capturedRequest{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+
+		captured.Authorization = r.Header.Get("Authorization")
+		captured.APIKey = r.Header.Get("x-api-key")
+		captured.AnthropicVersion = r.Header.Get("anthropic-version")
+		captured.AnthropicBeta = r.Header.Get("anthropic-beta")
+
+		var reqBody map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if system, ok := reqBody["system"].([]any); ok {
+			captured.SystemCount = len(system)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"content": []map[string]string{{"type": "text", "text": "ok"}},
+			"model":   "claude-opus-4-6",
+			"usage": map[string]int{
+				"input_tokens":  11,
+				"output_tokens": 7,
+			},
+			"stop_reason": "end_turn",
+		})
+	}))
+	defer server.Close()
+
+	provider := NewAnthropicDirectProvider(ProviderConfig{
+		Name:    "anthropic-direct",
+		Type:    "anthropic-direct",
+		BaseURL: server.URL,
+		APIKey:  "configured-key",
+		Model:   "claude-opus-4-6",
+	})
+
+	resp, err := provider.Send(context.Background(), &LLMRequest{
+		Model: "claude-opus-4-6",
+		SystemBlocks: []SystemBlock{
+			{Type: "text", Text: "<agent-identity>...</agent-identity>"},
+		},
+		Messages: []Message{{Role: "user", Content: "Hallo"}},
+		PassthroughHeaders: map[string]string{
+			"authorization":     "Bearer passthrough-token",
+			"anthropic-version": "2023-06-01",
+			"anthropic-beta":    "prompt-caching-2024-07-31",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if resp.Content != "ok" {
+		t.Fatalf("response content = %q, want ok", resp.Content)
+	}
+	if captured.Authorization != "Bearer passthrough-token" {
+		t.Fatalf("Authorization = %q", captured.Authorization)
+	}
+	if captured.APIKey != "" {
+		t.Fatalf("x-api-key = %q, want empty when Authorization is passed through", captured.APIKey)
+	}
+	if captured.AnthropicVersion != "2023-06-01" {
+		t.Fatalf("anthropic-version = %q", captured.AnthropicVersion)
+	}
+	if captured.AnthropicBeta != "prompt-caching-2024-07-31" {
+		t.Fatalf("anthropic-beta = %q", captured.AnthropicBeta)
+	}
+	if captured.SystemCount != 1 {
+		t.Fatalf("system block count = %d, want 1", captured.SystemCount)
+	}
+}
+
 func TestNewProviderFromConfig_Ollama(t *testing.T) {
 	cfg := ProviderConfig{
 		Name:    "test-ollama",

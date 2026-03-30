@@ -180,6 +180,103 @@ func TestPipelineStructuredSystemBlocksForAnthropicDirect(t *testing.T) {
 	}
 }
 
+func TestPipelineAnthropicMessagesPassthrough(t *testing.T) {
+	reg := NewRegistry()
+	internal := &pipelineMockProvider{
+		name: "claude-code",
+		resp: &LLMResponse{
+			Content:      "{\"action_type\":\"THINK\",\"target\":\"\",\"content\":\"wrong provider\"}",
+			Model:        "claude-opus-4-6",
+			TokensUsed:   3,
+			FinishReason: "end_turn",
+		},
+	}
+	direct := &pipelineMockProvider{
+		name: "anthropic-direct",
+		resp: &LLMResponse{
+			Content:      "Hallo aus Anthropic",
+			Model:        "claude-opus-4-6",
+			TokensUsed:   42,
+			InputTokens:  30,
+			OutputTokens: 12,
+			FinishReason: "end_turn",
+		},
+	}
+	reg.Register("claude-code", internal)
+	reg.Register("anthropic-direct", direct)
+
+	cfg := control.NewConfig("claude-code")
+	ph := newTestPipelineHandler(reg, cfg)
+
+	body := `{
+		"model":"claude-opus-4-6",
+		"max_tokens":128,
+		"system":[{"type":"text","text":"<agent-identity>Test</agent-identity>","cache_control":{"type":"ephemeral"}}],
+		"messages":[{"role":"user","content":[{"type":"text","text":"Sag hallo"}]}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer passthrough-token")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	ph.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if internal.calls != 0 {
+		t.Fatalf("claude-code calls = %d, want 0", internal.calls)
+	}
+	if direct.calls != 1 {
+		t.Fatalf("anthropic-direct calls = %d, want 1", direct.calls)
+	}
+	if direct.lastReq == nil {
+		t.Fatal("expected forwarded request")
+	}
+	if direct.lastReq.Format != RequestFormatAnthropic {
+		t.Fatalf("request format = %q", direct.lastReq.Format)
+	}
+	if direct.lastReq.PreferredProvider != "anthropic-direct" {
+		t.Fatalf("preferred provider = %q", direct.lastReq.PreferredProvider)
+	}
+	if got := direct.lastReq.PassthroughHeaders["authorization"]; got != "Bearer passthrough-token" {
+		t.Fatalf("authorization passthrough = %q", got)
+	}
+	if len(direct.lastReq.SystemBlocks) != 1 {
+		t.Fatalf("system blocks = %d, want 1", len(direct.lastReq.SystemBlocks))
+	}
+	if len(direct.lastReq.Messages) != 1 || direct.lastReq.Messages[0].Content != "Sag hallo" {
+		t.Fatalf("forwarded messages = %+v", direct.lastReq.Messages)
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["type"] != "message" {
+		t.Fatalf("response type = %#v", resp["type"])
+	}
+	if resp["role"] != "assistant" {
+		t.Fatalf("response role = %#v", resp["role"])
+	}
+	content, ok := resp["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("response content = %#v", resp["content"])
+	}
+	block, ok := content[0].(map[string]any)
+	if !ok || block["text"] != "Hallo aus Anthropic" {
+		t.Fatalf("response content block = %#v", content[0])
+	}
+	usage, ok := resp["usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("response usage = %#v", resp["usage"])
+	}
+	if usage["input_tokens"] != float64(30) || usage["output_tokens"] != float64(12) {
+		t.Fatalf("usage = %#v", usage)
+	}
+}
+
 func TestPipelineSynthesisUsesRuleActions(t *testing.T) {
 	reg := NewRegistry()
 	mock := &pipelineMockProvider{
@@ -833,6 +930,7 @@ func TestSynthesisFourthWallCheckFallsBackToForward(t *testing.T) {
 		"AGENT-12",
 		"Developer",
 		mock,
+		nil,
 		"test_rule",
 	)
 	if !shouldForward {
@@ -858,6 +956,7 @@ INHALT: Ich habe Hunger und gehe in die Kueche.`,
 		"AGENT-12",
 		"Developer",
 		mock,
+		nil,
 		"bio_hunger",
 	)
 	if shouldForward {
@@ -1333,7 +1432,7 @@ func TestJudgeProviderAdapter(t *testing.T) {
 		resp: &LLMResponse{Content: "judge says: clean", Model: "m", TokensUsed: 1},
 	}
 
-	adapter := NewJudgeProviderAdapter(mock)
+	adapter := NewJudgeProviderAdapter(mock, nil)
 
 	result, err := adapter.Send(context.Background(), "Is this a fourth wall break?", 0.3, 256)
 	if err != nil {
