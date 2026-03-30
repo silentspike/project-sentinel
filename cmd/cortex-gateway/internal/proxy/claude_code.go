@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,7 +25,11 @@ const (
 
 	// claudeCodeHealthTimeout is the timeout for health checks.
 	claudeCodeHealthTimeout = 10 * time.Second
+
+	defaultClaudeCodeLimitCooldown = 15 * time.Minute
 )
+
+var claudeCodeResetTimeRE = regexp.MustCompile(`(?i)resets\s+([0-9]{1,2})(?::([0-9]{2}))?\s*(am|pm)\s+\(utc\)`)
 
 // claudeCodeUsage holds token usage from claude CLI result events.
 type claudeCodeUsage struct {
@@ -64,12 +71,20 @@ type claudeCodeAssistantMsg struct {
 // It runs `claude -p --output-format stream-json` and communicates via NDJSON
 // on stdin/stdout. Authentication is handled by the claude binary itself
 // (OAuth token stored in ~/.claude/, no API key required).
+// maxConcurrentClaude limits parallel claude subprocess spawns to prevent OOM.
+// Each subprocess uses ~60-100 MB, systemd MemoryMax is 1 GB.
+const maxConcurrentClaude = 3
+
 type ClaudeCodeProvider struct {
-	mu     sync.Mutex
 	name   string
 	model  string
 	binary string
 	logger *slog.Logger
+	sem    chan struct{} // counting semaphore (buffered channel)
+
+	cooldownMu    sync.RWMutex
+	cooldownUntil time.Time
+	cooldownMsg   string
 }
 
 // NewClaudeCodeProvider creates a new Claude Code subprocess provider.
@@ -90,6 +105,7 @@ func NewClaudeCodeProvider(cfg ProviderConfig, logger *slog.Logger) *ClaudeCodeP
 		model:  model,
 		binary: binary,
 		logger: logger,
+		sem:    make(chan struct{}, maxConcurrentClaude),
 	}
 }
 
@@ -102,16 +118,32 @@ func (p *ClaudeCodeProvider) Name() string {
 // Each call runs: claude -p --output-format stream-json --model <model>
 // The prompt is piped via stdin, and the response is read from stdout as NDJSON.
 func (p *ClaudeCodeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMResponse, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	if err := p.cooldownError(); err != nil {
+		return nil, err
+	}
+
+	if req != nil && req.ProviderTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, req.ProviderTimeout)
+		defer cancel()
+	}
+
+	// Acquire semaphore slot (respects context deadline)
+	select {
+	case p.sem <- struct{}{}:
+		defer func() { <-p.sem }()
+	case <-ctx.Done():
+		return nil, fmt.Errorf("claude-code semaphore wait: %w", ctx.Err())
+	}
 
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
 	}
 
-	// Split messages into system prompt and user prompt
-	systemPrompt, userPrompt := splitMessages(req.Messages)
+	// Claude Code only accepts a single --system-prompt string, so any structured
+	// blocks have to be flattened deterministically for the legacy subprocess path.
+	systemPrompt, userPrompt := splitRequest(req)
 
 	// Spawn subprocess per request
 	args := []string{
@@ -163,9 +195,15 @@ func (p *ClaudeCodeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRes
 	<-stderrDone
 
 	if err != nil {
+		if limitErr := p.limitCooldownError(err.Error(), stderrBuf.String()); limitErr != nil {
+			return nil, limitErr
+		}
 		return nil, fmt.Errorf("claude-code parse response: %w (stderr: %s)", err, stderrBuf.String())
 	}
 	if waitErr != nil {
+		if limitErr := p.limitCooldownError(waitErr.Error(), stderrBuf.String()); limitErr != nil {
+			return nil, limitErr
+		}
 		// If we already got a response, the exit code might be non-zero but the response is valid
 		if response != nil && response.Content != "" {
 			p.logger.Warn("claude-code exited with error but response received", "error", waitErr)
@@ -175,6 +213,9 @@ func (p *ClaudeCodeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRes
 	}
 
 	if response == nil {
+		if limitErr := p.limitCooldownError(stderrBuf.String()); limitErr != nil {
+			return nil, limitErr
+		}
 		return nil, fmt.Errorf("claude-code: no response received (stderr: %s)", stderrBuf.String())
 	}
 
@@ -279,6 +320,113 @@ func (p *ClaudeCodeProvider) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
+// CurrentProviderError exposes an active provider-side cooldown without
+// spawning a new claude subprocess.
+func (p *ClaudeCodeProvider) CurrentProviderError() error {
+	return p.cooldownError()
+}
+
+func (p *ClaudeCodeProvider) cooldownError() error {
+	now := time.Now().UTC()
+
+	p.cooldownMu.Lock()
+	defer p.cooldownMu.Unlock()
+
+	if p.cooldownUntil.IsZero() {
+		return nil
+	}
+	if !now.Before(p.cooldownUntil) {
+		p.cooldownUntil = time.Time{}
+		p.cooldownMsg = ""
+		return nil
+	}
+
+	msg := strings.TrimSpace(p.cooldownMsg)
+	if msg == "" {
+		msg = "claude-code subscription limit active"
+	}
+	return &ProviderError{
+		StatusCode: http.StatusTooManyRequests,
+		Message:    fmt.Sprintf("%s until %s", msg, p.cooldownUntil.Format(time.RFC3339)),
+	}
+}
+
+func (p *ClaudeCodeProvider) limitCooldownError(parts ...string) error {
+	text := strings.TrimSpace(strings.Join(parts, "\n"))
+	if text == "" {
+		return nil
+	}
+
+	msg, until, ok := detectClaudeCodeLimit(text, time.Now().UTC())
+	if !ok {
+		return nil
+	}
+
+	p.cooldownMu.Lock()
+	if until.After(p.cooldownUntil) {
+		p.cooldownUntil = until
+		p.cooldownMsg = msg
+	}
+	activeUntil := p.cooldownUntil
+	activeMsg := p.cooldownMsg
+	p.cooldownMu.Unlock()
+
+	p.logger.Warn("claude-code subscription limit detected",
+		"until", activeUntil.Format(time.RFC3339),
+		"message", activeMsg,
+	)
+
+	return &ProviderError{
+		StatusCode: http.StatusTooManyRequests,
+		Message:    fmt.Sprintf("%s until %s", activeMsg, activeUntil.Format(time.RFC3339)),
+	}
+}
+
+func detectClaudeCodeLimit(text string, now time.Time) (string, time.Time, bool) {
+	if !strings.Contains(strings.ToLower(text), "hit your limit") {
+		return "", time.Time{}, false
+	}
+
+	msg := "claude-code subscription limit active"
+	lines := strings.Split(text, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.Contains(strings.ToLower(line), "hit your limit") {
+			msg = line
+			break
+		}
+	}
+
+	if matches := claudeCodeResetTimeRE.FindStringSubmatch(text); len(matches) == 4 {
+		hour, err := strconv.Atoi(matches[1])
+		if err != nil {
+			return msg, time.Time{}, false
+		}
+		minute := 0
+		if matches[2] != "" {
+			minute, err = strconv.Atoi(matches[2])
+			if err != nil {
+				return msg, time.Time{}, false
+			}
+		}
+		meridiem := strings.ToLower(matches[3])
+		if meridiem == "pm" && hour != 12 {
+			hour += 12
+		}
+		if meridiem == "am" && hour == 12 {
+			hour = 0
+		}
+
+		reset := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, time.UTC)
+		if !reset.After(now) {
+			reset = reset.Add(24 * time.Hour)
+		}
+		return msg, reset, true
+	}
+
+	return msg, now.Add(defaultClaudeCodeLimitCooldown), true
+}
+
 // splitMessages separates messages into a system prompt (passed via --system-prompt
 // to override Claude Code's default coding assistant persona) and a user prompt
 // (passed via -p). System messages become the system prompt; user/assistant
@@ -302,6 +450,32 @@ func splitMessages(messages []Message) (systemPrompt, userPrompt string) {
 	userPrompt = strings.Join(userParts, "\n\n")
 
 	// If no user messages, use system prompt as user prompt (single-message case)
+	if userPrompt == "" && systemPrompt != "" {
+		userPrompt = systemPrompt
+		systemPrompt = ""
+	}
+
+	return systemPrompt, userPrompt
+}
+
+func splitRequest(req *LLMRequest) (systemPrompt, userPrompt string) {
+	legacySystemPrompt, userPrompt := splitMessages(req.Messages)
+
+	var systemParts []string
+	for _, block := range req.SystemBlocks {
+		if strings.TrimSpace(block.Text) == "" {
+			continue
+		}
+		systemParts = append(systemParts, block.Text)
+	}
+	if legacySystemPrompt != "" {
+		systemParts = append(systemParts, legacySystemPrompt)
+	}
+
+	systemPrompt = strings.Join(systemParts, "\n\n")
+
+	// Claude Code requires a -p payload. Preserve the previous single-message
+	// fallback semantics when we only have system-level instructions.
 	if userPrompt == "" && systemPrompt != "" {
 		userPrompt = systemPrompt
 		systemPrompt = ""

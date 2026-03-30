@@ -1,7 +1,11 @@
 //! redb ACID KV-store for hot agent state and relationships.
 
+use std::collections::HashMap;
+
+use anyhow::Context;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use sentinel_common::{AgentId, RoomId};
+use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 /// Histogram bucket boundaries for redb operation latencies (microseconds).
@@ -26,6 +30,37 @@ const AGENT_FACTS: TableDefinition<u16, &[u8]> = TableDefinition::new("agent_fac
 
 // Simulation metadata (sim_hour persistence, time virtualization)
 const SIM_META: TableDefinition<&str, &[u8]> = TableDefinition::new("sim_meta");
+const API_PATTERNS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_patterns");
+const API_PATTERNS_LEGACY_SNAPSHOT_KEY: &str = "snapshot";
+const API_PATTERNS_META_SYNTH_COUNT_KEY: &str = "meta:synth_count";
+const API_PATTERNS_META_EVOLUTION_PREFIX: &str = "meta:evolution:";
+const API_PATTERNS_PATTERN_PREFIX: &str = "pattern:";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ApiCpPatternSnapshot {
+    pub agent_id: String,
+    pub fingerprint: String,
+    pub count: usize,
+    #[serde(default)]
+    pub response_hashes: HashMap<u64, usize>,
+    pub top_hash: u64,
+    #[serde(default)]
+    pub top_content: String,
+    pub confidence: f64,
+    pub last_seen: String,
+    #[serde(default)]
+    pub promoted: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ApiCpSnapshot {
+    #[serde(default)]
+    pub patterns: Vec<ApiCpPatternSnapshot>,
+    #[serde(default)]
+    pub synth_count: i64,
+    #[serde(default)]
+    pub last_evolution_versions: HashMap<String, String>,
+}
 
 pub struct StateStore {
     db: Database,
@@ -53,6 +88,7 @@ impl StateStore {
             write_txn.open_table(NMDA_SCORES)?;
             write_txn.open_table(AGENT_FACTS)?;
             write_txn.open_table(SIM_META)?;
+            write_txn.open_table(API_PATTERNS)?;
         }
         write_txn.commit()?;
 
@@ -515,6 +551,139 @@ impl StateStore {
         Ok(())
     }
 
+    // === API-CP PATTERNS ===
+
+    /// Get the persisted API-CP snapshot JSON payload.
+    ///
+    /// Storage is structured per-pattern/per-meta entry inside `API_PATTERNS`.
+    /// The JSON blob remains the transport shape for the gateway sync API.
+    pub fn get_api_patterns_snapshot(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        let snapshot = self.load_api_patterns_state()?;
+        if snapshot.patterns.is_empty()
+            && snapshot.synth_count == 0
+            && snapshot.last_evolution_versions.is_empty()
+        {
+            return Ok(None);
+        }
+        let data = serde_json::to_vec(&snapshot).context("API-CP Snapshot serialisieren")?;
+        Ok(Some(data))
+    }
+
+    /// Persist the full API-CP snapshot JSON payload into structured `API_PATTERNS`
+    /// entries instead of a single opaque blob.
+    pub fn set_api_patterns_snapshot(&self, data: &[u8]) -> anyhow::Result<()> {
+        let snapshot: ApiCpSnapshot =
+            serde_json::from_slice(data).context("API-CP Snapshot deserialisieren")?;
+        self.replace_api_patterns_state(&snapshot)
+    }
+
+    /// Load the daemon-owned API-CP state from structured `API_PATTERNS` keys.
+    ///
+    /// Falls back to the legacy `"snapshot"` blob if a deployment has not yet
+    /// been rewritten to structured storage.
+    pub fn load_api_patterns_state(&self) -> anyhow::Result<ApiCpSnapshot> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(API_PATTERNS)?;
+        let mut snapshot = ApiCpSnapshot::default();
+        let mut saw_structured_entries = false;
+        let mut legacy_snapshot: Option<Vec<u8>> = None;
+
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let key = key.value();
+            let value = value.value();
+            match key {
+                API_PATTERNS_LEGACY_SNAPSHOT_KEY => {
+                    legacy_snapshot = Some(value.to_vec());
+                }
+                API_PATTERNS_META_SYNTH_COUNT_KEY => {
+                    snapshot.synth_count = serde_json::from_slice(value)
+                        .context("API-CP synth_count deserialisieren")?;
+                    saw_structured_entries = true;
+                }
+                _ if key.starts_with(API_PATTERNS_META_EVOLUTION_PREFIX) => {
+                    let agent_id = key
+                        .trim_start_matches(API_PATTERNS_META_EVOLUTION_PREFIX)
+                        .to_string();
+                    let version = String::from_utf8(value.to_vec())
+                        .context("API-CP evolution version ist nicht UTF-8")?;
+                    snapshot.last_evolution_versions.insert(agent_id, version);
+                    saw_structured_entries = true;
+                }
+                _ if key.starts_with(API_PATTERNS_PATTERN_PREFIX) => {
+                    let pattern: ApiCpPatternSnapshot =
+                        serde_json::from_slice(value).context("API-CP Pattern deserialisieren")?;
+                    snapshot.patterns.push(pattern);
+                    saw_structured_entries = true;
+                }
+                _ => {}
+            }
+        }
+
+        if saw_structured_entries {
+            snapshot.patterns.sort_by(|a, b| {
+                if a.agent_id == b.agent_id {
+                    a.fingerprint.cmp(&b.fingerprint)
+                } else {
+                    a.agent_id.cmp(&b.agent_id)
+                }
+            });
+            return Ok(snapshot);
+        }
+
+        match legacy_snapshot {
+            Some(data) => {
+                serde_json::from_slice(&data).context("Legacy API-CP Snapshot deserialisieren")
+            }
+            None => Ok(ApiCpSnapshot::default()),
+        }
+    }
+
+    /// Replace the full structured API-CP state atomically.
+    pub fn replace_api_patterns_state(&self, snapshot: &ApiCpSnapshot) -> anyhow::Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(API_PATTERNS)?;
+            let keys: Vec<String> = table
+                .iter()?
+                .filter_map(|entry| entry.ok().map(|(k, _)| k.value().to_string()))
+                .collect();
+            for key in &keys {
+                table.remove(key.as_str())?;
+            }
+
+            if snapshot.synth_count != 0 {
+                let data = serde_json::to_vec(&snapshot.synth_count)
+                    .context("API-CP synth_count serialisieren")?;
+                table.insert(API_PATTERNS_META_SYNTH_COUNT_KEY, data.as_slice())?;
+            }
+
+            let mut evolution_entries: Vec<_> = snapshot.last_evolution_versions.iter().collect();
+            evolution_entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (agent_id, version) in evolution_entries {
+                let key = format!("{API_PATTERNS_META_EVOLUTION_PREFIX}{agent_id}");
+                table.insert(key.as_str(), version.as_bytes())?;
+            }
+
+            let mut patterns = snapshot.patterns.clone();
+            patterns.sort_by(|a, b| {
+                if a.agent_id == b.agent_id {
+                    a.fingerprint.cmp(&b.fingerprint)
+                } else {
+                    a.agent_id.cmp(&b.agent_id)
+                }
+            });
+            for pattern in patterns {
+                let key = api_pattern_key(&pattern.agent_id, &pattern.fingerprint)
+                    .context("API-CP Pattern-Key serialisieren")?;
+                let data = serde_json::to_vec(&pattern).context("API-CP Pattern serialisieren")?;
+                table.insert(key.as_str(), data.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     /// Dumpt alle 11 Tables in einer Read-Transaktion.
     pub fn dump_all_tables(&self) -> anyhow::Result<sentinel_common::RedbDump> {
         let txn = self.db.begin_read()?;
@@ -530,6 +699,7 @@ impl StateStore {
             nmda_scores: Self::dump_u16_bytes(&txn, NMDA_SCORES)?,
             agent_facts: Self::dump_u16_bytes(&txn, AGENT_FACTS)?,
             sim_meta: Self::dump_str_bytes(&txn, SIM_META)?,
+            api_patterns: Self::dump_str_bytes(&txn, API_PATTERNS)?,
         })
     }
 
@@ -548,6 +718,7 @@ impl StateStore {
             Self::restore_u16_bytes(&txn, NMDA_SCORES, &dump.nmda_scores)?;
             Self::restore_u16_bytes(&txn, AGENT_FACTS, &dump.agent_facts)?;
             Self::restore_str_bytes(&txn, SIM_META, &dump.sim_meta)?;
+            Self::restore_str_bytes(&txn, API_PATTERNS, &dump.api_patterns)?;
         }
         txn.commit()?;
         Ok(())
@@ -693,6 +864,11 @@ pub fn relationship_key(a: AgentId, b: AgentId) -> u32 {
     let min = a.0.min(b.0);
     let max = a.0.max(b.0);
     (min as u32) << 16 | max as u32
+}
+
+fn api_pattern_key(agent_id: &str, fingerprint: &str) -> anyhow::Result<String> {
+    let suffix = serde_json::to_string(&(agent_id, fingerprint))?;
+    Ok(format!("{API_PATTERNS_PATTERN_PREFIX}{suffix}"))
 }
 
 #[cfg(test)]
@@ -959,6 +1135,100 @@ mod tests {
         );
         // behavioral_notes was None — should remain empty
         assert!(store.get_behavioral_notes(agent(8)).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_api_patterns_snapshot_crud() {
+        let (store, _dir) = temp_store();
+        assert!(store.get_api_patterns_snapshot().unwrap().is_none());
+
+        let snapshot = ApiCpSnapshot {
+            patterns: vec![ApiCpPatternSnapshot {
+                agent_id: "AGENT-01".to_string(),
+                fingerprint: "fp1".to_string(),
+                count: 3,
+                response_hashes: HashMap::from([(42_u64, 3_usize)]),
+                top_hash: 42,
+                top_content: "ok".to_string(),
+                confidence: 1.0,
+                last_seen: "2026-03-29T12:00:00Z".to_string(),
+                promoted: true,
+            }],
+            synth_count: 7,
+            last_evolution_versions: HashMap::from([("AGENT-01".to_string(), "v2".to_string())]),
+        };
+        let data = serde_json::to_vec(&snapshot).unwrap();
+        store.set_api_patterns_snapshot(&data).unwrap();
+
+        let data = store.get_api_patterns_snapshot().unwrap().unwrap();
+        let restored: ApiCpSnapshot = serde_json::from_slice(&data).unwrap();
+        assert_eq!(restored, snapshot);
+
+        let dump = store.dump_all_tables().unwrap();
+        assert!(dump.api_patterns.len() >= 3);
+        assert!(dump
+            .api_patterns
+            .iter()
+            .all(|(key, _)| key != API_PATTERNS_LEGACY_SNAPSHOT_KEY));
+    }
+
+    #[test]
+    fn test_dump_restore_includes_api_patterns() {
+        let (store, _dir) = temp_store();
+        let snapshot = ApiCpSnapshot {
+            patterns: vec![ApiCpPatternSnapshot {
+                agent_id: "AGENT-02".to_string(),
+                fingerprint: "fp1".to_string(),
+                count: 50,
+                response_hashes: HashMap::from([(7_u64, 50_usize)]),
+                top_hash: 7,
+                top_content: "same".to_string(),
+                confidence: 1.0,
+                last_seen: "2026-03-29T12:30:00Z".to_string(),
+                promoted: true,
+            }],
+            synth_count: 9,
+            last_evolution_versions: HashMap::from([("AGENT-02".to_string(), "v3".to_string())]),
+        };
+        store
+            .set_api_patterns_snapshot(&serde_json::to_vec(&snapshot).unwrap())
+            .unwrap();
+
+        let dump = store.dump_all_tables().unwrap();
+        assert!(dump.api_patterns.len() >= 3);
+
+        let (restored_store, _restored_dir) = temp_store();
+        restored_store.restore_all_tables(&dump).unwrap();
+        let data = restored_store.get_api_patterns_snapshot().unwrap().unwrap();
+        let restored: ApiCpSnapshot = serde_json::from_slice(&data).unwrap();
+        assert_eq!(restored, snapshot);
+    }
+
+    #[test]
+    fn test_load_api_patterns_state_falls_back_to_legacy_snapshot_blob() {
+        let (store, _dir) = temp_store();
+        let write_txn = store.db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(API_PATTERNS).unwrap();
+            table
+                .insert(
+                    API_PATTERNS_LEGACY_SNAPSHOT_KEY,
+                    br#"{"patterns":[{"agent_id":"AGENT-09","fingerprint":"legacy","count":1,"top_hash":99,"confidence":1.0,"last_seen":"2026-03-29T13:00:00Z"}],"synth_count":4,"last_evolution_versions":{"AGENT-09":"v1"}}"#
+                        .as_slice(),
+                )
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        let snapshot = store.load_api_patterns_state().unwrap();
+        assert_eq!(snapshot.patterns.len(), 1);
+        assert_eq!(snapshot.patterns[0].agent_id, "AGENT-09");
+        assert_eq!(snapshot.patterns[0].fingerprint, "legacy");
+        assert_eq!(snapshot.synth_count, 4);
+        assert_eq!(
+            snapshot.last_evolution_versions.get("AGENT-09"),
+            Some(&"v1".to_string())
+        );
     }
 
     #[test]

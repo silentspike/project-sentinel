@@ -3,6 +3,36 @@
 //! Erstellt die ECS World mit allen Systems in korrekter Reihenfolge
 //! und bietet die Funktion zum Spawnen von Agenten.
 
+/// Alle gültigen room_ids aus rooms.toml (für Gaia-Move Intent-Erkennung).
+pub const ROOM_IDS: &[&str] = &[
+    "empfang",
+    "flur-eg",
+    "kueche",
+    "buero-dev-1",
+    "buero-dev-2",
+    "meetingraum-01",
+    "toilette-eg-damen",
+    "toilette-eg-herren",
+    "treppenhaus",
+    "flur-og",
+    "buero-design-1",
+    "buero-design-2",
+    "buero-ceo",
+    "meetingraum-02",
+    "meetingraum-03",
+    "toilette-og-damen",
+    "toilette-og-herren",
+    "buero-sales",
+    "buero-pm",
+    "buero-marketing",
+    "buero-admin",
+    "buero-qa",
+    "buero-it",
+    "buero-betriebsrat",
+    "buero-betriebspsych",
+    "buero-betriebsarzt",
+];
+
 use super::autonomy::AutonomyCooldown;
 use super::components::*;
 use super::systems::*;
@@ -535,6 +565,26 @@ impl RoomChatBuffer {
         entry.1 += 1;
     }
 
+    /// Letzter Chat-Tick in einem Raum (fuer Encounter Auto-Resume).
+    pub fn last_chat_tick_for_room(&self, room_id: &str) -> Option<u64> {
+        self.last_chat_tick.get(room_id).copied()
+    }
+
+    /// Zaehlt aktive (nicht abgelaufene) Messages in einem Raum innerhalb eines Tick-Fensters.
+    pub fn recent_count(&self, room_id: &str, current_tick: u64, window: u64) -> u64 {
+        self.messages
+            .get(room_id)
+            .map(|msgs| {
+                msgs.iter()
+                    .filter(|m| {
+                        current_tick < m.tick + m.ttl_ticks
+                            && current_tick.saturating_sub(m.tick) < window
+                    })
+                    .count() as u64
+            })
+            .unwrap_or(0)
+    }
+
     /// Entfernt abgelaufene Messages.
     pub fn cleanup(&mut self, current_tick: u64) {
         self.messages.retain(|_, msgs| {
@@ -558,6 +608,7 @@ pub struct GaiaThought {
     pub content: String,
     pub tick: u64,
     pub ttl_ticks: u64,
+    pub consumed: bool,
 }
 
 const GAIA_TTL_TICKS: u64 = 300;
@@ -571,6 +622,7 @@ impl GaiaBuffer {
                 content,
                 tick,
                 ttl_ticks: GAIA_TTL_TICKS,
+                consumed: false,
             });
     }
 
@@ -580,10 +632,37 @@ impl GaiaBuffer {
             .map(|thoughts| {
                 thoughts
                     .iter()
-                    .filter(|t| current_tick < t.tick + t.ttl_ticks)
+                    .filter(|t| !t.consumed && current_tick < t.tick + t.ttl_ticks)
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Markiert alle aktiven Thoughts eines Agents als consumed (one-shot).
+    pub fn consume(&mut self, agent_id: &AgentId) {
+        if let Some(thoughts) = self.thoughts.get_mut(agent_id) {
+            for t in thoughts.iter_mut() {
+                t.consumed = true;
+            }
+        }
+    }
+
+    /// Verkuerzt die TTL aller aktiven Thoughts auf max_remaining Ticks ab jetzt.
+    /// Verhindert Endlos-Loop (statt sofort consume, da die Bridge
+    /// die IM:1 Perception erst im naechsten Drain-Cycle sieht).
+    /// Verkuerzt die TTL: Thought expired in max_remaining Ticks ab current_tick.
+    pub fn shorten_ttl(&mut self, agent_id: &AgentId, max_remaining: u64, current_tick: u64) {
+        if let Some(thoughts) = self.thoughts.get_mut(agent_id) {
+            for t in thoughts.iter_mut() {
+                if !t.consumed {
+                    // get_active prueft: current_tick < t.tick + t.ttl_ticks
+                    // Setze t.tick = current_tick, t.ttl_ticks = max_remaining
+                    // → expired bei current_tick + max_remaining
+                    t.tick = current_tick;
+                    t.ttl_ticks = max_remaining;
+                }
+            }
+        }
     }
 
     pub fn cleanup(&mut self, current_tick: u64) {
@@ -611,7 +690,9 @@ pub struct BroadcastMessage {
     pub ttl_ticks: u64,
 }
 
-const BROADCAST_TTL_TICKS: u64 = 300;
+// 60 Ticks (~1 Minute): Durchsagen sollen kurz wirken, nicht 5 Min den Kontext dominieren.
+// Vorher 300 (5 Min) → hat_operator_impulse blieb zu lange true → Semaphore-Starvation.
+const BROADCAST_TTL_TICKS: u64 = 60;
 
 impl BroadcastBuffer {
     pub fn add(&mut self, content: String, broadcast_type: String, tick: u64) {
@@ -667,6 +748,7 @@ pub struct ToolRuntimeResource(pub sentinel_wasm::ToolRuntime);
 #[derive(Resource, Default, Clone)]
 pub struct RoomDistanceMap {
     distances: std::collections::HashMap<(String, String), u32>,
+    adjacency: std::collections::HashMap<String, Vec<String>>,
     room_ids: Vec<String>,
 }
 
@@ -674,7 +756,12 @@ impl RoomDistanceMap {
     /// Erstellt die Distance-Map aus einer BuildingConfig (BFS fuer alle Paare).
     pub fn from_building_config(config: &sentinel_common::room::BuildingConfig) -> Self {
         let mut distances = std::collections::HashMap::new();
-        let room_ids = config.rooms.iter().map(|room| room.id.clone()).collect();
+        let room_ids: Vec<String> = config.rooms.iter().map(|room| room.id.clone()).collect();
+        let adjacency: std::collections::HashMap<String, Vec<String>> = config
+            .rooms
+            .iter()
+            .map(|r| (r.id.clone(), r.adjacent.clone()))
+            .collect();
         for room in &config.rooms {
             for other in &config.rooms {
                 if let Some(dist) = config.shortest_distance(&room.id, &other.id) {
@@ -684,6 +771,7 @@ impl RoomDistanceMap {
         }
         Self {
             distances,
+            adjacency,
             room_ids,
         }
     }
@@ -694,6 +782,67 @@ impl RoomDistanceMap {
             .get(&(from.to_string(), to.to_string()))
             .copied()
             .unwrap_or(2) // Fallback: 2 Hops (mittlere Distanz)
+    }
+
+    /// BFS-Pfad zwischen zwei Raeumen (Zwischen-Raeume, ohne Start/Ziel).
+    ///
+    /// Gibt die Raum-IDs zurueck durch die der Agent laufen muss.
+    /// Leer wenn Start==Ziel oder direkt benachbart (1 Hop, kein Zwischen-Raum).
+    pub fn route(&self, from: &str, to: &str) -> Vec<String> {
+        if from == to {
+            return Vec::new();
+        }
+        if self.adjacency.is_empty() {
+            return Vec::new();
+        }
+
+        // BFS mit Parent-Tracking
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut parent: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
+
+        visited.insert(from);
+        queue.push_back(from);
+
+        let mut found = false;
+        while let Some(current) = queue.pop_front() {
+            if current == to {
+                found = true;
+                break;
+            }
+            if let Some(neighbors) = self.adjacency.get(current) {
+                for neighbor in neighbors {
+                    if visited.insert(neighbor.as_str()) {
+                        parent.insert(neighbor.as_str(), current);
+                        queue.push_back(neighbor.as_str());
+                    }
+                }
+            }
+        }
+
+        if !found {
+            return Vec::new();
+        }
+
+        // Pfad rekonstruieren (rueckwaerts von to nach from)
+        let mut path = Vec::new();
+        let mut current = to;
+        while let Some(&prev) = parent.get(current) {
+            path.push(current.to_string());
+            current = prev;
+        }
+        path.reverse();
+
+        // Start und Ziel entfernen — nur Zwischen-Raeume
+        if path.len() >= 2 {
+            // path enthaelt: [hop1, hop2, ..., to]. Start (from) ist nicht drin.
+            // Ziel (to) entfernen = letztes Element
+            path.pop();
+            path
+        } else {
+            // 1 Hop = direkt benachbart, kein Zwischen-Raum
+            Vec::new()
+        }
     }
 
     /// Gibt alle Raeume zurueck die max `max_hops` entfernt sind.
@@ -713,6 +862,44 @@ impl RoomDistanceMap {
     /// Prueft ob ein Raum in der Distance-Map existiert (d.h. in rooms.toml definiert ist).
     pub fn contains(&self, room_id: &str) -> bool {
         self.room_ids.iter().any(|r| r == room_id)
+    }
+}
+
+/// Raum-Metadaten (Floor + Capacity) aus rooms.toml.
+///
+/// EINE Resource fuer Floor-Lookup (Encounter-Filterung) und Capacity-Lookup (max_occupants).
+#[derive(Resource, Default, Clone)]
+pub struct RoomInfoMap {
+    floors: std::collections::HashMap<String, i8>,
+    capacities: std::collections::HashMap<String, u16>,
+}
+
+impl RoomInfoMap {
+    /// Erstellt die RoomInfoMap aus einer BuildingConfig.
+    pub fn from_building_config(config: &sentinel_common::room::BuildingConfig) -> Self {
+        let mut floors = std::collections::HashMap::new();
+        let mut capacities = std::collections::HashMap::new();
+        for room in &config.rooms {
+            floors.insert(room.id.clone(), room.floor);
+            capacities.insert(room.id.clone(), room.capacity);
+        }
+        Self { floors, capacities }
+    }
+
+    /// Floor eines Raums (-1=Treppenhaus, 0=EG, 1=OG).
+    pub fn get_floor(&self, room_id: &str) -> Option<i8> {
+        self.floors.get(room_id).copied()
+    }
+
+    /// Kapazitaet eines Raums (aus rooms.toml capacity Feld).
+    pub fn get_capacity(&self, room_id: &str) -> Option<u16> {
+        self.capacities.get(room_id).copied()
+    }
+
+    /// Setzt Kapazitaet fuer einen Raum (fuer Tests).
+    #[cfg(test)]
+    pub fn set_capacity(&mut self, room_id: &str, capacity: u16) {
+        self.capacities.insert(room_id.to_string(), capacity);
     }
 }
 
@@ -760,6 +947,7 @@ pub fn create_simulation_world() -> (World, Schedule) {
     world.insert_resource(RoomChatBuffer::default());
     world.insert_resource(GaiaBuffer::default());
     world.insert_resource(BroadcastBuffer::default());
+    world.insert_resource(RoomInfoMap::default());
 
     // System-Reihenfolge via configure_sets (10 Phasen)
     schedule.configure_sets(
@@ -853,6 +1041,11 @@ pub fn spawn_agent(
                 transit_target: None,
                 transit_remaining_ms: 0,
                 transit_correlation_id: None,
+                transit_route: Vec::new(),
+                transit_total_ms: 0,
+                transit_paused: false,
+                transit_pause_tick: 0,
+                transit_source: None,
             },
             BioState {
                 hunger: 20.0,
@@ -1097,6 +1290,11 @@ pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnaps
                 transit_target: None,
                 transit_remaining_ms: 0,
                 transit_correlation_id: None,
+                transit_route: Vec::new(),
+                transit_total_ms: 0,
+                transit_paused: false,
+                transit_pause_tick: 0,
+                transit_source: None,
             });
         let bio = snapshot
             .bio_states
@@ -1229,5 +1427,106 @@ pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnaps
         {
             world.insert_resource(stimuli);
         }
+    }
+}
+
+#[cfg(test)]
+mod room_chat_tests {
+    use super::*;
+
+    /// #295 Fix 1: get_recent gibt Chat zurueck auch wenn can_respond=false.
+    /// has_pending_chat im output_system nutzt get_recent() UNABHAENGIG von can_respond.
+    /// Dieser Test beweist dass get_recent korrekt arbeitet wenn can_respond exhausted ist.
+    #[test]
+    fn get_recent_returns_chat_even_when_can_respond_exhausted() {
+        let mut buf = RoomChatBuffer::default();
+        let all_names = vec!["Michael Hartmann".to_string(), "Lisa Mueller".to_string()];
+
+        // Chat in den Buffer einfuegen
+        buf.add(
+            "buero-ceo",
+            "Besucher".to_string(),
+            "Geh in die Kueche".to_string(),
+            100,
+            &all_names,
+        );
+
+        // can_respond exhausten: 10x record_response → can_respond wird false
+        for _ in 0..10 {
+            buf.record_response("Michael Hartmann", 100);
+        }
+        assert!(
+            !buf.can_respond("Michael Hartmann", 100),
+            "can_respond muss nach 10 Responses false sein"
+        );
+
+        // CRITICAL: get_recent muss Chat trotzdem zurueckgeben!
+        // Das ist die Basis fuer has_pending_chat im output_system.
+        let recent = buf.get_recent("buero-ceo", 100, "Michael Hartmann");
+        assert!(
+            !recent.is_empty(),
+            "get_recent MUSS Chat zurueckgeben auch wenn can_respond=false — \
+             darauf basiert has_pending_chat (HR:1 im Fingerprint)"
+        );
+        assert_eq!(recent[0].content, "Geh in die Kueche");
+    }
+
+    /// #295: Nach set_heard darf get_recent fuer denselben Chat NICHT mehr zurueckgeben.
+    /// Das stellt sicher dass has_pending_chat false wird nachdem der Chat verarbeitet wurde.
+    #[test]
+    fn get_recent_empty_after_set_heard() {
+        let mut buf = RoomChatBuffer::default();
+        let all_names = vec!["Michael Hartmann".to_string()];
+
+        buf.add(
+            "buero-ceo",
+            "Besucher".to_string(),
+            "Hallo".to_string(),
+            100,
+            &all_names,
+        );
+
+        // Vor set_heard: Chat sichtbar
+        assert!(!buf
+            .get_recent("buero-ceo", 100, "Michael Hartmann")
+            .is_empty());
+
+        // Nach set_heard: Chat nicht mehr sichtbar
+        buf.set_heard("Michael Hartmann", 100);
+        assert!(
+            buf.get_recent("buero-ceo", 101, "Michael Hartmann")
+                .is_empty(),
+            "Nach set_heard darf get_recent denselben Chat nicht mehr zurueckgeben"
+        );
+    }
+
+    /// #295: Neuer Chat NACH set_heard muss wieder sichtbar sein.
+    #[test]
+    fn new_chat_visible_after_set_heard() {
+        let mut buf = RoomChatBuffer::default();
+        let all_names = vec!["Michael Hartmann".to_string()];
+
+        // Erster Chat + set_heard
+        buf.add(
+            "buero-ceo",
+            "Besucher".to_string(),
+            "Hallo".to_string(),
+            100,
+            &all_names,
+        );
+        buf.set_heard("Michael Hartmann", 100);
+
+        // Zweiter Chat auf spaeterem Tick
+        buf.add(
+            "buero-ceo",
+            "Besucher".to_string(),
+            "Noch da?".to_string(),
+            105,
+            &all_names,
+        );
+
+        let recent = buf.get_recent("buero-ceo", 105, "Michael Hartmann");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].content, "Noch da?");
     }
 }

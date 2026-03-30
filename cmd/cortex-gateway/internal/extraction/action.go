@@ -100,16 +100,53 @@ func tryParseJSON(response string) *ExtractedAction {
 		return nil
 	}
 
+	target := ja.Target
+	if normalizeActionType(ja.ActionType) == "move" && target != "" {
+		target = resolveRoomID(target)
+	}
+
 	return &ExtractedAction{
 		Type:    normalizeActionType(ja.ActionType),
 		Content: ja.Content,
-		Target:  ja.Target,
+		Target:  target,
+	}
+}
+
+// aktionPattern parses the German "AKTION: X\nZIEL: Y\nINHALT: Z" format
+// that the LLM produces when responding to structured prompts.
+var aktionPattern = regexp.MustCompile(`(?i)AKTION:\s*(\w+)\s*\nZIEL:\s*(.*?)\s*\nINHALT:\s*(.*)`)
+
+// tryParseAktion attempts to parse the German structured action format.
+func tryParseAktion(response string) *ExtractedAction {
+	matches := aktionPattern.FindStringSubmatch(response)
+	if len(matches) < 4 {
+		return nil
+	}
+	actionType := normalizeActionType(matches[1])
+	target := strings.TrimSpace(matches[2])
+	content := strings.TrimSpace(matches[3])
+
+	// Resolve room target for move actions
+	if actionType == "move" && target != "" && target != "-" {
+		target = resolveRoomID(target)
+	}
+
+	return &ExtractedAction{
+		Type:    actionType,
+		Content: content,
+		Target:  target,
 	}
 }
 
 // Extract parses an LLM response for actions and emotions.
 func (e *Extractor) Extract(response string) []ExtractedAction {
-	// Try structured JSON first (preferred)
+	// Try German structured AKTION format first (most reliable for sentinel agents)
+	if parsed := tryParseAktion(response); parsed != nil {
+		parsed.Emotion = e.DetectEmotion(parsed.Content)
+		return []ExtractedAction{*parsed}
+	}
+
+	// Try structured JSON (preferred for generic responses)
 	if parsed := tryParseJSON(response); parsed != nil {
 		parsed.Emotion = e.DetectEmotion(parsed.Content)
 		return []ExtractedAction{*parsed}
@@ -221,7 +258,133 @@ var moveTargetPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)verlaesst\s+(?:die |den |das |dem )?(.+?)(?:\.|,|!|\*|\s*$)`),
 }
 
-// extractMoveTarget tries to extract the destination from a move statement.
+// RoomAlias maps a prose name (lowercase) to a room_id.
+type RoomAlias struct {
+	prose  string // lowercase prose name
+	roomID string // canonical room_id from rooms.toml
+}
+
+// roomAliases is populated by SetRoomAliases from rooms.toml data.
+// Falls back to prose if no match found.
+var roomAliases []RoomAlias
+
+// SetRoomAliases configures the room name resolver from rooms.toml data.
+// Each entry maps: room_id, room_name, and common German aliases.
+func SetRoomAliases(rooms []RoomDef) {
+	roomAliases = nil
+	for _, r := range rooms {
+		id := r.ID
+		// Exact id match
+		roomAliases = append(roomAliases, RoomAlias{strings.ToLower(id), id})
+		// Official name from rooms.toml
+		if r.Name != "" {
+			roomAliases = append(roomAliases, RoomAlias{strings.ToLower(r.Name), id})
+		}
+	}
+	// Common German aliases that LLMs use
+	staticAliases := map[string]string{
+		"kueche":                "kueche",
+		"kueche-eg":             "kueche",
+		"küche":                 "kueche",
+		"küche eg":              "kueche",
+		"pausenraum":            "kueche",
+		"toilette":              "toilette-eg-herren",
+		"toilette-eg":           "toilette-eg-herren",
+		"klo":                   "toilette-eg-herren",
+		"wc":                    "toilette-eg-herren",
+		"treppenhaus":           "treppenhaus",
+		"flur":                  "flur-eg",
+		"empfang":               "empfang",
+		"rezeption":             "empfang",
+		"chefbuero":             "buero-ceo",
+		"chefbüro":              "buero-ceo",
+		"geschaeftsfuehrung":    "buero-ceo",
+		"geschäftsführung":      "buero-ceo",
+		"ceo":                   "buero-ceo",
+		"entwicklungsbuero":     "buero-dev-1",
+		"entwicklungsbüro":      "buero-dev-1",
+		"dev":                   "buero-dev-1",
+		"entwicklungsbuero 1":   "buero-dev-1",
+		"entwicklungsbüro 1":    "buero-dev-1",
+		"entwicklungsbuero 2":   "buero-dev-2",
+		"entwicklungsbüro 2":    "buero-dev-2",
+		"designbuero":           "buero-design-1",
+		"designbüro":            "buero-design-1",
+		"designbuero 1":         "buero-design-1",
+		"designbüro 1":          "buero-design-1",
+		"designbuero 2":         "buero-design-2",
+		"designbüro 2":          "buero-design-2",
+		"meetingraum":           "meetingraum-01",
+		"konferenzraum":         "meetingraum-01",
+		"besprechungsraum":      "meetingraum-01",
+		"meetingraum galileo":   "meetingraum-01",
+		"meetingraum tesla":     "meetingraum-02",
+		"meetingraum edison":    "meetingraum-03",
+		"vertrieb":              "buero-sales",
+		"vertriebsbuero":        "buero-sales",
+		"vertriebsbüro":         "buero-sales",
+		"sales":                 "buero-sales",
+		"projektmanagement":     "buero-pm",
+		"pm":                    "buero-pm",
+		"marketing":             "buero-marketing",
+		"marketingbuero":        "buero-marketing",
+		"marketingbüro":         "buero-marketing",
+		"verwaltung":            "buero-admin",
+		"verwaltungsbuero":      "buero-admin",
+		"verwaltungsbüro":       "buero-admin",
+		"admin":                 "buero-admin",
+		"qa":                    "buero-qa",
+		"qualitaetssicherung":   "buero-qa",
+		"qualitätssicherung":    "buero-qa",
+		"it":                    "buero-it",
+		"betriebsrat":           "buero-betriebsrat",
+		"betriebsratsbuero":     "buero-betriebsrat",
+		"betriebsratsbüro":      "buero-betriebsrat",
+		"betriebspsychologie":   "buero-betriebspsych",
+		"psychologie":           "buero-betriebspsych",
+		"betriebsmedizin":       "buero-betriebsarzt",
+		"betriebsarzt":          "buero-betriebsarzt",
+		"arzt":                  "buero-betriebsarzt",
+	}
+	for prose, id := range staticAliases {
+		roomAliases = append(roomAliases, RoomAlias{prose, id})
+	}
+}
+
+// RoomDef is a minimal room definition for alias setup.
+type RoomDef struct {
+	ID   string
+	Name string
+}
+
+// resolveRoomID maps a prose target to a canonical room_id.
+// Returns the original string (lowercased) if no match found.
+func resolveRoomID(prose string) string {
+	if prose == "" {
+		return ""
+	}
+	lower := strings.ToLower(strings.TrimSpace(prose))
+
+	// 1. Exact match against aliases
+	for _, a := range roomAliases {
+		if a.prose == lower {
+			return a.roomID
+		}
+	}
+
+	// 2. Substring match: "Entwicklungsbuero 1" contains "entwicklungsbuero 1"
+	for _, a := range roomAliases {
+		if strings.Contains(lower, a.prose) && len(a.prose) >= 3 {
+			return a.roomID
+		}
+	}
+
+	// 3. No match — return lowercased original (will be rejected by Rust validation)
+	return lower
+}
+
+// extractMoveTarget tries to extract the destination from a move statement
+// and resolves it to a canonical room_id.
 func extractMoveTarget(text string) string {
 	for _, pat := range moveTargetPatterns {
 		matches := pat.FindStringSubmatch(text)
@@ -230,7 +393,7 @@ func extractMoveTarget(text string) string {
 			// Trim trailing asterisks and whitespace
 			target = regexp.MustCompile(`[\s*]+$`).ReplaceAllString(target, "")
 			if target != "" {
-				return target
+				return resolveRoomID(target)
 			}
 		}
 	}

@@ -7,9 +7,14 @@
 //! Arbeitskontext, Stimmung und Chaos-Events. Max 5 Events pro Injection.
 
 use super::components::*;
-use super::world::{BroadcastBuffer, EventBuffer, GaiaBuffer, RoomChatBuffer, SimulationTime};
+use super::world::{
+    BroadcastBuffer, EventBuffer, GaiaBuffer, RoomChatBuffer, RoomInfoMap, SimulationTime,
+};
 use bevy_ecs::prelude::*;
 use sentinel_common::Emotion;
+
+/// Standing Room: Zusaetzliche Plaetze ueber Capacity bevor "komplett voll".
+const STANDING_ROOM: u16 = 2;
 
 /// Max Events pro Injection-Zyklus (erweitert fuer Chat als 5. Quelle)
 const MAX_EVENTS: usize = 8;
@@ -39,8 +44,22 @@ pub fn decision_system(
     chat_buffer: Res<RoomChatBuffer>,
     gaia_buffer: Res<GaiaBuffer>,
     broadcast_buffer: Res<BroadcastBuffer>,
+    room_info: Res<RoomInfoMap>,
+    all_agents: Query<&AgentIdentity>,
+    all_positions: Query<&Position>,
 ) {
     let current_tick = time.tick.0;
+
+    // Raum-Belegung vorberechnen (NUR stationaere + paused Agents)
+    let room_occupancy: std::collections::HashMap<String, usize> = {
+        let mut counts = std::collections::HashMap::new();
+        for pos in all_positions.iter() {
+            if !pos.in_transit || pos.transit_paused {
+                *counts.entry(pos.room_id.clone()).or_insert(0) += 1;
+            }
+        }
+        counts
+    };
 
     for (identity, bio, personality, mood, work, _perception, position, mut queue) in &mut query {
         // 1. TTL dekrementieren, abgelaufene Events entfernen
@@ -70,8 +89,8 @@ pub fn decision_system(
             }
         }
 
-        // 4. Chat-Events aus RoomChatBuffer (5. Quelle)
-        if !position.in_transit {
+        // 4. Chat-Events aus RoomChatBuffer (Stationaer + Encounter-Pause)
+        if !position.in_transit || position.transit_paused {
             generate_chat_events(
                 &identity.name,
                 &position.room_id,
@@ -87,7 +106,27 @@ pub fn decision_system(
         // 6. Broadcast (alle Agents)
         generate_broadcast_events(&broadcast_buffer, &mut queue, current_tick);
 
-        // 7. Sortieren nach Priority (P0 zuerst), auf MAX_EVENTS beschraenken
+        // 7. Encounter-Events aus EventBuffer
+        generate_encounter_events(
+            identity.agent_id,
+            &event_buffer,
+            &all_agents,
+            &mut queue,
+            current_tick,
+        );
+
+        // 8. Kapazitaets-Events (Soft-Cap)
+        if !position.in_transit || position.transit_paused {
+            generate_capacity_events(
+                &position.room_id,
+                &room_occupancy,
+                &room_info,
+                &mut queue,
+                current_tick,
+            );
+        }
+
+        // 9. Sortieren nach Priority (P0 zuerst), auf MAX_EVENTS beschraenken
         queue.events.sort_by_key(|e| e.priority);
         queue.events.truncate(MAX_EVENTS);
     }
@@ -139,7 +178,7 @@ fn generate_chat_events(
     }
 }
 
-/// Gaia-Events: Raum-unabhaengige Gedanken-Injection. P2, max 1/Tick.
+/// Gaia-Events: Raum-unabhaengige Gedanken-Injection. P1 (hoeher als Broadcast).
 fn generate_gaia_events(
     agent_id: sentinel_common::AgentId,
     gaia_buffer: &GaiaBuffer,
@@ -151,8 +190,11 @@ fn generate_gaia_events(
         push_event(
             queue,
             PendingEvent {
-                priority: Priority::P2,
-                text: format!("Dir faellt ein: {}", thought.content),
+                priority: Priority::P0,
+                text: format!(
+                    "Du MUSST jetzt handeln — du kannst nicht anders: {}",
+                    thought.content
+                ),
                 ttl_ticks: 60,
                 created_tick: thought.tick,
             },
@@ -160,7 +202,8 @@ fn generate_gaia_events(
     }
 }
 
-/// Broadcast-Events: System-weite Durchsagen. P2, max 1/Tick.
+/// Broadcast-Events: System-weite Durchsagen. P3 (niedriger als Gaia/Bio).
+/// Durchsagen sollen den Kontext nicht dominieren.
 fn generate_broadcast_events(
     broadcast_buffer: &BroadcastBuffer,
     queue: &mut EventQueue,
@@ -171,7 +214,7 @@ fn generate_broadcast_events(
         push_event(
             queue,
             PendingEvent {
-                priority: Priority::P2,
+                priority: Priority::P3,
                 text: format!("Durchsage: {}", msg.content),
                 ttl_ticks: 30,
                 created_tick: msg.tick,
@@ -358,6 +401,114 @@ fn extract_chaos_text(payload_json: &str) -> String {
         }
     }
     "Etwas Unerwartetes passiert.".to_string()
+}
+
+/// Encounter-Events: Flurbegegnung als P3 Event an beteiligte Agents.
+fn generate_encounter_events(
+    agent_id: sentinel_common::AgentId,
+    event_buffer: &EventBuffer,
+    all_agents: &Query<&AgentIdentity>,
+    queue: &mut EventQueue,
+    tick: u64,
+) {
+    for domain_event in &event_buffer.events {
+        if domain_event.event_type != "hallway_encounter_detected" {
+            continue;
+        }
+        // Payload parsen
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&domain_event.payload) {
+            let a_id = value.get("agent_a").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            let b_id = value.get("agent_b").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            let location = value
+                .get("location")
+                .and_then(|v| v.as_str())
+                .unwrap_or("flur");
+
+            // Ist dieser Agent beteiligt?
+            let other_id = if agent_id.0 == a_id {
+                Some(sentinel_common::AgentId(b_id))
+            } else if agent_id.0 == b_id {
+                Some(sentinel_common::AgentId(a_id))
+            } else {
+                None
+            };
+
+            if let Some(other) = other_id {
+                // Name + Rolle des anderen Agents nachschlagen
+                let (other_name, other_role) = all_agents
+                    .iter()
+                    .find(|id| id.agent_id == other)
+                    .map(|id| (id.name.as_str(), id.role.as_str()))
+                    .unwrap_or(("jemand", "Mitarbeiter"));
+
+                let location_german = match location {
+                    "flur-eg" => "im Flur des Erdgeschosses",
+                    "flur-og" => "im Flur des Obergeschosses",
+                    "treppenhaus" => "im Treppenhaus",
+                    _ => "im Flur",
+                };
+
+                push_event(
+                    queue,
+                    PendingEvent {
+                        priority: Priority::P1,
+                        text: format!(
+                            "Du triffst {} ({}) {}. Begruesst du die Person kurz?",
+                            other_name, other_role, location_german
+                        ),
+                        ttl_ticks: 30,
+                        created_tick: tick,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Kapazitaets-Events: Soft-Cap Wahrnehmung bei vollen Raeumen.
+fn generate_capacity_events(
+    room_id: &str,
+    room_occupancy: &std::collections::HashMap<String, usize>,
+    room_info: &RoomInfoMap,
+    queue: &mut EventQueue,
+    tick: u64,
+) {
+    // Spam-Schutz: Wenn Queue bereits ein Kapazitaets-Event hat, nichts tun
+    if queue
+        .events
+        .iter()
+        .any(|e| e.text.contains("eng hier") || e.text.contains("voll"))
+    {
+        return;
+    }
+
+    let capacity = match room_info.get_capacity(room_id) {
+        Some(c) => c,
+        None => return, // Unbekannter Raum
+    };
+    let occupancy = room_occupancy.get(room_id).copied().unwrap_or(0) as u16;
+
+    if occupancy >= capacity + STANDING_ROOM {
+        push_event(
+            queue,
+            PendingEvent {
+                priority: Priority::P3,
+                text: "Der Raum ist komplett voll.".to_string(),
+                ttl_ticks: 30,
+                created_tick: tick,
+            },
+        );
+    } else if occupancy >= capacity {
+        push_event(
+            queue,
+            PendingEvent {
+                priority: Priority::P3,
+                text: "Es ist eng hier.".to_string(),
+                ttl_ticks: 30,
+                created_tick: tick,
+            },
+        );
+    }
 }
 
 /// Formatiert EventQueue als impulse_text fuer die Perception-Message.
@@ -771,5 +922,88 @@ mod tests {
 
         // Perception Channel pruefen: impulse_text nicht leer
         // (wird in output_system-Integration separat getestet)
+    }
+
+    /// MO1: "eng hier" Perception bei occupancy == capacity
+    #[test]
+    fn test_capacity_eng_hier_at_capacity() {
+        let mut queue = default_queue();
+        let mut occupancy = std::collections::HashMap::new();
+        occupancy.insert("buero-dev-1".to_string(), 6); // capacity=6
+        let mut room_info = RoomInfoMap::default();
+        room_info.set_capacity("buero-dev-1", 6);
+
+        generate_capacity_events("buero-dev-1", &occupancy, &room_info, &mut queue, 1);
+
+        let texts: Vec<_> = queue.events.iter().map(|e| &e.text).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("eng hier")),
+            "occupancy=capacity muss 'eng hier' erzeugen, got: {:?}",
+            texts
+        );
+    }
+
+    /// MO2: "komplett voll" bei occupancy >= capacity + STANDING_ROOM
+    #[test]
+    fn test_capacity_komplett_voll_over_standing_room() {
+        let mut queue = default_queue();
+        let mut occupancy = std::collections::HashMap::new();
+        occupancy.insert("buero-dev-1".to_string(), 8); // capacity=6 + standing_room=2
+        let mut room_info = RoomInfoMap::default();
+        room_info.set_capacity("buero-dev-1", 6);
+
+        generate_capacity_events("buero-dev-1", &occupancy, &room_info, &mut queue, 1);
+
+        let texts: Vec<_> = queue.events.iter().map(|e| &e.text).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("komplett voll")),
+            "occupancy=capacity+2 muss 'komplett voll' erzeugen, got: {:?}",
+            texts
+        );
+    }
+
+    /// MO3: Soft-Cap — kein Hard-Block, nur Perception
+    #[test]
+    fn test_capacity_soft_cap_no_block() {
+        let mut queue = default_queue();
+        let mut occupancy = std::collections::HashMap::new();
+        occupancy.insert("buero-dev-1".to_string(), 12); // Weit über capacity
+        let mut room_info = RoomInfoMap::default();
+        room_info.set_capacity("buero-dev-1", 6);
+
+        generate_capacity_events("buero-dev-1", &occupancy, &room_info, &mut queue, 1);
+
+        // Es gibt Perception-Events, aber keinen Block (Funktion returned normal)
+        assert!(
+            !queue.events.is_empty(),
+            "Ueberbelegung muss Perception erzeugen"
+        );
+        // Alle Events sind P3 (informativ, nicht blockierend)
+        assert!(
+            queue.events.iter().all(|e| e.priority == Priority::P3),
+            "Kapazitaets-Events muessen P3 sein (Soft-Cap)"
+        );
+    }
+
+    /// MO5: Spam-Schutz — doppelte Events werden verhindert
+    #[test]
+    fn test_capacity_spam_protection() {
+        let mut queue = default_queue();
+        let mut occupancy = std::collections::HashMap::new();
+        occupancy.insert("buero-dev-1".to_string(), 6);
+        let mut room_info = RoomInfoMap::default();
+        room_info.set_capacity("buero-dev-1", 6);
+
+        // Erstes Mal: erzeugt Event
+        generate_capacity_events("buero-dev-1", &occupancy, &room_info, &mut queue, 1);
+        assert_eq!(queue.events.len(), 1);
+
+        // Zweites Mal: kein Duplikat
+        generate_capacity_events("buero-dev-1", &occupancy, &room_info, &mut queue, 2);
+        assert_eq!(
+            queue.events.len(),
+            1,
+            "Doppeltes capacity-Event muss verhindert werden"
+        );
     }
 }

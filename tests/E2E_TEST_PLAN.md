@@ -75,7 +75,7 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 - **Fail-Kriterium:** "inactive" oder "failed"
 
 ### T1.10 — Alle systemd Services aktiv [P0] [SSH]
-- **Aktion:** `ssh ubuntu@192.0.2.240 "systemctl is-active sentinel-daemon sentinel-cortex sentinel-dashboard sentinel-projection sentinel-judge sentinel-nats-bridge nats-server"`
+- **Aktion:** `ssh ubuntu@192.0.2.240 "systemctl is-active sentinel-daemon sentinel-gateway sentinel-dashboard sentinel-projection sentinel-judge sentinel-nats-bridge nats-server"`
 - **Erwartung:** Alle 7 zeigen "active"
 - **Fail-Kriterium:** Mindestens einer nicht "active"
 
@@ -910,7 +910,7 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 ### T15.6 — Systemd Units gelistet [P1] [CLI]
 - **Aktion:** Systemd-Eintraege im Manifest filtern
 - **Erwartung:** Mindestens 5 Service-Units
-- **Pruefung:** sentinel-daemon.service, sentinel-cortex.service etc.
+- **Pruefung:** sentinel-daemon.service, sentinel-gateway.service etc.
 
 ### T15.7 — Init Scripts gelistet [P1] [CLI]
 - **Aktion:** Init-Script-Eintraege filtern

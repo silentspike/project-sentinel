@@ -23,8 +23,8 @@ use super::world::{
 use super::world::{PerceptionSender, SimulationTime};
 use bevy_ecs::prelude::*;
 use sentinel_common::{
-    ActionType, DomainEvent, DomainEventPayload, Emotion, EventType, OperatorCommand, Perception,
-    RoomStimulusType, Timestamp,
+    ActionType, AgentId, DomainEvent, DomainEventPayload, Emotion, EventType, OperatorCommand,
+    Perception, RoomStimulusType, Timestamp,
 };
 use std::collections::HashMap;
 use std::time::Instant;
@@ -118,18 +118,25 @@ pub fn input_system(
 
                         let from_room = position.room_id.clone();
                         let to_room = target_room.clone();
-                        // Distance-basierte Transit-Dauer: 1500ms Basis + 800ms pro Hop
-                        // Clamp auf 2000-5000ms (TRANSIT_MIN/MAX aus sentinel-physics)
+                        // Realistische Transit-Dauer: 20s/Hop, clamped 15-120s
                         let hops = room_distances
                             .as_ref()
                             .map(|rd| rd.distance(&from_room, &to_room))
                             .unwrap_or(2);
-                        let raw_ms = 1500 + hops * 800;
-                        let duration_ms: u32 = raw_ms.clamp(2000, 5000);
+                        let duration_ms = sentinel_physics::transit::transit_duration_ms(hops);
+                        // BFS Route (Zwischen-Raeume ohne Start/Ziel)
+                        let route = room_distances
+                            .as_ref()
+                            .map(|rd| rd.route(&from_room, &to_room))
+                            .unwrap_or_default();
                         position.in_transit = true;
                         position.transit_target = Some(to_room.clone());
                         position.transit_remaining_ms = duration_ms;
                         position.transit_correlation_id = Some(correlation_id.clone());
+                        position.transit_route = route;
+                        position.transit_total_ms = duration_ms;
+                        position.transit_paused = false;
+                        position.transit_source = Some(from_room.clone());
 
                         // TransitStarted Event (Causation-Chain wird unten via action_event gesetzt)
                         let transit_payload = DomainEventPayload::TransitStarted {
@@ -339,17 +346,24 @@ pub fn input_system(
 
 /// 1b. Empfaengt Operator-Kommandos und injiziert manuelles Chaos.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub fn operator_command_system(
     receiver: Option<Res<OperatorCommandReceiver>>,
     time: Res<SimulationTime>,
     mut event_buffer: ResMut<EventBuffer>,
     mut active_chaos: ResMut<ActiveChaos>,
     mut active_room_stimuli: ResMut<ActiveRoomStimuli>,
-    mut agents: Query<(&Position, &mut WorkContext)>,
+    mut agent_queries: ParamSet<(
+        Query<(&Position, &mut WorkContext)>,
+        Query<(&AgentIdentity, &mut Position, &Personality, &BioState)>,
+    )>,
     mut room_chat_buffer: ResMut<super::world::RoomChatBuffer>,
     mut gaia_buffer: ResMut<super::world::GaiaBuffer>,
     mut broadcast_buffer: ResMut<super::world::BroadcastBuffer>,
     all_agents_query: Query<&AgentIdentity>,
+    // PUSH-Perception: Sofort Perception fuer Chat-Empfaenger senden
+    perception_sender: Option<Res<PerceptionSender>>,
+    room_distances: Option<Res<RoomDistanceMap>>,
 ) {
     let Some(receiver) = receiver else { return };
     let Ok(rx) = receiver.0.lock() else { return };
@@ -374,7 +388,7 @@ pub fn operator_command_system(
                     duration_ticks,
                     &mut event_buffer,
                     &mut active_chaos,
-                    &mut agents,
+                    &mut agent_queries.p0(),
                     Some(metadata),
                 );
             }
@@ -411,22 +425,148 @@ pub fn operator_command_system(
                 );
                 tracing::info!(room = %cmd.room_id, sender = %cmd.sender_name,
                     "Operator-Chat in RoomChatBuffer eingefuegt");
+
+                // PUSH: Sofort Perception fuer alle Agents im Raum senden.
+                // Chat ist ein Event das sofortige Propagation braucht — nicht auf
+                // output_system Polling warten (1-Tick Fenster ist zu schmal).
+                if let Some(ref sender) = perception_sender {
+                    let msg_text = &cmd.message[..cmd.message.len().min(500)];
+                    let heard = format!("{} sagte: \"{}\"", cmd.sender_name, msg_text);
+                    let chat_agents = agent_queries.p1();
+
+                    for (identity, position, personality, bio) in chat_agents.iter() {
+                        if position.room_id == cmd.room_id && !position.in_transit {
+                            let first_name = identity
+                                .name
+                                .split_whitespace()
+                                .next()
+                                .unwrap_or(&identity.name);
+                            let is_addressed = cmd.message.contains(first_name);
+                            let pe = if personality.extraversion > 0.5 {
+                                "E"
+                            } else {
+                                "I"
+                            };
+
+                            // #295 Fix: Bio-Kontext in Push-Perception fuer bessere LLM-Antwortqualitaet
+                            let body_text = format!(
+                                "Hunger: {:.0}%, Energy: {:.0}%, Stress: {:.0}%, Koffein: {:.0}mg",
+                                bio.hunger, bio.energy, bio.stress, bio.caffeine_mg
+                            );
+                            let perception = Perception {
+                                agent_id: identity.agent_id,
+                                circadian_text: String::new(),
+                                body_text,
+                                environment_text: String::new(),
+                                acoustic_text: String::new(),
+                                heard_text: heard.clone(),
+                                presence_text: String::new(),
+                                impulse_text: String::new(),
+                                is_directly_addressed: is_addressed,
+                                timestamp: Timestamp(time.tick.0),
+                                tick: time.tick,
+                                room_id: cmd.room_id.clone(),
+                                max_priority: "P1".to_string(),
+                                synth_fingerprint: format!(
+                                    "H0|E0|B0|S0|C0|SN0|R:{}|P:0|CH:0|HR:1|T:0|TMP:0|PE:{}|IM:0",
+                                    cmd.room_id, pe
+                                ),
+                                personality_type: pe.to_string(),
+                                has_operator_impulse: false,
+                            };
+                            // Blockierend senden — Chat darf NICHT verloren gehen
+                            if sender.0.send(perception).is_err() {
+                                tracing::error!(
+                                    agent = %identity.name,
+                                    room = %cmd.room_id,
+                                    "Chat-Push-Perception send fehlgeschlagen"
+                                );
+                            } else {
+                                tracing::info!(
+                                    agent = %identity.name,
+                                    room = %cmd.room_id,
+                                    is_addressed,
+                                    "Chat-Push-Perception gesendet"
+                                );
+                            }
+                        }
+                    }
+                }
             }
             OperatorCommand::Gaia(cmd) => {
-                gaia_buffer.add(
-                    sentinel_common::AgentId(cmd.target_agent_id),
-                    cmd.thought.clone(),
-                    time.tick.0,
+                let agent_id = sentinel_common::AgentId(cmd.target_agent_id);
+                let tick = time.tick.0;
+
+                // Gaia-Thought im Buffer behalten (fuer Perception-Kontext/impulse_text)
+                gaia_buffer.add(agent_id, cmd.thought.clone(), tick);
+
+                // Event emittieren
+                let payload = DomainEventPayload::OperatorGaiaSent {
+                    target_agent_id: cmd.target_agent_id,
+                    thought: cmd.thought.clone(),
+                };
+                let event = DomainEvent::new(
+                    payload.event_type_str(),
+                    &format!("AGENT-{:02}", cmd.target_agent_id),
+                    &payload.to_json(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    tick,
                 );
-                tracing::info!(
-                    agent_id = cmd.target_agent_id,
-                    "Voice of Gaia: Gedanke eingepflanzt"
-                );
+                event_buffer.events.push(event);
+
+                // Gaia-Move: Wenn Thought eine room_id enthaelt, Transit direkt starten.
+                // Voice of Gaia ist ein goettlicher Impuls — der Agent MUSS folgen.
+                let thought_lower = cmd.thought.to_lowercase();
+                let target_room = super::world::ROOM_IDS
+                    .iter()
+                    .find(|&&rid| thought_lower.contains(rid));
+
+                if let Some(&room_id) = target_room {
+                    // Finde den Agent und starte Transit
+                    let mut chat_agents = agent_queries.p1();
+                    for (identity, mut pos, _, _) in &mut chat_agents {
+                        if identity.agent_id == agent_id && !pos.in_transit {
+                            let correlation = uuid::Uuid::new_v4().to_string();
+                            super::autonomy::start_transit(
+                                identity,
+                                &mut pos,
+                                room_id,
+                                &correlation,
+                                tick,
+                                &mut event_buffer,
+                                &room_distances,
+                            );
+                            tracing::info!(
+                                agent_id = cmd.target_agent_id,
+                                target = room_id,
+                                "Voice of Gaia: Transit direkt gestartet (goettlicher Impuls)"
+                            );
+                            break;
+                        }
+                    }
+                } else {
+                    tracing::info!(
+                        agent_id = cmd.target_agent_id,
+                        "Voice of Gaia: Gedanke eingepflanzt (kein Move-Intent)"
+                    );
+                }
             }
             OperatorCommand::Broadcast(cmd) => {
                 broadcast_buffer.add(cmd.message.clone(), cmd.broadcast_type.clone(), time.tick.0);
+                let payload = DomainEventPayload::OperatorBroadcastSent {
+                    message: cmd.message.clone(),
+                    broadcast_type: cmd.broadcast_type.clone(),
+                };
+                let event = DomainEvent::new(
+                    payload.event_type_str(),
+                    "SYSTEM",
+                    &payload.to_json(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    time.tick.0,
+                );
+                event_buffer.events.push(event);
                 tracing::info!(broadcast_type = %cmd.broadcast_type,
-                    "Broadcast: Durchsage gesendet");
+                    "Broadcast: Durchsage gesendet + Event emittiert");
             }
             OperatorCommand::Nightrun(_)
             | OperatorCommand::Snapshot(_)
@@ -698,44 +838,93 @@ pub fn physics_system(
     }
 }
 
-/// 4. Verarbeitet Raumwechsel (Transit-Timer runterzaehlen)
+/// Auto-Resume Timeout: Nach 120 Ticks ohne Chat im Flur wird Transit fortgesetzt.
+const ENCOUNTER_AUTO_RESUME_TICKS: u64 = 120;
+
+/// 4. Verarbeitet Raumwechsel (Transit-Timer runterzaehlen, room_id auf Zwischen-Raum setzen)
 ///
 /// Erzeugt TransitCompleted DomainEvents bei abgeschlossenem Transit.
+/// Bei `transit_paused` (Encounter): remaining_ms stoppt, Auto-Resume nach 120 Ticks idle.
 pub fn transit_system(
     mut query: Query<(&AgentIdentity, &mut Position)>,
     time: Res<SimulationTime>,
     mut event_buffer: ResMut<EventBuffer>,
+    room_chat_buffer: Res<super::world::RoomChatBuffer>,
 ) {
     let delta_ms = (time.delta_seconds * 1000.0) as u32;
+    let tick = time.tick.0;
     for (identity, mut pos) in &mut query {
-        if pos.in_transit {
-            pos.transit_remaining_ms = pos.transit_remaining_ms.saturating_sub(delta_ms);
-            if pos.transit_remaining_ms == 0 {
-                // Transit abgeschlossen: Agent kommt im Zielraum an
-                let target_room = pos.transit_target.take();
-                if let Some(target) = target_room {
-                    pos.room_id = target.clone();
+        if !pos.in_transit {
+            continue;
+        }
 
-                    // DomainEvent: TransitCompleted (mit Causation-Chain vom Move-Action)
-                    let payload = DomainEventPayload::TransitCompleted {
-                        agent_id: identity.agent_id,
-                        room_id: target,
-                    };
-                    let correlation = pos
-                        .transit_correlation_id
-                        .take()
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                    let event = DomainEvent::new(
-                        payload.event_type_str(),
-                        &identity.agent_id.to_string(),
-                        &payload.to_json(),
-                        &correlation,
-                        time.tick.0,
-                    );
-                    event_buffer.events.push(event);
-                }
-                pos.in_transit = false;
+        // Encounter-Pause: remaining_ms stoppt, Auto-Resume nach Mindest-Pause
+        if pos.transit_paused {
+            let ticks_paused = tick.saturating_sub(pos.transit_pause_tick);
+
+            // Mindest-Pause: 30 Ticks (gibt LLM Zeit zu antworten)
+            if ticks_paused < 30 {
+                continue;
             }
+
+            // Nach Mindest-Pause: Resume wenn Chat im Flur idle (120 Ticks seit letztem Chat)
+            // ODER wenn nie ein Chat kam (Agent hat nicht geantwortet)
+            let last_chat = room_chat_buffer.last_chat_tick_for_room(&pos.room_id);
+            let chat_idle = last_chat
+                .map(|t| tick.saturating_sub(t))
+                .unwrap_or(ticks_paused); // Kein Chat → idle = gesamte Pause-Dauer
+            if chat_idle >= ENCOUNTER_AUTO_RESUME_TICKS
+                || ticks_paused >= ENCOUNTER_AUTO_RESUME_TICKS
+            {
+                pos.transit_paused = false;
+                tracing::info!(
+                    agent = %identity.name,
+                    room = %pos.room_id,
+                    paused_ticks = ticks_paused,
+                    "Transit resumed nach Encounter"
+                );
+            }
+            continue; // remaining_ms nicht dekrementieren waehrend Pause
+        }
+
+        // room_id auf aktuellen Zwischen-Raum updaten
+        if let Some(current_room) = sentinel_physics::transit::current_transit_room(
+            &pos.transit_route,
+            pos.transit_remaining_ms,
+            pos.transit_total_ms,
+        ) {
+            pos.room_id = current_room.to_string();
+        }
+
+        pos.transit_remaining_ms = pos.transit_remaining_ms.saturating_sub(delta_ms);
+        if pos.transit_remaining_ms == 0 {
+            // Transit abgeschlossen: Agent kommt im Zielraum an
+            let target_room = pos.transit_target.take();
+            if let Some(target) = target_room {
+                pos.room_id = target.clone();
+
+                // DomainEvent: TransitCompleted (mit Causation-Chain vom Move-Action)
+                let payload = DomainEventPayload::TransitCompleted {
+                    agent_id: identity.agent_id,
+                    room_id: target,
+                };
+                let correlation = pos
+                    .transit_correlation_id
+                    .take()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let event = DomainEvent::new(
+                    payload.event_type_str(),
+                    &identity.agent_id.to_string(),
+                    &payload.to_json(),
+                    &correlation,
+                    time.tick.0,
+                );
+                event_buffer.events.push(event);
+            }
+            pos.in_transit = false;
+            pos.transit_route.clear();
+            pos.transit_total_ms = 0;
+            pos.transit_source = None;
         }
     }
 }
@@ -1301,6 +1490,15 @@ fn room_id_to_german(room_id: &str) -> String {
         "toilette-og-damen" => "auf der Damentoilette (OG)".to_string(),
         "toilette-og-herren" => "auf der Herrentoilette (OG)".to_string(),
         "treppenhaus" => "im Treppenhaus".to_string(),
+        "buero-sales" => "im Vertriebsbuero".to_string(),
+        "buero-pm" => "im Projektmanagement-Buero".to_string(),
+        "buero-marketing" => "im Marketingbuero".to_string(),
+        "buero-admin" => "im Verwaltungsbuero".to_string(),
+        "buero-qa" => "im QA-Buero".to_string(),
+        "buero-it" => "im IT-Buero".to_string(),
+        "buero-betriebsrat" => "im Betriebsratsbuero".to_string(),
+        "buero-betriebspsych" => "in der Betriebspsychologie".to_string(),
+        "buero-betriebsarzt" => "in der Betriebsmedizin".to_string(),
         other => format!("im Raum '{}'", other),
     }
 }
@@ -1337,15 +1535,16 @@ pub fn output_system(
     query: Query<OutputAgentQueryData>,
     time: Res<SimulationTime>,
     mut room_chat_buffer: ResMut<super::world::RoomChatBuffer>,
+    mut gaia_buffer: ResMut<super::world::GaiaBuffer>,
+    broadcast_buffer: Res<super::world::BroadcastBuffer>,
 ) {
     let Some(sender) = sender else { return };
 
-    let present_agents_by_room: HashMap<String, Vec<(String, String)>> = query
-        .iter()
-        .filter(|(_, _, position, _, _, _, _, _)| !position.in_transit)
-        .fold(
-            HashMap::new(),
-            |mut acc, (identity, _, position, _, _, _, work_ctx, _)| {
+    let present_agents_by_room: HashMap<String, Vec<(String, String)>> = query.iter().fold(
+        HashMap::new(),
+        |mut acc, (identity, _, position, _, _, _, work_ctx, _)| {
+            if !position.in_transit || position.transit_paused {
+                // Stationaer oder Encounter-Pause: normal anzeigen
                 let activity = work_ctx
                     .current_task
                     .clone()
@@ -1353,9 +1552,15 @@ pub fn output_system(
                 acc.entry(position.room_id.clone())
                     .or_default()
                     .push((identity.name.clone(), activity));
-                acc
-            },
-        );
+            } else if position.in_transit {
+                // Durchgehend: mit Annotation
+                acc.entry(position.room_id.clone())
+                    .or_default()
+                    .push((identity.name.clone(), "geht durch".to_string()));
+            }
+            acc
+        },
+    );
 
     for (identity, bio, position, personality, shift, perception, work_ctx, queue) in &query {
         let impulse_text = super::decision::format_impulse_from_queue(queue);
@@ -1413,7 +1618,25 @@ pub fn output_system(
         );
 
         let mut environment_text = perception.environment_text.clone();
-        if !position.in_transit {
+        if position.in_transit && !position.transit_paused {
+            // Transit-Perception: "Du bist auf dem Weg von X nach Y. Du gehst gerade durch Z."
+            let source = position
+                .transit_source
+                .as_deref()
+                .map(room_id_to_german)
+                .unwrap_or_else(|| "einem Raum".to_string());
+            let target = position
+                .transit_target
+                .as_deref()
+                .map(room_id_to_german)
+                .unwrap_or_else(|| "einem Raum".to_string());
+            let current = room_id_to_german(&position.room_id);
+            environment_text = format!(
+                "Du bist auf dem Weg von {} nach {}. Du gehst gerade durch {}.",
+                source, target, current
+            );
+        } else if !position.in_transit || position.transit_paused {
+            // Stationaer oder Encounter-Pause: normaler Raum-Text
             environment_text = format!("Du bist {}.", room_id_to_german(&position.room_id));
             if !prompt_perception.environment_text.is_empty() {
                 environment_text.push(' ');
@@ -1437,10 +1660,36 @@ pub fn output_system(
         };
 
         // Room-Chat: heard_text aus RoomChatBuffer
+        let can_respond_result = room_chat_buffer.can_respond(&identity.name, time.tick.0);
+        if !can_respond_result && present_agents.is_empty() {
+            // P3 Debug: Single-Agent-Room self-block detection
+            tracing::warn!(
+                agent = %identity.name,
+                room = %position.room_id,
+                "can_respond=false in Single-Agent-Room (self-block?)"
+            );
+        }
+        // #295 Fix: Prüfe ob ungelesener Chat existiert UNABHÄNGIG von can_respond.
+        // Setzt HR:1 im Fingerprint → verhindert Synthesis während Chat pending ist.
+        let has_pending_chat = if !position.in_transit || position.transit_paused {
+            !room_chat_buffer
+                .get_recent(&position.room_id, time.tick.0, &identity.name)
+                .is_empty()
+        } else {
+            false
+        };
         let (heard_text, is_directly_addressed) =
-            if !position.in_transit && room_chat_buffer.can_respond(&identity.name, time.tick.0) {
+            if (!position.in_transit || position.transit_paused) && can_respond_result {
                 let recent =
                     room_chat_buffer.get_recent(&position.room_id, time.tick.0, &identity.name);
+                if !recent.is_empty() {
+                    tracing::info!(
+                        agent = %identity.name,
+                        room = %position.room_id,
+                        recent_count = recent.len(),
+                        "output_system: heard_text gefunden"
+                    );
+                }
                 if recent.is_empty() {
                     (String::new(), false)
                 } else {
@@ -1466,15 +1715,74 @@ pub fn output_system(
                 (String::new(), false)
             };
 
-        // Perceptions senden wenn Inhalt vorhanden ODER als Heartbeat (alle 5 Ticks).
-        // Heartbeat alle 10 Ticks: Idle Agents bekommen periodisch LLM-Calls.
-        // 26 Agents / 10 Ticks = 2.6 Perceptions/s. Bridge drainet non-blocking (tokio::spawn).
-        let is_heartbeat = time.tick.0 > 0 && time.tick.0.is_multiple_of(10);
+        // Adaptiver Heartbeat: Raeume mit Chat-Aktivitaet bekommen hoehere Frequenz.
+        // Standard: 10 Ticks. Mit Chat: min 2 Ticks (skaliert mit Anzahl aktiver Chats).
+        let recent_chats = room_chat_buffer.recent_count(&position.room_id, time.tick.0, 30);
+        let heartbeat_interval = if recent_chats > 0 {
+            (10u64 / (1 + recent_chats)).max(2)
+        } else {
+            10
+        };
+        let is_heartbeat = time.tick.0 > 0 && time.tick.0.is_multiple_of(heartbeat_interval);
         let has_content = !impulse_text.is_empty()
             || !body_text.is_empty()
             || !heard_text.is_empty()
             || is_heartbeat;
         if has_content {
+            // Synthesis Fingerprint: Bio-Buckets + Room + Stimuli + Hour + Temp + Personality
+            let bio_bucket = |v: f32| -> u8 { (v / 10.0).floor().clamp(0.0, 9.0) as u8 };
+            let has_chaos = queue.events.iter().any(|e| {
+                e.text.contains("Chaos") || e.text.contains("Alarm") || e.text.contains("Notfall")
+            });
+            let pe = if personality.extraversion < 0.5 {
+                "I"
+            } else {
+                "E"
+            };
+            let sim_hour = time.sim_hour.floor() as u8;
+            let temp_high = room_temp_c > 26.0;
+            // Operator-Impulse: Gaia/Broadcast/Encounter aktiv → Synthesis MUSS bypassed werden
+            let has_encounter = queue.events.iter().any(|e| e.text.contains("Du triffst"));
+            let gaia_active = !gaia_buffer
+                .get_active(&identity.agent_id, time.tick.0)
+                .is_empty();
+            let broadcast_active = !broadcast_buffer.get_active(time.tick.0).is_empty();
+            let has_operator_impulse = gaia_active || broadcast_active || has_encounter;
+            if gaia_active {
+                tracing::info!(
+                    agent = %identity.name,
+                    agent_id = identity.agent_id.0,
+                    tick = time.tick.0,
+                    "Gaia-Thought AKTIV → IM:1 im Fingerprint"
+                );
+            }
+            let synth_fingerprint = format!(
+                "H{}|E{}|B{}|S{}|C{}|SN{}|R:{}|P:{}|CH:{}|HR:{}|T:{}|TMP:{}|PE:{}|IM:{}",
+                bio_bucket(bio.hunger),
+                bio_bucket(bio.energy),
+                bio_bucket(bio.bladder),
+                bio_bucket(bio.stress),
+                bio_bucket(bio.caffeine_mg.clamp(0.0, 100.0)),
+                bio_bucket(bio.social_need),
+                position.room_id,
+                present_agents.len(),
+                if has_chaos { 1 } else { 0 },
+                if has_pending_chat || !heard_text.is_empty() {
+                    1
+                } else {
+                    0
+                },
+                sim_hour,
+                if temp_high { 1 } else { 0 },
+                pe,
+                if has_operator_impulse { 1 } else { 0 },
+            );
+            let max_priority = queue
+                .events
+                .first()
+                .map(|e| format!("{:?}", e.priority))
+                .unwrap_or_else(|| "NONE".to_string());
+
             let msg = Perception {
                 agent_id: identity.agent_id,
                 circadian_text: prompt_perception.circadian_text,
@@ -1487,9 +1795,23 @@ pub fn output_system(
                 is_directly_addressed,
                 timestamp: Timestamp(time.tick.0),
                 tick: time.tick,
+                room_id: position.room_id.clone(),
+                max_priority,
+                synth_fingerprint,
+                personality_type: pe.to_string(),
+                has_operator_impulse,
             };
             if sender.0.try_send(msg).is_err() {
                 tracing::warn!(agent = %identity.name, "Perception gedroppt (Channel voll)");
+            }
+
+            // Gaia-Thought TTL verkuerzen statt sofort consumen.
+            // Sofortiges consume verhindert dass die Bridge die IM:1 Perception
+            // im naechsten Drain-Cycle sieht (Perception gesendet → consumed →
+            // naechster Tick IM:0 → Synthesis). TTL=3 gibt 3 Ticks fuer den
+            // LLM-Call und verhindert trotzdem Endlos-Loop (300→3 Ticks).
+            if has_operator_impulse {
+                gaia_buffer.shorten_ttl(&identity.agent_id, 120, time.tick.0);
             }
         }
     }
@@ -1520,58 +1842,102 @@ fn focus_hours_since_shift_start(sim_hour: f32, shift: &ShiftInfo) -> f32 {
     elapsed.clamp(0.0, duration.max(0.0))
 }
 
-/// 10. Erkennt Flurbegegnungen zwischen Agents die gleichzeitig in Transit sind.
+/// 10. Erkennt Flurbegegnungen zwischen Agents im SELBEN Zwischen-Raum.
 ///
-/// Paarweise Pruefung aller in-transit Agents (splitmix64-basierte Zufallsentscheidung,
-/// 30% Wahrscheinlichkeit). Laeuft alle 10 Ticks um Event-Flut zu vermeiden.
+/// Gruppiert Transit-Agents nach aktuellem Zwischen-Raum (via current_transit_room).
+/// Nur Agents im selben Raum koennen sich begegnen (30% Wahrscheinlichkeit).
+/// Bei Encounter: transit_paused = true fuer beide Agents.
 pub fn encounter_system(
-    query: Query<(&AgentIdentity, &Position)>,
+    mut query: Query<(Entity, &AgentIdentity, &mut Position)>,
     time: Res<SimulationTime>,
     mut event_buffer: ResMut<EventBuffer>,
 ) {
     let tick = time.tick.0;
 
-    // Alle 3 Ticks pruefen (typisch n<5 in Transit, O(n^2) bei max 105 Paaren ist guenstig)
+    // Alle 3 Ticks pruefen
     if tick == 0 || !tick.is_multiple_of(3) {
         return;
     }
 
-    // Sammle alle in-transit Agents
-    let in_transit: Vec<_> = query
-        .iter()
-        .filter(|(_, pos)| pos.in_transit)
-        .map(|(id, _)| id.agent_id)
-        .collect();
-
-    // Paarweise Encounter-Check (O(n^2/2), typisch n<5 in Transit)
-    for i in 0..in_transit.len() {
-        for j in (i + 1)..in_transit.len() {
-            // splitmix64 deterministische RNG basierend auf Tick + Agent-IDs
-            let seed = tick
-                .wrapping_mul(31)
-                .wrapping_add(in_transit[i].0 as u64 * 97)
-                .wrapping_add(in_transit[j].0 as u64 * 53);
-            let mut x = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            x ^= x >> 31;
-            let rng = (x % 10000) as f32 / 10000.0;
-
-            if sentinel_physics::transit::check_hallway_encounter(true, true, rng) {
-                let payload = DomainEventPayload::HallwayEncounterDetected {
-                    agent_a: in_transit[i],
-                    agent_b: in_transit[j],
-                    location: "flur".to_string(),
-                };
-                let event = DomainEvent::new(
-                    payload.event_type_str(),
-                    &format!("{}-{}", in_transit[i], in_transit[j]),
-                    &payload.to_json(),
-                    &uuid::Uuid::new_v4().to_string(),
-                    tick,
-                );
-                event_buffer.events.push(event);
+    // Pass 1: Sammle Transit-Agents mit ihrem aktuellen Zwischen-Raum (immutabler Read)
+    let mut agents_by_room: HashMap<String, Vec<(Entity, AgentId)>> = HashMap::new();
+    for (entity, identity, pos) in query.iter() {
+        if pos.in_transit && !pos.transit_paused {
+            // Aktuellen Zwischen-Raum bestimmen
+            let current = sentinel_physics::transit::current_transit_room(
+                &pos.transit_route,
+                pos.transit_remaining_ms,
+                pos.transit_total_ms,
+            );
+            if let Some(room) = current {
+                agents_by_room
+                    .entry(room.to_string())
+                    .or_default()
+                    .push((entity, identity.agent_id));
             }
+        }
+    }
+
+    // Pass 2: Paarweise Encounter-Check pro Zwischen-Raum
+    let mut encounters: Vec<(Entity, Entity, AgentId, AgentId, String)> = Vec::new();
+    for (room, agents) in agents_by_room.iter() {
+        let agents: &Vec<(Entity, AgentId)> = agents;
+        for i in 0..agents.len() {
+            for j in (i + 1)..agents.len() {
+                let (_, id_a) = agents[i];
+                let (_, id_b) = agents[j];
+                // splitmix64 deterministische RNG
+                let seed = tick
+                    .wrapping_mul(31)
+                    .wrapping_add(id_a.0 as u64 * 97)
+                    .wrapping_add(id_b.0 as u64 * 53);
+                let mut x = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                x ^= x >> 31;
+                let rng = (x % 10000) as f32 / 10000.0;
+
+                if sentinel_physics::transit::check_hallway_encounter(true, true, rng) {
+                    encounters.push((agents[i].0, agents[j].0, id_a, id_b, room.clone()));
+                }
+            }
+        }
+    }
+
+    // Pass 3: Encounter-Events emittieren + transit_paused setzen
+    for (entity_a, entity_b, id_a, id_b, location) in &encounters {
+        let payload = DomainEventPayload::HallwayEncounterDetected {
+            agent_a: *id_a,
+            agent_b: *id_b,
+            location: location.clone(),
+        };
+        let event = DomainEvent::new(
+            payload.event_type_str(),
+            &format!("{}-{}", id_a, id_b),
+            &payload.to_json(),
+            &uuid::Uuid::new_v4().to_string(),
+            tick,
+        );
+        event_buffer.events.push(event);
+
+        // Transit pausieren fuer beide Agents
+        if let Ok((_, identity_a, mut pos_a)) = query.get_mut(*entity_a) {
+            pos_a.transit_paused = true;
+            pos_a.transit_pause_tick = tick;
+            tracing::info!(
+                agent = %identity_a.name,
+                room = %location,
+                "Transit pausiert fuer Encounter"
+            );
+        }
+        if let Ok((_, identity_b, mut pos_b)) = query.get_mut(*entity_b) {
+            pos_b.transit_paused = true;
+            pos_b.transit_pause_tick = tick;
+            tracing::info!(
+                agent = %identity_b.name,
+                room = %location,
+                "Transit pausiert fuer Encounter"
+            );
         }
     }
 }

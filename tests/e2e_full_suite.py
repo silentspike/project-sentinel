@@ -261,7 +261,7 @@ def run_t1():
         gate_pass = False
 
     # T1.10 — Alle 7 systemd Services aktiv
-    services = ["sentinel-daemon", "sentinel-cortex", "sentinel-dashboard",
+    services = ["sentinel-daemon", "sentinel-gateway", "sentinel-dashboard",
                 "sentinel-projection", "sentinel-judge", "sentinel-nats-bridge", "nats-server"]
     out, _ = ssh(f"systemctl is-active {' '.join(services)}")
     lines = out.split("\n")

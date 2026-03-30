@@ -95,12 +95,16 @@ func (c *Compiler) Compile(model string, agentName string, agentRole string, per
 	b.WriteString("{\"action_type\":\"TYPE\",\"target\":\"ZIEL\",\"content\":\"TEXT\"}\n")
 	b.WriteString("Erlaubte action_type Werte:\n")
 	b.WriteString("- Chat: Sprich mit jemandem. target=Personenname, content=Was du sagst\n")
-	b.WriteString("- Move: Gehe woanders hin. target=Raumname, content=Warum\n")
+	b.WriteString("- Move: Gehe woanders hin. target=EXAKTE room_id (siehe Liste), content=Warum\n")
 	b.WriteString("- Emote: Koerpersprache/Aktion. target=optional, content=*Beschreibung*\n")
 	b.WriteString("- Work: Arbeite an etwas. target=Projekt/Aufgabe, content=Was du tust\n")
 	b.WriteString("- Break: Mache Pause. target=Ort, content=Was du tust\n")
 	b.WriteString("- Think: Denke nach. target=optional, content=Deine Gedanken\n")
 	b.WriteString("Antworte NUR mit dem JSON-Objekt, NICHTS davor oder danach.\n")
+	b.WriteString("\nVerfuegbare Raeume (NUR diese als Move-target verwenden):\n")
+	b.WriteString("EG: empfang, flur-eg, kueche, buero-dev-1, buero-dev-2, buero-sales, buero-pm, buero-marketing, buero-admin, buero-qa, buero-it, meetingraum-01, toilette-eg-damen, toilette-eg-herren\n")
+	b.WriteString("Treppenhaus: treppenhaus\n")
+	b.WriteString("OG: flur-og, buero-design-1, buero-design-2, buero-ceo, buero-betriebsrat, buero-betriebspsych, buero-betriebsarzt, meetingraum-02, meetingraum-03, toilette-og-damen, toilette-og-herren\n")
 
 	if perception != "" {
 		b.WriteString("\n[SYSTEM_INJECTION]\n")

@@ -17,6 +17,7 @@ func TestHasCapability_Claude_AllCapabilities(t *testing.T) {
 	caps := []Capability{
 		CapStreaming, CapToolUse, CapVision,
 		CapSystemPrompt, CapJSONMode, CapFunctionCall,
+		CapStructuredSystem,
 	}
 	for _, cap := range caps {
 		if !pc.HasCapability("claude", cap) {
@@ -123,8 +124,8 @@ func TestListCapabilities(t *testing.T) {
 	if caps == nil {
 		t.Fatal("expected non-nil capabilities for claude")
 	}
-	if len(caps) != 9 {
-		t.Errorf("expected 9 capabilities for claude, got %d", len(caps))
+	if len(caps) != 10 {
+		t.Errorf("expected 10 capabilities for claude, got %d", len(caps))
 	}
 }
 
@@ -228,15 +229,16 @@ func TestHasCapability_ClaudeCode_AllCapabilities(t *testing.T) {
 	pc := New()
 
 	expected := map[Capability]bool{
-		CapStreaming:    true,
-		CapToolUse:      true,
-		CapVision:       true,
-		CapSystemPrompt: true,
-		CapJSONMode:     true,
-		CapFunctionCall: true,
-		CapCaching:      false,
-		CapPredictedOut: false,
-		CapKVRetention:  false,
+		CapStreaming:        true,
+		CapToolUse:          true,
+		CapVision:           true,
+		CapSystemPrompt:     true,
+		CapJSONMode:         true,
+		CapFunctionCall:     true,
+		CapCaching:          false,
+		CapPredictedOut:     false,
+		CapKVRetention:      false,
+		CapStructuredSystem: false,
 	}
 
 	for cap, want := range expected {
@@ -253,8 +255,8 @@ func TestListCapabilities_ClaudeCode(t *testing.T) {
 	if caps == nil {
 		t.Fatal("expected non-nil capabilities for claude-code")
 	}
-	if len(caps) != 9 {
-		t.Errorf("expected 9 capabilities for claude-code, got %d", len(caps))
+	if len(caps) != 10 {
+		t.Errorf("expected 10 capabilities for claude-code, got %d", len(caps))
 	}
 }
 

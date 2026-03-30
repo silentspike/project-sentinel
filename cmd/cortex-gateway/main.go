@@ -14,15 +14,21 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/apicp"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/compiler"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/forwardqueue"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/guardrails"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/intercept"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/observatory"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy"
 	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/resilience"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/sequencing"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/synthesis"
+	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/ticksync"
 	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/eventstore"
 	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/judge"
 )
@@ -38,6 +44,7 @@ const (
 	shutdownTimeout = 10 * time.Second
 )
 
+//nolint:gocyclo // composition root wires many runtime subsystems in one place
 func main() {
 	// 1. Structured logging via slog
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -51,32 +58,35 @@ func main() {
 
 	// 3. Provider registry
 	registry := proxy.NewRegistry()
+	forwardQueue := forwardqueue.NewManager(envIntOrDefault("SENTINEL_MAX_FORWARD_CONCURRENCY", 3))
 
-	// Default provider: Claude Code (subprocess, uses existing subscription)
-	claudeCodeProvider := proxy.NewClaudeCodeProvider(proxy.ProviderConfig{
+	// Optional provider: direct Anthropic Messages API with structured system[]
+	anthropicModel := envOrDefault("ANTHROPIC_MODEL", "claude-opus-4-6")
+	anthropicDirectProvider := proxy.NewQueuedProvider(proxy.NewAnthropicDirectProvider(proxy.ProviderConfig{
+		Name:      "anthropic-direct",
+		Type:      "anthropic-direct",
+		BaseURL:   envOrDefault("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+		APIKey:    os.Getenv("ANTHROPIC_API_KEY"),
+		Model:     anthropicModel,
+		MaxTokens: 4096,
+		Priority:  1,
+	}), forwardQueue)
+	registry.Register("anthropic-direct", anthropicDirectProvider)
+	logger.Info("registered provider", "name", "anthropic-direct", "model", anthropicModel)
+
+	// Optional legacy/debug provider: Claude Code subprocess
+	claudeCodeProvider := proxy.NewQueuedProvider(proxy.NewClaudeCodeProvider(proxy.ProviderConfig{
 		Name:    "claude-code",
 		Type:    "claude-code",
 		BaseURL: envOrDefault("CLAUDE_CODE_BINARY", "claude"), // binary path
 		Model:   envOrDefault("CLAUDE_CODE_MODEL", "claude-opus-4-6"),
-	}, logger)
+	}, logger), forwardQueue)
 	registry.Register("claude-code", claudeCodeProvider)
 	logger.Info("registered provider", "name", "claude-code", "model", envOrDefault("CLAUDE_CODE_MODEL", "claude-opus-4-6"))
 
-	// Optional provider: Ollama (local models)
-	ollamaURL := envOrDefault("OLLAMA_BASE_URL", "http://localhost:11434")
-	ollamaProvider := proxy.NewOllamaProvider(proxy.ProviderConfig{
-		Name:      "ollama",
-		Type:      "ollama",
-		BaseURL:   ollamaURL,
-		Model:     envOrDefault("OLLAMA_MODEL", "qwen3:7b"),
-		MaxTokens: 4096,
-		Priority:  2,
-	})
-	registry.Register("ollama", ollamaProvider)
-	logger.Info("registered provider", "name", "ollama")
-
 	// 4. Control config (shared between pipeline + control plane)
-	controlConfig := control.NewConfig("claude-code")
+	controlConfig := control.NewConfig(defaultPrimaryProvider())
+	applyTrafficControlDefaults(controlConfig, logger)
 	applyHardeningDefaults(controlConfig, logger)
 
 	// 4b. Event Store (optional, enabled via SENTINEL_CORTEX_EVENT_STORE_PATH)
@@ -129,7 +139,9 @@ func main() {
 
 	// 5. Processing pipeline (fully wired)
 	providerDeadline := proxy.ProviderDeadlineFromEnv()
-	logger.Info("provider deadline configured", "deadline", providerDeadline)
+	inflightDeadline := proxy.InflightDeadlineFromEnv()
+	logger.Info("provider timeout configured", "timeout", providerDeadline)
+	logger.Info("inflight deadline configured", "deadline", inflightDeadline)
 
 	// 5a. Capabilities + TOML Loader + Compiler with 3-source Assembly
 	caps := capability.New()
@@ -144,7 +156,7 @@ func main() {
 	qualityScorer := judge.NewQualityScorer(driftDetector)
 
 	// 5c. InFlightMap for query lifecycle tracking
-	inflightMap := resilience.NewInFlightMap(providerDeadline)
+	inflightMap := resilience.NewInFlightMap(inflightDeadline)
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -154,23 +166,86 @@ func main() {
 			}
 		}
 	}()
-	logger.Info("inflight map enabled", "deadline", providerDeadline)
+	logger.Info("inflight map enabled", "deadline", inflightDeadline)
+
+	// 5d. Traffic Control: Synthesis, Sequencing, Tick-Sync, API-CP
+	trafficSnap := controlConfig.Get()
+
+	synthEngine := synthesis.NewEngine(trafficSnap.SynthesisEnabled, logger)
+	if trafficSnap.SynthesisEnabled {
+		logger.Info("synthesis engine enabled", "rules", 10)
+	}
+
+	chatSequencer := sequencing.NewSequencer(time.Duration(trafficSnap.P3TimeoutMs)*time.Millisecond, trafficSnap.SequencingEnabled, logger)
+	if trafficSnap.SequencingEnabled {
+		logger.Info("chat sequencing enabled", "timeout_ms", trafficSnap.P3TimeoutMs)
+	}
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			chatSequencer.Cleanup()
+		}
+	}()
+
+	tickSync := ticksync.NewBuffer(time.Duration(trafficSnap.TickSyncTimeoutMs)*time.Millisecond, trafficSnap.TickSyncEnabled, logger)
+	if trafficSnap.TickSyncEnabled {
+		logger.Info("tick sync enabled", "timeout_ms", trafficSnap.TickSyncTimeoutMs)
+	}
+	responseLogs := proxy.NewResponseLogBuffer(200)
+
+	operatorAPIURL := envOrDefault("SENTINEL_OPERATOR_API_URL", "http://127.0.0.1:8084")
+	apicpObserver := apicp.NewObserver(apicp.Config{
+		SyncURL:      operatorAPIURL + "/operator/apicp/snapshot",
+		SyncInterval: 5 * time.Minute,
+		SharedSecret: os.Getenv("SENTINEL_OPERATOR_API_KEY"),
+	}, logger)
+	if trafficSnap.APICPEnabled {
+		logger.Info("api-cp learning agent enabled", "sync_url", operatorAPIURL+"/operator/apicp/snapshot")
+	}
+	requestInterceptor := intercept.NewManager()
+	responseInterceptor := intercept.NewResponseManager()
+
+	applyTrafficRuntimeConfig(controlConfig.Get(), synthEngine, chatSequencer, tickSync, forwardQueue)
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			applyTrafficRuntimeConfig(controlConfig.Get(), synthEngine, chatSequencer, tickSync, forwardQueue)
+		}
+	}()
+
+	// Room aliases for move target resolution (rooms.toml → room_id mapping)
+	roomsPath := envOrDefault("SENTINEL_ROOMS_CONFIG", "config/rooms.toml")
+	if roomDefs, err := loadRoomDefs(roomsPath); err != nil {
+		logger.Warn("rooms.toml not loaded, move targets will not be resolved", "error", err)
+	} else {
+		extraction.SetRoomAliases(roomDefs)
+		logger.Info("room aliases loaded", "rooms", len(roomDefs), "path", roomsPath)
+	}
 
 	pipelineHandler := proxy.NewPipelineHandler(proxy.PipelineConfig{
-		Registry:         registry,
-		Config:           controlConfig,
-		Compiler:         promptCompiler,
-		Normalizer:       normalizer.New(),
-		Extractor:        extraction.New(),
-		Capabilities:     caps,
-		Logger:           logger,
-		BreakerCfg:       proxy.BreakerConfigFromEnv(),
-		EventStore:       evStore,
-		Guardrails:       guardrailsEnforcer,
-		InFlight:         inflightMap,
-		ProviderDeadline: providerDeadline,
-		Drift:            driftDetector,
-		Quality:          qualityScorer,
+		Registry:            registry,
+		Config:              controlConfig,
+		Compiler:            promptCompiler,
+		Normalizer:          normalizer.New(),
+		Extractor:           extraction.New(),
+		Capabilities:        caps,
+		Logger:              logger,
+		BreakerCfg:          proxy.BreakerConfigFromEnv(),
+		EventStore:          evStore,
+		Guardrails:          guardrailsEnforcer,
+		InFlight:            inflightMap,
+		ProviderDeadline:    providerDeadline,
+		Drift:               driftDetector,
+		Quality:             qualityScorer,
+		Synthesis:           synthEngine,
+		Sequencer:           chatSequencer,
+		Observer:            apicpObserver,
+		Interceptor:         requestInterceptor,
+		ResponseInterceptor: responseInterceptor,
+		TickSync:            tickSync,
+		ResponseLogs:        responseLogs,
 	})
 
 	// 6. HTTP proxy server
@@ -202,6 +277,143 @@ func main() {
 	if obsHandler != nil {
 		obsHandler.RegisterRoutes(controlMux)
 	}
+
+	// 7d. Traffic Control stats on control plane (AC-19)
+	controlMux.HandleFunc("GET /control/traffic-stats", func(w http.ResponseWriter, r *http.Request) {
+		costStats := guardrails.RuntimeCostSnapshot()
+		pendingIntercepts := requestInterceptor.Pending()
+		pendingResponseIntercepts := responseInterceptor.Pending()
+		stats := map[string]interface{}{
+			"synthesis_enabled":           controlConfig.Get().SynthesisEnabled,
+			"sequencing_enabled":          controlConfig.Get().SequencingEnabled,
+			"tick_sync_enabled":           controlConfig.Get().TickSyncEnabled,
+			"tick_sync_runtime_enabled":   tickSync.Enabled(),
+			"apicp_enabled":               controlConfig.Get().APICPEnabled,
+			"current_cost_usd":            costStats.TotalCostUSD,
+			"estimated_savings_usd":       costStats.TotalSavingsUSD,
+			"projected_daily_cost_usd":    costStats.ProjectedDailyCostUSD,
+			"projected_daily_savings_usd": costStats.ProjectedDailySavingsUSD,
+			"avg_forward_cost_usd":        costStats.AverageForwardCostUSD,
+			"forward_calls":               costStats.ForwardCalls,
+			"synthesis_count":             costStats.SynthesisCount,
+			"synthesis_rate":              costStats.SynthesisRate,
+			"cost_by_provider":            costStats.ByProvider,
+			"primary_provider":            controlConfig.Get().PrimaryProvider,
+			"intercept_mode":              controlConfig.Get().InterceptMode,
+			"max_forward_concurrency":     controlConfig.Get().MaxForwardConcurrency,
+			"tick_sync_timeout_ms":        controlConfig.Get().TickSyncTimeoutMs,
+			"p3_timeout_ms":               controlConfig.Get().P3TimeoutMs,
+			"queue_depth":                 forwardQueue.Stats().Depth,
+			"active_forward_calls":        forwardQueue.Stats().Active,
+			"pending_intercepts":          len(pendingIntercepts),
+			"pending_response_intercepts": len(pendingResponseIntercepts),
+			"tick_sync_pending":           tickSync.Stats().Pending,
+			"response_log_entries":        responseLogs.Len(),
+		}
+		if apicpObserver != nil {
+			apicpStats := apicpObserver.Stats()
+			stats["apicp"] = apicpStats
+			if patternsTotal, ok := apicpStats["patterns_total"]; ok {
+				stats["active_patterns"] = patternsTotal
+			}
+			if suggestionCount, ok := apicpStats["suggestions"]; ok {
+				stats["apicp_suggestion_count"] = suggestionCount
+			}
+			stats["apicp_suggestions"] = apicpObserver.Suggestions()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(stats); err != nil {
+			logger.Warn("encode traffic stats failed", "error", err)
+		}
+	})
+	controlMux.HandleFunc("GET /control/intercepts/pending", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(requestInterceptor.Pending())
+	})
+	controlMux.HandleFunc("GET /control/traffic-responses", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(responseLogs.Entries())
+	})
+	controlMux.HandleFunc("GET /control/intercepts/responses/pending", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(responseInterceptor.Pending())
+	})
+	controlMux.HandleFunc("POST /control/intercepts/{id}/decision", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if id == "" {
+			http.Error(w, "missing intercept id", http.StatusBadRequest)
+			return
+		}
+
+		var payload interceptDecisionPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		var decision intercept.RequestDecision
+		switch payload.Action {
+		case string(intercept.RequestForward), "":
+			decision = intercept.Forward(payload.Reason)
+		case string(intercept.RequestModify):
+			decision = intercept.Modify(payload.Reason, payload.ContextSuffix)
+		case string(intercept.RequestDrop):
+			decision = intercept.Drop(payload.Reason)
+		default:
+			http.Error(w, "invalid action", http.StatusBadRequest)
+			return
+		}
+
+		if ok := requestInterceptor.ResolveRequest(id, decision); !ok {
+			http.Error(w, "intercept not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":     true,
+			"id":     id,
+			"action": decision.Action,
+		})
+	})
+	controlMux.HandleFunc("POST /control/intercepts/responses/{id}/decision", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if id == "" {
+			http.Error(w, "missing intercept id", http.StatusBadRequest)
+			return
+		}
+
+		var payload interceptDecisionPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		var decision intercept.ResponseDecision
+		switch payload.Action {
+		case string(intercept.ResponseForward), "":
+			decision = intercept.ResponseDecision{Action: intercept.ResponseForward, Reason: payload.Reason}
+		case string(intercept.ResponseModify):
+			decision = intercept.ResponseDecision{Action: intercept.ResponseModify, Reason: payload.Reason, Content: payload.ContextSuffix}
+		case string(intercept.ResponseReplace):
+			decision = intercept.ResponseDecision{Action: intercept.ResponseReplace, Reason: payload.Reason, Content: payload.ContextSuffix}
+		case string(intercept.ResponseDrop):
+			decision = intercept.ResponseDecision{Action: intercept.ResponseDrop, Reason: payload.Reason}
+		default:
+			http.Error(w, "invalid action", http.StatusBadRequest)
+			return
+		}
+
+		if ok := responseInterceptor.Resolve(id, decision); !ok {
+			http.Error(w, "intercept not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":     true,
+			"id":     id,
+			"action": decision.Action,
+		})
+	})
 
 	controlServer := &http.Server{
 		Addr:         ":" + controlPort,
@@ -244,6 +456,9 @@ func main() {
 	if err := controlServer.Shutdown(ctx); err != nil {
 		logger.Error("control server shutdown error", "error", err)
 	}
+	if apicpObserver != nil {
+		apicpObserver.Stop()
+	}
 
 	logger.Info("cortex-gateway stopped")
 }
@@ -273,9 +488,24 @@ func handleReady(w http.ResponseWriter, _ *http.Request) {
 	_, _ = fmt.Fprint(w, `{"ready":true}`)
 }
 
+type interceptDecisionPayload struct {
+	Action        string `json:"action"`
+	ContextSuffix string `json:"context_suffix"`
+	Reason        string `json:"reason"`
+}
+
 func envOrDefault(key, defaultVal string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
+	}
+	return defaultVal
+}
+
+func envIntOrDefault(key string, defaultVal int) int {
+	if val := os.Getenv(key); val != "" {
+		if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
+			return parsed
+		}
 	}
 	return defaultVal
 }
@@ -319,6 +549,113 @@ func applyHardeningDefaults(cfg *control.Config, logger *slog.Logger) {
 	}
 }
 
+func applyTrafficControlDefaults(cfg *control.Config, logger *slog.Logger) {
+	updates, err := control.LoadTrafficControlDefaults(control.DaemonConfigPath())
+	if err != nil {
+		logger.Warn("failed to load daemon traffic control defaults, using hardcoded defaults", "error", err)
+		updates = control.DefaultTrafficControlUpdates()
+	}
+
+	if v, ok := envBoolValue("SENTINEL_SYNTHESIS_ENABLED"); ok {
+		updates["synthesis_enabled"] = v
+	}
+	if v, ok := envBoolValue("SENTINEL_SEQUENCING_ENABLED"); ok {
+		updates["sequencing_enabled"] = v
+	}
+	if v, ok := envBoolValue("SENTINEL_TICK_SYNC_ENABLED"); ok {
+		updates["tick_sync_enabled"] = v
+	}
+	if v, ok := envBoolValue("SENTINEL_APICP_ENABLED"); ok {
+		updates["apicp_enabled"] = v
+	}
+	if v, ok := envIntValue("SENTINEL_TICK_SYNC_TIMEOUT_MS"); ok {
+		updates["tick_sync_timeout_ms"] = v
+	}
+	if v, ok := envIntValue("SENTINEL_P3_TIMEOUT_MS"); ok {
+		updates["p3_timeout_ms"] = v
+	}
+	if v, ok := envIntValue("SENTINEL_MAX_FORWARD_CONCURRENCY"); ok {
+		updates["max_forward_concurrency"] = v
+	}
+	if v, ok := envStringValue("SENTINEL_INTERCEPT_MODE"); ok {
+		updates["intercept_mode"] = v
+	}
+
+	if err := cfg.Update(updates); err != nil {
+		logger.Error("failed to apply traffic control defaults", "error", err)
+		return
+	}
+	logger.Info("traffic control defaults applied", "config_path", control.DaemonConfigPath(), "updates", updates)
+}
+
+func defaultPrimaryProvider() string {
+	if v := os.Getenv("CORTEX_PRIMARY_PROVIDER"); v != "" {
+		return v
+	}
+	if os.Getenv("ANTHROPIC_API_KEY") != "" {
+		return "anthropic-direct"
+	}
+	return "claude-code"
+}
+
+func applyTrafficRuntimeConfig(
+	snap control.ConfigSnapshot,
+	synthEngine *synthesis.Engine,
+	chatSequencer *sequencing.Sequencer,
+	tickSync *ticksync.Buffer,
+	forwardQueue *forwardqueue.Manager,
+) {
+	if synthEngine != nil {
+		synthEngine.SetEnabled(snap.SynthesisEnabled)
+	}
+	if chatSequencer != nil {
+		chatSequencer.SetEnabled(snap.SequencingEnabled)
+		chatSequencer.SetTimeout(time.Duration(snap.P3TimeoutMs) * time.Millisecond)
+	}
+	if tickSync != nil {
+		tickSync.SetTimeout(time.Duration(snap.TickSyncTimeoutMs) * time.Millisecond)
+		tickSync.SetEnabled(snap.TickSyncEnabled)
+	}
+	if forwardQueue != nil {
+		forwardQueue.SetMaxConcurrent(snap.MaxForwardConcurrency)
+	}
+}
+
+func envBoolValue(key string) (bool, bool) {
+	val := os.Getenv(key)
+	if val == "" {
+		return false, false
+	}
+	switch val {
+	case "1", "true", "TRUE", "True":
+		return true, true
+	case "0", "false", "FALSE", "False":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func envIntValue(key string) (int, bool) {
+	val := os.Getenv(key)
+	if val == "" {
+		return 0, false
+	}
+	parsed, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, false
+	}
+	return parsed, true
+}
+
+func envStringValue(key string) (string, bool) {
+	val := os.Getenv(key)
+	if val == "" {
+		return "", false
+	}
+	return val, true
+}
+
 // loadAgentProfiles reads all agent TOMLs and registers their Big Five profiles
 // with the DriftDetector for personality guard checks.
 func loadAgentProfiles(loader *compiler.TOMLLoader, detector *judge.DriftDetector, agentsDir string, logger *slog.Logger) {
@@ -337,4 +674,97 @@ func loadAgentProfiles(loader *compiler.TOMLLoader, detector *judge.DriftDetecto
 		loaded++
 	}
 	logger.Info("agent personality profiles loaded", "count", loaded, "agents_dir", agentsDir)
+}
+
+// loadRoomDefs loads room definitions from rooms.toml for move target resolution.
+func loadRoomDefs(path string) ([]extraction.RoomDef, error) {
+	data, err := os.ReadFile(path) //nolint:gosec // path comes from trusted local config
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	// Simple TOML parsing: extract id and name from [[rooms]] entries.
+	// We use a line-by-line parser since we only need id/name fields.
+	var defs []extraction.RoomDef
+	var currentID, currentName string
+	inRoom := false
+
+	for _, line := range splitLines(string(data)) {
+		trimmed := trimLine(line)
+		if trimmed == "[[rooms]]" {
+			if inRoom && currentID != "" {
+				defs = append(defs, extraction.RoomDef{ID: currentID, Name: currentName})
+			}
+			currentID = ""
+			currentName = ""
+			inRoom = true
+			continue
+		}
+		if !inRoom {
+			continue
+		}
+		if key, val, ok := parseTomlKV(trimmed); ok {
+			switch key {
+			case "id":
+				currentID = val
+			case "name":
+				currentName = val
+			}
+		}
+	}
+	// Last room
+	if inRoom && currentID != "" {
+		defs = append(defs, extraction.RoomDef{ID: currentID, Name: currentName})
+	}
+
+	return defs, nil
+}
+
+func splitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			lines = append(lines, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
+}
+
+func trimLine(s string) string {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r') {
+		i++
+	}
+	j := len(s)
+	for j > i && (s[j-1] == ' ' || s[j-1] == '\t' || s[j-1] == '\r') {
+		j--
+	}
+	return s[i:j]
+}
+
+func parseTomlKV(line string) (key, val string, ok bool) {
+	eq := -1
+	for i := 0; i < len(line); i++ {
+		if line[i] == '=' {
+			eq = i
+			break
+		}
+	}
+	if eq < 0 {
+		return "", "", false
+	}
+	key = trimLine(line[:eq])
+	raw := trimLine(line[eq+1:])
+	// Strip quotes
+	if len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"' {
+		val = raw[1 : len(raw)-1]
+	} else {
+		val = raw
+	}
+	return key, val, true
 }
