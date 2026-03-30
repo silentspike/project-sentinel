@@ -13,6 +13,7 @@ const (
 // PromptCacheControl mirrors provider-side cache control hints for system blocks.
 type PromptCacheControl struct {
 	Type string
+	TTL  string
 }
 
 // CompiledSystemBlock is a structured, tagged system block ready for provider serialization.
@@ -90,19 +91,19 @@ func structuredBlocksFromFallback(agentName string, agentRole string, perception
 		{
 			Tag:          "agent-identity",
 			Text:         formatTaggedBlock("agent-identity", buildFallbackIdentity(agentName, agentRole)),
-			CacheControl: &PromptCacheControl{Type: "ephemeral"},
+			CacheControl: &PromptCacheControl{Type: "ephemeral", TTL: "1h"},
 			Static:       true,
 		},
 		{
 			Tag:          "company-context",
 			Text:         formatTaggedBlock("company-context", buildFallbackCompanyContext(agentRole)),
-			CacheControl: &PromptCacheControl{Type: "ephemeral"},
+			CacheControl: &PromptCacheControl{Type: "ephemeral", TTL: "1h"},
 			Static:       true,
 		},
 		{
 			Tag:          "personality",
 			Text:         formatTaggedBlock("personality", buildFallbackPersonality()),
-			CacheControl: &PromptCacheControl{Type: "ephemeral"},
+			CacheControl: &PromptCacheControl{Type: "ephemeral", TTL: "1h"},
 			Static:       true,
 		},
 		{
@@ -236,19 +237,19 @@ func (a *Assembler) AssembleStructured(agentID int, providerName string, percept
 		{
 			Tag:          "agent-identity",
 			Text:         formatTaggedBlock("agent-identity", buildIdentityBlock(dna)),
-			CacheControl: &PromptCacheControl{Type: "ephemeral"},
+			CacheControl: &PromptCacheControl{Type: "ephemeral", TTL: "1h"},
 			Static:       true,
 		},
 		{
 			Tag:          "company-context",
 			Text:         formatTaggedBlock("company-context", buildCompanyContextBlock(dna, a.companyContext)),
-			CacheControl: &PromptCacheControl{Type: "ephemeral"},
+			CacheControl: &PromptCacheControl{Type: "ephemeral", TTL: "1h"},
 			Static:       true,
 		},
 		{
 			Tag:          "personality",
 			Text:         formatTaggedBlock("personality", buildPersonalityBlock(dna.Personality)),
-			CacheControl: &PromptCacheControl{Type: "ephemeral"},
+			CacheControl: &PromptCacheControl{Type: "ephemeral", TTL: "1h"},
 			Static:       true,
 		},
 		{

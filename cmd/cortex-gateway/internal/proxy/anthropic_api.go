@@ -12,6 +12,7 @@ const anthropicMessagesPath = "/v1/messages"
 type anthropicInboundRequest struct {
 	Model       string                    `json:"model"`
 	MaxTokens   int                       `json:"max_tokens"`
+	Stream      bool                      `json:"stream,omitempty"`
 	System      json.RawMessage           `json:"system,omitempty"`
 	Messages    []anthropicInboundMessage `json:"messages"`
 	Temperature float64                   `json:"temperature,omitempty"`
@@ -32,7 +33,7 @@ type anthropicMessageResponse struct {
 	ID           string                        `json:"id"`
 	Type         string                        `json:"type"`
 	Role         string                        `json:"role"`
-	Content      []anthropicInboundTextBlock   `json:"content"`
+	Content      []json.RawMessage             `json:"content"`
 	Model        string                        `json:"model"`
 	StopReason   string                        `json:"stop_reason"`
 	StopSequence *string                       `json:"stop_sequence"`
@@ -73,13 +74,14 @@ func decodeAnthropicRequest(body []byte) (LLMRequest, error) {
 
 	messages := make([]Message, 0, len(raw.Messages))
 	for _, msg := range raw.Messages {
-		content, err := decodeAnthropicContent(msg.Content)
+		content, blocks, err := decodeAnthropicContent(msg.Content)
 		if err != nil {
 			return LLMRequest{}, fmt.Errorf("decode anthropic message content: %w", err)
 		}
 		messages = append(messages, Message{
-			Role:    msg.Role,
-			Content: content,
+			Role:          msg.Role,
+			Content:       content,
+			ContentBlocks: blocks,
 		})
 	}
 
@@ -88,6 +90,7 @@ func decodeAnthropicRequest(body []byte) (LLMRequest, error) {
 		SystemBlocks:      systemBlocks,
 		Temperature:       raw.Temperature,
 		MaxTokens:         raw.MaxTokens,
+		Stream:            raw.Stream,
 		Model:             raw.Model,
 		Metadata:          raw.Metadata,
 		Format:            RequestFormatAnthropic,
@@ -136,29 +139,22 @@ func decodeAnthropicSystem(raw json.RawMessage) ([]SystemBlock, error) {
 	return nil, fmt.Errorf("unsupported anthropic system payload")
 }
 
-func decodeAnthropicContent(raw json.RawMessage) (string, error) {
+func decodeAnthropicContent(raw json.RawMessage) (string, []json.RawMessage, error) {
 	if len(raw) == 0 || string(raw) == "null" {
-		return "", nil
+		return "", nil, nil
 	}
 
 	var asString string
 	if err := json.Unmarshal(raw, &asString); err == nil {
-		return asString, nil
+		return asString, nil, nil
 	}
 
-	var blocks []anthropicInboundTextBlock
+	var blocks []json.RawMessage
 	if err := json.Unmarshal(raw, &blocks); err == nil {
-		var b strings.Builder
-		for _, block := range blocks {
-			if block.Type != "" && block.Type != "text" {
-				continue
-			}
-			b.WriteString(block.Text)
-		}
-		return b.String(), nil
+		return anthropicContentProjection(blocks), cloneRawMessages(blocks), nil
 	}
 
-	return "", fmt.Errorf("unsupported anthropic content payload")
+	return "", nil, fmt.Errorf("unsupported anthropic content payload")
 }
 
 func extractAnthropicPassthroughHeaders(header http.Header) map[string]string {
@@ -200,12 +196,7 @@ func buildAnthropicMessageResponse(resp PipelineResponse) anthropicMessageRespon
 		ID:   id,
 		Type: "message",
 		Role: "assistant",
-		Content: []anthropicInboundTextBlock{
-			{
-				Type: "text",
-				Text: resp.Content,
-			},
-		},
+		Content: anthropicResponseBlocks(resp),
 		Model:        resp.Model,
 		StopReason:   stopReason,
 		StopSequence: nil,
@@ -240,4 +231,38 @@ func writeAnthropicError(w http.ResponseWriter, status int, message string) {
 			Message: message,
 		},
 	})
+}
+
+func anthropicContentProjection(blocks []json.RawMessage) string {
+	if len(blocks) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	for _, raw := range blocks {
+		var block anthropicInboundTextBlock
+		if err := json.Unmarshal(raw, &block); err != nil {
+			continue
+		}
+		if block.Type != "" && block.Type != "text" {
+			continue
+		}
+		b.WriteString(block.Text)
+	}
+	return b.String()
+}
+
+func anthropicTextBlockRaw(text string) json.RawMessage {
+	payload, _ := json.Marshal(anthropicInboundTextBlock{
+		Type: "text",
+		Text: text,
+	})
+	return payload
+}
+
+func anthropicResponseBlocks(resp PipelineResponse) []json.RawMessage {
+	if len(resp.ContentBlocks) > 0 {
+		return cloneRawMessages(resp.ContentBlocks)
+	}
+	return []json.RawMessage{anthropicTextBlockRaw(resp.Content)}
 }

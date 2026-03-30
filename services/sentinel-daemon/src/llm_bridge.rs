@@ -28,7 +28,9 @@ pub mod bridge {
     /// LLM Bridge Konfiguration.
     #[derive(Debug, Clone)]
     pub struct LlmBridgeConfig {
-        /// Cortex Gateway Base URL (default: http://localhost:8080)
+        /// Cortex Gateway Base URL (default: http://localhost:8080).
+        /// The bridge talks to the internal `/internal/llm` contract, not the
+        /// external Anthropic-compatible MITM endpoint.
         pub gateway_url: String,
         /// Max parallele LLM Calls
         pub max_concurrent: usize,
@@ -296,7 +298,7 @@ pub mod bridge {
                     "LLM call triggered");
 
                 let client = client.clone();
-                let url = format!("{}/v1/chat/completions", config.gateway_url);
+                let url = format!("{}/internal/llm", config.gateway_url);
                 let action_tx = action_tx.clone();
                 let telemetry = Arc::clone(&telemetry);
                 let cb = Arc::clone(&circuit_breaker);

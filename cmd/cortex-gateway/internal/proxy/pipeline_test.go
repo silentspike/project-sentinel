@@ -35,8 +35,10 @@ type pipelineMockProvider struct {
 	err       error
 	statusErr error
 	calls     int
+	streamCalls int
 	lastReq   *LLMRequest
 	sendFunc  func(ctx context.Context, req *LLMRequest) (*LLMResponse, error)
+	streamFunc func(ctx context.Context, req *LLMRequest, w http.ResponseWriter) error
 }
 
 func (p *pipelineMockProvider) Name() string { return p.name }
@@ -55,6 +57,17 @@ func (p *pipelineMockProvider) Send(ctx context.Context, req *LLMRequest) (*LLMR
 }
 func (p *pipelineMockProvider) HealthCheck(_ context.Context) error { return nil }
 func (p *pipelineMockProvider) CurrentProviderError() error         { return p.statusErr }
+func (p *pipelineMockProvider) StreamHTTP(ctx context.Context, req *LLMRequest, w http.ResponseWriter) error {
+	p.mu.Lock()
+	p.streamCalls++
+	p.lastReq = req
+	streamFunc := p.streamFunc
+	p.mu.Unlock()
+	if streamFunc != nil {
+		return streamFunc(ctx, req, w)
+	}
+	return errors.New("unexpected StreamHTTP call")
+}
 
 func newTestPipelineHandler(registry *Registry, controlCfg *control.Config) *PipelineHandler {
 	if controlCfg == nil {
@@ -274,6 +287,107 @@ func TestPipelineAnthropicMessagesPassthrough(t *testing.T) {
 	}
 	if usage["input_tokens"] != float64(30) || usage["output_tokens"] != float64(12) {
 		t.Fatalf("usage = %#v", usage)
+	}
+}
+
+func TestPipelineAnthropicMessagesPreserveRawBlocks(t *testing.T) {
+	reg := NewRegistry()
+	direct := &pipelineMockProvider{
+		name: "anthropic-direct",
+		resp: &LLMResponse{
+			Content: "visible text",
+			ContentBlocks: []json.RawMessage{
+				json.RawMessage(`{"type":"thinking","thinking":"chain","signature":"sig"}`),
+				json.RawMessage(`{"type":"text","text":"visible text"}`),
+			},
+			Model:        "claude-opus-4-6",
+			TokensUsed:   42,
+			InputTokens:  30,
+			OutputTokens: 12,
+			FinishReason: "end_turn",
+		},
+	}
+	reg.Register("anthropic-direct", direct)
+
+	cfg := control.NewConfig("anthropic-direct")
+	ph := newTestPipelineHandler(reg, cfg)
+
+	body := `{
+		"model":"claude-opus-4-6",
+		"max_tokens":128,
+		"messages":[{"role":"user","content":[{"type":"text","text":"Sag hallo"}]}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	ph.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	content, ok := resp["content"].([]any)
+	if !ok || len(content) != 2 {
+		t.Fatalf("content blocks = %#v, want 2", resp["content"])
+	}
+	first, _ := content[0].(map[string]any)
+	if first["type"] != "thinking" {
+		t.Fatalf("first content block = %#v, want thinking", first)
+	}
+}
+
+func TestPipelineAnthropicMessagesStreamingUsesDirectProvider(t *testing.T) {
+	reg := NewRegistry()
+	internal := &pipelineMockProvider{name: "claude-code"}
+	direct := &pipelineMockProvider{
+		name: "anthropic-direct",
+		streamFunc: func(_ context.Context, req *LLMRequest, w http.ResponseWriter) error {
+			if !req.Stream {
+				t.Fatal("expected stream flag on forwarded request")
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, err := w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\"}\n\n"))
+			return err
+		},
+	}
+	reg.Register("claude-code", internal)
+	reg.Register("anthropic-direct", direct)
+
+	cfg := control.NewConfig("claude-code")
+	ph := newTestPipelineHandler(reg, cfg)
+
+	body := `{
+		"model":"claude-opus-4-6",
+		"max_tokens":128,
+		"stream":true,
+		"messages":[{"role":"user","content":[{"type":"text","text":"stream bitte"}]}],
+		"metadata":{"agent_name":"Thomas Mueller","agent_role":"CEO","body":"Hunger: 45%","heard":"hi","room_id":"buero-ceo"}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer passthrough-token")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	ph.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if internal.calls != 0 {
+		t.Fatalf("claude-code send calls = %d, want 0", internal.calls)
+	}
+	if direct.streamCalls != 1 {
+		t.Fatalf("anthropic-direct stream calls = %d, want 1", direct.streamCalls)
+	}
+	if !strings.Contains(w.Body.String(), "message_start") {
+		t.Fatalf("expected SSE payload, got %q", w.Body.String())
 	}
 }
 
