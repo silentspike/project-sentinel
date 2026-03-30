@@ -868,7 +868,7 @@ INHALT: Ich habe Hunger und gehe in die Kueche.`,
 	}
 }
 
-//nolint:gocyclo // integration test intentionally exercises queueing, sequencing, and tick-sync together
+//nolint:gocyclo // integration test intentionally exercises queuing, sequencing, and tick-sync together
 func TestPipelineQueueTickSyncAndSequencingIntegrate(t *testing.T) {
 	reg := NewRegistry()
 	queue := forwardqueue.NewManager(1)
