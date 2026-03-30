@@ -7,14 +7,24 @@ import (
 	"time"
 )
 
+type RequestFormat string
+
+const (
+	RequestFormatInternal  RequestFormat = "internal"
+	RequestFormatAnthropic RequestFormat = "anthropic"
+)
+
 // LLMRequest represents a request to an LLM provider.
 type LLMRequest struct {
-	Messages     []Message         `json:"messages"`
-	SystemBlocks []SystemBlock     `json:"system,omitempty"`
-	Temperature  float64           `json:"temperature"`
-	MaxTokens    int               `json:"max_tokens"`
-	Model        string            `json:"model,omitempty"`
-	Metadata     map[string]string `json:"metadata,omitempty"`
+	Messages           []Message         `json:"messages"`
+	SystemBlocks       []SystemBlock     `json:"system,omitempty"`
+	Temperature        float64           `json:"temperature"`
+	MaxTokens          int               `json:"max_tokens"`
+	Model              string            `json:"model,omitempty"`
+	Metadata           map[string]string `json:"metadata,omitempty"`
+	Format             RequestFormat     `json:"-"`
+	PreferredProvider  string            `json:"-"`
+	PassthroughHeaders map[string]string `json:"-"`
 	// ProviderTimeout applies only to the real provider execution, not queue wait.
 	ProviderTimeout time.Duration `json:"-"`
 }
