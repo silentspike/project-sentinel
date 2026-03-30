@@ -18,6 +18,7 @@ import type {
 let projectionDb: Database;
 let eventStoreDb: Database;
 export const ROOM_REACTION_WINDOW_TICKS = 60;
+let _eventColumnsCache: Set<string> | null = null;
 
 interface ProjectedRoomOccupants {
   [roomId: string]: {
@@ -38,6 +39,7 @@ interface StoredEventRow {
 export function resetCaches(): void {
   _agentNameCache = null;
   _agentNameCacheTime = 0;
+  _eventColumnsCache = null;
 }
 
 export function openDatabases(
@@ -131,6 +133,31 @@ function normalizeAgentId(rawAgentId: unknown, fallback: string): {
     agentId,
     numericId: match ? parseInt(match[1], 10) : null,
   };
+}
+
+function getEventColumnSet(): Set<string> {
+  if (_eventColumnsCache) {
+    return _eventColumnsCache;
+  }
+
+  try {
+    const rows = eventStoreDb
+      .query<{ name: string }, []>("PRAGMA table_info(events)")
+      .all();
+    _eventColumnsCache = new Set(rows.map((row) => String(row.name)));
+  } catch {
+    _eventColumnsCache = new Set();
+  }
+  return _eventColumnsCache;
+}
+
+export function eventRowSelectColumns(): string {
+  const base =
+    "id, event_id, event_type, aggregate_id, payload, correlation_id, causation_id, tick, timestamp_ms";
+  if (getEventColumnSet().has("compensation_type")) {
+    return `${base}, compensation_type`;
+  }
+  return `${base}, 'none' AS compensation_type`;
 }
 
 // ── Agent Queries ────────────────────────────────
@@ -638,8 +665,7 @@ export function getRecentIncidentEvents(hours: number, limit = 200): EventRow[] 
   const cutoff = Date.now() - hours * 3600_000;
   return eventStoreDb
     .query<EventRow, [number, number]>(
-      `SELECT id, event_id, event_type, aggregate_id, payload,
-              correlation_id, causation_id, tick, timestamp_ms, compensation_type
+      `SELECT ${eventRowSelectColumns()}
        FROM events
        WHERE event_type IN (${INCIDENT_TYPES_SQL})
          AND timestamp_ms > ?
@@ -671,8 +697,7 @@ export function getRecentEvolutionAlerts(hours: number): EvolutionRow[] {
 export function getEventsByCorrelation(correlationId: string): EventRow[] {
   return eventStoreDb
     .query<EventRow, [string]>(
-      `SELECT id, event_id, event_type, aggregate_id, payload,
-              correlation_id, causation_id, tick, timestamp_ms, compensation_type
+      `SELECT ${eventRowSelectColumns()}
        FROM events
        WHERE correlation_id = ?
        ORDER BY id ASC`,
@@ -683,8 +708,7 @@ export function getEventsByCorrelation(correlationId: string): EventRow[] {
 export function getEventsByCausation(eventId: string): EventRow[] {
   return eventStoreDb
     .query<EventRow, [string]>(
-      `SELECT id, event_id, event_type, aggregate_id, payload,
-              correlation_id, causation_id, tick, timestamp_ms, compensation_type
+      `SELECT ${eventRowSelectColumns()}
        FROM events
        WHERE causation_id = ?
        ORDER BY id ASC`,
@@ -702,8 +726,7 @@ export function getEventsNearby(
 ): EventRow[] {
   return eventStoreDb
     .query<EventRow, [number, number, string, number]>(
-      `SELECT id, event_id, event_type, aggregate_id, payload,
-              correlation_id, causation_id, tick, timestamp_ms, compensation_type
+      `SELECT ${eventRowSelectColumns()}
        FROM events
        WHERE tick BETWEEN ? AND ?
          AND event_type = 'agent_action_received'
@@ -717,8 +740,7 @@ export function getEventsNearby(
 export function getEventById(eventId: string): EventRow | null {
   return eventStoreDb
     .query<EventRow, [string]>(
-      `SELECT id, event_id, event_type, aggregate_id, payload,
-              correlation_id, causation_id, tick, timestamp_ms, compensation_type
+      `SELECT ${eventRowSelectColumns()}
        FROM events
        WHERE event_id = ?`,
     )
@@ -1104,8 +1126,7 @@ const ACTIVITY_TYPES_SQL = ACTIVITY_EVENT_TYPES.map((t) => `'${t}'`).join(",");
 export function getRecentActivityEvents(limit = 200): EventRow[] {
   return eventStoreDb
     .query<EventRow, [number]>(
-      `SELECT id, event_id, event_type, aggregate_id, payload,
-              correlation_id, causation_id, tick, timestamp_ms, compensation_type
+      `SELECT ${eventRowSelectColumns()}
        FROM events
        WHERE event_type IN (${ACTIVITY_TYPES_SQL})
        ORDER BY id DESC

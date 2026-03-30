@@ -357,6 +357,39 @@ func (o *Observer) calcConfidence(ps *PatternStats) float64 {
 	return float64(topCount) / float64(ps.Count)
 }
 
+func (o *Observer) rebuildDerivedStatsLocked(ps *PatternStats) {
+	if ps.ResponseHashes == nil {
+		ps.ResponseHashes = map[uint64]int{}
+	}
+
+	originalTopHash := ps.TopHash
+	totalCount := 0
+	for _, count := range ps.ResponseHashes {
+		if count > 0 {
+			totalCount += count
+		}
+	}
+
+	if totalCount == 0 {
+		ps.Count = 0
+		ps.TopHash = 0
+		ps.TopContent = ""
+		ps.Confidence = 0
+		return
+	}
+
+	ps.Count = totalCount
+	topHash, _ := o.topResponseHash(ps)
+	ps.TopHash = topHash
+	if ps.TopContent != "" {
+		ps.TopContent = trimPatternContent(ps.TopContent)
+	}
+	if len(ps.ResponseHashes) > 1 && originalTopHash != 0 && originalTopHash != topHash {
+		ps.TopContent = ""
+	}
+	ps.Confidence = o.calcConfidence(ps)
+}
+
 func (o *Observer) topResponseHash(ps *PatternStats) (uint64, int) {
 	var topHash uint64
 	var topCount int
@@ -489,6 +522,7 @@ func (o *Observer) restore(snapshot Snapshot) {
 			LastSeen:       ps.LastSeen,
 			Promoted:       ps.Promoted,
 		}
+		o.rebuildDerivedStatsLocked(restored)
 		o.updatePromotionLocked(restored)
 		o.stats[patternKey(restored.AgentID, restored.Fingerprint)] = restored
 	}

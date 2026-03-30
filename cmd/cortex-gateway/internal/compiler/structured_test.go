@@ -47,11 +47,20 @@ func TestCompileStructured_FallbackProducesEightTaggedBlocks(t *testing.T) {
 	if prompt.SystemBlocks[0].CacheControl == nil || prompt.SystemBlocks[0].CacheControl.Type != "ephemeral" {
 		t.Errorf("expected cache control on %q block", prompt.SystemBlocks[0].Tag)
 	}
+	if prompt.SystemBlocks[0].CacheControl == nil || prompt.SystemBlocks[0].CacheControl.TTL != "1h" {
+		t.Errorf("expected 1h cache ttl on %q block", prompt.SystemBlocks[0].Tag)
+	}
 	if prompt.SystemBlocks[1].CacheControl == nil || prompt.SystemBlocks[1].CacheControl.Type != "ephemeral" {
 		t.Errorf("expected cache control on %q block", prompt.SystemBlocks[1].Tag)
 	}
+	if prompt.SystemBlocks[1].CacheControl == nil || prompt.SystemBlocks[1].CacheControl.TTL != "1h" {
+		t.Errorf("expected 1h cache ttl on %q block", prompt.SystemBlocks[1].Tag)
+	}
 	if prompt.SystemBlocks[2].CacheControl == nil || prompt.SystemBlocks[2].CacheControl.Type != "ephemeral" {
 		t.Errorf("expected cache control on %q block", prompt.SystemBlocks[2].Tag)
+	}
+	if prompt.SystemBlocks[2].CacheControl == nil || prompt.SystemBlocks[2].CacheControl.TTL != "1h" {
+		t.Errorf("expected 1h cache ttl on %q block", prompt.SystemBlocks[2].Tag)
 	}
 
 	if !strings.Contains(prompt.LegacySystemPrompt, "<agent-identity>") {

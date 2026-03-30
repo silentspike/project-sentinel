@@ -313,6 +313,48 @@ func TestSnapshotRestorePreservesEvolutionVersions(t *testing.T) {
 	}
 }
 
+func TestSnapshotRestoreRebuildsDerivedPatternStats(t *testing.T) {
+	restored := newTestObserver(t)
+	now := time.Now().UTC().Round(0)
+
+	restored.restore(Snapshot{
+		Patterns: []*PatternStats{{
+			AgentID:        "AGENT-01",
+			Fingerprint:    "fp1",
+			Count:          999,
+			ResponseHashes: map[uint64]int{42: 50},
+			TopHash:        0,
+			TopContent:     "same",
+			Confidence:     0.5,
+			LastSeen:       now,
+			Promoted:       false,
+		}},
+	})
+
+	restored.mu.RLock()
+	defer restored.mu.RUnlock()
+
+	ps, ok := restored.stats[patternKey("AGENT-01", "fp1")]
+	if !ok {
+		t.Fatal("expected restored pattern for AGENT-01/fp1")
+	}
+	if ps.Count != 50 {
+		t.Fatalf("restored count = %d, want 50", ps.Count)
+	}
+	if ps.TopHash != 42 {
+		t.Fatalf("restored top hash = %d, want 42", ps.TopHash)
+	}
+	if ps.TopContent != "same" {
+		t.Fatalf("restored top content = %q, want same", ps.TopContent)
+	}
+	if ps.Confidence != 1.0 {
+		t.Fatalf("restored confidence = %.2f, want 1.00", ps.Confidence)
+	}
+	if !ps.Promoted {
+		t.Fatal("expected restored pattern to be promoted after derived stats rebuild")
+	}
+}
+
 func TestSnapshotLoadRetriesOnStartup(t *testing.T) {
 	oldDelay := bootstrapRetryDelay
 	oldAttempts := bootstrapRetryAttempts

@@ -205,6 +205,7 @@ func (ph *PipelineHandler) BreakerStates() map[string]string {
 // PipelineResponse ist die erweiterte Antwort mit extrahierten Aktionen.
 type PipelineResponse struct {
 	Content      string                       `json:"content"`
+	ContentBlocks []json.RawMessage           `json:"-"`
 	Model        string                       `json:"model"`
 	Provider     string                       `json:"provider"`
 	TokensUsed   int                          `json:"tokens_used"`
@@ -414,7 +415,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	ph.injectPerception(&req, agentName, agentRole, providerName, snap)
 
 	// --- Step 7.5: Traffic Control — Synthesis Check ---
-	if ph.synthesis != nil && snap.SynthesisEnabled {
+	if ph.synthesis != nil && snap.SynthesisEnabled && !isAnthropicStreamingRequest(&req) {
 		result := ph.synthesis.Decide(req.Metadata, agentName)
 		if result.Decision == synthesis.Synthesize {
 			content := result.Content
@@ -471,7 +472,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 			}
 		}
 	}
-	if ph.observer != nil && snap.APICPEnabled {
+	if ph.observer != nil && snap.APICPEnabled && !isAnthropicStreamingRequest(&req) {
 		fp, ctx, err := synthesis.PrepareInputs(req.Metadata)
 		if err == nil && synthesis.CanSynthesize(fp, ctx) {
 			agentID := req.Metadata["agent_id"]
@@ -556,6 +557,11 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+	}
+
+	if isAnthropicStreamingRequest(&req) {
+		ph.streamAnthropicResponse(r.Context(), w, &req, provider, providerName, breaker, requestID, start)
+		return
 	}
 
 	// --- Step 8: Provider.Send() ---
@@ -704,15 +710,16 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	)
 
 	pipelineResp := PipelineResponse{
-		Content:      content,
-		Model:        resp.Model,
-		Provider:     providerName,
-		TokensUsed:   resp.TokensUsed,
-		InputTokens:  resp.InputTokens,
-		OutputTokens: resp.OutputTokens,
-		FinishReason: resp.FinishReason,
-		Actions:      actions,
-		RequestID:    requestID,
+		Content:       content,
+		ContentBlocks: pipelineResponseBlocks(content, resp),
+		Model:         resp.Model,
+		Provider:      providerName,
+		TokensUsed:    resp.TokensUsed,
+		InputTokens:   resp.InputTokens,
+		OutputTokens:  resp.OutputTokens,
+		FinishReason:  resp.FinishReason,
+		Actions:       actions,
+		RequestID:     requestID,
 	}
 	ph.writePipelineResponse(r.Context(), w, &req, pipelineResp)
 }
@@ -1230,6 +1237,10 @@ func responsePayloadForRequest(req *LLMRequest, resp PipelineResponse) interface
 	return resp
 }
 
+func isAnthropicStreamingRequest(req *LLMRequest) bool {
+	return req != nil && req.Format == RequestFormatAnthropic && req.Stream
+}
+
 func (ph *PipelineHandler) writePathError(w http.ResponseWriter, path, message string, status int) {
 	if isAnthropicMessagesPath(path) {
 		writeAnthropicError(w, status, message)
@@ -1264,6 +1275,90 @@ func buildSynthesisActions(actions []synthesis.Action, ext *extraction.Extractor
 		})
 	}
 	return result
+}
+
+func pipelineResponseBlocks(content string, resp *LLMResponse) []json.RawMessage {
+	if resp == nil || len(resp.ContentBlocks) == 0 {
+		return nil
+	}
+	if content != resp.Content {
+		return nil
+	}
+	return cloneRawMessages(resp.ContentBlocks)
+}
+
+type trackedResponseWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (w *trackedResponseWriter) WriteHeader(statusCode int) {
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *trackedResponseWriter) Write(p []byte) (int, error) {
+	w.wroteHeader = true
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *trackedResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (ph *PipelineHandler) streamAnthropicResponse(ctx context.Context, w http.ResponseWriter, req *LLMRequest, provider Provider, providerName string, breaker *CircuitBreaker, requestID string, start time.Time) {
+	streamer, ok := provider.(StreamingProvider)
+	if !ok {
+		ph.writeRequestError(w, req, "streaming not supported by provider", http.StatusBadGateway)
+		return
+	}
+
+	req.ProviderTimeout = ph.providerDeadline
+	prevState := breaker.State()
+	tracked := &trackedResponseWriter{ResponseWriter: w}
+	err := streamer.StreamHTTP(ctx, req, tracked)
+	breaker.Record(err)
+	if newState := breaker.State(); newState == "open" && prevState != "open" {
+		breakerTripsTotal.WithLabelValues(providerName).Inc()
+	}
+	ph.updateBreakerGauge(providerName, breaker)
+
+	duration := time.Since(start)
+	if err != nil {
+		pipelineRequestsTotal.WithLabelValues(providerName, "stream_error").Inc()
+		pipelineLatency.WithLabelValues(providerName).Observe(duration.Seconds())
+		ph.logger.Error("provider stream failed",
+			"provider", providerName,
+			"request_id", requestID,
+			"duration", duration,
+			"error", err,
+		)
+		if !tracked.wroteHeader {
+			statusCode := http.StatusBadGateway
+			errMsg := "provider stream failed"
+			var provErr *ProviderError
+			if errors.As(err, &provErr) {
+				if provErr.StatusCode > 0 {
+					statusCode = provErr.StatusCode
+				}
+				errMsg = provErr.Message
+			}
+			ph.writeRequestError(tracked, req, errMsg, statusCode)
+		}
+		return
+	}
+
+	pipelineRequestsTotal.WithLabelValues(providerName, "stream").Inc()
+	pipelineLatency.WithLabelValues(providerName).Observe(duration.Seconds())
+	ph.logger.Info("pipeline stream completed",
+		"provider", providerName,
+		"request_id", requestID,
+		"duration", duration,
+		"agent_id", req.Metadata["agent_id"],
+		"agent_name", req.Metadata["agent_name"],
+	)
 }
 
 // modelKey mappt Provider-Namen auf Compiler-Config-Keys.

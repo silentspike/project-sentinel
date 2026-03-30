@@ -37,12 +37,13 @@ type claudeRequest struct {
 	System      []claudeSystemBlock `json:"system,omitempty"`
 	Messages    []claudeMessage     `json:"messages"`
 	Temperature float64             `json:"temperature,omitempty"`
+	Stream      bool                `json:"stream,omitempty"`
 }
 
 // claudeMessage is a single message in the Anthropic format.
 type claudeMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string      `json:"role"`
+	Content interface{} `json:"content"`
 }
 
 // claudeSystemBlock is a structured system content block for Anthropic Messages.
@@ -55,14 +56,12 @@ type claudeSystemBlock struct {
 // claudeCacheControl mirrors Anthropic cache control hints.
 type claudeCacheControl struct {
 	Type string `json:"type"`
+	TTL  string `json:"ttl,omitempty"`
 }
 
 // claudeResponse is the Anthropic Messages API response format.
 type claudeResponse struct {
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
+	Content    []json.RawMessage `json:"content"`
 	Model      string      `json:"model"`
 	StopReason string      `json:"stop_reason"`
 	Usage      claudeUsage `json:"usage"`
@@ -140,6 +139,7 @@ func (p *ClaudeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 		System:      systemBlocks,
 		Messages:    messages,
 		Temperature: req.Temperature,
+		Stream:      false,
 	}
 
 	body, err := json.Marshal(cReq)
@@ -171,7 +171,10 @@ func (p *ClaudeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("claude API returned status %d: %s", resp.StatusCode, string(respBody))
+		return nil, &ProviderError{
+			StatusCode: resp.StatusCode,
+			Message:    strings.TrimSpace(string(respBody)),
+		}
 	}
 
 	var cResp claudeResponse
@@ -179,20 +182,16 @@ func (p *ClaudeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 		return nil, fmt.Errorf("unmarshal claude response: %w", err)
 	}
 
-	content := ""
-	for _, c := range cResp.Content {
-		if c.Type == "text" {
-			content += c.Text
-		}
-	}
+	content := anthropicContentProjection(cResp.Content)
 
 	return &LLMResponse{
-		Content:      content,
-		Model:        cResp.Model,
-		TokensUsed:   cResp.Usage.InputTokens + cResp.Usage.OutputTokens,
-		InputTokens:  cResp.Usage.InputTokens,
-		OutputTokens: cResp.Usage.OutputTokens,
-		FinishReason: cResp.StopReason,
+		Content:       content,
+		ContentBlocks: cloneRawMessages(cResp.Content),
+		Model:         cResp.Model,
+		TokensUsed:    cResp.Usage.InputTokens + cResp.Usage.OutputTokens,
+		InputTokens:   cResp.Usage.InputTokens,
+		OutputTokens:  cResp.Usage.OutputTokens,
+		FinishReason:  cResp.StopReason,
 	}, nil
 }
 
@@ -207,7 +206,10 @@ func splitAnthropicMessages(req *LLMRequest) ([]claudeSystemBlock, []claudeMessa
 			entry.Type = "text"
 		}
 		if block.CacheControl != nil {
-			entry.CacheControl = &claudeCacheControl{Type: block.CacheControl.Type}
+			entry.CacheControl = &claudeCacheControl{
+				Type: block.CacheControl.Type,
+				TTL:  block.CacheControl.TTL,
+			}
 		}
 		systemBlocks = append(systemBlocks, entry)
 	}
@@ -221,10 +223,104 @@ func splitAnthropicMessages(req *LLMRequest) ([]claudeSystemBlock, []claudeMessa
 			})
 			continue
 		}
-		messages = append(messages, claudeMessage(m))
+		entry := claudeMessage{Role: m.Role, Content: m.Content}
+		if len(m.ContentBlocks) > 0 {
+			entry.Content = cloneRawMessages(m.ContentBlocks)
+		}
+		messages = append(messages, entry)
 	}
 
 	return systemBlocks, messages
+}
+
+// StreamHTTP forwards an Anthropic streaming request and relays the SSE stream.
+func (p *ClaudeProvider) StreamHTTP(ctx context.Context, req *LLMRequest, w http.ResponseWriter) error {
+	if req != nil && req.ProviderTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, req.ProviderTimeout)
+		defer cancel()
+	}
+
+	systemBlocks, messages := splitAnthropicMessages(req)
+
+	model := p.model
+	if req != nil && req.Model != "" {
+		model = req.Model
+	}
+
+	maxTokens := p.maxTokens
+	if req != nil && req.MaxTokens > 0 {
+		maxTokens = req.MaxTokens
+	}
+
+	cReq := claudeRequest{
+		Model:       model,
+		MaxTokens:   maxTokens,
+		System:      systemBlocks,
+		Messages:    messages,
+		Temperature: req.Temperature,
+		Stream:      true,
+	}
+
+	body, err := json.Marshal(cReq)
+	if err != nil {
+		return fmt.Errorf("marshal claude streaming request: %w", err)
+	}
+
+	endpoint, err := url.JoinPath(p.baseURL, anthropicMessagesPath)
+	if err != nil {
+		return fmt.Errorf("build claude endpoint URL: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body)) //nolint:gosec // baseURL from trusted config
+	if err != nil {
+		return fmt.Errorf("create streaming http request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	applyAnthropicForwardHeaders(httpReq.Header, req, p.apiKey)
+
+	resp, err := p.client.Do(httpReq) //nolint:gosec // URL from trusted config
+	if err != nil {
+		return fmt.Errorf("claude streaming API call: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))
+		return &ProviderError{
+			StatusCode: resp.StatusCode,
+			Message:    strings.TrimSpace(string(respBody)),
+		}
+	}
+
+	copyAnthropicStreamHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+
+	if flusher, ok := w.(http.Flusher); ok {
+		buf := make([]byte, 32*1024)
+		for {
+			n, readErr := resp.Body.Read(buf)
+			if n > 0 {
+				if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+					return fmt.Errorf("relay streaming response: %w", writeErr)
+				}
+				flusher.Flush()
+			}
+			if readErr != nil {
+				if readErr == io.EOF {
+					return nil
+				}
+				return fmt.Errorf("read streaming response: %w", readErr)
+			}
+		}
+	}
+
+	_, err = io.Copy(w, resp.Body)
+	if err != nil {
+		return fmt.Errorf("relay streaming response: %w", err)
+	}
+	return nil
 }
 
 // HealthCheck verifies that the Claude API is reachable.
@@ -276,5 +372,20 @@ func applyAnthropicForwardHeaders(header http.Header, req *LLMRequest, configure
 	header.Set("anthropic-version", version)
 	if beta != "" {
 		header.Set("anthropic-beta", beta)
+	}
+}
+
+func copyAnthropicStreamHeaders(dst, src http.Header) {
+	for key, values := range src {
+		lower := strings.ToLower(key)
+		switch lower {
+		case "connection", "transfer-encoding", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "upgrade":
+			continue
+		case "content-length":
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
 	}
 }

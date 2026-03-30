@@ -2,7 +2,7 @@
 // Unterstuetzt Typ-Filter, Agent-Filter, Limit und Offset.
 
 import { Hono } from "hono";
-import { getEventStoreDb } from "../db";
+import { eventRowSelectColumns, getEventStoreDb } from "../db";
 import type { EventRow } from "../types";
 
 export const eventRoutes = new Hono();
@@ -52,8 +52,7 @@ eventRoutes.get("/events", (c) => {
   const whereClause =
     conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
-  const query = `SELECT id, event_id, event_type, aggregate_id, payload,
-                        correlation_id, causation_id, tick, timestamp_ms, compensation_type
+  const query = `SELECT ${eventRowSelectColumns()}
                  FROM events
                  ${whereClause}
                  ORDER BY id DESC

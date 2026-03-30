@@ -427,7 +427,8 @@ function renderTrafficControl(container) {
   }
 
   const items = [
-    ['Primary Provider', stats.primary_provider ?? '--'],
+    ['Internal Provider', stats.internal_primary_provider ?? stats.primary_provider ?? '--'],
+    ['External MITM Provider', stats.external_mitm_provider ?? '--'],
     ['Kosten heute', formatUSD(stats.current_cost_usd)],
     ['Ersparnis heute', formatUSD(stats.estimated_savings_usd)],
     ['Hochrechnung/Tag Kosten', formatUSD(stats.projected_daily_cost_usd)],
@@ -731,11 +732,6 @@ function formatKB(bytes) {
   if (bytes > 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
   if (bytes > 1024) return (bytes / 1024).toFixed(0) + ' KB';
   return bytes + ' B';
-}
-
-function authHeaders() {
-  var key = getApiKey();
-  return key ? { Authorization: 'Bearer ' + key } : {};
 }
 
 // Auto-refresh alle 10s wenn Control-Tab aktiv

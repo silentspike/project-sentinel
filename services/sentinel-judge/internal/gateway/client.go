@@ -87,8 +87,10 @@ func (c *Client) Chat(ctx context.Context, systemPrompt, userPrompt string) (str
 		return "", fmt.Errorf("gateway marshal: %w", err)
 	}
 
+	// Judge traffic uses the internal gateway contract and must not be routed
+	// through the public Anthropic-compatible MITM endpoint.
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.baseURL+"/v1/chat/completions", bytes.NewReader(body))
+		c.baseURL+"/internal/llm", bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("gateway new request: %w", err)
 	}
