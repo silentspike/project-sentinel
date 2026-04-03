@@ -4,7 +4,7 @@
 
 - Issue: `#289` Room-Kommunikation Phase 2
 - Overall status: `IN_PROGRESS`
-- Current task: `4. Verbleibende Code-Luecken schliessen`
+- Current task: `5. Benchmarks implementieren oder an vorhandene Harnesses anbinden`
 - Plan source: `/work/company/codex-plan289.md`
 - GitHub SSOT: `gh issue view 289 --repo silentspike/project-sentinel`
 - Last refresh: `2026-04-03`
@@ -23,6 +23,9 @@
 - `buero-betriebsarzt` ist als MO-Repro-Raum bestaetigt: live von `occupant_count=3` auf `occupant_count=6` gebracht, waehrend `transit_count` separat sichtbar blieb.
 - `MO6`-relevante Trennung ist sowohl live als auch im Code bestaetigt: `decision.rs` zaehlt nur stationaere oder `transit_paused` Agents zur Occupancy.
 - Wahrscheinliche Spec-/Code-Diskrepanz fuer `MO2`: `generate_capacity_events()` feuert `"Der Raum ist komplett voll."` bereits bei `occupancy >= capacity + 2`, nicht erst darueber.
+- Room-ID-Drift ist fuer operatornahe Fixtures, Dashboard-Optionen, Daemon-/Common-/Zenoh-/Wasm-Tests und Design-Agent-Spawn-Configs bereinigt.
+- Die verbliebenen `rg`-Treffer auf Legacy-Room-IDs liegen jetzt nur noch in historischen Notizen oder bewusst erhaltenen Alias-Resolvern.
+- Remote-Regressionen fuer den Task-4-Scope sind gruen: `sentinel-common`, `sentinel-daemon`, `sentinel-zenoh`, `sentinel-wasm` sowie die betroffenen Dashboard-Tests.
 
 ## Blocked items
 
@@ -35,8 +38,8 @@
 | 1 | Baseline bestaetigen | DONE | Commit-Basis, Issue-SSOT, Branch/Worktree, Runtime-Status | command |
 | 2 | GitHub-AC-Matrix erstellen | DONE | 17 ACs in pruefbare Matrix mit Evidence-Mapping ueberfuehren | command, inspect |
 | 3 | MO1-MO6 im laufenden System reproduzierbar machen | DONE | reproduzierbare Operator-/API-Trigger fuer Kapazitaetstests | command, system |
-| 4 | Verbleibende Code-Luecken schliessen | IN_PROGRESS | nur die real offenen Ursachen beheben | command, inspect, system |
-| 5 | Benchmarks implementieren oder an vorhandene Harnesses anbinden | TODO | BFS-, Encounter- und Tick-Benchmarkpfade absichern | command |
+| 4 | Verbleibende Code-Luecken schliessen | DONE | nur die real offenen Ursachen beheben | command, inspect, system |
+| 5 | Benchmarks implementieren oder an vorhandene Harnesses anbinden | IN_PROGRESS | BFS-, Encounter- und Tick-Benchmarkpfade absichern | command |
 | 6 | TOGAF aktualisieren | TODO | Transit-Zeiten auf `15s-120s` angleichen | inspect, command |
 | 7 | 17/17 ACs mit frischer Evidence verifizieren | TODO | jede AC einzeln im laufenden System oder passendem Harness nachweisen | command, system, inspect |
 | 8 | Abschlussartefakt erstellen | TODO | AC-Endstatus, Benchmarks, Risiken, Close-Empfehlung dokumentieren | inspect, command |
@@ -268,6 +271,34 @@ Acceptance criteria:
   Live-API zeigte im selben Raum getrennte Werte fuer `occupant_count` und `transit_count`.
   Codepfad in `crates/sentinel-ecs/src/decision.rs` bildet `room_occupancy` nur aus `!in_transit || transit_paused`.
 
+## Task 4 evidence summary
+
+- Operator- und Dashboard-Room-IDs auf reale `rooms.toml`-Werte gezogen:
+  `dashboard/public/operator.html` nutzt jetzt `buero-design-1`, `kueche`, `meetingraum-01`; die betroffenen Dashboard-Tests sind entsprechend aktualisiert.
+- Direkte Runtime-Drift in Design-Agent-Configs behoben:
+  `favorite_room = "buero-design"` wurde in sechs Agent-Dateien auf reale OG-Raeume (`buero-design-1` / `buero-design-2`) umgestellt.
+  Die Spawn-Pfade in Daemon/ECS nutzen diese IDs direkt, also war das keine reine Testkosmetik.
+- Daemon-/Common-/Zenoh-/Wasm-Fixtures auf echte Room-IDs normalisiert:
+  `kueche-eg -> kueche`, `konferenz-1 -> meetingraum-01`, `buero-design -> buero-design-1`.
+- Nachbereinigung bestaetigt:
+  `rg -n "konferenz-1|kueche-eg|toilette-eg|favorite_room = \"buero-design\"|R:buero-design\\b|room_id: \"buero-design\"" /work/company/project-sentinel`
+  laesst nur noch historische Notizen oder bewusst erhaltene Alias-Resolver stehen.
+- VM-Re-Check nach Wiederverfuegbarkeit:
+  `ssh ubuntu@10.0.0.240 'hostname; systemctl is-active sentinel-daemon sentinel-projection sentinel-gateway; curl -s localhost:8000/api/agents | python3 -c "import sys,json; data=json.load(sys.stdin); print(len(data)); print(data[0][\"current_room\"] if data else \"NO_AGENTS\")"'`
+  Ergebnis: Host `sentinel-ubuntu-2404`, alle drei Dienste `active`, `26` Agents sichtbar.
+- Dashboard-Regression lokal gruen:
+  `bun test src/__tests__/events.test.ts src/routes/cockpit.test.ts`
+  Ergebnis: `17` Tests gruen.
+- Remote-Rust-Regressionen fuer den geaenderten Scope gruen:
+  `cargo remote -c -- test -p sentinel-common --test acceptance` -> `2 passed`
+  `cargo remote -c -- test -p sentinel-common --lib` -> `47 passed`
+  `cargo remote -c -- test -p sentinel-daemon episode_producer::tests::` -> `13 passed`
+  `cargo remote -c -- test -p sentinel-daemon test_fanout_topic_room_events` -> `1 passed`
+  `cargo remote -c -- test -p sentinel-daemon build_gateway_request_formats_perception_for_gateway_compiler` -> `1 passed`
+  `cargo remote -c -- test -p sentinel-daemon test_stress_cluster_detection` -> `1 passed`
+  `cargo remote -c -- test -p sentinel-zenoh flatbuf` -> `20 passed`
+  `cargo remote -c -- test -p sentinel-wasm --test acceptance` -> `10 passed`
+
 ## Task 3 repro steps
 
 1. Stabilen Repro-Modus bestaetigen:
@@ -312,3 +343,4 @@ Acceptance criteria:
 
 - `7e4a72b` — Task 1: Baseline bestaetigen
 - `6b30891` — Task 2: GitHub-AC-Matrix erstellen
+- `27d536b` — Task 3: MO1-MO6 im laufenden System reproduzierbar machen

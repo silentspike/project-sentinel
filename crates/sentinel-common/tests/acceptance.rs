@@ -44,7 +44,7 @@ fn ac_05_04_serde_roundtrip_all_types() {
     let action = AgentAction {
         agent_id: AgentId(1),
         action_type: ActionType::Chat,
-        target_room: Some("konferenz-1".to_string()),
+        target_room: Some("meetingraum-01".to_string()),
         target_agent: Some(AgentId(5)),
         content: Some("Hallo Welt".to_string()),
         timestamp: Timestamp(1000),
@@ -73,7 +73,7 @@ fn ac_05_04_serde_roundtrip_all_types() {
         is_directly_addressed: false,
         timestamp: Timestamp(2000),
         tick: Tick(100),
-        room_id: "kueche-eg".to_string(),
+        room_id: "kueche".to_string(),
         max_priority: "P2".to_string(),
         synth_fingerprint: String::new(),
         personality_type: "I".to_string(),

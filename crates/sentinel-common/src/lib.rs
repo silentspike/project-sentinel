@@ -269,7 +269,7 @@ mod tests {
         let action = AgentAction {
             agent_id: AgentId(1),
             action_type: ActionType::Chat,
-            target_room: Some("konferenz-1".to_string()),
+            target_room: Some("meetingraum-01".to_string()),
             target_agent: Some(AgentId(5)),
             content: Some("Guten Morgen!".to_string()),
             timestamp: Timestamp(1000),
@@ -279,7 +279,7 @@ mod tests {
         let deserialized: AgentAction = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.agent_id, AgentId(1));
         assert_eq!(deserialized.action_type, ActionType::Chat);
-        assert_eq!(deserialized.target_room, Some("konferenz-1".to_string()));
+        assert_eq!(deserialized.target_room, Some("meetingraum-01".to_string()));
     }
 
     #[test]

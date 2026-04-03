@@ -553,7 +553,7 @@ mod tests {
         let original = AgentAction {
             agent_id: AgentId(1),
             action_type: ActionType::Chat,
-            target_room: Some("konferenz-1".to_string()),
+            target_room: Some("meetingraum-01".to_string()),
             target_agent: Some(AgentId(5)),
             content: Some("Guten Morgen!".to_string()),
             timestamp: Timestamp(1000),
@@ -820,7 +820,7 @@ mod tests {
             "type": "AgentActionReceived",
             "agent_id": 1,
             "action_type": "Chat",
-            "target_room": "konferenz-1",
+            "target_room": "meetingraum-01",
             "content": "Guten Morgen!"
         });
         let event = DomainEvent::new(
