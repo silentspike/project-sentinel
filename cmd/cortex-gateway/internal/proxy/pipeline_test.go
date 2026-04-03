@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -225,6 +226,13 @@ func TestPipelineAnthropicMessagesPassthrough(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
 	}
+	assertAnthropicPassthroughRequest(t, internal, direct)
+	assertAnthropicMessagesResponse(t, w.Body)
+}
+
+func assertAnthropicPassthroughRequest(t *testing.T, internal, direct *pipelineMockProvider) {
+	t.Helper()
+
 	if internal.calls != 0 {
 		t.Fatalf("claude-code calls = %d, want 0", internal.calls)
 	}
@@ -249,9 +257,13 @@ func TestPipelineAnthropicMessagesPassthrough(t *testing.T) {
 	if len(direct.lastReq.Messages) != 1 || direct.lastReq.Messages[0].Content != "Sag hallo" {
 		t.Fatalf("forwarded messages = %+v", direct.lastReq.Messages)
 	}
+}
+
+func assertAnthropicMessagesResponse(t *testing.T, body io.Reader) {
+	t.Helper()
 
 	var resp map[string]any
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+	if err := json.NewDecoder(body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 	if resp["type"] != "message" {

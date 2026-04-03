@@ -486,7 +486,7 @@ playwright-cli -s=t24 screenshot
 **Console Error:** `Identifier 'authHeaders' has already been declared`
 
 **Bewertung:** Control Tab wird selektiert (Border hervorgehoben) aber Content-Bereich ist komplett leer. WebSocket verbindet nicht ("Verbinde..."). JS-Error verhindert korrekte Initialisierung. Die API liefert Daten (T8 PASS) aber das GUI rendert sie nicht.
-**Ergebnis: FAIL** — Control Panel zeigt keine Traffic Stats trotz vorhandener API-Daten. JS-Bug: doppelte authHeaders Deklaration.
+**Ergebnis: FAIL** — Control Panel zeigt keine Traffic Stats trotz vorhandener API-Daten. JS-Bug: doppelte authHeaders Definition.
 
 ---
 

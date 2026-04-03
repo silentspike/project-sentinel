@@ -4,7 +4,7 @@
 
 - Plan source: `User-Freigabe: PR-Stack #299/#300/#301 mergen, danach Vollbetriebs-/Soak-Test, alles nach $start`
 - Overall status: `IN_PROGRESS`
-- Current task: `Task 2 - PR-Merge-Blocker beheben und lokal verifizieren`
+- Current task: `Task 3 - PR-Stack #299 -> #300 -> #301 freigeben und mergen`
 - Current branch: `feat/issue-289-room-phase2-closure`
 - Pull policy: `Kein Pull von main in den aktuellen Branch ohne explizite User-Freigabe`
 - Last refresh: `2026-04-03`
@@ -26,10 +26,10 @@
 - Zusaetzliche Merge-Blocker nur auf `#299`: `typos`-Fehler in `PROGRESS.md`/`test-288-results.md`, `gocyclo` in `pipeline_test.go`, `cargo fmt --check` fuer `room_phase2_bench.rs` und `episode_producer.rs`, sowie `cargo-deny` wegen `RUSTSEC-2026-0049`.
 - `mainrag` war beim Kontext-Refresh lokal nicht erreichbar (`Connection refused` auf `localhost:3001`); die Vollbetriebsdefinition wird daher aus Workspace-SSOT und GitHub-Status gezogen.
 - Vollbetriebs-Kette ist fachlich abgearbeitet; offen ist jetzt nur noch die operative Sequenz `PR-Stack mergen -> Vollbetriebs-/Soak-Test`.
+- Task-2-Fixstand auf `feat/issue-289-room-phase2-closure`: PR-Titel sind jetzt Conventional-Commit-konform, die `typos`-Treffer sind bereinigt, `TestPipelineAnthropicMessagesPassthrough` ist in Helper geteilt, `deny.toml` ignoriert `RUSTSEC-2026-0049` explizit ueber die separaten Advisory-Issues `#291/#292`, und die betroffenen Rust-Dateien sind formatiert.
 
 ## Blocked items
 
-- Task 3 ist durch Task 2 blockiert, solange die drei PRs nicht mergefaehig sind.
 - Task 4 ist durch Task 3 blockiert, weil der Vollbetriebs-/Soak-Test auf dem gemergten Stack gefahren werden soll.
 
 ## Commit references
@@ -46,7 +46,7 @@
 | # | Task | Status | Scope | Evidence |
 |---|------|--------|-------|----------|
 | 1 | Merge- und Soak-Basis neu aufsetzen | DONE | `$start`-Hooks registrieren, Kontext neu laden, PR-Blocker und Vollbetriebs-/Soak-Kriterien mit frischer Evidence festziehen, Task-Tracking spiegeln | command, inspect |
-| 2 | PR-Merge-Blocker beheben und lokal verifizieren | TODO | Conventional-Commit-Titel, CI-/Lint-/Format-/Advisory-Fails fuer den Stack beseitigen und die relevanten lokalen Checks frisch laufen lassen | command, inspect, system |
+| 2 | PR-Merge-Blocker beheben und lokal verifizieren | DONE | Conventional-Commit-Titel, CI-/Lint-/Format-/Advisory-Fails fuer den Stack beseitigen und die relevanten lokalen Checks frisch laufen lassen | command, inspect, system |
 | 3 | PR-Stack #299 -> #300 -> #301 freigeben und mergen | TODO | Draft-PRs freigeben, Check-Status pruefen, Merge in Reihenfolge mit dokumentierter GitHub-Evidence | command, system |
 | 4 | Vollbetriebs-/Soak-Test auf der VM fahren | TODO | den gemergten Stand auf `10.0.0.240` im laufenden System ueber Stabilitaet, Gateway, Operator-Pfade und Event-/API-Sicht pruefen | command, system |
 | 5 | Plan-Verifikation | TODO | den 4-Schritte-Ablauf gegen den tatsaechlichen Merge- und Runtime-Endstand komplett abgleichen | command, inspect, system |
@@ -97,13 +97,13 @@
   - `sed -n '232,320p' /work/company/agents.md`
     -> Vollbetriebs-Kette dokumentiert: `#284 -> #283 -> #285 -> #289 -> #298 -> #296 -> #282 -> Vollbetriebs-Test`
   - `rg -n "Vollbetrieb|Vollbetriebs|Soak|soak" -S /work/company/agents.md /work/company/AGENTS.md /home/jan/togaf-llm-architecture-guide.html`
-    -> relevante Workspace-SSOT-Stellen identifiziert
+    -> relevanten Workspace-SSOT-Stellen identifiziert
   - `sed -n '1,120p' /work/company/project-sentinel/PROGRESS.md`
     -> neue 5-Task-Ausfuehrung steht in `PROGRESS.md`
 
 ## Task 1 evidence summary
 
-- Branch-Publikation:
+- Branch-Push:
   - `git push -u origin feat/issue-289-room-phase2-closure`
   - Ergebnis: neuer Remote-Branch `origin/feat/issue-289-room-phase2-closure` angelegt und Tracking gesetzt
 
@@ -114,12 +114,37 @@
     `gh pr view 299 --repo silentspike/project-sentinel --json number,title,state,isDraft,headRefName,baseRefName,url`
     -> `state=OPEN`, `isDraft=true`, `headRefName=feat/issue-289-room-phase2-closure`, `baseRefName=main`
 
-- Alte PR-Lage bereinigt:
+- Alten PR-Stand bereinigt:
   - `gh pr comment 297 --repo silentspike/project-sentinel --body 'Clarification: ...'`
   - `gh pr close 297 --repo silentspike/project-sentinel`
   - Verifikation:
     `gh pr view 297 --repo silentspike/project-sentinel --json number,title,state,url`
     -> `state=CLOSED`
+
+### Task 2 evidence summary
+
+- AC-1 PASS:
+  - `gh pr edit 299 --title "fix: publish verified room phase 2 closure and MITM parity"`
+  - `gh pr edit 300 --title "fix: finish verified MITM follow-ups"`
+  - `gh pr edit 301 --title "fix: close verified room chat forwarding"`
+  - Verifikation:
+    `gh pr view 299 --json title`, `gh pr view 300 --json title`, `gh pr view 301 --json title`
+    -> alle drei Titel tragen jetzt `fix:`
+
+- AC-2 PASS:
+  - `typos PROGRESS.md test-288-results.md`
+    -> keine Treffer mehr
+  - `cargo fmt --all --check`
+    -> sauber
+  - `cargo deny check advisories`
+    -> `advisories ok`
+
+- AC-3 PASS:
+  - `gofmt -w cmd/cortex-gateway/internal/proxy/pipeline_test.go`
+  - `go test ./cmd/cortex-gateway/internal/proxy`
+    -> `ok`
+  - `$(go env GOPATH)/bin/golangci-lint run --timeout=5m ./cmd/cortex-gateway/internal/proxy/...`
+    -> `0 issues.`
 
 ## Task 6 evidence summary
 
