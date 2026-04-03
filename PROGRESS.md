@@ -4,7 +4,7 @@
 
 - Plan source: `/work/company/codex-review.md`
 - Overall status: `IN_PROGRESS`
-- Current task: `4. #296 mit kurzem Parity-Hinweis kommentieren`
+- Current task: `5. Lokale Doku- und Memory-Artefakte nuanciert korrigieren`
 - Current branch: `feat/issue-289-room-phase2-closure`
 - Pull policy: `Kein Pull von main in den aktuellen Branch ohne explizite User-Freigabe`
 - Last refresh: `2026-04-03`
@@ -19,6 +19,7 @@
 - `#288` ist jetzt formal geschlossen; `status:verified` ist gesetzt und der Close-Kommentar hält die getrennte Parity-Lücke fest.
 - `#295` ist jetzt formal geschlossen; `status:verified` ist gesetzt und der Close-Kommentar verweist korrekt auf `baseGate`/`heard`.
 - Das neue Parity-Issue ist als `#298` offen und bildet die Lücke zwischen verifiziertem MITM-Stand und `origin/main` separat ab.
+- `#296` hat jetzt einen knappen Parity-Hinweis mit Verweis auf `#298`, ohne den Follow-up-Scope von `#296` umzudefinieren.
 - Die vorhandene `#289`-Arbeit auf diesem Branch bleibt erhalten und wird für den späteren `#289`-Task wiederverwendet.
 
 ## Blocked items
@@ -43,8 +44,8 @@
 | 1 | #288 formal mit verifizierter Begründung schließen | DONE | Issue-Status prüfen, `status:verified` setzen, korrekt kommentieren, schließen | command |
 | 2 | #295 formal mit baseGate/heard-Begründung schließen | DONE | Issue-Kommentar mit Code-/Testbasis, `status:verified` setzen, schließen | command, inspect |
 | 3 | Neues Parity-Issue für origin/main gegen e4f8769/VM anlegen | DONE | schmal geschnittenes GitHub-Issue mit präzisem Scope und Labels | command |
-| 4 | #296 mit kurzem Parity-Hinweis kommentieren | IN_PROGRESS | knapper Hinweis auf Parity-Lücke, ohne Scope-Mix | command |
-| 5 | Lokale Doku- und Memory-Artefakte nuanciert korrigieren | TODO | `AGENTS.md`, `agents.md`, `test-288-*` an neuen Stand anpassen | inspect, command |
+| 4 | #296 mit kurzem Parity-Hinweis kommentieren | DONE | knapper Hinweis auf Parity-Lücke, ohne Scope-Mix | command |
+| 5 | Lokale Doku- und Memory-Artefakte nuanciert korrigieren | IN_PROGRESS | `AGENTS.md`, `agents.md`, `test-288-*` an neuen Stand anpassen | inspect, command |
 | 6 | #289 gemäß bestehender Branch-/Progress-Basis vollständig verifizieren und abschließen | TODO | vorhandene Room-Phase-2-Arbeit final zu Ende führen, `17/17` ACs + Benchmarks + Close | command, system, inspect |
 | 7 | Parity-Lücke zwischen e4f8769 und origin/main implementieren | TODO | MITM-Vertrag auf kanonischem `origin/main` wiederherstellen | command, system, inspect |
 | 8 | Verbleibende #296-Follow-ups sauber weiterbearbeiten | TODO | Streaming/Blocks/Observability/Redaction nach Scope | command, system, inspect |
@@ -117,27 +118,46 @@
 
 ## Current task pre-check
 
-### Task 4: #296 mit kurzem Parity-Hinweis kommentieren
+## Task 4 evidence summary
+
+- AC4.1 PASS
+  - `gh issue view 296 --repo silentspike/project-sentinel --json number,title,state,labels,url`
+  - Ergebnis: `#296` ist weiterhin `OPEN` und referenzierbar.
+- AC4.2 PASS
+  - `gh issue comment 296 --repo silentspike/project-sentinel --body ...`
+  - Ergebnis: Kommentar hält `#296` beim Follow-up-Scope und verweist die Parity-Lücke sauber auf `#298`.
+- AC4.3 PASS
+  - `gh issue view 296 --repo silentspike/project-sentinel --json comments --jq '.comments[-1].body'`
+  - Ergebnis: der neue Kommentar ist sichtbar.
+
+## Current task pre-check
+
+### Task 5: Lokale Doku- und Memory-Artefakte nuanciert korrigieren
 
 Was muss getan werden:
-- `#296` live prüfen
-- einen knappen Kommentar setzen, der `#296` nicht entwertet
-- auf `#298` als separates Parity-Issue verweisen
+- relevante lokale Artefakte rereaden
+- falsche oder zu harte Aussagen präzise korrigieren
+- den MITM-Vertrag als realen verifizierten Stand belassen, aber die `origin/main`-Parity-Lücke klar benennen
 - Ergebnis in `PROGRESS.md` dokumentieren
 
 Welche ACs müssen für den Task passen:
-- AC4.1: `#296` ist noch offen und referenzierbar
-- AC4.2: Kommentar hält `#296` beim Follow-up-Scope und schiebt die Parity-Lücke korrekt nach `#298`
-- AC4.3: Kommentar ist auf GitHub sichtbar
+- AC5.1: `AGENTS.md` ist auf den nuancierten Parity-Stand korrigiert
+- AC5.2: `agents.md` ist auf den nuancierten Parity-Stand korrigiert
+- AC5.3: `test-288-matrix.md`, `test-288-matrix-v3.md`, `test-288-results.md` vermeiden die falsche Gegenwartsbehauptung über `origin/main`
 
 Wie wird jede AC bewiesen:
-- AC4.1: `gh issue view 296`
-- AC4.2: Kommentartext plus `gh issue view 296 --json comments`
-- AC4.3: Kommentar-URL oder letzter Kommentar aus `gh issue view 296`
+- AC5.1: `inspect` auf aktualisierte Datei
+- AC5.2: `inspect` auf aktualisierte Datei
+- AC5.3: `inspect` auf aktualisierte Dateien plus gezieltes `rg`
 
 Erwartete Dateiänderungen:
+- `/work/company/AGENTS.md`
+- `/work/company/agents.md`
+- `/work/company/project-sentinel/test-288-matrix.md`
+- `/work/company/project-sentinel/test-288-matrix-v3.md`
+- `/work/company/project-sentinel/test-288-results.md`
 - `/work/company/project-sentinel/PROGRESS.md`
 
 Bekannte Risiken oder Abhängigkeiten:
-- Kein Repo-Code wird für Task 4 geändert.
-- Der Kommentar darf `#296` nicht zum Root-Cause erklären, sondern nur die Leitplanke für künftige Arbeit klarziehen.
+- Task 5 darf die historische Validität von `#288` nicht zurücknehmen.
+- Die Korrektur muss zwischen verifiziertem MITM-Stand und kanonischem `origin/main` unterscheiden, statt pauschal „falsch“ oder pauschal „alles korrekt“ zu behaupten.
