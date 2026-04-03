@@ -1435,17 +1435,17 @@ mod wasm_fs {
             social_need: 0.60,
             caffeine: 0.33,
             bladder: 0.20,
-            room_id: "buero-design".to_string(),
+            room_id: "buero-design-1".to_string(),
         }
     }
 
     fn make_rooms() -> HashMap<String, RoomSnapshot> {
         let mut rooms = HashMap::new();
         rooms.insert(
-            "buero-design".to_string(),
+            "buero-design-1".to_string(),
             RoomSnapshot {
-                room_id: "buero-design".to_string(),
-                name: "Design Buero".to_string(),
+                room_id: "buero-design-1".to_string(),
+                name: "Design Buero 1".to_string(),
                 floor: 1,
                 temperature: 21.5,
                 noise_db: 40.0,
@@ -1453,10 +1453,10 @@ mod wasm_fs {
             },
         );
         rooms.insert(
-            "kueche-eg".to_string(),
+            "kueche".to_string(),
             RoomSnapshot {
-                room_id: "kueche-eg".to_string(),
-                name: "Kueche EG".to_string(),
+                room_id: "kueche".to_string(),
+                name: "Kueche".to_string(),
                 floor: 0,
                 temperature: 23.0,
                 noise_db: 55.0,
@@ -1569,7 +1569,7 @@ mod wasm_fs {
         let result = host
             .execute(
                 &fs_fixture(),
-                "room buero-design",
+                "room buero-design-1",
                 make_agent_snapshot(),
                 make_rooms(),
                 400,
@@ -1583,8 +1583,8 @@ mod wasm_fs {
             result.err()
         );
         let output = result.unwrap();
-        assert!(output.contains("room:buero-design"), "Output: {output}");
-        assert!(output.contains("name:Design Buero"), "Output: {output}");
+        assert!(output.contains("room:buero-design-1"), "Output: {output}");
+        assert!(output.contains("name:Design Buero 1"), "Output: {output}");
         assert!(output.contains("floor:1"), "Output: {output}");
         assert!(output.contains("temp:21.5"), "Output: {output}");
         assert!(output.contains("noise:40.0"), "Output: {output}");
@@ -1941,7 +1941,7 @@ mod wasm_fs {
         let result = host
             .execute(
                 &fs_fixture(),
-                "room kueche-eg",
+                "room kueche",
                 make_agent_snapshot(),
                 make_rooms(),
                 1200,
@@ -1949,10 +1949,10 @@ mod wasm_fs {
             )
             .unwrap();
 
-        assert!(result.is_ok(), "kueche-eg: {:?}", result.err());
+        assert!(result.is_ok(), "kueche: {:?}", result.err());
         let output = result.unwrap();
-        assert!(output.contains("room:kueche-eg"), "Output: {output}");
-        assert!(output.contains("name:Kueche EG"), "Output: {output}");
+        assert!(output.contains("room:kueche"), "Output: {output}");
+        assert!(output.contains("name:Kueche"), "Output: {output}");
         assert!(output.contains("floor:0"), "Output: {output}");
         assert!(output.contains("temp:23.0"), "Output: {output}");
         assert!(output.contains("noise:55.0"), "Output: {output}");

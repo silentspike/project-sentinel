@@ -95,14 +95,14 @@ function seedEvents(db: Database): void {
   // Action caused by chaos
   insert.run(
     "evt-action-1", "transit_started", "AGENT-03",
-    JSON.stringify({ from_room: "buero-dev-1", to_room: "kueche-eg", duration_ms: 5000 }),
+    JSON.stringify({ from_room: "buero-dev-1", to_room: "kueche", duration_ms: 5000 }),
     "cor-1", "evt-chaos-1", "op-2", 4821, now - 590_000, "none",
   );
 
   // Transit completed (outcome)
   insert.run(
     "evt-outcome-1", "transit_completed", "AGENT-03",
-    JSON.stringify({ room: "kueche-eg" }),
+    JSON.stringify({ room: "kueche" }),
     "cor-1", "evt-action-1", "op-3", 4822, now - 580_000, "none",
   );
 
