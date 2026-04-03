@@ -14,7 +14,7 @@ func TestClientChat(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("expected POST, got %s", r.Method)
 		}
-		if r.URL.Path != "/v1/chat/completions" {
+		if r.URL.Path != "/internal/llm" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 

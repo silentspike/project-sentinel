@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -20,6 +22,7 @@ type LLMRequest struct {
 	SystemBlocks       []SystemBlock     `json:"system,omitempty"`
 	Temperature        float64           `json:"temperature"`
 	MaxTokens          int               `json:"max_tokens"`
+	Stream             bool              `json:"stream,omitempty"`
 	Model              string            `json:"model,omitempty"`
 	Metadata           map[string]string `json:"metadata,omitempty"`
 	Format             RequestFormat     `json:"-"`
@@ -31,13 +34,15 @@ type LLMRequest struct {
 
 // Message represents a single message in an LLM conversation.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role          string            `json:"role"`
+	Content       string            `json:"content"`
+	ContentBlocks []json.RawMessage `json:"-"`
 }
 
 // CacheControl annotates provider-side content caching hints.
 type CacheControl struct {
 	Type string `json:"type"`
+	TTL  string `json:"ttl,omitempty"`
 }
 
 // SystemBlock is a structured system-level content block.
@@ -49,12 +54,13 @@ type SystemBlock struct {
 
 // LLMResponse represents a response from an LLM provider.
 type LLMResponse struct {
-	Content      string `json:"content"`
-	Model        string `json:"model"`
-	TokensUsed   int    `json:"tokens_used"`
-	InputTokens  int    `json:"input_tokens"`
-	OutputTokens int    `json:"output_tokens"`
-	FinishReason string `json:"finish_reason"`
+	Content       string            `json:"content"`
+	ContentBlocks []json.RawMessage `json:"-"`
+	Model         string            `json:"model"`
+	TokensUsed    int               `json:"tokens_used"`
+	InputTokens   int               `json:"input_tokens"`
+	OutputTokens  int               `json:"output_tokens"`
+	FinishReason  string            `json:"finish_reason"`
 }
 
 // Provider interface for LLM backends.
@@ -62,6 +68,12 @@ type Provider interface {
 	Name() string
 	Send(ctx context.Context, req *LLMRequest) (*LLMResponse, error)
 	HealthCheck(ctx context.Context) error
+}
+
+// StreamingProvider is an optional provider capability for relaying HTTP
+// streaming responses such as Anthropic SSE.
+type StreamingProvider interface {
+	StreamHTTP(ctx context.Context, req *LLMRequest, w http.ResponseWriter) error
 }
 
 // ProviderStatusReporter is an optional provider capability for exposing an
@@ -163,4 +175,18 @@ func NewProviderFromConfig(cfg ProviderConfig) (Provider, error) {
 	default:
 		return nil, fmt.Errorf("unknown provider type: %q", cfg.Type)
 	}
+}
+
+func cloneRawMessages(in []json.RawMessage) []json.RawMessage {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]json.RawMessage, len(in))
+	for i, block := range in {
+		if block == nil {
+			continue
+		}
+		out[i] = append(json.RawMessage(nil), block...)
+	}
+	return out
 }

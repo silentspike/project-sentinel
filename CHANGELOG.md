@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MITM Follow-ups: Dashboard-Legacy-Schema, Anthropic-Streaming/Blocks, Observability, Redaction** (#296)
+  - Dashboard-Queries waehlen Event-Spalten jetzt schema-robust, so dass lokale DBs ohne `compensation_type` weder `cockpit` noch `events` brechen
+  - Gateway erhaelt rohe Anthropic-Content-Blocks ueber `/v1/messages`, beantwortet SSE-Streaming direkt und behaelt den Anthropic-Wire-Shape bei
+  - `traffic-stats` trennt jetzt internen Runtime-Provider (`internal_primary_provider`) und externen MITM-Provider (`external_mitm_provider`)
+  - interne Runtime-Clients (`sentinel-daemon`, `sentinel-judge`) nutzen jetzt `/internal/llm` statt den externen Kompatibilitaetspfad
+  - MITM-Smoke-Tooling wurde mit `scripts/mitm-smoke.sh` und erweiterter Fake-Anthropic-API nachgezogen; Auth-Dummywerte bleiben in Logs redigiert
+
 - **Canonical main parity: verified MITM contract restored on `/v1/messages`** (#298)
   - Gateway exposes `POST /v1/messages` again on the canonical line, not only on drifted deploys or historical branches
   - Anthropic wire-format parsing, path-specific error/response shaping and request-scoped passthrough headers are restored
