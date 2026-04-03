@@ -31,24 +31,6 @@ func (m *mockProvider) Send(_ context.Context, _ *LLMRequest) (*LLMResponse, err
 }
 func (m *mockProvider) HealthCheck(_ context.Context) error { return nil }
 
-type streamRecorderProvider struct {
-	name       string
-	lastReq    *LLMRequest
-	streamBody string
-}
-
-func (p *streamRecorderProvider) Name() string { return p.name }
-func (p *streamRecorderProvider) Send(_ context.Context, _ *LLMRequest) (*LLMResponse, error) {
-	return nil, errors.New("unexpected Send call")
-}
-func (p *streamRecorderProvider) HealthCheck(_ context.Context) error { return nil }
-func (p *streamRecorderProvider) StreamHTTP(_ context.Context, req *LLMRequest, w http.ResponseWriter) error {
-	p.lastReq = req
-	w.Header().Set("Content-Type", "text/event-stream")
-	_, err := w.Write([]byte(p.streamBody))
-	return err
-}
-
 type timeoutAwareProvider struct {
 	name  string
 	sleep time.Duration
