@@ -2,9 +2,9 @@
 
 ## Status
 
-- Plan source: `/work/company/codex-review.md`
+- Plan source: `User-freigegebener 4-Schritte-Ablauf nach $start`
 - Overall status: `IN_PROGRESS`
-- Current task: `8. Verbleibende #296-Follow-ups sauber weiterbearbeiten`
+- Current task: `2. Frischen #296-Arbeitsbranch von der korrigierten Basis anlegen`
 - Current branch: `feat/issue-289-room-phase2-closure`
 - Pull policy: `Kein Pull von main in den aktuellen Branch ohne explizite User-Freigabe`
 - Last refresh: `2026-04-03`
@@ -17,12 +17,16 @@
 - `#296` bleibt offen als echtes Follow-up fuer Dashboard/Streaming/Blocks/Observability/Redaction; die Parity-Luecke liegt separat in `#298`.
 - `#289` ist jetzt formal geschlossen; `status:verified` ist gesetzt, `status:triage` und `quality:needs-spec` sind entfernt.
 - `#298` ist jetzt formal geschlossen; `/v1/messages`, request-scoped Anthropic-Passthrough, path-spezifische Anthropic-Responses und die zugehoerigen Smoke-Tests sind wiederhergestellt.
+- Der aktuelle Closure-/Parity-Stand ist jetzt auf GitHub publiziert:
+  Draft-PR `#299` von `feat/issue-289-room-phase2-closure` nach `main`.
+- Der alte PR `#297` von `fix/issue-296-mitm-followups` ist jetzt geschlossen und explizit als superseded markiert.
 - TOGAF und lokale Artefakte sind auf den verifizierten Room-Phase-2-Stand angeglichen: realistische Transit-Zeiten `15s-120s`, Transit-Perception mit Zwischen-Raum und adaptiver Heartbeat ohne separaten Async-Task.
 
 ## Blocked items
 
 - Kein aktiver Blocker mehr fuer `#289`.
-- Naechster aktiver Planpunkt sind die verbleibenden `#296`-Follow-ups.
+- Kein technischer Blocker fuer Schritt 2; die korrigierte GitHub-Basis steht jetzt ueber PR `#299`.
+- `#296` soll auf einem frischen Branch weiterlaufen, nicht auf `fix/issue-296-mitm-followups`.
 
 ## Commit references
 
@@ -37,15 +41,31 @@
 
 | # | Task | Status | Scope | Evidence |
 |---|------|--------|-------|----------|
-| 1 | #288 formal mit verifizierter Begründung schließen | DONE | Issue-Status prüfen, `status:verified` setzen, korrekt kommentieren, schließen | command |
-| 2 | #295 formal mit baseGate/heard-Begründung schließen | DONE | Issue-Kommentar mit Code-/Testbasis, `status:verified` setzen, schließen | command, inspect |
-| 3 | Neues Parity-Issue für origin/main gegen e4f8769/VM anlegen | DONE | schmal geschnittenes GitHub-Issue mit präzisem Scope und Labels | command |
-| 4 | #296 mit kurzem Parity-Hinweis kommentieren | DONE | knapper Hinweis auf Parity-Lücke, ohne Scope-Mix | command |
-| 5 | Lokale Doku- und Memory-Artefakte nuanciert korrigieren | DONE | `AGENTS.md`, `agents.md`, `test-288-*` an neuen Stand anpassen | inspect, command |
-| 6 | #289 gemäß bestehender Branch-/Progress-Basis vollständig verifizieren und abschließen | DONE | vorhandene Room-Phase-2-Arbeit final zu Ende führen, `17/17` ACs + Benchmarks + Close | command, system, inspect |
-| 7 | Parity-Lücke zwischen e4f8769 und origin/main implementieren | DONE | MITM-Vertrag auf kanonischem `origin/main` wiederherstellen | command, system, inspect |
-| 8 | Verbleibende #296-Follow-ups sauber weiterbearbeiten | IN_PROGRESS | Streaming/Blocks/Observability/Redaction nach Scope | command, system, inspect |
-| 9 | Plan-Verifikation | TODO | `/work/company/codex-review.md` Zeile für Zeile gegen Ergebnis abgleichen | command, inspect, system |
+| 1 | Aktuellen #289/#298-Stand publizieren | DONE | aktuellen Branch pushen, PR-Lage bereinigen, verifizierten Closure-/Parity-Stand auf GitHub sichtbar machen | command, system |
+| 2 | Frischen #296-Arbeitsbranch von der korrigierten Basis anlegen | IN_PROGRESS | neuen Branch fuer #296 auf Basis des publizierten Stands erzeugen; alten `fix/issue-296-mitm-followups` nicht weiterverwenden | command |
+| 3 | Echten verbleibenden #296-Scope bearbeiten | TODO | Dashboard/Streaming/Blocks/Observability/Redaction nach aktuellem Issue-Scope umsetzen, verifizieren, dokumentieren | command, system, inspect |
+| 4 | Anschließend #282 starten | TODO | Room-Chat-Forwarding auf derselben verifizierten Basis bearbeiten und live belegen | command, system, inspect |
+| 5 | Plan-Verifikation | TODO | Vier-Schritte-Ablauf gegen Ergebnis und Runtime-Stand komplett abgleichen | command, inspect, system |
+
+## Task 1 evidence summary
+
+- Branch-Publikation:
+  - `git push -u origin feat/issue-289-room-phase2-closure`
+  - Ergebnis: neuer Remote-Branch `origin/feat/issue-289-room-phase2-closure` angelegt und Tracking gesetzt
+
+- Aktueller Publikations-PR:
+  - `gh pr create --repo silentspike/project-sentinel --base main --head feat/issue-289-room-phase2-closure --draft ...`
+  - Ergebnis: Draft-PR `#299`
+  - Verifikation:
+    `gh pr view 299 --repo silentspike/project-sentinel --json number,title,state,isDraft,headRefName,baseRefName,url`
+    -> `state=OPEN`, `isDraft=true`, `headRefName=feat/issue-289-room-phase2-closure`, `baseRefName=main`
+
+- Alte PR-Lage bereinigt:
+  - `gh pr comment 297 --repo silentspike/project-sentinel --body 'Clarification: ...'`
+  - `gh pr close 297 --repo silentspike/project-sentinel`
+  - Verifikation:
+    `gh pr view 297 --repo silentspike/project-sentinel --json number,title,state,url`
+    -> `state=CLOSED`
 
 ## Task 6 evidence summary
 
