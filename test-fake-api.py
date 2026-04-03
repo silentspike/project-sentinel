@@ -1,6 +1,6 @@
 """Fake Anthropic API Endpoint — testet ob claude -p synthetisierte Responses akzeptiert."""
 import json
-import time
+import os
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -49,7 +49,10 @@ class FakeAnthropicHandler(BaseHTTPRequestHandler):
             "content": [
                 {
                     "type": "text",
-                    "text": "Morgen wird es in Wien voraussichtlich sonnig mit Temperaturen um die 18 Grad, ideal fuer einen Spaziergang im Prater."
+                    "text": os.environ.get(
+                        "FAKE_ANTHROPIC_TEXT",
+                        "Morgen wird es in Wien voraussichtlich sonnig mit Temperaturen um die 18 Grad, ideal fuer einen Spaziergang im Prater."
+                    )
                 }
             ],
             "model": req.get("model", "claude-opus-4-6"),
@@ -84,7 +87,7 @@ class FakeAnthropicHandler(BaseHTTPRequestHandler):
         pass  # Suppress default logging
 
 if __name__ == '__main__':
-    port = 19876
+    port = int(os.environ.get("FAKE_ANTHROPIC_PORT", "19876"))
     server = HTTPServer(('127.0.0.1', port), FakeAnthropicHandler)
     print(f"Fake Anthropic API listening on http://127.0.0.1:{port}")
     print(f"Route claude with: ANTHROPIC_BASE_URL=http://127.0.0.1:{port}")

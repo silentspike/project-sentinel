@@ -82,7 +82,10 @@ func (p *OllamaProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 
 	messages := make([]ollamaMessage, len(req.Messages))
 	for i, m := range req.Messages {
-		messages[i] = ollamaMessage(m)
+		messages[i] = ollamaMessage{
+			Role:    m.Role,
+			Content: m.Content,
+		}
 	}
 
 	model := p.model

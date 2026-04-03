@@ -251,7 +251,10 @@ func main() {
 	// 6. HTTP proxy server
 	proxyMux := http.NewServeMux()
 	proxyMux.Handle("POST /v1/messages", pipelineHandler)
+	// Legacy/internal JSON compatibility path. Prefer /internal/llm for service-to-service calls.
 	proxyMux.Handle("POST /v1/chat/completions", pipelineHandler)
+	// Canonical internal gateway contract for daemon/judge traffic.
+	proxyMux.Handle("POST /internal/llm", pipelineHandler)
 	proxyMux.HandleFunc("GET /health", handleHealth(pipelineHandler, guardrailsEnforcer != nil))
 	proxyMux.HandleFunc("GET /ready", handleReady)
 	proxyMux.Handle("GET /metrics", promhttp.Handler())
@@ -300,6 +303,8 @@ func main() {
 			"synthesis_rate":              costStats.SynthesisRate,
 			"cost_by_provider":            costStats.ByProvider,
 			"primary_provider":            controlConfig.Get().PrimaryProvider,
+			"internal_primary_provider":   controlConfig.Get().PrimaryProvider,
+			"external_mitm_provider":      "anthropic-direct",
 			"intercept_mode":              controlConfig.Get().InterceptMode,
 			"max_forward_concurrency":     controlConfig.Get().MaxForwardConcurrency,
 			"tick_sync_timeout_ms":        controlConfig.Get().TickSyncTimeoutMs,
