@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Canonical main parity: verified MITM contract restored on `/v1/messages`** (#298)
+  - Gateway exposes `POST /v1/messages` again on the canonical line, not only on drifted deploys or historical branches
+  - Anthropic wire-format parsing, path-specific error/response shaping and request-scoped passthrough headers are restored
+  - `anthropic-direct` now propagates upstream HTTP status codes back into the pipeline, so MITM auth failures surface as `401 authentication_error` again
+  - Gateway smoke coverage restored for Anthropic passthrough and provider-header forwarding
+
 - **Move-Action zu ungueltigem Raum validiert** — Agent konnte in nicht-existierenden Raum (z.B. "Tuer") wechseln. Fix: input_system validiert target_room gegen RoomDistanceMap.
 
 - **Agents spawnen nicht in favorite_room** (#272)

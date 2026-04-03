@@ -4,24 +4,25 @@
 
 - Plan source: `/work/company/codex-review.md`
 - Overall status: `IN_PROGRESS`
-- Current task: `7. Parity-Luecke zwischen e4f8769/VM und origin/main implementieren`
+- Current task: `8. Verbleibende #296-Follow-ups sauber weiterbearbeiten`
 - Current branch: `feat/issue-289-room-phase2-closure`
 - Pull policy: `Kein Pull von main in den aktuellen Branch ohne explizite User-Freigabe`
 - Last refresh: `2026-04-03`
 
 ## Current findings
 
-- GitHub `origin/main` steht auf `4e69d4f`, lokales `main` auf `e4f8769`; die verifizierte MITM-Parity-Luecke bleibt als `#298` offen.
+- GitHub `origin/main` stand zu Task-Start auf `4e69d4f`; der historische MITM-Vertrag aus `e4f8769` ist jetzt wieder im aktuellen Gateway-Code und auf der VM deployed.
 - `#288` ist formal geschlossen; `status:verified` ist gesetzt und der Close-Kommentar grenzt die getrennte Parity-Luecke sauber ab.
 - `#295` ist formal geschlossen; `status:verified` ist gesetzt und der Close-Kommentar verweist korrekt auf den provider-unabhaengigen `baseGate`-/`heard`-Fix.
 - `#296` bleibt offen als echtes Follow-up fuer Dashboard/Streaming/Blocks/Observability/Redaction; die Parity-Luecke liegt separat in `#298`.
 - `#289` ist jetzt formal geschlossen; `status:verified` ist gesetzt, `status:triage` und `quality:needs-spec` sind entfernt.
+- `#298` ist jetzt formal geschlossen; `/v1/messages`, request-scoped Anthropic-Passthrough, path-spezifische Anthropic-Responses und die zugehoerigen Smoke-Tests sind wiederhergestellt.
 - TOGAF und lokale Artefakte sind auf den verifizierten Room-Phase-2-Stand angeglichen: realistische Transit-Zeiten `15s-120s`, Transit-Perception mit Zwischen-Raum und adaptiver Heartbeat ohne separaten Async-Task.
 
 ## Blocked items
 
 - Kein aktiver Blocker mehr fuer `#289`.
-- Naechster aktiver Planpunkt ist die Implementierung der Parity-Luecke `#298` auf kanonischem `origin/main`.
+- Naechster aktiver Planpunkt sind die verbleibenden `#296`-Follow-ups.
 
 ## Commit references
 
@@ -42,8 +43,8 @@
 | 4 | #296 mit kurzem Parity-Hinweis kommentieren | DONE | knapper Hinweis auf Parity-Lücke, ohne Scope-Mix | command |
 | 5 | Lokale Doku- und Memory-Artefakte nuanciert korrigieren | DONE | `AGENTS.md`, `agents.md`, `test-288-*` an neuen Stand anpassen | inspect, command |
 | 6 | #289 gemäß bestehender Branch-/Progress-Basis vollständig verifizieren und abschließen | DONE | vorhandene Room-Phase-2-Arbeit final zu Ende führen, `17/17` ACs + Benchmarks + Close | command, system, inspect |
-| 7 | Parity-Lücke zwischen e4f8769 und origin/main implementieren | IN_PROGRESS | MITM-Vertrag auf kanonischem `origin/main` wiederherstellen | command, system, inspect |
-| 8 | Verbleibende #296-Follow-ups sauber weiterbearbeiten | TODO | Streaming/Blocks/Observability/Redaction nach Scope | command, system, inspect |
+| 7 | Parity-Lücke zwischen e4f8769 und origin/main implementieren | DONE | MITM-Vertrag auf kanonischem `origin/main` wiederherstellen | command, system, inspect |
+| 8 | Verbleibende #296-Follow-ups sauber weiterbearbeiten | IN_PROGRESS | Streaming/Blocks/Observability/Redaction nach Scope | command, system, inspect |
 | 9 | Plan-Verifikation | TODO | `/work/company/codex-review.md` Zeile für Zeile gegen Ergebnis abgleichen | command, inspect, system |
 
 ## Task 6 evidence summary
@@ -130,3 +131,39 @@
   - `gh issue edit 289 --repo silentspike/project-sentinel --add-label 'status:verified' --remove-label 'status:triage' --remove-label 'quality:needs-spec'`
   - `gh issue close 289 --repo silentspike/project-sentinel`
   - Ergebnis: `#289` ist `CLOSED`
+
+## Task 7 evidence summary
+
+- Historische MITM-Parity-Luecke gegen `e4f8769` geschlossen:
+  - `cmd/cortex-gateway/main.go`: `POST /v1/messages` wiederhergestellt
+  - `cmd/cortex-gateway/internal/proxy/provider.go`: `RequestFormat`, `PreferredProvider`, `PassthroughHeaders` wiederhergestellt
+  - `cmd/cortex-gateway/internal/proxy/anthropic_api.go`: Anthropic-wire-format Parse/Response/Error helpers wiederhergestellt
+  - `cmd/cortex-gateway/internal/proxy/claude.go`: request-scoped Header-Passthrough und HTTP-Status-Weitergabe als `ProviderError`
+  - `cmd/cortex-gateway/internal/proxy/pipeline.go`: path-aware Parse/Error/Response-Pfade fuer `/v1/messages` wiederhergestellt
+  - `cmd/cortex-gateway/internal/proxy/judge_adapter.go`: passthrough-/format-sensitive Judge-Regen-Requests wiederhergestellt
+
+- Lokale Smoke-/Regression-Tests:
+  - `go test ./cmd/cortex-gateway/internal/...`
+  - Ergebnis: kompletter Gateway-Teststack gruen
+  - Wiederhergestellte Schluesseltests:
+    - `TestPipelineAnthropicMessagesPassthrough`
+    - `TestClaudeProviderSendUsesPassthroughHeaders`
+    - `TestClaudeProviderSendReturnsProviderErrorOnNon200`
+
+- VM-Deploy und Runtime-Evidence:
+  - Linux-Build:
+    `GOOS=linux GOARCH=amd64 go build -o cortex-gateway ./cmd/cortex-gateway/`
+  - Deploy:
+    `scp cortex-gateway ubuntu@10.0.0.240:/tmp/cortex-gateway`
+    `ssh ubuntu@10.0.0.240 "sudo systemctl stop sentinel-gateway && sudo cp /tmp/cortex-gateway /opt/sentinel/bin/cortex-gateway && sudo systemctl start sentinel-gateway && systemctl is-active sentinel-gateway"`
+  - Ergebnis: `sentinel-gateway` wieder `active`
+  - MITM-Smoke auf der VM:
+    - `POST /v1/messages` ohne Auth -> `401`
+    - Body: `{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",...}}`
+    - `POST /v1/messages` mit `Authorization` + `Anthropic-Version` -> ebenfalls path-spezifischer `401 authentication_error` statt `404` oder generischem internen JSON
+
+- Formale GitHub-Abschluss-Schritte:
+  - Kommentar mit kompletter Evidence auf `#298` hinterlegt
+  - `gh issue edit 298 --repo silentspike/project-sentinel --add-label 'status:verified' --remove-label 'status:triage' --remove-label 'quality:needs-spec'`
+  - `gh issue close 298 --repo silentspike/project-sentinel`
+  - Ergebnis: `#298` ist `CLOSED`
