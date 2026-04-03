@@ -694,9 +694,9 @@ pub mod bridge {
                 is_directly_addressed: false,
                 timestamp: Timestamp(1234),
                 tick: Tick(55),
-                room_id: "buero-design".to_string(),
+                room_id: "buero-design-1".to_string(),
                 max_priority: "P2".to_string(),
-                synth_fingerprint: "H3|E7|B2|S4|C1|SN5|R:buero-design|P:2|CH:0|HR:0|T:10|TMP:1|PE:E|IM:0".to_string(),
+                synth_fingerprint: "H3|E7|B2|S4|C1|SN5|R:buero-design-1|P:2|CH:0|HR:0|T:10|TMP:1|PE:E|IM:0".to_string(),
                 personality_type: "E".to_string(),
                 has_operator_impulse: false,
             };
@@ -728,7 +728,7 @@ pub mod bridge {
             assert_eq!(metadata.get("acoustic").unwrap(), &perception.acoustic_text);
 
             // Traffic Control Metadata
-            assert_eq!(metadata.get("room_id").unwrap(), "buero-design");
+            assert_eq!(metadata.get("room_id").unwrap(), "buero-design-1");
             assert_eq!(metadata.get("max_priority").unwrap(), "P2");
             assert!(metadata.get("synth_fp").unwrap().starts_with("H3|E7|"));
             assert_eq!(metadata.get("is_directly_addressed").unwrap(), "false");

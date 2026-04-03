@@ -250,6 +250,7 @@ func main() {
 
 	// 6. HTTP proxy server
 	proxyMux := http.NewServeMux()
+	proxyMux.Handle("POST /v1/messages", pipelineHandler)
 	proxyMux.Handle("POST /v1/chat/completions", pipelineHandler)
 	proxyMux.HandleFunc("GET /health", handleHealth(pipelineHandler, guardrailsEnforcer != nil))
 	proxyMux.HandleFunc("GET /ready", handleReady)

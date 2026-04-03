@@ -69,7 +69,7 @@ describe("Events Routes", () => {
 
     insert.run("evt-1", "chaos_triggered", "buero-dev-1", '{"event_type":"PhoneRing"}', 100, now - 60000);
     insert.run("evt-2", "agent_action_received", "AGENT-01", '{"action_type":"speak"}', 101, now - 50000);
-    insert.run("evt-3", "chaos_triggered", "kueche-eg", '{"event_type":"PrinterBroken"}', 102, now - 40000);
+    insert.run("evt-3", "chaos_triggered", "kueche", '{"event_type":"PrinterBroken"}', 102, now - 40000);
     insert.run("evt-4", "agent_spawned", "AGENT-02", '{}', 103, now - 30000);
     insert.run("evt-5", "bio_action_performed", "AGENT-01", '{}', 104, now - 20000);
 

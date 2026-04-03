@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -156,8 +157,7 @@ func (p *ClaudeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", p.apiKey)
-	httpReq.Header.Set("anthropic-version", anthropicVersion)
+	applyAnthropicForwardHeaders(httpReq.Header, req, p.apiKey)
 
 	resp, err := p.client.Do(httpReq) //nolint:gosec // URL from trusted config
 	if err != nil {
@@ -171,7 +171,10 @@ func (p *ClaudeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("claude API returned status %d: %s", resp.StatusCode, string(respBody))
+		return nil, &ProviderError{
+			StatusCode: resp.StatusCode,
+			Message:    string(respBody),
+		}
 	}
 
 	var cResp claudeResponse
@@ -249,4 +252,32 @@ func (p *ClaudeProvider) HealthCheck(ctx context.Context) error {
 
 	// Any response (even 405 Method Not Allowed) means the API is reachable
 	return nil
+}
+
+func applyAnthropicForwardHeaders(header http.Header, req *LLMRequest, configuredAPIKey string) {
+	var passthrough map[string]string
+	if req != nil {
+		passthrough = req.PassthroughHeaders
+	}
+
+	auth := strings.TrimSpace(passthrough["authorization"])
+	apiKey := strings.TrimSpace(passthrough["x-api-key"])
+	version := strings.TrimSpace(passthrough["anthropic-version"])
+	beta := strings.TrimSpace(passthrough["anthropic-beta"])
+
+	if auth != "" {
+		header.Set("Authorization", auth)
+	}
+	if apiKey != "" {
+		header.Set("x-api-key", apiKey)
+	} else if auth == "" && configuredAPIKey != "" {
+		header.Set("x-api-key", configuredAPIKey)
+	}
+	if version == "" {
+		version = anthropicVersion
+	}
+	header.Set("anthropic-version", version)
+	if beta != "" {
+		header.Set("anthropic-beta", beta)
+	}
 }

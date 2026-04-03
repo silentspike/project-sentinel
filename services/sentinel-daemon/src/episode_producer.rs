@@ -379,7 +379,7 @@ mod tests {
             agent_id: AgentId(1),
             action_type: "talk".to_string(),
             content: Some("Wir haben ein Problem mit dem Deadline".to_string()),
-            target_room: Some("konferenz-1".to_string()),
+            target_room: Some("meetingraum-01".to_string()),
         };
 
         let result = producer.event_to_episode(&payload, 100, 200, 1.0);
@@ -463,7 +463,7 @@ mod tests {
 
         let payload = DomainEventPayload::TransitCompleted {
             agent_id: AgentId(1),
-            room_id: "kueche-eg".to_string(),
+            room_id: "kueche".to_string(),
         };
 
         let result = producer.event_to_episode(&payload, 0, 100, 1.0);
@@ -536,9 +536,8 @@ mod tests {
 
     #[test]
     fn test_format_action_summary() {
-        let summary =
-            format_action_summary("Thomas", "talk", Some("Hallo Welt"), Some("kueche-eg"));
-        assert_eq!(summary, "Thomas: talk in kueche-eg - Hallo Welt");
+        let summary = format_action_summary("Thomas", "talk", Some("Hallo Welt"), Some("kueche"));
+        assert_eq!(summary, "Thomas: talk in kueche - Hallo Welt");
 
         let summary = format_action_summary("Lisa", "work", None, None);
         assert_eq!(summary, "Lisa: work");

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Room-Kommunikation Phase 2: Soft-Cap, Hallway Encounters, Transit-Realismus, adaptiver Heartbeat** (#289)
+  - Raum-Kapazitaeten als Soft-Cap mit Perceptions `Es ist eng hier.` und `Der Raum ist komplett voll.` statt hartem Block
+  - Flurbegegnungen nur im selben Transit-Raum; Encounter pausieren Transit und lassen ihn spaeter wieder anlaufen
+  - Realistische Transits mit BFS-Pfad, 20s pro Hop, Clamp auf 15-120s und Transit-Perception mit Quelle, Ziel und aktuellem Zwischen-Raum
+  - Dynamischer Heartbeat im ECS `output_system`: Standard 10 Ticks, bei aktiven Chats herunter bis auf 2 Ticks; Bio/Physics bleibt 1 Hz
+
 - **Security Hardening: CAS Ransomware-Schutz + Immutable Snapshots** (#264)
   - SQLite Trigger blockiert DELETE auf Snapshots juenger als 7 Tage
   - CAS GC Trash-Queue: Chunks mit Refcount 0 bleiben 24h erhalten
@@ -30,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Konfigurierbar + deaktivierbar via `[daemon.resource_manager]` in daemon.toml
 
 ### Fixed
+
+- **Canonical main parity: verified MITM contract restored on `/v1/messages`** (#298)
+  - Gateway exposes `POST /v1/messages` again on the canonical line, not only on drifted deploys or historical branches
+  - Anthropic wire-format parsing, path-specific error/response shaping and request-scoped passthrough headers are restored
+  - `anthropic-direct` now propagates upstream HTTP status codes back into the pipeline, so MITM auth failures surface as `401 authentication_error` again
+  - Gateway smoke coverage restored for Anthropic passthrough and provider-header forwarding
 
 - **Move-Action zu ungueltigem Raum validiert** — Agent konnte in nicht-existierenden Raum (z.B. "Tuer") wechseln. Fix: input_system validiert target_room gegen RoomDistanceMap.
 
