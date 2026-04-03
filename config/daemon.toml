@@ -32,10 +32,10 @@ enabled = true
 bind_addr = "127.0.0.1:8084"
 
 [daemon.traffic_control]
-synthesis_enabled = false
-sequencing_enabled = false
-tick_sync_enabled = false
-apicp_enabled = false
+synthesis_enabled = true
+sequencing_enabled = true
+tick_sync_enabled = true
+apicp_enabled = true
 tick_sync_timeout_ms = 2000
 p3_timeout_ms = 5000
 gateway_request_timeout_ms = 150000
