@@ -123,7 +123,10 @@ fn build_room_maps() -> (RoomDistanceMap, RoomInfoMap) {
 }
 
 fn spec_for(agent_id: u16) -> Option<TransitSpec> {
-    TRANSIT_SPECS.iter().copied().find(|spec| spec.agent_id == agent_id)
+    TRANSIT_SPECS
+        .iter()
+        .copied()
+        .find(|spec| spec.agent_id == agent_id)
 }
 
 fn reset_positions(world: &mut bevy_ecs::prelude::World) {
@@ -178,7 +181,10 @@ fn reset_bio_state(world: &mut bevy_ecs::prelude::World) {
 fn seed_chat_activity(world: &mut bevy_ecs::prelude::World, tick: u64) {
     let names: Vec<String> = {
         let mut query = world.query::<&sentinel_ecs::AgentIdentity>();
-        query.iter(world).map(|identity| identity.name.clone()).collect()
+        query
+            .iter(world)
+            .map(|identity| identity.name.clone())
+            .collect()
     };
 
     *world.resource_mut::<RoomChatBuffer>() = RoomChatBuffer::default();
@@ -311,9 +317,13 @@ fn bench_route_bfs(c: &mut Criterion) {
         ("upper_to_lower_wing", "meetingraum-03", "buero-dev-1"),
         ("full_office_span", "buero-betriebsarzt", "buero-admin"),
     ] {
-        group.bench_with_input(BenchmarkId::new("per_move", label), &(from, to), |b, pair| {
-            b.iter(|| black_box(room_distances.route(black_box(pair.0), black_box(pair.1))))
-        });
+        group.bench_with_input(
+            BenchmarkId::new("per_move", label),
+            &(from, to),
+            |b, pair| {
+                b.iter(|| black_box(room_distances.route(black_box(pair.0), black_box(pair.1))))
+            },
+        );
     }
 
     group.finish();

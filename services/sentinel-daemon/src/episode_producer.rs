@@ -536,8 +536,7 @@ mod tests {
 
     #[test]
     fn test_format_action_summary() {
-        let summary =
-            format_action_summary("Thomas", "talk", Some("Hallo Welt"), Some("kueche"));
+        let summary = format_action_summary("Thomas", "talk", Some("Hallo Welt"), Some("kueche"));
         assert_eq!(summary, "Thomas: talk in kueche - Hallo Welt");
 
         let summary = format_action_summary("Lisa", "work", None, None);
