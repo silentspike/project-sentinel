@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Room-Chat-Forwarding: `heard_text` bleibt bei Gateway-Fehlern bis zur Bridge erhalten** (#282)
+  - urgenter Room-Chat (`heard_text`, direkte Ansprache, Gaia) wird im Daemon jetzt bei offenem Circuit, `429/503`, Parse-Fehlern und Request-Timeouts fuer Retry gepuffert statt verloren zu gehen
+  - dadurch bleibt der Pfad `Operator-Chat -> RoomChatBuffer -> heard_text -> LLM bridge has_heard=true` auch unter Upstream-Fehlern live nachweisbar
+  - gezielte Regressionstests fuer Retry-Eligibility im LLM-Bridge-Modul wurden nachgezogen
+
 - **MITM Follow-ups: Dashboard-Legacy-Schema, Anthropic-Streaming/Blocks, Observability, Redaction** (#296)
   - Dashboard-Queries waehlen Event-Spalten jetzt schema-robust, so dass lokale DBs ohne `compensation_type` weder `cockpit` noch `events` brechen
   - Gateway erhaelt rohe Anthropic-Content-Blocks ueber `/v1/messages`, beantwortet SSE-Streaming direkt und behaelt den Anthropic-Wire-Shape bei
