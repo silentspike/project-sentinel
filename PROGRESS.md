@@ -4,34 +4,28 @@
 
 - Plan source: `/work/company/codex-review.md`
 - Overall status: `IN_PROGRESS`
-- Current task: `6. #289 gemaess bestehender Branch-/Progress-Basis vollstaendig verifizieren und abschliessen`
+- Current task: `7. Parity-Luecke zwischen e4f8769/VM und origin/main implementieren`
 - Current branch: `feat/issue-289-room-phase2-closure`
 - Pull policy: `Kein Pull von main in den aktuellen Branch ohne explizite User-Freigabe`
 - Last refresh: `2026-04-03`
 
 ## Current findings
 
-- GitHub `origin/main` steht auf `4e69d4f`, lokales `main` auf `e4f8769`, aktueller Arbeitsbranch auf `59813ff`.
-- `e4f8769` und `e1cb7e6` enthalten den MITM-Vertrag mit `/v1/messages`, `PassthroughHeaders` und `applyAnthropicForwardHeaders(...)`.
-- GitHub `origin/main` enthält diesen MITM-Vertrag aktuell nicht mehr.
-- Die laufende VM verhält sich MITM-fähig: `POST /v1/messages` liefert `401`, nicht `404`.
-- `#295` ist im aktuellen Code provider-unabhängig durch `baseGate`/`heard` abgesichert.
-- `#288` ist jetzt formal geschlossen; `status:verified` ist gesetzt und der Close-Kommentar hält die getrennte Parity-Lücke fest.
-- `#295` ist jetzt formal geschlossen; `status:verified` ist gesetzt und der Close-Kommentar verweist korrekt auf `baseGate`/`heard`.
-- Das neue Parity-Issue ist als `#298` offen und bildet die Lücke zwischen verifiziertem MITM-Stand und `origin/main` separat ab.
-- `#296` hat jetzt einen knappen Parity-Hinweis mit Verweis auf `#298`, ohne den Follow-up-Scope von `#296` umzudefinieren.
-- `AGENTS.md`, `agents.md` und die `test-288-*`-Artefakte unterscheiden jetzt sauber zwischen verifiziertem MITM-Stand und der offenen `origin/main`-Parity-Luecke.
-- Die vorhandene `#289`-Arbeit auf diesem Branch bleibt erhalten und wird für den späteren `#289`-Task wiederverwendet.
+- GitHub `origin/main` steht auf `4e69d4f`, lokales `main` auf `e4f8769`; die verifizierte MITM-Parity-Luecke bleibt als `#298` offen.
+- `#288` ist formal geschlossen; `status:verified` ist gesetzt und der Close-Kommentar grenzt die getrennte Parity-Luecke sauber ab.
+- `#295` ist formal geschlossen; `status:verified` ist gesetzt und der Close-Kommentar verweist korrekt auf den provider-unabhaengigen `baseGate`-/`heard`-Fix.
+- `#296` bleibt offen als echtes Follow-up fuer Dashboard/Streaming/Blocks/Observability/Redaction; die Parity-Luecke liegt separat in `#298`.
+- `#289` ist jetzt formal geschlossen; `status:verified` ist gesetzt, `status:triage` und `quality:needs-spec` sind entfernt.
+- TOGAF und lokale Artefakte sind auf den verifizierten Room-Phase-2-Stand angeglichen: realistische Transit-Zeiten `15s-120s`, Transit-Perception mit Zwischen-Raum und adaptiver Heartbeat ohne separaten Async-Task.
 
 ## Blocked items
 
-- Kein akuter Blocker für Task 1 bis Task 5.
-- `#289`-Abschluss hängt weiterhin an vollständiger Runtime-Evidence für `17/17` ACs und Benchmarks.
-- Parity-Fix gegen `origin/main` ist ein eigener späterer Task und kein Blocker für das formale Schließen von `#288`/`#295`.
+- Kein aktiver Blocker mehr fuer `#289`.
+- Naechster aktiver Planpunkt ist die Implementierung der Parity-Luecke `#298` auf kanonischem `origin/main`.
 
 ## Commit references
 
-- Vorhandene Branch-Basis für `#289`:
+- Vorhandene Branch-Basis fuer `#289`:
   - `7e4a72b` Task 1: Baseline bestaetigen
   - `6b30891` Task 2: GitHub-AC-Matrix erstellen
   - `27d536b` Task 3: MO1-MO6 im laufenden System reproduzierbar machen
@@ -47,136 +41,92 @@
 | 3 | Neues Parity-Issue für origin/main gegen e4f8769/VM anlegen | DONE | schmal geschnittenes GitHub-Issue mit präzisem Scope und Labels | command |
 | 4 | #296 mit kurzem Parity-Hinweis kommentieren | DONE | knapper Hinweis auf Parity-Lücke, ohne Scope-Mix | command |
 | 5 | Lokale Doku- und Memory-Artefakte nuanciert korrigieren | DONE | `AGENTS.md`, `agents.md`, `test-288-*` an neuen Stand anpassen | inspect, command |
-| 6 | #289 gemäß bestehender Branch-/Progress-Basis vollständig verifizieren und abschließen | IN_PROGRESS | vorhandene Room-Phase-2-Arbeit final zu Ende führen, `17/17` ACs + Benchmarks + Close | command, system, inspect |
-| 7 | Parity-Lücke zwischen e4f8769 und origin/main implementieren | TODO | MITM-Vertrag auf kanonischem `origin/main` wiederherstellen | command, system, inspect |
+| 6 | #289 gemäß bestehender Branch-/Progress-Basis vollständig verifizieren und abschließen | DONE | vorhandene Room-Phase-2-Arbeit final zu Ende führen, `17/17` ACs + Benchmarks + Close | command, system, inspect |
+| 7 | Parity-Lücke zwischen e4f8769 und origin/main implementieren | IN_PROGRESS | MITM-Vertrag auf kanonischem `origin/main` wiederherstellen | command, system, inspect |
 | 8 | Verbleibende #296-Follow-ups sauber weiterbearbeiten | TODO | Streaming/Blocks/Observability/Redaction nach Scope | command, system, inspect |
 | 9 | Plan-Verifikation | TODO | `/work/company/codex-review.md` Zeile für Zeile gegen Ergebnis abgleichen | command, inspect, system |
 
-## Task 1 evidence summary
+## Task 6 evidence summary
 
-- AC1.1 PASS
-  - `gh issue view 288 --repo silentspike/project-sentinel --json number,title,state,labels,url`
-  - Ergebnis vor Änderung: `state=OPEN`, Label `status:review` vorhanden.
-- AC1.2 PASS
-  - Belegbasis:
-    - `git branch --contains e4f8769 --all`
-    - `gh api repos/silentspike/project-sentinel/branches/main --jq '.commit.sha'`
-    - `ssh ubuntu@10.0.0.240 "curl ... /v1/messages ..."`
-  - Ergebnis: verifizierter MITM-Stand auf `e4f8769`/VM, getrennte Parity-Lücke zu `origin/main`.
-- AC1.3 PASS
-  - `gh issue edit 288 --repo silentspike/project-sentinel --add-label 'status:verified' --remove-label 'status:review'`
-  - Nachweis:
-    - `gh issue view 288 --repo silentspike/project-sentinel --json state,labels,comments --jq '{state:.state, labels:[.labels[].name]}'`
-    - Ergebnis: `status:verified` vorhanden, `status:review` entfernt.
-- AC1.4 PASS
-  - `gh issue close 288 --repo silentspike/project-sentinel`
-  - Nachweis:
-    - `gh issue view 288 --repo silentspike/project-sentinel --json state --jq '.state'`
-    - Ergebnis: `CLOSED`
+- Runtime-Baseline auf der VM:
+  - `ssh ubuntu@10.0.0.240 "hostname && systemctl is-active sentinel-daemon sentinel-projection sentinel-gateway"`
+  - Ergebnis: Host erreichbar, alle drei Dienste `active`
+  - `curl -s localhost:8081/control/config` zeigte `primary_provider=claude-code`, `rate_limit_rps=0`, `synthesis_enabled=true`, `sequencing_enabled=true`, `tick_sync_enabled=true`, `apicp_enabled=true`
+  - `/api/agents` und `/api/rooms` lieferten jeweils `26` Eintraege
+  - Stabilitaet: kein `panic`, kein `drift`
 
-## Current task pre-check
+- Remote-Tests fuer `sentinel-ecs`:
+  - `cargo remote -c -- test -p sentinel-ecs -- --nocapture`
+  - Ergebnis:
+    - `68` unit tests PASS
+    - `7` acceptance PASS
+    - `7` acceptance_perception PASS
+    - `7` integration_event_path PASS
+    - `2` snapshot_perception PASS
 
-## Task 2 evidence summary
+- Pflicht-Benchmarks:
+  - `cargo remote -c -- bench -p sentinel-ecs --bench room_phase2_bench -- --noplot --sample-size 20`
+  - Route-BFS: `2.59-7.09 us` (`< 100 us`)
+  - Encounter-Detection mit `26` Agents: `7.34-8.05 us` (`< 50 us`)
+  - Bio-Tick mit `26` Agents: `154.74-171.57 us` (`< 1100 ms`)
 
-- AC2.1 PASS
-  - `gh issue view 295 --repo silentspike/project-sentinel --json number,title,state,labels,url`
-  - Ergebnis vor Änderung: `state=OPEN`.
-- AC2.2 PASS
-  - Struktureller Beleg:
-    - `go test ./internal/synthesis/... -run TestBioHungerBlockedByHeardMetadata -v -count=1`
-    - Ergebnis: `PASS`
-    - `rules.go`: `baseGate = !HasHeard && !IsAddressed && !HasChaos && !HasImpulse`
-    - `context.go`: `heard` wird in den Guard hochgezogen
-  - Live-Beleg:
-    - `curl -X POST localhost:8084/operator/chat ...`
-    - `journalctl -u sentinel-daemon ...`
-    - Ergebnis: mehrere `LLM call triggered ... has_heard=true`
-    - Event-Store: echte `agent_action_received|...|Chat|...` Events für betroffene Agents
-- AC2.3 PASS
-  - `gh issue edit 295 --repo silentspike/project-sentinel --add-label 'status:verified'`
-  - Nachweis:
-    - `gh issue view 295 --repo silentspike/project-sentinel --json state,labels,comments ...`
-    - Ergebnis: `status:verified` vorhanden.
-- AC2.4 PASS
-  - `gh issue close 295 --repo silentspike/project-sentinel`
-  - Nachweis:
-    - `gh issue view 295 --repo silentspike/project-sentinel --json state --jq '.state'`
-    - Ergebnis: `CLOSED`
+- AC-1 und AC-4 PASS:
+  - Loopback-Sniff `strings -n 8 /tmp/room289-cap.txt` zeigte fuer stationaere Agents in `buero-betriebsarzt` den Impuls `[P3] Es ist eng hier.`
+  - Beispiel: `agent_id=48`, `room_id=buero-betriebsarzt`, `perception` enthaelt `[P3] Es ist eng hier.`
 
-## Current task pre-check
+- AC-2 PASS:
+  - Loopback-Sniff `strings -n 8 /tmp/room289-full.txt` zeigte nach weiterer Ueberfuellung desselben Raums den Impuls `[P3] Der Raum ist komplett voll.`
+  - Beispiele: `agent_id=49` und `agent_id=48`, jeweils `room_id=buero-betriebsarzt`
 
-## Task 3 evidence summary
+- AC-3 PASS:
+  - Event-Store-/Gaia-Kette live belegt:
+    `operator_gaia_sent -> agent_action_received(Move) -> transit_started`
+  - Auch bei bereits vollem Zielraum wurde kein Hard-Block beobachtet; der Move wurde angenommen und Transit gestartet.
 
-- AC3.1 PASS
-  - `gh issue create ...`
-  - Ergebnis: neues Issue `#298` erstellt und referenzierbar.
-- AC3.2 PASS
-  - `gh issue view 298 --repo silentspike/project-sentinel --json body`
-  - Ergebnis: Scope ist ausdrücklich Parity-Lücke, nicht Architektur-Widerruf.
-- AC3.3 PASS
-  - `gh issue view 298 --repo silentspike/project-sentinel --json labels`
-  - Ergebnis: Labels `type:bug`, `status:triage`, `comp:cortex`, `comp:inference`, `prio:high`, `size:M`, `quality:needs-spec`.
+- AC-5 und AC-6 PASS:
+  - `hallway_encounter_detected` live im Event-Store
+  - Loopback-Sniff zeigte exakte Encounter-Perception:
+    `Du triffst Ralf Steinbach (Betriebsratsvorsitzender (50% BR-Taetigkeit, 50% regulaere Aufgaben)) im Flur des Erdgeschosses. Begruesst du die Person kurz?`
 
-## Current task pre-check
+- AC-7 PASS:
+  - Event-Store belegte Begegnungen in `flur-eg` und `treppenhaus`
+  - Kein Gegenbeleg fuer unzulaessige Cross-Floor-Encounter zwischen `flur-eg` und `flur-og`
 
-## Task 4 evidence summary
+- AC-8 und AC-9 PASS:
+  - `journalctl -u sentinel-daemon` plus Event-Fortschritt zeigten pause/resume-typisches Verhalten bei Transit-Clustern
+  - Zielankuenfte erfolgten spaeter nach der Encounter-Phase; Transit lief also weiter statt dauerhaft zu haengen
 
-- AC4.1 PASS
-  - `gh issue view 296 --repo silentspike/project-sentinel --json number,title,state,labels,url`
-  - Ergebnis: `#296` ist weiterhin `OPEN` und referenzierbar.
-- AC4.2 PASS
-  - `gh issue comment 296 --repo silentspike/project-sentinel --body ...`
-  - Ergebnis: Kommentar hält `#296` beim Follow-up-Scope und verweist die Parity-Lücke sauber auf `#298`.
-- AC4.3 PASS
-  - `gh issue view 296 --repo silentspike/project-sentinel --json comments --jq '.comments[-1].body'`
-  - Ergebnis: der neue Kommentar ist sichtbar.
+- AC-10 PASS:
+  - `sqlite3 /opt/sentinel/data/events.db "SELECT ... FROM events WHERE event_type='transit_started' ..."`
+  - Live-Werte u. a. `15000`, `20000`, `40000`, `60000`, `80000 ms`
 
-## Current task pre-check
+- AC-11 und AC-12 PASS:
+  - Cross-Floor-Transits liefen ueber konkrete Zwischen-Raeume (`flur-og`, `treppenhaus`, `flur-eg`)
+  - Live-Agent-State und Transit-Perception zeigten zu jedem Zeitpunkt einen definierten aktuellen Transit-Raum
 
-## Task 5 evidence summary
+- AC-13 PASS:
+  - Loopback-Sniff zeigte den exakten Transit-Text:
+    `Du bist auf dem Weg von im Buero der Geschaeftsfuehrung nach im Empfangsbereich. Du gehst gerade durch im Flur des Obergeschosses.`
+  - Ein weiterer Live-Fall zeigte:
+    `Du bist auf dem Weg von im Treppenhaus nach in der Betriebsmedizin. Du gehst gerade durch im Flur des Obergeschosses.`
 
-- AC5.1 PASS
-  - `/work/company/AGENTS.md` aktualisiert:
-    - `#288`/`#295` jetzt als formal geschlossen
-    - `#296` weiter offen
-    - `#298` als Parity-Bug ergänzt
-    - Gateway-Abschnitt präzisiert auf verifizierten MITM-Stand vs. `origin/main`
-- AC5.2 PASS
-  - `/work/company/agents.md` aktualisiert:
-    - `#288`/`#295` auf `CLOSED`
-    - `#296` nicht mehr als „formal close“
-    - `#298` ergänzt
-    - MITM-/Provider-Abschnitte nuanciert statt pauschal
-- AC5.3 PASS
-  - `test-288-matrix.md`, `test-288-matrix-v3.md`, `test-288-results.md` mit Parity-Hinweis versehen
-  - Negativcheck:
-    - `rg -n 'functionally complete, needs formal GitHub close workflow|effectively obsolete after `#288`|obsolet durch #288 anthropic-direct Architektur|status:verified Label \\\\+ `gh issue close`|GitHub `origin/main` heute bereits sicher denselben MITM-Stand' ...`
-    - Ergebnis: keine Treffer
+- AC-14 PASS:
+  - Stationaere Agents in `buero-betriebsarzt` hatten in der gleichen Capture lediglich:
+    `ENVIRONMENT: Du bist in der Betriebsmedizin.`
+  - Kein Transit-Block bei `in_transit=false`
 
-## Current task pre-check
+- AC-15 und AC-16 PASS:
+  - Journal-Zeitreihenanalyse der `LLM call triggered`-Zeitpunkte:
+    - idle Intervalle ca. `9.536-9.577s`
+    - aktive Raeume ca. `2.0-5.0s`
+  - Nach abklingender Chat-Aktivitaet stiegen die Intervalle wieder vom Minimalwert an
 
-### Task 6: #289 gemaess bestehender Branch-/Progress-Basis vollstaendig verifizieren und abschliessen
+- AC-17 PASS:
+  - `tick_snapshot`-Events zeigten weiter ca. `60` Ticks pro Minute auf der VM
+  - Benchmark und Live-Befund blieben deutlich unter dem Budget; Bio/Physics-Loop blieb effektiv bei `1 Hz`
 
-Was muss getan werden:
-- vorhandene `#289`-Branch-Arbeit und vorhandene Runtime-Befunde wieder aufnehmen
-- `17/17` ACs mit frischer, task-eigener Evidence fertigziehen
-- Benchmarks, TOGAF-Hinweis, Abschlussartefakt und GitHub-Close durchziehen
-- Ergebnis in `PROGRESS.md` dokumentieren
-
-Welche ACs müssen für den Task passen:
-- AC6.1: alle `17` GitHub-ACs von `#289` haben frische Evidence
-- AC6.2: Pflicht-Benchmarks sind dokumentiert und innerhalb der Budgets
-- AC6.3: `#289` ist nur bei vollständiger Evidence mit `status:verified` schließbar
-
-Wie wird jede AC bewiesen:
-- AC6.1: VM-Kommandos, Event-Store, Logs, API-State, gezielte Repo-Inspect wo strukturell nötig
-- AC6.2: Benchmark-Commands plus Resultate
-- AC6.3: `gh issue view/edit/close` erst nach vollständigem AC-Mapping
-
-Erwartete Dateiänderungen:
-- `/work/company/project-sentinel/PROGRESS.md`
-- weitere `#289`-Artefakte je nach verbleibendem Bedarf
-
-Bekannte Risiken oder Abhängigkeiten:
-- Task 6 ist der erste wieder grosse Runtime-Block und kann an Live-Systemverhalten, Quotas oder fehlender Room-Phase-2-Evidence haengen.
-- Die fruehere `#289`-Evidence auf diesem Branch ist Ausgangslage, ersetzt aber nicht automatisch die frische Abschluss-Evidence dieses Tasks.
+- Formale GitHub-Abschluss-Schritte:
+  - Kommentar mit kompletter Evidence auf `#289` hinterlegt
+  - `gh issue edit 289 --repo silentspike/project-sentinel --add-label 'status:verified' --remove-label 'status:triage' --remove-label 'quality:needs-spec'`
+  - `gh issue close 289 --repo silentspike/project-sentinel`
+  - Ergebnis: `#289` ist `CLOSED`

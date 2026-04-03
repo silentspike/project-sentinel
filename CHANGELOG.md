@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Room-Kommunikation Phase 2: Soft-Cap, Hallway Encounters, Transit-Realismus, adaptiver Heartbeat** (#289)
+  - Raum-Kapazitaeten als Soft-Cap mit Perceptions `Es ist eng hier.` und `Der Raum ist komplett voll.` statt hartem Block
+  - Flurbegegnungen nur im selben Transit-Raum; Encounter pausieren Transit und lassen ihn spaeter wieder anlaufen
+  - Realistische Transits mit BFS-Pfad, 20s pro Hop, Clamp auf 15-120s und Transit-Perception mit Quelle, Ziel und aktuellem Zwischen-Raum
+  - Dynamischer Heartbeat im ECS `output_system`: Standard 10 Ticks, bei aktiven Chats herunter bis auf 2 Ticks; Bio/Physics bleibt 1 Hz
+
 - **Security Hardening: CAS Ransomware-Schutz + Immutable Snapshots** (#264)
   - SQLite Trigger blockiert DELETE auf Snapshots juenger als 7 Tage
   - CAS GC Trash-Queue: Chunks mit Refcount 0 bleiben 24h erhalten
