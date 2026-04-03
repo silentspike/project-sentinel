@@ -4,8 +4,8 @@
 
 - Plan source: `User-freigegebener 4-Schritte-Ablauf nach $start`
 - Overall status: `IN_PROGRESS`
-- Current task: `2. Frischen #296-Arbeitsbranch von der korrigierten Basis anlegen`
-- Current branch: `feat/issue-289-room-phase2-closure`
+- Current task: `3. Echten verbleibenden #296-Scope bearbeiten`
+- Current branch: `feat/issue-296-mitm-followups-clean`
 - Pull policy: `Kein Pull von main in den aktuellen Branch ohne explizite User-Freigabe`
 - Last refresh: `2026-04-03`
 
@@ -20,6 +20,7 @@
 - Der aktuelle Closure-/Parity-Stand ist jetzt auf GitHub publiziert:
   Draft-PR `#299` von `feat/issue-289-room-phase2-closure` nach `main`.
 - Der alte PR `#297` von `fix/issue-296-mitm-followups` ist jetzt geschlossen und explizit als superseded markiert.
+- Der neue `#296`-Arbeitsbranch ist jetzt `feat/issue-296-mitm-followups-clean` und zeigt exakt auf den publizierten Basis-Commit `fb019f0`.
 - TOGAF und lokale Artefakte sind auf den verifizierten Room-Phase-2-Stand angeglichen: realistische Transit-Zeiten `15s-120s`, Transit-Perception mit Zwischen-Raum und adaptiver Heartbeat ohne separaten Async-Task.
 
 ## Blocked items
@@ -42,8 +43,8 @@
 | # | Task | Status | Scope | Evidence |
 |---|------|--------|-------|----------|
 | 1 | Aktuellen #289/#298-Stand publizieren | DONE | aktuellen Branch pushen, PR-Lage bereinigen, verifizierten Closure-/Parity-Stand auf GitHub sichtbar machen | command, system |
-| 2 | Frischen #296-Arbeitsbranch von der korrigierten Basis anlegen | IN_PROGRESS | neuen Branch fuer #296 auf Basis des publizierten Stands erzeugen; alten `fix/issue-296-mitm-followups` nicht weiterverwenden | command |
-| 3 | Echten verbleibenden #296-Scope bearbeiten | TODO | Dashboard/Streaming/Blocks/Observability/Redaction nach aktuellem Issue-Scope umsetzen, verifizieren, dokumentieren | command, system, inspect |
+| 2 | Frischen #296-Arbeitsbranch von der korrigierten Basis anlegen | DONE | neuen Branch fuer #296 auf Basis des publizierten Stands erzeugen; alten `fix/issue-296-mitm-followups` nicht weiterverwenden | command |
+| 3 | Echten verbleibenden #296-Scope bearbeiten | IN_PROGRESS | Dashboard/Streaming/Blocks/Observability/Redaction nach aktuellem Issue-Scope umsetzen, verifizieren, dokumentieren | command, system, inspect |
 | 4 | Anschließend #282 starten | TODO | Room-Chat-Forwarding auf derselben verifizierten Basis bearbeiten und live belegen | command, system, inspect |
 | 5 | Plan-Verifikation | TODO | Vier-Schritte-Ablauf gegen Ergebnis und Runtime-Stand komplett abgleichen | command, inspect, system |
 
@@ -66,6 +67,18 @@
   - Verifikation:
     `gh pr view 297 --repo silentspike/project-sentinel --json number,title,state,url`
     -> `state=CLOSED`
+
+## Task 2 evidence summary
+
+- Frischer `#296`-Branch erstellt:
+  - `git switch -c feat/issue-296-mitm-followups-clean`
+  - Verifikation:
+    `git rev-parse --abbrev-ref HEAD` -> `feat/issue-296-mitm-followups-clean`
+
+- Korrigierte Basis bestaetigt:
+  - `git rev-parse --short HEAD` -> `fb019f0`
+  - `git rev-parse --short feat/issue-289-room-phase2-closure` -> `fb019f0`
+  - `git merge-base --is-ancestor feat/issue-289-room-phase2-closure HEAD && echo $?` -> `0`
 
 ## Task 6 evidence summary
 
