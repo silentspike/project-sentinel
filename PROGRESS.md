@@ -211,7 +211,7 @@
     `transit_started ... from_room":"buero-ceo","to_room":"kueche","duration_ms":80000`
 
 - Voller MITM-Codepfad auf der VM:
-  - Echter `claude -p`-Smoke mit `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` blockierte auf lokaler Maschine und auf der VM vor dem ersten Request; kein Gateway-Hit.
+- Echter `claude -p`-Smoke mit `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` blockierte auf dem lokalen Host und auf der VM vor dem ersten Request; kein Gateway-Hit.
   - Deshalb zusaetzlicher isolierter VM-Nachweis mit derselben Gateway-Binary:
     - temporaerer Fake-Upstream auf `127.0.0.1:19876`
     - temporaerer Gateway auf `18080/18081` mit `ANTHROPIC_BASE_URL=http://127.0.0.1:19876`
