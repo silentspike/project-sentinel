@@ -428,6 +428,8 @@ function renderTrafficControl(container) {
 
   const items = [
     ['Primary Provider', stats.primary_provider ?? '--'],
+    ['Internal Provider', stats.internal_primary_provider ?? stats.primary_provider ?? '--'],
+    ['External MITM Provider', stats.external_mitm_provider ?? '--'],
     ['Kosten heute', formatUSD(stats.current_cost_usd)],
     ['Ersparnis heute', formatUSD(stats.estimated_savings_usd)],
     ['Hochrechnung/Tag Kosten', formatUSD(stats.projected_daily_cost_usd)],
