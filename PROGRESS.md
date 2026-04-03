@@ -2,9 +2,9 @@
 
 ## Status
 
-- Plan source: `User-freigegebener 4-Schritte-Ablauf nach $start`
+- Plan source: `User-Freigabe: PR-Stack #299/#300/#301 mergen, danach Vollbetriebs-/Soak-Test, alles nach $start`
 - Overall status: `IN_PROGRESS`
-- Current task: `2. Frischen #296-Arbeitsbranch von der korrigierten Basis anlegen`
+- Current task: `Task 2 - PR-Merge-Blocker beheben und lokal verifizieren`
 - Current branch: `feat/issue-289-room-phase2-closure`
 - Pull policy: `Kein Pull von main in den aktuellen Branch ohne explizite User-Freigabe`
 - Last refresh: `2026-04-03`
@@ -21,12 +21,16 @@
   Draft-PR `#299` von `feat/issue-289-room-phase2-closure` nach `main`.
 - Der alte PR `#297` von `fix/issue-296-mitm-followups` ist jetzt geschlossen und explizit als superseded markiert.
 - TOGAF und lokale Artefakte sind auf den verifizierten Room-Phase-2-Stand angeglichen: realistische Transit-Zeiten `15s-120s`, Transit-Perception mit Zwischen-Raum und adaptiver Heartbeat ohne separaten Async-Task.
+- Alle drei Stack-PRs sind Stand Task-Start noch `DRAFT` und nicht mergebar.
+- Gemeinsamer harter Merge-Blocker: PR-Lint verlangt Conventional-Commit-Titel fuer `#299`, `#300` und `#301`.
+- Zusaetzliche Merge-Blocker nur auf `#299`: `typos`-Fehler in `PROGRESS.md`/`test-288-results.md`, `gocyclo` in `pipeline_test.go`, `cargo fmt --check` fuer `room_phase2_bench.rs` und `episode_producer.rs`, sowie `cargo-deny` wegen `RUSTSEC-2026-0049`.
+- `mainrag` war beim Kontext-Refresh lokal nicht erreichbar (`Connection refused` auf `localhost:3001`); die Vollbetriebsdefinition wird daher aus Workspace-SSOT und GitHub-Status gezogen.
+- Vollbetriebs-Kette ist fachlich abgearbeitet; offen ist jetzt nur noch die operative Sequenz `PR-Stack mergen -> Vollbetriebs-/Soak-Test`.
 
 ## Blocked items
 
-- Kein aktiver Blocker mehr fuer `#289`.
-- Kein technischer Blocker fuer Schritt 2; die korrigierte GitHub-Basis steht jetzt ueber PR `#299`.
-- `#296` soll auf einem frischen Branch weiterlaufen, nicht auf `fix/issue-296-mitm-followups`.
+- Task 3 ist durch Task 2 blockiert, solange die drei PRs nicht mergefaehig sind.
+- Task 4 ist durch Task 3 blockiert, weil der Vollbetriebs-/Soak-Test auf dem gemergten Stack gefahren werden soll.
 
 ## Commit references
 
@@ -41,11 +45,61 @@
 
 | # | Task | Status | Scope | Evidence |
 |---|------|--------|-------|----------|
-| 1 | Aktuellen #289/#298-Stand publizieren | DONE | aktuellen Branch pushen, PR-Lage bereinigen, verifizierten Closure-/Parity-Stand auf GitHub sichtbar machen | command, system |
-| 2 | Frischen #296-Arbeitsbranch von der korrigierten Basis anlegen | IN_PROGRESS | neuen Branch fuer #296 auf Basis des publizierten Stands erzeugen; alten `fix/issue-296-mitm-followups` nicht weiterverwenden | command |
-| 3 | Echten verbleibenden #296-Scope bearbeiten | TODO | Dashboard/Streaming/Blocks/Observability/Redaction nach aktuellem Issue-Scope umsetzen, verifizieren, dokumentieren | command, system, inspect |
-| 4 | Anschließend #282 starten | TODO | Room-Chat-Forwarding auf derselben verifizierten Basis bearbeiten und live belegen | command, system, inspect |
-| 5 | Plan-Verifikation | TODO | Vier-Schritte-Ablauf gegen Ergebnis und Runtime-Stand komplett abgleichen | command, inspect, system |
+| 1 | Merge- und Soak-Basis neu aufsetzen | DONE | `$start`-Hooks registrieren, Kontext neu laden, PR-Blocker und Vollbetriebs-/Soak-Kriterien mit frischer Evidence festziehen, Task-Tracking spiegeln | command, inspect |
+| 2 | PR-Merge-Blocker beheben und lokal verifizieren | TODO | Conventional-Commit-Titel, CI-/Lint-/Format-/Advisory-Fails fuer den Stack beseitigen und die relevanten lokalen Checks frisch laufen lassen | command, inspect, system |
+| 3 | PR-Stack #299 -> #300 -> #301 freigeben und mergen | TODO | Draft-PRs freigeben, Check-Status pruefen, Merge in Reihenfolge mit dokumentierter GitHub-Evidence | command, system |
+| 4 | Vollbetriebs-/Soak-Test auf der VM fahren | TODO | den gemergten Stand auf `10.0.0.240` im laufenden System ueber Stabilitaet, Gateway, Operator-Pfade und Event-/API-Sicht pruefen | command, system |
+| 5 | Plan-Verifikation | TODO | den 4-Schritte-Ablauf gegen den tatsaechlichen Merge- und Runtime-Endstand komplett abgleichen | command, inspect, system |
+
+## Task 1 pre-task self-check
+
+- Muss erledigt werden:
+  - Projektlokale `$start`-Hooks pruefen und registrieren
+  - Projekt-/Global-Regeln sowie Memory/PROGRESS neu lesen
+  - PR-Merge-Blocker und Vollbetriebs-/Soak-Kriterien mit frischen Commands dokumentieren
+  - `PROGRESS.md` und `update_plan` auf die neue Ausfuehrung spiegeln
+- Acceptance Criteria:
+  - AC-1: Hooks sind projektlokal registriert und die Start-Counter zurueckgesetzt
+  - AC-2: Die echten Merge-Blocker fuer `#299/#300/#301` sind mit GitHub-Evidence festgehalten
+  - AC-3: Die Vollbetriebs-/Soak-Definition ist aus SSOT/Memory extrahiert und die neue 5-Task-Ausfuehrung steht in `PROGRESS.md`
+- Evidence-Plan:
+  - AC-1 via `jq .hooks .claude/settings.json` plus Counter-Reset-Commands
+  - AC-2 via `gh pr view` / Actions-Logs / PR-Check-Inspektion
+  - AC-3 via `rg`/`sed` gegen Workspace-SSOT und den aktualisierten `PROGRESS.md`-Stand
+- Erwartete Dateiaenderungen:
+  - `PROGRESS.md`
+  - projektlokale `.claude/settings.json` nur fuer Hook-Setup, falls nicht bereits registriert
+- Risiken / Abhaengigkeiten:
+  - Task 1 erzeugt noch keine Mergefaehigkeit; Task 2 muss danach gezielt die CI-Blocker schliessen
+
+## Current execution evidence
+
+### Task 1 evidence summary
+
+- AC-1 PASS:
+  - `ls -la /home/jan/bin/pretooluse-start-progress-gate.sh /home/jan/bin/pretooluse-task-checklist-gate.sh /home/jan/bin/posttooluse-start-enforcer.sh`
+    -> alle drei Hook-Skripte vorhanden und `-rwx`
+  - `jq '.hooks' /work/company/project-sentinel/.claude/settings.json`
+    -> `PreToolUse/TaskUpdate` mit `pretooluse-task-checklist-gate.sh` und `pretooluse-start-progress-gate.sh`
+    -> `PostToolUse` mit `posttooluse-start-enforcer.sh`
+  - `echo '0' > /tmp/claude-start-edit-count && rm -f /tmp/claude-start-refresh-needed`
+    -> Counter zurueckgesetzt
+
+- AC-2 PASS:
+  - `gh pr view 299 ...`, `gh pr view 300 ...`, `gh pr view 301 ...`
+    -> alle drei PRs `OPEN`, `isDraft=true`
+  - Actions-Logs / `inspect_pr_checks.py`
+    -> `#299`: Conventional-Commit-Titel fehlt, `typos`, `gocyclo`, `cargo fmt --check`, `cargo-deny`/`RUSTSEC-2026-0049`
+    -> `#300`: Conventional-Commit-Titel fehlt
+    -> `#301`: Conventional-Commit-Titel fehlt
+
+- AC-3 PASS:
+  - `sed -n '232,320p' /work/company/agents.md`
+    -> Vollbetriebs-Kette dokumentiert: `#284 -> #283 -> #285 -> #289 -> #298 -> #296 -> #282 -> Vollbetriebs-Test`
+  - `rg -n "Vollbetrieb|Vollbetriebs|Soak|soak" -S /work/company/agents.md /work/company/AGENTS.md /home/jan/togaf-llm-architecture-guide.html`
+    -> relevante Workspace-SSOT-Stellen identifiziert
+  - `sed -n '1,120p' /work/company/project-sentinel/PROGRESS.md`
+    -> neue 5-Task-Ausfuehrung steht in `PROGRESS.md`
 
 ## Task 1 evidence summary
 
