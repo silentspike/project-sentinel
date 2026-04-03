@@ -4,7 +4,7 @@
 
 - Plan source: `User-Freigabe 2026-04-04: vier echte Runtime-Fixes nach $start umsetzen`
 - Overall status: `IN_PROGRESS`
-- Current task: `Task 4 - claude-code Breaker-/Health-Inkonsistenz beheben`
+- Current task: `Task 5 - Plan-Verifikation`
 - Current branch: `fix/post-soak-runtime-followups`
 - Hook status: `PreToolUse TaskUpdate + PostToolUse start-enforcer projektlokal registriert`
 - Last refresh: `2026-04-04 / Task 1 live verifiziert`
@@ -14,7 +14,7 @@
 - `hallway_encounter_detected` speichert aktuell `location`, aber kein `room_id`; Live-DB zeigt deshalb leeres `$.room_id` trotz korrekter Begegnungs-Location `flur-eg`.
 - Die Traffic-Control-Bootstrap-Flags sind jetzt zwischen Repo-`daemon.toml`, VM-`daemon.toml`, Gateway-Journal und `/control/config` konsistent auf `true/true/true` plus `apicp_enabled=true`.
 - `company-context.md` wird jetzt aus `config/company-context.md` geladen; die Datei liegt live auf der VM unter `/opt/sentinel/config/company-context.md` und der Gateway loggt genau diesen Pfad.
-- `/health` zeigt `claude-code:"open"`, obwohl im letzten Soak echte `claude-code`-Completions gelaufen sind; das deutet auf eine Breaker-/Health-Inkonsistenz statt auf einen vollständigen LLM-Ausfall.
+- Die frühere `claude-code:"open"`-Beobachtung ließ sich nach kontrolliertem Gateway-Restart nicht als reproduzierbarer Code-Bug bestätigen; mit frischen `claude-code`-Erfolgen bleibt `/health` stabil auf `closed`.
 - Die Punkte `synthesis_rate` und `capacity live nicht verifiziert` bleiben Beobachtungen, sind aber nicht Teil dieses 4-Task-Fixlaufs.
 
 ## Blocked items
@@ -32,8 +32,8 @@
 | 1 | Encounter-Event-Payload korrigieren | DONE | `HallwayEncounterDetected` so korrigieren, dass Event-Schema und Live-Payload die Begegnungs-Location konsistent als `room_id`/Ort transportieren; Reader und Tests mitziehen | inspect, command, system |
 | 2 | Traffic-Control-Config-Drift vereinheitlichen | DONE | Repo-Defaults und Runtime-Intention für `synthesis_enabled`, `sequencing_enabled`, `tick_sync_enabled` konsistent machen und auf der VM verifizieren | inspect, command, system |
 | 3 | `company-context.md` deploybar machen | DONE | Sicherstellen, dass die projektlokale Company-Datei im produktiven Config-Pfad landet und live geladen wird | inspect, command, system |
-| 4 | `claude-code` Breaker-/Health-Inkonsistenz beheben | IN_PROGRESS | Health-/Breaker-Zustand so korrigieren, dass erfolgreiche `claude-code`-Nutzung nicht weiter als dauerhaft `open` gemeldet wird | inspect, command, system |
-| 5 | Plan-Verifikation | TODO | die vier Fixpunkte gegen Repo- und VM-Endstand vollständig gegenprüfen | inspect, command, system |
+| 4 | `claude-code` Breaker-/Health-Inkonsistenz beheben | DONE | Health-/Breaker-Zustand so korrigieren, dass erfolgreiche `claude-code`-Nutzung nicht weiter als dauerhaft `open` gemeldet wird | inspect, command, system |
+| 5 | Plan-Verifikation | IN_PROGRESS | die vier Fixpunkte gegen Repo- und VM-Endstand vollständig gegenprüfen | inspect, command, system |
 
 ## Task details
 
@@ -221,6 +221,34 @@
   - AC-1 via `/health`
   - AC-2 via Gateway-Journal `pipeline request completed`
   - AC-3 via Go-Tests + VM-Smoke
+- Outcome:
+  - Der gemeldete `open`-Zustand ließ sich auf dem aktuellen Stand nicht als verbleibender Codefehler reproduzieren.
+  - Nach kontrolliertem Gateway-Restart und frischen `claude-code`-Requests bleibt `/health` konsistent `closed`.
+  - Die vorhandenen Breaker-Tests decken den relevanten Open→Half-Open→Closed-Pfad bereits ab; ein zusätzlicher Code-Patch war nicht nötig.
+- Evidence:
+  - AC-1 PASS:
+    - VM-`/health` vor Repro: `{"circuit_breakers":{"claude-code":"closed"}}`
+    - VM-`/health` nach frischem Operator-Chat und weiteren Erfolgen: unverändert `{"circuit_breakers":{"claude-code":"closed"}}`
+  - AC-2 PASS:
+    - VM-Journal `sentinel-gateway`: mehrere `pipeline request completed` mit `provider":"claude-code"`, z. B. für `agent_id:"48"`, `50`, `42`, `47`, `40`, `35`, `36`, `39`, `33`, `60`, `37`, `38`, `46`
+    - VM-Journal `sentinel-daemon`: `Operator-Chat empfangen`, `heard_text gefunden`, `LLM call triggered ... has_heard=true`, dazu `URGENT LLM Response erhalten`
+  - AC-3 PASS:
+    - `go test ./cmd/cortex-gateway/internal/proxy -run 'TestHalfOpenSuccessCloses|TestCircuitBreakerE2E|TestBreakerStatesReflectsState'`
+
+### Task 5 - Plan-Verifikation
+
+- Scope:
+  - alle vier Punkte gegen Repo und VM-Endstand prüfen
+- Checklist:
+  - Task-1- bis Task-4-Evidence gegen aktuellen Stand rereaden
+  - prüfen, ob noch offene Drift-/Deploy-Reste bestehen
+  - Abschlussstand in `PROGRESS.md` fixieren
+- Acceptance criteria:
+  - AC-1: alle vier Tasks mit frischer Repo- und VM-Evidence verifiziert oder sauber blockiert
+  - AC-2: `PROGRESS.md` Abschlussstand korrekt
+- Evidence plan:
+  - AC-1 via kombinierte Command-/System-Evidence
+  - AC-2 via finale `PROGRESS.md`-Inspektion
 
 ### Task 5 - Plan-Verifikation
 
