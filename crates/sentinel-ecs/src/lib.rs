@@ -1107,6 +1107,17 @@ mod tests {
              when multiple agents are in transit (got 0 events after 30 ticks \
              with 3 agents in transit)"
         );
+
+        let payload: serde_json::Value = serde_json::from_str(&encounter_events[0].payload)
+            .expect("encounter payload must be valid json");
+        assert_eq!(
+            payload["room_id"], "flur-eg",
+            "encounter events must persist the encounter room as room_id"
+        );
+        assert!(
+            payload.get("location").is_none(),
+            "new encounter payloads must not keep the legacy location field"
+        );
     }
 
     /// Move-Action mit echtem Raumnamen → korrekte Transit-Duration via RoomDistanceMap

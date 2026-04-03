@@ -225,7 +225,9 @@ pub enum DomainEventPayload {
     HallwayEncounterDetected {
         agent_a: AgentId,
         agent_b: AgentId,
-        location: String,
+        /// Aktuelle Encounter-Location. Alte Events nutzten das Feld `location`.
+        #[serde(alias = "location")]
+        room_id: String,
     },
     /// Geruchsereignis in einem Raum (Coffee, Food, etc.)
     SmellEventTriggered {
@@ -292,6 +294,51 @@ impl DomainEventPayload {
             Self::ResourceProfileChanged { .. } => "resource_profile_changed",
             Self::OperatorGaiaSent { .. } => "operator_gaia_sent",
             Self::OperatorBroadcastSent { .. } => "operator_broadcast_sent",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hallway_encounter_serializes_room_id() {
+        let payload = DomainEventPayload::HallwayEncounterDetected {
+            agent_a: AgentId(24),
+            agent_b: AgentId(28),
+            room_id: "flur-eg".to_string(),
+        };
+
+        let json = payload.to_json();
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+
+        assert_eq!(value["type"], "HallwayEncounterDetected");
+        assert_eq!(value["room_id"], "flur-eg");
+        assert!(
+            value.get("location").is_none(),
+            "new payloads must not keep the legacy location field"
+        );
+    }
+
+    #[test]
+    fn hallway_encounter_deserializes_legacy_location_alias() {
+        let json =
+            r#"{"type":"HallwayEncounterDetected","agent_a":24,"agent_b":28,"location":"flur-eg"}"#;
+
+        let payload: DomainEventPayload = serde_json::from_str(json).expect("legacy payload");
+
+        match payload {
+            DomainEventPayload::HallwayEncounterDetected {
+                agent_a,
+                agent_b,
+                room_id,
+            } => {
+                assert_eq!(agent_a, AgentId(24));
+                assert_eq!(agent_b, AgentId(28));
+                assert_eq!(room_id, "flur-eg");
+            }
+            other => panic!("unexpected payload: {other:?}"),
         }
     }
 }
