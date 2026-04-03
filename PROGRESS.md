@@ -4,7 +4,7 @@
 
 - Issue: `#289` Room-Kommunikation Phase 2
 - Overall status: `IN_PROGRESS`
-- Current task: `3. MO1-MO6 im laufenden System reproduzierbar machen`
+- Current task: `4. Verbleibende Code-Luecken schliessen`
 - Plan source: `/work/company/codex-plan289.md`
 - GitHub SSOT: `gh issue view 289 --repo silentspike/project-sentinel`
 - Last refresh: `2026-04-03`
@@ -17,10 +17,16 @@
 - Die genehmigte Planbasis fuer `#289` ist `/work/company/codex-plan289.md`.
 - Die lokale Handover-Datei bestaetigt den IST-Zustand `22/28` PASS, `6/28` BLOCKED (`MO1-MO6`) und verweist auf Operator-API als Trigger-Pfad.
 - `mainrag` ist derzeit nicht verfuegbar (`localhost:3001` connection refused). Das blockiert die Ausfuehrung nicht, ist aber als Umgebungsbefund festgehalten.
+- Die Deploy-VM `10.0.0.240` ist wieder erreichbar; `sentinel-daemon`, `sentinel-projection` und `sentinel-gateway` liefen beim Re-Check alle `active`.
+- Die Runtime ist fuer Repro stabiler als erwartet, weil `localhost:8081/control/config` aktuell bereits `rate_limit_rps=0` meldet. Normale LLM-Autonomie ist damit pausiert.
+- Gaia ist ein belastbarer MO-Trigger: `operator_gaia_sent -> agent_action_received(Move) -> transit_started` ist live fuer `AGENT-11`, `AGENT-46..50` belegt.
+- `buero-betriebsarzt` ist als MO-Repro-Raum bestaetigt: live von `occupant_count=3` auf `occupant_count=6` gebracht, waehrend `transit_count` separat sichtbar blieb.
+- `MO6`-relevante Trennung ist sowohl live als auch im Code bestaetigt: `decision.rs` zaehlt nur stationaere oder `transit_paused` Agents zur Occupancy.
+- Wahrscheinliche Spec-/Code-Diskrepanz fuer `MO2`: `generate_capacity_events()` feuert `"Der Raum ist komplett voll."` bereits bei `occupancy >= capacity + 2`, nicht erst darueber.
 
 ## Blocked items
 
-- `MO1-MO6` sind historisch als Runtime-Trigger-Problem bekannt und muessen im laufenden System reproduzierbar gemacht werden.
+- Kein externer Infrastruktur-Blocker mehr aktiv.
 
 ## Task table
 
@@ -28,8 +34,8 @@
 |---|------|--------|-------|----------|
 | 1 | Baseline bestaetigen | DONE | Commit-Basis, Issue-SSOT, Branch/Worktree, Runtime-Status | command |
 | 2 | GitHub-AC-Matrix erstellen | DONE | 17 ACs in pruefbare Matrix mit Evidence-Mapping ueberfuehren | command, inspect |
-| 3 | MO1-MO6 im laufenden System reproduzierbar machen | IN_PROGRESS | reproduzierbare Operator-/API-Trigger fuer Kapazitaetstests | command, system |
-| 4 | Verbleibende Code-Luecken schliessen | TODO | nur die real offenen Ursachen beheben | command, inspect, system |
+| 3 | MO1-MO6 im laufenden System reproduzierbar machen | DONE | reproduzierbare Operator-/API-Trigger fuer Kapazitaetstests | command, system |
+| 4 | Verbleibende Code-Luecken schliessen | IN_PROGRESS | nur die real offenen Ursachen beheben | command, inspect, system |
 | 5 | Benchmarks implementieren oder an vorhandene Harnesses anbinden | TODO | BFS-, Encounter- und Tick-Benchmarkpfade absichern | command |
 | 6 | TOGAF aktualisieren | TODO | Transit-Zeiten auf `15s-120s` angleichen | inspect, command |
 | 7 | 17/17 ACs mit frischer Evidence verifizieren | TODO | jede AC einzeln im laufenden System oder passendem Harness nachweisen | command, system, inspect |
@@ -239,6 +245,47 @@ Acceptance criteria:
 - AC10.3: finaler Repo-Status und `PROGRESS.md` konsistent
   Evidence: `command`
 
+## Task 3 evidence summary
+
+- VM-Reachability wiederhergestellt:
+  `ssh -o ConnectTimeout=5 ubuntu@10.0.0.240 "hostname && systemctl is-active sentinel-daemon && systemctl is-active sentinel-projection && systemctl is-active sentinel-gateway"`
+  Ergebnis: Host erreichbar, alle drei Dienste `active`.
+- Runtime-API verfuegbar:
+  `/api/agents` lieferte `26` Agents, `/api/rooms` lieferte `26` Raeume.
+- Repro-Raum identifiziert:
+  `buero-betriebsarzt` startete mit `capacity=4`, `occupant_count=3`, `transit_count=0`.
+- Gaia-Trigger fuer Einzelmove bestaetigt:
+  `AGENT-11 -> buero-it` fuehrte live zu `operator_gaia_sent`, `agent_action_received|Move|buero-it`, `transit_started` und `in_transit=true`.
+- MO1/MO2-Setup live etabliert:
+  `AGENT-46`, `47`, `48`, `49` wurden per Gaia nach `buero-betriebsarzt` geschickt.
+  Zwischenstand belegte `occupant_count=4`, spaeter `occupant_count=6` bei gleichzeitigem `transit_count=5`.
+- Encounter-bedingte Verzoegerung nachvollziehbar:
+  Event-Store zeigte `hallway_encounter_detected` fuer `AGENT-46-49` und `AGENT-46-48`, wodurch die restlichen Agenten zunaechst im `flur-og` pausierten.
+- MO3-Repro bestaetigt:
+  Trotz bereits ueberbelegtem `buero-betriebsarzt` wurde `AGENT-50` erneut nach dorthin geschickt.
+  Event-Store zeigte wieder `operator_gaia_sent`, `agent_action_received|Move|buero-betriebsarzt`, `transit_started`, also keinen Hard-Block.
+- MO6-Repro bestaetigt:
+  Live-API zeigte im selben Raum getrennte Werte fuer `occupant_count` und `transit_count`.
+  Codepfad in `crates/sentinel-ecs/src/decision.rs` bildet `room_occupancy` nur aus `!in_transit || transit_paused`.
+
+## Task 3 repro steps
+
+1. Stabilen Repro-Modus bestaetigen:
+   `ssh ubuntu@10.0.0.240 "curl -s localhost:8081/control/config"`
+   Erwartung: `rate_limit_rps=0`
+2. Startzustand des Zielraums lesen:
+   `ssh ubuntu@10.0.0.240 "curl -s localhost:8000/api/rooms | python3 -c 'import sys,json; rooms=json.load(sys.stdin); print(next(x for x in rooms if x[\"id\"]==\"buero-betriebsarzt\"))'"`
+3. Gaia-Moves fuer OG-Agents ausloesen:
+   `target_agent_id in {46,47,48,49,50}`, Thought: `Gehe jetzt bitte direkt ins buero-betriebsarzt.`
+4. Move-Akzeptanz pruefen:
+   Event-Store auf `operator_gaia_sent`, `agent_action_received`, `transit_started` fuer die Ziel-Agents abfragen.
+5. Raumzustand pollen:
+   `occupant_count` und `transit_count` fuer `buero-betriebsarzt` aus `/api/rooms` lesen.
+6. Transit-vs-Occupancy pruefen:
+   Agent-Zustaende in `/api/agents` mit Raumzustand kombinieren.
+7. Fuer Einzel-Repro eines Direct-Moves:
+   `AGENT-11 -> buero-it` oder denselben OG-Pfad erneut verwenden.
+
 ## AC matrix
 
 | AC | Requirement | Primary trigger | Primary evidence | Expected signal |
@@ -264,3 +311,4 @@ Acceptance criteria:
 ## Commit references
 
 - `7e4a72b` — Task 1: Baseline bestaetigen
+- `6b30891` — Task 2: GitHub-AC-Matrix erstellen
