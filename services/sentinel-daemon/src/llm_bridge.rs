@@ -19,7 +19,7 @@ pub mod bridge {
     use std::time::{Duration, Instant};
 
     use serde::{Deserialize, Serialize};
-    use tokio::sync::Semaphore;
+    use tokio::sync::{Mutex as AsyncMutex, Semaphore};
     use tracing::{debug, error, info, instrument, warn};
 
     use sentinel_common::{ActionType, AgentAction, AgentId, Perception, Tick, Timestamp};
@@ -202,6 +202,7 @@ pub mod bridge {
             config.circuit_breaker_threshold,
             config.circuit_breaker_reset,
         )));
+        let pending_retries = Arc::new(AsyncMutex::new(HashMap::<AgentId, Perception>::new()));
         let mut last_call_tick: HashMap<AgentId, u64> = HashMap::new();
         // Debounce: Operator-Impulse (Gaia/Broadcast) nur beim ERSTEN Tick urgent,
         // danach 60 Ticks Cooldown. Verhindert Semaphore-Starvation bei 300-Tick TTL.
@@ -224,7 +225,10 @@ pub mod bridge {
         while let Some(first) = async_rx.recv().await {
             // Drain: Alle sofort verfuegbaren Perceptions lesen.
             // Pro Agent: neueste behalten, heard_text bevorzugen.
-            let mut batch: HashMap<AgentId, Perception> = HashMap::new();
+            let mut batch: HashMap<AgentId, Perception> = {
+                let mut pending = pending_retries.lock().await;
+                std::mem::take(&mut *pending)
+            };
             insert_prefer_heard(&mut batch, first);
             while let Ok(p) = async_rx.try_recv() {
                 insert_prefer_heard(&mut batch, p);
@@ -277,6 +281,9 @@ pub mod bridge {
                     telemetry
                         .calls_skipped_circuit_open
                         .fetch_add(1, Ordering::Relaxed);
+                    if should_retry_perception(&perception) {
+                        queue_retry(&pending_retries, perception).await;
+                    }
                     continue;
                 }
 
@@ -300,6 +307,8 @@ pub mod bridge {
                 let action_tx = action_tx.clone();
                 let telemetry = Arc::clone(&telemetry);
                 let cb = Arc::clone(&circuit_breaker);
+                let retry_queue = Arc::clone(&pending_retries);
+                let retry_perception = perception.clone();
                 let request = build_gateway_request(&perception, &state_store);
 
                 telemetry.calls_total.fetch_add(1, Ordering::Relaxed);
@@ -321,6 +330,7 @@ pub mod bridge {
                             Ok(Ok(permit)) => permit,
                             Ok(Err(_)) => {
                                 warn!(agent = %agent_id, "URGENT Semaphore closed");
+                                queue_retry(&retry_queue, retry_perception.clone()).await;
                                 return;
                             }
                             Err(_) => {
@@ -329,6 +339,7 @@ pub mod bridge {
                                     timeout_ms = acquire_timeout.as_millis(),
                                     "URGENT Semaphore timeout"
                                 );
+                                queue_retry(&retry_queue, retry_perception.clone()).await;
                                 return;
                             }
                         };
@@ -372,12 +383,15 @@ pub mod bridge {
                                             warn!(agent = %agent_id, error = %e, "Gateway Response Parse-Fehler");
                                             telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                             cb.lock().unwrap().record_failure();
+                                            queue_retry(&retry_queue, retry_perception.clone())
+                                                .await;
                                         }
                                     }
                                 } else {
                                     warn!(agent = %agent_id, status = status.as_u16(), "Gateway HTTP Fehler");
                                     telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                     cb.lock().unwrap().record_failure();
+                                    queue_retry(&retry_queue, retry_perception.clone()).await;
                                 }
                             }
                             Err(e) => {
@@ -385,6 +399,7 @@ pub mod bridge {
                                 warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, "Gateway Request fehlgeschlagen");
                                 telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                 cb.lock().unwrap().record_failure();
+                                queue_retry(&retry_queue, retry_perception.clone()).await;
                             }
                         }
                         drop(permit);
@@ -483,6 +498,24 @@ pub mod bridge {
                 }
             })
             .or_insert(p);
+    }
+
+    fn should_retry_perception(perception: &Perception) -> bool {
+        !perception.heard_text.is_empty()
+            || perception.is_directly_addressed
+            || perception.has_operator_impulse
+    }
+
+    async fn queue_retry(
+        queue: &Arc<AsyncMutex<HashMap<AgentId, Perception>>>,
+        perception: Perception,
+    ) {
+        if !should_retry_perception(&perception) {
+            return;
+        }
+
+        let mut pending = queue.lock().await;
+        insert_prefer_heard(&mut pending, perception);
     }
 
     /// Baut den Gateway-Request aus einer Perception + Evolution-Daten aus redb.
@@ -830,6 +863,18 @@ pub mod bridge {
                 merged.heard_text, "Besucher sagte: Hallo",
                 "heard_text darf nicht durch leere Perception ueberschrieben werden"
             );
+        }
+
+        #[test]
+        fn should_retry_perception_for_room_chat() {
+            let perception = make_perception(21, "Besucher sagte: Hallo", false);
+            assert!(should_retry_perception(&perception));
+        }
+
+        #[test]
+        fn should_not_retry_plain_heartbeat() {
+            let perception = make_perception(22, "", false);
+            assert!(!should_retry_perception(&perception));
         }
     }
 }
