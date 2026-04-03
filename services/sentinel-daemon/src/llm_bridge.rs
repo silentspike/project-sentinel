@@ -296,7 +296,7 @@ pub mod bridge {
                     "LLM call triggered");
 
                 let client = client.clone();
-                let url = format!("{}/v1/chat/completions", config.gateway_url);
+                let url = format!("{}/internal/llm", config.gateway_url);
                 let action_tx = action_tx.clone();
                 let telemetry = Arc::clone(&telemetry);
                 let cb = Arc::clone(&circuit_breaker);

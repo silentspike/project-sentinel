@@ -135,6 +135,35 @@ function seedEvents(db: Database): void {
   );
 }
 
+function seedLegacyEvents(db: Database): void {
+  const insert = db.prepare(`
+    INSERT INTO events (event_id, event_type, aggregate_id, payload,
+                        correlation_id, causation_id, operation_id,
+                        tick, timestamp_ms)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  insert.run(
+    "evt-chaos-legacy", "chaos_triggered", "buero-dev-1",
+    JSON.stringify({
+      type: "power_outage",
+      target_room: "buero-dev-1",
+      description: "Legacy Stromausfall",
+    }),
+    "cor-legacy", null, "op-legacy-1", 9000, now - 120_000,
+  );
+
+  insert.run(
+    "evt-action-legacy", "transit_started", "AGENT-03",
+    JSON.stringify({
+      from_room: "buero-dev-1",
+      to_room: "kueche-eg",
+      duration_ms: 5000,
+    }),
+    "cor-legacy", "evt-chaos-legacy", "op-legacy-2", 9001, now - 110_000,
+  );
+}
+
 function seedEvolution(db: Database): void {
   const insert = db.prepare(`
     INSERT INTO personality_evolution (agent_id, tick, field, change_type,
@@ -328,5 +357,46 @@ describe("empty database", () => {
 
     emptyEs.close();
     emptyProj.close();
+  });
+
+  test("supports older event schema without compensation_type", async () => {
+    const legacyEs = new Database(":memory:");
+    const legacyProj = new Database(":memory:");
+    legacyEs.exec(`
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        event_type TEXT NOT NULL,
+        aggregate_id TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        correlation_id TEXT NOT NULL,
+        causation_id TEXT,
+        operation_id TEXT NOT NULL UNIQUE,
+        tick INTEGER NOT NULL,
+        timestamp_ms INTEGER NOT NULL,
+        schema_version INTEGER DEFAULT 1
+      );
+      CREATE INDEX idx_events_type ON events(event_type, id);
+      CREATE INDEX idx_events_correlation ON events(correlation_id);
+    `);
+    legacyEs.exec(EVOLUTION_SCHEMA);
+    legacyProj.exec(PROJECTION_SCHEMA);
+
+    seedLegacyEvents(legacyEs);
+    seedProjection(legacyProj);
+    setDatabases(legacyProj, legacyEs);
+
+    try {
+      const res = await app.request("/api/cockpit");
+      expect(res.status).toBe(200);
+
+      const data = await res.json();
+      expect(Array.isArray(data.incidents)).toBe(true);
+      expect(data.incidents.length).toBeGreaterThan(0);
+    } finally {
+      setDatabases(projDb, esDb);
+      legacyEs.close();
+      legacyProj.close();
+    }
   });
 });
