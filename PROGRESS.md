@@ -4,7 +4,7 @@
 
 - Issue: `#289` Room-Kommunikation Phase 2
 - Overall status: `IN_PROGRESS`
-- Current task: `2. GitHub-AC-Matrix erstellen`
+- Current task: `3. MO1-MO6 im laufenden System reproduzierbar machen`
 - Plan source: `/work/company/codex-plan289.md`
 - GitHub SSOT: `gh issue view 289 --repo silentspike/project-sentinel`
 - Last refresh: `2026-04-03`
@@ -27,8 +27,8 @@
 | # | Task | Status | Scope | Evidence |
 |---|------|--------|-------|----------|
 | 1 | Baseline bestaetigen | DONE | Commit-Basis, Issue-SSOT, Branch/Worktree, Runtime-Status | command |
-| 2 | GitHub-AC-Matrix erstellen | IN_PROGRESS | 17 ACs in pruefbare Matrix mit Evidence-Mapping ueberfuehren | command, inspect |
-| 3 | MO1-MO6 im laufenden System reproduzierbar machen | TODO | reproduzierbare Operator-/API-Trigger fuer Kapazitaetstests | command, system |
+| 2 | GitHub-AC-Matrix erstellen | DONE | 17 ACs in pruefbare Matrix mit Evidence-Mapping ueberfuehren | command, inspect |
+| 3 | MO1-MO6 im laufenden System reproduzierbar machen | IN_PROGRESS | reproduzierbare Operator-/API-Trigger fuer Kapazitaetstests | command, system |
 | 4 | Verbleibende Code-Luecken schliessen | TODO | nur die real offenen Ursachen beheben | command, inspect, system |
 | 5 | Benchmarks implementieren oder an vorhandene Harnesses anbinden | TODO | BFS-, Encounter- und Tick-Benchmarkpfade absichern | command |
 | 6 | TOGAF aktualisieren | TODO | Transit-Zeiten auf `15s-120s` angleichen | inspect, command |
@@ -239,6 +239,28 @@ Acceptance criteria:
 - AC10.3: finaler Repo-Status und `PROGRESS.md` konsistent
   Evidence: `command`
 
+## AC matrix
+
+| AC | Requirement | Primary trigger | Primary evidence | Expected signal |
+|---|---|---|---|---|
+| AC-1 | `Es ist eng hier` bei `capacity..capacity+2` | Agents gezielt in Raum bis Soft-Cap bewegen | `system` | Operator-/Daemon-Log oder Impulse zeigt `Es ist eng hier` |
+| AC-2 | `Der Raum ist komplett voll` ueber `capacity+2` | Raum gezielt massiv ueberbelegen | `system` | Operator-/Daemon-Log oder Impulse zeigt `Der Raum ist komplett voll` |
+| AC-3 | kein Hard-Block beim Eintritt | Agent per Operator/API in vollen Raum schicken | `system` | Transit/Move wird ausgefuehrt, Agent erreicht Ziel trotz Vollbelegung |
+| AC-4 | stationaere Agents erhalten ebenfalls Kapazitaets-Hinweis | Raum nachtraeglich um stationaeren Agenten herum fuellen | `system` | bereits sitzender Agent erhaelt Capacity-Perception im Log/Impuls |
+| AC-5 | `HallwayEncounterDetected` erzeugt P3 PendingEvent | zwei Transit-Agents in denselben Zwischen-Raum bringen | `system` | Event/Log weist Encounter PendingEvent nach |
+| AC-6 | Encounter-Perception nennt Name und Rolle | denselben Encounter-Fall wie AC-5 ausloesen | `system` | Perception enthaelt `Du triffst [Name] ([Rolle]) im Flur` |
+| AC-7 | Encounter nur im selben Zwischen-Raum | gleichzeitige Transit-Faelle auf verschiedenen Stockwerken und im Treppenhaus provozieren | `system` | kein Encounter fuer `flur-eg` vs `flur-og`, aber moeglich im `treppenhaus` |
+| AC-8 | Transit pausiert bei Encounter | laufenden Encounter waehrend Transit beobachten | `system` | `remaining_ms`/Transit-Fortschritt stoppt oder Pause-Log erscheint |
+| AC-9 | Transit resumed nach Encounter | nach Encounter-Chat/Timeout weiterbeobachten | `system` | Resume-Log/Event und spaetere Zielankunft |
+| AC-10 | Transit-Dauer `20s/Hop`, clamp `15-120s` | 1-, 2-, 4- und 5-Hop-Moves ausloesen | `system` | Event-Store zeigt `duration_ms` im Zielbereich |
+| AC-11 | Transit hat berechneten BFS-Pfad | Transit ueber bekannte adjacency-Routen ausloesen | `system` | Event/State/Log zeigt Route oder korrekte Zwischen-Raum-Sequenz |
+| AC-12 | Agent hat jederzeit definierten Zwischen-Raum | Cross-floor-Transit ueber mehrere Ticks beobachten | `system` | API/Perception zeigt pro Tick einen konkreten Transit-Raum |
+| AC-13 | Transit-Perception enthaelt Quelle, Ziel, Zwischen-Raum | waehrend Transit Impulse/Logs lesen | `system` | Text enthaelt `von`, `nach`, `durch` mit allen drei Angaben |
+| AC-14 | stationaere Agents haben keinen Transit-Block | stationaeren Agenten in Ruhe beobachten | `system` | keine Transit-Perception bei `in_transit=false` |
+| AC-15 | Heartbeat sinkt auf `2-3` Ticks bei aktivem Chat | 3+ Chat-Nachrichten in denselben Raum senden | `system` | Heartbeat-/Output-Logs zeigen kuerzere Intervalle |
+| AC-16 | Heartbeat steigt wieder auf `10` Ticks | Chat stoppen und >30 Ticks warten | `system` | Heartbeat-Intervalle normalisieren sich auf Standard |
+| AC-17 | Bio/Physics bleiben bei `1 Hz` | waehrend aktivem Chat Tick-Duration messen | `system` | Tick-/Metrikdaten bleiben um `1000ms`, unter `1100ms` |
+
 ## Commit references
 
-- none yet
+- `7e4a72b` — Task 1: Baseline bestaetigen
