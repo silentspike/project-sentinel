@@ -1905,11 +1905,11 @@ pub fn encounter_system(
     }
 
     // Pass 3: Encounter-Events emittieren + transit_paused setzen
-    for (entity_a, entity_b, id_a, id_b, location) in &encounters {
+    for (entity_a, entity_b, id_a, id_b, room_id) in &encounters {
         let payload = DomainEventPayload::HallwayEncounterDetected {
             agent_a: *id_a,
             agent_b: *id_b,
-            location: location.clone(),
+            room_id: room_id.clone(),
         };
         let event = DomainEvent::new(
             payload.event_type_str(),
@@ -1926,7 +1926,7 @@ pub fn encounter_system(
             pos_a.transit_pause_tick = tick;
             tracing::info!(
                 agent = %identity_a.name,
-                room = %location,
+                room = %room_id,
                 "Transit pausiert fuer Encounter"
             );
         }
@@ -1935,7 +1935,7 @@ pub fn encounter_system(
             pos_b.transit_pause_tick = tick;
             tracing::info!(
                 agent = %identity_b.name,
-                room = %location,
+                room = %room_id,
                 "Transit pausiert fuer Encounter"
             );
         }
