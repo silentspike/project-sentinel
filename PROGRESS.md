@@ -5,7 +5,7 @@
 - Plan source: `User-Freigabe: PR-Stack #299/#300/#301 mergen, danach Vollbetriebs-/Soak-Test, alles nach $start`
 - Overall status: `IN_PROGRESS`
 - Current task: `Task 3 - PR-Stack #299 -> #300 -> #301 freigeben und mergen`
-- Current branch: `feat/issue-296-mitm-followups-clean`
+- Current branch: `feat/issue-282-room-chat-forwarding`
 - Pull policy: `Kein Pull von main in den aktuellen Branch ohne explizite User-Freigabe`
 - Last refresh: `2026-04-03`
 
@@ -14,12 +14,15 @@
 - GitHub `origin/main` stand zu Task-Start auf `4e69d4f`; der historische MITM-Vertrag aus `e4f8769` ist jetzt wieder im aktuellen Gateway-Code und auf der VM deployed.
 - `#288` ist formal geschlossen; `status:verified` ist gesetzt und der Close-Kommentar grenzt die getrennte Parity-Luecke sauber ab.
 - `#295` ist formal geschlossen; `status:verified` ist gesetzt und der Close-Kommentar verweist korrekt auf den provider-unabhaengigen `baseGate`-/`heard`-Fix.
-- `#296` bleibt offen als echtes Follow-up fuer Dashboard/Streaming/Blocks/Observability/Redaction; die Parity-Luecke liegt separat in `#298`.
+- `#296` ist jetzt formal geschlossen; Dashboard-/Streaming-/Observability-/Redaction-Follow-ups sind verifiziert und nicht mehr mit der frueheren Parity-Luecke vermischt.
 - `#289` ist jetzt formal geschlossen; `status:verified` ist gesetzt, `status:triage` und `quality:needs-spec` sind entfernt.
 - `#298` ist jetzt formal geschlossen; `/v1/messages`, request-scoped Anthropic-Passthrough, path-spezifische Anthropic-Responses und die zugehoerigen Smoke-Tests sind wiederhergestellt.
+- `#282` ist jetzt formal geschlossen; die historische Auto-Reopen-Lage wurde mit frischer VM-Evidence und `status:verified` bereinigt.
 - Der aktuelle Closure-/Parity-Stand ist jetzt auf GitHub publiziert:
   Draft-PR `#299` von `feat/issue-289-room-phase2-closure` nach `main`.
 - Der alte PR `#297` von `fix/issue-296-mitm-followups` ist jetzt geschlossen und explizit als superseded markiert.
+- Der neue `#296`-Arbeitsbranch ist jetzt `feat/issue-296-mitm-followups-clean` und zeigt exakt auf den publizierten Basis-Commit `fb019f0`.
+- Auf `#282` gab es nach dem ersten Live-Test einen echten Runtime-Gap: `heard_text` wurde im ECS korrekt erzeugt, aber bei Gateway-Fehlern vor dem Bridge-Retry verloren. Das ist jetzt im Daemon gefixt und live nachverifiziert.
 - TOGAF und lokale Artefakte sind auf den verifizierten Room-Phase-2-Stand angeglichen: realistische Transit-Zeiten `15s-120s`, Transit-Perception mit Zwischen-Raum und adaptiver Heartbeat ohne separaten Async-Task.
 - Alle drei Stack-PRs sind Stand Task-Start noch `DRAFT` und nicht mergebar.
 - Gemeinsamer harter Merge-Blocker: PR-Lint verlangt Conventional-Commit-Titel fuer `#299`, `#300` und `#301`.
@@ -220,6 +223,67 @@
     - `tail /tmp/gateway296.log`
       -> `pipeline request completed","provider":"anthropic-direct"`
   - Damit ist der komplette `/v1/messages -> anthropic-direct -> upstream`-Pfad fuer die aktuelle Binary auf der VM belegt, unabhaengig vom blockierten `claude -p`-Prozess.
+
+## Task 4 evidence summary
+
+- Erster Live-Befund auf `#282`:
+  - `POST /operator/chat` wurde im ECS korrekt gehoert, aber der spaetere Bridge-Log lief fuer denselben Room-Chat noch mit `has_heard=false`
+  - Ursache: urgente Perceptions (`heard_text`, direkte Ansprache, Gaia) wurden bei Circuit-Open bzw. `429/503` im Daemon nicht fuer Retry behalten
+
+- Umgesetzter Fix:
+  - `services/sentinel-daemon/src/llm_bridge.rs`
+  - neuer Retry-Puffer fuer urgente Perceptions bei Circuit-Open, Semaphore-Timeout, HTTP-Fehlern, Parse-Fehlern und Request-Fehlern
+  - bestehende Priorisierung `insert_prefer_heard()` merged Retry-State und neue Perceptions desselben Agents weiterhin deterministisch
+
+- Gezielte Regressionen gruen:
+  - `cargo remote -c -- test -p sentinel-daemon insert_prefer_heard -- --nocapture`
+    -> `3` Tests PASS
+  - `cargo remote -c -- test -p sentinel-daemon should_retry_perception -- --nocapture`
+    -> PASS
+  - `cargo remote -c -- test -p sentinel-ecs get_recent_empty_after_set_heard -- --nocapture`
+    -> PASS
+  - `cargo remote -c -- test -p sentinel-ecs new_chat_visible_after_set_heard -- --nocapture`
+    -> PASS
+  - `cargo remote -c -- test -p sentinel-daemon build_gateway_request_formats_perception_for_gateway_compiler -- --nocapture`
+    -> PASS
+  - `cargo remote -c -- clippy -p sentinel-daemon --all-targets -- -D warnings`
+    -> PASS
+
+- VM-Deploy:
+  - `systemctl cat sentinel-daemon | grep ExecStart`
+    -> `/opt/sentinel/bin/sentinel-daemon --config /opt/sentinel/config/daemon.toml`
+  - neues Release-Binary nach `/opt/sentinel/bin/sentinel-daemon` kopiert und Dienst neu gestartet
+  - `systemctl is-active sentinel-daemon`
+    -> `active`
+
+- Live-Evidence nach Deploy:
+  - Raumbelegung:
+    `curl -s localhost:8000/api/agents | ... current_room == buero-dev-1`
+    -> `ROOM_COUNT 5` (`Andreas Wolff`, `Julia Neumann`, `Kai Fischer`, `Lena Hoffmann`, `Hannah Meier`)
+  - Operator-Chat:
+    `POST localhost:8084/operator/chat`
+    -> `{"accepted":true,"message":"Chat in RoomChatBuffer eingefuegt"}`
+  - ECS-Wahrnehmung:
+    `journalctl -u sentinel-daemon --since '2026-04-03 13:56:10' ...`
+    -> `Operator-Chat in RoomChatBuffer eingefuegt`
+    -> `output_system: heard_text gefunden` fuer alle `5` aktuellen Agents in `buero-dev-1`
+  - Bridge-/Retry-Nachweis:
+    derselbe Journal-Ausschnitt zeigt danach wiederholt `LLM call triggered ... has_heard=true` fuer die Live-Raumbesetzung (`AGENT-05`, `AGENT-06`, `AGENT-07`, `AGENT-08`, `AGENT-15`)
+    -> Room-Chat bleibt jetzt bis zur Bridge erhalten, auch wenn der Upstream weiter `429/503` liefert
+  - Error-Level:
+    `journalctl -u sentinel-daemon --since '5 min ago' -p err --no-pager`
+    und
+    `journalctl _PID=$(pgrep cortex-gate) --since '5 min ago' -p err --no-pager`
+    -> jeweils `-- No entries --`
+  - Event-Store:
+    `sqlite3 /opt/sentinel/data/events.db "SELECT event_type, COUNT(*) ... last 60s ..."`
+    -> nur bestehende Event-Typen (`bio_state_updated`, `room_physics_updated`, `judge_alert_received`, `agent_action_received`, `hallway_encounter_detected`, `tick_snapshot`, `transit_started`), keine neue Room-Chat-spezifische Disk-Event-Klasse
+
+- Formale GitHub-Abschluss-Schritte:
+  - Kommentar mit kompletter Evidence auf `#282` hinterlegt
+  - `gh issue edit 282 --repo silentspike/project-sentinel --add-label status:verified --remove-label status:backlog`
+  - `gh issue close 282 --repo silentspike/project-sentinel`
+  - Ergebnis: `#282` ist `CLOSED`
 
 ## Task 6 evidence summary
 
