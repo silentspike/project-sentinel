@@ -36,7 +36,7 @@ func NewAssembler(loader *TOMLLoader, caps *capability.ProviderCapabilities) *As
 
 // LoadCompanyContext reads company-context.md from the config directory.
 func LoadCompanyContext(agentsDir string) string {
-	configDir := filepath.Dir(agentsDir)
+	configDir := filepath.Join(filepath.Dir(agentsDir), "config")
 	path := filepath.Join(configDir, "company-context.md")
 	data, err := os.ReadFile(path) //nolint:gosec // path is derived from trusted local config layout
 	if err != nil {

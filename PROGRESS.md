@@ -4,7 +4,7 @@
 
 - Plan source: `User-Freigabe 2026-04-04: vier echte Runtime-Fixes nach $start umsetzen`
 - Overall status: `IN_PROGRESS`
-- Current task: `Task 3 - company-context.md deploybar machen`
+- Current task: `Task 4 - claude-code Breaker-/Health-Inkonsistenz beheben`
 - Current branch: `fix/post-soak-runtime-followups`
 - Hook status: `PreToolUse TaskUpdate + PostToolUse start-enforcer projektlokal registriert`
 - Last refresh: `2026-04-04 / Task 1 live verifiziert`
@@ -13,7 +13,7 @@
 
 - `hallway_encounter_detected` speichert aktuell `location`, aber kein `room_id`; Live-DB zeigt deshalb leeres `$.room_id` trotz korrekter Begegnungs-Location `flur-eg`.
 - Die Traffic-Control-Bootstrap-Flags sind jetzt zwischen Repo-`daemon.toml`, VM-`daemon.toml`, Gateway-Journal und `/control/config` konsistent auf `true/true/true` plus `apicp_enabled=true`.
-- `company-context.md` liegt auf der VM aktuell nur unter `/opt/sentinel/company-context.md`; der Gateway lädt also einen Root-Workdir-Pfad, obwohl die Repo-Quelle unter `config/company-context.md` liegt.
+- `company-context.md` wird jetzt aus `config/company-context.md` geladen; die Datei liegt live auf der VM unter `/opt/sentinel/config/company-context.md` und der Gateway loggt genau diesen Pfad.
 - `/health` zeigt `claude-code:"open"`, obwohl im letzten Soak echte `claude-code`-Completions gelaufen sind; das deutet auf eine Breaker-/Health-Inkonsistenz statt auf einen vollständigen LLM-Ausfall.
 - Die Punkte `synthesis_rate` und `capacity live nicht verifiziert` bleiben Beobachtungen, sind aber nicht Teil dieses 4-Task-Fixlaufs.
 
@@ -31,8 +31,8 @@
 |---|------|--------|-------|----------|
 | 1 | Encounter-Event-Payload korrigieren | DONE | `HallwayEncounterDetected` so korrigieren, dass Event-Schema und Live-Payload die Begegnungs-Location konsistent als `room_id`/Ort transportieren; Reader und Tests mitziehen | inspect, command, system |
 | 2 | Traffic-Control-Config-Drift vereinheitlichen | DONE | Repo-Defaults und Runtime-Intention für `synthesis_enabled`, `sequencing_enabled`, `tick_sync_enabled` konsistent machen und auf der VM verifizieren | inspect, command, system |
-| 3 | `company-context.md` deploybar machen | IN_PROGRESS | Sicherstellen, dass die projektlokale Company-Datei im produktiven Config-Pfad landet und live geladen wird | inspect, command, system |
-| 4 | `claude-code` Breaker-/Health-Inkonsistenz beheben | TODO | Health-/Breaker-Zustand so korrigieren, dass erfolgreiche `claude-code`-Nutzung nicht weiter als dauerhaft `open` gemeldet wird | inspect, command, system |
+| 3 | `company-context.md` deploybar machen | DONE | Sicherstellen, dass die projektlokale Company-Datei im produktiven Config-Pfad landet und live geladen wird | inspect, command, system |
+| 4 | `claude-code` Breaker-/Health-Inkonsistenz beheben | IN_PROGRESS | Health-/Breaker-Zustand so korrigieren, dass erfolgreiche `claude-code`-Nutzung nicht weiter als dauerhaft `open` gemeldet wird | inspect, command, system |
 | 5 | Plan-Verifikation | TODO | die vier Fixpunkte gegen Repo- und VM-Endstand vollständig gegenprüfen | inspect, command, system |
 
 ## Task details
@@ -166,6 +166,41 @@
   - AC-1 via `ls -l /opt/sentinel/config/company-context.md`
   - AC-2 via Gateway-Journal
   - AC-3 via Journal + Dateipfad
+- Outcome:
+  - Der Compiler leitet den Company-Context-Lookup jetzt aus dem `config`-Sibling der Agent-TOMLs ab statt aus dem Workdir-Root.
+  - Die Repo-Quelle `config/company-context.md` wird damit auf dem produktiven Layout korrekt auf `/opt/sentinel/config/company-context.md` gemappt.
+  - Gateway-Binary und Company-Context-Datei sind auf die VM deployed und nach Restart live verifiziert.
+- Evidence:
+  - AC-1 PASS:
+    - VM: `ls -l /opt/sentinel/config/company-context.md`
+    - Ergebnis: `-rw-r--r-- 1 root root 1242 ... /opt/sentinel/config/company-context.md`
+  - AC-2 PASS:
+    - VM-Journal: `company context loaded` mit `path:"config/company-context.md"`
+  - AC-3 PASS:
+    - kein `company context disabled`
+    - Gateway nach Restart `active (running)` und `/control/config` weiterhin erreichbar
+  - Test-Evidence:
+    - `go test ./cmd/cortex-gateway/internal/compiler`
+    - `go test ./cmd/cortex-gateway`
+
+### Task 4 pre-task self-check
+
+- Was jetzt erledigt werden muss:
+  - die Diskrepanz zwischen erfolgreichem `claude-code`-Betrieb und `/health`-Status `open` auf den konkreten Breaker-/Health-Pfad zurückführen
+  - den Status so korrigieren, dass Erfolg den Providerzustand wieder sichtbar schließt
+- Welche ACs jetzt bestehen müssen:
+  - AC-1: `/health` meldet `claude-code` nach erfolgreichen Requests nicht weiter fälschlich `open`
+  - AC-2: erfolgreiche `claude-code`-Completions bleiben möglich
+  - AC-3: relevante Gateway-Tests bleiben grün
+- Wie ich jede AC beweise:
+  - AC-1 mit VM-`/health` vor/nach reproduzierter Completion
+  - AC-2 mit Gateway-Journal `pipeline request completed` über `provider:"claude-code"`
+  - AC-3 mit gezielten Go-Tests
+- Erwartete Dateiänderungen:
+  - Breaker-/Health-Code im Gateway
+  - relevante Tests
+- Risiken / Abhängigkeiten:
+  - echte `claude-code`-Completions auf der VM hängen von verfügbarem Quota und lebendem Gateway-/Daemon-Pfad ab
 
 ### Task 4 - `claude-code` Breaker-/Health-Inkonsistenz beheben
 
