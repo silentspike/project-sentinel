@@ -17,7 +17,7 @@
 - `#296` ist jetzt formal geschlossen; Dashboard-/Streaming-/Observability-/Redaction-Follow-ups sind verifiziert und nicht mehr mit der frueheren Parity-Luecke vermischt.
 - `#289` ist jetzt formal geschlossen; `status:verified` ist gesetzt, `status:triage` und `quality:needs-spec` sind entfernt.
 - `#298` ist jetzt formal geschlossen; `/v1/messages`, request-scoped Anthropic-Passthrough, path-spezifische Anthropic-Responses und die zugehoerigen Smoke-Tests sind wiederhergestellt.
-- `#282` ist jetzt formal geschlossen; die historische Auto-Reopen-Lage wurde mit frischer VM-Evidence und `status:verified` bereinigt.
+- `#282` ist jetzt formal geschlossen; die historische Auto-Reopen-Situation wurde mit frischer VM-Evidence und `status:verified` bereinigt.
 - Der aktuelle Closure-/Parity-Stand ist jetzt auf GitHub publiziert:
   Draft-PR `#299` von `feat/issue-289-room-phase2-closure` nach `main`.
 - Der alte PR `#297` von `fix/issue-296-mitm-followups` ist jetzt geschlossen und explizit als superseded markiert.
