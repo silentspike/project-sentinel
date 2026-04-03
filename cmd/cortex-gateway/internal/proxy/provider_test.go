@@ -31,6 +31,24 @@ func (m *mockProvider) Send(_ context.Context, _ *LLMRequest) (*LLMResponse, err
 }
 func (m *mockProvider) HealthCheck(_ context.Context) error { return nil }
 
+type streamRecorderProvider struct {
+	name       string
+	lastReq    *LLMRequest
+	streamBody string
+}
+
+func (p *streamRecorderProvider) Name() string { return p.name }
+func (p *streamRecorderProvider) Send(_ context.Context, _ *LLMRequest) (*LLMResponse, error) {
+	return nil, errors.New("unexpected Send call")
+}
+func (p *streamRecorderProvider) HealthCheck(_ context.Context) error { return nil }
+func (p *streamRecorderProvider) StreamHTTP(_ context.Context, req *LLMRequest, w http.ResponseWriter) error {
+	p.lastReq = req
+	w.Header().Set("Content-Type", "text/event-stream")
+	_, err := w.Write([]byte(p.streamBody))
+	return err
+}
+
 type timeoutAwareProvider struct {
 	name  string
 	sleep time.Duration
@@ -590,10 +608,7 @@ func TestClaudeProvider_Send_Integration(t *testing.T) {
 		}
 
 		resp := claudeResponse{
-			Content: []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			}{{Type: "text", Text: "world"}},
+			Content: []json.RawMessage{anthropicTextBlockRaw("world")},
 			Model:      "claude-sonnet-4-5-20250929",
 			StopReason: "end_turn",
 			Usage:      claudeUsage{InputTokens: 10, OutputTokens: 5},
@@ -651,10 +666,7 @@ func TestClaudeProvider_Send_WithStructuredSystemBlocks(t *testing.T) {
 		}
 
 		resp := claudeResponse{
-			Content: []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			}{{Type: "text", Text: "world"}},
+			Content: []json.RawMessage{anthropicTextBlockRaw("world")},
 			Model:      "claude-sonnet-4-5-20250929",
 			StopReason: "end_turn",
 			Usage:      claudeUsage{InputTokens: 10, OutputTokens: 5},
@@ -765,10 +777,7 @@ func TestClaudeProvider_Send_ModelOverride(t *testing.T) {
 		receivedModel = cReq.Model
 
 		resp := claudeResponse{
-			Content: []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			}{{Type: "text", Text: "ok"}},
+			Content: []json.RawMessage{anthropicTextBlockRaw("ok")},
 			Model: cReq.Model,
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -792,6 +801,136 @@ func TestClaudeProvider_Send_ModelOverride(t *testing.T) {
 	}
 	if receivedModel != "override-model" {
 		t.Errorf("expected model override %q, got %q", "override-model", receivedModel)
+	}
+}
+
+func TestClaudeProviderSendPreservesRawContentBlocks(t *testing.T) {
+	var upstreamContent any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+
+		messages, ok := payload["messages"].([]any)
+		if !ok || len(messages) != 1 {
+			t.Fatalf("unexpected messages payload: %#v", payload["messages"])
+		}
+		first, ok := messages[0].(map[string]any)
+		if !ok {
+			t.Fatalf("unexpected first message: %#v", messages[0])
+		}
+		upstreamContent = first["content"]
+
+		resp := claudeResponse{
+			Content: []json.RawMessage{
+				json.RawMessage(`{"type":"thinking","thinking":"chain","signature":"sig"}`),
+				anthropicTextBlockRaw("done"),
+			},
+			Model:      "claude-sonnet-4-5-20250929",
+			StopReason: "end_turn",
+			Usage:      claudeUsage{InputTokens: 10, OutputTokens: 5},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	p := NewAnthropicDirectProvider(ProviderConfig{
+		Name:    "anthropic-direct",
+		BaseURL: server.URL,
+		APIKey:  "test-key",
+		Model:   "claude-sonnet-4-5-20250929",
+	})
+
+	resp, err := p.Send(context.Background(), &LLMRequest{
+		Messages: []Message{{
+			Role: "user",
+			ContentBlocks: []json.RawMessage{
+				json.RawMessage(`{"type":"text","text":"hello"}`),
+				json.RawMessage(`{"type":"tool_result","tool_use_id":"tool-1","content":"ok"}`),
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	blocks, ok := upstreamContent.([]any)
+	if !ok || len(blocks) != 2 {
+		t.Fatalf("upstream content = %#v, want 2 raw blocks", upstreamContent)
+	}
+	if resp.Content != "done" {
+		t.Fatalf("response content = %q, want done", resp.Content)
+	}
+	if len(resp.ContentBlocks) != 2 {
+		t.Fatalf("response content blocks = %d, want 2", len(resp.ContentBlocks))
+	}
+	if !strings.Contains(string(resp.ContentBlocks[0]), `"thinking"`) {
+		t.Fatalf("expected thinking block, got %s", string(resp.ContentBlocks[0]))
+	}
+}
+
+func TestClaudeProviderStreamHTTPRelaysSSE(t *testing.T) {
+	var gotStream bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode stream request: %v", err)
+		}
+		gotStream, _ = payload["stream"].(bool)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\"}\n\n"))
+	}))
+	defer server.Close()
+
+	p := NewAnthropicDirectProvider(ProviderConfig{
+		Name:    "anthropic-direct",
+		BaseURL: server.URL,
+		APIKey:  "test-key",
+		Model:   "claude-sonnet-4-5-20250929",
+	})
+
+	rec := httptest.NewRecorder()
+	err := p.StreamHTTP(context.Background(), &LLMRequest{
+		Messages: []Message{{Role: "user", Content: "hello"}},
+		Stream:   true,
+	}, rec)
+	if err != nil {
+		t.Fatalf("StreamHTTP() error = %v", err)
+	}
+	if !gotStream {
+		t.Fatal("expected upstream request to set stream=true")
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	if !strings.Contains(rec.Body.String(), "message_start") {
+		t.Fatalf("expected SSE payload, got %q", rec.Body.String())
+	}
+}
+
+func TestLLMRequestJSONDoesNotMarshalPassthroughHeaders(t *testing.T) {
+	body, err := json.Marshal(LLMRequest{
+		Messages: []Message{{Role: "user", Content: "hello"}},
+		PassthroughHeaders: map[string]string{
+			"authorization": "Bearer super-secret-token",
+			"x-api-key":     "secret-key",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	encoded := string(body)
+	if strings.Contains(encoded, "super-secret-token") {
+		t.Fatalf("authorization leaked into JSON payload: %s", encoded)
+	}
+	if strings.Contains(encoded, "secret-key") {
+		t.Fatalf("x-api-key leaked into JSON payload: %s", encoded)
 	}
 }
 

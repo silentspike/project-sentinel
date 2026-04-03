@@ -137,6 +137,72 @@ describe("Events Routes", () => {
       expect(body.events.length).toBe(2);
       expect(body.offset).toBe(3);
     });
+
+    it("supports older event schema without compensation_type", async () => {
+      const legacyProj = new Database(":memory:");
+      const legacyEs = new Database(":memory:");
+
+      legacyEs.run(`CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        aggregate_id TEXT NOT NULL,
+        payload TEXT NOT NULL DEFAULT '{}',
+        correlation_id TEXT NOT NULL DEFAULT '',
+        causation_id TEXT,
+        tick INTEGER NOT NULL DEFAULT 0,
+        timestamp_ms INTEGER NOT NULL
+      )`);
+
+      legacyProj.run(`CREATE TABLE agent_live_view (
+        agent_id INTEGER PRIMARY KEY,
+        name TEXT, role TEXT, shift_set INTEGER DEFAULT 1,
+        status TEXT DEFAULT 'active', current_room TEXT,
+        in_transit INTEGER DEFAULT 0, transit_target TEXT,
+        last_action TEXT, last_action_tick INTEGER,
+        hunger REAL DEFAULT 0, energy REAL DEFAULT 1,
+        stress REAL DEFAULT 0, bladder REAL DEFAULT 0,
+        social_need REAL DEFAULT 0, caffeine_mg REAL DEFAULT 0,
+        mood TEXT, last_event_id INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0
+      )`);
+      legacyProj.run(`CREATE TABLE room_live_view (
+        room_id TEXT PRIMARY KEY,
+        occupant_count INTEGER DEFAULT 0, transit_count INTEGER DEFAULT 0,
+        active_chaos TEXT, active_smells TEXT, temperature REAL, co2_ppm REAL, noise_db REAL,
+        last_event_tick INTEGER, last_event_id INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0
+      )`);
+      legacyProj.run(`CREATE TABLE kpi_1m (
+        bucket_start INTEGER PRIMARY KEY,
+        active_agents INTEGER DEFAULT 0, total_actions INTEGER DEFAULT 0,
+        total_transits INTEGER DEFAULT 0, chaos_events INTEGER DEFAULT 0,
+        tick_count INTEGER DEFAULT 0, shift_changes INTEGER DEFAULT 0,
+        nightrun_events INTEGER DEFAULT 0, last_event_id INTEGER DEFAULT 0,
+        updated_at INTEGER DEFAULT 0
+      )`);
+      legacyProj.run(`CREATE TABLE projection_offsets (
+        projection_name TEXT PRIMARY KEY,
+        last_event_id INTEGER DEFAULT 0
+      )`);
+
+      const insert = legacyEs.prepare(
+        `INSERT INTO events (event_id, event_type, aggregate_id, payload, tick, timestamp_ms)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      );
+      insert.run("legacy-1", "chaos_triggered", "buero-dev-1", '{"event_type":"PhoneRing"}', 100, Date.now() - 1000);
+
+      setDatabases(legacyProj, legacyEs);
+      try {
+        const res = await app.request("/api/events");
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.events.length).toBe(1);
+        expect(body.events[0].compensation_type).toBe("none");
+      } finally {
+        setDatabases(projDb, esDb);
+        legacyProj.close();
+        legacyEs.close();
+      }
+    });
   });
 
   describe("GET /api/events/types", () => {

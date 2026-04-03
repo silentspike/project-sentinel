@@ -4,7 +4,7 @@
 
 - Plan source: `User-freigegebener 4-Schritte-Ablauf nach $start`
 - Overall status: `IN_PROGRESS`
-- Current task: `3. Echten verbleibenden #296-Scope bearbeiten`
+- Current task: `4. Anschließend #282 starten`
 - Current branch: `feat/issue-296-mitm-followups-clean`
 - Pull policy: `Kein Pull von main in den aktuellen Branch ohne explizite User-Freigabe`
 - Last refresh: `2026-04-03`
@@ -44,8 +44,8 @@
 |---|------|--------|-------|----------|
 | 1 | Aktuellen #289/#298-Stand publizieren | DONE | aktuellen Branch pushen, PR-Lage bereinigen, verifizierten Closure-/Parity-Stand auf GitHub sichtbar machen | command, system |
 | 2 | Frischen #296-Arbeitsbranch von der korrigierten Basis anlegen | DONE | neuen Branch fuer #296 auf Basis des publizierten Stands erzeugen; alten `fix/issue-296-mitm-followups` nicht weiterverwenden | command |
-| 3 | Echten verbleibenden #296-Scope bearbeiten | IN_PROGRESS | Dashboard/Streaming/Blocks/Observability/Redaction nach aktuellem Issue-Scope umsetzen, verifizieren, dokumentieren | command, system, inspect |
-| 4 | Anschließend #282 starten | TODO | Room-Chat-Forwarding auf derselben verifizierten Basis bearbeiten und live belegen | command, system, inspect |
+| 3 | Echten verbleibenden #296-Scope bearbeiten | DONE | Dashboard/Streaming/Blocks/Observability/Redaction nach aktuellem Issue-Scope umsetzen, verifizieren, dokumentieren | command, system, inspect |
+| 4 | Anschließend #282 starten | IN_PROGRESS | Room-Chat-Forwarding auf derselben verifizierten Basis bearbeiten und live belegen | command, system, inspect |
 | 5 | Plan-Verifikation | TODO | Vier-Schritte-Ablauf gegen Ergebnis und Runtime-Stand komplett abgleichen | command, inspect, system |
 
 ## Task 1 evidence summary
@@ -79,6 +79,81 @@
   - `git rev-parse --short HEAD` -> `fb019f0`
   - `git rev-parse --short feat/issue-289-room-phase2-closure` -> `fb019f0`
   - `git merge-base --is-ancestor feat/issue-289-room-phase2-closure HEAD && echo $?` -> `0`
+
+## Task 3 evidence summary
+
+- Lokale Regressionen gruen:
+  - `bun test dashboard/src/routes/cockpit.test.ts dashboard/src/__tests__/events.test.ts`
+    -> `19` Tests PASS
+  - `go test ./cmd/cortex-gateway/internal/... ./services/sentinel-judge/internal/...`
+    -> PASS
+  - `cargo remote -c -- test -p sentinel-daemon`
+    -> `138` Tests PASS
+  - `cargo remote -c -- clippy -p sentinel-daemon --all-targets -- -D warnings`
+    -> PASS
+
+- Umgesetzter `#296`-Scope:
+  - Dashboard-DB-Zugriffe sind jetzt legacy-kompatibel gegen fehlendes `compensation_type`
+  - `/v1/messages` unterstuetzt jetzt rohe Anthropic-Content-Blocks und SSE-Streaming direkt im Gateway
+  - `traffic-stats` trennt jetzt `internal_primary_provider=claude-code` und `external_mitm_provider=anthropic-direct`
+  - interne Clients (`sentinel-daemon`, `sentinel-judge`) gehen jetzt ueber `/internal/llm` statt ueber den externen Kompatibilitaetspfad
+  - MITM-Smoke-Tooling existiert jetzt ueber `scripts/mitm-smoke.sh` plus `test-fake-api.py`
+  - Redaction-Nachweis fuer Auth-Header wurde auf der VM nachgezogen
+
+- VM-Deploy:
+  - `scp cortex-gateway ... && sudo cp ... /opt/sentinel/bin/cortex-gateway && sudo systemctl start sentinel-gateway`
+    -> `sentinel-gateway active`
+  - `scp sentinel-judge ... && sudo cp ... /opt/sentinel/bin/sentinel-judge && sudo systemctl start sentinel-judge`
+    -> `sentinel-judge active`
+  - `scp target/release/sentinel-daemon ... && sudo cp ... /opt/sentinel/bin/sentinel-daemon && sudo systemctl start sentinel-daemon`
+    -> `sentinel-daemon active`
+  - Gesamtdienste:
+    `systemctl is-active sentinel-daemon sentinel-gateway sentinel-judge sentinel-projection`
+    -> alle `active`
+
+- Live-Gateway-/Dashboard-Evidence:
+  - `curl -s localhost:8081/control/traffic-stats`
+    -> enthaelt `internal_primary_provider:"claude-code"` und `external_mitm_provider:"anthropic-direct"`
+  - `curl -s localhost:8000/api/cockpit >/dev/null && echo cockpit_ok`
+    -> `cockpit_ok`
+  - `curl -s -X POST localhost:8080/v1/messages ...`
+    -> Anthropic-Error-Shape statt Drift/Fallback:
+       `{"type":"error","error":{"type":"authentication_error","message":"provider request failed"}}`
+  - Dummy-Auth-Redaction:
+    Request mit `Authorization: Bearer REDACTTEST296`, danach `journalctl ... | grep REDACTTEST296`
+    -> `redaction_ok`
+
+- Interner Runtime-Vertrag live:
+  - `curl -s -X POST localhost:8080/internal/llm ... synth_fp=...HR:0...`
+    -> `provider:"synthesis"` und synthetische Antwort
+  - `curl -s -X POST localhost:8080/internal/llm ... synth_fp=...HR:1...`
+    -> `provider rate limited`
+  - passendes Gateway-Journal:
+    `provider request failed","provider":"claude-code"... HTTP 429 ...`
+    -> interner Forward-Pfad geht ueber `claude-code`, nicht ueber `anthropic-direct`
+
+- `Voice of Gaia` live:
+  - `curl -s -X POST localhost:8084/operator/gaia ... {"target_agent_id":1,"thought":"Geh bitte direkt in die Kueche."}`
+    -> `{"accepted":true,"message":"Gedanke eingepflanzt"}`
+  - `journalctl -u sentinel-daemon --since '20 sec ago'`
+    -> `Voice of Gaia empfangen agent_id=1`
+    -> `Voice of Gaia: Transit direkt gestartet (goettlicher Impuls) agent_id=1 target="kueche"`
+    -> `Gaia-Thought AKTIV -> IM:1 im Fingerprint`
+  - Event-Store:
+    `operator_gaia_sent`
+    `agent_action_received ... target_room":"kueche"`
+    `transit_started ... from_room":"buero-ceo","to_room":"kueche","duration_ms":80000`
+
+- Voller MITM-Codepfad auf der VM:
+  - Echter `claude -p`-Smoke mit `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` blockierte auf lokaler Maschine und auf der VM vor dem ersten Request; kein Gateway-Hit.
+  - Deshalb zusaetzlicher isolierter VM-Nachweis mit derselben Gateway-Binary:
+    - temporaerer Fake-Upstream auf `127.0.0.1:19876`
+    - temporaerer Gateway auf `18080/18081` mit `ANTHROPIC_BASE_URL=http://127.0.0.1:19876`
+    - `curl -X POST http://127.0.0.1:18080/v1/messages ... Authorization: Bearer dummy-mitm-test`
+      -> `200` mit Anthropic-Message-Body und Text `HALLO`
+    - `tail /tmp/gateway296.log`
+      -> `pipeline request completed","provider":"anthropic-direct"`
+  - Damit ist der komplette `/v1/messages -> anthropic-direct -> upstream`-Pfad fuer die aktuelle Binary auf der VM belegt, unabhaengig vom blockierten `claude -p`-Prozess.
 
 ## Task 6 evidence summary
 
