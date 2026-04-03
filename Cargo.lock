@@ -4333,6 +4333,7 @@ name = "sentinel-ecs"
 version = "0.1.0"
 dependencies = [
  "bevy_ecs",
+ "criterion 0.8.2",
  "insta",
  "sentinel-bio",
  "sentinel-common",

@@ -25,6 +25,11 @@ sentinel-wasm = { path = "../sentinel-wasm" }
 
 [dev-dependencies]
 sentinel-common = { path = "../sentinel-common" }
+criterion = { workspace = true }
 insta = { workspace = true }
 tempfile = "3"
 toml = { workspace = true }
+
+[[bench]]
+name = "room_phase2_bench"
+harness = false

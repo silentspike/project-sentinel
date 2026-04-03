@@ -4,7 +4,7 @@
 
 - Issue: `#289` Room-Kommunikation Phase 2
 - Overall status: `IN_PROGRESS`
-- Current task: `5. Benchmarks implementieren oder an vorhandene Harnesses anbinden`
+- Current task: `7. 17/17 ACs mit frischer Evidence verifizieren`
 - Plan source: `/work/company/codex-plan289.md`
 - GitHub SSOT: `gh issue view 289 --repo silentspike/project-sentinel`
 - Last refresh: `2026-04-03`
@@ -26,6 +26,10 @@
 - Room-ID-Drift ist fuer operatornahe Fixtures, Dashboard-Optionen, Daemon-/Common-/Zenoh-/Wasm-Tests und Design-Agent-Spawn-Configs bereinigt.
 - Die verbliebenen `rg`-Treffer auf Legacy-Room-IDs liegen jetzt nur noch in historischen Notizen oder bewusst erhaltenen Alias-Resolvern.
 - Remote-Regressionen fuer den Task-4-Scope sind gruen: `sentinel-common`, `sentinel-daemon`, `sentinel-zenoh`, `sentinel-wasm` sowie die betroffenen Dashboard-Tests.
+- Ein wiederholbarer Room-Phase-2-Benchmark-Harness existiert jetzt in `sentinel-ecs` und laeuft remote ueber `cargo remote -c -- bench -p sentinel-ecs --bench room_phase2_bench`.
+- Frischer Benchmark-Lauf liegt klar innerhalb der Pflichtbudgets:
+  Route-BFS `2.53-5.15us`, Encounter-Detection realistisch `7.25us` fuer `26` Agents, Room-Phase-2-Tick `156.77us`.
+- Ein dichter Stressfall fuer `encounter_system()` mit `26` gleichzeitig transitierten Agents im selben Flur liegt bei `202.62-209.46us`; das ist kein PFLICHT-Zielwert aus dem Issue, bleibt aber als Worst-Case-Evidence festgehalten.
 
 ## Blocked items
 
@@ -39,9 +43,9 @@
 | 2 | GitHub-AC-Matrix erstellen | DONE | 17 ACs in pruefbare Matrix mit Evidence-Mapping ueberfuehren | command, inspect |
 | 3 | MO1-MO6 im laufenden System reproduzierbar machen | DONE | reproduzierbare Operator-/API-Trigger fuer Kapazitaetstests | command, system |
 | 4 | Verbleibende Code-Luecken schliessen | DONE | nur die real offenen Ursachen beheben | command, inspect, system |
-| 5 | Benchmarks implementieren oder an vorhandene Harnesses anbinden | IN_PROGRESS | BFS-, Encounter- und Tick-Benchmarkpfade absichern | command |
+| 5 | Benchmarks implementieren oder an vorhandene Harnesses anbinden | DONE | BFS-, Encounter- und Tick-Benchmarkpfade absichern | command |
 | 6 | TOGAF aktualisieren | TODO | Transit-Zeiten auf `15s-120s` angleichen | inspect, command |
-| 7 | 17/17 ACs mit frischer Evidence verifizieren | TODO | jede AC einzeln im laufenden System oder passendem Harness nachweisen | command, system, inspect |
+| 7 | 17/17 ACs mit frischer Evidence verifizieren | IN_PROGRESS | jede AC einzeln im laufenden System oder passendem Harness nachweisen | command, system, inspect |
 | 8 | Abschlussartefakt erstellen | TODO | AC-Endstatus, Benchmarks, Risiken, Close-Empfehlung dokumentieren | inspect, command |
 | 9 | GitHub-Issue formal schliessen | TODO | `status:verified` setzen, `status:triage` entfernen, Issue schliessen | command |
 | 10 | Plan-Verifikation | TODO | Plan komplett rereaden und Ergebnis Zeile fuer Zeile abgleichen | command, inspect, system |
@@ -299,6 +303,29 @@ Acceptance criteria:
   `cargo remote -c -- test -p sentinel-zenoh flatbuf` -> `20 passed`
   `cargo remote -c -- test -p sentinel-wasm --test acceptance` -> `10 passed`
 
+## Task 5 evidence summary
+
+- Neuer wiederholbarer Benchmark-Harness in `crates/sentinel-ecs` angelegt:
+  `criterion` als Dev-Dependency plus `crates/sentinel-ecs/benches/room_phase2_bench.rs`.
+- Compile-/Harness-Check gruen:
+  `cargo remote -c -- bench -p sentinel-ecs --bench room_phase2_bench --no-run`
+  Ergebnis: `Finished 'bench' profile [optimized]`.
+- Frischer Voll-Lauf gruen:
+  `cargo remote -c -- bench -p sentinel-ecs --bench room_phase2_bench -- --noplot --sample-size 20`
+- Pflichtbenchmark `Route-BFS pro Move < 100us` klar eingehalten:
+  `same_floor_2_hops = [2.5184 us 2.5293 us 2.5404 us]`
+  `cross_floor_4_hops = [4.7902 us 4.8091 us 4.8259 us]`
+  `upper_to_lower_wing = [4.7447 us 4.7709 us 4.7952 us]`
+  `full_office_span = [5.1250 us 5.1348 us 5.1451 us]`
+- Pflichtbenchmark `Encounter Detection pro Tick < 50us fuer 26 Agents` eingehalten:
+  `room_phase2.encounter_detection_26_agents = [7.2499 us 7.2532 us 7.2572 us]`
+- Zusaetzlicher dichter Stressfall dokumentiert:
+  `room_phase2.encounter_detection_dense_26_agents = [202.62 us 205.70 us 209.46 us]`
+  Dieser Messwert ist bewusst nicht das GitHub-Pflichtbudget, sondern Worst-Case-Evidence fuer einen unnatuerlich dichten Transit-Cluster.
+- Pflichtbenchmark `Bio Tick-Duration darf nicht steigen < 1100ms` deutlich eingehalten:
+  `room_phase2.bio_tick_26_agents = [155.71 us 156.77 us 157.65 us]`
+  Der Repo-Harness liegt damit weit unter dem Budget; der verbleibende Live-Nachweis fuer `AC-17` folgt in Task 7 auf der VM.
+
 ## Task 3 repro steps
 
 1. Stabilen Repro-Modus bestaetigen:
@@ -344,3 +371,4 @@ Acceptance criteria:
 - `7e4a72b` — Task 1: Baseline bestaetigen
 - `6b30891` — Task 2: GitHub-AC-Matrix erstellen
 - `27d536b` — Task 3: MO1-MO6 im laufenden System reproduzierbar machen
+- `95be451` — Task 4: Room-ID-Drift und operatornahe Fixtures bereinigen
