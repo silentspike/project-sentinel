@@ -22,6 +22,9 @@ ignore = [
     { id = "RUSTSEC-2026-0020", reason = "wasmtime 41 -> 42+ upgrade needed, separate issue" },
     { id = "RUSTSEC-2026-0021", reason = "wasmtime 41 -> 42+ upgrade needed, separate issue" },
     { id = "RUSTSEC-2026-0022", reason = "wasmtime 41 -> 42+ upgrade needed, separate issue" },
+    # rustls-webpki CRL advisory (RUSTSEC-2026-0049): transitive via async-nats/quinn/zenoh.
+    # Tracked in separate dependency issues until the graph can move to >=0.103.10.
+    { id = "RUSTSEC-2026-0049", reason = "transitive dependency, tracked in issues #291/#292" },
     # bincode 1.3.3 unmaintained (RUSTSEC-2025-0141): Team ceased development.
     # v1.3.3 is considered complete. Used for World Snapshot serialization.
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 is feature-complete, no security issue" },

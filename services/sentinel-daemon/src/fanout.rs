@@ -131,16 +131,16 @@ mod tests {
 
     #[test]
     fn test_fanout_topic_room_events() {
-        let event = test_event("room_physics_updated", "kueche-eg");
+        let event = test_event("room_physics_updated", "kueche");
         assert_eq!(
             fanout_topic(&event),
-            Some("sentinel/room/kueche-eg/audio".to_string())
+            Some("sentinel/room/kueche/audio".to_string())
         );
 
-        let event = test_event("smell_event_triggered", "kueche-eg");
+        let event = test_event("smell_event_triggered", "kueche");
         assert_eq!(
             fanout_topic(&event),
-            Some("sentinel/room/kueche-eg/smell".to_string())
+            Some("sentinel/room/kueche/smell".to_string())
         );
     }
 

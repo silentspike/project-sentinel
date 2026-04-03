@@ -258,7 +258,7 @@ mod tests {
             .map(|i| {
                 let mut a = default_agent(i);
                 a.stress = 0.80; // Ueber 0.85 * 0.8 = 0.68
-                a.room_id = "konferenz-1".into();
+                a.room_id = "meetingraum-01".into();
                 a
             })
             .collect();
@@ -272,6 +272,6 @@ mod tests {
             .filter(|i| i.incident_type == IncidentType::HighStressCluster)
             .collect();
         assert_eq!(clusters.len(), 1);
-        assert!(clusters[0].description.contains("konferenz-1"));
+        assert!(clusters[0].description.contains("meetingraum-01"));
     }
 }

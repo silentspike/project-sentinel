@@ -208,6 +208,8 @@ type PipelineResponse struct {
 	Model        string                       `json:"model"`
 	Provider     string                       `json:"provider"`
 	TokensUsed   int                          `json:"tokens_used"`
+	InputTokens  int                          `json:"input_tokens,omitempty"`
+	OutputTokens int                          `json:"output_tokens,omitempty"`
 	FinishReason string                       `json:"finish_reason"`
 	Actions      []extraction.ExtractedAction `json:"actions,omitempty"`
 	RequestID    string                       `json:"request_id"`
@@ -287,20 +289,36 @@ func (ph *PipelineHandler) parseRequest(w http.ResponseWriter, r *http.Request) 
 	body, err := io.ReadAll(limited)
 	if err != nil {
 		ph.logger.Error("failed to read request body", "error", err)
-		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		ph.writePathError(w, r.URL.Path, "failed to read request body", http.StatusBadRequest)
 		return LLMRequest{}, "", false
 	}
 	if len(body) > maxRequestBodySize {
 		ph.logger.Warn("request body too large", "size", len(body))
-		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		ph.writePathError(w, r.URL.Path, "request body too large", http.StatusRequestEntityTooLarge)
 		return LLMRequest{}, "", false
 	}
 
 	var req LLMRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		ph.logger.Error("failed to decode request", "error", err)
-		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return LLMRequest{}, "", false
+	if isAnthropicMessagesPath(r.URL.Path) {
+		req, err = decodeAnthropicRequest(body)
+		if err != nil {
+			ph.logger.Error("failed to decode anthropic request", "error", err)
+			ph.writePathError(w, r.URL.Path, "invalid request body", http.StatusBadRequest)
+			return LLMRequest{}, "", false
+		}
+		req.PassthroughHeaders = extractAnthropicPassthroughHeaders(r.Header)
+	} else {
+		if err := json.Unmarshal(body, &req); err != nil {
+			ph.logger.Error("failed to decode request", "error", err)
+			ph.writePathError(w, r.URL.Path, "invalid request body", http.StatusBadRequest)
+			return LLMRequest{}, "", false
+		}
+		if req.Format == "" {
+			req.Format = RequestFormatInternal
+		}
+	}
+	if req.Metadata == nil {
+		req.Metadata = make(map[string]string)
 	}
 
 	return req, requestID, true
@@ -309,7 +327,7 @@ func (ph *PipelineHandler) parseRequest(w http.ResponseWriter, r *http.Request) 
 // ServeHTTP implementiert die vollstaendige 7-Step Pipeline.
 func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { //nolint:gocyclo // Pipeline orchestration is genuinely complex
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		ph.writePathError(w, r.URL.Path, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -326,11 +344,14 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	snap := ph.config.Get()
 
 	// --- Step 2: Provider bestimmen (Runtime-switchable via Control Plane) ---
-	resolvedProviderName := ph.resolveAgentProvider(snap, req.Metadata)
+	resolvedProviderName := req.PreferredProvider
+	if resolvedProviderName == "" {
+		resolvedProviderName = ph.resolveAgentProvider(snap, req.Metadata)
+	}
 	provider, providerName := ph.resolveProvider(resolvedProviderName)
 	if provider == nil {
 		ph.logger.Error("no provider available", "requested", resolvedProviderName)
-		http.Error(w, "no provider available", http.StatusServiceUnavailable)
+		ph.writeRequestError(w, &req, "no provider available", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -361,7 +382,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 				}
 			}
 		}
-		http.Error(w, "service unavailable (circuit breaker open)", http.StatusServiceUnavailable)
+		ph.writeRequestError(w, &req, "service unavailable (circuit breaker open)", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -397,7 +418,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		result := ph.synthesis.Decide(req.Metadata, agentName)
 		if result.Decision == synthesis.Synthesize {
 			content := result.Content
-			if ph.shouldForwardAfterSynthesisFourthWallCheck(r.Context(), content, agentName, agentRole, provider, result.Rule) {
+			if ph.shouldForwardAfterSynthesisFourthWallCheck(r.Context(), content, agentName, agentRole, provider, &req, result.Rule) {
 				// Fall through to normal Provider.Send()
 			} else {
 				content, dropped := ph.applyOutboundInterception(requestID, agentName, "synthesis", &req, content, snap)
@@ -440,6 +461,8 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 					Model:        "sentinel-synth-v1",
 					Provider:     "synthesis",
 					TokensUsed:   0,
+					InputTokens:  0,
+					OutputTokens: 0,
 					FinishReason: "synthetic",
 					Actions:      actions,
 					RequestID:    requestID,
@@ -500,6 +523,8 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 						Model:        "sentinel-apicp-v1",
 						Provider:     "apicp",
 						TokensUsed:   0,
+						InputTokens:  0,
+						OutputTokens: 0,
 						FinishReason: "synthetic",
 						Actions:      actions,
 						RequestID:    requestID,
@@ -574,7 +599,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 				errMsg = "provider unavailable"
 			}
 		}
-		http.Error(w, errMsg, statusCode)
+		ph.writeRequestError(w, &req, errMsg, statusCode)
 		return
 	}
 
@@ -586,7 +611,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 			"request_id", requestID,
 			"provider", providerName,
 		)
-		http.Error(w, "query expired or stale response", http.StatusGatewayTimeout)
+		ph.writeRequestError(w, &req, "query expired or stale response", http.StatusGatewayTimeout)
 		return
 	}
 
@@ -683,6 +708,8 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		Model:        resp.Model,
 		Provider:     providerName,
 		TokensUsed:   resp.TokensUsed,
+		InputTokens:  resp.InputTokens,
+		OutputTokens: resp.OutputTokens,
 		FinishReason: resp.FinishReason,
 		Actions:      actions,
 		RequestID:    requestID,
@@ -912,7 +939,7 @@ func (ph *PipelineHandler) applyGuardrails(w http.ResponseWriter, req *LLMReques
 	agentID := req.Metadata["agent_id"]
 	result := ph.guardrails.Check(agentID, maxTokens)
 	if result.RateLimited {
-		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		ph.writeRequestError(w, req, "rate limit exceeded", http.StatusTooManyRequests)
 		return nil, "", true
 	}
 	if result.BudgetExhausted && result.FallbackProvider != "" {
@@ -925,6 +952,9 @@ func (ph *PipelineHandler) applyGuardrails(w http.ResponseWriter, req *LLMReques
 
 // injectPerception assembles and prepends the system prompt when an agent name is present.
 func (ph *PipelineHandler) injectPerception(req *LLMRequest, agentName, agentRole, providerName string, snap control.ConfigSnapshot) {
+	if req.Format == RequestFormatAnthropic && len(req.SystemBlocks) > 0 {
+		return
+	}
 	if agentName == "" {
 		return
 	}
@@ -976,8 +1006,8 @@ func (ph *PipelineHandler) resolveProvider(name string) (Provider, string) {
 	return p, p.Name()
 }
 
-func (ph *PipelineHandler) shouldForwardAfterSynthesisFourthWallCheck(ctx context.Context, content, agentName, agentRole string, provider Provider, rule string) bool {
-	judgeAdapter := NewJudgeProviderAdapter(provider)
+func (ph *PipelineHandler) shouldForwardAfterSynthesisFourthWallCheck(ctx context.Context, content, agentName, agentRole string, provider Provider, req *LLMRequest, rule string) bool {
+	judgeAdapter := NewJudgeProviderAdapter(provider, req)
 	result, err := detection.HandleFourthWall(ctx, content, agentName, agentRole, judgeAdapter)
 	if err != nil {
 		ph.logger.Warn("synthesis fourth-wall detection error; falling back to provider",
@@ -1009,7 +1039,7 @@ func (ph *PipelineHandler) shouldForwardAfterSynthesisFourthWallCheck(ctx contex
 
 // fourthWallCheck fuehrt die 2-Stage Detection durch und re-generiert bei Bedarf.
 func (ph *PipelineHandler) fourthWallCheck(ctx context.Context, content string, agentName, agentRole string, provider Provider, req *LLMRequest) string {
-	judgeAdapter := NewJudgeProviderAdapter(provider)
+	judgeAdapter := NewJudgeProviderAdapter(provider, req)
 
 	for attempt := 0; attempt < maxRegenAttempts; attempt++ {
 		regenStart := time.Now()
@@ -1030,11 +1060,7 @@ func (ph *PipelineHandler) fourthWallCheck(ctx context.Context, content string, 
 			"attempt", attempt+1,
 		)
 
-		regenReq := &LLMRequest{
-			Messages:    appendCorrectionMessage(req.Messages, result.Correction),
-			Temperature: result.RetryWith,
-			MaxTokens:   req.MaxTokens,
-		}
+		regenReq := cloneRegenRequest(req, appendCorrectionMessage(req.Messages, result.Correction), result.RetryWith)
 
 		resp, sendErr := provider.Send(ctx, regenReq)
 		detection.RegenLatency().Observe(time.Since(regenStart).Seconds())
@@ -1083,11 +1109,7 @@ func (ph *PipelineHandler) personalityGuardCheck(ctx context.Context, content, a
 
 	// Attempt re-generation with personality correction hint
 	correction := fmt.Sprintf("Deine Antwort weicht von deinem Persoenlichkeitsprofil ab (Drift: %.2f, Severity: %s). Bitte antworte staerker im Charakter.", result.DriftScore, result.Severity)
-	regenReq := &LLMRequest{
-		Messages:    appendCorrectionMessage(req.Messages, correction),
-		Temperature: req.Temperature * 0.8, // slightly lower temperature for consistency
-		MaxTokens:   req.MaxTokens,
-	}
+	regenReq := cloneRegenRequest(req, appendCorrectionMessage(req.Messages, correction), req.Temperature*0.8)
 
 	resp, err := provider.Send(ctx, regenReq)
 	if err != nil {
@@ -1126,11 +1148,7 @@ func (ph *PipelineHandler) qualityGateCheck(ctx context.Context, content, agentN
 		qualityGateRegenTotal.WithLabelValues(agentName).Inc()
 
 		correction := fmt.Sprintf("Deine Antwort war zu kurz oder unspezifisch (Qualitaet: %d/5). Bitte antworte ausfuehrlicher und konkreter.", result.Score)
-		regenReq := &LLMRequest{
-			Messages:    appendCorrectionMessage(req.Messages, correction),
-			Temperature: req.Temperature,
-			MaxTokens:   req.MaxTokens,
-		}
+		regenReq := cloneRegenRequest(req, appendCorrectionMessage(req.Messages, correction), req.Temperature)
 
 		resp, err := provider.Send(ctx, regenReq)
 		if err != nil {
@@ -1180,6 +1198,8 @@ func (ph *PipelineHandler) writePipelineResponse(_ context.Context, w http.Respo
 		ph.responseLogs.Add(resp.RequestID, resp.Provider, resp.Content)
 	}
 
+	payload := responsePayloadForRequest(req, resp)
+
 	if ph.tickSync != nil && ph.tickSync.Enabled() {
 		if tick := parseTick(req.Metadata); tick > 0 {
 			done := ph.tickSync.Hold(
@@ -1187,7 +1207,7 @@ func (ph *PipelineHandler) writePipelineResponse(_ context.Context, w http.Respo
 				parseAgentID(req.Metadata),
 				parsePriority(req.Metadata),
 				resp.RequestID,
-				resp,
+				payload,
 				w,
 			)
 			if err := <-done; err != nil {
@@ -1198,9 +1218,32 @@ func (ph *PipelineHandler) writePipelineResponse(_ context.Context, w http.Respo
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		ph.logger.Error("failed to encode response", "error", err)
 	}
+}
+
+func responsePayloadForRequest(req *LLMRequest, resp PipelineResponse) interface{} {
+	if req != nil && req.Format == RequestFormatAnthropic {
+		return buildAnthropicMessageResponse(resp)
+	}
+	return resp
+}
+
+func (ph *PipelineHandler) writePathError(w http.ResponseWriter, path, message string, status int) {
+	if isAnthropicMessagesPath(path) {
+		writeAnthropicError(w, status, message)
+		return
+	}
+	http.Error(w, message, status)
+}
+
+func (ph *PipelineHandler) writeRequestError(w http.ResponseWriter, req *LLMRequest, message string, status int) {
+	if req != nil && req.Format == RequestFormatAnthropic {
+		writeAnthropicError(w, status, message)
+		return
+	}
+	http.Error(w, message, status)
 }
 
 func buildSynthesisActions(actions []synthesis.Action, ext *extraction.Extractor, content string) []extraction.ExtractedAction {
@@ -1253,6 +1296,28 @@ func appendCorrectionMessage(messages []Message, correction string) []Message {
 	result := make([]Message, len(messages), len(messages)+1)
 	copy(result, messages)
 	return append(result, Message{Role: "system", Content: correction})
+}
+
+func cloneRegenRequest(base *LLMRequest, messages []Message, temperature float64) *LLMRequest {
+	if base == nil {
+		return &LLMRequest{
+			Messages:    messages,
+			Temperature: temperature,
+		}
+	}
+
+	return &LLMRequest{
+		Messages:           messages,
+		SystemBlocks:       cloneSystemBlocks(base),
+		Temperature:        temperature,
+		MaxTokens:          base.MaxTokens,
+		Model:              base.Model,
+		Metadata:           base.Metadata,
+		Format:             base.Format,
+		PreferredProvider:  base.PreferredProvider,
+		PassthroughHeaders: clonePassthroughHeaders(base.PassthroughHeaders),
+		ProviderTimeout:    base.ProviderTimeout,
+	}
 }
 
 // parseTick extrahiert den Tick-Wert aus Request-Metadata.
