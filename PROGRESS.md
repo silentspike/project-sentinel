@@ -4,7 +4,7 @@
 
 - Plan source: `/work/company/codex-review.md`
 - Overall status: `IN_PROGRESS`
-- Current task: `3. Neues Parity-Issue für origin/main gegen e4f8769/VM anlegen`
+- Current task: `4. #296 mit kurzem Parity-Hinweis kommentieren`
 - Current branch: `feat/issue-289-room-phase2-closure`
 - Pull policy: `Kein Pull von main in den aktuellen Branch ohne explizite User-Freigabe`
 - Last refresh: `2026-04-03`
@@ -18,6 +18,7 @@
 - `#295` ist im aktuellen Code provider-unabhängig durch `baseGate`/`heard` abgesichert.
 - `#288` ist jetzt formal geschlossen; `status:verified` ist gesetzt und der Close-Kommentar hält die getrennte Parity-Lücke fest.
 - `#295` ist jetzt formal geschlossen; `status:verified` ist gesetzt und der Close-Kommentar verweist korrekt auf `baseGate`/`heard`.
+- Das neue Parity-Issue ist als `#298` offen und bildet die Lücke zwischen verifiziertem MITM-Stand und `origin/main` separat ab.
 - Die vorhandene `#289`-Arbeit auf diesem Branch bleibt erhalten und wird für den späteren `#289`-Task wiederverwendet.
 
 ## Blocked items
@@ -41,8 +42,8 @@
 |---|------|--------|-------|----------|
 | 1 | #288 formal mit verifizierter Begründung schließen | DONE | Issue-Status prüfen, `status:verified` setzen, korrekt kommentieren, schließen | command |
 | 2 | #295 formal mit baseGate/heard-Begründung schließen | DONE | Issue-Kommentar mit Code-/Testbasis, `status:verified` setzen, schließen | command, inspect |
-| 3 | Neues Parity-Issue für origin/main gegen e4f8769/VM anlegen | IN_PROGRESS | schmal geschnittenes GitHub-Issue mit präzisem Scope und Labels | command |
-| 4 | #296 mit kurzem Parity-Hinweis kommentieren | TODO | knapper Hinweis auf Parity-Lücke, ohne Scope-Mix | command |
+| 3 | Neues Parity-Issue für origin/main gegen e4f8769/VM anlegen | DONE | schmal geschnittenes GitHub-Issue mit präzisem Scope und Labels | command |
+| 4 | #296 mit kurzem Parity-Hinweis kommentieren | IN_PROGRESS | knapper Hinweis auf Parity-Lücke, ohne Scope-Mix | command |
 | 5 | Lokale Doku- und Memory-Artefakte nuanciert korrigieren | TODO | `AGENTS.md`, `agents.md`, `test-288-*` an neuen Stand anpassen | inspect, command |
 | 6 | #289 gemäß bestehender Branch-/Progress-Basis vollständig verifizieren und abschließen | TODO | vorhandene Room-Phase-2-Arbeit final zu Ende führen, `17/17` ACs + Benchmarks + Close | command, system, inspect |
 | 7 | Parity-Lücke zwischen e4f8769 und origin/main implementieren | TODO | MITM-Vertrag auf kanonischem `origin/main` wiederherstellen | command, system, inspect |
@@ -102,27 +103,41 @@
 
 ## Current task pre-check
 
-### Task 3: Neues Parity-Issue für origin/main gegen e4f8769/VM anlegen
+## Task 3 evidence summary
+
+- AC3.1 PASS
+  - `gh issue create ...`
+  - Ergebnis: neues Issue `#298` erstellt und referenzierbar.
+- AC3.2 PASS
+  - `gh issue view 298 --repo silentspike/project-sentinel --json body`
+  - Ergebnis: Scope ist ausdrücklich Parity-Lücke, nicht Architektur-Widerruf.
+- AC3.3 PASS
+  - `gh issue view 298 --repo silentspike/project-sentinel --json labels`
+  - Ergebnis: Labels `type:bug`, `status:triage`, `comp:cortex`, `comp:inference`, `prio:high`, `size:M`, `quality:needs-spec`.
+
+## Current task pre-check
+
+### Task 4: #296 mit kurzem Parity-Hinweis kommentieren
 
 Was muss getan werden:
-- den Parity-Scope präzise aus den verifizierten Branch-/VM-Fakten schneiden
-- neues GitHub-Issue mit sauberen Labels und Acceptance formulieren
-- Bezug zu `e4f8769`, `fix/issue-296-mitm-followups`, `origin/main` und VM sauber dokumentieren
+- `#296` live prüfen
+- einen knappen Kommentar setzen, der `#296` nicht entwertet
+- auf `#298` als separates Parity-Issue verweisen
 - Ergebnis in `PROGRESS.md` dokumentieren
 
 Welche ACs müssen für den Task passen:
-- AC3.1: neues Issue ist erstellt und referenzierbar
-- AC3.2: Body beschreibt den Scope als Parity-Lücke, nicht als Architektur-Widerruf
-- AC3.3: Labels passen zum schmalen Bug-/Parity-Scope
+- AC4.1: `#296` ist noch offen und referenzierbar
+- AC4.2: Kommentar hält `#296` beim Follow-up-Scope und schiebt die Parity-Lücke korrekt nach `#298`
+- AC4.3: Kommentar ist auf GitHub sichtbar
 
 Wie wird jede AC bewiesen:
-- AC3.1: `gh issue create ...` plus `gh issue view <neu>`
-- AC3.2: frischer `gh issue view <neu> --json body`
-- AC3.3: `gh issue view <neu> --json labels`
+- AC4.1: `gh issue view 296`
+- AC4.2: Kommentartext plus `gh issue view 296 --json comments`
+- AC4.3: Kommentar-URL oder letzter Kommentar aus `gh issue view 296`
 
 Erwartete Dateiänderungen:
 - `/work/company/project-sentinel/PROGRESS.md`
 
 Bekannte Risiken oder Abhängigkeiten:
-- Kein Repo-Code wird für Task 3 geändert.
-- Das neue Issue darf weder `#288` noch `#296` entwerten; es muss nur die Parity-Lücke zwischen verifiziertem MITM-Stand und kanonischem `origin/main` festhalten.
+- Kein Repo-Code wird für Task 4 geändert.
+- Der Kommentar darf `#296` nicht zum Root-Cause erklären, sondern nur die Leitplanke für künftige Arbeit klarziehen.
