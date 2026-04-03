@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `User-Freigabe 2026-04-04: vier echte Runtime-Fixes nach $start umsetzen`
-- Overall status: `IN_PROGRESS`
-- Current task: `Task 5 - Plan-Verifikation`
+- Overall status: `DONE`
+- Current task: `Completed`
 - Current branch: `fix/post-soak-runtime-followups`
 - Hook status: `PreToolUse TaskUpdate + PostToolUse start-enforcer projektlokal registriert`
 - Last refresh: `2026-04-04 / Task 1 live verifiziert`
@@ -23,7 +23,10 @@
 
 ## Commit references
 
-- Noch keine neuen Commits in diesem Ausführungszyklus.
+- `3d23084` `Task [1]: Encounter-Event-Payload korrigieren`
+- `69b9572` `Task [2]: Traffic-Control-Config-Drift vereinheitlichen`
+- `5bc04cf` `Task [3]: company-context Deploy-Pfad korrigieren`
+- `5846f21` `Task [4]: Breaker-Health-Status live neu verifizieren`
 
 ## Task table
 
@@ -33,7 +36,7 @@
 | 2 | Traffic-Control-Config-Drift vereinheitlichen | DONE | Repo-Defaults und Runtime-Intention für `synthesis_enabled`, `sequencing_enabled`, `tick_sync_enabled` konsistent machen und auf der VM verifizieren | inspect, command, system |
 | 3 | `company-context.md` deploybar machen | DONE | Sicherstellen, dass die projektlokale Company-Datei im produktiven Config-Pfad landet und live geladen wird | inspect, command, system |
 | 4 | `claude-code` Breaker-/Health-Inkonsistenz beheben | DONE | Health-/Breaker-Zustand so korrigieren, dass erfolgreiche `claude-code`-Nutzung nicht weiter als dauerhaft `open` gemeldet wird | inspect, command, system |
-| 5 | Plan-Verifikation | IN_PROGRESS | die vier Fixpunkte gegen Repo- und VM-Endstand vollständig gegenprüfen | inspect, command, system |
+| 5 | Plan-Verifikation | DONE | die vier Fixpunkte gegen Repo- und VM-Endstand vollständig gegenprüfen | inspect, command, system |
 
 ## Task details
 
@@ -249,6 +252,19 @@
 - Evidence plan:
   - AC-1 via kombinierte Command-/System-Evidence
   - AC-2 via finale `PROGRESS.md`-Inspektion
+- Outcome:
+  - Alle vier Task-Fixpunkte sind im Repo und auf der VM auf dem aktuellen Stand gegengeprüft.
+  - Es blieb kein offener Blocker zurück; nur die bereits vorhandenen untracked Dateien im Repo wurden bewusst unangetastet gelassen.
+- Evidence:
+  - AC-1 PASS:
+    - Task 1 Endstand: neue `hallway_encounter_detected`-Events zeigen weiter `room_id`, z. B. `8726303|37|50|flur-eg|`
+    - Task 2 Endstand: VM-`daemon.toml` und `/control/config` zeigen weiter `synthesis/sequencing/tick_sync/apicp = true`
+    - Task 3 Endstand: `/opt/sentinel/config/company-context.md` existiert, aktuelles Gateway-Journal zeigt `path:"config/company-context.md"`
+    - Task 4 Endstand: `/health` zeigt `{"circuit_breakers":{"claude-code":"closed"}}`
+    - Stabilität: `journalctl -u sentinel-daemon --since '10 min ago' | grep -Ei 'panic|drift'` => kein Treffer
+  - AC-2 PASS:
+    - `PROGRESS.md` auf Abschlussstand aktualisiert
+    - Repo-Worktree enthält nur die bekannten untracked Dateien `AGENTS.md`, `hooks/`, `test-288-verification.md`
 
 ### Task 5 - Plan-Verifikation
 
