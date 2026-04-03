@@ -4,7 +4,7 @@
 
 - Plan source: `User-Freigabe 2026-04-04: vier echte Runtime-Fixes nach $start umsetzen`
 - Overall status: `IN_PROGRESS`
-- Current task: `Task 2 - Traffic-Control-Config-Drift vereinheitlichen`
+- Current task: `Task 3 - company-context.md deploybar machen`
 - Current branch: `fix/post-soak-runtime-followups`
 - Hook status: `PreToolUse TaskUpdate + PostToolUse start-enforcer projektlokal registriert`
 - Last refresh: `2026-04-04 / Task 1 live verifiziert`
@@ -12,8 +12,8 @@
 ## Current findings
 
 - `hallway_encounter_detected` speichert aktuell `location`, aber kein `room_id`; Live-DB zeigt deshalb leeres `$.room_id` trotz korrekter Begegnungs-Location `flur-eg`.
-- Die Gateway-Runtime läuft mit `synthesis_enabled=true`, `sequencing_enabled=true`, `tick_sync_enabled=true`; [config/daemon.toml](/work/company/project-sentinel/config/daemon.toml) steht dafür noch auf `false` und ist damit irreführend.
-- `/opt/sentinel/config/company-context.md` fehlt auf `10.0.0.240`; der Gateway fällt dadurch auf `defaultCompanyFacts` zurück statt die projektlokale Company-Datei zu laden.
+- Die Traffic-Control-Bootstrap-Flags sind jetzt zwischen Repo-`daemon.toml`, VM-`daemon.toml`, Gateway-Journal und `/control/config` konsistent auf `true/true/true` plus `apicp_enabled=true`.
+- `company-context.md` liegt auf der VM aktuell nur unter `/opt/sentinel/company-context.md`; der Gateway lädt also einen Root-Workdir-Pfad, obwohl die Repo-Quelle unter `config/company-context.md` liegt.
 - `/health` zeigt `claude-code:"open"`, obwohl im letzten Soak echte `claude-code`-Completions gelaufen sind; das deutet auf eine Breaker-/Health-Inkonsistenz statt auf einen vollständigen LLM-Ausfall.
 - Die Punkte `synthesis_rate` und `capacity live nicht verifiziert` bleiben Beobachtungen, sind aber nicht Teil dieses 4-Task-Fixlaufs.
 
@@ -30,8 +30,8 @@
 | # | Task | Status | Scope | Evidence |
 |---|------|--------|-------|----------|
 | 1 | Encounter-Event-Payload korrigieren | DONE | `HallwayEncounterDetected` so korrigieren, dass Event-Schema und Live-Payload die Begegnungs-Location konsistent als `room_id`/Ort transportieren; Reader und Tests mitziehen | inspect, command, system |
-| 2 | Traffic-Control-Config-Drift vereinheitlichen | IN_PROGRESS | Repo-Defaults und Runtime-Intention für `synthesis_enabled`, `sequencing_enabled`, `tick_sync_enabled` konsistent machen und auf der VM verifizieren | inspect, command, system |
-| 3 | `company-context.md` deploybar machen | TODO | Sicherstellen, dass die projektlokale Company-Datei im produktiven Config-Pfad landet und live geladen wird | inspect, command, system |
+| 2 | Traffic-Control-Config-Drift vereinheitlichen | DONE | Repo-Defaults und Runtime-Intention für `synthesis_enabled`, `sequencing_enabled`, `tick_sync_enabled` konsistent machen und auf der VM verifizieren | inspect, command, system |
+| 3 | `company-context.md` deploybar machen | IN_PROGRESS | Sicherstellen, dass die projektlokale Company-Datei im produktiven Config-Pfad landet und live geladen wird | inspect, command, system |
 | 4 | `claude-code` Breaker-/Health-Inkonsistenz beheben | TODO | Health-/Breaker-Zustand so korrigieren, dass erfolgreiche `claude-code`-Nutzung nicht weiter als dauerhaft `open` gemeldet wird | inspect, command, system |
 | 5 | Plan-Verifikation | TODO | die vier Fixpunkte gegen Repo- und VM-Endstand vollständig gegenprüfen | inspect, command, system |
 
@@ -113,6 +113,40 @@
   - AC-1 via Code-Inspection der Default-Pfade
   - AC-2 via VM-`/control/config` plus Config-Datei/Unit-Datei
   - AC-3 via Go-Tests
+- Outcome:
+  - `config/daemon.toml` bootstrapped die Traffic-Control-Flags jetzt auf denselben Stand wie die produktive Gateway-Runtime.
+  - Der Drift betrifft neben den drei gemeldeten Flags auch `apicp_enabled`; dieser Bootstrap-Wert wurde im selben Schritt mitgezogen.
+  - Nach Gateway-Restart werden die Dateiwerte unverändert geloggt und in `/control/config` sichtbar.
+- Evidence:
+  - AC-1 PASS:
+    - Repo-`config/daemon.toml`: `synthesis_enabled = true`, `sequencing_enabled = true`, `tick_sync_enabled = true`, `apicp_enabled = true`
+  - AC-2 PASS:
+    - VM-Datei: `grep -n ... /opt/sentinel/config/daemon.toml` => Zeilen 35-38 alle `true`
+    - VM-Journal: `traffic control defaults applied ... updates:{..., sequencing_enabled:true, synthesis_enabled:true, tick_sync_enabled:true, apicp_enabled:true}`
+    - VM-`/control/config`: `synthesis_enabled:true`, `sequencing_enabled:true`, `tick_sync_enabled:true`, `apicp_enabled:true`
+  - AC-3 PASS:
+    - `go test ./cmd/cortex-gateway/internal/control`
+    - `go test ./cmd/cortex-gateway`
+
+### Task 3 pre-task self-check
+
+- Was jetzt erledigt werden muss:
+  - den Company-Context-Lookup auf den Repo-/Deploy-Pfad `config/company-context.md` ausrichten
+  - den produktiven Copy-/Restart-Pfad so anpassen, dass die Datei auf der VM dort liegt und aus diesem Pfad geladen wird
+- Welche ACs jetzt bestehen müssen:
+  - AC-1: `company-context.md` liegt live unter `/opt/sentinel/config/company-context.md`
+  - AC-2: Gateway lädt den Company-Context aus dem Config-Pfad statt aus dem Workdir-Root
+  - AC-3: Company-Context bleibt nach Restart aktiv, ohne auf Fallback/Disabled zu fallen
+- Wie ich jede AC beweise:
+  - AC-1 mit `ls -l /opt/sentinel/config/company-context.md`
+  - AC-2 mit Gateway-Journal `company context loaded` plus Pfad
+  - AC-3 mit Journal ohne `company context disabled` und mit erfolgreichem Gateway-Start
+- Erwartete Dateiänderungen:
+  - `cmd/cortex-gateway/internal/compiler/assembler.go`
+  - ggf. Tests im Compiler
+  - ggf. Deploy-Artefakt bzw. VM-Datei
+- Risiken / Abhängigkeiten:
+  - der Lookup-Pfad darf bestehende Agent-DNA-/Rooms-Pfade nicht versehentlich mit umbiegen
 
 ### Task 3 - `company-context.md` deploybar machen
 
