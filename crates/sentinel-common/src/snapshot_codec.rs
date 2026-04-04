@@ -9,8 +9,7 @@ fn legacy_config() -> impl bincode::config::Config {
 }
 
 pub fn encode_world_snapshot(snapshot: &WorldSnapshot) -> anyhow::Result<Vec<u8>> {
-    bincode::serde::encode_to_vec(snapshot, legacy_config())
-        .context("World Snapshot serialisieren")
+    bincode::serde::encode_to_vec(snapshot, legacy_config()).context("World Snapshot serialisieren")
 }
 
 pub fn decode_world_snapshot(bytes: &[u8]) -> anyhow::Result<WorldSnapshot> {
