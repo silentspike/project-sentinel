@@ -1,10 +1,13 @@
-//! Bincode roundtrip test fuer WorldSnapshot.
+//! Snapshot-Codec roundtrip tests fuer WorldSnapshot.
 
 use sentinel_common::components::*;
-use sentinel_common::{EcsSnapshot, RedbDump, SnapshotTier, WorldSnapshot};
+use sentinel_common::{
+    decode_world_snapshot, encode_world_snapshot, EcsSnapshot, RedbDump, SnapshotTier,
+    WorldSnapshot,
+};
 
 #[test]
-fn world_snapshot_bincode_roundtrip() {
+fn world_snapshot_codec_roundtrip() {
     let snapshot = WorldSnapshot {
         snapshot_id: "test-snapshot-001".to_string(),
         schema_version: WorldSnapshot::SCHEMA_VERSION,
@@ -82,11 +85,12 @@ fn world_snapshot_bincode_roundtrip() {
     };
 
     // Serialize
-    let bytes = bincode::serialize(&snapshot).expect("bincode serialize failed");
+    let bytes = encode_world_snapshot(&snapshot).expect("snapshot encode failed");
     assert!(!bytes.is_empty(), "serialized snapshot must not be empty");
 
     // Deserialize
-    let restored: WorldSnapshot = bincode::deserialize(&bytes).expect("bincode deserialize failed");
+    let restored: WorldSnapshot =
+        decode_world_snapshot(&bytes).expect("snapshot decode failed");
 
     // Verify fields
     assert_eq!(restored.snapshot_id, snapshot.snapshot_id);
@@ -157,8 +161,60 @@ fn empty_world_snapshot_roundtrip() {
         projection_offsets: vec![],
     };
 
-    let bytes = bincode::serialize(&snapshot).unwrap();
-    let restored: WorldSnapshot = bincode::deserialize(&bytes).unwrap();
+    let bytes = encode_world_snapshot(&snapshot).unwrap();
+    let restored: WorldSnapshot = decode_world_snapshot(&bytes).unwrap();
     assert_eq!(restored.snapshot_id, "empty");
     assert_eq!(restored.ecs.positions.len(), 0);
+}
+
+#[test]
+fn world_snapshot_codec_rejects_trailing_bytes() {
+    let snapshot = WorldSnapshot {
+        snapshot_id: "trailing".to_string(),
+        schema_version: WorldSnapshot::SCHEMA_VERSION,
+        tick: 1,
+        sim_hour: 1.0,
+        timestamp_ms: 1,
+        tier: SnapshotTier::Hourly,
+        last_event_id: 1,
+        redb: RedbDump {
+            agent_states: vec![],
+            room_states: vec![],
+            personalities: vec![],
+            relationships: vec![],
+            voice_styles: vec![],
+            behavioral_notes: vec![],
+            narrative_summaries: vec![],
+            evolution_versions: vec![],
+            nmda_scores: vec![],
+            agent_facts: vec![],
+            sim_meta: vec![],
+            api_patterns: vec![],
+        },
+        ecs: EcsSnapshot {
+            positions: vec![],
+            bio_states: vec![],
+            personalities: vec![],
+            moods: vec![],
+            perception_states: vec![],
+            work_contexts: vec![],
+            agent_capabilities: vec![],
+            event_queues: vec![],
+            identities: vec![],
+            shift_infos: vec![],
+            relationships: vec![],
+            llm_configs: vec![],
+            active_chaos_json: vec![],
+            active_stimuli_json: vec![],
+            sim_tick: 1,
+            sim_hour: 1.0,
+            sim_delta_seconds: 1.0,
+        },
+        projection_offsets: vec![],
+    };
+
+    let mut bytes = encode_world_snapshot(&snapshot).unwrap();
+    bytes.push(0xAA);
+
+    assert!(decode_world_snapshot(&bytes).is_err());
 }

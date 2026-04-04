@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Security: Snapshot-Codec von unmaintained `bincode 1` auf `bincode 2` migriert** (#293)
+  - `WorldSnapshot`-Encode/Decode laeuft jetzt ueber einen expliziten gemeinsamen Codec statt ueber direkte `bincode::serialize`-/`deserialize`-Aufrufe
+  - der neue Codec nutzt `bincode 2` mit `serde` und `legacy()`-Konfiguration, damit bestehende Snapshot-Payloads weiter lesbar bleiben
+  - der Daemon schreibt nach der Migration weiter neue Snapshots und kann vorhandene Alt-Snapshots auf der VM erfolgreich restaurieren
+
 - **Room-Chat-Forwarding: `heard_text` bleibt bei Gateway-Fehlern bis zur Bridge erhalten** (#282)
   - urgenter Room-Chat (`heard_text`, direkte Ansprache, Gaia) wird im Daemon jetzt bei offenem Circuit, `429/503`, Parse-Fehlern und Request-Timeouts fuer Retry gepuffert statt verloren zu gehen
   - dadurch bleibt der Pfad `Operator-Chat -> RoomChatBuffer -> heard_text -> LLM bridge has_heard=true` auch unter Upstream-Fehlern live nachweisbar
