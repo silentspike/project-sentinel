@@ -89,8 +89,7 @@ fn world_snapshot_codec_roundtrip() {
     assert!(!bytes.is_empty(), "serialized snapshot must not be empty");
 
     // Deserialize
-    let restored: WorldSnapshot =
-        decode_world_snapshot(&bytes).expect("snapshot decode failed");
+    let restored: WorldSnapshot = decode_world_snapshot(&bytes).expect("snapshot decode failed");
 
     // Verify fields
     assert_eq!(restored.snapshot_id, snapshot.snapshot_id);
