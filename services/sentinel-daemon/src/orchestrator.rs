@@ -1789,7 +1789,7 @@ fn ecs_tick_loop(
                 // 1. Snapshot laden
                 match es.load_world_snapshot(&restore_cmd.snapshot_id) {
                     Ok(Some(bytes)) => {
-                        match bincode::deserialize::<sentinel_common::WorldSnapshot>(&bytes) {
+                        match sentinel_common::decode_world_snapshot(&bytes) {
                             Ok(snapshot) => {
                                 // 2. redb restore (atomare Transaktion)
                                 if let Err(e) = ss.restore_all_tables(&snapshot.redb) {
@@ -2047,7 +2047,7 @@ fn ecs_tick_loop(
                                 );
                             }
                             Err(e) => {
-                                error!(error = %e, "Snapshot bincode-Deserialisierung fehlgeschlagen");
+                                error!(error = %e, "Snapshot-Deserialisierung fehlgeschlagen");
                             }
                         }
                     }

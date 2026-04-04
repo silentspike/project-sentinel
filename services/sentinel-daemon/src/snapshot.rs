@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use sentinel_common::{SnapshotMeta, SnapshotTier, WorldSnapshot};
+use sentinel_common::{encode_world_snapshot, SnapshotMeta, SnapshotTier, WorldSnapshot};
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
 use tracing::{debug, info};
@@ -122,8 +122,8 @@ impl SnapshotManager {
             projection_offsets,
         };
 
-        // 6. bincode serialisieren + in Limbo speichern
-        let bytes = bincode::serialize(&snapshot)?;
+        // 6. Snapshot serialisieren + in Limbo speichern
+        let bytes = encode_world_snapshot(&snapshot)?;
         let size = bytes.len();
         event_store.save_world_snapshot(
             &snapshot_id,
