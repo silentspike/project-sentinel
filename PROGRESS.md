@@ -82,7 +82,7 @@
   - Runtime-Impact auf Daemon/NATS live verifizieren
 - Acceptance criteria:
   - AC-1: `cargo remote -c -- tree -i rustls-webpki@0.102.8` zeigt keinen aktiven Produktivpfad mehr
-  - AC-2: relevante Rust-Tests und Clippy sind gruen
+  - AC-2: einschlaegige Rust-Tests und Clippy sind gruen
   - AC-3: Daemon startet und der NATS-/Bridge-Pfad bleibt auf `10.0.0.240` intakt
 - Outcome:
   - Der minimale sichere Upgrade-Korridor liegt bei `async-nats 0.47.0`; `0.45.0` und `0.46.0` hängen laut `cargo info --verbose` noch an `rustls-webpki@0.102`.
