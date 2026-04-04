@@ -11,7 +11,7 @@ use super::world::{
     BroadcastBuffer, EventBuffer, GaiaBuffer, RoomChatBuffer, RoomInfoMap, SimulationTime,
 };
 use bevy_ecs::prelude::*;
-use sentinel_common::Emotion;
+use sentinel_common::{DomainEventPayload, Emotion};
 
 /// Standing Room: Zusaetzliche Plaetze ueber Capacity bevor "komplett voll".
 const STANDING_ROOM: u16 = 2;
@@ -415,14 +415,15 @@ fn generate_encounter_events(
         if domain_event.event_type != "hallway_encounter_detected" {
             continue;
         }
-        // Payload parsen
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&domain_event.payload) {
-            let a_id = value.get("agent_a").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-            let b_id = value.get("agent_b").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-            let location = value
-                .get("location")
-                .and_then(|v| v.as_str())
-                .unwrap_or("flur");
+
+        if let Ok(DomainEventPayload::HallwayEncounterDetected {
+            agent_a,
+            agent_b,
+            room_id,
+        }) = serde_json::from_str::<DomainEventPayload>(&domain_event.payload)
+        {
+            let a_id = agent_a.0;
+            let b_id = agent_b.0;
 
             // Ist dieser Agent beteiligt?
             let other_id = if agent_id.0 == a_id {
@@ -441,7 +442,7 @@ fn generate_encounter_events(
                     .map(|id| (id.name.as_str(), id.role.as_str()))
                     .unwrap_or(("jemand", "Mitarbeiter"));
 
-                let location_german = match location {
+                let location_german = match room_id.as_str() {
                     "flur-eg" => "im Flur des Erdgeschosses",
                     "flur-og" => "im Flur des Obergeschosses",
                     "treppenhaus" => "im Treppenhaus",
@@ -543,6 +544,9 @@ pub fn format_impulse_from_queue(queue: &EventQueue) -> String {
 mod tests {
     use super::*;
     use sentinel_common::Tick;
+
+    #[derive(Resource, Default)]
+    struct EncounterQueueResource(EventQueue);
 
     fn default_bio() -> BioState {
         BioState {
@@ -817,6 +821,70 @@ mod tests {
         let queue = default_queue();
         let result = format_impulse_from_queue(&queue);
         assert!(result.is_empty(), "Leere Queue = leerer String");
+    }
+
+    #[test]
+    fn test_encounter_event_legacy_location_payload_stays_readable() {
+        use sentinel_common::DomainEvent;
+
+        let mut world = World::new();
+        world.insert_resource(EncounterQueueResource::default());
+        world.spawn(AgentIdentity {
+            agent_id: sentinel_common::AgentId(24),
+            name: "Robin Krause".to_string(),
+            role: "Designer".to_string(),
+        });
+        world.spawn(AgentIdentity {
+            agent_id: sentinel_common::AgentId(28),
+            name: "Mara Schneider".to_string(),
+            role: "Entwicklerin".to_string(),
+        });
+
+        let payload =
+            r#"{"type":"HallwayEncounterDetected","agent_a":24,"agent_b":28,"location":"flur-eg"}"#;
+        world.insert_resource(EventBuffer {
+            events: vec![DomainEvent::new(
+                "hallway_encounter_detected",
+                "24-28",
+                payload,
+                "encounter-legacy-test",
+                1,
+            )],
+        });
+
+        fn harness(
+            event_buffer: Res<EventBuffer>,
+            all_agents: Query<&AgentIdentity>,
+            mut out: ResMut<EncounterQueueResource>,
+        ) {
+            generate_encounter_events(
+                sentinel_common::AgentId(24),
+                &event_buffer,
+                &all_agents,
+                &mut out.0,
+                1,
+            );
+        }
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(harness);
+        schedule.run(&mut world);
+
+        let queue = &world.resource::<EncounterQueueResource>().0;
+        assert_eq!(
+            queue.events.len(),
+            1,
+            "legacy payload should still generate one event"
+        );
+        assert!(
+            queue.events[0].text.contains("im Flur des Erdgeschosses"),
+            "expected germanized legacy flur-eg location, got: {}",
+            queue.events[0].text
+        );
+        assert!(
+            queue.events[0].text.contains("Mara Schneider"),
+            "expected other agent name in encounter event"
+        );
     }
 
     /// AC5: Performance - decision_system < 50us pro Tick bei 24 Agents
