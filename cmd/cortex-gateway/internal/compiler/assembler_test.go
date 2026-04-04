@@ -205,10 +205,10 @@ func TestLoadCompanyContextReadsSiblingConfigDirectory(t *testing.T) {
 	baseDir := t.TempDir()
 	agentsDir := filepath.Join(baseDir, "agents")
 	configDir := filepath.Join(baseDir, "config")
-	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+	if err := os.MkdirAll(agentsDir, 0o750); err != nil {
 		t.Fatalf("MkdirAll(agents): %v", err)
 	}
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
+	if err := os.MkdirAll(configDir, 0o750); err != nil {
 		t.Fatalf("MkdirAll(config): %v", err)
 	}
 
