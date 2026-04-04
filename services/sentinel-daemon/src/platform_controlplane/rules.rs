@@ -47,7 +47,7 @@ pub fn evaluate_rules(
     for agent_name in &metrics.stalled_agents {
         // Agent hat kuerzlich eine Action ausgefuehrt → nicht stalled
         if let Some(&last_tick) = metrics.last_action_ticks.get(agent_name) {
-            if tick.saturating_sub(last_tick) < 120 {
+            if tick.saturating_sub(last_tick) < config.stall_recent_activity_grace_ticks {
                 continue;
             }
         }
@@ -213,6 +213,26 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "agent_stall");
         assert_eq!(actions[0].target, "Thomas Mueller");
+    }
+
+    #[test]
+    fn test_stall_rule_respects_recent_activity_grace_from_config() {
+        let metrics = PlatformMetrics {
+            stalled_agents: vec!["Thomas Mueller".to_string()],
+            last_action_ticks: HashMap::from([("Thomas Mueller".to_string(), 91)]),
+            ..Default::default()
+        };
+        let config = PlatformControlplaneConfig {
+            cycle_interval_ticks: 1,
+            stall_recent_activity_grace_ticks: 10,
+            ..test_config()
+        };
+
+        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &config, &HashMap::new());
+        assert!(
+            actions.is_empty(),
+            "recent activity inside grace window must suppress stall restarts"
+        );
     }
 
     #[test]
