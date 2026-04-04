@@ -483,12 +483,17 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         .unwrap_or("data/evolution.db")
         .to_string();
     let ecs_state_store = Arc::clone(&state_store);
+    let ecs_event_store = Arc::clone(&event_store);
+    let retention_config = config.retention.clone();
+    let resource_manager_config = config.resource_manager.clone();
+    let platform_cp_config = config.platform_controlplane.clone();
+    let events_db_path = events_path.to_string_lossy().to_string();
     let ecs_handle = std::thread::Builder::new()
         .name("ecs-tick-loop".into())
         .spawn(move || {
             ecs_tick_loop(
                 ecs_state_store,
-                event_store,
+                ecs_event_store,
                 action_rx,
                 operator_rx,
                 perception_tx,
@@ -507,16 +512,16 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 snapshot_rx,
                 restore_rx,
                 prune_rx,
-                config.retention.clone(),
+                retention_config,
                 evolution_db_path_clone,
                 agent_command_cfg,
                 adaptive_config,
                 room_distances,
                 room_info,
                 fanout_sender,
-                config.resource_manager.clone(),
-                config.platform_controlplane.clone(),
-                events_path.to_string_lossy().to_string(),
+                resource_manager_config,
+                platform_cp_config,
+                events_db_path,
             )
         })
         .context("ECS Thread spawnen")?;
@@ -569,6 +574,27 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             bridge_telem,
             Arc::clone(&state_store),
         ))
+    };
+
+    // -- Platform LLM Analyzer starten (daemon-interner Background-Worker) --
+    #[cfg(feature = "llm")]
+    let _platform_llm_analyzer = {
+        let gateway_url =
+            std::env::var("CORTEX_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8080".into());
+        let analyzer_config =
+            crate::platform_controlplane::llm_analyzer::LlmAnalyzerConfig::from_platform_config(
+                &config.platform_controlplane,
+                gateway_url,
+            );
+        let handle = crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::spawn(
+            analyzer_config,
+            Arc::clone(&event_store),
+        );
+        info!(
+            enabled = handle.is_enabled(),
+            "Platform LLM Analyzer initialisiert"
+        );
+        handle
     };
 
     // -- NATS Consumer fuer Judge-Alerts --

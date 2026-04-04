@@ -5,6 +5,8 @@
 //!
 //! OODA Loop: Observe (metrics) → Decide (rules) → Act (side-effects) → Verify.
 
+#[cfg(feature = "llm")]
+pub mod llm_analyzer;
 pub mod metrics;
 pub mod rules;
 pub mod verify;

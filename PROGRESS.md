@@ -4,7 +4,7 @@
 
 - Plan source: `/work/company/codex-plan263.md`
 - Overall status: `IN_PROGRESS`
-- Current task: `Task 3 - LLM-Analyzer als daemon-internes Background-Modul`
+- Current task: `Task 4 - Eskalationslogik, unresolved counters und deterministische Trigger`
 - Current branch: `feat/issue-263-platform-controlplane-completion`
 - Hook status: `PreToolUse TaskUpdate + PostToolUse start-enforcer projektlokal registriert`
 - Last refresh: `2026-04-05 Europe/Vienna`
@@ -34,6 +34,14 @@
 - Remote-Rust-Evidence fuer Task 2 ist vorhanden:
   - `cargo remote -c -- test -p sentinel-common -p sentinel-daemon -p sentinel-projection` lief mit Exit `0` durch; relevante Endzeilen zeigen `142 passed` fuer `sentinel-daemon` sowie gruenen `sentinel_projection`-/Acceptance-Run
   - `cargo remote -c -- clippy -p sentinel-common -p sentinel-daemon -p sentinel-projection --all-targets -- -D warnings` lief ebenfalls mit Exit `0` durch; der Output ist wegen `cargo remote`-Artifact-Transfer sehr rauschig, aber ohne Clippy-Fehler beendet
+- Task-3-Analyzer ist jetzt als echter daemon-interner Worker vorhanden:
+  - neue Datei [llm_analyzer.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/llm_analyzer.rs)
+  - Modul-Export in [mod.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/mod.rs)
+  - Start/Wiring in [orchestrator.rs](/work/company/project-sentinel/services/sentinel-daemon/src/orchestrator.rs)
+- Der Analyzer benutzt ausschliesslich den internen Gateway-Vertrag `POST /internal/llm`, baut seinen Kontext aus `PlatformMetrics`, Verify-Ergebnissen, den letzten `PlatformIntervention`-Events und fehlgeschlagenen Interventionen und persistiert erfolgreiche Antworten als `platform_analysis`.
+- Remote-Rust-Evidence fuer Task 3 ist vorhanden:
+  - `cargo remote -c -- test -p sentinel-daemon -p sentinel-common` => Exit `0`; relevante Endzeilen zeigen `145 passed; 0 failed`
+  - `cargo remote -c -- clippy -p sentinel-daemon --all-targets -- -D warnings` => Exit `0`
 
 ## Blocked items
 
@@ -43,7 +51,7 @@
 ## Commit references
 
 - `ae1b5cf` Task [1]
-- `TBD` Task [2]
+- `de96c37` Task [2]
 - `TBD` Task [3]
 - `TBD` Task [4]
 - `TBD` Task [5]
@@ -57,8 +65,8 @@
 |---|------|--------|-------|----------|
 | 1 | Issue-Hygiene, Branch-Setup und deterministische Baseline fuer AC-1 bis AC-5 / AC-10 bis AC-12 neu setzen | DONE | `#263`-Ist-Zustand gegen Repo/GitHub/VM abgleichen, offene Baseline-Luecken fuer Stall/Projection/Cooldowns/Disable-Flag pruefen, Issue-Text vorbereiten, Branch sauber halten | command, system, inspect |
 | 2 | Event- und Config-Schema fuer die LLM-Ebene ergaenzen | DONE | `PlatformAnalysis`-Event, neue Platform-CP-Config-Felder, TOML-Defaults und Typen stabil ergaenzen | inspect, command |
-| 3 | LLM-Analyzer als daemon-internes Background-Modul implementieren | IN_PROGRESS | asynchronen Analyzer, Kontext-Assembly, Gateway-Call und Parsing/Persistenz bauen | inspect, command |
-| 4 | Eskalationslogik, unresolved counters und deterministische Trigger vervollstaendigen | PENDING | scheduled/manual/unresolved Trigger, Counter-State und Test-Hooks fuer `AC-6` vervollstaendigen | inspect, command, system |
+| 3 | LLM-Analyzer als daemon-internes Background-Modul implementieren | DONE | asynchronen Analyzer, Kontext-Assembly, Gateway-Call und Parsing/Persistenz bauen | inspect, command |
+| 4 | Eskalationslogik, unresolved counters und deterministische Trigger vervollstaendigen | IN_PROGRESS | scheduled/manual/unresolved Trigger, Counter-State und Test-Hooks fuer `AC-6` vervollstaendigen | inspect, command, system |
 | 5 | Suggested-Action-Executor mit force_profile / adjust_threshold / escalate_to_operator implementieren | PENDING | guard-railed Executor inkl. cgroup-Apply, Audit-Trail und Runtime-Overrides bauen | inspect, command, system |
 | 6 | Operator-API, Dashboard, Cockpit und Playwright-relevante UI-Surfaces erweitern | PENDING | API-Read/Write-Pfade, Dashboard/Cockpit-Rendering, stabile Selektoren, Projection-Write-Key-Pfad und UI-Verifikation ergaenzen | inspect, command, browser, system |
 | 7 | Deploy, Benchmarks sowie AC-1 bis AC-12 inkl. UI-Evidence auf der VM verifizieren | PENDING | Release-Build, Deploy, systemd-Restarts, AC-Matrix, Playwright-Screenshots und Benchmarks mit Systemmetriken abarbeiten | command, system, browser |
@@ -173,6 +181,30 @@
   - AC-1 via Code + Tests + ggf. Tick-Overhead-Mikrobench
   - AC-2 via Tests und spaetere VM-Logs
   - AC-3 via Event-Store-Test und spaetere VM-Evidence
+- Pre-task self-check:
+  - Was muss getan werden: Ein echter Worker fuer LLM-Analysen muss stehen, bevor Trigger, Operator-Hooks oder Executor darauf zeigen koennen.
+  - Welche ACs muessen hier passen: async Worker vorhanden, interner Gateway-Pfad, persistierte `platform_analysis`-Events im Test.
+  - Wie wird bewiesen: zielgerichtete Remote-Rust-Tests, Mock-Gateway-Tests, Clippy.
+  - Erwartete Dateien: [llm_analyzer.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/llm_analyzer.rs), [mod.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/mod.rs), [orchestrator.rs](/work/company/project-sentinel/services/sentinel-daemon/src/orchestrator.rs)
+  - Risiken: Queue muss spaeter aus dem sync ECS-Thread ansteuerbar sein, keine Direct-API-Abkuerzung, Tests duerfen nicht an instabilen HTTP-Mocks haengen.
+- Outcome:
+  - Der neue `PlatformLlmAnalyzerHandle` kapselt einen async Worker mit unbounded Queue und laeuft daemon-intern als Hintergrundtask.
+  - Der Worker assembliert seinen Prompt-Kontext aus `PlatformMetrics`, `verify_results`, den letzten `PlatformIntervention`-Events und den letzten fehlgeschlagenen Interventionen.
+  - Der HTTP-Pfad geht fest gegen `POST /internal/llm`; erfolgreiche Antworten werden als `DomainEventPayload::PlatformAnalysis` in Limbo persistiert.
+  - Timeout- und Parse-Fehler bleiben explizit im Fehlerpfad, statt den Daemon zu crashen.
+- Evidence:
+  - AC-1 PASS:
+    - [llm_analyzer.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/llm_analyzer.rs) fuehrt `PlatformLlmAnalyzerHandle::spawn()` mit async Worker und Queue ein
+    - `handle_enqueue_is_non_blocking_and_worker_persists` belegt den nicht blockierenden Queue-Pfad
+    - [orchestrator.rs](/work/company/project-sentinel/services/sentinel-daemon/src/orchestrator.rs) startet den Worker daemon-intern beim Boot
+  - AC-2 PASS:
+    - `analyzer_persists_platform_analysis_event` prueft, dass der Mock-Request auf `/internal/llm` geht
+    - [llm_analyzer.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/llm_analyzer.rs) sendet ausschliesslich an `format!("{}/internal/llm", ...)`
+  - AC-3 PASS:
+    - `analyzer_persists_platform_analysis_event` prueft die persistierte `PlatformAnalysis`-Payload inklusive `provider`, `model`, `unresolved_keys` und `parameters`
+    - `analyzer_handles_gateway_timeout` prueft den expliziten Timeout-Fehlerpfad ohne Event-Persistenz
+    - `cargo remote -c -- test -p sentinel-daemon -p sentinel-common` => Exit `0`; `145 passed; 0 failed`
+    - `cargo remote -c -- clippy -p sentinel-daemon --all-targets -- -D warnings` => Exit `0`
 
 ### Task 4 - Eskalationslogik, unresolved counters und deterministische Trigger vervollstaendigen
 
