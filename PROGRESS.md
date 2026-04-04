@@ -4,15 +4,15 @@
 
 - Plan source: `User-Freigabe 2026-04-04: codex-security.md nach $start umsetzen`
 - Overall status: `IN_PROGRESS`
-- Current task: `Task 2 - #291 rustls-webpki 0.102.8 / async-nats-Pfad beheben`
+- Current task: `Task 3 - #293 bincode 1.3.3 ablösen`
 - Current branch: `feat/security-291-292-293`
 - Hook status: `PreToolUse TaskUpdate + PostToolUse start-enforcer projektlokal registriert`
-- Last refresh: `2026-04-04 11:01 UTC / Task 1 abgeschlossen`
+- Last refresh: `2026-04-04 11:10 UTC / Task 2 abgeschlossen`
 
 ## Current findings
 
 - `#292` ist auf aktuellem `main` re-verifiziert und geschlossen: `Cargo.lock` enthält kein `rustls-webpki 0.103.9`, `cargo remote -c -- tree -i rustls-webpki@0.103.9` findet keinen Paketpfad mehr, `status:verified` ist gesetzt.
-- `#291` bleibt nach Plan der echte offene `rustls-webpki`-Rest über `async-nats` im Daemon-Pfad.
+- `#291` ist technisch behoben: Workspace-Dependency `async-nats` wurde von `0.38` auf `0.47.0` angehoben; `cargo remote -c -- tree -i rustls-webpki@0.102.8` findet keinen Paketpfad mehr.
 - `#293` bleibt ein migrationskritischer `bincode`-Themenblock und ist nicht als bloßer Version-Bump zu behandeln.
 
 ## Blocked items
@@ -22,14 +22,15 @@
 ## Commit references
 
 - `TBD` `Task [1]: #292 re-verifizieren und formal schließen`
+- `TBD` `Task [2]: fix issue 291 async-nats webpki path`
 
 ## Task table
 
 | # | Task | Status | Scope | Evidence |
 |---|------|--------|-------|----------|
 | 1 | `#292` re-verifizieren und formal schließen | DONE | `rustls-webpki 0.103.9` auf aktuellem `main` gegen Lockfile, Dependency-Graph und Audit neu belegen; dann GitHub-Close-Workflow ausführen | inspect, command |
-| 2 | `#291` `rustls-webpki 0.102.8` / `async-nats`-Pfad beheben | IN_PROGRESS | minimalen belastbaren Upgrade-Pfad implementieren, remote testen, auf VM deployen und NATS-/Daemon-Verhalten live verifizieren | inspect, command, system |
-| 3 | `#293` `bincode 1.3.3` ablösen | TODO | Snapshot-/Persistenzpfade auf gepflegte Alternative migrieren, kompatibel testen und live Restore verifizieren | inspect, command, system |
+| 2 | `#291` `rustls-webpki 0.102.8` / `async-nats`-Pfad beheben | DONE | minimalen belastbaren Upgrade-Pfad implementieren, remote testen, auf VM deployen und NATS-/Daemon-Verhalten live verifizieren | inspect, command, system |
+| 3 | `#293` `bincode 1.3.3` ablösen | IN_PROGRESS | Snapshot-/Persistenzpfade auf gepflegte Alternative migrieren, kompatibel testen und live Restore verifizieren | inspect, command, system |
 | 4 | Plan-Verifikation | TODO | alle drei Security-Issues gegen Repo-, GitHub- und VM-Endstand vollständig gegenprüfen | inspect, command, system |
 
 ## Task details
@@ -79,6 +80,26 @@
   - AC-1: `cargo remote -c -- tree -i rustls-webpki@0.102.8` zeigt keinen aktiven Produktivpfad mehr
   - AC-2: relevante Rust-Tests und Clippy sind gruen
   - AC-3: Daemon startet und der NATS-/Bridge-Pfad bleibt auf `10.0.0.240` intakt
+- Outcome:
+  - Der minimale sichere Upgrade-Korridor liegt bei `async-nats 0.47.0`; `0.45.0` und `0.46.0` hängen laut `cargo info --verbose` noch an `rustls-webpki@0.102`.
+  - Workspace-Dependency in `Cargo.toml` wurde auf `async-nats = "0.47"` angehoben; `Cargo.lock` wurde entsprechend aktualisiert.
+  - Der Daemon läuft nach Release-Build und VM-Deploy sauber weiter und verbindet sich wieder mit NATS/JetStream.
+- Evidence:
+  - AC-1 PASS:
+    - `cargo remote -c -- tree -i rustls-webpki@0.102.8` => `did not match any packages`
+    - `cargo update -p async-nats --precise 0.47.0` => `Removing rustls-webpki v0.102.8`
+  - AC-2 PASS:
+    - `cargo remote -c -- test -p sentinel-daemon -p sentinel-zenoh` => exit `0`
+    - `cargo remote -c -- clippy -p sentinel-daemon -p sentinel-zenoh --all-targets -- -D warnings` => exit `0`
+  - AC-3 PASS:
+    - `cargo remote -c -- build -p sentinel-daemon --release` => exit `0`
+    - VM-Deploy: `systemctl is-active sentinel-daemon nats-server sentinel-nats-bridge` => alle `active`
+    - VM-Journal:
+      - `NATS Connected url="nats://127.0.0.1:4222"`
+      - `eBPF NATS Bridge verbunden url="nats://127.0.0.1:4222"`
+      - `NATS Stream SENTINEL_JUDGE ready`
+      - `Subscribed to sentinel.judge.alert.>`
+    - keine neuen `tls`-, `panic`- oder NATS-Verbindungsfehler im geprüften Restart-Fenster
 
 ### Task 3 - `#293` `bincode 1.3.3` ablösen
 
