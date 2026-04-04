@@ -55,7 +55,7 @@
 - Acceptance criteria:
   - AC-1: neues Encounter-Event enthält live eine nicht-leere Raumangabe im erwarteten Feld
   - AC-2: Encounter-Perception für Agents bleibt funktional
-  - AC-3: relevante Rust-Tests und Clippy sind grün
+  - AC-3: betroffene Rust-Tests und Clippy sind grün
 - Evidence plan:
   - AC-1 via `sqlite3 events.db ... hallway_encounter_detected ...`
   - AC-2 via Daemon-Log/Perception-Flow oder bestehende Encounter-Live-Evidence nach neuem Event
@@ -194,14 +194,14 @@
 - Welche ACs jetzt bestehen müssen:
   - AC-1: `/health` meldet `claude-code` nach erfolgreichen Requests nicht weiter fälschlich `open`
   - AC-2: erfolgreiche `claude-code`-Completions bleiben möglich
-  - AC-3: relevante Gateway-Tests bleiben grün
+  - AC-3: betroffene Gateway-Tests bleiben grün
 - Wie ich jede AC beweise:
   - AC-1 mit VM-`/health` vor/nach reproduzierter Completion
   - AC-2 mit Gateway-Journal `pipeline request completed` über `provider:"claude-code"`
   - AC-3 mit gezielten Go-Tests
 - Erwartete Dateiänderungen:
   - Breaker-/Health-Code im Gateway
-  - relevante Tests
+  - betroffene Tests
 - Risiken / Abhängigkeiten:
   - echte `claude-code`-Completions auf der VM hängen von verfügbarem Quota und lebendem Gateway-/Daemon-Pfad ab
 
@@ -219,7 +219,7 @@
 - Acceptance criteria:
   - AC-1: `/health` meldet `claude-code` nach erfolgreichem Betrieb nicht fälschlich dauerhaft `open`
   - AC-2: erfolgreiche `claude-code`-Completions bleiben möglich
-  - AC-3: keine neue Gateway-Regression in den relevanten Kontrollpfaden
+  - AC-3: keine neue Gateway-Regression in den betroffenen Kontrollpfaden
 - Evidence plan:
   - AC-1 via `/health`
   - AC-2 via Gateway-Journal `pipeline request completed`
@@ -227,7 +227,7 @@
 - Outcome:
   - Der gemeldete `open`-Zustand ließ sich auf dem aktuellen Stand nicht als verbleibender Codefehler reproduzieren.
   - Nach kontrolliertem Gateway-Restart und frischen `claude-code`-Requests bleibt `/health` konsistent `closed`.
-  - Die vorhandenen Breaker-Tests decken den relevanten Open→Half-Open→Closed-Pfad bereits ab; ein zusätzlicher Code-Patch war nicht nötig.
+  - Die vorhandenen Breaker-Tests decken den betroffenen Open→Half-Open→Closed-Pfad bereits ab; ein zusätzlicher Code-Patch war nicht nötig.
 - Evidence:
   - AC-1 PASS:
     - VM-`/health` vor Repro: `{"circuit_breakers":{"claude-code":"closed"}}`
@@ -254,7 +254,7 @@
   - AC-2 via finale `PROGRESS.md`-Inspektion
 - Outcome:
   - Alle vier Task-Fixpunkte sind im Repo und auf der VM auf dem aktuellen Stand gegengeprüft.
-  - Es blieb kein offener Blocker zurück; nur die bereits vorhandenen untracked Dateien im Repo wurden bewusst unangetastet gelassen.
+  - Es blieb kein verbleibender Blocker zurück; nur die bereits vorhandenen untracked Dateien im Repo wurden bewusst unangetastet gelassen.
 - Evidence:
   - AC-1 PASS:
     - Task 1 Endstand: neue `hallway_encounter_detected`-Events zeigen weiter `room_id`, z. B. `8726303|37|50|flur-eg|`
@@ -289,7 +289,7 @@
 - Welche ACs jetzt bestehen müssen:
   - AC-1: Encounter-Events haben auf der VM eine nicht-leere Raumangabe
   - AC-2: Encounter-Perception bleibt für beteiligte Agents intakt
-  - AC-3: relevante Tests/Clippy sind grün
+  - AC-3: betroffene Tests/Clippy sind grün
 - Wie ich jede AC beweise:
   - AC-1 mit frischer `sqlite3`-Abfrage auf `events.db`
   - AC-2 mit Daemon-/Event-Evidence nach provozierter Begegnung
@@ -298,7 +298,7 @@
   - `crates/sentinel-common/src/events.rs`
   - `crates/sentinel-ecs/src/systems.rs`
   - `crates/sentinel-ecs/src/decision.rs`
-  - relevante Tests in `crates/sentinel-ecs` und/oder `crates/sentinel-common`
+  - betroffene Tests in `crates/sentinel-ecs` und/oder `crates/sentinel-common`
 - Risiken / Abhängigkeiten:
   - Event-Schemaänderung darf alte Reader nicht still brechen
   - Live-Encounter muss sich auf der VM zeitnah provozieren lassen; sonst braucht die Task mehrere kurze Runtime-Anläufe
