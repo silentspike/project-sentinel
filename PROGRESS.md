@@ -3,11 +3,11 @@
 ## Status
 
 - Plan source: `User-Freigabe 2026-04-04: codex-security.md nach $start umsetzen`
-- Overall status: `IN_PROGRESS`
-- Current task: `Task 4 - Security-Plan-Verifikation`
+- Overall status: `DONE`
+- Current task: `Security-Plan abgeschlossen`
 - Current branch: `feat/security-291-292-293`
 - Hook status: `PreToolUse TaskUpdate + PostToolUse start-enforcer projektlokal registriert`
-- Last refresh: `2026-04-04 11:22 UTC / Task 3 abgeschlossen`
+- Last refresh: `2026-04-04 11:24 UTC / Plan abgeschlossen`
 
 ## Current findings
 
@@ -15,6 +15,7 @@
 - `#291` ist technisch behoben: Workspace-Dependency `async-nats` wurde von `0.38` auf `0.47.0` angehoben; `cargo remote -c -- tree -i rustls-webpki@0.102.8` findet keinen Paketpfad mehr.
 - `#293` ist technisch abgeschlossen: `bincode 1.3.3` ist aus dem Graph entfernt, Snapshots laufen jetzt über einen expliziten `bincode 2`-Codec mit `legacy()`-Kompatibilitätskonfiguration.
 - Die Live-Verifikation auf `10.0.0.240` belegt Alt-Snapshot-Restore und Neu-Snapshot-Write auf dem neuen Daemon-Binary.
+- Alle drei Security-Issues `#291`, `#292` und `#293` sind jetzt `CLOSED` und tragen `status:verified`.
 
 ## Blocked items
 
@@ -24,7 +25,8 @@
 
 - `4fe4e65` `Task [1]: re-verify and close issue 292`
 - `2b37f76` `Task [2]: fix issue 291 async-nats webpki path`
-- `TBD` `Task [3]: migrate issue 293 off bincode 1`
+- `9ada98b` `Task [3]: migrate issue 293 off bincode 1`
+- `TBD` `Task [4]: verify security plan completion`
 
 ## Task table
 
@@ -33,7 +35,7 @@
 | 1 | `#292` re-verifizieren und formal schließen | DONE | `rustls-webpki 0.103.9` auf aktuellem `main` gegen Lockfile, Dependency-Graph und Audit neu belegen; dann GitHub-Close-Workflow ausführen | inspect, command |
 | 2 | `#291` `rustls-webpki 0.102.8` / `async-nats`-Pfad beheben | DONE | minimalen belastbaren Upgrade-Pfad implementieren, remote testen, auf VM deployen und NATS-/Daemon-Verhalten live verifizieren | inspect, command, system |
 | 3 | `#293` `bincode 1.3.3` ablösen | DONE | Snapshot-/Persistenzpfade auf gepflegte Alternative migrieren, kompatibel testen und live Restore verifizieren | inspect, command, system |
-| 4 | Plan-Verifikation | IN_PROGRESS | alle drei Security-Issues gegen Repo-, GitHub- und VM-Endstand vollständig gegenprüfen | inspect, command, system |
+| 4 | Plan-Verifikation | DONE | alle drei Security-Issues gegen Repo-, GitHub- und VM-Endstand vollständig gegenprüfen | inspect, command, system |
 
 ## Task details
 
@@ -141,3 +143,11 @@
 - Scope:
   - Security-Issues, Commits, Tests, Deploys und VM-Evidence gegen den Endstand abgleichen
   - verbleibende Blocker oder Restrisiken klar dokumentieren
+- Outcome:
+  - `#291`, `#292` und `#293` sind jeweils mit `status:verified` geschlossen.
+  - Der Security-Branch enthält drei getrennte Task-Commits für Re-Verify, Dependency-Fix und Snapshot-Migration.
+  - Der aktive Worktree ist bis auf die bekannten untracked Workspace-Dateien sauber.
+- Evidence:
+  - `gh issue view 291/292/293 --json state,labels` => alle `CLOSED` mit `status:verified`
+  - `git status --short` => keine verbleibenden tracked Änderungen
+  - VM-Endstand aus Task 2 und Task 3 bleibt stabil: `sentinel-daemon active`, keine `panic`-/`drift`-Treffer im Prüffenster
