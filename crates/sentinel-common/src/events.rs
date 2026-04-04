@@ -3,6 +3,8 @@
 //! Jede mutierende Aktion erzeugt ein DomainEvent mit UUIDv4 event_id.
 //! Events werden append-only in Limbo (SQLite) persistiert.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -243,6 +245,24 @@ pub enum DomainEventPayload {
         action: String,
         description: String,
     },
+    /// LLM-gestuetzte Platform-Analyse mit optionaler Suggested Action.
+    PlatformAnalysis {
+        trigger: String,
+        severity: String,
+        summary: String,
+        recommendation: String,
+        #[serde(default)]
+        suggested_action: Option<String>,
+        target: String,
+        #[serde(default)]
+        provider: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        unresolved_keys: Vec<String>,
+        #[serde(default)]
+        parameters: BTreeMap<String, serde_json::Value>,
+    },
     /// Ressourcen-Profil eines Agents hat sich geaendert (cgroup Hot-Resize)
     ResourceProfileChanged {
         agent_id: AgentId,
@@ -291,6 +311,7 @@ impl DomainEventPayload {
             Self::HallwayEncounterDetected { .. } => "hallway_encounter_detected",
             Self::SmellEventTriggered { .. } => "smell_event_triggered",
             Self::PlatformIntervention { .. } => "platform_intervention",
+            Self::PlatformAnalysis { .. } => "platform_analysis",
             Self::ResourceProfileChanged { .. } => "resource_profile_changed",
             Self::OperatorGaiaSent { .. } => "operator_gaia_sent",
             Self::OperatorBroadcastSent { .. } => "operator_broadcast_sent",
@@ -340,5 +361,42 @@ mod tests {
             }
             other => panic!("unexpected payload: {other:?}"),
         }
+    }
+
+    #[test]
+    fn platform_analysis_serializes_all_required_fields() {
+        let mut parameters = BTreeMap::new();
+        parameters.insert("profile".to_string(), serde_json::json!("Idle"));
+        parameters.insert("value".to_string(), serde_json::json!(0.75));
+
+        let payload = DomainEventPayload::PlatformAnalysis {
+            trigger: "manual".to_string(),
+            severity: "warning".to_string(),
+            summary: "codex analysis".to_string(),
+            recommendation: "force idle profile".to_string(),
+            suggested_action: Some("force_profile".to_string()),
+            target: "AGENT-03".to_string(),
+            provider: Some("claude-code".to_string()),
+            model: Some("haiku".to_string()),
+            unresolved_keys: vec!["agent_stall:AGENT-03".to_string()],
+            parameters,
+        };
+
+        let json = payload.to_json();
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+
+        assert_eq!(value["type"], "PlatformAnalysis");
+        assert_eq!(value["trigger"], "manual");
+        assert_eq!(value["severity"], "warning");
+        assert_eq!(value["summary"], "codex analysis");
+        assert_eq!(value["recommendation"], "force idle profile");
+        assert_eq!(value["suggested_action"], "force_profile");
+        assert_eq!(value["target"], "AGENT-03");
+        assert_eq!(value["provider"], "claude-code");
+        assert_eq!(value["model"], "haiku");
+        assert_eq!(value["unresolved_keys"][0], "agent_stall:AGENT-03");
+        assert_eq!(value["parameters"]["profile"], "Idle");
+        assert_eq!(value["parameters"]["value"], 0.75);
+        assert_eq!(payload.event_type_str(), "platform_analysis");
     }
 }

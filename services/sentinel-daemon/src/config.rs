@@ -442,6 +442,8 @@ pub struct PlatformControlplaneConfig {
     pub enabled: bool,
     #[serde(default = "default_pcp_cycle_interval")]
     pub cycle_interval_ticks: u64,
+    #[serde(default = "default_pcp_stall_recent_activity_grace_ticks")]
+    pub stall_recent_activity_grace_ticks: u64,
     #[serde(default = "default_pcp_stall_cooldown")]
     pub stall_cooldown_ticks: u64,
     #[serde(default = "default_pcp_prune_cooldown")]
@@ -462,6 +464,20 @@ pub struct PlatformControlplaneConfig {
     pub monitored_services: Vec<String>,
     #[serde(default = "default_pcp_service_check_interval")]
     pub service_check_interval_secs: u64,
+    #[serde(default = "default_pcp_llm_enabled")]
+    pub llm_enabled: bool,
+    #[serde(default = "default_pcp_llm_analysis_interval")]
+    pub llm_analysis_interval_secs: u64,
+    #[serde(default = "default_pcp_llm_retry_delay")]
+    pub llm_retry_delay_secs: u64,
+    #[serde(default = "default_pcp_llm_gateway_timeout_ms")]
+    pub llm_gateway_timeout_ms: u64,
+    #[serde(default = "default_pcp_llm_prompt_template")]
+    pub llm_prompt_template: String,
+    #[serde(default = "default_pcp_llm_max_context_events")]
+    pub llm_max_context_events: usize,
+    #[serde(default = "default_pcp_llm_max_failed_interventions")]
+    pub llm_max_failed_interventions: usize,
 }
 
 fn default_pcp_enabled() -> bool {
@@ -469,6 +485,9 @@ fn default_pcp_enabled() -> bool {
 }
 fn default_pcp_cycle_interval() -> u64 {
     60
+}
+fn default_pcp_stall_recent_activity_grace_ticks() -> u64 {
+    120
 }
 fn default_pcp_stall_cooldown() -> u64 {
     60
@@ -504,12 +523,34 @@ fn default_pcp_monitored_services() -> Vec<String> {
 fn default_pcp_service_check_interval() -> u64 {
     60
 }
+fn default_pcp_llm_enabled() -> bool {
+    true
+}
+fn default_pcp_llm_analysis_interval() -> u64 {
+    300
+}
+fn default_pcp_llm_retry_delay() -> u64 {
+    60
+}
+fn default_pcp_llm_gateway_timeout_ms() -> u64 {
+    30_000
+}
+fn default_pcp_llm_prompt_template() -> String {
+    "platform-controlplane-default".to_string()
+}
+fn default_pcp_llm_max_context_events() -> usize {
+    10
+}
+fn default_pcp_llm_max_failed_interventions() -> usize {
+    3
+}
 
 impl Default for PlatformControlplaneConfig {
     fn default() -> Self {
         Self {
             enabled: default_pcp_enabled(),
             cycle_interval_ticks: default_pcp_cycle_interval(),
+            stall_recent_activity_grace_ticks: default_pcp_stall_recent_activity_grace_ticks(),
             stall_cooldown_ticks: default_pcp_stall_cooldown(),
             prune_cooldown_ticks: default_pcp_prune_cooldown(),
             max_event_store_bytes: default_pcp_max_event_store(),
@@ -520,6 +561,13 @@ impl Default for PlatformControlplaneConfig {
             write_anomaly_cooldown_ticks: default_pcp_write_anomaly_cooldown(),
             monitored_services: default_pcp_monitored_services(),
             service_check_interval_secs: default_pcp_service_check_interval(),
+            llm_enabled: default_pcp_llm_enabled(),
+            llm_analysis_interval_secs: default_pcp_llm_analysis_interval(),
+            llm_retry_delay_secs: default_pcp_llm_retry_delay(),
+            llm_gateway_timeout_ms: default_pcp_llm_gateway_timeout_ms(),
+            llm_prompt_template: default_pcp_llm_prompt_template(),
+            llm_max_context_events: default_pcp_llm_max_context_events(),
+            llm_max_failed_interventions: default_pcp_llm_max_failed_interventions(),
         }
     }
 }
@@ -594,6 +642,23 @@ data_dir = "/tmp/data"
         );
         assert_eq!(file.daemon.traffic_control.max_forward_concurrency, 3);
         assert_eq!(file.daemon.traffic_control.intercept_mode, "auto");
+        assert!(file.daemon.platform_controlplane.enabled);
+        assert_eq!(file.daemon.platform_controlplane.cycle_interval_ticks, 60);
+        assert_eq!(
+            file.daemon.platform_controlplane.stall_recent_activity_grace_ticks,
+            120
+        );
+        assert_eq!(file.daemon.platform_controlplane.service_check_interval_secs, 60);
+        assert!(file.daemon.platform_controlplane.llm_enabled);
+        assert_eq!(file.daemon.platform_controlplane.llm_analysis_interval_secs, 300);
+        assert_eq!(file.daemon.platform_controlplane.llm_retry_delay_secs, 60);
+        assert_eq!(file.daemon.platform_controlplane.llm_gateway_timeout_ms, 30_000);
+        assert_eq!(
+            file.daemon.platform_controlplane.llm_prompt_template,
+            "platform-controlplane-default"
+        );
+        assert_eq!(file.daemon.platform_controlplane.llm_max_context_events, 10);
+        assert_eq!(file.daemon.platform_controlplane.llm_max_failed_interventions, 3);
     }
 
     #[test]
@@ -734,5 +799,56 @@ intercept_mode = "manual"
         );
         assert_eq!(file.daemon.traffic_control.max_forward_concurrency, 5);
         assert_eq!(file.daemon.traffic_control.intercept_mode, "manual");
+    }
+
+    #[test]
+    fn test_platform_controlplane_custom() {
+        let toml_str = r#"
+[daemon]
+config_dir = "/tmp/cfg"
+data_dir = "/tmp/data"
+
+[daemon.platform_controlplane]
+enabled = true
+cycle_interval_ticks = 30
+stall_recent_activity_grace_ticks = 90
+stall_cooldown_ticks = 45
+prune_cooldown_ticks = 1200
+max_event_store_bytes = 123456
+max_projection_lag = 42
+memory_pressure_threshold = 0.75
+max_escalation = 4
+write_anomaly_threshold_bytes_per_sec = 111
+write_anomaly_cooldown_ticks = 22
+service_check_interval_secs = 15
+llm_enabled = false
+llm_analysis_interval_secs = 600
+llm_retry_delay_secs = 17
+llm_gateway_timeout_ms = 45000
+llm_prompt_template = "custom-template"
+llm_max_context_events = 23
+llm_max_failed_interventions = 5
+"#;
+        let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
+        let cfg = file.daemon.platform_controlplane;
+        assert!(cfg.enabled);
+        assert_eq!(cfg.cycle_interval_ticks, 30);
+        assert_eq!(cfg.stall_recent_activity_grace_ticks, 90);
+        assert_eq!(cfg.stall_cooldown_ticks, 45);
+        assert_eq!(cfg.prune_cooldown_ticks, 1200);
+        assert_eq!(cfg.max_event_store_bytes, 123456);
+        assert_eq!(cfg.max_projection_lag, 42);
+        assert_eq!(cfg.memory_pressure_threshold, 0.75);
+        assert_eq!(cfg.max_escalation, 4);
+        assert_eq!(cfg.write_anomaly_threshold_bytes_per_sec, 111);
+        assert_eq!(cfg.write_anomaly_cooldown_ticks, 22);
+        assert_eq!(cfg.service_check_interval_secs, 15);
+        assert!(!cfg.llm_enabled);
+        assert_eq!(cfg.llm_analysis_interval_secs, 600);
+        assert_eq!(cfg.llm_retry_delay_secs, 17);
+        assert_eq!(cfg.llm_gateway_timeout_ms, 45_000);
+        assert_eq!(cfg.llm_prompt_template, "custom-template");
+        assert_eq!(cfg.llm_max_context_events, 23);
+        assert_eq!(cfg.llm_max_failed_interventions, 5);
     }
 }

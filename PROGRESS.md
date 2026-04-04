@@ -4,7 +4,7 @@
 
 - Plan source: `/work/company/codex-plan263.md`
 - Overall status: `IN_PROGRESS`
-- Current task: `Task 2 - Event- und Config-Schema fuer die LLM-Ebene`
+- Current task: `Task 3 - LLM-Analyzer als daemon-internes Background-Modul`
 - Current branch: `feat/issue-263-platform-controlplane-completion`
 - Hook status: `PreToolUse TaskUpdate + PostToolUse start-enforcer projektlokal registriert`
 - Last refresh: `2026-04-05 Europe/Vienna`
@@ -27,6 +27,13 @@
   - `agent_stall` ueberspringt weiter alles mit `tick - last_action_tick < 120`
   - `projection_lag` feuert derzeit nur `alert`, keinen Restart
   - `ResourceManager::force_profile()` aendert nur den In-Memory-Zustand, ohne cgroup-Apply und ohne Audit-Event in diesem Pfad
+- Task-2-Schemaarbeit ist lokal umgesetzt:
+  - [events.rs](/work/company/project-sentinel/crates/sentinel-common/src/events.rs) enthaelt jetzt `PlatformAnalysis` inklusive `trigger`, `severity`, `summary`, `recommendation`, `suggested_action`, `target`, `provider`, `model`, `unresolved_keys` und `parameters`
+  - [config.rs](/work/company/project-sentinel/services/sentinel-daemon/src/config.rs) und [daemon.toml](/work/company/project-sentinel/config/daemon.toml) tragen jetzt die benoetigten Platform-CP-Felder fuer Grace-, LLM-, Retry- und Timeout-Steuerung
+  - [rules.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/rules.rs) nutzt jetzt `stall_recent_activity_grace_ticks` statt des bisher harten `120`-Tick-Skips
+- Remote-Rust-Evidence fuer Task 2 ist vorhanden:
+  - `cargo remote -c -- test -p sentinel-common -p sentinel-daemon -p sentinel-projection` lief mit Exit `0` durch; relevante Endzeilen zeigen `142 passed` fuer `sentinel-daemon` sowie gruenen `sentinel_projection`-/Acceptance-Run
+  - `cargo remote -c -- clippy -p sentinel-common -p sentinel-daemon -p sentinel-projection --all-targets -- -D warnings` lief ebenfalls mit Exit `0` durch; der Output ist wegen `cargo remote`-Artifact-Transfer sehr rauschig, aber ohne Clippy-Fehler beendet
 
 ## Blocked items
 
@@ -35,7 +42,7 @@
 
 ## Commit references
 
-- `TBD` Task [1]
+- `ae1b5cf` Task [1]
 - `TBD` Task [2]
 - `TBD` Task [3]
 - `TBD` Task [4]
@@ -49,8 +56,8 @@
 | # | Task | Status | Scope | Evidence |
 |---|------|--------|-------|----------|
 | 1 | Issue-Hygiene, Branch-Setup und deterministische Baseline fuer AC-1 bis AC-5 / AC-10 bis AC-12 neu setzen | DONE | `#263`-Ist-Zustand gegen Repo/GitHub/VM abgleichen, offene Baseline-Luecken fuer Stall/Projection/Cooldowns/Disable-Flag pruefen, Issue-Text vorbereiten, Branch sauber halten | command, system, inspect |
-| 2 | Event- und Config-Schema fuer die LLM-Ebene ergaenzen | IN_PROGRESS | `PlatformAnalysis`-Event, neue Platform-CP-Config-Felder, TOML-Defaults und Typen stabil ergaenzen | inspect, command |
-| 3 | LLM-Analyzer als daemon-internes Background-Modul implementieren | PENDING | asynchronen Analyzer, Kontext-Assembly, Gateway-Call und Parsing/Persistenz bauen | inspect, command |
+| 2 | Event- und Config-Schema fuer die LLM-Ebene ergaenzen | DONE | `PlatformAnalysis`-Event, neue Platform-CP-Config-Felder, TOML-Defaults und Typen stabil ergaenzen | inspect, command |
+| 3 | LLM-Analyzer als daemon-internes Background-Modul implementieren | IN_PROGRESS | asynchronen Analyzer, Kontext-Assembly, Gateway-Call und Parsing/Persistenz bauen | inspect, command |
 | 4 | Eskalationslogik, unresolved counters und deterministische Trigger vervollstaendigen | PENDING | scheduled/manual/unresolved Trigger, Counter-State und Test-Hooks fuer `AC-6` vervollstaendigen | inspect, command, system |
 | 5 | Suggested-Action-Executor mit force_profile / adjust_threshold / escalate_to_operator implementieren | PENDING | guard-railed Executor inkl. cgroup-Apply, Audit-Trail und Runtime-Overrides bauen | inspect, command, system |
 | 6 | Operator-API, Dashboard, Cockpit und Playwright-relevante UI-Surfaces erweitern | PENDING | API-Read/Write-Pfade, Dashboard/Cockpit-Rendering, stabile Selektoren, Projection-Write-Key-Pfad und UI-Verifikation ergaenzen | inspect, command, browser, system |
@@ -127,6 +134,28 @@
   - AC-1 via Code-Inspection + Tests
   - AC-2 via Code-Inspection + Config-Parse-Test
   - AC-3 via `cargo remote -c -- test ...` / `clippy`
+- Pre-task self-check:
+  - Was muss getan werden: Basistypen und Config muessen zuerst stabil stehen, bevor der Analyzer oder Operator-Pfade darauf aufbauen koennen.
+  - Welche ACs muessen hier passen: Eventschema, Config-Felder, gruene Remote-Rust-Checks.
+  - Wie wird bewiesen: Rust-Unit-Tests, Config-Parse-Tests, `cargo remote` fuer Test und Clippy.
+  - Erwartete Dateien: [events.rs](/work/company/project-sentinel/crates/sentinel-common/src/events.rs), [config.rs](/work/company/project-sentinel/services/sentinel-daemon/src/config.rs), [daemon.toml](/work/company/project-sentinel/config/daemon.toml), [rules.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/rules.rs)
+  - Risiken: exhaustive Event-Matches in Folgemodulen, lauter `cargo remote`-Output, keine lokale Rust-Ausfuehrung erlaubt.
+- Outcome:
+  - `PlatformAnalysis` ist als neues Domain-Event mit dem geplanten Analyse-/Recommendation-Vertrag vorhanden.
+  - Platform-Controlplane-Konfiguration enthaelt jetzt explizite Felder fuer `stall_recent_activity_grace_ticks`, `llm_enabled`, `llm_analysis_interval_secs`, `llm_retry_delay_secs`, `llm_gateway_timeout_ms`, `llm_prompt_template`, `llm_max_context_events` und `llm_max_failed_interventions`.
+  - Die bisher harte Stall-Grace von `120` Ticks ist aus der Regel herausgezogen und nun konfigurierbar.
+  - Event-/Config-Tests und Remote-Rust-Checks laufen gruen.
+- Evidence:
+  - AC-1 PASS:
+    - [events.rs](/work/company/project-sentinel/crates/sentinel-common/src/events.rs) fuehrt `DomainEventPayload::PlatformAnalysis` und `event_type_str() = "platform_analysis"` ein
+    - `platform_analysis_serializes_all_required_fields` prueft JSON-Shape inkl. `suggested_action`, `provider`, `model`, `unresolved_keys` und `parameters`
+  - AC-2 PASS:
+    - [config.rs](/work/company/project-sentinel/services/sentinel-daemon/src/config.rs) erweitert `PlatformControlplaneConfig` samt Defaults und Parse-Test `test_platform_controlplane_custom`
+    - [daemon.toml](/work/company/project-sentinel/config/daemon.toml) traegt die neuen Platform-CP-Felder im Default-Profil
+    - [rules.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/rules.rs) nutzt `config.stall_recent_activity_grace_ticks`
+  - AC-3 PASS:
+    - `cargo remote -c -- test -p sentinel-common -p sentinel-daemon -p sentinel-projection` => Exit `0`; Endzeilen: `142 passed; 0 failed` fuer `sentinel-daemon`, `4 passed` fuer `sentinel_projection`, `6 passed` in `tests/acceptance.rs`
+    - `cargo remote -c -- clippy -p sentinel-common -p sentinel-daemon -p sentinel-projection --all-targets -- -D warnings` => Exit `0`
 
 ### Task 3 - LLM-Analyzer als daemon-internes Background-Modul implementieren
 
