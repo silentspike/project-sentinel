@@ -202,6 +202,47 @@ export interface HealthResponse {
   projection_lag: number;
 }
 
+export interface PlatformAnalysisItem {
+  event_id: string;
+  aggregate_id: string;
+  trigger: string;
+  severity: string;
+  summary: string;
+  recommendation: string;
+  suggested_action: string | null;
+  target: string;
+  provider: string | null;
+  model: string | null;
+  unresolved_keys: string[];
+  parameters: Record<string, unknown>;
+  tick: number;
+  timestamp_ms: number;
+}
+
+export interface PlatformStateAgent {
+  agent_id: number;
+  aggregate_id: string;
+  name: string;
+  last_activity_tick: number;
+  cgroup_path: string;
+  current_profile: string;
+}
+
+export interface PlatformStateResponse {
+  current_tick: number;
+  stall_recent_activity_grace_ticks: number;
+  llm_enabled: boolean;
+  llm_analysis_interval_secs: number;
+  llm_retry_delay_secs: number;
+  last_analysis_tick: number | null;
+  last_analysis_trigger: string | null;
+  last_scheduled_analysis_tick: number | null;
+  unresolved_counts: Record<string, number>;
+  threshold_overrides: Record<string, unknown>;
+  resource_profiles: Record<string, string>;
+  agents: PlatformStateAgent[];
+}
+
 // ── EventStore Row (raw) ──────────────────────────
 
 export interface EventRow {

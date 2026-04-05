@@ -10,6 +10,7 @@ import type {
   EvolutionRow,
   ChaosEventItem,
   ChatMessage,
+  PlatformAnalysisItem,
   RoomPhysicsHistoryPoint,
   RoomReactionItem,
   RoomStimulusHistoryItem,
@@ -657,6 +658,8 @@ const INCIDENT_EVENT_TYPES = [
   "agent_consolidation_failed",
   "agent_despawned",
   "nightrun_completed",
+  "platform_analysis",
+  "platform_intervention",
 ] as const;
 
 const INCIDENT_TYPES_SQL = INCIDENT_EVENT_TYPES.map((t) => `'${t}'`).join(",");
@@ -673,6 +676,66 @@ export function getRecentIncidentEvents(hours: number, limit = 200): EventRow[] 
        LIMIT ?`,
     )
     .all(cutoff, limit);
+}
+
+export function getRecentPlatformAnalyses(limit = 50): PlatformAnalysisItem[] {
+  const rows = eventStoreDb
+    .query<
+      {
+        event_id: string;
+        aggregate_id: string;
+        payload: string;
+        tick: number;
+        timestamp_ms: number;
+      },
+      [number]
+    >(
+      `SELECT event_id, aggregate_id, payload, tick, timestamp_ms
+       FROM events
+       WHERE event_type = 'platform_analysis'
+       ORDER BY id DESC
+       LIMIT ?`,
+    )
+    .all(limit);
+
+  return rows
+    .map((row) => {
+      try {
+        const payload = JSON.parse(row.payload) as Record<string, unknown>;
+        const unresolvedKeys = Array.isArray(payload.unresolved_keys)
+          ? payload.unresolved_keys
+              .map((value) => String(value).trim())
+              .filter((value) => value.length > 0)
+          : [];
+        const parameters =
+          payload.parameters && typeof payload.parameters === "object"
+            ? (payload.parameters as Record<string, unknown>)
+            : {};
+
+        return {
+          event_id: row.event_id,
+          aggregate_id: row.aggregate_id,
+          trigger: String(payload.trigger ?? "unknown"),
+          severity: String(payload.severity ?? "info"),
+          summary: String(payload.summary ?? ""),
+          recommendation: String(payload.recommendation ?? ""),
+          suggested_action:
+            payload.suggested_action == null
+              ? null
+              : String(payload.suggested_action),
+          target: String(payload.target ?? row.aggregate_id),
+          provider: payload.provider == null ? null : String(payload.provider),
+          model: payload.model == null ? null : String(payload.model),
+          unresolved_keys: unresolvedKeys,
+          parameters,
+          tick: row.tick,
+          timestamp_ms: row.timestamp_ms,
+        } satisfies PlatformAnalysisItem;
+      } catch {
+        return null;
+      }
+    })
+    .filter((row): row is PlatformAnalysisItem => row !== null);
 }
 
 export function getRecentEvolutionAlerts(hours: number): EvolutionRow[] {

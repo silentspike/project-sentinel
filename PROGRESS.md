@@ -4,7 +4,7 @@
 
 - Plan source: `/work/company/codex-plan263.md`
 - Overall status: `IN_PROGRESS`
-- Current task: `Task 6 - Operator-API, Dashboard, Cockpit und Playwright-relevante UI-Surfaces erweitern`
+- Current task: `Task 7 - Deploy, Benchmarks sowie AC-1 bis AC-12 inkl. UI-Evidence auf der VM verifizieren`
 - Current branch: `feat/issue-263-platform-controlplane-completion`
 - Hook status: `PreToolUse TaskUpdate + PostToolUse start-enforcer projektlokal registriert`
 - Last refresh: `2026-04-05 Europe/Vienna`
@@ -32,7 +32,7 @@
   - [config.rs](/work/company/project-sentinel/services/sentinel-daemon/src/config.rs) und [daemon.toml](/work/company/project-sentinel/config/daemon.toml) tragen jetzt die benoetigten Platform-CP-Felder fuer Grace-, LLM-, Retry- und Timeout-Steuerung
   - [rules.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/rules.rs) nutzt jetzt `stall_recent_activity_grace_ticks` statt des bisher harten `120`-Tick-Skips
 - Remote-Rust-Evidence fuer Task 2 ist vorhanden:
-  - `cargo remote -c -- test -p sentinel-common -p sentinel-daemon -p sentinel-projection` lief mit Exit `0` durch; relevante Endzeilen zeigen `142 passed` fuer `sentinel-daemon` sowie gruenen `sentinel_projection`-/Acceptance-Run
+  - `cargo remote -c -- test -p sentinel-common -p sentinel-daemon -p sentinel-projection` lief mit Exit `0` durch; massgebliche Endzeilen zeigen `142 passed` fuer `sentinel-daemon` sowie gruenen `sentinel_projection`-/Acceptance-Run
   - `cargo remote -c -- clippy -p sentinel-common -p sentinel-daemon -p sentinel-projection --all-targets -- -D warnings` lief ebenfalls mit Exit `0` durch; der Output ist wegen `cargo remote`-Artifact-Transfer sehr rauschig, aber ohne Clippy-Fehler beendet
 - Task-3-Analyzer ist jetzt als echter daemon-interner Worker vorhanden:
   - neue Datei [llm_analyzer.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/llm_analyzer.rs)
@@ -40,7 +40,7 @@
   - Start/Wiring in [orchestrator.rs](/work/company/project-sentinel/services/sentinel-daemon/src/orchestrator.rs)
 - Der Analyzer benutzt ausschliesslich den internen Gateway-Vertrag `POST /internal/llm`, baut seinen Kontext aus `PlatformMetrics`, Verify-Ergebnissen, den letzten `PlatformIntervention`-Events und fehlgeschlagenen Interventionen und dispatcht erfolgreiche Antworten jetzt als strukturiertes `PlatformAnalysisCommand` in den gemeinsamen Runtime-Executor.
 - Remote-Rust-Evidence fuer Task 3 ist vorhanden:
-  - `cargo remote -c -- test -p sentinel-daemon -p sentinel-common` => Exit `0`; relevante Endzeilen zeigen `145 passed; 0 failed`
+  - `cargo remote -c -- test -p sentinel-daemon -p sentinel-common` => Exit `0`; massgebliche Endzeilen zeigen `145 passed; 0 failed`
   - `cargo remote -c -- clippy -p sentinel-daemon --all-targets -- -D warnings` => Exit `0`
 - Task-4-Trigger- und State-Ebene ist jetzt lokal umgesetzt:
   - [mod.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/mod.rs) fuehrt `PlatformControlCommand`, `PlatformTriggerTestCommand`, `PlatformStateSnapshot`, `PlatformCycleOutput`, unresolved counters, queued trigger und Analyse-Request-Building ein
@@ -57,6 +57,18 @@
 - Remote-Rust-Evidence fuer Task 5 ist vorhanden:
   - `cargo remote -c -- test -p sentinel-daemon -- --nocapture` => Exit `0`; Endzeilen zeigen `156 passed; 0 failed`
   - `cargo remote -c -- clippy -p sentinel-daemon --all-targets -- -D warnings` => Exit `0`; Endzeile `Finished 'dev' profile [unoptimized + debuginfo] target(s) in 5.71s`
+- Task-6-Dashboard-/Cockpit-/UI-Ebene ist jetzt lokal umgesetzt:
+  - [control.ts](/work/company/project-sentinel/dashboard/src/routes/control.ts) exponiert jetzt `GET /api/control/platform-state`, `GET /api/control/platform-analyses` und `POST /api/control/platform-analyze`
+  - [db.ts](/work/company/project-sentinel/dashboard/src/db.ts) liest `platform_analysis`-Events strukturiert aus dem Event Store
+  - [cockpit.ts](/work/company/project-sentinel/dashboard/src/routes/cockpit.ts) behandelt `platform_analysis` und `platform_intervention` jetzt als echte Cockpit-Incidents
+  - [control.js](/work/company/project-sentinel/dashboard/public/js/control.js) rendert neue UI-Sektionen/Selektoren fuer Analysen und Platform-State
+  - [cockpit.js](/work/company/project-sentinel/dashboard/public/js/cockpit.js) setzt `data-incident-type` fuer Playwright-stabile Incident-Selektoren
+- Dashboard-Evidence fuer Task 6 ist lokal vorhanden:
+  - `cd dashboard && bun test src/__tests__/control.test.ts src/routes/cockpit.test.ts` => Exit `0`; `27 pass`
+  - `cd dashboard && bun test` => Exit `0`; `63 pass`
+- Offen bleibt fuer Task 7 bewusst:
+  - `SENTINEL_DASHBOARD_API_KEY` ist live auf `sentinel-projection` weiter leer und muss fuer die UI-Write-Abnahme auf der VM erst provisioniert werden
+  - Playwright-/Screenshot-Evidence und die echte VM-Read/Write-Verifikation folgen erst nach Deploy in Task 7
 
 ## Blocked items
 
@@ -69,7 +81,7 @@
 - `de96c37` Task [2]
 - `f2bd13a` Task [3]
 - `93f2080` Task [4]
-- `TBD` Task [5]
+- `3355a69` Task [5]
 - `TBD` Task [6]
 - `TBD` Task [7]
 - `TBD` Task [8]
@@ -83,8 +95,8 @@
 | 3 | LLM-Analyzer als daemon-internes Background-Modul implementieren | DONE | asynchronen Analyzer, Kontext-Assembly, Gateway-Call und Parsing/Persistenz bauen | inspect, command |
 | 4 | Eskalationslogik, unresolved counters und deterministische Trigger vervollstaendigen | DONE | scheduled/manual/unresolved Trigger, Counter-State und Test-Hooks fuer `AC-6` vervollstaendigen | inspect, command, system |
 | 5 | Suggested-Action-Executor mit force_profile / adjust_threshold / escalate_to_operator implementieren | DONE | guard-railed Executor inkl. cgroup-Apply, Audit-Trail und Runtime-Overrides bauen | inspect, command, system |
-| 6 | Operator-API, Dashboard, Cockpit und Playwright-relevante UI-Surfaces erweitern | IN_PROGRESS | API-Read/Write-Pfade, Dashboard/Cockpit-Rendering, stabile Selektoren, Projection-Write-Key-Pfad und UI-Verifikation ergaenzen | inspect, command, browser, system |
-| 7 | Deploy, Benchmarks sowie AC-1 bis AC-12 inkl. UI-Evidence auf der VM verifizieren | PENDING | Release-Build, Deploy, systemd-Restarts, AC-Matrix, Playwright-Screenshots und Benchmarks mit Systemmetriken abarbeiten | command, system, browser |
+| 6 | Operator-API, Dashboard, Cockpit und Playwright-stabile UI-Surfaces erweitern | DONE | API-Read/Write-Pfade, Dashboard/Cockpit-Rendering, stabile Selektoren und lokale Testabdeckung ergaenzen | inspect, command, browser |
+| 7 | Deploy, Benchmarks sowie AC-1 bis AC-12 inkl. UI-Evidence auf der VM verifizieren | IN_PROGRESS | Release-Build, Deploy, systemd-Restarts, AC-Matrix, Playwright-Screenshots und Benchmarks mit Systemmetriken abarbeiten | command, system, browser |
 | 8 | Plan-Verifikation | PENDING | Gesamtergebnis Zeile fuer Zeile gegen den Plan pruefen, Restluecken sofort fixen oder als Blocker dokumentieren | inspect, command, system, browser |
 
 ## Task details
@@ -97,7 +109,7 @@
   - Branch-/Issue-Hygiene auf den Ausfuehrungsstand ziehen
 - Checklist:
   - GitHub-Issue `#263` lesen und mit [codex-plan263.md](/work/company/codex-plan263.md) abgleichen
-  - relevante Baseline-Implementierung in `platform_controlplane`, `service_health`, `config` und Deploy-Config lesen
+  - massgebliche Baseline-Implementierung in `platform_controlplane`, `service_health`, `config` und Deploy-Config lesen
   - VM-Checks fuer aktuelle Platform-CP-Defaults und vorhandene Events fahren
   - offene Baseline-Luecken fuer `AC-1`, `AC-4`, `AC-10`, `AC-11`, `AC-12` dokumentieren
   - Issue-Kommentar/Body fuer den echten Stand vorbereiten
@@ -303,7 +315,7 @@
     - `cargo remote -c -- test -p sentinel-daemon -- --nocapture` => Exit `0`; Endzeile `156 passed; 0 failed`
     - `cargo remote -c -- clippy -p sentinel-daemon --all-targets -- -D warnings` => Exit `0`; Endzeile `Finished 'dev' profile [unoptimized + debuginfo] target(s) in 5.71s`
 
-### Task 6 - Operator-API, Dashboard, Cockpit und Playwright-relevante UI-Surfaces erweitern
+### Task 6 - Operator-API, Dashboard, Cockpit und Playwright-stabile UI-Surfaces erweitern
 
 - Scope:
   - Operator-Read/Write-Pfade, Dashboard-Readmodelle, Cockpit-Mappings und stabile UI-Selektoren
@@ -320,6 +332,30 @@
   - AC-1 via Dashboard-Tests
   - AC-2 via Dashboard/Cockpit-Tests und spaetere Screenshots
   - AC-3 via Playwright-Flow und Projection-Service-Konfiguration
+- Pre-task self-check:
+  - Was muss getan werden: Die bestehenden Dashboard-/Cockpit-Pfade muessen erweitert werden, damit Platform-State und Analysen nicht nur im Backend existieren, sondern auch fuer Operator und spaetere Playwright-Abnahme lesbar und steuerbar werden.
+  - Welche ACs muessen hier passen: neue Read-/Write-Endpunkte im Dashboard, sichtbare `platform_analysis`-/`platform_intervention`-Incidents, stabile Selektoren fuer Control/Cockpit.
+  - Wie wird bewiesen: Bun-Route-/UI-Tests lokal; Live-/Screenshot-Evidence folgt in Task 7 auf der VM.
+  - Erwartete Dateien: [control.ts](/work/company/project-sentinel/dashboard/src/routes/control.ts), [db.ts](/work/company/project-sentinel/dashboard/src/db.ts), [types.ts](/work/company/project-sentinel/dashboard/src/types.ts), [cockpit.ts](/work/company/project-sentinel/dashboard/src/routes/cockpit.ts), [control.js](/work/company/project-sentinel/dashboard/public/js/control.js), [cockpit.js](/work/company/project-sentinel/dashboard/public/js/cockpit.js), [control.test.ts](/work/company/project-sentinel/dashboard/src/__tests__/control.test.ts), [cockpit.test.ts](/work/company/project-sentinel/dashboard/src/routes/cockpit.test.ts)
+  - Risiken: Write-Pfade duerfen keinen Parallelpfad zur Operator-API aufmachen; Cockpit darf bestehende Incident-Logik nicht regressieren; VM-Write-Abnahme bleibt ohne `SENTINEL_DASHBOARD_API_KEY` bewusst blockiert.
+- Outcome:
+  - Das Dashboard erweitert jetzt bestehende statt neue Parallelpfade: `GET /api/control/platform-state`, `GET /api/control/platform-analyses` und `POST /api/control/platform-analyze` haengen an den vorhandenen Control-Routen.
+  - `platform_analysis`-Events werden aus dem Event Store strukturiert gelesen und im Control-View mit stabilen Selektoren (`#platform-analyze-btn`, `#platform-analysis-list`, `data-trigger`, `data-severity`, `data-suggested-action`) gerendert.
+  - Der Platform-State wird im Control-View ueber `#platform-state-section`, `#platform-state-table`, `#platform-threshold-overrides` und `data-platform-agent-id` sichtbar.
+  - Das Cockpit behandelt `platform_analysis` und `platform_intervention` jetzt als echte Incident-Typen; die Frontend-Items tragen `data-incident-type`.
+  - Die lokale Testabdeckung umfasst sowohl die neuen Control-Routen als auch Cockpit-Mapping und bleibt ueber den kompletten Dashboard-Testlauf gruen.
+- Evidence:
+  - AC-1 PASS:
+    - [control.ts](/work/company/project-sentinel/dashboard/src/routes/control.ts) fuehrt `GET /control/platform-state`, `GET /control/platform-analyses` und `POST /control/platform-analyze` ein
+    - [db.ts](/work/company/project-sentinel/dashboard/src/db.ts) fuehrt `getRecentPlatformAnalyses()` ein
+    - `cd dashboard && bun test src/__tests__/control.test.ts src/routes/cockpit.test.ts` => Exit `0`; `27 pass`
+  - AC-2 PASS:
+    - [cockpit.ts](/work/company/project-sentinel/dashboard/src/routes/cockpit.ts) mapped `platform_analysis` und `platform_intervention` auf Severity/Summary/Incident-Felder
+    - [control.js](/work/company/project-sentinel/dashboard/public/js/control.js) und [cockpit.js](/work/company/project-sentinel/dashboard/public/js/cockpit.js) rendern die neuen Control-/Cockpit-Surfaces mit stabilen IDs/Data-Attributes
+    - `cd dashboard && bun test` => Exit `0`; `63 pass`
+  - AC-3 PASS fuer den lokalen Build-/Selektor-Teil:
+    - `#platform-analyze-btn`, `#platform-analyses-section`, `#platform-analysis-list`, `#platform-state-section`, `#platform-state-table`, `#platform-threshold-overrides` und `.cockpit-incident-item[data-incident-type=...]` sind jetzt im Frontend verankert
+    - Der produktive `SENTINEL_DASHBOARD_API_KEY`-Pfad bleibt fuer die echte VM-Write-Abnahme absichtlich in Task 7 offen; ohne diesen Key wird `#263` nicht geschlossen
 
 ### Task 7 - Deploy, Benchmarks sowie AC-1 bis AC-12 inkl. UI-Evidence auf der VM verifizieren
 

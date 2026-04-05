@@ -4,7 +4,7 @@
 
 import { Hono } from "hono";
 import { requireAuth } from "../middleware/auth";
-import { resetCaches } from "../db";
+import { getRecentPlatformAnalyses, resetCaches } from "../db";
 import { resetWatermarks, broadcast } from "../ws";
 
 export const controlRoutes = new Hono();
@@ -45,8 +45,13 @@ function getOperatorHeaders(): Record<string, string> {
   return headers;
 }
 
-async function proxyGet(baseUrl: string, path: string): Promise<Response> {
+async function proxyGet(
+  baseUrl: string,
+  path: string,
+  headers: Record<string, string> = {},
+): Promise<Response> {
   const resp = await fetch(`${baseUrl}${path}`, {
+    headers,
     signal: AbortSignal.timeout(PROXY_TIMEOUT_MS),
   });
   const body = await resp.text();
@@ -324,6 +329,54 @@ controlRoutes.get("/control/traffic-stats", async (c) => {
   } catch (err) {
     return c.json(
       { error: "Cortex Gateway nicht erreichbar", detail: String(err) },
+      502,
+    );
+  }
+});
+
+controlRoutes.get("/control/platform-state", async (c) => {
+  try {
+    return await proxyGet(
+      getOperatorApiUrl(),
+      "/operator/platform-state",
+      getOperatorHeaders(),
+    );
+  } catch (err) {
+    return c.json(
+      { error: "Operator-API nicht erreichbar", detail: String(err) },
+      502,
+    );
+  }
+});
+
+controlRoutes.get("/control/platform-analyses", (c) => {
+  try {
+    const limit = Math.min(
+      Math.max(parseInt(c.req.query("limit") || "50", 10) || 50, 1),
+      200,
+    );
+    return c.json(getRecentPlatformAnalyses(limit));
+  } catch (err) {
+    return c.json(
+      { error: "Platform-Analysen nicht verfuegbar", detail: String(err) },
+      500,
+    );
+  }
+});
+
+controlRoutes.post("/control/platform-analyze", async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    return await proxyJson(
+      getOperatorApiUrl(),
+      "POST",
+      "/operator/platform-analyze",
+      body,
+      getOperatorHeaders(),
+    );
+  } catch (err) {
+    return c.json(
+      { error: "Operator-API nicht erreichbar", detail: String(err) },
       502,
     );
   }

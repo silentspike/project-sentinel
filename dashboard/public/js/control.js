@@ -9,6 +9,8 @@ let controlState = {
   config: null,
   health: null,
   trafficStats: null,
+  platformAnalyses: [],
+  platformState: null,
 };
 
 // API-Key aus sessionStorage (User gibt ihn einmal ein)
@@ -31,20 +33,44 @@ async function controlFetch(url, opts = {}) {
 // ── Status laden ──────────────────────────────────
 
 async function loadControlStatus() {
-  try {
-    const [statusResp, trafficResp] = await Promise.all([
-      fetch('/api/control/status'),
-      fetch('/api/control/traffic-stats'),
-    ]);
-    const data = await statusResp.json();
-    const trafficStats = trafficResp.ok ? await trafficResp.json() : null;
-    controlState = { ...data, trafficStats };
-    return data;
-  } catch {
-    controlState.connected = false;
-    controlState.trafficStats = null;
+  async function fetchJsonOrNull(url) {
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) return null;
+      return await resp.json();
+    } catch {
+      return null;
+    }
+  }
+
+  const [statusData, trafficStats, platformAnalyses, platformState] = await Promise.all([
+    fetchJsonOrNull('/api/control/status'),
+    fetchJsonOrNull('/api/control/traffic-stats'),
+    fetchJsonOrNull('/api/control/platform-analyses'),
+    fetchJsonOrNull('/api/control/platform-state'),
+  ]);
+
+  if (!statusData) {
+    controlState = {
+      ...controlState,
+      connected: false,
+      paused: false,
+      config: null,
+      health: null,
+      trafficStats: null,
+      platformAnalyses: Array.isArray(platformAnalyses) ? platformAnalyses : [],
+      platformState,
+    };
     return controlState;
   }
+
+  controlState = {
+    ...statusData,
+    trafficStats,
+    platformAnalyses: Array.isArray(platformAnalyses) ? platformAnalyses : [],
+    platformState,
+  };
+  return controlState;
 }
 
 // ── Sektion 1: Quick Actions ──────────────────────
@@ -487,6 +513,201 @@ function renderLiveConfig(container) {
   container.appendChild(section);
 }
 
+function renderPlatformAnalyses(container) {
+  const section = el('div', 'control-section');
+  section.id = 'platform-analyses-section';
+  section.appendChild(sectionTitle('Platform Analyses'));
+
+  const actionRow = el('div', 'control-row');
+  const info = el('span', 'control-value');
+  info.textContent = 'Manueller Analyse-Trigger fuer Platform-Controlplane';
+  actionRow.appendChild(info);
+
+  const analyzeBtn = el('button', 'control-btn primary');
+  analyzeBtn.id = 'platform-analyze-btn';
+  analyzeBtn.textContent = 'Analyse jetzt ausloesen';
+  analyzeBtn.addEventListener('click', async () => {
+    analyzeBtn.disabled = true;
+    try {
+      const resp = await controlFetch('/api/control/platform-analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({}),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        showFeedback(section, 'Fehler: ' + (err.error || resp.statusText), true);
+      } else {
+        showFeedback(section, 'Platform-Analyse angestossen');
+        await loadControlStatus();
+        renderControl();
+      }
+    } catch (e) {
+      showFeedback(section, 'Verbindungsfehler: ' + e.message, true);
+    } finally {
+      analyzeBtn.disabled = false;
+    }
+  });
+  actionRow.appendChild(analyzeBtn);
+  section.appendChild(actionRow);
+
+  const list = el('div', 'control-list');
+  list.id = 'platform-analysis-list';
+  const analyses = Array.isArray(controlState.platformAnalyses)
+    ? controlState.platformAnalyses
+    : [];
+
+  if (analyses.length === 0) {
+    list.appendChild(noDataMsg('Noch keine Platform-Analysen im Event Store'));
+  } else {
+    for (const analysis of analyses) {
+      const item = el('div', 'control-section compact');
+      item.className = 'control-section compact platform-analysis-item';
+      item.setAttribute('data-trigger', analysis.trigger || '');
+      item.setAttribute('data-severity', analysis.severity || '');
+      item.setAttribute('data-suggested-action', analysis.suggested_action || '');
+
+      const header = el('div', 'control-row');
+      const summary = el('strong', 'control-value');
+      summary.textContent = analysis.summary || '(ohne Summary)';
+      header.appendChild(summary);
+      const severity = el('span', 'control-value');
+      severity.textContent = String(analysis.severity || 'info').toUpperCase();
+      header.appendChild(severity);
+      item.appendChild(header);
+
+      const meta = [
+        ['Trigger', analysis.trigger || '--'],
+        ['Target', analysis.target || analysis.aggregate_id || '--'],
+        ['Suggested Action', analysis.suggested_action || '--'],
+        ['Provider', analysis.provider || '--'],
+        ['Model', analysis.model || '--'],
+        ['Tick', analysis.tick],
+      ];
+      for (const [label, value] of meta) {
+        const row = el('div', 'control-row compact');
+        row.appendChild(labelEl(label + ':'));
+        const val = el('span', 'control-value mono');
+        val.textContent = String(value);
+        row.appendChild(val);
+        item.appendChild(row);
+      }
+
+      const recommendation = el('div', 'control-value');
+      recommendation.textContent = analysis.recommendation || 'Keine Empfehlung';
+      item.appendChild(recommendation);
+
+      if (Array.isArray(analysis.unresolved_keys) && analysis.unresolved_keys.length > 0) {
+        const unresolved = el('div', 'control-value mono');
+        unresolved.textContent = 'Unresolved: ' + analysis.unresolved_keys.join(', ');
+        item.appendChild(unresolved);
+      }
+
+      list.appendChild(item);
+    }
+  }
+
+  section.appendChild(list);
+  container.appendChild(section);
+}
+
+function renderPlatformState(container) {
+  const section = el('div', 'control-section');
+  section.id = 'platform-state-section';
+  section.appendChild(sectionTitle('Platform State'));
+
+  const state = controlState.platformState;
+  if (!state) {
+    section.appendChild(noDataMsg('Platform-State derzeit nicht verfuegbar'));
+    container.appendChild(section);
+    return;
+  }
+
+  const summaryRows = [
+    ['Current Tick', state.current_tick],
+    ['LLM Enabled', state.llm_enabled ? 'Ja' : 'Nein'],
+    ['Analysis Interval', state.llm_analysis_interval_secs + 's'],
+    ['Retry Delay', state.llm_retry_delay_secs + 's'],
+    ['Last Analysis Tick', state.last_analysis_tick ?? '--'],
+    ['Last Analysis Trigger', state.last_analysis_trigger ?? '--'],
+    ['Last Scheduled Analysis', state.last_scheduled_analysis_tick ?? '--'],
+    ['Stall Grace Ticks', state.stall_recent_activity_grace_ticks ?? '--'],
+  ];
+  for (const [label, value] of summaryRows) {
+    const row = el('div', 'control-row compact');
+    row.appendChild(labelEl(label + ':'));
+    const val = el('span', 'control-value mono');
+    val.textContent = String(value);
+    row.appendChild(val);
+    section.appendChild(row);
+  }
+
+  const unresolvedTitle = el('div', 'control-subtitle');
+  unresolvedTitle.textContent = 'Unresolved Counters';
+  section.appendChild(unresolvedTitle);
+  const unresolvedBox = el('div', 'control-json');
+  unresolvedBox.textContent = JSON.stringify(state.unresolved_counts || {}, null, 2);
+  unresolvedBox.id = 'platform-unresolved-counts';
+  section.appendChild(unresolvedBox);
+
+  const overrideTitle = el('div', 'control-subtitle');
+  overrideTitle.textContent = 'Threshold Overrides';
+  section.appendChild(overrideTitle);
+  const overrideBox = el('pre', 'control-json');
+  overrideBox.id = 'platform-threshold-overrides';
+  overrideBox.textContent = JSON.stringify(state.threshold_overrides || {}, null, 2);
+  section.appendChild(overrideBox);
+
+  const tableTitle = el('div', 'control-subtitle');
+  tableTitle.textContent = 'Agent Runtime State';
+  section.appendChild(tableTitle);
+
+  const table = document.createElement('table');
+  table.id = 'platform-state-table';
+  table.className = 'snapshot-table';
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  ['Agent', 'Aggregate', 'Profile', 'Last Activity Tick', 'cgroup'].forEach((text) => {
+    const th = document.createElement('th');
+    th.textContent = text;
+    headRow.appendChild(th);
+  });
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  for (const agent of state.agents || []) {
+    const row = document.createElement('tr');
+    row.setAttribute('data-platform-agent-id', String(agent.aggregate_id || agent.agent_id));
+
+    const nameCell = document.createElement('td');
+    nameCell.textContent = agent.name || '--';
+    row.appendChild(nameCell);
+
+    const aggCell = document.createElement('td');
+    aggCell.textContent = agent.aggregate_id || '--';
+    row.appendChild(aggCell);
+
+    const profileCell = document.createElement('td');
+    profileCell.textContent = agent.current_profile || '--';
+    row.appendChild(profileCell);
+
+    const activityCell = document.createElement('td');
+    activityCell.textContent = String(agent.last_activity_tick ?? '--');
+    row.appendChild(activityCell);
+
+    const cgroupCell = document.createElement('td');
+    cgroupCell.textContent = agent.cgroup_path || '--';
+    row.appendChild(cgroupCell);
+
+    tbody.appendChild(row);
+  }
+  table.appendChild(tbody);
+  section.appendChild(table);
+
+  container.appendChild(section);
+}
+
 // ── API Key Eingabe ───────────────────────────────
 
 function renderApiKeySection(container) {
@@ -547,9 +768,9 @@ function labelEl(text) {
   return l;
 }
 
-function noDataMsg() {
+function noDataMsg(text = 'Gateway nicht verbunden') {
   const d = el('div', 'control-no-data');
-  d.textContent = 'Gateway nicht verbunden';
+  d.textContent = text;
   return d;
 }
 
@@ -595,6 +816,8 @@ function renderControl() {
   renderPipelineHardening(container);
   renderGuardrailsStatus(container);
   renderTrafficControl(container);
+  renderPlatformAnalyses(container);
+  renderPlatformState(container);
   renderLiveConfig(container);
   renderSnapshotSection(container);
 }
