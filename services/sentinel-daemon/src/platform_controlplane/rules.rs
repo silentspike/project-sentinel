@@ -26,6 +26,8 @@ pub enum PlatformSideEffect {
     ForceIdleProfile(AgentId),
     /// Agent-Sandbox teardown + Despawn (Stall-Recovery, Respawn bei naechstem Shift-Check).
     RestartAgent(AgentId),
+    /// Systemd-Service direkt neu starten.
+    RestartService(String),
 }
 
 /// Evaluiert alle Regeln gegen die aktuellen Metriken.
@@ -47,7 +49,9 @@ pub fn evaluate_rules(
     for agent_name in &metrics.stalled_agents {
         // Agent hat kuerzlich eine Action ausgefuehrt → nicht stalled
         if let Some(&last_tick) = metrics.last_action_ticks.get(agent_name) {
-            if tick.saturating_sub(last_tick) < config.stall_recent_activity_grace_ticks {
+            if tick >= last_tick
+                && tick.saturating_sub(last_tick) < config.stall_recent_activity_grace_ticks
+            {
                 continue;
             }
         }
@@ -92,12 +96,14 @@ pub fn evaluate_rules(
             actions.push(PlatformAction {
                 rule_name: "projection_lag".to_string(),
                 target: "system".to_string(),
-                action_label: "alert".to_string(),
+                action_label: "restart_triggered".to_string(),
                 description: format!(
-                    "Projection Lag {} > {} Schwellwert",
+                    "Projection Lag {} > {} Schwellwert — Restart von sentinel-projection getriggert",
                     metrics.projection_lag, config.max_projection_lag
                 ),
-                side_effect: None,
+                side_effect: Some(PlatformSideEffect::RestartService(
+                    "sentinel-projection".to_string(),
+                )),
             });
         }
     }
@@ -155,11 +161,9 @@ pub fn evaluate_rules(
         actions.push(PlatformAction {
             rule_name: "service_health".to_string(),
             target: service_name.clone(),
-            action_label: "alert".to_string(),
-            description: format!(
-                "Service {service_name} ist nicht active — Restart wurde vom Health-Checker getriggert"
-            ),
-            side_effect: None, // Restart passiert im ServiceHealthChecker Thread
+            action_label: "restart_triggered".to_string(),
+            description: format!("Service {service_name} ist nicht active — Restart getriggert"),
+            side_effect: Some(PlatformSideEffect::RestartService(service_name.clone())),
         });
     }
 
@@ -236,6 +240,28 @@ mod tests {
     }
 
     #[test]
+    fn test_stall_rule_does_not_skip_when_activity_tick_is_from_older_epoch() {
+        let metrics = PlatformMetrics {
+            stalled_agents: vec!["Thomas Mueller".to_string()],
+            last_action_ticks: HashMap::from([("Thomas Mueller".to_string(), 70140)]),
+            ..Default::default()
+        };
+        let config = PlatformControlplaneConfig {
+            cycle_interval_ticks: 1,
+            stall_recent_activity_grace_ticks: 10,
+            ..test_config()
+        };
+
+        let actions = evaluate_rules(&metrics, &HashMap::new(), 37, &config, &HashMap::new());
+        assert_eq!(
+            actions.len(),
+            1,
+            "stalled agents must not stay protected when current_tick is from a newer runtime epoch"
+        );
+        assert_eq!(actions[0].rule_name, "agent_stall");
+    }
+
+    #[test]
     fn test_stall_rule_cooldown_prevents_repeat() {
         let metrics = PlatformMetrics {
             stalled_agents: vec!["Thomas Mueller".to_string()],
@@ -282,6 +308,11 @@ mod tests {
         );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "projection_lag");
+        assert_eq!(actions[0].action_label, "restart_triggered");
+        assert!(matches!(
+            &actions[0].side_effect,
+            Some(PlatformSideEffect::RestartService(service)) if service == "sentinel-projection"
+        ));
     }
 
     #[test]
@@ -368,7 +399,11 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "service_health");
         assert_eq!(actions[0].target, "sentinel-judge");
-        assert!(actions[0].side_effect.is_none()); // Restart passiert im Thread
+        assert_eq!(actions[0].action_label, "restart_triggered");
+        assert!(matches!(
+            &actions[0].side_effect,
+            Some(PlatformSideEffect::RestartService(service)) if service == "sentinel-judge"
+        ));
     }
 
     #[test]

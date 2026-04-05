@@ -4242,6 +4242,7 @@ dependencies = [
  "bincode",
  "chrono",
  "clap",
+ "criterion 0.8.2",
  "futures",
  "redb",
  "reqwest",

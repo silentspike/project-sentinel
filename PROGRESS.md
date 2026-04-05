@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan263.md`
-- Overall status: `IN_PROGRESS`
-- Current task: `Task 7 - Deploy, Benchmarks sowie AC-1 bis AC-12 inkl. UI-Evidence auf der VM verifizieren`
+- Overall status: `BLOCKED`
+- Current task: `Task 7 - Restliche Live-LLM-Evidence fuer AC-6/AC-7 ist durch claude-code-Quota blockiert; Deploy-, UI- und Benchmark-Evidence liegt vor`
 - Current branch: `feat/issue-263-platform-controlplane-completion`
 - Hook status: `PreToolUse TaskUpdate + PostToolUse start-enforcer projektlokal registriert`
 - Last refresh: `2026-04-05 Europe/Vienna`
@@ -27,6 +27,28 @@
   - `agent_stall` ueberspringt weiter alles mit `tick - last_action_tick < 120`
   - `projection_lag` feuert derzeit nur `alert`, keinen Restart
   - `ResourceManager::force_profile()` aendert nur den In-Memory-Zustand, ohne cgroup-Apply und ohne Audit-Event in diesem Pfad
+- Task-7-Deploy-/Runtime-Stand auf `10.0.0.240`:
+  - `sentinel-daemon` und `agent-runtime` wurden aus den aktuellen Remote-Release-Artefakten deployt und `sentinel-daemon` neu gestartet
+  - Dashboard-Dateien wurden nach `/opt/sentinel/dashboard` deployed; `sentinel-dashboard` laeuft danach wieder `active`
+  - `sentinel-projection` musste nach dem Daemon-Restart einmal manuell neu gestartet werden und ist seitdem wieder `active`
+  - `GET /operator/platform-state` liefert jetzt einen echten Platform-State-Snapshot; `GET /api/control/platform-state` und `GET /api/control/platform-analyses` liefern auf dem Dashboard-Pfad verwertbare Daten
+  - `SENTINEL_DASHBOARD_API_KEY` sitzt produktiv auf `sentinel-dashboard`, nicht auf `sentinel-projection`
+- Task-7-UI-/Read-Surfaces sind live verifiziert:
+  - [control.js](/work/company/project-sentinel/dashboard/public/js/control.js) und die neuen Dashboard-Routen laufen live; `GET /api/control/platform-analyses` liefert aktuell `5` Eintraege, neuester Trigger `operator_test`
+  - Playwright-Evidence liegt unter `/tmp/pcp263-control-baseline.png`, `/tmp/pcp263-control-analysis.png` und `/tmp/pcp263-cockpit-platform.png`
+- Task-7-Benchmark-/Stabilitaetsstand:
+  - `platform_cp.rule_evaluation`: `time: [5.7886 us 5.8963 us 6.0170 us]`
+  - `platform_cp.metrics_collection_15_agents`: `time: [1.2518 ms 1.2623 ms 1.2740 ms]`
+  - `platform_cp.tick_overhead_without_cp`: `time: [485.95 ns 486.04 ns 486.15 ns]` auf dem korrigierten `1000`-Tick-Harness
+  - `platform_cp.tick_overhead_with_cp`: `time: [217.30 ms 243.71 ms 274.69 ms]` auf demselben `1000`-Tick-Harness, also ca. `0.217-0.275 ms` Overhead pro Tick bzw. rund `0.022-0.027 %` des `1 Hz`-Tick-Budgets
+  - VM-Memory-Overhead-Messung fuer wiederholte Analyse-Trigger: `delta_kb=-320`
+  - Sidecar-Systemmetriken fuer die Tick-Benchmarks liegen unter `/tmp/pcp263-bench-tick/{without_cp,with_cp}/{bench,cpu,free,iostat,net,vmstat}.txt`
+  - Live-Metrik bleibt bei `sentinel_tick_duration_ms 1000`; im letzten Stunde-Fenster gab es keine `panic`- oder `drift`-Treffer
+- Offener harter Blocker fuer `#263`:
+  - `curl -s http://127.0.0.1:8080/health` liefert aktuell `{\"status\":\"ok\",\"version\":\"0.1.0\",\"circuit_breakers\":{\"claude-code\":\"open\"},\"guardrails_enabled\":false}`
+  - Gateway-Journal zeigt wiederholt `HTTP 429: claude-code result error: You've hit your limit · resets Apr 10, 6am (UTC)` sowie `provider circuit-broken`
+  - Daemon-Journal zeigt korrespondierend `sentinel_daemon::platform_controlplane::llm_analyzer`-/Bridge-Fehler mit `status=429/503`
+  - Damit sind die echte Live-Analyse fuer `AC-6`/`AC-7` und der LLM-Latenz-Benchmark aktuell betriebsseitig blockiert; der Issue-Stand ist deshalb nicht close-ready
 - Task-2-Schemaarbeit ist lokal umgesetzt:
   - [events.rs](/work/company/project-sentinel/crates/sentinel-common/src/events.rs) enthaelt jetzt `PlatformAnalysis` inklusive `trigger`, `severity`, `summary`, `recommendation`, `suggested_action`, `target`, `provider`, `model`, `unresolved_keys` und `parameters`
   - [config.rs](/work/company/project-sentinel/services/sentinel-daemon/src/config.rs) und [daemon.toml](/work/company/project-sentinel/config/daemon.toml) tragen jetzt die benoetigten Platform-CP-Felder fuer Grace-, LLM-, Retry- und Timeout-Steuerung
@@ -96,7 +118,7 @@
 | 4 | Eskalationslogik, unresolved counters und deterministische Trigger vervollstaendigen | DONE | scheduled/manual/unresolved Trigger, Counter-State und Test-Hooks fuer `AC-6` vervollstaendigen | inspect, command, system |
 | 5 | Suggested-Action-Executor mit force_profile / adjust_threshold / escalate_to_operator implementieren | DONE | guard-railed Executor inkl. cgroup-Apply, Audit-Trail und Runtime-Overrides bauen | inspect, command, system |
 | 6 | Operator-API, Dashboard, Cockpit und Playwright-stabile UI-Surfaces erweitern | DONE | API-Read/Write-Pfade, Dashboard/Cockpit-Rendering, stabile Selektoren und lokale Testabdeckung ergaenzen | inspect, command, browser |
-| 7 | Deploy, Benchmarks sowie AC-1 bis AC-12 inkl. UI-Evidence auf der VM verifizieren | IN_PROGRESS | Release-Build, Deploy, systemd-Restarts, AC-Matrix, Playwright-Screenshots und Benchmarks mit Systemmetriken abarbeiten | command, system, browser |
+| 7 | Deploy, Benchmarks sowie AC-1 bis AC-12 inkl. UI-Evidence auf der VM verifizieren | BLOCKED | Release-Build, Deploy, systemd-Restarts, AC-Matrix, Playwright-Screenshots und Benchmarks mit Systemmetriken abarbeiten; nur die echte Live-LLM-Analyse bleibt durch Provider-Quota offen | command, system, browser |
 | 8 | Plan-Verifikation | PENDING | Gesamtergebnis Zeile fuer Zeile gegen den Plan pruefen, Restluecken sofort fixen oder als Blocker dokumentieren | inspect, command, system, browser |
 
 ## Task details
@@ -375,6 +397,35 @@
   - AC-1 via vollstaendige VM-AC-Matrix
   - AC-2 via Bench-Commands und Systemmetriken
   - AC-3 via Journal und Stabilitaetschecks
+- Outcome:
+  - Remote-Release-Artefakte fuer `sentinel-daemon` und `agent-runtime` wurden deployt; Dashboard-Assets fuer Control/Cockpit laufen live auf der VM.
+  - Die UI-Read-/Write-Surfaces fuer `#263` sind ueber Dashboard und Playwright sichtbar und dokumentiert.
+  - Alle nicht-LLM-abhaengigen ACs sowie die deterministischen Operator-/UI-/State-Pfade sind auf der VM belegt.
+  - Die korrigierten Tick-Benchmarks sind auf der VM mit Sidecar-Systemmetriken neu gelaufen und jetzt wieder vergleichbar.
+  - Ein echter betrieblicher Blocker bleibt: `claude-code` ist aktuell im Quota-Limit, der Circuit-Breaker steht `open`, und frische Live-`platform_analysis`-Events ueber den echten LLM-Pfad lassen sich derzeit nicht erzeugen.
+- Evidence:
+  - Deploy PASS:
+    - `cargo remote -c -- build -p sentinel-daemon --release` und der bereits gruen gelaufene `agent-runtime`-Release-Stand wurden nach `10.0.0.240` deployed
+    - `ssh ubuntu@10.0.0.240 "curl -sf http://127.0.0.1:8084/operator/platform-state"` liefert einen echten Snapshot statt `Endpoint unbekannt`
+    - `ssh ubuntu@10.0.0.240 "curl -sf http://127.0.0.1:8000/api/control/platform-state"` und `.../platform-analyses` liefern Dashboard-Daten; letzter Analyse-Trigger ist aktuell `operator_test`
+  - UI PASS:
+    - produktiver Dashboard-Key wurde aus `sentinel-dashboard.service` gelesen, nicht aus `sentinel-projection`
+    - Playwright-Screenshots: `/tmp/pcp263-control-baseline.png`, `/tmp/pcp263-control-analysis.png`, `/tmp/pcp263-cockpit-platform.png`
+  - Bench PASS/Teil-PASS:
+    - `platform_cp.rule_evaluation`: `[5.7886 us 5.8963 us 6.0170 us]` `< 1 ms`
+    - `platform_cp.metrics_collection_15_agents`: `[1.2518 ms 1.2623 ms 1.2740 ms]` `< 5 ms`
+    - `platform_cp.tick_overhead_without_cp`: `[485.95 ns 486.04 ns 486.15 ns]`
+    - `platform_cp.tick_overhead_with_cp`: `[217.30 ms 243.71 ms 274.69 ms]` ueber `1000` Ticks, also ca. `0.217-0.275 ms` pro Tick und damit deutlich unter dem `< 2 %`-Budget relativ zur `1 Hz`-Tickdauer
+    - `Memory-Overhead`: `delta_kb=-320`, damit innerhalb des `< 10 MB`-Budgets
+    - Sidecar-Systemmetriken: `/tmp/pcp263-bench-tick/with_cp/*` und `/tmp/pcp263-bench-tick/without_cp/*`
+    - LLM-Analyse-Latenz ist aktuell BLOCKED, weil der echte LLM-Pfad durch `claude-code`-Quota kein frisches `platform_analysis` erzeugt
+  - Stability PASS:
+    - `ssh ubuntu@10.0.0.240 "curl -sf http://127.0.0.1:9090/metrics | grep '^sentinel_tick_duration_ms '"` => `sentinel_tick_duration_ms 1000`
+    - `ssh ubuntu@10.0.0.240 "journalctl -u sentinel-daemon --since '1 hour ago' --no-pager | grep -Ei 'panic|drift' || true"` => kein Treffer
+  - Blocker:
+    - `ssh ubuntu@10.0.0.240 "curl -s http://127.0.0.1:8080/health"` => `claude-code:\"open\"`
+    - Gateway-Logs zeigen `HTTP 429 ... You've hit your limit · resets Apr 10, 6am (UTC)` und `provider circuit-broken`
+    - Daemon-Logs zeigen korrespondierende Gateway-Fehler `status=429/503`
 
 ### Task 8 - Plan-Verifikation
 

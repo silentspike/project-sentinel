@@ -1,6 +1,6 @@
 //! Platform-Metriken Snapshot (Observe-Phase).
 
-use sentinel_sandbox::cgroup_path;
+use std::path::Path;
 
 /// Snapshot aller platform-relevanten Metriken fuer einen Zyklus.
 #[derive(Debug, Clone, Default)]
@@ -43,6 +43,29 @@ pub fn collect(
     tick: u64,
     failed_services: Vec<String>,
 ) -> PlatformMetrics {
+    collect_with_cgroup_root(
+        collector,
+        last_ebpf_snapshot,
+        event_store,
+        events_db_path,
+        agent_names,
+        tick,
+        failed_services,
+        Path::new("/sys/fs/cgroup/sentinel"),
+    )
+}
+
+/// Deterministische Variante fuer Tests und Benchmarks mit injizierbarem cgroup-Root.
+pub fn collect_with_cgroup_root(
+    collector: &mut PlatformMetricsCollector,
+    last_ebpf_snapshot: &Option<sentinel_ebpf::collector::MetricsSnapshot>,
+    event_store: &sentinel_limbo::EventStore,
+    events_db_path: &str,
+    agent_names: &[String],
+    tick: u64,
+    failed_services: Vec<String>,
+    cgroup_root: &Path,
+) -> PlatformMetrics {
     let mut metrics = PlatformMetrics {
         tick,
         failed_services,
@@ -74,9 +97,9 @@ pub fn collect(
 
     // 4. cgroup Memory Pressure pro Agent
     for name in agent_names {
-        let path = cgroup_path(name);
-        let current = read_cgroup_u64(&format!("{path}/memory.current"));
-        let max = read_cgroup_u64(&format!("{path}/memory.max"));
+        let path = cgroup_root.join(name);
+        let current = read_cgroup_u64(&path.join("memory.current"));
+        let max = read_cgroup_u64(&path.join("memory.max"));
         if max > 0 {
             metrics
                 .agent_memory_pressure
@@ -113,7 +136,7 @@ pub fn collect(
     metrics
 }
 
-fn read_cgroup_u64(path: &str) -> u64 {
+fn read_cgroup_u64(path: &Path) -> u64 {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse().ok())
