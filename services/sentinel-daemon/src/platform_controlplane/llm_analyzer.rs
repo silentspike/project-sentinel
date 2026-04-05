@@ -5,6 +5,7 @@
 //! `POST /internal/llm`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,12 +13,15 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sentinel_common::{DomainEvent, DomainEventPayload};
+use sentinel_common::DomainEventPayload;
 use sentinel_limbo::EventStore;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-use super::{metrics::PlatformMetrics, PlatformAnalysisRequest};
+use super::{
+    metrics::PlatformMetrics, PlatformAnalysisCommand, PlatformAnalysisRequest,
+    PlatformControlCommand,
+};
 use crate::config::PlatformControlplaneConfig;
 
 const DEFAULT_GATEWAY_URL: &str = "http://localhost:8080";
@@ -73,7 +77,11 @@ impl PlatformLlmAnalyzerHandle {
         Self { tx: None }
     }
 
-    pub fn spawn(config: LlmAnalyzerConfig, event_store: Arc<EventStore>) -> Self {
+    pub fn spawn(
+        config: LlmAnalyzerConfig,
+        event_store: Arc<EventStore>,
+        platform_tx: std_mpsc::Sender<PlatformControlCommand>,
+    ) -> Self {
         if !config.enabled {
             info!("Platform LLM Analyzer deaktiviert");
             return Self::disabled();
@@ -99,7 +107,7 @@ impl PlatformLlmAnalyzerHandle {
 
             while let Some(request) = rx.recv().await {
                 if let Err(error) =
-                    analyze_and_persist(&client, &worker_config, &event_store, request).await
+                    analyze_and_dispatch(&client, &worker_config, &event_store, &platform_tx, request).await
                 {
                     warn!(error = %error, "Platform LLM Analyzer fehlgeschlagen");
                 }
@@ -173,10 +181,11 @@ struct PromptContext {
     failed_interventions: Vec<Value>,
 }
 
-async fn analyze_and_persist(
+async fn analyze_and_dispatch(
     client: &Client,
     config: &LlmAnalyzerConfig,
     event_store: &EventStore,
+    platform_tx: &std_mpsc::Sender<PlatformControlCommand>,
     request: PlatformAnalysisRequest,
 ) -> Result<()> {
     let recent_interventions =
@@ -226,15 +235,15 @@ async fn analyze_and_persist(
         .json()
         .await
         .context("gateway response decode failed")?;
-    let analysis = parse_analyzer_response(&gateway_response.content)?;
-    persist_platform_analysis(
-        event_store,
-        request.tick,
+    let analysis = build_platform_analysis_command(
+        parse_analyzer_response(&gateway_response.content)?,
         &request.trigger,
         unresolved_keys,
         &gateway_response,
-        analysis,
-    )?;
+    );
+    platform_tx
+        .send(PlatformControlCommand::ApplyAnalysis(analysis))
+        .map_err(|_| anyhow!("platform control channel unavailable"))?;
     Ok(())
 }
 
@@ -312,50 +321,24 @@ fn extract_json_object(content: &str) -> Result<&str> {
         .context("analyzer response json slice invalid")
 }
 
-fn persist_platform_analysis(
-    event_store: &EventStore,
-    tick: u64,
+fn build_platform_analysis_command(
+    analysis: AnalyzerResponse,
     trigger: &str,
     unresolved_keys: Vec<String>,
     gateway_response: &GatewayResponse,
-    analysis: AnalyzerResponse,
-) -> Result<()> {
-    let target = if analysis.target.trim().is_empty() {
-        "system".to_string()
-    } else {
-        analysis.target.clone()
-    };
-
-    let payload = DomainEventPayload::PlatformAnalysis {
+) -> PlatformAnalysisCommand {
+    PlatformAnalysisCommand {
         trigger: trigger.to_string(),
         severity: analysis.severity,
         summary: analysis.summary,
         recommendation: analysis.recommendation,
         suggested_action: analysis.suggested_action,
-        target: target.clone(),
+        target: analysis.target,
         provider: (!gateway_response.provider.is_empty()).then(|| gateway_response.provider.clone()),
         model: (!gateway_response.model.is_empty()).then(|| gateway_response.model.clone()),
         unresolved_keys,
         parameters: analysis.parameters,
-    };
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let op_id = format!("platform-analysis-{trigger}-{tick}-{ts}");
-    let event = DomainEvent::new(
-        payload.event_type_str(),
-        &target,
-        &payload.to_json(),
-        &op_id,
-        tick,
-    );
-    let topic = format!("sentinel/events/platform_analysis/{target}");
-    event_store
-        .append_with_outbox(&event, &topic)
-        .context("persist platform_analysis")?;
-    debug!(trigger, target, "platform_analysis event persisted");
-    Ok(())
+    }
 }
 
 fn load_recent_platform_interventions(
@@ -532,7 +515,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn analyzer_persists_platform_analysis_event() {
+    async fn analyzer_dispatches_platform_analysis_command() {
         let (_dir, store) = temp_store();
         let body = json!({
             "content": "{\"severity\":\"critical\",\"summary\":\"Projection stuck\",\"recommendation\":\"Restart projection worker\",\"suggested_action\":\"escalate_to_operator\",\"target\":\"system\",\"parameters\":{\"lag\":123}}",
@@ -541,24 +524,20 @@ mod tests {
         })
         .to_string();
         let (gateway_url, captured) = spawn_gateway(200, body, Duration::ZERO).await;
+        let (tx, rx) = std_mpsc::channel();
 
         let config = LlmAnalyzerConfig {
             gateway_url,
             request_timeout: Duration::from_secs(2),
             ..LlmAnalyzerConfig::default()
         };
-        analyze_and_persist(&Client::new(), &config, &store, request("manual"))
+        analyze_and_dispatch(&Client::new(), &config, &store, &tx, request("manual"))
             .await
             .unwrap();
 
-        let events = store.get_events_since(0, 10).unwrap();
-        let event = events
-            .iter()
-            .find(|event| event.event_type == "platform_analysis")
-            .expect("platform_analysis event");
-        let payload: DomainEventPayload = serde_json::from_str(&event.payload).unwrap();
-        match payload {
-            DomainEventPayload::PlatformAnalysis {
+        let command = rx.recv().expect("platform analysis command");
+        match command {
+            PlatformControlCommand::ApplyAnalysis(PlatformAnalysisCommand {
                 trigger,
                 severity,
                 summary,
@@ -569,7 +548,7 @@ mod tests {
                 model,
                 unresolved_keys,
                 parameters,
-            } => {
+            }) => {
                 assert_eq!(trigger, "manual");
                 assert_eq!(severity, "critical");
                 assert_eq!(summary, "Projection stuck");
@@ -600,6 +579,7 @@ mod tests {
             Duration::from_millis(150),
         )
         .await;
+        let (tx, _rx) = std_mpsc::channel();
         let config = LlmAnalyzerConfig {
             gateway_url,
             request_timeout: Duration::from_millis(25),
@@ -610,7 +590,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let error = analyze_and_persist(&client, &config, &store, request("scheduled"))
+        let error = analyze_and_dispatch(&client, &config, &store, &tx, request("scheduled"))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("gateway request failed"));
@@ -628,6 +608,7 @@ mod tests {
         })
         .to_string();
         let (gateway_url, _) = spawn_gateway(200, body, Duration::ZERO).await;
+        let (tx, rx) = std_mpsc::channel();
         let handle = PlatformLlmAnalyzerHandle::spawn(
             LlmAnalyzerConfig {
                 gateway_url,
@@ -635,11 +616,17 @@ mod tests {
                 ..LlmAnalyzerConfig::default()
             },
             Arc::clone(&store),
+            tx,
         );
 
         handle.enqueue(request("scheduled")).unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let events = store.get_events_since(0, 10).unwrap();
-        assert!(events.iter().any(|event| event.event_type == "platform_analysis"));
+        let command = tokio::task::spawn_blocking(move || rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            command,
+            PlatformControlCommand::ApplyAnalysis(PlatformAnalysisCommand { .. })
+        ));
     }
 }

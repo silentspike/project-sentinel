@@ -23,7 +23,8 @@ use sentinel_common::{
 
 use crate::config::OperatorApiConfig;
 use crate::platform_controlplane::{
-    PlatformControlCommand, PlatformStateSnapshot, PlatformTriggerTestCommand,
+    PlatformAnalysisCommand, PlatformControlCommand, PlatformStateSnapshot,
+    PlatformTriggerTestCommand,
 };
 
 const OPERATOR_CHAOS_PATH: &str = "/operator/chaos";
@@ -38,6 +39,7 @@ const OPERATOR_GAIA_PATH: &str = "/operator/gaia";
 const OPERATOR_BROADCAST_PATH: &str = "/operator/broadcast";
 const OPERATOR_PLATFORM_ANALYZE_PATH: &str = "/operator/platform-analyze";
 const OPERATOR_PLATFORM_TRIGGER_TEST_PATH: &str = "/operator/platform-trigger-test";
+const OPERATOR_PLATFORM_ANALYSIS_TEST_PATH: &str = "/operator/platform-analysis-test";
 const OPERATOR_PLATFORM_STATE_PATH: &str = "/operator/platform-state";
 const OPERATOR_APICP_SNAPSHOT_PATH: &str = "/operator/apicp/snapshot";
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
@@ -480,6 +482,18 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Err(err) => err.to_response(),
             }
         }
+        OPERATOR_PLATFORM_ANALYSIS_TEST_PATH => {
+            let payload: PlatformAnalysisCommand = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                }
+            };
+            match dispatch_platform_analysis_test(payload, state) {
+                Ok(response) => json_response(202, response),
+                Err(err) => err.to_response(),
+            }
+        }
         OPERATOR_APICP_SNAPSHOT_PATH => {
             let payload: ApiCpSnapshot = match serde_json::from_slice(&request.body) {
                 Ok(p) => p,
@@ -697,6 +711,88 @@ fn dispatch_platform_trigger_test(
     Ok(TriggerNightrunResponse {
         accepted: true,
         message: format!("Platform-Testtrigger {trigger} eingeplant"),
+    })
+}
+
+fn dispatch_platform_analysis_test(
+    mut payload: PlatformAnalysisCommand,
+    state: &AppState,
+) -> std::result::Result<TriggerNightrunResponse, ApiError> {
+    payload.trigger = payload.trigger.trim().to_string();
+    payload.severity = payload.severity.trim().to_string();
+    payload.summary = payload.summary.trim().to_string();
+    payload.recommendation = payload.recommendation.trim().to_string();
+    payload.target = payload.normalized_target();
+    payload.suggested_action = payload
+        .suggested_action
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if payload.trigger.is_empty() {
+        return Err(ApiError::BadRequest("trigger fehlt"));
+    }
+    if payload.severity.is_empty() {
+        return Err(ApiError::BadRequest("severity fehlt"));
+    }
+    if payload.summary.is_empty() {
+        return Err(ApiError::BadRequest("summary fehlt"));
+    }
+    if payload.recommendation.is_empty() {
+        return Err(ApiError::BadRequest("recommendation fehlt"));
+    }
+
+    if let Some(action) = payload.suggested_action.as_deref() {
+        match action {
+            "force_profile" => {
+                if payload.target == "system" {
+                    return Err(ApiError::BadRequest(
+                        "force_profile braucht einen Agent-Target",
+                    ));
+                }
+                let profile = payload
+                    .parameters
+                    .get("profile")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_ascii_lowercase())
+                    .ok_or(ApiError::BadRequest("force_profile braucht parameters.profile"))?;
+                if !matches!(profile.as_str(), "idle" | "normal" | "heavy" | "suspended") {
+                    return Err(ApiError::BadRequest("parameters.profile ungueltig"));
+                }
+            }
+            "adjust_threshold" => {
+                let key = payload
+                    .parameters
+                    .get("key")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or(ApiError::BadRequest("adjust_threshold braucht parameters.key"))?;
+                if !payload.parameters.contains_key("value") {
+                    return Err(ApiError::BadRequest(
+                        "adjust_threshold braucht parameters.value",
+                    ));
+                }
+                let _ = key;
+            }
+            "escalate_to_operator" => {}
+            _ => {
+                return Err(ApiError::BadRequest(
+                    "suggested_action muss force_profile, adjust_threshold oder escalate_to_operator sein",
+                ));
+            }
+        }
+    }
+
+    state
+        .platform_tx
+        .send(PlatformControlCommand::ApplyAnalysis(payload))
+        .map_err(|_| ApiError::ServiceUnavailable("Platform-Channel nicht verfuegbar"))?;
+
+    Ok(TriggerNightrunResponse {
+        accepted: true,
+        message: "Platform-Analyse-Test eingeplant".to_string(),
     })
 }
 
@@ -1123,6 +1219,68 @@ mod tests {
                 count: Some(3),
             })
         );
+    }
+
+    #[test]
+    fn platform_analysis_test_is_forwarded() {
+        let (state, _rx, platform_rx) = test_state(None);
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_PLATFORM_ANALYSIS_TEST_PATH,
+                serde_json::json!({
+                    "trigger": "operator_test",
+                    "severity": "warning",
+                    "summary": "force idle",
+                    "recommendation": "apply idle profile",
+                    "suggested_action": "force_profile",
+                    "target": "AGENT-07",
+                    "parameters": { "profile": "Idle" }
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 202);
+        assert_eq!(
+            platform_rx.recv().unwrap(),
+            PlatformControlCommand::ApplyAnalysis(PlatformAnalysisCommand {
+                trigger: "operator_test".to_string(),
+                severity: "warning".to_string(),
+                summary: "force idle".to_string(),
+                recommendation: "apply idle profile".to_string(),
+                suggested_action: Some("force_profile".to_string()),
+                target: "AGENT-07".to_string(),
+                provider: None,
+                model: None,
+                unresolved_keys: Vec::new(),
+                parameters: std::collections::BTreeMap::from([(
+                    "profile".to_string(),
+                    serde_json::json!("Idle"),
+                )]),
+            })
+        );
+    }
+
+    #[test]
+    fn platform_analysis_test_rejects_missing_force_profile_parameters() {
+        let (state, _rx, _platform_rx) = test_state(None);
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_PLATFORM_ANALYSIS_TEST_PATH,
+                serde_json::json!({
+                    "trigger": "operator_test",
+                    "severity": "warning",
+                    "summary": "force idle",
+                    "recommendation": "apply idle profile",
+                    "suggested_action": "force_profile",
+                    "target": "AGENT-07",
+                    "parameters": {}
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 400);
     }
 
     #[test]
