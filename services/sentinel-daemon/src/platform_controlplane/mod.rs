@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod rules;
 pub mod verify;
 
+use anyhow::{anyhow, Context, Result};
 use std::collections::{BTreeMap, HashMap};
 
 use sentinel_common::{DomainEvent, DomainEventPayload};
@@ -41,6 +42,38 @@ pub struct PlatformAnalysisRequest {
     pub failed_interventions: Vec<FailedIntervention>,
 }
 
+/// Strukturierte Analyse, die persistiert und optional ausgefuehrt wird.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlatformAnalysisCommand {
+    pub trigger: String,
+    pub severity: String,
+    pub summary: String,
+    pub recommendation: String,
+    #[serde(default)]
+    pub suggested_action: Option<String>,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub unresolved_keys: Vec<String>,
+    #[serde(default)]
+    pub parameters: BTreeMap<String, serde_json::Value>,
+}
+
+impl PlatformAnalysisCommand {
+    pub fn normalized_target(&self) -> String {
+        let target = self.target.trim();
+        if target.is_empty() {
+            "system".to_string()
+        } else {
+            target.to_string()
+        }
+    }
+}
+
 /// Deterministischer Test-Hook fuer geplante Triggerpfade.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlatformTriggerTestCommand {
@@ -54,10 +87,11 @@ pub struct PlatformTriggerTestCommand {
 }
 
 /// Loopback-Operator-Kommandos fuer Platform-Controlplane.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PlatformControlCommand {
     AnalyzeNow,
     TriggerTest(PlatformTriggerTestCommand),
+    ApplyAnalysis(PlatformAnalysisCommand),
 }
 
 /// Read-Only Snapshot fuer Operator- und Dashboard-State.
@@ -78,6 +112,8 @@ pub struct PlatformStateSnapshot {
     pub unresolved_counts: BTreeMap<String, u32>,
     #[serde(default)]
     pub threshold_overrides: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub resource_profiles: BTreeMap<String, String>,
     #[serde(default)]
     pub agents: Vec<PlatformAgentSnapshot>,
 }
@@ -149,6 +185,7 @@ impl PlatformControlplane {
             PlatformControlCommand::TriggerTest(command) => self
                 .queued_analysis_triggers
                 .push(QueuedAnalysisTrigger::Test(command)),
+            PlatformControlCommand::ApplyAnalysis(_) => {}
         }
     }
 
@@ -176,6 +213,16 @@ impl PlatformControlplane {
         self.last_scheduled_analysis_tick
     }
 
+    pub fn apply_threshold_override(
+        &mut self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<()> {
+        validate_threshold_override(key, &value)?;
+        self.threshold_overrides.insert(key.to_string(), value);
+        Ok(())
+    }
+
     /// Fuehrt einen OODA-Zyklus aus und gibt Side-Effects zurueck.
     ///
     /// Der Orchestrator fuehrt die Side-Effects aus (TriggerPrune, ForceIdleProfile).
@@ -186,8 +233,9 @@ impl PlatformControlplane {
         tick: u64,
         agent_name_to_id: &std::collections::HashMap<String, sentinel_common::AgentId>,
     ) -> PlatformCycleOutput {
+        let effective_config = self.effective_config();
         // 1. Verify: Letzte Actions gewirkt?
-        let verify_results = verify::verify_last_actions(&self.last_actions, metrics, &self.config);
+        let verify_results = verify::verify_last_actions(&self.last_actions, metrics, &effective_config);
         let unresolved_escalations = self.update_unresolved_state(&verify_results);
         self.last_actions.retain(|action| {
             let key = action_key(&action.rule_name, &action.target);
@@ -202,7 +250,7 @@ impl PlatformControlplane {
             metrics,
             &self.cooldowns,
             tick,
-            &self.config,
+            &effective_config,
             agent_name_to_id,
         );
 
@@ -232,9 +280,9 @@ impl PlatformControlplane {
 
         // Cooldown Cleanup: Eintraege aelter als 2x max Cooldown entfernen
         let max_cooldown = self
-            .config
+            .effective_config()
             .prune_cooldown_ticks
-            .max(self.config.stall_cooldown_ticks);
+            .max(effective_config.stall_cooldown_ticks);
         self.cooldowns
             .retain(|_, &mut last_tick| tick.saturating_sub(last_tick) < max_cooldown * 2);
 
@@ -426,10 +474,140 @@ impl PlatformControlplane {
             self.last_actions.push(action);
         }
     }
+
+    fn effective_config(&self) -> PlatformControlplaneConfig {
+        let mut config = self.config.clone();
+        if let Some(value) = self.threshold_overrides.get("memory_pressure_threshold") {
+            if let Some(parsed) = value.as_f64() {
+                config.memory_pressure_threshold = parsed;
+            }
+        }
+        if let Some(value) = self.threshold_overrides.get("max_projection_lag") {
+            if let Some(parsed) = value.as_i64() {
+                config.max_projection_lag = parsed;
+            }
+        }
+        if let Some(value) = self.threshold_overrides.get("max_event_store_bytes") {
+            if let Some(parsed) = value.as_u64() {
+                config.max_event_store_bytes = parsed;
+            }
+        }
+        if let Some(value) = self
+            .threshold_overrides
+            .get("write_anomaly_threshold_bytes_per_sec")
+        {
+            if let Some(parsed) = value.as_u64() {
+                config.write_anomaly_threshold_bytes_per_sec = parsed;
+            }
+        }
+        if let Some(value) = self
+            .threshold_overrides
+            .get("stall_recent_activity_grace_ticks")
+        {
+            if let Some(parsed) = value.as_u64() {
+                config.stall_recent_activity_grace_ticks = parsed;
+            }
+        }
+        if let Some(value) = self.threshold_overrides.get("stall_cooldown_ticks") {
+            if let Some(parsed) = value.as_u64() {
+                config.stall_cooldown_ticks = parsed;
+            }
+        }
+        if let Some(value) = self.threshold_overrides.get("prune_cooldown_ticks") {
+            if let Some(parsed) = value.as_u64() {
+                config.prune_cooldown_ticks = parsed;
+            }
+        }
+        config
+    }
 }
 
 fn action_key(rule_name: &str, target: &str) -> String {
     format!("{rule_name}:{target}")
+}
+
+pub(crate) fn persist_platform_analysis_event(
+    event_store: &EventStore,
+    tick: u64,
+    analysis: &PlatformAnalysisCommand,
+) -> Result<()> {
+    let target = analysis.normalized_target();
+    let payload = DomainEventPayload::PlatformAnalysis {
+        trigger: analysis.trigger.clone(),
+        severity: analysis.severity.clone(),
+        summary: analysis.summary.clone(),
+        recommendation: analysis.recommendation.clone(),
+        suggested_action: analysis.suggested_action.clone(),
+        target: target.clone(),
+        provider: analysis.provider.clone(),
+        model: analysis.model.clone(),
+        unresolved_keys: analysis.unresolved_keys.clone(),
+        parameters: analysis.parameters.clone(),
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let op_id = format!("platform-analysis-{}-{tick}-{ts}", analysis.trigger);
+    let event = DomainEvent::new(
+        payload.event_type_str(),
+        &target,
+        &payload.to_json(),
+        &op_id,
+        tick,
+    );
+    let topic = format!("sentinel/events/platform_analysis/{target}");
+    event_store
+        .append_with_outbox(&event, &topic)
+        .context("persist platform_analysis")?;
+    Ok(())
+}
+
+fn validate_threshold_override(key: &str, value: &serde_json::Value) -> Result<()> {
+    match key {
+        "memory_pressure_threshold" => {
+            let parsed = value
+                .as_f64()
+                .context("memory_pressure_threshold muss Zahl sein")?;
+            if !(0.0 < parsed && parsed <= 1.0) {
+                return Err(anyhow!(
+                    "memory_pressure_threshold muss > 0.0 und <= 1.0 sein"
+                ));
+            }
+        }
+        "max_projection_lag" => {
+            let parsed = value.as_i64().context("max_projection_lag muss Integer sein")?;
+            if parsed <= 0 {
+                return Err(anyhow!("max_projection_lag muss > 0 sein"));
+            }
+        }
+        "max_event_store_bytes" => {
+            let parsed = value
+                .as_u64()
+                .context("max_event_store_bytes muss Integer sein")?;
+            if parsed == 0 {
+                return Err(anyhow!("max_event_store_bytes muss > 0 sein"));
+            }
+        }
+        "write_anomaly_threshold_bytes_per_sec" => {
+            let parsed = value
+                .as_u64()
+                .context("write_anomaly_threshold_bytes_per_sec muss Integer sein")?;
+            if parsed == 0 {
+                return Err(anyhow!(
+                    "write_anomaly_threshold_bytes_per_sec muss > 0 sein"
+                ));
+            }
+        }
+        "stall_recent_activity_grace_ticks" | "stall_cooldown_ticks" | "prune_cooldown_ticks" => {
+            let parsed = value.as_u64().context("Tick-Override muss Integer sein")?;
+            if parsed == 0 {
+                return Err(anyhow!("{key} muss > 0 sein"));
+            }
+        }
+        _ => return Err(anyhow!("unsupported threshold override key: {key}")),
+    }
+    Ok(())
 }
 
 /// Emittiert ein PlatformIntervention Event in den Event Store.
@@ -584,5 +762,78 @@ mod tests {
 
         let out5 = cp.cycle(&metrics, &db, 5, &HashMap::new());
         assert!(out5.analysis_requests.is_empty());
+    }
+
+    #[test]
+    fn test_apply_threshold_override_updates_effective_config() {
+        let mut cp = PlatformControlplane::new(PlatformControlplaneConfig {
+            memory_pressure_threshold: 0.9,
+            ..PlatformControlplaneConfig::default()
+        });
+
+        cp.apply_threshold_override("memory_pressure_threshold", serde_json::json!(0.75))
+            .expect("valid override");
+
+        let metrics = PlatformMetrics {
+            agent_memory_pressure: vec![("Test Agent".to_string(), 0.8)],
+            ..Default::default()
+        };
+        let actions = rules::evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            1,
+            &cp.effective_config(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            cp.threshold_overrides()
+                .get("memory_pressure_threshold")
+                .and_then(|value| value.as_f64()),
+            Some(0.75)
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.rule_name == "memory_pressure"),
+            "override must affect effective rule evaluation"
+        );
+    }
+
+    #[test]
+    fn test_persist_platform_analysis_event_normalizes_empty_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            sentinel_limbo::EventStore::open(dir.path().join("analysis.db").to_str().unwrap())
+                .unwrap();
+        let command = PlatformAnalysisCommand {
+            trigger: "operator_test".to_string(),
+            severity: "warning".to_string(),
+            summary: "Adjust threshold".to_string(),
+            recommendation: "Lower memory pressure threshold".to_string(),
+            suggested_action: Some("adjust_threshold".to_string()),
+            target: String::new(),
+            provider: Some("operator-test".to_string()),
+            model: Some("manual".to_string()),
+            unresolved_keys: vec!["memory_pressure:system".to_string()],
+            parameters: BTreeMap::from([
+                ("key".to_string(), serde_json::json!("memory_pressure_threshold")),
+                ("value".to_string(), serde_json::json!(0.75)),
+            ]),
+        };
+
+        persist_platform_analysis_event(&db, 7, &command).expect("analysis event persisted");
+
+        let events = db.get_events_since(0, 10).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "platform_analysis")
+            .expect("platform_analysis event");
+        assert_eq!(event.aggregate_id, "system");
+        let payload: DomainEventPayload = serde_json::from_str(&event.payload).unwrap();
+        match payload {
+            DomainEventPayload::PlatformAnalysis { target, .. } => assert_eq!(target, "system"),
+            other => panic!("unexpected payload: {other:?}"),
+        }
     }
 }

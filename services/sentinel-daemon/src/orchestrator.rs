@@ -464,6 +464,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         let handle = crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::spawn(
             analyzer_config,
             Arc::clone(&event_store),
+            platform_tx.clone(),
         );
         info!(
             enabled = handle.is_enabled(),
@@ -867,6 +868,10 @@ fn publish_platform_state_snapshot(
             }
         })
         .collect::<Vec<_>>();
+    let resource_profiles = agents
+        .iter()
+        .map(|agent| (agent.aggregate_id.clone(), agent.current_profile.clone()))
+        .collect();
 
     if let Ok(mut snapshot) = platform_state.write() {
         *snapshot = crate::platform_controlplane::PlatformStateSnapshot {
@@ -884,9 +889,129 @@ fn publish_platform_state_snapshot(
                 .map(|(key, value)| (key.clone(), *value))
                 .collect(),
             threshold_overrides: platform_cp.threshold_overrides().clone(),
+            resource_profiles,
             agents,
         };
     }
+}
+
+fn resolve_platform_analysis_target(
+    runtime_orch: &RuntimeOrchestrator,
+    target: &str,
+) -> Option<(AgentId, String)> {
+    let target = target.trim();
+    runtime_orch.agents().iter().find_map(|(agent_id, handle)| {
+        if handle.identity.name.eq_ignore_ascii_case(target)
+            || agent_id.to_string().eq_ignore_ascii_case(target)
+        {
+            Some((*agent_id, handle.identity.name.clone()))
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_analysis_profile(
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Option<sentinel_sandbox::ResourceProfile> {
+    let profile = parameters.get("profile")?.as_str()?.trim().to_ascii_lowercase();
+    match profile.as_str() {
+        "idle" => Some(sentinel_sandbox::ResourceProfile::Idle),
+        "normal" => Some(sentinel_sandbox::ResourceProfile::Normal),
+        "heavy" => Some(sentinel_sandbox::ResourceProfile::Heavy),
+        "suspended" => Some(sentinel_sandbox::ResourceProfile::Suspended),
+        _ => None,
+    }
+}
+
+fn apply_platform_analysis_command(
+    analysis: crate::platform_controlplane::PlatformAnalysisCommand,
+    tick: u64,
+    runtime_orch: &RuntimeOrchestrator,
+    platform_cp: &mut crate::platform_controlplane::PlatformControlplane,
+    resource_manager: &mut crate::resource_manager::ResourceManager,
+    event_store: &EventStore,
+) -> Result<()> {
+    crate::platform_controlplane::persist_platform_analysis_event(event_store, tick, &analysis)?;
+
+    let target = analysis.normalized_target();
+    let Some(action) = analysis
+        .suggested_action
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        debug!(
+            trigger = %analysis.trigger,
+            severity = %analysis.severity,
+            target = %target,
+            "Platform-Analyse ohne Suggested Action persistiert"
+        );
+        return Ok(());
+    };
+
+    match action {
+        "force_profile" => {
+            let (agent_id, agent_name) = resolve_platform_analysis_target(runtime_orch, &target)
+                .with_context(|| format!("PlatformAnalysis target nicht aufloesbar: {target}"))?;
+            let profile = parse_analysis_profile(&analysis.parameters)
+                .context("force_profile braucht gueltiges parameters.profile")?;
+            resource_manager.force_profile_and_apply(
+                agent_id,
+                &agent_name,
+                profile,
+                event_store,
+                tick,
+            )?;
+            info!(
+                trigger = %analysis.trigger,
+                target = %target,
+                profile = %profile,
+                "Platform-Analyse force_profile ausgefuehrt"
+            );
+        }
+        "adjust_threshold" => {
+            let key = analysis
+                .parameters
+                .get("key")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .context("adjust_threshold braucht parameters.key")?;
+            let value = analysis
+                .parameters
+                .get("value")
+                .cloned()
+                .context("adjust_threshold braucht parameters.value")?;
+            platform_cp.apply_threshold_override(key, value)?;
+            info!(
+                trigger = %analysis.trigger,
+                target = %target,
+                key,
+                "Platform-Analyse adjust_threshold ausgefuehrt"
+            );
+        }
+        "escalate_to_operator" => {
+            warn!(
+                trigger = %analysis.trigger,
+                severity = %analysis.severity,
+                target = %target,
+                summary = %analysis.summary,
+                recommendation = %analysis.recommendation,
+                "Platform-Analyse an Operator eskaliert"
+            );
+        }
+        other => {
+            warn!(
+                trigger = %analysis.trigger,
+                suggested_action = other,
+                target = %target,
+                "Platform-Analyse Suggested Action ignoriert"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// ECS Tick-Loop auf dediziertem Thread.
@@ -1367,7 +1492,29 @@ fn ecs_tick_loop(
 
         while let Ok(command) = platform_rx.try_recv() {
             info!(command = ?command, "Platform-Controlplane Trigger empfangen");
-            platform_cp.enqueue_control_command(command);
+            match command {
+                crate::platform_controlplane::PlatformControlCommand::AnalyzeNow => platform_cp
+                    .enqueue_control_command(
+                        crate::platform_controlplane::PlatformControlCommand::AnalyzeNow,
+                    ),
+                crate::platform_controlplane::PlatformControlCommand::TriggerTest(trigger) => {
+                    platform_cp.enqueue_control_command(
+                        crate::platform_controlplane::PlatformControlCommand::TriggerTest(trigger),
+                    );
+                }
+                crate::platform_controlplane::PlatformControlCommand::ApplyAnalysis(analysis) => {
+                    if let Err(error) = apply_platform_analysis_command(
+                        analysis,
+                        tick_count,
+                        &runtime_orch,
+                        &mut platform_cp,
+                        &mut resource_manager,
+                        &event_store_for_prune,
+                    ) {
+                        warn!(error = %error, "Platform-Analyse konnte nicht ausgefuehrt werden");
+                    }
+                }
+            }
         }
 
         // Platform-Controlplane: Self-Healing (alle N Ticks)
@@ -1411,8 +1558,21 @@ fn ecs_tick_loop(
                     crate::platform_controlplane::rules::PlatformSideEffect::ForceIdleProfile(
                         agent_id,
                     ) => {
-                        resource_manager
-                            .force_profile(agent_id, sentinel_sandbox::ResourceProfile::Idle);
+                        if let Some(handle) = runtime_orch.agents().get(&agent_id) {
+                            if let Err(error) = resource_manager.force_profile_and_apply(
+                                agent_id,
+                                &handle.identity.name,
+                                sentinel_sandbox::ResourceProfile::Idle,
+                                &event_store_for_prune,
+                                tick_count,
+                            ) {
+                                warn!(
+                                    agent_id = %agent_id,
+                                    error = %error,
+                                    "Idle-Profil konnte nicht erzwungen werden"
+                                );
+                            }
+                        }
                     }
                     crate::platform_controlplane::rules::PlatformSideEffect::RestartAgent(
                         agent_id,

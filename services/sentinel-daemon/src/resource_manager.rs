@@ -171,6 +171,38 @@ impl ResourceManager {
         self.profiles.insert(agent_id, profile);
         self.pending_transitions.remove(&agent_id);
     }
+
+    /// Erzwingt ein Profil inklusive cgroup-Resize und Audit-Event.
+    pub fn force_profile_and_apply(
+        &mut self,
+        agent_id: AgentId,
+        agent_name: &str,
+        profile: ResourceProfile,
+        event_store: &EventStore,
+        tick: u64,
+    ) -> anyhow::Result<()> {
+        let old = self.get_profile(&agent_id);
+        resize_cgroup(agent_name, &profile.limits())?;
+        self.force_profile(agent_id, profile);
+
+        if old != profile {
+            emit_profile_event(
+                event_store,
+                agent_id,
+                &old.to_string(),
+                &profile.to_string(),
+                tick,
+            )?;
+        }
+
+        info!(
+            agent = %agent_name,
+            old = %old,
+            new = %profile,
+            "Resource-Profil erzwungen"
+        );
+        Ok(())
+    }
 }
 
 /// Emittiert ein ResourceProfileChanged Event in den Event Store.
