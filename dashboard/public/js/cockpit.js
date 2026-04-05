@@ -71,6 +71,7 @@ function renderIncidentItem(incident) {
   item.className = 'cockpit-incident-item';
   item.setAttribute('data-severity', incident.severity);
   item.setAttribute('data-status', incident.status);
+  item.setAttribute('data-incident-type', incident.incident_type);
 
   // Header line: severity badge + type + summary
   const header = document.createElement('div');
