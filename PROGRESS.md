@@ -4,7 +4,7 @@
 
 - Plan source: `/work/company/codex-plan263.md`
 - Overall status: `IN_PROGRESS`
-- Current task: `Task 4 - Eskalationslogik, unresolved counters und deterministische Trigger`
+- Current task: `Task 5 - Suggested-Action-Executor mit force_profile / adjust_threshold / escalate_to_operator`
 - Current branch: `feat/issue-263-platform-controlplane-completion`
 - Hook status: `PreToolUse TaskUpdate + PostToolUse start-enforcer projektlokal registriert`
 - Last refresh: `2026-04-05 Europe/Vienna`
@@ -42,6 +42,13 @@
 - Remote-Rust-Evidence fuer Task 3 ist vorhanden:
   - `cargo remote -c -- test -p sentinel-daemon -p sentinel-common` => Exit `0`; relevante Endzeilen zeigen `145 passed; 0 failed`
   - `cargo remote -c -- clippy -p sentinel-daemon --all-targets -- -D warnings` => Exit `0`
+- Task-4-Trigger- und State-Ebene ist jetzt lokal umgesetzt:
+  - [mod.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/mod.rs) fuehrt `PlatformControlCommand`, `PlatformTriggerTestCommand`, `PlatformStateSnapshot`, `PlatformCycleOutput`, unresolved counters, queued trigger und Analyse-Request-Building ein
+  - [operator_api.rs](/work/company/project-sentinel/services/sentinel-daemon/src/operator_api.rs) enthaelt jetzt `POST /operator/platform-analyze`, `POST /operator/platform-trigger-test` und `GET /operator/platform-state`
+  - [orchestrator.rs](/work/company/project-sentinel/services/sentinel-daemon/src/orchestrator.rs) verbindet `platform_rx`, Analyzer-Queue und den live publizierten Platform-State mit dem ECS-Tick-Loop
+- Remote-Rust-Evidence fuer Task 4 ist vorhanden:
+  - `cargo remote -c -- test -p sentinel-daemon -- --nocapture` => Exit `0`; Endzeilen zeigen `152 passed; 0 failed`
+  - `cargo remote -c -- clippy -p sentinel-daemon --all-targets -- -D warnings` => Exit `0`; Endzeile `Finished 'dev' profile ...`
 
 ## Blocked items
 
@@ -52,7 +59,7 @@
 
 - `ae1b5cf` Task [1]
 - `de96c37` Task [2]
-- `TBD` Task [3]
+- `f2bd13a` Task [3]
 - `TBD` Task [4]
 - `TBD` Task [5]
 - `TBD` Task [6]
@@ -66,8 +73,8 @@
 | 1 | Issue-Hygiene, Branch-Setup und deterministische Baseline fuer AC-1 bis AC-5 / AC-10 bis AC-12 neu setzen | DONE | `#263`-Ist-Zustand gegen Repo/GitHub/VM abgleichen, offene Baseline-Luecken fuer Stall/Projection/Cooldowns/Disable-Flag pruefen, Issue-Text vorbereiten, Branch sauber halten | command, system, inspect |
 | 2 | Event- und Config-Schema fuer die LLM-Ebene ergaenzen | DONE | `PlatformAnalysis`-Event, neue Platform-CP-Config-Felder, TOML-Defaults und Typen stabil ergaenzen | inspect, command |
 | 3 | LLM-Analyzer als daemon-internes Background-Modul implementieren | DONE | asynchronen Analyzer, Kontext-Assembly, Gateway-Call und Parsing/Persistenz bauen | inspect, command |
-| 4 | Eskalationslogik, unresolved counters und deterministische Trigger vervollstaendigen | IN_PROGRESS | scheduled/manual/unresolved Trigger, Counter-State und Test-Hooks fuer `AC-6` vervollstaendigen | inspect, command, system |
-| 5 | Suggested-Action-Executor mit force_profile / adjust_threshold / escalate_to_operator implementieren | PENDING | guard-railed Executor inkl. cgroup-Apply, Audit-Trail und Runtime-Overrides bauen | inspect, command, system |
+| 4 | Eskalationslogik, unresolved counters und deterministische Trigger vervollstaendigen | DONE | scheduled/manual/unresolved Trigger, Counter-State und Test-Hooks fuer `AC-6` vervollstaendigen | inspect, command, system |
+| 5 | Suggested-Action-Executor mit force_profile / adjust_threshold / escalate_to_operator implementieren | IN_PROGRESS | guard-railed Executor inkl. cgroup-Apply, Audit-Trail und Runtime-Overrides bauen | inspect, command, system |
 | 6 | Operator-API, Dashboard, Cockpit und Playwright-relevante UI-Surfaces erweitern | PENDING | API-Read/Write-Pfade, Dashboard/Cockpit-Rendering, stabile Selektoren, Projection-Write-Key-Pfad und UI-Verifikation ergaenzen | inspect, command, browser, system |
 | 7 | Deploy, Benchmarks sowie AC-1 bis AC-12 inkl. UI-Evidence auf der VM verifizieren | PENDING | Release-Build, Deploy, systemd-Restarts, AC-Matrix, Playwright-Screenshots und Benchmarks mit Systemmetriken abarbeiten | command, system, browser |
 | 8 | Plan-Verifikation | PENDING | Gesamtergebnis Zeile fuer Zeile gegen den Plan pruefen, Restluecken sofort fixen oder als Blocker dokumentieren | inspect, command, system, browser |
@@ -221,6 +228,28 @@
 - Evidence plan:
   - AC-1/2 via Tests und spaetere VM-Commands
   - AC-3 via Code + Integrationstest
+- Pre-task self-check:
+  - Was muss getan werden: Die neue LLM-Ebene braucht echte Trigger-Quellen und einen lesbaren Runtime-State, sonst bleiben AC-6 und der spaetere UI-/VM-Pfad nondeterministisch.
+  - Welche ACs muessen hier passen: manual, scheduled und unresolved-escalation sind alle ueber denselben Analyzer-Pfad verdrahtet; Operator- und Dashboard-State koennen diesen Zustand lesen.
+  - Wie wird bewiesen: zielgerichtete Remote-Rust-Tests fuer Controlplane, Operator-API und anschliessend gruener Gesamt-`sentinel-daemon`-Lauf plus Clippy.
+  - Erwartete Dateien: [mod.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/mod.rs), [llm_analyzer.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/llm_analyzer.rs), [operator_api.rs](/work/company/project-sentinel/services/sentinel-daemon/src/operator_api.rs), [orchestrator.rs](/work/company/project-sentinel/services/sentinel-daemon/src/orchestrator.rs)
+  - Risiken: Borrow-Konflikte im Controlplane-State, zu viele Signaturargumente im Operator-Wiring, `cargo remote`-Output verrauscht die eigentliche Rust-Diagnose.
+- Outcome:
+  - `PlatformControlplane` verwaltet jetzt unresolved counters pro `rule:target`, gescheiterte Interventionen, letzte Analyse-Trigger und scheduled/queued Analyse-Requests.
+  - `AnalyzeNow` und deterministische Test-Trigger (`scheduled`, `unresolved_escalation`) laufen alle ueber denselben `PlatformAnalysisRequest`-Pfad wie die spaetere echte Runtime.
+  - Die lokale Operator-API exponiert jetzt `POST /operator/platform-analyze`, `POST /operator/platform-trigger-test` und `GET /operator/platform-state`.
+  - Der ECS-Tick-Loop drainet Platform-Kommandos, queued Analyse-Requests in den async Analyzer und publiziert pro Tick einen lesbaren `PlatformStateSnapshot`.
+- Evidence:
+  - AC-1 PASS:
+    - [mod.rs](/work/company/project-sentinel/services/sentinel-daemon/src/platform_controlplane/mod.rs) fuehrt `PlatformControlCommand::{AnalyzeNow, TriggerTest}`, `PlatformTriggerTestCommand` und `PlatformCycleOutput` ein
+    - `test_manual_trigger_creates_analysis_request`, `test_scheduled_analysis_respects_interval` und `test_unresolved_threshold_triggers_escalation_once` laufen gruen
+  - AC-2 PASS:
+    - [operator_api.rs](/work/company/project-sentinel/services/sentinel-daemon/src/operator_api.rs) fuehrt `POST /operator/platform-trigger-test` und `GET /operator/platform-state` ein
+    - `platform_analyze_is_forwarded_to_platform_channel`, `platform_trigger_test_is_forwarded`, `unresolved_trigger_test_requires_rule_and_target` und `platform_state_endpoint_returns_snapshot` laufen gruen
+  - AC-3 PASS:
+    - [orchestrator.rs](/work/company/project-sentinel/services/sentinel-daemon/src/orchestrator.rs) verdrahtet `platform_rx`, `platform_llm_analyzer.enqueue(...)` und `publish_platform_state_snapshot(...)`
+    - `cargo remote -c -- test -p sentinel-daemon -- --nocapture` => Exit `0`; Endzeile `152 passed; 0 failed`
+    - `cargo remote -c -- clippy -p sentinel-daemon --all-targets -- -D warnings` => Exit `0`; Endzeile `Finished 'dev' profile [unoptimized + debuginfo] target(s) in 8.29s`
 
 ### Task 5 - Suggested-Action-Executor mit force_profile / adjust_threshold / escalate_to_operator implementieren
 

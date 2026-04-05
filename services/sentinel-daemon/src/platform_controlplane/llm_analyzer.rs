@@ -17,29 +17,12 @@ use sentinel_limbo::EventStore;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::metrics::PlatformMetrics;
+use super::{metrics::PlatformMetrics, PlatformAnalysisRequest};
 use crate::config::PlatformControlplaneConfig;
 
 const DEFAULT_GATEWAY_URL: &str = "http://localhost:8080";
 const DEFAULT_CHANNEL_CAPACITY: usize = 16;
 const RECENT_EVENT_SCAN_LIMIT: usize = 256;
-
-#[derive(Debug, Clone)]
-pub struct FailedIntervention {
-    pub rule_name: String,
-    pub target: String,
-    pub action: String,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct PlatformAnalysisRequest {
-    pub trigger: String,
-    pub tick: u64,
-    pub metrics: PlatformMetrics,
-    pub verify_results: HashMap<String, bool>,
-    pub failed_interventions: Vec<FailedIntervention>,
-}
 
 #[derive(Debug, Clone)]
 pub struct LlmAnalyzerConfig {
@@ -86,17 +69,21 @@ pub struct PlatformLlmAnalyzerHandle {
 }
 
 impl PlatformLlmAnalyzerHandle {
+    pub fn disabled() -> Self {
+        Self { tx: None }
+    }
+
     pub fn spawn(config: LlmAnalyzerConfig, event_store: Arc<EventStore>) -> Self {
         if !config.enabled {
             info!("Platform LLM Analyzer deaktiviert");
-            return Self { tx: None };
+            return Self::disabled();
         }
 
         let client = match Client::builder().timeout(config.request_timeout).build() {
             Ok(client) => client,
             Err(error) => {
                 warn!(error = %error, "Platform LLM Analyzer Client fehlgeschlagen");
-                return Self { tx: None };
+                return Self::disabled();
             }
         };
 
@@ -535,7 +522,7 @@ mod tests {
                 ("projection_lag:system".to_string(), false),
                 ("event_store_size:system".to_string(), true),
             ]),
-            failed_interventions: vec![FailedIntervention {
+            failed_interventions: vec![crate::platform_controlplane::FailedIntervention {
                 rule_name: "projection_lag".to_string(),
                 target: "system".to_string(),
                 action: "restart_projection".to_string(),
