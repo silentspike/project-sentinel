@@ -1,25 +1,20 @@
 //! Asynchroner Service-Health-Checker.
 //!
-//! Separater Thread der periodisch systemd Services prueft und bei Ausfall
-//! automatisch restartet (max 3 Versuche). Ergebnisse werden non-blocking
-//! via mpsc Channel an den Tick-Loop geliefert.
+//! Separater Thread der periodisch systemd Services prueft.
+//! Ergebnisse werden non-blocking via mpsc Channel an den Tick-Loop geliefert.
 
-use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::warn;
 
 /// Non-blocking Service-Health-Checker.
 ///
-/// Laeuft in einem separaten Thread, prueft Services via `systemctl is-active`
-/// und restartet ausgefallene Services (max 3 Versuche pro Service).
+/// Laeuft in einem separaten Thread und prueft Services via `systemctl is-active`.
+/// Restart-Entscheidungen passieren deterministisch im Platform-Controlplane.
 pub struct ServiceHealthChecker {
     rx: mpsc::Receiver<Vec<String>>,
 }
-
-/// Max Restart-Versuche bevor nur noch Alert.
-const MAX_RESTART_ATTEMPTS: u32 = 3;
 
 impl ServiceHealthChecker {
     /// Spawnt den Health-Check Thread.
@@ -32,35 +27,17 @@ impl ServiceHealthChecker {
         std::thread::Builder::new()
             .name("service-health-checker".into())
             .spawn(move || {
-                let mut restart_counts: HashMap<String, u32> = HashMap::new();
-
                 loop {
                     let mut failed = Vec::new();
 
                     for service in &services {
                         let active = is_service_active(service);
                         if !active {
-                            let count = restart_counts.entry(service.clone()).or_insert(0);
-                            if *count < MAX_RESTART_ATTEMPTS {
-                                info!(service = %service, attempt = *count + 1,
-                                    "Service nicht active — Restart wird versucht");
-                                let restart_ok = restart_service(service);
-                                *count += 1;
-                                if restart_ok {
-                                    info!(service = %service, "Service erfolgreich restartet");
-                                } else {
-                                    warn!(service = %service, "Service-Restart fehlgeschlagen");
-                                }
-                            } else {
-                                warn!(service = %service, attempts = MAX_RESTART_ATTEMPTS,
-                                    "Max Restart-Versuche erreicht — nur noch Alert");
-                            }
+                            warn!(
+                                service = %service,
+                                "Service nicht active — Observation an Platform-Controlplane gemeldet"
+                            );
                             failed.push(service.clone());
-                        } else {
-                            // Service laeuft → Counter zuruecksetzen
-                            if restart_counts.remove(service).is_some() {
-                                info!(service = %service, "Service wieder active — Counter zurueckgesetzt");
-                            }
                         }
                     }
 
@@ -106,6 +83,14 @@ fn restart_service(service_name: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+pub fn restart_service_now(service_name: &str) -> bool {
+    restart_service(service_name)
+}
+
+pub fn is_service_active_now(service_name: &str) -> bool {
+    is_service_active(service_name)
 }
 
 #[cfg(test)]

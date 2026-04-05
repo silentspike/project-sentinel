@@ -54,4 +54,9 @@ wasm = ["sentinel-wasm/wasm", "sentinel-ecs/wasm"]
 fuse = ["sentinel-fs/fuse-tests"]
 
 [dev-dependencies]
+criterion = { workspace = true }
 tempfile = "3"
+
+[[bench]]
+name = "platform_controlplane_bench"
+harness = false

@@ -442,6 +442,10 @@ pub struct PlatformControlplaneConfig {
     pub enabled: bool,
     #[serde(default = "default_pcp_cycle_interval")]
     pub cycle_interval_ticks: u64,
+    #[serde(default = "default_pcp_ebpf_collect_interval")]
+    pub ebpf_collect_interval_ticks: u64,
+    #[serde(default = "default_pcp_stall_detection_threshold_secs")]
+    pub stall_detection_threshold_secs: u64,
     #[serde(default = "default_pcp_stall_recent_activity_grace_ticks")]
     pub stall_recent_activity_grace_ticks: u64,
     #[serde(default = "default_pcp_stall_cooldown")]
@@ -485,6 +489,12 @@ fn default_pcp_enabled() -> bool {
 }
 fn default_pcp_cycle_interval() -> u64 {
     60
+}
+fn default_pcp_ebpf_collect_interval() -> u64 {
+    10
+}
+fn default_pcp_stall_detection_threshold_secs() -> u64 {
+    30
 }
 fn default_pcp_stall_recent_activity_grace_ticks() -> u64 {
     120
@@ -550,6 +560,8 @@ impl Default for PlatformControlplaneConfig {
         Self {
             enabled: default_pcp_enabled(),
             cycle_interval_ticks: default_pcp_cycle_interval(),
+            ebpf_collect_interval_ticks: default_pcp_ebpf_collect_interval(),
+            stall_detection_threshold_secs: default_pcp_stall_detection_threshold_secs(),
             stall_recent_activity_grace_ticks: default_pcp_stall_recent_activity_grace_ticks(),
             stall_cooldown_ticks: default_pcp_stall_cooldown(),
             prune_cooldown_ticks: default_pcp_prune_cooldown(),
@@ -645,20 +657,50 @@ data_dir = "/tmp/data"
         assert!(file.daemon.platform_controlplane.enabled);
         assert_eq!(file.daemon.platform_controlplane.cycle_interval_ticks, 60);
         assert_eq!(
-            file.daemon.platform_controlplane.stall_recent_activity_grace_ticks,
+            file.daemon
+                .platform_controlplane
+                .ebpf_collect_interval_ticks,
+            10
+        );
+        assert_eq!(
+            file.daemon
+                .platform_controlplane
+                .stall_detection_threshold_secs,
+            30
+        );
+        assert_eq!(
+            file.daemon
+                .platform_controlplane
+                .stall_recent_activity_grace_ticks,
             120
         );
-        assert_eq!(file.daemon.platform_controlplane.service_check_interval_secs, 60);
+        assert_eq!(
+            file.daemon
+                .platform_controlplane
+                .service_check_interval_secs,
+            60
+        );
         assert!(file.daemon.platform_controlplane.llm_enabled);
-        assert_eq!(file.daemon.platform_controlplane.llm_analysis_interval_secs, 300);
+        assert_eq!(
+            file.daemon.platform_controlplane.llm_analysis_interval_secs,
+            300
+        );
         assert_eq!(file.daemon.platform_controlplane.llm_retry_delay_secs, 60);
-        assert_eq!(file.daemon.platform_controlplane.llm_gateway_timeout_ms, 30_000);
+        assert_eq!(
+            file.daemon.platform_controlplane.llm_gateway_timeout_ms,
+            30_000
+        );
         assert_eq!(
             file.daemon.platform_controlplane.llm_prompt_template,
             "platform-controlplane-default"
         );
         assert_eq!(file.daemon.platform_controlplane.llm_max_context_events, 10);
-        assert_eq!(file.daemon.platform_controlplane.llm_max_failed_interventions, 3);
+        assert_eq!(
+            file.daemon
+                .platform_controlplane
+                .llm_max_failed_interventions,
+            3
+        );
     }
 
     #[test]
@@ -811,6 +853,8 @@ data_dir = "/tmp/data"
 [daemon.platform_controlplane]
 enabled = true
 cycle_interval_ticks = 30
+ebpf_collect_interval_ticks = 2
+stall_detection_threshold_secs = 12
 stall_recent_activity_grace_ticks = 90
 stall_cooldown_ticks = 45
 prune_cooldown_ticks = 1200
@@ -833,6 +877,8 @@ llm_max_failed_interventions = 5
         let cfg = file.daemon.platform_controlplane;
         assert!(cfg.enabled);
         assert_eq!(cfg.cycle_interval_ticks, 30);
+        assert_eq!(cfg.ebpf_collect_interval_ticks, 2);
+        assert_eq!(cfg.stall_detection_threshold_secs, 12);
         assert_eq!(cfg.stall_recent_activity_grace_ticks, 90);
         assert_eq!(cfg.stall_cooldown_ticks, 45);
         assert_eq!(cfg.prune_cooldown_ticks, 1200);

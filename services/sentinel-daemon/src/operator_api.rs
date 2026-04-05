@@ -756,7 +756,9 @@ fn dispatch_platform_analysis_test(
                     .get("profile")
                     .and_then(|value| value.as_str())
                     .map(|value| value.to_ascii_lowercase())
-                    .ok_or(ApiError::BadRequest("force_profile braucht parameters.profile"))?;
+                    .ok_or(ApiError::BadRequest(
+                        "force_profile braucht parameters.profile",
+                    ))?;
                 if !matches!(profile.as_str(), "idle" | "normal" | "heavy" | "suspended") {
                     return Err(ApiError::BadRequest("parameters.profile ungueltig"));
                 }
@@ -768,7 +770,9 @@ fn dispatch_platform_analysis_test(
                     .and_then(|value| value.as_str())
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
-                    .ok_or(ApiError::BadRequest("adjust_threshold braucht parameters.key"))?;
+                    .ok_or(ApiError::BadRequest(
+                        "adjust_threshold braucht parameters.key",
+                    ))?;
                 if !payload.parameters.contains_key("value") {
                     return Err(ApiError::BadRequest(
                         "adjust_threshold braucht parameters.value",
@@ -980,6 +984,8 @@ mod tests {
             state_store,
             platform_state: Arc::new(std::sync::RwLock::new(PlatformStateSnapshot {
                 current_tick: 42,
+                ebpf_collect_interval_ticks: 10,
+                stall_detection_threshold_secs: 30,
                 llm_enabled: true,
                 llm_analysis_interval_secs: 300,
                 llm_retry_delay_secs: 60,

@@ -230,6 +230,8 @@ export interface PlatformStateAgent {
 
 export interface PlatformStateResponse {
   current_tick: number;
+  ebpf_collect_interval_ticks: number;
+  stall_detection_threshold_secs: number;
   stall_recent_activity_grace_ticks: number;
   llm_enabled: boolean;
   llm_analysis_interval_secs: number;

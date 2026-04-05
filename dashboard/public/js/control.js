@@ -958,11 +958,6 @@ function formatKB(bytes) {
   return bytes + ' B';
 }
 
-function authHeaders() {
-  var key = getApiKey();
-  return key ? { Authorization: 'Bearer ' + key } : {};
-}
-
 // Auto-refresh alle 10s wenn Control-Tab aktiv
 setInterval(async () => {
   const container = document.getElementById('view-control');

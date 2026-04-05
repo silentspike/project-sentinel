@@ -98,6 +98,8 @@ pub enum PlatformControlCommand {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct PlatformStateSnapshot {
     pub current_tick: u64,
+    pub ebpf_collect_interval_ticks: u64,
+    pub stall_detection_threshold_secs: u64,
     pub stall_recent_activity_grace_ticks: u64,
     pub llm_enabled: bool,
     pub llm_analysis_interval_secs: u64,
@@ -179,9 +181,9 @@ impl PlatformControlplane {
     /// Queue fuer manuelle oder deterministische Test-Trigger.
     pub fn enqueue_control_command(&mut self, command: PlatformControlCommand) {
         match command {
-            PlatformControlCommand::AnalyzeNow => {
-                self.queued_analysis_triggers.push(QueuedAnalysisTrigger::Manual)
-            }
+            PlatformControlCommand::AnalyzeNow => self
+                .queued_analysis_triggers
+                .push(QueuedAnalysisTrigger::Manual),
             PlatformControlCommand::TriggerTest(command) => self
                 .queued_analysis_triggers
                 .push(QueuedAnalysisTrigger::Test(command)),
@@ -213,11 +215,7 @@ impl PlatformControlplane {
         self.last_scheduled_analysis_tick
     }
 
-    pub fn apply_threshold_override(
-        &mut self,
-        key: &str,
-        value: serde_json::Value,
-    ) -> Result<()> {
+    pub fn apply_threshold_override(&mut self, key: &str, value: serde_json::Value) -> Result<()> {
         validate_threshold_override(key, &value)?;
         self.threshold_overrides.insert(key.to_string(), value);
         Ok(())
@@ -235,7 +233,8 @@ impl PlatformControlplane {
     ) -> PlatformCycleOutput {
         let effective_config = self.effective_config();
         // 1. Verify: Letzte Actions gewirkt?
-        let verify_results = verify::verify_last_actions(&self.last_actions, metrics, &effective_config);
+        let verify_results =
+            verify::verify_last_actions(&self.last_actions, metrics, &effective_config);
         let unresolved_escalations = self.update_unresolved_state(&verify_results);
         self.last_actions.retain(|action| {
             let key = action_key(&action.rule_name, &action.target);
@@ -348,9 +347,8 @@ impl PlatformControlplane {
                     verify_results.clone(),
                     self.failed_interventions.clone(),
                 )),
-                QueuedAnalysisTrigger::Test(command) => {
-                    requests.push(self.make_test_analysis_request(command, tick, metrics, verify_results))
-                }
+                QueuedAnalysisTrigger::Test(command) => requests
+                    .push(self.make_test_analysis_request(command, tick, metrics, verify_results)),
             }
         }
 
@@ -391,9 +389,7 @@ impl PlatformControlplane {
             };
             effective_results.insert(key.clone(), false);
             vec![FailedIntervention {
-                rule_name: command
-                    .rule_name
-                    .unwrap_or_else(|| "test_hook".to_string()),
+                rule_name: command.rule_name.unwrap_or_else(|| "test_hook".to_string()),
                 target: command.target.unwrap_or_else(|| "system".to_string()),
                 action: "analysis_requested".to_string(),
                 reason: format!(
@@ -576,7 +572,9 @@ fn validate_threshold_override(key: &str, value: &serde_json::Value) -> Result<(
             }
         }
         "max_projection_lag" => {
-            let parsed = value.as_i64().context("max_projection_lag muss Integer sein")?;
+            let parsed = value
+                .as_i64()
+                .context("max_projection_lag muss Integer sein")?;
             if parsed <= 0 {
                 return Err(anyhow!("max_projection_lag muss > 0 sein"));
             }
@@ -702,8 +700,8 @@ mod tests {
         cp.enqueue_control_command(PlatformControlCommand::AnalyzeNow);
 
         let dir = tempfile::tempdir().unwrap();
-        let db =
-            sentinel_limbo::EventStore::open(dir.path().join("manual.db").to_str().unwrap()).unwrap();
+        let db = sentinel_limbo::EventStore::open(dir.path().join("manual.db").to_str().unwrap())
+            .unwrap();
         let output = cp.cycle(&PlatformMetrics::default(), &db, 1, &HashMap::new());
 
         assert_eq!(output.analysis_requests.len(), 1);
@@ -722,10 +720,13 @@ mod tests {
             ..PlatformControlplaneConfig::default()
         });
         let dir = tempfile::tempdir().unwrap();
-        let db =
-            sentinel_limbo::EventStore::open(dir.path().join("sched.db").to_str().unwrap()).unwrap();
+        let db = sentinel_limbo::EventStore::open(dir.path().join("sched.db").to_str().unwrap())
+            .unwrap();
 
-        assert!(cp.cycle(&PlatformMetrics::default(), &db, 4, &HashMap::new()).analysis_requests.is_empty());
+        assert!(cp
+            .cycle(&PlatformMetrics::default(), &db, 4, &HashMap::new())
+            .analysis_requests
+            .is_empty());
         let output = cp.cycle(&PlatformMetrics::default(), &db, 5, &HashMap::new());
         assert_eq!(output.analysis_requests.len(), 1);
         assert_eq!(output.analysis_requests[0].trigger, "scheduled");
@@ -744,7 +745,8 @@ mod tests {
             ..PlatformControlplaneConfig::default()
         });
         let dir = tempfile::tempdir().unwrap();
-        let db = sentinel_limbo::EventStore::open(dir.path().join("esc.db").to_str().unwrap()).unwrap();
+        let db =
+            sentinel_limbo::EventStore::open(dir.path().join("esc.db").to_str().unwrap()).unwrap();
         let metrics = PlatformMetrics {
             failed_services: vec!["sentinel-judge".to_string()],
             ..Default::default()
@@ -803,9 +805,8 @@ mod tests {
     #[test]
     fn test_persist_platform_analysis_event_normalizes_empty_target() {
         let dir = tempfile::tempdir().unwrap();
-        let db =
-            sentinel_limbo::EventStore::open(dir.path().join("analysis.db").to_str().unwrap())
-                .unwrap();
+        let db = sentinel_limbo::EventStore::open(dir.path().join("analysis.db").to_str().unwrap())
+            .unwrap();
         let command = PlatformAnalysisCommand {
             trigger: "operator_test".to_string(),
             severity: "warning".to_string(),
@@ -817,7 +818,10 @@ mod tests {
             model: Some("manual".to_string()),
             unresolved_keys: vec!["memory_pressure:system".to_string()],
             parameters: BTreeMap::from([
-                ("key".to_string(), serde_json::json!("memory_pressure_threshold")),
+                (
+                    "key".to_string(),
+                    serde_json::json!("memory_pressure_threshold"),
+                ),
                 ("value".to_string(), serde_json::json!(0.75)),
             ]),
         };

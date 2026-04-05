@@ -63,6 +63,8 @@ min_transition_cycles = 3     # 3 konsekutive Zyklen vor Profil-Wechsel (Hystere
 [daemon.platform_controlplane]
 enabled = true
 cycle_interval_ticks = 60      # Regel-Evaluation alle 60 Ticks (~60s)
+ebpf_collect_interval_ticks = 10  # eBPF Metrics-Snapshot alle 10 Ticks (~10s)
+stall_detection_threshold_secs = 30  # eBPF write()-Inaktivitaet bis Stall
 stall_recent_activity_grace_ticks = 120  # Frische Activity innerhalb dieses Fensters ist kein Stall
 stall_cooldown_ticks = 60      # Cooldown pro gestalltem Agent
 prune_cooldown_ticks = 3600    # Max 1 Prune pro Stunde

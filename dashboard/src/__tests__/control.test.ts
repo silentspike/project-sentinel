@@ -300,6 +300,8 @@ describe("Control Routes", () => {
         return new Response(
           JSON.stringify({
             current_tick: 123,
+            ebpf_collect_interval_ticks: 10,
+            stall_detection_threshold_secs: 30,
             llm_enabled: true,
             llm_analysis_interval_secs: 30,
             llm_retry_delay_secs: 15,

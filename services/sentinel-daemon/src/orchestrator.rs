@@ -358,8 +358,13 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     info!("Episode Producer initialisiert");
 
     // -- eBPF Monitoring initialisieren --
-    let (ebpf_collector, ebpf_mode) = crate::ebpf::init_ebpf();
-    info!(mode = %ebpf_mode, "eBPF Monitoring initialisiert");
+    let (ebpf_collector, ebpf_mode) =
+        crate::ebpf::init_ebpf(config.platform_controlplane.stall_detection_threshold_secs);
+    info!(
+        mode = %ebpf_mode,
+        stall_threshold_secs = config.platform_controlplane.stall_detection_threshold_secs,
+        "eBPF Monitoring initialisiert"
+    );
 
     // -- eBPF Bridge: mpsc + shared Prometheus Text --
     let (ebpf_tx, ebpf_rx) = tokio::sync::mpsc::channel::<MetricsSnapshot>(4);
@@ -876,7 +881,11 @@ fn publish_platform_state_snapshot(
     if let Ok(mut snapshot) = platform_state.write() {
         *snapshot = crate::platform_controlplane::PlatformStateSnapshot {
             current_tick: tick_count,
-            stall_recent_activity_grace_ticks: platform_cp.config().stall_recent_activity_grace_ticks,
+            ebpf_collect_interval_ticks: platform_cp.config().ebpf_collect_interval_ticks,
+            stall_detection_threshold_secs: platform_cp.config().stall_detection_threshold_secs,
+            stall_recent_activity_grace_ticks: platform_cp
+                .config()
+                .stall_recent_activity_grace_ticks,
             llm_enabled: platform_cp.config().llm_enabled,
             llm_analysis_interval_secs: platform_cp.config().llm_analysis_interval_secs,
             llm_retry_delay_secs: platform_cp.config().llm_retry_delay_secs,
@@ -914,7 +923,11 @@ fn resolve_platform_analysis_target(
 fn parse_analysis_profile(
     parameters: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Option<sentinel_sandbox::ResourceProfile> {
-    let profile = parameters.get("profile")?.as_str()?.trim().to_ascii_lowercase();
+    let profile = parameters
+        .get("profile")?
+        .as_str()?
+        .trim()
+        .to_ascii_lowercase();
     match profile.as_str() {
         "idle" => Some(sentinel_sandbox::ResourceProfile::Idle),
         "normal" => Some(sentinel_sandbox::ResourceProfile::Normal),
@@ -1414,7 +1427,7 @@ fn ecs_tick_loop(
         "ECS World initialisiert"
     );
 
-    let mut tick_count: u64 = 0;
+    let mut tick_count: u64 = runtime_orch.current_tick();
     let mut current_shift = initial_shift;
 
     // sim_hour aus redb restaurieren (Fallback: 8.0 fuer Erststart)
@@ -1598,6 +1611,24 @@ fn ecs_tick_loop(
                         // Respawn bei naechstem Shift-Check
                         info!(agent_id = %agent_id,
                             "Agent nach Stall restartet (despawned, Respawn bei naechstem Shift-Check)");
+                    }
+                    crate::platform_controlplane::rules::PlatformSideEffect::RestartService(
+                        service_name,
+                    ) => {
+                        if crate::service_health::restart_service_now(&service_name) {
+                            let active =
+                                crate::service_health::is_service_active_now(&service_name);
+                            info!(
+                                service = %service_name,
+                                active,
+                                "Service nach Platform-Intervention restartet"
+                            );
+                        } else {
+                            warn!(
+                                service = %service_name,
+                                "Service-Restart via Platform-Intervention fehlgeschlagen"
+                            );
+                        }
                     }
                 }
             }
@@ -2355,8 +2386,9 @@ fn ecs_tick_loop(
             }
         }
 
-        // eBPF Metrics Collection (alle 10 Ticks = ~10s bei 1s Tick-Rate)
-        if tick_count > 0 && tick_count.is_multiple_of(10) {
+        // eBPF Metrics Collection (Intervall konfigurierbar fuer deterministische PCP-Tests)
+        let ebpf_collect_interval = platform_cp.config().ebpf_collect_interval_ticks.max(1);
+        if tick_count > 0 && tick_count.is_multiple_of(ebpf_collect_interval) {
             match ebpf_collector.collect() {
                 Ok(snapshot) => {
                     last_ebpf_snapshot = Some(snapshot.clone());

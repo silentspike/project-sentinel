@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use sentinel_common::DomainEventPayload;
 use sentinel_limbo::EventStore;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -106,8 +106,14 @@ impl PlatformLlmAnalyzerHandle {
             );
 
             while let Some(request) = rx.recv().await {
-                if let Err(error) =
-                    analyze_and_dispatch(&client, &worker_config, &event_store, &platform_tx, request).await
+                if let Err(error) = analyze_and_dispatch(
+                    &client,
+                    &worker_config,
+                    &event_store,
+                    &platform_tx,
+                    request,
+                )
+                .await
                 {
                     warn!(error = %error, "Platform LLM Analyzer fehlgeschlagen");
                 }
@@ -124,10 +130,7 @@ impl PlatformLlmAnalyzerHandle {
     }
 
     pub fn enqueue(&self, request: PlatformAnalysisRequest) -> Result<()> {
-        let tx = self
-            .tx
-            .as_ref()
-            .context("platform llm analyzer disabled")?;
+        let tx = self.tx.as_ref().context("platform llm analyzer disabled")?;
         tx.send(request)
             .map_err(|_| anyhow!("platform llm analyzer worker not running"))
     }
@@ -220,7 +223,10 @@ async fn analyze_and_dispatch(
 
     let gateway_request = build_gateway_request(config, &prompt_context);
     let response = client
-        .post(format!("{}/internal/llm", config.gateway_url.trim_end_matches('/')))
+        .post(format!(
+            "{}/internal/llm",
+            config.gateway_url.trim_end_matches('/')
+        ))
         .json(&gateway_request)
         .send()
         .await
@@ -251,7 +257,10 @@ fn build_gateway_request(config: &LlmAnalyzerConfig, context: &PromptContext) ->
     let mut metadata = HashMap::new();
     metadata.insert("request_id".to_string(), uuid::Uuid::new_v4().to_string());
     metadata.insert("agent_id".to_string(), "0".to_string());
-    metadata.insert("agent_name".to_string(), "PLATFORM-CONTROLPLANE".to_string());
+    metadata.insert(
+        "agent_name".to_string(),
+        "PLATFORM-CONTROLPLANE".to_string(),
+    );
     metadata.insert("agent_role".to_string(), "platform-analyst".to_string());
     metadata.insert("room_id".to_string(), "system".to_string());
     metadata.insert("platform_trigger".to_string(), context.trigger.clone());
@@ -303,7 +312,9 @@ fn parse_analyzer_response(content: &str) -> Result<AnalyzerResponse> {
 fn extract_json_object(content: &str) -> Result<&str> {
     let trimmed = content.trim();
     if trimmed.starts_with("```") {
-        let stripped = trimmed.trim_start_matches("```json").trim_start_matches("```");
+        let stripped = trimmed
+            .trim_start_matches("```json")
+            .trim_start_matches("```");
         let stripped = stripped.trim_end_matches("```").trim();
         if stripped.starts_with('{') && stripped.ends_with('}') {
             return Ok(stripped);
@@ -334,7 +345,8 @@ fn build_platform_analysis_command(
         recommendation: analysis.recommendation,
         suggested_action: analysis.suggested_action,
         target: analysis.target,
-        provider: (!gateway_response.provider.is_empty()).then(|| gateway_response.provider.clone()),
+        provider: (!gateway_response.provider.is_empty())
+            .then(|| gateway_response.provider.clone()),
         model: (!gateway_response.model.is_empty()).then(|| gateway_response.model.clone()),
         unresolved_keys,
         parameters: analysis.parameters,
@@ -467,8 +479,8 @@ mod tests {
                 .and_then(|line| line.split_whitespace().nth(1))
                 .unwrap_or("/")
                 .to_string();
-            let body = String::from_utf8(buf[header_end..header_end + content_length].to_vec())
-                .unwrap();
+            let body =
+                String::from_utf8(buf[header_end..header_end + content_length].to_vec()).unwrap();
             *captured_clone.lock().unwrap() = Some(CapturedRequest { path, body });
 
             if !delay.is_zero() {
