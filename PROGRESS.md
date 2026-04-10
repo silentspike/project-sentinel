@@ -4,10 +4,10 @@
 
 - Plan source: `/work/company/codex-plan263.md`
 - Overall status: `BLOCKED`
-- Current task: `Task 7 - Restliche Live-LLM-Evidence fuer AC-6/AC-7 ist durch claude-code-Quota blockiert; Deploy-, UI- und Benchmark-Evidence liegt vor`
+- Current task: `Task 7 - AC-6 ist live verifiziert; fuer AC-7 fehlt nur noch der erfolgreiche Recovery-Durchlauf nach Gateway-Recovery, der aktuell betriebsseitig an einem frischen claude-code-429-Fenster haengt`
 - Current branch: `feat/issue-263-platform-controlplane-completion`
 - Hook status: `PreToolUse TaskUpdate + PostToolUse start-enforcer projektlokal registriert`
-- Last refresh: `2026-04-05 Europe/Vienna`
+- Last refresh: `2026-04-10 Europe/Vienna`
 
 ## Current findings
 
@@ -44,11 +44,19 @@
   - VM-Memory-Overhead-Messung fuer wiederholte Analyse-Trigger: `delta_kb=-320`
   - Sidecar-Systemmetriken fuer die Tick-Benchmarks liegen unter `/tmp/pcp263-bench-tick/{without_cp,with_cp}/{bench,cpu,free,iostat,net,vmstat}.txt`
   - Live-Metrik bleibt bei `sentinel_tick_duration_ms 1000`; im letzten Stunde-Fenster gab es keine `panic`- oder `drift`-Treffer
+- Task-7-Live-LLM-Evidence wurde am `2026-04-10` neu gefahren:
+  - `AC-6` ist jetzt auf der VM frisch belegt: `manual`, `scheduled` und `unresolved_escalation` erzeugen echte `platform_analysis`-Events mit `provider=\"claude-code\"` / `model=\"claude-opus-4-6\"`
+  - `GET /operator/platform-state` zeigte waehrend der Verifikation `last_analysis_trigger` nacheinander auf `manual`, `unresolved_escalation` und spaeter wieder `scheduled`
+  - Daemon-Journal zeigte die korrespondierenden `ApplyAnalysis(PlatformAnalysisCommand { trigger: ... })`-Eintraege fuer `manual`, `scheduled` und `unresolved_escalation`
+  - Gateway-Journal zeigte dabei erfolgreiche `pipeline request completed`-Eintraege fuer `agent_id:\"0\"`, `agent_name:\"PLATFORM-CONTROLPLANE\"`; der Analyzer laeuft also ueber den Gateway-Pfad und nicht direkt an einer Provider-API vorbei
 - Offener harter Blocker fuer `#263`:
-  - `curl -s http://127.0.0.1:8080/health` liefert aktuell `{\"status\":\"ok\",\"version\":\"0.1.0\",\"circuit_breakers\":{\"claude-code\":\"open\"},\"guardrails_enabled\":false}`
-  - Gateway-Journal zeigt wiederholt `HTTP 429: claude-code result error: You've hit your limit · resets Apr 10, 6am (UTC)` sowie `provider circuit-broken`
-  - Daemon-Journal zeigt korrespondierend `sentinel_daemon::platform_controlplane::llm_analyzer`-/Bridge-Fehler mit `status=429/503`
-  - Damit sind die echte Live-Analyse fuer `AC-6`/`AC-7` und der LLM-Latenz-Benchmark aktuell betriebsseitig blockiert; der Issue-Stand ist deshalb nicht close-ready
+  - `AC-7` ist nach dem neuen VM-Rerun nur noch teilweise offen:
+    - der Fehlerpfad ist frisch belegt: bei absichtlich gestopptem `sentinel-gateway` blieb `sentinel-daemon` `active`, und das Journal zeigte wiederholt `Platform LLM Analyzer fehlgeschlagen error=gateway request failed`
+    - direkt nach Gateway-Recovery wurde der Recovery-Pfad nicht mehr durch Routing blockiert, sondern betriebsseitig durch einen frischen `HTTP 429: claude-code result error: You've hit your limit · resets 9pm (UTC) until 2026-04-10T21:00:00Z`
+    - Gateway-Logs zeigten im selben Fenster erfolgreiche Provider-Registrierung nach Restart, danach aber `provider request failed` fuer die `PLATFORM-CONTROLPLANE`-Requests; ein erfolgreicher post-recovery `platform_analysis`-Event liess sich in diesem Fenster deshalb nicht mehr frisch erzeugen
+  - Ein direkter Folgecheck um `2026-04-10 19:00 UTC` bestaetigte den Blocker: ein einzelner neuer `POST /operator/platform-analyze` erzeugte **kein** neues `platform_analysis`-Event; Gateway-Logs zeigten wieder `provider request failed` mit demselben `HTTP 429 ... resets 9pm (UTC)`-Fenster, und `/health` stand vor dem Trigger bereits wieder auf `claude-code:\"open\"`
+  - Nach dem Test-Rueckbau sind `sentinel-daemon` und `sentinel-gateway` wieder `active`, `/opt/sentinel/config/daemon.toml` ist auf dem produktiven Default-Stand, aber der aktuelle Gateway-Status bleibt betriebsseitig volatil (`claude-code` oeffnet erneut, sobald der naechste Platform-Analyzer-Request in das laufende Quota-Fenster laeuft)
+  - Damit bleiben aktuell nur noch der erfolgreiche Recovery-Nachweis fuer `AC-7` und der LLM-Latenz-Benchmark betriebsseitig blockiert; `AC-6` selbst ist nicht mehr offen
 - Task-2-Schemaarbeit ist lokal umgesetzt:
   - [events.rs](/work/company/project-sentinel/crates/sentinel-common/src/events.rs) enthaelt jetzt `PlatformAnalysis` inklusive `trigger`, `severity`, `summary`, `recommendation`, `suggested_action`, `target`, `provider`, `model`, `unresolved_keys` und `parameters`
   - [config.rs](/work/company/project-sentinel/services/sentinel-daemon/src/config.rs) und [daemon.toml](/work/company/project-sentinel/config/daemon.toml) tragen jetzt die benoetigten Platform-CP-Felder fuer Grace-, LLM-, Retry- und Timeout-Steuerung
@@ -89,8 +97,8 @@
   - `cd dashboard && bun test src/__tests__/control.test.ts src/routes/cockpit.test.ts` => Exit `0`; `27 pass`
   - `cd dashboard && bun test` => Exit `0`; `63 pass`
 - Offen bleibt fuer Task 7 bewusst:
-  - `SENTINEL_DASHBOARD_API_KEY` ist live auf `sentinel-projection` weiter leer und muss fuer die UI-Write-Abnahme auf der VM erst provisioniert werden
-  - Playwright-/Screenshot-Evidence und die echte VM-Read/Write-Verifikation folgen erst nach Deploy in Task 7
+  - `AC-7` braucht noch einen frischen erfolgreichen Recovery-Durchlauf nach Gateway-Recovery ohne gleichzeitiges `claude-code`-Quota-Fenster
+  - der LLM-Latenz-Benchmark muss in demselben quota-freien Fenster noch einmal mit echtem `platform_analysis`-Roundtrip gemessen werden
 
 ## Blocked items
 
@@ -104,8 +112,8 @@
 - `f2bd13a` Task [3]
 - `93f2080` Task [4]
 - `3355a69` Task [5]
-- `TBD` Task [6]
-- `TBD` Task [7]
+- `a20ce51` Task [6]
+- `c95bcd5` Task [7]
 - `TBD` Task [8]
 
 ## Task table
@@ -400,14 +408,22 @@
 - Outcome:
   - Remote-Release-Artefakte fuer `sentinel-daemon` und `agent-runtime` wurden deployt; Dashboard-Assets fuer Control/Cockpit laufen live auf der VM.
   - Die UI-Read-/Write-Surfaces fuer `#263` sind ueber Dashboard und Playwright sichtbar und dokumentiert.
+  - `AC-6` ist jetzt live belegt: `manual`, `scheduled` und `unresolved_escalation` erzeugen frische `platform_analysis`-Events ueber den echten LLM-Pfad.
   - Alle nicht-LLM-abhaengigen ACs sowie die deterministischen Operator-/UI-/State-Pfade sind auf der VM belegt.
   - Die korrigierten Tick-Benchmarks sind auf der VM mit Sidecar-Systemmetriken neu gelaufen und jetzt wieder vergleichbar.
-  - Ein echter betrieblicher Blocker bleibt: `claude-code` ist aktuell im Quota-Limit, der Circuit-Breaker steht `open`, und frische Live-`platform_analysis`-Events ueber den echten LLM-Pfad lassen sich derzeit nicht erzeugen.
+  - Ein echter betrieblicher Blocker bleibt: fuer `AC-7` liess sich der erfolgreiche Recovery-Durchlauf nach Gateway-Restart im letzten Rerun nicht mehr erzeugen, weil das `claude-code`-Providerfenster waehrend des Tests in `HTTP 429` lief.
 - Evidence:
   - Deploy PASS:
     - `cargo remote -c -- build -p sentinel-daemon --release` und der bereits gruen gelaufene `agent-runtime`-Release-Stand wurden nach `10.0.0.240` deployed
     - `ssh ubuntu@10.0.0.240 "curl -sf http://127.0.0.1:8084/operator/platform-state"` liefert einen echten Snapshot statt `Endpoint unbekannt`
     - `ssh ubuntu@10.0.0.240 "curl -sf http://127.0.0.1:8000/api/control/platform-state"` und `.../platform-analyses` liefern Dashboard-Daten; letzter Analyse-Trigger ist aktuell `operator_test`
+  - AC-6 PASS:
+    - `ssh ubuntu@10.0.0.240 "curl -s -X POST http://127.0.0.1:8084/operator/platform-analyze -H 'Content-Type: application/json' -d '{}'"` => `{\"accepted\":true,\"message\":\"Platform-Analyse eingeplant\"}`
+    - `ssh ubuntu@10.0.0.240 "curl -s -X POST http://127.0.0.1:8084/operator/platform-trigger-test -H 'Content-Type: application/json' -d '{\"trigger\":\"scheduled\"}'"` => `{\"accepted\":true,\"message\":\"Platform-Testtrigger scheduled eingeplant\"}`
+    - `ssh ubuntu@10.0.0.240 "curl -s -X POST http://127.0.0.1:8084/operator/platform-trigger-test -H 'Content-Type: application/json' -d '{\"trigger\":\"unresolved_escalation\",\"rule_name\":\"projection_lag\",\"target\":\"system\",\"count\":3}'"` => `{\"accepted\":true,\"message\":\"Platform-Testtrigger unresolved_escalation eingeplant\"}`
+    - `ssh ubuntu@10.0.0.240 "sqlite3 -json /opt/sentinel/data/events.db \"SELECT id, json_extract(payload,'$.trigger'), json_extract(payload,'$.provider'), json_extract(payload,'$.model') FROM events WHERE event_type='platform_analysis' ORDER BY id DESC LIMIT 3\""` zeigte danach frische Events fuer `manual`, `scheduled` und `unresolved_escalation`, jeweils mit `provider=\"claude-code\"` und `model=\"claude-opus-4-6\"`
+    - `ssh ubuntu@10.0.0.240 "journalctl -u sentinel-daemon --since '10 min ago' --no-pager | grep -Ei 'ApplyAnalysis\\(|Platform-Analyse an Operator eskaliert|Platform-Controlplane Trigger empfangen'"` zeigte die korrespondierenden `ApplyAnalysis(PlatformAnalysisCommand { trigger: ... })`-Eintraege
+    - `ssh ubuntu@10.0.0.240 "journalctl -u sentinel-gateway --since '10 min ago' --no-pager | grep 'PLATFORM-CONTROLPLANE'"` zeigte erfolgreiche Gateway-Requests mit `agent_id\":\"0\"`, `agent_name\":\"PLATFORM-CONTROLPLANE\"`
   - UI PASS:
     - produktiver Dashboard-Key wurde aus `sentinel-dashboard.service` gelesen, nicht aus `sentinel-projection`
     - Playwright-Screenshots: `/tmp/pcp263-control-baseline.png`, `/tmp/pcp263-control-analysis.png`, `/tmp/pcp263-cockpit-platform.png`
@@ -418,14 +434,15 @@
     - `platform_cp.tick_overhead_with_cp`: `[217.30 ms 243.71 ms 274.69 ms]` ueber `1000` Ticks, also ca. `0.217-0.275 ms` pro Tick und damit deutlich unter dem `< 2 %`-Budget relativ zur `1 Hz`-Tickdauer
     - `Memory-Overhead`: `delta_kb=-320`, damit innerhalb des `< 10 MB`-Budgets
     - Sidecar-Systemmetriken: `/tmp/pcp263-bench-tick/with_cp/*` und `/tmp/pcp263-bench-tick/without_cp/*`
-    - LLM-Analyse-Latenz ist aktuell BLOCKED, weil der echte LLM-Pfad durch `claude-code`-Quota kein frisches `platform_analysis` erzeugt
+    - LLM-Analyse-Latenz ist aktuell BLOCKED, weil der Recovery-Rerun fuer `AC-7` im betroffenen Fenster auf `HTTP 429` lief und damit kein sauberer End-to-End-Roundtrip ueber den Recovery-Pfad mehr messbar war
   - Stability PASS:
     - `ssh ubuntu@10.0.0.240 "curl -sf http://127.0.0.1:9090/metrics | grep '^sentinel_tick_duration_ms '"` => `sentinel_tick_duration_ms 1000`
     - `ssh ubuntu@10.0.0.240 "journalctl -u sentinel-daemon --since '1 hour ago' --no-pager | grep -Ei 'panic|drift' || true"` => kein Treffer
   - Blocker:
-    - `ssh ubuntu@10.0.0.240 "curl -s http://127.0.0.1:8080/health"` => `claude-code:\"open\"`
-    - Gateway-Logs zeigen `HTTP 429 ... You've hit your limit · resets Apr 10, 6am (UTC)` und `provider circuit-broken`
-    - Daemon-Logs zeigen korrespondierende Gateway-Fehler `status=429/503`
+    - `AC-7` Failure/No-Crash ist frisch bewiesen: bei temporaer auf `cycle_interval_ticks = 5` abgesenkter VM-Konfiguration und gestopptem `sentinel-gateway` blieb `sentinel-daemon` `active`, waehrend das Journal wiederholt `Platform LLM Analyzer fehlgeschlagen error=gateway request failed` zeigte
+    - derselbe Rerun zeigte nach Gateway-Restart zwar wieder Provider-Registrierung und den korrekten Gateway-Pfad, aber die Recovery-Requests liefen in ein frisches `HTTP 429 ... You've hit your limit · resets 9pm (UTC) until 2026-04-10T21:00:00Z`
+    - ein direkter Folgecheck um `19:00 UTC` bestaetigte, dass selbst ein einzelner manueller Analyse-Trigger noch in dasselbe `HTTP 429`-Fenster laeuft und kein neues `platform_analysis` erzeugt
+    - der Test-Rueckbau ist vollstaendig: `sentinel-daemon` und `sentinel-gateway` sind wieder `active`, `/opt/sentinel/config/daemon.toml` steht wieder auf `cycle_interval_ticks = 60` / `llm_analysis_interval_secs = 300` / `llm_retry_delay_secs = 60`
 
 ### Task 8 - Plan-Verifikation
 
