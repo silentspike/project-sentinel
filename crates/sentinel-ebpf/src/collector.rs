@@ -6,6 +6,7 @@
 //! Polling interval: 1s for hash maps, event-driven for ring buffer.
 
 use std::collections::HashMap;
+use std::fs;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -114,9 +115,14 @@ pub struct EbpfCollector {
 impl EbpfCollector {
     /// Creates a new collector in the specified monitoring mode.
     pub fn new(mode: MonitoringMode) -> Self {
+        Self::new_with_stall_threshold(mode, AgentHealthChecker::default().threshold_secs())
+    }
+
+    /// Creates a new collector with an explicit stall threshold in seconds.
+    pub fn new_with_stall_threshold(mode: MonitoringMode, stall_threshold_secs: u64) -> Self {
         Self {
             mode,
-            health_checker: AgentHealthChecker::new(),
+            health_checker: AgentHealthChecker::with_threshold(stall_threshold_secs),
             io_profiler: IoProfiler::new(),
             network_monitor: NetworkMonitor::new(),
             agent_mappings: Vec::new(),
@@ -133,9 +139,23 @@ impl EbpfCollector {
     /// Creates a collector with loaded eBPF probes for kernel-mode collection.
     #[cfg(feature = "ebpf")]
     pub fn with_probes(mode: MonitoringMode, probes: crate::loader::LoadedProbes) -> Self {
+        Self::with_probes_and_stall_threshold(
+            mode,
+            probes,
+            AgentHealthChecker::default().threshold_secs(),
+        )
+    }
+
+    /// Creates a collector with loaded eBPF probes and an explicit stall threshold.
+    #[cfg(feature = "ebpf")]
+    pub fn with_probes_and_stall_threshold(
+        mode: MonitoringMode,
+        probes: crate::loader::LoadedProbes,
+        stall_threshold_secs: u64,
+    ) -> Self {
         Self {
             mode,
-            health_checker: AgentHealthChecker::new(),
+            health_checker: AgentHealthChecker::with_threshold(stall_threshold_secs),
             io_profiler: IoProfiler::new(),
             network_monitor: NetworkMonitor::new(),
             agent_mappings: Vec::new(),
@@ -201,10 +221,12 @@ impl EbpfCollector {
             .iter_mut()
             .find(|m| m.cgroup_id == cgroup_id)
         {
-            mapping.pid = Some(pid);
+            let resolved_pid = resolve_agent_runtime_pid(&mapping.cgroup_path).unwrap_or(pid);
+            mapping.pid = Some(resolved_pid);
             debug!(
                 agent = %mapping.agent_name,
-                pid,
+                requested_pid = pid,
+                pid = resolved_pid,
                 "Agent PID updated for eBPF monitoring"
             );
         }
@@ -518,13 +540,6 @@ impl EbpfCollector {
                 }
                 if event_count > 0 {
                     debug!(events = event_count, "Drained TCP ring buffer");
-                    // TCP activity indicates agent processes are communicating
-                    // (LLM API calls via HTTP). Since TCP events lack cgroup_id,
-                    // mark ALL registered agents as active — they share the sentinel
-                    // cgroup hierarchy and any TCP activity means agent work.
-                    for &cid in &registered_cgroups {
-                        self.health_checker.record_write(cid, now_secs);
-                    }
                 }
             }
         }
@@ -744,6 +759,37 @@ impl EbpfCollector {
 
         psi_map
     }
+}
+
+fn resolve_agent_runtime_pid(cgroup_path: &str) -> Option<u32> {
+    let procs_path = format!("{cgroup_path}/cgroup.procs");
+    let entries = fs::read_to_string(procs_path).ok()?;
+    let mut candidates = Vec::new();
+    for line in entries.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let pid = match line.parse::<u32>() {
+            Ok(pid) => pid,
+            Err(_) => continue,
+        };
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        candidates.push((pid, comm));
+    }
+    select_agent_runtime_pid(&candidates)
+}
+
+fn select_agent_runtime_pid(candidates: &[(u32, String)]) -> Option<u32> {
+    candidates
+        .iter()
+        .filter(|(_, comm)| comm == "agent-runtime")
+        .map(|(pid, _)| *pid)
+        .max()
+        .or_else(|| candidates.iter().map(|(pid, _)| *pid).max())
 }
 
 /// Data from /proc/{pid}/io.
@@ -1076,5 +1122,24 @@ mod tests {
             snapshot.stalled_agents.is_empty(),
             "Freshly registered agent must not be stalled"
         );
+    }
+
+    #[test]
+    fn select_agent_runtime_pid_prefers_inner_runtime() {
+        let candidates = vec![
+            (1001, "bwrap".to_string()),
+            (1002, "bwrap".to_string()),
+            (1009, "agent-runtime".to_string()),
+        ];
+        assert_eq!(select_agent_runtime_pid(&candidates), Some(1009));
+    }
+
+    #[test]
+    fn select_agent_runtime_pid_falls_back_to_highest_pid() {
+        let candidates = vec![
+            (2001, "bwrap".to_string()),
+            (2007, "landlock-wrappe".to_string()),
+        ];
+        assert_eq!(select_agent_runtime_pid(&candidates), Some(2007));
     }
 }

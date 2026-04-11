@@ -49,6 +49,23 @@ function eventSeverity(eventType: string, payload: unknown): IncidentSeverity {
   if (eventType === "chaos_triggered") return "high";
   if (eventType === "agent_consolidation_failed") return "high";
   if (eventType === "agent_despawned") return "medium";
+  if (eventType === "platform_analysis") {
+    const severity = String(
+      (payload as { severity?: string }).severity ?? "medium",
+    ).toLowerCase();
+    if (severity === "critical") return "critical";
+    if (severity === "high" || severity === "warning") return "high";
+    if (severity === "low" || severity === "info") return "low";
+    return "medium";
+  }
+  if (eventType === "platform_intervention") {
+    const action = String((payload as { action?: string }).action ?? "").toLowerCase();
+    if (action.includes("restart")) return "high";
+    if (action.includes("prune") || action.includes("idle") || action.includes("force")) {
+      return "medium";
+    }
+    return "medium";
+  }
   if (eventType === "nightrun_completed") {
     const p = payload as { agents_failed?: number };
     return (p.agents_failed ?? 0) > 0 ? "medium" : "low";
@@ -86,6 +103,13 @@ function summarizeEvent(
       const consolidated = payload.agents_consolidated ?? 0;
       return `Nightrun: ${String(consolidated)} konsolidiert, ${String(failed)} fehlgeschlagen`;
     }
+    case "platform_analysis": {
+      const severity = String(payload.severity ?? "info").toUpperCase();
+      const target = String(payload.target ?? aggregateId);
+      return `Platform Analyse ${severity}: ${String(payload.summary ?? "ohne Summary")} (${target})`;
+    }
+    case "platform_intervention":
+      return `Platform Intervention: ${String(payload.action ?? "unknown")} fuer ${String(payload.target ?? aggregateId)} — ${String(payload.description ?? "")}`;
     default:
       return `${eventType} on ${aggregateId}`;
   }
@@ -182,6 +206,7 @@ function determineOutcome(
     "bio_action_performed",
     "agent_spawned",
     "agent_action_received",
+    "resource_profile_changed",
   ];
   if (resolvedTypes.includes(last.event_type)) {
     return { status: "resolved", outcome: last.summary };
@@ -234,10 +259,7 @@ function buildEventIncident(event: EventRow): CockpitIncident {
     incident_type: event.event_type,
     severity,
     status,
-    agent_id: event.event_type === "agent_despawned" ||
-      event.event_type === "agent_consolidation_failed"
-      ? event.aggregate_id
-      : null,
+    agent_id: event.aggregate_id.startsWith("AGENT-") ? event.aggregate_id : null,
     room_id: event.event_type === "chaos_triggered"
       ? (payload.target_room as string | null) ?? event.aggregate_id
       : null,

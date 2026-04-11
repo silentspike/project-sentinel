@@ -358,8 +358,13 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     info!("Episode Producer initialisiert");
 
     // -- eBPF Monitoring initialisieren --
-    let (ebpf_collector, ebpf_mode) = crate::ebpf::init_ebpf();
-    info!(mode = %ebpf_mode, "eBPF Monitoring initialisiert");
+    let (ebpf_collector, ebpf_mode) =
+        crate::ebpf::init_ebpf(config.platform_controlplane.stall_detection_threshold_secs);
+    info!(
+        mode = %ebpf_mode,
+        stall_threshold_secs = config.platform_controlplane.stall_detection_threshold_secs,
+        "eBPF Monitoring initialisiert"
+    );
 
     // -- eBPF Bridge: mpsc + shared Prometheus Text --
     let (ebpf_tx, ebpf_rx) = tokio::sync::mpsc::channel::<MetricsSnapshot>(4);
@@ -368,6 +373,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // -- Channels fuer ECS <-> Async Bridge --
     let (action_tx, action_rx) = mpsc::channel();
     let (operator_tx, operator_rx) = mpsc::channel::<OperatorCommand>();
+    let (platform_tx, platform_rx) =
+        mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>();
     let (nightrun_tx, nightrun_rx) = mpsc::channel::<sentinel_common::OperatorNightrunCommand>();
     let (snapshot_tx, snapshot_rx) = mpsc::channel::<sentinel_common::OperatorSnapshotCommand>();
     let (restore_tx, restore_rx) = mpsc::channel::<sentinel_common::OperatorRestoreCommand>();
@@ -375,6 +382,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // Bounded Channel: 128 Slots. Bridge drainet per try_recv() vor jedem LLM-Call.
     // Output_system nutzt try_send() (non-blocking, WARN bei Drop).
     let (perception_tx, perception_rx) = mpsc::sync_channel::<Perception>(128);
+    let platform_state = Arc::new(RwLock::new(
+        crate::platform_controlplane::PlatformStateSnapshot::default(),
+    ));
 
     // -- Zenoh SentinelBus (Core-Bus fuer Real-Time Event-Verteilung) --
     let bus_config = config.zenoh.to_bus_config();
@@ -445,18 +455,43 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         )
     };
     let operator_room_ids = room_distances.all_rooms().to_vec();
+
+    // -- Platform LLM Analyzer starten (daemon-interner Background-Worker) --
+    #[cfg(feature = "llm")]
+    let platform_llm_analyzer = {
+        let gateway_url =
+            std::env::var("CORTEX_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8080".into());
+        let analyzer_config =
+            crate::platform_controlplane::llm_analyzer::LlmAnalyzerConfig::from_platform_config(
+                &config.platform_controlplane,
+                gateway_url,
+            );
+        let handle = crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::spawn(
+            analyzer_config,
+            Arc::clone(&event_store),
+            platform_tx.clone(),
+        );
+        info!(
+            enabled = handle.is_enabled(),
+            "Platform LLM Analyzer initialisiert"
+        );
+        handle
+    };
+
     let operator_api_handle = if config.operator_api.enabled {
         Some(
             operator_api::start_server(
                 config.operator_api.clone(),
                 operator_room_ids,
                 operator_tx.clone(),
+                platform_tx.clone(),
                 nightrun_tx.clone(),
                 snapshot_tx.clone(),
                 restore_tx.clone(),
                 Arc::clone(&event_store),
                 prune_tx.clone(),
                 Arc::clone(&state_store),
+                Arc::clone(&platform_state),
             )
             .await?,
         )
@@ -483,14 +518,21 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         .unwrap_or("data/evolution.db")
         .to_string();
     let ecs_state_store = Arc::clone(&state_store);
+    let ecs_event_store = Arc::clone(&event_store);
+    let retention_config = config.retention.clone();
+    let resource_manager_config = config.resource_manager.clone();
+    let platform_cp_config = config.platform_controlplane.clone();
+    let events_db_path = events_path.to_string_lossy().to_string();
+    let ecs_platform_state = Arc::clone(&platform_state);
     let ecs_handle = std::thread::Builder::new()
         .name("ecs-tick-loop".into())
         .spawn(move || {
             ecs_tick_loop(
                 ecs_state_store,
-                event_store,
+                ecs_event_store,
                 action_rx,
                 operator_rx,
+                platform_rx,
                 perception_tx,
                 all_agents_clone,
                 current_shift,
@@ -507,16 +549,19 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 snapshot_rx,
                 restore_rx,
                 prune_rx,
-                config.retention.clone(),
+                retention_config,
                 evolution_db_path_clone,
                 agent_command_cfg,
                 adaptive_config,
                 room_distances,
                 room_info,
                 fanout_sender,
-                config.resource_manager.clone(),
-                config.platform_controlplane.clone(),
-                events_path.to_string_lossy().to_string(),
+                resource_manager_config,
+                platform_cp_config,
+                events_db_path,
+                ecs_platform_state,
+                #[cfg(feature = "llm")]
+                platform_llm_analyzer.clone(),
             )
         })
         .context("ECS Thread spawnen")?;
@@ -760,6 +805,228 @@ fn extract_swap_provider(details: &str) -> String {
     "claude-code".to_string()
 }
 
+fn collect_platform_metrics_snapshot(
+    runtime_orch: &RuntimeOrchestrator,
+    pcp_metrics_collector: &mut crate::platform_controlplane::metrics::PlatformMetricsCollector,
+    last_ebpf_snapshot: &Option<sentinel_ebpf::collector::MetricsSnapshot>,
+    event_store: &EventStore,
+    events_db_path_str: &str,
+    tick_count: u64,
+    service_health_checker: &crate::service_health::ServiceHealthChecker,
+) -> (
+    crate::platform_controlplane::metrics::PlatformMetrics,
+    std::collections::HashMap<String, sentinel_common::AgentId>,
+) {
+    let agent_names: Vec<String> = runtime_orch
+        .agents()
+        .values()
+        .map(|h| h.identity.name.clone())
+        .collect();
+    let agent_name_to_id: std::collections::HashMap<String, sentinel_common::AgentId> =
+        runtime_orch
+            .agents()
+            .iter()
+            .map(|(id, h)| (h.identity.name.clone(), *id))
+            .collect();
+    let failed_services = service_health_checker.poll_failed();
+    let mut pcp_metrics = crate::platform_controlplane::metrics::collect(
+        pcp_metrics_collector,
+        last_ebpf_snapshot,
+        event_store,
+        events_db_path_str,
+        &agent_names,
+        tick_count,
+        failed_services,
+    );
+    for handle in runtime_orch.agents().values() {
+        pcp_metrics
+            .last_action_ticks
+            .insert(handle.identity.name.clone(), handle.last_activity_tick.0);
+    }
+    (pcp_metrics, agent_name_to_id)
+}
+
+fn publish_platform_state_snapshot(
+    platform_state: &Arc<RwLock<crate::platform_controlplane::PlatformStateSnapshot>>,
+    tick_count: u64,
+    platform_cp: &crate::platform_controlplane::PlatformControlplane,
+    runtime_orch: &RuntimeOrchestrator,
+    resource_manager: &crate::resource_manager::ResourceManager,
+) {
+    let agents = runtime_orch
+        .agents()
+        .iter()
+        .map(|(agent_id, handle)| {
+            let cgroup_path = sentinel_sandbox::cgroup_path(&handle.identity.name);
+            let cgroup_path = if std::path::Path::new(&cgroup_path).exists() {
+                cgroup_path
+            } else {
+                String::new()
+            };
+            crate::platform_controlplane::PlatformAgentSnapshot {
+                agent_id: agent_id.0,
+                aggregate_id: agent_id.to_string(),
+                name: handle.identity.name.clone(),
+                last_activity_tick: handle.last_activity_tick.0,
+                cgroup_path,
+                current_profile: resource_manager.get_profile(agent_id).to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let resource_profiles = agents
+        .iter()
+        .map(|agent| (agent.aggregate_id.clone(), agent.current_profile.clone()))
+        .collect();
+
+    if let Ok(mut snapshot) = platform_state.write() {
+        *snapshot = crate::platform_controlplane::PlatformStateSnapshot {
+            current_tick: tick_count,
+            ebpf_collect_interval_ticks: platform_cp.config().ebpf_collect_interval_ticks,
+            stall_detection_threshold_secs: platform_cp.config().stall_detection_threshold_secs,
+            stall_recent_activity_grace_ticks: platform_cp
+                .config()
+                .stall_recent_activity_grace_ticks,
+            llm_enabled: platform_cp.config().llm_enabled,
+            llm_analysis_interval_secs: platform_cp.config().llm_analysis_interval_secs,
+            llm_retry_delay_secs: platform_cp.config().llm_retry_delay_secs,
+            last_analysis_tick: platform_cp.last_analysis_tick(),
+            last_analysis_trigger: platform_cp.last_analysis_trigger().map(str::to_string),
+            last_scheduled_analysis_tick: platform_cp.last_scheduled_analysis_tick(),
+            unresolved_counts: platform_cp
+                .unresolved_counts()
+                .iter()
+                .map(|(key, value)| (key.clone(), *value))
+                .collect(),
+            threshold_overrides: platform_cp.threshold_overrides().clone(),
+            resource_profiles,
+            agents,
+        };
+    }
+}
+
+fn resolve_platform_analysis_target(
+    runtime_orch: &RuntimeOrchestrator,
+    target: &str,
+) -> Option<(AgentId, String)> {
+    let target = target.trim();
+    runtime_orch.agents().iter().find_map(|(agent_id, handle)| {
+        if handle.identity.name.eq_ignore_ascii_case(target)
+            || agent_id.to_string().eq_ignore_ascii_case(target)
+        {
+            Some((*agent_id, handle.identity.name.clone()))
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_analysis_profile(
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Option<sentinel_sandbox::ResourceProfile> {
+    let profile = parameters
+        .get("profile")?
+        .as_str()?
+        .trim()
+        .to_ascii_lowercase();
+    match profile.as_str() {
+        "idle" => Some(sentinel_sandbox::ResourceProfile::Idle),
+        "normal" => Some(sentinel_sandbox::ResourceProfile::Normal),
+        "heavy" => Some(sentinel_sandbox::ResourceProfile::Heavy),
+        "suspended" => Some(sentinel_sandbox::ResourceProfile::Suspended),
+        _ => None,
+    }
+}
+
+fn apply_platform_analysis_command(
+    analysis: crate::platform_controlplane::PlatformAnalysisCommand,
+    tick: u64,
+    runtime_orch: &RuntimeOrchestrator,
+    platform_cp: &mut crate::platform_controlplane::PlatformControlplane,
+    resource_manager: &mut crate::resource_manager::ResourceManager,
+    event_store: &EventStore,
+) -> Result<()> {
+    crate::platform_controlplane::persist_platform_analysis_event(event_store, tick, &analysis)?;
+
+    let target = analysis.normalized_target();
+    let Some(action) = analysis
+        .suggested_action
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        debug!(
+            trigger = %analysis.trigger,
+            severity = %analysis.severity,
+            target = %target,
+            "Platform-Analyse ohne Suggested Action persistiert"
+        );
+        return Ok(());
+    };
+
+    match action {
+        "force_profile" => {
+            let (agent_id, agent_name) = resolve_platform_analysis_target(runtime_orch, &target)
+                .with_context(|| format!("PlatformAnalysis target nicht aufloesbar: {target}"))?;
+            let profile = parse_analysis_profile(&analysis.parameters)
+                .context("force_profile braucht gueltiges parameters.profile")?;
+            resource_manager.force_profile_and_apply(
+                agent_id,
+                &agent_name,
+                profile,
+                event_store,
+                tick,
+            )?;
+            info!(
+                trigger = %analysis.trigger,
+                target = %target,
+                profile = %profile,
+                "Platform-Analyse force_profile ausgefuehrt"
+            );
+        }
+        "adjust_threshold" => {
+            let key = analysis
+                .parameters
+                .get("key")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .context("adjust_threshold braucht parameters.key")?;
+            let value = analysis
+                .parameters
+                .get("value")
+                .cloned()
+                .context("adjust_threshold braucht parameters.value")?;
+            platform_cp.apply_threshold_override(key, value)?;
+            info!(
+                trigger = %analysis.trigger,
+                target = %target,
+                key,
+                "Platform-Analyse adjust_threshold ausgefuehrt"
+            );
+        }
+        "escalate_to_operator" => {
+            warn!(
+                trigger = %analysis.trigger,
+                severity = %analysis.severity,
+                target = %target,
+                summary = %analysis.summary,
+                recommendation = %analysis.recommendation,
+                "Platform-Analyse an Operator eskaliert"
+            );
+        }
+        other => {
+            warn!(
+                trigger = %analysis.trigger,
+                suggested_action = other,
+                target = %target,
+                "Platform-Analyse Suggested Action ignoriert"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// ECS Tick-Loop auf dediziertem Thread.
 ///
 /// Verwaltet den RuntimeOrchestrator (Lifecycle-Events, Shift-Wechsel, Snapshots)
@@ -771,6 +1038,7 @@ fn ecs_tick_loop(
     event_store: Arc<EventStore>,
     action_rx: mpsc::Receiver<sentinel_common::AgentAction>,
     operator_rx: mpsc::Receiver<sentinel_common::OperatorCommand>,
+    platform_rx: mpsc::Receiver<crate::platform_controlplane::PlatformControlCommand>,
     perception_tx: mpsc::SyncSender<Perception>,
     all_agents: Vec<AgentConfig>,
     initial_shift: u8,
@@ -797,6 +1065,9 @@ fn ecs_tick_loop(
     resource_manager_config: crate::config::ResourceManagerConfig,
     platform_cp_config: crate::config::PlatformControlplaneConfig,
     events_db_path_str: String,
+    platform_state: Arc<RwLock<crate::platform_controlplane::PlatformStateSnapshot>>,
+    #[cfg(feature = "llm")]
+    platform_llm_analyzer: crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle,
 ) -> Result<u64> {
     // Adaptive Tick-Rate Controller (PSI-basiert, TOGAF Adaptive Scheduling)
     let mut adaptive_tick = AdaptiveTickRate::new(adaptive_config);
@@ -1156,7 +1427,7 @@ fn ecs_tick_loop(
         "ECS World initialisiert"
     );
 
-    let mut tick_count: u64 = 0;
+    let mut tick_count: u64 = runtime_orch.current_tick();
     let mut current_shift = initial_shift;
 
     // sim_hour aus redb restaurieren (Fallback: 8.0 fuer Erststart)
@@ -1232,46 +1503,59 @@ fn ecs_tick_loop(
             adaptive_tick.should_block_spawn(),
         );
 
+        while let Ok(command) = platform_rx.try_recv() {
+            info!(command = ?command, "Platform-Controlplane Trigger empfangen");
+            match command {
+                crate::platform_controlplane::PlatformControlCommand::AnalyzeNow => platform_cp
+                    .enqueue_control_command(
+                        crate::platform_controlplane::PlatformControlCommand::AnalyzeNow,
+                    ),
+                crate::platform_controlplane::PlatformControlCommand::TriggerTest(trigger) => {
+                    platform_cp.enqueue_control_command(
+                        crate::platform_controlplane::PlatformControlCommand::TriggerTest(trigger),
+                    );
+                }
+                crate::platform_controlplane::PlatformControlCommand::ApplyAnalysis(analysis) => {
+                    if let Err(error) = apply_platform_analysis_command(
+                        analysis,
+                        tick_count,
+                        &runtime_orch,
+                        &mut platform_cp,
+                        &mut resource_manager,
+                        &event_store_for_prune,
+                    ) {
+                        warn!(error = %error, "Platform-Analyse konnte nicht ausgefuehrt werden");
+                    }
+                }
+            }
+        }
+
         // Platform-Controlplane: Self-Healing (alle N Ticks)
         if sentinel_common::feature_flags::RuntimeFlags::global().platform_controlplane_enabled
             && platform_cp.should_run(tick_count)
         {
-            let agent_names: Vec<String> = runtime_orch
-                .agents()
-                .values()
-                .map(|h| h.identity.name.clone())
-                .collect();
-            let agent_name_to_id: std::collections::HashMap<String, sentinel_common::AgentId> =
-                runtime_orch
-                    .agents()
-                    .iter()
-                    .map(|(id, h)| (h.identity.name.clone(), *id))
-                    .collect();
-            let failed_services = service_health_checker.poll_failed();
-            let mut pcp_metrics = crate::platform_controlplane::metrics::collect(
+            let (pcp_metrics, agent_name_to_id) = collect_platform_metrics_snapshot(
+                &runtime_orch,
                 &mut pcp_metrics_collector,
                 &last_ebpf_snapshot,
                 &event_store_for_prune,
                 &events_db_path_str,
-                &agent_names,
                 tick_count,
-                failed_services,
+                &service_health_checker,
             );
-            // last_action_ticks aus RuntimeOrchestrator befuellen —
-            // Agents mit kuerzlicher Activity sollen nicht als stalled despawnt werden.
-            for (id, handle) in runtime_orch.agents() {
-                let _ = id; // Agent-Name ist im Handle
-                pcp_metrics
-                    .last_action_ticks
-                    .insert(handle.identity.name.clone(), handle.last_activity_tick.0);
-            }
-            let side_effects = platform_cp.cycle(
+            let output = platform_cp.cycle(
                 &pcp_metrics,
                 &event_store_for_prune,
                 tick_count,
                 &agent_name_to_id,
             );
-            for effect in side_effects {
+            #[cfg(feature = "llm")]
+            for request in output.analysis_requests {
+                if let Err(error) = platform_llm_analyzer.enqueue(request) {
+                    warn!(error = %error, "Platform LLM Analyzer enqueue fehlgeschlagen");
+                }
+            }
+            for effect in output.side_effects {
                 match effect {
                     crate::platform_controlplane::rules::PlatformSideEffect::TriggerPrune(
                         _cutoff,
@@ -1287,8 +1571,21 @@ fn ecs_tick_loop(
                     crate::platform_controlplane::rules::PlatformSideEffect::ForceIdleProfile(
                         agent_id,
                     ) => {
-                        resource_manager
-                            .force_profile(agent_id, sentinel_sandbox::ResourceProfile::Idle);
+                        if let Some(handle) = runtime_orch.agents().get(&agent_id) {
+                            if let Err(error) = resource_manager.force_profile_and_apply(
+                                agent_id,
+                                &handle.identity.name,
+                                sentinel_sandbox::ResourceProfile::Idle,
+                                &event_store_for_prune,
+                                tick_count,
+                            ) {
+                                warn!(
+                                    agent_id = %agent_id,
+                                    error = %error,
+                                    "Idle-Profil konnte nicht erzwungen werden"
+                                );
+                            }
+                        }
                     }
                     crate::platform_controlplane::rules::PlatformSideEffect::RestartAgent(
                         agent_id,
@@ -1315,9 +1612,34 @@ fn ecs_tick_loop(
                         info!(agent_id = %agent_id,
                             "Agent nach Stall restartet (despawned, Respawn bei naechstem Shift-Check)");
                     }
+                    crate::platform_controlplane::rules::PlatformSideEffect::RestartService(
+                        service_name,
+                    ) => {
+                        if crate::service_health::restart_service_now(&service_name) {
+                            let active =
+                                crate::service_health::is_service_active_now(&service_name);
+                            info!(
+                                service = %service_name,
+                                active,
+                                "Service nach Platform-Intervention restartet"
+                            );
+                        } else {
+                            warn!(
+                                service = %service_name,
+                                "Service-Restart via Platform-Intervention fehlgeschlagen"
+                            );
+                        }
+                    }
                 }
             }
         }
+        publish_platform_state_snapshot(
+            &platform_state,
+            tick_count,
+            &platform_cp,
+            &runtime_orch,
+            &resource_manager,
+        );
 
         // Prune: Empfange Cutoff von Operator-API, arbeite 1 Batch/Tick ab
         while let Ok(cutoff) = prune_rx.try_recv() {
@@ -2064,8 +2386,9 @@ fn ecs_tick_loop(
             }
         }
 
-        // eBPF Metrics Collection (alle 10 Ticks = ~10s bei 1s Tick-Rate)
-        if tick_count > 0 && tick_count.is_multiple_of(10) {
+        // eBPF Metrics Collection (Intervall konfigurierbar fuer deterministische PCP-Tests)
+        let ebpf_collect_interval = platform_cp.config().ebpf_collect_interval_ticks.max(1);
+        if tick_count > 0 && tick_count.is_multiple_of(ebpf_collect_interval) {
             match ebpf_collector.collect() {
                 Ok(snapshot) => {
                     last_ebpf_snapshot = Some(snapshot.clone());
@@ -2442,6 +2765,7 @@ mod tests {
             event_store,
             rx,
             operator_rx,
+            mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
             ptx,
             vec![],
             1,
@@ -2468,6 +2792,11 @@ mod tests {
             crate::config::ResourceManagerConfig::default(),
             crate::config::PlatformControlplaneConfig::default(),
             String::new(),
+            Arc::new(RwLock::new(
+                crate::platform_controlplane::PlatformStateSnapshot::default(),
+            )),
+            #[cfg(feature = "llm")]
+            crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
         );
 
         assert!(result.is_ok());
@@ -2510,6 +2839,7 @@ mod tests {
                 event_store,
                 rx,
                 operator_rx,
+                mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
                 ptx,
                 all_agents,
                 1,
@@ -2536,6 +2866,11 @@ mod tests {
                 crate::config::ResourceManagerConfig::default(),
                 crate::config::PlatformControlplaneConfig::default(),
                 String::new(),
+                Arc::new(RwLock::new(
+                    crate::platform_controlplane::PlatformStateSnapshot::default(),
+                )),
+                #[cfg(feature = "llm")]
+                crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
             )
         });
 
@@ -2595,6 +2930,7 @@ mod tests {
                 event_store,
                 rx,
                 operator_rx,
+                mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
                 ptx,
                 all_agents,
                 1,
@@ -2621,6 +2957,11 @@ mod tests {
                 crate::config::ResourceManagerConfig::default(),
                 crate::config::PlatformControlplaneConfig::default(),
                 String::new(),
+                Arc::new(RwLock::new(
+                    crate::platform_controlplane::PlatformStateSnapshot::default(),
+                )),
+                #[cfg(feature = "llm")]
+                crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
             )
         });
 
@@ -2688,6 +3029,7 @@ mod tests {
                 event_store,
                 rx,
                 operator_rx,
+                mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
                 ptx,
                 all_agents,
                 1,
@@ -2714,6 +3056,11 @@ mod tests {
                 crate::config::ResourceManagerConfig::default(),
                 crate::config::PlatformControlplaneConfig::default(),
                 String::new(),
+                Arc::new(RwLock::new(
+                    crate::platform_controlplane::PlatformStateSnapshot::default(),
+                )),
+                #[cfg(feature = "llm")]
+                crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
             )
         });
 

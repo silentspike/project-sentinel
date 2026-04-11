@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Heartbeat interval in seconds.
-const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+///
+/// Must stay comfortably below the platform-controlplane stall SLA.
+const HEARTBEAT_INTERVAL_SECS: u64 = 5;
 
 /// Main loop sleep granularity in milliseconds.
 const SLEEP_MS: u64 = 500;

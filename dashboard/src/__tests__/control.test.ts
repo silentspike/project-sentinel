@@ -1,5 +1,7 @@
 import { describe, it, expect, afterAll, beforeEach } from "bun:test";
+import { Database } from "bun:sqlite";
 import { app } from "../index";
+import { setDatabases } from "../db";
 
 // Mock fetch fuer Cortex Gateway Proxy-Tests
 const originalFetch = globalThis.fetch;
@@ -284,6 +286,131 @@ describe("Control Routes", () => {
       const body = await res.json();
       expect(body.accepted).toBe(true);
       expect(body.stimulus_type).toBe("co2");
+    });
+  });
+
+  describe("Platform control endpoints", () => {
+    it("proxies GET /api/control/platform-state to the local operator API", async () => {
+      process.env.SENTINEL_OPERATOR_API_KEY = "operator-key";
+
+      mockFetch(async (url: string, init?: RequestInit) => {
+        expect(url).toBe("http://127.0.0.1:8084/operator/platform-state");
+        const headers = new Headers(init?.headers);
+        expect(headers.get("x-sentinel-operator-key")).toBe("operator-key");
+        return new Response(
+          JSON.stringify({
+            current_tick: 123,
+            ebpf_collect_interval_ticks: 10,
+            stall_detection_threshold_secs: 30,
+            llm_enabled: true,
+            llm_analysis_interval_secs: 30,
+            llm_retry_delay_secs: 15,
+            stall_recent_activity_grace_ticks: 120,
+            last_analysis_tick: 120,
+            last_analysis_trigger: "manual",
+            last_scheduled_analysis_tick: 90,
+            unresolved_counts: { projection_lag: 2 },
+            threshold_overrides: { memory_pressure_threshold: 0.8 },
+            resource_profiles: { "AGENT-01": "normal" },
+            agents: [],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      });
+
+      const res = await app.request("/api/control/platform-state");
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.current_tick).toBe(123);
+      expect(body.llm_enabled).toBe(true);
+    });
+
+    it("returns recent platform analyses from the event store", async () => {
+      const projDb = new Database(":memory:");
+      const esDb = new Database(":memory:");
+      esDb.exec(`
+        CREATE TABLE events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id TEXT NOT NULL UNIQUE,
+          event_type TEXT NOT NULL,
+          aggregate_id TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          correlation_id TEXT NOT NULL,
+          causation_id TEXT,
+          tick INTEGER NOT NULL,
+          timestamp_ms INTEGER NOT NULL
+        );
+      `);
+      esDb
+        .prepare(`
+          INSERT INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, tick, timestamp_ms)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          "evt-platform-1",
+          "platform_analysis",
+          "AGENT-03",
+          JSON.stringify({
+            trigger: "manual",
+            severity: "warning",
+            summary: "Projection lag analysis",
+            recommendation: "Watch projection",
+            suggested_action: "adjust_threshold",
+            target: "AGENT-03",
+            provider: "claude-code",
+            model: "gpt-test",
+            unresolved_keys: ["projection_lag"],
+            parameters: { key: "max_projection_lag", value: 120 },
+          }),
+          "corr-platform",
+          null,
+          345,
+          1_700_000_000_000,
+        );
+      setDatabases(projDb, esDb);
+
+      try {
+        const res = await app.request("/api/control/platform-analyses");
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body).toHaveLength(1);
+        expect(body[0].event_id).toBe("evt-platform-1");
+        expect(body[0].suggested_action).toBe("adjust_threshold");
+      } finally {
+        projDb.close();
+        esDb.close();
+      }
+    });
+
+    it("proxies POST /api/control/platform-analyze with dashboard auth", async () => {
+      process.env.SENTINEL_DASHBOARD_API_KEY = "dash-key";
+      process.env.SENTINEL_OPERATOR_API_KEY = "operator-key";
+
+      mockFetch(async (url: string, init?: RequestInit) => {
+        expect(url).toBe("http://127.0.0.1:8084/operator/platform-analyze");
+        expect(init?.method).toBe("POST");
+        const headers = new Headers(init?.headers);
+        expect(headers.get("x-sentinel-operator-key")).toBe("operator-key");
+        expect(headers.get("content-type")).toContain("application/json");
+        expect(String(init?.body)).toBe("{}");
+        return new Response(
+          JSON.stringify({ accepted: true, message: "Platform-Analyse eingeplant" }),
+          { status: 202, headers: { "Content-Type": "application/json" } },
+        );
+      });
+
+      const res = await app.request("/api/control/platform-analyze", {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer dash-key",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+
+      expect(res.status).toBe(202);
+      const body = await res.json();
+      expect(body.accepted).toBe(true);
     });
   });
 });
