@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - PlatformIntervention DomainEvent fuer Audit-Trail
   - Side-Effect Pattern: cycle() gibt Vec zurueck, Orchestrator fuehrt aus
   - Konfigurierbar + deaktivierbar via `[daemon.platform_controlplane]`
+  - LLM-Analyzer als daemon-interner Background-Worker ueber den Cortex-Gateway-Pfad, inklusive `manual`, `scheduled` und `unresolved_escalation` Triggern
+  - `PlatformAnalysis` DomainEvent, Operator-/Dashboard-State-Surfaces und Control-/Cockpit-UI fuer Analysen und Platform-Incidents
+  - deterministischer Suggested-Action-Executor fuer `force_profile`, `adjust_threshold` und `escalate_to_operator` mit Audit-/Runtime-State-Evidence
 
 - **Smart Resource Management: Dynamische cgroup-Limits** (#265)
   - `resize_cgroup()` fuer Hot-Resize ohne Agent-Restart (cpu.max, memory.max, io.max)
