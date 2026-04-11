@@ -269,6 +269,14 @@ pub enum DomainEventPayload {
         old_profile: String,
         new_profile: String,
     },
+    /// Geblockter Execute-Versuch in der Sandbox wurde auditiert.
+    SecurityExecBlocked {
+        agent_name: String,
+        scenario: String,
+        attempted_path: String,
+        exit_code: i32,
+        stderr: String,
+    },
     /// Voice of Gaia: Operator hat Gedanke eingepflanzt
     OperatorGaiaSent {
         target_agent_id: u16,
@@ -313,6 +321,7 @@ impl DomainEventPayload {
             Self::PlatformIntervention { .. } => "platform_intervention",
             Self::PlatformAnalysis { .. } => "platform_analysis",
             Self::ResourceProfileChanged { .. } => "resource_profile_changed",
+            Self::SecurityExecBlocked { .. } => "security_exec_blocked",
             Self::OperatorGaiaSent { .. } => "operator_gaia_sent",
             Self::OperatorBroadcastSent { .. } => "operator_broadcast_sent",
         }
