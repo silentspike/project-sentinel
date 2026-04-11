@@ -19,9 +19,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 use sentinel_common::{
-    EventType, OperatorBroadcastCommand, OperatorChaosCommand, OperatorChatCommand,
-    OperatorCommand, OperatorGaiaCommand, OperatorNightrunCommand, OperatorRoomStimulusCommand,
-    RoomStimulusType,
+    DomainEvent, DomainEventPayload, EventType, OperatorBroadcastCommand, OperatorChaosCommand,
+    OperatorChatCommand, OperatorCommand, OperatorGaiaCommand, OperatorNightrunCommand,
+    OperatorRoomStimulusCommand, RoomStimulusType,
 };
 
 use crate::config::OperatorApiConfig;
@@ -251,6 +251,8 @@ struct LandlockTestResponse {
     helper_pid: u32,
     exit_code: i32,
     blocked: bool,
+    attempted_path: Option<String>,
+    audit_event_id: Option<String>,
     stdout: String,
     stderr: String,
 }
@@ -1438,6 +1440,16 @@ fn landlock_test_blocked(exit_code: i32, stderr: &str) -> bool {
         || stderr.contains("[landlock-wrapper] exec failed: Operation not permitted")
 }
 
+fn landlock_attempted_path(agent_name: &str, scenario: &str) -> Option<String> {
+    match scenario {
+        "exec-from-tmp" => Some("/tmp/evil.sh".to_string()),
+        "exec-from-home" => Some(format!("/home/{agent_name}/.issue264-evil.sh")),
+        "exec-bin-sh" => Some("/bin/sh".to_string()),
+        "exec-python3" => Some("/usr/bin/python3".to_string()),
+        _ => None,
+    }
+}
+
 fn next_write_anomaly_start_tick(
     current_tick: u64,
     cycle_interval_ticks: u64,
@@ -1604,16 +1616,76 @@ fn run_landlock_test(
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let attempted_path = landlock_attempted_path(agent_name, scenario);
+    let blocked = landlock_test_blocked(exit_code, &stderr);
+    let audit_event_id = if blocked {
+        persist_landlock_block_event(
+            state,
+            agent_name,
+            scenario,
+            attempted_path.as_deref(),
+            exit_code,
+            &stderr,
+        )?
+    } else {
+        None
+    };
     Ok(LandlockTestResponse {
         accepted: true,
         agent_name: agent_name.to_string(),
         scenario: scenario.to_string(),
         helper_pid,
         exit_code,
-        blocked: landlock_test_blocked(exit_code, &stderr),
+        blocked,
+        attempted_path,
+        audit_event_id,
         stdout,
         stderr,
     })
+}
+
+fn persist_landlock_block_event(
+    state: &AppState,
+    agent_name: &str,
+    scenario: &str,
+    attempted_path: Option<&str>,
+    exit_code: i32,
+    stderr: &str,
+) -> std::result::Result<Option<String>, ApiError> {
+    let Some(attempted_path) = attempted_path else {
+        return Ok(None);
+    };
+    let tick = state
+        .platform_state
+        .read()
+        .ok()
+        .map(|snapshot| snapshot.current_tick)
+        .unwrap_or_default();
+    let payload = DomainEventPayload::SecurityExecBlocked {
+        agent_name: agent_name.to_string(),
+        scenario: scenario.to_string(),
+        attempted_path: attempted_path.to_string(),
+        exit_code,
+        stderr: stderr.to_string(),
+    };
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let op_id = format!("security-exec-blocked-{agent_name}-{scenario}-{tick}-{ts}");
+    let event = DomainEvent::new(
+        payload.event_type_str(),
+        agent_name,
+        &payload.to_json(),
+        &op_id,
+        tick,
+    );
+    let topic = format!("sentinel/events/security_exec_blocked/{agent_name}");
+    state
+        .event_store
+        .append_with_outbox(&event, &topic)
+        .map_err(|_| ApiError::ServiceUnavailable("Security-Exec-Event konnte nicht persistiert werden"))?;
+    Ok(Some(event.event_id))
 }
 
 fn is_authorized(headers: &HashMap<String, String>, shared_secret: Option<&str>) -> bool {
@@ -1994,6 +2066,19 @@ mod tests {
     }
 
     #[test]
+    fn landlock_attempted_path_maps_exec_scenarios() {
+        assert_eq!(
+            landlock_attempted_path("Test Agent", "exec-from-home").as_deref(),
+            Some("/home/Test Agent/.issue264-evil.sh")
+        );
+        assert_eq!(
+            landlock_attempted_path("Test Agent", "exec-python3").as_deref(),
+            Some("/usr/bin/python3")
+        );
+        assert_eq!(landlock_attempted_path("Test Agent", "write-etc"), None);
+    }
+
+    #[test]
     fn zero_delta_stimulus_is_rejected() {
         let (state, _rx, _platform_rx) = test_state(None);
         let response = handle_http_request(
@@ -2169,6 +2254,43 @@ mod tests {
     fn write_anomaly_alignment_handles_equal_cycle_and_ebpf_interval() {
         assert_eq!(next_write_anomaly_start_tick(120, 10, 10), 121);
         assert_eq!(next_write_anomaly_start_tick(121, 10, 10), 121);
+    }
+
+    #[test]
+    fn persist_landlock_block_event_writes_security_event() {
+        let (state, _rx, _platform_rx) = test_state(None);
+        let event_id = persist_landlock_block_event(
+            &state,
+            "Test Agent",
+            "exec-python3",
+            Some("/usr/bin/python3"),
+            0,
+            "Exec /usr/bin/python3 blocked: Permission denied",
+        )
+        .unwrap()
+        .expect("event id");
+        let events = state.event_store.get_all_events().unwrap();
+        let event = events
+            .into_iter()
+            .find(|event| event.event_id == event_id)
+            .expect("security event");
+        assert_eq!(event.event_type, "security_exec_blocked");
+        let payload: DomainEventPayload = serde_json::from_str(&event.payload).unwrap();
+        match payload {
+            DomainEventPayload::SecurityExecBlocked {
+                agent_name,
+                scenario,
+                attempted_path,
+                exit_code,
+                ..
+            } => {
+                assert_eq!(agent_name, "Test Agent");
+                assert_eq!(scenario, "exec-python3");
+                assert_eq!(attempted_path, "/usr/bin/python3");
+                assert_eq!(exit_code, 0);
+            }
+            other => panic!("unerwarteter Payload: {other:?}"),
+        }
     }
 
     #[test]

@@ -4,9 +4,9 @@
 //! Applied inside the bwrap namespace as Defense-in-Depth.
 //!
 //! Pfad-Policy (Masterplan-konform):
-//! - Read: /company (Firmendaten), /etc/resolv.conf (DNS)
+//! - Read: /company (Firmendaten), /etc/resolv.conf (DNS), Runtime-Libs
 //! - Write: /home/{name} (Agent-Home), /tmp (Temp)
-//! - Execute: /usr (Binaries+Libs), /lib (Shared Libs)
+//! - Execute: nur explizit freigegebene Binaries
 
 use std::path::PathBuf;
 
@@ -35,12 +35,21 @@ impl LandlockRuleset {
     /// - /etc/resolv.conf -> DNS resolution
     pub fn for_agent(name: &str) -> Self {
         Self {
-            read_paths: vec![PathBuf::from("/company"), PathBuf::from("/etc/resolv.conf")],
+            read_paths: vec![
+                PathBuf::from("/company"),
+                PathBuf::from("/etc/resolv.conf"),
+                PathBuf::from("/usr"),
+                PathBuf::from("/lib"),
+                PathBuf::from("/lib64"),
+            ],
             write_paths: vec![
                 PathBuf::from(format!("/home/{name}")),
                 PathBuf::from("/tmp"),
             ],
-            exec_paths: vec![PathBuf::from("/usr"), PathBuf::from("/lib")],
+            exec_paths: vec![
+                PathBuf::from("/usr/bin/agent-runtime"),
+                PathBuf::from("/breakout-helper"),
+            ],
         }
     }
 
@@ -57,6 +66,8 @@ impl LandlockRuleset {
         let all_access = AccessFs::from_all(abi);
         let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
         let exec_access = read_access | AccessFs::Execute;
+        let mut write_access = all_access;
+        write_access.remove(AccessFs::Execute);
 
         let mut ruleset = Ruleset::default()
             .handle_access(all_access)
@@ -77,7 +88,7 @@ impl LandlockRuleset {
         for path in &self.write_paths {
             if path.exists() {
                 ruleset = ruleset
-                    .add_rule(PathBeneath::new(PathFd::new(path)?, all_access))
+                    .add_rule(PathBeneath::new(PathFd::new(path)?, write_access))
                     .with_context(|| format!("Failed to add write rule for {}", path.display()))?;
             }
         }
@@ -143,10 +154,14 @@ mod tests {
         let rs = LandlockRuleset::for_agent("thomas");
         assert!(rs.read_paths.contains(&PathBuf::from("/company")));
         assert!(rs.read_paths.contains(&PathBuf::from("/etc/resolv.conf")));
+        assert!(rs.read_paths.contains(&PathBuf::from("/usr")));
+        assert!(rs.read_paths.contains(&PathBuf::from("/lib")));
+        assert!(rs.read_paths.contains(&PathBuf::from("/lib64")));
         assert!(rs.write_paths.contains(&PathBuf::from("/home/thomas")));
         assert!(rs.write_paths.contains(&PathBuf::from("/tmp")));
-        assert!(rs.exec_paths.contains(&PathBuf::from("/usr")));
-        assert!(rs.exec_paths.contains(&PathBuf::from("/lib")));
+        assert!(rs.exec_paths.contains(&PathBuf::from("/usr/bin/agent-runtime")));
+        assert!(rs.exec_paths.contains(&PathBuf::from("/breakout-helper")));
+        assert!(!rs.exec_paths.contains(&PathBuf::from("/usr")));
     }
 
     #[test]
