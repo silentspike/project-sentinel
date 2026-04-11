@@ -39,6 +39,9 @@ fn main() {
         "write-etc" => scenario_write_etc(),
         "read-other-home" => scenario_read_other_home(),
         "exec-from-tmp" => scenario_exec_from_tmp(),
+        "exec-from-home" => scenario_exec_from_home(),
+        "exec-bin-sh" => scenario_exec_bin_sh(),
+        "exec-python3" => scenario_exec_python3(),
         "symlink-escape" => scenario_symlink_escape(),
         "memory-bomb" => scenario_memory_bomb(),
         "fork-bomb" => scenario_fork_bomb(),
@@ -47,7 +50,10 @@ fn main() {
         "hostname" => scenario_hostname(),
         _ => {
             eprintln!("Unknown scenario: {scenario}");
-            eprintln!("Available: write-etc, read-other-home, exec-from-tmp, symlink-escape,");
+            eprintln!(
+                "Available: write-etc, read-other-home, exec-from-tmp, exec-from-home,"
+            );
+            eprintln!("          exec-bin-sh, exec-python3, symlink-escape,");
             eprintln!("          memory-bomb, fork-bomb, cpu-burn, pid-count, hostname");
             EXIT_SETUP_ERROR
         }
@@ -153,6 +159,102 @@ fn scenario_exec_from_tmp() -> i32 {
         Err(e) => {
             let _ = fs::remove_file(script_path);
             eprintln!("Exec from /tmp blocked: {e}");
+            EXIT_BLOCKED
+        }
+    }
+}
+
+/// FS-003b: Write a script into the agent home and attempt to execute it.
+/// Expected: blocked once Landlock no longer grants execute to write paths.
+fn scenario_exec_from_home() -> i32 {
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let script_path = format!("{home}/.issue264-evil.sh");
+    scenario_exec_script(&script_path, "Exec from agent home")
+}
+
+/// FS-003c: Attempt to execute the shell from the sandbox.
+/// Expected: blocked in the hardened config because no executable should leak through.
+fn scenario_exec_bin_sh() -> i32 {
+    match Command::new("/bin/sh")
+        .arg("-c")
+        .arg("echo shell-ok")
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "SECURITY FINDING: /bin/sh executed (status={}, stdout={stdout:?}, stderr={stderr:?})",
+                output.status
+            );
+            EXIT_BREAKOUT
+        }
+        Err(e) => {
+            eprintln!("Exec /bin/sh blocked: {e}");
+            EXIT_BLOCKED
+        }
+    }
+}
+
+/// FS-003d: Attempt to execute the Python interpreter from the sandbox.
+/// Expected: blocked once the execute whitelist is tightened.
+fn scenario_exec_python3() -> i32 {
+    match Command::new("/usr/bin/python3")
+        .arg("-c")
+        .arg("print('python-ok')")
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "SECURITY FINDING: /usr/bin/python3 executed (status={}, stdout={stdout:?}, stderr={stderr:?})",
+                output.status
+            );
+            EXIT_BREAKOUT
+        }
+        Err(e) => {
+            eprintln!("Exec /usr/bin/python3 blocked: {e}");
+            EXIT_BLOCKED
+        }
+    }
+}
+
+fn scenario_exec_script(script_path: &str, label: &str) -> i32 {
+    let path = std::path::Path::new(script_path);
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!("{label} blocked while creating parent directory: {e}");
+            return EXIT_BLOCKED;
+        }
+    }
+
+    if let Err(e) = fs::write(path, "#!/bin/sh\necho pwned\n") {
+        eprintln!("{label} blocked while writing script: {e}");
+        return EXIT_BLOCKED;
+    }
+
+    if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o755)) {
+        let _ = fs::remove_file(path);
+        eprintln!("{label} blocked while chmodding script: {e}");
+        return EXIT_BLOCKED;
+    }
+
+    match Command::new(path).output() {
+        Ok(output) => {
+            let _ = fs::remove_file(path);
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                eprintln!("{label} succeeded: {stdout}");
+                EXIT_BREAKOUT
+            } else {
+                eprintln!("{label} failed with status: {}", output.status);
+                EXIT_BLOCKED
+            }
+        }
+        Err(e) => {
+            let _ = fs::remove_file(path);
+            eprintln!("{label} blocked: {e}");
             EXIT_BLOCKED
         }
     }

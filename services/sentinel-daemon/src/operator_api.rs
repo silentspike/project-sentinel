@@ -5,8 +5,11 @@
 //! Kommando via std::sync::mpsc in den laufenden ECS-Thread.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result as AnyResult};
 use sentinel_redb::{ApiCpSnapshot, StateStore};
@@ -42,6 +45,16 @@ const OPERATOR_PLATFORM_TRIGGER_TEST_PATH: &str = "/operator/platform-trigger-te
 const OPERATOR_PLATFORM_ANALYSIS_TEST_PATH: &str = "/operator/platform-analysis-test";
 const OPERATOR_PLATFORM_STATE_PATH: &str = "/operator/platform-state";
 const OPERATOR_APICP_SNAPSHOT_PATH: &str = "/operator/apicp/snapshot";
+const OPERATOR_SECURITY_FS_TRASH_PATH: &str = "/operator/security/fs-trash";
+const OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH: &str = "/operator/security/fs-trash-fixture";
+const OPERATOR_SECURITY_FS_TRASH_AGE_PATH: &str = "/operator/security/fs-trash-age";
+const OPERATOR_SECURITY_FS_TRASH_GC_PATH: &str = "/operator/security/fs-trash-gc";
+const OPERATOR_SECURITY_FS_RANSOMWARE_TEST_PATH: &str = "/operator/security/fs-ransomware-test";
+const OPERATOR_SECURITY_AGENT_RUNTIME_STATE_PATH: &str =
+    "/operator/security/agent-runtime-state";
+const OPERATOR_SECURITY_WRITE_ANOMALY_TEST_PATH: &str =
+    "/operator/security/write-anomaly-test";
+const OPERATOR_SECURITY_LANDLOCK_TEST_PATH: &str = "/operator/security/landlock-test";
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024;
 const MAX_APICP_SNAPSHOT_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -101,10 +114,145 @@ pub struct TriggerNightrunResponse {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecurityAgentRuntimeSnapshot {
+    pub agent_id: u16,
+    pub aggregate_id: String,
+    pub agent_name: String,
+    pub bwrap_pid: Option<u32>,
+    pub home_host_path: String,
+    #[serde(default)]
+    pub fs_mount: Option<String>,
+}
+
+pub type SharedSecurityRuntimeState =
+    Arc<std::sync::RwLock<HashMap<u16, SecurityAgentRuntimeSnapshot>>>;
+
+#[derive(Debug, Clone, Deserialize)]
+struct FsTrashFixtureRequest {
+    agent_name: String,
+    relative_path: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FsTrashFixtureResponse {
+    accepted: bool,
+    agent_name: String,
+    relative_path: String,
+    object_id: u64,
+    chunk_hashes: Vec<String>,
+    trashed_chunks: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FsTrashInspectResponse {
+    found: bool,
+    chunk_hash: String,
+    trashed_at_ms: Option<u64>,
+    age_ms: Option<u64>,
+    in_chunk_index: bool,
+    refcount: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FsTrashAgeRequest {
+    chunk_hash: String,
+    hours_ago: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FsTrashAgeResponse {
+    accepted: bool,
+    chunk_hash: String,
+    trashed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FsTrashGcRequest {
+    grace_period_hours: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FsTrashGcResponse {
+    accepted: bool,
+    grace_period_hours: u64,
+    freed_from_trash: u64,
+    freed_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FsRansomwareTestRequest {
+    agent_name: String,
+    relative_path: String,
+    snapshot_label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FsRansomwareTestResponse {
+    accepted: bool,
+    agent_name: String,
+    relative_path: String,
+    snapshot_label: String,
+    host_path: String,
+    bytes_written: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AgentRuntimeStateResponse {
+    found: bool,
+    agent_id: u16,
+    aggregate_id: String,
+    agent_name: String,
+    bwrap_pid: Option<u32>,
+    cgroup_path: String,
+    current_profile: String,
+    home_host_path: String,
+    fs_mount: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WriteAnomalyTestRequest {
+    agent_name: String,
+    mode: String,
+    bytes_per_sec: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WriteAnomalyTestResponse {
+    accepted: bool,
+    agent_name: String,
+    mode: String,
+    bytes_per_sec: u64,
+    bwrap_pid: u32,
+    helper_pid: u32,
+    host_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LandlockTestRequest {
+    agent_name: String,
+    scenario: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LandlockTestResponse {
+    accepted: bool,
+    agent_name: String,
+    scenario: String,
+    helper_pid: u32,
+    exit_code: i32,
+    blocked: bool,
+    stdout: String,
+    stderr: String,
+}
+
 #[derive(Clone)]
 struct AppState {
     allowed_rooms: Arc<HashSet<String>>,
     shared_secret: Option<String>,
+    data_dir: PathBuf,
+    fs_mount: Option<String>,
     command_tx: mpsc::Sender<OperatorCommand>,
     platform_tx: mpsc::Sender<PlatformControlCommand>,
     nightrun_tx: mpsc::Sender<OperatorNightrunCommand>,
@@ -114,6 +262,7 @@ struct AppState {
     prune_tx: mpsc::Sender<i64>,
     state_store: Arc<StateStore>,
     platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
+    security_runtime_state: SharedSecurityRuntimeState,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -182,6 +331,8 @@ impl ApiError {
 #[allow(clippy::too_many_arguments)]
 pub async fn start_server(
     config: OperatorApiConfig,
+    data_dir: PathBuf,
+    fs_mount: Option<String>,
     allowed_rooms: Vec<String>,
     command_tx: mpsc::Sender<OperatorCommand>,
     platform_tx: mpsc::Sender<PlatformControlCommand>,
@@ -192,6 +343,7 @@ pub async fn start_server(
     prune_tx: mpsc::Sender<i64>,
     state_store: Arc<sentinel_redb::StateStore>,
     platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
+    security_runtime_state: SharedSecurityRuntimeState,
 ) -> AnyResult<tokio::task::JoinHandle<()>> {
     let listener = TcpListener::bind(&config.bind_addr)
         .await
@@ -200,6 +352,8 @@ pub async fn start_server(
     let state = AppState {
         allowed_rooms: Arc::new(allowed_rooms.into_iter().collect()),
         shared_secret: config.shared_secret,
+        data_dir,
+        fs_mount,
         command_tx,
         platform_tx,
         nightrun_tx,
@@ -209,6 +363,7 @@ pub async fn start_server(
         prune_tx,
         state_store,
         platform_state,
+        security_runtime_state,
     };
 
     info!(
@@ -246,14 +401,17 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> AnyResult<
 }
 
 fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
+    let path_only = request_path(&request.path);
+    let query = parse_query_params(&request.path);
+
     // GET-Endpoints ohne Auth (read-only)
     if request.method == "GET" {
-        if request.path == OPERATOR_APICP_SNAPSHOT_PATH
+        if (path_only == OPERATOR_APICP_SNAPSHOT_PATH || is_security_path(path_only))
             && !is_authorized(&request.headers, state.shared_secret.as_deref())
         {
             return ApiError::Unauthorized.to_response();
         }
-        return match request.path.as_str() {
+        return match path_only {
             OPERATOR_SNAPSHOTS_PATH => match state.event_store.list_world_snapshots() {
                 Ok(snapshots) => json_response(200, snapshots),
                 Err(_e) => {
@@ -283,6 +441,16 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                     ApiError::ServiceUnavailable("Platform-State nicht verfuegbar").to_response()
                 }
             },
+            OPERATOR_SECURITY_FS_TRASH_PATH => match inspect_fs_trash(query.get("hash"), state) {
+                Ok(payload) => json_response(200, payload),
+                Err(err) => err.to_response(),
+            },
+            OPERATOR_SECURITY_AGENT_RUNTIME_STATE_PATH => {
+                match inspect_agent_runtime_state(query.get("agent_id"), state) {
+                    Ok(payload) => json_response(200, payload),
+                    Err(err) => err.to_response(),
+                }
+            }
             _ => ApiError::NotFound("Endpoint unbekannt").to_response(),
         };
     }
@@ -293,7 +461,7 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
         return ApiError::Unauthorized.to_response();
     }
 
-    match request.path.as_str() {
+    match path_only {
         OPERATOR_CHAOS_PATH => {
             let payload: TriggerChaosRequest = match serde_json::from_slice(&request.body) {
                 Ok(payload) => payload,
@@ -517,6 +685,78 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                     ApiError::ServiceUnavailable("API-CP Snapshot konnte nicht persistiert werden")
                         .to_response()
                 }
+            }
+        }
+        OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH => {
+            let payload: FsTrashFixtureRequest = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                }
+            };
+            match create_fs_trash_fixture(payload, state) {
+                Ok(response) => json_response(202, response),
+                Err(err) => err.to_response(),
+            }
+        }
+        OPERATOR_SECURITY_FS_TRASH_AGE_PATH => {
+            let payload: FsTrashAgeRequest = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                }
+            };
+            match set_fs_trash_age(payload, state) {
+                Ok(response) => json_response(200, response),
+                Err(err) => err.to_response(),
+            }
+        }
+        OPERATOR_SECURITY_FS_TRASH_GC_PATH => {
+            let payload: FsTrashGcRequest = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                }
+            };
+            match run_fs_trash_gc(payload, state) {
+                Ok(response) => json_response(200, response),
+                Err(err) => err.to_response(),
+            }
+        }
+        OPERATOR_SECURITY_FS_RANSOMWARE_TEST_PATH => {
+            let payload: FsRansomwareTestRequest = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                }
+            };
+            match run_fs_ransomware_test(payload, state) {
+                Ok(response) => json_response(202, response),
+                Err(err) => err.to_response(),
+            }
+        }
+        OPERATOR_SECURITY_WRITE_ANOMALY_TEST_PATH => {
+            let payload: WriteAnomalyTestRequest = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                }
+            };
+            match run_write_anomaly_test(payload, state) {
+                Ok(response) => json_response(202, response),
+                Err(err) => err.to_response(),
+            }
+        }
+        OPERATOR_SECURITY_LANDLOCK_TEST_PATH => {
+            let payload: LandlockTestRequest = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                }
+            };
+            match run_landlock_test(payload, state) {
+                Ok(response) => json_response(200, response),
+                Err(err) => err.to_response(),
             }
         }
         _ => ApiError::NotFound("Endpoint unbekannt").to_response(),
@@ -800,6 +1040,520 @@ fn dispatch_platform_analysis_test(
     })
 }
 
+fn request_path(path: &str) -> &str {
+    path.split_once('?').map(|(base, _)| base).unwrap_or(path)
+}
+
+fn parse_query_params(path: &str) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    let Some((_, query)) = path.split_once('?') else {
+        return params;
+    };
+    for pair in query.split('&').filter(|entry| !entry.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        params.insert(key.to_string(), value.to_string());
+    }
+    params
+}
+
+fn is_security_path(path: &str) -> bool {
+    path.starts_with("/operator/security/")
+}
+
+fn open_artifact_plane(
+    state: &AppState,
+) -> std::result::Result<sentinel_fs::artifact::ArtifactPlane, ApiError> {
+    sentinel_fs::artifact::ArtifactPlane::open(state.data_dir.join("artifact.redb"))
+        .map_err(|_| ApiError::ServiceUnavailable("Artifact-Plane nicht verfuegbar"))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn decode_chunk_hash(hex: &str) -> std::result::Result<[u8; 16], ApiError> {
+    let trimmed = hex.trim();
+    if trimmed.len() != 32 {
+        return Err(ApiError::BadRequest(
+            "hash muss 32 hex Zeichen (16 Byte) haben",
+        ));
+    }
+    let mut out = [0u8; 16];
+    for (idx, chunk) in trimmed.as_bytes().chunks(2).enumerate() {
+        let part = std::str::from_utf8(chunk)
+            .map_err(|_| ApiError::BadRequest("hash enthaelt ungueltige Bytes"))?;
+        out[idx] = u8::from_str_radix(part, 16)
+            .map_err(|_| ApiError::BadRequest("hash ist kein gueltiger Hex-String"))?;
+    }
+    Ok(out)
+}
+
+fn validate_relative_path(path: &str) -> std::result::Result<(), ApiError> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::BadRequest("relative_path fehlt"));
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(ApiError::BadRequest(
+            "relative_path muss relativ und ohne '..' sein",
+        ));
+    }
+    Ok(())
+}
+
+fn security_home_host_path(fs_mount: Option<&str>, agent_name: &str) -> String {
+    match fs_mount {
+        Some(mount) => format!("{mount}/{agent_name}"),
+        None => format!("/ram/agents/{agent_name}"),
+    }
+}
+
+fn current_runtime_snapshot_for_agent_name(
+    state: &AppState,
+    agent_name: &str,
+) -> std::result::Result<SecurityAgentRuntimeSnapshot, ApiError> {
+    let runtime_state = state
+        .security_runtime_state
+        .read()
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-State nicht verfuegbar"))?;
+    runtime_state
+        .values()
+        .find(|snapshot| snapshot.agent_name == agent_name)
+        .cloned()
+        .ok_or(ApiError::NotFound("agent_name unbekannt"))
+}
+
+fn platform_agent_snapshot_for_id(
+    state: &AppState,
+    agent_id: u16,
+) -> std::result::Result<Option<crate::platform_controlplane::PlatformAgentSnapshot>, ApiError> {
+    let platform_state = state
+        .platform_state
+        .read()
+        .map_err(|_| ApiError::ServiceUnavailable("Platform-State nicht verfuegbar"))?;
+    Ok(platform_state
+        .agents
+        .iter()
+        .find(|snapshot| snapshot.agent_id == agent_id)
+        .cloned())
+}
+
+fn platform_agent_snapshot_for_name(
+    state: &AppState,
+    agent_name: &str,
+) -> std::result::Result<Option<crate::platform_controlplane::PlatformAgentSnapshot>, ApiError> {
+    let platform_state = state
+        .platform_state
+        .read()
+        .map_err(|_| ApiError::ServiceUnavailable("Platform-State nicht verfuegbar"))?;
+    Ok(platform_state
+        .agents
+        .iter()
+        .find(|snapshot| snapshot.name == agent_name)
+        .cloned())
+}
+
+fn inspect_fs_trash(
+    hash: Option<&String>,
+    state: &AppState,
+) -> std::result::Result<FsTrashInspectResponse, ApiError> {
+    let hash = hash.ok_or(ApiError::BadRequest("hash Query-Parameter fehlt"))?;
+    let chunk_hash = decode_chunk_hash(hash)?;
+    let plane = open_artifact_plane(state)?;
+    let trashed_at_ms = plane
+        .get_trash_timestamp(&chunk_hash)
+        .map_err(|_| ApiError::ServiceUnavailable("Trash-Queue nicht lesbar"))?;
+    let in_chunk_index = plane
+        .has_chunk(&chunk_hash)
+        .map_err(|_| ApiError::ServiceUnavailable("Chunk-Index nicht lesbar"))?;
+    let refcount = plane
+        .get_chunk_refcount(&chunk_hash)
+        .map_err(|_| ApiError::ServiceUnavailable("Chunk-Refcount nicht lesbar"))?;
+    Ok(FsTrashInspectResponse {
+        found: trashed_at_ms.is_some(),
+        chunk_hash: sentinel_fs::cas::hex_encode(&chunk_hash),
+        trashed_at_ms,
+        age_ms: trashed_at_ms.map(|value| now_ms().saturating_sub(value)),
+        in_chunk_index,
+        refcount,
+    })
+}
+
+fn create_fs_trash_fixture(
+    payload: FsTrashFixtureRequest,
+    state: &AppState,
+) -> std::result::Result<FsTrashFixtureResponse, ApiError> {
+    let agent_name = payload.agent_name.trim();
+    if agent_name.is_empty() {
+        return Err(ApiError::BadRequest("agent_name fehlt"));
+    }
+    validate_relative_path(&payload.relative_path)?;
+    let plane = open_artifact_plane(state)?;
+    let mut ingest = sentinel_fs::ingest::begin_ingest(&plane, "text/plain");
+    ingest.write(payload.content.as_bytes());
+    let object_id = sentinel_fs::ingest::commit_ingest(ingest)
+        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Ingest fehlgeschlagen"))?;
+    let manifest = plane
+        .get_manifest(object_id)
+        .map_err(|_| ApiError::ServiceUnavailable("Manifest nicht lesbar"))?
+        .ok_or(ApiError::ServiceUnavailable("Manifest fehlt nach Fixture-Ingest"))?;
+    sentinel_fs::gc::release_object(&plane, object_id)
+        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Release fehlgeschlagen"))?;
+    let gc_stats = sentinel_fs::gc::gc_chunks(&plane)
+        .map_err(|_| ApiError::ServiceUnavailable("Fixture-GC fehlgeschlagen"))?;
+    Ok(FsTrashFixtureResponse {
+        accepted: true,
+        agent_name: agent_name.to_string(),
+        relative_path: payload.relative_path,
+        object_id,
+        chunk_hashes: manifest
+            .iter()
+            .map(|hash| sentinel_fs::cas::hex_encode(hash))
+            .collect(),
+        trashed_chunks: gc_stats.trashed,
+    })
+}
+
+fn set_fs_trash_age(
+    payload: FsTrashAgeRequest,
+    state: &AppState,
+) -> std::result::Result<FsTrashAgeResponse, ApiError> {
+    let chunk_hash = decode_chunk_hash(&payload.chunk_hash)?;
+    let plane = open_artifact_plane(state)?;
+    let trashed_at_ms = now_ms().saturating_sub(payload.hours_ago * 3600 * 1000);
+    let updated = plane
+        .set_trash_timestamp(&chunk_hash, trashed_at_ms)
+        .map_err(|_| ApiError::ServiceUnavailable("Trash-Queue nicht schreibbar"))?;
+    if !updated {
+        return Err(ApiError::NotFound("chunk_hash nicht in fs_trash_queue"));
+    }
+    Ok(FsTrashAgeResponse {
+        accepted: true,
+        chunk_hash: sentinel_fs::cas::hex_encode(&chunk_hash),
+        trashed_at_ms,
+    })
+}
+
+fn run_fs_trash_gc(
+    payload: FsTrashGcRequest,
+    state: &AppState,
+) -> std::result::Result<FsTrashGcResponse, ApiError> {
+    let plane = open_artifact_plane(state)?;
+    let stats = sentinel_fs::gc::gc_trash(&plane, payload.grace_period_hours)
+        .map_err(|_| ApiError::ServiceUnavailable("gc_trash fehlgeschlagen"))?;
+    Ok(FsTrashGcResponse {
+        accepted: true,
+        grace_period_hours: payload.grace_period_hours,
+        freed_from_trash: stats.freed_from_trash,
+        freed_bytes: stats.freed_bytes,
+    })
+}
+
+fn inspect_agent_runtime_state(
+    agent_id: Option<&String>,
+    state: &AppState,
+) -> std::result::Result<AgentRuntimeStateResponse, ApiError> {
+    let agent_id = agent_id
+        .ok_or(ApiError::BadRequest("agent_id Query-Parameter fehlt"))?
+        .parse::<u16>()
+        .map_err(|_| ApiError::BadRequest("agent_id muss Integer sein"))?;
+    let runtime_state = state
+        .security_runtime_state
+        .read()
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-State nicht verfuegbar"))?;
+    let runtime = runtime_state.get(&agent_id).cloned();
+    drop(runtime_state);
+    let platform = platform_agent_snapshot_for_id(state, agent_id)?;
+    match (runtime, platform) {
+        (Some(runtime), Some(platform)) => Ok(AgentRuntimeStateResponse {
+            found: true,
+            agent_id,
+            aggregate_id: platform.aggregate_id,
+            agent_name: platform.name,
+            bwrap_pid: runtime.bwrap_pid,
+            cgroup_path: platform.cgroup_path,
+            current_profile: platform.current_profile,
+            home_host_path: runtime.home_host_path,
+            fs_mount: runtime.fs_mount,
+        }),
+        (Some(runtime), None) => Ok(AgentRuntimeStateResponse {
+            found: true,
+            agent_id,
+            aggregate_id: runtime.aggregate_id,
+            cgroup_path: sentinel_sandbox::cgroup_path(&runtime.agent_name),
+            agent_name: runtime.agent_name,
+            bwrap_pid: runtime.bwrap_pid,
+            current_profile: String::new(),
+            home_host_path: runtime.home_host_path,
+            fs_mount: runtime.fs_mount,
+        }),
+        (None, _) => Ok(AgentRuntimeStateResponse {
+            found: false,
+            agent_id,
+            aggregate_id: format!("AGENT-{agent_id:02}"),
+            agent_name: String::new(),
+            bwrap_pid: None,
+            cgroup_path: String::new(),
+            current_profile: String::new(),
+            home_host_path: String::new(),
+            fs_mount: state.fs_mount.clone(),
+        }),
+    }
+}
+
+fn run_fs_ransomware_test(
+    payload: FsRansomwareTestRequest,
+    state: &AppState,
+) -> std::result::Result<FsRansomwareTestResponse, ApiError> {
+    let agent_name = payload.agent_name.trim();
+    if agent_name.is_empty() {
+        return Err(ApiError::BadRequest("agent_name fehlt"));
+    }
+    if payload.snapshot_label.trim().is_empty() {
+        return Err(ApiError::BadRequest("snapshot_label fehlt"));
+    }
+    validate_relative_path(&payload.relative_path)?;
+    let home_host_path = security_home_host_path(state.fs_mount.as_deref(), agent_name);
+    let target = Path::new(&home_host_path).join(payload.relative_path.trim());
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|_| ApiError::ServiceUnavailable("Ransomware-Testverzeichnis nicht schreibbar"))?;
+    }
+    let content = format!(
+        "issue-264-ransomware-test:{}:{}",
+        payload.snapshot_label, agent_name
+    );
+    std::fs::write(&target, content.as_bytes())
+        .map_err(|_| ApiError::ServiceUnavailable("Ransomware-Testdatei konnte nicht geschrieben werden"))?;
+    Ok(FsRansomwareTestResponse {
+        accepted: true,
+        agent_name: agent_name.to_string(),
+        relative_path: payload.relative_path,
+        snapshot_label: payload.snapshot_label,
+        host_path: target.display().to_string(),
+        bytes_written: content.len(),
+    })
+}
+
+fn build_bwrap_command(
+    agent_name: &str,
+    fs_mount: Option<&str>,
+    extra_readonly_binds: &[(String, String)],
+    inner_command: &[String],
+) -> std::process::Command {
+    let mut config = sentinel_sandbox::BwrapConfig::for_agent(agent_name);
+    if let Some(mount) = fs_mount {
+        config = config.with_fs_mount(mount, agent_name);
+    }
+    config.readonly_binds.extend(extra_readonly_binds.iter().cloned());
+    let wrapped = maybe_wrap_with_landlock(agent_name, &mut config, inner_command);
+    let mut args = config.to_args();
+    args.extend(wrapped);
+    let mut command = std::process::Command::new("bwrap");
+    command.args(args).stdin(Stdio::null());
+    command
+}
+
+fn maybe_wrap_with_landlock(
+    agent_name: &str,
+    config: &mut sentinel_sandbox::BwrapConfig,
+    inner_command: &[String],
+) -> Vec<String> {
+    if sentinel_sandbox::landlock::detect_abi().is_some() {
+        let wrapper = security_landlock_wrapper_path();
+        if wrapper.exists() {
+            config.readonly_binds.push((
+                wrapper.to_string_lossy().into_owned(),
+                "/landlock-wrapper".to_string(),
+            ));
+            let mut command = vec![
+                "/landlock-wrapper".to_string(),
+                agent_name.to_string(),
+                "--".to_string(),
+            ];
+            command.extend_from_slice(inner_command);
+            return command;
+        }
+    }
+    inner_command.to_vec()
+}
+
+fn security_landlock_wrapper_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        let candidate = exe
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("landlock-wrapper");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    let deploy = PathBuf::from("/opt/sentinel/bin/landlock-wrapper");
+    if deploy.exists() {
+        return deploy;
+    }
+    PathBuf::from("/usr/local/bin/landlock-wrapper")
+}
+
+fn security_breakout_helper_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        let candidate = exe
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("breakout-helper");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    let deploy = PathBuf::from("/opt/sentinel/bin/breakout-helper");
+    if deploy.exists() {
+        return deploy;
+    }
+    PathBuf::from("/usr/local/bin/breakout-helper")
+}
+
+fn landlock_test_blocked(exit_code: i32, stderr: &str) -> bool {
+    exit_code == 0
+        || stderr.contains("[landlock-wrapper] exec failed: Permission denied")
+        || stderr.contains("[landlock-wrapper] exec failed: Operation not permitted")
+}
+
+fn run_write_anomaly_test(
+    payload: WriteAnomalyTestRequest,
+    state: &AppState,
+) -> std::result::Result<WriteAnomalyTestResponse, ApiError> {
+    let agent_name = payload.agent_name.trim();
+    if agent_name.is_empty() {
+        return Err(ApiError::BadRequest("agent_name fehlt"));
+    }
+    if payload.mode.trim().is_empty() {
+        return Err(ApiError::BadRequest("mode fehlt"));
+    }
+    if payload.bytes_per_sec == 0 {
+        return Err(ApiError::BadRequest("bytes_per_sec muss > 0 sein"));
+    }
+
+    let runtime = current_runtime_snapshot_for_agent_name(state, agent_name)?;
+    let _platform =
+        platform_agent_snapshot_for_name(state, agent_name)?.ok_or(ApiError::NotFound(
+            "agent_name nicht im Platform-State",
+        ))?;
+    let bwrap_pid = runtime
+        .bwrap_pid
+        .ok_or(ApiError::ServiceUnavailable("tracked bwrap_pid fehlt"))?;
+    let guest_path = format!("/home/{agent_name}/.issue264-write-anomaly.bin");
+    let host_path = Path::new(&runtime.home_host_path)
+        .join(".issue264-write-anomaly.bin")
+        .display()
+        .to_string();
+    let script = r#"import os, sys, time
+path = sys.argv[1]
+bps = int(sys.argv[2])
+duration = float(sys.argv[3])
+chunk = b'x' * max(4096, min(1048576, max(4096, bps // 4)))
+deadline = time.time() + duration
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, 'ab', buffering=0) as handle:
+    while time.time() < deadline:
+        loop_start = time.time()
+        written = 0
+        while written < bps and time.time() < deadline:
+            piece = chunk[:min(len(chunk), bps - written)]
+            handle.write(piece)
+            handle.flush()
+            os.fsync(handle.fileno())
+            written += len(piece)
+        sleep_for = 1.0 - (time.time() - loop_start)
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+"#;
+    let inner_command = vec![
+        "/usr/bin/python3".to_string(),
+        "-c".to_string(),
+        script.to_string(),
+        guest_path,
+        payload.bytes_per_sec.to_string(),
+        "20".to_string(),
+    ];
+    let mut child = build_bwrap_command(agent_name, state.fs_mount.as_deref(), &[], &inner_command);
+    child.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = child
+        .spawn()
+        .map_err(|_| ApiError::ServiceUnavailable("Write-Anomaly-Test konnte nicht gestartet werden"))?;
+    let helper_pid = child.id();
+    let _ = sentinel_sandbox::cgroups::add_pid_to_cgroup(agent_name, helper_pid);
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(WriteAnomalyTestResponse {
+        accepted: true,
+        agent_name: agent_name.to_string(),
+        mode: payload.mode,
+        bytes_per_sec: payload.bytes_per_sec,
+        bwrap_pid,
+        helper_pid,
+        host_path,
+    })
+}
+
+fn run_landlock_test(
+    payload: LandlockTestRequest,
+    state: &AppState,
+) -> std::result::Result<LandlockTestResponse, ApiError> {
+    let agent_name = payload.agent_name.trim();
+    let scenario = payload.scenario.trim();
+    if agent_name.is_empty() {
+        return Err(ApiError::BadRequest("agent_name fehlt"));
+    }
+    if scenario.is_empty() {
+        return Err(ApiError::BadRequest("scenario fehlt"));
+    }
+    let _runtime = current_runtime_snapshot_for_agent_name(state, agent_name)?;
+    let breakout_helper = security_breakout_helper_path();
+    if !breakout_helper.exists() {
+        return Err(ApiError::ServiceUnavailable(
+            "breakout-helper Binary nicht verfuegbar",
+        ));
+    }
+    let inner_command = vec!["/breakout-helper".to_string(), scenario.to_string()];
+    let binds = vec![(
+        breakout_helper.to_string_lossy().into_owned(),
+        "/breakout-helper".to_string(),
+    )];
+    let mut command =
+        build_bwrap_command(agent_name, state.fs_mount.as_deref(), &binds, &inner_command);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command
+        .spawn()
+        .map_err(|_| ApiError::ServiceUnavailable("Landlock-Test konnte nicht gestartet werden"))?;
+    let helper_pid = child.id();
+    let _ = sentinel_sandbox::cgroups::add_pid_to_cgroup(agent_name, helper_pid);
+    let output = child
+        .wait_with_output()
+        .map_err(|_| ApiError::ServiceUnavailable("Landlock-Test lieferte kein Ergebnis"))?;
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Ok(LandlockTestResponse {
+        accepted: true,
+        agent_name: agent_name.to_string(),
+        scenario: scenario.to_string(),
+        helper_pid,
+        exit_code,
+        blocked: landlock_test_blocked(exit_code, &stderr),
+        stdout,
+        stderr,
+    })
+}
+
 fn is_authorized(headers: &HashMap<String, String>, shared_secret: Option<&str>) -> bool {
     let Some(shared_secret) = shared_secret else {
         return true;
@@ -900,7 +1654,7 @@ async fn read_http_request(stream: &mut TcpStream) -> std::result::Result<HttpRe
 }
 
 fn max_body_bytes_for_path(path: &str) -> usize {
-    match path {
+    match request_path(path) {
         OPERATOR_APICP_SNAPSHOT_PATH => MAX_APICP_SNAPSHOT_BODY_BYTES,
         _ => MAX_BODY_BYTES,
     }
@@ -962,8 +1716,21 @@ mod tests {
         let (platform_tx, platform_rx) = mpsc::channel();
         let (nightrun_tx, _nightrun_rx) = mpsc::channel();
         let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
         let path = dir.path().join("test.redb");
         let state_store = Arc::new(StateStore::open(path.to_str().unwrap()).unwrap());
+        let security_runtime_state = Arc::new(std::sync::RwLock::new(HashMap::from([(
+            7,
+            SecurityAgentRuntimeSnapshot {
+                agent_id: 7,
+                aggregate_id: "AGENT-07".to_string(),
+                agent_name: "Test Agent".to_string(),
+                bwrap_pid: Some(4242),
+                home_host_path: "/ram/agents/Test Agent".to_string(),
+                fs_mount: None,
+            },
+        )])));
         let state = AppState {
             allowed_rooms: Arc::new(
                 ["empfang".to_string(), "flur_eg".to_string()]
@@ -971,6 +1738,8 @@ mod tests {
                     .collect(),
             ),
             shared_secret: secret.map(str::to_string),
+            data_dir,
+            fs_mount: None,
             command_tx: tx,
             platform_tx,
             nightrun_tx,
@@ -1000,6 +1769,7 @@ mod tests {
                 }],
                 ..PlatformStateSnapshot::default()
             })),
+            security_runtime_state,
         };
         std::mem::forget(dir);
         (state, rx, platform_rx)
@@ -1142,6 +1912,22 @@ mod tests {
             }
             other => panic!("unerwartetes Kommando: {other:?}"),
         }
+    }
+
+    #[test]
+    fn landlock_blocked_detects_wrapper_exec_denied() {
+        assert!(landlock_test_blocked(
+            1,
+            "[landlock-wrapper] exec failed: Permission denied (os error 13)"
+        ));
+        assert!(landlock_test_blocked(
+            1,
+            "[landlock-wrapper] exec failed: Operation not permitted (os error 1)"
+        ));
+        assert!(!landlock_test_blocked(
+            1,
+            "SECURITY FINDING: /usr/bin/python3 executed"
+        ));
     }
 
     #[test]
@@ -1307,6 +2093,108 @@ mod tests {
         assert_eq!(payload.current_tick, 42);
         assert_eq!(payload.agents.len(), 1);
         assert_eq!(payload.agents[0].aggregate_id, "AGENT-07");
+    }
+
+    #[test]
+    fn agent_runtime_state_endpoint_returns_snapshot() {
+        let (state, _rx, _platform_rx) = test_state(None);
+        let response = handle_http_request(
+            HttpRequest {
+                method: "GET".to_string(),
+                path: format!("{OPERATOR_SECURITY_AGENT_RUNTIME_STATE_PATH}?agent_id=7"),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            &state,
+        );
+
+        assert_eq!(response.status, 200);
+        let payload: AgentRuntimeStateResponse = serde_json::from_slice(&response.body).unwrap();
+        assert!(payload.found);
+        assert_eq!(payload.agent_id, 7);
+        assert_eq!(payload.bwrap_pid, Some(4242));
+        assert_eq!(payload.current_profile, "normal");
+    }
+
+    #[test]
+    fn fs_trash_fixture_and_inspect_roundtrip() {
+        let (state, _rx, _platform_rx) = test_state(None);
+        let fixture = handle_http_request(
+            test_request(
+                OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH,
+                serde_json::json!({
+                    "agent_name": "security-fixture",
+                    "relative_path": "ac1.txt",
+                    "content": "issue-264"
+                }),
+            ),
+            &state,
+        );
+        assert_eq!(fixture.status, 202);
+        let payload: FsTrashFixtureResponse = serde_json::from_slice(&fixture.body).unwrap();
+        assert!(!payload.chunk_hashes.is_empty());
+
+        let inspect = handle_http_request(
+            HttpRequest {
+                method: "GET".to_string(),
+                path: format!(
+                    "{OPERATOR_SECURITY_FS_TRASH_PATH}?hash={}",
+                    payload.chunk_hashes[0]
+                ),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            &state,
+        );
+        assert_eq!(inspect.status, 200);
+        let inspect_payload: FsTrashInspectResponse =
+            serde_json::from_slice(&inspect.body).unwrap();
+        assert!(inspect_payload.found);
+        assert!(inspect_payload.in_chunk_index);
+    }
+
+    #[test]
+    fn security_get_requires_auth_when_configured() {
+        let (state, _rx, _platform_rx) = test_state(Some("topsecret"));
+        let unauthorized = handle_http_request(
+            HttpRequest {
+                method: "GET".to_string(),
+                path: format!("{OPERATOR_SECURITY_AGENT_RUNTIME_STATE_PATH}?agent_id=7"),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            &state,
+        );
+        assert_eq!(unauthorized.status, 401);
+
+        let mut authorized = HttpRequest {
+            method: "GET".to_string(),
+            path: format!("{OPERATOR_SECURITY_AGENT_RUNTIME_STATE_PATH}?agent_id=7"),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        authorized
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "topsecret".to_string());
+        let response = handle_http_request(authorized, &state);
+        assert_eq!(response.status, 200);
+    }
+
+    #[test]
+    fn write_anomaly_test_requires_tracked_runtime() {
+        let (state, _rx, _platform_rx) = test_state(None);
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_SECURITY_WRITE_ANOMALY_TEST_PATH,
+                serde_json::json!({
+                    "agent_name": "Unbekannt",
+                    "mode": "absolute-threshold",
+                    "bytes_per_sec": 1000
+                }),
+            ),
+            &state,
+        );
+        assert_eq!(response.status, 404);
     }
 
     #[test]
