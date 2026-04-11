@@ -24,10 +24,19 @@ pub enum PlatformSideEffect {
     TriggerPrune(i64),
     /// Agent-Profil auf Idle setzen (Memory-Pressure).
     ForceIdleProfile(AgentId),
+    /// Agent-Cgroup per SIGSTOP anhalten (Write-Anomalie).
+    SuspendAgent(AgentId),
     /// Agent-Sandbox teardown + Despawn (Stall-Recovery, Respawn bei naechstem Shift-Check).
     RestartAgent(AgentId),
     /// Systemd-Service direkt neu starten.
     RestartService(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteAnomalyAssessment {
+    pub baseline_bytes_per_sec: Option<f64>,
+    pub baseline_triggered: bool,
+    pub absolute_triggered: bool,
 }
 
 /// Evaluiert alle Regeln gegen die aktuellen Metriken.
@@ -38,6 +47,7 @@ pub fn evaluate_rules(
     cooldowns: &HashMap<String, u64>,
     tick: u64,
     config: &PlatformControlplaneConfig,
+    write_rate_baselines: &HashMap<String, f64>,
     agent_name_to_id: &HashMap<String, AgentId>,
 ) -> Vec<PlatformAction> {
     let mut actions = Vec::new();
@@ -132,24 +142,51 @@ pub fn evaluate_rules(
 
     // Regel 5: Write-Rate Anomalie
     for (agent_name, rate) in &metrics.agent_write_rates {
-        if *rate > config.write_anomaly_threshold_bytes_per_sec as f64 {
-            let key = format!("write_anomaly:{agent_name}");
-            if !is_cooled_down(cooldowns, &key, tick, config.write_anomaly_cooldown_ticks) {
-                continue;
-            }
-            let rate_mb = rate / (1024.0 * 1024.0);
-            let threshold_mb =
-                config.write_anomaly_threshold_bytes_per_sec as f64 / (1024.0 * 1024.0);
-            actions.push(PlatformAction {
-                rule_name: "write_anomaly".to_string(),
-                target: agent_name.clone(),
-                action_label: "alert".to_string(),
-                description: format!(
-                    "Write-Rate {rate_mb:.1} MB/s > {threshold_mb:.1} MB/s Schwellwert"
-                ),
-                side_effect: None, // Phase 2: SIGSTOP
-            });
+        let Some(assessment) =
+            assess_write_anomaly(*rate, write_rate_baselines.get(agent_name).copied(), config)
+        else {
+            continue;
+        };
+        let Some(agent_id) = agent_name_to_id.get(agent_name).copied() else {
+            continue;
+        };
+        let key = format!("write_anomaly:{agent_name}");
+        if !is_cooled_down(cooldowns, &key, tick, config.write_anomaly_cooldown_ticks) {
+            continue;
         }
+        let rate_mb = rate / (1024.0 * 1024.0);
+        let threshold_mb = config.write_anomaly_threshold_bytes_per_sec as f64 / (1024.0 * 1024.0);
+        let baseline_clause = assessment
+            .baseline_bytes_per_sec
+            .filter(|baseline| *baseline > 0.0)
+            .map(|baseline| {
+                format!(
+                    "{:.1}x Baseline ({:.2} MB/s)",
+                    rate / baseline,
+                    baseline / (1024.0 * 1024.0)
+                )
+            });
+        let trigger_clause = match (
+            assessment.absolute_triggered,
+            assessment.baseline_triggered,
+            baseline_clause,
+        ) {
+            (true, true, Some(baseline)) => {
+                format!(">{threshold_mb:.1} MB/s absolut und > {baseline}")
+            }
+            (true, false, _) => format!(">{threshold_mb:.1} MB/s absolut"),
+            (false, true, Some(baseline)) => format!("> {baseline}"),
+            _ => format!(">{threshold_mb:.1} MB/s absolut"),
+        };
+        actions.push(PlatformAction {
+            rule_name: "write_anomaly".to_string(),
+            target: agent_name.clone(),
+            action_label: "sigstop".to_string(),
+            description: format!(
+                "Write-Rate {rate_mb:.1} MB/s {trigger_clause} — SIGSTOP fuer Agent-Cgroup getriggert"
+            ),
+            side_effect: Some(PlatformSideEffect::SuspendAgent(agent_id)),
+        });
     }
 
     // Regel 6: Service Health (aus ServiceHealthChecker Thread)
@@ -168,6 +205,30 @@ pub fn evaluate_rules(
     }
 
     actions
+}
+
+pub fn assess_write_anomaly(
+    rate_bytes_per_sec: f64,
+    baseline_bytes_per_sec: Option<f64>,
+    config: &PlatformControlplaneConfig,
+) -> Option<WriteAnomalyAssessment> {
+    let absolute_triggered = rate_bytes_per_sec > config.write_anomaly_threshold_bytes_per_sec as f64;
+    let baseline_triggered = baseline_bytes_per_sec
+        .filter(|baseline| *baseline > 0.0)
+        .map(|baseline| {
+            rate_bytes_per_sec > baseline * config.write_anomaly_baseline_multiplier
+        })
+        .unwrap_or(false);
+
+    if absolute_triggered || baseline_triggered {
+        Some(WriteAnomalyAssessment {
+            baseline_bytes_per_sec,
+            baseline_triggered,
+            absolute_triggered,
+        })
+    } else {
+        None
+    }
 }
 
 /// Prueft ob der Cooldown fuer eine Regel abgelaufen ist.
@@ -213,6 +274,7 @@ mod tests {
             100,
             &test_config(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "agent_stall");
@@ -232,7 +294,14 @@ mod tests {
             ..test_config()
         };
 
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &config, &HashMap::new());
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &config,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(
             actions.is_empty(),
             "recent activity inside grace window must suppress stall restarts"
@@ -252,7 +321,14 @@ mod tests {
             ..test_config()
         };
 
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 37, &config, &HashMap::new());
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            37,
+            &config,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert_eq!(
             actions.len(),
             1,
@@ -271,7 +347,14 @@ mod tests {
         cooldowns.insert("agent_stall:Thomas Mueller".to_string(), 90);
 
         // Tick 100, Cooldown 60 → last action at 90, diff=10 < 60 → cooled down = false
-        let actions = evaluate_rules(&metrics, &cooldowns, 100, &test_config(), &HashMap::new());
+        let actions = evaluate_rules(
+            &metrics,
+            &cooldowns,
+            100,
+            &test_config(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(actions.is_empty(), "Should be cooled down");
     }
 
@@ -286,6 +369,7 @@ mod tests {
             &HashMap::new(),
             100,
             &test_config(),
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert_eq!(actions.len(), 1);
@@ -304,6 +388,7 @@ mod tests {
             &HashMap::new(),
             100,
             &test_config(),
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert_eq!(actions.len(), 1);
@@ -327,9 +412,35 @@ mod tests {
             100,
             &test_config(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "memory_pressure");
+    }
+
+    #[test]
+    fn test_write_anomaly_assessment_triggers_on_baseline_multiplier() {
+        let config = PlatformControlplaneConfig {
+            write_anomaly_threshold_bytes_per_sec: 50_000_000,
+            write_anomaly_baseline_multiplier: 10.0,
+            ..test_config()
+        };
+        let assessment = assess_write_anomaly(12_000.0, Some(1_000.0), &config)
+            .expect("baseline should trigger");
+        assert!(assessment.baseline_triggered);
+        assert!(!assessment.absolute_triggered);
+    }
+
+    #[test]
+    fn test_write_anomaly_assessment_triggers_on_absolute_threshold() {
+        let config = PlatformControlplaneConfig {
+            write_anomaly_threshold_bytes_per_sec: 5_000,
+            write_anomaly_baseline_multiplier: 10.0,
+            ..test_config()
+        };
+        let assessment =
+            assess_write_anomaly(6_000.0, Some(1_000.0), &config).expect("absolute should trigger");
+        assert!(assessment.absolute_triggered);
     }
 
     #[test]
@@ -338,15 +449,22 @@ mod tests {
             agent_write_rates: vec![("Test Agent".to_string(), 10_000_000.0)], // 10 MB/s > 5 MB/s
             ..Default::default()
         };
+        let agent_name_to_id = HashMap::from([("Test Agent".to_string(), AgentId(7))]);
         let actions = evaluate_rules(
             &metrics,
             &HashMap::new(),
             100,
             &test_config(),
             &HashMap::new(),
+            &agent_name_to_id,
         );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "write_anomaly");
+        assert_eq!(actions[0].action_label, "sigstop");
+        assert!(matches!(
+            &actions[0].side_effect,
+            Some(PlatformSideEffect::SuspendAgent(id)) if *id == AgentId(7)
+        ));
     }
 
     #[test]
@@ -361,8 +479,35 @@ mod tests {
             100,
             &test_config(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn test_write_anomaly_rule_fires_on_baseline_without_absolute_threshold() {
+        let config = PlatformControlplaneConfig {
+            write_anomaly_threshold_bytes_per_sec: 50_000_000,
+            write_anomaly_baseline_multiplier: 10.0,
+            ..test_config()
+        };
+        let metrics = PlatformMetrics {
+            agent_write_rates: vec![("Test Agent".to_string(), 12_000.0)],
+            ..Default::default()
+        };
+        let baselines = HashMap::from([("Test Agent".to_string(), 1_000.0)]);
+        let agent_name_to_id = HashMap::from([("Test Agent".to_string(), AgentId(9))]);
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &config,
+            &baselines,
+            &agent_name_to_id,
+        );
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action_label, "sigstop");
+        assert!(actions[0].description.contains("Baseline"));
     }
 
     #[test]
@@ -374,7 +519,14 @@ mod tests {
         let mut name_to_id = HashMap::new();
         name_to_id.insert("Thomas Mueller".to_string(), AgentId(1));
 
-        let actions = evaluate_rules(&metrics, &HashMap::new(), 100, &test_config(), &name_to_id);
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &test_config(),
+            &HashMap::new(),
+            &name_to_id,
+        );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].action_label, "restart_triggered");
         assert!(matches!(
@@ -394,6 +546,7 @@ mod tests {
             &HashMap::new(),
             100,
             &test_config(),
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert_eq!(actions.len(), 1);
@@ -418,6 +571,7 @@ mod tests {
             &HashMap::new(),
             100,
             &test_config(),
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert!(actions.is_empty());

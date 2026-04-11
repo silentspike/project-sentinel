@@ -184,6 +184,11 @@ fn synthetic_metrics() -> (PlatformMetrics, HashMap<String, AgentId>) {
 
 fn bench_rule_evaluation(c: &mut Criterion) {
     let (metrics, agent_ids) = synthetic_metrics();
+    let write_rate_baselines = metrics
+        .agent_write_rates
+        .iter()
+        .map(|(name, rate)| (name.clone(), rate / 12.0))
+        .collect::<HashMap<_, _>>();
     let config = PlatformControlplaneConfig {
         cycle_interval_ticks: 1,
         stall_recent_activity_grace_ticks: 3,
@@ -198,6 +203,7 @@ fn bench_rule_evaluation(c: &mut Criterion) {
                 black_box(&cooldowns),
                 black_box(123),
                 black_box(&config),
+                black_box(&write_rate_baselines),
                 black_box(&agent_ids),
             );
             black_box(actions);

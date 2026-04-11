@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -216,6 +216,10 @@ struct WriteAnomalyTestRequest {
     agent_name: String,
     mode: String,
     bytes_per_sec: u64,
+    #[serde(default)]
+    duration_secs: Option<u64>,
+    #[serde(default = "default_write_anomaly_alignment")]
+    align_to_observation_window: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -224,6 +228,10 @@ struct WriteAnomalyTestResponse {
     agent_name: String,
     mode: String,
     bytes_per_sec: u64,
+    duration_secs: u64,
+    align_to_observation_window: bool,
+    start_delay_secs: u64,
+    scheduled_start_tick: u64,
     bwrap_pid: u32,
     helper_pid: u32,
     host_path: String,
@@ -298,6 +306,10 @@ enum ApiError {
     MethodNotAllowed,
     PayloadTooLarge,
     ServiceUnavailable(&'static str),
+}
+
+fn default_write_anomaly_alignment() -> bool {
+    true
 }
 
 impl ApiError {
@@ -1426,6 +1438,26 @@ fn landlock_test_blocked(exit_code: i32, stderr: &str) -> bool {
         || stderr.contains("[landlock-wrapper] exec failed: Operation not permitted")
 }
 
+fn next_write_anomaly_start_tick(
+    current_tick: u64,
+    cycle_interval_ticks: u64,
+    ebpf_collect_interval_ticks: u64,
+) -> u64 {
+    let cycle_interval_ticks = cycle_interval_ticks.max(1);
+    let ebpf_collect_interval_ticks = ebpf_collect_interval_ticks
+        .max(1)
+        .min(cycle_interval_ticks);
+    let target_mod =
+        (cycle_interval_ticks + 1 - ebpf_collect_interval_ticks) % cycle_interval_ticks;
+    let current_mod = current_tick % cycle_interval_ticks;
+    let delta = if current_mod <= target_mod {
+        target_mod - current_mod
+    } else {
+        cycle_interval_ticks - current_mod + target_mod
+    };
+    current_tick + delta
+}
+
 fn run_write_anomaly_test(
     payload: WriteAnomalyTestRequest,
     state: &AppState,
@@ -1440,28 +1472,51 @@ fn run_write_anomaly_test(
     if payload.bytes_per_sec == 0 {
         return Err(ApiError::BadRequest("bytes_per_sec muss > 0 sein"));
     }
+    let duration_secs = payload.duration_secs.unwrap_or(60);
+    if duration_secs == 0 {
+        return Err(ApiError::BadRequest("duration_secs muss > 0 sein"));
+    }
 
     let runtime = current_runtime_snapshot_for_agent_name(state, agent_name)?;
     let _platform =
         platform_agent_snapshot_for_name(state, agent_name)?.ok_or(ApiError::NotFound(
             "agent_name nicht im Platform-State",
         ))?;
+    let platform_state = state
+        .platform_state
+        .read()
+        .ok()
+        .map(|snapshot| snapshot.clone())
+        .unwrap_or_default();
+    let scheduled_start_tick = if payload.align_to_observation_window {
+        next_write_anomaly_start_tick(
+            platform_state.current_tick,
+            platform_state.cycle_interval_ticks,
+            platform_state.ebpf_collect_interval_ticks,
+        )
+    } else {
+        platform_state.current_tick
+    };
+    let start_delay_secs = scheduled_start_tick.saturating_sub(platform_state.current_tick);
     let bwrap_pid = runtime
         .bwrap_pid
         .ok_or(ApiError::ServiceUnavailable("tracked bwrap_pid fehlt"))?;
-    let guest_path = format!("/home/{agent_name}/.issue264-write-anomaly.bin");
     let host_path = Path::new(&runtime.home_host_path)
         .join(".issue264-write-anomaly.bin")
         .display()
         .to_string();
+    let _ = std::fs::remove_file(&host_path);
     let script = r#"import os, sys, time
 path = sys.argv[1]
 bps = int(sys.argv[2])
-duration = float(sys.argv[3])
+delay = float(sys.argv[3])
+duration = float(sys.argv[4])
 chunk = b'x' * max(4096, min(1048576, max(4096, bps // 4)))
+if delay > 0:
+    time.sleep(delay)
 deadline = time.time() + duration
 os.makedirs(os.path.dirname(path), exist_ok=True)
-with open(path, 'ab', buffering=0) as handle:
+with open(path, 'wb', buffering=0) as handle:
     while time.time() < deadline:
         loop_start = time.time()
         written = 0
@@ -1475,16 +1530,19 @@ with open(path, 'ab', buffering=0) as handle:
         if sleep_for > 0:
             time.sleep(sleep_for)
 "#;
-    let inner_command = vec![
-        "/usr/bin/python3".to_string(),
-        "-c".to_string(),
-        script.to_string(),
-        guest_path,
-        payload.bytes_per_sec.to_string(),
-        "20".to_string(),
-    ];
-    let mut child = build_bwrap_command(agent_name, state.fs_mount.as_deref(), &[], &inner_command);
-    child.stdout(Stdio::null()).stderr(Stdio::null());
+    // Operator-only test hook: spawn a host-side writer and move it into the
+    // target agent cgroup so write-rate detection is deterministic and does not
+    // depend on the sandbox's execute policy.
+    let mut child = Command::new("/usr/bin/python3");
+    child
+        .arg("-c")
+        .arg(script)
+        .arg(&host_path)
+        .arg(payload.bytes_per_sec.to_string())
+        .arg(start_delay_secs.to_string())
+        .arg(duration_secs.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut child = child
         .spawn()
         .map_err(|_| ApiError::ServiceUnavailable("Write-Anomaly-Test konnte nicht gestartet werden"))?;
@@ -1498,6 +1556,10 @@ with open(path, 'ab', buffering=0) as handle:
         agent_name: agent_name.to_string(),
         mode: payload.mode,
         bytes_per_sec: payload.bytes_per_sec,
+        duration_secs,
+        align_to_observation_window: payload.align_to_observation_window,
+        start_delay_secs,
+        scheduled_start_tick,
         bwrap_pid,
         helper_pid,
         host_path,
@@ -1753,6 +1815,7 @@ mod tests {
             state_store,
             platform_state: Arc::new(std::sync::RwLock::new(PlatformStateSnapshot {
                 current_tick: 42,
+                cycle_interval_ticks: 60,
                 ebpf_collect_interval_ticks: 10,
                 stall_detection_threshold_secs: 30,
                 llm_enabled: true,
@@ -2091,8 +2154,21 @@ mod tests {
         assert_eq!(response.status, 200);
         let payload: PlatformStateSnapshot = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(payload.current_tick, 42);
+        assert_eq!(payload.cycle_interval_ticks, 60);
         assert_eq!(payload.agents.len(), 1);
         assert_eq!(payload.agents[0].aggregate_id, "AGENT-07");
+    }
+
+    #[test]
+    fn write_anomaly_alignment_targets_observation_window_start() {
+        assert_eq!(next_write_anomaly_start_tick(111531, 60, 10), 111531);
+        assert_eq!(next_write_anomaly_start_tick(111538, 60, 10), 111591);
+    }
+
+    #[test]
+    fn write_anomaly_alignment_handles_equal_cycle_and_ebpf_interval() {
+        assert_eq!(next_write_anomaly_start_tick(120, 10, 10), 121);
+        assert_eq!(next_write_anomaly_start_tick(121, 10, 10), 121);
     }
 
     #[test]

@@ -462,6 +462,8 @@ pub struct PlatformControlplaneConfig {
     pub max_escalation: u32,
     #[serde(default = "default_pcp_write_anomaly_threshold")]
     pub write_anomaly_threshold_bytes_per_sec: u64,
+    #[serde(default = "default_pcp_write_anomaly_baseline_multiplier")]
+    pub write_anomaly_baseline_multiplier: f64,
     #[serde(default = "default_pcp_write_anomaly_cooldown")]
     pub write_anomaly_cooldown_ticks: u64,
     #[serde(default = "default_pcp_monitored_services")]
@@ -520,6 +522,9 @@ fn default_pcp_max_escalation() -> u32 {
 fn default_pcp_write_anomaly_threshold() -> u64 {
     5_000_000 // 5 MB/s
 }
+fn default_pcp_write_anomaly_baseline_multiplier() -> f64 {
+    10.0
+}
 fn default_pcp_write_anomaly_cooldown() -> u64 {
     60
 }
@@ -570,6 +575,7 @@ impl Default for PlatformControlplaneConfig {
             memory_pressure_threshold: default_pcp_memory_pressure(),
             max_escalation: default_pcp_max_escalation(),
             write_anomaly_threshold_bytes_per_sec: default_pcp_write_anomaly_threshold(),
+            write_anomaly_baseline_multiplier: default_pcp_write_anomaly_baseline_multiplier(),
             write_anomaly_cooldown_ticks: default_pcp_write_anomaly_cooldown(),
             monitored_services: default_pcp_monitored_services(),
             service_check_interval_secs: default_pcp_service_check_interval(),
@@ -863,6 +869,7 @@ max_projection_lag = 42
 memory_pressure_threshold = 0.75
 max_escalation = 4
 write_anomaly_threshold_bytes_per_sec = 111
+write_anomaly_baseline_multiplier = 12.5
 write_anomaly_cooldown_ticks = 22
 service_check_interval_secs = 15
 llm_enabled = false
@@ -887,6 +894,7 @@ llm_max_failed_interventions = 5
         assert_eq!(cfg.memory_pressure_threshold, 0.75);
         assert_eq!(cfg.max_escalation, 4);
         assert_eq!(cfg.write_anomaly_threshold_bytes_per_sec, 111);
+        assert_eq!(cfg.write_anomaly_baseline_multiplier, 12.5);
         assert_eq!(cfg.write_anomaly_cooldown_ticks, 22);
         assert_eq!(cfg.service_check_interval_secs, 15);
         assert!(!cfg.llm_enabled);
