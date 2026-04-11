@@ -119,6 +119,8 @@ impl From<AgentSnapshot> for AgentHandle {
 struct RuntimeSnapshot {
     agents: Vec<AgentSnapshot>,
     max_agents: usize,
+    #[serde(default)]
+    current_tick: u64,
 }
 
 /// Orchestriert Agent-Lifecycle: Spawn, Despawn, Schichtwechsel, Health-Checks.
@@ -162,6 +164,11 @@ impl RuntimeOrchestrator {
     /// Updates the current simulation tick (used for event timestamps).
     pub fn set_tick(&mut self, tick: u64) {
         self.current_tick = tick;
+    }
+
+    /// Liefert den aktuellen Runtime-Tick.
+    pub fn current_tick(&self) -> u64 {
+        self.current_tick
     }
 
     /// Spawnt einen neuen Agenten. Fehler bei Duplikat oder max erreicht.
@@ -459,6 +466,7 @@ impl RuntimeOrchestrator {
         let snapshot = RuntimeSnapshot {
             agents: self.agents.values().map(AgentSnapshot::from).collect(),
             max_agents: self.max_agents,
+            current_tick: self.current_tick,
         };
 
         let json = serde_json::to_string(&snapshot)?;
@@ -489,13 +497,17 @@ impl RuntimeOrchestrator {
         let snapshot: RuntimeSnapshot = serde_json::from_str(&snapshot_row.payload)?;
 
         let mut agents = HashMap::new();
+        let mut max_last_activity_tick = 0;
         for agent_snap in snapshot.agents {
             let agent_id = agent_snap.identity.agent_id;
+            max_last_activity_tick = max_last_activity_tick.max(agent_snap.last_activity_tick);
             agents.insert(agent_id, AgentHandle::from(agent_snap));
         }
+        let restored_tick = snapshot.current_tick.max(max_last_activity_tick);
 
         tracing::info!(
             agent_count = agents.len(),
+            restored_tick,
             "Runtime state restored from snapshot"
         );
 
@@ -508,7 +520,7 @@ impl RuntimeOrchestrator {
             },
             event_store: Some(store),
             event_sink: None,
-            current_tick: 0,
+            current_tick: restored_tick,
             event_seq: 0,
         })
     }
@@ -822,6 +834,7 @@ mod tests {
         let restored = RuntimeOrchestrator::restore(store, 15).unwrap();
 
         assert_eq!(restored.agent_count(), 5);
+        assert_eq!(restored.current_tick(), 50);
 
         // Verify specific agent state survived
         // Note: get_agent_mut requires &mut, so we create a mutable binding
@@ -830,6 +843,35 @@ mod tests {
         assert_eq!(agent3.status, AgentStatus::Errored);
         assert_eq!(agent3.identity.name, "Agent-3");
         assert_eq!(agent3.shift.shift_set, 1);
+    }
+
+    #[test]
+    fn restore_falls_back_to_last_activity_tick_for_legacy_snapshots() {
+        let (_dir, store) = temp_event_store();
+        let legacy_snapshot = RuntimeSnapshot {
+            agents: vec![AgentSnapshot {
+                identity: create_identity(1, "Thomas", "CEO"),
+                shift: create_shift(1, 6, 14),
+                status: AgentStatus::Active,
+                last_activity_tick: 70140,
+            }],
+            max_agents: 10,
+            current_tick: 0,
+        };
+        let mut legacy_value = serde_json::to_value(&legacy_snapshot).unwrap();
+        legacy_value
+            .as_object_mut()
+            .expect("runtime snapshot as object")
+            .remove("current_tick");
+        let legacy_json = serde_json::to_string(&legacy_value).unwrap();
+
+        store
+            .save_snapshot(RUNTIME_AGGREGATE, RUNTIME_SNAPSHOT_TYPE, &legacy_json, 0)
+            .unwrap();
+
+        let restored = RuntimeOrchestrator::restore(store, 10).unwrap();
+        assert_eq!(restored.current_tick(), 70140);
+        assert_eq!(restored.agent_count(), 1);
     }
 
     #[test]

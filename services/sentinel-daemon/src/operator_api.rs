@@ -22,6 +22,10 @@ use sentinel_common::{
 };
 
 use crate::config::OperatorApiConfig;
+use crate::platform_controlplane::{
+    PlatformAnalysisCommand, PlatformControlCommand, PlatformStateSnapshot,
+    PlatformTriggerTestCommand,
+};
 
 const OPERATOR_CHAOS_PATH: &str = "/operator/chaos";
 const OPERATOR_STIMULUS_PATH: &str = "/operator/stimulus";
@@ -33,6 +37,10 @@ const OPERATOR_PRUNE_PATH: &str = "/operator/prune";
 const OPERATOR_CHAT_PATH: &str = "/operator/chat";
 const OPERATOR_GAIA_PATH: &str = "/operator/gaia";
 const OPERATOR_BROADCAST_PATH: &str = "/operator/broadcast";
+const OPERATOR_PLATFORM_ANALYZE_PATH: &str = "/operator/platform-analyze";
+const OPERATOR_PLATFORM_TRIGGER_TEST_PATH: &str = "/operator/platform-trigger-test";
+const OPERATOR_PLATFORM_ANALYSIS_TEST_PATH: &str = "/operator/platform-analysis-test";
+const OPERATOR_PLATFORM_STATE_PATH: &str = "/operator/platform-state";
 const OPERATOR_APICP_SNAPSHOT_PATH: &str = "/operator/apicp/snapshot";
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024;
@@ -98,12 +106,14 @@ struct AppState {
     allowed_rooms: Arc<HashSet<String>>,
     shared_secret: Option<String>,
     command_tx: mpsc::Sender<OperatorCommand>,
+    platform_tx: mpsc::Sender<PlatformControlCommand>,
     nightrun_tx: mpsc::Sender<OperatorNightrunCommand>,
     snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
     event_store: Arc<sentinel_limbo::EventStore>,
     prune_tx: mpsc::Sender<i64>,
     state_store: Arc<StateStore>,
+    platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -169,16 +179,19 @@ impl ApiError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_server(
     config: OperatorApiConfig,
     allowed_rooms: Vec<String>,
     command_tx: mpsc::Sender<OperatorCommand>,
+    platform_tx: mpsc::Sender<PlatformControlCommand>,
     nightrun_tx: mpsc::Sender<OperatorNightrunCommand>,
     snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
     event_store: Arc<sentinel_limbo::EventStore>,
     prune_tx: mpsc::Sender<i64>,
     state_store: Arc<sentinel_redb::StateStore>,
+    platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
 ) -> AnyResult<tokio::task::JoinHandle<()>> {
     let listener = TcpListener::bind(&config.bind_addr)
         .await
@@ -188,12 +201,14 @@ pub async fn start_server(
         allowed_rooms: Arc::new(allowed_rooms.into_iter().collect()),
         shared_secret: config.shared_secret,
         command_tx,
+        platform_tx,
         nightrun_tx,
         snapshot_tx,
         restore_tx,
         event_store,
         prune_tx,
         state_store,
+        platform_state,
     };
 
     info!(
@@ -260,6 +275,12 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 ),
                 Err(_) => {
                     ApiError::ServiceUnavailable("API-CP Snapshot nicht verfuegbar").to_response()
+                }
+            },
+            OPERATOR_PLATFORM_STATE_PATH => match state.platform_state.read() {
+                Ok(snapshot) => json_response(200, snapshot.clone()),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Platform-State nicht verfuegbar").to_response()
                 }
             },
             _ => ApiError::NotFound("Endpoint unbekannt").to_response(),
@@ -438,6 +459,41 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 }
             }
         }
+        OPERATOR_PLATFORM_ANALYZE_PATH => {
+            if !request.body.is_empty()
+                && serde_json::from_slice::<serde_json::Value>(&request.body).is_err()
+            {
+                return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+            }
+            match dispatch_platform_analyze(state) {
+                Ok(response) => json_response(202, response),
+                Err(err) => err.to_response(),
+            }
+        }
+        OPERATOR_PLATFORM_TRIGGER_TEST_PATH => {
+            let payload: PlatformTriggerTestCommand = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                }
+            };
+            match dispatch_platform_trigger_test(payload, state) {
+                Ok(response) => json_response(202, response),
+                Err(err) => err.to_response(),
+            }
+        }
+        OPERATOR_PLATFORM_ANALYSIS_TEST_PATH => {
+            let payload: PlatformAnalysisCommand = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                }
+            };
+            match dispatch_platform_analysis_test(payload, state) {
+                Ok(response) => json_response(202, response),
+                Err(err) => err.to_response(),
+            }
+        }
         OPERATOR_APICP_SNAPSHOT_PATH => {
             let payload: ApiCpSnapshot = match serde_json::from_slice(&request.body) {
                 Ok(p) => p,
@@ -597,6 +653,153 @@ fn dispatch_nightrun_trigger(
     })
 }
 
+fn dispatch_platform_analyze(
+    state: &AppState,
+) -> std::result::Result<TriggerNightrunResponse, ApiError> {
+    state
+        .platform_tx
+        .send(PlatformControlCommand::AnalyzeNow)
+        .map_err(|_| ApiError::ServiceUnavailable("Platform-Channel nicht verfuegbar"))?;
+
+    Ok(TriggerNightrunResponse {
+        accepted: true,
+        message: "Platform-Analyse eingeplant".to_string(),
+    })
+}
+
+fn dispatch_platform_trigger_test(
+    payload: PlatformTriggerTestCommand,
+    state: &AppState,
+) -> std::result::Result<TriggerNightrunResponse, ApiError> {
+    let trigger = payload.trigger.trim();
+    if trigger.is_empty() {
+        return Err(ApiError::BadRequest("trigger fehlt"));
+    }
+    if trigger != "scheduled" && trigger != "unresolved_escalation" {
+        return Err(ApiError::BadRequest(
+            "trigger muss scheduled oder unresolved_escalation sein",
+        ));
+    }
+    if trigger == "unresolved_escalation" {
+        let missing_rule = payload
+            .rule_name
+            .as_deref()
+            .map(str::trim)
+            .map(|value| value.is_empty())
+            .unwrap_or(true);
+        let missing_target = payload
+            .target
+            .as_deref()
+            .map(str::trim)
+            .map(|value| value.is_empty())
+            .unwrap_or(true);
+        if missing_rule || missing_target {
+            return Err(ApiError::BadRequest(
+                "rule_name und target sind fuer unresolved_escalation Pflicht",
+            ));
+        }
+        if matches!(payload.count, Some(0)) {
+            return Err(ApiError::BadRequest("count muss > 0 sein"));
+        }
+    }
+
+    state
+        .platform_tx
+        .send(PlatformControlCommand::TriggerTest(payload.clone()))
+        .map_err(|_| ApiError::ServiceUnavailable("Platform-Channel nicht verfuegbar"))?;
+
+    Ok(TriggerNightrunResponse {
+        accepted: true,
+        message: format!("Platform-Testtrigger {trigger} eingeplant"),
+    })
+}
+
+fn dispatch_platform_analysis_test(
+    mut payload: PlatformAnalysisCommand,
+    state: &AppState,
+) -> std::result::Result<TriggerNightrunResponse, ApiError> {
+    payload.trigger = payload.trigger.trim().to_string();
+    payload.severity = payload.severity.trim().to_string();
+    payload.summary = payload.summary.trim().to_string();
+    payload.recommendation = payload.recommendation.trim().to_string();
+    payload.target = payload.normalized_target();
+    payload.suggested_action = payload
+        .suggested_action
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if payload.trigger.is_empty() {
+        return Err(ApiError::BadRequest("trigger fehlt"));
+    }
+    if payload.severity.is_empty() {
+        return Err(ApiError::BadRequest("severity fehlt"));
+    }
+    if payload.summary.is_empty() {
+        return Err(ApiError::BadRequest("summary fehlt"));
+    }
+    if payload.recommendation.is_empty() {
+        return Err(ApiError::BadRequest("recommendation fehlt"));
+    }
+
+    if let Some(action) = payload.suggested_action.as_deref() {
+        match action {
+            "force_profile" => {
+                if payload.target == "system" {
+                    return Err(ApiError::BadRequest(
+                        "force_profile braucht einen Agent-Target",
+                    ));
+                }
+                let profile = payload
+                    .parameters
+                    .get("profile")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_ascii_lowercase())
+                    .ok_or(ApiError::BadRequest(
+                        "force_profile braucht parameters.profile",
+                    ))?;
+                if !matches!(profile.as_str(), "idle" | "normal" | "heavy" | "suspended") {
+                    return Err(ApiError::BadRequest("parameters.profile ungueltig"));
+                }
+            }
+            "adjust_threshold" => {
+                let key = payload
+                    .parameters
+                    .get("key")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or(ApiError::BadRequest(
+                        "adjust_threshold braucht parameters.key",
+                    ))?;
+                if !payload.parameters.contains_key("value") {
+                    return Err(ApiError::BadRequest(
+                        "adjust_threshold braucht parameters.value",
+                    ));
+                }
+                let _ = key;
+            }
+            "escalate_to_operator" => {}
+            _ => {
+                return Err(ApiError::BadRequest(
+                    "suggested_action muss force_profile, adjust_threshold oder escalate_to_operator sein",
+                ));
+            }
+        }
+    }
+
+    state
+        .platform_tx
+        .send(PlatformControlCommand::ApplyAnalysis(payload))
+        .map_err(|_| ApiError::ServiceUnavailable("Platform-Channel nicht verfuegbar"))?;
+
+    Ok(TriggerNightrunResponse {
+        accepted: true,
+        message: "Platform-Analyse-Test eingeplant".to_string(),
+    })
+}
+
 fn is_authorized(headers: &HashMap<String, String>, shared_secret: Option<&str>) -> bool {
     let Some(shared_secret) = shared_secret else {
         return true;
@@ -748,8 +951,15 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
 
-    fn test_state(secret: Option<&str>) -> (AppState, mpsc::Receiver<OperatorCommand>) {
+    fn test_state(
+        secret: Option<&str>,
+    ) -> (
+        AppState,
+        mpsc::Receiver<OperatorCommand>,
+        mpsc::Receiver<PlatformControlCommand>,
+    ) {
         let (tx, rx) = mpsc::channel();
+        let (platform_tx, platform_rx) = mpsc::channel();
         let (nightrun_tx, _nightrun_rx) = mpsc::channel();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.redb");
@@ -762,6 +972,7 @@ mod tests {
             ),
             shared_secret: secret.map(str::to_string),
             command_tx: tx,
+            platform_tx,
             nightrun_tx,
             snapshot_tx: mpsc::channel().0,
             restore_tx: mpsc::channel().0,
@@ -771,9 +982,27 @@ mod tests {
             ),
             prune_tx: mpsc::channel().0,
             state_store,
+            platform_state: Arc::new(std::sync::RwLock::new(PlatformStateSnapshot {
+                current_tick: 42,
+                ebpf_collect_interval_ticks: 10,
+                stall_detection_threshold_secs: 30,
+                llm_enabled: true,
+                llm_analysis_interval_secs: 300,
+                llm_retry_delay_secs: 60,
+                stall_recent_activity_grace_ticks: 120,
+                agents: vec![crate::platform_controlplane::PlatformAgentSnapshot {
+                    agent_id: 7,
+                    aggregate_id: "AGENT-07".to_string(),
+                    name: "Test Agent".to_string(),
+                    last_activity_tick: 11,
+                    cgroup_path: "/sys/fs/cgroup/sentinel/Test Agent".to_string(),
+                    current_profile: "normal".to_string(),
+                }],
+                ..PlatformStateSnapshot::default()
+            })),
         };
         std::mem::forget(dir);
-        (state, rx)
+        (state, rx, platform_rx)
     }
 
     fn test_request(path: &str, body: serde_json::Value) -> HttpRequest {
@@ -787,7 +1016,7 @@ mod tests {
 
     #[test]
     fn valid_trigger_request_is_accepted_and_forwarded() {
-        let (state, rx) = test_state(None);
+        let (state, rx, _platform_rx) = test_state(None);
         let response = handle_http_request(
             test_request(
                 OPERATOR_CHAOS_PATH,
@@ -821,7 +1050,7 @@ mod tests {
 
     #[test]
     fn invalid_room_returns_not_found() {
-        let (state, _rx) = test_state(None);
+        let (state, _rx, _platform_rx) = test_state(None);
         let response = handle_http_request(
             test_request(
                 OPERATOR_CHAOS_PATH,
@@ -838,7 +1067,7 @@ mod tests {
 
     #[test]
     fn missing_shared_secret_is_rejected() {
-        let (state, _rx) = test_state(Some("topsecret"));
+        let (state, _rx, _platform_rx) = test_state(Some("topsecret"));
         let response = handle_http_request(
             test_request(
                 OPERATOR_CHAOS_PATH,
@@ -855,7 +1084,7 @@ mod tests {
 
     #[test]
     fn valid_shared_secret_via_header_is_accepted() {
-        let (state, rx) = test_state(Some("topsecret"));
+        let (state, rx, _platform_rx) = test_state(Some("topsecret"));
         let mut request = test_request(
             OPERATOR_CHAOS_PATH,
             serde_json::json!({
@@ -882,7 +1111,7 @@ mod tests {
 
     #[test]
     fn valid_stimulus_request_is_accepted_and_forwarded() {
-        let (state, rx) = test_state(None);
+        let (state, rx, _platform_rx) = test_state(None);
         let response = handle_http_request(
             test_request(
                 OPERATOR_STIMULUS_PATH,
@@ -917,7 +1146,7 @@ mod tests {
 
     #[test]
     fn zero_delta_stimulus_is_rejected() {
-        let (state, _rx) = test_state(None);
+        let (state, _rx, _platform_rx) = test_state(None);
         let response = handle_http_request(
             test_request(
                 OPERATOR_STIMULUS_PATH,
@@ -934,8 +1163,155 @@ mod tests {
     }
 
     #[test]
+    fn platform_analyze_is_forwarded_to_platform_channel() {
+        let (state, _rx, platform_rx) = test_state(None);
+        let response = handle_http_request(
+            HttpRequest {
+                method: "POST".to_string(),
+                path: OPERATOR_PLATFORM_ANALYZE_PATH.to_string(),
+                headers: HashMap::new(),
+                body: b"{}".to_vec(),
+            },
+            &state,
+        );
+
+        assert_eq!(response.status, 202);
+        assert_eq!(
+            platform_rx.recv().unwrap(),
+            PlatformControlCommand::AnalyzeNow
+        );
+    }
+
+    #[test]
+    fn unresolved_trigger_test_requires_rule_and_target() {
+        let (state, _rx, _platform_rx) = test_state(None);
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_PLATFORM_TRIGGER_TEST_PATH,
+                serde_json::json!({
+                    "trigger": "unresolved_escalation",
+                    "count": 3
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 400);
+    }
+
+    #[test]
+    fn platform_trigger_test_is_forwarded() {
+        let (state, _rx, platform_rx) = test_state(None);
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_PLATFORM_TRIGGER_TEST_PATH,
+                serde_json::json!({
+                    "trigger": "unresolved_escalation",
+                    "rule_name": "projection_lag",
+                    "target": "system",
+                    "count": 3
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 202);
+        assert_eq!(
+            platform_rx.recv().unwrap(),
+            PlatformControlCommand::TriggerTest(PlatformTriggerTestCommand {
+                trigger: "unresolved_escalation".to_string(),
+                rule_name: Some("projection_lag".to_string()),
+                target: Some("system".to_string()),
+                count: Some(3),
+            })
+        );
+    }
+
+    #[test]
+    fn platform_analysis_test_is_forwarded() {
+        let (state, _rx, platform_rx) = test_state(None);
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_PLATFORM_ANALYSIS_TEST_PATH,
+                serde_json::json!({
+                    "trigger": "operator_test",
+                    "severity": "warning",
+                    "summary": "force idle",
+                    "recommendation": "apply idle profile",
+                    "suggested_action": "force_profile",
+                    "target": "AGENT-07",
+                    "parameters": { "profile": "Idle" }
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 202);
+        assert_eq!(
+            platform_rx.recv().unwrap(),
+            PlatformControlCommand::ApplyAnalysis(PlatformAnalysisCommand {
+                trigger: "operator_test".to_string(),
+                severity: "warning".to_string(),
+                summary: "force idle".to_string(),
+                recommendation: "apply idle profile".to_string(),
+                suggested_action: Some("force_profile".to_string()),
+                target: "AGENT-07".to_string(),
+                provider: None,
+                model: None,
+                unresolved_keys: Vec::new(),
+                parameters: std::collections::BTreeMap::from([(
+                    "profile".to_string(),
+                    serde_json::json!("Idle"),
+                )]),
+            })
+        );
+    }
+
+    #[test]
+    fn platform_analysis_test_rejects_missing_force_profile_parameters() {
+        let (state, _rx, _platform_rx) = test_state(None);
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_PLATFORM_ANALYSIS_TEST_PATH,
+                serde_json::json!({
+                    "trigger": "operator_test",
+                    "severity": "warning",
+                    "summary": "force idle",
+                    "recommendation": "apply idle profile",
+                    "suggested_action": "force_profile",
+                    "target": "AGENT-07",
+                    "parameters": {}
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 400);
+    }
+
+    #[test]
+    fn platform_state_endpoint_returns_snapshot() {
+        let (state, _rx, _platform_rx) = test_state(None);
+        let response = handle_http_request(
+            HttpRequest {
+                method: "GET".to_string(),
+                path: OPERATOR_PLATFORM_STATE_PATH.to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            &state,
+        );
+
+        assert_eq!(response.status, 200);
+        let payload: PlatformStateSnapshot = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(payload.current_tick, 42);
+        assert_eq!(payload.agents.len(), 1);
+        assert_eq!(payload.agents[0].aggregate_id, "AGENT-07");
+    }
+
+    #[test]
     fn apicp_snapshot_roundtrip_requires_auth_when_configured() {
-        let (state, _rx) = test_state(Some("topsecret"));
+        let (state, _rx, _platform_rx) = test_state(Some("topsecret"));
 
         let unauthorized = HttpRequest {
             method: "GET".to_string(),

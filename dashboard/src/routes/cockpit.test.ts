@@ -133,6 +133,36 @@ function seedEvents(db: Database): void {
     JSON.stringify({ reason: "health_check_failed" }),
     "cor-2", null, "op-7", 5200, now - 100_000, "none",
   );
+
+  // Platform analysis
+  insert.run(
+    "evt-platform-analysis-1", "platform_analysis", "AGENT-05",
+    JSON.stringify({
+      trigger: "manual",
+      severity: "warning",
+      summary: "CPU hotspot detected",
+      recommendation: "Force idle profile",
+      suggested_action: "force_profile",
+      target: "AGENT-05",
+      provider: "claude-code",
+      model: "gpt-test",
+      unresolved_keys: ["agent_stall:AGENT-05"],
+      parameters: { profile: "idle" },
+    }),
+    "cor-platform-1", null, "op-8", 5250, now - 90_000, "none",
+  );
+
+  // Platform intervention
+  insert.run(
+    "evt-platform-intervention-1", "platform_intervention", "AGENT-05",
+    JSON.stringify({
+      rule_name: "agent_stall",
+      target: "AGENT-05",
+      action: "idle_forced",
+      description: "Agent wurde auf idle gesetzt",
+    }),
+    "cor-platform-2", null, "op-9", 5251, now - 80_000, "none",
+  );
 }
 
 function seedLegacyEvents(db: Database): void {
@@ -313,6 +343,35 @@ describe("GET /api/cockpit", () => {
         i.incident_type === "nightrun_completed" && i.id === "evt-nr-ok",
     );
     expect(nightruns.length).toBe(0);
+  });
+
+  test("platform analysis incidents are included with mapped severity", async () => {
+    const res = await app.request("/api/cockpit");
+    const data = await res.json();
+
+    const analysis = data.incidents.find(
+      (i: { incident_type: string; id: string }) =>
+        i.incident_type === "platform_analysis" && i.id === "evt-platform-analysis-1",
+    );
+    expect(analysis).toBeDefined();
+    expect(analysis.severity).toBe("high");
+    expect(analysis.summary).toContain("Platform Analyse");
+    expect(analysis.agent_id).toBe("AGENT-05");
+  });
+
+  test("platform intervention incidents are included with readable summary", async () => {
+    const res = await app.request("/api/cockpit");
+    const data = await res.json();
+
+    const intervention = data.incidents.find(
+      (i: { incident_type: string; id: string }) =>
+        i.incident_type === "platform_intervention" &&
+        i.id === "evt-platform-intervention-1",
+    );
+    expect(intervention).toBeDefined();
+    expect(intervention.severity).toBe("medium");
+    expect(intervention.summary).toContain("idle_forced");
+    expect(intervention.agent_id).toBe("AGENT-05");
   });
 });
 

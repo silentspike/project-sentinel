@@ -33,21 +33,22 @@ struct EbpfStatus {
 ///
 /// Gibt den konfigurierten Collector und den aktiven Modus zurueck.
 /// LoadedProbes werden vom Collector uebernommen (Ownership → Drop = Detach).
-pub fn init_ebpf() -> (EbpfCollector, MonitoringMode) {
+pub fn init_ebpf(stall_threshold_secs: u64) -> (EbpfCollector, MonitoringMode) {
     let result = sentinel_ebpf::loader::init();
     let mode = result.mode;
+    let stall_threshold_secs = stall_threshold_secs.max(1);
 
     #[cfg(feature = "ebpf")]
     let collector = match result.probes {
         Some(probes) => {
             info!("eBPF Kernel-Probes geladen, Collector mit BPF Maps");
-            EbpfCollector::with_probes(mode, probes)
+            EbpfCollector::with_probes_and_stall_threshold(mode, probes, stall_threshold_secs)
         }
-        None => EbpfCollector::new(mode),
+        None => EbpfCollector::new_with_stall_threshold(mode, stall_threshold_secs),
     };
 
     #[cfg(not(feature = "ebpf"))]
-    let collector = EbpfCollector::new(mode);
+    let collector = EbpfCollector::new_with_stall_threshold(mode, stall_threshold_secs);
 
     (collector, mode)
 }
