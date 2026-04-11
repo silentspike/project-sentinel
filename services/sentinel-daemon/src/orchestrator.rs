@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use tracing::{debug, error, info, warn};
 
 use sentinel_common::agent_config::{load_all_agents, AgentConfig};
@@ -93,6 +93,65 @@ fn remove_security_runtime_snapshot(
     if let Ok(mut state) = security_runtime_state.write() {
         state.remove(&agent_id.0);
     }
+}
+
+fn proc_state(pid: u32) -> Option<char> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("State:")?.trim();
+        value.chars().next()
+    })
+}
+
+fn signal_pid(pid: u32, signal: &str) -> Result<()> {
+    let status = std::process::Command::new("kill")
+        .args([format!("-{signal}"), pid.to_string()])
+        .status()
+        .with_context(|| format!("kill -{signal} fuer PID {pid} fehlgeschlagen"))?;
+    if status.success() || !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        Ok(())
+    } else {
+        Err(anyhow!("kill -{signal} fuer PID {pid} lieferte {status}"))
+    }
+}
+
+fn suspend_pids(pids: &[u32], tracked_pid: Option<u32>) -> Result<()> {
+    let mut unique_pids = pids.to_vec();
+    unique_pids.sort_unstable();
+    unique_pids.dedup();
+    if unique_pids.is_empty() {
+        return Err(anyhow!("keine PIDs zum Suspendieren vorhanden"));
+    }
+
+    for pid in &unique_pids {
+        signal_pid(*pid, "STOP")?;
+    }
+
+    if let Some(pid) = tracked_pid {
+        match proc_state(pid) {
+            Some('T') => {}
+            Some(state) => {
+                return Err(anyhow!(
+                    "tracked PID {pid} ist nach SIGSTOP nicht angehalten (state={state})"
+                ));
+            }
+            None => return Err(anyhow!("tracked PID {pid} ist nach SIGSTOP nicht mehr lesbar")),
+        }
+    }
+
+    Ok(())
+}
+
+fn suspend_agent_cgroup_processes(agent_name: &str, tracked_pid: Option<u32>) -> Result<Vec<u32>> {
+    let mut pids = sentinel_sandbox::cgroups::list_pids_in_cgroup(agent_name)
+        .with_context(|| format!("cgroup-Mitglieder fuer {agent_name} nicht lesbar"))?;
+    if let Some(pid) = tracked_pid {
+        pids.push(pid);
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    suspend_pids(&pids, tracked_pid)?;
+    Ok(pids)
 }
 
 /// Spawnt einen Agenten sowohl im RuntimeOrchestrator als auch in der ECS World.
@@ -947,6 +1006,7 @@ fn publish_platform_state_snapshot(
     if let Ok(mut snapshot) = platform_state.write() {
         *snapshot = crate::platform_controlplane::PlatformStateSnapshot {
             current_tick: tick_count,
+            cycle_interval_ticks: platform_cp.config().cycle_interval_ticks,
             ebpf_collect_interval_ticks: platform_cp.config().ebpf_collect_interval_ticks,
             stall_detection_threshold_secs: platform_cp.config().stall_detection_threshold_secs,
             stall_recent_activity_grace_ticks: platform_cp
@@ -1682,6 +1742,40 @@ fn ecs_tick_loop(
                                     "Idle-Profil konnte nicht erzwungen werden"
                                 );
                             }
+                        }
+                    }
+                    crate::platform_controlplane::rules::PlatformSideEffect::SuspendAgent(
+                        agent_id,
+                    ) => {
+                        if let Some(handle) = sandbox_handles.get(&agent_id) {
+                            match suspend_agent_cgroup_processes(
+                                &handle.agent_name,
+                                handle.bwrap_pid,
+                            ) {
+                                Ok(pids) => {
+                                    info!(
+                                        agent_id = %agent_id,
+                                        agent = %handle.agent_name,
+                                        tracked_pid = ?handle.bwrap_pid,
+                                        stopped_pids = pids.len(),
+                                        "Agent nach Write-Anomaly via SIGSTOP suspendiert"
+                                    );
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        agent_id = %agent_id,
+                                        agent = %handle.agent_name,
+                                        tracked_pid = ?handle.bwrap_pid,
+                                        error = %error,
+                                        "SIGSTOP fuer Write-Anomaly fehlgeschlagen"
+                                    );
+                                }
+                            }
+                        } else {
+                            warn!(
+                                agent_id = %agent_id,
+                                "SandboxHandle fuer Write-Anomaly-Suspend fehlt"
+                            );
                         }
                     }
                     crate::platform_controlplane::rules::PlatformSideEffect::RestartAgent(
@@ -2846,6 +2940,21 @@ mod tests {
             },
             capabilities: Default::default(),
         }
+    }
+
+    #[test]
+    fn test_suspend_pids_stops_tracked_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep child");
+        let pid = child.id();
+
+        suspend_pids(&[pid], Some(pid)).expect("pid suspended");
+        assert_eq!(proc_state(pid), Some('T'));
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
