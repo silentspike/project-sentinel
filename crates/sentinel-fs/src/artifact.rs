@@ -188,6 +188,7 @@ impl ArtifactPlane {
             wtxn.open_table(FS_MANIFESTS)?;
             wtxn.open_table(FS_CHUNKS)?;
             wtxn.open_table(FS_CHUNK_REFCOUNT)?;
+            wtxn.open_table(FS_TRASH_QUEUE)?;
             wtxn.open_table(FS_OBJECT_REFS)?;
             wtxn.open_table(FS_INGEST_SESSIONS)?;
         }
@@ -433,6 +434,33 @@ impl ArtifactPlane {
         Ok(table.get(hash)?.map(|g| g.value()).unwrap_or(0))
     }
 
+    /// Get the trash-queue timestamp for a chunk.
+    pub fn get_trash_timestamp(&self, hash: &ChunkHash) -> anyhow::Result<Option<u64>> {
+        let rtxn = self.db.begin_read()?;
+        let table = rtxn.open_table(FS_TRASH_QUEUE)?;
+        Ok(table.get(hash)?.map(|g| g.value()))
+    }
+
+    /// Override the trash-queue timestamp for a chunk.
+    pub fn set_trash_timestamp(
+        &self,
+        hash: &ChunkHash,
+        trashed_at_ms: u64,
+    ) -> anyhow::Result<bool> {
+        let wtxn = self.begin_write()?;
+        let updated = {
+            let mut table = wtxn.open_table(FS_TRASH_QUEUE)?;
+            if table.get(hash)?.is_some() {
+                table.insert(hash, trashed_at_ms)?;
+                true
+            } else {
+                false
+            }
+        };
+        wtxn.commit()?;
+        Ok(updated)
+    }
+
     /// Resolve a named reference to an ObjectId.
     pub fn resolve_ref(&self, name: &str) -> anyhow::Result<Option<u64>> {
         let rtxn = self.db.begin_read()?;
@@ -609,5 +637,12 @@ mod tests {
         // Writes still work (just without fsync)
         let id = plane.next_object_id().unwrap();
         assert_eq!(id, 1);
+    }
+
+    #[test]
+    fn trash_queue_table_exists_on_open() {
+        let (plane, _dir) = temp_plane();
+        let missing = [0x11u8; 16];
+        assert_eq!(plane.get_trash_timestamp(&missing).unwrap(), None);
     }
 }

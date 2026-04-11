@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan264.md`
-- Overall status: `TASK_1_DONE_TASK_2_PENDING`
-- Current task: `Task 2 - Operator-/Admin-Security-Read- und Testpfade (Phase E Foundations)`
+- Overall status: `TASK_1_DONE_TASK_2_DONE_TASK_3_PENDING`
+- Current task: `Task 3 - Write-Anomaly Enforcement, SIGSTOP und Platform-Intervention-Audit (Phase B)`
 - Current branch: `feat/issue-264-security-hardening-closure`
 - Hook status: `PreToolUse TaskUpdate + PostToolUse start-enforcer projektlokal registriert`
 - Last refresh: `2026-04-11 Europe/Vienna`
@@ -36,6 +36,18 @@
   - `sentinel-daemon`, `sentinel-gateway` und `sentinel-projection` sind `active`
   - `landlock.rs` nutzt aktuell `all_access` fuer `write_paths`
   - `cockpit.ts` mappt sowohl `platform_analysis` als auch `platform_intervention`
+- Task-2-Readiness und Live-Evidence stehen jetzt:
+  - `operator_api.rs` exponiert die geplanten loopback-only `/operator/security/*` Hooks fuer Trash, Runtime-State, Write-Anomaly und Landlock
+  - `orchestrator.rs` tracked dafuer live `bwrap_pid`, Agent-Home und optionales `fs_mount` in einem shared Runtime-State
+  - `ArtifactPlane::open()` initialisiert jetzt auch `fs_trash_queue`; ohne diesen Fix waeren die neuen Trash-Inspect-/GC-Pfade auf leeren Tabellen gelandet
+  - `breakout-helper` deckt jetzt die Landlock-Szenarien `exec-from-home`, `exec-bin-sh` und `exec-python3` ab; vorher war nur `exec-from-tmp` implementiert
+  - Der Live-Befund auf `10.0.0.240` war erst rot im Detail:
+    - `landlock-test` lieferte korrekt `exit_code=1` plus `Permission denied`, aber der Response markierte faelschlich `blocked:false`
+  - Der Fix ist jetzt deployed und live bestaetigt:
+    - dieselben Exec-Szenarien liefern `blocked:true`
+  - Der tatsaechliche API-Contract der Task-2-Hooks ist dokumentiert:
+    - `fs-trash-fixture` braucht `agent_name`, `relative_path`, `content`
+    - `write-anomaly-test` braucht `agent_name`, `mode`, `bytes_per_sec`
 
 ## Blocked items
 
@@ -47,7 +59,7 @@
 
 ## Commit references
 
-- `TBD` Task [1]
+- `f089875` Task [1]
 - `TBD` Task [2]
 - `TBD` Task [3]
 - `TBD` Task [4]
@@ -64,7 +76,7 @@
 | # | Task | Status | Scope | Evidence |
 |---|------|--------|-------|----------|
 | 1 | Issue-Truth-Repair, Branch-/Execution-Setup und AC-3-Scope-Gate | DONE | GitHub-Truth-Repair, Branch-/SSOT-Setup, AC-3-Entscheidung, frische Baseline fuer `#264` | command, system, inspect |
-| 2 | Operator-/Admin-Security-Read- und Testpfade (Phase E Foundations) | PENDING | `/operator/security/*` Read-/Test-Hooks, Auth/Loopback, deterministische Evidence-Pfade | inspect, command, system |
+| 2 | Operator-/Admin-Security-Read- und Testpfade (Phase E Foundations) | DONE | `/operator/security/*` Read-/Test-Hooks, Auth/Loopback, deterministische Evidence-Pfade | inspect, command, system |
 | 3 | Write-Anomaly Enforcement, SIGSTOP und Platform-Intervention-Audit (Phase B) | PENDING | Rolling Baseline, deterministischer Suspend, `platform_intervention` Audit-Trail | inspect, command, system |
 | 4 | Landlock-Minimal-Exec und `sandbox_exec_blocked` Events (Phase C) | PENDING | `write_paths` ohne Execute, minimale Exec-Allowlist, Security-Eventpfad | inspect, command, system |
 | 5 | Immutable Snapshot Hardening und Retention-Sicherheit (Phase D) | PENDING | SQLite-Trigger, Retention-/Prune-Vertraeglichkeit, Delete-Pfade | inspect, command, system |
@@ -163,6 +175,45 @@
   - AC-1: `inspect`, `command`
   - AC-2: `inspect`, `system`
   - AC-3: `command`
+- Outcome:
+  - `services/sentinel-daemon/src/operator_api.rs` exponiert jetzt die geplanten Security-Hooks:
+    - `GET /operator/security/fs-trash`
+    - `POST /operator/security/fs-trash-fixture`
+    - `POST /operator/security/fs-trash-age`
+    - `POST /operator/security/fs-trash-gc`
+    - `POST /operator/security/fs-ransomware-test`
+    - `GET /operator/security/agent-runtime-state`
+    - `POST /operator/security/write-anomaly-test`
+    - `POST /operator/security/landlock-test`
+  - Query-Parsing, loopback-read paths, Auth-Check fuer gesetztes Operator-Secret und body-size routing sind zentral im Operator-API-Pfad verankert.
+  - `services/sentinel-daemon/src/orchestrator.rs` fuehrt jetzt einen shared `security_runtime_state` mit `agent_id`, `aggregate_id`, `agent_name`, `bwrap_pid`, Home-Pfad und optionalem `fs_mount`; der State wird beim Spawn, Fallback, Restart und Shutdown mitgefuehrt.
+  - `crates/sentinel-fs/src/artifact.rs` initialisiert `fs_trash_queue` beim Open und expose't Test-/Inspect-Helfer fuer Trash-Timestamps.
+  - `crates/sentinel-sandbox/src/bin/breakout_helper.rs` deckt jetzt die deterministischen Exec-Szenarien `exec-from-home`, `exec-bin-sh` und `exec-python3` ab.
+  - Ein realer Runtime-Bug im neuen Landlock-Testpfad wurde behoben:
+    - Landlock blockierte Exec bereits korrekt im Wrapper
+    - der API-Response markierte das aber nur bei `exit_code == 0` als `blocked`
+    - jetzt wird auch der reale Wrapper-Fehlerpfad `exec failed: Permission denied` bzw. `Operation not permitted` als `blocked:true` gemappt
+- Evidence:
+  - AC-1 PASS:
+    - `rg -n "fs-trash|write-anomaly-test|landlock-test|agent-runtime-state" services/sentinel-daemon/src/operator_api.rs` => alle geplanten `/operator/security/*` Endpunkte sind im Handler verdrahtet
+    - `cargo remote -c -- build -p sentinel-daemon --release` => `Finished release profile [optimized] target(s)` fuer den Deploy-Stand
+    - `scp target/release/sentinel-daemon ubuntu@10.0.0.240:/tmp/sentinel-daemon` und `ssh ubuntu@10.0.0.240 "sudo systemctl stop sentinel-daemon && sudo install -m 0755 /tmp/sentinel-daemon /opt/sentinel/bin/sentinel-daemon && sudo systemctl start sentinel-daemon && sudo systemctl is-active sentinel-daemon"` => Redeploy erfolgreich, Dienst `active`
+    - `curl --max-time 2 http://10.0.0.240:8084/operator/security/agent-runtime-state?agent_id=49` => Timeout von ausserhalb der VM, also kein versehentlich exponierter Remote-Pfad
+    - `ssh ubuntu@10.0.0.240 "curl -s http://127.0.0.1:8084/operator/security/agent-runtime-state?agent_id=49"` => `found:true`, `agent_name:"Carla Friedmann"`, `bwrap_pid:...`, `home_host_path:"/ram/agents/Carla Friedmann"`
+    - `ssh ubuntu@10.0.0.240 'python3 - <<'"'"'PY'"'"' ... fs-trash-fixture ... PY'` => `accepted:true`, `chunk_hashes:["e926e21be7c88cc5152a7d37fff800fb"]`, `trashed_chunks:1`
+    - `ssh ubuntu@10.0.0.240 'python3 - <<'"'"'PY'"'"' ... write-anomaly-test ... PY'` => `accepted:true`, `mode:"burst"`, `bwrap_pid:1161446`, `host_path:"/ram/agents/Carla Friedmann/.issue264-write-anomaly.bin"`
+    - `ssh ubuntu@10.0.0.240 "curl -s -X POST http://127.0.0.1:8084/operator/security/landlock-test -H 'Content-Type: application/json' -d '{\"agent_name\":\"Carla Friedmann\",\"scenario\":\"exec-python3\"}'"` => `accepted:true`, `blocked:true`, Wrapper meldet `Permission denied`
+    - `ssh ubuntu@10.0.0.240 "curl -s -X POST http://127.0.0.1:8084/operator/security/landlock-test -H 'Content-Type: application/json' -d '{\"agent_name\":\"Carla Friedmann\",\"scenario\":\"exec-bin-sh\"}'"` => ebenfalls `blocked:true`
+  - AC-2 PASS:
+    - `cargo remote -c -- test -p sentinel-daemon operator_api::tests -- --nocapture` => Test `security_get_requires_auth_when_configured` gruen
+    - `rg -n "is_security_path|is_authorized|shared_secret" services/sentinel-daemon/src/operator_api.rs` => GET-Security-Pfade und POSTs haengen am zentralen Secret-Check
+    - Live auf `10.0.0.240` liefert nur Loopback Antworten; der Host `10.0.0.240:8084` bleibt von aussen nicht erreichbar
+  - AC-3 PASS:
+    - `cargo remote -c -- test -p sentinel-daemon operator_api::tests -- --nocapture` => `21 passed`
+    - `cargo remote -c -- test -p sentinel-daemon orchestrator::tests -- --nocapture` => Exit `0`
+    - `cargo remote -c -- test -p sentinel-fs artifact::tests -- --nocapture` => `5 passed`
+    - `cargo remote -c -- clippy -p sentinel-daemon -p sentinel-fs --all-targets -- -D warnings` => Exit `0`
+    - `cargo remote -c -- clippy -p sentinel-sandbox --all-targets -- -D warnings` => Exit `0`
 
 ### Task 3 - Write-Anomaly Enforcement, SIGSTOP und Platform-Intervention-Audit (Phase B)
 

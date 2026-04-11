@@ -61,6 +61,40 @@ fn default_agent_limits() -> CgroupLimits {
     CgroupLimits::default()
 }
 
+fn record_security_runtime_snapshot(
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    agent_id: AgentId,
+    agent_name: &str,
+    bwrap_pid: Option<u32>,
+    fs_mount: Option<&str>,
+) {
+    if let Ok(mut state) = security_runtime_state.write() {
+        state.insert(
+            agent_id.0,
+            operator_api::SecurityAgentRuntimeSnapshot {
+                agent_id: agent_id.0,
+                aggregate_id: format!("AGENT-{:02}", agent_id.0),
+                agent_name: agent_name.to_string(),
+                bwrap_pid,
+                home_host_path: match fs_mount {
+                    Some(mount) => format!("{mount}/{agent_name}"),
+                    None => format!("/ram/agents/{agent_name}"),
+                },
+                fs_mount: fs_mount.map(str::to_string),
+            },
+        );
+    }
+}
+
+fn remove_security_runtime_snapshot(
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    agent_id: AgentId,
+) {
+    if let Ok(mut state) = security_runtime_state.write() {
+        state.remove(&agent_id.0);
+    }
+}
+
 /// Spawnt einen Agenten sowohl im RuntimeOrchestrator als auch in der ECS World.
 /// Richtet die Sandbox (cgroup + home dir + bwrap-Prozess) ein wenn verfuegbar.
 /// Gibt `true` zurueck wenn erfolgreich.
@@ -74,6 +108,8 @@ fn spawn_agent_full(
     ebpf_collector: &mut EbpfCollector,
     agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
     agent_command: &[String],
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    fs_mount: Option<&str>,
 ) -> bool {
     let agent_id = AgentId(agent_cfg.identity.id);
     let identity = AgentIdentity {
@@ -142,6 +178,13 @@ fn spawn_agent_full(
 
                             // AgentProcess aufbewahren (haelt Child am Leben, Drop reaps Zombie)
                             agent_processes.insert(agent_id, proc);
+                            record_security_runtime_snapshot(
+                                security_runtime_state,
+                                agent_id,
+                                &agent_cfg.identity.name,
+                                Some(pid),
+                                fs_mount,
+                            );
 
                             // Network-Namespace Isolation (optional)
                             let agent_index = (agent_cfg.identity.id % 255) as u8;
@@ -164,6 +207,13 @@ fn spawn_agent_full(
                                 error = %e,
                                 "Agent-Prozess konnte nicht gestartet werden (ECS-only Fallback)"
                             );
+                            record_security_runtime_snapshot(
+                                security_runtime_state,
+                                agent_id,
+                                &agent_cfg.identity.name,
+                                None,
+                                fs_mount,
+                            );
                         }
                     }
                 }
@@ -174,6 +224,13 @@ fn spawn_agent_full(
                 agent = %agent_cfg.identity.name,
                 error = %e,
                 "Sandbox setup fehlgeschlagen (Agent laeuft ohne Isolation)"
+            );
+            record_security_runtime_snapshot(
+                security_runtime_state,
+                agent_id,
+                &agent_cfg.identity.name,
+                None,
+                fs_mount,
             );
         }
     }
@@ -385,6 +442,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let platform_state = Arc::new(RwLock::new(
         crate::platform_controlplane::PlatformStateSnapshot::default(),
     ));
+    let security_runtime_state: operator_api::SharedSecurityRuntimeState =
+        Arc::new(RwLock::new(HashMap::new()));
 
     // -- Zenoh SentinelBus (Core-Bus fuer Real-Time Event-Verteilung) --
     let bus_config = config.zenoh.to_bus_config();
@@ -482,6 +541,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         Some(
             operator_api::start_server(
                 config.operator_api.clone(),
+                data_dir.to_path_buf(),
+                config.fs_mount.clone(),
                 operator_room_ids,
                 operator_tx.clone(),
                 platform_tx.clone(),
@@ -492,6 +553,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 prune_tx.clone(),
                 Arc::clone(&state_store),
                 Arc::clone(&platform_state),
+                Arc::clone(&security_runtime_state),
             )
             .await?,
         )
@@ -524,6 +586,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let platform_cp_config = config.platform_controlplane.clone();
     let events_db_path = events_path.to_string_lossy().to_string();
     let ecs_platform_state = Arc::clone(&platform_state);
+    let ecs_security_runtime_state = Arc::clone(&security_runtime_state);
+    let ecs_fs_mount = config.fs_mount.clone();
     let ecs_handle = std::thread::Builder::new()
         .name("ecs-tick-loop".into())
         .spawn(move || {
@@ -560,6 +624,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 platform_cp_config,
                 events_db_path,
                 ecs_platform_state,
+                ecs_security_runtime_state,
+                ecs_fs_mount,
                 #[cfg(feature = "llm")]
                 platform_llm_analyzer.clone(),
             )
@@ -1066,6 +1132,8 @@ fn ecs_tick_loop(
     platform_cp_config: crate::config::PlatformControlplaneConfig,
     events_db_path_str: String,
     platform_state: Arc<RwLock<crate::platform_controlplane::PlatformStateSnapshot>>,
+    security_runtime_state: operator_api::SharedSecurityRuntimeState,
+    fs_mount: Option<String>,
     #[cfg(feature = "llm")]
     platform_llm_analyzer: crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle,
 ) -> Result<u64> {
@@ -1334,6 +1402,13 @@ fn ecs_tick_loop(
 
                                 // AgentProcess aufbewahren (Drop reaps Zombie)
                                 agent_processes.insert(agent_id, proc);
+                                record_security_runtime_snapshot(
+                                    &security_runtime_state,
+                                    agent_id,
+                                    &agent_cfg.identity.name,
+                                    Some(pid),
+                                    fs_mount.as_deref(),
+                                );
 
                                 // Network-Namespace Isolation (optional)
                                 let agent_index = (agent_cfg.identity.id % 255) as u8;
@@ -1356,8 +1431,23 @@ fn ecs_tick_loop(
                                     error = %e,
                                     "Agent-Prozess konnte nicht gestartet werden (ECS-only Fallback)"
                                 );
+                                record_security_runtime_snapshot(
+                                    &security_runtime_state,
+                                    agent_id,
+                                    &agent_cfg.identity.name,
+                                    None,
+                                    fs_mount.as_deref(),
+                                );
                             }
                         }
+                    } else {
+                        record_security_runtime_snapshot(
+                            &security_runtime_state,
+                            agent_id,
+                            &agent_cfg.identity.name,
+                            None,
+                            fs_mount.as_deref(),
+                        );
                     }
                 }
             }
@@ -1366,6 +1456,13 @@ fn ecs_tick_loop(
                     agent = %agent_cfg.identity.name,
                     error = %e,
                     "Sandbox setup fehlgeschlagen (Agent laeuft ohne Isolation)"
+                );
+                record_security_runtime_snapshot(
+                    &security_runtime_state,
+                    agent_id,
+                    &agent_cfg.identity.name,
+                    None,
+                    fs_mount.as_deref(),
                 );
             }
         }
@@ -1604,6 +1701,7 @@ fn ecs_tick_loop(
                         }
                         // Agent-Prozess droppen
                         agent_processes.remove(&agent_id);
+                        remove_security_runtime_snapshot(&security_runtime_state, agent_id);
                         // ECS Entity despawnen
                         despawn_agent_from_world(&mut world, agent_id);
                         // RuntimeOrchestrator despawn
@@ -1687,6 +1785,7 @@ fn ecs_tick_loop(
                     }
                     // AgentProcess droppen (reaps Zombie via Drop impl)
                     agent_processes.remove(agent_id);
+                    remove_security_runtime_snapshot(&security_runtime_state, *agent_id);
 
                     if !despawn_agent_from_world(&mut world, *agent_id) {
                         warn!(agent_id = %agent_id, "ECS Entity fuer entfernten Agent nicht gefunden");
@@ -1893,6 +1992,8 @@ fn ecs_tick_loop(
                         &mut ebpf_collector,
                         &mut agent_processes,
                         &agent_command,
+                        &security_runtime_state,
+                        fs_mount.as_deref(),
                     ) {
                         // GOLF: Default-Goals fuer neuen Schicht-Agent erstellen
                         let existing = episode_producer
@@ -2140,6 +2241,10 @@ fn ecs_tick_loop(
                                         }
                                     }
                                     agent_processes.remove(agent_id);
+                                    remove_security_runtime_snapshot(
+                                        &security_runtime_state,
+                                        *agent_id,
+                                    );
                                 }
                                 info!(
                                     terminated = agent_ids.len(),
@@ -2470,6 +2575,9 @@ fn ecs_tick_loop(
     }
     // Drop reaps exitierte Prozesse via try_wait()
     agent_processes.clear();
+    if let Ok(mut state) = security_runtime_state.write() {
+        state.clear();
+    }
     info!(
         agents = agent_count,
         duration_ms = t.elapsed().as_millis() as u64,
@@ -2674,6 +2782,7 @@ mod tests {
     };
     use sentinel_common::{DomainEventPayload, EventType, OperatorChaosCommand, OperatorCommand};
     use sentinel_ebpf::loader::MonitoringMode;
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -2795,6 +2904,8 @@ mod tests {
             Arc::new(RwLock::new(
                 crate::platform_controlplane::PlatformStateSnapshot::default(),
             )),
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
             #[cfg(feature = "llm")]
             crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
         );
@@ -2869,6 +2980,8 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::platform_controlplane::PlatformStateSnapshot::default(),
                 )),
+                Arc::new(RwLock::new(HashMap::new())),
+                None,
                 #[cfg(feature = "llm")]
                 crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
             )
@@ -2960,6 +3073,8 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::platform_controlplane::PlatformStateSnapshot::default(),
                 )),
+                Arc::new(RwLock::new(HashMap::new())),
+                None,
                 #[cfg(feature = "llm")]
                 crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
             )
@@ -3059,6 +3174,8 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::platform_controlplane::PlatformStateSnapshot::default(),
                 )),
+                Arc::new(RwLock::new(HashMap::new())),
+                None,
                 #[cfg(feature = "llm")]
                 crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
             )
