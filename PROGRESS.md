@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan279.md`
-- Overall status: `TASK_9_DONE_TASK_10_PENDING`
-- Current task: `Task 10 - Out-of-scope Follow-up: Haiku-Policy`
+- Overall status: `TASK_10_DONE_TASK_11_PENDING`
+- Current task: `Task 11 - Phase 3: Tests, Clippy, Builds`
 - Current branch: `feat/issue-279-daemon-hardening-v2`
 - Worktree: `/work/company/project-sentinel-279-review`
 - Base: `origin/main @ 83ab01c8835804fd951e619aa048324b7ff76ddf`
@@ -71,6 +71,10 @@
   - bei fehlendem FUSE-Mount faellt die Runtime explizit auf `/ram/agents` zurueck statt bwrap auf einen toten Mountpoint zu richten
   - Landlock-Exec-Allowlist bleibt schmal und enthaelt zusaetzlich die notwendigen dynamischen ELF-Loader
   - Remote-Tests, Clippy, FUSE-Release-Builds, Sandbox-Binary-Build, Scope-Guard und Artifact-Hashes sind dokumentiert
+- Task 10 ist erledigt:
+  - Es gab kein separates offenes Haiku-/Agent-Model-Policy-Issue
+  - neues Follow-up `#314` wurde fuer Gateway-/Inference-Agent-Model-Defaults erstellt
+  - `#279` wurde mit der Scope-Entscheidung kommentiert: keine Modellentscheidung im Daemon, Gateway waehlt Default
 
 ## Blocked items
 
@@ -111,7 +115,7 @@
 | 7 | Slice E - bounded Analysis-/Recovery-Pfade | DONE | bounded trigger queues, coalescing/drop counters, flood-test | inspect, command, system |
 | 8 | Slice F - Projection/API-Konvergenz | DONE | read-only Projection-Reads, Rebuild-Request, drift-heal, no restart storm | inspect, command, system |
 | 9 | Slice G - Conditional FUSE/Landlock Runtime Restore | DONE | FUSE-Aktivierungs-Gate, `/ram/agents` Fallback, Landlock-ELF-Loader-Allowlist, eigene Build-/Deploy-Gates | inspect, command, system |
-| 10 | Out-of-scope Follow-up - Haiku-Policy | PENDING | separates Gateway-/Policy-Issue oder Kommentar, nicht #279-Close-Bedingung | command, inspect |
+| 10 | Out-of-scope Follow-up - Haiku-Policy | DONE | separates Gateway-/Policy-Issue #314 erstellt und in #279 verlinkt, nicht #279-Close-Bedingung | command, inspect |
 | 11 | Phase 3 - Tests, Clippy, Builds | PENDING | cargo remote only, relevant packages, conditional FUSE/Landlock matrix | command |
 | 12 | Phase 4 - Deploy auf die VM | PENDING | ExecStart pruefen, scp/install, restart, post-restart smoke | command, system |
 | 13 | Phase 5 - AC-Matrix | PENDING | alle ACs mit Command, Output, PASS auf VM | command, system |
@@ -617,3 +621,40 @@
   - `517a9c6a14da0a4d4cd761b74cd7e37d1e2aaa9f24ec4329a7585f0c45638338  target/release/sentinel-daemon`
   - `a3d35bdf5261a617546a19a380f731dba89dc6f24327f4dca1eff4783a05a31d  target/release/landlock-wrapper`
   - `03abe24e93222b540bf36bbedf0d5c259780bea0f53c79386086c44d22e40be8  target/release/breakout-helper`
+
+## Task 10 - Out-of-scope Follow-up: Haiku-Policy
+
+### Pre-task self-check
+
+- Was muss getan werden: Haiku-/Agent-Model-Policy nicht in #279 implementieren, sondern als separates Gateway-/Inference-Follow-up sichern.
+- Welche ACs muessen hier passen:
+  - AC-1: Es gibt keine Haiku-/Model-Pinning-Aenderung im #279-Branch.
+  - AC-2: Bestehende Issues wurden geprueft, damit kein Duplikat erzeugt wird.
+  - AC-3: Wenn kein passendes Issue existiert, wird ein eigenes Follow-up erstellt.
+  - AC-4: #279 dokumentiert die Scope-Entscheidung.
+- Wie wird bewiesen: GitHub-Issue-Suche, neues Issue, Kommentar auf #279, Scope-Guard aus Task 9.
+- Erwartete Dateien: `PROGRESS.md`.
+- Risiken:
+  - Die fachliche Entscheidung "Agents sollen Haiku nutzen" darf nicht durch Daemon-Hardcoding umgesetzt werden.
+  - #279 darf dadurch keine neue Close-Bedingung bekommen.
+
+### Outcome
+
+- GitHub-Suche nach Haiku-/Model-Policy-Themen fand kein passendes offenes Follow-up.
+- Neues Issue erstellt: `#314 Policy: Agent LLM model defaults via Gateway/Inference layer`.
+- `#314` definiert Haiku als Agent-Runtime-Default in Gateway/Inference, nicht im Daemon.
+- #279 kommentiert mit Scope-Entscheidung und Link auf #314.
+- No Haiku/model-policy changes were introduced; runtime still leaves model selection to the Gateway default.
+
+### Evidence
+
+- `gh issue list --repo silentspike/project-sentinel --state all --search "Haiku in:title" --limit 20 --json number,title,state,labels,url`
+  - PASS: no matching existing Haiku policy issue.
+- `gh issue list --repo silentspike/project-sentinel --state all --search "model in:title" --limit 20 --json number,title,state,labels,url`
+  - PASS: only unrelated/closed historical model issues found.
+- `gh issue create ...`
+  - PASS: created `https://github.com/silentspike/project-sentinel/issues/314`.
+- `gh issue comment 279 ...`
+  - PASS: created `https://github.com/silentspike/project-sentinel/issues/279#issuecomment-4304109979`.
+- Scope guard inherited from Task 9:
+  - `services/sentinel-daemon/src/llm_bridge.rs:612: model: String::new(), // Gateway waehlt default`
