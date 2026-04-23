@@ -1182,3 +1182,149 @@ services/sentinel-daemon/src/llm_bridge.rs:612:            model: String::new(),
 ```
 
 PASS: Slice F builds, lints and keeps model selection out of the Daemon. The Projection-side release artifact is explicitly built for later VM deploy evidence.
+
+## Phase 8 - Slice G Conditional FUSE/Landlock Runtime Restore Evidence
+
+Date: 2026-04-23
+Host: remote build server via `cargo remote -c --`
+Scope: `services/sentinel-daemon/src/orchestrator.rs`, `crates/sentinel-sandbox/src/landlock.rs`
+
+### AC-1 - FUSE Mount Is Not Trusted Until Active
+
+Code scope:
+
+```text
+mountinfo_contains_mountpoint()
+mountpoint_is_active()
+wait_for_fuse_mount()
+active_fs_mount
+```
+
+Remote test command:
+
+```bash
+cargo remote -c -- test -q -p sentinel-daemon mountinfo_contains_mountpoint_matches_exact_sentinel_fuse_mount --features fuse -- --nocapture
+```
+
+Observed:
+
+```text
+PASS: targeted FUSE mountinfo test passed
+```
+
+PASS: The daemon recognizes only an exact `sentinel-fs` FUSE mount as active, not a configured path by itself.
+
+### AC-2 - Inactive FUSE Falls Back To `/ram/agents`
+
+Code scope:
+
+```text
+active_fs_mount: Option<String>
+sandbox.set_fs_mount(active_fs_mount)
+operator_api::start_server(..., active_fs_mount.clone(), ...)
+ecs_fs_mount = active_fs_mount.clone()
+```
+
+Observed implementation:
+
+```text
+if wait_for_fuse_mount(...) { active_mount = Some(fs_mount.clone()) }
+else { warn!("sentinel-fs FUSE-Mount nicht aktiv, fallback auf /ram/agents") }
+```
+
+PASS: Sandbox, Operator-API and ECS receive `fs_mount` only when FUSE is active; otherwise the runtime keeps the default `/ram/agents` path.
+
+### AC-3 - Landlock Execute Scope Stays Narrow
+
+Remote test command:
+
+```bash
+cargo remote -c -- test -q -p sentinel-sandbox ruleset_for_agent_paths -- --nocapture
+```
+
+Observed:
+
+```text
+PASS: targeted Landlock ruleset test passed
+```
+
+PASS: The ruleset still rejects broad `/usr` execute allowlisting and allows only the runtime binaries plus loader paths.
+
+### AC-4 - Full Sandbox Test Matrix
+
+Remote test command:
+
+```bash
+cargo remote -c -- test -q -p sentinel-sandbox -- --nocapture
+```
+
+Observed:
+
+```text
+44 tests: 41 passed, 0 failed, 3 ignored
+16 tests: 14 passed, 0 failed, 2 ignored
+12 tests: 3 passed, 0 failed, 9 ignored
+```
+
+PASS: Existing sandbox behavior remains green after the Landlock loader-path change.
+
+### AC-5 - sentinel-fs Fuse Feature Gate
+
+Remote test command:
+
+```bash
+cargo remote -c -- test -q -p sentinel-fs --features fuse-tests -- --nocapture
+```
+
+Observed:
+
+```text
+93 tests: 93 passed, 0 failed
+19 tests: 19 passed, 0 failed
+2 tests: 0 passed, 0 failed, 2 ignored
+```
+
+PASS: The `sentinel-fs` crate builds and tests successfully with the FUSE feature path enabled; kernel-dependent FUSE tests remain explicitly ignored.
+
+### AC-6 - Format, Clippy, Builds, Artifact And Scope Guard
+
+Remote quality gate commands:
+
+```bash
+cargo remote -c -- fmt --check
+cargo remote -c -- clippy -q -p sentinel-sandbox --all-targets -- -D warnings
+cargo remote -c -- clippy -q -p sentinel-daemon --all-targets --features fuse -- -D warnings
+cargo remote -c -- clippy -q -p sentinel-fs --all-targets --features fuse-tests -- -D warnings
+cargo remote -c -- build -q -p sentinel-daemon --release --features fuse
+cargo remote -c -- build -q -p sentinel-sandbox --release --bins
+```
+
+Observed:
+
+```text
+fmt: PASS
+sentinel-sandbox clippy: PASS exit 0
+sentinel-daemon clippy --features fuse: PASS exit 0
+sentinel-fs clippy --features fuse-tests: PASS exit 0
+sentinel-daemon release build --features fuse: PASS exit 0
+sentinel-sandbox release bin build: PASS exit 0
+517a9c6a14da0a4d4cd761b74cd7e37d1e2aaa9f24ec4329a7585f0c45638338  target/release/sentinel-daemon
+a3d35bdf5261a617546a19a380f731dba89dc6f24327f4dca1eff4783a05a31d  target/release/landlock-wrapper
+03abe24e93222b540bf36bbedf0d5c259780bea0f53c79386086c44d22e40be8  target/release/breakout-helper
+```
+
+Local non-build guards:
+
+```bash
+git diff --check
+rg -n "AGENT_MODEL_HAIKU|model: AGENT|model: String::new\\(\\).*Gateway" services/sentinel-daemon/src cmd crates
+```
+
+Observed:
+
+```text
+git diff --check: PASS
+services/sentinel-daemon/src/llm_bridge.rs:612:            model: String::new(), // Gateway waehlt default
+```
+
+PASS: Slice G builds, lints, keeps model selection out of the Daemon, and produces the release artifacts needed for VM deploy evidence.

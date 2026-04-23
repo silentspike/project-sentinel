@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan279.md`
-- Overall status: `TASK_8_DONE_TASK_9_PENDING`
-- Current task: `Task 9 - Slice G: Conditional FUSE/Landlock Runtime Restore`
+- Overall status: `TASK_9_DONE_TASK_10_PENDING`
+- Current task: `Task 10 - Out-of-scope Follow-up: Haiku-Policy`
 - Current branch: `feat/issue-279-daemon-hardening-v2`
 - Worktree: `/work/company/project-sentinel-279-review`
 - Base: `origin/main @ 83ab01c8835804fd951e619aa048324b7ff76ddf`
@@ -66,6 +66,11 @@
   - Runtime-Health erkennt Projection-Drift und zaehlt driftende Projection-Agenten
   - Runtime-Reconcile fordert Projection-Rebuilds per Request-Datei an und vermeidet Restart-Storms, wenn `sentinel-projection` bereits aktiv ist
   - Remote-Tests, Clippy, Release-Builds und Artifact-Hashes fuer Daemon und Projection sind dokumentiert
+- Slice G ist erledigt:
+  - Daemon aktiviert `fs_mount` fuer Sandbox, Operator-API und ECS nur noch, wenn `sentinel-fs` wirklich als FUSE-Mount aktiv ist
+  - bei fehlendem FUSE-Mount faellt die Runtime explizit auf `/ram/agents` zurueck statt bwrap auf einen toten Mountpoint zu richten
+  - Landlock-Exec-Allowlist bleibt schmal und enthaelt zusaetzlich die notwendigen dynamischen ELF-Loader
+  - Remote-Tests, Clippy, FUSE-Release-Builds, Sandbox-Binary-Build, Scope-Guard und Artifact-Hashes sind dokumentiert
 
 ## Blocked items
 
@@ -83,7 +88,7 @@
 - `f5e3dd9` Task [5] Slice C - Fast Stall Recovery
 - `b3b7786` Task [6] Slice D - Worker-Supervision
 - `bc57b4c` Task [7] Slice E - bounded Analysis-/Recovery-Pfade
-- `TBD` Task [8] Slice F - Projection/API-Konvergenz
+- `92b3279` Task [8] Slice F - Projection/API-Konvergenz
 - `TBD` Task [9] Slice G - Conditional FUSE/Landlock Runtime Restore
 - `TBD` Task [10] Out-of-scope Follow-up - Haiku-Policy
 - `TBD` Task [11] Phase 3 - Tests, Clippy, Builds
@@ -105,7 +110,7 @@
 | 6 | Slice D - Worker-Supervision | DONE | catch_unwind + in-process worker respawn, panic-test Hook | inspect, command, system |
 | 7 | Slice E - bounded Analysis-/Recovery-Pfade | DONE | bounded trigger queues, coalescing/drop counters, flood-test | inspect, command, system |
 | 8 | Slice F - Projection/API-Konvergenz | DONE | read-only Projection-Reads, Rebuild-Request, drift-heal, no restart storm | inspect, command, system |
-| 9 | Slice G - Conditional FUSE/Landlock Runtime Restore | PENDING | nur falls Main-Repro es braucht: FUSE/Landlock Runtime Restore, eigene Build-/Deploy-Gates | inspect, command, system |
+| 9 | Slice G - Conditional FUSE/Landlock Runtime Restore | DONE | FUSE-Aktivierungs-Gate, `/ram/agents` Fallback, Landlock-ELF-Loader-Allowlist, eigene Build-/Deploy-Gates | inspect, command, system |
 | 10 | Out-of-scope Follow-up - Haiku-Policy | PENDING | separates Gateway-/Policy-Issue oder Kommentar, nicht #279-Close-Bedingung | command, inspect |
 | 11 | Phase 3 - Tests, Clippy, Builds | PENDING | cargo remote only, relevant packages, conditional FUSE/Landlock matrix | command |
 | 12 | Phase 4 - Deploy auf die VM | PENDING | ExecStart pruefen, scp/install, restart, post-restart smoke | command, system |
@@ -548,3 +553,67 @@
 - `cargo remote -c -- build -q -p sentinel-projection-service --release`
   - PASS: exit `0`
   - artifact hash: `d0da3c42b11397e1c954777397c4b3622cfeeb4365fff2adebbded9adacb13b4  target/release/sentinel-projection`
+
+## Task 9 - Slice G: Conditional FUSE/Landlock Runtime Restore
+
+### Pre-task self-check
+
+- Was muss getan werden: Slice G nur soweit umsetzen, wie der canonical-main-Reset es fuer Runtime-Konsistenz rechtfertigt: kein #264-Port, kein Gateway-/Model-Scope, sondern FUSE-Aktivierung fail-closed und Landlock-Exec-Pfade runtime-faehig halten.
+- Welche ACs muessen hier passen:
+  - AC-1: `fs_mount` wird nur an Sandbox, Operator-API und ECS weitergegeben, wenn `sentinel-fs` wirklich als FUSE-Mount aktiv ist.
+  - AC-2: Wenn der FUSE-Mount nicht aktiv wird, laeuft die Runtime explizit ueber `/ram/agents` weiter statt auf einen leeren Mountpoint zu zeigen.
+  - AC-3: Landlock bleibt eng und erlaubt Execute nicht wieder pauschal fuer `/usr` oder `/lib`.
+  - AC-4: Dynamische ELF-Binaries koennen weiter starten, weil die notwendigen Loader explizit erlaubt sind.
+  - AC-5: Remote-Tests, Clippy, FUSE-Builds, Sandbox-Binary-Build, Scope-Guard und `git diff --check` sind gruen.
+- Wie wird bewiesen: Code-Diff, `cargo remote -c -- fmt/test/clippy/build`, `sha256sum`, `git diff --check`, Scope-Guard gegen Haiku-/Model-Pinning.
+- Erwartete Dateien: `services/sentinel-daemon/src/orchestrator.rs`, `crates/sentinel-sandbox/src/landlock.rs`, `CHANGELOG.md`.
+- Risiken:
+  - FUSE darf nicht blind als aktiv gelten, nur weil `fs_mount` konfiguriert ist.
+  - Landlock darf nicht durch breite `/usr`-/`/lib`-Exec-Allowlists verwässert werden.
+  - Slice G darf keine #264-Security-ACs oder Haiku-/Gateway-Policy einschleppen.
+
+### Outcome
+
+- `mountinfo_contains_mountpoint()` prueft jetzt exakt auf Mountpoint, FUSE-Filesystem und `sentinel-fs` als Mount-Source.
+- `wait_for_fuse_mount()` wartet bounded bis zu 2s auf den FUSE-Mount und prueft danach final erneut.
+- Der Daemon berechnet `active_fs_mount` und gibt nur diesen aktiven Mount an Sandbox, Operator-API und ECS weiter.
+- Wenn `config.fs_mount` gesetzt ist, aber kein tragfaehiger FUSE-Mount aktiv wird, loggt der Daemon eine Warnung und nutzt weiter `/ram/agents`.
+- Landlock `default_exec_paths()` bleibt eng:
+  - `/usr/bin/agent-runtime`
+  - `/breakout-helper`
+  - `/lib64/ld-linux-x86-64.so.2`
+  - `/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2`
+- Tests sichern ab, dass `/usr` nicht als pauschaler Exec-Pfad zurueckkommt.
+- No Haiku/model-policy changes were introduced; runtime still leaves model selection to the Gateway default.
+
+### Evidence
+
+- `cargo remote -c -- test -q -p sentinel-daemon mountinfo_contains_mountpoint_matches_exact_sentinel_fuse_mount --features fuse -- --nocapture`
+  - PASS: targeted FUSE-mountinfo test passed.
+- `cargo remote -c -- test -q -p sentinel-sandbox ruleset_for_agent_paths -- --nocapture`
+  - PASS: Landlock-Agent-Ruleset-Test passed and confirms no `/usr` exec path.
+- `cargo remote -c -- fmt --check`
+  - PASS: no remaining rustfmt diff.
+- `cargo remote -c -- test -q -p sentinel-sandbox -- --nocapture`
+  - PASS: `44 tests: 41 passed, 3 ignored`; `16 tests: 14 passed, 2 ignored`; `12 tests: 3 passed, 9 ignored`.
+- `cargo remote -c -- clippy -q -p sentinel-sandbox --all-targets -- -D warnings`
+  - PASS: exit `0`.
+- `cargo remote -c -- clippy -q -p sentinel-daemon --all-targets --features fuse -- -D warnings`
+  - PASS: exit `0`.
+- `cargo remote -c -- build -q -p sentinel-daemon --release --features fuse`
+  - PASS: exit `0`.
+- `cargo remote -c -- build -q -p sentinel-sandbox --release --bins`
+  - PASS: exit `0`.
+- `cargo remote -c -- test -q -p sentinel-fs --features fuse-tests -- --nocapture`
+  - PASS: `93 passed`; `19 passed`; `2 ignored`.
+- `cargo remote -c -- clippy -q -p sentinel-fs --all-targets --features fuse-tests -- -D warnings`
+  - PASS: exit `0`.
+- `git diff --check`
+  - PASS: no whitespace/conflict errors.
+- Scope guard:
+  - `rg -n "AGENT_MODEL_HAIKU|model: AGENT|model: String::new\\(\\).*Gateway" services/sentinel-daemon/src cmd crates`
+  - PASS: only `services/sentinel-daemon/src/llm_bridge.rs:612: model: String::new(), // Gateway waehlt default`.
+- Artifact hashes:
+  - `517a9c6a14da0a4d4cd761b74cd7e37d1e2aaa9f24ec4329a7585f0c45638338  target/release/sentinel-daemon`
+  - `a3d35bdf5261a617546a19a380f731dba89dc6f24327f4dca1eff4783a05a31d  target/release/landlock-wrapper`
+  - `03abe24e93222b540bf36bbedf0d5c259780bea0f53c79386086c44d22e40be8  target/release/breakout-helper`

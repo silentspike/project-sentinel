@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `service_health` laeuft jetzt unter in-process `catch_unwind`-Supervision; `POST /operator/runtime/panic-test` belegt Worker-Respawn ohne Daemon-PID-Wechsel
   - Platform-Controlplane-Analysepfade sind jetzt bounded: Trigger werden coalesced, alte Eintraege bei Ueberlauf gedropped und Queue-Stats ueber Runtime-Health sowie `POST /operator/runtime/analysis-flood-test` sichtbar
   - Projection/API-Konvergenz nutzt read-only Projection-Reads fuer Runtime-Health, erkennt Projection-Drift, fordert Full-Rebuilds per Request-Datei an und vermeidet Restart-Storms bei laufendem Projection-Service
+  - FUSE/Landlock Runtime-Konsistenz ist jetzt fail-closed: Sandboxes nutzen `fs_mount` nur nach aktivem `sentinel-fs`-Mount, fallen sonst auf `/ram/agents` zurueck und erlauben Execute nur fuer Agent-Binary, Breakout-Helper und notwendige ELF-Loader
 
 - **Room-Kommunikation Phase 2: Soft-Cap, Hallway Encounters, Transit-Realismus, adaptiver Heartbeat** (#289)
   - Raum-Kapazitaeten als Soft-Cap mit Perceptions `Es ist eng hier.` und `Der Raum ist komplett voll.` statt hartem Block
