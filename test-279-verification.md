@@ -1471,3 +1471,247 @@ services/sentinel-daemon/src/llm_bridge.rs:612:            model: String::new(),
 ```
 
 PASS: No whitespace/conflict errors. No Daemon-side Haiku/model-policy change was introduced.
+
+## Phase 10 - VM Deploy, Projection Convergence And Cgroup Orphan Repair
+
+Date: 2026-04-23
+Command target: `ubuntu@10.0.0.240`
+Scope: #279 runtime deploy after clean-port plus hotfix for stopped orphan cgroups found during live verification
+
+### AC-1 - ExecStart And Artifact Deploy
+
+ExecStart preflight:
+
+```bash
+ssh ubuntu@10.0.0.240 "systemctl cat sentinel-daemon | grep -n '^ExecStart'; systemctl cat sentinel-projection | grep -n '^ExecStart'; systemctl is-active sentinel-daemon sentinel-projection"
+```
+
+Observed:
+
+```text
+13:ExecStart=/opt/sentinel/bin/sentinel-daemon --config /opt/sentinel/config/daemon.toml
+13:ExecStart=/opt/sentinel/bin/sentinel-projection \
+active
+active
+```
+
+Final deploy command:
+
+```bash
+ssh ubuntu@10.0.0.240 "sudo mkdir -p /opt/sentinel/backups/issue-279-20260423T142544Z && sudo cp /opt/sentinel/bin/sentinel-daemon /opt/sentinel/backups/issue-279-20260423T142544Z/sentinel-daemon && sudo systemctl stop sentinel-daemon"
+scp target/release/sentinel-daemon ubuntu@10.0.0.240:/tmp/sentinel-daemon.issue279
+ssh ubuntu@10.0.0.240 "sudo install -m 0755 /tmp/sentinel-daemon.issue279 /opt/sentinel/bin/sentinel-daemon && sudo systemctl start sentinel-daemon && sleep 2 && systemctl is-active sentinel-daemon && sha256sum /opt/sentinel/bin/sentinel-daemon"
+```
+
+Observed:
+
+```text
+active
+d6c30a324d85cbb3ec9d919a14e5f5744482cda75e59984e6133944289129d86  /opt/sentinel/bin/sentinel-daemon
+backup=/opt/sentinel/backups/issue-279-20260423T142544Z
+```
+
+PASS: The final Daemon artifact was installed at the exact systemd `ExecStart` path and restarted successfully.
+
+### AC-2 - Projection-Only Drift Repair
+
+Initial post-deploy runtime-health before reconcile:
+
+```bash
+ssh ubuntu@10.0.0.240 "/tmp/opcurl -s http://127.0.0.1:8084/operator/runtime-health | python3 -c 'import sys,json; h=json.load(sys.stdin); print(\"expected\",h.get(\"expected_active_agents\"),\"runtime\",h.get(\"runtime_agents\"),\"projection\",h.get(\"projection_agents\"),\"cgroups\",h.get(\"live_cgroup_dirs\"),\"stale\",h.get(\"stale_runtime_entries\"),\"orphans\",h.get(\"orphan_cgroups\"),\"zombies\",h.get(\"zombie_tracked_pids\"),\"drift\",h.get(\"projection_drift_detected\"))'"
+```
+
+Observed before the first reconcile round:
+
+```text
+expected 26 runtime 26 projection 57 cgroups 29 stale 31 orphans 3 zombies 0 drift True
+api_agents=57
+projection_active_rows=57
+```
+
+Reconcile command:
+
+```bash
+ssh ubuntu@10.0.0.240 "/tmp/opcurl -s -X POST http://127.0.0.1:8084/operator/runtime/reconcile -H 'Content-Type: application/json' -d '{\"dry_run\":false,\"projection_rebuild\":true,\"respawn_missing\":true}' | python3 -m json.tool"
+```
+
+Observed first reconcile:
+
+```text
+"accepted": true
+"stale_agents_before": 31
+"stale_agents_after": 0
+"orphan_cgroups_before": 3
+"unexpected_runtime_removed": 3
+"projection_drift_before": true
+"projection_drift_after": false
+"projection_rebuild_requested": true
+"repair_last_status": "projection_rebuild_requested"
+```
+
+PASS: Projection-only ghost agents are now visible to Runtime-Health and reconciled through `agent_despawned` plus Projection rebuild instead of being hidden behind an aggregate count.
+
+### AC-3 - Stopped Orphan Cgroup Finding And Fix
+
+Runtime gate after the first reconcile still failed on live Cgroups:
+
+```text
+expected 26 runtime 26 projection 26 cgroups 29 stale 0 orphans 3 zombies 0 drift False api_agents=26
+```
+
+Orphan inspection:
+
+```bash
+ssh ubuntu@10.0.0.240 "python3 - <<'PY'
+import os
+root='/sys/fs/cgroup/sentinel'
+for name in sorted(os.listdir(root)):
+    procs=open(os.path.join(root,name,'cgroup.procs')).read().strip().split()
+    if procs:
+        print(name, ','.join(procs))
+PY"
+ssh ubuntu@10.0.0.240 "ps -o pid,stat,cmd -p 1291960,1314755,1324475 || true"
+```
+
+Observed:
+
+```text
+Carla Mendez pids=1291960
+Jonas Weber pids=1314755
+Oliver Brandt pids=1324475
+
+1291960 T /usr/bin/python3 -c ... /opt/sentinel/data/security-write-anomaly/AGENT-17/.issue264-write-anomaly.bin ...
+1314755 T /usr/bin/python3 -c ... /opt/sentinel/data/security-write-anomaly/AGENT-22/.issue264-write-anomaly.bin ...
+1324475 T /usr/bin/python3 -c ... /opt/sentinel/data/security-write-anomaly/AGENT-26/.issue264-write-anomaly.bin ...
+```
+
+Code fix:
+
+```text
+crates/sentinel-sandbox/src/cgroups.rs:
+  kill_cgroup_processes(name) uses cgroup.kill when available and SIGKILL fallback otherwise.
+
+services/sentinel-daemon/src/orchestrator.rs:
+  runtime reconcile empties orphan cgroups before remove_cgroup().
+```
+
+Post-fix remote gates:
+
+```bash
+cargo remote -c -- fmt --all
+cargo remote -c -- test -q -p sentinel-sandbox kill_nonexistent_cgroup_is_noop -- --nocapture
+cargo remote -c -- test -q -p sentinel-daemon test_runtime_reconcile_skips_projection_restart_when_rebuild_can_run_in_place -- --nocapture
+cargo remote -c -- test -q -p sentinel-daemon -- --nocapture
+cargo remote -c -- test -q -p sentinel-sandbox -- --nocapture
+cargo remote -c -- clippy -q -p sentinel-sandbox --all-targets -- -D warnings
+cargo remote -c -- clippy -q -p sentinel-daemon --all-targets --features fuse -- -D warnings
+cargo remote -c -- build -q -p sentinel-daemon --release --features fuse
+cargo remote -c -- build -q -p sentinel-projection-service --release
+```
+
+Observed:
+
+```text
+sentinel-sandbox targeted test: 1 passed; 0 failed
+sentinel-daemon targeted reconcile test: 1 passed; 0 failed
+sentinel-daemon full test: 194 passed; 0 failed
+sentinel-sandbox full test: 42 passed; 0 failed; 3 ignored
+sentinel-sandbox full test: 14 passed; 0 failed; 2 ignored
+sentinel-sandbox full test: 3 passed; 0 failed; 9 ignored
+sentinel-sandbox clippy: PASS exit 0
+sentinel-daemon clippy --features fuse: PASS exit 0
+sentinel-daemon release build --features fuse: PASS exit 0
+sentinel-projection-service release build: PASS exit 0
+d6c30a324d85cbb3ec9d919a14e5f5744482cda75e59984e6133944289129d86  target/release/sentinel-daemon
+67670ad90e9e72ac9e856ca88770e23fb3b5762115941ea5f26b3f94bf61c46c  target/release/sentinel-projection
+a3d35bdf5261a617546a19a380f731dba89dc6f24327f4dca1eff4783a05a31d  target/release/landlock-wrapper
+03abe24e93222b540bf36bbedf0d5c259780bea0f53c79386086c44d22e40be8  target/release/breakout-helper
+```
+
+PASS: Reconcile no longer leaves stopped writer processes in orphan cgroups.
+
+### AC-4 - Final Runtime Health Gate
+
+Final reconcile command:
+
+```bash
+ssh ubuntu@10.0.0.240 "/tmp/opcurl -s -X POST http://127.0.0.1:8084/operator/runtime/reconcile -H 'Content-Type: application/json' -d '{\"dry_run\":false,\"projection_rebuild\":true,\"respawn_missing\":true}' | python3 -m json.tool"
+```
+
+Observed:
+
+```text
+"accepted": true
+"stale_agents_before": 0
+"stale_agents_after": 0
+"orphan_cgroups_before": 3
+"orphan_cgroups_after": 0
+"orphan_cgroups_removed": 3
+"respawned_agents": 0
+"projection_drift_before": false
+"projection_drift_after": false
+"projection_rebuild_requested": true
+"errors": []
+```
+
+Projection rebuild completion:
+
+```text
+Full rebuild complete total=3562240
+Projection-Rebuild-Request abgearbeitet path=/opt/sentinel/data/.projection-rebuild-request events=3562240
+```
+
+Final runtime-health:
+
+```bash
+ssh ubuntu@10.0.0.240 "/tmp/opcurl -s http://127.0.0.1:8084/operator/runtime-health | python3 -c 'import sys,json; h=json.load(sys.stdin); print(\"expected\",h[\"expected_active_agents\"],\"runtime\",h[\"runtime_agents\"],\"projection\",h[\"projection_agents\"],\"cgroups\",h[\"live_cgroup_dirs\"],\"stale\",h[\"stale_runtime_entries\"],\"orphans\",h[\"orphan_cgroups\"],\"zombies\",h[\"zombie_tracked_pids\"],\"drift\",h[\"projection_drift_detected\"],\"repair\",h.get(\"repair_last_status\"))'"
+```
+
+Observed:
+
+```text
+expected 26 runtime 26 projection 26 cgroups 26 stale 0 orphans 0 zombies 0 drift False repair projection_rebuild_requested
+```
+
+Supporting checks:
+
+```bash
+ssh ubuntu@10.0.0.240 "curl -s http://127.0.0.1:8000/api/agents | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))'"
+ssh ubuntu@10.0.0.240 "sqlite3 /opt/sentinel/data/projection.db \"SELECT status, COUNT(*) FROM agent_live_view GROUP BY status ORDER BY status;\""
+ssh ubuntu@10.0.0.240 "ps -o pid,stat,cmd -p 1291960,1314755,1324475 || true"
+ssh ubuntu@10.0.0.240 "journalctl -u sentinel-daemon --since '5 min ago' --no-pager | grep -Ei 'panic|drift' || true"
+```
+
+Observed:
+
+```text
+api_agents=26
+active|26
+despawned|34
+PID STAT CMD
+no daemon panic/drift output
+```
+
+PASS: Runtime, Projection, Dashboard API and cgroups converge to the canonical active shift size `26`; stale, orphan and zombie counters are all zero.
+
+### AC-5 - Local Scope Guards After Deploy
+
+Commands:
+
+```bash
+git diff --check
+rg -n "AGENT_MODEL_HAIKU|model: AGENT|model: String::new\\(\\).*Gateway" services/sentinel-daemon/src cmd crates
+gh -R silentspike/project-sentinel issue view 279 --json number,title,state,labels,url
+```
+
+Observed:
+
+```text
+git diff --check: PASS
+services/sentinel-daemon/src/llm_bridge.rs:612:            model: String::new(), // Gateway waehlt default
+state=OPEN
+labels include status:in-progress and quality:needs-spec
+url=https://github.com/silentspike/project-sentinel/issues/279
+```
+
+PASS: No Daemon-side model policy change was introduced, and #279 remains open for the AC matrix, benchmarks, PR and verified close sequence.

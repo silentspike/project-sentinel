@@ -1344,6 +1344,34 @@ fn emit_runtime_repair_blocked_event(
     }
 }
 
+fn emit_runtime_projection_despawn_event(
+    event_store: &EventStore,
+    agent_id: AgentId,
+    tick_count: u64,
+) -> bool {
+    let aggregate_id = format!("AGENT-{:02}", agent_id.0);
+    let payload = DomainEventPayload::AgentDespawned {
+        agent_id,
+        reason: "runtime_reconcile_projection_only".to_string(),
+    };
+    let event = DomainEvent::new(
+        payload.event_type_str(),
+        &aggregate_id,
+        &payload.to_json(),
+        &format!("runtime-reconcile-projection-{}", agent_id.0),
+        tick_count,
+    );
+    if let Err(error) = event_store.append_event(&event) {
+        warn!(
+            agent_id = %agent_id,
+            error = %error,
+            "Projection-only Despawn-Event konnte nicht persistiert werden"
+        );
+        return false;
+    }
+    true
+}
+
 fn remove_agent_runtime_fragments(
     ctx: &mut RuntimeReconcileContext<'_>,
     agent: &runtime_health::RuntimeHealthAgentSnapshot,
@@ -1371,19 +1399,15 @@ fn remove_agent_runtime_fragments(
     }
 
     if agent.cgroup_live_pid_count > 0 {
-        match sentinel_sandbox::cgroups::list_pids_in_cgroup(&agent.name) {
-            Ok(pids) => {
-                for pid in &pids {
-                    let _ = signal_pid(*pid, "TERM");
-                }
-                if !pids.is_empty() {
-                    stats.repairs += 1;
-                }
+        match sentinel_sandbox::cgroups::kill_cgroup_processes(&agent.name) {
+            Ok(killed) if killed > 0 => {
+                stats.repairs += 1;
             }
+            Ok(_) => {}
             Err(error) => warn!(
                 agent = %agent.name,
                 error = %error,
-                "Live-Cgroup-PIDs konnten nicht beendet werden"
+                "Live-Cgroup-PIDs konnten nicht hart beendet werden"
             ),
         }
     }
@@ -1411,7 +1435,10 @@ fn remove_agent_runtime_fragments(
     }
 
     let cgroup_path = sentinel_sandbox::cgroups::cgroup_path(&agent.name);
-    if std::path::Path::new(&cgroup_path).exists() && agent.cgroup_live_pid_count == 0 {
+    let cgroup_empty = sentinel_sandbox::cgroups::list_pids_in_cgroup(&agent.name)
+        .map(|pids| pids.is_empty())
+        .unwrap_or(false);
+    if std::path::Path::new(&cgroup_path).exists() && cgroup_empty {
         match sentinel_sandbox::cgroups::remove_cgroup(&agent.name) {
             Ok(()) => {
                 stats.orphan_cgroups_removed += 1;
@@ -1500,6 +1527,7 @@ fn run_runtime_reconcile(
             let expected_active = expected_ids.contains(&agent.agent_id);
             !expected_active
                 && (agent.runtime_present
+                    || agent.projection_present
                     || agent.security_runtime_present
                     || agent.tracked_pid_alive
                     || agent.cgroup_live_pid_count > 0)
@@ -1513,6 +1541,18 @@ fn run_runtime_reconcile(
                 repaired_agents.push(agent.name.clone());
                 agent_status_updates
                     .insert(agent.agent_id, "unexpected_runtime_cleaned".to_string());
+            }
+            if agent.projection_present
+                && emit_runtime_projection_despawn_event(
+                    ctx.event_store,
+                    AgentId(agent.agent_id),
+                    ctx.tick_count,
+                )
+            {
+                repair_ops_total += 1;
+                repaired_agents.push(agent.name.clone());
+                agent_status_updates
+                    .insert(agent.agent_id, "projection_despawned".to_string());
             }
         }
 
@@ -1541,7 +1581,23 @@ fn run_runtime_reconcile(
                             repair_ops_total += 1;
                         }
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        match sentinel_sandbox::cgroups::kill_cgroup_processes(&name) {
+                            Ok(killed) if killed > 0 => {
+                                repair_ops_total += 1;
+                                if sentinel_sandbox::cgroups::remove_cgroup(&name).is_ok() {
+                                    orphan_cgroups_removed += 1;
+                                    repair_ops_total += 1;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => warn!(
+                                cgroup = %name,
+                                error = %error,
+                                "Orphan-Cgroup-PIDs konnten nicht hart beendet werden"
+                            ),
+                        }
+                    }
                     Err(error) => warn!(
                         cgroup = %name,
                         error = %error,
@@ -4182,6 +4238,14 @@ mod tests {
         assert!(response.projection_rebuild_requested);
         assert_eq!(PROJECTION_RESTART_CALLS.load(Ordering::SeqCst), 0);
         assert!(rebuild_request_path.exists());
+        let events = event_store.get_events_since(0, 100).unwrap();
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == "agent_despawned"
+                    && event.payload.contains("runtime_reconcile_projection_only")
+            }),
+            "Projection-only Ghost-Agent muss als Despawn-Event in den append-only Truth-Stream"
+        );
     }
 
     #[test]

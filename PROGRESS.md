@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan279.md`
-- Overall status: `TASK_11_DONE_TASK_12_PENDING`
-- Current task: `Task 12 - Phase 4: Deploy auf die VM`
+- Overall status: `TASK_12_DONE_TASK_13_PENDING`
+- Current task: `Task 13 - Phase 5: AC-Matrix`
 - Current branch: `feat/issue-279-daemon-hardening-v2`
 - Worktree: `/work/company/project-sentinel-279-review`
 - Base: `origin/main @ 83ab01c8835804fd951e619aa048324b7ff76ddf`
@@ -81,6 +81,13 @@
   - Release-Artefakte fuer Daemon, Projection und Sandbox-Helper wurden remote gebaut
   - conditional FUSE/Landlock-Gates wurden erneut auf demselben Branch wiederholt
   - `git diff --check`, Haiku-Scope-Guard und Artifact-Hashes sind dokumentiert
+- Task 12 ist erledigt:
+  - Release-Artefakte wurden an den systemd `ExecStart`-Pfaden auf `10.0.0.240` installiert
+  - erste Runtime-Reconcile-Runde reparierte Projection-only Drift von `57` auf `26`, deckte aber drei verwaiste gestoppte #264-Write-Anomaly-Cgroups auf
+  - Cgroup-Reconcile wurde gehärtet: verwaiste Live-Cgroups werden ueber `cgroup.kill`/SIGKILL-Fallback geleert und danach entfernt
+  - zweiter VM-Deploy mit Daemon-Hash `d6c30a324d85cbb3ec9d919a14e5f5744482cda75e59984e6133944289129d86`
+  - Live-Reconcile meldete `orphan_cgroups_before=3`, `orphan_cgroups_after=0`, `orphan_cgroups_removed=3`
+  - finaler Runtime-Health-Gate ist gruen: `expected/runtime/projection/cgroups = 26/26/26/26`, `stale=0`, `orphans=0`, `zombies=0`, `drift=false`, Dashboard-API `26`
 
 ## Blocked items
 
@@ -123,7 +130,7 @@
 | 9 | Slice G - Conditional FUSE/Landlock Runtime Restore | DONE | FUSE-Aktivierungs-Gate, `/ram/agents` Fallback, Landlock-ELF-Loader-Allowlist, eigene Build-/Deploy-Gates | inspect, command, system |
 | 10 | Out-of-scope Follow-up - Haiku-Policy | DONE | separates Gateway-/Policy-Issue #314 erstellt und in #279 verlinkt, nicht #279-Close-Bedingung | command, inspect |
 | 11 | Phase 3 - Tests, Clippy, Builds | DONE | cargo remote only, relevant packages, conditional FUSE/Landlock matrix | command |
-| 12 | Phase 4 - Deploy auf die VM | PENDING | ExecStart pruefen, scp/install, restart, post-restart smoke | command, system |
+| 12 | Phase 4 - Deploy auf die VM | DONE | ExecStart pruefen, scp/install, restart, post-restart smoke, Projection-/Cgroup-Drift reparieren | command, system |
 | 13 | Phase 5 - AC-Matrix | PENDING | alle ACs mit Command, Output, PASS auf VM | command, system |
 | 14 | Benchmarks | PENDING | Recovery, Queue, Soak, Sidecar-Monitoring | command, system |
 | 15 | PR- und Close-Sequenz | PENDING | PR mit Pflichtsektionen, labels, merge, branch delete, issue close erst nach verified | command |
