@@ -1328,3 +1328,146 @@ services/sentinel-daemon/src/llm_bridge.rs:612:            model: String::new(),
 ```
 
 PASS: Slice G builds, lints, keeps model selection out of the Daemon, and produces the release artifacts needed for VM deploy evidence.
+
+## Phase 9 - Full Remote Quality Matrix Before VM Deploy
+
+Date: 2026-04-23
+Host: remote build server via `cargo remote -c --`
+Scope: all #279 runtime-change crates plus conditional FUSE/Landlock slice
+
+### AC-1 - Daemon Full Test Suite
+
+Remote test command:
+
+```bash
+cargo remote -c -- test -q -p sentinel-daemon -- --nocapture
+```
+
+Observed:
+
+```text
+running 193 tests
+test result: ok. 193 passed; 0 failed; 0 ignored; finished in 10.29s
+expected controlled panic-test output:
+panic-test requested for service_health
+```
+
+PASS: The full Daemon test suite is green. The panic-test output is expected and is caught by the worker-supervision path.
+
+### AC-2 - Projection Test Suites
+
+Remote test commands:
+
+```bash
+cargo remote -c -- test -q -p sentinel-projection -- --nocapture
+cargo remote -c -- test -q -p sentinel-projection-service -- --nocapture
+```
+
+Observed:
+
+```text
+sentinel-projection:
+test result: ok. 7 passed; 0 failed
+test result: ok. 6 passed; 0 failed
+
+sentinel-projection-service:
+test result: ok. 0 passed; 0 failed
+```
+
+PASS: Projection library and service test targets are green before deploy.
+
+### AC-3 - Clippy Matrix
+
+Remote clippy commands:
+
+```bash
+cargo remote -c -- clippy -q -p sentinel-daemon --all-targets --features fuse -- -D warnings
+cargo remote -c -- clippy -q -p sentinel-projection --all-targets -- -D warnings
+cargo remote -c -- clippy -q -p sentinel-projection-service --all-targets -- -D warnings
+cargo remote -c -- clippy -q -p sentinel-fs --all-targets --features fuse-tests -- -D warnings
+cargo remote -c -- clippy -q -p sentinel-sandbox --all-targets -- -D warnings
+```
+
+Observed:
+
+```text
+sentinel-daemon clippy --features fuse: PASS exit 0
+sentinel-projection clippy: PASS exit 0
+sentinel-projection-service clippy: PASS exit 0
+sentinel-fs clippy --features fuse-tests: PASS exit 0
+sentinel-sandbox clippy: PASS exit 0
+```
+
+PASS: All touched Rust crates pass Clippy with `-D warnings`.
+
+### AC-4 - Release Build Matrix
+
+Remote build commands:
+
+```bash
+cargo remote -c -- build -q -p sentinel-daemon --release --features fuse
+cargo remote -c -- build -q -p sentinel-projection-service --release
+cargo remote -c -- build -q -p sentinel-sandbox --release --bins
+```
+
+Observed:
+
+```text
+sentinel-daemon release build --features fuse: PASS exit 0
+sentinel-projection-service release build: PASS exit 0
+sentinel-sandbox release bin build: PASS exit 0
+```
+
+Artifact hashes:
+
+```text
+517a9c6a14da0a4d4cd761b74cd7e37d1e2aaa9f24ec4329a7585f0c45638338  target/release/sentinel-daemon
+d0da3c42b11397e1c954777397c4b3622cfeeb4365fff2adebbded9adacb13b4  target/release/sentinel-projection
+a3d35bdf5261a617546a19a380f731dba89dc6f24327f4dca1eff4783a05a31d  target/release/landlock-wrapper
+03abe24e93222b540bf36bbedf0d5c259780bea0f53c79386086c44d22e40be8  target/release/breakout-helper
+```
+
+PASS: Deployable release artifacts exist locally after remote builds.
+
+### AC-5 - Conditional FUSE/Landlock Test Matrix
+
+Remote test commands:
+
+```bash
+cargo remote -c -- test -q -p sentinel-fs --features fuse-tests -- --nocapture
+cargo remote -c -- test -q -p sentinel-sandbox -- --nocapture
+```
+
+Observed:
+
+```text
+sentinel-fs:
+93 tests: 93 passed, 0 failed
+19 tests: 19 passed, 0 failed
+2 tests: 0 passed, 0 failed, 2 ignored
+
+sentinel-sandbox:
+44 tests: 41 passed, 0 failed, 3 ignored
+16 tests: 14 passed, 0 failed, 2 ignored
+12 tests: 3 passed, 0 failed, 9 ignored
+```
+
+PASS: The conditional FUSE/Landlock slice remains green after the complete #279 port.
+
+### AC-6 - Whitespace And Model-Scope Guards
+
+Local guard commands:
+
+```bash
+git diff --check
+rg -n "AGENT_MODEL_HAIKU|model: AGENT|model: String::new\\(\\).*Gateway" services/sentinel-daemon/src cmd crates
+```
+
+Observed:
+
+```text
+git diff --check: PASS
+services/sentinel-daemon/src/llm_bridge.rs:612:            model: String::new(), // Gateway waehlt default
+```
+
+PASS: No whitespace/conflict errors. No Daemon-side Haiku/model-policy change was introduced.

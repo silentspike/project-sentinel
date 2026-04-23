@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan279.md`
-- Overall status: `TASK_10_DONE_TASK_11_PENDING`
-- Current task: `Task 11 - Phase 3: Tests, Clippy, Builds`
+- Overall status: `TASK_11_DONE_TASK_12_PENDING`
+- Current task: `Task 12 - Phase 4: Deploy auf die VM`
 - Current branch: `feat/issue-279-daemon-hardening-v2`
 - Worktree: `/work/company/project-sentinel-279-review`
 - Base: `origin/main @ 83ab01c8835804fd951e619aa048324b7ff76ddf`
@@ -75,6 +75,12 @@
   - Es gab kein separates offenes Haiku-/Agent-Model-Policy-Issue
   - neues Follow-up `#314` wurde fuer Gateway-/Inference-Agent-Model-Defaults erstellt
   - `#279` wurde mit der Scope-Entscheidung kommentiert: keine Modellentscheidung im Daemon, Gateway waehlt Default
+- Task 11 ist erledigt:
+  - komplette Remote-Testmatrix fuer Daemon, Projection und Projection-Service ist gruen
+  - Clippy ist fuer Daemon, Projection, Projection-Service, `sentinel-fs` und `sentinel-sandbox` gruen
+  - Release-Artefakte fuer Daemon, Projection und Sandbox-Helper wurden remote gebaut
+  - conditional FUSE/Landlock-Gates wurden erneut auf demselben Branch wiederholt
+  - `git diff --check`, Haiku-Scope-Guard und Artifact-Hashes sind dokumentiert
 
 ## Blocked items
 
@@ -116,7 +122,7 @@
 | 8 | Slice F - Projection/API-Konvergenz | DONE | read-only Projection-Reads, Rebuild-Request, drift-heal, no restart storm | inspect, command, system |
 | 9 | Slice G - Conditional FUSE/Landlock Runtime Restore | DONE | FUSE-Aktivierungs-Gate, `/ram/agents` Fallback, Landlock-ELF-Loader-Allowlist, eigene Build-/Deploy-Gates | inspect, command, system |
 | 10 | Out-of-scope Follow-up - Haiku-Policy | DONE | separates Gateway-/Policy-Issue #314 erstellt und in #279 verlinkt, nicht #279-Close-Bedingung | command, inspect |
-| 11 | Phase 3 - Tests, Clippy, Builds | PENDING | cargo remote only, relevant packages, conditional FUSE/Landlock matrix | command |
+| 11 | Phase 3 - Tests, Clippy, Builds | DONE | cargo remote only, relevant packages, conditional FUSE/Landlock matrix | command |
 | 12 | Phase 4 - Deploy auf die VM | PENDING | ExecStart pruefen, scp/install, restart, post-restart smoke | command, system |
 | 13 | Phase 5 - AC-Matrix | PENDING | alle ACs mit Command, Output, PASS auf VM | command, system |
 | 14 | Benchmarks | PENDING | Recovery, Queue, Soak, Sidecar-Monitoring | command, system |
@@ -658,3 +664,82 @@
   - PASS: created `https://github.com/silentspike/project-sentinel/issues/279#issuecomment-4304109979`.
 - Scope guard inherited from Task 9:
   - `services/sentinel-daemon/src/llm_bridge.rs:612: model: String::new(), // Gateway waehlt default`
+
+## Task 11 - Phase 3: Tests, Clippy, Builds
+
+### Pre-task self-check
+
+- Was muss getan werden: die komplette Remote-Qualitaetsmatrix fuer #279 ausfuehren, inklusive conditional FUSE/Landlock-Gates, Release-Artefakte erzeugen und Scope-/Whitespace-Guards belegen.
+- Welche ACs muessen hier passen:
+  - AC-1: Daemon-, Projection- und Projection-Service-Tests laufen auf dem Remote-Builder gruen.
+  - AC-2: Clippy ist fuer alle beruehrten Rust-Crates gruen.
+  - AC-3: Release-Artefakte fuer Daemon, Projection und Sandbox-Helper existieren lokal nach Remote-Build.
+  - AC-4: conditional FUSE/Landlock-Gates bleiben nach allen Slices gruen.
+  - AC-5: `git diff --check` und Haiku-/Model-Scope-Guard sind gruen.
+- Wie wird bewiesen: ausschliesslich `cargo remote -c --` fuer Rust, danach lokale `git diff --check`, `rg` Scope-Guard und `sha256sum`.
+- Erwartete Dateien: `PROGRESS.md`, `test-279-verification.md`; keine Code-Aenderungen.
+- Risiken:
+  - Der Daemon-Test enthaelt einen erwarteten kontrollierten Panic-Test; PASS ist nur gueltig, wenn `catch_unwind` den Test abfaengt und der Testprozess erfolgreich endet.
+  - Release-Hashes muessen die finalen Artefakte fuer Task 12 sein.
+
+### Outcome
+
+- Full daemon test suite passed on the remote builder:
+  - `193 passed; 0 failed; 0 ignored; finished in 10.29s`
+  - expected controlled `panic-test requested for service_health` output was caught by the worker-supervision test.
+- Projection tests passed on the remote builder:
+  - `sentinel-projection`: `7 passed` and `6 passed`
+  - `sentinel-projection-service`: `0 tests`, exit `0`
+- Clippy passed for:
+  - `sentinel-daemon --all-targets --features fuse`
+  - `sentinel-projection --all-targets`
+  - `sentinel-projection-service --all-targets`
+  - `sentinel-fs --all-targets --features fuse-tests`
+  - `sentinel-sandbox --all-targets`
+- Release builds passed for:
+  - `sentinel-daemon --release --features fuse`
+  - `sentinel-projection-service --release`
+  - `sentinel-sandbox --release --bins`
+- Conditional FUSE/Landlock tests were repeated and remained green:
+  - `sentinel-fs --features fuse-tests`: `93 passed`, `19 passed`, `2 ignored`
+  - `sentinel-sandbox`: `41 passed, 3 ignored`; `14 passed, 2 ignored`; `3 passed, 9 ignored`
+- No Haiku/model-policy change was introduced; runtime still leaves model selection to the Gateway default.
+
+### Evidence
+
+- `cargo remote -c -- test -q -p sentinel-daemon -- --nocapture`
+  - PASS: `193 passed; 0 failed; 0 ignored; finished in 10.29s`.
+- `cargo remote -c -- test -q -p sentinel-projection -- --nocapture`
+  - PASS: `7 passed`; `6 passed`; no failures.
+- `cargo remote -c -- test -q -p sentinel-projection-service -- --nocapture`
+  - PASS: `0 tests`, exit `0`.
+- `cargo remote -c -- clippy -q -p sentinel-daemon --all-targets --features fuse -- -D warnings`
+  - PASS: exit `0`.
+- `cargo remote -c -- clippy -q -p sentinel-projection --all-targets -- -D warnings`
+  - PASS: exit `0`.
+- `cargo remote -c -- clippy -q -p sentinel-projection-service --all-targets -- -D warnings`
+  - PASS: exit `0`.
+- `cargo remote -c -- build -q -p sentinel-daemon --release --features fuse`
+  - PASS: exit `0`.
+- `cargo remote -c -- build -q -p sentinel-projection-service --release`
+  - PASS: exit `0`.
+- `cargo remote -c -- test -q -p sentinel-fs --features fuse-tests -- --nocapture`
+  - PASS: `93 passed; 19 passed; 2 ignored`.
+- `cargo remote -c -- test -q -p sentinel-sandbox -- --nocapture`
+  - PASS: `44 tests: 41 passed, 3 ignored`; `16 tests: 14 passed, 2 ignored`; `12 tests: 3 passed, 9 ignored`.
+- `cargo remote -c -- clippy -q -p sentinel-fs --all-targets --features fuse-tests -- -D warnings`
+  - PASS: exit `0`.
+- `cargo remote -c -- clippy -q -p sentinel-sandbox --all-targets -- -D warnings`
+  - PASS: exit `0`.
+- `cargo remote -c -- build -q -p sentinel-sandbox --release --bins`
+  - PASS: exit `0`.
+- `git diff --check`
+  - PASS: no whitespace/conflict errors.
+- Scope guard:
+  - `rg -n "AGENT_MODEL_HAIKU|model: AGENT|model: String::new\\(\\).*Gateway" services/sentinel-daemon/src cmd crates`
+  - PASS: only `services/sentinel-daemon/src/llm_bridge.rs:612: model: String::new(), // Gateway waehlt default`.
+- Artifact hashes:
+  - `517a9c6a14da0a4d4cd761b74cd7e37d1e2aaa9f24ec4329a7585f0c45638338  target/release/sentinel-daemon`
+  - `d0da3c42b11397e1c954777397c4b3622cfeeb4365fff2adebbded9adacb13b4  target/release/sentinel-projection`
+  - `a3d35bdf5261a617546a19a380f731dba89dc6f24327f4dca1eff4783a05a31d  target/release/landlock-wrapper`
+  - `03abe24e93222b540bf36bbedf0d5c259780bea0f53c79386086c44d22e40be8  target/release/breakout-helper`
