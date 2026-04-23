@@ -47,6 +47,10 @@ pub enum RuntimeControlCommand {
         request: RuntimeReconcileRequest,
         response_tx: mpsc::SyncSender<RuntimeReconcileResponse>,
     },
+    PanicTest {
+        request: RuntimePanicTestRequest,
+        response_tx: mpsc::SyncSender<RuntimePanicTestResponse>,
+    },
     StallRestartTest {
         request: RuntimeStallRestartTestRequest,
         response_tx: mpsc::SyncSender<RuntimeStallRestartTestResponse>,
@@ -72,6 +76,18 @@ pub struct RuntimeStallRestartTestResponse {
     pub pid_after: Option<u32>,
     pub runtime_present_after: bool,
     pub security_runtime_present_after: bool,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimePanicTestRequest {
+    pub worker: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimePanicTestResponse {
+    pub accepted: bool,
+    pub worker: String,
     pub note: String,
 }
 

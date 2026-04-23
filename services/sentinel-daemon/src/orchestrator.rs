@@ -42,8 +42,8 @@ use crate::controlplane::ControlplaneKernel;
 use crate::episode_producer::EpisodeProducer;
 use crate::operator_api;
 use crate::runtime_control::{
-    RespawnBackoffTracker, RespawnRetryDecision, RuntimeControlCommand, RuntimeReconcileRequest,
-    RuntimeReconcileResponse, RuntimeStallRestartTestResponse,
+    RespawnBackoffTracker, RespawnRetryDecision, RuntimeControlCommand, RuntimePanicTestResponse,
+    RuntimeReconcileRequest, RuntimeReconcileResponse, RuntimeStallRestartTestResponse,
 };
 use crate::runtime_health;
 use crate::shift::{agents_for_shift, detect_current_shift, detect_shift_from_sim_hour};
@@ -2406,6 +2406,37 @@ fn ecs_tick_loop(
                     };
                     let response =
                         run_runtime_reconcile(&mut reconcile_ctx, request, &mut respawn_backoff);
+                    let _ = response_tx.send(response);
+                }
+                RuntimeControlCommand::PanicTest {
+                    request,
+                    response_tx,
+                } => {
+                    let response = if request.worker == "service_health" {
+                        if service_health_checker.trigger_panic_test() {
+                            info!(
+                                worker = %request.worker,
+                                "panic test triggered fuer Worker"
+                            );
+                            RuntimePanicTestResponse {
+                                accepted: true,
+                                worker: request.worker,
+                                note: "panic-test dispatched".to_string(),
+                            }
+                        } else {
+                            RuntimePanicTestResponse {
+                                accepted: false,
+                                worker: request.worker,
+                                note: "service_health control channel unavailable".to_string(),
+                            }
+                        }
+                    } else {
+                        RuntimePanicTestResponse {
+                            accepted: false,
+                            worker: request.worker,
+                            note: "worker unsupported".to_string(),
+                        }
+                    };
                     let _ = response_tx.send(response);
                 }
                 RuntimeControlCommand::StallRestartTest {
