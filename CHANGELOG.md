@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Projection/API-Konvergenz nutzt read-only Projection-Reads fuer Runtime-Health, erkennt Projection-Drift, fordert Full-Rebuilds per Request-Datei an und vermeidet Restart-Storms bei laufendem Projection-Service
   - FUSE/Landlock Runtime-Konsistenz ist jetzt fail-closed: Sandboxes nutzen `fs_mount` nur nach aktivem `sentinel-fs`-Mount, fallen sonst auf `/ram/agents` zurueck und erlauben Execute nur fuer Agent-Binary, Breakout-Helper und notwendige ELF-Loader
   - Runtime-Reconcile entfernt jetzt auch gestoppte Prozesse in verwaisten Agent-Cgroups ueber `cgroup.kill`/SIGKILL-Fallback und schreibt Projection-only Ghost-Agents als `agent_despawned` in den append-only Truth-Stream
+  - Runtime-Health und Runtime-Control liefern serverseitige Timing-Felder; `scripts/vm-issue-279-bench.sh` belegt Reconcile, Projection-Drift-Detection, bounded Analysis-Flood und Stall-Bookkeeping mit VM-Sidecar-Metriken
 
 - **Room-Kommunikation Phase 2: Soft-Cap, Hallway Encounters, Transit-Realismus, adaptiver Heartbeat** (#289)
   - Raum-Kapazitaeten als Soft-Cap mit Perceptions `Es ist eng hier.` und `Der Raum ist komplett voll.` statt hartem Block

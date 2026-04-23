@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan279.md`
-- Overall status: `TASK_13_DONE_TASK_14_PENDING`
-- Current task: `Task 14 - Benchmarks`
+- Overall status: `TASK_14_DONE_TASK_15_PENDING`
+- Current task: `Task 15 - PR- und Close-Sequenz`
 - Current branch: `feat/issue-279-daemon-hardening-v2`
 - Worktree: `/work/company/project-sentinel-279-review`
 - Base: `origin/main @ 83ab01c8835804fd951e619aa048324b7ff76ddf`
@@ -97,6 +97,13 @@
   - AC-5 `service_health` Panic-Test blieb im selben Daemon-PID `1485419`, Worker `running=true`, `restart_count=1`
   - AC-6 Flood-Test mit `10000` Triggern blieb bounded: `queue_depth=1`, `dropped=9983`, `coalesced=9999`, `rss_delta_kb=-80`
   - AC-7 30-Minuten-Soak endete PASS; Artefakte liegen auf der VM unter `/tmp/issue279-soak-20260423T123633Z`
+- Task 14 ist erledigt:
+  - Benchmark-Instrumentierung fuer `elapsed_us`, `snapshot_build_elapsed_us`, `enqueue_per_request_ns` und `bookkeeping_elapsed_ns` wurde implementiert
+  - Remote-Qualitaetsmatrix nach Instrumentierung ist gruen: `fmt`, Daemon-Tests `194 passed`, Clippy Daemon mit `--features fuse`, Release-Build Daemon
+  - finaler Daemon-Hash wurde auf die VM deployed: `7d105283937f92a98bbf2dbd89fc44f8f86128b92a935042c328dac3e8c2756d`
+  - Benchmark-Harness `/opt/sentinel/scripts/vm-issue-279-bench.sh` lief auf `10.0.0.240` mit Sidecars fuer RAM, CPU, IOPS und Prozesszustand
+  - Benchmark-Artefakte liegen auf der VM unter `/tmp/issue279-bench-20260423T132030Z`
+  - alle vier Pflicht-Benchmarks sind PASS: Reconcile `2134us < 5000us`, Projection-Drift-Detection `817us < 5000us`, Analysis-Flood `148ns/request < 250000ns/request`, Stall-Bookkeeping `700ns < 50000ns`
 
 ## Blocked items
 
@@ -141,7 +148,7 @@
 | 11 | Phase 3 - Tests, Clippy, Builds | DONE | cargo remote only, relevant packages, conditional FUSE/Landlock matrix | command |
 | 12 | Phase 4 - Deploy auf die VM | DONE | ExecStart pruefen, scp/install, restart, post-restart smoke, Projection-/Cgroup-Drift reparieren | command, system |
 | 13 | Phase 5 - AC-Matrix | DONE | alle ACs mit Command, Output, PASS auf VM | command, system |
-| 14 | Benchmarks | PENDING | Recovery, Queue, Soak, Sidecar-Monitoring | command, system |
+| 14 | Benchmarks | DONE | Recovery, Queue, Soak, Sidecar-Monitoring | command, system |
 | 15 | PR- und Close-Sequenz | PENDING | PR mit Pflichtsektionen, labels, merge, branch delete, issue close erst nach verified | command |
 | 16 | Plan-Verifikation | PENDING | Plan Zeile fuer Zeile gegen Ergebnis pruefen, Abweichungen fixen | inspect, command |
 
@@ -759,3 +766,74 @@
   - `d0da3c42b11397e1c954777397c4b3622cfeeb4365fff2adebbded9adacb13b4  target/release/sentinel-projection`
   - `a3d35bdf5261a617546a19a380f731dba89dc6f24327f4dca1eff4783a05a31d  target/release/landlock-wrapper`
   - `03abe24e93222b540bf36bbedf0d5c259780bea0f53c79386086c44d22e40be8  target/release/breakout-helper`
+
+## Task 14 - Benchmarks
+
+### Pre-task self-check
+
+- Was muss getan werden: issue-spezifische Benchmarks fuer Runtime-Reconcile, Projection-Drift-Detection, bounded Analysis-Flood und Stall-Recovery-Bookkeeping auf der Deploy-VM messen.
+- Welche ACs muessen hier passen:
+  - AC-1: Benchmarks messen serverseitige Runtime-Pfade, nicht HTTP-Wallclock mit 1-Hz-Tick-Wartezeit.
+  - AC-2: Sidecar-Monitoring fuer RAM, CPU, IOPS und Prozesszustand liegt pro Lauf vor.
+  - AC-3: finaler VM-Zustand bleibt healthy: `expected/runtime/projection/cgroups = 26/26/26/26`, keine stale/orphan/zombie/drift-Treffer.
+  - AC-4: `journalctl` seit Benchmark-Start zeigt keine Panic-/Drift-Regressionsmarker.
+- Wie wird bewiesen: `cargo remote -c --`, Deploy-Hash, `/opt/sentinel/scripts/vm-issue-279-bench.sh`, Sidecar-Artefakte unter `/tmp/issue279-bench-20260423T132030Z`.
+- Erwartete Dateien: `scripts/vm-issue-279-bench.sh`, `PROGRESS.md`, `test-279-verification.md`, `CHANGELOG.md`.
+- Risiken:
+  - HTTP-End-to-End-Zeit ist fuer diese Benchmarks nicht geeignet, weil Runtime-Control-Befehle im ECS-Tick abgearbeitet werden; deshalb wurden serverseitige Timing-Felder ergaenzt.
+
+### Outcome
+
+- Runtime-Control und Runtime-Health liefern benchmarkfaehige serverseitige Timing-Felder:
+  - `RuntimeReconcileResponse.elapsed_us`
+  - `RuntimeHealthSnapshot.snapshot_build_elapsed_us`
+  - `RuntimeAnalysisFloodTestResponse.enqueue_per_request_ns`
+  - `RuntimeStallRestartTestResponse.bookkeeping_elapsed_ns`
+- Remote-Qualitaetsmatrix nach Instrumentierung ist gruen:
+  - `cargo remote -c -- fmt --all`
+  - `cargo remote -c -- test -q -p sentinel-daemon -- --nocapture`: `194 passed`
+  - `cargo remote -c -- clippy -q -p sentinel-daemon --all-targets --features fuse -- -D warnings`
+  - `cargo remote -c -- build -q -p sentinel-daemon --release --features fuse`
+- VM-Deploy erfolgte am systemd-`ExecStart`-Pfad `/opt/sentinel/bin/sentinel-daemon --config /opt/sentinel/config/daemon.toml`.
+- VM-Binary-Hash: `7d105283937f92a98bbf2dbd89fc44f8f86128b92a935042c328dac3e8c2756d`.
+- Benchmark PASS:
+  - `runtime_reconcile_26_agents`: `2134us < 5000us`
+  - `projection_divergence_detection`: `817us < 5000us`
+  - `analysis_flood_cap`: `148ns/request < 250000ns/request`
+  - `stall_recovery_bookkeeping`: `700ns < 50000ns`
+- Finaler VM-Gate blieb healthy: `expected/runtime/projection/cgroups = 26/26/26/26`, `stale=0`, `orphans=0`, `zombies=0`, `drift=false`.
+
+### Evidence
+
+- `cargo remote -c -- fmt --all`
+  - PASS: exit `0`.
+- `cargo remote -c -- test -q -p sentinel-daemon -- --nocapture`
+  - PASS: `194 passed; 0 failed`.
+- `cargo remote -c -- clippy -q -p sentinel-daemon --all-targets --features fuse -- -D warnings`
+  - PASS: exit `0`.
+- `cargo remote -c -- build -q -p sentinel-daemon --release --features fuse`
+  - PASS: exit `0`.
+- `sha256sum target/release/sentinel-daemon`
+  - PASS: `7d105283937f92a98bbf2dbd89fc44f8f86128b92a935042c328dac3e8c2756d  target/release/sentinel-daemon`.
+- Deploy:
+  - `ssh ubuntu@10.0.0.240 "grep ExecStart /etc/systemd/system/sentinel-daemon.service"`
+  - PASS: `ExecStart=/opt/sentinel/bin/sentinel-daemon --config /opt/sentinel/config/daemon.toml`.
+  - `scp target/release/sentinel-daemon ubuntu@10.0.0.240:/tmp/sentinel-daemon.issue279-bench`
+  - `ssh ubuntu@10.0.0.240 "sudo install -m 755 /tmp/sentinel-daemon.issue279-bench /opt/sentinel/bin/sentinel-daemon && sudo systemctl restart sentinel-daemon"`
+  - PASS: service active, VM hash matches `7d105283937f92a98bbf2dbd89fc44f8f86128b92a935042c328dac3e8c2756d`.
+- Benchmark:
+  - `scp scripts/vm-issue-279-bench.sh ubuntu@10.0.0.240:/tmp/vm-issue-279-bench.sh`
+  - `ssh ubuntu@10.0.0.240 "sudo install -m 755 /tmp/vm-issue-279-bench.sh /opt/sentinel/scripts/vm-issue-279-bench.sh && /opt/sentinel/scripts/vm-issue-279-bench.sh"`
+  - PASS: `BENCH_PASS out_dir=/tmp/issue279-bench-20260423T132030Z`.
+- Sidecars:
+  - `/tmp/issue279-bench-20260423T132030Z/free-before.txt`
+  - `/tmp/issue279-bench-20260423T132030Z/free-after.txt`
+  - `/tmp/issue279-bench-20260423T132030Z/vmstat-before.txt`
+  - `/tmp/issue279-bench-20260423T132030Z/vmstat-after.txt`
+  - `/tmp/issue279-bench-20260423T132030Z/iostat-before.txt`
+  - `/tmp/issue279-bench-20260423T132030Z/iostat-after.txt`
+  - `/tmp/issue279-bench-20260423T132030Z/ps-before.txt`
+  - `/tmp/issue279-bench-20260423T132030Z/ps-after.txt`
+- Final service gate:
+  - `sentinel-daemon`, `sentinel-projection`, `sentinel-gateway`, `sentinel-nats-bridge`: all `active`.
+  - `journalctl -u sentinel-daemon --since <benchmark-start>` panic/drift marker scan: empty.

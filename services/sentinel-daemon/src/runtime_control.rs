@@ -47,6 +47,8 @@ pub struct RuntimeReconcileResponse {
     pub blocked_agents: Vec<String>,
     #[serde(default)]
     pub errors: Vec<String>,
+    #[serde(default)]
+    pub elapsed_us: u64,
 }
 
 #[derive(Debug)]
@@ -81,6 +83,10 @@ pub struct RuntimeAnalysisFloodTestResponse {
     pub queue_depth: usize,
     pub dropped_total: u64,
     pub coalesced_total: u64,
+    #[serde(default)]
+    pub enqueue_elapsed_us: u64,
+    #[serde(default)]
+    pub enqueue_per_request_ns: u64,
     pub note: String,
 }
 
@@ -103,6 +109,8 @@ pub struct RuntimeStallRestartTestResponse {
     pub pid_after: Option<u32>,
     pub runtime_present_after: bool,
     pub security_runtime_present_after: bool,
+    #[serde(default)]
+    pub bookkeeping_elapsed_ns: u64,
     pub note: String,
 }
 

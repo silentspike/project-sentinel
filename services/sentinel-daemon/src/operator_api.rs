@@ -2393,6 +2393,7 @@ mod tests {
                     last_repair_error: None,
                     repair_last_status: Some("drift_detected".to_string()),
                     operator_auth_required: secret.is_some(),
+                    snapshot_build_elapsed_us: 0,
                     agents: vec![crate::runtime_health::RuntimeHealthAgentSnapshot {
                         agent_id: 7,
                         aggregate_id: "AGENT-07".to_string(),
@@ -2822,6 +2823,7 @@ mod tests {
                         repaired_agents: vec!["Test Agent".to_string()],
                         blocked_agents: Vec::new(),
                         errors: Vec::new(),
+                        elapsed_us: 0,
                     })
                     .unwrap();
             }
@@ -2872,6 +2874,8 @@ mod tests {
                         queue_depth: 17,
                         dropped_total: 9_983,
                         coalesced_total: 9_999,
+                        enqueue_elapsed_us: 0,
+                        enqueue_per_request_ns: 0,
                         note: "bounded queues exercised".to_string(),
                     })
                     .unwrap();
@@ -2993,6 +2997,7 @@ mod tests {
                         pid_after: Some(5252),
                         runtime_present_after: true,
                         security_runtime_present_after: true,
+                        bookkeeping_elapsed_ns: 0,
                         note: "fast_path_restart_executed_without_shift_wait".to_string(),
                     })
                     .unwrap();

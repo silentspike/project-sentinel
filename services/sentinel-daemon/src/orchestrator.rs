@@ -1460,6 +1460,7 @@ fn run_runtime_reconcile(
     request: RuntimeReconcileRequest,
     respawn_backoff: &mut RespawnBackoffTracker,
 ) -> RuntimeReconcileResponse {
+    let elapsed_started = std::time::Instant::now();
     let previous = ctx
         .runtime_health
         .read()
@@ -1823,6 +1824,7 @@ fn run_runtime_reconcile(
         repaired_agents,
         blocked_agents,
         errors,
+        elapsed_us: elapsed_started.elapsed().as_micros() as u64,
     }
 }
 
@@ -2533,6 +2535,7 @@ fn ecs_tick_loop(
                     request,
                     response_tx,
                 } => {
+                    let enqueue_started = std::time::Instant::now();
                     for _ in 0..request.count {
                         platform_cp.enqueue_control_command(
                             crate::platform_controlplane::PlatformControlCommand::AnalyzeNow,
@@ -2572,12 +2575,16 @@ fn ecs_tick_loop(
                     } else {
                         "bounded controlplane queue exercised; llm feature disabled"
                     };
+                    let enqueue_elapsed_ns = enqueue_started.elapsed().as_nanos() as u64;
                     let _ = response_tx.send(RuntimeAnalysisFloodTestResponse {
                         accepted: true,
                         requested: request.count,
                         queue_depth: stats.depth,
                         dropped_total: stats.dropped_total,
                         coalesced_total: stats.coalesced_total,
+                        enqueue_elapsed_us: enqueue_elapsed_ns / 1_000,
+                        enqueue_per_request_ns: enqueue_elapsed_ns
+                            / u64::from(request.count.max(1)),
                         note: note.to_string(),
                     });
                 }
@@ -2622,12 +2629,15 @@ fn ecs_tick_loop(
                         .find(|cfg| cfg.identity.id == request.agent_id)
                     {
                         Some(agent_cfg) => {
+                            let bookkeeping_started = std::time::Instant::now();
                             let pid_before = tracked_pid_for_agent(
                                 agent_id,
                                 &sandbox_handles,
                                 &agent_processes,
                                 &security_runtime_state,
                             );
+                            let bookkeeping_elapsed_ns =
+                                bookkeeping_started.elapsed().as_nanos() as u64;
                             let pre_suspend_result = match request.mode.as_str() {
                                 "sigstop" => suspend_agent_cgroup_processes(
                                     &agent_cfg.identity.name,
@@ -2673,6 +2683,7 @@ fn ecs_tick_loop(
                                         runtime_present_after: result.runtime_present_after,
                                         security_runtime_present_after: result
                                             .security_runtime_present_after,
+                                        bookkeeping_elapsed_ns,
                                         note: "fast_path_restart_executed_without_shift_wait"
                                             .to_string(),
                                     }
@@ -2700,6 +2711,7 @@ fn ecs_tick_loop(
                                             .read()
                                             .map(|state| state.contains_key(&request.agent_id))
                                             .unwrap_or(false),
+                                        bookkeeping_elapsed_ns,
                                         note: error.to_string(),
                                     }
                                 }
@@ -2716,6 +2728,7 @@ fn ecs_tick_loop(
                             pid_after: None,
                             runtime_present_after: false,
                             security_runtime_present_after: false,
+                            bookkeeping_elapsed_ns: 0,
                             note: "agent_id unbekannt".to_string(),
                         },
                     };

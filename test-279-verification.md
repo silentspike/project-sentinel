@@ -1974,3 +1974,193 @@ projection-journal.log: no panic/error/database-is-locked hits during soak windo
 ```
 
 PASS: The 30-minute VM soak ended at the canonical active-agent target with no panic or drift regression.
+
+## Phase 12 - Task 14 Benchmarks
+
+Date: 2026-04-23
+
+Benchmark design:
+
+```text
+HTTP wallclock is not used as the benchmark target because Runtime-Control commands are processed on
+the synchronous 1 Hz ECS tick. Task 14 therefore adds server-side timing fields to the same live
+Operator paths and measures those fields on the deployment VM.
+```
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/runtime_control.rs
+services/sentinel-daemon/src/runtime_health.rs
+services/sentinel-daemon/src/orchestrator.rs
+services/sentinel-daemon/src/operator_api.rs
+scripts/vm-issue-279-bench.sh
+```
+
+### Remote Quality Matrix After Benchmark Instrumentation
+
+Commands:
+
+```bash
+cargo remote -c -- fmt --all
+cargo remote -c -- test -q -p sentinel-daemon -- --nocapture
+cargo remote -c -- clippy -q -p sentinel-daemon --all-targets --features fuse -- -D warnings
+cargo remote -c -- build -q -p sentinel-daemon --release --features fuse
+sha256sum target/release/sentinel-daemon
+```
+
+Observed:
+
+```text
+fmt: PASS
+sentinel-daemon tests: 194 passed; 0 failed
+clippy sentinel-daemon --features fuse: PASS
+release build sentinel-daemon --features fuse: PASS
+7d105283937f92a98bbf2dbd89fc44f8f86128b92a935042c328dac3e8c2756d  target/release/sentinel-daemon
+```
+
+PASS: Benchmark instrumentation compiles, is formatted, passes daemon tests and clippy, and produced a release binary.
+
+### VM Deploy For Benchmark Binary
+
+Commands:
+
+```bash
+ssh ubuntu@10.0.0.240 "grep ExecStart /etc/systemd/system/sentinel-daemon.service && systemctl is-active sentinel-daemon && pgrep -x sentinel-daemon"
+scp target/release/sentinel-daemon ubuntu@10.0.0.240:/tmp/sentinel-daemon.issue279-bench
+ssh ubuntu@10.0.0.240 "sudo cp /opt/sentinel/bin/sentinel-daemon /opt/sentinel/bin/sentinel-daemon.backup-issue279-bench-$(date -u +%Y%m%dT%H%M%SZ) && sudo install -m 755 /tmp/sentinel-daemon.issue279-bench /opt/sentinel/bin/sentinel-daemon && sudo systemctl restart sentinel-daemon && systemctl is-active sentinel-daemon && sha256sum /opt/sentinel/bin/sentinel-daemon"
+```
+
+Observed:
+
+```text
+ExecStart=/opt/sentinel/bin/sentinel-daemon --config /opt/sentinel/config/daemon.toml
+active
+old_pid=1485419
+active
+7d105283937f92a98bbf2dbd89fc44f8f86128b92a935042c328dac3e8c2756d  /opt/sentinel/bin/sentinel-daemon
+```
+
+PASS: The benchmarked binary is installed at the live systemd `ExecStart` path and the VM hash matches the local release hash.
+
+### Endpoint Timing Smoke
+
+Commands:
+
+```bash
+ssh ubuntu@10.0.0.240 "/tmp/opcurl http://127.0.0.1:8084/operator/runtime-health | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[\"expected_active_agents\"], d[\"runtime_agents\"], d[\"projection_agents\"], d[\"snapshot_build_elapsed_us\"], d[\"operator_auth_required\"])'"
+ssh ubuntu@10.0.0.240 "/tmp/opcurl -X POST http://127.0.0.1:8084/operator/runtime/reconcile -H 'Content-Type: application/json' -d '{\"dry_run\":true,\"respawn_missing\":true,\"projection_rebuild\":false}' | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[\"accepted\"], d[\"dry_run\"], d[\"elapsed_us\"], d[\"repair_last_status\"])'"
+ssh ubuntu@10.0.0.240 "/tmp/opcurl -X POST http://127.0.0.1:8084/operator/runtime/analysis-flood-test -H 'Content-Type: application/json' -d '{\"count\":10000}' | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[\"accepted\"], d[\"enqueue_elapsed_us\"], d[\"enqueue_per_request_ns\"], d[\"queue_depth\"], d[\"dropped_total\"], d[\"coalesced_total\"])'"
+```
+
+Observed:
+
+```text
+26 26 26 1021 False
+True True 2229 dry_run
+True 1517 151 17 9982 9999
+```
+
+PASS: Runtime-Health, Reconcile and Analysis-Flood expose the server-side timing fields on the running VM.
+
+### Benchmark Harness
+
+Install and run command:
+
+```bash
+scp scripts/vm-issue-279-bench.sh ubuntu@10.0.0.240:/tmp/vm-issue-279-bench.sh
+ssh ubuntu@10.0.0.240 "sudo install -m 755 /tmp/vm-issue-279-bench.sh /opt/sentinel/scripts/vm-issue-279-bench.sh && /opt/sentinel/scripts/vm-issue-279-bench.sh"
+```
+
+Observed:
+
+```text
+healthy expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 snapshot_us=1001
+healthy expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 snapshot_us=1080
+BENCH_PASS out_dir=/tmp/issue279-bench-20260423T132030Z
+name	actual	target_exclusive	unit	pass	source
+runtime_reconcile_26_agents	2134	5000	us	PASS	runtime-reconcile-runs.tsv
+projection_divergence_detection	817	5000	us	PASS	projection-divergence-runs.tsv
+analysis_flood_cap	148	250000	ns_per_request	PASS	analysis-flood.json
+stall_recovery_bookkeeping	700	50000	ns	PASS	stall-restart-direct.json
+sidecars:
+/tmp/issue279-bench-20260423T132030Z/free-after.txt
+/tmp/issue279-bench-20260423T132030Z/free-before.txt
+/tmp/issue279-bench-20260423T132030Z/iostat-after.txt
+/tmp/issue279-bench-20260423T132030Z/iostat-before.txt
+/tmp/issue279-bench-20260423T132030Z/ps-after.txt
+/tmp/issue279-bench-20260423T132030Z/ps-before.txt
+/tmp/issue279-bench-20260423T132030Z/vmstat-after.txt
+/tmp/issue279-bench-20260423T132030Z/vmstat-before.txt
+```
+
+PASS: All four #279-specific benchmarks passed with VM-side system-monitoring artifacts.
+
+### Sidecar And Final Health Summary
+
+Artifact directory:
+
+```text
+/tmp/issue279-bench-20260423T132030Z
+```
+
+Final health:
+
+```text
+current_shift=1
+expected_active_agents=26
+runtime_agents=26
+projection_agents=26
+projection_drift_detected=false
+projection_drift_agents=0
+security_runtime_entries=26
+sandbox_handles=26
+tracked_processes=26
+live_cgroup_dirs=26
+stale_runtime_entries=0
+orphan_cgroups=0
+zombie_tracked_pids=0
+service_health running=true restart_count=0 last_error=null
+ecs_tick_loop running=true restart_count=0 last_error=null
+analysis_queue_depth=1
+analysis_queue_dropped_total=19964
+analysis_queue_coalesced_total=19998
+reconcile_runs_total=6
+reconcile_repairs_total=0
+respawn_failures=0
+repair_last_status=dry_run
+operator_auth_required=false
+snapshot_build_elapsed_us=1080
+```
+
+Process sidecar:
+
+```text
+before: daemon_pid=1495021 projection_pid=1495275 sentinel-daemon RSS=210768 KB projection RSS=6384 KB
+after:  daemon_pid=1495021 projection_pid=1495275 sentinel-daemon RSS=229172 KB projection RSS=6384 KB
+```
+
+System sidecar excerpt:
+
+```text
+Mem: total=24030MB used=1258MB free=10993MB available=22771MB
+iostat avg-cpu: user=1.39 system=0.46 iowait=0.22 steal=0.13 idle=97.80
+sda: r/s=0.80 rkB/s=17.37 w/s=18.11 wkB/s=634.71 util=1.54
+```
+
+Service gate:
+
+```text
+sentinel-daemon active
+sentinel-projection active
+sentinel-gateway active
+sentinel-nats-bridge active
+```
+
+Journal gate:
+
+```text
+journalctl -u sentinel-daemon --since <benchmark-start> panic/drift marker scan: empty
+```
+
+PASS: Benchmarks left the VM in the canonical healthy runtime state with no panic or drift regression.
