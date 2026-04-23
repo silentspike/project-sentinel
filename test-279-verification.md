@@ -649,3 +649,129 @@ PASS: no output, exit 0
 ```
 
 PASS: Slice C builds with the FUSE feature and has a reproducible release artifact hash.
+
+## Phase 5 - Slice D Worker-Supervision Evidence
+
+Date: 2026-04-23
+
+### AC-1 - In-Process Worker Supervision
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/service_health.rs
+```
+
+Observed implementation:
+
+```text
+ServiceHealthChecker::spawn()
+panic::catch_unwind(AssertUnwindSafe(...))
+ServiceHealthControl::PanicTest
+ServiceHealthWorkerExit
+restart_count
+last_error
+running
+thread_name
+```
+
+PASS: `service_health` panics are contained inside the worker thread, recorded in the worker snapshot, and followed by an in-process worker restart rather than a daemon-process exit.
+
+### AC-2 - Runtime Panic-Test Operator Hook
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/runtime_control.rs
+services/sentinel-daemon/src/operator_api.rs
+services/sentinel-daemon/src/orchestrator.rs
+```
+
+Observed implementation:
+
+```text
+RuntimeControlCommand::PanicTest
+RuntimePanicTestRequest { worker }
+RuntimePanicTestResponse { accepted, worker, note }
+POST /operator/runtime/panic-test
+```
+
+PASS: The hook is typed, input-validated, routed through the existing Operator API path, and dispatched into the ECS owner thread. Only `worker=service_health` is accepted.
+
+### AC-3 - Remote Tests
+
+Remote Operator API test command:
+
+```bash
+cargo remote -c -- test -p sentinel-daemon runtime_panic_test -- --nocapture
+```
+
+Observed:
+
+```text
+Finished test profile [unoptimized + debuginfo] target(s) in 21.56s
+running 2 tests
+test operator_api::tests::runtime_panic_test_rejects_invalid_worker ... ok
+test operator_api::tests::runtime_panic_test_is_forwarded_and_returns_response ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 183 filtered out; finished in 0.07s
+```
+
+Remote worker-supervision test command:
+
+```bash
+cargo remote -c -- test -p sentinel-daemon panic_test_restarts_worker_in_process -- --nocapture
+```
+
+Observed:
+
+```text
+Finished test profile [unoptimized + debuginfo] target(s) in 0.42s
+running 1 test
+thread 'service-health-checker' panicked at services/sentinel-daemon/src/service_health.rs:163:17:
+panic-test requested for service_health
+test service_health::tests::panic_test_restarts_worker_in_process ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 184 filtered out; finished in 0.25s
+```
+
+PASS: The panic/backtrace is the intentional test stimulus. The test passes because `catch_unwind` records the panic and restarts the worker in-process.
+
+### AC-4 - Release Build And Artifact Hash
+
+Remote format command:
+
+```bash
+cargo remote -c -- fmt --check
+```
+
+Observed:
+
+```text
+PASS: no remaining rustfmt diff.
+```
+
+Remote release build command:
+
+```bash
+cargo remote -c -- build -p sentinel-daemon --release --features fuse
+```
+
+Observed:
+
+```text
+Finished release profile [optimized] target(s) in 57.79s
+4400fcb9162fe242f3cbebda550f25175976abc8f444475ab201d0570e43c3d2  target/release/sentinel-daemon
+```
+
+Whitespace check command:
+
+```bash
+git diff --check
+```
+
+Observed:
+
+```text
+PASS: no output, exit 0
+```
+
+PASS: Slice D builds with the FUSE feature and has a reproducible release artifact hash.

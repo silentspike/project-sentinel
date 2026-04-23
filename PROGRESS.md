@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan279.md`
-- Overall status: `TASK_5_DONE_TASK_6_PENDING`
-- Current task: `Task 6 - Slice D: Worker-Supervision`
+- Overall status: `TASK_6_DONE_TASK_7_PENDING`
+- Current task: `Task 7 - Slice E: bounded Analysis-/Recovery-Pfade`
 - Current branch: `feat/issue-279-daemon-hardening-v2`
 - Worktree: `/work/company/project-sentinel-279-review`
 - Base: `origin/main @ 83ab01c8835804fd951e619aa048324b7ff76ddf`
@@ -49,6 +49,11 @@
   - `PlatformSideEffect::RestartAgent` nutzt jetzt einen same-tick Fast-Respawn statt verzögertem Despawn
   - der Fast-Restart entfernt alte Runtime-, Security- und Sandbox-Fragmente und respawned danach denselben Agent
   - Remote-Tests, FUSE-Release-Build und Artifact-Hash sind dokumentiert
+- Slice D ist erledigt:
+  - `service_health` ist per `catch_unwind` in-process supervised
+  - `POST /operator/runtime/panic-test` triggert kontrolliert den Service-Health-Panic-Test ueber den ECS-Thread
+  - Runtime-Health-Worker-State zeigt `running`, `restart_count`, `last_error` und `thread_name`
+  - Remote-Tests, FUSE-Release-Build und Artifact-Hash sind dokumentiert
 
 ## Blocked items
 
@@ -63,7 +68,7 @@
 - `e2e7523` Task [2] Phase 1 - Donor-Audit und Clean Port
 - `f5be73b` Task [3] Slice A - Runtime-Health-Read-Model
 - `ca44759` Task [4] Slice B - Runtime-Control / Reconcile
-- `TBD` Task [5] Slice C - Fast Stall Recovery
+- `f5e3dd9` Task [5] Slice C - Fast Stall Recovery
 - `TBD` Task [6] Slice D - Worker-Supervision
 - `TBD` Task [7] Slice E - bounded Analysis-/Recovery-Pfade
 - `TBD` Task [8] Slice F - Projection/API-Konvergenz
@@ -85,7 +90,7 @@
 | 3 | Slice A - Runtime-Health-Read-Model | DONE | `/operator/runtime-health`, Snapshot-Modell, Auth/Loopback, Tests | inspect, command, system |
 | 4 | Slice B - Runtime-Control / Reconcile | DONE | `/operator/runtime/reconcile`, stale/orphan/zombie cleanup, bounded retries | inspect, command, system |
 | 5 | Slice C - Fast Stall Recovery | DONE | deterministischer Stall-Testhook, same-tick Fast-Respawn, Runtime/Security/Sandbox-Recreate | inspect, command, system |
-| 6 | Slice D - Worker-Supervision | PENDING | catch_unwind + in-process worker respawn, panic-test Hook | inspect, command, system |
+| 6 | Slice D - Worker-Supervision | DONE | catch_unwind + in-process worker respawn, panic-test Hook | inspect, command, system |
 | 7 | Slice E - bounded Analysis-/Recovery-Pfade | PENDING | bounded trigger queues, coalescing/drop counters, flood-test | inspect, command, system |
 | 8 | Slice F - Projection/API-Konvergenz | PENDING | read-only Projection-Reads, Rebuild-Request, drift-heal | inspect, command, system |
 | 9 | Slice G - Conditional FUSE/Landlock Runtime Restore | PENDING | nur falls Main-Repro es braucht: FUSE/Landlock Runtime Restore, eigene Build-/Deploy-Gates | inspect, command, system |
@@ -357,5 +362,53 @@
 - `cargo remote -c -- build -p sentinel-daemon --release --features fuse`
   - PASS: `Finished release profile [optimized] target(s) in 56.20s`
   - artifact hash: `3470152e8b897217e2d2e547549b8f6759b3e733ec53d8a3ea8e00745da8d2bd  target/release/sentinel-daemon`
+- `git diff --check`
+  - PASS: no whitespace/conflict errors.
+
+## Task 6 - Slice D: Worker-Supervision
+
+### Pre-task self-check
+
+- Was muss getan werden: Worker-Supervision aus Donor `6919e66` path-limited portieren, `service_health` per `catch_unwind` im selben Daemon-Prozess neu starten und einen deterministischen Panic-Testhook bereitstellen.
+- Welche ACs muessen hier passen:
+  - AC-1: `service_health`-Worker-Panics werden gefangen und erhoehen `restart_count`, ohne den Daemon-Prozess zu beenden.
+  - AC-2: `POST /operator/runtime/panic-test` akzeptiert nur den erlaubten Worker `service_health`, dispatcht in den ECS-Thread und liefert eine bounded Response.
+  - AC-3: Runtime-Health-Worker-State bleibt beobachtbar: `running`, `restart_count`, `last_error`, `thread_name`.
+  - AC-4: Remote-Tests, FUSE-Release-Build, Artefakt-Hash und `git diff --check` sind gruen.
+- Wie wird bewiesen: Code-Diff, `cargo remote -c -- fmt/test/build`, `sha256sum`, `git diff --check`.
+- Erwartete Dateien: `services/sentinel-daemon/src/service_health.rs`, `runtime_control.rs`, `operator_api.rs`, `orchestrator.rs`, `CHANGELOG.md`.
+- Risiken:
+  - Der Panic-Test muss ein kontrollierter Testpfad bleiben und darf keinen Daemon-Crash als PASS werten.
+  - Die bestehende Operator-Auth-/Loopback-Schutzschicht darf nicht umgangen werden.
+
+### Outcome
+
+- Path-limited donor Slice D was applied from stack donor `6919e66`.
+- `ServiceHealthChecker::spawn()` supervisiert den Worker jetzt in einer Schleife mit `panic::catch_unwind(AssertUnwindSafe(...))`.
+- Ein kontrollierter Panic erhoeht `restart_count`, schreibt `last_error` und startet `service-health-checker` im selben Daemon-Prozess erneut.
+- `ServiceHealthControl::{PanicTest, Shutdown}` steuert Test und sauberen Drop des Workers.
+- `POST /operator/runtime/panic-test` ist verdrahtet:
+  - rejects empty worker
+  - allows only `worker=service_health`
+  - dispatches via `RuntimeControlCommand::PanicTest`
+  - waits with `recv_timeout(10s)`
+- Der Orchestrator behandelt den Panic-Test im ECS-Owner-Thread und ruft `service_health_checker.trigger_panic_test()`.
+- No Haiku/model-policy changes were introduced.
+
+### Evidence
+
+- `cargo remote -c -- fmt --check`
+  - PASS: no remaining rustfmt diff.
+- `cargo remote -c -- test -p sentinel-daemon runtime_panic_test -- --nocapture`
+  - PASS: `2 passed; 0 failed; 183 filtered out; finished in 0.07s`
+  - Covered tests:
+    - `operator_api::tests::runtime_panic_test_is_forwarded_and_returns_response`
+    - `operator_api::tests::runtime_panic_test_rejects_invalid_worker`
+- `cargo remote -c -- test -p sentinel-daemon panic_test_restarts_worker_in_process -- --nocapture`
+  - PASS: `1 passed; 0 failed; 184 filtered out; finished in 0.25s`
+  - Note: the printed panic/backtrace is expected evidence from the intentional panic-test path; `catch_unwind` catches it and the test passes.
+- `cargo remote -c -- build -p sentinel-daemon --release --features fuse`
+  - PASS: `Finished release profile [optimized] target(s) in 57.79s`
+  - artifact hash: `4400fcb9162fe242f3cbebda550f25175976abc8f444475ab201d0570e43c3d2  target/release/sentinel-daemon`
 - `git diff --check`
   - PASS: no whitespace/conflict errors.

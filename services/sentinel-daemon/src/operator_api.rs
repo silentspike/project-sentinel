@@ -32,8 +32,9 @@ use crate::platform_controlplane::{
     PlatformTriggerTestCommand,
 };
 use crate::runtime_control::{
-    RuntimeControlCommand, RuntimeReconcileRequest, RuntimeReconcileResponse,
-    RuntimeStallRestartTestRequest, RuntimeStallRestartTestResponse,
+    RuntimeControlCommand, RuntimePanicTestRequest, RuntimePanicTestResponse,
+    RuntimeReconcileRequest, RuntimeReconcileResponse, RuntimeStallRestartTestRequest,
+    RuntimeStallRestartTestResponse,
 };
 
 const OPERATOR_CHAOS_PATH: &str = "/operator/chaos";
@@ -52,6 +53,7 @@ const OPERATOR_PLATFORM_ANALYSIS_TEST_PATH: &str = "/operator/platform-analysis-
 const OPERATOR_PLATFORM_STATE_PATH: &str = "/operator/platform-state";
 const OPERATOR_RUNTIME_HEALTH_PATH: &str = "/operator/runtime-health";
 const OPERATOR_RUNTIME_RECONCILE_PATH: &str = "/operator/runtime/reconcile";
+const OPERATOR_RUNTIME_PANIC_TEST_PATH: &str = "/operator/runtime/panic-test";
 const OPERATOR_RUNTIME_STALL_RESTART_TEST_PATH: &str = "/operator/runtime/stall-restart-test";
 const OPERATOR_APICP_SNAPSHOT_PATH: &str = "/operator/apicp/snapshot";
 const OPERATOR_SECURITY_FS_TRASH_PATH: &str = "/operator/security/fs-trash";
@@ -714,6 +716,18 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Err(err) => err.to_response(),
             }
         }
+        OPERATOR_RUNTIME_PANIC_TEST_PATH => {
+            let payload: RuntimePanicTestRequest = match serde_json::from_slice(&request.body) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                }
+            };
+            match dispatch_runtime_panic_test(payload, state) {
+                Ok(response) => json_response(200, response),
+                Err(err) => err.to_response(),
+            }
+        }
         OPERATOR_RUNTIME_STALL_RESTART_TEST_PATH => {
             let payload: RuntimeStallRestartTestRequest =
                 match serde_json::from_slice(&request.body) {
@@ -1120,6 +1134,31 @@ fn dispatch_runtime_reconcile(
     response_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .map_err(|_| ApiError::ServiceUnavailable("Runtime-Reconcile Timeout"))
+}
+
+fn dispatch_runtime_panic_test(
+    mut payload: RuntimePanicTestRequest,
+    state: &AppState,
+) -> std::result::Result<RuntimePanicTestResponse, ApiError> {
+    payload.worker = payload.worker.trim().to_ascii_lowercase();
+    if payload.worker.is_empty() {
+        return Err(ApiError::BadRequest("worker fehlt"));
+    }
+    if payload.worker != "service_health" {
+        return Err(ApiError::BadRequest("worker muss service_health sein"));
+    }
+
+    let (response_tx, response_rx) = mpsc::sync_channel(1);
+    state
+        .runtime_tx
+        .send(RuntimeControlCommand::PanicTest {
+            request: payload,
+            response_tx,
+        })
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-Control-Channel nicht verfuegbar"))?;
+    response_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-Panic-Test Timeout"))
 }
 
 fn dispatch_runtime_stall_restart_test(
@@ -2748,6 +2787,9 @@ mod tests {
             RuntimeControlCommand::StallRestartTest { .. } => {
                 panic!("unerwartetes StallRestartTest-Kommando");
             }
+            RuntimeControlCommand::PanicTest { .. } => {
+                panic!("unerwartetes PanicTest-Kommando");
+            }
         });
         let response = handle_http_request(
             test_request(
@@ -2768,6 +2810,60 @@ mod tests {
         assert_eq!(payload.respawned_agents, 2);
         assert!(payload.projection_rebuild_requested);
         assert_eq!(payload.repair_last_status, "repaired");
+    }
+
+    #[test]
+    fn runtime_panic_test_is_forwarded_and_returns_response() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let worker = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::PanicTest {
+                request,
+                response_tx,
+            } => {
+                assert_eq!(request.worker, "service_health");
+                response_tx
+                    .send(RuntimePanicTestResponse {
+                        accepted: true,
+                        worker: "service_health".to_string(),
+                        note: "panic-test dispatched".to_string(),
+                    })
+                    .unwrap();
+            }
+            other => panic!("unerwartetes Kommando: {other:?}"),
+        });
+
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_RUNTIME_PANIC_TEST_PATH,
+                serde_json::json!({
+                    "worker": "service_health"
+                }),
+            ),
+            &state,
+        );
+
+        worker.join().unwrap();
+        assert_eq!(response.status, 200);
+        let payload: RuntimePanicTestResponse = serde_json::from_slice(&response.body).unwrap();
+        assert!(payload.accepted);
+        assert_eq!(payload.worker, "service_health");
+        assert_eq!(payload.note, "panic-test dispatched");
+    }
+
+    #[test]
+    fn runtime_panic_test_rejects_invalid_worker() {
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_RUNTIME_PANIC_TEST_PATH,
+                serde_json::json!({
+                    "worker": "ecs_tick_loop"
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 400);
     }
 
     #[test]
