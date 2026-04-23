@@ -1552,8 +1552,7 @@ fn run_runtime_reconcile(
             {
                 repair_ops_total += 1;
                 repaired_agents.push(agent.name.clone());
-                agent_status_updates
-                    .insert(agent.agent_id, "projection_despawned".to_string());
+                agent_status_updates.insert(agent.agent_id, "projection_despawned".to_string());
             }
         }
 
@@ -1582,23 +1581,21 @@ fn run_runtime_reconcile(
                             repair_ops_total += 1;
                         }
                     }
-                    Ok(_) => {
-                        match sentinel_sandbox::cgroups::kill_cgroup_processes(&name) {
-                            Ok(killed) if killed > 0 => {
+                    Ok(_) => match sentinel_sandbox::cgroups::kill_cgroup_processes(&name) {
+                        Ok(killed) if killed > 0 => {
+                            repair_ops_total += 1;
+                            if sentinel_sandbox::cgroups::remove_cgroup(&name).is_ok() {
+                                orphan_cgroups_removed += 1;
                                 repair_ops_total += 1;
-                                if sentinel_sandbox::cgroups::remove_cgroup(&name).is_ok() {
-                                    orphan_cgroups_removed += 1;
-                                    repair_ops_total += 1;
-                                }
                             }
-                            Ok(_) => {}
-                            Err(error) => warn!(
-                                cgroup = %name,
-                                error = %error,
-                                "Orphan-Cgroup-PIDs konnten nicht hart beendet werden"
-                            ),
                         }
-                    }
+                        Ok(_) => {}
+                        Err(error) => warn!(
+                            cgroup = %name,
+                            error = %error,
+                            "Orphan-Cgroup-PIDs konnten nicht hart beendet werden"
+                        ),
+                    },
                     Err(error) => warn!(
                         cgroup = %name,
                         error = %error,
