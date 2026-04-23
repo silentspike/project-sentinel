@@ -50,9 +50,7 @@ fn main() {
         "hostname" => scenario_hostname(),
         _ => {
             eprintln!("Unknown scenario: {scenario}");
-            eprintln!(
-                "Available: write-etc, read-other-home, exec-from-tmp, exec-from-home,"
-            );
+            eprintln!("Available: write-etc, read-other-home, exec-from-tmp, exec-from-home,");
             eprintln!("          exec-bin-sh, exec-python3, symlink-escape,");
             eprintln!("          memory-bomb, fork-bomb, cpu-burn, pid-count, hostname");
             EXIT_SETUP_ERROR
