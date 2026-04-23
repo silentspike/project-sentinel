@@ -16,10 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Dynamischer Heartbeat im ECS `output_system`: Standard 10 Ticks, bei aktiven Chats herunter bis auf 2 Ticks; Bio/Physics bleibt 1 Hz
 
 - **Security Hardening: CAS Ransomware-Schutz + Immutable Snapshots** (#264)
-  - SQLite Trigger blockiert DELETE auf Snapshots juenger als 7 Tage
-  - CAS GC Trash-Queue: Chunks mit Refcount 0 bleiben 24h erhalten
-  - Write-Rate Anomalie-Erkennung als Platform-CP Regel (> 5 MB/s Alert)
-  - gc_trash() fuer Grace-Period-Freigabe, restore_from_trash() fuer Recovery
+  - SQLite Trigger blockiert `DELETE` auf Snapshots juenger als 7 Tage
+  - CAS GC Trash-Queue haelt Chunks mit Refcount `0` fuer 24h zurueck; gezielte Fixture-/Age-/GC-Hooks liefern reproduzierbare Runtime-Evidence
+  - Snapshot/Restore nutzt jetzt die geteilte `sentinel-fs`-Layer im laufenden Daemon, so dass Ransomware-Simulation + Restore den Originalzustand auf dem FUSE-/Artifact-Runtime-Pfad wiederherstellen
+  - Write-Anomaly-Erkennung fuehrt live zu `platform_intervention` + echtem `SIGSTOP` der Ziel-Cgroup; der Operator-Testhook schreibt dafuer auf einen daemon-owned Hostpfad statt auf den read-focused FUSE-Mount
+  - Agent-Homes werden auf dem FUSE-Pfad jetzt stabil ueber `aggregate_id` statt Anzeigenamen gebunden; `agent-runtime-state` und Security-Hooks referenzieren denselben Runtime-Pfad
+  - Landlock-Tests auditiert blockierte Exec-Versuche als strukturierte `security_exec_blocked`-Events; `/tmp`, `/bin/sh` und `/usr/bin/python3` sind live ueber den Wrapper-Pfad nachweisbar geblockt
 
 - **Platform-Controlplane: Self-Healing Background Service** (#263)
   - 4 deterministische Regeln: Agent-Stall Detection, Event Store Size, Projection Lag, Memory Pressure

@@ -329,6 +329,28 @@ pub fn add_pid_to_cgroup(name: &str, pid: u32) -> Result<()> {
         .with_context(|| format!("Failed to add PID {pid} to cgroup {name}"))
 }
 
+/// Lists all PIDs currently attached to an agent's cgroup.
+pub fn list_pids_in_cgroup(name: &str) -> Result<Vec<u32>> {
+    let path = format!("{}/cgroup.procs", cgroup_path(name));
+    read_cgroup_pids(std::path::Path::new(&path))
+}
+
+fn read_cgroup_pids(path: &std::path::Path) -> Result<Vec<u32>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read cgroup member list {}", path.display()))?;
+    Ok(parse_cgroup_pids(&content))
+}
+
+fn parse_cgroup_pids(content: &str) -> Vec<u32> {
+    let mut pids = content
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
 /// Sets the OOM score adjustment for a process.
 ///
 /// -1000 = immortal (ECS core), +1000 = first to kill.
@@ -511,5 +533,11 @@ mod tests {
                 "sda1 (8:1) should resolve to sda (8:0)"
             );
         }
+    }
+
+    #[test]
+    fn parse_cgroup_pids_dedups_and_skips_invalid_lines() {
+        let pids = parse_cgroup_pids("42\n17\n42\ninvalid\n");
+        assert_eq!(pids, vec![17, 42]);
     }
 }

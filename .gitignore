@@ -84,6 +84,9 @@ bitnet/bitnet-inference
 # Docs (local-only, not for Git)
 docs/
 !docs/security-test-report.md
+/AGENTS.md
+/test-288-verification.md
+/hooks/
 
 # Evidence screenshots (binary, not for Git)
 /evidence-*.png

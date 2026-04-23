@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use super::metrics::PlatformMetrics;
-use super::rules::PlatformAction;
+use super::rules::{assess_write_anomaly, PlatformAction};
 use crate::config::PlatformControlplaneConfig;
 
 /// Prueft ob die letzten Actions ihre Probleme geloest haben.
@@ -13,6 +13,7 @@ use crate::config::PlatformControlplaneConfig;
 pub fn verify_last_actions(
     last_actions: &[PlatformAction],
     current_metrics: &PlatformMetrics,
+    write_rate_baselines: &HashMap<String, f64>,
     config: &PlatformControlplaneConfig,
 ) -> HashMap<String, bool> {
     let mut results = HashMap::new();
@@ -43,7 +44,14 @@ pub fn verify_last_actions(
                     .agent_write_rates
                     .iter()
                     .find(|(name, _)| *name == action.target)
-                    .map(|(_, rate)| *rate <= config.write_anomaly_threshold_bytes_per_sec as f64)
+                    .map(|(_, rate)| {
+                        assess_write_anomaly(
+                            *rate,
+                            write_rate_baselines.get(&action.target).copied(),
+                            config,
+                        )
+                        .is_none()
+                    })
                     .unwrap_or(true) // Agent nicht mehr da = resolved
             }
             "service_health" => {
@@ -89,7 +97,7 @@ mod tests {
             event_store_size_bytes: 100 * 1024 * 1024, // 100 MB < 500 MB
             ..Default::default()
         };
-        let results = verify_last_actions(&actions, &metrics, &test_config());
+        let results = verify_last_actions(&actions, &metrics, &HashMap::new(), &test_config());
         assert_eq!(results.get("event_store_size:system"), Some(&true));
     }
 
@@ -106,7 +114,7 @@ mod tests {
             event_store_size_bytes: 600 * 1024 * 1024, // 600 MB > 500 MB
             ..Default::default()
         };
-        let results = verify_last_actions(&actions, &metrics, &test_config());
+        let results = verify_last_actions(&actions, &metrics, &HashMap::new(), &test_config());
         assert_eq!(results.get("event_store_size:system"), Some(&false));
     }
 
@@ -115,7 +123,7 @@ mod tests {
         let actions = vec![PlatformAction {
             rule_name: "write_anomaly".to_string(),
             target: "Test Agent".to_string(),
-            action_label: "alert".to_string(),
+            action_label: "sigstop".to_string(),
             description: String::new(),
             side_effect: None,
         }];
@@ -123,7 +131,7 @@ mod tests {
             agent_write_rates: vec![("Test Agent".to_string(), 1_000_000.0)], // 1 MB/s < 5 MB/s
             ..Default::default()
         };
-        let results = verify_last_actions(&actions, &metrics, &test_config());
+        let results = verify_last_actions(&actions, &metrics, &HashMap::new(), &test_config());
         assert_eq!(results.get("write_anomaly:Test Agent"), Some(&true));
     }
 
@@ -132,7 +140,7 @@ mod tests {
         let actions = vec![PlatformAction {
             rule_name: "write_anomaly".to_string(),
             target: "Test Agent".to_string(),
-            action_label: "alert".to_string(),
+            action_label: "sigstop".to_string(),
             description: String::new(),
             side_effect: None,
         }];
@@ -140,7 +148,7 @@ mod tests {
             agent_write_rates: vec![("Test Agent".to_string(), 10_000_000.0)], // 10 MB/s > 5 MB/s
             ..Default::default()
         };
-        let results = verify_last_actions(&actions, &metrics, &test_config());
+        let results = verify_last_actions(&actions, &metrics, &HashMap::new(), &test_config());
         assert_eq!(results.get("write_anomaly:Test Agent"), Some(&false));
     }
 
@@ -157,7 +165,7 @@ mod tests {
             failed_services: vec![], // Keine failed services → resolved
             ..Default::default()
         };
-        let results = verify_last_actions(&actions, &metrics, &test_config());
+        let results = verify_last_actions(&actions, &metrics, &HashMap::new(), &test_config());
         assert_eq!(results.get("service_health:sentinel-judge"), Some(&true));
     }
 
@@ -174,7 +182,7 @@ mod tests {
             failed_services: vec!["sentinel-judge".to_string()],
             ..Default::default()
         };
-        let results = verify_last_actions(&actions, &metrics, &test_config());
+        let results = verify_last_actions(&actions, &metrics, &HashMap::new(), &test_config());
         assert_eq!(results.get("service_health:sentinel-judge"), Some(&false));
     }
 }

@@ -25,7 +25,7 @@ SyslogIdentifier=sentinel-daemon
 # Security Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/sentinel/data /ram/sentinel
+ReadWritePaths=/opt/sentinel/data /opt/sentinel/fs /ram/sentinel /ram/agents
 PrivateTmp=true
 
 [Install]

@@ -221,7 +221,19 @@ fn ac_76_n1_existing_apis_unchanged() {
         .contains(&std::path::PathBuf::from("/home/test-n1")));
     assert!(landlock
         .exec_paths
+        .contains(&std::path::PathBuf::from("/usr/bin/agent-runtime")));
+    assert!(landlock
+        .exec_paths
+        .contains(&std::path::PathBuf::from("/breakout-helper")));
+    assert!(!landlock
+        .exec_paths
         .contains(&std::path::PathBuf::from("/usr")));
+    assert!(!landlock
+        .exec_paths
+        .contains(&std::path::PathBuf::from("/tmp")));
+    assert!(!landlock
+        .exec_paths
+        .contains(&std::path::PathBuf::from("/home/test-n1")));
 }
 
 /// Verifies that breakout_bwrap_config() extends production config correctly.

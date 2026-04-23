@@ -98,6 +98,7 @@ pub enum PlatformControlCommand {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct PlatformStateSnapshot {
     pub current_tick: u64,
+    pub cycle_interval_ticks: u64,
     pub ebpf_collect_interval_ticks: u64,
     pub stall_detection_threshold_secs: u64,
     pub stall_recent_activity_grace_ticks: u64,
@@ -148,6 +149,7 @@ pub struct PlatformControlplane {
     config: PlatformControlplaneConfig,
     cooldowns: HashMap<String, u64>,
     last_actions: Vec<PlatformAction>,
+    write_rate_baselines: HashMap<String, f64>,
     unresolved_counts: HashMap<String, u32>,
     failed_interventions: Vec<FailedIntervention>,
     queued_analysis_triggers: Vec<QueuedAnalysisTrigger>,
@@ -163,6 +165,7 @@ impl PlatformControlplane {
             config,
             cooldowns: HashMap::new(),
             last_actions: Vec::new(),
+            write_rate_baselines: HashMap::new(),
             unresolved_counts: HashMap::new(),
             failed_interventions: Vec::new(),
             queued_analysis_triggers: Vec::new(),
@@ -223,7 +226,7 @@ impl PlatformControlplane {
 
     /// Fuehrt einen OODA-Zyklus aus und gibt Side-Effects zurueck.
     ///
-    /// Der Orchestrator fuehrt die Side-Effects aus (TriggerPrune, ForceIdleProfile).
+    /// Der Orchestrator fuehrt die Side-Effects aus (TriggerPrune, ForceIdleProfile, SuspendAgent).
     pub fn cycle(
         &mut self,
         metrics: &PlatformMetrics,
@@ -233,8 +236,12 @@ impl PlatformControlplane {
     ) -> PlatformCycleOutput {
         let effective_config = self.effective_config();
         // 1. Verify: Letzte Actions gewirkt?
-        let verify_results =
-            verify::verify_last_actions(&self.last_actions, metrics, &effective_config);
+        let verify_results = verify::verify_last_actions(
+            &self.last_actions,
+            metrics,
+            &self.write_rate_baselines,
+            &effective_config,
+        );
         let unresolved_escalations = self.update_unresolved_state(&verify_results);
         self.last_actions.retain(|action| {
             let key = action_key(&action.rule_name, &action.target);
@@ -250,6 +257,7 @@ impl PlatformControlplane {
             &self.cooldowns,
             tick,
             &effective_config,
+            &self.write_rate_baselines,
             agent_name_to_id,
         );
 
@@ -277,6 +285,8 @@ impl PlatformControlplane {
             self.upsert_last_action(action);
         }
 
+        self.refresh_write_rate_baselines(metrics, &effective_config);
+
         // Cooldown Cleanup: Eintraege aelter als 2x max Cooldown entfernen
         let max_cooldown = self
             .effective_config()
@@ -288,6 +298,27 @@ impl PlatformControlplane {
         PlatformCycleOutput {
             side_effects,
             analysis_requests,
+        }
+    }
+
+    fn refresh_write_rate_baselines(
+        &mut self,
+        metrics: &PlatformMetrics,
+        config: &PlatformControlplaneConfig,
+    ) {
+        const ALPHA: f64 = 0.05;
+
+        for (agent_name, rate) in &metrics.agent_write_rates {
+            let previous = self.write_rate_baselines.get(agent_name).copied();
+            if rules::assess_write_anomaly(*rate, previous, config).is_some() {
+                continue;
+            }
+            let updated = match previous {
+                Some(old) => (old * (1.0 - ALPHA)) + (*rate * ALPHA),
+                None => *rate,
+            };
+            self.write_rate_baselines
+                .insert(agent_name.clone(), updated);
         }
     }
 
@@ -786,6 +817,7 @@ mod tests {
             1,
             &cp.effective_config(),
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(
@@ -800,6 +832,79 @@ mod tests {
                 .any(|action| action.rule_name == "memory_pressure"),
             "override must affect effective rule evaluation"
         );
+    }
+
+    #[test]
+    fn test_cycle_learns_write_rate_baseline_from_healthy_samples() {
+        let mut cp = PlatformControlplane::new(PlatformControlplaneConfig {
+            enabled: true,
+            cycle_interval_ticks: 1,
+            write_anomaly_threshold_bytes_per_sec: 50_000_000,
+            write_anomaly_baseline_multiplier: 10.0,
+            ..PlatformControlplaneConfig::default()
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let db = sentinel_limbo::EventStore::open(dir.path().join("baseline.db").to_str().unwrap())
+            .unwrap();
+        let metrics = PlatformMetrics {
+            agent_write_rates: vec![("Test Agent".to_string(), 2_000.0)],
+            ..Default::default()
+        };
+
+        let output = cp.cycle(&metrics, &db, 1, &HashMap::new());
+        assert!(output.side_effects.is_empty());
+        assert_eq!(cp.write_rate_baselines.get("Test Agent"), Some(&2_000.0));
+    }
+
+    #[test]
+    fn test_cycle_emits_sigstop_platform_intervention_for_write_anomaly() {
+        let mut cp = PlatformControlplane::new(PlatformControlplaneConfig {
+            enabled: true,
+            cycle_interval_ticks: 1,
+            write_anomaly_threshold_bytes_per_sec: 50_000_000,
+            write_anomaly_baseline_multiplier: 10.0,
+            ..PlatformControlplaneConfig::default()
+        });
+        cp.write_rate_baselines
+            .insert("Test Agent".to_string(), 1_000.0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            sentinel_limbo::EventStore::open(dir.path().join("write-anomaly.db").to_str().unwrap())
+                .unwrap();
+        let metrics = PlatformMetrics {
+            agent_write_rates: vec![("Test Agent".to_string(), 12_000.0)],
+            ..Default::default()
+        };
+        let agent_name_to_id =
+            HashMap::from([("Test Agent".to_string(), sentinel_common::AgentId(5))]);
+
+        let output = cp.cycle(&metrics, &db, 1, &agent_name_to_id);
+        assert!(matches!(
+            output.side_effects.as_slice(),
+            [PlatformSideEffect::SuspendAgent(id)] if *id == sentinel_common::AgentId(5)
+        ));
+
+        let events = db.get_events_since(0, 10).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "platform_intervention")
+            .expect("platform_intervention event");
+        let payload: DomainEventPayload = serde_json::from_str(&event.payload).unwrap();
+        match payload {
+            DomainEventPayload::PlatformIntervention {
+                rule_name,
+                target,
+                action,
+                description,
+            } => {
+                assert_eq!(rule_name, "write_anomaly");
+                assert_eq!(target, "Test Agent");
+                assert_eq!(action, "sigstop");
+                assert!(description.contains("SIGSTOP"));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
     }
 
     #[test]

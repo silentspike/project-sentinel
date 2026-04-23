@@ -5,6 +5,7 @@ tick_rate_ms = 1000
 time_scale = 1.0
 max_agents = 60
 zenoh_prefix = "sentinel"
+fs_mount = "/opt/sentinel/fs"
 
 # PSI-basierte adaptive Tick-Rate (TOGAF Adaptive Scheduling)
 [daemon.adaptive]
