@@ -8,9 +8,10 @@
 //! tolerieren Re-Processing bei Restart.
 
 use anyhow::Context;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use std::time::Duration;
+use tracing::{debug, info};
 
 // ── SQL Schemas ──────────────────────────────────
 
@@ -94,6 +95,7 @@ impl ReadModelStore {
     pub fn open(path: &str) -> anyhow::Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("Failed to open projection DB: {path}"))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
 
         // WAL-Modus + Performance-Pragmas (wie EventStore)
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -149,6 +151,21 @@ impl ReadModelStore {
         }
 
         info!(path, "ReadModelStore opened");
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Oeffnet eine existierende Read-Model-Datenbank schreibgeschuetzt.
+    ///
+    /// Verwendet keinen Startup-Cleanup und keine Schema-Migrationen. Dieser
+    /// Pfad ist fuer daemon-seitige Runtime-Health-Diagnostik bestimmt, damit
+    /// kein zweiter Writer auf `projection.db` entsteht.
+    pub fn open_readonly(path: &str) -> anyhow::Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("Failed to open projection DB readonly: {path}"))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        debug!(path, readonly = true, "ReadModelStore opened");
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -349,6 +366,55 @@ impl ReadModelStore {
         )?;
         Ok(count)
     }
+
+    /// Listet aktive Agents in der Live-View.
+    ///
+    /// Dieser Read-Pfad wird vom Daemon fuer Runtime-Health genutzt. Er bleibt
+    /// read-only und macht Projection-only Ghost-Agents explizit sichtbar.
+    pub fn active_agents(&self) -> anyhow::Result<Vec<AgentView>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, name, role, shift_set, status, current_room, in_transit,
+                    transit_target, last_action, last_action_tick, hunger, energy,
+                    stress, bladder, social_need, caffeine_mg, mood, last_event_id,
+                    updated_at
+             FROM agent_live_view
+             WHERE status = 'active'
+             ORDER BY agent_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(AgentView {
+                agent_id: row.get(0)?,
+                name: row.get(1)?,
+                role: row.get(2)?,
+                shift_set: row.get(3)?,
+                status: row.get(4)?,
+                current_room: row.get(5)?,
+                in_transit: row.get::<_, i32>(6)? != 0,
+                transit_target: row.get(7)?,
+                last_action: row.get(8)?,
+                last_action_tick: row.get(9)?,
+                hunger: row.get(10)?,
+                energy: row.get(11)?,
+                stress: row.get(12)?,
+                bladder: row.get(13)?,
+                social_need: row.get(14)?,
+                caffeine_mg: row.get(15)?,
+                mood: row.get(16)?,
+                last_event_id: row.get(17)?,
+                updated_at: row.get(18)?,
+            })
+        })?;
+
+        let mut agents = Vec::new();
+        for row in rows {
+            agents.push(row?);
+        }
+        Ok(agents)
+    }
 }
 
 // ── View-Structs ─────────────────────────────────
@@ -413,6 +479,12 @@ impl<'a> ReadModelTransaction<'a> {
     /// Committed die SQLite-Transaktion.
     pub fn commit(&self) -> anyhow::Result<()> {
         self.guard.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    /// Rollback fuer fail-closed Batch-Fehler.
+    pub fn rollback(&self) -> anyhow::Result<()> {
+        self.guard.execute_batch("ROLLBACK")?;
         Ok(())
     }
 
@@ -798,6 +870,28 @@ mod tests {
             .query_row("SELECT count(*) FROM kpi_1m", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_open_readonly_reads_existing_projection_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-readonly.db");
+        let store = ReadModelStore::open(path.to_str().unwrap()).unwrap();
+
+        {
+            let txn = store.begin_transaction().unwrap();
+            txn.begin().unwrap();
+            txn.upsert_agent(7, "Readonly Agent", "QA", 1, "active", 10)
+                .unwrap();
+            txn.update_agent_room(7, "empfang", 11).unwrap();
+            txn.commit().unwrap();
+        }
+        drop(store);
+
+        let readonly = ReadModelStore::open_readonly(path.to_str().unwrap()).unwrap();
+        let agent = readonly.get_agent(7).unwrap().unwrap();
+        assert_eq!(agent.name, "Readonly Agent");
+        assert_eq!(agent.current_room.as_deref(), Some("empfang"));
     }
 
     #[test]

@@ -83,3 +83,5 @@ llm_gateway_timeout_ms = 30000
 llm_prompt_template = "platform-controlplane-default"
 llm_max_context_events = 10
 llm_max_failed_interventions = 3
+llm_trigger_queue_capacity = 16
+llm_analysis_channel_capacity = 16

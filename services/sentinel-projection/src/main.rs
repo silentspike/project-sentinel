@@ -4,6 +4,7 @@
 //! materialized read models (agent_live_view, room_live_view, kpi_1m).
 //! Started via systemd, runs continuously until stopped.
 
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -77,6 +78,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         poll_interval: std::time::Duration::from_millis(cli.poll_interval_ms),
         batch_size: cli.batch_size,
         db_path: cli.projection_db.clone(),
+        rebuild_request_path: Path::new(&cli.projection_db)
+            .parent()
+            .unwrap_or_else(|| Path::new("/opt/sentinel/data"))
+            .join(".projection-rebuild-request")
+            .to_string_lossy()
+            .to_string(),
+        rebuild_request_poll_interval: std::time::Duration::from_secs(1),
     };
 
     let worker =

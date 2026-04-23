@@ -10,7 +10,7 @@
 //! └─────────────────────┘                       └──────────────────┘
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -41,6 +41,12 @@ use crate::controlplane::store::ControlplaneStore;
 use crate::controlplane::ControlplaneKernel;
 use crate::episode_producer::EpisodeProducer;
 use crate::operator_api;
+use crate::runtime_control::{
+    RespawnBackoffTracker, RespawnRetryDecision, RuntimeAnalysisFloodTestResponse,
+    RuntimeControlCommand, RuntimePanicTestResponse, RuntimeReconcileRequest,
+    RuntimeReconcileResponse, RuntimeStallRestartTestResponse,
+};
+use crate::runtime_health;
 use crate::shift::{agents_for_shift, detect_current_shift, detect_shift_from_sim_hour};
 use crate::signal::wait_for_shutdown;
 
@@ -116,30 +122,44 @@ fn signal_pid(pid: u32, signal: &str) -> Result<()> {
     }
 }
 
-fn mountpoint_is_active(path: &std::path::Path) -> bool {
+fn mountinfo_contains_mountpoint(mountinfo: &str, path: &std::path::Path) -> bool {
     let target = path
         .canonicalize()
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .into_owned();
+
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (left, right) = line.split_once(" - ")?;
+            let mountpoint = left.split_whitespace().nth(4)?;
+            let mut suffix = right.split_whitespace();
+            let fs_type = suffix.next()?;
+            let mount_source = suffix.next()?;
+            Some((mountpoint, fs_type, mount_source))
+        })
+        .any(|(mountpoint, fs_type, mount_source)| {
+            mountpoint == target && fs_type == "fuse" && mount_source == "sentinel-fs"
+        })
+}
+
+fn mountpoint_is_active(path: &std::path::Path) -> bool {
     std::fs::read_to_string("/proc/self/mountinfo")
         .ok()
-        .map(|mountinfo| {
-            mountinfo
-                .lines()
-                .filter_map(|line| {
-                    let (left, right) = line.split_once(" - ")?;
-                    let mountpoint = left.split_whitespace().nth(4)?;
-                    let mut suffix = right.split_whitespace();
-                    let fs_type = suffix.next()?;
-                    let mount_source = suffix.next()?;
-                    Some((mountpoint, fs_type, mount_source))
-                })
-                .any(|(mountpoint, fs_type, mount_source)| {
-                    mountpoint == target && fs_type == "fuse" && mount_source == "sentinel-fs"
-                })
-        })
+        .map(|mountinfo| mountinfo_contains_mountpoint(&mountinfo, path))
         .unwrap_or(false)
+}
+
+fn wait_for_fuse_mount(path: &std::path::Path, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if mountpoint_is_active(path) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    mountpoint_is_active(path)
 }
 
 fn suspend_pids(pids: &[u32], tracked_pid: Option<u32>) -> Result<()> {
@@ -454,50 +474,60 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         };
 
     // -- sentinel-fs FUSE Mount (optional, konfigurierbar) --
-    #[cfg(feature = "fuse")]
-    if let Some(ref fs_mount) = config.fs_mount {
-        let mountpoint = std::path::PathBuf::from(fs_mount);
-        let fs_layer_clone = fs_layer
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| anyhow!("sentinel-fs Layer nicht initialisiert"))?;
-        if !mountpoint.exists() {
-            std::fs::create_dir_all(&mountpoint)
-                .with_context(|| format!("FUSE mountpoint erstellen: {}", mountpoint.display()))?;
-        }
-        info!(
-            mountpoint = %mountpoint.display(),
-            data_dir = %data_dir.display(),
-            "sentinel-fs FUSE-Mount starten"
-        );
-        let mountpoint_check = mountpoint.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = sentinel_fs::fuse::start_fuse_layer(fs_layer_clone, &mountpoint) {
-                error!(error = %e, "sentinel-fs FUSE-Mount fehlgeschlagen");
+    let active_fs_mount: Option<String> = {
+        #[cfg(feature = "fuse")]
+        {
+            let mut active_mount = None;
+            if let Some(ref fs_mount) = config.fs_mount {
+                let mountpoint = std::path::PathBuf::from(fs_mount);
+                let fs_layer_clone = fs_layer
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("sentinel-fs Layer nicht initialisiert"))?;
+                if !mountpoint.exists() {
+                    std::fs::create_dir_all(&mountpoint).with_context(|| {
+                        format!("FUSE mountpoint erstellen: {}", mountpoint.display())
+                    })?;
+                }
+                info!(
+                    mountpoint = %mountpoint.display(),
+                    data_dir = %data_dir.display(),
+                    "sentinel-fs FUSE-Mount starten"
+                );
+                let mountpoint_check = mountpoint.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = sentinel_fs::fuse::start_fuse_layer(fs_layer_clone, &mountpoint)
+                    {
+                        error!(error = %e, "sentinel-fs FUSE-Mount fehlgeschlagen");
+                    }
+                });
+                if wait_for_fuse_mount(&mountpoint_check, Duration::from_secs(2)) {
+                    info!(mountpoint = %mountpoint_check.display(), "sentinel-fs FUSE-Mount aktiv");
+                    active_mount = Some(fs_mount.clone());
+                } else {
+                    warn!(
+                        mountpoint = %mountpoint_check.display(),
+                        "sentinel-fs FUSE-Mount nicht aktiv, fallback auf /ram/agents"
+                    );
+                }
             }
-        });
-        let mut mount_ready = false;
-        for _ in 0..20 {
-            if mountpoint_is_active(&mountpoint_check) {
-                mount_ready = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
+            active_mount
         }
-        if mount_ready {
-            info!(mountpoint = %mountpoint_check.display(), "sentinel-fs FUSE-Mount aktiv");
-        } else {
-            warn!(mountpoint = %mountpoint_check.display(), "sentinel-fs FUSE-Mount moeglicherweise nicht bereit");
+        #[cfg(not(feature = "fuse"))]
+        {
+            None
         }
-    }
+    };
 
     // -- Sandbox Enforcer (Landlock + cgroups v2 + bwrap) --
     let (mut sandbox, sandbox_warnings) = SandboxEnforcer::detect();
 
-    // Wenn sentinel-fs FUSE konfiguriert: bwrap nutzt FUSE-Mount statt /ram/agents/
-    if let Some(ref fs_mount) = config.fs_mount {
+    // Wenn sentinel-fs FUSE aktiv ist: bwrap nutzt FUSE-Mount statt /ram/agents/.
+    if let Some(ref fs_mount) = active_fs_mount {
         sandbox.set_fs_mount(fs_mount.clone());
         info!(fs_mount = %fs_mount, "Sandbox nutzt sentinel-fs FUSE-Mount fuer Agent-Homes");
+    } else if config.fs_mount.is_some() {
+        warn!("Konfiguriertes fs_mount deaktiviert, weil kein tragfaehiger FUSE-Mount aktiv ist");
     }
     for w in &sandbox_warnings {
         match w {
@@ -581,6 +611,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let (operator_tx, operator_rx) = mpsc::channel::<OperatorCommand>();
     let (platform_tx, platform_rx) =
         mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>();
+    let (runtime_tx, runtime_rx) = mpsc::channel::<RuntimeControlCommand>();
     let (nightrun_tx, nightrun_rx) = mpsc::channel::<sentinel_common::OperatorNightrunCommand>();
     let (snapshot_tx, snapshot_rx) = mpsc::channel::<sentinel_common::OperatorSnapshotCommand>();
     let (restore_tx, restore_rx) = mpsc::channel::<sentinel_common::OperatorRestoreCommand>();
@@ -591,8 +622,13 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let platform_state = Arc::new(RwLock::new(
         crate::platform_controlplane::PlatformStateSnapshot::default(),
     ));
+    let runtime_health = Arc::new(RwLock::new(
+        crate::runtime_health::RuntimeHealthSnapshot::default(),
+    ));
     let security_runtime_state: operator_api::SharedSecurityRuntimeState =
         Arc::new(RwLock::new(HashMap::new()));
+    let projection_db_path = data_dir.join("projection.db").to_string_lossy().to_string();
+    let operator_auth_required = config.operator_api.shared_secret.is_some();
 
     // -- Zenoh SentinelBus (Core-Bus fuer Real-Time Event-Verteilung) --
     let bus_config = config.zenoh.to_bus_config();
@@ -691,11 +727,12 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             operator_api::start_server(
                 config.operator_api.clone(),
                 data_dir.to_path_buf(),
-                config.fs_mount.clone(),
+                active_fs_mount.clone(),
                 fs_layer.clone(),
                 operator_room_ids,
                 operator_tx.clone(),
                 platform_tx.clone(),
+                runtime_tx.clone(),
                 nightrun_tx.clone(),
                 snapshot_tx.clone(),
                 restore_tx.clone(),
@@ -703,6 +740,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 prune_tx.clone(),
                 Arc::clone(&state_store),
                 Arc::clone(&platform_state),
+                Arc::clone(&runtime_health),
                 Arc::clone(&security_runtime_state),
             )
             .await?,
@@ -736,8 +774,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let platform_cp_config = config.platform_controlplane.clone();
     let events_db_path = events_path.to_string_lossy().to_string();
     let ecs_platform_state = Arc::clone(&platform_state);
+    let ecs_runtime_health = Arc::clone(&runtime_health);
     let ecs_security_runtime_state = Arc::clone(&security_runtime_state);
-    let ecs_fs_mount = config.fs_mount.clone();
+    let ecs_fs_mount = active_fs_mount.clone();
+    let ecs_projection_db_path = projection_db_path.clone();
     let ecs_handle = std::thread::Builder::new()
         .name("ecs-tick-loop".into())
         .spawn(move || {
@@ -747,6 +787,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 action_rx,
                 operator_rx,
                 platform_rx,
+                runtime_rx,
                 perception_tx,
                 all_agents_clone,
                 current_shift,
@@ -774,7 +815,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 platform_cp_config,
                 events_db_path,
                 ecs_platform_state,
+                ecs_runtime_health,
                 ecs_security_runtime_state,
+                ecs_projection_db_path,
+                operator_auth_required,
                 ecs_fs_mount,
                 fs_layer.clone(),
                 #[cfg(feature = "llm")]
@@ -1122,6 +1166,665 @@ fn publish_platform_state_snapshot(
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FastRestartResult {
+    agent_name: String,
+    pid_before: Option<u32>,
+    pid_after: Option<u32>,
+    runtime_present_after: bool,
+    security_runtime_present_after: bool,
+}
+
+fn tracked_pid_for_agent(
+    agent_id: AgentId,
+    sandbox_handles: &HashMap<AgentId, SandboxHandle>,
+    agent_processes: &HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+) -> Option<u32> {
+    sandbox_handles
+        .get(&agent_id)
+        .and_then(|handle| handle.bwrap_pid)
+        .or_else(|| agent_processes.get(&agent_id).map(|proc| proc.pid))
+        .or_else(|| {
+            security_runtime_state.read().ok().and_then(|state| {
+                state
+                    .get(&agent_id.0)
+                    .and_then(|snapshot| snapshot.bwrap_pid)
+            })
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restart_agent_fast_path(
+    world: &mut bevy_ecs::prelude::World,
+    runtime_orch: &mut RuntimeOrchestrator,
+    agent_cfg: &AgentConfig,
+    sandbox: &SandboxEnforcer,
+    sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &mut EbpfCollector,
+    agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    agent_command: &[String],
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    fs_mount: Option<&str>,
+) -> Result<FastRestartResult> {
+    let agent_id = AgentId(agent_cfg.identity.id);
+    let pid_before = tracked_pid_for_agent(
+        agent_id,
+        sandbox_handles,
+        agent_processes,
+        security_runtime_state,
+    );
+
+    if let Some(handle) = sandbox_handles.remove(&agent_id) {
+        if handle.cgroup_created {
+            if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
+                ebpf_collector.unregister_agent(cid);
+            }
+        }
+        if let Err(error) = sandbox.teardown_agent(&handle) {
+            warn!(
+                agent_id = %agent_id,
+                error = %error,
+                "Sandbox teardown bei Fast-Restart fehlgeschlagen"
+            );
+        }
+    }
+
+    if let Some(proc_handle) = agent_processes.remove(&agent_id) {
+        let _ = signal_pid(proc_handle.pid, "TERM");
+        drop(proc_handle);
+    }
+
+    remove_security_runtime_snapshot(security_runtime_state, agent_id);
+    let _ = despawn_agent_from_world(world, agent_id);
+    let _ = runtime_orch.despawn_agent(agent_id);
+
+    if !spawn_agent_full(
+        runtime_orch,
+        world,
+        agent_cfg,
+        sandbox,
+        sandbox_handles,
+        ebpf_collector,
+        agent_processes,
+        agent_command,
+        security_runtime_state,
+        fs_mount,
+    ) {
+        return Err(anyhow!(
+            "Fast-Respawn fuer {} fehlgeschlagen",
+            agent_cfg.identity.name
+        ));
+    }
+
+    let pid_after = tracked_pid_for_agent(
+        agent_id,
+        sandbox_handles,
+        agent_processes,
+        security_runtime_state,
+    );
+    let security_runtime_present_after = security_runtime_state
+        .read()
+        .map(|state| state.contains_key(&agent_id.0))
+        .unwrap_or(false);
+
+    Ok(FastRestartResult {
+        agent_name: agent_cfg.identity.name.clone(),
+        pid_before,
+        pid_after,
+        runtime_present_after: runtime_orch.agents().contains_key(&agent_id),
+        security_runtime_present_after,
+    })
+}
+
+#[derive(Debug, Default)]
+struct RuntimeCleanupStats {
+    repairs: usize,
+    security_snapshots_removed: usize,
+    orphan_cgroups_removed: usize,
+}
+
+struct RuntimeReconcileContext<'a> {
+    tick_count: u64,
+    current_shift: u8,
+    all_agents: &'a [AgentConfig],
+    world: &'a mut bevy_ecs::prelude::World,
+    runtime_orch: &'a mut RuntimeOrchestrator,
+    sandbox: &'a SandboxEnforcer,
+    sandbox_handles: &'a mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &'a mut EbpfCollector,
+    agent_processes: &'a mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    agent_command: &'a [String],
+    security_runtime_state: &'a operator_api::SharedSecurityRuntimeState,
+    event_store: &'a Arc<EventStore>,
+    runtime_health: &'a crate::runtime_health::SharedRuntimeHealthState,
+    projection_db_path: &'a std::path::Path,
+    operator_auth_required: bool,
+    service_health_state: crate::service_health::ServiceHealthWorkerSnapshot,
+    fs_mount: Option<&'a str>,
+    data_dir: &'a std::path::Path,
+    restart_service_fn: fn(&str) -> bool,
+    is_service_active_fn: fn(&str) -> bool,
+}
+
+fn runtime_agent_is_healthy(agent: &runtime_health::RuntimeHealthAgentSnapshot) -> bool {
+    agent.runtime_present
+        && agent.projection_present
+        && agent.security_runtime_present
+        && agent.tracked_pid_alive
+        && agent.cgroup_live_pid_count > 0
+}
+
+fn emit_runtime_repair_blocked_event(
+    event_store: &EventStore,
+    agent_id: AgentId,
+    description: &str,
+    tick_count: u64,
+) {
+    let aggregate_id = format!("AGENT-{:02}", agent_id.0);
+    let payload = DomainEventPayload::PlatformIntervention {
+        rule_name: "runtime_reconcile".to_string(),
+        target: aggregate_id.clone(),
+        action: "repair_blocked".to_string(),
+        description: description.to_string(),
+    };
+    let event = DomainEvent::new(
+        payload.event_type_str(),
+        &aggregate_id,
+        &payload.to_json(),
+        &format!("runtime-reconcile-{}", agent_id.0),
+        tick_count,
+    );
+    if let Err(error) = event_store.append_event(&event) {
+        warn!(
+            agent_id = %agent_id,
+            error = %error,
+            "Repair-Blocked-Event konnte nicht persistiert werden"
+        );
+    }
+}
+
+fn emit_runtime_projection_despawn_event(
+    event_store: &EventStore,
+    agent_id: AgentId,
+    tick_count: u64,
+) -> bool {
+    let aggregate_id = format!("AGENT-{:02}", agent_id.0);
+    let payload = DomainEventPayload::AgentDespawned {
+        agent_id,
+        reason: "runtime_reconcile_projection_only".to_string(),
+    };
+    let event = DomainEvent::new(
+        payload.event_type_str(),
+        &aggregate_id,
+        &payload.to_json(),
+        &format!("runtime-reconcile-projection-{}", agent_id.0),
+        tick_count,
+    );
+    if let Err(error) = event_store.append_event(&event) {
+        warn!(
+            agent_id = %agent_id,
+            error = %error,
+            "Projection-only Despawn-Event konnte nicht persistiert werden"
+        );
+        return false;
+    }
+    true
+}
+
+fn remove_agent_runtime_fragments(
+    ctx: &mut RuntimeReconcileContext<'_>,
+    agent: &runtime_health::RuntimeHealthAgentSnapshot,
+) -> RuntimeCleanupStats {
+    let agent_id = AgentId(agent.agent_id);
+    let mut stats = RuntimeCleanupStats::default();
+
+    if let Some(handle) = ctx.sandbox_handles.remove(&agent_id) {
+        if handle.cgroup_created {
+            if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
+                ctx.ebpf_collector.unregister_agent(cid);
+            }
+        }
+        if let Err(error) = ctx.sandbox.teardown_agent(&handle) {
+            warn!(agent_id = %agent_id, error = %error, "Sandbox-Teardown bei Runtime-Reconcile fehlgeschlagen");
+        } else {
+            stats.repairs += 1;
+        }
+    }
+
+    if let Some(proc_handle) = ctx.agent_processes.remove(&agent_id) {
+        let _ = signal_pid(proc_handle.pid, "TERM");
+        drop(proc_handle);
+        stats.repairs += 1;
+    }
+
+    if agent.cgroup_live_pid_count > 0 {
+        match sentinel_sandbox::cgroups::kill_cgroup_processes(&agent.name) {
+            Ok(killed) if killed > 0 => {
+                stats.repairs += 1;
+            }
+            Ok(_) => {}
+            Err(error) => warn!(
+                agent = %agent.name,
+                error = %error,
+                "Live-Cgroup-PIDs konnten nicht hart beendet werden"
+            ),
+        }
+    }
+
+    let security_removed = ctx
+        .security_runtime_state
+        .write()
+        .map(|mut state| state.remove(&agent.agent_id).is_some())
+        .unwrap_or(false);
+    if security_removed {
+        stats.security_snapshots_removed += 1;
+        stats.repairs += 1;
+    }
+
+    if ctx.runtime_orch.agents().contains_key(&agent_id) {
+        if let Err(error) = ctx.runtime_orch.despawn_agent(agent_id) {
+            warn!(agent_id = %agent_id, error = %error, "Runtime-Despawn bei Reconcile fehlgeschlagen");
+        } else {
+            stats.repairs += 1;
+        }
+    }
+
+    if despawn_agent_from_world(ctx.world, agent_id) {
+        stats.repairs += 1;
+    }
+
+    let cgroup_path = sentinel_sandbox::cgroups::cgroup_path(&agent.name);
+    let cgroup_empty = sentinel_sandbox::cgroups::list_pids_in_cgroup(&agent.name)
+        .map(|pids| pids.is_empty())
+        .unwrap_or(false);
+    if std::path::Path::new(&cgroup_path).exists() && cgroup_empty {
+        match sentinel_sandbox::cgroups::remove_cgroup(&agent.name) {
+            Ok(()) => {
+                stats.orphan_cgroups_removed += 1;
+                stats.repairs += 1;
+            }
+            Err(error) => warn!(
+                agent = %agent.name,
+                error = %error,
+                "Orphan-Cgroup konnte nicht entfernt werden"
+            ),
+        }
+    }
+
+    stats
+}
+
+fn run_runtime_reconcile(
+    ctx: &mut RuntimeReconcileContext<'_>,
+    request: RuntimeReconcileRequest,
+    respawn_backoff: &mut RespawnBackoffTracker,
+) -> RuntimeReconcileResponse {
+    let elapsed_started = std::time::Instant::now();
+    let previous = ctx
+        .runtime_health
+        .read()
+        .ok()
+        .map(|snapshot| snapshot.clone());
+    let before = runtime_health::build_runtime_health_snapshot(
+        ctx.all_agents,
+        ctx.current_shift,
+        ctx.runtime_orch,
+        ctx.sandbox_handles,
+        ctx.agent_processes,
+        ctx.security_runtime_state,
+        ctx.projection_db_path,
+        ctx.operator_auth_required,
+        ctx.service_health_state.clone(),
+        previous.as_ref(),
+    );
+    let expected_agents = agents_for_shift(ctx.all_agents, ctx.current_shift);
+    let expected_ids = expected_agents
+        .iter()
+        .map(|cfg| cfg.identity.id)
+        .collect::<HashSet<_>>();
+    let before_by_id = before
+        .agents
+        .iter()
+        .cloned()
+        .map(|agent| (agent.agent_id, agent))
+        .collect::<HashMap<_, _>>();
+    let projection_drift_before = before.projection_drift_detected;
+
+    let mut security_snapshots_removed = 0usize;
+    let mut unexpected_runtime_removed = 0usize;
+    let mut orphan_cgroups_removed = 0usize;
+    let mut respawned_agents = 0usize;
+    let mut respawn_skipped_backoff = 0usize;
+    let mut respawn_blocked_agents = 0usize;
+    let mut repair_ops_total = 0usize;
+    let mut respawn_failures_added = 0u64;
+    let mut repaired_agents = Vec::new();
+    let mut blocked_agents = Vec::new();
+    let mut errors = Vec::new();
+    let mut agent_status_updates = HashMap::<u16, String>::new();
+    let mut projection_restart_attempted = false;
+    let mut projection_restart_succeeded = false;
+
+    if projection_drift_before && !request.dry_run {
+        let projection_service_active = (ctx.is_service_active_fn)("sentinel-projection");
+        if request.projection_rebuild && projection_service_active {
+            info!(
+                "Projection-Drift erkannt, aber laufender Projection-Service bleibt fuer Rebuild in Ruhe"
+            );
+        } else {
+            projection_restart_attempted = true;
+            if (ctx.restart_service_fn)("sentinel-projection") {
+                projection_restart_succeeded = true;
+                repair_ops_total += 1;
+            } else {
+                errors.push("Projection-Restart fehlgeschlagen".to_string());
+            }
+        }
+    }
+
+    if !request.dry_run {
+        for agent in before.agents.iter().filter(|agent| {
+            let expected_active = expected_ids.contains(&agent.agent_id);
+            !expected_active
+                && (agent.runtime_present
+                    || agent.projection_present
+                    || agent.security_runtime_present
+                    || agent.tracked_pid_alive
+                    || agent.cgroup_live_pid_count > 0)
+        }) {
+            let stats = remove_agent_runtime_fragments(ctx, agent);
+            if stats.repairs > 0 {
+                unexpected_runtime_removed += 1;
+                security_snapshots_removed += stats.security_snapshots_removed;
+                orphan_cgroups_removed += stats.orphan_cgroups_removed;
+                repair_ops_total += stats.repairs;
+                repaired_agents.push(agent.name.clone());
+                agent_status_updates
+                    .insert(agent.agent_id, "unexpected_runtime_cleaned".to_string());
+            }
+            if agent.projection_present
+                && emit_runtime_projection_despawn_event(
+                    ctx.event_store,
+                    AgentId(agent.agent_id),
+                    ctx.tick_count,
+                )
+            {
+                repair_ops_total += 1;
+                repaired_agents.push(agent.name.clone());
+                agent_status_updates.insert(agent.agent_id, "projection_despawned".to_string());
+            }
+        }
+
+        let runtime_agent_names = ctx
+            .runtime_orch
+            .agents()
+            .values()
+            .map(|handle| handle.identity.name.clone())
+            .collect::<HashSet<_>>();
+        if let Ok(entries) = std::fs::read_dir("/sys/fs/cgroup/sentinel") {
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if runtime_agent_names.contains(&name) {
+                    continue;
+                }
+                match sentinel_sandbox::cgroups::list_pids_in_cgroup(&name) {
+                    Ok(pids) if pids.is_empty() => {
+                        if sentinel_sandbox::cgroups::remove_cgroup(&name).is_ok() {
+                            orphan_cgroups_removed += 1;
+                            repair_ops_total += 1;
+                        }
+                    }
+                    Ok(_) => match sentinel_sandbox::cgroups::kill_cgroup_processes(&name) {
+                        Ok(killed) if killed > 0 => {
+                            repair_ops_total += 1;
+                            if sentinel_sandbox::cgroups::remove_cgroup(&name).is_ok() {
+                                orphan_cgroups_removed += 1;
+                                repair_ops_total += 1;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => warn!(
+                            cgroup = %name,
+                            error = %error,
+                            "Orphan-Cgroup-PIDs konnten nicht hart beendet werden"
+                        ),
+                    },
+                    Err(error) => warn!(
+                        cgroup = %name,
+                        error = %error,
+                        "Orphan-Cgroup konnte nicht inspiziert werden"
+                    ),
+                }
+            }
+        }
+    }
+
+    for agent_cfg in &expected_agents {
+        let agent_id = agent_cfg.identity.id;
+        let snapshot = before_by_id.get(&agent_id);
+
+        if let Some(snapshot) = snapshot {
+            let runtime_core_healthy = snapshot.runtime_present
+                && snapshot.tracked_pid_alive
+                && snapshot.cgroup_live_pid_count > 0;
+            if runtime_agent_is_healthy(snapshot) {
+                respawn_backoff.record_success(agent_id);
+                continue;
+            }
+            if runtime_core_healthy && !snapshot.security_runtime_present {
+                if request.dry_run {
+                    agent_status_updates
+                        .insert(agent_id, "security_runtime_restore_planned".to_string());
+                } else {
+                    let tracked_pid = ctx
+                        .sandbox_handles
+                        .get(&AgentId(agent_id))
+                        .and_then(|handle| handle.bwrap_pid)
+                        .or(snapshot.tracked_pid);
+                    record_security_runtime_snapshot(
+                        ctx.security_runtime_state,
+                        AgentId(agent_id),
+                        &agent_cfg.identity.name,
+                        tracked_pid,
+                        ctx.fs_mount,
+                    );
+                    repair_ops_total += 1;
+                    repaired_agents.push(agent_cfg.identity.name.clone());
+                    agent_status_updates.insert(agent_id, "security_runtime_restored".to_string());
+                }
+                respawn_backoff.record_success(agent_id);
+                continue;
+            }
+            if runtime_core_healthy
+                && snapshot.security_runtime_present
+                && !snapshot.projection_present
+            {
+                agent_status_updates.insert(agent_id, "projection_reconcile_pending".to_string());
+                respawn_backoff.record_success(agent_id);
+                continue;
+            }
+        }
+
+        if !request.respawn_missing {
+            continue;
+        }
+
+        match respawn_backoff.decision(agent_id, ctx.tick_count) {
+            RespawnRetryDecision::Blocked => {
+                respawn_blocked_agents += 1;
+                blocked_agents.push(agent_cfg.identity.name.clone());
+                agent_status_updates.insert(agent_id, "repair_blocked".to_string());
+                continue;
+            }
+            RespawnRetryDecision::BackoffActive { .. } => {
+                respawn_skipped_backoff += 1;
+                agent_status_updates.insert(agent_id, "respawn_backoff".to_string());
+                continue;
+            }
+            RespawnRetryDecision::Ready => {}
+        }
+
+        if request.dry_run {
+            agent_status_updates.insert(agent_id, "respawn_planned".to_string());
+            continue;
+        }
+
+        if let Some(snapshot) = snapshot {
+            let stats = remove_agent_runtime_fragments(ctx, snapshot);
+            security_snapshots_removed += stats.security_snapshots_removed;
+            orphan_cgroups_removed += stats.orphan_cgroups_removed;
+            repair_ops_total += stats.repairs;
+        }
+
+        if spawn_agent_full(
+            ctx.runtime_orch,
+            ctx.world,
+            agent_cfg,
+            ctx.sandbox,
+            ctx.sandbox_handles,
+            ctx.ebpf_collector,
+            ctx.agent_processes,
+            ctx.agent_command,
+            ctx.security_runtime_state,
+            ctx.fs_mount,
+        ) {
+            respawned_agents += 1;
+            repair_ops_total += 1;
+            repaired_agents.push(agent_cfg.identity.name.clone());
+            agent_status_updates.insert(agent_id, "respawned".to_string());
+            respawn_backoff.record_success(agent_id);
+        } else {
+            respawn_failures_added += 1;
+            let message = format!("Respawn fehlgeschlagen fuer {}", agent_cfg.identity.name);
+            errors.push(message.clone());
+            match respawn_backoff.record_failure(agent_id, ctx.tick_count) {
+                RespawnRetryDecision::Blocked => {
+                    respawn_blocked_agents += 1;
+                    blocked_agents.push(agent_cfg.identity.name.clone());
+                    agent_status_updates.insert(agent_id, "repair_blocked".to_string());
+                    emit_runtime_repair_blocked_event(
+                        ctx.event_store,
+                        AgentId(agent_id),
+                        &message,
+                        ctx.tick_count,
+                    );
+                }
+                RespawnRetryDecision::BackoffActive { .. } => {
+                    agent_status_updates.insert(agent_id, "respawn_backoff".to_string());
+                }
+                RespawnRetryDecision::Ready => {}
+            }
+        }
+    }
+
+    let projection_rebuild_requested = if request.projection_rebuild && !request.dry_run {
+        let reason = if projection_drift_before {
+            "projection_drift"
+        } else {
+            "manual_request"
+        };
+        match crate::runtime_control::write_projection_rebuild_request(
+            ctx.data_dir,
+            ctx.tick_count,
+            reason,
+        ) {
+            Ok(()) => {
+                repair_ops_total += 1;
+                true
+            }
+            Err(error) => {
+                errors.push(error.to_string());
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    let mut after = runtime_health::build_runtime_health_snapshot(
+        ctx.all_agents,
+        ctx.current_shift,
+        ctx.runtime_orch,
+        ctx.sandbox_handles,
+        ctx.agent_processes,
+        ctx.security_runtime_state,
+        ctx.projection_db_path,
+        ctx.operator_auth_required,
+        ctx.service_health_state.clone(),
+        Some(&before),
+    );
+    after.reconcile_runs_total = before.reconcile_runs_total.saturating_add(1);
+    after.reconcile_repairs_total = before
+        .reconcile_repairs_total
+        .saturating_add(repair_ops_total as u64);
+    after.respawn_failures = before
+        .respawn_failures
+        .saturating_add(respawn_failures_added);
+    after.last_repair_error = errors.last().cloned().or(before.last_repair_error.clone());
+    after.repair_last_status = Some(if request.dry_run {
+        "dry_run".to_string()
+    } else if respawn_blocked_agents > 0 {
+        "repair_blocked".to_string()
+    } else if !errors.is_empty() {
+        "repair_error".to_string()
+    } else if projection_rebuild_requested {
+        "projection_rebuild_requested".to_string()
+    } else if projection_restart_attempted && after.projection_drift_detected {
+        "projection_restart_requested".to_string()
+    } else if repair_ops_total > 0 || projection_rebuild_requested {
+        "repaired".to_string()
+    } else if after.stale_runtime_entries == 0 && after.orphan_cgroups == 0 {
+        "healthy".to_string()
+    } else {
+        "drift_detected".to_string()
+    });
+    for agent in &mut after.agents {
+        if let Some(status) = agent_status_updates.get(&agent.agent_id) {
+            agent.last_repair_status = Some(status.clone());
+        }
+    }
+    if let Ok(mut runtime_health) = ctx.runtime_health.write() {
+        *runtime_health = after.clone();
+    }
+
+    RuntimeReconcileResponse {
+        accepted: true,
+        dry_run: request.dry_run,
+        current_shift: ctx.current_shift,
+        stale_agents_before: before.stale_runtime_entries,
+        stale_agents_after: after.stale_runtime_entries,
+        orphan_cgroups_before: before.orphan_cgroups,
+        orphan_cgroups_after: after.orphan_cgroups,
+        security_snapshots_removed,
+        unexpected_runtime_removed,
+        orphan_cgroups_removed,
+        respawned_agents,
+        respawn_skipped_backoff,
+        respawn_blocked_agents,
+        projection_drift_before,
+        projection_drift_after: after.projection_drift_detected,
+        projection_restart_attempted,
+        projection_restart_succeeded,
+        projection_rebuild_requested,
+        respawn_failures_total: after.respawn_failures,
+        repair_last_status: after
+            .repair_last_status
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        repaired_agents,
+        blocked_agents,
+        errors,
+        elapsed_us: elapsed_started.elapsed().as_micros() as u64,
+    }
+}
+
 fn resolve_platform_analysis_target(
     runtime_orch: &RuntimeOrchestrator,
     target: &str,
@@ -1257,6 +1960,7 @@ fn ecs_tick_loop(
     action_rx: mpsc::Receiver<sentinel_common::AgentAction>,
     operator_rx: mpsc::Receiver<sentinel_common::OperatorCommand>,
     platform_rx: mpsc::Receiver<crate::platform_controlplane::PlatformControlCommand>,
+    runtime_rx: mpsc::Receiver<RuntimeControlCommand>,
     perception_tx: mpsc::SyncSender<Perception>,
     all_agents: Vec<AgentConfig>,
     initial_shift: u8,
@@ -1284,7 +1988,10 @@ fn ecs_tick_loop(
     platform_cp_config: crate::config::PlatformControlplaneConfig,
     events_db_path_str: String,
     platform_state: Arc<RwLock<crate::platform_controlplane::PlatformStateSnapshot>>,
+    runtime_health: crate::runtime_health::SharedRuntimeHealthState,
     security_runtime_state: operator_api::SharedSecurityRuntimeState,
+    projection_db_path: String,
+    operator_auth_required: bool,
     fs_mount: Option<String>,
     fs_layer: Option<Arc<sentinel_fs::layer::LayerManager>>,
     #[cfg(feature = "llm")]
@@ -1313,6 +2020,7 @@ fn ecs_tick_loop(
         platform_cp_config_clone.monitored_services.clone(),
         std::time::Duration::from_secs(platform_cp_config_clone.service_check_interval_secs),
     );
+    let mut respawn_backoff = RespawnBackoffTracker::new(3);
 
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
@@ -1784,6 +2492,248 @@ fn ecs_tick_loop(
             }
         }
 
+        while let Ok(command) = runtime_rx.try_recv() {
+            match command {
+                RuntimeControlCommand::Reconcile {
+                    request,
+                    response_tx,
+                } => {
+                    let projection_path = std::path::Path::new(&projection_db_path);
+                    let data_dir = projection_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    let mut reconcile_ctx = RuntimeReconcileContext {
+                        tick_count,
+                        current_shift,
+                        all_agents: &all_agents,
+                        world: &mut world,
+                        runtime_orch: &mut runtime_orch,
+                        sandbox: &sandbox,
+                        sandbox_handles: &mut sandbox_handles,
+                        ebpf_collector: &mut ebpf_collector,
+                        agent_processes: &mut agent_processes,
+                        agent_command: &agent_command,
+                        security_runtime_state: &security_runtime_state,
+                        event_store: &event_store_for_prune,
+                        runtime_health: &runtime_health,
+                        projection_db_path: projection_path,
+                        operator_auth_required,
+                        service_health_state: service_health_checker.worker_state(),
+                        fs_mount: fs_mount.as_deref(),
+                        data_dir,
+                        restart_service_fn: crate::service_health::restart_service_now,
+                        is_service_active_fn: crate::service_health::is_service_active_now,
+                    };
+                    let response =
+                        run_runtime_reconcile(&mut reconcile_ctx, request, &mut respawn_backoff);
+                    let _ = response_tx.send(response);
+                }
+                RuntimeControlCommand::AnalysisFloodTest {
+                    request,
+                    response_tx,
+                } => {
+                    let enqueue_started = std::time::Instant::now();
+                    for _ in 0..request.count {
+                        platform_cp.enqueue_control_command(
+                            crate::platform_controlplane::PlatformControlCommand::AnalyzeNow,
+                        );
+                    }
+
+                    #[cfg(feature = "llm")]
+                    for idx in 0..request.count {
+                        let synthetic = crate::platform_controlplane::PlatformAnalysisRequest {
+                            trigger: format!("flood_test_{idx}"),
+                            tick: tick_count,
+                            metrics: crate::platform_controlplane::metrics::PlatformMetrics {
+                                tick: tick_count,
+                                ..Default::default()
+                            },
+                            verify_results: HashMap::new(),
+                            failed_interventions: Vec::new(),
+                        };
+                        let _ = platform_llm_analyzer.enqueue(synthetic);
+                    }
+
+                    let mut stats = platform_cp.analysis_queue_stats();
+                    #[cfg(feature = "llm")]
+                    {
+                        let analyzer_stats = platform_llm_analyzer.queue_stats();
+                        stats.depth = stats.depth.saturating_add(analyzer_stats.depth);
+                        stats.dropped_total = stats
+                            .dropped_total
+                            .saturating_add(analyzer_stats.dropped_total);
+                        stats.coalesced_total = stats
+                            .coalesced_total
+                            .saturating_add(analyzer_stats.coalesced_total);
+                    }
+
+                    let note = if cfg!(feature = "llm") {
+                        "bounded controlplane and analyzer queues exercised"
+                    } else {
+                        "bounded controlplane queue exercised; llm feature disabled"
+                    };
+                    let enqueue_elapsed_ns = enqueue_started.elapsed().as_nanos() as u64;
+                    let _ = response_tx.send(RuntimeAnalysisFloodTestResponse {
+                        accepted: true,
+                        requested: request.count,
+                        queue_depth: stats.depth,
+                        dropped_total: stats.dropped_total,
+                        coalesced_total: stats.coalesced_total,
+                        enqueue_elapsed_us: enqueue_elapsed_ns / 1_000,
+                        enqueue_per_request_ns: enqueue_elapsed_ns
+                            / u64::from(request.count.max(1)),
+                        note: note.to_string(),
+                    });
+                }
+                RuntimeControlCommand::PanicTest {
+                    request,
+                    response_tx,
+                } => {
+                    let response = if request.worker == "service_health" {
+                        if service_health_checker.trigger_panic_test() {
+                            info!(
+                                worker = %request.worker,
+                                "panic test triggered fuer Worker"
+                            );
+                            RuntimePanicTestResponse {
+                                accepted: true,
+                                worker: request.worker,
+                                note: "panic-test dispatched".to_string(),
+                            }
+                        } else {
+                            RuntimePanicTestResponse {
+                                accepted: false,
+                                worker: request.worker,
+                                note: "service_health control channel unavailable".to_string(),
+                            }
+                        }
+                    } else {
+                        RuntimePanicTestResponse {
+                            accepted: false,
+                            worker: request.worker,
+                            note: "worker unsupported".to_string(),
+                        }
+                    };
+                    let _ = response_tx.send(response);
+                }
+                RuntimeControlCommand::StallRestartTest {
+                    request,
+                    response_tx,
+                } => {
+                    let agent_id = AgentId(request.agent_id);
+                    let response = match all_agents
+                        .iter()
+                        .find(|cfg| cfg.identity.id == request.agent_id)
+                    {
+                        Some(agent_cfg) => {
+                            let bookkeeping_started = std::time::Instant::now();
+                            let pid_before = tracked_pid_for_agent(
+                                agent_id,
+                                &sandbox_handles,
+                                &agent_processes,
+                                &security_runtime_state,
+                            );
+                            let bookkeeping_elapsed_ns =
+                                bookkeeping_started.elapsed().as_nanos() as u64;
+                            let pre_suspend_result = match request.mode.as_str() {
+                                "sigstop" => suspend_agent_cgroup_processes(
+                                    &agent_cfg.identity.name,
+                                    pid_before,
+                                )
+                                .map(|_| ()),
+                                "direct" => Ok(()),
+                                _ => Err(anyhow!("unbekannter stall-restart-test mode")),
+                            };
+
+                            match pre_suspend_result.and_then(|_| {
+                                restart_agent_fast_path(
+                                    &mut world,
+                                    &mut runtime_orch,
+                                    agent_cfg,
+                                    &sandbox,
+                                    &mut sandbox_handles,
+                                    &mut ebpf_collector,
+                                    &mut agent_processes,
+                                    &agent_command,
+                                    &security_runtime_state,
+                                    fs_mount.as_deref(),
+                                )
+                            }) {
+                                Ok(result) => {
+                                    info!(
+                                        agent_id = %agent_id,
+                                        mode = %request.mode,
+                                        stall_secs = request.stall_secs,
+                                        pid_before = ?result.pid_before,
+                                        pid_after = ?result.pid_after,
+                                        "Deterministischer Stall-Restart-Test ausgefuehrt"
+                                    );
+                                    RuntimeStallRestartTestResponse {
+                                        accepted: true,
+                                        agent_id: request.agent_id,
+                                        aggregate_id: format!("AGENT-{:02}", request.agent_id),
+                                        agent_name: result.agent_name,
+                                        mode: request.mode,
+                                        stall_secs: request.stall_secs,
+                                        pid_before: result.pid_before,
+                                        pid_after: result.pid_after,
+                                        runtime_present_after: result.runtime_present_after,
+                                        security_runtime_present_after: result
+                                            .security_runtime_present_after,
+                                        bookkeeping_elapsed_ns,
+                                        note: "fast_path_restart_executed_without_shift_wait"
+                                            .to_string(),
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        agent_id = %agent_id,
+                                        mode = %request.mode,
+                                        error = %error,
+                                        "Stall-Restart-Test fehlgeschlagen"
+                                    );
+                                    RuntimeStallRestartTestResponse {
+                                        accepted: false,
+                                        agent_id: request.agent_id,
+                                        aggregate_id: format!("AGENT-{:02}", request.agent_id),
+                                        agent_name: agent_cfg.identity.name.clone(),
+                                        mode: request.mode,
+                                        stall_secs: request.stall_secs,
+                                        pid_before,
+                                        pid_after: None,
+                                        runtime_present_after: runtime_orch
+                                            .agents()
+                                            .contains_key(&agent_id),
+                                        security_runtime_present_after: security_runtime_state
+                                            .read()
+                                            .map(|state| state.contains_key(&request.agent_id))
+                                            .unwrap_or(false),
+                                        bookkeeping_elapsed_ns,
+                                        note: error.to_string(),
+                                    }
+                                }
+                            }
+                        }
+                        None => RuntimeStallRestartTestResponse {
+                            accepted: false,
+                            agent_id: request.agent_id,
+                            aggregate_id: format!("AGENT-{:02}", request.agent_id),
+                            agent_name: String::new(),
+                            mode: request.mode,
+                            stall_secs: request.stall_secs,
+                            pid_before: None,
+                            pid_after: None,
+                            runtime_present_after: false,
+                            security_runtime_present_after: false,
+                            bookkeeping_elapsed_ns: 0,
+                            note: "agent_id unbekannt".to_string(),
+                        },
+                    };
+                    let _ = response_tx.send(response);
+                }
+            }
+        }
+
         // Platform-Controlplane: Self-Healing (alle N Ticks)
         if sentinel_common::feature_flags::RuntimeFlags::global().platform_controlplane_enabled
             && platform_cp.should_run(tick_count)
@@ -1877,30 +2827,37 @@ fn ecs_tick_loop(
                     }
                     crate::platform_controlplane::rules::PlatformSideEffect::RestartAgent(
                         agent_id,
-                    ) => {
-                        // Sandbox teardown
-                        if let Some(handle) = sandbox_handles.remove(&agent_id) {
-                            if handle.cgroup_created {
-                                if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
-                                    ebpf_collector.unregister_agent(cid);
-                                }
-                            }
-                            if let Err(e) = sandbox.teardown_agent(&handle) {
-                                warn!(agent_id = %agent_id, error = %e,
-                                    "Sandbox teardown bei Stall-Restart fehlgeschlagen");
-                            }
-                        }
-                        // Agent-Prozess droppen
-                        agent_processes.remove(&agent_id);
-                        remove_security_runtime_snapshot(&security_runtime_state, agent_id);
-                        // ECS Entity despawnen
-                        despawn_agent_from_world(&mut world, agent_id);
-                        // RuntimeOrchestrator despawn
-                        let _ = runtime_orch.despawn_agent(agent_id);
-                        // Respawn bei naechstem Shift-Check
-                        info!(agent_id = %agent_id,
-                            "Agent nach Stall restartet (despawned, Respawn bei naechstem Shift-Check)");
-                    }
+                    ) => match all_agents.iter().find(|cfg| cfg.identity.id == agent_id.0) {
+                        Some(agent_cfg) => match restart_agent_fast_path(
+                            &mut world,
+                            &mut runtime_orch,
+                            agent_cfg,
+                            &sandbox,
+                            &mut sandbox_handles,
+                            &mut ebpf_collector,
+                            &mut agent_processes,
+                            &agent_command,
+                            &security_runtime_state,
+                            fs_mount.as_deref(),
+                        ) {
+                            Ok(result) => info!(
+                                agent_id = %agent_id,
+                                agent = %result.agent_name,
+                                pid_before = ?result.pid_before,
+                                pid_after = ?result.pid_after,
+                                "Agent nach Stall sofort via Fast-Respawn wiederhergestellt"
+                            ),
+                            Err(error) => warn!(
+                                agent_id = %agent_id,
+                                error = %error,
+                                "Fast-Respawn nach Stall fehlgeschlagen"
+                            ),
+                        },
+                        None => warn!(
+                            agent_id = %agent_id,
+                            "Agent-Konfiguration fuer Stall-Restart nicht gefunden"
+                        ),
+                    },
                     crate::platform_controlplane::rules::PlatformSideEffect::RestartService(
                         service_name,
                     ) => {
@@ -1928,6 +2885,33 @@ fn ecs_tick_loop(
             &platform_cp,
             &runtime_orch,
             &resource_manager,
+        );
+        let mut analysis_queue_stats = platform_cp.analysis_queue_stats();
+        #[cfg(feature = "llm")]
+        {
+            let analyzer_stats = platform_llm_analyzer.queue_stats();
+            analysis_queue_stats.depth = analysis_queue_stats
+                .depth
+                .saturating_add(analyzer_stats.depth);
+            analysis_queue_stats.dropped_total = analysis_queue_stats
+                .dropped_total
+                .saturating_add(analyzer_stats.dropped_total);
+            analysis_queue_stats.coalesced_total = analysis_queue_stats
+                .coalesced_total
+                .saturating_add(analyzer_stats.coalesced_total);
+        }
+        runtime_health::publish_runtime_health_snapshot(
+            &runtime_health,
+            &all_agents,
+            current_shift,
+            &runtime_orch,
+            &sandbox_handles,
+            &agent_processes,
+            &security_runtime_state,
+            std::path::Path::new(&projection_db_path),
+            operator_auth_required,
+            service_health_checker.worker_state(),
+            analysis_queue_stats,
         );
 
         // Prune: Empfange Cutoff von Operator-API, arbeite 1 Batch/Tick ab
@@ -3022,14 +4006,41 @@ mod tests {
     use sentinel_common::{DomainEventPayload, EventType, OperatorChaosCommand, OperatorCommand};
     use sentinel_ebpf::loader::MonitoringMode;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_projection_restart(_service_name: &str) -> bool {
+        PROJECTION_RESTART_CALLS.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    fn projection_service_active(_service_name: &str) -> bool {
+        true
+    }
 
     /// Erstellt EbpfCollector + tokio mpsc Sender fuer Tests (Userspace mode, kein tokio noetig).
     fn test_ebpf() -> (EbpfCollector, tokio::sync::mpsc::Sender<MetricsSnapshot>) {
         let collector = EbpfCollector::new(MonitoringMode::Userspace);
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         (collector, tx)
+    }
+
+    #[test]
+    fn mountinfo_contains_mountpoint_matches_exact_sentinel_fuse_mount() {
+        let mountinfo = "\
+35 23 0:33 / / rw,relatime - overlay overlay rw\n\
+92 35 0:56 / /opt/sentinel/fs rw,nosuid,nodev - fuse sentinel-fs rw,user_id=0\n";
+
+        assert!(mountinfo_contains_mountpoint(
+            mountinfo,
+            std::path::Path::new("/opt/sentinel/fs")
+        ));
+        assert!(!mountinfo_contains_mountpoint(
+            mountinfo,
+            std::path::Path::new("/opt/sentinel/fs-missing")
+        ));
     }
 
     fn test_controlplane(tmp: &tempfile::TempDir) -> ControlplaneKernel {
@@ -3103,6 +4114,151 @@ mod tests {
     }
 
     #[test]
+    fn test_restart_agent_fast_path_recreates_runtime_and_security_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.db");
+        let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
+
+        let mut runtime_orch = RuntimeOrchestrator::new(10).with_event_store(event_store);
+        let (mut world, _schedule) = create_simulation_world();
+        let sandbox = test_sandbox();
+        let (mut ebpf_collector, _ebpf_tx) = test_ebpf();
+        let mut sandbox_handles = HashMap::new();
+        let mut agent_processes = HashMap::new();
+        let security_runtime_state = Arc::new(RwLock::new(HashMap::new()));
+        let agent_cfg = test_agent_config(1, "Test Agent", "Tester", 1);
+        let agent_command = vec!["true".to_string()];
+
+        assert!(spawn_agent_full(
+            &mut runtime_orch,
+            &mut world,
+            &agent_cfg,
+            &sandbox,
+            &mut sandbox_handles,
+            &mut ebpf_collector,
+            &mut agent_processes,
+            &agent_command,
+            &security_runtime_state,
+            None,
+        ));
+
+        let before_pid = tracked_pid_for_agent(
+            AgentId(1),
+            &sandbox_handles,
+            &agent_processes,
+            &security_runtime_state,
+        );
+        let result = restart_agent_fast_path(
+            &mut world,
+            &mut runtime_orch,
+            &agent_cfg,
+            &sandbox,
+            &mut sandbox_handles,
+            &mut ebpf_collector,
+            &mut agent_processes,
+            &agent_command,
+            &security_runtime_state,
+            None,
+        )
+        .expect("fast restart");
+
+        assert_eq!(result.agent_name, "Test Agent");
+        assert_eq!(result.pid_before, before_pid);
+        assert!(result.runtime_present_after);
+        assert!(result.security_runtime_present_after);
+        assert!(runtime_orch.agents().contains_key(&AgentId(1)));
+        assert!(security_runtime_state.read().unwrap().contains_key(&1));
+        assert_eq!(runtime_orch.agent_count(), 1);
+        if let (Some(pid_before), Some(pid_after)) = (result.pid_before, result.pid_after) {
+            assert_ne!(
+                pid_before, pid_after,
+                "Fast-Restart sollte einen neuen PID liefern"
+            );
+        }
+    }
+
+    #[test]
+    fn test_runtime_reconcile_skips_projection_restart_when_rebuild_can_run_in_place() {
+        PROJECTION_RESTART_CALLS.store(0, Ordering::SeqCst);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.db");
+        let projection_path = tmp.path().join("projection.db");
+        let rebuild_request_path = tmp.path().join(".projection-rebuild-request");
+        let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
+        let projection_store =
+            sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap();
+        {
+            let txn = projection_store.begin_transaction().unwrap();
+            txn.begin().unwrap();
+            txn.upsert_agent(7, "Projection Ghost", "Tester", 1, "active", 1)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        drop(projection_store);
+
+        let (mut world, _schedule) = create_simulation_world();
+        let sandbox = test_sandbox();
+        let (mut ebpf_collector, _ebpf_tx) = test_ebpf();
+        let mut runtime_orch =
+            RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
+        let mut sandbox_handles = HashMap::new();
+        let mut agent_processes = HashMap::new();
+        let security_runtime_state = Arc::new(RwLock::new(HashMap::new()));
+        let runtime_health = Arc::new(RwLock::new(
+            crate::runtime_health::RuntimeHealthSnapshot::default(),
+        ));
+        let mut respawn_backoff = RespawnBackoffTracker::new(3);
+        let mut reconcile_ctx = RuntimeReconcileContext {
+            tick_count: 123,
+            current_shift: 1,
+            all_agents: &[],
+            world: &mut world,
+            runtime_orch: &mut runtime_orch,
+            sandbox: &sandbox,
+            sandbox_handles: &mut sandbox_handles,
+            ebpf_collector: &mut ebpf_collector,
+            agent_processes: &mut agent_processes,
+            agent_command: &[],
+            security_runtime_state: &security_runtime_state,
+            event_store: &event_store,
+            runtime_health: &runtime_health,
+            projection_db_path: &projection_path,
+            operator_auth_required: false,
+            service_health_state: crate::service_health::ServiceHealthWorkerSnapshot::default(),
+            fs_mount: None,
+            data_dir: tmp.path(),
+            restart_service_fn: record_projection_restart,
+            is_service_active_fn: projection_service_active,
+        };
+
+        let response = run_runtime_reconcile(
+            &mut reconcile_ctx,
+            RuntimeReconcileRequest {
+                dry_run: false,
+                projection_rebuild: true,
+                respawn_missing: false,
+            },
+            &mut respawn_backoff,
+        );
+
+        assert!(response.projection_drift_before);
+        assert!(!response.projection_restart_attempted);
+        assert!(!response.projection_restart_succeeded);
+        assert!(response.projection_rebuild_requested);
+        assert_eq!(PROJECTION_RESTART_CALLS.load(Ordering::SeqCst), 0);
+        assert!(rebuild_request_path.exists());
+        let events = event_store.get_events_since(0, 100).unwrap();
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == "agent_despawned"
+                    && event.payload.contains("runtime_reconcile_projection_only")
+            }),
+            "Projection-only Ghost-Agent muss als Despawn-Event in den append-only Truth-Stream"
+        );
+    }
+
+    #[test]
     fn test_ecs_tick_loop_shutdown_immediate() {
         // Shutdown sofort setzen -> Loop sollte nach 0 Ticks beenden
         let shutdown = Arc::new(AtomicBool::new(true));
@@ -3129,6 +4285,7 @@ mod tests {
             rx,
             operator_rx,
             mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
+            mpsc::channel::<RuntimeControlCommand>().1,
             ptx,
             vec![],
             1,
@@ -3158,7 +4315,12 @@ mod tests {
             Arc::new(RwLock::new(
                 crate::platform_controlplane::PlatformStateSnapshot::default(),
             )),
+            Arc::new(RwLock::new(
+                crate::runtime_health::RuntimeHealthSnapshot::default(),
+            )),
             Arc::new(RwLock::new(HashMap::new())),
+            String::new(),
+            false,
             None,
             None,
             #[cfg(feature = "llm")]
@@ -3206,6 +4368,7 @@ mod tests {
                 rx,
                 operator_rx,
                 mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
+                mpsc::channel::<RuntimeControlCommand>().1,
                 ptx,
                 all_agents,
                 1,
@@ -3235,7 +4398,12 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::platform_controlplane::PlatformStateSnapshot::default(),
                 )),
+                Arc::new(RwLock::new(
+                    crate::runtime_health::RuntimeHealthSnapshot::default(),
+                )),
                 Arc::new(RwLock::new(HashMap::new())),
+                String::new(),
+                false,
                 None,
                 None,
                 #[cfg(feature = "llm")]
@@ -3300,6 +4468,7 @@ mod tests {
                 rx,
                 operator_rx,
                 mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
+                mpsc::channel::<RuntimeControlCommand>().1,
                 ptx,
                 all_agents,
                 1,
@@ -3329,7 +4498,12 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::platform_controlplane::PlatformStateSnapshot::default(),
                 )),
+                Arc::new(RwLock::new(
+                    crate::runtime_health::RuntimeHealthSnapshot::default(),
+                )),
                 Arc::new(RwLock::new(HashMap::new())),
+                String::new(),
+                false,
                 None,
                 None,
                 #[cfg(feature = "llm")]
@@ -3402,6 +4576,7 @@ mod tests {
                 rx,
                 operator_rx,
                 mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
+                mpsc::channel::<RuntimeControlCommand>().1,
                 ptx,
                 all_agents,
                 1,
@@ -3431,7 +4606,12 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::platform_controlplane::PlatformStateSnapshot::default(),
                 )),
+                Arc::new(RwLock::new(
+                    crate::runtime_health::RuntimeHealthSnapshot::default(),
+                )),
                 Arc::new(RwLock::new(HashMap::new())),
+                String::new(),
+                false,
                 None,
                 None,
                 #[cfg(feature = "llm")]

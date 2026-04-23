@@ -12,7 +12,7 @@ pub mod rules;
 pub mod verify;
 
 use anyhow::{anyhow, Context, Result};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use sentinel_common::{DomainEvent, DomainEventPayload};
 use sentinel_limbo::EventStore;
@@ -138,7 +138,14 @@ pub struct PlatformCycleOutput {
     pub analysis_requests: Vec<PlatformAnalysisRequest>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalysisQueueStats {
+    pub depth: usize,
+    pub dropped_total: u64,
+    pub coalesced_total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum QueuedAnalysisTrigger {
     Manual,
     Test(PlatformTriggerTestCommand),
@@ -152,7 +159,9 @@ pub struct PlatformControlplane {
     write_rate_baselines: HashMap<String, f64>,
     unresolved_counts: HashMap<String, u32>,
     failed_interventions: Vec<FailedIntervention>,
-    queued_analysis_triggers: Vec<QueuedAnalysisTrigger>,
+    queued_analysis_triggers: VecDeque<QueuedAnalysisTrigger>,
+    analysis_queue_dropped_total: u64,
+    analysis_queue_coalesced_total: u64,
     last_analysis_tick: Option<u64>,
     last_analysis_trigger: Option<String>,
     last_scheduled_analysis_tick: Option<u64>,
@@ -168,7 +177,9 @@ impl PlatformControlplane {
             write_rate_baselines: HashMap::new(),
             unresolved_counts: HashMap::new(),
             failed_interventions: Vec::new(),
-            queued_analysis_triggers: Vec::new(),
+            queued_analysis_triggers: VecDeque::new(),
+            analysis_queue_dropped_total: 0,
+            analysis_queue_coalesced_total: 0,
             last_analysis_tick: None,
             last_analysis_trigger: None,
             last_scheduled_analysis_tick: None,
@@ -184,13 +195,21 @@ impl PlatformControlplane {
     /// Queue fuer manuelle oder deterministische Test-Trigger.
     pub fn enqueue_control_command(&mut self, command: PlatformControlCommand) {
         match command {
-            PlatformControlCommand::AnalyzeNow => self
-                .queued_analysis_triggers
-                .push(QueuedAnalysisTrigger::Manual),
-            PlatformControlCommand::TriggerTest(command) => self
-                .queued_analysis_triggers
-                .push(QueuedAnalysisTrigger::Test(command)),
+            PlatformControlCommand::AnalyzeNow => {
+                self.enqueue_analysis_trigger(QueuedAnalysisTrigger::Manual)
+            }
+            PlatformControlCommand::TriggerTest(command) => {
+                self.enqueue_analysis_trigger(QueuedAnalysisTrigger::Test(command))
+            }
             PlatformControlCommand::ApplyAnalysis(_) => {}
+        }
+    }
+
+    pub fn analysis_queue_stats(&self) -> AnalysisQueueStats {
+        AnalysisQueueStats {
+            depth: self.queued_analysis_triggers.len(),
+            dropped_total: self.analysis_queue_dropped_total,
+            coalesced_total: self.analysis_queue_coalesced_total,
         }
     }
 
@@ -216,6 +235,21 @@ impl PlatformControlplane {
 
     pub fn last_scheduled_analysis_tick(&self) -> Option<u64> {
         self.last_scheduled_analysis_tick
+    }
+
+    fn enqueue_analysis_trigger(&mut self, trigger: QueuedAnalysisTrigger) {
+        if self.queued_analysis_triggers.contains(&trigger) {
+            self.analysis_queue_coalesced_total =
+                self.analysis_queue_coalesced_total.saturating_add(1);
+            return;
+        }
+
+        let capacity = self.config.llm_trigger_queue_capacity.max(1);
+        if self.queued_analysis_triggers.len() >= capacity {
+            self.queued_analysis_triggers.pop_front();
+            self.analysis_queue_dropped_total = self.analysis_queue_dropped_total.saturating_add(1);
+        }
+        self.queued_analysis_triggers.push_back(trigger);
     }
 
     pub fn apply_threshold_override(&mut self, key: &str, value: serde_json::Value) -> Result<()> {
@@ -739,6 +773,46 @@ mod tests {
         assert_eq!(output.analysis_requests[0].trigger, "manual");
         assert_eq!(cp.last_analysis_trigger(), Some("manual"));
         assert_eq!(cp.last_analysis_tick(), Some(1));
+    }
+
+    #[test]
+    fn test_manual_trigger_queue_coalesces_duplicates() {
+        let mut cp = PlatformControlplane::new(PlatformControlplaneConfig {
+            llm_trigger_queue_capacity: 16,
+            ..PlatformControlplaneConfig::default()
+        });
+
+        cp.enqueue_control_command(PlatformControlCommand::AnalyzeNow);
+        cp.enqueue_control_command(PlatformControlCommand::AnalyzeNow);
+
+        let stats = cp.analysis_queue_stats();
+        assert_eq!(stats.depth, 1);
+        assert_eq!(stats.dropped_total, 0);
+        assert_eq!(stats.coalesced_total, 1);
+    }
+
+    #[test]
+    fn test_test_trigger_queue_drops_when_capacity_is_exceeded() {
+        let mut cp = PlatformControlplane::new(PlatformControlplaneConfig {
+            llm_trigger_queue_capacity: 2,
+            ..PlatformControlplaneConfig::default()
+        });
+
+        for idx in 0..3 {
+            cp.enqueue_control_command(PlatformControlCommand::TriggerTest(
+                PlatformTriggerTestCommand {
+                    trigger: format!("manual_{idx}"),
+                    rule_name: None,
+                    target: None,
+                    count: None,
+                },
+            ));
+        }
+
+        let stats = cp.analysis_queue_stats();
+        assert_eq!(stats.depth, 2);
+        assert_eq!(stats.dropped_total, 1);
+        assert_eq!(stats.coalesced_total, 0);
     }
 
     #[test]

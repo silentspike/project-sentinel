@@ -31,6 +31,11 @@ use crate::platform_controlplane::{
     PlatformAnalysisCommand, PlatformControlCommand, PlatformStateSnapshot,
     PlatformTriggerTestCommand,
 };
+use crate::runtime_control::{
+    RuntimeAnalysisFloodTestRequest, RuntimeAnalysisFloodTestResponse, RuntimeControlCommand,
+    RuntimePanicTestRequest, RuntimePanicTestResponse, RuntimeReconcileRequest,
+    RuntimeReconcileResponse, RuntimeStallRestartTestRequest, RuntimeStallRestartTestResponse,
+};
 
 const OPERATOR_CHAOS_PATH: &str = "/operator/chaos";
 const OPERATOR_STIMULUS_PATH: &str = "/operator/stimulus";
@@ -46,6 +51,11 @@ const OPERATOR_PLATFORM_ANALYZE_PATH: &str = "/operator/platform-analyze";
 const OPERATOR_PLATFORM_TRIGGER_TEST_PATH: &str = "/operator/platform-trigger-test";
 const OPERATOR_PLATFORM_ANALYSIS_TEST_PATH: &str = "/operator/platform-analysis-test";
 const OPERATOR_PLATFORM_STATE_PATH: &str = "/operator/platform-state";
+const OPERATOR_RUNTIME_HEALTH_PATH: &str = "/operator/runtime-health";
+const OPERATOR_RUNTIME_RECONCILE_PATH: &str = "/operator/runtime/reconcile";
+const OPERATOR_RUNTIME_ANALYSIS_FLOOD_TEST_PATH: &str = "/operator/runtime/analysis-flood-test";
+const OPERATOR_RUNTIME_PANIC_TEST_PATH: &str = "/operator/runtime/panic-test";
+const OPERATOR_RUNTIME_STALL_RESTART_TEST_PATH: &str = "/operator/runtime/stall-restart-test";
 const OPERATOR_APICP_SNAPSHOT_PATH: &str = "/operator/apicp/snapshot";
 const OPERATOR_SECURITY_FS_TRASH_PATH: &str = "/operator/security/fs-trash";
 const OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH: &str = "/operator/security/fs-trash-fixture";
@@ -274,6 +284,7 @@ struct AppState {
     fs_layer: Option<Arc<LayerManager>>,
     command_tx: mpsc::Sender<OperatorCommand>,
     platform_tx: mpsc::Sender<PlatformControlCommand>,
+    runtime_tx: mpsc::Sender<RuntimeControlCommand>,
     nightrun_tx: mpsc::Sender<OperatorNightrunCommand>,
     snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
@@ -281,6 +292,7 @@ struct AppState {
     prune_tx: mpsc::Sender<i64>,
     state_store: Arc<StateStore>,
     platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
+    runtime_health: crate::runtime_health::SharedRuntimeHealthState,
     security_runtime_state: SharedSecurityRuntimeState,
 }
 
@@ -360,6 +372,7 @@ pub async fn start_server(
     allowed_rooms: Vec<String>,
     command_tx: mpsc::Sender<OperatorCommand>,
     platform_tx: mpsc::Sender<PlatformControlCommand>,
+    runtime_tx: mpsc::Sender<RuntimeControlCommand>,
     nightrun_tx: mpsc::Sender<OperatorNightrunCommand>,
     snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
@@ -367,6 +380,7 @@ pub async fn start_server(
     prune_tx: mpsc::Sender<i64>,
     state_store: Arc<sentinel_redb::StateStore>,
     platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
+    runtime_health: crate::runtime_health::SharedRuntimeHealthState,
     security_runtime_state: SharedSecurityRuntimeState,
 ) -> AnyResult<tokio::task::JoinHandle<()>> {
     let listener = TcpListener::bind(&config.bind_addr)
@@ -381,6 +395,7 @@ pub async fn start_server(
         fs_layer,
         command_tx,
         platform_tx,
+        runtime_tx,
         nightrun_tx,
         snapshot_tx,
         restore_tx,
@@ -388,6 +403,7 @@ pub async fn start_server(
         prune_tx,
         state_store,
         platform_state,
+        runtime_health,
         security_runtime_state,
     };
 
@@ -431,7 +447,7 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
 
     // GET-Endpoints ohne Auth (read-only)
     if request.method == "GET" {
-        if (path_only == OPERATOR_APICP_SNAPSHOT_PATH || is_security_path(path_only))
+        if is_protected_read_path(path_only)
             && !is_authorized(&request.headers, state.shared_secret.as_deref())
         {
             return ApiError::Unauthorized.to_response();
@@ -464,6 +480,12 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Ok(snapshot) => json_response(200, snapshot.clone()),
                 Err(_) => {
                     ApiError::ServiceUnavailable("Platform-State nicht verfuegbar").to_response()
+                }
+            },
+            OPERATOR_RUNTIME_HEALTH_PATH => match state.runtime_health.read() {
+                Ok(snapshot) => json_response(200, snapshot.clone()),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Runtime-Health nicht verfuegbar").to_response()
                 }
             },
             OPERATOR_SECURITY_FS_TRASH_PATH => match inspect_fs_trash(query.get("hash"), state) {
@@ -684,6 +706,52 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
             };
             match dispatch_platform_analysis_test(payload, state) {
                 Ok(response) => json_response(202, response),
+                Err(err) => err.to_response(),
+            }
+        }
+        OPERATOR_RUNTIME_RECONCILE_PATH => {
+            let payload: RuntimeReconcileRequest =
+                serde_json::from_slice(&request.body).unwrap_or_default();
+            match dispatch_runtime_reconcile(payload, state) {
+                Ok(response) => json_response(200, response),
+                Err(err) => err.to_response(),
+            }
+        }
+        OPERATOR_RUNTIME_ANALYSIS_FLOOD_TEST_PATH => {
+            let payload: RuntimeAnalysisFloodTestRequest =
+                match serde_json::from_slice(&request.body) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                    }
+                };
+            match dispatch_runtime_analysis_flood_test(payload, state) {
+                Ok(response) => json_response(200, response),
+                Err(err) => err.to_response(),
+            }
+        }
+        OPERATOR_RUNTIME_PANIC_TEST_PATH => {
+            let payload: RuntimePanicTestRequest = match serde_json::from_slice(&request.body) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                }
+            };
+            match dispatch_runtime_panic_test(payload, state) {
+                Ok(response) => json_response(200, response),
+                Err(err) => err.to_response(),
+            }
+        }
+        OPERATOR_RUNTIME_STALL_RESTART_TEST_PATH => {
+            let payload: RuntimeStallRestartTestRequest =
+                match serde_json::from_slice(&request.body) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                    }
+                };
+            match dispatch_runtime_stall_restart_test(payload, state) {
+                Ok(response) => json_response(200, response),
                 Err(err) => err.to_response(),
             }
         }
@@ -1065,6 +1133,100 @@ fn dispatch_platform_analysis_test(
     })
 }
 
+fn dispatch_runtime_reconcile(
+    payload: RuntimeReconcileRequest,
+    state: &AppState,
+) -> std::result::Result<RuntimeReconcileResponse, ApiError> {
+    let (response_tx, response_rx) = mpsc::sync_channel(1);
+    state
+        .runtime_tx
+        .send(RuntimeControlCommand::Reconcile {
+            request: payload,
+            response_tx,
+        })
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-Control-Channel nicht verfuegbar"))?;
+    response_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-Reconcile Timeout"))
+}
+
+fn dispatch_runtime_analysis_flood_test(
+    payload: RuntimeAnalysisFloodTestRequest,
+    state: &AppState,
+) -> std::result::Result<RuntimeAnalysisFloodTestResponse, ApiError> {
+    if payload.count == 0 {
+        return Err(ApiError::BadRequest("count muss > 0 sein"));
+    }
+
+    let (response_tx, response_rx) = mpsc::sync_channel(1);
+    state
+        .runtime_tx
+        .send(RuntimeControlCommand::AnalysisFloodTest {
+            request: payload,
+            response_tx,
+        })
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-Control-Channel nicht verfuegbar"))?;
+    response_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-Analysis-Flood-Test Timeout"))
+}
+
+fn dispatch_runtime_panic_test(
+    mut payload: RuntimePanicTestRequest,
+    state: &AppState,
+) -> std::result::Result<RuntimePanicTestResponse, ApiError> {
+    payload.worker = payload.worker.trim().to_ascii_lowercase();
+    if payload.worker.is_empty() {
+        return Err(ApiError::BadRequest("worker fehlt"));
+    }
+    if payload.worker != "service_health" {
+        return Err(ApiError::BadRequest("worker muss service_health sein"));
+    }
+
+    let (response_tx, response_rx) = mpsc::sync_channel(1);
+    state
+        .runtime_tx
+        .send(RuntimeControlCommand::PanicTest {
+            request: payload,
+            response_tx,
+        })
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-Control-Channel nicht verfuegbar"))?;
+    response_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-Panic-Test Timeout"))
+}
+
+fn dispatch_runtime_stall_restart_test(
+    mut payload: RuntimeStallRestartTestRequest,
+    state: &AppState,
+) -> std::result::Result<RuntimeStallRestartTestResponse, ApiError> {
+    payload.mode = payload.mode.trim().to_ascii_lowercase();
+    if payload.agent_id == 0 {
+        return Err(ApiError::BadRequest("agent_id fehlt"));
+    }
+    if payload.mode.is_empty() {
+        return Err(ApiError::BadRequest("mode fehlt"));
+    }
+    if !matches!(payload.mode.as_str(), "sigstop" | "direct") {
+        return Err(ApiError::BadRequest("mode muss sigstop oder direct sein"));
+    }
+    if payload.stall_secs == 0 {
+        return Err(ApiError::BadRequest("stall_secs muss > 0 sein"));
+    }
+
+    let (response_tx, response_rx) = mpsc::sync_channel(1);
+    state
+        .runtime_tx
+        .send(RuntimeControlCommand::StallRestartTest {
+            request: payload,
+            response_tx,
+        })
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-Control-Channel nicht verfuegbar"))?;
+    response_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|_| ApiError::ServiceUnavailable("Stall-Restart-Test Timeout"))
+}
+
 fn request_path(path: &str) -> &str {
     path.split_once('?').map(|(base, _)| base).unwrap_or(path)
 }
@@ -1083,6 +1245,12 @@ fn parse_query_params(path: &str) -> HashMap<String, String> {
 
 fn is_security_path(path: &str) -> bool {
     path.starts_with("/operator/security/")
+}
+
+fn is_protected_read_path(path: &str) -> bool {
+    path == OPERATOR_APICP_SNAPSHOT_PATH
+        || path == OPERATOR_RUNTIME_HEALTH_PATH
+        || is_security_path(path)
 }
 
 fn open_fs_layer(state: &AppState) -> std::result::Result<Arc<LayerManager>, ApiError> {
@@ -2129,9 +2297,11 @@ mod tests {
         AppState,
         mpsc::Receiver<OperatorCommand>,
         mpsc::Receiver<PlatformControlCommand>,
+        mpsc::Receiver<RuntimeControlCommand>,
     ) {
         let (tx, rx) = mpsc::channel();
         let (platform_tx, platform_rx) = mpsc::channel();
+        let (runtime_tx, runtime_rx) = mpsc::channel();
         let (nightrun_tx, _nightrun_rx) = mpsc::channel();
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("data");
@@ -2161,6 +2331,7 @@ mod tests {
             fs_layer: None,
             command_tx: tx,
             platform_tx,
+            runtime_tx,
             nightrun_tx,
             snapshot_tx: mpsc::channel().0,
             restore_tx: mpsc::channel().0,
@@ -2189,10 +2360,59 @@ mod tests {
                 }],
                 ..PlatformStateSnapshot::default()
             })),
+            runtime_health: Arc::new(std::sync::RwLock::new(
+                crate::runtime_health::RuntimeHealthSnapshot {
+                    current_shift: 1,
+                    expected_active_agents: 26,
+                    runtime_agents: 3,
+                    projection_agents: 2,
+                    security_runtime_entries: 1,
+                    sandbox_handles: 1,
+                    tracked_processes: 1,
+                    live_cgroup_dirs: 1,
+                    stale_runtime_entries: 2,
+                    orphan_cgroups: 1,
+                    zombie_tracked_pids: 0,
+                    projection_drift_detected: true,
+                    projection_drift_agents: 1,
+                    worker_states: std::collections::BTreeMap::from([(
+                        "service_health".to_string(),
+                        crate::runtime_health::RuntimeWorkerState {
+                            running: true,
+                            restart_count: 0,
+                            last_error: None,
+                            thread_name: "service-health-checker".to_string(),
+                        },
+                    )]),
+                    analysis_queue_depth: 0,
+                    analysis_queue_dropped_total: 0,
+                    analysis_queue_coalesced_total: 0,
+                    reconcile_runs_total: 0,
+                    reconcile_repairs_total: 0,
+                    respawn_failures: 0,
+                    last_repair_error: None,
+                    repair_last_status: Some("drift_detected".to_string()),
+                    operator_auth_required: secret.is_some(),
+                    snapshot_build_elapsed_us: 0,
+                    agents: vec![crate::runtime_health::RuntimeHealthAgentSnapshot {
+                        agent_id: 7,
+                        aggregate_id: "AGENT-07".to_string(),
+                        name: "Test Agent".to_string(),
+                        runtime_present: true,
+                        projection_present: false,
+                        tracked_pid: Some(4242),
+                        tracked_pid_alive: false,
+                        tracked_pid_state: Some("Z".to_string()),
+                        cgroup_live_pid_count: 0,
+                        security_runtime_present: true,
+                        last_repair_status: Some("stale".to_string()),
+                    }],
+                },
+            )),
             security_runtime_state,
         };
         std::mem::forget(dir);
-        (state, rx, platform_rx)
+        (state, rx, platform_rx, runtime_rx)
     }
 
     fn test_request(path: &str, body: serde_json::Value) -> HttpRequest {
@@ -2206,7 +2426,7 @@ mod tests {
 
     #[test]
     fn valid_trigger_request_is_accepted_and_forwarded() {
-        let (state, rx, _platform_rx) = test_state(None);
+        let (state, rx, _platform_rx, _runtime_rx) = test_state(None);
         let response = handle_http_request(
             test_request(
                 OPERATOR_CHAOS_PATH,
@@ -2240,7 +2460,7 @@ mod tests {
 
     #[test]
     fn invalid_room_returns_not_found() {
-        let (state, _rx, _platform_rx) = test_state(None);
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
         let response = handle_http_request(
             test_request(
                 OPERATOR_CHAOS_PATH,
@@ -2257,7 +2477,7 @@ mod tests {
 
     #[test]
     fn missing_shared_secret_is_rejected() {
-        let (state, _rx, _platform_rx) = test_state(Some("topsecret"));
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
         let response = handle_http_request(
             test_request(
                 OPERATOR_CHAOS_PATH,
@@ -2274,7 +2494,7 @@ mod tests {
 
     #[test]
     fn valid_shared_secret_via_header_is_accepted() {
-        let (state, rx, _platform_rx) = test_state(Some("topsecret"));
+        let (state, rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
         let mut request = test_request(
             OPERATOR_CHAOS_PATH,
             serde_json::json!({
@@ -2301,7 +2521,7 @@ mod tests {
 
     #[test]
     fn valid_stimulus_request_is_accepted_and_forwarded() {
-        let (state, rx, _platform_rx) = test_state(None);
+        let (state, rx, _platform_rx, _runtime_rx) = test_state(None);
         let response = handle_http_request(
             test_request(
                 OPERATOR_STIMULUS_PATH,
@@ -2365,7 +2585,7 @@ mod tests {
 
     #[test]
     fn zero_delta_stimulus_is_rejected() {
-        let (state, _rx, _platform_rx) = test_state(None);
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
         let response = handle_http_request(
             test_request(
                 OPERATOR_STIMULUS_PATH,
@@ -2383,7 +2603,7 @@ mod tests {
 
     #[test]
     fn platform_analyze_is_forwarded_to_platform_channel() {
-        let (state, _rx, platform_rx) = test_state(None);
+        let (state, _rx, platform_rx, _runtime_rx) = test_state(None);
         let response = handle_http_request(
             HttpRequest {
                 method: "POST".to_string(),
@@ -2403,7 +2623,7 @@ mod tests {
 
     #[test]
     fn unresolved_trigger_test_requires_rule_and_target() {
-        let (state, _rx, _platform_rx) = test_state(None);
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
         let response = handle_http_request(
             test_request(
                 OPERATOR_PLATFORM_TRIGGER_TEST_PATH,
@@ -2420,7 +2640,7 @@ mod tests {
 
     #[test]
     fn platform_trigger_test_is_forwarded() {
-        let (state, _rx, platform_rx) = test_state(None);
+        let (state, _rx, platform_rx, _runtime_rx) = test_state(None);
         let response = handle_http_request(
             test_request(
                 OPERATOR_PLATFORM_TRIGGER_TEST_PATH,
@@ -2448,7 +2668,7 @@ mod tests {
 
     #[test]
     fn platform_analysis_test_is_forwarded() {
-        let (state, _rx, platform_rx) = test_state(None);
+        let (state, _rx, platform_rx, _runtime_rx) = test_state(None);
         let response = handle_http_request(
             test_request(
                 OPERATOR_PLATFORM_ANALYSIS_TEST_PATH,
@@ -2488,7 +2708,7 @@ mod tests {
 
     #[test]
     fn platform_analysis_test_rejects_missing_force_profile_parameters() {
-        let (state, _rx, _platform_rx) = test_state(None);
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
         let response = handle_http_request(
             test_request(
                 OPERATOR_PLATFORM_ANALYSIS_TEST_PATH,
@@ -2510,7 +2730,7 @@ mod tests {
 
     #[test]
     fn platform_state_endpoint_returns_snapshot() {
-        let (state, _rx, _platform_rx) = test_state(None);
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
         let response = handle_http_request(
             HttpRequest {
                 method: "GET".to_string(),
@@ -2530,6 +2750,306 @@ mod tests {
     }
 
     #[test]
+    fn runtime_health_endpoint_returns_snapshot() {
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let response = handle_http_request(
+            HttpRequest {
+                method: "GET".to_string(),
+                path: OPERATOR_RUNTIME_HEALTH_PATH.to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            &state,
+        );
+
+        assert_eq!(response.status, 200);
+        let payload: crate::runtime_health::RuntimeHealthSnapshot =
+            serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(payload.current_shift, 1);
+        assert_eq!(payload.expected_active_agents, 26);
+        assert_eq!(payload.stale_runtime_entries, 2);
+        assert_eq!(payload.agents.len(), 1);
+        assert_eq!(payload.agents[0].agent_id, 7);
+    }
+
+    #[test]
+    fn runtime_health_endpoint_requires_auth_when_secret_is_set() {
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(Some("secret"));
+        let response = handle_http_request(
+            HttpRequest {
+                method: "GET".to_string(),
+                path: OPERATOR_RUNTIME_HEALTH_PATH.to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            &state,
+        );
+
+        assert_eq!(response.status, 401);
+    }
+
+    #[test]
+    fn runtime_reconcile_is_forwarded_and_returns_response() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let worker = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::Reconcile {
+                request,
+                response_tx,
+            } => {
+                assert!(request.respawn_missing);
+                assert!(!request.dry_run);
+                response_tx
+                    .send(RuntimeReconcileResponse {
+                        accepted: true,
+                        dry_run: false,
+                        current_shift: 1,
+                        stale_agents_before: 2,
+                        stale_agents_after: 0,
+                        orphan_cgroups_before: 1,
+                        orphan_cgroups_after: 0,
+                        security_snapshots_removed: 1,
+                        unexpected_runtime_removed: 1,
+                        orphan_cgroups_removed: 1,
+                        respawned_agents: 2,
+                        respawn_skipped_backoff: 0,
+                        respawn_blocked_agents: 0,
+                        projection_drift_before: true,
+                        projection_drift_after: false,
+                        projection_restart_attempted: false,
+                        projection_restart_succeeded: false,
+                        projection_rebuild_requested: true,
+                        respawn_failures_total: 0,
+                        repair_last_status: "repaired".to_string(),
+                        repaired_agents: vec!["Test Agent".to_string()],
+                        blocked_agents: Vec::new(),
+                        errors: Vec::new(),
+                        elapsed_us: 0,
+                    })
+                    .unwrap();
+            }
+            RuntimeControlCommand::StallRestartTest { .. } => {
+                panic!("unerwartetes StallRestartTest-Kommando");
+            }
+            RuntimeControlCommand::AnalysisFloodTest { .. } => {
+                panic!("unerwartetes AnalysisFloodTest-Kommando");
+            }
+            RuntimeControlCommand::PanicTest { .. } => {
+                panic!("unerwartetes PanicTest-Kommando");
+            }
+        });
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_RUNTIME_RECONCILE_PATH,
+                serde_json::json!({
+                    "dry_run": false,
+                    "projection_rebuild": true,
+                    "respawn_missing": true
+                }),
+            ),
+            &state,
+        );
+
+        worker.join().unwrap();
+        assert_eq!(response.status, 200);
+        let payload: RuntimeReconcileResponse = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(payload.current_shift, 1);
+        assert_eq!(payload.respawned_agents, 2);
+        assert!(payload.projection_rebuild_requested);
+        assert_eq!(payload.repair_last_status, "repaired");
+    }
+
+    #[test]
+    fn runtime_analysis_flood_test_is_forwarded_and_returns_response() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let worker = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::AnalysisFloodTest {
+                request,
+                response_tx,
+            } => {
+                assert_eq!(request.count, 10_000);
+                response_tx
+                    .send(RuntimeAnalysisFloodTestResponse {
+                        accepted: true,
+                        requested: 10_000,
+                        queue_depth: 17,
+                        dropped_total: 9_983,
+                        coalesced_total: 9_999,
+                        enqueue_elapsed_us: 0,
+                        enqueue_per_request_ns: 0,
+                        note: "bounded queues exercised".to_string(),
+                    })
+                    .unwrap();
+            }
+            other => panic!("unerwartetes Kommando: {other:?}"),
+        });
+
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_RUNTIME_ANALYSIS_FLOOD_TEST_PATH,
+                serde_json::json!({
+                    "count": 10000
+                }),
+            ),
+            &state,
+        );
+
+        worker.join().unwrap();
+        assert_eq!(response.status, 200);
+        let payload: RuntimeAnalysisFloodTestResponse =
+            serde_json::from_slice(&response.body).unwrap();
+        assert!(payload.accepted);
+        assert_eq!(payload.requested, 10_000);
+        assert_eq!(payload.queue_depth, 17);
+        assert_eq!(payload.dropped_total, 9_983);
+        assert_eq!(payload.coalesced_total, 9_999);
+    }
+
+    #[test]
+    fn runtime_analysis_flood_test_rejects_zero_count() {
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_RUNTIME_ANALYSIS_FLOOD_TEST_PATH,
+                serde_json::json!({
+                    "count": 0
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 400);
+    }
+
+    #[test]
+    fn runtime_panic_test_is_forwarded_and_returns_response() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let worker = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::PanicTest {
+                request,
+                response_tx,
+            } => {
+                assert_eq!(request.worker, "service_health");
+                response_tx
+                    .send(RuntimePanicTestResponse {
+                        accepted: true,
+                        worker: "service_health".to_string(),
+                        note: "panic-test dispatched".to_string(),
+                    })
+                    .unwrap();
+            }
+            other => panic!("unerwartetes Kommando: {other:?}"),
+        });
+
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_RUNTIME_PANIC_TEST_PATH,
+                serde_json::json!({
+                    "worker": "service_health"
+                }),
+            ),
+            &state,
+        );
+
+        worker.join().unwrap();
+        assert_eq!(response.status, 200);
+        let payload: RuntimePanicTestResponse = serde_json::from_slice(&response.body).unwrap();
+        assert!(payload.accepted);
+        assert_eq!(payload.worker, "service_health");
+        assert_eq!(payload.note, "panic-test dispatched");
+    }
+
+    #[test]
+    fn runtime_panic_test_rejects_invalid_worker() {
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_RUNTIME_PANIC_TEST_PATH,
+                serde_json::json!({
+                    "worker": "ecs_tick_loop"
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 400);
+    }
+
+    #[test]
+    fn runtime_stall_restart_test_is_forwarded_and_returns_response() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let worker = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::StallRestartTest {
+                request,
+                response_tx,
+            } => {
+                assert_eq!(request.agent_id, 7);
+                assert_eq!(request.mode, "sigstop");
+                assert_eq!(request.stall_secs, 35);
+                response_tx
+                    .send(RuntimeStallRestartTestResponse {
+                        accepted: true,
+                        agent_id: 7,
+                        aggregate_id: "AGENT-07".to_string(),
+                        agent_name: "Test Agent".to_string(),
+                        mode: "sigstop".to_string(),
+                        stall_secs: 35,
+                        pid_before: Some(4242),
+                        pid_after: Some(5252),
+                        runtime_present_after: true,
+                        security_runtime_present_after: true,
+                        bookkeeping_elapsed_ns: 0,
+                        note: "fast_path_restart_executed_without_shift_wait".to_string(),
+                    })
+                    .unwrap();
+            }
+            other => panic!("unerwartetes Kommando: {other:?}"),
+        });
+
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_RUNTIME_STALL_RESTART_TEST_PATH,
+                serde_json::json!({
+                    "agent_id": 7,
+                    "mode": "sigstop",
+                    "stall_secs": 35
+                }),
+            ),
+            &state,
+        );
+
+        worker.join().unwrap();
+        assert_eq!(response.status, 200);
+        let payload: RuntimeStallRestartTestResponse =
+            serde_json::from_slice(&response.body).unwrap();
+        assert!(payload.accepted);
+        assert_eq!(payload.agent_id, 7);
+        assert_eq!(payload.pid_before, Some(4242));
+        assert_eq!(payload.pid_after, Some(5252));
+        assert_eq!(
+            payload.note,
+            "fast_path_restart_executed_without_shift_wait"
+        );
+    }
+
+    #[test]
+    fn runtime_stall_restart_test_rejects_invalid_mode() {
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_RUNTIME_STALL_RESTART_TEST_PATH,
+                serde_json::json!({
+                    "agent_id": 7,
+                    "mode": "bogus",
+                    "stall_secs": 35
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 400);
+    }
+
+    #[test]
     fn write_anomaly_alignment_targets_observation_window_start() {
         assert_eq!(next_write_anomaly_start_tick(111531, 60, 10), 111531);
         assert_eq!(next_write_anomaly_start_tick(111538, 60, 10), 111591);
@@ -2543,7 +3063,7 @@ mod tests {
 
     #[test]
     fn persist_landlock_block_event_writes_security_event() {
-        let (state, _rx, _platform_rx) = test_state(None);
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
         let event_id = persist_landlock_block_event(
             &state,
             "Test Agent",
@@ -2580,7 +3100,7 @@ mod tests {
 
     #[test]
     fn agent_runtime_state_endpoint_returns_snapshot() {
-        let (state, _rx, _platform_rx) = test_state(None);
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
         let response = handle_http_request(
             HttpRequest {
                 method: "GET".to_string(),
@@ -2601,7 +3121,7 @@ mod tests {
 
     #[test]
     fn fs_trash_fixture_and_inspect_roundtrip() {
-        let (state, _rx, _platform_rx) = test_state(None);
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
         let fixture = handle_http_request(
             test_request(
                 OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH,
@@ -2638,7 +3158,7 @@ mod tests {
 
     #[test]
     fn security_get_requires_auth_when_configured() {
-        let (state, _rx, _platform_rx) = test_state(Some("topsecret"));
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
         let unauthorized = handle_http_request(
             HttpRequest {
                 method: "GET".to_string(),
@@ -2665,7 +3185,7 @@ mod tests {
 
     #[test]
     fn write_anomaly_test_requires_tracked_runtime() {
-        let (state, _rx, _platform_rx) = test_state(None);
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
         let response = handle_http_request(
             test_request(
                 OPERATOR_SECURITY_WRITE_ANOMALY_TEST_PATH,
@@ -2682,7 +3202,7 @@ mod tests {
 
     #[test]
     fn apicp_snapshot_roundtrip_requires_auth_when_configured() {
-        let (state, _rx, _platform_rx) = test_state(Some("topsecret"));
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
 
         let unauthorized = HttpRequest {
             method: "GET".to_string(),

@@ -25,6 +25,16 @@ pub struct LandlockRuleset {
 }
 
 impl LandlockRuleset {
+    fn default_exec_paths() -> Vec<PathBuf> {
+        vec![
+            PathBuf::from("/usr/bin/agent-runtime"),
+            PathBuf::from("/breakout-helper"),
+            // Dynamically linked ELF binaries also need their loader executable.
+            PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
+            PathBuf::from("/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"),
+        ]
+    }
+
     /// Creates a Masterplan-compliant ruleset for an agent.
     ///
     /// Paths are relative to the bwrap mount namespace:
@@ -46,10 +56,7 @@ impl LandlockRuleset {
                 PathBuf::from(format!("/home/{name}")),
                 PathBuf::from("/tmp"),
             ],
-            exec_paths: vec![
-                PathBuf::from("/usr/bin/agent-runtime"),
-                PathBuf::from("/breakout-helper"),
-            ],
+            exec_paths: Self::default_exec_paths(),
         }
     }
 
@@ -163,6 +170,9 @@ mod tests {
             .exec_paths
             .contains(&PathBuf::from("/usr/bin/agent-runtime")));
         assert!(rs.exec_paths.contains(&PathBuf::from("/breakout-helper")));
+        assert!(rs
+            .exec_paths
+            .contains(&PathBuf::from("/lib64/ld-linux-x86-64.so.2")));
         assert!(!rs.exec_paths.contains(&PathBuf::from("/usr")));
     }
 
