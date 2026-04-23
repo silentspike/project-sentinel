@@ -103,22 +103,16 @@ pub fn build_runtime_health_snapshot(
     let projection_store: Option<ReadModelStore> = projection_db_path
         .to_str()
         .and_then(|path| ReadModelStore::open_readonly(path).ok());
-    let projection_agents = projection_store
+    let projection_active_agents = projection_store
         .as_ref()
-        .and_then(|store| store.active_agent_count().ok())
-        .unwrap_or_default()
-        .max(0) as usize;
-    let runtime_agents = runtime_orch.agent_count();
-    let previous_agent_status = previous
-        .map(|snapshot| {
-            snapshot
-                .agents
-                .iter()
-                .map(|agent| (agent.agent_id, agent.last_repair_status.clone()))
-                .collect::<HashMap<_, _>>()
-        })
+        .and_then(|store| store.active_agents().ok())
         .unwrap_or_default();
-
+    let projection_active_by_id = projection_active_agents
+        .iter()
+        .filter_map(|view| u16::try_from(view.agent_id).ok().map(|id| (id, view)))
+        .collect::<HashMap<_, _>>();
+    let projection_agents = projection_active_by_id.len();
+    let runtime_agents = runtime_orch.agent_count();
     let mut agent_catalog = BTreeMap::<u16, (String, String)>::new();
     for cfg in expected_agents {
         agent_catalog.insert(
@@ -141,6 +135,11 @@ pub fn build_runtime_health_snapshot(
         agent_catalog
             .entry(snapshot.agent_id)
             .or_insert_with(|| (snapshot.aggregate_id.clone(), snapshot.agent_name.clone()));
+    }
+    for (agent_id, view) in &projection_active_by_id {
+        agent_catalog
+            .entry(*agent_id)
+            .or_insert_with(|| (format!("AGENT-{agent_id:02}"), view.name.clone()));
     }
 
     let mut stale_runtime_entries = 0usize;
@@ -173,10 +172,7 @@ pub fn build_runtime_health_snapshot(
             .get(&name)
             .copied()
             .unwrap_or(0);
-        let projection_present = projection_store
-            .as_ref()
-            .and_then(|store| store.get_agent(agent_id).ok().flatten())
-            .is_some_and(|view| view.status == "active");
+        let projection_present = projection_active_by_id.contains_key(&agent_id);
         let projection_drift = projection_present
             != (runtime_present
                 || security_runtime_present
@@ -204,19 +200,13 @@ pub fn build_runtime_health_snapshot(
         if stale {
             stale_runtime_entries += 1;
         }
-        let last_repair_status = previous_agent_status
-            .get(&agent_id)
-            .cloned()
-            .flatten()
-            .or_else(|| {
-                Some(if healthy {
-                    "healthy".to_string()
-                } else if expected_active {
-                    "stale".to_string()
-                } else {
-                    "unexpected_runtime".to_string()
-                })
-            });
+        let last_repair_status = Some(if healthy {
+            "healthy".to_string()
+        } else if expected_active {
+            "stale".to_string()
+        } else {
+            "unexpected_runtime".to_string()
+        });
         agents.push(RuntimeHealthAgentSnapshot {
             agent_id,
             aggregate_id,
@@ -498,6 +488,50 @@ mod tests {
         assert!(snapshot.agents[0].runtime_present);
         assert!(!snapshot.agents[0].projection_present);
         assert!(!snapshot.agents[0].security_runtime_present);
+    }
+
+    #[test]
+    fn build_snapshot_marks_projection_only_agents_as_stale() {
+        let tmp = tempdir().unwrap();
+        let projection_path = tmp.path().join("projection.db");
+        let projection_store =
+            sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap();
+        {
+            let txn = projection_store.begin_transaction().unwrap();
+            txn.begin().unwrap();
+            txn.upsert_agent(16, "Projection Ghost", "Tester", 2, "active", 1)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        drop(projection_store);
+
+        let snapshot = build_runtime_health_snapshot(
+            &[],
+            1,
+            &RuntimeOrchestrator::new(30),
+            &HashMap::new(),
+            &HashMap::new(),
+            &Arc::new(RwLock::new(HashMap::new())),
+            &projection_path,
+            false,
+            ServiceHealthWorkerSnapshot::default(),
+            None,
+        );
+
+        assert_eq!(snapshot.expected_active_agents, 0);
+        assert_eq!(snapshot.runtime_agents, 0);
+        assert_eq!(snapshot.projection_agents, 1);
+        assert!(snapshot.projection_drift_detected);
+        assert_eq!(snapshot.projection_drift_agents, 1);
+        assert_eq!(snapshot.stale_runtime_entries, 1);
+        assert_eq!(snapshot.agents.len(), 1);
+        assert_eq!(snapshot.agents[0].agent_id, 16);
+        assert!(!snapshot.agents[0].runtime_present);
+        assert!(snapshot.agents[0].projection_present);
+        assert_eq!(
+            snapshot.agents[0].last_repair_status.as_deref(),
+            Some("unexpected_runtime")
+        );
     }
 
     #[test]

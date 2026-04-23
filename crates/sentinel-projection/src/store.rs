@@ -366,6 +366,55 @@ impl ReadModelStore {
         )?;
         Ok(count)
     }
+
+    /// Listet aktive Agents in der Live-View.
+    ///
+    /// Dieser Read-Pfad wird vom Daemon fuer Runtime-Health genutzt. Er bleibt
+    /// read-only und macht Projection-only Ghost-Agents explizit sichtbar.
+    pub fn active_agents(&self) -> anyhow::Result<Vec<AgentView>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, name, role, shift_set, status, current_room, in_transit,
+                    transit_target, last_action, last_action_tick, hunger, energy,
+                    stress, bladder, social_need, caffeine_mg, mood, last_event_id,
+                    updated_at
+             FROM agent_live_view
+             WHERE status = 'active'
+             ORDER BY agent_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(AgentView {
+                agent_id: row.get(0)?,
+                name: row.get(1)?,
+                role: row.get(2)?,
+                shift_set: row.get(3)?,
+                status: row.get(4)?,
+                current_room: row.get(5)?,
+                in_transit: row.get::<_, i32>(6)? != 0,
+                transit_target: row.get(7)?,
+                last_action: row.get(8)?,
+                last_action_tick: row.get(9)?,
+                hunger: row.get(10)?,
+                energy: row.get(11)?,
+                stress: row.get(12)?,
+                bladder: row.get(13)?,
+                social_need: row.get(14)?,
+                caffeine_mg: row.get(15)?,
+                mood: row.get(16)?,
+                last_event_id: row.get(17)?,
+                updated_at: row.get(18)?,
+            })
+        })?;
+
+        let mut agents = Vec::new();
+        for row in rows {
+            agents.push(row?);
+        }
+        Ok(agents)
+    }
 }
 
 // ── View-Structs ─────────────────────────────────
