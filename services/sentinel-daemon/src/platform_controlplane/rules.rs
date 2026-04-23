@@ -212,12 +212,11 @@ pub fn assess_write_anomaly(
     baseline_bytes_per_sec: Option<f64>,
     config: &PlatformControlplaneConfig,
 ) -> Option<WriteAnomalyAssessment> {
-    let absolute_triggered = rate_bytes_per_sec > config.write_anomaly_threshold_bytes_per_sec as f64;
+    let absolute_triggered =
+        rate_bytes_per_sec > config.write_anomaly_threshold_bytes_per_sec as f64;
     let baseline_triggered = baseline_bytes_per_sec
         .filter(|baseline| *baseline > 0.0)
-        .map(|baseline| {
-            rate_bytes_per_sec > baseline * config.write_anomaly_baseline_multiplier
-        })
+        .map(|baseline| rate_bytes_per_sec > baseline * config.write_anomaly_baseline_multiplier)
         .unwrap_or(false);
 
     if absolute_triggered || baseline_triggered {

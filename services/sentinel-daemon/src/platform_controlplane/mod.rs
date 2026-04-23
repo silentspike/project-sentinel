@@ -317,7 +317,8 @@ impl PlatformControlplane {
                 Some(old) => (old * (1.0 - ALPHA)) + (*rate * ALPHA),
                 None => *rate,
             };
-            self.write_rate_baselines.insert(agent_name.clone(), updated);
+            self.write_rate_baselines
+                .insert(agent_name.clone(), updated);
         }
     }
 
@@ -868,13 +869,15 @@ mod tests {
             .insert("Test Agent".to_string(), 1_000.0);
 
         let dir = tempfile::tempdir().unwrap();
-        let db = sentinel_limbo::EventStore::open(dir.path().join("write-anomaly.db").to_str().unwrap())
-            .unwrap();
+        let db =
+            sentinel_limbo::EventStore::open(dir.path().join("write-anomaly.db").to_str().unwrap())
+                .unwrap();
         let metrics = PlatformMetrics {
             agent_write_rates: vec![("Test Agent".to_string(), 12_000.0)],
             ..Default::default()
         };
-        let agent_name_to_id = HashMap::from([("Test Agent".to_string(), sentinel_common::AgentId(5))]);
+        let agent_name_to_id =
+            HashMap::from([("Test Agent".to_string(), sentinel_common::AgentId(5))]);
 
         let output = cp.cycle(&metrics, &db, 1, &agent_name_to_id);
         assert!(matches!(

@@ -159,7 +159,9 @@ mod tests {
         assert!(rs.read_paths.contains(&PathBuf::from("/lib64")));
         assert!(rs.write_paths.contains(&PathBuf::from("/home/thomas")));
         assert!(rs.write_paths.contains(&PathBuf::from("/tmp")));
-        assert!(rs.exec_paths.contains(&PathBuf::from("/usr/bin/agent-runtime")));
+        assert!(rs
+            .exec_paths
+            .contains(&PathBuf::from("/usr/bin/agent-runtime")));
         assert!(rs.exec_paths.contains(&PathBuf::from("/breakout-helper")));
         assert!(!rs.exec_paths.contains(&PathBuf::from("/usr")));
     }
