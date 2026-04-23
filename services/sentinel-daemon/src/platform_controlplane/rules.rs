@@ -172,11 +172,11 @@ pub fn evaluate_rules(
             baseline_clause,
         ) {
             (true, true, Some(baseline)) => {
-                format!(">{threshold_mb:.1} MB/s absolut und > {baseline}")
+                format!(">{threshold_mb:.1} MB/s absolute and > {baseline}")
             }
-            (true, false, _) => format!(">{threshold_mb:.1} MB/s absolut"),
+            (true, false, _) => format!(">{threshold_mb:.1} MB/s absolute"),
             (false, true, Some(baseline)) => format!("> {baseline}"),
-            _ => format!(">{threshold_mb:.1} MB/s absolut"),
+            _ => format!(">{threshold_mb:.1} MB/s absolute"),
         };
         actions.push(PlatformAction {
             rule_name: "write_anomaly".to_string(),

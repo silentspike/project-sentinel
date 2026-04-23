@@ -166,7 +166,7 @@ Output:
 Intervention:
 
 ```text
-platform_intervention|write_anomaly|Michael Hartmann|sigstop|Write-Rate 8.3 MB/s >4.8 MB/s absolut — SIGSTOP fuer Agent-Cgroup getriggert
+platform_intervention|write_anomaly|Michael Hartmann|sigstop|Write-Rate 8.3 MB/s >4.8 MB/s absolute — SIGSTOP fuer Agent-Cgroup getriggert
 ```
 
 Cgroup-Nachweis:
@@ -194,7 +194,7 @@ Readout:
 ```json
 [
   {
-    "summary": "Platform Intervention: sigstop fuer Michael Hartmann — Write-Rate 8.3 MB/s >4.8 MB/s absolut — SIGSTOP fuer Agent-Cgroup getriggert",
+    "summary": "Platform Intervention: sigstop fuer Michael Hartmann — Write-Rate 8.3 MB/s >4.8 MB/s absolute — SIGSTOP fuer Agent-Cgroup getriggert",
     "status": "Ausstehend"
   }
 ]
@@ -293,7 +293,7 @@ Nach dem abschliessenden Daemon-Neustart:
 - keine Treffer fuer `panic` im geprueften Fenster
 - keine Treffer fuer `drift` im geprueften Fenster
 
-## Offener Runtime-Befund
+## Runtime-Befund Offen
 
 Waerend der Verifikation zeigte das System einen separaten Platform-Runtime-Befund, der **nicht** Teil des Security-Kerns von `#264` ist, aber fuer den Close beruecksichtigt werden muss:
 
