@@ -10,7 +10,7 @@
 //! └─────────────────────┘                       └──────────────────┘
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -41,6 +41,10 @@ use crate::controlplane::store::ControlplaneStore;
 use crate::controlplane::ControlplaneKernel;
 use crate::episode_producer::EpisodeProducer;
 use crate::operator_api;
+use crate::runtime_control::{
+    RespawnBackoffTracker, RespawnRetryDecision, RuntimeControlCommand,
+    RuntimeReconcileRequest, RuntimeReconcileResponse,
+};
 use crate::runtime_health;
 use crate::shift::{agents_for_shift, detect_current_shift, detect_shift_from_sim_hour};
 use crate::signal::wait_for_shutdown;
@@ -582,6 +586,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let (operator_tx, operator_rx) = mpsc::channel::<OperatorCommand>();
     let (platform_tx, platform_rx) =
         mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>();
+    let (runtime_tx, runtime_rx) = mpsc::channel::<RuntimeControlCommand>();
     let (nightrun_tx, nightrun_rx) = mpsc::channel::<sentinel_common::OperatorNightrunCommand>();
     let (snapshot_tx, snapshot_rx) = mpsc::channel::<sentinel_common::OperatorSnapshotCommand>();
     let (restore_tx, restore_rx) = mpsc::channel::<sentinel_common::OperatorRestoreCommand>();
@@ -702,6 +707,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 operator_room_ids,
                 operator_tx.clone(),
                 platform_tx.clone(),
+                runtime_tx.clone(),
                 nightrun_tx.clone(),
                 snapshot_tx.clone(),
                 restore_tx.clone(),
@@ -756,6 +762,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 action_rx,
                 operator_rx,
                 platform_rx,
+                runtime_rx,
                 perception_tx,
                 all_agents_clone,
                 current_shift,
@@ -1134,6 +1141,455 @@ fn publish_platform_state_snapshot(
     }
 }
 
+#[derive(Debug, Default)]
+struct RuntimeCleanupStats {
+    repairs: usize,
+    security_snapshots_removed: usize,
+    orphan_cgroups_removed: usize,
+}
+
+struct RuntimeReconcileContext<'a> {
+    tick_count: u64,
+    current_shift: u8,
+    all_agents: &'a [AgentConfig],
+    world: &'a mut bevy_ecs::prelude::World,
+    runtime_orch: &'a mut RuntimeOrchestrator,
+    sandbox: &'a SandboxEnforcer,
+    sandbox_handles: &'a mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &'a mut EbpfCollector,
+    agent_processes: &'a mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    agent_command: &'a [String],
+    security_runtime_state: &'a operator_api::SharedSecurityRuntimeState,
+    event_store: &'a Arc<EventStore>,
+    runtime_health: &'a crate::runtime_health::SharedRuntimeHealthState,
+    projection_db_path: &'a std::path::Path,
+    operator_auth_required: bool,
+    service_health_state: crate::service_health::ServiceHealthWorkerSnapshot,
+    fs_mount: Option<&'a str>,
+    data_dir: &'a std::path::Path,
+}
+
+fn runtime_agent_is_healthy(agent: &runtime_health::RuntimeHealthAgentSnapshot) -> bool {
+    agent.runtime_present
+        && agent.projection_present
+        && agent.security_runtime_present
+        && agent.tracked_pid_alive
+        && agent.cgroup_live_pid_count > 0
+}
+
+fn emit_runtime_repair_blocked_event(
+    event_store: &EventStore,
+    agent_id: AgentId,
+    description: &str,
+    tick_count: u64,
+) {
+    let aggregate_id = format!("AGENT-{:02}", agent_id.0);
+    let payload = DomainEventPayload::PlatformIntervention {
+        rule_name: "runtime_reconcile".to_string(),
+        target: aggregate_id.clone(),
+        action: "repair_blocked".to_string(),
+        description: description.to_string(),
+    };
+    let event = DomainEvent::new(
+        payload.event_type_str(),
+        &aggregate_id,
+        &payload.to_json(),
+        &format!("runtime-reconcile-{}", agent_id.0),
+        tick_count,
+    );
+    if let Err(error) = event_store.append_event(&event) {
+        warn!(
+            agent_id = %agent_id,
+            error = %error,
+            "Repair-Blocked-Event konnte nicht persistiert werden"
+        );
+    }
+}
+
+fn remove_agent_runtime_fragments(
+    ctx: &mut RuntimeReconcileContext<'_>,
+    agent: &runtime_health::RuntimeHealthAgentSnapshot,
+) -> RuntimeCleanupStats {
+    let agent_id = AgentId(agent.agent_id);
+    let mut stats = RuntimeCleanupStats::default();
+
+    if let Some(handle) = ctx.sandbox_handles.remove(&agent_id) {
+        if handle.cgroup_created {
+            if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
+                ctx.ebpf_collector.unregister_agent(cid);
+            }
+        }
+        if let Err(error) = ctx.sandbox.teardown_agent(&handle) {
+            warn!(agent_id = %agent_id, error = %error, "Sandbox-Teardown bei Runtime-Reconcile fehlgeschlagen");
+        } else {
+            stats.repairs += 1;
+        }
+    }
+
+    if let Some(proc_handle) = ctx.agent_processes.remove(&agent_id) {
+        let _ = signal_pid(proc_handle.pid, "TERM");
+        drop(proc_handle);
+        stats.repairs += 1;
+    }
+
+    if agent.cgroup_live_pid_count > 0 {
+        match sentinel_sandbox::cgroups::list_pids_in_cgroup(&agent.name) {
+            Ok(pids) => {
+                for pid in &pids {
+                    let _ = signal_pid(*pid, "TERM");
+                }
+                if !pids.is_empty() {
+                    stats.repairs += 1;
+                }
+            }
+            Err(error) => warn!(
+                agent = %agent.name,
+                error = %error,
+                "Live-Cgroup-PIDs konnten nicht beendet werden"
+            ),
+        }
+    }
+
+    let security_removed = ctx
+        .security_runtime_state
+        .write()
+        .map(|mut state| state.remove(&agent.agent_id).is_some())
+        .unwrap_or(false);
+    if security_removed {
+        stats.security_snapshots_removed += 1;
+        stats.repairs += 1;
+    }
+
+    if ctx.runtime_orch.agents().contains_key(&agent_id) {
+        if let Err(error) = ctx.runtime_orch.despawn_agent(agent_id) {
+            warn!(agent_id = %agent_id, error = %error, "Runtime-Despawn bei Reconcile fehlgeschlagen");
+        } else {
+            stats.repairs += 1;
+        }
+    }
+
+    if despawn_agent_from_world(ctx.world, agent_id) {
+        stats.repairs += 1;
+    }
+
+    let cgroup_path = sentinel_sandbox::cgroups::cgroup_path(&agent.name);
+    if std::path::Path::new(&cgroup_path).exists() && agent.cgroup_live_pid_count == 0 {
+        match sentinel_sandbox::cgroups::remove_cgroup(&agent.name) {
+            Ok(()) => {
+                stats.orphan_cgroups_removed += 1;
+                stats.repairs += 1;
+            }
+            Err(error) => warn!(
+                agent = %agent.name,
+                error = %error,
+                "Orphan-Cgroup konnte nicht entfernt werden"
+            ),
+        }
+    }
+
+    stats
+}
+
+fn run_runtime_reconcile(
+    ctx: &mut RuntimeReconcileContext<'_>,
+    request: RuntimeReconcileRequest,
+    respawn_backoff: &mut RespawnBackoffTracker,
+) -> RuntimeReconcileResponse {
+    let previous = ctx.runtime_health.read().ok().map(|snapshot| snapshot.clone());
+    let before = runtime_health::build_runtime_health_snapshot(
+        ctx.all_agents,
+        ctx.current_shift,
+        ctx.runtime_orch,
+        ctx.sandbox_handles,
+        ctx.agent_processes,
+        ctx.security_runtime_state,
+        ctx.projection_db_path,
+        ctx.operator_auth_required,
+        ctx.service_health_state.clone(),
+        previous.as_ref(),
+    );
+    let expected_agents = agents_for_shift(ctx.all_agents, ctx.current_shift);
+    let expected_ids = expected_agents
+        .iter()
+        .map(|cfg| cfg.identity.id)
+        .collect::<HashSet<_>>();
+    let before_by_id = before
+        .agents
+        .iter()
+        .cloned()
+        .map(|agent| (agent.agent_id, agent))
+        .collect::<HashMap<_, _>>();
+
+    let mut security_snapshots_removed = 0usize;
+    let mut unexpected_runtime_removed = 0usize;
+    let mut orphan_cgroups_removed = 0usize;
+    let mut respawned_agents = 0usize;
+    let mut respawn_skipped_backoff = 0usize;
+    let mut respawn_blocked_agents = 0usize;
+    let mut repair_ops_total = 0usize;
+    let mut respawn_failures_added = 0u64;
+    let mut repaired_agents = Vec::new();
+    let mut blocked_agents = Vec::new();
+    let mut errors = Vec::new();
+    let mut agent_status_updates = HashMap::<u16, String>::new();
+
+    if !request.dry_run {
+        for agent in before.agents.iter().filter(|agent| {
+            let expected_active = expected_ids.contains(&agent.agent_id);
+            !expected_active
+                && (agent.runtime_present
+                    || agent.security_runtime_present
+                    || agent.tracked_pid_alive
+                    || agent.cgroup_live_pid_count > 0)
+        }) {
+            let stats = remove_agent_runtime_fragments(ctx, agent);
+            if stats.repairs > 0 {
+                unexpected_runtime_removed += 1;
+                security_snapshots_removed += stats.security_snapshots_removed;
+                orphan_cgroups_removed += stats.orphan_cgroups_removed;
+                repair_ops_total += stats.repairs;
+                repaired_agents.push(agent.name.clone());
+                agent_status_updates.insert(agent.agent_id, "unexpected_runtime_cleaned".to_string());
+            }
+        }
+
+        let runtime_agent_names = ctx
+            .runtime_orch
+            .agents()
+            .values()
+            .map(|handle| handle.identity.name.clone())
+            .collect::<HashSet<_>>();
+        if let Ok(entries) = std::fs::read_dir("/sys/fs/cgroup/sentinel") {
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if runtime_agent_names.contains(&name) {
+                    continue;
+                }
+                match sentinel_sandbox::cgroups::list_pids_in_cgroup(&name) {
+                    Ok(pids) if pids.is_empty() => {
+                        if sentinel_sandbox::cgroups::remove_cgroup(&name).is_ok() {
+                            orphan_cgroups_removed += 1;
+                            repair_ops_total += 1;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(
+                        cgroup = %name,
+                        error = %error,
+                        "Orphan-Cgroup konnte nicht inspiziert werden"
+                    ),
+                }
+            }
+        }
+    }
+
+    for agent_cfg in &expected_agents {
+        let agent_id = agent_cfg.identity.id;
+        let snapshot = before_by_id.get(&agent_id);
+
+        if let Some(snapshot) = snapshot {
+            let runtime_core_healthy = snapshot.runtime_present
+                && snapshot.tracked_pid_alive
+                && snapshot.cgroup_live_pid_count > 0;
+            if runtime_agent_is_healthy(snapshot) {
+                respawn_backoff.record_success(agent_id);
+                continue;
+            }
+            if runtime_core_healthy && !snapshot.security_runtime_present {
+                if request.dry_run {
+                    agent_status_updates
+                        .insert(agent_id, "security_runtime_restore_planned".to_string());
+                } else {
+                    let tracked_pid = ctx
+                        .sandbox_handles
+                        .get(&AgentId(agent_id))
+                        .and_then(|handle| handle.bwrap_pid)
+                        .or(snapshot.tracked_pid);
+                    record_security_runtime_snapshot(
+                        ctx.security_runtime_state,
+                        AgentId(agent_id),
+                        &agent_cfg.identity.name,
+                        tracked_pid,
+                        ctx.fs_mount,
+                    );
+                    repair_ops_total += 1;
+                    repaired_agents.push(agent_cfg.identity.name.clone());
+                    agent_status_updates.insert(agent_id, "security_runtime_restored".to_string());
+                }
+                respawn_backoff.record_success(agent_id);
+                continue;
+            }
+            if runtime_core_healthy && snapshot.security_runtime_present && !snapshot.projection_present
+            {
+                agent_status_updates.insert(agent_id, "projection_reconcile_pending".to_string());
+                respawn_backoff.record_success(agent_id);
+                continue;
+            }
+        }
+
+        if !request.respawn_missing {
+            continue;
+        }
+
+        match respawn_backoff.decision(agent_id, ctx.tick_count) {
+            RespawnRetryDecision::Blocked => {
+                respawn_blocked_agents += 1;
+                blocked_agents.push(agent_cfg.identity.name.clone());
+                agent_status_updates.insert(agent_id, "repair_blocked".to_string());
+                continue;
+            }
+            RespawnRetryDecision::BackoffActive { .. } => {
+                respawn_skipped_backoff += 1;
+                agent_status_updates.insert(agent_id, "respawn_backoff".to_string());
+                continue;
+            }
+            RespawnRetryDecision::Ready => {}
+        }
+
+        if request.dry_run {
+            agent_status_updates.insert(agent_id, "respawn_planned".to_string());
+            continue;
+        }
+
+        if let Some(snapshot) = snapshot {
+            let stats = remove_agent_runtime_fragments(ctx, snapshot);
+            security_snapshots_removed += stats.security_snapshots_removed;
+            orphan_cgroups_removed += stats.orphan_cgroups_removed;
+            repair_ops_total += stats.repairs;
+        }
+
+        if spawn_agent_full(
+            ctx.runtime_orch,
+            ctx.world,
+            agent_cfg,
+            ctx.sandbox,
+            ctx.sandbox_handles,
+            ctx.ebpf_collector,
+            ctx.agent_processes,
+            ctx.agent_command,
+            ctx.security_runtime_state,
+            ctx.fs_mount,
+        ) {
+            respawned_agents += 1;
+            repair_ops_total += 1;
+            repaired_agents.push(agent_cfg.identity.name.clone());
+            agent_status_updates.insert(agent_id, "respawned".to_string());
+            respawn_backoff.record_success(agent_id);
+        } else {
+            respawn_failures_added += 1;
+            let message = format!("Respawn fehlgeschlagen fuer {}", agent_cfg.identity.name);
+            errors.push(message.clone());
+            match respawn_backoff.record_failure(agent_id, ctx.tick_count) {
+                RespawnRetryDecision::Blocked => {
+                    respawn_blocked_agents += 1;
+                    blocked_agents.push(agent_cfg.identity.name.clone());
+                    agent_status_updates.insert(agent_id, "repair_blocked".to_string());
+                    emit_runtime_repair_blocked_event(
+                        ctx.event_store,
+                        AgentId(agent_id),
+                        &message,
+                        ctx.tick_count,
+                    );
+                }
+                RespawnRetryDecision::BackoffActive { .. } => {
+                    agent_status_updates.insert(agent_id, "respawn_backoff".to_string());
+                }
+                RespawnRetryDecision::Ready => {}
+            }
+        }
+    }
+
+    let projection_rebuild_requested = if request.projection_rebuild && !request.dry_run {
+        match crate::runtime_control::write_projection_rebuild_request(ctx.data_dir, ctx.tick_count) {
+            Ok(()) => {
+                repair_ops_total += 1;
+                true
+            }
+            Err(error) => {
+                errors.push(error.to_string());
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    let mut after = runtime_health::build_runtime_health_snapshot(
+        ctx.all_agents,
+        ctx.current_shift,
+        ctx.runtime_orch,
+        ctx.sandbox_handles,
+        ctx.agent_processes,
+        ctx.security_runtime_state,
+        ctx.projection_db_path,
+        ctx.operator_auth_required,
+        ctx.service_health_state.clone(),
+        Some(&before),
+    );
+    after.reconcile_runs_total = before.reconcile_runs_total.saturating_add(1);
+    after.reconcile_repairs_total = before
+        .reconcile_repairs_total
+        .saturating_add(repair_ops_total as u64);
+    after.respawn_failures = before
+        .respawn_failures
+        .saturating_add(respawn_failures_added);
+    after.last_repair_error = errors.last().cloned().or(before.last_repair_error.clone());
+    after.repair_last_status = Some(
+        if request.dry_run {
+            "dry_run".to_string()
+        } else if respawn_blocked_agents > 0 {
+            "repair_blocked".to_string()
+        } else if !errors.is_empty() {
+            "repair_error".to_string()
+        } else if repair_ops_total > 0 || projection_rebuild_requested {
+            "repaired".to_string()
+        } else if after.stale_runtime_entries == 0 && after.orphan_cgroups == 0 {
+            "healthy".to_string()
+        } else {
+            "drift_detected".to_string()
+        },
+    );
+    for agent in &mut after.agents {
+        if let Some(status) = agent_status_updates.get(&agent.agent_id) {
+            agent.last_repair_status = Some(status.clone());
+        }
+    }
+    if let Ok(mut runtime_health) = ctx.runtime_health.write() {
+        *runtime_health = after.clone();
+    }
+
+    RuntimeReconcileResponse {
+        accepted: true,
+        dry_run: request.dry_run,
+        current_shift: ctx.current_shift,
+        stale_agents_before: before.stale_runtime_entries,
+        stale_agents_after: after.stale_runtime_entries,
+        orphan_cgroups_before: before.orphan_cgroups,
+        orphan_cgroups_after: after.orphan_cgroups,
+        security_snapshots_removed,
+        unexpected_runtime_removed,
+        orphan_cgroups_removed,
+        respawned_agents,
+        respawn_skipped_backoff,
+        respawn_blocked_agents,
+        projection_rebuild_requested,
+        respawn_failures_total: after.respawn_failures,
+        repair_last_status: after
+            .repair_last_status
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        repaired_agents,
+        blocked_agents,
+        errors,
+    }
+}
+
 fn resolve_platform_analysis_target(
     runtime_orch: &RuntimeOrchestrator,
     target: &str,
@@ -1269,6 +1725,7 @@ fn ecs_tick_loop(
     action_rx: mpsc::Receiver<sentinel_common::AgentAction>,
     operator_rx: mpsc::Receiver<sentinel_common::OperatorCommand>,
     platform_rx: mpsc::Receiver<crate::platform_controlplane::PlatformControlCommand>,
+    runtime_rx: mpsc::Receiver<RuntimeControlCommand>,
     perception_tx: mpsc::SyncSender<Perception>,
     all_agents: Vec<AgentConfig>,
     initial_shift: u8,
@@ -1328,6 +1785,7 @@ fn ecs_tick_loop(
         platform_cp_config_clone.monitored_services.clone(),
         std::time::Duration::from_secs(platform_cp_config_clone.service_check_interval_secs),
     );
+    let mut respawn_backoff = RespawnBackoffTracker::new(3);
 
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
@@ -1795,6 +2253,46 @@ fn ecs_tick_loop(
                     ) {
                         warn!(error = %error, "Platform-Analyse konnte nicht ausgefuehrt werden");
                     }
+                }
+            }
+        }
+
+        while let Ok(command) = runtime_rx.try_recv() {
+            match command {
+                RuntimeControlCommand::Reconcile {
+                    request,
+                    response_tx,
+                } => {
+                    let projection_path = std::path::Path::new(&projection_db_path);
+                    let data_dir = projection_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    let mut reconcile_ctx = RuntimeReconcileContext {
+                        tick_count,
+                        current_shift,
+                        all_agents: &all_agents,
+                        world: &mut world,
+                        runtime_orch: &mut runtime_orch,
+                        sandbox: &sandbox,
+                        sandbox_handles: &mut sandbox_handles,
+                        ebpf_collector: &mut ebpf_collector,
+                        agent_processes: &mut agent_processes,
+                        agent_command: &agent_command,
+                        security_runtime_state: &security_runtime_state,
+                        event_store: &event_store_for_prune,
+                        runtime_health: &runtime_health,
+                        projection_db_path: projection_path,
+                        operator_auth_required,
+                        service_health_state: service_health_checker.worker_state(),
+                        fs_mount: fs_mount.as_deref(),
+                        data_dir,
+                    };
+                    let response = run_runtime_reconcile(
+                        &mut reconcile_ctx,
+                        request,
+                        &mut respawn_backoff,
+                    );
+                    let _ = response_tx.send(response);
                 }
             }
         }
@@ -3156,6 +3654,7 @@ mod tests {
             rx,
             operator_rx,
             mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
+            mpsc::channel::<RuntimeControlCommand>().1,
             ptx,
             vec![],
             1,
@@ -3238,6 +3737,7 @@ mod tests {
                 rx,
                 operator_rx,
                 mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
+                mpsc::channel::<RuntimeControlCommand>().1,
                 ptx,
                 all_agents,
                 1,
@@ -3337,6 +3837,7 @@ mod tests {
                 rx,
                 operator_rx,
                 mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
+                mpsc::channel::<RuntimeControlCommand>().1,
                 ptx,
                 all_agents,
                 1,
@@ -3444,6 +3945,7 @@ mod tests {
                 rx,
                 operator_rx,
                 mpsc::channel::<crate::platform_controlplane::PlatformControlCommand>().1,
+                mpsc::channel::<RuntimeControlCommand>().1,
                 ptx,
                 all_agents,
                 1,

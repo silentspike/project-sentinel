@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan279.md`
-- Overall status: `TASK_3_DONE_TASK_4_PENDING`
-- Current task: `Task 4 - Slice B: Runtime-Control / Reconcile`
+- Overall status: `TASK_4_DONE_TASK_5_PENDING`
+- Current task: `Task 5 - Slice C: Fast Stall Recovery`
 - Current branch: `feat/issue-279-daemon-hardening-v2`
 - Worktree: `/work/company/project-sentinel-279-review`
 - Base: `origin/main @ 83ab01c8835804fd951e619aa048324b7ff76ddf`
@@ -38,6 +38,12 @@
   - Snapshot deckt Runtime, Projection, Cgroups, Security-Runtime und Worker-State ab
   - Operator-Auth-Schutz fuer den Endpoint ist im Unit-Test belegt
   - initialer Warnungsfund `unused import RuntimeHealthSnapshot` wurde vor Commit bereinigt
+- Slice B ist erledigt:
+  - `POST /operator/runtime/reconcile` ist als Runtime-Control-Pfad verdrahtet
+  - Reconcile entfernt unerwartete Runtime-Fragmente, orphan Cgroups und stale Security-Snapshots
+  - Expected active Agents koennen mit Backoff N=3 respawned werden
+  - Projection-Rebuild wird ueber `.projection-rebuild-request` entkoppelt angefordert
+  - aktuelle #264-SIGSTOP-Semantik wurde bei Konfliktauflösung beibehalten
 
 ## Blocked items
 
@@ -50,7 +56,7 @@
 
 - `dca25ac` Task [1] Phase 0 - Issue-Repair und Baseline-Reset
 - `e2e7523` Task [2] Phase 1 - Donor-Audit und Clean Port
-- `TBD` Task [3] Slice A - Runtime-Health-Read-Model
+- `f5be73b` Task [3] Slice A - Runtime-Health-Read-Model
 - `TBD` Task [4] Slice B - Runtime-Control / Reconcile
 - `TBD` Task [5] Slice C - Fast Stall Recovery
 - `TBD` Task [6] Slice D - Worker-Supervision
@@ -72,7 +78,7 @@
 | 1 | Phase 0 - Issue-Repair und Baseline-Reset | DONE | frische VM-Baseline, Issue-Body-Repair, canonical-main-Reset, Post-Reset-Baseline ohne runtime-health | command, system, inspect |
 | 2 | Phase 1 - Donor-Audit und Clean Port | DONE | alte #279-Donor-Commits pruefen, nur scope-konforme Teile uebernehmen, Haiku ausschliessen | inspect, command |
 | 3 | Slice A - Runtime-Health-Read-Model | DONE | `/operator/runtime-health`, Snapshot-Modell, Auth/Loopback, Tests | inspect, command, system |
-| 4 | Slice B - Runtime-Control / Reconcile | IN_PROGRESS | `/operator/runtime/reconcile`, stale/orphan/zombie cleanup, bounded retries | inspect, command, system |
+| 4 | Slice B - Runtime-Control / Reconcile | DONE | `/operator/runtime/reconcile`, stale/orphan/zombie cleanup, bounded retries | inspect, command, system |
 | 5 | Slice C - Fast Stall Recovery | PENDING | deterministischer Kandidat, SIGSTOP/SIGCONT, Respawn/Reconcile | command, system |
 | 6 | Slice D - Worker-Supervision | PENDING | catch_unwind + in-process worker respawn, panic-test Hook | inspect, command, system |
 | 7 | Slice E - bounded Analysis-/Recovery-Pfade | PENDING | bounded trigger queues, coalescing/drop counters, flood-test | inspect, command, system |
@@ -234,3 +240,60 @@
   - artifact hash: `7b5145a77da0a55a3e9e9da00b2d9036ce943df748d327b4095f87955b0034d2  target/release/sentinel-daemon`
 - `git diff --check`
   - PASS: no whitespace/conflict errors.
+
+## Task 4 - Slice B: Runtime-Control / Reconcile
+
+### Pre-task self-check
+
+- Was muss getan werden: Runtime-Control aus dem Donor path-limited portieren und `POST /operator/runtime/reconcile` als kontrollierten Reparaturpfad in den ECS-Thread verdrahten.
+- Welche ACs muessen hier passen:
+  - AC-1: `runtime_control.rs` definiert Request/Response, Command und bounded Respawn-Backoff.
+  - AC-2: Operator-Endpoint dispatcht in den ECS-Thread und wartet bounded auf Response.
+  - AC-3: Orchestrator kann stale Runtime-Fragmente, Security-Snapshots und orphan Cgroups bereinigen.
+  - AC-4: Missing expected Agents koennen mit Backoff respawned oder als `repair_blocked` dokumentiert werden.
+  - AC-5: Projection-Rebuild wird entkoppelt per Request-Datei angefordert.
+  - AC-6: relevante Remote-Rust-Tests und Release-Build sind gruen.
+- Wie wird bewiesen: Donor-Diff-Inspection, Code-Diff, `cargo remote -c -- test/build`.
+- Erwartete Dateien: `services/sentinel-daemon/src/runtime_control.rs`, `lib.rs`, `operator_api.rs`, `orchestrator.rs`.
+- Risiken:
+  - Donor-Patch darf keine alte #264-SIGSTOP-Abschwaechung einschleppen.
+  - Reconcile darf nicht inline Projection mutieren.
+  - Respawn-Fehler muessen bounded bleiben und duerfen keinen Endlos-Loop erzeugen.
+
+### Outcome
+
+- Path-limited donor Slice B was applied from stack donor `146ef43`.
+- Added `services/sentinel-daemon/src/runtime_control.rs` with:
+  - `RuntimeReconcileRequest`
+  - `RuntimeReconcileResponse`
+  - `RuntimeControlCommand`
+  - `RespawnBackoffTracker::new(3)` semantics
+  - `write_projection_rebuild_request()`
+- Added `POST /operator/runtime/reconcile` and a bounded `recv_timeout(10s)` response path.
+- Wired `runtime_tx/runtime_rx` through Operator API and ECS loop.
+- Added `run_runtime_reconcile()` in the orchestrator:
+  - removes unexpected active runtime fragments
+  - removes stale security runtime snapshots
+  - tears down orphan cgroups without live PIDs
+  - restores missing security runtime snapshots when core runtime is healthy
+  - respawns expected active Agents when requested
+  - records `repair_blocked` via `PlatformIntervention`
+  - updates `SharedRuntimeHealthState` with counters and per-agent repair status
+- Conflict resolution:
+  - kept current `suspend_pids()` implementation with 2s multi-PID verification from #264/main lineage
+  - rejected donor's narrower 250ms tracked-PID-only check
+
+### Evidence
+
+- `cargo remote -c -- test -p sentinel-daemon runtime_control -- --nocapture`
+  - PASS: `2 passed; 0 failed; 177 filtered out`
+  - Covered tests:
+    - `runtime_control::tests::respawn_backoff_tracker_applies_exponential_backoff_until_blocked`
+    - `runtime_control::tests::write_projection_rebuild_request_persists_request_file`
+- `cargo remote -c -- test -p sentinel-daemon runtime_reconcile -- --nocapture`
+  - PASS: `1 passed; 0 failed; 178 filtered out; finished in 0.61s`
+  - Covered test:
+    - `operator_api::tests::runtime_reconcile_is_forwarded_and_returns_response`
+- `cargo remote -c -- build -p sentinel-daemon --release --features fuse`
+  - PASS: `Finished release profile [optimized] target(s) in 1m 00s`
+  - artifact hash: `19ce8b228b5588142399a4f712afd4cd89b1caca2be43c1273355a3ad30fe724  target/release/sentinel-daemon`

@@ -407,3 +407,124 @@ no output
 ```
 
 PASS: Slice A tests and release build are green via remote Rust execution only.
+
+## Phase 3 - Slice B Runtime-Control / Reconcile Evidence
+
+### AC-1 - Runtime-Control Types And Backoff
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/runtime_control.rs
+services/sentinel-daemon/src/lib.rs
+```
+
+Observed implementation:
+
+```text
+RuntimeReconcileRequest { dry_run, projection_rebuild, respawn_missing }
+RuntimeReconcileResponse with stale/orphan/respawn/projection counters
+RuntimeControlCommand::Reconcile
+RespawnBackoffTracker::new(3) with 1/2 tick backoff, then Blocked
+```
+
+PASS: Runtime-control is explicit, typed and bounded.
+
+### AC-2 - Operator Runtime-Reconcile Endpoint
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/operator_api.rs
+services/sentinel-daemon/src/orchestrator.rs
+```
+
+Observed implementation:
+
+```text
+POST /operator/runtime/reconcile
+dispatches RuntimeControlCommand::Reconcile to the ECS thread
+waits with recv_timeout(10s)
+returns RuntimeReconcileResponse
+```
+
+PASS: The Operator API does not mutate runtime state directly; it dispatches into the ECS owner thread.
+
+### AC-3 - Runtime Repair Semantics
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/orchestrator.rs
+```
+
+Observed implementation:
+
+```text
+remove_agent_runtime_fragments()
+run_runtime_reconcile()
+repair_blocked PlatformIntervention event
+.projection-rebuild-request file via runtime_control::write_projection_rebuild_request()
+```
+
+PASS: Reconcile can clean unexpected runtime fragments, orphan cgroups and stale security snapshots, and it can respawn missing expected agents with bounded retries.
+
+### AC-4 - Conflict Resolution
+
+Observed conflict decision:
+
+```text
+orchestrator.rs donor conflict resolved by keeping the current suspend_pids()
+implementation with 2s multi-PID verification from the #264/main lineage.
+The donor's narrower 250ms tracked-PID-only check was not ported.
+```
+
+PASS: Slice B does not regress the stronger live-process stop verification.
+
+### AC-5 - Remote Tests And Release Build
+
+Remote test command:
+
+```bash
+cargo remote -c -- test -p sentinel-daemon runtime_control -- --nocapture
+```
+
+Observed:
+
+```text
+Finished test profile [unoptimized + debuginfo] target(s) in 26.37s
+running 2 tests
+test runtime_control::tests::respawn_backoff_tracker_applies_exponential_backoff_until_blocked ... ok
+test runtime_control::tests::write_projection_rebuild_request_persists_request_file ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 177 filtered out; finished in 0.00s
+```
+
+Remote endpoint-dispatch test command:
+
+```bash
+cargo remote -c -- test -p sentinel-daemon runtime_reconcile -- --nocapture
+```
+
+Observed:
+
+```text
+Finished test profile [unoptimized + debuginfo] target(s) in 11.70s
+running 1 test
+test operator_api::tests::runtime_reconcile_is_forwarded_and_returns_response ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 178 filtered out; finished in 0.61s
+```
+
+Remote release build command:
+
+```bash
+cargo remote -c -- build -p sentinel-daemon --release --features fuse
+```
+
+Observed:
+
+```text
+Finished release profile [optimized] target(s) in 1m 00s
+19ce8b228b5588142399a4f712afd4cd89b1caca2be43c1273355a3ad30fe724  target/release/sentinel-daemon
+```
+
+PASS: Slice B tests and release build are green via remote Rust execution only.
