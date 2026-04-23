@@ -122,30 +122,44 @@ fn signal_pid(pid: u32, signal: &str) -> Result<()> {
     }
 }
 
-fn mountpoint_is_active(path: &std::path::Path) -> bool {
+fn mountinfo_contains_mountpoint(mountinfo: &str, path: &std::path::Path) -> bool {
     let target = path
         .canonicalize()
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .into_owned();
+
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (left, right) = line.split_once(" - ")?;
+            let mountpoint = left.split_whitespace().nth(4)?;
+            let mut suffix = right.split_whitespace();
+            let fs_type = suffix.next()?;
+            let mount_source = suffix.next()?;
+            Some((mountpoint, fs_type, mount_source))
+        })
+        .any(|(mountpoint, fs_type, mount_source)| {
+            mountpoint == target && fs_type == "fuse" && mount_source == "sentinel-fs"
+        })
+}
+
+fn mountpoint_is_active(path: &std::path::Path) -> bool {
     std::fs::read_to_string("/proc/self/mountinfo")
         .ok()
-        .map(|mountinfo| {
-            mountinfo
-                .lines()
-                .filter_map(|line| {
-                    let (left, right) = line.split_once(" - ")?;
-                    let mountpoint = left.split_whitespace().nth(4)?;
-                    let mut suffix = right.split_whitespace();
-                    let fs_type = suffix.next()?;
-                    let mount_source = suffix.next()?;
-                    Some((mountpoint, fs_type, mount_source))
-                })
-                .any(|(mountpoint, fs_type, mount_source)| {
-                    mountpoint == target && fs_type == "fuse" && mount_source == "sentinel-fs"
-                })
-        })
+        .map(|mountinfo| mountinfo_contains_mountpoint(&mountinfo, path))
         .unwrap_or(false)
+}
+
+fn wait_for_fuse_mount(path: &std::path::Path, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if mountpoint_is_active(path) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    mountpoint_is_active(path)
 }
 
 fn suspend_pids(pids: &[u32], tracked_pid: Option<u32>) -> Result<()> {
@@ -460,50 +474,60 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         };
 
     // -- sentinel-fs FUSE Mount (optional, konfigurierbar) --
-    #[cfg(feature = "fuse")]
-    if let Some(ref fs_mount) = config.fs_mount {
-        let mountpoint = std::path::PathBuf::from(fs_mount);
-        let fs_layer_clone = fs_layer
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| anyhow!("sentinel-fs Layer nicht initialisiert"))?;
-        if !mountpoint.exists() {
-            std::fs::create_dir_all(&mountpoint)
-                .with_context(|| format!("FUSE mountpoint erstellen: {}", mountpoint.display()))?;
-        }
-        info!(
-            mountpoint = %mountpoint.display(),
-            data_dir = %data_dir.display(),
-            "sentinel-fs FUSE-Mount starten"
-        );
-        let mountpoint_check = mountpoint.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = sentinel_fs::fuse::start_fuse_layer(fs_layer_clone, &mountpoint) {
-                error!(error = %e, "sentinel-fs FUSE-Mount fehlgeschlagen");
+    let active_fs_mount: Option<String> = {
+        #[cfg(feature = "fuse")]
+        {
+            let mut active_mount = None;
+            if let Some(ref fs_mount) = config.fs_mount {
+                let mountpoint = std::path::PathBuf::from(fs_mount);
+                let fs_layer_clone = fs_layer
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("sentinel-fs Layer nicht initialisiert"))?;
+                if !mountpoint.exists() {
+                    std::fs::create_dir_all(&mountpoint).with_context(|| {
+                        format!("FUSE mountpoint erstellen: {}", mountpoint.display())
+                    })?;
+                }
+                info!(
+                    mountpoint = %mountpoint.display(),
+                    data_dir = %data_dir.display(),
+                    "sentinel-fs FUSE-Mount starten"
+                );
+                let mountpoint_check = mountpoint.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = sentinel_fs::fuse::start_fuse_layer(fs_layer_clone, &mountpoint)
+                    {
+                        error!(error = %e, "sentinel-fs FUSE-Mount fehlgeschlagen");
+                    }
+                });
+                if wait_for_fuse_mount(&mountpoint_check, Duration::from_secs(2)) {
+                    info!(mountpoint = %mountpoint_check.display(), "sentinel-fs FUSE-Mount aktiv");
+                    active_mount = Some(fs_mount.clone());
+                } else {
+                    warn!(
+                        mountpoint = %mountpoint_check.display(),
+                        "sentinel-fs FUSE-Mount nicht aktiv, fallback auf /ram/agents"
+                    );
+                }
             }
-        });
-        let mut mount_ready = false;
-        for _ in 0..20 {
-            if mountpoint_is_active(&mountpoint_check) {
-                mount_ready = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
+            active_mount
         }
-        if mount_ready {
-            info!(mountpoint = %mountpoint_check.display(), "sentinel-fs FUSE-Mount aktiv");
-        } else {
-            warn!(mountpoint = %mountpoint_check.display(), "sentinel-fs FUSE-Mount moeglicherweise nicht bereit");
+        #[cfg(not(feature = "fuse"))]
+        {
+            None
         }
-    }
+    };
 
     // -- Sandbox Enforcer (Landlock + cgroups v2 + bwrap) --
     let (mut sandbox, sandbox_warnings) = SandboxEnforcer::detect();
 
-    // Wenn sentinel-fs FUSE konfiguriert: bwrap nutzt FUSE-Mount statt /ram/agents/
-    if let Some(ref fs_mount) = config.fs_mount {
+    // Wenn sentinel-fs FUSE aktiv ist: bwrap nutzt FUSE-Mount statt /ram/agents/.
+    if let Some(ref fs_mount) = active_fs_mount {
         sandbox.set_fs_mount(fs_mount.clone());
         info!(fs_mount = %fs_mount, "Sandbox nutzt sentinel-fs FUSE-Mount fuer Agent-Homes");
+    } else if config.fs_mount.is_some() {
+        warn!("Konfiguriertes fs_mount deaktiviert, weil kein tragfaehiger FUSE-Mount aktiv ist");
     }
     for w in &sandbox_warnings {
         match w {
@@ -703,7 +727,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             operator_api::start_server(
                 config.operator_api.clone(),
                 data_dir.to_path_buf(),
-                config.fs_mount.clone(),
+                active_fs_mount.clone(),
                 fs_layer.clone(),
                 operator_room_ids,
                 operator_tx.clone(),
@@ -752,7 +776,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let ecs_platform_state = Arc::clone(&platform_state);
     let ecs_runtime_health = Arc::clone(&runtime_health);
     let ecs_security_runtime_state = Arc::clone(&security_runtime_state);
-    let ecs_fs_mount = config.fs_mount.clone();
+    let ecs_fs_mount = active_fs_mount.clone();
     let ecs_projection_db_path = projection_db_path.clone();
     let ecs_handle = std::thread::Builder::new()
         .name("ecs-tick-loop".into())
@@ -3935,6 +3959,22 @@ mod tests {
         let collector = EbpfCollector::new(MonitoringMode::Userspace);
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         (collector, tx)
+    }
+
+    #[test]
+    fn mountinfo_contains_mountpoint_matches_exact_sentinel_fuse_mount() {
+        let mountinfo = "\
+35 23 0:33 / / rw,relatime - overlay overlay rw\n\
+92 35 0:56 / /opt/sentinel/fs rw,nosuid,nodev - fuse sentinel-fs rw,user_id=0\n";
+
+        assert!(mountinfo_contains_mountpoint(
+            mountinfo,
+            std::path::Path::new("/opt/sentinel/fs")
+        ));
+        assert!(!mountinfo_contains_mountpoint(
+            mountinfo,
+            std::path::Path::new("/opt/sentinel/fs-missing")
+        ));
     }
 
     fn test_controlplane(tmp: &tempfile::TempDir) -> ControlplaneKernel {
