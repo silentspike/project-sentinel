@@ -32,9 +32,9 @@ use crate::platform_controlplane::{
     PlatformTriggerTestCommand,
 };
 use crate::runtime_control::{
-    RuntimeControlCommand, RuntimePanicTestRequest, RuntimePanicTestResponse,
-    RuntimeReconcileRequest, RuntimeReconcileResponse, RuntimeStallRestartTestRequest,
-    RuntimeStallRestartTestResponse,
+    RuntimeAnalysisFloodTestRequest, RuntimeAnalysisFloodTestResponse, RuntimeControlCommand,
+    RuntimePanicTestRequest, RuntimePanicTestResponse, RuntimeReconcileRequest,
+    RuntimeReconcileResponse, RuntimeStallRestartTestRequest, RuntimeStallRestartTestResponse,
 };
 
 const OPERATOR_CHAOS_PATH: &str = "/operator/chaos";
@@ -53,6 +53,7 @@ const OPERATOR_PLATFORM_ANALYSIS_TEST_PATH: &str = "/operator/platform-analysis-
 const OPERATOR_PLATFORM_STATE_PATH: &str = "/operator/platform-state";
 const OPERATOR_RUNTIME_HEALTH_PATH: &str = "/operator/runtime-health";
 const OPERATOR_RUNTIME_RECONCILE_PATH: &str = "/operator/runtime/reconcile";
+const OPERATOR_RUNTIME_ANALYSIS_FLOOD_TEST_PATH: &str = "/operator/runtime/analysis-flood-test";
 const OPERATOR_RUNTIME_PANIC_TEST_PATH: &str = "/operator/runtime/panic-test";
 const OPERATOR_RUNTIME_STALL_RESTART_TEST_PATH: &str = "/operator/runtime/stall-restart-test";
 const OPERATOR_APICP_SNAPSHOT_PATH: &str = "/operator/apicp/snapshot";
@@ -716,6 +717,19 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Err(err) => err.to_response(),
             }
         }
+        OPERATOR_RUNTIME_ANALYSIS_FLOOD_TEST_PATH => {
+            let payload: RuntimeAnalysisFloodTestRequest =
+                match serde_json::from_slice(&request.body) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                    }
+                };
+            match dispatch_runtime_analysis_flood_test(payload, state) {
+                Ok(response) => json_response(200, response),
+                Err(err) => err.to_response(),
+            }
+        }
         OPERATOR_RUNTIME_PANIC_TEST_PATH => {
             let payload: RuntimePanicTestRequest = match serde_json::from_slice(&request.body) {
                 Ok(payload) => payload,
@@ -1134,6 +1148,27 @@ fn dispatch_runtime_reconcile(
     response_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .map_err(|_| ApiError::ServiceUnavailable("Runtime-Reconcile Timeout"))
+}
+
+fn dispatch_runtime_analysis_flood_test(
+    payload: RuntimeAnalysisFloodTestRequest,
+    state: &AppState,
+) -> std::result::Result<RuntimeAnalysisFloodTestResponse, ApiError> {
+    if payload.count == 0 {
+        return Err(ApiError::BadRequest("count muss > 0 sein"));
+    }
+
+    let (response_tx, response_rx) = mpsc::sync_channel(1);
+    state
+        .runtime_tx
+        .send(RuntimeControlCommand::AnalysisFloodTest {
+            request: payload,
+            response_tx,
+        })
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-Control-Channel nicht verfuegbar"))?;
+    response_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-Analysis-Flood-Test Timeout"))
 }
 
 fn dispatch_runtime_panic_test(
@@ -2787,6 +2822,9 @@ mod tests {
             RuntimeControlCommand::StallRestartTest { .. } => {
                 panic!("unerwartetes StallRestartTest-Kommando");
             }
+            RuntimeControlCommand::AnalysisFloodTest { .. } => {
+                panic!("unerwartetes AnalysisFloodTest-Kommando");
+            }
             RuntimeControlCommand::PanicTest { .. } => {
                 panic!("unerwartetes PanicTest-Kommando");
             }
@@ -2810,6 +2848,66 @@ mod tests {
         assert_eq!(payload.respawned_agents, 2);
         assert!(payload.projection_rebuild_requested);
         assert_eq!(payload.repair_last_status, "repaired");
+    }
+
+    #[test]
+    fn runtime_analysis_flood_test_is_forwarded_and_returns_response() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let worker = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::AnalysisFloodTest {
+                request,
+                response_tx,
+            } => {
+                assert_eq!(request.count, 10_000);
+                response_tx
+                    .send(RuntimeAnalysisFloodTestResponse {
+                        accepted: true,
+                        requested: 10_000,
+                        queue_depth: 17,
+                        dropped_total: 9_983,
+                        coalesced_total: 9_999,
+                        note: "bounded queues exercised".to_string(),
+                    })
+                    .unwrap();
+            }
+            other => panic!("unerwartetes Kommando: {other:?}"),
+        });
+
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_RUNTIME_ANALYSIS_FLOOD_TEST_PATH,
+                serde_json::json!({
+                    "count": 10000
+                }),
+            ),
+            &state,
+        );
+
+        worker.join().unwrap();
+        assert_eq!(response.status, 200);
+        let payload: RuntimeAnalysisFloodTestResponse =
+            serde_json::from_slice(&response.body).unwrap();
+        assert!(payload.accepted);
+        assert_eq!(payload.requested, 10_000);
+        assert_eq!(payload.queue_depth, 17);
+        assert_eq!(payload.dropped_total, 9_983);
+        assert_eq!(payload.coalesced_total, 9_999);
+    }
+
+    #[test]
+    fn runtime_analysis_flood_test_rejects_zero_count() {
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_RUNTIME_ANALYSIS_FLOOD_TEST_PATH,
+                serde_json::json!({
+                    "count": 0
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 400);
     }
 
     #[test]

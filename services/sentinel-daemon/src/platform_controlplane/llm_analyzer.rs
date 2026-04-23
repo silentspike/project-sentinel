@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -19,13 +19,12 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use super::{
-    metrics::PlatformMetrics, PlatformAnalysisCommand, PlatformAnalysisRequest,
+    metrics::PlatformMetrics, AnalysisQueueStats, PlatformAnalysisCommand, PlatformAnalysisRequest,
     PlatformControlCommand,
 };
 use crate::config::PlatformControlplaneConfig;
 
 const DEFAULT_GATEWAY_URL: &str = "http://localhost:8080";
-const DEFAULT_CHANNEL_CAPACITY: usize = 16;
 const RECENT_EVENT_SCAN_LIMIT: usize = 256;
 
 #[derive(Debug, Clone)]
@@ -48,7 +47,7 @@ impl LlmAnalyzerConfig {
             prompt_template: config.llm_prompt_template.clone(),
             max_context_events: config.llm_max_context_events.max(1),
             max_failed_interventions: config.llm_max_failed_interventions.max(1),
-            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            channel_capacity: config.llm_analysis_channel_capacity.max(1),
         }
     }
 }
@@ -62,19 +61,23 @@ impl Default for LlmAnalyzerConfig {
             prompt_template: "platform-controlplane-default".to_string(),
             max_context_events: 10,
             max_failed_interventions: 3,
-            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            channel_capacity: 16,
         }
     }
 }
 
 #[derive(Clone)]
 pub struct PlatformLlmAnalyzerHandle {
-    tx: Option<mpsc::UnboundedSender<PlatformAnalysisRequest>>,
+    tx: Option<mpsc::Sender<PlatformAnalysisRequest>>,
+    queue_stats: Arc<Mutex<AnalysisQueueStats>>,
 }
 
 impl PlatformLlmAnalyzerHandle {
     pub fn disabled() -> Self {
-        Self { tx: None }
+        Self {
+            tx: None,
+            queue_stats: Arc::new(Mutex::new(AnalysisQueueStats::default())),
+        }
     }
 
     pub fn spawn(
@@ -95,7 +98,9 @@ impl PlatformLlmAnalyzerHandle {
             }
         };
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<PlatformAnalysisRequest>();
+        let (tx, mut rx) = mpsc::channel::<PlatformAnalysisRequest>(config.channel_capacity.max(1));
+        let queue_stats = Arc::new(Mutex::new(AnalysisQueueStats::default()));
+        let worker_queue_stats = Arc::clone(&queue_stats);
         let worker_config = config.clone();
         tokio::spawn(async move {
             info!(
@@ -106,6 +111,9 @@ impl PlatformLlmAnalyzerHandle {
             );
 
             while let Some(request) = rx.recv().await {
+                if let Ok(mut stats) = worker_queue_stats.lock() {
+                    stats.depth = stats.depth.saturating_sub(1);
+                }
                 if let Err(error) = analyze_and_dispatch(
                     &client,
                     &worker_config,
@@ -122,17 +130,44 @@ impl PlatformLlmAnalyzerHandle {
             info!("Platform LLM Analyzer beendet");
         });
 
-        Self { tx: Some(tx) }
+        Self {
+            tx: Some(tx),
+            queue_stats,
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
         self.tx.is_some()
     }
 
+    pub fn queue_stats(&self) -> AnalysisQueueStats {
+        self.queue_stats
+            .lock()
+            .map(|stats| *stats)
+            .unwrap_or_default()
+    }
+
     pub fn enqueue(&self, request: PlatformAnalysisRequest) -> Result<()> {
         let tx = self.tx.as_ref().context("platform llm analyzer disabled")?;
-        tx.send(request)
-            .map_err(|_| anyhow!("platform llm analyzer worker not running"))
+        if let Ok(mut stats) = self.queue_stats.lock() {
+            stats.depth = stats.depth.saturating_add(1);
+        }
+        match tx.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if let Ok(mut stats) = self.queue_stats.lock() {
+                    stats.depth = stats.depth.saturating_sub(1);
+                    stats.dropped_total = stats.dropped_total.saturating_add(1);
+                }
+                Err(anyhow!("platform llm analyzer queue full"))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                if let Ok(mut stats) = self.queue_stats.lock() {
+                    stats.depth = stats.depth.saturating_sub(1);
+                }
+                Err(anyhow!("platform llm analyzer worker not running"))
+            }
+        }
     }
 }
 
@@ -417,8 +452,6 @@ fn serialize_metrics(metrics: &PlatformMetrics) -> Value {
 mod tests {
     use super::*;
 
-    use std::sync::Mutex;
-
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -640,5 +673,23 @@ mod tests {
             command,
             PlatformControlCommand::ApplyAnalysis(PlatformAnalysisCommand { .. })
         ));
+    }
+
+    #[test]
+    fn enqueue_drops_when_bounded_queue_is_full() {
+        let (tx, _rx) = mpsc::channel(1);
+        let handle = PlatformLlmAnalyzerHandle {
+            tx: Some(tx),
+            queue_stats: Arc::new(Mutex::new(AnalysisQueueStats::default())),
+        };
+
+        handle.enqueue(request("scheduled")).unwrap();
+        let error = handle.enqueue(request("manual")).unwrap_err();
+
+        let stats = handle.queue_stats();
+        assert!(error.to_string().contains("queue full"));
+        assert_eq!(stats.depth, 1);
+        assert_eq!(stats.dropped_total, 1);
+        assert_eq!(stats.coalesced_total, 0);
     }
 }

@@ -42,8 +42,9 @@ use crate::controlplane::ControlplaneKernel;
 use crate::episode_producer::EpisodeProducer;
 use crate::operator_api;
 use crate::runtime_control::{
-    RespawnBackoffTracker, RespawnRetryDecision, RuntimeControlCommand, RuntimePanicTestResponse,
-    RuntimeReconcileRequest, RuntimeReconcileResponse, RuntimeStallRestartTestResponse,
+    RespawnBackoffTracker, RespawnRetryDecision, RuntimeAnalysisFloodTestResponse,
+    RuntimeControlCommand, RuntimePanicTestResponse, RuntimeReconcileRequest,
+    RuntimeReconcileResponse, RuntimeStallRestartTestResponse,
 };
 use crate::runtime_health;
 use crate::shift::{agents_for_shift, detect_current_shift, detect_shift_from_sim_hour};
@@ -2408,6 +2409,58 @@ fn ecs_tick_loop(
                         run_runtime_reconcile(&mut reconcile_ctx, request, &mut respawn_backoff);
                     let _ = response_tx.send(response);
                 }
+                RuntimeControlCommand::AnalysisFloodTest {
+                    request,
+                    response_tx,
+                } => {
+                    for _ in 0..request.count {
+                        platform_cp.enqueue_control_command(
+                            crate::platform_controlplane::PlatformControlCommand::AnalyzeNow,
+                        );
+                    }
+
+                    #[cfg(feature = "llm")]
+                    for idx in 0..request.count {
+                        let synthetic = crate::platform_controlplane::PlatformAnalysisRequest {
+                            trigger: format!("flood_test_{idx}"),
+                            tick: tick_count,
+                            metrics: crate::platform_controlplane::metrics::PlatformMetrics {
+                                tick: tick_count,
+                                ..Default::default()
+                            },
+                            verify_results: HashMap::new(),
+                            failed_interventions: Vec::new(),
+                        };
+                        let _ = platform_llm_analyzer.enqueue(synthetic);
+                    }
+
+                    let mut stats = platform_cp.analysis_queue_stats();
+                    #[cfg(feature = "llm")]
+                    {
+                        let analyzer_stats = platform_llm_analyzer.queue_stats();
+                        stats.depth = stats.depth.saturating_add(analyzer_stats.depth);
+                        stats.dropped_total = stats
+                            .dropped_total
+                            .saturating_add(analyzer_stats.dropped_total);
+                        stats.coalesced_total = stats
+                            .coalesced_total
+                            .saturating_add(analyzer_stats.coalesced_total);
+                    }
+
+                    let note = if cfg!(feature = "llm") {
+                        "bounded controlplane and analyzer queues exercised"
+                    } else {
+                        "bounded controlplane queue exercised; llm feature disabled"
+                    };
+                    let _ = response_tx.send(RuntimeAnalysisFloodTestResponse {
+                        accepted: true,
+                        requested: request.count,
+                        queue_depth: stats.depth,
+                        dropped_total: stats.dropped_total,
+                        coalesced_total: stats.coalesced_total,
+                        note: note.to_string(),
+                    });
+                }
                 RuntimeControlCommand::PanicTest {
                     request,
                     response_tx,
@@ -2703,6 +2756,20 @@ fn ecs_tick_loop(
             &runtime_orch,
             &resource_manager,
         );
+        let mut analysis_queue_stats = platform_cp.analysis_queue_stats();
+        #[cfg(feature = "llm")]
+        {
+            let analyzer_stats = platform_llm_analyzer.queue_stats();
+            analysis_queue_stats.depth = analysis_queue_stats
+                .depth
+                .saturating_add(analyzer_stats.depth);
+            analysis_queue_stats.dropped_total = analysis_queue_stats
+                .dropped_total
+                .saturating_add(analyzer_stats.dropped_total);
+            analysis_queue_stats.coalesced_total = analysis_queue_stats
+                .coalesced_total
+                .saturating_add(analyzer_stats.coalesced_total);
+        }
         runtime_health::publish_runtime_health_snapshot(
             &runtime_health,
             &all_agents,
@@ -2714,6 +2781,7 @@ fn ecs_tick_loop(
             std::path::Path::new(&projection_db_path),
             operator_auth_required,
             service_health_checker.worker_state(),
+            analysis_queue_stats,
         );
 
         // Prune: Empfange Cutoff von Operator-API, arbeite 1 Batch/Tick ab

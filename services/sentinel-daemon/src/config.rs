@@ -484,6 +484,10 @@ pub struct PlatformControlplaneConfig {
     pub llm_max_context_events: usize,
     #[serde(default = "default_pcp_llm_max_failed_interventions")]
     pub llm_max_failed_interventions: usize,
+    #[serde(default = "default_pcp_llm_trigger_queue_capacity")]
+    pub llm_trigger_queue_capacity: usize,
+    #[serde(default = "default_pcp_llm_analysis_channel_capacity")]
+    pub llm_analysis_channel_capacity: usize,
 }
 
 fn default_pcp_enabled() -> bool {
@@ -559,6 +563,12 @@ fn default_pcp_llm_max_context_events() -> usize {
 fn default_pcp_llm_max_failed_interventions() -> usize {
     3
 }
+fn default_pcp_llm_trigger_queue_capacity() -> usize {
+    16
+}
+fn default_pcp_llm_analysis_channel_capacity() -> usize {
+    16
+}
 
 impl Default for PlatformControlplaneConfig {
     fn default() -> Self {
@@ -586,6 +596,8 @@ impl Default for PlatformControlplaneConfig {
             llm_prompt_template: default_pcp_llm_prompt_template(),
             llm_max_context_events: default_pcp_llm_max_context_events(),
             llm_max_failed_interventions: default_pcp_llm_max_failed_interventions(),
+            llm_trigger_queue_capacity: default_pcp_llm_trigger_queue_capacity(),
+            llm_analysis_channel_capacity: default_pcp_llm_analysis_channel_capacity(),
         }
     }
 }
@@ -879,6 +891,8 @@ llm_gateway_timeout_ms = 45000
 llm_prompt_template = "custom-template"
 llm_max_context_events = 23
 llm_max_failed_interventions = 5
+llm_trigger_queue_capacity = 7
+llm_analysis_channel_capacity = 11
 "#;
         let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
         let cfg = file.daemon.platform_controlplane;
@@ -904,5 +918,7 @@ llm_max_failed_interventions = 5
         assert_eq!(cfg.llm_prompt_template, "custom-template");
         assert_eq!(cfg.llm_max_context_events, 23);
         assert_eq!(cfg.llm_max_failed_interventions, 5);
+        assert_eq!(cfg.llm_trigger_queue_capacity, 7);
+        assert_eq!(cfg.llm_analysis_channel_capacity, 11);
     }
 }
