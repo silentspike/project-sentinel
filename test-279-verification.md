@@ -1715,3 +1715,262 @@ url=https://github.com/silentspike/project-sentinel/issues/279
 ```
 
 PASS: No Daemon-side model policy change was introduced, and #279 remains open for the AC matrix, benchmarks, PR and verified close sequence.
+
+## Phase 11 - Full AC Matrix On VM
+
+Date: 2026-04-23
+Command target: `ubuntu@10.0.0.240`
+Operator helper: `/tmp/opcurl`
+
+### AC-1 - Runtime-Health Is Truth-Capable
+
+Command:
+
+```bash
+ssh ubuntu@10.0.0.240 "API_AGENTS=\$(curl -s localhost:8000/api/agents | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))'); echo api_agents=\$API_AGENTS; /tmp/opcurl http://127.0.0.1:8084/operator/runtime-health | python3 -c 'import sys,json; d=json.load(sys.stdin); print(\"expected_active_agents=%s\" % d[\"expected_active_agents\"]); print(\"runtime_agents=%s\" % d[\"runtime_agents\"]); print(\"projection_agents=%s\" % d[\"projection_agents\"]); print(\"projection_drift_detected=%s\" % d[\"projection_drift_detected\"]); print(\"stale_runtime_entries=%s\" % d[\"stale_runtime_entries\"]); print(\"orphan_cgroups=%s\" % d[\"orphan_cgroups\"]); print(\"zombie_tracked_pids=%s\" % d[\"zombie_tracked_pids\"])'"
+```
+
+Observed:
+
+```text
+api_agents=26
+expected_active_agents=26
+runtime_agents=26
+projection_agents=26
+projection_drift_detected=False
+stale_runtime_entries=0
+orphan_cgroups=0
+zombie_tracked_pids=0
+```
+
+PASS: API-, runtime-, projection-, drift-, stale-, orphan- and zombie-truth are live-readable.
+
+Dynamic candidate:
+
+```text
+candidate_id=1
+candidate_name=Thomas Mueller
+candidate_pid=1487965
+```
+
+### AC-2 - Stall Recovery Brings The Agent Back
+
+Command:
+
+```bash
+ssh ubuntu@10.0.0.240 "/tmp/opcurl -X POST http://127.0.0.1:8084/operator/runtime/stall-restart-test -H 'Content-Type: application/json' -d '{\"agent_id\":1,\"mode\":\"sigstop\",\"stall_secs\":35}' | python3 -m json.tool"
+```
+
+Observed:
+
+```text
+"accepted": true
+"agent_id": 1
+"agent_name": "Thomas Mueller"
+"mode": "sigstop"
+"stall_secs": 35
+"pid_before": 1487965
+"pid_after": 1488241
+"runtime_present_after": true
+"security_runtime_present_after": true
+"note": "fast_path_restart_executed_without_shift_wait"
+```
+
+Post-check:
+
+```text
+expected 26 runtime 26 projection 26 cgroups 26 stale 0 orphans 0 zombies 0 drift False
+agent_id=1 tracked_pid=1488241 tracked_pid_alive=True tracked_pid_state=S last_repair_status=healthy
+```
+
+PASS: The stalled Agent was respawned immediately, not on the shift-cycle path, and the VM returned to the healthy gate.
+
+### AC-3 - Restore And Reconcile Leave No Runtime Remainders
+
+Command:
+
+```bash
+ssh ubuntu@10.0.0.240 "/tmp/opcurl -X POST http://127.0.0.1:8084/operator/security/fs-ransomware-test -H 'Content-Type: application/json' -d '{\"agent_name\":\"Thomas Mueller\",\"relative_path\":\"issue279-restore-proof.txt\",\"snapshot_label\":\"issue279\"}' | python3 -m json.tool"
+```
+
+Observed:
+
+```text
+"accepted": true
+"agent_name": "Thomas Mueller"
+"relative_path": "issue279-restore-proof.txt"
+"host_path": "/opt/sentinel/fs/AGENT-01/issue279-restore-proof.txt"
+"snapshot_id": "019dba53-6ebb-7bf0-adc6-5de8e8569405"
+"bytes_written": 53
+"before_sha256": "697778f98aa060f58c08bf1d5802ed2ce141ca18dbcbb28eead7acfff15c4d26"
+"mutated_sha256": "9e739a632710cceab9ea861a442390633bf1c541e0f1193d64803ac79804bd3a"
+"restored_sha256": "697778f98aa060f58c08bf1d5802ed2ce141ca18dbcbb28eead7acfff15c4d26"
+"restored": true
+"snapshot_wait_ms": 996
+"restore_wait_ms": 1002
+```
+
+Reconcile command:
+
+```bash
+ssh ubuntu@10.0.0.240 "/tmp/opcurl -X POST http://127.0.0.1:8084/operator/runtime/reconcile -H 'Content-Type: application/json' -d '{\"dry_run\":false,\"projection_rebuild\":true,\"respawn_missing\":true}' | python3 -m json.tool"
+```
+
+Observed:
+
+```text
+"accepted": true
+"stale_agents_before": 26
+"stale_agents_after": 0
+"orphan_cgroups_before": 0
+"orphan_cgroups_after": 0
+"orphan_cgroups_removed": 26
+"respawned_agents": 26
+"respawn_failures_total": 0
+"projection_rebuild_requested": true
+"errors": []
+```
+
+Final gate after Projection rebuild:
+
+```text
+expected 26 runtime 26 projection 26 cgroups 26 stale 0 orphans 0 zombies 0 drift False respawn_failures 0
+```
+
+PASS: Restore preserves original data hash and Reconcile leaves no stale runtime entries or orphan cgroups. Note: this AC also exposed a conservative full-respawn after the restore path; it ends healthy and is captured as evidence rather than hidden.
+
+### AC-4 - Projection/API Converges Back To Runtime Truth
+
+Drift trigger:
+
+```bash
+ssh ubuntu@10.0.0.240 "timeout 10 sqlite3 /opt/sentinel/data/projection.db \"PRAGMA busy_timeout=5000; SELECT COUNT(*) FROM agent_live_view WHERE agent_id=1;\" | grep -qx '1' && echo precheck_agent_row=1"
+ssh ubuntu@10.0.0.240 "set -e; out=\$(timeout 10 sqlite3 /opt/sentinel/data/projection.db \"PRAGMA busy_timeout=5000; BEGIN IMMEDIATE; DELETE FROM agent_live_view WHERE agent_id=1; SELECT changes(); COMMIT;\"); echo changes=\$out"
+```
+
+Observed:
+
+```text
+precheck_agent_row=1
+changes=5000 1
+```
+
+The row delete succeeded. The `5000` prefix is SQLite echoing `PRAGMA busy_timeout`; the command chain stopped before Reconcile because the first script variant expected exactly `1`.
+
+Repair command:
+
+```bash
+ssh ubuntu@10.0.0.240 "/tmp/opcurl -X POST http://127.0.0.1:8084/operator/runtime/reconcile -H 'Content-Type: application/json' -d '{\"dry_run\":false,\"projection_rebuild\":true,\"respawn_missing\":false}' | python3 -m json.tool"
+```
+
+Observed:
+
+```text
+before_reconcile expected 26 runtime 26 projection 9 stale 17 drift True
+"accepted": true
+"stale_agents_before": 17
+"stale_agents_after": 17
+"projection_drift_before": true
+"projection_drift_after": true
+"projection_rebuild_requested": true
+"errors": []
+```
+
+Convergence polling:
+
+```text
+1 26 26 26 26 34 0 0 True
+2 26 26 26 26 34 0 0 True
+3 26 26 25 26 33 0 0 True
+4 26 26 26 26 0 0 0 False
+```
+
+PASS: Controlled Projection drift became visible and converged back to runtime truth without a Projection restart storm.
+
+### AC-5 - Worker Panic Causes In-Process Respawn
+
+Command:
+
+```bash
+ssh ubuntu@10.0.0.240 "pid_before=\$(pgrep -x sentinel-daemon); /tmp/opcurl -X POST http://127.0.0.1:8084/operator/runtime/panic-test -H 'Content-Type: application/json' -d '{\"worker\":\"service_health\"}'; sleep 4; pid_after=\$(pgrep -x sentinel-daemon); echo pid_before=\$pid_before pid_after=\$pid_after; /tmp/opcurl http://127.0.0.1:8084/operator/runtime-health | python3 -c 'import sys,json; d=json.load(sys.stdin); w=d[\"worker_states\"][\"service_health\"]; print(\"running=%s\" % w[\"running\"]); print(\"restart_count=%s\" % w[\"restart_count\"]); print(\"last_error=%s\" % w[\"last_error\"]); print(\"health=%s/%s/%s/%s stale=%s orphans=%s zombies=%s drift=%s\" % (d[\"expected_active_agents\"],d[\"runtime_agents\"],d[\"projection_agents\"],d[\"live_cgroup_dirs\"],d[\"stale_runtime_entries\"],d[\"orphan_cgroups\"],d[\"zombie_tracked_pids\"],d[\"projection_drift_detected\"]))'; journalctl -u sentinel-daemon --since '2 min ago' --no-pager | grep -E 'panic-test requested|Service-Health-Worker panicked|respawn' || true"
+```
+
+Observed:
+
+```text
+{"accepted":true,"worker":"service_health","note":"panic-test dispatched"}
+pid_before=1485419 pid_after=1485419
+running=True
+restart_count=1
+last_error=panic-test requested for service_health
+health=26/26/26/26 stale=34 orphans=0 zombies=0 drift=True
+panic-test requested for service_health
+service-health-checker panicked, respawn im selben Daemon-Prozess error=panic-test requested for service_health
+```
+
+Final gate after the still-running Projection rebuild:
+
+```text
+11 26 26 26 26 0 0 0 False
+```
+
+PASS: The Daemon PID stayed constant, the worker respawned in-process, and the VM returned to the healthy gate.
+
+### AC-6 - Analysis And Recovery Path Is Bounded
+
+Command:
+
+```bash
+ssh ubuntu@10.0.0.240 "RSS_BEFORE=\$(ps -o rss= -p \$(pgrep -x sentinel-daemon) | tr -d ' '); /tmp/opcurl -X POST http://127.0.0.1:8084/operator/runtime/analysis-flood-test -H 'Content-Type: application/json' -d '{\"count\":10000}'; sleep 5; RSS_AFTER=\$(ps -o rss= -p \$(pgrep -x sentinel-daemon) | tr -d ' '); /tmp/opcurl http://127.0.0.1:8084/operator/runtime-health | python3 -c 'import sys,json; d=json.load(sys.stdin); print(\"analysis_queue_depth=%s\" % d[\"analysis_queue_depth\"]); print(\"analysis_queue_dropped_total=%s\" % d[\"analysis_queue_dropped_total\"]); print(\"analysis_queue_coalesced_total=%s\" % d[\"analysis_queue_coalesced_total\"]); print(\"health=%s/%s/%s/%s stale=%s orphans=%s zombies=%s drift=%s\" % (d[\"expected_active_agents\"],d[\"runtime_agents\"],d[\"projection_agents\"],d[\"live_cgroup_dirs\"],d[\"stale_runtime_entries\"],d[\"orphan_cgroups\"],d[\"zombie_tracked_pids\"],d[\"projection_drift_detected\"]));'; echo rss_before_kb=\$RSS_BEFORE; echo rss_after_kb=\$RSS_AFTER; echo rss_delta_kb=\$((RSS_AFTER-RSS_BEFORE))"
+```
+
+Observed:
+
+```text
+{"accepted":true,"requested":10000,"queue_depth":17,"dropped_total":9983,"coalesced_total":9999,"note":"bounded controlplane and analyzer queues exercised"}
+analysis_queue_depth=1
+analysis_queue_dropped_total=9983
+analysis_queue_coalesced_total=9999
+health=26/26/26/26 stale=0 orphans=0 zombies=0 drift=False
+rss_before_kb=218204
+rss_after_kb=218124
+rss_delta_kb=-80
+```
+
+PASS: Queue pressure is bounded, drop/coalesce counters are visible, RSS is controlled, and the healthy gate remains true.
+
+### AC-7 - 30-Minute VM Soak Ends Healthy
+
+Soak script:
+
+```bash
+scp scripts/vm-issue-279-soak.sh ubuntu@10.0.0.240:/tmp/vm-issue-279-soak.sh
+ssh ubuntu@10.0.0.240 "sudo install -m 755 /tmp/vm-issue-279-soak.sh /opt/sentinel/scripts/vm-issue-279-soak.sh"
+ssh ubuntu@10.0.0.240 "ISSUE279_SOAK_SECONDS=1800 ISSUE279_POLL_INTERVAL=60 /opt/sentinel/scripts/vm-issue-279-soak.sh"
+```
+
+Observed final output:
+
+```text
+30	2026-04-23T13:05:39Z	26	26	26	26	0	0	0	False	0	9983	9999	26	26	26	26
+final_health=26/26/26/26 stale=0 orphans=0 zombies=0 drift=False
+api_agents=26
+projection_db_active=26
+cgroup_dirs=26
+cgroup_live_dirs=26
+daemon_journal_panic_or_drift=0
+SOAK_PASS out_dir=/tmp/issue279-soak-20260423T123633Z
+```
+
+Artifact summary:
+
+```text
+/tmp/issue279-soak-20260423T123633Z
+health.tsv: 30 samples, all 26/26/26/26 and drift=False
+final-health.json: expected/runtime/projection/cgroups 26/26/26/26, stale=0, orphans=0, zombies=0
+system.tsv: daemon RSS final 250748 KB, daemon CPU 0.3%, projection RSS 9564 KB
+daemon-journal.log: no panic/drift hits during soak window
+projection-journal.log: no panic/error/database-is-locked hits during soak window
+```
+
+PASS: The 30-minute VM soak ended at the canonical active-agent target with no panic or drift regression.

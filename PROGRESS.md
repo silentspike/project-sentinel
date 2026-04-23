@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan279.md`
-- Overall status: `TASK_12_DONE_TASK_13_PENDING`
-- Current task: `Task 13 - Phase 5: AC-Matrix`
+- Overall status: `TASK_13_DONE_TASK_14_PENDING`
+- Current task: `Task 14 - Benchmarks`
 - Current branch: `feat/issue-279-daemon-hardening-v2`
 - Worktree: `/work/company/project-sentinel-279-review`
 - Base: `origin/main @ 83ab01c8835804fd951e619aa048324b7ff76ddf`
@@ -88,6 +88,15 @@
   - zweiter VM-Deploy mit Daemon-Hash `d6c30a324d85cbb3ec9d919a14e5f5744482cda75e59984e6133944289129d86`
   - Live-Reconcile meldete `orphan_cgroups_before=3`, `orphan_cgroups_after=0`, `orphan_cgroups_removed=3`
   - finaler Runtime-Health-Gate ist gruen: `expected/runtime/projection/cgroups = 26/26/26/26`, `stale=0`, `orphans=0`, `zombies=0`, `drift=false`, Dashboard-API `26`
+- Task 13 ist erledigt:
+  - `/tmp/opcurl` ist auf der VM installiert und operator-auth-aware
+  - AC-1 bis AC-7 wurden auf `10.0.0.240` mit echten Commands/Outputs belegt
+  - AC-2 Stall-Restart wechselte `Thomas Mueller` von PID `1487965` auf `1488241` und blieb healthy
+  - AC-3 Restore stellte den Original-Hash wieder her; Reconcile brachte die VM danach zurueck auf `26/26/26/26`
+  - AC-4 Projection-Drift wurde per SQLite-Delete erzeugt und durch Reconcile/Rebuild wieder auf `26/26/26/26` gebracht
+  - AC-5 `service_health` Panic-Test blieb im selben Daemon-PID `1485419`, Worker `running=true`, `restart_count=1`
+  - AC-6 Flood-Test mit `10000` Triggern blieb bounded: `queue_depth=1`, `dropped=9983`, `coalesced=9999`, `rss_delta_kb=-80`
+  - AC-7 30-Minuten-Soak endete PASS; Artefakte liegen auf der VM unter `/tmp/issue279-soak-20260423T123633Z`
 
 ## Blocked items
 
@@ -131,7 +140,7 @@
 | 10 | Out-of-scope Follow-up - Haiku-Policy | DONE | separates Gateway-/Policy-Issue #314 erstellt und in #279 verlinkt, nicht #279-Close-Bedingung | command, inspect |
 | 11 | Phase 3 - Tests, Clippy, Builds | DONE | cargo remote only, relevant packages, conditional FUSE/Landlock matrix | command |
 | 12 | Phase 4 - Deploy auf die VM | DONE | ExecStart pruefen, scp/install, restart, post-restart smoke, Projection-/Cgroup-Drift reparieren | command, system |
-| 13 | Phase 5 - AC-Matrix | PENDING | alle ACs mit Command, Output, PASS auf VM | command, system |
+| 13 | Phase 5 - AC-Matrix | DONE | alle ACs mit Command, Output, PASS auf VM | command, system |
 | 14 | Benchmarks | PENDING | Recovery, Queue, Soak, Sidecar-Monitoring | command, system |
 | 15 | PR- und Close-Sequenz | PENDING | PR mit Pflichtsektionen, labels, merge, branch delete, issue close erst nach verified | command |
 | 16 | Plan-Verifikation | PENDING | Plan Zeile fuer Zeile gegen Ergebnis pruefen, Abweichungen fixen | inspect, command |
