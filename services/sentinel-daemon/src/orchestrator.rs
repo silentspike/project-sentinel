@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use tracing::{debug, error, info, warn};
 
 use sentinel_common::agent_config::{load_all_agents, AgentConfig};
@@ -61,6 +61,162 @@ fn default_agent_limits() -> CgroupLimits {
     CgroupLimits::default()
 }
 
+fn record_security_runtime_snapshot(
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    agent_id: AgentId,
+    agent_name: &str,
+    bwrap_pid: Option<u32>,
+    fs_mount: Option<&str>,
+) {
+    let aggregate_id = format!("AGENT-{:02}", agent_id.0);
+    if let Ok(mut state) = security_runtime_state.write() {
+        state.insert(
+            agent_id.0,
+            operator_api::SecurityAgentRuntimeSnapshot {
+                agent_id: agent_id.0,
+                aggregate_id: aggregate_id.clone(),
+                agent_name: agent_name.to_string(),
+                bwrap_pid,
+                home_host_path: match fs_mount {
+                    Some(mount) => format!("{mount}/{aggregate_id}"),
+                    None => format!("/ram/agents/{agent_name}"),
+                },
+                fs_mount: fs_mount.map(str::to_string),
+            },
+        );
+    }
+}
+
+fn remove_security_runtime_snapshot(
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    agent_id: AgentId,
+) {
+    if let Ok(mut state) = security_runtime_state.write() {
+        state.remove(&agent_id.0);
+    }
+}
+
+fn proc_state(pid: u32) -> Option<char> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("State:")?.trim();
+        value.chars().next()
+    })
+}
+
+fn signal_pid(pid: u32, signal: &str) -> Result<()> {
+    let status = std::process::Command::new("kill")
+        .args([format!("-{signal}"), pid.to_string()])
+        .status()
+        .with_context(|| format!("kill -{signal} fuer PID {pid} fehlgeschlagen"))?;
+    if status.success() || !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        Ok(())
+    } else {
+        Err(anyhow!("kill -{signal} fuer PID {pid} lieferte {status}"))
+    }
+}
+
+fn mountpoint_is_active(path: &std::path::Path) -> bool {
+    let target = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .ok()
+        .map(|mountinfo| {
+            mountinfo
+                .lines()
+                .filter_map(|line| {
+                    let (left, right) = line.split_once(" - ")?;
+                    let mountpoint = left.split_whitespace().nth(4)?;
+                    let mut suffix = right.split_whitespace();
+                    let fs_type = suffix.next()?;
+                    let mount_source = suffix.next()?;
+                    Some((mountpoint, fs_type, mount_source))
+                })
+                .any(|(mountpoint, fs_type, mount_source)| {
+                    mountpoint == target && fs_type == "fuse" && mount_source == "sentinel-fs"
+                })
+        })
+        .unwrap_or(false)
+}
+
+fn suspend_pids(pids: &[u32], tracked_pid: Option<u32>) -> Result<()> {
+    let mut unique_pids = pids.to_vec();
+    unique_pids.sort_unstable();
+    unique_pids.dedup();
+    if unique_pids.is_empty() {
+        return Err(anyhow!("keine PIDs zum Suspendieren vorhanden"));
+    }
+
+    for pid in &unique_pids {
+        signal_pid(*pid, "STOP")?;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let mut stopped = Vec::new();
+        let mut still_running = Vec::new();
+        let mut tracked_state = None;
+        for pid in &unique_pids {
+            match proc_state(*pid) {
+                Some('T') => stopped.push(*pid),
+                Some(state) => {
+                    if Some(*pid) == tracked_pid {
+                        tracked_state = Some(state);
+                    }
+                    if state != 'Z' {
+                        still_running.push((*pid, state));
+                    }
+                }
+                None => {
+                    if Some(*pid) == tracked_pid {
+                        tracked_state = None;
+                    }
+                }
+            }
+        }
+        if still_running.is_empty() && !stopped.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            if !still_running.is_empty() {
+                let details = still_running
+                    .into_iter()
+                    .map(|(pid, state)| format!("{pid}:{state}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(anyhow!("PIDs nach SIGSTOP nicht angehalten: {details}"));
+            }
+            if let Some(pid) = tracked_pid {
+                let suffix = tracked_state
+                    .map(|state| format!(" (tracked state={state})"))
+                    .unwrap_or_default();
+                return Err(anyhow!(
+                    "kein laufender PID erreichte nach SIGSTOP Zustand T; tracked PID {pid}{suffix}"
+                ));
+            }
+            return Err(anyhow!(
+                "kein laufender PID erreichte nach SIGSTOP Zustand T"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn suspend_agent_cgroup_processes(agent_name: &str, tracked_pid: Option<u32>) -> Result<Vec<u32>> {
+    let mut pids = sentinel_sandbox::cgroups::list_pids_in_cgroup(agent_name)
+        .with_context(|| format!("cgroup-Mitglieder fuer {agent_name} nicht lesbar"))?;
+    if let Some(pid) = tracked_pid {
+        pids.push(pid);
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    suspend_pids(&pids, tracked_pid)?;
+    Ok(pids)
+}
+
 /// Spawnt einen Agenten sowohl im RuntimeOrchestrator als auch in der ECS World.
 /// Richtet die Sandbox (cgroup + home dir + bwrap-Prozess) ein wenn verfuegbar.
 /// Gibt `true` zurueck wenn erfolgreich.
@@ -74,6 +230,8 @@ fn spawn_agent_full(
     ebpf_collector: &mut EbpfCollector,
     agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
     agent_command: &[String],
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    fs_mount: Option<&str>,
 ) -> bool {
     let agent_id = AgentId(agent_cfg.identity.id);
     let identity = AgentIdentity {
@@ -124,7 +282,12 @@ fn spawn_agent_full(
             // Agent-Prozess in bwrap starten (TOGAF: agent-runtime)
             if let Some(handle) = sandbox_handles.get_mut(&agent_id) {
                 if handle.cgroup_created {
-                    match sandbox.start_agent_process(&agent_cfg.identity.name, agent_command) {
+                    let aggregate_id = format!("AGENT-{:02}", agent_id.0);
+                    match sandbox.start_agent_process(
+                        &agent_cfg.identity.name,
+                        Some(&aggregate_id),
+                        agent_command,
+                    ) {
                         Ok(proc) => {
                             let pid = proc.pid;
                             info!(
@@ -142,6 +305,13 @@ fn spawn_agent_full(
 
                             // AgentProcess aufbewahren (haelt Child am Leben, Drop reaps Zombie)
                             agent_processes.insert(agent_id, proc);
+                            record_security_runtime_snapshot(
+                                security_runtime_state,
+                                agent_id,
+                                &agent_cfg.identity.name,
+                                Some(pid),
+                                fs_mount,
+                            );
 
                             // Network-Namespace Isolation (optional)
                             let agent_index = (agent_cfg.identity.id % 255) as u8;
@@ -164,6 +334,13 @@ fn spawn_agent_full(
                                 error = %e,
                                 "Agent-Prozess konnte nicht gestartet werden (ECS-only Fallback)"
                             );
+                            record_security_runtime_snapshot(
+                                security_runtime_state,
+                                agent_id,
+                                &agent_cfg.identity.name,
+                                None,
+                                fs_mount,
+                            );
                         }
                     }
                 }
@@ -174,6 +351,13 @@ fn spawn_agent_full(
                 agent = %agent_cfg.identity.name,
                 error = %e,
                 "Sandbox setup fehlgeschlagen (Agent laeuft ohne Isolation)"
+            );
+            record_security_runtime_snapshot(
+                security_runtime_state,
+                agent_id,
+                &agent_cfg.identity.name,
+                None,
+                fs_mount,
             );
         }
     }
@@ -221,6 +405,19 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
     let event_store = Arc::new(event_store);
 
+    let fs_layer = if config.fs_mount.is_some() {
+        let cas = sentinel_fs::cas::CasStore::open(data_dir).context("sentinel-fs CAS oeffnen")?;
+        let meta = sentinel_fs::metadata::MetadataStore::open(data_dir.join("metadata.redb"))
+            .context("sentinel-fs Metadata oeffnen")?;
+        let layer = Arc::new(sentinel_fs::layer::LayerManager::new(cas, meta));
+        layer
+            .init_base_root()
+            .context("sentinel-fs Base-Root initialisieren")?;
+        Some(layer)
+    } else {
+        None
+    };
+
     // -- Agent-Definitionen laden --
     let agents_dir = config.config_dir.join("agents");
     let all_agents = load_all_agents(&agents_dir)
@@ -260,25 +457,34 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     #[cfg(feature = "fuse")]
     if let Some(ref fs_mount) = config.fs_mount {
         let mountpoint = std::path::PathBuf::from(fs_mount);
-        let data_dir_clone = data_dir.clone();
+        let fs_layer_clone = fs_layer
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("sentinel-fs Layer nicht initialisiert"))?;
         if !mountpoint.exists() {
             std::fs::create_dir_all(&mountpoint)
                 .with_context(|| format!("FUSE mountpoint erstellen: {}", mountpoint.display()))?;
         }
         info!(
             mountpoint = %mountpoint.display(),
-            data_dir = %data_dir_clone.display(),
+            data_dir = %data_dir.display(),
             "sentinel-fs FUSE-Mount starten"
         );
         let mountpoint_check = mountpoint.clone();
         std::thread::spawn(move || {
-            if let Err(e) = sentinel_fs::fuse::start_fuse(&data_dir_clone, &mountpoint) {
+            if let Err(e) = sentinel_fs::fuse::start_fuse_layer(fs_layer_clone, &mountpoint) {
                 error!(error = %e, "sentinel-fs FUSE-Mount fehlgeschlagen");
             }
         });
-        // Kurz warten bis FUSE mounted ist
-        std::thread::sleep(Duration::from_millis(200));
-        if mountpoint_check.join("__BASE__").exists() || mountpoint_check.read_dir().is_ok() {
+        let mut mount_ready = false;
+        for _ in 0..20 {
+            if mountpoint_is_active(&mountpoint_check) {
+                mount_ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if mount_ready {
             info!(mountpoint = %mountpoint_check.display(), "sentinel-fs FUSE-Mount aktiv");
         } else {
             warn!(mountpoint = %mountpoint_check.display(), "sentinel-fs FUSE-Mount moeglicherweise nicht bereit");
@@ -385,6 +591,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let platform_state = Arc::new(RwLock::new(
         crate::platform_controlplane::PlatformStateSnapshot::default(),
     ));
+    let security_runtime_state: operator_api::SharedSecurityRuntimeState =
+        Arc::new(RwLock::new(HashMap::new()));
 
     // -- Zenoh SentinelBus (Core-Bus fuer Real-Time Event-Verteilung) --
     let bus_config = config.zenoh.to_bus_config();
@@ -482,6 +690,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         Some(
             operator_api::start_server(
                 config.operator_api.clone(),
+                data_dir.to_path_buf(),
+                config.fs_mount.clone(),
+                fs_layer.clone(),
                 operator_room_ids,
                 operator_tx.clone(),
                 platform_tx.clone(),
@@ -492,6 +703,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 prune_tx.clone(),
                 Arc::clone(&state_store),
                 Arc::clone(&platform_state),
+                Arc::clone(&security_runtime_state),
             )
             .await?,
         )
@@ -524,6 +736,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let platform_cp_config = config.platform_controlplane.clone();
     let events_db_path = events_path.to_string_lossy().to_string();
     let ecs_platform_state = Arc::clone(&platform_state);
+    let ecs_security_runtime_state = Arc::clone(&security_runtime_state);
+    let ecs_fs_mount = config.fs_mount.clone();
     let ecs_handle = std::thread::Builder::new()
         .name("ecs-tick-loop".into())
         .spawn(move || {
@@ -560,6 +774,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 platform_cp_config,
                 events_db_path,
                 ecs_platform_state,
+                ecs_security_runtime_state,
+                ecs_fs_mount,
+                fs_layer.clone(),
                 #[cfg(feature = "llm")]
                 platform_llm_analyzer.clone(),
             )
@@ -881,6 +1098,7 @@ fn publish_platform_state_snapshot(
     if let Ok(mut snapshot) = platform_state.write() {
         *snapshot = crate::platform_controlplane::PlatformStateSnapshot {
             current_tick: tick_count,
+            cycle_interval_ticks: platform_cp.config().cycle_interval_ticks,
             ebpf_collect_interval_ticks: platform_cp.config().ebpf_collect_interval_ticks,
             stall_detection_threshold_secs: platform_cp.config().stall_detection_threshold_secs,
             stall_recent_activity_grace_ticks: platform_cp
@@ -1066,6 +1284,9 @@ fn ecs_tick_loop(
     platform_cp_config: crate::config::PlatformControlplaneConfig,
     events_db_path_str: String,
     platform_state: Arc<RwLock<crate::platform_controlplane::PlatformStateSnapshot>>,
+    security_runtime_state: operator_api::SharedSecurityRuntimeState,
+    fs_mount: Option<String>,
+    fs_layer: Option<Arc<sentinel_fs::layer::LayerManager>>,
     #[cfg(feature = "llm")]
     platform_llm_analyzer: crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle,
 ) -> Result<u64> {
@@ -1314,8 +1535,12 @@ fn ecs_tick_loop(
                 // Agent-Prozess in bwrap starten (TOGAF: agent-runtime)
                 if let Some(h) = sandbox_handles.get_mut(&agent_id) {
                     if h.cgroup_created {
-                        match sandbox.start_agent_process(&agent_cfg.identity.name, &agent_command)
-                        {
+                        let aggregate_id = format!("AGENT-{:02}", agent_id.0);
+                        match sandbox.start_agent_process(
+                            &agent_cfg.identity.name,
+                            Some(&aggregate_id),
+                            &agent_command,
+                        ) {
                             Ok(proc) => {
                                 let pid = proc.pid;
                                 info!(
@@ -1334,6 +1559,13 @@ fn ecs_tick_loop(
 
                                 // AgentProcess aufbewahren (Drop reaps Zombie)
                                 agent_processes.insert(agent_id, proc);
+                                record_security_runtime_snapshot(
+                                    &security_runtime_state,
+                                    agent_id,
+                                    &agent_cfg.identity.name,
+                                    Some(pid),
+                                    fs_mount.as_deref(),
+                                );
 
                                 // Network-Namespace Isolation (optional)
                                 let agent_index = (agent_cfg.identity.id % 255) as u8;
@@ -1356,8 +1588,23 @@ fn ecs_tick_loop(
                                     error = %e,
                                     "Agent-Prozess konnte nicht gestartet werden (ECS-only Fallback)"
                                 );
+                                record_security_runtime_snapshot(
+                                    &security_runtime_state,
+                                    agent_id,
+                                    &agent_cfg.identity.name,
+                                    None,
+                                    fs_mount.as_deref(),
+                                );
                             }
                         }
+                    } else {
+                        record_security_runtime_snapshot(
+                            &security_runtime_state,
+                            agent_id,
+                            &agent_cfg.identity.name,
+                            None,
+                            fs_mount.as_deref(),
+                        );
                     }
                 }
             }
@@ -1366,6 +1613,13 @@ fn ecs_tick_loop(
                     agent = %agent_cfg.identity.name,
                     error = %e,
                     "Sandbox setup fehlgeschlagen (Agent laeuft ohne Isolation)"
+                );
+                record_security_runtime_snapshot(
+                    &security_runtime_state,
+                    agent_id,
+                    &agent_cfg.identity.name,
+                    None,
+                    fs_mount.as_deref(),
                 );
             }
         }
@@ -1587,6 +1841,40 @@ fn ecs_tick_loop(
                             }
                         }
                     }
+                    crate::platform_controlplane::rules::PlatformSideEffect::SuspendAgent(
+                        agent_id,
+                    ) => {
+                        if let Some(handle) = sandbox_handles.get(&agent_id) {
+                            match suspend_agent_cgroup_processes(
+                                &handle.agent_name,
+                                handle.bwrap_pid,
+                            ) {
+                                Ok(pids) => {
+                                    info!(
+                                        agent_id = %agent_id,
+                                        agent = %handle.agent_name,
+                                        tracked_pid = ?handle.bwrap_pid,
+                                        stopped_pids = pids.len(),
+                                        "Agent nach Write-Anomaly via SIGSTOP suspendiert"
+                                    );
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        agent_id = %agent_id,
+                                        agent = %handle.agent_name,
+                                        tracked_pid = ?handle.bwrap_pid,
+                                        error = %error,
+                                        "SIGSTOP fuer Write-Anomaly fehlgeschlagen"
+                                    );
+                                }
+                            }
+                        } else {
+                            warn!(
+                                agent_id = %agent_id,
+                                "SandboxHandle fuer Write-Anomaly-Suspend fehlt"
+                            );
+                        }
+                    }
                     crate::platform_controlplane::rules::PlatformSideEffect::RestartAgent(
                         agent_id,
                     ) => {
@@ -1604,6 +1892,7 @@ fn ecs_tick_loop(
                         }
                         // Agent-Prozess droppen
                         agent_processes.remove(&agent_id);
+                        remove_security_runtime_snapshot(&security_runtime_state, agent_id);
                         // ECS Entity despawnen
                         despawn_agent_from_world(&mut world, agent_id);
                         // RuntimeOrchestrator despawn
@@ -1687,6 +1976,7 @@ fn ecs_tick_loop(
                     }
                     // AgentProcess droppen (reaps Zombie via Drop impl)
                     agent_processes.remove(agent_id);
+                    remove_security_runtime_snapshot(&security_runtime_state, *agent_id);
 
                     if !despawn_agent_from_world(&mut world, *agent_id) {
                         warn!(agent_id = %agent_id, "ECS Entity fuer entfernten Agent nicht gefunden");
@@ -1893,6 +2183,8 @@ fn ecs_tick_loop(
                         &mut ebpf_collector,
                         &mut agent_processes,
                         &agent_command,
+                        &security_runtime_state,
+                        fs_mount.as_deref(),
                     ) {
                         // GOLF: Default-Goals fuer neuen Schicht-Agent erstellen
                         let existing = episode_producer
@@ -2051,9 +2343,19 @@ fn ecs_tick_loop(
                     .get_resource::<sentinel_ecs::RedbStateStore>()
                     .map(|rs| rs.store.clone());
                 if let Some(ss) = state_store_for_snapshot {
-                    match snapshot_manager
-                        .create_and_store(&mut world, &ss, &es, tick_count, sim_hour)
-                    {
+                    let data_dir = std::path::Path::new(&events_db_path_str)
+                        .parent()
+                        .unwrap_or(std::path::Path::new("/opt/sentinel/data"));
+                    match snapshot_manager.create_and_store(
+                        &mut world,
+                        &ss,
+                        &es,
+                        data_dir,
+                        fs_layer.as_deref(),
+                        fs_mount.as_deref(),
+                        tick_count,
+                        sim_hour,
+                    ) {
                         Ok(id) => {
                             debug!(snapshot_id = %id, "World Snapshot erstellt");
                             // Maintenance: Promotion + Cleanup
@@ -2078,8 +2380,19 @@ fn ecs_tick_loop(
                 .get_resource::<sentinel_ecs::RedbStateStore>()
                 .map(|rs| rs.store.clone());
             if let (Some(es), Some(ss)) = (event_store_for_snap, state_store_for_snap) {
-                match snapshot_manager.create_and_store(&mut world, &ss, &es, tick_count, sim_hour)
-                {
+                let data_dir = std::path::Path::new(&events_db_path_str)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("/opt/sentinel/data"));
+                match snapshot_manager.create_and_store(
+                    &mut world,
+                    &ss,
+                    &es,
+                    data_dir,
+                    fs_layer.as_deref(),
+                    fs_mount.as_deref(),
+                    tick_count,
+                    sim_hour,
+                ) {
                     Ok(id) => info!(snapshot_id = %id, "Manueller World Snapshot erstellt"),
                     Err(e) => warn!(error = %e, "Manueller Snapshot fehlgeschlagen"),
                 }
@@ -2098,8 +2411,19 @@ fn ecs_tick_loop(
 
             if let (Some(es), Some(ss)) = (event_store_for_restore, state_store_for_restore) {
                 // 0. Pre-Restore Snapshot (Rollback-Punkt)
-                match snapshot_manager.create_and_store(&mut world, &ss, &es, tick_count, sim_hour)
-                {
+                let data_dir = std::path::Path::new(&events_db_path_str)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("/opt/sentinel/data"));
+                match snapshot_manager.create_and_store(
+                    &mut world,
+                    &ss,
+                    &es,
+                    data_dir,
+                    fs_layer.as_deref(),
+                    fs_mount.as_deref(),
+                    tick_count,
+                    sim_hour,
+                ) {
                     Ok(id) => {
                         info!(snapshot_id = %id, "Pre-Restore Snapshot erstellt (Rollback-Punkt)")
                     }
@@ -2117,6 +2441,18 @@ fn ecs_tick_loop(
                                 if let Err(e) = ss.restore_all_tables(&snapshot.redb) {
                                     error!(error = %e, "redb Restore fehlgeschlagen");
                                     continue;
+                                }
+                                if let Some(fs_metadata) = &snapshot.fs_metadata {
+                                    let Some(layer) = fs_layer.as_deref() else {
+                                        error!(
+                                            "sentinel-fs Restore angefordert, aber Layer nicht initialisiert"
+                                        );
+                                        continue;
+                                    };
+                                    if let Err(e) = layer.meta().restore_all_tables(fs_metadata) {
+                                        error!(error = %e, "sentinel-fs Restore fehlgeschlagen");
+                                        continue;
+                                    }
                                 }
 
                                 // 3. Agent-Prozesse terminieren (Sandbox Teardown)
@@ -2140,6 +2476,10 @@ fn ecs_tick_loop(
                                         }
                                     }
                                     agent_processes.remove(agent_id);
+                                    remove_security_runtime_snapshot(
+                                        &security_runtime_state,
+                                        *agent_id,
+                                    );
                                 }
                                 info!(
                                     terminated = agent_ids.len(),
@@ -2150,17 +2490,21 @@ fn ecs_tick_loop(
                                 sentinel_ecs::restore_ecs_state(&mut world, &snapshot.ecs);
 
                                 // 6. Tick/SimHour zuruecksetzen + sofortiger Agent-Respawn
-                                // Align tick to next multiple of 60 so shift-check
-                                // fires immediately on next tick (< 1 second, not 60s).
+                                // Restore wird NACH dem Shift-Check des aktuellen Zyklus
+                                // verarbeitet. Darum muessen wir auf "next multiple - 1"
+                                // setzen, damit der naechste Loop-Durchlauf direkt wieder
+                                // ein Vielfaches von 60 sieht und den Respawn sofort
+                                // anstoesst, statt fast 60 Sekunden spaeter.
                                 let aligned_tick = ((snapshot.tick / 60) + 1) * 60;
-                                tick_count = aligned_tick;
+                                let respawn_tick = aligned_tick.saturating_sub(1);
+                                tick_count = respawn_tick;
                                 sim_hour = snapshot.sim_hour;
                                 current_shift = 0;
                                 if let Some(mut sim_time) =
                                     world.get_resource_mut::<sentinel_ecs::SimulationTime>()
                                 {
-                                    sim_time.tick = sentinel_common::Tick(snapshot.tick);
-                                    sim_time.tick_count = snapshot.tick;
+                                    sim_time.tick = sentinel_common::Tick(respawn_tick);
+                                    sim_time.tick_count = respawn_tick;
                                     sim_time.sim_hour = snapshot.sim_hour;
                                 }
 
@@ -2470,6 +2814,9 @@ fn ecs_tick_loop(
     }
     // Drop reaps exitierte Prozesse via try_wait()
     agent_processes.clear();
+    if let Ok(mut state) = security_runtime_state.write() {
+        state.clear();
+    }
     info!(
         agents = agent_count,
         duration_ms = t.elapsed().as_millis() as u64,
@@ -2674,6 +3021,7 @@ mod tests {
     };
     use sentinel_common::{DomainEventPayload, EventType, OperatorChaosCommand, OperatorCommand};
     use sentinel_ebpf::loader::MonitoringMode;
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -2740,6 +3088,21 @@ mod tests {
     }
 
     #[test]
+    fn test_suspend_pids_stops_tracked_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep child");
+        let pid = child.id();
+
+        suspend_pids(&[pid], Some(pid)).expect("pid suspended");
+        assert_eq!(proc_state(pid), Some('T'));
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
     fn test_ecs_tick_loop_shutdown_immediate() {
         // Shutdown sofort setzen -> Loop sollte nach 0 Ticks beenden
         let shutdown = Arc::new(AtomicBool::new(true));
@@ -2795,6 +3158,9 @@ mod tests {
             Arc::new(RwLock::new(
                 crate::platform_controlplane::PlatformStateSnapshot::default(),
             )),
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
+            None,
             #[cfg(feature = "llm")]
             crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
         );
@@ -2869,6 +3235,9 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::platform_controlplane::PlatformStateSnapshot::default(),
                 )),
+                Arc::new(RwLock::new(HashMap::new())),
+                None,
+                None,
                 #[cfg(feature = "llm")]
                 crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
             )
@@ -2960,6 +3329,9 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::platform_controlplane::PlatformStateSnapshot::default(),
                 )),
+                Arc::new(RwLock::new(HashMap::new())),
+                None,
+                None,
                 #[cfg(feature = "llm")]
                 crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
             )
@@ -3059,6 +3431,9 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::platform_controlplane::PlatformStateSnapshot::default(),
                 )),
+                Arc::new(RwLock::new(HashMap::new())),
+                None,
+                None,
                 #[cfg(feature = "llm")]
                 crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::disabled(),
             )

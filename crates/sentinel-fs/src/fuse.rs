@@ -12,11 +12,12 @@ mod inner {
     use fuser::{
         Config, Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, LockOwner,
         MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
+        SessionACL,
     };
     use std::collections::HashMap;
     use std::ffi::OsStr;
     use std::path::Path;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, UNIX_EPOCH};
     use tracing::warn;
 
@@ -29,7 +30,7 @@ mod inner {
 
     /// FUSE handler for the CAS-backed agent filesystem.
     pub struct SentinelFuse {
-        layer: LayerManager,
+        layer: Arc<LayerManager>,
         /// Map of known agent IDs to their inode offset base.
         agents: Mutex<AgentRegistry>,
     }
@@ -71,7 +72,7 @@ mod inner {
 
     impl SentinelFuse {
         /// Create a new FUSE handler.
-        pub fn new(layer: LayerManager) -> Self {
+        pub fn new(layer: Arc<LayerManager>) -> Self {
             Self {
                 layer,
                 agents: Mutex::new(AgentRegistry::new()),
@@ -81,11 +82,11 @@ mod inner {
         /// Mount the filesystem. Blocks until unmounted.
         pub fn mount(self, mountpoint: &Path) -> anyhow::Result<()> {
             let mut config = Config::default();
+            config.acl = SessionACL::All;
             config.mount_options = vec![
                 MountOption::RW,
                 MountOption::FSName("sentinel-fs".to_string()),
                 MountOption::AutoUnmount,
-                MountOption::CUSTOM("allow_other".to_string()),
             ];
             fuser::mount2(self, mountpoint, &config)
                 .map_err(|e| anyhow::anyhow!("FUSE mount failed: {e}"))
@@ -380,7 +381,11 @@ mod inner {
         let meta = MetadataStore::open(&meta_path)?;
         let layer = LayerManager::new(cas, meta);
         layer.init_base_root()?;
+        start_fuse_layer(Arc::new(layer), mountpoint)
+    }
 
+    /// Start the FUSE daemon using an existing shared layer manager.
+    pub fn start_fuse_layer(layer: Arc<LayerManager>, mountpoint: &Path) -> anyhow::Result<()> {
         let fuse = SentinelFuse::new(layer);
         fuse.mount(mountpoint)
     }

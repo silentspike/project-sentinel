@@ -66,14 +66,16 @@ impl BwrapConfig {
     /// Replaces the default agent-home writable bind with a sentinel-fs FUSE mount path.
     ///
     /// Default: `/ram/agents/{name}` → `/home/{name}`
-    /// With FS mount: `{fs_mount}/{name}` → `/home/{name}`
+    /// With FS mount: `{fs_mount}/{host_agent_dir}` → `/home/{guest_name}`
     ///
     /// This enables CoW-backed per-agent filesystems via sentinel-fs FUSE.
-    pub fn with_fs_mount(mut self, fs_mount: &str, name: &str) -> Self {
+    pub fn with_fs_mount(mut self, fs_mount: &str, host_agent_dir: &str, guest_name: &str) -> Self {
         self.writable_binds
             .retain(|(_, guest)| !guest.starts_with("/home/"));
-        self.writable_binds
-            .push((format!("{fs_mount}/{name}"), format!("/home/{name}")));
+        self.writable_binds.push((
+            format!("{fs_mount}/{host_agent_dir}"),
+            format!("/home/{guest_name}"),
+        ));
         self
     }
 
@@ -266,7 +268,8 @@ mod tests {
 
     #[test]
     fn with_fs_mount_replaces_agent_home() {
-        let config = BwrapConfig::for_agent("thomas").with_fs_mount("/sentinel-fs", "thomas");
+        let config =
+            BwrapConfig::for_agent("thomas").with_fs_mount("/sentinel-fs", "AGENT-01", "thomas");
         let args = config.to_args();
         // Old /ram/agents/ path must be gone
         assert!(
@@ -275,7 +278,7 @@ mod tests {
         );
         // New sentinel-fs path must be present
         assert!(
-            args.contains(&"/sentinel-fs/thomas".to_string()),
+            args.contains(&"/sentinel-fs/AGENT-01".to_string()),
             "sentinel-fs path missing, args: {:?}",
             args
         );

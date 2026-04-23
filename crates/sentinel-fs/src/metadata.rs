@@ -5,7 +5,9 @@
 //! - `FS_DIRENTS`: `(agent_id, parent_inode, name)` -> child inode
 //! - `CAS_REFCOUNT`: `sha256_hash` -> reference count (u32)
 
+use crate::cas::{CasStore, ChunkGcStats};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use sentinel_common::FsMetadataDump;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::SystemTime;
@@ -21,6 +23,9 @@ const FS_DIRENTS: TableDefinition<(&str, u64, &str), u64> = TableDefinition::new
 
 /// CAS blob reference counts: `sha256_hash` -> count.
 const CAS_REFCOUNT: TableDefinition<&[u8; 32], u32> = TableDefinition::new("cas_refcount");
+
+/// Grace-period Trash-Queue fuer null-ref CAS-Bloecke.
+const FS_TRASH_QUEUE: TableDefinition<&[u8; 32], u64> = TableDefinition::new("fs_trash_queue");
 
 // --- Types ---
 
@@ -126,6 +131,7 @@ impl MetadataStore {
             write_txn.open_table(FS_INODES)?;
             write_txn.open_table(FS_DIRENTS)?;
             write_txn.open_table(CAS_REFCOUNT)?;
+            write_txn.open_table(FS_TRASH_QUEUE)?;
         }
         write_txn.commit()?;
 
@@ -261,6 +267,8 @@ impl MetadataStore {
             let current = table.get(hash)?.map(|g| g.value()).unwrap_or(0);
             let new = current + 1;
             table.insert(hash, new)?;
+            let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
+            trash.remove(hash)?;
             new
         };
         write_txn.commit()?;
@@ -295,6 +303,203 @@ impl MetadataStore {
         Ok(Vec::new())
     }
 
+    /// Read the trash timestamp for a CAS hash.
+    pub fn get_trash_timestamp(&self, hash: &[u8; 32]) -> anyhow::Result<Option<u64>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(FS_TRASH_QUEUE)?;
+        Ok(table.get(hash)?.map(|g| g.value()))
+    }
+
+    /// Set or clear the trash timestamp for a CAS hash.
+    pub fn set_trash_timestamp(
+        &self,
+        hash: &[u8; 32],
+        trashed_at_ms: Option<u64>,
+    ) -> anyhow::Result<bool> {
+        let write_txn = self.db.begin_write()?;
+        let updated = {
+            let mut table = write_txn.open_table(FS_TRASH_QUEUE)?;
+            match trashed_at_ms {
+                Some(value) => {
+                    table.insert(hash, value)?;
+                    true
+                }
+                None => table.remove(hash)?.is_some(),
+            }
+        };
+        write_txn.commit()?;
+        Ok(updated)
+    }
+
+    /// Remove a hash from the trash queue and re-establish a refcount if needed.
+    pub fn restore_from_trash(&self, hash: &[u8; 32]) -> anyhow::Result<bool> {
+        let write_txn = self.db.begin_write()?;
+        let restored = {
+            let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
+            if trash.remove(hash)?.is_none() {
+                false
+            } else {
+                let mut refs = write_txn.open_table(CAS_REFCOUNT)?;
+                let current = refs.get(hash)?.map(|g| g.value()).unwrap_or(0);
+                if current == 0 {
+                    refs.insert(hash, 1)?;
+                }
+                true
+            }
+        };
+        write_txn.commit()?;
+        Ok(restored)
+    }
+
+    /// Dump all sentinel-fs metadata tables for a world snapshot.
+    pub fn dump_all_tables(&self) -> anyhow::Result<FsMetadataDump> {
+        let read_txn = self.db.begin_read()?;
+        let inodes = {
+            let table = read_txn.open_table(FS_INODES)?;
+            let mut rows = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                let (agent_id, inode) = key.value();
+                rows.push((agent_id.to_string(), inode, value.value().to_vec()));
+            }
+            rows
+        };
+        let dirents = {
+            let table = read_txn.open_table(FS_DIRENTS)?;
+            let mut rows = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                let (agent_id, parent, name) = key.value();
+                rows.push((
+                    agent_id.to_string(),
+                    parent,
+                    name.to_string(),
+                    value.value(),
+                ));
+            }
+            rows
+        };
+        let refcounts = {
+            let table = read_txn.open_table(CAS_REFCOUNT)?;
+            let mut rows = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                rows.push((*key.value(), value.value()));
+            }
+            rows
+        };
+        let trash_queue = {
+            let table = read_txn.open_table(FS_TRASH_QUEUE)?;
+            let mut rows = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                rows.push((*key.value(), value.value()));
+            }
+            rows
+        };
+        Ok(FsMetadataDump {
+            inodes,
+            dirents,
+            refcounts,
+            trash_queue,
+        })
+    }
+
+    /// Restore all sentinel-fs metadata tables from a snapshot dump.
+    pub fn restore_all_tables(&self, dump: &FsMetadataDump) -> anyhow::Result<()> {
+        let current = self.dump_all_tables()?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut inodes = write_txn.open_table(FS_INODES)?;
+            for (agent_id, inode, _) in &current.inodes {
+                inodes.remove((agent_id.as_str(), *inode))?;
+            }
+            for (agent_id, inode, data) in &dump.inodes {
+                inodes.insert((agent_id.as_str(), *inode), data.as_slice())?;
+            }
+
+            let mut dirents = write_txn.open_table(FS_DIRENTS)?;
+            for (agent_id, parent, name, _) in &current.dirents {
+                dirents.remove((agent_id.as_str(), *parent, name.as_str()))?;
+            }
+            for (agent_id, parent, name, child) in &dump.dirents {
+                dirents.insert((agent_id.as_str(), *parent, name.as_str()), *child)?;
+            }
+
+            let mut refs = write_txn.open_table(CAS_REFCOUNT)?;
+            for (hash, _) in &current.refcounts {
+                refs.remove(hash)?;
+            }
+            for (hash, count) in &dump.refcounts {
+                refs.insert(hash, *count)?;
+            }
+
+            let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
+            for (hash, _) in &current.trash_queue {
+                trash.remove(hash)?;
+            }
+            for (hash, ts) in &dump.trash_queue {
+                trash.insert(hash, *ts)?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Delete expired trash blobs from CAS and remove their queue entries.
+    pub fn gc_trash(
+        &self,
+        cas: &CasStore,
+        grace_period_hours: u64,
+    ) -> anyhow::Result<ChunkGcStats> {
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let cutoff_ms = now_ms.saturating_sub(grace_period_hours * 3600 * 1000);
+
+        let expired_hashes = {
+            let read_txn = self.db.begin_read()?;
+            let trash = read_txn.open_table(FS_TRASH_QUEUE)?;
+            let refs = read_txn.open_table(CAS_REFCOUNT)?;
+            let mut hashes = Vec::new();
+            for entry in trash.iter()? {
+                let (key, value) = entry?;
+                let hash = *key.value();
+                let trashed_at_ms = value.value();
+                if trashed_at_ms <= cutoff_ms && refs.get(&hash)?.is_none() {
+                    hashes.push(hash);
+                }
+            }
+            hashes
+        };
+
+        if expired_hashes.is_empty() {
+            return Ok(ChunkGcStats::default());
+        }
+
+        let gc_stats = cas.gc(&expired_hashes)?;
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
+            let refs = write_txn.open_table(CAS_REFCOUNT)?;
+            for hash in &expired_hashes {
+                if refs.get(hash)?.is_none() {
+                    trash.remove(hash)?;
+                }
+            }
+        }
+        write_txn.commit()?;
+
+        Ok(ChunkGcStats {
+            removed: gc_stats.removed,
+            freed_bytes: gc_stats.freed_bytes,
+            freed_from_trash: gc_stats.removed,
+            ..Default::default()
+        })
+    }
+
     // === BATCH / TRANSACTIONAL OPERATIONS ===
 
     /// Atomically create a file: set inode + dirent + inc refcount in one transaction.
@@ -319,6 +524,8 @@ impl MetadataStore {
                 let mut refs = write_txn.open_table(CAS_REFCOUNT)?;
                 let current = refs.get(&data.hash)?.map(|g| g.value()).unwrap_or(0);
                 refs.insert(&data.hash, current + 1)?;
+                let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
+                trash.remove(&data.hash)?;
             }
         }
         write_txn.commit()?;
@@ -350,6 +557,7 @@ impl MetadataStore {
             if let Some(ref inode_data) = old {
                 if inode_data.kind == FileKind::Regular {
                     let mut refs = write_txn.open_table(CAS_REFCOUNT)?;
+                    let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
                     let current = match refs.get(&inode_data.hash)? {
                         Some(g) => g.value(),
                         None => 0,
@@ -357,8 +565,16 @@ impl MetadataStore {
                     let new = current.saturating_sub(1);
                     if new == 0 {
                         refs.remove(&inode_data.hash)?;
+                        trash.insert(
+                            &inode_data.hash,
+                            SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64,
+                        )?;
                     } else {
                         refs.insert(&inode_data.hash, new)?;
+                        trash.remove(&inode_data.hash)?;
                     }
                 }
             }
@@ -555,6 +771,7 @@ mod tests {
         assert!(store.get_inode(agent, 3).unwrap().is_none());
         assert!(store.get_dirent(agent, 1, "gone.txt").unwrap().is_none());
         assert_eq!(store.get_refcount(&hash).unwrap(), 0);
+        assert!(store.get_trash_timestamp(&hash).unwrap().is_some());
     }
 
     #[test]
@@ -576,6 +793,76 @@ mod tests {
         // Remove one — refcount drops to 1
         store.remove_file("AGENT-01", 1, "shared.txt", 2).unwrap();
         assert_eq!(store.get_refcount(&hash).unwrap(), 1);
+        assert_eq!(store.get_trash_timestamp(&hash).unwrap(), None);
+    }
+
+    #[test]
+    fn restore_from_trash_reinstates_refcount() {
+        let (store, _dir) = temp_meta();
+        let hash = [0xAB; 32];
+        let data = InodeData::regular(hash, 64, 0o644);
+
+        store
+            .create_file("AGENT-01", 1, "trash.txt", 2, &data)
+            .unwrap();
+        store.remove_file("AGENT-01", 1, "trash.txt", 2).unwrap();
+        assert_eq!(store.get_refcount(&hash).unwrap(), 0);
+        assert!(store.get_trash_timestamp(&hash).unwrap().is_some());
+
+        assert!(store.restore_from_trash(&hash).unwrap());
+        assert_eq!(store.get_refcount(&hash).unwrap(), 1);
+        assert_eq!(store.get_trash_timestamp(&hash).unwrap(), None);
+    }
+
+    #[test]
+    fn dump_restore_roundtrip_includes_trash_queue() {
+        let (store, dir) = temp_meta();
+        let hash = [0xBC; 32];
+        let data = InodeData::regular(hash, 128, 0o644);
+
+        store.create_file("AGENT-01", 1, "f.txt", 2, &data).unwrap();
+        store.remove_file("AGENT-01", 1, "f.txt", 2).unwrap();
+
+        let dump = store.dump_all_tables().unwrap();
+        let restored = MetadataStore::open(dir.path().join("restored.redb")).unwrap();
+        restored.restore_all_tables(&dump).unwrap();
+
+        assert!(restored.get_inode("AGENT-01", 2).unwrap().is_none());
+        assert_eq!(restored.get_refcount(&hash).unwrap(), 0);
+        assert!(restored.get_trash_timestamp(&hash).unwrap().is_some());
+    }
+
+    #[test]
+    fn gc_trash_deletes_expired_blob() {
+        let (store, dir) = temp_meta();
+        let cas = CasStore::open(dir.path()).unwrap();
+        let content = b"issue-264-gc-trash";
+        let (hash, _) = cas.store(content).unwrap();
+        let data = InodeData::regular(hash, content.len() as u64, 0o644);
+
+        store
+            .create_file("AGENT-01", 1, "gc.txt", 2, &data)
+            .unwrap();
+        store.remove_file("AGENT-01", 1, "gc.txt", 2).unwrap();
+        assert!(cas.contains(&hash));
+
+        store
+            .set_trash_timestamp(
+                &hash,
+                Some(
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64
+                        - 25 * 3600 * 1000,
+                ),
+            )
+            .unwrap();
+
+        let stats = store.gc_trash(&cas, 24).unwrap();
+        assert_eq!(stats.freed_from_trash, 1);
+        assert!(!cas.contains(&hash));
+        assert_eq!(store.get_trash_timestamp(&hash).unwrap(), None);
     }
 
     #[test]
