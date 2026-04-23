@@ -18,6 +18,7 @@ pub mod orchestrator;
 pub mod platform_controlplane;
 pub mod query_responder;
 pub mod resource_manager;
+pub mod runtime_control;
 pub mod runtime_health;
 pub mod service_health;
 pub mod shift;
