@@ -1279,6 +1279,8 @@ struct RuntimeReconcileContext<'a> {
     service_health_state: crate::service_health::ServiceHealthWorkerSnapshot,
     fs_mount: Option<&'a str>,
     data_dir: &'a std::path::Path,
+    restart_service_fn: fn(&str) -> bool,
+    is_service_active_fn: fn(&str) -> bool,
 }
 
 fn runtime_agent_is_healthy(agent: &runtime_health::RuntimeHealthAgentSnapshot) -> bool {
@@ -1435,6 +1437,7 @@ fn run_runtime_reconcile(
         .cloned()
         .map(|agent| (agent.agent_id, agent))
         .collect::<HashMap<_, _>>();
+    let projection_drift_before = before.projection_drift_detected;
 
     let mut security_snapshots_removed = 0usize;
     let mut unexpected_runtime_removed = 0usize;
@@ -1448,6 +1451,25 @@ fn run_runtime_reconcile(
     let mut blocked_agents = Vec::new();
     let mut errors = Vec::new();
     let mut agent_status_updates = HashMap::<u16, String>::new();
+    let mut projection_restart_attempted = false;
+    let mut projection_restart_succeeded = false;
+
+    if projection_drift_before && !request.dry_run {
+        let projection_service_active = (ctx.is_service_active_fn)("sentinel-projection");
+        if request.projection_rebuild && projection_service_active {
+            info!(
+                "Projection-Drift erkannt, aber laufender Projection-Service bleibt fuer Rebuild in Ruhe"
+            );
+        } else {
+            projection_restart_attempted = true;
+            if (ctx.restart_service_fn)("sentinel-projection") {
+                projection_restart_succeeded = true;
+                repair_ops_total += 1;
+            } else {
+                errors.push("Projection-Restart fehlgeschlagen".to_string());
+            }
+        }
+    }
 
     if !request.dry_run {
         for agent in before.agents.iter().filter(|agent| {
@@ -1625,8 +1647,16 @@ fn run_runtime_reconcile(
     }
 
     let projection_rebuild_requested = if request.projection_rebuild && !request.dry_run {
-        match crate::runtime_control::write_projection_rebuild_request(ctx.data_dir, ctx.tick_count)
-        {
+        let reason = if projection_drift_before {
+            "projection_drift"
+        } else {
+            "manual_request"
+        };
+        match crate::runtime_control::write_projection_rebuild_request(
+            ctx.data_dir,
+            ctx.tick_count,
+            reason,
+        ) {
             Ok(()) => {
                 repair_ops_total += 1;
                 true
@@ -1666,6 +1696,10 @@ fn run_runtime_reconcile(
         "repair_blocked".to_string()
     } else if !errors.is_empty() {
         "repair_error".to_string()
+    } else if projection_rebuild_requested {
+        "projection_rebuild_requested".to_string()
+    } else if projection_restart_attempted && after.projection_drift_detected {
+        "projection_restart_requested".to_string()
     } else if repair_ops_total > 0 || projection_rebuild_requested {
         "repaired".to_string()
     } else if after.stale_runtime_entries == 0 && after.orphan_cgroups == 0 {
@@ -1696,6 +1730,10 @@ fn run_runtime_reconcile(
         respawned_agents,
         respawn_skipped_backoff,
         respawn_blocked_agents,
+        projection_drift_before,
+        projection_drift_after: after.projection_drift_detected,
+        projection_restart_attempted,
+        projection_restart_succeeded,
         projection_rebuild_requested,
         respawn_failures_total: after.respawn_failures,
         repair_last_status: after
@@ -2404,6 +2442,8 @@ fn ecs_tick_loop(
                         service_health_state: service_health_checker.worker_state(),
                         fs_mount: fs_mount.as_deref(),
                         data_dir,
+                        restart_service_fn: crate::service_health::restart_service_now,
+                        is_service_active_fn: crate::service_health::is_service_active_now,
                     };
                     let response =
                         run_runtime_reconcile(&mut reconcile_ctx, request, &mut respawn_backoff);
@@ -3876,8 +3916,19 @@ mod tests {
     use sentinel_common::{DomainEventPayload, EventType, OperatorChaosCommand, OperatorCommand};
     use sentinel_ebpf::loader::MonitoringMode;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_projection_restart(_service_name: &str) -> bool {
+        PROJECTION_RESTART_CALLS.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    fn projection_service_active(_service_name: &str) -> bool {
+        true
+    }
 
     /// Erstellt EbpfCollector + tokio mpsc Sender fuer Tests (Userspace mode, kein tokio noetig).
     fn test_ebpf() -> (EbpfCollector, tokio::sync::mpsc::Sender<MetricsSnapshot>) {
@@ -4018,6 +4069,79 @@ mod tests {
                 "Fast-Restart sollte einen neuen PID liefern"
             );
         }
+    }
+
+    #[test]
+    fn test_runtime_reconcile_skips_projection_restart_when_rebuild_can_run_in_place() {
+        PROJECTION_RESTART_CALLS.store(0, Ordering::SeqCst);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.db");
+        let projection_path = tmp.path().join("projection.db");
+        let rebuild_request_path = tmp.path().join(".projection-rebuild-request");
+        let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
+        let projection_store =
+            sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap();
+        {
+            let txn = projection_store.begin_transaction().unwrap();
+            txn.begin().unwrap();
+            txn.upsert_agent(7, "Projection Ghost", "Tester", 1, "active", 1)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        drop(projection_store);
+
+        let (mut world, _schedule) = create_simulation_world();
+        let sandbox = test_sandbox();
+        let (mut ebpf_collector, _ebpf_tx) = test_ebpf();
+        let mut runtime_orch =
+            RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
+        let mut sandbox_handles = HashMap::new();
+        let mut agent_processes = HashMap::new();
+        let security_runtime_state = Arc::new(RwLock::new(HashMap::new()));
+        let runtime_health = Arc::new(RwLock::new(
+            crate::runtime_health::RuntimeHealthSnapshot::default(),
+        ));
+        let mut respawn_backoff = RespawnBackoffTracker::new(3);
+        let mut reconcile_ctx = RuntimeReconcileContext {
+            tick_count: 123,
+            current_shift: 1,
+            all_agents: &[],
+            world: &mut world,
+            runtime_orch: &mut runtime_orch,
+            sandbox: &sandbox,
+            sandbox_handles: &mut sandbox_handles,
+            ebpf_collector: &mut ebpf_collector,
+            agent_processes: &mut agent_processes,
+            agent_command: &[],
+            security_runtime_state: &security_runtime_state,
+            event_store: &event_store,
+            runtime_health: &runtime_health,
+            projection_db_path: &projection_path,
+            operator_auth_required: false,
+            service_health_state: crate::service_health::ServiceHealthWorkerSnapshot::default(),
+            fs_mount: None,
+            data_dir: tmp.path(),
+            restart_service_fn: record_projection_restart,
+            is_service_active_fn: projection_service_active,
+        };
+
+        let response = run_runtime_reconcile(
+            &mut reconcile_ctx,
+            RuntimeReconcileRequest {
+                dry_run: false,
+                projection_rebuild: true,
+                respawn_missing: false,
+            },
+            &mut respawn_backoff,
+        );
+
+        assert!(response.projection_drift_before);
+        assert!(!response.projection_restart_attempted);
+        assert!(!response.projection_restart_succeeded);
+        assert!(response.projection_rebuild_requested);
+        assert_eq!(PROJECTION_RESTART_CALLS.load(Ordering::SeqCst), 0);
+        assert!(rebuild_request_path.exists());
     }
 
     #[test]

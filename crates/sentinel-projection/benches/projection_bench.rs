@@ -89,6 +89,13 @@ fn make_worker(event_store: Arc<EventStore>, db_path: &str) -> ProjectionWorker 
         poll_interval: Duration::from_millis(1),
         batch_size: 100,
         db_path: db_path.to_string(),
+        rebuild_request_path: std::path::Path::new(db_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(".projection-rebuild-request")
+            .to_string_lossy()
+            .to_string(),
+        rebuild_request_poll_interval: Duration::from_secs(1),
     };
     ProjectionWorker::new(event_store, config).unwrap()
 }
