@@ -43,7 +43,7 @@
 
 ## Commit references
 
-- `TBD` Task [1] Phase 0 - Issue-Repair und Baseline-Reset
+- `dca25ac` Task [1] Phase 0 - Issue-Repair und Baseline-Reset
 - `TBD` Task [2] Phase 1 - Donor-Audit und Clean Port
 - `TBD` Task [3] Slice A - Runtime-Health-Read-Model
 - `TBD` Task [4] Slice B - Runtime-Control / Reconcile
@@ -65,7 +65,7 @@
 | # | Task | Status | Scope | Evidence |
 |---|------|--------|-------|----------|
 | 1 | Phase 0 - Issue-Repair und Baseline-Reset | DONE | frische VM-Baseline, Issue-Body-Repair, canonical-main-Reset, Post-Reset-Baseline ohne runtime-health | command, system, inspect |
-| 2 | Phase 1 - Donor-Audit und Clean Port | PENDING | alte #279-Donor-Commits pruefen, nur scope-konforme Teile uebernehmen, Haiku ausschliessen | inspect, command |
+| 2 | Phase 1 - Donor-Audit und Clean Port | IN_PROGRESS | alte #279-Donor-Commits pruefen, nur scope-konforme Teile uebernehmen, Haiku ausschliessen | inspect, command |
 | 3 | Slice A - Runtime-Health-Read-Model | PENDING | `/operator/runtime-health`, Snapshot-Modell, Auth/Loopback, Tests | inspect, command, system |
 | 4 | Slice B - Runtime-Control / Reconcile | PENDING | `/operator/runtime/reconcile`, stale/orphan/zombie cleanup, bounded retries | inspect, command, system |
 | 5 | Slice C - Fast Stall Recovery | PENDING | deterministischer Kandidat, SIGSTOP/SIGCONT, Respawn/Reconcile | command, system |
@@ -141,3 +141,51 @@
   - `2b31820c751c6f3dd0eb8e1282e827d64c5b2d9b016bf56fcede4c765ee86883  /opt/sentinel/bin/sentinel-daemon`
   - `10b845881d24ed0c661ba5a18de4ebddad44d404d15f0231ef1ce83a83855ce3  /opt/sentinel/bin/sentinel-projection`
 - AC-4 PASS: Post-reset baseline uses only main-compatible checks and confirms `runtime_health_http=404`.
+
+## Task 2 - Phase 1: Donor-Audit und Clean Port
+
+### Pre-task self-check
+
+- Was muss getan werden: alten Donor-Branch lesen, Commit-/Diff-Scope klassifizieren, Haiku- und #264-fremde Arbeit ausschliessen, eine saubere Port-Reihenfolge fuer die Code-Slices herstellen.
+- Welche ACs muessen hier passen:
+  - AC-1: Donor-Commits sind gegen `main` sichtbar und klassifiziert.
+  - AC-2: Out-of-scope Commits/Dateien sind explizit ausgeschlossen.
+  - AC-3: Clean-port Reihenfolge fuer Slice A-F und conditional Slice G ist dokumentiert.
+- Wie wird bewiesen: `git log`, `git diff --name-status`, gezielte Code-Inspection, Abgleich gegen `codex-plan279.md`.
+- Erwartete Dateien: `PROGRESS.md`, ggf. `test-279-verification.md`; noch kein Produktionscode, solange nur Audit laeuft.
+- Risiken:
+  - Der alte Donor-Branch ist auf #264 gestackt und darf nicht direkt gemergt werden.
+  - Haiku-Pinning ist bewusst out-of-scope fuer #279.
+
+### Outcome
+
+- Donor sources inspected:
+  - old donor: `/work/company/project-sentinel-issue279`, branch `feat/issue-279-daemon-hardening`
+  - safer stack donor: `/work/company/project-sentinel-issue279-stack`, branch `feat/issue-279-daemon-hardening-stack`
+- The old donor contains `dbb1b8e` which pins agent LLM requests to `haiku`; this is rejected for #279.
+- The stack donor removed the Haiku commit, but still spans a broad stacked diff and is not mergeable as a branch.
+- Clean-port source of truth:
+  - use stack donor commits as code references
+  - path-limit each slice
+  - do not port stale donor evidence or donor `PROGRESS.md`
+- Port order is fixed:
+  - Slice A from `29a0fb5`
+  - Slice B from `146ef43`
+  - Slice C from `fdc40c7`
+  - Slice D from `6919e66`
+  - Slice E from `389b5e6`
+  - Slice F from `14560c4` plus relevant stabilization from `b1e376b`
+  - Slice G from `6c31975` only if needed
+  - Benchmarks from `ffca58b` with fresh current evidence
+
+### Evidence
+
+- `test-279-verification.md` contains Phase-1 command/output evidence.
+- AC-1 PASS:
+  - `git log --oneline --decorate --reverse origin/main..HEAD` run on both donor worktrees.
+  - `git range-diff origin/main...feat/issue-279-daemon-hardening-stack` shows the old #264 lineage and the #279 commit sequence.
+- AC-2 PASS:
+  - old donor `dbb1b8e` / `services/sentinel-daemon/src/llm_bridge.rs` is explicitly rejected.
+  - stale donor `PROGRESS.md`, old evidence and branch-wide #264 paths are excluded.
+- AC-3 PASS:
+  - clean port order and path-limited rules are documented in `test-279-verification.md`.

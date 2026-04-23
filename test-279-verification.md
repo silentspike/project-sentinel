@@ -152,3 +152,135 @@ projection_pid=1473941
 PASS: The canonical-main reset is measurable without `/operator/runtime-health`, and `runtime_health_http=404` is expected for current `main`.
 
 Finding: Canonical `main` does not self-heal the drift. API and Projection remain at `57`, while only `29` cgroup directories have live processes. Therefore the full #279 recovery scope remains required.
+
+## Phase 1 - Donor-Audit und Clean Port
+
+Date: 2026-04-23
+
+### AC-1 - Donor Commits Visible And Classified
+
+Commands:
+
+```bash
+git -C /work/company/project-sentinel-issue279 log --oneline --decorate --reverse origin/main..HEAD
+git -C /work/company/project-sentinel-issue279-stack log --oneline --decorate --reverse origin/main..HEAD
+git -C /work/company/project-sentinel-279-review range-diff origin/main...feat/issue-279-daemon-hardening-stack
+git -C /work/company/project-sentinel-279-review diff --stat origin/main..feat/issue-279-daemon-hardening-stack
+```
+
+Observed donor candidates:
+
+```text
+old donor includes:
+12b5138 Task [1]: Issue-Body-/Label-Repair vor Code fuer #279
+1af0d39 Task [2]: Build runtime health snapshot and operator endpoint
+d673603 Task [3]: Add runtime reconcile control path for #279
+76a20fe Task [4]: Add fast-path stall recovery and test hook for #279
+28348eb Task [5]: Add in-process worker supervision and panic test for #279
+a7ee414 Task [6]: Bound analysis queues and add flood test for #279
+9b50cb6 Task [7]: Add projection drift healing for #279
+dbb1b8e Task [8]: Pin agent LLM requests to haiku for #279
+dbab8fb Task [9]: Add #279 bench and soak harness
+300ded0 Fix [279]: Restore live agent runtime under FUSE and Landlock
+b71e1e1 Fix [279]: stabilize projection recovery and verify daemon hardening
+
+stack donor includes:
+3c596c1 Task [1]: Issue-Body-/Label-Repair vor Code fuer #279
+29a0fb5 Task [2]: Build runtime health snapshot and operator endpoint
+146ef43 Task [3]: Add runtime reconcile control path for #279
+fdc40c7 Task [4]: Add fast-path stall recovery and test hook for #279
+6919e66 Task [5]: Add in-process worker supervision and panic test for #279
+389b5e6 Task [6]: Bound analysis queues and add flood test for #279
+14560c4 Task [7]: Add projection drift healing for #279
+ffca58b Task [9]: Add #279 bench and soak harness
+6c31975 Fix [279]: restore runtime consistency after FUSE and Landlock recovery
+b1e376b Fix [279]: stabilize projection recovery and verify daemon hardening
+4600532 Task [11]: Refresh stack evidence for #279
+```
+
+PASS: The old donor and the stack donor are visible. The stack donor is the safer source because it already removed the Haiku commit, but it is still not mergeable as a branch.
+
+### AC-2 - Out-of-Scope Material Excluded
+
+Rejected for #279:
+
+```text
+dbb1b8e / llm_bridge.rs Haiku pin:
+- out-of-scope per current #279 body
+- violates gateway/model-policy separation for this issue
+
+direct branch merge:
+- rejected because the donor diff still spans 38 files and includes stacked/history artifacts
+
+donor evidence and progress files:
+- donor PROGRESS.md is stale
+- donor test-279-verification.md is old VM evidence, not current proof
+- test-264-verification.md deletion is not part of #279
+
+broad non-#279 paths:
+- .gitignore
+- deploy/systemd/sentinel-daemon.service unless a concrete runtime need appears
+- crates/sentinel-common/src/snapshot_codec.rs
+- crates/sentinel-common/src/types.rs
+- crates/sentinel-common/tests/snapshot_roundtrip.rs
+- crates/sentinel-fs/src/metadata.rs
+- crates/sentinel-sandbox/src/bin/breakout_helper.rs
+- crates/sentinel-sandbox/src/bwrap.rs
+- crates/sentinel-sandbox/src/enforcer.rs
+- crates/sentinel-sandbox/tests/breakout.rs
+```
+
+Conditional, not rejected:
+
+```text
+6c31975 / former 300ded0:
+- keep as Slice G candidate only
+- allowed paths if needed:
+  - crates/sentinel-fs/src/fuse.rs
+  - crates/sentinel-sandbox/src/landlock.rs
+  - services/sentinel-daemon/src/orchestrator.rs
+```
+
+PASS: Haiku and stale stacked scope are explicitly excluded before any port.
+
+### AC-3 - Clean Port Order
+
+Port order:
+
+```text
+Task 3 / Slice A:
+  donor 29a0fb5, path-limited runtime health endpoint and snapshot only
+
+Task 4 / Slice B:
+  donor 146ef43, runtime_control and reconcile paths
+
+Task 5 / Slice C:
+  donor fdc40c7, fast stall recovery and deterministic test hook
+
+Task 6 / Slice D:
+  donor 6919e66, in-process worker supervision and panic-test
+
+Task 7 / Slice E:
+  donor 389b5e6, bounded analysis/recovery queues and flood-test
+
+Task 8 / Slice F:
+  donor 14560c4 plus relevant parts of b1e376b, projection convergence and rebuild request
+
+Task 9 / Slice G:
+  donor 6c31975 only if current main plus ported #279 still requires FUSE/Landlock runtime restore
+
+Task 14 / Benchmarks:
+  donor ffca58b plus updated current evidence, not old results
+```
+
+Clean-port rule:
+
+```text
+Do not merge or cherry-pick the donor branch wholesale.
+Apply donor code path-limited by slice.
+Do not port llm_bridge.rs Haiku changes.
+Do not port stale donor PROGRESS/evidence as proof.
+Refresh CHANGELOG and verification evidence in this branch only.
+```
+
+PASS: The implementation path is now deterministic and scope-clean.
