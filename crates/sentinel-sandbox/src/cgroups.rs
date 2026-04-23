@@ -322,6 +322,55 @@ pub fn remove_cgroup(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Force-kills all processes that are still attached to an agent cgroup.
+///
+/// Runtime reconciliation uses this for stale cgroups whose tracked runtime
+/// handle is already gone. `cgroup.kill` handles stopped processes reliably;
+/// the PID fallback keeps older cgroup-v2 hosts functional.
+pub fn kill_cgroup_processes(name: &str) -> Result<usize> {
+    let path = cgroup_path(name);
+    if !std::path::Path::new(&path).exists() {
+        return Ok(0);
+    }
+
+    let initial_pids = list_pids_in_cgroup(name)?;
+    if initial_pids.is_empty() {
+        return Ok(0);
+    }
+
+    let kill_path = format!("{path}/cgroup.kill");
+    if std::path::Path::new(&kill_path).exists() {
+        std::fs::write(&kill_path, "1")
+            .with_context(|| format!("Failed to write cgroup.kill for {name}"))?;
+    } else {
+        for pid in &initial_pids {
+            let status = std::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status()
+                .with_context(|| format!("Failed to SIGKILL PID {pid} in cgroup {name}"))?;
+            if !status.success() && std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                warn!(pid = *pid, cgroup = %name, "SIGKILL for cgroup member returned non-zero");
+            }
+        }
+    }
+
+    for _ in 0..20 {
+        if list_pids_in_cgroup(name)?.is_empty() {
+            return Ok(initial_pids.len());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let remaining = list_pids_in_cgroup(name)?;
+    if remaining.is_empty() {
+        Ok(initial_pids.len())
+    } else {
+        Err(anyhow::anyhow!(
+            "cgroup {name} still contains PIDs after kill: {remaining:?}"
+        ))
+    }
+}
+
 /// Adds a process to an agent's cgroup.
 pub fn add_pid_to_cgroup(name: &str, pid: u32) -> Result<()> {
     let path = format!("{}/cgroup.procs", cgroup_path(name));
@@ -436,6 +485,11 @@ mod tests {
     fn remove_nonexistent_ok() {
         // Removing a non-existent cgroup should succeed silently
         assert!(remove_cgroup("does-not-exist-xyz").is_ok());
+    }
+
+    #[test]
+    fn kill_nonexistent_cgroup_is_noop() {
+        assert_eq!(kill_cgroup_processes("does-not-exist-xyz").unwrap(), 0);
     }
 
     #[test]

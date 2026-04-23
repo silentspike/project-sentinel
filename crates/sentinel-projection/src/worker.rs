@@ -3,8 +3,11 @@
 //! Sync API (kein async) — passt zum EventStore Pattern.
 //! Poll-Loop mit `std::thread::sleep` bei leeren Batches.
 
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use anyhow::Context;
 use sentinel_common::DomainEventPayload;
@@ -92,14 +95,21 @@ impl ProjectionWorker {
     pub fn run(&self) -> anyhow::Result<()> {
         // Rooms initialisieren (idempotent)
         self.read_store.initialize_rooms(ROOM_IDS)?;
+        let mut next_rebuild_poll = Instant::now();
 
         info!(
             poll_interval_ms = self.config.poll_interval.as_millis() as u64,
             batch_size = self.config.batch_size,
+            rebuild_request_path = %self.config.rebuild_request_path,
             "Projection worker starting live mode"
         );
 
         loop {
+            if Instant::now() >= next_rebuild_poll {
+                self.handle_rebuild_request_if_present()?;
+                next_rebuild_poll = Instant::now() + self.config.rebuild_request_poll_interval;
+            }
+
             let offset = self.event_store.get_offset(PROJECTION_NAME)?.unwrap_or(0);
 
             let batch = self
@@ -185,6 +195,41 @@ impl ProjectionWorker {
         Ok(total_processed)
     }
 
+    fn handle_rebuild_request_if_present(&self) -> anyhow::Result<bool> {
+        let request_path = Path::new(&self.config.rebuild_request_path);
+        if !request_path.exists() {
+            return Ok(false);
+        }
+
+        let payload = fs::read_to_string(request_path).with_context(|| {
+            format!(
+                "Projection-Rebuild-Request konnte nicht gelesen werden: {}",
+                request_path.display()
+            )
+        })?;
+        info!(
+            path = %request_path.display(),
+            request = %payload,
+            "Projection-Rebuild-Request erkannt"
+        );
+
+        let rebuilt = self
+            .rebuild()
+            .context("Projection-Rebuild aus Request-Datei fehlgeschlagen")?;
+        fs::remove_file(request_path).with_context(|| {
+            format!(
+                "Projection-Rebuild-Request konnte nicht entfernt werden: {}",
+                request_path.display()
+            )
+        })?;
+        info!(
+            path = %request_path.display(),
+            events = rebuilt,
+            "Projection-Rebuild-Request abgearbeitet"
+        );
+        Ok(true)
+    }
+
     /// Verarbeitet einen Batch von Events innerhalb einer Transaktion.
     ///
     /// Gibt Anzahl erfolgreich verarbeiteter Events zurueck.
@@ -223,13 +268,22 @@ impl ProjectionWorker {
             // Alle Handler aufrufen (Reihenfolge: agent -> room -> kpi)
             for handler in &self.handlers {
                 if let Err(e) = handler.handle(*row_id, event, &payload, &txn) {
+                    txn.rollback().with_context(|| {
+                        format!(
+                            "Rollback nach Projection-Handlerfehler fehlgeschlagen row_id={row_id} event_type={}",
+                            event.event_type
+                        )
+                    })?;
                     error!(
                         row_id,
                         event_type = event.event_type,
                         error = %e,
-                        "Handler error, skipping event"
+                        "Handler error, aborting batch"
                     );
-                    break;
+                    return Err(e).context(format!(
+                        "Projection-Handlerfehler row_id={row_id} event_type={}",
+                        event.event_type
+                    ));
                 }
             }
 
@@ -295,4 +349,121 @@ fn deserialize_legacy_payload(event_type: &str, payload: &str) -> Option<DomainE
     }
 
     serde_json::from_value(value).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::bail;
+    use sentinel_common::{AgentId, DomainEvent, DomainEventPayload};
+    use tempfile::tempdir;
+
+    struct FailingHandler;
+
+    impl crate::handlers::ProjectionHandler for FailingHandler {
+        fn handle(
+            &self,
+            _row_id: i64,
+            _event: &DomainEvent,
+            _payload: &DomainEventPayload,
+            _txn: &crate::store::ReadModelTransaction<'_>,
+        ) -> anyhow::Result<()> {
+            bail!("synthetic handler failure");
+        }
+    }
+
+    fn append_event(store: &EventStore, tick: u64, payload: &DomainEventPayload) {
+        let mut event = DomainEvent::new(
+            payload.event_type_str(),
+            "test-aggregate",
+            &payload.to_json(),
+            &format!("corr-{tick}"),
+            tick,
+        );
+        event.timestamp_ms = tick * 1000;
+        store.append_event(&event).unwrap();
+    }
+
+    #[test]
+    fn rebuild_request_file_triggers_full_rebuild_and_is_removed() {
+        let dir = tempdir().unwrap();
+        let event_store =
+            Arc::new(EventStore::open(dir.path().join("events.db").to_str().unwrap()).unwrap());
+        append_event(
+            &event_store,
+            1,
+            &DomainEventPayload::AgentSpawned {
+                agent_id: AgentId(1),
+                name: "Test Agent".to_string(),
+                role: "QA".to_string(),
+                shift_set: 1,
+                room_id: "empfang".to_string(),
+            },
+        );
+
+        let request_path = dir.path().join(".projection-rebuild-request");
+        let config = ProjectionConfig {
+            poll_interval: std::time::Duration::from_millis(1),
+            batch_size: 16,
+            db_path: dir
+                .path()
+                .join("projection.db")
+                .to_string_lossy()
+                .to_string(),
+            rebuild_request_path: request_path.to_string_lossy().to_string(),
+            rebuild_request_poll_interval: std::time::Duration::from_secs(1),
+        };
+        let worker = ProjectionWorker::new(Arc::clone(&event_store), config).unwrap();
+
+        fs::write(
+            &request_path,
+            r#"{"requested_by":"runtime_reconcile","reason":"projection_drift","tick":42}"#,
+        )
+        .unwrap();
+
+        assert!(worker.handle_rebuild_request_if_present().unwrap());
+        assert!(!request_path.exists());
+        assert_eq!(worker.read_store().active_agent_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn handler_error_rolls_back_batch_and_returns_err() {
+        let dir = tempdir().unwrap();
+        let event_store =
+            Arc::new(EventStore::open(dir.path().join("events.db").to_str().unwrap()).unwrap());
+        append_event(
+            &event_store,
+            1,
+            &DomainEventPayload::AgentSpawned {
+                agent_id: AgentId(1),
+                name: "Test Agent".to_string(),
+                role: "QA".to_string(),
+                shift_set: 1,
+                room_id: "empfang".to_string(),
+            },
+        );
+
+        let config = ProjectionConfig {
+            poll_interval: std::time::Duration::from_millis(1),
+            batch_size: 16,
+            db_path: dir
+                .path()
+                .join("projection.db")
+                .to_string_lossy()
+                .to_string(),
+            rebuild_request_path: dir
+                .path()
+                .join(".projection-rebuild-request")
+                .to_string_lossy()
+                .to_string(),
+            rebuild_request_poll_interval: std::time::Duration::from_secs(1),
+        };
+        let mut worker = ProjectionWorker::new(Arc::clone(&event_store), config).unwrap();
+        worker.handlers = vec![Box::new(FailingHandler)];
+
+        let batch = event_store.get_events_since_with_id(0, 16).unwrap();
+        let err = worker.process_batch(&batch).unwrap_err();
+        assert!(format!("{err:#}").contains("synthetic handler failure"));
+        assert_eq!(worker.read_store().active_agent_count().unwrap(), 0);
+    }
 }
