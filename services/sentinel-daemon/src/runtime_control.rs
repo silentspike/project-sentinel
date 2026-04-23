@@ -47,6 +47,32 @@ pub enum RuntimeControlCommand {
         request: RuntimeReconcileRequest,
         response_tx: mpsc::SyncSender<RuntimeReconcileResponse>,
     },
+    StallRestartTest {
+        request: RuntimeStallRestartTestRequest,
+        response_tx: mpsc::SyncSender<RuntimeStallRestartTestResponse>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeStallRestartTestRequest {
+    pub agent_id: u16,
+    pub mode: String,
+    pub stall_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeStallRestartTestResponse {
+    pub accepted: bool,
+    pub agent_id: u16,
+    pub aggregate_id: String,
+    pub agent_name: String,
+    pub mode: String,
+    pub stall_secs: u64,
+    pub pid_before: Option<u32>,
+    pub pid_after: Option<u32>,
+    pub runtime_present_after: bool,
+    pub security_runtime_present_after: bool,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,9 +106,11 @@ impl RespawnBackoffTracker {
         match self.states.get(&agent_id).copied() {
             None => RespawnRetryDecision::Ready,
             Some(state) if state.failures >= self.max_failures => RespawnRetryDecision::Blocked,
-            Some(state) if current_tick < state.next_retry_tick => RespawnRetryDecision::BackoffActive {
-                retry_at_tick: state.next_retry_tick,
-            },
+            Some(state) if current_tick < state.next_retry_tick => {
+                RespawnRetryDecision::BackoffActive {
+                    retry_at_tick: state.next_retry_tick,
+                }
+            }
             Some(_) => RespawnRetryDecision::Ready,
         }
     }
@@ -148,7 +176,10 @@ mod tests {
             tracker.record_failure(7, 11),
             RespawnRetryDecision::BackoffActive { retry_at_tick: 13 }
         );
-        assert_eq!(tracker.decision(7, 12), RespawnRetryDecision::BackoffActive { retry_at_tick: 13 });
+        assert_eq!(
+            tracker.decision(7, 12),
+            RespawnRetryDecision::BackoffActive { retry_at_tick: 13 }
+        );
         assert_eq!(tracker.decision(7, 13), RespawnRetryDecision::Ready);
 
         assert_eq!(tracker.record_failure(7, 13), RespawnRetryDecision::Blocked);
@@ -162,8 +193,8 @@ mod tests {
     fn write_projection_rebuild_request_persists_request_file() {
         let dir = tempfile::tempdir().unwrap();
         write_projection_rebuild_request(dir.path(), 77).unwrap();
-        let payload = std::fs::read_to_string(dir.path().join(".projection-rebuild-request"))
-            .unwrap();
+        let payload =
+            std::fs::read_to_string(dir.path().join(".projection-rebuild-request")).unwrap();
         assert!(payload.contains("\"requested_by\": \"runtime_reconcile\""));
         assert!(payload.contains("\"tick\": 77"));
     }
