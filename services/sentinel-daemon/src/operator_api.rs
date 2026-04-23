@@ -9,11 +9,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result as AnyResult};
+use sentinel_fs::{cas::CasStore, layer::LayerManager, metadata::MetadataStore};
 use sentinel_redb::{ApiCpSnapshot, StateStore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
@@ -50,10 +52,8 @@ const OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH: &str = "/operator/security/fs-tra
 const OPERATOR_SECURITY_FS_TRASH_AGE_PATH: &str = "/operator/security/fs-trash-age";
 const OPERATOR_SECURITY_FS_TRASH_GC_PATH: &str = "/operator/security/fs-trash-gc";
 const OPERATOR_SECURITY_FS_RANSOMWARE_TEST_PATH: &str = "/operator/security/fs-ransomware-test";
-const OPERATOR_SECURITY_AGENT_RUNTIME_STATE_PATH: &str =
-    "/operator/security/agent-runtime-state";
-const OPERATOR_SECURITY_WRITE_ANOMALY_TEST_PATH: &str =
-    "/operator/security/write-anomaly-test";
+const OPERATOR_SECURITY_AGENT_RUNTIME_STATE_PATH: &str = "/operator/security/agent-runtime-state";
+const OPERATOR_SECURITY_WRITE_ANOMALY_TEST_PATH: &str = "/operator/security/write-anomaly-test";
 const OPERATOR_SECURITY_LANDLOCK_TEST_PATH: &str = "/operator/security/landlock-test";
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024;
@@ -191,11 +191,19 @@ struct FsRansomwareTestRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct FsRansomwareTestResponse {
     accepted: bool,
+    hook_version: u32,
     agent_name: String,
     relative_path: String,
     snapshot_label: String,
     host_path: String,
+    snapshot_id: String,
     bytes_written: usize,
+    before_sha256: String,
+    mutated_sha256: String,
+    restored_sha256: String,
+    restored: bool,
+    snapshot_wait_ms: u64,
+    restore_wait_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,6 +271,7 @@ struct AppState {
     shared_secret: Option<String>,
     data_dir: PathBuf,
     fs_mount: Option<String>,
+    fs_layer: Option<Arc<LayerManager>>,
     command_tx: mpsc::Sender<OperatorCommand>,
     platform_tx: mpsc::Sender<PlatformControlCommand>,
     nightrun_tx: mpsc::Sender<OperatorNightrunCommand>,
@@ -347,6 +356,7 @@ pub async fn start_server(
     config: OperatorApiConfig,
     data_dir: PathBuf,
     fs_mount: Option<String>,
+    fs_layer: Option<Arc<LayerManager>>,
     allowed_rooms: Vec<String>,
     command_tx: mpsc::Sender<OperatorCommand>,
     platform_tx: mpsc::Sender<PlatformControlCommand>,
@@ -368,6 +378,7 @@ pub async fn start_server(
         shared_secret: config.shared_secret,
         data_dir,
         fs_mount,
+        fs_layer,
         command_tx,
         platform_tx,
         nightrun_tx,
@@ -1074,11 +1085,19 @@ fn is_security_path(path: &str) -> bool {
     path.starts_with("/operator/security/")
 }
 
-fn open_artifact_plane(
-    state: &AppState,
-) -> std::result::Result<sentinel_fs::artifact::ArtifactPlane, ApiError> {
-    sentinel_fs::artifact::ArtifactPlane::open(state.data_dir.join("artifact.redb"))
-        .map_err(|_| ApiError::ServiceUnavailable("Artifact-Plane nicht verfuegbar"))
+fn open_fs_layer(state: &AppState) -> std::result::Result<Arc<LayerManager>, ApiError> {
+    if let Some(layer) = &state.fs_layer {
+        return Ok(Arc::clone(layer));
+    }
+    let cas = CasStore::open(&state.data_dir)
+        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs CAS nicht verfuegbar"))?;
+    let meta = MetadataStore::open(state.data_dir.join("metadata.redb"))
+        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Metadata nicht verfuegbar"))?;
+    let layer = Arc::new(LayerManager::new(cas, meta));
+    layer
+        .init_base_root()
+        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Base-Root nicht initialisierbar"))?;
+    Ok(layer)
 }
 
 fn now_ms() -> u64 {
@@ -1088,14 +1107,14 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn decode_chunk_hash(hex: &str) -> std::result::Result<[u8; 16], ApiError> {
+fn decode_chunk_hash(hex: &str) -> std::result::Result<[u8; 32], ApiError> {
     let trimmed = hex.trim();
-    if trimmed.len() != 32 {
+    if trimmed.len() != 64 {
         return Err(ApiError::BadRequest(
-            "hash muss 32 hex Zeichen (16 Byte) haben",
+            "hash muss 64 hex Zeichen (32 Byte) haben",
         ));
     }
-    let mut out = [0u8; 16];
+    let mut out = [0u8; 32];
     for (idx, chunk) in trimmed.as_bytes().chunks(2).enumerate() {
         let part = std::str::from_utf8(chunk)
             .map_err(|_| ApiError::BadRequest("hash enthaelt ungueltige Bytes"))?;
@@ -1103,6 +1122,37 @@ fn decode_chunk_hash(hex: &str) -> std::result::Result<[u8; 16], ApiError> {
             .map_err(|_| ApiError::BadRequest("hash ist kein gueltiger Hex-String"))?;
     }
     Ok(out)
+}
+
+fn fs_parent_and_name(
+    layer: &LayerManager,
+    agent_name: &str,
+    relative_path: &str,
+) -> std::result::Result<(u64, String), ApiError> {
+    let mut parent_inode = 1u64;
+    let mut components = Path::new(relative_path).components().peekable();
+    while let Some(component) = components.next() {
+        let name = component.as_os_str().to_str().ok_or(ApiError::BadRequest(
+            "relative_path enthaelt ungueltige UTF-8-Segmente",
+        ))?;
+        if components.peek().is_none() {
+            return Ok((parent_inode, name.to_string()));
+        }
+        parent_inode = match layer
+            .lookup_dirent(agent_name, parent_inode, name)
+            .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Dirent-Lookup fehlgeschlagen"))?
+        {
+            Some(existing) => existing,
+            None => layer
+                .mkdir(agent_name, parent_inode, name, 0o755)
+                .map_err(|_| {
+                    ApiError::ServiceUnavailable("sentinel-fs Unterverzeichnis nicht anlegbar")
+                })?,
+        };
+    }
+    Err(ApiError::BadRequest(
+        "relative_path enthaelt keinen Dateinamen",
+    ))
 }
 
 fn validate_relative_path(path: &str) -> std::result::Result<(), ApiError> {
@@ -1121,13 +1171,6 @@ fn validate_relative_path(path: &str) -> std::result::Result<(), ApiError> {
         ));
     }
     Ok(())
-}
-
-fn security_home_host_path(fs_mount: Option<&str>, agent_name: &str) -> String {
-    match fs_mount {
-        Some(mount) => format!("{mount}/{agent_name}"),
-        None => format!("/ram/agents/{agent_name}"),
-    }
 }
 
 fn current_runtime_snapshot_for_agent_name(
@@ -1160,6 +1203,16 @@ fn platform_agent_snapshot_for_id(
         .cloned())
 }
 
+fn fs_agent_dir_for_name(
+    state: &AppState,
+    agent_name: &str,
+) -> std::result::Result<String, ApiError> {
+    if let Some(platform) = platform_agent_snapshot_for_name(state, agent_name)? {
+        return Ok(platform.aggregate_id);
+    }
+    Ok(current_runtime_snapshot_for_agent_name(state, agent_name)?.aggregate_id)
+}
+
 fn platform_agent_snapshot_for_name(
     state: &AppState,
     agent_name: &str,
@@ -1181,15 +1234,15 @@ fn inspect_fs_trash(
 ) -> std::result::Result<FsTrashInspectResponse, ApiError> {
     let hash = hash.ok_or(ApiError::BadRequest("hash Query-Parameter fehlt"))?;
     let chunk_hash = decode_chunk_hash(hash)?;
-    let plane = open_artifact_plane(state)?;
-    let trashed_at_ms = plane
+    let layer = open_fs_layer(state)?;
+    let trashed_at_ms = layer
+        .meta()
         .get_trash_timestamp(&chunk_hash)
         .map_err(|_| ApiError::ServiceUnavailable("Trash-Queue nicht lesbar"))?;
-    let in_chunk_index = plane
-        .has_chunk(&chunk_hash)
-        .map_err(|_| ApiError::ServiceUnavailable("Chunk-Index nicht lesbar"))?;
-    let refcount = plane
-        .get_chunk_refcount(&chunk_hash)
+    let in_chunk_index = layer.cas().contains(&chunk_hash);
+    let refcount = layer
+        .meta()
+        .get_refcount(&chunk_hash)
         .map_err(|_| ApiError::ServiceUnavailable("Chunk-Refcount nicht lesbar"))?;
     Ok(FsTrashInspectResponse {
         found: trashed_at_ms.is_some(),
@@ -1210,29 +1263,52 @@ fn create_fs_trash_fixture(
         return Err(ApiError::BadRequest("agent_name fehlt"));
     }
     validate_relative_path(&payload.relative_path)?;
-    let plane = open_artifact_plane(state)?;
-    let mut ingest = sentinel_fs::ingest::begin_ingest(&plane, "text/plain");
-    ingest.write(payload.content.as_bytes());
-    let object_id = sentinel_fs::ingest::commit_ingest(ingest)
-        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Ingest fehlgeschlagen"))?;
-    let manifest = plane
-        .get_manifest(object_id)
-        .map_err(|_| ApiError::ServiceUnavailable("Manifest nicht lesbar"))?
-        .ok_or(ApiError::ServiceUnavailable("Manifest fehlt nach Fixture-Ingest"))?;
-    sentinel_fs::gc::release_object(&plane, object_id)
-        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Release fehlgeschlagen"))?;
-    let gc_stats = sentinel_fs::gc::gc_chunks(&plane)
-        .map_err(|_| ApiError::ServiceUnavailable("Fixture-GC fehlgeschlagen"))?;
+    let fs_agent_dir = fs_agent_dir_for_name(state, agent_name)?;
+    let layer = open_fs_layer(state)?;
+    let metadata = layer.meta();
+    let (parent_inode, file_name) =
+        fs_parent_and_name(&layer, &fs_agent_dir, &payload.relative_path)?;
+    if let Some(existing_inode) = layer
+        .lookup_dirent(&fs_agent_dir, parent_inode, &file_name)
+        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Dirent-Lookup fehlgeschlagen"))?
+    {
+        layer
+            .unlink(&fs_agent_dir, parent_inode, &file_name, existing_inode)
+            .map_err(|_| {
+                ApiError::ServiceUnavailable("Vorhandene Fixture-Datei nicht entfernbar")
+            })?;
+    }
+    let inode = layer
+        .write_file(
+            &fs_agent_dir,
+            parent_inode,
+            &file_name,
+            payload.content.as_bytes(),
+            0o644,
+        )
+        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Write fehlgeschlagen"))?;
+    let inode_data = layer
+        .lookup_inode(&fs_agent_dir, inode)
+        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Inode nicht lesbar"))?
+        .ok_or(ApiError::ServiceUnavailable(
+            "Fixture-Inode fehlt nach Write",
+        ))?;
+    layer
+        .unlink(&fs_agent_dir, parent_inode, &file_name, inode)
+        .map_err(|_| ApiError::ServiceUnavailable("Fixture-Unlink fehlgeschlagen"))?;
+    let trashed_chunks = u64::from(
+        metadata
+            .get_trash_timestamp(&inode_data.hash)
+            .map_err(|_| ApiError::ServiceUnavailable("Trash-Queue nicht lesbar"))?
+            .is_some(),
+    );
     Ok(FsTrashFixtureResponse {
         accepted: true,
         agent_name: agent_name.to_string(),
         relative_path: payload.relative_path,
-        object_id,
-        chunk_hashes: manifest
-            .iter()
-            .map(|hash| sentinel_fs::cas::hex_encode(hash))
-            .collect(),
-        trashed_chunks: gc_stats.trashed,
+        object_id: inode,
+        chunk_hashes: vec![sentinel_fs::cas::hex_encode(&inode_data.hash)],
+        trashed_chunks,
     })
 }
 
@@ -1241,10 +1317,11 @@ fn set_fs_trash_age(
     state: &AppState,
 ) -> std::result::Result<FsTrashAgeResponse, ApiError> {
     let chunk_hash = decode_chunk_hash(&payload.chunk_hash)?;
-    let plane = open_artifact_plane(state)?;
+    let layer = open_fs_layer(state)?;
     let trashed_at_ms = now_ms().saturating_sub(payload.hours_ago * 3600 * 1000);
-    let updated = plane
-        .set_trash_timestamp(&chunk_hash, trashed_at_ms)
+    let updated = layer
+        .meta()
+        .set_trash_timestamp(&chunk_hash, Some(trashed_at_ms))
         .map_err(|_| ApiError::ServiceUnavailable("Trash-Queue nicht schreibbar"))?;
     if !updated {
         return Err(ApiError::NotFound("chunk_hash nicht in fs_trash_queue"));
@@ -1260,8 +1337,10 @@ fn run_fs_trash_gc(
     payload: FsTrashGcRequest,
     state: &AppState,
 ) -> std::result::Result<FsTrashGcResponse, ApiError> {
-    let plane = open_artifact_plane(state)?;
-    let stats = sentinel_fs::gc::gc_trash(&plane, payload.grace_period_hours)
+    let layer = open_fs_layer(state)?;
+    let stats = layer
+        .meta()
+        .gc_trash(layer.cas(), payload.grace_period_hours)
         .map_err(|_| ApiError::ServiceUnavailable("gc_trash fehlgeschlagen"))?;
     Ok(FsTrashGcResponse {
         accepted: true,
@@ -1335,39 +1414,235 @@ fn run_fs_ransomware_test(
         return Err(ApiError::BadRequest("snapshot_label fehlt"));
     }
     validate_relative_path(&payload.relative_path)?;
-    let home_host_path = security_home_host_path(state.fs_mount.as_deref(), agent_name);
-    let target = Path::new(&home_host_path).join(payload.relative_path.trim());
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|_| ApiError::ServiceUnavailable("Ransomware-Testverzeichnis nicht schreibbar"))?;
-    }
-    let content = format!(
-        "issue-264-ransomware-test:{}:{}",
-        payload.snapshot_label, agent_name
+    info!(
+        agent_name,
+        relative_path = %payload.relative_path,
+        "Issue #264 fs-ransomware-test v2 gestartet"
     );
-    std::fs::write(&target, content.as_bytes())
-        .map_err(|_| ApiError::ServiceUnavailable("Ransomware-Testdatei konnte nicht geschrieben werden"))?;
+    let fs_agent_dir = fs_agent_dir_for_name(state, agent_name)?;
+    let layer = open_fs_layer(state)?;
+    let (parent_inode, file_name) =
+        fs_parent_and_name(&layer, &fs_agent_dir, &payload.relative_path)?;
+    let runtime = current_runtime_snapshot_for_agent_name(state, agent_name)?;
+    let home_host_path = runtime.home_host_path;
+    let target = Path::new(&home_host_path).join(payload.relative_path.trim());
+    let before_content = format!(
+        "issue-264-ransomware-original:{}:{}",
+        payload.snapshot_label, agent_name
+    )
+    .into_bytes();
+    replace_layer_file(
+        &layer,
+        &fs_agent_dir,
+        parent_inode,
+        &file_name,
+        &before_content,
+    )?;
+    let before_sha256 = sha256_hex(&before_content);
+    wait_for_expected_runtime_bytes(
+        &layer,
+        &fs_agent_dir,
+        parent_inode,
+        &file_name,
+        &target,
+        &before_sha256,
+    )?;
+
+    let known_snapshots: HashSet<String> = state
+        .event_store
+        .list_world_snapshots()
+        .map_err(|_| ApiError::ServiceUnavailable("World Snapshot Liste nicht lesbar"))?
+        .into_iter()
+        .map(|snapshot| snapshot.id)
+        .collect();
+    let snapshot_started = Instant::now();
+    state
+        .snapshot_tx
+        .send(sentinel_common::OperatorSnapshotCommand { tier: None })
+        .map_err(|_| ApiError::ServiceUnavailable("Snapshot-Channel nicht verfuegbar"))?;
+    let snapshot_id = wait_for_new_snapshot_id(state, &known_snapshots)?;
+    let snapshot_wait_ms = snapshot_started.elapsed().as_millis() as u64;
+
+    let mutated_content = format!(
+        "issue-264-ransomware-encrypted:{}:{}:{}",
+        payload.snapshot_label,
+        agent_name,
+        uuid::Uuid::now_v7()
+    )
+    .into_bytes();
+    replace_layer_file(
+        &layer,
+        &fs_agent_dir,
+        parent_inode,
+        &file_name,
+        &mutated_content,
+    )?;
+    let mutated_sha256 = sha256_hex(&mutated_content);
+    wait_for_expected_runtime_bytes(
+        &layer,
+        &fs_agent_dir,
+        parent_inode,
+        &file_name,
+        &target,
+        &mutated_sha256,
+    )?;
+
+    let restore_started = Instant::now();
+    state
+        .restore_tx
+        .send(sentinel_common::OperatorRestoreCommand {
+            snapshot_id: snapshot_id.clone(),
+        })
+        .map_err(|_| ApiError::ServiceUnavailable("Restore-Channel nicht verfuegbar"))?;
+    let restored_bytes = wait_for_expected_runtime_bytes(
+        &layer,
+        &fs_agent_dir,
+        parent_inode,
+        &file_name,
+        &target,
+        &before_sha256,
+    )?;
+    let restore_wait_ms = restore_started.elapsed().as_millis() as u64;
+    let restored_sha256 = sha256_hex(&restored_bytes);
+    info!(
+        agent_name,
+        snapshot_id = %snapshot_id,
+        before_sha256 = %before_sha256,
+        mutated_sha256 = %mutated_sha256,
+        restored_sha256 = %restored_sha256,
+        "Issue #264 fs-ransomware-test v2 abgeschlossen"
+    );
     Ok(FsRansomwareTestResponse {
         accepted: true,
+        hook_version: 2,
         agent_name: agent_name.to_string(),
         relative_path: payload.relative_path,
         snapshot_label: payload.snapshot_label,
         host_path: target.display().to_string(),
-        bytes_written: content.len(),
+        snapshot_id,
+        bytes_written: before_content.len(),
+        before_sha256: before_sha256.clone(),
+        mutated_sha256,
+        restored_sha256: restored_sha256.clone(),
+        restored: restored_sha256 == before_sha256,
+        snapshot_wait_ms,
+        restore_wait_ms,
     })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    sentinel_fs::cas::hex_encode(digest.as_slice())
+}
+
+fn replace_layer_file(
+    layer: &LayerManager,
+    agent_id: &str,
+    parent_inode: u64,
+    file_name: &str,
+    content: &[u8],
+) -> std::result::Result<(), ApiError> {
+    if let Some(existing_inode) = layer
+        .lookup_dirent(agent_id, parent_inode, file_name)
+        .map_err(|_| ApiError::ServiceUnavailable("Ransomware-Test-Dirent-Lookup fehlgeschlagen"))?
+    {
+        layer
+            .unlink(agent_id, parent_inode, file_name, existing_inode)
+            .map_err(|_| {
+                ApiError::ServiceUnavailable("Vorhandene Ransomware-Testdatei nicht entfernbar")
+            })?;
+    }
+    layer
+        .write_file(agent_id, parent_inode, file_name, content, 0o644)
+        .map_err(|_| {
+            ApiError::ServiceUnavailable("Ransomware-Testdatei konnte nicht geschrieben werden")
+        })?;
+    Ok(())
+}
+
+fn read_layer_file_bytes(
+    layer: &LayerManager,
+    agent_id: &str,
+    parent_inode: u64,
+    file_name: &str,
+) -> std::result::Result<Vec<u8>, ApiError> {
+    let inode = layer
+        .lookup_dirent(agent_id, parent_inode, file_name)
+        .map_err(|_| ApiError::ServiceUnavailable("Ransomware-Test-Dirent-Lookup fehlgeschlagen"))?
+        .ok_or(ApiError::ServiceUnavailable(
+            "Ransomware-Testdatei nicht gefunden",
+        ))?;
+    layer
+        .read_file(agent_id, inode)
+        .map_err(|_| ApiError::ServiceUnavailable("Ransomware-Testdatei nicht lesbar"))
+}
+
+fn wait_for_expected_runtime_bytes(
+    layer: &LayerManager,
+    agent_id: &str,
+    parent_inode: u64,
+    file_name: &str,
+    runtime_path: &Path,
+    expected_sha256: &str,
+) -> std::result::Result<Vec<u8>, ApiError> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let bytes = read_layer_file_bytes(layer, agent_id, parent_inode, file_name)?;
+        if sha256_hex(&bytes) == expected_sha256
+            && std::fs::read(runtime_path)
+                .map(|runtime_bytes| runtime_bytes == bytes)
+                .unwrap_or(false)
+        {
+            return Ok(bytes);
+        }
+        if Instant::now() >= deadline {
+            return Err(ApiError::ServiceUnavailable(
+                "Ransomware-Testdatei nicht auf aktivem Runtime-Pfad sichtbar",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_new_snapshot_id(
+    state: &AppState,
+    known_snapshots: &HashSet<String>,
+) -> std::result::Result<String, ApiError> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let snapshots = state
+            .event_store
+            .list_world_snapshots()
+            .map_err(|_| ApiError::ServiceUnavailable("World Snapshot Liste nicht lesbar"))?;
+        if let Some(snapshot) = snapshots
+            .into_iter()
+            .find(|snapshot| !known_snapshots.contains(&snapshot.id))
+        {
+            return Ok(snapshot.id);
+        }
+        if Instant::now() >= deadline {
+            return Err(ApiError::ServiceUnavailable(
+                "World Snapshot wurde nicht rechtzeitig erstellt",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn build_bwrap_command(
     agent_name: &str,
+    fs_host_agent_dir: Option<&str>,
     fs_mount: Option<&str>,
     extra_readonly_binds: &[(String, String)],
     inner_command: &[String],
 ) -> std::process::Command {
     let mut config = sentinel_sandbox::BwrapConfig::for_agent(agent_name);
     if let Some(mount) = fs_mount {
-        config = config.with_fs_mount(mount, agent_name);
+        config = config.with_fs_mount(mount, fs_host_agent_dir.unwrap_or(agent_name), agent_name);
     }
-    config.readonly_binds.extend(extra_readonly_binds.iter().cloned());
+    config
+        .readonly_binds
+        .extend(extra_readonly_binds.iter().cloned());
     let wrapped = maybe_wrap_with_landlock(agent_name, &mut config, inner_command);
     let mut args = config.to_args();
     args.extend(wrapped);
@@ -1456,9 +1731,7 @@ fn next_write_anomaly_start_tick(
     ebpf_collect_interval_ticks: u64,
 ) -> u64 {
     let cycle_interval_ticks = cycle_interval_ticks.max(1);
-    let ebpf_collect_interval_ticks = ebpf_collect_interval_ticks
-        .max(1)
-        .min(cycle_interval_ticks);
+    let ebpf_collect_interval_ticks = ebpf_collect_interval_ticks.max(1).min(cycle_interval_ticks);
     let target_mod =
         (cycle_interval_ticks + 1 - ebpf_collect_interval_ticks) % cycle_interval_ticks;
     let current_mod = current_tick % cycle_interval_ticks;
@@ -1490,10 +1763,8 @@ fn run_write_anomaly_test(
     }
 
     let runtime = current_runtime_snapshot_for_agent_name(state, agent_name)?;
-    let _platform =
-        platform_agent_snapshot_for_name(state, agent_name)?.ok_or(ApiError::NotFound(
-            "agent_name nicht im Platform-State",
-        ))?;
+    let _platform = platform_agent_snapshot_for_name(state, agent_name)?
+        .ok_or(ApiError::NotFound("agent_name nicht im Platform-State"))?;
     let platform_state = state
         .platform_state
         .read()
@@ -1513,7 +1784,13 @@ fn run_write_anomaly_test(
     let bwrap_pid = runtime
         .bwrap_pid
         .ok_or(ApiError::ServiceUnavailable("tracked bwrap_pid fehlt"))?;
-    let host_path = Path::new(&runtime.home_host_path)
+    // The runtime FUSE mount is currently read-focused; use a daemon-owned test
+    // path on the host FS so the operator hook can deterministically generate I/O
+    // inside the target agent cgroup.
+    let host_path = state
+        .data_dir
+        .join("security-write-anomaly")
+        .join(&runtime.aggregate_id)
         .join(".issue264-write-anomaly.bin")
         .display()
         .to_string();
@@ -1555,9 +1832,9 @@ with open(path, 'wb', buffering=0) as handle:
         .arg(duration_secs.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = child
-        .spawn()
-        .map_err(|_| ApiError::ServiceUnavailable("Write-Anomaly-Test konnte nicht gestartet werden"))?;
+    let mut child = child.spawn().map_err(|_| {
+        ApiError::ServiceUnavailable("Write-Anomaly-Test konnte nicht gestartet werden")
+    })?;
     let helper_pid = child.id();
     let _ = sentinel_sandbox::cgroups::add_pid_to_cgroup(agent_name, helper_pid);
     std::thread::spawn(move || {
@@ -1590,7 +1867,7 @@ fn run_landlock_test(
     if scenario.is_empty() {
         return Err(ApiError::BadRequest("scenario fehlt"));
     }
-    let _runtime = current_runtime_snapshot_for_agent_name(state, agent_name)?;
+    let runtime = current_runtime_snapshot_for_agent_name(state, agent_name)?;
     let breakout_helper = security_breakout_helper_path();
     if !breakout_helper.exists() {
         return Err(ApiError::ServiceUnavailable(
@@ -1602,8 +1879,13 @@ fn run_landlock_test(
         breakout_helper.to_string_lossy().into_owned(),
         "/breakout-helper".to_string(),
     )];
-    let mut command =
-        build_bwrap_command(agent_name, state.fs_mount.as_deref(), &binds, &inner_command);
+    let mut command = build_bwrap_command(
+        agent_name,
+        Some(&runtime.aggregate_id),
+        state.fs_mount.as_deref(),
+        &binds,
+        &inner_command,
+    );
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command
         .spawn()
@@ -1684,7 +1966,9 @@ fn persist_landlock_block_event(
     state
         .event_store
         .append_with_outbox(&event, &topic)
-        .map_err(|_| ApiError::ServiceUnavailable("Security-Exec-Event konnte nicht persistiert werden"))?;
+        .map_err(|_| {
+            ApiError::ServiceUnavailable("Security-Exec-Event konnte nicht persistiert werden")
+        })?;
     Ok(Some(event.event_id))
 }
 
@@ -1874,6 +2158,7 @@ mod tests {
             shared_secret: secret.map(str::to_string),
             data_dir,
             fs_mount: None,
+            fs_layer: None,
             command_tx: tx,
             platform_tx,
             nightrun_tx,
@@ -2321,7 +2606,7 @@ mod tests {
             test_request(
                 OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH,
                 serde_json::json!({
-                    "agent_name": "security-fixture",
+                    "agent_name": "Test Agent",
                     "relative_path": "ac1.txt",
                     "content": "issue-264"
                 }),

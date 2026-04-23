@@ -234,7 +234,7 @@ impl SandboxEnforcer {
 
     /// Sets the sentinel-fs FUSE mount path.
     ///
-    /// When set, `start_agent_process()` binds `{fs_mount}/{name}` instead
+    /// When set, `start_agent_process()` binds `{fs_mount}/{host_agent_dir}` instead
     /// of the default `/ram/agents/{name}` as the agent's writable home.
     pub fn set_fs_mount(&mut self, path: String) {
         self.fs_mount = Some(path);
@@ -282,7 +282,12 @@ impl SandboxEnforcer {
     /// agent command that applies irreversible Landlock rules before exec.
     /// Returns an [`AgentProcess`] with PID and Child handle.
     /// The Child's stdin is piped for stream-json communication.
-    pub fn start_agent_process(&self, name: &str, command: &[String]) -> Result<AgentProcess> {
+    pub fn start_agent_process(
+        &self,
+        name: &str,
+        fs_host_agent_dir: Option<&str>,
+        command: &[String],
+    ) -> Result<AgentProcess> {
         if !self.bwrap_available {
             anyhow::bail!("bwrap not available — cannot start agent process");
         }
@@ -291,7 +296,7 @@ impl SandboxEnforcer {
 
         // sentinel-fs FUSE mount: replace /ram/agents/ with FUSE mount path
         if let Some(ref fs_mount) = self.fs_mount {
-            config = config.with_fs_mount(fs_mount, name);
+            config = config.with_fs_mount(fs_mount, fs_host_agent_dir.unwrap_or(name), name);
         }
 
         // TOGAF default: share_net=true (Cortex Gateway API-Zugang)

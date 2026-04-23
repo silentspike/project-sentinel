@@ -3,10 +3,12 @@
 //! Erstellt periodisch World Snapshots (bincode), promoted sie durch
 //! Tiers (hourly→daily→weekly→monthly) und loescht abgelaufene.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use sentinel_common::{encode_world_snapshot, SnapshotMeta, SnapshotTier, WorldSnapshot};
+use sentinel_fs::layer::LayerManager;
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
 use tracing::{debug, info};
@@ -85,6 +87,9 @@ impl SnapshotManager {
         world: &mut bevy_ecs::world::World,
         state_store: &Arc<StateStore>,
         event_store: &Arc<EventStore>,
+        _data_dir: &Path,
+        fs_layer: Option<&LayerManager>,
+        fs_mount: Option<&str>,
         tick: u64,
         sim_hour: f32,
     ) -> anyhow::Result<String> {
@@ -95,6 +100,15 @@ impl SnapshotManager {
 
         // 2. ECS Snapshot
         let ecs_snapshot = sentinel_ecs::snapshot_ecs_state(world);
+
+        // 2b. Optionaler sentinel-fs Runtime-Dump fuer echten FUSE-Restore.
+        let fs_metadata = if fs_mount.is_some() {
+            let layer =
+                fs_layer.ok_or_else(|| anyhow::anyhow!("sentinel-fs Layer nicht initialisiert"))?;
+            Some(layer.meta().dump_all_tables()?)
+        } else {
+            None
+        };
 
         // 3. Projection Offsets lesen
         let projection_offsets = event_store.get_all_offsets().unwrap_or_default();
@@ -120,6 +134,7 @@ impl SnapshotManager {
             redb: redb_dump,
             ecs: ecs_snapshot,
             projection_offsets,
+            fs_metadata,
         };
 
         // 6. Snapshot serialisieren + in Limbo speichern
