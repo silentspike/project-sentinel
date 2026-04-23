@@ -32,6 +32,10 @@ muessen = "muessen"
 moglich = "moglich"
 Woche = "Woche"
 und = "und"
+ded = "ded"                   # commit hash fragment, e.g. 300ded0
+fand = "fand"
+relevante = "relevante"
+temporaere = "temporaere"
 
 # Sprint 2 domain words (ECS, Bio-Engine, Physics, Room System)
 Buero = "Buero"
