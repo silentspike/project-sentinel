@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use sentinel_common::agent_config::AgentConfig;
 use sentinel_common::AgentId;
@@ -72,6 +73,8 @@ pub struct RuntimeHealthSnapshot {
     pub repair_last_status: Option<String>,
     pub operator_auth_required: bool,
     #[serde(default)]
+    pub snapshot_build_elapsed_us: u64,
+    #[serde(default)]
     pub agents: Vec<RuntimeHealthAgentSnapshot>,
 }
 
@@ -89,6 +92,7 @@ pub fn build_runtime_health_snapshot(
     service_health_state: ServiceHealthWorkerSnapshot,
     previous: Option<&RuntimeHealthSnapshot>,
 ) -> RuntimeHealthSnapshot {
+    let snapshot_started = Instant::now();
     let expected_agents = agents_for_shift(all_agents, current_shift);
     let expected_active_ids = expected_agents
         .iter()
@@ -291,6 +295,7 @@ pub fn build_runtime_health_snapshot(
         last_repair_error: None,
         repair_last_status: None,
         operator_auth_required,
+        snapshot_build_elapsed_us: 0,
         agents,
     };
 
@@ -321,6 +326,7 @@ pub fn build_runtime_health_snapshot(
         );
     }
 
+    snapshot.snapshot_build_elapsed_us = snapshot_started.elapsed().as_micros() as u64;
     snapshot
 }
 
