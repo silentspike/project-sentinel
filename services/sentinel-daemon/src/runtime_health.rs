@@ -49,6 +49,8 @@ pub struct RuntimeHealthSnapshot {
     pub expected_active_agents: usize,
     pub runtime_agents: usize,
     pub projection_agents: usize,
+    pub projection_drift_detected: bool,
+    pub projection_drift_agents: usize,
     pub security_runtime_entries: usize,
     pub sandbox_handles: usize,
     pub tracked_processes: usize,
@@ -100,7 +102,7 @@ pub fn build_runtime_health_snapshot(
     let cgroup_snapshot = collect_cgroup_snapshot();
     let projection_store: Option<ReadModelStore> = projection_db_path
         .to_str()
-        .and_then(|path| ReadModelStore::open(path).ok());
+        .and_then(|path| ReadModelStore::open_readonly(path).ok());
     let projection_agents = projection_store
         .as_ref()
         .and_then(|store| store.active_agent_count().ok())
@@ -143,6 +145,7 @@ pub fn build_runtime_health_snapshot(
 
     let mut stale_runtime_entries = 0usize;
     let mut zombie_tracked_pids = 0usize;
+    let mut projection_drift_agents = 0usize;
     let mut agents = Vec::with_capacity(agent_catalog.len());
 
     for (agent_id, (aggregate_id, name)) in agent_catalog {
@@ -174,6 +177,14 @@ pub fn build_runtime_health_snapshot(
             .as_ref()
             .and_then(|store| store.get_agent(agent_id).ok().flatten())
             .is_some_and(|view| view.status == "active");
+        let projection_drift = projection_present
+            != (runtime_present
+                || security_runtime_present
+                || tracked_pid_alive
+                || cgroup_live_pid_count > 0);
+        if projection_drift {
+            projection_drift_agents += 1;
+        }
         let healthy = runtime_present
             && projection_present
             && security_runtime_present
@@ -255,11 +266,12 @@ pub fn build_runtime_health_snapshot(
             restart_count: worker_states
                 .get("service_health")
                 .map(|state| state.restart_count)
-                .unwrap_or(service_health_state.restart_count),
+                .unwrap_or(0)
+                .max(service_health_state.restart_count),
             last_error: worker_states
                 .get("service_health")
                 .and_then(|state| state.last_error.clone())
-                .or(service_health_state.last_error),
+                .or_else(|| service_health_state.last_error.clone()),
             thread_name: service_health_state.thread_name,
         },
     );
@@ -269,6 +281,9 @@ pub fn build_runtime_health_snapshot(
         expected_active_agents,
         runtime_agents,
         projection_agents,
+        projection_drift_detected: projection_drift_agents > 0
+            || runtime_agents != projection_agents,
+        projection_drift_agents,
         security_runtime_entries: security_state.len(),
         sandbox_handles: sandbox_handles.len(),
         tracked_processes: agent_processes.len(),
@@ -476,10 +491,55 @@ mod tests {
         assert_eq!(snapshot.expected_active_agents, 1);
         assert_eq!(snapshot.runtime_agents, 1);
         assert_eq!(snapshot.projection_agents, 0);
+        assert!(snapshot.projection_drift_detected);
+        assert_eq!(snapshot.projection_drift_agents, 1);
         assert_eq!(snapshot.stale_runtime_entries, 1);
         assert_eq!(snapshot.agents.len(), 1);
         assert!(snapshot.agents[0].runtime_present);
         assert!(!snapshot.agents[0].projection_present);
         assert!(!snapshot.agents[0].security_runtime_present);
+    }
+
+    #[test]
+    fn build_snapshot_prefers_latest_service_health_restart_count() {
+        let tmp = tempdir().unwrap();
+        let mut previous = RuntimeHealthSnapshot::default();
+        previous.worker_states.insert(
+            "service_health".to_string(),
+            RuntimeWorkerState {
+                running: true,
+                restart_count: 0,
+                last_error: None,
+                thread_name: "service-health-checker".to_string(),
+            },
+        );
+
+        let snapshot = build_runtime_health_snapshot(
+            &[],
+            1,
+            &RuntimeOrchestrator::new(30),
+            &HashMap::new(),
+            &HashMap::new(),
+            &Arc::new(RwLock::new(HashMap::new())),
+            &tmp.path().join("projection.db"),
+            false,
+            ServiceHealthWorkerSnapshot {
+                running: true,
+                restart_count: 2,
+                last_error: Some("panic-test requested for service_health".to_string()),
+                thread_name: "service-health-checker".to_string(),
+            },
+            Some(&previous),
+        );
+
+        let worker = snapshot
+            .worker_states
+            .get("service_health")
+            .expect("service_health worker state");
+        assert_eq!(worker.restart_count, 2);
+        assert_eq!(
+            worker.last_error.as_deref(),
+            Some("panic-test requested for service_health")
+        );
     }
 }

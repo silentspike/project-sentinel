@@ -30,6 +30,14 @@ pub struct RuntimeReconcileResponse {
     pub respawned_agents: usize,
     pub respawn_skipped_backoff: usize,
     pub respawn_blocked_agents: usize,
+    #[serde(default)]
+    pub projection_drift_before: bool,
+    #[serde(default)]
+    pub projection_drift_after: bool,
+    #[serde(default)]
+    pub projection_restart_attempted: bool,
+    #[serde(default)]
+    pub projection_restart_succeeded: bool,
     pub projection_rebuild_requested: bool,
     pub respawn_failures_total: u64,
     pub repair_last_status: String,
@@ -173,10 +181,11 @@ impl RespawnBackoffTracker {
     }
 }
 
-pub fn write_projection_rebuild_request(data_dir: &Path, tick: u64) -> Result<()> {
+pub fn write_projection_rebuild_request(data_dir: &Path, tick: u64, reason: &str) -> Result<()> {
     let request_path = data_dir.join(".projection-rebuild-request");
     let payload = serde_json::json!({
         "requested_by": "runtime_reconcile",
+        "reason": reason,
         "tick": tick,
     });
     std::fs::write(&request_path, serde_json::to_vec_pretty(&payload)?).with_context(|| {
@@ -227,10 +236,11 @@ mod tests {
     #[test]
     fn write_projection_rebuild_request_persists_request_file() {
         let dir = tempfile::tempdir().unwrap();
-        write_projection_rebuild_request(dir.path(), 77).unwrap();
+        write_projection_rebuild_request(dir.path(), 77, "projection_drift").unwrap();
         let payload =
             std::fs::read_to_string(dir.path().join(".projection-rebuild-request")).unwrap();
         assert!(payload.contains("\"requested_by\": \"runtime_reconcile\""));
+        assert!(payload.contains("\"reason\": \"projection_drift\""));
         assert!(payload.contains("\"tick\": 77"));
     }
 }

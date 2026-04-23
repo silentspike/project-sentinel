@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan279.md`
-- Overall status: `TASK_7_DONE_TASK_8_PENDING`
-- Current task: `Task 8 - Slice F: Projection/API-Konvergenz`
+- Overall status: `TASK_8_DONE_TASK_9_PENDING`
+- Current task: `Task 9 - Slice G: Conditional FUSE/Landlock Runtime Restore`
 - Current branch: `feat/issue-279-daemon-hardening-v2`
 - Worktree: `/work/company/project-sentinel-279-review`
 - Base: `origin/main @ 83ab01c8835804fd951e619aa048324b7ff76ddf`
@@ -60,6 +60,12 @@
   - Runtime-Health publiziert Queue-Depth, Dropped- und Coalesced-Counter
   - `POST /operator/runtime/analysis-flood-test` erzeugt deterministische Queue-Pressure fuer VM-/AC-Evidence
   - Remote-Tests, FUSE-Release-Build, Clippy, Scope-Guard und Artifact-Hash sind dokumentiert
+- Slice F ist erledigt:
+  - Projection-Worker konsumiert `.projection-rebuild-request` und fuehrt Full-Rebuild in-place aus
+  - Projection-Store bietet read-only Open fuer Runtime-Health ohne Migration/Startup-Cleanup
+  - Runtime-Health erkennt Projection-Drift und zaehlt driftende Projection-Agenten
+  - Runtime-Reconcile fordert Projection-Rebuilds per Request-Datei an und vermeidet Restart-Storms, wenn `sentinel-projection` bereits aktiv ist
+  - Remote-Tests, Clippy, Release-Builds und Artifact-Hashes fuer Daemon und Projection sind dokumentiert
 
 ## Blocked items
 
@@ -76,7 +82,7 @@
 - `ca44759` Task [4] Slice B - Runtime-Control / Reconcile
 - `f5e3dd9` Task [5] Slice C - Fast Stall Recovery
 - `b3b7786` Task [6] Slice D - Worker-Supervision
-- `TBD` Task [7] Slice E - bounded Analysis-/Recovery-Pfade
+- `bc57b4c` Task [7] Slice E - bounded Analysis-/Recovery-Pfade
 - `TBD` Task [8] Slice F - Projection/API-Konvergenz
 - `TBD` Task [9] Slice G - Conditional FUSE/Landlock Runtime Restore
 - `TBD` Task [10] Out-of-scope Follow-up - Haiku-Policy
@@ -98,7 +104,7 @@
 | 5 | Slice C - Fast Stall Recovery | DONE | deterministischer Stall-Testhook, same-tick Fast-Respawn, Runtime/Security/Sandbox-Recreate | inspect, command, system |
 | 6 | Slice D - Worker-Supervision | DONE | catch_unwind + in-process worker respawn, panic-test Hook | inspect, command, system |
 | 7 | Slice E - bounded Analysis-/Recovery-Pfade | DONE | bounded trigger queues, coalescing/drop counters, flood-test | inspect, command, system |
-| 8 | Slice F - Projection/API-Konvergenz | PENDING | read-only Projection-Reads, Rebuild-Request, drift-heal | inspect, command, system |
+| 8 | Slice F - Projection/API-Konvergenz | DONE | read-only Projection-Reads, Rebuild-Request, drift-heal, no restart storm | inspect, command, system |
 | 9 | Slice G - Conditional FUSE/Landlock Runtime Restore | PENDING | nur falls Main-Repro es braucht: FUSE/Landlock Runtime Restore, eigene Build-/Deploy-Gates | inspect, command, system |
 | 10 | Out-of-scope Follow-up - Haiku-Policy | PENDING | separates Gateway-/Policy-Issue oder Kommentar, nicht #279-Close-Bedingung | command, inspect |
 | 11 | Phase 3 - Tests, Clippy, Builds | PENDING | cargo remote only, relevant packages, conditional FUSE/Landlock matrix | command |
@@ -477,3 +483,68 @@
 - Scope guard:
   - `rg -n "AGENT_MODEL_HAIKU|model: AGENT|model: String::new\\(\\).*Gateway" services/sentinel-daemon/src cmd crates || true`
   - PASS: only `services/sentinel-daemon/src/llm_bridge.rs:612: model: String::new(), // Gateway waehlt default`
+
+## Task 8 - Slice F: Projection/API-Konvergenz
+
+### Pre-task self-check
+
+- Was muss getan werden: Slice F aus Donor `14560c4` plus relevante Stabilisierung aus `b1e376b` path-limited portieren, Projection-Drift erkennbar machen, Projection-Rebuilds per Request-Datei ausloesen und Restart-Storms vermeiden.
+- Welche ACs muessen hier passen:
+  - AC-1: Projection-Worker konsumiert eine Rebuild-Request-Datei und entfernt sie nach erfolgreichem Full-Rebuild.
+  - AC-2: Projection-Read-Model kann read-only geoeffnet werden, ohne Migrations-/Cleanup-Writes auf Runtime-Health-Reads auszufuehren.
+  - AC-3: Handlerfehler rollen Projection-Batches zurueck statt teilweise fortzuschreiben.
+  - AC-4: Runtime-Health erkennt Projection-Drift gegen Runtime-/Security-/Cgroup-Truth.
+  - AC-5: Runtime-Reconcile fordert bei Drift einen Rebuild an und startet `sentinel-projection` nicht neu, solange der Service aktiv ist und in-place rebuilden kann.
+  - AC-6: Remote-Tests, Clippy, Release-Builds, Artefakt-Hashes und Scope-Guard sind gruen.
+- Wie wird bewiesen: Code-Diff, `cargo remote -c -- fmt/test/clippy/build`, `sha256sum`, `git diff --check`, Scope-Guard gegen Haiku-/Model-Pinning.
+- Erwartete Dateien: `crates/sentinel-projection/*`, `services/sentinel-projection/src/main.rs`, `services/sentinel-daemon/src/runtime_health.rs`, `runtime_control.rs`, `orchestrator.rs`, `service_health.rs`, `operator_api.rs`, `CHANGELOG.md`.
+- Risiken:
+  - Projection-Recovery darf keine Restart-Schleife erzeugen.
+  - Runtime-Health darf keine Projection-Migrationen oder Startup-Cleanup nebenbei ausfuehren.
+  - Slice F darf keine FUSE/Landlock- oder Gateway-/Model-Policy-Arbeit einschleppen.
+
+### Outcome
+
+- Path-limited Slice F was applied from stack donor `14560c4` plus relevant stabilization from `b1e376b`.
+- `ProjectionConfig` now carries `rebuild_request_path` and a `1s` poll interval.
+- `ProjectionWorker` now polls `.projection-rebuild-request`, runs a full rebuild in-place, and removes the request file after success.
+- Projection batch handler failures now rollback the transaction and return an error instead of silently skipping failed events.
+- `ReadModelStore::open_readonly()` opens Projection DB read-only with a busy timeout and does not run migrations or startup cleanup.
+- Runtime-Health uses read-only Projection access and reports:
+  - `projection_drift_detected`
+  - `projection_drift_agents`
+- Runtime-Reconcile writes rebuild request payloads with a reason and reports:
+  - `projection_drift_before`
+  - `projection_drift_after`
+  - `projection_restart_attempted`
+  - `projection_restart_succeeded`
+- Runtime-Reconcile deliberately skips `systemctl restart sentinel-projection` when Projection is already active and a request-file rebuild can run in-place.
+- `service_health::restart_service()` now calls `systemctl reset-failed` before restart when a restart is actually required.
+- No Haiku/model-policy changes were introduced; runtime still leaves model selection to the Gateway default.
+
+### Evidence
+
+- `cargo remote -c -- fmt --check`
+  - PASS: no remaining rustfmt diff.
+- `cargo remote -c -- test -p sentinel-projection rebuild_request -- --nocapture`
+  - PASS: `1 passed; 0 failed`
+- `cargo remote -c -- test -q -p sentinel-projection -- --nocapture`
+  - PASS: `7 unit + 6 acceptance tests passed`
+- `cargo remote -c -- test -q -p sentinel-daemon runtime_control -- --nocapture`
+  - PASS: `2 passed`
+- `cargo remote -c -- test -q -p sentinel-daemon runtime_health -- --nocapture`
+  - PASS: `4 passed`
+- `cargo remote -c -- test -q -p sentinel-daemon test_runtime_reconcile_skips_projection_restart_when_rebuild_can_run_in_place -- --nocapture`
+  - PASS: `1 passed`
+- `cargo remote -c -- clippy -q -p sentinel-projection --all-targets -- -D warnings`
+  - PASS: exit `0`
+- `cargo remote -c -- clippy -q -p sentinel-projection-service --all-targets -- -D warnings`
+  - PASS: exit `0`
+- `cargo remote -c -- clippy -q -p sentinel-daemon --all-targets --features fuse -- -D warnings`
+  - PASS: exit `0`
+- `cargo remote -c -- build -q -p sentinel-daemon --release --features fuse`
+  - PASS: exit `0`
+  - artifact hash: `3a05fc872c061ae973e3d820e0a1aaa2d0a909b201d61e9b0c8c84b080c08425  target/release/sentinel-daemon`
+- `cargo remote -c -- build -q -p sentinel-projection-service --release`
+  - PASS: exit `0`
+  - artifact hash: `d0da3c42b11397e1c954777397c4b3622cfeeb4365fff2adebbded9adacb13b4  target/release/sentinel-projection`

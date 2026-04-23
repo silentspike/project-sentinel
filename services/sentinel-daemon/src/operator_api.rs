@@ -2373,6 +2373,8 @@ mod tests {
                     stale_runtime_entries: 2,
                     orphan_cgroups: 1,
                     zombie_tracked_pids: 0,
+                    projection_drift_detected: true,
+                    projection_drift_agents: 1,
                     worker_states: std::collections::BTreeMap::from([(
                         "service_health".to_string(),
                         crate::runtime_health::RuntimeWorkerState {
@@ -2810,6 +2812,10 @@ mod tests {
                         respawned_agents: 2,
                         respawn_skipped_backoff: 0,
                         respawn_blocked_agents: 0,
+                        projection_drift_before: true,
+                        projection_drift_after: false,
+                        projection_restart_attempted: false,
+                        projection_restart_succeeded: false,
                         projection_rebuild_requested: true,
                         respawn_failures_total: 0,
                         repair_last_status: "repaired".to_string(),

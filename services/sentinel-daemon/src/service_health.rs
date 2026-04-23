@@ -194,6 +194,9 @@ fn is_service_active(service_name: &str) -> bool {
 
 /// Restartet einen systemd Service. Daemon laeuft als root → kein sudo noetig.
 fn restart_service(service_name: &str) -> bool {
+    let _ = std::process::Command::new("systemctl")
+        .args(["reset-failed", service_name])
+        .status();
     std::process::Command::new("systemctl")
         .args(["restart", service_name])
         .status()

@@ -973,3 +973,212 @@ services/sentinel-daemon/src/llm_bridge.rs:612:            model: String::new(),
 ```
 
 PASS: Slice E builds, lints and keeps model selection out of the Daemon. The only runtime model-related match is the intended Gateway-default path.
+
+## Phase 7 - Slice F Projection/API-Konvergenz Evidence
+
+Date: 2026-04-23
+
+### AC-1 - Projection Rebuild Request File
+
+Code scope:
+
+```text
+crates/sentinel-projection/src/config.rs
+crates/sentinel-projection/src/worker.rs
+services/sentinel-projection/src/main.rs
+```
+
+Observed implementation:
+
+```text
+ProjectionConfig::rebuild_request_path
+ProjectionConfig::rebuild_request_poll_interval
+ProjectionWorker::handle_rebuild_request_if_present()
+```
+
+Remote test command:
+
+```bash
+cargo remote -c -- test -p sentinel-projection rebuild_request -- --nocapture
+```
+
+Observed:
+
+```text
+test worker::tests::rebuild_request_file_triggers_full_rebuild_and_is_removed ... ok
+test result: ok. 1 passed; 0 failed
+```
+
+PASS: The Projection worker consumes the request file, triggers a full rebuild and removes the request file after successful processing.
+
+### AC-2 - Read-Only Projection Reads For Runtime-Health
+
+Code scope:
+
+```text
+crates/sentinel-projection/src/store.rs
+services/sentinel-daemon/src/runtime_health.rs
+```
+
+Observed implementation:
+
+```text
+ReadModelStore::open_readonly(path)
+OpenFlags::SQLITE_OPEN_READ_ONLY
+build_snapshot() uses ReadModelStore::open_readonly()
+```
+
+Remote test command:
+
+```bash
+cargo remote -c -- test -q -p sentinel-projection -- --nocapture
+```
+
+Observed:
+
+```text
+test store::tests::test_open_readonly_reads_existing_projection_without_writes ... ok
+test result: ok. 7 passed; 0 failed
+test result: ok. 6 passed; 0 failed
+```
+
+PASS: Runtime-health can read Projection state through a read-only connection without running migrations or startup cleanup.
+
+### AC-3 - Projection Batch Error Rollback
+
+Code scope:
+
+```text
+crates/sentinel-projection/src/worker.rs
+```
+
+Observed implementation:
+
+```text
+txn.rollback()
+Handler error, aborting batch
+handler_error_rolls_back_batch_and_returns_err
+```
+
+Remote test command:
+
+```bash
+cargo remote -c -- test -q -p sentinel-projection -- --nocapture
+```
+
+Observed:
+
+```text
+test worker::tests::handler_error_rolls_back_batch_and_returns_err ... ok
+```
+
+PASS: Handler failures abort and rollback the batch instead of partially applying events.
+
+### AC-4 - Runtime-Health Projection Drift Detection
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/runtime_health.rs
+```
+
+Observed implementation:
+
+```text
+projection_drift_detected
+projection_drift_agents
+ReadModelStore::open_readonly()
+```
+
+Remote test command:
+
+```bash
+cargo remote -c -- test -q -p sentinel-daemon runtime_health -- --nocapture
+```
+
+Observed:
+
+```text
+test runtime_health::tests::build_snapshot_marks_missing_projection_and_security_as_stale ... ok
+test runtime_health::tests::build_snapshot_prefers_latest_service_health_restart_count ... ok
+test result: ok. 4 passed; 0 failed
+```
+
+PASS: Runtime-health reports Projection drift against runtime/security/cgroup truth and preserves latest worker restart state.
+
+### AC-5 - Reconcile Requests Rebuild Without Restart Storm
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/runtime_control.rs
+services/sentinel-daemon/src/orchestrator.rs
+services/sentinel-daemon/src/service_health.rs
+```
+
+Observed implementation:
+
+```text
+write_projection_rebuild_request(data_dir, tick, reason)
+projection_drift_before
+projection_restart_attempted
+projection_restart_succeeded
+projection service active -> no restart
+```
+
+Remote test commands:
+
+```bash
+cargo remote -c -- test -q -p sentinel-daemon runtime_control -- --nocapture
+cargo remote -c -- test -q -p sentinel-daemon test_runtime_reconcile_skips_projection_restart_when_rebuild_can_run_in_place -- --nocapture
+```
+
+Observed:
+
+```text
+runtime_control: test result: ok. 2 passed; 0 failed
+test orchestrator::tests::test_runtime_reconcile_skips_projection_restart_when_rebuild_can_run_in_place ... ok
+test result: ok. 1 passed; 0 failed
+```
+
+PASS: Runtime-reconcile writes a rebuild request for Projection drift and deliberately avoids restarting an already active Projection service.
+
+### AC-6 - Format, Clippy, Build, Artifact And Scope Guard
+
+Remote quality gate commands:
+
+```bash
+cargo remote -c -- fmt --check
+cargo remote -c -- clippy -q -p sentinel-projection --all-targets -- -D warnings
+cargo remote -c -- clippy -q -p sentinel-projection-service --all-targets -- -D warnings
+cargo remote -c -- clippy -q -p sentinel-daemon --all-targets --features fuse -- -D warnings
+cargo remote -c -- build -q -p sentinel-daemon --release --features fuse
+cargo remote -c -- build -q -p sentinel-projection-service --release
+```
+
+Observed:
+
+```text
+fmt: PASS
+sentinel-projection clippy: PASS exit 0
+sentinel-projection-service clippy: PASS exit 0
+sentinel-daemon clippy --features fuse: PASS exit 0
+sentinel-daemon release build --features fuse: PASS exit 0
+sentinel-projection-service release build: PASS exit 0
+3a05fc872c061ae973e3d820e0a1aaa2d0a909b201d61e9b0c8c84b080c08425  target/release/sentinel-daemon
+d0da3c42b11397e1c954777397c4b3622cfeeb4365fff2adebbded9adacb13b4  target/release/sentinel-projection
+```
+
+Scope guard command:
+
+```bash
+rg -n "AGENT_MODEL_HAIKU|model: AGENT|model: String::new\\(\\).*Gateway" services/sentinel-daemon/src cmd crates || true
+```
+
+Expected/observed allowed match:
+
+```text
+services/sentinel-daemon/src/llm_bridge.rs:612:            model: String::new(), // Gateway waehlt default
+```
+
+PASS: Slice F builds, lints and keeps model selection out of the Daemon. The Projection-side release artifact is explicitly built for later VM deploy evidence.
