@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 sentinel-common = { path = "../../crates/sentinel-common" }
 sentinel-ecs = { path = "../../crates/sentinel-ecs" }
+sentinel-projection = { path = "../../crates/sentinel-projection" }
 sentinel-runtime = { path = "../../crates/sentinel-runtime" }
 sentinel-zenoh = { path = "../../crates/sentinel-zenoh" }
 sentinel-limbo = { path = "../../crates/sentinel-limbo" }

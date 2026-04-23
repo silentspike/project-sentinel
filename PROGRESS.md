@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan279.md`
-- Overall status: `TASK_1_DONE_TASK_2_PENDING`
-- Current task: `Task 2 - Phase 1: Donor-Audit und Clean Port`
+- Overall status: `TASK_3_DONE_TASK_4_PENDING`
+- Current task: `Task 4 - Slice B: Runtime-Control / Reconcile`
 - Current branch: `feat/issue-279-daemon-hardening-v2`
 - Worktree: `/work/company/project-sentinel-279-review`
 - Base: `origin/main @ 83ab01c8835804fd951e619aa048324b7ff76ddf`
@@ -32,7 +32,12 @@
   - Frische VM-Zahlen muessen dynamisch gemessen werden, nicht aus alten Reviews kopiert werden.
   - Canonical-main-Reset muss ohne `/operator/runtime-health` messbar sein, weil `main` diesen Endpoint noch nicht hat.
   - Operator-Auth wird spaeter ueber einen gemeinsamen `/tmp/opcurl` Helper operationalisiert.
-  - FUSE/Landlock bekommt nur bei aktivem Slice G eigene Build-/Deploy-Gates.
+- FUSE/Landlock bekommt nur bei aktivem Slice G eigene Build-/Deploy-Gates.
+- Slice A ist erledigt:
+  - `GET /operator/runtime-health` ist als read-only Operator-Pfad verdrahtet
+  - Snapshot deckt Runtime, Projection, Cgroups, Security-Runtime und Worker-State ab
+  - Operator-Auth-Schutz fuer den Endpoint ist im Unit-Test belegt
+  - initialer Warnungsfund `unused import RuntimeHealthSnapshot` wurde vor Commit bereinigt
 
 ## Blocked items
 
@@ -44,7 +49,7 @@
 ## Commit references
 
 - `dca25ac` Task [1] Phase 0 - Issue-Repair und Baseline-Reset
-- `TBD` Task [2] Phase 1 - Donor-Audit und Clean Port
+- `e2e7523` Task [2] Phase 1 - Donor-Audit und Clean Port
 - `TBD` Task [3] Slice A - Runtime-Health-Read-Model
 - `TBD` Task [4] Slice B - Runtime-Control / Reconcile
 - `TBD` Task [5] Slice C - Fast Stall Recovery
@@ -65,9 +70,9 @@
 | # | Task | Status | Scope | Evidence |
 |---|------|--------|-------|----------|
 | 1 | Phase 0 - Issue-Repair und Baseline-Reset | DONE | frische VM-Baseline, Issue-Body-Repair, canonical-main-Reset, Post-Reset-Baseline ohne runtime-health | command, system, inspect |
-| 2 | Phase 1 - Donor-Audit und Clean Port | IN_PROGRESS | alte #279-Donor-Commits pruefen, nur scope-konforme Teile uebernehmen, Haiku ausschliessen | inspect, command |
-| 3 | Slice A - Runtime-Health-Read-Model | PENDING | `/operator/runtime-health`, Snapshot-Modell, Auth/Loopback, Tests | inspect, command, system |
-| 4 | Slice B - Runtime-Control / Reconcile | PENDING | `/operator/runtime/reconcile`, stale/orphan/zombie cleanup, bounded retries | inspect, command, system |
+| 2 | Phase 1 - Donor-Audit und Clean Port | DONE | alte #279-Donor-Commits pruefen, nur scope-konforme Teile uebernehmen, Haiku ausschliessen | inspect, command |
+| 3 | Slice A - Runtime-Health-Read-Model | DONE | `/operator/runtime-health`, Snapshot-Modell, Auth/Loopback, Tests | inspect, command, system |
+| 4 | Slice B - Runtime-Control / Reconcile | IN_PROGRESS | `/operator/runtime/reconcile`, stale/orphan/zombie cleanup, bounded retries | inspect, command, system |
 | 5 | Slice C - Fast Stall Recovery | PENDING | deterministischer Kandidat, SIGSTOP/SIGCONT, Respawn/Reconcile | command, system |
 | 6 | Slice D - Worker-Supervision | PENDING | catch_unwind + in-process worker respawn, panic-test Hook | inspect, command, system |
 | 7 | Slice E - bounded Analysis-/Recovery-Pfade | PENDING | bounded trigger queues, coalescing/drop counters, flood-test | inspect, command, system |
@@ -189,3 +194,43 @@
   - stale donor `PROGRESS.md`, old evidence and branch-wide #264 paths are excluded.
 - AC-3 PASS:
   - clean port order and path-limited rules are documented in `test-279-verification.md`.
+
+## Task 3 - Slice A: Runtime-Health-Read-Model
+
+### Pre-task self-check
+
+- Was muss getan werden: Runtime-Health-Snapshot aus dem Donor path-limited portieren und `GET /operator/runtime-health` als loopback/auth-konformen Read-Pfad verfuegbar machen.
+- Welche ACs muessen hier passen:
+  - AC-1: `runtime_health.rs` existiert und berechnet runtime/cgroup/projection/worker truth ohne Seiteneffekte.
+  - AC-2: Operator-Endpoint ist verdrahtet und nutzt die bestehende Operator-Auth-/Loopback-Struktur.
+  - AC-3: relevante Remote-Rust-Tests oder mindestens package build fuer Slice A sind gruen.
+- Wie wird bewiesen: Donor-Diff-Inspection, Code-Diff, `cargo remote -c -- test/build`.
+- Erwartete Dateien: `services/sentinel-daemon/src/runtime_health.rs`, `lib.rs`, `operator_api.rs`, `orchestrator.rs`, `service_health.rs`, ggf. `Cargo.toml/Cargo.lock`.
+- Risiken:
+  - Donor-Patch darf keine Reconcile-/Stall-/Queue-Semantik vorziehen.
+  - `runtime-health` muss read-only bleiben.
+
+### Outcome
+
+- Path-limited donor Slice A was applied from stack donor `29a0fb5`.
+- Merge conflict in `services/sentinel-daemon/src/operator_api.rs` was resolved by keeping current `main`'s `open_fs_layer` security/FUSE helper and adding only the new `is_protected_read_path()` read-auth helper.
+- Added `services/sentinel-daemon/src/runtime_health.rs`.
+- Added `sentinel-projection` as `sentinel-daemon` dependency so the daemon can read Projection truth without mutating Projection state.
+- Wired `SharedRuntimeHealthState` through `orchestrator.rs` into the ECS tick loop and Operator API.
+- Added `GET /operator/runtime-health` as a protected read path; it returns the current snapshot and respects the existing operator shared-secret auth rule.
+- Extended `ServiceHealthChecker` with a read-only worker snapshot for runtime-health reporting.
+- Fixed the initial `unused import RuntimeHealthSnapshot` warning by moving the import into the test module.
+
+### Evidence
+
+- `cargo remote -c -- test -p sentinel-daemon runtime_health -- --nocapture`
+  - PASS: `3 passed; 0 failed; 173 filtered out; finished in 10.28s`
+  - Covered tests:
+    - `runtime_health::tests::build_snapshot_marks_missing_projection_and_security_as_stale`
+    - `operator_api::tests::runtime_health_endpoint_returns_snapshot`
+    - `operator_api::tests::runtime_health_endpoint_requires_auth_when_secret_is_set`
+- `cargo remote -c -- build -p sentinel-daemon --release --features fuse`
+  - PASS: `Finished release profile [optimized] target(s) in 1m 07s`
+  - artifact hash: `7b5145a77da0a55a3e9e9da00b2d9036ce943df748d327b4095f87955b0034d2  target/release/sentinel-daemon`
+- `git diff --check`
+  - PASS: no whitespace/conflict errors.

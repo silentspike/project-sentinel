@@ -284,3 +284,126 @@ Refresh CHANGELOG and verification evidence in this branch only.
 ```
 
 PASS: The implementation path is now deterministic and scope-clean.
+
+## Phase 2 / Slice A - Runtime-Health-Read-Model
+
+Date: 2026-04-23
+
+### AC-1 - Runtime-Health Snapshot Model
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/runtime_health.rs
+services/sentinel-daemon/src/orchestrator.rs
+services/sentinel-daemon/src/service_health.rs
+services/sentinel-daemon/Cargo.toml
+Cargo.lock
+```
+
+Observed implementation:
+
+```text
+RuntimeHealthSnapshot fields include:
+- current_shift
+- expected_active_agents
+- runtime_agents
+- projection_agents
+- security_runtime_entries
+- sandbox_handles
+- tracked_processes
+- live_cgroup_dirs
+- stale_runtime_entries
+- orphan_cgroups
+- zombie_tracked_pids
+- worker_states
+- analysis_queue_depth
+- analysis_queue_dropped_total
+- analysis_queue_coalesced_total
+- reconcile counters
+- operator_auth_required
+- per-agent runtime/projection/cgroup/security details
+```
+
+PASS: The snapshot is read-only and composes runtime, Projection, cgroup, security-runtime and worker-state truth without adding repair behavior in Slice A.
+
+### AC-2 - Operator Endpoint And Auth Wiring
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/operator_api.rs
+services/sentinel-daemon/src/orchestrator.rs
+```
+
+Observed implementation:
+
+```text
+GET /operator/runtime-health
+protected by is_protected_read_path()
+uses existing shared-secret authorization rule when configured
+returns RuntimeHealthSnapshot from SharedRuntimeHealthState
+```
+
+Conflict resolution:
+
+```text
+operator_api.rs donor conflict resolved by keeping current main open_fs_layer()
+and adding only is_protected_read_path() for /operator/runtime-health.
+Donor open_artifact_plane() was not ported into Slice A.
+```
+
+PASS: The endpoint follows the existing Operator API read-path/auth structure and does not introduce a parallel control path.
+
+### AC-3 - Remote Tests And Release Build
+
+Remote test command:
+
+```bash
+cargo remote -c -- test -p sentinel-daemon runtime_health -- --nocapture
+```
+
+Observed:
+
+```text
+Finished test profile [unoptimized + debuginfo] target(s) in 7.36s
+running 3 tests
+test runtime_health::tests::build_snapshot_marks_missing_projection_and_security_as_stale ... ok
+test operator_api::tests::runtime_health_endpoint_returns_snapshot ... ok
+test operator_api::tests::runtime_health_endpoint_requires_auth_when_secret_is_set ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 173 filtered out; finished in 10.28s
+```
+
+Initial warning found and fixed:
+
+```text
+unused import: crate::runtime_health::RuntimeHealthSnapshot
+fix: moved RuntimeHealthSnapshot import into operator_api::tests
+```
+
+Remote release build command:
+
+```bash
+cargo remote -c -- build -p sentinel-daemon --release --features fuse
+```
+
+Observed:
+
+```text
+Finished release profile [optimized] target(s) in 1m 07s
+7b5145a77da0a55a3e9e9da00b2d9036ce943df748d327b4095f87955b0034d2  target/release/sentinel-daemon
+```
+
+Static hygiene:
+
+```bash
+git diff --check
+```
+
+Observed:
+
+```text
+no output
+```
+
+PASS: Slice A tests and release build are green via remote Rust execution only.
