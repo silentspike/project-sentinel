@@ -31,7 +31,6 @@ use crate::platform_controlplane::{
     PlatformAnalysisCommand, PlatformControlCommand, PlatformStateSnapshot,
     PlatformTriggerTestCommand,
 };
-
 const OPERATOR_CHAOS_PATH: &str = "/operator/chaos";
 const OPERATOR_STIMULUS_PATH: &str = "/operator/stimulus";
 const OPERATOR_NIGHTRUN_PATH: &str = "/operator/nightrun";
@@ -46,6 +45,7 @@ const OPERATOR_PLATFORM_ANALYZE_PATH: &str = "/operator/platform-analyze";
 const OPERATOR_PLATFORM_TRIGGER_TEST_PATH: &str = "/operator/platform-trigger-test";
 const OPERATOR_PLATFORM_ANALYSIS_TEST_PATH: &str = "/operator/platform-analysis-test";
 const OPERATOR_PLATFORM_STATE_PATH: &str = "/operator/platform-state";
+const OPERATOR_RUNTIME_HEALTH_PATH: &str = "/operator/runtime-health";
 const OPERATOR_APICP_SNAPSHOT_PATH: &str = "/operator/apicp/snapshot";
 const OPERATOR_SECURITY_FS_TRASH_PATH: &str = "/operator/security/fs-trash";
 const OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH: &str = "/operator/security/fs-trash-fixture";
@@ -281,6 +281,7 @@ struct AppState {
     prune_tx: mpsc::Sender<i64>,
     state_store: Arc<StateStore>,
     platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
+    runtime_health: crate::runtime_health::SharedRuntimeHealthState,
     security_runtime_state: SharedSecurityRuntimeState,
 }
 
@@ -367,6 +368,7 @@ pub async fn start_server(
     prune_tx: mpsc::Sender<i64>,
     state_store: Arc<sentinel_redb::StateStore>,
     platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
+    runtime_health: crate::runtime_health::SharedRuntimeHealthState,
     security_runtime_state: SharedSecurityRuntimeState,
 ) -> AnyResult<tokio::task::JoinHandle<()>> {
     let listener = TcpListener::bind(&config.bind_addr)
@@ -388,6 +390,7 @@ pub async fn start_server(
         prune_tx,
         state_store,
         platform_state,
+        runtime_health,
         security_runtime_state,
     };
 
@@ -431,7 +434,7 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
 
     // GET-Endpoints ohne Auth (read-only)
     if request.method == "GET" {
-        if (path_only == OPERATOR_APICP_SNAPSHOT_PATH || is_security_path(path_only))
+        if is_protected_read_path(path_only)
             && !is_authorized(&request.headers, state.shared_secret.as_deref())
         {
             return ApiError::Unauthorized.to_response();
@@ -464,6 +467,12 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Ok(snapshot) => json_response(200, snapshot.clone()),
                 Err(_) => {
                     ApiError::ServiceUnavailable("Platform-State nicht verfuegbar").to_response()
+                }
+            },
+            OPERATOR_RUNTIME_HEALTH_PATH => match state.runtime_health.read() {
+                Ok(snapshot) => json_response(200, snapshot.clone()),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Runtime-Health nicht verfuegbar").to_response()
                 }
             },
             OPERATOR_SECURITY_FS_TRASH_PATH => match inspect_fs_trash(query.get("hash"), state) {
@@ -1083,6 +1092,12 @@ fn parse_query_params(path: &str) -> HashMap<String, String> {
 
 fn is_security_path(path: &str) -> bool {
     path.starts_with("/operator/security/")
+}
+
+fn is_protected_read_path(path: &str) -> bool {
+    path == OPERATOR_APICP_SNAPSHOT_PATH
+        || path == OPERATOR_RUNTIME_HEALTH_PATH
+        || is_security_path(path)
 }
 
 fn open_fs_layer(state: &AppState) -> std::result::Result<Arc<LayerManager>, ApiError> {
@@ -2119,6 +2134,7 @@ fn json_response<T: Serialize>(status: u16, payload: T) -> HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_health::RuntimeHealthSnapshot;
     use sentinel_redb::{ApiCpPatternSnapshot, StateStore};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
@@ -2188,6 +2204,50 @@ mod tests {
                     current_profile: "normal".to_string(),
                 }],
                 ..PlatformStateSnapshot::default()
+            })),
+            runtime_health: Arc::new(std::sync::RwLock::new(RuntimeHealthSnapshot {
+                current_shift: 1,
+                expected_active_agents: 26,
+                runtime_agents: 3,
+                projection_agents: 2,
+                security_runtime_entries: 1,
+                sandbox_handles: 1,
+                tracked_processes: 1,
+                live_cgroup_dirs: 1,
+                stale_runtime_entries: 2,
+                orphan_cgroups: 1,
+                zombie_tracked_pids: 0,
+                worker_states: std::collections::BTreeMap::from([(
+                    "service_health".to_string(),
+                    crate::runtime_health::RuntimeWorkerState {
+                        running: true,
+                        restart_count: 0,
+                        last_error: None,
+                        thread_name: "service-health-checker".to_string(),
+                    },
+                )]),
+                analysis_queue_depth: 0,
+                analysis_queue_dropped_total: 0,
+                analysis_queue_coalesced_total: 0,
+                reconcile_runs_total: 0,
+                reconcile_repairs_total: 0,
+                respawn_failures: 0,
+                last_repair_error: None,
+                repair_last_status: Some("drift_detected".to_string()),
+                operator_auth_required: secret.is_some(),
+                agents: vec![crate::runtime_health::RuntimeHealthAgentSnapshot {
+                    agent_id: 7,
+                    aggregate_id: "AGENT-07".to_string(),
+                    name: "Test Agent".to_string(),
+                    runtime_present: true,
+                    projection_present: false,
+                    tracked_pid: Some(4242),
+                    tracked_pid_alive: false,
+                    tracked_pid_state: Some("Z".to_string()),
+                    cgroup_live_pid_count: 0,
+                    security_runtime_present: true,
+                    last_repair_status: Some("stale".to_string()),
+                }],
             })),
             security_runtime_state,
         };
@@ -2527,6 +2587,44 @@ mod tests {
         assert_eq!(payload.cycle_interval_ticks, 60);
         assert_eq!(payload.agents.len(), 1);
         assert_eq!(payload.agents[0].aggregate_id, "AGENT-07");
+    }
+
+    #[test]
+    fn runtime_health_endpoint_returns_snapshot() {
+        let (state, _rx, _platform_rx) = test_state(None);
+        let response = handle_http_request(
+            HttpRequest {
+                method: "GET".to_string(),
+                path: OPERATOR_RUNTIME_HEALTH_PATH.to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            &state,
+        );
+
+        assert_eq!(response.status, 200);
+        let payload: RuntimeHealthSnapshot = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(payload.current_shift, 1);
+        assert_eq!(payload.expected_active_agents, 26);
+        assert_eq!(payload.stale_runtime_entries, 2);
+        assert_eq!(payload.agents.len(), 1);
+        assert_eq!(payload.agents[0].agent_id, 7);
+    }
+
+    #[test]
+    fn runtime_health_endpoint_requires_auth_when_secret_is_set() {
+        let (state, _rx, _platform_rx) = test_state(Some("secret"));
+        let response = handle_http_request(
+            HttpRequest {
+                method: "GET".to_string(),
+                path: OPERATOR_RUNTIME_HEALTH_PATH.to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            },
+            &state,
+        );
+
+        assert_eq!(response.status, 401);
     }
 
     #[test]

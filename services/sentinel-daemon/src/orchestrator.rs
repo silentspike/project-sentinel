@@ -41,6 +41,7 @@ use crate::controlplane::store::ControlplaneStore;
 use crate::controlplane::ControlplaneKernel;
 use crate::episode_producer::EpisodeProducer;
 use crate::operator_api;
+use crate::runtime_health;
 use crate::shift::{agents_for_shift, detect_current_shift, detect_shift_from_sim_hour};
 use crate::signal::wait_for_shutdown;
 
@@ -591,8 +592,13 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let platform_state = Arc::new(RwLock::new(
         crate::platform_controlplane::PlatformStateSnapshot::default(),
     ));
+    let runtime_health = Arc::new(RwLock::new(
+        crate::runtime_health::RuntimeHealthSnapshot::default(),
+    ));
     let security_runtime_state: operator_api::SharedSecurityRuntimeState =
         Arc::new(RwLock::new(HashMap::new()));
+    let projection_db_path = data_dir.join("projection.db").to_string_lossy().to_string();
+    let operator_auth_required = config.operator_api.shared_secret.is_some();
 
     // -- Zenoh SentinelBus (Core-Bus fuer Real-Time Event-Verteilung) --
     let bus_config = config.zenoh.to_bus_config();
@@ -703,6 +709,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 prune_tx.clone(),
                 Arc::clone(&state_store),
                 Arc::clone(&platform_state),
+                Arc::clone(&runtime_health),
                 Arc::clone(&security_runtime_state),
             )
             .await?,
@@ -736,8 +743,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let platform_cp_config = config.platform_controlplane.clone();
     let events_db_path = events_path.to_string_lossy().to_string();
     let ecs_platform_state = Arc::clone(&platform_state);
+    let ecs_runtime_health = Arc::clone(&runtime_health);
     let ecs_security_runtime_state = Arc::clone(&security_runtime_state);
     let ecs_fs_mount = config.fs_mount.clone();
+    let ecs_projection_db_path = projection_db_path.clone();
     let ecs_handle = std::thread::Builder::new()
         .name("ecs-tick-loop".into())
         .spawn(move || {
@@ -774,7 +783,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 platform_cp_config,
                 events_db_path,
                 ecs_platform_state,
+                ecs_runtime_health,
                 ecs_security_runtime_state,
+                ecs_projection_db_path,
+                operator_auth_required,
                 ecs_fs_mount,
                 fs_layer.clone(),
                 #[cfg(feature = "llm")]
@@ -1284,7 +1296,10 @@ fn ecs_tick_loop(
     platform_cp_config: crate::config::PlatformControlplaneConfig,
     events_db_path_str: String,
     platform_state: Arc<RwLock<crate::platform_controlplane::PlatformStateSnapshot>>,
+    runtime_health: crate::runtime_health::SharedRuntimeHealthState,
     security_runtime_state: operator_api::SharedSecurityRuntimeState,
+    projection_db_path: String,
+    operator_auth_required: bool,
     fs_mount: Option<String>,
     fs_layer: Option<Arc<sentinel_fs::layer::LayerManager>>,
     #[cfg(feature = "llm")]
@@ -1928,6 +1943,18 @@ fn ecs_tick_loop(
             &platform_cp,
             &runtime_orch,
             &resource_manager,
+        );
+        runtime_health::publish_runtime_health_snapshot(
+            &runtime_health,
+            &all_agents,
+            current_shift,
+            &runtime_orch,
+            &sandbox_handles,
+            &agent_processes,
+            &security_runtime_state,
+            std::path::Path::new(&projection_db_path),
+            operator_auth_required,
+            service_health_checker.worker_state(),
         );
 
         // Prune: Empfange Cutoff von Operator-API, arbeite 1 Batch/Tick ab
@@ -3158,7 +3185,12 @@ mod tests {
             Arc::new(RwLock::new(
                 crate::platform_controlplane::PlatformStateSnapshot::default(),
             )),
+            Arc::new(RwLock::new(
+                crate::runtime_health::RuntimeHealthSnapshot::default(),
+            )),
             Arc::new(RwLock::new(HashMap::new())),
+            String::new(),
+            false,
             None,
             None,
             #[cfg(feature = "llm")]
@@ -3235,7 +3267,12 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::platform_controlplane::PlatformStateSnapshot::default(),
                 )),
+                Arc::new(RwLock::new(
+                    crate::runtime_health::RuntimeHealthSnapshot::default(),
+                )),
                 Arc::new(RwLock::new(HashMap::new())),
+                String::new(),
+                false,
                 None,
                 None,
                 #[cfg(feature = "llm")]
@@ -3329,7 +3366,12 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::platform_controlplane::PlatformStateSnapshot::default(),
                 )),
+                Arc::new(RwLock::new(
+                    crate::runtime_health::RuntimeHealthSnapshot::default(),
+                )),
                 Arc::new(RwLock::new(HashMap::new())),
+                String::new(),
+                false,
                 None,
                 None,
                 #[cfg(feature = "llm")]
@@ -3431,7 +3473,12 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::platform_controlplane::PlatformStateSnapshot::default(),
                 )),
+                Arc::new(RwLock::new(
+                    crate::runtime_health::RuntimeHealthSnapshot::default(),
+                )),
                 Arc::new(RwLock::new(HashMap::new())),
+                String::new(),
+                false,
                 None,
                 None,
                 #[cfg(feature = "llm")]
