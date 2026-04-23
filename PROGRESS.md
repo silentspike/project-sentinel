@@ -89,7 +89,7 @@
 - `b3b7786` Task [6] Slice D - Worker-Supervision
 - `bc57b4c` Task [7] Slice E - bounded Analysis-/Recovery-Pfade
 - `92b3279` Task [8] Slice F - Projection/API-Konvergenz
-- `TBD` Task [9] Slice G - Conditional FUSE/Landlock Runtime Restore
+- `7eb95cb` Task [9] Slice G - Conditional FUSE/Landlock Runtime Restore
 - `TBD` Task [10] Out-of-scope Follow-up - Haiku-Policy
 - `TBD` Task [11] Phase 3 - Tests, Clippy, Builds
 - `TBD` Task [12] Phase 4 - Deploy auf die VM
