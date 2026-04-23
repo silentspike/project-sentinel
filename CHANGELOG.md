@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Daemon Hardening: Runtime-Truth, Reconcile und deterministischer Stall-Restart** (#279)
+  - neues Runtime-Read-Model `RuntimeHealthSnapshot` plus `GET /operator/runtime-health` fuer Drift-, Worker- und Agent-Truth
+  - neuer Runtime-Control-Pfad `POST /operator/runtime/reconcile` fuer stale cleanup, orphan-cgroup cleanup, kontrollierten Respawn und Projection-Rebuild-Request
+  - `PlatformSideEffect::RestartAgent` fuehrt jetzt einen Fast-Respawn im selben Tick aus statt auf den naechsten Shift-Check zu warten
+  - neuer loopback-/auth-faehiger Testhook `POST /operator/runtime/stall-restart-test` mit synchronem `pid_before`/`pid_after`-Nachweis
+
 - **Room-Kommunikation Phase 2: Soft-Cap, Hallway Encounters, Transit-Realismus, adaptiver Heartbeat** (#289)
   - Raum-Kapazitaeten als Soft-Cap mit Perceptions `Es ist eng hier.` und `Der Raum ist komplett voll.` statt hartem Block
   - Flurbegegnungen nur im selben Transit-Raum; Encounter pausieren Transit und lassen ihn spaeter wieder anlaufen

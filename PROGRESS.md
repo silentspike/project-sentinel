@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan279.md`
-- Overall status: `TASK_4_DONE_TASK_5_PENDING`
-- Current task: `Task 5 - Slice C: Fast Stall Recovery`
+- Overall status: `TASK_5_DONE_TASK_6_PENDING`
+- Current task: `Task 6 - Slice D: Worker-Supervision`
 - Current branch: `feat/issue-279-daemon-hardening-v2`
 - Worktree: `/work/company/project-sentinel-279-review`
 - Base: `origin/main @ 83ab01c8835804fd951e619aa048324b7ff76ddf`
@@ -44,6 +44,11 @@
   - Expected active Agents koennen mit Backoff N=3 respawned werden
   - Projection-Rebuild wird ueber `.projection-rebuild-request` entkoppelt angefordert
   - aktuelle #264-SIGSTOP-Semantik wurde bei Konfliktauflösung beibehalten
+- Slice C ist erledigt:
+  - `POST /operator/runtime/stall-restart-test` ist als synchroner Operator-Testhook verdrahtet
+  - `PlatformSideEffect::RestartAgent` nutzt jetzt einen same-tick Fast-Respawn statt verzögertem Despawn
+  - der Fast-Restart entfernt alte Runtime-, Security- und Sandbox-Fragmente und respawned danach denselben Agent
+  - Remote-Tests, FUSE-Release-Build und Artifact-Hash sind dokumentiert
 
 ## Blocked items
 
@@ -57,7 +62,7 @@
 - `dca25ac` Task [1] Phase 0 - Issue-Repair und Baseline-Reset
 - `e2e7523` Task [2] Phase 1 - Donor-Audit und Clean Port
 - `f5be73b` Task [3] Slice A - Runtime-Health-Read-Model
-- `TBD` Task [4] Slice B - Runtime-Control / Reconcile
+- `ca44759` Task [4] Slice B - Runtime-Control / Reconcile
 - `TBD` Task [5] Slice C - Fast Stall Recovery
 - `TBD` Task [6] Slice D - Worker-Supervision
 - `TBD` Task [7] Slice E - bounded Analysis-/Recovery-Pfade
@@ -79,7 +84,7 @@
 | 2 | Phase 1 - Donor-Audit und Clean Port | DONE | alte #279-Donor-Commits pruefen, nur scope-konforme Teile uebernehmen, Haiku ausschliessen | inspect, command |
 | 3 | Slice A - Runtime-Health-Read-Model | DONE | `/operator/runtime-health`, Snapshot-Modell, Auth/Loopback, Tests | inspect, command, system |
 | 4 | Slice B - Runtime-Control / Reconcile | DONE | `/operator/runtime/reconcile`, stale/orphan/zombie cleanup, bounded retries | inspect, command, system |
-| 5 | Slice C - Fast Stall Recovery | PENDING | deterministischer Kandidat, SIGSTOP/SIGCONT, Respawn/Reconcile | command, system |
+| 5 | Slice C - Fast Stall Recovery | DONE | deterministischer Stall-Testhook, same-tick Fast-Respawn, Runtime/Security/Sandbox-Recreate | inspect, command, system |
 | 6 | Slice D - Worker-Supervision | PENDING | catch_unwind + in-process worker respawn, panic-test Hook | inspect, command, system |
 | 7 | Slice E - bounded Analysis-/Recovery-Pfade | PENDING | bounded trigger queues, coalescing/drop counters, flood-test | inspect, command, system |
 | 8 | Slice F - Projection/API-Konvergenz | PENDING | read-only Projection-Reads, Rebuild-Request, drift-heal | inspect, command, system |
@@ -297,3 +302,60 @@
 - `cargo remote -c -- build -p sentinel-daemon --release --features fuse`
   - PASS: `Finished release profile [optimized] target(s) in 1m 00s`
   - artifact hash: `19ce8b228b5588142399a4f712afd4cd89b1caca2be43c1273355a3ad30fe724  target/release/sentinel-daemon`
+
+## Task 5 - Slice C: Fast Stall Recovery
+
+### Pre-task self-check
+
+- Was muss getan werden: Fast-Stall-Recovery aus dem Donor path-limited portieren, einen deterministischen Operator-Testhook bereitstellen und `PlatformSideEffect::RestartAgent` vom verzögerten Despawn auf same-tick Fast-Respawn umstellen.
+- Welche ACs muessen hier passen:
+  - AC-1: Operator-Testhook nimmt `agent_id`, `mode` und `stall_secs` an, validiert Eingaben und dispatcht in den ECS-Thread.
+  - AC-2: Fast-Restart entfernt alte Runtime-, Sandbox-, eBPF- und Security-Fragmente und erzeugt danach Runtime- und Security-State neu.
+  - AC-3: `PlatformSideEffect::RestartAgent` nutzt den Fast-Restart-Pfad statt nur zu despawnen.
+  - AC-4: relevante Remote-Tests, FUSE-Release-Build und `git diff --check` sind gruen.
+- Wie wird bewiesen: Donor-Diff-Inspection, Code-Diff, `cargo remote -c -- fmt/test/build`, `sha256sum`, `git diff --check`.
+- Erwartete Dateien: `services/sentinel-daemon/src/runtime_control.rs`, `operator_api.rs`, `orchestrator.rs`, `runtime_health.rs`, `CHANGELOG.md`.
+- Risiken:
+  - Testhook darf kein Auth-Bypass sein; er laeuft ueber die bestehende Operator-API-Schutzschicht.
+  - Stall-Test darf den ECS-Thread nicht kuenstlich schlafen lassen.
+  - Fast-Restart darf keine alten cgroups oder Security-Snapshots zuruecklassen.
+
+### Outcome
+
+- Path-limited donor Slice C was applied from stack donor `fdc40c7`.
+- Added `RuntimeControlCommand::StallRestartTest` plus typed request/response structs.
+- Added `POST /operator/runtime/stall-restart-test`:
+  - rejects `agent_id=0`
+  - allows only `mode=sigstop` or `mode=direct`
+  - rejects `stall_secs=0`
+  - dispatches to the ECS owner thread and waits with `recv_timeout(10s)`
+- Added `restart_agent_fast_path()` in the orchestrator:
+  - captures `pid_before`
+  - tears down sandbox handle and unregisters eBPF cgroup id
+  - removes and terminates the old tracked process
+  - removes stale security runtime state
+  - despawns ECS/runtime state
+  - respawns the same configured agent immediately
+  - captures `pid_after` and runtime/security presence
+- Replaced `PlatformSideEffect::RestartAgent` with the same fast-path restart.
+- No Haiku/model-policy changes were introduced.
+
+### Evidence
+
+- `cargo remote -c -- fmt --check`
+  - PASS after applying remote rustfmt diffs locally.
+- `cargo remote -c -- test -p sentinel-daemon runtime_stall_restart -- --nocapture`
+  - PASS: `2 passed; 0 failed; 180 filtered out; finished in 1.49s`
+  - Covered tests:
+    - `operator_api::tests::runtime_stall_restart_test_is_forwarded_and_returns_response`
+    - `operator_api::tests::runtime_stall_restart_test_rejects_invalid_mode`
+- `cargo remote -c -- test -p sentinel-daemon restart_agent_fast_path -- --nocapture`
+  - PASS: `1 passed; 0 failed; 181 filtered out; finished in 0.14s`
+  - Covered test:
+    - `orchestrator::tests::test_restart_agent_fast_path_recreates_runtime_and_security_state`
+  - Note: build-server test sandbox logged `bwrap: Can't find source path /work/company`; this did not fail the test and is limited to the remote test fixture path.
+- `cargo remote -c -- build -p sentinel-daemon --release --features fuse`
+  - PASS: `Finished release profile [optimized] target(s) in 56.20s`
+  - artifact hash: `3470152e8b897217e2d2e547549b8f6759b3e733ec53d8a3ea8e00745da8d2bd  target/release/sentinel-daemon`
+- `git diff --check`
+  - PASS: no whitespace/conflict errors.

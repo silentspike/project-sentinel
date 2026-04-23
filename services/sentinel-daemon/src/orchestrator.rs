@@ -42,8 +42,8 @@ use crate::controlplane::ControlplaneKernel;
 use crate::episode_producer::EpisodeProducer;
 use crate::operator_api;
 use crate::runtime_control::{
-    RespawnBackoffTracker, RespawnRetryDecision, RuntimeControlCommand,
-    RuntimeReconcileRequest, RuntimeReconcileResponse,
+    RespawnBackoffTracker, RespawnRetryDecision, RuntimeControlCommand, RuntimeReconcileRequest,
+    RuntimeReconcileResponse, RuntimeStallRestartTestResponse,
 };
 use crate::runtime_health;
 use crate::shift::{agents_for_shift, detect_current_shift, detect_shift_from_sim_hour};
@@ -1141,6 +1141,117 @@ fn publish_platform_state_snapshot(
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FastRestartResult {
+    agent_name: String,
+    pid_before: Option<u32>,
+    pid_after: Option<u32>,
+    runtime_present_after: bool,
+    security_runtime_present_after: bool,
+}
+
+fn tracked_pid_for_agent(
+    agent_id: AgentId,
+    sandbox_handles: &HashMap<AgentId, SandboxHandle>,
+    agent_processes: &HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+) -> Option<u32> {
+    sandbox_handles
+        .get(&agent_id)
+        .and_then(|handle| handle.bwrap_pid)
+        .or_else(|| agent_processes.get(&agent_id).map(|proc| proc.pid))
+        .or_else(|| {
+            security_runtime_state.read().ok().and_then(|state| {
+                state
+                    .get(&agent_id.0)
+                    .and_then(|snapshot| snapshot.bwrap_pid)
+            })
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restart_agent_fast_path(
+    world: &mut bevy_ecs::prelude::World,
+    runtime_orch: &mut RuntimeOrchestrator,
+    agent_cfg: &AgentConfig,
+    sandbox: &SandboxEnforcer,
+    sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &mut EbpfCollector,
+    agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    agent_command: &[String],
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    fs_mount: Option<&str>,
+) -> Result<FastRestartResult> {
+    let agent_id = AgentId(agent_cfg.identity.id);
+    let pid_before = tracked_pid_for_agent(
+        agent_id,
+        sandbox_handles,
+        agent_processes,
+        security_runtime_state,
+    );
+
+    if let Some(handle) = sandbox_handles.remove(&agent_id) {
+        if handle.cgroup_created {
+            if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
+                ebpf_collector.unregister_agent(cid);
+            }
+        }
+        if let Err(error) = sandbox.teardown_agent(&handle) {
+            warn!(
+                agent_id = %agent_id,
+                error = %error,
+                "Sandbox teardown bei Fast-Restart fehlgeschlagen"
+            );
+        }
+    }
+
+    if let Some(proc_handle) = agent_processes.remove(&agent_id) {
+        let _ = signal_pid(proc_handle.pid, "TERM");
+        drop(proc_handle);
+    }
+
+    remove_security_runtime_snapshot(security_runtime_state, agent_id);
+    let _ = despawn_agent_from_world(world, agent_id);
+    let _ = runtime_orch.despawn_agent(agent_id);
+
+    if !spawn_agent_full(
+        runtime_orch,
+        world,
+        agent_cfg,
+        sandbox,
+        sandbox_handles,
+        ebpf_collector,
+        agent_processes,
+        agent_command,
+        security_runtime_state,
+        fs_mount,
+    ) {
+        return Err(anyhow!(
+            "Fast-Respawn fuer {} fehlgeschlagen",
+            agent_cfg.identity.name
+        ));
+    }
+
+    let pid_after = tracked_pid_for_agent(
+        agent_id,
+        sandbox_handles,
+        agent_processes,
+        security_runtime_state,
+    );
+    let security_runtime_present_after = security_runtime_state
+        .read()
+        .map(|state| state.contains_key(&agent_id.0))
+        .unwrap_or(false);
+
+    Ok(FastRestartResult {
+        agent_name: agent_cfg.identity.name.clone(),
+        pid_before,
+        pid_after,
+        runtime_present_after: runtime_orch.agents().contains_key(&agent_id),
+        security_runtime_present_after,
+    })
+}
+
 #[derive(Debug, Default)]
 struct RuntimeCleanupStats {
     repairs: usize,
@@ -1295,7 +1406,11 @@ fn run_runtime_reconcile(
     request: RuntimeReconcileRequest,
     respawn_backoff: &mut RespawnBackoffTracker,
 ) -> RuntimeReconcileResponse {
-    let previous = ctx.runtime_health.read().ok().map(|snapshot| snapshot.clone());
+    let previous = ctx
+        .runtime_health
+        .read()
+        .ok()
+        .map(|snapshot| snapshot.clone());
     let before = runtime_health::build_runtime_health_snapshot(
         ctx.all_agents,
         ctx.current_shift,
@@ -1349,7 +1464,8 @@ fn run_runtime_reconcile(
                 orphan_cgroups_removed += stats.orphan_cgroups_removed;
                 repair_ops_total += stats.repairs;
                 repaired_agents.push(agent.name.clone());
-                agent_status_updates.insert(agent.agent_id, "unexpected_runtime_cleaned".to_string());
+                agent_status_updates
+                    .insert(agent.agent_id, "unexpected_runtime_cleaned".to_string());
             }
         }
 
@@ -1425,7 +1541,9 @@ fn run_runtime_reconcile(
                 respawn_backoff.record_success(agent_id);
                 continue;
             }
-            if runtime_core_healthy && snapshot.security_runtime_present && !snapshot.projection_present
+            if runtime_core_healthy
+                && snapshot.security_runtime_present
+                && !snapshot.projection_present
             {
                 agent_status_updates.insert(agent_id, "projection_reconcile_pending".to_string());
                 respawn_backoff.record_success(agent_id);
@@ -1506,7 +1624,8 @@ fn run_runtime_reconcile(
     }
 
     let projection_rebuild_requested = if request.projection_rebuild && !request.dry_run {
-        match crate::runtime_control::write_projection_rebuild_request(ctx.data_dir, ctx.tick_count) {
+        match crate::runtime_control::write_projection_rebuild_request(ctx.data_dir, ctx.tick_count)
+        {
             Ok(()) => {
                 repair_ops_total += 1;
                 true
@@ -1540,21 +1659,19 @@ fn run_runtime_reconcile(
         .respawn_failures
         .saturating_add(respawn_failures_added);
     after.last_repair_error = errors.last().cloned().or(before.last_repair_error.clone());
-    after.repair_last_status = Some(
-        if request.dry_run {
-            "dry_run".to_string()
-        } else if respawn_blocked_agents > 0 {
-            "repair_blocked".to_string()
-        } else if !errors.is_empty() {
-            "repair_error".to_string()
-        } else if repair_ops_total > 0 || projection_rebuild_requested {
-            "repaired".to_string()
-        } else if after.stale_runtime_entries == 0 && after.orphan_cgroups == 0 {
-            "healthy".to_string()
-        } else {
-            "drift_detected".to_string()
-        },
-    );
+    after.repair_last_status = Some(if request.dry_run {
+        "dry_run".to_string()
+    } else if respawn_blocked_agents > 0 {
+        "repair_blocked".to_string()
+    } else if !errors.is_empty() {
+        "repair_error".to_string()
+    } else if repair_ops_total > 0 || projection_rebuild_requested {
+        "repaired".to_string()
+    } else if after.stale_runtime_entries == 0 && after.orphan_cgroups == 0 {
+        "healthy".to_string()
+    } else {
+        "drift_detected".to_string()
+    });
     for agent in &mut after.agents {
         if let Some(status) = agent_status_updates.get(&agent.agent_id) {
             agent.last_repair_status = Some(status.clone());
@@ -2287,11 +2404,117 @@ fn ecs_tick_loop(
                         fs_mount: fs_mount.as_deref(),
                         data_dir,
                     };
-                    let response = run_runtime_reconcile(
-                        &mut reconcile_ctx,
-                        request,
-                        &mut respawn_backoff,
-                    );
+                    let response =
+                        run_runtime_reconcile(&mut reconcile_ctx, request, &mut respawn_backoff);
+                    let _ = response_tx.send(response);
+                }
+                RuntimeControlCommand::StallRestartTest {
+                    request,
+                    response_tx,
+                } => {
+                    let agent_id = AgentId(request.agent_id);
+                    let response = match all_agents
+                        .iter()
+                        .find(|cfg| cfg.identity.id == request.agent_id)
+                    {
+                        Some(agent_cfg) => {
+                            let pid_before = tracked_pid_for_agent(
+                                agent_id,
+                                &sandbox_handles,
+                                &agent_processes,
+                                &security_runtime_state,
+                            );
+                            let pre_suspend_result = match request.mode.as_str() {
+                                "sigstop" => suspend_agent_cgroup_processes(
+                                    &agent_cfg.identity.name,
+                                    pid_before,
+                                )
+                                .map(|_| ()),
+                                "direct" => Ok(()),
+                                _ => Err(anyhow!("unbekannter stall-restart-test mode")),
+                            };
+
+                            match pre_suspend_result.and_then(|_| {
+                                restart_agent_fast_path(
+                                    &mut world,
+                                    &mut runtime_orch,
+                                    agent_cfg,
+                                    &sandbox,
+                                    &mut sandbox_handles,
+                                    &mut ebpf_collector,
+                                    &mut agent_processes,
+                                    &agent_command,
+                                    &security_runtime_state,
+                                    fs_mount.as_deref(),
+                                )
+                            }) {
+                                Ok(result) => {
+                                    info!(
+                                        agent_id = %agent_id,
+                                        mode = %request.mode,
+                                        stall_secs = request.stall_secs,
+                                        pid_before = ?result.pid_before,
+                                        pid_after = ?result.pid_after,
+                                        "Deterministischer Stall-Restart-Test ausgefuehrt"
+                                    );
+                                    RuntimeStallRestartTestResponse {
+                                        accepted: true,
+                                        agent_id: request.agent_id,
+                                        aggregate_id: format!("AGENT-{:02}", request.agent_id),
+                                        agent_name: result.agent_name,
+                                        mode: request.mode,
+                                        stall_secs: request.stall_secs,
+                                        pid_before: result.pid_before,
+                                        pid_after: result.pid_after,
+                                        runtime_present_after: result.runtime_present_after,
+                                        security_runtime_present_after: result
+                                            .security_runtime_present_after,
+                                        note: "fast_path_restart_executed_without_shift_wait"
+                                            .to_string(),
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        agent_id = %agent_id,
+                                        mode = %request.mode,
+                                        error = %error,
+                                        "Stall-Restart-Test fehlgeschlagen"
+                                    );
+                                    RuntimeStallRestartTestResponse {
+                                        accepted: false,
+                                        agent_id: request.agent_id,
+                                        aggregate_id: format!("AGENT-{:02}", request.agent_id),
+                                        agent_name: agent_cfg.identity.name.clone(),
+                                        mode: request.mode,
+                                        stall_secs: request.stall_secs,
+                                        pid_before,
+                                        pid_after: None,
+                                        runtime_present_after: runtime_orch
+                                            .agents()
+                                            .contains_key(&agent_id),
+                                        security_runtime_present_after: security_runtime_state
+                                            .read()
+                                            .map(|state| state.contains_key(&request.agent_id))
+                                            .unwrap_or(false),
+                                        note: error.to_string(),
+                                    }
+                                }
+                            }
+                        }
+                        None => RuntimeStallRestartTestResponse {
+                            accepted: false,
+                            agent_id: request.agent_id,
+                            aggregate_id: format!("AGENT-{:02}", request.agent_id),
+                            agent_name: String::new(),
+                            mode: request.mode,
+                            stall_secs: request.stall_secs,
+                            pid_before: None,
+                            pid_after: None,
+                            runtime_present_after: false,
+                            security_runtime_present_after: false,
+                            note: "agent_id unbekannt".to_string(),
+                        },
+                    };
                     let _ = response_tx.send(response);
                 }
             }
@@ -2390,30 +2613,37 @@ fn ecs_tick_loop(
                     }
                     crate::platform_controlplane::rules::PlatformSideEffect::RestartAgent(
                         agent_id,
-                    ) => {
-                        // Sandbox teardown
-                        if let Some(handle) = sandbox_handles.remove(&agent_id) {
-                            if handle.cgroup_created {
-                                if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
-                                    ebpf_collector.unregister_agent(cid);
-                                }
-                            }
-                            if let Err(e) = sandbox.teardown_agent(&handle) {
-                                warn!(agent_id = %agent_id, error = %e,
-                                    "Sandbox teardown bei Stall-Restart fehlgeschlagen");
-                            }
-                        }
-                        // Agent-Prozess droppen
-                        agent_processes.remove(&agent_id);
-                        remove_security_runtime_snapshot(&security_runtime_state, agent_id);
-                        // ECS Entity despawnen
-                        despawn_agent_from_world(&mut world, agent_id);
-                        // RuntimeOrchestrator despawn
-                        let _ = runtime_orch.despawn_agent(agent_id);
-                        // Respawn bei naechstem Shift-Check
-                        info!(agent_id = %agent_id,
-                            "Agent nach Stall restartet (despawned, Respawn bei naechstem Shift-Check)");
-                    }
+                    ) => match all_agents.iter().find(|cfg| cfg.identity.id == agent_id.0) {
+                        Some(agent_cfg) => match restart_agent_fast_path(
+                            &mut world,
+                            &mut runtime_orch,
+                            agent_cfg,
+                            &sandbox,
+                            &mut sandbox_handles,
+                            &mut ebpf_collector,
+                            &mut agent_processes,
+                            &agent_command,
+                            &security_runtime_state,
+                            fs_mount.as_deref(),
+                        ) {
+                            Ok(result) => info!(
+                                agent_id = %agent_id,
+                                agent = %result.agent_name,
+                                pid_before = ?result.pid_before,
+                                pid_after = ?result.pid_after,
+                                "Agent nach Stall sofort via Fast-Respawn wiederhergestellt"
+                            ),
+                            Err(error) => warn!(
+                                agent_id = %agent_id,
+                                error = %error,
+                                "Fast-Respawn nach Stall fehlgeschlagen"
+                            ),
+                        },
+                        None => warn!(
+                            agent_id = %agent_id,
+                            "Agent-Konfiguration fuer Stall-Restart nicht gefunden"
+                        ),
+                    },
                     crate::platform_controlplane::rules::PlatformSideEffect::RestartService(
                         service_name,
                     ) => {
@@ -3625,6 +3855,70 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn test_restart_agent_fast_path_recreates_runtime_and_security_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.db");
+        let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
+
+        let mut runtime_orch = RuntimeOrchestrator::new(10).with_event_store(event_store);
+        let (mut world, _schedule) = create_simulation_world();
+        let sandbox = test_sandbox();
+        let (mut ebpf_collector, _ebpf_tx) = test_ebpf();
+        let mut sandbox_handles = HashMap::new();
+        let mut agent_processes = HashMap::new();
+        let security_runtime_state = Arc::new(RwLock::new(HashMap::new()));
+        let agent_cfg = test_agent_config(1, "Test Agent", "Tester", 1);
+        let agent_command = vec!["true".to_string()];
+
+        assert!(spawn_agent_full(
+            &mut runtime_orch,
+            &mut world,
+            &agent_cfg,
+            &sandbox,
+            &mut sandbox_handles,
+            &mut ebpf_collector,
+            &mut agent_processes,
+            &agent_command,
+            &security_runtime_state,
+            None,
+        ));
+
+        let before_pid = tracked_pid_for_agent(
+            AgentId(1),
+            &sandbox_handles,
+            &agent_processes,
+            &security_runtime_state,
+        );
+        let result = restart_agent_fast_path(
+            &mut world,
+            &mut runtime_orch,
+            &agent_cfg,
+            &sandbox,
+            &mut sandbox_handles,
+            &mut ebpf_collector,
+            &mut agent_processes,
+            &agent_command,
+            &security_runtime_state,
+            None,
+        )
+        .expect("fast restart");
+
+        assert_eq!(result.agent_name, "Test Agent");
+        assert_eq!(result.pid_before, before_pid);
+        assert!(result.runtime_present_after);
+        assert!(result.security_runtime_present_after);
+        assert!(runtime_orch.agents().contains_key(&AgentId(1)));
+        assert!(security_runtime_state.read().unwrap().contains_key(&1));
+        assert_eq!(runtime_orch.agent_count(), 1);
+        if let (Some(pid_before), Some(pid_after)) = (result.pid_before, result.pid_after) {
+            assert_ne!(
+                pid_before, pid_after,
+                "Fast-Restart sollte einen neuen PID liefern"
+            );
+        }
     }
 
     #[test]

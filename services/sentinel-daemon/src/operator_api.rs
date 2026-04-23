@@ -33,6 +33,7 @@ use crate::platform_controlplane::{
 };
 use crate::runtime_control::{
     RuntimeControlCommand, RuntimeReconcileRequest, RuntimeReconcileResponse,
+    RuntimeStallRestartTestRequest, RuntimeStallRestartTestResponse,
 };
 
 const OPERATOR_CHAOS_PATH: &str = "/operator/chaos";
@@ -51,6 +52,7 @@ const OPERATOR_PLATFORM_ANALYSIS_TEST_PATH: &str = "/operator/platform-analysis-
 const OPERATOR_PLATFORM_STATE_PATH: &str = "/operator/platform-state";
 const OPERATOR_RUNTIME_HEALTH_PATH: &str = "/operator/runtime-health";
 const OPERATOR_RUNTIME_RECONCILE_PATH: &str = "/operator/runtime/reconcile";
+const OPERATOR_RUNTIME_STALL_RESTART_TEST_PATH: &str = "/operator/runtime/stall-restart-test";
 const OPERATOR_APICP_SNAPSHOT_PATH: &str = "/operator/apicp/snapshot";
 const OPERATOR_SECURITY_FS_TRASH_PATH: &str = "/operator/security/fs-trash";
 const OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH: &str = "/operator/security/fs-trash-fixture";
@@ -712,6 +714,19 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Err(err) => err.to_response(),
             }
         }
+        OPERATOR_RUNTIME_STALL_RESTART_TEST_PATH => {
+            let payload: RuntimeStallRestartTestRequest =
+                match serde_json::from_slice(&request.body) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                    }
+                };
+            match dispatch_runtime_stall_restart_test(payload, state) {
+                Ok(response) => json_response(200, response),
+                Err(err) => err.to_response(),
+            }
+        }
         OPERATOR_APICP_SNAPSHOT_PATH => {
             let payload: ApiCpSnapshot = match serde_json::from_slice(&request.body) {
                 Ok(p) => p,
@@ -1105,6 +1120,37 @@ fn dispatch_runtime_reconcile(
     response_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .map_err(|_| ApiError::ServiceUnavailable("Runtime-Reconcile Timeout"))
+}
+
+fn dispatch_runtime_stall_restart_test(
+    mut payload: RuntimeStallRestartTestRequest,
+    state: &AppState,
+) -> std::result::Result<RuntimeStallRestartTestResponse, ApiError> {
+    payload.mode = payload.mode.trim().to_ascii_lowercase();
+    if payload.agent_id == 0 {
+        return Err(ApiError::BadRequest("agent_id fehlt"));
+    }
+    if payload.mode.is_empty() {
+        return Err(ApiError::BadRequest("mode fehlt"));
+    }
+    if !matches!(payload.mode.as_str(), "sigstop" | "direct") {
+        return Err(ApiError::BadRequest("mode muss sigstop oder direct sein"));
+    }
+    if payload.stall_secs == 0 {
+        return Err(ApiError::BadRequest("stall_secs muss > 0 sein"));
+    }
+
+    let (response_tx, response_rx) = mpsc::sync_channel(1);
+    state
+        .runtime_tx
+        .send(RuntimeControlCommand::StallRestartTest {
+            request: payload,
+            response_tx,
+        })
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-Control-Channel nicht verfuegbar"))?;
+    response_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|_| ApiError::ServiceUnavailable("Stall-Restart-Test Timeout"))
 }
 
 fn request_path(path: &str) -> &str {
@@ -2242,49 +2288,49 @@ mod tests {
             })),
             runtime_health: Arc::new(std::sync::RwLock::new(
                 crate::runtime_health::RuntimeHealthSnapshot {
-                current_shift: 1,
-                expected_active_agents: 26,
-                runtime_agents: 3,
-                projection_agents: 2,
-                security_runtime_entries: 1,
-                sandbox_handles: 1,
-                tracked_processes: 1,
-                live_cgroup_dirs: 1,
-                stale_runtime_entries: 2,
-                orphan_cgroups: 1,
-                zombie_tracked_pids: 0,
-                worker_states: std::collections::BTreeMap::from([(
-                    "service_health".to_string(),
-                    crate::runtime_health::RuntimeWorkerState {
-                        running: true,
-                        restart_count: 0,
-                        last_error: None,
-                        thread_name: "service-health-checker".to_string(),
-                    },
-                )]),
-                analysis_queue_depth: 0,
-                analysis_queue_dropped_total: 0,
-                analysis_queue_coalesced_total: 0,
-                reconcile_runs_total: 0,
-                reconcile_repairs_total: 0,
-                respawn_failures: 0,
-                last_repair_error: None,
-                repair_last_status: Some("drift_detected".to_string()),
-                operator_auth_required: secret.is_some(),
-                agents: vec![crate::runtime_health::RuntimeHealthAgentSnapshot {
-                    agent_id: 7,
-                    aggregate_id: "AGENT-07".to_string(),
-                    name: "Test Agent".to_string(),
-                    runtime_present: true,
-                    projection_present: false,
-                    tracked_pid: Some(4242),
-                    tracked_pid_alive: false,
-                    tracked_pid_state: Some("Z".to_string()),
-                    cgroup_live_pid_count: 0,
-                    security_runtime_present: true,
-                    last_repair_status: Some("stale".to_string()),
-                }],
-            },
+                    current_shift: 1,
+                    expected_active_agents: 26,
+                    runtime_agents: 3,
+                    projection_agents: 2,
+                    security_runtime_entries: 1,
+                    sandbox_handles: 1,
+                    tracked_processes: 1,
+                    live_cgroup_dirs: 1,
+                    stale_runtime_entries: 2,
+                    orphan_cgroups: 1,
+                    zombie_tracked_pids: 0,
+                    worker_states: std::collections::BTreeMap::from([(
+                        "service_health".to_string(),
+                        crate::runtime_health::RuntimeWorkerState {
+                            running: true,
+                            restart_count: 0,
+                            last_error: None,
+                            thread_name: "service-health-checker".to_string(),
+                        },
+                    )]),
+                    analysis_queue_depth: 0,
+                    analysis_queue_dropped_total: 0,
+                    analysis_queue_coalesced_total: 0,
+                    reconcile_runs_total: 0,
+                    reconcile_repairs_total: 0,
+                    respawn_failures: 0,
+                    last_repair_error: None,
+                    repair_last_status: Some("drift_detected".to_string()),
+                    operator_auth_required: secret.is_some(),
+                    agents: vec![crate::runtime_health::RuntimeHealthAgentSnapshot {
+                        agent_id: 7,
+                        aggregate_id: "AGENT-07".to_string(),
+                        name: "Test Agent".to_string(),
+                        runtime_present: true,
+                        projection_present: false,
+                        tracked_pid: Some(4242),
+                        tracked_pid_alive: false,
+                        tracked_pid_state: Some("Z".to_string()),
+                        cgroup_live_pid_count: 0,
+                        security_runtime_present: true,
+                        last_repair_status: Some("stale".to_string()),
+                    }],
+                },
             )),
             security_runtime_state,
         };
@@ -2699,6 +2745,9 @@ mod tests {
                     })
                     .unwrap();
             }
+            RuntimeControlCommand::StallRestartTest { .. } => {
+                panic!("unerwartetes StallRestartTest-Kommando");
+            }
         });
         let response = handle_http_request(
             test_request(
@@ -2719,6 +2768,80 @@ mod tests {
         assert_eq!(payload.respawned_agents, 2);
         assert!(payload.projection_rebuild_requested);
         assert_eq!(payload.repair_last_status, "repaired");
+    }
+
+    #[test]
+    fn runtime_stall_restart_test_is_forwarded_and_returns_response() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let worker = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::StallRestartTest {
+                request,
+                response_tx,
+            } => {
+                assert_eq!(request.agent_id, 7);
+                assert_eq!(request.mode, "sigstop");
+                assert_eq!(request.stall_secs, 35);
+                response_tx
+                    .send(RuntimeStallRestartTestResponse {
+                        accepted: true,
+                        agent_id: 7,
+                        aggregate_id: "AGENT-07".to_string(),
+                        agent_name: "Test Agent".to_string(),
+                        mode: "sigstop".to_string(),
+                        stall_secs: 35,
+                        pid_before: Some(4242),
+                        pid_after: Some(5252),
+                        runtime_present_after: true,
+                        security_runtime_present_after: true,
+                        note: "fast_path_restart_executed_without_shift_wait".to_string(),
+                    })
+                    .unwrap();
+            }
+            other => panic!("unerwartetes Kommando: {other:?}"),
+        });
+
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_RUNTIME_STALL_RESTART_TEST_PATH,
+                serde_json::json!({
+                    "agent_id": 7,
+                    "mode": "sigstop",
+                    "stall_secs": 35
+                }),
+            ),
+            &state,
+        );
+
+        worker.join().unwrap();
+        assert_eq!(response.status, 200);
+        let payload: RuntimeStallRestartTestResponse =
+            serde_json::from_slice(&response.body).unwrap();
+        assert!(payload.accepted);
+        assert_eq!(payload.agent_id, 7);
+        assert_eq!(payload.pid_before, Some(4242));
+        assert_eq!(payload.pid_after, Some(5252));
+        assert_eq!(
+            payload.note,
+            "fast_path_restart_executed_without_shift_wait"
+        );
+    }
+
+    #[test]
+    fn runtime_stall_restart_test_rejects_invalid_mode() {
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_RUNTIME_STALL_RESTART_TEST_PATH,
+                serde_json::json!({
+                    "agent_id": 7,
+                    "mode": "bogus",
+                    "stall_secs": 35
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 400);
     }
 
     #[test]

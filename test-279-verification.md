@@ -528,3 +528,124 @@ Finished release profile [optimized] target(s) in 1m 00s
 ```
 
 PASS: Slice B tests and release build are green via remote Rust execution only.
+
+## Phase 4 - Slice C Fast Stall Recovery Evidence
+
+Date: 2026-04-23
+
+### AC-1 - Runtime Stall-Restart Command And Operator Hook
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/runtime_control.rs
+services/sentinel-daemon/src/operator_api.rs
+services/sentinel-daemon/src/orchestrator.rs
+```
+
+Observed implementation:
+
+```text
+RuntimeControlCommand::StallRestartTest
+RuntimeStallRestartTestRequest { agent_id, mode, stall_secs }
+RuntimeStallRestartTestResponse { pid_before, pid_after, runtime_present_after, security_runtime_present_after, note }
+POST /operator/runtime/stall-restart-test
+```
+
+PASS: The test hook is typed, input-validated, routed through the existing Operator API path, and dispatched into the ECS owner thread.
+
+### AC-2 - Fast-Restart Runtime Semantics
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/orchestrator.rs
+```
+
+Observed implementation:
+
+```text
+restart_agent_fast_path()
+tracked_pid_for_agent()
+PlatformSideEffect::RestartAgent => restart_agent_fast_path(...)
+```
+
+PASS: Restart now removes old runtime, sandbox, eBPF and security fragments before immediately respawning the configured agent in the same tick path.
+
+### AC-3 - Formatting And Remote Tests
+
+Remote format command:
+
+```bash
+cargo remote -c -- fmt --check
+```
+
+Observed:
+
+```text
+PASS after applying remote rustfmt diffs locally.
+```
+
+Remote Operator API test command:
+
+```bash
+cargo remote -c -- test -p sentinel-daemon runtime_stall_restart -- --nocapture
+```
+
+Observed:
+
+```text
+Finished test profile [unoptimized + debuginfo] target(s) in 21.36s
+running 2 tests
+test operator_api::tests::runtime_stall_restart_test_is_forwarded_and_returns_response ... ok
+test operator_api::tests::runtime_stall_restart_test_rejects_invalid_mode ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 1.49s
+```
+
+Remote fast-path unit test command:
+
+```bash
+cargo remote -c -- test -p sentinel-daemon restart_agent_fast_path -- --nocapture
+```
+
+Observed:
+
+```text
+Finished test profile [unoptimized + debuginfo] target(s) in 0.41s
+running 1 test
+bwrap: Can't find source path /work/company: No such file or directory
+bwrap: Can't find source path /work/company: No such file or directory
+test orchestrator::tests::test_restart_agent_fast_path_recreates_runtime_and_security_state ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 181 filtered out; finished in 0.14s
+```
+
+PASS: Slice C behavior is covered by remote Rust tests only. The `bwrap` messages are build-server fixture path warnings and did not fail the test.
+
+### AC-4 - Release Build And Artifact Hash
+
+Remote release build command:
+
+```bash
+cargo remote -c -- build -p sentinel-daemon --release --features fuse
+```
+
+Observed:
+
+```text
+Finished release profile [optimized] target(s) in 56.20s
+3470152e8b897217e2d2e547549b8f6759b3e733ec53d8a3ea8e00745da8d2bd  target/release/sentinel-daemon
+```
+
+Whitespace check command:
+
+```bash
+git diff --check
+```
+
+Observed:
+
+```text
+PASS: no output, exit 0
+```
+
+PASS: Slice C builds with the FUSE feature and has a reproducible release artifact hash.

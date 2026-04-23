@@ -136,9 +136,9 @@ pub fn build_runtime_health_snapshot(
         });
     }
     for snapshot in security_state.values() {
-        agent_catalog.entry(snapshot.agent_id).or_insert_with(|| {
-            (snapshot.aggregate_id.clone(), snapshot.agent_name.clone())
-        });
+        agent_catalog
+            .entry(snapshot.agent_id)
+            .or_insert_with(|| (snapshot.aggregate_id.clone(), snapshot.agent_name.clone()));
     }
 
     let mut stale_runtime_entries = 0usize;
@@ -165,7 +165,11 @@ pub fn build_runtime_health_snapshot(
         if tracked_pid_state.as_deref() == Some("Z") {
             zombie_tracked_pids += 1;
         }
-        let cgroup_live_pid_count = cgroup_snapshot.live_pid_counts.get(&name).copied().unwrap_or(0);
+        let cgroup_live_pid_count = cgroup_snapshot
+            .live_pid_counts
+            .get(&name)
+            .copied()
+            .unwrap_or(0);
         let projection_present = projection_store
             .as_ref()
             .and_then(|store| store.get_agent(agent_id).ok().flatten())
@@ -294,11 +298,13 @@ pub fn build_runtime_health_snapshot(
         snapshot.respawn_failures = previous.respawn_failures;
         snapshot.last_repair_error = previous.last_repair_error.clone();
         snapshot.repair_last_status = previous.repair_last_status.clone().or_else(|| {
-            Some(if snapshot.stale_runtime_entries == 0 && snapshot.orphan_cgroups == 0 {
-                "healthy".to_string()
-            } else {
-                "drift_detected".to_string()
-            })
+            Some(
+                if snapshot.stale_runtime_entries == 0 && snapshot.orphan_cgroups == 0 {
+                    "healthy".to_string()
+                } else {
+                    "drift_detected".to_string()
+                },
+            )
         });
     } else {
         snapshot.repair_last_status = Some(
