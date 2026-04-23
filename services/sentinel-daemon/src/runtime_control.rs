@@ -47,6 +47,10 @@ pub enum RuntimeControlCommand {
         request: RuntimeReconcileRequest,
         response_tx: mpsc::SyncSender<RuntimeReconcileResponse>,
     },
+    AnalysisFloodTest {
+        request: RuntimeAnalysisFloodTestRequest,
+        response_tx: mpsc::SyncSender<RuntimeAnalysisFloodTestResponse>,
+    },
     PanicTest {
         request: RuntimePanicTestRequest,
         response_tx: mpsc::SyncSender<RuntimePanicTestResponse>,
@@ -55,6 +59,21 @@ pub enum RuntimeControlCommand {
         request: RuntimeStallRestartTestRequest,
         response_tx: mpsc::SyncSender<RuntimeStallRestartTestResponse>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeAnalysisFloodTestRequest {
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeAnalysisFloodTestResponse {
+    pub accepted: bool,
+    pub requested: u32,
+    pub queue_depth: usize,
+    pub dropped_total: u64,
+    pub coalesced_total: u64,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

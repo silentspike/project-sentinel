@@ -319,6 +319,7 @@ pub fn build_runtime_health_snapshot(
     snapshot
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn publish_runtime_health_snapshot(
     runtime_health: &SharedRuntimeHealthState,
     all_agents: &[AgentConfig],
@@ -330,9 +331,10 @@ pub fn publish_runtime_health_snapshot(
     projection_db_path: &Path,
     operator_auth_required: bool,
     service_health_state: ServiceHealthWorkerSnapshot,
+    analysis_queue_stats: crate::platform_controlplane::AnalysisQueueStats,
 ) {
     let previous = runtime_health.read().ok().map(|snapshot| snapshot.clone());
-    let snapshot = build_runtime_health_snapshot(
+    let mut snapshot = build_runtime_health_snapshot(
         all_agents,
         current_shift,
         runtime_orch,
@@ -344,6 +346,9 @@ pub fn publish_runtime_health_snapshot(
         service_health_state,
         previous.as_ref(),
     );
+    snapshot.analysis_queue_depth = analysis_queue_stats.depth;
+    snapshot.analysis_queue_dropped_total = analysis_queue_stats.dropped_total;
+    snapshot.analysis_queue_coalesced_total = analysis_queue_stats.coalesced_total;
     if let Ok(mut state) = runtime_health.write() {
         *state = snapshot;
     }

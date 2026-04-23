@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan279.md`
-- Overall status: `TASK_6_DONE_TASK_7_PENDING`
-- Current task: `Task 7 - Slice E: bounded Analysis-/Recovery-Pfade`
+- Overall status: `TASK_7_DONE_TASK_8_PENDING`
+- Current task: `Task 8 - Slice F: Projection/API-Konvergenz`
 - Current branch: `feat/issue-279-daemon-hardening-v2`
 - Worktree: `/work/company/project-sentinel-279-review`
 - Base: `origin/main @ 83ab01c8835804fd951e619aa048324b7ff76ddf`
@@ -18,7 +18,7 @@
 - Der neue Worktree ist sauber von `origin/main` geschnitten; alte #264/#279-Stack-Worktrees bleiben unangetastet.
 - `gh issue view 279` ist erreichbar; GitHub ist aktuell die SSOT.
 - `#279` ist `OPEN` und steht aktuell auf `status:in-progress`.
-- Der GitHub-Issue-Body ist stale: er enthaelt noch `Blocked by #278`, alte Runtime-Zahlen und muss vor Codearbeit truth-repaired werden.
+- Der GitHub-Issue-Body war stale und wurde in Phase 0 truth-repaired; aktuelle SSOT ist `#279` mit `status:in-progress`.
 - `mainrag search "issue 279 daemon hardening runtime" --source claude-conversations --limit 5` ist aktuell nicht nutzbar, weil `localhost:3001` `Connection refused` liefert. Das ist kein Task-Blocker, aber ein dokumentierter Kontextverlust.
 - Phase 0 ist erledigt:
   - frische Pre-Reset-VM-Baseline ist in `test-279-verification.md` dokumentiert
@@ -54,6 +54,12 @@
   - `POST /operator/runtime/panic-test` triggert kontrolliert den Service-Health-Panic-Test ueber den ECS-Thread
   - Runtime-Health-Worker-State zeigt `running`, `restart_count`, `last_error` und `thread_name`
   - Remote-Tests, FUSE-Release-Build und Artifact-Hash sind dokumentiert
+- Slice E ist erledigt:
+  - Platform-Controlplane-Triggerqueue ist bounded und coalesced doppelte Trigger
+  - LLM-Analyzer-Channel ist bounded und zaehlt Dropped-Requests
+  - Runtime-Health publiziert Queue-Depth, Dropped- und Coalesced-Counter
+  - `POST /operator/runtime/analysis-flood-test` erzeugt deterministische Queue-Pressure fuer VM-/AC-Evidence
+  - Remote-Tests, FUSE-Release-Build, Clippy, Scope-Guard und Artifact-Hash sind dokumentiert
 
 ## Blocked items
 
@@ -69,7 +75,7 @@
 - `f5be73b` Task [3] Slice A - Runtime-Health-Read-Model
 - `ca44759` Task [4] Slice B - Runtime-Control / Reconcile
 - `f5e3dd9` Task [5] Slice C - Fast Stall Recovery
-- `TBD` Task [6] Slice D - Worker-Supervision
+- `b3b7786` Task [6] Slice D - Worker-Supervision
 - `TBD` Task [7] Slice E - bounded Analysis-/Recovery-Pfade
 - `TBD` Task [8] Slice F - Projection/API-Konvergenz
 - `TBD` Task [9] Slice G - Conditional FUSE/Landlock Runtime Restore
@@ -91,7 +97,7 @@
 | 4 | Slice B - Runtime-Control / Reconcile | DONE | `/operator/runtime/reconcile`, stale/orphan/zombie cleanup, bounded retries | inspect, command, system |
 | 5 | Slice C - Fast Stall Recovery | DONE | deterministischer Stall-Testhook, same-tick Fast-Respawn, Runtime/Security/Sandbox-Recreate | inspect, command, system |
 | 6 | Slice D - Worker-Supervision | DONE | catch_unwind + in-process worker respawn, panic-test Hook | inspect, command, system |
-| 7 | Slice E - bounded Analysis-/Recovery-Pfade | PENDING | bounded trigger queues, coalescing/drop counters, flood-test | inspect, command, system |
+| 7 | Slice E - bounded Analysis-/Recovery-Pfade | DONE | bounded trigger queues, coalescing/drop counters, flood-test | inspect, command, system |
 | 8 | Slice F - Projection/API-Konvergenz | PENDING | read-only Projection-Reads, Rebuild-Request, drift-heal | inspect, command, system |
 | 9 | Slice G - Conditional FUSE/Landlock Runtime Restore | PENDING | nur falls Main-Repro es braucht: FUSE/Landlock Runtime Restore, eigene Build-/Deploy-Gates | inspect, command, system |
 | 10 | Out-of-scope Follow-up - Haiku-Policy | PENDING | separates Gateway-/Policy-Issue oder Kommentar, nicht #279-Close-Bedingung | command, inspect |
@@ -412,3 +418,62 @@
   - artifact hash: `4400fcb9162fe242f3cbebda550f25175976abc8f444475ab201d0570e43c3d2  target/release/sentinel-daemon`
 - `git diff --check`
   - PASS: no whitespace/conflict errors.
+
+## Task 7 - Slice E: bounded Analysis-/Recovery-Pfade
+
+### Pre-task self-check
+
+- Was muss getan werden: Slice E aus Donor `389b5e6` path-limited portieren, unbounded Analyse-Vorstufen begrenzen, Coalescing-/Drop-Counter sichtbar machen und einen deterministischen Flood-Testhook bereitstellen.
+- Welche ACs muessen hier passen:
+  - AC-1: Platform-Controlplane-Triggerqueue ist bounded, coalesced Duplikate und droppt aelteste Eintraege bei Ueberlauf.
+  - AC-2: LLM-Analyzer-Channel ist bounded und zaehlt Dropped-Requests statt unbounded Memory-Wachstum zuzulassen.
+  - AC-3: Runtime-Health enthaelt `analysis_queue_depth`, `analysis_queue_dropped_total` und `analysis_queue_coalesced_total`.
+  - AC-4: `POST /operator/runtime/analysis-flood-test` erzeugt kontrollierte Queue-Pressure fuer Live-Verifikation.
+  - AC-5: Remote-Tests, FUSE-Release-Build, Clippy, Artefakt-Hash, Scope-Guard und `git diff --check` sind gruen.
+- Wie wird bewiesen: Code-Diff, `cargo remote -c -- fmt/test/clippy/build`, `sha256sum`, `git diff --check`, Scope-Guard gegen Haiku-/Model-Pinning.
+- Erwartete Dateien: `config/daemon.toml`, `services/sentinel-daemon/src/config.rs`, `operator_api.rs`, `orchestrator.rs`, `platform_controlplane/*`, `runtime_control.rs`, `runtime_health.rs`, `CHANGELOG.md`.
+- Risiken:
+  - Nur den #279-Queue-Scope portieren, keine Gateway-/Model-Policy.
+  - Analyzer- und Controlplane-Stats muessen zusammengefuehrt werden, damit Runtime-Health nicht nur eine Queue sieht.
+  - Flood-Test muss ueber Operator-API/Runtime-Control laufen und darf kein ungeschuetzter Produktionspfad werden.
+
+### Outcome
+
+- Path-limited donor Slice E was applied from stack donor `389b5e6`.
+- Added `[daemon.platform_controlplane]` settings:
+  - `llm_trigger_queue_capacity = 16`
+  - `llm_analysis_channel_capacity = 16`
+- `PlatformControlplane` now uses a bounded `VecDeque` trigger queue.
+- Duplicate queued triggers are coalesced and counted via `analysis_queue_coalesced_total`.
+- Overflow drops the oldest trigger and increments `analysis_queue_dropped_total`.
+- `PlatformLlmAnalyzerHandle` now uses a bounded channel sized from config and tracks depth/drop counters.
+- Runtime-Health now publishes merged controlplane/analyzer queue stats.
+- Added `POST /operator/runtime/analysis-flood-test`:
+  - rejects `count=0`
+  - dispatches through `RuntimeControlCommand::AnalysisFloodTest`
+  - injects bounded/coalesced queue pressure in the ECS owner thread
+  - returns `requested`, `queue_depth`, `dropped_total` and `coalesced_total`
+- No Haiku/model-policy changes were introduced; runtime still leaves model selection to the Gateway default.
+
+### Evidence
+
+- `cargo remote -c -- fmt --check`
+  - PASS: no remaining rustfmt diff.
+- `cargo remote -c -- test -p sentinel-daemon test_parse_config -- --nocapture`
+  - PASS: `2 passed; 0 failed; 188 filtered out`
+- `cargo remote -c -- test -p sentinel-daemon trigger_queue -- --nocapture`
+  - PASS: `2 passed; 0 failed; 188 filtered out`
+- `cargo remote -c -- test -p sentinel-daemon enqueue_drops_when_bounded_queue_is_full -- --nocapture`
+  - PASS: `1 passed; 0 failed; 189 filtered out`
+- `cargo remote -c -- test -p sentinel-daemon runtime_analysis_flood_test -- --nocapture`
+  - PASS: `2 passed; 0 failed; 188 filtered out; finished in 0.06s`
+- `cargo remote -c -- clippy -p sentinel-daemon --all-targets --features fuse -- -D warnings`
+  - PASS: `Finished dev profile [unoptimized + debuginfo] target(s) in 2m 59s`
+- `cargo remote -c -- build -p sentinel-daemon --release --features fuse`
+  - PASS: `Finished release profile [optimized] target(s) in 56.44s`
+  - artifact hash: `39bf79442190541ec03f11a66c4e8be437f6a8bd1f2e2366611a0d9ad0366cb2  target/release/sentinel-daemon`
+- `git diff --check`
+  - PASS: no whitespace/conflict errors.
+- Scope guard:
+  - `rg -n "AGENT_MODEL_HAIKU|model: AGENT|model: String::new\\(\\).*Gateway" services/sentinel-daemon/src cmd crates || true`
+  - PASS: only `services/sentinel-daemon/src/llm_bridge.rs:612: model: String::new(), // Gateway waehlt default`

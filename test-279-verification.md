@@ -775,3 +775,201 @@ PASS: no output, exit 0
 ```
 
 PASS: Slice D builds with the FUSE feature and has a reproducible release artifact hash.
+
+## Phase 6 - Slice E Bounded Analysis-/Recovery-Pfade Evidence
+
+Date: 2026-04-23
+
+### AC-1 - Bounded Platform-Controlplane Trigger Queue
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/platform_controlplane/mod.rs
+config/daemon.toml
+services/sentinel-daemon/src/config.rs
+```
+
+Observed implementation:
+
+```text
+llm_trigger_queue_capacity = 16
+queued_analysis_triggers: VecDeque<QueuedAnalysisTrigger>
+analysis_queue_dropped_total
+analysis_queue_coalesced_total
+enqueue_analysis_trigger()
+analysis_queue_stats()
+```
+
+Remote test command:
+
+```bash
+cargo remote -c -- test -p sentinel-daemon trigger_queue -- --nocapture
+```
+
+Observed:
+
+```text
+running 2 tests
+test platform_controlplane::tests::test_manual_trigger_queue_coalesces_duplicates ... ok
+test platform_controlplane::tests::test_test_trigger_queue_drops_when_capacity_is_exceeded ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 188 filtered out
+```
+
+PASS: The pre-worker trigger queue is bounded, coalesces duplicate triggers and drops oldest entries when capacity is exceeded.
+
+### AC-2 - Bounded LLM Analyzer Channel
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/platform_controlplane/llm_analyzer.rs
+```
+
+Observed implementation:
+
+```text
+llm_analysis_channel_capacity = 16
+PlatformLlmAnalyzerHandle::queue_stats()
+try_send()
+TrySendError::Full
+dropped_total
+depth
+```
+
+Remote test command:
+
+```bash
+cargo remote -c -- test -p sentinel-daemon enqueue_drops_when_bounded_queue_is_full -- --nocapture
+```
+
+Observed:
+
+```text
+running 1 test
+test platform_controlplane::llm_analyzer::tests::enqueue_drops_when_bounded_queue_is_full ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 189 filtered out
+```
+
+PASS: Analyzer enqueue uses bounded `try_send()` semantics and records drops when the bounded channel is full.
+
+### AC-3 - Runtime-Health Queue Stats
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/runtime_health.rs
+services/sentinel-daemon/src/orchestrator.rs
+```
+
+Observed implementation:
+
+```text
+publish_runtime_health_snapshot(..., analysis_queue_stats)
+analysis_queue_depth
+analysis_queue_dropped_total
+analysis_queue_coalesced_total
+```
+
+PASS: Runtime-health snapshots receive merged Platform-Controlplane and LLM-Analyzer queue stats, so VM verification can read current depth/drop/coalescing state from the runtime truth surface after deploy.
+
+### AC-4 - Deterministic Analysis Flood Test Hook
+
+Code scope:
+
+```text
+services/sentinel-daemon/src/runtime_control.rs
+services/sentinel-daemon/src/operator_api.rs
+services/sentinel-daemon/src/orchestrator.rs
+```
+
+Observed implementation:
+
+```text
+RuntimeControlCommand::AnalysisFloodTest
+RuntimeAnalysisFloodTestRequest { count }
+RuntimeAnalysisFloodTestResponse { accepted, requested, queue_depth, dropped_total, coalesced_total, note }
+POST /operator/runtime/analysis-flood-test
+```
+
+Remote Operator API test command:
+
+```bash
+cargo remote -c -- test -p sentinel-daemon runtime_analysis_flood_test -- --nocapture
+```
+
+Observed:
+
+```text
+running 2 tests
+test operator_api::tests::runtime_analysis_flood_test_rejects_zero_count ... ok
+test operator_api::tests::runtime_analysis_flood_test_is_forwarded_and_returns_response ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 188 filtered out; finished in 0.06s
+```
+
+PASS: The flood hook is typed, validates `count > 0`, dispatches through Runtime-Control into the ECS owner thread and returns queue-pressure counters.
+
+### AC-5 - Format, Clippy, Build, Artifact And Scope Guard
+
+Remote config test command:
+
+```bash
+cargo remote -c -- test -p sentinel-daemon test_parse_config -- --nocapture
+```
+
+Observed:
+
+```text
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 188 filtered out
+```
+
+Remote clippy command:
+
+```bash
+cargo remote -c -- clippy -p sentinel-daemon --all-targets --features fuse -- -D warnings
+```
+
+Observed:
+
+```text
+Finished dev profile [unoptimized + debuginfo] target(s) in 2m 59s
+```
+
+Remote release build command:
+
+```bash
+cargo remote -c -- build -p sentinel-daemon --release --features fuse
+```
+
+Observed:
+
+```text
+Finished release profile [optimized] target(s) in 56.44s
+39bf79442190541ec03f11a66c4e8be437f6a8bd1f2e2366611a0d9ad0366cb2  target/release/sentinel-daemon
+```
+
+Whitespace check command:
+
+```bash
+git diff --check
+```
+
+Observed:
+
+```text
+PASS: no output, exit 0
+```
+
+Scope guard command:
+
+```bash
+rg -n "AGENT_MODEL_HAIKU|model: AGENT|model: String::new\\(\\).*Gateway" services/sentinel-daemon/src cmd crates || true
+```
+
+Observed:
+
+```text
+services/sentinel-daemon/src/llm_bridge.rs:612:            model: String::new(), // Gateway waehlt default
+```
+
+PASS: Slice E builds, lints and keeps model selection out of the Daemon. The only runtime model-related match is the intended Gateway-default path.
