@@ -82,6 +82,7 @@ fn world_snapshot_codec_roundtrip() {
             sim_delta_seconds: 1.0,
         },
         projection_offsets: vec![("room_live_view".to_string(), 49000)],
+        fs_metadata: None,
     };
 
     // Serialize
@@ -158,6 +159,7 @@ fn empty_world_snapshot_roundtrip() {
             sim_delta_seconds: 1.0,
         },
         projection_offsets: vec![],
+        fs_metadata: None,
     };
 
     let bytes = encode_world_snapshot(&snapshot).unwrap();
@@ -210,6 +212,7 @@ fn world_snapshot_codec_rejects_trailing_bytes() {
             sim_delta_seconds: 1.0,
         },
         projection_offsets: vec![],
+        fs_metadata: None,
     };
 
     let mut bytes = encode_world_snapshot(&snapshot).unwrap();

@@ -479,6 +479,15 @@ pub struct RedbDump {
     pub api_patterns: Vec<(String, Vec<u8>)>,
 }
 
+/// Dump des sentinel-fs Runtime-Metadatenpfads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FsMetadataDump {
+    pub inodes: Vec<(String, u64, Vec<u8>)>,
+    pub dirents: Vec<(String, u64, String, u64)>,
+    pub refcounts: Vec<([u8; 32], u32)>,
+    pub trash_queue: Vec<([u8; 32], u64)>,
+}
+
 /// ECS World-State Snapshot (alle Components + Resources).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EcsSnapshot {
@@ -516,11 +525,13 @@ pub struct WorldSnapshot {
     pub redb: RedbDump,
     pub ecs: EcsSnapshot,
     pub projection_offsets: Vec<(String, i64)>,
+    #[serde(default)]
+    pub fs_metadata: Option<FsMetadataDump>,
 }
 
 impl WorldSnapshot {
     /// Aktuelle Schema-Version fuer bincode Kompatibilitaet.
-    pub const SCHEMA_VERSION: u32 = 1;
+    pub const SCHEMA_VERSION: u32 = 2;
 }
 
 /// Operator-Trigger fuer Point-in-Time Restore.
