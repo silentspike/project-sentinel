@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan314.md`
-- Overall status: `TASK_7_DONE_TASK_8_PENDING`
-- Current task: `Task 8 - Dokumentation, PR- und Close-Sequenz`
+- Overall status: `TASK_8_DONE_TASK_9_PENDING`
+- Current task: `Task 9 - Plan-Verifikation`
 - Current branch: `feat/issue-314-agent-model-policy`
 - Worktree: `/work/company/project-sentinel`
 - Base: `origin/main @ 0f1c46c19bfa61d0616b3468834d29b557b3e254`
@@ -79,6 +79,10 @@
   - AC-5 PASS: `traffic-stats`, `traffic-responses` und Journal zeigen redigierte Felder; Secret-Grep fand keine Token/API-Key-Werte.
   - AC-6 PASS: Go-Tests plus VM-Smoke belegen interne Runtime-Default-Policy getrennt vom externen Compatibility-Pfad.
   - Panic/Drift-Grep fuer Gateway/Daemon seit Live-Verifikation ist leer.
+- Task 8 ist erledigt:
+  - `CHANGELOG.md` enthaelt einen #314-Unreleased-Eintrag.
+  - PR-Pflichtsektionen sind fuer `gh pr create` vorbereitet: Summary, Changes, Linked Issues, Test Plan, Benchmarks, Evidence, Checklist.
+  - Issue-Close-Sequenz bleibt korrekt nachgelagert: erst PR/CI/Merge, dann `status:verified`, dann Close.
 
 ## Blocked items
 
@@ -108,7 +112,7 @@
 | 5 | Phase 5 - Benchmarks | DONE | Classify/Resolve/ResponseLog Benchmarks mit Zielwerten und System-Monitoring | command, system |
 | 6 | Phase 6 - Gateway Deploy auf 10.0.0.240 | DONE | ExecStart pruefen, Linux-Binary bauen, deployen, Gateway restart, Smoke | command, system |
 | 7 | Phase 8 - AC-Matrix und Live-Verifikation | DONE | AC-1 bis AC-6 einzeln auf VM belegen, Config restore, Panic/Error/Secret-Grep | command, system |
-| 8 | Dokumentation, PR- und Close-Sequenz | PENDING | CHANGELOG, Evidence-Doku, PR mit Pflichtsektionen, Labels, Issue-Close erst nach verified | command, inspect |
+| 8 | Dokumentation, PR- und Close-Sequenz | DONE | CHANGELOG, Evidence-Doku, PR mit Pflichtsektionen, Labels, Issue-Close erst nach verified | command, inspect |
 | 9 | Plan-Verifikation | PENDING | Plan komplett gegen Ergebnis pruefen, Abweichungen fixen oder blocken | inspect, command, system |
 
 ## Task 6 - Phase 6: Gateway Deploy auf 10.0.0.240
@@ -208,6 +212,43 @@
 - AC-4 PASS: `/v1/messages` Dummy-Key-Test zeigt im Journal `provider=anthropic-direct`, `request_class=external_compat`, `effective_model=claude-opus-4-6`, `policy_source=request_override`.
 - AC-5 PASS: Observability- und Secret-Grep erfolgreich.
 - AC-6 PASS: Go-Tests plus VM-Smoke decken beide Pfade ab.
+
+## Task 8 - Dokumentation, PR- und Close-Sequenz
+
+### Pre-task self-check
+
+- Was muss getan werden:
+  - `CHANGELOG.md` aktualisieren
+  - PR-Pflichtsektionen vorbereiten
+  - keine Issue-Schliessung vor PR/Merge/CI
+  - Evidence-Datei aktuell halten
+- Welche ACs muessen hier passen:
+  - AC-1: CHANGELOG enthaelt #314.
+  - AC-2: PR-Body kann alle 7 Pflichtsektionen fuellen.
+  - AC-3: Close-Sequenz bleibt `status:verified` vor `gh issue close`.
+- Wie wird bewiesen:
+  - `rg "#314|Gateway Model Policy" CHANGELOG.md`
+  - PR-Erstellung nach Task-Commit mit Pflichtsektionen
+  - Issue-Label/Close erst nach Merge
+- Erwartete Dateien:
+  - `CHANGELOG.md`
+  - `PROGRESS.md`
+  - `test-314-verification.md`
+- Risiken:
+  - PR/Close vor finaler Plan-Verifikation waere gegen `$start`; deshalb nur vorbereiten, dann Task 9 final pruefen.
+
+### Outcome
+
+- `CHANGELOG.md` hat einen Unreleased-Eintrag fuer #314.
+- PR-Body-Sektionierung ist vorbereitet.
+- Close-Reihenfolge ist dokumentiert und bleibt bis nach PR/Merge gesperrt.
+
+### Evidence
+
+- `test-314-verification.md` enthaelt Task-8 Command/Output-Evidence.
+- AC-1 PASS: CHANGELOG enthaelt #314-Eintrag.
+- AC-2 PASS: PR-Pflichtsektionen werden beim `gh pr create` verwendet.
+- AC-3 PASS: `status:verified`/Close bleibt nach finaler Verifikation und Merge.
 
 ## Task 5 - Phase 5: Benchmarks
 

@@ -965,3 +965,53 @@ ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control	(ca
 ```
 
 PASS: Unit-/Regressionstests, Gateway-Build, VM-Smoke und Panic/Drift-Grep sind gruen.
+
+## Task 8 - Dokumentation, PR- und Close-Sequenz
+
+### AC-1 - CHANGELOG enthaelt #314
+
+Command:
+
+```bash
+rg -n "#314|Gateway Model Policy|agent_runtime_model_policy|Response-Log-Buffer" CHANGELOG.md
+```
+
+Output:
+
+```text
+12:- **Gateway Model Policy: Agent-Runtime defaultet ueber Inference-Layer auf Haiku** (#314)
+14:  - `agent_runtime_model_policy` defaultet im Gateway-Control-State auf `haiku`, ohne den Daemon oder `/v1/messages` hart zu pinnen
+18:  - Response-Log-Buffer nutzt jetzt einen bounded circular buffer statt steady-state Slice-Kopie
+```
+
+PASS: `CHANGELOG.md` dokumentiert #314 unter `[Unreleased]`.
+
+### AC-2 - PR-Pflichtsektionen vorbereitet
+
+Pflichtsektionen fuer `gh pr create`:
+
+```text
+## Summary
+## Changes
+## Linked Issues
+## Test Plan
+## Benchmarks
+## Evidence (AC Mapping)
+## Checklist
+```
+
+PASS: PR-Body wird mit allen Gate-Sektionen erstellt.
+
+### AC-3 - Close-Sequenz bleibt korrekt
+
+Geplante Reihenfolge:
+
+```bash
+git push -u origin feat/issue-314-agent-model-policy
+gh pr create --repo silentspike/project-sentinel ...
+# CI gruen, PR merge
+gh issue edit 314 --repo silentspike/project-sentinel --add-label "status:verified" --remove-label "status:in-progress"
+gh issue close 314 --repo silentspike/project-sentinel
+```
+
+PASS: `status:verified` wird erst nach finaler Verifikation/Merge gesetzt und vor dem Issue-Close.
