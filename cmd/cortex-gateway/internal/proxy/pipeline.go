@@ -204,16 +204,16 @@ func (ph *PipelineHandler) BreakerStates() map[string]string {
 
 // PipelineResponse ist die erweiterte Antwort mit extrahierten Aktionen.
 type PipelineResponse struct {
-	Content      string                       `json:"content"`
-	ContentBlocks []json.RawMessage           `json:"-"`
-	Model        string                       `json:"model"`
-	Provider     string                       `json:"provider"`
-	TokensUsed   int                          `json:"tokens_used"`
-	InputTokens  int                          `json:"input_tokens,omitempty"`
-	OutputTokens int                          `json:"output_tokens,omitempty"`
-	FinishReason string                       `json:"finish_reason"`
-	Actions      []extraction.ExtractedAction `json:"actions,omitempty"`
-	RequestID    string                       `json:"request_id"`
+	Content       string                       `json:"content"`
+	ContentBlocks []json.RawMessage            `json:"-"`
+	Model         string                       `json:"model"`
+	Provider      string                       `json:"provider"`
+	TokensUsed    int                          `json:"tokens_used"`
+	InputTokens   int                          `json:"input_tokens,omitempty"`
+	OutputTokens  int                          `json:"output_tokens,omitempty"`
+	FinishReason  string                       `json:"finish_reason"`
+	Actions       []extraction.ExtractedAction `json:"actions,omitempty"`
+	RequestID     string                       `json:"request_id"`
 }
 
 // NewPipelineHandler erstellt den Pipeline-Handler.
@@ -343,6 +343,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 
 	// --- Step 1: Config-Snapshot ---
 	snap := ph.config.Get()
+	req.RequestClass = ClassifyRequest(r.URL.Path, &req)
 
 	// --- Step 2: Provider bestimmen (Runtime-switchable via Control Plane) ---
 	resolvedProviderName := req.PreferredProvider
@@ -558,6 +559,22 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 			return
 		}
 	}
+
+	policyResolution, err := ResolveModelPolicy(providerName, req.RequestClass, req.Model, snap.AgentRuntimeModelPolicy)
+	if err != nil {
+		ph.logger.Error("model policy rejected",
+			"request_id", requestID,
+			"request_class", req.RequestClass,
+			"provider", providerName,
+			"policy", snap.AgentRuntimeModelPolicy,
+			"error", err,
+		)
+		ph.writeRequestError(w, &req, "model policy rejected", http.StatusUnprocessableEntity)
+		return
+	}
+	req.Model = policyResolution.Model
+	req.EffectiveModel = policyResolution.Model
+	req.PolicySource = policyResolution.Source
 
 	if isAnthropicStreamingRequest(&req) {
 		ph.streamAnthropicResponse(r.Context(), w, &req, provider, providerName, breaker, requestID, start)
@@ -1411,6 +1428,9 @@ func cloneRegenRequest(base *LLMRequest, messages []Message, temperature float64
 		Format:             base.Format,
 		PreferredProvider:  base.PreferredProvider,
 		PassthroughHeaders: clonePassthroughHeaders(base.PassthroughHeaders),
+		RequestClass:       base.RequestClass,
+		EffectiveModel:     base.EffectiveModel,
+		PolicySource:       base.PolicySource,
 		ProviderTimeout:    base.ProviderTimeout,
 	}
 }
