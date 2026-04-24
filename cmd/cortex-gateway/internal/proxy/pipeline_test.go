@@ -30,16 +30,16 @@ import (
 // pipelineMockProvider implementiert Provider fuer Pipeline-Tests.
 // Kann Requests aufzeichnen und konfigurierbare Responses/Errors liefern.
 type pipelineMockProvider struct {
-	mu        sync.Mutex
-	name      string
-	resp      *LLMResponse
-	err       error
-	statusErr error
-	calls     int
+	mu          sync.Mutex
+	name        string
+	resp        *LLMResponse
+	err         error
+	statusErr   error
+	calls       int
 	streamCalls int
-	lastReq   *LLMRequest
-	sendFunc  func(ctx context.Context, req *LLMRequest) (*LLMResponse, error)
-	streamFunc func(ctx context.Context, req *LLMRequest, w http.ResponseWriter) error
+	lastReq     *LLMRequest
+	sendFunc    func(ctx context.Context, req *LLMRequest) (*LLMResponse, error)
+	streamFunc  func(ctx context.Context, req *LLMRequest, w http.ResponseWriter) error
 }
 
 func (p *pipelineMockProvider) Name() string { return p.name }
@@ -194,6 +194,46 @@ func TestPipelineStructuredSystemBlocksForAnthropicDirect(t *testing.T) {
 	}
 }
 
+func TestPipelineAgentRuntimeAppliesHaikuPolicy(t *testing.T) {
+	reg := NewRegistry()
+	mock := &pipelineMockProvider{
+		name: "mock",
+		resp: &LLMResponse{
+			Content:      "{\"action_type\":\"THINK\",\"target\":\"\",\"content\":\"ok\"}",
+			Model:        "haiku",
+			TokensUsed:   5,
+			FinishReason: "end_turn",
+		},
+	}
+	reg.Register("mock", mock)
+
+	cfg := control.NewConfig("mock")
+	ph := newTestPipelineHandler(reg, cfg)
+
+	body := `{"messages":[{"role":"user","content":"Was machst du?"}],"metadata":{"agent_id":"12","agent_name":"Thomas Mueller","agent_role":"CEO"}}`
+	req := httptest.NewRequest(http.MethodPost, "/internal/llm", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	ph.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if mock.lastReq == nil {
+		t.Fatal("expected provider request")
+	}
+	if mock.lastReq.RequestClass != RequestClassAgentRuntime {
+		t.Fatalf("request class = %q, want %q", mock.lastReq.RequestClass, RequestClassAgentRuntime)
+	}
+	if mock.lastReq.Model != "haiku" || mock.lastReq.EffectiveModel != "haiku" {
+		t.Fatalf("model = %q effective = %q, want haiku", mock.lastReq.Model, mock.lastReq.EffectiveModel)
+	}
+	if mock.lastReq.PolicySource != PolicySourceAgentRuntime {
+		t.Fatalf("policy source = %q, want %q", mock.lastReq.PolicySource, PolicySourceAgentRuntime)
+	}
+}
+
 func TestPipelineAnthropicMessagesPassthrough(t *testing.T) {
 	reg := NewRegistry()
 	internal := &pipelineMockProvider{
@@ -260,6 +300,12 @@ func assertAnthropicPassthroughRequest(t *testing.T, internal, direct *pipelineM
 	}
 	if direct.lastReq.PreferredProvider != "anthropic-direct" {
 		t.Fatalf("preferred provider = %q", direct.lastReq.PreferredProvider)
+	}
+	if direct.lastReq.RequestClass != RequestClassExternalCompat {
+		t.Fatalf("request class = %q, want %q", direct.lastReq.RequestClass, RequestClassExternalCompat)
+	}
+	if direct.lastReq.EffectiveModel != "claude-opus-4-6" || direct.lastReq.PolicySource != PolicySourceRequestOverride {
+		t.Fatalf("effective model = %q policy source = %q, want request override", direct.lastReq.EffectiveModel, direct.lastReq.PolicySource)
 	}
 	if got := direct.lastReq.PassthroughHeaders["authorization"]; got != "Bearer passthrough-token" {
 		t.Fatalf("authorization passthrough = %q", got)

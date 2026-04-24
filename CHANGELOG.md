@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Gateway Model Policy: Agent-Runtime nutzt ueber Inference-Layer standardmaessig Haiku** (#314)
+  - neue Gateway-Request-Klassen fuer `external_compat`, `agent_runtime`, `platform_controlplane`, `service_internal` und `internal_other`
+  - `agent_runtime_model_policy` setzt im Gateway-Control-State standardmaessig `haiku`, ohne den Daemon oder `/v1/messages` hart zu pinnen
+  - Agent-Runtime-Requests mit positiver numerischer `agent_id` bekommen vor dem Provider-Forward effektiv `model=haiku`; explizite Request-Modelle gewinnen weiterhin
+  - `/v1/messages` bleibt externer Anthropic-/MITM-Compatibility-Pfad mit `anthropic-direct`
+  - Traffic-Stats, Response-Log und Journal zeigen redigiert `request_class`, `provider`, `policy_source` und `effective_model`
+  - Response-Log-Buffer nutzt jetzt einen bounded circular buffer statt steady-state Slice-Kopie
+
 - **Daemon Hardening: Runtime-Truth, Reconcile und deterministischer Stall-Restart** (#279)
   - neues Runtime-Read-Model `RuntimeHealthSnapshot` plus `GET /operator/runtime-health` fuer Drift-, Worker- und Agent-Truth
   - neuer Runtime-Control-Pfad `POST /operator/runtime/reconcile` fuer stale cleanup, orphan-cgroup cleanup, kontrollierten Respawn und Projection-Rebuild-Request

@@ -28,6 +28,9 @@ type LLMRequest struct {
 	Format             RequestFormat     `json:"-"`
 	PreferredProvider  string            `json:"-"`
 	PassthroughHeaders map[string]string `json:"-"`
+	RequestClass       RequestClass      `json:"-"`
+	EffectiveModel     string            `json:"-"`
+	PolicySource       string            `json:"-"`
 	// ProviderTimeout applies only to the real provider execution, not queue wait.
 	ProviderTimeout time.Duration `json:"-"`
 }

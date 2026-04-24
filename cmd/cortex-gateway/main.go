@@ -287,12 +287,14 @@ func main() {
 		costStats := guardrails.RuntimeCostSnapshot()
 		pendingIntercepts := requestInterceptor.Pending()
 		pendingResponseIntercepts := responseInterceptor.Pending()
+		trafficConfig := controlConfig.Get()
+		lastAgentRuntime, hasLastAgentRuntime := responseLogs.LastByClass(proxy.RequestClassAgentRuntime)
 		stats := map[string]interface{}{
-			"synthesis_enabled":           controlConfig.Get().SynthesisEnabled,
-			"sequencing_enabled":          controlConfig.Get().SequencingEnabled,
-			"tick_sync_enabled":           controlConfig.Get().TickSyncEnabled,
+			"synthesis_enabled":           trafficConfig.SynthesisEnabled,
+			"sequencing_enabled":          trafficConfig.SequencingEnabled,
+			"tick_sync_enabled":           trafficConfig.TickSyncEnabled,
 			"tick_sync_runtime_enabled":   tickSync.Enabled(),
-			"apicp_enabled":               controlConfig.Get().APICPEnabled,
+			"apicp_enabled":               trafficConfig.APICPEnabled,
 			"current_cost_usd":            costStats.TotalCostUSD,
 			"estimated_savings_usd":       costStats.TotalSavingsUSD,
 			"projected_daily_cost_usd":    costStats.ProjectedDailyCostUSD,
@@ -302,19 +304,25 @@ func main() {
 			"synthesis_count":             costStats.SynthesisCount,
 			"synthesis_rate":              costStats.SynthesisRate,
 			"cost_by_provider":            costStats.ByProvider,
-			"primary_provider":            controlConfig.Get().PrimaryProvider,
-			"internal_primary_provider":   controlConfig.Get().PrimaryProvider,
+			"primary_provider":            trafficConfig.PrimaryProvider,
+			"internal_primary_provider":   trafficConfig.PrimaryProvider,
 			"external_mitm_provider":      "anthropic-direct",
-			"intercept_mode":              controlConfig.Get().InterceptMode,
-			"max_forward_concurrency":     controlConfig.Get().MaxForwardConcurrency,
-			"tick_sync_timeout_ms":        controlConfig.Get().TickSyncTimeoutMs,
-			"p3_timeout_ms":               controlConfig.Get().P3TimeoutMs,
+			"agent_runtime_model_policy":  trafficConfig.AgentRuntimeModelPolicy,
+			"intercept_mode":              trafficConfig.InterceptMode,
+			"max_forward_concurrency":     trafficConfig.MaxForwardConcurrency,
+			"tick_sync_timeout_ms":        trafficConfig.TickSyncTimeoutMs,
+			"p3_timeout_ms":               trafficConfig.P3TimeoutMs,
 			"queue_depth":                 forwardQueue.Stats().Depth,
 			"active_forward_calls":        forwardQueue.Stats().Active,
 			"pending_intercepts":          len(pendingIntercepts),
 			"pending_response_intercepts": len(pendingResponseIntercepts),
 			"tick_sync_pending":           tickSync.Stats().Pending,
 			"response_log_entries":        responseLogs.Len(),
+		}
+		if hasLastAgentRuntime {
+			stats["last_agent_runtime_effective_model"] = lastAgentRuntime.Model
+			stats["last_agent_runtime_policy_source"] = lastAgentRuntime.PolicySource
+			stats["last_agent_runtime_provider"] = lastAgentRuntime.Provider
 		}
 		if apicpObserver != nil {
 			apicpStats := apicpObserver.Stats()

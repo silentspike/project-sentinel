@@ -2,838 +2,531 @@
 
 ## Status
 
-- Plan source: `/work/company/codex-plan279.md`
-- Overall status: `TASK_14_DONE_TASK_15_PENDING`
-- Current task: `Task 15 - PR- und Close-Sequenz`
-- Current branch: `feat/issue-279-daemon-hardening-v2`
-- Worktree: `/work/company/project-sentinel-279-review`
-- Base: `origin/main @ 83ab01c8835804fd951e619aa048324b7ff76ddf`
+- Plan source: `/work/company/codex-plan314.md`
+- Overall status: `TASK_9_DONE_READY_FOR_PR`
+- Current task: `Post-task GitHub PR/Merge/Close sequence`
+- Current branch: `feat/issue-314-agent-model-policy`
+- Worktree: `/work/company/project-sentinel`
+- Base: `origin/main @ 0f1c46c19bfa61d0616b3468834d29b557b3e254`
 - Hook status: `PreToolUse TaskUpdate + PostToolUse start-enforcer projektlokal registriert`
-- Last refresh: `2026-04-23 Europe/Vienna`
+- Last refresh: `2026-04-24 Europe/Vienna`
 
 ## Current findings
 
-- `$start` wurde fuer diese Ausfuehrung aktiviert.
-- Projektregeln, globale Regeln, Workspace-Handover und der komplette `#279`-Plan wurden in dieser Session frisch gelesen.
-- Der neue Worktree ist sauber von `origin/main` geschnitten; alte #264/#279-Stack-Worktrees bleiben unangetastet.
-- `gh issue view 279` ist erreichbar; GitHub ist aktuell die SSOT.
-- `#279` ist `OPEN` und steht aktuell auf `status:in-progress`.
-- Der GitHub-Issue-Body war stale und wurde in Phase 0 truth-repaired; aktuelle SSOT ist `#279` mit `status:in-progress`.
-- `mainrag search "issue 279 daemon hardening runtime" --source claude-conversations --limit 5` ist aktuell nicht nutzbar, weil `localhost:3001` `Connection refused` liefert. Das ist kein Task-Blocker, aber ein dokumentierter Kontextverlust.
-- Phase 0 ist erledigt:
-  - frische Pre-Reset-VM-Baseline ist in `test-279-verification.md` dokumentiert
-  - GitHub-Issue `#279` wurde auf frische 2026-04-23-Wahrheit repariert
-  - canonical `main` wurde remote gebaut und auf `10.0.0.240` deployed
-  - Post-Reset-Baseline zeigt erwartetes `runtime_health_http=404`
-  - Drift bleibt auf `main` reproduzierbar: API/Projection `57`, live cgroups `29`
-- Review-Entscheidungen aus dem Plan:
-  - Haiku-/Model-Policy ist out-of-scope fuer `#279`.
-  - Der Branch darf keine #264-Stack-Commits enthalten.
-  - Frische VM-Zahlen muessen dynamisch gemessen werden, nicht aus alten Reviews kopiert werden.
-  - Canonical-main-Reset muss ohne `/operator/runtime-health` messbar sein, weil `main` diesen Endpoint noch nicht hat.
-  - Operator-Auth wird spaeter ueber einen gemeinsamen `/tmp/opcurl` Helper operationalisiert.
-- FUSE/Landlock bekommt nur bei aktivem Slice G eigene Build-/Deploy-Gates.
-- Slice A ist erledigt:
-  - `GET /operator/runtime-health` ist als read-only Operator-Pfad verdrahtet
-  - Snapshot deckt Runtime, Projection, Cgroups, Security-Runtime und Worker-State ab
-  - Operator-Auth-Schutz fuer den Endpoint ist im Unit-Test belegt
-  - initialer Warnungsfund `unused import RuntimeHealthSnapshot` wurde vor Commit bereinigt
-- Slice B ist erledigt:
-  - `POST /operator/runtime/reconcile` ist als Runtime-Control-Pfad verdrahtet
-  - Reconcile entfernt unerwartete Runtime-Fragmente, orphan Cgroups und stale Security-Snapshots
-  - Expected active Agents koennen mit Backoff N=3 respawned werden
-  - Projection-Rebuild wird ueber `.projection-rebuild-request` entkoppelt angefordert
-  - aktuelle #264-SIGSTOP-Semantik wurde bei Konfliktauflösung beibehalten
-- Slice C ist erledigt:
-  - `POST /operator/runtime/stall-restart-test` ist als synchroner Operator-Testhook verdrahtet
-  - `PlatformSideEffect::RestartAgent` nutzt jetzt einen same-tick Fast-Respawn statt verzögertem Despawn
-  - der Fast-Restart entfernt alte Runtime-, Security- und Sandbox-Fragmente und respawned danach denselben Agent
-  - Remote-Tests, FUSE-Release-Build und Artifact-Hash sind dokumentiert
-- Slice D ist erledigt:
-  - `service_health` ist per `catch_unwind` in-process supervised
-  - `POST /operator/runtime/panic-test` triggert kontrolliert den Service-Health-Panic-Test ueber den ECS-Thread
-  - Runtime-Health-Worker-State zeigt `running`, `restart_count`, `last_error` und `thread_name`
-  - Remote-Tests, FUSE-Release-Build und Artifact-Hash sind dokumentiert
-- Slice E ist erledigt:
-  - Platform-Controlplane-Triggerqueue ist bounded und coalesced doppelte Trigger
-  - LLM-Analyzer-Channel ist bounded und zaehlt Dropped-Requests
-  - Runtime-Health publiziert Queue-Depth, Dropped- und Coalesced-Counter
-  - `POST /operator/runtime/analysis-flood-test` erzeugt deterministische Queue-Pressure fuer VM-/AC-Evidence
-  - Remote-Tests, FUSE-Release-Build, Clippy, Scope-Guard und Artifact-Hash sind dokumentiert
-- Slice F ist erledigt:
-  - Projection-Worker konsumiert `.projection-rebuild-request` und fuehrt Full-Rebuild in-place aus
-  - Projection-Store bietet read-only Open fuer Runtime-Health ohne Migration/Startup-Cleanup
-  - Runtime-Health erkennt Projection-Drift und zaehlt driftende Projection-Agenten
-  - Runtime-Reconcile fordert Projection-Rebuilds per Request-Datei an und vermeidet Restart-Storms, wenn `sentinel-projection` bereits aktiv ist
-  - Remote-Tests, Clippy, Release-Builds und Artifact-Hashes fuer Daemon und Projection sind dokumentiert
-- Slice G ist erledigt:
-  - Daemon aktiviert `fs_mount` fuer Sandbox, Operator-API und ECS nur noch, wenn `sentinel-fs` wirklich als FUSE-Mount aktiv ist
-  - bei fehlendem FUSE-Mount faellt die Runtime explizit auf `/ram/agents` zurueck statt bwrap auf einen toten Mountpoint zu richten
-  - Landlock-Exec-Allowlist bleibt schmal und enthaelt zusaetzlich die notwendigen dynamischen ELF-Loader
-  - Remote-Tests, Clippy, FUSE-Release-Builds, Sandbox-Binary-Build, Scope-Guard und Artifact-Hashes sind dokumentiert
-- Task 10 ist erledigt:
-  - Es gab kein separates offenes Haiku-/Agent-Model-Policy-Issue
-  - neues Follow-up `#314` wurde fuer Gateway-/Inference-Agent-Model-Defaults erstellt
-  - `#279` wurde mit der Scope-Entscheidung kommentiert: keine Modellentscheidung im Daemon, Gateway waehlt Default
-- Task 11 ist erledigt:
-  - komplette Remote-Testmatrix fuer Daemon, Projection und Projection-Service ist gruen
-  - Clippy ist fuer Daemon, Projection, Projection-Service, `sentinel-fs` und `sentinel-sandbox` gruen
-  - Release-Artefakte fuer Daemon, Projection und Sandbox-Helper wurden remote gebaut
-  - conditional FUSE/Landlock-Gates wurden erneut auf demselben Branch wiederholt
-  - `git diff --check`, Haiku-Scope-Guard und Artifact-Hashes sind dokumentiert
-- Task 12 ist erledigt:
-  - Release-Artefakte wurden an den systemd `ExecStart`-Pfaden auf `10.0.0.240` installiert
-  - erste Runtime-Reconcile-Runde reparierte Projection-only Drift von `57` auf `26`, deckte aber drei verwaiste gestoppte #264-Write-Anomaly-Cgroups auf
-  - Cgroup-Reconcile wurde gehärtet: verwaiste Live-Cgroups werden ueber `cgroup.kill`/SIGKILL-Fallback geleert und danach entfernt
-  - zweiter VM-Deploy mit Daemon-Hash `d6c30a324d85cbb3ec9d919a14e5f5744482cda75e59984e6133944289129d86`
-  - Live-Reconcile meldete `orphan_cgroups_before=3`, `orphan_cgroups_after=0`, `orphan_cgroups_removed=3`
-  - finaler Runtime-Health-Gate ist gruen: `expected/runtime/projection/cgroups = 26/26/26/26`, `stale=0`, `orphans=0`, `zombies=0`, `drift=false`, Dashboard-API `26`
-- Task 13 ist erledigt:
-  - `/tmp/opcurl` ist auf der VM installiert und operator-auth-aware
-  - AC-1 bis AC-7 wurden auf `10.0.0.240` mit echten Commands/Outputs belegt
-  - AC-2 Stall-Restart wechselte `Thomas Mueller` von PID `1487965` auf `1488241` und blieb healthy
-  - AC-3 Restore stellte den Original-Hash wieder her; Reconcile brachte die VM danach zurueck auf `26/26/26/26`
-  - AC-4 Projection-Drift wurde per SQLite-Delete erzeugt und durch Reconcile/Rebuild wieder auf `26/26/26/26` gebracht
-  - AC-5 `service_health` Panic-Test blieb im selben Daemon-PID `1485419`, Worker `running=true`, `restart_count=1`
-  - AC-6 Flood-Test mit `10000` Triggern blieb bounded: `queue_depth=1`, `dropped=9983`, `coalesced=9999`, `rss_delta_kb=-80`
-  - AC-7 30-Minuten-Soak endete PASS; Artefakte liegen auf der VM unter `/tmp/issue279-soak-20260423T123633Z`
-- Task 14 ist erledigt:
-  - Benchmark-Instrumentierung fuer `elapsed_us`, `snapshot_build_elapsed_us`, `enqueue_per_request_ns` und `bookkeeping_elapsed_ns` wurde implementiert
-  - Remote-Qualitaetsmatrix nach Instrumentierung ist gruen: `fmt`, Daemon-Tests `194 passed`, Clippy Daemon mit `--features fuse`, Release-Build Daemon
-  - finaler Daemon-Hash wurde auf die VM deployed: `7d105283937f92a98bbf2dbd89fc44f8f86128b92a935042c328dac3e8c2756d`
-  - Benchmark-Harness `/opt/sentinel/scripts/vm-issue-279-bench.sh` lief auf `10.0.0.240` mit Sidecars fuer RAM, CPU, IOPS und Prozesszustand
-  - Benchmark-Artefakte liegen auf der VM unter `/tmp/issue279-bench-20260423T132030Z`
-  - alle vier Pflicht-Benchmarks sind PASS: Reconcile `2134us < 5000us`, Projection-Drift-Detection `817us < 5000us`, Analysis-Flood `148ns/request < 250000ns/request`, Stall-Bookkeeping `700ns < 50000ns`
+- `$start` wurde fuer #314 aktiviert.
+- Hook-Skripte existieren und sind ausfuehrbar:
+  `pretooluse-task-checklist-gate.sh`, `pretooluse-start-progress-gate.sh`, `posttooluse-start-enforcer.sh`.
+- Projektlokale Hooks wurden in `.claude/settings.json` registriert und die Start-Counter wurden zurueckgesetzt.
+- Projektregeln, globale Regeln, Workspace-Handover, `.claude/AGENTS.md` und der komplette #314-Plan wurden in dieser Session frisch gelesen.
+- `mainrag search "Issue 314 Haiku Gateway model policy" --source claude-conversations --limit 5` ist aktuell nicht nutzbar, weil `localhost:3001` `Connection refused` liefert. Das ist dokumentiert, aber kein Task-Blocker.
+- `git fetch origin` lief, `main` ist synchron mit `origin/main` (`ahead/behind 0/0`), kein Pull war notwendig.
+- GitHub-Issue `#314` ist offen und traegt aktuell `quality:needs-spec`, `status:triage`, `status:backlog`.
+- Der Issue-Quality-Bot fordert die fehlenden Sektionen `Scope`, `Out of Scope`, `Benchmarks`.
+- Umsetzungsscope bleibt Go/Gateway-zentriert; Daemon-Haiku-Pinning ist out-of-scope.
+- Task 1 ist erledigt:
+  - `issue-314-body.md` wurde als Issue-Body-Artefakt erstellt.
+  - GitHub-Issue `#314` wurde aktualisiert und steht jetzt auf `quality:ready` und `status:in-progress`.
+  - `quality:needs-spec`, `status:triage` und `status:backlog` wurden entfernt.
+  - `ssh ubuntu@10.0.0.240 "/usr/bin/claude -p --model haiku 'Antworte exakt mit PONG.'"` lieferte `PONG`.
+  - In Task 1 wurde kein Daemon-Code geaendert.
+- Task 2 ist erledigt:
+  - `RequestClass` wurde zentral im Gateway eingefuehrt.
+  - `agent_runtime` wird nur bei positiver numerischer `agent_id` und nach Ausschluss von Platform-/Service-/Analysepfaden gesetzt.
+  - `agent_runtime_model_policy` setzt in der Control-Config standardmaessig `haiku`.
+  - `ResolveModelPolicy` setzt Haiku nur fuer `agent_runtime` ohne explizites Modell.
+  - `/v1/messages` bleibt `external_compat` und `PreferredProvider=anthropic-direct`.
+  - ungueltige Policy/Provider-Kombinationen failen vor dem Provider-Call mit `model policy rejected`.
+  - Zwischenfund: Die Policy wurde nach erstem Testfail aus dem Pre-Synthesis-Pfad in den echten Forward-Pfad verschoben.
+  - `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control` ist gruen.
+  - `go build ./cmd/cortex-gateway` ist gruen.
+- Task 3 ist erledigt:
+  - `traffic-stats` zeigt jetzt `agent_runtime_model_policy` und den letzten Agent-Runtime-Forward mit effektivem Modell, Policy-Source und Provider.
+  - `ResponseLogEntry` enthaelt `request_class`, `provider`, `model`, `policy_source`, `agent_id`, `agent_name` ohne Header-/Secret-Felder.
+  - Provider-Success, Provider-Error, Stream-Success und Stream-Error loggen Request-Klasse, effektives Modell und Policy-Source.
+  - `ResponseLogBuffer` ist jetzt ein bounded circular buffer und vermeidet steady-state O(n)-Kopie beim Append.
+  - `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control` ist gruen.
+  - `go build ./cmd/cortex-gateway` ist gruen.
+- Task 4 ist erledigt:
+  - Policy-Unit-Tests pruefen strikte Request-Klassifikation und Resolver-Reihenfolge.
+  - Pipeline-Test prueft, dass Agent-Runtime-Requests auf `haiku` gesetzt werden.
+  - Anthropic-Compat-Test prueft, dass `/v1/messages` `external_compat` bleibt und die Request-Override-Policy nutzt.
+  - Control-Tests pruefen Default, erlaubte Werte und Rejects fuer `agent_runtime_model_policy`.
+  - Response-Log-Test prueft Ring-Overwrite, chronologische Ausgabe und `LastByClass`.
+  - `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control` ist gruen.
+  - `go build ./cmd/cortex-gateway` ist gruen.
+- Task 5 ist erledigt:
+  - Benchmark-Harness fuer `ClassifyRequest`, `ResolveModelPolicy` und `ResponseLogBuffer.Add` wurde ergaenzt.
+  - Benchmarks mit `benchmem` laufen gruen:
+    - `BenchmarkClassifyRequestAgentRuntime`: `494.9 ns/op`, `16 B/op`, `1 allocs/op`
+    - `BenchmarkResolveModelPolicyAgentRuntime`: `38.43 ns/op`, `0 B/op`, `0 allocs/op`
+    - `BenchmarkResponseLogBufferAdd`: `3831 ns/op`, `0 B/op`, `0 allocs/op`
+  - Zielwerte sind erfuellt: Classify `<1us`, Resolve `<1us`, ResponseLog Add `<10us`.
+  - `/usr/bin/time -v`, `vmstat` und `iostat` wurden fuer CPU/RAM/IO-Evidence erfasst.
+- Task 6 ist erledigt:
+  - `sentinel-gateway` nutzt laut systemd `ExecStart=/opt/sentinel/bin/cortex-gateway`.
+  - Altes Binary wurde gesichert unter `/opt/sentinel/bin/cortex-gateway.bak-issue314-20260424062401`.
+  - Erster Copy-Versuch traf `Text file busy`; Fix war kontrolliertes `systemctl stop`, Copy, `systemctl start`.
+  - Neues Binary `/opt/sentinel/bin/cortex-gateway` ist deployed (`23244031` Bytes, `2026-04-24 06:24 UTC`).
+  - `sentinel-gateway` ist `active`.
+  - `curl -s localhost:8080/health` liefert `status=ok`.
+  - `curl -s localhost:8081/control/traffic-stats` enthaelt `agent_runtime_model_policy: haiku`.
+  - PID-basiertes Gateway-Journal seit Restart zeigt Startup-Logs ohne Panic/Fatal.
+- Task 7 ist erledigt:
+  - AC-1 PASS: Interner `/internal/llm` Agent-Runtime-Forward setzt `model=haiku`.
+  - AC-2 PASS: Daemon enthaelt kein `AGENT_MODEL_HAIKU`; Agent-Runtime sendet `model: String::new()`.
+  - AC-3 PASS: VM-Forward `request_id=49c25b39-466d-4c48-9bc0-04fac9e9b360` lief als `agent_runtime`, Provider `claude-code`, Model `haiku`.
+  - AC-4 PASS: `/v1/messages` mit Dummy-Key ging gegen `anthropic-direct`, `request_class=external_compat`, `effective_model=claude-opus-4-6`, `policy_source=request_override`, HTTP `401` wegen absichtlich falschem Key.
+  - AC-5 PASS: `traffic-stats`, `traffic-responses` und Journal zeigen redigierte Felder; Secret-Grep fand keine Token/API-Key-Werte.
+  - AC-6 PASS: Go-Tests plus VM-Smoke belegen interne Runtime-Default-Policy getrennt vom externen Compatibility-Pfad.
+  - Panic/Drift-Grep fuer Gateway/Daemon seit Live-Verifikation ist leer.
+- Task 8 ist erledigt:
+  - `CHANGELOG.md` enthaelt einen #314-Unreleased-Eintrag.
+  - PR-Pflichtsektionen sind fuer `gh pr create` vorbereitet: Summary, Changes, Linked Issues, Test Plan, Benchmarks, Evidence, Checklist.
+  - Issue-Close-Sequenz bleibt korrekt nachgelagert: erst PR/CI/Merge, dann `status:verified`, dann Close.
+- Task 9 ist erledigt:
+  - Plan-Slices 1-9 sind abgeschlossen.
+  - `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control` ist gruen.
+  - `go build ./cmd/cortex-gateway` ist gruen.
+  - VM-Gateway `/health` ist OK; `anthropic-direct` und `claude-code` Circuit-Breaker sind geschlossen.
+  - VM-`traffic-stats` zeigt `agent_runtime_model_policy=haiku`, `last_agent_runtime_effective_model=haiku`, `last_agent_runtime_policy_source=agent_runtime_policy`.
+  - GitHub Issue #314 ist offen mit `quality:ready` und `status:in-progress`; `status:verified` wird erst nach PR/Merge gesetzt.
 
 ## Blocked items
 
-- Kein harter technischer Blocker beim Setup.
-- `mainrag` ist lokal nicht verfuegbar; fuer `#279` nicht blockierend.
-- Kein Phase-0-Blocker mehr.
-- Der Main-Reset bestaetigt, dass der volle #279-Recovery-Scope notwendig bleibt.
+- Kein technischer Blocker beim Setup.
+- `mainrag` ist lokal nicht erreichbar; falls fuer spaetere Architekturfragen relevant, erneut pruefen.
 
 ## Commit references
 
-- `dca25ac` Task [1] Phase 0 - Issue-Repair und Baseline-Reset
-- `e2e7523` Task [2] Phase 1 - Donor-Audit und Clean Port
-- `f5be73b` Task [3] Slice A - Runtime-Health-Read-Model
-- `ca44759` Task [4] Slice B - Runtime-Control / Reconcile
-- `f5e3dd9` Task [5] Slice C - Fast Stall Recovery
-- `b3b7786` Task [6] Slice D - Worker-Supervision
-- `bc57b4c` Task [7] Slice E - bounded Analysis-/Recovery-Pfade
-- `92b3279` Task [8] Slice F - Projection/API-Konvergenz
-- `7eb95cb` Task [9] Slice G - Conditional FUSE/Landlock Runtime Restore
-- `90792a5` Task [10] Out-of-scope Follow-up - Haiku-Policy
-- `441ff3c` Task [11] Phase 3 - Tests, Clippy, Builds
-- `aa4ee20` Task [12] Phase 4 - Deploy auf die VM
-- `e53cb5c` Task [13] Phase 5 - AC-Matrix
-- `f752ffc` Task [14] Benchmarks
-- `TBD` Task [15] PR- und Close-Sequenz
-- `TBD` Task [16] Plan-Verifikation
+- `a42ef76` Task [1] Phase 1 - Issue-Body-Repair, Branch und Preflight
+- `b953e4a` Task [2] Phase 2 - Gateway Policy-Layer
+- `114732d` Task [3] Phase 3 - Observability und Response Log
+- `b326a2f` Task [4] Phase 4 - Go-Tests
+- `9d2adf5` Task [5] Phase 5 - Benchmarks
+- `9495871` Task [6] Phase 6 - Gateway Deploy auf 10.0.0.240
+- `TBD` Task [7] Phase 8 - AC-Matrix und Live-Verifikation
+- `645553b` Task [8] Dokumentation, PR- und Close-Sequenz
+- `TBD` Task [9] Plan-Verifikation
 
 ## Task table
 
 | # | Task | Status | Scope | Evidence |
 |---|------|--------|-------|----------|
-| 1 | Phase 0 - Issue-Repair und Baseline-Reset | DONE | frische VM-Baseline, Issue-Body-Repair, canonical-main-Reset, Post-Reset-Baseline ohne runtime-health | command, system, inspect |
-| 2 | Phase 1 - Donor-Audit und Clean Port | DONE | alte #279-Donor-Commits pruefen, nur scope-konforme Teile uebernehmen, Haiku ausschliessen | inspect, command |
-| 3 | Slice A - Runtime-Health-Read-Model | DONE | `/operator/runtime-health`, Snapshot-Modell, Auth/Loopback, Tests | inspect, command, system |
-| 4 | Slice B - Runtime-Control / Reconcile | DONE | `/operator/runtime/reconcile`, stale/orphan/zombie cleanup, bounded retries | inspect, command, system |
-| 5 | Slice C - Fast Stall Recovery | DONE | deterministischer Stall-Testhook, same-tick Fast-Respawn, Runtime/Security/Sandbox-Recreate | inspect, command, system |
-| 6 | Slice D - Worker-Supervision | DONE | catch_unwind + in-process worker respawn, panic-test Hook | inspect, command, system |
-| 7 | Slice E - bounded Analysis-/Recovery-Pfade | DONE | bounded trigger queues, coalescing/drop counters, flood-test | inspect, command, system |
-| 8 | Slice F - Projection/API-Konvergenz | DONE | read-only Projection-Reads, Rebuild-Request, drift-heal, no restart storm | inspect, command, system |
-| 9 | Slice G - Conditional FUSE/Landlock Runtime Restore | DONE | FUSE-Aktivierungs-Gate, `/ram/agents` Fallback, Landlock-ELF-Loader-Allowlist, eigene Build-/Deploy-Gates | inspect, command, system |
-| 10 | Out-of-scope Follow-up - Haiku-Policy | DONE | separates Gateway-/Policy-Issue #314 erstellt und in #279 verlinkt, nicht #279-Close-Bedingung | command, inspect |
-| 11 | Phase 3 - Tests, Clippy, Builds | DONE | cargo remote only, relevant packages, conditional FUSE/Landlock matrix | command |
-| 12 | Phase 4 - Deploy auf die VM | DONE | ExecStart pruefen, scp/install, restart, post-restart smoke, Projection-/Cgroup-Drift reparieren | command, system |
-| 13 | Phase 5 - AC-Matrix | DONE | alle ACs mit Command, Output, PASS auf VM | command, system |
-| 14 | Benchmarks | DONE | Recovery, Queue, Soak, Sidecar-Monitoring | command, system |
-| 15 | PR- und Close-Sequenz | PENDING | PR mit Pflichtsektionen, labels, merge, branch delete, issue close erst nach verified | command |
-| 16 | Plan-Verifikation | PENDING | Plan Zeile fuer Zeile gegen Ergebnis pruefen, Abweichungen fixen | inspect, command |
+| 1 | Phase 1 - Issue-Body-Repair, Branch und Preflight | DONE | Branch von main, GitHub-Body reparieren, `quality:ready`, Haiku-String fuer claude-code pruefen, Platform-Controlplane out-of-scope bestaetigen | command, inspect, system |
+| 2 | Phase 2 - Gateway Policy-Layer | DONE | Request-Klassifikation, Agent-Runtime-Policy, Resolver-Reihenfolge, fail-closed Validation | inspect, command |
+| 3 | Phase 3 - Observability und Response Log | DONE | Traffic-Stats, ResponseLogEntry, Journal-Logs fuer Success/Stream/Error, bounded circular buffer | inspect, command |
+| 4 | Phase 4 - Go-Tests | DONE | Unit-/Regressionstests fuer Klassen, Policy, `/v1/messages`, Response-Logs und Validation | command |
+| 5 | Phase 5 - Benchmarks | DONE | Classify/Resolve/ResponseLog Benchmarks mit Zielwerten und System-Monitoring | command, system |
+| 6 | Phase 6 - Gateway Deploy auf 10.0.0.240 | DONE | ExecStart pruefen, Linux-Binary bauen, deployen, Gateway restart, Smoke | command, system |
+| 7 | Phase 8 - AC-Matrix und Live-Verifikation | DONE | AC-1 bis AC-6 einzeln auf VM belegen, Config restore, Panic/Error/Secret-Grep | command, system |
+| 8 | Dokumentation, PR- und Close-Sequenz | DONE | CHANGELOG, Evidence-Doku, PR mit Pflichtsektionen, Labels, Issue-Close erst nach verified | command, inspect |
+| 9 | Plan-Verifikation | DONE | Plan komplett gegen Ergebnis pruefen, Abweichungen fixen oder blocken | inspect, command, system |
 
-## Task 1 - Phase 0: Issue-Repair und Baseline-Reset
+## Task 6 - Phase 6: Gateway Deploy auf 10.0.0.240
 
 ### Pre-task self-check
 
-- Was muss getan werden: frische Runtime-Wahrheit erfassen, GitHub-Issue korrigieren, canonical `main` auf der VM deployen, danach Baseline ohne `/operator/runtime-health` belegen.
+- Was muss getan werden:
+  - VM-Servicepfad und `ExecStart` fuer `sentinel-gateway` pruefen
+  - lokales Linux/amd64 Gateway-Binary bauen
+  - Binary nach `/opt/sentinel/bin/cortex-gateway` deployen
+  - `sentinel-gateway` restart ausfuehren
+  - Smoke-Checks gegen `/health` und `/control/traffic-stats`
+  - Gateway-Journal auf offensichtliche Startfehler pruefen
 - Welche ACs muessen hier passen:
-  - AC-1: frische experimentelle VM-Baseline ist dokumentiert.
-  - AC-2: `#279` Issue-Body ist truth-repaired und enthaelt keine stale Blocked-by-/Zahlen-Behauptung.
-  - AC-3: canonical `main` Binaries fuer Daemon und Projection sind remote gebaut, Deploy-Pfad inklusive ExecStart ist belegt.
-  - AC-4: Post-Reset-Baseline ohne `/operator/runtime-health` ist belegt.
-- Wie wird bewiesen: `gh`, `ssh ubuntu@10.0.0.240`, `cargo remote -c --`, `scp`, `systemctl`, `curl`, `sqlite3`, `journalctl`.
-- Erwartete Dateien: `PROGRESS.md`, `docs/issue-279-phase0-baseline.md`, optional temporaere Issue-Body-Datei.
+  - AC-1: Deploy trifft den tatsaechlich von systemd gestarteten Binary-Pfad.
+  - AC-2: Service ist nach Restart `active`.
+  - AC-3: `/health` liefert OK.
+  - AC-4: `/control/traffic-stats` enthaelt `agent_runtime_model_policy`.
+  - AC-5: Journal zeigt keinen unmittelbaren Panic-/Fatal-Startfehler.
+- Wie wird bewiesen:
+  - `ssh ubuntu@10.0.0.240 "systemctl cat sentinel-gateway ..."`
+  - `GOOS=linux GOARCH=amd64 go build -o cortex-gateway ./cmd/cortex-gateway/`
+  - `scp`, `sudo cp`, `sudo systemctl restart sentinel-gateway`
+  - `curl -s localhost:8080/health`
+  - `curl -s localhost:8081/control/traffic-stats`
+  - `journalctl _PID=$(pgrep cortex-gate) --since '2 min ago' --no-pager`
+- Erwartete Dateien:
+  - lokales Build-Artefakt `cortex-gateway` untracked/ignored
+  - `test-314-verification.md`
+  - `PROGRESS.md`
 - Risiken:
-  - VM laeuft aktuell moeglicherweise mit experimentellen #279-Binaries; Phase 0 ersetzt diese bewusst durch canonical `main`.
-  - Nach Main-Reset ist `/operator/runtime-health` erwartbar nicht vorhanden.
-  - Deployment darf nicht gegen falsche systemd `ExecStart`-Pfade kopieren.
+  - VM kann busy sein; falls Restart fehlschlaegt, sofort Journal lesen und Service nicht kaputt stehen lassen.
 
 ### Outcome
 
-- Fresh pre-reset VM baseline captured:
-  - services active
-  - API agents `57`
-  - Projection agents `57`
-  - experimental runtime-health expected active agents `26`
-  - experimental runtime-health runtime agents `26`
-  - experimental runtime-health orphan cgroups `33`
-  - experimental runtime-health projection drift `true`
-- GitHub issue `#279` body repaired at `2026-04-23T09:47:19Z`:
-  - removed stale `Blocked by #278`
-  - removed old 2026-04-21 numbers as current truth
-  - removed #264-stacked branch assumption
-  - kept Haiku/model policy out-of-scope
-  - kept strict `status:verified` close rule
-- Canonical `main` artifacts built through `cargo remote -c --`:
-  - `sentinel-daemon --features fuse`: `Finished release profile [optimized] target(s) in 12m 04s`
-  - `sentinel-projection-service`: `Finished release profile [optimized] target(s) in 1m 37s`
-- Main artifacts deployed to exact VM `ExecStart` paths:
-  - `/opt/sentinel/bin/sentinel-daemon`
-  - `/opt/sentinel/bin/sentinel-projection`
-  - timestamp backup created with `20260423T100300Z`
-- Post-reset baseline without runtime-health captured:
-  - services active
-  - API agents `57`
-  - Projection agents `57`
-  - cgroup dirs `59`
-  - live cgroup process dirs `29`
-  - `/operator/runtime-health` returns `404`, expected on current `main`
-- Conclusion:
-  - canonical `main` does not self-heal the runtime/projection/cgroup drift
-  - full #279 recovery scope remains required
+- `ExecStart=/opt/sentinel/bin/cortex-gateway` wurde verifiziert.
+- Linux/amd64 Gateway-Binary wurde lokal gebaut und auf die VM kopiert.
+- Altes Binary wurde vor Austausch gesichert.
+- Nach `Text file busy` wurde der Service kontrolliert gestoppt, das Binary ersetzt und wieder gestartet.
+- Gateway-Service ist aktiv, Health ist OK, neues Traffic-Stats-Feld ist live sichtbar.
 
 ### Evidence
 
-- `test-279-verification.md` contains Phase-0 command/output evidence.
-- AC-1 PASS: Pre-reset VM baseline captured on `10.0.0.240`.
-- AC-2 PASS: `gh issue edit 279 --repo silentspike/project-sentinel --body-file docs/issue-279-body.md`; follow-up `gh issue view` confirmed repaired body.
-- AC-3 PASS: remote release builds succeeded and deployed SHA256 values match installed VM binaries:
-  - `2b31820c751c6f3dd0eb8e1282e827d64c5b2d9b016bf56fcede4c765ee86883  /opt/sentinel/bin/sentinel-daemon`
-  - `10b845881d24ed0c661ba5a18de4ebddad44d404d15f0231ef1ce83a83855ce3  /opt/sentinel/bin/sentinel-projection`
-- AC-4 PASS: Post-reset baseline uses only main-compatible checks and confirms `runtime_health_http=404`.
+- `test-314-verification.md` enthaelt Task-6 Command/Output-Evidence.
+- AC-1 PASS: systemd startet `/opt/sentinel/bin/cortex-gateway`.
+- AC-2 PASS: `systemctl is-active sentinel-gateway` liefert `active`.
+- AC-3 PASS: `/health` liefert `{"status":"ok",...}`.
+- AC-4 PASS: `/control/traffic-stats` enthaelt `"agent_runtime_model_policy": "haiku"`.
+- AC-5 PASS: PID-basiertes Journal seit Restart zeigt Startup ohne Panic/Fatal.
 
-## Task 2 - Phase 1: Donor-Audit und Clean Port
+## Task 7 - Phase 8: AC-Matrix und Live-Verifikation
 
 ### Pre-task self-check
 
-- Was muss getan werden: alten Donor-Branch lesen, Commit-/Diff-Scope klassifizieren, Haiku- und #264-fremde Arbeit ausschliessen, eine saubere Port-Reihenfolge fuer die Code-Slices herstellen.
+- Was muss getan werden:
+  - alle 6 GitHub-ACs einzeln mit VM- oder Repo-Evidence belegen
+  - kontrollierten `agent_runtime`-Forward ueber `/internal/llm` provozieren
+  - externe `/v1/messages`-Compatibility gegen interne Policy trennen
+  - `/control/traffic-stats`, `/control/traffic-responses` und PID-Journal fuer Observability pruefen
+  - Daemon-Code auf fehlendes hartes `AGENT_MODEL_HAIKU`-Pinning pruefen
+  - Panic/Drift/Secret-Grep ausfuehren
 - Welche ACs muessen hier passen:
-  - AC-1: Donor-Commits sind gegen `main` sichtbar und klassifiziert.
-  - AC-2: Out-of-scope Commits/Dateien sind explizit ausgeschlossen.
-  - AC-3: Clean-port Reihenfolge fuer Slice A-F und conditional Slice G ist dokumentiert.
-- Wie wird bewiesen: `git log`, `git diff --name-status`, gezielte Code-Inspection, Abgleich gegen `codex-plan279.md`.
-- Erwartete Dateien: `PROGRESS.md`, ggf. `test-279-verification.md`; noch kein Produktionscode, solange nur Audit laeuft.
+  - AC-1: Interne Agent-Runtime-Requests bekommen effektiv `haiku`.
+  - AC-2: Der Daemon pinnt kein Agent-Haiku-Modell.
+  - AC-3: VM zeigt mindestens einen echten Agent-Runtime-Forward mit `effective_model=haiku`.
+  - AC-4: `/v1/messages` bleibt externer MITM-/Anthropic-Compatibility-Pfad und wird nicht von Agent-Default-Policy erfasst.
+  - AC-5: Observability zeigt Request-Klasse, Provider, Policy-Source und effektives Modell ohne Secrets.
+  - AC-6: Tests und VM-Smoke belegen die Trennung von internem Runtime-Default und externem Compatibility-Pfad.
+- Wie wird bewiesen:
+  - VM-`curl` gegen `127.0.0.1:8080/internal/llm`
+  - VM-`curl` gegen `127.0.0.1:8080/v1/messages`
+  - VM-`curl` gegen `127.0.0.1:8081/control/traffic-stats` und `/control/traffic-responses`
+  - PID-basiertes Gateway-Journal
+  - `rg` in Daemon-Quellen
+  - Panic/Drift/Secret-Grep
+- Erwartete Dateien:
+  - `test-314-verification.md`
+  - `PROGRESS.md`
 - Risiken:
-  - Der alte Donor-Branch ist auf #264 gestackt und darf nicht direkt gemergt werden.
-  - Haiku-Pinning ist bewusst out-of-scope fuer #279.
+  - Claude-Code-Quota/Circuit-Breaker kann den echten Forward blockieren; dann AC-3 bleibt BLOCKED statt durch Tests ersetzt zu werden.
 
 ### Outcome
 
-- Donor sources inspected:
-  - old donor: `/work/company/project-sentinel-issue279`, branch `feat/issue-279-daemon-hardening`
-  - safer stack donor: `/work/company/project-sentinel-issue279-stack`, branch `feat/issue-279-daemon-hardening-stack`
-- The old donor contains `dbb1b8e` which pins agent LLM requests to `haiku`; this is rejected for #279.
-- The stack donor removed the Haiku commit, but still spans a broad stacked diff and is not mergeable as a branch.
-- Clean-port source of truth:
-  - use stack donor commits as code references
-  - path-limit each slice
-  - do not port stale donor evidence or donor `PROGRESS.md`
-- Port order is fixed:
-  - Slice A from `29a0fb5`
-  - Slice B from `146ef43`
-  - Slice C from `fdc40c7`
-  - Slice D from `6919e66`
-  - Slice E from `389b5e6`
-  - Slice F from `14560c4` plus relevant stabilization from `b1e376b`
-  - Slice G from `6c31975` only if needed
-  - Benchmarks from `ffca58b` with fresh current evidence
+- Alle 6 GitHub-ACs wurden mit Repo- und VM-Evidence belegt.
+- Kontrollierter Agent-Runtime-Forward ueber `/internal/llm` lieferte HTTP `200`, Provider `claude-code`, Model `haiku`.
+- Externer `/v1/messages`-Pfad wurde mit Dummy-Key getestet und blieb `external_compat`/`anthropic-direct` ohne Agent-Runtime-Policy.
+- Observability-Felder sind in `traffic-stats`, `traffic-responses` und Journal sichtbar.
+- Secret-Grep auf Stats/Responses/Journal fand keine Token/API-Key-Werte.
+- Panic/Drift-Grep blieb leer.
 
 ### Evidence
 
-- `test-279-verification.md` contains Phase-1 command/output evidence.
-- AC-1 PASS:
-  - `git log --oneline --decorate --reverse origin/main..HEAD` run on both donor worktrees.
-  - `git range-diff origin/main...feat/issue-279-daemon-hardening-stack` shows the old #264 lineage and the #279 commit sequence.
-- AC-2 PASS:
-  - old donor `dbb1b8e` / `services/sentinel-daemon/src/llm_bridge.rs` is explicitly rejected.
-  - stale donor `PROGRESS.md`, old evidence and branch-wide #264 paths are excluded.
-- AC-3 PASS:
-  - clean port order and path-limited rules are documented in `test-279-verification.md`.
+- `test-314-verification.md` enthaelt Task-7 Command/Output-Evidence.
+- AC-1 PASS: `/internal/llm` Response enthaelt `"model":"haiku"` und `"provider":"claude-code"`.
+- AC-2 PASS: `rg "AGENT_MODEL_HAIKU"` ohne Treffer; `llm_bridge.rs` zeigt `model: String::new()`.
+- AC-3 PASS: `traffic-responses` fuer `49c25b39-466d-4c48-9bc0-04fac9e9b360` zeigt `request_class=agent_runtime`, `model=haiku`, `policy_source=agent_runtime_policy`.
+- AC-4 PASS: `/v1/messages` Dummy-Key-Test zeigt im Journal `provider=anthropic-direct`, `request_class=external_compat`, `effective_model=claude-opus-4-6`, `policy_source=request_override`.
+- AC-5 PASS: Observability- und Secret-Grep erfolgreich.
+- AC-6 PASS: Go-Tests plus VM-Smoke decken beide Pfade ab.
 
-## Task 3 - Slice A: Runtime-Health-Read-Model
+## Task 8 - Dokumentation, PR- und Close-Sequenz
 
 ### Pre-task self-check
 
-- Was muss getan werden: Runtime-Health-Snapshot aus dem Donor path-limited portieren und `GET /operator/runtime-health` als loopback/auth-konformen Read-Pfad verfuegbar machen.
+- Was muss getan werden:
+  - `CHANGELOG.md` aktualisieren
+  - PR-Pflichtsektionen vorbereiten
+  - keine Issue-Schliessung vor PR/Merge/CI
+  - Evidence-Datei aktuell halten
 - Welche ACs muessen hier passen:
-  - AC-1: `runtime_health.rs` existiert und berechnet runtime/cgroup/projection/worker truth ohne Seiteneffekte.
-  - AC-2: Operator-Endpoint ist verdrahtet und nutzt die bestehende Operator-Auth-/Loopback-Struktur.
-  - AC-3: relevante Remote-Rust-Tests oder mindestens package build fuer Slice A sind gruen.
-- Wie wird bewiesen: Donor-Diff-Inspection, Code-Diff, `cargo remote -c -- test/build`.
-- Erwartete Dateien: `services/sentinel-daemon/src/runtime_health.rs`, `lib.rs`, `operator_api.rs`, `orchestrator.rs`, `service_health.rs`, ggf. `Cargo.toml/Cargo.lock`.
+  - AC-1: CHANGELOG enthaelt #314.
+  - AC-2: PR-Body kann alle 7 Pflichtsektionen fuellen.
+  - AC-3: Close-Sequenz bleibt `status:verified` vor `gh issue close`.
+- Wie wird bewiesen:
+  - `rg "#314|Gateway Model Policy" CHANGELOG.md`
+  - PR-Erstellung nach Task-Commit mit Pflichtsektionen
+  - Issue-Label/Close erst nach Merge
+- Erwartete Dateien:
+  - `CHANGELOG.md`
+  - `PROGRESS.md`
+  - `test-314-verification.md`
 - Risiken:
-  - Donor-Patch darf keine Reconcile-/Stall-/Queue-Semantik vorziehen.
-  - `runtime-health` muss read-only bleiben.
+  - PR/Close vor finaler Plan-Verifikation waere gegen `$start`; deshalb nur vorbereiten, dann Task 9 final pruefen.
 
 ### Outcome
 
-- Path-limited donor Slice A was applied from stack donor `29a0fb5`.
-- Merge conflict in `services/sentinel-daemon/src/operator_api.rs` was resolved by keeping current `main`'s `open_fs_layer` security/FUSE helper and adding only the new `is_protected_read_path()` read-auth helper.
-- Added `services/sentinel-daemon/src/runtime_health.rs`.
-- Added `sentinel-projection` as `sentinel-daemon` dependency so the daemon can read Projection truth without mutating Projection state.
-- Wired `SharedRuntimeHealthState` through `orchestrator.rs` into the ECS tick loop and Operator API.
-- Added `GET /operator/runtime-health` as a protected read path; it returns the current snapshot and respects the existing operator shared-secret auth rule.
-- Extended `ServiceHealthChecker` with a read-only worker snapshot for runtime-health reporting.
-- Fixed the initial `unused import RuntimeHealthSnapshot` warning by moving the import into the test module.
+- `CHANGELOG.md` hat einen Unreleased-Eintrag fuer #314.
+- PR-Body-Sektionierung ist vorbereitet.
+- Close-Reihenfolge ist dokumentiert und bleibt bis nach PR/Merge gesperrt.
 
 ### Evidence
 
-- `cargo remote -c -- test -p sentinel-daemon runtime_health -- --nocapture`
-  - PASS: `3 passed; 0 failed; 173 filtered out; finished in 10.28s`
-  - Covered tests:
-    - `runtime_health::tests::build_snapshot_marks_missing_projection_and_security_as_stale`
-    - `operator_api::tests::runtime_health_endpoint_returns_snapshot`
-    - `operator_api::tests::runtime_health_endpoint_requires_auth_when_secret_is_set`
-- `cargo remote -c -- build -p sentinel-daemon --release --features fuse`
-  - PASS: `Finished release profile [optimized] target(s) in 1m 07s`
-  - artifact hash: `7b5145a77da0a55a3e9e9da00b2d9036ce943df748d327b4095f87955b0034d2  target/release/sentinel-daemon`
-- `git diff --check`
-  - PASS: no whitespace/conflict errors.
+- `test-314-verification.md` enthaelt Task-8 Command/Output-Evidence.
+- AC-1 PASS: CHANGELOG enthaelt #314-Eintrag.
+- AC-2 PASS: PR-Pflichtsektionen werden beim `gh pr create` verwendet.
+- AC-3 PASS: `status:verified`/Close bleibt nach finaler Verifikation und Merge.
 
-## Task 4 - Slice B: Runtime-Control / Reconcile
+## Task 9 - Plan-Verifikation
 
 ### Pre-task self-check
 
-- Was muss getan werden: Runtime-Control aus dem Donor path-limited portieren und `POST /operator/runtime/reconcile` als kontrollierten Reparaturpfad in den ECS-Thread verdrahten.
+- Was muss getan werden:
+  - `codex-plan314.md` gegen den umgesetzten Stand pruefen
+  - Issue-ACs, Benchmarks, Deploy, CHANGELOG und Evidence vollstaendig abgleichen
+  - finalen Git-Status pruefen
+  - keine offenen lokalen Code-/Doku-Aenderungen ausser Task-9-Progress/Evidence hinterlassen
 - Welche ACs muessen hier passen:
-  - AC-1: `runtime_control.rs` definiert Request/Response, Command und bounded Respawn-Backoff.
-  - AC-2: Operator-Endpoint dispatcht in den ECS-Thread und wartet bounded auf Response.
-  - AC-3: Orchestrator kann stale Runtime-Fragmente, Security-Snapshots und orphan Cgroups bereinigen.
-  - AC-4: Missing expected Agents koennen mit Backoff respawned oder als `repair_blocked` dokumentiert werden.
-  - AC-5: Projection-Rebuild wird entkoppelt per Request-Datei angefordert.
-  - AC-6: relevante Remote-Rust-Tests und Release-Build sind gruen.
-- Wie wird bewiesen: Donor-Diff-Inspection, Code-Diff, `cargo remote -c -- test/build`.
-- Erwartete Dateien: `services/sentinel-daemon/src/runtime_control.rs`, `lib.rs`, `operator_api.rs`, `orchestrator.rs`.
+  - AC-1: alle Plan-Slices sind erledigt oder explizit nicht relevant.
+  - AC-2: alle 6 GitHub-ACs sind PASS.
+  - AC-3: Benchmarks liegen unter Zielwert.
+  - AC-4: VM-Deploy ist live.
+  - AC-5: CHANGELOG und PR-Vorbereitung sind vorhanden.
+  - AC-6: Git-Status ist vor Push sauber nach Task-9-Commit.
+- Wie wird bewiesen:
+  - `git status --short`
+  - `go test`, `go build`
+  - `gh issue view 314`
+  - VM `health`, `traffic-stats`, `traffic-responses`
+  - Plan-/Evidence-Inspection
+- Erwartete Dateien:
+  - `PROGRESS.md`
+  - `test-314-verification.md`
 - Risiken:
-  - Donor-Patch darf keine alte #264-SIGSTOP-Abschwaechung einschleppen.
-  - Reconcile darf nicht inline Projection mutieren.
-  - Respawn-Fehler muessen bounded bleiben und duerfen keinen Endlos-Loop erzeugen.
+  - Nach Task 9 bleiben Push/PR/CI/Merge/Close als GitHub-Sequenz; nicht vor lokal sauberem Stand starten.
 
 ### Outcome
 
-- Path-limited donor Slice B was applied from stack donor `146ef43`.
-- Added `services/sentinel-daemon/src/runtime_control.rs` with:
-  - `RuntimeReconcileRequest`
-  - `RuntimeReconcileResponse`
-  - `RuntimeControlCommand`
-  - `RespawnBackoffTracker::new(3)` semantics
-  - `write_projection_rebuild_request()`
-- Added `POST /operator/runtime/reconcile` and a bounded `recv_timeout(10s)` response path.
-- Wired `runtime_tx/runtime_rx` through Operator API and ECS loop.
-- Added `run_runtime_reconcile()` in the orchestrator:
-  - removes unexpected active runtime fragments
-  - removes stale security runtime snapshots
-  - tears down orphan cgroups without live PIDs
-  - restores missing security runtime snapshots when core runtime is healthy
-  - respawns expected active Agents when requested
-  - records `repair_blocked` via `PlatformIntervention`
-  - updates `SharedRuntimeHealthState` with counters and per-agent repair status
-- Conflict resolution:
-  - kept current `suspend_pids()` implementation with 2s multi-PID verification from #264/main lineage
-  - rejected donor's narrower 250ms tracked-PID-only check
+- Alle Planphasen wurden gegen Code, Tests, Benchmarks, Deploy, VM-Evidence und CHANGELOG abgeglichen.
+- Keine Planabweichung bleibt offen.
+- Issue #314 bleibt vor PR/Merge korrekt offen und nicht verfrueht `status:verified`.
+- Lokaler Abschluss ist bereit fuer Push/PR/CI/Merge/Close-Sequenz.
 
 ### Evidence
 
-- `cargo remote -c -- test -p sentinel-daemon runtime_control -- --nocapture`
-  - PASS: `2 passed; 0 failed; 177 filtered out`
-  - Covered tests:
-    - `runtime_control::tests::respawn_backoff_tracker_applies_exponential_backoff_until_blocked`
-    - `runtime_control::tests::write_projection_rebuild_request_persists_request_file`
-- `cargo remote -c -- test -p sentinel-daemon runtime_reconcile -- --nocapture`
-  - PASS: `1 passed; 0 failed; 178 filtered out; finished in 0.61s`
-  - Covered test:
-    - `operator_api::tests::runtime_reconcile_is_forwarded_and_returns_response`
-- `cargo remote -c -- build -p sentinel-daemon --release --features fuse`
-  - PASS: `Finished release profile [optimized] target(s) in 1m 00s`
-  - artifact hash: `19ce8b228b5588142399a4f712afd4cd89b1caca2be43c1273355a3ad30fe724  target/release/sentinel-daemon`
+- `test-314-verification.md` enthaelt Task-9 Command/Output-Evidence.
+- AC-1 PASS: Plan-Slices 1-9 erledigt.
+- AC-2 PASS: GitHub-ACs 1-6 sind in Task 7 PASS.
+- AC-3 PASS: Benchmark-Zielwerte in Task 5 PASS.
+- AC-4 PASS: VM-Deploy in Task 6/7 live belegt.
+- AC-5 PASS: CHANGELOG und PR-Vorbereitung in Task 8 PASS.
+- AC-6 PASS: finaler Test-/Build-/VM-Smoke ist gruen.
 
-## Task 5 - Slice C: Fast Stall Recovery
+## Task 5 - Phase 5: Benchmarks
 
 ### Pre-task self-check
 
-- Was muss getan werden: Fast-Stall-Recovery aus dem Donor path-limited portieren, einen deterministischen Operator-Testhook bereitstellen und `PlatformSideEffect::RestartAgent` vom verzögerten Despawn auf same-tick Fast-Respawn umstellen.
+- Was muss getan werden:
+  - Benchmark-Harness fuer `ClassifyRequest`, `ResolveModelPolicy` und `ResponseLogBuffer.Add` ergaenzen oder vorhandene Benchmarks erweitern
+  - Benchmarks mit Zielwerten aus dem Plan ausfuehren
+  - System-Monitoring parallel dokumentieren: CPU, RAM, Disk/IOPS soweit lokal sinnvoll messbar
+  - Benchmark-Evidence in `test-314-verification.md` festhalten
 - Welche ACs muessen hier passen:
-  - AC-1: Operator-Testhook nimmt `agent_id`, `mode` und `stall_secs` an, validiert Eingaben und dispatcht in den ECS-Thread.
-  - AC-2: Fast-Restart entfernt alte Runtime-, Sandbox-, eBPF- und Security-Fragmente und erzeugt danach Runtime- und Security-State neu.
-  - AC-3: `PlatformSideEffect::RestartAgent` nutzt den Fast-Restart-Pfad statt nur zu despawnen.
-  - AC-4: relevante Remote-Tests, FUSE-Release-Build und `git diff --check` sind gruen.
-- Wie wird bewiesen: Donor-Diff-Inspection, Code-Diff, `cargo remote -c -- fmt/test/build`, `sha256sum`, `git diff --check`.
-- Erwartete Dateien: `services/sentinel-daemon/src/runtime_control.rs`, `operator_api.rs`, `orchestrator.rs`, `runtime_health.rs`, `CHANGELOG.md`.
+  - AC-1: `ClassifyRequest` bleibt unter `1us/op`.
+  - AC-2: `ResolveModelPolicy` bleibt unter `1us/op`.
+  - AC-3: `ResponseLogBuffer.Add` bleibt unter `10us/op`.
+  - AC-4: Benchmarks laufen mit `allocs/op` sichtbar.
+  - AC-5: System-Monitoring zeigt keine auffaellige lokale Lastspitze.
+- Wie wird bewiesen:
+  - `go test ./cmd/cortex-gateway/internal/proxy -bench 'Benchmark(ClassifyRequest|ResolveModelPolicy|ResponseLogBufferAdd)' -benchmem -run '^$'`
+  - Sidecar-Monitoring per `ps`, `vmstat`, optional `iostat` falls vorhanden
+- Erwartete Dateien:
+  - `cmd/cortex-gateway/internal/proxy/bench_test.go`
+  - `test-314-verification.md`
+  - `PROGRESS.md`
 - Risiken:
-  - Testhook darf kein Auth-Bypass sein; er laeuft ueber die bestehende Operator-API-Schutzschicht.
-  - Stall-Test darf den ECS-Thread nicht kuenstlich schlafen lassen.
-  - Fast-Restart darf keine alten cgroups oder Security-Snapshots zuruecklassen.
+  - Go-Benchmarkzeiten variieren lokal; Zielwerte muessen mit ausreichender Marge gegen ns/op liegen, nicht aus Einzellaeufen ueberinterpretiert werden.
 
 ### Outcome
 
-- Path-limited donor Slice C was applied from stack donor `fdc40c7`.
-- Added `RuntimeControlCommand::StallRestartTest` plus typed request/response structs.
-- Added `POST /operator/runtime/stall-restart-test`:
-  - rejects `agent_id=0`
-  - allows only `mode=sigstop` or `mode=direct`
-  - rejects `stall_secs=0`
-  - dispatches to the ECS owner thread and waits with `recv_timeout(10s)`
-- Added `restart_agent_fast_path()` in the orchestrator:
-  - captures `pid_before`
-  - tears down sandbox handle and unregisters eBPF cgroup id
-  - removes and terminates the old tracked process
-  - removes stale security runtime state
-  - despawns ECS/runtime state
-  - respawns the same configured agent immediately
-  - captures `pid_after` and runtime/security presence
-- Replaced `PlatformSideEffect::RestartAgent` with the same fast-path restart.
-- No Haiku/model-policy changes were introduced.
+- `bench_test.go` enthaelt jetzt Microbenchmarks fuer `ClassifyRequest`, `ResolveModelPolicy` und `ResponseLogBuffer.Add`.
+- Alle drei Benchmarks liegen deutlich unter den Zielwerten.
+- `benchmem` zeigt Allokationen explizit.
+- Lokales System-Monitoring wurde parallel bzw. ergaenzend per `/usr/bin/time -v`, `vmstat` und `iostat` dokumentiert.
 
 ### Evidence
 
-- `cargo remote -c -- fmt --check`
-  - PASS after applying remote rustfmt diffs locally.
-- `cargo remote -c -- test -p sentinel-daemon runtime_stall_restart -- --nocapture`
-  - PASS: `2 passed; 0 failed; 180 filtered out; finished in 1.49s`
-  - Covered tests:
-    - `operator_api::tests::runtime_stall_restart_test_is_forwarded_and_returns_response`
-    - `operator_api::tests::runtime_stall_restart_test_rejects_invalid_mode`
-- `cargo remote -c -- test -p sentinel-daemon restart_agent_fast_path -- --nocapture`
-  - PASS: `1 passed; 0 failed; 181 filtered out; finished in 0.14s`
-  - Covered test:
-    - `orchestrator::tests::test_restart_agent_fast_path_recreates_runtime_and_security_state`
-  - Note: build-server test sandbox logged `bwrap: Can't find source path /work/company`; this did not fail the test and is limited to the remote test fixture path.
-- `cargo remote -c -- build -p sentinel-daemon --release --features fuse`
-  - PASS: `Finished release profile [optimized] target(s) in 56.20s`
-  - artifact hash: `3470152e8b897217e2d2e547549b8f6759b3e733ec53d8a3ea8e00745da8d2bd  target/release/sentinel-daemon`
-- `git diff --check`
-  - PASS: no whitespace/conflict errors.
+- `test-314-verification.md` enthaelt Task-5 Command/Output-Evidence.
+- AC-1 PASS: `ClassifyRequest` `494.9 ns/op` < `1us/op`.
+- AC-2 PASS: `ResolveModelPolicy` `38.43 ns/op` < `1us/op`.
+- AC-3 PASS: `ResponseLogBuffer.Add` `3831 ns/op` < `10us/op`.
+- AC-4 PASS: `benchmem` zeigt `B/op` und `allocs/op`.
+- AC-5 PASS: `/usr/bin/time -v`, `vmstat` und `iostat` erfasst; keine Benchmark-Blockade oder Swap-Fehler.
 
-## Task 6 - Slice D: Worker-Supervision
+## Task 4 - Phase 4: Go-Tests
 
 ### Pre-task self-check
 
-- Was muss getan werden: Worker-Supervision aus Donor `6919e66` path-limited portieren, `service_health` per `catch_unwind` im selben Daemon-Prozess neu starten und einen deterministischen Panic-Testhook bereitstellen.
+- Was muss getan werden:
+  - gezielte Unit-/Regressionstests fuer Request-Klassifikation und Policy-Resolver ergaenzen
+  - Tests fuer `/v1/messages` als externe Compatibility-Klasse absichern
+  - Tests fuer Control-Config-Default und Validation von `agent_runtime_model_policy` ergaenzen
+  - Tests fuer Response-Log-Felder und Ringbuffer-Chronologie ergaenzen
+  - komplette betroffene Gateway-Testpakete laufen lassen
 - Welche ACs muessen hier passen:
-  - AC-1: `service_health`-Worker-Panics werden gefangen und erhoehen `restart_count`, ohne den Daemon-Prozess zu beenden.
-  - AC-2: `POST /operator/runtime/panic-test` akzeptiert nur den erlaubten Worker `service_health`, dispatcht in den ECS-Thread und liefert eine bounded Response.
-  - AC-3: Runtime-Health-Worker-State bleibt beobachtbar: `running`, `restart_count`, `last_error`, `thread_name`.
-  - AC-4: Remote-Tests, FUSE-Release-Build, Artefakt-Hash und `git diff --check` sind gruen.
-- Wie wird bewiesen: Code-Diff, `cargo remote -c -- fmt/test/build`, `sha256sum`, `git diff --check`.
-- Erwartete Dateien: `services/sentinel-daemon/src/service_health.rs`, `runtime_control.rs`, `operator_api.rs`, `orchestrator.rs`, `CHANGELOG.md`.
+  - AC-1: Agent-Runtime wird nur fuer positive numerische Agent-ID nach Ausschluss von Platform-/Service-Pfaden klassifiziert.
+  - AC-2: `/v1/messages` bleibt `external_compat` und bekommt keine Agent-Policy.
+  - AC-3: leeres Modell wird fuer Agent-Runtime zu `haiku`, explizites Modell gewinnt.
+  - AC-4: ungueltige Provider-/Policy-Kombination failt deterministisch.
+  - AC-5: Control-Config setzt standardmaessig `haiku` und akzeptiert nur erlaubte Werte.
+  - AC-6: ResponseLogBuffer liefert chronologische Eintraege nach Ring-Overwrite und `LastByClass` findet den letzten Runtime-Eintrag.
+- Wie wird bewiesen:
+  - `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control`
+  - `go build ./cmd/cortex-gateway`
+- Erwartete Dateien:
+  - `cmd/cortex-gateway/internal/proxy/policy_test.go`
+  - `cmd/cortex-gateway/internal/proxy/response_log_test.go`
+  - vorhandene Tests in `cmd/cortex-gateway/internal/control`
 - Risiken:
-  - Der Panic-Test muss ein kontrollierter Testpfad bleiben und darf keinen Daemon-Crash als PASS werten.
-  - Die bestehende Operator-Auth-/Loopback-Schutzschicht darf nicht umgangen werden.
+  - bestehende Tests koennen alte ResponseLogBuffer-Signatur erwarten; nicht per Compatibility-Wrapper kaschieren, sondern Tests auf neue Struktur aktualisieren.
 
 ### Outcome
 
-- Path-limited donor Slice D was applied from stack donor `6919e66`.
-- `ServiceHealthChecker::spawn()` supervisiert den Worker jetzt in einer Schleife mit `panic::catch_unwind(AssertUnwindSafe(...))`.
-- Ein kontrollierter Panic erhoeht `restart_count`, schreibt `last_error` und startet `service-health-checker` im selben Daemon-Prozess erneut.
-- `ServiceHealthControl::{PanicTest, Shutdown}` steuert Test und sauberen Drop des Workers.
-- `POST /operator/runtime/panic-test` ist verdrahtet:
-  - rejects empty worker
-  - allows only `worker=service_health`
-  - dispatches via `RuntimeControlCommand::PanicTest`
-  - waits with `recv_timeout(10s)`
-- Der Orchestrator behandelt den Panic-Test im ECS-Owner-Thread und ruft `service_health_checker.trigger_panic_test()`.
-- No Haiku/model-policy changes were introduced.
+- `policy_test.go` deckt strikte Klassifikation und Resolver-Reihenfolge ab.
+- `pipeline_test.go` deckt Agent-Runtime-Haiku-Anwendung und externe `/v1/messages`-Trennung ab.
+- `plane_test.go` deckt Default, erlaubte Werte und invaliden `agent_runtime_model_policy` ab.
+- `response_log_test.go` deckt Ringbuffer-Overwrite, chronologische Ausgabe und `LastByClass` ab.
 
 ### Evidence
 
-- `cargo remote -c -- fmt --check`
-  - PASS: no remaining rustfmt diff.
-- `cargo remote -c -- test -p sentinel-daemon runtime_panic_test -- --nocapture`
-  - PASS: `2 passed; 0 failed; 183 filtered out; finished in 0.07s`
-  - Covered tests:
-    - `operator_api::tests::runtime_panic_test_is_forwarded_and_returns_response`
-    - `operator_api::tests::runtime_panic_test_rejects_invalid_worker`
-- `cargo remote -c -- test -p sentinel-daemon panic_test_restarts_worker_in_process -- --nocapture`
-  - PASS: `1 passed; 0 failed; 184 filtered out; finished in 0.25s`
-  - Note: the printed panic/backtrace is expected evidence from the intentional panic-test path; `catch_unwind` catches it and the test passes.
-- `cargo remote -c -- build -p sentinel-daemon --release --features fuse`
-  - PASS: `Finished release profile [optimized] target(s) in 57.79s`
-  - artifact hash: `4400fcb9162fe242f3cbebda550f25175976abc8f444475ab201d0570e43c3d2  target/release/sentinel-daemon`
-- `git diff --check`
-  - PASS: no whitespace/conflict errors.
+- `test-314-verification.md` enthaelt Task-4 Command/Output-Evidence.
+- AC-1 PASS: Tests fuer numerische Agent-ID und Ausschluss von Platform-/Service-Pfaden.
+- AC-2 PASS: Pipeline-Test bestaetigt `/v1/messages` als `external_compat`.
+- AC-3 PASS: Policy- und Pipeline-Tests bestaetigen Haiku fuer Agent-Runtime und explizites Modell als Override.
+- AC-4 PASS: Policy-Test prueft unsupported Provider und unknown Policy als Fehler.
+- AC-5 PASS: Control-Test prueft Default `haiku`, leeres Disable und Rejects.
+- AC-6 PASS: ResponseLogBuffer-Test prueft Ring-Overwrite und `LastByClass`.
+- Command PASS: `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control`.
+- Command PASS: `go build ./cmd/cortex-gateway`.
 
-## Task 7 - Slice E: bounded Analysis-/Recovery-Pfade
+## Task 1 - Phase 1: Issue-Body-Repair, Branch und Preflight
 
 ### Pre-task self-check
 
-- Was muss getan werden: Slice E aus Donor `389b5e6` path-limited portieren, unbounded Analyse-Vorstufen begrenzen, Coalescing-/Drop-Counter sichtbar machen und einen deterministischen Flood-Testhook bereitstellen.
+- Was muss getan werden:
+  - frischen Branch von synchronem `main` verwenden
+  - GitHub-Issue `#314` mit dem Plan-Body reparieren
+  - `quality:needs-spec` entfernen und `quality:ready` setzen
+  - kanonischen Haiku-String fuer den aktuellen `claude-code` Provider pruefen
+  - Platform-Controlplane fuer #314 explizit out-of-scope halten
 - Welche ACs muessen hier passen:
-  - AC-1: Platform-Controlplane-Triggerqueue ist bounded, coalesced Duplikate und droppt aelteste Eintraege bei Ueberlauf.
-  - AC-2: LLM-Analyzer-Channel ist bounded und zaehlt Dropped-Requests statt unbounded Memory-Wachstum zuzulassen.
-  - AC-3: Runtime-Health enthaelt `analysis_queue_depth`, `analysis_queue_dropped_total` und `analysis_queue_coalesced_total`.
-  - AC-4: `POST /operator/runtime/analysis-flood-test` erzeugt kontrollierte Queue-Pressure fuer Live-Verifikation.
-  - AC-5: Remote-Tests, FUSE-Release-Build, Clippy, Artefakt-Hash, Scope-Guard und `git diff --check` sind gruen.
-- Wie wird bewiesen: Code-Diff, `cargo remote -c -- fmt/test/clippy/build`, `sha256sum`, `git diff --check`, Scope-Guard gegen Haiku-/Model-Pinning.
-- Erwartete Dateien: `config/daemon.toml`, `services/sentinel-daemon/src/config.rs`, `operator_api.rs`, `orchestrator.rs`, `platform_controlplane/*`, `runtime_control.rs`, `runtime_health.rs`, `CHANGELOG.md`.
+  - AC-1: Branch basiert sauber auf `origin/main`.
+  - AC-2: GitHub-Issue-Body enthaelt `Scope`, `Out of Scope`, `Benchmarks` und die 6 ACs.
+  - AC-3: Labels zeigen nicht mehr `quality:needs-spec`, sondern `quality:ready`.
+  - AC-4: Haiku-Provider-String ist per Live-Preflight geprueft oder als Blocker dokumentiert.
+  - AC-5: Keine Daemon-Code-Aenderung in Task 1.
+- Wie wird bewiesen:
+  - `git status`, `git rev-list`, `gh issue view/edit`, `ssh ubuntu@10.0.0.240 "/usr/bin/claude -p --model haiku ..."`
+- Erwartete Dateien:
+  - `PROGRESS.md`
+  - optional `issue-314-body.md`
+  - optional `test-314-verification.md`
 - Risiken:
-  - Nur den #279-Queue-Scope portieren, keine Gateway-/Model-Policy.
-  - Analyzer- und Controlplane-Stats muessen zusammengefuehrt werden, damit Runtime-Health nicht nur eine Queue sieht.
-  - Flood-Test muss ueber Operator-API/Runtime-Control laufen und darf kein ungeschuetzter Produktionspfad werden.
+  - `claude -p --model haiku` kann wegen Quota/Auth scheitern; dann Task 1 blockiert nicht den Issue-Body-Repair, aber der kanonische Modellstring muss spaeter vor Deploy final belegt werden.
+  - Issue-Body-Repair ist GitHub-Schreibaktion; Ergebnis muss direkt per `gh issue view` gegengeprueft werden.
 
 ### Outcome
 
-- Path-limited donor Slice E was applied from stack donor `389b5e6`.
-- Added `[daemon.platform_controlplane]` settings:
-  - `llm_trigger_queue_capacity = 16`
-  - `llm_analysis_channel_capacity = 16`
-- `PlatformControlplane` now uses a bounded `VecDeque` trigger queue.
-- Duplicate queued triggers are coalesced and counted via `analysis_queue_coalesced_total`.
-- Overflow drops the oldest trigger and increments `analysis_queue_dropped_total`.
-- `PlatformLlmAnalyzerHandle` now uses a bounded channel sized from config and tracks depth/drop counters.
-- Runtime-Health now publishes merged controlplane/analyzer queue stats.
-- Added `POST /operator/runtime/analysis-flood-test`:
-  - rejects `count=0`
-  - dispatches through `RuntimeControlCommand::AnalysisFloodTest`
-  - injects bounded/coalesced queue pressure in the ECS owner thread
-  - returns `requested`, `queue_depth`, `dropped_total` and `coalesced_total`
-- No Haiku/model-policy changes were introduced; runtime still leaves model selection to the Gateway default.
+- Branch `feat/issue-314-agent-model-policy` wurde von synchronem `main` erstellt.
+- `issue-314-body.md` enthaelt den reparierten GitHub-Issue-Body.
+- `gh issue edit 314` hat den Body aktualisiert, `quality:needs-spec`, `status:triage` und `status:backlog` entfernt sowie `quality:ready` und `status:in-progress` gesetzt.
+- `gh issue view 314` bestaetigt die reparierten Labels und Body-Sektionen.
+- VM-Preflight bestaetigt `haiku` als akzeptierten `claude-code` Modellalias mit Output `PONG`.
 
 ### Evidence
 
-- `cargo remote -c -- fmt --check`
-  - PASS: no remaining rustfmt diff.
-- `cargo remote -c -- test -p sentinel-daemon test_parse_config -- --nocapture`
-  - PASS: `2 passed; 0 failed; 188 filtered out`
-- `cargo remote -c -- test -p sentinel-daemon trigger_queue -- --nocapture`
-  - PASS: `2 passed; 0 failed; 188 filtered out`
-- `cargo remote -c -- test -p sentinel-daemon enqueue_drops_when_bounded_queue_is_full -- --nocapture`
-  - PASS: `1 passed; 0 failed; 189 filtered out`
-- `cargo remote -c -- test -p sentinel-daemon runtime_analysis_flood_test -- --nocapture`
-  - PASS: `2 passed; 0 failed; 188 filtered out; finished in 0.06s`
-- `cargo remote -c -- clippy -p sentinel-daemon --all-targets --features fuse -- -D warnings`
-  - PASS: `Finished dev profile [unoptimized + debuginfo] target(s) in 2m 59s`
-- `cargo remote -c -- build -p sentinel-daemon --release --features fuse`
-  - PASS: `Finished release profile [optimized] target(s) in 56.44s`
-  - artifact hash: `39bf79442190541ec03f11a66c4e8be437f6a8bd1f2e2366611a0d9ad0366cb2  target/release/sentinel-daemon`
-- `git diff --check`
-  - PASS: no whitespace/conflict errors.
-- Scope guard:
-  - `rg -n "AGENT_MODEL_HAIKU|model: AGENT|model: String::new\\(\\).*Gateway" services/sentinel-daemon/src cmd crates || true`
-  - PASS: only `services/sentinel-daemon/src/llm_bridge.rs:612: model: String::new(), // Gateway waehlt default`
+- `test-314-verification.md` enthaelt Task-1 Command/Output-Evidence.
+- AC-1 PASS: Branch basiert auf `origin/main @ 0f1c46c19bfa61d0616b3468834d29b557b3e254`, ahead/behind vor Branch-Erstellung `0/0`.
+- AC-2 PASS: Issue-Body enthaelt `Kontext`, `Scope`, `Out of Scope`, `Acceptance Criteria`, `Benchmarks`, `Verify-Ideen`.
+- AC-3 PASS: Labels enthalten `quality:ready` und `status:in-progress`; alte Spec-/Triage-/Backlog-Labels sind entfernt.
+- AC-4 PASS: VM-Befehl `/usr/bin/claude -p --model haiku ...` lieferte `PONG`.
+- AC-5 PASS: Task 1 aenderte nur `PROGRESS.md`, `docs/issue-314-body.md` und `test-314-verification.md`.
 
-## Task 8 - Slice F: Projection/API-Konvergenz
+## Task 2 - Phase 2: Gateway Policy-Layer
 
 ### Pre-task self-check
 
-- Was muss getan werden: Slice F aus Donor `14560c4` plus relevante Stabilisierung aus `b1e376b` path-limited portieren, Projection-Drift erkennbar machen, Projection-Rebuilds per Request-Datei ausloesen und Restart-Storms vermeiden.
+- Was muss getan werden:
+  - bestehende Gateway-Pipeline, Provider-Konfig und Control-Plane-Strukturen lesen
+  - `request_class` zentral einfuehren
+  - `agent_runtime_model_policy` als Gateway-Konfiguration einfuehren
+  - Resolver-Reihenfolge implementieren: explizites Modell, Agent-Runtime-Policy, Provider-Fallback
+  - Validation fuer unaufloesbare Policy/Provider-Kombinationen fail-closed einbauen
 - Welche ACs muessen hier passen:
-  - AC-1: Projection-Worker konsumiert eine Rebuild-Request-Datei und entfernt sie nach erfolgreichem Full-Rebuild.
-  - AC-2: Projection-Read-Model kann read-only geoeffnet werden, ohne Migrations-/Cleanup-Writes auf Runtime-Health-Reads auszufuehren.
-  - AC-3: Handlerfehler rollen Projection-Batches zurueck statt teilweise fortzuschreiben.
-  - AC-4: Runtime-Health erkennt Projection-Drift gegen Runtime-/Security-/Cgroup-Truth.
-  - AC-5: Runtime-Reconcile fordert bei Drift einen Rebuild an und startet `sentinel-projection` nicht neu, solange der Service aktiv ist und in-place rebuilden kann.
-  - AC-6: Remote-Tests, Clippy, Release-Builds, Artefakt-Hashes und Scope-Guard sind gruen.
-- Wie wird bewiesen: Code-Diff, `cargo remote -c -- fmt/test/clippy/build`, `sha256sum`, `git diff --check`, Scope-Guard gegen Haiku-/Model-Pinning.
-- Erwartete Dateien: `crates/sentinel-projection/*`, `services/sentinel-projection/src/main.rs`, `services/sentinel-daemon/src/runtime_health.rs`, `runtime_control.rs`, `orchestrator.rs`, `service_health.rs`, `operator_api.rs`, `CHANGELOG.md`.
+  - AC-1: `external_compat`, `agent_runtime`, `platform_controlplane`, `service_internal`, `internal_other` sind als klare Klassen modelliert.
+  - AC-2: `agent_runtime` erfordert positive numerische `agent_id` und schliesst `platform_analysis`, `request_type`, `sentinel-judge`, `PLATFORM-CONTROLPLANE` aus.
+  - AC-3: Leeres Modell wird nur fuer `agent_runtime` zu Haiku resolved.
+  - AC-4: Explizites Request-Modell gewinnt.
+  - AC-5: `/v1/messages` bleibt bei `PreferredProvider=anthropic-direct` und bekommt keine Agent-Policy.
+  - AC-6: Ungueltige Policy/Provider-Kombination wird nicht still auf Opus zurueckfallen.
+- Wie wird bewiesen:
+  - gezielte Go-Tests in Task 4
+  - fuer Task 2 zusaetzlich strukturelle Inspection und `go test` fuer betroffene Packages, sobald Code geaendert ist
+- Erwartete Dateien:
+  - `cmd/cortex-gateway/internal/proxy/policy.go`
+  - `cmd/cortex-gateway/internal/proxy/provider.go`
+  - `cmd/cortex-gateway/internal/proxy/pipeline.go`
+  - `cmd/cortex-gateway/main.go`
+  - ggf. `cmd/cortex-gateway/internal/control/plane.go`
 - Risiken:
-  - Projection-Recovery darf keine Restart-Schleife erzeugen.
-  - Runtime-Health darf keine Projection-Migrationen oder Startup-Cleanup nebenbei ausfuehren.
-  - Slice F darf keine FUSE/Landlock- oder Gateway-/Model-Policy-Arbeit einschleppen.
+  - aktuelle Config-Strukturen koennen in `control` statt `proxy` liegen; keine neue Parallel-Konfig bauen, sondern bestehende Patterns nutzen.
+  - Response-Observability gehoert erst in Task 3; Task 2 soll Policy-Entscheidung und Request-Klassen sauber schneiden.
 
 ### Outcome
 
-- Path-limited Slice F was applied from stack donor `14560c4` plus relevant stabilization from `b1e376b`.
-- `ProjectionConfig` now carries `rebuild_request_path` and a `1s` poll interval.
-- `ProjectionWorker` now polls `.projection-rebuild-request`, runs a full rebuild in-place, and removes the request file after success.
-- Projection batch handler failures now rollback the transaction and return an error instead of silently skipping failed events.
-- `ReadModelStore::open_readonly()` opens Projection DB read-only with a busy timeout and does not run migrations or startup cleanup.
-- Runtime-Health uses read-only Projection access and reports:
-  - `projection_drift_detected`
-  - `projection_drift_agents`
-- Runtime-Reconcile writes rebuild request payloads with a reason and reports:
-  - `projection_drift_before`
-  - `projection_drift_after`
-  - `projection_restart_attempted`
-  - `projection_restart_succeeded`
-- Runtime-Reconcile deliberately skips `systemctl restart sentinel-projection` when Projection is already active and a request-file rebuild can run in-place.
-- `service_health::restart_service()` now calls `systemctl reset-failed` before restart when a restart is actually required.
-- No Haiku/model-policy changes were introduced; runtime still leaves model selection to the Gateway default.
+- `cmd/cortex-gateway/internal/proxy/policy.go` neu eingefuehrt.
+- `LLMRequest` traegt jetzt `RequestClass`, `EffectiveModel` und `PolicySource` als interne Felder.
+- `control.ConfigSnapshot` und `control.Config` enthalten `AgentRuntimeModelPolicy`.
+- Default fuer `agent_runtime_model_policy` ist `haiku`.
+- `pipeline.ServeHTTP` klassifiziert Requests frueh, wendet die Modellpolicy aber erst im echten Forward-Pfad vor Streaming/Provider.Send an.
+- Die erste Testiteration zeigte eine Pre-Synthesis-Blockade; diese wurde durch Verschieben der Policy-Anwendung behoben.
+- Testprovider `mock` mappt `haiku` fuer bestehende Gateway-Tests; unbekannte Provider bleiben fail-closed.
 
 ### Evidence
 
-- `cargo remote -c -- fmt --check`
-  - PASS: no remaining rustfmt diff.
-- `cargo remote -c -- test -p sentinel-projection rebuild_request -- --nocapture`
-  - PASS: `1 passed; 0 failed`
-- `cargo remote -c -- test -q -p sentinel-projection -- --nocapture`
-  - PASS: `7 unit + 6 acceptance tests passed`
-- `cargo remote -c -- test -q -p sentinel-daemon runtime_control -- --nocapture`
-  - PASS: `2 passed`
-- `cargo remote -c -- test -q -p sentinel-daemon runtime_health -- --nocapture`
-  - PASS: `4 passed`
-- `cargo remote -c -- test -q -p sentinel-daemon test_runtime_reconcile_skips_projection_restart_when_rebuild_can_run_in_place -- --nocapture`
-  - PASS: `1 passed`
-- `cargo remote -c -- clippy -q -p sentinel-projection --all-targets -- -D warnings`
-  - PASS: exit `0`
-- `cargo remote -c -- clippy -q -p sentinel-projection-service --all-targets -- -D warnings`
-  - PASS: exit `0`
-- `cargo remote -c -- clippy -q -p sentinel-daemon --all-targets --features fuse -- -D warnings`
-  - PASS: exit `0`
-- `cargo remote -c -- build -q -p sentinel-daemon --release --features fuse`
-  - PASS: exit `0`
-  - artifact hash: `3a05fc872c061ae973e3d820e0a1aaa2d0a909b201d61e9b0c8c84b080c08425  target/release/sentinel-daemon`
-- `cargo remote -c -- build -q -p sentinel-projection-service --release`
-  - PASS: exit `0`
-  - artifact hash: `d0da3c42b11397e1c954777397c4b3622cfeeb4365fff2adebbded9adacb13b4  target/release/sentinel-projection`
+- `test-314-verification.md` enthaelt Task-2 Command/Output-Evidence.
+- AC-1 PASS: `RequestClassExternalCompat`, `RequestClassAgentRuntime`, `RequestClassPlatformControlplane`, `RequestClassServiceInternal`, `RequestClassInternalOther` in `policy.go`.
+- AC-2 PASS: `ClassifyRequest()` prueft `/v1/messages`, `platform_analysis`, `request_type`, Service-Identitaeten und erst danach numerische Agent-ID.
+- AC-3 PASS: `ResolveModelPolicy()` setzt Haiku nur fuer `RequestClassAgentRuntime` ohne explizites Modell.
+- AC-4 PASS: explizites Request-Modell gewinnt mit `PolicySourceRequestOverride`.
+- AC-5 PASS: `/v1/messages` bleibt `PreferredProvider=anthropic-direct` und `RequestClassExternalCompat`.
+- AC-6 PASS: nicht unterstuetzte Provider liefern `model policy rejected`, kein stiller Opus-Fallback.
+- Command PASS: `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control`.
+- Command PASS: `go build ./cmd/cortex-gateway`.
 
-## Task 9 - Slice G: Conditional FUSE/Landlock Runtime Restore
+## Task 3 - Phase 3: Observability und Response Log
 
 ### Pre-task self-check
 
-- Was muss getan werden: Slice G nur soweit umsetzen, wie der canonical-main-Reset es fuer Runtime-Konsistenz rechtfertigt: kein #264-Port, kein Gateway-/Model-Scope, sondern FUSE-Aktivierung fail-closed und Landlock-Exec-Pfade runtime-faehig halten.
+- Was muss getan werden:
+  - `traffic-stats` um Agent-Runtime-Policy und letzten effektiven Runtime-Forward erweitern
+  - `ResponseLogEntry` um `request_class`, `model`, `policy_source`, `agent_id`, `agent_name` erweitern
+  - Journal-Logs fuer Success-, Stream- und Provider-Error-Pfade mit Request-Klasse und Policy-Feldern anreichern
+  - pruefen, ob `ResponseLogBuffer` wegen Hot-Path-Kopieren auf bounded circular buffer umgebaut werden muss
 - Welche ACs muessen hier passen:
-  - AC-1: `fs_mount` wird nur an Sandbox, Operator-API und ECS weitergegeben, wenn `sentinel-fs` wirklich als FUSE-Mount aktiv ist.
-  - AC-2: Wenn der FUSE-Mount nicht aktiv wird, laeuft die Runtime explizit ueber `/ram/agents` weiter statt auf einen leeren Mountpoint zu zeigen.
-  - AC-3: Landlock bleibt eng und erlaubt Execute nicht wieder pauschal fuer `/usr` oder `/lib`.
-  - AC-4: Dynamische ELF-Binaries koennen weiter starten, weil die notwendigen Loader explizit erlaubt sind.
-  - AC-5: Remote-Tests, Clippy, FUSE-Builds, Sandbox-Binary-Build, Scope-Guard und `git diff --check` sind gruen.
-- Wie wird bewiesen: Code-Diff, `cargo remote -c -- fmt/test/clippy/build`, `sha256sum`, `git diff --check`, Scope-Guard gegen Haiku-/Model-Pinning.
-- Erwartete Dateien: `services/sentinel-daemon/src/orchestrator.rs`, `crates/sentinel-sandbox/src/landlock.rs`, `CHANGELOG.md`.
+  - AC-1: Traffic-Stats zeigen `agent_runtime_model_policy`, `last_agent_runtime_effective_model`, `last_agent_runtime_policy_source`.
+  - AC-2: Traffic-Responses zeigen redigiert `request_class`, `provider`, `model`, `policy_source`, `agent_id`, `agent_name`.
+  - AC-3: Success-, Stream- und Error-Logs enthalten die neuen Felder.
+  - AC-4: keine Header, Tokens oder Secrets werden in Response-Log/Stats aufgenommen.
+  - AC-5: Response-Log-Append bleibt bounded und ohne O(n)-Kopie im steady state, falls Benchmarks das erzwingen.
+- Wie wird bewiesen:
+  - Go-Tests/Build nach Edit
+  - strukturelle Inspection fuer Secret-Freiheit
+  - Benchmarks folgen in Task 5
+- Erwartete Dateien:
+  - `cmd/cortex-gateway/internal/proxy/response_log.go`
+  - `cmd/cortex-gateway/internal/proxy/pipeline.go`
+  - `cmd/cortex-gateway/main.go`
+  - Tests in `cmd/cortex-gateway/internal/proxy` und ggf. `cmd/cortex-gateway/internal/control`
 - Risiken:
-  - FUSE darf nicht blind als aktiv gelten, nur weil `fs_mount` konfiguriert ist.
-  - Landlock darf nicht durch breite `/usr`-/`/lib`-Exec-Allowlists verwässert werden.
-  - Slice G darf keine #264-Security-ACs oder Haiku-/Gateway-Policy einschleppen.
+  - `traffic-stats` lebt in `main.go` und muss ohne zusaetzliche globale State-Duplikation an Gateway-Daten kommen.
+  - Error-Logs muessen AC-4 belegen koennen, auch wenn `/v1/messages` mit Dummy-Key fehlschlaegt.
 
 ### Outcome
 
-- `mountinfo_contains_mountpoint()` prueft jetzt exakt auf Mountpoint, FUSE-Filesystem und `sentinel-fs` als Mount-Source.
-- `wait_for_fuse_mount()` wartet bounded bis zu 2s auf den FUSE-Mount und prueft danach final erneut.
-- Der Daemon berechnet `active_fs_mount` und gibt nur diesen aktiven Mount an Sandbox, Operator-API und ECS weiter.
-- Wenn `config.fs_mount` gesetzt ist, aber kein tragfaehiger FUSE-Mount aktiv wird, loggt der Daemon eine Warnung und nutzt weiter `/ram/agents`.
-- Landlock `default_exec_paths()` bleibt eng:
-  - `/usr/bin/agent-runtime`
-  - `/breakout-helper`
-  - `/lib64/ld-linux-x86-64.so.2`
-  - `/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2`
-- Tests sichern ab, dass `/usr` nicht als pauschaler Exec-Pfad zurueckkommt.
-- No Haiku/model-policy changes were introduced; runtime still leaves model selection to the Gateway default.
+- `traffic-stats` liest die Control-Konfiguration einmal pro Request und exportiert `agent_runtime_model_policy`.
+- Wenn ein Agent-Runtime-Forward im Response-Log existiert, exportiert `traffic-stats` zusaetzlich `last_agent_runtime_effective_model`, `last_agent_runtime_policy_source` und `last_agent_runtime_provider`.
+- `ResponseLogEntry` wurde um `request_class`, `model`, `policy_source`, `agent_id` und `agent_name` erweitert; Header, Tokens und Secrets werden nicht gespeichert.
+- Provider-Success-, Provider-Error-, Stream-Success- und Stream-Error-Logs tragen jetzt Request-Klasse, effektives Modell, Policy-Source und Agent-Metadaten.
+- `ResponseLogBuffer` wurde auf einen bounded circular buffer umgestellt; `Add()` ueberschreibt bei vollem Buffer ohne Slice-Restkopie.
 
 ### Evidence
 
-- `cargo remote -c -- test -q -p sentinel-daemon mountinfo_contains_mountpoint_matches_exact_sentinel_fuse_mount --features fuse -- --nocapture`
-  - PASS: targeted FUSE-mountinfo test passed.
-- `cargo remote -c -- test -q -p sentinel-sandbox ruleset_for_agent_paths -- --nocapture`
-  - PASS: Landlock-Agent-Ruleset-Test passed and confirms no `/usr` exec path.
-- `cargo remote -c -- fmt --check`
-  - PASS: no remaining rustfmt diff.
-- `cargo remote -c -- test -q -p sentinel-sandbox -- --nocapture`
-  - PASS: `44 tests: 41 passed, 3 ignored`; `16 tests: 14 passed, 2 ignored`; `12 tests: 3 passed, 9 ignored`.
-- `cargo remote -c -- clippy -q -p sentinel-sandbox --all-targets -- -D warnings`
-  - PASS: exit `0`.
-- `cargo remote -c -- clippy -q -p sentinel-daemon --all-targets --features fuse -- -D warnings`
-  - PASS: exit `0`.
-- `cargo remote -c -- build -q -p sentinel-daemon --release --features fuse`
-  - PASS: exit `0`.
-- `cargo remote -c -- build -q -p sentinel-sandbox --release --bins`
-  - PASS: exit `0`.
-- `cargo remote -c -- test -q -p sentinel-fs --features fuse-tests -- --nocapture`
-  - PASS: `93 passed`; `19 passed`; `2 ignored`.
-- `cargo remote -c -- clippy -q -p sentinel-fs --all-targets --features fuse-tests -- -D warnings`
-  - PASS: exit `0`.
-- `git diff --check`
-  - PASS: no whitespace/conflict errors.
-- Scope guard:
-  - `rg -n "AGENT_MODEL_HAIKU|model: AGENT|model: String::new\\(\\).*Gateway" services/sentinel-daemon/src cmd crates`
-  - PASS: only `services/sentinel-daemon/src/llm_bridge.rs:612: model: String::new(), // Gateway waehlt default`.
-- Artifact hashes:
-  - `517a9c6a14da0a4d4cd761b74cd7e37d1e2aaa9f24ec4329a7585f0c45638338  target/release/sentinel-daemon`
-  - `a3d35bdf5261a617546a19a380f731dba89dc6f24327f4dca1eff4783a05a31d  target/release/landlock-wrapper`
-  - `03abe24e93222b540bf36bbedf0d5c259780bea0f53c79386086c44d22e40be8  target/release/breakout-helper`
-
-## Task 10 - Out-of-scope Follow-up: Haiku-Policy
-
-### Pre-task self-check
-
-- Was muss getan werden: Haiku-/Agent-Model-Policy nicht in #279 implementieren, sondern als separates Gateway-/Inference-Follow-up sichern.
-- Welche ACs muessen hier passen:
-  - AC-1: Es gibt keine Haiku-/Model-Pinning-Aenderung im #279-Branch.
-  - AC-2: Bestehende Issues wurden geprueft, damit kein Duplikat erzeugt wird.
-  - AC-3: Wenn kein passendes Issue existiert, wird ein eigenes Follow-up erstellt.
-  - AC-4: #279 dokumentiert die Scope-Entscheidung.
-- Wie wird bewiesen: GitHub-Issue-Suche, neues Issue, Kommentar auf #279, Scope-Guard aus Task 9.
-- Erwartete Dateien: `PROGRESS.md`.
-- Risiken:
-  - Die fachliche Entscheidung "Agents sollen Haiku nutzen" darf nicht durch Daemon-Hardcoding umgesetzt werden.
-  - #279 darf dadurch keine neue Close-Bedingung bekommen.
-
-### Outcome
-
-- GitHub-Suche nach Haiku-/Model-Policy-Themen fand kein passendes offenes Follow-up.
-- Neues Issue erstellt: `#314 Policy: Agent LLM model defaults via Gateway/Inference layer`.
-- `#314` definiert Haiku als Agent-Runtime-Default in Gateway/Inference, nicht im Daemon.
-- #279 kommentiert mit Scope-Entscheidung und Link auf #314.
-- No Haiku/model-policy changes were introduced; runtime still leaves model selection to the Gateway default.
-
-### Evidence
-
-- `gh issue list --repo silentspike/project-sentinel --state all --search "Haiku in:title" --limit 20 --json number,title,state,labels,url`
-  - PASS: no matching existing Haiku policy issue.
-- `gh issue list --repo silentspike/project-sentinel --state all --search "model in:title" --limit 20 --json number,title,state,labels,url`
-  - PASS: only unrelated/closed historical model issues found.
-- `gh issue create ...`
-  - PASS: created `https://github.com/silentspike/project-sentinel/issues/314`.
-- `gh issue comment 279 ...`
-  - PASS: created `https://github.com/silentspike/project-sentinel/issues/279#issuecomment-4304109979`.
-- Scope guard inherited from Task 9:
-  - `services/sentinel-daemon/src/llm_bridge.rs:612: model: String::new(), // Gateway waehlt default`
-
-## Task 11 - Phase 3: Tests, Clippy, Builds
-
-### Pre-task self-check
-
-- Was muss getan werden: die komplette Remote-Qualitaetsmatrix fuer #279 ausfuehren, inklusive conditional FUSE/Landlock-Gates, Release-Artefakte erzeugen und Scope-/Whitespace-Guards belegen.
-- Welche ACs muessen hier passen:
-  - AC-1: Daemon-, Projection- und Projection-Service-Tests laufen auf dem Remote-Builder gruen.
-  - AC-2: Clippy ist fuer alle beruehrten Rust-Crates gruen.
-  - AC-3: Release-Artefakte fuer Daemon, Projection und Sandbox-Helper existieren lokal nach Remote-Build.
-  - AC-4: conditional FUSE/Landlock-Gates bleiben nach allen Slices gruen.
-  - AC-5: `git diff --check` und Haiku-/Model-Scope-Guard sind gruen.
-- Wie wird bewiesen: ausschliesslich `cargo remote -c --` fuer Rust, danach lokale `git diff --check`, `rg` Scope-Guard und `sha256sum`.
-- Erwartete Dateien: `PROGRESS.md`, `test-279-verification.md`; keine Code-Aenderungen.
-- Risiken:
-  - Der Daemon-Test enthaelt einen erwarteten kontrollierten Panic-Test; PASS ist nur gueltig, wenn `catch_unwind` den Test abfaengt und der Testprozess erfolgreich endet.
-  - Release-Hashes muessen die finalen Artefakte fuer Task 12 sein.
-
-### Outcome
-
-- Full daemon test suite passed on the remote builder:
-  - `193 passed; 0 failed; 0 ignored; finished in 10.29s`
-  - expected controlled `panic-test requested for service_health` output was caught by the worker-supervision test.
-- Projection tests passed on the remote builder:
-  - `sentinel-projection`: `7 passed` and `6 passed`
-  - `sentinel-projection-service`: `0 tests`, exit `0`
-- Clippy passed for:
-  - `sentinel-daemon --all-targets --features fuse`
-  - `sentinel-projection --all-targets`
-  - `sentinel-projection-service --all-targets`
-  - `sentinel-fs --all-targets --features fuse-tests`
-  - `sentinel-sandbox --all-targets`
-- Release builds passed for:
-  - `sentinel-daemon --release --features fuse`
-  - `sentinel-projection-service --release`
-  - `sentinel-sandbox --release --bins`
-- Conditional FUSE/Landlock tests were repeated and remained green:
-  - `sentinel-fs --features fuse-tests`: `93 passed`, `19 passed`, `2 ignored`
-  - `sentinel-sandbox`: `41 passed, 3 ignored`; `14 passed, 2 ignored`; `3 passed, 9 ignored`
-- No Haiku/model-policy change was introduced; runtime still leaves model selection to the Gateway default.
-
-### Evidence
-
-- `cargo remote -c -- test -q -p sentinel-daemon -- --nocapture`
-  - PASS: `193 passed; 0 failed; 0 ignored; finished in 10.29s`.
-- `cargo remote -c -- test -q -p sentinel-projection -- --nocapture`
-  - PASS: `7 passed`; `6 passed`; no failures.
-- `cargo remote -c -- test -q -p sentinel-projection-service -- --nocapture`
-  - PASS: `0 tests`, exit `0`.
-- `cargo remote -c -- clippy -q -p sentinel-daemon --all-targets --features fuse -- -D warnings`
-  - PASS: exit `0`.
-- `cargo remote -c -- clippy -q -p sentinel-projection --all-targets -- -D warnings`
-  - PASS: exit `0`.
-- `cargo remote -c -- clippy -q -p sentinel-projection-service --all-targets -- -D warnings`
-  - PASS: exit `0`.
-- `cargo remote -c -- build -q -p sentinel-daemon --release --features fuse`
-  - PASS: exit `0`.
-- `cargo remote -c -- build -q -p sentinel-projection-service --release`
-  - PASS: exit `0`.
-- `cargo remote -c -- test -q -p sentinel-fs --features fuse-tests -- --nocapture`
-  - PASS: `93 passed; 19 passed; 2 ignored`.
-- `cargo remote -c -- test -q -p sentinel-sandbox -- --nocapture`
-  - PASS: `44 tests: 41 passed, 3 ignored`; `16 tests: 14 passed, 2 ignored`; `12 tests: 3 passed, 9 ignored`.
-- `cargo remote -c -- clippy -q -p sentinel-fs --all-targets --features fuse-tests -- -D warnings`
-  - PASS: exit `0`.
-- `cargo remote -c -- clippy -q -p sentinel-sandbox --all-targets -- -D warnings`
-  - PASS: exit `0`.
-- `cargo remote -c -- build -q -p sentinel-sandbox --release --bins`
-  - PASS: exit `0`.
-- `git diff --check`
-  - PASS: no whitespace/conflict errors.
-- Scope guard:
-  - `rg -n "AGENT_MODEL_HAIKU|model: AGENT|model: String::new\\(\\).*Gateway" services/sentinel-daemon/src cmd crates`
-  - PASS: only `services/sentinel-daemon/src/llm_bridge.rs:612: model: String::new(), // Gateway waehlt default`.
-- Artifact hashes:
-  - `517a9c6a14da0a4d4cd761b74cd7e37d1e2aaa9f24ec4329a7585f0c45638338  target/release/sentinel-daemon`
-  - `d0da3c42b11397e1c954777397c4b3622cfeeb4365fff2adebbded9adacb13b4  target/release/sentinel-projection`
-  - `a3d35bdf5261a617546a19a380f731dba89dc6f24327f4dca1eff4783a05a31d  target/release/landlock-wrapper`
-  - `03abe24e93222b540bf36bbedf0d5c259780bea0f53c79386086c44d22e40be8  target/release/breakout-helper`
-
-## Task 14 - Benchmarks
-
-### Pre-task self-check
-
-- Was muss getan werden: issue-spezifische Benchmarks fuer Runtime-Reconcile, Projection-Drift-Detection, bounded Analysis-Flood und Stall-Recovery-Bookkeeping auf der Deploy-VM messen.
-- Welche ACs muessen hier passen:
-  - AC-1: Benchmarks messen serverseitige Runtime-Pfade, nicht HTTP-Wallclock mit 1-Hz-Tick-Wartezeit.
-  - AC-2: Sidecar-Monitoring fuer RAM, CPU, IOPS und Prozesszustand liegt pro Lauf vor.
-  - AC-3: finaler VM-Zustand bleibt healthy: `expected/runtime/projection/cgroups = 26/26/26/26`, keine stale/orphan/zombie/drift-Treffer.
-  - AC-4: `journalctl` seit Benchmark-Start zeigt keine Panic-/Drift-Regressionsmarker.
-- Wie wird bewiesen: `cargo remote -c --`, Deploy-Hash, `/opt/sentinel/scripts/vm-issue-279-bench.sh`, Sidecar-Artefakte unter `/tmp/issue279-bench-20260423T132030Z`.
-- Erwartete Dateien: `scripts/vm-issue-279-bench.sh`, `PROGRESS.md`, `test-279-verification.md`, `CHANGELOG.md`.
-- Risiken:
-  - HTTP-End-to-End-Zeit ist fuer diese Benchmarks nicht geeignet, weil Runtime-Control-Befehle im ECS-Tick abgearbeitet werden; deshalb wurden serverseitige Timing-Felder ergaenzt.
-
-### Outcome
-
-- Runtime-Control und Runtime-Health liefern benchmarkfaehige serverseitige Timing-Felder:
-  - `RuntimeReconcileResponse.elapsed_us`
-  - `RuntimeHealthSnapshot.snapshot_build_elapsed_us`
-  - `RuntimeAnalysisFloodTestResponse.enqueue_per_request_ns`
-  - `RuntimeStallRestartTestResponse.bookkeeping_elapsed_ns`
-- Remote-Qualitaetsmatrix nach Instrumentierung ist gruen:
-  - `cargo remote -c -- fmt --all`
-  - `cargo remote -c -- test -q -p sentinel-daemon -- --nocapture`: `194 passed`
-  - `cargo remote -c -- clippy -q -p sentinel-daemon --all-targets --features fuse -- -D warnings`
-  - `cargo remote -c -- build -q -p sentinel-daemon --release --features fuse`
-- VM-Deploy erfolgte am systemd-`ExecStart`-Pfad `/opt/sentinel/bin/sentinel-daemon --config /opt/sentinel/config/daemon.toml`.
-- VM-Binary-Hash: `7d105283937f92a98bbf2dbd89fc44f8f86128b92a935042c328dac3e8c2756d`.
-- Benchmark PASS:
-  - `runtime_reconcile_26_agents`: `2134us < 5000us`
-  - `projection_divergence_detection`: `817us < 5000us`
-  - `analysis_flood_cap`: `148ns/request < 250000ns/request`
-  - `stall_recovery_bookkeeping`: `700ns < 50000ns`
-- Finaler VM-Gate blieb healthy: `expected/runtime/projection/cgroups = 26/26/26/26`, `stale=0`, `orphans=0`, `zombies=0`, `drift=false`.
-
-### Evidence
-
-- `cargo remote -c -- fmt --all`
-  - PASS: exit `0`.
-- `cargo remote -c -- test -q -p sentinel-daemon -- --nocapture`
-  - PASS: `194 passed; 0 failed`.
-- `cargo remote -c -- clippy -q -p sentinel-daemon --all-targets --features fuse -- -D warnings`
-  - PASS: exit `0`.
-- `cargo remote -c -- build -q -p sentinel-daemon --release --features fuse`
-  - PASS: exit `0`.
-- `sha256sum target/release/sentinel-daemon`
-  - PASS: `7d105283937f92a98bbf2dbd89fc44f8f86128b92a935042c328dac3e8c2756d  target/release/sentinel-daemon`.
-- Deploy:
-  - `ssh ubuntu@10.0.0.240 "grep ExecStart /etc/systemd/system/sentinel-daemon.service"`
-  - PASS: `ExecStart=/opt/sentinel/bin/sentinel-daemon --config /opt/sentinel/config/daemon.toml`.
-  - `scp target/release/sentinel-daemon ubuntu@10.0.0.240:/tmp/sentinel-daemon.issue279-bench`
-  - `ssh ubuntu@10.0.0.240 "sudo install -m 755 /tmp/sentinel-daemon.issue279-bench /opt/sentinel/bin/sentinel-daemon && sudo systemctl restart sentinel-daemon"`
-  - PASS: service active, VM hash matches `7d105283937f92a98bbf2dbd89fc44f8f86128b92a935042c328dac3e8c2756d`.
-- Benchmark:
-  - `scp scripts/vm-issue-279-bench.sh ubuntu@10.0.0.240:/tmp/vm-issue-279-bench.sh`
-  - `ssh ubuntu@10.0.0.240 "sudo install -m 755 /tmp/vm-issue-279-bench.sh /opt/sentinel/scripts/vm-issue-279-bench.sh && /opt/sentinel/scripts/vm-issue-279-bench.sh"`
-  - PASS: `BENCH_PASS out_dir=/tmp/issue279-bench-20260423T132030Z`.
-- Sidecars:
-  - `/tmp/issue279-bench-20260423T132030Z/free-before.txt`
-  - `/tmp/issue279-bench-20260423T132030Z/free-after.txt`
-  - `/tmp/issue279-bench-20260423T132030Z/vmstat-before.txt`
-  - `/tmp/issue279-bench-20260423T132030Z/vmstat-after.txt`
-  - `/tmp/issue279-bench-20260423T132030Z/iostat-before.txt`
-  - `/tmp/issue279-bench-20260423T132030Z/iostat-after.txt`
-  - `/tmp/issue279-bench-20260423T132030Z/ps-before.txt`
-  - `/tmp/issue279-bench-20260423T132030Z/ps-after.txt`
-- Final service gate:
-  - `sentinel-daemon`, `sentinel-projection`, `sentinel-gateway`, `sentinel-nats-bridge`: all `active`.
-  - `journalctl -u sentinel-daemon --since <benchmark-start>` panic/drift marker scan: empty.
+- `test-314-verification.md` enthaelt Task-3 Command/Output-Evidence.
+- AC-1 PASS: `main.go` exportiert `agent_runtime_model_policy` und letzte Agent-Runtime-Policy-Felder.
+- AC-2 PASS: `ResponseLogEntry` enthaelt redigierte Policy-/Agent-Felder.
+- AC-3 PASS: Success-, Stream- und Error-Logs enthalten Request-Klasse, effektives Modell und Policy-Source.
+- AC-4 PASS: Neue Response-Log-/Stats-Felder enthalten keine Header, API-Keys oder Tokenwerte.
+- AC-5 PASS: `ResponseLogBuffer.Add()` bleibt bounded und hat im steady state keine O(n)-Kopie.
+- Command PASS: `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control`.
+- Command PASS: `go build ./cmd/cortex-gateway`.
