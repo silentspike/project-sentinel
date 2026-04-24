@@ -186,3 +186,56 @@ func BenchmarkAnthropicDirectRequestAssembly(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkClassifyRequestAgentRuntime(b *testing.B) {
+	req := &LLMRequest{Metadata: map[string]string{
+		"agent_id":   "12",
+		"agent_name": "Thomas Mueller",
+		"room_id":    "buero-ceo",
+	}}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if got := ClassifyRequest("/internal/llm", req); got != RequestClassAgentRuntime {
+			b.Fatalf("ClassifyRequest() = %q, want %q", got, RequestClassAgentRuntime)
+		}
+	}
+}
+
+func BenchmarkResolveModelPolicyAgentRuntime(b *testing.B) {
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		got, err := ResolveModelPolicy("claude-code", RequestClassAgentRuntime, "", AgentRuntimeModelPolicyHaiku)
+		if err != nil {
+			b.Fatalf("ResolveModelPolicy() error: %v", err)
+		}
+		if got.Model != "haiku" || got.Source != PolicySourceAgentRuntime {
+			b.Fatalf("ResolveModelPolicy() = %+v, want haiku/%s", got, PolicySourceAgentRuntime)
+		}
+	}
+}
+
+func BenchmarkResponseLogBufferAdd(b *testing.B) {
+	buffer := NewResponseLogBuffer(128)
+	entry := ResponseLogEntry{
+		RequestID:    "bench-request",
+		RequestClass: RequestClassAgentRuntime,
+		Provider:     "claude-code",
+		Model:        "haiku",
+		PolicySource: PolicySourceAgentRuntime,
+		AgentID:      "12",
+		AgentName:    "Thomas Mueller",
+		Content:      "ok",
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		buffer.Add(entry)
+	}
+}

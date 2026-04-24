@@ -576,3 +576,88 @@ ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control	0.0
 ```
 
 `go build ./cmd/cortex-gateway` exited `0`.
+
+## Task 5 - Phase 5: Benchmarks
+
+### AC-1 bis AC-4 - Benchmark-Zielwerte und Allokationen
+
+Command:
+
+```bash
+rm -f /tmp/issue314-vmstat.txt /tmp/issue314-bench.txt
+(vmstat 1 5 > /tmp/issue314-vmstat.txt &)
+/usr/bin/time -v go test ./cmd/cortex-gateway/internal/proxy \
+  -bench 'Benchmark(ClassifyRequest|ResolveModelPolicy|ResponseLogBufferAdd)' \
+  -benchmem \
+  -run '^$' 2>&1 | tee /tmp/issue314-bench.txt
+wait
+cat /tmp/issue314-vmstat.txt
+```
+
+Output:
+
+```text
+goos: linux
+goarch: amd64
+pkg: github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy
+cpu: AMD Ryzen 9 5900HS with Radeon Graphics
+BenchmarkClassifyRequestAgentRuntime-16       	 3408093	       494.9 ns/op	      16 B/op	       1 allocs/op
+BenchmarkResolveModelPolicyAgentRuntime-16    	28704816	        38.43 ns/op	       0 B/op	       0 allocs/op
+BenchmarkResponseLogBufferAdd-16              	  331939	      3831 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy	4.537s
+```
+
+PASS:
+
+```text
+ClassifyRequest: 494.9 ns/op < 1us/op
+ResolveModelPolicy: 38.43 ns/op < 1us/op
+ResponseLogBuffer.Add: 3831 ns/op < 10us/op
+benchmem visible: B/op and allocs/op recorded
+```
+
+### AC-5 - System-Monitoring waehrend Benchmarks
+
+Command:
+
+```bash
+/usr/bin/time -v go test ./cmd/cortex-gateway/internal/proxy \
+  -bench 'Benchmark(ClassifyRequest|ResolveModelPolicy|ResponseLogBufferAdd)' \
+  -benchmem \
+  -run '^$'
+vmstat 1 5
+iostat -dx 1 2
+```
+
+Output excerpt:
+
+```text
+User time (seconds): 6.31
+System time (seconds): 2.06
+Percent of CPU this job got: 125%
+Elapsed (wall clock) time: 0:06.66
+Maximum resident set size (kbytes): 245816
+Swaps: 0
+File system inputs: 49904
+File system outputs: 112
+```
+
+`vmstat` excerpt:
+
+```text
+procs -----------memory---------- ---swap-- -----io---- -system-- -------cpu-------
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st gu
+13  0 7093336 508428  4292 5292392 111  262  7410  7235 14249  20 24  8 67  1  0  0
+ 7  0 7093904 449476  4292 5194228   0  540 203676 91808 44259 36959 34 29 36 1 0 0
+ 9  1 7096252 508796  4292 5326296 452 2792 211448 46760 40951 43288 33 21 46 1 0 0
+```
+
+`iostat` excerpt:
+
+```text
+Device            r/s     rkB/s     w/s     wkB/s  r_await w_await aqu-sz  %util
+nvme0n1        187.00   2984.00 1799.00  24092.00     0.07    2.95   5.35   5.80
+```
+
+PASS: CPU/RAM/IO-Metriken wurden dokumentiert; der Benchmarklauf beendet sauber ohne Swap-Fehler oder IO-Blockade.

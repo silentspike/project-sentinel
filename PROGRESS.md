@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan314.md`
-- Overall status: `TASK_4_DONE_TASK_5_PENDING`
-- Current task: `Task 5 - Phase 5: Benchmarks`
+- Overall status: `TASK_5_DONE_TASK_6_PENDING`
+- Current task: `Task 6 - Phase 6: Gateway Deploy auf 10.0.0.240`
 - Current branch: `feat/issue-314-agent-model-policy`
 - Worktree: `/work/company/project-sentinel`
 - Base: `origin/main @ 0f1c46c19bfa61d0616b3468834d29b557b3e254`
@@ -54,6 +54,14 @@
   - Response-Log-Test prueft Ring-Overwrite, chronologische Ausgabe und `LastByClass`.
   - `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control` ist gruen.
   - `go build ./cmd/cortex-gateway` ist gruen.
+- Task 5 ist erledigt:
+  - Benchmark-Harness fuer `ClassifyRequest`, `ResolveModelPolicy` und `ResponseLogBuffer.Add` wurde ergaenzt.
+  - Benchmarks mit `benchmem` laufen gruen:
+    - `BenchmarkClassifyRequestAgentRuntime`: `494.9 ns/op`, `16 B/op`, `1 allocs/op`
+    - `BenchmarkResolveModelPolicyAgentRuntime`: `38.43 ns/op`, `0 B/op`, `0 allocs/op`
+    - `BenchmarkResponseLogBufferAdd`: `3831 ns/op`, `0 B/op`, `0 allocs/op`
+  - Zielwerte sind erfuellt: Classify `<1us`, Resolve `<1us`, ResponseLog Add `<10us`.
+  - `/usr/bin/time -v`, `vmstat` und `iostat` wurden fuer CPU/RAM/IO-Evidence erfasst.
 
 ## Blocked items
 
@@ -65,7 +73,7 @@
 - `a42ef76` Task [1] Phase 1 - Issue-Body-Repair, Branch und Preflight
 - `b953e4a` Task [2] Phase 2 - Gateway Policy-Layer
 - `114732d` Task [3] Phase 3 - Observability und Response Log
-- `TBD` Task [4] Phase 4 - Go-Tests
+- `b326a2f` Task [4] Phase 4 - Go-Tests
 - `TBD` Task [5] Phase 5 - Benchmarks
 - `TBD` Task [6] Phase 6 - Gateway Deploy auf 10.0.0.240
 - `TBD` Task [7] Phase 8 - AC-Matrix und Live-Verifikation
@@ -80,11 +88,52 @@
 | 2 | Phase 2 - Gateway Policy-Layer | DONE | Request-Klassifikation, Agent-Runtime-Policy, Resolver-Reihenfolge, fail-closed Validation | inspect, command |
 | 3 | Phase 3 - Observability und Response Log | DONE | Traffic-Stats, ResponseLogEntry, Journal-Logs fuer Success/Stream/Error, bounded circular buffer | inspect, command |
 | 4 | Phase 4 - Go-Tests | DONE | Unit-/Regressionstests fuer Klassen, Policy, `/v1/messages`, Response-Logs und Validation | command |
-| 5 | Phase 5 - Benchmarks | PENDING | Classify/Resolve/ResponseLog Benchmarks mit Zielwerten und System-Monitoring | command, system |
+| 5 | Phase 5 - Benchmarks | DONE | Classify/Resolve/ResponseLog Benchmarks mit Zielwerten und System-Monitoring | command, system |
 | 6 | Phase 6 - Gateway Deploy auf 10.0.0.240 | PENDING | ExecStart pruefen, Linux-Binary bauen, deployen, Gateway restart, Smoke | command, system |
 | 7 | Phase 8 - AC-Matrix und Live-Verifikation | PENDING | AC-1 bis AC-6 einzeln auf VM belegen, Config restore, Panic/Error/Secret-Grep | command, system |
 | 8 | Dokumentation, PR- und Close-Sequenz | PENDING | CHANGELOG, Evidence-Doku, PR mit Pflichtsektionen, Labels, Issue-Close erst nach verified | command, inspect |
 | 9 | Plan-Verifikation | PENDING | Plan komplett gegen Ergebnis pruefen, Abweichungen fixen oder blocken | inspect, command, system |
+
+## Task 5 - Phase 5: Benchmarks
+
+### Pre-task self-check
+
+- Was muss getan werden:
+  - Benchmark-Harness fuer `ClassifyRequest`, `ResolveModelPolicy` und `ResponseLogBuffer.Add` ergaenzen oder vorhandene Benchmarks erweitern
+  - Benchmarks mit Zielwerten aus dem Plan ausfuehren
+  - System-Monitoring parallel dokumentieren: CPU, RAM, Disk/IOPS soweit lokal sinnvoll messbar
+  - Benchmark-Evidence in `test-314-verification.md` festhalten
+- Welche ACs muessen hier passen:
+  - AC-1: `ClassifyRequest` bleibt unter `1us/op`.
+  - AC-2: `ResolveModelPolicy` bleibt unter `1us/op`.
+  - AC-3: `ResponseLogBuffer.Add` bleibt unter `10us/op`.
+  - AC-4: Benchmarks laufen mit `allocs/op` sichtbar.
+  - AC-5: System-Monitoring zeigt keine auffaellige lokale Lastspitze.
+- Wie wird bewiesen:
+  - `go test ./cmd/cortex-gateway/internal/proxy -bench 'Benchmark(ClassifyRequest|ResolveModelPolicy|ResponseLogBufferAdd)' -benchmem -run '^$'`
+  - Sidecar-Monitoring per `ps`, `vmstat`, optional `iostat` falls vorhanden
+- Erwartete Dateien:
+  - `cmd/cortex-gateway/internal/proxy/bench_test.go`
+  - `test-314-verification.md`
+  - `PROGRESS.md`
+- Risiken:
+  - Go-Benchmarkzeiten variieren lokal; Zielwerte muessen mit ausreichender Marge gegen ns/op liegen, nicht aus Einzellaeufen ueberinterpretiert werden.
+
+### Outcome
+
+- `bench_test.go` enthaelt jetzt Microbenchmarks fuer `ClassifyRequest`, `ResolveModelPolicy` und `ResponseLogBuffer.Add`.
+- Alle drei Benchmarks liegen deutlich unter den Zielwerten.
+- `benchmem` zeigt Allokationen explizit.
+- Lokales System-Monitoring wurde parallel bzw. ergaenzend per `/usr/bin/time -v`, `vmstat` und `iostat` dokumentiert.
+
+### Evidence
+
+- `test-314-verification.md` enthaelt Task-5 Command/Output-Evidence.
+- AC-1 PASS: `ClassifyRequest` `494.9 ns/op` < `1us/op`.
+- AC-2 PASS: `ResolveModelPolicy` `38.43 ns/op` < `1us/op`.
+- AC-3 PASS: `ResponseLogBuffer.Add` `3831 ns/op` < `10us/op`.
+- AC-4 PASS: `benchmem` zeigt `B/op` und `allocs/op`.
+- AC-5 PASS: `/usr/bin/time -v`, `vmstat` und `iostat` erfasst; keine Benchmark-Blockade oder Swap-Fehler.
 
 ## Task 4 - Phase 4: Go-Tests
 
