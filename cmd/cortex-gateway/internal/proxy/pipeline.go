@@ -204,16 +204,16 @@ func (ph *PipelineHandler) BreakerStates() map[string]string {
 
 // PipelineResponse ist die erweiterte Antwort mit extrahierten Aktionen.
 type PipelineResponse struct {
-	Content      string                       `json:"content"`
-	ContentBlocks []json.RawMessage           `json:"-"`
-	Model        string                       `json:"model"`
-	Provider     string                       `json:"provider"`
-	TokensUsed   int                          `json:"tokens_used"`
-	InputTokens  int                          `json:"input_tokens,omitempty"`
-	OutputTokens int                          `json:"output_tokens,omitempty"`
-	FinishReason string                       `json:"finish_reason"`
-	Actions      []extraction.ExtractedAction `json:"actions,omitempty"`
-	RequestID    string                       `json:"request_id"`
+	Content       string                       `json:"content"`
+	ContentBlocks []json.RawMessage            `json:"-"`
+	Model         string                       `json:"model"`
+	Provider      string                       `json:"provider"`
+	TokensUsed    int                          `json:"tokens_used"`
+	InputTokens   int                          `json:"input_tokens,omitempty"`
+	OutputTokens  int                          `json:"output_tokens,omitempty"`
+	FinishReason  string                       `json:"finish_reason"`
+	Actions       []extraction.ExtractedAction `json:"actions,omitempty"`
+	RequestID     string                       `json:"request_id"`
 }
 
 // NewPipelineHandler erstellt den Pipeline-Handler.
@@ -343,6 +343,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 
 	// --- Step 1: Config-Snapshot ---
 	snap := ph.config.Get()
+	req.RequestClass = ClassifyRequest(r.URL.Path, &req)
 
 	// --- Step 2: Provider bestimmen (Runtime-switchable via Control Plane) ---
 	resolvedProviderName := req.PreferredProvider
@@ -450,6 +451,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 				pipelineLatency.WithLabelValues("synthesis").Observe(duration.Seconds())
 				ph.logger.Info("pipeline request completed",
 					"provider", "synthesis",
+					"request_class", req.RequestClass,
+					"effective_model", "sentinel-synth-v1",
+					"policy_source", req.PolicySource,
 					"duration", duration,
 					"tokens", 0,
 					"actions", len(actions),
@@ -512,6 +516,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 					pipelineLatency.WithLabelValues("apicp").Observe(duration.Seconds())
 					ph.logger.Info("pipeline request completed",
 						"provider", "apicp",
+						"request_class", req.RequestClass,
+						"effective_model", "sentinel-apicp-v1",
+						"policy_source", req.PolicySource,
 						"duration", duration,
 						"tokens", 0,
 						"actions", len(actions),
@@ -559,6 +566,22 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		}
 	}
 
+	policyResolution, err := ResolveModelPolicy(providerName, req.RequestClass, req.Model, snap.AgentRuntimeModelPolicy)
+	if err != nil {
+		ph.logger.Error("model policy rejected",
+			"request_id", requestID,
+			"request_class", req.RequestClass,
+			"provider", providerName,
+			"policy", snap.AgentRuntimeModelPolicy,
+			"error", err,
+		)
+		ph.writeRequestError(w, &req, "model policy rejected", http.StatusUnprocessableEntity)
+		return
+	}
+	req.Model = policyResolution.Model
+	req.EffectiveModel = policyResolution.Model
+	req.PolicySource = policyResolution.Source
+
 	if isAnthropicStreamingRequest(&req) {
 		ph.streamAnthropicResponse(r.Context(), w, &req, provider, providerName, breaker, requestID, start)
 		return
@@ -588,6 +611,11 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		pipelineLatency.WithLabelValues(providerName).Observe(duration.Seconds())
 		ph.logger.Error("provider request failed",
 			"provider", providerName,
+			"request_class", req.RequestClass,
+			"effective_model", effectiveModelForLog(&req, ""),
+			"policy_source", req.PolicySource,
+			"agent_id", req.Metadata["agent_id"],
+			"agent_name", agentName,
 			"duration", duration,
 			"error", err,
 		)
@@ -702,6 +730,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 
 	ph.logger.Info("pipeline request completed",
 		"provider", providerName,
+		"request_class", req.RequestClass,
+		"effective_model", effectiveModelForLog(&req, resp.Model),
+		"policy_source", req.PolicySource,
 		"duration", duration,
 		"tokens", resp.TokensUsed,
 		"actions", len(actions),
@@ -1202,7 +1233,16 @@ func (ph *PipelineHandler) persistActions(actions []extraction.ExtractedAction, 
 
 func (ph *PipelineHandler) writePipelineResponse(_ context.Context, w http.ResponseWriter, req *LLMRequest, resp PipelineResponse) {
 	if ph.responseLogs != nil {
-		ph.responseLogs.Add(resp.RequestID, resp.Provider, resp.Content)
+		ph.responseLogs.Add(ResponseLogEntry{
+			RequestID:    resp.RequestID,
+			RequestClass: req.RequestClass,
+			Provider:     resp.Provider,
+			Model:        effectiveModelForLog(req, resp.Model),
+			PolicySource: req.PolicySource,
+			AgentID:      req.Metadata["agent_id"],
+			AgentName:    req.Metadata["agent_name"],
+			Content:      resp.Content,
+		})
 	}
 
 	payload := responsePayloadForRequest(req, resp)
@@ -1228,6 +1268,19 @@ func (ph *PipelineHandler) writePipelineResponse(_ context.Context, w http.Respo
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		ph.logger.Error("failed to encode response", "error", err)
 	}
+}
+
+func effectiveModelForLog(req *LLMRequest, responseModel string) string {
+	if strings.TrimSpace(responseModel) != "" {
+		return responseModel
+	}
+	if req == nil {
+		return ""
+	}
+	if strings.TrimSpace(req.EffectiveModel) != "" {
+		return req.EffectiveModel
+	}
+	return strings.TrimSpace(req.Model)
 }
 
 func responsePayloadForRequest(req *LLMRequest, resp PipelineResponse) interface{} {
@@ -1332,6 +1385,11 @@ func (ph *PipelineHandler) streamAnthropicResponse(ctx context.Context, w http.R
 		ph.logger.Error("provider stream failed",
 			"provider", providerName,
 			"request_id", requestID,
+			"request_class", req.RequestClass,
+			"effective_model", effectiveModelForLog(req, ""),
+			"policy_source", req.PolicySource,
+			"agent_id", req.Metadata["agent_id"],
+			"agent_name", req.Metadata["agent_name"],
 			"duration", duration,
 			"error", err,
 		)
@@ -1355,6 +1413,9 @@ func (ph *PipelineHandler) streamAnthropicResponse(ctx context.Context, w http.R
 	ph.logger.Info("pipeline stream completed",
 		"provider", providerName,
 		"request_id", requestID,
+		"request_class", req.RequestClass,
+		"effective_model", effectiveModelForLog(req, ""),
+		"policy_source", req.PolicySource,
 		"duration", duration,
 		"agent_id", req.Metadata["agent_id"],
 		"agent_name", req.Metadata["agent_name"],
@@ -1411,6 +1472,9 @@ func cloneRegenRequest(base *LLMRequest, messages []Message, temperature float64
 		Format:             base.Format,
 		PreferredProvider:  base.PreferredProvider,
 		PassthroughHeaders: clonePassthroughHeaders(base.PassthroughHeaders),
+		RequestClass:       base.RequestClass,
+		EffectiveModel:     base.EffectiveModel,
+		PolicySource:       base.PolicySource,
 		ProviderTimeout:    base.ProviderTimeout,
 	}
 }
