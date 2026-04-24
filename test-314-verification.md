@@ -259,6 +259,148 @@ ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control	(ca
 
 `go build ./cmd/cortex-gateway` exited `0`.
 
+## Task 3 - Phase 3: Observability und Response Log
+
+### AC-1 - Traffic-Stats zeigen Agent-Runtime-Policy
+
+Command:
+
+```bash
+nl -ba cmd/cortex-gateway/main.go | sed -n '287,328p'
+```
+
+Output excerpt:
+
+```text
+trafficConfig := controlConfig.Get()
+lastAgentRuntime, hasLastAgentRuntime := responseLogs.LastByClass(proxy.RequestClassAgentRuntime)
+...
+"agent_runtime_model_policy":  trafficConfig.AgentRuntimeModelPolicy,
+...
+stats["last_agent_runtime_effective_model"] = lastAgentRuntime.Model
+stats["last_agent_runtime_policy_source"] = lastAgentRuntime.PolicySource
+stats["last_agent_runtime_provider"] = lastAgentRuntime.Provider
+```
+
+PASS: `/control/traffic-stats` kann die aktive Agent-Runtime-Policy und den letzten effektiven Runtime-Forward ausgeben.
+
+### AC-2 - ResponseLogEntry enthaelt redigierte Policy- und Agent-Felder
+
+Command:
+
+```bash
+nl -ba cmd/cortex-gateway/internal/proxy/response_log.go | sed -n '8,19p'
+nl -ba cmd/cortex-gateway/internal/proxy/pipeline.go | sed -n '1233,1247p'
+```
+
+Output excerpt:
+
+```text
+RequestClass RequestClass `json:"request_class,omitempty"`
+Provider     string       `json:"provider"`
+Model        string       `json:"model,omitempty"`
+PolicySource string       `json:"policy_source,omitempty"`
+AgentID      string       `json:"agent_id,omitempty"`
+AgentName    string       `json:"agent_name,omitempty"`
+Content      string       `json:"content"`
+```
+
+PASS: Response-Logs enthalten Request-Klasse, Provider, effektives Modell, Policy-Source und Agent-Metadaten, aber keine Header-/Secret-Felder.
+
+### AC-3 - Success-, Stream- und Error-Logs enthalten Policy-Felder
+
+Command:
+
+```bash
+rg -n '"request_class"|"effective_model"|"policy_source"' cmd/cortex-gateway/internal/proxy/pipeline.go
+```
+
+Output excerpt:
+
+```text
+454: "request_class", req.RequestClass,
+455: "effective_model", "sentinel-synth-v1",
+456: "policy_source", req.PolicySource,
+614: "request_class", req.RequestClass,
+615: "effective_model", effectiveModelForLog(&req, ""),
+616: "policy_source", req.PolicySource,
+733: "request_class", req.RequestClass,
+734: "effective_model", effectiveModelForLog(&req, resp.Model),
+735: "policy_source", req.PolicySource,
+1388: "request_class", req.RequestClass,
+1389: "effective_model", effectiveModelForLog(req, ""),
+1390: "policy_source", req.PolicySource,
+1416: "request_class", req.RequestClass,
+1417: "effective_model", effectiveModelForLog(req, ""),
+1418: "policy_source", req.PolicySource,
+```
+
+PASS: Synthesis/APICP, Provider-Error, Provider-Success, Stream-Error und Stream-Success sind observierbar.
+
+### AC-4 - Keine Secrets in Observability-Feldern
+
+Command:
+
+```bash
+rg -n 'ResponseLogEntry|agent_runtime_model_policy|last_agent_runtime|x-api-key|authorization|secret|token' \
+  cmd/cortex-gateway/main.go \
+  cmd/cortex-gateway/internal/proxy/response_log.go \
+  cmd/cortex-gateway/internal/proxy/pipeline.go
+```
+
+Output excerpt:
+
+```text
+cmd/cortex-gateway/main.go:312: "agent_runtime_model_policy": trafficConfig.AgentRuntimeModelPolicy,
+cmd/cortex-gateway/main.go:324: stats["last_agent_runtime_policy_source"] = lastAgentRuntime.PolicySource
+cmd/cortex-gateway/internal/proxy/response_log.go:8:type ResponseLogEntry struct {
+```
+
+PASS: Die neuen Stats-/ResponseLog-Felder speichern keine Authorization-Header, API-Keys oder Secret-Werte.
+
+### AC-5 - Response-Log-Append ist bounded und ohne steady-state Slice-Kopie
+
+Command:
+
+```bash
+nl -ba cmd/cortex-gateway/internal/proxy/response_log.go | sed -n '25,55p'
+```
+
+Output excerpt:
+
+```text
+return &ResponseLogBuffer{limit: limit, entries: make([]ResponseLogEntry, 0, limit)}
+...
+if len(b.entries) < b.limit {
+    b.entries = append(b.entries, entry)
+    return
+}
+
+b.entries[b.next] = entry
+b.next = (b.next + 1) % b.limit
+```
+
+PASS: Der Buffer ist begrenzt und ersetzt nach Erreichen des Limits Eintraege per Ring-Index statt den Restslice zu kopieren.
+
+### Compile-/Regression-Check
+
+Command:
+
+```bash
+gofmt -w cmd/cortex-gateway/main.go cmd/cortex-gateway/internal/proxy/pipeline.go cmd/cortex-gateway/internal/proxy/response_log.go
+go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control
+go build ./cmd/cortex-gateway
+```
+
+Output:
+
+```text
+ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy	(cached)
+ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control	(cached)
+```
+
+`go build ./cmd/cortex-gateway` exited `0`.
+
 PASS: Betroffene Gateway-Packages testen und bauen nach Task 2.
 
 ### Zwischenfund

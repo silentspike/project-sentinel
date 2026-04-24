@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan314.md`
-- Overall status: `TASK_2_DONE_TASK_3_PENDING`
-- Current task: `Task 3 - Phase 3: Observability und Response Log`
+- Overall status: `TASK_3_DONE_TASK_4_PENDING`
+- Current task: `Task 4 - Phase 4: Go-Tests`
 - Current branch: `feat/issue-314-agent-model-policy`
 - Worktree: `/work/company/project-sentinel`
 - Base: `origin/main @ 0f1c46c19bfa61d0616b3468834d29b557b3e254`
@@ -39,6 +39,13 @@
   - Zwischenfund: Die Policy wurde nach erstem Testfail aus dem Pre-Synthesis-Pfad in den echten Forward-Pfad verschoben.
   - `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control` ist gruen.
   - `go build ./cmd/cortex-gateway` ist gruen.
+- Task 3 ist erledigt:
+  - `traffic-stats` zeigt jetzt `agent_runtime_model_policy` und den letzten Agent-Runtime-Forward mit effektivem Modell, Policy-Source und Provider.
+  - `ResponseLogEntry` enthaelt `request_class`, `provider`, `model`, `policy_source`, `agent_id`, `agent_name` ohne Header-/Secret-Felder.
+  - Provider-Success, Provider-Error, Stream-Success und Stream-Error loggen Request-Klasse, effektives Modell und Policy-Source.
+  - `ResponseLogBuffer` ist jetzt ein bounded circular buffer und vermeidet steady-state O(n)-Kopie beim Append.
+  - `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control` ist gruen.
+  - `go build ./cmd/cortex-gateway` ist gruen.
 
 ## Blocked items
 
@@ -48,7 +55,7 @@
 ## Commit references
 
 - `a42ef76` Task [1] Phase 1 - Issue-Body-Repair, Branch und Preflight
-- `TBD` Task [2] Phase 2 - Gateway Policy-Layer
+- `b953e4a` Task [2] Phase 2 - Gateway Policy-Layer
 - `TBD` Task [3] Phase 3 - Observability und Response Log
 - `TBD` Task [4] Phase 4 - Go-Tests
 - `TBD` Task [5] Phase 5 - Benchmarks
@@ -63,7 +70,7 @@
 |---|------|--------|-------|----------|
 | 1 | Phase 1 - Issue-Body-Repair, Branch und Preflight | DONE | Branch von main, GitHub-Body reparieren, `quality:ready`, Haiku-String fuer claude-code pruefen, Platform-Controlplane out-of-scope bestaetigen | command, inspect, system |
 | 2 | Phase 2 - Gateway Policy-Layer | DONE | Request-Klassifikation, Agent-Runtime-Policy, Resolver-Reihenfolge, fail-closed Validation | inspect, command |
-| 3 | Phase 3 - Observability und Response Log | PENDING | Traffic-Stats, ResponseLogEntry, Journal-Logs fuer Success/Stream/Error, ggf. bounded circular buffer | inspect, command |
+| 3 | Phase 3 - Observability und Response Log | DONE | Traffic-Stats, ResponseLogEntry, Journal-Logs fuer Success/Stream/Error, bounded circular buffer | inspect, command |
 | 4 | Phase 4 - Go-Tests | PENDING | Unit-/Regressionstests fuer Klassen, Policy, `/v1/messages`, Response-Logs und Validation | command |
 | 5 | Phase 5 - Benchmarks | PENDING | Classify/Resolve/ResponseLog Benchmarks mit Zielwerten und System-Monitoring | command, system |
 | 6 | Phase 6 - Gateway Deploy auf 10.0.0.240 | PENDING | ExecStart pruefen, Linux-Binary bauen, deployen, Gateway restart, Smoke | command, system |
@@ -193,3 +200,22 @@
 - Risiken:
   - `traffic-stats` lebt in `main.go` und muss ohne zusaetzliche globale State-Duplikation an Gateway-Daten kommen.
   - Error-Logs muessen AC-4 belegen koennen, auch wenn `/v1/messages` mit Dummy-Key fehlschlaegt.
+
+### Outcome
+
+- `traffic-stats` liest die Control-Konfiguration einmal pro Request und exportiert `agent_runtime_model_policy`.
+- Wenn ein Agent-Runtime-Forward im Response-Log existiert, exportiert `traffic-stats` zusaetzlich `last_agent_runtime_effective_model`, `last_agent_runtime_policy_source` und `last_agent_runtime_provider`.
+- `ResponseLogEntry` wurde um `request_class`, `model`, `policy_source`, `agent_id` und `agent_name` erweitert; Header, Tokens und Secrets werden nicht gespeichert.
+- Provider-Success-, Provider-Error-, Stream-Success- und Stream-Error-Logs tragen jetzt Request-Klasse, effektives Modell, Policy-Source und Agent-Metadaten.
+- `ResponseLogBuffer` wurde auf einen bounded circular buffer umgestellt; `Add()` ueberschreibt bei vollem Buffer ohne Slice-Restkopie.
+
+### Evidence
+
+- `test-314-verification.md` enthaelt Task-3 Command/Output-Evidence.
+- AC-1 PASS: `main.go` exportiert `agent_runtime_model_policy` und letzte Agent-Runtime-Policy-Felder.
+- AC-2 PASS: `ResponseLogEntry` enthaelt redigierte Policy-/Agent-Felder.
+- AC-3 PASS: Success-, Stream- und Error-Logs enthalten Request-Klasse, effektives Modell und Policy-Source.
+- AC-4 PASS: Neue Response-Log-/Stats-Felder enthalten keine Header, API-Keys oder Tokenwerte.
+- AC-5 PASS: `ResponseLogBuffer.Add()` bleibt bounded und hat im steady state keine O(n)-Kopie.
+- Command PASS: `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control`.
+- Command PASS: `go build ./cmd/cortex-gateway`.

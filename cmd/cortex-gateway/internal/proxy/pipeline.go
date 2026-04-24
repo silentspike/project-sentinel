@@ -451,6 +451,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 				pipelineLatency.WithLabelValues("synthesis").Observe(duration.Seconds())
 				ph.logger.Info("pipeline request completed",
 					"provider", "synthesis",
+					"request_class", req.RequestClass,
+					"effective_model", "sentinel-synth-v1",
+					"policy_source", req.PolicySource,
 					"duration", duration,
 					"tokens", 0,
 					"actions", len(actions),
@@ -513,6 +516,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 					pipelineLatency.WithLabelValues("apicp").Observe(duration.Seconds())
 					ph.logger.Info("pipeline request completed",
 						"provider", "apicp",
+						"request_class", req.RequestClass,
+						"effective_model", "sentinel-apicp-v1",
+						"policy_source", req.PolicySource,
 						"duration", duration,
 						"tokens", 0,
 						"actions", len(actions),
@@ -605,6 +611,11 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		pipelineLatency.WithLabelValues(providerName).Observe(duration.Seconds())
 		ph.logger.Error("provider request failed",
 			"provider", providerName,
+			"request_class", req.RequestClass,
+			"effective_model", effectiveModelForLog(&req, ""),
+			"policy_source", req.PolicySource,
+			"agent_id", req.Metadata["agent_id"],
+			"agent_name", agentName,
 			"duration", duration,
 			"error", err,
 		)
@@ -719,6 +730,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 
 	ph.logger.Info("pipeline request completed",
 		"provider", providerName,
+		"request_class", req.RequestClass,
+		"effective_model", effectiveModelForLog(&req, resp.Model),
+		"policy_source", req.PolicySource,
 		"duration", duration,
 		"tokens", resp.TokensUsed,
 		"actions", len(actions),
@@ -1219,7 +1233,16 @@ func (ph *PipelineHandler) persistActions(actions []extraction.ExtractedAction, 
 
 func (ph *PipelineHandler) writePipelineResponse(_ context.Context, w http.ResponseWriter, req *LLMRequest, resp PipelineResponse) {
 	if ph.responseLogs != nil {
-		ph.responseLogs.Add(resp.RequestID, resp.Provider, resp.Content)
+		ph.responseLogs.Add(ResponseLogEntry{
+			RequestID:    resp.RequestID,
+			RequestClass: req.RequestClass,
+			Provider:     resp.Provider,
+			Model:        effectiveModelForLog(req, resp.Model),
+			PolicySource: req.PolicySource,
+			AgentID:      req.Metadata["agent_id"],
+			AgentName:    req.Metadata["agent_name"],
+			Content:      resp.Content,
+		})
 	}
 
 	payload := responsePayloadForRequest(req, resp)
@@ -1245,6 +1268,19 @@ func (ph *PipelineHandler) writePipelineResponse(_ context.Context, w http.Respo
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		ph.logger.Error("failed to encode response", "error", err)
 	}
+}
+
+func effectiveModelForLog(req *LLMRequest, responseModel string) string {
+	if strings.TrimSpace(responseModel) != "" {
+		return responseModel
+	}
+	if req == nil {
+		return ""
+	}
+	if strings.TrimSpace(req.EffectiveModel) != "" {
+		return req.EffectiveModel
+	}
+	return strings.TrimSpace(req.Model)
 }
 
 func responsePayloadForRequest(req *LLMRequest, resp PipelineResponse) interface{} {
@@ -1349,6 +1385,11 @@ func (ph *PipelineHandler) streamAnthropicResponse(ctx context.Context, w http.R
 		ph.logger.Error("provider stream failed",
 			"provider", providerName,
 			"request_id", requestID,
+			"request_class", req.RequestClass,
+			"effective_model", effectiveModelForLog(req, ""),
+			"policy_source", req.PolicySource,
+			"agent_id", req.Metadata["agent_id"],
+			"agent_name", req.Metadata["agent_name"],
 			"duration", duration,
 			"error", err,
 		)
@@ -1372,6 +1413,9 @@ func (ph *PipelineHandler) streamAnthropicResponse(ctx context.Context, w http.R
 	ph.logger.Info("pipeline stream completed",
 		"provider", providerName,
 		"request_id", requestID,
+		"request_class", req.RequestClass,
+		"effective_model", effectiveModelForLog(req, ""),
+		"policy_source", req.PolicySource,
 		"duration", duration,
 		"agent_id", req.Metadata["agent_id"],
 		"agent_name", req.Metadata["agent_name"],
