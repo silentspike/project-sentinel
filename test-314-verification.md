@@ -979,8 +979,8 @@ rg -n "#314|Gateway Model Policy|agent_runtime_model_policy|Response-Log-Buffer"
 Output:
 
 ```text
-12:- **Gateway Model Policy: Agent-Runtime defaultet ueber Inference-Layer auf Haiku** (#314)
-14:  - `agent_runtime_model_policy` defaultet im Gateway-Control-State auf `haiku`, ohne den Daemon oder `/v1/messages` hart zu pinnen
+12:- **Gateway Model Policy: Agent-Runtime nutzt ueber Inference-Layer standardmaessig Haiku** (#314)
+14:  - `agent_runtime_model_policy` setzt im Gateway-Control-State standardmaessig `haiku`, ohne den Daemon oder `/v1/messages` hart zu pinnen
 18:  - Response-Log-Buffer nutzt jetzt einen bounded circular buffer statt steady-state Slice-Kopie
 ```
 

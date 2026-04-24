@@ -32,7 +32,7 @@
 - Task 2 ist erledigt:
   - `RequestClass` wurde zentral im Gateway eingefuehrt.
   - `agent_runtime` wird nur bei positiver numerischer `agent_id` und nach Ausschluss von Platform-/Service-/Analysepfaden gesetzt.
-  - `agent_runtime_model_policy` defaultet in der Control-Config auf `haiku`.
+  - `agent_runtime_model_policy` setzt in der Control-Config standardmaessig `haiku`.
   - `ResolveModelPolicy` setzt Haiku nur fuer `agent_runtime` ohne explizites Modell.
   - `/v1/messages` bleibt `external_compat` und `PreferredProvider=anthropic-direct`.
   - ungueltige Policy/Provider-Kombinationen failen vor dem Provider-Call mit `model policy rejected`.
@@ -358,7 +358,7 @@
   - AC-2: `/v1/messages` bleibt `external_compat` und bekommt keine Agent-Policy.
   - AC-3: leeres Modell wird fuer Agent-Runtime zu `haiku`, explizites Modell gewinnt.
   - AC-4: ungueltige Provider-/Policy-Kombination failt deterministisch.
-  - AC-5: Control-Config defaultet auf `haiku` und akzeptiert nur erlaubte Werte.
+  - AC-5: Control-Config setzt standardmaessig `haiku` und akzeptiert nur erlaubte Werte.
   - AC-6: ResponseLogBuffer liefert chronologische Eintraege nach Ring-Overwrite und `LastByClass` findet den letzten Runtime-Eintrag.
 - Wie wird bewiesen:
   - `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control`

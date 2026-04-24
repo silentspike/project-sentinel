@@ -9,9 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Gateway Model Policy: Agent-Runtime defaultet ueber Inference-Layer auf Haiku** (#314)
+- **Gateway Model Policy: Agent-Runtime nutzt ueber Inference-Layer standardmaessig Haiku** (#314)
   - neue Gateway-Request-Klassen fuer `external_compat`, `agent_runtime`, `platform_controlplane`, `service_internal` und `internal_other`
-  - `agent_runtime_model_policy` defaultet im Gateway-Control-State auf `haiku`, ohne den Daemon oder `/v1/messages` hart zu pinnen
+  - `agent_runtime_model_policy` setzt im Gateway-Control-State standardmaessig `haiku`, ohne den Daemon oder `/v1/messages` hart zu pinnen
   - Agent-Runtime-Requests mit positiver numerischer `agent_id` bekommen vor dem Provider-Forward effektiv `model=haiku`; explizite Request-Modelle gewinnen weiterhin
   - `/v1/messages` bleibt externer Anthropic-/MITM-Compatibility-Pfad mit `anthropic-direct`
   - Traffic-Stats, Response-Log und Journal zeigen redigiert `request_class`, `provider`, `policy_source` und `effective_model`
