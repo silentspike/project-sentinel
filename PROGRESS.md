@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan314.md`
-- Overall status: `TASK_6_DONE_TASK_7_PENDING`
-- Current task: `Task 7 - Phase 8: AC-Matrix und Live-Verifikation`
+- Overall status: `TASK_7_DONE_TASK_8_PENDING`
+- Current task: `Task 8 - Dokumentation, PR- und Close-Sequenz`
 - Current branch: `feat/issue-314-agent-model-policy`
 - Worktree: `/work/company/project-sentinel`
 - Base: `origin/main @ 0f1c46c19bfa61d0616b3468834d29b557b3e254`
@@ -71,6 +71,14 @@
   - `curl -s localhost:8080/health` liefert `status=ok`.
   - `curl -s localhost:8081/control/traffic-stats` enthaelt `agent_runtime_model_policy: haiku`.
   - PID-basiertes Gateway-Journal seit Restart zeigt Startup-Logs ohne Panic/Fatal.
+- Task 7 ist erledigt:
+  - AC-1 PASS: Interner `/internal/llm` Agent-Runtime-Forward setzt `model=haiku`.
+  - AC-2 PASS: Daemon enthaelt kein `AGENT_MODEL_HAIKU`; Agent-Runtime sendet `model: String::new()`.
+  - AC-3 PASS: VM-Forward `request_id=49c25b39-466d-4c48-9bc0-04fac9e9b360` lief als `agent_runtime`, Provider `claude-code`, Model `haiku`.
+  - AC-4 PASS: `/v1/messages` mit Dummy-Key ging gegen `anthropic-direct`, `request_class=external_compat`, `effective_model=claude-opus-4-6`, `policy_source=request_override`, HTTP `401` wegen absichtlich falschem Key.
+  - AC-5 PASS: `traffic-stats`, `traffic-responses` und Journal zeigen redigierte Felder; Secret-Grep fand keine Token/API-Key-Werte.
+  - AC-6 PASS: Go-Tests plus VM-Smoke belegen interne Runtime-Default-Policy getrennt vom externen Compatibility-Pfad.
+  - Panic/Drift-Grep fuer Gateway/Daemon seit Live-Verifikation ist leer.
 
 ## Blocked items
 
@@ -84,7 +92,7 @@
 - `114732d` Task [3] Phase 3 - Observability und Response Log
 - `b326a2f` Task [4] Phase 4 - Go-Tests
 - `9d2adf5` Task [5] Phase 5 - Benchmarks
-- `TBD` Task [6] Phase 6 - Gateway Deploy auf 10.0.0.240
+- `9495871` Task [6] Phase 6 - Gateway Deploy auf 10.0.0.240
 - `TBD` Task [7] Phase 8 - AC-Matrix und Live-Verifikation
 - `TBD` Task [8] Dokumentation, PR- und Close-Sequenz
 - `TBD` Task [9] Plan-Verifikation
@@ -99,7 +107,7 @@
 | 4 | Phase 4 - Go-Tests | DONE | Unit-/Regressionstests fuer Klassen, Policy, `/v1/messages`, Response-Logs und Validation | command |
 | 5 | Phase 5 - Benchmarks | DONE | Classify/Resolve/ResponseLog Benchmarks mit Zielwerten und System-Monitoring | command, system |
 | 6 | Phase 6 - Gateway Deploy auf 10.0.0.240 | DONE | ExecStart pruefen, Linux-Binary bauen, deployen, Gateway restart, Smoke | command, system |
-| 7 | Phase 8 - AC-Matrix und Live-Verifikation | PENDING | AC-1 bis AC-6 einzeln auf VM belegen, Config restore, Panic/Error/Secret-Grep | command, system |
+| 7 | Phase 8 - AC-Matrix und Live-Verifikation | DONE | AC-1 bis AC-6 einzeln auf VM belegen, Config restore, Panic/Error/Secret-Grep | command, system |
 | 8 | Dokumentation, PR- und Close-Sequenz | PENDING | CHANGELOG, Evidence-Doku, PR mit Pflichtsektionen, Labels, Issue-Close erst nach verified | command, inspect |
 | 9 | Plan-Verifikation | PENDING | Plan komplett gegen Ergebnis pruefen, Abweichungen fixen oder blocken | inspect, command, system |
 
@@ -150,6 +158,56 @@
 - AC-3 PASS: `/health` liefert `{"status":"ok",...}`.
 - AC-4 PASS: `/control/traffic-stats` enthaelt `"agent_runtime_model_policy": "haiku"`.
 - AC-5 PASS: PID-basiertes Journal seit Restart zeigt Startup ohne Panic/Fatal.
+
+## Task 7 - Phase 8: AC-Matrix und Live-Verifikation
+
+### Pre-task self-check
+
+- Was muss getan werden:
+  - alle 6 GitHub-ACs einzeln mit VM- oder Repo-Evidence belegen
+  - kontrollierten `agent_runtime`-Forward ueber `/internal/llm` provozieren
+  - externe `/v1/messages`-Compatibility gegen interne Policy trennen
+  - `/control/traffic-stats`, `/control/traffic-responses` und PID-Journal fuer Observability pruefen
+  - Daemon-Code auf fehlendes hartes `AGENT_MODEL_HAIKU`-Pinning pruefen
+  - Panic/Drift/Secret-Grep ausfuehren
+- Welche ACs muessen hier passen:
+  - AC-1: Interne Agent-Runtime-Requests bekommen effektiv `haiku`.
+  - AC-2: Der Daemon pinnt kein Agent-Haiku-Modell.
+  - AC-3: VM zeigt mindestens einen echten Agent-Runtime-Forward mit `effective_model=haiku`.
+  - AC-4: `/v1/messages` bleibt externer MITM-/Anthropic-Compatibility-Pfad und wird nicht von Agent-Default-Policy erfasst.
+  - AC-5: Observability zeigt Request-Klasse, Provider, Policy-Source und effektives Modell ohne Secrets.
+  - AC-6: Tests und VM-Smoke belegen die Trennung von internem Runtime-Default und externem Compatibility-Pfad.
+- Wie wird bewiesen:
+  - VM-`curl` gegen `127.0.0.1:8080/internal/llm`
+  - VM-`curl` gegen `127.0.0.1:8080/v1/messages`
+  - VM-`curl` gegen `127.0.0.1:8081/control/traffic-stats` und `/control/traffic-responses`
+  - PID-basiertes Gateway-Journal
+  - `rg` in Daemon-Quellen
+  - Panic/Drift/Secret-Grep
+- Erwartete Dateien:
+  - `test-314-verification.md`
+  - `PROGRESS.md`
+- Risiken:
+  - Claude-Code-Quota/Circuit-Breaker kann den echten Forward blockieren; dann AC-3 bleibt BLOCKED statt durch Tests ersetzt zu werden.
+
+### Outcome
+
+- Alle 6 GitHub-ACs wurden mit Repo- und VM-Evidence belegt.
+- Kontrollierter Agent-Runtime-Forward ueber `/internal/llm` lieferte HTTP `200`, Provider `claude-code`, Model `haiku`.
+- Externer `/v1/messages`-Pfad wurde mit Dummy-Key getestet und blieb `external_compat`/`anthropic-direct` ohne Agent-Runtime-Policy.
+- Observability-Felder sind in `traffic-stats`, `traffic-responses` und Journal sichtbar.
+- Secret-Grep auf Stats/Responses/Journal fand keine Token/API-Key-Werte.
+- Panic/Drift-Grep blieb leer.
+
+### Evidence
+
+- `test-314-verification.md` enthaelt Task-7 Command/Output-Evidence.
+- AC-1 PASS: `/internal/llm` Response enthaelt `"model":"haiku"` und `"provider":"claude-code"`.
+- AC-2 PASS: `rg "AGENT_MODEL_HAIKU"` ohne Treffer; `llm_bridge.rs` zeigt `model: String::new()`.
+- AC-3 PASS: `traffic-responses` fuer `49c25b39-466d-4c48-9bc0-04fac9e9b360` zeigt `request_class=agent_runtime`, `model=haiku`, `policy_source=agent_runtime_policy`.
+- AC-4 PASS: `/v1/messages` Dummy-Key-Test zeigt im Journal `provider=anthropic-direct`, `request_class=external_compat`, `effective_model=claude-opus-4-6`, `policy_source=request_override`.
+- AC-5 PASS: Observability- und Secret-Grep erfolgreich.
+- AC-6 PASS: Go-Tests plus VM-Smoke decken beide Pfade ab.
 
 ## Task 5 - Phase 5: Benchmarks
 

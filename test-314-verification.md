@@ -785,3 +785,183 @@ control plane starting addr=:8081
 ```
 
 PASS: PID-basiertes Journal zeigt normalen Startup ohne Panic/Fatal.
+
+## Task 7 - Phase 8: AC-Matrix und Live-Verifikation
+
+### AC-1 - Interne agent_runtime Requests bekommen effektiv Haiku
+
+Command:
+
+```bash
+ssh ubuntu@10.0.0.240 "cat > /tmp/issue314-agent-runtime.json <<'JSON'
+{
+  \"messages\": [{\"role\": \"user\", \"content\": \"Antworte exakt mit PONG314.\"}],
+  \"metadata\": {
+    \"agent_id\": \"314\",
+    \"agent_name\": \"Issue314 Test Agent\",
+    \"agent_role\": \"Testperson\",
+    \"room_id\": \"buero-ceo\",
+    \"is_directly_addressed\": \"true\"
+  }
+}
+JSON
+timeout 90 curl -sS -w '\nHTTP_STATUS=%{http_code}\n' \
+  -X POST http://127.0.0.1:8080/internal/llm \
+  -H 'Content-Type: application/json' \
+  --data-binary @/tmp/issue314-agent-runtime.json"
+```
+
+Output:
+
+```json
+{"content":"PONG314","model":"haiku","provider":"claude-code","tokens_used":19282,"input_tokens":18783,"output_tokens":499,"finish_reason":"success","actions":[{"type":"chat","content":"PONG314","emotion":"neutral"}],"request_id":"49c25b39-466d-4c48-9bc0-04fac9e9b360"}
+```
+
+```text
+HTTP_STATUS=200
+```
+
+PASS: Der interne Agent-Runtime-Forward lief ueber `claude-code` mit effektivem Modell `haiku`.
+
+### AC-2 - Daemon pinnt kein AGENT_MODEL_HAIKU
+
+Command:
+
+```bash
+rg -n "AGENT_MODEL_HAIKU" services/sentinel-daemon/src || true
+rg -n "model:\s*String::new\(\)|model:\s*\"haiku\"|model:\s*AGENT" \
+  services/sentinel-daemon/src/llm_bridge.rs \
+  services/sentinel-daemon/src/orchestrator.rs \
+  services/sentinel-daemon/src/platform_controlplane/llm_analyzer.rs
+nl -ba services/sentinel-daemon/src/llm_bridge.rs | sed -n '600,620p'
+```
+
+Output:
+
+```text
+services/sentinel-daemon/src/platform_controlplane/llm_analyzer.rs:326:        model: String::new(),
+services/sentinel-daemon/src/llm_bridge.rs:612:            model: String::new(), // Gateway waehlt default
+```
+
+```text
+605	        GatewayRequest {
+606	            messages: vec![GatewayMessage {
+607	                role: "user".to_string(),
+608	                content: user_prompt,
+609	            }],
+610	            temperature: 0.7,
+611	            max_tokens: 1024,
+612	            model: String::new(), // Gateway waehlt default
+613	            metadata,
+614	        }
+```
+
+PASS: Kein `AGENT_MODEL_HAIKU`; Agent-Runtime bleibt beim Gateway-/Policy-Default.
+
+### AC-3 - VM-Evidence zeigt echten agent_runtime Forward mit Haiku
+
+Command:
+
+```bash
+ssh ubuntu@10.0.0.240 "curl -s localhost:8081/control/traffic-stats | python3 -m json.tool | sed -n '1,140p'"
+ssh ubuntu@10.0.0.240 "curl -s localhost:8081/control/traffic-responses | python3 -c 'import sys,json; data=json.load(sys.stdin); [print(json.dumps({k:e.get(k) for k in (\"request_id\",\"request_class\",\"provider\",\"model\",\"policy_source\",\"agent_id\",\"agent_name\")}, ensure_ascii=False)) for e in data if e.get(\"request_id\")==\"49c25b39-466d-4c48-9bc0-04fac9e9b360\"]'"
+```
+
+Output excerpt:
+
+```json
+{
+    "agent_runtime_model_policy": "haiku",
+    "last_agent_runtime_effective_model": "haiku",
+    "last_agent_runtime_policy_source": "agent_runtime_policy",
+    "last_agent_runtime_provider": "claude-code"
+}
+```
+
+```json
+{"request_id": "49c25b39-466d-4c48-9bc0-04fac9e9b360", "request_class": "agent_runtime", "provider": "claude-code", "model": "haiku", "policy_source": "agent_runtime_policy", "agent_id": "314", "agent_name": "Issue314 Test Agent"}
+```
+
+PASS: Live-Observability belegt den echten Forward mit `agent_runtime` + `haiku`.
+
+### AC-4 - /v1/messages bleibt externer Compatibility-Pfad
+
+Command:
+
+```bash
+ssh ubuntu@10.0.0.240 "cat > /tmp/issue314-v1messages.json <<'JSON'
+{
+  \"model\": \"claude-opus-4-6\",
+  \"max_tokens\": 16,
+  \"messages\": [{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Sag PONG314\"}]}]
+}
+JSON
+timeout 30 curl -sS -w '\nHTTP_STATUS=%{http_code}\n' \
+  -X POST http://127.0.0.1:8080/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: dummy-issue314' \
+  -H 'anthropic-version: 2023-06-01' \
+  --data-binary @/tmp/issue314-v1messages.json"
+```
+
+Output:
+
+```json
+{"type":"error","error":{"type":"authentication_error","message":"provider request failed"}}
+```
+
+```text
+HTTP_STATUS=401
+```
+
+Journal:
+
+```bash
+ssh ubuntu@10.0.0.240 "pid=\$(pgrep -n cortex-gate); journalctl _PID=\$pid --since '2 min ago' --no-pager | grep -E 'provider request failed|anthropic-direct|external_compat|request_override' | tail -20"
+```
+
+Output:
+
+```text
+provider request failed provider=anthropic-direct request_class=external_compat effective_model=claude-opus-4-6 policy_source=request_override agent_id="" agent_name="" error="provider error: HTTP 401: ... invalid x-api-key ..."
+```
+
+PASS: `/v1/messages` geht weiter an `anthropic-direct` als `external_compat`; die interne Agent-Policy greift dort nicht.
+
+### AC-5 - Observability redigiert und ohne Secrets
+
+Command:
+
+```bash
+ssh ubuntu@10.0.0.240 "curl -s localhost:8081/control/traffic-stats | grep -E 'x-api-key|dummy-issue314|authorization|Bearer|sk-ant|api_key' || true; curl -s localhost:8081/control/traffic-responses | grep -E 'dummy-issue314|Bearer|sk-ant|api_key|authorization' || true"
+ssh ubuntu@10.0.0.240 "pid=\$(pgrep -n cortex-gate); journalctl _PID=\$pid --since '10 min ago' --no-pager | grep -E 'dummy-issue314|Bearer|sk-ant|api_key|authorization' || true"
+```
+
+Output:
+
+```text
+
+```
+
+PASS: Stats, Response-Log und PID-Journal enthalten keine Dummy-Key-/Bearer-/Secret-Werte.
+
+### AC-6 - Tests und VM-Smoke belegen interne/externe Trennung
+
+Command:
+
+```bash
+go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control
+go build ./cmd/cortex-gateway
+ssh ubuntu@10.0.0.240 "journalctl -u sentinel-gateway --since '10 min ago' --no-pager | grep -iE 'panic|fatal|segfault' || true; printf '\n--- daemon drift/panic ---\n'; journalctl -u sentinel-daemon --since '10 min ago' --no-pager | grep -iE 'panic|drift' || true"
+```
+
+Output:
+
+```text
+ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy	(cached)
+ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control	(cached)
+
+--- daemon drift/panic ---
+```
+
+PASS: Unit-/Regressionstests, Gateway-Build, VM-Smoke und Panic/Drift-Grep sind gruen.
