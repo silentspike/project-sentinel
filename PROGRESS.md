@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan314.md`
-- Overall status: `TASK_3_DONE_TASK_4_PENDING`
-- Current task: `Task 4 - Phase 4: Go-Tests`
+- Overall status: `TASK_4_DONE_TASK_5_PENDING`
+- Current task: `Task 5 - Phase 5: Benchmarks`
 - Current branch: `feat/issue-314-agent-model-policy`
 - Worktree: `/work/company/project-sentinel`
 - Base: `origin/main @ 0f1c46c19bfa61d0616b3468834d29b557b3e254`
@@ -46,6 +46,14 @@
   - `ResponseLogBuffer` ist jetzt ein bounded circular buffer und vermeidet steady-state O(n)-Kopie beim Append.
   - `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control` ist gruen.
   - `go build ./cmd/cortex-gateway` ist gruen.
+- Task 4 ist erledigt:
+  - Policy-Unit-Tests pruefen strikte Request-Klassifikation und Resolver-Reihenfolge.
+  - Pipeline-Test prueft, dass Agent-Runtime-Requests auf `haiku` gesetzt werden.
+  - Anthropic-Compat-Test prueft, dass `/v1/messages` `external_compat` bleibt und die Request-Override-Policy nutzt.
+  - Control-Tests pruefen Default, erlaubte Werte und Rejects fuer `agent_runtime_model_policy`.
+  - Response-Log-Test prueft Ring-Overwrite, chronologische Ausgabe und `LastByClass`.
+  - `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control` ist gruen.
+  - `go build ./cmd/cortex-gateway` ist gruen.
 
 ## Blocked items
 
@@ -56,7 +64,7 @@
 
 - `a42ef76` Task [1] Phase 1 - Issue-Body-Repair, Branch und Preflight
 - `b953e4a` Task [2] Phase 2 - Gateway Policy-Layer
-- `TBD` Task [3] Phase 3 - Observability und Response Log
+- `114732d` Task [3] Phase 3 - Observability und Response Log
 - `TBD` Task [4] Phase 4 - Go-Tests
 - `TBD` Task [5] Phase 5 - Benchmarks
 - `TBD` Task [6] Phase 6 - Gateway Deploy auf 10.0.0.240
@@ -71,12 +79,58 @@
 | 1 | Phase 1 - Issue-Body-Repair, Branch und Preflight | DONE | Branch von main, GitHub-Body reparieren, `quality:ready`, Haiku-String fuer claude-code pruefen, Platform-Controlplane out-of-scope bestaetigen | command, inspect, system |
 | 2 | Phase 2 - Gateway Policy-Layer | DONE | Request-Klassifikation, Agent-Runtime-Policy, Resolver-Reihenfolge, fail-closed Validation | inspect, command |
 | 3 | Phase 3 - Observability und Response Log | DONE | Traffic-Stats, ResponseLogEntry, Journal-Logs fuer Success/Stream/Error, bounded circular buffer | inspect, command |
-| 4 | Phase 4 - Go-Tests | PENDING | Unit-/Regressionstests fuer Klassen, Policy, `/v1/messages`, Response-Logs und Validation | command |
+| 4 | Phase 4 - Go-Tests | DONE | Unit-/Regressionstests fuer Klassen, Policy, `/v1/messages`, Response-Logs und Validation | command |
 | 5 | Phase 5 - Benchmarks | PENDING | Classify/Resolve/ResponseLog Benchmarks mit Zielwerten und System-Monitoring | command, system |
 | 6 | Phase 6 - Gateway Deploy auf 10.0.0.240 | PENDING | ExecStart pruefen, Linux-Binary bauen, deployen, Gateway restart, Smoke | command, system |
 | 7 | Phase 8 - AC-Matrix und Live-Verifikation | PENDING | AC-1 bis AC-6 einzeln auf VM belegen, Config restore, Panic/Error/Secret-Grep | command, system |
 | 8 | Dokumentation, PR- und Close-Sequenz | PENDING | CHANGELOG, Evidence-Doku, PR mit Pflichtsektionen, Labels, Issue-Close erst nach verified | command, inspect |
 | 9 | Plan-Verifikation | PENDING | Plan komplett gegen Ergebnis pruefen, Abweichungen fixen oder blocken | inspect, command, system |
+
+## Task 4 - Phase 4: Go-Tests
+
+### Pre-task self-check
+
+- Was muss getan werden:
+  - gezielte Unit-/Regressionstests fuer Request-Klassifikation und Policy-Resolver ergaenzen
+  - Tests fuer `/v1/messages` als externe Compatibility-Klasse absichern
+  - Tests fuer Control-Config-Default und Validation von `agent_runtime_model_policy` ergaenzen
+  - Tests fuer Response-Log-Felder und Ringbuffer-Chronologie ergaenzen
+  - komplette betroffene Gateway-Testpakete laufen lassen
+- Welche ACs muessen hier passen:
+  - AC-1: Agent-Runtime wird nur fuer positive numerische Agent-ID nach Ausschluss von Platform-/Service-Pfaden klassifiziert.
+  - AC-2: `/v1/messages` bleibt `external_compat` und bekommt keine Agent-Policy.
+  - AC-3: leeres Modell wird fuer Agent-Runtime zu `haiku`, explizites Modell gewinnt.
+  - AC-4: ungueltige Provider-/Policy-Kombination failt deterministisch.
+  - AC-5: Control-Config defaultet auf `haiku` und akzeptiert nur erlaubte Werte.
+  - AC-6: ResponseLogBuffer liefert chronologische Eintraege nach Ring-Overwrite und `LastByClass` findet den letzten Runtime-Eintrag.
+- Wie wird bewiesen:
+  - `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control`
+  - `go build ./cmd/cortex-gateway`
+- Erwartete Dateien:
+  - `cmd/cortex-gateway/internal/proxy/policy_test.go`
+  - `cmd/cortex-gateway/internal/proxy/response_log_test.go`
+  - vorhandene Tests in `cmd/cortex-gateway/internal/control`
+- Risiken:
+  - bestehende Tests koennen alte ResponseLogBuffer-Signatur erwarten; nicht per Compatibility-Wrapper kaschieren, sondern Tests auf neue Struktur aktualisieren.
+
+### Outcome
+
+- `policy_test.go` deckt strikte Klassifikation und Resolver-Reihenfolge ab.
+- `pipeline_test.go` deckt Agent-Runtime-Haiku-Anwendung und externe `/v1/messages`-Trennung ab.
+- `plane_test.go` deckt Default, erlaubte Werte und invaliden `agent_runtime_model_policy` ab.
+- `response_log_test.go` deckt Ringbuffer-Overwrite, chronologische Ausgabe und `LastByClass` ab.
+
+### Evidence
+
+- `test-314-verification.md` enthaelt Task-4 Command/Output-Evidence.
+- AC-1 PASS: Tests fuer numerische Agent-ID und Ausschluss von Platform-/Service-Pfaden.
+- AC-2 PASS: Pipeline-Test bestaetigt `/v1/messages` als `external_compat`.
+- AC-3 PASS: Policy- und Pipeline-Tests bestaetigen Haiku fuer Agent-Runtime und explizites Modell als Override.
+- AC-4 PASS: Policy-Test prueft unsupported Provider und unknown Policy als Fehler.
+- AC-5 PASS: Control-Test prueft Default `haiku`, leeres Disable und Rejects.
+- AC-6 PASS: ResponseLogBuffer-Test prueft Ring-Overwrite und `LastByClass`.
+- Command PASS: `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control`.
+- Command PASS: `go build ./cmd/cortex-gateway`.
 
 ## Task 1 - Phase 1: Issue-Body-Repair, Branch und Preflight
 

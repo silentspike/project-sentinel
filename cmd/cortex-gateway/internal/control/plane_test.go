@@ -56,6 +56,9 @@ func TestNewConfig_Defaults(t *testing.T) {
 	if snapshot.InterceptMode != "auto" {
 		t.Errorf("expected intercept_mode auto, got %q", snapshot.InterceptMode)
 	}
+	if snapshot.AgentRuntimeModelPolicy != "haiku" {
+		t.Errorf("expected agent_runtime_model_policy haiku, got %q", snapshot.AgentRuntimeModelPolicy)
+	}
 }
 
 // TestConfig_GetSnapshot verifies that Get returns a snapshot and is concurrent-safe.
@@ -160,6 +163,31 @@ func TestConfig_Update_UnknownKey(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unknown config key") {
 		t.Errorf("error should mention unknown key: %v", err)
+	}
+}
+
+func TestConfig_Update_AgentRuntimeModelPolicy(t *testing.T) {
+	cfg := NewConfig("claude")
+
+	if err := cfg.Update(map[string]interface{}{"agent_runtime_model_policy": "haiku"}); err != nil {
+		t.Fatalf("update haiku policy: %v", err)
+	}
+	if got := cfg.Get().AgentRuntimeModelPolicy; got != "haiku" {
+		t.Fatalf("AgentRuntimeModelPolicy = %q, want haiku", got)
+	}
+
+	if err := cfg.Update(map[string]interface{}{"agent_runtime_model_policy": ""}); err != nil {
+		t.Fatalf("clear policy: %v", err)
+	}
+	if got := cfg.Get().AgentRuntimeModelPolicy; got != "" {
+		t.Fatalf("AgentRuntimeModelPolicy = %q, want empty", got)
+	}
+
+	if err := cfg.Update(map[string]interface{}{"agent_runtime_model_policy": "opus"}); err == nil {
+		t.Fatal("expected invalid policy to be rejected")
+	}
+	if err := cfg.Update(map[string]interface{}{"agent_runtime_model_policy": 42}); err == nil {
+		t.Fatal("expected non-string policy to be rejected")
 	}
 }
 

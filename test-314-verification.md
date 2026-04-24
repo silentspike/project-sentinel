@@ -401,7 +401,7 @@ ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control	(ca
 
 `go build ./cmd/cortex-gateway` exited `0`.
 
-PASS: Betroffene Gateway-Packages testen und bauen nach Task 2.
+PASS: Betroffene Gateway-Packages testen und bauen nach Task 3.
 
 ### Zwischenfund
 
@@ -409,3 +409,170 @@ Der erste `go test`-Lauf zeigte, dass die Policy zu frueh vor dem Synthesis-Pfad
 
 - Policy-Anwendung wurde hinter Synthesis/API-CP/Sequencing und direkt vor Streaming/Provider.Send verschoben.
 - Testprovider `mock` wird als Testmapping fuer `haiku` akzeptiert; echte unbekannte Provider bleiben fail-closed.
+
+## Task 4 - Phase 4: Go-Tests
+
+### AC-1 - Agent-Runtime-Klassifikation ist getestet
+
+Command:
+
+```bash
+go test ./cmd/cortex-gateway/internal/proxy -run 'TestClassifyRequestStrictAgentRuntime|TestResolveModelPolicy'
+```
+
+Output:
+
+```text
+ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy	0.033s
+```
+
+Covered cases:
+
+```text
+/v1/messages + agent_id -> external_compat
+platform_analysis/request_type/service identity + agent_id -> not agent_runtime
+positive numeric agent_id -> agent_runtime
+0, leading zero, non-numeric agent_id -> internal_other
+```
+
+PASS: `agent_runtime` ist streng positiv-numerisch und wird erst nach Platform-/Service-Ausschluessen gesetzt.
+
+### AC-2 - /v1/messages bleibt externe Compatibility-Klasse
+
+Command:
+
+```bash
+go test ./cmd/cortex-gateway/internal/proxy -run TestPipelineAnthropicMessagesPassthrough
+```
+
+Output:
+
+```text
+ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy	0.019s
+```
+
+Assertions:
+
+```text
+claude-code calls = 0
+anthropic-direct calls = 1
+PreferredProvider = anthropic-direct
+RequestClass = external_compat
+PolicySource = request_override
+```
+
+PASS: `/v1/messages` laeuft nicht in die Agent-Runtime-Haiku-Policy.
+
+### AC-3 - Agent-Runtime-Haiku und Request-Override sind getestet
+
+Command:
+
+```bash
+go test ./cmd/cortex-gateway/internal/proxy -run 'TestPipelineAgentRuntimeAppliesHaikuPolicy|TestResolveModelPolicy'
+```
+
+Output:
+
+```text
+ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy	0.032s
+```
+
+Assertions:
+
+```text
+agent_runtime without model -> model haiku, effective_model haiku, policy_source agent_runtime_policy
+explicit request model -> policy_source request_override
+```
+
+PASS: Der Runtime-Pfad setzt Haiku nur bei leerem Modell; explizite Modelle gewinnen.
+
+### AC-4 - Fail-Closed fuer ungueltige Policy/Provider-Kombination
+
+Command:
+
+```bash
+go test ./cmd/cortex-gateway/internal/proxy -run TestResolveModelPolicy
+```
+
+Output:
+
+```text
+ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy	0.023s
+```
+
+Assertions:
+
+```text
+provider anthropic-direct + agent_runtime_policy haiku -> error contains "not supported"
+policy opus -> error contains "unknown"
+```
+
+PASS: Unaufloesbare Policy-Zustaende fallen nicht still auf Provider-Default/Opus zurueck.
+
+### AC-5 - Control-Config-Default und Validation sind getestet
+
+Command:
+
+```bash
+go test ./cmd/cortex-gateway/internal/control -run 'TestNewConfig_Defaults|TestConfig_Update_AgentRuntimeModelPolicy'
+```
+
+Output:
+
+```text
+ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control	0.010s
+```
+
+Assertions:
+
+```text
+default agent_runtime_model_policy = haiku
+accepted: "haiku", ""
+rejected: "opus", non-string
+```
+
+PASS: Die Runtime-Policy ist im Control-Plane-State deterministisch validiert.
+
+### AC-6 - ResponseLogBuffer-Ring und LastByClass sind getestet
+
+Command:
+
+```bash
+go test ./cmd/cortex-gateway/internal/proxy -run TestResponseLogBufferRingOverwriteAndLastByClass
+```
+
+Output:
+
+```text
+ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy	0.017s
+```
+
+Assertions:
+
+```text
+limit 2 -> third Add overwrites oldest entry
+Entries() returns chronological [agent-1, agent-2]
+LastByClass(agent_runtime) returns agent-2
+LastByClass(external_compat) does not return overwritten external entry
+```
+
+PASS: Der bounded Ringbuffer ist regressionsgesichert.
+
+### Compile-/Regression-Check
+
+Command:
+
+```bash
+gofmt -w cmd/cortex-gateway/internal/proxy/policy_test.go cmd/cortex-gateway/internal/proxy/response_log_test.go cmd/cortex-gateway/internal/proxy/pipeline_test.go cmd/cortex-gateway/internal/control/plane_test.go
+go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control
+go build ./cmd/cortex-gateway
+```
+
+Output:
+
+```text
+ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy	1.087s
+ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control	0.019s
+```
+
+`go build ./cmd/cortex-gateway` exited `0`.
