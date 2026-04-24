@@ -6,10 +6,15 @@ import (
 )
 
 type ResponseLogEntry struct {
-	RequestID string    `json:"request_id"`
-	Provider  string    `json:"provider"`
-	Content   string    `json:"content"`
-	LoggedAt  time.Time `json:"logged_at"`
+	RequestID    string       `json:"request_id"`
+	RequestClass RequestClass `json:"request_class,omitempty"`
+	Provider     string       `json:"provider"`
+	Model        string       `json:"model,omitempty"`
+	PolicySource string       `json:"policy_source,omitempty"`
+	AgentID      string       `json:"agent_id,omitempty"`
+	AgentName    string       `json:"agent_name,omitempty"`
+	Content      string       `json:"content"`
+	LoggedAt     time.Time    `json:"logged_at"`
 }
 
 // ResponseLogBuffer keeps recent response bodies in memory for control-plane
@@ -18,16 +23,17 @@ type ResponseLogBuffer struct {
 	mu      sync.Mutex
 	limit   int
 	entries []ResponseLogEntry
+	next    int
 }
 
 func NewResponseLogBuffer(limit int) *ResponseLogBuffer {
 	if limit <= 0 {
 		limit = 200
 	}
-	return &ResponseLogBuffer{limit: limit}
+	return &ResponseLogBuffer{limit: limit, entries: make([]ResponseLogEntry, 0, limit)}
 }
 
-func (b *ResponseLogBuffer) Add(requestID, provider, content string) {
+func (b *ResponseLogBuffer) Add(entry ResponseLogEntry) {
 	if b == nil {
 		return
 	}
@@ -35,15 +41,17 @@ func (b *ResponseLogBuffer) Add(requestID, provider, content string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	b.entries = append(b.entries, ResponseLogEntry{
-		RequestID: requestID,
-		Provider:  provider,
-		Content:   content,
-		LoggedAt:  time.Now(),
-	})
-	if len(b.entries) > b.limit {
-		b.entries = append([]ResponseLogEntry(nil), b.entries[len(b.entries)-b.limit:]...)
+	if entry.LoggedAt.IsZero() {
+		entry.LoggedAt = time.Now()
 	}
+
+	if len(b.entries) < b.limit {
+		b.entries = append(b.entries, entry)
+		return
+	}
+
+	b.entries[b.next] = entry
+	b.next = (b.next + 1) % b.limit
 }
 
 func (b *ResponseLogBuffer) Entries() []ResponseLogEntry {
@@ -54,8 +62,7 @@ func (b *ResponseLogBuffer) Entries() []ResponseLogEntry {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	out := make([]ResponseLogEntry, len(b.entries))
-	copy(out, b.entries)
+	out := b.entriesChronologicalLocked()
 	return out
 }
 
@@ -67,4 +74,37 @@ func (b *ResponseLogBuffer) Len() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return len(b.entries)
+}
+
+func (b *ResponseLogBuffer) LastByClass(class RequestClass) (ResponseLogEntry, bool) {
+	if b == nil {
+		return ResponseLogEntry{}, false
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	entries := b.entriesChronologicalLocked()
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].RequestClass == class {
+			return entries[i], true
+		}
+	}
+	return ResponseLogEntry{}, false
+}
+
+func (b *ResponseLogBuffer) entriesChronologicalLocked() []ResponseLogEntry {
+	if len(b.entries) == 0 {
+		return nil
+	}
+	if len(b.entries) < b.limit || b.next == 0 {
+		out := make([]ResponseLogEntry, len(b.entries))
+		copy(out, b.entries)
+		return out
+	}
+
+	out := make([]ResponseLogEntry, 0, len(b.entries))
+	out = append(out, b.entries[b.next:]...)
+	out = append(out, b.entries[:b.next]...)
+	return out
 }
