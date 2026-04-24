@@ -661,3 +661,127 @@ nvme0n1        187.00   2984.00 1799.00  24092.00     0.07    2.95   5.35   5.80
 ```
 
 PASS: CPU/RAM/IO-Metriken wurden dokumentiert; der Benchmarklauf beendet sauber ohne Swap-Fehler oder IO-Blockade.
+
+## Task 6 - Phase 6: Gateway Deploy auf 10.0.0.240
+
+### AC-1 - Deploy trifft den systemd-Binary-Pfad
+
+Command:
+
+```bash
+ssh ubuntu@10.0.0.240 "systemctl cat sentinel-gateway --no-pager && systemctl is-active sentinel-gateway && ls -l /opt/sentinel/bin/cortex-gateway"
+```
+
+Output excerpt:
+
+```text
+ExecStart=/opt/sentinel/bin/cortex-gateway
+active
+-rwxr-xr-x 1 root root 23269163 Apr  3 22:39 /opt/sentinel/bin/cortex-gateway
+```
+
+PASS: Der Zielpfad ist `/opt/sentinel/bin/cortex-gateway`.
+
+### AC-2 - Linux-Binary wurde deployed und Service ist aktiv
+
+Command:
+
+```bash
+GOOS=linux GOARCH=amd64 go build -o cortex-gateway ./cmd/cortex-gateway/
+scp cortex-gateway ubuntu@10.0.0.240:/tmp/cortex-gateway.issue314
+ssh ubuntu@10.0.0.240 "set -euo pipefail; \
+  sudo systemctl stop sentinel-gateway; \
+  sudo cp /tmp/cortex-gateway.issue314 /opt/sentinel/bin/cortex-gateway; \
+  sudo chmod 0755 /opt/sentinel/bin/cortex-gateway; \
+  sudo chown root:root /opt/sentinel/bin/cortex-gateway; \
+  sudo systemctl start sentinel-gateway; \
+  sleep 2; \
+  systemctl is-active sentinel-gateway; \
+  ls -l /opt/sentinel/bin/cortex-gateway"
+```
+
+Output:
+
+```text
+active
+-rwxr-xr-x 1 root root 23244031 Apr 24 06:24 /opt/sentinel/bin/cortex-gateway
+```
+
+Zwischenfund:
+
+```text
+cp: cannot create regular file '/opt/sentinel/bin/cortex-gateway': Text file busy
+```
+
+Fix: Service wurde vor dem finalen Copy gestoppt und danach wieder gestartet.
+
+Backup:
+
+```text
+/opt/sentinel/bin/cortex-gateway.bak-issue314-20260424062401
+```
+
+PASS: Neues Binary ist live am systemd-Pfad, Gateway-Service ist aktiv.
+
+### AC-3 - Health ist OK
+
+Command:
+
+```bash
+ssh ubuntu@10.0.0.240 "curl -s localhost:8080/health"
+```
+
+Output:
+
+```json
+{"status":"ok","version":"0.1.0","circuit_breakers":{},"guardrails_enabled":false}
+```
+
+PASS: Gateway-Health liefert `status=ok`.
+
+### AC-4 - Traffic-Stats zeigen neues Policy-Feld live
+
+Command:
+
+```bash
+ssh ubuntu@10.0.0.240 "curl -s localhost:8081/control/traffic-stats | python3 -m json.tool | sed -n '1,120p'"
+```
+
+Output excerpt:
+
+```json
+{
+    "active_forward_calls": 0,
+    "active_patterns": 123,
+    "agent_runtime_model_policy": "haiku",
+    "apicp_enabled": true,
+    "primary_provider": "claude-code",
+    "response_log_entries": 0,
+    "synthesis_enabled": true
+}
+```
+
+PASS: Die neue Gateway-Policy ist auf der VM sichtbar.
+
+### AC-5 - Journal zeigt keinen Startfehler
+
+Command:
+
+```bash
+ssh ubuntu@10.0.0.240 "pid=\$(pgrep -n cortex-gate); echo PID=\$pid; journalctl _PID=\$pid --since '2 min ago' --no-pager | tail -80"
+```
+
+Output excerpt:
+
+```text
+PID=1578506
+cortex-gateway starting
+registered provider name=anthropic-direct model=claude-opus-4-6
+registered provider name=claude-code model=claude-opus-4-6
+traffic control defaults applied
+company context loaded
+proxy server starting addr=:8080
+control plane starting addr=:8081
+```
+
+PASS: PID-basiertes Journal zeigt normalen Startup ohne Panic/Fatal.

@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan314.md`
-- Overall status: `TASK_5_DONE_TASK_6_PENDING`
-- Current task: `Task 6 - Phase 6: Gateway Deploy auf 10.0.0.240`
+- Overall status: `TASK_6_DONE_TASK_7_PENDING`
+- Current task: `Task 7 - Phase 8: AC-Matrix und Live-Verifikation`
 - Current branch: `feat/issue-314-agent-model-policy`
 - Worktree: `/work/company/project-sentinel`
 - Base: `origin/main @ 0f1c46c19bfa61d0616b3468834d29b557b3e254`
@@ -62,6 +62,15 @@
     - `BenchmarkResponseLogBufferAdd`: `3831 ns/op`, `0 B/op`, `0 allocs/op`
   - Zielwerte sind erfuellt: Classify `<1us`, Resolve `<1us`, ResponseLog Add `<10us`.
   - `/usr/bin/time -v`, `vmstat` und `iostat` wurden fuer CPU/RAM/IO-Evidence erfasst.
+- Task 6 ist erledigt:
+  - `sentinel-gateway` nutzt laut systemd `ExecStart=/opt/sentinel/bin/cortex-gateway`.
+  - Altes Binary wurde gesichert unter `/opt/sentinel/bin/cortex-gateway.bak-issue314-20260424062401`.
+  - Erster Copy-Versuch traf `Text file busy`; Fix war kontrolliertes `systemctl stop`, Copy, `systemctl start`.
+  - Neues Binary `/opt/sentinel/bin/cortex-gateway` ist deployed (`23244031` Bytes, `2026-04-24 06:24 UTC`).
+  - `sentinel-gateway` ist `active`.
+  - `curl -s localhost:8080/health` liefert `status=ok`.
+  - `curl -s localhost:8081/control/traffic-stats` enthaelt `agent_runtime_model_policy: haiku`.
+  - PID-basiertes Gateway-Journal seit Restart zeigt Startup-Logs ohne Panic/Fatal.
 
 ## Blocked items
 
@@ -74,7 +83,7 @@
 - `b953e4a` Task [2] Phase 2 - Gateway Policy-Layer
 - `114732d` Task [3] Phase 3 - Observability und Response Log
 - `b326a2f` Task [4] Phase 4 - Go-Tests
-- `TBD` Task [5] Phase 5 - Benchmarks
+- `9d2adf5` Task [5] Phase 5 - Benchmarks
 - `TBD` Task [6] Phase 6 - Gateway Deploy auf 10.0.0.240
 - `TBD` Task [7] Phase 8 - AC-Matrix und Live-Verifikation
 - `TBD` Task [8] Dokumentation, PR- und Close-Sequenz
@@ -89,10 +98,58 @@
 | 3 | Phase 3 - Observability und Response Log | DONE | Traffic-Stats, ResponseLogEntry, Journal-Logs fuer Success/Stream/Error, bounded circular buffer | inspect, command |
 | 4 | Phase 4 - Go-Tests | DONE | Unit-/Regressionstests fuer Klassen, Policy, `/v1/messages`, Response-Logs und Validation | command |
 | 5 | Phase 5 - Benchmarks | DONE | Classify/Resolve/ResponseLog Benchmarks mit Zielwerten und System-Monitoring | command, system |
-| 6 | Phase 6 - Gateway Deploy auf 10.0.0.240 | PENDING | ExecStart pruefen, Linux-Binary bauen, deployen, Gateway restart, Smoke | command, system |
+| 6 | Phase 6 - Gateway Deploy auf 10.0.0.240 | DONE | ExecStart pruefen, Linux-Binary bauen, deployen, Gateway restart, Smoke | command, system |
 | 7 | Phase 8 - AC-Matrix und Live-Verifikation | PENDING | AC-1 bis AC-6 einzeln auf VM belegen, Config restore, Panic/Error/Secret-Grep | command, system |
 | 8 | Dokumentation, PR- und Close-Sequenz | PENDING | CHANGELOG, Evidence-Doku, PR mit Pflichtsektionen, Labels, Issue-Close erst nach verified | command, inspect |
 | 9 | Plan-Verifikation | PENDING | Plan komplett gegen Ergebnis pruefen, Abweichungen fixen oder blocken | inspect, command, system |
+
+## Task 6 - Phase 6: Gateway Deploy auf 10.0.0.240
+
+### Pre-task self-check
+
+- Was muss getan werden:
+  - VM-Servicepfad und `ExecStart` fuer `sentinel-gateway` pruefen
+  - lokales Linux/amd64 Gateway-Binary bauen
+  - Binary nach `/opt/sentinel/bin/cortex-gateway` deployen
+  - `sentinel-gateway` restart ausfuehren
+  - Smoke-Checks gegen `/health` und `/control/traffic-stats`
+  - Gateway-Journal auf offensichtliche Startfehler pruefen
+- Welche ACs muessen hier passen:
+  - AC-1: Deploy trifft den tatsaechlich von systemd gestarteten Binary-Pfad.
+  - AC-2: Service ist nach Restart `active`.
+  - AC-3: `/health` liefert OK.
+  - AC-4: `/control/traffic-stats` enthaelt `agent_runtime_model_policy`.
+  - AC-5: Journal zeigt keinen unmittelbaren Panic-/Fatal-Startfehler.
+- Wie wird bewiesen:
+  - `ssh ubuntu@10.0.0.240 "systemctl cat sentinel-gateway ..."`
+  - `GOOS=linux GOARCH=amd64 go build -o cortex-gateway ./cmd/cortex-gateway/`
+  - `scp`, `sudo cp`, `sudo systemctl restart sentinel-gateway`
+  - `curl -s localhost:8080/health`
+  - `curl -s localhost:8081/control/traffic-stats`
+  - `journalctl _PID=$(pgrep cortex-gate) --since '2 min ago' --no-pager`
+- Erwartete Dateien:
+  - lokales Build-Artefakt `cortex-gateway` untracked/ignored
+  - `test-314-verification.md`
+  - `PROGRESS.md`
+- Risiken:
+  - VM kann busy sein; falls Restart fehlschlaegt, sofort Journal lesen und Service nicht kaputt stehen lassen.
+
+### Outcome
+
+- `ExecStart=/opt/sentinel/bin/cortex-gateway` wurde verifiziert.
+- Linux/amd64 Gateway-Binary wurde lokal gebaut und auf die VM kopiert.
+- Altes Binary wurde vor Austausch gesichert.
+- Nach `Text file busy` wurde der Service kontrolliert gestoppt, das Binary ersetzt und wieder gestartet.
+- Gateway-Service ist aktiv, Health ist OK, neues Traffic-Stats-Feld ist live sichtbar.
+
+### Evidence
+
+- `test-314-verification.md` enthaelt Task-6 Command/Output-Evidence.
+- AC-1 PASS: systemd startet `/opt/sentinel/bin/cortex-gateway`.
+- AC-2 PASS: `systemctl is-active sentinel-gateway` liefert `active`.
+- AC-3 PASS: `/health` liefert `{"status":"ok",...}`.
+- AC-4 PASS: `/control/traffic-stats` enthaelt `"agent_runtime_model_policy": "haiku"`.
+- AC-5 PASS: PID-basiertes Journal seit Restart zeigt Startup ohne Panic/Fatal.
 
 ## Task 5 - Phase 5: Benchmarks
 
