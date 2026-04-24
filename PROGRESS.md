@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan314.md`
-- Overall status: `TASK_8_DONE_TASK_9_PENDING`
-- Current task: `Task 9 - Plan-Verifikation`
+- Overall status: `TASK_9_DONE_READY_FOR_PR`
+- Current task: `Post-task GitHub PR/Merge/Close sequence`
 - Current branch: `feat/issue-314-agent-model-policy`
 - Worktree: `/work/company/project-sentinel`
 - Base: `origin/main @ 0f1c46c19bfa61d0616b3468834d29b557b3e254`
@@ -83,6 +83,13 @@
   - `CHANGELOG.md` enthaelt einen #314-Unreleased-Eintrag.
   - PR-Pflichtsektionen sind fuer `gh pr create` vorbereitet: Summary, Changes, Linked Issues, Test Plan, Benchmarks, Evidence, Checklist.
   - Issue-Close-Sequenz bleibt korrekt nachgelagert: erst PR/CI/Merge, dann `status:verified`, dann Close.
+- Task 9 ist erledigt:
+  - Plan-Slices 1-9 sind abgeschlossen.
+  - `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control` ist gruen.
+  - `go build ./cmd/cortex-gateway` ist gruen.
+  - VM-Gateway `/health` ist OK; `anthropic-direct` und `claude-code` Circuit-Breaker sind geschlossen.
+  - VM-`traffic-stats` zeigt `agent_runtime_model_policy=haiku`, `last_agent_runtime_effective_model=haiku`, `last_agent_runtime_policy_source=agent_runtime_policy`.
+  - GitHub Issue #314 ist offen mit `quality:ready` und `status:in-progress`; `status:verified` wird erst nach PR/Merge gesetzt.
 
 ## Blocked items
 
@@ -98,7 +105,7 @@
 - `9d2adf5` Task [5] Phase 5 - Benchmarks
 - `9495871` Task [6] Phase 6 - Gateway Deploy auf 10.0.0.240
 - `TBD` Task [7] Phase 8 - AC-Matrix und Live-Verifikation
-- `TBD` Task [8] Dokumentation, PR- und Close-Sequenz
+- `645553b` Task [8] Dokumentation, PR- und Close-Sequenz
 - `TBD` Task [9] Plan-Verifikation
 
 ## Task table
@@ -113,7 +120,7 @@
 | 6 | Phase 6 - Gateway Deploy auf 10.0.0.240 | DONE | ExecStart pruefen, Linux-Binary bauen, deployen, Gateway restart, Smoke | command, system |
 | 7 | Phase 8 - AC-Matrix und Live-Verifikation | DONE | AC-1 bis AC-6 einzeln auf VM belegen, Config restore, Panic/Error/Secret-Grep | command, system |
 | 8 | Dokumentation, PR- und Close-Sequenz | DONE | CHANGELOG, Evidence-Doku, PR mit Pflichtsektionen, Labels, Issue-Close erst nach verified | command, inspect |
-| 9 | Plan-Verifikation | PENDING | Plan komplett gegen Ergebnis pruefen, Abweichungen fixen oder blocken | inspect, command, system |
+| 9 | Plan-Verifikation | DONE | Plan komplett gegen Ergebnis pruefen, Abweichungen fixen oder blocken | inspect, command, system |
 
 ## Task 6 - Phase 6: Gateway Deploy auf 10.0.0.240
 
@@ -249,6 +256,51 @@
 - AC-1 PASS: CHANGELOG enthaelt #314-Eintrag.
 - AC-2 PASS: PR-Pflichtsektionen werden beim `gh pr create` verwendet.
 - AC-3 PASS: `status:verified`/Close bleibt nach finaler Verifikation und Merge.
+
+## Task 9 - Plan-Verifikation
+
+### Pre-task self-check
+
+- Was muss getan werden:
+  - `codex-plan314.md` gegen den umgesetzten Stand pruefen
+  - Issue-ACs, Benchmarks, Deploy, CHANGELOG und Evidence vollstaendig abgleichen
+  - finalen Git-Status pruefen
+  - keine offenen lokalen Code-/Doku-Aenderungen ausser Task-9-Progress/Evidence hinterlassen
+- Welche ACs muessen hier passen:
+  - AC-1: alle Plan-Slices sind erledigt oder explizit nicht relevant.
+  - AC-2: alle 6 GitHub-ACs sind PASS.
+  - AC-3: Benchmarks liegen unter Zielwert.
+  - AC-4: VM-Deploy ist live.
+  - AC-5: CHANGELOG und PR-Vorbereitung sind vorhanden.
+  - AC-6: Git-Status ist vor Push sauber nach Task-9-Commit.
+- Wie wird bewiesen:
+  - `git status --short`
+  - `go test`, `go build`
+  - `gh issue view 314`
+  - VM `health`, `traffic-stats`, `traffic-responses`
+  - Plan-/Evidence-Inspection
+- Erwartete Dateien:
+  - `PROGRESS.md`
+  - `test-314-verification.md`
+- Risiken:
+  - Nach Task 9 bleiben Push/PR/CI/Merge/Close als GitHub-Sequenz; nicht vor lokal sauberem Stand starten.
+
+### Outcome
+
+- Alle Planphasen wurden gegen Code, Tests, Benchmarks, Deploy, VM-Evidence und CHANGELOG abgeglichen.
+- Keine Planabweichung bleibt offen.
+- Issue #314 bleibt vor PR/Merge korrekt offen und nicht verfrueht `status:verified`.
+- Lokaler Abschluss ist bereit fuer Push/PR/CI/Merge/Close-Sequenz.
+
+### Evidence
+
+- `test-314-verification.md` enthaelt Task-9 Command/Output-Evidence.
+- AC-1 PASS: Plan-Slices 1-9 erledigt.
+- AC-2 PASS: GitHub-ACs 1-6 sind in Task 7 PASS.
+- AC-3 PASS: Benchmark-Zielwerte in Task 5 PASS.
+- AC-4 PASS: VM-Deploy in Task 6/7 live belegt.
+- AC-5 PASS: CHANGELOG und PR-Vorbereitung in Task 8 PASS.
+- AC-6 PASS: finaler Test-/Build-/VM-Smoke ist gruen.
 
 ## Task 5 - Phase 5: Benchmarks
 

@@ -1015,3 +1015,103 @@ gh issue close 314 --repo silentspike/project-sentinel
 ```
 
 PASS: `status:verified` wird erst nach finaler Verifikation/Merge gesetzt und vor dem Issue-Close.
+
+## Task 9 - Plan-Verifikation
+
+### AC-1 - Plan-Slices abgeschlossen
+
+Command:
+
+```bash
+git log --oneline --decorate -10
+```
+
+Output excerpt:
+
+```text
+645553b Task [8]: Dokumentation und PR-Vorbereitung
+00f10ec Task [7]: Phase 8 - AC-Matrix und Live-Verifikation
+9495871 Task [6]: Phase 6 - Gateway Deploy auf VM
+9d2adf5 Task [5]: Phase 5 - Benchmarks
+b326a2f Task [4]: Phase 4 - Go-Tests
+114732d Task [3]: Phase 3 - Observability und Response Log
+b953e4a Task [2]: Phase 2 - Gateway Policy-Layer
+a42ef76 Task [1]: Phase 1 - Issue-Body-Repair, Branch und Preflight
+```
+
+PASS: Plan-Slices 1 bis 8 sind committed; Task 9 ist diese finale Verifikation.
+
+### AC-2 - Tests und Build final gruen
+
+Command:
+
+```bash
+go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control
+go build ./cmd/cortex-gateway
+```
+
+Output:
+
+```text
+ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy	(cached)
+ok  	github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control	(cached)
+```
+
+`go build ./cmd/cortex-gateway` exited `0`.
+
+PASS: Betroffene Gateway-Packages testen und bauen final.
+
+### AC-3 - VM-Deploy bleibt live und gesund
+
+Command:
+
+```bash
+ssh ubuntu@10.0.0.240 "curl -s localhost:8080/health; printf '\n--- traffic ---\n'; curl -s localhost:8081/control/traffic-stats | python3 -c 'import sys,json; d=json.load(sys.stdin); print({k:d.get(k) for k in [\"agent_runtime_model_policy\",\"last_agent_runtime_effective_model\",\"last_agent_runtime_policy_source\",\"last_agent_runtime_provider\",\"primary_provider\",\"external_mitm_provider\"]})'"
+```
+
+Output:
+
+```text
+{"status":"ok","version":"0.1.0","circuit_breakers":{"anthropic-direct":"closed","claude-code":"closed"},"guardrails_enabled":false}
+
+--- traffic ---
+{'agent_runtime_model_policy': 'haiku', 'last_agent_runtime_effective_model': 'haiku', 'last_agent_runtime_policy_source': 'agent_runtime_policy', 'last_agent_runtime_provider': 'claude-code', 'primary_provider': 'claude-code', 'external_mitm_provider': 'anthropic-direct'}
+```
+
+PASS: Der deployed Gateway zeigt die #314-Policy weiterhin live.
+
+### AC-4 - GitHub Issue bleibt korrekt offen bis PR/Merge
+
+Command:
+
+```bash
+gh issue view 314 --repo silentspike/project-sentinel --json number,state,labels,title,updatedAt
+```
+
+Output excerpt:
+
+```json
+{
+  "number": 314,
+  "state": "OPEN",
+  "title": "Policy: Agent LLM model defaults via Gateway/Inference layer",
+  "labels": ["quality:ready", "status:in-progress", "type:feature", "comp:cortex", "comp:inference"]
+}
+```
+
+PASS: Issue ist nicht verfrueht geschlossen; `status:verified` kommt erst nach PR/Merge.
+
+### AC-5 - Finale Sequenz
+
+Nach Task-9-Commit:
+
+```bash
+git push -u origin feat/issue-314-agent-model-policy
+gh pr create --repo silentspike/project-sentinel ...
+# CI gruen abwarten
+gh pr merge ...
+gh issue edit 314 --repo silentspike/project-sentinel --add-label "status:verified" --remove-label "status:in-progress"
+gh issue close 314 --repo silentspike/project-sentinel
+```
+
+PASS: Lokaler Stand ist bereit fuer die GitHub-Sequenz.
