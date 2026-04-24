@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 )
 
@@ -23,11 +24,12 @@ const (
 
 // ConfigSnapshot is a mutex-free copy of Config for serialization and reads.
 type ConfigSnapshot struct {
-	PrimaryProvider string            `json:"primary_provider"`
-	Temperature     float64           `json:"temperature"`
-	MaxTokens       int               `json:"max_tokens"`
-	RateLimit       float64           `json:"rate_limit_rps"`
-	AgentOverrides  map[string]string `json:"agent_overrides"`
+	PrimaryProvider         string            `json:"primary_provider"`
+	Temperature             float64           `json:"temperature"`
+	MaxTokens               int               `json:"max_tokens"`
+	RateLimit               float64           `json:"rate_limit_rps"`
+	AgentOverrides          map[string]string `json:"agent_overrides"`
+	AgentRuntimeModelPolicy string            `json:"agent_runtime_model_policy"`
 
 	// Traffic Control (#288)
 	SynthesisEnabled      bool   `json:"synthesis_enabled"`
@@ -50,12 +52,13 @@ type ConfigSnapshot struct {
 
 // Config holds the current gateway configuration (mutable at runtime).
 type Config struct {
-	mu              sync.RWMutex
-	primaryProvider string
-	temperature     float64
-	maxTokens       int
-	rateLimit       float64
-	agentOverrides  map[string]string // agent_id -> provider_name
+	mu                      sync.RWMutex
+	primaryProvider         string
+	temperature             float64
+	maxTokens               int
+	rateLimit               float64
+	agentOverrides          map[string]string // agent_id -> provider_name
+	agentRuntimeModelPolicy string
 
 	// Traffic Control (#288)
 	synthesisEnabled      bool
@@ -79,11 +82,12 @@ type Config struct {
 // NewConfig creates a Config with sensible defaults.
 func NewConfig(primaryProvider string) *Config {
 	return &Config{
-		primaryProvider: primaryProvider,
-		temperature:     0.7,
-		maxTokens:       4096,
-		rateLimit:       0,
-		agentOverrides:  make(map[string]string),
+		primaryProvider:         primaryProvider,
+		temperature:             0.7,
+		maxTokens:               4096,
+		rateLimit:               0,
+		agentOverrides:          make(map[string]string),
+		agentRuntimeModelPolicy: "haiku",
 
 		synthesisEnabled:      false,
 		sequencingEnabled:     false,
@@ -135,11 +139,12 @@ func (c *Config) Get() ConfigSnapshot {
 		overrides[k] = v
 	}
 	return ConfigSnapshot{
-		PrimaryProvider: c.primaryProvider,
-		Temperature:     c.temperature,
-		MaxTokens:       c.maxTokens,
-		RateLimit:       c.rateLimit,
-		AgentOverrides:  overrides,
+		PrimaryProvider:         c.primaryProvider,
+		Temperature:             c.temperature,
+		MaxTokens:               c.maxTokens,
+		RateLimit:               c.rateLimit,
+		AgentOverrides:          overrides,
+		AgentRuntimeModelPolicy: c.agentRuntimeModelPolicy,
 
 		SynthesisEnabled:      c.synthesisEnabled,
 		SequencingEnabled:     c.sequencingEnabled,
@@ -207,6 +212,18 @@ var configUpdaters = map[string]configUpdater{
 			return errors.New("primary_provider must not be empty")
 		}
 		c.primaryProvider = v
+		return nil
+	},
+	"agent_runtime_model_policy": func(c *Config, val interface{}) error {
+		v, ok := val.(string)
+		if !ok {
+			return fmt.Errorf("agent_runtime_model_policy must be a string, got %T", val)
+		}
+		v = strings.TrimSpace(v)
+		if v != "" && v != "haiku" {
+			return fmt.Errorf("agent_runtime_model_policy must be empty or %q, got %q", "haiku", v)
+		}
+		c.agentRuntimeModelPolicy = v
 		return nil
 	},
 	"synthesis_enabled": func(c *Config, val interface{}) error {

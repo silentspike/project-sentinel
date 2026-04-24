@@ -3,8 +3,8 @@
 ## Status
 
 - Plan source: `/work/company/codex-plan314.md`
-- Overall status: `TASK_1_DONE_TASK_2_PENDING`
-- Current task: `Task 2 - Phase 2: Gateway Policy-Layer`
+- Overall status: `TASK_2_DONE_TASK_3_PENDING`
+- Current task: `Task 3 - Phase 3: Observability und Response Log`
 - Current branch: `feat/issue-314-agent-model-policy`
 - Worktree: `/work/company/project-sentinel`
 - Base: `origin/main @ 0f1c46c19bfa61d0616b3468834d29b557b3e254`
@@ -29,6 +29,16 @@
   - `quality:needs-spec`, `status:triage` und `status:backlog` wurden entfernt.
   - `ssh ubuntu@10.0.0.240 "/usr/bin/claude -p --model haiku 'Antworte exakt mit PONG.'"` lieferte `PONG`.
   - In Task 1 wurde kein Daemon-Code geaendert.
+- Task 2 ist erledigt:
+  - `RequestClass` wurde zentral im Gateway eingefuehrt.
+  - `agent_runtime` wird nur bei positiver numerischer `agent_id` und nach Ausschluss von Platform-/Service-/Analysepfaden gesetzt.
+  - `agent_runtime_model_policy` defaultet in der Control-Config auf `haiku`.
+  - `ResolveModelPolicy` setzt Haiku nur fuer `agent_runtime` ohne explizites Modell.
+  - `/v1/messages` bleibt `external_compat` und `PreferredProvider=anthropic-direct`.
+  - ungueltige Policy/Provider-Kombinationen failen vor dem Provider-Call mit `model policy rejected`.
+  - Zwischenfund: Die Policy wurde nach erstem Testfail aus dem Pre-Synthesis-Pfad in den echten Forward-Pfad verschoben.
+  - `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control` ist gruen.
+  - `go build ./cmd/cortex-gateway` ist gruen.
 
 ## Blocked items
 
@@ -37,7 +47,7 @@
 
 ## Commit references
 
-- `TBD` Task [1] Phase 1 - Issue-Body-Repair, Branch und Preflight
+- `a42ef76` Task [1] Phase 1 - Issue-Body-Repair, Branch und Preflight
 - `TBD` Task [2] Phase 2 - Gateway Policy-Layer
 - `TBD` Task [3] Phase 3 - Observability und Response Log
 - `TBD` Task [4] Phase 4 - Go-Tests
@@ -52,7 +62,7 @@
 | # | Task | Status | Scope | Evidence |
 |---|------|--------|-------|----------|
 | 1 | Phase 1 - Issue-Body-Repair, Branch und Preflight | DONE | Branch von main, GitHub-Body reparieren, `quality:ready`, Haiku-String fuer claude-code pruefen, Platform-Controlplane out-of-scope bestaetigen | command, inspect, system |
-| 2 | Phase 2 - Gateway Policy-Layer | PENDING | Request-Klassifikation, Agent-Runtime-Policy, Resolver-Reihenfolge, fail-closed Validation | inspect, command |
+| 2 | Phase 2 - Gateway Policy-Layer | DONE | Request-Klassifikation, Agent-Runtime-Policy, Resolver-Reihenfolge, fail-closed Validation | inspect, command |
 | 3 | Phase 3 - Observability und Response Log | PENDING | Traffic-Stats, ResponseLogEntry, Journal-Logs fuer Success/Stream/Error, ggf. bounded circular buffer | inspect, command |
 | 4 | Phase 4 - Go-Tests | PENDING | Unit-/Regressionstests fuer Klassen, Policy, `/v1/messages`, Response-Logs und Validation | command |
 | 5 | Phase 5 - Benchmarks | PENDING | Classify/Resolve/ResponseLog Benchmarks mit Zielwerten und System-Monitoring | command, system |
@@ -133,3 +143,53 @@
 - Risiken:
   - aktuelle Config-Strukturen koennen in `control` statt `proxy` liegen; keine neue Parallel-Konfig bauen, sondern bestehende Patterns nutzen.
   - Response-Observability gehoert erst in Task 3; Task 2 soll Policy-Entscheidung und Request-Klassen sauber schneiden.
+
+### Outcome
+
+- `cmd/cortex-gateway/internal/proxy/policy.go` neu eingefuehrt.
+- `LLMRequest` traegt jetzt `RequestClass`, `EffectiveModel` und `PolicySource` als interne Felder.
+- `control.ConfigSnapshot` und `control.Config` enthalten `AgentRuntimeModelPolicy`.
+- Default fuer `agent_runtime_model_policy` ist `haiku`.
+- `pipeline.ServeHTTP` klassifiziert Requests frueh, wendet die Modellpolicy aber erst im echten Forward-Pfad vor Streaming/Provider.Send an.
+- Die erste Testiteration zeigte eine Pre-Synthesis-Blockade; diese wurde durch Verschieben der Policy-Anwendung behoben.
+- Testprovider `mock` mappt `haiku` fuer bestehende Gateway-Tests; unbekannte Provider bleiben fail-closed.
+
+### Evidence
+
+- `test-314-verification.md` enthaelt Task-2 Command/Output-Evidence.
+- AC-1 PASS: `RequestClassExternalCompat`, `RequestClassAgentRuntime`, `RequestClassPlatformControlplane`, `RequestClassServiceInternal`, `RequestClassInternalOther` in `policy.go`.
+- AC-2 PASS: `ClassifyRequest()` prueft `/v1/messages`, `platform_analysis`, `request_type`, Service-Identitaeten und erst danach numerische Agent-ID.
+- AC-3 PASS: `ResolveModelPolicy()` setzt Haiku nur fuer `RequestClassAgentRuntime` ohne explizites Modell.
+- AC-4 PASS: explizites Request-Modell gewinnt mit `PolicySourceRequestOverride`.
+- AC-5 PASS: `/v1/messages` bleibt `PreferredProvider=anthropic-direct` und `RequestClassExternalCompat`.
+- AC-6 PASS: nicht unterstuetzte Provider liefern `model policy rejected`, kein stiller Opus-Fallback.
+- Command PASS: `go test ./cmd/cortex-gateway/internal/proxy ./cmd/cortex-gateway/internal/control`.
+- Command PASS: `go build ./cmd/cortex-gateway`.
+
+## Task 3 - Phase 3: Observability und Response Log
+
+### Pre-task self-check
+
+- Was muss getan werden:
+  - `traffic-stats` um Agent-Runtime-Policy und letzten effektiven Runtime-Forward erweitern
+  - `ResponseLogEntry` um `request_class`, `model`, `policy_source`, `agent_id`, `agent_name` erweitern
+  - Journal-Logs fuer Success-, Stream- und Provider-Error-Pfade mit Request-Klasse und Policy-Feldern anreichern
+  - pruefen, ob `ResponseLogBuffer` wegen Hot-Path-Kopieren auf bounded circular buffer umgebaut werden muss
+- Welche ACs muessen hier passen:
+  - AC-1: Traffic-Stats zeigen `agent_runtime_model_policy`, `last_agent_runtime_effective_model`, `last_agent_runtime_policy_source`.
+  - AC-2: Traffic-Responses zeigen redigiert `request_class`, `provider`, `model`, `policy_source`, `agent_id`, `agent_name`.
+  - AC-3: Success-, Stream- und Error-Logs enthalten die neuen Felder.
+  - AC-4: keine Header, Tokens oder Secrets werden in Response-Log/Stats aufgenommen.
+  - AC-5: Response-Log-Append bleibt bounded und ohne O(n)-Kopie im steady state, falls Benchmarks das erzwingen.
+- Wie wird bewiesen:
+  - Go-Tests/Build nach Edit
+  - strukturelle Inspection fuer Secret-Freiheit
+  - Benchmarks folgen in Task 5
+- Erwartete Dateien:
+  - `cmd/cortex-gateway/internal/proxy/response_log.go`
+  - `cmd/cortex-gateway/internal/proxy/pipeline.go`
+  - `cmd/cortex-gateway/main.go`
+  - Tests in `cmd/cortex-gateway/internal/proxy` und ggf. `cmd/cortex-gateway/internal/control`
+- Risiken:
+  - `traffic-stats` lebt in `main.go` und muss ohne zusaetzliche globale State-Duplikation an Gateway-Daten kommen.
+  - Error-Logs muessen AC-4 belegen koennen, auch wenn `/v1/messages` mit Dummy-Key fehlschlaegt.
