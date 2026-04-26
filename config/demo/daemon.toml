@@ -21,7 +21,7 @@
 #
 # The SandboxEnforcer detects feature absence at startup and degrades
 # gracefully. You will see warning lines in the daemon log on boot —
-# that is expected demo behaviour.
+# that is expected demo behavior.
 
 [daemon]
 config_dir   = "/opt/sentinel/config-runtime"
