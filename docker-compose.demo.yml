@@ -1,0 +1,148 @@
+# Sentinel 10-minute demo stack.
+#
+# Brings up: NATS + sentinel-daemon + cortex-gateway + sentinel-judge +
+#            sentinel-nats-bridge + sentinel-dashboard
+#
+# All five Sentinel services share the same image (deploy/docker/Dockerfile.demo)
+# and select their binary via the SENTINEL_ROLE environment variable.
+#
+# Usage:
+#   ./scripts/demo.sh                    # build + run + open dashboard + tear down
+#   docker compose -f docker-compose.demo.yml up --build
+#
+# Ports exposed on the host:
+#   18000  Dashboard UI           (browser)              -> container :8000
+#   8080   Cortex Gateway (proxy) -- also serves /metrics
+#   8081   Cortex Gateway (control plane)
+#   18082  sentinel-judge        (health, /metrics)     -> container :8082
+#   18083  sentinel-nats-bridge  (health)               -> container :8083
+#   8084   sentinel-daemon (operator API)
+#   8222   NATS monitoring HTTP
+#
+# Host ports 18000/18082/18083 use a +10000 offset because 8000/8082/8083 are
+# commonly bound on a developer laptop (nginx, dev servers, other compose
+# stacks). Adjust to canonical ports if your machine has them free.
+
+name: sentinel-demo
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    container_name: sentinel-demo-nats
+    command: ["-c", "/etc/nats/nats.conf"]
+    volumes:
+      - ./config/demo/nats.conf:/etc/nats/nats.conf:ro
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [sentinel]
+
+  daemon:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.demo
+    image: sentinel-demo:local
+    container_name: sentinel-demo-daemon
+    environment:
+      SENTINEL_ROLE: daemon
+    depends_on:
+      nats:
+        condition: service_healthy
+    ports:
+      - "8084:8084"
+    volumes:
+      - sentinel-data:/opt/sentinel/data
+    healthcheck:
+      # operator API has no dedicated /healthz; any HTTP response (incl. 404)
+      # proves the listener is up. -f is intentionally omitted.
+      test: ["CMD", "curl", "-s", "-o", "/dev/null", "--max-time", "3", "http://localhost:8084/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks: [sentinel]
+
+  gateway:
+    image: sentinel-demo:local
+    container_name: sentinel-demo-gateway
+    environment:
+      SENTINEL_ROLE: gateway
+    depends_on:
+      daemon:
+        condition: service_healthy
+    # gateway exposes the proxy on 8080 (also serves /metrics) and the
+    # control plane on 8081. There is no separate metrics port.
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "3", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    networks: [sentinel]
+
+  judge:
+    image: sentinel-demo:local
+    container_name: sentinel-demo-judge
+    environment:
+      SENTINEL_ROLE: judge
+    depends_on:
+      nats:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    # host port 18082 to avoid colliding with other local services on 8082
+    ports:
+      - "18082:8082"
+    networks: [sentinel]
+
+  nats-bridge:
+    image: sentinel-demo:local
+    container_name: sentinel-demo-nats-bridge
+    environment:
+      SENTINEL_ROLE: nats-bridge
+    depends_on:
+      nats:
+        condition: service_healthy
+      daemon:
+        condition: service_healthy
+    # host port 18083 (matching judge's 18082 offset)
+    ports:
+      - "18083:8083"
+    volumes:
+      - sentinel-data:/opt/sentinel/data
+    networks: [sentinel]
+
+  dashboard:
+    image: sentinel-demo:local
+    container_name: sentinel-demo-dashboard
+    environment:
+      SENTINEL_ROLE: dashboard
+      PORT: "8000"
+      DAEMON_OPERATOR_URL: "http://daemon:8084"
+      GATEWAY_URL: "http://gateway:8080"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    # host port 18000 (port 8000 commonly used by local nginx/dev servers).
+    # Adjust on a host where 8000 is free if you want the canonical mapping.
+    ports:
+      - "18000:8000"
+    volumes:
+      - sentinel-data:/opt/sentinel/data:ro
+    networks: [sentinel]
+
+networks:
+  sentinel:
+    name: sentinel-demo
+
+volumes:
+  sentinel-data:
+    name: sentinel-demo-data

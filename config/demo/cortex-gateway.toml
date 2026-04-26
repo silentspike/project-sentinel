@@ -1,0 +1,46 @@
+# Demo overrides for Cortex Gateway.
+# Whole-file replacement — keep ALL sections present in the production schema.
+
+[server]
+proxy_port = 8080
+control_port = 8081
+read_timeout_seconds = 30
+write_timeout_seconds = 60
+
+[providers.ollama]
+type = "ollama"
+base_url = "http://localhost:11434"
+model = "qwen3:7b"
+max_tokens = 4096
+priority = 1
+
+[pipeline]
+temperature = 0.7
+enable_fourth_wall_detection = true
+enable_perception_injection = true
+enable_action_extraction = true
+
+[compiler]
+agent_config_dir = "config/agents"
+enable_cache_ordering = true
+enable_distillation = true
+distillation_max_tokens = 2000
+
+[guardrails]
+enabled = false
+budget_hourly_tokens = 5000000
+budget_daily_tokens = 50000000
+rate_limit_per_agent_rpm = 20
+rate_limit_global_rpm = 300
+burst_multiple = 2
+fallback_provider = "ollama"
+
+[guardrails.provider_prices.ollama]
+input_price_per_m_token = 0.0
+output_price_per_m_token = 0.0
+
+[hardening]
+
+[metrics]
+enabled = true
+path = "/metrics"

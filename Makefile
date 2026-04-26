@@ -72,6 +72,17 @@ build-rust-remote: ## Build Rust on remote build server
 build-rust-release: ## Build Rust release (remote, includes eBPF kernel probes)
 	cargo remote -- build --workspace --release --features ebpf
 
+demo-binaries: ## Build only the Rust binaries the docker demo image needs (remote)
+	cargo remote -c -- build --release \
+		--bin sentinel-daemon \
+		--bin sentinel-nightrun
+
+demo-image: demo-binaries ## Build the docker demo image (requires demo-binaries)
+	docker build -f deploy/docker/Dockerfile.demo -t sentinel-demo:local .
+
+demo: demo-image ## Build + run the 10-minute demo stack
+	./scripts/demo.sh
+
 build-go: ## Build Cortex Gateway
 	cd cmd/cortex-gateway && go build -o cortex-gateway ./...
 

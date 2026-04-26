@@ -121,12 +121,51 @@ transparently use it.
 
 ### Demo (10 minutes)
 
+![Sentinel demo dashboard](docs/images/sentinel-demo.gif)
+
 ```bash
-docker compose -f docker-compose.demo.yml up
+make demo                                 # build binaries + image, then run
+# or, step by step:
+make demo-binaries                        # cargo remote -c -- build --release ...
+make demo-image                           # docker build
+./scripts/demo.sh                         # run + open dashboard, tear down after 10 min
 ```
 
 Runs five agents through a 10-minute morning shift with a default
-PixelPerfekt configuration. Dashboard: http://localhost:8000.
+PixelPerfekt configuration. Dashboard: http://localhost:18000 (host port
+18000 is used because 8000 is commonly bound by local nginx/dev servers;
+adjust in `docker-compose.demo.yml` if you have 8000 free).
+
+#### What the docker demo shows — and what it does not
+
+The compose stack is deliberately a **behavioural demo**, not a full
+production deployment. It is meant to give a recruiter or curious reader
+a working dashboard in one command, not to reproduce the full sandbox
+story.
+
+| Feature                                 | Demo container | VM deploy |
+|-----------------------------------------|----------------|-----------|
+| ECS world, Bio-Engine, Physics          | yes            | yes       |
+| Event sourcing + projections + dashboard| yes            | yes       |
+| Cortex Gateway pipeline + synthesis     | yes            | yes       |
+| NATS JetStream + sentinel-judge         | yes            | yes       |
+| **bwrap + Landlock per-agent isolation**| no (warned)    | yes       |
+| **cgroups v2 per-agent resource caps**  | no (warned)    | yes       |
+| **netns + nftables agent network**      | no (warned)    | yes       |
+| **eBPF probes (aya-rs)**                | no (warned)    | yes       |
+| **sentinel-fs CAS-FUSE**                | no (warned)    | yes       |
+| Zenoh SHM transport                     | no (TCP only)  | yes       |
+
+These kernel-bound features need user namespaces, `CAP_BPF`,
+`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, and a writeable bpf-fs / `/dev/fuse`.
+A plain unprivileged container has none of those. The
+`SandboxEnforcer` (`crates/sentinel-sandbox/src/enforcer.rs`) detects
+the absence at boot and degrades gracefully — warnings in the daemon
+log are the expected demo signal.
+
+For the full stack with sandbox enforcement see
+`deploy/systemd/*.service` and the deployment notes in
+[docs/governance.md](docs/governance.md).
 
 ## Repository Layout
 

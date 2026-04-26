@@ -1,0 +1,46 @@
+# Demo overrides — small, fast, time-capped.
+#
+# Loaded by the docker-compose.demo.yml stack on top of config/daemon.toml.
+# DO NOT use these values for production deployments.
+#
+# What the demo container CAN do:
+#   - run the bevy_ecs world deterministically
+#   - drive the Bio-Engine + Physics
+#   - persist to event store + read-models
+#   - serve the Operator API on :8084
+#   - emit perception calls through cortex-gateway
+#
+# What the demo container CANNOT do (kernel features unavailable in plain
+# Docker — full setup runs on a privileged VM, see docs/governance.md):
+#   - bwrap / Landlock per-agent isolation
+#   - cgroups v2 per-agent resource caps
+#   - network namespaces + nftables egress filtering
+#   - eBPF probes (CAP_BPF + bpf-fs not available)
+#   - sentinel-fs CAS-FUSE (no /dev/fuse access)
+#   - Zenoh SHM transport (cross-namespace SHM does not work)
+#
+# The SandboxEnforcer detects feature absence at startup and degrades
+# gracefully. You will see warning lines in the daemon log on boot —
+# that is expected demo behaviour.
+
+[daemon]
+config_dir   = "/opt/sentinel/config-runtime"
+data_dir     = "/opt/sentinel/data"
+# fs_mount intentionally omitted: no FUSE in the demo container, agents
+# fall back to /ram/agents/<name> on a normal filesystem.
+tick_rate_ms = 200       # 5 Hz so a 10-minute demo feels alive
+time_scale   = 4.0       # one wall-clock minute = ~4 simulated minutes
+max_agents   = 5         # small demo cohort
+
+[daemon.adaptive]
+enabled = false          # deterministic demo, no PSI feedback
+
+[daemon.zenoh]
+shm_enabled = false      # SHM does not survive across docker namespaces
+
+[daemon.nats]
+url = "nats://nats:4222"
+
+[daemon.operator_api]
+enabled   = true
+bind_addr = "0.0.0.0:8084"

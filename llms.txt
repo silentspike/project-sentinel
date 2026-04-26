@@ -62,6 +62,10 @@ See [docs/security-test-report.md](docs/security-test-report.md).
 
 ## Demo
 ```
-docker compose -f docker-compose.demo.yml up
+make demo                               # one command: build + run + open dashboard
+# or: docker compose -f docker-compose.demo.yml up
 ```
-5 agents, 10-minute simulation. Dashboard: http://localhost:8000.
+5 agents, 10-minute simulation. Dashboard: http://localhost:18000 (port 18000
+because 8000 is commonly taken). See README.md "What the docker demo shows
+— and what it does not" for the kernel-feature limitations of running this
+stack inside Docker.

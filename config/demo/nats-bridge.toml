@@ -1,0 +1,13 @@
+# Demo overrides for sentinel-nats-bridge.
+# Whole-file replacement — keep ALL sections.
+
+[eventstore]
+path = "/opt/sentinel/data/events.db"
+poll_interval_ms = 200
+batch_size = 100
+
+[nats]
+url = "nats://nats:4222"
+
+[server]
+health_port = 8083

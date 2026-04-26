@@ -101,8 +101,11 @@ crates/sentinel-wasm/tests/fixtures/**/target/
 /cortex-gateway
 
 # Docs (selectively gitignored — public-facing docs are tracked)
-# Internal-only doc artefacts that should not appear in Git:
-docs/images/
+# Internal-only doc artefacts that should not appear in Git.
+# docs/images/ is gitignored except for the public-facing demo GIF; don't
+# add the directory itself, just specific files inside it.
+docs/images/*
+!docs/images/sentinel-demo.gif
 docs/screenshots/
 docs/user-testing-report.md
 /AGENTS.md

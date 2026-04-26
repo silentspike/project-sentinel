@@ -1,0 +1,32 @@
+# Demo overrides for sentinel-judge.
+# Whole-file replacement — keep ALL sections present in the production schema.
+
+[server]
+port = 8082
+
+[nats]
+url = "nats://nats:4222"
+consumer_name = "judge-heuristic"
+
+[thresholds]
+drift_alert_severity = "moderate"
+quality_alert_min_score = 2
+fatigue_alert_min_score = 0.6
+
+[evolution]
+path = "/opt/sentinel/data/evolution.db"
+
+[agents]
+config_dir = "/opt/sentinel/config-runtime/agents"
+
+[gateway]
+url = "http://gateway:8080"
+model = "stub"
+temperature = 0.2
+max_tokens = 500
+timeout_seconds = 30
+
+[ebpf]
+enabled = false
+consumer_name = "judge-ebpf"
+stall_threshold_ms = 60000
