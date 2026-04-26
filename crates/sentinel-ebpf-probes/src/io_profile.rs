@@ -28,7 +28,7 @@ pub struct IoStats {
 }
 
 /// Per-CPU Hash Map: cgroup_id -> IoStats.
-/// Max 128 entries covers 54 agents + headroom.
+/// Max 128 entries covers 60 agents + headroom.
 #[map]
 static IO_STATS: PerCpuHashMap<u64, IoStats> = PerCpuHashMap::with_max_entries(128, 0);
 

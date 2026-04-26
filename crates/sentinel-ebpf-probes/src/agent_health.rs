@@ -24,7 +24,7 @@ use aya_ebpf::{
 };
 
 /// Per-CPU Hash Map: cgroup_id (u64) -> last_write_timestamp_ns (u64).
-/// Max 128 entries covers 54 agents + headroom.
+/// Max 128 entries covers 60 agents + headroom.
 #[map]
 static AGENT_HEALTH: PerCpuHashMap<u64, u64> = PerCpuHashMap::with_max_entries(128, 0);
 

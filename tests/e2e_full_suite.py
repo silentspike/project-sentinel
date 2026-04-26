@@ -734,7 +734,7 @@ def run_t14():
     else:
         skip("T14.4", "Event-Count steigt", "No events in DB")
 
-    # T14.5 — RAM-Verbrauch (54 agents + ECS world + 2GB events.db = ~500MB realistic)
+    # T14.5 — RAM-Verbrauch (60 agents + ECS world + 2GB events.db = ~500MB realistic)
     out, _ = ssh("ps -o rss= -p $(pgrep -f sentinel-daemon 2>/dev/null | head -1) 2>/dev/null")
     try:
         rss_kb = int(out.strip())

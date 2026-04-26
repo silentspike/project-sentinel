@@ -633,7 +633,7 @@ fn bench_production_scenario(c: &mut Criterion) {
                 let dir = tempfile::tempdir().unwrap();
                 let path = dir.path().join("bench-prod.redb");
                 let service = HippocampusService::open(path.to_str().unwrap()).unwrap();
-                // 54 agents, each with 8-12 episodes (realistic daily load)
+                // 54-agent sample point (legacy benchmark size; spec is 60)
                 for i in 0..54 {
                     let count = 8 + (i % 5); // 8-12 episodes
                     let episodes = make_realistic_episodes(&format!("Agent_{i}"), count);
@@ -691,7 +691,7 @@ fn bench_production_scenario(c: &mut Criterion) {
         });
     }
 
-    // DB file size after 54 agents with 10 episodes each
+    // DB file size after 54-agent sample with 10 episodes each
     // (informational, not timed — prints to stderr)
     {
         let dir = tempfile::tempdir().unwrap();
@@ -713,7 +713,7 @@ fn bench_production_scenario(c: &mut Criterion) {
         drop(service);
         let file_size = std::fs::metadata(&path).unwrap().len();
         eprintln!(
-            "\n[INFO] redb file size (54 agents, 10 eps each + 54 facts): {} bytes ({:.1} KB)",
+            "\n[INFO] redb file size (54-agent sample, 10 eps each + 54 facts): {} bytes ({:.1} KB)",
             file_size,
             file_size as f64 / 1024.0
         );
