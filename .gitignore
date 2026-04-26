@@ -126,3 +126,7 @@ deploy/release-manifest.json
 cortex-gateway-linux
 .cache/ >> .gitignore
 .cache/
+
+# Internal sprint tracking — never publish
+PROGRESS.md
+IMPL-PLAN*.md
