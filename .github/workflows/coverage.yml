@@ -35,14 +35,19 @@ jobs:
           tool: cargo-tarpaulin
 
       - name: Generate coverage
-        # ac_10_02_bio_formulas is skipped under tarpaulin only: the test
-        # passes locally and on the remote build server but flakes under
-        # tarpaulin's instrumentation due to f32 rounding drift in the
-        # social-need accumulator. Tracked in PROGRESS.md F-007 — fix is to
-        # rewrite the assertion to be epsilon-tolerant of accumulator drift.
+        # Skips and tuning:
+        # - --skip ac_10_02_bio_formulas: bio acceptance test flakes only
+        #   under tarpaulin's instrumentation (passes locally + on cargo
+        #   remote). Tracked in PROGRESS.md F-007.
+        # - --skip wasm_e2e: end-to-end WASM tests boot a sandboxed
+        #   wasmtime + plugin and exceed tarpaulin's per-test timeout. The
+        #   same tests run green under `cargo test`. Tracked in F-009.
+        # - --timeout 300 raises tarpaulin's per-test ceiling so the
+        #   remaining slow-but-finite tests get headroom.
         run: |
-          cargo tarpaulin --workspace --out xml --output-dir target/coverage \
-            -- --skip ac_10_02_bio_formulas
+          cargo tarpaulin --workspace --timeout 300 --out xml \
+            --output-dir target/coverage \
+            -- --skip ac_10_02_bio_formulas --skip wasm_e2e
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
