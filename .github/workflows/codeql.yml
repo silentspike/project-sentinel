@@ -5,16 +5,32 @@ on:
     branches: [main]
     paths:
       - 'cmd/**'
+      - 'pkg/**'
+      - 'services/**'
       - 'dashboard/**'
+      - '.github/codeql/**'
+      - '.github/workflows/codeql.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'cmd/**'
+      - 'pkg/**'
+      - 'services/**'
+      - 'dashboard/**'
+      - '.github/codeql/**'
+      - '.github/workflows/codeql.yml'
   schedule:
-    - cron: '0 4 * * 3'  # Mittwoch 04:00 UTC
+    - cron: '0 4 * * 3'  # Wednesday 04:00 UTC
 
 permissions:
   contents: read
   security-events: write
 
 jobs:
+  # Go analysis. The Go workspace builds via `go build ./...` in each
+  # workspace member directory; that is what CodeQL needs to see.
   analyze-go:
+    name: CodeQL (Go)
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -26,25 +42,49 @@ jobs:
       - uses: github/codeql-action/init@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
         with:
           languages: go
-          source-root: cmd/cortex-gateway
+          build-mode: manual
+          config-file: ./.github/codeql/codeql-config.yml
 
-      - uses: github/codeql-action/autobuild@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
+      - name: Build Go modules manually
+        run: |
+          set -euo pipefail
+          for module in cmd/cortex-gateway services/sentinel-judge \
+                        services/sentinel-nats-bridge pkg/sentinel-go; do
+            echo "::group::Build $module"
+            (cd "$module" && go build ./...)
+            echo "::endgroup::"
+          done
 
       - uses: github/codeql-action/analyze@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
         with:
           category: go
 
-  analyze-js:
+  # Dashboard analysis. Bun/TSX is reported as javascript-typescript.
+  # CodeQL's autobuild gives up on Bun projects ("nothing to build") and
+  # then misses parts of the source tree. Manual build = bun install +
+  # bun typecheck makes every TSX file reachable to the extractor.
+  analyze-dashboard:
+    name: CodeQL (Dashboard)
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2
+        with:
+          bun-version: 1.1.30
+
       - uses: github/codeql-action/init@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
         with:
           languages: javascript-typescript
-          source-root: dashboard
+          build-mode: manual
+          config-file: ./.github/codeql/codeql-config.yml
 
-      - uses: github/codeql-action/autobuild@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
+      - name: Build dashboard manually
+        working-directory: dashboard
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+          bun run typecheck
 
       - uses: github/codeql-action/analyze@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
         with:

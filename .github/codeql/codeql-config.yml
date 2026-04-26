@@ -1,0 +1,30 @@
+name: "Sentinel CodeQL Config"
+
+# Cluster-aware path scoping. The dashboard is intentionally INCLUDED in
+# this config so it gets full SAST coverage instead of the autobuild
+# shortcut (which silently misclassifies Bun/TSX projects as "no build
+# needed" and then misses dependency-injection sinks).
+#
+# Per Plan v4 §F4 / decision E17:
+#   build-mode: manual  with explicit dashboard build via bun run typecheck
+
+paths:
+  - "cmd"
+  - "crates"
+  - "services"
+  - "pkg"
+  - "dashboard"
+  - "scripts"
+
+paths-ignore:
+  - "target"
+  - "crates/sentinel-wasm/tests/fixtures/*/target"
+  - "docs"
+  - "config"
+
+query-filters:
+  # Bun/TSX noise — local-scope unused vars are a project style choice,
+  # not a security signal. Filter out to keep the dashboard advisory list
+  # focused on injection / unsafe-deserialisation findings.
+  - exclude:
+      id: js/unused-local-variable
