@@ -10,7 +10,7 @@ import re
 import sys
 from pathlib import Path
 
-SOURCE_DIR = Path(os.environ.get("PIXELPERFEKT_AGENTS", "/work/company/pixelperfekt/agents"))
+SOURCE_DIR = Path(os.environ.get("PIXELPERFEKT_AGENTS", "./pixelperfekt-agents"))
 TARGET_DIR = Path(os.environ.get("SENTINEL_AGENTS_DIR", "./config/agents"))
 
 # Room mappings per department/role
