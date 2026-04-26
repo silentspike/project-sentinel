@@ -3,10 +3,10 @@
 # Sentinel Demo image — packages every binary the 10-minute demo needs into
 # a single ~200 MB runtime layer.
 #
-# Pre-requisite (Rust binaries are built OUTSIDE Docker via cargo remote):
+# Pre-requisite (Rust binaries are built OUTSIDE Docker):
 #   make demo-binaries
-# which is equivalent to:
-#   cargo remote -c -- build --release --bin sentinel-daemon --bin sentinel-nightrun
+# which uses cargo-remote against a build server if .cargo-remote.toml is
+# configured, otherwise falls back to a local `cargo build --release`.
 #
 # Then build the image:
 #   docker build -f deploy/docker/Dockerfile.demo -t sentinel-demo:local .
@@ -15,9 +15,9 @@
 #   The Sentinel Rust workspace has 15+ crates and links bevy_ecs / zenoh /
 #   redb / wasmtime. A from-scratch in-container `cargo build --release` needs
 #   8+ GB RAM and 30+ min on a developer laptop, and frequently OOM-kills.
-#   The project standard is to use cargo remote against a dedicated build
-#   server (.cargo-remote.toml). The Dockerfile honors that: Rust binaries
-#   come from `target/release/` on the host, the image just packages them.
+#   The Dockerfile expects the binaries to be present in `target/release/`
+#   on the host (built either via cargo-remote or local cargo); the image
+#   just packages them.
 #
 # The image bundles:
 #   - sentinel-daemon (Rust)         operator API on :8084

@@ -119,17 +119,23 @@ make test        # all tests
 If you have cargo-remote configured for offload builds, those targets
 transparently use it.
 
-### Demo (10 minutes)
+### Demo (one command)
 
 ![Sentinel demo dashboard](docs/images/sentinel-demo.gif)
 
 ```bash
 make demo                                 # build binaries + image, then run
 # or, step by step:
-make demo-binaries                        # cargo remote -c -- build --release ...
+make demo-binaries                        # build sentinel-daemon + sentinel-nightrun
 make demo-image                           # docker build
 ./scripts/demo.sh                         # run + open dashboard, tear down after 10 min
 ```
+
+The Rust workspace is heavy. `make demo-binaries` uses `cargo-remote`
+against a build server if `.cargo-remote.toml` is present, otherwise
+falls back to a local `cargo build --release` (~8 GB RAM, ~20 min on
+a developer laptop). See [CONTRIBUTING.md](CONTRIBUTING.md) for
+cargo-remote setup if you want to offload the Rust compile.
 
 Runs five agents through a 10-minute morning shift with a default
 PixelPerfekt configuration. Dashboard: http://localhost:18000 (host port
