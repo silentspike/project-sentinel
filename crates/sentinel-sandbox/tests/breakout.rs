@@ -5,7 +5,7 @@
 //!
 //! Test-Tiers:
 //! - Tier 1 (CI): Config-Validation, kein #[ignore], kein root/bwrap noetig
-//! - Tier 2 (VM): Echte Breakout-Tests, #[ignore], brauchen bwrap auf 192.0.2.240
+//! - Tier 2 (VM): Echte Breakout-Tests, #[ignore], brauchen bwrap auf <deploy-vm>
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -309,7 +309,7 @@ fn ac_76_config_proc_and_dev_mount_in_args() {
 fn require_bwrap() {
     require_helper();
     if !BwrapConfig::test_userns() {
-        panic!("bwrap user namespace not available — run on VM (192.0.2.240)");
+        panic!("bwrap user namespace not available — run on VM (<deploy-vm>)");
     }
 }
 
