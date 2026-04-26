@@ -71,6 +71,13 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v6.0.0
+        with:
+          # CodeQL JS extractor invokes node for TypeScript parsing.
+          # Without this step the self-hosted runner has no node on PATH
+          # and the extractor crashes with `Could not start Node.js`.
+          node-version: '24'
+
       - uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2
         with:
           bun-version: 1.1.30
