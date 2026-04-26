@@ -100,9 +100,11 @@ crates/sentinel-wasm/tests/fixtures/**/target/
 /sentinel-nats-bridge
 /cortex-gateway
 
-# Docs (local-only, not for Git)
-docs/
-!docs/security-test-report.md
+# Docs (selectively gitignored — public-facing docs are tracked)
+# Internal-only doc artefacts that should not appear in Git:
+docs/images/
+docs/screenshots/
+docs/user-testing-report.md
 /AGENTS.md
 /test-288-verification.md
 /hooks/
