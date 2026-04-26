@@ -67,12 +67,31 @@ bitnet/bitnet-inference
 
 # Local Config
 .cargo-remote.toml
+.make.local
 
 # Claude Code (internal working files)
 .claude/
 
 # Audit working files
 .audit/
+
+# ─── Parent Workspace Leak Prevention ──────────────────────
+# Never accidentally commit parent-level planning/audit artifacts
+codex-plan*.md
+AUDIT_REPORT*.md
+IMPLEMENTATION_EVIDENCE*.md
+IST_ANALYSE_*.md
+PROGRESS.md
+all-issues*.txt
+togaf-check.html
+
+# ─── Session-Internal ──────────────────────────────────────
+test-*-verification.md
+test-288-*.md
+issue-*-body.md
+
+# ─── Wasm-Fixtures Build-Artefakte (Phase 13 / U1) ──────────
+crates/sentinel-wasm/tests/fixtures/**/target/
 
 # Playwright CLI session files
 .playwright-cli/
