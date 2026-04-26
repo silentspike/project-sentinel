@@ -1,4 +1,4 @@
-module github.com/obtFusi/project-sentinel/services/sentinel-nats-bridge
+module github.com/silentspike/project-sentinel/services/sentinel-nats-bridge
 
 go 1.26.0
 

@@ -10,12 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/compiler"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/resilience"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/capability"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/compiler"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/control"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/extraction"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/normalizer"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/resilience"
 )
 
 func newTestPipelineWithInFlight(reg *Registry, inflight *resilience.InFlightMap) *PipelineHandler {

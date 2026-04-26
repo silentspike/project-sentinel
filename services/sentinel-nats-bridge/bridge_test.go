@@ -5,8 +5,8 @@ import (
 
 	"github.com/nats-io/nats.go"
 
-	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/eventstore"
-	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/messaging"
+	"github.com/silentspike/project-sentinel/pkg/sentinel-go/eventstore"
+	"github.com/silentspike/project-sentinel/pkg/sentinel-go/messaging"
 )
 
 func TestBuildPublishMessage(t *testing.T) {

@@ -13,9 +13,9 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 
-	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/messaging"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/config"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/metrics"
+	"github.com/silentspike/project-sentinel/pkg/sentinel-go/messaging"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/config"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/metrics"
 )
 
 // EBPFState holds the latest eBPF signal for a single agent.

@@ -1,6 +1,6 @@
 [Unit]
 Description=Sentinel Nightrun — Schichtwechsel-Konsolidierung
-Documentation=https://github.com/obtFusi/project-sentinel/issues/17
+Documentation=https://github.com/silentspike/project-sentinel/issues/17
 After=network.target
 Wants=sentinel-nightrun.timer
 

@@ -3,7 +3,7 @@ package apicp
 import (
 	"testing"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/extraction"
 )
 
 func TestBuildResponseSignatureUsesRoomForWork(t *testing.T) {

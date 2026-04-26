@@ -9,7 +9,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/service"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/service"
 )
 
 // Handler holds the HTTP endpoints for the judge service.

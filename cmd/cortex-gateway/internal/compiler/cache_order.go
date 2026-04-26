@@ -3,7 +3,7 @@ package compiler
 import (
 	"strings"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/capability"
 )
 
 // OrderForCache sorts prompt blocks: static first, then dynamic.

@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/gateway"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/persistence"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/gateway"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/persistence"
 )
 
 func TestAnalyzeVoice(t *testing.T) {

@@ -2,7 +2,7 @@
 
 ## Quick Start
 
-1. Clone: `git clone https://github.com/obtFusi/project-sentinel.git`
+1. Clone: `git clone https://github.com/silentspike/project-sentinel.git`
 2. Setup: `make hooks` (installs repo-managed pre-push hook via `.githooks`)
 3. Build: `make build`
 4. Test: `make test`

@@ -12,12 +12,12 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 
-	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/judge"
-	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/messaging"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/alerter"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/config"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/metrics"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/persistence"
+	"github.com/silentspike/project-sentinel/pkg/sentinel-go/judge"
+	"github.com/silentspike/project-sentinel/pkg/sentinel-go/messaging"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/alerter"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/config"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/metrics"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/persistence"
 )
 
 // StreamConsumer processes events from NATS JetStream in realtime.

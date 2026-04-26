@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/obtFusi/project-sentinel/deploy/release-manifest.schema.json",
+  "$id": "https://github.com/silentspike/project-sentinel/deploy/release-manifest.schema.json",
   "title": "Release Manifest",
   "description": "Deployment artifact manifest with SHA-256 hashes for deploy-gate parity checks",
   "type": "object",

@@ -4,9 +4,9 @@ import (
 	"context"
 	"log/slog"
 
-	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/judge"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/analyzer"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/config"
+	"github.com/silentspike/project-sentinel/pkg/sentinel-go/judge"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/analyzer"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/config"
 )
 
 // BatchRequest is the input for a batch analysis (called by Night-Run via HTTP).

@@ -1,6 +1,6 @@
 [Unit]
 Description=Sentinel Health Monitor Timer — Check every 60s
-Documentation=https://github.com/obtFusi/project-sentinel
+Documentation=https://github.com/silentspike/project-sentinel
 
 [Timer]
 OnBootSec=30
