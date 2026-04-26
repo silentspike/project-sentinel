@@ -1,0 +1,5 @@
+# Wasm Fixtures Build Artifacts
+# Source crates: echo-plugin/, fs-plugin/, loop-plugin/
+# We commit the compiled .wasm binaries (~316 KB total) but not the
+# intermediate target/ build cache (~293 MB) generated during local testing.
+**/target/
