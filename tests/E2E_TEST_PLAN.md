@@ -2,7 +2,7 @@
 
 > **Zweck:** Vollstaendige End-to-End-Validierung aller implementierten Features gegen den Masterplan.
 > **Tool:** Playwright (Browser-Tests) + curl/SSH (Service-Tests)
-> **Target:** Deploy-VM `10.0.0.240` (Dashboard: Port 8000, Cortex: 8080/8081, Judge: 8082, Bridge: 8083, NATS: 4222)
+> **Target:** Deploy-VM `<deploy-vm>` (Dashboard: Port 8000, Cortex: 8080/8081, Judge: 8082, Bridge: 8083, NATS: 4222)
 > **Erstellt:** 2026-02-21
 
 ---
@@ -30,77 +30,77 @@
 Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 
 ### T1.1 — Dashboard erreichbar [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8000/`
+- **Aktion:** `GET http://<deploy-vm>:8000/`
 - **Erwartung:** HTTP 200, Response enthaelt `<title>` mit "Project Sentinel"
 - **Fail-Kriterium:** Kein Response oder Status != 200
 
 ### T1.2 — Cortex Gateway Proxy Health [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8080/health`
+- **Aktion:** `GET http://<deploy-vm>:8080/health`
 - **Erwartung:** HTTP 200, JSON `{"status":"ok","version":"0.1.0"}`
 - **Fail-Kriterium:** Status != 200 oder fehlende Felder
 
 ### T1.3 — Cortex Gateway Proxy Ready [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8080/ready`
+- **Aktion:** `GET http://<deploy-vm>:8080/ready`
 - **Erwartung:** HTTP 200, JSON `{"ready":true}`
 - **Fail-Kriterium:** Status 503 oder `ready: false`
 
 ### T1.4 — Cortex Gateway Control Plane [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8081/control/config`
+- **Aktion:** `GET http://<deploy-vm>:8081/control/config`
 - **Erwartung:** HTTP 200, JSON mit `primary_provider`, `temperature`, `max_tokens`
 - **Fail-Kriterium:** Status != 200
 
 ### T1.5 — Sentinel Judge Health [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8082/health`
+- **Aktion:** `GET http://<deploy-vm>:8082/health`
 - **Erwartung:** HTTP 200, JSON `{"status":"ok","service":"sentinel-judge"}`
 - **Fail-Kriterium:** Status != 200
 
 ### T1.6 — Sentinel Judge Ready [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8082/ready`
+- **Aktion:** `GET http://<deploy-vm>:8082/ready`
 - **Erwartung:** HTTP 200, JSON `{"ready":true}`
 - **Fail-Kriterium:** Status 503 (NATS nicht connected)
 
 ### T1.7 — NATS Bridge Health [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8083/health`
+- **Aktion:** `GET http://<deploy-vm>:8083/health`
 - **Erwartung:** HTTP 200, JSON `{"status":"ok","service":"sentinel-nats-bridge"}`
 - **Fail-Kriterium:** Status != 200
 
 ### T1.8 — NATS Server erreichbar [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "nc -zv 127.0.0.1 4222"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "nc -zv 127.0.0.1 4222"`
 - **Erwartung:** Connection succeeded
 - **Fail-Kriterium:** Connection refused
 
 ### T1.9 — Sentinel Daemon laeuft [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "systemctl is-active sentinel-daemon.service"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "systemctl is-active sentinel-daemon.service"`
 - **Erwartung:** Output "active"
 - **Fail-Kriterium:** "inactive" oder "failed"
 
 ### T1.10 — Alle systemd Services aktiv [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "systemctl is-active sentinel-daemon sentinel-gateway sentinel-dashboard sentinel-projection sentinel-judge sentinel-nats-bridge nats-server"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "systemctl is-active sentinel-daemon sentinel-gateway sentinel-dashboard sentinel-projection sentinel-judge sentinel-nats-bridge nats-server"`
 - **Erwartung:** Alle 7 zeigen "active"
 - **Fail-Kriterium:** Mindestens einer nicht "active"
 
 ### T1.11 — Cortex Control Plane Health [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8081/health`
+- **Aktion:** `GET http://<deploy-vm>:8081/health`
 - **Erwartung:** HTTP 200, JSON `{"status":"ok"}`
 - **Fail-Kriterium:** Status != 200
 
 ### T1.12 — NATS Bridge Ready [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8083/ready`
+- **Aktion:** `GET http://<deploy-vm>:8083/ready`
 - **Erwartung:** HTTP 200, JSON `{"status":"ok",...}` (NATS connected)
 - **Fail-Kriterium:** Status 503 (NATS disconnected)
 
 ### T1.13 — Dashboard Health [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8000/api/health`
+- **Aktion:** `GET http://<deploy-vm>:8000/api/health`
 - **Erwartung:** HTTP 200, JSON `{"status":"ok","uptime":N,"projection_lag":N}`
 - **Fail-Kriterium:** Status != 200 oder fehlende Felder
 
 ### T1.14 — Sentinel Projection Worker laeuft [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "systemctl is-active sentinel-projection"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "systemctl is-active sentinel-projection"`
 - **Erwartung:** Output "active"
 - **Fail-Kriterium:** "inactive" oder "failed"
 
 ### T1.15 — NATS Monitoring Port [P1] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8222/varz`
+- **Aktion:** `GET http://<deploy-vm>:8222/varz`
 - **Erwartung:** HTTP 200, JSON mit NATS Server-Info
 - **Fail-Kriterium:** Port nicht erreichbar
 
@@ -109,7 +109,7 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 ## T2: Dashboard — Navigation & Layout
 
 ### T2.1 — Seite laed komplett [P0] [PW]
-- **Aktion:** Playwright `open http://10.0.0.240:8000`, warte auf DOM ready
+- **Aktion:** Playwright `open http://<deploy-vm>:8000`, warte auf DOM ready
 - **Erwartung:** Titel enthaelt "Project Sentinel", keine Console-Errors
 - **Pruefung:** `document.title`, Console-Log auf Errors pruefen
 
@@ -630,7 +630,7 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 ## T9: Dashboard — WebSocket
 
 ### T9.1 — WebSocket Verbindung [P0] [PW]
-- **Aktion:** Playwright WebSocket an `ws://10.0.0.240:8000/ws` verbinden
+- **Aktion:** Playwright WebSocket an `ws://<deploy-vm>:8000/ws` verbinden
 - **Erwartung:** Verbindung wird akzeptiert
 - **Pruefung:** `onopen` Event empfangen
 
@@ -693,27 +693,27 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 ## T11: Cortex Gateway (Issue #59, #58, #99)
 
 ### T11.1 — Health Endpoint [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8080/health`
+- **Aktion:** `GET http://<deploy-vm>:8080/health`
 - **Erwartung:** `{"status":"ok","version":"0.1.0"}`
 - **Pruefung:** Status 200, JSON korrekt
 
 ### T11.2 — Ready Endpoint [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8080/ready`
+- **Aktion:** `GET http://<deploy-vm>:8080/ready`
 - **Erwartung:** `{"ready":true}`
 - **Pruefung:** Status 200
 
 ### T11.3 — Prometheus Metrics [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8080/metrics`
+- **Aktion:** `GET http://<deploy-vm>:8080/metrics`
 - **Erwartung:** Prometheus-Text-Format mit `cortex_requests_total`, `cortex_request_duration_seconds`
 - **Pruefung:** Content-Type text/plain, Metriken vorhanden
 
 ### T11.4 — Control Plane Config GET [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8081/control/config`
+- **Aktion:** `GET http://<deploy-vm>:8081/control/config`
 - **Erwartung:** JSON mit primary_provider, temperature, max_tokens, rate_limit_rps
 - **Pruefung:** Alle Felder vorhanden
 
 ### T11.5 — Control Plane Config PATCH [P1] [HTTP]
-- **Aktion:** `PATCH http://10.0.0.240:8081/control/config` mit `{"temperature": 0.5}`
+- **Aktion:** `PATCH http://<deploy-vm>:8081/control/config` mit `{"temperature": 0.5}`
 - **Erwartung:** HTTP 200, Config aktualisiert
 - **Pruefung:** GET danach zeigt temperature=0.5
 - **Cleanup:** PATCH zurueck auf Original-Wert
@@ -724,7 +724,7 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 - **Pruefung:** Beide Requests abgelehnt
 
 ### T11.7 — Control Plane Provider Switch [P1] [HTTP]
-- **Aktion:** `POST http://10.0.0.240:8081/control/provider` mit `{"provider":"ollama"}`
+- **Aktion:** `POST http://<deploy-vm>:8081/control/provider` mit `{"provider":"ollama"}`
 - **Erwartung:** HTTP 200, Provider gewechselt
 - **Pruefung:** GET config zeigt neuen primary_provider
 - **Cleanup:** Zurueck auf Original-Provider
@@ -735,12 +735,12 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 - **Pruefung:** Metriken existieren (Wert >= 0)
 
 ### T11.9 — Guardrails Endpoint (wenn aktiviert) [P1] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8081/control/guardrails`
+- **Aktion:** `GET http://<deploy-vm>:8081/control/guardrails`
 - **Erwartung:** Budget-Status, Rate-Limit-Info (oder 404 wenn deaktiviert)
 - **Pruefung:** Valides JSON oder 404
 
 ### T11.10 — LLM Chat Completion [P0] [HTTP]
-- **Aktion:** `POST http://10.0.0.240:8080/v1/chat/completions` mit Test-Payload
+- **Aktion:** `POST http://<deploy-vm>:8080/v1/chat/completions` mit Test-Payload
 - **Erwartung:** HTTP 200, JSON mit `choices[0].message.content`
 - **Pruefung:** Response hat sinnvollen Inhalt
 - **ACHTUNG:** Verbraucht LLM-Tokens! Nur mit minimalem Payload testen.
@@ -750,42 +750,42 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 ## T12: NATS JetStream Infrastruktur (Issue #109)
 
 ### T12.1 — NATS Server Version [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "/opt/sentinel/bin/nats-server --version"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "/opt/sentinel/bin/nats-server --version"`
 - **Erwartung:** Version 2.12.4 oder hoeher
 - **Pruefung:** Versionsnummer extrahieren
 
 ### T12.2 — SENTINEL_EVENTS Stream existiert [P0] [NATS]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "nats stream info SENTINEL_EVENTS"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "nats stream info SENTINEL_EVENTS"`
 - **Erwartung:** Stream konfiguriert, 7-day retention, 1GB max
 - **Pruefung:** Retention, MaxBytes korrekt
 
 ### T12.3 — SENTINEL_JUDGE Stream existiert [P0] [NATS]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "nats stream info SENTINEL_JUDGE"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "nats stream info SENTINEL_JUDGE"`
 - **Erwartung:** Stream konfiguriert, 30-day retention, 100MB max
 - **Pruefung:** Retention, MaxBytes korrekt
 
 ### T12.4 — judge-heuristic Consumer existiert [P0] [NATS]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "nats consumer info SENTINEL_EVENTS judge-heuristic"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "nats consumer info SENTINEL_EVENTS judge-heuristic"`
 - **Erwartung:** Durable Pull Consumer aktiv
 - **Pruefung:** Consumer-Type = Pull, Durable = true
 
 ### T12.5 — judge-batch Consumer existiert [P0] [NATS]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "nats consumer info SENTINEL_EVENTS judge-batch"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "nats consumer info SENTINEL_EVENTS judge-batch"`
 - **Erwartung:** Durable Pull Consumer aktiv
 - **Pruefung:** Analog T12.4
 
 ### T12.6 — Bridge publiziert Events [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "nats stream info SENTINEL_EVENTS"` — Messages-Count pruefen
+- **Aktion:** `ssh ubuntu@<deploy-vm> "nats stream info SENTINEL_EVENTS"` — Messages-Count pruefen
 - **Erwartung:** Messages > 0 (Bridge hat Events publiziert)
 - **Pruefung:** Message-Count steigt ueber Zeit
 
 ### T12.7 — Bridge Subject-Pattern [P1] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "nats stream subjects SENTINEL_EVENTS"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "nats stream subjects SENTINEL_EVENTS"`
 - **Erwartung:** Subjects folgen Pattern `sentinel.events.{type}.{agent_id}`
 - **Pruefung:** Mindestens 1 Subject mit korrektem Format
 
 ### T12.8 — NATS JetStream aktiviert [P0] [SSH]
-- **Aktion:** NATS Monitoring `GET http://10.0.0.240:8222/jsz`
+- **Aktion:** NATS Monitoring `GET http://<deploy-vm>:8222/jsz`
 - **Erwartung:** JetStream-Info mit Streams-Count >= 2
 - **Pruefung:** `streams >= 2`
 
@@ -795,7 +795,7 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 - **Pruefung:** Delta == 1
 
 ### T12.10 — Bridge Service stabil (kein Restart-Loop) [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "systemctl show sentinel-nats-bridge --property=NRestarts"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "systemctl show sentinel-nats-bridge --property=NRestarts"`
 - **Erwartung:** NRestarts == 0 oder sehr niedrig
 - **Pruefung:** Kein Crash-Loop
 
@@ -804,28 +804,28 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 ## T13: Sentinel Judge (Issue #26)
 
 ### T13.1 — Judge Health [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8082/health`
+- **Aktion:** `GET http://<deploy-vm>:8082/health`
 - **Erwartung:** `{"status":"ok","service":"sentinel-judge"}`
 - **Pruefung:** Status 200
 
 ### T13.2 — Judge Ready (NATS connected) [P0] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8082/ready`
+- **Aktion:** `GET http://<deploy-vm>:8082/ready`
 - **Erwartung:** `{"ready":true}` — bedeutet NATS Consumer aktiv
 - **Pruefung:** ready === true
 
 ### T13.3 — Judge Prometheus Metrics [P1] [HTTP]
-- **Aktion:** `GET http://10.0.0.240:8082/metrics`
+- **Aktion:** `GET http://<deploy-vm>:8082/metrics`
 - **Erwartung:** Prometheus-Format mit Judge-spezifischen Metriken
 - **Pruefung:** Metriken vorhanden (drift, quality, fatigue, events, lag)
 
 ### T13.4 — Judge Batch Analyze Endpoint [P1] [HTTP]
-- **Aktion:** `POST http://10.0.0.240:8082/api/v1/analyze` mit Test-Payload
+- **Aktion:** `POST http://<deploy-vm>:8082/api/v1/analyze` mit Test-Payload
 - **Erwartung:** HTTP 200, Analysis-Response mit quality_score
 - **Pruefung:** JSON-Schema korrekt
 - **ACHTUNG:** Nutzt LLM-Tokens via Cortex Gateway!
 
 ### T13.5 — Judge Service stabil [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "systemctl show sentinel-judge --property=NRestarts"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "systemctl show sentinel-judge --property=NRestarts"`
 - **Erwartung:** NRestarts == 0
 - **Pruefung:** Kein Crash-Loop
 
@@ -839,17 +839,17 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 ## T14: Sentinel Daemon (Issue #94, #107)
 
 ### T14.1 — Daemon Prozess aktiv [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "systemctl is-active sentinel-daemon"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "systemctl is-active sentinel-daemon"`
 - **Erwartung:** "active"
 - **Pruefung:** Output === "active"
 
 ### T14.2 — Daemon Uptime > 1h [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "systemctl show sentinel-daemon --property=ActiveEnterTimestamp"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "systemctl show sentinel-daemon --property=ActiveEnterTimestamp"`
 - **Erwartung:** Laeuft seit mindestens 1 Stunde (keine staendigen Restarts)
 - **Pruefung:** Timestamp-Differenz > 3600s
 
 ### T14.3 — Events werden geschrieben [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "sqlite3 /opt/sentinel/data/events.db 'SELECT COUNT(*) FROM events'"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "sqlite3 /opt/sentinel/data/events.db 'SELECT COUNT(*) FROM events'"`
 - **Erwartung:** Count > 0 (Daemon produziert Events)
 - **Pruefung:** Zahl > 0
 
@@ -859,17 +859,17 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 - **Pruefung:** Delta > 0
 
 ### T14.5 — Daemon RAM-Verbrauch [P1] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "ps -o rss= -p $(pgrep sentinel-daemon)"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "ps -o rss= -p $(pgrep sentinel-daemon)"`
 - **Erwartung:** < 200 MB (typisch ~62 MB nach 21h)
 - **Pruefung:** RSS < 200000 KB
 
 ### T14.6 — Daemon kein Crash-Loop [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "systemctl show sentinel-daemon --property=NRestarts"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "systemctl show sentinel-daemon --property=NRestarts"`
 - **Erwartung:** NRestarts == 0
 - **Pruefung:** Kein Restart
 
 ### T14.7 — 54 Agent-Configs geladen [P1] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "ls /opt/sentinel/config/agents/*.toml | wc -l"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "ls /opt/sentinel/config/agents/*.toml | wc -l"`
 - **Erwartung:** 54 TOML-Dateien
 - **Pruefung:** Count === 54
 
@@ -962,7 +962,7 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 - **Pruefung:** Count === 17
 
 ### T16.6 — nats.conf valide [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "/opt/sentinel/bin/nats-server --config /etc/nats/nats.conf -t"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "/opt/sentinel/bin/nats-server --config /etc/nats/nats.conf -t"`
 - **Erwartung:** Config-Test bestanden
 - **Pruefung:** Exit Code 0
 
@@ -1113,7 +1113,7 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 - **Pruefung:** Alle Pflichtfelder vorhanden
 
 ### T20.3 — Nightrun systemd Timer [P1] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "systemctl list-timers | grep nightrun"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "systemctl list-timers | grep nightrun"`
 - **Erwartung:** Timer aktiv (06:00, 14:00, 22:00 UTC)
 - **Pruefung:** Timer gelistet mit naechstem Ausfuehrungszeitpunkt
 
@@ -1122,12 +1122,12 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 ## T20a: Projection Worker (CQRS Read-Model)
 
 ### T20a.1 — Projection DB Tabellen existieren [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "python3 -c \"import sqlite3; c=sqlite3.connect('/opt/sentinel/data/projection.db'); print([r[0] for r in c.execute('SELECT name FROM sqlite_master WHERE type=\\'table\\'')]); c.close()\""`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "python3 -c \"import sqlite3; c=sqlite3.connect('/opt/sentinel/data/projection.db'); print([r[0] for r in c.execute('SELECT name FROM sqlite_master WHERE type=\\'table\\'')]); c.close()\""`
 - **Erwartung:** Tabellen `agent_live_view`, `room_live_view`, `kpi_1m` vorhanden
 - **Pruefung:** Alle 3 Tabellen in der Liste
 
 ### T20a.2 — room_live_view hat 17 Raeume [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "python3 -c \"import sqlite3; c=sqlite3.connect('/opt/sentinel/data/projection.db'); print(c.execute('SELECT COUNT(*) FROM room_live_view').fetchone()[0]); c.close()\""`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "python3 -c \"import sqlite3; c=sqlite3.connect('/opt/sentinel/data/projection.db'); print(c.execute('SELECT COUNT(*) FROM room_live_view').fetchone()[0]); c.close()\""`
 - **Erwartung:** 17 Eintraege (alle Raeume)
 - **Pruefung:** Count === 15
 
@@ -1137,7 +1137,7 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 - **Pruefung:** Delta > 0
 
 ### T20a.4 — Projection Worker stabil [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "systemctl show sentinel-projection --property=NRestarts"`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "systemctl show sentinel-projection --property=NRestarts"`
 - **Erwartung:** NRestarts == 0
 - **Pruefung:** Kein Crash-Loop
 
@@ -1146,7 +1146,7 @@ Bevor IRGENDEIN anderer Test laeuft, muessen alle Services erreichbar sein.
 ## T20b: Outbox Drain (Transactional Outbox Pattern)
 
 ### T20b.1 — Outbox pending bei 0 [P0] [SSH]
-- **Aktion:** `ssh ubuntu@10.0.0.240 "python3 -c \"import sqlite3; c=sqlite3.connect('/opt/sentinel/data/events.db'); print(c.execute('SELECT COUNT(*) FROM outbox WHERE status=\\'pending\\'').fetchone()[0]); c.close()\""`
+- **Aktion:** `ssh ubuntu@<deploy-vm> "python3 -c \"import sqlite3; c=sqlite3.connect('/opt/sentinel/data/events.db'); print(c.execute('SELECT COUNT(*) FROM outbox WHERE status=\\'pending\\'').fetchone()[0]); c.close()\""`
 - **Erwartung:** 0 oder sehr wenige pending Eintraege (Bridge draint aktiv)
 - **Pruefung:** Count < 100
 

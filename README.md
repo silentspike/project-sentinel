@@ -43,7 +43,7 @@ ECS-Kern (Rust)          Cortex Gateway (Go)         Dashboard (Bun)
 # Alle Checks (Lint + Tests + cargo deny)
 make ci
 
-# Remote Build (auf Build-Server 10.0.0.155)
+# Remote Build (auf Build-Server 192.0.2.155)
 cargo remote -- build
 
 # Tests

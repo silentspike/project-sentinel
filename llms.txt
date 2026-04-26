@@ -1,42 +1,67 @@
 # Project Sentinel
-> Synthetic Enterprise Reality: 54 AI agents believe they are real employees
-> in a web design agency. Their entire reality is simulated.
+> Runtime & Sandbox Research Platform: 60 LLM-persona agents (Big Five
+> personalities) plus 5 background services run under bwrap + Landlock + cgroups
+> isolation. The simulated office (PixelPerfekt GmbH, fictional, Truman-Show-style)
+> is the evaluation context for runtime hardening, controlplane experiments and
+> agent control loops.
 
 ## Architecture (read first)
-- [Implementation Plan](/home/jan/.claude/plans/peaceful-splashing-willow.md): Full implementation plan with all formulas and code
+- [docs/architecture/togaf-architecture-guide.html](docs/architecture/togaf-architecture-guide.html): TOGAF v22.1 — authoritative architecture reference (10 clusters)
+- [docs/governance.md](docs/governance.md): Governance mechanisms mapped to code paths
+- [docs/togaf-gap-v22.md](docs/togaf-gap-v22.md): Per-cluster implementation status
+- [docs/togaf-deviations-v22.md](docs/togaf-deviations-v22.md): Deviation register (DEV-001/002/003)
+- [docs/glossary.md](docs/glossary.md): PixelPerfekt narrative, agent-layer model, terminology
 
-## Core Components
+## Agent Layers
+- 60 LLM-persona agents (51 on 3-shift rotation, 9 always-on duty staff)
+- 5 background service agents: sentinel-daemon, cortex-gateway, sentinel-judge, sentinel-nightrun, sentinel-nats-bridge
+- Approximately 26 LLM agents active at any given moment (17 shift + 9 always-on)
+
+## Core Components (Rust + Go)
 - [crates/sentinel-ecs](crates/sentinel-ecs/): Rust ECS world simulation (bevy_ecs). Deterministic physics, biology, acoustics.
 - [crates/sentinel-bio](crates/sentinel-bio/): Bio-Engine. Differential equations for hunger, caffeine (t½=5.7h), bladder, stress, energy.
 - [crates/sentinel-physics](crates/sentinel-physics/): Matrix Physics. Noise (30dB base + 5dB/person), smell propagation, temperature, CO2.
-- [cmd/cortex-gateway](cmd/cortex-gateway/): Go LLM proxy. Perception injection, fourth-wall detection, model-agnostic routing.
+- [cmd/cortex-gateway](cmd/cortex-gateway/): Go LLM proxy. 7-step pipeline. Synthesis engine. Controlplane.
+- [services/sentinel-judge](services/sentinel-judge/): Quality & drift monitoring (NATS streaming + LLM analysis).
+- [services/sentinel-nightrun](services/sentinel-nightrun/): Nightly batch consolidation, deterministic replay, hash chain.
+- [services/sentinel-nats-bridge](services/sentinel-nats-bridge/): eBPF metrics dual-publish.
 - [dashboard](dashboard/): Bun + Hono real-time dashboard with WebSocket.
 
 ## Infrastructure
-- [crates/sentinel-zenoh](crates/sentinel-zenoh/): Zenoh pub/sub (shared-memory local, TCP distributed). Replaces file-based communication.
-- [crates/sentinel-redb](crates/sentinel-redb/): Pure Rust ACID KV-store for hot state (agent data, relationships).
-- [crates/sentinel-limbo](crates/sentinel-limbo/): Async SQLite (Limbo) for cold storage (chat archive, observations).
-- [crates/sentinel-sandbox](crates/sentinel-sandbox/): Agent isolation via bwrap + Landlock + cgroups v2.
-- [crates/sentinel-wasm](crates/sentinel-wasm/): Wasm tool runtime (Wasmtime + Extism).
+- [crates/sentinel-zenoh](crates/sentinel-zenoh/): Zenoh pub/sub (shared-memory local <10μs, TCP distributed).
+- [crates/sentinel-redb](crates/sentinel-redb/): Pure Rust ACID KV-store for hot state.
+- [crates/sentinel-limbo](crates/sentinel-limbo/): Async SQLite event store (append-only, idempotent).
+- [crates/sentinel-sandbox](crates/sentinel-sandbox/): Agent isolation via bwrap + Landlock + cgroups v2 + netns.
+- [crates/sentinel-wasm](crates/sentinel-wasm/): WASM tool runtime (Wasmtime).
 - [crates/sentinel-ebpf](crates/sentinel-ebpf/): eBPF monitoring (aya-rs). Zero-overhead kernel probes.
 
 ## Configuration
-- [config/agents](config/agents/): 54 agent personality definitions (TOML).
-- [config/rooms.toml](config/rooms.toml): Office layout (17 rooms, 2 floors, adjacency graph).
+- [config/agents](config/agents/): 60 agent personality definitions (TOML, Big Five).
+- [config/rooms.toml](config/rooms.toml): Office layout (26 rooms, 2 floors, adjacency graph).
 - [config/simulation.toml](config/simulation.toml): Simulation parameters (tick rate, thresholds).
-- [schemas](schemas/): FlatBuffer schemas for zero-copy serialization.
 
 ## Key Patterns
 - **Neuro-Symbolic AI**: ECS (symbolic, deterministic) + LLM (neural, probabilistic)
-- **Perception Injection**: `[SYSTEM_INJECTION]...[/SYSTEM_INJECTION]` blocks injected transparently before each LLM call
+- **Perception Injection**: `[SYSTEM_INJECTION]...[/SYSTEM_INJECTION]` blocks transparently injected before each LLM call
+- **Synthesis Engine**: 10 deterministic rules intercept ~70% of routine perceptions before they hit the real LLM
 - **Fourth-Wall Detection**: Regex + LLM-Judge detects when agent realizes it's AI → re-generation
 - **NMDA Night-Run**: Shift-change memory consolidation via background service (no model training)
-- **Diegetic Hardware Mapping**: CPU throttling = "afternoon tiredness", API timeout = "migraine"
+- **Native Controlplane Kernel**: observe → decide → act → verify (every auto-action with rollback condition + TTL)
+
+## Sandbox Verification
+9/9 breakout tests passing (bwrap + Landlock + cgroups + netns).
+See [docs/security-test-report.md](docs/security-test-report.md).
 
 ## Building
-- Rust: `cargo remote -- build` (build server at 10.0.0.155)
+- Rust: `cargo remote -- build --workspace` (build server configurable via .make.local)
 - Go: `cd cmd/cortex-gateway && go build ./...`
 - Dashboard: `cd dashboard && bun install && bun run dev`
 - All: `make build`
 - Tests: `make test`
-- CI: `make ci`
+- CI: 16 GitHub Workflows (cargo-deny, CodeQL, OSSF Scorecard, Renovate, Coverage)
+
+## Demo
+```
+docker compose -f docker-compose.demo.yml up
+```
+5 agents, 10-minute simulation. Dashboard: http://localhost:8000.

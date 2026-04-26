@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # smoke-test.sh — Post-deploy smoke test: verifies service health within timeout.
 # Usage: bash deploy/smoke-test.sh <SSH_TARGET> [TIMEOUT_SEC]
-#   SSH_TARGET:  e.g. ubuntu@10.0.0.240
+#   SSH_TARGET:  e.g. ubuntu@<deploy-vm>
 #   TIMEOUT_SEC: max seconds to wait for healthy services (default: 30)
 set -uo pipefail
 

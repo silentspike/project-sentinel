@@ -1,6 +1,6 @@
 # E2E Test Results — Project Sentinel
 **Datum:** 2026-02-21
-**VM:** ubuntu@10.0.0.240
+**VM:** ubuntu@<deploy-vm>
 **HEAD:** 5f6af0b01579b80ee75262ca9fdabc5f1eecc79b
 **Testmethode:** Playwright headful + SSH Remote Commands
 
@@ -96,7 +96,7 @@
 
 ## Firewall (Infrastruktur-Fix waehrend E2E)
 
-UFW-Regeln fuer LAN-Zugriff (10.0.0.0/24) hinzugefuegt:
+UFW-Regeln fuer LAN-Zugriff (<lab-net>/24) hinzugefuegt:
 - Port 8000 (Dashboard), 8080 (Cortex Proxy), 8081 (Cortex Control)
 - Port 8082 (Judge), 8083 (Bridge), 8222 (NATS Monitor)
 
@@ -122,7 +122,7 @@ wurden nie upgegraded.
 ### BUG-3: UFW blockierte Dashboard-Port (MEDIUM)
 **Root Cause:** VM-Firewall erlaubte nur SSH. Browser konnte Dashboard nicht
 erreichen, SSH-Tunnel verursachte WebSocket-Probleme.
-**Fix:** UFW-Regeln fuer alle Sentinel-Ports (8000-8083, 8222) von 10.0.0.0/24.
+**Fix:** UFW-Regeln fuer alle Sentinel-Ports (8000-8083, 8222) von <lab-net>/24.
 
 ---
 

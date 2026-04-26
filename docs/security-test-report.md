@@ -5,7 +5,7 @@
 | Feld | Wert |
 |------|------|
 | **Datum** | 2026-03-14 |
-| **Getestet auf** | Deploy-VM 10.0.0.240 (Ubuntu, Kernel 6.x) |
+| **Getestet auf** | Deploy-VM <deploy-vm> (Ubuntu, Kernel 6.x) |
 | **Sandbox-Stack** | bwrap (User Namespaces) + Landlock LSM + cgroups v2 |
 | **Testbinary** | `breakout-helper` (Rust, statisch gelinkt) |
 | **Test-Suite** | `crates/sentinel-sandbox/tests/breakout.rs` |

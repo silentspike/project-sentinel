@@ -159,21 +159,24 @@ safe-merge: ## Safely merge PR (usage: make safe-merge PR=123 [METHOD=merge|squa
 	./scripts/safe-merge.sh "$(PR)" "$(if $(METHOD),$(METHOD),merge)"
 
 # ──────────────────────────────────────────────
-# Deploy (VM: ubuntu@10.0.0.240)
+# Deploy (VM: configurable via .make.local override)
 # ──────────────────────────────────────────────
 
-SSH ?= ubuntu@10.0.0.240
+# Local overrides (gitignored): set SSH to actual VM target
+-include .make.local
+
+SSH ?= ubuntu@<deploy-vm>
 
 manifest: ## Generate release manifest (requires built artifacts)
 	bash deploy/generate-manifest.sh
 
-preflight: ## Verify manifest hashes against VM (usage: make preflight [SSH=ubuntu@10.0.0.240])
+preflight: ## Verify manifest hashes against VM (usage: make preflight [SSH=ubuntu@<deploy-vm>])
 	bash deploy/deploy-preflight.sh "$(SSH)"
 
-smoke-test: ## Post-deploy smoke test (usage: make smoke-test [SSH=ubuntu@10.0.0.240])
+smoke-test: ## Post-deploy smoke test (usage: make smoke-test [SSH=ubuntu@<deploy-vm>])
 	bash deploy/smoke-test.sh "$(SSH)"
 
-deploy: preflight ## Deploy to VM: preflight + sync + smoke (usage: make deploy [SSH=ubuntu@10.0.0.240])
+deploy: preflight ## Deploy to VM: preflight + sync + smoke (usage: make deploy [SSH=ubuntu@<deploy-vm>])
 	@echo ""
 	@echo "=== Preflight passed, deploying artifacts ==="
 	@echo "Syncing configs..."
