@@ -10,7 +10,7 @@
 //! - veth/nftables setup + teardown (Tier 2, VM only)
 //!
 //! WICHTIG: Die VM-only Benchmarks liefern nur auf der Deployment-VM
-//! (192.0.2.240) aussagekraeftige Ergebnisse. Auf anderen Systemen
+//! (<deploy-vm>) aussagekraeftige Ergebnisse. Auf anderen Systemen
 //! messen sie nur den Config-Overhead.
 
 use criterion::{criterion_group, criterion_main, Criterion};

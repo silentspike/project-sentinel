@@ -4,7 +4,7 @@ Deployment-Artefakte fuer Project Sentinel auf der Ziel-VM.
 
 ## Ziel-VM
 
-- Host: `ubuntu@192.0.2.240` (Proxmox VM 1069)
+- Host: `ubuntu@<deploy-vm>` (Proxmox VM)
 - OS: Ubuntu, KVM/q35, CPU host-passthrough
 - Tuning: isolcpus, tmpfs, cgroups v2, io_uring
 
@@ -40,10 +40,10 @@ deploy/vm-config/install-boot-guard.sh
 
 ```bash
 # Stack-Suite auf VM ausfuehren (ECS, redb, Limbo, Zenoh, bwrap, wasmtime)
-ssh ubuntu@192.0.2.240 'bash -s' < deploy/bench/run-stack-suite-guest.sh
+ssh ubuntu@<deploy-vm> 'bash -s' < deploy/bench/run-stack-suite-guest.sh
 
 # P0-Gate-Tests (Zenoh SHM, Persist, Circuit Breaker)
-ssh ubuntu@192.0.2.240 'bash -s' < deploy/bench/run-p0-gates-guest.sh
+ssh ubuntu@<deploy-vm> 'bash -s' < deploy/bench/run-p0-gates-guest.sh
 ```
 
 ## Guest-Setup

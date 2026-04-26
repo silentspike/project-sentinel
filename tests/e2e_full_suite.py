@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Full E2E Test Suite — Project Sentinel Go-Live Validation.
 
-Runs tests against the Deploy VM (192.0.2.240).
+Runs tests against the Deploy VM (set SENTINEL_VM_HOST env var, default 127.0.0.1).
 Tests: HTTP (API), SSH (Services), CLI (Local), NATS (HTTP Monitoring API).
 Playwright browser tests are handled separately (e2e_playwright.py).
 
 Usage: python3 tests/e2e_full_suite.py [BASE_URL]
-  BASE_URL default: http://192.0.2.240:8000
+  BASE_URL default: http://${SENTINEL_VM_HOST:-127.0.0.1}:8000
 
 Exit code 0 = all P0 tests pass, 1 = at least one P0 failure.
 
@@ -28,13 +28,14 @@ import time
 import urllib.request
 import urllib.error
 
-BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://192.0.2.240:8000"
-VM = "ubuntu@192.0.2.240"
-CORTEX_URL = "http://192.0.2.240:8080"
-CORTEX_CP_URL = "http://192.0.2.240:8081"
-JUDGE_URL = "http://192.0.2.240:8082"
-BRIDGE_URL = "http://192.0.2.240:8083"
-NATS_MON_URL = "http://192.0.2.240:8222"  # Only reachable via SSH (localhost)
+VM_HOST = os.environ.get("SENTINEL_VM_HOST", "127.0.0.1")
+BASE_URL = sys.argv[1] if len(sys.argv) > 1 else f"http://{VM_HOST}:8000"
+VM = f"ubuntu@{VM_HOST}"
+CORTEX_URL = f"http://{VM_HOST}:8080"
+CORTEX_CP_URL = f"http://{VM_HOST}:8081"
+JUDGE_URL = f"http://{VM_HOST}:8082"
+BRIDGE_URL = f"http://{VM_HOST}:8083"
+NATS_MON_URL = f"http://{VM_HOST}:8222"  # Only reachable via SSH (localhost)
 
 # Counters
 passes = 0
@@ -140,7 +141,7 @@ def local(cmd: str, timeout: int = 15) -> tuple:
     """Run local command, return (stdout, exit_code)."""
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                          timeout=timeout, cwd="/work/company/project-sentinel")
+                          timeout=timeout, cwd=os.environ.get("SENTINEL_PROJECT_ROOT", os.getcwd()))
         return r.stdout.strip(), r.returncode
     except subprocess.TimeoutExpired:
         return "TIMEOUT", -1

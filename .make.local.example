@@ -1,0 +1,7 @@
+# Local Makefile Overrides — Template
+#
+# Copy to .make.local (gitignored) and adjust SSH target for your VM.
+# .make.local.example is tracked as a documentation reference.
+
+# Production VM target (overrides Makefile default `ubuntu@<deploy-vm>`)
+SSH = ubuntu@your-deploy-vm.example.com

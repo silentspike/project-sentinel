@@ -8,7 +8,7 @@
 //! - sandbox_overhead   < 2ms
 //! - registry_lookup    < 1ms
 //!
-//! WICHTIG: Diese Benchmarks auf der Deploy-VM (192.0.2.240)
+//! WICHTIG: Diese Benchmarks auf der Deploy-VM (<deploy-vm>)
 //! oder lokal ausfuehren — NICHT auf dem Build-Server (cargo remote)!
 
 use criterion::{criterion_group, criterion_main, Criterion};

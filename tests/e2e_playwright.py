@@ -10,7 +10,7 @@ Uses playwright-cli for headless browser automation.
 Companion to e2e_full_suite.py (HTTP/SSH/CLI tests).
 
 Usage: python3 tests/e2e_playwright.py [BASE_URL]
-  BASE_URL default: http://192.0.2.240:8000
+  BASE_URL default: http://${SENTINEL_VM_HOST:-127.0.0.1}:8000
 
 Exit code 0 = all P0 tests pass, 1 = at least one P0 failure.
 """
@@ -26,7 +26,8 @@ import urllib.error
 # Parse arguments: positional URL or flags
 _args = [a for a in sys.argv[1:] if not a.startswith("--")]
 _flags = [a for a in sys.argv[1:] if a.startswith("--")]
-BASE_URL = _args[0] if _args else "http://192.0.2.240:8000"
+VM_HOST = os.environ.get("SENTINEL_VM_HOST", "127.0.0.1")
+BASE_URL = _args[0] if _args else f"http://{VM_HOST}:8000"
 SESSION = "e2e"
 # Default: headed (user can watch). Use --headless to disable.
 HEADED = "" if "--headless" in _flags else "--headed"

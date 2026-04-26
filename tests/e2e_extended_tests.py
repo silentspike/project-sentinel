@@ -3,7 +3,7 @@
 
 Runs against the Dashboard API on the deploy VM.
 Usage: python3 tests/e2e_extended_tests.py [BASE_URL]
-  BASE_URL default: http://192.0.2.240:8000
+  BASE_URL default: http://${SENTINEL_VM_HOST:-127.0.0.1}:8000
 
 Exit code 0 = all tests pass, 1 = at least one failure.
 
@@ -30,11 +30,13 @@ Known Findings (discovered during test creation, 2026-02-22):
 """
 import json
 import math
+import os
 import sys
 import urllib.request
 import urllib.error
 
-BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://192.0.2.240:8000"
+VM_HOST = os.environ.get("SENTINEL_VM_HOST", "127.0.0.1")
+BASE_URL = sys.argv[1] if len(sys.argv) > 1 else f"http://{VM_HOST}:8000"
 
 VALID_CHAOS_TYPES = {
     "PhoneRing",

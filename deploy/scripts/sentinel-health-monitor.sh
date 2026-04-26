@@ -19,7 +19,7 @@ readonly STATE_FILE="/opt/sentinel/data/health-monitor.state"
 readonly EVENT_STORE_DB="/opt/sentinel/data/events.db"
 
 # --- Defaults (overridable via env file) ---
-NTFY_SERVER="${NTFY_SERVER:-https://10.0.0.150}"
+NTFY_SERVER="${NTFY_SERVER:-https://<ntfy-server>}"
 NTFY_TOPIC="${NTFY_TOPIC:-sentinel-health}"
 LAG_WARN="${LAG_WARN:-500}"
 LAG_CRIT="${LAG_CRIT:-5000}"

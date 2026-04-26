@@ -1,0 +1,20 @@
+# Sentinel systemd Environment File — Template
+#
+# Deploy as /etc/sentinel/env on the deploy VM. Referenced from systemd units
+# via `EnvironmentFile=/etc/sentinel/env`.
+# This .example is tracked; the actual /etc/sentinel/env is host-local.
+
+# Production VM internal IP/hostname (used for service discovery if needed)
+SENTINEL_VM_IP=192.0.2.240
+
+# NATS endpoint (leave default if NATS runs on same host)
+NATS_URL=nats://127.0.0.1:4222
+
+# Cortex Gateway upstream (typically same host)
+CORTEX_GATEWAY_URL=http://127.0.0.1:8080
+
+# Anthropic API key (required for cortex-gateway with claude provider)
+# ANTHROPIC_API_KEY=
+
+# Logging
+RUST_LOG=info

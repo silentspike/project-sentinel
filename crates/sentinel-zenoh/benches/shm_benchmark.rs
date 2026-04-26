@@ -1,7 +1,7 @@
 //! SHM Performance Benchmarks fuer sentinel-zenoh.
 //!
 //! Misst Latenz, Throughput und Concurrency-Verhalten des Zenoh SHM Core-Bus.
-//! NUR auf Deploy-VM (192.0.2.240) ausfuehren — NIEMALS auf cargo remote oder lokal!
+//! NUR auf Deploy-VM (<deploy-vm>) ausfuehren — NIEMALS auf cargo remote oder lokal!
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use sentinel_common::{AgentId, BioStateUpdate, ChaosEvent, EventType, RoomId, Tick, Timestamp};

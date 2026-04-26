@@ -2,7 +2,7 @@
 # deploy-preflight.sh — Verifies SHA-256 hash parity between release manifest and target VM.
 # Hard-aborts deploy (exit 1) on any mismatch.
 # Usage: bash deploy/deploy-preflight.sh <SSH_TARGET> [MANIFEST_PATH]
-#   SSH_TARGET:    e.g. ubuntu@192.0.2.240
+#   SSH_TARGET:    e.g. ubuntu@<deploy-vm>
 #   MANIFEST_PATH: optional, defaults to deploy/release-manifest.json
 # Note: intentionally no `set -e` — the while-loop handles each artifact's
 # exit codes manually. `set -e` would abort the script on the first grep
@@ -14,7 +14,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 if [ $# -lt 1 ]; then
   echo "Usage: $0 <SSH_TARGET> [MANIFEST_PATH]" >&2
-  echo "  SSH_TARGET:    e.g. ubuntu@192.0.2.240" >&2
+  echo "  SSH_TARGET:    e.g. ubuntu@<deploy-vm>" >&2
   echo "  MANIFEST_PATH: path to manifest JSON (default: deploy/release-manifest.json)" >&2
   exit 1
 fi
