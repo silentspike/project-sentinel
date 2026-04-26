@@ -23,8 +23,8 @@
 | **Security (Rust)** | `cargo audit` | CI | `deny.toml` advisories |
 | **Security (Go)** | `govulncheck ./...` | CI | CI log |
 | **Security (Dashboard)** | `cd dashboard && bun audit` | CI | CI log |
-| **System/Artifact** | Deploy binary to VM, `curl -sf http://localhost:8080/health` | VM 10.0.0.240 | Health response + journalctl |
-| **E2E/Smoke** | `cd tests/e2e && bun test` (playwright-cli based) | VM 10.0.0.240 + browser | Screenshots + test report |
+| **System/Artifact** | Deploy binary to VM, `curl -sf http://localhost:8080/health` | VM <deploy-vm> | Health response + journalctl |
+| **E2E/Smoke** | `cd tests/e2e && bun test` (playwright-cli based) | VM <deploy-vm> + browser | Screenshots + test report |
 
 ## Rules
 
