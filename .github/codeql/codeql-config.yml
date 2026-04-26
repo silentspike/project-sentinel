@@ -21,6 +21,10 @@ paths-ignore:
   - "crates/sentinel-wasm/tests/fixtures/*/target"
   - "docs"
   - "config"
+  - "**/node_modules"           # excludes dashboard/node_modules to avoid OOM
+  - "**/.next"
+  - "**/dist"
+  - "**/build"
 
 query-filters:
   # Bun/TSX noise — local-scope unused vars are a project style choice,
