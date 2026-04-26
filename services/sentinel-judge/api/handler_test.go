@@ -8,8 +8,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/config"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/service"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/config"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/service"
 )
 
 func newTestHandler(t *testing.T) *Handler {

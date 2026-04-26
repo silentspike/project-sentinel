@@ -7,8 +7,8 @@ import (
 
 	"github.com/nats-io/nats.go"
 
-	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/messaging"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/metrics"
+	"github.com/silentspike/project-sentinel/pkg/sentinel-go/messaging"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/metrics"
 )
 
 // Alert represents a judge alert.

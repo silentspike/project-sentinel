@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/judge"
+	"github.com/silentspike/project-sentinel/pkg/sentinel-go/judge"
 )
 
 const floatTolerance = 0.01

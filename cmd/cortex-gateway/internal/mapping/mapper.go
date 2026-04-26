@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
-	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/eventstore"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/extraction"
+	"github.com/silentspike/project-sentinel/pkg/sentinel-go/eventstore"
 )
 
 // ActionMeta holds contextual metadata for mapping actions to events.

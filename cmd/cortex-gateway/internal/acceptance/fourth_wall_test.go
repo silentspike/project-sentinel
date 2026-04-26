@@ -6,7 +6,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/detection"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/detection"
 )
 
 // AC-22-01: All 15 pattern strings detected by DetectFourthWall

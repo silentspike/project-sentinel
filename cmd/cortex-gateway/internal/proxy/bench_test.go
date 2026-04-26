@@ -10,16 +10,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/apicp"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/compiler"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/forwardqueue"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/sequencing"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/synthesis"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/ticksync"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/apicp"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/capability"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/compiler"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/control"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/extraction"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/forwardqueue"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/normalizer"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/sequencing"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/synthesis"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/ticksync"
 )
 
 func newBenchmarkPipelineHandler(providerName string, provider Provider, synthesisEnabled bool) *PipelineHandler {

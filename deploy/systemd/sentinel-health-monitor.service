@@ -1,6 +1,6 @@
 [Unit]
 Description=Sentinel Health Monitor — Service Health Check
-Documentation=https://github.com/obtFusi/project-sentinel
+Documentation=https://github.com/silentspike/project-sentinel
 
 [Service]
 Type=oneshot

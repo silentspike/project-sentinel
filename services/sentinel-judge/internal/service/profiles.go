@@ -10,7 +10,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/judge"
+	"github.com/silentspike/project-sentinel/pkg/sentinel-go/judge"
 )
 
 // agentTOML represents the structure of an AGENT-XX-NAME.toml file.

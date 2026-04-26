@@ -1,6 +1,6 @@
 [Unit]
 Description=Sentinel Agent %i
-Documentation=https://github.com/obtFusi/project-sentinel/issues/28
+Documentation=https://github.com/silentspike/project-sentinel/issues/28
 After=sentinel-gateway.service
 
 [Service]

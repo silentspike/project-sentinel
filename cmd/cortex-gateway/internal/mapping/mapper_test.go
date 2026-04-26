@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/extraction"
 )
 
 func TestMapActions_Move(t *testing.T) {

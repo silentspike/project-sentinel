@@ -12,13 +12,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/compiler"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/normalizer"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/proxy"
-	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/eventstore"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/capability"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/compiler"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/control"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/extraction"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/normalizer"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/proxy"
+	"github.com/silentspike/project-sentinel/pkg/sentinel-go/eventstore"
 )
 
 // mockProvider implements proxy.Provider for acceptance tests.

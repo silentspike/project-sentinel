@@ -1,4 +1,4 @@
-module github.com/obtFusi/project-sentinel/cmd/cortex-gateway
+module github.com/silentspike/project-sentinel/cmd/cortex-gateway
 
 go 1.26.0
 

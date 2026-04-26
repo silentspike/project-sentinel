@@ -14,14 +14,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/messaging"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/api"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/alerter"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/analyzer"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/config"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/gateway"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/persistence"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/service"
+	"github.com/silentspike/project-sentinel/pkg/sentinel-go/messaging"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/api"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/alerter"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/analyzer"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/config"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/gateway"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/persistence"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/service"
 )
 
 func main() {

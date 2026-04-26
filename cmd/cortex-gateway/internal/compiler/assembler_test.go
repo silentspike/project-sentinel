@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/capability"
 )
 
 func setupAssembler(t *testing.T) *Assembler {

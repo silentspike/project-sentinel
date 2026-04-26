@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/forwardqueue"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/forwardqueue"
 )
 
 // mockProvider implements Provider for testing.
