@@ -5,11 +5,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/control"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/forwardqueue"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/sequencing"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/synthesis"
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/ticksync"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/control"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/forwardqueue"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/sequencing"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/synthesis"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/ticksync"
 )
 
 func TestDefaultPrimaryProviderFallsBackToClaudeCodeWithoutAPIKey(t *testing.T) {

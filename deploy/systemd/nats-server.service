@@ -1,6 +1,6 @@
 [Unit]
 Description=NATS JetStream Server — Go Message Bus
-Documentation=https://github.com/obtFusi/project-sentinel/issues/26
+Documentation=https://github.com/silentspike/project-sentinel/issues/26
 Before=sentinel-nats-bridge.service sentinel-judge.service
 StartLimitBurst=5
 StartLimitIntervalSec=300

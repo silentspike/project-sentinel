@@ -3,7 +3,7 @@ package apicp
 import (
 	"strings"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/extraction"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/extraction"
 )
 
 // BuildResponseSignature derives a stable learning signature for API-CP.

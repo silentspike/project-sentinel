@@ -1,4 +1,4 @@
-module github.com/obtFusi/project-sentinel/services/sentinel-judge
+module github.com/silentspike/project-sentinel/services/sentinel-judge
 
 go 1.26.0
 

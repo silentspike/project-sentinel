@@ -17,8 +17,8 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/nats-io/nats.go"
 
-	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/eventstore"
-	"github.com/obtFusi/project-sentinel/pkg/sentinel-go/messaging"
+	"github.com/silentspike/project-sentinel/pkg/sentinel-go/eventstore"
+	"github.com/silentspike/project-sentinel/pkg/sentinel-go/messaging"
 )
 
 // Config holds bridge configuration (loaded from TOML).

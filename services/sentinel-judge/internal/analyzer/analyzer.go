@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/gateway"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/metrics"
-	"github.com/obtFusi/project-sentinel/services/sentinel-judge/internal/persistence"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/gateway"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/metrics"
+	"github.com/silentspike/project-sentinel/services/sentinel-judge/internal/persistence"
 )
 
 // VoiceResult is the JSON structure returned by the LLM for voice analysis.

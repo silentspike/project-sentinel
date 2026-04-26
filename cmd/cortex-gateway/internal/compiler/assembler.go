@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/capability"
 )
 
 // PromptBlock represents a section of the assembled prompt.

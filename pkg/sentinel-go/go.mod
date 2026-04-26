@@ -1,4 +1,4 @@
-module github.com/obtFusi/project-sentinel/pkg/sentinel-go
+module github.com/silentspike/project-sentinel/pkg/sentinel-go
 
 go 1.26.0
 

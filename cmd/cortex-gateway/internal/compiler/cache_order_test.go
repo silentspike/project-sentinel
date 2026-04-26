@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/obtFusi/project-sentinel/cmd/cortex-gateway/internal/capability"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/capability"
 )
 
 // AC-2: Static blocks before dynamic blocks

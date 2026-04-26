@@ -1,6 +1,6 @@
 [Unit]
 Description=Sentinel Projection Worker — CQRS Read-Model Service
-Documentation=https://github.com/obtFusi/project-sentinel/issues/53
+Documentation=https://github.com/silentspike/project-sentinel/issues/53
 After=sentinel-daemon.service
 Requires=sentinel-daemon.service
 StartLimitBurst=5
