@@ -11,7 +11,7 @@ A testbed environment combining two agent layers:
 
 **60 LLM-persona agents** — autonomous entities with distinct personalities
 (Big Five profiles), roles (developers, designers, management, works council,
-medical staff), and bio-driven behaviour (hunger, caffeine, stress, social
+medical staff), and bio-driven behavior (hunger, caffeine, stress, social
 need). Staffed as **51 on a 3-shift rotation (17 per shift)** + **9 always-on
 duty staff** (works council, occupational psychologist, occupational
 physician). Approximately 26 agents are active at any given moment.
@@ -45,7 +45,7 @@ environment:
    verify loops (Agent CP, Platform CP, API CP) co-exist. Each owns one
    decision domain, none reach across. See
    [docs/governance.md](docs/governance.md).
-3. **Boundary detection.** When does an LLM agent realise it is an LLM?
+3. **Boundary detection.** When does an LLM agent realize it is an LLM?
    The Cortex Gateway's fourth-wall detector (15 regex + LLM judge)
    measures it; the synthesis engine intercepts ~70% of routine
    perceptions before they reach a real LLM call.
@@ -138,7 +138,7 @@ adjust in `docker-compose.demo.yml` if you have 8000 free).
 
 #### What the docker demo shows — and what it does not
 
-The compose stack is deliberately a **behavioural demo**, not a full
+The compose stack is deliberately a **behavioral demo**, not a full
 production deployment. It is meant to give a recruiter or curious reader
 a working dashboard in one command, not to reproduce the full sandbox
 story.

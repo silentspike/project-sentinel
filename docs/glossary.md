@@ -11,8 +11,8 @@ employee of PixelPerfekt GmbH, located at Fuerther Strasse 42, 90429 Nuernberg.
 Founded (in-story) 2019, ~1.2M EUR annual revenue, 60 employees across shifts.
 
 **This company does not exist in reality.** The address, revenue, employee
-roster, and organisational structure are synthetic data for Truman-Show-style
-agent-belief experiments. Any resemblance to real organisations at this address
+roster, and organizational structure are synthetic data for Truman-Show-style
+agent-belief experiments. Any resemblance to real organizations at this address
 is coincidental.
 
 The choice to embed fictional details deep in configs
@@ -66,7 +66,7 @@ The Open Group Architecture Framework. This project uses **TOGAF v22.1** as
 its authoritative architecture reference, located at
 [docs/architecture/togaf-architecture-guide.html](architecture/togaf-architecture-guide.html).
 
-The architecture is structured into **10 clusters**. Per-cluster implementation
+The architecture is structured into **12 clusters**. Per-cluster implementation
 status and deviation register live in
 [docs/togaf-gap-v22.md](togaf-gap-v22.md) and
 [docs/togaf-deviations-v22.md](togaf-deviations-v22.md).

@@ -16,7 +16,7 @@
 #   redb / wasmtime. A from-scratch in-container `cargo build --release` needs
 #   8+ GB RAM and 30+ min on a developer laptop, and frequently OOM-kills.
 #   The project standard is to use cargo remote against a dedicated build
-#   server (.cargo-remote.toml). The Dockerfile honours that: Rust binaries
+#   server (.cargo-remote.toml). The Dockerfile honors that: Rust binaries
 #   come from `target/release/` on the host, the image just packages them.
 #
 # The image bundles:
