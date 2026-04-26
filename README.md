@@ -1,79 +1,175 @@
 # Project Sentinel
 
-Neuro-symbolische Buero-Simulation: deterministische Weltregeln (ECS) kombiniert mit probabilistischen Agent-Entscheidungen (LLM).
+**A research testbed for runtime hardening, controlplane design, and LLM agent
+boundary detection.** Sixty LLM-persona agents live inside a fictional web
+design agency under strict sandbox isolation. The simulated office is the
+*evaluation context*; the platform underneath is the work.
 
-## Architektur
+## What It Is
+
+A testbed environment combining two agent layers:
+
+**60 LLM-persona agents** — autonomous entities with distinct personalities
+(Big Five profiles), roles (developers, designers, management, works council,
+medical staff), and bio-driven behaviour (hunger, caffeine, stress, social
+need). Staffed as **51 on a 3-shift rotation (17 per shift)** + **9 always-on
+duty staff** (works council, occupational psychologist, occupational
+physician). Approximately 26 agents are active at any given moment.
+
+**5 background service agents** — Rust/Go services running the platform itself:
+
+- `sentinel-daemon` — ECS world, tick loop, persistence
+- `cortex-gateway` — LLM proxy, synthesis engine, controlplane
+- `sentinel-judge` — quality + drift monitoring, NATS streaming
+- `sentinel-nightrun` — nightly batch consolidation, deterministic replay
+- `sentinel-nats-bridge` — eBPF metrics dual-publish
+
+Both layers run under sandbox isolation (bwrap + Landlock + cgroups v2 +
+netns). The simulated office is the evaluation context for stress-testing
+runtime hardening primitives, agent control loops, and boundary detection.
+
+See the [TOGAF Architecture Guide](docs/architecture/togaf-architecture-guide.html)
+(v22.1) for cluster-level detail.
+
+## Why It Exists
+
+Three things are hard to study without a believable, persistent, multi-agent
+environment:
+
+1. **Sandbox primitives at scale.** What does bwrap + Landlock + cgroups
+   v2 + netns actually cost when 26 agents tick simultaneously? Where do
+   the breakouts come from when nobody is looking? The
+   [security test report](docs/security-test-report.md) records 9/9
+   breakout tests passing.
+2. **Controlplane design.** Three independent observe / decide / act /
+   verify loops (Agent CP, Platform CP, API CP) co-exist. Each owns one
+   decision domain, none reach across. See
+   [docs/governance.md](docs/governance.md).
+3. **Boundary detection.** When does an LLM agent realise it is an LLM?
+   The Cortex Gateway's fourth-wall detector (15 regex + LLM judge)
+   measures it; the synthesis engine intercepts ~70% of routine
+   perceptions before they reach a real LLM call.
+
+PixelPerfekt GmbH (the fictional employer) is a Truman-Show framing — see
+[docs/glossary.md](docs/glossary.md) for the narrative convention.
+
+## Architecture at a Glance
 
 ```
-ECS-Kern (Rust)          Cortex Gateway (Go)         Dashboard (Bun)
-  bevy_ecs World    <-->   LLM Proxy + Pipeline   -->  Echtzeit-UI
-  Bio/Physics/Mood         Perception Injection        WebSocket
-  Event Store (Limbo)      Fourth-Wall Detection       Metriken
-  State Store (redb)       Action Extraction
+Deterministic (ECS)            Probabilistic (LLM)
+┌───────────────────┐          ┌────────────────────┐
+│ bevy_ecs World    │          │ Cortex Gateway     │
+│ Bio / Physics     │ ───────> │ 7-step pipeline    │
+│ 60 agent slots    │ <─────── │ Synthesis engine   │
+│ Event Store       │          │ Fourth-wall guard  │
+└───────────────────┘          └────────────────────┘
+         │                              │
+         └────── Event Sourcing ────────┘
+            (sentinel-limbo, append-only)
 ```
 
-- **ECS** berechnet Bio-Zustaende, Physik, Raeume (deterministisch, reproduzierbar)
-- **LLM** empfaengt Wahrnehmungs-Texte, entscheidet Aktionen (kreativ, nicht-deterministisch)
-- **Agents** wissen nicht, dass sie simuliert werden (Fourth-Wall-Prinzip)
+| Layer            | Tech                                      |
+|------------------|-------------------------------------------|
+| World simulation | Rust workspace (15 crates), `bevy_ecs`    |
+| LLM gateway      | Go (`cmd/cortex-gateway`)                 |
+| Quality monitor  | Go (`services/sentinel-judge`)            |
+| Dashboard        | Bun + Hono + vanilla-JS (`dashboard/`)    |
+| Pub/Sub          | Zenoh (Rust SHM <10 µs) + NATS JetStream  |
+| Storage          | redb (state) + Limbo SQLite (events)      |
 
-## Verzeichnisstruktur
-
-| Verzeichnis | Inhalt |
-|-------------|--------|
-| `crates/` | Rust Workspace (ECS, Bio, Physics, Zenoh, redb, Limbo, Sandbox, eBPF, Wasm, Common, Telemetry, Runtime, Hippocampus, Inference) |
-| `cmd/cortex-gateway/` | Go LLM-Proxy (7-Step-Pipeline, Provider Registry, Control Plane) |
-| `dashboard/` | Bun + Hono Frontend/Backend |
-| `schemas/` | FlatBuffer-Definitionen (.fbs) |
-| `config/` | Raum-Layout, Agent-Definitionen, Simulations-Parameter ([config/README.md](config/README.md)) |
-| `services/` | Standalone Services (sentinel-nightrun) |
-| `deploy/` | VM-Konfiguration, systemd, Benchmarks ([deploy/README.md](deploy/README.md)) |
-
-## Prerequisites
-
-| Tool | Version | Zweck |
-|------|---------|-------|
-| Rust | stable (1.93+) | ECS, Crates |
-| Go | 1.23+ | Cortex Gateway |
-| Bun | 1.x | Dashboard |
-| cargo-remote | latest | Remote-Build auf Build-Server |
+For per-cluster implementation status see
+[docs/togaf-gap-v22.md](docs/togaf-gap-v22.md).
+For deliberate deviations from the spec see
+[docs/togaf-deviations-v22.md](docs/togaf-deviations-v22.md).
 
 ## Quick Start
 
+### Prerequisites
+
+| Tool        | Version  | Purpose                       |
+|-------------|----------|-------------------------------|
+| Rust        | 1.93+    | ECS world, all Rust crates    |
+| Go          | 1.23+    | Gateway, judge, nats-bridge   |
+| Bun         | 1.x      | Dashboard                     |
+| cargo-remote (optional) | latest | Remote build server  |
+| Docker + Compose | 24+ | Demo stack                    |
+
+### Configure
+
+Sentinel takes deployment-specific values from a single local file. Copy
+the templates and fill in your own values:
+
 ```bash
-# Alle Checks (Lint + Tests + cargo deny)
-make ci
-
-# Remote Build (auf Build-Server 192.0.2.155)
-cargo remote -- build
-
-# Tests
-cargo remote -- test
-
-# Go Build
-cd cmd/cortex-gateway && go build ./...
-
-# Dashboard
-cd dashboard && bun install && bun test
+cp .env.example .env
+cp .make.local.example .make.local
 ```
 
-## Make-Targets
+The `.env` file holds runtime values (NATS URL, dashboard port). The
+`.make.local` file holds build values (cargo remote server address, deploy
+target). Neither file is committed.
 
-| Target | Beschreibung |
-|--------|-------------|
-| `make ci` | Vollstaendiger CI-Lauf (fmt, clippy, test, deny, typos, doc) |
-| `make build` | Workspace Build |
-| `make test` | Alle Tests |
-| `make check` | Quick Lint (fmt + clippy) |
-| `make lint-all` | Alle Lints (Rust + Go + Dashboard) |
-| `make deny` | Supply-Chain-Check (Licenses, Advisories) |
-| `make coverage` | Code Coverage (tarpaulin) |
-| `make bench` | Benchmarks |
-| `make fuzz` | Fuzzing (bolero, libfuzzer) |
+### Build
 
-## Konfiguration
+```bash
+make ci          # full: fmt + clippy + test + cargo-deny + typos
+make build       # workspace build
+make test        # all tests
+```
 
-Siehe [config/README.md](config/README.md) fuer Details zu Raum-Layout, Agent-Definitionen und Simulations-Parametern.
+If you have cargo-remote configured for offload builds, those targets
+transparently use it.
 
-## Deployment
+### Demo (10 minutes)
 
-Siehe [deploy/README.md](deploy/README.md) fuer VM-Setup, systemd-Services und Benchmark-Runner.
+```bash
+docker compose -f docker-compose.demo.yml up
+```
+
+Runs five agents through a 10-minute morning shift with a default
+PixelPerfekt configuration. Dashboard: http://localhost:8000.
+
+## Repository Layout
+
+| Path                         | Contents                                                    |
+|------------------------------|-------------------------------------------------------------|
+| `crates/`                    | 15 Rust crates (ECS, bio, physics, sandbox, eBPF, …)        |
+| `services/sentinel-daemon/`  | Daemon + controlplane                                       |
+| `services/sentinel-judge/`   | Quality / drift monitor (Go)                                |
+| `services/sentinel-nightrun/`| Nightly consolidation (Rust)                                |
+| `services/sentinel-nats-bridge/` | NATS event bridge (Go)                                  |
+| `cmd/cortex-gateway/`        | LLM proxy + synthesis (Go)                                  |
+| `dashboard/`                 | Bun + Hono real-time UI                                     |
+| `pkg/sentinel-go/`           | Shared Go package (judge heuristics, eventstore, messaging) |
+| `config/`                    | Agent TOMLs, room layout, simulation parameters             |
+| `docs/`                      | Architecture, governance, gap, deviations, glossary         |
+| `deploy/`                    | systemd units, release manifest schema                      |
+| `.github/workflows/`         | 16 CI workflows (build, test, security, supply chain)       |
+
+## Documentation
+
+| Doc                                                          | Purpose                                       |
+|--------------------------------------------------------------|-----------------------------------------------|
+| [llms.txt](llms.txt)                                         | LLM-friendly project index (read first)       |
+| [docs/architecture/togaf-architecture-guide.html](docs/architecture/togaf-architecture-guide.html) | Authoritative architecture reference (v22.1) |
+| [docs/governance.md](docs/governance.md)                     | Governance mechanisms ↔ code path mapping     |
+| [docs/togaf-gap-v22.md](docs/togaf-gap-v22.md)               | Per-cluster implementation status             |
+| [docs/togaf-deviations-v22.md](docs/togaf-deviations-v22.md) | Intentional deviations from the spec          |
+| [docs/glossary.md](docs/glossary.md)                         | PixelPerfekt narrative + agent-layer glossary |
+| [docs/security-test-report.md](docs/security-test-report.md) | Sandbox breakout test results                 |
+| [CONTRIBUTING.md](CONTRIBUTING.md)                           | How to contribute                             |
+| [SECURITY.md](SECURITY.md)                                   | Reporting vulnerabilities                     |
+| [CHANGELOG.md](CHANGELOG.md)                                 | Release history                               |
+
+## Status
+
+This is the first **public** release boundary. The project was developed
+privately prior to `v0.1.0-alpha`; the tag marks the boundary between
+private development and public visibility, not the start of the project.
+
+CI: 16 workflows (build, test, CodeQL, OSSF Scorecard, cargo-deny,
+Renovate, coverage). Security review: dependency audit clean, secret scan
+clean, 9/9 sandbox breakout tests passing.
+
+## License
+
+See [LICENSE](LICENSE).
