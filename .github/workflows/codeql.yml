@@ -25,6 +25,7 @@ on:
 permissions:
   contents: read
   security-events: write
+  actions: read  # required by codeql-action/analyze to read workflow run metadata
 
 jobs:
   # Go analysis. The Go workspace builds via `go build ./...` in each
@@ -60,9 +61,10 @@ jobs:
           category: go
 
   # Dashboard analysis. Bun/TSX is reported as javascript-typescript.
-  # CodeQL's autobuild gives up on Bun projects ("nothing to build") and
-  # then misses parts of the source tree. Manual build = bun install +
-  # bun typecheck makes every TSX file reachable to the extractor.
+  # JavaScript/TypeScript only supports build-mode: none (CodeQL extracts
+  # source directly without compilation). We still install dependencies
+  # and run typecheck so any imported TypeScript files reachable through
+  # the dependency graph are present on disk for the extractor.
   analyze-dashboard:
     name: CodeQL (Dashboard)
     runs-on: [self-hosted, linux, x64]
@@ -73,18 +75,18 @@ jobs:
         with:
           bun-version: 1.1.30
 
-      - uses: github/codeql-action/init@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
-        with:
-          languages: javascript-typescript
-          build-mode: manual
-          config-file: ./.github/codeql/codeql-config.yml
-
-      - name: Build dashboard manually
+      - name: Install dashboard dependencies + typecheck
         working-directory: dashboard
         run: |
           set -euo pipefail
           bun install --frozen-lockfile
           bun run typecheck
+
+      - uses: github/codeql-action/init@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
+        with:
+          languages: javascript-typescript
+          build-mode: none
+          config-file: ./.github/codeql/codeql-config.yml
 
       - uses: github/codeql-action/analyze@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
         with:
