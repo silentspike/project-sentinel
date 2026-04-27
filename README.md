@@ -208,8 +208,9 @@ the absence at boot and degrades gracefully — warnings in the daemon
 log are the expected demo signal.
 
 For the full stack with sandbox enforcement see
-`deploy/systemd/*.service` and the deployment notes in
-[docs/governance.md](docs/governance.md).
+`deploy/systemd/*.service`, the deployment notes in
+[docs/governance.md](docs/governance.md), and the
+[TOGAF v22.1 Architecture Guide](docs/architecture/togaf-architecture-guide.html).
 
 ## Status — what works in this alpha, what doesn't yet
 
@@ -271,7 +272,9 @@ caveat list.
 | [docs/togaf-deviations-v22.md](docs/togaf-deviations-v22.md) | Intentional deviations from the spec          |
 | [docs/glossary.md](docs/glossary.md)                         | Agent-persona narrative + agent-layer glossary |
 | [docs/security-test-report.md](docs/security-test-report.md) | Sandbox breakout test results                 |
-| [docs/workshop-agent-runtime-boundaries.md](docs/workshop-agent-runtime-boundaries.md) | 45-min hands-on workshop: how to evaluate agent runtime boundaries |
+| [docs/workshop-agent-runtime-governance.md](docs/workshop-agent-runtime-governance.md) | 45-min hands-on workshop: how to evaluate runtime governance for LLM coding agents |
+| [docs/research-context.md](docs/research-context.md)         | Synthetic-workload personality model + role taxonomy + ethics |
+| [examples/](examples/)                                       | Copy-pasteable runtime-governance walkthroughs (sandbox policy, audit replay, control-plane isolation) |
 | [CONTRIBUTING.md](CONTRIBUTING.md)                           | How to contribute                             |
 | [SECURITY.md](SECURITY.md)                                   | Reporting vulnerabilities                     |
 | [CHANGELOG.md](CHANGELOG.md)                                 | Release history                               |
