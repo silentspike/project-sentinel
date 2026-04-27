@@ -14,7 +14,7 @@
 #   SENTINEL_RELEASE_TAG   override the tag to fetch (default: v0.1.0-alpha)
 #   GH_REPO                override the repo (default: silentspike/project-sentinel)
 #
-# Behaviour:
+# Behavior:
 # - exit 0  binaries already present (skip download)
 # - exit 0  download succeeded; binaries placed in target/release/
 # - exit 1  download failed (gh missing, no auth, no release, network)
