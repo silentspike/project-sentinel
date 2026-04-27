@@ -94,3 +94,9 @@ deploy/              VM configuration
 
 - See `docs/private-repo-guardrails.md` for the full private-repo enforcement model
 - Direct push to `main` is blocked locally by pre-push hook and monitored in CI
+
+## Development methodology
+
+Project Sentinel is developed using AI coding agents (Codex, Claude Code,
+Gemini CLI). The runtime governance work in this repo informs how those
+tools should be sandboxed.
