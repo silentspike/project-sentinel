@@ -34,14 +34,14 @@ note "starting stack..."
 
 note "waiting for daemon TCP (operator API has no /healthz; max 120s)..."
 deadline=$(( $(date +%s) + 120 ))
-until curl -s -o /dev/null --max-time 3 http://127.0.0.1:8084/ >/dev/null 2>&1; do
+until curl -s -o /dev/null --max-time 3 http://127.0.0.1:18084/ >/dev/null 2>&1; do
     [ "$(date +%s)" -lt "$deadline" ] || fail "daemon did not become reachable in 120s"
     sleep 2
 done
 
 note "waiting for gateway /health..."
 deadline=$(( $(date +%s) + 60 ))
-until curl -fsS --max-time 3 http://127.0.0.1:8080/health >/dev/null 2>&1; do
+until curl -fsS --max-time 3 http://127.0.0.1:18080/health >/dev/null 2>&1; do
     [ "$(date +%s)" -lt "$deadline" ] || fail "gateway did not become healthy in 60s"
     sleep 2
 done
@@ -57,11 +57,11 @@ note "stack is up — endpoints:"
 cat <<EOF
 
   Dashboard       http://localhost:18000
-  Gateway proxy   http://localhost:8080         (also exposes /metrics)
-  Gateway ctrl    http://localhost:8081
+  Gateway proxy   http://localhost:18080        (also exposes /metrics)
+  Gateway ctrl    http://localhost:18081
   Judge           http://localhost:18082/health (also /metrics)
   NATS bridge     http://localhost:18083/health
-  Daemon API      http://localhost:8084
+  Daemon API      http://localhost:18084
   NATS monitor    http://localhost:8222
 
 EOF
