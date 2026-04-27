@@ -106,6 +106,7 @@ crates/sentinel-wasm/tests/fixtures/**/target/
 # add the directory itself, just specific files inside it.
 docs/images/*
 !docs/images/sentinel-demo.gif
+!docs/images/opengraph-preview.png
 docs/screenshots/
 docs/user-testing-report.md
 /AGENTS.md
