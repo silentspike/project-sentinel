@@ -273,6 +273,7 @@ caveat list.
 | [docs/togaf-deviations-v22.md](docs/togaf-deviations-v22.md) | Intentional deviations from the spec          |
 | [docs/glossary.md](docs/glossary.md)                         | Agent-persona narrative + agent-layer glossary |
 | [docs/security-test-report.md](docs/security-test-report.md) | Sandbox breakout test results                 |
+| [docs/workshop-agent-runtime-boundaries.md](docs/workshop-agent-runtime-boundaries.md) | 45-min hands-on workshop: how to evaluate agent runtime boundaries |
 | [CONTRIBUTING.md](CONTRIBUTING.md)                           | How to contribute                             |
 | [SECURITY.md](SECURITY.md)                                   | Reporting vulnerabilities                     |
 | [CHANGELOG.md](CHANGELOG.md)                                 | Release history                               |
