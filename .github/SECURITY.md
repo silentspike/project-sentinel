@@ -34,7 +34,7 @@ Include:
 | Severity | Examples |
 |----------|---------|
 | **Critical** | Sandbox escape, arbitrary code execution, credential leak |
-| **High** | Agent data exfiltration, fourth-wall detection bypass, auth bypass |
+| **High** | Agent data exfiltration, self-recognition pattern detection bypass, auth bypass |
 | **Medium** | Information disclosure, DoS, privilege escalation within sandbox |
 | **Low** | Configuration issues, minor information leaks |
 
