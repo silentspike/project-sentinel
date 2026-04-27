@@ -1,5 +1,15 @@
 # Project Sentinel
 
+[![CI](https://github.com/silentspike/project-sentinel/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/silentspike/project-sentinel/actions/workflows/ci.yml)
+[![Coverage](https://github.com/silentspike/project-sentinel/actions/workflows/coverage.yml/badge.svg?branch=main)](https://github.com/silentspike/project-sentinel/actions/workflows/coverage.yml)
+[![CodeQL](https://github.com/silentspike/project-sentinel/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/silentspike/project-sentinel/actions/workflows/codeql.yml)
+[![Supply Chain](https://github.com/silentspike/project-sentinel/actions/workflows/deny.yml/badge.svg?branch=main)](https://github.com/silentspike/project-sentinel/actions/workflows/deny.yml)
+[![OSSF Scorecard](https://github.com/silentspike/project-sentinel/actions/workflows/scorecard.yml/badge.svg?branch=main)](https://github.com/silentspike/project-sentinel/actions/workflows/scorecard.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/silentspike/project-sentinel?include_prereleases&label=release)](https://github.com/silentspike/project-sentinel/releases)
+[![Rust 1.93+](https://img.shields.io/badge/rust-1.93%2B-orange.svg)](https://www.rust-lang.org)
+[![Go 1.26+](https://img.shields.io/badge/go-1.26%2B-blue.svg)](https://go.dev)
+
 **A research testbed for runtime hardening, controlplane design, and LLM agent
 boundary detection.** Sixty LLM-persona agents live inside a fictional web
 design agency under strict sandbox isolation. The simulated office is the
@@ -173,6 +183,31 @@ For the full stack with sandbox enforcement see
 `deploy/systemd/*.service` and the deployment notes in
 [docs/governance.md](docs/governance.md).
 
+## Status — what works in this alpha, what doesn't yet
+
+| Area | Status |
+|------|--------|
+| ECS world (bevy_ecs), bio + physics + room sim                   | ✅ implemented + exercised in demo |
+| Event sourcing (Limbo SQLite, idempotent, replayable)            | ✅ implemented + exercised in demo |
+| Cortex Gateway 7-step pipeline + 10-rule synthesis engine        | ✅ implemented + exercised in demo |
+| Dashboard (Bun + Hono + WebSocket)                               | ✅ implemented + exercised in demo |
+| sentinel-judge quality + drift monitoring (NATS streaming)       | ✅ implemented + exercised in demo |
+| sentinel-projection CQRS read-models                             | ✅ implemented + exercised in demo |
+| sentinel-nightrun batch consolidation, deterministic replay      | ✅ implemented, manual trigger only |
+| 60 LLM-persona agents (`config/agents/AGENT-*.toml`)             | ✅ defined; demo runs a 5-agent subset |
+| **bwrap + Landlock per-agent isolation**                         | ✅ implemented (`crates/sentinel-sandbox/`); 9/9 breakout tests pass on a privileged host; **not exercised in the docker demo** |
+| **cgroups v2 per-agent caps + netns + nftables**                 | ✅ implemented; same caveat |
+| **eBPF probes (aya-rs)** + **sentinel-fs CAS-FUSE**              | ✅ implemented; same caveat |
+| TOGAF v22.1 architecture guide + per-cluster gap report          | ✅ shipped in `docs/architecture/` |
+| Pre-built demo binaries (linux-x86_64) on every release          | ✅ since v0.1.0-alpha |
+| Tag verified-badge on GitHub                                     | ⏳ pending maintainer's SSH signing-key registration; tag itself carries valid Ed25519 signature |
+| CodeQL pipeline live status                                      | ⏳ green only after first scheduled run post-public-flip (GHAS gating) |
+| Demo binaries for arm64 / Apple Silicon                          | ⏳ planned (currently linux-x86_64 only) |
+| Multi-tenant company configs ("Gaia firmen-konfigurator")        | ⏳ tracked as roadmap issue |
+
+See [docs/known-limitations.md](docs/known-limitations.md) for the full
+caveat list.
+
 ## Repository Layout
 
 | Path                         | Contents                                                    |
@@ -205,15 +240,21 @@ For the full stack with sandbox enforcement see
 | [SECURITY.md](SECURITY.md)                                   | Reporting vulnerabilities                     |
 | [CHANGELOG.md](CHANGELOG.md)                                 | Release history                               |
 
-## Status
+## Release status
 
 This is the first **public** release boundary. The project was developed
 privately prior to `v0.1.0-alpha`; the tag marks the boundary between
 private development and public visibility, not the start of the project.
 
-CI: 16 workflows (build, test, CodeQL, OSSF Scorecard, cargo-deny,
-Renovate, coverage). Security review: dependency audit clean, secret scan
-clean, 9/9 sandbox breakout tests passing.
+CI on `main`: ci, lint, coverage, supply-chain (cargo-deny, npm-audit,
+go-vuln, rust-audit), conventional-commits, dependency-freshness — green.
+CodeQL goes green on the first scheduled run after the public flip
+(GHAS gating). Security: dependency audit + `gitleaks` + `trufflehog` clean,
+9/9 sandbox breakout tests passing on a privileged host.
+
+See [docs/known-limitations.md](docs/known-limitations.md) for full caveats
+and the [Status table above](#status--what-works-in-this-alpha-what-doesnt-yet)
+for the per-feature picture.
 
 ## License
 
