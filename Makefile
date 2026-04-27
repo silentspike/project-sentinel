@@ -45,7 +45,7 @@ test: ## Run all tests
 	@echo "=== Go Tests ==="
 	cd cmd/cortex-gateway && go test ./...
 	@echo "=== Dashboard Tests ==="
-	cd dashboard && bun test 2>/dev/null || echo "(no dashboard tests yet)"
+	$(MAKE) test-dashboard
 	@echo "All tests: OK"
 
 test-rust: ## Run Rust tests only
@@ -54,7 +54,11 @@ test-rust: ## Run Rust tests only
 test-go: ## Run Go tests only
 	cd cmd/cortex-gateway && go test ./...
 
-test-dashboard: ## Run Dashboard tests only
+test-dashboard: ## Run Dashboard tests only (auto-installs deps on a fresh clone)
+	@if [ ! -d dashboard/node_modules ]; then \
+		echo "[test-dashboard] dashboard/node_modules missing -> bun install"; \
+		cd dashboard && bun install --frozen-lockfile; \
+	fi
 	cd dashboard && bun test
 
 # ──────────────────────────────────────────────
@@ -98,7 +102,7 @@ demo: demo-image ## Build + run the 10-minute demo stack
 	./scripts/demo.sh
 
 build-go: ## Build Cortex Gateway
-	cd cmd/cortex-gateway && go build -o cortex-gateway ./...
+	cd cmd/cortex-gateway && go build -o cortex-gateway .
 
 build-dashboard: ## Build Dashboard
 	cd dashboard && bun install
