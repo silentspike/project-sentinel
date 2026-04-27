@@ -98,7 +98,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 |-------------------------------|--------|----------|
 | systemd units (12)            | ✅ | `deploy/systemd/*.service` |
 | Release manifest schema       | ✅ | `deploy/release-manifest.schema.json` |
-| Demo compose stack            | ⏳ | Phase 11 of public-readiness sprint |
+| Demo compose stack            | ✅ | `docker-compose.demo.yml` (7 services), `scripts/demo.sh`, `make demo-binaries` 3-tier (release-fetch / cargo-remote / local cargo); pre-built `linux-x86_64` binaries on every release |
 | 4-tier IP / path strategy     | ✅ | `.env.example`, `.make.local.example`, `deploy/systemd/sentinel-env.example`, `Makefile` |
 
 ## Cluster 08 — LLM Behavioral Science
@@ -107,7 +107,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 |-------------------------------|--------|----------|
 | Personality-driven prompting  | ✅ | gateway prompt compiler injects Big-Five vector |
 | Drift / quality / fatigue / swap heuristics | ✅ | `pkg/sentinel-go/judge/` |
-| LLM-judge for fourth-wall     | ✅ | `cmd/cortex-gateway/internal/detection/llm_judge.go` |
+| LLM-judge for self-recognition pattern | ✅ | `cmd/cortex-gateway/internal/detection/llm_judge.go` (formerly "fourth-wall"; renamed in glossary, anchor preserved) |
 | Voice analysis (semantic drift) | ✅ | `services/sentinel-judge/internal/analyzer/` |
 
 ## Cluster 09 — Wissenschaftliche Grundlagen
@@ -146,7 +146,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | #276 | 06 | Tick-loop hot-path optimisation |
 | #277 | 05b | Dashboard polling efficiency |
 | #278 | 11 | Non-blocking nightrun |
-| #279 | 03 | Daemon hardening |
+| #336 | 10 | Acronym glossary section + README cross-links (good-first-issue) |
 
 For known intentional deviations from the spec, see
 [docs/togaf-deviations-v22.md](togaf-deviations-v22.md).
