@@ -64,17 +64,52 @@ environment:
 
 ## Architecture at a Glance
 
-```
-Deterministic (ECS)            Probabilistic (LLM)
-┌───────────────────┐          ┌────────────────────┐
-│ bevy_ecs World    │          │ Cortex Gateway     │
-│ Bio / Physics     │ ───────> │ 7-step pipeline    │
-│ 60 agent slots    │ <─────── │ Synthesis engine   │
-│ Event Store       │          │ Self-recognition   │
-└───────────────────┘          └────────────────────┘
-         │                              │
-         └────── Event Sourcing ────────┘
-            (sentinel-limbo, append-only)
+```mermaid
+flowchart TB
+  subgraph AGENTS["Agent Layer · 60 LLM personas"]
+    A1["51 shift-bound (3 shifts × 17)"]
+    A2["9 always-on duty staff"]
+  end
+
+  subgraph SANDBOX["Sandbox Stack (per agent)"]
+    S1["bwrap (user-namespaces)"]
+    S2["Landlock LSM"]
+    S3["cgroups v2"]
+    S4["netns + nftables"]
+    S5["Wasmtime (tool runtime)"]
+  end
+
+  subgraph CP["Three Controlplanes — Observe → Decide → Act → Verify"]
+    direction LR
+    AGCP["Agent CP<br/>(bio · perception)"]
+    PLCP["Platform CP<br/>(infra · health)"]
+    APCP["API CP<br/>(cost · routing)"]
+  end
+
+  STORE["Event Store<br/>Limbo SQLite · append-only<br/>Lamport ordering · hash-chain"]
+
+  subgraph GATEWAY["Cortex Gateway (Go)"]
+    G1["7-step proxy + guardrails"]
+    G2["10-rule synthesis engine"]
+  end
+
+  subgraph BRIDGE["Quality + Memory Plane"]
+    J1["Sentinel Judge<br/>(NATS · drift · quality)"]
+    J2["NATS Bridge<br/>(Limbo → JetStream)"]
+    J3["Hippocampus<br/>(NMDA night-run)"]
+  end
+
+  DASH["Dashboard<br/>Bun + Hono + WebSocket"]
+
+  AGENTS -.->|"sandboxed in"| SANDBOX
+  AGENTS -->|prompts| GATEWAY
+  GATEWAY -->|emit events| STORE
+  STORE -->|projections| DASH
+  STORE -->|stream| BRIDGE
+  CP -.->|govern| AGENTS
+  CP -.->|govern| GATEWAY
+  CP -.->|govern| STORE
+  BRIDGE -->|alerts + metrics| DASH
 ```
 
 | Layer            | Tech                                      |
@@ -85,6 +120,9 @@ Deterministic (ECS)            Probabilistic (LLM)
 | Dashboard        | Bun + Hono + vanilla-JS (`dashboard/`)    |
 | Pub/Sub          | Zenoh (Rust SHM <10 µs) + NATS JetStream  |
 | Storage          | redb (state) + Limbo SQLite (events)      |
+
+For a terminal-friendly plain-text view of the same data flow see
+[Architecture Details](#architecture-details) further down.
 
 For per-cluster implementation status see
 [docs/togaf-gap-v22.md](docs/togaf-gap-v22.md).
@@ -238,6 +276,30 @@ caveat list.
 | [CONTRIBUTING.md](CONTRIBUTING.md)                           | How to contribute                             |
 | [SECURITY.md](SECURITY.md)                                   | Reporting vulnerabilities                     |
 | [CHANGELOG.md](CHANGELOG.md)                                 | Release history                               |
+
+## Architecture Details
+
+Plain-text alternative to the [Mermaid diagram above](#architecture-at-a-glance),
+useful for terminal-only viewers and screen-readers. Same data flow, lower
+fidelity:
+
+```
+Deterministic (ECS)            Probabilistic (LLM)
+┌───────────────────┐          ┌────────────────────┐
+│ bevy_ecs World    │          │ Cortex Gateway     │
+│ Bio / Physics     │ ───────> │ 7-step pipeline    │
+│ 60 agent slots    │ <─────── │ Synthesis engine   │
+│ Event Store       │          │ Self-recognition   │
+└───────────────────┘          └────────────────────┘
+         │                              │
+         └────── Event Sourcing ────────┘
+            (sentinel-limbo, append-only)
+```
+
+For full architectural depth (clusters, controlplane internals, deviation
+register) see the
+[TOGAF v22.1 architecture guide](docs/architecture/togaf-architecture-guide.html)
+and the gap report in [docs/togaf-gap-v22.md](docs/togaf-gap-v22.md).
 
 ## Release status
 
