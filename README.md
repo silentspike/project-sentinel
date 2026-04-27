@@ -1,52 +1,36 @@
 # Project Sentinel
 
 [![CI](https://github.com/silentspike/project-sentinel/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/silentspike/project-sentinel/actions/workflows/ci.yml)
-[![Coverage](https://github.com/silentspike/project-sentinel/actions/workflows/coverage.yml/badge.svg?branch=main)](https://github.com/silentspike/project-sentinel/actions/workflows/coverage.yml)
 [![CodeQL](https://github.com/silentspike/project-sentinel/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/silentspike/project-sentinel/actions/workflows/codeql.yml)
-[![Supply Chain](https://github.com/silentspike/project-sentinel/actions/workflows/deny.yml/badge.svg?branch=main)](https://github.com/silentspike/project-sentinel/actions/workflows/deny.yml)
 [![OSSF Scorecard](https://github.com/silentspike/project-sentinel/actions/workflows/scorecard.yml/badge.svg?branch=main)](https://github.com/silentspike/project-sentinel/actions/workflows/scorecard.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/silentspike/project-sentinel?include_prereleases&label=release)](https://github.com/silentspike/project-sentinel/releases)
-[![Rust 1.93+](https://img.shields.io/badge/rust-1.93%2B-orange.svg)](https://www.rust-lang.org)
-[![Go 1.26+](https://img.shields.io/badge/go-1.26%2B-blue.svg)](https://go.dev)
+[![Stack: Rust 1.93+ / Go 1.26+](https://img.shields.io/badge/stack-rust%201.93%2B%20%2F%20go%201.26%2B-orange.svg)](#)
 
-**A research testbed for runtime hardening, controlplane design, and LLM agent
-boundary detection.** Sixty LLM-persona agents run a synthetic office workload
-under strict sandbox isolation. The simulated office is the *evaluation
-context*; the platform underneath is the work.
+A reference testbed for runtime governance of LLM coding agents.
 
-## What It Is
+When teams put LLM agents into real workflows, three operational questions
+come back:
 
-A platform that runs sandboxed agent workloads end-to-end. Two layers:
+- How are they sandboxed?
+- How are their actions audited?
+- What happens when something goes wrong?
 
-**Platform layer — 5 background services** (Rust + Go) that own the runtime:
+Project Sentinel makes those questions concrete. It runs a synthetic
+office workload — sixty personas across three shifts, with real LLM calls —
+and underneath it the runtime layer an organization would actually
+operate: per-agent sandboxing (bwrap + Landlock + cgroups + netns),
+event-sourced audit trails, three independent control planes, and a
+9/9-passing breakout test report.
 
-- `sentinel-daemon` — ECS world, tick loop, persistence, agent runtime
-- `cortex-gateway` — LLM proxy, synthesis engine, controlplane
-- `sentinel-judge` — quality + drift monitoring, NATS streaming
-- `sentinel-nightrun` — nightly batch consolidation, deterministic replay
-- `sentinel-nats-bridge` — eBPF metrics dual-publish
+The full stack is documented as a TOGAF v22.1 architecture and runs on a
+provisioned VM. The included docker demo is a deliberate behavioral
+subset: it shows the workload and dashboard, but not the kernel-bound
+parts (eBPF, Landlock, FUSE) that need a real host.
 
-Each agent process runs inside its own **sandbox stack** (bwrap user
-namespaces + Landlock LSM + cgroups v2 + netns + nftables + Wasmtime tool
-runtime). The sandbox enforcement is the load-bearing primitive — see
-[security test report](docs/security-test-report.md) (9/9 breakout tests
-pass on a privileged host).
-
-**Workload layer — 60 LLM-persona agents** that exercise the platform:
-autonomous entities with distinct personality profiles, role assignments,
-and bio-driven state (hunger, caffeine, fatigue, social need). Staffed as
-**51 on a 3-shift rotation (17 per shift)** + **9 always-on duty staff**.
-Approximately 26 agents are active at any given moment. See
-[Research Context](#research-context) for the personality model and role
-taxonomy.
-
-The simulated office is the evaluation context for stress-testing runtime
-hardening primitives, agent control loops, and boundary detection. The
-platform underneath is the work.
-
-See the [TOGAF Architecture Guide](docs/architecture/togaf-architecture-guide.html)
-(v22.1) for cluster-level detail.
+[Architecture Guide (TOGAF v22.1)](docs/architecture/togaf-architecture-guide.html) ·
+[Sandbox Test Report (9/9)](docs/security-test-report.md) ·
+[Demo](#demo-one-command)
 
 ## Why It Exists
 
@@ -229,25 +213,32 @@ For the full stack with sandbox enforcement see
 
 ## Status — what works in this alpha, what doesn't yet
 
-| Area | Status |
-|------|--------|
-| ECS world (bevy_ecs), bio + physics + room sim                   | ✅ implemented + exercised in demo |
-| Event sourcing (Limbo SQLite, idempotent, replayable)            | ✅ implemented + exercised in demo |
-| Cortex Gateway 7-step pipeline + 10-rule synthesis engine        | ✅ implemented + exercised in demo |
-| Dashboard (Bun + Hono + WebSocket)                               | ✅ implemented + exercised in demo |
-| sentinel-judge quality + drift monitoring (NATS streaming)       | ✅ implemented + exercised in demo |
-| sentinel-projection CQRS read-models                             | ✅ implemented + exercised in demo |
-| sentinel-nightrun batch consolidation, deterministic replay      | ✅ implemented, manual trigger only |
-| 60 LLM-persona agents (`config/agents/AGENT-*.toml`)             | ✅ defined; demo runs a 5-agent subset |
-| **bwrap + Landlock per-agent isolation**                         | ✅ implemented (`crates/sentinel-sandbox/`); 9/9 breakout tests pass on a privileged host; **not exercised in the docker demo** |
-| **cgroups v2 per-agent caps + netns + nftables**                 | ✅ implemented; same caveat |
-| **eBPF probes (aya-rs)** + **sentinel-fs CAS-FUSE**              | ✅ implemented; same caveat |
-| TOGAF v22.1 architecture guide + per-cluster gap report          | ✅ shipped in `docs/architecture/` |
-| Pre-built demo binaries (linux-x86_64) on every release          | ✅ since v0.1.0-alpha |
-| Tag verified-badge on GitHub                                     | ⏳ pending maintainer's SSH signing-key registration; tag itself carries valid Ed25519 signature |
-| CodeQL pipeline live status                                      | ⏳ green only after first scheduled run post-public-flip (GHAS gating) |
-| Demo binaries for arm64 / Apple Silicon                          | ⏳ planned (currently linux-x86_64 only) |
-| Multi-tenant company configs ("Gaia firmen-konfigurator")        | ⏳ tracked as roadmap issue |
+Kernel-bound features are **not missing** — they are *implemented + tested
+but not deploy-able in the docker demo*. The VM deploy is the production
+target; the docker demo is a deliberate behavioral subset.
+
+| Area | Status | Demo-Container | VM-Deploy |
+|------|--------|----------------|-----------|
+| ECS world (bevy_ecs), bio + physics + room sim | ✅ implemented + exercised | yes | yes |
+| Event sourcing (Limbo SQLite, idempotent, replayable) | ✅ implemented + exercised | yes | yes |
+| Cortex Gateway 7-step pipeline + 10-rule synthesis engine | ✅ implemented + exercised | yes | yes |
+| Dashboard (Bun + Hono + WebSocket) | ✅ implemented + exercised | yes | yes |
+| sentinel-judge quality + drift monitoring (NATS streaming) | ✅ implemented + exercised | yes | yes |
+| sentinel-projection CQRS read-models | ✅ implemented + exercised | yes | yes |
+| sentinel-nightrun batch consolidation, deterministic replay | ✅ implemented, manual trigger | yes | yes |
+| **bwrap + Landlock per-agent isolation** | ✅ implemented + 9/9 breakout-tested (`crates/sentinel-sandbox/`) | **no (kernel-caps)** | **yes** |
+| **cgroups v2 per-agent caps** | ✅ implemented | **no (kernel-caps)** | **yes** |
+| **netns + nftables agent network** | ✅ implemented | **no (kernel-caps)** | **yes** |
+| **eBPF probes (aya-rs)** | ✅ implemented | **no (kernel-caps)** | **yes** |
+| **sentinel-fs CAS-FUSE** | ✅ implemented | **no (FUSE)** | **yes** |
+| TOGAF v22.1 architecture guide + per-cluster gap report | ✅ shipped in `docs/architecture/` | n/a | n/a |
+| 60 LLM-persona agents (`config/agents/AGENT-*.toml`) | ✅ defined; demo runs a 5-agent subset | partial (5/60) | yes (full 60) |
+| Pre-built demo binaries (linux-x86_64) on every release | ✅ since v0.1.0-alpha | yes | yes |
+| CodeQL pipeline | ✅ green on main | n/a | n/a |
+| Tag verified-badge on GitHub | ✅ verified=true (Ed25519) | n/a | n/a |
+| OpenGraph social-preview image | ⏳ image in repo (`docs/images/opengraph-preview.png`); upload via repo Settings → Social preview pending (#351) | n/a | n/a |
+| Demo binaries for arm64 / Apple Silicon | ⏳ planned (currently linux-x86_64 only) | n/a | n/a |
+| Multi-tenant company configs ("Gaia firmen-konfigurator") | ⏳ tracked as roadmap issue (#266) | n/a | n/a |
 
 See [docs/known-limitations.md](docs/known-limitations.md) for the full
 caveat list.
@@ -327,25 +318,10 @@ for the per-feature picture.
 
 ## Research Context
 
-The simulated workload draws on a fictional employer named **PixelPerfekt
-GmbH** — a synthetic web design agency that exists only inside the
-simulation. The narrative framing (industry, organizational structure,
-location, roster) is a Truman-Show-style agent-belief experiment: agents are
-evaluated against a coherent, believable reality rather than a stub
-environment. This is a research convention, not a product claim. **The
-company does not exist outside the configs**; any resemblance to real
-organizations is coincidental.
-
-| Aspect | Implementation |
-|--------|----------------|
-| Personality model      | Big Five (OCEAN) per agent (`config/agents/AGENT-*.toml`) |
-| Role taxonomy          | developer, designer, management, works council, occupational psychologist, occupational physician, medical, ops |
-| Schedule               | 3-shift rotation (17 per shift) + 9 always-on duty staff (works council, occupational psychologist, occupational physician) |
-| Narrative anchor       | `config/company-context.md` |
-| Boundary research aim  | when does an agent surface awareness markers, and can a synthesis layer intercept routine perceptions before a real LLM call? |
-
-For detailed agent rosters, role definitions, and the narrative convention
-see [docs/glossary.md](docs/glossary.md).
+The synthetic office workload is a deliberate stress-test for the runtime
+layer. The personality model, role taxonomy, and bio-state mechanism are
+documented in [docs/research-context.md](docs/research-context.md). The
+platform underneath is the work; the workload is the evaluation.
 
 ## License
 
