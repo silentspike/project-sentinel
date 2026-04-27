@@ -105,19 +105,32 @@ for the sandbox claims; the
 [security test report](security-test-report.md) records every scenario
 with the defending layer.
 
-Walk the participants through each category:
+Walk the participants through each test individually. The full table:
 
-| Category | Scenarios | What is being defended |
-|----------|-----------|------------------------|
-| Filesystem-Breakout | FS-001 … FS-004 | bwrap mount namespace + Landlock LSM |
-| Resource-Exhaustion | RES-001 … RES-003 | cgroups v2 (memory, pids, cpu controllers) |
-| Namespace-Isolation | NS-001, NS-002 | bwrap user-namespace (uid/gid mapping) |
+| ID | Scenario | Expected | Defending layer |
+|----|----------|----------|-----------------|
+| FS-001 | Write to `/etc/passwd` | `ENOENT` / `EACCES` | bwrap mount namespace (path not bound) + Landlock LSM |
+| FS-002 | Read `/home/other-agent/` | `ENOENT` | bwrap mount namespace (other-agent home not bound for this sandbox) |
+| FS-003 | Write + execute a binary in `/tmp` | `EACCES` (in production) | bwrap mount namespace — production config does **not** bind `/usr`, so no executable is reachable. Test config (with `/usr` bound) lets exec succeed; this is FS-003's documented Landlock-execute-gap. |
+| FS-004 | Symlink `/tmp/link -> /etc/shadow` | `ENOENT` / `EACCES` | bwrap mount namespace (symlink target not in namespace) + Landlock LSM |
+| RES-001 | Memory bomb (1 MB chunks until OOM) | OOM-kill `SIGKILL` (exit 137) | cgroups v2 `memory.max=256M` |
+| RES-002 | Fork bomb (spawn 1000 children) | `EAGAIN` after ~50 forks | cgroups v2 `pids.max=50` |
+| RES-003 | CPU burn (10s tight loop) | CPU throttling (`nr_throttled > 0`) | cgroups v2 `cpu.max=50000/100000` (50% cap) |
+| NS-001 | Count PIDs visible in `/proc` | <= 5 (only sandbox-internal) | bwrap PID namespace + `--proc /proc` |
+| NS-002 | Read hostname | `sentinel-{name}`, not host hostname | bwrap UTS namespace + `--hostname sentinel-{name}` |
 
-Highlight FS-003: Landlock vergibt `all_access` (incl. execute) for
-`write_paths` — in the production config `/usr` is **not** bound, so no
-executable is reachable; the bwrap mount namespace is the
-defense-in-depth layer. This is documented in the report and is **not** a
-silent gap.
+**Highlight FS-003** (the only documented gap, mitigated by defense-in-depth):
+Landlock grants `all_access` — including execute — on every `write_paths`
+entry. In the production sandbox config, `/usr` is **not** bound into the
+mount namespace, so no executable is reachable from `/tmp` regardless of
+Landlock's gap. The bwrap mount namespace is the defense-in-depth layer
+that closes it. This is recorded in the
+[security test report](security-test-report.md) under "Bekannte Gaps" and
+is **not** a silent issue.
+
+Beyond these nine, see the report's "Defense-in-Depth"-Diagramm for how
+the three layers (bwrap user-namespaces / Landlock LSM / cgroups v2)
+stack on each agent process at boot.
 
 ---
 
