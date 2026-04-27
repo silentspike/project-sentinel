@@ -93,7 +93,12 @@ blocks to the agent's prompt with body-state, environment cues, and social
 perception. The agent treats these as in-character sensations, not as
 metadata.
 
-## Fourth-Wall Detection
+## Self-Recognition Pattern Detection
+
+<a id="fourth-wall-detection"></a>
+
+(Also referred to in older docs and code paths as "Fourth-Wall Detection";
+the anchor `#fourth-wall-detection` is preserved for back-compatibility.)
 
 Fifteen regex patterns plus a two-stage LLM-judge in
 `cmd/cortex-gateway/internal/detection/`. Fires when an agent response shows
