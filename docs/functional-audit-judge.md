@@ -1,8 +1,8 @@
 # Functional Audit: sentinel-judge Communication
 
 **Date:** 2026-03-03
-**Issue:** [#140](https://github.com/obtFusi/project-sentinel/issues/140)
-**ADR:** [ADR-001](adr/ADR-001-judge-nats-communication.md)
+**Issue:** [#140](https://github.com/silentspike/project-sentinel/issues/140)
+**ADR:** ADR-001-judge-nats-communication (internal — see CHANGELOG)
 
 ## Audit Findings
 
