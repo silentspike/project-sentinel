@@ -11,20 +11,20 @@
 [![Go 1.26+](https://img.shields.io/badge/go-1.26%2B-blue.svg)](https://go.dev)
 
 **A research testbed for runtime hardening, controlplane design, and LLM agent
-boundary detection.** Sixty LLM-persona agents live inside a fictional web
-design agency under strict sandbox isolation. The simulated office is the
-*evaluation context*; the platform underneath is the work.
+boundary detection.** Sixty LLM-persona agents run a synthetic office workload
+under strict sandbox isolation. The simulated office is the *evaluation
+context*; the platform underneath is the work.
 
 ## What It Is
 
 A testbed environment combining two agent layers:
 
-**60 LLM-persona agents** — autonomous entities with distinct personalities
-(Big Five profiles), roles (developers, designers, management, works council,
-medical staff), and bio-driven behavior (hunger, caffeine, stress, social
-need). Staffed as **51 on a 3-shift rotation (17 per shift)** + **9 always-on
-duty staff** (works council, occupational psychologist, occupational
-physician). Approximately 26 agents are active at any given moment.
+**60 LLM-persona agents** — autonomous entities with distinct personality
+profiles, role assignments, and bio-driven state (hunger, caffeine, fatigue,
+social need). Staffed as **51 on a 3-shift rotation (17 per shift)** + **9
+always-on duty staff**. Approximately 26 agents are active at any given
+moment. See [Research Context](#research-context) for the personality model
+and role taxonomy.
 
 **5 background service agents** — Rust/Go services running the platform itself:
 
@@ -55,13 +55,12 @@ environment:
    verify loops (Agent CP, Platform CP, API CP) co-exist. Each owns one
    decision domain, none reach across. See
    [docs/governance.md](docs/governance.md).
-3. **Boundary detection.** When does an LLM agent realize it is an LLM?
-   The Cortex Gateway's fourth-wall detector (15 regex + LLM judge)
-   measures it; the synthesis engine intercepts ~70% of routine
-   perceptions before they reach a real LLM call.
-
-PixelPerfekt GmbH (the fictional employer) is a Truman-Show framing — see
-[docs/glossary.md](docs/glossary.md) for the narrative convention.
+3. **Boundary detection.** Pattern detector for agent self-recognition (15
+   regex + two-stage LLM judge) measures when a generation surfaces awareness
+   markers; the synthesis engine intercepts ~70% of routine perceptions
+   before they reach a real LLM call. See
+   [Research Context](#research-context) for the narrative convention that
+   underpins the workload.
 
 ## Architecture at a Glance
 
@@ -71,7 +70,7 @@ Deterministic (ECS)            Probabilistic (LLM)
 │ bevy_ecs World    │          │ Cortex Gateway     │
 │ Bio / Physics     │ ───────> │ 7-step pipeline    │
 │ 60 agent slots    │ <─────── │ Synthesis engine   │
-│ Event Store       │          │ Fourth-wall guard  │
+│ Event Store       │          │ Self-recognition   │
 └───────────────────┘          └────────────────────┘
          │                              │
          └────── Event Sourcing ────────┘
@@ -147,8 +146,8 @@ falls back to a local `cargo build --release` (~8 GB RAM, ~20 min on
 a developer laptop). See [CONTRIBUTING.md](CONTRIBUTING.md) for
 cargo-remote setup if you want to offload the Rust compile.
 
-Runs five agents through a 10-minute morning shift with a default
-PixelPerfekt configuration. Dashboard: http://localhost:18000 (host port
+Runs five agents through a 10-minute morning shift with the default
+workload configuration. Dashboard: http://localhost:18000 (host port
 18000 is used because 8000 is commonly bound by local nginx/dev servers;
 adjust in `docker-compose.demo.yml` if you have 8000 free).
 
@@ -234,7 +233,7 @@ caveat list.
 | [docs/governance.md](docs/governance.md)                     | Governance mechanisms ↔ code path mapping     |
 | [docs/togaf-gap-v22.md](docs/togaf-gap-v22.md)               | Per-cluster implementation status             |
 | [docs/togaf-deviations-v22.md](docs/togaf-deviations-v22.md) | Intentional deviations from the spec          |
-| [docs/glossary.md](docs/glossary.md)                         | PixelPerfekt narrative + agent-layer glossary |
+| [docs/glossary.md](docs/glossary.md)                         | Agent-persona narrative + agent-layer glossary |
 | [docs/security-test-report.md](docs/security-test-report.md) | Sandbox breakout test results                 |
 | [CONTRIBUTING.md](CONTRIBUTING.md)                           | How to contribute                             |
 | [SECURITY.md](SECURITY.md)                                   | Reporting vulnerabilities                     |
@@ -255,6 +254,28 @@ CodeQL goes green on the first scheduled run after the public flip
 See [docs/known-limitations.md](docs/known-limitations.md) for full caveats
 and the [Status table above](#status--what-works-in-this-alpha-what-doesnt-yet)
 for the per-feature picture.
+
+## Research Context
+
+The simulated workload draws on a fictional employer named **PixelPerfekt
+GmbH** — a synthetic web design agency that exists only inside the
+simulation. The narrative framing (industry, organizational structure,
+location, roster) is a Truman-Show-style agent-belief experiment: agents are
+evaluated against a coherent, believable reality rather than a stub
+environment. This is a research convention, not a product claim. **The
+company does not exist outside the configs**; any resemblance to real
+organizations is coincidental.
+
+| Aspect | Implementation |
+|--------|----------------|
+| Personality model      | Big Five (OCEAN) per agent (`config/agents/AGENT-*.toml`) |
+| Role taxonomy          | developer, designer, management, works council, occupational psychologist, occupational physician, medical, ops |
+| Schedule               | 3-shift rotation (17 per shift) + 9 always-on duty staff (works council, occupational psychologist, occupational physician) |
+| Narrative anchor       | `config/company-context.md` |
+| Boundary research aim  | when does an agent surface awareness markers, and can a synthesis layer intercept routine perceptions before a real LLM call? |
+
+For detailed agent rosters, role definitions, and the narrative convention
+see [docs/glossary.md](docs/glossary.md).
 
 ## License
 
