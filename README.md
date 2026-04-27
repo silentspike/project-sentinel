@@ -17,26 +17,33 @@ context*; the platform underneath is the work.
 
 ## What It Is
 
-A testbed environment combining two agent layers:
+A platform that runs sandboxed agent workloads end-to-end. Two layers:
 
-**60 LLM-persona agents** — autonomous entities with distinct personality
-profiles, role assignments, and bio-driven state (hunger, caffeine, fatigue,
-social need). Staffed as **51 on a 3-shift rotation (17 per shift)** + **9
-always-on duty staff**. Approximately 26 agents are active at any given
-moment. See [Research Context](#research-context) for the personality model
-and role taxonomy.
+**Platform layer — 5 background services** (Rust + Go) that own the runtime:
 
-**5 background service agents** — Rust/Go services running the platform itself:
-
-- `sentinel-daemon` — ECS world, tick loop, persistence
+- `sentinel-daemon` — ECS world, tick loop, persistence, agent runtime
 - `cortex-gateway` — LLM proxy, synthesis engine, controlplane
 - `sentinel-judge` — quality + drift monitoring, NATS streaming
 - `sentinel-nightrun` — nightly batch consolidation, deterministic replay
 - `sentinel-nats-bridge` — eBPF metrics dual-publish
 
-Both layers run under sandbox isolation (bwrap + Landlock + cgroups v2 +
-netns). The simulated office is the evaluation context for stress-testing
-runtime hardening primitives, agent control loops, and boundary detection.
+Each agent process runs inside its own **sandbox stack** (bwrap user
+namespaces + Landlock LSM + cgroups v2 + netns + nftables + Wasmtime tool
+runtime). The sandbox enforcement is the load-bearing primitive — see
+[security test report](docs/security-test-report.md) (9/9 breakout tests
+pass on a privileged host).
+
+**Workload layer — 60 LLM-persona agents** that exercise the platform:
+autonomous entities with distinct personality profiles, role assignments,
+and bio-driven state (hunger, caffeine, fatigue, social need). Staffed as
+**51 on a 3-shift rotation (17 per shift)** + **9 always-on duty staff**.
+Approximately 26 agents are active at any given moment. See
+[Research Context](#research-context) for the personality model and role
+taxonomy.
+
+The simulated office is the evaluation context for stress-testing runtime
+hardening primitives, agent control loops, and boundary detection. The
+platform underneath is the work.
 
 See the [TOGAF Architecture Guide](docs/architecture/togaf-architecture-guide.html)
 (v22.1) for cluster-level detail.
@@ -285,16 +292,16 @@ useful for terminal-only viewers and screen-readers. Same data flow, lower
 fidelity:
 
 ```
-Deterministic (ECS)            Probabilistic (LLM)
-┌───────────────────┐          ┌────────────────────┐
-│ bevy_ecs World    │          │ Cortex Gateway     │
-│ Bio / Physics     │ ───────> │ 7-step pipeline    │
-│ 60 agent slots    │ <─────── │ Synthesis engine   │
-│ Event Store       │          │ Self-recognition   │
-└───────────────────┘          └────────────────────┘
-         │                              │
-         └────── Event Sourcing ────────┘
-            (sentinel-limbo, append-only)
+Deterministic (ECS)              Probabilistic (LLM)
+┌─────────────────────┐          ┌──────────────────────────────────┐
+│ bevy_ecs World      │          │ Cortex Gateway                   │
+│ Bio / Physics       │ ───────> │ 7-step pipeline                  │
+│ 60 agent slots      │ <─────── │ Synthesis engine                 │
+│ Event Store         │          │ Self-recognition pattern detector│
+└─────────────────────┘          └──────────────────────────────────┘
+          │                                   │
+          └─────────── Event Sourcing ────────┘
+                 (sentinel-limbo, append-only)
 ```
 
 For full architectural depth (clusters, controlplane internals, deviation
