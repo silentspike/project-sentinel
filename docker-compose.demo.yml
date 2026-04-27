@@ -1,7 +1,7 @@
 # Sentinel 10-minute demo stack.
 #
 # Brings up: NATS + sentinel-daemon + cortex-gateway + sentinel-judge +
-#            sentinel-nats-bridge + sentinel-dashboard
+#            sentinel-nats-bridge + sentinel-projection + sentinel-dashboard
 #
 # All five Sentinel services share the same image (deploy/docker/Dockerfile.demo)
 # and select their binary via the SENTINEL_ROLE environment variable.
@@ -120,6 +120,22 @@ services:
       - sentinel-data:/opt/sentinel/data
     networks: [sentinel]
 
+  projection:
+    # CQRS read-model worker. Polls the EventStore and builds the
+    # projection.db that the dashboard reads (agent_live_view, room_live_view,
+    # kpi_1m). Without this service running, the dashboard crashes on
+    # startup because projection.db doesn't exist.
+    image: sentinel-demo:local
+    container_name: sentinel-demo-projection
+    environment:
+      SENTINEL_ROLE: projection
+    depends_on:
+      daemon:
+        condition: service_healthy
+    volumes:
+      - sentinel-data:/opt/sentinel/data
+    networks: [sentinel]
+
   dashboard:
     image: sentinel-demo:local
     container_name: sentinel-demo-dashboard
@@ -131,6 +147,8 @@ services:
     depends_on:
       gateway:
         condition: service_healthy
+      projection:
+        condition: service_started
     # host port 18000 (port 8000 commonly used by local nginx/dev servers).
     # Adjust on a host where 8000 is free if you want the canonical mapping.
     ports:
