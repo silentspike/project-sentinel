@@ -72,15 +72,21 @@ build-rust-remote: ## Build Rust on remote build server
 build-rust-release: ## Build Rust release (remote, includes eBPF kernel probes)
 	cargo remote -- build --workspace --release --features ebpf
 
-demo-binaries: ## Build only the Rust binaries the docker demo image needs (remote with local fallback)
-	@if [ -f .cargo-remote.toml ] && command -v cargo-remote >/dev/null 2>&1; then \
-		echo "[demo-binaries] cargo-remote configured -> offloading build"; \
+demo-binaries: ## Get the Rust binaries for the docker demo (release-fetch / cargo-remote / local cargo, in that order)
+	@if [ -x target/release/sentinel-daemon ] && [ -x target/release/sentinel-nightrun ] && [ -x target/release/sentinel-projection ]; then \
+		echo "[demo-binaries] all 3 binaries already in target/release/, skipping"; \
+	elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 && gh release view v0.1.0-alpha --repo silentspike/project-sentinel >/dev/null 2>&1; then \
+		echo "[demo-binaries] tier 1: fetching pre-built binaries from GitHub Release v0.1.0-alpha"; \
+		./scripts/fetch-demo-binaries.sh; \
+	elif [ -f .cargo-remote.toml ] && command -v cargo-remote >/dev/null 2>&1; then \
+		echo "[demo-binaries] tier 2: cargo-remote configured -> offloading build"; \
 		cargo remote -c -- build --release --bin sentinel-daemon --bin sentinel-nightrun; \
 		cargo remote -c -- build --release -p sentinel-projection-service; \
 	else \
-		echo "[demo-binaries] cargo-remote not configured -> local cargo build"; \
+		echo "[demo-binaries] tier 3: local cargo build (slow path)"; \
 		echo "[demo-binaries] note: local build needs ~8 GB free RAM and ~20 min on a laptop;"; \
-		echo "[demo-binaries]       set up cargo-remote (see CONTRIBUTING.md) to offload."; \
+		echo "[demo-binaries]       install gh + run 'gh auth login' to use the pre-built path,"; \
+		echo "[demo-binaries]       or set up cargo-remote (see CONTRIBUTING.md)."; \
 		cargo build --release --bin sentinel-daemon --bin sentinel-nightrun; \
 		cargo build --release -p sentinel-projection-service; \
 	fi
