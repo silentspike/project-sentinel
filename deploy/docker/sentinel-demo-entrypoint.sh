@@ -6,12 +6,13 @@
 # compose file can drive a multi-process stack from a single image.
 #
 # Roles:
-#   daemon         sentinel-daemon  (ECS world, operator API on :8084)
-#   gateway        cortex-gateway   (LLM proxy on :8080, control on :8081)
-#   judge          sentinel-judge   (quality monitor on :8082)
-#   nats-bridge    sentinel-nats-bridge (event bridge on :8083)
-#   dashboard      sentinel-dashboard (Bun UI on :8000)
-#   nightrun       sentinel-nightrun (one-shot nightly batch)
+#   daemon         sentinel-daemon       (ECS world, operator API on :8084)
+#   gateway        cortex-gateway        (LLM proxy on :8080, control on :8081)
+#   judge          sentinel-judge        (quality monitor on :8082)
+#   nats-bridge    sentinel-nats-bridge  (event bridge on :8083)
+#   projection     sentinel-projection   (CQRS read-model worker, builds projection.db)
+#   dashboard      sentinel-dashboard    (Bun UI on :8000)
+#   nightrun       sentinel-nightrun     (one-shot nightly batch)
 #   help           print this message and exit
 #
 set -euo pipefail
@@ -55,8 +56,24 @@ case "$role" in
         cd "$go_workdir"
         exec /usr/local/bin/sentinel-nats-bridge
         ;;
+    projection)
+        # Long-running CQRS read-model worker. Polls EventStore, builds
+        # projection.db that the dashboard reads from.
+        exec /usr/local/bin/sentinel-projection \
+            --event-store /opt/sentinel/data/events.db \
+            --projection-db /opt/sentinel/data/projection.db
+        ;;
     dashboard)
         cd /opt/sentinel/dashboard
+        export PROJECTION_DB_PATH="${PROJECTION_DB_PATH:-/opt/sentinel/data/projection.db}"
+        export EVENT_STORE_DB_PATH="${EVENT_STORE_DB_PATH:-/opt/sentinel/data/events.db}"
+        # Wait for projection worker to create projection.db before bun starts.
+        # Otherwise the dashboard crashes with SQLITE_CANTOPEN.
+        deadline=$(( $(date +%s) + 60 ))
+        while [ ! -f "$PROJECTION_DB_PATH" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+            echo "[entrypoint] waiting for projection.db ($PROJECTION_DB_PATH) to appear..."
+            sleep 2
+        done
         exec bun run src/index.ts
         ;;
     nightrun)
@@ -69,7 +86,7 @@ Sentinel demo container.
 
 Usage: docker run --rm -e SENTINEL_ROLE=<role> sentinel-demo:local
 
-Available roles: daemon | gateway | judge | nats-bridge | dashboard | nightrun
+Available roles: daemon | gateway | judge | nats-bridge | projection | dashboard | nightrun
 
 The demo stack normally invokes this image once per service via
 docker-compose.demo.yml. To run an individual service ad-hoc, set

@@ -76,11 +76,13 @@ demo-binaries: ## Build only the Rust binaries the docker demo image needs (remo
 	@if [ -f .cargo-remote.toml ] && command -v cargo-remote >/dev/null 2>&1; then \
 		echo "[demo-binaries] cargo-remote configured -> offloading build"; \
 		cargo remote -c -- build --release --bin sentinel-daemon --bin sentinel-nightrun; \
+		cargo remote -c -- build --release -p sentinel-projection-service; \
 	else \
 		echo "[demo-binaries] cargo-remote not configured -> local cargo build"; \
 		echo "[demo-binaries] note: local build needs ~8 GB free RAM and ~20 min on a laptop;"; \
 		echo "[demo-binaries]       set up cargo-remote (see CONTRIBUTING.md) to offload."; \
 		cargo build --release --bin sentinel-daemon --bin sentinel-nightrun; \
+		cargo build --release -p sentinel-projection-service; \
 	fi
 
 demo-image: demo-binaries ## Build the docker demo image (requires demo-binaries)
