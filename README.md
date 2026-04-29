@@ -7,7 +7,9 @@
 [![Release](https://img.shields.io/github/v/release/silentspike/project-sentinel?include_prereleases&label=release)](https://github.com/silentspike/project-sentinel/releases)
 [![Stack: Rust 1.93+ / Go 1.26+](https://img.shields.io/badge/stack-rust%201.93%2B%20%2F%20go%201.26%2B-orange.svg)](#)
 
-A reference testbed for runtime governance of LLM coding agents.
+A reference testbed for runtime governance of LLM coding agents:
+sandbox each agent, audit each action, and verify failure modes before
+customers run agents against production code.
 
 When teams put LLM agents into real workflows, three operational questions
 come back:
@@ -161,6 +163,8 @@ transparently use it.
 
 ![Sentinel demo dashboard](docs/images/sentinel-demo.gif)
 
+*The dashboard surfaces runtime governance signals: control-plane decisions, sandbox enforcer status, audit-event throughput, and agent quality drift.*
+
 ```bash
 make demo                                 # build binaries + image, then run
 # or, step by step:
@@ -211,6 +215,53 @@ For the full stack with sandbox enforcement see
 `deploy/systemd/*.service`, the deployment notes in
 [docs/governance.md](docs/governance.md), and the
 [TOGAF v22.1 Architecture Guide](docs/architecture/togaf-architecture-guide.html).
+
+## Customer Workshop Path
+
+For engineering leadership and DevSecOps teams evaluating runtime
+governance for AI coding agents, the recommended walkthrough is a
+45-minute hands-on session:
+
+1. Architecture overview (10 min): TOGAF v22.1 guide, three control planes, sandbox stack.
+2. Hands-on demo (15 min): start the demo stack, observe agent activity, replay events.
+3. Sandbox-config inspection (10 min): bwrap + Landlock + cgroups policy walkthrough.
+4. 9/9 breakout test report review (5 min): what the tests prove, what they don't.
+5. Q&A + production deployment caveats (5 min).
+
+Full agenda: [`docs/workshop-agent-runtime-governance.md`](docs/workshop-agent-runtime-governance.md).
+
+## Demo: What it proves and what it doesn't
+
+The included docker demo (`make demo`) is a deliberate behavioral
+subset. It is meant to give a recruiter or curious reader a working
+dashboard in one command, not to reproduce the full sandbox story.
+
+### What the demo proves
+- ECS world simulation, bio-engine, physics, room sim — 60-persona
+  workload runs end-to-end on a 5-agent subset.
+- Event sourcing (Limbo SQLite, idempotent, replayable) — full audit
+  trail captured per agent.
+- Cortex Gateway 7-step pipeline + 10-rule synthesis engine — agent
+  reasoning is observable.
+- Dashboard (Bun + Hono + WebSocket) — live agent activity, drift,
+  quality metrics.
+
+### What the demo does not exercise
+The kernel-bound sandbox primitives (per-agent isolation) require
+`CAP_BPF`, `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, user namespaces, and a
+writeable bpf-fs / `/dev/fuse`. A plain unprivileged Docker container
+has none of those. The `SandboxEnforcer`
+(`crates/sentinel-sandbox/src/enforcer.rs`) detects the absence at boot
+and degrades gracefully — warnings in the daemon log are the expected
+demo signal.
+
+For the full stack with sandbox enforcement (bwrap + Landlock + cgroups
++ netns + nftables + Wasmtime) see `deploy/systemd/*.service` and the
+[TOGAF v22.1 architecture guide](docs/architecture/togaf-architecture-guide.html).
+
+### Verified by external tests
+[Sandbox Test Report](docs/security-test-report.md): 9/9 breakout
+tests pass on a privileged host.
 
 ## Status — what works in this alpha, what doesn't yet
 
@@ -325,6 +376,24 @@ The synthetic office workload is a deliberate stress-test for the runtime
 layer. The personality model, role taxonomy, and bio-state mechanism are
 documented in [docs/research-context.md](docs/research-context.md). The
 platform underneath is the work; the workload is the evaluation.
+
+## Why this proof matters
+
+When customers evaluate AI coding agent deployment, three runtime
+questions come back:
+
+- *"How is the agent isolated from production?"* — sandbox stack
+  (bwrap + Landlock + cgroups + netns), 9/9 breakout tests passing.
+- *"What evidence remains for review?"* — event sourcing on Limbo
+  SQLite, deterministic replay, hash-chained audit trail.
+- *"Who decides what the agent can do?"* — three independent control
+  planes (Agent CP, Platform CP, API CP), each owning a single
+  decision domain.
+
+This repo is not a product. It is a **reference implementation** that
+makes those questions concrete. The TOGAF v22.1 architecture is the
+contract; the docker demo is a reduced behavioral subset (see Demo
+section above).
 
 ## License
 
