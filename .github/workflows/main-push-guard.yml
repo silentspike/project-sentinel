@@ -6,7 +6,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 jobs:
   enforce-pr-only:
@@ -20,7 +19,6 @@ jobs:
             const repo = context.repo.repo;
             const commits = context.payload.commits || [];
             const head = context.payload.head_commit;
-            const marker = "<!-- main-push-guard -->";
 
             // Ignore bot-driven maintenance pushes
             if (actor === "github-actions[bot]" || actor === "dependabot[bot]") {
@@ -66,30 +64,25 @@ jobs:
               return;
             }
 
-            const body = [
-              marker,
-              "Direct push to `main` detected without PR association.",
-              "",
-              `Actor: @${actor}`,
-              `Violating commits:`,
-              ...violations.map((v) => `- \`${v}\``),
-              "",
-              "Policy: merge via PR only. Use CI + review flow.",
-            ].join("\n");
-
-            // Create one incident issue per push event.
-            await github.rest.issues.create({
-              owner,
-              repo,
-              title: `policy: direct push to main detected (${new Date().toISOString().slice(0, 19)}Z)`,
-              body,
-              labels: ["type:bug", "prio:critical", "status:triage"],
-            });
-
-            core.summary.addHeading("Main Push Guard: FAILED");
-            core.summary.addList([
-              `Direct push commits without PR association: ${violations.join(", ")}`,
-              "Incident issue has been created automatically.",
-            ]);
+            // Direct push detected. We log it to the run summary as an audit trail
+            // but do not create an issue (this is a single-maintainer repo with
+            // strict branch protection; opening prio:critical issues per push
+            // creates noise that does not reflect real governance defects).
+            //
+            // The run summary remains visible in the Actions tab and serves the
+            // same audit purpose without polluting the issue tracker.
+            core.summary.addHeading("Main Push Guard: direct push detected");
+            core.summary.addRaw(`Actor: @${actor}\n\n`);
+            core.summary.addList(
+              violations.map((v) => `Direct-push commit (no PR association): \`${v}\``)
+            );
+            core.summary.addRaw(
+              "\nThis is logged for audit only. Policy preference: merge via PR. " +
+              "Branch protection (required CI checks, enforce_admins, no force-pushes, " +
+              "no deletions) provides the binding enforcement.",
+            );
             await core.summary.write();
-            core.setFailed("Main branch received commits that are not associated with a PR.");
+            core.warning(
+              `Direct push to main detected by ${actor} (${violations.length} commit(s)). ` +
+              "Logged in run summary; no issue created.",
+            );
