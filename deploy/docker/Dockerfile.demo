@@ -3,10 +3,10 @@
 # Sentinel Demo image — packages every binary the 10-minute demo needs into
 # a single ~200 MB runtime layer.
 #
-# Pre-requisite (Rust binaries are built OUTSIDE Docker via cargo remote):
+# Pre-requisite (Rust binaries are built OUTSIDE Docker):
 #   make demo-binaries
-# which is equivalent to:
-#   cargo remote -c -- build --release --bin sentinel-daemon --bin sentinel-nightrun
+# which uses cargo-remote against a build server if .cargo-remote.toml is
+# configured, otherwise falls back to a local `cargo build --release`.
 #
 # Then build the image:
 #   docker build -f deploy/docker/Dockerfile.demo -t sentinel-demo:local .
@@ -15,9 +15,9 @@
 #   The Sentinel Rust workspace has 15+ crates and links bevy_ecs / zenoh /
 #   redb / wasmtime. A from-scratch in-container `cargo build --release` needs
 #   8+ GB RAM and 30+ min on a developer laptop, and frequently OOM-kills.
-#   The project standard is to use cargo remote against a dedicated build
-#   server (.cargo-remote.toml). The Dockerfile honors that: Rust binaries
-#   come from `target/release/` on the host, the image just packages them.
+#   The Dockerfile expects the binaries to be present in `target/release/`
+#   on the host (built either via cargo-remote or local cargo); the image
+#   just packages them.
 #
 # The image bundles:
 #   - sentinel-daemon (Rust)         operator API on :8084
@@ -37,9 +37,10 @@
 # `make demo-binaries` (cargo remote -c -- build --release ...) first.
 FROM debian:bookworm-slim AS rust-binaries
 
-COPY target/release/sentinel-daemon   /out/sentinel-daemon
-COPY target/release/sentinel-nightrun /out/sentinel-nightrun
-RUN chmod +x /out/sentinel-daemon /out/sentinel-nightrun
+COPY target/release/sentinel-daemon     /out/sentinel-daemon
+COPY target/release/sentinel-nightrun   /out/sentinel-nightrun
+COPY target/release/sentinel-projection /out/sentinel-projection
+RUN chmod +x /out/sentinel-daemon /out/sentinel-nightrun /out/sentinel-projection
 
 # ---------------------------------------------------------------------------
 # Stage 2: Go build (gateway + judge + nats-bridge)
@@ -95,6 +96,7 @@ RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.1.30" && \
 # Service binaries
 COPY --from=rust-binaries /out/sentinel-daemon          /usr/local/bin/
 COPY --from=rust-binaries /out/sentinel-nightrun        /usr/local/bin/
+COPY --from=rust-binaries /out/sentinel-projection      /usr/local/bin/
 COPY --from=go-builder    /out/cortex-gateway           /usr/local/bin/
 COPY --from=go-builder    /out/sentinel-judge           /usr/local/bin/
 COPY --from=go-builder    /out/sentinel-nats-bridge     /usr/local/bin/

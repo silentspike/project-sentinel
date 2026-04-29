@@ -1,7 +1,7 @@
 # Sentinel 10-minute demo stack.
 #
 # Brings up: NATS + sentinel-daemon + cortex-gateway + sentinel-judge +
-#            sentinel-nats-bridge + sentinel-dashboard
+#            sentinel-nats-bridge + sentinel-projection + sentinel-dashboard
 #
 # All five Sentinel services share the same image (deploy/docker/Dockerfile.demo)
 # and select their binary via the SENTINEL_ROLE environment variable.
@@ -10,18 +10,18 @@
 #   ./scripts/demo.sh                    # build + run + open dashboard + tear down
 #   docker compose -f docker-compose.demo.yml up --build
 #
-# Ports exposed on the host:
+# Ports exposed on the host (every Sentinel-app port uses a +10000 offset
+# to avoid colliding with common local dev services on 8000-8090):
 #   18000  Dashboard UI           (browser)              -> container :8000
-#   8080   Cortex Gateway (proxy) -- also serves /metrics
-#   8081   Cortex Gateway (control plane)
+#   18080  Cortex Gateway (proxy) -- also serves /metrics-> container :8080
+#   18081  Cortex Gateway (control plane)               -> container :8081
 #   18082  sentinel-judge        (health, /metrics)     -> container :8082
 #   18083  sentinel-nats-bridge  (health)               -> container :8083
-#   8084   sentinel-daemon (operator API)
-#   8222   NATS monitoring HTTP
+#   18084  sentinel-daemon (operator API)               -> container :8084
+#    8222  NATS monitoring HTTP                          (no collision risk)
+#    4222  NATS client                                   (no collision risk)
 #
-# Host ports 18000/18082/18083 use a +10000 offset because 8000/8082/8083 are
-# commonly bound on a developer laptop (nginx, dev servers, other compose
-# stacks). Adjust to canonical ports if your machine has them free.
+# Adjust to canonical ports (8000, 8080-8084) if your machine has them free.
 
 name: sentinel-demo
 
@@ -54,7 +54,7 @@ services:
       nats:
         condition: service_healthy
     ports:
-      - "8084:8084"
+      - "18084:8084"
     volumes:
       - sentinel-data:/opt/sentinel/data
     healthcheck:
@@ -76,10 +76,12 @@ services:
       daemon:
         condition: service_healthy
     # gateway exposes the proxy on 8080 (also serves /metrics) and the
-    # control plane on 8081. There is no separate metrics port.
+    # control plane on 8081 inside the container. Host ports 18080/18081
+    # use the +10000 offset to avoid colliding with local dev servers
+    # (gradle, java app servers, custom proxies on 8080/8081).
     ports:
-      - "8080:8080"
-      - "8081:8081"
+      - "18080:8080"
+      - "18081:8081"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "--max-time", "3", "http://localhost:8080/health"]
       interval: 10s
@@ -120,6 +122,22 @@ services:
       - sentinel-data:/opt/sentinel/data
     networks: [sentinel]
 
+  projection:
+    # CQRS read-model worker. Polls the EventStore and builds the
+    # projection.db that the dashboard reads (agent_live_view, room_live_view,
+    # kpi_1m). Without this service running, the dashboard crashes on
+    # startup because projection.db doesn't exist.
+    image: sentinel-demo:local
+    container_name: sentinel-demo-projection
+    environment:
+      SENTINEL_ROLE: projection
+    depends_on:
+      daemon:
+        condition: service_healthy
+    volumes:
+      - sentinel-data:/opt/sentinel/data
+    networks: [sentinel]
+
   dashboard:
     image: sentinel-demo:local
     container_name: sentinel-demo-dashboard
@@ -131,6 +149,8 @@ services:
     depends_on:
       gateway:
         condition: service_healthy
+      projection:
+        condition: service_started
     # host port 18000 (port 8000 commonly used by local nginx/dev servers).
     # Adjust on a host where 8000 is free if you want the canonical mapping.
     ports:

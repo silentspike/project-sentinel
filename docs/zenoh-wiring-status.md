@@ -3,7 +3,7 @@
 Katalog aller 22 Zenoh-Topics in `crates/sentinel-zenoh/src/topics.rs`.
 Referenz fuer zukuenftige Verdrahtungs-Issues.
 
-**ADR:** [ADR-001](adr/ADR-001-judge-nats-communication.md)
+**ADR:** ADR-001-judge-nats-communication (internal — see CHANGELOG)
 
 ## Topics
 
