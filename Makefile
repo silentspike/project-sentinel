@@ -45,7 +45,7 @@ test: ## Run all tests
 	@echo "=== Go Tests ==="
 	cd cmd/cortex-gateway && go test ./...
 	@echo "=== Dashboard Tests ==="
-	cd dashboard && bun test 2>/dev/null || echo "(no dashboard tests yet)"
+	$(MAKE) test-dashboard
 	@echo "All tests: OK"
 
 test-rust: ## Run Rust tests only
@@ -54,7 +54,11 @@ test-rust: ## Run Rust tests only
 test-go: ## Run Go tests only
 	cd cmd/cortex-gateway && go test ./...
 
-test-dashboard: ## Run Dashboard tests only
+test-dashboard: ## Run Dashboard tests only (auto-installs deps on a fresh clone)
+	@if [ ! -d dashboard/node_modules ]; then \
+		echo "[test-dashboard] dashboard/node_modules missing -> bun install"; \
+		cd dashboard && bun install --frozen-lockfile; \
+	fi
 	cd dashboard && bun test
 
 # ──────────────────────────────────────────────
@@ -72,10 +76,24 @@ build-rust-remote: ## Build Rust on remote build server
 build-rust-release: ## Build Rust release (remote, includes eBPF kernel probes)
 	cargo remote -- build --workspace --release --features ebpf
 
-demo-binaries: ## Build only the Rust binaries the docker demo image needs (remote)
-	cargo remote -c -- build --release \
-		--bin sentinel-daemon \
-		--bin sentinel-nightrun
+demo-binaries: ## Get the Rust binaries for the docker demo (release-fetch / cargo-remote / local cargo, in that order)
+	@if [ -x target/release/sentinel-daemon ] && [ -x target/release/sentinel-nightrun ] && [ -x target/release/sentinel-projection ]; then \
+		echo "[demo-binaries] all 3 binaries already in target/release/, skipping"; \
+	elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 && gh release view v0.1.0-alpha --repo silentspike/project-sentinel >/dev/null 2>&1; then \
+		echo "[demo-binaries] tier 1: fetching pre-built binaries from GitHub Release v0.1.0-alpha"; \
+		./scripts/fetch-demo-binaries.sh; \
+	elif [ -f .cargo-remote.toml ] && command -v cargo-remote >/dev/null 2>&1; then \
+		echo "[demo-binaries] tier 2: cargo-remote configured -> offloading build"; \
+		cargo remote -c -- build --release --bin sentinel-daemon --bin sentinel-nightrun; \
+		cargo remote -c -- build --release -p sentinel-projection-service; \
+	else \
+		echo "[demo-binaries] tier 3: local cargo build (slow path)"; \
+		echo "[demo-binaries] note: local build needs ~8 GB free RAM and ~20 min on a laptop;"; \
+		echo "[demo-binaries]       install gh + run 'gh auth login' to use the pre-built path,"; \
+		echo "[demo-binaries]       or set up cargo-remote (see CONTRIBUTING.md)."; \
+		cargo build --release --bin sentinel-daemon --bin sentinel-nightrun; \
+		cargo build --release -p sentinel-projection-service; \
+	fi
 
 demo-image: demo-binaries ## Build the docker demo image (requires demo-binaries)
 	docker build -f deploy/docker/Dockerfile.demo -t sentinel-demo:local .
@@ -84,7 +102,7 @@ demo: demo-image ## Build + run the 10-minute demo stack
 	./scripts/demo.sh
 
 build-go: ## Build Cortex Gateway
-	cd cmd/cortex-gateway && go build -o cortex-gateway ./...
+	cd cmd/cortex-gateway && go build -o cortex-gateway .
 
 build-dashboard: ## Build Dashboard
 	cd dashboard && bun install

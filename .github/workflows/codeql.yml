@@ -21,6 +21,7 @@ on:
       - '.github/workflows/codeql.yml'
   schedule:
     - cron: '0 4 * * 3'  # Wednesday 04:00 UTC
+  workflow_dispatch: {}
 
 permissions:
   contents: read
