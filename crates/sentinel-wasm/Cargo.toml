@@ -15,7 +15,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
-wasmtime = { version = "42", features = ["component-model"], optional = true }
+wasmtime = { version = "43", features = ["component-model"], optional = true }
 wasmtime-wasi = { version = "42", optional = true }
 
 [dev-dependencies]
