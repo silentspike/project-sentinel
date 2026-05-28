@@ -633,22 +633,38 @@ export function getAgentNameMap(): Map<number, string> {
 
 // ── Change Detection (fuer WebSocket) ────────────
 
-export function getMaxAgentEventId(): number {
+const PROJECTION_NAME = "sentinel-projection";
+
+function getProjectedSourceMaxEventId(): number {
   const row = projectionDb
     .query<{ max_id: number | null }, []>(
-      "SELECT MAX(last_event_id) as max_id FROM agent_live_view",
+      `SELECT MAX(m) as max_id
+       FROM (
+         SELECT MAX(last_event_id) as m FROM agent_live_view
+         UNION ALL
+         SELECT MAX(last_event_id) as m FROM room_live_view
+         UNION ALL
+         SELECT MAX(last_event_id) as m FROM kpi_1m
+       )`,
     )
     .get();
   return row?.max_id ?? 0;
 }
 
-export function getMaxRoomEventId(): number {
-  const row = projectionDb
-    .query<{ max_id: number | null }, []>(
-      "SELECT MAX(last_event_id) as max_id FROM room_live_view",
-    )
-    .get();
-  return row?.max_id ?? 0;
+export function getGlobalMaxEventId(): number {
+  try {
+    const row = projectionDb
+      .query<{ max_id: number | null }, [string]>(
+        `SELECT last_event_id as max_id
+         FROM projection_watermarks
+         WHERE projection_name = ?`,
+      )
+      .get(PROJECTION_NAME);
+    if (row?.max_id == null) return getProjectedSourceMaxEventId();
+    return row.max_id;
+  } catch {
+    return getProjectedSourceMaxEventId();
+  }
 }
 
 // ── Cockpit Queries ───────────────────────────────
@@ -857,16 +873,6 @@ export function getLastNightrunStats(): {
   }
 }
 
-export function getMaxIncidentEventId(): number {
-  const row = eventStoreDb
-    .query<{ max_id: number | null }, []>(
-      `SELECT MAX(id) as max_id FROM events
-       WHERE event_type IN (${INCIDENT_TYPES_SQL})`,
-    )
-    .get();
-  return row?.max_id ?? 0;
-}
-
 // ── Chaos Event Feed ────────────────────────────
 
 export function getRecentChaosEvents(limit = 100): ChaosEventItem[] {
@@ -930,15 +936,6 @@ export function getChaosEventsByRoom(roomId: string, limit = 50): ChaosEventItem
         timestamp_ms: row.timestamp_ms,
       };
     });
-}
-
-export function getMaxChaosEventId(): number {
-  const row = eventStoreDb
-    .query<{ max_id: number | null }, []>(
-      "SELECT MAX(id) as max_id FROM events WHERE event_type = 'chaos_triggered'",
-    )
-    .get();
-  return row?.max_id ?? 0;
 }
 
 // ── Operator Messages (Chat Input) ──────────────
@@ -1196,16 +1193,6 @@ export function getRecentActivityEvents(limit = 200): EventRow[] {
        LIMIT ?`,
     )
     .all(limit);
-}
-
-export function getMaxActivityEventId(): number {
-  const row = eventStoreDb
-    .query<{ max_id: number | null }, []>(
-      `SELECT MAX(id) as max_id FROM events
-       WHERE event_type IN (${ACTIVITY_TYPES_SQL})`,
-    )
-    .get();
-  return row?.max_id ?? 0;
 }
 
 // ── Total Event Count ───────────────────────────

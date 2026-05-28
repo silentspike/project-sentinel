@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Updated optional `sentinel-wasm` Wasmtime dependencies to 44.0.2 to clear current RustSec advisories.
+- Optimized Issue #277 dashboard WebSocket change detection from five per-view polling queries to one Projection-DB `projection_watermarks` lookup per poll cycle, with idle polling skipped when no WebSocket clients are connected; VM benchmark evidence is captured with `dashboard/scripts/measure-ws-polling.sh`.
+- Optimized Issue #276 ECS tick-loop hot paths: reusable room-physics and persist workspaces, perception buffer reuse, and batched Limbo event/outbox writes. Deploy-VM benchmarks on Intel i7-3930K show relative improvements of 26.86% physics, 26.34% perception, 52.57% persist e2e, 86.95% persist write-only, and 17.23% full tick.
+- Excluded `sentinel-gateway` from daemon platform-controlplane `monitored_services` in the deployment config so benchmark and smoke runs can keep the gateway stopped without self-heal restarts.
+
+### Added
+- Added dashboard exposure for Issue #276 benchmark evidence at `/api/metrics/benchmarks`, including hardware scope, relative-only comparison notes, and system-metric log labels.
 
 ## [0.1.0-alpha] - 2026-04-26
 

@@ -290,6 +290,10 @@ impl ProjectionWorker {
             processed += 1;
         }
 
+        if let Some((last_row_id, _)) = batch.last() {
+            txn.update_projection_watermark(PROJECTION_NAME, *last_row_id)?;
+        }
+
         txn.commit()?;
         Ok(processed)
     }
