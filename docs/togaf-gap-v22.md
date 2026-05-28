@@ -143,7 +143,6 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | GitHub issue | Cluster | Topic |
 |--------------|---------|-------|
 | #266 | 01 | Gaia firmen-konfigurator (multi-tenant company definitions) |
-| #277 | 05b | Dashboard polling efficiency |
 | #278 | 11 | Non-blocking nightrun |
 | #336 | 10 | Acronym glossary section + README cross-links (good-first-issue) |
 
