@@ -315,9 +315,10 @@ describe("Acceptance Tests - Issue #24: Dashboard Live-Daten", () => {
     expect(data.issue).toBe(277);
     expect(data.cpu).toContain("i7-3930K");
     expect(data.notes.join(" ")).toContain("linux-x64-baseline");
+    expect(data.query_count_per_poll).toBe(1);
     expect(data.results[0].before_pread64_calls).toBe(13);
-    expect(data.results[0].after_pread64_calls).toBe(10);
-    expect(data.results[0].reduction_percent).toBe(23.08);
+    expect(data.results[0].after_pread64_calls).toBe(11);
+    expect(data.results[0].reduction_percent).toBe(15.38);
   });
 
   // AC-5: GET /api/health hat projection_lag

@@ -633,7 +633,9 @@ export function getAgentNameMap(): Map<number, string> {
 
 // ── Change Detection (fuer WebSocket) ────────────
 
-export function getGlobalMaxEventId(): number {
+const PROJECTION_NAME = "sentinel-projection";
+
+function getProjectedSourceMaxEventId(): number {
   const row = projectionDb
     .query<{ max_id: number | null }, []>(
       `SELECT MAX(m) as max_id
@@ -641,10 +643,28 @@ export function getGlobalMaxEventId(): number {
          SELECT MAX(last_event_id) as m FROM agent_live_view
          UNION ALL
          SELECT MAX(last_event_id) as m FROM room_live_view
+         UNION ALL
+         SELECT MAX(last_event_id) as m FROM kpi_1m
        )`,
     )
     .get();
   return row?.max_id ?? 0;
+}
+
+export function getGlobalMaxEventId(): number {
+  try {
+    const row = projectionDb
+      .query<{ max_id: number | null }, [string]>(
+        `SELECT last_event_id as max_id
+         FROM projection_watermarks
+         WHERE projection_name = ?`,
+      )
+      .get(PROJECTION_NAME);
+    if (row?.max_id == null) return getProjectedSourceMaxEventId();
+    return row.max_id;
+  } catch {
+    return getProjectedSourceMaxEventId();
+  }
 }
 
 // ── Cockpit Queries ───────────────────────────────

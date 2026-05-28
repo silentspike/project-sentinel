@@ -1,5 +1,5 @@
 // WebSocket-Handler mit DB-Poll Change-Detection.
-// Pollt agent_live_view + room_live_view auf Aenderungen via MAX(last_event_id).
+// Pollt den globalen Projection-Watermark.
 // Bei Aenderung: Broadcast Snapshot an alle verbundenen Clients.
 
 import type { ServerWebSocket } from "bun";
@@ -111,6 +111,8 @@ export function broadcast(data: unknown): void {
 
 export function pollForChanges(): void {
   try {
+    if (clients.size === 0) return;
+
     const currentMax = getGlobalMaxEventId();
     if (currentMax <= lastGlobalEventId) return;
 
@@ -132,6 +134,8 @@ export function pollForChanges(): void {
 }
 
 function sendHealthUpdate(): void {
+  if (clients.size === 0) return;
+
   let lag = 0;
   try {
     lag = getProjectionLag();
