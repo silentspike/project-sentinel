@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Updated optional `sentinel-wasm` Wasmtime dependencies to 44.0.2 to clear current RustSec advisories.
+
 ## [0.1.0-alpha] - 2026-04-26
 
 First public release.
