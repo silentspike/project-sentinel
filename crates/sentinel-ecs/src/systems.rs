@@ -27,6 +27,7 @@ use sentinel_common::{
     Perception, RoomStimulusType, Timestamp,
 };
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::time::Instant;
 use tracing::{debug, warn};
 
@@ -1363,57 +1364,68 @@ pub fn perception_system(
 ) {
     for (bio, position, mood, mut perception) in &mut query {
         // Koerper-Wahrnehmung
-        let mut body_parts: Vec<&str> = Vec::new();
+        perception.body_text.clear();
 
         if bio.hunger > 70.0 {
-            body_parts.push("Du hast grossen Hunger.");
+            append_perception_part(&mut perception.body_text, "Du hast grossen Hunger.");
         } else if bio.hunger > 40.0 {
-            body_parts.push("Du spuerst leichten Hunger.");
+            append_perception_part(&mut perception.body_text, "Du spuerst leichten Hunger.");
         }
 
         if bio.energy < 30.0 {
-            body_parts.push("Du bist sehr muede.");
+            append_perception_part(&mut perception.body_text, "Du bist sehr muede.");
         } else if bio.energy < 50.0 {
-            body_parts.push("Du fuehlst dich etwas schlapp.");
+            append_perception_part(&mut perception.body_text, "Du fuehlst dich etwas schlapp.");
         } else if bio.energy > 85.0 {
-            body_parts.push("Du fuehlst dich voller Energie.");
+            append_perception_part(&mut perception.body_text, "Du fuehlst dich voller Energie.");
         }
 
         if bio.caffeine_mg > 80.0 {
-            body_parts.push("Der Kaffee wirkt, du bist wach und konzentriert.");
+            append_perception_part(
+                &mut perception.body_text,
+                "Der Kaffee wirkt, du bist wach und konzentriert.",
+            );
         } else if bio.caffeine_mg > 30.0 {
-            body_parts.push("Du spuerst noch etwas Koffein.");
+            append_perception_part(&mut perception.body_text, "Du spuerst noch etwas Koffein.");
         }
 
         if bio.bladder > 70.0 {
-            body_parts.push("Du musst dringend auf die Toilette.");
+            append_perception_part(
+                &mut perception.body_text,
+                "Du musst dringend auf die Toilette.",
+            );
         } else if bio.bladder > 40.0 {
-            body_parts.push("Du bemerkst leichten Blasendrang.");
+            append_perception_part(
+                &mut perception.body_text,
+                "Du bemerkst leichten Blasendrang.",
+            );
         }
 
         if bio.stress > 70.0 {
-            body_parts.push("Du bist sehr gestresst.");
+            append_perception_part(&mut perception.body_text, "Du bist sehr gestresst.");
         } else if bio.stress > 40.0 {
-            body_parts.push("Du fuehlst leichten Stress.");
+            append_perception_part(&mut perception.body_text, "Du fuehlst leichten Stress.");
         }
 
-        perception.body_text = body_parts.join(" ");
-
         // Umgebungs-Wahrnehmung
-        let room_desc = room_id_to_german(&position.room_id);
-        perception.environment_text = if position.in_transit {
-            format!(
-                "Du bist auf dem Weg von {} nach {}.",
-                room_desc,
-                position
-                    .transit_target
-                    .as_deref()
-                    .map(room_id_to_german)
-                    .unwrap_or_else(|| "unbekannt".to_string())
-            )
+        perception.environment_text.clear();
+        if position.in_transit {
+            perception
+                .environment_text
+                .push_str("Du bist auf dem Weg von ");
+            append_room_id_to_german(&mut perception.environment_text, &position.room_id);
+            perception.environment_text.push_str(" nach ");
+            if let Some(target) = position.transit_target.as_deref() {
+                append_room_id_to_german(&mut perception.environment_text, target);
+            } else {
+                perception.environment_text.push_str("unbekannt");
+            }
+            perception.environment_text.push('.');
         } else {
-            format!("Du bist {}.", room_desc)
-        };
+            perception.environment_text.push_str("Du bist ");
+            append_room_id_to_german(&mut perception.environment_text, &position.room_id);
+            perception.environment_text.push('.');
+        }
 
         // Aktive Gerueche im aktuellen Raum in die Umgebungswahrnehmung injizieren
         if !position.in_transit {
@@ -1439,13 +1451,16 @@ pub fn perception_system(
         }
 
         // Stimmungs-basierte soziale Wahrnehmung
-        perception.social_text = if bio.social_need > 70.0 {
-            "Du hast das Beduerfnis, mit jemandem zu reden.".to_string()
+        perception.social_text.clear();
+        if bio.social_need > 70.0 {
+            perception
+                .social_text
+                .push_str("Du hast das Beduerfnis, mit jemandem zu reden.");
         } else if bio.social_need < 20.0 {
-            "Du moechtest gerade lieber allein sein.".to_string()
-        } else {
-            String::new()
-        };
+            perception
+                .social_text
+                .push_str("Du moechtest gerade lieber allein sein.");
+        }
 
         // Stimmungstext anhaengen wenn markant
         let mood_text = match mood.dominant_emotion {
@@ -1470,35 +1485,58 @@ pub fn perception_system(
 
 /// Mappt Raum-ID auf deutschen Beschreibungstext
 fn room_id_to_german(room_id: &str) -> String {
-    match room_id {
-        "empfang" => "im Empfangsbereich".to_string(),
-        "flur-eg" => "im Flur des Erdgeschosses".to_string(),
-        "flur-og" => "im Flur des Obergeschosses".to_string(),
-        "kueche" => "in der Kueche".to_string(),
-        "buero-dev-1" => "im Entwicklerbuero 1".to_string(),
-        "buero-dev-2" => "im Entwicklerbuero 2".to_string(),
-        "buero-design-1" => "im Designbuero 1".to_string(),
-        "buero-design-2" => "im Designbuero 2".to_string(),
-        "buero-ceo" => "im Buero der Geschaeftsfuehrung".to_string(),
-        "meetingraum-01" => "im Meetingraum 1 (EG)".to_string(),
-        "meetingraum-02" => "im Meetingraum 2 (OG)".to_string(),
-        "meetingraum-03" => "im Meetingraum 3 (OG)".to_string(),
-        "toilette-eg-damen" => "auf der Damentoilette (EG)".to_string(),
-        "toilette-eg-herren" => "auf der Herrentoilette (EG)".to_string(),
-        "toilette-og-damen" => "auf der Damentoilette (OG)".to_string(),
-        "toilette-og-herren" => "auf der Herrentoilette (OG)".to_string(),
-        "treppenhaus" => "im Treppenhaus".to_string(),
-        "buero-sales" => "im Vertriebsbuero".to_string(),
-        "buero-pm" => "im Projektmanagement-Buero".to_string(),
-        "buero-marketing" => "im Marketingbuero".to_string(),
-        "buero-admin" => "im Verwaltungsbuero".to_string(),
-        "buero-qa" => "im QA-Buero".to_string(),
-        "buero-it" => "im IT-Buero".to_string(),
-        "buero-betriebsrat" => "im Betriebsratsbuero".to_string(),
-        "buero-betriebspsych" => "in der Betriebspsychologie".to_string(),
-        "buero-betriebsarzt" => "in der Betriebsmedizin".to_string(),
-        other => format!("im Raum '{}'", other),
+    if let Some(room) = room_id_to_german_static(room_id) {
+        room.to_string()
+    } else {
+        format!("im Raum '{}'", room_id)
     }
+}
+
+fn room_id_to_german_static(room_id: &str) -> Option<&'static str> {
+    match room_id {
+        "empfang" => Some("im Empfangsbereich"),
+        "flur-eg" => Some("im Flur des Erdgeschosses"),
+        "flur-og" => Some("im Flur des Obergeschosses"),
+        "kueche" => Some("in der Kueche"),
+        "buero-dev-1" => Some("im Entwicklerbuero 1"),
+        "buero-dev-2" => Some("im Entwicklerbuero 2"),
+        "buero-design-1" => Some("im Designbuero 1"),
+        "buero-design-2" => Some("im Designbuero 2"),
+        "buero-ceo" => Some("im Buero der Geschaeftsfuehrung"),
+        "meetingraum-01" => Some("im Meetingraum 1 (EG)"),
+        "meetingraum-02" => Some("im Meetingraum 2 (OG)"),
+        "meetingraum-03" => Some("im Meetingraum 3 (OG)"),
+        "toilette-eg-damen" => Some("auf der Damentoilette (EG)"),
+        "toilette-eg-herren" => Some("auf der Herrentoilette (EG)"),
+        "toilette-og-damen" => Some("auf der Damentoilette (OG)"),
+        "toilette-og-herren" => Some("auf der Herrentoilette (OG)"),
+        "treppenhaus" => Some("im Treppenhaus"),
+        "buero-sales" => Some("im Vertriebsbuero"),
+        "buero-pm" => Some("im Projektmanagement-Buero"),
+        "buero-marketing" => Some("im Marketingbuero"),
+        "buero-admin" => Some("im Verwaltungsbuero"),
+        "buero-qa" => Some("im QA-Buero"),
+        "buero-it" => Some("im IT-Buero"),
+        "buero-betriebsrat" => Some("im Betriebsratsbuero"),
+        "buero-betriebspsych" => Some("in der Betriebspsychologie"),
+        "buero-betriebsarzt" => Some("in der Betriebsmedizin"),
+        _ => None,
+    }
+}
+
+fn append_room_id_to_german(output: &mut String, room_id: &str) {
+    if let Some(room) = room_id_to_german_static(room_id) {
+        output.push_str(room);
+    } else {
+        write!(output, "im Raum '{}'", room_id).expect("writing to String cannot fail");
+    }
+}
+
+fn append_perception_part(output: &mut String, text: &str) {
+    if !output.is_empty() {
+        output.push(' ');
+    }
+    output.push_str(text);
 }
 
 #[cfg(feature = "wasm")]
