@@ -20,7 +20,7 @@ use super::world::{
     OperatorCommandReceiver, PersistTelemetry, PsiMetrics, RedbStateStore, RoomDistanceMap,
     RoomPhysicsState, RoomPhysicsWorkspace, ToolRuntimeResource, ZenohFanoutSender,
 };
-use super::world::{PerceptionSender, SimulationTime};
+use super::world::{PerceptionSender, PersistWorkspace, SimulationTime};
 use bevy_ecs::prelude::*;
 use sentinel_common::{
     ActionType, AgentId, DomainEvent, DomainEventPayload, Emotion, EventType, OperatorCommand,
@@ -2033,6 +2033,7 @@ pub fn persist_system(
     store: Option<Res<RedbStateStore>>,
     event_store: Option<Res<LimboEventStore>>,
     mut event_buffer: ResMut<EventBuffer>,
+    mut persist_workspace: ResMut<PersistWorkspace>,
     mut telemetry: ResMut<PersistTelemetry>,
     fanout_sender: Option<Res<ZenohFanoutSender>>,
 ) {
@@ -2055,30 +2056,30 @@ pub fn persist_system(
 
     // 1. Events aus Buffer nach Limbo schreiben (mit Outbox) + Zenoh Fan-Out
     if let Some(es) = &event_store {
-        let mut batch = Vec::with_capacity(event_buffer.events.len());
+        persist_workspace.clear();
         for event in event_buffer.events.drain(..) {
-            let topic = event_topic(&event);
-            batch.push((event, topic));
+            persist_workspace.push_with_topic(event, write_event_topic);
         }
 
-        if !batch.is_empty() {
-            let batch_result = es.0.append_with_outbox_batch(
-                batch.iter().map(|(event, topic)| (event, topic.as_str())),
-            );
+        if !persist_workspace.is_empty() {
+            let event_count = persist_workspace.len();
+            let batch_result = es.0.append_with_outbox_batch(persist_workspace.entries());
 
             if let Err(err) = batch_result {
                 warn!(
-                    event_count = batch.len(),
+                    event_count,
                     "persist_system: failed to write event batch: {err}"
                 );
             } else if let Some(ref fanout) = fanout_sender {
                 // Nach erfolgreichem Limbo-Write: Events an Zenoh Fan-Out Bridge senden
-                for (event, _) in batch {
+                for event in persist_workspace.drain_events() {
                     if fanout.sender.try_send(event).is_err() {
                         // Channel voll — Event droppen (Limbo ist SSOT, Zenoh ist best-effort)
                     }
                 }
             }
+
+            persist_workspace.clear();
         }
     } else {
         // Kein Event Store: Buffer leeren damit er nicht unendlich waechst
@@ -2129,12 +2130,12 @@ pub fn persist_system(
     }
 }
 
-/// Bestimmt das Zenoh-Topic fuer ein DomainEvent.
-fn event_topic(event: &DomainEvent) -> String {
-    format!(
-        "sentinel/events/{}/{}",
-        event.event_type, event.aggregate_id
-    )
+/// Schreibt das Zenoh-Topic fuer ein DomainEvent in einen wiederverwendeten Buffer.
+fn write_event_topic(output: &mut String, event: &DomainEvent) {
+    output.push_str("sentinel/events/");
+    output.push_str(&event.event_type);
+    output.push('/');
+    output.push_str(&event.aggregate_id);
 }
 
 fn encode_agent_snapshot(tick: u64, position: &Position, bio: &BioState, mood: &Mood) -> Vec<u8> {

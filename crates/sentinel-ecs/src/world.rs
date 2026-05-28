@@ -555,6 +555,81 @@ impl PersistTelemetry {
     }
 }
 
+const PERSIST_WORKSPACE_CAPACITY: usize = 64;
+const PERSIST_TOPIC_CAPACITY: usize = 96;
+
+/// Reusable scratch storage for the Limbo write phase of a tick.
+#[derive(Resource, Debug, Clone)]
+pub struct PersistWorkspace {
+    events: Vec<DomainEvent>,
+    topics: Vec<String>,
+    active_len: usize,
+}
+
+impl Default for PersistWorkspace {
+    fn default() -> Self {
+        Self {
+            events: Vec::with_capacity(PERSIST_WORKSPACE_CAPACITY),
+            topics: Vec::with_capacity(PERSIST_WORKSPACE_CAPACITY),
+            active_len: 0,
+        }
+    }
+}
+
+impl PersistWorkspace {
+    pub fn clear(&mut self) {
+        self.events.clear();
+        self.active_len = 0;
+    }
+
+    pub fn len(&self) -> usize {
+        self.active_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.active_len == 0
+    }
+
+    pub fn push_with_topic<F>(&mut self, event: DomainEvent, write_topic: F)
+    where
+        F: FnOnce(&mut String, &DomainEvent),
+    {
+        let index = self.active_len;
+        if self.topics.len() == index {
+            self.topics
+                .push(String::with_capacity(PERSIST_TOPIC_CAPACITY));
+        }
+
+        let topic = &mut self.topics[index];
+        topic.clear();
+        write_topic(topic, &event);
+        self.events.push(event);
+        self.active_len += 1;
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (&DomainEvent, &str)> {
+        self.events[..self.active_len]
+            .iter()
+            .zip(self.topics[..self.active_len].iter())
+            .map(|(event, topic)| (event, topic.as_str()))
+    }
+
+    pub fn drain_events(&mut self) -> std::vec::Drain<'_, DomainEvent> {
+        self.active_len = 0;
+        self.events.drain(..)
+    }
+
+    #[cfg(test)]
+    pub fn event_capacity(&self) -> usize {
+        self.events.capacity()
+    }
+
+    #[cfg(test)]
+    pub fn topic_capacity(&self, index: usize) -> Option<usize> {
+        self.topics.get(index).map(String::capacity)
+    }
+}
+
 /// Empfaengt AgentActions vom externen Zenoh-Subscriber (oder Test-Code).
 /// Mutex-wrapped weil std::sync::mpsc::Receiver nicht Sync ist (bevy_ecs braucht Sync).
 #[derive(Resource)]
@@ -1089,6 +1164,7 @@ pub fn create_simulation_world() -> (World, Schedule) {
     // Resources einfuegen
     world.insert_resource(SimulationTime::default());
     world.insert_resource(PersistTelemetry::default());
+    world.insert_resource(PersistWorkspace::default());
     world.insert_resource(EventBuffer::default());
     world.insert_resource(ActiveSmells::default());
     world.insert_resource(ActiveChaos::default());
@@ -1620,6 +1696,72 @@ mod room_physics_workspace_tests {
 
         assert_eq!(workspace.len(), 1);
         assert_eq!(workspace.room_stats(0), ("empfang", 2, true));
+    }
+}
+
+#[cfg(test)]
+mod persist_workspace_tests {
+    use super::*;
+
+    fn push_default_topic(workspace: &mut PersistWorkspace, event: DomainEvent) {
+        workspace.push_with_topic(event, |topic, event| {
+            topic.push_str("sentinel/events/");
+            topic.push_str(&event.event_type);
+            topic.push('/');
+            topic.push_str(&event.aggregate_id);
+        });
+    }
+
+    #[test]
+    fn create_world_registers_persist_workspace() {
+        let (world, _) = create_simulation_world();
+        assert!(world.get_resource::<PersistWorkspace>().is_some());
+    }
+
+    #[test]
+    fn persist_workspace_reuses_topic_storage_after_clear() {
+        let mut workspace = PersistWorkspace::default();
+        assert!(workspace.event_capacity() >= PERSIST_WORKSPACE_CAPACITY);
+
+        let event = DomainEvent::new("agent_action_received", "AGENT-01", "{}", "corr-1", 1);
+        push_default_topic(&mut workspace, event);
+        let topic_capacity = workspace.topic_capacity(0).unwrap();
+
+        workspace.clear();
+        let event = DomainEvent::new("agent_action_received", "AGENT-02", "{}", "corr-2", 2);
+        push_default_topic(&mut workspace, event);
+
+        assert_eq!(workspace.len(), 1);
+        assert_eq!(workspace.topic_capacity(0), Some(topic_capacity));
+    }
+
+    #[test]
+    fn persist_workspace_preserves_entry_order() {
+        let mut workspace = PersistWorkspace::default();
+        let first = DomainEvent::new("agent_action_received", "AGENT-01", "{}", "corr-1", 1);
+        let second = DomainEvent::new("transit_started", "AGENT-02", "{}", "corr-2", 2);
+
+        push_default_topic(&mut workspace, first);
+        push_default_topic(&mut workspace, second);
+
+        let entries: Vec<_> = workspace
+            .entries()
+            .map(|(event, topic)| (event.event_type.as_str(), topic))
+            .collect();
+
+        assert_eq!(
+            entries,
+            vec![
+                (
+                    "agent_action_received",
+                    "sentinel/events/agent_action_received/AGENT-01"
+                ),
+                (
+                    "transit_started",
+                    "sentinel/events/transit_started/AGENT-02"
+                )
+            ]
+        );
     }
 }
 
