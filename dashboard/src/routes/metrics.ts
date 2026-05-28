@@ -93,6 +93,36 @@ const ISSUE_276_BENCHMARKS: BenchmarkSnapshotResponse = {
   ],
 };
 
+const ISSUE_277_BENCHMARKS = {
+  issue: 277,
+  title: "Dashboard WebSocket polling",
+  measured_at: "2026-05-28T20:44:00+02:00",
+  host: "sentinel-ubuntu-2404",
+  cpu: "Intel Core i7-3930K @ 3.20 GHz (2011, KVM, 8 vCPU)",
+  comparison_scope: "Deploy-VM same-machine before/after only; syscall count is a relative proxy, AC-1 is proven by one global SQL query in the poll path",
+  notes: [
+    "Before build: d44f89e (#276 head). After build: feat/issue-277-dashboard-polling deployed to /opt/sentinel/dashboard.",
+    "Bun on the Deploy-VM must use the linux-x64-baseline binary because i7-3930K lacks AVX2; /usr/local/bin/bun was updated to baseline v1.3.14 before measurement.",
+    "System metrics captured with vmstat 1, mpstat 1, and iostat -x 1 in parallel with strace.",
+    "Final browser verification used 3 simultaneous Playwright tabs for 30 seconds with 0 console errors and no ERR_INSUFFICIENT_RESOURCES.",
+  ],
+  results: [
+    {
+      id: "ws-poll-pread64",
+      label: "Dashboard poll pread64 calls",
+      before_reference: "d44f89e dashboard",
+      after_reference: "feat/issue-277-dashboard-polling",
+      duration_seconds: 10,
+      before_pread64_calls: 13,
+      after_pread64_calls: 10,
+      reduction_percent: 23.08,
+      system_metrics_log_dir: "/tmp/issue277-before and /tmp/issue277-after on Deploy-VM",
+      system_metrics_summary: "Before mpstat idle 99.61%, iowait 0.02%; after idle 99.52%, iowait 0.08%. sda activity was near-idle except short write bursts.",
+      note: "The runtime code path now performs one change-detection SQL query per poll cycle via getGlobalMaxEventId() instead of five per-view max queries.",
+    },
+  ],
+};
+
 metricRoutes.get("/metrics", async (c) => {
   const kpi = getLatestKpi();
   const agents = getActiveAgents();
@@ -156,6 +186,7 @@ metricRoutes.get("/metrics", async (c) => {
 });
 
 metricRoutes.get("/metrics/benchmarks", (c) => c.json(ISSUE_276_BENCHMARKS));
+metricRoutes.get("/metrics/benchmarks/277", (c) => c.json(ISSUE_277_BENCHMARKS));
 
 metricRoutes.get("/ebpf/status", async (c) => {
   try {
