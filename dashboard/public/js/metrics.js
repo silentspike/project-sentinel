@@ -51,6 +51,7 @@ export function renderMetrics(metrics) {
   }
 
   container.appendChild(grid);
+  renderBenchmarkSnapshot(container);
 }
 
 function formatUptime(seconds) {
@@ -95,6 +96,98 @@ function fetchEbpfStatus(badge, retries) {
       badge.className = 'ebpf-badge unavailable';
       badge.textContent = 'eBPF: N/A';
     });
+}
+
+function renderBenchmarkSnapshot(container) {
+  const section = document.createElement('section');
+  section.className = 'benchmark-panel';
+  section.id = 'issue276-benchmarks';
+
+  const heading = document.createElement('h2');
+  heading.textContent = 'Tick-Loop Benchmarks #276';
+  section.appendChild(heading);
+
+  const meta = document.createElement('div');
+  meta.className = 'benchmark-meta';
+  meta.textContent = 'Lade Benchmark-Snapshot...';
+  section.appendChild(meta);
+
+  const body = document.createElement('div');
+  body.className = 'benchmark-body';
+  section.appendChild(body);
+
+  container.appendChild(section);
+
+  fetch('/api/metrics/benchmarks')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      renderBenchmarkTable(meta, body, data);
+    })
+    .catch(function() {
+      meta.textContent = 'Benchmark-Snapshot nicht verfuegbar';
+    });
+}
+
+function renderBenchmarkTable(meta, body, data) {
+  while (body.firstChild) body.removeChild(body.firstChild);
+
+  meta.textContent = data.host + ' / ' + data.cpu + ' / ' + data.comparison_scope;
+
+  const table = document.createElement('table');
+  table.className = 'benchmark-table';
+
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  for (const label of ['Pfad', 'Vorher', 'Nachher', 'Delta', 'System']) {
+    const th = document.createElement('th');
+    th.textContent = label;
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  for (const row of data.results || []) {
+    const tr = document.createElement('tr');
+    appendBenchmarkCell(tr, row.label + ' (' + row.after_benchmark + ')');
+    appendBenchmarkCell(tr, formatNsWithSpread(row.before_ns_per_iter, row.before_stddev_ns_per_iter));
+    appendBenchmarkCell(tr, formatNsWithSpread(row.after_ns_per_iter, row.after_stddev_ns_per_iter));
+    appendBenchmarkCell(tr, row.improvement_percent.toFixed(2) + '% schneller');
+    appendBenchmarkCell(tr, row.system_metrics_summary);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  body.appendChild(table);
+
+  if (Array.isArray(data.notes) && data.notes.length > 0) {
+    const notes = document.createElement('ul');
+    notes.className = 'benchmark-notes';
+    for (const note of data.notes) {
+      const item = document.createElement('li');
+      item.textContent = note;
+      notes.appendChild(item);
+    }
+    body.appendChild(notes);
+  }
+}
+
+function appendBenchmarkCell(row, text) {
+  const td = document.createElement('td');
+  td.textContent = text;
+  row.appendChild(td);
+}
+
+function formatNs(ns) {
+  if (ns == null) return '--';
+  if (ns >= 1_000_000) return (ns / 1_000_000).toFixed(2) + ' ms';
+  if (ns >= 1_000) return (ns / 1_000).toFixed(2) + ' us';
+  return String(ns) + ' ns';
+}
+
+function formatNsWithSpread(ns, spread) {
+  const base = formatNs(ns);
+  if (spread == null) return base;
+  return base + ' +/- ' + formatNs(spread);
 }
 
 function renderEbpfCards(container, data) {

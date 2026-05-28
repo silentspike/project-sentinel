@@ -33,3 +33,7 @@ toml = { workspace = true }
 [[bench]]
 name = "room_phase2_bench"
 harness = false
+
+[[bench]]
+name = "tick_loop_hotpath_bench"
+harness = false

@@ -15,16 +15,18 @@ pub mod world;
 
 pub use components::*;
 pub use decision::format_impulse_from_queue;
-pub use perception::{format_injection, generate_perception, PerceptionTexts, SmellEvent};
+pub use perception::{
+    format_injection, generate_perception, generate_perception_into, PerceptionTexts, SmellEvent,
+};
 pub use systems::SimulationPhase;
 pub use world::{
     apply_capabilities, apply_personality, attach_redb_store, create_simulation_world,
     despawn_agent_from_world, restore_ecs_state, snapshot_ecs_state, spawn_agent, ActionReceiver,
     ActiveAgentsThisTick, ActiveChaos, ActiveChaosEvent, ActiveRoomStimuli, ActiveSmell,
     ActiveSmells, BroadcastBuffer, EventBuffer, GaiaBuffer, LimboEventStore,
-    OperatorCommandReceiver, PerceptionSender, PersistTelemetry, PsiMetrics, RedbStateStore,
-    RoomChatBuffer, RoomDistanceMap, RoomInfoMap, RoomPhysicsSnapshot, RoomPhysicsState,
-    SimulationTime, ToolRuntimeResource, ZenohFanoutSender,
+    OperatorCommandReceiver, PerceptionSender, PersistTelemetry, PersistWorkspace, PsiMetrics,
+    RedbStateStore, RoomChatBuffer, RoomDistanceMap, RoomInfoMap, RoomPhysicsSnapshot,
+    RoomPhysicsState, RoomPhysicsWorkspace, SimulationTime, ToolRuntimeResource, ZenohFanoutSender,
 };
 
 #[cfg(test)]

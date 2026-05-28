@@ -49,6 +49,16 @@ projDb.run(`
     updated_at INTEGER NOT NULL
   )
 `);
+projDb.run(`
+  CREATE TABLE IF NOT EXISTS projection_watermarks (
+    projection_name TEXT PRIMARY KEY,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+  )
+`);
+projDb.run("CREATE INDEX IF NOT EXISTS idx_agent_live_view_last_event_id ON agent_live_view(last_event_id)");
+projDb.run("CREATE INDEX IF NOT EXISTS idx_room_live_view_last_event_id ON room_live_view(last_event_id)");
+projDb.run("CREATE INDEX IF NOT EXISTS idx_kpi_1m_last_event_id ON kpi_1m(last_event_id)");
 
 // EventStore DB Schemas
 esDb.run(`
@@ -120,6 +130,9 @@ for (const id of roomIds) {
 projDb.run(
   `INSERT OR REPLACE INTO kpi_1m VALUES (${Math.floor(now / 60000) * 60000}, 8, 347, 89, 3, 1420, 2, 0, 200, ${now})`,
 );
+projDb.prepare(
+  "INSERT OR REPLACE INTO projection_watermarks VALUES (?,?,?)",
+).run("sentinel-projection", 200, now);
 
 // ── Seed Events + Offset ────────────────────────
 const insertEvent = esDb.prepare(
