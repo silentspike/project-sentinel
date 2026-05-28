@@ -63,6 +63,23 @@ function setupDatabases(): void {
     VALUES
       ('kueche', 1, 0, NULL, NULL, 22.5, 520, 41, 120, 150, 1000)
   `);
+  projDb.run(`
+    CREATE TABLE kpi_1m (
+      bucket_start INTEGER PRIMARY KEY,
+      last_event_id INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  projDb.run("INSERT INTO kpi_1m (bucket_start, last_event_id) VALUES (1000, 140)");
+  projDb.run(`
+    CREATE TABLE projection_watermarks (
+      projection_name TEXT PRIMARY KEY,
+      last_event_id INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    )
+  `);
+  projDb
+    .prepare("INSERT INTO projection_watermarks VALUES (?, ?, ?)")
+    .run("sentinel-projection", 150, Date.now());
 
   esDb = new Database(":memory:");
   setDatabases(projDb, esDb);
@@ -108,9 +125,21 @@ describe("WebSocket global polling (#277)", () => {
     ]);
   });
 
+  it("skips DB polling when no WebSocket clients are connected", () => {
+    createWsHandler().close(fakeWs);
+    sentMessages = [];
+    projDb.run("DROP TABLE projection_watermarks");
+    projDb.run("DROP TABLE agent_live_view");
+    projDb.run("DROP TABLE room_live_view");
+    projDb.run("DROP TABLE kpi_1m");
+
+    expect(() => pollForChanges()).not.toThrow();
+    expect(messageTypes()).toEqual([]);
+  });
+
   it("broadcasts all view update types when the global watermark changes", () => {
     pollForChanges();
-    projDb.run("UPDATE agent_live_view SET last_event_id = 151 WHERE agent_id = 1");
+    projDb.run("UPDATE projection_watermarks SET last_event_id = 151 WHERE projection_name = 'sentinel-projection'");
 
     pollForChanges();
 
