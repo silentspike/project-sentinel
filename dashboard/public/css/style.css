@@ -539,6 +539,62 @@ main { padding: 2rem; }
 }
 .metric-card .value { font-size: 2rem; font-weight: 700; color: var(--accent); }
 .metric-card .label { font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.3rem; }
+.benchmark-panel {
+  margin-top: 1.5rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.2rem;
+}
+.benchmark-panel h2 {
+  font-size: 1rem;
+  margin-bottom: 0.4rem;
+  color: var(--bright);
+}
+.benchmark-meta {
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  margin-bottom: 0.9rem;
+}
+.benchmark-body {
+  overflow-x: auto;
+}
+.benchmark-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 920px;
+}
+.benchmark-table th,
+.benchmark-table td {
+  text-align: left;
+  padding: 0.65rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.82rem;
+}
+.benchmark-table th {
+  color: var(--text-secondary);
+  font-family: 'JetBrains Mono', monospace;
+  text-transform: uppercase;
+  font-size: 0.68rem;
+}
+.benchmark-table td {
+  color: var(--text-primary);
+}
+.benchmark-table td:last-child {
+  color: var(--text-secondary);
+  font-weight: 400;
+}
+.benchmark-table td:nth-child(4) {
+  color: var(--success);
+  font-weight: 700;
+}
+.benchmark-notes {
+  margin-top: 0.9rem;
+  padding-left: 1.1rem;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
 
 /* eBPF Metrics Grid */
 .ebpf-grid {
