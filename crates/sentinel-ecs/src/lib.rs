@@ -24,7 +24,7 @@ pub use world::{
     ActiveSmells, BroadcastBuffer, EventBuffer, GaiaBuffer, LimboEventStore,
     OperatorCommandReceiver, PerceptionSender, PersistTelemetry, PsiMetrics, RedbStateStore,
     RoomChatBuffer, RoomDistanceMap, RoomInfoMap, RoomPhysicsSnapshot, RoomPhysicsState,
-    SimulationTime, ToolRuntimeResource, ZenohFanoutSender,
+    RoomPhysicsWorkspace, SimulationTime, ToolRuntimeResource, ZenohFanoutSender,
 };
 
 #[cfg(test)]

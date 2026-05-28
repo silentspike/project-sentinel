@@ -18,7 +18,7 @@ use super::components::*;
 use super::world::{
     ActionReceiver, ActiveChaos, ActiveChaosEvent, ActiveRoomStimuli, EventBuffer, LimboEventStore,
     OperatorCommandReceiver, PersistTelemetry, PsiMetrics, RedbStateStore, RoomDistanceMap,
-    RoomPhysicsState, ToolRuntimeResource, ZenohFanoutSender,
+    RoomPhysicsState, RoomPhysicsWorkspace, ToolRuntimeResource, ZenohFanoutSender,
 };
 use super::world::{PerceptionSender, SimulationTime};
 use bevy_ecs::prelude::*;
@@ -693,20 +693,20 @@ pub fn physics_system(
     active_chaos: Option<Res<ActiveChaos>>,
     mut active_room_stimuli: ResMut<ActiveRoomStimuli>,
     mut room_physics_state: ResMut<RoomPhysicsState>,
+    mut workspace: ResMut<RoomPhysicsWorkspace>,
     mut event_buffer: ResMut<EventBuffer>,
 ) {
     let tick = time.tick.0;
     active_room_stimuli.cleanup(tick);
 
     // Agenten pro Raum zaehlen und Meeting-Status ermitteln
-    let mut room_agents: std::collections::HashMap<String, (usize, bool)> =
-        std::collections::HashMap::new();
+    workspace.clear();
 
     // Initialisiere alle bekannten Raeume, damit leere Transit-Raeume keine
     // veralteten Physics-Werte im Read Model behalten.
     if let Some(distances) = room_distances.as_ref() {
         for room_id in distances.all_rooms() {
-            room_agents.entry(room_id.clone()).or_insert((0, false));
+            workspace.ensure_room(room_id);
         }
     }
 
@@ -714,28 +714,26 @@ pub fn physics_system(
     // auch wenn aktuell niemand darin sitzt.
     if let Some(chaos) = active_chaos.as_ref() {
         for room_id in chaos.active_rooms(tick) {
-            room_agents.entry(room_id.to_string()).or_insert((0, false));
+            workspace.ensure_room(room_id);
         }
     }
     for room_id in active_room_stimuli.active_rooms(tick) {
-        room_agents.entry(room_id.to_string()).or_insert((0, false));
+        workspace.ensure_room(room_id);
     }
 
     for (pos, work) in &query {
         if !pos.in_transit {
-            let entry = room_agents.entry(pos.room_id.clone()).or_insert((0, false));
-            entry.0 += 1;
-            if let Some(w) = work {
-                if w.in_meeting {
-                    entry.1 = true;
-                }
-            }
+            workspace.add_occupant(
+                &pos.room_id,
+                work.map(|work_context| work_context.in_meeting)
+                    .unwrap_or(false),
+            );
         }
     }
 
     // Seed-Laerm ohne Nachbarraum-Einfluesse vorberechnen.
-    let mut seed_noise: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
-    for (room_id, (agent_count, has_meeting)) in &room_agents {
+    for room_index in 0..workspace.len() {
+        let (room_id, agent_count, has_meeting) = workspace.room_stats(room_index);
         let chaos_bonus = active_chaos
             .as_ref()
             .and_then(|chaos| chaos.get_active(room_id, tick))
@@ -743,50 +741,49 @@ pub fn physics_system(
             .unwrap_or(0.0);
         let stimulus_noise = active_room_stimuli.delta_for(room_id, RoomStimulusType::Noise, tick);
         let local_noise =
-            sentinel_physics::calculate_noise_level(*agent_count, *has_meeting, false, &[])
+            sentinel_physics::calculate_noise_level(agent_count, has_meeting, false, &[])
                 + chaos_bonus
                 + stimulus_noise;
-        seed_noise.insert(room_id.as_str(), local_noise);
+        workspace.set_seed_noise(room_index, local_noise);
     }
 
     // Physik pro Raum berechnen
-    for (room_id, (agent_count, has_meeting)) in &room_agents {
-        let adjacent_noise = room_distances
-            .as_ref()
-            .map(|distances| {
-                distances
-                    .rooms_within(room_id, 1)
-                    .into_iter()
-                    .filter_map(|(adjacent_room, _)| seed_noise.get(adjacent_room).copied())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+    for room_index in 0..workspace.len() {
+        let (_, agent_count, has_meeting) = workspace.room_stats(room_index);
 
-        let active_chaos_event = active_chaos
-            .as_ref()
-            .and_then(|chaos| chaos.get_active(room_id, tick));
-        let active_stimulus_delta_temperature =
-            active_room_stimuli.delta_for(room_id, RoomStimulusType::Temperature, tick);
-        let active_stimulus_delta_noise =
-            active_room_stimuli.delta_for(room_id, RoomStimulusType::Noise, tick);
-        let active_stimulus_delta_co2 =
-            active_room_stimuli.delta_for(room_id, RoomStimulusType::Co2, tick);
+        let active_chaos_event = {
+            let (room_id, _, _) = workspace.room_stats(room_index);
+            active_chaos
+                .as_ref()
+                .and_then(|chaos| chaos.get_active(room_id, tick))
+        };
+        let active_stimulus_delta_temperature = {
+            let (room_id, _, _) = workspace.room_stats(room_index);
+            active_room_stimuli.delta_for(room_id, RoomStimulusType::Temperature, tick)
+        };
+        let active_stimulus_delta_noise = {
+            let (room_id, _, _) = workspace.room_stats(room_index);
+            active_room_stimuli.delta_for(room_id, RoomStimulusType::Noise, tick)
+        };
+        let active_stimulus_delta_co2 = {
+            let (room_id, _, _) = workspace.room_stats(room_index);
+            active_room_stimuli.delta_for(room_id, RoomStimulusType::Co2, tick)
+        };
         let chaos_elapsed_hours = active_chaos_event
             .map(|event| chaos_elapsed_hours(event, &time))
             .unwrap_or(0.0);
 
-        let noise_db = sentinel_physics::calculate_noise_level(
-            *agent_count,
-            *has_meeting,
-            false,
-            &adjacent_noise,
-        ) + active_chaos_event
+        let noise_db = {
+            let adjacent_noise =
+                workspace.collect_adjacent_noise_for(room_index, room_distances.as_deref());
+            sentinel_physics::calculate_noise_level(agent_count, has_meeting, false, adjacent_noise)
+        } + active_chaos_event
             .map(|event| sentinel_physics::chaos_noise_bonus_db(event.event_type))
             .unwrap_or(0.0)
             + active_stimulus_delta_noise;
 
         let temperature =
-            sentinel_physics::calculate_temperature(21.0, *agent_count, false, 15.0, 0.3)
+            sentinel_physics::calculate_temperature(21.0, agent_count, false, 15.0, 0.3)
                 + active_chaos_event
                     .map(|event| {
                         sentinel_physics::chaos_temperature_delta_celsius(
@@ -796,17 +793,18 @@ pub fn physics_system(
                     })
                     .unwrap_or(0.0)
                 + active_stimulus_delta_temperature;
-        let co2 = sentinel_physics::calculate_co2(400.0, *agent_count, 0.5, 1.0)
+        let co2 = sentinel_physics::calculate_co2(400.0, agent_count, 0.5, 1.0)
             + active_stimulus_delta_co2;
         let has_active_stimulus = active_stimulus_delta_temperature.abs() > f32::EPSILON
             || active_stimulus_delta_noise.abs() > f32::EPSILON
             || active_stimulus_delta_co2.abs() > f32::EPSILON;
         let has_active_chaos = active_chaos_event.is_some();
+        let (room_id, _, _) = workspace.room_stats(room_index);
 
         room_physics_state.set(
             room_id,
             tick,
-            *agent_count as u32,
+            agent_count as u32,
             temperature,
             co2,
             noise_db,
@@ -824,7 +822,7 @@ pub fn physics_system(
                 temperature,
                 co2_ppm: co2,
                 noise_db,
-                occupant_count: *agent_count as u32,
+                occupant_count: agent_count as u32,
             };
             let event = DomainEvent::new(
                 payload.event_type_str(),
