@@ -75,6 +75,7 @@ memory_pressure_threshold = 0.9  # 90% cgroup Memory
 max_escalation = 3             # Max Eskalationsstufen
 write_anomaly_threshold_bytes_per_sec = 5000000  # 5 MB/s
 write_anomaly_cooldown_ticks = 60
+monitored_services = ["sentinel-judge", "sentinel-projection"]
 service_check_interval_secs = 60
 llm_enabled = true
 llm_analysis_interval_secs = 300

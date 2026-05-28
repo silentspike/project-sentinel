@@ -1,10 +1,97 @@
 import { Hono } from "hono";
 import { getLatestKpi, getProjectionLag, getActiveAgents, getTotalEventCount, getEventRatePerMinute, getRecentEvolutionAlerts, getLastNightrunStats } from "../db";
-import type { MetricsResponse, HealthResponse } from "../types";
+import type { BenchmarkSnapshotResponse, MetricsResponse, HealthResponse } from "../types";
 
 export const metricRoutes = new Hono();
 
 const startTime = Date.now();
+
+const ISSUE_276_BENCHMARKS: BenchmarkSnapshotResponse = {
+  issue: 276,
+  title: "ECS tick-loop hot-path",
+  measured_at: "2026-05-28T18:33:14+02:00",
+  host: "sentinel-ubuntu-2404",
+  cpu: "Intel Core i7-3930K @ 3.20 GHz (2011, KVM, 8 vCPU, taskset core 2)",
+  comparison_scope: "Deploy-VM same-machine before/after only; TOGAF absolute baselines intentionally not used",
+  notes: [
+    "Measured on ubuntu@10.0.0.240 with sentinel-gateway and health-monitor timer stopped.",
+    "Deploy config excludes sentinel-gateway from platform-controlplane monitored_services so gateway-off smokes stay stable.",
+    "Persist benches are storage-bound on this VM; relative deltas are valid, absolute latency is not a production-baseline gate.",
+    "prepare_cached/IMMEDIATE EventStore trial was rejected after mixed A/B results; gateway self-heal restart was treated as a benchmark anomaly and fixed by config.",
+  ],
+  results: [
+    {
+      id: "physics",
+      label: "Physics",
+      before_benchmark: "issue276.physics_system/tick_26_agents",
+      after_benchmark: "issue276.physics_system/tick_26_agents",
+      before_ns_per_iter: 1_172_325,
+      before_stddev_ns_per_iter: 35_864,
+      after_ns_per_iter: 857_440,
+      after_stddev_ns_per_iter: 24_774,
+      improvement_percent: 26.86,
+      system_metrics_log_dir: "/tmp/issue-276-bench/logs clean-baseline-tick clean-after2-tick",
+      system_metrics_summary: "CPU-pinned run; mpstat iowait 0.01%, sda util below 0.3%.",
+      note: "RoomPhysicsWorkspace removes per-tick HashMap allocation and keeps room aggregation in reusable Vec storage.",
+    },
+    {
+      id: "perception",
+      label: "Perception",
+      before_benchmark: "issue276.generate_perception/texts_26_agents",
+      after_benchmark: "issue276.generate_perception/texts_26_agents",
+      before_ns_per_iter: 149_127,
+      before_stddev_ns_per_iter: 3_788,
+      after_ns_per_iter: 109_845,
+      after_stddev_ns_per_iter: 4_944,
+      improvement_percent: 26.34,
+      system_metrics_log_dir: "/tmp/issue-276-bench/logs clean-baseline-tick clean-after2-tick",
+      system_metrics_summary: "CPU-pinned run; same tick benchmark pass as physics.",
+      note: "generate_perception_into reuses caller-owned buffers and static text fragments where output is deterministic.",
+    },
+    {
+      id: "persist",
+      label: "Persist e2e",
+      before_benchmark: "issue276.persist_26_events_individual_tx",
+      after_benchmark: "issue276.persist_26_events_batch_tx",
+      before_ns_per_iter: 40_377_309,
+      before_stddev_ns_per_iter: 17_368_530,
+      after_ns_per_iter: 19_151_838,
+      after_stddev_ns_per_iter: 6_010_275,
+      improvement_percent: 52.57,
+      system_metrics_log_dir: "/tmp/issue-276-bench/logs clean-baseline-persist-individual clean-after2-persist-batch",
+      system_metrics_summary: "Storage-bound SQLite path; mpstat iowait about 8%, sda util about 63-65%.",
+      note: "append_with_outbox_batch writes all 26 events/outbox rows in one SQLite transaction.",
+    },
+    {
+      id: "persist-prebuilt",
+      label: "Persist write-only",
+      before_benchmark: "issue276.persist_26_events_individual_tx_prebuilt",
+      after_benchmark: "issue276.persist_26_events_batch_tx_prebuilt",
+      before_ns_per_iter: 34_143_782,
+      before_stddev_ns_per_iter: 12_614_457,
+      after_ns_per_iter: 4_454_866,
+      after_stddev_ns_per_iter: 1_560_601,
+      improvement_percent: 86.95,
+      system_metrics_log_dir: "/tmp/issue-276-bench/logs clean2-after2-persist-individual-prebuilt clean2-after2-persist-batch-prebuilt",
+      system_metrics_summary: "Events/topics prebuilt to isolate store writes; still storage-bound on sda.",
+      note: "This isolates EventStore write behavior from UUID/getrandom and event construction overhead.",
+    },
+    {
+      id: "bio-tick",
+      label: "Full tick",
+      before_benchmark: "room_phase2.bio_tick_26_agents",
+      after_benchmark: "room_phase2.bio_tick_26_agents",
+      before_ns_per_iter: 2_357_373,
+      before_stddev_ns_per_iter: 186_539,
+      after_ns_per_iter: 1_951_265,
+      after_stddev_ns_per_iter: 84_290,
+      improvement_percent: 17.23,
+      system_metrics_log_dir: "/tmp/issue-276-bench/logs clean-baseline-bio clean-after2-bio",
+      system_metrics_summary: "CPU-pinned full tick run; mpstat iowait 0.01%, sda util below 0.5%.",
+      note: "Regression guard: total 26-agent tick improved on the same VM.",
+    },
+  ],
+};
 
 metricRoutes.get("/metrics", async (c) => {
   const kpi = getLatestKpi();
@@ -67,6 +154,8 @@ metricRoutes.get("/metrics", async (c) => {
     psi_io: psi_io / 1000,
   });
 });
+
+metricRoutes.get("/metrics/benchmarks", (c) => c.json(ISSUE_276_BENCHMARKS));
 
 metricRoutes.get("/ebpf/status", async (c) => {
   try {

@@ -90,7 +90,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | Encounter-detection benchmark | ✅ | 7.34 – 8.05 µs |
 | Bio-tick benchmark            | ✅ | 154 – 171 µs |
 | Synthesis-engine latency      | ✅ | 95 – 103 µs end-to-end |
-| Tick-loop hot-path (#276)     | ⏳ | open issue, planned post-v0.1.0-alpha |
+| Tick-loop hot-path (#276)     | ✅ | Deploy-VM relative before/after on Intel i7-3930K @ 3.20 GHz (2011): physics 26.86% faster, perception 26.34% faster, persist e2e batch 52.57% faster, persist write-only batch 86.95% faster, full tick 17.23% faster; absolute TOGAF baselines intentionally not used for this hardware |
 
 ## Cluster 07 — Deployment & Tuning
 
@@ -143,7 +143,6 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | GitHub issue | Cluster | Topic |
 |--------------|---------|-------|
 | #266 | 01 | Gaia firmen-konfigurator (multi-tenant company definitions) |
-| #276 | 06 | Tick-loop hot-path optimisation |
 | #277 | 05b | Dashboard polling efficiency |
 | #278 | 11 | Non-blocking nightrun |
 | #336 | 10 | Acronym glossary section + README cross-links (good-first-issue) |
