@@ -19,6 +19,8 @@ use sentinel_limbo::EventStore;
 
 /// Anzahl Agents pro Schicht (SSOT: config/rooms.toml + sprint2-domain.md)
 const AGENTS_PER_SHIFT: u64 = 15;
+/// Aktive Agents fuer Issue #276 Tick-Loop-Hot-Path Messungen.
+const ISSUE276_ACTIVE_AGENTS: u64 = 26;
 /// Tick-Rate Schwellenwert aus CLAUDE.md (>100 ticks/s)
 const MIN_TICKS_PER_SECOND: u64 = 100;
 
@@ -62,6 +64,33 @@ fn bench_append_with_outbox(c: &mut Criterion) {
                     .unwrap(),
             );
             i += 1;
+        });
+    });
+}
+
+fn bench_issue276_persist_26_events_individual_tx(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bench_issue276_persist.db");
+    let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+    let mut tick = 0u64;
+    c.bench_function("issue276.persist_26_events_individual_tx", |b| {
+        b.iter(|| {
+            for agent in 1..=ISSUE276_ACTIVE_AGENTS {
+                let event = DomainEvent::new(
+                    "agent_action_received",
+                    &format!("AGENT-{agent:02}"),
+                    &format!(r#"{{"tick":{tick},"action":"work","agent":{agent}}}"#),
+                    &format!("issue276-corr-{tick}"),
+                    tick * 100,
+                );
+                let topic = format!(
+                    "sentinel/events/{}/{}",
+                    event.event_type, event.aggregate_id
+                );
+                black_box(store.append_with_outbox(&event, &topic).unwrap());
+            }
+            tick += 1;
         });
     });
 }
@@ -370,6 +399,7 @@ criterion_group!(
     // Einzeloperationen
     bench_append_event,
     bench_append_with_outbox,
+    bench_issue276_persist_26_events_individual_tx,
     bench_get_events_since,
     bench_get_events_by_aggregate,
     bench_save_snapshot,
