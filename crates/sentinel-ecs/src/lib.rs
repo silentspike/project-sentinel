@@ -15,7 +15,9 @@ pub mod world;
 
 pub use components::*;
 pub use decision::format_impulse_from_queue;
-pub use perception::{format_injection, generate_perception, PerceptionTexts, SmellEvent};
+pub use perception::{
+    format_injection, generate_perception, generate_perception_into, PerceptionTexts, SmellEvent,
+};
 pub use systems::SimulationPhase;
 pub use world::{
     apply_capabilities, apply_personality, attach_redb_store, create_simulation_world,
