@@ -633,6 +633,20 @@ export function getAgentNameMap(): Map<number, string> {
 
 // ── Change Detection (fuer WebSocket) ────────────
 
+export function getGlobalMaxEventId(): number {
+  const row = projectionDb
+    .query<{ max_id: number | null }, []>(
+      `SELECT MAX(m) as max_id
+       FROM (
+         SELECT MAX(last_event_id) as m FROM agent_live_view
+         UNION ALL
+         SELECT MAX(last_event_id) as m FROM room_live_view
+       )`,
+    )
+    .get();
+  return row?.max_id ?? 0;
+}
+
 export function getMaxAgentEventId(): number {
   const row = projectionDb
     .query<{ max_id: number | null }, []>(
