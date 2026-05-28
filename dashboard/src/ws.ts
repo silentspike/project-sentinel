@@ -6,11 +6,7 @@ import type { ServerWebSocket } from "bun";
 import {
   getActiveAgents,
   getAllRooms,
-  getMaxAgentEventId,
-  getMaxRoomEventId,
-  getMaxIncidentEventId,
-  getMaxChaosEventId,
-  getMaxActivityEventId,
+  getGlobalMaxEventId,
   getOccupantsByRoom,
   getProjectionLag,
 } from "./db";
@@ -19,11 +15,7 @@ import type { AgentListItem, RoomResponse, RoomRow } from "./types";
 
 const clients = new Set<ServerWebSocket<unknown>>();
 
-let lastAgentEventId = 0;
-let lastRoomEventId = 0;
-let lastIncidentEventId = 0;
-let lastChaosEventId = 0;
-let lastActivityEventId = 0;
+let lastGlobalEventId = 0;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -117,40 +109,23 @@ export function broadcast(data: unknown): void {
   }
 }
 
-function pollForChanges(): void {
+export function pollForChanges(): void {
   try {
-    const currentAgentMax = getMaxAgentEventId();
-    if (currentAgentMax > lastAgentEventId) {
-      const agents = getActiveAgents();
-      broadcast({ type: "agent_update", agents: agents.map(toAgentListItem) });
-      lastAgentEventId = currentAgentMax;
-    }
+    const currentMax = getGlobalMaxEventId();
+    if (currentMax <= lastGlobalEventId) return;
 
-    const currentRoomMax = getMaxRoomEventId();
-    if (currentRoomMax > lastRoomEventId) {
-      const rooms = getAllRooms();
-      const occupantsMap = getOccupantsByRoom();
-      broadcast({ type: "room_update", rooms: rooms.map((r) => toRoomResponse(r, occupantsMap[r.room_id] ?? [])) });
-      lastRoomEventId = currentRoomMax;
-    }
+    const agents = getActiveAgents();
+    broadcast({ type: "agent_update", agents: agents.map(toAgentListItem) });
 
-    const currentIncidentMax = getMaxIncidentEventId();
-    if (currentIncidentMax > lastIncidentEventId) {
-      broadcast({ type: "cockpit_update" });
-      lastIncidentEventId = currentIncidentMax;
-    }
+    const rooms = getAllRooms();
+    const occupantsMap = getOccupantsByRoom();
+    broadcast({ type: "room_update", rooms: rooms.map((r) => toRoomResponse(r, occupantsMap[r.room_id] ?? [])) });
 
-    const currentChaosMax = getMaxChaosEventId();
-    if (currentChaosMax > lastChaosEventId) {
-      broadcast({ type: "chaos_update" });
-      lastChaosEventId = currentChaosMax;
-    }
+    broadcast({ type: "cockpit_update" });
+    broadcast({ type: "chaos_update" });
+    broadcast({ type: "activity_update" });
 
-    const currentActivityMax = getMaxActivityEventId();
-    if (currentActivityMax > lastActivityEventId) {
-      broadcast({ type: "activity_update" });
-      lastActivityEventId = currentActivityMax;
-    }
+    lastGlobalEventId = currentMax;
   } catch {
     // DB-Fehler beim Poll — skip, naechster Versuch in 1s
   }
@@ -171,11 +146,7 @@ function sendHealthUpdate(): void {
 }
 
 export function resetWatermarks(): void {
-  lastAgentEventId = 0;
-  lastRoomEventId = 0;
-  lastIncidentEventId = 0;
-  lastChaosEventId = 0;
-  lastActivityEventId = 0;
+  lastGlobalEventId = 0;
 }
 
 export function startPolling(): void {
