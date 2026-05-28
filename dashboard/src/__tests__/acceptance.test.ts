@@ -295,6 +295,18 @@ describe("Acceptance Tests - Issue #24: Dashboard Live-Daten", () => {
     expect(typeof data.uptime).toBe("number");
   });
 
+  test("AC-276: /api/metrics/benchmarks exposes VM benchmark evidence", async () => {
+    const res = await app.request("/api/metrics/benchmarks");
+    expect(res.status).toBe(200);
+
+    const data = await res.json();
+    expect(data.issue).toBe(276);
+    expect(data.host).toBe("sentinel-ubuntu-2404");
+    expect(data.cpu).toContain("i7-3930K");
+    expect(data.notes.join(" ")).toContain("gateway");
+    expect(data.results.find((row: { id: string }) => row.id === "persist-prebuilt").improvement_percent).toBe(86.95);
+  });
+
   // AC-5: GET /api/health hat projection_lag
   test("AC-5: /api/health returns projection_lag from EventStore", async () => {
     const res = await app.request("/api/health");

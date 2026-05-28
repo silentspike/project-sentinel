@@ -170,6 +170,32 @@ export interface MetricsResponse {
   event_rate_per_min: number;
 }
 
+export interface BenchmarkResult {
+  id: string;
+  label: string;
+  before_benchmark: string;
+  after_benchmark: string;
+  before_ns_per_iter: number;
+  before_stddev_ns_per_iter: number;
+  after_ns_per_iter: number;
+  after_stddev_ns_per_iter: number;
+  improvement_percent: number;
+  system_metrics_log_dir: string;
+  system_metrics_summary: string;
+  note: string;
+}
+
+export interface BenchmarkSnapshotResponse {
+  issue: number;
+  title: string;
+  measured_at: string;
+  host: string;
+  cpu: string;
+  comparison_scope: string;
+  notes: string[];
+  results: BenchmarkResult[];
+}
+
 // ── Chaos Event Feed ────────────────────────────
 
 export interface ChaosEventItem {

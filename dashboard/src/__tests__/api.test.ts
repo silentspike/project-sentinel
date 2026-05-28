@@ -144,6 +144,24 @@ describe("Dashboard API", () => {
     expect(data.total_transits).toBe(5);
   });
 
+  it("GET /api/metrics/benchmarks returns issue #276 VM-relative results", async () => {
+    const res = await app.request("/api/metrics/benchmarks");
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.issue).toBe(276);
+    expect(data.cpu).toContain("i7-3930K");
+    expect(data.comparison_scope).toContain("Deploy-VM same-machine");
+    expect(data.results.map((row: { id: string }) => row.id)).toEqual([
+      "physics",
+      "perception",
+      "persist",
+      "persist-prebuilt",
+      "bio-tick",
+    ]);
+    expect(data.results[0].before_ns_per_iter).toBe(1_172_325);
+    expect(data.results[0].after_ns_per_iter).toBe(857_440);
+  });
+
   it("GET /api/agents/:id/state returns 404 for unknown", async () => {
     const res = await app.request("/api/agents/999/state");
     expect(res.status).toBe(404);
