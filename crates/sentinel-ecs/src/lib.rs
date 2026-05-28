@@ -24,9 +24,9 @@ pub use world::{
     despawn_agent_from_world, restore_ecs_state, snapshot_ecs_state, spawn_agent, ActionReceiver,
     ActiveAgentsThisTick, ActiveChaos, ActiveChaosEvent, ActiveRoomStimuli, ActiveSmell,
     ActiveSmells, BroadcastBuffer, EventBuffer, GaiaBuffer, LimboEventStore,
-    OperatorCommandReceiver, PerceptionSender, PersistTelemetry, PsiMetrics, RedbStateStore,
-    RoomChatBuffer, RoomDistanceMap, RoomInfoMap, RoomPhysicsSnapshot, RoomPhysicsState,
-    RoomPhysicsWorkspace, SimulationTime, ToolRuntimeResource, ZenohFanoutSender,
+    OperatorCommandReceiver, PerceptionSender, PersistTelemetry, PersistWorkspace, PsiMetrics,
+    RedbStateStore, RoomChatBuffer, RoomDistanceMap, RoomInfoMap, RoomPhysicsSnapshot,
+    RoomPhysicsState, RoomPhysicsWorkspace, SimulationTime, ToolRuntimeResource, ZenohFanoutSender,
 };
 
 #[cfg(test)]

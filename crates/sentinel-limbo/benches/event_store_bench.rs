@@ -12,6 +12,7 @@
 //! 3. Realistisches Mixed-Workload Szenario
 
 use std::hint::black_box;
+use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use sentinel_common::DomainEvent;
@@ -78,11 +79,53 @@ fn make_issue276_event(tick: u64, agent: u64) -> DomainEvent {
     )
 }
 
+fn deterministic_uuidish(tick: u64, agent: u64, salt: u64) -> String {
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (tick ^ salt) as u32,
+        agent as u16,
+        ((tick >> 16) as u16) | 0x4000,
+        ((agent as u16) & 0x0fff) | 0x8000,
+        tick.wrapping_mul(31).wrapping_add(agent).wrapping_add(salt) & 0x0000_ffff_ffff_ffff
+    )
+}
+
+fn make_issue276_prebuilt_event(tick: u64, agent: u64) -> DomainEvent {
+    DomainEvent {
+        event_id: deterministic_uuidish(tick, agent, 0x276),
+        event_type: "agent_action_received".to_string(),
+        aggregate_id: format!("AGENT-{agent:02}"),
+        payload: format!(r#"{{"tick":{tick},"action":"work","agent":{agent}}}"#),
+        correlation_id: format!("issue276-corr-{tick}"),
+        causation_id: None,
+        operation_id: deterministic_uuidish(tick, agent, 0x2760),
+        tick: tick * 100,
+        timestamp_ms: 1_700_000_000_000 + tick * 100 + agent,
+        schema_version: 1,
+        compensation_type: "none".to_string(),
+    }
+}
+
 fn issue276_topic(event: &DomainEvent) -> String {
     format!(
         "sentinel/events/{}/{}",
         event.event_type, event.aggregate_id
     )
+}
+
+fn prebuild_issue276_batches(start_tick: u64, batch_count: u64) -> Vec<Vec<(DomainEvent, String)>> {
+    (0..batch_count)
+        .map(|offset| {
+            let tick = start_tick + offset;
+            (1..=ISSUE276_ACTIVE_AGENTS)
+                .map(|agent| {
+                    let event = make_issue276_prebuilt_event(tick, agent);
+                    let topic = issue276_topic(&event);
+                    (event, topic)
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn bench_issue276_persist_26_events_individual_tx(c: &mut Criterion) {
@@ -99,6 +142,30 @@ fn bench_issue276_persist_26_events_individual_tx(c: &mut Criterion) {
                 black_box(store.append_with_outbox(&event, &topic).unwrap());
             }
             tick += 1;
+        });
+    });
+}
+
+fn bench_issue276_persist_26_events_individual_tx_prebuilt(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bench_issue276_persist_prebuilt.db");
+    let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+    let mut next_tick = 0u64;
+    c.bench_function("issue276.persist_26_events_individual_tx_prebuilt", |b| {
+        b.iter_custom(|iters| {
+            let batches = prebuild_issue276_batches(next_tick, iters);
+            next_tick += iters;
+
+            let mut total = Duration::ZERO;
+            for batch in &batches {
+                let start = Instant::now();
+                for (event, topic) in batch {
+                    black_box(store.append_with_outbox(event, topic).unwrap());
+                }
+                total += start.elapsed();
+            }
+            total
         });
     });
 }
@@ -126,6 +193,34 @@ fn bench_issue276_persist_26_events_batch_tx(c: &mut Criterion) {
                     .unwrap(),
             );
             tick += 1;
+        });
+    });
+}
+
+fn bench_issue276_persist_26_events_batch_tx_prebuilt(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bench_issue276_persist_batch_prebuilt.db");
+    let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+    let mut next_tick = 0u64;
+    c.bench_function("issue276.persist_26_events_batch_tx_prebuilt", |b| {
+        b.iter_custom(|iters| {
+            let batches = prebuild_issue276_batches(next_tick, iters);
+            next_tick += iters;
+
+            let mut total = Duration::ZERO;
+            for batch in &batches {
+                let start = Instant::now();
+                black_box(
+                    store
+                        .append_with_outbox_batch(
+                            batch.iter().map(|(event, topic)| (event, topic.as_str())),
+                        )
+                        .unwrap(),
+                );
+                total += start.elapsed();
+            }
+            total
         });
     });
 }
@@ -435,7 +530,9 @@ criterion_group!(
     bench_append_event,
     bench_append_with_outbox,
     bench_issue276_persist_26_events_individual_tx,
+    bench_issue276_persist_26_events_individual_tx_prebuilt,
     bench_issue276_persist_26_events_batch_tx,
+    bench_issue276_persist_26_events_batch_tx_prebuilt,
     bench_get_events_since,
     bench_get_events_by_aggregate,
     bench_save_snapshot,
