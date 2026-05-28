@@ -309,6 +309,145 @@ impl RoomPhysicsState {
     }
 }
 
+const ROOM_PHYSICS_WORKSPACE_CAPACITY: usize = 32;
+
+/// Reusable scratch storage for per-tick room physics aggregation.
+#[derive(Resource, Debug, Clone)]
+pub struct RoomPhysicsWorkspace {
+    rooms: Vec<RoomPhysicsWorkspaceRoom>,
+    active_len: usize,
+    adjacent_noise: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct RoomPhysicsWorkspaceRoom {
+    room_id: String,
+    occupant_count: usize,
+    has_meeting: bool,
+    seed_noise_db: f32,
+}
+
+impl Default for RoomPhysicsWorkspace {
+    fn default() -> Self {
+        Self {
+            rooms: Vec::with_capacity(ROOM_PHYSICS_WORKSPACE_CAPACITY),
+            active_len: 0,
+            adjacent_noise: Vec::with_capacity(ROOM_PHYSICS_WORKSPACE_CAPACITY),
+        }
+    }
+}
+
+impl RoomPhysicsWorkspace {
+    pub fn clear(&mut self) {
+        self.active_len = 0;
+        self.adjacent_noise.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.active_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.active_len == 0
+    }
+
+    pub fn ensure_room(&mut self, room_id: &str) {
+        if self.find_room_index(room_id).is_none() {
+            self.activate_room(room_id);
+        }
+    }
+
+    pub fn add_occupant(&mut self, room_id: &str, has_meeting: bool) {
+        let index = match self.find_room_index(room_id) {
+            Some(index) => index,
+            None => self.activate_room(room_id),
+        };
+
+        let room = &mut self.rooms[index];
+        room.occupant_count += 1;
+        room.has_meeting |= has_meeting;
+    }
+
+    pub fn room_stats(&self, index: usize) -> (&str, usize, bool) {
+        assert!(index < self.active_len);
+        let room = &self.rooms[index];
+        (room.room_id.as_str(), room.occupant_count, room.has_meeting)
+    }
+
+    pub fn set_seed_noise(&mut self, index: usize, seed_noise_db: f32) {
+        assert!(index < self.active_len);
+        self.rooms[index].seed_noise_db = seed_noise_db;
+    }
+
+    pub fn collect_adjacent_noise_for(
+        &mut self,
+        index: usize,
+        room_distances: Option<&RoomDistanceMap>,
+    ) -> &[f32] {
+        self.adjacent_noise.clear();
+        let Some(room_distances) = room_distances else {
+            return &self.adjacent_noise;
+        };
+
+        assert!(index < self.active_len);
+        let rooms = &self.rooms[..self.active_len];
+        let adjacent_noise = &mut self.adjacent_noise;
+        let room_id = rooms[index].room_id.as_str();
+
+        room_distances.for_rooms_within(room_id, 1, |adjacent_room, _| {
+            if let Some(seed_noise_db) = rooms
+                .iter()
+                .find(|room| room.room_id == adjacent_room)
+                .map(|room| room.seed_noise_db)
+            {
+                adjacent_noise.push(seed_noise_db);
+            }
+        });
+
+        adjacent_noise
+    }
+
+    pub fn room_capacity(&self) -> usize {
+        self.rooms.capacity()
+    }
+
+    fn activate_room(&mut self, room_id: &str) -> usize {
+        let index = self.active_len;
+        if let Some(room) = self.rooms.get_mut(index) {
+            room.reset(room_id);
+        } else {
+            self.rooms.push(RoomPhysicsWorkspaceRoom::new(room_id));
+        }
+        self.active_len += 1;
+        index
+    }
+
+    fn find_room_index(&self, room_id: &str) -> Option<usize> {
+        self.rooms[..self.active_len]
+            .iter()
+            .position(|room| room.room_id == room_id)
+    }
+}
+
+impl RoomPhysicsWorkspaceRoom {
+    fn new(room_id: &str) -> Self {
+        Self {
+            room_id: room_id.to_string(),
+            occupant_count: 0,
+            has_meeting: false,
+            seed_noise_db: 0.0,
+        }
+    }
+
+    fn reset(&mut self, room_id: &str) {
+        self.room_id.clear();
+        self.room_id.push_str(room_id);
+        self.occupant_count = 0;
+        self.has_meeting = false;
+        self.seed_noise_db = 0.0;
+    }
+}
+
 /// Simulationszeit-Resource (muss vor jedem Schedule::run() aktualisiert werden)
 #[derive(Resource, Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationTime {
@@ -854,6 +993,18 @@ impl RoomDistanceMap {
             .collect()
     }
 
+    /// Besucht alle Raeume die max `max_hops` entfernt sind, ohne ein Vec zu allozieren.
+    pub fn for_rooms_within<F>(&self, from: &str, max_hops: u32, mut visit: F)
+    where
+        F: FnMut(&str, u32),
+    {
+        for ((source, target), &distance) in &self.distances {
+            if source == from && distance > 0 && distance <= max_hops {
+                visit(target.as_str(), distance);
+            }
+        }
+    }
+
     /// Gibt die bekannte Liste aller Raum-IDs aus `rooms.toml` zurueck.
     pub fn all_rooms(&self) -> &[String] {
         &self.room_ids
@@ -943,6 +1094,7 @@ pub fn create_simulation_world() -> (World, Schedule) {
     world.insert_resource(ActiveChaos::default());
     world.insert_resource(ActiveRoomStimuli::default());
     world.insert_resource(RoomPhysicsState::default());
+    world.insert_resource(RoomPhysicsWorkspace::default());
     world.insert_resource(ActiveAgentsThisTick::default());
     world.insert_resource(RoomChatBuffer::default());
     world.insert_resource(GaiaBuffer::default());
@@ -1427,6 +1579,47 @@ pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnaps
         {
             world.insert_resource(stimuli);
         }
+    }
+}
+
+#[cfg(test)]
+mod room_physics_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn create_world_registers_room_physics_workspace() {
+        let (world, _) = create_simulation_world();
+        assert!(world.get_resource::<RoomPhysicsWorkspace>().is_some());
+    }
+
+    #[test]
+    fn room_physics_workspace_reuses_room_storage_after_clear() {
+        let mut workspace = RoomPhysicsWorkspace::default();
+        assert!(workspace.room_capacity() >= ROOM_PHYSICS_WORKSPACE_CAPACITY);
+
+        for index in 0..40 {
+            workspace.ensure_room(&format!("room-{index:02}"));
+        }
+        let expanded_capacity = workspace.room_capacity();
+        assert!(expanded_capacity >= 40);
+
+        workspace.clear();
+        assert_eq!(workspace.len(), 0);
+        assert_eq!(workspace.room_capacity(), expanded_capacity);
+
+        workspace.ensure_room("empfang");
+        assert_eq!(workspace.room_capacity(), expanded_capacity);
+    }
+
+    #[test]
+    fn room_physics_workspace_merges_occupants_by_room() {
+        let mut workspace = RoomPhysicsWorkspace::default();
+
+        workspace.add_occupant("empfang", false);
+        workspace.add_occupant("empfang", true);
+
+        assert_eq!(workspace.len(), 1);
+        assert_eq!(workspace.room_stats(0), ("empfang", 2, true));
     }
 }
 
