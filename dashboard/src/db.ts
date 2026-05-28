@@ -647,24 +647,6 @@ export function getGlobalMaxEventId(): number {
   return row?.max_id ?? 0;
 }
 
-export function getMaxAgentEventId(): number {
-  const row = projectionDb
-    .query<{ max_id: number | null }, []>(
-      "SELECT MAX(last_event_id) as max_id FROM agent_live_view",
-    )
-    .get();
-  return row?.max_id ?? 0;
-}
-
-export function getMaxRoomEventId(): number {
-  const row = projectionDb
-    .query<{ max_id: number | null }, []>(
-      "SELECT MAX(last_event_id) as max_id FROM room_live_view",
-    )
-    .get();
-  return row?.max_id ?? 0;
-}
-
 // ── Cockpit Queries ───────────────────────────────
 
 const INCIDENT_EVENT_TYPES = [
@@ -871,16 +853,6 @@ export function getLastNightrunStats(): {
   }
 }
 
-export function getMaxIncidentEventId(): number {
-  const row = eventStoreDb
-    .query<{ max_id: number | null }, []>(
-      `SELECT MAX(id) as max_id FROM events
-       WHERE event_type IN (${INCIDENT_TYPES_SQL})`,
-    )
-    .get();
-  return row?.max_id ?? 0;
-}
-
 // ── Chaos Event Feed ────────────────────────────
 
 export function getRecentChaosEvents(limit = 100): ChaosEventItem[] {
@@ -944,15 +916,6 @@ export function getChaosEventsByRoom(roomId: string, limit = 50): ChaosEventItem
         timestamp_ms: row.timestamp_ms,
       };
     });
-}
-
-export function getMaxChaosEventId(): number {
-  const row = eventStoreDb
-    .query<{ max_id: number | null }, []>(
-      "SELECT MAX(id) as max_id FROM events WHERE event_type = 'chaos_triggered'",
-    )
-    .get();
-  return row?.max_id ?? 0;
 }
 
 // ── Operator Messages (Chat Input) ──────────────
@@ -1210,16 +1173,6 @@ export function getRecentActivityEvents(limit = 200): EventRow[] {
        LIMIT ?`,
     )
     .all(limit);
-}
-
-export function getMaxActivityEventId(): number {
-  const row = eventStoreDb
-    .query<{ max_id: number | null }, []>(
-      `SELECT MAX(id) as max_id FROM events
-       WHERE event_type IN (${ACTIVITY_TYPES_SQL})`,
-    )
-    .get();
-  return row?.max_id ?? 0;
 }
 
 // ── Total Event Count ───────────────────────────
