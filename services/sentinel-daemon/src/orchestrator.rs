@@ -363,6 +363,14 @@ fn spawn_agent_full(
                             );
                         }
                     }
+                } else {
+                    record_security_runtime_snapshot(
+                        security_runtime_state,
+                        agent_id,
+                        &agent_cfg.identity.name,
+                        None,
+                        fs_mount,
+                    );
                 }
             }
         }
