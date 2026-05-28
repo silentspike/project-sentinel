@@ -80,6 +80,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | Health + readiness endpoints  | ✅ | each service exposes `/healthz`, `/readyz` |
 | eBPF probes (write-syscall, stall) | ✅ | `crates/sentinel-ebpf/` |
 | MARBLE Observatory            | ✅ | `cmd/cortex-gateway/internal/observatory/` |
+| Dashboard polling efficiency (#277) | ✅ | Projection-owned `projection_watermarks` table gives one indexed change-detection lookup per active WebSocket poll; Deploy-VM evidence on Intel i7-3930K @ 3.20 GHz (2011), gateway inactive, 3-tab Playwright: no `ERR_INSUFFICIENT_RESOURCES` |
 | OTel tracing                  | 🟡 | structured spans in place, OTLP exporter behind feature flag |
 
 ## Cluster 06 — Performance & Hardware
