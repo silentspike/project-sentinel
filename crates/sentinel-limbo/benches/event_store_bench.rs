@@ -68,6 +68,23 @@ fn bench_append_with_outbox(c: &mut Criterion) {
     });
 }
 
+fn make_issue276_event(tick: u64, agent: u64) -> DomainEvent {
+    DomainEvent::new(
+        "agent_action_received",
+        &format!("AGENT-{agent:02}"),
+        &format!(r#"{{"tick":{tick},"action":"work","agent":{agent}}}"#),
+        &format!("issue276-corr-{tick}"),
+        tick * 100,
+    )
+}
+
+fn issue276_topic(event: &DomainEvent) -> String {
+    format!(
+        "sentinel/events/{}/{}",
+        event.event_type, event.aggregate_id
+    )
+}
+
 fn bench_issue276_persist_26_events_individual_tx(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bench_issue276_persist.db");
@@ -77,19 +94,37 @@ fn bench_issue276_persist_26_events_individual_tx(c: &mut Criterion) {
     c.bench_function("issue276.persist_26_events_individual_tx", |b| {
         b.iter(|| {
             for agent in 1..=ISSUE276_ACTIVE_AGENTS {
-                let event = DomainEvent::new(
-                    "agent_action_received",
-                    &format!("AGENT-{agent:02}"),
-                    &format!(r#"{{"tick":{tick},"action":"work","agent":{agent}}}"#),
-                    &format!("issue276-corr-{tick}"),
-                    tick * 100,
-                );
-                let topic = format!(
-                    "sentinel/events/{}/{}",
-                    event.event_type, event.aggregate_id
-                );
+                let event = make_issue276_event(tick, agent);
+                let topic = issue276_topic(&event);
                 black_box(store.append_with_outbox(&event, &topic).unwrap());
             }
+            tick += 1;
+        });
+    });
+}
+
+fn bench_issue276_persist_26_events_batch_tx(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bench_issue276_persist_batch.db");
+    let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+    let mut tick = 0u64;
+    c.bench_function("issue276.persist_26_events_batch_tx", |b| {
+        b.iter(|| {
+            let mut entries = Vec::with_capacity(ISSUE276_ACTIVE_AGENTS as usize);
+            for agent in 1..=ISSUE276_ACTIVE_AGENTS {
+                let event = make_issue276_event(tick, agent);
+                let topic = issue276_topic(&event);
+                entries.push((event, topic));
+            }
+
+            black_box(
+                store
+                    .append_with_outbox_batch(
+                        entries.iter().map(|(event, topic)| (event, topic.as_str())),
+                    )
+                    .unwrap(),
+            );
             tick += 1;
         });
     });
@@ -400,6 +435,7 @@ criterion_group!(
     bench_append_event,
     bench_append_with_outbox,
     bench_issue276_persist_26_events_individual_tx,
+    bench_issue276_persist_26_events_batch_tx,
     bench_get_events_since,
     bench_get_events_by_aggregate,
     bench_save_snapshot,

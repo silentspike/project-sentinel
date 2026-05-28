@@ -2055,15 +2055,28 @@ pub fn persist_system(
 
     // 1. Events aus Buffer nach Limbo schreiben (mit Outbox) + Zenoh Fan-Out
     if let Some(es) = &event_store {
+        let mut batch = Vec::with_capacity(event_buffer.events.len());
         for event in event_buffer.events.drain(..) {
             let topic = event_topic(&event);
-            if let Err(err) = es.0.append_with_outbox(&event, &topic) {
-                warn!(event_id = %event.event_id, "persist_system: failed to write event: {err}");
-            }
-            // Nach erfolgreichem Limbo-Write: Event an Zenoh Fan-Out Bridge senden
-            if let Some(ref fanout) = fanout_sender {
-                if fanout.sender.try_send(event).is_err() {
-                    // Channel voll — Event droppen (Limbo ist SSOT, Zenoh ist best-effort)
+            batch.push((event, topic));
+        }
+
+        if !batch.is_empty() {
+            let batch_result = es.0.append_with_outbox_batch(
+                batch.iter().map(|(event, topic)| (event, topic.as_str())),
+            );
+
+            if let Err(err) = batch_result {
+                warn!(
+                    event_count = batch.len(),
+                    "persist_system: failed to write event batch: {err}"
+                );
+            } else if let Some(ref fanout) = fanout_sender {
+                // Nach erfolgreichem Limbo-Write: Events an Zenoh Fan-Out Bridge senden
+                for (event, _) in batch {
+                    if fanout.sender.try_send(event).is_err() {
+                        // Channel voll — Event droppen (Limbo ist SSOT, Zenoh ist best-effort)
+                    }
                 }
             }
         }
