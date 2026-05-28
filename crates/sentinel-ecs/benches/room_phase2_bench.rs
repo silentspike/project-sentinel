@@ -102,6 +102,17 @@ const TRANSIT_SPECS: &[TransitSpec] = &[
 ];
 
 fn config_path() -> PathBuf {
+    if let Ok(repo_root) = std::env::var("SENTINEL_REPO_ROOT") {
+        return Path::new(&repo_root).join("config/rooms.toml");
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        let candidate = current_dir.join("config/rooms.toml");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
