@@ -18,8 +18,8 @@ Acceptance Criteria:
 | AC-1 | Daemon loads eBPF in Kernel-Mode (`mode=kernel`, not userspace fallback) | Baseline already PASS on VM; final post-deploy verification still required |
 | AC-2 | fentry probes deliver live Agent-Health write-bytes, IOPS, TCP values | Code path PASS for I/O + TCP API exposure; final controlled VM deltas still required |
 | AC-3 | Dashboard shows eBPF metrics with real values, no `N/A` | API/unit PASS for network counters; Playwright screenshot still required |
-| AC-4 | Overhead stays below `<0.15%` tick budget | PENDING benchmark |
-| AC-5 | Userspace fallback remains graceful without CAP_BPF | PENDING fallback proof |
+| AC-4 | Overhead stays below `<0.15%` tick budget | PASS on Deploy-VM: 0.012658% amortized |
+| AC-5 | Userspace fallback remains graceful without CAP_BPF | PASS on Deploy-VM no-CAP smoke |
 
 ## Task 1 - Issue Readiness And Baseline
 
@@ -263,6 +263,103 @@ test result: ok. 1 passed; 0 failed
 cargo remote -c -- clippy -p sentinel-ecs --all-targets -- -D warnings
 PASS
 ```
+
+## Task 5 - Overhead Benchmark And Userspace Fallback
+
+Change:
+
+- Added `ebpf-mode-smoke`, a focused runtime smoke binary for production loader
+  behavior. It uses `loader::init()` and `EbpfCollector`, prints per-sample
+  mode/cycle/drop counts, and exits successfully in both `kernel` and
+  `userspace` fallback mode.
+
+Build and static checks:
+
+```text
+cargo fmt --check
+PASS
+```
+
+```text
+git diff --check
+PASS
+```
+
+```text
+cargo remote -c -- clippy -p sentinel-ebpf --all-targets --features ebpf -- -D warnings
+PASS
+```
+
+```text
+cargo remote -c -- build --release -p sentinel-ebpf --bin ebpf-mode-smoke --features ebpf
+Finished `release` profile [optimized] target(s) in 45.58s
+```
+
+Deploy-VM runtime context:
+
+```text
+Host: ubuntu@10.0.0.240
+Hardware: Intel(R) Core(TM) i7-3930K CPU @ 3.20GHz (2011, KVM, 8 vCPU)
+Kernel: 6.17.0-22-generic
+Services: sentinel-daemon=active, sentinel-projection=active, sentinel-gateway=inactive
+System metrics captured with: vmstat 1, mpstat 1, iostat -x 1
+```
+
+Kernel-mode smoke:
+
+```text
+sudo /tmp/ebpf-mode-smoke-issue380 5 500
+mode=kernel
+sample=1 mode=kernel cycle_us=240 drops=0 io_entries=0 network_entries=0 psi_entries=0
+sample=2 mode=kernel cycle_us=210 drops=0 io_entries=0 network_entries=0 psi_entries=0
+sample=3 mode=kernel cycle_us=164 drops=0 io_entries=0 network_entries=0 psi_entries=0
+sample=4 mode=kernel cycle_us=164 drops=0 io_entries=0 network_entries=0 psi_entries=0
+sample=5 mode=kernel cycle_us=208 drops=0 io_entries=0 network_entries=0 psi_entries=0
+```
+
+No-CAP fallback smoke:
+
+```text
+sudo capsh --drop=cap_bpf -- -c "/tmp/ebpf-mode-smoke-issue380 5 500"
+mode=userspace
+sample=1 mode=userspace cycle_us=1 drops=0 io_entries=0 network_entries=0 psi_entries=0
+sample=2 mode=userspace cycle_us=1 drops=0 io_entries=0 network_entries=0 psi_entries=0
+sample=3 mode=userspace cycle_us=0 drops=0 io_entries=0 network_entries=0 psi_entries=0
+sample=4 mode=userspace cycle_us=0 drops=0 io_entries=0 network_entries=0 psi_entries=0
+sample=5 mode=userspace cycle_us=0 drops=0 io_entries=0 network_entries=0 psi_entries=0
+sentinel-gateway=inactive
+```
+
+Overhead benchmark:
+
+```text
+Log directory: /tmp/issue380-bench-20260529-132405
+Window: 18 Prometheus samples over ~36s, controlled HTTPS traffic during the run
+Collector interval: production daemon config, 1 collector cycle per 10 ticks
+
+collector_cycle_us count=18 min=1089 avg=1265.83 max=1630
+overhead_avg_pct=0.012658
+ring_buffer_drops_total=0
+tick_duration_ms count=18 avg=1000.000 max=1000.000
+network_requests sentinel_llm_requests_total{destination="0.0.0.0:0"} 1072
+```
+
+System metrics summary:
+
+```text
+vmstat_avg us=0.54 sy=0.19 id=99.08 samples=37
+mpstat_avg usr=0.64 sys=0.26 iowait=0.03 idle=99.05 samples=36
+iostat_cpu_avg user=0.64 system=0.27 iowait=0.06 idle=99.03 samples=37
+iostat_sda_avg r_s=1.15 w_s=12.70 util=0.44 samples=37
+```
+
+Result:
+
+- AC-4 PASS: 0.012658% amortized overhead is below the `<0.15%` tick-budget
+  gate on the Deploy-VM hardware.
+- AC-5 PASS: dropping `CAP_BPF` forces `mode=userspace` without panic, while
+  the production daemon remains active in kernel mode and the gateway remains
+  inactive.
 
 ## Benchmark Method
 
