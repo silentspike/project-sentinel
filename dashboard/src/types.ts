@@ -286,6 +286,37 @@ export interface EventRow {
   compensation_type: string;
 }
 
+// ── Time Machine: Snapshot World State (#384) ─────
+
+/// Belegung eines einzelnen Raums zum Snapshot-Zeitpunkt.
+export interface SnapshotRoomOccupancy {
+  room_id: string;
+  name: string;
+  occupant_count: number;
+}
+
+/// Aus dem EventStore abgeleiteter Welt-Zustand zum Zeitpunkt eines Snapshots.
+/// Wird durch Event-Replay bis `last_event_id` berechnet (kein Payload-Decode).
+export interface SnapshotWorldState {
+  snapshot_id: string;
+  tier: string;
+  tick: number;
+  sim_hour: number;
+  last_event_id: number;
+  created_at_ms: number;
+  /// Authoritative Anzahl der zur Schicht AKTIVEN Agents aus dem naechsten
+  /// tick_snapshot-Event bei/vor `tick` (deckt sich mit der Live-Agents-View).
+  /// null, wenn kein tick_snapshot-Event bis zu diesem Tick existiert.
+  active_agent_count: number | null;
+  /// Anzahl der im Gebaeude ANWESENDEN Agents (spawned, nicht despawned bis
+  /// `last_event_id`) — inkl. Off-Shift-Agents. Basis fuer die Raum-Belegung.
+  present_agent_count: number;
+  /// Anzahl zum Zeitpunkt belegter Raeume (aus anwesenden Agents).
+  room_count: number;
+  /// Pro-Raum-Belegung der anwesenden Agents, absteigend nach Belegung sortiert.
+  rooms: SnapshotRoomOccupancy[];
+}
+
 // ── Personality Evolution Row ─────────────────────
 
 export interface EvolutionRow {

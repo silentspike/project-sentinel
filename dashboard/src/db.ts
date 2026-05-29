@@ -14,7 +14,9 @@ import type {
   RoomPhysicsHistoryPoint,
   RoomReactionItem,
   RoomStimulusHistoryItem,
+  SnapshotWorldState,
 } from "./types";
+import { ROOM_METADATA } from "./rooms-meta";
 
 let projectionDb: Database;
 let eventStoreDb: Database;
@@ -1212,4 +1214,115 @@ export function getEventRatePerMinute(): number {
     )
     .get(fiveMinAgo);
   return Math.round(((row?.cnt ?? 0) / 5) * 10) / 10;
+}
+
+// ── Time Machine: Welt-Zustand zum Snapshot-Zeitpunkt (#384) ──
+// Leitet Agent- und Raum-Belegung zum Snapshot-Zeitpunkt aus dem EventStore ab.
+// Kein Payload-Decode (Payload ist bincode-2 BLOB) — stattdessen deterministischer
+// Replay der Lifecycle-/Transit-Events bis zur Snapshot-Grenze `last_event_id`.
+
+interface SnapshotMetaRow {
+  id: string;
+  tier: string;
+  tick: number;
+  sim_hour: number;
+  last_event_id: number;
+  payload_size: number;
+  created_at: number;
+}
+
+/// Berechnet den Welt-Zustand eines Snapshots oder null, wenn kein Snapshot
+/// mit dieser ID existiert.
+export function getSnapshotWorldState(
+  snapshotId: string,
+): SnapshotWorldState | null {
+  const meta = eventStoreDb
+    .query<SnapshotMetaRow, [string]>(
+      `SELECT id, tier, tick, sim_hour, last_event_id, payload_size, created_at
+       FROM world_snapshots
+       WHERE id = ?`,
+    )
+    .get(snapshotId);
+
+  if (!meta) return null;
+
+  // Lifecycle-/Transit-Events bis zur Snapshot-Grenze in chronologischer
+  // Reihenfolge replayen. Nur drei Event-Typen sind relevant (Index: idx_events_type).
+  const rows = eventStoreDb
+    .query<{ event_type: string; payload: string }, [number]>(
+      `SELECT event_type, payload
+       FROM events
+       WHERE id <= ?
+         AND event_type IN ('agent_spawned', 'transit_completed', 'agent_despawned')
+       ORDER BY id ASC`,
+    )
+    .all(meta.last_event_id);
+
+  // agent_id -> aktueller room_id (nur lebende Agents enthalten)
+  const agentRoom = new Map<number, string>();
+  for (const row of rows) {
+    let payload: { agent_id?: number; room_id?: string };
+    try {
+      payload = JSON.parse(row.payload);
+    } catch {
+      continue;
+    }
+    if (typeof payload.agent_id !== "number") continue;
+
+    if (row.event_type === "agent_despawned") {
+      agentRoom.delete(payload.agent_id);
+    } else if (typeof payload.room_id === "string") {
+      // agent_spawned + transit_completed tragen beide room_id
+      agentRoom.set(payload.agent_id, payload.room_id);
+    }
+  }
+
+  // Pro-Raum-Belegung aggregieren
+  const roomCounts = new Map<string, number>();
+  for (const roomId of agentRoom.values()) {
+    roomCounts.set(roomId, (roomCounts.get(roomId) ?? 0) + 1);
+  }
+
+  const rooms = Array.from(roomCounts.entries())
+    .map(([roomId, count]) => ({
+      room_id: roomId,
+      name: ROOM_METADATA[roomId]?.name ?? roomId,
+      occupant_count: count,
+    }))
+    .sort((a, b) => b.occupant_count - a.occupant_count);
+
+  // Authoritative Anzahl der schicht-aktiven Agents aus dem naechsten
+  // tick_snapshot-Event bei/vor tick (deckt sich mit der Live-Agents-View).
+  const tickSnap = eventStoreDb
+    .query<{ payload: string }, [number]>(
+      `SELECT payload
+       FROM events
+       WHERE event_type = 'tick_snapshot' AND tick <= ?
+       ORDER BY tick DESC
+       LIMIT 1`,
+    )
+    .get(meta.tick);
+
+  let activeAgentCount: number | null = null;
+  if (tickSnap) {
+    try {
+      const p = JSON.parse(tickSnap.payload) as { agent_count?: number };
+      if (typeof p.agent_count === "number") activeAgentCount = p.agent_count;
+    } catch {
+      // ignore malformed payload
+    }
+  }
+
+  return {
+    snapshot_id: meta.id,
+    tier: meta.tier,
+    tick: meta.tick,
+    sim_hour: meta.sim_hour,
+    last_event_id: meta.last_event_id,
+    created_at_ms: meta.created_at,
+    active_agent_count: activeAgentCount,
+    present_agent_count: agentRoom.size,
+    room_count: roomCounts.size,
+    rooms,
+  };
 }
