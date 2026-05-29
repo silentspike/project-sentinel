@@ -162,6 +162,52 @@ describe("Dashboard API", () => {
     expect(data.results[0].after_ns_per_iter).toBe(857_440);
   });
 
+  it("GET /api/ebpf/metrics exposes network counters from Prometheus", async () => {
+    const originalFetch = globalThis.fetch;
+    const prometheusText = `
+sentinel_ebpf_monitoring_mode{mode="kernel"} 1
+sentinel_agent_stalled_total 0
+sentinel_ebpf_collector_cycle_microseconds 42
+sentinel_ebpf_ring_buffer_drops_total 0
+sentinel_io_bytes_total{cgroup_id="1",cgroup_name="agent-01",direction="read"} 4096
+sentinel_io_bytes_total{cgroup_id="1",cgroup_name="agent-01",direction="write"} 2048
+sentinel_llm_request_duration_seconds{destination="api.openai.com:443"} 0.125000
+sentinel_llm_requests_total{destination="api.openai.com:443"} 3
+sentinel_llm_errors_total{destination="api.openai.com:443"} 1
+sentinel_llm_bytes_total{destination="api.openai.com:443",direction="sent"} 512
+sentinel_llm_bytes_total{destination="api.openai.com:443",direction="received"} 4096
+sentinel_agent_cpu_pressure_stress{agent="AGENT-01"} 0.2500
+`;
+
+    globalThis.fetch = (async () =>
+      new Response(prometheusText, { status: 200 })) as unknown as typeof fetch;
+
+    try {
+      const res = await app.request("/api/ebpf/metrics");
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.available).toBe(true);
+      expect(data.mode).toBe("kernel");
+      expect(data.network_request_count).toBe(3);
+      expect(data.network_error_count).toBe(1);
+      expect(data.network_avg_latency_ms).toBe(125);
+      expect(data.network_bytes_sent).toBe(512);
+      expect(data.network_bytes_received).toBe(4096);
+      expect(data.network_destinations).toEqual([
+        {
+          destination: "api.openai.com:443",
+          request_count: 3,
+          error_count: 1,
+          avg_latency_ms: 125,
+          bytes_sent: 512,
+          bytes_received: 4096,
+        },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("GET /api/agents/:id/state returns 404 for unknown", async () => {
     const res = await app.request("/api/agents/999/state");
     expect(res.status).toBe(404);

@@ -204,6 +204,10 @@ function renderEbpfCards(container, data) {
     { label: 'Ring Buffer Drops', value: String(data.ring_buffer_drops), id: 'ebpf-drops', warn: data.ring_buffer_drops > 0 },
     { label: 'I/O Read', value: formatBytes(data.io_read_bytes), id: 'ebpf-io-read', warn: false },
     { label: 'I/O Write', value: formatBytes(data.io_write_bytes), id: 'ebpf-io-write', warn: false },
+    { label: 'TCP Requests', value: formatNumber(data.network_request_count ?? 0), id: 'ebpf-tcp-requests', warn: false },
+    { label: 'TCP Errors', value: formatNumber(data.network_error_count ?? 0), id: 'ebpf-tcp-errors', warn: (data.network_error_count ?? 0) > 0 },
+    { label: 'TCP Latency', value: formatMs(data.network_avg_latency_ms ?? 0), id: 'ebpf-tcp-latency', warn: false },
+    { label: 'TCP Rx/Tx', value: formatBytes(data.network_bytes_received ?? 0) + ' / ' + formatBytes(data.network_bytes_sent ?? 0), id: 'ebpf-tcp-bytes', warn: false },
     { label: 'Avg PSI Stress', value: (data.avg_stress * 100).toFixed(1) + '%', id: 'ebpf-stress', warn: data.avg_stress > 0.5 },
   ];
 
@@ -244,6 +248,23 @@ function renderEbpfCards(container, data) {
     grid.appendChild(detail);
   }
 
+  if (data.network_destinations && data.network_destinations.length > 0) {
+    var netDetail = document.createElement('div');
+    netDetail.className = 'ebpf-network-detail';
+    var netHeading = document.createElement('div');
+    netHeading.className = 'ebpf-network-heading';
+    netHeading.textContent = 'TCP Destinations:';
+    netDetail.appendChild(netHeading);
+    for (var k = 0; k < Math.min(data.network_destinations.length, 3); k++) {
+      var dest = data.network_destinations[k];
+      var netLine = document.createElement('div');
+      netLine.className = 'ebpf-network-destination';
+      netLine.textContent = dest.destination + ' (' + formatNumber(dest.request_count ?? 0) + ')';
+      netDetail.appendChild(netLine);
+    }
+    grid.appendChild(netDetail);
+  }
+
   container.appendChild(grid);
 }
 
@@ -253,4 +274,11 @@ function formatBytes(bytes) {
   if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
   if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
   return bytes + ' B';
+}
+
+function formatMs(ms) {
+  if (ms == null || ms === 0) return '0 ms';
+  if (ms >= 1000) return (ms / 1000).toFixed(2) + ' s';
+  if (ms < 1) return ms.toFixed(2) + ' ms';
+  return ms.toFixed(1) + ' ms';
 }

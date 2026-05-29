@@ -16,8 +16,8 @@ Acceptance Criteria:
 | AC | Requirement | Status |
 |---|---|---|
 | AC-1 | Daemon loads eBPF in Kernel-Mode (`mode=kernel`, not userspace fallback) | Baseline already PASS on VM; final post-deploy verification still required |
-| AC-2 | fentry probes deliver live Agent-Health write-bytes, IOPS, TCP values | PARTIAL baseline: agent health, I/O and TCP counters exist; final controlled deltas still required |
-| AC-3 | Dashboard shows eBPF metrics with real values, no `N/A` | Baseline API PASS; Playwright screenshot still required |
+| AC-2 | fentry probes deliver live Agent-Health write-bytes, IOPS, TCP values | Code path PASS for I/O + TCP API exposure; final controlled VM deltas still required |
+| AC-3 | Dashboard shows eBPF metrics with real values, no `N/A` | API/unit PASS for network counters; Playwright screenshot still required |
 | AC-4 | Overhead stays below `<0.15%` tick budget | PENDING benchmark |
 | AC-5 | Userspace fallback remains graceful without CAP_BPF | PENDING fallback proof |
 
@@ -156,6 +156,53 @@ PASS
 
 ```text
 git diff --check
+PASS
+```
+
+```text
+cargo remote -c -- test -p sentinel-ebpf --lib
+running 65 tests
+test result: ok. 64 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+```
+
+```text
+cargo remote -c -- clippy -p sentinel-ebpf --all-targets -- -D warnings
+PASS
+```
+
+## Task 3 - Network Metrics API And Dashboard Exposure
+
+Change:
+
+- Added Prometheus export for `sentinel_llm_bytes_total` with `sent` and `received` directions.
+- Parsed eBPF TCP request/error/latency/byte counters from Prometheus in `/api/ebpf/metrics`.
+- Exposed dashboard JSON fields:
+  `network_request_count`, `network_error_count`, `network_avg_latency_ms`,
+  `network_bytes_sent`, `network_bytes_received`, `network_destinations`.
+- Rendered TCP cards and top destinations in the eBPF dashboard section without `N/A` placeholders.
+- Added API coverage using mocked Prometheus text with kernel mode, I/O, PSI, and TCP counters.
+
+Checks:
+
+```text
+git diff --check
+PASS
+```
+
+```text
+cargo fmt --check
+PASS
+```
+
+```text
+cd dashboard && bun test
+75 pass
+0 fail
+661 expect() calls
+```
+
+```text
+cd dashboard && bun run typecheck
 PASS
 ```
 
