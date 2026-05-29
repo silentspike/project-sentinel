@@ -139,6 +139,37 @@ Output:
 - TCP metrics are present in Prometheus as `sentinel_llm_requests_total`, but the dashboard eBPF JSON currently does not expose network request counters. This is a Task 3 gap.
 - AC-4 and AC-5 still require fresh VM evidence.
 
+## Task 2 - Loader And Fallback Hardening
+
+Change:
+
+- Extracted CAP_BPF effective-capability parsing into a pure helper.
+- Added tests for CAP_BPF present, CAP_BPF absent, malformed `CapEff`, and missing `CapEff`.
+- Runtime behavior is unchanged on privileged systems; the change makes the no-CAP fallback decision explicit and covered.
+
+Checks:
+
+```text
+cargo fmt --check
+PASS
+```
+
+```text
+git diff --check
+PASS
+```
+
+```text
+cargo remote -c -- test -p sentinel-ebpf --lib
+running 65 tests
+test result: ok. 64 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+```
+
+```text
+cargo remote -c -- clippy -p sentinel-ebpf --all-targets -- -D warnings
+PASS
+```
+
 ## Benchmark Method
 
 Final #380 benchmark evidence must compare only same-VM runs:
