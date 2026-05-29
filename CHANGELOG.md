@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Excluded `sentinel-gateway` from daemon platform-controlplane `monitored_services` in the deployment config so benchmark and smoke runs can keep the gateway stopped without self-heal restarts.
 
 ### Added
+- Added Issue #390 security threat model at `docs/security/threat-model.md`, covering compromised-agent, external-attacker, and supply-chain attacker classes with asset inventory and prioritized follow-up gaps.
+- Recorded Issue #396 Cluster 12 runtime-contract decision as DEV-006 in the Deviation Register: WASM/WASI on Wasmtime is the default Nano-Container contract, while native code is limited to an explicit Escape-Hatch-Pool.
 - Added `ebpf-mode-smoke` for focused kernel-mode/userspace-fallback runtime checks and committed Issue #380 dashboard screenshot evidence at `docs/screenshots/issue380-dashboard-ebpf.png`.
 - Added dashboard exposure for Issue #276 benchmark evidence at `/api/metrics/benchmarks`, including hardware scope, relative-only comparison notes, and system-metric log labels.
 

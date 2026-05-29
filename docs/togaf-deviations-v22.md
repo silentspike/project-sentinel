@@ -68,6 +68,20 @@ Each deviation records: **what** the spec says, **what** the code does,
 | Why | these artefacts describe AC-level evidence for issues that are now closed and whose acceptance criteria are no longer the public contract. They consist mostly of raw command output and intermediate iteration runs and are not useful as living documentation. The current public contract is reflected by the CI workflow status and the gap report. |
 | Revisit when | a public test-evidence portal becomes part of the release process |
 
+## DEV-006 — Nano-Container runtime defaults to WASM/WASI with native escape hatch
+
+| Field | Value |
+|-------|-------|
+| Cluster | 12 (Zielarchitektur / Nano-Container Platform) |
+| Spec | Cluster 12 leaves the defining platform fork open: a WASM-bound runtime with millisecond spin-up and high density, or arbitrary native code with full runtime freedom but container/Firecracker-like cost. |
+| Decision | WASM/WASI on Wasmtime is the default Nano-Container runtime contract. Arbitrary native code is not part of the default density/portability promise; it is allowed only through an explicit native Escape-Hatch-Pool with separate scheduling, stronger isolation, and no millisecond spin-up guarantee. |
+| Runtime contract | Default runtime: `wasm+wasi` via `crates/sentinel-wasm/` and the sandbox capability registry. Native runtime: opt-in pool for workloads that prove they cannot fit WASM/WASI, isolated outside the default hot path. |
+| Trade-offs | WASM/WASI wins density, portability, reproducible cold start, and least-privilege capability control, but constrains runtime freedom. Native code wins language/runtime freedom and compatibility with existing binaries, but loses the core density, portability, and deterministic spin-up advantages and increases host-isolation burden. |
+| Why | The current platform strength is small, portable, capability-scoped execution that can emerge from the agent system without becoming a generic container platform first. A native default would discard that advantage and pull the project back toward the existing container/Firecracker design space. The escape hatch preserves product flexibility without making native execution the baseline contract. |
+| Consequences | Follow-up work under #397 must design around `wasm+wasi` as the baseline. Native support must be tracked as an explicit exception path with separate capacity planning, security review, and verification. Clusters 00-11 remain untouched until a Cluster 12 building block is validated from concrete agent-system need. |
+| Files | `docs/togaf-deviations-v22.md`, `crates/sentinel-wasm/`, `crates/sentinel-sandbox/`, #396, #397 |
+| Revisit when | real customer or agent workloads repeatedly require native runtimes, WASI cannot cover the needed system interface, or native escape-hatch usage becomes common enough to threaten the platform's default density and security assumptions |
+
 ---
 
 For governance mechanisms see [docs/governance.md](governance.md). For
