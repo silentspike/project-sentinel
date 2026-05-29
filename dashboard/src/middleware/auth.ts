@@ -1,8 +1,11 @@
-// Auth Middleware: Bearer Token Check fuer Write-Endpoints (POST/PATCH/DELETE).
-// Wenn SENTINEL_DASHBOARD_API_KEY gesetzt → Bearer Token wird geprueft.
-// Wenn nicht gesetzt → Write-Endpoints sind disabled (403).
+// Auth Middleware: Session-Cookie-Check fuer Write-Endpoints (POST/PATCH/DELETE) (#402).
+// Wenn SENTINEL_DASHBOARD_API_KEY nicht gesetzt → Write-Endpoints disabled (403).
+// Sonst: gueltiges httpOnly-Session-Cookie erforderlich (Login via /api/auth/login).
+// Der Key wird nie mehr per Header transportiert (kein JS-zugaenglicher Token).
 
 import type { Context, Next } from "hono";
+import { getCookie } from "hono/cookie";
+import { validateSession, SESSION_COOKIE } from "../auth-session";
 
 export function getDashboardApiKey(): string {
   return process.env.SENTINEL_DASHBOARD_API_KEY || "";
@@ -10,7 +13,7 @@ export function getDashboardApiKey(): string {
 
 export async function requireAuth(c: Context, next: Next): Promise<Response | void> {
   const apiKey = getDashboardApiKey();
-  // Keine API-Key konfiguriert → Write-Endpoints gesperrt
+  // Kein API-Key konfiguriert → Write-Endpoints gesperrt
   if (!apiKey) {
     return c.json(
       { error: "Write-Endpoints deaktiviert: SENTINEL_DASHBOARD_API_KEY nicht konfiguriert" },
@@ -18,14 +21,9 @@ export async function requireAuth(c: Context, next: Next): Promise<Response | vo
     );
   }
 
-  const authHeader = c.req.header("Authorization") || "";
-  if (!authHeader.startsWith("Bearer ")) {
-    return c.json({ error: "Authorization header fehlt oder ungueltig" }, 401);
-  }
-
-  const token = authHeader.slice(7);
-  if (token !== apiKey) {
-    return c.json({ error: "Ungueltiger API-Key" }, 403);
+  // Gueltiges Session-Cookie erforderlich (httpOnly, via Login gesetzt)
+  if (!validateSession(getCookie(c, SESSION_COOKIE))) {
+    return c.json({ error: "Nicht authentifiziert: Login erforderlich" }, 401);
   }
 
   await next();

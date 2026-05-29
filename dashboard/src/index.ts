@@ -11,6 +11,7 @@ import { chatRoutes } from "./routes/chat";
 import { activityRoutes } from "./routes/activity";
 import { controlRoutes } from "./routes/control";
 import { eventRoutes } from "./routes/events";
+import { authRoutes } from "./routes/auth";
 import { createWsHandler, startPolling } from "./ws";
 
 const app = new Hono();
@@ -29,6 +30,7 @@ app.route("/api", chatRoutes);
 app.route("/api", activityRoutes);
 app.route("/api", controlRoutes);
 app.route("/api", eventRoutes);
+app.route("/api", authRoutes);
 
 // Statische Dateien
 app.use("/public/*", serveStatic({ root: "./" }));
