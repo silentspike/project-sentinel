@@ -290,6 +290,15 @@ struct FsDedupBenchmarkRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct FsLatencySummary {
+    min_us: u64,
+    p50_us: u64,
+    p95_us: u64,
+    max_us: u64,
+    mean_us: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct FsDedupBenchmarkResponse {
     accepted: bool,
     agent_name: String,
@@ -312,6 +321,11 @@ struct FsDedupBenchmarkResponse {
     dedup_hit_latency_us_p95: u64,
     dedup_hit_latency_us_max: u64,
     dedup_hit_latency_us_mean: f64,
+    dedup_hit_cas_check_latency: FsLatencySummary,
+    dedup_hit_write_file_latency: FsLatencySummary,
+    dedup_hit_loop_latency: FsLatencySummary,
+    storage_stats_before_us: u64,
+    storage_stats_after_us: u64,
     target_100us_met: bool,
 }
 
@@ -1690,9 +1704,11 @@ fn run_fs_dedup_benchmark(
     let content = dedup_benchmark_content(payload.bytes_per_write, &file_prefix);
     let content_hash = CasStore::hash(&content);
 
+    let stats_before_started = Instant::now();
     let before = layer
         .storage_stats()
         .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Storage-Stats nicht lesbar"))?;
+    let storage_stats_before_us = elapsed_us(stats_before_started.elapsed());
     let seed_started = Instant::now();
     layer
         .write_file(
@@ -1705,13 +1721,19 @@ fn run_fs_dedup_benchmark(
         .map_err(|_| ApiError::ServiceUnavailable("Dedup-Benchmark Seed-Write fehlgeschlagen"))?;
     let seed_write_us = elapsed_us(seed_started.elapsed());
 
-    let mut latencies = Vec::with_capacity(payload.writes as usize);
+    let mut cas_check_latencies = Vec::with_capacity(payload.writes as usize);
+    let mut write_file_latencies = Vec::with_capacity(payload.writes as usize);
+    let mut loop_latencies = Vec::with_capacity(payload.writes as usize);
     let mut dedup_hits = 0u32;
     for idx in 0..payload.writes {
+        let loop_started = Instant::now();
+        let cas_check_started = Instant::now();
         if layer.cas().contains(&content_hash) {
             dedup_hits += 1;
         }
-        let started = Instant::now();
+        cas_check_latencies.push(elapsed_us(cas_check_started.elapsed()));
+
+        let write_started = Instant::now();
         layer
             .write_file(
                 &fs_agent_dir,
@@ -1721,12 +1743,15 @@ fn run_fs_dedup_benchmark(
                 0o644,
             )
             .map_err(|_| ApiError::ServiceUnavailable("Dedup-Benchmark Write fehlgeschlagen"))?;
-        latencies.push(elapsed_us(started.elapsed()));
+        write_file_latencies.push(elapsed_us(write_started.elapsed()));
+        loop_latencies.push(elapsed_us(loop_started.elapsed()));
     }
 
+    let stats_after_started = Instant::now();
     let after = layer
         .storage_stats()
         .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Storage-Stats nicht lesbar"))?;
+    let storage_stats_after_us = elapsed_us(stats_after_started.elapsed());
     let logical_bytes_written =
         u64::from(payload.writes + 1).saturating_mul(payload.bytes_per_write as u64);
     let cas_bytes_delta = after
@@ -1738,16 +1763,14 @@ fn run_fs_dedup_benchmark(
         (logical_bytes_written.saturating_sub(cas_bytes_delta) as f64 * 100.0)
             / logical_bytes_written as f64
     };
-    latencies.sort_unstable();
-    let latency_min = *latencies.first().unwrap_or(&0);
-    let latency_max = *latencies.last().unwrap_or(&0);
-    let latency_p50 = percentile_us(&latencies, 0.50);
-    let latency_p95 = percentile_us(&latencies, 0.95);
-    let latency_mean = if latencies.is_empty() {
-        0.0
-    } else {
-        latencies.iter().sum::<u64>() as f64 / latencies.len() as f64
-    };
+    let cas_check_summary = latency_summary(cas_check_latencies);
+    let write_file_summary = latency_summary(write_file_latencies);
+    let loop_summary = latency_summary(loop_latencies);
+    let latency_min = write_file_summary.min_us;
+    let latency_max = write_file_summary.max_us;
+    let latency_p50 = write_file_summary.p50_us;
+    let latency_p95 = write_file_summary.p95_us;
+    let latency_mean = write_file_summary.mean_us;
 
     Ok(FsDedupBenchmarkResponse {
         accepted: true,
@@ -1771,8 +1794,34 @@ fn run_fs_dedup_benchmark(
         dedup_hit_latency_us_p95: latency_p95,
         dedup_hit_latency_us_max: latency_max,
         dedup_hit_latency_us_mean: latency_mean,
+        dedup_hit_cas_check_latency: cas_check_summary,
+        dedup_hit_write_file_latency: write_file_summary,
+        dedup_hit_loop_latency: loop_summary,
+        storage_stats_before_us,
+        storage_stats_after_us,
         target_100us_met: latency_p95 <= 100,
     })
+}
+
+fn latency_summary(mut latencies: Vec<u64>) -> FsLatencySummary {
+    latencies.sort_unstable();
+    let min_us = *latencies.first().unwrap_or(&0);
+    let max_us = *latencies.last().unwrap_or(&0);
+    let p50_us = percentile_us(&latencies, 0.50);
+    let p95_us = percentile_us(&latencies, 0.95);
+    let mean_us = if latencies.is_empty() {
+        0.0
+    } else {
+        latencies.iter().sum::<u64>() as f64 / latencies.len() as f64
+    };
+
+    FsLatencySummary {
+        min_us,
+        p50_us,
+        p95_us,
+        max_us,
+        mean_us,
+    }
 }
 
 fn validate_benchmark_file_prefix(prefix: &str) -> std::result::Result<String, ApiError> {
@@ -2990,6 +3039,18 @@ mod tests {
         assert!(payload.cas_blob_count_after > payload.cas_blob_count_before);
         assert!(payload.target_87_percent_met);
         assert!(payload.dedup_hit_latency_us_max >= payload.dedup_hit_latency_us_min);
+        assert_eq!(
+            payload.dedup_hit_latency_us_p95,
+            payload.dedup_hit_write_file_latency.p95_us
+        );
+        assert!(
+            payload.dedup_hit_cas_check_latency.max_us
+                >= payload.dedup_hit_cas_check_latency.min_us
+        );
+        assert!(
+            payload.dedup_hit_loop_latency.p95_us >= payload.dedup_hit_write_file_latency.min_us
+        );
+        assert!(payload.storage_stats_after_us > 0);
     }
 
     #[test]
