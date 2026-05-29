@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Finalized Issue #382 NMDA episode-selection policy for hippocampus/nightrun: calibrated threshold `0.25`, shared narrative threshold, max 10 selected episodes, selection-quality payload metrics, and Deploy-VM replay evidence for a `2/3` consolidated Night-Run.
 - Moved Issue #278 nightrun/shift evolution LLM calls out of the ECS tick loop into an async background task, with VM evidence for fake-gateway success, gateway-down fail-safe behavior, and redb `EVOLUTION_VERSION` writes.
 - Added and optimized Issue #379 live sentinel-fs FUSE/CAS verification paths for storage stats and dedup-hit benchmarking; Deploy-VM evidence shows active FUSE agent homes, 99.22% dedup savings, and same-VM median dedup-hit write p95 improved from 40,411 us to 189 us, while the strict `<100us` target remains unmet on the i7-3930K VM.
 - Updated optional `sentinel-wasm` Wasmtime dependencies to 44.0.2 to clear current RustSec advisories.

@@ -196,6 +196,27 @@ pub enum DomainEventPayload {
         agents_failed: u32,
         agents_skipped: u32,
         total_episodes: u32,
+        /// Episodes selected by the calibrated NMDA threshold.
+        #[serde(default)]
+        total_episodes_consolidated: u32,
+        /// Aggregated NMDA selection rate for processed episodes.
+        #[serde(default)]
+        nmda_selection_rate: Option<f64>,
+        /// Calibrated NMDA threshold used for the run.
+        #[serde(default)]
+        nmda_threshold: Option<f64>,
+        /// Maximum episodes selected per agent during consolidation.
+        #[serde(default)]
+        nmda_max_consolidation_episodes: Option<u32>,
+        /// Minimum NMDA score across all processed episodes, including rejects.
+        #[serde(default)]
+        nmda_score_min: Option<f64>,
+        /// Average NMDA score across all processed episodes, including rejects.
+        #[serde(default)]
+        nmda_score_avg: Option<f64>,
+        /// Maximum NMDA score across all processed episodes, including rejects.
+        #[serde(default)]
+        nmda_score_max: Option<f64>,
         duration_ms: u64,
         /// Final hash of the deterministic event chain (for replay verification).
         #[serde(default)]
