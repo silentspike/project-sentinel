@@ -148,8 +148,13 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 
 | Item                          | Status | Evidence |
 |-------------------------------|--------|----------|
-| Runtime contract decision (#396) | ✅ | DEV-006 in [docs/togaf-deviations-v22.md](togaf-deviations-v22.md) records WASM/WASI on Wasmtime as the default Nano-Container runtime, with arbitrary native code only via an explicit Escape-Hatch-Pool |
-| Tracking epic (#397)          | 🟡 | #397 remains the Cluster 12 tracking epic; implementation issues are intentionally deferred until they emerge from concrete agent-system needs under the DEV-006 contract |
+| Runtime contract decision (#407) | ✅ | DEV-007 in [docs/togaf-deviations-v22.md](togaf-deviations-v22.md) supersedes DEV-006: Nano-Container uses a runtime-agnostic CRI contract, four runtime families, and no global default runtime |
+| NanoRuntime trait + ECS reference (#408) | ✅ | `crates/sentinel-common/src/nano_runtime.rs` defines `spawn`/`exec`/`snapshot`/`restore`/`migrate`/`health`/`isolate`; `crates/sentinel-runtime/src/nano.rs` proves the ECS-native reference through the shared conformance harness |
+| WASM/Wasmtime adapter (#409)  | ✅ | `crates/sentinel-wasm/src/nano.rs` implements the same contract with documented re-execute snapshot semantics, not a bitwise Wasmtime Store dump |
+| bwrap+Landlock adapter (#410) | ✅ | `crates/sentinel-sandbox/src/nano.rs` implements the same contract with config+filesystem snapshot semantics, not process RAM or CRIU checkpointing |
+| Registry and workload selection (#411) | ✅ | `NanoRuntimeRegistry` selects explicit workload runtime keys with only configured fallback policy; `services/sentinel-daemon/tests/nano_runtime_registry.rs` covers `ecs-native`, `wasm-wasmtime`, and `bwrap-landlock` routing |
+| Cross-architecture gate (#394/#406) | 🟡 | DEV-007 keeps cross-architecture replay, snapshot, and isolation evidence as a gate for runtime families that leave the local ECS/native host boundary |
+| Tracking epic (#397)          | 🟡 | #397 remains the Cluster 12 tracking epic; #407-#411 deliver the first coherent contract chain but microVM and cross-node live migration remain out of scope |
 
 ---
 
