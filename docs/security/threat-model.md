@@ -57,6 +57,10 @@ snapshot/replay, hippocampus memory consolidation, dashboard control endpoints.
 
 - Gateway pipeline separates normalization, prompt compilation, detection,
   extraction, capability handling, and proxying.
+- Issue #391 adds server-side action validation: the gateway loads per-agent
+  `[capabilities].tools` from agent TOML, filters extracted actions before
+  response/persistence, and writes `agent_action_rejected` audit events for
+  blocked actions.
 - Self-recognition/fourth-wall detection protects one known class of diegetic
   boundary failure, but it is not a complete prompt-injection defense.
 - Tool execution is constrained by bwrap, Landlock, cgroups, netns, Wasmtime,
@@ -66,10 +70,9 @@ snapshot/replay, hippocampus memory consolidation, dashboard control endpoints.
 
 ### Open Gaps
 
-- Agent actions need capability-based permissions and server-side
-  action-validation independent of model text. Follow-up: #391.
-- Tool permission checks must be tied to agent identity, action type, and
-  current room/company context, not only to prompt-level instructions.
+- Tool permission checks now cover agent identity, action type, tool, and
+  declared target, but remaining memory write paths still need explicit trust
+  labels or provenance.
 - Memory write paths need explicit trust labels or provenance so injected
   content can be filtered, quarantined, or aged out.
 
@@ -160,7 +163,7 @@ Landlock, FUSE, eBPF, SQLite/Limbo integration.
 
 | Priority | Gap | Risk reduced | Follow-up |
 | --- | --- | --- | --- |
-| P0 | Capability-based tool permissions plus server-side action validation | Compromised agent / prompt injection | #391 |
+| P0 | Capability-based tool permissions plus server-side action validation | Compromised agent / prompt injection | #391 implemented for Gateway action extraction; memory provenance remains future work |
 | P1 | Unsafe audit with SAFETY justifications and CI threshold | Supply-chain and kernel-adjacent memory-safety regressions | #392 |
 | P1 | Formal verification for critical Event Store, snapshot, and bio invariants | State corruption that normal tests may miss | #393 |
 | P2 | Operator/dashboard auth hardening before broad exposure | External attacker control-plane abuse | Future issue when exposure model is finalized |

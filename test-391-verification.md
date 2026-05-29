@@ -181,5 +181,78 @@ ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/capabil
 
 ## Not Tested Yet
 
-- Go Gateway tests: pending implementation.
 - Deploy-VM runtime: not run in this task; gateway remains inactive unless explicitly approved.
+- Real LLM calls: intentionally not run.
+
+## Full Gateway Verification
+
+Command:
+
+```bash
+cd cmd/cortex-gateway
+go test ./...
+```
+
+Observed:
+
+```text
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway	0.041s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/acceptance	0.028s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/apicp	0.086s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/capability	(cached)
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/compiler	0.018s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/control	0.018s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/detection	0.019s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/extraction	0.022s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/forwardqueue	0.037s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/guardrails	0.017s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/injection	0.014s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/intercept	0.075s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/mapping	0.017s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/normalizer	0.017s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/observatory	0.101s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/proxy	(cached)
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/resilience	0.020s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/sequencing	0.336s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/synthesis	0.010s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/ticksync	1.513s
+```
+
+Command:
+
+```bash
+cd cmd/cortex-gateway
+go build ./...
+```
+
+Observed:
+
+```text
+exit 0, no output
+```
+
+## Plan-Verifikation
+
+Command:
+
+```bash
+python3 <issue #391 plan contract check>
+git diff --check
+```
+
+Observed:
+
+```text
+issue_open: PASS
+issue_quality_ready: PASS
+ac1_policy_loader: PASS
+ac1_real_config: PASS
+ac2_pipeline_enforcement: PASS
+ac3_audit_event: PASS
+ac4_injection_test: PASS
+ac5_legit_test: PASS
+verification_all_pass: PASS
+docs_updated: PASS
+issue_391_plan_contract_check: PASS
+git diff --check: PASS
+```
