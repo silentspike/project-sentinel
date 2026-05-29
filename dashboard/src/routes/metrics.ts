@@ -6,6 +6,133 @@ export const metricRoutes = new Hono();
 
 const startTime = Date.now();
 
+interface PrometheusSample {
+  labels: Record<string, string>;
+  value: number;
+}
+
+interface NetworkMetricSummary {
+  destination: string;
+  request_count: number;
+  error_count: number;
+  avg_latency_ms: number;
+  bytes_sent: number;
+  bytes_received: number;
+}
+
+function parsePrometheusSamples(text: string, metricName: string): PrometheusSample[] {
+  const escapedName = metricName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^${escapedName}(?:\\{([^}]*)\\})?\\s+(-?\\d+(?:\\.\\d+)?)$`, "gm");
+  const samples: PrometheusSample[] = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = re.exec(text)) !== null) {
+    samples.push({
+      labels: parsePrometheusLabels(match[1] ?? ""),
+      value: Number(match[2]),
+    });
+  }
+
+  return samples;
+}
+
+function parsePrometheusLabels(labelText: string): Record<string, string> {
+  const labels: Record<string, string> = {};
+  const re = /([a-zA-Z_][a-zA-Z0-9_]*)="([^"]*)"/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = re.exec(labelText)) !== null) {
+    labels[match[1]] = match[2];
+  }
+
+  return labels;
+}
+
+function summarizeNetworkMetrics(text: string): {
+  requestCount: number;
+  errorCount: number;
+  avgLatencyMs: number;
+  bytesSent: number;
+  bytesReceived: number;
+  destinations: NetworkMetricSummary[];
+} {
+  const byDestination = new Map<string, NetworkMetricSummary>();
+
+  const ensureDestination = (destination: string): NetworkMetricSummary => {
+    const existing = byDestination.get(destination);
+    if (existing) return existing;
+    const summary = {
+      destination,
+      request_count: 0,
+      error_count: 0,
+      avg_latency_ms: 0,
+      bytes_sent: 0,
+      bytes_received: 0,
+    };
+    byDestination.set(destination, summary);
+    return summary;
+  };
+
+  for (const sample of parsePrometheusSamples(text, "sentinel_llm_requests_total")) {
+    const destination = sample.labels.destination;
+    if (!destination) continue;
+    ensureDestination(destination).request_count += sample.value;
+  }
+
+  for (const sample of parsePrometheusSamples(text, "sentinel_llm_errors_total")) {
+    const destination = sample.labels.destination;
+    if (!destination) continue;
+    ensureDestination(destination).error_count += sample.value;
+  }
+
+  for (const sample of parsePrometheusSamples(text, "sentinel_llm_request_duration_seconds")) {
+    const destination = sample.labels.destination;
+    if (!destination) continue;
+    ensureDestination(destination).avg_latency_ms = sample.value * 1000;
+  }
+
+  for (const sample of parsePrometheusSamples(text, "sentinel_llm_bytes_total")) {
+    const destination = sample.labels.destination;
+    const direction = sample.labels.direction;
+    if (!destination) continue;
+    const summary = ensureDestination(destination);
+    if (direction === "sent") {
+      summary.bytes_sent += sample.value;
+    } else if (direction === "received") {
+      summary.bytes_received += sample.value;
+    }
+  }
+
+  const destinations = Array.from(byDestination.values()).sort((a, b) =>
+    a.destination.localeCompare(b.destination),
+  );
+  const requestCount = destinations.reduce((sum, item) => sum + item.request_count, 0);
+  const errorCount = destinations.reduce((sum, item) => sum + item.error_count, 0);
+  const bytesSent = destinations.reduce((sum, item) => sum + item.bytes_sent, 0);
+  const bytesReceived = destinations.reduce((sum, item) => sum + item.bytes_received, 0);
+  const latencyWeight = destinations.reduce(
+    (sum, item) => sum + (item.avg_latency_ms > 0 ? Math.max(item.request_count, 1) : 0),
+    0,
+  );
+  const avgLatencyMs =
+    latencyWeight > 0
+      ? destinations.reduce(
+          (sum, item) =>
+            sum + item.avg_latency_ms * (item.avg_latency_ms > 0 ? Math.max(item.request_count, 1) : 0),
+          0,
+        ) / latencyWeight
+      : 0;
+
+  return {
+    requestCount,
+    errorCount,
+    avgLatencyMs,
+    bytesSent,
+    bytesReceived,
+    destinations,
+  };
+}
+
 const ISSUE_276_BENCHMARKS: BenchmarkSnapshotResponse = {
   issue: 276,
   title: "ECS tick-loop hot-path",
@@ -280,6 +407,8 @@ metricRoutes.get("/ebpf/metrics", async (c) => {
       stressCount++;
     }
 
+    const network = summarizeNetworkMetrics(text);
+
     return c.json({
       available: true,
       mode,
@@ -290,6 +419,12 @@ metricRoutes.get("/ebpf/metrics", async (c) => {
       io_read_bytes: ioReadBytes,
       io_write_bytes: ioWriteBytes,
       avg_stress: stressCount > 0 ? totalStress / stressCount : 0,
+      network_request_count: network.requestCount,
+      network_error_count: network.errorCount,
+      network_avg_latency_ms: network.avgLatencyMs,
+      network_bytes_sent: network.bytesSent,
+      network_bytes_received: network.bytesReceived,
+      network_destinations: network.destinations,
     });
   } catch {
     return c.json({ available: false, mode: "unavailable" });
