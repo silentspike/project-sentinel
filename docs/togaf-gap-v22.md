@@ -57,6 +57,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | Item                          | Status | Evidence |
 |-------------------------------|--------|----------|
 | 7-step LLM pipeline           | ✅ | `cmd/cortex-gateway/internal/{normalizer,compiler,detection,extraction,capability,proxy}/` |
+| Prompt-injection action validation (#391) | 🟡 | Go Gateway loads per-agent `[capabilities].tools`, filters unauthorized extracted actions before response/persistence, and emits `agent_action_rejected` audit events; unit/integration evidence in `test-391-verification.md`, Deploy-VM gateway runtime smoke deferred because gateway remains inactive for token-safe verification |
 | Synthesis engine (10 rules)   | ✅ | `cmd/cortex-gateway/internal/synthesis/rules.go` |
 | Fourth-wall detection (15 regex + judge) | ✅ | `cmd/cortex-gateway/internal/detection/` |
 | Perception injection          | ✅ | `cmd/cortex-gateway/internal/injection/` + 8 system blocks |

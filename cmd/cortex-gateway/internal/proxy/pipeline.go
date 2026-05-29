@@ -100,6 +100,7 @@ type PipelineConfig struct {
 	Normalizer          *normalizer.Normalizer
 	Extractor           *extraction.Extractor
 	Capabilities        *capability.ProviderCapabilities
+	ActionPolicy        *capability.AgentActionPolicy
 	Logger              *slog.Logger
 	BreakerCfg          BreakerConfig
 	EventStore          *eventstore.Store          // optional: nil disables event persistence
@@ -167,6 +168,7 @@ type PipelineHandler struct {
 	norm                *normalizer.Normalizer
 	ext                 *extraction.Extractor
 	caps                *capability.ProviderCapabilities
+	actionPolicy        *capability.AgentActionPolicy
 	logger              *slog.Logger
 	eventStore          *eventstore.Store
 	guardrails          *guardrails.Enforcer
@@ -237,6 +239,7 @@ func NewPipelineHandler(cfg PipelineConfig) *PipelineHandler {
 		norm:                cfg.Normalizer,
 		ext:                 cfg.Extractor,
 		caps:                cfg.Capabilities,
+		actionPolicy:        cfg.ActionPolicy,
 		logger:              cfg.Logger,
 		eventStore:          cfg.EventStore,
 		guardrails:          cfg.Guardrails,
@@ -445,6 +448,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 				// For synthesis, rule-provided actions are authoritative because they
 				// can encode deterministic targets that plain text extraction would lose.
 				actions := buildSynthesisActions(result.Actions, ph.ext, content)
+				actions = ph.enforceActionPolicy(actions, agentName, requestID, &req)
 				ph.persistActions(actions, agentName, requestID, &req)
 				duration := time.Since(start)
 				pipelineRequestsTotal.WithLabelValues("synthesis", "ok").Inc()
@@ -510,6 +514,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 					ph.observer.MarkSynthesisCandidate()
 					guardrails.RecordRuntimeSynthesisSavings()
 					actions := buildSynthesisActions(nil, ph.ext, content)
+					actions = ph.enforceActionPolicy(actions, agentName, requestID, &req)
 					ph.persistActions(actions, agentName, requestID, &req)
 					duration := time.Since(start)
 					pipelineRequestsTotal.WithLabelValues("apicp", "ok").Inc()
@@ -689,6 +694,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 
 	// --- Step 8: Action Extraction ---
 	actions := ph.ext.Extract(content)
+	actions = ph.enforceActionPolicy(actions, agentName, requestID, &req)
 
 	// --- Step 8b: Persist extracted actions as events (AC-5) ---
 	ph.persistActions(actions, agentName, requestID, &req)
@@ -1228,6 +1234,95 @@ func (ph *PipelineHandler) persistActions(actions []extraction.ExtractedAction, 
 				"agent", agentName,
 			)
 		}
+	}
+}
+
+func (ph *PipelineHandler) enforceActionPolicy(actions []extraction.ExtractedAction, agentName, requestID string, req *LLMRequest) []extraction.ExtractedAction {
+	if len(actions) == 0 || ph.actionPolicy == nil {
+		return actions
+	}
+	allowed := make([]extraction.ExtractedAction, 0, len(actions))
+	for i, action := range actions {
+		decision := ph.actionPolicy.Allows(capability.ActionRequest{
+			AgentID:    req.Metadata["agent_id"],
+			AgentName:  agentName,
+			ActionType: action.Type,
+			Target:     action.Target,
+			Content:    action.Content,
+		})
+		if decision.Allowed {
+			allowed = append(allowed, action)
+			continue
+		}
+		ph.logger.Warn("agent action rejected by capability policy",
+			"request_id", requestID,
+			"agent_id", req.Metadata["agent_id"],
+			"agent_name", agentName,
+			"action_type", action.Type,
+			"target", action.Target,
+			"reason", decision.Reason,
+		)
+		ph.persistActionRejection(action, decision, i, agentName, requestID, req)
+	}
+	return allowed
+}
+
+func (ph *PipelineHandler) persistActionRejection(action extraction.ExtractedAction, decision capability.ActionDecision, index int, agentName, requestID string, req *LLMRequest) {
+	if ph.eventStore == nil {
+		return
+	}
+	aggregateID := decision.AgentKey
+	if aggregateID == "" {
+		aggregateID = agentName
+	}
+	if aggregateID == "" {
+		aggregateID = "unknown-agent"
+	}
+
+	payload := map[string]string{
+		"action_type":    action.Type,
+		"agent_id":       req.Metadata["agent_id"],
+		"agent_name":     agentName,
+		"reason":         decision.Reason,
+		"security_issue": "prompt_injection_defense",
+	}
+	if action.Target != "" {
+		payload["target"] = action.Target
+	}
+	if action.Content != "" {
+		payload["content"] = action.Content
+	}
+	if decision.Tool != "" {
+		payload["tool"] = decision.Tool
+	}
+	if decision.Target != "" {
+		payload["validated_target"] = decision.Target
+	}
+
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		payloadJSON = []byte(`{"security_issue":"prompt_injection_defense","error":"marshal_failed"}`)
+	}
+
+	evt := eventstore.DomainEvent{
+		EventID:          eventstore.GenerateUUID(),
+		EventType:        "agent_action_rejected",
+		AggregateID:      aggregateID,
+		Payload:          string(payloadJSON),
+		CorrelationID:    requestID,
+		OperationID:      fmt.Sprintf("%s-rejected-%d", requestID, index),
+		Tick:             parseTick(req.Metadata),
+		TimestampMs:      time.Now().UnixMilli(),
+		SchemaVersion:    1,
+		CompensationType: "none",
+	}
+	topic := fmt.Sprintf("sentinel/cortex/audit/%s", aggregateID)
+	if err := ph.eventStore.AppendWithOutbox(evt, topic); err != nil {
+		ph.logger.Warn("event store rejection audit write failed",
+			"error", err,
+			"request_id", requestID,
+			"agent", aggregateID,
+		)
 	}
 }
 
