@@ -139,7 +139,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | Hot-swap restore              | ✅ | `services/sentinel-daemon/src/runtime_health.rs` (snapshot reload path) |
 | Deterministic replay          | ✅ | `services/sentinel-nightrun/` |
 | Non-blocking evolution LLM (#278) | 🟡 | Async `evolution_task` moves nightrun/shift LLM calls out of the ECS tick loop; Deploy-VM nightrun returned in 0.669 ms and gateway-down shift jobs failed safe, but total shift transition measured ~1.455 s on the i7-3930K VM, above the strict `<1s` AC target due remaining Hippocampus/sandbox work |
-| Time-travel debugging UI      | ⏳ | dashboard hook designed, frontend deferred |
+| Time-travel debugging UI      | ✅ | Issue #384: dashboard "Zeitreise" view — visual snapshot timeline, point-in-time world-state preview (`GET /api/control/snapshot-state`), hot-swap restore with confirm + live WebSocket refresh; Deploy-VM Playwright evidence in `test-384-verification.md` |
 
 ## Cluster 12 — Zielarchitektur / Nano-Container Platform
 

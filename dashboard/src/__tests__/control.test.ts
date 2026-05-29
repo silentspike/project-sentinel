@@ -413,4 +413,111 @@ describe("Control Routes", () => {
       expect(body.accepted).toBe(true);
     });
   });
+
+  describe("GET /api/control/snapshot-state (#384)", () => {
+    function buildEventStore(): Database {
+      const esDb = new Database(":memory:");
+      esDb.exec(`
+        CREATE TABLE events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id TEXT NOT NULL UNIQUE,
+          event_type TEXT NOT NULL,
+          aggregate_id TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          correlation_id TEXT NOT NULL DEFAULT '',
+          causation_id TEXT,
+          tick INTEGER NOT NULL DEFAULT 0,
+          timestamp_ms INTEGER NOT NULL
+        );
+        CREATE TABLE world_snapshots (
+          id TEXT PRIMARY KEY,
+          tier TEXT NOT NULL,
+          tick INTEGER NOT NULL,
+          sim_hour REAL NOT NULL,
+          last_event_id INTEGER NOT NULL,
+          payload_size INTEGER NOT NULL DEFAULT 0,
+          payload BLOB NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+      `);
+      const ins = esDb.prepare(
+        `INSERT INTO events (event_id, event_type, aggregate_id, payload, tick, timestamp_ms)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      );
+      // id 1..7 — Lifecycle/Transit-Verlauf bis tick 100
+      ins.run("e1", "agent_spawned", "AGENT-01", '{"agent_id":1,"room_id":"buero-dev-1"}', 10, 1000);
+      ins.run("e2", "agent_spawned", "AGENT-02", '{"agent_id":2,"room_id":"buero-dev-1"}', 11, 1100);
+      ins.run("e3", "agent_spawned", "AGENT-03", '{"agent_id":3,"room_id":"kueche"}', 12, 1200);
+      ins.run("e4", "tick_snapshot", "world", '{"type":"TickSnapshot","tick":50,"agent_count":3}', 50, 1300);
+      ins.run("e5", "transit_completed", "AGENT-02", '{"agent_id":2,"room_id":"kueche"}', 60, 1400);
+      ins.run("e6", "agent_despawned", "AGENT-03", '{"agent_id":3,"reason":"shift_end"}', 70, 1500);
+      // id 7: nach der Snapshot-Grenze (last_event_id=6) — darf NICHT zaehlen
+      ins.run("e7", "agent_spawned", "AGENT-04", '{"agent_id":4,"room_id":"empfang"}', 90, 1600);
+
+      // Snapshot mit Grenze last_event_id=6, tick=80
+      esDb
+        .prepare(
+          `INSERT INTO world_snapshots (id, tier, tick, sim_hour, last_event_id, payload_size, payload, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("snap-1", "hourly", 80, 13.5, 6, 4096, Buffer.from([0]), 1_700_000_000_000);
+      return esDb;
+    }
+
+    it("derives agent and room counts at the snapshot boundary", async () => {
+      const projDb = new Database(":memory:");
+      const esDb = buildEventStore();
+      setDatabases(projDb, esDb);
+      try {
+        const res = await app.request("/api/control/snapshot-state?snapshot_id=snap-1");
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.snapshot_id).toBe("snap-1");
+        expect(body.tier).toBe("hourly");
+        expect(body.tick).toBe(80);
+        // AGENT-01 (dev-1), AGENT-02 (in kueche nach transit), AGENT-03 despawned,
+        // AGENT-04 liegt hinter der Grenze (id 7 > 6) -> 2 anwesende Agents.
+        expect(body.present_agent_count).toBe(2);
+        // Belegte Raeume: buero-dev-1 (1) + kueche (1) = 2
+        expect(body.room_count).toBe(2);
+        // tick_snapshot (tick 50 <= 80) meldete 3 aktive Agents
+        expect(body.active_agent_count).toBe(3);
+        const dev1 = body.rooms.find((r: { room_id: string }) => r.room_id === "buero-dev-1");
+        const kueche = body.rooms.find((r: { room_id: string }) => r.room_id === "kueche");
+        expect(dev1.occupant_count).toBe(1);
+        expect(kueche.occupant_count).toBe(1);
+        // Raum-Name aus ROOM_METADATA aufgeloest
+        expect(kueche.name).toBe("Küche / Pausenraum");
+      } finally {
+        projDb.close();
+        esDb.close();
+      }
+    });
+
+    it("returns 404 for unknown snapshot id", async () => {
+      const projDb = new Database(":memory:");
+      const esDb = buildEventStore();
+      setDatabases(projDb, esDb);
+      try {
+        const res = await app.request("/api/control/snapshot-state?snapshot_id=nope");
+        expect(res.status).toBe(404);
+      } finally {
+        projDb.close();
+        esDb.close();
+      }
+    });
+
+    it("returns 400 when snapshot_id is missing", async () => {
+      const projDb = new Database(":memory:");
+      const esDb = buildEventStore();
+      setDatabases(projDb, esDb);
+      try {
+        const res = await app.request("/api/control/snapshot-state");
+        expect(res.status).toBe(400);
+      } finally {
+        projDb.close();
+        esDb.close();
+      }
+    });
+  });
 });
