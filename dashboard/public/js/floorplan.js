@@ -1,3 +1,6 @@
+// API-Key: geteiltes In-Memory-Modul (siehe api-key.js)
+import { getApiKey, setApiKey, authHeaders } from './api-key.js';
+
 const CHAOS_OPTIONS = [
   ['AirConBroken', 'Klimaanlage defekt'],
   ['PrinterBroken', 'Drucker defekt'],
@@ -39,15 +42,6 @@ let stimulusTriggerState = {
 
 function getFloorplanContainer() {
   return document.getElementById('view-floorplan');
-}
-
-function getApiKey() {
-  return sessionStorage.getItem('sentinel_api_key') || '';
-}
-
-function authHeaders() {
-  const key = getApiKey();
-  return key ? { Authorization: 'Bearer ' + key } : {};
 }
 
 function createEl(tag, className, text) {
@@ -545,7 +539,7 @@ function renderStimulusSection(detail) {
     keyInput.placeholder = 'Operator API-Key';
     keyInput.addEventListener('change', () => {
       if (keyInput.value.trim()) {
-        sessionStorage.setItem('sentinel_api_key', keyInput.value.trim());
+        setApiKey(keyInput.value);
         renderFloorplan(latestRooms);
       }
     });
@@ -662,7 +656,7 @@ function renderChaosTriggerSection() {
     keyInput.placeholder = 'Operator API-Key';
     keyInput.addEventListener('change', () => {
       if (keyInput.value.trim()) {
-        sessionStorage.setItem('sentinel_api_key', keyInput.value.trim());
+        setApiKey(keyInput.value);
         renderFloorplan(latestRooms);
       }
     });
