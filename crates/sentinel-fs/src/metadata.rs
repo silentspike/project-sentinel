@@ -118,6 +118,14 @@ pub struct MetadataStore {
     db: Database,
 }
 
+/// Aggregated metadata statistics for storage and dedup verification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetadataStorageStats {
+    pub regular_file_count: u64,
+    pub logical_regular_file_bytes: u64,
+    pub unreadable_inode_rows: u64,
+}
+
 impl MetadataStore {
     /// Open or create the metadata store at the given path.
     #[instrument(level = "debug", fields(path = %path.as_ref().display()))]
@@ -403,6 +411,29 @@ impl MetadataStore {
             refcounts,
             trash_queue,
         })
+    }
+
+    /// Sum logical payload bytes for live storage/dedup verification.
+    pub fn storage_stats(&self) -> anyhow::Result<MetadataStorageStats> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(FS_INODES)?;
+        let mut stats = MetadataStorageStats::default();
+        for entry in table.iter()? {
+            let (_, value) = entry?;
+            let data = match InodeData::deserialize(value.value()) {
+                Ok(data) => data,
+                Err(_) => {
+                    stats.unreadable_inode_rows += 1;
+                    continue;
+                }
+            };
+            if data.kind == FileKind::Regular && data.size != u64::MAX {
+                stats.regular_file_count += 1;
+                stats.logical_regular_file_bytes =
+                    stats.logical_regular_file_bytes.saturating_add(data.size);
+            }
+        }
+        Ok(stats)
     }
 
     /// Restore all sentinel-fs metadata tables from a snapshot dump.
