@@ -172,4 +172,3 @@ Security claims must name the attacker class they address. A mitigation that
 contains external HTTP abuse does not automatically address prompt injection,
 and a Rust memory-safety property does not automatically protect against a
 compromised model, poisoned memory, or malicious dependency.
-
