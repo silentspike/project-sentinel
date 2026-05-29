@@ -45,13 +45,71 @@ Issue Quality Gate 26643915941 completed with success.
 
 | AC | Evidence | Status |
 | --- | --- | --- |
-| AC-1 | Pending implementation. | Pending |
-| AC-2 | Pending implementation. | Pending |
-| AC-3 | Pending implementation. | Pending |
-| AC-4 | Pending implementation. | Pending |
+| AC-1 | DEV-006 documents both WASM/WASI and arbitrary native-code options with density/freedom/portability/security trade-offs. | PASS |
+| AC-2 | DEV-006 records the user-approved decision: WASM/WASI on Wasmtime is the default runtime; native code is an explicit Escape-Hatch-Pool. | PASS |
+| AC-3 | DEV-006 records the runtime contract, default runtime, native exception path, and Cluster 12 consequences. | PASS |
+| AC-4 | Tracking epic #397 has a comment linking #396 to DEV-006 and the selected contract. | PASS |
 
 ## Benchmarks
 
 Docs-only contract benchmark. Target: 100% of runtime-decision contract elements
 validated by script/inline check. Runtime performance is not applicable.
 
+Command:
+
+```bash
+python3 - <<'PY'
+import json
+import subprocess
+from pathlib import Path
+text = Path('docs/togaf-deviations-v22.md').read_text()
+gap = Path('docs/togaf-gap-v22.md').read_text()
+comments = subprocess.check_output(['gh', 'issue', 'view', '397', '--json', 'comments'], text=True)
+comment_text = '\n'.join(c['body'] for c in json.loads(comments)['comments'])
+checks = {
+    'dev_006_exists': '## DEV-006' in text,
+    'wasm_option': 'WASM/WASI' in text and 'Wasmtime' in text,
+    'native_option': 'native' in text and 'Escape-Hatch-Pool' in text,
+    'density_tradeoff': 'density' in text,
+    'freedom_tradeoff': 'freedom' in text,
+    'portability_tradeoff': 'portability' in text,
+    'security_tradeoff': 'security' in text,
+    'decision_default': 'default Nano-Container runtime contract' in text,
+    'runtime_contract': 'Default runtime: `wasm+wasi`' in text,
+    'consequences': 'Follow-up work under #397' in text and 'Clusters 00-11 remain untouched' in text,
+    'dev_004_intact': 'ADRs live in the internal workspace, not the public repository' in text,
+    'cluster_12_gap': 'Cluster 12' in gap and 'Runtime contract decision (#396)' in gap,
+    'epic_link_comment': '#396 decision link' in comment_text and 'DEV-006' in comment_text and 'Escape-Hatch-Pool' in comment_text,
+}
+missing = [name for name, ok in checks.items() if not ok]
+for name, ok in checks.items():
+    print(f'{name}: {"PASS" if ok else "FAIL"}')
+if missing:
+    raise SystemExit(f'Missing checks: {missing}')
+print('issue_396_contract_check: PASS')
+PY
+```
+
+Observed:
+
+```text
+dev_006_exists: PASS
+wasm_option: PASS
+native_option: PASS
+density_tradeoff: PASS
+freedom_tradeoff: PASS
+portability_tradeoff: PASS
+security_tradeoff: PASS
+decision_default: PASS
+runtime_contract: PASS
+consequences: PASS
+dev_004_intact: PASS
+cluster_12_gap: PASS
+epic_link_comment: PASS
+issue_396_contract_check: PASS
+```
+
+## Non-Applicable Runtime Checks
+
+- Deploy: not applicable for docs-only issue.
+- Gateway start: not applicable and intentionally avoided.
