@@ -16,8 +16,14 @@ pub mod snapshot_codec;
 pub mod types;
 
 pub use events::{DomainEvent, DomainEventPayload};
-pub use snapshot_codec::{decode_world_snapshot, encode_world_snapshot};
+pub use snapshot_codec::{
+    decode_snapshot_cursor, decode_world_snapshot, encode_snapshot_cursor, encode_world_snapshot,
+    SnapshotCursor,
+};
 pub use types::*;
+
+#[cfg(kani)]
+mod kani;
 
 #[cfg(test)]
 mod tests {

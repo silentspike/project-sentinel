@@ -51,6 +51,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | WASM tool runtime             | ✅ | `crates/sentinel-wasm/` |
 | eBPF monitoring (aya-rs)      | ✅ | `crates/sentinel-ebpf/`; #380 verified production kernel mode on Deploy-VM with CAP_BPF fallback smoke and dashboard evidence |
 | Security threat model (#390)  | ✅ | [docs/security/threat-model.md](security/threat-model.md) documents compromised-agent, external-attacker, and supply-chain attacker classes, protected assets, mitigations, and prioritized gaps linked to #391/#392/#393 |
+| Unsafe audit baseline (#392)  | ✅ | [docs/security/unsafe-audit.md](security/unsafe-audit.md) documents 19 first-party unsafe constructs, SAFETY justifications, `scripts/check-unsafe-baseline.py`, and shift FFI regression evidence |
 
 ## Cluster 04 — Cortex Gateway
 
@@ -69,7 +70,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 
 | Item                          | Status | Evidence |
 |-------------------------------|--------|----------|
-| Rust workspace (15 crates + 2 services) | ✅ | `Cargo.toml` workspace members |
+| Rust workspace (17 crates + 4 Rust services) | ✅ | `Cargo.toml` workspace members plus component README coverage in [docs/component-readmes.md](component-readmes.md) |
 | Go workspace (4 modules)      | ✅ | `go.work` |
 | Bun + Hono dashboard          | ✅ | `dashboard/` |
 | Build server pattern          | ✅ | `cargo remote --` (server IP injected via `.make.local`) |
@@ -122,12 +123,13 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | Reproducible scenario runs    | ✅ | nightrun deterministic replay + SHA-256 hash chain |
 | Event-sourcing primitives     | ✅ | `crates/sentinel-limbo/` |
 | Snapshot tiered retention     | ✅ | `crates/sentinel-limbo/src/snapshot.rs` |
+| Kani formal verification (#393) | ✅ | [docs/security/kani-verification.md](security/kani-verification.md) and `scripts/verify-kani.sh` prove six harnesses on build-server Kani/CBMC |
 
 ## Cluster 10 — Software Design Description
 
 | Item                          | Status | Evidence |
 |-------------------------------|--------|----------|
-| Component-level READMEs       | 🟡 | `config/README.md`, `deploy/README.md`; per-crate READMEs deferred |
+| Component-level READMEs       | ✅ | #383: 25 current Rust/Go component READMEs indexed in [docs/component-readmes.md](component-readmes.md); coverage checked by `scripts/check-component-readmes.sh` |
 | llms.txt index                | ✅ | `llms.txt` |
 | Glossary                      | ✅ | [docs/glossary.md](glossary.md) |
 | Governance ↔ code map         | ✅ | [docs/governance.md](governance.md) |
