@@ -1724,8 +1724,11 @@ fn run_fs_dedup_benchmark(
     let mut cas_check_latencies = Vec::with_capacity(payload.writes as usize);
     let mut write_file_latencies = Vec::with_capacity(payload.writes as usize);
     let mut loop_latencies = Vec::with_capacity(payload.writes as usize);
+    let hit_file_names: Vec<String> = (0..payload.writes)
+        .map(|idx| format!("{file_prefix}-hit-{idx:04}.bin"))
+        .collect();
     let mut dedup_hits = 0u32;
-    for idx in 0..payload.writes {
+    for name in &hit_file_names {
         let loop_started = Instant::now();
         let cas_check_started = Instant::now();
         if layer.cas().contains(&content_hash) {
@@ -1735,13 +1738,7 @@ fn run_fs_dedup_benchmark(
 
         let write_started = Instant::now();
         layer
-            .write_file(
-                &fs_agent_dir,
-                parent_inode,
-                &format!("{file_prefix}-hit-{idx:04}.bin"),
-                &content,
-                0o644,
-            )
+            .write_file(&fs_agent_dir, parent_inode, name, &content, 0o644)
             .map_err(|_| ApiError::ServiceUnavailable("Dedup-Benchmark Write fehlgeschlagen"))?;
         write_file_latencies.push(elapsed_us(write_started.elapsed()));
         loop_latencies.push(elapsed_us(loop_started.elapsed()));

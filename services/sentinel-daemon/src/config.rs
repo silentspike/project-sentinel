@@ -66,6 +66,14 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub fs_mount: Option<String>,
 
+    /// redb-Durability fuer sentinel-fs Metadata-Commits.
+    ///
+    /// `immediate` fsyncs every commit. `eventual` skips fsync for the FUSE
+    /// hot path and is only appropriate when lower write latency is preferred
+    /// over crash durability for the most recent metadata commits.
+    #[serde(default)]
+    pub fs_metadata_durability: FsMetadataDurability,
+
     /// Time Machine: Tiered Snapshot + Event Retention.
     #[serde(default)]
     pub retention: RetentionConfig,
@@ -81,6 +89,14 @@ pub struct DaemonConfig {
     /// Traffic Control Defaults fuer den Gateway-Start.
     #[serde(default)]
     pub traffic_control: TrafficControlConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FsMetadataDurability {
+    #[default]
+    Immediate,
+    Eventual,
 }
 
 /// Traffic-Control Defaults fuer den Gateway Bootstrap.
@@ -636,6 +652,10 @@ shared_secret = "secret"
         assert_eq!(file.daemon.tick_rate_ms, 500);
         assert_eq!(file.daemon.max_agents, 10);
         assert_eq!(file.daemon.zenoh_prefix, "test");
+        assert_eq!(
+            file.daemon.fs_metadata_durability,
+            FsMetadataDurability::Immediate
+        );
         assert!(file.daemon.operator_api.enabled);
         assert_eq!(file.daemon.operator_api.bind_addr, "127.0.0.1:9999");
         assert_eq!(
@@ -659,6 +679,10 @@ data_dir = "/tmp/data"
         assert_eq!(file.daemon.max_agents, 30);
         assert_eq!(file.daemon.zenoh_prefix, "sentinel");
         assert_eq!(file.daemon.time_scale, 1.0);
+        assert_eq!(
+            file.daemon.fs_metadata_durability,
+            FsMetadataDurability::Immediate
+        );
         assert_eq!(file.daemon.agent_command, vec!["/usr/bin/agent-runtime"]);
         assert!(!file.daemon.traffic_control.synthesis_enabled);
         assert!(!file.daemon.traffic_control.sequencing_enabled);
@@ -718,6 +742,21 @@ data_dir = "/tmp/data"
                 .platform_controlplane
                 .llm_max_failed_interventions,
             3
+        );
+    }
+
+    #[test]
+    fn test_parse_fs_metadata_eventual_durability() {
+        let toml_str = r#"
+[daemon]
+config_dir = "/tmp/cfg"
+data_dir = "/tmp/data"
+fs_metadata_durability = "eventual"
+"#;
+        let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            file.daemon.fs_metadata_durability,
+            FsMetadataDurability::Eventual
         );
     }
 

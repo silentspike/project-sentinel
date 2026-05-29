@@ -436,8 +436,23 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
     let fs_layer = if config.fs_mount.is_some() {
         let cas = sentinel_fs::cas::CasStore::open(data_dir).context("sentinel-fs CAS oeffnen")?;
-        let meta = sentinel_fs::metadata::MetadataStore::open(data_dir.join("metadata.redb"))
-            .context("sentinel-fs Metadata oeffnen")?;
+        let metadata_durability = match config.fs_metadata_durability {
+            crate::config::FsMetadataDurability::Immediate => {
+                sentinel_fs::metadata::MetadataDurability::Immediate
+            }
+            crate::config::FsMetadataDurability::Eventual => {
+                sentinel_fs::metadata::MetadataDurability::Eventual
+            }
+        };
+        let meta = sentinel_fs::metadata::MetadataStore::open_with_durability(
+            data_dir.join("metadata.redb"),
+            metadata_durability,
+        )
+        .context("sentinel-fs Metadata oeffnen")?;
+        info!(
+            ?metadata_durability,
+            "sentinel-fs Metadata-Durability konfiguriert"
+        );
         let layer = Arc::new(sentinel_fs::layer::LayerManager::new(cas, meta));
         layer
             .init_base_root()

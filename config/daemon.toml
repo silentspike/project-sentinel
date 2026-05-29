@@ -6,6 +6,10 @@ time_scale = 1.0
 max_agents = 60
 zenoh_prefix = "sentinel"
 fs_mount = "/opt/sentinel/fs"
+# sentinel-fs metadata write durability.
+# "immediate" = fsync on every metadata commit (crash-safe, higher latency)
+# "eventual"  = skip fsync for FUSE hot-path commits (lower latency, recent metadata may be lost on VM crash)
+fs_metadata_durability = "eventual"
 
 # PSI-basierte adaptive Tick-Rate (TOGAF Adaptive Scheduling)
 [daemon.adaptive]

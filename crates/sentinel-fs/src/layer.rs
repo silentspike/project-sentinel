@@ -5,6 +5,9 @@
 //! Deletes place a whiteout marker in the agent layer that hides the base entry.
 //! Agent layers are created lazily on first write.
 
+use std::collections::HashSet;
+use std::sync::RwLock;
+
 use crate::cas::CasStore;
 use crate::metadata::{FileKind, InodeData, MetadataStore};
 use tracing::instrument;
@@ -37,6 +40,7 @@ fn whiteout_marker() -> InodeData {
 pub struct LayerManager {
     cas: CasStore,
     meta: MetadataStore,
+    known_agent_roots: RwLock<HashSet<String>>,
 }
 
 /// Live storage stats for the layer manager.
@@ -54,7 +58,11 @@ pub struct LayerStorageStats {
 impl LayerManager {
     /// Create a new layer manager.
     pub fn new(cas: CasStore, meta: MetadataStore) -> Self {
-        Self { cas, meta }
+        Self {
+            cas,
+            meta,
+            known_agent_roots: RwLock::new(HashSet::new()),
+        }
     }
 
     /// Access the CAS store.
@@ -136,10 +144,32 @@ impl LayerManager {
 
     /// Ensure agent root directory exists (lazy creation).
     pub fn ensure_agent_root(&self, agent_id: &str) -> anyhow::Result<()> {
+        if self.agent_root_known(agent_id)? {
+            return Ok(());
+        }
+
         if self.meta.get_inode(agent_id, 1)?.is_none() {
             let root = InodeData::directory(0o755);
             self.meta.set_inode(agent_id, 1, &root)?;
         }
+        self.mark_agent_root_known(agent_id)?;
+        Ok(())
+    }
+
+    fn agent_root_known(&self, agent_id: &str) -> anyhow::Result<bool> {
+        let roots = self
+            .known_agent_roots
+            .read()
+            .map_err(|err| anyhow::anyhow!("Agent-Root-Cache read failed: {err}"))?;
+        Ok(roots.contains(agent_id))
+    }
+
+    fn mark_agent_root_known(&self, agent_id: &str) -> anyhow::Result<()> {
+        let mut roots = self
+            .known_agent_roots
+            .write()
+            .map_err(|err| anyhow::anyhow!("Agent-Root-Cache write failed: {err}"))?;
+        roots.insert(agent_id.to_string());
         Ok(())
     }
 
@@ -201,13 +231,19 @@ impl LayerManager {
         content: &[u8],
         mode: u32,
     ) -> anyhow::Result<u64> {
-        self.ensure_agent_root(agent_id)?;
-
         let (hash, _deduped) = self.cas.store(content)?;
-        let inode = self.meta.next_inode(agent_id)?;
         let data = InodeData::regular(hash, content.len() as u64, mode);
-        self.meta
-            .create_file(agent_id, parent_inode, name, inode, &data)?;
+        let ensure_root = !self.agent_root_known(agent_id)?;
+        let inode = self.meta.create_file_allocating_inode(
+            agent_id,
+            parent_inode,
+            name,
+            &data,
+            ensure_root,
+        )?;
+        if ensure_root {
+            self.mark_agent_root_known(agent_id)?;
+        }
         Ok(inode)
     }
 
@@ -219,12 +255,18 @@ impl LayerManager {
         name: &str,
         mode: u32,
     ) -> anyhow::Result<u64> {
-        self.ensure_agent_root(agent_id)?;
-
-        let inode = self.meta.next_inode(agent_id)?;
         let data = InodeData::directory(mode);
-        self.meta
-            .create_file(agent_id, parent_inode, name, inode, &data)?;
+        let ensure_root = !self.agent_root_known(agent_id)?;
+        let inode = self.meta.create_file_allocating_inode(
+            agent_id,
+            parent_inode,
+            name,
+            &data,
+            ensure_root,
+        )?;
+        if ensure_root {
+            self.mark_agent_root_known(agent_id)?;
+        }
         Ok(inode)
     }
 
@@ -454,6 +496,31 @@ mod tests {
 
         // Now agent root exists
         assert!(lm.meta().get_inode("AGENT-99", 1).unwrap().is_some());
+    }
+
+    #[test]
+    fn write_file_allocates_sequential_inodes_in_single_metadata_path() {
+        let (lm, _dir) = temp_layer();
+
+        let first = lm
+            .write_file("AGENT-88", 1, "first.txt", b"same", 0o644)
+            .unwrap();
+        let second = lm
+            .write_file("AGENT-88", 1, "second.txt", b"same", 0o644)
+            .unwrap();
+
+        assert_eq!(first, 2);
+        assert_eq!(second, 3);
+        assert!(lm.meta().get_inode("AGENT-88", 1).unwrap().is_some());
+        assert_eq!(
+            lm.meta().get_dirent("AGENT-88", 1, "first.txt").unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            lm.meta().get_dirent("AGENT-88", 1, "second.txt").unwrap(),
+            Some(second)
+        );
+        assert_eq!(lm.meta().get_refcount(&CasStore::hash(b"same")).unwrap(), 2);
     }
 
     #[test]
