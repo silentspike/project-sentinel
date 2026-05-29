@@ -49,11 +49,62 @@ Issue Quality Gate 26645872696 completed with success.
 
 | AC | Evidence | Status |
 | --- | --- | --- |
-| AC-1 | Pending implementation. | Pending |
+| AC-1 | `cmd/cortex-gateway/internal/capability/agent_policy.go` loads per-agent `[capabilities].tools` from agent TOML and validates tool/target permissions. Focused Go tests and real config count passed. | PASS |
 | AC-2 | Pending implementation. | Pending |
 | AC-3 | Pending implementation. | Pending |
 | AC-4 | Pending implementation. | Pending |
 | AC-5 | Pending implementation. | Pending |
+
+## AC-1 Evidence
+
+Command:
+
+```bash
+cd cmd/cortex-gateway
+go test ./internal/capability -run 'TestLoadAgentActionPolicyFromAgentTOML|TestAgentActionPolicy' -v
+```
+
+Observed:
+
+```text
+=== RUN   TestLoadAgentActionPolicyFromAgentTOML
+--- PASS: TestLoadAgentActionPolicyFromAgentTOML (0.00s)
+=== RUN   TestAgentActionPolicyAllowsConfiguredTool
+--- PASS: TestAgentActionPolicyAllowsConfiguredTool (0.00s)
+=== RUN   TestAgentActionPolicyRejectsUnconfiguredTool
+--- PASS: TestAgentActionPolicyRejectsUnconfiguredTool (0.00s)
+=== RUN   TestAgentActionPolicyRejectsUnconfiguredTarget
+--- PASS: TestAgentActionPolicyRejectsUnconfiguredTarget (0.00s)
+=== RUN   TestAgentActionPolicyAllowsBaselineNonToolActions
+--- PASS: TestAgentActionPolicyAllowsBaselineNonToolActions (0.00s)
+PASS
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/capability	0.004s
+```
+
+Command:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+files = sorted(Path('config/agents').glob('AGENT-*.toml'))
+missing = [str(p) for p in files if '[capabilities]' not in p.read_text() or 'tools =' not in p.read_text()]
+print(f'agent_files={len(files)}')
+print(f'capability_definitions={len(files)-len(missing)}')
+print(f'missing={len(missing)}')
+if missing:
+    raise SystemExit('\n'.join(missing[:10]))
+print('real_agent_capability_config: PASS')
+PY
+```
+
+Observed:
+
+```text
+agent_files=60
+capability_definitions=60
+missing=0
+real_agent_capability_config: PASS
+```
 
 ## Not Tested Yet
 
