@@ -19,6 +19,7 @@ Deploy target: `ubuntu@10.0.0.240`
 - Daemon Operator API exposes `GET /operator/security/fs-stats`.
 - Daemon Operator API exposes `POST /operator/security/fs-dedup-benchmark`.
 - The benchmark writes one seed blob and repeated identical hit files through the shared FUSE/CAS layer and reports dedup ratio plus latency target flags.
+- The benchmark now reports phase-level latency for CAS hit check, `LayerManager::write_file()`, full loop, and storage-stat overhead so AC-4 optimization work can target the real bottleneck.
 
 ## Test Gates
 
@@ -160,6 +161,67 @@ Interpretation:
 
 - PASS for storage savings: dedup ratio was 99.22%, above the 87% target.
 - TARGET MISS for dedup-hit latency: p95 was 21,712 us, above the `<100us` target. This is a real VM measurement through redb metadata writes and the CAS/FUSE path, not a synthetic in-memory number.
+
+## Instrumented Baseline
+
+Task-1 instrumented daemon:
+
+```text
+local sha256 target/release/sentinel-daemon -> cbb38e1be7a5d70158b61ee17b8a525212b5bc172e5ef48d0ceb0c3d1defda4e
+vm sha256 /opt/sentinel/bin/sentinel-daemon -> cbb38e1be7a5d70158b61ee17b8a525212b5bc172e5ef48d0ceb0c3d1defda4e
+systemctl is-active sentinel-daemon -> active
+systemctl is-active sentinel-gateway -> inactive
+/proc/118821/mountinfo -> fuse sentinel-fs at /opt/sentinel/fs
+```
+
+Live benchmark agent after daemon restart:
+
+```text
+curl http://127.0.0.1:8084/operator/security/agent-runtime-state?agent_id=1
+
+{
+  "found": true,
+  "agent_id": 1,
+  "aggregate_id": "AGENT-01",
+  "agent_name": "Thomas Mueller",
+  "home_host_path": "/opt/sentinel/fs/AGENT-01",
+  "fs_mount": "/opt/sentinel/fs"
+}
+```
+
+Command shape, repeated three times on the Deploy-VM:
+
+```text
+vmstat 1 12
+mpstat 1 12
+iostat -x 1 12
+curl -X POST http://127.0.0.1:8084/operator/security/fs-dedup-benchmark \
+  -H "Content-Type: application/json" \
+  -d '{"agent_name":"Thomas Mueller","writes":128,"bytes_per_write":4096,"file_prefix":"issue379-baseline-rN"}'
+```
+
+Raw evidence path on VM:
+
+```text
+/tmp/issue379-baseline-20260529T071418/run-1
+/tmp/issue379-baseline-20260529T071418/run-2
+/tmp/issue379-baseline-20260529T071418/run-3
+```
+
+Instrumented baseline summary:
+
+| Run | Dedup ratio | CAS check p95 | write_file p50 | write_file p95 | loop p95 | Target <100us | mpstat avg idle |
+|---|---:|---:|---:|---:|---:|---|---:|
+| 1 | 99.2246% | 35 us | 12,474 us | 40,411 us | 40,440 us | false | 97.58% |
+| 2 | 99.2246% | 35 us | 11,822 us | 47,709 us | 47,740 us | false | 97.40% |
+| 3 | 99.2246% | 38 us | 12,099 us | 37,235 us | 37,261 us | false | 97.64% |
+
+Interpretation:
+
+- CAS hit lookup is already near the `<100us` target at p95 35-38 us.
+- The miss is dominated by `LayerManager::write_file()` metadata/write work: p95 37.2-47.7 ms.
+- Full-loop p95 is only 26-31 us above `write_file()` p95, so benchmark loop overhead is not the driver.
+- CPU was mostly idle and there was no swap pressure; this is a code-path/storage-sync bottleneck, not a saturated-CPU benchmark.
 
 ## Soak
 
