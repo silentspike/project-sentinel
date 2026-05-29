@@ -4291,6 +4291,7 @@ name = "sentinel-fs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "blake3",
  "criterion 0.8.2",
  "fuser",
