@@ -145,7 +145,20 @@ func main() {
 
 	// 5a. Capabilities + TOML Loader + Compiler with 3-source Assembly
 	caps := capability.New()
-	agentsDir := envOrDefault("SENTINEL_AGENTS_DIR", "agents")
+	agentsDir := envOrDefault("SENTINEL_AGENTS_DIR", "config/agents")
+	actionPolicy, err := capability.LoadAgentActionPolicy(agentsDir)
+	if err != nil {
+		logger.Warn("agent action capability policy unavailable; tool_use actions will be denied",
+			"agents_dir", agentsDir,
+			"error", err,
+		)
+		actionPolicy = capability.NewAgentActionPolicy(nil)
+	} else {
+		logger.Info("agent action capability policy loaded",
+			"agents", len(actionPolicy.Definitions()),
+			"agents_dir", agentsDir,
+		)
+	}
 	tomlLoader := compiler.NewTOMLLoader(agentsDir)
 	promptCompiler := compiler.NewWithAssembler(tomlLoader, caps)
 	logger.Info("4-source assembly enabled (DNA + Company + Evolution + Perception)", "agents_dir", agentsDir)
@@ -231,6 +244,7 @@ func main() {
 		Normalizer:          normalizer.New(),
 		Extractor:           extraction.New(),
 		Capabilities:        caps,
+		ActionPolicy:        actionPolicy,
 		Logger:              logger,
 		BreakerCfg:          proxy.BreakerConfigFromEnv(),
 		EventStore:          evStore,
