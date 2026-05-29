@@ -102,3 +102,34 @@ issue_390_contract_check: PASS
 
 - Deploy: not applicable for docs-only issue.
 - Gateway start: not applicable and intentionally avoided.
+
+## Final Docs Check
+
+Command:
+
+```bash
+python3 <combined #390/#396 contract check>
+git diff --check -- CHANGELOG.md docs/security/threat-model.md docs/togaf-deviations-v22.md docs/togaf-gap-v22.md test-390-verification.md test-396-verification.md
+```
+
+Observed:
+
+```text
+390_doc_exists: PASS
+390_three_classes: PASS
+390_sections_per_class: PASS
+390_assets: PASS
+390_followups: PASS
+390_gap_doc: PASS
+396_dev006: PASS
+396_options: PASS
+396_tradeoffs: PASS
+396_default: PASS
+396_dev004_intact: PASS
+396_cluster12_gap: PASS
+396_epic_link: PASS
+no_public_adr: PASS
+changelog_390_396: PASS
+combined_contract_check: PASS
+git diff --check: PASS
+```
