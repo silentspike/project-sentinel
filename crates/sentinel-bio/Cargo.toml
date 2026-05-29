@@ -11,3 +11,6 @@ sentinel-common = { path = "../sentinel-common" }
 [dev-dependencies]
 approx = { workspace = true }
 bolero = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

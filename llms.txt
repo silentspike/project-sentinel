@@ -10,6 +10,7 @@
 - [docs/governance.md](docs/governance.md): Governance mechanisms mapped to code paths
 - [docs/togaf-gap-v22.md](docs/togaf-gap-v22.md): Per-cluster implementation status
 - [docs/togaf-deviations-v22.md](docs/togaf-deviations-v22.md): Deviation register (DEV-001/002/003)
+- [docs/component-readmes.md](docs/component-readmes.md): Component-level README index for current Rust/Go modules
 - [docs/glossary.md](docs/glossary.md): PixelPerfekt narrative, agent-layer model, terminology
 
 ## Agent Layers
