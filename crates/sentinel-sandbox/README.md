@@ -10,6 +10,10 @@
 - `BwrapConfig`, `LandlockRuleset`, `NetworkNsConfig`, and `CgroupLimits` describe isolation policy.
 - `AgentProcess` and `SandboxHandle` represent managed runtime state.
 - `psi_publisher` exposes pressure metrics for bio stress and monitoring.
+- `BwrapNanoRuntime` implements the shared `NanoRuntime` contract for the
+  `bwrap-landlock` key. Its `snapshot` captures workload config, isolation
+  metadata, and agent-home filesystem state. It does not checkpoint process RAM
+  and does not claim CRIU/live-process migration.
 
 ## Dependencies
 
@@ -22,6 +26,7 @@
 ```bash
 cargo remote -c -- test -p sentinel-sandbox
 cargo remote -c -- test -p sentinel-sandbox --test breakout
+cargo remote -c -- test -p sentinel-sandbox --test nano_runtime_conformance -- --ignored
 ```
 
 Sandbox policy changes require runtime verification on the deploy VM because kernel features and permissions are host-dependent.
