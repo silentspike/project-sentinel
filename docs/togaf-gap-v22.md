@@ -47,7 +47,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | Pub/Sub (Zenoh, Rust)         | ✅ | `crates/sentinel-zenoh/`; SHM local <10µs |
 | Pub/Sub (NATS JetStream, Go)  | ✅ | `pkg/sentinel-go/messaging/`, two streams |
 | Sandbox (bwrap + Landlock + cgroups + netns) | ✅ | `crates/sentinel-sandbox/`; 9/9 breakout tests pass |
-| sentinel-fs CAS-FUSE (#379)  | 🟡 | Deploy-VM daemon namespace shows active `fuse sentinel-fs` at `/opt/sentinel/fs` and agent homes bound through `/opt/sentinel/fs/AGENT-*`; live dedup benchmark on Intel i7-3930K @ 3.20 GHz (2011) reached 99.22% dedup savings, but dedup-hit p95 write latency was 21,712 us, above the `<100us` target |
+| sentinel-fs CAS-FUSE (#379)  | 🟡 | Deploy-VM daemon namespace shows active `fuse sentinel-fs` at `/opt/sentinel/fs` and agent homes bound through `/opt/sentinel/fs/AGENT-*`; same-VM optimization loop on Intel i7-3930K @ 3.20 GHz (2011) reached 99.22% dedup savings and improved median dedup-hit write p95 from 40,411 us to 189 us, but the strict `<100us` target remains unmet on this VM |
 | WASM tool runtime             | ✅ | `crates/sentinel-wasm/` |
 | eBPF monitoring (aya-rs)      | ✅ | `crates/sentinel-ebpf/` |
 
