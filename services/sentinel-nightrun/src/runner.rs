@@ -7,11 +7,15 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use tracing::{error, info, warn};
 
 use sentinel_common::agent_config::load_all_agents;
 use sentinel_common::{DomainEvent, DomainEventPayload};
-use sentinel_hippocampus::HippocampusService;
+use sentinel_hippocampus::{
+    HippocampusService, NMDA_CONSOLIDATION_THRESHOLD, NMDA_MAX_CONSOLIDATION_EPISODES,
+    NMDA_SELECTION_RATIONALE,
+};
 use sentinel_limbo::EventStore;
 
 use crate::config::NightrunSettings;
@@ -20,16 +24,132 @@ use crate::hash_chain::HashChain;
 use crate::job_queue::JobQueue;
 
 /// Ergebnis eines Nightrun-Durchlaufs.
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize)]
 pub struct NightrunResult {
     pub run_id: String,
     pub agents_consolidated: u32,
     pub agents_failed: u32,
     pub agents_skipped: u32,
     pub total_episodes: u32,
+    pub total_episodes_consolidated: u32,
+    pub selection: NightrunSelectionMetrics,
     pub duration_ms: u64,
     /// Final hash of the deterministic event chain (for replay verification).
     pub hash_chain_final: String,
+}
+
+/// Aggregated NMDA episode-selection evidence for one Night-Run.
+#[derive(Debug, Clone, Serialize)]
+pub struct NightrunSelectionMetrics {
+    pub episodes_processed: u32,
+    pub episodes_consolidated: u32,
+    pub selection_rate: f64,
+    pub threshold: f64,
+    pub max_consolidation_episodes: usize,
+    pub rationale: &'static str,
+    pub score_min: Option<f64>,
+    pub score_avg: Option<f64>,
+    pub score_max: Option<f64>,
+    pub agents: Vec<AgentSelectionMetrics>,
+}
+
+impl NightrunSelectionMetrics {
+    pub fn empty() -> Self {
+        Self {
+            episodes_processed: 0,
+            episodes_consolidated: 0,
+            selection_rate: 0.0,
+            threshold: NMDA_CONSOLIDATION_THRESHOLD,
+            max_consolidation_episodes: NMDA_MAX_CONSOLIDATION_EPISODES,
+            rationale: NMDA_SELECTION_RATIONALE,
+            score_min: None,
+            score_avg: None,
+            score_max: None,
+            agents: Vec::new(),
+        }
+    }
+
+    fn record_agent(&mut self, agent: AgentSelectionMetrics) {
+        self.episodes_processed += agent.episodes_processed;
+        self.episodes_consolidated += agent.episodes_consolidated;
+        self.agents.push(agent);
+        self.recompute();
+    }
+
+    fn recompute(&mut self) {
+        self.selection_rate = if self.episodes_processed == 0 {
+            0.0
+        } else {
+            self.episodes_consolidated as f64 / self.episodes_processed as f64
+        };
+
+        let mut min_score: Option<f64> = None;
+        let mut max_score: Option<f64> = None;
+        let mut sum = 0.0;
+        let mut count = 0u32;
+
+        for agent in &self.agents {
+            if let Some(score) = agent.score_min {
+                min_score = Some(min_score.map_or(score, |current| current.min(score)));
+            }
+            if let Some(score) = agent.score_max {
+                max_score = Some(max_score.map_or(score, |current| current.max(score)));
+            }
+            if let Some(avg) = agent.score_avg {
+                sum += avg * agent.episodes_consolidated as f64;
+                count += agent.episodes_consolidated;
+            }
+        }
+
+        self.score_min = min_score;
+        self.score_max = max_score;
+        self.score_avg = if count == 0 {
+            None
+        } else {
+            Some(sum / count as f64)
+        };
+    }
+}
+
+/// NMDA selection evidence for one agent.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentSelectionMetrics {
+    pub agent_name: String,
+    pub episodes_processed: u32,
+    pub episodes_consolidated: u32,
+    pub selection_rate: f64,
+    pub score_min: Option<f64>,
+    pub score_avg: Option<f64>,
+    pub score_max: Option<f64>,
+}
+
+impl AgentSelectionMetrics {
+    fn new(agent_name: &str, episodes_processed: u32, scores: &[f64]) -> Self {
+        let episodes_consolidated = scores.len() as u32;
+        let selection_rate = if episodes_processed == 0 {
+            0.0
+        } else {
+            episodes_consolidated as f64 / episodes_processed as f64
+        };
+
+        let score_min = scores.iter().copied().reduce(f64::min);
+        let score_max = scores.iter().copied().reduce(f64::max);
+        let score_avg = if scores.is_empty() {
+            None
+        } else {
+            Some(scores.iter().sum::<f64>() / scores.len() as f64)
+        };
+
+        Self {
+            agent_name: agent_name.to_string(),
+            episodes_processed,
+            episodes_consolidated,
+            selection_rate,
+            score_min,
+            score_avg,
+            score_max,
+        }
+    }
 }
 
 /// Kern-Pipeline fuer Schichtwechsel-Konsolidierung.
@@ -90,6 +210,8 @@ impl NightrunRunner {
                 agents_failed: 0,
                 agents_skipped: 0,
                 total_episodes: 0,
+                total_episodes_consolidated: 0,
+                selection: NightrunSelectionMetrics::empty(),
                 duration_ms: start.elapsed().as_millis() as u64,
                 hash_chain_final: hash_chain.current_hash(),
             });
@@ -122,6 +244,8 @@ impl NightrunRunner {
         let mut failed = 0u32;
         let mut skipped = 0u32;
         let mut total_episodes = 0u32;
+        let mut total_episodes_consolidated = 0u32;
+        let mut selection = NightrunSelectionMetrics::empty();
 
         let pending_jobs = self.job_queue.get_pending(&self.run_id)?;
 
@@ -173,12 +297,22 @@ impl NightrunRunner {
 
             let agent_start = Instant::now();
             match self.consolidate_single_agent(agent) {
-                Ok((processed, cons)) => {
+                Ok(result) => {
+                    let processed = result.episodes_processed as u32;
+                    let cons = result.episodes_consolidated as u32;
+                    let scores: Vec<f64> = result
+                        .consolidated_summaries
+                        .iter()
+                        .map(|(_, score)| *score)
+                        .collect();
+                    let agent_selection = AgentSelectionMetrics::new(agent, processed, &scores);
+                    selection.record_agent(agent_selection);
                     let duration_ms = agent_start.elapsed().as_millis() as u64;
                     info!(
                         agent,
                         episodes_processed = processed,
                         episodes_consolidated = cons,
+                        selection_rate = format!("{:.3}", selection.selection_rate),
                         duration_ms,
                         "Agent konsolidiert"
                     );
@@ -188,6 +322,7 @@ impl NightrunRunner {
                     hash_chain.extend(&ev);
                     consolidated += 1;
                     total_episodes += processed;
+                    total_episodes_consolidated += cons;
                 }
                 Err(e) => {
                     let err_msg = format!("{e:#}");
@@ -217,6 +352,7 @@ impl NightrunRunner {
             failed,
             skipped,
             total_episodes,
+            total_episodes_consolidated,
             duration_ms,
             &hash_chain_final,
         )?;
@@ -227,6 +363,8 @@ impl NightrunRunner {
             agents_failed: failed,
             agents_skipped: skipped,
             total_episodes,
+            total_episodes_consolidated,
+            selection,
             duration_ms,
             hash_chain_final,
         };
@@ -237,6 +375,8 @@ impl NightrunRunner {
             failed,
             skipped,
             total_episodes,
+            total_episodes_consolidated,
+            selection_rate = format!("{:.3}", result.selection.selection_rate),
             duration_ms,
             hash_chain = %result.hash_chain_final,
             "Nightrun abgeschlossen"
@@ -296,16 +436,16 @@ impl NightrunRunner {
     }
 
     /// Konsolidiert einen einzelnen Agent ueber HippocampusService.
-    fn consolidate_single_agent(&self, agent: &str) -> Result<(u32, u32)> {
+    fn consolidate_single_agent(
+        &self,
+        agent: &str,
+    ) -> Result<sentinel_hippocampus::ConsolidationResult> {
         let result = self
             .hippocampus
             .consolidate_agent(agent)
             .with_context(|| format!("Consolidation failed for agent: {agent}"))?;
 
-        Ok((
-            result.episodes_processed as u32,
-            result.episodes_consolidated as u32,
-        ))
+        Ok(result)
     }
 
     /// Ermittelt die Episode-Anzahl fuer einen Agent.
@@ -342,6 +482,7 @@ impl NightrunRunner {
         agents_failed: u32,
         agents_skipped: u32,
         total_episodes: u32,
+        total_episodes_consolidated: u32,
         duration_ms: u64,
         hash_chain_final: &str,
     ) -> Result<()> {
@@ -352,6 +493,7 @@ impl NightrunRunner {
             agents_failed,
             agents_skipped,
             total_episodes,
+            total_episodes_consolidated,
             duration_ms,
             hash_chain: Some(hash_chain_final.to_string()),
         };
