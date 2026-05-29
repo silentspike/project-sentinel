@@ -7,6 +7,18 @@ const FLOORPLAN_MODULE_URL = pathToFileURL(
   path.resolve(import.meta.dir, "../../public/js/floorplan.js"),
 ).href;
 
+// api-key.js wird (ohne Cache-Buster) als geteilte Modul-Instanz geladen — dieselbe,
+// die floorplan.js via relativem Import nutzt. Damit seedet setTestApiKey den Key
+// auf exakt der Instanz, aus der floorplan.js authHeaders/getApiKey liest.
+const API_KEY_MODULE_URL = pathToFileURL(
+  path.resolve(import.meta.dir, "../../public/js/api-key.js"),
+).href;
+
+async function setTestApiKey(value: string): Promise<void> {
+  const mod = await import(API_KEY_MODULE_URL);
+  mod.setApiKey(value);
+}
+
 class StorageMock {
   private values = new Map<string, string>();
 
@@ -186,7 +198,10 @@ const UPDATED_DETAIL = {
   ],
 };
 
-afterEach(() => {
+afterEach(async () => {
+  // In-Memory-Key persistiert ueber Tests (anders als der per-Test frische
+  // sessionStorage-Mock) — daher explizit zuruecksetzen.
+  await setTestApiKey("");
   delete (globalThis as Record<string, unknown>).window;
   delete (globalThis as Record<string, unknown>).document;
   delete (globalThis as Record<string, unknown>).Event;
@@ -249,8 +264,8 @@ describe("floorplan.js", () => {
   });
 
   it("submits the chaos trigger with auth and refreshes badge plus detail", async () => {
-    const { document, window, storage } = installDom();
-    storage.setItem("sentinel_api_key", "dash-key");
+    const { document, window } = installDom();
+    await setTestApiKey("dash-key");
 
     const requests: Array<{ url: string; method: string; headers: Headers; body: string }> = [];
     let detailReads = 0;
@@ -319,8 +334,8 @@ describe("floorplan.js", () => {
   });
 
   it("submits a room stimulus trigger and refreshes the detail drawer", async () => {
-    const { document, window, storage } = installDom();
-    storage.setItem("sentinel_api_key", "dash-key");
+    const { document, window } = installDom();
+    await setTestApiKey("dash-key");
 
     const requests: Array<{ url: string; method: string; headers: Headers; body: string }> = [];
     let detailReads = 0;

@@ -3,22 +3,14 @@
 // Hot-Swap-Restore via bestehende Operator-API.
 // KEIN innerHTML — ausschliesslich textContent + DOM-API.
 
+// API-Key: geteiltes In-Memory-Modul (siehe api-key.js), view-uebergreifend mit Control-Tab
+import { getApiKey, setApiKey, authHeaders } from './api-key.js';
+
 let snapshots = [];
 let selectedId = null;
 let loadError = false;
 
 const TIER_ORDER = ['live', 'hourly', 'daily', 'weekly', 'monthly'];
-
-// ── API-Key (geteilt mit Control-Tab via sessionStorage) ──
-
-function ttApiKey() {
-  return sessionStorage.getItem('sentinel_api_key') || '';
-}
-
-function ttAuthHeaders() {
-  const key = ttApiKey();
-  return key ? { 'Authorization': 'Bearer ' + key } : {};
-}
 
 // ── Helpers ──
 
@@ -353,7 +345,7 @@ async function triggerRestore(state, panel, btn) {
   try {
     const res = await fetch('/api/control/restore', {
       method: 'POST',
-      headers: Object.assign({ 'Content-Type': 'application/json' }, ttAuthHeaders()),
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
       body: JSON.stringify({ snapshot_id: state.snapshot_id }),
     });
     if (res.ok) {
@@ -398,9 +390,9 @@ function renderActionBar(container) {
   keyInput.id = 'tt-api-key-input';
   keyInput.className = 'control-input';
   keyInput.placeholder = 'API-Key (fuer Restore)';
-  keyInput.value = ttApiKey();
+  keyInput.value = getApiKey();
   keyInput.addEventListener('change', () => {
-    sessionStorage.setItem('sentinel_api_key', keyInput.value);
+    setApiKey(keyInput.value);
   });
   bar.appendChild(keyInput);
 
@@ -413,7 +405,7 @@ function renderActionBar(container) {
     try {
       await fetch('/api/control/snapshot', {
         method: 'POST',
-        headers: Object.assign({ 'Content-Type': 'application/json' }, ttAuthHeaders()),
+        headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
         body: '{}',
       });
       await refreshTimeTravel();
