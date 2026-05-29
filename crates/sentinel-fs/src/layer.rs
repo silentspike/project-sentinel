@@ -5,6 +5,9 @@
 //! Deletes place a whiteout marker in the agent layer that hides the base entry.
 //! Agent layers are created lazily on first write.
 
+use std::collections::HashSet;
+use std::sync::RwLock;
+
 use crate::cas::CasStore;
 use crate::metadata::{FileKind, InodeData, MetadataStore};
 use tracing::instrument;
@@ -37,12 +40,29 @@ fn whiteout_marker() -> InodeData {
 pub struct LayerManager {
     cas: CasStore,
     meta: MetadataStore,
+    known_agent_roots: RwLock<HashSet<String>>,
+}
+
+/// Live storage stats for the layer manager.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayerStorageStats {
+    pub cas_blob_count: u64,
+    pub cas_bytes_on_disk: u64,
+    pub regular_file_count: u64,
+    pub logical_regular_file_bytes: u64,
+    pub dedup_savings_bytes: u64,
+    pub dedup_ratio_percent: f64,
+    pub unreadable_inode_rows: u64,
 }
 
 impl LayerManager {
     /// Create a new layer manager.
     pub fn new(cas: CasStore, meta: MetadataStore) -> Self {
-        Self { cas, meta }
+        Self {
+            cas,
+            meta,
+            known_agent_roots: RwLock::new(HashSet::new()),
+        }
     }
 
     /// Access the CAS store.
@@ -53,6 +73,29 @@ impl LayerManager {
     /// Access the metadata store.
     pub fn meta(&self) -> &MetadataStore {
         &self.meta
+    }
+
+    /// Aggregate CAS and metadata counters for live dedup verification.
+    pub fn storage_stats(&self) -> anyhow::Result<LayerStorageStats> {
+        let cas_stats = self.cas.stats()?;
+        let metadata_stats = self.meta.storage_stats()?;
+        let dedup_savings_bytes = metadata_stats
+            .logical_regular_file_bytes
+            .saturating_sub(cas_stats.total_bytes_on_disk);
+        let dedup_ratio_percent = if metadata_stats.logical_regular_file_bytes == 0 {
+            0.0
+        } else {
+            (dedup_savings_bytes as f64 * 100.0) / metadata_stats.logical_regular_file_bytes as f64
+        };
+        Ok(LayerStorageStats {
+            cas_blob_count: cas_stats.blob_count,
+            cas_bytes_on_disk: cas_stats.total_bytes_on_disk,
+            regular_file_count: metadata_stats.regular_file_count,
+            logical_regular_file_bytes: metadata_stats.logical_regular_file_bytes,
+            dedup_savings_bytes,
+            dedup_ratio_percent,
+            unreadable_inode_rows: metadata_stats.unreadable_inode_rows,
+        })
     }
 
     // === BASE LAYER OPERATIONS (populating shared content) ===
@@ -101,10 +144,32 @@ impl LayerManager {
 
     /// Ensure agent root directory exists (lazy creation).
     pub fn ensure_agent_root(&self, agent_id: &str) -> anyhow::Result<()> {
+        if self.agent_root_known(agent_id)? {
+            return Ok(());
+        }
+
         if self.meta.get_inode(agent_id, 1)?.is_none() {
             let root = InodeData::directory(0o755);
             self.meta.set_inode(agent_id, 1, &root)?;
         }
+        self.mark_agent_root_known(agent_id)?;
+        Ok(())
+    }
+
+    fn agent_root_known(&self, agent_id: &str) -> anyhow::Result<bool> {
+        let roots = self
+            .known_agent_roots
+            .read()
+            .map_err(|err| anyhow::anyhow!("Agent-Root-Cache read failed: {err}"))?;
+        Ok(roots.contains(agent_id))
+    }
+
+    fn mark_agent_root_known(&self, agent_id: &str) -> anyhow::Result<()> {
+        let mut roots = self
+            .known_agent_roots
+            .write()
+            .map_err(|err| anyhow::anyhow!("Agent-Root-Cache write failed: {err}"))?;
+        roots.insert(agent_id.to_string());
         Ok(())
     }
 
@@ -166,13 +231,19 @@ impl LayerManager {
         content: &[u8],
         mode: u32,
     ) -> anyhow::Result<u64> {
-        self.ensure_agent_root(agent_id)?;
-
         let (hash, _deduped) = self.cas.store(content)?;
-        let inode = self.meta.next_inode(agent_id)?;
         let data = InodeData::regular(hash, content.len() as u64, mode);
-        self.meta
-            .create_file(agent_id, parent_inode, name, inode, &data)?;
+        let ensure_root = !self.agent_root_known(agent_id)?;
+        let inode = self.meta.create_file_allocating_inode(
+            agent_id,
+            parent_inode,
+            name,
+            &data,
+            ensure_root,
+        )?;
+        if ensure_root {
+            self.mark_agent_root_known(agent_id)?;
+        }
         Ok(inode)
     }
 
@@ -184,12 +255,18 @@ impl LayerManager {
         name: &str,
         mode: u32,
     ) -> anyhow::Result<u64> {
-        self.ensure_agent_root(agent_id)?;
-
-        let inode = self.meta.next_inode(agent_id)?;
         let data = InodeData::directory(mode);
-        self.meta
-            .create_file(agent_id, parent_inode, name, inode, &data)?;
+        let ensure_root = !self.agent_root_known(agent_id)?;
+        let inode = self.meta.create_file_allocating_inode(
+            agent_id,
+            parent_inode,
+            name,
+            &data,
+            ensure_root,
+        )?;
+        if ensure_root {
+            self.mark_agent_root_known(agent_id)?;
+        }
         Ok(inode)
     }
 
@@ -422,6 +499,31 @@ mod tests {
     }
 
     #[test]
+    fn write_file_allocates_sequential_inodes_in_single_metadata_path() {
+        let (lm, _dir) = temp_layer();
+
+        let first = lm
+            .write_file("AGENT-88", 1, "first.txt", b"same", 0o644)
+            .unwrap();
+        let second = lm
+            .write_file("AGENT-88", 1, "second.txt", b"same", 0o644)
+            .unwrap();
+
+        assert_eq!(first, 2);
+        assert_eq!(second, 3);
+        assert!(lm.meta().get_inode("AGENT-88", 1).unwrap().is_some());
+        assert_eq!(
+            lm.meta().get_dirent("AGENT-88", 1, "first.txt").unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            lm.meta().get_dirent("AGENT-88", 1, "second.txt").unwrap(),
+            Some(second)
+        );
+        assert_eq!(lm.meta().get_refcount(&CasStore::hash(b"same")).unwrap(), 2);
+    }
+
+    #[test]
     fn dedup_across_agents() {
         let (lm, _dir) = temp_layer();
         let content = b"identical content for all agents";
@@ -440,6 +542,26 @@ mod tests {
         // Refcount should be 3
         let hash = CasStore::hash(content);
         assert_eq!(lm.meta().get_refcount(&hash).unwrap(), 3);
+    }
+
+    #[test]
+    fn storage_stats_report_logical_bytes_and_dedup_savings() {
+        let (lm, _dir) = temp_layer();
+        let content = b"identical content for live stats";
+
+        lm.write_file("AGENT-01", 1, "same-1.txt", content, 0o644)
+            .unwrap();
+        lm.write_file("AGENT-02", 1, "same-2.txt", content, 0o644)
+            .unwrap();
+        lm.write_file("AGENT-03", 1, "same-3.txt", content, 0o644)
+            .unwrap();
+
+        let stats = lm.storage_stats().unwrap();
+        assert_eq!(stats.regular_file_count, 3);
+        assert_eq!(stats.logical_regular_file_bytes, (content.len() * 3) as u64);
+        assert_eq!(stats.cas_blob_count, 1);
+        assert!(stats.dedup_savings_bytes > 0);
+        assert!(stats.dedup_ratio_percent > 0.0);
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub mod config;
 pub mod controlplane;
 pub mod ebpf;
 pub mod episode_producer;
+pub mod evolution_task;
 pub mod fanout;
 pub mod llm_bridge;
 #[cfg(feature = "nats")]

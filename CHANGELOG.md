@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Moved Issue #278 nightrun/shift evolution LLM calls out of the ECS tick loop into an async background task, with VM evidence for fake-gateway success, gateway-down fail-safe behavior, and redb `EVOLUTION_VERSION` writes.
+- Added and optimized Issue #379 live sentinel-fs FUSE/CAS verification paths for storage stats and dedup-hit benchmarking; Deploy-VM evidence shows active FUSE agent homes, 99.22% dedup savings, and same-VM median dedup-hit write p95 improved from 40,411 us to 189 us, while the strict `<100us` target remains unmet on the i7-3930K VM.
 - Updated optional `sentinel-wasm` Wasmtime dependencies to 44.0.2 to clear current RustSec advisories.
 - Optimized Issue #277 dashboard WebSocket change detection from five per-view polling queries to one Projection-DB `projection_watermarks` lookup per poll cycle, with idle polling skipped when no WebSocket clients are connected; VM benchmark evidence is captured with `dashboard/scripts/measure-ws-polling.sh`.
 - Optimized Issue #276 ECS tick-loop hot paths: reusable room-physics and persist workspaces, perception buffer reuse, and batched Limbo event/outbox writes. Deploy-VM benchmarks on Intel i7-3930K show relative improvements of 26.86% physics, 26.34% perception, 52.57% persist e2e, 86.95% persist write-only, and 17.23% full tick.
