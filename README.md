@@ -299,7 +299,7 @@ caveat list.
 
 | Path                         | Contents                                                    |
 |------------------------------|-------------------------------------------------------------|
-| `crates/`                    | 15 Rust crates (ECS, bio, physics, sandbox, eBPF, …)        |
+| `crates/`                    | 17 Rust crates (ECS, bio, physics, sandbox, eBPF, etc.)     |
 | `services/sentinel-daemon/`  | Daemon + controlplane                                       |
 | `services/sentinel-judge/`   | Quality / drift monitor (Go)                                |
 | `services/sentinel-nightrun/`| Nightly consolidation (Rust)                                |
@@ -321,6 +321,7 @@ caveat list.
 | [docs/governance.md](docs/governance.md)                     | Governance mechanisms ↔ code path mapping     |
 | [docs/togaf-gap-v22.md](docs/togaf-gap-v22.md)               | Per-cluster implementation status             |
 | [docs/togaf-deviations-v22.md](docs/togaf-deviations-v22.md) | Intentional deviations from the spec          |
+| [docs/component-readmes.md](docs/component-readmes.md)        | Component-level README index for Rust/Go modules |
 | [docs/glossary.md](docs/glossary.md)                         | Agent-persona narrative + agent-layer glossary |
 | [docs/security-test-report.md](docs/security-test-report.md) | Sandbox breakout test results                 |
 | [docs/workshop-agent-runtime-governance.md](docs/workshop-agent-runtime-governance.md) | 45-min hands-on workshop: how to evaluate runtime governance for LLM coding agents |

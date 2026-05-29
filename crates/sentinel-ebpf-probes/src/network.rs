@@ -55,10 +55,14 @@ pub fn tcp_connect_probe(_ctx: FEntryContext) -> u32 {
 
 #[inline(always)]
 fn try_tcp_connect() -> Result<u32, u32> {
+    // SAFETY: this helper is called from a verified eBPF program context where
+    // `bpf_ktime_get_ns` is available and has no Rust-side memory preconditions.
     let ts = unsafe { bpf_ktime_get_ns() };
 
     if let Some(mut entry) = TCP_EVENTS.reserve::<TcpEvent>(0) {
         let event = entry.as_mut_ptr();
+        // SAFETY: `reserve::<TcpEvent>` returned a writable ring-buffer slot
+        // for exactly one `TcpEvent`, valid until `submit` or discard.
         unsafe {
             (*event).timestamp_ns = ts;
             (*event).event_type = 0; // connect
@@ -85,10 +89,14 @@ pub fn tcp_close_probe(_ctx: FEntryContext) -> u32 {
 
 #[inline(always)]
 fn try_tcp_close() -> Result<u32, u32> {
+    // SAFETY: this helper is called from a verified eBPF program context where
+    // `bpf_ktime_get_ns` is available and has no Rust-side memory preconditions.
     let ts = unsafe { bpf_ktime_get_ns() };
 
     if let Some(mut entry) = TCP_EVENTS.reserve::<TcpEvent>(0) {
         let event = entry.as_mut_ptr();
+        // SAFETY: `reserve::<TcpEvent>` returned a writable ring-buffer slot
+        // for exactly one `TcpEvent`, valid until `submit` or discard.
         unsafe {
             (*event).timestamp_ns = ts;
             (*event).event_type = 1; // close

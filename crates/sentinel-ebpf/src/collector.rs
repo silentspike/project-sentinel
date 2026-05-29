@@ -516,6 +516,9 @@ impl EbpfCollector {
                 let mut event_count = 0u64;
                 while let Some(data) = ring_buf.next() {
                     if data.len() >= core::mem::size_of::<BpfTcpEvent>() {
+                        // SAFETY: the ring-buffer sample is at least the size of
+                        // `BpfTcpEvent`; `read_unaligned` is used because kernel
+                        // ring-buffer bytes do not guarantee Rust struct alignment.
                         let event: BpfTcpEvent =
                             unsafe { core::ptr::read_unaligned(data.as_ptr() as *const _) };
                         if event.event_type == 1 {
@@ -893,6 +896,8 @@ struct BpfIoStats {
 }
 
 #[cfg(feature = "ebpf")]
+// SAFETY: `BpfIoStats` is `#[repr(C)]`, contains only integer fields, has no
+// references or drop glue, and matches the kernel-side eBPF map value layout.
 unsafe impl aya::Pod for BpfIoStats {}
 
 /// BPF TcpEvent struct matching the kernel-side definition in network.rs.
@@ -917,8 +922,11 @@ fn monotonic_clock_ns() -> u64 {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    // SAFETY: `ts` is a valid writable timespec pointer and CLOCK_MONOTONIC is
+    // a valid clock id on Linux. On failure, return a conservative zero value.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if rc != 0 {
+        return 0;
     }
     (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
 }
