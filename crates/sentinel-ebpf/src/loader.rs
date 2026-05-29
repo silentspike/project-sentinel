@@ -7,6 +7,8 @@ use std::path::Path;
 
 use tracing::{info, warn};
 
+const CAP_BPF_BIT: u64 = 39;
+
 /// Monitoring mode determined at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum MonitoringMode {
@@ -169,16 +171,15 @@ fn check_cap_bpf() -> bool {
         Err(_) => return false,
     };
 
-    for line in status.lines() {
-        if let Some(hex) = line.strip_prefix("CapEff:\t") {
-            if let Ok(caps) = u64::from_str_radix(hex.trim(), 16) {
-                // CAP_BPF = bit 39
-                return caps & (1u64 << 39) != 0;
-            }
-        }
-    }
+    cap_eff_has_cap_bpf(&status)
+}
 
-    false
+fn cap_eff_has_cap_bpf(status: &str) -> bool {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        .is_some_and(|caps| caps & (1u64 << CAP_BPF_BIT) != 0)
 }
 
 /// Reads the kernel version string from /proc/version.
@@ -368,6 +369,24 @@ mod tests {
         assert!(!check_fentry_support("5.4.0"));
         assert!(!check_fentry_support("4.19.0"));
         assert!(!check_fentry_support("unknown"));
+    }
+
+    #[test]
+    fn cap_eff_detects_cap_bpf_bit() {
+        let status = "Name:\tsentinel-daemon\nCapEff:\t0000008000000000\n";
+        assert!(cap_eff_has_cap_bpf(status));
+    }
+
+    #[test]
+    fn cap_eff_rejects_missing_cap_bpf_bit() {
+        let status = "Name:\tsentinel-daemon\nCapEff:\t0000000000000000\n";
+        assert!(!cap_eff_has_cap_bpf(status));
+    }
+
+    #[test]
+    fn cap_eff_rejects_malformed_or_missing_status() {
+        assert!(!cap_eff_has_cap_bpf("Name:\tsentinel-daemon\n"));
+        assert!(!cap_eff_has_cap_bpf("CapEff:\tnot-hex\n"));
     }
 
     #[test]
