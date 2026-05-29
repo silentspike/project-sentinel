@@ -47,6 +47,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | Pub/Sub (Zenoh, Rust)         | ✅ | `crates/sentinel-zenoh/`; SHM local <10µs |
 | Pub/Sub (NATS JetStream, Go)  | ✅ | `pkg/sentinel-go/messaging/`, two streams |
 | Sandbox (bwrap + Landlock + cgroups + netns) | ✅ | `crates/sentinel-sandbox/`; 9/9 breakout tests pass |
+| sentinel-fs CAS-FUSE (#379)  | 🟡 | Deploy-VM daemon namespace shows active `fuse sentinel-fs` at `/opt/sentinel/fs` and agent homes bound through `/opt/sentinel/fs/AGENT-*`; live dedup benchmark on Intel i7-3930K @ 3.20 GHz (2011) reached 99.22% dedup savings, but dedup-hit p95 write latency was 21,712 us, above the `<100us` target |
 | WASM tool runtime             | ✅ | `crates/sentinel-wasm/` |
 | eBPF monitoring (aya-rs)      | ✅ | `crates/sentinel-ebpf/` |
 
@@ -135,6 +136,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | WorldSnapshot (bincode 2)     | ✅ | `crates/sentinel-limbo/src/snapshot.rs` |
 | Hot-swap restore              | ✅ | `services/sentinel-daemon/src/runtime_health.rs` (snapshot reload path) |
 | Deterministic replay          | ✅ | `services/sentinel-nightrun/` |
+| Non-blocking evolution LLM (#278) | 🟡 | Async `evolution_task` moves nightrun/shift LLM calls out of the ECS tick loop; Deploy-VM nightrun returned in 0.669 ms and gateway-down shift jobs failed safe, but total shift transition measured ~1.455 s on the i7-3930K VM, above the strict `<1s` AC target due remaining Hippocampus/sandbox work |
 | Time-travel debugging UI      | ⏳ | dashboard hook designed, frontend deferred |
 
 ---
