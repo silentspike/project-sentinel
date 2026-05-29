@@ -166,8 +166,15 @@ Landlock, FUSE, eBPF, SQLite/Limbo integration.
 | P0 | Capability-based tool permissions plus server-side action validation | Compromised agent / prompt injection | #391 implemented for Gateway action extraction; memory provenance remains future work |
 | P1 | Unsafe audit with SAFETY justifications and CI threshold | Supply-chain and kernel-adjacent memory-safety regressions | #392 |
 | P1 | Formal verification for critical Event Store, snapshot, and bio invariants | State corruption that normal tests may miss | #393 |
-| P2 | Operator/dashboard auth hardening before broad exposure | External attacker control-plane abuse | Future issue when exposure model is finalized |
+| P2 | Operator/dashboard auth hardening before broad exposure | External attacker control-plane abuse | #402 implemented: server-side session store + httpOnly+SameSite=Strict cookie (operator key no longer JS-readable). Residual: see Accepted Residual Risks |
 | P2 | Release provenance and artifact integrity policy | Supply-chain substitution | Future issue before public release hardening |
+
+## Accepted Residual Risks
+
+| Risk | Attacker class | Why accepted (current) | Direktive / Revisit |
+| --- | --- | --- | --- |
+| Operator key (login POST body) and session cookie transit in cleartext over HTTP on the deploy VM (`:8000`, LAN) → LAN-MITM sniffing | External Attacker (network) | **No regression** — the previous Bearer-header scheme transited over the same HTTP. The deploy VM is a loopback/LAN single-operator setup. Same-origin + `SameSite=Strict` block cross-site CSRF; `textContent`-only frontend minimizes XSS. | Production exposure MUST sit behind an HTTPS-terminating proxy; then set `DASHBOARD_COOKIE_SECURE=on` (or `auto` detects HTTPS via `X-Forwarded-Proto`) so the cookie carries the `Secure` flag. Revisit when the public exposure model is finalized. |
+| Dashboard WebSocket (`/ws`, `ws.ts`) is intentionally unauthenticated | External Attacker (network) | **By design, no regression.** The WS pushes read-only telemetry only — it performs **no** state changes. All control actions (pause/resume/provider/restore/chaos/stimulus/snapshot) go through `/api/control/*` with `requireAuth` (session cookie). Reading telemetry is not a control-plane capability. | Add WS auth only if telemetry is later classified sensitive or if write-paths are ever added to the socket. |
 
 ## Operating Rule
 
