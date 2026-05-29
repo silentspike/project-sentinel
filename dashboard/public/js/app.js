@@ -7,6 +7,7 @@ import { renderCockpit, updateCockpit } from './cockpit.js';
 import { renderChaos, updateChaos } from './chaos.js';
 import { renderChat, initChat } from './chat.js';
 import { initControl } from './control.js';
+import { initTimeTravel, refreshTimeTravel } from './timetravel.js';
 
 let ws = null;
 
@@ -20,9 +21,13 @@ function initNavigation() {
       btn.classList.add('active');
 
       document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-      const viewId = 'view-' + btn.getAttribute('data-view');
+      const viewName = btn.getAttribute('data-view');
+      const viewId = 'view-' + viewName;
       const view = document.getElementById(viewId);
       if (view) view.classList.add('active');
+
+      // Zeitreise-View bei Aktivierung mit frischer Snapshot-Liste laden
+      if (viewName === 'timetravel') refreshTimeTravel();
     });
   });
 }
@@ -32,6 +37,27 @@ function updateLagDisplay(lag) {
   if (!lagEl) return;
   lagEl.textContent = 'Lag: ' + lag;
   lagEl.className = lag > 100 ? 'lag-high' : lag > 10 ? 'lag-medium' : 'lag-ok';
+}
+
+// Nach Snapshot-Restore: World-State wurde ersetzt — Agents/Raeume aus REST
+// neu laden (Projection ist nach resetWatermarks frisch) und abhaengige Views
+// aktualisieren. (AC-4, #384)
+async function reloadAfterRestore() {
+  try {
+    const [agentsRes, roomsRes] = await Promise.all([
+      fetch('/api/agents'),
+      fetch('/api/rooms'),
+    ]);
+    if (agentsRes.ok) renderAgents(await agentsRes.json());
+    if (roomsRes.ok) {
+      renderFloorplan(await roomsRes.json());
+      refreshActiveRoomDetail();
+    }
+  } catch { /* ignore — naechster WS-Poll holt nach */ }
+  updateCockpit();
+  updateChaos();
+  updateActivity();
+  refreshTimeTravel();
 }
 
 function connectWebSocket() {
@@ -63,12 +89,8 @@ function connectWebSocket() {
       } else if (data.type === 'activity_update') {
         updateActivity();
       } else if (data.type === 'snapshot_restored') {
-        // Restore hat World-State ersetzt — alles neu laden
-        loadAgents();
-        loadRooms();
-        updateCockpit();
-        updateChaos();
-        updateActivity();
+        // Restore hat World-State ersetzt — Views aus REST neu laden (AC-4, #384)
+        reloadAfterRestore();
       }
     } catch { /* ignore parse errors */ }
   };
@@ -116,6 +138,9 @@ async function init() {
 
     // Control Panel async laden
     initControl();
+
+    // Zeitreise-View async laden
+    initTimeTravel();
 
     // Initiales Lag laden
     try {

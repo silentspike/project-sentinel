@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Added Issue #390 security threat model at `docs/security/threat-model.md`, covering compromised-agent, external-attacker, and supply-chain attacker classes with asset inventory and prioritized follow-up gaps.
 - Recorded Issue #396 Cluster 12 runtime-contract decision as DEV-006 in the Deviation Register: WASM/WASI on Wasmtime is the default Nano-Container contract, while native code is limited to an explicit Escape-Hatch-Pool.
+- Implemented Issue #384 Time-Travel Debugging UI (TOGAF Cluster 11): new dashboard "Zeitreise" view with a visual snapshot timeline (tier badge, timestamp, tick, size), point-in-time world-state preview (active agents from `tick_snapshot`, present agents and per-room occupancy derived from EventStore lifecycle replay up to the snapshot boundary via new `GET /api/control/snapshot-state`), and a hot-swap Restore flow with confirmation dialog. Fixed the broken `snapshot_restored` WebSocket handler (`loadAgents`/`loadRooms` ReferenceError) so the dashboard live-refreshes after a restore. Verified end to end on the Deploy-VM with Playwright (all five ACs).
 - Added `ebpf-mode-smoke` for focused kernel-mode/userspace-fallback runtime checks and committed Issue #380 dashboard screenshot evidence at `docs/screenshots/issue380-dashboard-ebpf.png`.
 - Added dashboard exposure for Issue #276 benchmark evidence at `/api/metrics/benchmarks`, including hardware scope, relative-only comparison notes, and system-metric log labels.
 
