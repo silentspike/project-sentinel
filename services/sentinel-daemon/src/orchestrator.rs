@@ -28,11 +28,13 @@ use sentinel_ecs::{
     apply_personality, create_simulation_world, despawn_agent_from_world, spawn_agent,
     ActionReceiver, LimboEventStore, PerceptionSender, SimulationTime,
 };
+use sentinel_hippocampus::{NMDA_CONSOLIDATION_THRESHOLD, NMDA_MAX_CONSOLIDATION_EPISODES};
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
 use sentinel_runtime::RuntimeOrchestrator;
 use sentinel_sandbox::{CgroupLimits, SandboxEnforcer, SandboxHandle, SandboxWarning};
 use sentinel_zenoh::SentinelBus;
+use sha2::{Digest, Sha256};
 
 use crate::adaptive_tick::AdaptiveTickRate;
 use crate::config::DaemonConfig;
@@ -66,6 +68,107 @@ fn shift_hours(shift_set: u8) -> (u8, u8) {
 /// CPU: 1 core, Memory: 256MB, IO: 300 IOPS + 10MB/s.
 fn default_agent_limits() -> CgroupLimits {
     CgroupLimits::default()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NmdaScoreStats {
+    min: Option<f64>,
+    avg: Option<f64>,
+    max: Option<f64>,
+}
+
+#[derive(Debug)]
+struct NightrunHashChain {
+    current: [u8; 32],
+}
+
+impl NightrunHashChain {
+    fn new(seed: &str, run_id: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(run_id.as_bytes());
+        hasher.update(b":");
+        hasher.update(seed.as_bytes());
+        Self {
+            current: hasher.finalize().into(),
+        }
+    }
+
+    fn extend(&mut self, event: &DomainEvent) {
+        let mut hasher = Sha256::new();
+        hasher.update(self.current);
+        hasher.update(event.event_id.as_bytes());
+        hasher.update(event.payload.as_bytes());
+        hasher.update(event.tick.to_le_bytes());
+        self.current = hasher.finalize().into();
+    }
+
+    fn current_hash(&self) -> String {
+        hex_encode(&self.current)
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn nmda_selection_rate(episodes_processed: u32, episodes_consolidated: u32) -> f64 {
+    if episodes_processed == 0 {
+        0.0
+    } else {
+        episodes_consolidated as f64 / episodes_processed as f64
+    }
+}
+
+fn nmda_consolidated_scores(result: &sentinel_hippocampus::ConsolidationResult) -> Vec<f64> {
+    result
+        .consolidated_summaries
+        .iter()
+        .map(|(_summary, score)| *score)
+        .collect()
+}
+
+fn nmda_score_stats(scores: &[f64]) -> NmdaScoreStats {
+    let min = scores.iter().copied().reduce(f64::min);
+    let max = scores.iter().copied().reduce(f64::max);
+    let avg = if scores.is_empty() {
+        None
+    } else {
+        Some(scores.iter().sum::<f64>() / scores.len() as f64)
+    };
+
+    NmdaScoreStats { min, avg, max }
+}
+
+fn nightrun_run_id(prefix: &str, tick_count: u64, from_shift: u8, to_shift: u8) -> String {
+    format!("{prefix}-tick-{tick_count}-shift-{from_shift}-to-{to_shift}")
+}
+
+fn append_nightrun_event(
+    event_store: &EventStore,
+    payload: DomainEventPayload,
+    aggregate_id: &str,
+    run_id: &str,
+    tick_count: u64,
+    hash_chain: Option<&mut NightrunHashChain>,
+) -> Result<DomainEvent> {
+    let event = DomainEvent::new(
+        payload.event_type_str(),
+        aggregate_id,
+        &payload.to_json(),
+        run_id,
+        tick_count,
+    );
+    event_store.append_with_outbox(&event, "nightrun")?;
+    if let Some(chain) = hash_chain {
+        chain.extend(&event);
+    }
+    Ok(event)
 }
 
 fn record_security_runtime_snapshot(
@@ -3111,103 +3214,192 @@ fn ecs_tick_loop(
                 let redb_store = world
                     .get_resource::<sentinel_ecs::RedbStateStore>()
                     .map(|r| r.store.clone());
+                let nightrun_event_store = world
+                    .get_resource::<sentinel_ecs::LimboEventStore>()
+                    .map(|es| Arc::clone(&es.0));
+                let shift_run_id = nightrun_run_id("shift", tick_count, current_shift, new_shift);
+                let shift_started = Instant::now();
+                let mut shift_hash_chain = NightrunHashChain::new(&shift_run_id, &shift_run_id);
+                let mut shift_event_emission_enabled = false;
+                if let Some(ref event_store) = nightrun_event_store {
+                    let payload = DomainEventPayload::NightRunStarted {
+                        run_id: shift_run_id.clone(),
+                        trigger_shift_set: current_shift,
+                        agents_queued: removed.len() as u32,
+                    };
+                    match append_nightrun_event(
+                        event_store,
+                        payload,
+                        "nightrun",
+                        &shift_run_id,
+                        tick_count,
+                        Some(&mut shift_hash_chain),
+                    ) {
+                        Ok(_) => {
+                            shift_event_emission_enabled = true;
+                        }
+                        Err(e) => {
+                            warn!(
+                                run_id = %shift_run_id,
+                                error = %e,
+                                "Schichtwechsel-Nightrun-Start-Event fehlgeschlagen"
+                            );
+                        }
+                    }
+                }
+                let mut shift_episodes_processed = 0u32;
+                let mut shift_episodes_consolidated = 0u32;
+                let mut shift_agents_consolidated = 0u32;
+                let mut shift_agents_failed = 0u32;
+                let mut shift_nmda_scores: Vec<f64> = Vec::new();
                 for agent_id in &removed {
                     let agent_name = all_agents
                         .iter()
                         .find(|a| AgentId(a.identity.id) == *agent_id)
                         .map(|a| a.identity.name.as_str());
                     if let Some(name) = agent_name {
+                        let agent_started = Instant::now();
                         match episode_producer.hippocampus().consolidate_agent(name) {
                             Ok(result) => {
-                                if result.episodes_processed > 0 {
+                                let episodes_processed = result.episodes_processed as u32;
+                                let episodes_consolidated = result.episodes_consolidated as u32;
+                                if episodes_processed > 0 {
+                                    let nmda_scores = nmda_consolidated_scores(&result);
+                                    let agent_stats = nmda_score_stats(&result.episode_scores);
+                                    shift_episodes_processed += episodes_processed;
+                                    shift_episodes_consolidated += episodes_consolidated;
+                                    shift_agents_consolidated += 1;
+                                    shift_nmda_scores.extend(result.episode_scores.iter().copied());
+
                                     info!(
                                         agent = name,
-                                        episodes_processed = result.episodes_processed,
-                                        episodes_consolidated = result.episodes_consolidated,
-                                        "Schichtwechsel-Konsolidierung abgeschlossen"
+                                        episodes_processed,
+                                        episodes_consolidated,
+                                        selection_rate = format!(
+                                            "{:.3}",
+                                            nmda_selection_rate(
+                                                episodes_processed,
+                                                episodes_consolidated
+                                            )
+                                        ),
+                                        nmda_threshold = NMDA_CONSOLIDATION_THRESHOLD,
+                                        nmda_score_min = ?agent_stats.min,
+                                        nmda_score_avg = ?agent_stats.avg,
+                                        nmda_score_max = ?agent_stats.max,
+                                        "Schichtwechsel-NMDA-Agent-Selektion"
                                     );
 
-                                    let narrative: String = result
-                                        .consolidated_summaries
-                                        .iter()
-                                        .map(|(s, _score)| s.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join("; ");
-
-                                    let agent_role = all_agents
-                                        .iter()
-                                        .find(|a| AgentId(a.identity.id) == *agent_id)
-                                        .map(|a| a.identity.role.as_str())
-                                        .unwrap_or("Mitarbeiter");
-                                    let queued = queue_evolution_job(
-                                        &evolution_job_tx,
-                                        EvolutionJob {
-                                            agent_id: *agent_id,
-                                            agent_name: name.to_string(),
-                                            agent_role: agent_role.to_string(),
-                                            narrative: narrative.clone(),
-                                            source: EvolutionSource::ShiftTransition,
-                                        },
-                                    );
-                                    if !queued {
-                                        write_evolution_narrative_only(
-                                            &state_store_for_sim,
-                                            *agent_id,
-                                            name,
-                                            EvolutionSource::ShiftTransition,
-                                            &narrative,
-                                        );
-                                    }
-
-                                    if let Some(ref store) = redb_store {
-                                        // NMDA scores nach redb schreiben
-                                        let scores: Vec<f64> = result
-                                            .consolidated_summaries
-                                            .iter()
-                                            .map(|(_s, score)| *score)
-                                            .collect();
-                                        if !scores.is_empty() {
-                                            let avg_score: f64 =
-                                                scores.iter().sum::<f64>() / scores.len() as f64;
-                                            match store.set_nmda_scores(*agent_id, &scores) {
-                                                Ok(()) => {
-                                                    info!(
-                                                        agent = name,
-                                                        nmda_count = scores.len(),
-                                                        nmda_avg = format!("{avg_score:.4}"),
-                                                        "NMDA scores nach redb geschrieben"
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    warn!(
-                                                        agent = name,
-                                                        error = %e,
-                                                        "NMDA scores redb-Write fehlgeschlagen"
-                                                    );
-                                                }
+                                    if shift_event_emission_enabled {
+                                        if let Some(ref event_store) = nightrun_event_store {
+                                            let payload = DomainEventPayload::AgentConsolidated {
+                                                run_id: shift_run_id.clone(),
+                                                agent_name: name.to_string(),
+                                                episodes_processed,
+                                                episodes_consolidated,
+                                                duration_ms: agent_started.elapsed().as_millis()
+                                                    as u64,
+                                            };
+                                            let aggregate_id = format!("AGENT-{:02}", agent_id.0);
+                                            if let Err(e) = append_nightrun_event(
+                                                event_store,
+                                                payload,
+                                                &aggregate_id,
+                                                &shift_run_id,
+                                                tick_count,
+                                                Some(&mut shift_hash_chain),
+                                            ) {
+                                                shift_event_emission_enabled = false;
+                                                warn!(
+                                                    run_id = %shift_run_id,
+                                                    agent = name,
+                                                    error = %e,
+                                                    "Schichtwechsel-AgentConsolidated-Event fehlgeschlagen"
+                                                );
                                             }
                                         }
+                                    }
 
-                                        // Facts aus Hippocampus FactRetriever nach state.redb bridgen
-                                        let facts =
-                                            episode_producer.hippocampus().retrieve_facts(name);
-                                        if !facts.is_empty() {
-                                            let facts_json =
-                                                serde_json::to_vec(&facts).unwrap_or_default();
-                                            match store.set_agent_facts(*agent_id, &facts_json) {
-                                                Ok(()) => {
-                                                    info!(
-                                                        agent = name,
-                                                        facts_count = facts.len(),
-                                                        "AGENT_FACTS nach state.redb geschrieben"
-                                                    );
+                                    if episodes_consolidated > 0 {
+                                        let narrative: String = result
+                                            .consolidated_summaries
+                                            .iter()
+                                            .map(|(s, _score)| s.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join("; ");
+
+                                        let agent_role = all_agents
+                                            .iter()
+                                            .find(|a| AgentId(a.identity.id) == *agent_id)
+                                            .map(|a| a.identity.role.as_str())
+                                            .unwrap_or("Mitarbeiter");
+                                        let queued = queue_evolution_job(
+                                            &evolution_job_tx,
+                                            EvolutionJob {
+                                                agent_id: *agent_id,
+                                                agent_name: name.to_string(),
+                                                agent_role: agent_role.to_string(),
+                                                narrative: narrative.clone(),
+                                                source: EvolutionSource::ShiftTransition,
+                                            },
+                                        );
+                                        if !queued {
+                                            write_evolution_narrative_only(
+                                                &state_store_for_sim,
+                                                *agent_id,
+                                                name,
+                                                EvolutionSource::ShiftTransition,
+                                                &narrative,
+                                            );
+                                        }
+
+                                        if let Some(ref store) = redb_store {
+                                            // NMDA scores nach redb schreiben
+                                            if !nmda_scores.is_empty() {
+                                                let avg_score: f64 =
+                                                    nmda_scores.iter().sum::<f64>()
+                                                        / nmda_scores.len() as f64;
+                                                match store.set_nmda_scores(*agent_id, &nmda_scores)
+                                                {
+                                                    Ok(()) => {
+                                                        info!(
+                                                            agent = name,
+                                                            nmda_count = nmda_scores.len(),
+                                                            nmda_avg = format!("{avg_score:.4}"),
+                                                            "NMDA scores nach redb geschrieben"
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            agent = name,
+                                                            error = %e,
+                                                            "NMDA scores redb-Write fehlgeschlagen"
+                                                        );
+                                                    }
                                                 }
-                                                Err(e) => {
-                                                    warn!(
-                                                        agent = name,
-                                                        error = %e,
-                                                        "AGENT_FACTS redb-Write fehlgeschlagen"
-                                                    );
+                                            }
+
+                                            // Facts aus Hippocampus FactRetriever nach state.redb bridgen
+                                            let facts =
+                                                episode_producer.hippocampus().retrieve_facts(name);
+                                            if !facts.is_empty() {
+                                                let facts_json =
+                                                    serde_json::to_vec(&facts).unwrap_or_default();
+                                                match store.set_agent_facts(*agent_id, &facts_json)
+                                                {
+                                                    Ok(()) => {
+                                                        info!(
+                                                            agent = name,
+                                                            facts_count = facts.len(),
+                                                            "AGENT_FACTS nach state.redb geschrieben"
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            agent = name,
+                                                            error = %e,
+                                                            "AGENT_FACTS redb-Write fehlgeschlagen"
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -3215,8 +3407,101 @@ fn ecs_tick_loop(
                                 }
                             }
                             Err(e) => {
+                                shift_agents_failed += 1;
+                                if shift_event_emission_enabled {
+                                    if let Some(ref event_store) = nightrun_event_store {
+                                        let payload =
+                                            DomainEventPayload::AgentConsolidationFailed {
+                                                run_id: shift_run_id.clone(),
+                                                agent_name: name.to_string(),
+                                                error: e.to_string(),
+                                            };
+                                        let aggregate_id = format!("AGENT-{:02}", agent_id.0);
+                                        if let Err(event_err) = append_nightrun_event(
+                                            event_store,
+                                            payload,
+                                            &aggregate_id,
+                                            &shift_run_id,
+                                            tick_count,
+                                            Some(&mut shift_hash_chain),
+                                        ) {
+                                            shift_event_emission_enabled = false;
+                                            warn!(
+                                                run_id = %shift_run_id,
+                                                agent = name,
+                                                error = %event_err,
+                                                "Schichtwechsel-AgentConsolidationFailed-Event fehlgeschlagen"
+                                            );
+                                        }
+                                    }
+                                }
                                 warn!(agent = name, error = %e, "Schichtwechsel-Konsolidierung fehlgeschlagen");
                             }
+                        }
+                    }
+                }
+                let shift_stats = nmda_score_stats(&shift_nmda_scores);
+                if shift_episodes_processed > 0 {
+                    info!(
+                        old_shift = current_shift,
+                        new_shift,
+                        agents_removed = removed.len(),
+                        episodes_processed = shift_episodes_processed,
+                        episodes_consolidated = shift_episodes_consolidated,
+                        selection_rate = format!(
+                            "{:.3}",
+                            nmda_selection_rate(
+                                shift_episodes_processed,
+                                shift_episodes_consolidated
+                            )
+                        ),
+                        nmda_threshold = NMDA_CONSOLIDATION_THRESHOLD,
+                        nmda_max_consolidation_episodes = NMDA_MAX_CONSOLIDATION_EPISODES,
+                        nmda_score_min = ?shift_stats.min,
+                        nmda_score_avg = ?shift_stats.avg,
+                        nmda_score_max = ?shift_stats.max,
+                        "Schichtwechsel-NMDA-Selektion abgeschlossen"
+                    );
+                }
+                if shift_event_emission_enabled {
+                    if let Some(ref event_store) = nightrun_event_store {
+                        let hash_chain_final = shift_hash_chain.current_hash();
+                        let payload = DomainEventPayload::NightRunCompleted {
+                            run_id: shift_run_id.clone(),
+                            trigger_shift_set: current_shift,
+                            agents_consolidated: shift_agents_consolidated,
+                            agents_failed: shift_agents_failed,
+                            agents_skipped: 0,
+                            total_episodes: shift_episodes_processed,
+                            total_episodes_consolidated: shift_episodes_consolidated,
+                            nmda_selection_rate: Some(nmda_selection_rate(
+                                shift_episodes_processed,
+                                shift_episodes_consolidated,
+                            )),
+                            nmda_threshold: Some(NMDA_CONSOLIDATION_THRESHOLD),
+                            nmda_max_consolidation_episodes: Some(
+                                NMDA_MAX_CONSOLIDATION_EPISODES as u32,
+                            ),
+                            nmda_score_min: shift_stats.min,
+                            nmda_score_avg: shift_stats.avg,
+                            nmda_score_max: shift_stats.max,
+                            duration_ms: shift_started.elapsed().as_millis() as u64,
+                            hash_chain: Some(hash_chain_final.clone()),
+                        };
+                        if let Err(e) = append_nightrun_event(
+                            event_store,
+                            payload,
+                            "nightrun",
+                            &shift_run_id,
+                            tick_count,
+                            None,
+                        ) {
+                            warn!(
+                                run_id = %shift_run_id,
+                                hash_chain = %hash_chain_final,
+                                error = %e,
+                                "Schichtwechsel-Nightrun-Completed-Event fehlgeschlagen"
+                            );
                         }
                     }
                 }
@@ -3361,7 +3646,49 @@ fn ecs_tick_loop(
                     nightrun_cmd.shift_set.is_none_or(|s| set == s)
                 })
                 .collect();
-            let mut consolidated_total = 0u32;
+            let trigger_shift_set = nightrun_cmd.shift_set.unwrap_or(current_shift);
+            let operator_run_id =
+                nightrun_run_id("operator", tick_count, current_shift, trigger_shift_set);
+            let operator_started = Instant::now();
+            let operator_event_store = world
+                .get_resource::<sentinel_ecs::LimboEventStore>()
+                .map(|es| Arc::clone(&es.0));
+            let mut operator_hash_chain =
+                NightrunHashChain::new(&operator_run_id, &operator_run_id);
+            let mut operator_event_emission_enabled = false;
+            if !nightrun_cmd.dry_run {
+                if let Some(ref event_store) = operator_event_store {
+                    let payload = DomainEventPayload::NightRunStarted {
+                        run_id: operator_run_id.clone(),
+                        trigger_shift_set,
+                        agents_queued: target_agents.len() as u32,
+                    };
+                    match append_nightrun_event(
+                        event_store,
+                        payload,
+                        "nightrun",
+                        &operator_run_id,
+                        tick_count,
+                        Some(&mut operator_hash_chain),
+                    ) {
+                        Ok(_) => {
+                            operator_event_emission_enabled = true;
+                        }
+                        Err(e) => {
+                            warn!(
+                                run_id = %operator_run_id,
+                                error = %e,
+                                "Operator-Nightrun-Start-Event fehlgeschlagen"
+                            );
+                        }
+                    }
+                }
+            }
+            let mut episodes_processed_total = 0u32;
+            let mut episodes_consolidated_total = 0u32;
+            let mut agents_consolidated_total = 0u32;
+            let mut agents_failed_total = 0u32;
+            let mut operator_nmda_scores: Vec<f64> = Vec::new();
             let mut evolution_jobs_queued = 0u32;
             let mut evolution_entries: Vec<(String, u32)> = Vec::new();
             for agent_cfg in &target_agents {
@@ -3370,46 +3697,121 @@ fn ecs_tick_loop(
                     info!(agent = %name, "Nightrun dry-run: wuerde konsolidieren");
                     continue;
                 }
+                let agent_started = Instant::now();
                 match episode_producer.hippocampus().consolidate_agent(name) {
                     Ok(result) if result.episodes_processed > 0 => {
-                        consolidated_total += result.episodes_processed as u32;
-                        evolution_entries
-                            .push((name.to_string(), result.episodes_processed as u32));
-                        let narrative = result
-                            .consolidated_summaries
-                            .iter()
-                            .map(|(summary, _score)| summary.as_str())
-                            .collect::<Vec<_>>()
-                            .join("; ");
-                        let queued = queue_evolution_job(
-                            &evolution_job_tx,
-                            EvolutionJob {
-                                agent_id: AgentId(agent_cfg.identity.id),
-                                agent_name: name.to_string(),
-                                agent_role: agent_cfg.identity.role.clone(),
-                                narrative: narrative.clone(),
-                                source: EvolutionSource::Nightrun,
-                            },
-                        );
-                        if queued {
-                            evolution_jobs_queued += 1;
-                        } else {
-                            write_evolution_narrative_only(
-                                &state_store_for_sim,
-                                AgentId(agent_cfg.identity.id),
-                                name,
-                                EvolutionSource::Nightrun,
-                                &narrative,
-                            );
-                        }
+                        let episodes_processed = result.episodes_processed as u32;
+                        let episodes_consolidated = result.episodes_consolidated as u32;
+                        let agent_stats = nmda_score_stats(&result.episode_scores);
+                        episodes_processed_total += episodes_processed;
+                        episodes_consolidated_total += episodes_consolidated;
+                        agents_consolidated_total += 1;
+                        operator_nmda_scores.extend(result.episode_scores.iter().copied());
+
                         info!(
                             agent = %name,
-                            episodes = result.episodes_processed,
-                            "Nightrun: Agent konsolidiert"
+                            episodes_processed,
+                            episodes_consolidated,
+                            selection_rate = format!(
+                                "{:.3}",
+                                nmda_selection_rate(episodes_processed, episodes_consolidated)
+                            ),
+                            nmda_threshold = NMDA_CONSOLIDATION_THRESHOLD,
+                            nmda_score_min = ?agent_stats.min,
+                            nmda_score_avg = ?agent_stats.avg,
+                            nmda_score_max = ?agent_stats.max,
+                            "Nightrun-NMDA-Agent-Selektion"
                         );
+
+                        if operator_event_emission_enabled {
+                            if let Some(ref event_store) = operator_event_store {
+                                let payload = DomainEventPayload::AgentConsolidated {
+                                    run_id: operator_run_id.clone(),
+                                    agent_name: name.to_string(),
+                                    episodes_processed,
+                                    episodes_consolidated,
+                                    duration_ms: agent_started.elapsed().as_millis() as u64,
+                                };
+                                let aggregate_id = format!("AGENT-{:02}", agent_cfg.identity.id);
+                                if let Err(e) = append_nightrun_event(
+                                    event_store,
+                                    payload,
+                                    &aggregate_id,
+                                    &operator_run_id,
+                                    tick_count,
+                                    Some(&mut operator_hash_chain),
+                                ) {
+                                    operator_event_emission_enabled = false;
+                                    warn!(
+                                        run_id = %operator_run_id,
+                                        agent = %name,
+                                        error = %e,
+                                        "Operator-AgentConsolidated-Event fehlgeschlagen"
+                                    );
+                                }
+                            }
+                        }
+
+                        if episodes_consolidated > 0 {
+                            evolution_entries.push((name.to_string(), episodes_consolidated));
+                            let narrative = result
+                                .consolidated_summaries
+                                .iter()
+                                .map(|(summary, _score)| summary.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            let queued = queue_evolution_job(
+                                &evolution_job_tx,
+                                EvolutionJob {
+                                    agent_id: AgentId(agent_cfg.identity.id),
+                                    agent_name: name.to_string(),
+                                    agent_role: agent_cfg.identity.role.clone(),
+                                    narrative: narrative.clone(),
+                                    source: EvolutionSource::Nightrun,
+                                },
+                            );
+                            if queued {
+                                evolution_jobs_queued += 1;
+                            } else {
+                                write_evolution_narrative_only(
+                                    &state_store_for_sim,
+                                    AgentId(agent_cfg.identity.id),
+                                    name,
+                                    EvolutionSource::Nightrun,
+                                    &narrative,
+                                );
+                            }
+                        }
                     }
                     Ok(_) => {} // Keine Episodes = nichts zu tun
                     Err(e) => {
+                        agents_failed_total += 1;
+                        if operator_event_emission_enabled {
+                            if let Some(ref event_store) = operator_event_store {
+                                let payload = DomainEventPayload::AgentConsolidationFailed {
+                                    run_id: operator_run_id.clone(),
+                                    agent_name: name.to_string(),
+                                    error: e.to_string(),
+                                };
+                                let aggregate_id = format!("AGENT-{:02}", agent_cfg.identity.id);
+                                if let Err(event_err) = append_nightrun_event(
+                                    event_store,
+                                    payload,
+                                    &aggregate_id,
+                                    &operator_run_id,
+                                    tick_count,
+                                    Some(&mut operator_hash_chain),
+                                ) {
+                                    operator_event_emission_enabled = false;
+                                    warn!(
+                                        run_id = %operator_run_id,
+                                        agent = %name,
+                                        error = %event_err,
+                                        "Operator-AgentConsolidationFailed-Event fehlgeschlagen"
+                                    );
+                                }
+                            }
+                        }
                         warn!(agent = %name, error = %e, "Nightrun-Konsolidierung fehlgeschlagen");
                     }
                 }
@@ -3444,7 +3846,7 @@ fn ecs_tick_loop(
                                     "night_run",
                                     "",
                                     format!("{episodes} episodes consolidated"),
-                                    format!("Nightrun-Konsolidierung: {episodes} Episoden verarbeitet"),
+                                    format!("Nightrun-Konsolidierung: {episodes} Episoden konsolidiert"),
                                     0.0_f64,
                                     "night_run",
                                     now_ms,
@@ -3465,13 +3867,66 @@ fn ecs_tick_loop(
                 }
             }
 
+            let operator_stats = nmda_score_stats(&operator_nmda_scores);
             info!(
                 agents = target_agents.len(),
-                consolidated = consolidated_total,
+                episodes_processed = episodes_processed_total,
+                episodes_consolidated = episodes_consolidated_total,
+                selection_rate = format!(
+                    "{:.3}",
+                    nmda_selection_rate(episodes_processed_total, episodes_consolidated_total)
+                ),
+                nmda_threshold = NMDA_CONSOLIDATION_THRESHOLD,
+                nmda_max_consolidation_episodes = NMDA_MAX_CONSOLIDATION_EPISODES,
+                nmda_score_min = ?operator_stats.min,
+                nmda_score_avg = ?operator_stats.avg,
+                nmda_score_max = ?operator_stats.max,
                 evolution_jobs_queued,
                 dry_run = nightrun_cmd.dry_run,
                 "Nightrun abgeschlossen"
             );
+            if operator_event_emission_enabled {
+                if let Some(ref event_store) = operator_event_store {
+                    let hash_chain_final = operator_hash_chain.current_hash();
+                    let payload = DomainEventPayload::NightRunCompleted {
+                        run_id: operator_run_id.clone(),
+                        trigger_shift_set,
+                        agents_consolidated: agents_consolidated_total,
+                        agents_failed: agents_failed_total,
+                        agents_skipped: 0,
+                        total_episodes: episodes_processed_total,
+                        total_episodes_consolidated: episodes_consolidated_total,
+                        nmda_selection_rate: Some(nmda_selection_rate(
+                            episodes_processed_total,
+                            episodes_consolidated_total,
+                        )),
+                        nmda_threshold: Some(NMDA_CONSOLIDATION_THRESHOLD),
+                        nmda_max_consolidation_episodes: Some(
+                            NMDA_MAX_CONSOLIDATION_EPISODES as u32,
+                        ),
+                        nmda_score_min: operator_stats.min,
+                        nmda_score_avg: operator_stats.avg,
+                        nmda_score_max: operator_stats.max,
+                        duration_ms: operator_started.elapsed().as_millis() as u64,
+                        hash_chain: Some(hash_chain_final.clone()),
+                    };
+                    if let Err(e) = append_nightrun_event(
+                        event_store,
+                        payload,
+                        "nightrun",
+                        &operator_run_id,
+                        tick_count,
+                        None,
+                    ) {
+                        warn!(
+                            run_id = %operator_run_id,
+                            hash_chain = %hash_chain_final,
+                            error = %e,
+                            "Operator-Nightrun-Completed-Event fehlgeschlagen"
+                        );
+                    }
+                }
+            }
         }
 
         // Time Machine: Periodische World Snapshots
@@ -4045,6 +4500,116 @@ mod tests {
 
     fn projection_service_active(_service_name: &str) -> bool {
         true
+    }
+
+    #[test]
+    fn nightrun_events_persist_replayable_hash_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.db");
+        let event_store = EventStore::open(events_path.to_str().unwrap()).unwrap();
+        let run_id = "shift-tick-42-shift-1-to-2";
+        let mut chain = NightrunHashChain::new(run_id, run_id);
+
+        append_nightrun_event(
+            &event_store,
+            DomainEventPayload::NightRunStarted {
+                run_id: run_id.to_string(),
+                trigger_shift_set: 1,
+                agents_queued: 1,
+            },
+            "nightrun",
+            run_id,
+            42,
+            Some(&mut chain),
+        )
+        .unwrap();
+        append_nightrun_event(
+            &event_store,
+            DomainEventPayload::AgentConsolidated {
+                run_id: run_id.to_string(),
+                agent_name: "Anna".to_string(),
+                episodes_processed: 3,
+                episodes_consolidated: 1,
+                duration_ms: 7,
+            },
+            "AGENT-01",
+            run_id,
+            42,
+            Some(&mut chain),
+        )
+        .unwrap();
+        let expected_hash = chain.current_hash();
+        append_nightrun_event(
+            &event_store,
+            DomainEventPayload::NightRunCompleted {
+                run_id: run_id.to_string(),
+                trigger_shift_set: 1,
+                agents_consolidated: 1,
+                agents_failed: 0,
+                agents_skipped: 0,
+                total_episodes: 3,
+                total_episodes_consolidated: 1,
+                nmda_selection_rate: Some(1.0 / 3.0),
+                nmda_threshold: Some(NMDA_CONSOLIDATION_THRESHOLD),
+                nmda_max_consolidation_episodes: Some(NMDA_MAX_CONSOLIDATION_EPISODES as u32),
+                nmda_score_min: Some(0.1),
+                nmda_score_avg: Some(0.2),
+                nmda_score_max: Some(0.3),
+                duration_ms: 9,
+                hash_chain: Some(expected_hash.clone()),
+            },
+            "nightrun",
+            run_id,
+            42,
+            None,
+        )
+        .unwrap();
+
+        let events = event_store.get_events_by_correlation(run_id, 10).unwrap();
+        assert_eq!(events.len(), 3);
+
+        let mut replay_chain = NightrunHashChain::new(run_id, run_id);
+        for event in events
+            .iter()
+            .filter(|event| event.event_type != "nightrun_completed")
+        {
+            replay_chain.extend(event);
+        }
+        assert_eq!(replay_chain.current_hash(), expected_hash);
+
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == "nightrun_completed")
+            .unwrap();
+        let payload: DomainEventPayload = serde_json::from_str(&completed.payload).unwrap();
+        match payload {
+            DomainEventPayload::NightRunCompleted {
+                hash_chain,
+                total_episodes,
+                total_episodes_consolidated,
+                nmda_selection_rate,
+                nmda_threshold,
+                nmda_max_consolidation_episodes,
+                nmda_score_min,
+                nmda_score_avg,
+                nmda_score_max,
+                ..
+            } => {
+                assert_eq!(hash_chain.as_deref(), Some(expected_hash.as_str()));
+                assert_eq!(total_episodes, 3);
+                assert_eq!(total_episodes_consolidated, 1);
+                assert_eq!(nmda_selection_rate, Some(1.0 / 3.0));
+                assert_eq!(nmda_threshold, Some(NMDA_CONSOLIDATION_THRESHOLD));
+                assert_eq!(
+                    nmda_max_consolidation_episodes,
+                    Some(NMDA_MAX_CONSOLIDATION_EPISODES as u32)
+                );
+                assert_eq!(nmda_score_min, Some(0.1));
+                assert_eq!(nmda_score_avg, Some(0.2));
+                assert_eq!(nmda_score_max, Some(0.3));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
     }
 
     /// Erstellt EbpfCollector + tokio mpsc Sender fuer Tests (Userspace mode, kein tokio noetig).
