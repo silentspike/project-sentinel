@@ -252,6 +252,7 @@ Raw evidence paths:
 /tmp/issue379-directbincode-warm-20260529T082022
 /tmp/issue379-final-bincode-20260529T082714
 /tmp/issue379-final-bincode-warm-20260529T082803
+/tmp/issue379-inodecache-warm-20260529T085737
 ```
 
 Median comparison, same VM and same command shape:
@@ -268,6 +269,7 @@ Median comparison, same VM and same command shape:
 | No root cache | remove root-known cache again | 171 us | 288 us | 303 us | Rejected |
 | Direct-buffer bincode | encode directly into final buffer | 144 us | 190 us | 198 us | Rejected after warm repeat showed worse stability |
 | Final bincode warm | final binary `91ef5767...` after reverting direct-buffer | 141 us | 189 us | 196 us | Final selected result |
+| In-memory inode counter | reserve per-agent inode IDs in memory and recover from DB after reopen | 145 us | 304 us | 321 us | Rejected, worse p95/noise than final selected |
 
 Final selected run:
 
@@ -300,6 +302,7 @@ Interpretation:
 
 - The original p95 miss was primarily redb commit durability, not CAS hit lookup or benchmark loop overhead.
 - The final code keeps the real FUSE/CAS write semantics and does not fake the benchmark by bypassing metadata writes.
+- A later in-memory inode-counter experiment was measured on the same VM and rejected because median p95 regressed from 189 us to 304 us.
 - The strict `<100us` target is still not met on this 2011 Sandy Bridge-E VM: final p95 is 189 us and `target_100us_met=false`.
 - Further reduction below 100 us likely requires a larger design change such as write-behind/batched metadata commits or a different metadata layout, which would change crash semantics and needs a separate architecture decision.
 
