@@ -3,8 +3,8 @@
 // Hot-Swap-Restore via bestehende Operator-API.
 // KEIN innerHTML — ausschliesslich textContent + DOM-API.
 
-// API-Key: geteiltes In-Memory-Modul (siehe api-key.js), view-uebergreifend mit Control-Tab
-import { getApiKey, setApiKey, authHeaders } from './api-key.js';
+// Operator-Auth: server-side Session + httpOnly-Cookie (siehe auth.js), view-uebergreifend
+import { login } from './auth.js';
 
 let snapshots = [];
 let selectedId = null;
@@ -345,7 +345,8 @@ async function triggerRestore(state, panel, btn) {
   try {
     const res = await fetch('/api/control/restore', {
       method: 'POST',
-      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ snapshot_id: state.snapshot_id }),
     });
     if (res.ok) {
@@ -389,10 +390,12 @@ function renderActionBar(container) {
   keyInput.type = 'password';
   keyInput.id = 'tt-api-key-input';
   keyInput.className = 'control-input';
-  keyInput.placeholder = 'API-Key (fuer Restore)';
-  keyInput.value = getApiKey();
-  keyInput.addEventListener('change', () => {
-    setApiKey(keyInput.value);
+  keyInput.placeholder = 'Operator API-Key (Login)';
+  keyInput.addEventListener('change', async () => {
+    if (keyInput.value.trim()) {
+      await login(keyInput.value);
+      keyInput.value = '';
+    }
   });
   bar.appendChild(keyInput);
 
@@ -405,7 +408,8 @@ function renderActionBar(container) {
     try {
       await fetch('/api/control/snapshot', {
         method: 'POST',
-        headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
         body: '{}',
       });
       await refreshTimeTravel();
