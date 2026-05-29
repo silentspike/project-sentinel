@@ -3,6 +3,9 @@
 // Traffic Control, Live Config, Snapshots.
 // KEIN innerHTML — nur textContent + DOM API.
 
+// API-Key: geteiltes In-Memory-Modul (siehe api-key.js)
+import { getApiKey, setApiKey, authHeaders } from './api-key.js';
+
 let controlState = {
   connected: false,
   paused: false,
@@ -12,17 +15,6 @@ let controlState = {
   platformAnalyses: [],
   platformState: null,
 };
-
-// API-Key aus sessionStorage (User gibt ihn einmal ein)
-function getApiKey() {
-  return sessionStorage.getItem('sentinel_api_key') || '';
-}
-
-function authHeaders() {
-  const key = getApiKey();
-  if (!key) return {};
-  return { 'Authorization': 'Bearer ' + key };
-}
 
 async function controlFetch(url, opts = {}) {
   const headers = { ...authHeaders(), ...(opts.headers || {}) };
@@ -722,7 +714,7 @@ function renderApiKeySection(container) {
   keyInput.placeholder = 'SENTINEL_DASHBOARD_API_KEY';
   keyInput.value = getApiKey();
   keyInput.addEventListener('change', () => {
-    sessionStorage.setItem('sentinel_api_key', keyInput.value);
+    setApiKey(keyInput.value);
     showFeedback(container, 'API-Key gespeichert');
   });
   row.appendChild(keyInput);
