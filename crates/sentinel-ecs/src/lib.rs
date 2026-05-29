@@ -214,6 +214,79 @@ mod tests {
     }
 
     #[test]
+    fn test_psi_pressure_flows_into_bio_mood_and_perception() {
+        let run_tick_with_psi = |cpu_avg10: f64, mem_avg10: f64| {
+            let (mut world, mut schedule) = create_simulation_world();
+            world.insert_resource(PsiMetrics {
+                cpu_avg10,
+                mem_avg10,
+            });
+            let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");
+
+            {
+                let mut bio = world.get_mut::<BioState>(entity).unwrap();
+                bio.stress = 45.0;
+                bio.comfort = 80.0;
+                bio.energy = 80.0;
+                bio.hunger = 10.0;
+                bio.bladder = 10.0;
+                bio.social_need = 30.0;
+                bio.caffeine_mg = 0.0;
+            }
+            {
+                let mut time = world.resource_mut::<SimulationTime>();
+                time.tick = sentinel_common::Tick(1);
+                time.tick_count = 1;
+                time.delta_seconds = 0.0;
+                time.sim_hour = 10.0;
+            }
+
+            schedule.run(&mut world);
+
+            let bio = world.get::<BioState>(entity).unwrap();
+            let mood = world.get::<Mood>(entity).unwrap();
+            let perception = world.get::<PerceptionState>(entity).unwrap();
+            (
+                bio.stress,
+                bio.comfort,
+                mood.arousal,
+                perception.body_text.clone(),
+            )
+        };
+
+        let baseline = run_tick_with_psi(0.0, 0.0);
+        let pressured = run_tick_with_psi(60.0, 85.0);
+
+        assert!(
+            pressured.0 >= baseline.0 + 25.0,
+            "PSI pressure should raise bio stress: baseline={}, pressured={}",
+            baseline.0,
+            pressured.0
+        );
+        assert!(
+            pressured.1 <= baseline.1 - 10.0,
+            "memory pressure should lower comfort: baseline={}, pressured={}",
+            baseline.1,
+            pressured.1
+        );
+
+        assert!(
+            pressured.2 > baseline.2 + 0.1,
+            "PSI-raised stress should influence mood arousal: baseline={}, pressured={}",
+            baseline.2,
+            pressured.2
+        );
+
+        assert!(
+            pressured.3.contains("gestresst")
+                || pressured.3.contains("Druck")
+                || pressured.3.contains("Herz rast"),
+            "PSI-raised stress should be visible in body perception, got: {}",
+            pressured.3
+        );
+    }
+
+    #[test]
     fn test_perception_generates_text() {
         let (mut world, mut schedule) = create_simulation_world();
         let entity = spawn_agent(&mut world, AgentId(1), "Test Agent", "Tester", 1, "empfang");

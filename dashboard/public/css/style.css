@@ -617,6 +617,15 @@ main { padding: 2rem; }
 }
 .ebpf-stalled-heading { font-weight: 600; font-size: 0.85rem; color: var(--error); margin-bottom: 0.3rem; }
 .ebpf-stalled-agent { font-size: 0.8rem; color: var(--text-secondary); padding: 0.15rem 0; }
+.ebpf-network-detail {
+  grid-column: 1 / -1;
+  background: var(--bg-card);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+}
+.ebpf-network-heading { font-weight: 600; font-size: 0.85rem; color: var(--text-primary); margin-bottom: 0.3rem; }
+.ebpf-network-destination { font-size: 0.8rem; color: var(--text-secondary); padding: 0.15rem 0; }
 
 /* Agent Stall Indicator */
 .stall-indicator {
