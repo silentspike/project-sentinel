@@ -40,6 +40,7 @@ use crate::controlplane::config::ControlplaneConfig;
 use crate::controlplane::store::ControlplaneStore;
 use crate::controlplane::ControlplaneKernel;
 use crate::episode_producer::EpisodeProducer;
+use crate::evolution_task::{EvolutionJob, EvolutionResult, EvolutionSource};
 use crate::operator_api;
 use crate::runtime_control::{
     RespawnBackoffTracker, RespawnRetryDecision, RuntimeAnalysisFloodTestResponse,
@@ -624,6 +625,12 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let (snapshot_tx, snapshot_rx) = mpsc::channel::<sentinel_common::OperatorSnapshotCommand>();
     let (restore_tx, restore_rx) = mpsc::channel::<sentinel_common::OperatorRestoreCommand>();
     let (prune_tx, prune_rx) = mpsc::channel::<i64>();
+    let (evolution_result_tx, evolution_result_rx) = mpsc::channel::<EvolutionResult>();
+    let evolution_job_tx = crate::evolution_task::spawn_evolution_background_task(
+        crate::evolution_task::EvolutionTaskConfig::from_env(),
+        evolution_result_tx,
+    );
+    info!("Evolution Background-Task initialisiert");
     // Bounded Channel: 128 Slots. Bridge drainet per try_recv() vor jedem LLM-Call.
     // Output_system nutzt try_send() (non-blocking, WARN bei Drop).
     let (perception_tx, perception_rx) = mpsc::sync_channel::<Perception>(128);
@@ -730,6 +737,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         handle
     };
 
+    let nightrun_agent_counts = operator_api::NightrunAgentCounts::from_shift_sets(
+        all_agents.iter().map(|agent| agent.identity.shift_set),
+    );
+
     let operator_api_handle = if config.operator_api.enabled {
         Some(
             operator_api::start_server(
@@ -742,6 +753,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 platform_tx.clone(),
                 runtime_tx.clone(),
                 nightrun_tx.clone(),
+                nightrun_agent_counts,
                 snapshot_tx.clone(),
                 restore_tx.clone(),
                 Arc::clone(&event_store),
@@ -809,6 +821,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 ebpf_tx,
                 episode_producer,
                 nightrun_rx,
+                Some(evolution_job_tx),
+                Some(evolution_result_rx),
                 snapshot_rx,
                 restore_rx,
                 prune_rx,
@@ -1956,6 +1970,101 @@ fn apply_platform_analysis_command(
     Ok(())
 }
 
+fn queue_evolution_job(
+    tx: &Option<tokio::sync::mpsc::Sender<EvolutionJob>>,
+    job: EvolutionJob,
+) -> bool {
+    let Some(tx) = tx else {
+        warn!(
+            agent = %job.agent_name,
+            source = job.source.as_str(),
+            "Evolution Background-Task nicht verfuegbar, Job wird nicht eingereiht"
+        );
+        return false;
+    };
+
+    let source = job.source.as_str();
+    let agent_name = job.agent_name.clone();
+    match tx.try_send(job) {
+        Ok(()) => {
+            info!(
+                agent = %agent_name,
+                source = source,
+                "Evolution Background-Job eingereiht"
+            );
+            true
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
+            warn!(
+                agent = %job.agent_name,
+                source = job.source.as_str(),
+                "Evolution Background-Channel voll, Job wird nicht blockierend verworfen"
+            );
+            false
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(job)) => {
+            warn!(
+                agent = %job.agent_name,
+                source = job.source.as_str(),
+                "Evolution Background-Channel geschlossen, Job wird nicht eingereiht"
+            );
+            false
+        }
+    }
+}
+
+fn write_evolution_narrative_only(
+    store: &StateStore,
+    agent_id: AgentId,
+    agent_name: &str,
+    source: EvolutionSource,
+    narrative: &str,
+) {
+    match store.set_evolution_batch(agent_id, None, None, Some(narrative.as_bytes()), None) {
+        Ok(version) => {
+            info!(
+                agent = agent_name,
+                source = source.as_str(),
+                version,
+                "Evolution Narrative fallback nach redb geschrieben, EVOLUTION_VERSION = {version}"
+            );
+        }
+        Err(error) => {
+            warn!(
+                agent = agent_name,
+                source = source.as_str(),
+                error = %error,
+                "Evolution Narrative fallback redb-Write fehlgeschlagen"
+            );
+        }
+    }
+}
+
+fn drain_evolution_results(store: &StateStore, rx: &mpsc::Receiver<EvolutionResult>) {
+    while let Ok(result) = rx.try_recv() {
+        match crate::evolution_task::apply_evolution_result(store, &result) {
+            Ok(version) => {
+                info!(
+                    agent = %result.agent_name,
+                    source = result.source.as_str(),
+                    version,
+                    voice_style = result.voice_style.is_some(),
+                    behavioral_notes = result.behavioral_notes.is_some(),
+                    "Evolution nach redb geschrieben, EVOLUTION_VERSION = {version}"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    agent = %result.agent_name,
+                    source = result.source.as_str(),
+                    error = %error,
+                    "Evolution redb-Write fehlgeschlagen"
+                );
+            }
+        }
+    }
+}
+
 /// ECS Tick-Loop auf dediziertem Thread.
 ///
 /// Verwaltet den RuntimeOrchestrator (Lifecycle-Events, Shift-Wechsel, Snapshots)
@@ -1982,6 +2091,8 @@ fn ecs_tick_loop(
     ebpf_tx: tokio::sync::mpsc::Sender<MetricsSnapshot>,
     mut episode_producer: EpisodeProducer,
     nightrun_rx: mpsc::Receiver<sentinel_common::OperatorNightrunCommand>,
+    evolution_job_tx: Option<tokio::sync::mpsc::Sender<EvolutionJob>>,
+    evolution_result_rx: Option<mpsc::Receiver<EvolutionResult>>,
     snapshot_rx: mpsc::Receiver<sentinel_common::OperatorSnapshotCommand>,
     restore_rx: mpsc::Receiver<sentinel_common::OperatorRestoreCommand>,
     prune_rx: mpsc::Receiver<i64>,
@@ -2427,6 +2538,10 @@ fn ecs_tick_loop(
 
         if shutdown.load(Ordering::SeqCst) {
             break;
+        }
+
+        if let Some(rx) = evolution_result_rx.as_ref() {
+            drain_evolution_results(&state_store_for_sim, rx);
         }
 
         // PSI-basierte adaptive Tick-Rate aktualisieren (alle N Ticks)
@@ -2997,49 +3112,39 @@ fn ecs_tick_loop(
                                         "Schichtwechsel-Konsolidierung abgeschlossen"
                                     );
 
-                                    // Evolution-Daten nach redb schreiben
-                                    if let Some(ref store) = redb_store {
-                                        let narrative: String = result
-                                            .consolidated_summaries
-                                            .iter()
-                                            .map(|(s, _score)| s.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join("; ");
+                                    let narrative: String = result
+                                        .consolidated_summaries
+                                        .iter()
+                                        .map(|(s, _score)| s.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("; ");
 
-                                        // LLM-basierte Voice-Style + Behavioral-Notes Generierung
-                                        let agent_role = all_agents
-                                            .iter()
-                                            .find(|a| AgentId(a.identity.id) == *agent_id)
-                                            .map(|a| a.identity.role.as_str())
-                                            .unwrap_or("Mitarbeiter");
-                                        let (voice_style, behavioral_notes) =
-                                            generate_evolution_fields(name, agent_role, &narrative);
-
-                                        match store.set_evolution_batch(
+                                    let agent_role = all_agents
+                                        .iter()
+                                        .find(|a| AgentId(a.identity.id) == *agent_id)
+                                        .map(|a| a.identity.role.as_str())
+                                        .unwrap_or("Mitarbeiter");
+                                    let queued = queue_evolution_job(
+                                        &evolution_job_tx,
+                                        EvolutionJob {
+                                            agent_id: *agent_id,
+                                            agent_name: name.to_string(),
+                                            agent_role: agent_role.to_string(),
+                                            narrative: narrative.clone(),
+                                            source: EvolutionSource::ShiftTransition,
+                                        },
+                                    );
+                                    if !queued {
+                                        write_evolution_narrative_only(
+                                            &state_store_for_sim,
                                             *agent_id,
-                                            voice_style.as_deref(),
-                                            behavioral_notes.as_deref(),
-                                            Some(narrative.as_bytes()),
-                                            None, // agent_facts bridged separately
-                                        ) {
-                                            Ok(version) => {
-                                                info!(
-                                                    agent = name,
-                                                    version,
-                                                    voice_style = voice_style.is_some(),
-                                                    behavioral_notes = behavioral_notes.is_some(),
-                                                    "Evolution nach redb geschrieben, EVOLUTION_VERSION = {version}"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    agent = name,
-                                                    error = %e,
-                                                    "Evolution redb-Write fehlgeschlagen"
-                                                );
-                                            }
-                                        }
+                                            name,
+                                            EvolutionSource::ShiftTransition,
+                                            &narrative,
+                                        );
+                                    }
 
+                                    if let Some(ref store) = redb_store {
                                         // NMDA scores nach redb schreiben
                                         let scores: Vec<f64> = result
                                             .consolidated_summaries
@@ -3242,6 +3347,7 @@ fn ecs_tick_loop(
                 })
                 .collect();
             let mut consolidated_total = 0u32;
+            let mut evolution_jobs_queued = 0u32;
             let mut evolution_entries: Vec<(String, u32)> = Vec::new();
             for agent_cfg in &target_agents {
                 let name = &agent_cfg.identity.name;
@@ -3254,6 +3360,33 @@ fn ecs_tick_loop(
                         consolidated_total += result.episodes_processed as u32;
                         evolution_entries
                             .push((name.to_string(), result.episodes_processed as u32));
+                        let narrative = result
+                            .consolidated_summaries
+                            .iter()
+                            .map(|(summary, _score)| summary.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        let queued = queue_evolution_job(
+                            &evolution_job_tx,
+                            EvolutionJob {
+                                agent_id: AgentId(agent_cfg.identity.id),
+                                agent_name: name.to_string(),
+                                agent_role: agent_cfg.identity.role.clone(),
+                                narrative: narrative.clone(),
+                                source: EvolutionSource::Nightrun,
+                            },
+                        );
+                        if queued {
+                            evolution_jobs_queued += 1;
+                        } else {
+                            write_evolution_narrative_only(
+                                &state_store_for_sim,
+                                AgentId(agent_cfg.identity.id),
+                                name,
+                                EvolutionSource::Nightrun,
+                                &narrative,
+                            );
+                        }
                         info!(
                             agent = %name,
                             episodes = result.episodes_processed,
@@ -3320,6 +3453,7 @@ fn ecs_tick_loop(
             info!(
                 agents = target_agents.len(),
                 consolidated = consolidated_total,
+                evolution_jobs_queued,
                 dry_run = nightrun_cmd.dry_run,
                 "Nightrun abgeschlossen"
             );
@@ -3873,136 +4007,6 @@ fn ecs_tick_loop(
     Ok(tick_count)
 }
 
-/// Generiert voice_style und behavioral_notes via LLM (Cortex Gateway).
-///
-/// Laeuft im ECS std::thread — nutzt `reqwest::blocking` (kein Tokio).
-/// Fail-safe: Bei jedem Fehler wird `(None, None)` zurueckgegeben,
-/// die Konsolidierung laeuft trotzdem durch.
-#[cfg(feature = "llm")]
-fn generate_evolution_fields(
-    agent_name: &str,
-    agent_role: &str,
-    narrative: &str,
-) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-    let gateway_url =
-        std::env::var("CORTEX_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
-    let url = format!("{gateway_url}/v1/chat/completions");
-
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "Evolution LLM Client erstellen fehlgeschlagen");
-            return (None, None);
-        }
-    };
-
-    // Voice-Style Analyse
-    let voice_style = llm_evolution_call(
-        &client,
-        &url,
-        agent_name,
-        "Du bist ein linguistischer Analyst fuer eine Firmen-Simulation. \
-         Analysiere den Sprachstil des Agenten basierend auf seiner Schicht-Zusammenfassung. \
-         Antworte AUSSCHLIESSLICH als valides JSON.",
-        &format!(
-            "Agent \"{agent_name}\" (Rolle: {agent_role}) hatte folgende Schicht-Erfahrungen:\n\n\
-             {narrative}\n\n\
-             Analysiere den Sprachstil. Antwort als JSON:\n\
-             {{\"phrases\": [\"phrase1\"], \"sentence_style\": \"kurz|mittel|lang\", \"formality\": 0.X}}"
-        ),
-    );
-
-    // Behavioral-Notes Analyse
-    let behavioral_notes = llm_evolution_call(
-        &client,
-        &url,
-        agent_name,
-        "Du bist ein Verhaltensanalyst fuer eine Firmen-Simulation. \
-         Analysiere Verhaltensmuster des Agenten basierend auf seiner Schicht-Zusammenfassung. \
-         Antworte AUSSCHLIESSLICH als valides JSON.",
-        &format!(
-            "Agent \"{agent_name}\" (Rolle: {agent_role}) hatte folgende Schicht-Erfahrungen:\n\n\
-             {narrative}\n\n\
-             Identifiziere Verhaltensmuster. Antwort als JSON:\n\
-             {{\"habits\": [\"habit1\"], \"interaction_style\": \"proaktiv|reaktiv|gemischt\", \
-             \"decision_style\": \"schnell|zoegerlich|ausgewogen\", \"anomalies\": []}}"
-        ),
-    );
-
-    (voice_style, behavioral_notes)
-}
-
-/// Einzelner LLM-Call fuer Evolution-Feld-Generierung.
-#[cfg(feature = "llm")]
-fn llm_evolution_call(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    agent_name: &str,
-    system_prompt: &str,
-    user_prompt: &str,
-) -> Option<Vec<u8>> {
-    let body = serde_json::json!({
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        "temperature": 0.3,
-        "max_tokens": 500,
-        "model": "default",
-        "metadata": {
-            "agent_id": agent_name,
-            "request_type": "evolution_analysis"
-        }
-    });
-
-    match client.post(url).json(&body).send() {
-        Ok(resp) => {
-            if !resp.status().is_success() {
-                warn!(
-                    agent = agent_name,
-                    status = %resp.status(),
-                    "Evolution LLM Call fehlgeschlagen (HTTP)"
-                );
-                return None;
-            }
-            match resp.json::<serde_json::Value>() {
-                Ok(json) => {
-                    let content = json
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
-                    if content.is_empty() {
-                        warn!(agent = agent_name, "Evolution LLM Response leer");
-                        return None;
-                    }
-                    Some(content.as_bytes().to_vec())
-                }
-                Err(e) => {
-                    warn!(agent = agent_name, error = %e, "Evolution LLM Response parse fehlgeschlagen");
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            warn!(agent = agent_name, error = %e, "Evolution LLM Call fehlgeschlagen");
-            None
-        }
-    }
-}
-
-/// Fallback wenn LLM-Feature deaktiviert ist.
-#[cfg(not(feature = "llm"))]
-fn generate_evolution_fields(
-    _agent_name: &str,
-    _agent_role: &str,
-    _narrative: &str,
-) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-    (None, None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4307,6 +4311,8 @@ mod tests {
             ebpf_tx,
             ep,
             mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+            None,
+            None,
             mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
             mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
             mpsc::channel::<i64>().1,
@@ -4390,6 +4396,8 @@ mod tests {
                 ebpf_tx,
                 ep,
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+                None,
+                None,
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
                 mpsc::channel::<i64>().1,
@@ -4490,6 +4498,8 @@ mod tests {
                 ebpf_tx,
                 ep,
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+                None,
+                None,
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
                 mpsc::channel::<i64>().1,
@@ -4598,6 +4608,8 @@ mod tests {
                 ebpf_tx,
                 ep,
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+                None,
+                None,
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
                 mpsc::channel::<i64>().1,

@@ -39,6 +39,18 @@ pub struct LayerManager {
     meta: MetadataStore,
 }
 
+/// Live storage stats for the layer manager.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayerStorageStats {
+    pub cas_blob_count: u64,
+    pub cas_bytes_on_disk: u64,
+    pub regular_file_count: u64,
+    pub logical_regular_file_bytes: u64,
+    pub dedup_savings_bytes: u64,
+    pub dedup_ratio_percent: f64,
+    pub unreadable_inode_rows: u64,
+}
+
 impl LayerManager {
     /// Create a new layer manager.
     pub fn new(cas: CasStore, meta: MetadataStore) -> Self {
@@ -53,6 +65,29 @@ impl LayerManager {
     /// Access the metadata store.
     pub fn meta(&self) -> &MetadataStore {
         &self.meta
+    }
+
+    /// Aggregate CAS and metadata counters for live dedup verification.
+    pub fn storage_stats(&self) -> anyhow::Result<LayerStorageStats> {
+        let cas_stats = self.cas.stats()?;
+        let metadata_stats = self.meta.storage_stats()?;
+        let dedup_savings_bytes = metadata_stats
+            .logical_regular_file_bytes
+            .saturating_sub(cas_stats.total_bytes_on_disk);
+        let dedup_ratio_percent = if metadata_stats.logical_regular_file_bytes == 0 {
+            0.0
+        } else {
+            (dedup_savings_bytes as f64 * 100.0) / metadata_stats.logical_regular_file_bytes as f64
+        };
+        Ok(LayerStorageStats {
+            cas_blob_count: cas_stats.blob_count,
+            cas_bytes_on_disk: cas_stats.total_bytes_on_disk,
+            regular_file_count: metadata_stats.regular_file_count,
+            logical_regular_file_bytes: metadata_stats.logical_regular_file_bytes,
+            dedup_savings_bytes,
+            dedup_ratio_percent,
+            unreadable_inode_rows: metadata_stats.unreadable_inode_rows,
+        })
     }
 
     // === BASE LAYER OPERATIONS (populating shared content) ===
@@ -440,6 +475,26 @@ mod tests {
         // Refcount should be 3
         let hash = CasStore::hash(content);
         assert_eq!(lm.meta().get_refcount(&hash).unwrap(), 3);
+    }
+
+    #[test]
+    fn storage_stats_report_logical_bytes_and_dedup_savings() {
+        let (lm, _dir) = temp_layer();
+        let content = b"identical content for live stats";
+
+        lm.write_file("AGENT-01", 1, "same-1.txt", content, 0o644)
+            .unwrap();
+        lm.write_file("AGENT-02", 1, "same-2.txt", content, 0o644)
+            .unwrap();
+        lm.write_file("AGENT-03", 1, "same-3.txt", content, 0o644)
+            .unwrap();
+
+        let stats = lm.storage_stats().unwrap();
+        assert_eq!(stats.regular_file_count, 3);
+        assert_eq!(stats.logical_regular_file_bytes, (content.len() * 3) as u64);
+        assert_eq!(stats.cas_blob_count, 1);
+        assert!(stats.dedup_savings_bytes > 0);
+        assert!(stats.dedup_ratio_percent > 0.0);
     }
 
     #[test]
