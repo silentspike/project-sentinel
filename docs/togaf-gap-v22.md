@@ -49,7 +49,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | Sandbox (bwrap + Landlock + cgroups + netns) | ✅ | `crates/sentinel-sandbox/`; 9/9 breakout tests pass |
 | sentinel-fs CAS-FUSE (#379)  | 🟡 | Deploy-VM daemon namespace shows active `fuse sentinel-fs` at `/opt/sentinel/fs` and agent homes bound through `/opt/sentinel/fs/AGENT-*`; same-VM optimization loop on Intel i7-3930K @ 3.20 GHz (2011) reached 99.22% dedup savings and improved median dedup-hit write p95 from 40,411 us to 189 us, but the strict `<100us` target remains unmet on this VM |
 | WASM tool runtime             | ✅ | `crates/sentinel-wasm/` |
-| eBPF monitoring (aya-rs)      | ✅ | `crates/sentinel-ebpf/` |
+| eBPF monitoring (aya-rs)      | ✅ | `crates/sentinel-ebpf/`; #380 verified production kernel mode on Deploy-VM with CAP_BPF fallback smoke and dashboard evidence |
 
 ## Cluster 04 — Cortex Gateway
 
@@ -79,7 +79,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 |-------------------------------|--------|----------|
 | Prometheus metrics            | ✅ | `crates/sentinel-telemetry/`, gateway `/metrics` |
 | Health + readiness endpoints  | ✅ | each service exposes `/healthz`, `/readyz` |
-| eBPF probes (write-syscall, stall) | ✅ | `crates/sentinel-ebpf/` |
+| eBPF probes (write-syscall, stall) | ✅ | `crates/sentinel-ebpf/`; #380 Deploy-VM evidence shows `mode=kernel`, ring drops 0, I/O read/write values, TCP request deltas, and dashboard eBPF cards without `N/A` |
 | MARBLE Observatory            | ✅ | `cmd/cortex-gateway/internal/observatory/` |
 | Dashboard polling efficiency (#277) | ✅ | Projection-owned `projection_watermarks` table gives one indexed change-detection lookup per active WebSocket poll; Deploy-VM evidence on Intel i7-3930K @ 3.20 GHz (2011), gateway inactive, 3-tab Playwright: no `ERR_INSUFFICIENT_RESOURCES` |
 | OTel tracing                  | 🟡 | structured spans in place, OTLP exporter behind feature flag |
@@ -93,6 +93,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | Bio-tick benchmark            | ✅ | 154 – 171 µs |
 | Synthesis-engine latency      | ✅ | 95 – 103 µs end-to-end |
 | Tick-loop hot-path (#276)     | ✅ | Deploy-VM relative before/after on Intel i7-3930K @ 3.20 GHz (2011): physics 26.86% faster, perception 26.34% faster, persist e2e batch 52.57% faster, persist write-only batch 86.95% faster, full tick 17.23% faster; absolute TOGAF baselines intentionally not used for this hardware |
+| eBPF monitoring overhead (#380) | ✅ | Deploy-VM Intel i7-3930K @ 3.20 GHz (2011): collector avg 1265.83 us per 10 ticks, amortized 0.012658% of tick budget, ring drops 0; vmstat/mpstat/iostat captured in parallel |
 
 ## Cluster 07 — Deployment & Tuning
 

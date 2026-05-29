@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Activated Issue #380 eBPF production evidence end to end: daemon/dashboard deploy verified `mode=kernel`, no-CAP `userspace` fallback, TCP request deltas, dashboard eBPF cards without `N/A`, and Deploy-VM overhead of 0.012658% amortized on the i7-3930K VM.
 - Finalized Issue #382 NMDA episode-selection policy for hippocampus/nightrun: calibrated threshold `0.25`, shared narrative threshold, max 10 selected episodes, selection-quality payload metrics, and Deploy-VM replay evidence for a `2/3` consolidated Night-Run.
 - Moved Issue #278 nightrun/shift evolution LLM calls out of the ECS tick loop into an async background task, with VM evidence for fake-gateway success, gateway-down fail-safe behavior, and redb `EVOLUTION_VERSION` writes.
 - Added and optimized Issue #379 live sentinel-fs FUSE/CAS verification paths for storage stats and dedup-hit benchmarking; Deploy-VM evidence shows active FUSE agent homes, 99.22% dedup savings, and same-VM median dedup-hit write p95 improved from 40,411 us to 189 us, while the strict `<100us` target remains unmet on the i7-3930K VM.
@@ -17,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Excluded `sentinel-gateway` from daemon platform-controlplane `monitored_services` in the deployment config so benchmark and smoke runs can keep the gateway stopped without self-heal restarts.
 
 ### Added
+- Added `ebpf-mode-smoke` for focused kernel-mode/userspace-fallback runtime checks and committed Issue #380 dashboard screenshot evidence at `docs/screenshots/issue380-dashboard-ebpf.png`.
 - Added dashboard exposure for Issue #276 benchmark evidence at `/api/metrics/benchmarks`, including hardware scope, relative-only comparison notes, and system-metric log labels.
 
 ## [0.1.0-alpha] - 2026-04-26
