@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Excluded `sentinel-gateway` from daemon platform-controlplane `monitored_services` in the deployment config so benchmark and smoke runs can keep the gateway stopped without self-heal restarts.
 
 ### Added
+- Added Issue #393 Kani verification baseline: installed/verified Kani+CBMC on the build server, added six proven harnesses across bio, snapshot cursor, and event-store offset/dedup invariants, and documented limits in `docs/security/kani-verification.md`.
+- Added Issue #392 unsafe audit baseline: first-party unsafe inventory, local `SAFETY:` justifications, CI-ready baseline checker, and a safe `MaybeUninit` replacement for the nightrun `localtime_r` path with fixed-time shift regression coverage.
+- Added Issue #383 component-level READMEs for 25 current Rust/Go component directories, plus `docs/component-readmes.md` and `scripts/check-component-readmes.sh` coverage verification.
 - Added Issue #391 prompt-injection defense in the Cortex Gateway: per-agent tool capabilities from agent TOML, server-side action validation, `agent_action_rejected` audit events, and injection/legitimate-action regression coverage without real LLM calls.
 - Added Issue #390 security threat model at `docs/security/threat-model.md`, covering compromised-agent, external-attacker, and supply-chain attacker classes with asset inventory and prioritized follow-up gaps.
 - Recorded Issue #396 Cluster 12 runtime-contract decision as DEV-006 in the Deviation Register: WASM/WASI on Wasmtime is the default Nano-Container contract, while native code is limited to an explicit Escape-Hatch-Pool.

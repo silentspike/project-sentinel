@@ -124,6 +124,21 @@ impl fmt::Display for MonotonicityError {
 
 impl std::error::Error for MonotonicityError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetUpdateDecision {
+    InsertOrAdvance,
+    Noop,
+    Reject,
+}
+
+pub fn classify_offset_update(current: Option<i64>, attempted: i64) -> OffsetUpdateDecision {
+    match current {
+        Some(current) if attempted < current => OffsetUpdateDecision::Reject,
+        Some(current) if attempted == current => OffsetUpdateDecision::Noop,
+        _ => OffsetUpdateDecision::InsertOrAdvance,
+    }
+}
+
 /// Zeile aus der Outbox-Tabelle fuer den Publisher.
 #[derive(Debug, Clone)]
 pub struct OutboxEntry {
@@ -798,19 +813,17 @@ impl EventStore {
             )
             .ok();
 
-        if let Some(current_val) = current {
-            if offset == current_val {
-                // Idempotent: gleicher Offset = kein Update noetig
-                return Ok(());
-            }
-            if offset < current_val {
+        match classify_offset_update(current, offset) {
+            OffsetUpdateDecision::Noop => return Ok(()),
+            OffsetUpdateDecision::Reject => {
                 return Err(MonotonicityError {
                     projection: name.to_string(),
-                    current: current_val,
+                    current: current.expect("reject requires existing offset"),
                     attempted: offset,
                 }
                 .into());
             }
+            OffsetUpdateDecision::InsertOrAdvance => {}
         }
 
         let now_ms = std::time::SystemTime::now()
