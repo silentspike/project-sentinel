@@ -3265,11 +3265,11 @@ fn ecs_tick_loop(
                                 let episodes_consolidated = result.episodes_consolidated as u32;
                                 if episodes_processed > 0 {
                                     let nmda_scores = nmda_consolidated_scores(&result);
-                                    let agent_stats = nmda_score_stats(&nmda_scores);
+                                    let agent_stats = nmda_score_stats(&result.episode_scores);
                                     shift_episodes_processed += episodes_processed;
                                     shift_episodes_consolidated += episodes_consolidated;
                                     shift_agents_consolidated += 1;
-                                    shift_nmda_scores.extend(nmda_scores.iter().copied());
+                                    shift_nmda_scores.extend(result.episode_scores.iter().copied());
 
                                     info!(
                                         agent = name,
@@ -3440,8 +3440,8 @@ fn ecs_tick_loop(
                         }
                     }
                 }
+                let shift_stats = nmda_score_stats(&shift_nmda_scores);
                 if shift_episodes_processed > 0 {
-                    let shift_stats = nmda_score_stats(&shift_nmda_scores);
                     info!(
                         old_shift = current_shift,
                         new_shift,
@@ -3474,6 +3474,17 @@ fn ecs_tick_loop(
                             agents_skipped: 0,
                             total_episodes: shift_episodes_processed,
                             total_episodes_consolidated: shift_episodes_consolidated,
+                            nmda_selection_rate: Some(nmda_selection_rate(
+                                shift_episodes_processed,
+                                shift_episodes_consolidated,
+                            )),
+                            nmda_threshold: Some(NMDA_CONSOLIDATION_THRESHOLD),
+                            nmda_max_consolidation_episodes: Some(
+                                NMDA_MAX_CONSOLIDATION_EPISODES as u32,
+                            ),
+                            nmda_score_min: shift_stats.min,
+                            nmda_score_avg: shift_stats.avg,
+                            nmda_score_max: shift_stats.max,
                             duration_ms: shift_started.elapsed().as_millis() as u64,
                             hash_chain: Some(hash_chain_final.clone()),
                         };
@@ -3691,12 +3702,11 @@ fn ecs_tick_loop(
                     Ok(result) if result.episodes_processed > 0 => {
                         let episodes_processed = result.episodes_processed as u32;
                         let episodes_consolidated = result.episodes_consolidated as u32;
-                        let nmda_scores = nmda_consolidated_scores(&result);
-                        let agent_stats = nmda_score_stats(&nmda_scores);
+                        let agent_stats = nmda_score_stats(&result.episode_scores);
                         episodes_processed_total += episodes_processed;
                         episodes_consolidated_total += episodes_consolidated;
                         agents_consolidated_total += 1;
-                        operator_nmda_scores.extend(nmda_scores.iter().copied());
+                        operator_nmda_scores.extend(result.episode_scores.iter().copied());
 
                         info!(
                             agent = %name,
@@ -3886,6 +3896,17 @@ fn ecs_tick_loop(
                         agents_skipped: 0,
                         total_episodes: episodes_processed_total,
                         total_episodes_consolidated: episodes_consolidated_total,
+                        nmda_selection_rate: Some(nmda_selection_rate(
+                            episodes_processed_total,
+                            episodes_consolidated_total,
+                        )),
+                        nmda_threshold: Some(NMDA_CONSOLIDATION_THRESHOLD),
+                        nmda_max_consolidation_episodes: Some(
+                            NMDA_MAX_CONSOLIDATION_EPISODES as u32,
+                        ),
+                        nmda_score_min: operator_stats.min,
+                        nmda_score_avg: operator_stats.avg,
+                        nmda_score_max: operator_stats.max,
                         duration_ms: operator_started.elapsed().as_millis() as u64,
                         hash_chain: Some(hash_chain_final.clone()),
                     };
@@ -4528,6 +4549,12 @@ mod tests {
                 agents_skipped: 0,
                 total_episodes: 3,
                 total_episodes_consolidated: 1,
+                nmda_selection_rate: Some(1.0 / 3.0),
+                nmda_threshold: Some(NMDA_CONSOLIDATION_THRESHOLD),
+                nmda_max_consolidation_episodes: Some(NMDA_MAX_CONSOLIDATION_EPISODES as u32),
+                nmda_score_min: Some(0.1),
+                nmda_score_avg: Some(0.2),
+                nmda_score_max: Some(0.3),
                 duration_ms: 9,
                 hash_chain: Some(expected_hash.clone()),
             },
@@ -4560,11 +4587,26 @@ mod tests {
                 hash_chain,
                 total_episodes,
                 total_episodes_consolidated,
+                nmda_selection_rate,
+                nmda_threshold,
+                nmda_max_consolidation_episodes,
+                nmda_score_min,
+                nmda_score_avg,
+                nmda_score_max,
                 ..
             } => {
                 assert_eq!(hash_chain.as_deref(), Some(expected_hash.as_str()));
                 assert_eq!(total_episodes, 3);
                 assert_eq!(total_episodes_consolidated, 1);
+                assert_eq!(nmda_selection_rate, Some(1.0 / 3.0));
+                assert_eq!(nmda_threshold, Some(NMDA_CONSOLIDATION_THRESHOLD));
+                assert_eq!(
+                    nmda_max_consolidation_episodes,
+                    Some(NMDA_MAX_CONSOLIDATION_EPISODES as u32)
+                );
+                assert_eq!(nmda_score_min, Some(0.1));
+                assert_eq!(nmda_score_avg, Some(0.2));
+                assert_eq!(nmda_score_max, Some(0.3));
             }
             other => panic!("unexpected payload: {other:?}"),
         }
