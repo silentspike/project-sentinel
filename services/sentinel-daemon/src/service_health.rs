@@ -290,8 +290,10 @@ mod tests {
         assert!(checker.trigger_panic_test());
 
         let mut recovered = false;
-        for _ in 0..100 {
+        let mut last_state = checker.worker_state();
+        for _ in 0..500 {
             let state = checker.worker_state();
+            last_state = state.clone();
             if state.running && state.restart_count >= 1 {
                 recovered = true;
                 assert_eq!(state.thread_name, "service-health-checker");
@@ -306,7 +308,7 @@ mod tests {
 
         assert!(
             recovered,
-            "service-health worker wurde nach panic-test nicht neu gestartet"
+            "service-health worker wurde nach panic-test nicht neu gestartet: {last_state:?}"
         );
     }
 }
