@@ -4,7 +4,7 @@
 
 import { Hono } from "hono";
 import { requireAuth } from "../middleware/auth";
-import { getRecentPlatformAnalyses, resetCaches } from "../db";
+import { getRecentPlatformAnalyses, getSnapshotWorldState, resetCaches } from "../db";
 import { resetWatermarks, broadcast } from "../ws";
 
 export const controlRoutes = new Hono();
@@ -281,6 +281,27 @@ controlRoutes.post("/control/snapshot", async (c) => {
     );
   } catch (err) {
     return c.json({ error: "Operator-API nicht erreichbar", detail: String(err) }, 502);
+  }
+});
+
+// ── GET /api/control/snapshot-state — Welt-Zustand zum Snapshot-Zeitpunkt (#384) ──
+// Liest den EventStore lokal (kein Proxy) und leitet Agent-/Raum-Counts ab.
+controlRoutes.get("/control/snapshot-state", (c) => {
+  const snapshotId = c.req.query("snapshot_id");
+  if (!snapshotId) {
+    return c.json({ error: "snapshot_id Query-Parameter erforderlich" }, 400);
+  }
+  try {
+    const state = getSnapshotWorldState(snapshotId);
+    if (!state) {
+      return c.json({ error: "Snapshot nicht gefunden" }, 404);
+    }
+    return c.json(state);
+  } catch (err) {
+    return c.json(
+      { error: "Snapshot-Zustand nicht abrufbar", detail: String(err) },
+      500,
+    );
   }
 });
 
