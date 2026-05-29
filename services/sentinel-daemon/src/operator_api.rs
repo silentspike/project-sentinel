@@ -2987,7 +2987,7 @@ mod tests {
         assert_eq!(payload.dedup_hit_writes, 8);
         assert_eq!(payload.dedup_hits, 8);
         assert_eq!(payload.logical_bytes_written, 9 * 512);
-        assert!(payload.cas_blob_count_after >= payload.cas_blob_count_before + 1);
+        assert!(payload.cas_blob_count_after > payload.cas_blob_count_before);
         assert!(payload.target_87_percent_met);
         assert!(payload.dedup_hit_latency_us_max >= payload.dedup_hit_latency_us_min);
     }
