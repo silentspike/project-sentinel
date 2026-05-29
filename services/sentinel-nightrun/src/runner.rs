@@ -96,8 +96,8 @@ impl NightrunSelectionMetrics {
                 max_score = Some(max_score.map_or(score, |current| current.max(score)));
             }
             if let Some(avg) = agent.score_avg {
-                sum += avg * agent.episodes_consolidated as f64;
-                count += agent.episodes_consolidated;
+                sum += avg * agent.episodes_processed as f64;
+                count += agent.episodes_processed;
             }
         }
 
@@ -124,8 +124,12 @@ pub struct AgentSelectionMetrics {
 }
 
 impl AgentSelectionMetrics {
-    fn new(agent_name: &str, episodes_processed: u32, scores: &[f64]) -> Self {
-        let episodes_consolidated = scores.len() as u32;
+    fn new(
+        agent_name: &str,
+        episodes_processed: u32,
+        episodes_consolidated: u32,
+        scores: &[f64],
+    ) -> Self {
         let selection_rate = if episodes_processed == 0 {
             0.0
         } else {
@@ -300,12 +304,8 @@ impl NightrunRunner {
                 Ok(result) => {
                     let processed = result.episodes_processed as u32;
                     let cons = result.episodes_consolidated as u32;
-                    let scores: Vec<f64> = result
-                        .consolidated_summaries
-                        .iter()
-                        .map(|(_, score)| *score)
-                        .collect();
-                    let agent_selection = AgentSelectionMetrics::new(agent, processed, &scores);
+                    let agent_selection =
+                        AgentSelectionMetrics::new(agent, processed, cons, &result.episode_scores);
                     selection.record_agent(agent_selection);
                     let duration_ms = agent_start.elapsed().as_millis() as u64;
                     info!(
@@ -355,6 +355,7 @@ impl NightrunRunner {
             total_episodes_consolidated,
             duration_ms,
             &hash_chain_final,
+            &selection,
         )?;
 
         let result = NightrunResult {
@@ -485,6 +486,7 @@ impl NightrunRunner {
         total_episodes_consolidated: u32,
         duration_ms: u64,
         hash_chain_final: &str,
+        selection: &NightrunSelectionMetrics,
     ) -> Result<()> {
         let payload = DomainEventPayload::NightRunCompleted {
             run_id: self.run_id.clone(),
@@ -494,6 +496,12 @@ impl NightrunRunner {
             agents_skipped,
             total_episodes,
             total_episodes_consolidated,
+            nmda_selection_rate: Some(selection.selection_rate),
+            nmda_threshold: Some(selection.threshold),
+            nmda_max_consolidation_episodes: Some(selection.max_consolidation_episodes as u32),
+            nmda_score_min: selection.score_min,
+            nmda_score_avg: selection.score_avg,
+            nmda_score_max: selection.score_max,
             duration_ms,
             hash_chain: Some(hash_chain_final.to_string()),
         };

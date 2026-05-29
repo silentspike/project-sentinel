@@ -134,8 +134,12 @@ fn issue382_selection_metrics_report_processed_vs_consolidated() {
     assert_eq!(result.selection.episodes_consolidated, 1);
     assert_eq!(result.selection.threshold, NMDA_CONSOLIDATION_THRESHOLD);
     assert_relative_eq!(result.selection.selection_rate, 1.0 / 3.0, epsilon = 1e-12);
-    assert_relative_eq!(result.selection.score_min.unwrap(), 0.28, epsilon = 1e-12);
-    assert_relative_eq!(result.selection.score_avg.unwrap(), 0.28, epsilon = 1e-12);
+    assert_relative_eq!(result.selection.score_min.unwrap(), 0.0025, epsilon = 1e-12);
+    assert_relative_eq!(
+        result.selection.score_avg.unwrap(),
+        (0.28 + 0.125 + 0.0025) / 3.0,
+        epsilon = 1e-12
+    );
     assert_relative_eq!(result.selection.score_max.unwrap(), 0.28, epsilon = 1e-12);
     assert_eq!(result.selection.agents.len(), 1);
     assert_eq!(result.selection.agents[0].agent_name, "Thomas");

@@ -34,7 +34,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | Big-Five personality model    | ✅ | `crates/sentinel-common/src/personality.rs` |
 | Bio-engine (6 differential eqs) | ✅ | `crates/sentinel-bio/src/` |
 | Mood (valence + arousal)      | ✅ | `crates/sentinel-bio/src/mood.rs` |
-| Memory (episodic + semantic)  | 🟡 | `crates/sentinel-hippocampus/`; multi-tier in place, NMDA selection still tuning |
+| Memory (episodic + semantic)  | ✅ | `crates/sentinel-hippocampus/`; calibrated NMDA selection profile finalized in #382 (`threshold=0.25`, max 10), Deploy-VM Night-Run consolidated 2/3 controlled episodes with deterministic replay evidence in `test-382-verification.md` |
 | Action ontology               | ✅ | `crates/sentinel-common/src/action.rs` |
 
 ## Cluster 03 — Infrastruktur
