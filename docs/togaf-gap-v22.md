@@ -50,6 +50,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | sentinel-fs CAS-FUSE (#379)  | 🟡 | Deploy-VM daemon namespace shows active `fuse sentinel-fs` at `/opt/sentinel/fs` and agent homes bound through `/opt/sentinel/fs/AGENT-*`; same-VM optimization loop on Intel i7-3930K @ 3.20 GHz (2011) reached 99.22% dedup savings and improved median dedup-hit write p95 from 40,411 us to 189 us, but the strict `<100us` target remains unmet on this VM |
 | WASM tool runtime             | ✅ | `crates/sentinel-wasm/` |
 | eBPF monitoring (aya-rs)      | ✅ | `crates/sentinel-ebpf/`; #380 verified production kernel mode on Deploy-VM with CAP_BPF fallback smoke and dashboard evidence |
+| Security threat model (#390)  | ✅ | [docs/security/threat-model.md](security/threat-model.md) documents compromised-agent, external-attacker, and supply-chain attacker classes, protected assets, mitigations, and prioritized gaps linked to #391/#392/#393 |
 
 ## Cluster 04 — Cortex Gateway
 
