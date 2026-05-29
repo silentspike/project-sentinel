@@ -196,6 +196,9 @@ pub enum DomainEventPayload {
         agents_failed: u32,
         agents_skipped: u32,
         total_episodes: u32,
+        /// Episodes selected by the calibrated NMDA threshold.
+        #[serde(default)]
+        total_episodes_consolidated: u32,
         duration_ms: u64,
         /// Final hash of the deterministic event chain (for replay verification).
         #[serde(default)]
