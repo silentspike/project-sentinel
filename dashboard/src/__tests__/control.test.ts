@@ -2,6 +2,12 @@ import { describe, it, expect, afterAll, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { app } from "../index";
 import { setDatabases } from "../db";
+import { createSession, SESSION_COOKIE, _clearAllSessions } from "../auth-session";
+
+// Hilfsfunktion: gueltiges Session-Cookie fuer authentifizierte Requests (#402).
+function authCookie(): { Cookie: string } {
+  return { Cookie: `${SESSION_COOKIE}=${createSession()}` };
+}
 
 // Mock fetch fuer Cortex Gateway Proxy-Tests
 const originalFetch = globalThis.fetch;
@@ -20,6 +26,7 @@ function restoreFetch() {
 describe("Control Routes", () => {
   beforeEach(() => {
     restoreFetch();
+    _clearAllSessions();
     process.env.SENTINEL_DASHBOARD_API_KEY = originalDashboardApiKey || "";
     process.env.SENTINEL_OPERATOR_API_KEY = originalOperatorApiKey || "";
     process.env.SENTINEL_OPERATOR_API_URL = originalOperatorApiUrl || "";
@@ -131,7 +138,7 @@ describe("Control Routes", () => {
       expect(res.status).toBe(403);
     });
 
-    it("returns 401 when no Authorization header", async () => {
+    it("returns 401 when no session cookie", async () => {
       process.env.SENTINEL_DASHBOARD_API_KEY = "test-key-123";
       const res = await app.request("/api/control/pause", {
         method: "POST",
@@ -195,7 +202,7 @@ describe("Control Routes", () => {
       const res = await app.request("/api/control/chaos", {
         method: "POST",
         headers: {
-          "Authorization": "Bearer dash-key",
+          ...authCookie(),
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -221,7 +228,7 @@ describe("Control Routes", () => {
       const res = await app.request("/api/control/chaos", {
         method: "POST",
         headers: {
-          "Authorization": "Bearer dash-key",
+          ...authCookie(),
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -271,7 +278,7 @@ describe("Control Routes", () => {
       const res = await app.request("/api/control/stimulus", {
         method: "POST",
         headers: {
-          "Authorization": "Bearer dash-key",
+          ...authCookie(),
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -402,7 +409,7 @@ describe("Control Routes", () => {
       const res = await app.request("/api/control/platform-analyze", {
         method: "POST",
         headers: {
-          "Authorization": "Bearer dash-key",
+          ...authCookie(),
           "Content-Type": "application/json",
         },
         body: JSON.stringify({}),
