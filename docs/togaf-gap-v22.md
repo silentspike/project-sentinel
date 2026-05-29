@@ -141,6 +141,13 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | Non-blocking evolution LLM (#278) | 🟡 | Async `evolution_task` moves nightrun/shift LLM calls out of the ECS tick loop; Deploy-VM nightrun returned in 0.669 ms and gateway-down shift jobs failed safe, but total shift transition measured ~1.455 s on the i7-3930K VM, above the strict `<1s` AC target due remaining Hippocampus/sandbox work |
 | Time-travel debugging UI      | ⏳ | dashboard hook designed, frontend deferred |
 
+## Cluster 12 — Zielarchitektur / Nano-Container Platform
+
+| Item                          | Status | Evidence |
+|-------------------------------|--------|----------|
+| Runtime contract decision (#396) | ✅ | DEV-006 in [docs/togaf-deviations-v22.md](togaf-deviations-v22.md) records WASM/WASI on Wasmtime as the default Nano-Container runtime, with arbitrary native code only via an explicit Escape-Hatch-Pool |
+| Tracking epic (#397)          | 🟡 | #397 remains the Cluster 12 tracking epic; implementation issues are intentionally deferred until they emerge from concrete agent-system needs under the DEV-006 contract |
+
 ---
 
 ## Open work tracked elsewhere
