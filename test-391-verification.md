@@ -50,8 +50,8 @@ Issue Quality Gate 26645872696 completed with success.
 | AC | Evidence | Status |
 | --- | --- | --- |
 | AC-1 | `cmd/cortex-gateway/internal/capability/agent_policy.go` loads per-agent `[capabilities].tools` from agent TOML and validates tool/target permissions. Focused Go tests and real config count passed. | PASS |
-| AC-2 | Pending implementation. | Pending |
-| AC-3 | Pending implementation. | Pending |
+| AC-2 | Pipeline filters unauthorized extracted `tool_use` actions before response/persistence. Focused proxy test passed. | PASS |
+| AC-3 | Rejected action writes `agent_action_rejected` audit event with reason/tool/security metadata into the Event Store. Focused proxy test passed. | PASS |
 | AC-4 | Pending implementation. | Pending |
 | AC-5 | Pending implementation. | Pending |
 
@@ -104,6 +104,40 @@ agent_files=60
 capability_definitions=60
 missing=0
 real_agent_capability_config: PASS
+```
+
+## AC-2 / AC-3 Evidence
+
+Command:
+
+```bash
+cd cmd/cortex-gateway
+go test ./internal/proxy -run TestPipelineRejectsUnauthorizedToolUseAndAudits -v
+```
+
+Observed:
+
+```text
+=== RUN   TestPipelineRejectsUnauthorizedToolUseAndAudits
+2026/05/29 17:30:08 WARN 3-source assembly failed, using fallback agent_id=1 error="assembler not configured, use NewWithAssembler"
+2026/05/29 17:30:08 WARN agent action rejected by capability policy request_id=req-injection-001 agent_id=1 agent_name="Thomas Mueller" action_type=tool_use target=file_write:/etc/passwd reason=tool_not_allowed
+2026/05/29 17:30:08 INFO pipeline request completed provider=mock request_class=agent_runtime effective_model=test-model policy_source=agent_runtime_policy duration=631.908µs tokens=7 actions=0 agent_id=1 agent_name="Thomas Mueller"
+--- PASS: TestPipelineRejectsUnauthorizedToolUseAndAudits (0.00s)
+PASS
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/proxy	0.011s
+```
+
+Package check:
+
+```bash
+cd cmd/cortex-gateway
+go test ./internal/proxy
+```
+
+Observed:
+
+```text
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/proxy	0.940s
 ```
 
 ## Not Tested Yet
