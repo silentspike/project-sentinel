@@ -191,6 +191,10 @@ Command:
 ```bash
 cd cmd/cortex-gateway
 go test ./...
+go test -race -count=1 ./...
+go build ./...
+go vet ./...
+golangci-lint run --timeout=5m
 ```
 
 Observed:
@@ -216,6 +220,15 @@ ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/resilie
 ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/sequencing	0.336s
 ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/synthesis	0.010s
 ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/ticksync	1.513s
+```
+
+Post-PR CI parity rerun after the gosec G306 test-file permission fix:
+
+```text
+go test -race -count=1 ./...: PASS
+go build ./...: PASS
+go vet ./...: PASS
+golangci-lint run --timeout=5m: 0 issues
 ```
 
 Command:
