@@ -1,5 +1,5 @@
-// API-Key: geteiltes In-Memory-Modul (siehe api-key.js)
-import { getApiKey, setApiKey, authHeaders } from './api-key.js';
+// Operator-Auth: server-side Session + httpOnly-Cookie (siehe auth.js)
+import { isAuthenticated, login } from './auth.js';
 
 const CHAOS_OPTIONS = [
   ['AirConBroken', 'Klimaanlage defekt'],
@@ -181,9 +181,9 @@ async function submitChaosTrigger(event) {
   try {
     const res = await fetch('/api/control/chaos', {
       method: 'POST',
+      credentials: 'same-origin',
       headers: {
         'Content-Type': 'application/json',
-        ...authHeaders(),
       },
       body: JSON.stringify(payload),
     });
@@ -246,9 +246,9 @@ async function submitStimulusTrigger(event) {
   try {
     const res = await fetch('/api/control/stimulus', {
       method: 'POST',
+      credentials: 'same-origin',
       headers: {
         'Content-Type': 'application/json',
-        ...authHeaders(),
       },
       body: JSON.stringify(payload),
     });
@@ -528,7 +528,7 @@ function renderStimulusSection(detail) {
   const section = createEl('section', 'room-detail-section');
   section.appendChild(createEl('h3', 'room-detail-heading', 'Raumreiz testen'));
 
-  if (!getApiKey()) {
+  if (!isAuthenticated()) {
     const authBox = createEl('div', 'room-detail-auth');
     authBox.appendChild(
       createEl('div', 'room-detail-note', 'API-Key eingeben um Raumreize auszuloesen:'),
@@ -537,9 +537,10 @@ function renderStimulusSection(detail) {
     keyInput.type = 'password';
     keyInput.className = 'room-trigger-input';
     keyInput.placeholder = 'Operator API-Key';
-    keyInput.addEventListener('change', () => {
+    keyInput.addEventListener('change', async () => {
       if (keyInput.value.trim()) {
-        setApiKey(keyInput.value);
+        await login(keyInput.value);
+        keyInput.value = '';
         renderFloorplan(latestRooms);
       }
     });
@@ -624,7 +625,7 @@ function renderStimulusSection(detail) {
     stimulusTriggerState.pending ? 'Reiz laeuft...' : 'Raumreiz ausloesen',
   );
   submit.type = 'submit';
-  submit.disabled = stimulusTriggerState.pending || !getApiKey();
+  submit.disabled = stimulusTriggerState.pending || !isAuthenticated();
   form.appendChild(submit);
 
   if (stimulusTriggerState.message) {
@@ -645,7 +646,7 @@ function renderChaosTriggerSection() {
   const section = createEl('section', 'room-detail-section');
   section.appendChild(createEl('h3', 'room-detail-heading', 'Chaos triggern'));
 
-  if (!getApiKey()) {
+  if (!isAuthenticated()) {
     const authBox = createEl('div', 'room-detail-auth');
     authBox.appendChild(
       createEl('div', 'room-detail-note', 'API-Key eingeben um Chaos zu triggern:'),
@@ -654,9 +655,10 @@ function renderChaosTriggerSection() {
     keyInput.type = 'password';
     keyInput.className = 'room-trigger-input';
     keyInput.placeholder = 'Operator API-Key';
-    keyInput.addEventListener('change', () => {
+    keyInput.addEventListener('change', async () => {
       if (keyInput.value.trim()) {
-        setApiKey(keyInput.value);
+        await login(keyInput.value);
+        keyInput.value = '';
         renderFloorplan(latestRooms);
       }
     });
@@ -709,7 +711,7 @@ function renderChaosTriggerSection() {
     chaosTriggerState.pending ? 'Trigger laeuft...' : 'Chaos ausloesen',
   );
   submit.type = 'submit';
-  submit.disabled = chaosTriggerState.pending || !getApiKey();
+  submit.disabled = chaosTriggerState.pending || !isAuthenticated();
   form.appendChild(submit);
 
   if (chaosTriggerState.message) {

@@ -7,16 +7,16 @@ const FLOORPLAN_MODULE_URL = pathToFileURL(
   path.resolve(import.meta.dir, "../../public/js/floorplan.js"),
 ).href;
 
-// api-key.js wird (ohne Cache-Buster) als geteilte Modul-Instanz geladen — dieselbe,
-// die floorplan.js via relativem Import nutzt. Damit seedet setTestApiKey den Key
-// auf exakt der Instanz, aus der floorplan.js authHeaders/getApiKey liest.
-const API_KEY_MODULE_URL = pathToFileURL(
-  path.resolve(import.meta.dir, "../../public/js/api-key.js"),
+// auth.js wird (ohne Cache-Buster) als geteilte Modul-Instanz geladen — dieselbe,
+// die floorplan.js via relativem Import nutzt. setTestAuth setzt das UI-Auth-Flag
+// auf exakt der Instanz, aus der floorplan.js isAuthenticated() liest (#402).
+const AUTH_MODULE_URL = pathToFileURL(
+  path.resolve(import.meta.dir, "../../public/js/auth.js"),
 ).href;
 
-async function setTestApiKey(value: string): Promise<void> {
-  const mod = await import(API_KEY_MODULE_URL);
-  mod.setApiKey(value);
+async function setTestAuth(value: boolean): Promise<void> {
+  const mod = await import(AUTH_MODULE_URL);
+  mod._setAuthenticated(value);
 }
 
 class StorageMock {
@@ -201,7 +201,7 @@ const UPDATED_DETAIL = {
 afterEach(async () => {
   // In-Memory-Key persistiert ueber Tests (anders als der per-Test frische
   // sessionStorage-Mock) — daher explizit zuruecksetzen.
-  await setTestApiKey("");
+  await setTestAuth(false);
   delete (globalThis as Record<string, unknown>).window;
   delete (globalThis as Record<string, unknown>).document;
   delete (globalThis as Record<string, unknown>).Event;
@@ -265,7 +265,7 @@ describe("floorplan.js", () => {
 
   it("submits the chaos trigger with auth and refreshes badge plus detail", async () => {
     const { document, window } = installDom();
-    await setTestApiKey("dash-key");
+    await setTestAuth(true);
 
     const requests: Array<{ url: string; method: string; headers: Headers; body: string }> = [];
     let detailReads = 0;
@@ -318,7 +318,8 @@ describe("floorplan.js", () => {
     const chaosRequest = requests.find((request) => request.url.includes("/api/control/chaos"));
     expect(chaosRequest).toBeTruthy();
     expect(chaosRequest?.method).toBe("POST");
-    expect(chaosRequest?.headers.get("Authorization")).toBe("Bearer dash-key");
+    // Kein Authorization-Header mehr — Auth laeuft ueber das httpOnly-Session-Cookie (#402).
+    expect(chaosRequest?.headers.get("Authorization")).toBeNull();
     expect(JSON.parse(chaosRequest?.body ?? "{}")).toEqual({
       room_id: "buero-design-2",
       chaos_type: "AirConBroken",
@@ -335,7 +336,7 @@ describe("floorplan.js", () => {
 
   it("submits a room stimulus trigger and refreshes the detail drawer", async () => {
     const { document, window } = installDom();
-    await setTestApiKey("dash-key");
+    await setTestAuth(true);
 
     const requests: Array<{ url: string; method: string; headers: Headers; body: string }> = [];
     let detailReads = 0;
@@ -397,7 +398,8 @@ describe("floorplan.js", () => {
 
     const stimulusRequest = requests.find((request) => request.url.includes("/api/control/stimulus"));
     expect(stimulusRequest).toBeTruthy();
-    expect(stimulusRequest?.headers.get("Authorization")).toBe("Bearer dash-key");
+    // Kein Authorization-Header mehr — Auth laeuft ueber das httpOnly-Session-Cookie (#402).
+    expect(stimulusRequest?.headers.get("Authorization")).toBeNull();
     expect(JSON.parse(stimulusRequest?.body ?? "{}")).toEqual({
       room_id: "buero-design-2",
       stimulus_type: "temperature",

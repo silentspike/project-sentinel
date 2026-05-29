@@ -8,6 +8,7 @@ import { renderChaos, updateChaos } from './chaos.js';
 import { renderChat, initChat } from './chat.js';
 import { initControl } from './control.js';
 import { initTimeTravel, refreshTimeTravel } from './timetravel.js';
+import { refreshAuthStatus } from './auth.js';
 
 let ws = null;
 
@@ -109,6 +110,10 @@ function connectWebSocket() {
 
 async function init() {
   initNavigation();
+
+  // Auth-Status frueh ermitteln, damit alle Views (Floorplan/Control/Zeitreise) den
+  // korrekten Login-Zustand rendern (httpOnly-Cookie ist fuer JS unlesbar). (#402)
+  await refreshAuthStatus();
 
   // Lade initiale Daten parallel
   try {

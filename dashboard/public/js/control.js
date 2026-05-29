@@ -3,8 +3,8 @@
 // Traffic Control, Live Config, Snapshots.
 // KEIN innerHTML — nur textContent + DOM API.
 
-// API-Key: geteiltes In-Memory-Modul (siehe api-key.js)
-import { getApiKey, setApiKey, authHeaders } from './api-key.js';
+// Operator-Auth: server-side Session + httpOnly-Cookie (siehe auth.js)
+import { isAuthenticated, login, logout, refreshAuthStatus, markUnauthenticated } from './auth.js';
 
 let controlState = {
   connected: false,
@@ -17,8 +17,9 @@ let controlState = {
 };
 
 async function controlFetch(url, opts = {}) {
-  const headers = { ...authHeaders(), ...(opts.headers || {}) };
-  const resp = await fetch(url, { ...opts, headers });
+  // Session-Cookie wird same-origin automatisch mitgeschickt (kein JS-Token mehr).
+  const resp = await fetch(url, { ...opts, credentials: 'same-origin' });
+  if (resp.status === 401) markUnauthenticated();
   return resp;
 }
 
@@ -149,7 +150,7 @@ function renderProviderSection(container) {
   providerSelect.addEventListener('change', async () => {
     const resp = await controlFetch('/api/control/provider', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ provider: providerSelect.value }),
     });
     if (resp.ok) {
@@ -183,7 +184,7 @@ function renderProviderSection(container) {
       removeBtn.addEventListener('click', async () => {
         await controlFetch('/api/control/agent-provider', {
           method: 'DELETE',
-          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ agent_id: agentId }),
         });
         await loadControlStatus();
@@ -262,7 +263,7 @@ function renderLlmParams(container) {
     };
     const resp = await controlFetch('/api/control/config', {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(updates),
     });
     if (resp.ok) {
@@ -523,7 +524,7 @@ function renderPlatformAnalyses(container) {
     try {
       const resp = await controlFetch('/api/control/platform-analyze', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
       });
       if (!resp.ok) {
@@ -700,26 +701,44 @@ function renderPlatformState(container) {
   container.appendChild(section);
 }
 
-// ── API Key Eingabe ───────────────────────────────
+// ── Operator-Login / Logout ───────────────────────
+// Key wird per Login ge-POSTet (httpOnly-Session-Cookie), NIE in JS gehalten.
 
 function renderApiKeySection(container) {
   const section = el('div', 'control-section compact');
-
   const row = el('div', 'control-row');
-  row.appendChild(labelEl('API-Key:'));
-  const keyInput = document.createElement('input');
-  keyInput.type = 'password';
-  keyInput.id = 'api-key-input';
-  keyInput.className = 'control-input';
-  keyInput.placeholder = 'SENTINEL_DASHBOARD_API_KEY';
-  keyInput.value = getApiKey();
-  keyInput.addEventListener('change', () => {
-    setApiKey(keyInput.value);
-    showFeedback(container, 'API-Key gespeichert');
-  });
-  row.appendChild(keyInput);
-  section.appendChild(row);
 
+  if (isAuthenticated()) {
+    row.appendChild(labelEl('Operator:'));
+    const status = el('span', 'control-value');
+    status.textContent = 'Eingeloggt';
+    row.appendChild(status);
+    const logoutBtn = el('button', 'control-btn');
+    logoutBtn.id = 'logout-btn';
+    logoutBtn.textContent = 'Logout';
+    logoutBtn.addEventListener('click', async () => {
+      await logout();
+      showFeedback(container, 'Ausgeloggt');
+      renderControl();
+    });
+    row.appendChild(logoutBtn);
+  } else {
+    row.appendChild(labelEl('API-Key:'));
+    const keyInput = document.createElement('input');
+    keyInput.type = 'password';
+    keyInput.id = 'api-key-input';
+    keyInput.className = 'control-input';
+    keyInput.placeholder = 'SENTINEL_DASHBOARD_API_KEY';
+    keyInput.addEventListener('change', async () => {
+      const ok = await login(keyInput.value);
+      keyInput.value = '';
+      showFeedback(container, ok ? 'Eingeloggt' : 'Login fehlgeschlagen', !ok);
+      renderControl();
+    });
+    row.appendChild(keyInput);
+  }
+
+  section.appendChild(row);
   container.appendChild(section);
 }
 
@@ -728,7 +747,7 @@ function renderApiKeySection(container) {
 async function patchConfig(updates) {
   const resp = await controlFetch('/api/control/config', {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(updates),
   });
   if (resp.ok) {
@@ -815,6 +834,7 @@ function renderControl() {
 }
 
 async function initControl() {
+  await refreshAuthStatus();
   await loadControlStatus();
   renderControl();
 }
@@ -847,7 +867,8 @@ function renderSnapshotSection(container) {
     try {
       await fetch('/api/control/snapshot', {
         method: 'POST',
-        headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
         body: '{}',
       });
       await refreshSnapshotList(section);
@@ -927,7 +948,8 @@ async function refreshSnapshotList(section) {
       if (confirm('Simulation auf diesen Snapshot zuruecksetzen?\n\nSnapshot ID: ' + id)) {
         fetch('/api/control/restore', {
           method: 'POST',
-          headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ snapshot_id: id }),
         }).then(function() {
           alert('Restore gestartet');
