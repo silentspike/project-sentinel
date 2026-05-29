@@ -52,8 +52,8 @@ Issue Quality Gate 26645872696 completed with success.
 | AC-1 | `cmd/cortex-gateway/internal/capability/agent_policy.go` loads per-agent `[capabilities].tools` from agent TOML and validates tool/target permissions. Focused Go tests and real config count passed. | PASS |
 | AC-2 | Pipeline filters unauthorized extracted `tool_use` actions before response/persistence. Focused proxy test passed. | PASS |
 | AC-3 | Rejected action writes `agent_action_rejected` audit event with reason/tool/security metadata into the Event Store. Focused proxy test passed. | PASS |
-| AC-4 | Pending implementation. | Pending |
-| AC-5 | Pending implementation. | Pending |
+| AC-4 | Operator-chat injection regression blocks a forbidden `file_write` action and persists only an audit event. Focused proxy test passed. | PASS |
+| AC-5 | Legitimate baseline `move` action still appears in the response and persists as `agent_action_received`. Focused proxy test passed. | PASS |
 
 ## AC-1 Evidence
 
@@ -140,7 +140,46 @@ Observed:
 ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/proxy	0.940s
 ```
 
+## AC-4 / AC-5 Evidence
+
+Command:
+
+```bash
+cd cmd/cortex-gateway
+go test ./internal/proxy -run 'TestOperatorChatInjectionCannotPersistForbiddenToolAction|TestPipelineAllowsLegitimateMoveActionWithPolicy' -v
+```
+
+Observed:
+
+```text
+=== RUN   TestOperatorChatInjectionCannotPersistForbiddenToolAction
+2026/05/29 17:32:09 WARN 3-source assembly failed, using fallback agent_id=15 error="assembler not configured, use NewWithAssembler"
+2026/05/29 17:32:09 WARN agent action rejected by capability policy request_id=req-operator-injection-001 agent_id=15 agent_name="Hannah Meier" action_type=tool_use target=file_write:payroll.csv reason=tool_not_allowed
+2026/05/29 17:32:09 INFO pipeline request completed provider=mock request_class=agent_runtime effective_model=test-model policy_source=agent_runtime_policy duration=792.8µs tokens=9 actions=0 agent_id=15 agent_name="Hannah Meier"
+--- PASS: TestOperatorChatInjectionCannotPersistForbiddenToolAction (0.01s)
+=== RUN   TestPipelineAllowsLegitimateMoveActionWithPolicy
+2026/05/29 17:32:09 WARN 3-source assembly failed, using fallback agent_id=1 error="assembler not configured, use NewWithAssembler"
+2026/05/29 17:32:09 INFO pipeline request completed provider=mock request_class=agent_runtime effective_model=test-model policy_source=agent_runtime_policy duration=2.520188ms tokens=6 actions=1 agent_id=1 agent_name="Thomas Mueller"
+--- PASS: TestPipelineAllowsLegitimateMoveActionWithPolicy (0.01s)
+PASS
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/proxy	0.037s
+```
+
+Package check:
+
+```bash
+cd cmd/cortex-gateway
+go test ./internal/proxy ./internal/capability
+```
+
+Observed:
+
+```text
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/proxy	1.013s
+ok  	github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/capability	(cached)
+```
+
 ## Not Tested Yet
 
 - Go Gateway tests: pending implementation.
-- Deploy-VM runtime: pending; gateway remains inactive unless explicitly approved.
+- Deploy-VM runtime: not run in this task; gateway remains inactive unless explicitly approved.
