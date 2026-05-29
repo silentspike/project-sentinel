@@ -217,6 +217,53 @@ cargo remote -c -- clippy -p sentinel-ebpf --all-targets -- -D warnings
 PASS
 ```
 
+## Task 4 - PSI Coupling Into Bio, Mood, And Perception
+
+Decision:
+
+- Kernel eBPF remains an observability and judge signal path.
+- CPU and memory pressure enter the diegetic simulation through PSI, not by
+  feeding technical probe stalls directly into agent physiology.
+- Existing runtime path:
+  `/proc/pressure` -> `AdaptiveTickRate` -> daemon ECS `PsiMetrics` ->
+  `bio_system` -> `sentinel_bio::apply_psi_stress` -> Mood -> Perception.
+- Existing judge path:
+  eBPF publisher/NATS -> `sentinel-judge` eBPF consumer -> drift score
+  enrichment.
+
+Change:
+
+- Added `test_psi_pressure_flows_into_bio_mood_and_perception` in
+  `crates/sentinel-ecs/src/lib.rs`.
+- The test runs identical baseline and pressured worlds, then asserts:
+  stress increases by at least 25 points, comfort drops by at least 10 points,
+  mood arousal rises by more than 0.1, and body perception contains the raised
+  stress state.
+
+Checks:
+
+```text
+cargo fmt --check
+PASS
+```
+
+```text
+git diff --check
+PASS
+```
+
+```text
+cargo remote -c -- test -p sentinel-ecs test_psi_pressure_flows_into_bio_mood_and_perception
+running 1 test
+test tests::test_psi_pressure_flows_into_bio_mood_and_perception ... ok
+test result: ok. 1 passed; 0 failed
+```
+
+```text
+cargo remote -c -- clippy -p sentinel-ecs --all-targets -- -D warnings
+PASS
+```
+
 ## Benchmark Method
 
 Final #380 benchmark evidence must compare only same-VM runs:
