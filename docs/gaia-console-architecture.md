@@ -118,8 +118,14 @@ bereits selbst. Gaia ist die strategische/User-Schicht *darueber*, nicht ein kon
 ### Leitplanken (jede Gaia-Integration MUSS sie respektieren)
 1. **An `escalate_to_operator` andocken** — Gaia ist der Operator, empfaengt Eskalationen, macht sie
    sichtbar/beraet. KEIN zweiter Healing-LLM-Loop, `llm_analyzer` bleibt.
-2. **Personality/Evolution nicht direkt ueberschreiben** (TOML = unveraenderliche Identitaet; Evolution
-   ist autonom).
+2. **Evolution-Schicht nicht autonom/heimlich ueberschreiben.** Die *autonome* Evolution (redb: Voice-Style/
+   Behavioral-Notes, vom Nightrun) ist additiv und veraendert die Base-TOML NICHT — „TOML = unveraenderliche
+   Identitaet" meint genau das (die Evolution laesst die Base in Ruhe), NICHT dass der User sie nicht aendern darf.
+   **Ein expliziter User-Edit der Base-Personality ist legitim und wirkt LIVE** am laufenden Agent — KEIN
+   Despawn/Respawn (das wuerde Memory + Evolution zerstoeren): `apply_personality` (Live-Component-Update,
+   world.rs:1365) + TOML-Persistenz + **Gateway-DNA-Cache-Invalidierung** (der `TOMLLoader` cacht die Big-Five
+   pro Agent → Edit erreicht den Prompt erst nach Reload; Erweiterung von #440 auf Agent-DNA). Memory + Evolution
+   bleiben erhalten. Strukturelles (Role/Tier/Caps) ohnehin live. Despawn nur fuer *entfernte* Agents.
 3. **Keine Kollision mit CP-Actions** (Vorrang/Koordination — nicht den Agent despawnen, den die CP heilt).
 4. **Adaptive-Tick/Resource-Manager nicht uebersteuern**.
 5. **Task-Entity koexistiert** mit der emergenten Agent-Autonomie, ersetzt sie nicht.
