@@ -2,7 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use sentinel_common::agent_config::AgentConfigValidation;
 use serde::Deserialize;
 
 use crate::adaptive_tick::AdaptiveConfig;
@@ -627,6 +628,20 @@ impl DaemonConfig {
             .with_context(|| format!("Config parsen: {}", path.display()))?;
         Ok(file.daemon)
     }
+
+    /// Liefert die Agent-TOML Validierung passend zu `max_agents`.
+    pub fn agent_config_validation(&self) -> Result<AgentConfigValidation> {
+        let max_agent_id = u16::try_from(self.max_agents).map_err(|_| {
+            anyhow!(
+                "daemon.max_agents {} exceeds AgentId u16 range",
+                self.max_agents
+            )
+        })?;
+        if max_agent_id == 0 {
+            return Err(anyhow!("daemon.max_agents must be >= 1"));
+        }
+        Ok(AgentConfigValidation::with_max_agent_id(max_agent_id))
+    }
 }
 
 #[cfg(test)]
@@ -677,6 +692,14 @@ data_dir = "/tmp/data"
         assert!(file.daemon.operator_api.shared_secret.is_none());
         assert_eq!(file.daemon.tick_rate_ms, 1000);
         assert_eq!(file.daemon.max_agents, 30);
+        assert_eq!(
+            file.daemon
+                .agent_config_validation()
+                .unwrap()
+                .agent_id_bounds
+                .max,
+            30
+        );
         assert_eq!(file.daemon.zenoh_prefix, "sentinel");
         assert_eq!(file.daemon.time_scale, 1.0);
         assert_eq!(
@@ -743,6 +766,18 @@ data_dir = "/tmp/data"
                 .llm_max_failed_interventions,
             3
         );
+    }
+
+    #[test]
+    fn agent_config_validation_rejects_unrepresentable_max_agents() {
+        let toml_str = r#"
+[daemon]
+config_dir = "/tmp/cfg"
+data_dir = "/tmp/data"
+max_agents = 70000
+"#;
+        let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
+        assert!(file.daemon.agent_config_validation().is_err());
     }
 
     #[test]

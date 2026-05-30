@@ -5,6 +5,8 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
+use crate::{AgentId, AgentIdBounds};
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentConfig {
     pub identity: IdentityConfig,
@@ -78,6 +80,19 @@ pub struct BackgroundConfig {
     pub quirks: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AgentConfigValidation {
+    pub agent_id_bounds: AgentIdBounds,
+}
+
+impl AgentConfigValidation {
+    pub fn with_max_agent_id(max_agent_id: u16) -> Self {
+        Self {
+            agent_id_bounds: AgentIdBounds::new(max_agent_id),
+        }
+    }
+}
+
 impl PersonalityConfig {
     /// Validiert dass alle f32-Werte in [0.0, 1.0] liegen.
     pub fn validate(&self) -> Result<()> {
@@ -100,23 +115,34 @@ impl PersonalityConfig {
 
 /// Laedt eine einzelne Agent-Config aus einer TOML-Datei.
 pub fn load_agent_config(path: &Path) -> Result<AgentConfig> {
+    load_agent_config_with_validation(path, AgentConfigValidation::default())
+}
+
+/// Laedt eine einzelne Agent-Config mit expliziten Validierungsgrenzen.
+pub fn load_agent_config_with_validation(
+    path: &Path,
+    validation: AgentConfigValidation,
+) -> Result<AgentConfig> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read agent config: {}", path.display()))?;
     let config: AgentConfig = toml::from_str(&content)
         .with_context(|| format!("Failed to parse agent config: {}", path.display()))?;
     config.personality.validate()?;
-    // Validiere id Bereich 1-60
-    if config.identity.id == 0 || config.identity.id > 60 {
-        return Err(anyhow!(
-            "Agent id {} out of range (1-60)",
-            config.identity.id
-        ));
-    }
+    AgentId::new_with_bounds(config.identity.id, validation.agent_id_bounds)
+        .with_context(|| format!("Invalid agent id in {}", path.display()))?;
     Ok(config)
 }
 
 /// Laedt alle AGENT-*.toml Dateien aus einem Verzeichnis, sortiert nach ID.
 pub fn load_all_agents(dir: &Path) -> Result<Vec<AgentConfig>> {
+    load_all_agents_with_validation(dir, AgentConfigValidation::default())
+}
+
+/// Laedt alle AGENT-*.toml Dateien aus einem Verzeichnis mit expliziten Grenzen.
+pub fn load_all_agents_with_validation(
+    dir: &Path,
+    validation: AgentConfigValidation,
+) -> Result<Vec<AgentConfig>> {
     let mut agents = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -126,7 +152,7 @@ pub fn load_all_agents(dir: &Path) -> Result<Vec<AgentConfig>> {
                 .file_name()
                 .is_some_and(|n| n.to_string_lossy().starts_with("AGENT-"))
         {
-            agents.push(load_agent_config(&path)?);
+            agents.push(load_agent_config_with_validation(&path, validation)?);
         }
     }
     agents.sort_by_key(|a| a.identity.id);
@@ -276,24 +302,54 @@ mod tests {
     fn agent_id_range() {
         use tempfile::NamedTempFile;
 
-        // Test id = 0 (invalid)
-        let mut tmpfile = NamedTempFile::new().unwrap();
-        std::io::Write::write_all(
-            &mut tmpfile,
-            b"[identity]\nid = 0\nname = \"Test\"\nrole = \"Test\"\ndepartment = \"Test\"\nshift_set = 1\n[personality]\nopenness = 0.5\nconscientiousness = 0.5\nextraversion = 0.5\nagreeableness = 0.5\nneuroticism = 0.5\ncaffeine_tolerance = 0.5\nmorning_person = true\n[preferences]\nfavorite_room = \"test\"\ncoffee_preference = \"test\"\nlunch_time = \"12:00\"\n[background]\nbio = \"test\"\nquirks = []\n",
-        )
-        .unwrap();
-        let result = load_agent_config(tmpfile.path());
-        assert!(result.is_err());
+        fn agent_toml(id: u16) -> String {
+            format!(
+                r#"[identity]
+id = {id}
+name = "Test"
+role = "Test"
+department = "Test"
+shift_set = 1
 
-        // Test id = 61 (invalid)
-        let mut tmpfile = NamedTempFile::new().unwrap();
-        std::io::Write::write_all(
-            &mut tmpfile,
-            b"[identity]\nid = 61\nname = \"Test\"\nrole = \"Test\"\ndepartment = \"Test\"\nshift_set = 1\n[personality]\nopenness = 0.5\nconscientiousness = 0.5\nextraversion = 0.5\nagreeableness = 0.5\nneuroticism = 0.5\ncaffeine_tolerance = 0.5\nmorning_person = true\n[preferences]\nfavorite_room = \"test\"\ncoffee_preference = \"test\"\nlunch_time = \"12:00\"\n[background]\nbio = \"test\"\nquirks = []\n",
-        )
-        .unwrap();
-        let result = load_agent_config(tmpfile.path());
-        assert!(result.is_err());
+[personality]
+openness = 0.5
+conscientiousness = 0.5
+extraversion = 0.5
+agreeableness = 0.5
+neuroticism = 0.5
+caffeine_tolerance = 0.5
+morning_person = true
+
+[preferences]
+favorite_room = "test"
+coffee_preference = "test"
+lunch_time = "12:00"
+
+[background]
+bio = "test"
+quirks = []
+"#
+            )
+        }
+
+        fn write_agent(id: u16) -> NamedTempFile {
+            let mut tmpfile = NamedTempFile::new().unwrap();
+            std::io::Write::write_all(&mut tmpfile, agent_toml(id).as_bytes()).unwrap();
+            tmpfile
+        }
+
+        let zero = write_agent(0);
+        assert!(load_agent_config(zero.path()).is_err());
+
+        let default_overflow = write_agent(61);
+        assert!(load_agent_config(default_overflow.path()).is_err());
+
+        let custom_valid = write_agent(61);
+        let validation = AgentConfigValidation::with_max_agent_id(120);
+        let loaded = load_agent_config_with_validation(custom_valid.path(), validation).unwrap();
+        assert_eq!(loaded.identity.id, 61);
+
+        let custom_overflow = write_agent(121);
+        assert!(load_agent_config_with_validation(custom_overflow.path(), validation).is_err());
     }
 }

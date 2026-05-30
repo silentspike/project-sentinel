@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use tracing::{error, info, warn};
 
-use sentinel_common::agent_config::load_all_agents;
+use sentinel_common::agent_config::load_all_agents_with_validation;
 use sentinel_common::{DomainEvent, DomainEventPayload};
 use sentinel_hippocampus::{
     HippocampusService, NMDA_CONSOLIDATION_THRESHOLD, NMDA_MAX_CONSOLIDATION_EPISODES,
@@ -395,8 +395,20 @@ impl NightrunRunner {
         agents: &[String],
         trigger_shift_set: u8,
     ) -> (Vec<String>, std::collections::HashMap<String, String>) {
-        let agent_configs =
-            load_all_agents(Path::new(&self.config.agent_config_dir)).unwrap_or_default();
+        let agent_configs = match load_all_agents_with_validation(
+            Path::new(&self.config.agent_config_dir),
+            self.config.agent_config_validation(),
+        ) {
+            Ok(configs) => configs,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    agent_config_dir = %self.config.agent_config_dir,
+                    "Agent-TOMLs fuer Nightrun-Shift-Filter konnten nicht geladen werden; konservativer Fallback inkludiert Agents ohne TOML-Mapping"
+                );
+                Vec::new()
+            }
+        };
 
         // Name → AGENT-XX Mapping (fuer NATS-kompatible aggregate_ids)
         let name_to_id: std::collections::HashMap<String, String> = agent_configs
