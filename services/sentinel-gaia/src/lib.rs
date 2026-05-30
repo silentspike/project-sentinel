@@ -294,6 +294,94 @@ pub fn generate(spec: GaiaSpec) -> Result<GeneratedCompany> {
     })
 }
 
+pub fn read_spec(path: &Path) -> Result<GaiaSpec> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("read Gaia spec {}", path.display()))?;
+    let spec: GaiaSpec =
+        toml::from_str(&content).with_context(|| format!("parse Gaia spec {}", path.display()))?;
+    spec.validate()?;
+    Ok(spec)
+}
+
+pub fn validate_output_dir(root: &Path) -> Result<ValidationReport> {
+    let spec = read_spec(&root.join(GAIA_SPEC_FILENAME))?;
+    let validation = AgentConfigValidation::with_max_agent_id(spec.agent_count);
+    let agents = sentinel_common::agent_config::load_all_agents_with_validation(
+        &root.join("agents"),
+        validation,
+    )
+    .with_context(|| {
+        format!(
+            "load generated agents from {}",
+            root.join("agents").display()
+        )
+    })?;
+
+    if agents.len() != usize::from(spec.agent_count) {
+        bail!(
+            "output contains {} agents, expected {}",
+            agents.len(),
+            spec.agent_count
+        );
+    }
+
+    let mut ids = BTreeSet::new();
+    for agent in &agents {
+        if !ids.insert(agent.identity.id) {
+            bail!("duplicate generated AgentId {}", agent.identity.id);
+        }
+        if agent.runtime.nano_runtime.as_deref() != Some(RUNTIME_ECS_NATIVE) {
+            bail!(
+                "generated agent {} does not use runtime {}",
+                agent.identity.id,
+                RUNTIME_ECS_NATIVE
+            );
+        }
+    }
+
+    let rooms_path = root.join("rooms.toml");
+    let rooms_content = fs::read_to_string(&rooms_path)
+        .with_context(|| format!("read generated {}", rooms_path.display()))?;
+    let rooms: BuildingConfig = toml::from_str(&rooms_content)
+        .with_context(|| format!("parse generated {}", rooms_path.display()))?;
+    rooms
+        .validate(spec.agent_count)
+        .map_err(|errors| anyhow!("generated rooms.toml invalid: {}", errors.join("; ")))?;
+    let total_room_capacity = rooms.rooms.iter().map(|room| room.capacity as u32).sum();
+
+    let daemon_path = root.join("daemon.toml");
+    let daemon_content = fs::read_to_string(&daemon_path)
+        .with_context(|| format!("read generated {}", daemon_path.display()))?;
+    let daemon_max_agents = table_int(&daemon_content, &["daemon", "max_agents"])?;
+    if daemon_max_agents != u64::from(spec.agent_count) {
+        bail!(
+            "daemon.max_agents {} != spec.agent_count {}",
+            daemon_max_agents,
+            spec.agent_count
+        );
+    }
+
+    let nightrun_path = root.join("nightrun.toml");
+    let nightrun_content = fs::read_to_string(&nightrun_path)
+        .with_context(|| format!("read generated {}", nightrun_path.display()))?;
+    let nightrun_max_agent_id = table_int(&nightrun_content, &["nightrun", "max_agent_id"])?;
+    if nightrun_max_agent_id != u64::from(spec.agent_count) {
+        bail!(
+            "nightrun.max_agent_id {} != spec.agent_count {}",
+            nightrun_max_agent_id,
+            spec.agent_count
+        );
+    }
+
+    Ok(ValidationReport {
+        agents: agents.len(),
+        rooms: rooms.rooms.len(),
+        total_room_capacity,
+        daemon_max_agents,
+        nightrun_max_agent_id,
+    })
+}
+
 impl GeneratedCompany {
     pub fn file(&self, relative_path: impl AsRef<Path>) -> Option<&GeneratedFile> {
         let relative_path = relative_path.as_ref();
@@ -1143,6 +1231,19 @@ mod tests {
         assert_eq!(agents.len(), 75);
         assert_eq!(agents[0].identity.id, 1);
         assert_eq!(agents[74].identity.id, 75);
+    }
+
+    #[test]
+    fn validate_output_dir_checks_written_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let generated = generate(GaiaSpec::example()).unwrap();
+        generated.write_to_dir(tmp.path(), false).unwrap();
+
+        let report = validate_output_dir(tmp.path()).unwrap();
+
+        assert_eq!(report.agents, 75);
+        assert_eq!(report.daemon_max_agents, 75);
+        assert_eq!(report.nightrun_max_agent_id, 75);
     }
 
     #[test]
