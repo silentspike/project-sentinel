@@ -148,6 +148,21 @@ The `.env` file holds runtime values (NATS URL, dashboard port). The
 `.make.local` file holds build values (cargo remote server address, deploy
 target). Neither file is committed.
 
+### Generate a Company Config
+
+Gaia can bootstrap a fresh Sentinel company configuration without LLM calls:
+
+```bash
+cargo run -p sentinel-gaia -- print-example-spec > /tmp/gaia-spec.toml
+cargo run -p sentinel-gaia -- init --spec /tmp/gaia-spec.toml --output-dir /tmp/sentinel-config --yes
+cargo run -p sentinel-gaia -- validate --output-dir /tmp/sentinel-config
+```
+
+For an operator-style smoke, build `sentinel-daemon` and add
+`--daemon-dry-run --daemon-bin <path-to-sentinel-daemon>` to `init`. Gaia
+persists its own input as `gaia-spec.toml` and deliberately leaves
+`company.toml` to the Gateway/company-context schema.
+
 ### Build
 
 ```bash
@@ -290,7 +305,7 @@ target; the docker demo is a deliberate behavioral subset.
 | Tag verified-badge on GitHub | ✅ verified=true (Ed25519) | n/a | n/a |
 | OpenGraph social-preview image | ⏳ image in repo (`docs/images/opengraph-preview.png`); upload via repo Settings → Social preview pending (#351) | n/a | n/a |
 | Demo binaries for arm64 / Apple Silicon | ⏳ planned (currently linux-x86_64 only) | n/a | n/a |
-| Multi-tenant company configs ("Gaia firmen-konfigurator") | ⏳ tracked as roadmap issue (#266) | n/a | n/a |
+| Multi-tenant company configs (`sentinel-gaia`) | ✅ deterministic generator + CLI init/validate path | n/a | yes (offline config generation + daemon dry-run) |
 
 See [docs/known-limitations.md](docs/known-limitations.md) for the full
 caveat list.
@@ -300,6 +315,7 @@ caveat list.
 | Path                         | Contents                                                    |
 |------------------------------|-------------------------------------------------------------|
 | `crates/`                    | 17 Rust crates (ECS, bio, physics, sandbox, eBPF, etc.)     |
+| `services/sentinel-gaia/`    | Gaia company-config generator + CLI                         |
 | `services/sentinel-daemon/`  | Daemon + controlplane                                       |
 | `services/sentinel-judge/`   | Quality / drift monitor (Go)                                |
 | `services/sentinel-nightrun/`| Nightly consolidation (Rust)                                |

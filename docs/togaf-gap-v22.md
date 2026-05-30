@@ -23,6 +23,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | Item                          | Status | Evidence |
 |-------------------------------|--------|----------|
 | 60 LLM-persona agents defined | ✅ | `config/agents/AGENT-01.toml` … `AGENT-60.toml` |
+| Gaia company bootstrap (#414/#415/#416) | ✅ | `sentinel-gaia` generates and validates `gaia-spec.toml`, Agent TOMLs, `rooms.toml`, `daemon.toml`, and `nightrun.toml`; AgentId bounds are configurable while preserving the default 60-agent cohort |
 | 4-shift assignment (1+2+3+0)  | ✅ | `shift_set` field in each agent TOML; counts 17/17/17/9 |
 | PixelPerfekt narrative        | ✅ | `config/company-context.md`, [docs/glossary.md](glossary.md) |
 | 5 background services         | ✅ | sentinel-daemon, cortex-gateway, sentinel-judge, sentinel-nightrun, sentinel-nats-bridge |
@@ -70,7 +71,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 
 | Item                          | Status | Evidence |
 |-------------------------------|--------|----------|
-| Rust workspace (17 crates + 4 Rust services) | ✅ | `Cargo.toml` workspace members plus component README coverage in [docs/component-readmes.md](component-readmes.md) |
+| Rust workspace (17 crates + 5 Rust services) | ✅ | `Cargo.toml` workspace members plus component README coverage in [docs/component-readmes.md](component-readmes.md) |
 | Go workspace (4 modules)      | ✅ | `go.work` |
 | Bun + Hono dashboard          | ✅ | `dashboard/` |
 | Build server pattern          | ✅ | `cargo remote --` (server IP injected via `.make.local`) |
@@ -129,7 +130,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 
 | Item                          | Status | Evidence |
 |-------------------------------|--------|----------|
-| Component-level READMEs       | ✅ | #383: 25 current Rust/Go component READMEs indexed in [docs/component-readmes.md](component-readmes.md); coverage checked by `scripts/check-component-readmes.sh` |
+| Component-level READMEs       | ✅ | #383: 26 current Rust/Go component READMEs indexed in [docs/component-readmes.md](component-readmes.md); coverage checked by `scripts/check-component-readmes.sh` |
 | llms.txt index                | ✅ | `llms.txt` |
 | Glossary                      | ✅ | [docs/glossary.md](glossary.md) |
 | Governance ↔ code map         | ✅ | [docs/governance.md](governance.md) |
@@ -162,7 +163,6 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 
 | GitHub issue | Cluster | Topic |
 |--------------|---------|-------|
-| #266 | 01 | Gaia firmen-konfigurator (multi-tenant company definitions) |
 | #278 | 11 | Non-blocking nightrun |
 | #336 | 10 | Acronym glossary section + README cross-links (good-first-issue) |
 
