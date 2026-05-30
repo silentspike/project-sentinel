@@ -753,6 +753,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let (nightrun_tx, nightrun_rx) = mpsc::channel::<sentinel_common::OperatorNightrunCommand>();
     let (snapshot_tx, snapshot_rx) = mpsc::channel::<sentinel_common::OperatorSnapshotCommand>();
     let (restore_tx, restore_rx) = mpsc::channel::<sentinel_common::OperatorRestoreCommand>();
+    let (config_apply_tx, config_apply_rx) =
+        mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>();
     let (prune_tx, prune_rx) = mpsc::channel::<i64>();
     let (evolution_result_tx, evolution_result_rx) = mpsc::channel::<EvolutionResult>();
     let evolution_job_tx = crate::evolution_task::spawn_evolution_background_task(
@@ -885,6 +887,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 nightrun_agent_counts,
                 snapshot_tx.clone(),
                 restore_tx.clone(),
+                config_apply_tx.clone(),
+                config.max_agents,
+                agent_validation,
                 Arc::clone(&event_store),
                 prune_tx.clone(),
                 Arc::clone(&state_store),

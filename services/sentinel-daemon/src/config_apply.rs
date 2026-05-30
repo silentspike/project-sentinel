@@ -6,10 +6,11 @@
 //! passieren im Orchestrator, der den `AgentDiff` konsumiert (Handles leben dort).
 
 use bevy_ecs::prelude::{Entity, World};
-use sentinel_common::agent_config::AgentConfig;
+use sentinel_common::agent_config::{AgentConfig, AgentConfigValidation};
 use sentinel_common::components::AgentIdentity;
 use sentinel_common::room::BuildingConfig;
-use sentinel_common::AgentId;
+use sentinel_common::{AgentId, OperatorConfigApplyCommand};
+use std::collections::HashSet;
 
 /// Delta zwischen aktuell angewandter und neuer Agent-Config (per `identity.id`).
 #[derive(Debug, Default, PartialEq)]
@@ -53,6 +54,55 @@ pub fn compute_agent_diff(old: &[AgentConfig], new: &[AgentConfig]) -> AgentDiff
 /// True, wenn sich die Building-/Raum-Config geaendert hat (per `PartialEq`).
 pub fn building_changed(old: &BuildingConfig, new: &BuildingConfig) -> bool {
     old != new
+}
+
+/// Validiert eine Apply-Anfrage **vor jeder Mutation**. Sammelt ALLE Fehler (keine
+/// Early-Exit-Ueberraschung). Gilt fuer beide Modi: nach einem Apply enthaelt die Welt genau
+/// `cmd.agents` → die Agent-Anzahl muss `max_agents` (#414) respektieren; das Gebaeude muss alle
+/// Agents fassen (Kapazitaet) und konsistente Adjacency haben; jede Personality in [0,1]; jede
+/// AgentId in den Daemon-Grenzen; keine doppelten IDs.
+pub fn validate_config_apply(
+    cmd: &OperatorConfigApplyCommand,
+    max_agents: usize,
+    validation: AgentConfigValidation,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+
+    if cmd.agents.len() > max_agents {
+        errors.push(format!(
+            "agent count {} exceeds daemon.max_agents {}",
+            cmd.agents.len(),
+            max_agents
+        ));
+    }
+
+    // Gebaeude muss alle Agents fassen (min_capacity = Agent-Anzahl) + Adjacency/Duplikate.
+    let min_capacity = u16::try_from(cmd.agents.len()).unwrap_or(u16::MAX);
+    if let Err(room_errors) = cmd.building.validate(min_capacity) {
+        errors.extend(room_errors);
+    }
+
+    let mut seen = HashSet::new();
+    for agent in &cmd.agents {
+        if !seen.insert(agent.identity.id) {
+            errors.push(format!("duplicate agent id {}", agent.identity.id));
+        }
+        if let Err(e) = agent.personality.validate() {
+            errors.push(format!(
+                "agent {} personality invalid: {e}",
+                agent.identity.id
+            ));
+        }
+        if let Err(e) = AgentId::new_with_bounds(agent.identity.id, validation.agent_id_bounds) {
+            errors.push(format!("agent {} id out of bounds: {e}", agent.identity.id));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 /// Findet die ECS-Entity eines Agents anhand seiner `AgentId`.
@@ -178,5 +228,89 @@ mod tests {
     fn apply_agent_update_returns_false_for_absent_agent() {
         let (mut world, _) = sentinel_ecs::create_simulation_world();
         assert!(!apply_agent_update(&mut world, &agent(99, "Ghost", "None", 0.5)));
+    }
+
+    use sentinel_common::room::{BuildingConfig, BuildingMeta, RoomConfig, RoomType};
+    use sentinel_common::ApplyMode;
+
+    fn building(capacity: u16) -> BuildingConfig {
+        BuildingConfig {
+            building: BuildingMeta {
+                name: "Test".to_string(),
+                address: "Teststr. 1".to_string(),
+                floors: 1,
+            },
+            rooms: vec![RoomConfig {
+                id: "empfang".to_string(),
+                name: "Empfang".to_string(),
+                floor: 0,
+                capacity,
+                room_type: RoomType::Common,
+                adjacent: vec![],
+                department: None,
+                has_coffee_machine: false,
+                has_printer: false,
+            }],
+        }
+    }
+
+    fn cmd(agents: Vec<AgentConfig>, capacity: u16) -> OperatorConfigApplyCommand {
+        OperatorConfigApplyCommand {
+            mode: ApplyMode::Live,
+            agents,
+            building: building(capacity),
+        }
+    }
+
+    fn validation(max_id: u16) -> AgentConfigValidation {
+        AgentConfigValidation::with_max_agent_id(max_id)
+    }
+
+    #[test]
+    fn validate_accepts_valid_config() {
+        let c = cmd(vec![agent(1, "Anna", "Dev", 0.5), agent(2, "Bob", "PM", 0.5)], 10);
+        assert!(validate_config_apply(&c, 10, validation(60)).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_too_many_agents() {
+        let c = cmd(
+            vec![agent(1, "A", "x", 0.5), agent(2, "B", "y", 0.5), agent(3, "C", "z", 0.5)],
+            10,
+        );
+        let errs = validate_config_apply(&c, 2, validation(60)).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("exceeds daemon.max_agents")));
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_personality() {
+        let c = cmd(vec![agent(1, "Anna", "Dev", 1.5)], 10); // openness 1.5 > 1.0
+        let errs = validate_config_apply(&c, 10, validation(60)).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("personality invalid")));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_ids() {
+        let c = cmd(vec![agent(1, "Anna", "Dev", 0.5), agent(1, "Clone", "Dev", 0.5)], 10);
+        let errs = validate_config_apply(&c, 10, validation(60)).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("duplicate agent id 1")));
+    }
+
+    #[test]
+    fn validate_rejects_insufficient_room_capacity() {
+        // 3 Agents, Gebaeude fasst nur 1 → Kapazitaetsfehler.
+        let c = cmd(
+            vec![agent(1, "A", "x", 0.5), agent(2, "B", "y", 0.5), agent(3, "C", "z", 0.5)],
+            1,
+        );
+        let errs = validate_config_apply(&c, 60, validation(60)).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("capacity")));
+    }
+
+    #[test]
+    fn validate_rejects_agent_id_over_bound() {
+        let c = cmd(vec![agent(99, "Over", "x", 0.5)], 10);
+        let errs = validate_config_apply(&c, 10, validation(60)).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("id out of bounds")));
     }
 }
