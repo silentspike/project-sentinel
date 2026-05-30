@@ -60,6 +60,15 @@ impl LandlockRuleset {
         }
     }
 
+    /// Allows the concrete workload entrypoint in addition to the static runtime binaries.
+    pub fn with_entrypoint_exec(mut self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        if !self.exec_paths.iter().any(|existing| existing == &path) {
+            self.exec_paths.push(path);
+        }
+        self
+    }
+
     /// Applies the Landlock ruleset to the current process (irreversible).
     ///
     /// Must be called in the bwrap child process BEFORE exec'ing the agent.
@@ -182,6 +191,20 @@ mod tests {
         assert!(!rs.write_paths.contains(&PathBuf::from("/")));
         assert!(!rs.write_paths.contains(&PathBuf::from("/etc")));
         assert!(!rs.write_paths.contains(&PathBuf::from("/company")));
+    }
+
+    #[test]
+    fn ruleset_allows_explicit_entrypoint_once() {
+        let rs = LandlockRuleset::for_agent("thomas")
+            .with_entrypoint_exec("/usr/bin/sleep")
+            .with_entrypoint_exec("/usr/bin/sleep");
+
+        let occurrences = rs
+            .exec_paths
+            .iter()
+            .filter(|path| *path == &PathBuf::from("/usr/bin/sleep"))
+            .count();
+        assert_eq!(occurrences, 1);
     }
 
     #[test]

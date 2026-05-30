@@ -4,6 +4,7 @@ pub mod bwrap;
 pub mod cgroups;
 pub mod enforcer;
 pub mod landlock;
+pub mod nano;
 pub mod netns;
 pub mod psi_publisher;
 
@@ -13,4 +14,5 @@ pub use cgroups::{
 };
 pub use enforcer::{AgentProcess, SandboxEnforcer, SandboxHandle, SandboxWarning};
 pub use landlock::LandlockRuleset;
+pub use nano::BwrapNanoRuntime;
 pub use netns::NetworkNsConfig;

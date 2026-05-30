@@ -10,12 +10,14 @@ pub mod components;
 pub mod events;
 pub mod feature_flags;
 pub mod generated;
+pub mod nano_runtime;
 pub mod psi;
 pub mod room;
 pub mod snapshot_codec;
 pub mod types;
 
 pub use events::{DomainEvent, DomainEventPayload};
+pub use nano_runtime::*;
 pub use snapshot_codec::{
     decode_snapshot_cursor, decode_world_snapshot, encode_snapshot_cursor, encode_world_snapshot,
     SnapshotCursor,

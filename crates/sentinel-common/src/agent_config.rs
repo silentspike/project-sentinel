@@ -12,6 +12,8 @@ pub struct AgentConfig {
     pub preferences: PreferencesConfig,
     pub background: BackgroundConfig,
     #[serde(default)]
+    pub runtime: RuntimeSelectionConfig,
+    #[serde(default)]
     pub capabilities: CapabilitiesConfig,
 }
 
@@ -25,6 +27,16 @@ pub struct CapabilitiesConfig {
     /// Erlaubte Dateisystem-Pfade fuer FileRead/FileWrite.
     #[serde(default)]
     pub sandbox_allowed_paths: Vec<String>,
+}
+
+/// Optional Nano-Container runtime selection for this workload.
+///
+/// Empty means the caller must provide an explicit fallback policy. The parser
+/// does not inject a default runtime because DEV-007 makes the contract plural.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RuntimeSelectionConfig {
+    #[serde(default)]
+    pub nano_runtime: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
