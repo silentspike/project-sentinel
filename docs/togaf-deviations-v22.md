@@ -73,6 +73,7 @@ Each deviation records: **what** the spec says, **what** the code does,
 | Field | Value |
 |-------|-------|
 | Cluster | 12 (Zielarchitektur / Nano-Container Platform) |
+| Status | Superseded by DEV-007 (#407) on 2026-05-29. Historical record only; no longer the active runtime contract. |
 | Spec | Cluster 12 leaves the defining platform fork open: a WASM-bound runtime with millisecond spin-up and high density, or arbitrary native code with full runtime freedom but container/Firecracker-like cost. |
 | Decision | WASM/WASI on Wasmtime is the default Nano-Container runtime contract. Arbitrary native code is not part of the default density/portability promise; it is allowed only through an explicit native Escape-Hatch-Pool with separate scheduling, stronger isolation, and no millisecond spin-up guarantee. |
 | Runtime contract | Default runtime: `wasm+wasi` via `crates/sentinel-wasm/` and the sandbox capability registry. Native runtime: opt-in pool for workloads that prove they cannot fit WASM/WASI, isolated outside the default hot path. |
@@ -81,6 +82,21 @@ Each deviation records: **what** the spec says, **what** the code does,
 | Consequences | Follow-up work under #397 must design around `wasm+wasi` as the baseline. Native support must be tracked as an explicit exception path with separate capacity planning, security review, and verification. Clusters 00-11 remain untouched until a Cluster 12 building block is validated from concrete agent-system need. |
 | Files | `docs/togaf-deviations-v22.md`, `crates/sentinel-wasm/`, `crates/sentinel-sandbox/`, #396, #397 |
 | Revisit when | real customer or agent workloads repeatedly require native runtimes, WASI cannot cover the needed system interface, or native escape-hatch usage becomes common enough to threaten the platform's default density and security assumptions |
+
+## DEV-007 — Nano-Container CRI contract without a default runtime
+
+| Field | Value |
+|-------|-------|
+| Cluster | 12 (Zielarchitektur / Nano-Container Platform) |
+| Spec | Cluster 12 needs a Nano-Container execution contract but does not require a single runtime family. The architecture must remain open for dense in-process ECS workloads, WASM/WASI tools, hardened host processes, and later microVM isolation. |
+| Decision | The active Nano-Container contract is runtime-agnostic and CRI-style. Workloads select an explicit runtime key; there is no global default runtime. An orchestrator may configure an explicit fallback key, but that fallback is policy data, not an architectural default. |
+| Runtime contract | A compliant runtime implements seven operations: `spawn`, `exec`, `snapshot`, `restore`, `migrate`, `health`, and `isolate`. Initial runtime families are `ecs-native`, `wasm-wasmtime`, `bwrap-landlock`, and future `microvm`. |
+| Options considered | Option 1: fixed WASM/WASI default with native escape hatch (DEV-006). Option 2: native/container-first runtime as the baseline. Option 3: plural CRI contract with per-workload runtime selection. DEV-007 chooses Option 3. |
+| Trade-offs | The plural contract keeps runtime density and portability available where they fit, while allowing stronger process or microVM isolation for workloads that need it. The cost is a stricter conformance harness and explicit workload routing: every runtime must document snapshot semantics and every caller must choose a runtime key or a configured fallback. |
+| Why | The maintainer decision on 2026-05-29 defines Project Sentinel's Nano-Container axis as "Beyond Kubernetes": one contract, multiple runtime implementations, and workload-specific selection. This supersedes the earlier WASM-default choice without rejecting WASM/WASI as one strong runtime option. |
+| Consequences | #408 defines the shared `NanoRuntime` trait and conformance harness. #409 and #410 must prove their adapters against that harness. #411 owns registry and selection policy. Cross-architecture gate work (#394/#406) remains coupled: runtime contracts that cross architecture boundaries must keep replay, snapshot, and isolation evidence explicit. |
+| Files | `docs/togaf-deviations-v22.md`, `docs/togaf-gap-v22.md`, `crates/sentinel-common/src/nano_runtime.rs`, `crates/sentinel-runtime/`, `crates/sentinel-wasm/`, `crates/sentinel-sandbox/`, #397, #407, #408, #409, #410, #411 |
+| Revisit when | microVM support moves from future runtime family to implemented adapter; cross-node migration becomes a product requirement; or conformance evidence shows the seven-operation contract is too weak or too broad for real workloads |
 
 ---
 

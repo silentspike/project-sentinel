@@ -4686,6 +4686,7 @@ mod tests {
                 bio: "Test Agent".to_string(),
                 quirks: vec!["testing".to_string()],
             },
+            runtime: Default::default(),
             capabilities: Default::default(),
         }
     }

@@ -17,6 +17,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+sentinel-common = { path = "../sentinel-common", features = ["test-util"] }
 
 [[bin]]
 name = "breakout-helper"

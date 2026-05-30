@@ -5,6 +5,10 @@ edition = "2021"
 license = "MIT"
 publish = false
 
+[features]
+default = []
+test-util = []
+
 [dependencies]
 bevy_ecs = { workspace = true }
 flatbuffers = { workspace = true }
