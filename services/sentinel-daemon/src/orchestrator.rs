@@ -18,10 +18,10 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use tracing::{debug, error, info, warn};
 
-use sentinel_common::agent_config::{load_all_agents, AgentConfig};
+use sentinel_common::agent_config::{load_all_agents_with_validation, AgentConfig};
 use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::events::{DomainEvent, DomainEventPayload};
-use sentinel_common::{AgentId, OperatorCommand, Perception};
+use sentinel_common::{AgentId, AgentIdBounds, OperatorCommand, Perception};
 use sentinel_ebpf::collector::MetricsSnapshot;
 use sentinel_ebpf::EbpfCollector;
 use sentinel_ecs::{
@@ -68,6 +68,16 @@ fn shift_hours(shift_set: u8) -> (u8, u8) {
 /// CPU: 1 core, Memory: 256MB, IO: 300 IOPS + 10MB/s.
 fn default_agent_limits() -> CgroupLimits {
     CgroupLimits::default()
+}
+
+fn parse_judge_alert_agent_id(agent_id: &str, bounds: AgentIdBounds) -> Result<AgentId> {
+    let agent_num = agent_id
+        .strip_prefix("AGENT-")
+        .ok_or_else(|| anyhow!("Judge alert agent id {agent_id} lacks AGENT- prefix"))?
+        .parse::<u16>()
+        .with_context(|| format!("Judge alert agent id {agent_id} has invalid number"))?;
+    AgentId::new_with_bounds(agent_num, bounds)
+        .with_context(|| format!("Judge alert agent id {agent_id} is outside configured bounds"))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -567,7 +577,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
     // -- Agent-Definitionen laden --
     let agents_dir = config.config_dir.join("agents");
-    let all_agents = load_all_agents(&agents_dir)
+    let agent_validation = config.agent_config_validation()?;
+    let all_agents = load_all_agents_with_validation(&agents_dir, agent_validation)
         .with_context(|| format!("Agents laden aus: {}", agents_dir.display()))?;
     info!(
         total_agents = all_agents.len(),
@@ -1030,6 +1041,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
         // Alert-Receiver: DomainEvent persistieren + Prometheus Counter + Log
         let es = Arc::clone(&alert_event_store);
+        let alert_agent_id_bounds = agent_validation.agent_id_bounds;
         // Gateway URL for model-swap HTTP calls (ADR-001: swap via NATS alert → HTTP to Gateway)
         let gateway_url = std::env::var("CORTEX_GATEWAY_URL")
             .unwrap_or_else(|_| "http://localhost:8081".to_string());
@@ -1046,13 +1058,18 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 counter.increment();
 
                 // DomainEvent in Limbo persistieren
-                // Parse "AGENT-XX" → u16 → AgentId
-                let agent_num: u16 = alert
-                    .agent_id
-                    .strip_prefix("AGENT-")
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0);
-                let agent_id = AgentId::new(agent_num).unwrap_or(AgentId(1));
+                // Parse "AGENT-XX" → u16 → AgentId with the same bounds as Agent-TOMLs.
+                let agent_id =
+                    parse_judge_alert_agent_id(&alert.agent_id, alert_agent_id_bounds).unwrap_or_else(
+                        |error| {
+                            warn!(
+                                error = %error,
+                                agent = %alert.agent_id,
+                                "Judge Alert AgentId konnte nicht validiert werden; fallback auf AGENT-01"
+                            );
+                            AgentId(1)
+                        },
+                    );
                 let payload = DomainEventPayload::JudgeAlertReceived {
                     agent_id,
                     alert_type: alert.alert_type.clone(),
@@ -4492,6 +4509,18 @@ mod tests {
     use std::sync::Arc;
 
     static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn judge_alert_agent_id_uses_configured_bounds() {
+        let bounds = AgentIdBounds::new(120);
+
+        assert_eq!(
+            parse_judge_alert_agent_id("AGENT-75", bounds).unwrap(),
+            AgentId(75)
+        );
+        assert!(parse_judge_alert_agent_id("AGENT-121", bounds).is_err());
+        assert!(parse_judge_alert_agent_id("agent-75", bounds).is_err());
+    }
 
     fn record_projection_restart(_service_name: &str) -> bool {
         PROJECTION_RESTART_CALLS.fetch_add(1, Ordering::SeqCst);

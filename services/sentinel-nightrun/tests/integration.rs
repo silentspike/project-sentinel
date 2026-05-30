@@ -57,6 +57,7 @@ impl TestHarness {
             timeout_total_secs: 7200,
             max_episodes_per_agent: 1000,
             max_jobs_per_run: 100,
+            max_agent_id: sentinel_common::DEFAULT_MAX_AGENT_ID,
         };
 
         Self {
@@ -166,6 +167,7 @@ fn ac2_narratives_persist_after_consolidation() {
             timeout_total_secs: 7200,
             max_episodes_per_agent: 1000,
             max_jobs_per_run: 100,
+            max_agent_id: sentinel_common::DEFAULT_MAX_AGENT_ID,
         };
 
         let eps = vec![
@@ -302,6 +304,7 @@ fn resume_continues_partial_run() {
             timeout_total_secs: 7200,
             max_episodes_per_agent: 1000,
             max_jobs_per_run: 100,
+            max_agent_id: sentinel_common::DEFAULT_MAX_AGENT_ID,
         };
 
         let runner = NightrunRunner::new(hc, es, jq, settings, "run-resume".into(), false);
@@ -465,6 +468,7 @@ fn ac18_3_guardrails_deterministic() {
         timeout_total_secs: 7200,
         max_episodes_per_agent: 100,
         max_jobs_per_run: 100,
+        max_agent_id: sentinel_common::DEFAULT_MAX_AGENT_ID,
     };
     let gc = GuardrailController::from_settings(&settings);
 
@@ -511,6 +515,7 @@ fn ac18_4_degradation_documented() {
         timeout_total_secs: 7200,
         max_episodes_per_agent: 3,
         max_jobs_per_run: 100,
+        max_agent_id: sentinel_common::DEFAULT_MAX_AGENT_ID,
     };
 
     let runner = NightrunRunner::new(hc, es, jq, settings, "run-degrade".into(), false);
