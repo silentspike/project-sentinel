@@ -48,6 +48,14 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_id_custom_bounds() {
+        let bounds = AgentIdBounds::new(120);
+        assert!(AgentId::new_with_bounds(61, bounds).is_ok());
+        assert!(AgentId::new_with_bounds(120, bounds).is_ok());
+        assert!(AgentId::new_with_bounds(121, bounds).is_err());
+    }
+
+    #[test]
     fn test_room_id_valid() {
         assert!(RoomId::new(1).is_ok());
         assert!(RoomId::new(15).is_ok());
