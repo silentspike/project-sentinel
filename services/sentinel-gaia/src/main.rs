@@ -1,8 +1,8 @@
-use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{env, fs};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -119,7 +119,9 @@ fn init(args: InitArgs) -> Result<()> {
     };
     let generated = generate(spec)?;
     let report = generated.validate()?;
-    print_preview(&generated, &report);
+    if !args.json {
+        print_preview(&generated, &report);
+    }
 
     if !args.yes && !confirm("Write these files? [y/N] ")? {
         bail!("aborted by user");
@@ -400,26 +402,40 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn run_daemon_dry_run(daemon_bin: &Path, output_dir: &Path) -> Result<()> {
-    let daemon_config = output_dir.join("daemon.toml");
+    let daemon_bin = daemon_command_path(daemon_bin)?;
+    let daemon_config = daemon_config_path(output_dir)?;
     let working_dir = daemon_working_dir(output_dir)?;
-    let status = Command::new(daemon_bin)
+    let output = Command::new(&daemon_bin)
         .arg("--config")
         .arg(&daemon_config)
         .arg("--dry-run")
         .current_dir(&working_dir)
-        .status()
+        .output()
         .with_context(|| format!("run daemon dry-run via {}", daemon_bin.display()))?;
 
-    if !status.success() {
-        bail!("daemon dry-run failed with status {status}");
+    if !output.status.success() {
+        if !output.stdout.is_empty() {
+            eprintln!(
+                "daemon dry-run stdout:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        if !output.stderr.is_empty() {
+            eprintln!(
+                "daemon dry-run stderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        bail!("daemon dry-run failed with status {}", output.status);
     }
     Ok(())
 }
 
 fn start_daemon(daemon_bin: &Path, output_dir: &Path) -> Result<bool> {
-    let daemon_config = output_dir.join("daemon.toml");
+    let daemon_bin = daemon_command_path(daemon_bin)?;
+    let daemon_config = daemon_config_path(output_dir)?;
     let working_dir = daemon_working_dir(output_dir)?;
-    let child = Command::new(daemon_bin)
+    let child = Command::new(&daemon_bin)
         .arg("--config")
         .arg(&daemon_config)
         .current_dir(&working_dir)
@@ -430,6 +446,22 @@ fn start_daemon(daemon_bin: &Path, output_dir: &Path) -> Result<bool> {
         .with_context(|| format!("start daemon via {}", daemon_bin.display()))?;
     println!("sentinel-daemon pid {}", child.id());
     Ok(true)
+}
+
+fn daemon_command_path(daemon_bin: &Path) -> Result<PathBuf> {
+    if daemon_bin.is_absolute() || daemon_bin.components().count() == 1 {
+        return Ok(daemon_bin.to_path_buf());
+    }
+
+    env::current_dir()
+        .map(|cwd| cwd.join(daemon_bin))
+        .with_context(|| format!("resolve daemon binary {}", daemon_bin.display()))
+}
+
+fn daemon_config_path(output_dir: &Path) -> Result<PathBuf> {
+    let candidate = output_dir.join("daemon.toml");
+    fs::canonicalize(&candidate)
+        .with_context(|| format!("resolve generated daemon config {}", candidate.display()))
 }
 
 fn daemon_working_dir(output_dir: &Path) -> Result<PathBuf> {

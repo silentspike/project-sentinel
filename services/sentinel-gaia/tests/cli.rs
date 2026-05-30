@@ -47,7 +47,9 @@ fn init_from_spec_writes_valid_configs_and_protects_existing_output() {
         "{}",
         String::from_utf8_lossy(&init.stderr)
     );
-    assert!(String::from_utf8_lossy(&init.stdout).contains("\"agents\": 12"));
+    let summary: serde_json::Value =
+        serde_json::from_slice(&init.stdout).expect("init --json should emit JSON only");
+    assert_eq!(summary["agents"], 12);
     assert!(output_dir.join("gaia-spec.toml").exists());
     assert_eq!(fs::read_dir(output_dir.join("agents")).unwrap().count(), 12);
     assert!(!output_dir.join("company.toml").exists());
@@ -148,7 +150,32 @@ fn init_can_run_daemon_dry_run_with_config_output_dir() {
     fs::write(
         &daemon_bin,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 0\n",
+            r#"#!/bin/sh
+original_args="$*"
+config=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --config)
+      shift
+      config="$1"
+      ;;
+  esac
+  shift || break
+done
+printf 'daemon stdout noise\n'
+printf 'daemon stderr noise\n' >&2
+{{
+  printf 'pwd=%s\n' "$(pwd)"
+  printf 'args=%s\n' "$original_args"
+  printf 'config=%s\n' "$config"
+}} > '{}'
+if [ ! -f "$config" ]; then
+  printf 'missing_config=%s\n' "$config" >> '{}'
+  exit 42
+fi
+exit 0
+"#,
+            call_file.display(),
             call_file.display()
         ),
     )
@@ -171,6 +198,7 @@ fn init_can_run_daemon_dry_run_with_config_output_dir() {
         .arg("--daemon-dry-run")
         .arg("--daemon-bin")
         .arg(&daemon_bin)
+        .arg("--json")
         .output()
         .unwrap();
 
@@ -179,8 +207,13 @@ fn init_can_run_daemon_dry_run_with_config_output_dir() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .expect("init --json should not be contaminated by daemon dry-run logs");
     let call = fs::read_to_string(call_file).unwrap();
+    let expected_pwd = fs::canonicalize(&root).unwrap();
+    assert!(call.contains(&format!("pwd={}", expected_pwd.display())));
     assert!(call.contains("--config"));
     assert!(call.contains("--dry-run"));
     assert!(call.contains("daemon.toml"));
+    assert!(!call.contains("missing_config="));
 }
