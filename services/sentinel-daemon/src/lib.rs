@@ -7,6 +7,7 @@
 pub mod adaptive_tick;
 pub mod config;
 pub mod config_apply;
+pub mod config_persist;
 pub mod controlplane;
 pub mod ebpf;
 pub mod episode_producer;
