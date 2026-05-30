@@ -2,7 +2,7 @@
 
 Issue #383 baseline. Current product component scope:
 
-- Rust component directories: 21
+- Rust component directories: 22
 - Go module/service directories: 4
 - Excluded: WASM test fixture crates under `crates/sentinel-wasm/tests/fixtures/`
 
@@ -36,6 +36,7 @@ Each component README must include purpose, interfaces, dependencies, and verify
 | --- | --- |
 | `services/agent-runtime` | [README](../services/agent-runtime/README.md) |
 | `services/sentinel-daemon` | [README](../services/sentinel-daemon/README.md) |
+| `services/sentinel-gaia` | [README](../services/sentinel-gaia/README.md) |
 | `services/sentinel-nightrun` | [README](../services/sentinel-nightrun/README.md) |
 | `services/sentinel-projection` | [README](../services/sentinel-projection/README.md) |
 
