@@ -100,6 +100,38 @@ Each deviation records: **what** the spec says, **what** the code does,
 
 ---
 
+## DEV-008 — Gaia operator console: reactive Claude-Code interface, CLI over MCP
+
+| Field | Value |
+|-------|-------|
+| Cluster | User interface / operator plane |
+| Spec | Sentinel needs a single user-facing interface (setup, conversational orchestration, observability, platform admin) over an already-autonomous company. The interface must reach the operator API, telemetry, events, and platform plane with minimal overhead. |
+| Decision | Gaia is a **reactive Claude-Code instance** sitting *above* the autonomous self-* systems — it never acts on its own, only on explicit user request. Tool access is a local **`sentinel-ctl` CLI** invoked via Bash, **not** an MCP server: Gaia runs `claude -p` on the same VM as the backend, so an MCP server (separate process + HTTP/SSE transport) is pure overhead. Mutating subcommands gate through policy-as-code (#391). |
+| Options considered | Option 1: autonomous Gaia agent with its own loop (rejected — autonomy already lives in the control planes). Option 2: MCP server for tool access (rejected — transport/process overhead for a co-located process). Option 3: reactive Gaia + local CLI tool. DEV-008 chooses Option 3. |
+| Trade-offs | CLI keeps tool access overhead-free and directly user/test-usable, at the cost of structured tool schemas an MCP server would provide. Reactive design keeps Gaia from colliding with the autonomous control planes; it must instead **dock onto** the existing `escalate_to_operator` path rather than duplicate any self-* loop. |
+| Why | Maintainer decision 2026-05-30. The company already self-heals/learns/improves (control planes, Platform-CP + `llm_analyzer` + `escalate_to_operator`, Judge, Nightrun, Hippocampus). Gaia is the user's window and hand, not a second controller. Overhead/IO/performance is the primary driver (polyglot principle). |
+| Consequences | New `sentinel-ctl`, Gaia readiness loop (`claude -p`, resume), task entity (ECS+events) for delegation, hybrid run model. Five guardrails apply: dock onto escalation, never overwrite personality/evolution, no collision with CP actions, do not override adaptive-tick, task entity coexists with emergent agent autonomy. |
+| Files | `docs/gaia-console-architecture.md` (SSOT), `services/sentinel-daemon/src/operator_api.rs`, `cmd/cortex-gateway/internal/compiler/structured.go` (Voice of Gaia / inner-voice), #391 |
+| Revisit when | Gaia must serve remote/multi-client (then reconsider a transport layer); or autonomy requirements change such that Gaia needs a standing actor loop |
+
+---
+
+## DEV-009 — Polyglot console frontend and CAS console data plane
+
+| Field | Value |
+|-------|-------|
+| Cluster | User interface / data plane |
+| Spec | The console must render rich live infographics for many agents at 120 fps, stay overhead/IO-minimal, and run on weak hardware as a side effect of that minimalism. |
+| Decision | **Polyglot per layer**, not one language: **SolidJS** for the DOM/reactivity layer (overhead-minimal at the DOM; a Rust/WASM UI framework would pay WASM↔JS bridge cost per DOM update), **Rust→WASM** workers for heavy data (CAS decode, dedup, msgpack/zstd, validation), **WebGL/Canvas** for live rendering + SVG for structure. Data flows over a **CAS console data plane** reusing `sentinel-fs` primitives (chunking, blake3, refcount, zstd) with push (WebTransport/QUIC) + client-manifest/server-delta sync, OPFS store. |
+| Options considered | Option 1: all-Rust/WASM frontend (Leptos/Dioxus) for stack consistency — rejected, the DOM-bridge overhead is against the goal. Option 2: all-JS — rejected, leaves heavy-data and CAS work on the main thread. Option 3: polyglot per layer. DEV-009 chooses Option 3. |
+| Trade-offs | Polyglot maximizes per-layer performance and reuses the proven 1:n-pointer/dedup engine (massive redundancy in agent conversations dedupes hard), at the cost of a TS/Rust boundary that must be kept narrow (only data crosses, not DOM logic). |
+| Why | Maintainer decision 2026-05-30: polyglot, best-of-all-worlds; the goal is overhead/IO/performance maximization. noaide/PixelPerfekt are UI-pattern references, not code ports. |
+| Consequences | New console frontend (SolidJS + Rust/WASM workers + WebGL), own tiling engine (niri/Hyprland style), CAS console data plane on `sentinel-fs`, WebTransport push replacing the 1s-poll dashboard. Existing dashboard phased out at parity, not destroyed. |
+| Files | `docs/gaia-console-architecture.md` (SSOT), `crates/sentinel-fs/`, `dashboard/` (phased migration), #430, #431, #432, #433 |
+| Revisit when | DOM-bridge cost of Rust/WASM UI frameworks drops to parity with JS; or the data plane shows that a simpler transport suffices |
+
+---
+
 For governance mechanisms see [docs/governance.md](governance.md). For
 the underlying spec see
 [docs/architecture/togaf-architecture-guide.html](architecture/togaf-architecture-guide.html).
