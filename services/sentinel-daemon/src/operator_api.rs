@@ -75,6 +75,9 @@ const OPERATOR_SECURITY_LANDLOCK_TEST_PATH: &str = "/operator/security/landlock-
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024;
 const MAX_APICP_SNAPSHOT_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Config-Apply (#425) traegt eine ganze Firma inline (agents[] + building) — eine 60er-Firma
+/// ist ~64 KB, Gaia-Firmen koennen deutlich groesser sein. Grosszuegiges Limit (4 MB).
+const MAX_CONFIG_APPLY_BODY_BYTES: usize = 4 * 1024 * 1024;
 const OPERATOR_KEY_HEADER: &str = "x-sentinel-operator-key";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2681,6 +2684,7 @@ async fn read_http_request(stream: &mut TcpStream) -> std::result::Result<HttpRe
 fn max_body_bytes_for_path(path: &str) -> usize {
     match request_path(path) {
         OPERATOR_APICP_SNAPSHOT_PATH => MAX_APICP_SNAPSHOT_BODY_BYTES,
+        OPERATOR_CONFIG_APPLY_PATH => MAX_CONFIG_APPLY_BODY_BYTES,
         _ => MAX_BODY_BYTES,
     }
 }
@@ -3956,6 +3960,17 @@ mod tests {
             MAX_APICP_SNAPSHOT_BODY_BYTES
         );
         assert_eq!(max_body_bytes_for_path(OPERATOR_CHAT_PATH), MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn config_apply_path_has_larger_body_limit() {
+        // #425: eine ganze Firma (60+ Agents inline) muss durch das Body-Limit passen.
+        assert_eq!(
+            max_body_bytes_for_path(OPERATOR_CONFIG_APPLY_PATH),
+            MAX_CONFIG_APPLY_BODY_BYTES
+        );
+        // Eine 60-Agent-Firma ist ~64 KB -> das Limit muss komfortabel darueber liegen.
+        assert_ne!(max_body_bytes_for_path(OPERATOR_CONFIG_APPLY_PATH), MAX_BODY_BYTES);
     }
 
     #[tokio::test]
