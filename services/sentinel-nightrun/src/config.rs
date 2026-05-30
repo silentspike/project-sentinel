@@ -3,6 +3,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use sentinel_common::agent_config::AgentConfigValidation;
+use sentinel_common::DEFAULT_MAX_AGENT_ID;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +35,9 @@ pub struct NightrunSettings {
     /// Verhindert Endlos-Runs bei grossen Agent-Pools.
     #[serde(default = "default_max_jobs_per_run")]
     pub max_jobs_per_run: usize,
+    /// Obergrenze fuer AgentId-Validierung beim Laden der Agent-TOMLs.
+    #[serde(default = "default_max_agent_id")]
+    pub max_agent_id: u16,
 }
 
 fn default_timeout_per_agent() -> u64 {
@@ -46,6 +51,15 @@ fn default_max_episodes() -> usize {
 }
 fn default_max_jobs_per_run() -> usize {
     100
+}
+fn default_max_agent_id() -> u16 {
+    DEFAULT_MAX_AGENT_ID
+}
+
+impl NightrunSettings {
+    pub fn agent_config_validation(&self) -> AgentConfigValidation {
+        AgentConfigValidation::with_max_agent_id(self.max_agent_id)
+    }
 }
 
 impl NightrunConfig {
@@ -74,12 +88,14 @@ timeout_per_agent_secs = 120
 timeout_total_secs = 3600
 max_episodes_per_agent = 500
 max_jobs_per_run = 50
+max_agent_id = 120
 "#;
         let config: NightrunConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.nightrun.hippocampus_db, "data/hippocampus.redb");
         assert_eq!(config.nightrun.timeout_per_agent_secs, 120);
         assert_eq!(config.nightrun.max_episodes_per_agent, 500);
         assert_eq!(config.nightrun.max_jobs_per_run, 50);
+        assert_eq!(config.nightrun.max_agent_id, 120);
     }
 
     #[test]
@@ -96,5 +112,27 @@ job_queue_path = "data/nightrun-jobs.db"
         assert_eq!(config.nightrun.timeout_total_secs, 7200);
         assert_eq!(config.nightrun.max_episodes_per_agent, 1000);
         assert_eq!(config.nightrun.max_jobs_per_run, 100);
+        assert_eq!(config.nightrun.max_agent_id, DEFAULT_MAX_AGENT_ID);
+    }
+
+    #[test]
+    fn agent_config_validation_uses_configured_max_agent_id() {
+        let toml_str = r#"
+[nightrun]
+hippocampus_db = "data/hippocampus.redb"
+event_store_db = "data/events.db"
+agent_config_dir = "config/agents"
+job_queue_path = "data/nightrun-jobs.db"
+max_agent_id = 75
+"#;
+        let config: NightrunConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config
+                .nightrun
+                .agent_config_validation()
+                .agent_id_bounds
+                .max,
+            75
+        );
     }
 }

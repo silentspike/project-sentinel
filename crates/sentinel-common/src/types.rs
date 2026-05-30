@@ -7,8 +7,8 @@ use std::fmt;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
-    #[error("AgentId {0} out of range (1-60)")]
-    InvalidAgentId(u16),
+    #[error("AgentId {id} out of range (1-{max})")]
+    InvalidAgentId { id: u16, max: u16 },
     #[error("RoomId {0} out of range")]
     InvalidRoomId(u16),
     #[error("Value {value} out of range [{min}, {max}] for {field}")]
@@ -24,16 +24,45 @@ pub enum ValidationError {
 // Newtypes
 // ──────────────────────────────────────────────
 
+/// Default upper AgentId bound for the shipped 60-agent PixelPerfekt config.
+pub const DEFAULT_MAX_AGENT_ID: u16 = 60;
+
+/// Validation bounds for AgentId-bearing config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentIdBounds {
+    pub max: u16,
+}
+
+impl AgentIdBounds {
+    pub const fn new(max: u16) -> Self {
+        Self { max }
+    }
+
+    pub fn validate(self, id: u16) -> Result<AgentId, ValidationError> {
+        if (1..=self.max).contains(&id) {
+            Ok(AgentId(id))
+        } else {
+            Err(ValidationError::InvalidAgentId { id, max: self.max })
+        }
+    }
+}
+
+impl Default for AgentIdBounds {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_AGENT_ID)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AgentId(pub u16);
 
 impl AgentId {
     pub fn new(id: u16) -> Result<Self, ValidationError> {
-        if (1..=60).contains(&id) {
-            Ok(Self(id))
-        } else {
-            Err(ValidationError::InvalidAgentId(id))
-        }
+        Self::new_with_bounds(id, AgentIdBounds::default())
+    }
+
+    pub fn new_with_bounds(id: u16, bounds: AgentIdBounds) -> Result<Self, ValidationError> {
+        bounds.validate(id)
     }
 }
 

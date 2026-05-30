@@ -24,6 +24,7 @@ members = [
     "crates/sentinel-projection",
     "crates/sentinel-fs",
     "services/sentinel-nightrun",
+    "services/sentinel-gaia",
     "services/sentinel-daemon",
     "services/sentinel-projection",
     "services/agent-runtime",

@@ -4310,6 +4310,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-gaia"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "sentinel-common",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 1.0.6+spec-1.1.0",
+]
+
+[[package]]
 name = "sentinel-hippocampus"
 version = "0.1.0"
 dependencies = [
