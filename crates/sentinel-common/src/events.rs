@@ -308,6 +308,17 @@ pub enum DomainEventPayload {
         message: String,
         broadcast_type: String,
     },
+    /// Runtime Config-Apply abgeschlossen (#425): Audit-Trail fuer Live-Diff/Fresh-Load.
+    ConfigApplied {
+        /// "live" oder "fresh".
+        mode: String,
+        spawned: u32,
+        updated: u32,
+        despawned: u32,
+        rooms_changed: u32,
+        /// True wenn die Config erfolgreich in den config_dir persistiert wurde.
+        persisted: bool,
+    },
 }
 
 impl DomainEventPayload {
@@ -345,6 +356,7 @@ impl DomainEventPayload {
             Self::SecurityExecBlocked { .. } => "security_exec_blocked",
             Self::OperatorGaiaSent { .. } => "operator_gaia_sent",
             Self::OperatorBroadcastSent { .. } => "operator_broadcast_sent",
+            Self::ConfigApplied { .. } => "config_applied",
         }
     }
 }
