@@ -51,7 +51,7 @@ Overhead; er lohnt nur remote/multi-client.
 
 - Kapselt Operator-API + Telemetrie + Events + Platform-Admin als **feinkoernige Subcommands**
   (`chat-to-room`, `set-agent-tier`, `apply-config`, `restore`, `platform …`).
-- Jeder mutierende/hochriskante Subcommand laeuft durch **Policy-as-Code (#391)** + Konsolen-Gate.
+- Jeder mutierende/hochriskante Subcommand laeuft durch ein **operator-seitiges Policy-Gate** (RiskLevel Read/Mutate/HighRisk + Bestaetigung) + Konsolen-Gate. **NICHT** #391 — das ist die gateway-seitige *Agent*-Tool-Policy (`agent_policy.go`); das ctl-Gate ist die eigenstaendige Operator-Ebene.
 - Bonus: dasselbe CLI ist direkt vom User nutzbar + deterministisch testbar (kein Server-Mock).
 
 ---
@@ -94,7 +94,7 @@ Das heutige Dashboard pollt 1s + sendet Voll-State (laggy). Loesung = Sentinels 
 99,2 % erprobt) auf den Konsolen-Datenstrom:
 
 - **Eigene Console-Data-Plane**, die dieselben `sentinel-fs`-Primitive nutzt, aber auf **Stream/Append** optimiert.
-- **Wire**: Push (WebTransport/QUIC) statt Poll; **Client-Manifest + Server-Delta** — Client zieht nur
+- **Wire**: Push (**WebTransport/QUIC only** — Maintainer 2026-05-31: KEIN WebSocket-Fallback; WebTransport ist seit Maerz 2026 Baseline, kein Doppel-Transport fuer Alt-Browser); **Client-Manifest + Server-Delta** — Client zieht nur
   Bloecke, die er noch nicht hat (Conversations/System-Bloecke sind massiv redundant → Dedup greift stark).
 - **Client-Store**: **OPFS** fuer Binaer-Bloecke + **IndexedDB-Fallback**, hinter einem Interface.
 - **Observability-Tiefe**: aggregierte Live-Views default, **Drill-Down on-demand** (rohe Events/Internals
