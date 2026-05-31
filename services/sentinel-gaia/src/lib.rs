@@ -47,6 +47,53 @@ fn default_department_weight() -> u16 {
     1
 }
 
+/// Strukturierte Kultur-/Sozial-Dimension der Firma (#441). Steuert deterministisch (blake3,
+/// kein LLM) die Big-Five-Verteilung der generierten Agents und fliesst in die `company-context.md`.
+/// Alle Achsen in [0.0, 1.0]; 0.5 = neutral. `mission`/`values` sind die Prosa-Felder, die Gaia
+/// (Claude Code) im Interview befuellt — leer => aus `company_type` abgeleitet (siehe Render).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CultureSpec {
+    /// Formalitaet (0 = locker/flach, 1 = formell/hierarchisch) → praegt Conscientiousness.
+    #[serde(default = "default_culture_axis")]
+    pub formality: f32,
+    /// Kollaboration (0 = einzelkaempferisch, 1 = teamzentriert) → praegt Agreeableness.
+    #[serde(default = "default_culture_axis")]
+    pub collaboration: f32,
+    /// Konfliktniveau (0 = harmonisch, 1 = reibungsintensiv) → praegt Neuroticism-Streuung.
+    #[serde(default = "default_culture_axis")]
+    pub conflict_level: f32,
+    /// Innovationsgrad (0 = bewahrend, 1 = experimentierfreudig) → praegt Openness.
+    #[serde(default = "default_culture_axis")]
+    pub innovation: f32,
+    /// Diversitaet (0 = homogen, 1 = heterogen) → globale Verteilungsstreuung.
+    #[serde(default = "default_culture_axis")]
+    pub diversity: f32,
+    /// Firmenmission (Prosa, von Gaia befuellt). Leer => aus `company_type` abgeleitet.
+    #[serde(default)]
+    pub mission: String,
+    /// Firmenwerte (Prosa, von Gaia befuellt). Leer => aus `company_type` abgeleitet.
+    #[serde(default)]
+    pub values: Vec<String>,
+}
+
+fn default_culture_axis() -> f32 {
+    0.5
+}
+
+impl Default for CultureSpec {
+    fn default() -> Self {
+        Self {
+            formality: default_culture_axis(),
+            collaboration: default_culture_axis(),
+            conflict_level: default_culture_axis(),
+            innovation: default_culture_axis(),
+            diversity: default_culture_axis(),
+            mission: String::new(),
+            values: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GaiaSpec {
     pub company_name: String,
@@ -65,6 +112,8 @@ pub struct GaiaSpec {
     pub time_scale: f32,
     #[serde(default)]
     pub departments: Vec<DepartmentSpec>,
+    #[serde(default)]
+    pub culture: CultureSpec,
 }
 
 impl GaiaSpec {
@@ -79,6 +128,19 @@ impl GaiaSpec {
             shift_model: ShiftModel::Hybrid,
             time_scale: default_time_scale(),
             departments: Vec::new(),
+            culture: CultureSpec {
+                formality: 0.4,
+                collaboration: 0.7,
+                conflict_level: 0.3,
+                innovation: 0.8,
+                diversity: 0.6,
+                mission: "Digitale Produkte mit Handwerks-Qualitaet bauen.".to_string(),
+                values: vec![
+                    "Qualitaet vor Tempo".to_string(),
+                    "Transparente Zusammenarbeit".to_string(),
+                    "Kontinuierliches Lernen".to_string(),
+                ],
+            },
         }
     }
 
@@ -98,6 +160,17 @@ impl GaiaSpec {
             }
             if department.weight == 0 {
                 bail!("department '{}' weight must be > 0", department.name);
+            }
+        }
+        for (name, value) in [
+            ("formality", self.culture.formality),
+            ("collaboration", self.culture.collaboration),
+            ("conflict_level", self.culture.conflict_level),
+            ("innovation", self.culture.innovation),
+            ("diversity", self.culture.diversity),
+        ] {
+            if !(0.0..=1.0).contains(&value) {
+                bail!("culture.{name} must be in [0.0, 1.0], got {value}");
             }
         }
         Ok(())
@@ -286,6 +359,10 @@ pub fn generate(spec: GaiaSpec) -> Result<GeneratedCompany> {
         relative_path: PathBuf::from("nightrun.toml"),
         contents: nightrun_toml(&spec),
     });
+    files.push(GeneratedFile {
+        relative_path: PathBuf::from("company-context.md"),
+        contents: render_company_context(&spec),
+    });
 
     Ok(GeneratedCompany {
         spec,
@@ -370,6 +447,17 @@ pub fn validate_output_dir(root: &Path) -> Result<ValidationReport> {
             "nightrun.max_agent_id {} != spec.agent_count {}",
             nightrun_max_agent_id,
             spec.agent_count
+        );
+    }
+
+    // #441 AC3: eigene company-context.md muss existieren + die Firmendaten tragen (kein Default).
+    let context_path = root.join("company-context.md");
+    let context_content = fs::read_to_string(&context_path)
+        .with_context(|| format!("read generated {}", context_path.display()))?;
+    if !context_content.contains(&spec.company_name) {
+        bail!(
+            "generated company-context.md does not mention company '{}'",
+            spec.company_name
         );
     }
 
@@ -591,7 +679,7 @@ struct AgentIdentityToml {
     direct_reports: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq)]
 struct AgentPersonalityToml {
     openness: f32,
     conscientiousness: f32,
@@ -711,7 +799,7 @@ fn build_agents(
                     reports_to,
                     direct_reports: direct_reports.remove(&agent.name).unwrap_or_default(),
                 },
-                personality: personality_for(spec.seed, agent.id),
+                personality: personality_for(spec.seed, agent.id, &spec.culture),
                 preferences: preferences_for(spec.seed, agent.id, favorite_room),
                 background: AgentBackgroundToml {
                     bio: format!(
@@ -767,16 +855,202 @@ fn kpis_for(department: &str) -> Vec<String> {
     ]
 }
 
-fn personality_for(seed: u64, id: u16) -> AgentPersonalityToml {
+/// Firmenmission: explizit aus der Spec, sonst deterministisch aus `company_type` abgeleitet (#441).
+fn effective_mission(spec: &GaiaSpec) -> String {
+    let trimmed = spec.culture.mission.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    match spec.company_type {
+        CompanyType::SoftwareAgency => format!(
+            "{} entwickelt digitale Produkte und Dienstleistungen in verlaesslicher Qualitaet.",
+            spec.company_name
+        ),
+        CompanyType::Manufacturing => format!(
+            "{} fertigt Produkte mit gleichbleibend hoher Qualitaet und sicheren Prozessen.",
+            spec.company_name
+        ),
+        CompanyType::Healthcare => format!(
+            "{} versorgt Patientinnen und Patienten verantwortungsvoll und zugewandt.",
+            spec.company_name
+        ),
+        CompanyType::Generic => {
+            format!("{} liefert verlaessliche Leistungen fuer ihre Kunden.", spec.company_name)
+        }
+    }
+}
+
+/// Firmenwerte: explizit aus der Spec, sonst ein neutraler Default-Satz (#441).
+fn effective_values(spec: &GaiaSpec) -> Vec<String> {
+    if !spec.culture.values.is_empty() {
+        return spec.culture.values.clone();
+    }
+    vec![
+        "Verlaesslichkeit".to_string(),
+        "Zusammenarbeit".to_string(),
+        "Qualitaet".to_string(),
+    ]
+}
+
+fn level_label(value: f32) -> &'static str {
+    if value < 0.34 {
+        "niedrig"
+    } else if value < 0.67 {
+        "mittel"
+    } else {
+        "hoch"
+    }
+}
+
+fn company_type_label(company_type: &CompanyType) -> &'static str {
+    match company_type {
+        CompanyType::SoftwareAgency => "Software-/Digitalagentur",
+        CompanyType::Manufacturing => "Produktion / Fertigung",
+        CompanyType::Healthcare => "Gesundheitswesen",
+        CompanyType::Generic => "Allgemein",
+    }
+}
+
+fn shift_model_label(shift_model: &ShiftModel) -> &'static str {
+    match shift_model {
+        ShiftModel::OfficeHours => "Bueroarbeitszeiten",
+        ShiftModel::ThreeShift => "3-Schicht-Betrieb (24/7)",
+        ShiftModel::Hybrid => "Hybrid (Kernzeit + Schichten)",
+    }
+}
+
+/// Rendert die firmenweite `company-context.md` deterministisch aus der Spec (#441, kein LLM).
+/// Mission/Werte stammen aus der (von Gaia befuellten) Spec oder werden aus `company_type` abgeleitet;
+/// Organigramm/KPIs aus den (effektiven) Abteilungen; Kultur-Achsen als Prosa. blake3-frei → bei
+/// gleicher Spec byte-identisch.
+fn render_company_context(spec: &GaiaSpec) -> String {
+    let departments = spec.effective_departments();
+    let mission = effective_mission(spec);
+    let values = effective_values(spec);
+    let mut out = String::new();
+
+    out.push_str(&format!("# {} — Firmenkontext\n\n", spec.company_name));
+    out.push_str(
+        "> Deterministisch von `sentinel-gaia` aus der `gaia-spec` erzeugt (#441). \
+         Nicht manuell editieren — ueber die gaia-spec + Regenerierung pflegen.\n\n",
+    );
+
+    out.push_str("## Unternehmen\n");
+    out.push_str(&format!("- **Standort:** {}\n", spec.city));
+    out.push_str(&format!("- **Adresse:** {}\n", spec.address));
+    out.push_str(&format!("- **Typ:** {}\n", company_type_label(&spec.company_type)));
+    out.push_str(&format!("- **Mitarbeiter:** {}\n", spec.agent_count));
+    out.push_str(&format!(
+        "- **Arbeitsmodell:** {}\n\n",
+        shift_model_label(&spec.shift_model)
+    ));
+
+    out.push_str("## Mission & Werte\n");
+    out.push_str(&format!("{mission}\n\n"));
+    out.push_str("Werte:\n");
+    for value in &values {
+        out.push_str(&format!("- {value}\n"));
+    }
+    out.push('\n');
+
+    out.push_str("## Organigramm\n");
+    if let Some(lead_dept) = departments.first() {
+        let lead_role = lead_dept
+            .roles
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "Geschaeftsfuehrung".to_string());
+        out.push_str(&format!(
+            "- **Leitung:** {} (Abteilung {})\n",
+            lead_role, lead_dept.name
+        ));
+    }
+    for department in departments.iter().skip(1) {
+        let roles = if department.roles.is_empty() {
+            "diverse Rollen".to_string()
+        } else {
+            department.roles.join(", ")
+        };
+        out.push_str(&format!("- **{}:** {}\n", department.name, roles));
+    }
+    out.push('\n');
+
+    out.push_str("## Abteilungs-KPIs\n");
+    for department in &departments {
+        out.push_str(&format!(
+            "- **{}:** {}\n",
+            department.name,
+            kpis_for(&department.name).join("; ")
+        ));
+    }
+    out.push('\n');
+
+    out.push_str("## Kultur\n");
+    out.push_str(&format!(
+        "- Formalitaet: {}\n",
+        level_label(spec.culture.formality)
+    ));
+    out.push_str(&format!(
+        "- Kollaboration: {}\n",
+        level_label(spec.culture.collaboration)
+    ));
+    out.push_str(&format!(
+        "- Konfliktniveau: {}\n",
+        level_label(spec.culture.conflict_level)
+    ));
+    out.push_str(&format!(
+        "- Innovationsgrad: {}\n",
+        level_label(spec.culture.innovation)
+    ));
+    out.push_str(&format!(
+        "- Diversitaet: {}\n",
+        level_label(spec.culture.diversity)
+    ));
+
+    out
+}
+
+/// Leitet die Big-Five-Verteilung eines Agents deterministisch aus Seed+Id UND der Firmen-Kultur ab
+/// (#441). Kultur-Achsen verschieben den Mittelwert (`center`) bzw. die Streuung (`spread`) pro Trait;
+/// `diversity` weitet die globale Streuung; `conflict_level` weitet speziell die Neuroticism-Streuung.
+/// Bleibt blake3-deterministisch: gleiche Spec+Seed → identische Werte.
+fn personality_for(seed: u64, id: u16, culture: &CultureSpec) -> AgentPersonalityToml {
+    // Globale Streuung: homogen (0.45) bis heterogen (0.80) je nach Diversitaet.
+    let base_spread = 0.45 + culture.diversity * 0.35;
     AgentPersonalityToml {
-        openness: score(seed, id, "openness"),
-        conscientiousness: score(seed, id, "conscientiousness"),
-        extraversion: score(seed, id, "extraversion"),
-        agreeableness: score(seed, id, "agreeableness"),
-        neuroticism: score(seed, id, "neuroticism"),
-        caffeine_tolerance: score(seed, id, "caffeine"),
+        openness: score_with(seed, id, "openness", axis_center(culture.innovation), base_spread),
+        conscientiousness: score_with(
+            seed,
+            id,
+            "conscientiousness",
+            axis_center(culture.formality),
+            base_spread,
+        ),
+        // Keine eigene Achse → neutraler Mittelwert, kulturweite Streuung.
+        extraversion: score_with(seed, id, "extraversion", 0.5, base_spread),
+        agreeableness: score_with(
+            seed,
+            id,
+            "agreeableness",
+            axis_center(culture.collaboration),
+            base_spread,
+        ),
+        // Konfliktniveau weitet die Streuung (mehr Reibung → breiteres Spektrum an Belastbarkeit).
+        neuroticism: score_with(
+            seed,
+            id,
+            "neuroticism",
+            0.5,
+            base_spread + culture.conflict_level * 0.40,
+        ),
+        caffeine_tolerance: score_with(seed, id, "caffeine", 0.5, base_spread),
         morning_person: hash_byte(seed, id, "morning").is_multiple_of(2),
     }
+}
+
+/// Bildet eine Kultur-Achse [0,1] auf einen Trait-Mittelwert in [0.35, 0.65] ab (0.5 = neutral).
+fn axis_center(axis: f32) -> f32 {
+    0.35 + axis.clamp(0.0, 1.0) * 0.30
 }
 
 fn preferences_for(seed: u64, id: u16, favorite_room: String) -> AgentPreferencesToml {
@@ -859,10 +1133,13 @@ fn deterministic_name(seed: u64, id: u16) -> String {
     format!("{first} {last}")
 }
 
-fn score(seed: u64, id: u16, field: &str) -> f32 {
-    let raw = hash_byte(seed, id, field);
-    let value = 0.15 + (f32::from(raw) / 255.0) * 0.7;
-    (value * 100.0).round() / 100.0
+/// Deterministischer Trait-Wert um `center` mit Streuung `spread`, blake3-basiert, auf [0.05, 0.95]
+/// geklemmt (innerhalb des von `PersonalityConfig::validate` geforderten [0,1]) und auf 2 Nachkommastellen.
+fn score_with(seed: u64, id: u16, field: &str, center: f32, spread: f32) -> f32 {
+    let norm = f32::from(hash_byte(seed, id, field)) / 255.0; // [0,1]
+    let value = center + (norm - 0.5) * spread;
+    let clamped = value.clamp(0.05, 0.95);
+    (clamped * 100.0).round() / 100.0
 }
 
 fn hash_byte(seed: u64, id: u16, field: &str) -> u8 {
@@ -1140,6 +1417,125 @@ mod tests {
         let b = generate(spec).unwrap();
 
         assert_eq!(a.files, b.files);
+    }
+
+    #[test]
+    fn spec_without_culture_loads_with_defaults() {
+        // #441 AC: Bestands-Specs ohne [culture]-Block bleiben gueltig (serde-default).
+        let toml_str = "company_name = \"Legacy GmbH\"\nagent_count = 10\n";
+        let spec: GaiaSpec = toml::from_str(toml_str).expect("legacy spec parses");
+        assert_eq!(spec.culture, CultureSpec::default());
+        spec.validate().expect("legacy spec is valid");
+    }
+
+    #[test]
+    fn spec_with_culture_toml_round_trips() {
+        // #441: company-context-Write-Back braucht stabiles TOML-Round-Trip inkl. CultureSpec.
+        let spec = GaiaSpec::example();
+        let serialized = toml::to_string_pretty(&spec).expect("serialize GaiaSpec");
+        let reparsed: GaiaSpec = toml::from_str(&serialized).expect("re-parse GaiaSpec");
+        assert_eq!(spec, reparsed, "GaiaSpec TOML round-trip must be identical");
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_culture_axis() {
+        // #441 AC: validate lehnt eine Kultur-Achse ausserhalb [0,1] ab.
+        let mut spec = GaiaSpec::example();
+        spec.culture.conflict_level = 1.5;
+        assert!(spec.validate().is_err());
+        let mut spec2 = GaiaSpec::example();
+        spec2.culture.formality = -0.1;
+        assert!(spec2.validate().is_err());
+    }
+
+    #[test]
+    fn generate_emits_own_company_context() {
+        // #441 AC3: generierte Firma hat eigene company-context.md mit Firmendaten (kein PixelPerfekt-Default).
+        let spec = GaiaSpec {
+            company_name: "Acme Robotics AG".to_string(),
+            ..GaiaSpec::example()
+        };
+        let generated = generate(spec).unwrap();
+        let ctx = generated
+            .file("company-context.md")
+            .expect("company-context.md emitted");
+        assert!(ctx.contents.contains("Acme Robotics AG"), "context names the company");
+        assert!(!ctx.contents.contains("PixelPerfekt"), "context is not the default");
+        assert!(ctx.contents.contains("## Mission & Werte"));
+        assert!(ctx.contents.contains("## Organigramm"));
+        assert!(ctx.contents.contains("## Kultur"));
+        // Mission aus example()-Spec uebernommen (nicht aus company_type abgeleitet).
+        assert!(ctx.contents.contains("Digitale Produkte mit Handwerks-Qualitaet"));
+    }
+
+    #[test]
+    fn company_context_derives_mission_when_spec_empty() {
+        // Leere culture.mission/values -> deterministisch aus company_type abgeleitet.
+        let spec = GaiaSpec {
+            company_name: "Werk Nord GmbH".to_string(),
+            company_type: CompanyType::Manufacturing,
+            culture: CultureSpec::default(),
+            ..GaiaSpec::example()
+        };
+        let generated = generate(spec).unwrap();
+        let ctx = &generated.file("company-context.md").unwrap().contents;
+        assert!(ctx.contains("Werk Nord GmbH"));
+        assert!(ctx.contains("fertigt Produkte"), "mission derived from Manufacturing type");
+    }
+
+    #[test]
+    fn personality_for_is_deterministic_with_culture() {
+        // #441 AC1: gleiche Spec+Seed → identische Big-Five-Werte (blake3, kein RNG).
+        let culture = CultureSpec {
+            conflict_level: 0.8,
+            innovation: 0.9,
+            ..CultureSpec::default()
+        };
+        for id in 1..=25u16 {
+            assert_eq!(
+                personality_for(42, id, &culture),
+                personality_for(42, id, &culture)
+            );
+        }
+    }
+
+    fn neuroticism_variance(conflict_level: f32) -> f32 {
+        let culture = CultureSpec {
+            conflict_level,
+            ..CultureSpec::default()
+        };
+        let values: Vec<f32> = (1..=120u16)
+            .map(|id| personality_for(42, id, &culture).neuroticism)
+            .collect();
+        let mean = values.iter().sum::<f32>() / values.len() as f32;
+        values.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / values.len() as f32
+    }
+
+    #[test]
+    fn higher_conflict_widens_neuroticism_variance() {
+        // #441 AC2: hoeheres Konfliktniveau → spuerbar breitere Neuroticism-Streuung.
+        let low = neuroticism_variance(0.0);
+        let high = neuroticism_variance(1.0);
+        assert!(
+            high > low * 1.3,
+            "high-conflict variance {high} must clearly exceed low-conflict {low}"
+        );
+    }
+
+    #[test]
+    fn culture_centers_shift_trait_means() {
+        // #441 AC2: hohe Innovation hebt den Openness-Mittelwert ggue niedriger Innovation.
+        fn openness_mean(innovation: f32) -> f32 {
+            let culture = CultureSpec {
+                innovation,
+                ..CultureSpec::default()
+            };
+            let values: Vec<f32> = (1..=120u16)
+                .map(|id| personality_for(42, id, &culture).openness)
+                .collect();
+            values.iter().sum::<f32>() / values.len() as f32
+        }
+        assert!(openness_mean(0.95) > openness_mean(0.05) + 0.1);
     }
 
     #[test]

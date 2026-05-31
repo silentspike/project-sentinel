@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/capability"
 )
@@ -18,9 +19,13 @@ type PromptBlock struct {
 }
 
 // Assembler creates prompts from 4 sources: TOML DNA, Company Context, redb Evolution, live Perception.
+//
+// companyContext is guarded by mu so it can be hot-reloaded (#440) without a gateway restart while
+// requests are in flight: ReloadCompanyContext swaps it atomically, Assemble reads it under RLock.
 type Assembler struct {
 	loader         *TOMLLoader
 	caps           *capability.ProviderCapabilities
+	mu             sync.RWMutex
 	companyContext string
 }
 
@@ -34,10 +39,32 @@ func NewAssembler(loader *TOMLLoader, caps *capability.ProviderCapabilities) *As
 	}
 }
 
+// ReloadCompanyContext re-reads company-context.md from disk and swaps the cached value atomically
+// (#440). It makes NO provider/LLM call (token-safe). Returns the byte size of the freshly loaded
+// context (0 if the file is absent). The next Assemble picks up the new context.
+func (a *Assembler) ReloadCompanyContext() int {
+	ctx := LoadCompanyContext(a.loader.agentDir)
+	a.mu.Lock()
+	a.companyContext = ctx
+	a.mu.Unlock()
+	return len(ctx)
+}
+
+// CompanyContext returns the currently cached company context (thread-safe).
+func (a *Assembler) CompanyContext() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.companyContext
+}
+
 // LoadCompanyContext reads company-context.md from the config directory.
+//
+// Layout: agents live in <configDir>/agents/AGENT-*.toml and company-context.md sits directly in
+// <configDir> (the PARENT of the agents directory). On the VM agentsDir is "config/agents", so the
+// context is "config/company-context.md" — NOT "config/config/company-context.md" (the previous
+// extra "config" join meant the context never loaded; #440 fix surfaced by VM smoke).
 func LoadCompanyContext(agentsDir string) string {
-	configDir := filepath.Join(filepath.Dir(agentsDir), "config")
-	path := filepath.Join(configDir, "company-context.md")
+	path := filepath.Join(filepath.Dir(agentsDir), "company-context.md")
 	data, err := os.ReadFile(path) //nolint:gosec // path is derived from trusted local config layout
 	if err != nil {
 		slog.Info("company-context.md not found, company context disabled", "path", path)
@@ -64,11 +91,12 @@ func (a *Assembler) Assemble(agentID int, providerName string, evolution Evoluti
 		Static:  true,
 	})
 
-	// Source 1b: Company Context (static, cacheable, shared across all agents)
-	if a.companyContext != "" {
+	// Source 1b: Company Context (static, cacheable, shared across all agents).
+	// Read under RLock so a concurrent hot-reload (#440) never exposes a half-swapped value.
+	if companyContext := a.CompanyContext(); companyContext != "" {
 		blocks = append(blocks, PromptBlock{
 			Label:   "company",
-			Content: a.companyContext,
+			Content: companyContext,
 			Static:  true,
 		})
 	}
