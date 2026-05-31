@@ -1,8 +1,9 @@
 //! sentinel-dashboard-backend entrypoint (#431): HTTPS (axum) + WebTransport/QUIC.
 //!
 //! - HTTPS :8001 (self-signed) — secure context fuer die WebTransport-API + ServeDir(Bundle) + API.
-//! - WebTransport/QUIC :4434 — topic+msgpack+zstd Push.
-//! - Auth: httpOnly-Session (#402/#405). Control-Routen hinter `require_auth`.
+//! - WebTransport/QUIC same-origin auf dem HTTPS-Port (`wt_bind`-Default :8001, UDP) — topic+msgpack+zstd Push.
+//! - Auth: httpOnly-Session (#402/#405) fuer HTTP/Control-Routen; der WebTransport-Pfad nutzt ein
+//!   kurzlebiges Einmal-Ticket (`?t=`, WT traegt keine Cookies).
 //!
 //! Laeuft parallel zum Bun-Dashboard (:8000) — phased cutover.
 
