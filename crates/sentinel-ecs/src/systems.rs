@@ -372,6 +372,15 @@ pub fn operator_command_system(
     let Some(receiver) = receiver else { return };
     let Ok(rx) = receiver.0.lock() else { return };
 
+    // #438: naechste freie Task-Id, einmal aus den committeten Tasks geseedet; handle_task_command
+    // zaehlt lokal hoch, damit mehrere Creates im selben Tick eindeutige Ids bekommen.
+    let mut next_task_id = task_query
+        .iter()
+        .map(|(_, t)| t.task_id.0)
+        .max()
+        .unwrap_or(0)
+        + 1;
+
     while let Ok(command) = rx.try_recv() {
         match command {
             OperatorCommand::Chaos(command) => {
@@ -601,6 +610,7 @@ pub fn operator_command_system(
                 handle_task_command(
                     &cmd,
                     time.tick.0,
+                    &mut next_task_id,
                     &mut commands,
                     &mut task_query,
                     &mut gaia_buffer,
@@ -622,6 +632,7 @@ pub fn operator_command_system(
 fn handle_task_command(
     cmd: &sentinel_common::OperatorTaskCommand,
     tick: u64,
+    next_task_id: &mut u32,
     commands: &mut Commands,
     task_query: &mut Query<(Entity, &mut sentinel_common::components::TaskState)>,
     gaia_buffer: &mut super::world::GaiaBuffer,
@@ -645,13 +656,12 @@ fn handle_task_command(
 
     match cmd.action {
         OperatorTaskAction::Create => {
+            // Monotoner Zaehler (vor der Drain-Schleife aus der Query geseedet): immun gegen
+            // deferred commands.spawn() — sonst kollidieren mehrere Creates im selben Tick auf id=1.
             let task_id = cmd.task_id.unwrap_or_else(|| {
-                task_query
-                    .iter()
-                    .map(|(_, t)| t.task_id.0)
-                    .max()
-                    .unwrap_or(0)
-                    + 1
+                let id = *next_task_id;
+                *next_task_id += 1;
+                id
             });
             let assigned_to = AgentId(cmd.assigned_to.unwrap_or(1));
             let assigned_by = cmd.assigned_by.map(AgentId);
