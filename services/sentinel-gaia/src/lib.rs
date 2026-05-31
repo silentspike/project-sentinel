@@ -664,7 +664,7 @@ struct AgentIdentityToml {
     direct_reports: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq)]
 struct AgentPersonalityToml {
     openness: f32,
     conscientiousness: f32,
@@ -784,7 +784,7 @@ fn build_agents(
                     reports_to,
                     direct_reports: direct_reports.remove(&agent.name).unwrap_or_default(),
                 },
-                personality: personality_for(spec.seed, agent.id),
+                personality: personality_for(spec.seed, agent.id, &spec.culture),
                 preferences: preferences_for(spec.seed, agent.id, favorite_room),
                 background: AgentBackgroundToml {
                     bio: format!(
@@ -840,16 +840,47 @@ fn kpis_for(department: &str) -> Vec<String> {
     ]
 }
 
-fn personality_for(seed: u64, id: u16) -> AgentPersonalityToml {
+/// Leitet die Big-Five-Verteilung eines Agents deterministisch aus Seed+Id UND der Firmen-Kultur ab
+/// (#441). Kultur-Achsen verschieben den Mittelwert (`center`) bzw. die Streuung (`spread`) pro Trait;
+/// `diversity` weitet die globale Streuung; `conflict_level` weitet speziell die Neuroticism-Streuung.
+/// Bleibt blake3-deterministisch: gleiche Spec+Seed → identische Werte.
+fn personality_for(seed: u64, id: u16, culture: &CultureSpec) -> AgentPersonalityToml {
+    // Globale Streuung: homogen (0.45) bis heterogen (0.80) je nach Diversitaet.
+    let base_spread = 0.45 + culture.diversity * 0.35;
     AgentPersonalityToml {
-        openness: score(seed, id, "openness"),
-        conscientiousness: score(seed, id, "conscientiousness"),
-        extraversion: score(seed, id, "extraversion"),
-        agreeableness: score(seed, id, "agreeableness"),
-        neuroticism: score(seed, id, "neuroticism"),
-        caffeine_tolerance: score(seed, id, "caffeine"),
+        openness: score_with(seed, id, "openness", axis_center(culture.innovation), base_spread),
+        conscientiousness: score_with(
+            seed,
+            id,
+            "conscientiousness",
+            axis_center(culture.formality),
+            base_spread,
+        ),
+        // Keine eigene Achse → neutraler Mittelwert, kulturweite Streuung.
+        extraversion: score_with(seed, id, "extraversion", 0.5, base_spread),
+        agreeableness: score_with(
+            seed,
+            id,
+            "agreeableness",
+            axis_center(culture.collaboration),
+            base_spread,
+        ),
+        // Konfliktniveau weitet die Streuung (mehr Reibung → breiteres Spektrum an Belastbarkeit).
+        neuroticism: score_with(
+            seed,
+            id,
+            "neuroticism",
+            0.5,
+            base_spread + culture.conflict_level * 0.40,
+        ),
+        caffeine_tolerance: score_with(seed, id, "caffeine", 0.5, base_spread),
         morning_person: hash_byte(seed, id, "morning").is_multiple_of(2),
     }
+}
+
+/// Bildet eine Kultur-Achse [0,1] auf einen Trait-Mittelwert in [0.35, 0.65] ab (0.5 = neutral).
+fn axis_center(axis: f32) -> f32 {
+    0.35 + axis.clamp(0.0, 1.0) * 0.30
 }
 
 fn preferences_for(seed: u64, id: u16, favorite_room: String) -> AgentPreferencesToml {
@@ -932,10 +963,13 @@ fn deterministic_name(seed: u64, id: u16) -> String {
     format!("{first} {last}")
 }
 
-fn score(seed: u64, id: u16, field: &str) -> f32 {
-    let raw = hash_byte(seed, id, field);
-    let value = 0.15 + (f32::from(raw) / 255.0) * 0.7;
-    (value * 100.0).round() / 100.0
+/// Deterministischer Trait-Wert um `center` mit Streuung `spread`, blake3-basiert, auf [0.05, 0.95]
+/// geklemmt (innerhalb des von `PersonalityConfig::validate` geforderten [0,1]) und auf 2 Nachkommastellen.
+fn score_with(seed: u64, id: u16, field: &str, center: f32, spread: f32) -> f32 {
+    let norm = f32::from(hash_byte(seed, id, field)) / 255.0; // [0,1]
+    let value = center + (norm - 0.5) * spread;
+    let clamped = value.clamp(0.05, 0.95);
+    (clamped * 100.0).round() / 100.0
 }
 
 fn hash_byte(seed: u64, id: u16, field: &str) -> u8 {
@@ -1242,6 +1276,61 @@ mod tests {
         let mut spec2 = GaiaSpec::example();
         spec2.culture.formality = -0.1;
         assert!(spec2.validate().is_err());
+    }
+
+    #[test]
+    fn personality_for_is_deterministic_with_culture() {
+        // #441 AC1: gleiche Spec+Seed → identische Big-Five-Werte (blake3, kein RNG).
+        let culture = CultureSpec {
+            conflict_level: 0.8,
+            innovation: 0.9,
+            ..CultureSpec::default()
+        };
+        for id in 1..=25u16 {
+            assert_eq!(
+                personality_for(42, id, &culture),
+                personality_for(42, id, &culture)
+            );
+        }
+    }
+
+    fn neuroticism_variance(conflict_level: f32) -> f32 {
+        let culture = CultureSpec {
+            conflict_level,
+            ..CultureSpec::default()
+        };
+        let values: Vec<f32> = (1..=120u16)
+            .map(|id| personality_for(42, id, &culture).neuroticism)
+            .collect();
+        let mean = values.iter().sum::<f32>() / values.len() as f32;
+        values.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / values.len() as f32
+    }
+
+    #[test]
+    fn higher_conflict_widens_neuroticism_variance() {
+        // #441 AC2: hoeheres Konfliktniveau → spuerbar breitere Neuroticism-Streuung.
+        let low = neuroticism_variance(0.0);
+        let high = neuroticism_variance(1.0);
+        assert!(
+            high > low * 1.3,
+            "high-conflict variance {high} must clearly exceed low-conflict {low}"
+        );
+    }
+
+    #[test]
+    fn culture_centers_shift_trait_means() {
+        // #441 AC2: hohe Innovation hebt den Openness-Mittelwert ggue niedriger Innovation.
+        fn openness_mean(innovation: f32) -> f32 {
+            let culture = CultureSpec {
+                innovation,
+                ..CultureSpec::default()
+            };
+            let values: Vec<f32> = (1..=120u16)
+                .map(|id| personality_for(42, id, &culture).openness)
+                .collect();
+            values.iter().sum::<f32>() / values.len() as f32
+        }
+        assert!(openness_mean(0.95) > openness_mean(0.05) + 0.1);
     }
 
     #[test]
