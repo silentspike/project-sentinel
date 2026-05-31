@@ -31,6 +31,7 @@ members = [
     "services/sentinel-console",
     "services/agent-runtime",
     "services/sentinel-ctl",
+    "services/sentinel-dashboard-backend",
 ]
 
 [workspace.dependencies]
