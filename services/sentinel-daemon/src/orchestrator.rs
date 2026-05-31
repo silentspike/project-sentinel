@@ -4495,6 +4495,8 @@ fn ecs_tick_loop(
             let mut updated = 0u32;
             let mut despawned = 0u32;
             let mut deferred_ids: Vec<AgentId> = Vec::new();
+            // IDs der live-geaenderten Agents → gezielte Gateway-DNA-Invalidierung (#440).
+            let mut changed_ids: Vec<u16> = Vec::new();
 
             match mode {
                 sentinel_common::ApplyMode::Fresh => {
@@ -4555,6 +4557,7 @@ fn ecs_tick_loop(
                     for cfg in &diff.update {
                         if crate::config_apply::apply_agent_update(&mut world, cfg) {
                             updated += 1;
+                            changed_ids.push(cfg.identity.id);
                             update_agent_projection_identity(&projection_db_path, cfg);
                         }
                     }
@@ -4639,14 +4642,42 @@ fn ecs_tick_loop(
                 }
             }
 
-            // 6. Gateway-DNA-Cache-Invalidierung triggern (#440 erweitert auf Agent-DNA).
-            //    #425 triggert via ConfigApplied-Event + Log; die Gateway-seitige Invalidierung
-            //    implementiert #440. Best-effort: No-op wenn Gateway inaktiv (VM-Default).
+            // 6. Gateway-DNA-Cache-Invalidierung triggern (#440). Realer Trigger: fire-and-forget
+            //    HTTP-POST an den Gateway-Control-Plane in einem detached Thread, damit der Tick-Loop
+            //    NICHT blockiert. No-op wenn der Gateway aus ist (Connection refused → still ignoriert,
+            //    VM-Default token-safe). Leere agent_ids (Fresh/Spawn-only) ⇒ Gateway invalidiert alle.
             if spawned + updated > 0 {
+                let gateway_url = std::env::var("CORTEX_GATEWAY_URL")
+                    .unwrap_or_else(|_| "http://localhost:8081".to_string());
+                let ids = changed_ids.clone();
+                std::thread::spawn(move || {
+                    let body = serde_json::json!({ "agent_ids": ids });
+                    match reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(2))
+                        .build()
+                    {
+                        Ok(client) => {
+                            let url = format!("{gateway_url}/control/dna/invalidate");
+                            match client.post(&url).json(&body).send() {
+                                Ok(resp) => info!(
+                                    status = %resp.status(),
+                                    "Gateway-DNA-Invalidierung getriggert (#440)"
+                                ),
+                                Err(_) => info!(
+                                    "Gateway-DNA-Invalidierung: Gateway nicht erreichbar — No-op (erwartet wenn inaktiv)"
+                                ),
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "reqwest-Client fuer DNA-Invalidierung nicht baubar")
+                        }
+                    }
+                });
                 info!(
                     spawned,
                     updated,
-                    "Gateway-DNA-Cache-Invalidierung getriggert (ConfigApplied-Event) — Gateway-Reload via #440, No-op wenn inaktiv"
+                    changed = changed_ids.len(),
+                    "Gateway-DNA-Cache-Invalidierung getriggert (#440, fire-and-forget)"
                 );
             }
 

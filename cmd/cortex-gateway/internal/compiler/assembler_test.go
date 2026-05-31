@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/capability"
@@ -201,15 +202,14 @@ func TestAssemble_MissingAgent(t *testing.T) {
 	}
 }
 
-func TestLoadCompanyContextReadsSiblingConfigDirectory(t *testing.T) {
+func TestLoadCompanyContextReadsFromConfigDirectory(t *testing.T) {
+	// Mirrors the production layout: <configDir>/agents/AGENT-*.toml + <configDir>/company-context.md
+	// (agentsDir = ".../config/agents"; the context sits in its PARENT, the config dir).
 	baseDir := t.TempDir()
-	agentsDir := filepath.Join(baseDir, "agents")
 	configDir := filepath.Join(baseDir, "config")
+	agentsDir := filepath.Join(configDir, "agents")
 	if err := os.MkdirAll(agentsDir, 0o750); err != nil {
 		t.Fatalf("MkdirAll(agents): %v", err)
-	}
-	if err := os.MkdirAll(configDir, 0o750); err != nil {
-		t.Fatalf("MkdirAll(config): %v", err)
 	}
 
 	agentPath := filepath.Join(agentsDir, "AGENT-01-THOMAS-CEO.toml")
@@ -331,4 +331,87 @@ func TestFormatPerception(t *testing.T) {
 	if !strings.Contains(result, "KOERPER: Wach und aufmerksam") {
 		t.Error("should contain perception content")
 	}
+}
+
+// setupAssemblerWithConfig builds a <root>/agents + <root>/config layout (matching
+// LoadCompanyContext's filepath.Dir(agentDir)/config) so hot-reload (#440) can be exercised.
+func setupAssemblerWithConfig(t *testing.T, contextContent string) (*Assembler, string) {
+	t.Helper()
+	root := t.TempDir()
+	// Production layout: agents under <configDir>/agents, company-context.md in <configDir>.
+	configDir := filepath.Join(root, "config")
+	agentDir := filepath.Join(configDir, "agents")
+	if err := os.MkdirAll(agentDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENT-01-THOMAS-CEO.toml"), []byte(testAgentTOML), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctxPath := filepath.Join(configDir, "company-context.md")
+	if contextContent != "" {
+		if err := os.WriteFile(ctxPath, []byte(contextContent), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loader := NewTOMLLoader(agentDir)
+	return NewAssembler(loader, capability.New()), ctxPath
+}
+
+// #440 AC-1/AC-2: reload re-reads company-context.md and the swap is atomic + visible to Assemble.
+func TestReloadCompanyContextSwapsAtomically(t *testing.T) {
+	asm, ctxPath := setupAssemblerWithConfig(t, "VERSION-A firmenweiter Kontext")
+	if got := asm.CompanyContext(); !strings.Contains(got, "VERSION-A") {
+		t.Fatalf("initial context = %q, want VERSION-A", got)
+	}
+
+	if err := os.WriteFile(ctxPath, []byte("VERSION-B firmenweiter Kontext"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if n := asm.ReloadCompanyContext(); n == 0 {
+		t.Fatal("reload returned 0 bytes for a non-empty file")
+	}
+	if got := asm.CompanyContext(); !strings.Contains(got, "VERSION-B") {
+		t.Errorf("after reload context = %q, want VERSION-B", got)
+	}
+
+	blocks, err := asm.Assemble(1, "claude", EvolutionData{}, "")
+	if err != nil {
+		t.Fatalf("Assemble() error: %v", err)
+	}
+	foundNew := false
+	for _, b := range blocks {
+		if b.Label == "company" && strings.Contains(b.Content, "VERSION-B") {
+			foundNew = true
+		}
+	}
+	if !foundNew {
+		t.Error("Assemble did not pick up the reloaded company context")
+	}
+}
+
+// #440 AC-2: concurrent reloads + reads never expose a half-swapped value (run with -race).
+func TestReloadCompanyContextConcurrent(t *testing.T) {
+	asm, ctxPath := setupAssemblerWithConfig(t, "initialer Kontext")
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				_ = os.WriteFile(ctxPath, []byte(strings.Repeat("X", n*10+j+1)), 0600)
+				asm.ReloadCompanyContext()
+			}
+		}(i)
+	}
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				_, _ = asm.Assemble(1, "claude", EvolutionData{}, "")
+				_ = asm.CompanyContext()
+			}
+		}()
+	}
+	wg.Wait()
 }
