@@ -46,11 +46,13 @@ where
 }
 
 /// GET /api/agents — aktueller Zustand aller Agenten (Bio + Position).
-pub async fn agents(State(st): State<AppState>) -> Response {
+/// Liest die Agent-Read-Models als JSON-Zeilen (read-only). Wiederverwendet von der HTTP-Route
+/// `agents` **und** vom WebTransport-Connect-Snapshot (`wt.rs`).
+pub fn agents_rows(db_path: &str) -> Result<Vec<Value>, rusqlite::Error> {
     let sql = "SELECT agent_id,name,role,shift_set,status,current_room,in_transit,transit_target,\
                last_action,last_action_tick,hunger,energy,stress,bladder,social_need,caffeine_mg,mood,\
                last_event_id,updated_at FROM agent_live_view ORDER BY agent_id";
-    match query_json(&st.config.projection_db, sql, |r| {
+    query_json(db_path, sql, |r| {
         Ok(json!({
             "agent_id": r.get::<_, i64>(0)?,
             "name": r.get::<_, String>(1)?,
@@ -72,7 +74,11 @@ pub async fn agents(State(st): State<AppState>) -> Response {
             "last_event_id": r.get::<_, i64>(17)?,
             "updated_at": r.get::<_, i64>(18)?,
         }))
-    }) {
+    })
+}
+
+pub async fn agents(State(st): State<AppState>) -> Response {
+    match agents_rows(&st.config.projection_db) {
         Ok(rows) => Json(json!({ "agents": rows })).into_response(),
         Err(e) => db_unavailable(e),
     }

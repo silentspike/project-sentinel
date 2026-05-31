@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use anyhow::Context;
 use wtransport::{endpoint::IncomingSession, Endpoint, Identity, ServerConfig};
 
-use crate::auth::SESSION_COOKIE;
 use crate::AppState;
 
 /// Startet den WebTransport-Server (blockiert in der Accept-Loop).
@@ -47,14 +46,13 @@ pub async fn run_server(state: AppState, cert_pem: PathBuf, key_pem: PathBuf) ->
 async fn handle_session(incoming: IncomingSession, st: AppState) -> anyhow::Result<()> {
     let request = incoming.await?;
 
-    // AC-3: Auth am Handshake. Nur erzwungen, wenn ein Dashboard-Key konfiguriert ist (sonst offen, wie Operator-API).
+    // AC-3: Auth am Handshake via kurzlebigem Einmal-Ticket aus der WT-URL-Query (`?t=<ticket>`).
+    // Browser senden bei WebTransport KEINE Cookies → das Ticket (vom authentifizierten /api/wt-ticket
+    // geholt) ist der Auth-Traeger. Nur erzwungen, wenn ein Dashboard-Key konfiguriert ist.
     if st.config.dashboard_api_key.is_some() {
-        let token = request
-            .headers()
-            .get("cookie")
-            .and_then(|c| cookie_value_from_header(c, SESSION_COOKIE));
-        if !st.sessions.validate(token.as_deref()) {
-            tracing::info!("wt session rejected: missing/invalid session cookie");
+        let ticket = query_param(request.path(), "t");
+        if !st.sessions.consume_ticket(ticket.as_deref()) {
+            tracing::info!("wt session rejected: missing/invalid wt-ticket");
             // Kein accept() => Session wird verworfen (Reject).
             return Ok(());
         }
@@ -71,14 +69,33 @@ async fn handle_session(incoming: IncomingSession, st: AppState) -> anyhow::Resu
     let mut uni = connection.open_uni().await?.await?;
     uni.write_all(&hello).await?;
     uni.finish().await?;
-    tracing::debug!(bytes = hello.len(), "wt hello frame pushed");
+
+    // Connect-Snapshot: aktueller agent_live-Stand (read-only aus projection.db) als ein topic-Frame
+    // — damit die Konsole beim Verbinden sofort die echten Agents reaktiv rendert. Der kontinuierliche
+    // Delta-Stream (Push bei jedem neuen Event) bleibt #432. Token-sicher (reiner Projection-Read).
+    match crate::projection::agents_rows(&st.config.projection_db) {
+        Ok(rows) => {
+            let frame = crate::codec::encode_frame("agent_live", &serde_json::json!({ "agents": rows }))?;
+            let mut snap = connection.open_uni().await?.await?;
+            snap.write_all(&frame).await?;
+            snap.finish().await?;
+            tracing::debug!(agents = rows.len(), bytes = frame.len(), "wt agent_live snapshot pushed");
+        }
+        Err(e) => tracing::warn!(error = %e, "wt agent_live snapshot skipped (projection read failed)"),
+    }
+
+    // Verbindung offen halten (Push-Server): nach dem Connect-Snapshot bleibt die Session idle bestehen,
+    // damit der Client „connected" anzeigt. Der kontinuierliche Delta-Push (neue Frames bei Events) ist #432.
+    let reason = connection.closed().await;
+    tracing::debug!(?reason, "wt session closed by peer");
     Ok(())
 }
 
-/// Liest einen Cookie-Wert aus dem rohen `Cookie`-Headerwert.
-fn cookie_value_from_header(header: &str, name: &str) -> Option<String> {
-    header.split(';').find_map(|kv| {
-        let (k, v) = kv.trim().split_once('=')?;
-        (k == name).then(|| v.to_string())
+/// Liest einen Query-Parameter aus dem WT-Request-Pfad (z.B. `/?t=abc` -> "abc").
+fn query_param(path: &str, key: &str) -> Option<String> {
+    let q = path.split_once('?')?.1;
+    q.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key).then(|| v.to_string())
     })
 }
