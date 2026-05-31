@@ -4210,6 +4210,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-ctl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sentinel-daemon"
 version = "0.1.0"
 dependencies = [
