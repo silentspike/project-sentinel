@@ -572,6 +572,31 @@ pub fn operator_command_system(
                 tracing::info!(broadcast_type = %cmd.broadcast_type,
                     "Broadcast: Durchsage gesendet + Event emittiert");
             }
+            OperatorCommand::Dm(cmd) => {
+                // #437: gerichtete 1:1-Nachricht — als Perception mit sichtbarem Absender zugestellt
+                // (reuse GaiaBuffer-Lieferweg), KEIN Despawn. Audit via OperatorDmSent.
+                let agent_id = sentinel_common::AgentId(cmd.target_agent_id);
+                let tick = time.tick.0;
+                gaia_buffer.add(
+                    agent_id,
+                    format!("Direktnachricht von {}: {}", cmd.sender_name, cmd.message),
+                    tick,
+                );
+                let payload = DomainEventPayload::OperatorDmSent {
+                    target_agent_id: cmd.target_agent_id,
+                    sender_name: cmd.sender_name.clone(),
+                    message: cmd.message.clone(),
+                };
+                let event = DomainEvent::new(
+                    payload.event_type_str(),
+                    &format!("AGENT-{:02}", cmd.target_agent_id),
+                    &payload.to_json(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    tick,
+                );
+                event_buffer.events.push(event);
+                tracing::info!(agent_id = cmd.target_agent_id, "DM zugestellt (#437)");
+            }
             OperatorCommand::Task(cmd) => {
                 handle_task_command(
                     &cmd,

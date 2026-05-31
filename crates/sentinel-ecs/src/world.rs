@@ -1750,6 +1750,90 @@ mod room_physics_workspace_tests {
 mod config_apply_helper_tests {
     use super::*;
 
+    fn make_task(
+        task_id: u32,
+        assigned_to: u16,
+        status: sentinel_common::TaskStatus,
+    ) -> sentinel_common::components::TaskState {
+        sentinel_common::components::TaskState {
+            task_id: sentinel_common::TaskId(task_id),
+            title: format!("Task {task_id}"),
+            description: "desc".to_string(),
+            assigned_to: AgentId(assigned_to),
+            assigned_by: Some(AgentId(1)),
+            parent_task: Some(sentinel_common::TaskId(1)),
+            status,
+            created_tick: 5,
+            updated_tick: 5,
+            result: None,
+        }
+    }
+
+    #[test]
+    fn task_survives_snapshot_restore() {
+        // #438 AC-5: Task-Entities sind Time-Machine-faehig (Snapshot + Restore).
+        use sentinel_common::{TaskId, TaskStatus};
+        let (mut world, _) = create_simulation_world();
+        world.spawn(make_task(42, 3, TaskStatus::InProgress));
+
+        let snapshot = snapshot_ecs_state(&mut world);
+        assert_eq!(snapshot.task_states.len(), 1, "task in snapshot");
+
+        let (mut restored, _) = create_simulation_world();
+        restore_ecs_state(&mut restored, &snapshot);
+        let mut query = restored.query::<&sentinel_common::components::TaskState>();
+        let tasks: Vec<_> = query.iter(&restored).collect();
+        assert_eq!(tasks.len(), 1, "task restored");
+        assert_eq!(tasks[0].task_id, TaskId(42));
+        assert_eq!(tasks[0].status, TaskStatus::InProgress);
+        assert_eq!(tasks[0].parent_task, Some(TaskId(1)));
+        assert_eq!(tasks[0].assigned_to, AgentId(3));
+    }
+
+    #[test]
+    fn task_progress_advances_only_active_agents_pending_tasks() {
+        // #438 AC-3-Progress: ein diesen Tick aktiver Agent bringt seine Pending-Tasks auf InProgress.
+        use sentinel_common::TaskStatus;
+        let mut world = World::new();
+        world.insert_resource(SimulationTime {
+            tick: sentinel_common::Tick(10),
+            tick_count: 10,
+            delta_seconds: 1.0,
+            sim_hour: 8.0,
+        });
+        world.insert_resource(EventBuffer::default());
+        world.insert_resource(ActiveAgentsThisTick(vec![AgentId(5)]));
+        let active = world.spawn(make_task(1, 5, TaskStatus::Pending)).id();
+        let idle = world.spawn(make_task(2, 9, TaskStatus::Pending)).id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(crate::systems::task_progress_system);
+        schedule.run(&mut world);
+
+        let active_task = world
+            .get::<sentinel_common::components::TaskState>(active)
+            .unwrap();
+        assert_eq!(
+            active_task.status,
+            TaskStatus::InProgress,
+            "active agent's pending task advanced"
+        );
+        let idle_task = world
+            .get::<sentinel_common::components::TaskState>(idle)
+            .unwrap();
+        assert_eq!(
+            idle_task.status,
+            TaskStatus::Pending,
+            "idle agent's task untouched"
+        );
+        // Status-Change-Event emittiert.
+        let buffer = world.get_resource::<EventBuffer>().unwrap();
+        assert!(buffer
+            .events
+            .iter()
+            .any(|e| e.event_type == "task_status_changed"));
+    }
+
     #[test]
     fn apply_identity_updates_only_name_and_role_keeps_other_components() {
         let (mut world, _) = create_simulation_world();
