@@ -753,6 +753,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let (nightrun_tx, nightrun_rx) = mpsc::channel::<sentinel_common::OperatorNightrunCommand>();
     let (snapshot_tx, snapshot_rx) = mpsc::channel::<sentinel_common::OperatorSnapshotCommand>();
     let (restore_tx, restore_rx) = mpsc::channel::<sentinel_common::OperatorRestoreCommand>();
+    let (config_apply_tx, config_apply_rx) =
+        mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>();
     let (prune_tx, prune_rx) = mpsc::channel::<i64>();
     let (evolution_result_tx, evolution_result_rx) = mpsc::channel::<EvolutionResult>();
     let evolution_job_tx = crate::evolution_task::spawn_evolution_background_task(
@@ -885,6 +887,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 nightrun_agent_counts,
                 snapshot_tx.clone(),
                 restore_tx.clone(),
+                config_apply_tx.clone(),
+                config.max_agents,
+                agent_validation,
                 Arc::clone(&event_store),
                 prune_tx.clone(),
                 Arc::clone(&state_store),
@@ -927,6 +932,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let ecs_security_runtime_state = Arc::clone(&security_runtime_state);
     let ecs_fs_mount = active_fs_mount.clone();
     let ecs_projection_db_path = projection_db_path.clone();
+    let ecs_config_dir = config.config_dir.clone();
+    let ecs_max_agents = config.max_agents;
     let ecs_handle = std::thread::Builder::new()
         .name("ecs-tick-loop".into())
         .spawn(move || {
@@ -954,6 +961,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 Some(evolution_result_rx),
                 snapshot_rx,
                 restore_rx,
+                config_apply_rx,
+                ecs_config_dir,
+                ecs_max_agents,
+                agent_validation,
                 prune_rx,
                 retention_config,
                 evolution_db_path_clone,
@@ -2200,6 +2211,83 @@ fn drain_evolution_results(store: &StateStore, rx: &mpsc::Receiver<EvolutionResu
     }
 }
 
+/// Vollstaendiger Teardown eines Agents (#425 Live-Despawn / Fresh-Load): Sandbox-Handle, bwrap-
+/// Prozess, eBPF-Registrierung, Security-Snapshot, RuntimeOrchestrator-Eintrag und ECS-Entity.
+/// Spiegelt den Reconcile-Cleanup-Pfad (`remove_agent_runtime_fragments`).
+#[allow(clippy::too_many_arguments)]
+fn teardown_agent_full(
+    agent_id: AgentId,
+    world: &mut bevy_ecs::prelude::World,
+    runtime_orch: &mut RuntimeOrchestrator,
+    sandbox: &SandboxEnforcer,
+    sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &mut EbpfCollector,
+    agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+) {
+    if let Some(handle) = sandbox_handles.remove(&agent_id) {
+        if handle.cgroup_created {
+            if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
+                ebpf_collector.unregister_agent(cid);
+            }
+        }
+        if let Err(e) = sandbox.teardown_agent(&handle) {
+            warn!(agent_id = %agent_id, error = %e, "Sandbox-Teardown bei Config-Apply fehlgeschlagen");
+        }
+    }
+    if let Some(proc_handle) = agent_processes.remove(&agent_id) {
+        let _ = signal_pid(proc_handle.pid, "TERM");
+        drop(proc_handle);
+    }
+    remove_security_runtime_snapshot(security_runtime_state, agent_id);
+    if runtime_orch.agents().contains_key(&agent_id) {
+        if let Err(e) = runtime_orch.despawn_agent(agent_id) {
+            warn!(agent_id = %agent_id, error = %e, "Runtime-Despawn bei Config-Apply fehlgeschlagen");
+        }
+    }
+    let _ = despawn_agent_from_world(world, agent_id);
+}
+
+/// Alle Agent-IDs der aktuellen ECS-Welt (fuer Fresh-Load Reset).
+fn world_agent_ids(world: &mut bevy_ecs::prelude::World) -> Vec<AgentId> {
+    let mut query = world.query::<&AgentIdentity>();
+    query.iter(world).map(|identity| identity.agent_id).collect()
+}
+
+/// True, wenn der Agent gerade unter aktiver Control-Plane-Heilung steht (Runtime-Health „stale").
+/// TOGAF §6 L3: solche Agents NICHT despawnen — Despawn wird deferred.
+fn agent_under_active_healing(
+    runtime_health: &crate::runtime_health::SharedRuntimeHealthState,
+    agent_id: AgentId,
+) -> bool {
+    runtime_health
+        .read()
+        .map(|snapshot| {
+            snapshot.agents.iter().any(|a| {
+                a.agent_id == agent_id.0 && a.last_repair_status.as_deref() == Some("stale")
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Aktualisiert Name/Rolle eines live-aktualisierten Agents in der Read-Projection (Dashboard).
+/// Live-Component-Updates emittieren kein Event → die Projection wird hier gezielt nachgezogen.
+fn update_agent_projection_identity(projection_db_path: &str, cfg: &AgentConfig) {
+    if projection_db_path.is_empty() {
+        return;
+    }
+    if let Ok(db) = sentinel_limbo::rusqlite::Connection::open(projection_db_path) {
+        let _ = db.execute(
+            "UPDATE agent_live_view SET name = ?2, role = ?3 WHERE agent_id = ?1",
+            sentinel_limbo::rusqlite::params![
+                cfg.identity.id as i64,
+                cfg.identity.name,
+                cfg.identity.role
+            ],
+        );
+    }
+}
+
 /// ECS Tick-Loop auf dediziertem Thread.
 ///
 /// Verwaltet den RuntimeOrchestrator (Lifecycle-Events, Shift-Wechsel, Snapshots)
@@ -2214,7 +2302,7 @@ fn ecs_tick_loop(
     platform_rx: mpsc::Receiver<crate::platform_controlplane::PlatformControlCommand>,
     runtime_rx: mpsc::Receiver<RuntimeControlCommand>,
     perception_tx: mpsc::SyncSender<Perception>,
-    all_agents: Vec<AgentConfig>,
+    mut all_agents: Vec<AgentConfig>,
     initial_shift: u8,
     tick_rate: Duration,
     time_scale: f32,
@@ -2230,6 +2318,10 @@ fn ecs_tick_loop(
     evolution_result_rx: Option<mpsc::Receiver<EvolutionResult>>,
     snapshot_rx: mpsc::Receiver<sentinel_common::OperatorSnapshotCommand>,
     restore_rx: mpsc::Receiver<sentinel_common::OperatorRestoreCommand>,
+    config_apply_rx: mpsc::Receiver<sentinel_common::OperatorConfigApplyCommand>,
+    config_dir: std::path::PathBuf,
+    config_apply_max_agents: usize,
+    config_apply_validation: sentinel_common::agent_config::AgentConfigValidation,
     prune_rx: mpsc::Receiver<i64>,
     retention_config: crate::config::RetentionConfig,
     evolution_db_path: String,
@@ -4343,6 +4435,232 @@ fn ecs_tick_loop(
             }
         }
 
+        // Runtime Config-Apply (#425): Firma zur Laufzeit aendern — Live-Diff oder Fresh-Load.
+        // Laeuft zwischen Ticks (nach schedule.run) → tick-synchron.
+        while let Ok(apply_cmd) = config_apply_rx.try_recv() {
+            // Defensive Re-Validierung (Endpoint hat bereits 4xx geliefert; hier nur Schutz).
+            if let Err(errors) = crate::config_apply::validate_config_apply(
+                &apply_cmd,
+                config_apply_max_agents,
+                config_apply_validation,
+            ) {
+                warn!(
+                    error_count = errors.len(),
+                    "Config-Apply im Tick-Loop abgelehnt (Re-Validierung) — keine Mutation"
+                );
+                continue;
+            }
+            let mode = apply_cmd.mode;
+            info!(
+                ?mode,
+                agents = apply_cmd.agents.len(),
+                rooms = apply_cmd.building.rooms.len(),
+                "Config-Apply gestartet (tick-synchron)"
+            );
+
+            // 1. Pre-Apply Safety-Snapshot (Rollback-Punkt).
+            {
+                let es = world
+                    .get_resource::<sentinel_ecs::LimboEventStore>()
+                    .map(|e| Arc::clone(&e.0));
+                let ss = world
+                    .get_resource::<sentinel_ecs::RedbStateStore>()
+                    .map(|r| r.store.clone());
+                if let (Some(es), Some(ss)) = (es, ss) {
+                    let data_dir = std::path::Path::new(&events_db_path_str)
+                        .parent()
+                        .unwrap_or(std::path::Path::new("/opt/sentinel/data"));
+                    match snapshot_manager.create_and_store(
+                        &mut world,
+                        &ss,
+                        &es,
+                        data_dir,
+                        fs_layer.as_deref(),
+                        fs_mount.as_deref(),
+                        tick_count,
+                        sim_hour,
+                    ) {
+                        Ok(id) => info!(snapshot_id = %id, "Pre-Apply Safety-Snapshot erstellt"),
+                        Err(e) => {
+                            warn!(error = %e, "Pre-Apply Snapshot fehlgeschlagen (Apply wird fortgesetzt)")
+                        }
+                    }
+                }
+            }
+
+            // 2. Raum-Maps idempotent neu bauen (Layout-Aenderungen wirken sofort).
+            sentinel_ecs::rebuild_room_maps(&mut world, &apply_cmd.building);
+
+            let mut spawned = 0u32;
+            let mut updated = 0u32;
+            let mut despawned = 0u32;
+            let mut deferred_ids: Vec<AgentId> = Vec::new();
+
+            match mode {
+                sentinel_common::ApplyMode::Fresh => {
+                    // Fresh-Load: gesamte Agent-Welt abbauen, dann Schicht-Agents neu spawnen.
+                    for agent_id in world_agent_ids(&mut world) {
+                        teardown_agent_full(
+                            agent_id,
+                            &mut world,
+                            &mut runtime_orch,
+                            &sandbox,
+                            &mut sandbox_handles,
+                            &mut ebpf_collector,
+                            &mut agent_processes,
+                            &security_runtime_state,
+                        );
+                        despawned += 1;
+                    }
+                    for cfg in agents_for_shift(&apply_cmd.agents, current_shift) {
+                        if spawn_agent_full(
+                            &mut runtime_orch,
+                            &mut world,
+                            cfg,
+                            &sandbox,
+                            &mut sandbox_handles,
+                            &mut ebpf_collector,
+                            &mut agent_processes,
+                            &agent_command,
+                            &security_runtime_state,
+                            fs_mount.as_deref(),
+                        ) {
+                            spawned += 1;
+                        }
+                    }
+                }
+                sentinel_common::ApplyMode::Live => {
+                    let diff =
+                        crate::config_apply::compute_agent_diff(&all_agents, &apply_cmd.agents);
+                    // Neue Agents: nur spawnen wenn in aktueller Schicht (sonst beim Schichtwechsel).
+                    for cfg in &diff.spawn {
+                        if (current_shift == 0 || cfg.identity.shift_set == current_shift)
+                            && spawn_agent_full(
+                                &mut runtime_orch,
+                                &mut world,
+                                cfg,
+                                &sandbox,
+                                &mut sandbox_handles,
+                                &mut ebpf_collector,
+                                &mut agent_processes,
+                                &agent_command,
+                                &security_runtime_state,
+                                fs_mount.as_deref(),
+                            )
+                        {
+                            spawned += 1;
+                        }
+                    }
+                    // Geaenderte Agents: live aktualisieren, KEIN Despawn (Memory/Bio/Evolution bleibt).
+                    for cfg in &diff.update {
+                        if crate::config_apply::apply_agent_update(&mut world, cfg) {
+                            updated += 1;
+                            update_agent_projection_identity(&projection_db_path, cfg);
+                        }
+                    }
+                    // Entfernte Agents: despawnen — aber CP-Heilung nicht stoeren (§6 L3 → deferren).
+                    for agent_id in &diff.despawn {
+                        if agent_under_active_healing(&runtime_health, *agent_id) {
+                            warn!(agent_id = %agent_id, "Despawn deferred: Agent unter aktiver Control-Plane-Heilung (TOGAF §6 L3)");
+                            deferred_ids.push(*agent_id);
+                            continue;
+                        }
+                        teardown_agent_full(
+                            *agent_id,
+                            &mut world,
+                            &mut runtime_orch,
+                            &sandbox,
+                            &mut sandbox_handles,
+                            &mut ebpf_collector,
+                            &mut agent_processes,
+                            &security_runtime_state,
+                        );
+                        despawned += 1;
+                    }
+                }
+            }
+
+            // 3. Persistenz (config_dir Write-Back) — Daemon ist alleiniger Schreiber (#420).
+            let persisted = match crate::config_persist::persist_company_config(
+                &config_dir,
+                &apply_cmd.agents,
+                &apply_cmd.building,
+                &tick_count.to_string(),
+            ) {
+                Ok(result) => {
+                    info!(
+                        agents = result.agents_written,
+                        removed = result.agents_removed,
+                        "Config in config_dir persistiert (ueberlebt Restart)"
+                    );
+                    true
+                }
+                Err(e) => {
+                    error!(error = %e, "Config-Persistenz fehlgeschlagen — Laufzeit-Welt ist bereits aktualisiert (Safety-Snapshot erlaubt Rollback)");
+                    false
+                }
+            };
+
+            // 4. Angewandte Config fuer den naechsten Diff uebernehmen. Deferred (CP-Heilung) Agents
+            //    bleiben erhalten, damit ihr Despawn beim naechsten Apply erneut versucht wird.
+            let deferred_configs: Vec<AgentConfig> = deferred_ids
+                .iter()
+                .filter_map(|id| all_agents.iter().find(|a| a.identity.id == id.0).cloned())
+                .collect();
+            all_agents = apply_cmd.agents.clone();
+            all_agents.extend(deferred_configs);
+
+            // 5. ConfigApplied-DomainEvent (Audit + durabler Trigger fuer Gateway-DNA-Reload #440).
+            let payload = DomainEventPayload::ConfigApplied {
+                mode: format!("{mode:?}").to_lowercase(),
+                spawned,
+                updated,
+                despawned,
+                rooms_changed: apply_cmd.building.rooms.len() as u32,
+                persisted,
+            };
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let event = DomainEvent::new(
+                payload.event_type_str(),
+                "company",
+                &payload.to_json(),
+                &format!("config-apply-{now_ms}"),
+                tick_count,
+            );
+            if let Some(es) = world
+                .get_resource::<sentinel_ecs::LimboEventStore>()
+                .map(|e| Arc::clone(&e.0))
+            {
+                if let Err(e) = es.append_event(&event) {
+                    warn!(error = %e, "ConfigApplied-Event konnte nicht persistiert werden");
+                }
+            }
+
+            // 6. Gateway-DNA-Cache-Invalidierung triggern (#440 erweitert auf Agent-DNA).
+            //    #425 triggert via ConfigApplied-Event + Log; die Gateway-seitige Invalidierung
+            //    implementiert #440. Best-effort: No-op wenn Gateway inaktiv (VM-Default).
+            if spawned + updated > 0 {
+                info!(
+                    spawned,
+                    updated,
+                    "Gateway-DNA-Cache-Invalidierung getriggert (ConfigApplied-Event) — Gateway-Reload via #440, No-op wenn inaktiv"
+                );
+            }
+
+            info!(
+                ?mode,
+                spawned,
+                updated,
+                despawned,
+                deferred = deferred_ids.len(),
+                persisted,
+                "Config-Apply abgeschlossen"
+            );
+        }
+
         // eBPF Metrics Collection (Intervall konfigurierbar fuer deterministische PCP-Tests)
         let ebpf_collect_interval = platform_cp.config().ebpf_collect_interval_ticks.max(1);
         if tick_count > 0 && tick_count.is_multiple_of(ebpf_collect_interval) {
@@ -4925,6 +5243,10 @@ mod tests {
             None,
             mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
             mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+            mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+            std::path::PathBuf::from("/tmp/sentinel-test-config-apply"),
+            10,
+            sentinel_common::agent_config::AgentConfigValidation::default(),
             mpsc::channel::<i64>().1,
             crate::config::RetentionConfig::default(),
             String::new(),
@@ -5010,6 +5332,10 @@ mod tests {
                 None,
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+                std::path::PathBuf::from("/tmp/sentinel-test-config-apply"),
+                10,
+                sentinel_common::agent_config::AgentConfigValidation::default(),
                 mpsc::channel::<i64>().1,
                 crate::config::RetentionConfig::default(),
                 String::new(),
@@ -5112,6 +5438,10 @@ mod tests {
                 None,
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+                std::path::PathBuf::from("/tmp/sentinel-test-config-apply"),
+                10,
+                sentinel_common::agent_config::AgentConfigValidation::default(),
                 mpsc::channel::<i64>().1,
                 crate::config::RetentionConfig::default(),
                 String::new(),
@@ -5222,6 +5552,10 @@ mod tests {
                 None,
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+                std::path::PathBuf::from("/tmp/sentinel-test-config-apply"),
+                10,
+                sentinel_common::agent_config::AgentConfigValidation::default(),
                 mpsc::channel::<i64>().1,
                 crate::config::RetentionConfig::default(),
                 String::new(),
@@ -5331,5 +5665,51 @@ mod tests {
         assert_eq!(shift_hours(2), (14, 22));
         assert_eq!(shift_hours(3), (22, 6));
         assert_eq!(shift_hours(99), (6, 14)); // Fallback
+    }
+
+    #[test]
+    fn world_agent_ids_lists_all_spawned() {
+        // Fresh-Load Reset enumeriert alle ECS-Agents (#425).
+        let (mut world, _) = create_simulation_world();
+        spawn_agent(&mut world, AgentId(1), "A", "Dev", 1, "empfang");
+        spawn_agent(&mut world, AgentId(2), "B", "PM", 1, "empfang");
+        let mut ids: Vec<u16> = world_agent_ids(&mut world).iter().map(|a| a.0).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    fn health_agent(
+        agent_id: u16,
+        repair_status: &str,
+    ) -> crate::runtime_health::RuntimeHealthAgentSnapshot {
+        crate::runtime_health::RuntimeHealthAgentSnapshot {
+            agent_id,
+            aggregate_id: format!("AGENT-{agent_id:02}"),
+            name: format!("Agent{agent_id}"),
+            runtime_present: true,
+            projection_present: true,
+            tracked_pid: None,
+            tracked_pid_alive: false,
+            tracked_pid_state: None,
+            cgroup_live_pid_count: 0,
+            security_runtime_present: true,
+            last_repair_status: Some(repair_status.to_string()),
+        }
+    }
+
+    #[test]
+    fn agent_under_active_healing_defers_only_stale() {
+        // TOGAF §6 L3: Agents unter aktiver CP-Heilung ("stale") NICHT despawnen.
+        let health = Arc::new(RwLock::new(
+            crate::runtime_health::RuntimeHealthSnapshot::default(),
+        ));
+        {
+            let mut h = health.write().unwrap();
+            h.agents.push(health_agent(5, "stale"));
+            h.agents.push(health_agent(6, "healthy"));
+        }
+        assert!(agent_under_active_healing(&health, AgentId(5)), "stale -> defer");
+        assert!(!agent_under_active_healing(&health, AgentId(6)), "healthy -> despawn ok");
+        assert!(!agent_under_active_healing(&health, AgentId(99)), "unknown -> despawn ok");
     }
 }

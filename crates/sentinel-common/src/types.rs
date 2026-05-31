@@ -574,3 +574,23 @@ pub struct OperatorRestoreCommand {
 pub struct OperatorSnapshotCommand {
     pub tier: Option<SnapshotTier>,
 }
+
+/// Apply-Modus fuer Runtime-Config-Apply (#425).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApplyMode {
+    /// Inkrementelles Diff-Apply gegen die laufende Welt (Editieren bestehender Firma).
+    Live,
+    /// Volle Welt-Initialisierung aus neuer Config (brandneue Firma).
+    Fresh,
+}
+
+/// Operator-Trigger fuer Runtime-Config-Apply (#425).
+/// Self-contained Inline-JSON: traegt die ganze ECS-Firma (agents + building).
+/// `company-context` ist NICHT enthalten (laeuft via Gateway-Hot-Reload #440).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorConfigApplyCommand {
+    pub mode: ApplyMode,
+    pub agents: Vec<crate::agent_config::AgentConfig>,
+    pub building: crate::room::BuildingConfig,
+}

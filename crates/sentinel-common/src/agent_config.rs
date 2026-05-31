@@ -3,11 +3,11 @@
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{AgentId, AgentIdBounds};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub identity: IdentityConfig,
     pub personality: PersonalityConfig,
@@ -21,7 +21,7 @@ pub struct AgentConfig {
 
 /// Tool-Capabilities und Sandbox-Einschraenkungen pro Agent.
 /// Leere Capabilities = kein Tool-Zugriff (sicherer Default).
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CapabilitiesConfig {
     /// Tool-Namen die der Agent nutzen darf (z.B. "file_read", "chat", "calendar").
     #[serde(default)]
@@ -35,13 +35,13 @@ pub struct CapabilitiesConfig {
 ///
 /// Empty means the caller must provide an explicit fallback policy. The parser
 /// does not inject a default runtime because DEV-007 makes the contract plural.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RuntimeSelectionConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nano_runtime: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IdentityConfig {
     pub id: u16,
     pub name: String,
@@ -50,13 +50,13 @@ pub struct IdentityConfig {
     pub shift_set: u8,
     #[serde(default)]
     pub kpis: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reports_to: Option<String>,
     #[serde(default)]
     pub direct_reports: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersonalityConfig {
     pub openness: f32,
     pub conscientiousness: f32,
@@ -67,14 +67,14 @@ pub struct PersonalityConfig {
     pub morning_person: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreferencesConfig {
     pub favorite_room: String,
     pub coffee_preference: String,
     pub lunch_time: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackgroundConfig {
     pub bio: String,
     pub quirks: Vec<String>,
@@ -175,6 +175,17 @@ mod tests {
         assert_eq!(config.identity.name, "Thomas Mueller");
         assert_eq!(config.identity.role, "CEO / Geschaeftsfuehrer / Gruender");
         assert_eq!(config.identity.id, 1);
+    }
+
+    #[test]
+    fn agent_config_toml_round_trip() {
+        // #425: Serialize muss fuer config_dir-Write-Back round-trippen.
+        let path = config_dir().join("AGENT-01-THOMAS-CEO.toml");
+        let original = load_agent_config(&path).unwrap();
+        let serialized = toml::to_string(&original).expect("serialize AgentConfig to TOML");
+        let reparsed: AgentConfig =
+            toml::from_str(&serialized).expect("re-parse serialized AgentConfig");
+        assert_eq!(original, reparsed, "AgentConfig TOML round-trip must be identical");
     }
 
     #[test]
