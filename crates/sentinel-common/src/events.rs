@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{AgentId, EventType, RoomStimulusType};
+use crate::{AgentId, EventType, RoomStimulusType, TaskId};
 
 /// Domain-Event mit Saga-ready Kettenfeldern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +170,35 @@ pub enum DomainEventPayload {
     },
     /// Agent wurde aus der Runtime entfernt
     AgentDespawned { agent_id: AgentId, reason: String },
+    /// Task/Auftrag erstellt (#438)
+    TaskCreated {
+        task_id: TaskId,
+        title: String,
+        assigned_to: AgentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_task: Option<TaskId>,
+    },
+    /// Task einem (anderen) Agent zugewiesen / delegiert (#438)
+    TaskAssigned {
+        task_id: TaskId,
+        assigned_to: AgentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assigned_by: Option<AgentId>,
+    },
+    /// Task-Status geaendert (#438)
+    TaskStatusChanged {
+        task_id: TaskId,
+        old_status: String,
+        new_status: String,
+    },
+    /// Task abgeschlossen (#438)
+    TaskCompleted {
+        task_id: TaskId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+    },
+    /// Task blockiert (#438)
+    TaskBlocked { task_id: TaskId, reason: String },
     /// Schichtwechsel abgeschlossen
     ShiftTransitionCompleted {
         new_shift_set: u8,
@@ -341,6 +370,11 @@ impl DomainEventPayload {
             Self::TickSnapshot { .. } => "tick_snapshot",
             Self::AgentSpawned { .. } => "agent_spawned",
             Self::AgentDespawned { .. } => "agent_despawned",
+            Self::TaskCreated { .. } => "task_created",
+            Self::TaskAssigned { .. } => "task_assigned",
+            Self::TaskStatusChanged { .. } => "task_status_changed",
+            Self::TaskCompleted { .. } => "task_completed",
+            Self::TaskBlocked { .. } => "task_blocked",
             Self::ShiftTransitionCompleted { .. } => "shift_transition_completed",
             Self::AgentStatusChanged { .. } => "agent_status_changed",
             Self::NightRunStarted { .. } => "nightrun_started",
@@ -364,6 +398,62 @@ impl DomainEventPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_event_types_and_roundtrip() {
+        // #438 AC1: Task-Events haben korrekte event_type_str + serde-Roundtrip.
+        let created = DomainEventPayload::TaskCreated {
+            task_id: TaskId(7),
+            title: "Landingpage bauen".to_string(),
+            assigned_to: AgentId(3),
+            parent_task: Some(TaskId(1)),
+        };
+        assert_eq!(created.event_type_str(), "task_created");
+        let json = created.to_json();
+        let back: DomainEventPayload = serde_json::from_str(&json).expect("roundtrip");
+        assert_eq!(back.to_json(), json);
+
+        assert_eq!(
+            DomainEventPayload::TaskAssigned {
+                task_id: TaskId(7),
+                assigned_to: AgentId(4),
+                assigned_by: Some(AgentId(3)),
+            }
+            .event_type_str(),
+            "task_assigned"
+        );
+        assert_eq!(
+            DomainEventPayload::TaskStatusChanged {
+                task_id: TaskId(7),
+                old_status: "pending".to_string(),
+                new_status: "in_progress".to_string(),
+            }
+            .event_type_str(),
+            "task_status_changed"
+        );
+        assert_eq!(
+            DomainEventPayload::TaskCompleted {
+                task_id: TaskId(7),
+                result: None
+            }
+            .event_type_str(),
+            "task_completed"
+        );
+        assert_eq!(
+            DomainEventPayload::TaskBlocked {
+                task_id: TaskId(7),
+                reason: "wartet auf Zulieferung".to_string(),
+            }
+            .event_type_str(),
+            "task_blocked"
+        );
+    }
+
+    #[test]
+    fn task_status_default_is_pending() {
+        assert_eq!(crate::TaskStatus::default(), crate::TaskStatus::Pending);
+        assert_eq!(crate::TaskStatus::InProgress.as_str(), "in_progress");
+    }
 
     #[test]
     fn hallway_encounter_serializes_room_id() {

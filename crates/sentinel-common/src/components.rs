@@ -8,7 +8,7 @@
 use bevy_ecs::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentId, Emotion, Tick};
+use crate::{AgentId, Emotion, TaskId, TaskStatus, Tick};
 
 /// Interrupt-Prioritaet fuer Decision Engine (P0 = hoechste Prioritaet)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -55,6 +55,26 @@ pub struct AgentIdentity {
     pub agent_id: AgentId,
     pub name: String,
     pub role: String,
+}
+
+/// Task-/Auftrags-Entity (#438): event-sourced, hierarchisch (parent_task), via Voice-of-Gaia an
+/// Agents zugestellt, Status aus Agent-Aktionen abgeleitet. Eigene Entity (kein Agent-Component).
+#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskState {
+    pub task_id: TaskId,
+    pub title: String,
+    pub description: String,
+    /// Agent, dem der Task zugewiesen ist.
+    pub assigned_to: AgentId,
+    /// Delegierender Agent (None = direkt von Gaia/Operator).
+    pub assigned_by: Option<AgentId>,
+    /// Uebergeordneter Task fuer mehrstufige Delegation (CEO→Lead→Mitarbeiter).
+    pub parent_task: Option<TaskId>,
+    pub status: TaskStatus,
+    pub created_tick: u64,
+    pub updated_tick: u64,
+    /// Ergebnis/Notiz bei Abschluss.
+    pub result: Option<String>,
 }
 
 /// Position im Buerogebaeude (String-basierte Raum-IDs aus rooms.toml)
