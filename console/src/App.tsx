@@ -7,8 +7,10 @@ import {
   ToastContainer, addToast, type Status,
 } from "./components/controls";
 import { VirtualScroller } from "./components/VirtualScroller";
+import { Tiling } from "./tiling/TilingLayout";
+import { tilingTree, splitLeaf, closeLeaf, openPanel, type PanelKind } from "./tiling/engine";
 
-// Mobile-Breakpoint via matchMedia (Desktop=3 Saeulen, Mobile=BottomTabBar).
+// Mobile-Breakpoint via matchMedia (Desktop=Tiling, Mobile=BottomTabBar).
 function useIsMobile() {
   const mq = typeof window !== "undefined" ? window.matchMedia("(max-width: 767px)") : null;
   const [m, setM] = createSignal(mq?.matches ?? false);
@@ -46,7 +48,6 @@ function Login(props: { onOk: () => void }): JSX.Element {
 
 function DashboardCol(): JSX.Element {
   const bigList = createMemo(() => Array.from({ length: 10000 }, (_, i) => ({ id: i, label: `Zeile ${i}` })));
-  // Demo eines gepushten Frames (gleicher reconcile-Pfad wie ein echter WebTransport-Push).
   const simulatePush = () =>
     ingestFrame("agent_live", {
       agents: [
@@ -55,28 +56,24 @@ function DashboardCol(): JSX.Element {
       ] satisfies AgentRow[],
     });
   return (
-    <section class="col" data-testid="col-dashboard">
+    <section class="col" style={{ height: "100%" }} data-testid="col-dashboard">
       <div class="col__head">Dashboard <LiveIndicator status={status()} /></div>
       <div class="col__body">
-        <p class="muted">Frames empfangen: <span data-testid="frame-count" class="pill">{frameCount()}</span> · letztes Topic: <span data-testid="last-topic" class="pill">{consoleStore.lastTopic ?? "—"}</span></p>
+        <p class="muted">Frames: <span data-testid="frame-count" class="pill">{frameCount()}</span> · Topic: <span data-testid="last-topic" class="pill">{consoleStore.lastTopic ?? "—"}</span></p>
         <ProgressBar label="Schicht-Auslastung" done={Math.min(consoleStore.agents.length, 26)} total={26} />
         <button data-testid="simulate-push" onClick={simulatePush}>Push simulieren</button>
         <h3 style={{ "margin-bottom": "4px" }}>Agents (reaktiv)</h3>
-        <div data-testid="agent-list">
-          <Show when={consoleStore.agents.length > 0} fallback={<p class="muted">noch keine Agents (Push simulieren / Backend verbinden)</p>}>
-            <For each={consoleStore.agents}>
-              {(a) => (
-                <div data-testid="agent-row" style={{ display: "flex", "justify-content": "space-between", padding: "4px 0", "border-bottom": "1px solid var(--border)" }}>
-                  <span>{a.name} <span class="muted">· {a.role}</span></span>
-                  <span class="pill">{a.current_room ?? "—"}</span>
-                </div>
-              )}
-            </For>
-          </Show>
-        </div>
+        <Show when={consoleStore.agents.length > 0} fallback={<p class="muted">noch keine Agents</p>}>
+          <For each={consoleStore.agents}>
+            {(a) => (
+              <div data-testid="agent-row" style={{ display: "flex", "justify-content": "space-between", padding: "4px 0", "border-bottom": "1px solid var(--border)" }}>
+                <span>{a.name} <span class="muted">· {a.role}</span></span><span class="pill">{a.current_room ?? "—"}</span>
+              </div>
+            )}
+          </For>
+        </Show>
         <h3 style={{ "margin-bottom": "4px" }}>VirtualScroller (N=10000)</h3>
-        <VirtualScroller items={bigList()} rowHeight={28} height={220}
-          renderRow={(it) => <span data-testid="vrow">{it.label}</span>} />
+        <VirtualScroller items={bigList()} rowHeight={28} height={180} renderRow={(it) => <span data-testid="vrow">{it.label}</span>} />
       </div>
     </section>
   );
@@ -86,18 +83,13 @@ function ControlCol(): JSX.Element {
   const [st, setSt] = createSignal<Status>("pending");
   const [filter, setFilter] = createSignal("");
   return (
-    <section class="col" data-testid="col-control">
+    <section class="col" style={{ height: "100%" }} data-testid="col-control">
       <div class="col__head">Control-Center</div>
       <div class="col__body" style={{ display: "grid", gap: "10px" }}>
         <SearchFilter placeholder="Agents filtern…" onFilter={setFilter} />
         <p class="muted" style={{ "font-size": "12px" }}>Filter: <span data-testid="filter-value">{filter() || "—"}</span></p>
-        <div style={{ display: "flex", gap: "8px", "align-items": "center" }}>
-          <span>Status:</span><StatusDropdown value={st()} onChange={setSt} />
-        </div>
-        <div style={{ display: "flex", gap: "8px" }}>
-          <ThemeToggle />
-          <button data-testid="toast-btn" onClick={() => addToast("Aktion ausgefuehrt", "ok")}>Toast</button>
-        </div>
+        <div style={{ display: "flex", gap: "8px", "align-items": "center" }}><span>Status:</span><StatusDropdown value={st()} onChange={setSt} /></div>
+        <div style={{ display: "flex", gap: "8px" }}><ThemeToggle /><button data-testid="toast-btn" onClick={() => addToast("Aktion ausgefuehrt", "ok")}>Toast</button></div>
       </div>
     </section>
   );
@@ -105,10 +97,41 @@ function ControlCol(): JSX.Element {
 
 function ChatCol(): JSX.Element {
   return (
-    <section class="col" data-testid="col-chat">
+    <section class="col" style={{ height: "100%" }} data-testid="col-chat">
       <div class="col__head">Chat</div>
-      <div class="col__body"><p class="muted">Room-Chat · 1:1-Agent-DM · Invite (Phase 4). Hier rendern Konversationen.</p></div>
+      <div class="col__body"><p class="muted">Room-Chat · 1:1-Agent-DM · Invite (Phase 4).</p></div>
     </section>
+  );
+}
+
+function FloorplanCol(): JSX.Element {
+  return (
+    <section class="col" style={{ height: "100%" }} data-testid="col-floorplan">
+      <div class="col__head">Floorplan</div>
+      <div class="col__body">
+        <p class="muted">2D-Floorplan (WebGL/Canvas, eigenes View-Issue). Von Gaia kontextuell geoeffnet.</p>
+        <div style={{ height: "120px", border: "1px dashed var(--border)", "border-radius": "6px", display: "grid", "place-items": "center" }} class="muted">[ Floorplan-Canvas ]</div>
+      </div>
+    </section>
+  );
+}
+
+const PANELS: Record<PanelKind, () => JSX.Element> = {
+  dashboard: DashboardCol, control: ControlCol, chat: ChatCol, floorplan: FloorplanCol,
+};
+
+// Tile-Chrome: kompakte Leiste (Split horizontal/vertikal, Schliessen) ueber dem Panel.
+function renderPanel(panel: PanelKind, leafId: string): JSX.Element {
+  return (
+    <div style={{ height: "100%", display: "flex", "flex-direction": "column", "min-height": 0 }}>
+      <div style={{ display: "flex", gap: "4px", padding: "3px 6px", background: "var(--surface-1)", "border-bottom": "1px solid var(--border)" }}>
+        <span class="muted" style={{ flex: 1, "font-size": "11px", "align-self": "center" }}>{panel}</span>
+        <button data-testid={`split-row-${panel}`} title="rechts splitten" style={{ padding: "1px 7px" }} onClick={() => splitLeaf(leafId, "row", "floorplan")}>⬌</button>
+        <button data-testid={`split-col-${panel}`} title="unten splitten" style={{ padding: "1px 7px" }} onClick={() => splitLeaf(leafId, "col", "floorplan")}>⬍</button>
+        <button data-testid={`close-${panel}`} title="schliessen" style={{ padding: "1px 7px" }} onClick={() => closeLeaf(leafId)}>✕</button>
+      </div>
+      <div style={{ flex: 1, "min-height": 0, overflow: "auto" }}>{PANELS[panel]()}</div>
+    </div>
   );
 }
 
@@ -123,8 +146,6 @@ export default function App(): JSX.Element {
     connectTransport(`https://${host}:4434`);
   });
 
-  const cols: Record<Pillar, () => JSX.Element> = { dashboard: DashboardCol, control: ControlCol, chat: ChatCol };
-
   return (
     <Show when={authed()} fallback={<Login onOk={() => setAuthed(true)} />}>
       <div data-testid="shell" style={{ height: "100%", display: "flex", "flex-direction": "column" }}>
@@ -132,7 +153,9 @@ export default function App(): JSX.Element {
           when={!isMobile()}
           fallback={
             <>
-              <main style={{ flex: 1, overflow: "auto", padding: "var(--gap)" }}>{cols[tab()]()}</main>
+              <main style={{ flex: 1, overflow: "auto", padding: "var(--gap)" }}>
+                {tab() === "dashboard" ? <DashboardCol /> : tab() === "control" ? <ControlCol /> : <ChatCol />}
+              </main>
               <nav data-testid="bottom-tabbar" style={{ display: "flex", "border-top": "1px solid var(--border)", background: "var(--surface-1)" }}>
                 <For each={PILLARS}>
                   {(p) => (
@@ -146,10 +169,12 @@ export default function App(): JSX.Element {
             </>
           }
         >
-          <main style={{ flex: 1, display: "grid", "grid-template-columns": "1fr 1fr 1fr", gap: "var(--gap)", padding: "var(--gap)", "min-height": 0 }}>
-            <DashboardCol />
-            <ControlCol />
-            <ChatCol />
+          <div data-testid="tiling-toolbar" style={{ display: "flex", gap: "8px", padding: "6px var(--gap)", "border-bottom": "1px solid var(--border)", background: "var(--surface-0)" }}>
+            <span class="muted" style={{ "align-self": "center", "font-size": "12px" }}>Workspace (niri-Stil)</span>
+            <button data-testid="gaia-open-floorplan" onClick={() => openPanel("floorplan")}>Gaia: zeig Floorplan</button>
+          </div>
+          <main data-testid="tiling-root" style={{ flex: 1, "min-height": 0, padding: "var(--gap)" }}>
+            <Tiling node={tilingTree.root} renderPanel={renderPanel} />
           </main>
         </Show>
       </div>
