@@ -58,9 +58,13 @@ func (a *Assembler) CompanyContext() string {
 }
 
 // LoadCompanyContext reads company-context.md from the config directory.
+//
+// Layout: agents live in <configDir>/agents/AGENT-*.toml and company-context.md sits directly in
+// <configDir> (the PARENT of the agents directory). On the VM agentsDir is "config/agents", so the
+// context is "config/company-context.md" — NOT "config/config/company-context.md" (the previous
+// extra "config" join meant the context never loaded; #440 fix surfaced by VM smoke).
 func LoadCompanyContext(agentsDir string) string {
-	configDir := filepath.Join(filepath.Dir(agentsDir), "config")
-	path := filepath.Join(configDir, "company-context.md")
+	path := filepath.Join(filepath.Dir(agentsDir), "company-context.md")
 	data, err := os.ReadFile(path) //nolint:gosec // path is derived from trusted local config layout
 	if err != nil {
 		slog.Info("company-context.md not found, company context disabled", "path", path)

@@ -202,15 +202,14 @@ func TestAssemble_MissingAgent(t *testing.T) {
 	}
 }
 
-func TestLoadCompanyContextReadsSiblingConfigDirectory(t *testing.T) {
+func TestLoadCompanyContextReadsFromConfigDirectory(t *testing.T) {
+	// Mirrors the production layout: <configDir>/agents/AGENT-*.toml + <configDir>/company-context.md
+	// (agentsDir = ".../config/agents"; the context sits in its PARENT, the config dir).
 	baseDir := t.TempDir()
-	agentsDir := filepath.Join(baseDir, "agents")
 	configDir := filepath.Join(baseDir, "config")
+	agentsDir := filepath.Join(configDir, "agents")
 	if err := os.MkdirAll(agentsDir, 0o750); err != nil {
 		t.Fatalf("MkdirAll(agents): %v", err)
-	}
-	if err := os.MkdirAll(configDir, 0o750); err != nil {
-		t.Fatalf("MkdirAll(config): %v", err)
 	}
 
 	agentPath := filepath.Join(agentsDir, "AGENT-01-THOMAS-CEO.toml")
@@ -339,12 +338,10 @@ func TestFormatPerception(t *testing.T) {
 func setupAssemblerWithConfig(t *testing.T, contextContent string) (*Assembler, string) {
 	t.Helper()
 	root := t.TempDir()
-	agentDir := filepath.Join(root, "agents")
+	// Production layout: agents under <configDir>/agents, company-context.md in <configDir>.
 	configDir := filepath.Join(root, "config")
+	agentDir := filepath.Join(configDir, "agents")
 	if err := os.MkdirAll(agentDir, 0750); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(configDir, 0750); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(agentDir, "AGENT-01-THOMAS-CEO.toml"), []byte(testAgentTOML), 0600); err != nil {
