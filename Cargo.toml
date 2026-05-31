@@ -28,6 +28,7 @@ members = [
     "services/sentinel-gaia",
     "services/sentinel-daemon",
     "services/sentinel-projection",
+    "services/sentinel-console",
     "services/agent-runtime",
 ]
 
