@@ -6,6 +6,7 @@
 pub mod agent_live_view;
 pub mod kpi;
 pub mod room_live_view;
+pub mod task_kanban_view;
 
 use sentinel_common::{DomainEvent, DomainEventPayload};
 
