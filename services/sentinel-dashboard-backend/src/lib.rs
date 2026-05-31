@@ -10,3 +10,5 @@
 //! - `wt`         — WebTransport/QUIC endpoint (self-signed TLS, uni-stream push)
 
 #![forbid(unsafe_code)]
+
+pub mod codec;

@@ -22,6 +22,7 @@ sentinel-projection = { path = "../../crates/sentinel-projection" }
 sentinel-limbo = { path = "../../crates/sentinel-limbo" }
 # Workspace-Deps
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
