@@ -365,6 +365,9 @@ pub fn operator_command_system(
     // PUSH-Perception: Sofort Perception fuer Chat-Empfaenger senden
     perception_sender: Option<Res<PerceptionSender>>,
     room_distances: Option<Res<RoomDistanceMap>>,
+    // #438 Task-Entity: spawn neue Tasks (Commands) / mutiere bestehende (Query).
+    mut commands: Commands,
+    mut task_query: Query<(Entity, &mut sentinel_common::components::TaskState)>,
 ) {
     let Some(receiver) = receiver else { return };
     let Ok(rx) = receiver.0.lock() else { return };
@@ -569,11 +572,208 @@ pub fn operator_command_system(
                 tracing::info!(broadcast_type = %cmd.broadcast_type,
                     "Broadcast: Durchsage gesendet + Event emittiert");
             }
+            OperatorCommand::Task(cmd) => {
+                handle_task_command(
+                    &cmd,
+                    time.tick.0,
+                    &mut commands,
+                    &mut task_query,
+                    &mut gaia_buffer,
+                    &mut event_buffer,
+                );
+            }
             OperatorCommand::Nightrun(_)
             | OperatorCommand::Snapshot(_)
             | OperatorCommand::Restore(_) => {
                 // Orchestrator-Commands: werden im Tick-Loop gehandelt, nicht im ECS.
             }
+        }
+    }
+}
+
+/// Verarbeitet ein Task-/Auftrags-Kommando (#438): spawnt/mutiert die `TaskState`-Entity, emittiert
+/// das passende DomainEvent und stellt neue Auftraege via Voice-of-Gaia an den Agent zu (kein
+/// Despawn, kein Reset — unbeteiligte Agents bleiben unberuehrt).
+fn handle_task_command(
+    cmd: &sentinel_common::OperatorTaskCommand,
+    tick: u64,
+    commands: &mut Commands,
+    task_query: &mut Query<(Entity, &mut sentinel_common::components::TaskState)>,
+    gaia_buffer: &mut super::world::GaiaBuffer,
+    event_buffer: &mut EventBuffer,
+) {
+    use sentinel_common::components::TaskState;
+    use sentinel_common::{
+        AgentId, DomainEvent, DomainEventPayload, OperatorTaskAction, TaskId, TaskStatus,
+    };
+
+    let emit = |event_buffer: &mut EventBuffer, payload: DomainEventPayload, task_id: u32| {
+        let event = DomainEvent::new(
+            payload.event_type_str(),
+            &format!("TASK-{task_id}"),
+            &payload.to_json(),
+            &uuid::Uuid::new_v4().to_string(),
+            tick,
+        );
+        event_buffer.events.push(event);
+    };
+
+    match cmd.action {
+        OperatorTaskAction::Create => {
+            let task_id = cmd.task_id.unwrap_or_else(|| {
+                task_query
+                    .iter()
+                    .map(|(_, t)| t.task_id.0)
+                    .max()
+                    .unwrap_or(0)
+                    + 1
+            });
+            let assigned_to = AgentId(cmd.assigned_to.unwrap_or(1));
+            let assigned_by = cmd.assigned_by.map(AgentId);
+            let parent_task = cmd.parent_task.map(TaskId);
+            let title = cmd.title.clone().unwrap_or_default();
+            commands.spawn(TaskState {
+                task_id: TaskId(task_id),
+                title: title.clone(),
+                description: cmd.description.clone().unwrap_or_default(),
+                assigned_to,
+                assigned_by,
+                parent_task,
+                status: TaskStatus::Pending,
+                created_tick: tick,
+                updated_tick: tick,
+                result: None,
+            });
+            // Zustellung via Voice-of-Gaia (#438 AC-3): Agent erhaelt den Auftrag als inner-voice.
+            gaia_buffer.add(
+                assigned_to,
+                format!("Neuer Auftrag (TASK-{task_id}): {title}"),
+                tick,
+            );
+            emit(
+                event_buffer,
+                DomainEventPayload::TaskCreated {
+                    task_id: TaskId(task_id),
+                    title,
+                    assigned_to,
+                    parent_task,
+                },
+                task_id,
+            );
+        }
+        OperatorTaskAction::Assign => {
+            let (Some(tid), Some(new_to)) = (cmd.task_id, cmd.assigned_to) else {
+                tracing::warn!("Task Assign ohne task_id/assigned_to ignoriert");
+                return;
+            };
+            let assigned_by = cmd.assigned_by.map(AgentId);
+            for (_, mut task) in task_query.iter_mut() {
+                if task.task_id.0 == tid {
+                    task.assigned_to = AgentId(new_to);
+                    task.assigned_by = assigned_by;
+                    task.updated_tick = tick;
+                    gaia_buffer.add(
+                        AgentId(new_to),
+                        format!("Dir wurde TASK-{tid} zugewiesen: {}", task.title),
+                        tick,
+                    );
+                    emit(
+                        event_buffer,
+                        DomainEventPayload::TaskAssigned {
+                            task_id: TaskId(tid),
+                            assigned_to: AgentId(new_to),
+                            assigned_by,
+                        },
+                        tid,
+                    );
+                    break;
+                }
+            }
+        }
+        OperatorTaskAction::UpdateStatus => {
+            let Some(tid) = cmd.task_id else {
+                tracing::warn!("Task UpdateStatus ohne task_id ignoriert");
+                return;
+            };
+            let Some(new_status) = cmd.status else {
+                tracing::warn!("Task UpdateStatus ohne status ignoriert");
+                return;
+            };
+            for (_, mut task) in task_query.iter_mut() {
+                if task.task_id.0 == tid {
+                    let old = task.status.as_str().to_string();
+                    task.status = new_status;
+                    task.updated_tick = tick;
+                    emit(
+                        event_buffer,
+                        DomainEventPayload::TaskStatusChanged {
+                            task_id: TaskId(tid),
+                            old_status: old,
+                            new_status: new_status.as_str().to_string(),
+                        },
+                        tid,
+                    );
+                    break;
+                }
+            }
+        }
+        OperatorTaskAction::Complete => {
+            let Some(tid) = cmd.task_id else {
+                tracing::warn!("Task Complete ohne task_id ignoriert");
+                return;
+            };
+            for (_, mut task) in task_query.iter_mut() {
+                if task.task_id.0 == tid {
+                    task.status = TaskStatus::Done;
+                    task.result = cmd.result.clone();
+                    task.updated_tick = tick;
+                    emit(
+                        event_buffer,
+                        DomainEventPayload::TaskCompleted {
+                            task_id: TaskId(tid),
+                            result: cmd.result.clone(),
+                        },
+                        tid,
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// #438: Leitet Task-Fortschritt aus Agent-Aktionen ab. Ein Agent, der diesen Tick aktiv war
+/// (`ActiveAgentsThisTick`), bringt seine `Pending`-Tasks auf `InProgress` (+ `TaskStatusChanged`-
+/// Event). Explizite Completion laeuft ueber `OperatorTaskCommand::Complete`. Beruehrt KEINE
+/// Agent-Components (nur Task-Entities) — emergente Agent-Autonomie bleibt unangetastet (§6 L5).
+pub fn task_progress_system(
+    active_agents: Res<super::world::ActiveAgentsThisTick>,
+    mut task_query: Query<&mut sentinel_common::components::TaskState>,
+    time: Res<SimulationTime>,
+    mut event_buffer: ResMut<EventBuffer>,
+) {
+    if active_agents.0.is_empty() {
+        return;
+    }
+    for mut task in task_query.iter_mut() {
+        if task.status == sentinel_common::TaskStatus::Pending
+            && active_agents.0.contains(&task.assigned_to)
+        {
+            task.status = sentinel_common::TaskStatus::InProgress;
+            task.updated_tick = time.tick.0;
+            let payload = DomainEventPayload::TaskStatusChanged {
+                task_id: task.task_id,
+                old_status: sentinel_common::TaskStatus::Pending.as_str().to_string(),
+                new_status: sentinel_common::TaskStatus::InProgress.as_str().to_string(),
+            };
+            let event = DomainEvent::new(
+                payload.event_type_str(),
+                &format!("TASK-{}", task.task_id.0),
+                &payload.to_json(),
+                &uuid::Uuid::new_v4().to_string(),
+                time.tick.0,
+            );
+            event_buffer.events.push(event);
         }
     }
 }

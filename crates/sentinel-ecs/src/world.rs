@@ -1230,6 +1230,8 @@ pub fn create_simulation_world() -> (World, Schedule) {
             .in_set(SimulationPhase::Decision)
             .after(super::decision::decision_system),
     );
+    // #438: Task-Fortschritt aus Agent-Aktionen ableiten (Pending -> InProgress).
+    schedule.add_systems(super::systems::task_progress_system.in_set(SimulationPhase::Decision));
     schedule.add_systems(output_system.in_set(SimulationPhase::Output));
     schedule.add_systems(persist_system.in_set(SimulationPhase::Persist));
 
@@ -1483,6 +1485,13 @@ pub fn snapshot_ecs_state(world: &mut World) -> sentinel_common::EcsSnapshot {
         llm_configs_vec.push((id, llm.clone()));
     }
 
+    // Task-Entities (#438): eigene Entities ohne AgentIdentity, separat erfassen.
+    let mut task_states = Vec::new();
+    let mut task_query = world.query::<&sentinel_common::components::TaskState>();
+    for task in task_query.iter(world) {
+        task_states.push(task.clone());
+    }
+
     let sim_time = world.get_resource::<SimulationTime>();
 
     sentinel_common::EcsSnapshot {
@@ -1498,6 +1507,7 @@ pub fn snapshot_ecs_state(world: &mut World) -> sentinel_common::EcsSnapshot {
         shift_infos,
         relationships: relationships_vec,
         llm_configs: llm_configs_vec,
+        task_states,
         sim_tick: sim_time.map(|t| t.tick.0).unwrap_or(0),
         sim_hour: sim_time.map(|t| t.sim_hour).unwrap_or(0.0),
         sim_delta_seconds: sim_time.map(|t| t.delta_seconds).unwrap_or(1.0),
@@ -1525,6 +1535,21 @@ pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnaps
     }
     for entity in existing {
         world.despawn(entity);
+    }
+
+    // 1b. Task-Entities (#438): eigene Entities ohne AgentIdentity — separat despawnen + respawnen.
+    let mut existing_tasks: Vec<Entity> = Vec::new();
+    {
+        let mut task_query = world.query::<(Entity, &sentinel_common::components::TaskState)>();
+        for (entity, _) in task_query.iter(world) {
+            existing_tasks.push(entity);
+        }
+    }
+    for entity in existing_tasks {
+        world.despawn(entity);
+    }
+    for task in &snapshot.task_states {
+        world.spawn(task.clone());
     }
 
     // 2. Agents aus Snapshot respawnen (mit allen Components)

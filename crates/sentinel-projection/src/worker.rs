@@ -18,6 +18,7 @@ use crate::config::ProjectionConfig;
 use crate::handlers::agent_live_view::AgentLiveViewHandler;
 use crate::handlers::kpi::KpiHandler;
 use crate::handlers::room_live_view::RoomLiveViewHandler;
+use crate::handlers::task_kanban_view::TaskKanbanHandler;
 use crate::handlers::ProjectionHandler;
 use crate::store::ReadModelStore;
 
@@ -74,6 +75,7 @@ impl ProjectionWorker {
             Box::new(AgentLiveViewHandler),
             Box::new(RoomLiveViewHandler),
             Box::new(KpiHandler),
+            Box::new(TaskKanbanHandler),
         ];
 
         Ok(Self {
