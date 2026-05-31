@@ -30,6 +30,8 @@ const [state, setState] = createStore<ConsoleState>({
 
 const [status, setStatus] = createSignal<ConnectionStatus>("disconnected");
 const [frameCount, setFrameCount] = createSignal(0);
+// Geteilter Agent-Filter (Control-Center setzt ihn, Dashboard-Liste filtert reaktiv darauf).
+const [agentFilter, setAgentFilter] = createSignal("");
 
 /** Verarbeitet einen gepushten topic-Frame in den reaktiven Store. */
 export function ingestFrame(topic: string, value: unknown) {
@@ -58,4 +60,4 @@ export function connectTransport(url: string): TransportClient {
 }
 
 export const consoleStore = state;
-export { status, frameCount, setStatus };
+export { status, frameCount, setStatus, agentFilter, setAgentFilter };
