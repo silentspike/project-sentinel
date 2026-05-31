@@ -1,5 +1,6 @@
 import { createSignal, For, Show, type JSX } from "solid-js";
 import type { ConnectionStatus } from "../transport/client";
+import { theme, toggleTheme } from "../theme";
 
 // Wiederverwendbare Controls (#419) — portiert nach noaide `components/togaf/controls/`.
 // Funktionales Design; CSS-Vars-Theming.
@@ -55,14 +56,13 @@ export function LiveIndicator(props: { status: ConnectionStatus; label?: boolean
   );
 }
 
-export function ThemeToggle(props: { onToggle?: (dark: boolean) => void }) {
-  const [dark, setDark] = createSignal(true);
+export function ThemeToggle(props: { onToggle?: (t: "dark" | "light") => void }) {
   return (
     <button
       data-testid="ctl-themetoggle"
-      onClick={() => { const d = !dark(); setDark(d); props.onToggle?.(d); }}
+      onClick={() => props.onToggle?.(toggleTheme())}
     >
-      {dark() ? "🌙 Dark" : "☀ Light"}
+      {theme() === "dark" ? "🌙 Dark" : "☀ Light"}
     </button>
   );
 }
