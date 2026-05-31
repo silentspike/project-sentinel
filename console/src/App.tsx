@@ -1,6 +1,6 @@
 import { createSignal, createMemo, createEffect, onMount, For, Show, type JSX } from "solid-js";
 import "./styles/tokens.css";
-import { consoleStore, status, frameCount, connectTransport, ingestFrame, type AgentRow } from "./stores/console";
+import { consoleStore, status, frameCount, agentFilter, setAgentFilter, connectTransport, ingestFrame, type AgentRow } from "./stores/console";
 import { authStatus, login as doLogin } from "./auth";
 import {
   ProgressBar, SearchFilter, StatusDropdown, LiveIndicator, ThemeToggle,
@@ -54,6 +54,10 @@ function DashboardCol(): JSX.Element {
         { agent_id: 5, name: "Andreas Wolff", role: "Lead", current_room: "buero-dev-1", energy: 0.6, stress: 0.4, mood: "konzentriert" },
       ] satisfies AgentRow[],
     });
+  const filteredAgents = createMemo(() => {
+    const q = agentFilter().toLowerCase().trim();
+    return q ? consoleStore.agents.filter((a) => a.name.toLowerCase().includes(q)) : consoleStore.agents;
+  });
   return (
     <section class="col" data-testid="col-dashboard">
       <div class="col__head">Dashboard <LiveIndicator status={status()} /></div>
@@ -61,10 +65,10 @@ function DashboardCol(): JSX.Element {
         <p class="muted">Frames empfangen: <span data-testid="frame-count" class="pill">{frameCount()}</span> · letztes Topic: <span data-testid="last-topic" class="pill">{consoleStore.lastTopic ?? "—"}</span></p>
         <ProgressBar label="Schicht-Auslastung" done={Math.min(consoleStore.agents.length, 26)} total={26} />
         <button data-testid="simulate-push" onClick={simulatePush}>Push simulieren</button>
-        <h3 style={{ "margin-bottom": "4px" }}>Agents (reaktiv)</h3>
+        <h3 style={{ "margin-bottom": "4px" }}>Agents (reaktiv)<Show when={agentFilter()}> · Filter „{agentFilter()}"</Show></h3>
         <div data-testid="agent-list">
-          <Show when={consoleStore.agents.length > 0} fallback={<p class="muted">noch keine Agents (Push simulieren / Backend verbinden)</p>}>
-            <For each={consoleStore.agents}>
+          <Show when={filteredAgents().length > 0} fallback={<p class="muted">keine Agents (Filter/Push/Backend pruefen)</p>}>
+            <For each={filteredAgents()}>
               {(a) => (
                 <div data-testid="agent-row" style={{ display: "flex", "justify-content": "space-between", padding: "4px 0", "border-bottom": "1px solid var(--border)" }}>
                   <span>{a.name} <span class="muted">· {a.role}</span></span>
@@ -84,13 +88,12 @@ function DashboardCol(): JSX.Element {
 
 function ControlCol(): JSX.Element {
   const [st, setSt] = createSignal<Status>("pending");
-  const [filter, setFilter] = createSignal("");
   return (
     <section class="col" data-testid="col-control">
       <div class="col__head">Control-Center</div>
       <div class="col__body" style={{ display: "grid", gap: "10px" }}>
-        <SearchFilter placeholder="Agents filtern…" onFilter={setFilter} />
-        <p class="muted" style={{ "font-size": "12px" }}>Filter: <span data-testid="filter-value">{filter() || "—"}</span></p>
+        <SearchFilter placeholder="Agents filtern…" onFilter={setAgentFilter} />
+        <p class="muted" style={{ "font-size": "12px" }}>Filter: <span data-testid="filter-value">{agentFilter() || "—"}</span> (filtert die Dashboard-Liste)</p>
         <div style={{ display: "flex", gap: "8px", "align-items": "center" }}>
           <span>Status:</span><StatusDropdown value={st()} onChange={setSt} />
         </div>
