@@ -936,7 +936,8 @@ fn render_company_context(spec: &GaiaSpec) -> String {
     );
 
     out.push_str("## Unternehmen\n");
-    out.push_str(&format!("- **Sitz:** {}, {}\n", spec.address, spec.city));
+    out.push_str(&format!("- **Standort:** {}\n", spec.city));
+    out.push_str(&format!("- **Adresse:** {}\n", spec.address));
     out.push_str(&format!("- **Typ:** {}\n", company_type_label(&spec.company_type)));
     out.push_str(&format!("- **Mitarbeiter:** {}\n", spec.agent_count));
     out.push_str(&format!(
