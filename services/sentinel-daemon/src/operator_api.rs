@@ -47,6 +47,7 @@ const OPERATOR_NIGHTRUN_PATH: &str = "/operator/nightrun";
 const OPERATOR_SNAPSHOTS_PATH: &str = "/operator/snapshots";
 const OPERATOR_SNAPSHOT_PATH: &str = "/operator/snapshot";
 const OPERATOR_RESTORE_PATH: &str = "/operator/restore";
+const OPERATOR_CONFIG_APPLY_PATH: &str = "/operator/config/apply";
 const OPERATOR_PRUNE_PATH: &str = "/operator/prune";
 const OPERATOR_CHAT_PATH: &str = "/operator/chat";
 const OPERATOR_GAIA_PATH: &str = "/operator/gaia";
@@ -74,6 +75,9 @@ const OPERATOR_SECURITY_LANDLOCK_TEST_PATH: &str = "/operator/security/landlock-
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024;
 const MAX_APICP_SNAPSHOT_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Config-Apply (#425) traegt eine ganze Firma inline (agents[] + building) — eine 60er-Firma
+/// ist ~64 KB, Gaia-Firmen koennen deutlich groesser sein. Grosszuegiges Limit (4 MB).
+const MAX_CONFIG_APPLY_BODY_BYTES: usize = 4 * 1024 * 1024;
 const OPERATOR_KEY_HEADER: &str = "x-sentinel-operator-key";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -389,6 +393,9 @@ struct AppState {
     nightrun_agent_counts: NightrunAgentCounts,
     snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
+    config_apply_tx: mpsc::Sender<sentinel_common::OperatorConfigApplyCommand>,
+    config_apply_max_agents: usize,
+    config_apply_validation: sentinel_common::agent_config::AgentConfigValidation,
     event_store: Arc<sentinel_limbo::EventStore>,
     prune_tx: mpsc::Sender<i64>,
     state_store: Arc<StateStore>,
@@ -486,6 +493,9 @@ pub async fn start_server(
     nightrun_agent_counts: NightrunAgentCounts,
     snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
+    config_apply_tx: mpsc::Sender<sentinel_common::OperatorConfigApplyCommand>,
+    config_apply_max_agents: usize,
+    config_apply_validation: sentinel_common::agent_config::AgentConfigValidation,
     event_store: Arc<sentinel_limbo::EventStore>,
     prune_tx: mpsc::Sender<i64>,
     state_store: Arc<sentinel_redb::StateStore>,
@@ -510,6 +520,9 @@ pub async fn start_server(
         nightrun_agent_counts,
         snapshot_tx,
         restore_tx,
+        config_apply_tx,
+        config_apply_max_agents,
+        config_apply_validation,
         event_store,
         prune_tx,
         state_store,
@@ -702,6 +715,55 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 ),
                 Err(_) => {
                     ApiError::ServiceUnavailable("Restore-Channel nicht verfuegbar").to_response()
+                }
+            }
+        }
+        OPERATOR_CONFIG_APPLY_PATH => {
+            let payload: sentinel_common::OperatorConfigApplyCommand =
+                match serde_json::from_slice(&request.body) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return ApiError::BadRequest(
+                            "Request-JSON ungueltig (erwartet {mode, agents[], building})",
+                        )
+                        .to_response();
+                    }
+                };
+            // Validierung VOR dem Send — invalid => 4xx, KEIN Apply (#425 AC-3).
+            if let Err(errors) = crate::config_apply::validate_config_apply(
+                &payload,
+                state.config_apply_max_agents,
+                state.config_apply_validation,
+            ) {
+                warn!(
+                    error_count = errors.len(),
+                    "Config-Apply abgelehnt (Validierung)"
+                );
+                return json_response(
+                    400,
+                    serde_json::json!({
+                        "accepted": false,
+                        "errors": errors,
+                    }),
+                );
+            }
+            info!(
+                mode = ?payload.mode,
+                agents = payload.agents.len(),
+                rooms = payload.building.rooms.len(),
+                "Config-Apply via Operator-API angefordert"
+            );
+            match state.config_apply_tx.send(payload) {
+                Ok(()) => json_response(
+                    202,
+                    serde_json::json!({
+                        "accepted": true,
+                        "message": "Config-Apply gestartet (tick-synchron)"
+                    }),
+                ),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Config-Apply-Channel nicht verfuegbar")
+                        .to_response()
                 }
             }
         }
@@ -2622,6 +2684,7 @@ async fn read_http_request(stream: &mut TcpStream) -> std::result::Result<HttpRe
 fn max_body_bytes_for_path(path: &str) -> usize {
     match request_path(path) {
         OPERATOR_APICP_SNAPSHOT_PATH => MAX_APICP_SNAPSHOT_BODY_BYTES,
+        OPERATOR_CONFIG_APPLY_PATH => MAX_CONFIG_APPLY_BODY_BYTES,
         _ => MAX_BODY_BYTES,
     }
 }
@@ -2716,6 +2779,10 @@ mod tests {
             nightrun_agent_counts: NightrunAgentCounts::from_shift_sets([1, 1, 2, 3]),
             snapshot_tx: mpsc::channel().0,
             restore_tx: mpsc::channel().0,
+            config_apply_tx: mpsc::channel().0,
+            config_apply_max_agents: 60,
+            config_apply_validation:
+                sentinel_common::agent_config::AgentConfigValidation::with_max_agent_id(60),
             event_store: Arc::new(
                 sentinel_limbo::EventStore::open(":memory:")
                     .expect("in-memory EventStore fuer Tests"),
@@ -2951,6 +3018,133 @@ mod tests {
             }
             other => panic!("unerwartetes Kommando: {other:?}"),
         }
+    }
+
+    fn config_apply_agent(id: u16, openness: f32) -> sentinel_common::agent_config::AgentConfig {
+        use sentinel_common::agent_config::*;
+        AgentConfig {
+            identity: IdentityConfig {
+                id,
+                name: format!("Agent{id}"),
+                role: "Dev".to_string(),
+                department: "Dev".to_string(),
+                shift_set: 1,
+                kpis: vec![],
+                reports_to: None,
+                direct_reports: vec![],
+            },
+            personality: PersonalityConfig {
+                openness,
+                conscientiousness: 0.5,
+                extraversion: 0.5,
+                agreeableness: 0.5,
+                neuroticism: 0.5,
+                caffeine_tolerance: 0.5,
+                morning_person: true,
+            },
+            preferences: PreferencesConfig {
+                favorite_room: "empfang".to_string(),
+                coffee_preference: "espresso".to_string(),
+                lunch_time: "12:30".to_string(),
+            },
+            background: BackgroundConfig {
+                bio: "bio".to_string(),
+                quirks: vec![],
+            },
+            runtime: RuntimeSelectionConfig::default(),
+            capabilities: CapabilitiesConfig::default(),
+        }
+    }
+
+    fn config_apply_building() -> sentinel_common::room::BuildingConfig {
+        use sentinel_common::room::*;
+        BuildingConfig {
+            building: BuildingMeta {
+                name: "Test".to_string(),
+                address: "Teststr. 1".to_string(),
+                floors: 1,
+            },
+            rooms: vec![RoomConfig {
+                id: "empfang".to_string(),
+                name: "Empfang".to_string(),
+                floor: 0,
+                capacity: 10,
+                room_type: RoomType::Common,
+                adjacent: vec![],
+                department: None,
+                has_coffee_machine: false,
+                has_printer: false,
+            }],
+        }
+    }
+
+    fn config_apply_cmd(
+        agents: Vec<sentinel_common::agent_config::AgentConfig>,
+    ) -> serde_json::Value {
+        let cmd = sentinel_common::OperatorConfigApplyCommand {
+            mode: sentinel_common::ApplyMode::Live,
+            agents,
+            building: config_apply_building(),
+        };
+        serde_json::to_value(&cmd).unwrap()
+    }
+
+    #[test]
+    fn config_apply_valid_request_is_accepted_and_forwarded() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let (tx, apply_rx) = mpsc::channel();
+        state.config_apply_tx = tx;
+
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_CONFIG_APPLY_PATH,
+                config_apply_cmd(vec![config_apply_agent(1, 0.5), config_apply_agent(2, 0.6)]),
+            ),
+            &state,
+        );
+        assert_eq!(response.status, 202);
+
+        let received = apply_rx.recv().unwrap();
+        assert_eq!(received.agents.len(), 2);
+        assert_eq!(received.mode, sentinel_common::ApplyMode::Live);
+    }
+
+    #[test]
+    fn config_apply_invalid_personality_rejected_without_send() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let (tx, apply_rx) = mpsc::channel();
+        state.config_apply_tx = tx;
+
+        // openness 1.5 > 1.0 -> Validierung schlaegt fehl
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_CONFIG_APPLY_PATH,
+                config_apply_cmd(vec![config_apply_agent(1, 1.5)]),
+            ),
+            &state,
+        );
+        assert_eq!(response.status, 400);
+        let parsed: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(parsed["accepted"], serde_json::json!(false));
+        assert!(parsed["errors"].as_array().unwrap().iter().any(|e| e
+            .as_str()
+            .unwrap()
+            .contains("personality invalid")));
+        // KEIN Command gesendet
+        assert!(apply_rx.try_recv().is_err(), "invalid config must not be sent");
+    }
+
+    #[test]
+    fn config_apply_requires_auth() {
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_CONFIG_APPLY_PATH,
+                config_apply_cmd(vec![config_apply_agent(1, 0.5)]),
+            ),
+            &state,
+        );
+        assert_eq!(response.status, 401);
     }
 
     #[test]
@@ -3766,6 +3960,17 @@ mod tests {
             MAX_APICP_SNAPSHOT_BODY_BYTES
         );
         assert_eq!(max_body_bytes_for_path(OPERATOR_CHAT_PATH), MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn config_apply_path_has_larger_body_limit() {
+        // #425: eine ganze Firma (60+ Agents inline) muss durch das Body-Limit passen.
+        assert_eq!(
+            max_body_bytes_for_path(OPERATOR_CONFIG_APPLY_PATH),
+            MAX_CONFIG_APPLY_BODY_BYTES
+        );
+        // Eine 60-Agent-Firma ist ~64 KB -> das Limit muss komfortabel darueber liegen.
+        assert_ne!(max_body_bytes_for_path(OPERATOR_CONFIG_APPLY_PATH), MAX_BODY_BYTES);
     }
 
     #[tokio::test]

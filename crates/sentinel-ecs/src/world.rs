@@ -1388,6 +1388,28 @@ pub fn apply_capabilities(
     }
 }
 
+/// Aktualisiert Name + Rolle eines laufenden Agents aus der IdentityConfig (#425 Live-Apply).
+///
+/// Aendert NUR die ECS AgentIdentity-Component (Bio/Position/Memory/Evolution bleiben).
+/// `department` ist nicht Teil der ECS-Identity (nur TOML/Gateway-DNA), wird daher hier nicht gesetzt.
+pub fn apply_identity(
+    world: &mut World,
+    entity: Entity,
+    cfg: &sentinel_common::agent_config::IdentityConfig,
+) {
+    if let Some(mut id) = world.get_mut::<AgentIdentity>(entity) {
+        id.name = cfg.name.clone();
+        id.role = cfg.role.clone();
+    }
+}
+
+/// Baut die Raum-Resources (RoomInfoMap + RoomDistanceMap) aus einer neuen BuildingConfig neu auf (#425).
+/// Fuer Live-Apply geaenderter Raeume + Fresh-Load.
+pub fn rebuild_room_maps(world: &mut World, building: &sentinel_common::room::BuildingConfig) {
+    world.insert_resource(RoomInfoMap::from_building_config(building));
+    world.insert_resource(RoomDistanceMap::from_building_config(building));
+}
+
 /// Entfernt einen Agenten aus der ECS World anhand seiner AgentId.
 /// Gibt `true` zurueck wenn der Agent gefunden und despawned wurde.
 pub fn despawn_agent_from_world(world: &mut World, agent_id: AgentId) -> bool {
@@ -1696,6 +1718,47 @@ mod room_physics_workspace_tests {
 
         assert_eq!(workspace.len(), 1);
         assert_eq!(workspace.room_stats(0), ("empfang", 2, true));
+    }
+}
+
+#[cfg(test)]
+mod config_apply_helper_tests {
+    use super::*;
+
+    #[test]
+    fn apply_identity_updates_only_name_and_role_keeps_other_components() {
+        let (mut world, _) = create_simulation_world();
+        let entity = spawn_agent(&mut world, AgentId(1), "Alt Name", "Alte Rolle", 1, "empfang");
+
+        let pcfg = sentinel_common::agent_config::PersonalityConfig {
+            openness: 0.42,
+            conscientiousness: 0.5,
+            extraversion: 0.5,
+            agreeableness: 0.5,
+            neuroticism: 0.5,
+            caffeine_tolerance: 0.5,
+            morning_person: true,
+        };
+        apply_personality(&mut world, entity, &pcfg);
+
+        let idcfg = sentinel_common::agent_config::IdentityConfig {
+            id: 1,
+            name: "Neuer Name".to_string(),
+            role: "Neue Rolle".to_string(),
+            department: "Dev".to_string(),
+            shift_set: 1,
+            kpis: vec![],
+            reports_to: None,
+            direct_reports: vec![],
+        };
+        apply_identity(&mut world, entity, &idcfg);
+
+        let id = world.get::<AgentIdentity>(entity).unwrap();
+        assert_eq!(id.name, "Neuer Name");
+        assert_eq!(id.role, "Neue Rolle");
+        // Live-Update beruehrt NUR Identity — Personality bleibt unveraendert (#425 AC-1).
+        let p = world.get::<Personality>(entity).unwrap();
+        assert_eq!(p.openness, 0.42);
     }
 }
 
