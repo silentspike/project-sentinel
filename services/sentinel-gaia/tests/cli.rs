@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use sentinel_gaia::{CompanyType, GaiaSpec, ShiftModel};
+use sentinel_gaia::{CompanyType, CultureSpec, GaiaSpec, ShiftModel};
 
 fn gaia_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_sentinel-gaia"))
@@ -20,6 +20,7 @@ fn write_spec(root: &Path, agent_count: u16) -> PathBuf {
         shift_model: ShiftModel::Hybrid,
         time_scale: 1.0,
         departments: Vec::new(),
+        culture: CultureSpec::default(),
     };
     let path = root.join("spec.toml");
     fs::write(&path, toml::to_string_pretty(&spec).unwrap()).unwrap();
