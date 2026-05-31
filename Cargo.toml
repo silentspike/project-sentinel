@@ -23,10 +23,12 @@ members = [
     "crates/sentinel-hippocampus",
     "crates/sentinel-projection",
     "crates/sentinel-fs",
+    "crates/sentinel-console-plane",
     "services/sentinel-nightrun",
     "services/sentinel-gaia",
     "services/sentinel-daemon",
     "services/sentinel-projection",
+    "services/sentinel-console",
     "services/agent-runtime",
     "services/sentinel-ctl",
 ]
