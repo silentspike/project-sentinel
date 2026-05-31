@@ -7,7 +7,7 @@ use std::{env, fs};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use sentinel_gaia::{
-    generate, read_spec, validate_output_dir, CompanyType, DepartmentSpec, GaiaSpec,
+    generate, read_spec, validate_output_dir, CompanyType, CultureSpec, DepartmentSpec, GaiaSpec,
     GeneratedCompany, ShiftModel, GAIA_SPEC_FILENAME,
 };
 use serde::Serialize;
@@ -242,6 +242,7 @@ fn prompt_spec() -> Result<GaiaSpec> {
         shift_model,
         time_scale: 1.0,
         departments,
+        culture: CultureSpec::default(),
     })
 }
 

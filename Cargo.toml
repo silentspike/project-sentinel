@@ -30,6 +30,7 @@ members = [
     "services/sentinel-projection",
     "services/sentinel-console",
     "services/agent-runtime",
+    "services/sentinel-ctl",
 ]
 
 [workspace.dependencies]
