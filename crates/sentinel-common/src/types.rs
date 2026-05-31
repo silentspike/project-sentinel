@@ -75,6 +75,38 @@ impl fmt::Display for AgentId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RoomId(pub u16);
 
+/// Identitaet eines Tasks/Auftrags (#438). Eigener Schluesselraum (u32, NICHT AgentId).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TaskId(pub u32);
+
+impl fmt::Display for TaskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TASK-{}", self.0)
+    }
+}
+
+/// Lebenszyklus-Status eines Tasks (#438).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Done,
+    Blocked,
+}
+
+impl TaskStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
 impl RoomId {
     pub fn new(id: u16) -> Result<Self, ValidationError> {
         if id > 0 {
