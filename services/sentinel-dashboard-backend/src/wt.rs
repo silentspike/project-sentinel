@@ -1,9 +1,10 @@
 //! WebTransport/QUIC-Endpoint (#431) — server→client unidirektionale Streams, topic+msgpack+zstd-Frames.
 //!
 //! Muster aus `sentinel-console/src/lib.rs:113-140` (wtransport 0.6). TLS = geteiltes self-signed Cert
-//! (siehe `tls`). Beim Session-Handshake wird das `sentinel_session`-Cookie validiert (AC-3): ohne
-//! gueltige Session wird die Session NICHT akzeptiert (Drop = Reject). #431-Scope: ein `hello`-Frame
-//! als End-to-End-Codec-Beweis (voller Delta-Push = #432).
+//! (siehe `tls`). Beim Session-Handshake wird ein kurzlebiges Einmal-Ticket (`?t=`) validiert (AC-3):
+//! ohne gueltiges Ticket wird die Session NICHT akzeptiert (Drop = Reject). Ablauf pro Session:
+//! `hello`-Frame -> `agent_live`-Connect-Snapshot -> kontinuierlicher Delta-Push aus dem
+//! Broadcast-Kanal (#432, gespeist vom NATS-Event-Subscriber `event_sub`).
 
 use std::path::PathBuf;
 
@@ -84,10 +85,31 @@ async fn handle_session(incoming: IncomingSession, st: AppState) -> anyhow::Resu
         Err(e) => tracing::warn!(error = %e, "wt agent_live snapshot skipped (projection read failed)"),
     }
 
-    // Verbindung offen halten (Push-Server): nach dem Connect-Snapshot bleibt die Session idle bestehen,
-    // damit der Client „connected" anzeigt. Der kontinuierliche Delta-Push (neue Frames bei Events) ist #432.
-    let reason = connection.closed().await;
-    tracing::debug!(?reason, "wt session closed by peer");
+    // Kontinuierlicher Delta-Push (#432): nach dem Connect-Snapshot abonniert die Session den
+    // Broadcast-Kanal. Jeder vom Event-Subscriber gepushte topic-Frame wird als eigener uni-Stream
+    // an den Client geschrieben. `Lagged` (langsamer Client) wird uebersprungen — der naechste
+    // Voll-Snapshot ist ohnehin autoritativ (client-reconcile).
+    use tokio::sync::broadcast::error::RecvError;
+    let mut rx = st.broadcast_tx.subscribe();
+    loop {
+        tokio::select! {
+            frame = rx.recv() => match frame {
+                Ok(bytes) => {
+                    let mut stream = connection.open_uni().await?.await?;
+                    stream.write_all(&bytes).await?;
+                    stream.finish().await?;
+                }
+                Err(RecvError::Lagged(n)) => {
+                    tracing::debug!(skipped = n, "wt delta receiver lagged, next snapshot is authoritative");
+                }
+                Err(RecvError::Closed) => break,
+            },
+            reason = connection.closed() => {
+                tracing::debug!(?reason, "wt session closed by peer");
+                break;
+            }
+        }
+    }
     Ok(())
 }
 
