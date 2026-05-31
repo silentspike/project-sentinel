@@ -30,7 +30,13 @@ pub const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 #[derive(Clone, Default)]
 pub struct SessionStore {
     inner: Arc<Mutex<HashMap<String, u64>>>,
+    /// Kurzlebige Einmal-Tickets fuer den WebTransport-Handshake (Browser senden bei WT KEINE Cookies,
+    /// daher kann der WT-Pfad nicht das Session-Cookie nutzen). token -> expiry (epoch ms).
+    tickets: Arc<Mutex<HashMap<String, u64>>>,
 }
+
+/// Gueltigkeit eines WT-Tickets (kurz: nur fuer den unmittelbaren Connect).
+pub const WT_TICKET_TTL_SECS: u64 = 30;
 
 impl SessionStore {
     pub fn new() -> Self {
@@ -42,6 +48,24 @@ impl SessionStore {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64
+    }
+
+    /// Mintet ein kurzlebiges Einmal-WT-Ticket (nur fuer einen authentifizierten Caller via require_auth).
+    pub fn issue_ticket(&self) -> String {
+        let t = uuid::Uuid::new_v4().to_string();
+        let mut m = self.tickets.lock().expect("ticket lock");
+        m.insert(t.clone(), Self::now_ms() + WT_TICKET_TTL_SECS * 1000);
+        t
+    }
+
+    /// Validiert + verbraucht (single-use) ein WT-Ticket am Handshake.
+    pub fn consume_ticket(&self, ticket: Option<&str>) -> bool {
+        let Some(ticket) = ticket else { return false };
+        let mut m = self.tickets.lock().expect("ticket lock");
+        match m.remove(ticket) {
+            Some(expiry) => Self::now_ms() < expiry,
+            None => false,
+        }
     }
 
     /// Mintet ein neues opakes Token (12h gueltig).
@@ -142,6 +166,12 @@ pub async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Response 
 pub async fn status(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let ok = st.sessions.validate(cookie_value(&headers, SESSION_COOKIE).as_deref());
     Json(json!({ "authenticated": ok })).into_response()
+}
+
+/// GET /api/wt-ticket — mintet ein kurzlebiges Einmal-Ticket fuer den WebTransport-Connect.
+/// Hinter `require_auth` (gueltige Session noetig). Der Client haengt es als `?t=<ticket>` an die WT-URL.
+pub async fn wt_ticket(State(st): State<AppState>) -> Response {
+    Json(json!({ "ticket": st.sessions.issue_ticket() })).into_response()
 }
 
 /// Middleware: blockt unauthentifizierte Requests (kein/ungueltiges Session-Cookie) mit 401.
