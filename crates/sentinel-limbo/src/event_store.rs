@@ -225,6 +225,27 @@ impl EventStore {
         })
     }
 
+    /// Oeffnet den Event Store **read-only** — fuer reine Consumer (z.B. `sentinel-console`),
+    /// die unter `systemd ReadOnlyPaths=` auf einem read-only gemounteten Datenverzeichnis laufen.
+    /// Kein Schema-DDL, kein WAL-Mode-Write — `open()` wuerde sonst mit
+    /// "attempt to write a readonly database" scheitern. Liest die Live-WAL-DB read-only
+    /// (SQLite read-only shm-Fallback); sieht neu committete Events des Writers.
+    #[instrument(level = "debug", fields(path = %path))]
+    pub fn open_readonly(path: &str) -> anyhow::Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        // Nur verbindungslokale, lesende Pragmas (kein DB-Write, kein Schema, kein WAL-Wechsel).
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        conn.execute_batch("PRAGMA query_only = ON;")?;
+        info!("EventStore opened READ-ONLY at {path}");
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path: PathBuf::from(path),
+        })
+    }
+
     /// Append-only: Fuegt ein Event ein. Gibt die interne Row-ID zurueck.
     pub fn append_event(&self, event: &DomainEvent) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
