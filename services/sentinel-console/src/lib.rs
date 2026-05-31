@@ -65,7 +65,9 @@ where
 /// Background ingest from the Limbo event store (sync API → runs on a dedicated thread).
 /// Each new event's JSON is content-addressed into the data-plane (dedup of recurring blocks).
 pub fn run_ingest(plane: SharedPlane, events_db: String, poll: Duration) {
-    let store = match sentinel_limbo::EventStore::open(&events_db) {
+    // Read-only: die Console ist ein reiner Consumer und laeuft unter `ReadOnlyPaths=`
+    // (systemd-Hardening) — ein read-write Open wuerde mit "readonly database" scheitern.
+    let store = match sentinel_limbo::EventStore::open_readonly(&events_db) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, db = %events_db, "console ingest: open event store failed");
