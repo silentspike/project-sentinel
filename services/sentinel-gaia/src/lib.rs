@@ -47,6 +47,53 @@ fn default_department_weight() -> u16 {
     1
 }
 
+/// Strukturierte Kultur-/Sozial-Dimension der Firma (#441). Steuert deterministisch (blake3,
+/// kein LLM) die Big-Five-Verteilung der generierten Agents und fliesst in die `company-context.md`.
+/// Alle Achsen in [0.0, 1.0]; 0.5 = neutral. `mission`/`values` sind die Prosa-Felder, die Gaia
+/// (Claude Code) im Interview befuellt — leer => aus `company_type` abgeleitet (siehe Render).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CultureSpec {
+    /// Formalitaet (0 = locker/flach, 1 = formell/hierarchisch) → praegt Conscientiousness.
+    #[serde(default = "default_culture_axis")]
+    pub formality: f32,
+    /// Kollaboration (0 = einzelkaempferisch, 1 = teamzentriert) → praegt Agreeableness.
+    #[serde(default = "default_culture_axis")]
+    pub collaboration: f32,
+    /// Konfliktniveau (0 = harmonisch, 1 = reibungsintensiv) → praegt Neuroticism-Streuung.
+    #[serde(default = "default_culture_axis")]
+    pub conflict_level: f32,
+    /// Innovationsgrad (0 = bewahrend, 1 = experimentierfreudig) → praegt Openness.
+    #[serde(default = "default_culture_axis")]
+    pub innovation: f32,
+    /// Diversitaet (0 = homogen, 1 = heterogen) → globale Verteilungsstreuung.
+    #[serde(default = "default_culture_axis")]
+    pub diversity: f32,
+    /// Firmenmission (Prosa, von Gaia befuellt). Leer => aus `company_type` abgeleitet.
+    #[serde(default)]
+    pub mission: String,
+    /// Firmenwerte (Prosa, von Gaia befuellt). Leer => aus `company_type` abgeleitet.
+    #[serde(default)]
+    pub values: Vec<String>,
+}
+
+fn default_culture_axis() -> f32 {
+    0.5
+}
+
+impl Default for CultureSpec {
+    fn default() -> Self {
+        Self {
+            formality: default_culture_axis(),
+            collaboration: default_culture_axis(),
+            conflict_level: default_culture_axis(),
+            innovation: default_culture_axis(),
+            diversity: default_culture_axis(),
+            mission: String::new(),
+            values: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GaiaSpec {
     pub company_name: String,
@@ -65,6 +112,8 @@ pub struct GaiaSpec {
     pub time_scale: f32,
     #[serde(default)]
     pub departments: Vec<DepartmentSpec>,
+    #[serde(default)]
+    pub culture: CultureSpec,
 }
 
 impl GaiaSpec {
@@ -79,6 +128,19 @@ impl GaiaSpec {
             shift_model: ShiftModel::Hybrid,
             time_scale: default_time_scale(),
             departments: Vec::new(),
+            culture: CultureSpec {
+                formality: 0.4,
+                collaboration: 0.7,
+                conflict_level: 0.3,
+                innovation: 0.8,
+                diversity: 0.6,
+                mission: "Digitale Produkte mit Handwerks-Qualitaet bauen.".to_string(),
+                values: vec![
+                    "Qualitaet vor Tempo".to_string(),
+                    "Transparente Zusammenarbeit".to_string(),
+                    "Kontinuierliches Lernen".to_string(),
+                ],
+            },
         }
     }
 
@@ -98,6 +160,17 @@ impl GaiaSpec {
             }
             if department.weight == 0 {
                 bail!("department '{}' weight must be > 0", department.name);
+            }
+        }
+        for (name, value) in [
+            ("formality", self.culture.formality),
+            ("collaboration", self.culture.collaboration),
+            ("conflict_level", self.culture.conflict_level),
+            ("innovation", self.culture.innovation),
+            ("diversity", self.culture.diversity),
+        ] {
+            if !(0.0..=1.0).contains(&value) {
+                bail!("culture.{name} must be in [0.0, 1.0], got {value}");
             }
         }
         Ok(())
@@ -1140,6 +1213,35 @@ mod tests {
         let b = generate(spec).unwrap();
 
         assert_eq!(a.files, b.files);
+    }
+
+    #[test]
+    fn spec_without_culture_loads_with_defaults() {
+        // #441 AC: Bestands-Specs ohne [culture]-Block bleiben gueltig (serde-default).
+        let toml_str = "company_name = \"Legacy GmbH\"\nagent_count = 10\n";
+        let spec: GaiaSpec = toml::from_str(toml_str).expect("legacy spec parses");
+        assert_eq!(spec.culture, CultureSpec::default());
+        spec.validate().expect("legacy spec is valid");
+    }
+
+    #[test]
+    fn spec_with_culture_toml_round_trips() {
+        // #441: company-context-Write-Back braucht stabiles TOML-Round-Trip inkl. CultureSpec.
+        let spec = GaiaSpec::example();
+        let serialized = toml::to_string_pretty(&spec).expect("serialize GaiaSpec");
+        let reparsed: GaiaSpec = toml::from_str(&serialized).expect("re-parse GaiaSpec");
+        assert_eq!(spec, reparsed, "GaiaSpec TOML round-trip must be identical");
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_culture_axis() {
+        // #441 AC: validate lehnt eine Kultur-Achse ausserhalb [0,1] ab.
+        let mut spec = GaiaSpec::example();
+        spec.culture.conflict_level = 1.5;
+        assert!(spec.validate().is_err());
+        let mut spec2 = GaiaSpec::example();
+        spec2.culture.formality = -0.1;
+        assert!(spec2.validate().is_err());
     }
 
     #[test]
