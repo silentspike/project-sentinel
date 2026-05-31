@@ -3,6 +3,7 @@
 //! - HTTPS :8001 (self-signed) — secure context fuer die WebTransport-API + ServeDir(Bundle) + API.
 //! - WebTransport/QUIC :4434 — topic+msgpack+zstd Push.
 //! - Auth: httpOnly-Session (#402/#405). Control-Routen hinter `require_auth`.
+//!
 //! Laeuft parallel zum Bun-Dashboard (:8000) — phased cutover.
 
 use std::net::SocketAddr;

@@ -65,11 +65,8 @@ async fn ac2_client_receives_and_decodes_hello_frame() {
         .expect("uni stream");
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
-    loop {
-        match tokio::time::timeout(Duration::from_secs(5), recv.read(&mut chunk)).await {
-            Ok(Ok(Some(n))) => buf.extend_from_slice(&chunk[..n]),
-            _ => break,
-        }
+    while let Ok(Ok(Some(n))) = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut chunk)).await {
+        buf.extend_from_slice(&chunk[..n]);
     }
     let (topic, value): (String, serde_json::Value) = codec::decode_frame_as(&buf).expect("decode frame");
     assert_eq!(topic, "hello");
