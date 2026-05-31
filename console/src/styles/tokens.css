@@ -1,0 +1,46 @@
+/* Sentinel-Konsole Theme-Tokens (#419) — funktionales Design (Polish = eigene Phase). */
+:root {
+  color-scheme: dark;
+  --bg: #0f1117;
+  --surface-0: #161922;
+  --surface-1: #1d212e;
+  --surface-2: #262b3a;
+  --border: #2c3242;
+  --text: #e6e8ef;
+  --text-muted: #9aa3b5;
+  --accent: #5ad19a;
+  --accent-2: #5aa0ff;
+  --warn: #f2c14e;
+  --danger: #e2615a;
+  --radius: 8px;
+  --gap: 12px;
+  --font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* Light-Theme (per data-theme auf <html>, gesetzt von src/theme.ts). */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f6fb;
+  --surface-0: #ffffff;
+  --surface-1: #eef1f7;
+  --surface-2: #e2e7f0;
+  --border: #cdd4e0;
+  --text: #18202e;
+  --text-muted: #5b6577;
+  --accent: #1f9d6b;
+  --accent-2: #2f6fe0;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); font: var(--font); }
+
+.col { background: var(--surface-0); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden auto; }
+.col__head { padding: 10px 14px; font-weight: 700; border-bottom: 1px solid var(--border); background: var(--surface-1); position: sticky; top: 0; }
+.col__body { padding: 12px 14px; }
+.muted { color: var(--text-muted); }
+.pill { background: var(--surface-2); border-radius: 999px; padding: 1px 8px; font-size: 12px; }
+button { font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+button:hover { background: var(--surface-1); }
+button.primary { background: var(--accent); color: #06281c; border-color: transparent; font-weight: 700; }
+input, select { font: inherit; color: var(--text); background: var(--surface-0); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; }
