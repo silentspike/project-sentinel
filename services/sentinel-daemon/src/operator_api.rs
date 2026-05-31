@@ -26,8 +26,8 @@ use tracing::{debug, info, warn};
 
 use sentinel_common::{
     DomainEvent, DomainEventPayload, EventType, OperatorBroadcastCommand, OperatorChaosCommand,
-    OperatorChatCommand, OperatorCommand, OperatorGaiaCommand, OperatorNightrunCommand,
-    OperatorRoomStimulusCommand, OperatorTaskCommand, RoomStimulusType,
+    OperatorChatCommand, OperatorCommand, OperatorDmCommand, OperatorGaiaCommand,
+    OperatorNightrunCommand, OperatorRoomStimulusCommand, OperatorTaskCommand, RoomStimulusType,
 };
 
 use crate::config::OperatorApiConfig;
@@ -53,6 +53,7 @@ const OPERATOR_CHAT_PATH: &str = "/operator/chat";
 const OPERATOR_GAIA_PATH: &str = "/operator/gaia";
 const OPERATOR_BROADCAST_PATH: &str = "/operator/broadcast";
 const OPERATOR_TASK_PATH: &str = "/operator/task";
+const OPERATOR_DM_PATH: &str = "/operator/dm";
 const OPERATOR_PLATFORM_ANALYZE_PATH: &str = "/operator/platform-analyze";
 const OPERATOR_PLATFORM_TRIGGER_TEST_PATH: &str = "/operator/platform-trigger-test";
 const OPERATOR_PLATFORM_ANALYSIS_TEST_PATH: &str = "/operator/platform-analysis-test";
@@ -851,6 +852,27 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Ok(()) => json_response(
                     202,
                     serde_json::json!({"accepted": true, "message": "Task-Kommando angenommen"}),
+                ),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Command-Channel nicht verfuegbar").to_response()
+                }
+            }
+        }
+        OPERATOR_DM_PATH => {
+            let cmd: OperatorDmCommand = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest(
+                        "JSON ungueltig (target_agent_id, message, sender_name noetig)",
+                    )
+                    .to_response();
+                }
+            };
+            info!(agent_id = cmd.target_agent_id, "DM empfangen (#437)");
+            match state.command_tx.send(OperatorCommand::Dm(cmd)) {
+                Ok(()) => json_response(
+                    202,
+                    serde_json::json!({"accepted": true, "message": "DM zugestellt"}),
                 ),
                 Err(_) => {
                     ApiError::ServiceUnavailable("Command-Channel nicht verfuegbar").to_response()

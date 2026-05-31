@@ -337,6 +337,12 @@ pub enum DomainEventPayload {
         message: String,
         broadcast_type: String,
     },
+    /// DM: Operator/Gaia hat 1:1-Direktnachricht an einen Agent gesendet (#437)
+    OperatorDmSent {
+        target_agent_id: u16,
+        sender_name: String,
+        message: String,
+    },
     /// Runtime Config-Apply abgeschlossen (#425): Audit-Trail fuer Live-Diff/Fresh-Load.
     ConfigApplied {
         /// "live" oder "fresh".
@@ -390,6 +396,7 @@ impl DomainEventPayload {
             Self::SecurityExecBlocked { .. } => "security_exec_blocked",
             Self::OperatorGaiaSent { .. } => "operator_gaia_sent",
             Self::OperatorBroadcastSent { .. } => "operator_broadcast_sent",
+            Self::OperatorDmSent { .. } => "operator_dm_sent",
             Self::ConfigApplied { .. } => "config_applied",
         }
     }

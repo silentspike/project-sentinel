@@ -279,6 +279,16 @@ pub enum OperatorCommand {
     Gaia(OperatorGaiaCommand),
     Broadcast(OperatorBroadcastCommand),
     Task(OperatorTaskCommand),
+    Dm(OperatorDmCommand),
+}
+
+/// 1:1-Direktnachricht an einen Agent (#437): gerichtete Perception mit sichtbarem Absender
+/// (kein getarnter Eigen-Gedanke wie Voice-of-Gaia).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorDmCommand {
+    pub target_agent_id: u16,
+    pub message: String,
+    pub sender_name: String,
 }
 
 /// Aktion eines Task-Kommandos (#438).
