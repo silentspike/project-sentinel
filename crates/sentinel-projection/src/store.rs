@@ -83,6 +83,19 @@ CREATE TABLE IF NOT EXISTS kpi_1m (
     updated_at INTEGER NOT NULL
 )";
 
+const CREATE_TASK_KANBAN: &str = "
+CREATE TABLE IF NOT EXISTS task_kanban (
+    task_id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    assigned_to INTEGER NOT NULL,
+    assigned_by INTEGER,
+    parent_task INTEGER,
+    status TEXT NOT NULL DEFAULT 'pending',
+    result TEXT,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+)";
+
 const CREATE_PROJECTION_WATERMARKS: &str = "
 CREATE TABLE IF NOT EXISTS projection_watermarks (
     projection_name TEXT PRIMARY KEY,
@@ -121,6 +134,7 @@ impl ReadModelStore {
         conn.execute_batch(CREATE_AGENT_LIVE_VIEW)?;
         conn.execute_batch(CREATE_ROOM_LIVE_VIEW)?;
         conn.execute_batch(CREATE_KPI_1M)?;
+        conn.execute_batch(CREATE_TASK_KANBAN)?;
         conn.execute_batch(CREATE_PROJECTION_WATERMARKS)?;
         conn.execute_batch(CREATE_WATERMARK_INDEXES)?;
 
@@ -524,6 +538,79 @@ impl<'a> ReadModelTransaction<'a> {
                last_event_id = MAX(projection_watermarks.last_event_id, ?2),
                updated_at = ?3",
             params![projection_name, row_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    // ── task_kanban (#438) ──
+
+    /// UPSERT: Task erstellt. Idempotent via row_id > last_event_id.
+    pub fn upsert_task(
+        &self,
+        task_id: u32,
+        title: &str,
+        assigned_to: u16,
+        assigned_by: Option<u16>,
+        parent_task: Option<u32>,
+        status: &str,
+        row_id: i64,
+    ) -> anyhow::Result<()> {
+        self.guard.execute(
+            "INSERT INTO task_kanban (task_id, title, assigned_to, assigned_by, parent_task, status, last_event_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(task_id) DO UPDATE SET
+               title = excluded.title, assigned_to = excluded.assigned_to,
+               assigned_by = excluded.assigned_by, parent_task = excluded.parent_task,
+               status = excluded.status,
+               last_event_id = excluded.last_event_id, updated_at = excluded.updated_at
+             WHERE excluded.last_event_id > task_kanban.last_event_id",
+            params![task_id, title, assigned_to, assigned_by, parent_task, status, row_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// UPDATE: Task neu zugewiesen / delegiert.
+    pub fn update_task_assignee(
+        &self,
+        task_id: u32,
+        assigned_to: u16,
+        assigned_by: Option<u16>,
+        row_id: i64,
+    ) -> anyhow::Result<()> {
+        self.guard.execute(
+            "UPDATE task_kanban SET assigned_to = ?1, assigned_by = ?2, last_event_id = ?3, updated_at = ?4
+             WHERE task_id = ?5 AND ?3 > last_event_id",
+            params![assigned_to, assigned_by, row_id, now_ms(), task_id],
+        )?;
+        Ok(())
+    }
+
+    /// UPDATE: Task-Status aendern.
+    pub fn update_task_status(
+        &self,
+        task_id: u32,
+        status: &str,
+        row_id: i64,
+    ) -> anyhow::Result<()> {
+        self.guard.execute(
+            "UPDATE task_kanban SET status = ?1, last_event_id = ?2, updated_at = ?3
+             WHERE task_id = ?4 AND ?2 > last_event_id",
+            params![status, row_id, now_ms(), task_id],
+        )?;
+        Ok(())
+    }
+
+    /// UPDATE: Task abgeschlossen (status=done + Ergebnis).
+    pub fn complete_task(
+        &self,
+        task_id: u32,
+        result: Option<&str>,
+        row_id: i64,
+    ) -> anyhow::Result<()> {
+        self.guard.execute(
+            "UPDATE task_kanban SET status = 'done', result = ?1, last_event_id = ?2, updated_at = ?3
+             WHERE task_id = ?4 AND ?2 > last_event_id",
+            params![result, row_id, now_ms(), task_id],
         )?;
         Ok(())
     }
