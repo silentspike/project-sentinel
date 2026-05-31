@@ -359,6 +359,10 @@ pub fn generate(spec: GaiaSpec) -> Result<GeneratedCompany> {
         relative_path: PathBuf::from("nightrun.toml"),
         contents: nightrun_toml(&spec),
     });
+    files.push(GeneratedFile {
+        relative_path: PathBuf::from("company-context.md"),
+        contents: render_company_context(&spec),
+    });
 
     Ok(GeneratedCompany {
         spec,
@@ -443,6 +447,17 @@ pub fn validate_output_dir(root: &Path) -> Result<ValidationReport> {
             "nightrun.max_agent_id {} != spec.agent_count {}",
             nightrun_max_agent_id,
             spec.agent_count
+        );
+    }
+
+    // #441 AC3: eigene company-context.md muss existieren + die Firmendaten tragen (kein Default).
+    let context_path = root.join("company-context.md");
+    let context_content = fs::read_to_string(&context_path)
+        .with_context(|| format!("read generated {}", context_path.display()))?;
+    if !context_content.contains(&spec.company_name) {
+        bail!(
+            "generated company-context.md does not mention company '{}'",
+            spec.company_name
         );
     }
 
@@ -838,6 +853,160 @@ fn kpis_for(department: &str) -> Vec<String> {
         format!("{department} cycle time within target"),
         format!("{department} handoffs completed"),
     ]
+}
+
+/// Firmenmission: explizit aus der Spec, sonst deterministisch aus `company_type` abgeleitet (#441).
+fn effective_mission(spec: &GaiaSpec) -> String {
+    let trimmed = spec.culture.mission.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    match spec.company_type {
+        CompanyType::SoftwareAgency => format!(
+            "{} entwickelt digitale Produkte und Dienstleistungen in verlaesslicher Qualitaet.",
+            spec.company_name
+        ),
+        CompanyType::Manufacturing => format!(
+            "{} fertigt Produkte mit gleichbleibend hoher Qualitaet und sicheren Prozessen.",
+            spec.company_name
+        ),
+        CompanyType::Healthcare => format!(
+            "{} versorgt Patientinnen und Patienten verantwortungsvoll und zugewandt.",
+            spec.company_name
+        ),
+        CompanyType::Generic => {
+            format!("{} liefert verlaessliche Leistungen fuer ihre Kunden.", spec.company_name)
+        }
+    }
+}
+
+/// Firmenwerte: explizit aus der Spec, sonst ein neutraler Default-Satz (#441).
+fn effective_values(spec: &GaiaSpec) -> Vec<String> {
+    if !spec.culture.values.is_empty() {
+        return spec.culture.values.clone();
+    }
+    vec![
+        "Verlaesslichkeit".to_string(),
+        "Zusammenarbeit".to_string(),
+        "Qualitaet".to_string(),
+    ]
+}
+
+fn level_label(value: f32) -> &'static str {
+    if value < 0.34 {
+        "niedrig"
+    } else if value < 0.67 {
+        "mittel"
+    } else {
+        "hoch"
+    }
+}
+
+fn company_type_label(company_type: &CompanyType) -> &'static str {
+    match company_type {
+        CompanyType::SoftwareAgency => "Software-/Digitalagentur",
+        CompanyType::Manufacturing => "Produktion / Fertigung",
+        CompanyType::Healthcare => "Gesundheitswesen",
+        CompanyType::Generic => "Allgemein",
+    }
+}
+
+fn shift_model_label(shift_model: &ShiftModel) -> &'static str {
+    match shift_model {
+        ShiftModel::OfficeHours => "Bueroarbeitszeiten",
+        ShiftModel::ThreeShift => "3-Schicht-Betrieb (24/7)",
+        ShiftModel::Hybrid => "Hybrid (Kernzeit + Schichten)",
+    }
+}
+
+/// Rendert die firmenweite `company-context.md` deterministisch aus der Spec (#441, kein LLM).
+/// Mission/Werte stammen aus der (von Gaia befuellten) Spec oder werden aus `company_type` abgeleitet;
+/// Organigramm/KPIs aus den (effektiven) Abteilungen; Kultur-Achsen als Prosa. blake3-frei → bei
+/// gleicher Spec byte-identisch.
+fn render_company_context(spec: &GaiaSpec) -> String {
+    let departments = spec.effective_departments();
+    let mission = effective_mission(spec);
+    let values = effective_values(spec);
+    let mut out = String::new();
+
+    out.push_str(&format!("# {} — Firmenkontext\n\n", spec.company_name));
+    out.push_str(
+        "> Deterministisch von `sentinel-gaia` aus der `gaia-spec` erzeugt (#441). \
+         Nicht manuell editieren — ueber die gaia-spec + Regenerierung pflegen.\n\n",
+    );
+
+    out.push_str("## Unternehmen\n");
+    out.push_str(&format!("- **Sitz:** {}, {}\n", spec.address, spec.city));
+    out.push_str(&format!("- **Typ:** {}\n", company_type_label(&spec.company_type)));
+    out.push_str(&format!("- **Mitarbeiter:** {}\n", spec.agent_count));
+    out.push_str(&format!(
+        "- **Arbeitsmodell:** {}\n\n",
+        shift_model_label(&spec.shift_model)
+    ));
+
+    out.push_str("## Mission & Werte\n");
+    out.push_str(&format!("{mission}\n\n"));
+    out.push_str("Werte:\n");
+    for value in &values {
+        out.push_str(&format!("- {value}\n"));
+    }
+    out.push('\n');
+
+    out.push_str("## Organigramm\n");
+    if let Some(lead_dept) = departments.first() {
+        let lead_role = lead_dept
+            .roles
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "Geschaeftsfuehrung".to_string());
+        out.push_str(&format!(
+            "- **Leitung:** {} (Abteilung {})\n",
+            lead_role, lead_dept.name
+        ));
+    }
+    for department in departments.iter().skip(1) {
+        let roles = if department.roles.is_empty() {
+            "diverse Rollen".to_string()
+        } else {
+            department.roles.join(", ")
+        };
+        out.push_str(&format!("- **{}:** {}\n", department.name, roles));
+    }
+    out.push('\n');
+
+    out.push_str("## Abteilungs-KPIs\n");
+    for department in &departments {
+        out.push_str(&format!(
+            "- **{}:** {}\n",
+            department.name,
+            kpis_for(&department.name).join("; ")
+        ));
+    }
+    out.push('\n');
+
+    out.push_str("## Kultur\n");
+    out.push_str(&format!(
+        "- Formalitaet: {}\n",
+        level_label(spec.culture.formality)
+    ));
+    out.push_str(&format!(
+        "- Kollaboration: {}\n",
+        level_label(spec.culture.collaboration)
+    ));
+    out.push_str(&format!(
+        "- Konfliktniveau: {}\n",
+        level_label(spec.culture.conflict_level)
+    ));
+    out.push_str(&format!(
+        "- Innovationsgrad: {}\n",
+        level_label(spec.culture.innovation)
+    ));
+    out.push_str(&format!(
+        "- Diversitaet: {}\n",
+        level_label(spec.culture.diversity)
+    ));
+
+    out
 }
 
 /// Leitet die Big-Five-Verteilung eines Agents deterministisch aus Seed+Id UND der Firmen-Kultur ab
@@ -1276,6 +1445,41 @@ mod tests {
         let mut spec2 = GaiaSpec::example();
         spec2.culture.formality = -0.1;
         assert!(spec2.validate().is_err());
+    }
+
+    #[test]
+    fn generate_emits_own_company_context() {
+        // #441 AC3: generierte Firma hat eigene company-context.md mit Firmendaten (kein PixelPerfekt-Default).
+        let spec = GaiaSpec {
+            company_name: "Acme Robotics AG".to_string(),
+            ..GaiaSpec::example()
+        };
+        let generated = generate(spec).unwrap();
+        let ctx = generated
+            .file("company-context.md")
+            .expect("company-context.md emitted");
+        assert!(ctx.contents.contains("Acme Robotics AG"), "context names the company");
+        assert!(!ctx.contents.contains("PixelPerfekt"), "context is not the default");
+        assert!(ctx.contents.contains("## Mission & Werte"));
+        assert!(ctx.contents.contains("## Organigramm"));
+        assert!(ctx.contents.contains("## Kultur"));
+        // Mission aus example()-Spec uebernommen (nicht aus company_type abgeleitet).
+        assert!(ctx.contents.contains("Digitale Produkte mit Handwerks-Qualitaet"));
+    }
+
+    #[test]
+    fn company_context_derives_mission_when_spec_empty() {
+        // Leere culture.mission/values -> deterministisch aus company_type abgeleitet.
+        let spec = GaiaSpec {
+            company_name: "Werk Nord GmbH".to_string(),
+            company_type: CompanyType::Manufacturing,
+            culture: CultureSpec::default(),
+            ..GaiaSpec::example()
+        };
+        let generated = generate(spec).unwrap();
+        let ctx = &generated.file("company-context.md").unwrap().contents;
+        assert!(ctx.contains("Werk Nord GmbH"));
+        assert!(ctx.contains("fertigt Produkte"), "mission derived from Manufacturing type");
     }
 
     #[test]
