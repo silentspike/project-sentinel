@@ -63,6 +63,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/status", get(auth::status))
+        .route(
+            "/wt-ticket",
+            get(auth::wt_ticket).route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth)),
+        )
         .route("/cert-hash", get(cert_hash))
         .route("/agents", get(projection::agents))
         .route("/rooms", get(projection::rooms))

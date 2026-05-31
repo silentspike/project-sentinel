@@ -52,7 +52,9 @@ impl Config {
         Self {
             dashboard_api_key: env("SENTINEL_DASHBOARD_API_KEY"),
             http_bind: env("SENTINEL_DASHBOARD_HTTP_BIND").unwrap_or_else(|| "0.0.0.0:8001".into()),
-            wt_bind: env("SENTINEL_DASHBOARD_WT_BIND").unwrap_or_else(|| "0.0.0.0:4434".into()),
+            // WT teilt den Port der HTTPS-Seite (UDP/QUIC) -> same-origin, damit das httpOnly-Session-Cookie
+            // an den WebTransport-Handshake gesendet wird (Browser sendet Cookies nur same-origin).
+            wt_bind: env("SENTINEL_DASHBOARD_WT_BIND").unwrap_or_else(|| "0.0.0.0:8001".into()),
             operator_url: env("SENTINEL_OPERATOR_API_URL").unwrap_or_else(|| "http://127.0.0.1:8084".into()),
             operator_key: env("SENTINEL_OPERATOR_API_KEY"),
             gateway_url: env("CORTEX_GATEWAY_CONTROL_URL").unwrap_or_else(|| "http://127.0.0.1:8081".into()),
