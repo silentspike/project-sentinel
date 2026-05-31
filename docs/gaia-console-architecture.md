@@ -152,8 +152,8 @@ bereits selbst. Gaia ist die strategische/User-Schicht *darueber*, nicht ein kon
 - **Arbeitsmodell**: **Task-Entity** (ECS, event-sourced, hierarchisch, Status pending→in_progress→done/blocked,
   Kanban-Backing) **+ Voice-of-Gaia** als In-Sim-Zustellweg. Fortschritt aus Agent-Aktionen, Gaia ueberwacht via Projection.
 - **Chat-Scope**: volle PixelPerfekt-Paritaet — Room-Chat (existiert) + **1:1-Agent-DM** (neu) + **Room-Invite** (neu) + reiche Chat-UI.
-- **company-context**: Gaia (Claude Code) generiert `company-context.md` aus dem Interview; **Gateway-Hot-Reload-Endpoint** macht Aenderungen live wirksam (Gateway cacht heute statisch).
-- **Soziale Dimension**: strukturierte Kultur-/Sozial-Felder in der `gaia-spec` (steuern Big-Five-Verteilung deterministisch) **+** Prosa im company-context.
+- **company-context**: Klare Trennung Inhalt/Form — **Gaia (LLM) liefert den Inhalt**, indem es im Interview die strukturierten `gaia-spec`-Felder (`mission`, `values[]`, Kultur-/Sozial-Achsen) befuellt; **`sentinel-gaia` rendert daraus deterministisch** (Template, kein LLM, blake3-reproduzierbar) die vollstaendige `company-context.md` (Mission/Werte + Organigramm-Prosa aus departments/Hierarchie/KPIs). So ist jede generierte Firma sofort eigenstaendig — auch eine reine CLI-Firma ohne Gaia-Lauf (kein PixelPerfekt-Default, AC-3). **Optionale narrative LLM-Anreicherung** der Prosa ist nachgelagert (Gaia-Loop, nicht Voraussetzung). **Gateway-Hot-Reload-Endpoint** (#440) macht Aenderungen live wirksam (Gateway cacht company-context + Agent-DNA statisch).
+- **Soziale Dimension**: strukturierte Kultur-/Sozial-Felder in der `gaia-spec` (steuern die Big-Five-Verteilung deterministisch) **+** fliessen ins deterministisch gerenderte company-context (kein freier LLM-Prosa-Durchreich).
 - **Gaia-Transparenz**: umschaltbar — Ergebnis-Sicht default, **Deep/Supervision-Modus** zeigt Gaias JSONL/Tool-Stream (noaide-Pattern) mit Gates.
 - **Auth**: Server-Session + httpOnly-Cookie (#405-Muster), Desktop+Mobile.
 - **Gaia-Persona**: neutrale Assistenz (kein Rollenspiel) + dynamisches Firmen-Wissen (Backend-injiziert) + CLI-Tools.
