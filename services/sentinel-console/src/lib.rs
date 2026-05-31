@@ -73,6 +73,7 @@ pub fn run_ingest(plane: SharedPlane, events_db: String, poll: Duration) {
         }
     };
     let mut offset = 0i64;
+    let mut ingested_since_log = 0u64;
     loop {
         match store.get_events_since_with_id(offset, 500) {
             Ok(batch) if !batch.is_empty() => {
@@ -82,6 +83,20 @@ pub fn run_ingest(plane: SharedPlane, events_db: String, poll: Duration) {
                             guard.ingest(&bytes);
                         }
                         offset = id;
+                        ingested_since_log += 1;
+                    }
+                    // Periodischer Dedup-Benchmark auf echten Event-Daten (#439 AC-1, VM-Evidence).
+                    if ingested_since_log >= 200 {
+                        ingested_since_log = 0;
+                        tracing::info!(
+                            total_blocks = guard.total_blocks(),
+                            unique_blocks = guard.unique_blocks(),
+                            dedup_ratio = guard.dedup_ratio(),
+                            savings_ratio = guard.savings_ratio(),
+                            ingested_bytes = guard.total_ingested_bytes(),
+                            stored_bytes = guard.stored_bytes(),
+                            "console data-plane dedup stats"
+                        );
                     }
                 }
             }
