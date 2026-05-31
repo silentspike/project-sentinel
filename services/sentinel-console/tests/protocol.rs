@@ -52,41 +52,75 @@ async fn empty_manifest_gets_all_blocks() {
 
 #[tokio::test]
 async fn partial_manifest_gets_only_missing_blocks() {
-    let (plane, full_manifest) = seeded_plane();
-    // Client already has 90% of the blocks.
-    let keep = full_manifest.len() * 9 / 10;
-    let client_has: Vec<BlockHash> = full_manifest.iter().copied().take(keep).collect();
-    let expected_missing = full_manifest.len() - keep;
+    // Real DEV-009 append/push scenario: the client is caught up through the first nine
+    // entries (it already holds the recurring 256 KiB system block plus their tails); only
+    // the newest entry's brand-new unique tail is missing, so the server transfers just that
+    // small delta. We build `client_has` from the actual ingest hashes — NOT from a slice of
+    // `server_manifest()`, whose order is non-deterministic (HashMap iteration). The previous
+    // version took a count-based 90% slice over that random order, so whether a large shared
+    // block landed in the "missing 10%" was random → the byte-size assertion was flaky.
+    let mut plane = ConsolePlane::new();
+    let mut client_has_vec: Vec<BlockHash> = Vec::new();
+    for i in 0..9u32 {
+        let mut msg = varied(256 * 1024, 0); // shared system block (recurs in every entry)
+        msg.extend(varied(4096, i + 1)); // per-entry unique tail
+        client_has_vec.extend(plane.ingest(&msg)); // client is already caught up on these
+    }
+    // The newest entry: same recurring system block (already known) + a brand-new unique tail.
+    let mut newest = varied(256 * 1024, 0);
+    newest.extend(varied(4096, 999));
+    let newest_hashes = plane.ingest(&newest);
 
-    let full_bytes: u64 = {
-        let g = plane.lock().unwrap();
-        full_manifest
+    let client_has: HashSet<BlockHash> = client_has_vec.into_iter().collect();
+    // Missing = exactly the newest entry's blocks the client does not already have.
+    let expected_missing: HashSet<BlockHash> = {
+        let mut seen = HashSet::new();
+        newest_hashes
             .iter()
-            .map(|h| g.block(h).map(|b| b.len() as u64).unwrap_or(0))
-            .sum()
+            .copied()
+            .filter(|h| !client_has.contains(h) && seen.insert(*h))
+            .collect()
     };
+    assert!(
+        !expected_missing.is_empty(),
+        "the new entry must contribute at least one previously-unseen block"
+    );
 
+    let full_bytes: u64 = plane
+        .server_manifest()
+        .iter()
+        .map(|h| plane.block(h).map(|b| b.len() as u64).unwrap_or(0))
+        .sum();
+
+    let plane = Arc::new(Mutex::new(plane));
     let (client, server) = tokio::io::duplex(16 * 1024 * 1024);
     let (mut client_rx, mut client_tx) = tokio::io::split(client);
     let (server_rx, server_tx) = tokio::io::split(server);
     let pl = plane.clone();
     let srv = tokio::spawn(async move { serve_protocol(server_rx, server_tx, &pl).await });
 
-    let hello = serde_json::to_vec(&HelloManifest { have: client_has.clone() }).unwrap();
+    let hello = serde_json::to_vec(&HelloManifest {
+        have: client_has.iter().copied().collect(),
+    })
+    .unwrap();
     write_frame(&mut client_tx, &hello).await.unwrap();
     let delta_bytes = read_frame(&mut client_rx).await.unwrap();
     let delta: Delta = serde_json::from_slice(&delta_bytes).unwrap();
 
-    assert_eq!(delta.missing.len(), expected_missing, "only missing ~10% of blocks");
-    let known: HashSet<BlockHash> = client_has.into_iter().collect();
+    let missing: HashSet<BlockHash> = delta.missing.iter().copied().collect();
+    assert_eq!(
+        missing, expected_missing,
+        "delta carries exactly the newest entry's previously-unseen blocks"
+    );
     assert!(
-        delta.missing.iter().all(|h| !known.contains(h)),
+        delta.missing.iter().all(|h| !client_has.contains(h)),
         "delta never re-sends a block the client already has"
     );
-    // Transfer is far smaller than the full state.
+    // The recurring 256 KiB system block is already known → only the small new tail transfers,
+    // so the delta is far smaller than the full state. Deterministic by construction.
     assert!(
         delta.transfer_bytes() * 3 < full_bytes,
-        "delta {} must be much smaller than full state {}",
+        "delta {} must be much smaller than full state {} (only the new tail transfers)",
         delta.transfer_bytes(),
         full_bytes
     );
