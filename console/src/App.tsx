@@ -1,4 +1,4 @@
-import { createSignal, createMemo, onMount, For, Show, type JSX } from "solid-js";
+import { createSignal, createMemo, createEffect, onMount, For, Show, type JSX } from "solid-js";
 import "./styles/tokens.css";
 import { consoleStore, status, frameCount, connectTransport, ingestFrame, type AgentRow } from "./stores/console";
 import { authStatus, login as doLogin } from "./auth";
@@ -119,8 +119,11 @@ export default function App(): JSX.Element {
 
   onMount(async () => {
     setAuthed(await authStatus());
-    const host = window.location.hostname || "127.0.0.1";
-    connectTransport(`https://${host}:4434`);
+  });
+  // WebTransport erst nach Auth verbinden — der WT-Connect holt ein Ticket von /api/wt-ticket
+  // (require_auth), das nur mit gueltiger Session ausgegeben wird. URL = same-origin (window.location.origin).
+  createEffect(() => {
+    if (authed()) connectTransport(window.location.origin);
   });
 
   const cols: Record<Pillar, () => JSX.Element> = { dashboard: DashboardCol, control: ControlCol, chat: ChatCol };

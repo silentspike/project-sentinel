@@ -9,6 +9,7 @@ export type ConnectionStatus = "connecting" | "connected" | "disconnected";
 interface TransportClientOptions {
   url: string;
   certHashUrl?: string;
+  ticketUrl?: string;
   onFrame?: (topic: string, value: unknown) => void;
   onStatusChange?: (status: ConnectionStatus) => void;
 }
@@ -27,6 +28,7 @@ export class TransportClient {
   private transport: WebTransport | null = null;
   private readonly url: string;
   private readonly certHashUrl: string;
+  private readonly ticketUrl: string;
   private status: ConnectionStatus = "disconnected";
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -37,6 +39,7 @@ export class TransportClient {
   constructor(options: TransportClientOptions) {
     this.url = options.url;
     this.certHashUrl = options.certHashUrl ?? `${window.location.origin}/api/cert-hash`;
+    this.ticketUrl = options.ticketUrl ?? `${window.location.origin}/api/wt-ticket`;
     this.onFrame = options.onFrame;
     this.onStatusChange = options.onStatusChange;
   }
@@ -51,7 +54,10 @@ export class TransportClient {
       if (certHash) {
         options.serverCertificateHashes = [{ algorithm: "sha-256", value: base64ToArrayBuffer(certHash) }];
       }
-      this.transport = new WebTransport(this.url, options);
+      // WT-Auth via Einmal-Ticket in der URL (Browser senden bei WebTransport keine Cookies).
+      const ticket = await this.fetchTicket();
+      const wtUrl = ticket ? `${this.url}${this.url.includes("?") ? "&" : "?"}t=${encodeURIComponent(ticket)}` : this.url;
+      this.transport = new WebTransport(wtUrl, options);
       await this.transport.ready;
       this.setStatus("connected");
       this.reconnectAttempt = 0;
@@ -99,6 +105,16 @@ export class TransportClient {
       if (!resp.ok) return null;
       const data = (await resp.json()) as { algorithm: string; hash: string | null };
       return data.hash ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async fetchTicket(): Promise<string | null> {
+    try {
+      const resp = await fetch(this.ticketUrl, { credentials: "include" });
+      if (!resp.ok) return null;
+      return ((await resp.json()) as { ticket?: string }).ticket ?? null;
     } catch {
       return null;
     }
