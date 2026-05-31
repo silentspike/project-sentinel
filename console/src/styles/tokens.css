@@ -17,6 +17,20 @@
   --font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
+/* Light-Theme (per data-theme auf <html>, gesetzt von src/theme.ts). */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f6fb;
+  --surface-0: #ffffff;
+  --surface-1: #eef1f7;
+  --surface-2: #e2e7f0;
+  --border: #cdd4e0;
+  --text: #18202e;
+  --text-muted: #5b6577;
+  --accent: #1f9d6b;
+  --accent-2: #2f6fe0;
+}
+
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; margin: 0; }
 body { background: var(--bg); color: var(--text); font: var(--font); }
