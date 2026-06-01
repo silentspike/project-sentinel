@@ -4526,9 +4526,11 @@ name = "sentinel-dashboard-backend"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-nats",
  "axum",
  "axum-server",
  "base64",
+ "futures",
  "rcgen",
  "reqwest",
  "rmp-serde",

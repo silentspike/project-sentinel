@@ -1,24 +1,17 @@
-//! sentinel-dashboard-backend entrypoint (#431): HTTPS (axum) + WebTransport/QUIC.
+//! sentinel-dashboard-backend entrypoint (#431/#432): HTTPS (axum) + WebTransport/QUIC + Event-Push.
 //!
 //! - HTTPS :8001 (self-signed) — secure context fuer die WebTransport-API + ServeDir(Bundle) + API.
 //! - WebTransport/QUIC same-origin auf dem HTTPS-Port (`wt_bind`-Default :8001, UDP) — topic+msgpack+zstd Push.
-//! - Auth: httpOnly-Session (#402/#405) fuer HTTP/Control-Routen; der WebTransport-Pfad nutzt ein
-//!   kurzlebiges Einmal-Ticket (`?t=`, WT traegt keine Cookies).
+//! - Event-Stream-Push (#432): NATS SENTINEL_EVENTS -> Delta-Frames (ersetzt das 1s-Projection-Polling).
+//! - Auth: httpOnly-Session (#402/#405) fuer HTTP/Control- + Projection-Read-Routen (#463); der
+//!   WebTransport-Pfad nutzt ein kurzlebiges Einmal-Ticket (`?t=`, WT traegt keine Cookies).
 //!
-//! Laeuft parallel zum Bun-Dashboard (:8000) — phased cutover.
+//! Laeuft parallel zum Bun-Dashboard (:8000) — phased cutover. Der HTTP-Router wird in
+//! `sentinel_dashboard_backend::build_app` gebaut (testbar fuer die Auth-Gates, #463).
 
 use std::net::SocketAddr;
 
-use axum::{
-    extract::State,
-    middleware,
-    routing::{get, post},
-    Json, Router,
-};
-use serde_json::{json, Value};
-use tower_http::{cors::CorsLayer, services::ServeDir};
-
-use sentinel_dashboard_backend::{auth, control, projection, tls, wt, AppState, Config};
+use sentinel_dashboard_backend::{build_app, event_sub, tls, wt, AppState, Config};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,8 +25,8 @@ async fn main() -> anyhow::Result<()> {
     let mut config = Config::from_env();
 
     // Geteiltes self-signed Cert (HTTPS + WebTransport), Hash fuer /api/cert-hash.
-    let cert_dir = std::env::var("SENTINEL_DASHBOARD_CERT_DIR")
-        .unwrap_or_else(|_| "/opt/sentinel/console-cert".into());
+    let cert_dir =
+        std::env::var("SENTINEL_DASHBOARD_CERT_DIR").unwrap_or_else(|_| "/opt/sentinel/console-cert".into());
     let cert = tls::generate(std::path::Path::new(&cert_dir), &["localhost", "127.0.0.1", "10.0.0.240"])?;
     config.cert_hash_b64 = Some(cert.cert_hash_b64.clone());
 
@@ -51,45 +44,17 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Control-Proxy hinter require_auth.
-    let control_routes = Router::new()
-        .route("/chaos", post(control::chaos))
-        .route("/stimulus", post(control::stimulus))
-        .route("/nightrun", post(control::nightrun))
-        .route("/config", get(control::get_config).patch(control::patch_config))
-        .route("/provider", post(control::provider))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
+    // Event-Stream-Subscriber (#432): NATS SENTINEL_EVENTS -> Delta-Frames in den Broadcast-Kanal
+    // (ersetzt das alte 1s-Projection-Polling). Eigener Daemon-Task mit Reconnect-Backoff.
+    tokio::spawn(event_sub::run_event_subscriber(state.clone()));
 
-    let api = Router::new()
-        .route("/auth/login", post(auth::login))
-        .route("/auth/logout", post(auth::logout))
-        .route("/auth/status", get(auth::status))
-        .route(
-            "/wt-ticket",
-            get(auth::wt_ticket).route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth)),
-        )
-        .route("/cert-hash", get(cert_hash))
-        .route("/agents", get(projection::agents))
-        .route("/rooms", get(projection::rooms))
-        .route("/metrics", get(projection::metrics))
-        .route("/tasks", get(projection::tasks))
-        .nest("/control", control_routes);
+    let app = build_app(state.clone());
 
-    let app = Router::new()
-        .nest("/api", api)
-        .fallback_service(ServeDir::new(&state.config.bundle_dir).append_index_html_on_directories(true))
-        .layer(CorsLayer::permissive())
-        .with_state(state.clone());
-
-    let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert.cert_pem_path, &cert.key_pem_path).await?;
+    let tls_config =
+        axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert.cert_pem_path, &cert.key_pem_path).await?;
     tracing::info!(%http_bind, bundle = %state.config.bundle_dir, "sentinel-dashboard-backend HTTPS listening");
     axum_server::bind_rustls(http_bind, tls_config)
         .serve(app.into_make_service())
         .await?;
     Ok(())
-}
-
-/// GET /api/cert-hash — base64(sha-256(cert DER)) fuer WebTransport `serverCertificateHashes` (leer bei CA-Cert).
-async fn cert_hash(State(st): State<AppState>) -> Json<Value> {
-    Json(json!({ "hash": st.config.cert_hash_b64, "algorithm": "sha-256" }))
 }
