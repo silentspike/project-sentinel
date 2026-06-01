@@ -262,4 +262,46 @@ mod tests {
         assert_eq!(event_type_from_subject("garbage"), "");
         assert!(classify(event_type_from_subject("garbage")));
     }
+
+    /// Integrationstest (Maßgabe Hauptsession): ein `config_applied`-Event laeuft durch classify
+    /// (-> dirty) und der Resync-Push (`push_agent_live`) legt tatsaechlich einen `agent_live`-Frame
+    /// auf den Broadcast-Kanal. Belegt den genannten config_applied->Resync-Pfad end-to-end (die
+    /// Live-Optik O3 zeigt denselben Effekt via Schichtwechsel).
+    #[tokio::test]
+    async fn config_applied_event_pushes_agent_live_frame() {
+        // Temp projection.db mit dem agent_live_view-Schema + einem Agenten.
+        let dir = std::env::temp_dir().join(format!("evsub-cfgapply-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("projection.db");
+        {
+            let c = rusqlite::Connection::open(&db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE agent_live_view (agent_id INTEGER PRIMARY KEY,name TEXT NOT NULL,role TEXT NOT NULL,\
+                 shift_set INTEGER NOT NULL,status TEXT NOT NULL,current_room TEXT,in_transit INTEGER NOT NULL,\
+                 transit_target TEXT,last_action TEXT,last_action_tick INTEGER,hunger REAL NOT NULL,energy REAL NOT NULL,\
+                 stress REAL NOT NULL,bladder REAL NOT NULL,social_need REAL NOT NULL,caffeine_mg REAL NOT NULL,mood TEXT,\
+                 last_event_id INTEGER NOT NULL,updated_at INTEGER NOT NULL);\
+                 INSERT INTO agent_live_view VALUES (1,'Thomas','CEO',1,'active','buero-ceo',0,NULL,NULL,NULL,\
+                 0.2,0.8,0.1,0.0,0.0,0.0,'fokussiert',5,100);",
+            )
+            .unwrap();
+        }
+        let mut config = crate::Config::from_env();
+        config.projection_db = db.to_string_lossy().into_owned();
+        let state = crate::AppState::new(config).unwrap();
+        let mut rx = state.broadcast_tx.subscribe();
+
+        // config_applied ist push-relevant -> Resync-Push ausloesen (wie der Tick es taete).
+        assert!(classify("config_applied"), "config_applied muss dirty setzen");
+        push_agent_live(&state);
+
+        // Ein agent_live-Frame muss auf dem Broadcast-Kanal liegen.
+        let frame = rx.try_recv().expect("config_applied muss einen agent_live-Frame pushen");
+        let (topic, value): (String, serde_json::Value) =
+            crate::codec::decode_frame_as(&frame).expect("decode frame");
+        assert_eq!(topic, "agent_live");
+        assert_eq!(value["agents"][0]["name"], "Thomas");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
