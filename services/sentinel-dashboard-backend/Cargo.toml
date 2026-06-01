@@ -48,6 +48,11 @@ zstd = "0.13"
 base64 = "0.22"
 # WebTransport/QUIC
 wtransport = "0.6"
+# Event-Stream-Push (#432): NATS JetStream Subscribe + Stream-Iteration
+async-nats = { workspace = true }
+futures = "0.3"
 
 [dev-dependencies]
 tokio = { workspace = true }
+# Auth-Gate-Test (#463): app.oneshot() braucht das tower `util`-Feature.
+tower = { version = "0.5", features = ["util"] }
