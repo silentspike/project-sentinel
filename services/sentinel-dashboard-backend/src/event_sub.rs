@@ -4,14 +4,13 @@
 //!
 //! #433 erweitert denselben Push-Pfad auf `room_live` und `kpi`: relevante Events setzen Dirty-Flags,
 //! der 150ms-Tick liest jedes betroffene Read-Model hoechstens einmal und sendet ein Topic-Frame.
-//! Der append-only Event-Log-Stream nutzt denselben topic-Codec als eigener Poller aus `events.db`:
-//! `event_log` liefert nur neue `id > offset`-Rows; der WebTransport-Connect-Snapshot deckt den
-//! letzten Verlauf ab.
+//! Der append-only Event-Log-Stream aktualisiert eine CAS-Plane aus `events.db`; Clients ziehen den
+//! geordneten Block-Delta-Zustand per WebTransport-Bi-Stream (`HelloManifest -> EventLogCasResponse`).
+//! Der Broadcast-Kanal sendet dafuer nur kleine `event_log_cas_tick`-Frames als Sync-Trigger.
 //!
-//! **Strategie: Voll-Satz pro Event + client-`reconcile`** (nicht CAS-Block-Delta). Bei ~26-43
-//! winzigen Agent-Zeilen ist der zstd-komprimierte Voll-Satz <4 KB; `reconcile({key:"agent_id"})`
-//! erzeugt das DOM-Delta (Despawn/Resync gratis). CAS lohnt erst bei grossen append-only Stroemen
-//! (Event-Log) → separates Folge-Issue.
+//! **Strategie: Voll-Satz pro Projection + client-`reconcile`**. Bei ~26-43 winzigen Agent-Zeilen
+//! ist der zstd-komprimierte Voll-Satz <4 KB; `reconcile({key:"agent_id"})` erzeugt das DOM-Delta
+//! (Despawn/Resync gratis). Der grosse append-only Event-Log nutzt CAS-Block-Deltas (#464).
 //!
 //! **Consumer: ephemeral** (kein `durable_name`) + **`DeliverPolicy::New`** — ab Connect nur NEUE
 //! Events, KEIN Backlog-Replay des 7-Tage-Streams; der Connect-Snapshot (`wt.rs`) deckt den
@@ -172,43 +171,24 @@ pub async fn run_event_subscriber(state: AppState) {
     }
 }
 
-/// Pusht append-only EventStore-Deltas als `event_log`-Topic-Frames.
+/// Aktualisiert die Event-Log-CAS-Plane und pusht nur einen kleinen `event_log_cas_tick`.
 ///
-/// Start-offset ist der aktuelle Maximalwert, damit ein Backend-Restart nicht das ganze Log neu
-/// broadcastet. Connect-Backfill laeuft separat in `wt.rs`; der Client dedupliziert nach `id`.
+/// Der vollstaendige Event-Log-Zustand wird nicht mehr als Topic-Frame broadcastet. Verbundene
+/// Clients oeffnen beim Tick einen Bi-Stream und bekommen nur fehlende CAS-Bloecke.
 pub async fn run_event_log_pusher(state: AppState) {
-    let mut offset = match crate::events::max_event_id(&state.config.events_db) {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %state.config.events_db,
-                "event_log pusher starts degraded: events.db unavailable"
-            );
-            0
-        }
-    };
     let mut tick = tokio::time::interval(EVENT_LOG_POLL_INTERVAL);
     loop {
         tick.tick().await;
         if should_skip_read(state.broadcast_tx.receiver_count()) {
             continue;
         }
-        match crate::events::events_after_id(&state.config.events_db, offset, EVENT_LOG_BATCH_LIMIT)
-        {
-            Ok(events) => {
-                if events.is_empty() {
-                    continue;
-                }
-                if let Some(max_seen) = max_event_log_id(&events) {
-                    offset = offset.max(max_seen);
-                }
-                push_event_log(&state, events, false);
-            }
+        match refresh_event_log_cas(&state) {
+            Ok(inserted) if inserted > 0 => push_event_log_cas_tick(&state),
+            Ok(_) => {}
             Err(e) => tracing::warn!(
                 error = %e,
-                offset,
-                "event_log delta skipped (events.db read failed)"
+                path = %state.config.events_db,
+                "event_log CAS refresh skipped"
             ),
         }
     }
@@ -295,18 +275,75 @@ pub(crate) fn max_event_log_id(events: &[serde_json::Value]) -> Option<i64> {
         .max()
 }
 
-pub(crate) fn push_event_log(state: &AppState, events: Vec<serde_json::Value>, backfill: bool) {
-    if events.is_empty() {
-        return;
+pub(crate) fn refresh_event_log_cas(state: &AppState) -> anyhow::Result<usize> {
+    let (empty, mut offset) = {
+        let guard = state
+            .event_cas
+            .lock()
+            .map_err(|_| anyhow::anyhow!("event_log CAS lock poisoned"))?;
+        (guard.is_empty(), guard.max_event_id())
+    };
+
+    let mut inserted = 0;
+    if empty {
+        let events = crate::events::event_log_backfill_events(
+            &state.config.events_db,
+            EVENT_LOG_BACKFILL_RECENT_LIMIT,
+            EVENT_LOG_BACKFILL_FOCUS_LIMIT,
+        )?;
+        inserted += ingest_event_log_cas(state, &events)?;
+        offset = {
+            let guard = state
+                .event_cas
+                .lock()
+                .map_err(|_| anyhow::anyhow!("event_log CAS lock poisoned"))?;
+            guard.max_event_id()
+        };
     }
-    match crate::codec::encode_frame(
-        "event_log",
-        &serde_json::json!({ "events": events, "backfill": backfill }),
-    ) {
+
+    loop {
+        let events =
+            crate::events::events_after_id(&state.config.events_db, offset, EVENT_LOG_BATCH_LIMIT)?;
+        if events.is_empty() {
+            break;
+        }
+        if let Some(max_seen) = max_event_log_id(&events) {
+            offset = offset.max(max_seen);
+        }
+        let batch_len = events.len();
+        inserted += ingest_event_log_cas(state, &events)?;
+        if batch_len < EVENT_LOG_BATCH_LIMIT {
+            break;
+        }
+    }
+
+    Ok(inserted)
+}
+
+fn ingest_event_log_cas(state: &AppState, events: &[serde_json::Value]) -> anyhow::Result<usize> {
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let mut guard = state
+        .event_cas
+        .lock()
+        .map_err(|_| anyhow::anyhow!("event_log CAS lock poisoned"))?;
+    guard.ingest_events(events)
+}
+
+pub(crate) fn push_event_log_cas_tick(state: &AppState) {
+    let stats = match state.event_cas.lock() {
+        Ok(guard) => guard.stats_snapshot(),
+        Err(_) => {
+            tracing::warn!("event_log CAS tick skipped (lock poisoned)");
+            return;
+        }
+    };
+    match crate::codec::encode_frame("event_log_cas_tick", &serde_json::json!({ "stats": stats })) {
         Ok(frame) => {
             let _ = state.broadcast_tx.send(frame);
         }
-        Err(e) => tracing::warn!(error = %e, "event_log encode_frame failed"),
+        Err(e) => tracing::warn!(error = %e, "event_log_cas_tick encode_frame failed"),
     }
 }
 
@@ -514,29 +551,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_event_log_sends_topic_frame() {
+    async fn push_event_log_cas_tick_sends_sync_trigger() {
         let state = crate::AppState::new(crate::Config::from_env()).unwrap();
-        let mut rx = state.broadcast_tx.subscribe();
-
-        push_event_log(
-            &state,
-            vec![serde_json::json!({
+        state
+            .event_cas
+            .lock()
+            .unwrap()
+            .ingest_events(&[serde_json::json!({
                 "id": 42,
                 "event_id": "evt-42",
                 "event_type": "agent_action_received",
                 "payload": "{\"content\":\"Hallo\"}"
-            })],
-            false,
-        );
+            })])
+            .unwrap();
+        let mut rx = state.broadcast_tx.subscribe();
+
+        push_event_log_cas_tick(&state);
 
         let frame = rx
             .try_recv()
-            .expect("event_log muss einen Broadcast-Frame pushen");
+            .expect("event_log_cas_tick muss einen Broadcast-Frame pushen");
         let (topic, value): (String, serde_json::Value) =
             crate::codec::decode_frame_as(&frame).expect("decode frame");
-        assert_eq!(topic, "event_log");
-        assert_eq!(value["events"][0]["id"], 42);
-        assert_eq!(value["backfill"], false);
+        assert_eq!(topic, "event_log_cas_tick");
+        assert_eq!(value["stats"]["event_count"], 1);
+        assert_eq!(value["stats"]["max_event_id"], 42);
     }
 
     /// Integrationstest (Maßgabe Hauptsession): ein `config_applied`-Event laeuft durch classify

@@ -227,6 +227,7 @@ pub(crate) fn query_event_rows(
     rows.collect()
 }
 
+#[cfg(test)]
 pub(crate) fn max_event_id(db_path: &str) -> rusqlite::Result<i64> {
     let conn = open_events_ro(db_path)?;
     conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
