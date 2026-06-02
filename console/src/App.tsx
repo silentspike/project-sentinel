@@ -176,7 +176,7 @@ export default function App(): JSX.Element {
           }
         >
           <div data-testid="tiling-toolbar" style={{ display: "flex", gap: "8px", padding: "6px var(--gap)", "border-bottom": "1px solid var(--border)", background: "var(--surface-0)" }}>
-            <span class="muted" style={{ "align-self": "center", "font-size": "12px" }}>Workspace (niri-Stil)</span>
+            <span class="muted" style={{ "align-self": "center", "font-size": "12px" }}>Workspace (niri layout)</span>
             <button data-testid="gaia-open-floorplan" onClick={() => openPanel("floorplan")}>Gaia: zeig Floorplan</button>
           </div>
           <main data-testid="tiling-root" style={{ flex: 1, "min-height": 0, padding: "var(--gap)" }}>

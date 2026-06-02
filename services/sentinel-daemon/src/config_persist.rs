@@ -133,9 +133,7 @@ fn backup_existing(agents_dir: &Path, rooms_path: &Path, backup_dir: &Path) -> R
         for entry in std::fs::read_dir(agents_dir)? {
             let path = entry?.path();
             if path.is_file() {
-                let name = path
-                    .file_name()
-                    .context("backup source file has no name")?;
+                let name = path.file_name().context("backup source file has no name")?;
                 std::fs::copy(&path, backup_agents.join(name))
                     .with_context(|| format!("backup {}", path.display()))?;
             }
@@ -154,8 +152,8 @@ fn atomic_write(target: &Path, bytes: &[u8]) -> Result<()> {
     let file_name = target.file_name().context("target has no file name")?;
     let tmp = dir.join(format!(".{}.tmp", file_name.to_string_lossy()));
     {
-        let mut f =
-            std::fs::File::create(&tmp).with_context(|| format!("create temp {}", tmp.display()))?;
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("create temp {}", tmp.display()))?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
@@ -280,15 +278,18 @@ mod tests {
         let b = building();
         persist_company_config(cfg, &[agent(1, "Anna", "Dev")], &b, "0").unwrap();
         let reloaded = BuildingConfig::load(&cfg.join("rooms.toml")).unwrap();
-        assert_eq!(reloaded, b, "rooms.toml write-back must round-trip identical");
+        assert_eq!(
+            reloaded, b,
+            "rooms.toml write-back must round-trip identical"
+        );
     }
 
     #[test]
     fn persist_into_empty_config_dir_creates_agents() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path();
-        let res =
-            persist_company_config(cfg, &[agent(7, "Greta", "Sales")], &building(), "init").unwrap();
+        let res = persist_company_config(cfg, &[agent(7, "Greta", "Sales")], &building(), "init")
+            .unwrap();
         assert_eq!(res.agents_written, 1);
         assert_eq!(res.agents_removed, 0);
         let reloaded = load_all_agents(&cfg.join("agents")).unwrap();

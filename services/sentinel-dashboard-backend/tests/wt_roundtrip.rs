@@ -26,7 +26,10 @@ async fn spawn_server(
     let mut config = Config::from_env();
     config.dashboard_api_key = dashboard_api_key;
     config.wt_bind = format!("127.0.0.1:{port}");
-    config.projection_db = dir.join("nonexistent-projection.db").to_string_lossy().into_owned();
+    config.projection_db = dir
+        .join("nonexistent-projection.db")
+        .to_string_lossy()
+        .into_owned();
     let mut state = AppState::new(config).unwrap();
     state.config = std::sync::Arc::new({
         let mut c = (*state.config).clone();
@@ -51,7 +54,9 @@ async fn read_one_frame(conn: &wtransport::Connection) -> (String, serde_json::V
         .expect("uni stream");
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
-    while let Ok(Ok(Some(n))) = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut chunk)).await {
+    while let Ok(Ok(Some(n))) =
+        tokio::time::timeout(Duration::from_secs(5), recv.read(&mut chunk)).await
+    {
         buf.extend_from_slice(&chunk[..n]);
     }
     codec::decode_frame_as(&buf).expect("decode frame")
@@ -59,7 +64,9 @@ async fn read_one_frame(conn: &wtransport::Connection) -> (String, serde_json::V
 
 fn client_endpoint(cert_hash_b64: &str) -> Endpoint<wtransport::endpoint::endpoint_side::Client> {
     use base64::Engine;
-    let hash = base64::engine::general_purpose::STANDARD.decode(cert_hash_b64).unwrap();
+    let hash = base64::engine::general_purpose::STANDARD
+        .decode(cert_hash_b64)
+        .unwrap();
     let config = ClientConfig::builder()
         .with_bind_default()
         .with_server_certificate_hashes([wtransport::tls::Sha256Digest::new(
@@ -85,10 +92,13 @@ async fn ac2_client_receives_and_decodes_hello_frame() {
         .expect("uni stream");
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
-    while let Ok(Ok(Some(n))) = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut chunk)).await {
+    while let Ok(Ok(Some(n))) =
+        tokio::time::timeout(Duration::from_secs(5), recv.read(&mut chunk)).await
+    {
         buf.extend_from_slice(&chunk[..n]);
     }
-    let (topic, value): (String, serde_json::Value) = codec::decode_frame_as(&buf).expect("decode frame");
+    let (topic, value): (String, serde_json::Value) =
+        codec::decode_frame_as(&buf).expect("decode frame");
     assert_eq!(topic, "hello");
     assert_eq!(value["proto"], "topic-msgpack-zstd-v1");
 }

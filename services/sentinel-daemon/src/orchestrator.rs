@@ -2251,7 +2251,10 @@ fn teardown_agent_full(
 /// Alle Agent-IDs der aktuellen ECS-Welt (fuer Fresh-Load Reset).
 fn world_agent_ids(world: &mut bevy_ecs::prelude::World) -> Vec<AgentId> {
     let mut query = world.query::<&AgentIdentity>();
-    query.iter(world).map(|identity| identity.agent_id).collect()
+    query
+        .iter(world)
+        .map(|identity| identity.agent_id)
+        .collect()
 }
 
 /// True, wenn der Agent gerade unter aktiver Control-Plane-Heilung steht (Runtime-Health „stale").
@@ -5739,8 +5742,17 @@ mod tests {
             h.agents.push(health_agent(5, "stale"));
             h.agents.push(health_agent(6, "healthy"));
         }
-        assert!(agent_under_active_healing(&health, AgentId(5)), "stale -> defer");
-        assert!(!agent_under_active_healing(&health, AgentId(6)), "healthy -> despawn ok");
-        assert!(!agent_under_active_healing(&health, AgentId(99)), "unknown -> despawn ok");
+        assert!(
+            agent_under_active_healing(&health, AgentId(5)),
+            "stale -> defer"
+        );
+        assert!(
+            !agent_under_active_healing(&health, AgentId(6)),
+            "healthy -> despawn ok"
+        );
+        assert!(
+            !agent_under_active_healing(&health, AgentId(99)),
+            "unknown -> despawn ok"
+        );
     }
 }

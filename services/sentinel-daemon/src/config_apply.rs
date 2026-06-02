@@ -183,8 +183,8 @@ mod tests {
             agent(3, "Cara", "QA", 0.5),
         ];
         let new = vec![
-            agent(1, "Anna", "Dev", 0.9), // geaendert (Personality)
-            agent(2, "Bob", "PM", 0.5),   // unveraendert
+            agent(1, "Anna", "Dev", 0.9),   // geaendert (Personality)
+            agent(2, "Bob", "PM", 0.5),     // unveraendert
             agent(4, "Dora", "Sales", 0.5), // neu
         ];
         let diff = compute_agent_diff(&old, &new);
@@ -227,7 +227,10 @@ mod tests {
     #[test]
     fn apply_agent_update_returns_false_for_absent_agent() {
         let (mut world, _) = sentinel_ecs::create_simulation_world();
-        assert!(!apply_agent_update(&mut world, &agent(99, "Ghost", "None", 0.5)));
+        assert!(!apply_agent_update(
+            &mut world,
+            &agent(99, "Ghost", "None", 0.5)
+        ));
     }
 
     use sentinel_common::room::{BuildingConfig, BuildingMeta, RoomConfig, RoomType};
@@ -268,14 +271,21 @@ mod tests {
 
     #[test]
     fn validate_accepts_valid_config() {
-        let c = cmd(vec![agent(1, "Anna", "Dev", 0.5), agent(2, "Bob", "PM", 0.5)], 10);
+        let c = cmd(
+            vec![agent(1, "Anna", "Dev", 0.5), agent(2, "Bob", "PM", 0.5)],
+            10,
+        );
         assert!(validate_config_apply(&c, 10, validation(60)).is_ok());
     }
 
     #[test]
     fn validate_rejects_too_many_agents() {
         let c = cmd(
-            vec![agent(1, "A", "x", 0.5), agent(2, "B", "y", 0.5), agent(3, "C", "z", 0.5)],
+            vec![
+                agent(1, "A", "x", 0.5),
+                agent(2, "B", "y", 0.5),
+                agent(3, "C", "z", 0.5),
+            ],
             10,
         );
         let errs = validate_config_apply(&c, 2, validation(60)).unwrap_err();
@@ -291,7 +301,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_duplicate_ids() {
-        let c = cmd(vec![agent(1, "Anna", "Dev", 0.5), agent(1, "Clone", "Dev", 0.5)], 10);
+        let c = cmd(
+            vec![agent(1, "Anna", "Dev", 0.5), agent(1, "Clone", "Dev", 0.5)],
+            10,
+        );
         let errs = validate_config_apply(&c, 10, validation(60)).unwrap_err();
         assert!(errs.iter().any(|e| e.contains("duplicate agent id 1")));
     }
@@ -300,7 +313,11 @@ mod tests {
     fn validate_rejects_insufficient_room_capacity() {
         // 3 Agents, Gebaeude fasst nur 1 → Kapazitaetsfehler.
         let c = cmd(
-            vec![agent(1, "A", "x", 0.5), agent(2, "B", "y", 0.5), agent(3, "C", "z", 0.5)],
+            vec![
+                agent(1, "A", "x", 0.5),
+                agent(2, "B", "y", 0.5),
+                agent(3, "C", "z", 0.5),
+            ],
             1,
         );
         let errs = validate_config_apply(&c, 60, validation(60)).unwrap_err();

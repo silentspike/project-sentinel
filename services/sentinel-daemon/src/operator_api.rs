@@ -763,10 +763,8 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                         "message": "Config-Apply gestartet (tick-synchron)"
                     }),
                 ),
-                Err(_) => {
-                    ApiError::ServiceUnavailable("Config-Apply-Channel nicht verfuegbar")
-                        .to_response()
-                }
+                Err(_) => ApiError::ServiceUnavailable("Config-Apply-Channel nicht verfuegbar")
+                    .to_response(),
             }
         }
         OPERATOR_PRUNE_PATH => {
@@ -3170,12 +3168,16 @@ mod tests {
         assert_eq!(response.status, 400);
         let parsed: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(parsed["accepted"], serde_json::json!(false));
-        assert!(parsed["errors"].as_array().unwrap().iter().any(|e| e
-            .as_str()
+        assert!(parsed["errors"]
+            .as_array()
             .unwrap()
-            .contains("personality invalid")));
+            .iter()
+            .any(|e| e.as_str().unwrap().contains("personality invalid")));
         // KEIN Command gesendet
-        assert!(apply_rx.try_recv().is_err(), "invalid config must not be sent");
+        assert!(
+            apply_rx.try_recv().is_err(),
+            "invalid config must not be sent"
+        );
     }
 
     #[test]
@@ -4014,7 +4016,10 @@ mod tests {
             MAX_CONFIG_APPLY_BODY_BYTES
         );
         // Eine 60-Agent-Firma ist ~64 KB -> das Limit muss komfortabel darueber liegen.
-        assert_ne!(max_body_bytes_for_path(OPERATOR_CONFIG_APPLY_PATH), MAX_BODY_BYTES);
+        assert_ne!(
+            max_body_bytes_for_path(OPERATOR_CONFIG_APPLY_PATH),
+            MAX_BODY_BYTES
+        );
     }
 
     #[tokio::test]

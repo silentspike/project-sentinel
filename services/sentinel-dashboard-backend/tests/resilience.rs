@@ -22,15 +22,27 @@ async fn nats_unreachable_keeps_subscriber_and_http_alive() {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     // Der Subscriber-Task laeuft weiter (Retry-Loop) — NICHT gepanickt/beendet.
-    assert!(!handle.is_finished(), "Subscriber darf bei NATS-Ausfall nicht panicken/exiten");
+    assert!(
+        !handle.is_finished(),
+        "Subscriber darf bei NATS-Ausfall nicht panicken/exiten"
+    );
 
     // HTTP bleibt funktionsfaehig (cert-hash ist public, kein DB/NATS noetig).
     let app = build_app(state);
     let resp = app
-        .oneshot(Request::builder().uri("/api/cert-hash").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/cert-hash")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "HTTP muss trotz NATS-Ausfall antworten");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "HTTP muss trotz NATS-Ausfall antworten"
+    );
 
     handle.abort();
 }

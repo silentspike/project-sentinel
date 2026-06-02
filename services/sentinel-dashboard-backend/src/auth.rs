@@ -148,23 +148,38 @@ pub async fn login(State(st): State<AppState>, body: Bytes) -> Response {
             .into_response();
     }
     let token = st.sessions.create();
-    let secure = if st.config.cookie_secure { "; Secure" } else { "" };
+    let secure = if st.config.cookie_secure {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!(
         "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict{secure}; Path=/; Max-Age={SESSION_TTL_SECS}"
     );
-    ([(header::SET_COOKIE, cookie)], Json(json!({"authenticated":true}))).into_response()
+    (
+        [(header::SET_COOKIE, cookie)],
+        Json(json!({"authenticated":true})),
+    )
+        .into_response()
 }
 
 /// POST /api/auth/logout — Session invalidieren + Cookie loeschen.
 pub async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    st.sessions.revoke(cookie_value(&headers, SESSION_COOKIE).as_deref());
+    st.sessions
+        .revoke(cookie_value(&headers, SESSION_COOKIE).as_deref());
     let clear = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
-    ([(header::SET_COOKIE, clear)], Json(json!({"authenticated":false}))).into_response()
+    (
+        [(header::SET_COOKIE, clear)],
+        Json(json!({"authenticated":false})),
+    )
+        .into_response()
 }
 
 /// GET /api/auth/status — fuer UI-Restore nach Reload (Cookie ist httpOnly).
 pub async fn status(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let ok = st.sessions.validate(cookie_value(&headers, SESSION_COOKIE).as_deref());
+    let ok = st
+        .sessions
+        .validate(cookie_value(&headers, SESSION_COOKIE).as_deref());
     Json(json!({ "authenticated": ok })).into_response()
 }
 
@@ -181,7 +196,10 @@ pub async fn require_auth(
     req: Request,
     next: Next,
 ) -> Response {
-    if st.sessions.validate(cookie_value(&headers, SESSION_COOKIE).as_deref()) {
+    if st
+        .sessions
+        .validate(cookie_value(&headers, SESSION_COOKIE).as_deref())
+    {
         next.run(req).await
     } else {
         (
@@ -201,7 +219,10 @@ mod tests {
         let s = SessionStore::new();
         let t = s.create();
         assert!(s.validate(Some(&t)), "frisch gemintet -> gueltig");
-        assert!(!s.validate(Some("nonexistent")), "unbekanntes Token -> ungueltig");
+        assert!(
+            !s.validate(Some("nonexistent")),
+            "unbekanntes Token -> ungueltig"
+        );
         assert!(!s.validate(None), "kein Token -> ungueltig");
         s.revoke(Some(&t));
         assert!(!s.validate(Some(&t)), "revoked -> ungueltig");
@@ -217,7 +238,10 @@ mod tests {
     #[test]
     fn cookie_value_parses_session() {
         let mut h = HeaderMap::new();
-        h.insert(header::COOKIE, "foo=bar; sentinel_session=abc123; baz=qux".parse().unwrap());
+        h.insert(
+            header::COOKIE,
+            "foo=bar; sentinel_session=abc123; baz=qux".parse().unwrap(),
+        );
         assert_eq!(cookie_value(&h, SESSION_COOKIE).as_deref(), Some("abc123"));
         assert_eq!(cookie_value(&h, "missing"), None);
     }

@@ -174,7 +174,7 @@ impl ConsolePlane {
 mod tests {
     use super::*;
 
-    /// Deterministisch-variierter Inhalt (kein uniformes Byte → CDC findet content-defined Grenzen,
+    /// Deterministisch-variierter Inhalt (nicht nur dasselbe Byte → CDC findet content-defined Grenzen,
     /// sodass der geteilte Block in mehrere wiederkehrende Chunks zerfaellt).
     fn varied(len: usize, salt: u32) -> Vec<u8> {
         (0..len as u32)
@@ -197,7 +197,10 @@ mod tests {
         for i in 0..50 {
             plane.ingest(&message(i));
         }
-        assert!(plane.total_blocks() > plane.unique_blocks(), "Wiederholungen existieren");
+        assert!(
+            plane.total_blocks() > plane.unique_blocks(),
+            "Wiederholungen existieren"
+        );
         // Der grosse geteilte Block zerfaellt in mehrere Chunks, die nur EINMAL gespeichert werden
         // → hohe Dedup-Ratio + Byte-Ersparnis (Dedup, zstal auf variiertem Inhalt schwach).
         assert!(
@@ -235,7 +238,10 @@ mod tests {
             }
         }
         let delta = plane.delta(&client_has);
-        assert!(!delta.missing.is_empty(), "es fehlt der neue, eindeutige Block");
+        assert!(
+            !delta.missing.is_empty(),
+            "es fehlt der neue, eindeutige Block"
+        );
         assert!(
             delta.transfer_bytes() * 5 < full_bytes,
             "Delta {} muss deutlich kleiner als Voll-State {} sein",
@@ -254,7 +260,10 @@ mod tests {
         for h in &hashes {
             restored.extend(plane.read_block(h).expect("block present"));
         }
-        assert_eq!(restored, data, "Block-Reassembly muss die Originaldaten ergeben");
+        assert_eq!(
+            restored, data,
+            "Block-Reassembly muss die Originaldaten ergeben"
+        );
     }
 
     #[test]

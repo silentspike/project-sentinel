@@ -56,10 +56,10 @@ pub struct CultureSpec {
     /// Formalitaet (0 = locker/flach, 1 = formell/hierarchisch) → praegt Conscientiousness.
     #[serde(default = "default_culture_axis")]
     pub formality: f32,
-    /// Kollaboration (0 = einzelkaempferisch, 1 = teamzentriert) → praegt Agreeableness.
+    /// Zusammenarbeit (0 = einzelkaempferisch, 1 = teamzentriert) → praegt Agreeableness.
     #[serde(default = "default_culture_axis")]
     pub collaboration: f32,
-    /// Konfliktniveau (0 = harmonisch, 1 = reibungsintensiv) → praegt Neuroticism-Streuung.
+    /// Konfliktniveau (0 = ausgeglichen, 1 = reibungsintensiv) → praegt Neuroticism-Streuung.
     #[serde(default = "default_culture_axis")]
     pub conflict_level: f32,
     /// Innovationsgrad (0 = bewahrend, 1 = experimentierfreudig) → praegt Openness.
@@ -875,7 +875,10 @@ fn effective_mission(spec: &GaiaSpec) -> String {
             spec.company_name
         ),
         CompanyType::Generic => {
-            format!("{} liefert verlaessliche Leistungen fuer ihre Kunden.", spec.company_name)
+            format!(
+                "{} liefert verlaessliche Leistungen fuer ihre Kunden.",
+                spec.company_name
+            )
         }
     }
 }
@@ -938,7 +941,10 @@ fn render_company_context(spec: &GaiaSpec) -> String {
     out.push_str("## Unternehmen\n");
     out.push_str(&format!("- **Standort:** {}\n", spec.city));
     out.push_str(&format!("- **Adresse:** {}\n", spec.address));
-    out.push_str(&format!("- **Typ:** {}\n", company_type_label(&spec.company_type)));
+    out.push_str(&format!(
+        "- **Typ:** {}\n",
+        company_type_label(&spec.company_type)
+    ));
     out.push_str(&format!("- **Mitarbeiter:** {}\n", spec.agent_count));
     out.push_str(&format!(
         "- **Arbeitsmodell:** {}\n\n",
@@ -991,7 +997,7 @@ fn render_company_context(spec: &GaiaSpec) -> String {
         level_label(spec.culture.formality)
     ));
     out.push_str(&format!(
-        "- Kollaboration: {}\n",
+        "- Zusammenarbeit: {}\n",
         level_label(spec.culture.collaboration)
     ));
     out.push_str(&format!(
@@ -1018,7 +1024,13 @@ fn personality_for(seed: u64, id: u16, culture: &CultureSpec) -> AgentPersonalit
     // Globale Streuung: homogen (0.45) bis heterogen (0.80) je nach Diversitaet.
     let base_spread = 0.45 + culture.diversity * 0.35;
     AgentPersonalityToml {
-        openness: score_with(seed, id, "openness", axis_center(culture.innovation), base_spread),
+        openness: score_with(
+            seed,
+            id,
+            "openness",
+            axis_center(culture.innovation),
+            base_spread,
+        ),
         conscientiousness: score_with(
             seed,
             id,
@@ -1459,13 +1471,21 @@ mod tests {
         let ctx = generated
             .file("company-context.md")
             .expect("company-context.md emitted");
-        assert!(ctx.contents.contains("Acme Robotics AG"), "context names the company");
-        assert!(!ctx.contents.contains("PixelPerfekt"), "context is not the default");
+        assert!(
+            ctx.contents.contains("Acme Robotics AG"),
+            "context names the company"
+        );
+        assert!(
+            !ctx.contents.contains("PixelPerfekt"),
+            "context is not the default"
+        );
         assert!(ctx.contents.contains("## Mission & Werte"));
         assert!(ctx.contents.contains("## Organigramm"));
         assert!(ctx.contents.contains("## Kultur"));
         // Mission aus example()-Spec uebernommen (nicht aus company_type abgeleitet).
-        assert!(ctx.contents.contains("Digitale Produkte mit Handwerks-Qualitaet"));
+        assert!(ctx
+            .contents
+            .contains("Digitale Produkte mit Handwerks-Qualitaet"));
     }
 
     #[test]
@@ -1480,7 +1500,10 @@ mod tests {
         let generated = generate(spec).unwrap();
         let ctx = &generated.file("company-context.md").unwrap().contents;
         assert!(ctx.contains("Werk Nord GmbH"));
-        assert!(ctx.contains("fertigt Produkte"), "mission derived from Manufacturing type");
+        assert!(
+            ctx.contains("fertigt Produkte"),
+            "mission derived from Manufacturing type"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Event-Stream-Push (#432): subscribt den Engine-Event-Bus (NATS JetStream `SENTINEL_EVENTS`)
+//! Event-Stream-Push (#432): liest den Engine-Event-Bus (NATS JetStream `SENTINEL_EVENTS`)
 //! und pusht bei jeder agent-relevanten Engine-Aenderung einen `agent_live`-Frame in den
 //! Broadcast-Kanal — ersetzt das alte 1s-Projection-Polling (kein Poll, idle ~0 Arbeit).
 //!

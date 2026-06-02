@@ -1837,7 +1837,14 @@ mod config_apply_helper_tests {
     #[test]
     fn apply_identity_updates_only_name_and_role_keeps_other_components() {
         let (mut world, _) = create_simulation_world();
-        let entity = spawn_agent(&mut world, AgentId(1), "Alt Name", "Alte Rolle", 1, "empfang");
+        let entity = spawn_agent(
+            &mut world,
+            AgentId(1),
+            "Alt Name",
+            "Alte Rolle",
+            1,
+            "empfang",
+        );
 
         let pcfg = sentinel_common::agent_config::PersonalityConfig {
             openness: 0.42,
