@@ -518,6 +518,10 @@ Spanisch = "Spanisch"
 Empathie = "Empathie"
 Koordination = "Koordination"
 
+# Issue #417 - microVM adapter (German words in Rust doc comments)
+Maschine = "Maschine"     # German: machine (KVM-faehige Maschine)
+simpel = "simpel"         # German: simple
+
 [files]
 extend-exclude = [
     "Cargo.lock",
