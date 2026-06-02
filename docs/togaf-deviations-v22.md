@@ -126,8 +126,8 @@ Each deviation records: **what** the spec says, **what** the code does,
 | Options considered | Option 1: all-Rust/WASM frontend (Leptos/Dioxus) for stack consistency — rejected, the DOM-bridge overhead is against the goal. Option 2: all-JS — rejected, leaves heavy-data and CAS work on the main thread. Option 3: polyglot per layer. DEV-009 chooses Option 3. |
 | Trade-offs | Polyglot maximizes per-layer performance and reuses the proven 1:n-pointer/dedup engine (massive redundancy in agent conversations dedupes hard), at the cost of a TS/Rust boundary that must be kept narrow (only data crosses, not DOM logic). |
 | Why | Maintainer decision 2026-05-30: polyglot, best-of-all-worlds; the goal is overhead/IO/performance maximization. noaide/PixelPerfekt are UI-pattern references, not code ports. |
-| Consequences | New console frontend (SolidJS + Rust/WASM workers + WebGL), own tiling engine (niri/Hyprland style), CAS console data plane on `sentinel-fs`, WebTransport push replacing the 1s-poll dashboard. Existing dashboard phased out at parity, not destroyed. |
-| Files | `docs/gaia-console-architecture.md` (SSOT), `crates/sentinel-fs/`, `dashboard/` (phased migration), #430, #431, #432, #433 |
+| Consequences | New console frontend (SolidJS + Rust/WASM workers + WebGL), own tiling engine (niri/Hyprland style), CAS console data plane on `sentinel-fs`, WebTransport push replacing the 1s-poll dashboard. The Bun dashboard was removed after view parity verification in #433. |
+| Files | `docs/gaia-console-architecture.md` (SSOT), `crates/sentinel-fs/`, `console/`, `services/sentinel-dashboard-backend/`, #430, #431, #432, #433 |
 | Revisit when | DOM-bridge cost of Rust/WASM UI frameworks drops to parity with JS; or the data plane shows that a simpler transport suffices |
 
 ---

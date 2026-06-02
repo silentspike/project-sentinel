@@ -5,7 +5,7 @@ import { createStore, produce } from "solid-js/store";
 // Operationen (split/resize/close/openPanel) sind reine Baum-Transformationen im SolidJS-Store
 // → fine-grained reaktiv, kein Voll-Rerender.
 
-export type PanelKind = "agents" | "floorplan" | "metrics" | "cockpit" | "activity" | "chaos" | "control" | "chat";
+export type PanelKind = "agents" | "floorplan" | "metrics" | "cockpit" | "activity" | "chaos" | "chat" | "control" | "timetravel";
 export type SplitDir = "row" | "col";
 
 export interface LeafNode {

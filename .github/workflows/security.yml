@@ -48,7 +48,7 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
 
-  npm-audit:
+  console-audit:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -57,8 +57,8 @@ jobs:
           curl -fsSL https://bun.sh/install | bash
           echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
       - name: Install dependencies
-        working-directory: dashboard
+        working-directory: console
         run: bun install --frozen-lockfile
       - name: Audit
-        working-directory: dashboard
+        working-directory: console
         run: bun pm audit 2>/dev/null || echo "Audit completed"

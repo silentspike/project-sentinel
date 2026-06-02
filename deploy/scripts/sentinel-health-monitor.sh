@@ -140,6 +140,12 @@ check_http_health() {
         "http://localhost:${port}${path}" >/dev/null 2>&1
 }
 
+check_https_health() {
+    local port="$1" path="$2"
+    curl -skf --connect-timeout 3 --max-time "$CURL_TIMEOUT" \
+        "https://localhost:${port}${path}" >/dev/null 2>&1
+}
+
 check_nats_health() {
     curl -sf --connect-timeout 3 --max-time "$CURL_TIMEOUT" \
         "http://localhost:8222/healthz" >/dev/null 2>&1
@@ -205,6 +211,11 @@ check_service() {
                 check_http_health "$port" "$path" && is_ok=true
             fi
             ;;
+        https)
+            if check_systemd_unit "$unit"; then
+                check_https_health "$port" "$path" && is_ok=true
+            fi
+            ;;
         nats)
             if check_systemd_unit "$unit"; then
                 check_nats_health && is_ok=true
@@ -252,7 +263,7 @@ main() {
         "projection:sentinel-projection.service:systemd:::5"
         "nats:nats-server.service:nats:::5"
         "cortex:sentinel-gateway.service:http:8080:/health:5"
-        "dashboard:sentinel-dashboard.service:http:8000:/api/health:3"
+        "dashboard-backend:sentinel-dashboard-backend.service:https:8001:/api/health:3"
         "judge:sentinel-judge.service:http:8082:/health:3"
         "nats-bridge:sentinel-nats-bridge.service:http:8083:/health:3"
     )

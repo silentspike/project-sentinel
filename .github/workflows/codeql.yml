@@ -7,7 +7,7 @@ on:
       - 'cmd/**'
       - 'pkg/**'
       - 'services/**'
-      - 'dashboard/**'
+      - 'console/**'
       - '.github/codeql/**'
       - '.github/workflows/codeql.yml'
   pull_request:
@@ -16,7 +16,7 @@ on:
       - 'cmd/**'
       - 'pkg/**'
       - 'services/**'
-      - 'dashboard/**'
+      - 'console/**'
       - '.github/codeql/**'
       - '.github/workflows/codeql.yml'
   schedule:
@@ -61,13 +61,13 @@ jobs:
         with:
           category: go
 
-  # Dashboard analysis. Bun/TSX is reported as javascript-typescript.
+  # Console analysis. Bun/TSX is reported as javascript-typescript.
   # JavaScript/TypeScript only supports build-mode: none (CodeQL extracts
   # source directly without compilation). We still install dependencies
   # and run typecheck so any imported TypeScript files reachable through
   # the dependency graph are present on disk for the extractor.
-  analyze-dashboard:
-    name: CodeQL (Dashboard)
+  analyze-console:
+    name: CodeQL (Console)
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -83,8 +83,8 @@ jobs:
         with:
           bun-version: 1.1.30
 
-      - name: Install dashboard dependencies + typecheck
-        working-directory: dashboard
+      - name: Install console dependencies + typecheck
+        working-directory: console
         run: |
           set -euo pipefail
           bun install --frozen-lockfile
@@ -98,4 +98,6 @@ jobs:
 
       - uses: github/codeql-action/analyze@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
         with:
+          # Keep the historical CodeQL category stable so GitHub code scanning
+          # can compare PR findings against main while this job now scans console/.
           category: dashboard

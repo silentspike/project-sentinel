@@ -10,7 +10,7 @@ implementation work stays in follow-up issues.
 ## Scope
 
 This threat model covers the Project Sentinel runtime and control plane:
-agents, the Cortex Gateway, the daemon/operator APIs, the dashboard/projection
+agents, the Cortex Gateway, the daemon/operator APIs, the console/projection
 read side, the event/snapshot stores, sentinel-fs, sandboxed tool execution, and
 the dependency/build pipeline.
 
@@ -23,10 +23,10 @@ and implementation of new mitigations.
 | --- | --- | --- |
 | Agent identity, persona, bio-state, mood, perception, episodic/semantic memory | Core simulation integrity; poisoned state can steer future behavior | `config/agents/`, `crates/sentinel-bio/`, `crates/sentinel-hippocampus/`, `services/sentinel-nightrun/` |
 | Event Store, Outbox, snapshots, deterministic replay hashes | Audit trail and time-machine trust boundary | `crates/sentinel-limbo/`, daemon runtime, nightrun replay |
-| Operator API, dashboard controls, restore/control endpoints | Human control plane; misuse can alter or reset the simulation | `services/sentinel-daemon/`, `dashboard/`, projection DB |
+| Operator API, console controls, restore/control endpoints | Human control plane; misuse can alter or reset the simulation | `services/sentinel-daemon/`, `services/sentinel-dashboard-backend/`, `console/`, projection DB |
 | Cortex Gateway auth, prompt compiler, provider credentials, LLM responses | Boundary between diegetic simulation and external model providers | `cmd/cortex-gateway/`, provider registry, prompt compiler |
 | sentinel-fs CAS, chunks, trash, agent home mounts | Shared filesystem integrity and cross-agent isolation | `crates/sentinel-fs/`, `crates/sentinel-sandbox/` |
-| Projection DB and dashboard WebSocket/read models | Operator visibility; stale or forged projections hide incidents | `dashboard/data/projection.db`, `dashboard/src/` |
+| Projection DB and console WebTransport/read models | Operator visibility; stale or forged projections hide incidents | `/opt/sentinel/data/projection.db`, `services/sentinel-dashboard-backend/`, `console/src/` |
 | Sandbox/runtime/kernel primitives | Last line between untrusted tool code and host resources | bwrap, Landlock, cgroups, netns, Wasmtime, eBPF, FUSE |
 | CI, release artifacts, dependency graph | Supply-chain trust root for binaries and deployed services | GitHub Actions, Cargo, Go, Bun/npm, Wasmtime, aya, system packages |
 
@@ -83,7 +83,7 @@ network, API, dashboard, filesystem, or host-service boundaries.
 
 ### Attack Vectors
 
-- Unauthorized dashboard/operator API access, including restore/control routes.
+- Unauthorized console/operator API access, including restore/control routes.
 - WebSocket or projection-read abuse to exhaust SQLite/WAL readers or hide
   operational state.
 - Request smuggling or malformed JSON against the dashboard, daemon, or gateway.
@@ -166,15 +166,15 @@ Landlock, FUSE, eBPF, SQLite/Limbo integration.
 | P0 | Capability-based tool permissions plus server-side action validation | Compromised agent / prompt injection | #391 implemented for Gateway action extraction; memory provenance remains future work |
 | P1 | Unsafe audit with SAFETY justifications and CI threshold | Supply-chain and kernel-adjacent memory-safety regressions | #392 |
 | P1 | Formal verification for critical Event Store, snapshot, and bio invariants | State corruption that normal tests may miss | #393 |
-| P2 | Operator/dashboard auth hardening before broad exposure | External attacker control-plane abuse | #402 implemented: server-side session store + httpOnly+SameSite=Strict cookie (operator key no longer JS-readable). Residual: see Accepted Residual Risks |
+| P2 | Operator/console auth hardening before broad exposure | External attacker control-plane abuse | #402 implemented: server-side session store + httpOnly+SameSite=Strict cookie (operator key no longer JS-readable). Residual: see Accepted Residual Risks |
 | P2 | Release provenance and artifact integrity policy | Supply-chain substitution | Future issue before public release hardening |
 
 ## Accepted Residual Risks
 
 | Risk | Attacker class | Why accepted (current) | Direktive / Revisit |
 | --- | --- | --- | --- |
-| Operator key (login POST body) and session cookie transit in cleartext over HTTP on the deploy VM (`:8000`, LAN) → LAN-MITM sniffing | External Attacker (network) | **No regression** — the previous Bearer-header scheme transited over the same HTTP. The deploy VM is a loopback/LAN single-operator setup. Same-origin + `SameSite=Strict` block cross-site CSRF; `textContent`-only frontend minimizes XSS. | Production exposure MUST sit behind an HTTPS-terminating proxy; then set `DASHBOARD_COOKIE_SECURE=on` (or `auto` detects HTTPS via `X-Forwarded-Proto`) so the cookie carries the `Secure` flag. Revisit when the public exposure model is finalized. |
-| Dashboard WebSocket (`/ws`, `ws.ts`) is intentionally unauthenticated | External Attacker (network) | **By design, no regression.** The WS pushes read-only telemetry only — it performs **no** state changes. All control actions (pause/resume/provider/restore/chaos/stimulus/snapshot) go through `/api/control/*` with `requireAuth` (session cookie). Reading telemetry is not a control-plane capability. | Add WS auth only if telemetry is later classified sensitive or if write-paths are ever added to the socket. |
+| Operator key (login POST body) and session cookie transit over the deploy VM console endpoint (`:8001`, LAN) | External Attacker (network) | Console traffic is HTTPS with a self-signed certificate for the single-operator LAN setup. Same-origin + `SameSite=Strict` block cross-site CSRF; `textContent`-only frontend minimizes XSS. | Production exposure MUST sit behind an HTTPS-terminating proxy or CA-issued cert; keep `DASHBOARD_COOKIE_SECURE=on`. Revisit when the public exposure model is finalized. |
+| Console WebTransport telemetry | External Attacker (network) | WebTransport uses the same HTTPS origin and requires an authenticated one-time ticket. All control actions (pause/resume/provider/restore/chaos/stimulus/snapshot) go through `/api/control/*` with `require_auth` (session cookie). | Revisit if telemetry is later classified sensitive beyond the operator-console trust boundary. |
 
 ## Operating Rule
 
