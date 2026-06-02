@@ -3117,10 +3117,13 @@ fn ecs_tick_loop(
                     crate::platform_controlplane::rules::PlatformSideEffect::TriggerPrune(
                         _cutoff,
                     ) => {
-                        // Auto-detect cutoff: nutze bestehenden SnapshotManager
+                        // Auto-detect cutoff: behalte die 2 neuesten World-Snapshots (Restore-Puffer),
+                        // prune alle Events davor. list_world_snapshots() liefert ORDER BY tick DESC,
+                        // also ist der zweitneueste Snapshot Index 1 (NICHT len-2 = zweitältester — #475:
+                        // der Index-Bug ergab einen uralten cutoff < min(event_id) → prune loeschte nie etwas).
                         if let Ok(snapshots) = event_store_for_prune.list_world_snapshots() {
                             if snapshots.len() >= 2 {
-                                let prune_point = snapshots[snapshots.len() - 2].last_event_id;
+                                let prune_point = snapshots[1].last_event_id;
                                 snapshot_manager.start_prune(prune_point);
                             }
                         }

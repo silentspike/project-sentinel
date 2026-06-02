@@ -13,6 +13,13 @@ func TestBuildEventSubject(t *testing.T) {
 		{"agent_action_received", "AGENT-07", "sentinel.events.agent_action_received.AGENT-07"},
 		{"agent_chat", "AGENT-12", "sentinel.events.agent_chat.AGENT-12"},
 		{"bio_state_updated", "AGENT-01", "sentinel.events.bio_state_updated.AGENT-01"},
+		// #475: display-name aggregate IDs (spaces) must be sanitized, not break the subject.
+		{"platform_intervention", "Michael Hartmann", "sentinel.events.platform_intervention.Michael_Hartmann"},
+		{"platform_intervention", "Thomas Mueller", "sentinel.events.platform_intervention.Thomas_Mueller"},
+		{"platform_intervention", "system", "sentinel.events.platform_intervention.system"},
+		// Reserved NATS chars in either token must not leak into the subject.
+		{"weird.type", "a*b>c d", "sentinel.events.weird_type.a_b_c_d"},
+		{"agent_spawned", "", "sentinel.events.agent_spawned._"},
 	}
 
 	for _, tt := range tests {
