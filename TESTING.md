@@ -15,16 +15,16 @@
 |-------|---------|-------------|---------------|
 | **Static (Rust)** | `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings` | CI (self-hosted) | CI log |
 | **Static (Go)** | `cd cmd/cortex-gateway && go vet ./... && golangci-lint run` | CI (self-hosted) | CI log |
-| **Static (Dashboard)** | `cd dashboard && bun run typecheck` | CI (self-hosted) | CI log |
+| **Static (Console)** | `cd console && bun run typecheck` | CI (self-hosted) | CI log |
 | **Unit (Rust)** | `cargo test --workspace` | CI (self-hosted) | CI log / cargo-nextest report |
 | **Unit (Go)** | `cd cmd/cortex-gateway && go test -race -count=1 ./...` | CI (self-hosted) | CI log |
-| **Unit (Dashboard)** | `cd dashboard && bun test` | CI (self-hosted) | CI log |
+| **Unit (Console)** | `cd console && bun test` | CI (self-hosted) | CI log |
 | **Integration** | `cargo test --workspace --features integration` | CI with NATS/Zenoh | CI log |
 | **Security (Rust)** | `cargo audit` | CI | `deny.toml` advisories |
 | **Security (Go)** | `govulncheck ./...` | CI | CI log |
-| **Security (Dashboard)** | `cd dashboard && bun audit` | CI | CI log |
+| **Security (Console)** | `cd console && bun audit` | CI | CI log |
 | **System/Artifact** | Deploy binary to VM, `curl -sf http://localhost:8080/health` | VM <deploy-vm> | Health response + journalctl |
-| **E2E/Smoke** | `cd tests/e2e && bun test` (playwright-cli based) | VM <deploy-vm> + browser | Screenshots + test report |
+| **E2E/Smoke** | View-specific Playwright smoke scripts under `console/evidence/` | VM <deploy-vm> + browser | Screenshots + smoke summary |
 
 ## Rules
 

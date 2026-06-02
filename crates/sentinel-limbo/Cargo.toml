@@ -30,3 +30,6 @@ criterion = { workspace = true }
 [[bench]]
 name = "event_store_bench"
 harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

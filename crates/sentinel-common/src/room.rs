@@ -3,12 +3,12 @@
 //! Parses `config/rooms.toml` and provides validated building/room data.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Raum-Typ im Bürogebäude
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoomType {
     Office,
@@ -20,7 +20,7 @@ pub enum RoomType {
 }
 
 /// Konfiguration eines einzelnen Raums aus rooms.toml
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoomConfig {
     pub id: String,
     pub name: String,
@@ -28,7 +28,7 @@ pub struct RoomConfig {
     pub capacity: u16,
     pub room_type: RoomType,
     pub adjacent: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub department: Option<String>,
     #[serde(default)]
     pub has_coffee_machine: bool,
@@ -37,7 +37,7 @@ pub struct RoomConfig {
 }
 
 /// Gebäude-Metadaten
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuildingMeta {
     pub name: String,
     pub address: String,
@@ -45,7 +45,7 @@ pub struct BuildingMeta {
 }
 
 /// Top-level Config aus rooms.toml
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuildingConfig {
     pub building: BuildingMeta,
     pub rooms: Vec<RoomConfig>,
@@ -227,6 +227,19 @@ mod tests {
         // Gebäudename korrekt
         assert_eq!(config.building.name, "PixelPerfekt GmbH");
         assert_eq!(config.building.floors, 2);
+    }
+
+    #[test]
+    fn building_config_toml_round_trip() {
+        // #425: Serialize muss fuer config_dir-Write-Back round-trippen.
+        let original = load_test_config();
+        let serialized = toml::to_string(&original).expect("serialize BuildingConfig to TOML");
+        let reparsed: BuildingConfig =
+            toml::from_str(&serialized).expect("re-parse serialized BuildingConfig");
+        assert_eq!(
+            original, reparsed,
+            "BuildingConfig TOML round-trip must be identical"
+        );
     }
 
     #[test]

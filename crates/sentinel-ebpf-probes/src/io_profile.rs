@@ -44,12 +44,18 @@ pub fn io_profile_probe(ctx: TracePointContext) -> u32 {
 
 #[inline(always)]
 fn try_io_profile(ctx: TracePointContext) -> Result<u32, u32> {
+    // SAFETY: this helper is called from a verified eBPF tracepoint context
+    // where `bpf_get_current_cgroup_id` is available and has no Rust-side
+    // memory preconditions.
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
 
     // Read the request bytes and rwbs (read/write flag) from tracepoint args.
     // block_rq_complete format: dev, sector, nr_sector, errors, rwbs
     // rwbs offset in trace event struct is typically at offset 32.
+    // SAFETY: the offsets match the documented tracepoint layout used by this
+    // probe; `read_at` returns an error if the verifier/runtime cannot read it.
     let nr_sector: u32 = unsafe { ctx.read_at(24).map_err(|_| 0u32)? };
+    // SAFETY: same tracepoint-layout reasoning as `nr_sector` above.
     let rwbs: u8 = unsafe { ctx.read_at(32).map_err(|_| 0u32)? };
     let bytes = (nr_sector as u64) * 512;
 
@@ -57,6 +63,8 @@ fn try_io_profile(ctx: TracePointContext) -> Result<u32, u32> {
 
     // Get or create entry for this cgroup.
     if let Some(stats) = IO_STATS.get_ptr_mut(&cgroup_id) {
+        // SAFETY: aya returns a verifier-checked mutable map-value pointer for
+        // this key; the pointer remains valid for this helper invocation.
         let stats = unsafe { &mut *stats };
         if is_write {
             stats.write_ops += 1;

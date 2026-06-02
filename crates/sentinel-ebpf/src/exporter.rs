@@ -92,6 +92,8 @@ impl MetricsExporter {
         output.push_str("# TYPE sentinel_llm_requests_total counter\n");
         output.push_str("# HELP sentinel_llm_errors_total Total LLM API errors\n");
         output.push_str("# TYPE sentinel_llm_errors_total counter\n");
+        output.push_str("# HELP sentinel_llm_bytes_total LLM API network bytes\n");
+        output.push_str("# TYPE sentinel_llm_bytes_total counter\n");
 
         for (dest, metrics) in monitor.all_metrics() {
             if let Some(avg) = metrics.avg_latency() {
@@ -108,6 +110,14 @@ impl MetricsExporter {
             output.push_str(&format!(
                 "sentinel_llm_errors_total{{destination=\"{}\"}} {}\n",
                 dest, metrics.error_count
+            ));
+            output.push_str(&format!(
+                "sentinel_llm_bytes_total{{destination=\"{}\",direction=\"sent\"}} {}\n",
+                dest, metrics.bytes_sent
+            ));
+            output.push_str(&format!(
+                "sentinel_llm_bytes_total{{destination=\"{}\",direction=\"received\"}} {}\n",
+                dest, metrics.bytes_received
             ));
         }
 
@@ -258,6 +268,14 @@ impl MetricsExporter {
                 "sentinel_llm_errors_total{{destination=\"{}\"}} {}\n",
                 net.destination, net.error_count
             ));
+            output.push_str(&format!(
+                "sentinel_llm_bytes_total{{destination=\"{}\",direction=\"sent\"}} {}\n",
+                net.destination, net.bytes_sent
+            ));
+            output.push_str(&format!(
+                "sentinel_llm_bytes_total{{destination=\"{}\",direction=\"received\"}} {}\n",
+                net.destination, net.bytes_received
+            ));
         }
 
         // PSI metrics from snapshot.
@@ -316,8 +334,14 @@ mod tests {
         let output = MetricsExporter::export_network(&monitor);
         assert!(output.contains("# HELP sentinel_llm_request_duration_seconds"));
         assert!(output.contains("# TYPE sentinel_llm_request_duration_seconds summary"));
+        assert!(output.contains("# HELP sentinel_llm_bytes_total"));
+        assert!(output.contains("# TYPE sentinel_llm_bytes_total counter"));
         assert!(output.contains("destination=\"api.anthropic.com:443\""));
         assert!(output.contains("0.150000"));
+        assert!(output
+            .contains("sentinel_llm_bytes_total{destination=\"api.anthropic.com:443\",direction=\"sent\"} 1024"));
+        assert!(output
+            .contains("sentinel_llm_bytes_total{destination=\"api.anthropic.com:443\",direction=\"received\"} 4096"));
     }
 
     #[test]
@@ -458,6 +482,10 @@ mod tests {
         assert!(output.contains("cgroup_name=\"agent-01\""));
         assert!(output
             .contains("sentinel_llm_requests_total{destination=\"api.anthropic.com:443\"} 10"));
+        assert!(output
+            .contains("sentinel_llm_bytes_total{destination=\"api.anthropic.com:443\",direction=\"sent\"} 10240"));
+        assert!(output
+            .contains("sentinel_llm_bytes_total{destination=\"api.anthropic.com:443\",direction=\"received\"} 40960"));
         assert!(output.contains("sentinel_agent_cpu_pressure_stress{agent=\"AGENT-01\"}"));
     }
 }

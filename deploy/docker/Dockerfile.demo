@@ -22,10 +22,10 @@
 # The image bundles:
 #   - sentinel-daemon (Rust)         operator API on :8084
 #   - sentinel-nightrun (Rust)       one-shot batch
+#   - sentinel-dashboard-backend     SolidJS console + WebTransport on :8001
 #   - cortex-gateway  (Go)           proxy on :8080, control on :8081, metrics on :9090
 #   - sentinel-judge  (Go)           health on :8082
 #   - sentinel-nats-bridge (Go)      health on :8083
-#   - sentinel-dashboard (Bun)       UI on :8000
 #
 # An entrypoint script (`/usr/local/bin/sentinel-demo-entrypoint`) selects
 # which binary to run based on the `SENTINEL_ROLE` environment variable.
@@ -40,7 +40,8 @@ FROM debian:bookworm-slim AS rust-binaries
 COPY target/release/sentinel-daemon     /out/sentinel-daemon
 COPY target/release/sentinel-nightrun   /out/sentinel-nightrun
 COPY target/release/sentinel-projection /out/sentinel-projection
-RUN chmod +x /out/sentinel-daemon /out/sentinel-nightrun /out/sentinel-projection
+COPY target/release/sentinel-dashboard-backend /out/sentinel-dashboard-backend
+RUN chmod +x /out/sentinel-daemon /out/sentinel-nightrun /out/sentinel-projection /out/sentinel-dashboard-backend
 
 # ---------------------------------------------------------------------------
 # Stage 2: Go build (gateway + judge + nats-bridge)
@@ -65,19 +66,19 @@ RUN go build -trimpath -ldflags="-s -w" \
         -o /out/sentinel-nats-bridge ./services/sentinel-nats-bridge
 
 # ---------------------------------------------------------------------------
-# Stage 3: Bun (dashboard) — fetch deps + sanity-check TypeScript
+# Stage 3: Console — build SolidJS static bundle
 # ---------------------------------------------------------------------------
-FROM oven/bun:1 AS bun-builder
+FROM oven/bun:1 AS console-builder
 
-WORKDIR /src/dashboard
-COPY dashboard/package.json dashboard/bun.lock ./
+WORKDIR /src/console
+COPY console/package.json console/bun.lock ./
 RUN bun install --frozen-lockfile
 
-COPY dashboard/ ./
-RUN bun run typecheck
+COPY console/ ./
+RUN bun run typecheck && bun run build
 
 # ---------------------------------------------------------------------------
-# Stage 4: Runtime — debian-slim with all binaries + Bun runtime
+# Stage 4: Runtime — debian-slim with service binaries + console bundle
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
@@ -88,21 +89,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         unzip xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Bun runtime for the dashboard
-RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.1.30" && \
-    mv /root/.bun/bin/bun /usr/local/bin/bun && \
-    chmod +x /usr/local/bin/bun
-
 # Service binaries
 COPY --from=rust-binaries /out/sentinel-daemon          /usr/local/bin/
 COPY --from=rust-binaries /out/sentinel-nightrun        /usr/local/bin/
 COPY --from=rust-binaries /out/sentinel-projection      /usr/local/bin/
+COPY --from=rust-binaries /out/sentinel-dashboard-backend /usr/local/bin/
 COPY --from=go-builder    /out/cortex-gateway           /usr/local/bin/
 COPY --from=go-builder    /out/sentinel-judge           /usr/local/bin/
 COPY --from=go-builder    /out/sentinel-nats-bridge     /usr/local/bin/
 
-# Dashboard runtime tree (with node_modules)
-COPY --from=bun-builder  /src/dashboard /opt/sentinel/dashboard
+# Console static bundle served by sentinel-dashboard-backend
+COPY --from=console-builder /src/console/dist /opt/sentinel/console-dist
 
 # Configuration tree (overridden via volume in compose)
 COPY config/ /opt/sentinel/config-default/
@@ -115,7 +112,7 @@ COPY deploy/docker/sentinel-demo-entrypoint.sh /usr/local/bin/sentinel-demo-entr
 RUN chmod +x /usr/local/bin/sentinel-demo-entrypoint
 
 # Writable runtime dirs (avoid bash brace-expansion: debian-slim has dash)
-RUN mkdir -p /opt/sentinel/data /opt/sentinel/fs /opt/sentinel/logs && \
+RUN mkdir -p /opt/sentinel/data /opt/sentinel/fs /opt/sentinel/logs /opt/sentinel/console-cert && \
     useradd -r -u 65001 -d /opt/sentinel sentinel && \
     chown -R sentinel:sentinel /opt/sentinel
 

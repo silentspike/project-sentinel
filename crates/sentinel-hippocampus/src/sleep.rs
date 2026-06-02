@@ -4,6 +4,7 @@
 //! from the day are scored, selected, and consolidated into long-term storage.
 
 use crate::episode::{nmda_score, Episode};
+use crate::selection::{NMDA_CONSOLIDATION_THRESHOLD, NMDA_MAX_CONSOLIDATION_EPISODES};
 
 /// Sleep cycle phases representing different stages of memory processing.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,15 +41,15 @@ pub struct SleepCycle {
 impl SleepCycle {
     /// Create a new sleep cycle with default parameters.
     ///
-    /// Default threshold: 0.1, max episodes: 10
+    /// Default threshold: calibrated NMDA profile, max episodes: 10.
     pub fn new(agent_name: &str) -> Self {
         Self {
             agent_name: agent_name.to_string(),
             phase: SleepPhase::Awake,
             episodes: Vec::new(),
             selected: Vec::new(),
-            consolidation_threshold: 0.05,
-            max_consolidation_episodes: 10,
+            consolidation_threshold: NMDA_CONSOLIDATION_THRESHOLD,
+            max_consolidation_episodes: NMDA_MAX_CONSOLIDATION_EPISODES,
             consolidated_narrative: None,
         }
     }
@@ -286,10 +287,20 @@ mod tests {
     }
 
     #[test]
+    fn test_default_selection_uses_calibrated_profile() {
+        let cycle = SleepCycle::new("Thomas");
+        assert_eq!(cycle.consolidation_threshold, NMDA_CONSOLIDATION_THRESHOLD);
+        assert_eq!(
+            cycle.max_consolidation_episodes,
+            NMDA_MAX_CONSOLIDATION_EPISODES
+        );
+    }
+
+    #[test]
     fn test_wake_up_clears_state() {
         let mut cycle = SleepCycle::new("Thomas");
 
-        let episodes = vec![make_episode(1, "Test", 0.5, 0.5, 1, 1.0)];
+        let episodes = vec![make_episode(1, "Test", 0.8, 0.7, 1, 1.0)];
 
         cycle.begin_sleep();
         cycle.add_episodes(episodes);

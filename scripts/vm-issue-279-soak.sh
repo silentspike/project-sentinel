@@ -41,7 +41,7 @@ print("{expected}\t{runtime}\t{projection}\t{cgroups}\t{stale}\t{orphans}\t{zomb
 }
 
 api_agents() {
-  curl -s http://127.0.0.1:8000/api/agents \
+  curl -ks -b "${DASHBOARD_COOKIE_JAR:-/tmp/sentinel-console.cookie}" https://127.0.0.1:8001/api/agents \
     | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))'
 }
 

@@ -669,7 +669,7 @@ fn bench_production_scenario(c: &mut Criterion) {
         )
     });
 
-    // 54-agent retrieval sweep (dashboard/monitoring use case)
+    // 54-agent retrieval sweep (console/monitoring use case)
     {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bench-prod-retrieve.redb");

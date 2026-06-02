@@ -5,6 +5,7 @@
 //! eingefuegt werden.
 
 use sentinel_common::components::{BioState, Personality, Position};
+use std::fmt::Write as _;
 
 /// Geruchsereignis aus der Physics-Engine
 #[derive(Debug, Clone)]
@@ -19,7 +20,7 @@ pub struct SmellEvent {
 }
 
 /// Generierte Wahrnehmungstexte (ohne Metadaten wie agent_id/timestamp)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PerceptionTexts {
     pub circadian_text: String,
     pub body_text: String,
@@ -27,6 +28,17 @@ pub struct PerceptionTexts {
     pub acoustic_text: String,
     pub presence_text: String,
     pub impulse_text: String,
+}
+
+impl PerceptionTexts {
+    pub fn clear(&mut self) {
+        self.circadian_text.clear();
+        self.body_text.clear();
+        self.environment_text.clear();
+        self.acoustic_text.clear();
+        self.presence_text.clear();
+        self.impulse_text.clear();
+    }
 }
 
 /// Generiert Wahrnehmungstexte aus ECS-Zustandsdaten.
@@ -47,194 +59,263 @@ pub fn generate_perception(
     sim_time: &str,
     focus_hours: f32,
 ) -> PerceptionTexts {
+    let mut perception = PerceptionTexts::default();
+    generate_perception_into(
+        &mut perception,
+        bio,
+        _position,
+        personality,
+        room_noise_db,
+        room_temp_c,
+        room_co2_ppm,
+        room_smells,
+        present_agents,
+        sim_time,
+        focus_hours,
+    );
+    perception
+}
+
+/// Generiert Wahrnehmungstexte in wiederverwendete String-Buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_perception_into(
+    perception: &mut PerceptionTexts,
+    bio: &BioState,
+    _position: &Position,
+    personality: &Personality,
+    room_noise_db: f32,
+    room_temp_c: f32,
+    room_co2_ppm: f32,
+    room_smells: &[SmellEvent],
+    present_agents: &[(String, String)],
+    sim_time: &str,
+    focus_hours: f32,
+) {
+    perception.clear();
+
     // Circadian
-    let circadian_text = format!(
+    write!(
+        perception.circadian_text,
         "{} (Du arbeitest seit {:.0}h konzentriert)",
         sim_time, focus_hours
-    );
+    )
+    .expect("writing to String cannot fail");
 
     // Koerperwahrnehmung
-    let body_text = generate_body_text(bio, personality);
+    generate_body_text_into(&mut perception.body_text, bio, personality);
 
     // Umgebung (Temperatur, CO2, Gerueche)
-    let environment_text = generate_environment_text(room_temp_c, room_co2_ppm, room_smells);
+    generate_environment_text_into(
+        &mut perception.environment_text,
+        room_temp_c,
+        room_co2_ppm,
+        room_smells,
+    );
 
     // Akustik
-    let acoustic_text = generate_acoustic_text(room_noise_db);
+    generate_acoustic_text_into(&mut perception.acoustic_text, room_noise_db);
 
     // Anwesende
-    let presence_text = generate_presence_text(present_agents);
+    generate_presence_text_into(&mut perception.presence_text, present_agents);
 
     // Impuls
-    let impulse_text = generate_impulse_text(bio, personality);
-
-    PerceptionTexts {
-        circadian_text,
-        body_text,
-        environment_text,
-        acoustic_text,
-        presence_text,
-        impulse_text,
-    }
+    generate_impulse_text_into(&mut perception.impulse_text, bio, personality);
 }
 
 /// Formatiert Wahrnehmungstexte als `[SYSTEM_INJECTION]` Block fuer LLM-Prompts.
 ///
 /// Nur nicht-leere Felder werden aufgenommen (CIRCADIAN ist immer dabei).
 pub fn format_injection(perception: &PerceptionTexts) -> String {
-    let mut lines = Vec::new();
-    lines.push("[SYSTEM_INJECTION]".to_string());
-
-    // CIRCADIAN ist immer dabei
-    lines.push(format!("CIRCADIAN: {}", perception.circadian_text));
+    let mut injection = String::with_capacity(
+        perception.circadian_text.len()
+            + perception.body_text.len()
+            + perception.environment_text.len()
+            + perception.acoustic_text.len()
+            + perception.presence_text.len()
+            + perception.impulse_text.len()
+            + 96,
+    );
+    injection.push_str("[SYSTEM_INJECTION]\nCIRCADIAN: ");
+    injection.push_str(&perception.circadian_text);
 
     if !perception.body_text.is_empty() {
-        lines.push(format!("KOERPER: {}", perception.body_text));
+        append_injection_field(&mut injection, "KOERPER", &perception.body_text);
     }
     if !perception.environment_text.is_empty() {
-        lines.push(format!("ENVIRONMENT: {}", perception.environment_text));
+        append_injection_field(&mut injection, "ENVIRONMENT", &perception.environment_text);
     }
     if !perception.acoustic_text.is_empty() {
-        lines.push(format!("AKUSTIK: {}", perception.acoustic_text));
+        append_injection_field(&mut injection, "AKUSTIK", &perception.acoustic_text);
     }
     if !perception.presence_text.is_empty() {
-        lines.push(format!("ANWESEND: {}", perception.presence_text));
+        append_injection_field(&mut injection, "ANWESEND", &perception.presence_text);
     }
     if !perception.impulse_text.is_empty() {
-        lines.push(format!("IMPULS: {}", perception.impulse_text));
+        append_injection_field(&mut injection, "IMPULS", &perception.impulse_text);
     }
 
-    lines.push("[/SYSTEM_INJECTION]".to_string());
-    lines.join("\n")
+    injection.push_str("\n[/SYSTEM_INJECTION]");
+    injection
 }
 
-/// Generiert Koerperwahrnehmungstext aus Bio-Zustand
-fn generate_body_text(bio: &BioState, personality: &Personality) -> String {
-    let mut parts: Vec<String> = Vec::new();
+fn generate_body_text_into(output: &mut String, bio: &BioState, personality: &Personality) {
+    output.clear();
 
     // Hunger-Schwellenwerte
     if bio.hunger > 90.0 {
-        parts.push("Dir ist schwindelig vor Hunger.".to_string());
+        append_part(output, "Dir ist schwindelig vor Hunger.");
     } else if bio.hunger > 80.0 {
-        parts.push("Dein Magen krampft.".to_string());
+        append_part(output, "Dein Magen krampft.");
     } else if bio.hunger > 70.0 {
-        parts.push("Du koenntest etwas essen.".to_string());
+        append_part(output, "Du koenntest etwas essen.");
     }
 
     // Blasendrang
     if bio.bladder > 90.0 {
-        parts.push("Du musst JETZT zur Toilette.".to_string());
+        append_part(output, "Du musst JETZT zur Toilette.");
     } else if bio.bladder > 80.0 {
-        parts.push("Dringend: Toilette.".to_string());
+        append_part(output, "Dringend: Toilette.");
     } else if bio.bladder > 60.0 {
-        parts.push("Du solltest bald eine Pause einlegen.".to_string());
+        append_part(output, "Du solltest bald eine Pause einlegen.");
     }
 
     // Energie
     if bio.energy < 20.0 {
-        parts.push("Du kannst kaum die Augen offen halten.".to_string());
+        append_part(output, "Du kannst kaum die Augen offen halten.");
     } else if bio.energy < 40.0 {
-        parts.push("Du bist muede.".to_string());
+        append_part(output, "Du bist muede.");
     }
 
     // Stress
     if bio.stress > 80.0 {
-        parts.push("Dein Herz rast.".to_string());
+        append_part(output, "Dein Herz rast.");
     } else if bio.stress > 60.0 {
-        parts.push("Du stehst unter Druck.".to_string());
+        append_part(output, "Du stehst unter Druck.");
     }
 
     // Koffein-Entzug: caffeine_mg < 20.0 UND caffeine_tolerance > 0.3
     if bio.caffeine_mg < 20.0 && personality.caffeine_tolerance > 0.3 {
-        parts.push("Leichte Kopfschmerzen - du brauchst Kaffee.".to_string());
+        append_part(output, "Leichte Kopfschmerzen - du brauchst Kaffee.");
     }
 
     // Gesund (keine Schwellenwerte ueberschritten)
-    if parts.is_empty() {
-        parts.push("Du fuehlst dich gut.".to_string());
+    if output.is_empty() {
+        output.push_str("Du fuehlst dich gut.");
     }
-
-    parts.join(" ")
 }
 
-/// Generiert Umgebungstext aus Temperatur, CO2 und Geruechen
-fn generate_environment_text(temp_c: f32, co2_ppm: f32, smells: &[SmellEvent]) -> String {
-    let mut parts: Vec<String> = Vec::new();
+fn generate_environment_text_into(
+    output: &mut String,
+    temp_c: f32,
+    co2_ppm: f32,
+    smells: &[SmellEvent],
+) {
+    output.clear();
 
     // Temperatur
+    begin_part(output);
     if temp_c > 26.0 {
-        parts.push(format!("Es ist deutlich zu warm ({temp_c:.1} °C)."));
+        write!(output, "Es ist deutlich zu warm ({temp_c:.1} °C).")
+            .expect("writing to String cannot fail");
     } else if temp_c > 24.0 {
-        parts.push(format!("Es ist warm ({temp_c:.1} °C)."));
+        write!(output, "Es ist warm ({temp_c:.1} °C).").expect("writing to String cannot fail");
     } else if temp_c < 17.0 {
-        parts.push(format!("Es ist unangenehm kuehl ({temp_c:.1} °C)."));
+        write!(output, "Es ist unangenehm kuehl ({temp_c:.1} °C).")
+            .expect("writing to String cannot fail");
     } else if temp_c < 19.0 {
-        parts.push(format!("Es ist kuehl ({temp_c:.1} °C)."));
+        write!(output, "Es ist kuehl ({temp_c:.1} °C).").expect("writing to String cannot fail");
     } else {
-        parts.push(format!("Die Temperatur ist angenehm ({temp_c:.1} °C)."));
+        write!(output, "Die Temperatur ist angenehm ({temp_c:.1} °C).")
+            .expect("writing to String cannot fail");
     }
 
     // CO2
     if co2_ppm > 1400.0 {
-        parts.push(format!("Die Luft ist sehr stickig ({co2_ppm:.0} ppm CO2)."));
+        begin_part(output);
+        write!(output, "Die Luft ist sehr stickig ({co2_ppm:.0} ppm CO2).")
+            .expect("writing to String cannot fail");
     } else if co2_ppm > 1000.0 {
-        parts.push(format!("Die Luft ist stickig ({co2_ppm:.0} ppm CO2)."));
+        begin_part(output);
+        write!(output, "Die Luft ist stickig ({co2_ppm:.0} ppm CO2).")
+            .expect("writing to String cannot fail");
     }
 
     // Gerueche (nur intensity > 0.3)
     for smell in smells {
         if smell.intensity > 0.3 {
-            let smell_text = match smell.smell_type.as_str() {
-                "coffee" => "Kaffeeduft.".to_string(),
-                "food" => "Essensgeruch.".to_string(),
-                "perfume" => "Parfuemduft.".to_string(),
-                "printer_toner" => "Tonergeruch.".to_string(),
-                other => format!("Ein Geruch von {}.", other),
-            };
-            parts.push(smell_text);
+            match smell.smell_type.as_str() {
+                "coffee" => append_part(output, "Kaffeeduft."),
+                "food" => append_part(output, "Essensgeruch."),
+                "perfume" => append_part(output, "Parfuemduft."),
+                "printer_toner" => append_part(output, "Tonergeruch."),
+                other => {
+                    begin_part(output);
+                    write!(output, "Ein Geruch von {}.", other)
+                        .expect("writing to String cannot fail");
+                }
+            }
         }
     }
-
-    parts.join(" ")
 }
 
-/// Generiert Akustiktext aus Laermpegel
-fn generate_acoustic_text(noise_db: f32) -> String {
+fn generate_acoustic_text_into(output: &mut String, noise_db: f32) {
+    output.clear();
     match noise_db as u32 {
-        0..=35 => format!("Stille ({noise_db:.0} dB)."),
-        36..=50 => format!("Normales Buerogeraeusch ({noise_db:.0} dB)."),
-        51..=65 => format!("Lebhafte Unterhaltungen ({noise_db:.0} dB)."),
-        _ => format!("Es ist laut ({noise_db:.0} dB). Konzentration faellt schwer."),
+        0..=35 => write!(output, "Stille ({noise_db:.0} dB)."),
+        36..=50 => write!(output, "Normales Buerogeraeusch ({noise_db:.0} dB)."),
+        51..=65 => write!(output, "Lebhafte Unterhaltungen ({noise_db:.0} dB)."),
+        _ => write!(
+            output,
+            "Es ist laut ({noise_db:.0} dB). Konzentration faellt schwer."
+        ),
     }
+    .expect("writing to String cannot fail");
 }
 
-/// Generiert Anwesenheitstext
-fn generate_presence_text(present_agents: &[(String, String)]) -> String {
+fn generate_presence_text_into(output: &mut String, present_agents: &[(String, String)]) {
+    output.clear();
     if present_agents.is_empty() {
-        "Du bist allein.".to_string()
+        output.push_str("Du bist allein.");
     } else {
-        present_agents
-            .iter()
-            .map(|(name, activity)| format!("{} ({})", name, activity))
-            .collect::<Vec<_>>()
-            .join(", ")
+        for (index, (name, activity)) in present_agents.iter().enumerate() {
+            if index > 0 {
+                output.push_str(", ");
+            }
+            write!(output, "{} ({})", name, activity).expect("writing to String cannot fail");
+        }
     }
 }
 
-/// Generiert Impulstext (Prioritaet: Toilette > Hunger > Muedigkeit > Sozial > Ruhe)
-fn generate_impulse_text(bio: &BioState, personality: &Personality) -> String {
+fn generate_impulse_text_into(output: &mut String, bio: &BioState, personality: &Personality) {
+    output.clear();
     if bio.bladder > 85.0 {
-        "Dringendes Beduerfnis, zur Toilette zu gehen.".to_string()
+        output.push_str("Dringendes Beduerfnis, zur Toilette zu gehen.");
     } else if bio.hunger > 85.0 {
-        "Dringendes Beduerfnis, etwas zu essen.".to_string()
+        output.push_str("Dringendes Beduerfnis, etwas zu essen.");
     } else if bio.energy < 25.0 {
-        "Dringendes Beduerfnis, Pause zu machen.".to_string()
+        output.push_str("Dringendes Beduerfnis, Pause zu machen.");
     } else if bio.social_need > 80.0 && personality.extraversion > 0.5 {
-        "Du moechtest mit jemandem reden.".to_string()
+        output.push_str("Du moechtest mit jemandem reden.");
     } else if bio.social_need < 20.0 && personality.extraversion < 0.5 {
-        "Du geniesst die Ruhe.".to_string()
-    } else {
-        String::new()
+        output.push_str("Du geniesst die Ruhe.");
+    }
+}
+
+fn append_injection_field(output: &mut String, label: &str, text: &str) {
+    output.push('\n');
+    output.push_str(label);
+    output.push_str(": ");
+    output.push_str(text);
+}
+
+fn append_part(output: &mut String, text: &str) {
+    begin_part(output);
+    output.push_str(text);
+}
+
+fn begin_part(output: &mut String) {
+    if !output.is_empty() {
+        output.push(' ');
     }
 }
 
@@ -279,6 +360,92 @@ mod tests {
             transit_pause_tick: 0,
             transit_source: None,
         }
+    }
+
+    #[test]
+    fn test_generate_perception_into_reuses_output_buffers() {
+        let mut bio = default_bio();
+        bio.hunger = 95.0;
+        bio.bladder = 95.0;
+        bio.caffeine_mg = 50.0;
+        bio.social_need = 90.0;
+        let personality = default_personality();
+        let pos = default_position();
+        let smells = vec![SmellEvent {
+            source_room: "kueche".to_string(),
+            smell_type: "coffee".to_string(),
+            intensity: 0.8,
+            radius_rooms: 2,
+            decay_per_room: 0.3,
+            created_tick: 100,
+            duration_ticks: 500,
+        }];
+        let agents = vec![
+            ("Lisa".to_string(), "Telefonat".to_string()),
+            ("Andreas".to_string(), "Coding".to_string()),
+        ];
+        let mut texts = PerceptionTexts {
+            circadian_text: String::with_capacity(128),
+            body_text: String::with_capacity(256),
+            environment_text: String::with_capacity(256),
+            acoustic_text: String::with_capacity(128),
+            presence_text: String::with_capacity(128),
+            impulse_text: String::with_capacity(128),
+        };
+
+        let capacities_before = (
+            texts.circadian_text.capacity(),
+            texts.body_text.capacity(),
+            texts.environment_text.capacity(),
+            texts.acoustic_text.capacity(),
+            texts.presence_text.capacity(),
+            texts.impulse_text.capacity(),
+        );
+
+        generate_perception_into(
+            &mut texts,
+            &bio,
+            &pos,
+            &personality,
+            55.0,
+            25.5,
+            1200.0,
+            &smells,
+            &agents,
+            "12:00",
+            2.0,
+        );
+        assert!(texts.body_text.contains("schwindelig"));
+
+        bio.hunger = 20.0;
+        bio.bladder = 10.0;
+        generate_perception_into(
+            &mut texts,
+            &bio,
+            &pos,
+            &personality,
+            30.0,
+            21.0,
+            600.0,
+            &[],
+            &[],
+            "13:00",
+            3.0,
+        );
+
+        assert_eq!(
+            capacities_before,
+            (
+                texts.circadian_text.capacity(),
+                texts.body_text.capacity(),
+                texts.environment_text.capacity(),
+                texts.acoustic_text.capacity(),
+                texts.presence_text.capacity(),
+                texts.impulse_text.capacity(),
+            )
+        );
+        assert_eq!(texts.body_text, "Du fuehlst dich gut.");
+        assert_eq!(texts.presence_text, "Du bist allein.");
     }
 
     #[test]

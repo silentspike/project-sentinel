@@ -11,7 +11,7 @@
 //! 3. `start_agent_process()` — startet bwrap (spaeter: mit Landlock im Child)
 //! 4. `teardown_agent()` — killt bwrap + entfernt cgroup
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -44,6 +44,18 @@ impl AgentProcess {
     /// Prueft ob der Prozess noch laeuft.
     pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Terminates and reaps the child process owned by this handle.
+    pub fn terminate(&mut self) {
+        match self.child.try_wait() {
+            Ok(Some(_status)) => {}
+            Ok(None) => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+            Err(_) => {}
+        }
     }
 }
 
@@ -138,6 +150,17 @@ impl std::fmt::Debug for SandboxEnforcer {
 }
 
 impl SandboxEnforcer {
+    fn cgroup_root_writable(cgroup_root: &Path) -> bool {
+        let probe = cgroup_root.join(format!(".sentinel-write-check-{}", std::process::id()));
+        match std::fs::create_dir(&probe) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir(&probe);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Detects available kernel sandbox features.
     ///
     /// Probes:
@@ -160,7 +183,15 @@ impl SandboxEnforcer {
         // 2. cgroup root + controller delegation
         let cgroup_root = PathBuf::from("/sys/fs/cgroup/sentinel");
         let cgroup_available = if cgroup_root.exists() {
-            true
+            if Self::cgroup_root_writable(&cgroup_root) {
+                true
+            } else {
+                warnings.push(SandboxWarning::CgroupNotDelegated(format!(
+                    "{} exists but is not writable by the current user",
+                    cgroup_root.display()
+                )));
+                false
+            }
         } else {
             match std::fs::create_dir_all(&cgroup_root) {
                 Ok(_) => {
@@ -395,6 +426,8 @@ impl SandboxEnforcer {
         if let Some(pid) = handle.bwrap_pid {
             let _ = std::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status();
         }
 

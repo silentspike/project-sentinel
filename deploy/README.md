@@ -12,7 +12,7 @@ Deployment-Artefakte fuer Project Sentinel auf der Ziel-VM.
 
 | Verzeichnis/Datei | Zweck |
 |-------------------|-------|
-| `systemd/` | systemd Service-Units (sentinel-ecs, cortex, dashboard) |
+| `systemd/` | systemd Service-Units (sentinel-ecs, cortex, console backend) |
 | `vm-config/` | Host/Guest-Tuning Scripts |
 | `bench/` | Benchmark-Harness + Runner-Scripts |
 | `proxmox-vm.conf` | Proxmox VM-Konfiguration (CPU, RAM, Storage) |

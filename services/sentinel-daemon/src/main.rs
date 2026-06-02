@@ -68,11 +68,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
 /// Dry-Run: Config validieren, Agents laden, Schicht erkennen, beenden.
 fn dry_run(config: &DaemonConfig) -> anyhow::Result<()> {
-    use sentinel_common::agent_config::load_all_agents;
+    use sentinel_common::agent_config::load_all_agents_with_validation;
     use sentinel_daemon::shift::{agents_for_shift, detect_current_shift};
 
     let agents_dir = config.config_dir.join("agents");
-    let all_agents = load_all_agents(&agents_dir)
+    let validation = config.agent_config_validation()?;
+    let all_agents = load_all_agents_with_validation(&agents_dir, validation)
         .with_context(|| format!("Agents laden: {}", agents_dir.display()))?;
 
     let current_shift = detect_current_shift();

@@ -25,7 +25,10 @@ SyslogIdentifier=sentinel-daemon
 # Security Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/sentinel/data /opt/sentinel/fs /ram/sentinel /ram/agents
+# config_dir muss schreibbar sein: der Daemon ist der alleinige config_dir-Schreiber fuer den
+# Runtime Config-Apply Write-Back (#425/#420) — sonst ueberlebt eine zur Laufzeit geaenderte
+# Firma keinen Restart und driftet von der TOML-SSOT.
+ReadWritePaths=/opt/sentinel/data /opt/sentinel/config /opt/sentinel/fs /ram/sentinel /ram/agents
 PrivateTmp=true
 
 [Install]

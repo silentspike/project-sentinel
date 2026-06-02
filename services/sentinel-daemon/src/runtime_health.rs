@@ -446,6 +446,7 @@ mod tests {
                 bio: "bio".to_string(),
                 quirks: Vec::new(),
             },
+            runtime: Default::default(),
             capabilities: Default::default(),
         }
     }

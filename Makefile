@@ -1,4 +1,4 @@
-.PHONY: help lint lint-all test build build-rust build-go build-dashboard \
+.PHONY: help lint lint-all test build build-rust build-go build-console \
        fmt check clean hooks ci deny coverage typos doc machete safe-merge \
        manifest preflight smoke-test deploy fuzz verify snapshot-test snapshot-review
 
@@ -44,8 +44,8 @@ test: ## Run all tests
 	cargo test --workspace
 	@echo "=== Go Tests ==="
 	cd cmd/cortex-gateway && go test ./...
-	@echo "=== Dashboard Tests ==="
-	$(MAKE) test-dashboard
+	@echo "=== Console Tests ==="
+	$(MAKE) test-console
 	@echo "All tests: OK"
 
 test-rust: ## Run Rust tests only
@@ -54,18 +54,18 @@ test-rust: ## Run Rust tests only
 test-go: ## Run Go tests only
 	cd cmd/cortex-gateway && go test ./...
 
-test-dashboard: ## Run Dashboard tests only (auto-installs deps on a fresh clone)
-	@if [ ! -d dashboard/node_modules ]; then \
-		echo "[test-dashboard] dashboard/node_modules missing -> bun install"; \
-		cd dashboard && bun install --frozen-lockfile; \
+test-console: ## Run Console tests only (auto-installs deps on a fresh clone)
+	@if [ ! -d console/node_modules ]; then \
+		echo "[test-console] console/node_modules missing -> bun install"; \
+		cd console && bun install --frozen-lockfile; \
 	fi
-	cd dashboard && bun test
+	cd console && bun test
 
 # ──────────────────────────────────────────────
 # Build
 # ──────────────────────────────────────────────
 
-build: build-rust build-go build-dashboard ## Build everything
+build: build-rust build-go build-console ## Build everything
 
 build-rust: ## Build Rust workspace
 	cargo build --workspace
@@ -77,8 +77,8 @@ build-rust-release: ## Build Rust release (remote, includes eBPF kernel probes)
 	cargo remote -- build --workspace --release --features ebpf
 
 demo-binaries: ## Get the Rust binaries for the docker demo (release-fetch / cargo-remote / local cargo, in that order)
-	@if [ -x target/release/sentinel-daemon ] && [ -x target/release/sentinel-nightrun ] && [ -x target/release/sentinel-projection ]; then \
-		echo "[demo-binaries] all 3 binaries already in target/release/, skipping"; \
+	@if [ -x target/release/sentinel-daemon ] && [ -x target/release/sentinel-nightrun ] && [ -x target/release/sentinel-projection ] && [ -x target/release/sentinel-dashboard-backend ]; then \
+		echo "[demo-binaries] all 4 binaries already in target/release/, skipping"; \
 	elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 && gh release view v0.1.0-alpha --repo silentspike/project-sentinel >/dev/null 2>&1; then \
 		echo "[demo-binaries] tier 1: fetching pre-built binaries from GitHub Release v0.1.0-alpha"; \
 		./scripts/fetch-demo-binaries.sh; \
@@ -86,6 +86,7 @@ demo-binaries: ## Get the Rust binaries for the docker demo (release-fetch / car
 		echo "[demo-binaries] tier 2: cargo-remote configured -> offloading build"; \
 		cargo remote -c -- build --release --bin sentinel-daemon --bin sentinel-nightrun; \
 		cargo remote -c -- build --release -p sentinel-projection-service; \
+		cargo remote -c -- build --release -p sentinel-dashboard-backend; \
 	else \
 		echo "[demo-binaries] tier 3: local cargo build (slow path)"; \
 		echo "[demo-binaries] note: local build needs ~8 GB free RAM and ~20 min on a laptop;"; \
@@ -93,6 +94,7 @@ demo-binaries: ## Get the Rust binaries for the docker demo (release-fetch / car
 		echo "[demo-binaries]       or set up cargo-remote (see CONTRIBUTING.md)."; \
 		cargo build --release --bin sentinel-daemon --bin sentinel-nightrun; \
 		cargo build --release -p sentinel-projection-service; \
+		cargo build --release -p sentinel-dashboard-backend; \
 	fi
 
 demo-image: demo-binaries ## Build the docker demo image (requires demo-binaries)
@@ -104,8 +106,9 @@ demo: demo-image ## Build + run the 10-minute demo stack
 build-go: ## Build Cortex Gateway
 	cd cmd/cortex-gateway && go build -o cortex-gateway .
 
-build-dashboard: ## Build Dashboard
-	cd dashboard && bun install
+build-console: ## Build SolidJS console
+	cd console && bun install --frozen-lockfile
+	cd console && bun run build
 
 # ──────────────────────────────────────────────
 # Code Generation
@@ -229,5 +232,5 @@ deploy: preflight ## Deploy to VM: preflight + sync + smoke (usage: make deploy 
 clean: ## Remove build artifacts
 	cargo clean
 	cd cmd/cortex-gateway && rm -f cortex-gateway
-	cd dashboard && rm -rf node_modules
+	cd console && rm -rf node_modules
 	@echo "Clean: OK"

@@ -13,6 +13,9 @@ use sentinel_common::{AgentId, Tick};
 use sentinel_limbo::EventStore;
 use serde::{Deserialize, Serialize};
 
+pub mod nano;
+pub use nano::EcsNativeRuntime;
+
 /// Status eines laufenden Agenten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentStatus {

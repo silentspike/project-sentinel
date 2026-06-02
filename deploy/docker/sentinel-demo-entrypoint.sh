@@ -11,7 +11,7 @@
 #   judge          sentinel-judge        (quality monitor on :8082)
 #   nats-bridge    sentinel-nats-bridge  (event bridge on :8083)
 #   projection     sentinel-projection   (CQRS read-model worker, builds projection.db)
-#   dashboard      sentinel-dashboard    (Bun UI on :8000)
+#   console        sentinel-dashboard-backend (SolidJS console on :8001)
 #   nightrun       sentinel-nightrun     (one-shot nightly batch)
 #   help           print this message and exit
 #
@@ -58,23 +58,25 @@ case "$role" in
         ;;
     projection)
         # Long-running CQRS read-model worker. Polls EventStore, builds
-        # projection.db that the dashboard reads from.
+        # projection.db that the console backend reads from.
         exec /usr/local/bin/sentinel-projection \
             --event-store /opt/sentinel/data/events.db \
             --projection-db /opt/sentinel/data/projection.db
         ;;
-    dashboard)
-        cd /opt/sentinel/dashboard
-        export PROJECTION_DB_PATH="${PROJECTION_DB_PATH:-/opt/sentinel/data/projection.db}"
-        export EVENT_STORE_DB_PATH="${EVENT_STORE_DB_PATH:-/opt/sentinel/data/events.db}"
-        # Wait for projection worker to create projection.db before bun starts.
-        # Otherwise the dashboard crashes with SQLITE_CANTOPEN.
+    console)
+        export SENTINEL_PROJECTION_DB="${SENTINEL_PROJECTION_DB:-/opt/sentinel/data/projection.db}"
+        export SENTINEL_EVENTS_DB="${SENTINEL_EVENTS_DB:-/opt/sentinel/data/events.db}"
+        export SENTINEL_DASHBOARD_BUNDLE_DIR="${SENTINEL_DASHBOARD_BUNDLE_DIR:-/opt/sentinel/console-dist}"
+        export SENTINEL_DASHBOARD_HTTP_BIND="${SENTINEL_DASHBOARD_HTTP_BIND:-0.0.0.0:8001}"
+        export SENTINEL_DASHBOARD_WT_BIND="${SENTINEL_DASHBOARD_WT_BIND:-0.0.0.0:8001}"
+        export SENTINEL_DASHBOARD_API_KEY="${SENTINEL_DASHBOARD_API_KEY:-demo}"
+        # Wait for projection worker to create projection.db before the console backend starts.
         deadline=$(( $(date +%s) + 60 ))
-        while [ ! -f "$PROJECTION_DB_PATH" ] && [ "$(date +%s)" -lt "$deadline" ]; do
-            echo "[entrypoint] waiting for projection.db ($PROJECTION_DB_PATH) to appear..."
+        while [ ! -f "$SENTINEL_PROJECTION_DB" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+            echo "[entrypoint] waiting for projection.db ($SENTINEL_PROJECTION_DB) to appear..."
             sleep 2
         done
-        exec bun run src/index.ts
+        exec /usr/local/bin/sentinel-dashboard-backend
         ;;
     nightrun)
         exec /usr/local/bin/sentinel-nightrun \
@@ -86,7 +88,7 @@ Sentinel demo container.
 
 Usage: docker run --rm -e SENTINEL_ROLE=<role> sentinel-demo:local
 
-Available roles: daemon | gateway | judge | nats-bridge | projection | dashboard | nightrun
+Available roles: daemon | gateway | judge | nats-bridge | projection | console | nightrun
 
 The demo stack normally invokes this image once per service via
 docker-compose.demo.yml. To run an individual service ad-hoc, set
