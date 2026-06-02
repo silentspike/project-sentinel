@@ -5,7 +5,7 @@ import { createStore, produce } from "solid-js/store";
 // Operationen (split/resize/close/openPanel) sind reine Baum-Transformationen im SolidJS-Store
 // → fine-grained reaktiv, kein Voll-Rerender.
 
-export type PanelKind = "dashboard" | "control" | "chat" | "floorplan";
+export type PanelKind = "agents" | "floorplan" | "metrics" | "cockpit" | "control" | "chat";
 export type SplitDir = "row" | "col";
 
 export interface LeafNode {
@@ -32,15 +32,15 @@ export function leaf(panel: PanelKind): LeafNode {
   return { kind: "leaf", id: nextId("leaf"), panel };
 }
 
-/** Default-Workspace: drei Saeulen (Dashboard | Control-Center | Chat) als verschachtelte row-Splits. */
+/** Default-Workspace: drei Saeulen fuer die ersten migrierten Push-Views. */
 export function defaultWorkspace(): TileNode {
   return {
     kind: "split",
     id: nextId("split"),
     dir: "row",
     fraction: 0.34,
-    a: leaf("dashboard"),
-    b: { kind: "split", id: nextId("split"), dir: "row", fraction: 0.5, a: leaf("control"), b: leaf("chat") },
+    a: leaf("agents"),
+    b: { kind: "split", id: nextId("split"), dir: "row", fraction: 0.5, a: leaf("floorplan"), b: leaf("metrics") },
   };
 }
 
