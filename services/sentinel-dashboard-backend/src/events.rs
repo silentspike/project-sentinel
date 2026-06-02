@@ -227,6 +227,84 @@ pub(crate) fn query_event_rows(
     rows.collect()
 }
 
+pub(crate) fn max_event_id(db_path: &str) -> rusqlite::Result<i64> {
+    let conn = open_events_ro(db_path)?;
+    conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+        row.get::<_, i64>(0)
+    })
+}
+
+pub(crate) fn events_after_id(
+    db_path: &str,
+    offset: i64,
+    limit: usize,
+) -> rusqlite::Result<Vec<Value>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let conn = open_events_ro(db_path)?;
+    let columns = event_select_columns(&conn);
+    let sql = format!("SELECT {columns} FROM events WHERE id > ? ORDER BY id ASC LIMIT ?");
+    let rows = query_event_rows(
+        &conn,
+        &sql,
+        &[
+            SqlValue::Integer(offset),
+            SqlValue::Integer(limit.min(10_000) as i64),
+        ],
+    )?;
+    Ok(rows.iter().map(event_to_json).collect())
+}
+
+pub(crate) fn event_log_backfill_events(
+    db_path: &str,
+    recent_limit: usize,
+    focus_limit: usize,
+) -> rusqlite::Result<Vec<Value>> {
+    if recent_limit == 0 && focus_limit == 0 {
+        return Ok(Vec::new());
+    }
+    let conn = open_events_ro(db_path)?;
+    let columns = event_select_columns(&conn);
+    let recent_sql = format!("SELECT {columns} FROM events ORDER BY id DESC LIMIT ?");
+    let mut rows = query_event_rows(
+        &conn,
+        &recent_sql,
+        &[SqlValue::Integer(recent_limit.min(10_000) as i64)],
+    )?;
+
+    if focus_limit > 0 {
+        for event_type in ["chaos_triggered", "agent_action_received"] {
+            rows.extend(events_by_type(&conn, &columns, event_type, focus_limit)?);
+        }
+    }
+
+    let mut by_id = HashMap::new();
+    for row in rows {
+        by_id.insert(row.id, row);
+    }
+    let mut rows = by_id.into_values().collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.id);
+    Ok(rows.iter().map(event_to_json).collect())
+}
+
+fn events_by_type(
+    conn: &Connection,
+    columns: &str,
+    event_type: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<EventRow>> {
+    let sql = format!("SELECT {columns} FROM events WHERE event_type = ? ORDER BY id DESC LIMIT ?");
+    query_event_rows(
+        conn,
+        &sql,
+        &[
+            SqlValue::Text(event_type.to_string()),
+            SqlValue::Integer(limit.min(1_000) as i64),
+        ],
+    )
+}
+
 pub(crate) fn room_history(db_path: &str, room_id: &str) -> Value {
     let conn = match open_events_ro(db_path) {
         Ok(conn) => conn,
@@ -484,4 +562,167 @@ pub(crate) fn snapshot_state_json(
         "room_count": rooms.len(),
         "rooms": rooms,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_events_db(with_compensation_type: bool) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("events-log-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("events.db");
+        let conn = Connection::open(&db).unwrap();
+        let compensation = if with_compensation_type {
+            ",compensation_type TEXT NOT NULL DEFAULT 'none'"
+        } else {
+            ""
+        };
+        conn.execute_batch(&format!(
+            "CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                correlation_id TEXT,
+                causation_id TEXT,
+                tick INTEGER NOT NULL,
+                timestamp_ms INTEGER NOT NULL
+                {compensation}
+            );"
+        ))
+        .unwrap();
+        (dir, db.to_string_lossy().into_owned())
+    }
+
+    fn insert_event(
+        conn: &Connection,
+        id: i64,
+        event_type: &str,
+        aggregate_id: &str,
+        payload: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO events
+             (id,event_id,event_type,aggregate_id,payload,correlation_id,causation_id,tick,timestamp_ms)
+             VALUES (?1,?2,?3,?4,?5,'corr',NULL,?6,?7)",
+            params![
+                id,
+                format!("evt-{id}"),
+                event_type,
+                aggregate_id,
+                payload,
+                id * 10,
+                1_700_000_000_000_i64 + id
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn append_queries_return_events_in_ascending_id_order() {
+        let (dir, db_path) = temp_events_db(true);
+        let conn = Connection::open(&db_path).unwrap();
+        insert_event(&conn, 1, "agent_spawned", "agent-1", r#"{"name":"Ada"}"#);
+        insert_event(
+            &conn,
+            2,
+            "chaos_triggered",
+            "kueche",
+            r#"{"event_type":"AirConBroken","target_room":"kueche"}"#,
+        );
+        insert_event(
+            &conn,
+            3,
+            "agent_action_received",
+            "agent-1",
+            r#"{"content":"Ich pruefe die Kueche","target_room":"kueche"}"#,
+        );
+        drop(conn);
+
+        assert_eq!(max_event_id(&db_path).unwrap(), 3);
+
+        let recent = event_log_backfill_events(&db_path, 2, 0).unwrap();
+        let recent_ids = recent
+            .iter()
+            .map(|event| event["id"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(recent_ids, vec![2, 3]);
+
+        let appended = events_after_id(&db_path, 1, 500).unwrap();
+        let appended_ids = appended
+            .iter()
+            .map(|event| event["id"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(appended_ids, vec![2, 3]);
+        assert_eq!(
+            appended[1]["payload"],
+            r#"{"content":"Ich pruefe die Kueche","target_room":"kueche"}"#
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn event_log_backfill_keeps_focus_events_outside_recent_window() {
+        let (dir, db_path) = temp_events_db(true);
+        let mut conn = Connection::open(&db_path).unwrap();
+        let tx = conn.transaction().unwrap();
+        insert_event(
+            &tx,
+            1,
+            "chaos_triggered",
+            "kueche",
+            r#"{"event_type":"PhoneRing","target_room":"kueche"}"#,
+        );
+        insert_event(
+            &tx,
+            2,
+            "agent_action_received",
+            "agent-1",
+            r#"{"content":"autonomy:bio_emergency","target_room":"kueche"}"#,
+        );
+        for id in 3..=9_102 {
+            insert_event(
+                &tx,
+                id,
+                "room_physics_updated",
+                "kueche",
+                r#"{"co2_ppm":700}"#,
+            );
+        }
+        tx.commit().unwrap();
+        drop(conn);
+
+        let backfill = event_log_backfill_events(&db_path, 9_000, 10).unwrap();
+        let ids = backfill
+            .iter()
+            .map(|event| event["id"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(backfill.len(), 9_002);
+        assert_eq!(&ids[..3], &[1, 2, 103]);
+        assert_eq!(ids.last(), Some(&9_102));
+        assert_eq!(backfill[0]["event_type"], "chaos_triggered");
+        assert_eq!(backfill[1]["event_type"], "agent_action_received");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn event_queries_tolerate_legacy_schema_without_compensation_type() {
+        let (dir, db_path) = temp_events_db(false);
+        let conn = Connection::open(&db_path).unwrap();
+        insert_event(
+            &conn,
+            7,
+            "room_physics_updated",
+            "kueche",
+            r#"{"co2_ppm":800}"#,
+        );
+        drop(conn);
+
+        let events = events_after_id(&db_path, 0, 10).unwrap();
+        assert_eq!(events[0]["id"], 7);
+        assert_eq!(events[0]["compensation_type"], "none");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
