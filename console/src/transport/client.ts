@@ -1,4 +1,11 @@
 import { parseTopicFrame, frameHeaderSize } from "./codec";
+import {
+  hashFromKey,
+  readJsonFrame,
+  reassembleEventLogCas,
+  writeJsonFrame,
+  type EventLogCasResponse,
+} from "./cas";
 
 // WebTransport-Client der Sentinel-Konsole (#419) — Port von noaide `transport/client.ts`.
 // Server->Client unidirektionale Streams; topic+msgpack+zstd Frames. Self-signed Cert via
@@ -33,6 +40,9 @@ export class TransportClient {
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private abortController: AbortController | null = null;
+  private readonly casBlocks = new Map<string, Uint8Array>();
+  private casSyncInFlight = false;
+  private casSyncQueued = false;
   private readonly onFrame?: (topic: string, value: unknown) => void;
   private readonly onStatusChange?: (status: ConnectionStatus) => void;
 
@@ -62,6 +72,7 @@ export class TransportClient {
       this.setStatus("connected");
       this.reconnectAttempt = 0;
       void this.readStreams();
+      void this.syncEventLogCas();
       this.transport.closed
         .then(() => this.onClosed())
         .catch(() => this.onClosed());
@@ -87,6 +98,26 @@ export class TransportClient {
 
   currentStatus(): ConnectionStatus {
     return this.status;
+  }
+
+  async syncEventLogCas(): Promise<void> {
+    if (this.casSyncInFlight) {
+      this.casSyncQueued = true;
+      return;
+    }
+    this.casSyncInFlight = true;
+    try {
+      do {
+        this.casSyncQueued = false;
+        const transport = this.transport;
+        if (!transport || this.status !== "connected") return;
+        await this.performEventLogCasSync(transport);
+      } while (this.casSyncQueued);
+    } catch (e) {
+      if (!this.abortController?.signal.aborted) console.warn("[transport] event_log CAS sync failed:", e);
+    } finally {
+      this.casSyncInFlight = false;
+    }
   }
 
   private onClosed() {
@@ -166,6 +197,7 @@ export class TransportClient {
           buffer = buffer.subarray(totalSize);
           try {
             const { topic, value: decoded } = parseTopicFrame(frame);
+            if (topic === "event_log_cas_tick") void this.syncEventLogCas();
             this.onFrame?.(topic, decoded);
           } catch (e) {
             console.warn("[transport] frame decode error:", e);
@@ -174,6 +206,22 @@ export class TransportClient {
       }
     } catch (e) {
       if (!this.abortController?.signal.aborted) console.warn("[transport] stream read error:", e);
+    }
+  }
+
+  private async performEventLogCasSync(transport: WebTransport): Promise<void> {
+    const stream = await transport.createBidirectionalStream();
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+    try {
+      await writeJsonFrame(writer, { have: [...this.casBlocks.keys()].map(hashFromKey) });
+      await writer.close();
+      const response = await readJsonFrame<EventLogCasResponse>(reader);
+      const { events, stats } = reassembleEventLogCas(response, this.casBlocks);
+      this.onFrame?.("event_log", { events, backfill: true, cas: stats });
+    } finally {
+      writer.releaseLock();
+      reader.releaseLock();
     }
   }
 }

@@ -103,6 +103,15 @@ impl ConsolePlane {
         self.blocks.keys().copied().collect()
     }
 
+    /// Append-only Manifest in Log-Reihenfolge, inkl. wiederkehrender Bloecke.
+    ///
+    /// Ein Delta allein enthaelt nur fehlende eindeutige Bloecke. Append-only Streams brauchen
+    /// zusaetzlich diese Reihenfolge, damit der Client die dekomprimierten Bloecke wieder zum
+    /// vollstaendigen Log zusammensetzen kann.
+    pub fn log_manifest(&self) -> Vec<BlockHash> {
+        self.log.clone()
+    }
+
     /// Berechnet das Delta: Bloecke, die der Server hat, der Client (laut Manifest) aber nicht.
     /// Genau das ersetzt den Voll-State-Poll — Client zieht nur die fehlenden ~10%.
     pub fn delta(&self, client_has: &HashSet<BlockHash>) -> Delta {
