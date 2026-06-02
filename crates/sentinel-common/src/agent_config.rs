@@ -185,7 +185,10 @@ mod tests {
         let serialized = toml::to_string(&original).expect("serialize AgentConfig to TOML");
         let reparsed: AgentConfig =
             toml::from_str(&serialized).expect("re-parse serialized AgentConfig");
-        assert_eq!(original, reparsed, "AgentConfig TOML round-trip must be identical");
+        assert_eq!(
+            original, reparsed,
+            "AgentConfig TOML round-trip must be identical"
+        );
     }
 
     #[test]

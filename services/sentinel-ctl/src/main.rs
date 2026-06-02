@@ -41,7 +41,11 @@ impl Risk {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "sentinel-ctl", version, about = "Operator CLI for Sentinel / Gaia (#437)")]
+#[command(
+    name = "sentinel-ctl",
+    version,
+    about = "Operator CLI for Sentinel / Gaia (#437)"
+)]
 struct Cli {
     /// Maschinenlesbare JSON-Ausgabe (fuer Gaia).
     #[arg(long, global = true)]
@@ -318,12 +322,16 @@ fn resolve_call(cmd: &Commands) -> Result<Call, String> {
                     assigned_to,
                     parent,
                     description,
-                } => json!({"action":"create","title":title,"assigned_to":assigned_to,"parent_task":parent,"description":description}),
+                } => {
+                    json!({"action":"create","title":title,"assigned_to":assigned_to,"parent_task":parent,"description":description})
+                }
                 TaskAction::Assign {
                     task_id,
                     assigned_to,
                     by,
-                } => json!({"action":"assign","task_id":task_id,"assigned_to":assigned_to,"assigned_by":by}),
+                } => {
+                    json!({"action":"assign","task_id":task_id,"assigned_to":assigned_to,"assigned_by":by})
+                }
                 TaskAction::Status { task_id, status } => {
                     json!({"action":"update_status","task_id":task_id,"status":status})
                 }
@@ -331,15 +339,23 @@ fn resolve_call(cmd: &Commands) -> Result<Call, String> {
                     json!({"action":"complete","task_id":task_id,"result":result})
                 }
             };
-            c(Method::Post, false, "/operator/task", Some(body), Risk::Mutate)
+            c(
+                Method::Post,
+                false,
+                "/operator/task",
+                Some(body),
+                Risk::Mutate,
+            )
         }
-        Commands::GatewayReload => {
-            c(Method::Post, true, "/control/reload", None, Risk::Mutate)
-        }
+        Commands::GatewayReload => c(Method::Post, true, "/control/reload", None, Risk::Mutate),
         Commands::Platform { action } => match action {
-            PlatformAction::Analyze => {
-                c(Method::Post, false, "/operator/platform-analyze", None, Risk::Mutate)
-            }
+            PlatformAction::Analyze => c(
+                Method::Post,
+                false,
+                "/operator/platform-analyze",
+                None,
+                Risk::Mutate,
+            ),
             PlatformAction::Reconcile => c(
                 Method::Post,
                 false,
@@ -347,26 +363,46 @@ fn resolve_call(cmd: &Commands) -> Result<Call, String> {
                 Some(json!({})),
                 Risk::High,
             ),
-            PlatformAction::State => {
-                c(Method::Get, false, "/operator/platform-state", None, Risk::Read)
-            }
-            PlatformAction::RuntimeHealth => {
-                c(Method::Get, false, "/operator/runtime-health", None, Risk::Read)
-            }
+            PlatformAction::State => c(
+                Method::Get,
+                false,
+                "/operator/platform-state",
+                None,
+                Risk::Read,
+            ),
+            PlatformAction::RuntimeHealth => c(
+                Method::Get,
+                false,
+                "/operator/runtime-health",
+                None,
+                Risk::Read,
+            ),
         },
         Commands::Observe { what } => match what {
             ObserveWhat::Snapshots => {
                 c(Method::Get, false, "/operator/snapshots", None, Risk::Read)
             }
-            ObserveWhat::RuntimeHealth => {
-                c(Method::Get, false, "/operator/runtime-health", None, Risk::Read)
-            }
-            ObserveWhat::PlatformState => {
-                c(Method::Get, false, "/operator/platform-state", None, Risk::Read)
-            }
-            ObserveWhat::FsStats => {
-                c(Method::Get, false, "/operator/security/fs-stats", None, Risk::Read)
-            }
+            ObserveWhat::RuntimeHealth => c(
+                Method::Get,
+                false,
+                "/operator/runtime-health",
+                None,
+                Risk::Read,
+            ),
+            ObserveWhat::PlatformState => c(
+                Method::Get,
+                false,
+                "/operator/platform-state",
+                None,
+                Risk::Read,
+            ),
+            ObserveWhat::FsStats => c(
+                Method::Get,
+                false,
+                "/operator/security/fs-stats",
+                None,
+                Risk::Read,
+            ),
         },
     })
 }
@@ -439,9 +475,15 @@ mod tests {
         })
         .unwrap();
         assert_eq!(call.risk, Risk::Mutate);
-        assert!(gate(call.risk, false, false).is_err(), "deny without confirm");
+        assert!(
+            gate(call.risk, false, false).is_err(),
+            "deny without confirm"
+        );
         assert!(gate(call.risk, true, false).is_ok(), "allow with --confirm");
-        assert!(gate(call.risk, false, true).is_ok(), "allow with assume_yes");
+        assert!(
+            gate(call.risk, false, true).is_ok(),
+            "allow with assume_yes"
+        );
     }
 
     #[test]

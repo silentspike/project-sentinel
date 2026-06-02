@@ -26,7 +26,10 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result
 }
 
 /// Writes a length-prefixed frame.
-pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> std::io::Result<()> {
+pub async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+) -> std::io::Result<()> {
     writer.write_all(&(data.len() as u32).to_le_bytes()).await?;
     writer.write_all(data).await?;
     writer.flush().await?;
@@ -49,7 +52,9 @@ where
     let client_has: HashSet<BlockHash> = hello.have.into_iter().collect();
     // Lock only briefly (sync) to compute the delta; never held across an await.
     let delta: Delta = {
-        let guard = plane.lock().map_err(|_| anyhow::anyhow!("plane lock poisoned"))?;
+        let guard = plane
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plane lock poisoned"))?;
         guard.delta(&client_has)
     };
     let delta_bytes = serde_json::to_vec(&delta)?;
