@@ -12,9 +12,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub mod auth;
+pub mod cas;
 pub mod cockpit;
 pub mod codec;
 pub mod control;
@@ -112,6 +113,8 @@ pub struct AppState {
     /// Broadcast-Kanal der Delta-Frames (#432): der Event-Subscriber sendet encodierte topic-Frames,
     /// jede WebTransport-Session abonniert via `subscribe()` und schreibt sie als uni-Streams an den Client.
     pub broadcast_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
+    /// Event-Log CAS-Plane (#464): append-only Block-Log fuer den WT-Bi-Stream.
+    pub event_cas: Arc<Mutex<cas::EventLogCasPlane>>,
 }
 
 impl AppState {
@@ -135,6 +138,7 @@ impl AppState {
             events,
             saved_rate_limit: Arc::new(tokio::sync::Mutex::new(None)),
             broadcast_tx,
+            event_cas: Arc::new(Mutex::new(cas::EventLogCasPlane::new())),
         })
     }
 }

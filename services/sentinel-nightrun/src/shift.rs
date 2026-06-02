@@ -70,6 +70,10 @@ mod tests {
 
     static TZ_LOCK: Mutex<()> = Mutex::new(());
 
+    extern "C" {
+        fn tzset();
+    }
+
     #[test]
     fn shift_mapping_frueh() {
         for hour in 6..=13 {
@@ -137,6 +141,7 @@ mod tests {
         let _guard = TZ_LOCK.lock().expect("timezone test lock poisoned");
         let original_tz = std::env::var_os("TZ");
         std::env::set_var("TZ", "UTC0");
+        refresh_timezone();
 
         let result = catch_unwind(AssertUnwindSafe(test));
         restore_tz(original_tz);
@@ -151,5 +156,11 @@ mod tests {
             Some(value) => std::env::set_var("TZ", value),
             None => std::env::remove_var("TZ"),
         }
+        refresh_timezone();
+    }
+
+    fn refresh_timezone() {
+        // SAFETY: `tzset` reads process environment (`TZ`) and updates libc timezone state.
+        unsafe { tzset() };
     }
 }
