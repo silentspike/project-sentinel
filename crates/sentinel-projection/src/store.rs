@@ -83,6 +83,34 @@ CREATE TABLE IF NOT EXISTS kpi_1m (
     updated_at INTEGER NOT NULL
 )";
 
+const CREATE_TASK_KANBAN: &str = "
+CREATE TABLE IF NOT EXISTS task_kanban (
+    task_id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    assigned_to INTEGER NOT NULL,
+    assigned_by INTEGER,
+    parent_task INTEGER,
+    status TEXT NOT NULL DEFAULT 'pending',
+    result TEXT,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+)";
+
+const CREATE_PROJECTION_WATERMARKS: &str = "
+CREATE TABLE IF NOT EXISTS projection_watermarks (
+    projection_name TEXT PRIMARY KEY,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+)";
+
+const CREATE_WATERMARK_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS idx_agent_live_view_last_event_id ON agent_live_view(last_event_id);
+CREATE INDEX IF NOT EXISTS idx_room_live_view_last_event_id ON room_live_view(last_event_id);
+CREATE INDEX IF NOT EXISTS idx_kpi_1m_last_event_id ON kpi_1m(last_event_id);
+";
+
+const PROJECTION_NAME: &str = "sentinel-projection";
+
 // ── ReadModelStore ───────────────────────────────
 
 /// Store fuer materialisierte Read Models.
@@ -106,6 +134,9 @@ impl ReadModelStore {
         conn.execute_batch(CREATE_AGENT_LIVE_VIEW)?;
         conn.execute_batch(CREATE_ROOM_LIVE_VIEW)?;
         conn.execute_batch(CREATE_KPI_1M)?;
+        conn.execute_batch(CREATE_TASK_KANBAN)?;
+        conn.execute_batch(CREATE_PROJECTION_WATERMARKS)?;
+        conn.execute_batch(CREATE_WATERMARK_INDEXES)?;
 
         // Migration: Bio-Spalten hinzufuegen (idempotent, ignoriert "duplicate column" Fehler)
         for line in MIGRATE_AGENT_BIO_COLUMNS.lines() {
@@ -149,6 +180,8 @@ impl ReadModelStore {
             )?;
             info!(stale_count, "Stale Transits in Projection zurueckgesetzt");
         }
+
+        bootstrap_projection_watermark(&conn)?;
 
         info!(path, "ReadModelStore opened");
         Ok(Self {
@@ -233,14 +266,17 @@ impl ReadModelStore {
         Ok(())
     }
 
-    /// Loescht alle Daten aus allen drei View-Tabellen (fuer Rebuild).
+    /// Loescht alle Daten aus allen Projection-Tabellen (fuer Rebuild).
     pub fn clear_all(&self) -> anyhow::Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
         conn.execute_batch(
-            "DELETE FROM agent_live_view; DELETE FROM room_live_view; DELETE FROM kpi_1m;",
+            "DELETE FROM agent_live_view;
+             DELETE FROM room_live_view;
+             DELETE FROM kpi_1m;
+             DELETE FROM projection_watermarks;",
         )?;
         info!("All read model tables cleared");
         Ok(())
@@ -485,6 +521,97 @@ impl<'a> ReadModelTransaction<'a> {
     /// Rollback fuer fail-closed Batch-Fehler.
     pub fn rollback(&self) -> anyhow::Result<()> {
         self.guard.execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+
+    /// Globaler Dashboard-Watermark: ein Read aus dieser Tabelle ersetzt die
+    /// frueheren per-view MAX-Queries im WebSocket-Poll.
+    pub fn update_projection_watermark(
+        &self,
+        projection_name: &str,
+        row_id: i64,
+    ) -> anyhow::Result<()> {
+        self.guard.execute(
+            "INSERT INTO projection_watermarks (projection_name, last_event_id, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(projection_name) DO UPDATE SET
+               last_event_id = MAX(projection_watermarks.last_event_id, ?2),
+               updated_at = ?3",
+            params![projection_name, row_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    // ── task_kanban (#438) ──
+
+    /// UPSERT: Task erstellt. Idempotent via row_id > last_event_id.
+    pub fn upsert_task(
+        &self,
+        task_id: u32,
+        title: &str,
+        assigned_to: u16,
+        assigned_by: Option<u16>,
+        parent_task: Option<u32>,
+        status: &str,
+        row_id: i64,
+    ) -> anyhow::Result<()> {
+        self.guard.execute(
+            "INSERT INTO task_kanban (task_id, title, assigned_to, assigned_by, parent_task, status, last_event_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(task_id) DO UPDATE SET
+               title = excluded.title, assigned_to = excluded.assigned_to,
+               assigned_by = excluded.assigned_by, parent_task = excluded.parent_task,
+               status = excluded.status,
+               last_event_id = excluded.last_event_id, updated_at = excluded.updated_at
+             WHERE excluded.last_event_id > task_kanban.last_event_id",
+            params![task_id, title, assigned_to, assigned_by, parent_task, status, row_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// UPDATE: Task neu zugewiesen / delegiert.
+    pub fn update_task_assignee(
+        &self,
+        task_id: u32,
+        assigned_to: u16,
+        assigned_by: Option<u16>,
+        row_id: i64,
+    ) -> anyhow::Result<()> {
+        self.guard.execute(
+            "UPDATE task_kanban SET assigned_to = ?1, assigned_by = ?2, last_event_id = ?3, updated_at = ?4
+             WHERE task_id = ?5 AND ?3 > last_event_id",
+            params![assigned_to, assigned_by, row_id, now_ms(), task_id],
+        )?;
+        Ok(())
+    }
+
+    /// UPDATE: Task-Status aendern.
+    pub fn update_task_status(
+        &self,
+        task_id: u32,
+        status: &str,
+        row_id: i64,
+    ) -> anyhow::Result<()> {
+        self.guard.execute(
+            "UPDATE task_kanban SET status = ?1, last_event_id = ?2, updated_at = ?3
+             WHERE task_id = ?4 AND ?2 > last_event_id",
+            params![status, row_id, now_ms(), task_id],
+        )?;
+        Ok(())
+    }
+
+    /// UPDATE: Task abgeschlossen (status=done + Ergebnis).
+    pub fn complete_task(
+        &self,
+        task_id: u32,
+        result: Option<&str>,
+        row_id: i64,
+    ) -> anyhow::Result<()> {
+        self.guard.execute(
+            "UPDATE task_kanban SET status = 'done', result = ?1, last_event_id = ?2, updated_at = ?3
+             WHERE task_id = ?4 AND ?2 > last_event_id",
+            params![result, row_id, now_ms(), task_id],
+        )?;
         Ok(())
     }
 
@@ -838,6 +965,31 @@ pub enum KpiField {
     NightrunEvents,
 }
 
+fn bootstrap_projection_watermark(conn: &Connection) -> anyhow::Result<()> {
+    let source_max: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(m), 0)
+         FROM (
+           SELECT MAX(last_event_id) as m FROM agent_live_view
+           UNION ALL
+           SELECT MAX(last_event_id) as m FROM room_live_view
+           UNION ALL
+           SELECT MAX(last_event_id) as m FROM kpi_1m
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+
+    conn.execute(
+        "INSERT INTO projection_watermarks (projection_name, last_event_id, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(projection_name) DO UPDATE SET
+           last_event_id = MAX(projection_watermarks.last_event_id, excluded.last_event_id),
+           updated_at = excluded.updated_at",
+        params![PROJECTION_NAME, source_max, now_ms()],
+    )?;
+    Ok(())
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -870,6 +1022,66 @@ mod tests {
             .query_row("SELECT count(*) FROM kpi_1m", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM projection_watermarks", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let watermark: i64 = conn
+            .query_row(
+                "SELECT last_event_id FROM projection_watermarks WHERE projection_name = ?1",
+                params![PROJECTION_NAME],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(watermark, 0);
+
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name IN (
+                     'idx_agent_live_view_last_event_id',
+                     'idx_room_live_view_last_event_id',
+                     'idx_kpi_1m_last_event_id'
+                   )",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 3);
+    }
+
+    #[test]
+    fn test_open_bootstraps_projection_watermark_from_existing_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-bootstrap.db");
+        let store = ReadModelStore::open(path.to_str().unwrap()).unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kpi_1m (bucket_start, last_event_id, updated_at)
+                 VALUES (?1, ?2, ?3)",
+                params![60_000_i64, 321_i64, now_ms()],
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let store = ReadModelStore::open(path.to_str().unwrap()).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let watermark: i64 = conn
+            .query_row(
+                "SELECT last_event_id FROM projection_watermarks WHERE projection_name = ?1",
+                params![PROJECTION_NAME],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(watermark, 321);
     }
 
     #[test]
@@ -923,8 +1135,23 @@ mod tests {
         store.initialize_rooms(&["empfang"]).unwrap();
         assert!(store.get_room("empfang").unwrap().is_some());
 
+        {
+            let txn = store.begin_transaction().unwrap();
+            txn.begin().unwrap();
+            txn.update_projection_watermark("sentinel-projection", 42)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+
         store.clear_all().unwrap();
         assert!(store.get_room("empfang").unwrap().is_none());
+        let conn = store.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM projection_watermarks", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

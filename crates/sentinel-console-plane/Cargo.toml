@@ -1,0 +1,16 @@
+[package]
+name = "sentinel-console-plane"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "CAS console data-plane: content-defined chunking + dedup + manifest/delta (#439)"
+
+[lib]
+name = "sentinel_console_plane"
+path = "src/lib.rs"
+
+[dependencies]
+sentinel-fs = { path = "../sentinel-fs" }
+serde = { workspace = true }
+zstd = "0.13"

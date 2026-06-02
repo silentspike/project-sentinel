@@ -35,6 +35,7 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 criterion = { workspace = true }
+approx = { workspace = true }
 
 [[bench]]
 name = "nightrun_bench"

@@ -1,9 +1,10 @@
 //! Bubblewrap sandbox configuration.
 
+use std::path::Path;
 use std::process::{Child, Command};
 
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Bubblewrap sandbox configuration fuer einen einzelnen Agenten.
 #[derive(Debug, Clone)]
@@ -104,7 +105,8 @@ impl BwrapConfig {
     /// Returns the Child handle. Caller is responsible for managing the child
     /// (e.g. adding to cgroup, forgetting handle for --die-with-parent).
     pub fn spawn(&self, command: &[String]) -> Result<Child> {
-        let mut args = self.to_args();
+        let config = self.with_existing_host_binds();
+        let mut args = config.to_args();
         args.extend(command.iter().cloned());
 
         info!(
@@ -118,6 +120,33 @@ impl BwrapConfig {
             .stdin(std::process::Stdio::piped())
             .spawn()
             .context("Failed to spawn bwrap process")
+    }
+
+    fn with_existing_host_binds(&self) -> Self {
+        let mut config = self.clone();
+        config.readonly_binds.retain(|(host, guest)| {
+            let exists = Path::new(host).exists();
+            if !exists {
+                warn!(
+                    host = host.as_str(),
+                    guest = guest.as_str(),
+                    "Skipping bwrap readonly bind because host path is missing"
+                );
+            }
+            exists
+        });
+        config.writable_binds.retain(|(host, guest)| {
+            let exists = Path::new(host).exists();
+            if !exists {
+                warn!(
+                    host = host.as_str(),
+                    guest = guest.as_str(),
+                    "Skipping bwrap writable bind because host path is missing"
+                );
+            }
+            exists
+        });
+        config
     }
 
     /// Generiert bwrap CLI-Argumente.

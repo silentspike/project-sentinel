@@ -3,21 +3,25 @@
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+use crate::{AgentId, AgentIdBounds};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub identity: IdentityConfig,
     pub personality: PersonalityConfig,
     pub preferences: PreferencesConfig,
     pub background: BackgroundConfig,
     #[serde(default)]
+    pub runtime: RuntimeSelectionConfig,
+    #[serde(default)]
     pub capabilities: CapabilitiesConfig,
 }
 
 /// Tool-Capabilities und Sandbox-Einschraenkungen pro Agent.
 /// Leere Capabilities = kein Tool-Zugriff (sicherer Default).
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CapabilitiesConfig {
     /// Tool-Namen die der Agent nutzen darf (z.B. "file_read", "chat", "calendar").
     #[serde(default)]
@@ -27,7 +31,17 @@ pub struct CapabilitiesConfig {
     pub sandbox_allowed_paths: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Optional Nano-Container runtime selection for this workload.
+///
+/// Empty means the caller must provide an explicit fallback policy. The parser
+/// does not inject a default runtime because DEV-007 makes the contract plural.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct RuntimeSelectionConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nano_runtime: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IdentityConfig {
     pub id: u16,
     pub name: String,
@@ -36,13 +50,13 @@ pub struct IdentityConfig {
     pub shift_set: u8,
     #[serde(default)]
     pub kpis: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reports_to: Option<String>,
     #[serde(default)]
     pub direct_reports: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersonalityConfig {
     pub openness: f32,
     pub conscientiousness: f32,
@@ -53,17 +67,30 @@ pub struct PersonalityConfig {
     pub morning_person: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreferencesConfig {
     pub favorite_room: String,
     pub coffee_preference: String,
     pub lunch_time: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackgroundConfig {
     pub bio: String,
     pub quirks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AgentConfigValidation {
+    pub agent_id_bounds: AgentIdBounds,
+}
+
+impl AgentConfigValidation {
+    pub fn with_max_agent_id(max_agent_id: u16) -> Self {
+        Self {
+            agent_id_bounds: AgentIdBounds::new(max_agent_id),
+        }
+    }
 }
 
 impl PersonalityConfig {
@@ -88,23 +115,34 @@ impl PersonalityConfig {
 
 /// Laedt eine einzelne Agent-Config aus einer TOML-Datei.
 pub fn load_agent_config(path: &Path) -> Result<AgentConfig> {
+    load_agent_config_with_validation(path, AgentConfigValidation::default())
+}
+
+/// Laedt eine einzelne Agent-Config mit expliziten Validierungsgrenzen.
+pub fn load_agent_config_with_validation(
+    path: &Path,
+    validation: AgentConfigValidation,
+) -> Result<AgentConfig> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read agent config: {}", path.display()))?;
     let config: AgentConfig = toml::from_str(&content)
         .with_context(|| format!("Failed to parse agent config: {}", path.display()))?;
     config.personality.validate()?;
-    // Validiere id Bereich 1-60
-    if config.identity.id == 0 || config.identity.id > 60 {
-        return Err(anyhow!(
-            "Agent id {} out of range (1-60)",
-            config.identity.id
-        ));
-    }
+    AgentId::new_with_bounds(config.identity.id, validation.agent_id_bounds)
+        .with_context(|| format!("Invalid agent id in {}", path.display()))?;
     Ok(config)
 }
 
 /// Laedt alle AGENT-*.toml Dateien aus einem Verzeichnis, sortiert nach ID.
 pub fn load_all_agents(dir: &Path) -> Result<Vec<AgentConfig>> {
+    load_all_agents_with_validation(dir, AgentConfigValidation::default())
+}
+
+/// Laedt alle AGENT-*.toml Dateien aus einem Verzeichnis mit expliziten Grenzen.
+pub fn load_all_agents_with_validation(
+    dir: &Path,
+    validation: AgentConfigValidation,
+) -> Result<Vec<AgentConfig>> {
     let mut agents = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -114,7 +152,7 @@ pub fn load_all_agents(dir: &Path) -> Result<Vec<AgentConfig>> {
                 .file_name()
                 .is_some_and(|n| n.to_string_lossy().starts_with("AGENT-"))
         {
-            agents.push(load_agent_config(&path)?);
+            agents.push(load_agent_config_with_validation(&path, validation)?);
         }
     }
     agents.sort_by_key(|a| a.identity.id);
@@ -137,6 +175,20 @@ mod tests {
         assert_eq!(config.identity.name, "Thomas Mueller");
         assert_eq!(config.identity.role, "CEO / Geschaeftsfuehrer / Gruender");
         assert_eq!(config.identity.id, 1);
+    }
+
+    #[test]
+    fn agent_config_toml_round_trip() {
+        // #425: Serialize muss fuer config_dir-Write-Back round-trippen.
+        let path = config_dir().join("AGENT-01-THOMAS-CEO.toml");
+        let original = load_agent_config(&path).unwrap();
+        let serialized = toml::to_string(&original).expect("serialize AgentConfig to TOML");
+        let reparsed: AgentConfig =
+            toml::from_str(&serialized).expect("re-parse serialized AgentConfig");
+        assert_eq!(
+            original, reparsed,
+            "AgentConfig TOML round-trip must be identical"
+        );
     }
 
     #[test]
@@ -264,24 +316,54 @@ mod tests {
     fn agent_id_range() {
         use tempfile::NamedTempFile;
 
-        // Test id = 0 (invalid)
-        let mut tmpfile = NamedTempFile::new().unwrap();
-        std::io::Write::write_all(
-            &mut tmpfile,
-            b"[identity]\nid = 0\nname = \"Test\"\nrole = \"Test\"\ndepartment = \"Test\"\nshift_set = 1\n[personality]\nopenness = 0.5\nconscientiousness = 0.5\nextraversion = 0.5\nagreeableness = 0.5\nneuroticism = 0.5\ncaffeine_tolerance = 0.5\nmorning_person = true\n[preferences]\nfavorite_room = \"test\"\ncoffee_preference = \"test\"\nlunch_time = \"12:00\"\n[background]\nbio = \"test\"\nquirks = []\n",
-        )
-        .unwrap();
-        let result = load_agent_config(tmpfile.path());
-        assert!(result.is_err());
+        fn agent_toml(id: u16) -> String {
+            format!(
+                r#"[identity]
+id = {id}
+name = "Test"
+role = "Test"
+department = "Test"
+shift_set = 1
 
-        // Test id = 61 (invalid)
-        let mut tmpfile = NamedTempFile::new().unwrap();
-        std::io::Write::write_all(
-            &mut tmpfile,
-            b"[identity]\nid = 61\nname = \"Test\"\nrole = \"Test\"\ndepartment = \"Test\"\nshift_set = 1\n[personality]\nopenness = 0.5\nconscientiousness = 0.5\nextraversion = 0.5\nagreeableness = 0.5\nneuroticism = 0.5\ncaffeine_tolerance = 0.5\nmorning_person = true\n[preferences]\nfavorite_room = \"test\"\ncoffee_preference = \"test\"\nlunch_time = \"12:00\"\n[background]\nbio = \"test\"\nquirks = []\n",
-        )
-        .unwrap();
-        let result = load_agent_config(tmpfile.path());
-        assert!(result.is_err());
+[personality]
+openness = 0.5
+conscientiousness = 0.5
+extraversion = 0.5
+agreeableness = 0.5
+neuroticism = 0.5
+caffeine_tolerance = 0.5
+morning_person = true
+
+[preferences]
+favorite_room = "test"
+coffee_preference = "test"
+lunch_time = "12:00"
+
+[background]
+bio = "test"
+quirks = []
+"#
+            )
+        }
+
+        fn write_agent(id: u16) -> NamedTempFile {
+            let mut tmpfile = NamedTempFile::new().unwrap();
+            std::io::Write::write_all(&mut tmpfile, agent_toml(id).as_bytes()).unwrap();
+            tmpfile
+        }
+
+        let zero = write_agent(0);
+        assert!(load_agent_config(zero.path()).is_err());
+
+        let default_overflow = write_agent(61);
+        assert!(load_agent_config(default_overflow.path()).is_err());
+
+        let custom_valid = write_agent(61);
+        let validation = AgentConfigValidation::with_max_agent_id(120);
+        let loaded = load_agent_config_with_validation(custom_valid.path(), validation).unwrap();
+        assert_eq!(loaded.identity.id, 61);
+
+        let custom_overflow = write_agent(121);
+        assert!(load_agent_config_with_validation(custom_overflow.path(), validation).is_err());
     }
 }

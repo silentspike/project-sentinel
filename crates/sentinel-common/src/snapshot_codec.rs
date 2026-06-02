@@ -13,6 +13,48 @@ pub fn encode_world_snapshot(snapshot: &WorldSnapshot) -> anyhow::Result<Vec<u8>
     bincode::serde::encode_to_vec(snapshot, legacy_config()).context("World Snapshot serialisieren")
 }
 
+/// Heap-free cursor subset of a world snapshot.
+///
+/// Kani verifies this small contract with the same bincode legacy config as
+/// full world snapshots. The full `WorldSnapshot` codec remains covered by
+/// unit tests because its `String`/`Vec` payload graph is too large for the
+/// baseline solver budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotCursor {
+    pub schema_version: u32,
+    pub tick: u64,
+    pub ecs_tick: u64,
+    pub last_event_id: i64,
+}
+
+impl SnapshotCursor {
+    pub fn from_snapshot(snapshot: &WorldSnapshot) -> Self {
+        Self {
+            schema_version: snapshot.schema_version,
+            tick: snapshot.tick,
+            ecs_tick: snapshot.ecs.sim_tick,
+            last_event_id: snapshot.last_event_id,
+        }
+    }
+}
+
+pub fn encode_snapshot_cursor(cursor: SnapshotCursor) -> anyhow::Result<Vec<u8>> {
+    bincode::serde::encode_to_vec(cursor, legacy_config()).context("Snapshot Cursor serialisieren")
+}
+
+pub fn decode_snapshot_cursor(bytes: &[u8]) -> anyhow::Result<SnapshotCursor> {
+    let (cursor, consumed) =
+        bincode::serde::decode_from_slice::<SnapshotCursor, _>(bytes, legacy_config())
+            .context("Snapshot Cursor deserialisieren")?;
+    if consumed != bytes.len() {
+        return Err(anyhow!(
+            "Snapshot Cursor enthaelt {} ungenutzte Bytes",
+            bytes.len() - consumed
+        ));
+    }
+    Ok(cursor)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorldSnapshotV1 {
     snapshot_id: String,
@@ -111,6 +153,7 @@ mod tests {
                 shift_infos: Vec::new(),
                 relationships: Vec::new(),
                 llm_configs: Vec::new(),
+                task_states: Vec::new(),
                 sim_tick: 42,
                 sim_hour: 13.5,
                 sim_delta_seconds: 1.0,
@@ -129,6 +172,19 @@ mod tests {
         let decoded = decode_world_snapshot(&bytes).unwrap();
         assert!(decoded.fs_metadata.is_some());
         assert_eq!(decoded.schema_version, WorldSnapshot::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn cursor_roundtrip_preserves_replay_fields() {
+        let snapshot = base_snapshot();
+        let cursor = SnapshotCursor::from_snapshot(&snapshot);
+        let bytes = encode_snapshot_cursor(cursor).unwrap();
+        let decoded = decode_snapshot_cursor(&bytes).unwrap();
+
+        assert_eq!(decoded, cursor);
+        assert_eq!(decoded.tick, snapshot.tick);
+        assert_eq!(decoded.ecs_tick, snapshot.ecs.sim_tick);
+        assert_eq!(decoded.last_event_id, snapshot.last_event_id);
     }
 
     #[test]
@@ -168,6 +224,7 @@ mod tests {
                 shift_infos: Vec::new(),
                 relationships: Vec::new(),
                 llm_configs: Vec::new(),
+                task_states: Vec::new(),
                 sim_tick: 7,
                 sim_hour: 9.25,
                 sim_delta_seconds: 1.0,

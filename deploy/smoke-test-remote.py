@@ -9,17 +9,17 @@ import sys
 import time
 
 HEALTH_ENDPOINTS = [
-    (8080, "/health", "cortex-proxy"),
-    (8081, "/health", "cortex-control"),
-    (8082, "/health", "sentinel-judge"),
-    (8083, "/health", "sentinel-nats-bridge"),
-    (8000, "/api/health", "sentinel-dashboard"),
+    ("http", 8080, "/health", "cortex-proxy"),
+    ("http", 8081, "/health", "cortex-control"),
+    ("http", 8082, "/health", "sentinel-judge"),
+    ("http", 8083, "/health", "sentinel-nats-bridge"),
+    ("https", 8001, "/api/health", "sentinel-dashboard-backend"),
 ]
 
 SERVICES = [
     "sentinel-daemon",
     "sentinel-gateway",
-    "sentinel-dashboard",
+    "sentinel-dashboard-backend",
     "sentinel-projection",
     "sentinel-nightrun.timer",
     "nats-server",
@@ -34,10 +34,14 @@ start = time.time()
 all_healthy = False
 while time.time() - start < timeout:
     ok = 0
-    for port, path, _name in HEALTH_ENDPOINTS:
+    for scheme, port, path, _name in HEALTH_ENDPOINTS:
         try:
+            url = "%s://localhost:%d%s" % (scheme, port, path)
+            cmd = ["curl", "-sf", url]
+            if scheme == "https":
+                cmd.insert(1, "-k")
             r = subprocess.run(
-                ["curl", "-sf", "http://localhost:%d%s" % (port, path)],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=3,
@@ -60,10 +64,14 @@ print("%-25s %-10s %s" % ("Service", "Status", "Detail"))
 print("-" * 60)
 
 health_pass = 0
-for port, path, name in HEALTH_ENDPOINTS:
+for scheme, port, path, name in HEALTH_ENDPOINTS:
     try:
+        url = "%s://localhost:%d%s" % (scheme, port, path)
+        cmd = ["curl", "-sf", url]
+        if scheme == "https":
+            cmd.insert(1, "-k")
         r = subprocess.run(
-            ["curl", "-sf", "http://localhost:%d%s" % (port, path)],
+            cmd,
             capture_output=True,
             text=True,
             timeout=3,

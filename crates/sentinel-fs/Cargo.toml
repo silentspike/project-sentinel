@@ -18,6 +18,7 @@ sentinel-common = { path = "../sentinel-common" }
 sentinel-telemetry = { path = "../sentinel-telemetry" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+bincode = { workspace = true }
 sha2 = { workspace = true }
 blake3 = { workspace = true }
 tracing = { workspace = true }

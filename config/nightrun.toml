@@ -13,6 +13,10 @@ event_store_db = "data/events.db"
 # Verzeichnis mit Agent-TOML-Definitionen (fuer shift_set Filter)
 agent_config_dir = "config/agents"
 
+# Obergrenze fuer AgentId-Validierung beim Laden der Agent-TOMLs.
+# Gaia-generierte Firmen mit >60 Agents erhoehen diesen Wert passend.
+max_agent_id = 60
+
 # Pfad zur Job-Queue SQLite-Datenbank (Crash-Recovery)
 job_queue_path = "data/nightrun-jobs.db"
 

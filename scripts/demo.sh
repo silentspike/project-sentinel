@@ -4,8 +4,8 @@
 #
 # 1. Build the demo image (cached on subsequent runs).
 # 2. Bring up NATS + 5 Sentinel services via docker-compose.demo.yml.
-# 3. Wait for daemon, gateway, and dashboard to report healthy.
-# 4. Open the dashboard in the default browser (skipped under DEMO_NO_OPEN=1).
+# 3. Wait for daemon, gateway, and console to report healthy.
+# 4. Open the console in the default browser (skipped under DEMO_NO_OPEN=1).
 # 5. Run for DEMO_DURATION_SECONDS (default 600 = 10 min).
 # 6. Tear the stack down.
 #
@@ -46,17 +46,17 @@ until curl -fsS --max-time 3 http://127.0.0.1:18080/health >/dev/null 2>&1; do
     sleep 2
 done
 
-note "waiting for dashboard /health..."
+note "waiting for console /api/health..."
 deadline=$(( $(date +%s) + 60 ))
-until curl -fsS --max-time 3 http://127.0.0.1:18000/health >/dev/null 2>&1; do
-    [ "$(date +%s)" -lt "$deadline" ] || fail "dashboard did not respond in 60s"
+until curl -kfsS --max-time 3 https://127.0.0.1:18001/api/health >/dev/null 2>&1; do
+    [ "$(date +%s)" -lt "$deadline" ] || fail "console did not respond in 60s"
     sleep 2
 done
 
 note "stack is up — endpoints:"
 cat <<EOF
 
-  Dashboard       http://localhost:18000
+  Console         https://localhost:18001   (login key: demo)
   Gateway proxy   http://localhost:18080        (also exposes /metrics)
   Gateway ctrl    http://localhost:18081
   Judge           http://localhost:18082/health (also /metrics)
@@ -68,9 +68,9 @@ EOF
 
 if [ -z "${DEMO_NO_OPEN:-}" ]; then
     if command -v xdg-open >/dev/null 2>&1; then
-        xdg-open "http://localhost:18000" >/dev/null 2>&1 || true
+        xdg-open "https://localhost:18001" >/dev/null 2>&1 || true
     elif command -v open >/dev/null 2>&1; then
-        open "http://localhost:18000" >/dev/null 2>&1 || true
+        open "https://localhost:18001" >/dev/null 2>&1 || true
     fi
 fi
 

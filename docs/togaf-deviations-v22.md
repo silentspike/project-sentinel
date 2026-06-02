@@ -68,6 +68,68 @@ Each deviation records: **what** the spec says, **what** the code does,
 | Why | these artefacts describe AC-level evidence for issues that are now closed and whose acceptance criteria are no longer the public contract. They consist mostly of raw command output and intermediate iteration runs and are not useful as living documentation. The current public contract is reflected by the CI workflow status and the gap report. |
 | Revisit when | a public test-evidence portal becomes part of the release process |
 
+## DEV-006 — Nano-Container runtime defaults to WASM/WASI with native escape hatch
+
+| Field | Value |
+|-------|-------|
+| Cluster | 12 (Zielarchitektur / Nano-Container Platform) |
+| Status | Superseded by DEV-007 (#407) on 2026-05-29. Historical record only; no longer the active runtime contract. |
+| Spec | Cluster 12 leaves the defining platform fork open: a WASM-bound runtime with millisecond spin-up and high density, or arbitrary native code with full runtime freedom but container/Firecracker-like cost. |
+| Decision | WASM/WASI on Wasmtime is the default Nano-Container runtime contract. Arbitrary native code is not part of the default density/portability promise; it is allowed only through an explicit native Escape-Hatch-Pool with separate scheduling, stronger isolation, and no millisecond spin-up guarantee. |
+| Runtime contract | Default runtime: `wasm+wasi` via `crates/sentinel-wasm/` and the sandbox capability registry. Native runtime: opt-in pool for workloads that prove they cannot fit WASM/WASI, isolated outside the default hot path. |
+| Trade-offs | WASM/WASI wins density, portability, reproducible cold start, and least-privilege capability control, but constrains runtime freedom. Native code wins language/runtime freedom and compatibility with existing binaries, but loses the core density, portability, and deterministic spin-up advantages and increases host-isolation burden. |
+| Why | The current platform strength is small, portable, capability-scoped execution that can emerge from the agent system without becoming a generic container platform first. A native default would discard that advantage and pull the project back toward the existing container/Firecracker design space. The escape hatch preserves product flexibility without making native execution the baseline contract. |
+| Consequences | Follow-up work under #397 must design around `wasm+wasi` as the baseline. Native support must be tracked as an explicit exception path with separate capacity planning, security review, and verification. Clusters 00-11 remain untouched until a Cluster 12 building block is validated from concrete agent-system need. |
+| Files | `docs/togaf-deviations-v22.md`, `crates/sentinel-wasm/`, `crates/sentinel-sandbox/`, #396, #397 |
+| Revisit when | real customer or agent workloads repeatedly require native runtimes, WASI cannot cover the needed system interface, or native escape-hatch usage becomes common enough to threaten the platform's default density and security assumptions |
+
+## DEV-007 — Nano-Container CRI contract without a default runtime
+
+| Field | Value |
+|-------|-------|
+| Cluster | 12 (Zielarchitektur / Nano-Container Platform) |
+| Spec | Cluster 12 needs a Nano-Container execution contract but does not require a single runtime family. The architecture must remain open for dense in-process ECS workloads, WASM/WASI tools, hardened host processes, and later microVM isolation. |
+| Decision | The active Nano-Container contract is runtime-agnostic and CRI-style. Workloads select an explicit runtime key; there is no global default runtime. An orchestrator may configure an explicit fallback key, but that fallback is policy data, not an architectural default. |
+| Runtime contract | A compliant runtime implements seven operations: `spawn`, `exec`, `snapshot`, `restore`, `migrate`, `health`, and `isolate`. Initial runtime families are `ecs-native`, `wasm-wasmtime`, `bwrap-landlock`, and future `microvm`. |
+| Options considered | Option 1: fixed WASM/WASI default with native escape hatch (DEV-006). Option 2: native/container-first runtime as the baseline. Option 3: plural CRI contract with per-workload runtime selection. DEV-007 chooses Option 3. |
+| Trade-offs | The plural contract keeps runtime density and portability available where they fit, while allowing stronger process or microVM isolation for workloads that need it. The cost is a stricter conformance harness and explicit workload routing: every runtime must document snapshot semantics and every caller must choose a runtime key or a configured fallback. |
+| Why | The maintainer decision on 2026-05-29 defines Project Sentinel's Nano-Container axis as "Beyond Kubernetes": one contract, multiple runtime implementations, and workload-specific selection. This supersedes the earlier WASM-default choice without rejecting WASM/WASI as one strong runtime option. |
+| Consequences | #408 defines the shared `NanoRuntime` trait and conformance harness. #409 and #410 must prove their adapters against that harness. #411 owns registry and selection policy. Cross-architecture gate work (#394/#406) remains coupled: runtime contracts that cross architecture boundaries must keep replay, snapshot, and isolation evidence explicit. |
+| Files | `docs/togaf-deviations-v22.md`, `docs/togaf-gap-v22.md`, `crates/sentinel-common/src/nano_runtime.rs`, `crates/sentinel-runtime/`, `crates/sentinel-wasm/`, `crates/sentinel-sandbox/`, #397, #407, #408, #409, #410, #411 |
+| Revisit when | microVM support moves from future runtime family to implemented adapter; cross-node migration becomes a product requirement; or conformance evidence shows the seven-operation contract is too weak or too broad for real workloads |
+
+---
+
+## DEV-008 — Gaia operator console: reactive Claude-Code interface, CLI over MCP
+
+| Field | Value |
+|-------|-------|
+| Cluster | User interface / operator plane |
+| Spec | Sentinel needs a single user-facing interface (setup, conversational orchestration, observability, platform admin) over an already-autonomous company. The interface must reach the operator API, telemetry, events, and platform plane with minimal overhead. |
+| Decision | Gaia is a **reactive Claude-Code instance** sitting *above* the autonomous self-* systems — it never acts on its own, only on explicit user request. Tool access is a local **`sentinel-ctl` CLI** invoked via Bash, **not** an MCP server: Gaia runs `claude -p` on the same VM as the backend, so an MCP server (separate process + HTTP/SSE transport) is pure overhead. Mutating subcommands gate through policy-as-code (#391). |
+| Options considered | Option 1: autonomous Gaia agent with its own loop (rejected — autonomy already lives in the control planes). Option 2: MCP server for tool access (rejected — transport/process overhead for a co-located process). Option 3: reactive Gaia + local CLI tool. DEV-008 chooses Option 3. |
+| Trade-offs | CLI keeps tool access overhead-free and directly user/test-usable, at the cost of structured tool schemas an MCP server would provide. Reactive design keeps Gaia from colliding with the autonomous control planes; it must instead **dock onto** the existing `escalate_to_operator` path rather than duplicate any self-* loop. |
+| Why | Maintainer decision 2026-05-30. The company already self-heals/learns/improves (control planes, Platform-CP + `llm_analyzer` + `escalate_to_operator`, Judge, Nightrun, Hippocampus). Gaia is the user's window and hand, not a second controller. Overhead/IO/performance is the primary driver (polyglot principle). |
+| Consequences | New `sentinel-ctl`, Gaia readiness loop (`claude -p`, resume), task entity (ECS+events) for delegation, hybrid run model. Five guardrails apply: dock onto escalation, never overwrite personality/evolution, no collision with CP actions, do not override adaptive-tick, task entity coexists with emergent agent autonomy. |
+| Files | `docs/gaia-console-architecture.md` (SSOT), `services/sentinel-daemon/src/operator_api.rs`, `cmd/cortex-gateway/internal/compiler/structured.go` (Voice of Gaia / inner-voice), #391 |
+| Revisit when | Gaia must serve remote/multi-client (then reconsider a transport layer); or autonomy requirements change such that Gaia needs a standing actor loop |
+
+---
+
+## DEV-009 — Polyglot console frontend and CAS console data plane
+
+| Field | Value |
+|-------|-------|
+| Cluster | User interface / data plane |
+| Spec | The console must render rich live infographics for many agents at 120 fps, stay overhead/IO-minimal, and run on weak hardware as a side effect of that minimalism. |
+| Decision | **Polyglot per layer**, not one language: **SolidJS** for the DOM/reactivity layer (overhead-minimal at the DOM; a Rust/WASM UI framework would pay WASM↔JS bridge cost per DOM update), **Rust→WASM** workers for heavy data (CAS decode, dedup, msgpack/zstd, validation), **WebGL/Canvas** for live rendering + SVG for structure. Data flows over a **CAS console data plane** reusing `sentinel-fs` primitives (chunking, blake3, refcount, zstd) with push (WebTransport/QUIC) + client-manifest/server-delta sync, OPFS store. |
+| Options considered | Option 1: all-Rust/WASM frontend (Leptos/Dioxus) for stack consistency — rejected, the DOM-bridge overhead is against the goal. Option 2: all-JS — rejected, leaves heavy-data and CAS work on the main thread. Option 3: polyglot per layer. DEV-009 chooses Option 3. |
+| Trade-offs | Polyglot maximizes per-layer performance and reuses the proven 1:n-pointer/dedup engine (massive redundancy in agent conversations dedupes hard), at the cost of a TS/Rust boundary that must be kept narrow (only data crosses, not DOM logic). |
+| Why | Maintainer decision 2026-05-30: polyglot, best-of-all-worlds; the goal is overhead/IO/performance maximization. noaide/PixelPerfekt are UI-pattern references, not code ports. |
+| Consequences | New console frontend (SolidJS + Rust/WASM workers + WebGL), own tiling engine (niri/Hyprland style), CAS console data plane on `sentinel-fs`, WebTransport push replacing the 1s-poll dashboard. The Bun dashboard was removed after view parity verification in #433. |
+| Files | `docs/gaia-console-architecture.md` (SSOT), `crates/sentinel-fs/`, `console/`, `services/sentinel-dashboard-backend/`, #430, #431, #432, #433 |
+| Revisit when | DOM-bridge cost of Rust/WASM UI frameworks drops to parity with JS; or the data plane shows that a simpler transport suffices |
+
 ---
 
 For governance mechanisms see [docs/governance.md](governance.md). For

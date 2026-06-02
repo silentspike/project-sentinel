@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "scope": "First-party Rust sources under crates/ and services/.",
+  "exclude_prefixes": [
+    "crates/sentinel-common/src/generated"
+  ],
+  "max_unsafe_constructs": 19,
+  "notes": [
+    "Generated FlatBuffers bindings are excluded because they are machine-generated and regenerated from schemas.",
+    "The check also requires a nearby SAFETY comment for every counted unsafe construct."
+  ]
+}

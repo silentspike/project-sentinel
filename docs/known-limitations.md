@@ -77,6 +77,15 @@ demo `daemon.toml` caps `max_agents = 5` for the 10-minute window so the
 log stays readable and the CPU stays available. To run the full cohort,
 remove or raise the cap, expect higher steady-state CPU and memory.
 
+## Gaia generates config, not a zero-downtime live migration
+
+`sentinel-gaia` can generate and validate a complete company config tree
+(`gaia-spec.toml`, Agent TOMLs, `rooms.toml`, `daemon.toml`, and
+`nightrun.toml`) and can run a daemon dry-run against that tree. It does not
+perform a zero-downtime migration of an already running production company.
+Operators still need to place the generated config under the intended runtime
+path and restart or roll services according to their deployment procedure.
+
 ## Nightrun is one-shot in the demo
 
 `sentinel-nightrun` is included in the image but the demo compose stack
@@ -95,7 +104,6 @@ Live tracking lives at
 
 - Performance: tick-loop hot-path, dashboard polling, non-blocking nightrun
 - Resilience: daemon hardening
-- Feature: Gaia firmen-konfigurator (multi-tenant company definitions)
 
 These are intentionally open — they reflect post-v0.1.0-alpha roadmap, not
 regressions.

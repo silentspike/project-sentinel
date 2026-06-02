@@ -6,7 +6,7 @@
 //! - `CAS_REFCOUNT`: `sha256_hash` -> reference count (u32)
 
 use crate::cas::{CasStore, ChunkGcStats};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 use sentinel_common::FsMetadataDump;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -26,6 +26,8 @@ const CAS_REFCOUNT: TableDefinition<&[u8; 32], u32> = TableDefinition::new("cas_
 
 /// Grace-period Trash-Queue fuer null-ref CAS-Bloecke.
 const FS_TRASH_QUEUE: TableDefinition<&[u8; 32], u64> = TableDefinition::new("fs_trash_queue");
+
+const INODE_DATA_BINCODE_V1: &[u8; 4] = b"SFI1";
 
 // --- Types ---
 
@@ -103,11 +105,24 @@ impl InodeData {
     }
 
     fn serialize(&self) -> anyhow::Result<Vec<u8>> {
-        serde_json::to_vec(self).map_err(|e| anyhow::anyhow!("InodeData serialize: {e}"))
+        let payload = bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .map_err(|e| anyhow::anyhow!("InodeData bincode serialize: {e}"))?;
+        let mut bytes = Vec::with_capacity(INODE_DATA_BINCODE_V1.len() + payload.len());
+        bytes.extend_from_slice(INODE_DATA_BINCODE_V1);
+        bytes.extend_from_slice(&payload);
+        Ok(bytes)
     }
 
     fn deserialize(data: &[u8]) -> anyhow::Result<Self> {
-        serde_json::from_slice(data).map_err(|e| anyhow::anyhow!("InodeData deserialize: {e}"))
+        if let Some(payload) = data.strip_prefix(INODE_DATA_BINCODE_V1) {
+            let (decoded, _): (Self, usize) =
+                bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                    .map_err(|e| anyhow::anyhow!("InodeData bincode deserialize: {e}"))?;
+            return Ok(decoded);
+        }
+
+        serde_json::from_slice(data)
+            .map_err(|e| anyhow::anyhow!("InodeData legacy json deserialize: {e}"))
     }
 }
 
@@ -116,16 +131,46 @@ impl InodeData {
 /// Filesystem metadata backed by a single redb database.
 pub struct MetadataStore {
     db: Database,
+    durability: MetadataDurability,
+}
+
+/// Durability level for metadata write transactions.
+///
+/// `Immediate` is the default and fsyncs every commit. `Eventual` skips fsync
+/// for FUSE hot-path writes, trading crash durability for substantially lower
+/// VM write latency.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MetadataDurability {
+    #[default]
+    Immediate,
+    Eventual,
+}
+
+/// Aggregated metadata statistics for storage and dedup verification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetadataStorageStats {
+    pub regular_file_count: u64,
+    pub logical_regular_file_bytes: u64,
+    pub unreadable_inode_rows: u64,
 }
 
 impl MetadataStore {
     /// Open or create the metadata store at the given path.
     #[instrument(level = "debug", fields(path = %path.as_ref().display()))]
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::open_with_durability(path, MetadataDurability::Immediate)
+    }
+
+    /// Open or create the metadata store with a specific write durability.
+    #[instrument(level = "debug", fields(path = %path.as_ref().display(), ?durability))]
+    pub fn open_with_durability(
+        path: impl AsRef<Path>,
+        durability: MetadataDurability,
+    ) -> anyhow::Result<Self> {
         let db = Database::create(path.as_ref())
             .map_err(|e| anyhow::anyhow!("MetadataStore open: {e}"))?;
 
-        // Initialize all tables
+        // Initialize all tables with immediate durability.
         let write_txn = db.begin_write()?;
         {
             write_txn.open_table(FS_INODES)?;
@@ -135,7 +180,18 @@ impl MetadataStore {
         }
         write_txn.commit()?;
 
-        Ok(Self { db })
+        Ok(Self { db, durability })
+    }
+
+    fn begin_write(&self) -> anyhow::Result<WriteTransaction> {
+        let mut write_txn = self.db.begin_write()?;
+        match self.durability {
+            MetadataDurability::Immediate => {}
+            MetadataDurability::Eventual => {
+                write_txn.set_durability(redb::Durability::None)?;
+            }
+        }
+        Ok(write_txn)
     }
 
     // === INODE OPERATIONS ===
@@ -153,7 +209,7 @@ impl MetadataStore {
     /// Set inode metadata for an agent.
     pub fn set_inode(&self, agent_id: &str, inode: u64, data: &InodeData) -> anyhow::Result<()> {
         let serialized = data.serialize()?;
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         {
             let mut table = write_txn.open_table(FS_INODES)?;
             table.insert((agent_id, inode), serialized.as_slice())?;
@@ -164,7 +220,7 @@ impl MetadataStore {
 
     /// Remove an inode. Returns the old data if it existed.
     pub fn remove_inode(&self, agent_id: &str, inode: u64) -> anyhow::Result<Option<InodeData>> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         let old = {
             let mut table = write_txn.open_table(FS_INODES)?;
             let x = match table.remove((agent_id, inode))? {
@@ -201,7 +257,7 @@ impl MetadataStore {
         name: &str,
         child_inode: u64,
     ) -> anyhow::Result<()> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         {
             let mut table = write_txn.open_table(FS_DIRENTS)?;
             table.insert((agent_id, parent, name), child_inode)?;
@@ -217,7 +273,7 @@ impl MetadataStore {
         parent: u64,
         name: &str,
     ) -> anyhow::Result<Option<u64>> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         let old = {
             let mut table = write_txn.open_table(FS_DIRENTS)?;
             // Deliberate match instead of .map() — redb AccessGuard lifetime workaround
@@ -261,14 +317,16 @@ impl MetadataStore {
 
     /// Increment reference count. Returns the new count.
     pub fn inc_refcount(&self, hash: &[u8; 32]) -> anyhow::Result<u32> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         let new_count = {
             let mut table = write_txn.open_table(CAS_REFCOUNT)?;
             let current = table.get(hash)?.map(|g| g.value()).unwrap_or(0);
             let new = current + 1;
             table.insert(hash, new)?;
-            let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
-            trash.remove(hash)?;
+            if current == 0 {
+                let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
+                trash.remove(hash)?;
+            }
             new
         };
         write_txn.commit()?;
@@ -277,7 +335,7 @@ impl MetadataStore {
 
     /// Decrement reference count. Returns the new count (clamped to 0).
     pub fn dec_refcount(&self, hash: &[u8; 32]) -> anyhow::Result<u32> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         let new_count = {
             let mut table = write_txn.open_table(CAS_REFCOUNT)?;
             let current = table.get(hash)?.map(|g| g.value()).unwrap_or(0);
@@ -316,7 +374,7 @@ impl MetadataStore {
         hash: &[u8; 32],
         trashed_at_ms: Option<u64>,
     ) -> anyhow::Result<bool> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         let updated = {
             let mut table = write_txn.open_table(FS_TRASH_QUEUE)?;
             match trashed_at_ms {
@@ -333,7 +391,7 @@ impl MetadataStore {
 
     /// Remove a hash from the trash queue and re-establish a refcount if needed.
     pub fn restore_from_trash(&self, hash: &[u8; 32]) -> anyhow::Result<bool> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         let restored = {
             let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
             if trash.remove(hash)?.is_none() {
@@ -405,10 +463,33 @@ impl MetadataStore {
         })
     }
 
+    /// Sum logical payload bytes for live storage/dedup verification.
+    pub fn storage_stats(&self) -> anyhow::Result<MetadataStorageStats> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(FS_INODES)?;
+        let mut stats = MetadataStorageStats::default();
+        for entry in table.iter()? {
+            let (_, value) = entry?;
+            let data = match InodeData::deserialize(value.value()) {
+                Ok(data) => data,
+                Err(_) => {
+                    stats.unreadable_inode_rows += 1;
+                    continue;
+                }
+            };
+            if data.kind == FileKind::Regular && data.size != u64::MAX {
+                stats.regular_file_count += 1;
+                stats.logical_regular_file_bytes =
+                    stats.logical_regular_file_bytes.saturating_add(data.size);
+            }
+        }
+        Ok(stats)
+    }
+
     /// Restore all sentinel-fs metadata tables from a snapshot dump.
     pub fn restore_all_tables(&self, dump: &FsMetadataDump) -> anyhow::Result<()> {
         let current = self.dump_all_tables()?;
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         {
             let mut inodes = write_txn.open_table(FS_INODES)?;
             for (agent_id, inode, _) in &current.inodes {
@@ -480,7 +561,7 @@ impl MetadataStore {
 
         let gc_stats = cas.gc(&expired_hashes)?;
 
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         {
             let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
             let refs = write_txn.open_table(CAS_REFCOUNT)?;
@@ -512,7 +593,7 @@ impl MetadataStore {
         data: &InodeData,
     ) -> anyhow::Result<()> {
         let serialized = data.serialize()?;
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         {
             let mut inodes = write_txn.open_table(FS_INODES)?;
             inodes.insert((agent_id, inode), serialized.as_slice())?;
@@ -524,12 +605,75 @@ impl MetadataStore {
                 let mut refs = write_txn.open_table(CAS_REFCOUNT)?;
                 let current = refs.get(&data.hash)?.map(|g| g.value()).unwrap_or(0);
                 refs.insert(&data.hash, current + 1)?;
-                let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
-                trash.remove(&data.hash)?;
+                if current == 0 {
+                    let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
+                    trash.remove(&data.hash)?;
+                }
             }
         }
         write_txn.commit()?;
         Ok(())
+    }
+
+    /// Atomically allocate an inode and create an entry in one transaction.
+    ///
+    /// This is the hot-path variant for agent writes: it avoids the old
+    /// `next_inode()` transaction followed by a second `create_file()`
+    /// transaction. When `ensure_root` is true, the agent root inode is also
+    /// checked/created inside the same write transaction.
+    pub fn create_file_allocating_inode(
+        &self,
+        agent_id: &str,
+        parent_inode: u64,
+        name: &str,
+        data: &InodeData,
+        ensure_root: bool,
+    ) -> anyhow::Result<u64> {
+        let serialized = data.serialize()?;
+
+        let write_txn = self.begin_write()?;
+        let inode = {
+            let mut inodes = write_txn.open_table(FS_INODES)?;
+
+            if ensure_root && inodes.get((agent_id, 1u64))?.is_none() {
+                let root = InodeData::directory(0o755).serialize()?;
+                inodes.insert((agent_id, 1u64), root.as_slice())?;
+            }
+
+            let current = inodes
+                .get((agent_id, 0u64))?
+                .map(|g| {
+                    let bytes = g.value();
+                    if bytes.len() == 8 {
+                        u64::from_le_bytes(bytes.try_into().unwrap())
+                    } else {
+                        1
+                    }
+                })
+                .unwrap_or(1);
+            let inode = current + 1;
+            inodes.insert((agent_id, 0u64), inode.to_le_bytes().as_slice())?;
+            inodes.insert((agent_id, inode), serialized.as_slice())?;
+            inode
+        };
+
+        {
+            let mut dirents = write_txn.open_table(FS_DIRENTS)?;
+            dirents.insert((agent_id, parent_inode, name), inode)?;
+        }
+
+        if data.kind == FileKind::Regular {
+            let mut refs = write_txn.open_table(CAS_REFCOUNT)?;
+            let current = refs.get(&data.hash)?.map(|g| g.value()).unwrap_or(0);
+            refs.insert(&data.hash, current + 1)?;
+            if current == 0 {
+                let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
+                trash.remove(&data.hash)?;
+            }
+        }
+
+        write_txn.commit()?;
+        Ok(inode)
     }
 
     /// Atomically remove a file: remove inode + dirent + dec refcount in one transaction.
@@ -541,7 +685,7 @@ impl MetadataStore {
         name: &str,
         inode: u64,
     ) -> anyhow::Result<Option<InodeData>> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         let old_data = {
             let mut inodes = write_txn.open_table(FS_INODES)?;
             let old = match inodes.remove((agent_id, inode))? {
@@ -588,7 +732,7 @@ impl MetadataStore {
     /// Allocate the next inode number for an agent.
     /// Uses a special inode 0 entry to track the counter.
     pub fn next_inode(&self, agent_id: &str) -> anyhow::Result<u64> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         let next = {
             let mut table = write_txn.open_table(FS_INODES)?;
             // Use inode 0 as the counter (never a real inode in FUSE — root is 1)
@@ -652,6 +796,24 @@ mod tests {
         let old = store.remove_inode(agent, 1).unwrap().unwrap();
         assert_eq!(old.size, 2048);
         assert!(store.get_inode(agent, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn inode_data_serializes_as_bincode_with_legacy_json_fallback() {
+        let data = InodeData::regular([0xA1; 32], 1024, 0o644);
+
+        let encoded = data.serialize().unwrap();
+        assert!(encoded.starts_with(INODE_DATA_BINCODE_V1));
+        let decoded = InodeData::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.kind, FileKind::Regular);
+        assert_eq!(decoded.hash, [0xA1; 32]);
+        assert_eq!(decoded.size, 1024);
+
+        let legacy_json = serde_json::to_vec(&data).unwrap();
+        let legacy_decoded = InodeData::deserialize(&legacy_json).unwrap();
+        assert_eq!(legacy_decoded.kind, FileKind::Regular);
+        assert_eq!(legacy_decoded.hash, [0xA1; 32]);
+        assert_eq!(legacy_decoded.size, 1024);
     }
 
     #[test]
@@ -752,6 +914,67 @@ mod tests {
 
         // Refcount incremented
         assert_eq!(store.get_refcount(&hash).unwrap(), 1);
+    }
+
+    #[test]
+    fn create_file_allocating_inode_is_single_path_counter_and_refcount() {
+        let (store, _dir) = temp_meta();
+        let agent = "AGENT-77";
+        let hash = [0xC7; 32];
+        let data = InodeData::regular(hash, 512, 0o644);
+
+        let first = store
+            .create_file_allocating_inode(agent, 1, "first.txt", &data, true)
+            .unwrap();
+        let second = store
+            .create_file_allocating_inode(agent, 1, "second.txt", &data, true)
+            .unwrap();
+
+        assert_eq!(first, 2);
+        assert_eq!(second, 3);
+        assert!(store.get_inode(agent, 1).unwrap().is_some());
+        assert_eq!(store.get_dirent(agent, 1, "first.txt").unwrap(), Some(2));
+        assert_eq!(store.get_dirent(agent, 1, "second.txt").unwrap(), Some(3));
+        assert_eq!(store.get_refcount(&hash).unwrap(), 2);
+        assert_eq!(store.next_inode(agent).unwrap(), 4);
+    }
+
+    #[test]
+    fn create_file_allocating_inode_removes_zero_ref_trash_entry() {
+        let (store, _dir) = temp_meta();
+        let agent = "AGENT-78";
+        let hash = [0xC8; 32];
+        let data = InodeData::regular(hash, 512, 0o644);
+
+        let first = store
+            .create_file_allocating_inode(agent, 1, "first.txt", &data, true)
+            .unwrap();
+        store.remove_file(agent, 1, "first.txt", first).unwrap();
+        assert_eq!(store.get_refcount(&hash).unwrap(), 0);
+        assert!(store.get_trash_timestamp(&hash).unwrap().is_some());
+
+        let second = store
+            .create_file_allocating_inode(agent, 1, "second.txt", &data, true)
+            .unwrap();
+
+        assert_eq!(second, 3);
+        assert_eq!(store.get_refcount(&hash).unwrap(), 1);
+        assert_eq!(store.get_trash_timestamp(&hash).unwrap(), None);
+    }
+
+    #[test]
+    fn open_with_eventual_metadata_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetadataStore::open_with_durability(
+            dir.path().join("meta.redb"),
+            MetadataDurability::Eventual,
+        )
+        .unwrap();
+
+        assert_eq!(store.durability, MetadataDurability::Eventual);
+        let data = InodeData::directory(0o755);
+        store.set_inode("AGENT-01", 1, &data).unwrap();
+        assert!(store.get_inode("AGENT-01", 1).unwrap().is_some());
     }
 
     #[test]
