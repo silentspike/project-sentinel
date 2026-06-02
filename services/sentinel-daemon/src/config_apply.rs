@@ -59,7 +59,7 @@ pub fn building_changed(old: &BuildingConfig, new: &BuildingConfig) -> bool {
 /// Validiert eine Apply-Anfrage **vor jeder Mutation**. Sammelt ALLE Fehler (keine
 /// Early-Exit-Ueberraschung). Gilt fuer beide Modi: nach einem Apply enthaelt die Welt genau
 /// `cmd.agents` → die Agent-Anzahl muss `max_agents` (#414) respektieren; das Gebaeude muss alle
-/// Agents fassen (Kapazitaet) und konsistente Adjacency haben; jede Personality in [0,1]; jede
+/// Agents fassen (Kapazitaet) und konsistente Adjacency haben; jede Personality in \[0,1]; jede
 /// AgentId in den Daemon-Grenzen; keine doppelten IDs.
 pub fn validate_config_apply(
     cmd: &OperatorConfigApplyCommand,
