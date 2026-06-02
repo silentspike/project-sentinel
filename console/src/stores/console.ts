@@ -57,18 +57,36 @@ export interface KpiRow {
   [k: string]: unknown;
 }
 
+export interface EventLogRow {
+  id: number;
+  event_id: string;
+  event_type: string;
+  aggregate_id: string;
+  payload: string;
+  correlation_id?: string;
+  causation_id?: string | null;
+  tick: number;
+  timestamp_ms: number;
+  compensation_type?: string;
+  [k: string]: unknown;
+}
+
 interface ConsoleState {
   agents: AgentRow[];
   rooms: RoomRow[];
   kpi: KpiRow | null;
+  events: EventLogRow[];
   lastTopic: string | null;
   lastHello: Record<string, unknown> | null;
 }
+
+export const EVENT_LOG_CAP = 10_000;
 
 const [state, setState] = createStore<ConsoleState>({
   agents: [],
   rooms: [],
   kpi: null,
+  events: [],
   lastTopic: null,
   lastHello: null,
 });
@@ -77,6 +95,28 @@ const [status, setStatus] = createSignal<ConnectionStatus>("disconnected");
 const [frameCount, setFrameCount] = createSignal(0);
 // Geteilter Agent-Filter (Control-Center setzt ihn, Dashboard-Liste filtert reaktiv darauf).
 const [agentFilter, setAgentFilter] = createSignal("");
+
+function eventKey(row: EventLogRow): string | null {
+  if (typeof row.id === "number" && Number.isFinite(row.id)) return `id:${row.id}`;
+  if (row.event_id) return `event:${row.event_id}`;
+  return null;
+}
+
+export function appendEventRows(current: readonly EventLogRow[], rows: EventLogRow[]): EventLogRow[] {
+  if (rows.length === 0) return current.slice();
+  const byKey = new Map<string, EventLogRow>();
+  for (const row of current) {
+    const key = eventKey(row);
+    if (key) byKey.set(key, row);
+  }
+  for (const row of rows) {
+    const key = eventKey(row);
+    if (key) byKey.set(key, row);
+  }
+  return [...byKey.values()]
+    .sort((a, b) => (a.id ?? 0) - (b.id ?? 0))
+    .slice(-EVENT_LOG_CAP);
+}
 
 /** Verarbeitet einen gepushten topic-Frame in den reaktiven Store. */
 export function ingestFrame(topic: string, value: unknown) {
@@ -93,6 +133,9 @@ export function ingestFrame(topic: string, value: unknown) {
   } else if (topic === "kpi" && value && typeof value === "object") {
     const row = (value as { kpi?: KpiRow | null }).kpi;
     setState("kpi", row ?? null);
+  } else if (topic === "event_log" && value && typeof value === "object") {
+    const rows = (value as { events?: EventLogRow[] }).events;
+    if (Array.isArray(rows)) setState("events", appendEventRows(state.events, rows));
   }
 }
 

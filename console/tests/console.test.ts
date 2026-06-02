@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { uuidFieldToString, frameHeaderSize } from "../src/transport/codec";
-import { ingestFrame, consoleStore } from "../src/stores/console";
+import { appendEventRows, EVENT_LOG_CAP, ingestFrame, consoleStore, type EventLogRow } from "../src/stores/console";
 
 describe("codec helpers", () => {
   it("uuidFieldToString maps 16 raw bytes to hyphenated UUID", () => {
@@ -115,4 +115,48 @@ describe("store reconcile (delta-merge from pushed frames)", () => {
     expect(consoleStore.kpi?.active_agents).toBe(12);
     expect(consoleStore.kpi?.total_actions).toBe(30);
   });
+
+  it("ingestFrame('event_log') appends by id, dedupes, and keeps ascending order", () => {
+    ingestFrame("event_log", {
+      events: [
+        eventRow(12, "chaos_triggered", "kueche", { event_type: "AirConBroken", target_room: "kueche" }),
+        eventRow(10, "agent_spawned", "1", { name: "Thomas" }),
+      ],
+    });
+    ingestFrame("event_log", {
+      events: [
+        eventRow(12, "chaos_triggered", "kueche", { event_type: "PrinterBroken", target_room: "kueche" }),
+        eventRow(13, "agent_action_received", "1", { content: "Ich pruefe den Drucker", target_room: "kueche" }),
+      ],
+    });
+    const tail = consoleStore.events.slice(-3);
+    expect(tail.map((event) => event.id)).toEqual([10, 12, 13]);
+    expect(tail[1].payload).toContain("PrinterBroken");
+    expect(consoleStore.lastTopic).toBe("event_log");
+  });
+
+  it("appendEventRows caps the in-memory event log at 10k rows", () => {
+    const rows = Array.from({ length: EVENT_LOG_CAP + 5 }, (_, index) =>
+      eventRow(index + 1, "tick_snapshot", "runtime", { tick: index + 1 }),
+    );
+    const capped = appendEventRows([], rows);
+    expect(capped).toHaveLength(EVENT_LOG_CAP);
+    expect(capped[0].id).toBe(6);
+    expect(capped.at(-1)?.id).toBe(EVENT_LOG_CAP + 5);
+  });
 });
+
+function eventRow(id: number, eventType: string, aggregateId: string, payload: Record<string, unknown>): EventLogRow {
+  return {
+    id,
+    event_id: `evt-${id}`,
+    event_type: eventType,
+    aggregate_id: aggregateId,
+    payload: JSON.stringify(payload),
+    correlation_id: "",
+    causation_id: null,
+    tick: id * 10,
+    timestamp_ms: 1_700_000_000_000 + id,
+    compensation_type: "none",
+  };
+}

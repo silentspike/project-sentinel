@@ -124,8 +124,6 @@ export function pollForChanges(): void {
     broadcast({ type: "room_update", rooms: rooms.map((r) => toRoomResponse(r, occupantsMap[r.room_id] ?? [])) });
 
     broadcast({ type: "cockpit_update" });
-    broadcast({ type: "chaos_update" });
-    broadcast({ type: "activity_update" });
 
     lastGlobalEventId = currentMax;
   } catch {

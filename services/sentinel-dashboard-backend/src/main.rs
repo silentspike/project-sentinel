@@ -2,12 +2,12 @@
 //!
 //! - HTTPS :8001 (self-signed) — secure context fuer die WebTransport-API + ServeDir(Bundle) + API.
 //! - WebTransport/QUIC same-origin auf dem HTTPS-Port (`wt_bind`-Default :8001, UDP) — topic+msgpack+zstd Push.
-//! - Event-Stream-Push (#432): NATS SENTINEL_EVENTS -> Delta-Frames (ersetzt das 1s-Projection-Polling).
+//! - Event-Stream-Push (#432/#433): NATS SENTINEL_EVENTS -> Projection-Frames, events.db -> EventLog-Frames.
 //! - Auth: httpOnly-Session (#402/#405) fuer HTTP/Control- + Projection-Read-Routen (#463); der
 //!   WebTransport-Pfad nutzt ein kurzlebiges Einmal-Ticket (`?t=`, WT traegt keine Cookies).
 //!
-//! Laeuft parallel zum Bun-Dashboard (:8000) — phased cutover. Der HTTP-Router wird in
-//! `sentinel_dashboard_backend::build_app` gebaut (testbar fuer die Auth-Gates, #463).
+//! Der HTTP-Router wird in `sentinel_dashboard_backend::build_app` gebaut (testbar fuer die
+//! Auth-Gates, #463).
 
 use std::net::SocketAddr;
 
@@ -53,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
     // Event-Stream-Subscriber (#432): NATS SENTINEL_EVENTS -> Delta-Frames in den Broadcast-Kanal
     // (ersetzt das alte 1s-Projection-Polling). Eigener Daemon-Task mit Reconnect-Backoff.
     tokio::spawn(event_sub::run_event_subscriber(state.clone()));
+    tokio::spawn(event_sub::run_event_log_pusher(state.clone()));
 
     let app = build_app(state.clone());
 
