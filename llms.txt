@@ -10,6 +10,7 @@
 - [docs/governance.md](docs/governance.md): Governance mechanisms mapped to code paths
 - [docs/togaf-gap-v22.md](docs/togaf-gap-v22.md): Per-cluster implementation status
 - [docs/togaf-deviations-v22.md](docs/togaf-deviations-v22.md): Deviation register (DEV-001/002/003)
+- [docs/component-readmes.md](docs/component-readmes.md): Component-level README index for current Rust/Go modules
 - [docs/glossary.md](docs/glossary.md): PixelPerfekt narrative, agent-layer model, terminology
 
 ## Agent Layers
@@ -25,7 +26,7 @@
 - [services/sentinel-judge](services/sentinel-judge/): Quality & drift monitoring (NATS streaming + LLM analysis).
 - [services/sentinel-nightrun](services/sentinel-nightrun/): Nightly batch consolidation, deterministic replay, hash chain.
 - [services/sentinel-nats-bridge](services/sentinel-nats-bridge/): eBPF metrics dual-publish.
-- [dashboard](dashboard/): Bun + Hono real-time dashboard with WebSocket.
+- [console](console/): SolidJS console served by `sentinel-dashboard-backend` with WebTransport push.
 
 ## Infrastructure
 - [crates/sentinel-zenoh](crates/sentinel-zenoh/): Zenoh pub/sub (shared-memory local <10μs, TCP distributed).
@@ -55,7 +56,7 @@ See [docs/security-test-report.md](docs/security-test-report.md).
 ## Building
 - Rust: `cargo remote -- build --workspace` (build server configurable via .make.local)
 - Go: `cd cmd/cortex-gateway && go build ./...`
-- Dashboard: `cd dashboard && bun install && bun run dev`
+- Console: `cd console && bun install && bun run dev`
 - All: `make build`
 - Tests: `make test`
 - CI: 16 GitHub Workflows (cargo-deny, CodeQL, OSSF Scorecard, Renovate, Coverage)
@@ -65,7 +66,7 @@ See [docs/security-test-report.md](docs/security-test-report.md).
 make demo                               # one command: build + run + open dashboard
 # or: docker compose -f docker-compose.demo.yml up
 ```
-5 agents, 10-minute simulation. Dashboard: http://localhost:18000 (port 18000
-because 8000 is commonly taken). See README.md "What the docker demo shows
+5 agents, 10-minute simulation. Console: https://localhost:18001 (demo key:
+`demo`). See README.md "What the docker demo shows
 — and what it does not" for the kernel-feature limitations of running this
 stack inside Docker.

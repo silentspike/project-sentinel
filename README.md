@@ -92,7 +92,7 @@ flowchart TB
     J3["Hippocampus<br/>(NMDA night-run)"]
   end
 
-  DASH["Dashboard<br/>Bun + Hono + WebSocket"]
+  DASH["Console<br/>SolidJS + Rust WebTransport"]
 
   AGENTS -.->|"sandboxed in"| SANDBOX
   AGENTS -->|prompts| GATEWAY
@@ -110,7 +110,7 @@ flowchart TB
 | World simulation | Rust workspace (15 crates), `bevy_ecs`    |
 | LLM gateway      | Go (`cmd/cortex-gateway`)                 |
 | Quality monitor  | Go (`services/sentinel-judge`)            |
-| Dashboard        | Bun + Hono + vanilla-JS (`dashboard/`)    |
+| Console          | SolidJS + Rust/WebTransport (`console/`, `sentinel-dashboard-backend`) |
 | Pub/Sub          | Zenoh (Rust SHM <10 µs) + NATS JetStream  |
 | Storage          | redb (state) + Limbo SQLite (events)      |
 
@@ -148,6 +148,21 @@ The `.env` file holds runtime values (NATS URL, dashboard port). The
 `.make.local` file holds build values (cargo remote server address, deploy
 target). Neither file is committed.
 
+### Generate a Company Config
+
+Gaia can bootstrap a fresh Sentinel company configuration without LLM calls:
+
+```bash
+cargo run -p sentinel-gaia -- print-example-spec > /tmp/gaia-spec.toml
+cargo run -p sentinel-gaia -- init --spec /tmp/gaia-spec.toml --output-dir /tmp/sentinel-config --yes
+cargo run -p sentinel-gaia -- validate --output-dir /tmp/sentinel-config
+```
+
+For an operator-style smoke, build `sentinel-daemon` and add
+`--daemon-dry-run --daemon-bin <path-to-sentinel-daemon>` to `init`. Gaia
+persists its own input as `gaia-spec.toml` and deliberately leaves
+`company.toml` to the Gateway/company-context schema.
+
 ### Build
 
 ```bash
@@ -163,14 +178,14 @@ transparently use it.
 
 ![Sentinel demo dashboard](docs/images/sentinel-demo.gif)
 
-*The dashboard surfaces runtime governance signals: control-plane decisions, sandbox enforcer status, audit-event throughput, and agent quality drift.*
+*The console surfaces runtime governance signals: control-plane decisions, sandbox enforcer status, audit-event throughput, and agent quality drift.*
 
 ```bash
 make demo                                 # build binaries + image, then run
 # or, step by step:
-make demo-binaries                        # build sentinel-daemon + sentinel-nightrun
+make demo-binaries                        # build daemon, projection, nightrun, console backend
 make demo-image                           # docker build
-./scripts/demo.sh                         # run + open dashboard, tear down after 10 min
+./scripts/demo.sh                         # run + open console, tear down after 10 min
 ```
 
 The Rust workspace is heavy. `make demo-binaries` uses `cargo-remote`
@@ -180,15 +195,14 @@ a developer laptop). See [CONTRIBUTING.md](CONTRIBUTING.md) for
 cargo-remote setup if you want to offload the Rust compile.
 
 Runs five agents through a 10-minute morning shift with the default
-workload configuration. Dashboard: http://localhost:18000 (host port
-18000 is used because 8000 is commonly bound by local nginx/dev servers;
-adjust in `docker-compose.demo.yml` if you have 8000 free).
+workload configuration. Console: https://localhost:18001 (self-signed
+local certificate; demo login key: `demo`).
 
 #### What the docker demo shows — and what it does not
 
 The compose stack is deliberately a **behavioral demo**, not a full
 production deployment. It is meant to give a recruiter or curious reader
-a working dashboard in one command, not to reproduce the full sandbox
+a working console in one command, not to reproduce the full sandbox
 story.
 
 | Feature                                 | Demo container | VM deploy |
@@ -234,7 +248,7 @@ Full agenda: [`docs/workshop-agent-runtime-governance.md`](docs/workshop-agent-r
 
 The included docker demo (`make demo`) is a deliberate behavioral
 subset. It is meant to give a recruiter or curious reader a working
-dashboard in one command, not to reproduce the full sandbox story.
+console in one command, not to reproduce the full sandbox story.
 
 ### What the demo proves
 - ECS world simulation, bio-engine, physics, room sim — 60-persona
@@ -243,7 +257,7 @@ dashboard in one command, not to reproduce the full sandbox story.
   trail captured per agent.
 - Cortex Gateway 7-step pipeline + 10-rule synthesis engine — agent
   reasoning is observable.
-- Dashboard (Bun + Hono + WebSocket) — live agent activity, drift,
+- Console (SolidJS + Rust WebTransport) — live agent activity, drift,
   quality metrics.
 
 ### What the demo does not exercise
@@ -274,7 +288,7 @@ target; the docker demo is a deliberate behavioral subset.
 | ECS world (bevy_ecs), bio + physics + room sim | ✅ implemented + exercised | yes | yes |
 | Event sourcing (Limbo SQLite, idempotent, replayable) | ✅ implemented + exercised | yes | yes |
 | Cortex Gateway 7-step pipeline + 10-rule synthesis engine | ✅ implemented + exercised | yes | yes |
-| Dashboard (Bun + Hono + WebSocket) | ✅ implemented + exercised | yes | yes |
+| Console (SolidJS + Rust WebTransport) | ✅ implemented + exercised | yes | yes |
 | sentinel-judge quality + drift monitoring (NATS streaming) | ✅ implemented + exercised | yes | yes |
 | sentinel-projection CQRS read-models | ✅ implemented + exercised | yes | yes |
 | sentinel-nightrun batch consolidation, deterministic replay | ✅ implemented, manual trigger | yes | yes |
@@ -290,7 +304,7 @@ target; the docker demo is a deliberate behavioral subset.
 | Tag verified-badge on GitHub | ✅ verified=true (Ed25519) | n/a | n/a |
 | OpenGraph social-preview image | ⏳ image in repo (`docs/images/opengraph-preview.png`); upload via repo Settings → Social preview pending (#351) | n/a | n/a |
 | Demo binaries for arm64 / Apple Silicon | ⏳ planned (currently linux-x86_64 only) | n/a | n/a |
-| Multi-tenant company configs ("Gaia firmen-konfigurator") | ⏳ tracked as roadmap issue (#266) | n/a | n/a |
+| Multi-tenant company configs (`sentinel-gaia`) | ✅ deterministic generator + CLI init/validate path | n/a | yes (offline config generation + daemon dry-run) |
 
 See [docs/known-limitations.md](docs/known-limitations.md) for the full
 caveat list.
@@ -299,13 +313,14 @@ caveat list.
 
 | Path                         | Contents                                                    |
 |------------------------------|-------------------------------------------------------------|
-| `crates/`                    | 15 Rust crates (ECS, bio, physics, sandbox, eBPF, …)        |
+| `crates/`                    | 17 Rust crates (ECS, bio, physics, sandbox, eBPF, etc.)     |
+| `services/sentinel-gaia/`    | Gaia company-config generator + CLI                         |
 | `services/sentinel-daemon/`  | Daemon + controlplane                                       |
 | `services/sentinel-judge/`   | Quality / drift monitor (Go)                                |
 | `services/sentinel-nightrun/`| Nightly consolidation (Rust)                                |
 | `services/sentinel-nats-bridge/` | NATS event bridge (Go)                                  |
 | `cmd/cortex-gateway/`        | LLM proxy + synthesis (Go)                                  |
-| `dashboard/`                 | Bun + Hono real-time UI                                     |
+| `console/`                   | SolidJS console served by the Rust dashboard backend        |
 | `pkg/sentinel-go/`           | Shared Go package (judge heuristics, eventstore, messaging) |
 | `config/`                    | Agent TOMLs, room layout, simulation parameters             |
 | `docs/`                      | Architecture, governance, gap, deviations, glossary         |
@@ -321,6 +336,7 @@ caveat list.
 | [docs/governance.md](docs/governance.md)                     | Governance mechanisms ↔ code path mapping     |
 | [docs/togaf-gap-v22.md](docs/togaf-gap-v22.md)               | Per-cluster implementation status             |
 | [docs/togaf-deviations-v22.md](docs/togaf-deviations-v22.md) | Intentional deviations from the spec          |
+| [docs/component-readmes.md](docs/component-readmes.md)        | Component-level README index for Rust/Go modules |
 | [docs/glossary.md](docs/glossary.md)                         | Agent-persona narrative + agent-layer glossary |
 | [docs/security-test-report.md](docs/security-test-report.md) | Sandbox breakout test results                 |
 | [docs/workshop-agent-runtime-governance.md](docs/workshop-agent-runtime-governance.md) | 45-min hands-on workshop: how to evaluate runtime governance for LLM coding agents |

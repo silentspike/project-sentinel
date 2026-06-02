@@ -12,7 +12,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result as AnyResult};
-use sentinel_fs::{cas::CasStore, layer::LayerManager, metadata::MetadataStore};
+use sentinel_fs::{
+    cas::CasStore,
+    layer::LayerManager,
+    metadata::{FileKind, MetadataStore},
+};
 use sentinel_redb::{ApiCpSnapshot, StateStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,8 +26,8 @@ use tracing::{debug, info, warn};
 
 use sentinel_common::{
     DomainEvent, DomainEventPayload, EventType, OperatorBroadcastCommand, OperatorChaosCommand,
-    OperatorChatCommand, OperatorCommand, OperatorGaiaCommand, OperatorNightrunCommand,
-    OperatorRoomStimulusCommand, RoomStimulusType,
+    OperatorChatCommand, OperatorCommand, OperatorDmCommand, OperatorGaiaCommand,
+    OperatorNightrunCommand, OperatorRoomStimulusCommand, OperatorTaskCommand, RoomStimulusType,
 };
 
 use crate::config::OperatorApiConfig;
@@ -43,10 +47,13 @@ const OPERATOR_NIGHTRUN_PATH: &str = "/operator/nightrun";
 const OPERATOR_SNAPSHOTS_PATH: &str = "/operator/snapshots";
 const OPERATOR_SNAPSHOT_PATH: &str = "/operator/snapshot";
 const OPERATOR_RESTORE_PATH: &str = "/operator/restore";
+const OPERATOR_CONFIG_APPLY_PATH: &str = "/operator/config/apply";
 const OPERATOR_PRUNE_PATH: &str = "/operator/prune";
 const OPERATOR_CHAT_PATH: &str = "/operator/chat";
 const OPERATOR_GAIA_PATH: &str = "/operator/gaia";
 const OPERATOR_BROADCAST_PATH: &str = "/operator/broadcast";
+const OPERATOR_TASK_PATH: &str = "/operator/task";
+const OPERATOR_DM_PATH: &str = "/operator/dm";
 const OPERATOR_PLATFORM_ANALYZE_PATH: &str = "/operator/platform-analyze";
 const OPERATOR_PLATFORM_TRIGGER_TEST_PATH: &str = "/operator/platform-trigger-test";
 const OPERATOR_PLATFORM_ANALYSIS_TEST_PATH: &str = "/operator/platform-analysis-test";
@@ -61,6 +68,8 @@ const OPERATOR_SECURITY_FS_TRASH_PATH: &str = "/operator/security/fs-trash";
 const OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH: &str = "/operator/security/fs-trash-fixture";
 const OPERATOR_SECURITY_FS_TRASH_AGE_PATH: &str = "/operator/security/fs-trash-age";
 const OPERATOR_SECURITY_FS_TRASH_GC_PATH: &str = "/operator/security/fs-trash-gc";
+const OPERATOR_SECURITY_FS_STATS_PATH: &str = "/operator/security/fs-stats";
+const OPERATOR_SECURITY_FS_DEDUP_BENCHMARK_PATH: &str = "/operator/security/fs-dedup-benchmark";
 const OPERATOR_SECURITY_FS_RANSOMWARE_TEST_PATH: &str = "/operator/security/fs-ransomware-test";
 const OPERATOR_SECURITY_AGENT_RUNTIME_STATE_PATH: &str = "/operator/security/agent-runtime-state";
 const OPERATOR_SECURITY_WRITE_ANOMALY_TEST_PATH: &str = "/operator/security/write-anomaly-test";
@@ -68,6 +77,9 @@ const OPERATOR_SECURITY_LANDLOCK_TEST_PATH: &str = "/operator/security/landlock-
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024;
 const MAX_APICP_SNAPSHOT_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Config-Apply (#425) traegt eine ganze Firma inline (agents[] + building) — eine 60er-Firma
+/// ist ~64 KB, Gaia-Firmen koennen deutlich groesser sein. Grosszuegiges Limit (4 MB).
+const MAX_CONFIG_APPLY_BODY_BYTES: usize = 4 * 1024 * 1024;
 const OPERATOR_KEY_HEADER: &str = "x-sentinel-operator-key";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -121,7 +133,37 @@ pub struct TriggerNightrunRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TriggerNightrunResponse {
     pub accepted: bool,
+    #[serde(default)]
+    pub agents_queued: u32,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NightrunAgentCounts {
+    total: u32,
+    by_shift: HashMap<u8, u32>,
+}
+
+impl NightrunAgentCounts {
+    pub fn from_shift_sets(shift_sets: impl IntoIterator<Item = u8>) -> Self {
+        let mut total = 0u32;
+        let mut by_shift = HashMap::new();
+        for shift_set in shift_sets {
+            if shift_set == 0 {
+                continue;
+            }
+            total += 1;
+            *by_shift.entry(shift_set).or_insert(0) += 1;
+        }
+        Self { total, by_shift }
+    }
+
+    fn agents_queued(&self, shift_set: Option<u8>) -> u32 {
+        match shift_set {
+            Some(shift) => self.by_shift.get(&shift).copied().unwrap_or(0),
+            None => self.total,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -229,6 +271,70 @@ struct AgentRuntimeStateResponse {
     fs_mount: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct FsStorageStatsResponse {
+    accepted: bool,
+    fs_mount: Option<String>,
+    cas_blob_count: u64,
+    cas_bytes_on_disk: u64,
+    regular_file_count: u64,
+    logical_regular_file_bytes: u64,
+    dedup_savings_bytes: u64,
+    dedup_ratio_percent: f64,
+    unreadable_inode_rows: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FsDedupBenchmarkRequest {
+    agent_name: String,
+    #[serde(default = "default_fs_dedup_benchmark_writes")]
+    writes: u32,
+    #[serde(default = "default_fs_dedup_benchmark_bytes")]
+    bytes_per_write: usize,
+    #[serde(default)]
+    file_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct FsLatencySummary {
+    min_us: u64,
+    p50_us: u64,
+    p95_us: u64,
+    max_us: u64,
+    mean_us: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct FsDedupBenchmarkResponse {
+    accepted: bool,
+    agent_name: String,
+    fs_agent_dir: String,
+    file_prefix: String,
+    bytes_per_write: usize,
+    seed_write_us: u64,
+    dedup_hit_writes: u32,
+    dedup_hits: u32,
+    logical_bytes_written: u64,
+    cas_blob_count_before: u64,
+    cas_blob_count_after: u64,
+    cas_bytes_before: u64,
+    cas_bytes_after: u64,
+    cas_bytes_delta: u64,
+    dedup_ratio_percent: f64,
+    target_87_percent_met: bool,
+    dedup_hit_latency_us_min: u64,
+    dedup_hit_latency_us_p50: u64,
+    dedup_hit_latency_us_p95: u64,
+    dedup_hit_latency_us_max: u64,
+    dedup_hit_latency_us_mean: f64,
+    dedup_hit_cas_check_latency: FsLatencySummary,
+    dedup_hit_write_file_latency: FsLatencySummary,
+    dedup_hit_loop_latency: FsLatencySummary,
+    storage_stats_before_us: u64,
+    storage_stats_after_us: u64,
+    target_100us_met: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct WriteAnomalyTestRequest {
     agent_name: String,
@@ -286,8 +392,12 @@ struct AppState {
     platform_tx: mpsc::Sender<PlatformControlCommand>,
     runtime_tx: mpsc::Sender<RuntimeControlCommand>,
     nightrun_tx: mpsc::Sender<OperatorNightrunCommand>,
+    nightrun_agent_counts: NightrunAgentCounts,
     snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
+    config_apply_tx: mpsc::Sender<sentinel_common::OperatorConfigApplyCommand>,
+    config_apply_max_agents: usize,
+    config_apply_validation: sentinel_common::agent_config::AgentConfigValidation,
     event_store: Arc<sentinel_limbo::EventStore>,
     prune_tx: mpsc::Sender<i64>,
     state_store: Arc<StateStore>,
@@ -335,6 +445,14 @@ fn default_write_anomaly_alignment() -> bool {
     true
 }
 
+fn default_fs_dedup_benchmark_writes() -> u32 {
+    64
+}
+
+fn default_fs_dedup_benchmark_bytes() -> usize {
+    4096
+}
+
 impl ApiError {
     fn to_response(&self) -> HttpResponse {
         match self {
@@ -374,8 +492,12 @@ pub async fn start_server(
     platform_tx: mpsc::Sender<PlatformControlCommand>,
     runtime_tx: mpsc::Sender<RuntimeControlCommand>,
     nightrun_tx: mpsc::Sender<OperatorNightrunCommand>,
+    nightrun_agent_counts: NightrunAgentCounts,
     snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
+    config_apply_tx: mpsc::Sender<sentinel_common::OperatorConfigApplyCommand>,
+    config_apply_max_agents: usize,
+    config_apply_validation: sentinel_common::agent_config::AgentConfigValidation,
     event_store: Arc<sentinel_limbo::EventStore>,
     prune_tx: mpsc::Sender<i64>,
     state_store: Arc<sentinel_redb::StateStore>,
@@ -397,8 +519,12 @@ pub async fn start_server(
         platform_tx,
         runtime_tx,
         nightrun_tx,
+        nightrun_agent_counts,
         snapshot_tx,
         restore_tx,
+        config_apply_tx,
+        config_apply_max_agents,
+        config_apply_validation,
         event_store,
         prune_tx,
         state_store,
@@ -492,6 +618,10 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Ok(payload) => json_response(200, payload),
                 Err(err) => err.to_response(),
             },
+            OPERATOR_SECURITY_FS_STATS_PATH => match inspect_fs_storage_stats(state) {
+                Ok(payload) => json_response(200, payload),
+                Err(err) => err.to_response(),
+            },
             OPERATOR_SECURITY_AGENT_RUNTIME_STATE_PATH => {
                 match inspect_agent_runtime_state(query.get("agent_id"), state) {
                     Ok(payload) => json_response(200, payload),
@@ -557,6 +687,7 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                     202,
                     TriggerNightrunResponse {
                         accepted: true,
+                        agents_queued: 0,
                         message: "Snapshot-Erstellung gestartet".to_string(),
                     },
                 ),
@@ -580,12 +711,60 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                     202,
                     TriggerNightrunResponse {
                         accepted: true,
+                        agents_queued: 0,
                         message: "Restore gestartet".to_string(),
                     },
                 ),
                 Err(_) => {
                     ApiError::ServiceUnavailable("Restore-Channel nicht verfuegbar").to_response()
                 }
+            }
+        }
+        OPERATOR_CONFIG_APPLY_PATH => {
+            let payload: sentinel_common::OperatorConfigApplyCommand =
+                match serde_json::from_slice(&request.body) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return ApiError::BadRequest(
+                            "Request-JSON ungueltig (erwartet {mode, agents[], building})",
+                        )
+                        .to_response();
+                    }
+                };
+            // Validierung VOR dem Send — invalid => 4xx, KEIN Apply (#425 AC-3).
+            if let Err(errors) = crate::config_apply::validate_config_apply(
+                &payload,
+                state.config_apply_max_agents,
+                state.config_apply_validation,
+            ) {
+                warn!(
+                    error_count = errors.len(),
+                    "Config-Apply abgelehnt (Validierung)"
+                );
+                return json_response(
+                    400,
+                    serde_json::json!({
+                        "accepted": false,
+                        "errors": errors,
+                    }),
+                );
+            }
+            info!(
+                mode = ?payload.mode,
+                agents = payload.agents.len(),
+                rooms = payload.building.rooms.len(),
+                "Config-Apply via Operator-API angefordert"
+            );
+            match state.config_apply_tx.send(payload) {
+                Ok(()) => json_response(
+                    202,
+                    serde_json::json!({
+                        "accepted": true,
+                        "message": "Config-Apply gestartet (tick-synchron)"
+                    }),
+                ),
+                Err(_) => ApiError::ServiceUnavailable("Config-Apply-Channel nicht verfuegbar")
+                    .to_response(),
             }
         }
         OPERATOR_PRUNE_PATH => {
@@ -650,6 +829,48 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Ok(()) => json_response(
                     202,
                     serde_json::json!({"accepted": true, "message": "Gedanke eingepflanzt"}),
+                ),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Command-Channel nicht verfuegbar").to_response()
+                }
+            }
+        }
+        OPERATOR_TASK_PATH => {
+            let cmd: OperatorTaskCommand = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest(
+                        "JSON ungueltig (action + je nach Aktion task_id/title/assigned_to noetig)",
+                    )
+                    .to_response();
+                }
+            };
+            info!(action = ?cmd.action, task_id = ?cmd.task_id, "Task-Kommando empfangen (#438)");
+            match state.command_tx.send(OperatorCommand::Task(cmd)) {
+                Ok(()) => json_response(
+                    202,
+                    serde_json::json!({"accepted": true, "message": "Task-Kommando angenommen"}),
+                ),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Command-Channel nicht verfuegbar").to_response()
+                }
+            }
+        }
+        OPERATOR_DM_PATH => {
+            let cmd: OperatorDmCommand = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest(
+                        "JSON ungueltig (target_agent_id, message, sender_name noetig)",
+                    )
+                    .to_response();
+                }
+            };
+            info!(agent_id = cmd.target_agent_id, "DM empfangen (#437)");
+            match state.command_tx.send(OperatorCommand::Dm(cmd)) {
+                Ok(()) => json_response(
+                    202,
+                    serde_json::json!({"accepted": true, "message": "DM zugestellt"}),
                 ),
                 Err(_) => {
                     ApiError::ServiceUnavailable("Command-Channel nicht verfuegbar").to_response()
@@ -816,6 +1037,18 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Err(err) => err.to_response(),
             }
         }
+        OPERATOR_SECURITY_FS_DEDUP_BENCHMARK_PATH => {
+            let payload: FsDedupBenchmarkRequest = match serde_json::from_slice(&request.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    return ApiError::BadRequest("Request-JSON ungueltig").to_response();
+                }
+            };
+            match run_fs_dedup_benchmark(payload, state) {
+                Ok(response) => json_response(200, response),
+                Err(err) => err.to_response(),
+            }
+        }
         OPERATOR_SECURITY_FS_RANSOMWARE_TEST_PATH => {
             let payload: FsRansomwareTestRequest = match serde_json::from_slice(&request.body) {
                 Ok(p) => p,
@@ -975,6 +1208,8 @@ fn dispatch_nightrun_trigger(
         "Nightrun-Trigger via Operator-API empfangen"
     );
 
+    let agents_queued = state.nightrun_agent_counts.agents_queued(payload.shift_set);
+
     state
         .nightrun_tx
         .send(command)
@@ -982,6 +1217,7 @@ fn dispatch_nightrun_trigger(
 
     Ok(TriggerNightrunResponse {
         accepted: true,
+        agents_queued,
         message: "Nightrun-Konsolidierung gestartet".to_string(),
     })
 }
@@ -996,6 +1232,7 @@ fn dispatch_platform_analyze(
 
     Ok(TriggerNightrunResponse {
         accepted: true,
+        agents_queued: 0,
         message: "Platform-Analyse eingeplant".to_string(),
     })
 }
@@ -1043,6 +1280,7 @@ fn dispatch_platform_trigger_test(
 
     Ok(TriggerNightrunResponse {
         accepted: true,
+        agents_queued: 0,
         message: format!("Platform-Testtrigger {trigger} eingeplant"),
     })
 }
@@ -1129,6 +1367,7 @@ fn dispatch_platform_analysis_test(
 
     Ok(TriggerNightrunResponse {
         accepted: true,
+        agents_queued: 0,
         message: "Platform-Analyse-Test eingeplant".to_string(),
     })
 }
@@ -1516,6 +1755,251 @@ fn run_fs_trash_gc(
         freed_from_trash: stats.freed_from_trash,
         freed_bytes: stats.freed_bytes,
     })
+}
+
+fn inspect_fs_storage_stats(
+    state: &AppState,
+) -> std::result::Result<FsStorageStatsResponse, ApiError> {
+    let layer = open_fs_layer(state)?;
+    let stats = layer
+        .storage_stats()
+        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Storage-Stats nicht lesbar"))?;
+    Ok(FsStorageStatsResponse {
+        accepted: true,
+        fs_mount: state.fs_mount.clone(),
+        cas_blob_count: stats.cas_blob_count,
+        cas_bytes_on_disk: stats.cas_bytes_on_disk,
+        regular_file_count: stats.regular_file_count,
+        logical_regular_file_bytes: stats.logical_regular_file_bytes,
+        dedup_savings_bytes: stats.dedup_savings_bytes,
+        dedup_ratio_percent: stats.dedup_ratio_percent,
+        unreadable_inode_rows: stats.unreadable_inode_rows,
+    })
+}
+
+fn run_fs_dedup_benchmark(
+    payload: FsDedupBenchmarkRequest,
+    state: &AppState,
+) -> std::result::Result<FsDedupBenchmarkResponse, ApiError> {
+    let agent_name = payload.agent_name.trim();
+    if agent_name.is_empty() {
+        return Err(ApiError::BadRequest("agent_name fehlt"));
+    }
+    if payload.writes == 0 || payload.writes > 512 {
+        return Err(ApiError::BadRequest(
+            "writes muss zwischen 1 und 512 liegen",
+        ));
+    }
+    if payload.bytes_per_write == 0 || payload.bytes_per_write > 64 * 1024 {
+        return Err(ApiError::BadRequest(
+            "bytes_per_write muss zwischen 1 und 65536 liegen",
+        ));
+    }
+
+    let requested_prefix = payload.file_prefix.as_deref().unwrap_or("issue379");
+    let file_prefix = format!(
+        "{}-{}",
+        validate_benchmark_file_prefix(requested_prefix)?,
+        uuid::Uuid::now_v7()
+    );
+    let fs_agent_dir = fs_agent_dir_for_name(state, agent_name)?;
+    let layer = open_fs_layer(state)?;
+    let parent_inode = ensure_issue379_benchmark_dir(&layer, &fs_agent_dir)?;
+    let content = dedup_benchmark_content(payload.bytes_per_write, &file_prefix);
+    let content_hash = CasStore::hash(&content);
+
+    let stats_before_started = Instant::now();
+    let before = layer
+        .storage_stats()
+        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Storage-Stats nicht lesbar"))?;
+    let storage_stats_before_us = elapsed_us(stats_before_started.elapsed());
+    let seed_started = Instant::now();
+    layer
+        .write_file(
+            &fs_agent_dir,
+            parent_inode,
+            &format!("{file_prefix}-seed.bin"),
+            &content,
+            0o644,
+        )
+        .map_err(|_| ApiError::ServiceUnavailable("Dedup-Benchmark Seed-Write fehlgeschlagen"))?;
+    let seed_write_us = elapsed_us(seed_started.elapsed());
+
+    let mut cas_check_latencies = Vec::with_capacity(payload.writes as usize);
+    let mut write_file_latencies = Vec::with_capacity(payload.writes as usize);
+    let mut loop_latencies = Vec::with_capacity(payload.writes as usize);
+    let hit_file_names: Vec<String> = (0..payload.writes)
+        .map(|idx| format!("{file_prefix}-hit-{idx:04}.bin"))
+        .collect();
+    let mut dedup_hits = 0u32;
+    for name in &hit_file_names {
+        let loop_started = Instant::now();
+        let cas_check_started = Instant::now();
+        if layer.cas().contains(&content_hash) {
+            dedup_hits += 1;
+        }
+        cas_check_latencies.push(elapsed_us(cas_check_started.elapsed()));
+
+        let write_started = Instant::now();
+        layer
+            .write_file(&fs_agent_dir, parent_inode, name, &content, 0o644)
+            .map_err(|_| ApiError::ServiceUnavailable("Dedup-Benchmark Write fehlgeschlagen"))?;
+        write_file_latencies.push(elapsed_us(write_started.elapsed()));
+        loop_latencies.push(elapsed_us(loop_started.elapsed()));
+    }
+
+    let stats_after_started = Instant::now();
+    let after = layer
+        .storage_stats()
+        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Storage-Stats nicht lesbar"))?;
+    let storage_stats_after_us = elapsed_us(stats_after_started.elapsed());
+    let logical_bytes_written =
+        u64::from(payload.writes + 1).saturating_mul(payload.bytes_per_write as u64);
+    let cas_bytes_delta = after
+        .cas_bytes_on_disk
+        .saturating_sub(before.cas_bytes_on_disk);
+    let dedup_ratio_percent = if logical_bytes_written == 0 {
+        0.0
+    } else {
+        (logical_bytes_written.saturating_sub(cas_bytes_delta) as f64 * 100.0)
+            / logical_bytes_written as f64
+    };
+    let cas_check_summary = latency_summary(cas_check_latencies);
+    let write_file_summary = latency_summary(write_file_latencies);
+    let loop_summary = latency_summary(loop_latencies);
+    let latency_min = write_file_summary.min_us;
+    let latency_max = write_file_summary.max_us;
+    let latency_p50 = write_file_summary.p50_us;
+    let latency_p95 = write_file_summary.p95_us;
+    let latency_mean = write_file_summary.mean_us;
+
+    Ok(FsDedupBenchmarkResponse {
+        accepted: true,
+        agent_name: agent_name.to_string(),
+        fs_agent_dir,
+        file_prefix,
+        bytes_per_write: payload.bytes_per_write,
+        seed_write_us,
+        dedup_hit_writes: payload.writes,
+        dedup_hits,
+        logical_bytes_written,
+        cas_blob_count_before: before.cas_blob_count,
+        cas_blob_count_after: after.cas_blob_count,
+        cas_bytes_before: before.cas_bytes_on_disk,
+        cas_bytes_after: after.cas_bytes_on_disk,
+        cas_bytes_delta,
+        dedup_ratio_percent,
+        target_87_percent_met: dedup_ratio_percent >= 87.0,
+        dedup_hit_latency_us_min: latency_min,
+        dedup_hit_latency_us_p50: latency_p50,
+        dedup_hit_latency_us_p95: latency_p95,
+        dedup_hit_latency_us_max: latency_max,
+        dedup_hit_latency_us_mean: latency_mean,
+        dedup_hit_cas_check_latency: cas_check_summary,
+        dedup_hit_write_file_latency: write_file_summary,
+        dedup_hit_loop_latency: loop_summary,
+        storage_stats_before_us,
+        storage_stats_after_us,
+        target_100us_met: latency_p95 <= 100,
+    })
+}
+
+fn latency_summary(mut latencies: Vec<u64>) -> FsLatencySummary {
+    latencies.sort_unstable();
+    let min_us = *latencies.first().unwrap_or(&0);
+    let max_us = *latencies.last().unwrap_or(&0);
+    let p50_us = percentile_us(&latencies, 0.50);
+    let p95_us = percentile_us(&latencies, 0.95);
+    let mean_us = if latencies.is_empty() {
+        0.0
+    } else {
+        latencies.iter().sum::<u64>() as f64 / latencies.len() as f64
+    };
+
+    FsLatencySummary {
+        min_us,
+        p50_us,
+        p95_us,
+        max_us,
+        mean_us,
+    }
+}
+
+fn validate_benchmark_file_prefix(prefix: &str) -> std::result::Result<String, ApiError> {
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return Err(ApiError::BadRequest(
+            "file_prefix muss 1 bis 64 Zeichen lang sein",
+        ));
+    }
+    if !trimmed
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(ApiError::BadRequest(
+            "file_prefix darf nur ASCII alnum, Punkt, Bindestrich und Unterstrich enthalten",
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn ensure_issue379_benchmark_dir(
+    layer: &LayerManager,
+    agent_id: &str,
+) -> std::result::Result<u64, ApiError> {
+    const BENCHMARK_DIR: &str = ".issue379-dedup";
+    if let Some(inode) = layer
+        .lookup_dirent(agent_id, 1, BENCHMARK_DIR)
+        .map_err(|_| ApiError::ServiceUnavailable("Dedup-Benchmark Dirent-Lookup fehlgeschlagen"))?
+    {
+        let data = layer
+            .lookup_inode(agent_id, inode)
+            .map_err(|_| {
+                ApiError::ServiceUnavailable("Dedup-Benchmark Inode-Lookup fehlgeschlagen")
+            })?
+            .ok_or(ApiError::ServiceUnavailable(
+                "Dedup-Benchmark Verzeichnis-Inode fehlt",
+            ))?;
+        if data.kind != FileKind::Directory {
+            return Err(ApiError::ServiceUnavailable(
+                "Dedup-Benchmark Pfad ist kein Verzeichnis",
+            ));
+        }
+        return Ok(inode);
+    }
+    layer
+        .mkdir(agent_id, 1, BENCHMARK_DIR, 0o755)
+        .map_err(|_| ApiError::ServiceUnavailable("Dedup-Benchmark Verzeichnis nicht anlegbar"))
+}
+
+fn dedup_benchmark_content(len: usize, file_prefix: &str) -> Vec<u8> {
+    let digest = Sha256::digest(file_prefix.as_bytes());
+    let mut seed_bytes = [0u8; 8];
+    seed_bytes.copy_from_slice(&digest[..8]);
+    let mut state = u64::from_le_bytes(seed_bytes);
+    let mut output = Vec::with_capacity(len);
+    for index in 0..len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state = state
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(index as u64);
+        output.push((state >> 32) as u8);
+    }
+    output
+}
+
+fn elapsed_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn percentile_us(sorted_values: &[u64], percentile: f64) -> u64 {
+    if sorted_values.is_empty() {
+        return 0;
+    }
+    let index = ((sorted_values.len() - 1) as f64 * percentile).ceil() as usize;
+    sorted_values[index.min(sorted_values.len() - 1)]
 }
 
 fn inspect_agent_runtime_state(
@@ -2242,6 +2726,7 @@ async fn read_http_request(stream: &mut TcpStream) -> std::result::Result<HttpRe
 fn max_body_bytes_for_path(path: &str) -> usize {
     match request_path(path) {
         OPERATOR_APICP_SNAPSHOT_PATH => MAX_APICP_SNAPSHOT_BODY_BYTES,
+        OPERATOR_CONFIG_APPLY_PATH => MAX_CONFIG_APPLY_BODY_BYTES,
         _ => MAX_BODY_BYTES,
     }
 }
@@ -2333,8 +2818,13 @@ mod tests {
             platform_tx,
             runtime_tx,
             nightrun_tx,
+            nightrun_agent_counts: NightrunAgentCounts::from_shift_sets([1, 1, 2, 3]),
             snapshot_tx: mpsc::channel().0,
             restore_tx: mpsc::channel().0,
+            config_apply_tx: mpsc::channel().0,
+            config_apply_max_agents: 60,
+            config_apply_validation:
+                sentinel_common::agent_config::AgentConfigValidation::with_max_agent_id(60),
             event_store: Arc::new(
                 sentinel_limbo::EventStore::open(":memory:")
                     .expect("in-memory EventStore fuer Tests"),
@@ -2422,6 +2912,24 @@ mod tests {
             headers: HashMap::new(),
             body: serde_json::to_vec(&body).unwrap(),
         }
+    }
+
+    fn test_get_request(path: &str) -> HttpRequest {
+        HttpRequest {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        }
+    }
+
+    fn attach_test_fs_layer(state: &mut AppState) -> Arc<LayerManager> {
+        let cas = CasStore::open(&state.data_dir).unwrap();
+        let meta = MetadataStore::open(state.data_dir.join("metadata.redb")).unwrap();
+        let layer = Arc::new(LayerManager::new(cas, meta));
+        layer.init_base_root().unwrap();
+        state.fs_layer = Some(Arc::clone(&layer));
+        layer
     }
 
     #[test]
@@ -2552,6 +3060,234 @@ mod tests {
             }
             other => panic!("unerwartetes Kommando: {other:?}"),
         }
+    }
+
+    fn config_apply_agent(id: u16, openness: f32) -> sentinel_common::agent_config::AgentConfig {
+        use sentinel_common::agent_config::*;
+        AgentConfig {
+            identity: IdentityConfig {
+                id,
+                name: format!("Agent{id}"),
+                role: "Dev".to_string(),
+                department: "Dev".to_string(),
+                shift_set: 1,
+                kpis: vec![],
+                reports_to: None,
+                direct_reports: vec![],
+            },
+            personality: PersonalityConfig {
+                openness,
+                conscientiousness: 0.5,
+                extraversion: 0.5,
+                agreeableness: 0.5,
+                neuroticism: 0.5,
+                caffeine_tolerance: 0.5,
+                morning_person: true,
+            },
+            preferences: PreferencesConfig {
+                favorite_room: "empfang".to_string(),
+                coffee_preference: "espresso".to_string(),
+                lunch_time: "12:30".to_string(),
+            },
+            background: BackgroundConfig {
+                bio: "bio".to_string(),
+                quirks: vec![],
+            },
+            runtime: RuntimeSelectionConfig::default(),
+            capabilities: CapabilitiesConfig::default(),
+        }
+    }
+
+    fn config_apply_building() -> sentinel_common::room::BuildingConfig {
+        use sentinel_common::room::*;
+        BuildingConfig {
+            building: BuildingMeta {
+                name: "Test".to_string(),
+                address: "Teststr. 1".to_string(),
+                floors: 1,
+            },
+            rooms: vec![RoomConfig {
+                id: "empfang".to_string(),
+                name: "Empfang".to_string(),
+                floor: 0,
+                capacity: 10,
+                room_type: RoomType::Common,
+                adjacent: vec![],
+                department: None,
+                has_coffee_machine: false,
+                has_printer: false,
+            }],
+        }
+    }
+
+    fn config_apply_cmd(
+        agents: Vec<sentinel_common::agent_config::AgentConfig>,
+    ) -> serde_json::Value {
+        let cmd = sentinel_common::OperatorConfigApplyCommand {
+            mode: sentinel_common::ApplyMode::Live,
+            agents,
+            building: config_apply_building(),
+        };
+        serde_json::to_value(&cmd).unwrap()
+    }
+
+    #[test]
+    fn config_apply_valid_request_is_accepted_and_forwarded() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let (tx, apply_rx) = mpsc::channel();
+        state.config_apply_tx = tx;
+
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_CONFIG_APPLY_PATH,
+                config_apply_cmd(vec![config_apply_agent(1, 0.5), config_apply_agent(2, 0.6)]),
+            ),
+            &state,
+        );
+        assert_eq!(response.status, 202);
+
+        let received = apply_rx.recv().unwrap();
+        assert_eq!(received.agents.len(), 2);
+        assert_eq!(received.mode, sentinel_common::ApplyMode::Live);
+    }
+
+    #[test]
+    fn config_apply_invalid_personality_rejected_without_send() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let (tx, apply_rx) = mpsc::channel();
+        state.config_apply_tx = tx;
+
+        // openness 1.5 > 1.0 -> Validierung schlaegt fehl
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_CONFIG_APPLY_PATH,
+                config_apply_cmd(vec![config_apply_agent(1, 1.5)]),
+            ),
+            &state,
+        );
+        assert_eq!(response.status, 400);
+        let parsed: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(parsed["accepted"], serde_json::json!(false));
+        assert!(parsed["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.as_str().unwrap().contains("personality invalid")));
+        // KEIN Command gesendet
+        assert!(
+            apply_rx.try_recv().is_err(),
+            "invalid config must not be sent"
+        );
+    }
+
+    #[test]
+    fn config_apply_requires_auth() {
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_CONFIG_APPLY_PATH,
+                config_apply_cmd(vec![config_apply_agent(1, 0.5)]),
+            ),
+            &state,
+        );
+        assert_eq!(response.status, 401);
+    }
+
+    #[test]
+    fn nightrun_request_returns_agents_queued_and_forwards_command() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let (nightrun_tx, nightrun_rx) = mpsc::channel();
+        state.nightrun_tx = nightrun_tx;
+        state.nightrun_agent_counts = NightrunAgentCounts::from_shift_sets([1, 1, 2, 3]);
+
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_NIGHTRUN_PATH,
+                serde_json::json!({
+                    "shift_set": 1,
+                    "dry_run": false
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 202);
+        let payload: TriggerNightrunResponse = serde_json::from_slice(&response.body).unwrap();
+        assert!(payload.accepted);
+        assert_eq!(payload.agents_queued, 2);
+        let command = nightrun_rx.recv().unwrap();
+        assert_eq!(command.shift_set, Some(1));
+        assert!(!command.dry_run);
+    }
+
+    #[test]
+    fn fs_storage_stats_get_reports_logical_and_cas_bytes() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let layer = attach_test_fs_layer(&mut state);
+        let fs_agent_dir = fs_agent_dir_for_name(&state, "Test Agent").unwrap();
+        let content = b"same content for fs stats";
+        layer
+            .write_file(&fs_agent_dir, 1, "stats-a.bin", content, 0o644)
+            .unwrap();
+        layer
+            .write_file(&fs_agent_dir, 1, "stats-b.bin", content, 0o644)
+            .unwrap();
+
+        let response =
+            handle_http_request(test_get_request(OPERATOR_SECURITY_FS_STATS_PATH), &state);
+
+        assert_eq!(response.status, 200);
+        let payload: FsStorageStatsResponse = serde_json::from_slice(&response.body).unwrap();
+        assert!(payload.accepted);
+        assert_eq!(payload.cas_blob_count, 1);
+        assert_eq!(
+            payload.logical_regular_file_bytes,
+            (content.len() * 2) as u64
+        );
+        assert!(payload.dedup_savings_bytes > 0);
+    }
+
+    #[test]
+    fn fs_dedup_benchmark_reports_hits_ratio_and_latency() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        attach_test_fs_layer(&mut state);
+
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_SECURITY_FS_DEDUP_BENCHMARK_PATH,
+                serde_json::json!({
+                    "agent_name": "Test Agent",
+                    "writes": 8,
+                    "bytes_per_write": 512,
+                    "file_prefix": "test-379"
+                }),
+            ),
+            &state,
+        );
+
+        assert_eq!(response.status, 200);
+        let payload: FsDedupBenchmarkResponse = serde_json::from_slice(&response.body).unwrap();
+        assert!(payload.accepted);
+        assert_eq!(payload.agent_name, "Test Agent");
+        assert_eq!(payload.fs_agent_dir, "AGENT-07");
+        assert_eq!(payload.dedup_hit_writes, 8);
+        assert_eq!(payload.dedup_hits, 8);
+        assert_eq!(payload.logical_bytes_written, 9 * 512);
+        assert!(payload.cas_blob_count_after > payload.cas_blob_count_before);
+        assert!(payload.target_87_percent_met);
+        assert!(payload.dedup_hit_latency_us_max >= payload.dedup_hit_latency_us_min);
+        assert_eq!(
+            payload.dedup_hit_latency_us_p95,
+            payload.dedup_hit_write_file_latency.p95_us
+        );
+        assert!(
+            payload.dedup_hit_cas_check_latency.max_us
+                >= payload.dedup_hit_cas_check_latency.min_us
+        );
+        assert!(
+            payload.dedup_hit_loop_latency.p95_us >= payload.dedup_hit_write_file_latency.min_us
+        );
+        assert!(payload.storage_stats_after_us > 0);
     }
 
     #[test]
@@ -3270,6 +4006,20 @@ mod tests {
             MAX_APICP_SNAPSHOT_BODY_BYTES
         );
         assert_eq!(max_body_bytes_for_path(OPERATOR_CHAT_PATH), MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn config_apply_path_has_larger_body_limit() {
+        // #425: eine ganze Firma (60+ Agents inline) muss durch das Body-Limit passen.
+        assert_eq!(
+            max_body_bytes_for_path(OPERATOR_CONFIG_APPLY_PATH),
+            MAX_CONFIG_APPLY_BODY_BYTES
+        );
+        // Eine 60-Agent-Firma ist ~64 KB -> das Limit muss komfortabel darueber liegen.
+        assert_ne!(
+            max_body_bytes_for_path(OPERATOR_CONFIG_APPLY_PATH),
+            MAX_BODY_BYTES
+        );
     }
 
     #[tokio::test]

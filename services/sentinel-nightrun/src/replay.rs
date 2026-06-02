@@ -4,18 +4,21 @@
 //! and verifies against an expected final hash.
 //! Replay is READ-ONLY — it never mutates events or creates new ones.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use serde::Serialize;
 
-use sentinel_common::DomainEvent;
+use sentinel_common::{DomainEvent, DomainEventPayload};
 use sentinel_limbo::EventStore;
 
 use crate::hash_chain::HashChain;
 
 /// Result of a replay verification.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ReplayResult {
     /// The run ID that was replayed.
     pub run_id: String,
+    /// Number of events loaded from the EventStore for this run.
+    pub events_loaded: usize,
     /// Number of events replayed.
     pub events_replayed: usize,
     /// Whether the hash chain matches the expected value.
@@ -52,12 +55,13 @@ impl<'a> ReplayEngine<'a> {
             .get_events_by_correlation(run_id, 100_000)
             .context("Failed to load events for replay")?;
 
-        let final_hash = HashChain::compute(&events, seed, run_id);
+        let (final_hash, events_replayed) = compute_replay_hash(&events, seed, run_id);
         let valid = final_hash == expected_hash;
 
         Ok(ReplayResult {
             run_id: run_id.to_string(),
-            events_replayed: events.len(),
+            events_loaded: events.len(),
+            events_replayed,
             hash_chain_valid: valid,
             final_hash,
             expected_hash: expected_hash.to_string(),
@@ -73,9 +77,34 @@ impl<'a> ReplayEngine<'a> {
             .get_events_by_correlation(run_id, 100_000)
             .context("Failed to load events for hash capture")?;
 
-        let hash = HashChain::compute(&events, seed, run_id);
-        let count = events.len();
+        let (hash, count) = compute_replay_hash(&events, seed, run_id);
         Ok((hash, count))
+    }
+
+    /// Read the expected hash from the `nightrun_completed` event for a run.
+    pub fn expected_hash_from_completed(&self, run_id: &str) -> Result<String> {
+        let events = self
+            .event_store
+            .get_events_by_correlation(run_id, 100_000)
+            .context("Failed to load events for expected hash extraction")?;
+
+        for event in events.iter().rev() {
+            if event.event_type != "nightrun_completed" {
+                continue;
+            }
+
+            let payload: DomainEventPayload = serde_json::from_str(&event.payload)
+                .context("Failed to parse nightrun_completed payload")?;
+            if let DomainEventPayload::NightRunCompleted {
+                hash_chain: Some(hash),
+                ..
+            } = payload
+            {
+                return Ok(hash);
+            }
+        }
+
+        bail!("No nightrun_completed event with hash_chain found for run_id={run_id}")
     }
 
     /// Replay from a pre-loaded event list (for testing without EventStore).
@@ -85,17 +114,34 @@ impl<'a> ReplayEngine<'a> {
         seed: &str,
         expected_hash: &str,
     ) -> ReplayResult {
-        let final_hash = HashChain::compute(events, seed, run_id);
+        let (final_hash, events_replayed) = compute_replay_hash(events, seed, run_id);
         let valid = final_hash == expected_hash;
 
         ReplayResult {
             run_id: run_id.to_string(),
-            events_replayed: events.len(),
+            events_loaded: events.len(),
+            events_replayed,
             hash_chain_valid: valid,
             final_hash,
             expected_hash: expected_hash.to_string(),
         }
     }
+}
+
+fn compute_replay_hash(events: &[DomainEvent], seed: &str, run_id: &str) -> (String, usize) {
+    let mut chain = HashChain::new(seed, run_id);
+    let mut events_replayed = 0usize;
+
+    for event in events.iter().filter(|event| is_replay_chain_event(event)) {
+        chain.extend(event);
+        events_replayed += 1;
+    }
+
+    (chain.current_hash(), events_replayed)
+}
+
+fn is_replay_chain_event(event: &DomainEvent) -> bool {
+    event.event_type != "nightrun_completed"
 }
 
 #[cfg(test)]

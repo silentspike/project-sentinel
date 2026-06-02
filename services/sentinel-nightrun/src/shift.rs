@@ -42,11 +42,23 @@ fn current_local_hour() -> u8 {
         .unwrap_or_default()
         .as_secs();
 
-    // SAFETY: libc::localtime_r ist thread-safe
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let time_t = secs as libc::time_t;
-    unsafe { libc::localtime_r(&time_t, &mut tm) };
-    tm.tm_hour as u8
+    local_hour_from_unix_secs(secs).unwrap_or(0)
+}
+
+fn local_hour_from_unix_secs(secs: u64) -> Option<u8> {
+    let time_t = secs.try_into().ok()?;
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+
+    // SAFETY: `time_t` is a valid readable pointer and `tm` points to writable
+    // uninitialized storage that `localtime_r` initializes on non-null return.
+    let result = unsafe { libc::localtime_r(&time_t, tm.as_mut_ptr()) };
+    if result.is_null() {
+        return None;
+    }
+
+    // SAFETY: `localtime_r` returned non-null, so it initialized `tm`.
+    let tm = unsafe { tm.assume_init() };
+    u8::try_from(tm.tm_hour).ok().filter(|hour| *hour <= 23)
 }
 
 #[cfg(test)]
@@ -96,5 +108,17 @@ mod tests {
     fn current_shift_set_returns_valid() {
         let shift = current_shift_set();
         assert!((1..=3).contains(&shift));
+    }
+
+    #[test]
+    fn fixed_epoch_samples_return_valid_local_hours_and_shift_mapping() {
+        for secs in [0, 21_599, 21_600, 50_399, 50_400, 79_199, 79_200] {
+            let hour = local_hour_from_unix_secs(secs).expect("localtime_r should succeed");
+            assert!(hour <= 23, "hour {hour} should be in 0..=23");
+            assert!(
+                (1..=3).contains(&shift_set_for_hour(hour)),
+                "hour {hour} should map to a valid shift"
+            );
+        }
     }
 }

@@ -4,6 +4,9 @@
 
 use sentinel_common::components::{BioState, Personality, WorkContext};
 
+#[cfg(kani)]
+mod kani;
+
 // ── Konstanten ──
 
 /// Hunger-Rate: 12.5% pro Stunde

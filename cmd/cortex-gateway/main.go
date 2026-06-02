@@ -145,7 +145,20 @@ func main() {
 
 	// 5a. Capabilities + TOML Loader + Compiler with 3-source Assembly
 	caps := capability.New()
-	agentsDir := envOrDefault("SENTINEL_AGENTS_DIR", "agents")
+	agentsDir := envOrDefault("SENTINEL_AGENTS_DIR", "config/agents")
+	actionPolicy, err := capability.LoadAgentActionPolicy(agentsDir)
+	if err != nil {
+		logger.Warn("agent action capability policy unavailable; tool_use actions will be denied",
+			"agents_dir", agentsDir,
+			"error", err,
+		)
+		actionPolicy = capability.NewAgentActionPolicy(nil)
+	} else {
+		logger.Info("agent action capability policy loaded",
+			"agents", len(actionPolicy.Definitions()),
+			"agents_dir", agentsDir,
+		)
+	}
 	tomlLoader := compiler.NewTOMLLoader(agentsDir)
 	promptCompiler := compiler.NewWithAssembler(tomlLoader, caps)
 	logger.Info("4-source assembly enabled (DNA + Company + Evolution + Perception)", "agents_dir", agentsDir)
@@ -231,6 +244,7 @@ func main() {
 		Normalizer:          normalizer.New(),
 		Extractor:           extraction.New(),
 		Capabilities:        caps,
+		ActionPolicy:        actionPolicy,
 		Logger:              logger,
 		BreakerCfg:          proxy.BreakerConfigFromEnv(),
 		EventStore:          evStore,
@@ -426,6 +440,47 @@ func main() {
 			"ok":     true,
 			"id":     id,
 			"action": decision.Action,
+		})
+	})
+
+	// #440: Hot-Reload company-context.md + invalidate all agent-DNA caches at runtime (no restart,
+	// no LLM/provider call — token-safe). Triggered by sentinel-ctl / the daemon config-apply path.
+	controlMux.HandleFunc("POST /control/reload", func(w http.ResponseWriter, _ *http.Request) {
+		bytesLoaded := promptCompiler.ReloadCompanyContext()
+		tomlLoader.InvalidateAll()
+		logger.Info("hot-reload via control plane",
+			"company_context_bytes", bytesLoaded, "dna_invalidated", "all")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"reloaded":              true,
+			"company_context_bytes": bytesLoaded,
+			"dna_invalidated":       "all",
+		})
+	})
+
+	// #440: targeted agent-DNA cache invalidation (for #425 live single-agent edits). Empty body or
+	// empty agent_ids => invalidate all. No LLM call.
+	controlMux.HandleFunc("POST /control/dna/invalidate", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			AgentIDs []int `json:"agent_ids"`
+		}
+		// An empty/absent body is valid and means "invalidate all".
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		var invalidated any
+		if len(req.AgentIDs) == 0 {
+			tomlLoader.InvalidateAll()
+			invalidated = "all"
+		} else {
+			for _, id := range req.AgentIDs {
+				tomlLoader.Invalidate(id)
+			}
+			invalidated = req.AgentIDs
+		}
+		logger.Info("agent DNA cache invalidated via control plane", "agents", invalidated)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"reloaded":        true,
+			"dna_invalidated": invalidated,
 		})
 	})
 

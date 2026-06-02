@@ -111,6 +111,7 @@ mod tests {
             timeout_total_secs: 7200,
             max_episodes_per_agent: 1000,
             max_jobs_per_run: 100,
+            max_agent_id: sentinel_common::DEFAULT_MAX_AGENT_ID,
         }
     }
 

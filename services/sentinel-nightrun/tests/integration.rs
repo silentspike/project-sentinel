@@ -3,8 +3,9 @@
 //! Testet die gesamte Pipeline end-to-end:
 //! HippocampusService + EventStore + JobQueue + Runner
 
+use approx::assert_relative_eq;
 use sentinel_common::DomainEvent;
-use sentinel_hippocampus::{Episode, HippocampusService};
+use sentinel_hippocampus::{Episode, HippocampusService, NMDA_CONSOLIDATION_THRESHOLD};
 use sentinel_limbo::EventStore;
 use sentinel_nightrun::config::NightrunSettings;
 use sentinel_nightrun::guardrails::{GuardrailController, GuardrailDecision};
@@ -56,6 +57,7 @@ impl TestHarness {
             timeout_total_secs: 7200,
             max_episodes_per_agent: 1000,
             max_jobs_per_run: 100,
+            max_agent_id: sentinel_common::DEFAULT_MAX_AGENT_ID,
         };
 
         Self {
@@ -108,6 +110,40 @@ fn ac1_consolidation_completes_for_all_agents() {
     assert_eq!(result.agents_failed, 0);
     assert_eq!(result.agents_skipped, 0);
     assert!(result.total_episodes > 0);
+    assert_eq!(result.total_episodes, result.total_episodes_consolidated);
+    assert_relative_eq!(result.selection.selection_rate, 1.0, epsilon = 1e-12);
+}
+
+// === Issue #382: NMDA selection quality evidence ===
+
+#[test]
+fn issue382_selection_metrics_report_processed_vs_consolidated() {
+    let h = TestHarness::new();
+    let episodes = vec![
+        make_episode(1, "Thomas", "Relevant work episode", 0.8, 0.7),
+        make_episode(2, "Thomas", "Medium context", 0.5, 0.5),
+        make_episode(3, "Thomas", "Routine noise", 0.1, 0.05),
+    ];
+    h.hippocampus.record_episodes("Thomas", &episodes).unwrap();
+
+    let (runner, _es, _dir) = h.runner("run-issue382-selection", false);
+    let result = runner.run(1).unwrap();
+
+    assert_eq!(result.total_episodes, 3);
+    assert_eq!(result.total_episodes_consolidated, 1);
+    assert_eq!(result.selection.episodes_processed, 3);
+    assert_eq!(result.selection.episodes_consolidated, 1);
+    assert_eq!(result.selection.threshold, NMDA_CONSOLIDATION_THRESHOLD);
+    assert_relative_eq!(result.selection.selection_rate, 1.0 / 3.0, epsilon = 1e-12);
+    assert_relative_eq!(result.selection.score_min.unwrap(), 0.0025, epsilon = 1e-12);
+    assert_relative_eq!(
+        result.selection.score_avg.unwrap(),
+        (0.28 + 0.125 + 0.0025) / 3.0,
+        epsilon = 1e-12
+    );
+    assert_relative_eq!(result.selection.score_max.unwrap(), 0.28, epsilon = 1e-12);
+    assert_eq!(result.selection.agents.len(), 1);
+    assert_eq!(result.selection.agents[0].agent_name, "Thomas");
 }
 
 // === AC-2: Konsolidierte Daten persistent ===
@@ -131,6 +167,7 @@ fn ac2_narratives_persist_after_consolidation() {
             timeout_total_secs: 7200,
             max_episodes_per_agent: 1000,
             max_jobs_per_run: 100,
+            max_agent_id: sentinel_common::DEFAULT_MAX_AGENT_ID,
         };
 
         let eps = vec![
@@ -267,6 +304,7 @@ fn resume_continues_partial_run() {
             timeout_total_secs: 7200,
             max_episodes_per_agent: 1000,
             max_jobs_per_run: 100,
+            max_agent_id: sentinel_common::DEFAULT_MAX_AGENT_ID,
         };
 
         let runner = NightrunRunner::new(hc, es, jq, settings, "run-resume".into(), false);
@@ -369,6 +407,16 @@ fn ac18_1_replay_same_hash() {
         event_count >= 3,
         "Mindestens 3 Events erwartet, gefunden: {event_count}"
     );
+    assert_eq!(
+        captured_hash, result.hash_chain_final,
+        "Replay muss den im Night-Run gespeicherten Hash reproduzieren"
+    );
+
+    let replay_result = replay_engine
+        .replay("run-replay-1", "run-replay-1", &result.hash_chain_final)
+        .unwrap();
+    assert!(replay_result.hash_chain_valid);
+    assert!(replay_result.events_loaded > replay_result.events_replayed);
 
     // Hash muss konsistent sein (gleicher Seed + gleiche Events = gleicher Hash)
     let (captured_hash_2, _) = replay_engine
@@ -420,6 +468,7 @@ fn ac18_3_guardrails_deterministic() {
         timeout_total_secs: 7200,
         max_episodes_per_agent: 100,
         max_jobs_per_run: 100,
+        max_agent_id: sentinel_common::DEFAULT_MAX_AGENT_ID,
     };
     let gc = GuardrailController::from_settings(&settings);
 
@@ -466,6 +515,7 @@ fn ac18_4_degradation_documented() {
         timeout_total_secs: 7200,
         max_episodes_per_agent: 3,
         max_jobs_per_run: 100,
+        max_agent_id: sentinel_common::DEFAULT_MAX_AGENT_ID,
     };
 
     let runner = NightrunRunner::new(hc, es, jq, settings, "run-degrade".into(), false);

@@ -220,7 +220,8 @@ impl SegmentStore {
                 .build()
                 .user_data(i as u64);
 
-            // Safety: buffer outlives the SQE (both live until reap below)
+            // SAFETY: the read buffer, file descriptor, and SQE user data stay
+            // alive until `submit_and_wait` completes and completions are reaped below.
             unsafe {
                 ring.submission()
                     .push(&entry)

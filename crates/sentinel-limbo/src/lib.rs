@@ -9,6 +9,8 @@
 //! with tokio::task::spawn_blocking for async compatibility.
 
 pub mod event_store;
+#[cfg(kani)]
+mod kani;
 pub mod outbox_publisher;
 
 pub use event_store::{EventStore, MonotonicityError, OutboxEntry, OutboxTransport, SnapshotRow};

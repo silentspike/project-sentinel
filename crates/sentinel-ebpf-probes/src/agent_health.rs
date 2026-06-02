@@ -40,7 +40,12 @@ pub fn agent_health_probe(_ctx: FEntryContext) -> u32 {
 
 #[inline(always)]
 fn try_agent_health() -> Result<u32, u32> {
+    // SAFETY: this helper is called from a verified eBPF program context where
+    // `bpf_get_current_cgroup_id` is available and has no Rust-side memory
+    // preconditions.
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    // SAFETY: this helper is called from a verified eBPF program context where
+    // `bpf_ktime_get_ns` is available and has no Rust-side memory preconditions.
     let ts = unsafe { bpf_ktime_get_ns() };
 
     // Update the per-CPU map with current timestamp.

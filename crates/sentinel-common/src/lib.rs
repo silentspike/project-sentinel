@@ -10,14 +10,22 @@ pub mod components;
 pub mod events;
 pub mod feature_flags;
 pub mod generated;
+pub mod nano_runtime;
 pub mod psi;
 pub mod room;
 pub mod snapshot_codec;
 pub mod types;
 
 pub use events::{DomainEvent, DomainEventPayload};
-pub use snapshot_codec::{decode_world_snapshot, encode_world_snapshot};
+pub use nano_runtime::*;
+pub use snapshot_codec::{
+    decode_snapshot_cursor, decode_world_snapshot, encode_snapshot_cursor, encode_world_snapshot,
+    SnapshotCursor,
+};
 pub use types::*;
+
+#[cfg(kani)]
+mod kani;
 
 #[cfg(test)]
 mod tests {
@@ -37,6 +45,14 @@ mod tests {
         assert!(AgentId::new(0).is_err());
         assert!(AgentId::new(61).is_err());
         assert!(AgentId::new(u16::MAX).is_err());
+    }
+
+    #[test]
+    fn test_agent_id_custom_bounds() {
+        let bounds = AgentIdBounds::new(120);
+        assert!(AgentId::new_with_bounds(61, bounds).is_ok());
+        assert!(AgentId::new_with_bounds(120, bounds).is_ok());
+        assert!(AgentId::new_with_bounds(121, bounds).is_err());
     }
 
     #[test]

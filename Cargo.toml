@@ -23,10 +23,14 @@ members = [
     "crates/sentinel-hippocampus",
     "crates/sentinel-projection",
     "crates/sentinel-fs",
+    "crates/sentinel-console-plane",
     "services/sentinel-nightrun",
+    "services/sentinel-gaia",
     "services/sentinel-daemon",
     "services/sentinel-projection",
     "services/agent-runtime",
+    "services/sentinel-ctl",
+    "services/sentinel-dashboard-backend",
 ]
 
 [workspace.dependencies]

@@ -15,6 +15,8 @@ pub struct ConsolidationResult {
     pub agent_name: String,
     pub episodes_processed: usize,
     pub episodes_consolidated: usize,
+    /// NMDA scores for all processed episodes, including rejected ones.
+    pub episode_scores: Vec<f64>,
     pub consolidated_summaries: Vec<(String, f64)>,
 }
 
@@ -74,9 +76,12 @@ impl HippocampusService {
                 agent_name: agent.to_string(),
                 episodes_processed: 0,
                 episodes_consolidated: 0,
+                episode_scores: Vec::new(),
                 consolidated_summaries: Vec::new(),
             });
         }
+
+        let episode_scores: Vec<f64> = episodes.iter().map(nmda_score).collect();
 
         // Run sleep cycle (scoring + selection + consolidation)
         let mut cycle = SleepCycle::new(agent);
@@ -107,6 +112,7 @@ impl HippocampusService {
             agent_name: agent.to_string(),
             episodes_processed,
             episodes_consolidated,
+            episode_scores,
             consolidated_summaries: selected,
         })
     }
