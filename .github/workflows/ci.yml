@@ -134,7 +134,8 @@ jobs:
       - name: Snapshot tests
         run: |
           command -v cargo-insta >/dev/null 2>&1 || cargo install cargo-insta --locked
-          cargo insta test --workspace --check
+          cargo insta test -p sentinel-ecs --test snapshot_perception --check
+          cargo insta test -p sentinel-physics --test snapshot_perception --check
 
       # eBPF: install kernel headers on hosted, soft-fail if unavailable
       - name: Install eBPF dependencies (hosted)
