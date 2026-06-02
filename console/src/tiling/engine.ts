@@ -119,7 +119,7 @@ export function focusLeaf(leafId: string) {
   setTree("focused", leafId);
 }
 
-/** Zaehlt die Leafs (fuer Tests/Benchmarks). */
+/** Zaehlt die Leaves (fuer Tests/Benchmarks). */
 export function countLeaves(node: TileNode = tree.root): number {
   return node.kind === "leaf" ? 1 : countLeaves(node.a) + countLeaves(node.b);
 }

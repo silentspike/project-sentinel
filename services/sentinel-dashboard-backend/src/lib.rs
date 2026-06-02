@@ -15,9 +15,12 @@
 use std::sync::Arc;
 
 pub mod auth;
+pub mod cockpit;
 pub mod codec;
 pub mod control;
 pub mod event_sub;
+pub mod events;
+pub mod metrics_extra;
 pub mod projection;
 pub mod tls;
 pub mod wt;
@@ -37,8 +40,14 @@ pub struct Config {
     pub operator_key: Option<String>,
     /// Gateway-Control-Basis-URL, Default `http://127.0.0.1:8081`.
     pub gateway_url: String,
+    /// Gateway-Proxy-Basis-URL fuer Pipeline-Metrics, Default `http://127.0.0.1:8080`.
+    pub gateway_proxy_url: String,
+    /// Prometheus-Basis-URL des Daemons, Default `http://127.0.0.1:9090`.
+    pub prometheus_url: String,
     /// Pfad zur Projection-DB (read-only geoeffnet).
     pub projection_db: String,
+    /// Pfad zur Limbo events.db (read-only geoeffnet, optional/degradierend).
+    pub events_db: String,
     /// Verzeichnis mit der SolidJS-Bundle (ServeDir); enthaelt Platzhalter-index.html bis #419.
     pub bundle_dir: String,
     /// `Secure`-Flag fuer das Session-Cookie (true bei HTTPS-Serving).
@@ -64,15 +73,28 @@ impl Config {
             // (WebTransport-Handshakes tragen keine Cookies, siehe wt.rs), sondern ueber das kurzlebige
             // Einmal-Ticket (`?t=`).
             wt_bind: env("SENTINEL_DASHBOARD_WT_BIND").unwrap_or_else(|| "0.0.0.0:8001".into()),
-            operator_url: env("SENTINEL_OPERATOR_API_URL").unwrap_or_else(|| "http://127.0.0.1:8084".into()),
+            operator_url: env("SENTINEL_OPERATOR_API_URL")
+                .unwrap_or_else(|| "http://127.0.0.1:8084".into()),
             operator_key: env("SENTINEL_OPERATOR_API_KEY"),
-            gateway_url: env("CORTEX_GATEWAY_CONTROL_URL").unwrap_or_else(|| "http://127.0.0.1:8081".into()),
-            projection_db: env("SENTINEL_PROJECTION_DB").unwrap_or_else(|| "/opt/sentinel/data/projection.db".into()),
-            bundle_dir: env("SENTINEL_DASHBOARD_BUNDLE_DIR").unwrap_or_else(|| "/opt/sentinel/console-dist".into()),
-            cookie_secure: env("DASHBOARD_COOKIE_SECURE").map(|v| v != "off").unwrap_or(true),
+            gateway_url: env("CORTEX_GATEWAY_CONTROL_URL")
+                .unwrap_or_else(|| "http://127.0.0.1:8081".into()),
+            gateway_proxy_url: env("CORTEX_GATEWAY_PROXY_URL")
+                .unwrap_or_else(|| "http://127.0.0.1:8080".into()),
+            prometheus_url: env("SENTINEL_DAEMON_PROMETHEUS_URL")
+                .unwrap_or_else(|| "http://127.0.0.1:9090".into()),
+            projection_db: env("SENTINEL_PROJECTION_DB")
+                .unwrap_or_else(|| "/opt/sentinel/data/projection.db".into()),
+            events_db: env("SENTINEL_EVENTS_DB")
+                .unwrap_or_else(|| "/opt/sentinel/data/events.db".into()),
+            bundle_dir: env("SENTINEL_DASHBOARD_BUNDLE_DIR")
+                .unwrap_or_else(|| "/opt/sentinel/console-dist".into()),
+            cookie_secure: env("DASHBOARD_COOKIE_SECURE")
+                .map(|v| v != "off")
+                .unwrap_or(true),
             cert_hash_b64: None,
             nats_url: env("SENTINEL_NATS_URL").unwrap_or_else(|| "nats://127.0.0.1:4222".into()),
-            nats_consumer: env("SENTINEL_DASHBOARD_NATS_CONSUMER").unwrap_or_else(|| "dashboard-live".into()),
+            nats_consumer: env("SENTINEL_DASHBOARD_NATS_CONSUMER")
+                .unwrap_or_else(|| "dashboard-live".into()),
         }
     }
 }
@@ -83,6 +105,10 @@ pub struct AppState {
     pub sessions: auth::SessionStore,
     pub config: Arc<Config>,
     pub http: reqwest::Client,
+    /// Optionaler read-only Limbo EventStore-Handle. Nicht verfuegbar => Routen degradieren.
+    pub events: Option<sentinel_limbo::EventStore>,
+    /// Control-Pause merkt den vorherigen Gateway rate_limit_rps-Wert fuer Resume.
+    pub saved_rate_limit: Arc<tokio::sync::Mutex<Option<f64>>>,
     /// Broadcast-Kanal der Delta-Frames (#432): der Event-Subscriber sendet encodierte topic-Frames,
     /// jede WebTransport-Session abonniert via `subscribe()` und schreibt sie als uni-Streams an den Client.
     pub broadcast_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
@@ -93,12 +119,21 @@ impl AppState {
         // Kapazitaet 256: ueberlaeuft ein langsamer Client, liefert `recv()` `Lagged` — der naechste
         // Voll-Snapshot ist ohnehin autoritativ (reconcile), also tolerierbar.
         let (broadcast_tx, _) = tokio::sync::broadcast::channel(256);
+        let events = match sentinel_limbo::EventStore::open_readonly(&config.events_db) {
+            Ok(store) => Some(store),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %config.events_db, "events.db read-only handle unavailable; event routes degrade");
+                None
+            }
+        };
         Ok(Self {
             sessions: auth::SessionStore::new(),
             config: Arc::new(config),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()?,
+            events,
+            saved_rate_limit: Arc::new(tokio::sync::Mutex::new(None)),
             broadcast_tx,
         })
     }
@@ -116,18 +151,57 @@ pub fn build_app(state: AppState) -> axum::Router {
     let read_routes = axum::Router::new()
         .route("/agents", get(projection::agents))
         .route("/rooms", get(projection::rooms))
+        .route("/rooms/{id}/detail", get(projection::room_detail))
         .route("/metrics", get(projection::metrics))
+        .route("/metrics/ebpf", get(metrics_extra::ebpf))
+        .route("/metrics/pipeline", get(metrics_extra::pipeline))
+        .route("/metrics/tick", get(metrics_extra::tick))
         .route("/tasks", get(projection::tasks))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
+        .route("/cockpit", get(cockpit::cockpit))
+        .route("/cockpit/incident/{id}", get(cockpit::incident))
+        .route("/events", get(events::events))
+        .route("/events/types", get(events::event_types))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
 
     // Control-Proxy hinter require_auth.
     let control_routes = axum::Router::new()
         .route("/chaos", post(control::chaos))
         .route("/stimulus", post(control::stimulus))
         .route("/nightrun", post(control::nightrun))
-        .route("/config", get(control::get_config).patch(control::patch_config))
+        .route(
+            "/config",
+            get(control::get_config).patch(control::patch_config),
+        )
         .route("/provider", post(control::provider))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
+        .route("/pause", post(control::pause))
+        .route("/resume", post(control::resume))
+        .route(
+            "/agent-provider",
+            post(control::agent_provider).delete(control::delete_agent_provider),
+        )
+        .route("/traffic-stats", get(control::traffic_stats))
+        .route("/platform-state", get(control::platform_state))
+        .route("/platform-analyses", get(control::platform_analyses))
+        .route("/status", get(control::status))
+        .route("/snapshots", get(control::snapshots))
+        .route("/snapshot", post(control::snapshot))
+        .route("/snapshot-state", get(control::snapshot_state))
+        .route("/snapshot-restore", post(control::snapshot_restore))
+        .route("/restore", post(control::snapshot_restore))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+
+    let operator_routes = axum::Router::new()
+        .route("/chat", post(control::operator_chat))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
 
     let api = axum::Router::new()
         .route("/auth/login", post(auth::login))
@@ -135,7 +209,10 @@ pub fn build_app(state: AppState) -> axum::Router {
         .route("/auth/status", get(auth::status))
         .route(
             "/wt-ticket",
-            get(auth::wt_ticket).route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth)),
+            get(auth::wt_ticket).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth::require_auth,
+            )),
         )
         // `/cert-hash` bleibt BEWUSST public: der Browser braucht den Cert-Hash VOR dem Login, um die
         // WebTransport-Verbindung via `serverCertificateHashes` zu pinnen (self-signed) — der Connect
@@ -143,11 +220,14 @@ pub fn build_app(state: AppState) -> axum::Router {
         // Zertifikats-Hash, keine sensiblen Daten.
         .route("/cert-hash", get(cert_hash))
         .merge(read_routes)
-        .nest("/control", control_routes);
+        .nest("/control", control_routes)
+        .nest("/operator", operator_routes);
 
     axum::Router::new()
         .nest("/api", api)
-        .fallback_service(ServeDir::new(&state.config.bundle_dir).append_index_html_on_directories(true))
+        .fallback_service(
+            ServeDir::new(&state.config.bundle_dir).append_index_html_on_directories(true),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
