@@ -14,8 +14,8 @@ demo behind the *"event-sourced audit trails"* line in the README.
 
 ## Pre-conditions
 
-- Demo stack is up (`make demo` running, dashboard reachable at
-  `http://localhost:18000`)
+- Demo stack is up (`make demo` running, console reachable at
+  `https://localhost:18001`)
 - `curl` and `jq` available locally
 - Operator API on `http://localhost:18084` reachable
 

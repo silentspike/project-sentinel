@@ -185,6 +185,7 @@ pub fn build_app(state: AppState) -> axum::Router {
         .route("/traffic-stats", get(control::traffic_stats))
         .route("/platform-state", get(control::platform_state))
         .route("/platform-analyses", get(control::platform_analyses))
+        .route("/platform-analyze", post(control::platform_analyze))
         .route("/status", get(control::status))
         .route("/snapshots", get(control::snapshots))
         .route("/snapshot", post(control::snapshot))
@@ -219,6 +220,7 @@ pub fn build_app(state: AppState) -> axum::Router {
         // (und damit das Holen des Auth-Tickets) laeuft sonst nie an. Liefert nur den oeffentlichen
         // Zertifikats-Hash, keine sensiblen Daten.
         .route("/cert-hash", get(cert_hash))
+        .route("/health", get(health))
         .merge(read_routes)
         .nest("/control", control_routes)
         .nest("/operator", operator_routes);
@@ -237,4 +239,9 @@ async fn cert_hash(
     axum::extract::State(st): axum::extract::State<AppState>,
 ) -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({ "hash": st.config.cert_hash_b64, "algorithm": "sha-256" }))
+}
+
+/// GET /api/health — public service liveness probe for deploy smoke/monitoring.
+async fn health() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({ "status": "ok", "service": "sentinel-dashboard-backend" }))
 }

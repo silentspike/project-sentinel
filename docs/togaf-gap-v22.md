@@ -73,7 +73,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 |-------------------------------|--------|----------|
 | Rust workspace (17 crates + 5 Rust services) | ✅ | `Cargo.toml` workspace members plus component README coverage in [docs/component-readmes.md](component-readmes.md) |
 | Go workspace (4 modules)      | ✅ | `go.work` |
-| Bun + Hono dashboard          | ✅ | `dashboard/` |
+| SolidJS console + Rust WebTransport backend | ✅ | `console/`, `services/sentinel-dashboard-backend/` |
 | Build server pattern          | ✅ | `cargo remote --` (server IP injected via `.make.local`) |
 | 16 GitHub Actions workflows   | ✅ | `.github/workflows/*.yml` |
 

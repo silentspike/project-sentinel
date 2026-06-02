@@ -1,10 +1,9 @@
 import { createSignal, createEffect, onMount, For, Show, type JSX } from "solid-js";
 import "./styles/tokens.css";
-import { agentFilter, setAgentFilter, connectTransport } from "./stores/console";
+import { connectTransport } from "./stores/console";
 import { authStatus, login as doLogin } from "./auth";
 import {
-  SearchFilter, StatusDropdown, ThemeToggle,
-  ToastContainer, addToast, type Status,
+  ToastContainer,
 } from "./components/controls";
 import { Tiling } from "./tiling/TilingLayout";
 import { tilingTree, splitLeaf, closeLeaf, openPanel, type PanelKind } from "./tiling/engine";
@@ -13,8 +12,10 @@ import { ActivityView } from "./views/ActivityView";
 import { ChaosView } from "./views/ChaosView";
 import { ChatView } from "./views/ChatView";
 import { CockpitView } from "./views/CockpitView";
+import { ControlView } from "./views/ControlView";
 import { FloorplanView } from "./views/FloorplanView";
 import { MetricsView } from "./views/MetricsView";
+import { TimeTravelView } from "./views/TimeTravelView";
 
 // Mobile-Breakpoint via matchMedia (Desktop=Tiling, Mobile=BottomTabBar).
 function useIsMobile() {
@@ -24,7 +25,7 @@ function useIsMobile() {
   return m;
 }
 
-const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "cockpit", "activity", "chaos", "chat", "control"];
+const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "cockpit", "activity", "chaos", "chat", "control", "timetravel"];
 const PANEL_LABEL: Record<PanelKind, string> = {
   agents: "Agents",
   floorplan: "Floorplan",
@@ -32,8 +33,9 @@ const PANEL_LABEL: Record<PanelKind, string> = {
   cockpit: "Cockpit",
   activity: "Activity",
   chaos: "Chaos",
-  control: "Control",
   chat: "Chat",
+  control: "Control",
+  timetravel: "Zeitreise",
 };
 
 function Login(props: { onOk: () => void }): JSX.Element {
@@ -60,21 +62,6 @@ function Login(props: { onOk: () => void }): JSX.Element {
   );
 }
 
-function ControlCol(): JSX.Element {
-  const [st, setSt] = createSignal<Status>("pending");
-  return (
-    <section class="col" style={{ height: "100%" }} data-testid="col-control">
-      <div class="col__head">Control-Center</div>
-      <div class="col__body" style={{ display: "grid", gap: "10px" }}>
-        <SearchFilter placeholder="Agents filtern…" onFilter={setAgentFilter} />
-        <p class="muted" style={{ "font-size": "12px" }}>Filter: <span data-testid="filter-value">{agentFilter() || "—"}</span> (filtert die Dashboard-Liste)</p>
-        <div style={{ display: "flex", gap: "8px", "align-items": "center" }}><span>Status:</span><StatusDropdown value={st()} onChange={setSt} /></div>
-        <div style={{ display: "flex", gap: "8px" }}><ThemeToggle /><button data-testid="toast-btn" onClick={() => addToast("Aktion ausgefuehrt", "ok")}>Toast</button></div>
-      </div>
-    </section>
-  );
-}
-
 const PANELS: Record<PanelKind, () => JSX.Element> = {
   agents: AgentsView,
   floorplan: FloorplanView,
@@ -82,8 +69,9 @@ const PANELS: Record<PanelKind, () => JSX.Element> = {
   cockpit: CockpitView,
   activity: ActivityView,
   chaos: ChaosView,
-  control: ControlCol,
   chat: ChatView,
+  control: ControlView,
+  timetravel: TimeTravelView,
 };
 
 // Tile-Chrome: kompakte Leiste (Split horizontal/vertikal, Schliessen) ueber dem Panel.
