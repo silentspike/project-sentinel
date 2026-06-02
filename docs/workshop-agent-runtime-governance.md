@@ -73,7 +73,7 @@ independent control planes.
   └──────────────────────────────────────────────────────────┘
          │ projections
          ▼
-  Dashboard (Bun + Hono + WebSocket)
+  Console (SolidJS + Rust WebTransport)
 ```
 
 The Mermaid version of the same diagram lives in the

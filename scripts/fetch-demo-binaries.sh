@@ -27,12 +27,12 @@ cd "$repo_root"
 tag="${SENTINEL_RELEASE_TAG:-v0.1.0-alpha}"
 gh_repo="${GH_REPO:-silentspike/project-sentinel}"
 out_dir="target/release"
-binaries=(sentinel-daemon sentinel-nightrun sentinel-projection)
+binaries=(sentinel-daemon sentinel-nightrun sentinel-projection sentinel-dashboard-backend)
 
 note() { printf '[fetch-demo-binaries] %s\n' "$*"; }
 fail() { printf '[fetch-demo-binaries] FAIL: %s\n' "$*" >&2; exit 1; }
 
-# Skip if all three are already present
+# Skip if all binaries are already present
 all_present=true
 for b in "${binaries[@]}"; do
     [ -x "$out_dir/$b" ] || { all_present=false; break; }
@@ -57,6 +57,7 @@ if ! gh release download "$tag" \
         --pattern 'sentinel-daemon' \
         --pattern 'sentinel-nightrun' \
         --pattern 'sentinel-projection' \
+        --pattern 'sentinel-dashboard-backend' \
         --clobber 2>&1 | tail -5; then
     fail "gh release download failed"
 fi

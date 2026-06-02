@@ -10,8 +10,8 @@
 # Go Cortex Gateway
 /cmd/ @silentspike/maintainers
 
-# Dashboard
-/dashboard/ @silentspike/maintainers
+# SolidJS Console
+/console/ @silentspike/maintainers
 
 # CI/CD
 /.github/ @silentspike/maintainers

@@ -1,4 +1,4 @@
-//! Server-side Session-Auth (#431) — Port von `dashboard/src/auth-session.ts` + `routes/auth.ts` (#402/#405).
+//! Server-side Session-Auth (#431/#402/#405) fuer die SolidJS-Konsole.
 //!
 //! In-Memory `Map<token, expiry_epoch_ms>`. Der Operator-Key (`SENTINEL_DASHBOARD_API_KEY`) verlaesst
 //! den Server nie: Login validiert constant-time, mintet ein opakes UUID-Token, setzt es als

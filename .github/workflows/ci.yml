@@ -28,7 +28,7 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       go: ${{ steps.filter.outputs.go }}
-      dashboard: ${{ steps.filter.outputs.dashboard }}
+      console: ${{ steps.filter.outputs.console }}
       schemas: ${{ steps.filter.outputs.schemas }}
       config: ${{ steps.filter.outputs.config }}
     steps:
@@ -49,8 +49,8 @@ jobs:
               - 'pkg/**'
               - 'go.work'
               - 'go.work.sum'
-            dashboard:
-              - 'dashboard/**'
+            console:
+              - 'console/**'
             schemas:
               - 'schemas/**'
             config:
@@ -192,11 +192,11 @@ jobs:
           GOLANGCI_LINT_SKIP_CONFIG_VERIFY: "true"
 
   # ──────────────────────────────────────────────
-  # Dashboard - only when dashboard/ changed
+  # Console - only when console/ changed
   # ──────────────────────────────────────────────
-  dashboard:
+  console:
     needs: changes
-    if: needs.changes.outputs.dashboard == 'true'
+    if: needs.changes.outputs.console == 'true'
     runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -216,16 +216,20 @@ jobs:
           bun-version: latest
 
       - name: Install
-        working-directory: dashboard
+        working-directory: console
         run: bun install --frozen-lockfile
 
       - name: Type check
-        working-directory: dashboard
-        run: bun run typecheck || true
+        working-directory: console
+        run: bun run typecheck
 
       - name: Tests
-        working-directory: dashboard
-        run: bun test
+        working-directory: console
+        run: bun run test
+
+      - name: Build
+        working-directory: console
+        run: bun run build
 
   # ──────────────────────────────────────────────
   # FlatBuffer schema validation
@@ -255,7 +259,7 @@ jobs:
   # ──────────────────────────────────────────────
   ci-pass:
     if: always()
-    needs: [lint, rust, go, dashboard, schemas]
+    needs: [lint, rust, go, console, schemas]
     runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     steps:
       - name: Evaluate results
@@ -264,7 +268,7 @@ jobs:
             "${{ needs.lint.result }}"
             "${{ needs.rust.result }}"
             "${{ needs.go.result }}"
-            "${{ needs.dashboard.result }}"
+            "${{ needs.console.result }}"
             "${{ needs.schemas.result }}"
           )
           for r in "${results[@]}"; do

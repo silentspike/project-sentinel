@@ -40,6 +40,12 @@
       "type": "binary"
     },
     {
+      "path": "/opt/sentinel/bin/sentinel-dashboard-backend",
+      "source": "target/release/sentinel-dashboard-backend",
+      "sha256": "ac91bcbbf61d6c8e3534a58598c1700bdbaa918f9dcbe3acfeb58c6628955da4",
+      "type": "binary"
+    },
+    {
       "path": "/opt/sentinel/config/daemon.toml",
       "source": "config/daemon.toml",
       "sha256": "d8b264e2f47bd1598e3e1d4f384ed46037217dce7d7417ce434fb5a003ebfad0",
@@ -142,9 +148,9 @@
       "type": "systemd"
     },
     {
-      "path": "/etc/systemd/system/sentinel-dashboard.service",
-      "source": "deploy/systemd/sentinel-dashboard.service",
-      "sha256": "de6897898cd1d8ab08559711accb330422d137067bea5b1a7f623423e1c217e9",
+      "path": "/etc/systemd/system/sentinel-dashboard-backend.service",
+      "source": "deploy/systemd/sentinel-dashboard-backend.service",
+      "sha256": "12a29f33147347f49060899f8fd70d595ae730582ffe19c464c985612feb2b9f",
       "type": "systemd"
     },
     {
@@ -156,7 +162,7 @@
     {
       "path": "/etc/systemd/system/sentinel.target",
       "source": "deploy/systemd/sentinel.target",
-      "sha256": "6a080b400fe951311eb80c8d3ad3ac2556d844a3e9ff0d62cd76a57c4751fa49",
+      "sha256": "70ec2d8d90ddb6c0935510453175d0f21380fcd72dffc396ac14341e8af63932",
       "type": "systemd"
     },
     {
