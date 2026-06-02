@@ -3,8 +3,8 @@
 //! Muster aus `sentinel-console/src/lib.rs:113-140` (wtransport 0.6). TLS = geteiltes self-signed Cert
 //! (siehe `tls`). Beim Session-Handshake wird ein kurzlebiges Einmal-Ticket (`?t=`) validiert (AC-3):
 //! ohne gueltiges Ticket wird die Session NICHT akzeptiert (Drop = Reject). Ablauf pro Session:
-//! `hello`-Frame -> `agent_live`-Connect-Snapshot -> kontinuierlicher Delta-Push aus dem
-//! Broadcast-Kanal (#432, gespeist vom NATS-Event-Subscriber `event_sub`).
+//! `hello`-Frame -> Projection-/EventLog-Connect-Snapshots -> kontinuierlicher Delta-Push aus dem
+//! Broadcast-Kanal (#432/#433, gespeist von `event_sub`).
 
 use std::path::PathBuf;
 
@@ -123,6 +123,25 @@ async fn handle_session(incoming: IncomingSession, st: AppState) -> anyhow::Resu
             tracing::debug!(bytes = frame.len(), "wt kpi snapshot pushed");
         }
         Err(e) => tracing::warn!(error = %e, "wt kpi snapshot skipped (projection read failed)"),
+    }
+    match crate::events::event_log_backfill_events(
+        &st.config.events_db,
+        crate::event_sub::EVENT_LOG_BACKFILL_RECENT_LIMIT,
+        crate::event_sub::EVENT_LOG_BACKFILL_FOCUS_LIMIT,
+    ) {
+        Ok(events) => {
+            let frame = crate::codec::encode_frame(
+                "event_log",
+                &serde_json::json!({ "events": events, "backfill": true }),
+            )?;
+            let mut snap = connection.open_uni().await?.await?;
+            snap.write_all(&frame).await?;
+            snap.finish().await?;
+            tracing::debug!(bytes = frame.len(), "wt event_log backfill pushed");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "wt event_log backfill skipped (events.db read failed)")
+        }
     }
 
     // Kontinuierlicher Delta-Push (#432): nach dem Connect-Snapshot abonniert die Session den

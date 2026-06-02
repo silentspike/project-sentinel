@@ -120,8 +120,6 @@ describe("WebSocket global polling (#277)", () => {
       "agent_update",
       "room_update",
       "cockpit_update",
-      "chaos_update",
-      "activity_update",
     ]);
   });
 
@@ -137,7 +135,7 @@ describe("WebSocket global polling (#277)", () => {
     expect(messageTypes()).toEqual([]);
   });
 
-  it("broadcasts all view update types when the global watermark changes", () => {
+  it("broadcasts remaining live update types when the global watermark changes", () => {
     pollForChanges();
     projDb.run("UPDATE projection_watermarks SET last_event_id = 151 WHERE projection_name = 'sentinel-projection'");
 
@@ -147,16 +145,12 @@ describe("WebSocket global polling (#277)", () => {
       "agent_update",
       "room_update",
       "cockpit_update",
-      "chaos_update",
-      "activity_update",
       "agent_update",
       "room_update",
       "cockpit_update",
-      "chaos_update",
-      "activity_update",
     ]);
-    expect((sentMessages[5].agents as unknown[]).length).toBe(1);
-    expect((sentMessages[6].rooms as unknown[]).length).toBe(1);
+    expect((sentMessages[3].agents as unknown[]).length).toBe(1);
+    expect((sentMessages[4].rooms as unknown[]).length).toBe(1);
   });
 
   it("resetWatermarks forces the next poll to broadcast a full update again", () => {
@@ -169,13 +163,9 @@ describe("WebSocket global polling (#277)", () => {
       "agent_update",
       "room_update",
       "cockpit_update",
-      "chaos_update",
-      "activity_update",
       "agent_update",
       "room_update",
       "cockpit_update",
-      "chaos_update",
-      "activity_update",
     ]);
   });
 });

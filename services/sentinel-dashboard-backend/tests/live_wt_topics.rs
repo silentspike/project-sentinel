@@ -85,7 +85,7 @@ async fn live_vm_connect_snapshot_contains_room_live_and_kpi() -> anyhow::Result
         .map_err(|e| anyhow::anyhow!("connect live WT: {e}"))?;
 
     let mut frames = BTreeMap::new();
-    for _ in 0..4 {
+    for _ in 0..5 {
         let (topic, value) = read_one_frame(&conn).await?;
         frames.insert(topic, value);
     }
@@ -94,7 +94,7 @@ async fn live_vm_connect_snapshot_contains_room_live_and_kpi() -> anyhow::Result
         "live WT topics: {:?}",
         frames.keys().cloned().collect::<Vec<_>>()
     );
-    for topic in ["hello", "agent_live", "room_live", "kpi"] {
+    for topic in ["hello", "agent_live", "room_live", "kpi", "event_log"] {
         anyhow::ensure!(frames.contains_key(topic), "missing topic {topic}");
     }
     let agent_count = frames["agent_live"]["agents"]
@@ -111,6 +111,13 @@ async fn live_vm_connect_snapshot_contains_room_live_and_kpi() -> anyhow::Result
     anyhow::ensure!(
         frames["kpi"].get("kpi").is_some(),
         "kpi snapshot must contain kpi key"
+    );
+    anyhow::ensure!(
+        frames["event_log"]
+            .get("events")
+            .and_then(Value::as_array)
+            .is_some(),
+        "event_log snapshot must contain events array"
     );
     Ok(())
 }

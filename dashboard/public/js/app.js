@@ -1,7 +1,4 @@
 // Router und WebSocket Manager
-import { renderActivity, updateActivity } from './activity.js';
-import { renderChaos, updateChaos } from './chaos.js';
-import { renderChat, initChat } from './chat.js';
 import { initControl } from './control.js';
 import { initTimeTravel, refreshTimeTravel } from './timetravel.js';
 import { refreshAuthStatus } from './auth.js';
@@ -40,8 +37,6 @@ function updateLagDisplay(lag) {
 // neu laden (Projection ist nach resetWatermarks frisch) und abhaengige Views
 // aktualisieren. (AC-4, #384)
 async function reloadAfterRestore() {
-  updateChaos();
-  updateActivity();
   refreshTimeTravel();
 }
 
@@ -58,14 +53,8 @@ function connectWebSocket() {
   ws.onmessage = (event) => {
     try {
       const data = JSON.parse(event.data);
-      if (data.type === 'agent_update') {
-        updateActivity();
-      } else if (data.type === 'health_update') {
+      if (data.type === 'health_update') {
         updateLagDisplay(data.lag);
-      } else if (data.type === 'chaos_update') {
-        updateChaos();
-      } else if (data.type === 'activity_update') {
-        updateActivity();
       } else if (data.type === 'snapshot_restored') {
         // Restore hat World-State ersetzt — Views aus REST neu laden (AC-4, #384)
         reloadAfterRestore();
@@ -94,18 +83,6 @@ async function init() {
 
   // Lade initiale Daten parallel
   try {
-    const [chaosRes] = await Promise.all([
-      fetch('/api/chaos?limit=100'),
-    ]);
-
-    const chaos = await chaosRes.json();
-
-    renderActivity();
-    renderChaos(chaos);
-
-    // Chat async laden (eigener Fetch)
-    initChat();
-
     // Control Panel async laden
     initControl();
 
