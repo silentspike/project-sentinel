@@ -24,6 +24,7 @@ members = [
     "crates/sentinel-projection",
     "crates/sentinel-fs",
     "crates/sentinel-console-plane",
+    "crates/sentinel-microvm",
     "services/sentinel-nightrun",
     "services/sentinel-gaia",
     "services/sentinel-daemon",
