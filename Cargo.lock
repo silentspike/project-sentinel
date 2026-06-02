@@ -4448,22 +4448,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sentinel-console"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "sentinel-common",
- "sentinel-console-plane",
- "sentinel-limbo",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "wtransport",
-]
-
-[[package]]
 name = "sentinel-console-plane"
 version = "0.1.0"
 dependencies = [

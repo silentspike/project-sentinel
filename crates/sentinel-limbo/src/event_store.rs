@@ -225,7 +225,7 @@ impl EventStore {
         })
     }
 
-    /// Oeffnet den Event Store **read-only** — fuer reine Consumer (z.B. `sentinel-console`),
+    /// Oeffnet den Event Store **read-only** — fuer reine Consumer (z.B. Dashboard/CAS-Pusher),
     /// die unter `systemd ReadOnlyPaths=` auf einem read-only gemounteten Datenverzeichnis laufen.
     /// Kein Schema-DDL, kein WAL-Mode-Write — `open()` wuerde sonst mit
     /// "attempt to write a readonly database" scheitern. Liest die Live-WAL-DB read-only

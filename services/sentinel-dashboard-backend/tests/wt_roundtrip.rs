@@ -4,7 +4,9 @@
 
 use std::time::Duration;
 
-use sentinel_dashboard_backend::{codec, tls, wt, AppState, Config};
+use sentinel_console_plane::HelloManifest;
+use sentinel_dashboard_backend::{cas::EventLogCasResponse, codec, tls, wt, AppState, Config};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use wtransport::{ClientConfig, Endpoint};
 
 /// Startet den WT-Server auf einem ephemeren Port mit frischem self-signed Cert.
@@ -13,6 +15,13 @@ use wtransport::{ClientConfig, Endpoint};
 /// uni-Stream ist dann immer der `hello`-Frame).
 async fn spawn_server(
     dashboard_api_key: Option<String>,
+) -> (u16, String, tokio::sync::broadcast::Sender<Vec<u8>>) {
+    spawn_server_with_events(dashboard_api_key, None).await
+}
+
+async fn spawn_server_with_events(
+    dashboard_api_key: Option<String>,
+    events_db: Option<String>,
 ) -> (u16, String, tokio::sync::broadcast::Sender<Vec<u8>>) {
     // Freien UDP-Port ermitteln.
     let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -30,10 +39,11 @@ async fn spawn_server(
         .join("nonexistent-projection.db")
         .to_string_lossy()
         .into_owned();
-    config.events_db = dir
-        .join("nonexistent-events.db")
-        .to_string_lossy()
-        .into_owned();
+    config.events_db = events_db.unwrap_or_else(|| {
+        dir.join("nonexistent-events.db")
+            .to_string_lossy()
+            .into_owned()
+    });
     let mut state = AppState::new(config).unwrap();
     state.config = std::sync::Arc::new({
         let mut c = (*state.config).clone();
@@ -50,6 +60,53 @@ async fn spawn_server(
     (port, hash, broadcast_tx)
 }
 
+fn temp_events_db() -> (std::path::PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!("wt-events-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("events.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE events (
+            id INTEGER PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            correlation_id TEXT,
+            causation_id TEXT,
+            tick INTEGER NOT NULL,
+            timestamp_ms INTEGER NOT NULL,
+            compensation_type TEXT NOT NULL DEFAULT 'none'
+        );",
+    )
+    .unwrap();
+    (dir, db.to_string_lossy().into_owned())
+}
+
+fn insert_event(
+    conn: &rusqlite::Connection,
+    id: i64,
+    event_type: &str,
+    aggregate_id: &str,
+    payload: &str,
+) {
+    conn.execute(
+        "INSERT INTO events
+         (id,event_id,event_type,aggregate_id,payload,correlation_id,causation_id,tick,timestamp_ms)
+         VALUES (?1,?2,?3,?4,?5,'corr',NULL,?6,?7)",
+        rusqlite::params![
+            id,
+            format!("evt-{id}"),
+            event_type,
+            aggregate_id,
+            payload,
+            id * 10,
+            1_700_000_000_000_i64 + id
+        ],
+    )
+    .unwrap();
+}
+
 /// Liest einen vollstaendigen topic-Frame vom naechsten server-initiierten uni-Stream.
 async fn read_one_frame(conn: &wtransport::Connection) -> (String, serde_json::Value) {
     let mut recv = tokio::time::timeout(Duration::from_secs(5), conn.accept_uni())
@@ -64,6 +121,28 @@ async fn read_one_frame(conn: &wtransport::Connection) -> (String, serde_json::V
         buf.extend_from_slice(&chunk[..n]);
     }
     codec::decode_frame_as(&buf).expect("decode frame")
+}
+
+async fn write_json_frame<W: AsyncWrite + Unpin>(writer: &mut W, value: &impl serde::Serialize) {
+    let payload = serde_json::to_vec(value).unwrap();
+    writer
+        .write_all(&(payload.len() as u32).to_le_bytes())
+        .await
+        .unwrap();
+    writer.write_all(&payload).await.unwrap();
+    writer.flush().await.unwrap();
+}
+
+async fn read_json_frame<R, T>(reader: &mut R) -> T
+where
+    R: AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+{
+    let mut len = [0u8; 4];
+    reader.read_exact(&mut len).await.unwrap();
+    let mut payload = vec![0; u32::from_le_bytes(len) as usize];
+    reader.read_exact(&mut payload).await.unwrap();
+    serde_json::from_slice(&payload).unwrap()
 }
 
 fn client_endpoint(cert_hash_b64: &str) -> Endpoint<wtransport::endpoint::endpoint_side::Client> {
@@ -162,4 +241,70 @@ async fn delta_frame_broadcast_delivered_to_session() {
     let (topic, value) = read_one_frame(&conn).await;
     assert_eq!(topic, "agent_live");
     assert_eq!(value["agents"][0]["name"], "Delta Dora");
+}
+
+#[tokio::test]
+async fn event_log_cas_bi_stream_returns_ordered_delta() {
+    let (dir, db_path) = temp_events_db();
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    insert_event(&conn, 1, "agent_spawned", "agent-1", r#"{"name":"Ada"}"#);
+    insert_event(
+        &conn,
+        2,
+        "agent_action_received",
+        "agent-1",
+        r#"{"content":"Hallo"}"#,
+    );
+
+    let (port, hash, _tx) = spawn_server_with_events(None, Some(db_path)).await;
+    let client = client_endpoint(&hash);
+    let wt = client
+        .connect(format!("https://127.0.0.1:{port}"))
+        .await
+        .expect("connect");
+
+    let (topic, _hello) = read_one_frame(&wt).await;
+    assert_eq!(topic, "hello");
+
+    let (mut send, mut recv) = wt
+        .open_bi()
+        .await
+        .expect("open bi")
+        .await
+        .expect("bi ready");
+    write_json_frame(&mut send, &HelloManifest { have: vec![] }).await;
+    send.finish().await.expect("finish hello");
+    let response: EventLogCasResponse = read_json_frame(&mut recv).await;
+
+    assert_eq!(response.topic, "event_log_cas");
+    assert_eq!(response.stats.event_count, 2);
+    assert_eq!(response.stats.max_event_id, 2);
+    assert!(!response.manifest.is_empty());
+    assert!(!response.delta.blocks.is_empty());
+
+    let compressed_by_hash = response
+        .delta
+        .blocks
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut ndjson = Vec::new();
+    for hash in &response.manifest {
+        let compressed = compressed_by_hash
+            .get(hash)
+            .expect("empty manifest client must receive every block");
+        ndjson.extend(zstd::decode_all(compressed.as_slice()).expect("zstd block"));
+    }
+    let ids = std::str::from_utf8(&ndjson)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                .as_i64()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![1, 2]);
+
+    let _ = std::fs::remove_dir_all(dir);
 }

@@ -1,14 +1,19 @@
-//! WebTransport/QUIC-Endpoint (#431) — server→client unidirektionale Streams, topic+msgpack+zstd-Frames.
+//! WebTransport/QUIC-Endpoint (#431/#464) — server→client unidirektionale Streams
+//! (topic+msgpack+zstd-Frames) plus Event-Log-CAS ueber bidirektionale Streams.
 //!
-//! Muster aus `sentinel-console/src/lib.rs:113-140` (wtransport 0.6). TLS = geteiltes self-signed Cert
-//! (siehe `tls`). Beim Session-Handshake wird ein kurzlebiges Einmal-Ticket (`?t=`) validiert (AC-3):
+//! Der Event-Log-CAS-Bi-Stream bleibt byte-kompatibel zu #439 (u32-LE length-prefixed JSON).
+//! TLS = geteiltes self-signed Cert (siehe `tls`). Beim Session-Handshake wird ein kurzlebiges
+//! Einmal-Ticket (`?t=`) validiert (AC-3):
 //! ohne gueltiges Ticket wird die Session NICHT akzeptiert (Drop = Reject). Ablauf pro Session:
-//! `hello`-Frame -> Projection-/EventLog-Connect-Snapshots -> kontinuierlicher Delta-Push aus dem
-//! Broadcast-Kanal (#432/#433, gespeist von `event_sub`).
+//! `hello`-Frame -> Projection-Connect-Snapshots -> kontinuierlicher Projection-Push aus dem
+//! Broadcast-Kanal (#432/#433, gespeist von `event_sub`). Event-Log-Clients synchronisieren den
+//! append-only Log per CAS-Bi-Stream (`HelloManifest -> EventLogCasResponse`).
 
 use std::path::PathBuf;
 
 use anyhow::Context;
+use sentinel_console_plane::HelloManifest;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use wtransport::{endpoint::IncomingSession, Endpoint, Identity, ServerConfig};
 
 use crate::AppState;
@@ -124,34 +129,29 @@ async fn handle_session(incoming: IncomingSession, st: AppState) -> anyhow::Resu
         }
         Err(e) => tracing::warn!(error = %e, "wt kpi snapshot skipped (projection read failed)"),
     }
-    match crate::events::event_log_backfill_events(
-        &st.config.events_db,
-        crate::event_sub::EVENT_LOG_BACKFILL_RECENT_LIMIT,
-        crate::event_sub::EVENT_LOG_BACKFILL_FOCUS_LIMIT,
-    ) {
-        Ok(events) => {
-            let frame = crate::codec::encode_frame(
-                "event_log",
-                &serde_json::json!({ "events": events, "backfill": true }),
-            )?;
-            let mut snap = connection.open_uni().await?.await?;
-            snap.write_all(&frame).await?;
-            snap.finish().await?;
-            tracing::debug!(bytes = frame.len(), "wt event_log backfill pushed");
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "wt event_log backfill skipped (events.db read failed)")
-        }
-    }
-
     // Kontinuierlicher Delta-Push (#432): nach dem Connect-Snapshot abonniert die Session den
     // Broadcast-Kanal. Jeder vom Event-Subscriber gepushte topic-Frame wird als eigener uni-Stream
-    // an den Client geschrieben. `Lagged` (langsamer Client) wird uebersprungen — der naechste
-    // Voll-Snapshot ist ohnehin autoritativ (client-reconcile).
+    // an den Client geschrieben. Parallel akzeptiert dieselbe Session Event-Log-CAS-Bi-Streams.
+    // `Lagged` (langsamer Client) wird uebersprungen — der naechste Voll-Snapshot ist ohnehin
+    // autoritativ (client-reconcile).
     use tokio::sync::broadcast::error::RecvError;
     let mut rx = st.broadcast_tx.subscribe();
     loop {
         tokio::select! {
+            stream = connection.accept_bi() => match stream {
+                Ok((send, recv)) => {
+                    let st = st.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = serve_event_log_cas(recv, send, st).await {
+                            tracing::warn!(error = %e, "event_log CAS bi-stream error");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "wt accept_bi failed");
+                    break;
+                }
+            },
             frame = rx.recv() => match frame {
                 Ok(bytes) => {
                     let mut stream = connection.open_uni().await?.await?;
@@ -169,6 +169,68 @@ async fn handle_session(incoming: IncomingSession, st: AppState) -> anyhow::Resu
             }
         }
     }
+    Ok(())
+}
+
+/// Reads a length-prefixed frame (u32-LE length + payload), byte-compatible with #439.
+pub(crate) async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Vec<u8>> {
+    let mut len = [0u8; 4];
+    reader.read_exact(&mut len).await?;
+    let n = u32::from_le_bytes(len) as usize;
+    let mut buf = vec![0u8; n];
+    reader.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Writes a length-prefixed frame (u32-LE length + payload), byte-compatible with #439.
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+) -> std::io::Result<()> {
+    writer.write_all(&(data.len() as u32).to_le_bytes()).await?;
+    writer.write_all(data).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn serve_event_log_cas(
+    mut recv: wtransport::RecvStream,
+    mut send: wtransport::SendStream,
+    st: AppState,
+) -> anyhow::Result<()> {
+    let hello_bytes = read_frame(&mut recv)
+        .await
+        .context("read event_log CAS hello")?;
+    let hello: HelloManifest =
+        serde_json::from_slice(&hello_bytes).context("decode event_log CAS hello")?;
+
+    if let Err(e) = crate::event_sub::refresh_event_log_cas(&st) {
+        tracing::warn!(
+            error = %e,
+            path = %st.config.events_db,
+            "event_log CAS refresh degraded; serving current plane"
+        );
+    }
+    let response = {
+        let guard = st
+            .event_cas
+            .lock()
+            .map_err(|_| anyhow::anyhow!("event_log CAS lock poisoned"))?;
+        guard.response_for(hello)
+    };
+    let response_bytes = serde_json::to_vec(&response).context("encode event_log CAS response")?;
+    write_frame(&mut send, &response_bytes)
+        .await
+        .context("write event_log CAS response")?;
+    send.finish().await?;
+    tracing::info!(
+        sent_blocks = response.delta.missing.len(),
+        bytes = response.stats.delta_transfer_bytes,
+        full_state_bytes = response.stats.full_state_bytes,
+        event_count = response.stats.event_count,
+        dedup_ratio = response.stats.dedup_ratio,
+        "event_log CAS delta sent"
+    );
     Ok(())
 }
 
