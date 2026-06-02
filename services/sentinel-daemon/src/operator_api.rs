@@ -48,6 +48,7 @@ const OPERATOR_SNAPSHOTS_PATH: &str = "/operator/snapshots";
 const OPERATOR_SNAPSHOT_PATH: &str = "/operator/snapshot";
 const OPERATOR_RESTORE_PATH: &str = "/operator/restore";
 const OPERATOR_CONFIG_APPLY_PATH: &str = "/operator/config/apply";
+const OPERATOR_MIGRATE_PATH: &str = "/operator/migrate";
 const OPERATOR_PRUNE_PATH: &str = "/operator/prune";
 const OPERATOR_CHAT_PATH: &str = "/operator/chat";
 const OPERATOR_GAIA_PATH: &str = "/operator/gaia";
@@ -396,6 +397,7 @@ struct AppState {
     snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
     config_apply_tx: mpsc::Sender<sentinel_common::OperatorConfigApplyCommand>,
+    migrate_tx: mpsc::Sender<sentinel_common::OperatorMigrateCommand>,
     config_apply_max_agents: usize,
     config_apply_validation: sentinel_common::agent_config::AgentConfigValidation,
     event_store: Arc<sentinel_limbo::EventStore>,
@@ -496,6 +498,7 @@ pub async fn start_server(
     snapshot_tx: mpsc::Sender<sentinel_common::OperatorSnapshotCommand>,
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
     config_apply_tx: mpsc::Sender<sentinel_common::OperatorConfigApplyCommand>,
+    migrate_tx: mpsc::Sender<sentinel_common::OperatorMigrateCommand>,
     config_apply_max_agents: usize,
     config_apply_validation: sentinel_common::agent_config::AgentConfigValidation,
     event_store: Arc<sentinel_limbo::EventStore>,
@@ -523,6 +526,7 @@ pub async fn start_server(
         snapshot_tx,
         restore_tx,
         config_apply_tx,
+        migrate_tx,
         config_apply_max_agents,
         config_apply_validation,
         event_store,
@@ -765,6 +769,33 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 ),
                 Err(_) => ApiError::ServiceUnavailable("Config-Apply-Channel nicht verfuegbar")
                     .to_response(),
+            }
+        }
+        OPERATOR_MIGRATE_PATH => {
+            // Nano-Container Live-Migration (#413): lokaler Snapshot->Restore-Handoff der
+            // ECS-native-Instanz (tick-synchron im Daemon). reason ist serde(default) =>
+            // leerer Body erlaubt. Cross-node/Netzwerk-Migration ist out-of-scope.
+            let payload: sentinel_common::OperatorMigrateCommand = serde_json::from_slice(
+                &request.body,
+            )
+            .unwrap_or(sentinel_common::OperatorMigrateCommand {
+                reason: String::new(),
+            });
+            info!(
+                reason = %payload.reason,
+                "Nano-Container Live-Migration via Operator-API angefordert"
+            );
+            match state.migrate_tx.send(payload) {
+                Ok(()) => json_response(
+                    202,
+                    serde_json::json!({
+                        "accepted": true,
+                        "message": "Live-Migration gestartet (lokal, tick-synchron)"
+                    }),
+                ),
+                Err(_) => {
+                    ApiError::ServiceUnavailable("Migrate-Channel nicht verfuegbar").to_response()
+                }
             }
         }
         OPERATOR_PRUNE_PATH => {
@@ -2822,6 +2853,7 @@ mod tests {
             snapshot_tx: mpsc::channel().0,
             restore_tx: mpsc::channel().0,
             config_apply_tx: mpsc::channel().0,
+            migrate_tx: mpsc::channel().0,
             config_apply_max_agents: 60,
             config_apply_validation:
                 sentinel_common::agent_config::AgentConfigValidation::with_max_agent_id(60),
@@ -3187,6 +3219,54 @@ mod tests {
             test_request(
                 OPERATOR_CONFIG_APPLY_PATH,
                 config_apply_cmd(vec![config_apply_agent(1, 0.5)]),
+            ),
+            &state,
+        );
+        assert_eq!(response.status, 401);
+    }
+
+    #[test]
+    fn migrate_request_is_accepted_and_forwarded() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let (tx, migrate_rx) = mpsc::channel();
+        state.migrate_tx = tx;
+
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_MIGRATE_PATH,
+                serde_json::json!({ "reason": "resource_rebalance" }),
+            ),
+            &state,
+        );
+        assert_eq!(response.status, 202);
+
+        let received = migrate_rx.recv().unwrap();
+        assert_eq!(received.reason, "resource_rebalance");
+    }
+
+    #[test]
+    fn migrate_empty_body_defaults_reason_and_is_forwarded() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let (tx, migrate_rx) = mpsc::channel();
+        state.migrate_tx = tx;
+
+        // Leerer/teilweiser Body erlaubt — reason ist serde(default).
+        let response = handle_http_request(
+            test_request(OPERATOR_MIGRATE_PATH, serde_json::json!({})),
+            &state,
+        );
+        assert_eq!(response.status, 202);
+        let received = migrate_rx.recv().unwrap();
+        assert!(received.reason.is_empty());
+    }
+
+    #[test]
+    fn migrate_requires_auth() {
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_MIGRATE_PATH,
+                serde_json::json!({ "reason": "manual" }),
             ),
             &state,
         );

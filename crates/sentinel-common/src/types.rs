@@ -654,6 +654,16 @@ pub struct OperatorSnapshotCommand {
     pub tier: Option<SnapshotTier>,
 }
 
+/// Operator-Trigger fuer lokale Nano-Container Live-Migration (#413): die laufende ECS-native
+/// Instanz wird via Snapshot->Restore auf eine frische Instanz uebergeben (alte beendet).
+/// LOKAL (gleicher Host); cross-node ist out-of-scope (Multi-Node-gated).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorMigrateCommand {
+    /// Ausloesegrund fuer den Audit-Trail (z.B. "manual", "resource_rebalance").
+    #[serde(default)]
+    pub reason: String,
+}
+
 /// Apply-Modus fuer Runtime-Config-Apply (#425).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
