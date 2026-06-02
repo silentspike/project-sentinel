@@ -1060,7 +1060,7 @@ fn personality_for(seed: u64, id: u16, culture: &CultureSpec) -> AgentPersonalit
     }
 }
 
-/// Bildet eine Kultur-Achse [0,1] auf einen Trait-Mittelwert in [0.35, 0.65] ab (0.5 = neutral).
+/// Bildet eine Kultur-Achse \[0,1] auf einen Trait-Mittelwert in \[0.35, 0.65] ab (0.5 = neutral).
 fn axis_center(axis: f32) -> f32 {
     0.35 + axis.clamp(0.0, 1.0) * 0.30
 }
@@ -1145,8 +1145,8 @@ fn deterministic_name(seed: u64, id: u16) -> String {
     format!("{first} {last}")
 }
 
-/// Deterministischer Trait-Wert um `center` mit Streuung `spread`, blake3-basiert, auf [0.05, 0.95]
-/// geklemmt (innerhalb des von `PersonalityConfig::validate` geforderten [0,1]) und auf 2 Nachkommastellen.
+/// Deterministischer Trait-Wert um `center` mit Streuung `spread`, blake3-basiert, auf \[0.05, 0.95]
+/// geklemmt (innerhalb des von `PersonalityConfig::validate` geforderten \[0,1]) und auf 2 Nachkommastellen.
 fn score_with(seed: u64, id: u16, field: &str, center: f32, spread: f32) -> f32 {
     let norm = f32::from(hash_byte(seed, id, field)) / 255.0; // [0,1]
     let value = center + (norm - 0.5) * spread;
