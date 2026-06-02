@@ -16,7 +16,10 @@ use sentinel_dashboard_backend::{build_app, event_sub, tls, wt, AppState, Config
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
         .init();
 
     // rustls Crypto-Provider (0.23) einmalig installieren (wird von axum-server + wtransport genutzt).
@@ -25,9 +28,12 @@ async fn main() -> anyhow::Result<()> {
     let mut config = Config::from_env();
 
     // Geteiltes self-signed Cert (HTTPS + WebTransport), Hash fuer /api/cert-hash.
-    let cert_dir =
-        std::env::var("SENTINEL_DASHBOARD_CERT_DIR").unwrap_or_else(|_| "/opt/sentinel/console-cert".into());
-    let cert = tls::generate(std::path::Path::new(&cert_dir), &["localhost", "127.0.0.1", "10.0.0.240"])?;
+    let cert_dir = std::env::var("SENTINEL_DASHBOARD_CERT_DIR")
+        .unwrap_or_else(|_| "/opt/sentinel/console-cert".into());
+    let cert = tls::generate(
+        std::path::Path::new(&cert_dir),
+        &["localhost", "127.0.0.1", "10.0.0.240"],
+    )?;
     config.cert_hash_b64 = Some(cert.cert_hash_b64.clone());
 
     let http_bind: SocketAddr = config.http_bind.parse()?;
@@ -50,8 +56,11 @@ async fn main() -> anyhow::Result<()> {
 
     let app = build_app(state.clone());
 
-    let tls_config =
-        axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert.cert_pem_path, &cert.key_pem_path).await?;
+    let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+        &cert.cert_pem_path,
+        &cert.key_pem_path,
+    )
+    .await?;
     tracing::info!(%http_bind, bundle = %state.config.bundle_dir, "sentinel-dashboard-backend HTTPS listening");
     axum_server::bind_rustls(http_bind, tls_config)
         .serve(app.into_make_service())

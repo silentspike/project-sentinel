@@ -23,7 +23,8 @@ pub struct SharedCert {
 pub fn generate(out_dir: &Path, sans: &[&str]) -> anyhow::Result<SharedCert> {
     std::fs::create_dir_all(out_dir)?;
     let params = {
-        let mut p = rcgen::CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>())?;
+        let mut p =
+            rcgen::CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>())?;
         p.not_before = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
         p.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(13);
         p
@@ -40,5 +41,9 @@ pub fn generate(out_dir: &Path, sans: &[&str]) -> anyhow::Result<SharedCert> {
     std::fs::write(&key_pem_path, key_pair.serialize_pem())?;
 
     tracing::info!(?cert_pem_path, cert_hash_b64 = %cert_hash_b64, "self-signed console cert generated (13d)");
-    Ok(SharedCert { cert_pem_path, key_pem_path, cert_hash_b64 })
+    Ok(SharedCert {
+        cert_pem_path,
+        key_pem_path,
+        cert_hash_b64,
+    })
 }

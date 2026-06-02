@@ -46,7 +46,8 @@ pub fn encode_frame<T: Serialize>(topic: &str, value: &T) -> Result<Vec<u8>, Cod
     let msgpack = rmp_serde::to_vec_named(value)?;
     let compressed = zstd::encode_all(msgpack.as_slice(), ZSTD_LEVEL)?;
 
-    let mut frame = Vec::with_capacity(2 + topic_bytes.len() + HEADER_AFTER_TOPIC + compressed.len());
+    let mut frame =
+        Vec::with_capacity(2 + topic_bytes.len() + HEADER_AFTER_TOPIC + compressed.len());
     frame.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
     frame.extend_from_slice(topic_bytes);
     frame.push(CODEC_MSGPACK);
@@ -66,7 +67,10 @@ pub struct DecodedFrame {
 /// used by the integration test client and any in-process consumer.
 pub fn decode_frame(data: &[u8]) -> Result<DecodedFrame, CodecError> {
     if data.len() < 2 {
-        return Err(CodecError::Truncated { need: 2, have: data.len() });
+        return Err(CodecError::Truncated {
+            need: 2,
+            have: data.len(),
+        });
     }
     let topic_len = u16::from_be_bytes([data[0], data[1]]) as usize;
     let after_topic = 2 + topic_len;
@@ -101,7 +105,9 @@ pub fn decode_frame(data: &[u8]) -> Result<DecodedFrame, CodecError> {
 }
 
 /// Convenience: decode a frame straight into a typed value.
-pub fn decode_frame_as<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<(String, T), CodecError> {
+pub fn decode_frame_as<T: serde::de::DeserializeOwned>(
+    data: &[u8],
+) -> Result<(String, T), CodecError> {
     let f = decode_frame(data)?;
     let value = rmp_serde::from_slice(&f.msgpack)?;
     Ok((f.topic, value))
@@ -121,7 +127,11 @@ mod tests {
 
     #[test]
     fn roundtrip_topic_and_value() {
-        let v = Sample { id: 7, name: "agent-01".into(), values: vec![1.0, 2.5, 3.25] };
+        let v = Sample {
+            id: 7,
+            name: "agent-01".into(),
+            values: vec![1.0, 2.5, 3.25],
+        };
         let frame = encode_frame("agent_live", &v).unwrap();
         let (topic, decoded): (String, Sample) = decode_frame_as(&frame).unwrap();
         assert_eq!(topic, "agent_live");
@@ -136,7 +146,11 @@ mod tests {
         assert_eq!(&frame[2..4], b"hi", "topic bytes");
         assert_eq!(frame[4], CODEC_MSGPACK, "codec id 0x01");
         let payload_len = u32::from_be_bytes([frame[5], frame[6], frame[7], frame[8]]) as usize;
-        assert_eq!(frame.len(), 9 + payload_len, "total = header + compressed payload");
+        assert_eq!(
+            frame.len(),
+            9 + payload_len,
+            "total = header + compressed payload"
+        );
         // The compressed payload must zstd-decode back to valid msgpack.
         let decoded = decode_frame(&frame).unwrap();
         assert_eq!(decoded.topic, "hi");
@@ -146,13 +160,19 @@ mod tests {
     #[test]
     fn truncated_frame_errors_not_panics() {
         let frame = encode_frame("topic", &42u32).unwrap();
-        assert!(matches!(decode_frame(&frame[..3]), Err(CodecError::Truncated { .. })));
+        assert!(matches!(
+            decode_frame(&frame[..3]),
+            Err(CodecError::Truncated { .. })
+        ));
     }
 
     #[test]
     fn unknown_codec_id_rejected() {
         let mut frame = encode_frame("t", &1u8).unwrap();
         frame[3] = 0xFF; // corrupt codec id (after 2B len + 1B topic "t")
-        assert!(matches!(decode_frame(&frame), Err(CodecError::UnknownCodec(0xFF))));
+        assert!(matches!(
+            decode_frame(&frame),
+            Err(CodecError::UnknownCodec(0xFF))
+        ));
     }
 }
