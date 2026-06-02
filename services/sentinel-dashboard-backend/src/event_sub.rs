@@ -4,6 +4,9 @@
 //!
 //! #433 erweitert denselben Push-Pfad auf `room_live` und `kpi`: relevante Events setzen Dirty-Flags,
 //! der 150ms-Tick liest jedes betroffene Read-Model hoechstens einmal und sendet ein Topic-Frame.
+//! Der append-only Event-Log-Stream nutzt denselben topic-Codec als eigener Poller aus `events.db`:
+//! `event_log` liefert nur neue `id > offset`-Rows; der WebTransport-Connect-Snapshot deckt den
+//! letzten Verlauf ab.
 //!
 //! **Strategie: Voll-Satz pro Event + client-`reconcile`** (nicht CAS-Block-Delta). Bei ~26-43
 //! winzigen Agent-Zeilen ist der zstd-komprimierte Voll-Satz <4 KB; `reconcile({key:"agent_id"})`
@@ -19,6 +22,11 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use crate::AppState;
+
+pub(crate) const EVENT_LOG_BATCH_LIMIT: usize = 500;
+pub(crate) const EVENT_LOG_BACKFILL_RECENT_LIMIT: usize = 9_000;
+pub(crate) const EVENT_LOG_BACKFILL_FOCUS_LIMIT: usize = 500;
+pub(crate) const EVENT_LOG_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DirtyModels {
@@ -164,6 +172,48 @@ pub async fn run_event_subscriber(state: AppState) {
     }
 }
 
+/// Pusht append-only EventStore-Deltas als `event_log`-Topic-Frames.
+///
+/// Start-offset ist der aktuelle Maximalwert, damit ein Backend-Restart nicht das ganze Log neu
+/// broadcastet. Connect-Backfill laeuft separat in `wt.rs`; der Client dedupliziert nach `id`.
+pub async fn run_event_log_pusher(state: AppState) {
+    let mut offset = match crate::events::max_event_id(&state.config.events_db) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %state.config.events_db,
+                "event_log pusher starts degraded: events.db unavailable"
+            );
+            0
+        }
+    };
+    let mut tick = tokio::time::interval(EVENT_LOG_POLL_INTERVAL);
+    loop {
+        tick.tick().await;
+        if should_skip_read(state.broadcast_tx.receiver_count()) {
+            continue;
+        }
+        match crate::events::events_after_id(&state.config.events_db, offset, EVENT_LOG_BATCH_LIMIT)
+        {
+            Ok(events) => {
+                if events.is_empty() {
+                    continue;
+                }
+                if let Some(max_seen) = max_event_log_id(&events) {
+                    offset = offset.max(max_seen);
+                }
+                push_event_log(&state, events, false);
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                offset,
+                "event_log delta skipped (events.db read failed)"
+            ),
+        }
+    }
+}
+
 /// Verbindet zu NATS, erstellt einen ephemeren `DeliverPolicy::New`-Consumer und pusht koalesziert
 /// `agent_live`-Frames. Kehrt mit `Err` bei Verbindungs-/Streamfehlern zurueck (Caller retried).
 async fn subscribe_and_pump(state: &AppState) -> anyhow::Result<()> {
@@ -235,6 +285,28 @@ fn push_dirty(state: &AppState, dirty: DirtyModels) {
     }
     if dirty.kpi {
         push_kpi(state);
+    }
+}
+
+pub(crate) fn max_event_log_id(events: &[serde_json::Value]) -> Option<i64> {
+    events
+        .iter()
+        .filter_map(|event| event.get("id").and_then(serde_json::Value::as_i64))
+        .max()
+}
+
+pub(crate) fn push_event_log(state: &AppState, events: Vec<serde_json::Value>, backfill: bool) {
+    if events.is_empty() {
+        return;
+    }
+    match crate::codec::encode_frame(
+        "event_log",
+        &serde_json::json!({ "events": events, "backfill": backfill }),
+    ) {
+        Ok(frame) => {
+            let _ = state.broadcast_tx.send(frame);
+        }
+        Err(e) => tracing::warn!(error = %e, "event_log encode_frame failed"),
     }
 }
 
@@ -428,6 +500,43 @@ mod tests {
         // Defensive: falsch geformtes Subject -> "" -> fail-safe push-relevant.
         assert_eq!(event_type_from_subject("garbage"), "");
         assert!(classify(event_type_from_subject("garbage")).agents);
+    }
+
+    #[test]
+    fn max_event_log_id_reads_highest_numeric_id() {
+        let events = vec![
+            serde_json::json!({"id": 7, "event_type": "agent_spawned"}),
+            serde_json::json!({"id": 12, "event_type": "chaos_triggered"}),
+            serde_json::json!({"event_type": "legacy_without_id"}),
+        ];
+        assert_eq!(max_event_log_id(&events), Some(12));
+        assert_eq!(max_event_log_id(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn push_event_log_sends_topic_frame() {
+        let state = crate::AppState::new(crate::Config::from_env()).unwrap();
+        let mut rx = state.broadcast_tx.subscribe();
+
+        push_event_log(
+            &state,
+            vec![serde_json::json!({
+                "id": 42,
+                "event_id": "evt-42",
+                "event_type": "agent_action_received",
+                "payload": "{\"content\":\"Hallo\"}"
+            })],
+            false,
+        );
+
+        let frame = rx
+            .try_recv()
+            .expect("event_log muss einen Broadcast-Frame pushen");
+        let (topic, value): (String, serde_json::Value) =
+            crate::codec::decode_frame_as(&frame).expect("decode frame");
+        assert_eq!(topic, "event_log");
+        assert_eq!(value["events"][0]["id"], 42);
+        assert_eq!(value["backfill"], false);
     }
 
     /// Integrationstest (Maßgabe Hauptsession): ein `config_applied`-Event laeuft durch classify

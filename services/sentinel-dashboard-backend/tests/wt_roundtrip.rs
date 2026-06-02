@@ -30,6 +30,10 @@ async fn spawn_server(
         .join("nonexistent-projection.db")
         .to_string_lossy()
         .into_owned();
+    config.events_db = dir
+        .join("nonexistent-events.db")
+        .to_string_lossy()
+        .into_owned();
     let mut state = AppState::new(config).unwrap();
     state.config = std::sync::Arc::new({
         let mut c = (*state.config).clone();

@@ -9,6 +9,9 @@ import {
 import { Tiling } from "./tiling/TilingLayout";
 import { tilingTree, splitLeaf, closeLeaf, openPanel, type PanelKind } from "./tiling/engine";
 import { AgentsView } from "./views/AgentsView";
+import { ActivityView } from "./views/ActivityView";
+import { ChaosView } from "./views/ChaosView";
+import { ChatView } from "./views/ChatView";
 import { CockpitView } from "./views/CockpitView";
 import { FloorplanView } from "./views/FloorplanView";
 import { MetricsView } from "./views/MetricsView";
@@ -21,12 +24,14 @@ function useIsMobile() {
   return m;
 }
 
-const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "cockpit", "control", "chat"];
+const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "cockpit", "activity", "chaos", "chat", "control"];
 const PANEL_LABEL: Record<PanelKind, string> = {
   agents: "Agents",
   floorplan: "Floorplan",
   metrics: "Metrics",
   cockpit: "Cockpit",
+  activity: "Activity",
+  chaos: "Chaos",
   control: "Control",
   chat: "Chat",
 };
@@ -70,22 +75,15 @@ function ControlCol(): JSX.Element {
   );
 }
 
-function ChatCol(): JSX.Element {
-  return (
-    <section class="col" style={{ height: "100%" }} data-testid="col-chat">
-      <div class="col__head">Chat</div>
-      <div class="col__body"><p class="muted">Room-Chat · 1:1-Agent-DM · Invite (Phase 4).</p></div>
-    </section>
-  );
-}
-
 const PANELS: Record<PanelKind, () => JSX.Element> = {
   agents: AgentsView,
   floorplan: FloorplanView,
   metrics: MetricsView,
   cockpit: CockpitView,
+  activity: ActivityView,
+  chaos: ChaosView,
   control: ControlCol,
-  chat: ChatCol,
+  chat: ChatView,
 };
 
 // Tile-Chrome: kompakte Leiste (Split horizontal/vertikal, Schliessen) ueber dem Panel.
