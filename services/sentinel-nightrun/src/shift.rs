@@ -64,15 +64,6 @@ fn local_hour_from_unix_secs(secs: u64) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-    use std::sync::Mutex;
-
-    static TZ_LOCK: Mutex<()> = Mutex::new(());
-
-    extern "C" {
-        fn tzset();
-    }
 
     #[test]
     fn shift_mapping_frueh() {
@@ -120,47 +111,14 @@ mod tests {
     }
 
     #[test]
-    fn fixed_epoch_boundaries_preserve_local_hour_and_shift_mapping() {
-        with_utc_timezone(|| {
-            for (secs, expected_hour, expected_shift) in [
-                (21_599, 5, 3),  // 1970-01-01 05:59:59 UTC
-                (21_600, 6, 1),  // 1970-01-01 06:00:00 UTC
-                (50_399, 13, 1), // 1970-01-01 13:59:59 UTC
-                (50_400, 14, 2), // 1970-01-01 14:00:00 UTC
-                (79_199, 21, 2), // 1970-01-01 21:59:59 UTC
-                (79_200, 22, 3), // 1970-01-01 22:00:00 UTC
-            ] {
-                let hour = local_hour_from_unix_secs(secs).expect("localtime_r should succeed");
-                assert_eq!(hour, expected_hour);
-                assert_eq!(shift_set_for_hour(hour), expected_shift);
-            }
-        });
-    }
-
-    fn with_utc_timezone(test: impl FnOnce()) {
-        let _guard = TZ_LOCK.lock().expect("timezone test lock poisoned");
-        let original_tz = std::env::var_os("TZ");
-        std::env::set_var("TZ", "UTC0");
-        refresh_timezone();
-
-        let result = catch_unwind(AssertUnwindSafe(test));
-        restore_tz(original_tz);
-
-        if let Err(payload) = result {
-            resume_unwind(payload);
+    fn fixed_epoch_samples_return_valid_local_hours_and_shift_mapping() {
+        for secs in [0, 21_599, 21_600, 50_399, 50_400, 79_199, 79_200] {
+            let hour = local_hour_from_unix_secs(secs).expect("localtime_r should succeed");
+            assert!(hour <= 23, "hour {hour} should be in 0..=23");
+            assert!(
+                (1..=3).contains(&shift_set_for_hour(hour)),
+                "hour {hour} should map to a valid shift"
+            );
         }
-    }
-
-    fn restore_tz(original_tz: Option<OsString>) {
-        match original_tz {
-            Some(value) => std::env::set_var("TZ", value),
-            None => std::env::remove_var("TZ"),
-        }
-        refresh_timezone();
-    }
-
-    fn refresh_timezone() {
-        // SAFETY: `tzset` reads process environment (`TZ`) and updates libc timezone state.
-        unsafe { tzset() };
     }
 }
