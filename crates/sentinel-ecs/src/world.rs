@@ -309,6 +309,145 @@ impl RoomPhysicsState {
     }
 }
 
+const ROOM_PHYSICS_WORKSPACE_CAPACITY: usize = 32;
+
+/// Reusable scratch storage for per-tick room physics aggregation.
+#[derive(Resource, Debug, Clone)]
+pub struct RoomPhysicsWorkspace {
+    rooms: Vec<RoomPhysicsWorkspaceRoom>,
+    active_len: usize,
+    adjacent_noise: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct RoomPhysicsWorkspaceRoom {
+    room_id: String,
+    occupant_count: usize,
+    has_meeting: bool,
+    seed_noise_db: f32,
+}
+
+impl Default for RoomPhysicsWorkspace {
+    fn default() -> Self {
+        Self {
+            rooms: Vec::with_capacity(ROOM_PHYSICS_WORKSPACE_CAPACITY),
+            active_len: 0,
+            adjacent_noise: Vec::with_capacity(ROOM_PHYSICS_WORKSPACE_CAPACITY),
+        }
+    }
+}
+
+impl RoomPhysicsWorkspace {
+    pub fn clear(&mut self) {
+        self.active_len = 0;
+        self.adjacent_noise.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.active_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.active_len == 0
+    }
+
+    pub fn ensure_room(&mut self, room_id: &str) {
+        if self.find_room_index(room_id).is_none() {
+            self.activate_room(room_id);
+        }
+    }
+
+    pub fn add_occupant(&mut self, room_id: &str, has_meeting: bool) {
+        let index = match self.find_room_index(room_id) {
+            Some(index) => index,
+            None => self.activate_room(room_id),
+        };
+
+        let room = &mut self.rooms[index];
+        room.occupant_count += 1;
+        room.has_meeting |= has_meeting;
+    }
+
+    pub fn room_stats(&self, index: usize) -> (&str, usize, bool) {
+        assert!(index < self.active_len);
+        let room = &self.rooms[index];
+        (room.room_id.as_str(), room.occupant_count, room.has_meeting)
+    }
+
+    pub fn set_seed_noise(&mut self, index: usize, seed_noise_db: f32) {
+        assert!(index < self.active_len);
+        self.rooms[index].seed_noise_db = seed_noise_db;
+    }
+
+    pub fn collect_adjacent_noise_for(
+        &mut self,
+        index: usize,
+        room_distances: Option<&RoomDistanceMap>,
+    ) -> &[f32] {
+        self.adjacent_noise.clear();
+        let Some(room_distances) = room_distances else {
+            return &self.adjacent_noise;
+        };
+
+        assert!(index < self.active_len);
+        let rooms = &self.rooms[..self.active_len];
+        let adjacent_noise = &mut self.adjacent_noise;
+        let room_id = rooms[index].room_id.as_str();
+
+        room_distances.for_rooms_within(room_id, 1, |adjacent_room, _| {
+            if let Some(seed_noise_db) = rooms
+                .iter()
+                .find(|room| room.room_id == adjacent_room)
+                .map(|room| room.seed_noise_db)
+            {
+                adjacent_noise.push(seed_noise_db);
+            }
+        });
+
+        adjacent_noise
+    }
+
+    pub fn room_capacity(&self) -> usize {
+        self.rooms.capacity()
+    }
+
+    fn activate_room(&mut self, room_id: &str) -> usize {
+        let index = self.active_len;
+        if let Some(room) = self.rooms.get_mut(index) {
+            room.reset(room_id);
+        } else {
+            self.rooms.push(RoomPhysicsWorkspaceRoom::new(room_id));
+        }
+        self.active_len += 1;
+        index
+    }
+
+    fn find_room_index(&self, room_id: &str) -> Option<usize> {
+        self.rooms[..self.active_len]
+            .iter()
+            .position(|room| room.room_id == room_id)
+    }
+}
+
+impl RoomPhysicsWorkspaceRoom {
+    fn new(room_id: &str) -> Self {
+        Self {
+            room_id: room_id.to_string(),
+            occupant_count: 0,
+            has_meeting: false,
+            seed_noise_db: 0.0,
+        }
+    }
+
+    fn reset(&mut self, room_id: &str) {
+        self.room_id.clear();
+        self.room_id.push_str(room_id);
+        self.occupant_count = 0;
+        self.has_meeting = false;
+        self.seed_noise_db = 0.0;
+    }
+}
+
 /// Simulationszeit-Resource (muss vor jedem Schedule::run() aktualisiert werden)
 #[derive(Resource, Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationTime {
@@ -413,6 +552,81 @@ impl PersistTelemetry {
             return 0.0;
         }
         self.batch_size_sum as f64 / self.flush_attempts as f64
+    }
+}
+
+const PERSIST_WORKSPACE_CAPACITY: usize = 64;
+const PERSIST_TOPIC_CAPACITY: usize = 96;
+
+/// Reusable scratch storage for the Limbo write phase of a tick.
+#[derive(Resource, Debug, Clone)]
+pub struct PersistWorkspace {
+    events: Vec<DomainEvent>,
+    topics: Vec<String>,
+    active_len: usize,
+}
+
+impl Default for PersistWorkspace {
+    fn default() -> Self {
+        Self {
+            events: Vec::with_capacity(PERSIST_WORKSPACE_CAPACITY),
+            topics: Vec::with_capacity(PERSIST_WORKSPACE_CAPACITY),
+            active_len: 0,
+        }
+    }
+}
+
+impl PersistWorkspace {
+    pub fn clear(&mut self) {
+        self.events.clear();
+        self.active_len = 0;
+    }
+
+    pub fn len(&self) -> usize {
+        self.active_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.active_len == 0
+    }
+
+    pub fn push_with_topic<F>(&mut self, event: DomainEvent, write_topic: F)
+    where
+        F: FnOnce(&mut String, &DomainEvent),
+    {
+        let index = self.active_len;
+        if self.topics.len() == index {
+            self.topics
+                .push(String::with_capacity(PERSIST_TOPIC_CAPACITY));
+        }
+
+        let topic = &mut self.topics[index];
+        topic.clear();
+        write_topic(topic, &event);
+        self.events.push(event);
+        self.active_len += 1;
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (&DomainEvent, &str)> {
+        self.events[..self.active_len]
+            .iter()
+            .zip(self.topics[..self.active_len].iter())
+            .map(|(event, topic)| (event, topic.as_str()))
+    }
+
+    pub fn drain_events(&mut self) -> std::vec::Drain<'_, DomainEvent> {
+        self.active_len = 0;
+        self.events.drain(..)
+    }
+
+    #[cfg(test)]
+    pub fn event_capacity(&self) -> usize {
+        self.events.capacity()
+    }
+
+    #[cfg(test)]
+    pub fn topic_capacity(&self, index: usize) -> Option<usize> {
+        self.topics.get(index).map(String::capacity)
     }
 }
 
@@ -854,6 +1068,18 @@ impl RoomDistanceMap {
             .collect()
     }
 
+    /// Besucht alle Raeume die max `max_hops` entfernt sind, ohne ein Vec zu allozieren.
+    pub fn for_rooms_within<F>(&self, from: &str, max_hops: u32, mut visit: F)
+    where
+        F: FnMut(&str, u32),
+    {
+        for ((source, target), &distance) in &self.distances {
+            if source == from && distance > 0 && distance <= max_hops {
+                visit(target.as_str(), distance);
+            }
+        }
+    }
+
     /// Gibt die bekannte Liste aller Raum-IDs aus `rooms.toml` zurueck.
     pub fn all_rooms(&self) -> &[String] {
         &self.room_ids
@@ -938,11 +1164,13 @@ pub fn create_simulation_world() -> (World, Schedule) {
     // Resources einfuegen
     world.insert_resource(SimulationTime::default());
     world.insert_resource(PersistTelemetry::default());
+    world.insert_resource(PersistWorkspace::default());
     world.insert_resource(EventBuffer::default());
     world.insert_resource(ActiveSmells::default());
     world.insert_resource(ActiveChaos::default());
     world.insert_resource(ActiveRoomStimuli::default());
     world.insert_resource(RoomPhysicsState::default());
+    world.insert_resource(RoomPhysicsWorkspace::default());
     world.insert_resource(ActiveAgentsThisTick::default());
     world.insert_resource(RoomChatBuffer::default());
     world.insert_resource(GaiaBuffer::default());
@@ -1002,6 +1230,8 @@ pub fn create_simulation_world() -> (World, Schedule) {
             .in_set(SimulationPhase::Decision)
             .after(super::decision::decision_system),
     );
+    // #438: Task-Fortschritt aus Agent-Aktionen ableiten (Pending -> InProgress).
+    schedule.add_systems(super::systems::task_progress_system.in_set(SimulationPhase::Decision));
     schedule.add_systems(output_system.in_set(SimulationPhase::Output));
     schedule.add_systems(persist_system.in_set(SimulationPhase::Persist));
 
@@ -1160,6 +1390,28 @@ pub fn apply_capabilities(
     }
 }
 
+/// Aktualisiert Name + Rolle eines laufenden Agents aus der IdentityConfig (#425 Live-Apply).
+///
+/// Aendert NUR die ECS AgentIdentity-Component (Bio/Position/Memory/Evolution bleiben).
+/// `department` ist nicht Teil der ECS-Identity (nur TOML/Gateway-DNA), wird daher hier nicht gesetzt.
+pub fn apply_identity(
+    world: &mut World,
+    entity: Entity,
+    cfg: &sentinel_common::agent_config::IdentityConfig,
+) {
+    if let Some(mut id) = world.get_mut::<AgentIdentity>(entity) {
+        id.name = cfg.name.clone();
+        id.role = cfg.role.clone();
+    }
+}
+
+/// Baut die Raum-Resources (RoomInfoMap + RoomDistanceMap) aus einer neuen BuildingConfig neu auf (#425).
+/// Fuer Live-Apply geaenderter Raeume + Fresh-Load.
+pub fn rebuild_room_maps(world: &mut World, building: &sentinel_common::room::BuildingConfig) {
+    world.insert_resource(RoomInfoMap::from_building_config(building));
+    world.insert_resource(RoomDistanceMap::from_building_config(building));
+}
+
 /// Entfernt einen Agenten aus der ECS World anhand seiner AgentId.
 /// Gibt `true` zurueck wenn der Agent gefunden und despawned wurde.
 pub fn despawn_agent_from_world(world: &mut World, agent_id: AgentId) -> bool {
@@ -1233,6 +1485,13 @@ pub fn snapshot_ecs_state(world: &mut World) -> sentinel_common::EcsSnapshot {
         llm_configs_vec.push((id, llm.clone()));
     }
 
+    // Task-Entities (#438): eigene Entities ohne AgentIdentity, separat erfassen.
+    let mut task_states = Vec::new();
+    let mut task_query = world.query::<&sentinel_common::components::TaskState>();
+    for task in task_query.iter(world) {
+        task_states.push(task.clone());
+    }
+
     let sim_time = world.get_resource::<SimulationTime>();
 
     sentinel_common::EcsSnapshot {
@@ -1248,6 +1507,7 @@ pub fn snapshot_ecs_state(world: &mut World) -> sentinel_common::EcsSnapshot {
         shift_infos,
         relationships: relationships_vec,
         llm_configs: llm_configs_vec,
+        task_states,
         sim_tick: sim_time.map(|t| t.tick.0).unwrap_or(0),
         sim_hour: sim_time.map(|t| t.sim_hour).unwrap_or(0.0),
         sim_delta_seconds: sim_time.map(|t| t.delta_seconds).unwrap_or(1.0),
@@ -1275,6 +1535,21 @@ pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnaps
     }
     for entity in existing {
         world.despawn(entity);
+    }
+
+    // 1b. Task-Entities (#438): eigene Entities ohne AgentIdentity — separat despawnen + respawnen.
+    let mut existing_tasks: Vec<Entity> = Vec::new();
+    {
+        let mut task_query = world.query::<(Entity, &sentinel_common::components::TaskState)>();
+        for (entity, _) in task_query.iter(world) {
+            existing_tasks.push(entity);
+        }
+    }
+    for entity in existing_tasks {
+        world.despawn(entity);
+    }
+    for task in &snapshot.task_states {
+        world.spawn(task.clone());
     }
 
     // 2. Agents aus Snapshot respawnen (mit allen Components)
@@ -1427,6 +1702,245 @@ pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnaps
         {
             world.insert_resource(stimuli);
         }
+    }
+}
+
+#[cfg(test)]
+mod room_physics_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn create_world_registers_room_physics_workspace() {
+        let (world, _) = create_simulation_world();
+        assert!(world.get_resource::<RoomPhysicsWorkspace>().is_some());
+    }
+
+    #[test]
+    fn room_physics_workspace_reuses_room_storage_after_clear() {
+        let mut workspace = RoomPhysicsWorkspace::default();
+        assert!(workspace.room_capacity() >= ROOM_PHYSICS_WORKSPACE_CAPACITY);
+
+        for index in 0..40 {
+            workspace.ensure_room(&format!("room-{index:02}"));
+        }
+        let expanded_capacity = workspace.room_capacity();
+        assert!(expanded_capacity >= 40);
+
+        workspace.clear();
+        assert_eq!(workspace.len(), 0);
+        assert_eq!(workspace.room_capacity(), expanded_capacity);
+
+        workspace.ensure_room("empfang");
+        assert_eq!(workspace.room_capacity(), expanded_capacity);
+    }
+
+    #[test]
+    fn room_physics_workspace_merges_occupants_by_room() {
+        let mut workspace = RoomPhysicsWorkspace::default();
+
+        workspace.add_occupant("empfang", false);
+        workspace.add_occupant("empfang", true);
+
+        assert_eq!(workspace.len(), 1);
+        assert_eq!(workspace.room_stats(0), ("empfang", 2, true));
+    }
+}
+
+#[cfg(test)]
+mod config_apply_helper_tests {
+    use super::*;
+
+    fn make_task(
+        task_id: u32,
+        assigned_to: u16,
+        status: sentinel_common::TaskStatus,
+    ) -> sentinel_common::components::TaskState {
+        sentinel_common::components::TaskState {
+            task_id: sentinel_common::TaskId(task_id),
+            title: format!("Task {task_id}"),
+            description: "desc".to_string(),
+            assigned_to: AgentId(assigned_to),
+            assigned_by: Some(AgentId(1)),
+            parent_task: Some(sentinel_common::TaskId(1)),
+            status,
+            created_tick: 5,
+            updated_tick: 5,
+            result: None,
+        }
+    }
+
+    #[test]
+    fn task_survives_snapshot_restore() {
+        // #438 AC-5: Task-Entities sind Time-Machine-faehig (Snapshot + Restore).
+        use sentinel_common::{TaskId, TaskStatus};
+        let (mut world, _) = create_simulation_world();
+        world.spawn(make_task(42, 3, TaskStatus::InProgress));
+
+        let snapshot = snapshot_ecs_state(&mut world);
+        assert_eq!(snapshot.task_states.len(), 1, "task in snapshot");
+
+        let (mut restored, _) = create_simulation_world();
+        restore_ecs_state(&mut restored, &snapshot);
+        let mut query = restored.query::<&sentinel_common::components::TaskState>();
+        let tasks: Vec<_> = query.iter(&restored).collect();
+        assert_eq!(tasks.len(), 1, "task restored");
+        assert_eq!(tasks[0].task_id, TaskId(42));
+        assert_eq!(tasks[0].status, TaskStatus::InProgress);
+        assert_eq!(tasks[0].parent_task, Some(TaskId(1)));
+        assert_eq!(tasks[0].assigned_to, AgentId(3));
+    }
+
+    #[test]
+    fn task_progress_advances_only_active_agents_pending_tasks() {
+        // #438 AC-3-Progress: ein diesen Tick aktiver Agent bringt seine Pending-Tasks auf InProgress.
+        use sentinel_common::TaskStatus;
+        let mut world = World::new();
+        world.insert_resource(SimulationTime {
+            tick: sentinel_common::Tick(10),
+            tick_count: 10,
+            delta_seconds: 1.0,
+            sim_hour: 8.0,
+        });
+        world.insert_resource(EventBuffer::default());
+        world.insert_resource(ActiveAgentsThisTick(vec![AgentId(5)]));
+        let active = world.spawn(make_task(1, 5, TaskStatus::Pending)).id();
+        let idle = world.spawn(make_task(2, 9, TaskStatus::Pending)).id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(crate::systems::task_progress_system);
+        schedule.run(&mut world);
+
+        let active_task = world
+            .get::<sentinel_common::components::TaskState>(active)
+            .unwrap();
+        assert_eq!(
+            active_task.status,
+            TaskStatus::InProgress,
+            "active agent's pending task advanced"
+        );
+        let idle_task = world
+            .get::<sentinel_common::components::TaskState>(idle)
+            .unwrap();
+        assert_eq!(
+            idle_task.status,
+            TaskStatus::Pending,
+            "idle agent's task untouched"
+        );
+        // Status-Change-Event emittiert.
+        let buffer = world.get_resource::<EventBuffer>().unwrap();
+        assert!(buffer
+            .events
+            .iter()
+            .any(|e| e.event_type == "task_status_changed"));
+    }
+
+    #[test]
+    fn apply_identity_updates_only_name_and_role_keeps_other_components() {
+        let (mut world, _) = create_simulation_world();
+        let entity = spawn_agent(
+            &mut world,
+            AgentId(1),
+            "Alt Name",
+            "Alte Rolle",
+            1,
+            "empfang",
+        );
+
+        let pcfg = sentinel_common::agent_config::PersonalityConfig {
+            openness: 0.42,
+            conscientiousness: 0.5,
+            extraversion: 0.5,
+            agreeableness: 0.5,
+            neuroticism: 0.5,
+            caffeine_tolerance: 0.5,
+            morning_person: true,
+        };
+        apply_personality(&mut world, entity, &pcfg);
+
+        let idcfg = sentinel_common::agent_config::IdentityConfig {
+            id: 1,
+            name: "Neuer Name".to_string(),
+            role: "Neue Rolle".to_string(),
+            department: "Dev".to_string(),
+            shift_set: 1,
+            kpis: vec![],
+            reports_to: None,
+            direct_reports: vec![],
+        };
+        apply_identity(&mut world, entity, &idcfg);
+
+        let id = world.get::<AgentIdentity>(entity).unwrap();
+        assert_eq!(id.name, "Neuer Name");
+        assert_eq!(id.role, "Neue Rolle");
+        // Live-Update beruehrt NUR Identity — Personality bleibt unveraendert (#425 AC-1).
+        let p = world.get::<Personality>(entity).unwrap();
+        assert_eq!(p.openness, 0.42);
+    }
+}
+
+#[cfg(test)]
+mod persist_workspace_tests {
+    use super::*;
+
+    fn push_default_topic(workspace: &mut PersistWorkspace, event: DomainEvent) {
+        workspace.push_with_topic(event, |topic, event| {
+            topic.push_str("sentinel/events/");
+            topic.push_str(&event.event_type);
+            topic.push('/');
+            topic.push_str(&event.aggregate_id);
+        });
+    }
+
+    #[test]
+    fn create_world_registers_persist_workspace() {
+        let (world, _) = create_simulation_world();
+        assert!(world.get_resource::<PersistWorkspace>().is_some());
+    }
+
+    #[test]
+    fn persist_workspace_reuses_topic_storage_after_clear() {
+        let mut workspace = PersistWorkspace::default();
+        assert!(workspace.event_capacity() >= PERSIST_WORKSPACE_CAPACITY);
+
+        let event = DomainEvent::new("agent_action_received", "AGENT-01", "{}", "corr-1", 1);
+        push_default_topic(&mut workspace, event);
+        let topic_capacity = workspace.topic_capacity(0).unwrap();
+
+        workspace.clear();
+        let event = DomainEvent::new("agent_action_received", "AGENT-02", "{}", "corr-2", 2);
+        push_default_topic(&mut workspace, event);
+
+        assert_eq!(workspace.len(), 1);
+        assert_eq!(workspace.topic_capacity(0), Some(topic_capacity));
+    }
+
+    #[test]
+    fn persist_workspace_preserves_entry_order() {
+        let mut workspace = PersistWorkspace::default();
+        let first = DomainEvent::new("agent_action_received", "AGENT-01", "{}", "corr-1", 1);
+        let second = DomainEvent::new("transit_started", "AGENT-02", "{}", "corr-2", 2);
+
+        push_default_topic(&mut workspace, first);
+        push_default_topic(&mut workspace, second);
+
+        let entries: Vec<_> = workspace
+            .entries()
+            .map(|(event, topic)| (event.event_type.as_str(), topic))
+            .collect();
+
+        assert_eq!(
+            entries,
+            vec![
+                (
+                    "agent_action_received",
+                    "sentinel/events/agent_action_received/AGENT-01"
+                ),
+                (
+                    "transit_started",
+                    "sentinel/events/transit_started/AGENT-02"
+                )
+            ]
+        );
     }
 }
 

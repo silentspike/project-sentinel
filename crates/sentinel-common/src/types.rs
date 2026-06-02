@@ -7,8 +7,8 @@ use std::fmt;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
-    #[error("AgentId {0} out of range (1-60)")]
-    InvalidAgentId(u16),
+    #[error("AgentId {id} out of range (1-{max})")]
+    InvalidAgentId { id: u16, max: u16 },
     #[error("RoomId {0} out of range")]
     InvalidRoomId(u16),
     #[error("Value {value} out of range [{min}, {max}] for {field}")]
@@ -24,16 +24,45 @@ pub enum ValidationError {
 // Newtypes
 // ──────────────────────────────────────────────
 
+/// Default upper AgentId bound for the shipped 60-agent PixelPerfekt config.
+pub const DEFAULT_MAX_AGENT_ID: u16 = 60;
+
+/// Validation bounds for AgentId-bearing config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentIdBounds {
+    pub max: u16,
+}
+
+impl AgentIdBounds {
+    pub const fn new(max: u16) -> Self {
+        Self { max }
+    }
+
+    pub fn validate(self, id: u16) -> Result<AgentId, ValidationError> {
+        if (1..=self.max).contains(&id) {
+            Ok(AgentId(id))
+        } else {
+            Err(ValidationError::InvalidAgentId { id, max: self.max })
+        }
+    }
+}
+
+impl Default for AgentIdBounds {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_AGENT_ID)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AgentId(pub u16);
 
 impl AgentId {
     pub fn new(id: u16) -> Result<Self, ValidationError> {
-        if (1..=60).contains(&id) {
-            Ok(Self(id))
-        } else {
-            Err(ValidationError::InvalidAgentId(id))
-        }
+        Self::new_with_bounds(id, AgentIdBounds::default())
+    }
+
+    pub fn new_with_bounds(id: u16, bounds: AgentIdBounds) -> Result<Self, ValidationError> {
+        bounds.validate(id)
     }
 }
 
@@ -45,6 +74,38 @@ impl fmt::Display for AgentId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RoomId(pub u16);
+
+/// Identitaet eines Tasks/Auftrags (#438). Eigener Schluesselraum (u32, NICHT AgentId).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TaskId(pub u32);
+
+impl fmt::Display for TaskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TASK-{}", self.0)
+    }
+}
+
+/// Lebenszyklus-Status eines Tasks (#438).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Done,
+    Blocked,
+}
+
+impl TaskStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+        }
+    }
+}
 
 impl RoomId {
     pub fn new(id: u16) -> Result<Self, ValidationError> {
@@ -217,6 +278,50 @@ pub enum OperatorCommand {
     Chat(OperatorChatCommand),
     Gaia(OperatorGaiaCommand),
     Broadcast(OperatorBroadcastCommand),
+    Task(OperatorTaskCommand),
+    Dm(OperatorDmCommand),
+}
+
+/// 1:1-Direktnachricht an einen Agent (#437): gerichtete Perception mit sichtbarem Absender
+/// (kein getarnter Eigen-Gedanke wie Voice-of-Gaia).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorDmCommand {
+    pub target_agent_id: u16,
+    pub message: String,
+    pub sender_name: String,
+}
+
+/// Aktion eines Task-Kommandos (#438).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorTaskAction {
+    Create,
+    Assign,
+    UpdateStatus,
+    Complete,
+}
+
+/// Task-/Auftrags-Kommando (#438): Gaia/Operator erstellt, delegiert, aktualisiert oder schliesst
+/// Tasks. Zustellung an den Agent erfolgt via Voice-of-Gaia; Felder je nach `action` relevant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorTaskCommand {
+    pub action: OperatorTaskAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_to: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_by: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
 }
 
 /// Besucher-Chat: Operator redet mit Agents im selben Raum (asynchron via RoomChatBuffer).
@@ -503,6 +608,9 @@ pub struct EcsSnapshot {
     pub shift_infos: Vec<(u16, crate::components::ShiftInfo)>,
     pub relationships: Vec<(u16, crate::components::Relationships)>,
     pub llm_configs: Vec<(u16, crate::components::LlmConfig)>,
+    /// Task-/Auftrags-Entities (#438) — eigener Schluessel (task_id in TaskState), kein Agent-u16.
+    #[serde(default)]
+    pub task_states: Vec<crate::components::TaskState>,
     pub sim_tick: u64,
     pub sim_hour: f32,
     pub sim_delta_seconds: f32,
@@ -544,4 +652,24 @@ pub struct OperatorRestoreCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorSnapshotCommand {
     pub tier: Option<SnapshotTier>,
+}
+
+/// Apply-Modus fuer Runtime-Config-Apply (#425).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApplyMode {
+    /// Inkrementelles Diff-Apply gegen die laufende Welt (Editieren bestehender Firma).
+    Live,
+    /// Volle Welt-Initialisierung aus neuer Config (brandneue Firma).
+    Fresh,
+}
+
+/// Operator-Trigger fuer Runtime-Config-Apply (#425).
+/// Self-contained Inline-JSON: traegt die ganze ECS-Firma (agents + building).
+/// `company-context` ist NICHT enthalten (laeuft via Gateway-Hot-Reload #440).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorConfigApplyCommand {
+    pub mode: ApplyMode,
+    pub agents: Vec<crate::agent_config::AgentConfig>,
+    pub building: crate::room::BuildingConfig,
 }

@@ -20,6 +20,7 @@ wasmtime-wasi = { version = "44.0.2", optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+sentinel-common = { path = "../sentinel-common", features = ["test-util"] }
 tempfile = "3"
 
 [[bench]]

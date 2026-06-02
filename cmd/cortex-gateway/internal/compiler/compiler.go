@@ -137,6 +137,15 @@ func truncateUTF8(s string, maxBytes int) string {
 
 // CompileFromSources creates a prompt using the 3-source assembly pipeline.
 // Falls back to the basic Compile() if assembler is not configured.
+// ReloadCompanyContext re-reads company-context.md and swaps it atomically (#440). No LLM call.
+// Returns the new byte size (0 if no assembler configured or the file is absent).
+func (c *Compiler) ReloadCompanyContext() int {
+	if c.assembler == nil {
+		return 0
+	}
+	return c.assembler.ReloadCompanyContext()
+}
+
 func (c *Compiler) CompileFromSources(agentID int, providerName string, evolution EvolutionData, perception string) (string, error) {
 	if c.assembler == nil {
 		return "", fmt.Errorf("assembler not configured, use NewWithAssembler")

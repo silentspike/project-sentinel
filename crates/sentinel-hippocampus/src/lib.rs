@@ -14,6 +14,7 @@ pub mod episode;
 pub mod facts;
 pub mod golf;
 pub mod narrative;
+pub mod selection;
 pub mod service;
 pub mod sleep;
 pub mod store;
@@ -23,6 +24,11 @@ pub use episode::{nmda_score, Episode};
 pub use facts::{FactRetriever, FactStore, InMemoryFactStore, FACT_TRIGGERS};
 pub use golf::{default_goals_for_role, Goal, GoalStatus, GoalType};
 pub use narrative::NarrativeMemory;
+pub use selection::{
+    selection_decision, should_consolidate, NmdaSelectionDecision, NmdaSelectionProfile,
+    CALIBRATED_NMDA_SELECTION_PROFILE, NMDA_CONSOLIDATION_THRESHOLD,
+    NMDA_MAX_CONSOLIDATION_EPISODES, NMDA_NARRATIVE_INCLUSION_THRESHOLD, NMDA_SELECTION_RATIONALE,
+};
 pub use service::{ConsolidationResult, HippocampusService};
 pub use sleep::{SleepCycle, SleepPhase};
 pub use store::{HippocampusStore, NarrativeState, RedbFactStore};

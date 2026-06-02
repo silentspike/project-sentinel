@@ -2,18 +2,18 @@
 #
 # scripts/record-demo-gif.sh — capture docs/images/sentinel-demo.gif
 #
-# Drives a headless Chrome at the running dashboard, takes 30 screenshots
-# over ~30 seconds (one per second, cycling through dashboard tabs), and
+# Drives a headless Chrome at the running console, takes 30 screenshots
+# over ~30 seconds (one per second, cycling through console states), and
 # assembles them into a GIF with ffmpeg's two-pass palette encode.
 #
-# The dashboard at http://localhost:18000 must already be up. Start it via
+# The console at https://localhost:18001 must already be up. Start it via
 #   ./scripts/demo.sh
 # in another terminal first.
 #
 # Output: docs/images/sentinel-demo.gif (~1-2 MB)
 #
 # Knobs:
-#   DASHBOARD_URL   override base URL (default http://localhost:18000)
+#   DASHBOARD_URL   override base URL (default https://localhost:18001)
 #   FRAMES          override frame count (default 30)
 #   CHROME          chrome binary (default: google-chrome)
 
@@ -22,7 +22,7 @@ set -uo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-dashboard_url="${DASHBOARD_URL:-http://localhost:18000}"
+dashboard_url="${DASHBOARD_URL:-https://localhost:18001}"
 frames="${FRAMES:-30}"
 chrome="${CHROME:-google-chrome}"
 work=$(mktemp -d -t sentinel-gif-XXXXXX)
@@ -34,8 +34,8 @@ trap cleanup EXIT
 
 mkdir -p "$out_dir"
 
-if ! curl -fsS --max-time 5 "$dashboard_url/health" >/dev/null; then
-    echo "Dashboard not reachable at $dashboard_url — start ./scripts/demo.sh first" >&2
+if ! curl -kfsS --max-time 5 "$dashboard_url/api/health" >/dev/null; then
+    echo "Console not reachable at $dashboard_url — start ./scripts/demo.sh first" >&2
     exit 2
 fi
 
@@ -43,17 +43,14 @@ echo "[gif] capturing $frames frames from $dashboard_url"
 
 routes=(
     "$dashboard_url/"
-    "$dashboard_url/#/floorplan"
-    "$dashboard_url/#/agents"
-    "$dashboard_url/#/chat"
-    "$dashboard_url/#/metrics"
+    "$dashboard_url/"
 )
 
 for i in $(seq 1 "$frames"); do
     url="${routes[$(( (i-1) % ${#routes[@]} ))]}"
     frame=$(printf '%s/frame-%03d.png' "$work" "$i")
 
-    "$chrome" --headless --disable-gpu --hide-scrollbars --no-sandbox \
+    "$chrome" --headless --disable-gpu --hide-scrollbars --no-sandbox --ignore-certificate-errors \
         --window-size=1280,800 --virtual-time-budget=1500 \
         --screenshot="$frame" "$url" >/dev/null 2>&1 || true
 

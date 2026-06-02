@@ -2,7 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use sentinel_common::agent_config::AgentConfigValidation;
 use serde::Deserialize;
 
 use crate::adaptive_tick::AdaptiveConfig;
@@ -66,6 +67,14 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub fs_mount: Option<String>,
 
+    /// redb-Durability fuer sentinel-fs Metadata-Commits.
+    ///
+    /// `immediate` fsyncs every commit. `eventual` skips fsync for the FUSE
+    /// hot path and is only appropriate when lower write latency is preferred
+    /// over crash durability for the most recent metadata commits.
+    #[serde(default)]
+    pub fs_metadata_durability: FsMetadataDurability,
+
     /// Time Machine: Tiered Snapshot + Event Retention.
     #[serde(default)]
     pub retention: RetentionConfig,
@@ -81,6 +90,14 @@ pub struct DaemonConfig {
     /// Traffic Control Defaults fuer den Gateway-Start.
     #[serde(default)]
     pub traffic_control: TrafficControlConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FsMetadataDurability {
+    #[default]
+    Immediate,
+    Eventual,
 }
 
 /// Traffic-Control Defaults fuer den Gateway Bootstrap.
@@ -611,6 +628,20 @@ impl DaemonConfig {
             .with_context(|| format!("Config parsen: {}", path.display()))?;
         Ok(file.daemon)
     }
+
+    /// Liefert die Agent-TOML Validierung passend zu `max_agents`.
+    pub fn agent_config_validation(&self) -> Result<AgentConfigValidation> {
+        let max_agent_id = u16::try_from(self.max_agents).map_err(|_| {
+            anyhow!(
+                "daemon.max_agents {} exceeds AgentId u16 range",
+                self.max_agents
+            )
+        })?;
+        if max_agent_id == 0 {
+            return Err(anyhow!("daemon.max_agents must be >= 1"));
+        }
+        Ok(AgentConfigValidation::with_max_agent_id(max_agent_id))
+    }
 }
 
 #[cfg(test)]
@@ -636,6 +667,10 @@ shared_secret = "secret"
         assert_eq!(file.daemon.tick_rate_ms, 500);
         assert_eq!(file.daemon.max_agents, 10);
         assert_eq!(file.daemon.zenoh_prefix, "test");
+        assert_eq!(
+            file.daemon.fs_metadata_durability,
+            FsMetadataDurability::Immediate
+        );
         assert!(file.daemon.operator_api.enabled);
         assert_eq!(file.daemon.operator_api.bind_addr, "127.0.0.1:9999");
         assert_eq!(
@@ -657,8 +692,20 @@ data_dir = "/tmp/data"
         assert!(file.daemon.operator_api.shared_secret.is_none());
         assert_eq!(file.daemon.tick_rate_ms, 1000);
         assert_eq!(file.daemon.max_agents, 30);
+        assert_eq!(
+            file.daemon
+                .agent_config_validation()
+                .unwrap()
+                .agent_id_bounds
+                .max,
+            30
+        );
         assert_eq!(file.daemon.zenoh_prefix, "sentinel");
         assert_eq!(file.daemon.time_scale, 1.0);
+        assert_eq!(
+            file.daemon.fs_metadata_durability,
+            FsMetadataDurability::Immediate
+        );
         assert_eq!(file.daemon.agent_command, vec!["/usr/bin/agent-runtime"]);
         assert!(!file.daemon.traffic_control.synthesis_enabled);
         assert!(!file.daemon.traffic_control.sequencing_enabled);
@@ -718,6 +765,33 @@ data_dir = "/tmp/data"
                 .platform_controlplane
                 .llm_max_failed_interventions,
             3
+        );
+    }
+
+    #[test]
+    fn agent_config_validation_rejects_unrepresentable_max_agents() {
+        let toml_str = r#"
+[daemon]
+config_dir = "/tmp/cfg"
+data_dir = "/tmp/data"
+max_agents = 70000
+"#;
+        let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
+        assert!(file.daemon.agent_config_validation().is_err());
+    }
+
+    #[test]
+    fn test_parse_fs_metadata_eventual_durability() {
+        let toml_str = r#"
+[daemon]
+config_dir = "/tmp/cfg"
+data_dir = "/tmp/data"
+fs_metadata_durability = "eventual"
+"#;
+        let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            file.daemon.fs_metadata_durability,
+            FsMetadataDurability::Eventual
         );
     }
 

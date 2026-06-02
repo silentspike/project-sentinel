@@ -138,6 +138,7 @@
         <a href="#ontology" class="nav-link text-dim no-underline font-mono font-bold text-[0.6rem] uppercase tracking-widest px-2.5 py-2 rounded border border-transparent whitespace-nowrap hover:text-neon-green hover:bg-neon-green/5 hover:border-neon-green/15 transition-all">02 Ontologie</a>
         <a href="#infra" class="nav-link text-dim no-underline font-mono font-bold text-[0.6rem] uppercase tracking-widest px-2.5 py-2 rounded border border-transparent whitespace-nowrap hover:text-neon-green hover:bg-neon-green/5 hover:border-neon-green/15 transition-all">03 Infrastruktur</a>
         <a href="#cortex" class="nav-link text-dim no-underline font-mono font-bold text-[0.6rem] uppercase tracking-widest px-2.5 py-2 rounded border border-transparent whitespace-nowrap hover:text-neon-green hover:bg-neon-green/5 hover:border-neon-green/15 transition-all">04 Cortex</a>
+        <a href="#gaia" class="nav-link text-dim no-underline font-mono font-bold text-[0.6rem] uppercase tracking-widest px-2.5 py-2 rounded border border-transparent whitespace-nowrap hover:text-neon-green hover:bg-neon-green/5 hover:border-neon-green/15 transition-all">04b Gaia</a>
         <a href="#stack" class="nav-link text-dim no-underline font-mono font-bold text-[0.6rem] uppercase tracking-widest px-2.5 py-2 rounded border border-transparent whitespace-nowrap hover:text-neon-green hover:bg-neon-green/5 hover:border-neon-green/15 transition-all">05 Stack</a>
         <a href="#telemetry" class="nav-link text-dim no-underline font-mono font-bold text-[0.6rem] uppercase tracking-widest px-2.5 py-2 rounded border border-transparent whitespace-nowrap hover:text-neon-green hover:bg-neon-green/5 hover:border-neon-green/15 transition-all">05b Telemetrie</a>
         <a href="#perf" class="nav-link text-dim no-underline font-mono font-bold text-[0.6rem] uppercase tracking-widest px-2.5 py-2 rounded border border-transparent whitespace-nowrap hover:text-neon-green hover:bg-neon-green/5 hover:border-neon-green/15 transition-all">06 Performance</a>
@@ -1205,6 +1206,35 @@ PRAGMA page_size = 8192;              -- Optimiert f&uuml;r NVMe-Sektoren
 
         <p class="text-sm mb-4">Der Cortex Gateway wird in <strong class="text-bright">Go</strong> implementiert (optimiert f&uuml;r I/O-bound Workloads
         mit tausenden gleichzeitigen Connections via Goroutinen).</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- 04b GAIA CONSOLE                                                    -->
+    <!-- ================================================================== -->
+    <section id="gaia" class="mb-28 scroll-mt-20 reveal">
+        <span class="font-mono font-bold text-[0.7rem] text-neon-blue uppercase tracking-[2px] mb-3 block flex items-center gap-2">
+            <i data-lucide="message-square" class="w-4 h-4"></i> Cluster 04b // Gaia Console
+        </span>
+        <h2 class="font-sans font-extrabold text-bright text-[clamp(1.8rem,3vw,2.5rem)] leading-tight mb-10 flex items-center gap-5 section-line">Gaia &mdash; Das User-Interface</h2>
+
+        <p class="text-sm leading-relaxed mb-4"><strong class="text-bright">Gaia</strong> ist die durchg&auml;ngige, <strong class="text-neon-green">reaktive</strong> User-Schnittstelle zu Sentinel &mdash; eine vollwertige <strong class="text-bright">Claude-Code-Instanz</strong>, die <em>&uuml;ber</em> der bereits autonomen Firma sitzt. Sie handelt nie von sich aus (die Firma reguliert/heilt/lernt sich selbst, siehe Cortex &amp; Control-Planes); sie ist Setup-Interface, konversationeller Orchestrator (nur auf User-Auftrag) und Observability-/Steuer-Konsole &mdash; auch f&uuml;r den Plattform-Layer (Nano-Container). <span class="inline-block px-1.5 py-0.5 font-mono font-extrabold text-[0.5rem] uppercase rounded bg-neon-purple/15 text-neon-purple border border-neon-purple/30">SOTA</span></p>
+
+        <p class="text-dim text-[0.72rem] italic mb-6">Drei &quot;Gaia&quot; nie verwechseln: <strong class="text-bright">Gaia</strong> (das Claude-Code-Interface) &mdash; <strong class="text-bright">sentinel-gaia</strong> (deterministisches Generator-Tool, blake3, das Gaia aufruft) &mdash; <strong class="text-neon-purple">Voice of Gaia</strong> (Laufzeit-Gedankeninfusion an Agents via <code class="text-[0.8em]">inner-voice</code>-Block).</p>
+
+        <table class="w-full border-collapse text-[0.82rem] mb-6">
+            <thead><tr><th class="text-left p-3 border-b border-border text-neon-blue font-mono text-[0.7rem] uppercase tracking-wider">Schicht</th><th class="text-left p-3 border-b border-border text-neon-blue font-mono text-[0.7rem] uppercase tracking-wider">Entscheidung</th><th class="text-left p-3 border-b border-border text-neon-blue font-mono text-[0.7rem] uppercase tracking-wider">Warum (Polyglot: Overhead/IO/Perf)</th></tr></thead>
+            <tbody>
+            <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Werkzeug-Zugriff</strong></td><td class="p-3 border-b border-border/60"><code class="text-neon-green text-[0.8em]">sentinel-ctl</code> CLI via Bash <span class="inline-block px-1 py-0.5 font-mono font-extrabold text-[0.45rem] uppercase rounded bg-neon-blue/12 text-neon-blue border border-neon-blue/25">DEV-008</span></td><td class="p-3 border-b border-border/60">Gaia l&auml;uft <code>claude -p</code> lokal &mdash; ein MCP-Server (Prozess + HTTP/SSE) w&auml;re reiner Overhead</td></tr>
+            <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Frontend</strong></td><td class="p-3 border-b border-border/60">SolidJS (DOM) + Rust&rarr;WASM (Daten) + WebGL (Render) <span class="inline-block px-1 py-0.5 font-mono font-extrabold text-[0.45rem] uppercase rounded bg-neon-blue/12 text-neon-blue border border-neon-blue/25">DEV-009</span></td><td class="p-3 border-b border-border/60">best tool per layer; all-Rust-UI zahlt WASM&harr;JS-Bridge pro DOM-Update</td></tr>
+            <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Daten</strong></td><td class="p-3 border-b border-border/60">CAS-Konsolen-Datenebene auf <code>sentinel-fs</code> + WebTransport-Push</td><td class="p-3 border-b border-border/60">1:n-Pointer-Dedup statt 1s-Poll-Voll-State; nur Deltas + fehlende Bl&ouml;cke</td></tr>
+            <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Memory</strong></td><td class="p-3 border-b border-border/60">Event-Rehydration + Rust-Graph (relational-temporal, <em>ohne Vektor</em>)</td><td class="p-3 border-b border-border/60">kein Embedding-Overhead; semantische Verdichtung via Nightrun (Hippocampus, vorhanden)</td></tr>
+            <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-neon-green">Self-* Andocken</strong></td><td class="p-3 border-b border-border/60">empf&auml;ngt <code>escalate_to_operator</code>, ersetzt nichts</td><td class="p-3 border-b border-border/60">Control-Planes / Evolution / Adaptive-Tick bleiben unangetastet (Leitplanken)</td></tr>
+            </tbody>
+        </table>
+
+        <p class="text-sm leading-relaxed mb-4">Bedienung: dynamisch-kachelbares Workspace-Layout (niri/Hyprland-Stil, smooth) mit drei S&auml;ulen &mdash; <strong class="text-bright">Dashboard</strong> (Infografiken, Highlight), <strong class="text-bright">Control-Center</strong> (Agents/R&auml;ume/Voice-of-Gaia), <strong class="text-bright">Chat</strong> (1:1-Agent-DM, Room-Chat, Invite). Desktop + nativ-artiges Mobile. Auftrags-Delegation via <strong class="text-bright">Task-Entity</strong> (ECS + Events, hierarchisch). Time-Travel: voller Restore + Gaia-gesteuerte selektive Extraktion. Roadmap: Backend &rarr; Shell &rarr; Gaia &rarr; Features.</p>
+
+        <p class="text-dim text-[0.72rem] italic mt-3">SSOT: <code class="font-mono text-neon-blue text-[0.8em]">docs/gaia-console-architecture.md</code> (~38 Architektur-Weichen) &middot; ADRs <strong class="text-bright">DEV-008</strong> / <strong class="text-bright">DEV-009</strong> in <code class="font-mono text-[0.8em]">docs/togaf-deviations-v22.md</code> &middot; Epic #436.</p>
     </section>
 
     <!-- ================================================================== -->

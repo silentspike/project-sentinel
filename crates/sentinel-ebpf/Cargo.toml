@@ -38,6 +38,11 @@ name = "elf-debug"
 path = "src/bin/elf-debug.rs"
 required-features = ["ebpf"]
 
+[[bin]]
+name = "ebpf-mode-smoke"
+path = "src/bin/ebpf-mode-smoke.rs"
+required-features = ["ebpf"]
+
 [dev-dependencies]
 approx = { workspace = true }
 tracing-subscriber = { workspace = true }

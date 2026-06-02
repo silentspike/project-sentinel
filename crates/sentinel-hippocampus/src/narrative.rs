@@ -1,6 +1,7 @@
 //! NarrativeMemory - Running summary of important daily events per agent.
 
 use crate::episode::{nmda_score, Episode};
+use crate::selection::NMDA_NARRATIVE_INCLUSION_THRESHOLD;
 
 /// Maintains a running summary of the most important daily events for an agent.
 ///
@@ -12,7 +13,7 @@ pub struct NarrativeMemory {
     summary: String,
     /// All episodes of the day that passed the threshold
     episodes: Vec<Episode>,
-    /// Minimum NMDA score for inclusion (default: 0.3)
+    /// Minimum NMDA score for inclusion (calibrated NMDA profile)
     inclusion_threshold: f64,
 }
 
@@ -22,7 +23,7 @@ impl NarrativeMemory {
             agent_name: agent_name.to_string(),
             summary: String::new(),
             episodes: Vec::new(),
-            inclusion_threshold: 0.3,
+            inclusion_threshold: NMDA_NARRATIVE_INCLUSION_THRESHOLD,
         }
     }
 

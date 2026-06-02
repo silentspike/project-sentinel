@@ -18,15 +18,16 @@ use super::components::*;
 use super::world::{
     ActionReceiver, ActiveChaos, ActiveChaosEvent, ActiveRoomStimuli, EventBuffer, LimboEventStore,
     OperatorCommandReceiver, PersistTelemetry, PsiMetrics, RedbStateStore, RoomDistanceMap,
-    RoomPhysicsState, ToolRuntimeResource, ZenohFanoutSender,
+    RoomPhysicsState, RoomPhysicsWorkspace, ToolRuntimeResource, ZenohFanoutSender,
 };
-use super::world::{PerceptionSender, SimulationTime};
+use super::world::{PerceptionSender, PersistWorkspace, SimulationTime};
 use bevy_ecs::prelude::*;
 use sentinel_common::{
     ActionType, AgentId, DomainEvent, DomainEventPayload, Emotion, EventType, OperatorCommand,
     Perception, RoomStimulusType, Timestamp,
 };
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::time::Instant;
 use tracing::{debug, warn};
 
@@ -364,9 +365,21 @@ pub fn operator_command_system(
     // PUSH-Perception: Sofort Perception fuer Chat-Empfaenger senden
     perception_sender: Option<Res<PerceptionSender>>,
     room_distances: Option<Res<RoomDistanceMap>>,
+    // #438 Task-Entity: spawn neue Tasks (Commands) / mutiere bestehende (Query).
+    mut commands: Commands,
+    mut task_query: Query<(Entity, &mut sentinel_common::components::TaskState)>,
 ) {
     let Some(receiver) = receiver else { return };
     let Ok(rx) = receiver.0.lock() else { return };
+
+    // #438: naechste freie Task-Id, einmal aus den committeten Tasks geseedet; handle_task_command
+    // zaehlt lokal hoch, damit mehrere Creates im selben Tick eindeutige Ids bekommen.
+    let mut next_task_id = task_query
+        .iter()
+        .map(|(_, t)| t.task_id.0)
+        .max()
+        .unwrap_or(0)
+        + 1;
 
     while let Ok(command) = rx.try_recv() {
         match command {
@@ -568,11 +581,234 @@ pub fn operator_command_system(
                 tracing::info!(broadcast_type = %cmd.broadcast_type,
                     "Broadcast: Durchsage gesendet + Event emittiert");
             }
+            OperatorCommand::Dm(cmd) => {
+                // #437: gerichtete 1:1-Nachricht — als Perception mit sichtbarem Absender zugestellt
+                // (reuse GaiaBuffer-Lieferweg), KEIN Despawn. Audit via OperatorDmSent.
+                let agent_id = sentinel_common::AgentId(cmd.target_agent_id);
+                let tick = time.tick.0;
+                gaia_buffer.add(
+                    agent_id,
+                    format!("Direktnachricht von {}: {}", cmd.sender_name, cmd.message),
+                    tick,
+                );
+                let payload = DomainEventPayload::OperatorDmSent {
+                    target_agent_id: cmd.target_agent_id,
+                    sender_name: cmd.sender_name.clone(),
+                    message: cmd.message.clone(),
+                };
+                let event = DomainEvent::new(
+                    payload.event_type_str(),
+                    &format!("AGENT-{:02}", cmd.target_agent_id),
+                    &payload.to_json(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    tick,
+                );
+                event_buffer.events.push(event);
+                tracing::info!(agent_id = cmd.target_agent_id, "DM zugestellt (#437)");
+            }
+            OperatorCommand::Task(cmd) => {
+                handle_task_command(
+                    &cmd,
+                    time.tick.0,
+                    &mut next_task_id,
+                    &mut commands,
+                    &mut task_query,
+                    &mut gaia_buffer,
+                    &mut event_buffer,
+                );
+            }
             OperatorCommand::Nightrun(_)
             | OperatorCommand::Snapshot(_)
             | OperatorCommand::Restore(_) => {
                 // Orchestrator-Commands: werden im Tick-Loop gehandelt, nicht im ECS.
             }
+        }
+    }
+}
+
+/// Verarbeitet ein Task-/Auftrags-Kommando (#438): spawnt/mutiert die `TaskState`-Entity, emittiert
+/// das passende DomainEvent und stellt neue Auftraege via Voice-of-Gaia an den Agent zu (kein
+/// Despawn, kein Reset — unbeteiligte Agents bleiben unberuehrt).
+fn handle_task_command(
+    cmd: &sentinel_common::OperatorTaskCommand,
+    tick: u64,
+    next_task_id: &mut u32,
+    commands: &mut Commands,
+    task_query: &mut Query<(Entity, &mut sentinel_common::components::TaskState)>,
+    gaia_buffer: &mut super::world::GaiaBuffer,
+    event_buffer: &mut EventBuffer,
+) {
+    use sentinel_common::components::TaskState;
+    use sentinel_common::{
+        AgentId, DomainEvent, DomainEventPayload, OperatorTaskAction, TaskId, TaskStatus,
+    };
+
+    let emit = |event_buffer: &mut EventBuffer, payload: DomainEventPayload, task_id: u32| {
+        let event = DomainEvent::new(
+            payload.event_type_str(),
+            &format!("TASK-{task_id}"),
+            &payload.to_json(),
+            &uuid::Uuid::new_v4().to_string(),
+            tick,
+        );
+        event_buffer.events.push(event);
+    };
+
+    match cmd.action {
+        OperatorTaskAction::Create => {
+            // Monotoner Zaehler (vor der Drain-Schleife aus der Query geseedet): immun gegen
+            // deferred commands.spawn() — sonst kollidieren mehrere Creates im selben Tick auf id=1.
+            let task_id = cmd.task_id.unwrap_or_else(|| {
+                let id = *next_task_id;
+                *next_task_id += 1;
+                id
+            });
+            let assigned_to = AgentId(cmd.assigned_to.unwrap_or(1));
+            let assigned_by = cmd.assigned_by.map(AgentId);
+            let parent_task = cmd.parent_task.map(TaskId);
+            let title = cmd.title.clone().unwrap_or_default();
+            commands.spawn(TaskState {
+                task_id: TaskId(task_id),
+                title: title.clone(),
+                description: cmd.description.clone().unwrap_or_default(),
+                assigned_to,
+                assigned_by,
+                parent_task,
+                status: TaskStatus::Pending,
+                created_tick: tick,
+                updated_tick: tick,
+                result: None,
+            });
+            // Zustellung via Voice-of-Gaia (#438 AC-3): Agent erhaelt den Auftrag als inner-voice.
+            gaia_buffer.add(
+                assigned_to,
+                format!("Neuer Auftrag (TASK-{task_id}): {title}"),
+                tick,
+            );
+            emit(
+                event_buffer,
+                DomainEventPayload::TaskCreated {
+                    task_id: TaskId(task_id),
+                    title,
+                    assigned_to,
+                    parent_task,
+                },
+                task_id,
+            );
+        }
+        OperatorTaskAction::Assign => {
+            let (Some(tid), Some(new_to)) = (cmd.task_id, cmd.assigned_to) else {
+                tracing::warn!("Task Assign ohne task_id/assigned_to ignoriert");
+                return;
+            };
+            let assigned_by = cmd.assigned_by.map(AgentId);
+            for (_, mut task) in task_query.iter_mut() {
+                if task.task_id.0 == tid {
+                    task.assigned_to = AgentId(new_to);
+                    task.assigned_by = assigned_by;
+                    task.updated_tick = tick;
+                    gaia_buffer.add(
+                        AgentId(new_to),
+                        format!("Dir wurde TASK-{tid} zugewiesen: {}", task.title),
+                        tick,
+                    );
+                    emit(
+                        event_buffer,
+                        DomainEventPayload::TaskAssigned {
+                            task_id: TaskId(tid),
+                            assigned_to: AgentId(new_to),
+                            assigned_by,
+                        },
+                        tid,
+                    );
+                    break;
+                }
+            }
+        }
+        OperatorTaskAction::UpdateStatus => {
+            let Some(tid) = cmd.task_id else {
+                tracing::warn!("Task UpdateStatus ohne task_id ignoriert");
+                return;
+            };
+            let Some(new_status) = cmd.status else {
+                tracing::warn!("Task UpdateStatus ohne status ignoriert");
+                return;
+            };
+            for (_, mut task) in task_query.iter_mut() {
+                if task.task_id.0 == tid {
+                    let old = task.status.as_str().to_string();
+                    task.status = new_status;
+                    task.updated_tick = tick;
+                    emit(
+                        event_buffer,
+                        DomainEventPayload::TaskStatusChanged {
+                            task_id: TaskId(tid),
+                            old_status: old,
+                            new_status: new_status.as_str().to_string(),
+                        },
+                        tid,
+                    );
+                    break;
+                }
+            }
+        }
+        OperatorTaskAction::Complete => {
+            let Some(tid) = cmd.task_id else {
+                tracing::warn!("Task Complete ohne task_id ignoriert");
+                return;
+            };
+            for (_, mut task) in task_query.iter_mut() {
+                if task.task_id.0 == tid {
+                    task.status = TaskStatus::Done;
+                    task.result = cmd.result.clone();
+                    task.updated_tick = tick;
+                    emit(
+                        event_buffer,
+                        DomainEventPayload::TaskCompleted {
+                            task_id: TaskId(tid),
+                            result: cmd.result.clone(),
+                        },
+                        tid,
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// #438: Leitet Task-Fortschritt aus Agent-Aktionen ab. Ein Agent, der diesen Tick aktiv war
+/// (`ActiveAgentsThisTick`), bringt seine `Pending`-Tasks auf `InProgress` (+ `TaskStatusChanged`-
+/// Event). Explizite Completion laeuft ueber `OperatorTaskCommand::Complete`. Beruehrt KEINE
+/// Agent-Components (nur Task-Entities) — emergente Agent-Autonomie bleibt unangetastet (§6 L5).
+pub fn task_progress_system(
+    active_agents: Res<super::world::ActiveAgentsThisTick>,
+    mut task_query: Query<&mut sentinel_common::components::TaskState>,
+    time: Res<SimulationTime>,
+    mut event_buffer: ResMut<EventBuffer>,
+) {
+    if active_agents.0.is_empty() {
+        return;
+    }
+    for mut task in task_query.iter_mut() {
+        if task.status == sentinel_common::TaskStatus::Pending
+            && active_agents.0.contains(&task.assigned_to)
+        {
+            task.status = sentinel_common::TaskStatus::InProgress;
+            task.updated_tick = time.tick.0;
+            let payload = DomainEventPayload::TaskStatusChanged {
+                task_id: task.task_id,
+                old_status: sentinel_common::TaskStatus::Pending.as_str().to_string(),
+                new_status: sentinel_common::TaskStatus::InProgress.as_str().to_string(),
+            };
+            let event = DomainEvent::new(
+                payload.event_type_str(),
+                &format!("TASK-{}", task.task_id.0),
+                &payload.to_json(),
+                &uuid::Uuid::new_v4().to_string(),
+                time.tick.0,
+            );
+            event_buffer.events.push(event);
         }
     }
 }
@@ -693,20 +929,20 @@ pub fn physics_system(
     active_chaos: Option<Res<ActiveChaos>>,
     mut active_room_stimuli: ResMut<ActiveRoomStimuli>,
     mut room_physics_state: ResMut<RoomPhysicsState>,
+    mut workspace: ResMut<RoomPhysicsWorkspace>,
     mut event_buffer: ResMut<EventBuffer>,
 ) {
     let tick = time.tick.0;
     active_room_stimuli.cleanup(tick);
 
     // Agenten pro Raum zaehlen und Meeting-Status ermitteln
-    let mut room_agents: std::collections::HashMap<String, (usize, bool)> =
-        std::collections::HashMap::new();
+    workspace.clear();
 
     // Initialisiere alle bekannten Raeume, damit leere Transit-Raeume keine
     // veralteten Physics-Werte im Read Model behalten.
     if let Some(distances) = room_distances.as_ref() {
         for room_id in distances.all_rooms() {
-            room_agents.entry(room_id.clone()).or_insert((0, false));
+            workspace.ensure_room(room_id);
         }
     }
 
@@ -714,28 +950,26 @@ pub fn physics_system(
     // auch wenn aktuell niemand darin sitzt.
     if let Some(chaos) = active_chaos.as_ref() {
         for room_id in chaos.active_rooms(tick) {
-            room_agents.entry(room_id.to_string()).or_insert((0, false));
+            workspace.ensure_room(room_id);
         }
     }
     for room_id in active_room_stimuli.active_rooms(tick) {
-        room_agents.entry(room_id.to_string()).or_insert((0, false));
+        workspace.ensure_room(room_id);
     }
 
     for (pos, work) in &query {
         if !pos.in_transit {
-            let entry = room_agents.entry(pos.room_id.clone()).or_insert((0, false));
-            entry.0 += 1;
-            if let Some(w) = work {
-                if w.in_meeting {
-                    entry.1 = true;
-                }
-            }
+            workspace.add_occupant(
+                &pos.room_id,
+                work.map(|work_context| work_context.in_meeting)
+                    .unwrap_or(false),
+            );
         }
     }
 
     // Seed-Laerm ohne Nachbarraum-Einfluesse vorberechnen.
-    let mut seed_noise: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
-    for (room_id, (agent_count, has_meeting)) in &room_agents {
+    for room_index in 0..workspace.len() {
+        let (room_id, agent_count, has_meeting) = workspace.room_stats(room_index);
         let chaos_bonus = active_chaos
             .as_ref()
             .and_then(|chaos| chaos.get_active(room_id, tick))
@@ -743,50 +977,49 @@ pub fn physics_system(
             .unwrap_or(0.0);
         let stimulus_noise = active_room_stimuli.delta_for(room_id, RoomStimulusType::Noise, tick);
         let local_noise =
-            sentinel_physics::calculate_noise_level(*agent_count, *has_meeting, false, &[])
+            sentinel_physics::calculate_noise_level(agent_count, has_meeting, false, &[])
                 + chaos_bonus
                 + stimulus_noise;
-        seed_noise.insert(room_id.as_str(), local_noise);
+        workspace.set_seed_noise(room_index, local_noise);
     }
 
     // Physik pro Raum berechnen
-    for (room_id, (agent_count, has_meeting)) in &room_agents {
-        let adjacent_noise = room_distances
-            .as_ref()
-            .map(|distances| {
-                distances
-                    .rooms_within(room_id, 1)
-                    .into_iter()
-                    .filter_map(|(adjacent_room, _)| seed_noise.get(adjacent_room).copied())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+    for room_index in 0..workspace.len() {
+        let (_, agent_count, has_meeting) = workspace.room_stats(room_index);
 
-        let active_chaos_event = active_chaos
-            .as_ref()
-            .and_then(|chaos| chaos.get_active(room_id, tick));
-        let active_stimulus_delta_temperature =
-            active_room_stimuli.delta_for(room_id, RoomStimulusType::Temperature, tick);
-        let active_stimulus_delta_noise =
-            active_room_stimuli.delta_for(room_id, RoomStimulusType::Noise, tick);
-        let active_stimulus_delta_co2 =
-            active_room_stimuli.delta_for(room_id, RoomStimulusType::Co2, tick);
+        let active_chaos_event = {
+            let (room_id, _, _) = workspace.room_stats(room_index);
+            active_chaos
+                .as_ref()
+                .and_then(|chaos| chaos.get_active(room_id, tick))
+        };
+        let active_stimulus_delta_temperature = {
+            let (room_id, _, _) = workspace.room_stats(room_index);
+            active_room_stimuli.delta_for(room_id, RoomStimulusType::Temperature, tick)
+        };
+        let active_stimulus_delta_noise = {
+            let (room_id, _, _) = workspace.room_stats(room_index);
+            active_room_stimuli.delta_for(room_id, RoomStimulusType::Noise, tick)
+        };
+        let active_stimulus_delta_co2 = {
+            let (room_id, _, _) = workspace.room_stats(room_index);
+            active_room_stimuli.delta_for(room_id, RoomStimulusType::Co2, tick)
+        };
         let chaos_elapsed_hours = active_chaos_event
             .map(|event| chaos_elapsed_hours(event, &time))
             .unwrap_or(0.0);
 
-        let noise_db = sentinel_physics::calculate_noise_level(
-            *agent_count,
-            *has_meeting,
-            false,
-            &adjacent_noise,
-        ) + active_chaos_event
+        let noise_db = {
+            let adjacent_noise =
+                workspace.collect_adjacent_noise_for(room_index, room_distances.as_deref());
+            sentinel_physics::calculate_noise_level(agent_count, has_meeting, false, adjacent_noise)
+        } + active_chaos_event
             .map(|event| sentinel_physics::chaos_noise_bonus_db(event.event_type))
             .unwrap_or(0.0)
             + active_stimulus_delta_noise;
 
         let temperature =
-            sentinel_physics::calculate_temperature(21.0, *agent_count, false, 15.0, 0.3)
+            sentinel_physics::calculate_temperature(21.0, agent_count, false, 15.0, 0.3)
                 + active_chaos_event
                     .map(|event| {
                         sentinel_physics::chaos_temperature_delta_celsius(
@@ -796,17 +1029,18 @@ pub fn physics_system(
                     })
                     .unwrap_or(0.0)
                 + active_stimulus_delta_temperature;
-        let co2 = sentinel_physics::calculate_co2(400.0, *agent_count, 0.5, 1.0)
+        let co2 = sentinel_physics::calculate_co2(400.0, agent_count, 0.5, 1.0)
             + active_stimulus_delta_co2;
         let has_active_stimulus = active_stimulus_delta_temperature.abs() > f32::EPSILON
             || active_stimulus_delta_noise.abs() > f32::EPSILON
             || active_stimulus_delta_co2.abs() > f32::EPSILON;
         let has_active_chaos = active_chaos_event.is_some();
+        let (room_id, _, _) = workspace.room_stats(room_index);
 
         room_physics_state.set(
             room_id,
             tick,
-            *agent_count as u32,
+            agent_count as u32,
             temperature,
             co2,
             noise_db,
@@ -824,7 +1058,7 @@ pub fn physics_system(
                 temperature,
                 co2_ppm: co2,
                 noise_db,
-                occupant_count: *agent_count as u32,
+                occupant_count: agent_count as u32,
             };
             let event = DomainEvent::new(
                 payload.event_type_str(),
@@ -1365,57 +1599,68 @@ pub fn perception_system(
 ) {
     for (bio, position, mood, mut perception) in &mut query {
         // Koerper-Wahrnehmung
-        let mut body_parts: Vec<&str> = Vec::new();
+        perception.body_text.clear();
 
         if bio.hunger > 70.0 {
-            body_parts.push("Du hast grossen Hunger.");
+            append_perception_part(&mut perception.body_text, "Du hast grossen Hunger.");
         } else if bio.hunger > 40.0 {
-            body_parts.push("Du spuerst leichten Hunger.");
+            append_perception_part(&mut perception.body_text, "Du spuerst leichten Hunger.");
         }
 
         if bio.energy < 30.0 {
-            body_parts.push("Du bist sehr muede.");
+            append_perception_part(&mut perception.body_text, "Du bist sehr muede.");
         } else if bio.energy < 50.0 {
-            body_parts.push("Du fuehlst dich etwas schlapp.");
+            append_perception_part(&mut perception.body_text, "Du fuehlst dich etwas schlapp.");
         } else if bio.energy > 85.0 {
-            body_parts.push("Du fuehlst dich voller Energie.");
+            append_perception_part(&mut perception.body_text, "Du fuehlst dich voller Energie.");
         }
 
         if bio.caffeine_mg > 80.0 {
-            body_parts.push("Der Kaffee wirkt, du bist wach und konzentriert.");
+            append_perception_part(
+                &mut perception.body_text,
+                "Der Kaffee wirkt, du bist wach und konzentriert.",
+            );
         } else if bio.caffeine_mg > 30.0 {
-            body_parts.push("Du spuerst noch etwas Koffein.");
+            append_perception_part(&mut perception.body_text, "Du spuerst noch etwas Koffein.");
         }
 
         if bio.bladder > 70.0 {
-            body_parts.push("Du musst dringend auf die Toilette.");
+            append_perception_part(
+                &mut perception.body_text,
+                "Du musst dringend auf die Toilette.",
+            );
         } else if bio.bladder > 40.0 {
-            body_parts.push("Du bemerkst leichten Blasendrang.");
+            append_perception_part(
+                &mut perception.body_text,
+                "Du bemerkst leichten Blasendrang.",
+            );
         }
 
         if bio.stress > 70.0 {
-            body_parts.push("Du bist sehr gestresst.");
+            append_perception_part(&mut perception.body_text, "Du bist sehr gestresst.");
         } else if bio.stress > 40.0 {
-            body_parts.push("Du fuehlst leichten Stress.");
+            append_perception_part(&mut perception.body_text, "Du fuehlst leichten Stress.");
         }
 
-        perception.body_text = body_parts.join(" ");
-
         // Umgebungs-Wahrnehmung
-        let room_desc = room_id_to_german(&position.room_id);
-        perception.environment_text = if position.in_transit {
-            format!(
-                "Du bist auf dem Weg von {} nach {}.",
-                room_desc,
-                position
-                    .transit_target
-                    .as_deref()
-                    .map(room_id_to_german)
-                    .unwrap_or_else(|| "unbekannt".to_string())
-            )
+        perception.environment_text.clear();
+        if position.in_transit {
+            perception
+                .environment_text
+                .push_str("Du bist auf dem Weg von ");
+            append_room_id_to_german(&mut perception.environment_text, &position.room_id);
+            perception.environment_text.push_str(" nach ");
+            if let Some(target) = position.transit_target.as_deref() {
+                append_room_id_to_german(&mut perception.environment_text, target);
+            } else {
+                perception.environment_text.push_str("unbekannt");
+            }
+            perception.environment_text.push('.');
         } else {
-            format!("Du bist {}.", room_desc)
-        };
+            perception.environment_text.push_str("Du bist ");
+            append_room_id_to_german(&mut perception.environment_text, &position.room_id);
+            perception.environment_text.push('.');
+        }
 
         // Aktive Gerueche im aktuellen Raum in die Umgebungswahrnehmung injizieren
         if !position.in_transit {
@@ -1441,13 +1686,16 @@ pub fn perception_system(
         }
 
         // Stimmungs-basierte soziale Wahrnehmung
-        perception.social_text = if bio.social_need > 70.0 {
-            "Du hast das Beduerfnis, mit jemandem zu reden.".to_string()
+        perception.social_text.clear();
+        if bio.social_need > 70.0 {
+            perception
+                .social_text
+                .push_str("Du hast das Beduerfnis, mit jemandem zu reden.");
         } else if bio.social_need < 20.0 {
-            "Du moechtest gerade lieber allein sein.".to_string()
-        } else {
-            String::new()
-        };
+            perception
+                .social_text
+                .push_str("Du moechtest gerade lieber allein sein.");
+        }
 
         // Stimmungstext anhaengen wenn markant
         let mood_text = match mood.dominant_emotion {
@@ -1472,35 +1720,58 @@ pub fn perception_system(
 
 /// Mappt Raum-ID auf deutschen Beschreibungstext
 fn room_id_to_german(room_id: &str) -> String {
-    match room_id {
-        "empfang" => "im Empfangsbereich".to_string(),
-        "flur-eg" => "im Flur des Erdgeschosses".to_string(),
-        "flur-og" => "im Flur des Obergeschosses".to_string(),
-        "kueche" => "in der Kueche".to_string(),
-        "buero-dev-1" => "im Entwicklerbuero 1".to_string(),
-        "buero-dev-2" => "im Entwicklerbuero 2".to_string(),
-        "buero-design-1" => "im Designbuero 1".to_string(),
-        "buero-design-2" => "im Designbuero 2".to_string(),
-        "buero-ceo" => "im Buero der Geschaeftsfuehrung".to_string(),
-        "meetingraum-01" => "im Meetingraum 1 (EG)".to_string(),
-        "meetingraum-02" => "im Meetingraum 2 (OG)".to_string(),
-        "meetingraum-03" => "im Meetingraum 3 (OG)".to_string(),
-        "toilette-eg-damen" => "auf der Damentoilette (EG)".to_string(),
-        "toilette-eg-herren" => "auf der Herrentoilette (EG)".to_string(),
-        "toilette-og-damen" => "auf der Damentoilette (OG)".to_string(),
-        "toilette-og-herren" => "auf der Herrentoilette (OG)".to_string(),
-        "treppenhaus" => "im Treppenhaus".to_string(),
-        "buero-sales" => "im Vertriebsbuero".to_string(),
-        "buero-pm" => "im Projektmanagement-Buero".to_string(),
-        "buero-marketing" => "im Marketingbuero".to_string(),
-        "buero-admin" => "im Verwaltungsbuero".to_string(),
-        "buero-qa" => "im QA-Buero".to_string(),
-        "buero-it" => "im IT-Buero".to_string(),
-        "buero-betriebsrat" => "im Betriebsratsbuero".to_string(),
-        "buero-betriebspsych" => "in der Betriebspsychologie".to_string(),
-        "buero-betriebsarzt" => "in der Betriebsmedizin".to_string(),
-        other => format!("im Raum '{}'", other),
+    if let Some(room) = room_id_to_german_static(room_id) {
+        room.to_string()
+    } else {
+        format!("im Raum '{}'", room_id)
     }
+}
+
+fn room_id_to_german_static(room_id: &str) -> Option<&'static str> {
+    match room_id {
+        "empfang" => Some("im Empfangsbereich"),
+        "flur-eg" => Some("im Flur des Erdgeschosses"),
+        "flur-og" => Some("im Flur des Obergeschosses"),
+        "kueche" => Some("in der Kueche"),
+        "buero-dev-1" => Some("im Entwicklerbuero 1"),
+        "buero-dev-2" => Some("im Entwicklerbuero 2"),
+        "buero-design-1" => Some("im Designbuero 1"),
+        "buero-design-2" => Some("im Designbuero 2"),
+        "buero-ceo" => Some("im Buero der Geschaeftsfuehrung"),
+        "meetingraum-01" => Some("im Meetingraum 1 (EG)"),
+        "meetingraum-02" => Some("im Meetingraum 2 (OG)"),
+        "meetingraum-03" => Some("im Meetingraum 3 (OG)"),
+        "toilette-eg-damen" => Some("auf der Damentoilette (EG)"),
+        "toilette-eg-herren" => Some("auf der Herrentoilette (EG)"),
+        "toilette-og-damen" => Some("auf der Damentoilette (OG)"),
+        "toilette-og-herren" => Some("auf der Herrentoilette (OG)"),
+        "treppenhaus" => Some("im Treppenhaus"),
+        "buero-sales" => Some("im Vertriebsbuero"),
+        "buero-pm" => Some("im Projektmanagement-Buero"),
+        "buero-marketing" => Some("im Marketingbuero"),
+        "buero-admin" => Some("im Verwaltungsbuero"),
+        "buero-qa" => Some("im QA-Buero"),
+        "buero-it" => Some("im IT-Buero"),
+        "buero-betriebsrat" => Some("im Betriebsratsbuero"),
+        "buero-betriebspsych" => Some("in der Betriebspsychologie"),
+        "buero-betriebsarzt" => Some("in der Betriebsmedizin"),
+        _ => None,
+    }
+}
+
+fn append_room_id_to_german(output: &mut String, room_id: &str) {
+    if let Some(room) = room_id_to_german_static(room_id) {
+        output.push_str(room);
+    } else {
+        write!(output, "im Raum '{}'", room_id).expect("writing to String cannot fail");
+    }
+}
+
+fn append_perception_part(output: &mut String, text: &str) {
+    if !output.is_empty() {
+        output.push(' ');
+    }
+    output.push_str(text);
 }
 
 #[cfg(feature = "wasm")]
@@ -1997,6 +2268,7 @@ pub fn persist_system(
     store: Option<Res<RedbStateStore>>,
     event_store: Option<Res<LimboEventStore>>,
     mut event_buffer: ResMut<EventBuffer>,
+    mut persist_workspace: ResMut<PersistWorkspace>,
     mut telemetry: ResMut<PersistTelemetry>,
     fanout_sender: Option<Res<ZenohFanoutSender>>,
 ) {
@@ -2019,17 +2291,30 @@ pub fn persist_system(
 
     // 1. Events aus Buffer nach Limbo schreiben (mit Outbox) + Zenoh Fan-Out
     if let Some(es) = &event_store {
+        persist_workspace.clear();
         for event in event_buffer.events.drain(..) {
-            let topic = event_topic(&event);
-            if let Err(err) = es.0.append_with_outbox(&event, &topic) {
-                warn!(event_id = %event.event_id, "persist_system: failed to write event: {err}");
-            }
-            // Nach erfolgreichem Limbo-Write: Event an Zenoh Fan-Out Bridge senden
-            if let Some(ref fanout) = fanout_sender {
-                if fanout.sender.try_send(event).is_err() {
-                    // Channel voll — Event droppen (Limbo ist SSOT, Zenoh ist best-effort)
+            persist_workspace.push_with_topic(event, write_event_topic);
+        }
+
+        if !persist_workspace.is_empty() {
+            let event_count = persist_workspace.len();
+            let batch_result = es.0.append_with_outbox_batch(persist_workspace.entries());
+
+            if let Err(err) = batch_result {
+                warn!(
+                    event_count,
+                    "persist_system: failed to write event batch: {err}"
+                );
+            } else if let Some(ref fanout) = fanout_sender {
+                // Nach erfolgreichem Limbo-Write: Events an Zenoh Fan-Out Bridge senden
+                for event in persist_workspace.drain_events() {
+                    if fanout.sender.try_send(event).is_err() {
+                        // Channel voll — Event droppen (Limbo ist SSOT, Zenoh ist best-effort)
+                    }
                 }
             }
+
+            persist_workspace.clear();
         }
     } else {
         // Kein Event Store: Buffer leeren damit er nicht unendlich waechst
@@ -2080,12 +2365,12 @@ pub fn persist_system(
     }
 }
 
-/// Bestimmt das Zenoh-Topic fuer ein DomainEvent.
-fn event_topic(event: &DomainEvent) -> String {
-    format!(
-        "sentinel/events/{}/{}",
-        event.event_type, event.aggregate_id
-    )
+/// Schreibt das Zenoh-Topic fuer ein DomainEvent in einen wiederverwendeten Buffer.
+fn write_event_topic(output: &mut String, event: &DomainEvent) {
+    output.push_str("sentinel/events/");
+    output.push_str(&event.event_type);
+    output.push('/');
+    output.push_str(&event.aggregate_id);
 }
 
 fn encode_agent_snapshot(tick: u64, position: &Position, bio: &BioState, mood: &Mood) -> Vec<u8> {

@@ -18,21 +18,23 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use tracing::{debug, error, info, warn};
 
-use sentinel_common::agent_config::{load_all_agents, AgentConfig};
+use sentinel_common::agent_config::{load_all_agents_with_validation, AgentConfig};
 use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::events::{DomainEvent, DomainEventPayload};
-use sentinel_common::{AgentId, OperatorCommand, Perception};
+use sentinel_common::{AgentId, AgentIdBounds, OperatorCommand, Perception};
 use sentinel_ebpf::collector::MetricsSnapshot;
 use sentinel_ebpf::EbpfCollector;
 use sentinel_ecs::{
     apply_personality, create_simulation_world, despawn_agent_from_world, spawn_agent,
     ActionReceiver, LimboEventStore, PerceptionSender, SimulationTime,
 };
+use sentinel_hippocampus::{NMDA_CONSOLIDATION_THRESHOLD, NMDA_MAX_CONSOLIDATION_EPISODES};
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
 use sentinel_runtime::RuntimeOrchestrator;
 use sentinel_sandbox::{CgroupLimits, SandboxEnforcer, SandboxHandle, SandboxWarning};
 use sentinel_zenoh::SentinelBus;
+use sha2::{Digest, Sha256};
 
 use crate::adaptive_tick::AdaptiveTickRate;
 use crate::config::DaemonConfig;
@@ -40,6 +42,7 @@ use crate::controlplane::config::ControlplaneConfig;
 use crate::controlplane::store::ControlplaneStore;
 use crate::controlplane::ControlplaneKernel;
 use crate::episode_producer::EpisodeProducer;
+use crate::evolution_task::{EvolutionJob, EvolutionResult, EvolutionSource};
 use crate::operator_api;
 use crate::runtime_control::{
     RespawnBackoffTracker, RespawnRetryDecision, RuntimeAnalysisFloodTestResponse,
@@ -65,6 +68,117 @@ fn shift_hours(shift_set: u8) -> (u8, u8) {
 /// CPU: 1 core, Memory: 256MB, IO: 300 IOPS + 10MB/s.
 fn default_agent_limits() -> CgroupLimits {
     CgroupLimits::default()
+}
+
+fn parse_judge_alert_agent_id(agent_id: &str, bounds: AgentIdBounds) -> Result<AgentId> {
+    let agent_num = agent_id
+        .strip_prefix("AGENT-")
+        .ok_or_else(|| anyhow!("Judge alert agent id {agent_id} lacks AGENT- prefix"))?
+        .parse::<u16>()
+        .with_context(|| format!("Judge alert agent id {agent_id} has invalid number"))?;
+    AgentId::new_with_bounds(agent_num, bounds)
+        .with_context(|| format!("Judge alert agent id {agent_id} is outside configured bounds"))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NmdaScoreStats {
+    min: Option<f64>,
+    avg: Option<f64>,
+    max: Option<f64>,
+}
+
+#[derive(Debug)]
+struct NightrunHashChain {
+    current: [u8; 32],
+}
+
+impl NightrunHashChain {
+    fn new(seed: &str, run_id: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(run_id.as_bytes());
+        hasher.update(b":");
+        hasher.update(seed.as_bytes());
+        Self {
+            current: hasher.finalize().into(),
+        }
+    }
+
+    fn extend(&mut self, event: &DomainEvent) {
+        let mut hasher = Sha256::new();
+        hasher.update(self.current);
+        hasher.update(event.event_id.as_bytes());
+        hasher.update(event.payload.as_bytes());
+        hasher.update(event.tick.to_le_bytes());
+        self.current = hasher.finalize().into();
+    }
+
+    fn current_hash(&self) -> String {
+        hex_encode(&self.current)
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn nmda_selection_rate(episodes_processed: u32, episodes_consolidated: u32) -> f64 {
+    if episodes_processed == 0 {
+        0.0
+    } else {
+        episodes_consolidated as f64 / episodes_processed as f64
+    }
+}
+
+fn nmda_consolidated_scores(result: &sentinel_hippocampus::ConsolidationResult) -> Vec<f64> {
+    result
+        .consolidated_summaries
+        .iter()
+        .map(|(_summary, score)| *score)
+        .collect()
+}
+
+fn nmda_score_stats(scores: &[f64]) -> NmdaScoreStats {
+    let min = scores.iter().copied().reduce(f64::min);
+    let max = scores.iter().copied().reduce(f64::max);
+    let avg = if scores.is_empty() {
+        None
+    } else {
+        Some(scores.iter().sum::<f64>() / scores.len() as f64)
+    };
+
+    NmdaScoreStats { min, avg, max }
+}
+
+fn nightrun_run_id(prefix: &str, tick_count: u64, from_shift: u8, to_shift: u8) -> String {
+    format!("{prefix}-tick-{tick_count}-shift-{from_shift}-to-{to_shift}")
+}
+
+fn append_nightrun_event(
+    event_store: &EventStore,
+    payload: DomainEventPayload,
+    aggregate_id: &str,
+    run_id: &str,
+    tick_count: u64,
+    hash_chain: Option<&mut NightrunHashChain>,
+) -> Result<DomainEvent> {
+    let event = DomainEvent::new(
+        payload.event_type_str(),
+        aggregate_id,
+        &payload.to_json(),
+        run_id,
+        tick_count,
+    );
+    event_store.append_with_outbox(&event, "nightrun")?;
+    if let Some(chain) = hash_chain {
+        chain.extend(&event);
+    }
+    Ok(event)
 }
 
 fn record_security_runtime_snapshot(
@@ -435,8 +549,23 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
     let fs_layer = if config.fs_mount.is_some() {
         let cas = sentinel_fs::cas::CasStore::open(data_dir).context("sentinel-fs CAS oeffnen")?;
-        let meta = sentinel_fs::metadata::MetadataStore::open(data_dir.join("metadata.redb"))
-            .context("sentinel-fs Metadata oeffnen")?;
+        let metadata_durability = match config.fs_metadata_durability {
+            crate::config::FsMetadataDurability::Immediate => {
+                sentinel_fs::metadata::MetadataDurability::Immediate
+            }
+            crate::config::FsMetadataDurability::Eventual => {
+                sentinel_fs::metadata::MetadataDurability::Eventual
+            }
+        };
+        let meta = sentinel_fs::metadata::MetadataStore::open_with_durability(
+            data_dir.join("metadata.redb"),
+            metadata_durability,
+        )
+        .context("sentinel-fs Metadata oeffnen")?;
+        info!(
+            ?metadata_durability,
+            "sentinel-fs Metadata-Durability konfiguriert"
+        );
         let layer = Arc::new(sentinel_fs::layer::LayerManager::new(cas, meta));
         layer
             .init_base_root()
@@ -448,7 +577,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
     // -- Agent-Definitionen laden --
     let agents_dir = config.config_dir.join("agents");
-    let all_agents = load_all_agents(&agents_dir)
+    let agent_validation = config.agent_config_validation()?;
+    let all_agents = load_all_agents_with_validation(&agents_dir, agent_validation)
         .with_context(|| format!("Agents laden aus: {}", agents_dir.display()))?;
     info!(
         total_agents = all_agents.len(),
@@ -623,7 +753,15 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let (nightrun_tx, nightrun_rx) = mpsc::channel::<sentinel_common::OperatorNightrunCommand>();
     let (snapshot_tx, snapshot_rx) = mpsc::channel::<sentinel_common::OperatorSnapshotCommand>();
     let (restore_tx, restore_rx) = mpsc::channel::<sentinel_common::OperatorRestoreCommand>();
+    let (config_apply_tx, config_apply_rx) =
+        mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>();
     let (prune_tx, prune_rx) = mpsc::channel::<i64>();
+    let (evolution_result_tx, evolution_result_rx) = mpsc::channel::<EvolutionResult>();
+    let evolution_job_tx = crate::evolution_task::spawn_evolution_background_task(
+        crate::evolution_task::EvolutionTaskConfig::from_env(),
+        evolution_result_tx,
+    );
+    info!("Evolution Background-Task initialisiert");
     // Bounded Channel: 128 Slots. Bridge drainet per try_recv() vor jedem LLM-Call.
     // Output_system nutzt try_send() (non-blocking, WARN bei Drop).
     let (perception_tx, perception_rx) = mpsc::sync_channel::<Perception>(128);
@@ -730,6 +868,10 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         handle
     };
 
+    let nightrun_agent_counts = operator_api::NightrunAgentCounts::from_shift_sets(
+        all_agents.iter().map(|agent| agent.identity.shift_set),
+    );
+
     let operator_api_handle = if config.operator_api.enabled {
         Some(
             operator_api::start_server(
@@ -742,8 +884,12 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 platform_tx.clone(),
                 runtime_tx.clone(),
                 nightrun_tx.clone(),
+                nightrun_agent_counts,
                 snapshot_tx.clone(),
                 restore_tx.clone(),
+                config_apply_tx.clone(),
+                config.max_agents,
+                agent_validation,
                 Arc::clone(&event_store),
                 prune_tx.clone(),
                 Arc::clone(&state_store),
@@ -786,6 +932,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let ecs_security_runtime_state = Arc::clone(&security_runtime_state);
     let ecs_fs_mount = active_fs_mount.clone();
     let ecs_projection_db_path = projection_db_path.clone();
+    let ecs_config_dir = config.config_dir.clone();
+    let ecs_max_agents = config.max_agents;
     let ecs_handle = std::thread::Builder::new()
         .name("ecs-tick-loop".into())
         .spawn(move || {
@@ -809,8 +957,14 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 ebpf_tx,
                 episode_producer,
                 nightrun_rx,
+                Some(evolution_job_tx),
+                Some(evolution_result_rx),
                 snapshot_rx,
                 restore_rx,
+                config_apply_rx,
+                ecs_config_dir,
+                ecs_max_agents,
+                agent_validation,
                 prune_rx,
                 retention_config,
                 evolution_db_path_clone,
@@ -898,6 +1052,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
         // Alert-Receiver: DomainEvent persistieren + Prometheus Counter + Log
         let es = Arc::clone(&alert_event_store);
+        let alert_agent_id_bounds = agent_validation.agent_id_bounds;
         // Gateway URL for model-swap HTTP calls (ADR-001: swap via NATS alert → HTTP to Gateway)
         let gateway_url = std::env::var("CORTEX_GATEWAY_URL")
             .unwrap_or_else(|_| "http://localhost:8081".to_string());
@@ -914,13 +1069,18 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 counter.increment();
 
                 // DomainEvent in Limbo persistieren
-                // Parse "AGENT-XX" → u16 → AgentId
-                let agent_num: u16 = alert
-                    .agent_id
-                    .strip_prefix("AGENT-")
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0);
-                let agent_id = AgentId::new(agent_num).unwrap_or(AgentId(1));
+                // Parse "AGENT-XX" → u16 → AgentId with the same bounds as Agent-TOMLs.
+                let agent_id =
+                    parse_judge_alert_agent_id(&alert.agent_id, alert_agent_id_bounds).unwrap_or_else(
+                        |error| {
+                            warn!(
+                                error = %error,
+                                agent = %alert.agent_id,
+                                "Judge Alert AgentId konnte nicht validiert werden; fallback auf AGENT-01"
+                            );
+                            AgentId(1)
+                        },
+                    );
                 let payload = DomainEventPayload::JudgeAlertReceived {
                     agent_id,
                     alert_type: alert.alert_type.clone(),
@@ -1956,6 +2116,181 @@ fn apply_platform_analysis_command(
     Ok(())
 }
 
+fn queue_evolution_job(
+    tx: &Option<tokio::sync::mpsc::Sender<EvolutionJob>>,
+    job: EvolutionJob,
+) -> bool {
+    let Some(tx) = tx else {
+        warn!(
+            agent = %job.agent_name,
+            source = job.source.as_str(),
+            "Evolution Background-Task nicht verfuegbar, Job wird nicht eingereiht"
+        );
+        return false;
+    };
+
+    let source = job.source.as_str();
+    let agent_name = job.agent_name.clone();
+    match tx.try_send(job) {
+        Ok(()) => {
+            info!(
+                agent = %agent_name,
+                source = source,
+                "Evolution Background-Job eingereiht"
+            );
+            true
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
+            warn!(
+                agent = %job.agent_name,
+                source = job.source.as_str(),
+                "Evolution Background-Channel voll, Job wird nicht blockierend verworfen"
+            );
+            false
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(job)) => {
+            warn!(
+                agent = %job.agent_name,
+                source = job.source.as_str(),
+                "Evolution Background-Channel geschlossen, Job wird nicht eingereiht"
+            );
+            false
+        }
+    }
+}
+
+fn write_evolution_narrative_only(
+    store: &StateStore,
+    agent_id: AgentId,
+    agent_name: &str,
+    source: EvolutionSource,
+    narrative: &str,
+) {
+    match store.set_evolution_batch(agent_id, None, None, Some(narrative.as_bytes()), None) {
+        Ok(version) => {
+            info!(
+                agent = agent_name,
+                source = source.as_str(),
+                version,
+                "Evolution Narrative fallback nach redb geschrieben, EVOLUTION_VERSION = {version}"
+            );
+        }
+        Err(error) => {
+            warn!(
+                agent = agent_name,
+                source = source.as_str(),
+                error = %error,
+                "Evolution Narrative fallback redb-Write fehlgeschlagen"
+            );
+        }
+    }
+}
+
+fn drain_evolution_results(store: &StateStore, rx: &mpsc::Receiver<EvolutionResult>) {
+    while let Ok(result) = rx.try_recv() {
+        match crate::evolution_task::apply_evolution_result(store, &result) {
+            Ok(version) => {
+                info!(
+                    agent = %result.agent_name,
+                    source = result.source.as_str(),
+                    version,
+                    voice_style = result.voice_style.is_some(),
+                    behavioral_notes = result.behavioral_notes.is_some(),
+                    "Evolution nach redb geschrieben, EVOLUTION_VERSION = {version}"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    agent = %result.agent_name,
+                    source = result.source.as_str(),
+                    error = %error,
+                    "Evolution redb-Write fehlgeschlagen"
+                );
+            }
+        }
+    }
+}
+
+/// Vollstaendiger Teardown eines Agents (#425 Live-Despawn / Fresh-Load): Sandbox-Handle, bwrap-
+/// Prozess, eBPF-Registrierung, Security-Snapshot, RuntimeOrchestrator-Eintrag und ECS-Entity.
+/// Spiegelt den Reconcile-Cleanup-Pfad (`remove_agent_runtime_fragments`).
+#[allow(clippy::too_many_arguments)]
+fn teardown_agent_full(
+    agent_id: AgentId,
+    world: &mut bevy_ecs::prelude::World,
+    runtime_orch: &mut RuntimeOrchestrator,
+    sandbox: &SandboxEnforcer,
+    sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &mut EbpfCollector,
+    agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+) {
+    if let Some(handle) = sandbox_handles.remove(&agent_id) {
+        if handle.cgroup_created {
+            if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
+                ebpf_collector.unregister_agent(cid);
+            }
+        }
+        if let Err(e) = sandbox.teardown_agent(&handle) {
+            warn!(agent_id = %agent_id, error = %e, "Sandbox-Teardown bei Config-Apply fehlgeschlagen");
+        }
+    }
+    if let Some(proc_handle) = agent_processes.remove(&agent_id) {
+        let _ = signal_pid(proc_handle.pid, "TERM");
+        drop(proc_handle);
+    }
+    remove_security_runtime_snapshot(security_runtime_state, agent_id);
+    if runtime_orch.agents().contains_key(&agent_id) {
+        if let Err(e) = runtime_orch.despawn_agent(agent_id) {
+            warn!(agent_id = %agent_id, error = %e, "Runtime-Despawn bei Config-Apply fehlgeschlagen");
+        }
+    }
+    let _ = despawn_agent_from_world(world, agent_id);
+}
+
+/// Alle Agent-IDs der aktuellen ECS-Welt (fuer Fresh-Load Reset).
+fn world_agent_ids(world: &mut bevy_ecs::prelude::World) -> Vec<AgentId> {
+    let mut query = world.query::<&AgentIdentity>();
+    query
+        .iter(world)
+        .map(|identity| identity.agent_id)
+        .collect()
+}
+
+/// True, wenn der Agent gerade unter aktiver Control-Plane-Heilung steht (Runtime-Health „stale").
+/// TOGAF §6 L3: solche Agents NICHT despawnen — Despawn wird deferred.
+fn agent_under_active_healing(
+    runtime_health: &crate::runtime_health::SharedRuntimeHealthState,
+    agent_id: AgentId,
+) -> bool {
+    runtime_health
+        .read()
+        .map(|snapshot| {
+            snapshot.agents.iter().any(|a| {
+                a.agent_id == agent_id.0 && a.last_repair_status.as_deref() == Some("stale")
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Aktualisiert Name/Rolle eines live-aktualisierten Agents in der Read-Projection (Dashboard).
+/// Live-Component-Updates emittieren kein Event → die Projection wird hier gezielt nachgezogen.
+fn update_agent_projection_identity(projection_db_path: &str, cfg: &AgentConfig) {
+    if projection_db_path.is_empty() {
+        return;
+    }
+    if let Ok(db) = sentinel_limbo::rusqlite::Connection::open(projection_db_path) {
+        let _ = db.execute(
+            "UPDATE agent_live_view SET name = ?2, role = ?3 WHERE agent_id = ?1",
+            sentinel_limbo::rusqlite::params![
+                cfg.identity.id as i64,
+                cfg.identity.name,
+                cfg.identity.role
+            ],
+        );
+    }
+}
+
 /// ECS Tick-Loop auf dediziertem Thread.
 ///
 /// Verwaltet den RuntimeOrchestrator (Lifecycle-Events, Shift-Wechsel, Snapshots)
@@ -1970,7 +2305,7 @@ fn ecs_tick_loop(
     platform_rx: mpsc::Receiver<crate::platform_controlplane::PlatformControlCommand>,
     runtime_rx: mpsc::Receiver<RuntimeControlCommand>,
     perception_tx: mpsc::SyncSender<Perception>,
-    all_agents: Vec<AgentConfig>,
+    mut all_agents: Vec<AgentConfig>,
     initial_shift: u8,
     tick_rate: Duration,
     time_scale: f32,
@@ -1982,8 +2317,14 @@ fn ecs_tick_loop(
     ebpf_tx: tokio::sync::mpsc::Sender<MetricsSnapshot>,
     mut episode_producer: EpisodeProducer,
     nightrun_rx: mpsc::Receiver<sentinel_common::OperatorNightrunCommand>,
+    evolution_job_tx: Option<tokio::sync::mpsc::Sender<EvolutionJob>>,
+    evolution_result_rx: Option<mpsc::Receiver<EvolutionResult>>,
     snapshot_rx: mpsc::Receiver<sentinel_common::OperatorSnapshotCommand>,
     restore_rx: mpsc::Receiver<sentinel_common::OperatorRestoreCommand>,
+    config_apply_rx: mpsc::Receiver<sentinel_common::OperatorConfigApplyCommand>,
+    config_dir: std::path::PathBuf,
+    config_apply_max_agents: usize,
+    config_apply_validation: sentinel_common::agent_config::AgentConfigValidation,
     prune_rx: mpsc::Receiver<i64>,
     retention_config: crate::config::RetentionConfig,
     evolution_db_path: String,
@@ -2429,6 +2770,10 @@ fn ecs_tick_loop(
             break;
         }
 
+        if let Some(rx) = evolution_result_rx.as_ref() {
+            drain_evolution_results(&state_store_for_sim, rx);
+        }
+
         // PSI-basierte adaptive Tick-Rate aktualisieren (alle N Ticks)
         adaptive_tick.update(tick_count);
 
@@ -2772,10 +3117,13 @@ fn ecs_tick_loop(
                     crate::platform_controlplane::rules::PlatformSideEffect::TriggerPrune(
                         _cutoff,
                     ) => {
-                        // Auto-detect cutoff: nutze bestehenden SnapshotManager
+                        // Auto-detect cutoff: behalte die 2 neuesten World-Snapshots (Restore-Puffer),
+                        // prune alle Events davor. list_world_snapshots() liefert ORDER BY tick DESC,
+                        // also ist der zweitneueste Snapshot Index 1 (NICHT len-2 = zweitältester — #475:
+                        // der Index-Bug ergab einen uralten cutoff < min(event_id) → prune loeschte nie etwas).
                         if let Ok(snapshots) = event_store_for_prune.list_world_snapshots() {
                             if snapshots.len() >= 2 {
-                                let prune_point = snapshots[snapshots.len() - 2].last_event_id;
+                                let prune_point = snapshots[1].last_event_id;
                                 snapshot_manager.start_prune(prune_point);
                             }
                         }
@@ -2981,24 +3329,112 @@ fn ecs_tick_loop(
                 let redb_store = world
                     .get_resource::<sentinel_ecs::RedbStateStore>()
                     .map(|r| r.store.clone());
+                let nightrun_event_store = world
+                    .get_resource::<sentinel_ecs::LimboEventStore>()
+                    .map(|es| Arc::clone(&es.0));
+                let shift_run_id = nightrun_run_id("shift", tick_count, current_shift, new_shift);
+                let shift_started = Instant::now();
+                let mut shift_hash_chain = NightrunHashChain::new(&shift_run_id, &shift_run_id);
+                let mut shift_event_emission_enabled = false;
+                if let Some(ref event_store) = nightrun_event_store {
+                    let payload = DomainEventPayload::NightRunStarted {
+                        run_id: shift_run_id.clone(),
+                        trigger_shift_set: current_shift,
+                        agents_queued: removed.len() as u32,
+                    };
+                    match append_nightrun_event(
+                        event_store,
+                        payload,
+                        "nightrun",
+                        &shift_run_id,
+                        tick_count,
+                        Some(&mut shift_hash_chain),
+                    ) {
+                        Ok(_) => {
+                            shift_event_emission_enabled = true;
+                        }
+                        Err(e) => {
+                            warn!(
+                                run_id = %shift_run_id,
+                                error = %e,
+                                "Schichtwechsel-Nightrun-Start-Event fehlgeschlagen"
+                            );
+                        }
+                    }
+                }
+                let mut shift_episodes_processed = 0u32;
+                let mut shift_episodes_consolidated = 0u32;
+                let mut shift_agents_consolidated = 0u32;
+                let mut shift_agents_failed = 0u32;
+                let mut shift_nmda_scores: Vec<f64> = Vec::new();
                 for agent_id in &removed {
                     let agent_name = all_agents
                         .iter()
                         .find(|a| AgentId(a.identity.id) == *agent_id)
                         .map(|a| a.identity.name.as_str());
                     if let Some(name) = agent_name {
+                        let agent_started = Instant::now();
                         match episode_producer.hippocampus().consolidate_agent(name) {
                             Ok(result) => {
-                                if result.episodes_processed > 0 {
+                                let episodes_processed = result.episodes_processed as u32;
+                                let episodes_consolidated = result.episodes_consolidated as u32;
+                                if episodes_processed > 0 {
+                                    let nmda_scores = nmda_consolidated_scores(&result);
+                                    let agent_stats = nmda_score_stats(&result.episode_scores);
+                                    shift_episodes_processed += episodes_processed;
+                                    shift_episodes_consolidated += episodes_consolidated;
+                                    shift_agents_consolidated += 1;
+                                    shift_nmda_scores.extend(result.episode_scores.iter().copied());
+
                                     info!(
                                         agent = name,
-                                        episodes_processed = result.episodes_processed,
-                                        episodes_consolidated = result.episodes_consolidated,
-                                        "Schichtwechsel-Konsolidierung abgeschlossen"
+                                        episodes_processed,
+                                        episodes_consolidated,
+                                        selection_rate = format!(
+                                            "{:.3}",
+                                            nmda_selection_rate(
+                                                episodes_processed,
+                                                episodes_consolidated
+                                            )
+                                        ),
+                                        nmda_threshold = NMDA_CONSOLIDATION_THRESHOLD,
+                                        nmda_score_min = ?agent_stats.min,
+                                        nmda_score_avg = ?agent_stats.avg,
+                                        nmda_score_max = ?agent_stats.max,
+                                        "Schichtwechsel-NMDA-Agent-Selektion"
                                     );
 
-                                    // Evolution-Daten nach redb schreiben
-                                    if let Some(ref store) = redb_store {
+                                    if shift_event_emission_enabled {
+                                        if let Some(ref event_store) = nightrun_event_store {
+                                            let payload = DomainEventPayload::AgentConsolidated {
+                                                run_id: shift_run_id.clone(),
+                                                agent_name: name.to_string(),
+                                                episodes_processed,
+                                                episodes_consolidated,
+                                                duration_ms: agent_started.elapsed().as_millis()
+                                                    as u64,
+                                            };
+                                            let aggregate_id = format!("AGENT-{:02}", agent_id.0);
+                                            if let Err(e) = append_nightrun_event(
+                                                event_store,
+                                                payload,
+                                                &aggregate_id,
+                                                &shift_run_id,
+                                                tick_count,
+                                                Some(&mut shift_hash_chain),
+                                            ) {
+                                                shift_event_emission_enabled = false;
+                                                warn!(
+                                                    run_id = %shift_run_id,
+                                                    agent = name,
+                                                    error = %e,
+                                                    "Schichtwechsel-AgentConsolidated-Event fehlgeschlagen"
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    if episodes_consolidated > 0 {
                                         let narrative: String = result
                                             .consolidated_summaries
                                             .iter()
@@ -3006,88 +3442,79 @@ fn ecs_tick_loop(
                                             .collect::<Vec<_>>()
                                             .join("; ");
 
-                                        // LLM-basierte Voice-Style + Behavioral-Notes Generierung
                                         let agent_role = all_agents
                                             .iter()
                                             .find(|a| AgentId(a.identity.id) == *agent_id)
                                             .map(|a| a.identity.role.as_str())
                                             .unwrap_or("Mitarbeiter");
-                                        let (voice_style, behavioral_notes) =
-                                            generate_evolution_fields(name, agent_role, &narrative);
-
-                                        match store.set_evolution_batch(
-                                            *agent_id,
-                                            voice_style.as_deref(),
-                                            behavioral_notes.as_deref(),
-                                            Some(narrative.as_bytes()),
-                                            None, // agent_facts bridged separately
-                                        ) {
-                                            Ok(version) => {
-                                                info!(
-                                                    agent = name,
-                                                    version,
-                                                    voice_style = voice_style.is_some(),
-                                                    behavioral_notes = behavioral_notes.is_some(),
-                                                    "Evolution nach redb geschrieben, EVOLUTION_VERSION = {version}"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    agent = name,
-                                                    error = %e,
-                                                    "Evolution redb-Write fehlgeschlagen"
-                                                );
-                                            }
+                                        let queued = queue_evolution_job(
+                                            &evolution_job_tx,
+                                            EvolutionJob {
+                                                agent_id: *agent_id,
+                                                agent_name: name.to_string(),
+                                                agent_role: agent_role.to_string(),
+                                                narrative: narrative.clone(),
+                                                source: EvolutionSource::ShiftTransition,
+                                            },
+                                        );
+                                        if !queued {
+                                            write_evolution_narrative_only(
+                                                &state_store_for_sim,
+                                                *agent_id,
+                                                name,
+                                                EvolutionSource::ShiftTransition,
+                                                &narrative,
+                                            );
                                         }
 
-                                        // NMDA scores nach redb schreiben
-                                        let scores: Vec<f64> = result
-                                            .consolidated_summaries
-                                            .iter()
-                                            .map(|(_s, score)| *score)
-                                            .collect();
-                                        if !scores.is_empty() {
-                                            let avg_score: f64 =
-                                                scores.iter().sum::<f64>() / scores.len() as f64;
-                                            match store.set_nmda_scores(*agent_id, &scores) {
-                                                Ok(()) => {
-                                                    info!(
-                                                        agent = name,
-                                                        nmda_count = scores.len(),
-                                                        nmda_avg = format!("{avg_score:.4}"),
-                                                        "NMDA scores nach redb geschrieben"
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    warn!(
-                                                        agent = name,
-                                                        error = %e,
-                                                        "NMDA scores redb-Write fehlgeschlagen"
-                                                    );
+                                        if let Some(ref store) = redb_store {
+                                            // NMDA scores nach redb schreiben
+                                            if !nmda_scores.is_empty() {
+                                                let avg_score: f64 =
+                                                    nmda_scores.iter().sum::<f64>()
+                                                        / nmda_scores.len() as f64;
+                                                match store.set_nmda_scores(*agent_id, &nmda_scores)
+                                                {
+                                                    Ok(()) => {
+                                                        info!(
+                                                            agent = name,
+                                                            nmda_count = nmda_scores.len(),
+                                                            nmda_avg = format!("{avg_score:.4}"),
+                                                            "NMDA scores nach redb geschrieben"
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            agent = name,
+                                                            error = %e,
+                                                            "NMDA scores redb-Write fehlgeschlagen"
+                                                        );
+                                                    }
                                                 }
                                             }
-                                        }
 
-                                        // Facts aus Hippocampus FactRetriever nach state.redb bridgen
-                                        let facts =
-                                            episode_producer.hippocampus().retrieve_facts(name);
-                                        if !facts.is_empty() {
-                                            let facts_json =
-                                                serde_json::to_vec(&facts).unwrap_or_default();
-                                            match store.set_agent_facts(*agent_id, &facts_json) {
-                                                Ok(()) => {
-                                                    info!(
-                                                        agent = name,
-                                                        facts_count = facts.len(),
-                                                        "AGENT_FACTS nach state.redb geschrieben"
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    warn!(
-                                                        agent = name,
-                                                        error = %e,
-                                                        "AGENT_FACTS redb-Write fehlgeschlagen"
-                                                    );
+                                            // Facts aus Hippocampus FactRetriever nach state.redb bridgen
+                                            let facts =
+                                                episode_producer.hippocampus().retrieve_facts(name);
+                                            if !facts.is_empty() {
+                                                let facts_json =
+                                                    serde_json::to_vec(&facts).unwrap_or_default();
+                                                match store.set_agent_facts(*agent_id, &facts_json)
+                                                {
+                                                    Ok(()) => {
+                                                        info!(
+                                                            agent = name,
+                                                            facts_count = facts.len(),
+                                                            "AGENT_FACTS nach state.redb geschrieben"
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            agent = name,
+                                                            error = %e,
+                                                            "AGENT_FACTS redb-Write fehlgeschlagen"
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -3095,8 +3522,101 @@ fn ecs_tick_loop(
                                 }
                             }
                             Err(e) => {
+                                shift_agents_failed += 1;
+                                if shift_event_emission_enabled {
+                                    if let Some(ref event_store) = nightrun_event_store {
+                                        let payload =
+                                            DomainEventPayload::AgentConsolidationFailed {
+                                                run_id: shift_run_id.clone(),
+                                                agent_name: name.to_string(),
+                                                error: e.to_string(),
+                                            };
+                                        let aggregate_id = format!("AGENT-{:02}", agent_id.0);
+                                        if let Err(event_err) = append_nightrun_event(
+                                            event_store,
+                                            payload,
+                                            &aggregate_id,
+                                            &shift_run_id,
+                                            tick_count,
+                                            Some(&mut shift_hash_chain),
+                                        ) {
+                                            shift_event_emission_enabled = false;
+                                            warn!(
+                                                run_id = %shift_run_id,
+                                                agent = name,
+                                                error = %event_err,
+                                                "Schichtwechsel-AgentConsolidationFailed-Event fehlgeschlagen"
+                                            );
+                                        }
+                                    }
+                                }
                                 warn!(agent = name, error = %e, "Schichtwechsel-Konsolidierung fehlgeschlagen");
                             }
+                        }
+                    }
+                }
+                let shift_stats = nmda_score_stats(&shift_nmda_scores);
+                if shift_episodes_processed > 0 {
+                    info!(
+                        old_shift = current_shift,
+                        new_shift,
+                        agents_removed = removed.len(),
+                        episodes_processed = shift_episodes_processed,
+                        episodes_consolidated = shift_episodes_consolidated,
+                        selection_rate = format!(
+                            "{:.3}",
+                            nmda_selection_rate(
+                                shift_episodes_processed,
+                                shift_episodes_consolidated
+                            )
+                        ),
+                        nmda_threshold = NMDA_CONSOLIDATION_THRESHOLD,
+                        nmda_max_consolidation_episodes = NMDA_MAX_CONSOLIDATION_EPISODES,
+                        nmda_score_min = ?shift_stats.min,
+                        nmda_score_avg = ?shift_stats.avg,
+                        nmda_score_max = ?shift_stats.max,
+                        "Schichtwechsel-NMDA-Selektion abgeschlossen"
+                    );
+                }
+                if shift_event_emission_enabled {
+                    if let Some(ref event_store) = nightrun_event_store {
+                        let hash_chain_final = shift_hash_chain.current_hash();
+                        let payload = DomainEventPayload::NightRunCompleted {
+                            run_id: shift_run_id.clone(),
+                            trigger_shift_set: current_shift,
+                            agents_consolidated: shift_agents_consolidated,
+                            agents_failed: shift_agents_failed,
+                            agents_skipped: 0,
+                            total_episodes: shift_episodes_processed,
+                            total_episodes_consolidated: shift_episodes_consolidated,
+                            nmda_selection_rate: Some(nmda_selection_rate(
+                                shift_episodes_processed,
+                                shift_episodes_consolidated,
+                            )),
+                            nmda_threshold: Some(NMDA_CONSOLIDATION_THRESHOLD),
+                            nmda_max_consolidation_episodes: Some(
+                                NMDA_MAX_CONSOLIDATION_EPISODES as u32,
+                            ),
+                            nmda_score_min: shift_stats.min,
+                            nmda_score_avg: shift_stats.avg,
+                            nmda_score_max: shift_stats.max,
+                            duration_ms: shift_started.elapsed().as_millis() as u64,
+                            hash_chain: Some(hash_chain_final.clone()),
+                        };
+                        if let Err(e) = append_nightrun_event(
+                            event_store,
+                            payload,
+                            "nightrun",
+                            &shift_run_id,
+                            tick_count,
+                            None,
+                        ) {
+                            warn!(
+                                run_id = %shift_run_id,
+                                hash_chain = %hash_chain_final,
+                                error = %e,
+                                "Schichtwechsel-Nightrun-Completed-Event fehlgeschlagen"
+                            );
                         }
                     }
                 }
@@ -3241,7 +3761,50 @@ fn ecs_tick_loop(
                     nightrun_cmd.shift_set.is_none_or(|s| set == s)
                 })
                 .collect();
-            let mut consolidated_total = 0u32;
+            let trigger_shift_set = nightrun_cmd.shift_set.unwrap_or(current_shift);
+            let operator_run_id =
+                nightrun_run_id("operator", tick_count, current_shift, trigger_shift_set);
+            let operator_started = Instant::now();
+            let operator_event_store = world
+                .get_resource::<sentinel_ecs::LimboEventStore>()
+                .map(|es| Arc::clone(&es.0));
+            let mut operator_hash_chain =
+                NightrunHashChain::new(&operator_run_id, &operator_run_id);
+            let mut operator_event_emission_enabled = false;
+            if !nightrun_cmd.dry_run {
+                if let Some(ref event_store) = operator_event_store {
+                    let payload = DomainEventPayload::NightRunStarted {
+                        run_id: operator_run_id.clone(),
+                        trigger_shift_set,
+                        agents_queued: target_agents.len() as u32,
+                    };
+                    match append_nightrun_event(
+                        event_store,
+                        payload,
+                        "nightrun",
+                        &operator_run_id,
+                        tick_count,
+                        Some(&mut operator_hash_chain),
+                    ) {
+                        Ok(_) => {
+                            operator_event_emission_enabled = true;
+                        }
+                        Err(e) => {
+                            warn!(
+                                run_id = %operator_run_id,
+                                error = %e,
+                                "Operator-Nightrun-Start-Event fehlgeschlagen"
+                            );
+                        }
+                    }
+                }
+            }
+            let mut episodes_processed_total = 0u32;
+            let mut episodes_consolidated_total = 0u32;
+            let mut agents_consolidated_total = 0u32;
+            let mut agents_failed_total = 0u32;
+            let mut operator_nmda_scores: Vec<f64> = Vec::new();
+            let mut evolution_jobs_queued = 0u32;
             let mut evolution_entries: Vec<(String, u32)> = Vec::new();
             for agent_cfg in &target_agents {
                 let name = &agent_cfg.identity.name;
@@ -3249,19 +3812,121 @@ fn ecs_tick_loop(
                     info!(agent = %name, "Nightrun dry-run: wuerde konsolidieren");
                     continue;
                 }
+                let agent_started = Instant::now();
                 match episode_producer.hippocampus().consolidate_agent(name) {
                     Ok(result) if result.episodes_processed > 0 => {
-                        consolidated_total += result.episodes_processed as u32;
-                        evolution_entries
-                            .push((name.to_string(), result.episodes_processed as u32));
+                        let episodes_processed = result.episodes_processed as u32;
+                        let episodes_consolidated = result.episodes_consolidated as u32;
+                        let agent_stats = nmda_score_stats(&result.episode_scores);
+                        episodes_processed_total += episodes_processed;
+                        episodes_consolidated_total += episodes_consolidated;
+                        agents_consolidated_total += 1;
+                        operator_nmda_scores.extend(result.episode_scores.iter().copied());
+
                         info!(
                             agent = %name,
-                            episodes = result.episodes_processed,
-                            "Nightrun: Agent konsolidiert"
+                            episodes_processed,
+                            episodes_consolidated,
+                            selection_rate = format!(
+                                "{:.3}",
+                                nmda_selection_rate(episodes_processed, episodes_consolidated)
+                            ),
+                            nmda_threshold = NMDA_CONSOLIDATION_THRESHOLD,
+                            nmda_score_min = ?agent_stats.min,
+                            nmda_score_avg = ?agent_stats.avg,
+                            nmda_score_max = ?agent_stats.max,
+                            "Nightrun-NMDA-Agent-Selektion"
                         );
+
+                        if operator_event_emission_enabled {
+                            if let Some(ref event_store) = operator_event_store {
+                                let payload = DomainEventPayload::AgentConsolidated {
+                                    run_id: operator_run_id.clone(),
+                                    agent_name: name.to_string(),
+                                    episodes_processed,
+                                    episodes_consolidated,
+                                    duration_ms: agent_started.elapsed().as_millis() as u64,
+                                };
+                                let aggregate_id = format!("AGENT-{:02}", agent_cfg.identity.id);
+                                if let Err(e) = append_nightrun_event(
+                                    event_store,
+                                    payload,
+                                    &aggregate_id,
+                                    &operator_run_id,
+                                    tick_count,
+                                    Some(&mut operator_hash_chain),
+                                ) {
+                                    operator_event_emission_enabled = false;
+                                    warn!(
+                                        run_id = %operator_run_id,
+                                        agent = %name,
+                                        error = %e,
+                                        "Operator-AgentConsolidated-Event fehlgeschlagen"
+                                    );
+                                }
+                            }
+                        }
+
+                        if episodes_consolidated > 0 {
+                            evolution_entries.push((name.to_string(), episodes_consolidated));
+                            let narrative = result
+                                .consolidated_summaries
+                                .iter()
+                                .map(|(summary, _score)| summary.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            let queued = queue_evolution_job(
+                                &evolution_job_tx,
+                                EvolutionJob {
+                                    agent_id: AgentId(agent_cfg.identity.id),
+                                    agent_name: name.to_string(),
+                                    agent_role: agent_cfg.identity.role.clone(),
+                                    narrative: narrative.clone(),
+                                    source: EvolutionSource::Nightrun,
+                                },
+                            );
+                            if queued {
+                                evolution_jobs_queued += 1;
+                            } else {
+                                write_evolution_narrative_only(
+                                    &state_store_for_sim,
+                                    AgentId(agent_cfg.identity.id),
+                                    name,
+                                    EvolutionSource::Nightrun,
+                                    &narrative,
+                                );
+                            }
+                        }
                     }
                     Ok(_) => {} // Keine Episodes = nichts zu tun
                     Err(e) => {
+                        agents_failed_total += 1;
+                        if operator_event_emission_enabled {
+                            if let Some(ref event_store) = operator_event_store {
+                                let payload = DomainEventPayload::AgentConsolidationFailed {
+                                    run_id: operator_run_id.clone(),
+                                    agent_name: name.to_string(),
+                                    error: e.to_string(),
+                                };
+                                let aggregate_id = format!("AGENT-{:02}", agent_cfg.identity.id);
+                                if let Err(event_err) = append_nightrun_event(
+                                    event_store,
+                                    payload,
+                                    &aggregate_id,
+                                    &operator_run_id,
+                                    tick_count,
+                                    Some(&mut operator_hash_chain),
+                                ) {
+                                    operator_event_emission_enabled = false;
+                                    warn!(
+                                        run_id = %operator_run_id,
+                                        agent = %name,
+                                        error = %event_err,
+                                        "Operator-AgentConsolidationFailed-Event fehlgeschlagen"
+                                    );
+                                }
+                            }
+                        }
                         warn!(agent = %name, error = %e, "Nightrun-Konsolidierung fehlgeschlagen");
                     }
                 }
@@ -3296,7 +3961,7 @@ fn ecs_tick_loop(
                                     "night_run",
                                     "",
                                     format!("{episodes} episodes consolidated"),
-                                    format!("Nightrun-Konsolidierung: {episodes} Episoden verarbeitet"),
+                                    format!("Nightrun-Konsolidierung: {episodes} Episoden konsolidiert"),
                                     0.0_f64,
                                     "night_run",
                                     now_ms,
@@ -3317,12 +3982,66 @@ fn ecs_tick_loop(
                 }
             }
 
+            let operator_stats = nmda_score_stats(&operator_nmda_scores);
             info!(
                 agents = target_agents.len(),
-                consolidated = consolidated_total,
+                episodes_processed = episodes_processed_total,
+                episodes_consolidated = episodes_consolidated_total,
+                selection_rate = format!(
+                    "{:.3}",
+                    nmda_selection_rate(episodes_processed_total, episodes_consolidated_total)
+                ),
+                nmda_threshold = NMDA_CONSOLIDATION_THRESHOLD,
+                nmda_max_consolidation_episodes = NMDA_MAX_CONSOLIDATION_EPISODES,
+                nmda_score_min = ?operator_stats.min,
+                nmda_score_avg = ?operator_stats.avg,
+                nmda_score_max = ?operator_stats.max,
+                evolution_jobs_queued,
                 dry_run = nightrun_cmd.dry_run,
                 "Nightrun abgeschlossen"
             );
+            if operator_event_emission_enabled {
+                if let Some(ref event_store) = operator_event_store {
+                    let hash_chain_final = operator_hash_chain.current_hash();
+                    let payload = DomainEventPayload::NightRunCompleted {
+                        run_id: operator_run_id.clone(),
+                        trigger_shift_set,
+                        agents_consolidated: agents_consolidated_total,
+                        agents_failed: agents_failed_total,
+                        agents_skipped: 0,
+                        total_episodes: episodes_processed_total,
+                        total_episodes_consolidated: episodes_consolidated_total,
+                        nmda_selection_rate: Some(nmda_selection_rate(
+                            episodes_processed_total,
+                            episodes_consolidated_total,
+                        )),
+                        nmda_threshold: Some(NMDA_CONSOLIDATION_THRESHOLD),
+                        nmda_max_consolidation_episodes: Some(
+                            NMDA_MAX_CONSOLIDATION_EPISODES as u32,
+                        ),
+                        nmda_score_min: operator_stats.min,
+                        nmda_score_avg: operator_stats.avg,
+                        nmda_score_max: operator_stats.max,
+                        duration_ms: operator_started.elapsed().as_millis() as u64,
+                        hash_chain: Some(hash_chain_final.clone()),
+                    };
+                    if let Err(e) = append_nightrun_event(
+                        event_store,
+                        payload,
+                        "nightrun",
+                        &operator_run_id,
+                        tick_count,
+                        None,
+                    ) {
+                        warn!(
+                            run_id = %operator_run_id,
+                            hash_chain = %hash_chain_final,
+                            error = %e,
+                            "Operator-Nightrun-Completed-Event fehlgeschlagen"
+                        );
+                    }
+                }
+            }
         }
 
         // Time Machine: Periodische World Snapshots
@@ -3722,6 +4441,263 @@ fn ecs_tick_loop(
             }
         }
 
+        // Runtime Config-Apply (#425): Firma zur Laufzeit aendern — Live-Diff oder Fresh-Load.
+        // Laeuft zwischen Ticks (nach schedule.run) → tick-synchron.
+        while let Ok(apply_cmd) = config_apply_rx.try_recv() {
+            // Defensive Re-Validierung (Endpoint hat bereits 4xx geliefert; hier nur Schutz).
+            if let Err(errors) = crate::config_apply::validate_config_apply(
+                &apply_cmd,
+                config_apply_max_agents,
+                config_apply_validation,
+            ) {
+                warn!(
+                    error_count = errors.len(),
+                    "Config-Apply im Tick-Loop abgelehnt (Re-Validierung) — keine Mutation"
+                );
+                continue;
+            }
+            let mode = apply_cmd.mode;
+            info!(
+                ?mode,
+                agents = apply_cmd.agents.len(),
+                rooms = apply_cmd.building.rooms.len(),
+                "Config-Apply gestartet (tick-synchron)"
+            );
+
+            // 1. Pre-Apply Safety-Snapshot (Rollback-Punkt).
+            {
+                let es = world
+                    .get_resource::<sentinel_ecs::LimboEventStore>()
+                    .map(|e| Arc::clone(&e.0));
+                let ss = world
+                    .get_resource::<sentinel_ecs::RedbStateStore>()
+                    .map(|r| r.store.clone());
+                if let (Some(es), Some(ss)) = (es, ss) {
+                    let data_dir = std::path::Path::new(&events_db_path_str)
+                        .parent()
+                        .unwrap_or(std::path::Path::new("/opt/sentinel/data"));
+                    match snapshot_manager.create_and_store(
+                        &mut world,
+                        &ss,
+                        &es,
+                        data_dir,
+                        fs_layer.as_deref(),
+                        fs_mount.as_deref(),
+                        tick_count,
+                        sim_hour,
+                    ) {
+                        Ok(id) => info!(snapshot_id = %id, "Pre-Apply Safety-Snapshot erstellt"),
+                        Err(e) => {
+                            warn!(error = %e, "Pre-Apply Snapshot fehlgeschlagen (Apply wird fortgesetzt)")
+                        }
+                    }
+                }
+            }
+
+            // 2. Raum-Maps idempotent neu bauen (Layout-Aenderungen wirken sofort).
+            sentinel_ecs::rebuild_room_maps(&mut world, &apply_cmd.building);
+
+            let mut spawned = 0u32;
+            let mut updated = 0u32;
+            let mut despawned = 0u32;
+            let mut deferred_ids: Vec<AgentId> = Vec::new();
+            // IDs der live-geaenderten Agents → gezielte Gateway-DNA-Invalidierung (#440).
+            let mut changed_ids: Vec<u16> = Vec::new();
+
+            match mode {
+                sentinel_common::ApplyMode::Fresh => {
+                    // Fresh-Load: gesamte Agent-Welt abbauen, dann Schicht-Agents neu spawnen.
+                    for agent_id in world_agent_ids(&mut world) {
+                        teardown_agent_full(
+                            agent_id,
+                            &mut world,
+                            &mut runtime_orch,
+                            &sandbox,
+                            &mut sandbox_handles,
+                            &mut ebpf_collector,
+                            &mut agent_processes,
+                            &security_runtime_state,
+                        );
+                        despawned += 1;
+                    }
+                    for cfg in agents_for_shift(&apply_cmd.agents, current_shift) {
+                        if spawn_agent_full(
+                            &mut runtime_orch,
+                            &mut world,
+                            cfg,
+                            &sandbox,
+                            &mut sandbox_handles,
+                            &mut ebpf_collector,
+                            &mut agent_processes,
+                            &agent_command,
+                            &security_runtime_state,
+                            fs_mount.as_deref(),
+                        ) {
+                            spawned += 1;
+                        }
+                    }
+                }
+                sentinel_common::ApplyMode::Live => {
+                    let diff =
+                        crate::config_apply::compute_agent_diff(&all_agents, &apply_cmd.agents);
+                    // Neue Agents: nur spawnen wenn in aktueller Schicht (sonst beim Schichtwechsel).
+                    for cfg in &diff.spawn {
+                        if (current_shift == 0 || cfg.identity.shift_set == current_shift)
+                            && spawn_agent_full(
+                                &mut runtime_orch,
+                                &mut world,
+                                cfg,
+                                &sandbox,
+                                &mut sandbox_handles,
+                                &mut ebpf_collector,
+                                &mut agent_processes,
+                                &agent_command,
+                                &security_runtime_state,
+                                fs_mount.as_deref(),
+                            )
+                        {
+                            spawned += 1;
+                        }
+                    }
+                    // Geaenderte Agents: live aktualisieren, KEIN Despawn (Memory/Bio/Evolution bleibt).
+                    for cfg in &diff.update {
+                        if crate::config_apply::apply_agent_update(&mut world, cfg) {
+                            updated += 1;
+                            changed_ids.push(cfg.identity.id);
+                            update_agent_projection_identity(&projection_db_path, cfg);
+                        }
+                    }
+                    // Entfernte Agents: despawnen — aber CP-Heilung nicht stoeren (§6 L3 → deferren).
+                    for agent_id in &diff.despawn {
+                        if agent_under_active_healing(&runtime_health, *agent_id) {
+                            warn!(agent_id = %agent_id, "Despawn deferred: Agent unter aktiver Control-Plane-Heilung (TOGAF §6 L3)");
+                            deferred_ids.push(*agent_id);
+                            continue;
+                        }
+                        teardown_agent_full(
+                            *agent_id,
+                            &mut world,
+                            &mut runtime_orch,
+                            &sandbox,
+                            &mut sandbox_handles,
+                            &mut ebpf_collector,
+                            &mut agent_processes,
+                            &security_runtime_state,
+                        );
+                        despawned += 1;
+                    }
+                }
+            }
+
+            // 3. Persistenz (config_dir Write-Back) — Daemon ist alleiniger Schreiber (#420).
+            let persisted = match crate::config_persist::persist_company_config(
+                &config_dir,
+                &apply_cmd.agents,
+                &apply_cmd.building,
+                &tick_count.to_string(),
+            ) {
+                Ok(result) => {
+                    info!(
+                        agents = result.agents_written,
+                        removed = result.agents_removed,
+                        "Config in config_dir persistiert (ueberlebt Restart)"
+                    );
+                    true
+                }
+                Err(e) => {
+                    error!(error = %e, "Config-Persistenz fehlgeschlagen — Laufzeit-Welt ist bereits aktualisiert (Safety-Snapshot erlaubt Rollback)");
+                    false
+                }
+            };
+
+            // 4. Angewandte Config fuer den naechsten Diff uebernehmen. Deferred (CP-Heilung) Agents
+            //    bleiben erhalten, damit ihr Despawn beim naechsten Apply erneut versucht wird.
+            let deferred_configs: Vec<AgentConfig> = deferred_ids
+                .iter()
+                .filter_map(|id| all_agents.iter().find(|a| a.identity.id == id.0).cloned())
+                .collect();
+            all_agents = apply_cmd.agents.clone();
+            all_agents.extend(deferred_configs);
+
+            // 5. ConfigApplied-DomainEvent (Audit + durabler Trigger fuer Gateway-DNA-Reload #440).
+            let payload = DomainEventPayload::ConfigApplied {
+                mode: format!("{mode:?}").to_lowercase(),
+                spawned,
+                updated,
+                despawned,
+                rooms_changed: apply_cmd.building.rooms.len() as u32,
+                persisted,
+            };
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let event = DomainEvent::new(
+                payload.event_type_str(),
+                "company",
+                &payload.to_json(),
+                &format!("config-apply-{now_ms}"),
+                tick_count,
+            );
+            if let Some(es) = world
+                .get_resource::<sentinel_ecs::LimboEventStore>()
+                .map(|e| Arc::clone(&e.0))
+            {
+                if let Err(e) = es.append_event(&event) {
+                    warn!(error = %e, "ConfigApplied-Event konnte nicht persistiert werden");
+                }
+            }
+
+            // 6. Gateway-DNA-Cache-Invalidierung triggern (#440). Realer Trigger: fire-and-forget
+            //    HTTP-POST an den Gateway-Control-Plane in einem detached Thread, damit der Tick-Loop
+            //    NICHT blockiert. No-op wenn der Gateway aus ist (Connection refused → still ignoriert,
+            //    VM-Default token-safe). Leere agent_ids (Fresh/Spawn-only) ⇒ Gateway invalidiert alle.
+            if spawned + updated > 0 {
+                let gateway_url = std::env::var("CORTEX_GATEWAY_URL")
+                    .unwrap_or_else(|_| "http://localhost:8081".to_string());
+                let ids = changed_ids.clone();
+                std::thread::spawn(move || {
+                    let body = serde_json::json!({ "agent_ids": ids });
+                    match reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(2))
+                        .build()
+                    {
+                        Ok(client) => {
+                            let url = format!("{gateway_url}/control/dna/invalidate");
+                            match client.post(&url).json(&body).send() {
+                                Ok(resp) => info!(
+                                    status = %resp.status(),
+                                    "Gateway-DNA-Invalidierung getriggert (#440)"
+                                ),
+                                Err(_) => info!(
+                                    "Gateway-DNA-Invalidierung: Gateway nicht erreichbar — No-op (erwartet wenn inaktiv)"
+                                ),
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "reqwest-Client fuer DNA-Invalidierung nicht baubar")
+                        }
+                    }
+                });
+                info!(
+                    spawned,
+                    updated,
+                    changed = changed_ids.len(),
+                    "Gateway-DNA-Cache-Invalidierung getriggert (#440, fire-and-forget)"
+                );
+            }
+
+            info!(
+                ?mode,
+                spawned,
+                updated,
+                despawned,
+                deferred = deferred_ids.len(),
+                persisted,
+                "Config-Apply abgeschlossen"
+            );
+        }
+
         // eBPF Metrics Collection (Intervall konfigurierbar fuer deterministische PCP-Tests)
         let ebpf_collect_interval = platform_cp.config().ebpf_collect_interval_ticks.max(1);
         if tick_count > 0 && tick_count.is_multiple_of(ebpf_collect_interval) {
@@ -3873,136 +4849,6 @@ fn ecs_tick_loop(
     Ok(tick_count)
 }
 
-/// Generiert voice_style und behavioral_notes via LLM (Cortex Gateway).
-///
-/// Laeuft im ECS std::thread — nutzt `reqwest::blocking` (kein Tokio).
-/// Fail-safe: Bei jedem Fehler wird `(None, None)` zurueckgegeben,
-/// die Konsolidierung laeuft trotzdem durch.
-#[cfg(feature = "llm")]
-fn generate_evolution_fields(
-    agent_name: &str,
-    agent_role: &str,
-    narrative: &str,
-) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-    let gateway_url =
-        std::env::var("CORTEX_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
-    let url = format!("{gateway_url}/v1/chat/completions");
-
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "Evolution LLM Client erstellen fehlgeschlagen");
-            return (None, None);
-        }
-    };
-
-    // Voice-Style Analyse
-    let voice_style = llm_evolution_call(
-        &client,
-        &url,
-        agent_name,
-        "Du bist ein linguistischer Analyst fuer eine Firmen-Simulation. \
-         Analysiere den Sprachstil des Agenten basierend auf seiner Schicht-Zusammenfassung. \
-         Antworte AUSSCHLIESSLICH als valides JSON.",
-        &format!(
-            "Agent \"{agent_name}\" (Rolle: {agent_role}) hatte folgende Schicht-Erfahrungen:\n\n\
-             {narrative}\n\n\
-             Analysiere den Sprachstil. Antwort als JSON:\n\
-             {{\"phrases\": [\"phrase1\"], \"sentence_style\": \"kurz|mittel|lang\", \"formality\": 0.X}}"
-        ),
-    );
-
-    // Behavioral-Notes Analyse
-    let behavioral_notes = llm_evolution_call(
-        &client,
-        &url,
-        agent_name,
-        "Du bist ein Verhaltensanalyst fuer eine Firmen-Simulation. \
-         Analysiere Verhaltensmuster des Agenten basierend auf seiner Schicht-Zusammenfassung. \
-         Antworte AUSSCHLIESSLICH als valides JSON.",
-        &format!(
-            "Agent \"{agent_name}\" (Rolle: {agent_role}) hatte folgende Schicht-Erfahrungen:\n\n\
-             {narrative}\n\n\
-             Identifiziere Verhaltensmuster. Antwort als JSON:\n\
-             {{\"habits\": [\"habit1\"], \"interaction_style\": \"proaktiv|reaktiv|gemischt\", \
-             \"decision_style\": \"schnell|zoegerlich|ausgewogen\", \"anomalies\": []}}"
-        ),
-    );
-
-    (voice_style, behavioral_notes)
-}
-
-/// Einzelner LLM-Call fuer Evolution-Feld-Generierung.
-#[cfg(feature = "llm")]
-fn llm_evolution_call(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    agent_name: &str,
-    system_prompt: &str,
-    user_prompt: &str,
-) -> Option<Vec<u8>> {
-    let body = serde_json::json!({
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        "temperature": 0.3,
-        "max_tokens": 500,
-        "model": "default",
-        "metadata": {
-            "agent_id": agent_name,
-            "request_type": "evolution_analysis"
-        }
-    });
-
-    match client.post(url).json(&body).send() {
-        Ok(resp) => {
-            if !resp.status().is_success() {
-                warn!(
-                    agent = agent_name,
-                    status = %resp.status(),
-                    "Evolution LLM Call fehlgeschlagen (HTTP)"
-                );
-                return None;
-            }
-            match resp.json::<serde_json::Value>() {
-                Ok(json) => {
-                    let content = json
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
-                    if content.is_empty() {
-                        warn!(agent = agent_name, "Evolution LLM Response leer");
-                        return None;
-                    }
-                    Some(content.as_bytes().to_vec())
-                }
-                Err(e) => {
-                    warn!(agent = agent_name, error = %e, "Evolution LLM Response parse fehlgeschlagen");
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            warn!(agent = agent_name, error = %e, "Evolution LLM Call fehlgeschlagen");
-            None
-        }
-    }
-}
-
-/// Fallback wenn LLM-Feature deaktiviert ist.
-#[cfg(not(feature = "llm"))]
-fn generate_evolution_fields(
-    _agent_name: &str,
-    _agent_role: &str,
-    _narrative: &str,
-) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-    (None, None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4019,6 +4865,18 @@ mod tests {
 
     static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
 
+    #[test]
+    fn judge_alert_agent_id_uses_configured_bounds() {
+        let bounds = AgentIdBounds::new(120);
+
+        assert_eq!(
+            parse_judge_alert_agent_id("AGENT-75", bounds).unwrap(),
+            AgentId(75)
+        );
+        assert!(parse_judge_alert_agent_id("AGENT-121", bounds).is_err());
+        assert!(parse_judge_alert_agent_id("agent-75", bounds).is_err());
+    }
+
     fn record_projection_restart(_service_name: &str) -> bool {
         PROJECTION_RESTART_CALLS.fetch_add(1, Ordering::SeqCst);
         true
@@ -4026,6 +4884,116 @@ mod tests {
 
     fn projection_service_active(_service_name: &str) -> bool {
         true
+    }
+
+    #[test]
+    fn nightrun_events_persist_replayable_hash_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.db");
+        let event_store = EventStore::open(events_path.to_str().unwrap()).unwrap();
+        let run_id = "shift-tick-42-shift-1-to-2";
+        let mut chain = NightrunHashChain::new(run_id, run_id);
+
+        append_nightrun_event(
+            &event_store,
+            DomainEventPayload::NightRunStarted {
+                run_id: run_id.to_string(),
+                trigger_shift_set: 1,
+                agents_queued: 1,
+            },
+            "nightrun",
+            run_id,
+            42,
+            Some(&mut chain),
+        )
+        .unwrap();
+        append_nightrun_event(
+            &event_store,
+            DomainEventPayload::AgentConsolidated {
+                run_id: run_id.to_string(),
+                agent_name: "Anna".to_string(),
+                episodes_processed: 3,
+                episodes_consolidated: 1,
+                duration_ms: 7,
+            },
+            "AGENT-01",
+            run_id,
+            42,
+            Some(&mut chain),
+        )
+        .unwrap();
+        let expected_hash = chain.current_hash();
+        append_nightrun_event(
+            &event_store,
+            DomainEventPayload::NightRunCompleted {
+                run_id: run_id.to_string(),
+                trigger_shift_set: 1,
+                agents_consolidated: 1,
+                agents_failed: 0,
+                agents_skipped: 0,
+                total_episodes: 3,
+                total_episodes_consolidated: 1,
+                nmda_selection_rate: Some(1.0 / 3.0),
+                nmda_threshold: Some(NMDA_CONSOLIDATION_THRESHOLD),
+                nmda_max_consolidation_episodes: Some(NMDA_MAX_CONSOLIDATION_EPISODES as u32),
+                nmda_score_min: Some(0.1),
+                nmda_score_avg: Some(0.2),
+                nmda_score_max: Some(0.3),
+                duration_ms: 9,
+                hash_chain: Some(expected_hash.clone()),
+            },
+            "nightrun",
+            run_id,
+            42,
+            None,
+        )
+        .unwrap();
+
+        let events = event_store.get_events_by_correlation(run_id, 10).unwrap();
+        assert_eq!(events.len(), 3);
+
+        let mut replay_chain = NightrunHashChain::new(run_id, run_id);
+        for event in events
+            .iter()
+            .filter(|event| event.event_type != "nightrun_completed")
+        {
+            replay_chain.extend(event);
+        }
+        assert_eq!(replay_chain.current_hash(), expected_hash);
+
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == "nightrun_completed")
+            .unwrap();
+        let payload: DomainEventPayload = serde_json::from_str(&completed.payload).unwrap();
+        match payload {
+            DomainEventPayload::NightRunCompleted {
+                hash_chain,
+                total_episodes,
+                total_episodes_consolidated,
+                nmda_selection_rate,
+                nmda_threshold,
+                nmda_max_consolidation_episodes,
+                nmda_score_min,
+                nmda_score_avg,
+                nmda_score_max,
+                ..
+            } => {
+                assert_eq!(hash_chain.as_deref(), Some(expected_hash.as_str()));
+                assert_eq!(total_episodes, 3);
+                assert_eq!(total_episodes_consolidated, 1);
+                assert_eq!(nmda_selection_rate, Some(1.0 / 3.0));
+                assert_eq!(nmda_threshold, Some(NMDA_CONSOLIDATION_THRESHOLD));
+                assert_eq!(
+                    nmda_max_consolidation_episodes,
+                    Some(NMDA_MAX_CONSOLIDATION_EPISODES as u32)
+                );
+                assert_eq!(nmda_score_min, Some(0.1));
+                assert_eq!(nmda_score_avg, Some(0.2));
+                assert_eq!(nmda_score_max, Some(0.3));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
     }
 
     /// Erstellt EbpfCollector + tokio mpsc Sender fuer Tests (Userspace mode, kein tokio noetig).
@@ -4102,6 +5070,7 @@ mod tests {
                 bio: "Test Agent".to_string(),
                 quirks: vec!["testing".to_string()],
             },
+            runtime: Default::default(),
             capabilities: Default::default(),
         }
     }
@@ -4307,8 +5276,14 @@ mod tests {
             ebpf_tx,
             ep,
             mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+            None,
+            None,
             mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
             mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+            mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+            std::path::PathBuf::from("/tmp/sentinel-test-config-apply"),
+            10,
+            sentinel_common::agent_config::AgentConfigValidation::default(),
             mpsc::channel::<i64>().1,
             crate::config::RetentionConfig::default(),
             String::new(),
@@ -4390,8 +5365,14 @@ mod tests {
                 ebpf_tx,
                 ep,
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+                None,
+                None,
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+                std::path::PathBuf::from("/tmp/sentinel-test-config-apply"),
+                10,
+                sentinel_common::agent_config::AgentConfigValidation::default(),
                 mpsc::channel::<i64>().1,
                 crate::config::RetentionConfig::default(),
                 String::new(),
@@ -4490,8 +5471,14 @@ mod tests {
                 ebpf_tx,
                 ep,
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+                None,
+                None,
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+                std::path::PathBuf::from("/tmp/sentinel-test-config-apply"),
+                10,
+                sentinel_common::agent_config::AgentConfigValidation::default(),
                 mpsc::channel::<i64>().1,
                 crate::config::RetentionConfig::default(),
                 String::new(),
@@ -4598,8 +5585,14 @@ mod tests {
                 ebpf_tx,
                 ep,
                 mpsc::channel::<sentinel_common::OperatorNightrunCommand>().1,
+                None,
+                None,
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+                std::path::PathBuf::from("/tmp/sentinel-test-config-apply"),
+                10,
+                sentinel_common::agent_config::AgentConfigValidation::default(),
                 mpsc::channel::<i64>().1,
                 crate::config::RetentionConfig::default(),
                 String::new(),
@@ -4709,5 +5702,60 @@ mod tests {
         assert_eq!(shift_hours(2), (14, 22));
         assert_eq!(shift_hours(3), (22, 6));
         assert_eq!(shift_hours(99), (6, 14)); // Fallback
+    }
+
+    #[test]
+    fn world_agent_ids_lists_all_spawned() {
+        // Fresh-Load Reset enumeriert alle ECS-Agents (#425).
+        let (mut world, _) = create_simulation_world();
+        spawn_agent(&mut world, AgentId(1), "A", "Dev", 1, "empfang");
+        spawn_agent(&mut world, AgentId(2), "B", "PM", 1, "empfang");
+        let mut ids: Vec<u16> = world_agent_ids(&mut world).iter().map(|a| a.0).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    fn health_agent(
+        agent_id: u16,
+        repair_status: &str,
+    ) -> crate::runtime_health::RuntimeHealthAgentSnapshot {
+        crate::runtime_health::RuntimeHealthAgentSnapshot {
+            agent_id,
+            aggregate_id: format!("AGENT-{agent_id:02}"),
+            name: format!("Agent{agent_id}"),
+            runtime_present: true,
+            projection_present: true,
+            tracked_pid: None,
+            tracked_pid_alive: false,
+            tracked_pid_state: None,
+            cgroup_live_pid_count: 0,
+            security_runtime_present: true,
+            last_repair_status: Some(repair_status.to_string()),
+        }
+    }
+
+    #[test]
+    fn agent_under_active_healing_defers_only_stale() {
+        // TOGAF §6 L3: Agents unter aktiver CP-Heilung ("stale") NICHT despawnen.
+        let health = Arc::new(RwLock::new(
+            crate::runtime_health::RuntimeHealthSnapshot::default(),
+        ));
+        {
+            let mut h = health.write().unwrap();
+            h.agents.push(health_agent(5, "stale"));
+            h.agents.push(health_agent(6, "healthy"));
+        }
+        assert!(
+            agent_under_active_healing(&health, AgentId(5)),
+            "stale -> defer"
+        );
+        assert!(
+            !agent_under_active_healing(&health, AgentId(6)),
+            "healthy -> despawn ok"
+        );
+        assert!(
+            !agent_under_active_healing(&health, AgentId(99)),
+            "unknown -> despawn ok"
+        );
     }
 }

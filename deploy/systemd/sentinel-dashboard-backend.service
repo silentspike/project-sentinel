@@ -1,0 +1,43 @@
+[Unit]
+Description=Sentinel Dashboard-Backend — axum HTTPS + WebTransport/QUIC, topic+msgpack+zstd (#431)
+Documentation=https://github.com/silentspike/project-sentinel/issues/431
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel-dashboard-backend
+# Optionaler Secret-Env (SENTINEL_DASHBOARD_API_KEY, gleicher Key wie das Bun-Dashboard fuer geteilten Login)
+EnvironmentFile=-/opt/sentinel/config/dashboard-backend.env
+Environment=SENTINEL_DASHBOARD_HTTP_BIND=0.0.0.0:8001
+Environment=SENTINEL_DASHBOARD_WT_BIND=0.0.0.0:8001
+Environment=SENTINEL_OPERATOR_API_URL=http://127.0.0.1:8084
+Environment=CORTEX_GATEWAY_CONTROL_URL=http://127.0.0.1:8081
+Environment=CORTEX_GATEWAY_PROXY_URL=http://127.0.0.1:8080
+Environment=SENTINEL_DAEMON_PROMETHEUS_URL=http://127.0.0.1:9090
+Environment=SENTINEL_PROJECTION_DB=/opt/sentinel/data/projection.db
+Environment=SENTINEL_EVENTS_DB=/opt/sentinel/data/events.db
+Environment=SENTINEL_DASHBOARD_BUNDLE_DIR=/opt/sentinel/console-dist
+Environment=SENTINEL_DASHBOARD_CERT_DIR=/opt/sentinel/console-cert
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-dashboard-backend
+
+# Security Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+# Projection-DB nur lesen (Backend oeffnet read-only); Cert-Dir schreiben (self-signed beim Start)
+ReadOnlyPaths=/opt/sentinel/data /opt/sentinel/console-dist
+ReadWritePaths=/opt/sentinel/console-cert
+PrivateTmp=true
+
+[Install]
+WantedBy=sentinel.target

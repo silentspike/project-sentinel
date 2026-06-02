@@ -1,0 +1,20 @@
+{
+  "old": {
+    "activity": "200 Events",
+    "chaos": "100 Events",
+    "chatMessages": 100
+  },
+  "new": {
+    "status": "connected",
+    "chaos": "446 Events",
+    "chat": "500 Nachrichten",
+    "chatMessages": 22,
+    "activityBefore": "9946 Events",
+    "activityAfter": "10000 Events"
+  },
+  "eventLogAppend": {
+    "before": 9946,
+    "after": 10000,
+    "increased": true
+  }
+}

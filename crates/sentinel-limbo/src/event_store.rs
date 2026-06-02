@@ -124,6 +124,21 @@ impl fmt::Display for MonotonicityError {
 
 impl std::error::Error for MonotonicityError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetUpdateDecision {
+    InsertOrAdvance,
+    Noop,
+    Reject,
+}
+
+pub fn classify_offset_update(current: Option<i64>, attempted: i64) -> OffsetUpdateDecision {
+    match current {
+        Some(current) if attempted < current => OffsetUpdateDecision::Reject,
+        Some(current) if attempted == current => OffsetUpdateDecision::Noop,
+        _ => OffsetUpdateDecision::InsertOrAdvance,
+    }
+}
+
 /// Zeile aus der Outbox-Tabelle fuer den Publisher.
 #[derive(Debug, Clone)]
 pub struct OutboxEntry {
@@ -204,6 +219,27 @@ impl EventStore {
         ))?;
 
         info!("EventStore opened at {path}");
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path: PathBuf::from(path),
+        })
+    }
+
+    /// Oeffnet den Event Store **read-only** — fuer reine Consumer (z.B. Dashboard/CAS-Pusher),
+    /// die unter `systemd ReadOnlyPaths=` auf einem read-only gemounteten Datenverzeichnis laufen.
+    /// Kein Schema-DDL, kein WAL-Mode-Write — `open()` wuerde sonst mit
+    /// "attempt to write a readonly database" scheitern. Liest die Live-WAL-DB read-only
+    /// (SQLite read-only shm-Fallback); sieht neu committete Events des Writers.
+    #[instrument(level = "debug", fields(path = %path))]
+    pub fn open_readonly(path: &str) -> anyhow::Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        // Nur verbindungslokale, lesende Pragmas (kein DB-Write, kein Schema, kein WAL-Wechsel).
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        conn.execute_batch("PRAGMA query_only = ON;")?;
+        info!("EventStore opened READ-ONLY at {path}");
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path: PathBuf::from(path),
@@ -303,6 +339,74 @@ impl EventStore {
             .observe(_telemetry_start.elapsed().as_micros() as f64);
         }
         Ok(row_id)
+    }
+
+    /// Atomar: mehrere Events + Outbox-Eintraege in einer Transaktion.
+    ///
+    /// Nutzt dieselbe operation_id-Idempotenz wie `append_with_outbox`.
+    /// Duplikate werden ignoriert und erzeugen keinen Outbox-Eintrag.
+    pub fn append_with_outbox_batch<'a, I>(&self, entries: I) -> anyhow::Result<usize>
+    where
+        I: IntoIterator<Item = (&'a DomainEvent, &'a str)>,
+    {
+        let _telemetry_start = std::time::Instant::now();
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let tx = conn.transaction()?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let inserted_count = {
+            let mut insert_event = tx.prepare(
+                "INSERT OR IGNORE INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )?;
+            let mut insert_outbox = tx.prepare(
+                "INSERT INTO outbox (event_id, topic, payload, status, created_at) VALUES (?1, ?2, ?3, 'pending', ?4)",
+            )?;
+            let mut inserted_count = 0usize;
+
+            for (event, topic) in entries {
+                let inserted = insert_event.execute(params![
+                    event.event_id,
+                    event.event_type,
+                    event.aggregate_id,
+                    event.payload,
+                    event.correlation_id,
+                    event.causation_id,
+                    event.operation_id,
+                    event.tick as i64,
+                    event.timestamp_ms as i64,
+                    event.schema_version,
+                    event.compensation_type,
+                ])?;
+
+                if inserted > 0 {
+                    insert_outbox.execute(params![event.event_id, topic, event.payload, now_ms])?;
+                    inserted_count += inserted;
+                }
+            }
+
+            inserted_count
+        };
+
+        tx.commit()?;
+
+        #[cfg(feature = "telemetry")]
+        {
+            let reg = sentinel_telemetry::MetricsRegistry::global();
+            reg.counter("sentinel.limbo.event.append_outbox_batch.count")
+                .increment_by(inserted_count as u64);
+            reg.histogram(
+                "sentinel.limbo.event.append_outbox_batch.duration_us",
+                LATENCY_BUCKETS,
+            )
+            .observe(_telemetry_start.elapsed().as_micros() as f64);
+        }
+        Ok(inserted_count)
     }
 
     /// Liest Events nach einer bestimmten internen ID (Cursor-basiert).
@@ -730,19 +834,17 @@ impl EventStore {
             )
             .ok();
 
-        if let Some(current_val) = current {
-            if offset == current_val {
-                // Idempotent: gleicher Offset = kein Update noetig
-                return Ok(());
-            }
-            if offset < current_val {
+        match classify_offset_update(current, offset) {
+            OffsetUpdateDecision::Noop => return Ok(()),
+            OffsetUpdateDecision::Reject => {
                 return Err(MonotonicityError {
                     projection: name.to_string(),
-                    current: current_val,
+                    current: current.expect("reject requires existing offset"),
                     attempted: offset,
                 }
                 .into());
             }
+            OffsetUpdateDecision::InsertOrAdvance => {}
         }
 
         let now_ms = std::time::SystemTime::now()
@@ -1087,6 +1189,100 @@ mod tests {
         // Nur 1 Outbox-Eintrag
         let outbox = store.poll_outbox(10).unwrap();
         assert_eq!(outbox.len(), 1, "Duplicate should not create outbox entry");
+    }
+
+    #[test]
+    fn test_append_with_outbox_batch_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-batch-empty.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        let inserted = store
+            .append_with_outbox_batch(std::iter::empty::<(&DomainEvent, &str)>())
+            .unwrap();
+        assert_eq!(inserted, 0);
+
+        let conn = store.conn();
+        let event_count: i64 = conn
+            .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let outbox_count: i64 = conn
+            .query_row("SELECT count(*) FROM outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count, 0);
+        assert_eq!(outbox_count, 0);
+    }
+
+    #[test]
+    fn test_append_with_outbox_batch_preserves_order_and_outbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-batch-order.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        let event_a = test_event("agent_action_received", "AGENT-01");
+        let event_b = test_event("transit_started", "AGENT-02");
+        let event_c = test_event("transit_completed", "AGENT-03");
+        let entries = [
+            (&event_a, "sentinel/events/agent_action_received/AGENT-01"),
+            (&event_b, "sentinel/events/transit_started/AGENT-02"),
+            (&event_c, "sentinel/events/transit_completed/AGENT-03"),
+        ];
+
+        let inserted = store.append_with_outbox_batch(entries).unwrap();
+        assert_eq!(inserted, 3);
+
+        let events = store.get_events_since(0, 10).unwrap();
+        let event_ids: Vec<&str> = events.iter().map(|event| event.event_id.as_str()).collect();
+        assert_eq!(
+            event_ids,
+            vec![
+                event_a.event_id.as_str(),
+                event_b.event_id.as_str(),
+                event_c.event_id.as_str()
+            ]
+        );
+
+        let outbox = store.poll_outbox(10).unwrap();
+        let outbox_event_ids: Vec<&str> =
+            outbox.iter().map(|entry| entry.event_id.as_str()).collect();
+        assert_eq!(outbox_event_ids, event_ids);
+        assert_eq!(
+            outbox[0].topic,
+            "sentinel/events/agent_action_received/AGENT-01"
+        );
+        assert_eq!(outbox[1].topic, "sentinel/events/transit_started/AGENT-02");
+        assert_eq!(
+            outbox[2].topic,
+            "sentinel/events/transit_completed/AGENT-03"
+        );
+    }
+
+    #[test]
+    fn test_append_with_outbox_batch_idempotency() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-batch-idempotency.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        let mut event = test_event("agent_action_received", "AGENT-01");
+        event.operation_id = "op-batch-fixed".to_string();
+        let mut duplicate = test_event("agent_action_received", "AGENT-02");
+        duplicate.operation_id = "op-batch-fixed".to_string();
+
+        let inserted = store
+            .append_with_outbox_batch([
+                (&event, "sentinel/events/agent_action_received/AGENT-01"),
+                (&duplicate, "sentinel/events/agent_action_received/AGENT-02"),
+            ])
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        let events = store.get_events_since(0, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, event.event_id);
+
+        let outbox = store.poll_outbox(10).unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].event_id, event.event_id);
     }
 
     /// AC4: causation_id Kette - Event B.causation_id == Event A.event_id

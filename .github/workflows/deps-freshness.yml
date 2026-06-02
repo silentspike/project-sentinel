@@ -110,7 +110,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   bun-deps:
-    name: Dashboard Dependencies
+    name: Console Dependencies
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -120,9 +120,9 @@ jobs:
           echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
 
       - name: Check outdated npm packages
-        working-directory: dashboard
+        working-directory: console
         run: |
-          echo "## Dashboard Dependencies" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Console Dependencies" >> "$GITHUB_STEP_SUMMARY"
           bun install --frozen-lockfile
           OUTPUT=$(bun outdated 2>&1 || echo "Alle Packages aktuell.") || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"

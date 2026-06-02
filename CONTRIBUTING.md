@@ -58,7 +58,7 @@ deps: bump bevy_ecs to 0.15.1
 ```
 crates/              Rust workspace (10 crates)
 cmd/cortex-gateway/  Go LLM proxy
-dashboard/           Bun + Hono frontend
+console/             SolidJS console frontend
 schemas/             FlatBuffer definitions
 config/              Agent definitions, room layout
 bitnet/              BitNet CPU inference
@@ -78,10 +78,10 @@ deploy/              VM configuration
 - Context propagation on all functions
 - Errors: wrap with `fmt.Errorf("operation: %w", err)`
 
-### TypeScript (Dashboard)
-- Vanilla JS in frontend (no framework)
-- Hono for backend routes
-- WebSocket for real-time updates
+### TypeScript (Console)
+- SolidJS for frontend views
+- Rust `sentinel-dashboard-backend` for API routes
+- WebTransport topic frames for real-time updates
 
 ## Security
 

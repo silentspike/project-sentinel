@@ -1,18 +1,18 @@
 # Sentinel 10-minute demo stack.
 #
 # Brings up: NATS + sentinel-daemon + cortex-gateway + sentinel-judge +
-#            sentinel-nats-bridge + sentinel-projection + sentinel-dashboard
+#            sentinel-nats-bridge + sentinel-projection + Sentinel console
 #
 # All five Sentinel services share the same image (deploy/docker/Dockerfile.demo)
 # and select their binary via the SENTINEL_ROLE environment variable.
 #
 # Usage:
-#   ./scripts/demo.sh                    # build + run + open dashboard + tear down
+#   ./scripts/demo.sh                    # build + run + open console + tear down
 #   docker compose -f docker-compose.demo.yml up --build
 #
 # Ports exposed on the host (every Sentinel-app port uses a +10000 offset
 # to avoid colliding with common local dev services on 8000-8090):
-#   18000  Dashboard UI           (browser)              -> container :8000
+#   18001  Console UI             (browser)              -> container :8001
 #   18080  Cortex Gateway (proxy) -- also serves /metrics-> container :8080
 #   18081  Cortex Gateway (control plane)               -> container :8081
 #   18082  sentinel-judge        (health, /metrics)     -> container :8082
@@ -21,7 +21,7 @@
 #    8222  NATS monitoring HTTP                          (no collision risk)
 #    4222  NATS client                                   (no collision risk)
 #
-# Adjust to canonical ports (8000, 8080-8084) if your machine has them free.
+# Adjust to canonical ports (8001, 8080-8084) if your machine has them free.
 
 name: sentinel-demo
 
@@ -124,8 +124,9 @@ services:
 
   projection:
     # CQRS read-model worker. Polls the EventStore and builds the
-    # projection.db that the dashboard reads (agent_live_view, room_live_view,
-    # kpi_1m). Without this service running, the dashboard crashes on
+    # projection.db that the console backend reads (agent_live_view,
+    # room_live_view, kpi_1m). Without this service running, the console
+    # starts degraded.
     # startup because projection.db doesn't exist.
     image: sentinel-demo:local
     container_name: sentinel-demo-projection
@@ -138,23 +139,26 @@ services:
       - sentinel-data:/opt/sentinel/data
     networks: [sentinel]
 
-  dashboard:
+  console:
     image: sentinel-demo:local
-    container_name: sentinel-demo-dashboard
+    container_name: sentinel-demo-console
     environment:
-      SENTINEL_ROLE: dashboard
-      PORT: "8000"
-      DAEMON_OPERATOR_URL: "http://daemon:8084"
-      GATEWAY_URL: "http://gateway:8080"
+      SENTINEL_ROLE: console
+      SENTINEL_DASHBOARD_HTTP_BIND: "0.0.0.0:8001"
+      SENTINEL_DASHBOARD_WT_BIND: "0.0.0.0:8001"
+      SENTINEL_DASHBOARD_API_KEY: "demo"
+      SENTINEL_NATS_URL: "nats://nats:4222"
+      SENTINEL_OPERATOR_API_URL: "http://daemon:8084"
+      CORTEX_GATEWAY_PROXY_URL: "http://gateway:8080"
+      CORTEX_GATEWAY_CONTROL_URL: "http://gateway:8081"
     depends_on:
       gateway:
         condition: service_healthy
       projection:
         condition: service_started
-    # host port 18000 (port 8000 commonly used by local nginx/dev servers).
-    # Adjust on a host where 8000 is free if you want the canonical mapping.
     ports:
-      - "18000:8000"
+      - "18001:8001/tcp"
+      - "18001:8001/udp"
     volumes:
       - sentinel-data:/opt/sentinel/data:ro
     networks: [sentinel]

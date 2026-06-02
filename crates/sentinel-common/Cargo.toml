@@ -5,6 +5,10 @@ edition = "2021"
 license = "MIT"
 publish = false
 
+[features]
+default = []
+test-util = []
+
 [dependencies]
 bevy_ecs = { workspace = true }
 flatbuffers = { workspace = true }
@@ -19,3 +23,6 @@ bincode = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
