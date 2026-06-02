@@ -90,6 +90,10 @@ pub enum NanoSnapshotSemantics {
     WasmReexecute,
     BwrapConfigFs,
     RuntimeMetadata,
+    /// microVM-Snapshot (#417): die NanoSnapshot.payload traegt STABILE Metadaten (Config +
+    /// deterministische Pfade zu Firecracker mem/state-Dateien je workload_id), NICHT die volatilen
+    /// Guest-RAM-Bytes. Der echte Speicher-Snapshot liegt in den referenzierten Firecracker-Dateien.
+    MicrovmMemory,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
