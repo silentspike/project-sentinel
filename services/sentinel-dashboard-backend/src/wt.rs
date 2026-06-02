@@ -14,7 +14,11 @@ use wtransport::{endpoint::IncomingSession, Endpoint, Identity, ServerConfig};
 use crate::AppState;
 
 /// Startet den WebTransport-Server (blockiert in der Accept-Loop).
-pub async fn run_server(state: AppState, cert_pem: PathBuf, key_pem: PathBuf) -> anyhow::Result<()> {
+pub async fn run_server(
+    state: AppState,
+    cert_pem: PathBuf,
+    key_pem: PathBuf,
+) -> anyhow::Result<()> {
     let identity = Identity::load_pemfiles(&cert_pem, &key_pem)
         .await
         .context("load self-signed pemfiles")?;
@@ -30,7 +34,10 @@ pub async fn run_server(state: AppState, cert_pem: PathBuf, key_pem: PathBuf) ->
         .with_identity(identity)
         .build();
     let server = Endpoint::server(config)?;
-    tracing::info!(port, "sentinel-dashboard-backend WebTransport/QUIC listening");
+    tracing::info!(
+        port,
+        "sentinel-dashboard-backend WebTransport/QUIC listening"
+    );
 
     loop {
         let incoming = server.accept().await;
@@ -71,18 +78,51 @@ async fn handle_session(incoming: IncomingSession, st: AppState) -> anyhow::Resu
     uni.write_all(&hello).await?;
     uni.finish().await?;
 
-    // Connect-Snapshot: aktueller agent_live-Stand (read-only aus projection.db) als ein topic-Frame
-    // — damit die Konsole beim Verbinden sofort die echten Agents reaktiv rendert. Der kontinuierliche
-    // Delta-Stream (Push bei jedem neuen Event) bleibt #432. Token-sicher (reiner Projection-Read).
+    // Connect-Snapshots: aktuelle Projection-Staende als topic-Frames, damit die Konsole beim
+    // Verbinden sofort echte Daten rendert. Token-sicher (reine Projection-Reads).
     match crate::projection::agents_rows(&st.config.projection_db) {
         Ok(rows) => {
-            let frame = crate::codec::encode_frame("agent_live", &serde_json::json!({ "agents": rows }))?;
+            let frame =
+                crate::codec::encode_frame("agent_live", &serde_json::json!({ "agents": rows }))?;
             let mut snap = connection.open_uni().await?.await?;
             snap.write_all(&frame).await?;
             snap.finish().await?;
-            tracing::debug!(agents = rows.len(), bytes = frame.len(), "wt agent_live snapshot pushed");
+            tracing::debug!(
+                agents = rows.len(),
+                bytes = frame.len(),
+                "wt agent_live snapshot pushed"
+            );
         }
-        Err(e) => tracing::warn!(error = %e, "wt agent_live snapshot skipped (projection read failed)"),
+        Err(e) => {
+            tracing::warn!(error = %e, "wt agent_live snapshot skipped (projection read failed)")
+        }
+    }
+    match crate::projection::rooms_rows(&st.config.projection_db) {
+        Ok(rows) => {
+            let frame =
+                crate::codec::encode_frame("room_live", &serde_json::json!({ "rooms": rows }))?;
+            let mut snap = connection.open_uni().await?.await?;
+            snap.write_all(&frame).await?;
+            snap.finish().await?;
+            tracing::debug!(
+                rooms = rows.len(),
+                bytes = frame.len(),
+                "wt room_live snapshot pushed"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "wt room_live snapshot skipped (projection read failed)")
+        }
+    }
+    match crate::projection::metrics_row(&st.config.projection_db) {
+        Ok(kpi) => {
+            let frame = crate::codec::encode_frame("kpi", &serde_json::json!({ "kpi": kpi }))?;
+            let mut snap = connection.open_uni().await?.await?;
+            snap.write_all(&frame).await?;
+            snap.finish().await?;
+            tracing::debug!(bytes = frame.len(), "wt kpi snapshot pushed");
+        }
+        Err(e) => tracing::warn!(error = %e, "wt kpi snapshot skipped (projection read failed)"),
     }
 
     // Kontinuierlicher Delta-Push (#432): nach dem Connect-Snapshot abonniert die Session den
