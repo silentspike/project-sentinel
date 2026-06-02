@@ -42,6 +42,17 @@ const CONTROL_GET_ROUTES: [&str; 6] = [
     "/api/control/snapshots",
 ];
 
+const CONTROL_POST_ROUTES: [&str; 8] = [
+    "/api/control/chaos",
+    "/api/control/stimulus",
+    "/api/control/nightrun",
+    "/api/control/provider",
+    "/api/control/pause",
+    "/api/control/resume",
+    "/api/control/platform-analyze",
+    "/api/control/snapshot",
+];
+
 async fn get_json(path: &str) -> (StatusCode, serde_json::Value) {
     let state = test_state();
     let token = state.sessions.create();
@@ -84,6 +95,29 @@ async fn control_proxy_routes_return_401_without_cookie() {
         let app = build_app(test_state());
         let resp = app
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{path} ohne Cookie muss 401 sein"
+        );
+    }
+}
+
+#[tokio::test]
+async fn control_mutation_routes_return_401_without_cookie() {
+    for path in CONTROL_POST_ROUTES {
+        let app = build_app(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(

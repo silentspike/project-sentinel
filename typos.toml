@@ -525,5 +525,6 @@ extend-exclude = [
     "target/",
     "node_modules/",
     "*.min.js",
+    "console/evidence/",
     "docs/",
 ]

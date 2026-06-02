@@ -65,7 +65,7 @@
   description: "Cortex Gateway"
 - name: "comp:dashboard"
   color: "006b75"
-  description: "Dashboard UI"
+  description: "Console UI"
 - name: "comp:inference"
   color: "e99695"
   description: "Inference / LLM Routing"

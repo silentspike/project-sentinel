@@ -28,7 +28,7 @@ describe("tiling engine (#444)", () => {
 
   it("openPanel (Gaia command) inserts a panel", () => {
     const before = countLeaves(tilingTree.root);
-    openPanel("activity");
+    openPanel("timetravel");
     expect(countLeaves(tilingTree.root)).toBe(before + 1);
   });
 

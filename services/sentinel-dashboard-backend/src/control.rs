@@ -1,6 +1,6 @@
 //! Control-Proxy (#431) — leitet mutierende Operator-Befehle an die Backend-Dienste weiter:
 //! Operator-API (Daemon, `:8084`, Header `x-sentinel-operator-key`) und Gateway-Control (`:8081`).
-//! 1:1-Aequivalent zu `dashboard/src/routes/control.ts`. Alle Routen laufen hinter `require_auth`.
+//! Control- und Operator-Proxies fuer die SolidJS-Konsole. Alle Routen laufen hinter `require_auth`.
 
 use axum::{
     body::Bytes,
@@ -329,6 +329,18 @@ pub async fn platform_analyses(
         limit,
     ))
     .into_response()
+}
+
+/// POST /api/control/platform-analyze → Operator-API `/operator/platform-analyze`.
+pub async fn platform_analyze(State(st): State<AppState>, body: Bytes) -> Response {
+    forward(
+        &st,
+        reqwest::Method::POST,
+        format!("{}/operator/platform-analyze", st.config.operator_url),
+        true,
+        Some(body),
+    )
+    .await
 }
 
 /// GET /api/control/status — aggregierter Gateway-Status, 200 auch bei offline Gateway.

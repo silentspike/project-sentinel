@@ -163,9 +163,9 @@ bereits selbst. Gaia ist die strategische/User-Schicht *darueber*, nicht ein kon
 - **Platform/Nano-Container-Admin**: voll — observe + verwalten + Gaia-orchestriert (ueber CLI, mit Gates).
 - **Firmen-Scope**: **single aktiv + Firmen-Bibliothek** (gaia-specs speichern/laden/umschalten via #425 Fresh-Load); kein Multi-Tenant.
 - **Benachrichtigung**: nur In-Konsole-Alerts (kein ntfy/Web-Push).
-- **Deployment**: alles auf Deploy-VM (10.0.0.240) als systemd-Services, nginx :8000.
+- **Deployment**: alles auf Deploy-VM (10.0.0.240) als systemd-Services; Konsole via `sentinel-dashboard-backend` auf HTTPS/WebTransport `:8001`.
 - **Test-Strategie**: mehrschichtig — Unit + Integration + Playwright-E2E + Gaia-Eval.
-- **Dashboard-Migration**: schrittweise abloesen, bestehendes Hono+Vanilla-Dashboard bleibt bis Feature-Paritaet, dann Cut-over.
+- **Dashboard-Migration**: #433 migriert die neun Views strikt in die SolidJS-Konsole; der Bun/Hono-Pfad wird nach View-Paritaet entfernt.
 
 ---
 

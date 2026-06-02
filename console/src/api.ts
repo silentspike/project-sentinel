@@ -32,6 +32,14 @@ export function postJson<T>(path: string, body: unknown): Promise<T> {
   return apiJson<T>(path, { method: "POST", body: JSON.stringify(body) });
 }
 
+export function patchJson<T>(path: string, body: unknown): Promise<T> {
+  return apiJson<T>(path, { method: "PATCH", body: JSON.stringify(body) });
+}
+
+export function deleteJson<T>(path: string, body: unknown): Promise<T> {
+  return apiJson<T>(path, { method: "DELETE", body: JSON.stringify(body) });
+}
+
 export interface EbpfMetrics {
   available: boolean;
   mode: string;
@@ -101,4 +109,128 @@ export interface CockpitResponse {
   total_active: number;
   total_resolved_24h: number;
   events_db: "ok" | "offline" | string;
+}
+
+export interface ControlConfig {
+  primary_provider?: string;
+  rate_limit_rps?: number;
+  temperature?: number;
+  max_tokens?: number;
+  agent_overrides?: Record<string, string>;
+  personality_guard_enabled?: boolean;
+  drift_threshold?: number;
+  quality_gate_enabled?: boolean;
+  quality_threshold?: number;
+  quality_max_regen?: number;
+  narrative_nudge?: string;
+  [key: string]: unknown;
+}
+
+export interface ControlStatus {
+  connected: boolean;
+  paused: boolean;
+  config: ControlConfig | null;
+  health: Record<string, unknown> | null;
+  saved_rate_limit?: number | null;
+  gateway?: "ok" | "offline" | string;
+}
+
+export interface TrafficStats {
+  primary_provider?: string;
+  internal_primary_provider?: string;
+  external_mitm_provider?: string;
+  current_cost_usd?: number;
+  estimated_savings_usd?: number;
+  projected_daily_cost_usd?: number;
+  projected_daily_savings_usd?: number;
+  avg_forward_cost_usd?: number;
+  forward_calls?: number;
+  synthesis_count?: number;
+  synthesis_rate?: number;
+  tick_sync_enabled?: boolean;
+  tick_sync_runtime_enabled?: boolean;
+  tick_sync_pending?: number;
+  synthesis_enabled?: boolean;
+  sequencing_enabled?: boolean;
+  apicp_enabled?: boolean;
+  active_patterns?: number;
+  queue_depth?: number | null;
+  active_forward_calls?: number | null;
+  pending_intercepts?: number;
+  pending_response_intercepts?: number;
+  response_log_entries?: number;
+  tick_sync_timeout_ms?: number | null;
+  p3_timeout_ms?: number | null;
+  intercept_mode?: string;
+  [key: string]: unknown;
+}
+
+export interface PlatformAnalysis {
+  event_id?: string;
+  trigger?: string;
+  severity?: string;
+  summary?: string;
+  recommendation?: string;
+  suggested_action?: string;
+  target?: string;
+  aggregate_id?: string;
+  provider?: string | null;
+  model?: string | null;
+  tick?: number;
+  unresolved_keys?: string[];
+  [key: string]: unknown;
+}
+
+export interface PlatformAgentState {
+  agent_id?: number | string;
+  name?: string;
+  aggregate_id?: string;
+  current_profile?: string;
+  last_activity_tick?: number | null;
+  cgroup_path?: string | null;
+  [key: string]: unknown;
+}
+
+export interface PlatformState {
+  current_tick?: number;
+  llm_enabled?: boolean;
+  llm_analysis_interval_secs?: number;
+  llm_retry_delay_secs?: number;
+  last_analysis_tick?: number | null;
+  last_analysis_trigger?: string | null;
+  last_scheduled_analysis_tick?: number | null;
+  stall_recent_activity_grace_ticks?: number;
+  unresolved_counts?: Record<string, unknown>;
+  threshold_overrides?: Record<string, unknown>;
+  agents?: PlatformAgentState[];
+  [key: string]: unknown;
+}
+
+export interface SnapshotInfo {
+  id: string;
+  tier: string;
+  created_at_ms: number;
+  tick: number;
+  sim_hour?: number;
+  payload_size_bytes?: number | null;
+  [key: string]: unknown;
+}
+
+export interface SnapshotRoomState {
+  room_id?: string;
+  name: string;
+  occupant_count: number;
+}
+
+export interface SnapshotWorldState {
+  snapshot_id: string;
+  tier: string;
+  created_at_ms: number;
+  tick: number;
+  sim_hour?: number;
+  last_event_id?: number;
+  active_agent_count?: number | null;
+  present_agent_count: number;
+  room_count: number;
+  rooms: SnapshotRoomState[];
 }

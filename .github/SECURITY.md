@@ -44,7 +44,7 @@ Include:
 
 - Rust crates (sentinel-ecs, sentinel-bio, sentinel-sandbox, etc.)
 - Cortex Gateway (Go HTTP proxy)
-- Dashboard (Bun + Hono backend, Vanilla JS frontend)
+- Console (SolidJS frontend, Rust/WebTransport backend)
 - Agent sandbox isolation (bwrap, Landlock, cgroups v2)
 - FlatBuffer schema validation
 - Wasm tool runtime (Wasmtime + Extism)
