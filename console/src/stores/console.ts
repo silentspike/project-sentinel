@@ -10,20 +10,65 @@ export interface AgentRow {
   name: string;
   role: string;
   current_room: string | null;
-  energy: number;
-  stress: number;
+  shift_set?: number;
+  status?: string;
+  in_transit?: boolean;
+  transit_target?: string | null;
+  last_action?: string | null;
+  last_action_tick?: number | null;
+  hunger?: number;
+  energy?: number;
+  stress?: number;
+  bladder?: number;
+  social_need?: number;
+  caffeine_mg?: number;
   mood: string | null;
+  last_event_id?: number;
+  updated_at?: number;
+  stalled?: boolean;
+  [k: string]: unknown;
+}
+
+export interface RoomRow {
+  room_id: string;
+  occupant_count: number;
+  transit_count: number;
+  active_chaos: unknown | null;
+  active_smells: unknown | null;
+  temperature: number | null;
+  co2_ppm: number | null;
+  noise_db: number | null;
+  last_event_tick: number | null;
+  last_event_id?: number;
+  updated_at?: number;
+  [k: string]: unknown;
+}
+
+export interface KpiRow {
+  bucket_start: number;
+  active_agents: number;
+  total_actions: number;
+  total_transits: number;
+  chaos_events: number;
+  tick_count: number;
+  shift_changes: number;
+  nightrun_events: number;
+  updated_at: number;
   [k: string]: unknown;
 }
 
 interface ConsoleState {
   agents: AgentRow[];
+  rooms: RoomRow[];
+  kpi: KpiRow | null;
   lastTopic: string | null;
   lastHello: Record<string, unknown> | null;
 }
 
 const [state, setState] = createStore<ConsoleState>({
   agents: [],
+  rooms: [],
+  kpi: null,
   lastTopic: null,
   lastHello: null,
 });
@@ -42,6 +87,12 @@ export function ingestFrame(topic: string, value: unknown) {
   } else if (topic === "agent_live" && value && typeof value === "object") {
     const rows = (value as { agents?: AgentRow[] }).agents;
     if (Array.isArray(rows)) setState("agents", reconcile(rows, { key: "agent_id" }));
+  } else if (topic === "room_live" && value && typeof value === "object") {
+    const rows = (value as { rooms?: RoomRow[] }).rooms;
+    if (Array.isArray(rows)) setState("rooms", reconcile(rows, { key: "room_id" }));
+  } else if (topic === "kpi" && value && typeof value === "object") {
+    const row = (value as { kpi?: KpiRow | null }).kpi;
+    setState("kpi", row ?? null);
   }
 }
 

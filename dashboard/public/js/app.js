@@ -1,9 +1,5 @@
 // Router und WebSocket Manager
-import { renderAgents, updateAgents } from './agents.js';
-import { renderFloorplan, refreshActiveRoomDetail } from './floorplan.js';
 import { renderActivity, updateActivity } from './activity.js';
-import { renderMetrics } from './metrics.js';
-import { renderCockpit, updateCockpit } from './cockpit.js';
 import { renderChaos, updateChaos } from './chaos.js';
 import { renderChat, initChat } from './chat.js';
 import { initControl } from './control.js';
@@ -44,18 +40,6 @@ function updateLagDisplay(lag) {
 // neu laden (Projection ist nach resetWatermarks frisch) und abhaengige Views
 // aktualisieren. (AC-4, #384)
 async function reloadAfterRestore() {
-  try {
-    const [agentsRes, roomsRes] = await Promise.all([
-      fetch('/api/agents'),
-      fetch('/api/rooms'),
-    ]);
-    if (agentsRes.ok) renderAgents(await agentsRes.json());
-    if (roomsRes.ok) {
-      renderFloorplan(await roomsRes.json());
-      refreshActiveRoomDetail();
-    }
-  } catch { /* ignore — naechster WS-Poll holt nach */ }
-  updateCockpit();
   updateChaos();
   updateActivity();
   refreshTimeTravel();
@@ -75,18 +59,11 @@ function connectWebSocket() {
     try {
       const data = JSON.parse(event.data);
       if (data.type === 'agent_update') {
-        updateAgents(data.agents);
         updateActivity();
-      } else if (data.type === 'room_update') {
-        renderFloorplan(data.rooms);
-        refreshActiveRoomDetail();
       } else if (data.type === 'health_update') {
         updateLagDisplay(data.lag);
-      } else if (data.type === 'cockpit_update') {
-        updateCockpit();
       } else if (data.type === 'chaos_update') {
         updateChaos();
-        refreshActiveRoomDetail();
       } else if (data.type === 'activity_update') {
         updateActivity();
       } else if (data.type === 'snapshot_restored') {
@@ -117,25 +94,13 @@ async function init() {
 
   // Lade initiale Daten parallel
   try {
-    const [agentsRes, roomsRes, metricsRes, cockpitRes, chaosRes] = await Promise.all([
-      fetch('/api/agents'),
-      fetch('/api/rooms'),
-      fetch('/api/metrics'),
-      fetch('/api/cockpit'),
+    const [chaosRes] = await Promise.all([
       fetch('/api/chaos?limit=100'),
     ]);
 
-    const agents = await agentsRes.json();
-    const rooms = await roomsRes.json();
-    const metrics = await metricsRes.json();
-    const cockpit = await cockpitRes.json();
     const chaos = await chaosRes.json();
 
-    renderAgents(agents);
-    renderFloorplan(rooms);
-    renderMetrics(metrics);
     renderActivity();
-    renderCockpit(cockpit);
     renderChaos(chaos);
 
     // Chat async laden (eigener Fetch)
