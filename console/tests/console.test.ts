@@ -45,4 +45,74 @@ describe("store reconcile (delta-merge from pushed frames)", () => {
     ingestFrame("hello", { server: "sentinel-dashboard-backend", proto: "topic-msgpack-zstd-v1" });
     expect(consoleStore.lastHello).toEqual({ server: "sentinel-dashboard-backend", proto: "topic-msgpack-zstd-v1" });
   });
+
+  it("ingestFrame('room_live') reconciles rooms by room_id", () => {
+    ingestFrame("room_live", {
+      rooms: [
+        {
+          room_id: "kueche",
+          occupant_count: 2,
+          transit_count: 0,
+          active_chaos: null,
+          active_smells: null,
+          temperature: 22.5,
+          co2_ppm: 650,
+          noise_db: 40,
+          last_event_tick: 7,
+        },
+      ],
+    });
+    expect(consoleStore.lastTopic).toBe("room_live");
+    expect(consoleStore.rooms).toHaveLength(1);
+    expect(consoleStore.rooms[0].room_id).toBe("kueche");
+
+    ingestFrame("room_live", {
+      rooms: [
+        {
+          room_id: "kueche",
+          occupant_count: 3,
+          transit_count: 1,
+          active_chaos: { type: "PrinterBroken" },
+          active_smells: null,
+          temperature: 23,
+          co2_ppm: 700,
+          noise_db: 45,
+          last_event_tick: 8,
+        },
+        {
+          room_id: "buero-ceo",
+          occupant_count: 1,
+          transit_count: 0,
+          active_chaos: null,
+          active_smells: null,
+          temperature: 21,
+          co2_ppm: 500,
+          noise_db: 35,
+          last_event_tick: 8,
+        },
+      ],
+    });
+    expect(consoleStore.rooms).toHaveLength(2);
+    expect(consoleStore.rooms[0].occupant_count).toBe(3);
+    expect(consoleStore.rooms[1].room_id).toBe("buero-ceo");
+  });
+
+  it("ingestFrame('kpi') stores the latest KPI bucket", () => {
+    ingestFrame("kpi", {
+      kpi: {
+        bucket_start: 1000,
+        active_agents: 12,
+        total_actions: 30,
+        total_transits: 4,
+        chaos_events: 1,
+        tick_count: 60,
+        shift_changes: 0,
+        nightrun_events: 0,
+        updated_at: 1100,
+      },
+    });
+    expect(consoleStore.lastTopic).toBe("kpi");
+    expect(consoleStore.kpi?.active_agents).toBe(12);
+    expect(consoleStore.kpi?.total_actions).toBe(30);
+  });
 });
