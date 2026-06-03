@@ -354,6 +354,24 @@ pub enum DomainEventPayload {
         /// True wenn die Config erfolgreich in den config_dir persistiert wurde.
         persisted: bool,
     },
+    /// Nano-Container Live-Migration abgeschlossen (#413): orchestrator-getriebener,
+    /// lokaler Snapshot->Restore-Handoff einer NanoRuntime-Instanz (Time-Machine-Audit).
+    MigrationCompleted {
+        /// Runtime-Key der migrierten Instanz (z.B. "ecs-native").
+        runtime_key: String,
+        /// Workload-Identitaet der migrierten Instanz.
+        workload_id: String,
+        /// Anzahl Agents/Workloads in der migrierten Instanz.
+        agent_count: u32,
+        /// Workload-ID des Quell-Handles (vor der Migration).
+        from_handle: String,
+        /// Workload-ID des Ziel-Handles (frische Instanz nach Restore).
+        to_handle: String,
+        /// Dauer des snapshot->restore->terminate-Handoffs in Millisekunden.
+        duration_ms: u64,
+        /// Ausloesegrund (z.B. "manual", "resource_rebalance").
+        reason: String,
+    },
 }
 
 impl DomainEventPayload {
@@ -398,6 +416,7 @@ impl DomainEventPayload {
             Self::OperatorBroadcastSent { .. } => "operator_broadcast_sent",
             Self::OperatorDmSent { .. } => "operator_dm_sent",
             Self::ConfigApplied { .. } => "config_applied",
+            Self::MigrationCompleted { .. } => "migration_completed",
         }
     }
 }

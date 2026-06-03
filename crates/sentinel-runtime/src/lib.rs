@@ -14,7 +14,7 @@ use sentinel_limbo::EventStore;
 use serde::{Deserialize, Serialize};
 
 pub mod nano;
-pub use nano::EcsNativeRuntime;
+pub use nano::{migrate_ecs_native_instance, EcsNativeRuntime, MigrationOutcome};
 
 /// Status eines laufenden Agenten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
