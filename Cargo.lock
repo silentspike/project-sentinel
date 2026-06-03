@@ -4650,6 +4650,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-microvm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "sentinel-common",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "sentinel-nightrun"
 version = "0.1.0"
 dependencies = [

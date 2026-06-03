@@ -154,8 +154,9 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | WASM/Wasmtime adapter (#409)  | ✅ | `crates/sentinel-wasm/src/nano.rs` implements the same contract with documented re-execute snapshot semantics, not a bitwise Wasmtime Store dump |
 | bwrap+Landlock adapter (#410) | ✅ | `crates/sentinel-sandbox/src/nano.rs` implements the same contract with config+filesystem snapshot semantics, not process RAM or CRIU checkpointing |
 | Registry and workload selection (#411) | ✅ | `NanoRuntimeRegistry` selects explicit workload runtime keys with only configured fallback policy; `services/sentinel-daemon/tests/nano_runtime_registry.rs` covers `ecs-native`, `wasm-wasmtime`, and `bwrap-landlock` routing |
+| microVM adapter + local live-migration (#417 / #413) | 🟡 | `crates/sentinel-microvm/src/{microvm,firecracker}.rs` implements the contract and passes the conformance harness (live-verified on the Deploy-VM, real Firecracker/KVM); #413 adds local ECS-native live-migration (`POST /operator/migrate` → `MigrationCompleted` event, live-verified). **Adapter + conformance only — like all four adapters, microVM is not yet wired into the productive daemon spawn path (`spawn_agent_full` uses `SandboxEnforcer`/`RuntimeOrchestrator` directly, not the registry); that productive `NanoRuntimeRegistry` integration is tracked in #472 (open)** |
 | Cross-architecture gate (#394/#406) | 🟡 | DEV-007 keeps cross-architecture replay, snapshot, and isolation evidence as a gate for runtime families that leave the local ECS/native host boundary |
-| Tracking epic (#397)          | 🟡 | #397 remains the Cluster 12 tracking epic; #407-#411 deliver the first coherent contract chain but microVM and cross-node live migration remain out of scope |
+| Tracking epic (#397)          | 🟡 | #397 remains the Cluster 12 tracking epic; #407-#411 deliver the first coherent contract chain and #413/#417 add local live-migration + the microVM adapter (see above). Productive `NanoRuntimeRegistry` integration into the daemon spawn path (#472) and cross-node live migration remain out of scope |
 
 ---
 

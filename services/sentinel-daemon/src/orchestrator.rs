@@ -755,6 +755,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let (restore_tx, restore_rx) = mpsc::channel::<sentinel_common::OperatorRestoreCommand>();
     let (config_apply_tx, config_apply_rx) =
         mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>();
+    let (migrate_tx, migrate_rx) = mpsc::channel::<sentinel_common::OperatorMigrateCommand>();
     let (prune_tx, prune_rx) = mpsc::channel::<i64>();
     let (evolution_result_tx, evolution_result_rx) = mpsc::channel::<EvolutionResult>();
     let evolution_job_tx = crate::evolution_task::spawn_evolution_background_task(
@@ -888,6 +889,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 snapshot_tx.clone(),
                 restore_tx.clone(),
                 config_apply_tx.clone(),
+                migrate_tx.clone(),
                 config.max_agents,
                 agent_validation,
                 Arc::clone(&event_store),
@@ -962,6 +964,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 snapshot_rx,
                 restore_rx,
                 config_apply_rx,
+                migrate_rx,
                 ecs_config_dir,
                 ecs_max_agents,
                 agent_validation,
@@ -2322,6 +2325,7 @@ fn ecs_tick_loop(
     snapshot_rx: mpsc::Receiver<sentinel_common::OperatorSnapshotCommand>,
     restore_rx: mpsc::Receiver<sentinel_common::OperatorRestoreCommand>,
     config_apply_rx: mpsc::Receiver<sentinel_common::OperatorConfigApplyCommand>,
+    migrate_rx: mpsc::Receiver<sentinel_common::OperatorMigrateCommand>,
     config_dir: std::path::PathBuf,
     config_apply_max_agents: usize,
     config_apply_validation: sentinel_common::agent_config::AgentConfigValidation,
@@ -4698,6 +4702,80 @@ fn ecs_tick_loop(
             );
         }
 
+        // Nano-Container Live-Migration via Operator-API (#413): orchestrator-getriebener,
+        // lokaler Snapshot->Restore-Handoff einer ECS-native-Instanz (Time-Machine-Audit).
+        // Migriert wird die aus dem Live-Welt-Snapshot abgeleitete Instanz — die Live-Daemon-Welt
+        // bleibt unangetastet (LOKAL). Cross-node/Netzwerk-Migration ist out-of-scope (Multi-Node-gated).
+        while let Ok(migrate_cmd) = migrate_rx.try_recv() {
+            let reason = if migrate_cmd.reason.trim().is_empty() {
+                "manual".to_string()
+            } else {
+                migrate_cmd.reason.clone()
+            };
+            info!(%reason, "Nano-Container Live-Migration gestartet (lokal, ECS-native)");
+
+            // 1. Read-only ECS-Snapshot der Live-Welt ziehen (Welt bleibt unangetastet).
+            let ecs_snapshot = sentinel_ecs::snapshot_ecs_state(&mut world);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let workload_id = format!("ecs-world-migrate-{now_ms}");
+
+            // 2. Handoff via NanoRuntime-Vertrag (snapshot(source)->restore(target)->terminate) +
+            //    lokale Migrations-Latenz messen.
+            let started = std::time::Instant::now();
+            match sentinel_runtime::migrate_ecs_native_instance(
+                &ecs_snapshot,
+                config_apply_max_agents,
+                &workload_id,
+            ) {
+                Ok(outcome) => {
+                    let duration_ms = started.elapsed().as_millis() as u64;
+
+                    // 3. Telemetrie-Counter (Migrations-Gesamtzahl).
+                    sentinel_telemetry::MetricsRegistry::global()
+                        .counter("sentinel_daemon_migrations_total")
+                        .increment();
+
+                    // 4. MigrationCompleted-DomainEvent (Audit-Trail in der Time Machine).
+                    let payload = DomainEventPayload::MigrationCompleted {
+                        runtime_key: outcome.runtime_key,
+                        workload_id: workload_id.clone(),
+                        agent_count: outcome.agent_count,
+                        from_handle: outcome.from_handle,
+                        to_handle: outcome.to_handle,
+                        duration_ms,
+                        reason: reason.clone(),
+                    };
+                    let event = DomainEvent::new(
+                        payload.event_type_str(),
+                        "platform",
+                        &payload.to_json(),
+                        &format!("migrate-{now_ms}"),
+                        tick_count,
+                    );
+                    if let Some(es) = world
+                        .get_resource::<sentinel_ecs::LimboEventStore>()
+                        .map(|e| Arc::clone(&e.0))
+                    {
+                        if let Err(e) = es.append_event(&event) {
+                            warn!(error = %e, "MigrationCompleted-Event konnte nicht persistiert werden");
+                        }
+                    }
+                    info!(
+                        agents = outcome.agent_count,
+                        duration_ms,
+                        %reason,
+                        "Nano-Container Live-Migration abgeschlossen (lokal)"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "Nano-Container Live-Migration fehlgeschlagen");
+                }
+            }
+        }
+
         // eBPF Metrics Collection (Intervall konfigurierbar fuer deterministische PCP-Tests)
         let ebpf_collect_interval = platform_cp.config().ebpf_collect_interval_ticks.max(1);
         if tick_count > 0 && tick_count.is_multiple_of(ebpf_collect_interval) {
@@ -5322,6 +5400,7 @@ mod tests {
             mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
             mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
             mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+            mpsc::channel::<sentinel_common::OperatorMigrateCommand>().1,
             std::path::PathBuf::from("/tmp/sentinel-test-config-apply"),
             10,
             sentinel_common::agent_config::AgentConfigValidation::default(),
@@ -5411,6 +5490,7 @@ mod tests {
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorMigrateCommand>().1,
                 std::path::PathBuf::from("/tmp/sentinel-test-config-apply"),
                 10,
                 sentinel_common::agent_config::AgentConfigValidation::default(),
@@ -5517,6 +5597,7 @@ mod tests {
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorMigrateCommand>().1,
                 std::path::PathBuf::from("/tmp/sentinel-test-config-apply"),
                 10,
                 sentinel_common::agent_config::AgentConfigValidation::default(),
@@ -5631,6 +5712,7 @@ mod tests {
                 mpsc::channel::<sentinel_common::OperatorSnapshotCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorRestoreCommand>().1,
                 mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>().1,
+                mpsc::channel::<sentinel_common::OperatorMigrateCommand>().1,
                 std::path::PathBuf::from("/tmp/sentinel-test-config-apply"),
                 10,
                 sentinel_common::agent_config::AgentConfigValidation::default(),

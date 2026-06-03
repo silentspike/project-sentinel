@@ -1,0 +1,18 @@
+[package]
+name = "sentinel-microvm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+sentinel-common = { path = "../sentinel-common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# test-util aktiviert das conformance-Modul in sentinel-common (sonst hinter
+# #[cfg(any(test, feature = "test-util"))] ausgeblendet) — wie bei den anderen Adapter-Crates.
+sentinel-common = { path = "../sentinel-common", features = ["test-util"] }
