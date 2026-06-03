@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use anyhow::Context;
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, info_span};
 
 use sentinel_daemon::config::DaemonConfig;
 
@@ -27,16 +27,36 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
+    let runtime = match tokio::runtime::Runtime::new().context("Tokio Runtime erstellen") {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("Daemon fehlgeschlagen: {e:#}");
+            return ExitCode::from(1);
+        }
+    };
+    let observability = match runtime
+        .block_on(async { sentinel_telemetry::init_observability("sentinel-daemon") })
+    {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("Observability-Initialisierung fehlgeschlagen: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let otlp_enabled = observability.otlp_enabled();
 
-    match run(cli) {
+    {
+        let span = info_span!(
+            "sentinel_daemon.bootstrap",
+            service = "sentinel-daemon",
+            otlp_enabled
+        );
+        let _entered = span.enter();
+        info!("Observability initialisiert");
+    }
+
+    match run(cli, &runtime) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!(error = %e, "Daemon fehlgeschlagen");
@@ -45,9 +65,13 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> anyhow::Result<()> {
-    let config = DaemonConfig::load(Path::new(&cli.config))
-        .with_context(|| format!("Config laden: {}", cli.config))?;
+fn run(cli: Cli, runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+    let config = {
+        let span = info_span!("sentinel_daemon.config_load", config_path = %cli.config);
+        let _entered = span.enter();
+        DaemonConfig::load(Path::new(&cli.config))
+            .with_context(|| format!("Config laden: {}", cli.config))?
+    };
 
     info!(
         config_dir = %config.config_dir.display(),
@@ -61,8 +85,6 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         return dry_run(&config);
     }
 
-    // Tokio Runtime fuer async I/O
-    let runtime = tokio::runtime::Runtime::new().context("Tokio Runtime erstellen")?;
     runtime.block_on(sentinel_daemon::orchestrator::run(config))
 }
 

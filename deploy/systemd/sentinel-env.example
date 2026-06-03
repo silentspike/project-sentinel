@@ -18,3 +18,14 @@ CORTEX_GATEWAY_URL=http://127.0.0.1:8080
 
 # Logging
 RUST_LOG=info
+
+# OTLP tracing (default off). `sentinel-daemon` is wired to this production path.
+SENTINEL_OTLP_ENABLED=false
+# Supported values: http, grpc
+SENTINEL_OTLP_PROTOCOL=http
+# HTTP/protobuf default: http://127.0.0.1:4318/v1/traces
+# gRPC default:         http://127.0.0.1:4317
+# SENTINEL_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces
+SENTINEL_OTLP_SERVICE_NAME=sentinel-daemon
+SENTINEL_OTLP_TIMEOUT_MS=3000
+SENTINEL_OTLP_BATCH_MS=5000

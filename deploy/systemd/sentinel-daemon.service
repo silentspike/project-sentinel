@@ -9,6 +9,7 @@ StartLimitIntervalSec=300
 [Service]
 Type=simple
 WorkingDirectory=/opt/sentinel
+EnvironmentFile=-/etc/sentinel/env
 ExecStart=/opt/sentinel/bin/sentinel-daemon --config /opt/sentinel/config/daemon.toml
 Restart=on-failure
 RestartSec=5

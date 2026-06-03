@@ -8,6 +8,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use sentinel_telemetry::metrics::MetricsRegistry;
+use tracing::info_span;
 
 // ──────────────────────────────────────────────
 // 1. Counter — Budget: < 1 ns per increment
@@ -192,6 +193,24 @@ fn bench_snapshot_raw(c: &mut Criterion) {
     group.finish();
 }
 
+// ──────────────────────────────────────────────
+// 6. Span enter/exit — Disabled OTLP hot path
+// ──────────────────────────────────────────────
+
+fn bench_span_enter_exit_disabled(c: &mut Criterion) {
+    let mut group = c.benchmark_group("span_enter_exit");
+
+    group.bench_function("disabled_dispatch", |b| {
+        b.iter(|| {
+            let span = info_span!("bench_disabled_span", tick = 1u64);
+            let _entered = span.enter();
+            black_box(1u64);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_counter_increment,
@@ -199,5 +218,6 @@ criterion_group!(
     bench_gauge_operations,
     bench_registry_lookup,
     bench_snapshot_raw,
+    bench_span_enter_exit_disabled,
 );
 criterion_main!(benches);

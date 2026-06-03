@@ -86,7 +86,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | eBPF probes (write-syscall, stall) | ✅ | `crates/sentinel-ebpf/`; #380 Deploy-VM evidence shows `mode=kernel`, ring drops 0, I/O read/write values, TCP request deltas, and dashboard eBPF cards without `N/A` |
 | MARBLE Observatory            | ✅ | `cmd/cortex-gateway/internal/observatory/` |
 | Dashboard polling efficiency (#277) | ✅ | Projection-owned `projection_watermarks` table gives one indexed change-detection lookup per active WebSocket poll; Deploy-VM evidence on Intel i7-3930K @ 3.20 GHz (2011), gateway inactive, 3-tab Playwright: no `ERR_INSUFFICIENT_RESOURCES` |
-| OTel tracing                  | 🟡 | structured spans in place, OTLP exporter behind feature flag |
+| OTel tracing                  | ✅ | `sentinel-telemetry::init_observability` provides a default-off production OTLP path; `sentinel-daemon` is wired to export real bootstrap/config-load spans over HTTP or gRPC via `SENTINEL_OTLP_*` |
 
 ## Cluster 06 — Performance & Hardware
 
