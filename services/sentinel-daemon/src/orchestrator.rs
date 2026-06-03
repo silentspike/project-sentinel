@@ -3121,10 +3121,13 @@ fn ecs_tick_loop(
                     crate::platform_controlplane::rules::PlatformSideEffect::TriggerPrune(
                         _cutoff,
                     ) => {
-                        // Auto-detect cutoff: nutze bestehenden SnapshotManager
+                        // Auto-detect cutoff: behalte die 2 neuesten World-Snapshots (Restore-Puffer),
+                        // prune alle Events davor. list_world_snapshots() liefert ORDER BY tick DESC,
+                        // also ist der zweitneueste Snapshot Index 1 (NICHT len-2 = zweitältester — #475:
+                        // der Index-Bug ergab einen uralten cutoff < min(event_id) → prune loeschte nie etwas).
                         if let Ok(snapshots) = event_store_for_prune.list_world_snapshots() {
                             if snapshots.len() >= 2 {
-                                let prune_point = snapshots[snapshots.len() - 2].last_event_id;
+                                let prune_point = snapshots[1].last_event_id;
                                 snapshot_manager.start_prune(prune_point);
                             }
                         }
@@ -4950,6 +4953,47 @@ mod tests {
         );
         assert!(parse_judge_alert_agent_id("AGENT-121", bounds).is_err());
         assert!(parse_judge_alert_agent_id("agent-75", bounds).is_err());
+    }
+
+    #[test]
+    fn degraded_agent_recorded_in_security_runtime_state() {
+        // #378/#375: Agenten ohne vollstaendige Sandbox (bwrap-Start-Fehler,
+        // kein cgroup oder Sandbox-Setup-Fehler) muessen trotzdem im
+        // Security-Runtime-State erscheinen — sonst verliert die Operator-
+        // Security-API degradierte Agenten komplett aus der Sicht.
+        let state: operator_api::SharedSecurityRuntimeState = Default::default();
+        record_security_runtime_snapshot(&state, AgentId(7), "Thomas Mueller", None, None);
+
+        let guard = state.read().unwrap();
+        let snap = guard.get(&7).expect("degradierter Agent muss erfasst sein");
+        assert_eq!(snap.agent_id, 7);
+        assert_eq!(snap.aggregate_id, "AGENT-07");
+        assert_eq!(snap.bwrap_pid, None, "degraded => kein bwrap-PID");
+        assert_eq!(snap.fs_mount, None);
+        assert_eq!(
+            snap.home_host_path, "/ram/agents/Thomas Mueller",
+            "ohne fs_mount faellt der Home-Pfad auf /ram/agents/<name> zurueck"
+        );
+    }
+
+    #[test]
+    fn healthy_agent_records_pid_and_mount_home() {
+        // Kontrast zum degraded-Pfad: mit bwrap-PID + Mount wird der Home-Pfad
+        // aus Mount + aggregate_id gebildet (nicht der /ram-Fallback).
+        let state: operator_api::SharedSecurityRuntimeState = Default::default();
+        record_security_runtime_snapshot(
+            &state,
+            AgentId(3),
+            "Lisa Brenner",
+            Some(4242),
+            Some("/cas/mnt"),
+        );
+
+        let guard = state.read().unwrap();
+        let snap = guard.get(&3).expect("Agent muss erfasst sein");
+        assert_eq!(snap.bwrap_pid, Some(4242));
+        assert_eq!(snap.fs_mount.as_deref(), Some("/cas/mnt"));
+        assert_eq!(snap.home_host_path, "/cas/mnt/AGENT-03");
     }
 
     fn record_projection_restart(_service_name: &str) -> bool {
