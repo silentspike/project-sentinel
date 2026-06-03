@@ -18,6 +18,7 @@ pub mod auth;
 pub mod cas;
 pub mod cockpit;
 pub mod codec;
+pub mod config;
 pub mod control;
 pub mod event_sub;
 pub mod events;
@@ -60,12 +61,21 @@ pub struct Config {
     /// Log-Label fuer den Event-Subscriber (#432). NICHT der NATS-durable-Name — der Consumer ist
     /// ephemeral (serverseitig generierter Name). Default `dashboard-live`.
     pub nats_consumer: String,
+    /// Verzeichnis mit der Plattform-Config (Agent-TOMLs, rooms.toml, daemon.toml) — read-only fuer #420.
+    pub config_dir: String,
+    /// `[daemon].max_agents` aus daemon.toml (Single-Source wie der Daemon); None = lenient (Daemon
+    /// bleibt finale Validierungs-Autoritaet). Siehe `config::read_max_agents`.
+    pub max_agents: Option<usize>,
 }
 
 impl Config {
     /// Liest die Konfiguration aus der Umgebung (Defaults = lokale Single-VM-Deploy).
     pub fn from_env() -> Self {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let config_dir =
+            env("SENTINEL_CONFIG_DIR").unwrap_or_else(|| "/opt/sentinel/config".into());
+        // max_agents aus derselben daemon.toml wie der Daemon (Single-Source, kein Drift).
+        let max_agents = config::read_max_agents(&config_dir);
         Self {
             dashboard_api_key: env("SENTINEL_DASHBOARD_API_KEY"),
             http_bind: env("SENTINEL_DASHBOARD_HTTP_BIND").unwrap_or_else(|| "0.0.0.0:8001".into()),
@@ -96,6 +106,8 @@ impl Config {
             nats_url: env("SENTINEL_NATS_URL").unwrap_or_else(|| "nats://127.0.0.1:4222".into()),
             nats_consumer: env("SENTINEL_DASHBOARD_NATS_CONSUMER")
                 .unwrap_or_else(|| "dashboard-live".into()),
+            config_dir,
+            max_agents,
         }
     }
 }
@@ -208,6 +220,18 @@ pub fn build_app(state: AppState) -> axum::Router {
             auth::require_auth,
         ));
 
+    // #420: Config Read+Write — EIGENE Gruppe (NICHT `/control/config`, das proxyt die Gateway-LLM-Config).
+    // READ geparst (agents/rooms) + daemon.toml-Rohtext; WRITE validiert + proxyt an #425 (Daemon=Schreiber).
+    let config_routes = axum::Router::new()
+        .route("/agents", get(config::get_agents))
+        .route("/rooms", get(config::get_rooms))
+        .route("/daemon", get(config::get_daemon))
+        .route("/apply", post(config::apply))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+
     let api = axum::Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -227,7 +251,8 @@ pub fn build_app(state: AppState) -> axum::Router {
         .route("/health", get(health))
         .merge(read_routes)
         .nest("/control", control_routes)
-        .nest("/operator", operator_routes);
+        .nest("/operator", operator_routes)
+        .nest("/config", config_routes);
 
     axum::Router::new()
         .nest("/api", api)
