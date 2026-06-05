@@ -57,6 +57,9 @@ pub fn evaluate_rules(
     // Synthesis-Agents machen 0 Kernel-Syscalls → eBPF meldet sie als "stalled",
     // aber sie produzieren aktiv Actions. Erst despawnen wenn WIRKLICH tot.
     for agent_name in &metrics.stalled_agents {
+        if metrics.llm_circuit_open {
+            continue;
+        }
         // Agent hat kuerzlich eine Action ausgefuehrt → nicht stalled
         if let Some(&last_tick) = metrics.last_action_ticks.get(agent_name) {
             if tick >= last_tick
@@ -513,6 +516,7 @@ mod tests {
     fn test_stall_rule_generates_restart_side_effect() {
         let metrics = PlatformMetrics {
             stalled_agents: vec!["Thomas Mueller".to_string()],
+            llm_circuit_open: false,
             ..Default::default()
         };
         let mut name_to_id = HashMap::new();
@@ -531,6 +535,66 @@ mod tests {
         assert!(matches!(
             &actions[0].side_effect,
             Some(PlatformSideEffect::RestartAgent(id)) if *id == AgentId(1)
+        ));
+    }
+
+    #[test]
+    fn test_stall_rule_suppressed_when_llm_circuit_open() {
+        let metrics = PlatformMetrics {
+            stalled_agents: vec!["Thomas Mueller".to_string()],
+            llm_circuit_open: true,
+            ..Default::default()
+        };
+        let name_to_id = HashMap::from([("Thomas Mueller".to_string(), AgentId(1))]);
+
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &test_config(),
+            &HashMap::new(),
+            &name_to_id,
+        );
+
+        assert!(
+            actions.iter().all(|action| !matches!(
+                action.side_effect,
+                Some(PlatformSideEffect::RestartAgent(_))
+            )),
+            "open LLM circuit must suppress agent stall restarts"
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.rule_name != "agent_stall"),
+            "open LLM circuit must suppress only the agent_stall rule"
+        );
+    }
+
+    #[test]
+    fn test_llm_circuit_open_does_not_suppress_service_health() {
+        let metrics = PlatformMetrics {
+            stalled_agents: vec!["Thomas Mueller".to_string()],
+            failed_services: vec!["sentinel-judge".to_string()],
+            llm_circuit_open: true,
+            ..Default::default()
+        };
+        let name_to_id = HashMap::from([("Thomas Mueller".to_string(), AgentId(1))]);
+
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &test_config(),
+            &HashMap::new(),
+            &name_to_id,
+        );
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].rule_name, "service_health");
+        assert!(matches!(
+            &actions[0].side_effect,
+            Some(PlatformSideEffect::RestartService(service)) if service == "sentinel-judge"
         ));
     }
 
