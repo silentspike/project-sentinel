@@ -1535,6 +1535,44 @@ struct RuntimeReconcileContext<'a> {
     is_service_active_fn: fn(&str) -> bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeReconcileSource {
+    Operator,
+    Periodic,
+}
+
+impl RuntimeReconcileSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Periodic => "periodic",
+        }
+    }
+
+    fn is_periodic(self) -> bool {
+        matches!(self, Self::Periodic)
+    }
+}
+
+fn should_run_periodic_runtime_reconcile(
+    config: &crate::config::PlatformControlplaneConfig,
+    tick_count: u64,
+) -> bool {
+    config.runtime_reconcile_enabled
+        && tick_count > 0
+        && tick_count.is_multiple_of(config.runtime_reconcile_interval_ticks.max(1))
+}
+
+fn periodic_runtime_reconcile_request(
+    config: &crate::config::PlatformControlplaneConfig,
+) -> RuntimeReconcileRequest {
+    RuntimeReconcileRequest {
+        dry_run: false,
+        projection_rebuild: config.runtime_reconcile_projection_rebuild,
+        respawn_missing: config.runtime_reconcile_respawn_missing,
+    }
+}
+
 fn runtime_agent_is_healthy(agent: &runtime_health::RuntimeHealthAgentSnapshot) -> bool {
     agent.runtime_present
         && agent.projection_present
@@ -1683,10 +1721,63 @@ fn remove_agent_runtime_fragments(
     stats
 }
 
+#[allow(clippy::too_many_arguments)]
+fn execute_runtime_reconcile(
+    tick_count: u64,
+    current_shift: u8,
+    all_agents: &[AgentConfig],
+    world: &mut bevy_ecs::prelude::World,
+    runtime_orch: &mut RuntimeOrchestrator,
+    sandbox: &SandboxEnforcer,
+    sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &mut EbpfCollector,
+    agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    agent_command: &[String],
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    event_store: &Arc<EventStore>,
+    runtime_health: &crate::runtime_health::SharedRuntimeHealthState,
+    projection_db_path: &str,
+    operator_auth_required: bool,
+    service_health_state: crate::service_health::ServiceHealthWorkerSnapshot,
+    fs_mount: Option<&str>,
+    request: RuntimeReconcileRequest,
+    respawn_backoff: &mut RespawnBackoffTracker,
+    source: RuntimeReconcileSource,
+) -> RuntimeReconcileResponse {
+    let projection_path = std::path::Path::new(projection_db_path);
+    let data_dir = projection_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut reconcile_ctx = RuntimeReconcileContext {
+        tick_count,
+        current_shift,
+        all_agents,
+        world,
+        runtime_orch,
+        sandbox,
+        sandbox_handles,
+        ebpf_collector,
+        agent_processes,
+        agent_command,
+        security_runtime_state,
+        event_store,
+        runtime_health,
+        projection_db_path: projection_path,
+        operator_auth_required,
+        service_health_state,
+        fs_mount,
+        data_dir,
+        restart_service_fn: crate::service_health::restart_service_now,
+        is_service_active_fn: crate::service_health::is_service_active_now,
+    };
+    run_runtime_reconcile(&mut reconcile_ctx, request, respawn_backoff, source)
+}
+
 fn run_runtime_reconcile(
     ctx: &mut RuntimeReconcileContext<'_>,
     request: RuntimeReconcileRequest,
     respawn_backoff: &mut RespawnBackoffTracker,
+    source: RuntimeReconcileSource,
 ) -> RuntimeReconcileResponse {
     let elapsed_started = std::time::Instant::now();
     let previous = ctx
@@ -1989,6 +2080,11 @@ fn run_runtime_reconcile(
         Some(&before),
     );
     after.reconcile_runs_total = before.reconcile_runs_total.saturating_add(1);
+    if source.is_periodic() {
+        after.auto_reconcile_runs_total = before.auto_reconcile_runs_total.saturating_add(1);
+    }
+    after.last_reconcile_tick = ctx.tick_count;
+    after.last_reconcile_source = source.as_str().to_string();
     after.reconcile_repairs_total = before
         .reconcile_repairs_total
         .saturating_add(repair_ops_total as u64);
@@ -2912,34 +3008,28 @@ fn ecs_tick_loop(
                     request,
                     response_tx,
                 } => {
-                    let projection_path = std::path::Path::new(&projection_db_path);
-                    let data_dir = projection_path
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."));
-                    let mut reconcile_ctx = RuntimeReconcileContext {
+                    let response = execute_runtime_reconcile(
                         tick_count,
                         current_shift,
-                        all_agents: &all_agents,
-                        world: &mut world,
-                        runtime_orch: &mut runtime_orch,
-                        sandbox: &sandbox,
-                        sandbox_handles: &mut sandbox_handles,
-                        ebpf_collector: &mut ebpf_collector,
-                        agent_processes: &mut agent_processes,
-                        agent_command: &agent_command,
-                        security_runtime_state: &security_runtime_state,
-                        event_store: &event_store_for_prune,
-                        runtime_health: &runtime_health,
-                        projection_db_path: projection_path,
+                        &all_agents,
+                        &mut world,
+                        &mut runtime_orch,
+                        &sandbox,
+                        &mut sandbox_handles,
+                        &mut ebpf_collector,
+                        &mut agent_processes,
+                        &agent_command,
+                        &security_runtime_state,
+                        &event_store_for_prune,
+                        &runtime_health,
+                        &projection_db_path,
                         operator_auth_required,
-                        service_health_state: service_health_checker.worker_state(),
-                        fs_mount: fs_mount.as_deref(),
-                        data_dir,
-                        restart_service_fn: crate::service_health::restart_service_now,
-                        is_service_active_fn: crate::service_health::is_service_active_now,
-                    };
-                    let response =
-                        run_runtime_reconcile(&mut reconcile_ctx, request, &mut respawn_backoff);
+                        service_health_checker.worker_state(),
+                        fs_mount.as_deref(),
+                        request,
+                        &mut respawn_backoff,
+                        RuntimeReconcileSource::Operator,
+                    );
                     let _ = response_tx.send(response);
                 }
                 RuntimeControlCommand::AnalysisFloodTest {
@@ -3294,6 +3384,41 @@ fn ecs_tick_loop(
                     }
                 }
             }
+        }
+        if should_run_periodic_runtime_reconcile(platform_cp.config(), tick_count) {
+            let request = periodic_runtime_reconcile_request(platform_cp.config());
+            let response = execute_runtime_reconcile(
+                tick_count,
+                current_shift,
+                &all_agents,
+                &mut world,
+                &mut runtime_orch,
+                &sandbox,
+                &mut sandbox_handles,
+                &mut ebpf_collector,
+                &mut agent_processes,
+                &agent_command,
+                &security_runtime_state,
+                &event_store_for_prune,
+                &runtime_health,
+                &projection_db_path,
+                operator_auth_required,
+                service_health_checker.worker_state(),
+                fs_mount.as_deref(),
+                request,
+                &mut respawn_backoff,
+                RuntimeReconcileSource::Periodic,
+            );
+            debug!(
+                tick = tick_count,
+                elapsed_us = response.elapsed_us,
+                repairs = response.security_snapshots_removed
+                    + response.unexpected_runtime_removed
+                    + response.orphan_cgroups_removed
+                    + response.respawned_agents,
+                status = %response.repair_last_status,
+                "Periodischer Runtime-Reconcile abgeschlossen"
+            );
         }
         publish_platform_state_snapshot(
             &platform_state,
@@ -5273,6 +5398,116 @@ mod tests {
     }
 
     #[test]
+    fn should_run_periodic_runtime_reconcile_respects_due_rules() {
+        let mut config = crate::config::PlatformControlplaneConfig::default();
+
+        assert!(!should_run_periodic_runtime_reconcile(&config, 0));
+        assert!(!should_run_periodic_runtime_reconcile(&config, 59));
+        assert!(should_run_periodic_runtime_reconcile(&config, 60));
+        assert!(should_run_periodic_runtime_reconcile(&config, 120));
+
+        config.runtime_reconcile_enabled = false;
+        assert!(!should_run_periodic_runtime_reconcile(&config, 60));
+
+        config.runtime_reconcile_enabled = true;
+        config.runtime_reconcile_interval_ticks = 0;
+        assert!(should_run_periodic_runtime_reconcile(&config, 1));
+        assert!(should_run_periodic_runtime_reconcile(&config, 2));
+        assert!(!should_run_periodic_runtime_reconcile(&config, 0));
+    }
+
+    #[test]
+    fn periodic_runtime_reconcile_request_is_explicit_and_configured() {
+        let mut config = crate::config::PlatformControlplaneConfig::default();
+        config.runtime_reconcile_respawn_missing = false;
+        config.runtime_reconcile_projection_rebuild = false;
+
+        let request = periodic_runtime_reconcile_request(&config);
+
+        assert!(!request.dry_run);
+        assert!(!request.respawn_missing);
+        assert!(!request.projection_rebuild);
+    }
+
+    #[test]
+    fn runtime_reconcile_records_operator_and_periodic_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.db");
+        let projection_path = tmp.path().join("projection.db");
+        let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
+        let (mut world, _schedule) = create_simulation_world();
+        let sandbox = test_sandbox();
+        let (mut ebpf_collector, _ebpf_tx) = test_ebpf();
+        let mut runtime_orch =
+            RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
+        let mut sandbox_handles = HashMap::new();
+        let mut agent_processes = HashMap::new();
+        let security_runtime_state = Arc::new(RwLock::new(HashMap::new()));
+        let runtime_health = Arc::new(RwLock::new(
+            crate::runtime_health::RuntimeHealthSnapshot::default(),
+        ));
+        let mut respawn_backoff = RespawnBackoffTracker::new(3);
+        let mut reconcile_ctx = RuntimeReconcileContext {
+            tick_count: 10,
+            current_shift: 1,
+            all_agents: &[],
+            world: &mut world,
+            runtime_orch: &mut runtime_orch,
+            sandbox: &sandbox,
+            sandbox_handles: &mut sandbox_handles,
+            ebpf_collector: &mut ebpf_collector,
+            agent_processes: &mut agent_processes,
+            agent_command: &[],
+            security_runtime_state: &security_runtime_state,
+            event_store: &event_store,
+            runtime_health: &runtime_health,
+            projection_db_path: &projection_path,
+            operator_auth_required: false,
+            service_health_state: crate::service_health::ServiceHealthWorkerSnapshot::default(),
+            fs_mount: None,
+            data_dir: tmp.path(),
+            restart_service_fn: record_projection_restart,
+            is_service_active_fn: projection_service_active,
+        };
+        let request = RuntimeReconcileRequest {
+            dry_run: true,
+            projection_rebuild: false,
+            respawn_missing: false,
+        };
+
+        let operator_response = run_runtime_reconcile(
+            &mut reconcile_ctx,
+            request.clone(),
+            &mut respawn_backoff,
+            RuntimeReconcileSource::Operator,
+        );
+        assert!(operator_response.accepted);
+        {
+            let snapshot = runtime_health.read().unwrap();
+            assert_eq!(snapshot.reconcile_runs_total, 1);
+            assert_eq!(snapshot.auto_reconcile_runs_total, 0);
+            assert_eq!(snapshot.last_reconcile_tick, 10);
+            assert_eq!(snapshot.last_reconcile_source, "operator");
+        }
+
+        reconcile_ctx.tick_count = 60;
+        let periodic_response = run_runtime_reconcile(
+            &mut reconcile_ctx,
+            request,
+            &mut respawn_backoff,
+            RuntimeReconcileSource::Periodic,
+        );
+        assert!(periodic_response.accepted);
+        {
+            let snapshot = runtime_health.read().unwrap();
+            assert_eq!(snapshot.reconcile_runs_total, 2);
+            assert_eq!(snapshot.auto_reconcile_runs_total, 1);
+            assert_eq!(snapshot.last_reconcile_tick, 60);
+            assert_eq!(snapshot.last_reconcile_source, "periodic");
+        }
+    }
+
+    #[test]
     fn test_suspend_pids_stops_tracked_process() {
         let mut child = std::process::Command::new("sleep")
             .arg("30")
@@ -5414,6 +5649,7 @@ mod tests {
                 respawn_missing: false,
             },
             &mut respawn_backoff,
+            RuntimeReconcileSource::Operator,
         );
 
         assert!(response.projection_drift_before);
