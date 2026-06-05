@@ -840,6 +840,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let runtime_health = Arc::new(RwLock::new(
         crate::runtime_health::RuntimeHealthSnapshot::default(),
     ));
+    let llm_circuit_open = Arc::new(AtomicBool::new(false));
     let security_runtime_state: operator_api::SharedSecurityRuntimeState =
         Arc::new(RwLock::new(HashMap::new()));
     let projection_db_path = data_dir.join("projection.db").to_string_lossy().to_string();
@@ -999,6 +1000,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let events_db_path = events_path.to_string_lossy().to_string();
     let ecs_platform_state = Arc::clone(&platform_state);
     let ecs_runtime_health = Arc::clone(&runtime_health);
+    let ecs_llm_circuit_open = Arc::clone(&llm_circuit_open);
     let ecs_security_runtime_state = Arc::clone(&security_runtime_state);
     let ecs_fs_mount = active_fs_mount.clone();
     let ecs_projection_db_path = projection_db_path.clone();
@@ -1049,6 +1051,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 events_db_path,
                 ecs_platform_state,
                 ecs_runtime_health,
+                ecs_llm_circuit_open,
                 ecs_security_runtime_state,
                 ecs_projection_db_path,
                 operator_auth_required,
@@ -1107,6 +1110,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             bridge_action_tx,
             bridge_telem,
             Arc::clone(&state_store),
+            Arc::clone(&llm_circuit_open),
         ))
     };
 
@@ -1313,6 +1317,7 @@ fn collect_platform_metrics_snapshot(
     events_db_path_str: &str,
     tick_count: u64,
     service_health_checker: &crate::service_health::ServiceHealthChecker,
+    llm_circuit_open: &AtomicBool,
 ) -> (
     crate::platform_controlplane::metrics::PlatformMetrics,
     std::collections::HashMap<String, sentinel_common::AgentId>,
@@ -1337,6 +1342,7 @@ fn collect_platform_metrics_snapshot(
         &agent_names,
         tick_count,
         failed_services,
+        llm_circuit_open,
     );
     for handle in runtime_orch.agents().values() {
         pcp_metrics
@@ -2504,6 +2510,7 @@ fn ecs_tick_loop(
     events_db_path_str: String,
     platform_state: Arc<RwLock<crate::platform_controlplane::PlatformStateSnapshot>>,
     runtime_health: crate::runtime_health::SharedRuntimeHealthState,
+    llm_circuit_open: Arc<AtomicBool>,
     security_runtime_state: operator_api::SharedSecurityRuntimeState,
     projection_db_path: String,
     operator_auth_required: bool,
@@ -3259,6 +3266,7 @@ fn ecs_tick_loop(
                 &events_db_path_str,
                 tick_count,
                 &service_health_checker,
+                llm_circuit_open.as_ref(),
             );
             let output = platform_cp.cycle(
                 &pcp_metrics,
@@ -5748,6 +5756,7 @@ mod tests {
             Arc::new(RwLock::new(
                 crate::runtime_health::RuntimeHealthSnapshot::default(),
             )),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(RwLock::new(HashMap::new())),
             String::new(),
             false,
@@ -5838,6 +5847,7 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::runtime_health::RuntimeHealthSnapshot::default(),
                 )),
+                Arc::new(AtomicBool::new(false)),
                 Arc::new(RwLock::new(HashMap::new())),
                 String::new(),
                 false,
@@ -5945,6 +5955,7 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::runtime_health::RuntimeHealthSnapshot::default(),
                 )),
+                Arc::new(AtomicBool::new(false)),
                 Arc::new(RwLock::new(HashMap::new())),
                 String::new(),
                 false,
@@ -6060,6 +6071,7 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::runtime_health::RuntimeHealthSnapshot::default(),
                 )),
+                Arc::new(AtomicBool::new(false)),
                 Arc::new(RwLock::new(HashMap::new())),
                 String::new(),
                 false,
