@@ -68,6 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_events_aggregate ON events(aggregate_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type, id);
 CREATE INDEX IF NOT EXISTS idx_events_correlation ON events(correlation_id);
 CREATE INDEX IF NOT EXISTS idx_events_causation ON events(causation_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id ON events(event_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_operation ON events(operation_id)
 `
 
@@ -78,10 +79,15 @@ const createOutbox = `CREATE TABLE IF NOT EXISTS outbox (
 	payload TEXT NOT NULL,
 	status TEXT NOT NULL DEFAULT 'pending',
 	created_at INTEGER NOT NULL,
-	published_at INTEGER
+	published_at INTEGER,
+	retry_count INTEGER NOT NULL DEFAULT 0,
+	last_error TEXT
 )`
 
-const createOutboxIndex = `CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(status) WHERE status = 'pending'`
+const createOutboxIndex = `
+CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(status) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_outbox_event_id ON outbox(event_id)
+`
 
 const pragmas = `
 PRAGMA journal_mode = WAL;
@@ -117,12 +123,57 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("eventstore create outbox: %w", err)
 	}
+	if err := ensureOutboxColumns(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if _, err := db.Exec(createOutboxIndex); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("eventstore create outbox index: %w", err)
 	}
 
 	return &Store{db: db}, nil
+}
+
+func ensureOutboxColumns(db *sql.DB) error {
+	if ok, err := tableHasColumn(db, "outbox", "retry_count"); err != nil {
+		return err
+	} else if !ok {
+		if _, err := db.Exec(`ALTER TABLE outbox ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("eventstore migrate outbox retry_count: %w", err)
+		}
+	}
+	if ok, err := tableHasColumn(db, "outbox", "last_error"); err != nil {
+		return err
+	} else if !ok {
+		if _, err := db.Exec(`ALTER TABLE outbox ADD COLUMN last_error TEXT`); err != nil {
+			return fmt.Errorf("eventstore migrate outbox last_error: %w", err)
+		}
+	}
+	return nil
+}
+
+func tableHasColumn(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return false, fmt.Errorf("eventstore table info %s: %w", table, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return false, fmt.Errorf("eventstore scan table info %s: %w", table, err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // AppendWithOutbox atomically inserts a DomainEvent and an outbox entry

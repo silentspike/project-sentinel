@@ -807,7 +807,16 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                     serde_json::json!({"accepted": false, "message": "Zu wenige Snapshots fuer Pruning"}),
                 );
             }
-            let prune_point = snapshots[snapshots.len() - 2].last_event_id;
+            let prune_point = match crate::snapshot::prune_cutoff_from_ordered_snapshots(&snapshots)
+            {
+                Some(cutoff) => cutoff,
+                None => {
+                    return json_response(
+                        200,
+                        serde_json::json!({"accepted": false, "message": "Zu wenige Snapshots fuer Pruning"}),
+                    );
+                }
+            };
             if !state.event_store.can_prune(prune_point).unwrap_or(false) {
                 return json_response(
                     200,
