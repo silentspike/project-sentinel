@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, RwLock};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -841,6 +841,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         crate::runtime_health::RuntimeHealthSnapshot::default(),
     ));
     let llm_circuit_open = Arc::new(AtomicBool::new(false));
+    let llm_activity_ticks = Arc::new(Mutex::new(HashMap::<AgentId, u64>::new()));
     let security_runtime_state: operator_api::SharedSecurityRuntimeState =
         Arc::new(RwLock::new(HashMap::new()));
     let projection_db_path = data_dir.join("projection.db").to_string_lossy().to_string();
@@ -1001,6 +1002,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let ecs_platform_state = Arc::clone(&platform_state);
     let ecs_runtime_health = Arc::clone(&runtime_health);
     let ecs_llm_circuit_open = Arc::clone(&llm_circuit_open);
+    let ecs_llm_activity_ticks = Arc::clone(&llm_activity_ticks);
     let ecs_security_runtime_state = Arc::clone(&security_runtime_state);
     let ecs_fs_mount = active_fs_mount.clone();
     let ecs_projection_db_path = projection_db_path.clone();
@@ -1052,6 +1054,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 ecs_platform_state,
                 ecs_runtime_health,
                 ecs_llm_circuit_open,
+                ecs_llm_activity_ticks,
                 ecs_security_runtime_state,
                 ecs_projection_db_path,
                 operator_auth_required,
@@ -1111,6 +1114,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             bridge_telem,
             Arc::clone(&state_store),
             Arc::clone(&llm_circuit_open),
+            Arc::clone(&llm_activity_ticks),
         ))
     };
 
@@ -1318,6 +1322,7 @@ fn collect_platform_metrics_snapshot(
     tick_count: u64,
     service_health_checker: &crate::service_health::ServiceHealthChecker,
     llm_circuit_open: &AtomicBool,
+    llm_activity_ticks: &Mutex<HashMap<AgentId, u64>>,
 ) -> (
     crate::platform_controlplane::metrics::PlatformMetrics,
     std::collections::HashMap<String, sentinel_common::AgentId>,
@@ -1348,6 +1353,15 @@ fn collect_platform_metrics_snapshot(
         pcp_metrics
             .last_action_ticks
             .insert(handle.identity.name.clone(), handle.last_activity_tick.0);
+    }
+    if let Ok(llm_ticks) = llm_activity_ticks.lock() {
+        for (agent_id, last_tick) in llm_ticks.iter() {
+            if let Some(handle) = runtime_orch.agents().get(agent_id) {
+                pcp_metrics
+                    .last_llm_call_ticks
+                    .insert(handle.identity.name.clone(), *last_tick);
+            }
+        }
     }
     (pcp_metrics, agent_name_to_id)
 }
@@ -2511,6 +2525,7 @@ fn ecs_tick_loop(
     platform_state: Arc<RwLock<crate::platform_controlplane::PlatformStateSnapshot>>,
     runtime_health: crate::runtime_health::SharedRuntimeHealthState,
     llm_circuit_open: Arc<AtomicBool>,
+    llm_activity_ticks: Arc<Mutex<HashMap<AgentId, u64>>>,
     security_runtime_state: operator_api::SharedSecurityRuntimeState,
     projection_db_path: String,
     operator_auth_required: bool,
@@ -3267,6 +3282,7 @@ fn ecs_tick_loop(
                 tick_count,
                 &service_health_checker,
                 llm_circuit_open.as_ref(),
+                llm_activity_ticks.as_ref(),
             );
             let output = platform_cp.cycle(
                 &pcp_metrics,
@@ -5759,6 +5775,7 @@ mod tests {
                 crate::runtime_health::RuntimeHealthSnapshot::default(),
             )),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(HashMap::new())),
             Arc::new(RwLock::new(HashMap::new())),
             String::new(),
             false,
@@ -5850,6 +5867,7 @@ mod tests {
                     crate::runtime_health::RuntimeHealthSnapshot::default(),
                 )),
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(RwLock::new(HashMap::new())),
                 String::new(),
                 false,
@@ -5958,6 +5976,7 @@ mod tests {
                     crate::runtime_health::RuntimeHealthSnapshot::default(),
                 )),
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(RwLock::new(HashMap::new())),
                 String::new(),
                 false,
@@ -6074,6 +6093,7 @@ mod tests {
                     crate::runtime_health::RuntimeHealthSnapshot::default(),
                 )),
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(RwLock::new(HashMap::new())),
                 String::new(),
                 false,

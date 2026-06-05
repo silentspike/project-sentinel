@@ -15,7 +15,7 @@ pub mod bridge {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use serde::{Deserialize, Serialize};
@@ -24,6 +24,8 @@ pub mod bridge {
 
     use sentinel_common::{ActionType, AgentAction, AgentId, Perception, Tick, Timestamp};
     use sentinel_redb::StateStore;
+
+    pub type SharedLlmActivityTicks = Arc<Mutex<HashMap<AgentId, u64>>>;
 
     /// LLM Bridge Konfiguration.
     #[derive(Debug, Clone)]
@@ -181,6 +183,7 @@ pub mod bridge {
         telemetry: Arc<BridgeTelemetry>,
         state_store: Arc<StateStore>,
         llm_unavailable: Arc<AtomicBool>,
+        llm_activity_ticks: SharedLlmActivityTicks,
     ) {
         info!(
             max_concurrent = config.max_concurrent,
@@ -305,6 +308,15 @@ pub mod bridge {
                 }
 
                 last_call_tick.insert(agent_id, current_tick);
+                {
+                    let mut ticks = llm_activity_ticks.lock().unwrap();
+                    ticks.insert(agent_id, current_tick);
+                    let retention_ticks =
+                        config.min_ticks_between_calls.saturating_mul(24).max(120);
+                    ticks.retain(|_, last_tick| {
+                        current_tick.saturating_sub(*last_tick) <= retention_ticks
+                    });
+                }
 
                 info!(agent = %agent_id,
                     priority = if perception.is_directly_addressed { "P1" } else { "normal" },

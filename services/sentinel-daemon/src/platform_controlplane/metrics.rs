@@ -25,6 +25,9 @@ pub struct PlatformMetrics {
     /// Letzter Tick mit Action pro Agent (Agent-Name → Tick).
     /// Agents mit kuerzlicher Activity sollen NICHT als stalled despawnt werden.
     pub last_action_ticks: std::collections::HashMap<String, u64>,
+    /// Letzter Tick mit gestartetem LLM-Call pro Agent (Agent-Name → Tick).
+    /// Lange Provider-Latenzen sind kein Agent-Stall.
+    pub last_llm_call_ticks: std::collections::HashMap<String, u64>,
 }
 
 /// Stateful Metrics Collector (behaelt prev_write_bytes fuer Delta-Berechnung).

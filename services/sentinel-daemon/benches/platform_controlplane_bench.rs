@@ -179,6 +179,7 @@ fn synthetic_metrics() -> (PlatformMetrics, HashMap<String, AgentId>) {
             failed_services: vec!["sentinel-judge".to_string()],
             llm_circuit_open: false,
             last_action_ticks,
+            last_llm_call_ticks: HashMap::new(),
         },
         agent_ids,
     )
