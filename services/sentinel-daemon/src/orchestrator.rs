@@ -53,6 +53,63 @@ use crate::runtime_health;
 use crate::shift::{agents_for_shift, detect_current_shift, detect_shift_from_sim_hour};
 use crate::signal::wait_for_shutdown;
 
+const PERSONALITY_EVOLUTION_PER_AGENT_FIELD_KEEP: i64 = 2000;
+const PERSONALITY_EVOLUTION_GLOBAL_HIGH_WATER: i64 = 499_000;
+const PERSONALITY_EVOLUTION_GLOBAL_RETAIN: i64 = 490_000;
+
+fn retain_personality_evolution_agent_field(
+    evo_db: &sentinel_limbo::rusqlite::Connection,
+    agent_id: &str,
+    field: &str,
+) -> Result<()> {
+    evo_db
+        .execute(
+            "DELETE FROM personality_evolution
+             WHERE agent_id = ?1
+               AND field = ?2
+               AND id <= (
+                 SELECT id
+                 FROM personality_evolution
+                 WHERE agent_id = ?1 AND field = ?2
+                 ORDER BY id DESC
+                 LIMIT 1 OFFSET ?3
+               )",
+            sentinel_limbo::rusqlite::params![
+                agent_id,
+                field,
+                PERSONALITY_EVOLUTION_PER_AGENT_FIELD_KEEP
+            ],
+        )
+        .context("personality_evolution agent-field retention failed")?;
+    Ok(())
+}
+
+fn retain_personality_evolution_global(
+    evo_db: &sentinel_limbo::rusqlite::Connection,
+) -> Result<()> {
+    let count: i64 = evo_db
+        .query_row("SELECT COUNT(*) FROM personality_evolution", [], |row| {
+            row.get(0)
+        })
+        .context("personality_evolution global retention count failed")?;
+    if count <= PERSONALITY_EVOLUTION_GLOBAL_HIGH_WATER {
+        return Ok(());
+    }
+    evo_db
+        .execute(
+            "DELETE FROM personality_evolution
+             WHERE id <= (
+               SELECT id
+               FROM personality_evolution
+               ORDER BY id DESC
+               LIMIT 1 OFFSET ?1
+             )",
+            sentinel_limbo::rusqlite::params![PERSONALITY_EVOLUTION_GLOBAL_RETAIN],
+        )
+        .context("personality_evolution global retention failed")?;
+    Ok(())
+}
+
 /// Mapping von shift_set auf (start_hour, end_hour).
 fn shift_hours(shift_set: u8) -> (u8, u8) {
     match shift_set {
@@ -3122,12 +3179,11 @@ fn ecs_tick_loop(
                         _cutoff,
                     ) => {
                         // Auto-detect cutoff: behalte die 2 neuesten World-Snapshots (Restore-Puffer),
-                        // prune alle Events davor. list_world_snapshots() liefert ORDER BY tick DESC,
-                        // also ist der zweitneueste Snapshot Index 1 (NICHT len-2 = zweitältester — #475:
-                        // der Index-Bug ergab einen uralten cutoff < min(event_id) → prune loeschte nie etwas).
+                        // prune alle Events davor.
                         if let Ok(snapshots) = event_store_for_prune.list_world_snapshots() {
-                            if snapshots.len() >= 2 {
-                                let prune_point = snapshots[1].last_event_id;
+                            if let Some(prune_point) =
+                                crate::snapshot::prune_cutoff_from_ordered_snapshots(&snapshots)
+                            {
                                 snapshot_manager.start_prune(prune_point);
                             }
                         }
@@ -3972,6 +4028,28 @@ fn ecs_tick_loop(
                                 ],
                             ).is_ok() {
                                 written += 1;
+                                if let Err(retention_err) =
+                                    retain_personality_evolution_agent_field(
+                                        &evo_db,
+                                        &agent_id,
+                                        "memory_consolidation",
+                                    )
+                                {
+                                    warn!(
+                                        agent = %agent_id,
+                                        error = %retention_err,
+                                        "personality_evolution: agent-field retention fehlgeschlagen"
+                                    );
+                                }
+                            }
+                        }
+                        if written > 0 {
+                            if let Err(retention_err) = retain_personality_evolution_global(&evo_db)
+                            {
+                                warn!(
+                                    error = %retention_err,
+                                    "personality_evolution: global retention fehlgeschlagen"
+                                );
                             }
                         }
                         info!(
@@ -5879,6 +5957,65 @@ mod tests {
         assert!(
             !agent_under_active_healing(&health, AgentId(99)),
             "unknown -> despawn ok"
+        );
+    }
+
+    #[test]
+    fn personality_evolution_agent_field_retention_uses_insert_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evolution.db");
+        let db = sentinel_limbo::rusqlite::Connection::open(path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE personality_evolution (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL,
+                tick INTEGER NOT NULL,
+                field TEXT NOT NULL,
+                change_type TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                nmda_score REAL,
+                source TEXT NOT NULL DEFAULT 'night_run',
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX idx_evolution_agent_field_id
+            ON personality_evolution(agent_id, field, id DESC);",
+        )
+        .unwrap();
+
+        db.execute(
+            "INSERT INTO personality_evolution
+             (agent_id, tick, field, change_type, new_value, reason, source, created_at_ms)
+             VALUES ('AGENT-01', 1780475609399, 'memory_consolidation', 'night_run', 'legacy', 'legacy ms tick', 'night_run', 1)",
+            [],
+        )
+        .unwrap();
+        for tick in 0..PERSONALITY_EVOLUTION_PER_AGENT_FIELD_KEEP {
+            db.execute(
+                "INSERT INTO personality_evolution
+                 (agent_id, tick, field, change_type, new_value, reason, source, created_at_ms)
+                 VALUES ('AGENT-01', ?1, 'memory_consolidation', 'night_run', 'real', 'real sim tick', 'night_run', ?2)",
+                sentinel_limbo::rusqlite::params![1_900_000 + tick, 2 + tick],
+            )
+            .unwrap();
+        }
+
+        retain_personality_evolution_agent_field(&db, "AGENT-01", "memory_consolidation").unwrap();
+
+        let (count, max_tick): (i64, i64) = db
+            .query_row(
+                "SELECT count(*), max(tick)
+                 FROM personality_evolution
+                 WHERE agent_id = 'AGENT-01' AND field = 'memory_consolidation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, PERSONALITY_EVOLUTION_PER_AGENT_FIELD_KEEP);
+        assert!(
+            max_tick < 1_000_000_000,
+            "legacy millisecond tick was retained: {max_tick}"
         );
     }
 }

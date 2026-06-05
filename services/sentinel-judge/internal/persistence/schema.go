@@ -18,5 +18,6 @@ const createEvolutionTable = `CREATE TABLE IF NOT EXISTS personality_evolution (
 
 const createEvolutionIndices = `
 CREATE INDEX IF NOT EXISTS idx_evolution_agent ON personality_evolution(agent_id, tick);
-CREATE INDEX IF NOT EXISTS idx_evolution_source ON personality_evolution(source)
+CREATE INDEX IF NOT EXISTS idx_evolution_source ON personality_evolution(source);
+CREATE INDEX IF NOT EXISTS idx_evolution_agent_field_id ON personality_evolution(agent_id, field, id DESC)
 `
