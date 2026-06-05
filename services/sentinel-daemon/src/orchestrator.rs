@@ -5439,9 +5439,11 @@ mod tests {
 
     #[test]
     fn periodic_runtime_reconcile_request_is_explicit_and_configured() {
-        let mut config = crate::config::PlatformControlplaneConfig::default();
-        config.runtime_reconcile_respawn_missing = false;
-        config.runtime_reconcile_projection_rebuild = false;
+        let config = crate::config::PlatformControlplaneConfig {
+            runtime_reconcile_respawn_missing: false,
+            runtime_reconcile_projection_rebuild: false,
+            ..crate::config::PlatformControlplaneConfig::default()
+        };
 
         let request = periodic_runtime_reconcile_request(&config);
 
