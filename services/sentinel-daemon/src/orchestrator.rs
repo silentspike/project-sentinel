@@ -293,6 +293,17 @@ fn signal_pid(pid: u32, signal: &str) -> Result<()> {
     }
 }
 
+fn terminate_agent_process(mut proc_handle: sentinel_sandbox::AgentProcess) {
+    let _ = signal_pid(proc_handle.pid, "TERM");
+    for _ in 0..10 {
+        if !proc_handle.is_running() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    proc_handle.terminate();
+}
+
 fn mountinfo_contains_mountpoint(mountinfo: &str, path: &std::path::Path) -> bool {
     let target = path
         .canonicalize()
@@ -1443,6 +1454,10 @@ fn restart_agent_fast_path(
         security_runtime_state,
     );
 
+    if let Some(proc_handle) = agent_processes.remove(&agent_id) {
+        terminate_agent_process(proc_handle);
+    }
+
     if let Some(handle) = sandbox_handles.remove(&agent_id) {
         if handle.cgroup_created {
             if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
@@ -1456,11 +1471,6 @@ fn restart_agent_fast_path(
                 "Sandbox teardown bei Fast-Restart fehlgeschlagen"
             );
         }
-    }
-
-    if let Some(proc_handle) = agent_processes.remove(&agent_id) {
-        let _ = signal_pid(proc_handle.pid, "TERM");
-        drop(proc_handle);
     }
 
     remove_security_runtime_snapshot(security_runtime_state, agent_id);
@@ -1645,6 +1655,11 @@ fn remove_agent_runtime_fragments(
     let agent_id = AgentId(agent.agent_id);
     let mut stats = RuntimeCleanupStats::default();
 
+    if let Some(proc_handle) = ctx.agent_processes.remove(&agent_id) {
+        terminate_agent_process(proc_handle);
+        stats.repairs += 1;
+    }
+
     if let Some(handle) = ctx.sandbox_handles.remove(&agent_id) {
         if handle.cgroup_created {
             if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
@@ -1656,12 +1671,6 @@ fn remove_agent_runtime_fragments(
         } else {
             stats.repairs += 1;
         }
-    }
-
-    if let Some(proc_handle) = ctx.agent_processes.remove(&agent_id) {
-        let _ = signal_pid(proc_handle.pid, "TERM");
-        drop(proc_handle);
-        stats.repairs += 1;
     }
 
     if agent.cgroup_live_pid_count > 0 {
@@ -2381,6 +2390,10 @@ fn teardown_agent_full(
     agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
     security_runtime_state: &operator_api::SharedSecurityRuntimeState,
 ) {
+    if let Some(proc_handle) = agent_processes.remove(&agent_id) {
+        terminate_agent_process(proc_handle);
+    }
+
     if let Some(handle) = sandbox_handles.remove(&agent_id) {
         if handle.cgroup_created {
             if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
@@ -2390,10 +2403,6 @@ fn teardown_agent_full(
         if let Err(e) = sandbox.teardown_agent(&handle) {
             warn!(agent_id = %agent_id, error = %e, "Sandbox-Teardown bei Config-Apply fehlgeschlagen");
         }
-    }
-    if let Some(proc_handle) = agent_processes.remove(&agent_id) {
-        let _ = signal_pid(proc_handle.pid, "TERM");
-        drop(proc_handle);
     }
     remove_security_runtime_snapshot(security_runtime_state, agent_id);
     if runtime_orch.agents().contains_key(&agent_id) {
@@ -3487,7 +3496,10 @@ fn ecs_tick_loop(
                 // Alte Schicht-Agents entfernen (Orchestrator entfernt + emittiert Events)
                 let removed = runtime_orch.shift_transition(new_shift);
                 for agent_id in &removed {
-                    // Sandbox teardown VOR ECS despawn
+                    if let Some(proc_handle) = agent_processes.remove(agent_id) {
+                        terminate_agent_process(proc_handle);
+                    }
+
                     if let Some(handle) = sandbox_handles.remove(agent_id) {
                         // eBPF Agent-Unregistrierung
                         if handle.cgroup_created {
@@ -3499,8 +3511,6 @@ fn ecs_tick_loop(
                             warn!(agent_id = %agent_id, error = %e, "Sandbox teardown fehlgeschlagen");
                         }
                     }
-                    // AgentProcess droppen (reaps Zombie via Drop impl)
-                    agent_processes.remove(agent_id);
                     remove_security_runtime_snapshot(&security_runtime_state, *agent_id);
 
                     if !despawn_agent_from_world(&mut world, *agent_id) {
@@ -4377,6 +4387,10 @@ fn ecs_tick_loop(
                                 let agent_ids: Vec<sentinel_common::AgentId> =
                                     agent_processes.keys().copied().collect();
                                 for agent_id in &agent_ids {
+                                    if let Some(proc_handle) = agent_processes.remove(agent_id) {
+                                        terminate_agent_process(proc_handle);
+                                    }
+
                                     if let Some(handle) = sandbox_handles.remove(agent_id) {
                                         if handle.cgroup_created {
                                             if let Some(cid) =
@@ -4393,7 +4407,6 @@ fn ecs_tick_loop(
                                             );
                                         }
                                     }
-                                    agent_processes.remove(agent_id);
                                     remove_security_runtime_snapshot(
                                         &security_runtime_state,
                                         *agent_id,

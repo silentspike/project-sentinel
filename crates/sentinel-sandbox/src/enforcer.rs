@@ -9,7 +9,7 @@
 //! 1. `detect()` — prueft verfuegbare Kernel-Features, setzt OOM-Score
 //! 2. `setup_agent()` — erstellt cgroup + Agent-Home
 //! 3. `start_agent_process()` — startet bwrap (spaeter: mit Landlock im Child)
-//! 4. `teardown_agent()` — killt bwrap + entfernt cgroup
+//! 4. `teardown_agent()` — beendet bwrap-Reste + entfernt cgroup
 
 use std::path::{Path, PathBuf};
 use std::process::Child;
@@ -72,6 +72,61 @@ impl Drop for AgentProcess {
                 // the daemon might be shutting down gracefully.
             }
             Err(_) => {} // Error checking status, nothing we can do
+        }
+    }
+}
+
+fn pid_exists(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn wait_for_pid_exit(pid: u32) {
+    for _ in 0..20 {
+        if !pid_exists(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn cleanup_cgroup_after_process_exit(name: &str) -> Result<()> {
+    cleanup_cgroup_after_process_exit_with(
+        name,
+        cgroups::list_pids_in_cgroup,
+        cgroups::kill_cgroup_processes,
+        cgroups::remove_cgroup,
+    )
+}
+
+fn cleanup_cgroup_after_process_exit_with<List, Kill, Remove>(
+    name: &str,
+    list_pids: List,
+    kill_pids: Kill,
+    remove: Remove,
+) -> Result<()>
+where
+    List: Fn(&str) -> Result<Vec<u32>>,
+    Kill: Fn(&str) -> Result<usize>,
+    Remove: Fn(&str) -> Result<()>,
+{
+    match list_pids(name) {
+        Ok(pids) if pids.is_empty() => remove(name),
+        Ok(pids) => {
+            debug!(
+                cgroup = %name,
+                pid_count = pids.len(),
+                "cgroup vor Entfernen noch belegt, beende Mitglieder"
+            );
+            kill_pids(name)?;
+            remove(name)
+        }
+        Err(error) => {
+            warn!(
+                cgroup = %name,
+                error = %error,
+                "cgroup-Mitglieder konnten vor Remove nicht gelesen werden"
+            );
+            remove(name)
         }
     }
 }
@@ -422,13 +477,14 @@ impl SandboxEnforcer {
     /// resources, and removes the cgroup.
     /// Called by RuntimeOrchestrator::despawn_agent().
     pub fn teardown_agent(&self, handle: &SandboxHandle) -> Result<()> {
-        // Kill bwrap process if running
+        // Ask bwrap to exit first; remaining cgroup members are handled below.
         if let Some(pid) = handle.bwrap_pid {
             let _ = std::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
+            wait_for_pid_exit(pid);
         }
 
         // Remove network namespace resources BEFORE cgroup cleanup
@@ -440,9 +496,8 @@ impl SandboxEnforcer {
             }
         }
 
-        // Remove cgroup (may fail if processes still in it)
         if handle.cgroup_created {
-            if let Err(e) = cgroups::remove_cgroup(&handle.agent_name) {
+            if let Err(e) = cleanup_cgroup_after_process_exit(&handle.agent_name) {
                 warn!("Failed to remove cgroup for {}: {e}", handle.agent_name);
             }
         }
@@ -566,6 +621,56 @@ mod tests {
         assert!(handle.network_isolated);
         assert!(handle.netns_config.is_some());
         assert_eq!(handle.netns_config.unwrap().agent_ip(), "10.42.0.7");
+    }
+
+    #[test]
+    fn teardown_cgroup_kills_members_before_remove() {
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        cleanup_cgroup_after_process_exit_with(
+            "agent",
+            |_| {
+                calls.borrow_mut().push("list");
+                Ok(vec![42])
+            },
+            |_| {
+                calls.borrow_mut().push("kill");
+                Ok(1)
+            },
+            |_| {
+                let killed = calls.borrow().contains(&"kill");
+                assert!(killed, "occupied cgroup must be killed before remove");
+                calls.borrow_mut().push("remove");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.into_inner(), vec!["list", "kill", "remove"]);
+    }
+
+    #[test]
+    fn teardown_cgroup_removes_empty_without_kill() {
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        cleanup_cgroup_after_process_exit_with(
+            "agent",
+            |_| {
+                calls.borrow_mut().push("list");
+                Ok(Vec::new())
+            },
+            |_| {
+                calls.borrow_mut().push("kill");
+                Ok(0)
+            },
+            |_| {
+                calls.borrow_mut().push("remove");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.into_inner(), vec!["list", "remove"]);
     }
 
     #[test]
