@@ -15,6 +15,15 @@ use tracing::{debug, info};
 
 use crate::config::RetentionConfig;
 
+/// Waehlt den Cutoff fuer Pruning aus `list_world_snapshots()`-Ergebnissen.
+///
+/// Die Liste ist nach `tick DESC` sortiert. Index 1 ist der zweitneueste
+/// Restore-Puffer; `len() - 2` waere der zweitaelteste Snapshot und kann nach
+/// CTAS-Kompaktion dauerhaft unter `min(events.id)` liegen.
+pub(crate) fn prune_cutoff_from_ordered_snapshots(snapshots: &[SnapshotMeta]) -> Option<i64> {
+    snapshots.get(1).map(|snapshot| snapshot.last_event_id)
+}
+
 /// Verwaltet World Snapshots mit Tiered Retention.
 pub struct SnapshotManager {
     config: RetentionConfig,
@@ -167,7 +176,7 @@ impl SnapshotManager {
     /// Promoted Snapshots durch die Tiers und loescht abgelaufene.
     ///
     /// Promoted Snapshots durch die Tiers und loescht abgelaufene.
-    /// Auto-Prune loescht Events vor dem zweitaeltesten Snapshot.
+    /// Auto-Prune loescht Events vor dem zweitneuesten Snapshot.
     pub fn maintain(&mut self, event_store: &Arc<EventStore>) -> anyhow::Result<MaintenanceReport> {
         let snapshots = event_store.list_world_snapshots()?;
         if snapshots.is_empty() {
@@ -249,8 +258,7 @@ impl SnapshotManager {
         // Auto-Prune: Cutoff setzen, prune_tick() arbeitet 1 Batch/Tick ab
         if self.config.auto_prune && !self.is_pruning() {
             let current_snapshots = event_store.list_world_snapshots().unwrap_or_default();
-            if current_snapshots.len() >= 2 {
-                let prune_point = current_snapshots[current_snapshots.len() - 2].last_event_id;
+            if let Some(prune_point) = prune_cutoff_from_ordered_snapshots(&current_snapshots) {
                 if event_store.can_prune(prune_point).unwrap_or(false) {
                     self.start_prune(prune_point);
                 }
@@ -305,4 +313,33 @@ impl SnapshotManager {
 pub struct MaintenanceReport {
     pub promoted: u32,
     pub deleted: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(tick: u64, last_event_id: i64) -> SnapshotMeta {
+        SnapshotMeta {
+            id: format!("snap-{tick}"),
+            tier: SnapshotTier::Hourly,
+            tick,
+            sim_hour: 0.0,
+            last_event_id,
+            payload_size_bytes: 0,
+            created_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn prune_cutoff_uses_second_newest_snapshot() {
+        let snapshots = vec![meta(300, 30), meta(200, 20), meta(100, 10)];
+        assert_eq!(prune_cutoff_from_ordered_snapshots(&snapshots), Some(20));
+    }
+
+    #[test]
+    fn prune_cutoff_requires_two_snapshots() {
+        assert_eq!(prune_cutoff_from_ordered_snapshots(&[]), None);
+        assert_eq!(prune_cutoff_from_ordered_snapshots(&[meta(100, 10)]), None);
+    }
 }

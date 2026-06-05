@@ -87,9 +87,10 @@ jobs:
         uses: crate-ci/typos@631208b7aac2daa8b707f55e7331f9112b0e062d # v1.44.0
 
   # ──────────────────────────────────────────────
-  # Rust - only when crates/ or Cargo.* changed
+  # Rust static analysis - fmt + clippy + machete
+  # Parallel to rust-doc / rust-test / rust-ebpf (fans across runners)
   # ──────────────────────────────────────────────
-  rust:
+  rust-static:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.config == 'true'
     runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
@@ -97,25 +98,20 @@ jobs:
       CARGO_BUILD_JOBS: ${{ vars.RUNNER_MODE == 'hosted' && '2' || '3' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
       - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
           components: rustfmt, clippy
-
-      # Self-hosted: persistent local cache
       - name: Configure local cache (self-hosted)
         if: vars.RUNNER_MODE != 'hosted'
         run: |
           export CARGO_TARGET_DIR="$HOME/.cache/project-sentinel/cargo-target/${{ runner.name }}/target"
           mkdir -p "$CARGO_TARGET_DIR"
           echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
-
-      # Hosted: actions-based Rust cache
       - name: Rust cache (hosted)
         if: vars.RUNNER_MODE == 'hosted'
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: sentinel-hosted
+          shared-key: sentinel-hosted-static
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -123,10 +119,64 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Unused dependencies
+        uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131 # v2.67.30
+        with:
+          tool: cargo-machete
+      - run: cargo machete || echo "::warning::Unused dependencies found (non-blocking)"
+
+  # ──────────────────────────────────────────────
+  # Rust docs - rustdoc warnings (own compile, parallel)
+  # ──────────────────────────────────────────────
+  rust-doc:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.config == 'true'
+    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    env:
+      CARGO_BUILD_JOBS: ${{ vars.RUNNER_MODE == 'hosted' && '2' || '3' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+      - name: Configure local cache (self-hosted)
+        if: vars.RUNNER_MODE != 'hosted'
+        run: |
+          export CARGO_TARGET_DIR="$HOME/.cache/project-sentinel/cargo-target/${{ runner.name }}/target"
+          mkdir -p "$CARGO_TARGET_DIR"
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
+      - name: Rust cache (hosted)
+        if: vars.RUNNER_MODE == 'hosted'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sentinel-hosted-doc
+
       - name: Rustdoc warnings
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --workspace --no-deps --document-private-items
+
+  # ──────────────────────────────────────────────
+  # Rust tests - workspace + snapshot tests (own compile, parallel)
+  # ──────────────────────────────────────────────
+  rust-test:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.config == 'true'
+    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    env:
+      CARGO_BUILD_JOBS: ${{ vars.RUNNER_MODE == 'hosted' && '2' || '3' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+      - name: Configure local cache (self-hosted)
+        if: vars.RUNNER_MODE != 'hosted'
+        run: |
+          export CARGO_TARGET_DIR="$HOME/.cache/project-sentinel/cargo-target/${{ runner.name }}/target"
+          mkdir -p "$CARGO_TARGET_DIR"
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
+      - name: Rust cache (hosted)
+        if: vars.RUNNER_MODE == 'hosted'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sentinel-hosted-test
 
       - name: Tests
         run: cargo test --workspace
@@ -136,6 +186,32 @@ jobs:
           command -v cargo-insta >/dev/null 2>&1 || cargo install cargo-insta --locked
           cargo insta test -p sentinel-ecs --test snapshot_perception --check
           cargo insta test -p sentinel-physics --test snapshot_perception --check
+
+  # ──────────────────────────────────────────────
+  # Rust eBPF feature - separate feature compile (parallel)
+  # ──────────────────────────────────────────────
+  rust-ebpf:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.config == 'true'
+    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    env:
+      CARGO_BUILD_JOBS: ${{ vars.RUNNER_MODE == 'hosted' && '2' || '3' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          components: clippy
+      - name: Configure local cache (self-hosted)
+        if: vars.RUNNER_MODE != 'hosted'
+        run: |
+          export CARGO_TARGET_DIR="$HOME/.cache/project-sentinel/cargo-target/${{ runner.name }}/target"
+          mkdir -p "$CARGO_TARGET_DIR"
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
+      - name: Rust cache (hosted)
+        if: vars.RUNNER_MODE == 'hosted'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sentinel-hosted-ebpf
 
       # eBPF: install kernel headers on hosted, soft-fail if unavailable
       - name: Install eBPF dependencies (hosted)
@@ -149,12 +225,6 @@ jobs:
 
       - name: Tests (eBPF feature)
         run: cargo test -p sentinel-ebpf --features ebpf || ${{ vars.RUNNER_MODE == 'hosted' && 'echo "::warning::eBPF tests failed (kernel headers may be missing)"' || 'exit 1' }}
-
-      - name: Unused dependencies
-        uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131 # v2.67.30
-        with:
-          tool: cargo-machete
-      - run: cargo machete || echo "::warning::Unused dependencies found (non-blocking)"
 
   # ──────────────────────────────────────────────
   # Go - only when cmd/ changed
@@ -260,14 +330,17 @@ jobs:
   # ──────────────────────────────────────────────
   ci-pass:
     if: always()
-    needs: [lint, rust, go, console, schemas]
+    needs: [lint, rust-static, rust-doc, rust-test, rust-ebpf, go, console, schemas]
     runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     steps:
       - name: Evaluate results
         run: |
           results=(
             "${{ needs.lint.result }}"
-            "${{ needs.rust.result }}"
+            "${{ needs.rust-static.result }}"
+            "${{ needs.rust-doc.result }}"
+            "${{ needs.rust-test.result }}"
+            "${{ needs.rust-ebpf.result }}"
             "${{ needs.go.result }}"
             "${{ needs.console.result }}"
             "${{ needs.schemas.result }}"
