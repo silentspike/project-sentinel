@@ -68,6 +68,13 @@ pub fn evaluate_rules(
                 continue;
             }
         }
+        if let Some(&last_tick) = metrics.last_llm_call_ticks.get(agent_name) {
+            if tick >= last_tick
+                && tick.saturating_sub(last_tick) < config.stall_recent_activity_grace_ticks
+            {
+                continue;
+            }
+        }
         let key = format!("agent_stall:{agent_name}");
         if !is_cooled_down(cooldowns, &key, tick, config.stall_cooldown_ticks) {
             continue;
@@ -307,6 +314,33 @@ mod tests {
         assert!(
             actions.is_empty(),
             "recent activity inside grace window must suppress stall restarts"
+        );
+    }
+
+    #[test]
+    fn test_stall_rule_respects_recent_llm_call_grace_from_config() {
+        let metrics = PlatformMetrics {
+            stalled_agents: vec!["Thomas Mueller".to_string()],
+            last_llm_call_ticks: HashMap::from([("Thomas Mueller".to_string(), 91)]),
+            ..Default::default()
+        };
+        let config = PlatformControlplaneConfig {
+            cycle_interval_ticks: 1,
+            stall_recent_activity_grace_ticks: 10,
+            ..test_config()
+        };
+
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &config,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(
+            actions.is_empty(),
+            "recent LLM activity inside grace window must suppress stall restarts"
         );
     }
 
