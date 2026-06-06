@@ -130,3 +130,34 @@ sensations rather than as out-of-band signals.
 | API timeout      | migraine                  |
 | RAM pressure     | trouble concentrating     |
 | Network latency  | "having a slow day"       |
+
+
+## Acronyms
+
+External standards, frameworks, and infrastructure components referenced
+throughout this project. Each entry is a one-line definition for first-time
+readers; click through to the source-of-truth for full context.
+
+| Acronym | Stands for | One-line definition |
+|---------|------------|---------------------|
+| [TOGAF] | The Open Group Architecture Framework | Authoritative architecture reference used by this project (v22.1). See [togaf-architecture-guide.html](architecture/togaf-architecture-guide.html). |
+| [SBOM]   | Software Bill of Materials             | Machine-readable inventory of all components and dependencies in a build artifact. Required for the OSSF Scorecard supply-chain checks. |
+| [GHAS]   | GitHub Advanced Security              | GitHub's code-scanning, secret-scanning, and dependency-review suite. Enabled for this repo, see `.github/workflows/codeql.yml`. |
+| [OSSF Scorecard] | OpenSSF Security Scorecard     | Automated security health check (SLSA, dangerous workflow, token permissions, branch protection, …). Runs on every release, see `.github/workflows/scorecard.yml`. |
+| [CQRS]   | Command Query Responsibility Segregation | Architectural pattern that separates write paths (commands, audit-trail-emitting) from read paths (queries, projections). Used in the audit-pipeline. |
+| [ECS]    | Entity Component System                | Data-oriented architecture pattern used in `sentinel-daemon` for the per-tick world state. |
+| [NMDA]   | Night-run Memory Drift Aggregator      | Internal abbreviation for the six-phase shift-change consolidation pipeline in `sentinel-nightrun`. |
+| [eBPF]   | Extended Berkeley Packet Filter        | Linux kernel technology used to publish Limbo and NATS metrics in `sentinel-nats-bridge`. |
+| [NATS]   | Neural Autonomic Transport System      | Lightweight, high-performance messaging system used as the event bus for control-plane and judge telemetry. |
+| [MITM]   | Man-in-the-Middle                      | Test posture used by `cortex-gateway` to intercept and synthesize LLM calls before forwarding (or not) to a real provider. |
+
+[TOGAF]: https://pubs.opengroup.org/architecture/togaf9-doc/arch/
+[SBOM]: https://cyclonedx.org/specification/overview/
+[GHAS]: https://docs.github.com/en/get-started/learning-about-github/about-github-advanced-security
+[OSSF Scorecard]: https://scorecard.dev/
+[CQRS]: https://martinfowler.com/bliki/CQRS.html
+[ECS]: https://en.wikipedia.org/wiki/Entity_component_system
+[NMDA]: governance.md#nmda-night-run
+[eBPF]: https://ebpf.io/
+[NATS]: https://nats.io/
+[MITM]: https://en.wikipedia.org/wiki/Man-in-the-middle_attack
