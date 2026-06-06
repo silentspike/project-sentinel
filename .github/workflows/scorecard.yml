@@ -14,7 +14,7 @@ permissions: read-all
 jobs:
   analysis:
     name: OSSF Scorecard
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     permissions:
       contents: read
       security-events: write
