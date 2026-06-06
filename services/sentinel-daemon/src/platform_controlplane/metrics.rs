@@ -1,6 +1,7 @@
 //! Platform-Metriken Snapshot (Observe-Phase).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Snapshot aller platform-relevanten Metriken fuer einen Zyklus.
 #[derive(Debug, Clone, Default)]
@@ -19,9 +20,14 @@ pub struct PlatformMetrics {
     pub tick: u64,
     /// Namen von systemd Services die nicht active sind.
     pub failed_services: Vec<String>,
+    /// Ob der LLM-Gateway-Circuitbreaker aktuell offen ist.
+    pub llm_circuit_open: bool,
     /// Letzter Tick mit Action pro Agent (Agent-Name → Tick).
     /// Agents mit kuerzlicher Activity sollen NICHT als stalled despawnt werden.
     pub last_action_ticks: std::collections::HashMap<String, u64>,
+    /// Letzter Tick mit gestartetem LLM-Call pro Agent (Agent-Name → Tick).
+    /// Lange Provider-Latenzen sind kein Agent-Stall.
+    pub last_llm_call_ticks: std::collections::HashMap<String, u64>,
 }
 
 /// Stateful Metrics Collector (behaelt prev_write_bytes fuer Delta-Berechnung).
@@ -42,6 +48,7 @@ pub fn collect(
     agent_names: &[String],
     tick: u64,
     failed_services: Vec<String>,
+    llm_circuit_open: &AtomicBool,
 ) -> PlatformMetrics {
     collect_with_cgroup_root(
         collector,
@@ -51,6 +58,7 @@ pub fn collect(
         agent_names,
         tick,
         failed_services,
+        llm_circuit_open.load(Ordering::Relaxed),
         Path::new("/sys/fs/cgroup/sentinel"),
     )
 }
@@ -64,11 +72,13 @@ pub fn collect_with_cgroup_root(
     agent_names: &[String],
     tick: u64,
     failed_services: Vec<String>,
+    llm_circuit_open: bool,
     cgroup_root: &Path,
 ) -> PlatformMetrics {
     let mut metrics = PlatformMetrics {
         tick,
         failed_services,
+        llm_circuit_open,
         ..Default::default()
     };
 
@@ -154,5 +164,6 @@ mod tests {
         assert_eq!(m.event_store_size_bytes, 0);
         assert_eq!(m.projection_lag, 0);
         assert!(m.agent_memory_pressure.is_empty());
+        assert!(!m.llm_circuit_open);
     }
 }

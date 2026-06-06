@@ -35,7 +35,7 @@ impl BwrapConfig {
     /// Landlock (Defense-in-Depth) schraenkt Zugriff innerhalb des Namespace weiter ein.
     pub fn for_agent(name: &str) -> Self {
         Self {
-            hostname: format!("sentinel-{name}"),
+            hostname: hostname_for_agent(name),
             readonly_binds: vec![
                 // System-Binaries + Libraries (noetig fuer agent-runtime Execution)
                 ("/usr".to_string(), "/usr".to_string()),
@@ -200,6 +200,40 @@ impl BwrapConfig {
     }
 }
 
+fn hostname_for_agent(name: &str) -> String {
+    const MAX_HOSTNAME_LEN: usize = 63;
+    let mut token = String::with_capacity(name.len());
+    let mut previous_was_dash = false;
+
+    for ch in name.chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            previous_was_dash = false;
+            Some(ch.to_ascii_lowercase())
+        } else if !previous_was_dash {
+            previous_was_dash = true;
+            Some('-')
+        } else {
+            None
+        };
+        if let Some(ch) = next {
+            token.push(ch);
+        }
+    }
+
+    let token = token.trim_matches('-');
+    let token = if token.is_empty() { "agent" } else { token };
+    let mut hostname = format!("sentinel-{token}");
+    hostname.truncate(MAX_HOSTNAME_LEN);
+    while hostname.ends_with('-') {
+        hostname.pop();
+    }
+    if hostname.is_empty() {
+        "sentinel-agent".to_string()
+    } else {
+        hostname
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +327,20 @@ mod tests {
             .position(|a| a == "--hostname")
             .expect("--hostname missing");
         assert_eq!(args[idx + 1], "sentinel-thomas");
+    }
+
+    #[test]
+    fn hostname_sanitizes_display_names_for_bwrap() {
+        let config = BwrapConfig::for_agent(
+            "Victoria Lehmann (intern \"Vicky\", akzeptiert beide Varianten)",
+        );
+        assert!(config.hostname.starts_with("sentinel-victoria-lehmann"));
+        assert!(config.hostname.len() <= 63);
+        assert!(!config.hostname.ends_with('-'));
+        assert!(config
+            .hostname
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'));
     }
 
     #[test]

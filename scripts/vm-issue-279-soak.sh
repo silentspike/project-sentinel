@@ -10,6 +10,31 @@ start_since="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
 mkdir -p "$out_dir"
 
+sidecar_pids=()
+
+start_sidecar() {
+  local name="$1"
+  shift
+  if command -v "$1" >/dev/null 2>&1; then
+    "$@" >"$out_dir/${name}.log" 2>&1 &
+    sidecar_pids+=("$!")
+  else
+    echo "$1 missing" >"$out_dir/${name}.log"
+  fi
+}
+
+stop_sidecars() {
+  local pid
+  for pid in "${sidecar_pids[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  for pid in "${sidecar_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+}
+
+trap stop_sidecars EXIT
+
 opcurl() {
   if [ -x /tmp/opcurl ]; then
     /tmp/opcurl "$@"
@@ -25,7 +50,7 @@ read_health() {
 health_line() {
   python3 -c 'import sys,json
 h=json.load(sys.stdin)
-print("{expected}\t{runtime}\t{projection}\t{cgroups}\t{stale}\t{orphans}\t{zombies}\t{drift}\t{depth}\t{dropped}\t{coalesced}".format(
+print("{expected}\t{runtime}\t{projection}\t{cgroups}\t{stale}\t{orphans}\t{zombies}\t{drift}\t{depth}\t{dropped}\t{coalesced}\t{reconcile}\t{auto_reconcile}\t{last_source}\t{last_tick}".format(
     expected=h["expected_active_agents"],
     runtime=h["runtime_agents"],
     projection=h["projection_agents"],
@@ -37,12 +62,26 @@ print("{expected}\t{runtime}\t{projection}\t{cgroups}\t{stale}\t{orphans}\t{zomb
     depth=h["analysis_queue_depth"],
     dropped=h["analysis_queue_dropped_total"],
     coalesced=h["analysis_queue_coalesced_total"],
+    reconcile=h.get("reconcile_runs_total", 0),
+    auto_reconcile=h.get("auto_reconcile_runs_total", 0),
+    last_source=h.get("last_reconcile_source", ""),
+    last_tick=h.get("last_reconcile_tick", 0),
 ))'
 }
 
 api_agents() {
   curl -ks -b "${DASHBOARD_COOKIE_JAR:-/tmp/sentinel-console.cookie}" https://127.0.0.1:8001/api/agents \
-    | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))'
+    | python3 -c 'import sys,json
+payload=json.load(sys.stdin)
+if isinstance(payload, list):
+    rows=payload
+elif isinstance(payload, dict) and isinstance(payload.get("agents"), list):
+    rows=payload["agents"]
+elif isinstance(payload, dict) and isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("agents"), list):
+    rows=payload["data"]["agents"]
+else:
+    rows=[]
+print(sum(1 for row in rows if isinstance(row, dict) and row.get("status") == "active"))'
 }
 
 projection_active_agents() {
@@ -97,9 +136,13 @@ system_line() {
   echo "# started_at=$start_since"
   echo "# duration_seconds=$duration"
   echo "# interval_seconds=$interval"
-  echo -e "sample\ttimestamp\texpected\truntime\tprojection\tcgroups\tstale\torphans\tzombies\tdrift\tqueue_depth\tdropped\tcoalesced\tapi_agents\tprojection_db_active\tcgroup_dirs\tcgroup_live_dirs"
+  echo -e "sample\ttimestamp\texpected\truntime\tprojection\tcgroups\tstale\torphans\tzombies\tdrift\tqueue_depth\tdropped\tcoalesced\treconcile_runs\tauto_reconcile_runs\tlast_reconcile_source\tlast_reconcile_tick\tapi_active_agents\tprojection_db_active\tcgroup_dirs\tcgroup_live_dirs"
 } >"$out_dir/health.tsv"
 echo -e "timestamp\tdaemon_pid\tdaemon_rss_kb\tdaemon_cpu\tprojection_pid\tprojection_rss_kb\tprojection_cpu\tdata_used_kb\tdata_avail_kb" >"$out_dir/system.tsv"
+
+start_sidecar vmstat vmstat 1
+start_sidecar mpstat mpstat 1
+start_sidecar iostat iostat -x 1
 
 sample=0
 while [ "$(date +%s)" -le "$end_epoch" ]; do
@@ -119,6 +162,7 @@ done
 
 final_json="$(read_health)"
 printf "%s" "$final_json" >"$out_dir/final-health.json"
+expected_final="$(printf "%s" "$final_json" | python3 -c 'import sys,json; print(json.load(sys.stdin)["expected_active_agents"])')"
 api_final="$(api_agents)"
 projection_final="$(projection_active_agents)"
 cgroup_final="$(cgroup_dirs)"
@@ -129,17 +173,20 @@ journalctl -u sentinel-projection --since "$start_since" --no-pager >"$out_dir/p
 
 printf "%s" "$final_json" | python3 -c 'import sys,json
 h=json.load(sys.stdin)
+expected = h["expected_active_agents"]
 ok = (
-    h["expected_active_agents"] == 26
-    and h["runtime_agents"] == 26
-    and h["projection_agents"] == 26
-    and h["live_cgroup_dirs"] == 26
+    h["runtime_agents"] == expected
+    and h["projection_agents"] == expected
+    and h["live_cgroup_dirs"] == expected
     and h["stale_runtime_entries"] == 0
     and h["orphan_cgroups"] == 0
     and h["zombie_tracked_pids"] == 0
     and h["projection_drift_detected"] is False
+    and h.get("reconcile_runs_total", 0) > 0
+    and h.get("auto_reconcile_runs_total", 0) >= 1
+    and h.get("last_reconcile_source") == "periodic"
 )
-print("final_health={}/{}/{}/{} stale={} orphans={} zombies={} drift={}".format(
+print("final_health={}/{}/{}/{} stale={} orphans={} zombies={} drift={} reconcile={} auto_reconcile={} last_source={} last_tick={}".format(
     h["expected_active_agents"],
     h["runtime_agents"],
     h["projection_agents"],
@@ -148,23 +195,35 @@ print("final_health={}/{}/{}/{} stale={} orphans={} zombies={} drift={}".format(
     h["orphan_cgroups"],
     h["zombie_tracked_pids"],
     h["projection_drift_detected"],
+    h.get("reconcile_runs_total", 0),
+    h.get("auto_reconcile_runs_total", 0),
+    h.get("last_reconcile_source", ""),
+    h.get("last_reconcile_tick", 0),
 ))
 raise SystemExit(0 if ok else 1)'
 
-test "$api_final" = "26"
-test "$projection_final" = "26"
-test "$cgroup_final" = "26"
-test "$cgroup_live_final" = "26"
+test "$api_final" = "$expected_final"
+test "$projection_final" = "$expected_final"
+test "$cgroup_final" = "$expected_final"
+test "$cgroup_live_final" = "$expected_final"
 
-if grep -Ei 'panic|drift' "$out_dir/daemon-journal.log" >/dev/null; then
+if grep -Ei 'panicked|thread .*panicked|projection drift detected|projection_drift_detected=true|runtime drift' "$out_dir/daemon-journal.log" >/dev/null; then
   echo "daemon_journal_panic_or_drift=FAIL"
-  grep -Ei 'panic|drift' "$out_dir/daemon-journal.log"
+  grep -Ei 'panicked|thread .*panicked|projection drift detected|projection_drift_detected=true|runtime drift' "$out_dir/daemon-journal.log"
   exit 1
 fi
 
+if grep -F 'Failed to remove cgroup' "$out_dir/daemon-journal.log" >/dev/null; then
+  echo "daemon_journal_cgroup_remove_warning=FAIL"
+  grep -F 'Failed to remove cgroup' "$out_dir/daemon-journal.log"
+  exit 1
+fi
+
+echo "expected_active_agents=$expected_final"
 echo "api_agents=$api_final"
 echo "projection_db_active=$projection_final"
 echo "cgroup_dirs=$cgroup_final"
 echo "cgroup_live_dirs=$cgroup_live_final"
 echo "daemon_journal_panic_or_drift=0"
+echo "daemon_journal_cgroup_remove_warning=0"
 echo "SOAK_PASS out_dir=$out_dir"
