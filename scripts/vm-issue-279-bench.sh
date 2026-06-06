@@ -134,6 +134,7 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\n' "name" "actual" "target_exclusive" "unit" "pas
 
 capture_sidecars before
 wait_healthy pre
+expected_active_agents="$(json_field "$OUT_DIR/health-pre.json" expected_active_agents)"
 
 max_reconcile_us=0
 for idx in $(seq 1 5); do
@@ -145,7 +146,7 @@ for idx in $(seq 1 5); do
     max_reconcile_us="$elapsed"
   fi
 done
-record_result runtime_reconcile_26_agents "$max_reconcile_us" 5000 us runtime-reconcile-runs.tsv
+record_result "runtime_reconcile_${expected_active_agents}_agents" "$max_reconcile_us" 5000 us runtime-reconcile-runs.tsv
 
 max_projection_us=0
 for idx in $(seq 1 5); do

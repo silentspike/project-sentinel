@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, RwLock};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -291,6 +291,17 @@ fn signal_pid(pid: u32, signal: &str) -> Result<()> {
     } else {
         Err(anyhow!("kill -{signal} fuer PID {pid} lieferte {status}"))
     }
+}
+
+fn terminate_agent_process(mut proc_handle: sentinel_sandbox::AgentProcess) {
+    let _ = signal_pid(proc_handle.pid, "TERM");
+    for _ in 0..10 {
+        if !proc_handle.is_running() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    proc_handle.terminate();
 }
 
 fn mountinfo_contains_mountpoint(mountinfo: &str, path: &std::path::Path) -> bool {
@@ -829,6 +840,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let runtime_health = Arc::new(RwLock::new(
         crate::runtime_health::RuntimeHealthSnapshot::default(),
     ));
+    let llm_circuit_open = Arc::new(AtomicBool::new(false));
+    let llm_activity_ticks = Arc::new(Mutex::new(HashMap::<AgentId, u64>::new()));
     let security_runtime_state: operator_api::SharedSecurityRuntimeState =
         Arc::new(RwLock::new(HashMap::new()));
     let projection_db_path = data_dir.join("projection.db").to_string_lossy().to_string();
@@ -988,6 +1001,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let events_db_path = events_path.to_string_lossy().to_string();
     let ecs_platform_state = Arc::clone(&platform_state);
     let ecs_runtime_health = Arc::clone(&runtime_health);
+    let ecs_llm_circuit_open = Arc::clone(&llm_circuit_open);
+    let ecs_llm_activity_ticks = Arc::clone(&llm_activity_ticks);
     let ecs_security_runtime_state = Arc::clone(&security_runtime_state);
     let ecs_fs_mount = active_fs_mount.clone();
     let ecs_projection_db_path = projection_db_path.clone();
@@ -1038,6 +1053,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 events_db_path,
                 ecs_platform_state,
                 ecs_runtime_health,
+                ecs_llm_circuit_open,
+                ecs_llm_activity_ticks,
                 ecs_security_runtime_state,
                 ecs_projection_db_path,
                 operator_auth_required,
@@ -1096,6 +1113,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             bridge_action_tx,
             bridge_telem,
             Arc::clone(&state_store),
+            Arc::clone(&llm_circuit_open),
+            Arc::clone(&llm_activity_ticks),
         ))
     };
 
@@ -1302,6 +1321,8 @@ fn collect_platform_metrics_snapshot(
     events_db_path_str: &str,
     tick_count: u64,
     service_health_checker: &crate::service_health::ServiceHealthChecker,
+    llm_circuit_open: &AtomicBool,
+    llm_activity_ticks: &Mutex<HashMap<AgentId, u64>>,
 ) -> (
     crate::platform_controlplane::metrics::PlatformMetrics,
     std::collections::HashMap<String, sentinel_common::AgentId>,
@@ -1326,11 +1347,21 @@ fn collect_platform_metrics_snapshot(
         &agent_names,
         tick_count,
         failed_services,
+        llm_circuit_open,
     );
     for handle in runtime_orch.agents().values() {
         pcp_metrics
             .last_action_ticks
             .insert(handle.identity.name.clone(), handle.last_activity_tick.0);
+    }
+    if let Ok(llm_ticks) = llm_activity_ticks.lock() {
+        for (agent_id, last_tick) in llm_ticks.iter() {
+            if let Some(handle) = runtime_orch.agents().get(agent_id) {
+                pcp_metrics
+                    .last_llm_call_ticks
+                    .insert(handle.identity.name.clone(), *last_tick);
+            }
+        }
     }
     (pcp_metrics, agent_name_to_id)
 }
@@ -1443,6 +1474,10 @@ fn restart_agent_fast_path(
         security_runtime_state,
     );
 
+    if let Some(proc_handle) = agent_processes.remove(&agent_id) {
+        terminate_agent_process(proc_handle);
+    }
+
     if let Some(handle) = sandbox_handles.remove(&agent_id) {
         if handle.cgroup_created {
             if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
@@ -1456,11 +1491,6 @@ fn restart_agent_fast_path(
                 "Sandbox teardown bei Fast-Restart fehlgeschlagen"
             );
         }
-    }
-
-    if let Some(proc_handle) = agent_processes.remove(&agent_id) {
-        let _ = signal_pid(proc_handle.pid, "TERM");
-        drop(proc_handle);
     }
 
     remove_security_runtime_snapshot(security_runtime_state, agent_id);
@@ -1535,6 +1565,44 @@ struct RuntimeReconcileContext<'a> {
     is_service_active_fn: fn(&str) -> bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeReconcileSource {
+    Operator,
+    Periodic,
+}
+
+impl RuntimeReconcileSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Periodic => "periodic",
+        }
+    }
+
+    fn is_periodic(self) -> bool {
+        matches!(self, Self::Periodic)
+    }
+}
+
+fn should_run_periodic_runtime_reconcile(
+    config: &crate::config::PlatformControlplaneConfig,
+    tick_count: u64,
+) -> bool {
+    config.runtime_reconcile_enabled
+        && tick_count > 0
+        && tick_count.is_multiple_of(config.runtime_reconcile_interval_ticks.max(1))
+}
+
+fn periodic_runtime_reconcile_request(
+    config: &crate::config::PlatformControlplaneConfig,
+) -> RuntimeReconcileRequest {
+    RuntimeReconcileRequest {
+        dry_run: false,
+        projection_rebuild: config.runtime_reconcile_projection_rebuild,
+        respawn_missing: config.runtime_reconcile_respawn_missing,
+    }
+}
+
 fn runtime_agent_is_healthy(agent: &runtime_health::RuntimeHealthAgentSnapshot) -> bool {
     agent.runtime_present
         && agent.projection_present
@@ -1576,28 +1644,136 @@ fn emit_runtime_projection_despawn_event(
     event_store: &EventStore,
     agent_id: AgentId,
     tick_count: u64,
-) -> bool {
+) -> Result<i64> {
     let aggregate_id = format!("AGENT-{:02}", agent_id.0);
     let payload = DomainEventPayload::AgentDespawned {
         agent_id,
         reason: "runtime_reconcile_projection_only".to_string(),
     };
+    let op_id = format!(
+        "runtime-reconcile-projection-despawn-{}-{}-{}",
+        agent_id.0,
+        tick_count,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
     let event = DomainEvent::new(
         payload.event_type_str(),
         &aggregate_id,
         &payload.to_json(),
-        &format!("runtime-reconcile-projection-{}", agent_id.0),
+        &op_id,
         tick_count,
+    )
+    .with_operation_id(&op_id);
+    event_store
+        .append_event(&event)
+        .with_context(|| format!("Projection-only Despawn-Event persistieren fuer {aggregate_id}"))
+}
+
+fn mark_agent_projection_despawned(
+    projection_db_path: &std::path::Path,
+    agent_id: AgentId,
+    last_event_id: i64,
+) -> Result<()> {
+    let db = sentinel_limbo::rusqlite::Connection::open(projection_db_path)
+        .with_context(|| format!("Projection DB oeffnen: {}", projection_db_path.display()))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    db.execute(
+        "UPDATE agent_live_view
+         SET status = 'despawned',
+             in_transit = 0,
+             transit_target = NULL,
+             last_event_id = CASE
+               WHEN agent_live_view.last_event_id > ?2
+               THEN agent_live_view.last_event_id
+               ELSE ?2
+             END,
+             updated_at = ?3
+         WHERE agent_id = ?1",
+        sentinel_limbo::rusqlite::params![agent_id.0 as i64, last_event_id, now_ms],
+    )?;
+    Ok(())
+}
+
+fn emit_runtime_projection_spawn_event(
+    event_store: &EventStore,
+    agent_cfg: &AgentConfig,
+    tick_count: u64,
+) -> Result<i64> {
+    let agent_id = AgentId(agent_cfg.identity.id);
+    let aggregate_id = format!("AGENT-{:02}", agent_id.0);
+    let payload = DomainEventPayload::AgentSpawned {
+        agent_id,
+        name: agent_cfg.identity.name.clone(),
+        role: agent_cfg.identity.role.clone(),
+        shift_set: agent_cfg.identity.shift_set,
+        room_id: agent_cfg.preferences.favorite_room.clone(),
+    };
+    let op_id = format!(
+        "runtime-reconcile-projection-spawn-{}-{}-{}",
+        agent_id.0,
+        tick_count,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
     );
-    if let Err(error) = event_store.append_event(&event) {
-        warn!(
-            agent_id = %agent_id,
-            error = %error,
-            "Projection-only Despawn-Event konnte nicht persistiert werden"
-        );
-        return false;
-    }
-    true
+    let event = DomainEvent::new(
+        payload.event_type_str(),
+        &aggregate_id,
+        &payload.to_json(),
+        &op_id,
+        tick_count,
+    )
+    .with_operation_id(&op_id);
+    event_store.append_event(&event)
+}
+
+fn upsert_agent_projection_seed(
+    projection_db_path: &std::path::Path,
+    agent_cfg: &AgentConfig,
+    last_event_id: i64,
+) -> Result<()> {
+    let db = sentinel_limbo::rusqlite::Connection::open(projection_db_path)
+        .with_context(|| format!("Projection DB oeffnen: {}", projection_db_path.display()))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    db.execute(
+        "INSERT INTO agent_live_view
+           (agent_id, name, role, shift_set, status, current_room, in_transit, last_event_id, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'active', ?5, 0, ?6, ?7)
+         ON CONFLICT(agent_id) DO UPDATE SET
+           name = excluded.name,
+           role = excluded.role,
+           shift_set = excluded.shift_set,
+           status = 'active',
+           current_room = excluded.current_room,
+           in_transit = 0,
+           transit_target = NULL,
+           last_event_id = CASE
+             WHEN agent_live_view.last_event_id > excluded.last_event_id
+             THEN agent_live_view.last_event_id
+             ELSE excluded.last_event_id
+           END,
+           updated_at = excluded.updated_at",
+        sentinel_limbo::rusqlite::params![
+            agent_cfg.identity.id as i64,
+            &agent_cfg.identity.name,
+            &agent_cfg.identity.role,
+            agent_cfg.identity.shift_set as i64,
+            &agent_cfg.preferences.favorite_room,
+            last_event_id,
+            now_ms,
+        ],
+    )?;
+    Ok(())
 }
 
 fn remove_agent_runtime_fragments(
@@ -1606,6 +1782,11 @@ fn remove_agent_runtime_fragments(
 ) -> RuntimeCleanupStats {
     let agent_id = AgentId(agent.agent_id);
     let mut stats = RuntimeCleanupStats::default();
+
+    if let Some(proc_handle) = ctx.agent_processes.remove(&agent_id) {
+        terminate_agent_process(proc_handle);
+        stats.repairs += 1;
+    }
 
     if let Some(handle) = ctx.sandbox_handles.remove(&agent_id) {
         if handle.cgroup_created {
@@ -1618,12 +1799,6 @@ fn remove_agent_runtime_fragments(
         } else {
             stats.repairs += 1;
         }
-    }
-
-    if let Some(proc_handle) = ctx.agent_processes.remove(&agent_id) {
-        let _ = signal_pid(proc_handle.pid, "TERM");
-        drop(proc_handle);
-        stats.repairs += 1;
     }
 
     if agent.cgroup_live_pid_count > 0 {
@@ -1683,10 +1858,63 @@ fn remove_agent_runtime_fragments(
     stats
 }
 
+#[allow(clippy::too_many_arguments)]
+fn execute_runtime_reconcile(
+    tick_count: u64,
+    current_shift: u8,
+    all_agents: &[AgentConfig],
+    world: &mut bevy_ecs::prelude::World,
+    runtime_orch: &mut RuntimeOrchestrator,
+    sandbox: &SandboxEnforcer,
+    sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &mut EbpfCollector,
+    agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    agent_command: &[String],
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    event_store: &Arc<EventStore>,
+    runtime_health: &crate::runtime_health::SharedRuntimeHealthState,
+    projection_db_path: &str,
+    operator_auth_required: bool,
+    service_health_state: crate::service_health::ServiceHealthWorkerSnapshot,
+    fs_mount: Option<&str>,
+    request: RuntimeReconcileRequest,
+    respawn_backoff: &mut RespawnBackoffTracker,
+    source: RuntimeReconcileSource,
+) -> RuntimeReconcileResponse {
+    let projection_path = std::path::Path::new(projection_db_path);
+    let data_dir = projection_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut reconcile_ctx = RuntimeReconcileContext {
+        tick_count,
+        current_shift,
+        all_agents,
+        world,
+        runtime_orch,
+        sandbox,
+        sandbox_handles,
+        ebpf_collector,
+        agent_processes,
+        agent_command,
+        security_runtime_state,
+        event_store,
+        runtime_health,
+        projection_db_path: projection_path,
+        operator_auth_required,
+        service_health_state,
+        fs_mount,
+        data_dir,
+        restart_service_fn: crate::service_health::restart_service_now,
+        is_service_active_fn: crate::service_health::is_service_active_now,
+    };
+    run_runtime_reconcile(&mut reconcile_ctx, request, respawn_backoff, source)
+}
+
 fn run_runtime_reconcile(
     ctx: &mut RuntimeReconcileContext<'_>,
     request: RuntimeReconcileRequest,
     respawn_backoff: &mut RespawnBackoffTracker,
+    source: RuntimeReconcileSource,
 ) -> RuntimeReconcileResponse {
     let elapsed_started = std::time::Instant::now();
     let previous = ctx
@@ -1771,16 +1999,32 @@ fn run_runtime_reconcile(
                 agent_status_updates
                     .insert(agent.agent_id, "unexpected_runtime_cleaned".to_string());
             }
-            if agent.projection_present
-                && emit_runtime_projection_despawn_event(
+            if agent.projection_present {
+                match emit_runtime_projection_despawn_event(
                     ctx.event_store,
                     AgentId(agent.agent_id),
                     ctx.tick_count,
                 )
-            {
-                repair_ops_total += 1;
-                repaired_agents.push(agent.name.clone());
-                agent_status_updates.insert(agent.agent_id, "projection_despawned".to_string());
+                .and_then(|row_id| {
+                    mark_agent_projection_despawned(
+                        ctx.projection_db_path,
+                        AgentId(agent.agent_id),
+                        row_id,
+                    )
+                }) {
+                    Ok(()) => {
+                        repair_ops_total += 1;
+                        repaired_agents.push(agent.name.clone());
+                        agent_status_updates
+                            .insert(agent.agent_id, "projection_despawned".to_string());
+                    }
+                    Err(error) => {
+                        errors.push(format!(
+                            "Projection-only Despawn fehlgeschlagen fuer {}: {error}",
+                            agent.name
+                        ));
+                    }
+                }
             }
         }
 
@@ -1874,7 +2118,33 @@ fn run_runtime_reconcile(
                 && snapshot.security_runtime_present
                 && !snapshot.projection_present
             {
-                agent_status_updates.insert(agent_id, "projection_reconcile_pending".to_string());
+                if request.projection_rebuild && !request.dry_run {
+                    match emit_runtime_projection_spawn_event(
+                        ctx.event_store,
+                        agent_cfg,
+                        ctx.tick_count,
+                    )
+                    .and_then(|row_id| {
+                        upsert_agent_projection_seed(ctx.projection_db_path, agent_cfg, row_id)
+                    }) {
+                        Ok(()) => {
+                            repair_ops_total += 1;
+                            repaired_agents.push(agent_cfg.identity.name.clone());
+                            agent_status_updates.insert(agent_id, "projection_seeded".to_string());
+                        }
+                        Err(error) => {
+                            errors.push(format!(
+                                "Projection-Seed fehlgeschlagen fuer {}: {error}",
+                                agent_cfg.identity.name
+                            ));
+                            agent_status_updates
+                                .insert(agent_id, "projection_reconcile_pending".to_string());
+                        }
+                    }
+                } else {
+                    agent_status_updates
+                        .insert(agent_id, "projection_reconcile_pending".to_string());
+                }
                 respawn_backoff.record_success(agent_id);
                 continue;
             }
@@ -1989,6 +2259,11 @@ fn run_runtime_reconcile(
         Some(&before),
     );
     after.reconcile_runs_total = before.reconcile_runs_total.saturating_add(1);
+    if source.is_periodic() {
+        after.auto_reconcile_runs_total = before.auto_reconcile_runs_total.saturating_add(1);
+    }
+    after.last_reconcile_tick = ctx.tick_count;
+    after.last_reconcile_source = source.as_str().to_string();
     after.reconcile_repairs_total = before
         .reconcile_repairs_total
         .saturating_add(repair_ops_total as u64);
@@ -2285,6 +2560,10 @@ fn teardown_agent_full(
     agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
     security_runtime_state: &operator_api::SharedSecurityRuntimeState,
 ) {
+    if let Some(proc_handle) = agent_processes.remove(&agent_id) {
+        terminate_agent_process(proc_handle);
+    }
+
     if let Some(handle) = sandbox_handles.remove(&agent_id) {
         if handle.cgroup_created {
             if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
@@ -2294,10 +2573,6 @@ fn teardown_agent_full(
         if let Err(e) = sandbox.teardown_agent(&handle) {
             warn!(agent_id = %agent_id, error = %e, "Sandbox-Teardown bei Config-Apply fehlgeschlagen");
         }
-    }
-    if let Some(proc_handle) = agent_processes.remove(&agent_id) {
-        let _ = signal_pid(proc_handle.pid, "TERM");
-        drop(proc_handle);
     }
     remove_security_runtime_snapshot(security_runtime_state, agent_id);
     if runtime_orch.agents().contains_key(&agent_id) {
@@ -2399,6 +2674,8 @@ fn ecs_tick_loop(
     events_db_path_str: String,
     platform_state: Arc<RwLock<crate::platform_controlplane::PlatformStateSnapshot>>,
     runtime_health: crate::runtime_health::SharedRuntimeHealthState,
+    llm_circuit_open: Arc<AtomicBool>,
+    llm_activity_ticks: Arc<Mutex<HashMap<AgentId, u64>>>,
     security_runtime_state: operator_api::SharedSecurityRuntimeState,
     projection_db_path: String,
     operator_auth_required: bool,
@@ -2912,34 +3189,28 @@ fn ecs_tick_loop(
                     request,
                     response_tx,
                 } => {
-                    let projection_path = std::path::Path::new(&projection_db_path);
-                    let data_dir = projection_path
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."));
-                    let mut reconcile_ctx = RuntimeReconcileContext {
+                    let response = execute_runtime_reconcile(
                         tick_count,
                         current_shift,
-                        all_agents: &all_agents,
-                        world: &mut world,
-                        runtime_orch: &mut runtime_orch,
-                        sandbox: &sandbox,
-                        sandbox_handles: &mut sandbox_handles,
-                        ebpf_collector: &mut ebpf_collector,
-                        agent_processes: &mut agent_processes,
-                        agent_command: &agent_command,
-                        security_runtime_state: &security_runtime_state,
-                        event_store: &event_store_for_prune,
-                        runtime_health: &runtime_health,
-                        projection_db_path: projection_path,
+                        &all_agents,
+                        &mut world,
+                        &mut runtime_orch,
+                        &sandbox,
+                        &mut sandbox_handles,
+                        &mut ebpf_collector,
+                        &mut agent_processes,
+                        &agent_command,
+                        &security_runtime_state,
+                        &event_store_for_prune,
+                        &runtime_health,
+                        &projection_db_path,
                         operator_auth_required,
-                        service_health_state: service_health_checker.worker_state(),
-                        fs_mount: fs_mount.as_deref(),
-                        data_dir,
-                        restart_service_fn: crate::service_health::restart_service_now,
-                        is_service_active_fn: crate::service_health::is_service_active_now,
-                    };
-                    let response =
-                        run_runtime_reconcile(&mut reconcile_ctx, request, &mut respawn_backoff);
+                        service_health_checker.worker_state(),
+                        fs_mount.as_deref(),
+                        request,
+                        &mut respawn_backoff,
+                        RuntimeReconcileSource::Operator,
+                    );
                     let _ = response_tx.send(response);
                 }
                 RuntimeControlCommand::AnalysisFloodTest {
@@ -3160,6 +3431,8 @@ fn ecs_tick_loop(
                 &events_db_path_str,
                 tick_count,
                 &service_health_checker,
+                llm_circuit_open.as_ref(),
+                llm_activity_ticks.as_ref(),
             );
             let output = platform_cp.cycle(
                 &pcp_metrics,
@@ -3295,6 +3568,41 @@ fn ecs_tick_loop(
                 }
             }
         }
+        if should_run_periodic_runtime_reconcile(platform_cp.config(), tick_count) {
+            let request = periodic_runtime_reconcile_request(platform_cp.config());
+            let response = execute_runtime_reconcile(
+                tick_count,
+                current_shift,
+                &all_agents,
+                &mut world,
+                &mut runtime_orch,
+                &sandbox,
+                &mut sandbox_handles,
+                &mut ebpf_collector,
+                &mut agent_processes,
+                &agent_command,
+                &security_runtime_state,
+                &event_store_for_prune,
+                &runtime_health,
+                &projection_db_path,
+                operator_auth_required,
+                service_health_checker.worker_state(),
+                fs_mount.as_deref(),
+                request,
+                &mut respawn_backoff,
+                RuntimeReconcileSource::Periodic,
+            );
+            debug!(
+                tick = tick_count,
+                elapsed_us = response.elapsed_us,
+                repairs = response.security_snapshots_removed
+                    + response.unexpected_runtime_removed
+                    + response.orphan_cgroups_removed
+                    + response.respawned_agents,
+                status = %response.repair_last_status,
+                "Periodischer Runtime-Reconcile abgeschlossen"
+            );
+        }
         publish_platform_state_snapshot(
             &platform_state,
             tick_count,
@@ -3362,7 +3670,10 @@ fn ecs_tick_loop(
                 // Alte Schicht-Agents entfernen (Orchestrator entfernt + emittiert Events)
                 let removed = runtime_orch.shift_transition(new_shift);
                 for agent_id in &removed {
-                    // Sandbox teardown VOR ECS despawn
+                    if let Some(proc_handle) = agent_processes.remove(agent_id) {
+                        terminate_agent_process(proc_handle);
+                    }
+
                     if let Some(handle) = sandbox_handles.remove(agent_id) {
                         // eBPF Agent-Unregistrierung
                         if handle.cgroup_created {
@@ -3374,8 +3685,6 @@ fn ecs_tick_loop(
                             warn!(agent_id = %agent_id, error = %e, "Sandbox teardown fehlgeschlagen");
                         }
                     }
-                    // AgentProcess droppen (reaps Zombie via Drop impl)
-                    agent_processes.remove(agent_id);
                     remove_security_runtime_snapshot(&security_runtime_state, *agent_id);
 
                     if !despawn_agent_from_world(&mut world, *agent_id) {
@@ -4252,6 +4561,10 @@ fn ecs_tick_loop(
                                 let agent_ids: Vec<sentinel_common::AgentId> =
                                     agent_processes.keys().copied().collect();
                                 for agent_id in &agent_ids {
+                                    if let Some(proc_handle) = agent_processes.remove(agent_id) {
+                                        terminate_agent_process(proc_handle);
+                                    }
+
                                     if let Some(handle) = sandbox_handles.remove(agent_id) {
                                         if handle.cgroup_created {
                                             if let Some(cid) =
@@ -4268,7 +4581,6 @@ fn ecs_tick_loop(
                                             );
                                         }
                                     }
-                                    agent_processes.remove(agent_id);
                                     remove_security_runtime_snapshot(
                                         &security_runtime_state,
                                         *agent_id,
@@ -5273,6 +5585,118 @@ mod tests {
     }
 
     #[test]
+    fn should_run_periodic_runtime_reconcile_respects_due_rules() {
+        let mut config = crate::config::PlatformControlplaneConfig::default();
+
+        assert!(!should_run_periodic_runtime_reconcile(&config, 0));
+        assert!(!should_run_periodic_runtime_reconcile(&config, 59));
+        assert!(should_run_periodic_runtime_reconcile(&config, 60));
+        assert!(should_run_periodic_runtime_reconcile(&config, 120));
+
+        config.runtime_reconcile_enabled = false;
+        assert!(!should_run_periodic_runtime_reconcile(&config, 60));
+
+        config.runtime_reconcile_enabled = true;
+        config.runtime_reconcile_interval_ticks = 0;
+        assert!(should_run_periodic_runtime_reconcile(&config, 1));
+        assert!(should_run_periodic_runtime_reconcile(&config, 2));
+        assert!(!should_run_periodic_runtime_reconcile(&config, 0));
+    }
+
+    #[test]
+    fn periodic_runtime_reconcile_request_is_explicit_and_configured() {
+        let config = crate::config::PlatformControlplaneConfig {
+            runtime_reconcile_respawn_missing: false,
+            runtime_reconcile_projection_rebuild: false,
+            ..crate::config::PlatformControlplaneConfig::default()
+        };
+
+        let request = periodic_runtime_reconcile_request(&config);
+
+        assert!(!request.dry_run);
+        assert!(!request.respawn_missing);
+        assert!(!request.projection_rebuild);
+    }
+
+    #[test]
+    fn runtime_reconcile_records_operator_and_periodic_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.db");
+        let projection_path = tmp.path().join("projection.db");
+        let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
+        let (mut world, _schedule) = create_simulation_world();
+        let sandbox = test_sandbox();
+        let (mut ebpf_collector, _ebpf_tx) = test_ebpf();
+        let mut runtime_orch =
+            RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
+        let mut sandbox_handles = HashMap::new();
+        let mut agent_processes = HashMap::new();
+        let security_runtime_state = Arc::new(RwLock::new(HashMap::new()));
+        let runtime_health = Arc::new(RwLock::new(
+            crate::runtime_health::RuntimeHealthSnapshot::default(),
+        ));
+        let mut respawn_backoff = RespawnBackoffTracker::new(3);
+        let mut reconcile_ctx = RuntimeReconcileContext {
+            tick_count: 10,
+            current_shift: 1,
+            all_agents: &[],
+            world: &mut world,
+            runtime_orch: &mut runtime_orch,
+            sandbox: &sandbox,
+            sandbox_handles: &mut sandbox_handles,
+            ebpf_collector: &mut ebpf_collector,
+            agent_processes: &mut agent_processes,
+            agent_command: &[],
+            security_runtime_state: &security_runtime_state,
+            event_store: &event_store,
+            runtime_health: &runtime_health,
+            projection_db_path: &projection_path,
+            operator_auth_required: false,
+            service_health_state: crate::service_health::ServiceHealthWorkerSnapshot::default(),
+            fs_mount: None,
+            data_dir: tmp.path(),
+            restart_service_fn: record_projection_restart,
+            is_service_active_fn: projection_service_active,
+        };
+        let request = RuntimeReconcileRequest {
+            dry_run: true,
+            projection_rebuild: false,
+            respawn_missing: false,
+        };
+
+        let operator_response = run_runtime_reconcile(
+            &mut reconcile_ctx,
+            request.clone(),
+            &mut respawn_backoff,
+            RuntimeReconcileSource::Operator,
+        );
+        assert!(operator_response.accepted);
+        {
+            let snapshot = runtime_health.read().unwrap();
+            assert_eq!(snapshot.reconcile_runs_total, 1);
+            assert_eq!(snapshot.auto_reconcile_runs_total, 0);
+            assert_eq!(snapshot.last_reconcile_tick, 10);
+            assert_eq!(snapshot.last_reconcile_source, "operator");
+        }
+
+        reconcile_ctx.tick_count = 60;
+        let periodic_response = run_runtime_reconcile(
+            &mut reconcile_ctx,
+            request,
+            &mut respawn_backoff,
+            RuntimeReconcileSource::Periodic,
+        );
+        assert!(periodic_response.accepted);
+        {
+            let snapshot = runtime_health.read().unwrap();
+            assert_eq!(snapshot.reconcile_runs_total, 2);
+            assert_eq!(snapshot.auto_reconcile_runs_total, 1);
+            assert_eq!(snapshot.last_reconcile_tick, 60);
+            assert_eq!(snapshot.last_reconcile_source, "periodic");
+        }
+    }
+
+    #[test]
     fn test_suspend_pids_stops_tracked_process() {
         let mut child = std::process::Command::new("sleep")
             .arg("30")
@@ -5352,6 +5776,105 @@ mod tests {
     }
 
     #[test]
+    fn runtime_reconcile_projection_seed_persists_event_and_live_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.db");
+        let projection_path = tmp.path().join("projection.db");
+        let event_store = EventStore::open(events_path.to_str().unwrap()).unwrap();
+        let projection_store =
+            sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap();
+        drop(projection_store);
+
+        let agent_cfg = test_agent_config(46, "Ralf Steinbach", "Operations", 1);
+        let row_id = emit_runtime_projection_spawn_event(&event_store, &agent_cfg, 2095680)
+            .expect("projection seed event");
+        upsert_agent_projection_seed(&projection_path, &agent_cfg, row_id)
+            .expect("projection seed upsert");
+
+        let events = event_store.get_events_since(0, 10).unwrap();
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == "agent_spawned"
+                    && event.aggregate_id == "AGENT-46"
+                    && event.payload.contains("\"agent_id\":46")
+            }),
+            "Projection-Seed muss als AgentSpawned-Event rebuild-faehig persistieren"
+        );
+
+        let db = sentinel_limbo::rusqlite::Connection::open(&projection_path).unwrap();
+        let row: (String, String, String, String, i64) = db
+            .query_row(
+                "SELECT name, role, status, current_room, last_event_id
+                 FROM agent_live_view
+                 WHERE agent_id = 46",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, "Ralf Steinbach");
+        assert_eq!(row.1, "Operations");
+        assert_eq!(row.2, "active");
+        assert_eq!(row.3, "empfang");
+        assert_eq!(row.4, row_id);
+    }
+
+    #[test]
+    fn runtime_reconcile_projection_despawn_marks_live_view_inactive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.db");
+        let projection_path = tmp.path().join("projection.db");
+        let event_store = EventStore::open(events_path.to_str().unwrap()).unwrap();
+        let projection_store =
+            sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap();
+        drop(projection_store);
+
+        let db = sentinel_limbo::rusqlite::Connection::open(&projection_path).unwrap();
+        db.execute(
+            "INSERT INTO agent_live_view
+               (agent_id, name, role, shift_set, status, current_room, in_transit, last_event_id, updated_at)
+             VALUES (39, 'Victoria Lehmann', 'Support', 3, 'active', 'empfang', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        let row_id = emit_runtime_projection_despawn_event(&event_store, AgentId(39), 2096700)
+            .expect("projection despawn event");
+        mark_agent_projection_despawned(&projection_path, AgentId(39), row_id)
+            .expect("projection despawn update");
+
+        let events = event_store.get_events_since(0, 10).unwrap();
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == "agent_despawned"
+                    && event.aggregate_id == "AGENT-39"
+                    && event.payload.contains("\"agent_id\":39")
+            }),
+            "Projection-only Despawn muss als AgentDespawned-Event rebuild-faehig persistieren"
+        );
+
+        let row: (String, i64, Option<String>) = db
+            .query_row(
+                "SELECT status, in_transit, transit_target
+                 FROM agent_live_view
+                 WHERE agent_id = 39",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "despawned");
+        assert_eq!(row.1, 0);
+        assert_eq!(row.2, None);
+    }
+
+    #[test]
     fn test_runtime_reconcile_skips_projection_restart_when_rebuild_can_run_in_place() {
         PROJECTION_RESTART_CALLS.store(0, Ordering::SeqCst);
 
@@ -5414,6 +5937,7 @@ mod tests {
                 respawn_missing: false,
             },
             &mut respawn_backoff,
+            RuntimeReconcileSource::Operator,
         );
 
         assert!(response.projection_drift_before);
@@ -5499,6 +6023,8 @@ mod tests {
             Arc::new(RwLock::new(
                 crate::runtime_health::RuntimeHealthSnapshot::default(),
             )),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(HashMap::new())),
             Arc::new(RwLock::new(HashMap::new())),
             String::new(),
             false,
@@ -5589,6 +6115,8 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::runtime_health::RuntimeHealthSnapshot::default(),
                 )),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(RwLock::new(HashMap::new())),
                 String::new(),
                 false,
@@ -5696,6 +6224,8 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::runtime_health::RuntimeHealthSnapshot::default(),
                 )),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(RwLock::new(HashMap::new())),
                 String::new(),
                 false,
@@ -5811,6 +6341,8 @@ mod tests {
                 Arc::new(RwLock::new(
                     crate::runtime_health::RuntimeHealthSnapshot::default(),
                 )),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(RwLock::new(HashMap::new())),
                 String::new(),
                 false,

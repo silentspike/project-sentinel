@@ -483,6 +483,14 @@ pub struct PlatformControlplaneConfig {
     pub write_anomaly_baseline_multiplier: f64,
     #[serde(default = "default_pcp_write_anomaly_cooldown")]
     pub write_anomaly_cooldown_ticks: u64,
+    #[serde(default = "default_pcp_runtime_reconcile_enabled")]
+    pub runtime_reconcile_enabled: bool,
+    #[serde(default = "default_pcp_runtime_reconcile_interval")]
+    pub runtime_reconcile_interval_ticks: u64,
+    #[serde(default = "default_pcp_runtime_reconcile_respawn_missing")]
+    pub runtime_reconcile_respawn_missing: bool,
+    #[serde(default = "default_pcp_runtime_reconcile_rebuild")]
+    pub runtime_reconcile_projection_rebuild: bool,
     #[serde(default = "default_pcp_monitored_services")]
     pub monitored_services: Vec<String>,
     #[serde(default = "default_pcp_service_check_interval")]
@@ -549,12 +557,20 @@ fn default_pcp_write_anomaly_baseline_multiplier() -> f64 {
 fn default_pcp_write_anomaly_cooldown() -> u64 {
     60
 }
+fn default_pcp_runtime_reconcile_enabled() -> bool {
+    true
+}
+fn default_pcp_runtime_reconcile_interval() -> u64 {
+    60
+}
+fn default_pcp_runtime_reconcile_respawn_missing() -> bool {
+    true
+}
+fn default_pcp_runtime_reconcile_rebuild() -> bool {
+    true
+}
 fn default_pcp_monitored_services() -> Vec<String> {
-    vec![
-        "sentinel-judge".into(),
-        "sentinel-projection".into(),
-        "sentinel-gateway".into(),
-    ]
+    vec!["sentinel-judge".into(), "sentinel-projection".into()]
 }
 fn default_pcp_service_check_interval() -> u64 {
     60
@@ -604,6 +620,10 @@ impl Default for PlatformControlplaneConfig {
             write_anomaly_threshold_bytes_per_sec: default_pcp_write_anomaly_threshold(),
             write_anomaly_baseline_multiplier: default_pcp_write_anomaly_baseline_multiplier(),
             write_anomaly_cooldown_ticks: default_pcp_write_anomaly_cooldown(),
+            runtime_reconcile_enabled: default_pcp_runtime_reconcile_enabled(),
+            runtime_reconcile_interval_ticks: default_pcp_runtime_reconcile_interval(),
+            runtime_reconcile_respawn_missing: default_pcp_runtime_reconcile_respawn_missing(),
+            runtime_reconcile_projection_rebuild: default_pcp_runtime_reconcile_rebuild(),
             monitored_services: default_pcp_monitored_services(),
             service_check_interval_secs: default_pcp_service_check_interval(),
             llm_enabled: default_pcp_llm_enabled(),
@@ -744,6 +764,36 @@ data_dir = "/tmp/data"
                 .platform_controlplane
                 .service_check_interval_secs,
             60
+        );
+        assert_eq!(
+            file.daemon.platform_controlplane.monitored_services,
+            vec![
+                "sentinel-judge".to_string(),
+                "sentinel-projection".to_string()
+            ]
+        );
+        assert!(!file
+            .daemon
+            .platform_controlplane
+            .monitored_services
+            .iter()
+            .any(|service| service == "sentinel-gateway"));
+        assert!(file.daemon.platform_controlplane.runtime_reconcile_enabled);
+        assert_eq!(
+            file.daemon
+                .platform_controlplane
+                .runtime_reconcile_interval_ticks,
+            60
+        );
+        assert!(
+            file.daemon
+                .platform_controlplane
+                .runtime_reconcile_respawn_missing
+        );
+        assert!(
+            file.daemon
+                .platform_controlplane
+                .runtime_reconcile_projection_rebuild
         );
         assert!(file.daemon.platform_controlplane.llm_enabled);
         assert_eq!(
@@ -957,6 +1007,10 @@ max_escalation = 4
 write_anomaly_threshold_bytes_per_sec = 111
 write_anomaly_baseline_multiplier = 12.5
 write_anomaly_cooldown_ticks = 22
+runtime_reconcile_enabled = false
+runtime_reconcile_interval_ticks = 7
+runtime_reconcile_respawn_missing = false
+runtime_reconcile_projection_rebuild = false
 service_check_interval_secs = 15
 llm_enabled = false
 llm_analysis_interval_secs = 600
@@ -984,6 +1038,10 @@ llm_analysis_channel_capacity = 11
         assert_eq!(cfg.write_anomaly_threshold_bytes_per_sec, 111);
         assert_eq!(cfg.write_anomaly_baseline_multiplier, 12.5);
         assert_eq!(cfg.write_anomaly_cooldown_ticks, 22);
+        assert!(!cfg.runtime_reconcile_enabled);
+        assert_eq!(cfg.runtime_reconcile_interval_ticks, 7);
+        assert!(!cfg.runtime_reconcile_respawn_missing);
+        assert!(!cfg.runtime_reconcile_projection_rebuild);
         assert_eq!(cfg.service_check_interval_secs, 15);
         assert!(!cfg.llm_enabled);
         assert_eq!(cfg.llm_analysis_interval_secs, 600);

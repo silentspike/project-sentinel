@@ -65,6 +65,12 @@ pub struct RuntimeHealthSnapshot {
     pub analysis_queue_dropped_total: u64,
     pub analysis_queue_coalesced_total: u64,
     pub reconcile_runs_total: u64,
+    #[serde(default)]
+    pub auto_reconcile_runs_total: u64,
+    #[serde(default)]
+    pub last_reconcile_tick: u64,
+    #[serde(default)]
+    pub last_reconcile_source: String,
     pub reconcile_repairs_total: u64,
     pub respawn_failures: u64,
     #[serde(default)]
@@ -290,6 +296,9 @@ pub fn build_runtime_health_snapshot(
         analysis_queue_dropped_total: 0,
         analysis_queue_coalesced_total: 0,
         reconcile_runs_total: 0,
+        auto_reconcile_runs_total: 0,
+        last_reconcile_tick: 0,
+        last_reconcile_source: String::new(),
         reconcile_repairs_total: 0,
         respawn_failures: 0,
         last_repair_error: None,
@@ -304,6 +313,9 @@ pub fn build_runtime_health_snapshot(
         snapshot.analysis_queue_dropped_total = previous.analysis_queue_dropped_total;
         snapshot.analysis_queue_coalesced_total = previous.analysis_queue_coalesced_total;
         snapshot.reconcile_runs_total = previous.reconcile_runs_total;
+        snapshot.auto_reconcile_runs_total = previous.auto_reconcile_runs_total;
+        snapshot.last_reconcile_tick = previous.last_reconcile_tick;
+        snapshot.last_reconcile_source = previous.last_reconcile_source.clone();
         snapshot.reconcile_repairs_total = previous.reconcile_repairs_total;
         snapshot.respawn_failures = previous.respawn_failures;
         snapshot.last_repair_error = previous.last_repair_error.clone();
@@ -582,5 +594,37 @@ mod tests {
             worker.last_error.as_deref(),
             Some("panic-test requested for service_health")
         );
+    }
+
+    #[test]
+    fn build_snapshot_preserves_reconcile_source_counters() {
+        let tmp = tempdir().unwrap();
+        let previous = RuntimeHealthSnapshot {
+            reconcile_runs_total: 9,
+            auto_reconcile_runs_total: 4,
+            last_reconcile_tick: 120,
+            last_reconcile_source: "periodic".to_string(),
+            reconcile_repairs_total: 7,
+            ..RuntimeHealthSnapshot::default()
+        };
+
+        let snapshot = build_runtime_health_snapshot(
+            &[],
+            1,
+            &RuntimeOrchestrator::new(30),
+            &HashMap::new(),
+            &HashMap::new(),
+            &Arc::new(RwLock::new(HashMap::new())),
+            &tmp.path().join("projection.db"),
+            false,
+            ServiceHealthWorkerSnapshot::default(),
+            Some(&previous),
+        );
+
+        assert_eq!(snapshot.reconcile_runs_total, 9);
+        assert_eq!(snapshot.auto_reconcile_runs_total, 4);
+        assert_eq!(snapshot.last_reconcile_tick, 120);
+        assert_eq!(snapshot.last_reconcile_source, "periodic");
+        assert_eq!(snapshot.reconcile_repairs_total, 7);
     }
 }
