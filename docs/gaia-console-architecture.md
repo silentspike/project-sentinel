@@ -1,209 +1,209 @@
-# Gaia-Konsole — Architektur-Entscheidungen (SSOT)
+# Gaia Console - Architecture Decisions (SSOT)
 
-> Single Source of Truth fuer die Gaia-Konsole: das User-Interface zu Project Sentinel.
-> Alle Issues zu diesem Vorhaben verweisen hierher. Das **Was/Wie** steht im jeweiligen Issue,
-> das **Warum** hier. Status: Entscheidungen final (Maintainer, 2026-05-30), Umsetzung folgt.
+> Single Source of Truth for the Gaia Console: the user interface for Project Sentinel.
+> All issues for this initiative point here. The **what/how** is in the respective issue,
+> the **why** is here. Status: decisions final (Maintainer, 2026-05-30), implementation follows.
 >
-> Querverweise: `docs/togaf-deviations-v22.md` (DEV-008/DEV-009), `/work/company/AUDIT-sentinel-pp-noaide.md`,
-> Memory `decision_gaia_is_claude_code.md`. Design-Polish ist bewusst ein **eigenes spaeteres Thema** (vor Go-Live).
+> Cross-references: `docs/togaf-deviations-v22.md` (DEV-008/DEV-009), `/work/company/AUDIT-sentinel-pp-noaide.md`,
+> Memory `decision_gaia_is_claude_code.md`. Design polish is deliberately a **separate later topic** (before go-live).
 
 ---
 
-## 0. Leitprinzip — Polyglot, best of all worlds
+## 0. Guiding Principle - Polyglot, best of all worlds
 
-Sentinel ist bewusst **polyglot** (Rust + Go + …). Ziel ist nicht Einheitssprache, sondern
-**Overhead-Reduktion, I/O-Reduktion, Performance-Maximierung** — jede Schicht bekommt ihr
-overhead-aermstes Werkzeug. (Lauffaehigkeit auf schwacher Hardware ist der Nebeneffekt davon,
-nicht das Ziel; primaer geht es um Overhead/IO/Perf auf moeglichst starker Hardware.)
-Dieses Prinzip praegt jede Tech-Entscheidung unten.
+Sentinel is deliberately **polyglot** (Rust + Go + ...). The goal is not one unified language, but
+**overhead reduction, I/O reduction, performance maximization** - every layer gets its
+lowest-overhead tool. (Ability to run on weak hardware is the side effect of that,
+not the goal; the primary focus is overhead/IO/perf on the strongest possible hardware.)
+This principle shapes every technical decision below.
 
 ---
 
-## 1. Vision & Rolle von Gaia
+## 1. Vision & Role of Gaia
 
-**Gaia ist die durchgaengige, reaktive User-Schnittstelle zu Sentinel** — eine vollwertige
-**Claude-Code-Instanz**, die *ueber* der bereits autonomen Firma sitzt. Drei Rollen:
+**Gaia is the continuous, reactive user interface to Sentinel** - a full-fledged
+**Claude Code instance** that sits *above* the already autonomous company. Three roles:
 
-1. **Setup** — Firma im Dialog erstellen (adaptiv-dialogisches Interview).
-2. **Orchestrierung (nur auf Auftrag)** — „mach einen Plan und kuemmere dich um die Umsetzung" →
-   Gaia plant, delegiert hierarchisch, ueberwacht (Task-Entity + Voice-of-Gaia).
-3. **Observability/Kontrolle** — Voll-Sicht + Steuerung von Firma *und* Plattform.
+1. **Setup** - create the company through dialog (adaptive dialog interview).
+2. **Orchestration (only when instructed)** - "make a plan and take care of implementation" ->
+   Gaia plans, delegates hierarchically, monitors (Task Entity + Voice of Gaia).
+3. **Observability/control** - full visibility + control of company *and* platform.
 
-**Gaia handelt nie von sich aus.** Die Firma reguliert/heilt/lernt/verbessert sich bereits selbst
-(siehe §6). Gaia ist rein reaktiv: keine eigene Agenda, keine laufenden Tasks ausser auf
-expliziten User-Auftrag. Der „Bereitschafts-Loop" (§3) informiert den User, greift nicht selbst ein.
+**Gaia never acts on its own.** The company already regulates/heals/learns/improves itself
+(see section 6). Gaia is purely reactive: no agenda of its own, no running tasks except on
+explicit user instruction. The "standby loop" (section 3) informs the user; it does not intervene on its own.
 
-### Drei verschiedene „Gaia" — nie verwechseln
-| Begriff | Was es ist |
+### Three Different "Gaia" - Never Confuse Them
+| Term | What it is |
 |---|---|
-| **Gaia** (Interface) | Claude-Code-Instanz, das User-Tor. Reaktiv. Ruft Werkzeuge auf. |
-| **`sentinel-gaia`** (#414–416) | Deterministisches Generator-Tool (Rust, blake3, kein LLM), das Gaia *aufruft*. |
-| **Voice of Gaia** | Laufzeit-Gedankeninfusion an Sim-Agents (`OperatorGaiaCommand` → `inner-voice`-`<system>`-Block, getarnt als agenten-eigener Gedanke). **Bereits integriert** (`cortex-gateway/.../structured.go`). |
+| **Gaia** (Interface) | Claude Code instance, the user gateway. Reactive. Calls tools. |
+| **`sentinel-gaia`** (#414-416) | Deterministic generator tool (Rust, blake3, no LLM) that Gaia *calls*. |
+| **Voice of Gaia** | Runtime thought infusion into Sim agents (`OperatorGaiaCommand` -> `inner-voice`-`<system>` block, disguised as an agent's own thought). **Already integrated** (`cortex-gateway/.../structured.go`). |
 
 ---
 
-## 2. Werkzeug-Zugriff — CLI statt MCP
+## 2. Tool Access - CLI Instead of MCP
 
-**Entscheidung:** Kein MCP-Server. Stattdessen ein **`sentinel-ctl`-CLI** (Rust), das Gaia via
-**Bash** aufruft (Claude Code nativ). Gaia laeuft `claude -p` **lokal auf derselben VM** wie das
-Backend → ein MCP-Server (eigener Prozess + HTTP/SSE-Transport + Protokoll-Roundtrip) waere reiner
-Overhead; er lohnt nur remote/multi-client.
+**Decision:** No MCP server. Instead, a **`sentinel-ctl` CLI** (Rust) that Gaia invokes via
+**Bash** (Claude Code native). Gaia runs `claude -p` **locally on the same VM** as the
+backend -> an MCP server (own process + HTTP/SSE transport + protocol roundtrip) would be pure
+overhead; it only pays off for remote/multi-client setups.
 
-- Kapselt Operator-API + Telemetrie + Events + Platform-Admin als **feinkoernige Subcommands**
+- Encapsulates Operator API + telemetry + events + Platform Admin as **fine-grained subcommands**
   (`chat-to-room`, `set-agent-tier`, `apply-config`, `restore`, `platform …`).
-- Jeder mutierende/hochriskante Subcommand laeuft durch ein **operator-seitiges Policy-Gate** (RiskLevel Read/Mutate/HighRisk + Bestaetigung) + Konsolen-Gate. **NICHT** #391 — das ist die gateway-seitige *Agent*-Tool-Policy (`agent_policy.go`); das ctl-Gate ist die eigenstaendige Operator-Ebene.
-- Bonus: dasselbe CLI ist direkt vom User nutzbar + deterministisch testbar (kein Server-Mock).
+- Every mutating/high-risk subcommand goes through an **operator-side policy gate** (RiskLevel Read/Mutate/HighRisk + confirmation) + console gate. **NOT** #391 - that is the gateway-side *agent* tool policy (`agent_policy.go`); the ctl gate is the independent operator layer.
+- Bonus: the same CLI is directly usable by the user + deterministically testable (no server mock).
 
 ---
 
-## 3. Laufzeit-Modell
+## 3. Runtime Model
 
-- **Hybrid**: leichter, event-/schedule-getriggerter **Bereitschafts-Loop** (informiert/benachrichtigt
-  den User, handelt nicht selbst) + **tiefe Sessions on-demand** bei Auftrag.
-- **Spawn**: pro Auftrag eine **headless `claude -p`**-Session (Subscription, claude-code-Provider-Pfad),
-  `--resume` fuer Mehrturn-Kontext, beendet nach Erledigung. Token-bewusst.
-- **Token**: nur Monitoring, kein hartes Limit; Live-Cost-Sicht via API-Cost-Control-Plane + OTel-GenAI (#427).
+- **Hybrid**: lightweight, event-/schedule-triggered **standby loop** (informs/notifies
+  the user, does not act on its own) + **deep sessions on demand** when instructed.
+- **Spawn**: one **headless `claude -p`** session per task (subscription, claude-code provider path),
+  `--resume` for multi-turn context, exits after completion. Token-aware.
+- **Token**: monitoring only, no hard limit; live cost view via API Cost Control Plane + OTel GenAI (#427).
 
 ---
 
-## 4. Frontend — Polyglot pro Schicht
+## 4. Frontend - Polyglot Per Layer
 
-Kein „eine Sprache". Jede Schicht ihr overhead-aermstes Werkzeug:
+No "one language". Every layer gets its lowest-overhead tool:
 
-| Schicht | Werkzeug | Warum |
+| Layer | Tool | Why |
 |---|---|---|
-| **DOM / UI-Reaktivitaet** | **JS / SolidJS** (fine-grained Signals) | overhead-minimal am DOM; Rust/WASM-UI (Leptos/Dioxus) zahlt pro DOM-Update WASM↔JS-Bridge-Overhead → gegen das Ziel |
-| **Heavy-Data** (CAS-Decode, Dedup, msgpack/zstd, Validierung) | **Rust → WASM** (Worker, off-main-thread) | low-level, kein GC, SIMD |
-| **Rendering** (Floorplan, Live-Charts) | **WebGL/Canvas** (live) + **SVG** (Struktur) | GPU/Canvas-Performance bei vielen Datenpunkten |
+| **DOM / UI reactivity** | **JS / SolidJS** (fine-grained Signals) | minimal DOM overhead; Rust/WASM UI (Leptos/Dioxus) pays WASM<->JS bridge overhead per DOM update -> against the goal |
+| **Heavy Data** (CAS decode, dedup, msgpack/zstd, validation) | **Rust -> WASM** (Worker, off-main-thread) | low-level, no GC, SIMD |
+| **Rendering** (floorplan, live charts) | **WebGL/Canvas** (live) + **SVG** (structure) | GPU/Canvas performance with many data points |
 
-- noaide/PixelPerfekt = **UI-Pattern-Referenzen** (Chat-Layout, Tool-Cards, Mobile, Kanban), **kein Code-Port**.
-- **Layout/IA**: dynamisch-kachelbares Workspace-Layout im **niri/Hyprland-Stil** (freies Resizing,
-  smooth Web-Animations), eigene leichte **Tiling-Engine** (SolidJS-Signals + CSS Grid + ResizeObserver).
-  Drei Saeulen: **Dashboard** (Highlight, Infografiken) · **Control-Center** (Agents/Raeume/Voice-of-Gaia) · **Chat**.
-- **Mobile**: native-app-artig (BottomTabBar + SwipeView + Pull-to-refresh), Desktop/Mobile via Breakpoint.
-- **i18n**: Deutsch primaer, UI-Strings i18n-faehig (keine Hardcodes). Gaia-Dialog ist als LLM ohnehin multilingual.
-- **Design-Polish**: bewusst **vertagt** als eigenes grosses Thema (vor Go-Live, parallel zu Abnahmetests).
-  Jetzt nur **funktionales** Design; die Layout-Architektur (Tiling) entsteht aber schon jetzt.
+- noaide/PixelPerfekt = **UI pattern references** (chat layout, tool cards, mobile, Kanban), **no code port**.
+- **Layout/IA**: dynamically tileable workspace layout in the **niri/Hyprland style** (free resizing,
+  smooth web animations), custom lightweight **tiling engine** (SolidJS Signals + CSS Grid + ResizeObserver).
+  Three columns: **Dashboard** (highlight, infographics) · **Control Center** (agents/rooms/Voice of Gaia) · **Chat**.
+- **Mobile**: native-app-like (BottomTabBar + SwipeView + pull-to-refresh), desktop/mobile via breakpoint.
+- **i18n**: German primary, UI strings i18n-capable (no hardcodes). Gaia dialog is multilingual as an LLM anyway.
+- **Design polish**: deliberately **deferred** as a separate large topic (before go-live, in parallel with acceptance tests).
+  For now only **functional** design; the layout architecture (tiling) is already created now.
 
 ---
 
-## 5. Daten — CAS-Konsolen-Datenebene (1:n-Pointer)
+## 5. Data - CAS Console Data Plane (1:n Pointer)
 
-Das heutige Dashboard pollt 1s + sendet Voll-State (laggy). Loesung = Sentinels eigenes
-**1:n-Pointer/CAS-Prinzip** (`sentinel-fs`: content-defined chunking + blake3 + refcount-Dedup + zstd,
-99,2 % erprobt) auf den Konsolen-Datenstrom:
+Today's dashboard polls every 1s + sends full state (laggy). Solution = Sentinel's own
+**1:n pointer/CAS principle** (`sentinel-fs`: content-defined chunking + blake3 + refcount dedup + zstd,
+99.2% proven) applied to the console data stream:
 
-- **Eigene Console-Data-Plane**, die dieselben `sentinel-fs`-Primitive nutzt, aber auf **Stream/Append** optimiert.
-- **Wire**: Push (**WebTransport/QUIC only** — Maintainer 2026-05-31: KEIN WebSocket-Fallback; WebTransport ist seit Maerz 2026 Baseline, kein Doppel-Transport fuer Alt-Browser); **Client-Manifest + Server-Delta** — Client zieht nur
-  Bloecke, die er noch nicht hat (Conversations/System-Bloecke sind massiv redundant → Dedup greift stark).
-- **Client-Store**: **OPFS** fuer Binaer-Bloecke + **IndexedDB-Fallback**, hinter einem Interface.
-- **Observability-Tiefe**: aggregierte Live-Views default, **Drill-Down on-demand** (rohe Events/Internals
+- **Dedicated Console Data Plane** that uses the same `sentinel-fs` primitives, but optimized for **stream/append**.
+- **Wire**: Push (**WebTransport/QUIC only** - Maintainer 2026-05-31: NO WebSocket fallback; WebTransport has been Baseline since March 2026, no duplicate transport for legacy browsers); **Client Manifest + Server Delta** - the client fetches only
+  blocks it does not already have (Conversations/System blocks are massively redundant -> dedup is very effective).
+- **Client Store**: **OPFS** for binary blocks + **IndexedDB fallback**, behind an interface.
+- **Observability depth**: aggregated live views by default, **drill-down on demand** (raw events/internals
   lazy via CAS).
-- **Visualisierung**: Live-**Floorplan (2D)** + Daten-Charts.
+- **Visualization**: live **floorplan (2D)** + data charts.
 
 ---
 
-## 6. Self-* Systeme — Gaia dockt an, ersetzt NICHTS
+## 6. Self-* Systems - Gaia Docks On, Replaces NOTHING
 
-**Audit-Ergebnis (verifiziert, integriert UND aktiv):** Die Firma reguliert/heilt/lernt/verbessert sich
-bereits selbst. Gaia ist die strategische/User-Schicht *darueber*, nicht ein konkurrierender Controller.
+**Audit result (verified, integrated AND active):** The company already regulates/heals/learns/improves
+itself. Gaia is the strategic/user layer *above* that, not a competing controller.
 
-- **Self-Healing**: Agent-Control-Plane (`controlplane/` observe/decide/act/verify, TTL+rollback),
-  **Platform-CP** (`platform_controlplane/` Stall/EventStore/ProjectionLag/MemoryPressure) → bei
-  Fehlschlag **`llm_analyzer`-Eskalation** (aktiv: `enqueue`, orchestrator:2812/3016) → **`escalate_to_operator`-Pfad** (Z.2085). Circuit-Breaker.
-- **Self-Improving**: **Adaptive Tick** (PSI-Throttling), API-CP (Kosten via Synthesis).
-- **Self-Learning**: **Hippocampus/NMDA** (Episode→Sleep-Cycle-Konsolidierung→Narrative), **Nightrun**
-  (Evolution ohne Modelltraining), **Judge** (Drift/Quality/Fatigue/Swap), `evolution_task`, `EpisodeProducer`.
+- **Self-Healing**: Agent Control Plane (`controlplane/` observe/decide/act/verify, TTL+rollback),
+  **Platform CP** (`platform_controlplane/` Stall/EventStore/ProjectionLag/MemoryPressure) -> on
+  failure **`llm_analyzer` escalation** (active: `enqueue`, orchestrator:2812/3016) -> **`escalate_to_operator` path** (line 2085). Circuit breaker.
+- **Self-Improving**: **Adaptive Tick** (PSI throttling), API CP (costs via Synthesis).
+- **Self-Learning**: **Hippocampus/NMDA** (episode -> sleep-cycle consolidation -> narrative), **Nightrun**
+  (evolution without model training), **Judge** (drift/quality/fatigue/swap), `evolution_task`, `EpisodeProducer`.
 
-### Leitplanken (jede Gaia-Integration MUSS sie respektieren)
-1. **An `escalate_to_operator` andocken** — Gaia ist der Operator, empfaengt Eskalationen, macht sie
-   sichtbar/beraet. KEIN zweiter Healing-LLM-Loop, `llm_analyzer` bleibt.
-2. **Evolution-Schicht nicht autonom/heimlich ueberschreiben.** Die *autonome* Evolution (redb: Voice-Style/
-   Behavioral-Notes, vom Nightrun) ist additiv und veraendert die Base-TOML NICHT — „TOML = unveraenderliche
-   Identitaet" meint genau das (die Evolution laesst die Base in Ruhe), NICHT dass der User sie nicht aendern darf.
-   **Ein expliziter User-Edit der Base-Personality ist legitim und wirkt LIVE** am laufenden Agent — KEIN
-   Despawn/Respawn (das wuerde Memory + Evolution zerstoeren): `apply_personality` (Live-Component-Update,
-   world.rs:1365) + TOML-Persistenz + **Gateway-DNA-Cache-Invalidierung** (der `TOMLLoader` cacht die Big-Five
-   pro Agent → Edit erreicht den Prompt erst nach Reload; Erweiterung von #440 auf Agent-DNA). Memory + Evolution
-   bleiben erhalten. Strukturelles (Role/Tier/Caps) ohnehin live. Despawn nur fuer *entfernte* Agents.
-3. **Keine Kollision mit CP-Actions** (Vorrang/Koordination — nicht den Agent despawnen, den die CP heilt).
-4. **Adaptive-Tick/Resource-Manager nicht uebersteuern**.
-5. **Task-Entity koexistiert** mit der emergenten Agent-Autonomie, ersetzt sie nicht.
+### Guardrails (Every Gaia Integration MUST Respect Them)
+1. **Dock onto `escalate_to_operator`** - Gaia is the operator, receives escalations, makes them
+   visible/advises. NO second healing LLM loop; `llm_analyzer` remains.
+2. **Do not autonomously/secretly overwrite the evolution layer.** The *autonomous* evolution (redb: Voice-Style/
+   Behavioral-Notes, from Nightrun) is additive and does NOT change the base TOML - "TOML = immutable
+   identity" means exactly that (evolution leaves the base alone), NOT that the user is not allowed to change it.
+   **An explicit user edit of the base personality is legitimate and takes effect LIVE** on the running agent - NO
+   despawn/respawn (that would destroy memory + evolution): `apply_personality` (live component update,
+   world.rs:1365) + TOML persistence + **Gateway DNA cache invalidation** (the `TOMLLoader` caches the Big Five
+   per agent -> the edit reaches the prompt only after reload; extension of #440 to agent DNA). Memory + evolution
+   remain intact. Structural fields (role/tier/caps) are live anyway. Despawn only for *removed* agents.
+3. **No collision with CP actions** (priority/coordination - do not despawn the agent the CP is healing).
+4. **Do not override Adaptive Tick/Resource Manager**.
+5. **Task Entity coexists** with emergent agent autonomy; it does not replace it.
 
 ---
 
 ## 7. Memory
 
-**Kein semantisches Embedding** (zu viel Last/Overhead). Stattdessen auf Vorhandenem aufbauen:
+**No semantic embedding** (too much load/overhead). Instead, build on what already exists:
 
-- **Agent-Memory** = bereits vollstaendig: Events (Limbo) → `EpisodeProducer` (alle 30s) → Episode →
-  **Nightrun-Konsolidierung** (NMDA-Scoring + Narrative-Building) → Archive. JSONL/Outputs liegen im
-  virtuellen FS (CAS). Per Agent getrennt (gewollt). Bleibt; ggf. spaeter optionaler Recall.
-- **Gaia-Memory** = **Event-Rehydration + Gaia-Memory-File** (Setup, offene Tasks, Praeferenzen) **plus**
-  ein **eigener Rust-Graph (relational-temporal, OHNE Vektor)** fuer Gaias Wissen ueber Firma/User/Entscheidungen
-  (embedded auf redb/Limbo, SOTA-Prinzipien: bi-temporal, Staleness-bewusst — Graphiti-Idee, kein Fremd-Service).
-- **Semantische Abfrage** macht **Gaia als LLM** selbst (liest verdichtete Narratives + zieht Rohdaten on-demand).
-- Persistenz in die bestehenden Sentinel-Backups eingebunden.
-
----
-
-## 8. Weitere Festlegungen
-
-- **Arbeitsmodell**: **Task-Entity** (ECS, event-sourced, hierarchisch, Status pending→in_progress→done/blocked,
-  Kanban-Backing) **+ Voice-of-Gaia** als In-Sim-Zustellweg. Fortschritt aus Agent-Aktionen, Gaia ueberwacht via Projection.
-- **Chat-Scope**: volle PixelPerfekt-Paritaet — Room-Chat (existiert) + **1:1-Agent-DM** (neu) + **Room-Invite** (neu) + reiche Chat-UI.
-- **company-context**: Klare Trennung Inhalt/Form — **Gaia (LLM) liefert den Inhalt**, indem es im Interview die strukturierten `gaia-spec`-Felder (`mission`, `values[]`, Kultur-/Sozial-Achsen) befuellt; **`sentinel-gaia` rendert daraus deterministisch** (Template, kein LLM, blake3-reproduzierbar) die vollstaendige `company-context.md` (Mission/Werte + Organigramm-Prosa aus departments/Hierarchie/KPIs). So ist jede generierte Firma sofort eigenstaendig — auch eine reine CLI-Firma ohne Gaia-Lauf (kein PixelPerfekt-Default, AC-3). **Optionale narrative LLM-Anreicherung** der Prosa ist nachgelagert (Gaia-Loop, nicht Voraussetzung). **Gateway-Hot-Reload-Endpoint** (#440) macht Aenderungen live wirksam (Gateway cacht company-context + Agent-DNA statisch).
-- **Soziale Dimension**: strukturierte Kultur-/Sozial-Felder in der `gaia-spec` (steuern die Big-Five-Verteilung deterministisch) **+** fliessen ins deterministisch gerenderte company-context (kein freier LLM-Prosa-Durchreich).
-- **Gaia-Transparenz**: umschaltbar — Ergebnis-Sicht default, **Deep/Supervision-Modus** zeigt Gaias JSONL/Tool-Stream (noaide-Pattern) mit Gates.
-- **Auth**: Server-Session + httpOnly-Cookie (#405-Muster), Desktop+Mobile.
-- **Gaia-Persona**: neutrale Assistenz (kein Rollenspiel) + dynamisches Firmen-Wissen (Backend-injiziert) + CLI-Tools.
-- **Editier-Modalitaet**: beides — Gaia-Dialog **und** strukturierte UI-Editoren.
-- **Setup-Interview**: adaptiv-dialogisch mit interner Vollstaendigkeits-Checkliste.
-- **Time-Travel**: voll — bewusster Total-Restore (gegatet) **+** Gaia-gesteuerte selektive Extraktion (konversationell, ohne Welt-Reset).
-- **Platform/Nano-Container-Admin**: voll — observe + verwalten + Gaia-orchestriert (ueber CLI, mit Gates).
-- **Firmen-Scope**: **single aktiv + Firmen-Bibliothek** (gaia-specs speichern/laden/umschalten via #425 Fresh-Load); kein Multi-Tenant.
-- **Benachrichtigung**: nur In-Konsole-Alerts (kein ntfy/Web-Push).
-- **Deployment**: alles auf Deploy-VM (10.0.0.240) als systemd-Services; Konsole via `sentinel-dashboard-backend` auf HTTPS/WebTransport `:8001`.
-- **Test-Strategie**: mehrschichtig — Unit + Integration + Playwright-E2E + Gaia-Eval.
-- **Dashboard-Migration**: #433 migriert die neun Views strikt in die SolidJS-Konsole; der Bun/Hono-Pfad wird nach View-Paritaet entfernt.
+- **Agent Memory** = already complete: events (Limbo) -> `EpisodeProducer` (every 30s) -> episode ->
+  **Nightrun consolidation** (NMDA scoring + narrative building) -> archive. JSONL/outputs are in the
+  virtual FS (CAS). Separated per agent (intentional). Stays; optional recall maybe later.
+- **Gaia Memory** = **event rehydration + Gaia memory file** (setup, open tasks, preferences) **plus**
+  a **dedicated Rust graph (relational-temporal, WITHOUT vector)** for Gaia's knowledge about company/user/decisions
+  (embedded on redb/Limbo, SOTA principles: bi-temporal, staleness-aware - Graphiti idea, no third-party service).
+- **Semantic query** is done by **Gaia as LLM** itself (reads condensed narratives + fetches raw data on demand).
+- Persistence integrated into existing Sentinel backups.
 
 ---
 
-## 9. Bestandsaufnahme — existiert / nur Anbindung / Neubau
+## 8. Further Decisions
 
-**Existiert bereits (verifiziert):** Room-Chat (`RoomChatBuffer`), Voice-of-Gaia (`inner-voice`-`<system>`),
-Operator-API (chat/broadcast/restore/snapshot/nightrun/gaia/platform-analysis), Self-*-Systeme (CP, Platform-CP +
+- **Work model**: **Task Entity** (ECS, event-sourced, hierarchical, status pending->in_progress->done/blocked,
+  Kanban backing) **+ Voice of Gaia** as the in-simulation delivery path. Progress comes from agent actions; Gaia monitors via Projection.
+- **Chat scope**: full PixelPerfekt parity - room chat (exists) + **1:1 agent DM** (new) + **room invite** (new) + rich chat UI.
+- **company-context**: clear separation of content/form - **Gaia (LLM) supplies the content** by filling the structured `gaia-spec` fields (`mission`, `values[]`, culture/social axes) during the interview; **`sentinel-gaia` renders from that deterministically** (template, no LLM, blake3-reproducible) into the complete `company-context.md` (mission/values + org chart prose from departments/hierarchy/KPIs). This makes every generated company immediately standalone - even a pure CLI company without a Gaia run (no PixelPerfekt default, AC-3). **Optional narrative LLM enrichment** of the prose happens later (Gaia loop, not a prerequisite). **Gateway hot-reload endpoint** (#440) makes changes live (Gateway caches company-context + agent DNA statically).
+- **Social dimension**: structured culture/social fields in the `gaia-spec` (control the Big Five distribution deterministically) **+** flow into the deterministically rendered company-context (no passthrough of free LLM prose).
+- **Gaia transparency**: toggleable - result view by default, **Deep/Supervision mode** shows Gaia's JSONL/tool stream (noaide pattern) with gates.
+- **Auth**: server session + httpOnly cookie (#405 pattern), desktop+mobile.
+- **Gaia persona**: neutral assistant (no roleplay) + dynamic company knowledge (backend-injected) + CLI tools.
+- **Edit modality**: both - Gaia dialog **and** structured UI editors.
+- **Setup interview**: adaptive dialog with internal completeness checklist.
+- **Time Travel**: full - deliberate total restore (gated) **+** Gaia-controlled selective extraction (conversational, without world reset).
+- **Platform/Nano Container Admin**: full - observe + manage + Gaia-orchestrated (via CLI, with gates).
+- **Company scope**: **single active + company library** (save/load/switch gaia-specs via #425 Fresh Load); no multi-tenant.
+- **Notification**: in-console alerts only (no ntfy/Web Push).
+- **Deployment**: everything on the deploy VM (10.0.0.240) as systemd services; console via `sentinel-dashboard-backend` on HTTPS/WebTransport `:8001`.
+- **Test strategy**: layered - unit + integration + Playwright E2E + Gaia eval.
+- **Dashboard migration**: #433 migrates the nine views strictly into the SolidJS console; the Bun/Hono path is removed after view parity.
+
+---
+
+## 9. Inventory - Exists / Only Integration / New Development
+
+**Already exists (verified):** room chat (`RoomChatBuffer`), Voice of Gaia (`inner-voice`-`<system>`),
+Operator API (chat/broadcast/restore/snapshot/nightrun/gaia/platform-analysis), Self-* systems (CP, Platform CP +
 `llm_analyzer` + `escalate_to_operator`, Judge, Nightrun, Hippocampus, `evolution_task`, `EpisodeProducer`),
-Tages-Memory-Verdichtung, `sentinel-fs` CAS, Time-Machine (Snapshot/Restore/Replay), Telemetrie, Projection,
-Floorplan-View, `sentinel-gaia` Generator (#414–416), Agent-`[identity]` (role/department/KPIs/Hierarchie),
+daily memory condensation, `sentinel-fs` CAS, Time Machine (snapshot/restore/replay), telemetry, Projection,
+floorplan view, `sentinel-gaia` generator (#414-416), agent `[identity]` (role/department/KPIs/hierarchy),
 `company-context.md` (PixelPerfekt).
 
-**Nur Anbindung (Backend da, UI/Trigger fehlt):** Cost/Token-Tracking (API-CP existiert, `apicp_enabled=false`),
-company-context-Hot-Reload (Datei da, Reload fehlt), Observability-Views auf vorhandene Telemetrie/Events,
-Platform-CP-State sichtbar/steuerbar.
+**Only integration needed (backend exists, UI/trigger missing):** cost/token tracking (API CP exists, `apicp_enabled=false`),
+company-context hot reload (file exists, reload missing), observability views on existing telemetry/events,
+Platform CP state visible/controllable.
 
-**Neubau:** `sentinel-ctl`-CLI, Konsolen-Frontend (Polyglot-Stack), CAS-Konsolen-Datenebene + Push,
-Task-Entity (ECS+Events), Gaia-Claude-Instanz + Bereitschafts-Loop + Setup-Interview, 1:1-Agent-DM, Room-Invite,
-soziale `gaia-spec`-Felder + company-context-Generierung durch Gaia, Gaia-Memory-Graph, Tiling-Engine,
-selektive Time-Travel-Extraktion.
+**New development:** `sentinel-ctl` CLI, console frontend (polyglot stack), CAS console data plane + push,
+Task Entity (ECS+events), Gaia Claude instance + standby loop + setup interview, 1:1 agent DM, room invite,
+social `gaia-spec` fields + company-context generation by Gaia, Gaia memory graph, tiling engine,
+selective Time Travel extraction.
 
 ---
 
-## 10. Roadmap (Bau-Reihenfolge)
+## 10. Roadmap (Build Order)
 
-Backend-first — nie tote UI-Platzhalter (Sentinel-Kultur).
+Backend first - never dead UI placeholders (Sentinel culture).
 
-1. **Phase 1 — Backend-Fundament**: CAS-Konsolen-Datenebene (auf #431), `sentinel-ctl`-CLI, Task-Entity,
-   Config-Apply (#425), Gateway-Hot-Reload, soziale `gaia-spec`-Felder + company-context-Generierung,
-   API-CP aktivieren (Cost, #427).
-2. **Phase 2 — Konsole-Shell**: SolidJS-Shell + Tiling-Engine + Auth (#405-Muster) + WebTransport-Push +
-   Floorplan/Chat-Views + Mobile-Layout.
-3. **Phase 3 — Gaia**: `claude -p`-Bereitschafts-Loop, Setup-Interview, Voice-of-Gaia-Delegation, Gaia-Memory-Graph,
-   Deep/Supervision-Modus, Platform-Admin.
-4. **Phase 4 — reiche Features**: 1:1-Agent-DM + Invite, selektive Time-Travel-Extraktion, Cost-Deep,
-   Org-Chart, Editoren, Firmen-Bibliothek.
-5. **Quer**: TOGAF-HTML-Aktualisierung (Gaia-Konsole als Komponente) — eigenes Issue.
-6. **Vor Go-Live**: Design-/Aesthetics-Phase (eigenes grosses Thema) + Abnahmetests.
+1. **Phase 1 - Backend foundation**: CAS console data plane (on #431), `sentinel-ctl` CLI, Task Entity,
+   Config Apply (#425), Gateway hot reload, social `gaia-spec` fields + company-context generation,
+   enable API CP (cost, #427).
+2. **Phase 2 - Console shell**: SolidJS shell + tiling engine + auth (#405 pattern) + WebTransport push +
+   floorplan/chat views + mobile layout.
+3. **Phase 3 - Gaia**: `claude -p` standby loop, setup interview, Voice of Gaia delegation, Gaia memory graph,
+   Deep/Supervision mode, Platform Admin.
+4. **Phase 4 - rich features**: 1:1 agent DM + invite, selective Time Travel extraction, cost deep dive,
+   org chart, editors, company library.
+5. **Cross-cutting**: TOGAF HTML update (Gaia Console as component) - own issue.
+6. **Before go-live**: design/aesthetics phase (own large topic) + acceptance tests.
 
-Bestehende Epics einordnen: **#418** (Configure/Build), **#426** (Observe/Govern), **#430** (SOTA-Stack)
-werden Teil dieser Phasen — aktualisieren statt duplizieren.
+Classify existing epics: **#418** (Configure/Build), **#426** (Observe/Govern), **#430** (SOTA Stack)
+become part of these phases - update instead of duplicating.

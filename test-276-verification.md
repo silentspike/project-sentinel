@@ -5,11 +5,11 @@
 - Plan: `/home/jan/.claude/plans/robust-dancing-steele.md`
 - Branch: `feat/issues-276-277-combined`
 - Issue: `https://github.com/silentspike/project-sentinel/issues/276`
-- Benchmark host: Deploy-VM `ubuntu@10.0.0.240`, host label `sentinel-ubuntu-2404`
-- Hardware label: gemessen auf Intel i7-3930K @ 3.20 GHz (Sandy Bridge-E, 2011), KVM, 8 vCPU, `taskset -c 2`; Vergleich rein relativ vorher/nachher.
-- Comparison rule: keine TOGAF-/Gap-Doc-Absolutwerte als Gate. Diese Baselines stammen von deutlich neuerer Hardware. #276 wird ueber same-VM deltas, Allokationsform und funktionale Gates bewertet.
-- Build rule: Rust build/test/clippy via `cargo remote -c --`; Benchmarks nie auf dem Build-Server ausfuehren.
-- Runtime rule: `sentinel-gateway` und `sentinel-health-monitor.timer` bleiben fuer Benchmarks/Smoke inaktiv.
+- Benchmark host: Deploy VM `ubuntu@10.0.0.240`, host label `sentinel-ubuntu-2404`
+- Hardware label: measured on Intel i7-3930K @ 3.20 GHz (Sandy Bridge-E, 2011), KVM, 8 vCPU, `taskset -c 2`; comparison purely relative before/after.
+- Comparison rule: no TOGAF/gap-doc absolute values as a gate. These baselines come from significantly newer hardware. #276 is evaluated through same-VM deltas, allocation shape, and functional gates.
+- Build rule: Rust build/test/clippy via `cargo remote -c --`; never run benchmarks on the build server.
+- Runtime rule: `sentinel-gateway` and `sentinel-health-monitor.timer` remain inactive for benchmarks/smoke.
 - PR hygiene: final combined PR excludes unrelated commits `8e8ecf1` (Wasmtime audit), `bfac43c` (Go toolchain), and `d44f89e` (sandbox snapshot).
 
 ## AC Matrix
@@ -141,4 +141,4 @@ Final state:
 
 ## Conclusion
 
-Issue #276 is verified on the Deploy-VM with same-machine relative benchmarks. The final accepted implementation improves all measured hot paths and the full 26-agent tick, documents the old hardware context explicitly, keeps benchmark comparisons relative-only, and leaves the gateway inactive for VM smoke validation.
+Issue #276 is verified on the Deploy VM with same-machine relative benchmarks. The final accepted implementation improves all measured hot paths and the full 26-agent tick, documents the old hardware context explicitly, keeps benchmark comparisons relative-only, and leaves the gateway inactive for VM smoke validation.
