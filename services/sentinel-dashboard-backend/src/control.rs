@@ -17,7 +17,8 @@ use crate::AppState;
 const OPERATOR_KEY_HEADER: &str = "x-sentinel-operator-key";
 
 /// Generischer Upstream-Forward: Status + Body werden durchgereicht (JSON).
-async fn forward(
+/// `pub(crate)`: auch von `config::apply` (#420) fuer den Daemon-Config-Apply-Proxy genutzt.
+pub(crate) async fn forward(
     st: &AppState,
     method: reqwest::Method,
     url: String,
