@@ -41,10 +41,11 @@ type anthropicMessageResponse struct {
 }
 
 type anthropicMessageResponseUsage struct {
-	InputTokens              int `json:"input_tokens"`
-	OutputTokens             int `json:"output_tokens"`
-	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	InputTokens              int    `json:"input_tokens"`
+	OutputTokens             int    `json:"output_tokens"`
+	CacheCreationInputTokens int    `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int    `json:"cache_read_input_tokens"`
+	ServiceTier              string `json:"service_tier,omitempty"`
 }
 
 type anthropicErrorResponse struct {
@@ -193,10 +194,10 @@ func buildAnthropicMessageResponse(resp PipelineResponse) anthropicMessageRespon
 	}
 
 	return anthropicMessageResponse{
-		ID:   id,
-		Type: "message",
-		Role: "assistant",
-		Content: anthropicResponseBlocks(resp),
+		ID:           id,
+		Type:         "message",
+		Role:         "assistant",
+		Content:      anthropicResponseBlocks(resp),
 		Model:        resp.Model,
 		StopReason:   stopReason,
 		StopSequence: nil,
@@ -205,6 +206,7 @@ func buildAnthropicMessageResponse(resp PipelineResponse) anthropicMessageRespon
 			OutputTokens:             resp.OutputTokens,
 			CacheCreationInputTokens: 0,
 			CacheReadInputTokens:     0,
+			ServiceTier:              "standard",
 		},
 	}
 }

@@ -75,6 +75,18 @@ func New() *ProviderCapabilities {
 				CapKVRetention:      false,
 				CapStructuredSystem: false,
 			},
+			"local-loop": {
+				CapStreaming:        true,
+				CapToolUse:          false,
+				CapVision:           false,
+				CapSystemPrompt:     true,
+				CapJSONMode:         false,
+				CapFunctionCall:     false,
+				CapCaching:          false,
+				CapPredictedOut:     false,
+				CapKVRetention:      false,
+				CapStructuredSystem: true,
+			},
 			"ollama": {
 				CapStreaming:        true,
 				CapToolUse:          false,

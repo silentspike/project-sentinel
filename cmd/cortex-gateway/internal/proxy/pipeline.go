@@ -347,6 +347,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	// --- Step 1: Config-Snapshot ---
 	snap := ph.config.Get()
 	req.RequestClass = ClassifyRequest(r.URL.Path, &req)
+	if isLocalLoopActive(snap) {
+		req.PreferredProvider = LocalLoopProviderName
+	}
 
 	// --- Step 2: Provider bestimmen (Runtime-switchable via Control Plane) ---
 	resolvedProviderName := req.PreferredProvider
@@ -980,6 +983,9 @@ func (ph *PipelineHandler) applyGuardrails(w http.ResponseWriter, req *LLMReques
 	if ph.guardrails == nil {
 		return provider, providerName, false
 	}
+	if providerName == LocalLoopProviderName {
+		return provider, providerName, false
+	}
 	agentID := req.Metadata["agent_id"]
 	result := ph.guardrails.Check(agentID, maxTokens)
 	if result.RateLimited {
@@ -992,6 +998,10 @@ func (ph *PipelineHandler) applyGuardrails(w http.ResponseWriter, req *LLMReques
 		}
 	}
 	return provider, providerName, false
+}
+
+func isLocalLoopActive(snap control.ConfigSnapshot) bool {
+	return snap.LocalLoopEnabled || strings.EqualFold(strings.TrimSpace(snap.PrimaryProvider), LocalLoopProviderName)
 }
 
 // injectPerception assembles and prepends the system prompt when an agent name is present.

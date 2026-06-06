@@ -199,6 +199,24 @@ func TestNewProviderFromConfig_AnthropicDirect(t *testing.T) {
 	}
 }
 
+func TestNewProviderFromConfig_LocalLoop(t *testing.T) {
+	cfg := ProviderConfig{
+		Name:  LocalLoopProviderName,
+		Type:  LocalLoopProviderName,
+		Model: "local-loop-test",
+	}
+	p, err := NewProviderFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.Name() != LocalLoopProviderName {
+		t.Errorf("expected name %q, got %q", LocalLoopProviderName, p.Name())
+	}
+	if _, ok := p.(StreamingProvider); !ok {
+		t.Fatal("expected local-loop provider to implement StreamingProvider")
+	}
+}
+
 func TestClaudeProviderSendUsesPassthroughHeaders(t *testing.T) {
 	t.Helper()
 
@@ -590,7 +608,7 @@ func TestClaudeProvider_Send_Integration(t *testing.T) {
 		}
 
 		resp := claudeResponse{
-			Content: []json.RawMessage{anthropicTextBlockRaw("world")},
+			Content:    []json.RawMessage{anthropicTextBlockRaw("world")},
 			Model:      "claude-sonnet-4-5-20250929",
 			StopReason: "end_turn",
 			Usage:      claudeUsage{InputTokens: 10, OutputTokens: 5},
@@ -648,7 +666,7 @@ func TestClaudeProvider_Send_WithStructuredSystemBlocks(t *testing.T) {
 		}
 
 		resp := claudeResponse{
-			Content: []json.RawMessage{anthropicTextBlockRaw("world")},
+			Content:    []json.RawMessage{anthropicTextBlockRaw("world")},
 			Model:      "claude-sonnet-4-5-20250929",
 			StopReason: "end_turn",
 			Usage:      claudeUsage{InputTokens: 10, OutputTokens: 5},
@@ -760,7 +778,7 @@ func TestClaudeProvider_Send_ModelOverride(t *testing.T) {
 
 		resp := claudeResponse{
 			Content: []json.RawMessage{anthropicTextBlockRaw("ok")},
-			Model: cReq.Model,
+			Model:   cReq.Model,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)

@@ -7,6 +7,7 @@ import (
 
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/control"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/forwardqueue"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/proxy"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/sequencing"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/synthesis"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/ticksync"
@@ -18,6 +19,16 @@ func TestDefaultPrimaryProviderFallsBackToClaudeCodeWithoutAPIKey(t *testing.T) 
 
 	if got := defaultPrimaryProvider(); got != "claude-code" {
 		t.Fatalf("defaultPrimaryProvider() = %q, want %q", got, "claude-code")
+	}
+}
+
+func TestDefaultPrimaryProviderUsesLocalLoopFlag(t *testing.T) {
+	t.Setenv("CORTEX_PRIMARY_PROVIDER", "")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("CORTEX_LOCAL_LOOP", "1")
+
+	if got := defaultPrimaryProvider(); got != proxy.LocalLoopProviderName {
+		t.Fatalf("defaultPrimaryProvider() = %q, want %q", got, proxy.LocalLoopProviderName)
 	}
 }
 
