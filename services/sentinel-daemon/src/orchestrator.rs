@@ -1668,6 +1668,82 @@ fn emit_runtime_projection_despawn_event(
     true
 }
 
+fn emit_runtime_projection_spawn_event(
+    event_store: &EventStore,
+    agent_cfg: &AgentConfig,
+    tick_count: u64,
+) -> Result<i64> {
+    let agent_id = AgentId(agent_cfg.identity.id);
+    let aggregate_id = format!("AGENT-{:02}", agent_id.0);
+    let payload = DomainEventPayload::AgentSpawned {
+        agent_id,
+        name: agent_cfg.identity.name.clone(),
+        role: agent_cfg.identity.role.clone(),
+        shift_set: agent_cfg.identity.shift_set,
+        room_id: agent_cfg.preferences.favorite_room.clone(),
+    };
+    let op_id = format!(
+        "runtime-reconcile-projection-spawn-{}-{}-{}",
+        agent_id.0,
+        tick_count,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    let event = DomainEvent::new(
+        payload.event_type_str(),
+        &aggregate_id,
+        &payload.to_json(),
+        &op_id,
+        tick_count,
+    )
+    .with_operation_id(&op_id);
+    event_store.append_event(&event)
+}
+
+fn upsert_agent_projection_seed(
+    projection_db_path: &std::path::Path,
+    agent_cfg: &AgentConfig,
+    last_event_id: i64,
+) -> Result<()> {
+    let db = sentinel_limbo::rusqlite::Connection::open(projection_db_path)
+        .with_context(|| format!("Projection DB oeffnen: {}", projection_db_path.display()))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    db.execute(
+        "INSERT INTO agent_live_view
+           (agent_id, name, role, shift_set, status, current_room, in_transit, last_event_id, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'active', ?5, 0, ?6, ?7)
+         ON CONFLICT(agent_id) DO UPDATE SET
+           name = excluded.name,
+           role = excluded.role,
+           shift_set = excluded.shift_set,
+           status = 'active',
+           current_room = excluded.current_room,
+           in_transit = 0,
+           transit_target = NULL,
+           last_event_id = CASE
+             WHEN agent_live_view.last_event_id > excluded.last_event_id
+             THEN agent_live_view.last_event_id
+             ELSE excluded.last_event_id
+           END,
+           updated_at = excluded.updated_at",
+        sentinel_limbo::rusqlite::params![
+            agent_cfg.identity.id as i64,
+            &agent_cfg.identity.name,
+            &agent_cfg.identity.role,
+            agent_cfg.identity.shift_set as i64,
+            &agent_cfg.preferences.favorite_room,
+            last_event_id,
+            now_ms,
+        ],
+    )?;
+    Ok(())
+}
+
 fn remove_agent_runtime_fragments(
     ctx: &mut RuntimeReconcileContext<'_>,
     agent: &runtime_health::RuntimeHealthAgentSnapshot,
@@ -1994,7 +2070,33 @@ fn run_runtime_reconcile(
                 && snapshot.security_runtime_present
                 && !snapshot.projection_present
             {
-                agent_status_updates.insert(agent_id, "projection_reconcile_pending".to_string());
+                if request.projection_rebuild && !request.dry_run {
+                    match emit_runtime_projection_spawn_event(
+                        ctx.event_store,
+                        agent_cfg,
+                        ctx.tick_count,
+                    )
+                    .and_then(|row_id| {
+                        upsert_agent_projection_seed(ctx.projection_db_path, agent_cfg, row_id)
+                    }) {
+                        Ok(()) => {
+                            repair_ops_total += 1;
+                            repaired_agents.push(agent_cfg.identity.name.clone());
+                            agent_status_updates.insert(agent_id, "projection_seeded".to_string());
+                        }
+                        Err(error) => {
+                            errors.push(format!(
+                                "Projection-Seed fehlgeschlagen fuer {}: {error}",
+                                agent_cfg.identity.name
+                            ));
+                            agent_status_updates
+                                .insert(agent_id, "projection_reconcile_pending".to_string());
+                        }
+                    }
+                } else {
+                    agent_status_updates
+                        .insert(agent_id, "projection_reconcile_pending".to_string());
+                }
                 respawn_backoff.record_success(agent_id);
                 continue;
             }
@@ -5623,6 +5725,57 @@ mod tests {
                 "Fast-Restart sollte einen neuen PID liefern"
             );
         }
+    }
+
+    #[test]
+    fn runtime_reconcile_projection_seed_persists_event_and_live_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.db");
+        let projection_path = tmp.path().join("projection.db");
+        let event_store = EventStore::open(events_path.to_str().unwrap()).unwrap();
+        let projection_store =
+            sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap();
+        drop(projection_store);
+
+        let agent_cfg = test_agent_config(46, "Ralf Steinbach", "Operations", 1);
+        let row_id = emit_runtime_projection_spawn_event(&event_store, &agent_cfg, 2095680)
+            .expect("projection seed event");
+        upsert_agent_projection_seed(&projection_path, &agent_cfg, row_id)
+            .expect("projection seed upsert");
+
+        let events = event_store.get_events_since(0, 10).unwrap();
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == "agent_spawned"
+                    && event.aggregate_id == "AGENT-46"
+                    && event.payload.contains("\"agent_id\":46")
+            }),
+            "Projection-Seed muss als AgentSpawned-Event rebuild-faehig persistieren"
+        );
+
+        let db = sentinel_limbo::rusqlite::Connection::open(&projection_path).unwrap();
+        let row: (String, String, String, String, i64) = db
+            .query_row(
+                "SELECT name, role, status, current_room, last_event_id
+                 FROM agent_live_view
+                 WHERE agent_id = 46",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, "Ralf Steinbach");
+        assert_eq!(row.1, "Operations");
+        assert_eq!(row.2, "active");
+        assert_eq!(row.3, "empfang");
+        assert_eq!(row.4, row_id);
     }
 
     #[test]
