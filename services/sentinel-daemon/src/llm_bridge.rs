@@ -13,9 +13,9 @@
 #[cfg(feature = "llm")]
 pub mod bridge {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use serde::{Deserialize, Serialize};
@@ -24,6 +24,8 @@ pub mod bridge {
 
     use sentinel_common::{ActionType, AgentAction, AgentId, Perception, Tick, Timestamp};
     use sentinel_redb::StateStore;
+
+    pub type SharedLlmActivityTicks = Arc<Mutex<HashMap<AgentId, u64>>>;
 
     /// LLM Bridge Konfiguration.
     #[derive(Debug, Clone)]
@@ -62,15 +64,17 @@ pub mod bridge {
         threshold: u32,
         last_failure: Option<Instant>,
         reset_duration: Duration,
+        open_signal: Arc<AtomicBool>,
     }
 
     impl CircuitBreaker {
-        fn new(threshold: u32, reset_duration: Duration) -> Self {
+        fn new(threshold: u32, reset_duration: Duration, open_signal: Arc<AtomicBool>) -> Self {
             Self {
                 failure_count: 0,
                 threshold,
                 last_failure: None,
                 reset_duration,
+                open_signal,
             }
         }
 
@@ -79,21 +83,25 @@ pub mod bridge {
                 // Pruefen ob Reset-Zeit abgelaufen
                 if let Some(last) = self.last_failure {
                     if last.elapsed() < self.reset_duration {
+                        self.open_signal.store(true, Ordering::Relaxed);
                         return true;
                     }
                 }
             }
+            self.open_signal.store(false, Ordering::Relaxed);
             false
         }
 
         fn record_success(&mut self) {
             self.failure_count = 0;
             self.last_failure = None;
+            self.open_signal.store(false, Ordering::Relaxed);
         }
 
         fn record_failure(&mut self) {
             self.failure_count += 1;
             self.last_failure = Some(Instant::now());
+            let _ = self.is_open();
         }
     }
 
@@ -174,6 +182,8 @@ pub mod bridge {
         action_tx: mpsc::Sender<AgentAction>,
         telemetry: Arc<BridgeTelemetry>,
         state_store: Arc<StateStore>,
+        llm_unavailable: Arc<AtomicBool>,
+        llm_activity_ticks: SharedLlmActivityTicks,
     ) {
         info!(
             max_concurrent = config.max_concurrent,
@@ -201,7 +211,9 @@ pub mod bridge {
         let circuit_breaker = Arc::new(std::sync::Mutex::new(CircuitBreaker::new(
             config.circuit_breaker_threshold,
             config.circuit_breaker_reset,
+            Arc::clone(&llm_unavailable),
         )));
+        llm_unavailable.store(false, Ordering::Relaxed);
         let pending_retries = Arc::new(AsyncMutex::new(HashMap::<AgentId, Perception>::new()));
         let mut last_call_tick: HashMap<AgentId, u64> = HashMap::new();
         // Debounce: Operator-Impulse (Gaia/Broadcast) nur beim ERSTEN Tick urgent,
@@ -296,6 +308,15 @@ pub mod bridge {
                 }
 
                 last_call_tick.insert(agent_id, current_tick);
+                {
+                    let mut ticks = llm_activity_ticks.lock().unwrap();
+                    ticks.insert(agent_id, current_tick);
+                    let retention_ticks =
+                        config.min_ticks_between_calls.saturating_mul(24).max(120);
+                    ticks.retain(|_, last_tick| {
+                        current_tick.saturating_sub(*last_tick) <= retention_ticks
+                    });
+                }
 
                 info!(agent = %agent_id,
                     priority = if perception.is_directly_addressed { "P1" } else { "normal" },
@@ -766,6 +787,32 @@ pub mod bridge {
             assert!(metadata.get("synth_fp").unwrap().starts_with("H3|E7|"));
             assert_eq!(metadata.get("is_directly_addressed").unwrap(), "false");
             assert_eq!(metadata.get("personality_type").unwrap(), "E");
+        }
+
+        #[test]
+        fn circuit_breaker_updates_open_signal() {
+            let open_signal = Arc::new(AtomicBool::new(false));
+            let mut breaker =
+                CircuitBreaker::new(2, Duration::from_millis(1), Arc::clone(&open_signal));
+
+            assert!(!breaker.is_open());
+            assert!(!open_signal.load(Ordering::Relaxed));
+
+            breaker.record_failure();
+            assert!(!breaker.is_open());
+            assert!(!open_signal.load(Ordering::Relaxed));
+
+            breaker.record_failure();
+            assert!(breaker.is_open());
+            assert!(open_signal.load(Ordering::Relaxed));
+
+            std::thread::sleep(Duration::from_millis(2));
+            assert!(!breaker.is_open());
+            assert!(!open_signal.load(Ordering::Relaxed));
+
+            breaker.record_success();
+            assert!(!breaker.is_open());
+            assert!(!open_signal.load(Ordering::Relaxed));
         }
 
         fn make_perception(agent_id: u16, heard: &str, impulse: bool) -> Perception {

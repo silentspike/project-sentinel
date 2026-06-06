@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/silentspike/project-sentinel/pkg/sentinel-go/judge"
@@ -22,16 +24,16 @@ import (
 
 // StreamConsumer processes events from NATS JetStream in realtime.
 type StreamConsumer struct {
-	js       jetstream.JetStream
-	cfg      *config.Config
-	drift    *judge.DriftDetector
-	quality  *judge.QualityScorer
-	fatigue  *judge.FatigueDetector
-	swap     *judge.SwapTrigger
-	alerter  *alerter.Alerter
-	evol     *persistence.EvolutionStore
-	logger   *slog.Logger
-	ebpf     *EBPFStore // ADR-001: eBPF enrichment for drift-detection
+	js      jetstream.JetStream
+	cfg     *config.Config
+	drift   *judge.DriftDetector
+	quality *judge.QualityScorer
+	fatigue *judge.FatigueDetector
+	swap    *judge.SwapTrigger
+	alerter *alerter.Alerter
+	evol    *persistence.EvolutionStore
+	logger  *slog.Logger
+	ebpf    *EBPFStore // ADR-001: eBPF enrichment for drift-detection
 
 	// Message buffer per agent for heuristic analysis
 	mu       sync.RWMutex
@@ -69,14 +71,15 @@ func (sc *StreamConsumer) DriftDetector() *judge.DriftDetector {
 }
 
 const maxMessagesPerAgent = 20
+const maxPlausibleSimTickExclusive = int64(1_000_000_000)
 
 // Run starts the streaming consumer. Blocks until ctx is cancelled.
 func (sc *StreamConsumer) Run(ctx context.Context) error {
 	// Create or get durable pull consumer
 	consumer, err := sc.js.CreateOrUpdateConsumer(ctx, messaging.StreamEvents, jetstream.ConsumerConfig{
-		Durable:       sc.cfg.NATS.ConsumerName,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		MaxDeliver:    3,
+		Durable:    sc.cfg.NATS.ConsumerName,
+		AckPolicy:  jetstream.AckExplicitPolicy,
+		MaxDeliver: 3,
 		FilterSubjects: []string{
 			"sentinel.events.agent_action_received.*",
 			"sentinel.events.agent_chat.*",
@@ -148,6 +151,10 @@ func (sc *StreamConsumer) processMessage(msg jetstream.Msg) {
 		_ = msg.Ack()
 		return
 	}
+	tick, hasTick := extractSimTick(msg.Headers(), payload)
+	if !hasTick {
+		sc.logger.Warn("event missing valid simulation tick; evolution write disabled", "agent", agentID)
+	}
 	content, _ := payload["content"].(string)
 	if content == "" {
 		content, _ = payload["msg"].(string)
@@ -168,15 +175,13 @@ func (sc *StreamConsumer) processMessage(msg jetstream.Msg) {
 	sc.mu.Unlock()
 
 	// Run heuristic pipeline
-	sc.runHeuristics(agentID, content, recentMessages)
+	sc.runHeuristics(agentID, content, recentMessages, tick, hasTick)
 
 	_ = msg.Ack()
 }
 
 // runHeuristics executes the 4-algorithm heuristic pipeline on agent messages.
-func (sc *StreamConsumer) runHeuristics(agentID, latestMessage string, recentMessages []string) {
-	now := time.Now().UnixMilli()
-
+func (sc *StreamConsumer) runHeuristics(agentID, latestMessage string, recentMessages []string, tick int64, writeEvolution bool) {
 	// 1. Drift Detection (enriched with eBPF signal per ADR-001)
 	driftResult := sc.drift.CheckDrift(agentID, recentMessages)
 	driftScore := driftResult.DriftScore
@@ -207,17 +212,19 @@ func (sc *StreamConsumer) runHeuristics(agentID, latestMessage string, recentMes
 		})
 	}
 
-	// Write drift evolution entry (enriched score)
-	if err := sc.evol.Write(persistence.EvolutionEntry{
-		AgentID:    agentID,
-		Tick:       now,
-		Field:      "drift_score",
-		ChangeType: "drift",
-		NewValue:   fmt.Sprintf("%.4f", driftScore),
-		Reason:     driftResult.Details,
-		Source:     "realtime_judge",
-	}); err != nil {
-		sc.logger.Warn("failed to write drift evolution", "agent", agentID, "error", err)
+	if writeEvolution {
+		// Write drift evolution entry (enriched score)
+		if err := sc.evol.Write(persistence.EvolutionEntry{
+			AgentID:    agentID,
+			Tick:       tick,
+			Field:      "drift_score",
+			ChangeType: "drift",
+			NewValue:   fmt.Sprintf("%.4f", driftScore),
+			Reason:     driftResult.Details,
+			Source:     "realtime_judge",
+		}); err != nil {
+			sc.logger.Warn("failed to write drift evolution", "agent", agentID, "error", err)
+		}
 	}
 
 	// 2. Quality Scoring
@@ -234,17 +241,19 @@ func (sc *StreamConsumer) runHeuristics(agentID, latestMessage string, recentMes
 		})
 	}
 
-	// Write quality evolution entry
-	if err := sc.evol.Write(persistence.EvolutionEntry{
-		AgentID:    agentID,
-		Tick:       now,
-		Field:      "quality_score",
-		ChangeType: "quality",
-		NewValue:   fmt.Sprintf("%d", qualityResult.Score),
-		Reason:     qualityResult.Details,
-		Source:     "realtime_judge",
-	}); err != nil {
-		sc.logger.Warn("failed to write quality evolution", "agent", agentID, "error", err)
+	if writeEvolution {
+		// Write quality evolution entry
+		if err := sc.evol.Write(persistence.EvolutionEntry{
+			AgentID:    agentID,
+			Tick:       tick,
+			Field:      "quality_score",
+			ChangeType: "quality",
+			NewValue:   fmt.Sprintf("%d", qualityResult.Score),
+			Reason:     qualityResult.Details,
+			Source:     "realtime_judge",
+		}); err != nil {
+			sc.logger.Warn("failed to write quality evolution", "agent", agentID, "error", err)
+		}
 	}
 
 	// 3. Fatigue Detection
@@ -261,32 +270,36 @@ func (sc *StreamConsumer) runHeuristics(agentID, latestMessage string, recentMes
 		})
 	}
 
-	// Write fatigue evolution entry
-	if err := sc.evol.Write(persistence.EvolutionEntry{
-		AgentID:    agentID,
-		Tick:       now,
-		Field:      "fatigue_score",
-		ChangeType: "fatigue",
-		NewValue:   fmt.Sprintf("%.4f", fatigueResult.FatigueScore),
-		Reason:     fatigueResult.Details,
-		Source:     "realtime_judge",
-	}); err != nil {
-		sc.logger.Warn("failed to write fatigue evolution", "agent", agentID, "error", err)
+	if writeEvolution {
+		// Write fatigue evolution entry
+		if err := sc.evol.Write(persistence.EvolutionEntry{
+			AgentID:    agentID,
+			Tick:       tick,
+			Field:      "fatigue_score",
+			ChangeType: "fatigue",
+			NewValue:   fmt.Sprintf("%.4f", fatigueResult.FatigueScore),
+			Reason:     fatigueResult.Details,
+			Source:     "realtime_judge",
+		}); err != nil {
+			sc.logger.Warn("failed to write fatigue evolution", "agent", agentID, "error", err)
+		}
 	}
 
 	// Write NMDA relevance score (max of drift + fatigue as proxy)
 	nmdaVal := math.Max(driftResult.DriftScore, fatigueResult.FatigueScore)
-	if err := sc.evol.Write(persistence.EvolutionEntry{
-		AgentID:    agentID,
-		Tick:       now,
-		Field:      "nmda_score",
-		ChangeType: "nmda_relevance",
-		NewValue:   fmt.Sprintf("%.4f", nmdaVal),
-		Reason:     "max(drift, fatigue) as NMDA relevance proxy",
-		Source:     "realtime_judge",
-		NMDAScore:  &nmdaVal,
-	}); err != nil {
-		sc.logger.Warn("failed to write nmda_score", "agent", agentID, "error", err)
+	if writeEvolution {
+		if err := sc.evol.Write(persistence.EvolutionEntry{
+			AgentID:    agentID,
+			Tick:       tick,
+			Field:      "nmda_score",
+			ChangeType: "nmda_relevance",
+			NewValue:   fmt.Sprintf("%.4f", nmdaVal),
+			Reason:     "max(drift, fatigue) as NMDA relevance proxy",
+			Source:     "realtime_judge",
+			NMDAScore:  &nmdaVal,
+		}); err != nil {
+			sc.logger.Warn("failed to write nmda_score", "agent", agentID, "error", err)
+		}
 	}
 
 	// 4. Swap Decision
@@ -301,6 +314,47 @@ func (sc *StreamConsumer) runHeuristics(agentID, latestMessage string, recentMes
 			Details:  swapDecision.Reason,
 		})
 	}
+}
+
+func extractSimTick(headers nats.Header, payload map[string]any) (int64, bool) {
+	if raw := headers.Get("X-Tick"); raw != "" {
+		return parseSimTick(raw)
+	}
+	for _, key := range []string{"tick", "sim_tick"} {
+		if tick, ok := payloadTick(payload[key]); ok {
+			return tick, true
+		}
+	}
+	return 0, false
+}
+
+func payloadTick(value any) (int64, bool) {
+	switch v := value.(type) {
+	case float64:
+		if math.Trunc(v) != v {
+			return 0, false
+		}
+		return validateSimTick(int64(v))
+	case string:
+		return parseSimTick(v)
+	default:
+		return 0, false
+	}
+}
+
+func parseSimTick(raw string) (int64, bool) {
+	tick, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return validateSimTick(tick)
+}
+
+func validateSimTick(tick int64) (int64, bool) {
+	if tick < 0 || tick >= maxPlausibleSimTickExclusive {
+		return 0, false
+	}
+	return tick, true
 }
 
 // severityAtLeast checks if actual severity meets or exceeds the threshold.

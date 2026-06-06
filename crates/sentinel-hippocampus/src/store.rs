@@ -17,6 +17,8 @@ const CACHE_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("cache_st
 const GOALS: TableDefinition<&str, &[u8]> = TableDefinition::new("goals");
 const ARCHIVE: TableDefinition<&str, &[u8]> = TableDefinition::new("archive");
 
+const MAX_EPISODES_PER_AGENT: usize = 1000;
+
 /// Persistent state for narrative memory (serializable for redb storage).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NarrativeState {
@@ -61,7 +63,12 @@ impl HippocampusStore {
 
     /// Store episodes for an agent (overwrites existing).
     pub fn store_episodes(&self, agent: &str, eps: &[Episode]) -> anyhow::Result<()> {
-        let json = serde_json::to_vec(eps)?;
+        let retained = if eps.len() > MAX_EPISODES_PER_AGENT {
+            &eps[eps.len() - MAX_EPISODES_PER_AGENT..]
+        } else {
+            eps
+        };
+        let json = serde_json::to_vec(retained)?;
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(EPISODES)?;
@@ -85,7 +92,7 @@ impl HippocampusStore {
         }
     }
 
-    /// Append episodes to an agent's existing list.
+    /// Append episodes to an agent's existing list. Caps at 1000 live episodes per agent.
     pub fn append_episodes(&self, agent: &str, new: &[Episode]) -> anyhow::Result<()> {
         let mut existing = self.load_episodes(agent)?;
         existing.extend_from_slice(new);
@@ -302,8 +309,8 @@ impl HippocampusStore {
         let mut existing = self.load_archive(agent)?;
         existing.extend_from_slice(new);
         // Cap at 1000 episodes — drop oldest if exceeding
-        if existing.len() > 1000 {
-            let excess = existing.len() - 1000;
+        if existing.len() > MAX_EPISODES_PER_AGENT {
+            let excess = existing.len() - MAX_EPISODES_PER_AGENT;
             existing.drain(..excess);
         }
         self.store_archive(agent, &existing)
@@ -411,6 +418,20 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].summary, "Erstes");
         assert_eq!(loaded[1].summary, "Zweites");
+    }
+
+    #[test]
+    fn test_live_episodes_cap_at_1000() {
+        let (store, _dir) = temp_store();
+        let many: Vec<Episode> = (0..1100)
+            .map(|i| make_episode(i, &format!("Episode {i}")))
+            .collect();
+
+        store.append_episodes("Thomas", &many).unwrap();
+        let loaded = store.load_episodes("Thomas").unwrap();
+        assert_eq!(loaded.len(), 1000);
+        assert_eq!(loaded[0].summary, "Episode 100");
+        assert_eq!(loaded[999].summary, "Episode 1099");
     }
 
     #[test]

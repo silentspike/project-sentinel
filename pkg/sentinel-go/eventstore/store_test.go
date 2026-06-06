@@ -1,10 +1,13 @@
 package eventstore
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 func tempDB(t *testing.T) (*Store, string) {
@@ -57,6 +60,87 @@ func TestOpenAndClose(t *testing.T) {
 	}
 	if pending != 0 {
 		t.Errorf("expected 0 pending outbox, got %d", pending)
+	}
+}
+
+func TestSchemaIndexes(t *testing.T) {
+	store, _ := tempDB(t)
+
+	for _, name := range []string{"idx_events_event_id", "idx_outbox_event_id"} {
+		var count int
+		if err := store.db.QueryRow(
+			`SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?`,
+			name,
+		).Scan(&count); err != nil {
+			t.Fatalf("query index %s: %v", name, err)
+		}
+		if count != 1 {
+			t.Fatalf("expected index %s to exist, found %d", name, count)
+		}
+	}
+
+	for _, name := range []string{"retry_count", "last_error"} {
+		ok, err := tableHasColumn(store.db, "outbox", name)
+		if err != nil {
+			t.Fatalf("query outbox column %s: %v", name, err)
+		}
+		if !ok {
+			t.Fatalf("expected outbox column %s to exist", name)
+		}
+	}
+}
+
+func TestOpenMigratesLegacyOutboxColumns(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.db")
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		event_id TEXT NOT NULL UNIQUE,
+		event_type TEXT NOT NULL,
+		aggregate_id TEXT NOT NULL,
+		payload TEXT NOT NULL,
+		correlation_id TEXT NOT NULL,
+		causation_id TEXT,
+		operation_id TEXT NOT NULL,
+		tick INTEGER NOT NULL,
+		timestamp_ms INTEGER NOT NULL,
+		schema_version INTEGER NOT NULL DEFAULT 1,
+		compensation_type TEXT NOT NULL DEFAULT 'none'
+	);
+	CREATE TABLE outbox (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		event_id TEXT NOT NULL REFERENCES events(event_id),
+		topic TEXT NOT NULL,
+		payload TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'pending',
+		created_at INTEGER NOT NULL,
+		published_at INTEGER
+	);`); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open legacy db: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	for _, name := range []string{"retry_count", "last_error"} {
+		ok, err := tableHasColumn(store.db, "outbox", name)
+		if err != nil {
+			t.Fatalf("query migrated column %s: %v", name, err)
+		}
+		if !ok {
+			t.Fatalf("expected migrated outbox column %s to exist", name)
+		}
 	}
 }
 
