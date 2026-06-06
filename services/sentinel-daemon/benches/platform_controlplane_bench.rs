@@ -129,6 +129,7 @@ fn setup_metrics_fixture() -> MetricsFixture {
         &agent_names,
         1,
         Vec::new(),
+        false,
         &cgroup_root,
     );
 
@@ -176,7 +177,9 @@ fn synthetic_metrics() -> (PlatformMetrics, HashMap<String, AgentId>) {
             agent_write_rates,
             tick: 123,
             failed_services: vec!["sentinel-judge".to_string()],
+            llm_circuit_open: false,
             last_action_ticks,
+            last_llm_call_ticks: HashMap::new(),
         },
         agent_ids,
     )
@@ -224,6 +227,7 @@ fn bench_metrics_collection(c: &mut Criterion) {
                     &fixture.agent_names,
                     2,
                     Vec::new(),
+                    false,
                     &fixture.cgroup_root,
                 );
                 black_box(metrics);
