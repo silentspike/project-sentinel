@@ -1644,28 +1644,60 @@ fn emit_runtime_projection_despawn_event(
     event_store: &EventStore,
     agent_id: AgentId,
     tick_count: u64,
-) -> bool {
+) -> Result<i64> {
     let aggregate_id = format!("AGENT-{:02}", agent_id.0);
     let payload = DomainEventPayload::AgentDespawned {
         agent_id,
         reason: "runtime_reconcile_projection_only".to_string(),
     };
+    let op_id = format!(
+        "runtime-reconcile-projection-despawn-{}-{}-{}",
+        agent_id.0,
+        tick_count,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
     let event = DomainEvent::new(
         payload.event_type_str(),
         &aggregate_id,
         &payload.to_json(),
-        &format!("runtime-reconcile-projection-{}", agent_id.0),
+        &op_id,
         tick_count,
-    );
-    if let Err(error) = event_store.append_event(&event) {
-        warn!(
-            agent_id = %agent_id,
-            error = %error,
-            "Projection-only Despawn-Event konnte nicht persistiert werden"
-        );
-        return false;
-    }
-    true
+    )
+    .with_operation_id(&op_id);
+    event_store
+        .append_event(&event)
+        .with_context(|| format!("Projection-only Despawn-Event persistieren fuer {aggregate_id}"))
+}
+
+fn mark_agent_projection_despawned(
+    projection_db_path: &std::path::Path,
+    agent_id: AgentId,
+    last_event_id: i64,
+) -> Result<()> {
+    let db = sentinel_limbo::rusqlite::Connection::open(projection_db_path)
+        .with_context(|| format!("Projection DB oeffnen: {}", projection_db_path.display()))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    db.execute(
+        "UPDATE agent_live_view
+         SET status = 'despawned',
+             in_transit = 0,
+             transit_target = NULL,
+             last_event_id = CASE
+               WHEN agent_live_view.last_event_id > ?2
+               THEN agent_live_view.last_event_id
+               ELSE ?2
+             END,
+             updated_at = ?3
+         WHERE agent_id = ?1",
+        sentinel_limbo::rusqlite::params![agent_id.0 as i64, last_event_id, now_ms],
+    )?;
+    Ok(())
 }
 
 fn emit_runtime_projection_spawn_event(
@@ -1967,16 +1999,32 @@ fn run_runtime_reconcile(
                 agent_status_updates
                     .insert(agent.agent_id, "unexpected_runtime_cleaned".to_string());
             }
-            if agent.projection_present
-                && emit_runtime_projection_despawn_event(
+            if agent.projection_present {
+                match emit_runtime_projection_despawn_event(
                     ctx.event_store,
                     AgentId(agent.agent_id),
                     ctx.tick_count,
                 )
-            {
-                repair_ops_total += 1;
-                repaired_agents.push(agent.name.clone());
-                agent_status_updates.insert(agent.agent_id, "projection_despawned".to_string());
+                .and_then(|row_id| {
+                    mark_agent_projection_despawned(
+                        ctx.projection_db_path,
+                        AgentId(agent.agent_id),
+                        row_id,
+                    )
+                }) {
+                    Ok(()) => {
+                        repair_ops_total += 1;
+                        repaired_agents.push(agent.name.clone());
+                        agent_status_updates
+                            .insert(agent.agent_id, "projection_despawned".to_string());
+                    }
+                    Err(error) => {
+                        errors.push(format!(
+                            "Projection-only Despawn fehlgeschlagen fuer {}: {error}",
+                            agent.name
+                        ));
+                    }
+                }
             }
         }
 
@@ -5776,6 +5824,54 @@ mod tests {
         assert_eq!(row.2, "active");
         assert_eq!(row.3, "empfang");
         assert_eq!(row.4, row_id);
+    }
+
+    #[test]
+    fn runtime_reconcile_projection_despawn_marks_live_view_inactive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.db");
+        let projection_path = tmp.path().join("projection.db");
+        let event_store = EventStore::open(events_path.to_str().unwrap()).unwrap();
+        let projection_store =
+            sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap();
+        drop(projection_store);
+
+        let db = sentinel_limbo::rusqlite::Connection::open(&projection_path).unwrap();
+        db.execute(
+            "INSERT INTO agent_live_view
+               (agent_id, name, role, shift_set, status, current_room, in_transit, last_event_id, updated_at)
+             VALUES (39, 'Victoria Lehmann', 'Support', 3, 'active', 'empfang', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        let row_id = emit_runtime_projection_despawn_event(&event_store, AgentId(39), 2096700)
+            .expect("projection despawn event");
+        mark_agent_projection_despawned(&projection_path, AgentId(39), row_id)
+            .expect("projection despawn update");
+
+        let events = event_store.get_events_since(0, 10).unwrap();
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == "agent_despawned"
+                    && event.aggregate_id == "AGENT-39"
+                    && event.payload.contains("\"agent_id\":39")
+            }),
+            "Projection-only Despawn muss als AgentDespawned-Event rebuild-faehig persistieren"
+        );
+
+        let row: (String, i64, Option<String>) = db
+            .query_row(
+                "SELECT status, in_transit, transit_target
+                 FROM agent_live_view
+                 WHERE agent_id = 39",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "despawned");
+        assert_eq!(row.1, 0);
+        assert_eq!(row.2, None);
     }
 
     #[test]
