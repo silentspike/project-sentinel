@@ -444,6 +444,7 @@ fn serialize_metrics(metrics: &PlatformMetrics) -> Value {
             "bytes_per_sec": rate,
         })).collect::<Vec<_>>(),
         "failed_services": metrics.failed_services,
+        "llm_circuit_open": metrics.llm_circuit_open,
         "tick": metrics.tick,
     })
 }
