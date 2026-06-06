@@ -522,6 +522,11 @@ Koordination = "Koordination"
 Maschine = "Maschine"     # German: machine (KVM-faehige Maschine)
 simpel = "simpel"         # German: simple
 
+# Issue #420 - dashboard config endpoints (German words in Rust doc comments)
+Plattform = "Plattform"   # German: platform
+invalide = "invalide"     # German: invalid
+Invalide = "Invalide"     # German: invalid (capitalized)
+
 [files]
 extend-exclude = [
     "Cargo.lock",
