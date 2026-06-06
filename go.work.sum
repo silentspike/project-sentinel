@@ -1,4 +1,5 @@
 github.com/silentspike/project-sentinel/pkg/sentinel-go v0.0.0-20260426185014-30c7fd621515/go.mod h1:O23Is4HFuLB04LZFerrjWhIsX/W9wWmlGRlusXQVUdM=
+github.com/silentspike/project-sentinel/pkg/sentinel-go v0.0.0-20260528210141-be607cd65df5/go.mod h1:2AQrmE0MhYRgEDeR6foQTIL0ocx4GeFKQV6RJPSABDI=
 golang.org/x/crypto v0.37.0/go.mod h1:vg+k43peMZ0pUMhYmVAWysMK35e6ioLh3wB8ZCAfbVc=
 golang.org/x/net v0.47.0/go.mod h1:/jNxtkgq5yWUGYkaZGqo27cfGZ1c5Nen03aYrrKpVRU=
 golang.org/x/term v0.37.0/go.mod h1:5pB4lxRNYYVZuTLmy8oR2BH8dflOR+IbTYFD8fi3254=

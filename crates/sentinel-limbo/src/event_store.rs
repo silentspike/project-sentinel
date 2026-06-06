@@ -47,6 +47,8 @@ const CREATE_IDX_EVENTS_CORRELATION: &str =
     "CREATE INDEX IF NOT EXISTS idx_events_correlation ON events(correlation_id)";
 const CREATE_IDX_EVENTS_CAUSATION: &str =
     "CREATE INDEX IF NOT EXISTS idx_events_causation ON events(causation_id)";
+const CREATE_IDX_EVENTS_EVENT_ID: &str =
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id ON events(event_id)";
 const CREATE_IDX_EVENTS_OPERATION: &str =
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_operation ON events(operation_id)";
 
@@ -58,11 +60,15 @@ CREATE TABLE IF NOT EXISTS outbox (
     payload TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     created_at INTEGER NOT NULL,
-    published_at INTEGER
+    published_at INTEGER,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
 )";
 
 const CREATE_IDX_OUTBOX_PENDING: &str =
     "CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(status) WHERE status = 'pending'";
+const CREATE_IDX_OUTBOX_EVENT_ID: &str =
+    "CREATE INDEX IF NOT EXISTS idx_outbox_event_id ON outbox(event_id)";
 
 const CREATE_SNAPSHOTS: &str = "
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -197,9 +203,12 @@ impl EventStore {
         conn.execute(CREATE_IDX_EVENTS_TYPE, [])?;
         conn.execute(CREATE_IDX_EVENTS_CORRELATION, [])?;
         conn.execute(CREATE_IDX_EVENTS_CAUSATION, [])?;
+        conn.execute(CREATE_IDX_EVENTS_EVENT_ID, [])?;
         conn.execute(CREATE_IDX_EVENTS_OPERATION, [])?;
         conn.execute_batch(CREATE_OUTBOX)?;
+        Self::ensure_outbox_migrations(&conn)?;
         conn.execute(CREATE_IDX_OUTBOX_PENDING, [])?;
+        conn.execute(CREATE_IDX_OUTBOX_EVENT_ID, [])?;
         conn.execute_batch(CREATE_SNAPSHOTS)?;
         conn.execute(CREATE_IDX_SNAPSHOTS_AGGREGATE, [])?;
         conn.execute_batch(CREATE_WORLD_SNAPSHOTS)?;
@@ -223,6 +232,31 @@ impl EventStore {
             conn: Arc::new(Mutex::new(conn)),
             path: PathBuf::from(path),
         })
+    }
+
+    fn ensure_outbox_migrations(conn: &Connection) -> anyhow::Result<()> {
+        if !Self::table_has_column(conn, "outbox", "retry_count")? {
+            conn.execute(
+                "ALTER TABLE outbox ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !Self::table_has_column(conn, "outbox", "last_error")? {
+            conn.execute("ALTER TABLE outbox ADD COLUMN last_error TEXT", [])?;
+        }
+        Ok(())
+    }
+
+    fn table_has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Oeffnet den Event Store **read-only** — fuer reine Consumer (z.B. Dashboard/CAS-Pusher),
@@ -586,13 +620,14 @@ impl EventStore {
         last_event_id: i64,
     ) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
-        let conn = self
+        let mut conn = self
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let tx = conn.transaction()?;
 
         // Aktuelle Version ermitteln
-        let current_version: i32 = conn
+        let current_version: i32 = tx
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM snapshots WHERE aggregate_id = ?1",
                 params![aggregate_id],
@@ -605,7 +640,7 @@ impl EventStore {
             .unwrap_or_default()
             .as_millis() as i64;
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO snapshots (aggregate_id, snapshot_type, payload, last_event_id, version, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 aggregate_id,
@@ -616,7 +651,12 @@ impl EventStore {
                 now_ms,
             ],
         )?;
-        let row_id = conn.last_insert_rowid();
+        let row_id = tx.last_insert_rowid();
+        tx.execute(
+            "DELETE FROM snapshots WHERE aggregate_id = ?1 AND id <> ?2",
+            params![aggregate_id, row_id],
+        )?;
+        tx.commit()?;
         #[cfg(feature = "telemetry")]
         {
             let reg = sentinel_telemetry::MetricsRegistry::global();
@@ -654,6 +694,32 @@ impl EventStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Loescht alte Snapshot-Versionen und behaelt pro Aggregate nur die neueste Version.
+    ///
+    /// Diese Retention betrifft die kompakte `snapshots`-Tabelle, nicht die immutable
+    /// `world_snapshots` Time-Machine-Tabelle.
+    pub fn retain_latest_snapshots(&self) -> anyhow::Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let deleted = conn.execute(
+            "DELETE FROM snapshots
+             WHERE id NOT IN (
+                 SELECT (
+                     SELECT s2.id
+                     FROM snapshots s2
+                     WHERE s2.aggregate_id = aggregates.aggregate_id
+                     ORDER BY s2.version DESC, s2.id DESC
+                     LIMIT 1
+                 )
+                 FROM (SELECT DISTINCT aggregate_id FROM snapshots) aggregates
+             )",
+            [],
+        )? as u64;
+        Ok(deleted)
     }
 
     // ── Outbox ──────────────────────────────────
@@ -797,13 +863,67 @@ impl EventStore {
     /// Nutzt die shared Connection — kein separater Thread, kein Lock-Konflikt.
     /// Gibt die Anzahl geloeschter Rows zurueck (0 = fertig).
     pub fn prune_batch(&self, cutoff_event_id: i64, batch_size: i64) -> anyhow::Result<u64> {
+        if batch_size <= 0 {
+            return Ok(0);
+        }
+
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let tx = conn.transaction()?;
+
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS prune_batch_ids (
+                id INTEGER PRIMARY KEY,
+                event_id TEXT NOT NULL
+            );
+            DELETE FROM prune_batch_ids;",
+        )?;
+
+        let selected = tx.execute(
+            "INSERT INTO prune_batch_ids(id, event_id)
+             SELECT id, event_id
+             FROM events
+             WHERE id < ?1
+             ORDER BY id
+             LIMIT ?2",
+            params![cutoff_event_id, batch_size],
+        )? as u64;
+
+        if selected == 0 {
+            tx.commit()?;
+            return Ok(0);
+        }
+
+        tx.execute(
+            "DELETE FROM outbox
+             WHERE event_id IN (SELECT event_id FROM prune_batch_ids)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM events
+             WHERE id IN (SELECT id FROM prune_batch_ids)",
+            [],
+        )?;
+        tx.commit()?;
+
+        Ok(selected)
+    }
+
+    /// Loescht Outbox-Zeilen, deren Event bereits nicht mehr existiert.
+    ///
+    /// Fuer Live-Grossdatenbanken ist der bevorzugte Pfad die Offline-CTAS-Kompaktion.
+    /// Diese Methode ist als Maintenance-/Test-Primitive gedacht.
+    pub fn delete_orphan_outbox(&self) -> anyhow::Result<u64> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
         let deleted = conn.execute(
-            "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE id < ?1 LIMIT ?2)",
-            params![cutoff_event_id, batch_size],
+            "DELETE FROM outbox
+             WHERE event_id NOT IN (SELECT event_id FROM events)",
+            [],
         )? as u64;
         Ok(deleted)
     }
@@ -1353,6 +1473,224 @@ mod tests {
     }
 
     #[test]
+    fn test_outbox_event_id_index_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-outbox-index.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        let conn = store.conn();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_event_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_outbox_event_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 DELETE FROM outbox
+                 WHERE event_id IN (
+                     SELECT event_id FROM events WHERE id < 100 ORDER BY id LIMIT 10
+                 )",
+            )
+            .unwrap();
+        let details = stmt
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            details.contains("idx_outbox_event_id"),
+            "outbox delete should use idx_outbox_event_id, plan:\n{details}"
+        );
+    }
+
+    #[test]
+    fn test_open_migrates_legacy_outbox_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-legacy-outbox.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    event_type TEXT NOT NULL,
+                    aggregate_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    correlation_id TEXT NOT NULL,
+                    causation_id TEXT,
+                    operation_id TEXT NOT NULL,
+                    tick INTEGER NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
+                    compensation_type TEXT NOT NULL DEFAULT 'none'
+                );
+                CREATE TABLE outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL REFERENCES events(event_id),
+                    topic TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at INTEGER NOT NULL,
+                    published_at INTEGER
+                );",
+            )
+            .unwrap();
+        }
+
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        let conn = store.conn();
+        assert!(EventStore::table_has_column(&conn, "outbox", "retry_count").unwrap());
+        assert!(EventStore::table_has_column(&conn, "outbox", "last_error").unwrap());
+    }
+
+    #[test]
+    fn test_prune_batch_deletes_outbox_for_all_statuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-prune-outbox.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        let events = [
+            test_event("agent_action_received", "AGENT-01"),
+            test_event("agent_action_received", "AGENT-02"),
+            test_event("agent_action_received", "AGENT-03"),
+            test_event("agent_action_received", "AGENT-04"),
+        ];
+        for event in &events {
+            store
+                .append_with_outbox(event, "sentinel/events/agent_action_received/test")
+                .unwrap();
+        }
+
+        {
+            let conn = store.conn();
+            conn.execute(
+                "UPDATE outbox SET status = 'published' WHERE event_id = ?1",
+                params![events[0].event_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE outbox SET status = 'failed' WHERE event_id = ?1",
+                params![events[1].event_id],
+            )
+            .unwrap();
+        }
+
+        let cutoff: i64 = {
+            let conn = store.conn();
+            conn.query_row(
+                "SELECT id FROM events WHERE event_id = ?1",
+                params![events[3].event_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let deleted = store.prune_batch(cutoff, 10).unwrap();
+        assert_eq!(deleted, 3);
+
+        let conn = store.conn();
+        let event_count: i64 = conn
+            .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let outbox_count: i64 = conn
+            .query_row("SELECT count(*) FROM outbox", [], |row| row.get(0))
+            .unwrap();
+        let remaining_event_id: String = conn
+            .query_row("SELECT event_id FROM outbox", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(event_count, 1);
+        assert_eq!(outbox_count, 1);
+        assert_eq!(remaining_event_id, events[3].event_id);
+    }
+
+    #[test]
+    fn test_prune_batch_works_with_foreign_keys_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-prune-fk.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        {
+            let conn = store.conn();
+            conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+            let fk_enabled: i64 = conn
+                .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(fk_enabled, 1);
+        }
+
+        let event = test_event("agent_action_received", "AGENT-01");
+        store
+            .append_with_outbox(&event, "sentinel/events/agent_action_received/AGENT-01")
+            .unwrap();
+
+        let deleted = store.prune_batch(i64::MAX, 10).unwrap();
+        assert_eq!(deleted, 1);
+
+        let conn = store.conn();
+        let orphan_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM outbox o
+                 WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.event_id = o.event_id)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_count, 0);
+    }
+
+    #[test]
+    fn test_delete_orphan_outbox_removes_only_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-orphan-cleanup.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        let event = test_event("agent_action_received", "AGENT-01");
+        store
+            .append_with_outbox(&event, "sentinel/events/agent_action_received/AGENT-01")
+            .unwrap();
+
+        {
+            let conn = store.conn();
+            conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+            conn.execute(
+                "INSERT INTO outbox (event_id, topic, payload, status, created_at)
+                 VALUES ('missing-event', 'sentinel/events/test/missing', '{}', 'pending', 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let deleted = store.delete_orphan_outbox().unwrap();
+        assert_eq!(deleted, 1);
+
+        let conn = store.conn();
+        let outbox_count: i64 = conn
+            .query_row("SELECT count(*) FROM outbox", [], |row| row.get(0))
+            .unwrap();
+        let remaining_event_id: String = conn
+            .query_row("SELECT event_id FROM outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(outbox_count, 1);
+        assert_eq!(remaining_event_id, event.event_id);
+    }
+
+    #[test]
     fn test_get_events_by_aggregate() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test-aggregate.db");
@@ -1447,6 +1785,47 @@ mod tests {
         assert_eq!(snap2.version, 2);
         assert_eq!(snap2.last_event_id, 10);
         assert_eq!(snap2.payload, r#"{"hunger":80}"#);
+    }
+
+    #[test]
+    fn test_retain_latest_snapshots_keeps_latest_per_aggregate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-snap-retention.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        store
+            .save_snapshot("AGENT-01", "bio_state", r#"{"hunger":50}"#, 5)
+            .unwrap();
+        store
+            .save_snapshot("AGENT-01", "bio_state", r#"{"hunger":80}"#, 10)
+            .unwrap();
+        store
+            .save_snapshot("AGENT-02", "bio_state", r#"{"hunger":30}"#, 7)
+            .unwrap();
+
+        let deleted = store.retain_latest_snapshots().unwrap();
+        assert_eq!(deleted, 0);
+
+        let conn = store.conn();
+        let snapshot_count: i64 = conn
+            .query_row("SELECT count(*) FROM snapshots", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(snapshot_count, 2);
+        let agent_01_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM snapshots WHERE aggregate_id = 'AGENT-01'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent_01_count, 1);
+        drop(conn);
+
+        let snap = store.get_latest_snapshot("AGENT-01").unwrap().unwrap();
+        assert_eq!(snap.version, 2);
+        assert_eq!(snap.payload, r#"{"hunger":80}"#);
+        let snap = store.get_latest_snapshot("AGENT-02").unwrap().unwrap();
+        assert_eq!(snap.version, 1);
     }
 
     /// AC5: Rebuild aus Events - Reihenfolge und Daten bleiben erhalten.
@@ -1646,6 +2025,25 @@ mod tests {
             result.is_err(),
             "DELETE auf jungen Snapshot sollte vom Trigger blockiert werden"
         );
+    }
+
+    #[test]
+    fn test_snapshot_immutable_trigger_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-immutable-trigger.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        let conn = store.conn();
+        let trigger_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'trigger' AND name = 'protect_recent_snapshots'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(trigger_sql.contains("BEFORE DELETE ON world_snapshots"));
+        assert!(trigger_sql.contains("604800000"));
     }
 
     /// #264: Immutable Snapshots — DELETE auf alten Snapshot funktioniert.

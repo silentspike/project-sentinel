@@ -1,0 +1,5 @@
+# Benchmark Results
+
+| Benchmark | Issue | Date | Environment | Best settings | Result | TOGAF cluster | Findings |
+|---|---:|---|---|---|---|---|---|
+| sentinel-daemon-runtime-reconcile | #279 | 2026-06-05 | Live VM `ubuntu@10.0.0.240`, Ubuntu 24.04 native release build with `--features fuse`, i7-3930K host | 26 expected active agents, `sentinel-gateway` inactive except supervised AC-7 window, soak poll interval 60s | PASS: reconcile 3305us < 5000us; runtime health/projection drift snapshot 2259us < 5000us; analysis flood 198ns/request < 250000ns/request; stall bookkeeping 946ns < 50000ns. Soak A PASS at `/tmp/issue279-soak-A-20260605T185941Z`; supervised Soak B PASS at `/tmp/issue279-soak-B-20260605T195229Z` with `stall_churn_lines=0` and gateway stopped afterward. | Runtime Governance / Platform Controlplane | Periodic in-process reconcile converged runtime, projection, API, and live cgroups to 26/26/26/26 without manual operator reconcile. `llm_circuit_open` plus recent LLM-call grace suppresses false-positive stall churn while preserving service-health restarts. |
