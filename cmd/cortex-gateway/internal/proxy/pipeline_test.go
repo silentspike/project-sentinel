@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/control"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/extraction"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/forwardqueue"
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/guardrails"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/intercept"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/normalizer"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/sequencing"
@@ -446,6 +448,213 @@ func TestPipelineAnthropicMessagesStreamingUsesDirectProvider(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "message_start") {
 		t.Fatalf("expected SSE payload, got %q", w.Body.String())
+	}
+}
+
+func TestPipelineLocalLoopOverridesAnthropicMessagesStreaming(t *testing.T) {
+	reg := NewRegistry()
+	direct := &pipelineMockProvider{
+		name: "anthropic-direct",
+		streamFunc: func(_ context.Context, _ *LLMRequest, _ http.ResponseWriter) error {
+			return errors.New("anthropic-direct must not be called in local-loop mode")
+		},
+	}
+	localLoop, err := NewLocalLoopProvider(LocalLoopConfig{Name: LocalLoopProviderName})
+	if err != nil {
+		t.Fatalf("new local-loop provider: %v", err)
+	}
+	reg.Register("anthropic-direct", direct)
+	reg.Register(LocalLoopProviderName, localLoop)
+
+	cfg := control.NewConfig("anthropic-direct")
+	if err := cfg.Update(map[string]interface{}{"local_loop_enabled": true}); err != nil {
+		t.Fatalf("config update: %v", err)
+	}
+	ph := newTestPipelineHandler(reg, cfg)
+
+	body := `{
+		"model":"claude-opus-4-6",
+		"max_tokens":128,
+		"stream":true,
+		"messages":[{"role":"user","content":[{"type":"text","text":"stream bitte"}]}],
+		"metadata":{"agent_id":"9","agent_name":"AGENT-09","heard":"hi","room_id":"office","tick":"77"}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	ph.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if direct.streamCalls != 0 || direct.calls != 0 {
+		t.Fatalf("anthropic-direct calls=%d streamCalls=%d, want 0/0", direct.calls, direct.streamCalls)
+	}
+	if !strings.Contains(w.Body.String(), "event: message_start") || !strings.Contains(w.Body.String(), "AKTION:") {
+		t.Fatalf("expected local-loop SSE action response, got %q", w.Body.String())
+	}
+}
+
+func TestPipelineLocalLoopAnthropicMessagesNonStreaming(t *testing.T) {
+	reg := NewRegistry()
+	direct := &pipelineMockProvider{
+		name: "anthropic-direct",
+		resp: &LLMResponse{Content: "upstream", Model: "m", TokensUsed: 1},
+	}
+	localLoop, err := NewLocalLoopProvider(LocalLoopConfig{Name: LocalLoopProviderName})
+	if err != nil {
+		t.Fatalf("new local-loop provider: %v", err)
+	}
+	reg.Register("anthropic-direct", direct)
+	reg.Register(LocalLoopProviderName, localLoop)
+
+	cfg := control.NewConfig("anthropic-direct")
+	if err := cfg.Update(map[string]interface{}{"local_loop_enabled": true}); err != nil {
+		t.Fatalf("config update: %v", err)
+	}
+	ph := newTestPipelineHandler(reg, cfg)
+
+	body := `{
+		"model":"claude-opus-4-6",
+		"max_tokens":128,
+		"stream":false,
+		"messages":[{"role":"user","content":[{"type":"text","text":"non stream bitte"}]}],
+		"metadata":{"agent_id":"10","agent_name":"AGENT-10","heard":"hi","room_id":"office","tick":"78"}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	ph.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if direct.calls != 0 || direct.streamCalls != 0 {
+		t.Fatalf("anthropic-direct calls=%d streamCalls=%d, want 0/0", direct.calls, direct.streamCalls)
+	}
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode anthropic response: %v", err)
+	}
+	if resp["type"] != "message" || resp["role"] != "assistant" {
+		t.Fatalf("unexpected message shape: %#v", resp)
+	}
+	if resp["model"] != "claude-opus-4-6" {
+		t.Fatalf("model = %#v", resp["model"])
+	}
+	content := resp["content"].([]any)
+	first := content[0].(map[string]any)
+	if first["type"] != "text" || !strings.Contains(first["text"].(string), "AKTION:") {
+		t.Fatalf("unexpected content block: %#v", first)
+	}
+	usage := resp["usage"].(map[string]any)
+	if usage["service_tier"] != "standard" {
+		t.Fatalf("usage = %#v", usage)
+	}
+	if usage["input_tokens"].(float64) <= 0 || usage["output_tokens"].(float64) <= 0 {
+		t.Fatalf("usage tokens = %#v", usage)
+	}
+}
+
+func TestPipelineLocalLoopInternalExtractsActionsAndAvoidsUpstream(t *testing.T) {
+	reg := NewRegistry()
+	upstream := &pipelineMockProvider{
+		name: "claude-code",
+		resp: &LLMResponse{Content: "upstream", Model: "m", TokensUsed: 1},
+	}
+	localLoop, err := NewLocalLoopProvider(LocalLoopConfig{Name: LocalLoopProviderName})
+	if err != nil {
+		t.Fatalf("new local-loop provider: %v", err)
+	}
+	reg.Register("claude-code", upstream)
+	reg.Register(LocalLoopProviderName, localLoop)
+
+	cfg := control.NewConfig("claude-code")
+	if err := cfg.Update(map[string]interface{}{"local_loop_enabled": true}); err != nil {
+		t.Fatalf("config update: %v", err)
+	}
+	ph := newTestPipelineHandler(reg, cfg)
+
+	body := `{"messages":[{"role":"user","content":"Bitte antworte."}],"metadata":{"agent_id":"4","agent_name":"AGENT-04","tick":"88","heard":"Hallo","room_id":"engineering"}}`
+	req := httptest.NewRequest(http.MethodPost, "/internal/llm", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	beforeCost := guardrails.RuntimeCostSnapshot()
+	ph.ServeHTTP(w, req)
+	afterCost := guardrails.RuntimeCostSnapshot()
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if upstream.calls != 0 || upstream.streamCalls != 0 {
+		t.Fatalf("upstream calls=%d streamCalls=%d, want 0/0", upstream.calls, upstream.streamCalls)
+	}
+	var resp PipelineResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Provider != LocalLoopProviderName {
+		t.Fatalf("provider = %q, want %q", resp.Provider, LocalLoopProviderName)
+	}
+	if resp.TokensUsed <= 0 {
+		t.Fatalf("tokens_used = %d, want >0", resp.TokensUsed)
+	}
+	if len(resp.Actions) == 0 {
+		t.Fatalf("expected extracted action, response=%+v", resp)
+	}
+	if afterCost.ForwardCalls != beforeCost.ForwardCalls {
+		t.Fatalf("forward calls changed from %d to %d", beforeCost.ForwardCalls, afterCost.ForwardCalls)
+	}
+	if math.Abs(afterCost.TotalCostUSD-beforeCost.TotalCostUSD) > 1e-12 {
+		t.Fatalf("total cost changed from %.12f to %.12f", beforeCost.TotalCostUSD, afterCost.TotalCostUSD)
+	}
+	if afterCost.SynthesisCount <= beforeCost.SynthesisCount {
+		t.Fatalf("synthesis count did not increase: before=%d after=%d", beforeCost.SynthesisCount, afterCost.SynthesisCount)
+	}
+}
+
+func TestPipelineLocalLoopDefaultOffForwardsNormally(t *testing.T) {
+	reg := NewRegistry()
+	mock := &pipelineMockProvider{
+		name: "mock",
+		resp: &LLMResponse{
+			Content:      "AKTION: Emote\nZIEL: -\nINHALT: *normaler Mock*",
+			Model:        "mock-model",
+			TokensUsed:   3,
+			FinishReason: "end_turn",
+		},
+	}
+	localLoop, err := NewLocalLoopProvider(LocalLoopConfig{Name: LocalLoopProviderName})
+	if err != nil {
+		t.Fatalf("new local-loop provider: %v", err)
+	}
+	reg.Register("mock", mock)
+	reg.Register(LocalLoopProviderName, localLoop)
+
+	ph := newTestPipelineHandler(reg, control.NewConfig("mock"))
+
+	body := `{"messages":[{"role":"user","content":"test"}],"metadata":{"agent_id":"6","tick":"12"}}`
+	req := httptest.NewRequest(http.MethodPost, "/internal/llm", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	ph.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if mock.calls != 1 {
+		t.Fatalf("mock calls = %d, want 1", mock.calls)
+	}
+	var resp PipelineResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Provider != "mock" {
+		t.Fatalf("provider = %q, want mock", resp.Provider)
 	}
 }
 

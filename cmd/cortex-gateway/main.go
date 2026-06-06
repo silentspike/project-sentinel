@@ -84,6 +84,18 @@ func main() {
 	registry.Register("claude-code", claudeCodeProvider)
 	logger.Info("registered provider", "name", "claude-code", "model", envOrDefault("CLAUDE_CODE_MODEL", "claude-opus-4-6"))
 
+	localLoopProvider, err := proxy.NewLocalLoopProvider(proxy.LocalLoopConfig{
+		Name:         proxy.LocalLoopProviderName,
+		Model:        envOrDefault("CORTEX_LOCAL_LOOP_MODEL", "local-loop"),
+		ScenarioPath: os.Getenv("CORTEX_LOCAL_LOOP_SCENARIO"),
+	})
+	if err != nil {
+		logger.Error("failed to configure local-loop provider", "error", err)
+		os.Exit(1)
+	}
+	registry.Register(proxy.LocalLoopProviderName, localLoopProvider)
+	logger.Info("registered provider", "name", proxy.LocalLoopProviderName, "model", envOrDefault("CORTEX_LOCAL_LOOP_MODEL", "local-loop"))
+
 	// 4. Control config (shared between pipeline + control plane)
 	controlConfig := control.NewConfig(defaultPrimaryProvider())
 	applyTrafficControlDefaults(controlConfig, logger)
@@ -303,6 +315,11 @@ func main() {
 		pendingResponseIntercepts := responseInterceptor.Pending()
 		trafficConfig := controlConfig.Get()
 		lastAgentRuntime, hasLastAgentRuntime := responseLogs.LastByClass(proxy.RequestClassAgentRuntime)
+		localLoopActive := trafficConfig.LocalLoopEnabled || trafficConfig.PrimaryProvider == proxy.LocalLoopProviderName
+		externalMITMProvider := "anthropic-direct"
+		if localLoopActive {
+			externalMITMProvider = proxy.LocalLoopProviderName
+		}
 		stats := map[string]interface{}{
 			"synthesis_enabled":           trafficConfig.SynthesisEnabled,
 			"sequencing_enabled":          trafficConfig.SequencingEnabled,
@@ -318,9 +335,10 @@ func main() {
 			"synthesis_count":             costStats.SynthesisCount,
 			"synthesis_rate":              costStats.SynthesisRate,
 			"cost_by_provider":            costStats.ByProvider,
+			"local_loop_enabled":          localLoopActive,
 			"primary_provider":            trafficConfig.PrimaryProvider,
 			"internal_primary_provider":   trafficConfig.PrimaryProvider,
-			"external_mitm_provider":      "anthropic-direct",
+			"external_mitm_provider":      externalMITMProvider,
 			"agent_runtime_model_policy":  trafficConfig.AgentRuntimeModelPolicy,
 			"intercept_mode":              trafficConfig.InterceptMode,
 			"max_forward_concurrency":     trafficConfig.MaxForwardConcurrency,
@@ -637,6 +655,9 @@ func applyTrafficControlDefaults(cfg *control.Config, logger *slog.Logger) {
 	if v, ok := envBoolValue("SENTINEL_APICP_ENABLED"); ok {
 		updates["apicp_enabled"] = v
 	}
+	if v, ok := envBoolValue("CORTEX_LOCAL_LOOP"); ok {
+		updates["local_loop_enabled"] = v
+	}
 	if v, ok := envIntValue("SENTINEL_TICK_SYNC_TIMEOUT_MS"); ok {
 		updates["tick_sync_timeout_ms"] = v
 	}
@@ -660,6 +681,9 @@ func applyTrafficControlDefaults(cfg *control.Config, logger *slog.Logger) {
 func defaultPrimaryProvider() string {
 	if v := os.Getenv("CORTEX_PRIMARY_PROVIDER"); v != "" {
 		return v
+	}
+	if enabled, ok := envBoolValue("CORTEX_LOCAL_LOOP"); ok && enabled {
+		return proxy.LocalLoopProviderName
 	}
 	if os.Getenv("ANTHROPIC_API_KEY") != "" {
 		return "anthropic-direct"
