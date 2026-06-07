@@ -642,6 +642,52 @@ impl WorldSnapshot {
     pub const SCHEMA_VERSION: u32 = 2;
 }
 
+/// Scope einer gefenceten State-Transfer-Operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StateTransferScope {
+    /// Ganze Welt. Das ist der einzige in dieser Iteration produktiv implementierte Scope.
+    World,
+    /// Vorgesehener Scope fuer spaetere Nano-Container-Migrationen.
+    NanoContainer(String),
+}
+
+/// Stabiler Cursor des Quellzustands fuer Restore/Migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateTransferCursor {
+    pub tick: u64,
+    pub last_event_id: i64,
+}
+
+/// Hash-Manifest fuer immutable CAS-Blobs, die ein Snapshot referenziert.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CasManifest {
+    pub blob_hashes: Vec<[u8; 32]>,
+}
+
+/// Platzhalter fuer scope-gefilterte Projection-Updates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionDelta {
+    pub last_event_id: i64,
+}
+
+/// Platzhalter fuer spaetere Routing-Updates nach State-Transfer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteUpdate {
+    pub entries: Vec<String>,
+}
+
+/// Gemeinsamer Envelope fuer Time-Machine-Restore und spaetere Nano-Migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FencedStateTransfer {
+    pub scope: StateTransferScope,
+    pub owner_epoch: u64,
+    pub source_cursor: StateTransferCursor,
+    pub snapshot_id: String,
+    pub cas_manifest: CasManifest,
+    pub projection_delta: ProjectionDelta,
+    pub route_update: RouteUpdate,
+}
+
 /// Operator-Trigger fuer Point-in-Time Restore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorRestoreCommand {
