@@ -1,50 +1,50 @@
 # Zenoh Topic Wiring Status
 
-Catalog of all 22 Zenoh topics in `crates/sentinel-zenoh/src/topics.rs`.
-Reference for future wiring issues.
+Katalog aller 22 Zenoh-Topics in `crates/sentinel-zenoh/src/topics.rs`.
+Referenz fuer zukuenftige Verdrahtungs-Issues.
 
-**ADR:** ADR-001-judge-nats-communication (internal - see CHANGELOG)
+**ADR:** ADR-001-judge-nats-communication (internal — see CHANGELOG)
 
 ## Topics
 
-| # | Topic | Type | Status | Reference |
+| # | Topic | Typ | Status | Referenz |
 |---|-------|-----|--------|----------|
-| 1 | `sentinel/agent/{name}/action` | fn | dead | No Zenoh subscriber |
-| 2 | `sentinel/agent/{name}/perception` | fn | dead | No Zenoh subscriber |
-| 3 | `sentinel/agent/{name}/state` | fn | dead | No Zenoh subscriber |
-| 4 | `sentinel/room/{id}/audio` | fn | dead | No Zenoh subscriber |
-| 5 | `sentinel/room/{id}/smell` | fn | dead | No Zenoh subscriber |
-| 6 | `sentinel/room/{id}/presence` | fn | dead | No Zenoh subscriber |
-| 7 | `sentinel/physics/tick/{n}` | fn | dead | No Zenoh subscriber |
-| 8 | `sentinel/chaos/event` | const | dead | No Zenoh subscriber |
+| 1 | `sentinel/agent/{name}/action` | fn | dead | Kein Zenoh Subscriber |
+| 2 | `sentinel/agent/{name}/perception` | fn | dead | Kein Zenoh Subscriber |
+| 3 | `sentinel/agent/{name}/state` | fn | dead | Kein Zenoh Subscriber |
+| 4 | `sentinel/room/{id}/audio` | fn | dead | Kein Zenoh Subscriber |
+| 5 | `sentinel/room/{id}/smell` | fn | dead | Kein Zenoh Subscriber |
+| 6 | `sentinel/room/{id}/presence` | fn | dead | Kein Zenoh Subscriber |
+| 7 | `sentinel/physics/tick/{n}` | fn | dead | Kein Zenoh Subscriber |
+| 8 | `sentinel/chaos/event` | const | dead | Kein Zenoh Subscriber |
 | 9 | `sentinel/judge/alert` | const | **deprecated** | ADR-001: NATS `sentinel.judge.alert.*` |
-| 10 | `sentinel/agent/{name}/psi` | fn | dead | No Zenoh subscriber |
-| 11 | `sentinel/cortex/inject/{name}` | fn | dead | No Zenoh subscriber |
+| 10 | `sentinel/agent/{name}/psi` | fn | dead | Kein Zenoh Subscriber |
+| 11 | `sentinel/cortex/inject/{name}` | fn | dead | Kein Zenoh Subscriber |
 | 12 | `sentinel/meta/model-swap` | const | **deprecated** | ADR-001: NATS alert + HTTP |
 | 13 | `sentinel/ebpf/agent-health` | const | **live** | Daemon publishes (Zenoh + NATS) |
 | 14 | `sentinel/ebpf/io-profile` | const | **live** | Daemon publishes (Zenoh + NATS) |
 | 15 | `sentinel/ebpf/network` | const | **live** | Daemon publishes (Zenoh + NATS) |
 | 16 | `sentinel/ebpf/psi` | const | **live** | Daemon publishes (Zenoh + NATS) |
 | 17 | `sentinel/ebpf/status` | const | **live** | Daemon publishes (Zenoh + NATS) |
-| 18 | `sentinel/query/agent/{name}/request` | fn | dead | No Zenoh subscriber |
-| 19 | `sentinel/query/room/{id}/request` | fn | dead | No Zenoh subscriber |
-| 20 | `sentinel/query/global/request` | const | dead | No Zenoh subscriber |
-| 21 | `sentinel/query/response/{name}` | fn | dead | No Zenoh subscriber |
+| 18 | `sentinel/query/agent/{name}/request` | fn | dead | Kein Zenoh Subscriber |
+| 19 | `sentinel/query/room/{id}/request` | fn | dead | Kein Zenoh Subscriber |
+| 20 | `sentinel/query/global/request` | const | dead | Kein Zenoh Subscriber |
+| 21 | `sentinel/query/response/{name}` | fn | dead | Kein Zenoh Subscriber |
 | 22 | `sentinel` (PREFIX) | const | **live** | Namespace prefix |
 
 ## Summary
 
 - **Live:** 6 (5 eBPF + PREFIX)
-- **Deprecated:** 2 (JUDGE_ALERT, MODEL_SWAP - ADR-001)
-- **Dead:** 14 (never wired, no subscribers)
+- **Deprecated:** 2 (JUDGE_ALERT, MODEL_SWAP — ADR-001)
+- **Dead:** 14 (nie verdrahtet, keine Subscriber)
 
-## Next Steps
+## Naechste Schritte
 
-1. **Agent Action/Perception/State (1-3):** wire when ECS->Zenoh tick loop is active
-2. **Room Topics (4-6):** wire when room events flow via Zenoh
-3. **Physics Tick (7):** wire when Zenoh tick broadcast is implemented
-4. **Chaos Event (8):** wire when Physics Engine publishes Chaos->Zenoh
-5. **Agent PSI (10):** wire when Sandbox publishes PSI->Zenoh
-6. **Cortex Inject (11):** wire when Gateway uses Perception->Zenoh
-7. **Query Topics (18-21):** already implemented as a feature in sentinel-zenoh (InFlightTracker)
-8. **Dead Topics (all):** remove when the wiring sprint is complete
+1. **Agent Action/Perception/State (1-3):** Verdrahten wenn ECS→Zenoh Tick-Loop aktiv
+2. **Room Topics (4-6):** Verdrahten wenn Room-Events ueber Zenoh fliessen
+3. **Physics Tick (7):** Verdrahten wenn Zenoh Tick-Broadcast implementiert
+4. **Chaos Event (8):** Verdrahten wenn Physics Engine Chaos→Zenoh publiziert
+5. **Agent PSI (10):** Verdrahten wenn Sandbox PSI→Zenoh publiziert
+6. **Cortex Inject (11):** Verdrahten wenn Gateway Perception→Zenoh nutzt
+7. **Query Topics (18-21):** Bereits als Feature in sentinel-zenoh implementiert (InFlightTracker)
+8. **Dead Topics (alle):** Entfernen wenn Wiring-Sprint abgeschlossen
