@@ -131,3 +131,13 @@ cortex-gateway-linux
 # Internal sprint tracking — never publish
 PROGRESS.md
 IMPL-PLAN*.md
+
+# Internal working artifacts — not part of the public-facing repo
+.claude/
+docs/gaia-console-architecture.md
+docs/zenoh-wiring-status.md
+docs/functional-audit-judge.md
+test-*-verification.md
+tests/E2E_TEST_PLAN.md
+tests/E2E_RESULTS.md
+config/company-context.md
