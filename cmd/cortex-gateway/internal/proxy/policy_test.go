@@ -120,6 +120,14 @@ func TestResolveModelPolicy(t *testing.T) {
 			wantSource: PolicySourceAgentRuntime,
 		},
 		{
+			name:       "agent runtime defaults to haiku on local-loop provider",
+			provider:   LocalLoopProviderName,
+			class:      RequestClassAgentRuntime,
+			policy:     AgentRuntimeModelPolicyHaiku,
+			wantModel:  "haiku",
+			wantSource: PolicySourceAgentRuntime,
+		},
+		{
 			name:       "external compat keeps provider default",
 			provider:   "claude-code",
 			class:      RequestClassExternalCompat,

@@ -89,7 +89,7 @@ func resolveAgentRuntimePolicyModel(providerName, policy string) (string, error)
 	switch strings.TrimSpace(policy) {
 	case AgentRuntimeModelPolicyHaiku:
 		switch strings.TrimSpace(providerName) {
-		case "claude-code", "mock":
+		case "claude-code", "mock", LocalLoopProviderName:
 			return "haiku", nil
 		default:
 			return "", fmt.Errorf("agent_runtime_model_policy %q is not supported for provider %q", policy, providerName)

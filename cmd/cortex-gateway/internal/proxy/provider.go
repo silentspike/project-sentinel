@@ -14,6 +14,8 @@ type RequestFormat string
 const (
 	RequestFormatInternal  RequestFormat = "internal"
 	RequestFormatAnthropic RequestFormat = "anthropic"
+
+	LocalLoopProviderName = "local-loop"
 )
 
 // LLMRequest represents a request to an LLM provider.
@@ -88,7 +90,7 @@ type ProviderStatusReporter interface {
 // ProviderConfig holds configuration for a provider.
 type ProviderConfig struct {
 	Name      string `toml:"name"`
-	Type      string `toml:"type"` // "claude", "anthropic-direct", "ollama", or "claude-code"
+	Type      string `toml:"type"` // "claude", "anthropic-direct", "ollama", "claude-code", or "local-loop"
 	BaseURL   string `toml:"base_url"`
 	APIKey    string `toml:"api_key"` //nolint:gosec // field name, not a credential
 	Model     string `toml:"model"`
@@ -175,6 +177,8 @@ func NewProviderFromConfig(cfg ProviderConfig) (Provider, error) {
 		return NewOllamaProvider(cfg), nil
 	case "claude-code":
 		return NewClaudeCodeProvider(cfg, nil), nil
+	case LocalLoopProviderName:
+		return NewLocalLoopProvider(LocalLoopConfig{Name: cfg.Name, Model: cfg.Model})
 	default:
 		return nil, fmt.Errorf("unknown provider type: %q", cfg.Type)
 	}

@@ -30,6 +30,7 @@ type ConfigSnapshot struct {
 	RateLimit               float64           `json:"rate_limit_rps"`
 	AgentOverrides          map[string]string `json:"agent_overrides"`
 	AgentRuntimeModelPolicy string            `json:"agent_runtime_model_policy"`
+	LocalLoopEnabled        bool              `json:"local_loop_enabled"`
 
 	// Traffic Control (#288)
 	SynthesisEnabled      bool   `json:"synthesis_enabled"`
@@ -59,6 +60,7 @@ type Config struct {
 	rateLimit               float64
 	agentOverrides          map[string]string // agent_id -> provider_name
 	agentRuntimeModelPolicy string
+	localLoopEnabled        bool
 
 	// Traffic Control (#288)
 	synthesisEnabled      bool
@@ -88,6 +90,7 @@ func NewConfig(primaryProvider string) *Config {
 		rateLimit:               0,
 		agentOverrides:          make(map[string]string),
 		agentRuntimeModelPolicy: "haiku",
+		localLoopEnabled:        strings.EqualFold(strings.TrimSpace(primaryProvider), "local-loop"),
 
 		synthesisEnabled:      false,
 		sequencingEnabled:     false,
@@ -145,6 +148,7 @@ func (c *Config) Get() ConfigSnapshot {
 		RateLimit:               c.rateLimit,
 		AgentOverrides:          overrides,
 		AgentRuntimeModelPolicy: c.agentRuntimeModelPolicy,
+		LocalLoopEnabled:        c.localLoopEnabled,
 
 		SynthesisEnabled:      c.synthesisEnabled,
 		SequencingEnabled:     c.sequencingEnabled,
@@ -224,6 +228,14 @@ var configUpdaters = map[string]configUpdater{
 			return fmt.Errorf("agent_runtime_model_policy must be empty or %q, got %q", "haiku", v)
 		}
 		c.agentRuntimeModelPolicy = v
+		return nil
+	},
+	"local_loop_enabled": func(c *Config, val interface{}) error {
+		v, ok := val.(bool)
+		if !ok {
+			return fmt.Errorf("local_loop_enabled must be a boolean, got %T", val)
+		}
+		c.localLoopEnabled = v
 		return nil
 	},
 	"synthesis_enabled": func(c *Config, val interface{}) error {

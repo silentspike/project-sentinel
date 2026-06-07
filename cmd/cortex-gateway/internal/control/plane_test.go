@@ -59,6 +59,12 @@ func TestNewConfig_Defaults(t *testing.T) {
 	if snapshot.AgentRuntimeModelPolicy != "haiku" {
 		t.Errorf("expected agent_runtime_model_policy haiku, got %q", snapshot.AgentRuntimeModelPolicy)
 	}
+	if snapshot.LocalLoopEnabled {
+		t.Error("expected local_loop_enabled false by default")
+	}
+	if got := NewConfig("local-loop").Get(); !got.LocalLoopEnabled {
+		t.Error("expected local_loop_enabled true when primary provider is local-loop")
+	}
 }
 
 // TestConfig_GetSnapshot verifies that Get returns a snapshot and is concurrent-safe.
@@ -250,7 +256,7 @@ func TestPlane_HandleUpdateConfig_TrafficControlFields(t *testing.T) {
 	plane := NewPlane(cfg, testLogger())
 	handler := plane.Handler()
 
-	body := `{"synthesis_enabled": true, "sequencing_enabled": true, "tick_sync_enabled": true, "apicp_enabled": true, "tick_sync_timeout_ms": 1500, "p3_timeout_ms": 4000, "max_forward_concurrency": 5, "intercept_mode": "manual"}`
+	body := `{"synthesis_enabled": true, "sequencing_enabled": true, "tick_sync_enabled": true, "apicp_enabled": true, "local_loop_enabled": true, "tick_sync_timeout_ms": 1500, "p3_timeout_ms": 4000, "max_forward_concurrency": 5, "intercept_mode": "manual"}`
 	req := httptest.NewRequest(http.MethodPatch, "/control/config", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -264,7 +270,7 @@ func TestPlane_HandleUpdateConfig_TrafficControlFields(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
-	if !result.SynthesisEnabled || !result.SequencingEnabled || !result.TickSyncEnabled || !result.APICPEnabled {
+	if !result.SynthesisEnabled || !result.SequencingEnabled || !result.TickSyncEnabled || !result.APICPEnabled || !result.LocalLoopEnabled {
 		t.Fatalf("expected traffic toggles to be true, got %+v", result)
 	}
 	if result.TickSyncTimeoutMs != 1500 {
