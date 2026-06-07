@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   sync:
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: EndBug/label-sync@52074158190acb45f3077f9099fea818aa43f97a # v2.3.3
