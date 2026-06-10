@@ -79,6 +79,21 @@ export interface TickMetrics {
   prometheus?: string;
 }
 
+export interface PhaseRow {
+  phase: string;
+  p50_ms: number;
+  p95_ms: number;
+  count: number;
+  sum_ms: number;
+  avg_ms: number;
+}
+
+export interface PhaseMetrics {
+  available: boolean;
+  phases: PhaseRow[];
+  prometheus?: string;
+}
+
 export type IncidentSeverity = "critical" | "high" | "medium" | "low" | string;
 export type IncidentStatus = "active" | "pending" | "resolved" | "failed" | string;
 

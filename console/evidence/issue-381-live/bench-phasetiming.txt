@@ -1,0 +1,21 @@
+Gnuplot not found, using plotters backend
+Benchmarking issue381.phase_timing/full_tick_baseline_26_agents
+Benchmarking issue381.phase_timing/full_tick_baseline_26_agents: Warming up for 3.0000 s
+Benchmarking issue381.phase_timing/full_tick_baseline_26_agents: Collecting 50 samples in estimated 5.0834 s (38k iterations)
+Benchmarking issue381.phase_timing/full_tick_baseline_26_agents: Analyzing
+issue381.phase_timing/full_tick_baseline_26_agents
+                        time:   [126.44 µs 129.78 µs 133.40 µs]
+Found 3 outliers among 50 measurements (6.00%)
+  2 (4.00%) high mild
+  1 (2.00%) high severe
+
+Benchmarking issue381.phase_timing/full_tick_with_phase_timing_26_agents
+Benchmarking issue381.phase_timing/full_tick_with_phase_timing_26_agents: Warming up for 3.0000 s
+Benchmarking issue381.phase_timing/full_tick_with_phase_timing_26_agents: Collecting 50 samples in estimated 5.0833 s (36k iterations)
+Benchmarking issue381.phase_timing/full_tick_with_phase_timing_26_agents: Analyzing
+issue381.phase_timing/full_tick_with_phase_timing_26_agents
+                        time:   [127.49 µs 129.54 µs 131.85 µs]
+Found 4 outliers among 50 measurements (8.00%)
+  3 (6.00%) high mild
+  1 (2.00%) high severe
+

@@ -15,6 +15,7 @@ import { CockpitView } from "./views/CockpitView";
 import { ControlView } from "./views/ControlView";
 import { FloorplanView } from "./views/FloorplanView";
 import { MetricsView } from "./views/MetricsView";
+import { ProfilingView } from "./views/ProfilingView";
 import { TimeTravelView } from "./views/TimeTravelView";
 
 // Mobile-Breakpoint via matchMedia (Desktop=Tiling, Mobile=BottomTabBar).
@@ -25,11 +26,12 @@ function useIsMobile() {
   return m;
 }
 
-const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "cockpit", "activity", "chaos", "chat", "control", "timetravel"];
+const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "profiling", "cockpit", "activity", "chaos", "chat", "control", "timetravel"];
 const PANEL_LABEL: Record<PanelKind, string> = {
   agents: "Agents",
   floorplan: "Floorplan",
   metrics: "Metrics",
+  profiling: "Profiling",
   cockpit: "Cockpit",
   activity: "Activity",
   chaos: "Chaos",
@@ -66,6 +68,7 @@ const PANELS: Record<PanelKind, () => JSX.Element> = {
   agents: AgentsView,
   floorplan: FloorplanView,
   metrics: MetricsView,
+  profiling: ProfilingView,
   cockpit: CockpitView,
   activity: ActivityView,
   chaos: ChaosView,
