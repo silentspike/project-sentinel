@@ -63,8 +63,9 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     tracing::info!(%http_bind, bundle = %state.config.bundle_dir, "sentinel-dashboard-backend HTTPS listening");
+    // #474: ConnectInfo<SocketAddr> so the login handler can rate-limit per client IP.
     axum_server::bind_rustls(http_bind, tls_config)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
     Ok(())
 }
