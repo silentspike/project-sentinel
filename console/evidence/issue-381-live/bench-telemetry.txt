@@ -1,0 +1,32 @@
+Gnuplot not found, using plotters backend
+Benchmarking phase_histogram/observe_phase_4_buckets
+Benchmarking phase_histogram/observe_phase_4_buckets: Warming up for 3.0000 s
+Benchmarking phase_histogram/observe_phase_4_buckets: Collecting 100 samples in estimated 5.0001 s (181M iterations)
+Benchmarking phase_histogram/observe_phase_4_buckets: Analyzing
+phase_histogram/observe_phase_4_buckets
+                        time:   [27.205 ns 27.546 ns 27.941 ns]
+Found 8 outliers among 100 measurements (8.00%)
+  8 (8.00%) high mild
+Benchmarking phase_histogram/observe_phase_8_buckets
+Benchmarking phase_histogram/observe_phase_8_buckets: Warming up for 3.0000 s
+Benchmarking phase_histogram/observe_phase_8_buckets: Collecting 100 samples in estimated 5.0000 s (176M iterations)
+Benchmarking phase_histogram/observe_phase_8_buckets: Analyzing
+phase_histogram/observe_phase_8_buckets
+                        time:   [27.668 ns 27.963 ns 28.273 ns]
+Benchmarking phase_histogram/observe_phase_16_buckets
+Benchmarking phase_histogram/observe_phase_16_buckets: Warming up for 3.0000 s
+Benchmarking phase_histogram/observe_phase_16_buckets: Collecting 100 samples in estimated 5.0000 s (166M iterations)
+Benchmarking phase_histogram/observe_phase_16_buckets: Analyzing
+phase_histogram/observe_phase_16_buckets
+                        time:   [29.721 ns 30.019 ns 30.338 ns]
+Found 8 outliers among 100 measurements (8.00%)
+  8 (8.00%) high mild
+Benchmarking phase_histogram/record_all_10_phases_per_tick
+Benchmarking phase_histogram/record_all_10_phases_per_tick: Warming up for 3.0000 s
+Benchmarking phase_histogram/record_all_10_phases_per_tick: Collecting 100 samples in estimated 5.0004 s (18M iterations)
+Benchmarking phase_histogram/record_all_10_phases_per_tick: Analyzing
+phase_histogram/record_all_10_phases_per_tick
+                        time:   [276.65 ns 280.07 ns 283.78 ns]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+
