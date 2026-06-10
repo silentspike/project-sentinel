@@ -3,6 +3,10 @@ config_dir = "/opt/sentinel/config"
 data_dir = "/opt/sentinel/data"
 tick_rate_ms = 1000
 time_scale = 1.0
+# Per-Phase-Timing (#381): Dauer-Histogramme pro SimulationPhase
+# (sentinel_phase_duration_ms auf :9090 → Console-Profiling-View).
+# Telemetrie-only, Overhead < 0.1% des Tick-Budgets.
+phase_timing_enabled = true
 max_agents = 60
 zenoh_prefix = "sentinel"
 fs_mount = "/opt/sentinel/fs"

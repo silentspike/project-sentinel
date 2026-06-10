@@ -40,6 +40,12 @@ pub struct DaemonConfig {
     #[serde(default = "default_time_scale")]
     pub time_scale: f32,
 
+    /// Per-Phase-Timing (#381): Dauer-Histogramme pro `SimulationPhase`
+    /// (sentinel_phase_duration_ms auf :9090). Telemetrie-only, Budget
+    /// < 0,1% der Tick-Zeit (default: true).
+    #[serde(default = "default_phase_timing_enabled")]
+    pub phase_timing_enabled: bool,
+
     /// Command das im bwrap-Sandbox pro Agent ausgefuehrt wird.
     /// Default: agent-runtime (TOGAF: leichtgewichtiger Sandbox-Prozess).
     #[serde(default = "default_agent_command")]
@@ -412,6 +418,10 @@ fn default_max_agents() -> usize {
 
 fn default_time_scale() -> f32 {
     1.0
+}
+
+fn default_phase_timing_enabled() -> bool {
+    true
 }
 
 fn default_agent_command() -> Vec<String> {

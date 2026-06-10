@@ -10,6 +10,7 @@ pub mod export;
 pub mod health;
 pub mod logging;
 pub mod metrics;
+pub mod phase;
 
 pub use context::{
     TraceContext, TELEMETRY_ERRORS, TELEMETRY_HEALTH, TELEMETRY_METRICS, TELEMETRY_TRACES,
@@ -21,4 +22,7 @@ pub use health::{HealthRegistry, HealthSnapshot, HealthStatus, SubsystemHealth};
 pub use logging::{init_logging, init_logging_dev};
 pub use metrics::{
     metric_name, Counter, Gauge, Histogram, MetricsRegistry, MetricsSnapshot, SubsystemMetrics,
+};
+pub use phase::{
+    phase_label, phase_metric_name, PHASE_DURATION_BOUNDARIES_MS, PHASE_DURATION_PROM_NAME,
 };

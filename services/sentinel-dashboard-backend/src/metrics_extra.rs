@@ -193,3 +193,157 @@ pub async fn tick(State(st): State<AppState>) -> impl IntoResponse {
         }
     }
 }
+
+/// Kanonische Phasen-Reihenfolge der ECS-Simulation (#381).
+const PHASE_ORDER: [&str; 10] = [
+    "input",
+    "biology",
+    "physics",
+    "transit",
+    "chaos",
+    "mood",
+    "perception",
+    "decision",
+    "output",
+    "persist",
+];
+
+/// Parst die `sentinel_phase_duration_ms`-Summary von :9090 in das
+/// Profiling-JSON der Console (#381). Reihenfolge = `PHASE_ORDER`,
+/// unbekannte Phasen folgen alphabetisch dahinter.
+fn phases_payload(text: &str) -> Value {
+    // (p50_ms, p95_ms, count, sum_ms)
+    let mut by_phase: BTreeMap<String, (f64, f64, i64, f64)> = BTreeMap::new();
+    for line in text
+        .lines()
+        .filter(|l| l.starts_with("sentinel_phase_duration_ms"))
+    {
+        let Some(phase) = label_value(line, "phase") else {
+            continue;
+        };
+        let value = line
+            .split_whitespace()
+            .last()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let entry = by_phase.entry(phase).or_insert((0.0, 0.0, 0, 0.0));
+        // _count/_sum VOR den quantile-Zeilen pruefen: gleicher Basisname!
+        if line.starts_with("sentinel_phase_duration_ms_count") {
+            entry.2 = value as i64;
+        } else if line.starts_with("sentinel_phase_duration_ms_sum") {
+            entry.3 = value;
+        } else if label_value(line, "quantile").as_deref() == Some("0.5") {
+            entry.0 = value;
+        } else if label_value(line, "quantile").as_deref() == Some("0.95") {
+            entry.1 = value;
+        }
+    }
+
+    let mut ordered: Vec<(String, (f64, f64, i64, f64))> = Vec::new();
+    for p in PHASE_ORDER {
+        if let Some(v) = by_phase.remove(p) {
+            ordered.push((p.to_string(), v));
+        }
+    }
+    ordered.extend(by_phase);
+
+    let phases: Vec<Value> = ordered
+        .into_iter()
+        .map(|(phase, (p50, p95, count, sum))| {
+            json!({
+                "phase": phase,
+                "p50_ms": p50,
+                "p95_ms": p95,
+                "count": count,
+                "sum_ms": sum,
+                "avg_ms": if count > 0 { sum / count as f64 } else { 0.0 },
+            })
+        })
+        .collect();
+
+    json!({ "available": !phases.is_empty(), "phases": phases, "prometheus": "ok" })
+}
+
+pub async fn phases(State(st): State<AppState>) -> impl IntoResponse {
+    match fetch_text(&st, format!("{}/metrics", st.config.prometheus_url), 2000).await {
+        Ok(text) => Json(phases_payload(&text)),
+        Err(e) => {
+            tracing::warn!(error = %e, "phase metrics degraded");
+            Json(json!({ "available": false, "phases": [], "prometheus": "offline" }))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = "\
+# HELP sentinel_phase_duration_ms ECS SimulationPhase duration per tick (ms)
+# TYPE sentinel_phase_duration_ms summary
+sentinel_phase_duration_ms{phase=\"persist\",quantile=\"0.5\"} 5
+sentinel_phase_duration_ms{phase=\"persist\",quantile=\"0.95\"} 25
+sentinel_phase_duration_ms{phase=\"persist\",quantile=\"0.99\"} 100
+sentinel_phase_duration_ms_sum{phase=\"persist\"} 600
+sentinel_phase_duration_ms_count{phase=\"persist\"} 100
+sentinel_phase_duration_ms{phase=\"input\",quantile=\"0.5\"} 0.05
+sentinel_phase_duration_ms{phase=\"input\",quantile=\"0.95\"} 0.25
+sentinel_phase_duration_ms{phase=\"input\",quantile=\"0.99\"} 1
+sentinel_phase_duration_ms_sum{phase=\"input\"} 7.5
+sentinel_phase_duration_ms_count{phase=\"input\"} 100
+sentinel_tick_duration_ms 42
+";
+
+    #[test]
+    fn phases_payload_parses_summary_in_canonical_order() {
+        let payload = phases_payload(SAMPLE);
+        assert_eq!(payload["available"], json!(true));
+        let phases = payload["phases"].as_array().unwrap();
+        assert_eq!(phases.len(), 2);
+        // Kanonische Reihenfolge: input vor persist (trotz umgekehrter Text-Reihenfolge).
+        assert_eq!(phases[0]["phase"], json!("input"));
+        assert_eq!(phases[0]["p50_ms"], json!(0.05));
+        assert_eq!(phases[0]["p95_ms"], json!(0.25));
+        assert_eq!(phases[1]["phase"], json!("persist"));
+        assert_eq!(phases[1]["count"], json!(100));
+        assert_eq!(phases[1]["sum_ms"], json!(600.0));
+        assert_eq!(phases[1]["avg_ms"], json!(6.0));
+    }
+
+    #[test]
+    fn phases_payload_empty_text_is_unavailable() {
+        let payload = phases_payload("sentinel_tick_duration_ms 42\n");
+        assert_eq!(payload["available"], json!(false));
+        assert!(payload["phases"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn phases_payload_missing_quantile_defaults_to_zero() {
+        let text = "\
+sentinel_phase_duration_ms{phase=\"mood\",quantile=\"0.5\"} 0.01
+sentinel_phase_duration_ms_count{phase=\"mood\"} 3
+sentinel_phase_duration_ms_sum{phase=\"mood\"} 0.03
+";
+        let payload = phases_payload(text);
+        let phases = payload["phases"].as_array().unwrap();
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0]["p95_ms"], json!(0.0));
+        assert_eq!(phases[0]["avg_ms"], json!(0.01));
+    }
+
+    #[test]
+    fn phases_payload_unknown_phase_is_appended_after_canonical() {
+        let text = "\
+sentinel_phase_duration_ms{phase=\"persist\",quantile=\"0.5\"} 1
+sentinel_phase_duration_ms_count{phase=\"persist\"} 1
+sentinel_phase_duration_ms_sum{phase=\"persist\"} 1
+sentinel_phase_duration_ms{phase=\"zukunft\",quantile=\"0.5\"} 2
+sentinel_phase_duration_ms_count{phase=\"zukunft\"} 1
+sentinel_phase_duration_ms_sum{phase=\"zukunft\"} 2
+";
+        let payload = phases_payload(text);
+        let phases = payload["phases"].as_array().unwrap();
+        assert_eq!(phases[0]["phase"], json!("persist"));
+        assert_eq!(phases[1]["phase"], json!("zukunft"));
+    }
+}

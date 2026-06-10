@@ -172,6 +172,7 @@ pub fn build_app(state: AppState) -> axum::Router {
         .route("/metrics/ebpf", get(metrics_extra::ebpf))
         .route("/metrics/pipeline", get(metrics_extra::pipeline))
         .route("/metrics/tick", get(metrics_extra::tick))
+        .route("/metrics/phases", get(metrics_extra::phases))
         .route("/tasks", get(projection::tasks))
         .route("/cockpit", get(cockpit::cockpit))
         .route("/cockpit/incident/{id}", get(cockpit::incident))
