@@ -271,6 +271,33 @@ input, select { font: inherit; color: var(--text); background: var(--surface-0);
 .metrics-section, .benchmark-panel { display: grid; gap: 8px; }
 .metrics-section h3, .benchmark-panel h3 { margin: 0; font-size: 15px; }
 .metric-detail-list { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+
+/* Phase-Profiling (#381): p50/p95-Balken pro SimulationPhase */
+.phase-table { display: grid; gap: 8px; }
+.phase-row {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  gap: 4px 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-1);
+}
+.phase-row__label { font-weight: 700; font-size: 13px; align-self: center; }
+.phase-row__bars { display: grid; gap: 3px; align-self: center; }
+.phase-bar { height: 8px; border-radius: 4px; min-width: 2px; }
+.phase-bar--p50 { background: var(--accent); }
+.phase-bar--p95 { background: var(--warn); }
+.phase-row__values {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+}
+.phase-legend { display: flex; gap: 6px; align-items: center; font-size: 12px; }
+.phase-legend__swatch { width: 14px; height: 8px; border-radius: 4px; display: inline-block; }
+.phase-legend__swatch--p50 { background: var(--accent); }
+.phase-legend__swatch--p95 { background: var(--warn); }
 .degraded-panel {
   border: 1px solid var(--border);
   border-radius: 8px;
