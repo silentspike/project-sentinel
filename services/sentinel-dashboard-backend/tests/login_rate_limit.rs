@@ -3,7 +3,7 @@
 //! Verified via `build_app` + `tower::ServiceExt::oneshot` (no live server). The client IP is
 //! injected as a `ConnectInfo<SocketAddr>` request extension (the same extension
 //! `into_make_service_with_connect_info` installs in production). Time-based block expiry is
-//! covered by the unit tests in `auth.rs` (injected `now`); here we only assert the HTTP behaviour.
+//! covered by the unit tests in `auth.rs` (injected `now`); here we only assert the HTTP behavior.
 
 use std::net::SocketAddr;
 
