@@ -1,0 +1,22 @@
+{
+  "anchor_tick": 400,
+  "chaos_enabled": true,
+  "core_matches": true,
+  "psi": "zero",
+  "t1_engine_determinism": true,
+  "t1_hash_a": "36c7652fd15fe177185ff83f9fe30c7a72c332ac15e89775352c85f6b6cf8332",
+  "t1_hash_b": "36c7652fd15fe177185ff83f9fe30c7a72c332ac15e89775352c85f6b6cf8332",
+  "t2_live": {
+    "core": "2da4d5528a73a6857d7244d6cd7e246c5f84a7230669f8f812088c6b855dd454",
+    "strict": "36c7652fd15fe177185ff83f9fe30c7a72c332ac15e89775352c85f6b6cf8332"
+  },
+  "t2_replay": {
+    "core": "2da4d5528a73a6857d7244d6cd7e246c5f84a7230669f8f812088c6b855dd454",
+    "strict": "36c7652fd15fe177185ff83f9fe30c7a72c332ac15e89775352c85f6b6cf8332"
+  },
+  "t2_restore_vs_live": true,
+  "t3_two_replays": true,
+  "t7_negative_control_sensitive": true,
+  "variant": "GapProbe",
+  "window": 1000
+}
