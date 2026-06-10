@@ -10,10 +10,15 @@ StartLimitIntervalSec=300
 Type=simple
 WorkingDirectory=/opt/sentinel
 ExecStart=/opt/sentinel/bin/sentinel-dashboard-backend
-# Optionaler Secret-Env (SENTINEL_DASHBOARD_API_KEY, gleicher Key wie das Bun-Dashboard fuer geteilten Login)
+# Operator secret (SENTINEL_DASHBOARD_API_KEY) + login rate-limit knobs; see
+# docs/security/dashboard-key-management.md (#474). Strong deploy-specific secret, never a smoke/test key.
 EnvironmentFile=-/opt/sentinel/config/dashboard-backend.env
-Environment=SENTINEL_DASHBOARD_HTTP_BIND=0.0.0.0:8001
-Environment=SENTINEL_DASHBOARD_WT_BIND=0.0.0.0:8001
+# #474: loopback-only secure default. On-VM access is full (incl. WebTransport); an `ssh -L`
+# tunnel is HTTP-only (WT/QUIC = UDP does not traverse a TCP tunnel; full remote console: #522).
+# Deliberate LAN/third-party exposure: override SENTINEL_DASHBOARD_*_BIND via the env-file above;
+# the TLS/exposure model for that case is defined in #473. Do NOT re-add a 0.0.0.0 bind here.
+Environment=SENTINEL_DASHBOARD_HTTP_BIND=127.0.0.1:8001
+Environment=SENTINEL_DASHBOARD_WT_BIND=127.0.0.1:8001
 Environment=SENTINEL_OPERATOR_API_URL=http://127.0.0.1:8084
 Environment=CORTEX_GATEWAY_CONTROL_URL=http://127.0.0.1:8081
 Environment=CORTEX_GATEWAY_PROXY_URL=http://127.0.0.1:8080

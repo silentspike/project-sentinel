@@ -109,13 +109,18 @@ runtime, sentinel-fs, Deploy-VM service layout.
   processes; gateway can remain stopped for token-safe verification work.
 - Public security policy and dependency scanning workflows exist in the GitHub
   repository.
+- Dashboard login is rate-limited per client IP with audit logging, the dashboard
+  backend binds loopback-only on the deploy VM, and the operator-key lifecycle is
+  documented in `docs/security/dashboard-key-management.md` (#474).
 
 ### Open Gaps
 
-- Operator/dashboard auth hardening must remain an explicit production gate
-  before broader network exposure.
-- Restore/control routes need rate limits and audit-focused authorization checks
-  before remote operation is allowed.
+- Dashboard login brute force is now rate-limited and audited (#474); the remaining
+  pre-exposure gates are a CA-issued/edge-terminated TLS model (#473) and operator
+  RBAC.
+- Control/restore mutations remain session-gated; per-route rate limits and
+  structured mutation-audit events remain future work before remote operation is
+  allowed.
 - FUSE/eBPF/kernel-adjacent code needs regular privilege and unsafe reviews.
   Follow-up for unsafe review: #392.
 
@@ -166,14 +171,15 @@ Landlock, FUSE, eBPF, SQLite/Limbo integration.
 | P0 | Capability-based tool permissions plus server-side action validation | Compromised agent / prompt injection | #391 implemented for Gateway action extraction; memory provenance remains future work |
 | P1 | Unsafe audit with SAFETY justifications and CI threshold | Supply-chain and kernel-adjacent memory-safety regressions | #392 |
 | P1 | Formal verification for critical Event Store, snapshot, and bio invariants | State corruption that normal tests may miss | #393 |
-| P2 | Operator/console auth hardening before broad exposure | External attacker control-plane abuse | #402 implemented: server-side session store + httpOnly+SameSite=Strict cookie (operator key no longer JS-readable). Residual: see Accepted Residual Risks |
+| P2 | Operator/console auth hardening before broad exposure | External attacker control-plane abuse | #402 implemented: server-side session store + httpOnly+SameSite=Strict cookie (operator key no longer JS-readable). #474 implemented: strong operator secret, per-IP login rate limit + audit logging, loopback-only bind + UFW closure. Residual: see Accepted Residual Risks |
 | P2 | Release provenance and artifact integrity policy | Supply-chain substitution | Future issue before public release hardening |
 
 ## Accepted Residual Risks
 
 | Risk | Attacker class | Why accepted (current) | Direktive / Revisit |
 | --- | --- | --- | --- |
-| Operator key (login POST body) and session cookie transit over the deploy VM console endpoint (`:8001`, LAN) | External Attacker (network) | Console traffic is HTTPS with a self-signed certificate for the single-operator LAN setup. Same-origin + `SameSite=Strict` block cross-site CSRF; `textContent`-only frontend minimizes XSS. | Production exposure MUST sit behind an HTTPS-terminating proxy or CA-issued cert; keep `DASHBOARD_COOKIE_SECURE=on`. Revisit when the public exposure model is finalized. |
+| Operator key (login POST body) and session cookie transit over the deploy VM console endpoint (`:8001`) | External Attacker (network) | After #474 the endpoint is no longer LAN-exposed: the backend binds loopback-only and the UFW `:8001` rule is removed, so key/cookie transit happens over loopback or an SSH tunnel rather than the open LAN. Console traffic is HTTPS with a self-signed certificate; same-origin + `SameSite=Strict` block cross-site CSRF; the SolidJS frontend escapes by default (no `innerHTML`). Login is rate-limited + audited (#474). | Deliberate exposure for third-party deployments MUST sit behind an HTTPS-terminating proxy / CA-issued cert (#473); keep `DASHBOARD_COOKIE_SECURE=on`. |
+| Remote operator console over an `ssh -L` tunnel is HTTP-only | External Attacker (network) / operability | WebTransport is QUIC/UDP and does not traverse a TCP `ssh -L` tunnel, so remote login/REST works but the live push does not. Accepted for the single-operator setup: full live console requires on-VM access. | Full remote live console via a UDP-capable overlay (WireGuard/ZTNA) is tracked in #522 (lab ops — distinct from the #473 product exposure model). |
 | Console WebTransport telemetry | External Attacker (network) | WebTransport uses the same HTTPS origin and requires an authenticated one-time ticket. All control actions (pause/resume/provider/restore/chaos/stimulus/snapshot) go through `/api/control/*` with `require_auth` (session cookie). | Revisit if telemetry is later classified sensitive beyond the operator-console trust boundary. |
 
 ## Operating Rule
