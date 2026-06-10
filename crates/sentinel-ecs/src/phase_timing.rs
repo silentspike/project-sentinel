@@ -3,7 +3,7 @@
 //! [`install_phase_timing`] adds 11 boundary marker systems between the
 //! chained phase sets. Each marker only stamps `Instant::now()` into the
 //! [`PhaseTimings`] resource — no `Commands`, no deferred params, so the
-//! schedule gains no new sync points and simulation behaviour stays
+//! schedule gains no new sync points and simulation behavior stays
 //! unchanged (the timestamps are never read by any simulation system).
 //!
 //! The daemon reads the resource after `schedule.run()` and records the
