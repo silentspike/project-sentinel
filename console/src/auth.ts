@@ -13,7 +13,10 @@ export async function authStatus(): Promise<boolean> {
   }
 }
 
-export async function login(key: string): Promise<boolean> {
+/// Login outcome: success, wrong key, or rate-limited (#474 — distinct UX on `429`).
+export type LoginResult = "ok" | "invalid" | "rate-limited";
+
+export async function login(key: string): Promise<LoginResult> {
   try {
     const r = await fetch(`${base}/api/auth/login`, {
       method: "POST",
@@ -21,10 +24,11 @@ export async function login(key: string): Promise<boolean> {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ key }),
     });
-    if (!r.ok) return false;
-    return ((await r.json()) as { authenticated: boolean }).authenticated;
+    if (r.status === 429) return "rate-limited";
+    if (!r.ok) return "invalid";
+    return ((await r.json()) as { authenticated: boolean }).authenticated ? "ok" : "invalid";
   } catch {
-    return false;
+    return "invalid";
   }
 }
 
