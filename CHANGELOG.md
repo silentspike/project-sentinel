@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- TOGAF architecture guide (clusters 06/07): deploy-VM memory right-sized from 24 GB to 8 GB (#517) after a host-level OOM kill; hardware table, memory-budget card (headroom now ~2-4 GB), and the VM host-level tuning row updated. Measured normal load is <1 GB. Boot defaults on the VM are now token-safe via systemd `ConditionPathExists=/etc/sentinel/allow-llm` drop-ins for gateway/judge/health-monitor-timer (VM-side deliberate drift; repo units unchanged).
 - TOGAF architecture guide (clusters 05/07) now reflects the SOTA console stack delivered by Epic #430: the language-selection and stack tables describe SolidJS + Rust (axum/wtransport, :8001) with WebTransport/QUIC event push and msgpack+zstd delta frames instead of the removed Bun/Hono + WebSocket-poll dashboard; the service table and the `sentinel.target` startup chain reference `sentinel-dashboard-backend`.
 
 ### Removed
