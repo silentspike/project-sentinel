@@ -10,6 +10,7 @@ pub mod autonomy;
 pub mod components;
 pub mod decision;
 pub mod perception;
+pub mod phase_timing;
 pub mod systems;
 pub mod world;
 
@@ -18,6 +19,7 @@ pub use decision::format_impulse_from_queue;
 pub use perception::{
     format_injection, generate_perception, generate_perception_into, PerceptionTexts, SmellEvent,
 };
+pub use phase_timing::{install_phase_timing, PhaseTimings, PHASE_COUNT, PHASE_NAMES};
 pub use systems::SimulationPhase;
 pub use world::{
     apply_capabilities, apply_identity, apply_personality, attach_redb_store,

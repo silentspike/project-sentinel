@@ -1056,6 +1056,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 current_shift,
                 tick_rate,
                 time_scale,
+                config.phase_timing_enabled,
                 shutdown_ecs,
                 controlplane,
                 runtime_orch,
@@ -3369,6 +3370,7 @@ fn ecs_tick_loop(
     initial_shift: u8,
     tick_rate: Duration,
     time_scale: f32,
+    phase_timing_enabled: bool,
     shutdown: Arc<AtomicBool>,
     mut controlplane: ControlplaneKernel,
     mut runtime_orch: RuntimeOrchestrator,
@@ -3436,6 +3438,12 @@ fn ecs_tick_loop(
 
     // ECS World + Schedule erstellen
     let (mut world, mut schedule) = create_simulation_world();
+
+    // Per-Phase-Timing (#381): Boundary-Marker + PhaseTimings-Resource (opt-in).
+    // Die Resource ueberlebt restore_ecs_state (das despawnt nur Entities).
+    if phase_timing_enabled {
+        sentinel_ecs::install_phase_timing(&mut world, &mut schedule);
+    }
 
     // Diegetisches HW-Mapping: PSI-Metriken als ECS Resource (bio_system liest diese)
     world.insert_resource(sentinel_ecs::PsiMetrics::default());
@@ -3825,6 +3833,21 @@ fn ecs_tick_loop(
     let psi_mem_gauge =
         sentinel_telemetry::MetricsRegistry::global().gauge("sentinel_psi_mem_avg10");
     let psi_io_gauge = sentinel_telemetry::MetricsRegistry::global().gauge("sentinel_psi_io_avg10");
+    // Per-Phase-Histogramme (#381): leer wenn phase_timing deaktiviert.
+    let phase_histograms: Vec<std::sync::Arc<sentinel_telemetry::Histogram>> =
+        if phase_timing_enabled {
+            sentinel_ecs::PHASE_NAMES
+                .iter()
+                .map(|phase| {
+                    sentinel_telemetry::MetricsRegistry::global().histogram(
+                        &sentinel_telemetry::phase_metric_name(phase),
+                        &sentinel_telemetry::PHASE_DURATION_BOUNDARIES_MS,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
     let mut restore_fence = RestoreFence::default();
 
     loop {
@@ -3863,6 +3886,17 @@ fn ecs_tick_loop(
 
         // ECS Schedule ausfuehren (alle 12 Systems in Reihenfolge)
         schedule.run(&mut world);
+
+        // Per-Phase-Dauern recorden (#381): 10x observe, ~25ns each — im Budget.
+        if !phase_histograms.is_empty() {
+            if let Some(timings) = world.get_resource::<sentinel_ecs::PhaseTimings>() {
+                for (i, hist) in phase_histograms.iter().enumerate() {
+                    if let Some(ms) = timings.duration_ms(i) {
+                        hist.observe(ms);
+                    }
+                }
+            }
+        }
 
         // Activity-Tracking: Agents die eine Action ausgefuehrt haben als aktiv markieren
         if let Some(active) = world.get_resource::<sentinel_ecs::ActiveAgentsThisTick>() {
@@ -7170,6 +7204,7 @@ mod tests {
             1,
             Duration::from_millis(100),
             1.0, // time_scale
+            true,
             shutdown,
             controlplane,
             runtime_orch,
@@ -7262,6 +7297,7 @@ mod tests {
                 1,
                 Duration::from_millis(50),
                 1.0, // time_scale
+                true,
                 shutdown,
                 controlplane,
                 runtime_orch,
@@ -7371,6 +7407,7 @@ mod tests {
                 1,
                 Duration::from_millis(50),
                 1.0, // time_scale
+                true,
                 shutdown,
                 controlplane,
                 runtime_orch,
@@ -7488,6 +7525,7 @@ mod tests {
                 1,
                 Duration::from_millis(50),
                 1.0,
+                true,
                 shutdown,
                 controlplane,
                 runtime_orch,

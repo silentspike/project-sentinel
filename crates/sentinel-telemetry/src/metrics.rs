@@ -189,6 +189,7 @@ impl Histogram {
         let count = self.count.load(Ordering::Relaxed);
 
         let p50 = percentile_from_buckets(&self.boundaries, &bucket_counts, count, 0.50);
+        let p95 = percentile_from_buckets(&self.boundaries, &bucket_counts, count, 0.95);
         let p99 = percentile_from_buckets(&self.boundaries, &bucket_counts, count, 0.99);
 
         HistogramSnapshot {
@@ -197,6 +198,7 @@ impl Histogram {
             sum: f64::from_bits(self.sum_bits.load(Ordering::Relaxed)),
             count,
             p50,
+            p95,
             p99,
         }
     }
@@ -243,9 +245,11 @@ pub struct HistogramSnapshot {
     pub bucket_counts: Vec<u64>,
     pub sum: f64,
     pub count: u64,
-    /// Estimated 50th percentile (median), interpolated from buckets.
+    /// Estimated 50th percentile (median): upper boundary of the median bucket.
     pub p50: f64,
-    /// Estimated 99th percentile, interpolated from buckets.
+    /// Estimated 95th percentile: upper boundary of the p95 bucket.
+    pub p95: f64,
+    /// Estimated 99th percentile: upper boundary of the p99 bucket.
     pub p99: f64,
 }
 
@@ -404,8 +408,11 @@ pub fn metric_name(crate_name: &str, operation: &str, metric_type: &str) -> Stri
     format!("sentinel.{crate_name}.{operation}.{metric_type}")
 }
 
-/// Estimate a percentile from histogram buckets via linear interpolation.
-/// Returns 0.0 if count is 0.
+/// Estimate a percentile from histogram buckets.
+///
+/// Returns the **upper boundary of the bucket** containing the target rank
+/// (no interpolation within the bucket) — quantiles are therefore quantized
+/// to the configured boundaries. Returns 0.0 if count is 0.
 fn percentile_from_buckets(
     boundaries: &[f64],
     bucket_counts: &[u64],
@@ -635,8 +642,28 @@ mod tests {
         assert_eq!(snap.count, 100);
         // p50 should be in the <=10 bucket (50% of data is <=10)
         assert_eq!(snap.p50, 10.0);
+        // p95 is at observation 95, which lies in the <=50 bucket
+        assert_eq!(snap.p95, 50.0);
         // p99 should be in the <=50 bucket (99% is at observation 99, which is <=50)
         assert_eq!(snap.p99, 50.0);
+    }
+
+    #[test]
+    fn test_histogram_p95_known_distribution() {
+        let hist = Histogram::new(&[1.0, 10.0, 100.0]);
+        // 95 observations <=1, 5 observations in the <=100 bucket:
+        // rank 95 falls exactly into the first bucket, rank 99 into <=100.
+        for _ in 0..95 {
+            hist.observe(0.5);
+        }
+        for _ in 0..5 {
+            hist.observe(50.0);
+        }
+        let snap = hist.snapshot();
+        assert_eq!(snap.p50, 1.0);
+        assert_eq!(snap.p95, 1.0);
+        assert_eq!(snap.p99, 100.0);
+        assert!(snap.p50 <= snap.p95 && snap.p95 <= snap.p99);
     }
 
     #[test]
@@ -644,6 +671,7 @@ mod tests {
         let hist = Histogram::new(&[10.0, 100.0]);
         let snap = hist.snapshot();
         assert_eq!(snap.p50, 0.0);
+        assert_eq!(snap.p95, 0.0);
         assert_eq!(snap.p99, 0.0);
     }
 }
