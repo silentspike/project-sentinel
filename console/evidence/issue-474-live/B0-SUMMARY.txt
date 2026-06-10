@@ -1,0 +1,11 @@
+B0 baseline (#474) — login latency before hardening
+Target: running prod sentinel-dashboard-backend, OLD binary (no rate limiter), https://127.0.0.1:8001
+Host: deploy VM (i7-3930K, 8 cores). Sidecars: vmstat-b0.txt / mpstat-b0.txt (mpstat idle ~90%).
+n = 100 requests each. Key passed via env on the VM (not argv); summary is key-free.
+
+  success  p50 = 0.0046 s   p95 = 0.0455 s   (200 + Set-Cookie)
+  wrong    p50 = 0.0050 s   p95 = 0.0459 s   (401)
+
+Note: time_total is dominated by the TLS handshake (p95 ~45 ms = occasional fresh-connection
+handshake; p50 ~5 ms warm). success≈wrong at the median already. The security-relevant
+constant-time signal (wrong vs wrong-prefix) is measured in B1 against the hardened binary.
