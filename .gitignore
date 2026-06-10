@@ -137,6 +137,7 @@ IMPL-PLAN*.md
 docs/gaia-console-architecture.md
 docs/zenoh-wiring-status.md
 docs/functional-audit-judge.md
+docs/benchmarks/
 test-*-verification.md
 tests/E2E_TEST_PLAN.md
 tests/E2E_RESULTS.md
