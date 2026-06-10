@@ -1,0 +1,14 @@
+{
+  "event_replay": {
+    "core": "1e5d0d9f1def281b4e2886db507b1e9025c6c5e10bb91fff7e69fc9dda0871ac",
+    "strict": "95d6397195fefec8da74b79600cc621f54c67d92777427a631fe29541c8b2dcb"
+  },
+  "match": true,
+  "note": "operator chaos is not reconstructable from the agent-action log (TM-3 field gap)",
+  "reconstructed_inputs": 78,
+  "script_actions_in_window": 78,
+  "script_replay": {
+    "core": "1e5d0d9f1def281b4e2886db507b1e9025c6c5e10bb91fff7e69fc9dda0871ac",
+    "strict": "95d6397195fefec8da74b79600cc621f54c67d92777427a631fe29541c8b2dcb"
+  }
+}
