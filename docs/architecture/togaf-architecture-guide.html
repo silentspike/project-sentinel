@@ -1600,7 +1600,7 @@ sentinel/telemetry/spans        # SpanExport (optional, debug-only)</pre>
                 <thead><tr><th class="bg-white/[0.02] text-left p-3 text-dim uppercase tracking-widest text-[0.7rem] border-b border-border">Component</th><th class="bg-white/[0.02] text-left p-3 text-dim uppercase tracking-widest text-[0.7rem] border-b border-border">Specification</th><th class="bg-white/[0.02] text-left p-3 text-dim uppercase tracking-widest text-[0.7rem] border-b border-border">Relevance</th></tr></thead>
                 <tbody>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">CPU</strong></td><td class="p-3 border-b border-border/60"><strong class="text-neon-green">Bench/deploy VM: Intel i7-3930K (Sandy Bridge-E, Q4 2011), 6C/12T @ 3.2 GHz</strong> &mdash; reference target platform: i5-1235U mini PC (Alder Lake)</td><td class="p-3 border-b border-border/60">Every benchmark in this document was measured on the ~15-year-old i7-3930K VM</td></tr>
-                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">RAM</strong></td><td class="p-3 border-b border-border/60">24 GB DDR4-3200, dual channel</td><td class="p-3 border-b border-border/60">Sufficient for ECS, telemetry, night-run</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">RAM</strong></td><td class="p-3 border-b border-border/60">8 GB DDR4-3200 (right-sized 2026-06, #517 &mdash; was 24 GB)</td><td class="p-3 border-b border-border/60">Sufficient for ECS, telemetry, night-run &mdash; measured normal load &lt;1 GB</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">NVMe</strong></td><td class="p-3 border-b border-border/60">Samsung 980 256GB (DRAM-less, 64MB HMB)</td><td class="p-3 border-b border-border/60">SLC cache ~40&ndash;80 GB. After that: write IOPS drop 5&ndash;10&times;</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">GPU</strong></td><td class="p-3 border-b border-border/60">Intel Iris Xe (integrated)</td><td class="p-3 border-b border-border/60">No dGPU. No dGPU needed (cloud inference)</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3"><strong class="text-bright">Kernel</strong></td><td class="p-3">6.17.2-pve</td><td class="p-3">io_uring + eBPF + FUSE fully supported</td></tr>
@@ -1622,7 +1622,7 @@ sentinel/telemetry/spans        # SpanExport (optional, debug-only)</pre>
                 </div>
             </div>
             <div class="bg-surface-1 border border-border p-6 card-hover">
-                <div class="font-mono font-bold text-[0.65rem] text-dim uppercase tracking-widest mb-3 flex items-center gap-2"><i data-lucide="hard-drive" class="w-4 h-4 text-neon-blue"></i> Memory Budget (24 GB VM)</div>
+                <div class="font-mono font-bold text-[0.65rem] text-dim uppercase tracking-widest mb-3 flex items-center gap-2"><i data-lucide="hard-drive" class="w-4 h-4 text-neon-blue"></i> Memory Budget (8 GB VM)</div>
                 <div class="space-y-1 text-sm">
                     <div class="flex justify-between py-1.5 border-b border-border/60"><span>Guest OS + kernel</span><span class="text-bright">~400 MB</span></div>
                     <div class="flex justify-between py-1.5 border-b border-border/60"><span>ECS core (bevy_ecs)</span><span class="text-bright">~100-300 MB</span></div>
@@ -1630,7 +1630,7 @@ sentinel/telemetry/spans        # SpanExport (optional, debug-only)</pre>
                     <div class="flex justify-between py-1.5 border-b border-border/60"><span>tmpfs (working memory)</span><span class="text-bright">2-4 GB</span></div>
                     <div class="flex justify-between py-1.5 border-b border-border/60"><span>Night-Run + caches</span><span class="text-bright">~200-800 MB</span></div>
                     <div class="flex justify-between py-1.5 border-b border-border/60"><span>ZFS ARC (capped host-side)</span><span class="text-bright">4 GiB</span></div>
-                    <div class="flex justify-between py-1.5 font-bold"><span>Free headroom</span><span class="text-neon-green">~12-16 GB</span></div>
+                    <div class="flex justify-between py-1.5 font-bold"><span>Free headroom</span><span class="text-neon-green">~2-4 GB</span></div>
                 </div>
             </div>
         </div>
@@ -1738,7 +1738,7 @@ sentinel/telemetry/spans        # SpanExport (optional, debug-only)</pre>
                 <div class="space-y-1 text-sm">
                     <div class="flex gap-3 py-1.5 border-b border-border/60"><strong class="text-bright w-32 shrink-0">CPU</strong><span><code class="font-mono text-neon-blue text-[0.8em]">host-passthrough</code> (AVX2, AES-NI)</span></div>
                     <div class="flex gap-3 py-1.5 border-b border-border/60"><strong class="text-bright w-32 shrink-0">Machine</strong><span><code class="font-mono text-neon-blue text-[0.8em]">q35</code> (PCIe instead of i440fx)</span></div>
-                    <div class="flex gap-3 py-1.5 border-b border-border/60"><strong class="text-bright w-32 shrink-0">Memory</strong><span>24 GB fixed, ballooning=OFF, hugepages configurable (default 0)</span></div>
+                    <div class="flex gap-3 py-1.5 border-b border-border/60"><strong class="text-bright w-32 shrink-0">Memory</strong><span>8 GB fixed (right-sized from 24 GB, #517), ballooning=OFF, hugepages configurable (default 0)</span></div>
                     <div class="flex gap-3 py-1.5 border-b border-border/60"><strong class="text-bright w-32 shrink-0">CPU isolation</strong><span><code class="font-mono text-neon-blue text-[0.8em]">isolcpus=0-3</code> (P-cores exclusive)</span></div>
                     <div class="flex gap-3 py-1.5 border-b border-border/60"><strong class="text-bright w-32 shrink-0">Storage</strong><span><code class="font-mono text-neon-blue text-[0.8em]">virtio-scsi-single</code>, io_uring</span></div>
                     <div class="flex gap-3 py-1.5"><strong class="text-bright w-32 shrink-0">Network</strong><span><code class="font-mono text-neon-blue text-[0.8em]">virtio-net</code> + <code class="font-mono text-neon-blue text-[0.8em]">vhost-net</code></span></div>
