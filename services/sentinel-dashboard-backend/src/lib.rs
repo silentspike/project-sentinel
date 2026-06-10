@@ -66,12 +66,23 @@ pub struct Config {
     /// `[daemon].max_agents` aus daemon.toml (Single-Source wie der Daemon); None = lenient (Daemon
     /// bleibt finale Validierungs-Autoritaet). Siehe `config::read_max_agents`.
     pub max_agents: Option<usize>,
+    /// #474: failed `/api/auth/login` attempts per client IP within `login_window_secs` that
+    /// engage a block (`SENTINEL_DASHBOARD_LOGIN_MAX_FAILS`, default 5).
+    pub login_max_fails: u32,
+    /// #474: rate-limit window in seconds (`SENTINEL_DASHBOARD_LOGIN_WINDOW_SECS`, default 60).
+    pub login_window_secs: u64,
+    /// #474: block duration in seconds after the threshold is hit
+    /// (`SENTINEL_DASHBOARD_LOGIN_BLOCK_SECS`, default 300).
+    pub login_block_secs: u64,
 }
 
 impl Config {
     /// Liest die Konfiguration aus der Umgebung (Defaults = lokale Single-VM-Deploy).
     pub fn from_env() -> Self {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let env_parse = |k: &str, default: u64| -> u64 {
+            env(k).and_then(|v| v.parse().ok()).unwrap_or(default)
+        };
         let config_dir =
             env("SENTINEL_CONFIG_DIR").unwrap_or_else(|| "/opt/sentinel/config".into());
         // max_agents aus derselben daemon.toml wie der Daemon (Single-Source, kein Drift).
@@ -108,6 +119,9 @@ impl Config {
                 .unwrap_or_else(|| "dashboard-live".into()),
             config_dir,
             max_agents,
+            login_max_fails: env_parse("SENTINEL_DASHBOARD_LOGIN_MAX_FAILS", 5) as u32,
+            login_window_secs: env_parse("SENTINEL_DASHBOARD_LOGIN_WINDOW_SECS", 60),
+            login_block_secs: env_parse("SENTINEL_DASHBOARD_LOGIN_BLOCK_SECS", 300),
         }
     }
 }
@@ -116,6 +130,8 @@ impl Config {
 #[derive(Clone)]
 pub struct AppState {
     pub sessions: auth::SessionStore,
+    /// #474: per-IP brute-force limiter for `POST /api/auth/login`.
+    pub login_limiter: auth::LoginRateLimiter,
     pub config: Arc<Config>,
     pub http: reqwest::Client,
     /// Optionaler read-only Limbo EventStore-Handle. Nicht verfuegbar => Routen degradieren.
@@ -141,8 +157,14 @@ impl AppState {
                 None
             }
         };
+        let login_limiter = auth::LoginRateLimiter::new(
+            config.login_max_fails,
+            config.login_window_secs,
+            config.login_block_secs,
+        );
         Ok(Self {
             sessions: auth::SessionStore::new(),
+            login_limiter,
             config: Arc::new(config),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
