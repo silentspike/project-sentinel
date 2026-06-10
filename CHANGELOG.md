@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- Removed `docs/benchmarks/BENCHMARK-RESULTS.md` from the repository and gitignored `docs/benchmarks/`: benchmark result registers are internal working artifacts (same policy as the other entries under "Internal working artifacts" in `.gitignore`); the measurement data lives in the internal benchmark register outside the repo.
+
 ### Security
 - Closed Issue #477: bumped the Go toolchain directive from `go1.26.3`/`.2`/`.1` to **`go1.26.4`** across `go.work` and all Go-module `go.mod` files (`cmd/cortex-gateway`, `pkg/sentinel-go`, `services/sentinel-judge`, `services/sentinel-nats-bridge`). This clears two standard-library vulnerabilities that `govulncheck` started flagging on 2026-06-03: **GO-2026-5039** (`net/textproto`, arbitrary inputs in errors without escaping — reachable via `cortex-gateway` `ClaudeProvider.StreamHTTP` → `ReadMIMEHeader`) and **GO-2026-5037** (`crypto/x509`, inefficient candidate hostname parsing). Both are fixed in `go1.26.4`. No functional or dependency changes (x/crypto is already on 0.45 via #386).
 
