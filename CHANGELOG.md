@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- TOGAF architecture guide (clusters 05/07) now reflects the SOTA console stack delivered by Epic #430: the language-selection and stack tables describe SolidJS + Rust (axum/wtransport, :8001) with WebTransport/QUIC event push and msgpack+zstd delta frames instead of the removed Bun/Hono + WebSocket-poll dashboard; the service table and the `sentinel.target` startup chain reference `sentinel-dashboard-backend`.
+
 ### Removed
 - Removed `docs/benchmarks/BENCHMARK-RESULTS.md` from the repository and gitignored `docs/benchmarks/`: benchmark result registers are internal working artifacts (same policy as the other entries under "Internal working artifacts" in `.gitignore`); the measurement data lives in the internal benchmark register outside the repo.
 
