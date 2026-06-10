@@ -169,6 +169,10 @@ pub async fn ebpf_publisher(
                 let g = reg.gauge(name);
                 let _ = writeln!(text, "{} {}", name, g.get());
             }
+
+            // Per-Phase-Histogramme (#381) als Prometheus-Summary anhaengen.
+            let (_counters, histograms, _gauges) = reg.snapshot_raw();
+            render_phase_histograms(&mut text, &histograms);
         }
 
         match metrics_text.write() {
@@ -272,4 +276,129 @@ pub async fn ebpf_publisher(
         snapshots_processed = snapshot_count,
         "eBPF Publisher beendet: mpsc Sender gedroppt (ECS-Thread beendet)"
     );
+}
+
+/// Rendert alle `sentinel.ecs.phase.*`-Histogramme als Prometheus-Summary (#381).
+///
+/// Eine Metric-Family `sentinel_phase_duration_ms` mit `phase`-Label,
+/// Quantile p50/p95/p99 plus `_sum`/`_count` pro Phase. Deterministisch
+/// sortiert; Nicht-Phase-Histogramme werden ignoriert. Leere Map = kein Output
+/// (Lazy-Filter: vor dem ersten Tick erscheinen keine Zeilen).
+fn render_phase_histograms(
+    text: &mut String,
+    histograms: &std::collections::HashMap<String, sentinel_telemetry::metrics::HistogramSnapshot>,
+) {
+    use std::fmt::Write;
+
+    let mut rows: Vec<(&str, &sentinel_telemetry::metrics::HistogramSnapshot)> = histograms
+        .iter()
+        .filter_map(|(key, snap)| sentinel_telemetry::phase_label(key).map(|p| (p, snap)))
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    rows.sort_by_key(|(phase, _)| *phase);
+
+    let name = sentinel_telemetry::PHASE_DURATION_PROM_NAME;
+    let _ = writeln!(
+        text,
+        "# HELP {name} ECS SimulationPhase duration per tick (ms)"
+    );
+    let _ = writeln!(text, "# TYPE {name} summary");
+    for (phase, snap) in rows {
+        let _ = writeln!(
+            text,
+            "{name}{{phase=\"{phase}\",quantile=\"0.5\"}} {}",
+            snap.p50
+        );
+        let _ = writeln!(
+            text,
+            "{name}{{phase=\"{phase}\",quantile=\"0.95\"}} {}",
+            snap.p95
+        );
+        let _ = writeln!(
+            text,
+            "{name}{{phase=\"{phase}\",quantile=\"0.99\"}} {}",
+            snap.p99
+        );
+        let _ = writeln!(text, "{name}_sum{{phase=\"{phase}\"}} {}", snap.sum);
+        let _ = writeln!(text, "{name}_count{{phase=\"{phase}\"}} {}", snap.count);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sentinel_telemetry::metrics::HistogramSnapshot;
+    use std::collections::HashMap;
+
+    fn snap(p50: f64, p95: f64, p99: f64, sum: f64, count: u64) -> HistogramSnapshot {
+        HistogramSnapshot {
+            boundaries: vec![1.0, 10.0],
+            bucket_counts: vec![count, 0, 0],
+            sum,
+            count,
+            p50,
+            p95,
+            p99,
+        }
+    }
+
+    #[test]
+    fn render_emits_summary_lines_for_phase_keys_only() {
+        let mut histograms = HashMap::new();
+        histograms.insert(
+            sentinel_telemetry::phase_metric_name("input"),
+            snap(0.5, 1.0, 1.0, 12.5, 25),
+        );
+        histograms.insert(
+            sentinel_telemetry::phase_metric_name("persist"),
+            snap(1.0, 10.0, 10.0, 99.0, 25),
+        );
+        histograms.insert(
+            "sentinel.redb.get_agent_state.duration_us".to_string(),
+            snap(2.0, 4.0, 8.0, 1.0, 1),
+        );
+
+        let mut text = String::new();
+        render_phase_histograms(&mut text, &histograms);
+
+        assert_eq!(
+            text.matches("# TYPE sentinel_phase_duration_ms summary")
+                .count(),
+            1,
+            "exactly one TYPE header"
+        );
+        assert!(text.contains("sentinel_phase_duration_ms{phase=\"input\",quantile=\"0.5\"} 0.5"));
+        assert!(text.contains("sentinel_phase_duration_ms{phase=\"input\",quantile=\"0.95\"} 1"));
+        assert!(text.contains("sentinel_phase_duration_ms_sum{phase=\"persist\"} 99"));
+        assert!(text.contains("sentinel_phase_duration_ms_count{phase=\"persist\"} 25"));
+        assert!(
+            !text.contains("redb"),
+            "non-phase histograms must not be rendered"
+        );
+        // Deterministische Sortierung: input vor persist.
+        let input_pos = text.find("phase=\"input\"").unwrap();
+        let persist_pos = text.find("phase=\"persist\"").unwrap();
+        assert!(input_pos < persist_pos);
+    }
+
+    #[test]
+    fn render_with_empty_map_emits_nothing() {
+        let mut text = String::new();
+        render_phase_histograms(&mut text, &HashMap::new());
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn render_with_only_foreign_keys_emits_nothing() {
+        let mut histograms = HashMap::new();
+        histograms.insert(
+            "sentinel.zenoh.publish.duration_us".to_string(),
+            snap(1.0, 2.0, 3.0, 4.0, 5),
+        );
+        let mut text = String::new();
+        render_phase_histograms(&mut text, &histograms);
+        assert!(text.is_empty());
+    }
 }

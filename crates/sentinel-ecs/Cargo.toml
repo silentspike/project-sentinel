@@ -25,6 +25,8 @@ sentinel-wasm = { path = "../sentinel-wasm" }
 
 [dev-dependencies]
 sentinel-common = { path = "../sentinel-common" }
+# Nur fuer den #381-Bench (Daemon-Record-Pfad); die Library selbst bleibt telemetry-frei.
+sentinel-telemetry = { path = "../sentinel-telemetry" }
 criterion = { workspace = true }
 insta = { workspace = true }
 tempfile = "3"
@@ -36,4 +38,8 @@ harness = false
 
 [[bench]]
 name = "tick_loop_hotpath_bench"
+harness = false
+
+[[bench]]
+name = "phase_timing_bench"
 harness = false
