@@ -42,10 +42,12 @@ const PANEL_LABEL: Record<PanelKind, string> = {
 
 function Login(props: { onOk: () => void }): JSX.Element {
   const [key, setKey] = createSignal("");
-  const [err, setErr] = createSignal(false);
+  // #474: distinguish wrong key ("invalid") from rate-limit ("rate-limited") for the operator.
+  const [err, setErr] = createSignal<"" | "invalid" | "rate-limited">("");
   const submit = async () => {
-    if (await doLogin(key())) props.onOk();
-    else setErr(true);
+    const res = await doLogin(key());
+    if (res === "ok") props.onOk();
+    else setErr(res);
   };
   return (
     <div data-testid="login" style={{ display: "grid", "place-items": "center", height: "100%" }}>
@@ -58,7 +60,13 @@ function Login(props: { onOk: () => void }): JSX.Element {
           onKeyDown={(e) => e.key === "Enter" && void submit()}
         />
         <button class="primary" data-testid="login-submit" style={{ width: "100%" }} onClick={() => void submit()}>Anmelden</button>
-        <Show when={err()}><p style={{ color: "var(--danger)", "font-size": "13px" }}>Ungueltiger Key.</p></Show>
+        <Show when={err()}>
+          <p data-testid="login-error" style={{ color: "var(--danger)", "font-size": "13px" }}>
+            {err() === "rate-limited"
+              ? "Zu viele Fehlversuche — bitte kurz warten."
+              : "Ungueltiger Key."}
+          </p>
+        </Show>
       </div>
     </div>
   );

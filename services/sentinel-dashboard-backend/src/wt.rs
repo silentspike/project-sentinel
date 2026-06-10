@@ -27,20 +27,21 @@ pub async fn run_server(
     let identity = Identity::load_pemfiles(&cert_pem, &key_pem)
         .await
         .context("load self-signed pemfiles")?;
-    let port: u16 = state
+    // #474 acceptance finding: `with_bind_default(port)` binds QUIC to 0.0.0.0 and silently
+    // ignores the address part of SENTINEL_DASHBOARD_WT_BIND — the loopback-only default
+    // would not apply to WebTransport. Bind the full configured SocketAddr instead.
+    let bind_addr: std::net::SocketAddr = state
         .config
         .wt_bind
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse().ok())
-        .context("wt_bind port")?;
+        .parse()
+        .context("wt_bind must be a full socket address, e.g. 127.0.0.1:8001")?;
     let config = ServerConfig::builder()
-        .with_bind_default(port)
+        .with_bind_address(bind_addr)
         .with_identity(identity)
         .build();
     let server = Endpoint::server(config)?;
     tracing::info!(
-        port,
+        %bind_addr,
         "sentinel-dashboard-backend WebTransport/QUIC listening"
     );
 
