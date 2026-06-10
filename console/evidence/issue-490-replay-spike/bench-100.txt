@@ -1,0 +1,1 @@
+{"anchor_tick":40,"live_compute_ms":42.171302000000004,"replay_ms":31.504495000000002,"snapshot_bytes":13552,"window":100}
