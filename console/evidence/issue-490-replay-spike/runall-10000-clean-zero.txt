@@ -1,0 +1,22 @@
+{
+  "anchor_tick": 4000,
+  "chaos_enabled": true,
+  "core_matches": true,
+  "psi": "zero",
+  "t1_engine_determinism": true,
+  "t1_hash_a": "1531c24a48db8b969a3147813f13b225dba95466a7766127a408d316013da9a0",
+  "t1_hash_b": "1531c24a48db8b969a3147813f13b225dba95466a7766127a408d316013da9a0",
+  "t2_live": {
+    "core": "3f9c005bcc82683b676579155c3f840f5fcfbf6d443390fd4ab0805bbf69b842",
+    "strict": "1531c24a48db8b969a3147813f13b225dba95466a7766127a408d316013da9a0"
+  },
+  "t2_replay": {
+    "core": "3f9c005bcc82683b676579155c3f840f5fcfbf6d443390fd4ab0805bbf69b842",
+    "strict": "1531c24a48db8b969a3147813f13b225dba95466a7766127a408d316013da9a0"
+  },
+  "t2_restore_vs_live": true,
+  "t3_two_replays": true,
+  "t7_negative_control_sensitive": true,
+  "variant": "Clean",
+  "window": 10000
+}
