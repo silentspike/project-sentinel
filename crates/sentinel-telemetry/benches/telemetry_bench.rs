@@ -59,6 +59,17 @@ fn bench_histogram_observe(c: &mut Criterion) {
         });
     });
 
+    // 8-bucket histogram (#381 default candidate)
+    let boundaries_8: Vec<f64> = (1..=8).map(|i| i as f64 * 25.0).collect();
+    let hist_8 = registry.histogram("bench.hist.8bucket", &boundaries_8);
+    group.bench_function("observe_8_buckets", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            i = i.wrapping_add(1);
+            hist_8.observe(black_box((i % 250) as f64));
+        });
+    });
+
     // 16-bucket histogram (stress test — more buckets = more linear scan)
     let boundaries_16: Vec<f64> = (1..=16).map(|i| i as f64 * 10.0).collect();
     let hist_16 = registry.histogram("bench.hist.16bucket", &boundaries_16);
@@ -74,6 +85,83 @@ fn bench_histogram_observe(c: &mut Criterion) {
     group.bench_function("snapshot_4_buckets", |b| {
         b.iter(|| {
             black_box(hist_4.snapshot());
+        });
+    });
+
+    group.finish();
+}
+
+// ──────────────────────────────────────────────
+// 2b. Phase-Histogramme (#381) — Budget: 10x observe < 1 µs/Tick
+//
+// Bucket-Sweep 4/8/16 mit identischer, phasen-typischer Werteverteilung
+// (µs-Bereich dominiert, einzelne ms- und >100-ms-Ausreisser) — findet das
+// beste Setting fuer PHASE_DURATION_BOUNDARIES_MS auf der Deploy-VM.
+// ──────────────────────────────────────────────
+
+/// Phasen-typische Dauer in ms: ~80% µs-Bereich, ~18% einstellige ms,
+/// ~2% Persist-artige Ausreisser. Deterministisch (kein RNG im Hot-Loop).
+fn phase_like_value_ms(i: u64) -> f64 {
+    match i % 50 {
+        0 => 120.0 + (i % 7) as f64 * 30.0, // seltener Ausreisser (persist unter Last)
+        n if n < 10 => 1.0 + (i % 9) as f64 * 0.5, // einstellige ms
+        _ => 0.002 + (i % 40) as f64 * 0.004, // 2-160 µs
+    }
+}
+
+fn bench_phase_histogram(c: &mut Criterion) {
+    use sentinel_telemetry::{phase_metric_name, PHASE_DURATION_BOUNDARIES_MS};
+
+    let mut group = c.benchmark_group("phase_histogram");
+    let registry = MetricsRegistry::global();
+
+    let sweep_4: Vec<f64> = vec![0.05, 1.0, 25.0, 500.0];
+    let sweep_8: Vec<f64> = PHASE_DURATION_BOUNDARIES_MS.to_vec();
+    let sweep_16: Vec<f64> = vec![
+        0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0,
+        500.0,
+    ];
+
+    for (label, boundaries) in [
+        ("observe_phase_4_buckets", &sweep_4),
+        ("observe_phase_8_buckets", &sweep_8),
+        ("observe_phase_16_buckets", &sweep_16),
+    ] {
+        let hist = registry.histogram(&format!("bench.phase.{label}"), boundaries);
+        group.bench_function(label, |b| {
+            let mut i = 0u64;
+            b.iter(|| {
+                i = i.wrapping_add(1);
+                hist.observe(black_box(phase_like_value_ms(i)));
+            });
+        });
+    }
+
+    // Realer Per-Tick-Pfad des Daemons: 10 Phasen-Histogramme nacheinander
+    // recorden (orchestrator.rs nach schedule.run). Budget: < 1 µs gesamt.
+    let phase_names = [
+        "input",
+        "biology",
+        "physics",
+        "transit",
+        "chaos",
+        "mood",
+        "perception",
+        "decision",
+        "output",
+        "persist",
+    ];
+    let phase_hists: Vec<_> = phase_names
+        .iter()
+        .map(|p| registry.histogram(&phase_metric_name(p), &PHASE_DURATION_BOUNDARIES_MS))
+        .collect();
+    group.bench_function("record_all_10_phases_per_tick", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            i = i.wrapping_add(1);
+            for (k, hist) in phase_hists.iter().enumerate() {
+                hist.observe(black_box(phase_like_value_ms(i.wrapping_add(k as u64))));
+            }
         });
     });
 
@@ -196,6 +284,7 @@ criterion_group!(
     benches,
     bench_counter_increment,
     bench_histogram_observe,
+    bench_phase_histogram,
     bench_gauge_operations,
     bench_registry_lookup,
     bench_snapshot_raw,

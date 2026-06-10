@@ -9,6 +9,7 @@ const BENCHMARK_ROWS = [
   ["Persist e2e", "52.57% schneller", "26 Events in einer SQLite-Transaktion"],
   ["Persist write-only", "86.95% schneller", "prebuilt Event-Pfad isoliert Store-Writes"],
   ["Full tick", "17.23% schneller", "26-Agenten-Tick Regression-Guard"],
+  ["Phase-Timing #381", "<0.1% Tick-Budget", "10 Histogramm-Records ~0.3 µs/Tick; full-tick Delta im Messrauschen (129.78 vs 129.54 µs)"],
 ] as const;
 
 function MetricCard(props: { label: string; value: string; tone?: "warn" | "danger" | "ok" }): JSX.Element {

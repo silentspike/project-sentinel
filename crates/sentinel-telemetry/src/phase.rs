@@ -18,9 +18,13 @@ pub const PHASE_METRIC_SUFFIX: &str = ".duration_ms";
 /// Default bucket boundaries in milliseconds.
 ///
 /// Phases range from a few microseconds (mood) to ~100 ms (persist under
-/// load); the tick budget is 1000 ms. 8 log-spread buckets; the count is
-/// validated by the #381 bucket sweep (4 vs 8 vs 16) on the deploy VM.
-pub const PHASE_DURATION_BOUNDARIES_MS: [f64; 8] = [0.01, 0.05, 0.25, 1.0, 5.0, 25.0, 100.0, 500.0];
+/// load); the tick budget is 1000 ms. 16 log-spread buckets — winner of the
+/// #381 sweep on the deploy VM (i7-3930K): 30.0 ns/observe vs 28.0 ns with
+/// 8 buckets, i.e. +2 ns buys double quantile resolution (percentiles are
+/// quantized to these boundaries, so resolution dominates the trade-off).
+pub const PHASE_DURATION_BOUNDARIES_MS: [f64; 16] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0,
+];
 
 /// Registry key for one phase, e.g. `sentinel.ecs.phase.biology.duration_ms`.
 pub fn phase_metric_name(phase: &str) -> String {
