@@ -33,7 +33,7 @@ try {
 
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
 
-  // Operator-Login ueber die echte Login-Maske (user-like behaviour).
+  // Operator-Login ueber die echte Login-Maske (user-like behavior).
   await page.getByTestId("login-key").fill(key);
   await page.getByTestId("login-submit").click();
   await page.waitForSelector("[data-testid=open-profiling], [data-testid=view-profiling]", { timeout: 15_000 });
