@@ -12,6 +12,7 @@
 //!   LLM-Bridge-Receiver haelt waehrenddessen sein altes Ende und bekommt nichts.
 //! - `LimboEventStore`/`ZenohFanoutSender`/`RedbStateStore` werden **ENTFERNT** — `persist_system`
 //!   leert den `EventBuffer` bei Absenz (kein Event-Re-Append, kein Zenoh/redb-Write).
+//!
 //! Setup/Teardown ist explizit (restore auf Ok UND Err). Ein Panic waehrend des Replays ist fatal
 //! wie jeder Tick-Loop-Panic — die aktive `RestoreFence` + der Pre-Restore-Safety-Snapshot decken
 //! das Recovery beim Neustart ab.
@@ -61,6 +62,7 @@ pub struct ReplayReport {
 ///   deterministische Autonomy-System beim Replay selbst neu -> sonst Doppel-Anwendung),
 /// - Operator-Kommandos (`chaos_triggered`, `room_stimulus_applied`, `operator_gaia_sent`,
 ///   `operator_broadcast_sent`, `operator_dm_sent`).
+///
 /// Alle anderen Event-Typen sind Outputs (transit/bio/physics/…) und werden NICHT eingespeist.
 pub fn reconstruct_inputs(events: &[DomainEvent]) -> Vec<(u64, ReplayInput)> {
     let mut out = Vec::new();
@@ -351,8 +353,10 @@ fn replay_loop(
     operator_tx: &Sender<OperatorCommand>,
     perception_rx: &std::sync::mpsc::Receiver<Perception>,
 ) -> Result<ReplayReport> {
-    let mut report = ReplayReport::default();
-    report.psi_band_changes = bands.len();
+    let mut report = ReplayReport {
+        psi_band_changes: bands.len(),
+        ..Default::default()
+    };
     // sim_hour aus dem (restaurierten) Anchor-Zustand weiterfuehren.
     let mut sim_hour = world
         .get_resource::<SimulationTime>()
