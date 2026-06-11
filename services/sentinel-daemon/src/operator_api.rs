@@ -47,6 +47,8 @@ const OPERATOR_NIGHTRUN_PATH: &str = "/operator/nightrun";
 const OPERATOR_SNAPSHOTS_PATH: &str = "/operator/snapshots";
 const OPERATOR_SNAPSHOT_PATH: &str = "/operator/snapshot";
 const OPERATOR_RESTORE_PATH: &str = "/operator/restore";
+/// #491 (TM-3): read-only deterministischer State-Hash der Live-World (Restore/Replay-Evidence).
+const OPERATOR_STATE_HASH_PATH: &str = "/operator/state-hash";
 const OPERATOR_CONFIG_APPLY_PATH: &str = "/operator/config/apply";
 const OPERATOR_MIGRATE_PATH: &str = "/operator/migrate";
 const OPERATOR_PRUNE_PATH: &str = "/operator/prune";
@@ -632,6 +634,22 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                     Err(err) => err.to_response(),
                 }
             }
+            OPERATOR_STATE_HASH_PATH => {
+                // #491 (TM-3): State-Hash im Tick-Loop erheben (RuntimeControlCommand-Muster).
+                let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+                if state
+                    .runtime_tx
+                    .send(crate::runtime_control::RuntimeControlCommand::StateHash { response_tx })
+                    .is_err()
+                {
+                    return ApiError::ServiceUnavailable("Runtime-Channel nicht verfuegbar")
+                        .to_response();
+                }
+                match response_rx.recv_timeout(Duration::from_secs(10)) {
+                    Ok(resp) => json_response(200, resp),
+                    Err(_) => ApiError::ServiceUnavailable("State-Hash Timeout").to_response(),
+                }
+            }
             _ => ApiError::NotFound("Endpoint unbekannt").to_response(),
         };
     }
@@ -705,11 +723,19 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 match serde_json::from_slice(&request.body) {
                     Ok(p) => p,
                     Err(_) => {
-                        return ApiError::BadRequest("Request-JSON ungueltig (snapshot_id fehlt)")
-                            .to_response();
+                        return ApiError::BadRequest("Request-JSON ungueltig").to_response();
                     }
                 };
-            info!(snapshot_id = %payload.snapshot_id, "Restore via Operator-API angefordert");
+            // #491: genau eines von snapshot_id/target_tick/target_event_id.
+            if let Err(msg) = payload.validate() {
+                return ApiError::BadRequest(msg).to_response();
+            }
+            info!(
+                snapshot_id = ?payload.snapshot_id,
+                target_tick = ?payload.target_tick,
+                target_event_id = ?payload.target_event_id,
+                "Restore via Operator-API angefordert"
+            );
             match state.restore_tx.send(payload) {
                 Ok(()) => json_response(
                     202,
@@ -1529,6 +1555,7 @@ fn is_security_path(path: &str) -> bool {
 fn is_protected_read_path(path: &str) -> bool {
     path == OPERATOR_APICP_SNAPSHOT_PATH
         || path == OPERATOR_RUNTIME_HEALTH_PATH
+        || path == OPERATOR_STATE_HASH_PATH
         || is_security_path(path)
 }
 
@@ -2182,9 +2209,9 @@ fn run_fs_ransomware_test(
     let restore_started = Instant::now();
     state
         .restore_tx
-        .send(sentinel_common::OperatorRestoreCommand {
-            snapshot_id: snapshot_id.clone(),
-        })
+        .send(sentinel_common::OperatorRestoreCommand::from_snapshot_id(
+            snapshot_id.clone(),
+        ))
         .map_err(|_| ApiError::ServiceUnavailable("Restore-Channel nicht verfuegbar"))?;
     let restored_bytes = wait_for_expected_runtime_bytes(
         &layer,
@@ -3663,6 +3690,9 @@ mod tests {
             }
             RuntimeControlCommand::PanicTest { .. } => {
                 panic!("unerwartetes PanicTest-Kommando");
+            }
+            RuntimeControlCommand::StateHash { .. } => {
+                panic!("unerwartetes StateHash-Kommando");
             }
         });
         let response = handle_http_request(
