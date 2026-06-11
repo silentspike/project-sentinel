@@ -372,6 +372,16 @@ pub enum DomainEventPayload {
         /// Ausloesegrund (z.B. "manual", "resource_rebalance").
         reason: String,
     },
+    /// PSI-Band hat sich geaendert (#491, TM-3): die diegetische Hardware-Last (CPU/Mem PSI)
+    /// ueberschreitet die Bio-Stress-Schwellen ja/nein. Da `apply_psi_stress` rein
+    /// schwellenbasiert ist, genuegen die zwei Booleans als exakter, sparse aufgezeichneter
+    /// Replay-Input — nur bei einem tatsaechlichen Band-Wechsel emittiert.
+    PsiBandChanged {
+        /// CPU-PSI ueber `PSI_CPU_STRESS_THRESHOLD`.
+        cpu_above: bool,
+        /// Mem-PSI ueber `PSI_MEM_STRESS_THRESHOLD`.
+        mem_above: bool,
+    },
 }
 
 impl DomainEventPayload {
@@ -417,6 +427,7 @@ impl DomainEventPayload {
             Self::OperatorDmSent { .. } => "operator_dm_sent",
             Self::ConfigApplied { .. } => "config_applied",
             Self::MigrationCompleted { .. } => "migration_completed",
+            Self::PsiBandChanged { .. } => "psi_band_changed",
         }
     }
 }
@@ -479,6 +490,29 @@ mod tests {
     fn task_status_default_is_pending() {
         assert_eq!(crate::TaskStatus::default(), crate::TaskStatus::Pending);
         assert_eq!(crate::TaskStatus::InProgress.as_str(), "in_progress");
+    }
+
+    #[test]
+    fn psi_band_changed_event_type_and_roundtrip() {
+        // #491 (TM-3): PsiBandChanged hat den richtigen event_type + serde-Roundtrip (Replay-Input).
+        let payload = DomainEventPayload::PsiBandChanged {
+            cpu_above: true,
+            mem_above: false,
+        };
+        assert_eq!(payload.event_type_str(), "psi_band_changed");
+        let json = payload.to_json();
+        let back: DomainEventPayload = serde_json::from_str(&json).expect("roundtrip");
+        assert_eq!(back.to_json(), json);
+        match back {
+            DomainEventPayload::PsiBandChanged {
+                cpu_above,
+                mem_above,
+            } => {
+                assert!(cpu_above);
+                assert!(!mem_above);
+            }
+            _ => panic!("falsche Variante"),
+        }
     }
 
     #[test]
