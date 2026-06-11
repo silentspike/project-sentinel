@@ -83,8 +83,15 @@ enum Commands {
     VoiceOfGaia { agent_id: u16, thought: String },
     /// Firmen-Config zur Laufzeit anwenden (#425). `file` = JSON {mode,agents[],building}.
     ApplyConfig { file: String },
-    /// Welt aus Snapshot wiederherstellen.
-    Restore { snapshot_id: String },
+    /// Welt wiederherstellen: genau EINES von snapshot_id (Positional) / --target-tick /
+    /// --target-event-id (#491 TM-3: Tick/Event-Ziel via Anchor-Snapshot + bounded Replay).
+    Restore {
+        snapshot_id: Option<String>,
+        #[arg(long)]
+        target_tick: Option<u64>,
+        #[arg(long)]
+        target_event_id: Option<i64>,
+    },
     /// Manuellen Snapshot ausloesen.
     Snapshot {
         #[arg(long)]
@@ -294,11 +301,21 @@ fn resolve_call(cmd: &Commands) -> Result<Call, String> {
                 Risk::High,
             )
         }
-        Commands::Restore { snapshot_id } => c(
+        Commands::Restore {
+            snapshot_id,
+            target_tick,
+            target_event_id,
+        } => c(
             Method::Post,
             false,
             "/operator/restore",
-            Some(json!({"snapshot_id": snapshot_id})),
+            // Nicht gesetzte Felder werden zu JSON null -> serde(default) liest sie als None.
+            // Der Daemon validiert "genau eines gesetzt" und antwortet sonst 400.
+            Some(json!({
+                "snapshot_id": snapshot_id,
+                "target_tick": target_tick,
+                "target_event_id": target_event_id,
+            })),
             Risk::High,
         ),
         Commands::Snapshot { tier } => c(
@@ -489,7 +506,9 @@ mod tests {
     #[test]
     fn high_risk_apply_and_restore_are_gated() {
         let restore = resolve_call(&Commands::Restore {
-            snapshot_id: "abc".into(),
+            snapshot_id: Some("abc".into()),
+            target_tick: None,
+            target_event_id: None,
         })
         .unwrap();
         assert_eq!(restore.risk, Risk::High);

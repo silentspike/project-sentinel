@@ -69,6 +69,20 @@ pub enum RuntimeControlCommand {
         request: RuntimeStallRestartTestRequest,
         response_tx: mpsc::SyncSender<RuntimeStallRestartTestResponse>,
     },
+    /// #491 (TM-3): liest den deterministischen State-Hash der Live-World (Evidence fuer
+    /// Restore/Replay-Korrektheit). Read-only — laeuft auch waehrend der Restore-Fence.
+    StateHash {
+        response_tx: mpsc::SyncSender<StateHashResponse>,
+    },
+}
+
+/// #491 (TM-3): Antwort auf `StateHash` — STRICT/CORE-Hash + Position im Tick-Zyklus.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StateHashResponse {
+    pub strict: String,
+    pub core: String,
+    pub tick: u64,
+    pub last_event_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
