@@ -1865,7 +1865,10 @@ mod config_apply_helper_tests {
         let entity = spawn_agent(&mut world, AgentId(3), "Ada", "Dev", 1, "empfang");
 
         // Cooldown auf einen markanten Tick setzen (Default waere 0).
-        world.get_mut::<AutonomyCooldown>(entity).unwrap().last_action_tick = 426;
+        world
+            .get_mut::<AutonomyCooldown>(entity)
+            .unwrap()
+            .last_action_tick = 426;
         // Je einen Eintrag in alle vier Buffer legen.
         world
             .resource_mut::<ActiveSmells>()
@@ -1880,9 +1883,11 @@ mod config_apply_helper_tests {
         world
             .resource_mut::<GaiaBuffer>()
             .add(AgentId(3), "Dir faellt etwas ein".to_string(), 10);
-        world
-            .resource_mut::<BroadcastBuffer>()
-            .add("Feueralarm-Uebung".to_string(), "drill".to_string(), 10);
+        world.resource_mut::<BroadcastBuffer>().add(
+            "Feueralarm-Uebung".to_string(),
+            "drill".to_string(),
+            10,
+        );
 
         let snapshot = snapshot_ecs_state(&mut world);
         assert_eq!(
@@ -1930,7 +1935,10 @@ mod config_apply_helper_tests {
             "gaia-thought nach restore aktiv (AgentId-keyed map round-trip)"
         );
         assert!(
-            !restored.resource::<BroadcastBuffer>().get_active(40).is_empty(),
+            !restored
+                .resource::<BroadcastBuffer>()
+                .get_active(40)
+                .is_empty(),
             "broadcast nach restore aktiv"
         );
     }

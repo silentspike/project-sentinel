@@ -10,8 +10,8 @@
 
 use crate::world::snapshot_ecs_state;
 use bevy_ecs::world::World;
-use serde::{Deserialize, Serialize};
 use sentinel_common::EcsSnapshot;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// STRICT- und CORE-Hash eines Welt-Zustands.
@@ -129,6 +129,9 @@ mod tests {
         snap.identities.reverse();
         snap.autonomy_cooldowns.reverse();
         let h_b = sha256_hex(&bincode_bytes(&canonicalize(snap)));
-        assert_eq!(h_a, h_b, "Reihenfolge der Component-Vecs darf den Hash nicht aendern");
+        assert_eq!(
+            h_a, h_b,
+            "Reihenfolge der Component-Vecs darf den Hash nicht aendern"
+        );
     }
 }

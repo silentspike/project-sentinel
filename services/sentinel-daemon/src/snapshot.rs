@@ -366,15 +366,36 @@ mod tests {
             first_hour_interval_ticks: 300,
             ..RetentionConfig::default()
         };
-        let mgr = SnapshotManager::new(cfg);
-        // last_snapshot_tick = 0 (frisch).
+        let mut mgr = SnapshotManager::new(cfg);
+        // Erste Stunde, last=0: feines Intervall 300.
         assert!(!mgr.should_create_snapshot(0), "tick 0 nie");
         assert!(!mgr.should_create_snapshot(299), "vor erstem 5-min-Anchor");
-        assert!(mgr.should_create_snapshot(300), "erster 5-min-Anchor in 1. Stunde");
-        assert!(mgr.should_create_snapshot(600), "weiterer 5-min-Anchor");
-        // Nach der ersten Stunde gilt das grobe Intervall: 3600 seit last(0) -> ja; 3300 -> nein.
-        assert!(!mgr.should_create_snapshot(3300), "in 2. Stunde noch < hourly seit last");
-        assert!(mgr.should_create_snapshot(3600), "hourly-Anchor ausserhalb 1. Stunde");
+        assert!(
+            mgr.should_create_snapshot(300),
+            "erster 5-min-Anchor in 1. Stunde"
+        );
+        // Nach einem Anchor bei 300: naechster feiner Anchor erst bei 600 (in der 1. Stunde).
+        mgr.last_snapshot_tick = 300;
+        assert!(
+            !mgr.should_create_snapshot(599),
+            "vor naechstem 5-min-Anchor"
+        );
+        assert!(mgr.should_create_snapshot(600), "naechster 5-min-Anchor");
+        // Nach der ersten Stunde (tick >= 3600) gilt das GROBE Intervall: eine 300-Tick-Luecke
+        // loest dann KEINEN Snapshot mehr aus (Tiered Retention).
+        mgr.last_snapshot_tick = 3600;
+        assert!(
+            !mgr.should_create_snapshot(3900),
+            "300-Tick-Luecke triggert nach 1. Stunde NICHT (grob)"
+        );
+        assert!(
+            !mgr.should_create_snapshot(3601),
+            "in 2. Stunde: erst < hourly seit last"
+        );
+        assert!(
+            mgr.should_create_snapshot(7200),
+            "hourly-Anchor (3600 seit last) ausserhalb 1. Stunde"
+        );
     }
 
     #[test]
@@ -386,7 +407,10 @@ mod tests {
             ..RetentionConfig::default()
         };
         let mgr = SnapshotManager::new(cfg);
-        assert!(!mgr.should_create_snapshot(300), "kein 5-min-Anchor wenn deaktiviert");
+        assert!(
+            !mgr.should_create_snapshot(300),
+            "kein 5-min-Anchor wenn deaktiviert"
+        );
         assert!(mgr.should_create_snapshot(3600), "hourly greift");
     }
 }

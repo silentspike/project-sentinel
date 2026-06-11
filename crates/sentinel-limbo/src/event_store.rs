@@ -1815,12 +1815,22 @@ mod tests {
         }
 
         // get_events_range: (from_exclusive, to_inclusive], stabile id-Reihenfolge.
-        assert_eq!(store.get_events_range(0, 5).unwrap().len(), 5, "voller Bereich");
+        assert_eq!(
+            store.get_events_range(0, 5).unwrap().len(),
+            5,
+            "voller Bereich"
+        );
         let mid = store.get_events_range(2, 4).unwrap();
         assert_eq!(mid.len(), 2, "ids 3,4");
         assert!(mid.iter().all(|e| e.tick == 2));
-        assert!(store.get_events_range(5, 5).unwrap().is_empty(), "leerer Bereich");
-        assert!(store.get_events_range(2, 2).unwrap().is_empty(), "from==to leer");
+        assert!(
+            store.get_events_range(5, 5).unwrap().is_empty(),
+            "leerer Bereich"
+        );
+        assert!(
+            store.get_events_range(2, 2).unwrap().is_empty(),
+            "from==to leer"
+        );
 
         // count_events_in_range
         assert_eq!(store.count_events_in_range(0, 5).unwrap(), 5);
@@ -1831,7 +1841,11 @@ mod tests {
         assert_eq!(store.max_event_id_at_tick(2).unwrap(), Some(4));
         assert_eq!(store.max_event_id_at_tick(1).unwrap(), Some(2));
         assert_eq!(store.max_event_id_at_tick(3).unwrap(), Some(5));
-        assert_eq!(store.max_event_id_at_tick(0).unwrap(), None, "vor erstem Event");
+        assert_eq!(
+            store.max_event_id_at_tick(0).unwrap(),
+            None,
+            "vor erstem Event"
+        );
 
         // get_event_tick
         assert_eq!(store.get_event_tick(3).unwrap(), Some(2));
