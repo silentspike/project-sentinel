@@ -4555,6 +4555,7 @@ name = "sentinel-ecs"
 version = "0.1.0"
 dependencies = [
  "bevy_ecs",
+ "bincode",
  "criterion 0.8.2",
  "insta",
  "sentinel-bio",
@@ -4566,6 +4567,7 @@ dependencies = [
  "sentinel-wasm",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "toml 1.0.6+spec-1.1.0",

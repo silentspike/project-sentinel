@@ -430,6 +430,9 @@ mod tests {
         assert!(decoded.fs_metadata.is_some());
         assert!(decoded.ecs.autonomy_cooldowns.is_empty());
         assert!(decoded.ecs.room_chat_json.is_empty());
-        assert_eq!(decoded.projection_offsets, vec![("agent_live".to_string(), 42)]);
+        assert_eq!(
+            decoded.projection_offsets,
+            vec![("agent_live".to_string(), 42)]
+        );
     }
 }
