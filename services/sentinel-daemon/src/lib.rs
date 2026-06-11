@@ -20,6 +20,7 @@ pub mod operator_api;
 pub mod orchestrator;
 pub mod platform_controlplane;
 pub mod query_responder;
+pub mod replay;
 pub mod resource_manager;
 pub mod runtime_control;
 pub mod runtime_health;

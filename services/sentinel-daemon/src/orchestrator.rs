@@ -2676,9 +2676,15 @@ struct ProjectionRestoreSeedReport {
     watermarks_seeded: u32,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 struct RestoreCommitReport {
     projection_report: ProjectionRestoreSeedReport,
+    /// #491: finaler Tick nach (optionalem) Replay — = Ziel-Tick, sonst Anchor-Tick.
+    final_tick: u64,
+    /// #491: finale sim_hour nach Replay (aus dem Post-Replay-Zustand).
+    final_sim_hour: f32,
+    /// #491: Anzahl waehrend des Replays eingespeister Eingaben (0 = reiner Snapshot-Restore).
+    replayed_inputs: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -2963,12 +2969,104 @@ fn teardown_runtime_for_world_restore(
     ids.len()
 }
 
+/// #491 (TM-3): Sicherungs-Obergrenze fuer die Replay-Spanne in Ticks. Das Feature zielt auf die
+/// erste Stunde (~3600 Ticks @1 Hz); ein Vielfaches davon faengt versehentlich riesige Spannen ab
+/// (Fallback nearest, exact:false) statt den Tick-Loop minutenlang zu blockieren.
+const REPLAY_TICK_CAP: u64 = 14_400;
+
+/// #491: Replay-Anteil eines Restore (`None` im commit = reiner Snapshot-Punkt-Restore).
+#[derive(Debug, Clone)]
+struct RestoreReplayPlan {
+    events: Vec<sentinel_common::DomainEvent>,
+    anchor_tick: u64,
+    target_tick: u64,
+    target_event_id: i64,
+}
+
+/// #491: aufgeloestes Restore-Ziel (Anchor + optionaler Replay-Cursor).
+#[derive(Debug, Clone)]
+struct RestoreResolution {
+    anchor_snapshot_id: String,
+    /// `Some` => Replay bis zu diesem Event; `None` => reiner Snapshot-Punkt-Restore.
+    target_event_id: Option<i64>,
+    target_tick: Option<u64>,
+    exact: bool,
+    granularity: &'static str,
+}
+
+/// #491: loest ein `OperatorRestoreCommand` in Anchor-Snapshot + (optionalen) Ziel-Cursor auf.
+/// Reine Lese-Operationen auf dem EventStore + der Snapshot-Liste (nach `tick DESC`).
+fn resolve_restore_target(
+    cmd: &sentinel_common::OperatorRestoreCommand,
+    event_store: &EventStore,
+    snapshots: &[sentinel_common::SnapshotMeta],
+) -> Result<RestoreResolution> {
+    if let Some(sid) = &cmd.snapshot_id {
+        return Ok(RestoreResolution {
+            anchor_snapshot_id: sid.clone(),
+            target_event_id: None,
+            target_tick: None,
+            exact: true,
+            granularity: "snapshot",
+        });
+    }
+
+    // Ziel-Event + Ziel-Tick bestimmen.
+    let (target_event_id, target_tick) = if let Some(eid) = cmd.target_event_id {
+        let tick = event_store
+            .get_event_tick(eid)?
+            .ok_or_else(|| anyhow!("target_event_id {eid} unbekannt"))?;
+        (eid, tick)
+    } else if let Some(t) = cmd.target_tick {
+        match event_store.max_event_id_at_tick(t)? {
+            Some(eid) => (eid, t),
+            None => {
+                // Kein Event <= t -> Ziel liegt vor dem ersten Event. Aeltester Snapshot, exact:false.
+                let oldest = snapshots
+                    .last()
+                    .ok_or_else(|| anyhow!("kein Snapshot vorhanden"))?;
+                return Ok(RestoreResolution {
+                    anchor_snapshot_id: oldest.id.clone(),
+                    target_event_id: None,
+                    target_tick: None,
+                    exact: false,
+                    granularity: "snapshot",
+                });
+            }
+        }
+    } else {
+        return Err(anyhow!(
+            "Restore-Command ohne Ziel (validate uebersprungen?)"
+        ));
+    };
+
+    // Anchor = juengster Snapshot mit last_event_id <= target_event_id (Liste ist tick DESC).
+    let anchor = snapshots
+        .iter()
+        .find(|s| s.last_event_id <= target_event_id)
+        .ok_or_else(|| anyhow!("kein Anchor-Snapshot <= target_event_id {target_event_id}"))?;
+
+    // exact, wenn das Ziel-Event das letzte seines Ticks ist (sonst tick-granular).
+    let exact = event_store.max_event_id_at_tick(target_tick)? == Some(target_event_id);
+
+    Ok(RestoreResolution {
+        anchor_snapshot_id: anchor.id.clone(),
+        target_event_id: Some(target_event_id),
+        target_tick: Some(target_tick),
+        exact,
+        granularity: if exact { "event" } else { "tick" },
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn commit_world_restore_stores(
-    restore_cmd: &sentinel_common::OperatorRestoreCommand,
+    anchor_snapshot_id: &str,
     snapshot: &sentinel_common::WorldSnapshot,
     owner_epoch: u64,
     world: &mut bevy_ecs::prelude::World,
+    schedule: &mut bevy_ecs::schedule::Schedule,
+    replay_plan: Option<RestoreReplayPlan>,
+    exact: bool,
     event_store: &Arc<EventStore>,
     state_store: &Arc<StateStore>,
     fs_layer: Option<&sentinel_fs::layer::LayerManager>,
@@ -2989,15 +3087,62 @@ fn commit_world_restore_stores(
         failure_point.fail_if(RestoreCommitFailurePoint::AfterFs)?;
     }
 
+    // ECS auf den ANCHOR-Zustand setzen.
     sentinel_ecs::restore_ecs_state(world, &snapshot.ecs);
     failure_point.fail_if(RestoreCommitFailurePoint::AfterEcs)?;
+
+    // #491 (TM-3): optionales bounded Replay `(anchor, target]` auf der Live-World. Danach steht die
+    // World am Ziel-Zustand; die Projection wird aus DIESEM Zustand geseedet (nicht aus dem Anchor).
+    let (final_tick, final_sim_hour, replayed_inputs, target_event_id) =
+        if let Some(plan) = &replay_plan {
+            let report = crate::replay::run_bounded_replay(
+                world,
+                schedule,
+                &plan.events,
+                plan.anchor_tick,
+                plan.target_tick,
+            )
+            .context("Bounded Replay fehlgeschlagen")?;
+            let sim_hour = world
+                .get_resource::<sentinel_ecs::SimulationTime>()
+                .map(|t| t.sim_hour)
+                .unwrap_or(snapshot.sim_hour);
+            info!(
+                anchor_tick = plan.anchor_tick,
+                target_tick = plan.target_tick,
+                ticks_replayed = report.ticks_replayed,
+                inputs = report.inputs_injected,
+                "Bounded Replay abgeschlossen"
+            );
+            (
+                plan.target_tick,
+                sim_hour,
+                report.inputs_injected as u64,
+                Some(plan.target_event_id),
+            )
+        } else {
+            (snapshot.tick, snapshot.sim_hour, 0u64, None)
+        };
 
     let max_event_id = event_store
         .get_latest_event_id()
         .unwrap_or(snapshot.last_event_id);
+    // Projection-Seed: bei Replay aus dem Post-Replay-Zustand (Anchor-Snapshot geklont, nur ecs/tick
+    // /sim_hour ersetzt — redb wird vom Seed nicht gelesen). Ohne Replay: direkt der Anchor.
+    let seed_snapshot;
+    let seed_ref: &sentinel_common::WorldSnapshot = if replay_plan.is_some() {
+        let mut view = snapshot.clone();
+        view.ecs = sentinel_ecs::snapshot_ecs_state(world);
+        view.tick = final_tick;
+        view.sim_hour = final_sim_hour;
+        seed_snapshot = view;
+        &seed_snapshot
+    } else {
+        snapshot
+    };
     let projection_report = seed_projection_from_world_snapshot(
         projection_db_path,
-        snapshot,
+        seed_ref,
         max_event_id,
         now_ms_i64(),
     )?;
@@ -3013,17 +3158,20 @@ fn commit_world_restore_stores(
         event_type: "snapshot_restored".to_string(),
         aggregate_id: "system".to_string(),
         payload: serde_json::json!({
-            "snapshot_id": restore_cmd.snapshot_id,
-            "restored_tick": snapshot.tick,
-            "restored_sim_hour": snapshot.sim_hour,
-            "agents_count": snapshot.ecs.identities.len(),
+            "anchor_snapshot_id": anchor_snapshot_id,
+            "restored_tick": final_tick,
+            "restored_sim_hour": final_sim_hour,
+            "target_event_id": target_event_id,
+            "exact": exact,
+            "replayed_inputs": replayed_inputs,
+            "agents_count": seed_ref.ecs.identities.len(),
             "owner_epoch": owner_epoch,
         })
         .to_string(),
-        correlation_id: restore_cmd.snapshot_id.clone(),
+        correlation_id: anchor_snapshot_id.to_string(),
         causation_id: None,
         operation_id: uuid::Uuid::new_v4().to_string(),
-        tick: snapshot.tick,
+        tick: final_tick,
         timestamp_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3035,7 +3183,12 @@ fn commit_world_restore_stores(
         .append_with_outbox(&restore_event, "sentinel.events")
         .context("SnapshotRestored Event schreiben fehlgeschlagen")?;
 
-    Ok(RestoreCommitReport { projection_report })
+    Ok(RestoreCommitReport {
+        projection_report,
+        final_tick,
+        final_sim_hour,
+        replayed_inputs,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3124,6 +3277,7 @@ fn execute_world_restore_transfer(
     restore_fence: &mut RestoreFence,
     snapshot_manager: &mut crate::snapshot::SnapshotManager,
     world: &mut bevy_ecs::prelude::World,
+    schedule: &mut bevy_ecs::schedule::Schedule,
     runtime_orch: &mut RuntimeOrchestrator,
     sandbox: &SandboxEnforcer,
     sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
@@ -3157,12 +3311,18 @@ fn execute_world_restore_transfer(
         .context("Pre-Restore Snapshot fatal fehlgeschlagen")?;
     info!(snapshot_id = %pre_snapshot_id, "Pre-Restore Snapshot erstellt (Rollback-Punkt)");
 
+    // #491 (TM-3): Ziel aufloesen (Anchor-Snapshot + optionaler Replay-Cursor).
+    let snapshots = event_store
+        .list_world_snapshots()
+        .context("Snapshot-Liste fuer Restore-Resolution")?;
+    let resolution = resolve_restore_target(restore_cmd, event_store.as_ref(), &snapshots)?;
+
     let bytes = event_store
-        .load_world_snapshot(&restore_cmd.snapshot_id)
-        .with_context(|| format!("Snapshot laden: {}", restore_cmd.snapshot_id))?
-        .ok_or_else(|| anyhow!("Snapshot nicht gefunden: {}", restore_cmd.snapshot_id))?;
+        .load_world_snapshot(&resolution.anchor_snapshot_id)
+        .with_context(|| format!("Snapshot laden: {}", resolution.anchor_snapshot_id))?
+        .ok_or_else(|| anyhow!("Snapshot nicht gefunden: {}", resolution.anchor_snapshot_id))?;
     let snapshot = sentinel_common::decode_world_snapshot(&bytes)
-        .with_context(|| format!("Snapshot dekodieren: {}", restore_cmd.snapshot_id))?;
+        .with_context(|| format!("Snapshot dekodieren: {}", resolution.anchor_snapshot_id))?;
 
     if let Some(fs_metadata) = &snapshot.fs_metadata {
         if fs_layer.is_none() {
@@ -3174,7 +3334,49 @@ fn execute_world_restore_transfer(
     }
     validate_projection_restore_schema(projection_db_path)?;
 
+    // #491: Replay-Plan bilden — Legacy-Gate (Anchor muss v3 sein) + Sanity-Cap + Branch-Check
+    // (keine `snapshot_restored`-Events in der Range). Jeder Fall, der kein exaktes Replay erlaubt,
+    // faellt auf den Anchor als reinen Snapshot-Punkt zurueck (exact:false, ehrlich reportet).
+    let mut exact = resolution.exact;
+    let mut replay_plan: Option<RestoreReplayPlan> = None;
+    if let (Some(target_event_id), Some(target_tick)) =
+        (resolution.target_event_id, resolution.target_tick)
+    {
+        if snapshot.schema_version < 3 {
+            warn!(anchor = %resolution.anchor_snapshot_id, "Anchor pre-v3 -> kein Replay (nearest, exact:false)");
+            exact = false;
+        } else if target_tick.saturating_sub(snapshot.tick) > REPLAY_TICK_CAP {
+            warn!(
+                span = target_tick.saturating_sub(snapshot.tick),
+                cap = REPLAY_TICK_CAP,
+                "Replay-Spanne ueber Cap -> nearest, exact:false"
+            );
+            exact = false;
+        } else {
+            let range = event_store
+                .get_events_range(snapshot.last_event_id, target_event_id)
+                .context("Replay-Range laden")?;
+            if range.iter().any(|e| e.event_type == "snapshot_restored") {
+                warn!("Replay-Range enthaelt snapshot_restored (nicht-lineare History) -> nearest, exact:false");
+                exact = false;
+            } else {
+                replay_plan = Some(RestoreReplayPlan {
+                    events: range,
+                    anchor_tick: snapshot.tick,
+                    target_tick,
+                    target_event_id,
+                });
+            }
+        }
+    }
+
     let owner_epoch = restore_fence.begin();
+    let target_cursor = replay_plan
+        .as_ref()
+        .map(|p| sentinel_common::StateTransferCursor {
+            tick: p.target_tick,
+            last_event_id: p.target_event_id,
+        });
     let transfer = sentinel_common::FencedStateTransfer {
         scope: sentinel_common::StateTransferScope::World,
         owner_epoch,
@@ -3182,7 +3384,7 @@ fn execute_world_restore_transfer(
             tick: snapshot.tick,
             last_event_id: snapshot.last_event_id,
         },
-        snapshot_id: restore_cmd.snapshot_id.clone(),
+        snapshot_id: resolution.anchor_snapshot_id.clone(),
         cas_manifest: sentinel_common::CasManifest {
             blob_hashes: snapshot
                 .fs_metadata
@@ -3201,18 +3403,26 @@ fn execute_world_restore_transfer(
             last_event_id: snapshot.last_event_id,
         },
         route_update: sentinel_common::RouteUpdate::default(),
+        target_cursor,
     };
     info!(
         owner_epoch = transfer.owner_epoch,
-        snapshot_id = %transfer.snapshot_id,
+        anchor_snapshot_id = %transfer.snapshot_id,
+        replay = replay_plan.is_some(),
+        exact,
+        granularity = resolution.granularity,
         "Restore-Fence aktiviert"
     );
 
+    let anchor_snapshot_id = resolution.anchor_snapshot_id.clone();
     let commit_result = commit_world_restore_stores(
-        restore_cmd,
+        &anchor_snapshot_id,
         &snapshot,
         owner_epoch,
         world,
+        schedule,
+        replay_plan,
+        exact,
         event_store,
         state_store,
         fs_layer,
@@ -3220,6 +3430,9 @@ fn execute_world_restore_transfer(
         RestoreCommitFailurePoint::None,
     );
 
+    // #491: finaler Zustand = Ziel-Tick (nach Replay) bzw. Anchor-Tick (ohne Replay).
+    let final_tick;
+    let final_sim_hour;
     match commit_result {
         Err(commit_error) => {
             error!(
@@ -3246,8 +3459,11 @@ fn execute_world_restore_transfer(
                 tasks_seeded = report.projection_report.tasks_seeded,
                 kpi_rows_seeded = report.projection_report.kpi_rows_seeded,
                 watermarks_seeded = report.projection_report.watermarks_seeded,
+                replayed_inputs = report.replayed_inputs,
                 "Projection Snapshot-Seeding abgeschlossen"
             );
+            final_tick = report.final_tick;
+            final_sim_hour = report.final_sim_hour;
         }
     }
 
@@ -3284,13 +3500,13 @@ fn execute_world_restore_transfer(
         }
     }
 
-    *tick_count = snapshot.tick;
-    *sim_hour = snapshot.sim_hour;
-    *current_shift = detect_shift_from_sim_hour(snapshot.sim_hour);
+    *tick_count = final_tick;
+    *sim_hour = final_sim_hour;
+    *current_shift = detect_shift_from_sim_hour(final_sim_hour);
     if let Some(mut sim_time) = world.get_resource_mut::<sentinel_ecs::SimulationTime>() {
-        sim_time.tick = sentinel_common::Tick(snapshot.tick);
-        sim_time.tick_count = snapshot.tick;
-        sim_time.sim_hour = snapshot.sim_hour;
+        sim_time.tick = sentinel_common::Tick(final_tick);
+        sim_time.tick_count = final_tick;
+        sim_time.sim_hour = final_sim_hour;
     }
 
     if let Some(receiver) = world.get_resource::<sentinel_ecs::ActionReceiver>() {
@@ -3311,9 +3527,9 @@ fn execute_world_restore_transfer(
     restore_fence.end();
     if respawn_errors.is_empty() {
         info!(
-            snapshot_id = %restore_cmd.snapshot_id,
-            tick = snapshot.tick,
-            sim_hour = snapshot.sim_hour,
+            anchor_snapshot_id = %anchor_snapshot_id,
+            tick = final_tick,
+            sim_hour = final_sim_hour,
             agents = snapshot.ecs.identities.len(),
             terminated,
             respawned,
@@ -4226,6 +4442,26 @@ fn ecs_tick_loop(
                         },
                     };
                     let _ = response_tx.send(response);
+                }
+                // #491 (TM-3): read-only State-Hash der Live-World. Wird hier (nach schedule.run
+                // dieses Ticks) erhoben = "Ende des Ticks" — dieselbe Zyklus-Position wie der
+                // Post-Replay-Hash, damit live@T und restore(@T)+replay vergleichbar sind.
+                RuntimeControlCommand::StateHash { response_tx } => {
+                    let hashes = sentinel_ecs::hash::state_hashes(&mut world);
+                    let tick = world
+                        .get_resource::<sentinel_ecs::SimulationTime>()
+                        .map(|t| t.tick_count)
+                        .unwrap_or(0);
+                    let last_event_id = world
+                        .get_resource::<sentinel_ecs::LimboEventStore>()
+                        .and_then(|es| es.0.get_latest_event_id().ok())
+                        .unwrap_or(0);
+                    let _ = response_tx.send(crate::runtime_control::StateHashResponse {
+                        strict: hashes.strict,
+                        core: hashes.core,
+                        tick,
+                        last_event_id,
+                    });
                 }
             }
         }
@@ -5329,7 +5565,7 @@ fn ecs_tick_loop(
 
         // Time Machine: Hot-Swap Restore via Operator-API
         while let Ok(restore_cmd) = restore_rx.try_recv() {
-            info!(snapshot_id = %restore_cmd.snapshot_id, "Hot-Swap Restore gestartet");
+            info!(cmd = ?restore_cmd, "Hot-Swap Restore gestartet");
             let event_store_for_restore = world
                 .get_resource::<sentinel_ecs::LimboEventStore>()
                 .map(|es| Arc::clone(&es.0));
@@ -5346,6 +5582,7 @@ fn ecs_tick_loop(
                     &mut restore_fence,
                     &mut snapshot_manager,
                     &mut world,
+                    &mut schedule,
                     &mut runtime_orch,
                     &sandbox,
                     &mut sandbox_handles,
@@ -5365,7 +5602,7 @@ fn ecs_tick_loop(
                     &mut current_shift,
                 ) {
                     error!(
-                        snapshot_id = %restore_cmd.snapshot_id,
+                        cmd = ?restore_cmd,
                         error = %error,
                         fenced = restore_fence.is_active(),
                         "Hot-Swap Restore fehlgeschlagen"
@@ -6473,7 +6710,7 @@ mod tests {
             .restore_all_tables(pre_snapshot.fs_metadata.as_ref().unwrap())
             .expect("pre fs fixture");
 
-        let (mut world, _schedule) = create_simulation_world();
+        let (mut world, mut schedule) = create_simulation_world();
         sentinel_ecs::restore_ecs_state(&mut world, &pre_snapshot.ecs);
         seed_projection_from_world_snapshot(
             projection_path.to_str().unwrap(),
@@ -6483,14 +6720,15 @@ mod tests {
         )
         .expect("pre projection fixture");
 
-        let restore_cmd = sentinel_common::OperatorRestoreCommand {
-            snapshot_id: target_snapshot.snapshot_id.clone(),
-        };
+        // #491: reiner Snapshot-Punkt-Restore (kein Replay) — Failure-Injection wie zuvor.
         let commit_error = commit_world_restore_stores(
-            &restore_cmd,
+            &target_snapshot.snapshot_id,
             &target_snapshot,
             7,
             &mut world,
+            &mut schedule,
+            None,
+            true,
             &event_store,
             &state_store,
             Some(&fs_layer),

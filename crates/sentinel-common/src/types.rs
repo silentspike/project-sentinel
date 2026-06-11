@@ -705,12 +705,47 @@ pub struct FencedStateTransfer {
     pub cas_manifest: CasManifest,
     pub projection_delta: ProjectionDelta,
     pub route_update: RouteUpdate,
+    /// #491 (TM-3): Ziel-Cursor des bounded Replay `(source_cursor, target_cursor]`. `None` =
+    /// reiner Snapshot-Punkt-Restore (kein Replay), `Some` = Anchor + Replay bis zum Ziel-Event.
+    #[serde(default)]
+    pub target_cursor: Option<StateTransferCursor>,
 }
 
-/// Operator-Trigger fuer Point-in-Time Restore.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Operator-Trigger fuer Point-in-Time Restore (#491 TM-3: jetzt drei Ziel-Varianten).
+///
+/// Genau EINES der drei Felder ist gesetzt (`validate`): `snapshot_id` = direkter Snapshot-Punkt
+/// (Vor-#491-Verhalten, altes JSON bleibt gueltig), `target_tick`/`target_event_id` = Anchor-Snapshot
+/// + bounded Replay `(anchor, target]`. Alle `#[serde(default)]` -> rueckwaerts-kompatibel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OperatorRestoreCommand {
-    pub snapshot_id: String,
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+    #[serde(default)]
+    pub target_tick: Option<u64>,
+    #[serde(default)]
+    pub target_event_id: Option<i64>,
+}
+
+impl OperatorRestoreCommand {
+    /// Genau eines der drei Ziel-Felder muss gesetzt sein.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let set = self.snapshot_id.is_some() as u8
+            + self.target_tick.is_some() as u8
+            + self.target_event_id.is_some() as u8;
+        match set {
+            1 => Ok(()),
+            0 => Err("genau eines von snapshot_id/target_tick/target_event_id erforderlich (keines gesetzt)"),
+            _ => Err("genau eines von snapshot_id/target_tick/target_event_id erlaubt (mehrere gesetzt)"),
+        }
+    }
+
+    /// Convenience: direkter Snapshot-Restore (Vor-#491-Pfad).
+    pub fn from_snapshot_id(snapshot_id: String) -> Self {
+        Self {
+            snapshot_id: Some(snapshot_id),
+            ..Default::default()
+        }
+    }
 }
 
 /// Operator-Trigger fuer manuellen Snapshot.
@@ -747,4 +782,49 @@ pub struct OperatorConfigApplyCommand {
     pub mode: ApplyMode,
     pub agents: Vec<crate::agent_config::AgentConfig>,
     pub building: crate::room::BuildingConfig,
+}
+
+#[cfg(test)]
+mod restore_command_tests {
+    use super::OperatorRestoreCommand;
+
+    #[test]
+    fn validate_requires_exactly_one_target() {
+        // genau eines -> ok
+        assert!(OperatorRestoreCommand::from_snapshot_id("snap-1".into())
+            .validate()
+            .is_ok());
+        assert!(OperatorRestoreCommand {
+            target_tick: Some(100),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
+        assert!(OperatorRestoreCommand {
+            target_event_id: Some(42),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
+        // keines -> err
+        assert!(OperatorRestoreCommand::default().validate().is_err());
+        // mehrere -> err
+        assert!(OperatorRestoreCommand {
+            snapshot_id: Some("s".into()),
+            target_tick: Some(1),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn old_json_still_deserializes() {
+        // Vor-#491-JSON (nur snapshot_id als String-Feld) -> Some(snapshot_id), Rest None.
+        let cmd: OperatorRestoreCommand =
+            serde_json::from_str(r#"{"snapshot_id":"snap-x"}"#).unwrap();
+        assert_eq!(cmd.snapshot_id.as_deref(), Some("snap-x"));
+        assert!(cmd.target_tick.is_none() && cmd.target_event_id.is_none());
+        assert!(cmd.validate().is_ok());
+    }
 }
