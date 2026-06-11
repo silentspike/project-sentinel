@@ -176,6 +176,13 @@ pub struct RetentionConfig {
     #[serde(default = "default_hourly_interval")]
     pub hourly_interval_ticks: u64,
 
+    /// #491 (TM-3): feineres Anchor-Intervall in der ERSTEN Stunde (Ticks), damit der Bounded
+    /// Replay `(anchor, target]` kurz bleibt und jeder Tick guenstig erreichbar ist. Default 300
+    /// (5 min bei 1s Tick) — finaler Wert aus dem Benchmark-Sweep (#491 Teil C). Gilt nur solange
+    /// `tick < hourly_interval_ticks`; danach greift `hourly_interval_ticks` (Tiered Retention).
+    #[serde(default = "default_first_hour_interval")]
+    pub first_hour_interval_ticks: u64,
+
     /// Wie viele Stunden Hourly Snapshots behalten (default: 24).
     #[serde(default = "default_daily_keep")]
     pub daily_keep_hours: u32,
@@ -201,6 +208,7 @@ impl Default for RetentionConfig {
     fn default() -> Self {
         Self {
             hourly_interval_ticks: 3600,
+            first_hour_interval_ticks: 300,
             daily_keep_hours: 24,
             weekly_keep_days: 7,
             monthly_keep_weeks: 4,
@@ -212,6 +220,9 @@ impl Default for RetentionConfig {
 
 fn default_hourly_interval() -> u64 {
     3600
+}
+fn default_first_hour_interval() -> u64 {
+    300
 }
 fn default_daily_keep() -> u32 {
     24

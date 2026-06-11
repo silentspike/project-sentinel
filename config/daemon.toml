@@ -54,6 +54,7 @@ intercept_mode = "auto"
 # Time Machine: World Snapshots + Event Retention
 [daemon.retention]
 hourly_interval_ticks = 3600  # 1h bei 1s Tick-Rate
+first_hour_interval_ticks = 300  # #491 (TM-3): feinere Anchor in der 1. Stunde (5 min) fuer kurzen Replay
 daily_keep_hours = 24         # Hourly Snapshots 24h behalten
 weekly_keep_days = 7          # Daily Snapshots 7 Tage behalten
 monthly_keep_weeks = 4        # Weekly Snapshots 4 Wochen behalten
