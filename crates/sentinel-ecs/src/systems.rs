@@ -284,6 +284,8 @@ pub fn input_system(
             action_type: format!("{:?}", action.action_type),
             target_room: action.target_room.clone(),
             content: action.content.clone(),
+            // #491 (TM-3): externe Aktion (via Channel vom LLM/Operator) -> echter Replay-Input.
+            source: None,
         };
         let action_event = DomainEvent::new(
             payload.event_type_str(),
@@ -1333,6 +1335,8 @@ fn inject_chaos_event(
         event_type,
         target_room: Some(target_room.to_string()),
         description: description.to_string(),
+        // #491 (TM-3): explizite Dauer (Parameter liegt vor) -> exakte Replay-Rekonstruktion.
+        duration_ticks,
     };
     let correlation_id = metadata
         .as_ref()

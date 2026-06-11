@@ -93,6 +93,7 @@ impl ProjectionHandler for RoomLiveViewHandler {
                 event_type,
                 target_room: Some(room),
                 description,
+                ..
             } => {
                 let chaos_json = serde_json::json!({
                     "type": format!("{:?}", event_type),
