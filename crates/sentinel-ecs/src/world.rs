@@ -646,7 +646,7 @@ pub struct ActiveAgentsThisTick(pub Vec<AgentId>);
 ///
 /// ZERO Disk-Writes — Chat ist bereits als AgentActionReceived Event persistiert.
 /// Kaskade-Dampening: Max 1 Chat/Tick/Raum + Max 2 Responses/Agent/120 Ticks.
-#[derive(Resource, Default, Debug, Clone)]
+#[derive(Resource, Default, Debug, Clone, Serialize, Deserialize)]
 pub struct RoomChatBuffer {
     messages: std::collections::HashMap<String, Vec<RoomChatEntry>>,
     /// Letzter Chat-Tick pro Raum (1 Chat/Tick/Raum Rate-Limit).
@@ -658,7 +658,7 @@ pub struct RoomChatBuffer {
 }
 
 /// Eine einzelne Chat-Nachricht in einem Raum.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomChatEntry {
     pub agent_name: String,
     pub content: String,
@@ -812,12 +812,12 @@ impl RoomChatBuffer {
 ///
 /// Operator pflanzt einem Agent einen "Gedanken" ein. Agent merkt NICHT woher.
 /// In Perception als "INNERER IMPULS: Dir faellt ein: ...".
-#[derive(Resource, Default, Debug, Clone)]
+#[derive(Resource, Default, Debug, Clone, Serialize, Deserialize)]
 pub struct GaiaBuffer {
     thoughts: std::collections::HashMap<AgentId, Vec<GaiaThought>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GaiaThought {
     pub content: String,
     pub tick: u64,
@@ -891,12 +891,12 @@ impl GaiaBuffer {
 ///
 /// "Achtung: Feueralarm-Uebung in 5 Minuten."
 /// In Perception als "DURCHSAGE: ...".
-#[derive(Resource, Default, Debug, Clone)]
+#[derive(Resource, Default, Debug, Clone, Serialize, Deserialize)]
 pub struct BroadcastBuffer {
     messages: Vec<BroadcastMessage>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BroadcastMessage {
     pub content: String,
     pub broadcast_type: String,
@@ -1492,6 +1492,13 @@ pub fn snapshot_ecs_state(world: &mut World) -> sentinel_common::EcsSnapshot {
         task_states.push(task.clone());
     }
 
+    // #491 (TM-3): Autonomy-Cooldown pro Agent erfassen (separate Query, damit kein Agent fehlt).
+    let mut autonomy_cooldowns = Vec::new();
+    let mut cd_query = world.query::<(&AgentIdentity, &AutonomyCooldown)>();
+    for (identity, cd) in cd_query.iter(world) {
+        autonomy_cooldowns.push((identity.agent_id.0, cd.last_action_tick));
+    }
+
     let sim_time = world.get_resource::<SimulationTime>();
 
     sentinel_common::EcsSnapshot {
@@ -1518,6 +1525,24 @@ pub fn snapshot_ecs_state(world: &mut World) -> sentinel_common::EcsSnapshot {
         active_stimuli_json: world
             .get_resource::<ActiveRoomStimuli>()
             .and_then(|s| serde_json::to_vec(s).ok())
+            .unwrap_or_default(),
+        autonomy_cooldowns,
+        // #491 (TM-3): bisher beim Restore verworfene ephemere Resources erfassen.
+        smells_json: world
+            .get_resource::<ActiveSmells>()
+            .and_then(|r| serde_json::to_vec(r).ok())
+            .unwrap_or_default(),
+        room_chat_json: world
+            .get_resource::<RoomChatBuffer>()
+            .and_then(|r| serde_json::to_vec(r).ok())
+            .unwrap_or_default(),
+        gaia_json: world
+            .get_resource::<GaiaBuffer>()
+            .and_then(|r| serde_json::to_vec(r).ok())
+            .unwrap_or_default(),
+        broadcast_json: world
+            .get_resource::<BroadcastBuffer>()
+            .and_then(|r| serde_json::to_vec(r).ok())
             .unwrap_or_default(),
     }
 }
@@ -1665,6 +1690,17 @@ pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnaps
                 max_tokens: 4096,
             });
 
+        // #491 (TM-3): Cooldown aus dem Snapshot wiederherstellen statt Default (Spike-#490-Luecke:
+        // Respawn mit last_action_tick=0 liess Autonomy nach dem Anchor sofort feuern -> Divergenz).
+        let autonomy_cooldown = snapshot
+            .autonomy_cooldowns
+            .iter()
+            .find(|(aid, _)| aid == id)
+            .map(|(_, t)| AutonomyCooldown {
+                last_action_tick: *t,
+            })
+            .unwrap_or_default();
+
         world.spawn((
             identity.clone(),
             pos,
@@ -1677,7 +1713,7 @@ pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnaps
             llm,
             shift,
             events,
-            AutonomyCooldown::default(),
+            autonomy_cooldown,
             caps,
         ));
     }
@@ -1701,6 +1737,29 @@ pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnaps
             serde_json::from_slice::<ActiveRoomStimuli>(&snapshot.active_stimuli_json)
         {
             world.insert_resource(stimuli);
+        }
+    }
+
+    // 5. #491 (TM-3): bisher beim Restore verworfene ephemere Resources wiederherstellen.
+    // Leeres Feld = Vor-#491-Snapshot (v2) -> Default belassen (kein Insert, Vor-#491-Verhalten).
+    if !snapshot.smells_json.is_empty() {
+        if let Ok(smells) = serde_json::from_slice::<ActiveSmells>(&snapshot.smells_json) {
+            world.insert_resource(smells);
+        }
+    }
+    if !snapshot.room_chat_json.is_empty() {
+        if let Ok(chat) = serde_json::from_slice::<RoomChatBuffer>(&snapshot.room_chat_json) {
+            world.insert_resource(chat);
+        }
+    }
+    if !snapshot.gaia_json.is_empty() {
+        if let Ok(gaia) = serde_json::from_slice::<GaiaBuffer>(&snapshot.gaia_json) {
+            world.insert_resource(gaia);
+        }
+    }
+    if !snapshot.broadcast_json.is_empty() {
+        if let Ok(broadcast) = serde_json::from_slice::<BroadcastBuffer>(&snapshot.broadcast_json) {
+            world.insert_resource(broadcast);
         }
     }
 }
@@ -1788,6 +1847,85 @@ mod config_apply_helper_tests {
         assert_eq!(tasks[0].status, TaskStatus::InProgress);
         assert_eq!(tasks[0].parent_task, Some(TaskId(1)));
         assert_eq!(tasks[0].assigned_to, AgentId(3));
+    }
+
+    #[test]
+    fn cooldown_and_buffers_survive_snapshot_restore() {
+        // #491 (TM-3) Regression gegen die Spike-#490-Luecke: AutonomyCooldown + die vier
+        // ephemeren Buffer-Resources gingen beim Restore verloren (Respawn/Default) und liessen
+        // die Simulation nach dem Anchor divergieren (erste Divergenz Tick ~426).
+        let (mut world, _) = create_simulation_world();
+        let entity = spawn_agent(&mut world, AgentId(3), "Ada", "Dev", 1, "empfang");
+
+        // Cooldown auf einen markanten Tick setzen (Default waere 0).
+        world.get_mut::<AutonomyCooldown>(entity).unwrap().last_action_tick = 426;
+        // Je einen Eintrag in alle vier Buffer legen.
+        world
+            .resource_mut::<ActiveSmells>()
+            .add("empfang", "coffee".to_string(), 0.8, 5, 100);
+        world.resource_mut::<RoomChatBuffer>().add(
+            "empfang",
+            "Ada".to_string(),
+            "Hallo".to_string(),
+            12,
+            &["Ada".to_string()],
+        );
+        world
+            .resource_mut::<GaiaBuffer>()
+            .add(AgentId(3), "Dir faellt etwas ein".to_string(), 10);
+        world
+            .resource_mut::<BroadcastBuffer>()
+            .add("Feueralarm-Uebung".to_string(), "drill".to_string(), 10);
+
+        let snapshot = snapshot_ecs_state(&mut world);
+        assert_eq!(
+            snapshot.autonomy_cooldowns,
+            vec![(3u16, 426u64)],
+            "cooldown im snapshot"
+        );
+        assert!(!snapshot.smells_json.is_empty(), "smells im snapshot");
+        assert!(!snapshot.room_chat_json.is_empty(), "chat im snapshot");
+        assert!(!snapshot.gaia_json.is_empty(), "gaia im snapshot");
+        assert!(!snapshot.broadcast_json.is_empty(), "broadcast im snapshot");
+
+        // Frische Welt -> Restore -> Zustand muss exakt wiederhergestellt sein.
+        let (mut restored, _) = create_simulation_world();
+        restore_ecs_state(&mut restored, &snapshot);
+
+        // Cooldown ueberlebt (NICHT Default 0).
+        let mut cd_query = restored.query::<(&AgentIdentity, &AutonomyCooldown)>();
+        let cd = cd_query
+            .iter(&restored)
+            .find(|(idn, _)| idn.agent_id == AgentId(3))
+            .map(|(_, c)| c.last_action_tick);
+        assert_eq!(cd, Some(426), "cooldown nach restore");
+
+        // Alle vier Buffer semantisch wiederhergestellt.
+        assert!(
+            !restored
+                .resource::<ActiveSmells>()
+                .get_active("empfang", 50)
+                .is_empty(),
+            "smell nach restore aktiv"
+        );
+        assert_eq!(
+            restored
+                .resource::<RoomChatBuffer>()
+                .last_chat_tick_for_room("empfang"),
+            Some(12),
+            "chat nach restore"
+        );
+        assert!(
+            !restored
+                .resource::<GaiaBuffer>()
+                .get_active(&AgentId(3), 11)
+                .is_empty(),
+            "gaia-thought nach restore aktiv (AgentId-keyed map round-trip)"
+        );
+        assert!(
+            !restored.resource::<BroadcastBuffer>().get_active(40).is_empty(),
+            "broadcast nach restore aktiv"
+        );
     }
 
     #[test]
