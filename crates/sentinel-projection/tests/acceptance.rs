@@ -64,6 +64,7 @@ fn seed_lifecycle(store: &EventStore, agent_num: u16, base_tick: u64) {
             action_type: "Chat".to_string(),
             target_room: None,
             content: Some("Hallo Kollegen!".to_string()),
+            source: None,
         },
     );
 
@@ -343,6 +344,7 @@ fn unknown_event_type_is_skipped_gracefully() {
             action_type: "Work".to_string(),
             target_room: None,
             content: None,
+            source: None,
         },
     );
 
@@ -388,6 +390,7 @@ fn chaos_and_shift_events_project_correctly() {
             event_type: EventType::PrinterBroken,
             target_room: Some("buero-dev-1".to_string()),
             description: "Drucker zeigt Papierstau".to_string(),
+            duration_ticks: 0,
         },
     );
 
@@ -472,6 +475,7 @@ fn expired_chaos_is_cleared_by_room_physics_update() {
             event_type: EventType::PrinterBroken,
             target_room: Some(room_id.to_string()),
             description: "Drucker zeigt Papierstau".to_string(),
+            duration_ticks: 0,
         },
     );
 

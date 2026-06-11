@@ -268,6 +268,9 @@ pub fn start_transit(
         action_type: "Move".to_string(),
         target_room: Some(target.to_string()),
         content: Some("autonomy:bio_emergency".to_string()),
+        // #491 (TM-3): autonomy-deriviert -> Replay injiziert dies NICHT erneut (das deterministische
+        // Autonomy-System erzeugt es ohnehin wieder). Ersetzt die fruehere content-Marker-Heuristik.
+        source: Some("autonomy".to_string()),
     };
     let action_event = DomainEvent::new(
         action_payload.event_type_str(),

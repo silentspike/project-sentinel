@@ -7685,6 +7685,7 @@ mod tests {
                 event_type,
                 target_room,
                 description,
+                ..
             } => {
                 assert_eq!(event_type, EventType::AirConBroken);
                 assert_eq!(target_room.as_deref(), Some("empfang"));
