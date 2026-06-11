@@ -8,7 +8,7 @@
 //! Append-Only wird im Code erzwungen (kein UPDATE/DELETE auf events).
 //! rusqlite unterstuetzt keine INSTEAD OF Trigger auf normalen Tabellen.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use sentinel_common::DomainEvent;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -484,6 +484,94 @@ impl EventStore {
                 .observe(_telemetry_start.elapsed().as_micros() as f64);
         }
         Ok(results)
+    }
+
+    /// #491 (TM-3): Liest Events im halboffenen Cursor-Intervall `(from_exclusive, to_inclusive]`
+    /// in stabiler `id`-Reihenfolge — die exakte Eingabe-Sequenz fuer den Bounded Replay
+    /// `(anchor, target]`. Im Gegensatz zu `get_events_since` mit oberer Schranke statt Limit.
+    pub fn get_events_range(
+        &self,
+        from_exclusive: i64,
+        to_inclusive: i64,
+    ) -> anyhow::Result<Vec<DomainEvent>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE id > ?1 AND id <= ?2 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![from_exclusive, to_inclusive], |row| {
+            Ok(DomainEvent {
+                event_id: row.get(0)?,
+                event_type: row.get(1)?,
+                aggregate_id: row.get(2)?,
+                payload: row.get(3)?,
+                correlation_id: row.get(4)?,
+                causation_id: row.get(5)?,
+                operation_id: row.get(6)?,
+                tick: row.get::<_, i64>(7)? as u64,
+                timestamp_ms: row.get::<_, i64>(8)? as u64,
+                schema_version: row.get::<_, i32>(9)? as u32,
+                compensation_type: row.get(10)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// #491 (TM-3): Anzahl Events in `(from_exclusive, to_inclusive]` (Replay-Range-Groesse fuer die
+    /// Restore-Response `replay_event_count`, ohne die Events tatsaechlich zu laden).
+    pub fn count_events_in_range(
+        &self,
+        from_exclusive: i64,
+        to_inclusive: i64,
+    ) -> anyhow::Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE id > ?1 AND id <= ?2",
+            params![from_exclusive, to_inclusive],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
+    /// #491 (TM-3): groesste `events.id` mit `tick <= target_tick` — loest ein Ziel-Tick in einen
+    /// Event-Cursor auf (Restore-auf-Tick = Ende dieses Ticks). `None` wenn kein Event so frueh ist
+    /// (Ziel liegt vor dem ersten Event).
+    pub fn max_event_id_at_tick(&self, target_tick: u64) -> anyhow::Result<Option<i64>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let id: Option<i64> = conn.query_row(
+            "SELECT MAX(id) FROM events WHERE tick <= ?1",
+            params![target_tick as i64],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    /// #491 (TM-3): Tick eines Events anhand seiner `id` (Anchor-Aufloesung / Ziel-Validierung).
+    pub fn get_event_tick(&self, id: i64) -> anyhow::Result<Option<u64>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let tick: Option<i64> = conn
+            .query_row(
+                "SELECT tick FROM events WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(tick.map(|t| t as u64))
     }
 
     /// Liest Events mit interner Row-ID (fuer Projection-Cursor-Tracking).
@@ -1711,6 +1799,44 @@ mod tests {
 
         let agent2_events = store.get_events_by_aggregate("AGENT-02", 10).unwrap();
         assert_eq!(agent2_events.len(), 1);
+    }
+
+    #[test]
+    fn test_range_queries_for_bounded_replay() {
+        // #491 (TM-3): get_events_range/count/max_event_id_at_tick/get_event_tick.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-range.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        // 5 Events, ids 1..5, ticks [1,1,2,2,3].
+        for tick in [1u64, 1, 2, 2, 3] {
+            let e = DomainEvent::new("agent_action_received", "AGENT-01", "{}", "corr-1", tick);
+            store.append_event(&e).unwrap();
+        }
+
+        // get_events_range: (from_exclusive, to_inclusive], stabile id-Reihenfolge.
+        assert_eq!(store.get_events_range(0, 5).unwrap().len(), 5, "voller Bereich");
+        let mid = store.get_events_range(2, 4).unwrap();
+        assert_eq!(mid.len(), 2, "ids 3,4");
+        assert!(mid.iter().all(|e| e.tick == 2));
+        assert!(store.get_events_range(5, 5).unwrap().is_empty(), "leerer Bereich");
+        assert!(store.get_events_range(2, 2).unwrap().is_empty(), "from==to leer");
+
+        // count_events_in_range
+        assert_eq!(store.count_events_in_range(0, 5).unwrap(), 5);
+        assert_eq!(store.count_events_in_range(2, 4).unwrap(), 2);
+        assert_eq!(store.count_events_in_range(5, 5).unwrap(), 0);
+
+        // max_event_id_at_tick: groesste id mit tick <= target.
+        assert_eq!(store.max_event_id_at_tick(2).unwrap(), Some(4));
+        assert_eq!(store.max_event_id_at_tick(1).unwrap(), Some(2));
+        assert_eq!(store.max_event_id_at_tick(3).unwrap(), Some(5));
+        assert_eq!(store.max_event_id_at_tick(0).unwrap(), None, "vor erstem Event");
+
+        // get_event_tick
+        assert_eq!(store.get_event_tick(3).unwrap(), Some(2));
+        assert_eq!(store.get_event_tick(5).unwrap(), Some(3));
+        assert_eq!(store.get_event_tick(99).unwrap(), None, "unbekannte id");
     }
 
     #[test]

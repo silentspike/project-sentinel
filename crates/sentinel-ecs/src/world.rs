@@ -1231,7 +1231,14 @@ pub fn create_simulation_world() -> (World, Schedule) {
             .after(super::decision::decision_system),
     );
     // #438: Task-Fortschritt aus Agent-Aktionen ableiten (Pending -> InProgress).
-    schedule.add_systems(super::systems::task_progress_system.in_set(SimulationPhase::Decision));
+    // #491 (TM-3): explizit NACH autonomy_system ordnen (Kette decision -> autonomy -> task_progress).
+    // Ohne diese Schranke war die Reihenfolge im Decision-Set auf einem Multi-Thread-Executor
+    // unbestimmt (Spike-#490 T6) -> potenzieller Replay-Nichtdeterminismus.
+    schedule.add_systems(
+        super::systems::task_progress_system
+            .in_set(SimulationPhase::Decision)
+            .after(super::autonomy::autonomy_system),
+    );
     schedule.add_systems(output_system.in_set(SimulationPhase::Output));
     schedule.add_systems(persist_system.in_set(SimulationPhase::Persist));
 

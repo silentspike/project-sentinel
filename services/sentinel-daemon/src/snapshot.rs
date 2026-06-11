@@ -85,9 +85,24 @@ impl SnapshotManager {
     }
 
     /// Prueft ob ein neuer Snapshot erstellt werden soll.
+    ///
+    /// #491 (TM-3): in der ERSTEN Stunde (`tick < hourly_interval_ticks`) gilt das feinere
+    /// `first_hour_interval_ticks`, damit der Bounded Replay kurz bleibt; danach das grobe
+    /// `hourly_interval_ticks` (Tiered Retention). Die EVENT-Aufbewahrung, die das Replay-Fenster
+    /// der ersten Stunde tatsaechlich offenhaelt, ist separat (#250); ausserhalb davon faellt der
+    /// Restore auf den naechsten Snapshot-Punkt zurueck (AC-3, exact:false).
     pub fn should_create_snapshot(&self, tick: u64) -> bool {
-        tick > 0
-            && tick.saturating_sub(self.last_snapshot_tick) >= self.config.hourly_interval_ticks
+        if tick == 0 {
+            return false;
+        }
+        let interval = if tick < self.config.hourly_interval_ticks
+            && self.config.first_hour_interval_ticks > 0
+        {
+            self.config.first_hour_interval_ticks
+        } else {
+            self.config.hourly_interval_ticks
+        };
+        tick.saturating_sub(self.last_snapshot_tick) >= interval
     }
 
     /// Erstellt einen vollstaendigen World Snapshot und speichert ihn in Limbo.
@@ -341,5 +356,37 @@ mod tests {
     fn prune_cutoff_requires_two_snapshots() {
         assert_eq!(prune_cutoff_from_ordered_snapshots(&[]), None);
         assert_eq!(prune_cutoff_from_ordered_snapshots(&[meta(100, 10)]), None);
+    }
+
+    #[test]
+    fn should_create_snapshot_uses_fine_interval_in_first_hour() {
+        // #491 (TM-3): erste Stunde feines Intervall (300), danach grob (3600).
+        let cfg = RetentionConfig {
+            hourly_interval_ticks: 3600,
+            first_hour_interval_ticks: 300,
+            ..RetentionConfig::default()
+        };
+        let mgr = SnapshotManager::new(cfg);
+        // last_snapshot_tick = 0 (frisch).
+        assert!(!mgr.should_create_snapshot(0), "tick 0 nie");
+        assert!(!mgr.should_create_snapshot(299), "vor erstem 5-min-Anchor");
+        assert!(mgr.should_create_snapshot(300), "erster 5-min-Anchor in 1. Stunde");
+        assert!(mgr.should_create_snapshot(600), "weiterer 5-min-Anchor");
+        // Nach der ersten Stunde gilt das grobe Intervall: 3600 seit last(0) -> ja; 3300 -> nein.
+        assert!(!mgr.should_create_snapshot(3300), "in 2. Stunde noch < hourly seit last");
+        assert!(mgr.should_create_snapshot(3600), "hourly-Anchor ausserhalb 1. Stunde");
+    }
+
+    #[test]
+    fn should_create_snapshot_fine_interval_zero_falls_back_to_hourly() {
+        // first_hour_interval_ticks = 0 -> deaktiviert, hourly gilt auch in der 1. Stunde.
+        let cfg = RetentionConfig {
+            hourly_interval_ticks: 3600,
+            first_hour_interval_ticks: 0,
+            ..RetentionConfig::default()
+        };
+        let mgr = SnapshotManager::new(cfg);
+        assert!(!mgr.should_create_snapshot(300), "kein 5-min-Anchor wenn deaktiviert");
+        assert!(mgr.should_create_snapshot(3600), "hourly greift");
     }
 }

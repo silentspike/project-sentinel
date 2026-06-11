@@ -13,6 +13,9 @@ wasm = ["sentinel-wasm/wasm"]
 bevy_ecs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# #491 (TM-3): deterministischer State-Hash (canonical bincode + sha256) fuer Restore/Replay-Evidence.
+sha2 = { workspace = true }
+bincode = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
