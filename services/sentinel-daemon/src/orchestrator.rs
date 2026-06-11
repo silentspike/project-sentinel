@@ -2969,7 +2969,6 @@ fn teardown_runtime_for_world_restore(
     ids.len()
 }
 
-#[allow(clippy::too_many_arguments)]
 /// #491 (TM-3): Sicherungs-Obergrenze fuer die Replay-Spanne in Ticks. Das Feature zielt auf die
 /// erste Stunde (~3600 Ticks @1 Hz); ein Vielfaches davon faengt versehentlich riesige Spannen ab
 /// (Fallback nearest, exact:false) statt den Tick-Loop minutenlang zu blockieren.
@@ -3059,6 +3058,7 @@ fn resolve_restore_target(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit_world_restore_stores(
     anchor_snapshot_id: &str,
     snapshot: &sentinel_common::WorldSnapshot,
@@ -3271,7 +3271,6 @@ fn rollback_world_restore_after_commit_failure(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn execute_world_restore_transfer(
     restore_cmd: &sentinel_common::OperatorRestoreCommand,
