@@ -104,6 +104,12 @@ pub enum DomainEventPayload {
         action_type: String,
         target_room: Option<String>,
         content: Option<String>,
+        /// #491 (TM-3): Herkunft der Aktion. `None`/`Some("external")` = vom LLM/Operator (echter
+        /// Replay-Input), `Some("autonomy")` = vom deterministischen Autonomy-System abgeleitet.
+        /// Letztere werden beim Replay NICHT erneut injiziert (sonst Doppel-Anwendung), da das
+        /// Autonomy-System sie ohnehin wieder erzeugt. Ersetzt die fruehere content-Marker-Heuristik.
+        #[serde(default)]
+        source: Option<String>,
     },
     /// Agent startet Raumwechsel
     TransitStarted {
@@ -119,6 +125,10 @@ pub enum DomainEventPayload {
         event_type: EventType,
         target_room: Option<String>,
         description: String,
+        /// #491 (TM-3): Dauer des Chaos in Ticks. Bisher implizit (TTL im System); explizit im
+        /// Event, damit Operator-Chaos nach dem Anchor beim Replay exakt rekonstruiert werden kann.
+        #[serde(default)]
+        duration_ticks: u64,
     },
     /// Bio-Aktion (essen, trinken, Toilette)
     BioActionPerformed { agent_id: AgentId, action: String },
@@ -372,6 +382,16 @@ pub enum DomainEventPayload {
         /// Ausloesegrund (z.B. "manual", "resource_rebalance").
         reason: String,
     },
+    /// PSI-Band hat sich geaendert (#491, TM-3): die diegetische Hardware-Last (CPU/Mem PSI)
+    /// ueberschreitet die Bio-Stress-Schwellen ja/nein. Da `apply_psi_stress` rein
+    /// schwellenbasiert ist, genuegen die zwei Booleans als exakter, sparse aufgezeichneter
+    /// Replay-Input — nur bei einem tatsaechlichen Band-Wechsel emittiert.
+    PsiBandChanged {
+        /// CPU-PSI ueber `PSI_CPU_STRESS_THRESHOLD`.
+        cpu_above: bool,
+        /// Mem-PSI ueber `PSI_MEM_STRESS_THRESHOLD`.
+        mem_above: bool,
+    },
 }
 
 impl DomainEventPayload {
@@ -417,6 +437,7 @@ impl DomainEventPayload {
             Self::OperatorDmSent { .. } => "operator_dm_sent",
             Self::ConfigApplied { .. } => "config_applied",
             Self::MigrationCompleted { .. } => "migration_completed",
+            Self::PsiBandChanged { .. } => "psi_band_changed",
         }
     }
 }
@@ -479,6 +500,47 @@ mod tests {
     fn task_status_default_is_pending() {
         assert_eq!(crate::TaskStatus::default(), crate::TaskStatus::Pending);
         assert_eq!(crate::TaskStatus::InProgress.as_str(), "in_progress");
+    }
+
+    #[test]
+    fn event_hardening_is_backward_compatible() {
+        // #491 (TM-3): altes JSON OHNE die neuen Felder muss weiter deserialisieren (serde default),
+        // damit bereits persistierte Events (Event-Store ist append-only) lesbar bleiben.
+        let old_aar = r#"{"type":"AgentActionReceived","agent_id":3,"action_type":"Chat","target_room":null,"content":"Hi"}"#;
+        match serde_json::from_str::<DomainEventPayload>(old_aar).expect("alt-AAR deser") {
+            DomainEventPayload::AgentActionReceived { source, .. } => assert_eq!(source, None),
+            _ => panic!("falsche Variante"),
+        }
+        let old_chaos = r#"{"type":"ChaosTriggered","event_type":"PrinterBroken","target_room":null,"description":"x"}"#;
+        match serde_json::from_str::<DomainEventPayload>(old_chaos).expect("alt-Chaos deser") {
+            DomainEventPayload::ChaosTriggered { duration_ticks, .. } => {
+                assert_eq!(duration_ticks, 0)
+            }
+            _ => panic!("falsche Variante"),
+        }
+    }
+
+    #[test]
+    fn psi_band_changed_event_type_and_roundtrip() {
+        // #491 (TM-3): PsiBandChanged hat den richtigen event_type + serde-Roundtrip (Replay-Input).
+        let payload = DomainEventPayload::PsiBandChanged {
+            cpu_above: true,
+            mem_above: false,
+        };
+        assert_eq!(payload.event_type_str(), "psi_band_changed");
+        let json = payload.to_json();
+        let back: DomainEventPayload = serde_json::from_str(&json).expect("roundtrip");
+        assert_eq!(back.to_json(), json);
+        match back {
+            DomainEventPayload::PsiBandChanged {
+                cpu_above,
+                mem_above,
+            } => {
+                assert!(cpu_above);
+                assert!(!mem_above);
+            }
+            _ => panic!("falsche Variante"),
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 
-use crate::{EcsSnapshot, RedbDump, SnapshotTier, WorldSnapshot};
+use crate::{EcsSnapshot, FsMetadataDump, RedbDump, SnapshotTier, WorldSnapshot};
 
 /// Bincode 2 in legacy mode keeps wire compatibility with the historic
 /// `bincode::serialize` / `deserialize` snapshots from bincode 1.x.
@@ -55,6 +55,100 @@ pub fn decode_snapshot_cursor(bytes: &[u8]) -> anyhow::Result<SnapshotCursor> {
     Ok(cursor)
 }
 
+/// Eingefrorene `EcsSnapshot`-Form VOR #491 (Schema v2): ohne `autonomy_cooldowns` und ohne die
+/// vier Buffer-JSON-Felder. Wird ausschliesslich vom Decoder fuer die Rueckwaerts-Kompatibilitaet
+/// genutzt — bincode liest positional, deshalb braucht jede fruehere Form ihre eigene Struktur.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EcsSnapshotV2 {
+    positions: Vec<(u16, crate::components::Position)>,
+    bio_states: Vec<(u16, crate::components::BioState)>,
+    personalities: Vec<(u16, crate::components::Personality)>,
+    moods: Vec<(u16, crate::components::Mood)>,
+    perception_states: Vec<(u16, crate::components::PerceptionState)>,
+    work_contexts: Vec<(u16, crate::components::WorkContext)>,
+    agent_capabilities: Vec<(u16, crate::components::AgentCapabilities)>,
+    event_queues: Vec<(u16, crate::components::EventQueue)>,
+    identities: Vec<(u16, crate::components::AgentIdentity)>,
+    shift_infos: Vec<(u16, crate::components::ShiftInfo)>,
+    relationships: Vec<(u16, crate::components::Relationships)>,
+    llm_configs: Vec<(u16, crate::components::LlmConfig)>,
+    #[serde(default)]
+    task_states: Vec<crate::components::TaskState>,
+    sim_tick: u64,
+    sim_hour: f32,
+    sim_delta_seconds: f32,
+    active_chaos_json: Vec<u8>,
+    active_stimuli_json: Vec<u8>,
+}
+
+impl From<EcsSnapshotV2> for EcsSnapshot {
+    fn from(ecs: EcsSnapshotV2) -> Self {
+        Self {
+            positions: ecs.positions,
+            bio_states: ecs.bio_states,
+            personalities: ecs.personalities,
+            moods: ecs.moods,
+            perception_states: ecs.perception_states,
+            work_contexts: ecs.work_contexts,
+            agent_capabilities: ecs.agent_capabilities,
+            event_queues: ecs.event_queues,
+            identities: ecs.identities,
+            shift_infos: ecs.shift_infos,
+            relationships: ecs.relationships,
+            llm_configs: ecs.llm_configs,
+            task_states: ecs.task_states,
+            sim_tick: ecs.sim_tick,
+            sim_hour: ecs.sim_hour,
+            sim_delta_seconds: ecs.sim_delta_seconds,
+            active_chaos_json: ecs.active_chaos_json,
+            active_stimuli_json: ecs.active_stimuli_json,
+            // v2-Snapshots kennen diese Felder nicht -> leer. Restore behandelt leer als "Default
+            // belassen" (Vor-#491-Verhalten); Replay (#491 PR-B) verlangt ohnehin schema_version >= 3.
+            autonomy_cooldowns: Vec::new(),
+            smells_json: Vec::new(),
+            room_chat_json: Vec::new(),
+            gaia_json: Vec::new(),
+            broadcast_json: Vec::new(),
+        }
+    }
+}
+
+/// World-Snapshot Schema v2: aktuelle Form VOR #491 (mit `fs_metadata`, ohne die v3-ECS-Felder).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorldSnapshotV2 {
+    snapshot_id: String,
+    schema_version: u32,
+    tick: u64,
+    sim_hour: f32,
+    timestamp_ms: u64,
+    tier: SnapshotTier,
+    last_event_id: i64,
+    redb: RedbDump,
+    ecs: EcsSnapshotV2,
+    projection_offsets: Vec<(String, i64)>,
+    #[serde(default)]
+    fs_metadata: Option<FsMetadataDump>,
+}
+
+impl From<WorldSnapshotV2> for WorldSnapshot {
+    fn from(snapshot: WorldSnapshotV2) -> Self {
+        Self {
+            snapshot_id: snapshot.snapshot_id,
+            schema_version: snapshot.schema_version,
+            tick: snapshot.tick,
+            sim_hour: snapshot.sim_hour,
+            timestamp_ms: snapshot.timestamp_ms,
+            tier: snapshot.tier,
+            last_event_id: snapshot.last_event_id,
+            redb: snapshot.redb,
+            ecs: snapshot.ecs.into(),
+            projection_offsets: snapshot.projection_offsets,
+            fs_metadata: snapshot.fs_metadata,
+        }
+    }
+}
+
+/// World-Snapshot Schema v1: aelteste Form, VOR `fs_metadata`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorldSnapshotV1 {
     snapshot_id: String,
@@ -65,7 +159,7 @@ struct WorldSnapshotV1 {
     tier: SnapshotTier,
     last_event_id: i64,
     redb: RedbDump,
-    ecs: EcsSnapshot,
+    ecs: EcsSnapshotV2,
     projection_offsets: Vec<(String, i64)>,
 }
 
@@ -80,7 +174,7 @@ impl From<WorldSnapshotV1> for WorldSnapshot {
             tier: snapshot.tier,
             last_event_id: snapshot.last_event_id,
             redb: snapshot.redb,
-            ecs: snapshot.ecs,
+            ecs: snapshot.ecs.into(),
             projection_offsets: snapshot.projection_offsets,
             fs_metadata: None,
         }
@@ -88,18 +182,28 @@ impl From<WorldSnapshotV1> for WorldSnapshot {
 }
 
 pub fn decode_world_snapshot(bytes: &[u8]) -> anyhow::Result<WorldSnapshot> {
+    // v3 (aktuell): nur akzeptieren wenn vollstaendig konsumiert UND schema_version == 3.
+    // Der schema_version-Guard verhindert, dass ein aelterer (v2/v1) Byte-Stream durch zufaellige
+    // bincode-Ausrichtung als v3 fehl-dekodiert wird (schema_version liegt in allen Versionen an
+    // derselben Position: direkt hinter dem fuehrenden snapshot_id-String).
     if let Ok((snapshot, consumed)) =
         bincode::serde::decode_from_slice::<WorldSnapshot, _>(bytes, legacy_config())
     {
-        if consumed != bytes.len() {
-            return Err(anyhow!(
-                "World Snapshot enthaelt {} ungenutzte Bytes",
-                bytes.len() - consumed
-            ));
+        if consumed == bytes.len() && snapshot.schema_version == WorldSnapshot::SCHEMA_VERSION {
+            return Ok(snapshot);
         }
-        return Ok(snapshot);
     }
 
+    // v2: aktuelle Form vor #491 (mit fs_metadata, ohne v3-ECS-Felder).
+    if let Ok((snapshot, consumed)) =
+        bincode::serde::decode_from_slice::<WorldSnapshotV2, _>(bytes, legacy_config())
+    {
+        if consumed == bytes.len() {
+            return Ok(WorldSnapshot::from(snapshot));
+        }
+    }
+
+    // v1: aelteste Form vor fs_metadata.
     let (snapshot, consumed) =
         bincode::serde::decode_from_slice::<WorldSnapshotV1, _>(bytes, legacy_config())
             .context("World Snapshot deserialisieren")?;
@@ -159,6 +263,11 @@ mod tests {
                 sim_delta_seconds: 1.0,
                 active_chaos_json: Vec::new(),
                 active_stimuli_json: Vec::new(),
+                autonomy_cooldowns: vec![(3, 100), (7, 250)],
+                smells_json: b"{\"smells\":{}}".to_vec(),
+                room_chat_json: Vec::new(),
+                gaia_json: Vec::new(),
+                broadcast_json: Vec::new(),
             },
             projection_offsets: Vec::new(),
             fs_metadata: Some(FsMetadataDump::default()),
@@ -211,7 +320,7 @@ mod tests {
                 sim_meta: Vec::new(),
                 api_patterns: Vec::new(),
             },
-            ecs: EcsSnapshot {
+            ecs: EcsSnapshotV2 {
                 positions: Vec::new(),
                 bio_states: Vec::new(),
                 personalities: Vec::new(),
@@ -238,5 +347,92 @@ mod tests {
         assert_eq!(decoded.snapshot_id, "snap-old");
         assert!(decoded.fs_metadata.is_none());
         assert_eq!(decoded.tick, 7);
+        // v1 kennt die v3-ECS-Felder nicht -> muessen leer/Default sein.
+        assert!(decoded.ecs.autonomy_cooldowns.is_empty());
+        assert!(decoded.ecs.smells_json.is_empty());
+    }
+
+    fn ecs_v2_fixture(sim_tick: u64) -> EcsSnapshotV2 {
+        EcsSnapshotV2 {
+            positions: Vec::new(),
+            bio_states: Vec::new(),
+            personalities: Vec::new(),
+            moods: Vec::new(),
+            perception_states: Vec::new(),
+            work_contexts: Vec::new(),
+            agent_capabilities: Vec::new(),
+            event_queues: Vec::new(),
+            identities: Vec::new(),
+            shift_infos: Vec::new(),
+            relationships: Vec::new(),
+            llm_configs: Vec::new(),
+            task_states: Vec::new(),
+            sim_tick,
+            sim_hour: 4.0,
+            sim_delta_seconds: 1.0,
+            active_chaos_json: b"{\"events\":{}}".to_vec(),
+            active_stimuli_json: Vec::new(),
+        }
+    }
+
+    fn redb_empty() -> RedbDump {
+        RedbDump {
+            agent_states: Vec::new(),
+            room_states: Vec::new(),
+            personalities: Vec::new(),
+            relationships: Vec::new(),
+            voice_styles: Vec::new(),
+            behavioral_notes: Vec::new(),
+            narrative_summaries: Vec::new(),
+            evolution_versions: Vec::new(),
+            nmda_scores: Vec::new(),
+            agent_facts: Vec::new(),
+            sim_meta: Vec::new(),
+            api_patterns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn roundtrip_preserves_v3_fields() {
+        let snapshot = base_snapshot();
+        let bytes = encode_world_snapshot(&snapshot).unwrap();
+        let decoded = decode_world_snapshot(&bytes).unwrap();
+        assert_eq!(decoded.schema_version, 3);
+        assert_eq!(decoded.ecs.autonomy_cooldowns, vec![(3, 100), (7, 250)]);
+        assert_eq!(decoded.ecs.smells_json, b"{\"smells\":{}}".to_vec());
+    }
+
+    #[test]
+    fn decode_falls_back_to_v2_snapshots() {
+        // v2 = aktuelle Form VOR #491 (mit fs_metadata, ohne v3-ECS-Felder), schema_version == 2.
+        let legacy = WorldSnapshotV2 {
+            snapshot_id: "snap-v2".to_string(),
+            schema_version: 2,
+            tick: 21,
+            sim_hour: 4.0,
+            timestamp_ms: 88,
+            tier: SnapshotTier::Hourly,
+            last_event_id: 42,
+            redb: redb_empty(),
+            ecs: ecs_v2_fixture(21),
+            projection_offsets: vec![("agent_live".to_string(), 42)],
+            fs_metadata: Some(FsMetadataDump::default()),
+        };
+        let bytes = bincode::serde::encode_to_vec(&legacy, legacy_config()).unwrap();
+        let decoded = decode_world_snapshot(&bytes).unwrap();
+        // Muss ueber den v2-Zweig laufen (NICHT als v3 fehl-akzeptiert): alte Daten erhalten,
+        // neue Felder leer.
+        assert_eq!(decoded.snapshot_id, "snap-v2");
+        assert_eq!(decoded.schema_version, 2);
+        assert_eq!(decoded.tick, 21);
+        assert_eq!(decoded.ecs.sim_tick, 21);
+        assert_eq!(decoded.ecs.active_chaos_json, b"{\"events\":{}}".to_vec());
+        assert!(decoded.fs_metadata.is_some());
+        assert!(decoded.ecs.autonomy_cooldowns.is_empty());
+        assert!(decoded.ecs.room_chat_json.is_empty());
+        assert_eq!(
+            decoded.projection_offsets,
+            vec![("agent_live".to_string(), 42)]
+        );
     }
 }

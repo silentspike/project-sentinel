@@ -2656,6 +2656,17 @@ impl RestoreFence {
     }
 }
 
+/// #491 (TM-3): leitet das PSI-Band `(cpu_above, mem_above)` aus den avg10-Metriken ab.
+/// Schwellen aus sentinel-bio (via sentinel-ecs re-exportiert), strikt `>` — ein Wert exakt auf der
+/// Schwelle ergibt `false`, konsistent mit `apply_psi_stress`. Reiner Helper -> deterministisch und
+/// fuer den Replay-Pfad (#491 PR-B) wiederverwendbar.
+pub(crate) fn psi_band_from_metrics(cpu_avg10: f64, mem_avg10: f64) -> (bool, bool) {
+    (
+        cpu_avg10 > sentinel_ecs::PSI_CPU_STRESS_THRESHOLD,
+        mem_avg10 > sentinel_ecs::PSI_MEM_STRESS_THRESHOLD,
+    )
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ProjectionRestoreSeedReport {
     agents_seeded: u32,
@@ -3849,6 +3860,9 @@ fn ecs_tick_loop(
             Vec::new()
         };
     let mut restore_fence = RestoreFence::default();
+    // #491 (TM-3): zuletzt aufgezeichnetes PSI-Band (cpu_above, mem_above). None = noch nichts
+    // emittiert -> erster Tick setzt die Baseline. Nur Aenderungen werden als Event geschrieben.
+    let mut psi_band: Option<(bool, bool)> = None;
 
     loop {
         let tick_start = Instant::now();
@@ -3876,9 +3890,33 @@ fn ecs_tick_loop(
         }
 
         // PSI-Metriken in ECS World injizieren (fuer bio_system → apply_psi_stress)
+        let psi_cpu_avg10 = adaptive_tick.cpu_avg10();
+        let psi_mem_avg10 = adaptive_tick.mem_avg10();
         if let Some(mut psi) = world.get_resource_mut::<sentinel_ecs::PsiMetrics>() {
-            psi.cpu_avg10 = adaptive_tick.cpu_avg10();
-            psi.mem_avg10 = adaptive_tick.mem_avg10();
+            psi.cpu_avg10 = psi_cpu_avg10;
+            psi.mem_avg10 = psi_mem_avg10;
+        }
+
+        // #491 (TM-3): PSI-Band als sparse Event aufzeichnen (nur bei Wechsel). apply_psi_stress
+        // ist rein schwellenbasiert -> die zwei Booleans sind der exakte, deterministische
+        // Replay-Input. Push in den EventBuffer VOR schedule.run -> persist_system schreibt das
+        // Event mit GENAU diesem Tick; das Band wirkt im Replay ab demselben Tick (kein Off-by-one).
+        let current_band = psi_band_from_metrics(psi_cpu_avg10, psi_mem_avg10);
+        if psi_band != Some(current_band) {
+            psi_band = Some(current_band);
+            let payload = sentinel_common::DomainEventPayload::PsiBandChanged {
+                cpu_above: current_band.0,
+                mem_above: current_band.1,
+            };
+            if let Some(mut buffer) = world.get_resource_mut::<sentinel_ecs::EventBuffer>() {
+                buffer.events.push(sentinel_common::DomainEvent::new(
+                    payload.event_type_str(),
+                    "world",
+                    &payload.to_json(),
+                    &format!("psi-{tick_count}"),
+                    tick_count,
+                ));
+            }
         }
 
         // RuntimeOrchestrator Tick synchronisieren
@@ -5845,6 +5883,47 @@ mod tests {
     static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
+    fn psi_band_matches_bio_thresholds() {
+        // #491 (TM-3): Band-Ableitung nutzt exakt die Bio-Schwellen, strikt `>`.
+        assert_eq!(psi_band_from_metrics(0.0, 0.0), (false, false));
+        // Wert exakt auf der Schwelle -> false (konsistent mit apply_psi_stress).
+        assert_eq!(
+            psi_band_from_metrics(
+                sentinel_ecs::PSI_CPU_STRESS_THRESHOLD,
+                sentinel_ecs::PSI_MEM_STRESS_THRESHOLD
+            ),
+            (false, false)
+        );
+        assert_eq!(psi_band_from_metrics(99.0, 99.0), (true, true));
+        assert_eq!(psi_band_from_metrics(99.0, 0.0), (true, false));
+        assert_eq!(psi_band_from_metrics(0.0, 99.0), (false, true));
+    }
+
+    #[test]
+    fn psi_band_emits_only_on_change() {
+        // #491 (TM-3): sparse Emission — dieselbe Tracking-Logik wie der Tick-Loop. Nur echte
+        // Band-Wechsel (inkl. der None->Baseline am ersten Tick) erzeugen ein Event.
+        let metrics = [
+            (0.0, 0.0),   // Baseline (false,false) -> emit 1
+            (10.0, 20.0), // weiter (false,false) -> kein emit
+            (99.0, 0.0),  // (true,false) -> emit 2
+            (80.0, 10.0), // weiter (true,false) -> kein emit
+            (99.0, 99.0), // (true,true) -> emit 3
+            (0.0, 0.0),   // (false,false) -> emit 4
+        ];
+        let mut prev: Option<(bool, bool)> = None;
+        let mut emits = 0;
+        for (cpu, mem) in metrics {
+            let band = psi_band_from_metrics(cpu, mem);
+            if prev != Some(band) {
+                prev = Some(band);
+                emits += 1;
+            }
+        }
+        assert_eq!(emits, 4, "nur 4 Band-Wechsel bei 6 Ticks");
+    }
+
+    #[test]
     fn judge_alert_agent_id_uses_configured_bounds() {
         let bounds = AgentIdBounds::new(120);
 
@@ -6199,6 +6278,11 @@ mod tests {
                 sim_delta_seconds: 1.0,
                 active_chaos_json: Vec::new(),
                 active_stimuli_json: Vec::new(),
+                autonomy_cooldowns: Vec::new(),
+                smells_json: Vec::new(),
+                room_chat_json: Vec::new(),
+                gaia_json: Vec::new(),
+                broadcast_json: Vec::new(),
             },
             projection_offsets: vec![("sentinel-projection".to_string(), 321)],
             fs_metadata: None,
@@ -7601,6 +7685,7 @@ mod tests {
                 event_type,
                 target_room,
                 description,
+                ..
             } => {
                 assert_eq!(event_type, EventType::AirConBroken);
                 assert_eq!(target_room.as_deref(), Some("empfang"));

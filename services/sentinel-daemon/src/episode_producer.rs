@@ -194,6 +194,7 @@ impl EpisodeProducer {
                 action_type,
                 content,
                 target_room,
+                ..
             } => {
                 let name = self.agent_names.get(&agent_id.0)?.clone();
                 let (relevance, emotion, tags) = classify_action(action_type, content.as_deref());
@@ -380,6 +381,7 @@ mod tests {
             action_type: "talk".to_string(),
             content: Some("Wir haben ein Problem mit dem Deadline".to_string()),
             target_room: Some("meetingraum-01".to_string()),
+            source: None,
         };
 
         let result = producer.event_to_episode(&payload, 100, 200, 1.0);
@@ -427,6 +429,7 @@ mod tests {
             event_type: sentinel_common::EventType::PrinterBroken,
             target_room: Some("buero-dev-1".to_string()),
             description: "Drucker streikt wieder".to_string(),
+            duration_ticks: 0,
         };
 
         let result = producer.event_to_episode(&payload, 0, 100, 1.0);
@@ -449,6 +452,7 @@ mod tests {
             action_type: "talk".to_string(),
             content: None,
             target_room: None,
+            source: None,
         };
 
         let result = producer.event_to_episode(&payload, 0, 100, 1.0);

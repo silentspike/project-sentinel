@@ -20,7 +20,6 @@ use bevy_ecs::prelude::{Schedule, World};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
 use sentinel_common::events::DomainEvent;
 use sentinel_common::feature_flags::RuntimeFlags;
@@ -43,73 +42,10 @@ const SIM_HOUR_START: f32 = 8.0;
 const PERCEPTION_CHANNEL_CAP: usize = 100_000;
 
 // ───────────────────────── State hash (AC-1/AC-2/AC-3) ─────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct StateHashes {
-    /// Full canonical snapshot.
-    strict: String,
-    /// Without `PerceptionState`/`EventQueue` — separates perception-text gaps from sim-core divergence.
-    core: String,
-}
-
-/// Re-serialize JSON bytes through `serde_json::Value` so HashMap key order is canonical (BTreeMap).
-fn canonical_json(bytes: &[u8]) -> Vec<u8> {
-    match serde_json::from_slice::<serde_json::Value>(bytes) {
-        Ok(v) => serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec()),
-        Err(_) => bytes.to_vec(),
-    }
-}
-
-fn bincode_bytes<T: Serialize>(value: &T) -> Vec<u8> {
-    bincode::serde::encode_to_vec(value, bincode::config::legacy())
-        .expect("bincode legacy encode of canonical snapshot")
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    format!("{:x}", h.finalize())
-}
-
-/// Canonicalize an `EcsSnapshot` for hashing.
-/// N1: sort every component vec by agent id (Bevy allocation order is not stable across restore);
-/// N2: `transit_correlation_id := None` (UUIDv4 event identity, not sim state);
-/// N3: canonicalize the chaos/stimuli JSON (HashMap byte order);
-/// N4: nothing else (f32 stays a bit pattern via the legacy bincode codec).
-fn canonicalize(mut s: EcsSnapshot) -> EcsSnapshot {
-    s.positions.sort_by_key(|(id, _)| *id);
-    s.bio_states.sort_by_key(|(id, _)| *id);
-    s.personalities.sort_by_key(|(id, _)| *id);
-    s.moods.sort_by_key(|(id, _)| *id);
-    s.perception_states.sort_by_key(|(id, _)| *id);
-    s.work_contexts.sort_by_key(|(id, _)| *id);
-    s.agent_capabilities.sort_by_key(|(id, _)| *id);
-    s.event_queues.sort_by_key(|(id, _)| *id);
-    s.identities.sort_by_key(|(id, _)| *id);
-    s.shift_infos.sort_by_key(|(id, _)| *id);
-    s.relationships.sort_by_key(|(id, _)| *id);
-    s.llm_configs.sort_by_key(|(id, _)| *id);
-    // Task entities have no agent u16 key — order by their canonical bincode encoding.
-    s.task_states.sort_by_cached_key(bincode_bytes);
-    // N2: drop the per-action UUID that leaks into ECS state.
-    for (_, p) in s.positions.iter_mut() {
-        p.transit_correlation_id = None;
-    }
-    // N3: HashMap-order-independent JSON.
-    s.active_chaos_json = canonical_json(&s.active_chaos_json);
-    s.active_stimuli_json = canonical_json(&s.active_stimuli_json);
-    s
-}
-
-fn state_hashes(world: &mut World) -> StateHashes {
-    let canon = canonicalize(snapshot_ecs_state(world));
-    let strict = sha256_hex(&bincode_bytes(&canon));
-    let mut core = canon;
-    core.perception_states.clear();
-    core.event_queues.clear();
-    let core = sha256_hex(&bincode_bytes(&core));
-    StateHashes { strict, core }
-}
+// #491 (TM-3): die Hash-Implementierung wurde in die Produktion gehoben (sentinel_ecs::hash),
+// damit Spike, der `/operator/state-hash`-Endpunkt und Drift-Checks EINE kanonische Quelle teilen.
+// `StateHashes`/`canonicalize`/`state_hashes` + die Helfer werden von dort re-importiert.
+use sentinel_ecs::hash::{bincode_bytes, state_hashes, StateHashes};
 
 // ───────────────────────── Scenario / scripted inputs ─────────────────────────
 
@@ -975,22 +911,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn canonical_json_sorts_object_keys() {
-        let a = br#"{"b":1,"a":2}"#;
-        let b = br#"{"a":2,"b":1}"#;
-        assert_eq!(
-            canonical_json(a),
-            canonical_json(b),
-            "key order canonicalized"
-        );
-    }
-
-    #[test]
-    fn canonical_json_passthrough_on_invalid() {
-        let raw = b"not json";
-        assert_eq!(canonical_json(raw), raw.to_vec());
-    }
+    // #491 (TM-3): canonical_json/sha256_hex-Tests leben jetzt in sentinel_ecs::hash (SSOT).
 
     #[test]
     fn build_script_is_deterministic() {
@@ -1010,12 +931,6 @@ mod tests {
         assert!(gap > clean, "gap-probe injects extra pre-anchor inputs");
         let gp = build_script(1000, Variant::GapProbe);
         assert!(gp.iter().any(|i| i.tick == anchor - 1));
-    }
-
-    #[test]
-    fn sha256_hex_is_stable() {
-        assert_eq!(sha256_hex(b"abc"), sha256_hex(b"abc"));
-        assert_ne!(sha256_hex(b"abc"), sha256_hex(b"xyz"));
     }
 
     fn action_event(

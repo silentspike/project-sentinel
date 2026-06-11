@@ -9,6 +9,7 @@
 pub mod autonomy;
 pub mod components;
 pub mod decision;
+pub mod hash;
 pub mod perception;
 pub mod phase_timing;
 pub mod systems;
@@ -21,6 +22,11 @@ pub use perception::{
 };
 pub use phase_timing::{install_phase_timing, PhaseTimings, PHASE_COUNT, PHASE_NAMES};
 pub use systems::SimulationPhase;
+// #491 (TM-3): PSI-Schwellen re-exportieren, damit der Daemon-Orchestrator das PSI-Band fuer
+// `PsiBandChanged` ableiten kann, ohne sentinel-bio direkt zu verlinken oder die Werte zu duplizieren.
+pub use sentinel_bio::{PSI_CPU_STRESS_THRESHOLD, PSI_MEM_STRESS_THRESHOLD};
+// #491 (TM-3): kanonischer State-Hash (Spike + state-hash-Endpunkt teilen diese Implementierung).
+pub use hash::{canonicalize, state_hashes, StateHashes};
 pub use world::{
     apply_capabilities, apply_identity, apply_personality, attach_redb_store,
     create_simulation_world, despawn_agent_from_world, rebuild_room_maps, restore_ecs_state,

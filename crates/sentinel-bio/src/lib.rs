@@ -199,14 +199,17 @@ fn update_energy(bio: &mut BioState, personality: &Personality, sim_hour: f32) {
 
 // ── PSI-Stress Konstanten ──
 
-/// CPU PSI avg10 Schwellenwert fuer Stress-Erhoehung
-const PSI_CPU_STRESS_THRESHOLD: f64 = 50.0;
+/// CPU PSI avg10 Schwellenwert fuer Stress-Erhoehung.
+/// `pub` seit #491 (TM-3): der Orchestrator leitet daraus das PSI-Band fuer `PsiBandChanged` ab,
+/// damit Replay denselben deklarierten Input nutzt statt die Schwelle zu duplizieren.
+pub const PSI_CPU_STRESS_THRESHOLD: f64 = 50.0;
 
 /// Stress-Erhoehung bei CPU-Pressure ueber Schwelle
 const PSI_CPU_STRESS_ADDITION: f32 = 10.0;
 
-/// Memory PSI avg10 Schwellenwert fuer Stress + Comfort-Reduktion
-const PSI_MEM_STRESS_THRESHOLD: f64 = 70.0;
+/// Memory PSI avg10 Schwellenwert fuer Stress + Comfort-Reduktion.
+/// `pub` seit #491 (TM-3) — siehe [`PSI_CPU_STRESS_THRESHOLD`].
+pub const PSI_MEM_STRESS_THRESHOLD: f64 = 70.0;
 
 /// Stress-Erhoehung bei Memory-Pressure ueber Schwelle
 const PSI_MEM_STRESS_ADDITION: f32 = 20.0;

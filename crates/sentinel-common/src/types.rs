@@ -618,6 +618,22 @@ pub struct EcsSnapshot {
     /// als JSON-Bytes — vermeidet zirkulaere Dependency zu sentinel-ecs.
     pub active_chaos_json: Vec<u8>,
     pub active_stimuli_json: Vec<u8>,
+    /// #491 (TM-3, Schema v3): Autonomy-Cooldown pro Agent (`agent_id.0` -> `last_action_tick`).
+    /// Ging beim Restore bisher verloren (Respawn mit Default) -> Spike-#490-Divergenz.
+    /// `Vec<(u16, u64)>` statt der sentinel-ecs-Component, um die Crate-Grenze nicht zu brechen.
+    #[serde(default)]
+    pub autonomy_cooldowns: Vec<(u16, u64)>,
+    /// #491 (TM-3, Schema v3): bisher beim Restore verworfene ephemere Resources als JSON-Bytes
+    /// (`ActiveSmells`, `RoomChatBuffer`, `GaiaBuffer`, `BroadcastBuffer`). HashMap-Ordnung wird
+    /// erst beim State-Hash kanonisiert (N3), die Snapshot-Bytes selbst sind unkanonisch (wie chaos).
+    #[serde(default)]
+    pub smells_json: Vec<u8>,
+    #[serde(default)]
+    pub room_chat_json: Vec<u8>,
+    #[serde(default)]
+    pub gaia_json: Vec<u8>,
+    #[serde(default)]
+    pub broadcast_json: Vec<u8>,
 }
 
 /// Vollstaendiger World Snapshot (redb + ECS + Cursor).
@@ -639,7 +655,10 @@ pub struct WorldSnapshot {
 
 impl WorldSnapshot {
     /// Aktuelle Schema-Version fuer bincode Kompatibilitaet.
-    pub const SCHEMA_VERSION: u32 = 2;
+    /// v3 (#491): EcsSnapshot um `autonomy_cooldowns` + 4 Buffer-JSON-Felder erweitert.
+    /// Der Decoder faellt ueber `WorldSnapshotV2` (v2, Buffer-frei) und `WorldSnapshotV1`
+    /// (pre-`fs_metadata`) zurueck. Replay (#491 PR-B) verlangt Anchor `schema_version >= 3`.
+    pub const SCHEMA_VERSION: u32 = 3;
 }
 
 /// Scope einer gefenceten State-Transfer-Operation.
