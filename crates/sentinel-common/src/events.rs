@@ -104,6 +104,12 @@ pub enum DomainEventPayload {
         action_type: String,
         target_room: Option<String>,
         content: Option<String>,
+        /// #491 (TM-3): Herkunft der Aktion. `None`/`Some("external")` = vom LLM/Operator (echter
+        /// Replay-Input), `Some("autonomy")` = vom deterministischen Autonomy-System abgeleitet.
+        /// Letztere werden beim Replay NICHT erneut injiziert (sonst Doppel-Anwendung), da das
+        /// Autonomy-System sie ohnehin wieder erzeugt. Ersetzt die fruehere content-Marker-Heuristik.
+        #[serde(default)]
+        source: Option<String>,
     },
     /// Agent startet Raumwechsel
     TransitStarted {
@@ -119,6 +125,10 @@ pub enum DomainEventPayload {
         event_type: EventType,
         target_room: Option<String>,
         description: String,
+        /// #491 (TM-3): Dauer des Chaos in Ticks. Bisher implizit (TTL im System); explizit im
+        /// Event, damit Operator-Chaos nach dem Anchor beim Replay exakt rekonstruiert werden kann.
+        #[serde(default)]
+        duration_ticks: u64,
     },
     /// Bio-Aktion (essen, trinken, Toilette)
     BioActionPerformed { agent_id: AgentId, action: String },
@@ -490,6 +500,24 @@ mod tests {
     fn task_status_default_is_pending() {
         assert_eq!(crate::TaskStatus::default(), crate::TaskStatus::Pending);
         assert_eq!(crate::TaskStatus::InProgress.as_str(), "in_progress");
+    }
+
+    #[test]
+    fn event_hardening_is_backward_compatible() {
+        // #491 (TM-3): altes JSON OHNE die neuen Felder muss weiter deserialisieren (serde default),
+        // damit bereits persistierte Events (Event-Store ist append-only) lesbar bleiben.
+        let old_aar = r#"{"type":"AgentActionReceived","agent_id":3,"action_type":"Chat","target_room":null,"content":"Hi"}"#;
+        match serde_json::from_str::<DomainEventPayload>(old_aar).expect("alt-AAR deser") {
+            DomainEventPayload::AgentActionReceived { source, .. } => assert_eq!(source, None),
+            _ => panic!("falsche Variante"),
+        }
+        let old_chaos = r#"{"type":"ChaosTriggered","event_type":"PrinterBroken","target_room":null,"description":"x"}"#;
+        match serde_json::from_str::<DomainEventPayload>(old_chaos).expect("alt-Chaos deser") {
+            DomainEventPayload::ChaosTriggered { duration_ticks, .. } => {
+                assert_eq!(duration_ticks, 0)
+            }
+            _ => panic!("falsche Variante"),
+        }
     }
 
     #[test]

@@ -47,6 +47,7 @@ fn make_payload(i: u64) -> DomainEventPayload {
             action_type: "Chat".to_string(),
             target_room: None,
             content: Some("Benchmark event".to_string()),
+            source: None,
         },
         4 => DomainEventPayload::TickSnapshot {
             tick: i,
@@ -65,6 +66,7 @@ fn make_payload(i: u64) -> DomainEventPayload {
             event_type: sentinel_common::EventType::PhoneRing,
             target_room: Some("buero-dev-1".to_string()),
             description: "Benchmark chaos".to_string(),
+            duration_ticks: 0,
         },
     }
 }
