@@ -1173,7 +1173,7 @@ impl EventStore {
 
     // ── World Snapshots (Time Machine) ──
 
-    /// Speichert einen World Snapshot als bincode BLOB.
+    /// Speichert einen World Snapshot als bincode BLOB (created_at = jetzt).
     pub fn save_world_snapshot(
         &self,
         id: &str,
@@ -1183,11 +1183,30 @@ impl EventStore {
         last_event_id: i64,
         payload: &[u8],
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
+        self.save_world_snapshot_at(id, tier, tick, sim_hour, last_event_id, payload, now_ms)
+    }
+
+    /// Speichert einen World Snapshot mit explizitem `created_at_ms` (Epoch-Millisekunden).
+    ///
+    /// Fuer Pfade, die einen Snapshot zu einem bestimmten Zeitpunkt einspielen (Import, Replay,
+    /// Tests, Retention-Benchmarks mit gealterter Population). Der Produktiv-Pfad nutzt
+    /// `save_world_snapshot` (created_at = jetzt). Der #264-Trigger bewertet das Alter ueber die
+    /// echte Uhr (`strftime('now')`), unabhaengig vom hier gesetzten `created_at_ms`.
+    pub fn save_world_snapshot_at(
+        &self,
+        id: &str,
+        tier: &str,
+        tick: u64,
+        sim_hour: f32,
+        last_event_id: i64,
+        payload: &[u8],
+        created_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO world_snapshots (id, tier, tick, sim_hour, last_event_id, payload_size, payload, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1199,7 +1218,7 @@ impl EventStore {
                 last_event_id,
                 payload.len() as i64,
                 payload,
-                now_ms,
+                created_at_ms,
             ],
         )?;
         Ok(())
@@ -1261,6 +1280,19 @@ impl EventStore {
             params![new_tier, id],
         )?;
         Ok(updated > 0)
+    }
+
+    /// Zaehlt World Snapshots gruppiert nach Tier (`GROUP BY tier`, absteigend nach Anzahl).
+    /// Fuer Retention-Verifikation/Monitoring (#250 AC-1: Tier-Verteilung) und Benchmarks.
+    pub fn count_world_snapshots_by_tier(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT tier, count(*) FROM world_snapshots GROUP BY tier ORDER BY count(*) DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 }
 
