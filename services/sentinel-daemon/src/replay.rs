@@ -420,7 +420,8 @@ mod tests {
     use super::*;
     use sentinel_ecs::hash::state_hashes;
     use sentinel_ecs::{
-        create_simulation_world, restore_ecs_state, snapshot_ecs_state, spawn_agent,
+        create_simulation_world, despawn_agent_from_world, restore_ecs_state, snapshot_ecs_state,
+        spawn_agent,
     };
 
     fn world_with_agents(n: u16) -> (World, Schedule) {
@@ -550,7 +551,6 @@ mod tests {
         run_bounded_replay(&mut w2, &mut sched2, &events, anchor_tick, target_tick)
             .expect("replay");
         let replayed = state_hashes(&mut w2);
-
         assert_eq!(
             live.strict, replayed.strict,
             "STRICT exakt bei delta=2.0 (Anchor-delta reproduziert)"
@@ -558,6 +558,67 @@ mod tests {
         assert_eq!(
             live.core, replayed.core,
             "CORE exakt bei delta=2.0 (Anchor-delta reproduziert)"
+        );
+    }
+
+    #[test]
+    fn replay_does_not_reproduce_shift_transition_r1() {
+        // #529 AC-1 Messung (R1): Ein Schichtwechsel = Despawn alter + Spawn neuer Agents wird vom
+        // DAEMON-Loop ausgefuehrt (runtime_orch.shift_transition, orch:4731), NICHT vom ECS-Schedule.
+        // `run_bounded_replay` faehrt nur das Schedule (replay.rs:398) -> der Schichtwechsel wird im
+        // Replay NICHT reproduziert -> live@target != restore(anchor)+replay. Der Diff liegt in der
+        // aktiven Agent-Menge (identities/...), also CORE-Ebene (nicht nur STRICT/Perception).
+        let anchor_tick = 20u64;
+        let shift_tick = 40u64;
+        let target_tick = 60u64;
+        let events: Vec<DomainEvent> = vec![
+            action_event(25, 2, "Chat", "empfang"),
+            action_event(55, 1, "Chat", "kueche"),
+        ];
+
+        // Live: bis anchor -> snapshot -> bis shift_tick -> SCHICHTWECHSEL -> bis target.
+        let (mut w, mut sched) = world_with_agents(4);
+        run_ticks(&mut w, &mut sched, &events, 0, anchor_tick);
+        let anchor = snapshot_ecs_state(&mut w);
+        run_ticks(&mut w, &mut sched, &events, anchor_tick, shift_tick);
+        // Daemon-Loop-Schichtwechsel ausserhalb des ECS-Schedule:
+        assert!(despawn_agent_from_world(&mut w, AgentId(4)));
+        spawn_agent(&mut w, AgentId(5), "A-05", "Dev", 2, "empfang");
+        run_ticks(&mut w, &mut sched, &events, shift_tick, target_tick);
+        let live = snapshot_ecs_state(&mut w);
+        let live_h = state_hashes(&mut w);
+
+        // Replay: frische World bis anchor -> restore(anchor) -> run_bounded_replay (nur Schedule).
+        let (mut w2, mut sched2) = world_with_agents(4);
+        run_ticks(&mut w2, &mut sched2, &events, 0, anchor_tick);
+        restore_ecs_state(&mut w2, &anchor);
+        run_bounded_replay(&mut w2, &mut sched2, &events, anchor_tick, target_tick)
+            .expect("replay");
+        let replayed = snapshot_ecs_state(&mut w2);
+        let replay_h = state_hashes(&mut w2);
+
+        let live_ids: Vec<u16> = live.identities.iter().map(|(id, _)| *id).collect();
+        let rep_ids: Vec<u16> = replayed.identities.iter().map(|(id, _)| *id).collect();
+        println!("[R1] live ids={live_ids:?} replay ids={rep_ids:?}");
+        println!(
+            "[R1] STRICT live={} replay={}",
+            live_h.strict, replay_h.strict
+        );
+        println!("[R1] CORE   live={} replay={}", live_h.core, replay_h.core);
+
+        // R1 belegt: Replay reproduziert den Schichtwechsel nicht -> Divergenz, und sie ist CORE
+        // (Agent-Menge), nicht blosse STRICT/Perception-Differenz.
+        assert_ne!(
+            live_h.strict, replay_h.strict,
+            "R1: Replay reproduziert den Schichtwechsel nicht (STRICT divergiert)"
+        );
+        assert_ne!(
+            live_h.core, replay_h.core,
+            "R1: Divergenz ist CORE-Ebene (aktive Agent-Menge), nicht nur STRICT"
+        );
+        assert_ne!(
+            live_ids, rep_ids,
+            "Diff lokalisiert auf die aktive Agent-Menge"
         );
     }
 
