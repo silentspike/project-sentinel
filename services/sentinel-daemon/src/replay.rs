@@ -568,6 +568,12 @@ mod tests {
         // `run_bounded_replay` faehrt nur das Schedule (replay.rs:398) -> der Schichtwechsel wird im
         // Replay NICHT reproduziert -> live@target != restore(anchor)+replay. Der Diff liegt in der
         // aktiven Agent-Menge (identities/...), also CORE-Ebene (nicht nur STRICT/Perception).
+        //
+        // Diese Invariante ist DAUERHAFT (die Replay-Engine kann einen Schichtwechsel strukturell
+        // nicht reproduzieren) und ist die Begruendung fuer den #529-Fix: statt den Replay zu
+        // erweitern, erzwingt der Daemon nach jedem Schichtwechsel einen Anker-Snapshot
+        // (`SnapshotManager::mark_shift_snapshot_pending`), sodass ein solches Cross-Shift-Fenster nie
+        // entsteht — das Replay laeuft immer nur INNERHALB einer Schicht (dort byte-exakt, #491).
         let anchor_tick = 20u64;
         let shift_tick = 40u64;
         let target_tick = 60u64;

@@ -67,19 +67,33 @@ the schedule — is the same regardless of those details.)
 trajectory matched ground truth byte-for-byte until exactly the nightrun tick (2785860→2785861), then
 diverged — consistent with R1+R2.
 
-## Implication for Phase 2 (decided by this gate)
-The fix must make the replay reproduce the shift/nightrun transition deterministically at its
-**recorded** tick:
-1. During replay, fire the shift transition (despawn/respawn for the new shift) at the tick of the
-   recorded `shift_transition_completed` event — i.e., the replay path must include the daemon-loop
-   shift orchestration, driven by the event log, not by `detect_current_shift()` (which would read
-   replay-time wall-clock). (Branch H5 + the structural R1 extension.)
-2. Gate any async re-trigger during replay (no re-queue of the evolution background task), analogous to
-   the `source == "autonomy"` suppression (`replay.rs:79`) and the store removals in the RAII guard.
-3. The recordable "input" is the **shift transition (trigger tick + new shift set)**, already present in
-   the event log — not a new evolution-content field. Confirm during implementation whether the
-   despawn/respawn alone closes the gap or whether consolidation side-effects also need recording
-   (re-measure with the harness after wiring the shift into the replay path).
+## Decision (Phase 2): Snapshot-on-Shift-Transition — bypass R1, don't rebuild the shift in replay
 
-Replay cap unaffected: a window straddling one shift boundary needs ≤ the hourly anchor distance
-(≤ 3600 ticks) < `REPLAY_TICK_CAP` (14 400, `orchestrator.rs:2975`).
+Rather than teaching the replay loop to reproduce the shift transition (surgery on the #491 core
+restore path, with regression risk), **force an anchor snapshot immediately after every shift
+transition** (post-shift state, same tick). Then:
+- For any target ≥ the shift tick, the nearest anchor ≤ target is the **post-shift** snapshot, so the
+  replay window `(anchor, target]` is **always within a single shift** → #491's engine is already
+  byte-exact there (it proved exactly that). R1 is **bypassed** (the replay never crosses a shift);
+  R2 (wall-clock trigger tick) is **moot** (the anchor carries the post-shift state directly).
+- This satisfies the TOGAF mechanism *"nearest anchor ≤ target + bounded replay (anchor, target]"*
+  literally, by guaranteeing the window stays in scope. Additive, couples to #250 Tiered Retention.
+
+Implemented (this PR):
+- `SnapshotManager::mark_shift_snapshot_pending()` + `shift_snapshot_pending` flag; `should_create_snapshot`
+  returns `true` while pending (interval logic otherwise unchanged); `create_and_store` clears it.
+  (`services/sentinel-daemon/src/snapshot.rs`)
+- The daemon tick loop calls `mark_shift_snapshot_pending()` right after a completed shift transition
+  (despawn + respawn), so the periodic snapshot block later in the same tick captures the post-shift
+  state. (`orchestrator.rs`, end of the shift block ~5185)
+- `select_anchor_snapshot`: `tick < target_tick` → `tick <= target_tick` so a snapshot exactly at the
+  target tick (the forced post-shift anchor for `target == shift_tick`) yields an empty replay window =
+  exact post-shift state. The #528 guard (a snapshot with `tick > target` is rejected) is preserved.
+
+Why R1 (replay can't reproduce a shift) makes this the clean answer rather than "rebuild it": the shift
+is orchestrated outside the ECS schedule, so the correct contract is "never replay across it", enforced
+structurally by the anchor placement. The R1 measurement above is kept as the permanent invariant test
+that justifies the policy.
+
+Replay cap unaffected: a within-shift window needs ≤ the hourly anchor distance (≤ 3600 ticks) <
+`REPLAY_TICK_CAP` (14 400, `orchestrator.rs:2975`).
