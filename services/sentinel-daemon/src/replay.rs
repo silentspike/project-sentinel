@@ -362,6 +362,15 @@ fn replay_loop(
         .get_resource::<SimulationTime>()
         .map(|t| t.sim_hour)
         .unwrap_or(0.0);
+    // #530: den vom Anchor wiederhergestellten delta_seconds REPRODUZIEREN (restore_ecs_state setzt ihn
+    // aus EcsSnapshot.sim_delta_seconds, world.rs:1733) statt hardcoded 1.0. Der Live-Tick-Loop nutzt
+    // delta = tick_rate * time_scale (orchestrator.rs:4117); bei time_scale != 1.0 wuerde ein
+    // 1.0-Schritt sim_hour/sim_delta_seconds (beide gehasht) und die delta-abhaengige Bio-Integration
+    // divergieren lassen. Bei time_scale == 1.0 ist anchor_delta == 1.0 -> unveraendert.
+    let anchor_delta = world
+        .get_resource::<SimulationTime>()
+        .map(|t| t.delta_seconds)
+        .unwrap_or(1.0);
 
     for tick in (anchor_tick + 1)..=target_tick {
         // Eingaben dieses Ticks einspeisen.
@@ -378,14 +387,14 @@ fn replay_loop(
                 }
             }
         }
-        // SimulationTime (delta = 1.0, wie der Live-Tick-Loop bei tick_rate*time_scale; Replay nutzt
-        // den deterministischen 1.0-Schritt — Inputs sind tick-gepinnt, nicht wandzeitabhaengig).
+        // SimulationTime: Inputs sind tick-gepinnt; der Zeit-Schritt wird mit dem Anchor-delta
+        // reproduziert (= Live-delta bei konstantem time_scale), nicht hardcoded 1.0 (#530).
         {
             let mut time = world.resource_mut::<SimulationTime>();
             time.tick = Tick(tick);
             time.tick_count = tick;
-            time.delta_seconds = 1.0;
-            sim_hour = (sim_hour + 1.0 / 3600.0) % 24.0;
+            time.delta_seconds = anchor_delta;
+            sim_hour = (sim_hour + anchor_delta / 3600.0) % 24.0;
             time.sim_hour = sim_hour;
         }
         // PSI-Band setzen (deklarierter Input).
@@ -507,6 +516,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replay_reproduces_anchor_delta_at_nonunit_time_scale() {
+        // #530: bei time_scale != 1.0 (hier delta_seconds=2.0) muss restore(anchor)+replay den
+        // Live-Zustand byte-exakt reproduzieren. Der Replay nutzt den Anchor-delta (aus dem Snapshot,
+        // via restore gesetzt), nicht hardcoded 1.0. OHNE den Fix divergieren sim_hour +
+        // sim_delta_seconds (beide gehasht) + die delta-abhaengige Bio-Integration -> dieser Test
+        // wuerde failen.
+        let anchor_tick = 20u64;
+        let target_tick = 60u64;
+        let events: Vec<DomainEvent> = vec![
+            action_event(25, 2, "Chat", "empfang"),
+            action_event(40, 3, "Move", "flur-eg"),
+        ];
+
+        // Live-Lauf bei delta=2.0 (time_scale=2.0).
+        let (mut w, mut sched) = world_with_agents(4);
+        w.resource_mut::<SimulationTime>().delta_seconds = 2.0;
+        run_ticks(&mut w, &mut sched, &events, 0, anchor_tick);
+        let anchor = snapshot_ecs_state(&mut w);
+        assert_eq!(
+            anchor.sim_delta_seconds, 2.0,
+            "Anchor-Snapshot traegt den delta_seconds"
+        );
+        run_ticks(&mut w, &mut sched, &events, anchor_tick, target_tick);
+        let live = state_hashes(&mut w);
+
+        // Restore (setzt delta_seconds=2.0 aus dem Snapshot) + Replay -> muss live reproduzieren.
+        let (mut w2, mut sched2) = world_with_agents(4);
+        w2.resource_mut::<SimulationTime>().delta_seconds = 2.0;
+        run_ticks(&mut w2, &mut sched2, &events, 0, anchor_tick);
+        restore_ecs_state(&mut w2, &anchor);
+        run_bounded_replay(&mut w2, &mut sched2, &events, anchor_tick, target_tick)
+            .expect("replay");
+        let replayed = state_hashes(&mut w2);
+
+        assert_eq!(
+            live.strict, replayed.strict,
+            "STRICT exakt bei delta=2.0 (Anchor-delta reproduziert)"
+        );
+        assert_eq!(
+            live.core, replayed.core,
+            "CORE exakt bei delta=2.0 (Anchor-delta reproduziert)"
+        );
+    }
+
     // Hilfs-Tick-Loop fuer den Test (spiegelt run_bounded_replay ohne Resource-Gating, da die
     // Test-World ohnehin keine Limbo/Zenoh/Redb-Resources haelt).
     fn run_ticks(
@@ -544,8 +598,10 @@ mod tests {
                 let mut time = world.resource_mut::<SimulationTime>();
                 time.tick = Tick(tick);
                 time.tick_count = tick;
-                time.delta_seconds = 1.0;
-                sim_hour = (sim_hour + 1.0 / 3600.0) % 24.0;
+                // #530: den in der World gesetzten delta verwenden (Default 1.0; Test kann time_scale
+                // simulieren) — spiegelt den echten Live-Loop, der delta aus der Config nimmt.
+                let d = time.delta_seconds;
+                sim_hour = (sim_hour + d / 3600.0) % 24.0;
                 time.sim_hour = sim_hour;
             }
             {
