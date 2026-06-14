@@ -31,6 +31,13 @@ pub struct SnapshotManager {
     /// Aktiver Prune-Cutoff: wenn > 0, loescht prune_tick() 1 Batch pro Tick.
     prune_cutoff: i64,
     prune_total: u64,
+    /// #529: nach einem Schichtwechsel wird genau am Shift-Tick ein Anker erzwungen, damit jeder
+    /// Restore auf ein Ziel >= Shift-Tick den Post-Shift-Anker waehlt und das Replay-Fenster
+    /// `(anker, ziel]` nie ueber eine Schichtgrenze laeuft (#491-Engine ist nur innerhalb einer
+    /// Schicht byte-exakt — der Schichtwechsel selbst ist Daemon-Loop-Orchestrierung, nicht im
+    /// ECS-Schedule, vgl. docs/spikes/SPIKE-529-cross-nightrun.md). Wird beim naechsten Snapshot
+    /// wieder geloescht.
+    shift_snapshot_pending: bool,
 }
 
 impl SnapshotManager {
@@ -40,7 +47,16 @@ impl SnapshotManager {
             last_snapshot_tick: 0,
             prune_cutoff: 0,
             prune_total: 0,
+            shift_snapshot_pending: false,
         }
+    }
+
+    /// #529: markiert, dass am aktuellen (Shift-)Tick ein Anker-Snapshot erzwungen werden soll.
+    /// Aufgerufen vom Tick-Loop direkt nach Abschluss eines Schichtwechsels (Despawn + Respawn),
+    /// sodass der naechste `should_create_snapshot` im selben Tick true liefert und den
+    /// Post-Shift-Zustand erfasst.
+    pub fn mark_shift_snapshot_pending(&mut self) {
+        self.shift_snapshot_pending = true;
     }
 
     /// Loescht einen kleinen Batch alle 10 Ticks. Aufgerufen aus dem Tick-Loop.
@@ -94,6 +110,11 @@ impl SnapshotManager {
     pub fn should_create_snapshot(&self, tick: u64) -> bool {
         if tick == 0 {
             return false;
+        }
+        // #529: Schichtwechsel-Anker hat Vorrang vor dem Intervall (erzwingt den Post-Shift-Anker,
+        // damit kein Replay-Fenster eine Schichtgrenze kreuzt).
+        if self.shift_snapshot_pending {
+            return true;
         }
         let interval = if tick < self.config.hourly_interval_ticks
             && self.config.first_hour_interval_ticks > 0
@@ -174,6 +195,8 @@ impl SnapshotManager {
         )?;
 
         self.last_snapshot_tick = tick;
+        // #529: erzwungener Shift-Anker erledigt — Flag zuruecksetzen (Intervall ab hier ab tick).
+        self.shift_snapshot_pending = false;
 
         let duration_ms = start.elapsed().as_millis();
         info!(
@@ -395,6 +418,32 @@ mod tests {
         assert!(
             mgr.should_create_snapshot(7200),
             "hourly-Anchor (3600 seit last) ausserhalb 1. Stunde"
+        );
+    }
+
+    #[test]
+    fn shift_pending_forces_snapshot_regardless_of_interval() {
+        // #529: Ein Schichtwechsel erzwingt einen Anker am Shift-Tick, unabhaengig vom Intervall —
+        // damit das Replay-Fenster jedes Post-Shift-Ziels innerhalb einer Schicht bleibt.
+        let cfg = RetentionConfig {
+            hourly_interval_ticks: 3600,
+            first_hour_interval_ticks: 300,
+            ..RetentionConfig::default()
+        };
+        let mut mgr = SnapshotManager::new(cfg);
+        mgr.last_snapshot_tick = 10_000; // gerade gesnapshottet -> Intervall NICHT faellig
+        assert!(
+            !mgr.should_create_snapshot(10_050),
+            "ohne Shift: Intervall nicht faellig"
+        );
+        mgr.mark_shift_snapshot_pending();
+        assert!(
+            mgr.should_create_snapshot(10_050),
+            "Schichtwechsel erzwingt Snapshot trotz frischem Intervall"
+        );
+        assert!(
+            !mgr.should_create_snapshot(0),
+            "tick 0 nie ein Snapshot, auch mit pending"
         );
     }
 
