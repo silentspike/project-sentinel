@@ -628,6 +628,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn within_shift_replay_from_post_shift_anchor_is_exact() {
+        // #529 AC-3 (in-process, #491-Methodik Ground-Truth vs Restore-Forward): Mit Snapshot-on-Shift
+        // liegt der Anker am Shift-Tick = POST-Shift, also INNERHALB der neuen Schicht. Ground-Truth
+        // (live durch den Shift) vs. restore(post-shift-anchor) + replay(anchor, target] -> byte-exakt
+        // (STRICT+CORE), 0 Mismatches. Gegenstueck zu ...r1 (dort kreuzt das Fenster den Shift und
+        // divergiert; hier liegt der Anker post-shift -> Fenster in der Schicht -> exakt).
+        let shift_tick = 30u64;
+        let target_tick = 60u64;
+        let events: Vec<DomainEvent> = vec![
+            action_event(40, 2, "Chat", "empfang"),
+            action_event(55, 1, "Move", "kueche"),
+        ];
+
+        // Ground-Truth: bis shift_tick -> SHIFT (despawn 4, spawn 5) -> Post-Shift-Anker -> bis target.
+        let (mut w, mut sched) = world_with_agents(4);
+        run_ticks(&mut w, &mut sched, &events, 0, shift_tick);
+        assert!(despawn_agent_from_world(&mut w, AgentId(4)));
+        spawn_agent(&mut w, AgentId(5), "A-05", "Dev", 2, "empfang");
+        let post_shift_anchor = snapshot_ecs_state(&mut w); // = Snapshot-on-Shift @ shift_tick
+        run_ticks(&mut w, &mut sched, &events, shift_tick, target_tick);
+        let live = state_hashes(&mut w);
+
+        // Restore vom Post-Shift-Anker + Replay (innerhalb der Schicht, kein Cross-Shift).
+        let (mut w2, mut sched2) = world_with_agents(4);
+        run_ticks(&mut w2, &mut sched2, &events, 0, shift_tick);
+        restore_ecs_state(&mut w2, &post_shift_anchor);
+        run_bounded_replay(&mut w2, &mut sched2, &events, shift_tick, target_tick).expect("replay");
+        let replayed = state_hashes(&mut w2);
+
+        assert_eq!(
+            live.strict, replayed.strict,
+            "STRICT: within-shift Replay vom Post-Shift-Anker exakt (0 Mismatches)"
+        );
+        assert_eq!(
+            live.core, replayed.core,
+            "CORE: within-shift Replay vom Post-Shift-Anker exakt (0 Mismatches)"
+        );
+    }
+
     // Hilfs-Tick-Loop fuer den Test (spiegelt run_bounded_replay ohne Resource-Gating, da die
     // Test-World ohnehin keine Limbo/Zenoh/Redb-Resources haelt).
     fn run_ticks(
