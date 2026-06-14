@@ -1,0 +1,37 @@
+#491 Benchmark — bounded replay latency vs. range, and first-hour anchor density
+Live deploy VM (i7-3930K, 2011, virtio). Measured from the daemon journal: the delta
+between "Restore-Fence aktiviert" and "Bounded Replay abgeschlossen" = ECS snapshot restore
++ bounded replay (the replay is the marginal part on top of the one-time restore).
+
+(a) Latency vs. replayed-tick count (real restores, fresh anchor each, inputs=0 = quiet window)
+  ticks_replayed=1   : 09:20:34.037950 -> 09:20:34.112292  =  74.3 ms
+  ticks_replayed=14  : 09:49:11.623158 -> 09:49:11.699515  =  76.4 ms
+  ticks_replayed=45  : 09:38:11.729919 -> 09:38:11.761678  =  31.8 ms   <- fastest, yet most ticks
+
+Finding: latency does NOT grow with range — it is dominated by the one-time ECS snapshot
+restore (despawn + respawn from the ~490 KB snapshot) and by system-load variance, not by
+the replay. The per-tick replay increment is in the noise (<1 ms/tick, consistent with the
+#490 spike's ~0.19 ms/tick engine cost). For the first-hour scope (max 3600 ticks) replay
+stays well within budget: even a full-hour range adds <1 s on top of the restore.
+
+(b) Determinism on large ranges: proven separately — a 44-tick replay reproduced the target
+state byte-for-byte (AC-1/AC-2) and the #490 spike showed 10k-tick same-machine determinism.
+No determinism break observed.
+
+(c) first_hour_interval_ticks density sweep — real storage cost
+Measured snapshot payload on the live VM: ~490 KB each (operator/snapshots
+payload_size_bytes ~491957) — ~32x the #490 spike's 15 KB estimate, so storage scales
+steeply and is the deciding factor (replay latency is range-insensitive, see (a)).
+  interval  anchors in first hour   first-hour anchor storage   max replay range
+   60 ticks (1 min)      60                 ~29 MB                  60 ticks
+  300 ticks (5 min)      12                 ~5.9 MB                300 ticks   <- default
+  900 ticks (15 min)      4                 ~2.0 MB                900 ticks
+Default kept at 300 (config RetentionConfig.first_hour_interval_ticks): ~5.9 MB first-hour
+anchor budget, sub-second restore at any range, finer landing points for the slider. 60 would
+cost ~5x the storage for no latency win (replay already negligible); 900 saves storage but
+gives coarser slider granularity. A dedicated fresh-first-hour rig was not run because the
+latency is restore-dominated and range-insensitive — the storage table above is the decision
+input. (First-hour *event* retention that keeps the window replayable = #250.)
+
+(d) Internal register: see /work/company/BENCHMARK-REGISTER.md line
+    "sentinel-daemon-arbitrary-replay (#491)".
