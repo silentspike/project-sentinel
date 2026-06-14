@@ -1,0 +1,40 @@
+#529 — LIVE evidence: snapshot-on-shift fires on a real daemon at every shift tick
+
+Setup: an isolated ad-hoc sentinel-daemon (own DB/port :18084, time_scale=600 to force
+shifts in seconds, gateway/judge off = 0 tokens) built from the rebased #529 branch (which
+includes #530's anchor-delta fix). At time_scale=600 the shift trigger is
+detect_shift_from_sim_hour (deterministic), so shifts fire every ~60 ticks.
+
+Observed (daemon log, ANSI-stripped): every "Schichtwechsel abgeschlossen" is immediately
+followed by "World Snapshot erstellt" at the SAME tick — i.e. the #529
+`SnapshotManager::mark_shift_snapshot_pending()` hook fires the post-shift anchor at the shift
+tick, in the real orchestrator tick loop:
+
+2026-06-14T16:17:36.751940Z  INFO sentinel_daemon::orchestrator: Schichtwechsel erkannt old=2 new=3
+2026-06-14T16:17:36.753000Z  INFO sentinel_daemon::orchestrator: Schichtwechsel abgeschlossen removed=0 spawned=0 active=0
+2026-06-14T16:17:36.753423Z  INFO sentinel_daemon::snapshot: World Snapshot erstellt snapshot_id=019ec6ec-9ff1-7660-ae48-ffbaf6207e1d tick=120 sim_hour=4.166651725769043 size_kb=0 duration_ms=0
+2026-06-14T16:18:35.999328Z  INFO sentinel_daemon::orchestrator: Schichtwechsel erkannt old=3 new=2
+2026-06-14T16:18:36.000198Z  INFO sentinel_daemon::orchestrator: Schichtwechsel abgeschlossen removed=0 spawned=0 active=0
+2026-06-14T16:18:36.000504Z  INFO sentinel_daemon::snapshot: World Snapshot erstellt snapshot_id=019ec6ed-8760-7993-8c27-d53079f5bc70 tick=180 sim_hour=14.166659355163574 size_kb=0 duration_ms=0
+2026-06-14T16:19:35.897237Z  INFO sentinel_daemon::orchestrator: Schichtwechsel erkannt old=2 new=3
+2026-06-14T16:19:35.897887Z  INFO sentinel_daemon::orchestrator: Schichtwechsel abgeschlossen removed=0 spawned=0 active=0
+2026-06-14T16:19:35.898107Z  INFO sentinel_daemon::snapshot: World Snapshot erstellt snapshot_id=019ec6ee-715a-74d2-8f13-acc4363bd3fe tick=240 sim_hour=0.16663169860839844 size_kb=0 duration_ms=0
+2026-06-14T16:20:35.932528Z  INFO sentinel_daemon::orchestrator: Schichtwechsel erkannt old=3 new=1
+2026-06-14T16:20:35.933471Z  INFO sentinel_daemon::orchestrator: Schichtwechsel abgeschlossen removed=0 spawned=0 active=0
+2026-06-14T16:20:35.933768Z  INFO sentinel_daemon::snapshot: World Snapshot erstellt snapshot_id=019ec6ef-5bdd-70e0-8b7f-863502ced0ec tick=300 sim_hour=10.166632652282715 size_kb=0 duration_ms=0
+
+operator/snapshots confirmed entries at exactly the shift ticks (120, 180, 240, 300).
+
+NOTE on scope of this live run: the ad-hoc test agents did not load (active=0; the agent
+configs failed validation against the company roster), so the world was empty — but the
+snapshot-on-shift HOOK firing is independent of agent count and is what this run confirms
+live. The cross-shift restore EXACTNESS (byte-exact STRICT+CORE from the post-shift anchor)
+is proven deterministically by the in-process integration test
+`replay::tests::within_shift_replay_from_post_shift_anchor_is_exact` (and the anchor-selection
+unit tests). A full live cross-shift restore with a non-trivial agent population was NOT run
+on the deploy VM: a second full daemon there is unsafe — the #279 periodic runtime-reconcile
+scans the system cgroup tree and treats the *production* daemon's agent cgroups as orphans
+(they are not in the ad-hoc roster), attempting to kill them (the attempts failed — no
+permission — and production stayed healthy, tick advancing). That live confirmation with real
+agents belongs to the main-session production step (real agents + a real wall-clock shift
+boundary, non-disruptive).

@@ -2995,9 +2995,14 @@ fn select_anchor_snapshot(
     target_tick: u64,
     target_event_id: i64,
 ) -> Option<&sentinel_common::SnapshotMeta> {
+    // tick <= target_tick: ein Snapshot GENAU am Ziel-Tick ergibt ein leeres Replay-Fenster
+    // `(target, target]` = exakter Ziel-Zustand (#529: der erzwungene Post-Shift-Anker am Shift-Tick
+    // bedient damit auch ein Ziel == Shift-Tick, ohne ueber die Schichtgrenze zu replayen). Ein
+    // Snapshot mit tick > target bleibt ausgeschlossen (#528-Bug: leeres Replay -> Anchor-Zustand
+    // statt Ziel, in Ruhephasen mit geteilter last_event_id).
     snapshots
         .iter()
-        .find(|s| s.tick < target_tick && s.last_event_id <= target_event_id)
+        .find(|s| s.tick <= target_tick && s.last_event_id <= target_event_id)
 }
 
 /// #491: aufgeloestes Restore-Ziel (Anchor + optionaler Replay-Cursor).
@@ -5183,6 +5188,11 @@ fn ecs_tick_loop(
                 );
 
                 current_shift = new_shift;
+                // #529: Post-Shift-Anker erzwingen. Der periodische Snapshot-Block weiter unten
+                // (im selben Tick, nach Despawn+Respawn) erfasst dann den Post-Shift-Zustand, sodass
+                // jeder Restore auf ein Ziel >= diesem Shift-Tick den Post-Shift-Anker waehlt und das
+                // Replay-Fenster nie ueber die Schichtgrenze laeuft (vgl. SPIKE-529).
+                snapshot_manager.mark_shift_snapshot_pending();
             }
         }
 
@@ -6148,9 +6158,9 @@ mod tests {
 
     #[test]
     fn select_anchor_requires_tick_strictly_before_target() {
-        // #491 VM-Befund: in Ruhephasen teilen sich Snapshots dieselbe last_event_id. Der Anchor
-        // MUSS tick < target_tick haben, sonst leeres Replay -> Anchor-Zustand statt Ziel.
-        // Liste ist tick DESC.
+        // #491 VM-Befund: in Ruhephasen teilen sich Snapshots dieselbe last_event_id. Ein Anchor
+        // mit tick > target_tick ist verboten (sonst leeres/negatives Replay -> Anchor-Zustand statt
+        // Ziel). tick == target_tick ist erlaubt (#529, eigener Test). Liste ist tick DESC.
         let snapshots = vec![
             snap_meta("newer", 2_540_056, 12_034_085), // gleiche le wie Ziel, aber tick NACH Ziel
             snap_meta("valid", 2_539_906, 12_034_085), // tick VOR Ziel -> korrekter Anchor
@@ -6169,6 +6179,43 @@ mod tests {
         // Direkt nach 'older': dessen le<=Ziel und tick<Ziel.
         let a2 = select_anchor_snapshot(&snapshots, 2_537_000, 12_031_000).expect("anchor");
         assert_eq!(a2.id, "older");
+    }
+
+    #[test]
+    fn select_anchor_accepts_snapshot_exactly_at_target_tick() {
+        // #529: ein Snapshot GENAU am Ziel-Tick (z.B. der erzwungene Post-Shift-Anker) ist ein
+        // gueltiger Anchor -> leeres Replay-Fenster = exakter Ziel-Zustand, kein Replay ueber die
+        // Schichtgrenze. (Bug #528 bleibt gefixt: tick > Ziel ist weiter ausgeschlossen.)
+        let snapshots = vec![
+            snap_meta("at_target", 2_540_040, 12_034_085), // tick == Ziel
+            snap_meta("pre_shift", 2_539_900, 12_033_000), // vor dem Shift
+        ];
+        let anchor = select_anchor_snapshot(&snapshots, 2_540_040, 12_034_085).expect("anchor");
+        assert_eq!(
+            anchor.id, "at_target",
+            "Snapshot am Ziel-Tick muss als Anchor gewaehlt werden (leeres Replay = exakt)"
+        );
+    }
+
+    #[test]
+    fn select_anchor_picks_post_shift_anchor_for_post_shift_target() {
+        // #529-Kern: nach einem Schichtwechsel existiert ein erzwungener Post-Shift-Anker am
+        // Shift-Tick. Fuer JEDES Ziel >= Shift-Tick waehlt select_anchor diesen (nicht den
+        // Pre-Shift-Anker) -> das Fenster (anker, ziel] liegt innerhalb der neuen Schicht, kreuzt die
+        // Schichtgrenze NIE. (DESC-Liste, find() nimmt den naechstgelegenen <= Ziel.)
+        let snapshots = vec![
+            snap_meta("post_shift", 2_540_000, 12_034_000), // erzwungener Anker am Shift-Tick
+            snap_meta("pre_shift", 2_536_400, 12_030_000),  // letzter Pre-Shift-Intervall-Anker
+        ];
+        // Ziel mitten in der neuen Schicht.
+        let a = select_anchor_snapshot(&snapshots, 2_540_500, 12_034_400).expect("anchor");
+        assert_eq!(
+            a.id, "post_shift",
+            "Post-Shift-Ziel muss den Post-Shift-Anker waehlen -> kein Cross-Shift-Replay"
+        );
+        // Ziel exakt am Shift-Tick -> ebenfalls Post-Shift-Anker (leeres Replay).
+        let a0 = select_anchor_snapshot(&snapshots, 2_540_000, 12_034_000).expect("anchor");
+        assert_eq!(a0.id, "post_shift");
     }
 
     #[test]

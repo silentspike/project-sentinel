@@ -420,7 +420,8 @@ mod tests {
     use super::*;
     use sentinel_ecs::hash::state_hashes;
     use sentinel_ecs::{
-        create_simulation_world, restore_ecs_state, snapshot_ecs_state, spawn_agent,
+        create_simulation_world, despawn_agent_from_world, restore_ecs_state, snapshot_ecs_state,
+        spawn_agent,
     };
 
     fn world_with_agents(n: u16) -> (World, Schedule) {
@@ -550,7 +551,6 @@ mod tests {
         run_bounded_replay(&mut w2, &mut sched2, &events, anchor_tick, target_tick)
             .expect("replay");
         let replayed = state_hashes(&mut w2);
-
         assert_eq!(
             live.strict, replayed.strict,
             "STRICT exakt bei delta=2.0 (Anchor-delta reproduziert)"
@@ -558,6 +558,113 @@ mod tests {
         assert_eq!(
             live.core, replayed.core,
             "CORE exakt bei delta=2.0 (Anchor-delta reproduziert)"
+        );
+    }
+
+    #[test]
+    fn replay_does_not_reproduce_shift_transition_r1() {
+        // #529 AC-1 Messung (R1): Ein Schichtwechsel = Despawn alter + Spawn neuer Agents wird vom
+        // DAEMON-Loop ausgefuehrt (runtime_orch.shift_transition, orch:4731), NICHT vom ECS-Schedule.
+        // `run_bounded_replay` faehrt nur das Schedule (replay.rs:398) -> der Schichtwechsel wird im
+        // Replay NICHT reproduziert -> live@target != restore(anchor)+replay. Der Diff liegt in der
+        // aktiven Agent-Menge (identities/...), also CORE-Ebene (nicht nur STRICT/Perception).
+        //
+        // Diese Invariante ist DAUERHAFT (die Replay-Engine kann einen Schichtwechsel strukturell
+        // nicht reproduzieren) und ist die Begruendung fuer den #529-Fix: statt den Replay zu
+        // erweitern, erzwingt der Daemon nach jedem Schichtwechsel einen Anker-Snapshot
+        // (`SnapshotManager::mark_shift_snapshot_pending`), sodass ein solches Cross-Shift-Fenster nie
+        // entsteht — das Replay laeuft immer nur INNERHALB einer Schicht (dort byte-exakt, #491).
+        let anchor_tick = 20u64;
+        let shift_tick = 40u64;
+        let target_tick = 60u64;
+        let events: Vec<DomainEvent> = vec![
+            action_event(25, 2, "Chat", "empfang"),
+            action_event(55, 1, "Chat", "kueche"),
+        ];
+
+        // Live: bis anchor -> snapshot -> bis shift_tick -> SCHICHTWECHSEL -> bis target.
+        let (mut w, mut sched) = world_with_agents(4);
+        run_ticks(&mut w, &mut sched, &events, 0, anchor_tick);
+        let anchor = snapshot_ecs_state(&mut w);
+        run_ticks(&mut w, &mut sched, &events, anchor_tick, shift_tick);
+        // Daemon-Loop-Schichtwechsel ausserhalb des ECS-Schedule:
+        assert!(despawn_agent_from_world(&mut w, AgentId(4)));
+        spawn_agent(&mut w, AgentId(5), "A-05", "Dev", 2, "empfang");
+        run_ticks(&mut w, &mut sched, &events, shift_tick, target_tick);
+        let live = snapshot_ecs_state(&mut w);
+        let live_h = state_hashes(&mut w);
+
+        // Replay: frische World bis anchor -> restore(anchor) -> run_bounded_replay (nur Schedule).
+        let (mut w2, mut sched2) = world_with_agents(4);
+        run_ticks(&mut w2, &mut sched2, &events, 0, anchor_tick);
+        restore_ecs_state(&mut w2, &anchor);
+        run_bounded_replay(&mut w2, &mut sched2, &events, anchor_tick, target_tick)
+            .expect("replay");
+        let replayed = snapshot_ecs_state(&mut w2);
+        let replay_h = state_hashes(&mut w2);
+
+        let live_ids: Vec<u16> = live.identities.iter().map(|(id, _)| *id).collect();
+        let rep_ids: Vec<u16> = replayed.identities.iter().map(|(id, _)| *id).collect();
+        println!("[R1] live ids={live_ids:?} replay ids={rep_ids:?}");
+        println!(
+            "[R1] STRICT live={} replay={}",
+            live_h.strict, replay_h.strict
+        );
+        println!("[R1] CORE   live={} replay={}", live_h.core, replay_h.core);
+
+        // R1 belegt: Replay reproduziert den Schichtwechsel nicht -> Divergenz, und sie ist CORE
+        // (Agent-Menge), nicht blosse STRICT/Perception-Differenz.
+        assert_ne!(
+            live_h.strict, replay_h.strict,
+            "R1: Replay reproduziert den Schichtwechsel nicht (STRICT divergiert)"
+        );
+        assert_ne!(
+            live_h.core, replay_h.core,
+            "R1: Divergenz ist CORE-Ebene (aktive Agent-Menge), nicht nur STRICT"
+        );
+        assert_ne!(
+            live_ids, rep_ids,
+            "Diff lokalisiert auf die aktive Agent-Menge"
+        );
+    }
+
+    #[test]
+    fn within_shift_replay_from_post_shift_anchor_is_exact() {
+        // #529 AC-3 (in-process, #491-Methodik Ground-Truth vs Restore-Forward): Mit Snapshot-on-Shift
+        // liegt der Anker am Shift-Tick = POST-Shift, also INNERHALB der neuen Schicht. Ground-Truth
+        // (live durch den Shift) vs. restore(post-shift-anchor) + replay(anchor, target] -> byte-exakt
+        // (STRICT+CORE), 0 Mismatches. Gegenstueck zu ...r1 (dort kreuzt das Fenster den Shift und
+        // divergiert; hier liegt der Anker post-shift -> Fenster in der Schicht -> exakt).
+        let shift_tick = 30u64;
+        let target_tick = 60u64;
+        let events: Vec<DomainEvent> = vec![
+            action_event(40, 2, "Chat", "empfang"),
+            action_event(55, 1, "Move", "kueche"),
+        ];
+
+        // Ground-Truth: bis shift_tick -> SHIFT (despawn 4, spawn 5) -> Post-Shift-Anker -> bis target.
+        let (mut w, mut sched) = world_with_agents(4);
+        run_ticks(&mut w, &mut sched, &events, 0, shift_tick);
+        assert!(despawn_agent_from_world(&mut w, AgentId(4)));
+        spawn_agent(&mut w, AgentId(5), "A-05", "Dev", 2, "empfang");
+        let post_shift_anchor = snapshot_ecs_state(&mut w); // = Snapshot-on-Shift @ shift_tick
+        run_ticks(&mut w, &mut sched, &events, shift_tick, target_tick);
+        let live = state_hashes(&mut w);
+
+        // Restore vom Post-Shift-Anker + Replay (innerhalb der Schicht, kein Cross-Shift).
+        let (mut w2, mut sched2) = world_with_agents(4);
+        run_ticks(&mut w2, &mut sched2, &events, 0, shift_tick);
+        restore_ecs_state(&mut w2, &post_shift_anchor);
+        run_bounded_replay(&mut w2, &mut sched2, &events, shift_tick, target_tick).expect("replay");
+        let replayed = state_hashes(&mut w2);
+
+        assert_eq!(
+            live.strict, replayed.strict,
+            "STRICT: within-shift Replay vom Post-Shift-Anker exakt (0 Mismatches)"
+        );
+        assert_eq!(
+            live.core, replayed.core,
+            "CORE: within-shift Replay vom Post-Shift-Anker exakt (0 Mismatches)"
         );
     }
 
