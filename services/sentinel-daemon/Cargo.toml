@@ -62,3 +62,7 @@ tempfile = "3"
 [[bench]]
 name = "platform_controlplane_bench"
 harness = false
+
+[[bench]]
+name = "retention_bench"
+harness = false
