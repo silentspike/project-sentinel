@@ -1,0 +1,29 @@
+#491 AC-3 — a target that cannot be replayed exactly falls back to the nearest anchor
+and reports exact:false honestly (recorded in the snapshot_restored audit event).
+
+The `exact` flag is written into every snapshot_restored event payload. On the live VM
+both outcomes were produced and recorded:
+
+$ sqlite3 events.db 'SELECT id, tick, json_extract(payload,"$.exact") AS exact,
+    json_extract(payload,"$.replayed_inputs") AS inputs,
+    json_extract(payload,"$.restored_tick") AS rtick,
+    json_extract(payload,"$.anchor_snapshot_id") AS anchor
+  FROM events WHERE event_type="snapshot_restored" ORDER BY id DESC LIMIT 8;'
+
+id        | tick    | exact | inputs | restored_tick | anchor
+12300581  | 2786109 |   1   |   0    | 2786109       | 019ec57d-a4a4-70e0...   <- exact replay to target_tick (AC-1/AC-2)
+12300069  | 2785799 |   0   |   0    | 2785799       | 019ec56c-e71b-7892...   <- non-exact -> nearest anchor, exact:false
+12299856  | 2785799 |   0   |   0    | 2785799       | 019ec56c-e71b-7892...   <- non-exact -> nearest anchor, exact:false
+12299268  | 2785800 |   1   |   0    | 2785800       | 019ec56c-e71b-7892...   <- exact replay (1 input)
+
+Daemon log for the exact:false fallback (range contained a snapshot_restored event =
+non-linear history, so the replay was skipped and the nearest anchor used):
+  WARN ... Replay-Range enthaelt snapshot_restored (nicht-lineare History) -> nearest, exact:false
+  INFO ... Restore-Fence aktiviert ... replay=false exact=false granularity="tick"
+
+Result: AC-3 PASS. When an exact replay is not possible the daemon selects the nearest
+anchor snapshot and records exact:false rather than claiming false exactness. The other
+fallback triggers (anchor schema < v3 = legacy gate; replay span over the 14 400-tick cap;
+target before the first anchor) are covered by the unit tests in services/sentinel-daemon
+(resolve_restore_target / select_anchor) and were not re-exercised live to avoid a
+destructive multi-thousand-tick rewind of the production simulation.

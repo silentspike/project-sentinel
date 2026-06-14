@@ -1,0 +1,29 @@
+#491 — honest scope note: the nightrun / shift-transition boundary
+
+Observation during AC-1 verification: after a restore, the forward state-hash trajectory
+matched the ground truth byte-for-byte for every tick UP TO AND INCLUDING the target, and
+then continued to match for the live ticks afterwards — until tick 2785861, where it
+diverged. Tick 2785860 is a nightrun / shift-transition (event log at 2785860:
+nightrun_started + nightrun_completed + shift_transition_completed + 68 agent_spawned +
+34 agent_despawned + resource_profile_changed). There were NO psi_band_changed events in
+the window, so this is not a PSI effect.
+
+Diagnosis:
+- The divergence is between two LIVE executions of the same nightrun (the ground-truth run
+  and the post-restore live-forward run executed tick 2785860 at different wall-clock
+  moments). The nightrun runs an asynchronous evolution task whose result is applied when
+  it arrives (timing-dependent), so two live passes through a nightrun can diverge. This is
+  a pre-existing live-engine property, independent of #491.
+- It is NOT a defect in the bounded replay: the replay window of the verified restores did
+  not cross the nightrun, and every tick the replay actually covered reproduced the ground
+  truth exactly (AC-1/AC-2 PASS).
+
+Scope:
+- #491 is the Time-Machine slider for the FIRST simulation hour (3600 ticks @ 1 Hz).
+  Nightruns occur roughly once per simulation day (~86 400 ticks), so the first-hour window
+  that #491 targets is nightrun-free by construction — first-hour replay never crosses one.
+- reconstruct_inputs deliberately injects only external inputs (agent actions, operator
+  commands, PSI band) and lets the deterministic engine regenerate its own outputs
+  (spawns/despawns/shift transitions). For full-history (beyond first hour) replay to be
+  exact ACROSS a nightrun, the nightrun's asynchronous evolution step would have to be made
+  replay-deterministic. That is tracked as a follow-up, not part of #491's first-hour scope.
