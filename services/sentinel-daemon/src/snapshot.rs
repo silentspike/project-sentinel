@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use chrono::{DateTime, Datelike, Utc};
 use sentinel_common::{encode_world_snapshot, SnapshotMeta, SnapshotTier, WorldSnapshot};
 use sentinel_fs::layer::LayerManager;
 use sentinel_limbo::EventStore;
@@ -226,8 +227,7 @@ impl SnapshotManager {
             .unwrap_or_default()
             .as_millis() as i64;
 
-        let mut promoted = 0u32;
-        let mut deleted = 0u32;
+        let mut report = MaintenanceReport::default();
 
         // Promotion: hourly → daily (aelter als daily_keep_hours)
         let daily_cutoff_ms = now_ms - (self.config.daily_keep_hours as i64 * 3600 * 1000);
@@ -239,11 +239,11 @@ impl SnapshotManager {
                         .promote_world_snapshot(&snap.id, "daily")
                         .unwrap_or(false)
                     {
-                        promoted += 1;
+                        report.promoted += 1;
                         debug!(id = %snap.id, "Snapshot promoted: hourly → daily");
                     }
-                } else if event_store.delete_world_snapshot(&snap.id).unwrap_or(false) {
-                    deleted += 1;
+                } else {
+                    delete_redundant(event_store, snap, now_ms, &mut report)?;
                 }
             }
         }
@@ -258,11 +258,11 @@ impl SnapshotManager {
                         .promote_world_snapshot(&snap.id, "weekly")
                         .unwrap_or(false)
                     {
-                        promoted += 1;
+                        report.promoted += 1;
                         debug!(id = %snap.id, "Snapshot promoted: daily → weekly");
                     }
-                } else if event_store.delete_world_snapshot(&snap.id).unwrap_or(false) {
-                    deleted += 1;
+                } else {
+                    delete_redundant(event_store, snap, now_ms, &mut report)?;
                 }
             }
         }
@@ -280,17 +280,23 @@ impl SnapshotManager {
                         .promote_world_snapshot(&snap.id, "monthly")
                         .unwrap_or(false)
                     {
-                        promoted += 1;
+                        report.promoted += 1;
                         debug!(id = %snap.id, "Snapshot promoted: weekly → monthly");
                     }
-                } else if event_store.delete_world_snapshot(&snap.id).unwrap_or(false) {
-                    deleted += 1;
+                } else {
+                    delete_redundant(event_store, snap, now_ms, &mut report)?;
                 }
             }
         }
 
-        if promoted > 0 || deleted > 0 {
-            info!(promoted, deleted, "Snapshot Maintenance abgeschlossen");
+        if report.promoted > 0 || report.deleted > 0 || report.delete_blocked_young > 0 {
+            info!(
+                promoted = report.promoted,
+                deleted = report.deleted,
+                kept_protected = report.kept_protected,
+                delete_blocked_young = report.delete_blocked_young,
+                "Snapshot Maintenance abgeschlossen"
+            );
         }
 
         // Auto-Prune: Cutoff setzen, prune_tick() arbeitet 1 Batch/Tick ab
@@ -303,8 +309,20 @@ impl SnapshotManager {
             }
         }
 
-        Ok(MaintenanceReport { promoted, deleted })
+        Ok(report)
     }
+
+    // #250: Promotion-Dedup ist KALENDER-aligned (nicht Epoch-Modulo). Genau EIN Keeper pro
+    // Kalender-Periode (UTC). Die Bucket-Schluessel hier MUESSEN exakt zu den Verify-SQL-Ausdruecken
+    // passen, mit denen die ACs geprueft werden (SSOT — driften sie auseinander, entstehen
+    // Phantom-Duplikate im Test ODER im Live-Betrieb):
+    //   AC-2 Tag:   SELECT date(created_at/1000,'unixepoch'), count(*) ... GROUP BY 1
+    //   AC-3 Woche: SELECT date(created_at/1000,'unixepoch',
+    //                      '-'||((strftime('%w',created_at/1000,'unixepoch')+6)%7)||' days') ...  -- Montag der Woche
+    //   AC-3 Monat: SELECT strftime('%Y-%m',created_at/1000,'unixepoch'), count(*) ... GROUP BY 1
+    // 1970-01-01 war ein Donnerstag → die alte `% (7*86400_000)`-Woche brach Do/Mi statt Mo/So und
+    // `% (30*86400_000)` driftet gegen echte Kalendermonate; beides erzeugte Doppel-Keeper an den
+    // Periodengrenzen (Live `daily=13`/`weekly` zu hoch). Repro-Tests: siehe unten.
 
     fn has_snapshot_for_day(
         &self,
@@ -312,11 +330,10 @@ impl SnapshotManager {
         tier: SnapshotTier,
         timestamp_ms: i64,
     ) -> bool {
-        let day_start = timestamp_ms - (timestamp_ms % (86400 * 1000));
-        let day_end = day_start + 86400 * 1000;
+        let key = calendar_day_key(timestamp_ms);
         snapshots
             .iter()
-            .any(|s| s.tier == tier && s.created_at_ms >= day_start && s.created_at_ms < day_end)
+            .any(|s| s.tier == tier && calendar_day_key(s.created_at_ms) == key)
     }
 
     fn has_snapshot_for_week(
@@ -325,11 +342,10 @@ impl SnapshotManager {
         tier: SnapshotTier,
         timestamp_ms: i64,
     ) -> bool {
-        let week_start = timestamp_ms - (timestamp_ms % (7 * 86400 * 1000));
-        let week_end = week_start + 7 * 86400 * 1000;
+        let key = calendar_week_key(timestamp_ms);
         snapshots
             .iter()
-            .any(|s| s.tier == tier && s.created_at_ms >= week_start && s.created_at_ms < week_end)
+            .any(|s| s.tier == tier && calendar_week_key(s.created_at_ms) == key)
     }
 
     fn has_snapshot_for_month(
@@ -338,12 +354,86 @@ impl SnapshotManager {
         tier: SnapshotTier,
         timestamp_ms: i64,
     ) -> bool {
-        let month_start = timestamp_ms - (timestamp_ms % (30 * 86400 * 1000));
-        let month_end = month_start + 30 * 86400 * 1000;
-        snapshots.iter().any(|s| {
-            s.tier == tier && s.created_at_ms >= month_start && s.created_at_ms < month_end
-        })
+        let key = calendar_month_key(timestamp_ms);
+        snapshots
+            .iter()
+            .any(|s| s.tier == tier && calendar_month_key(s.created_at_ms) == key)
     }
+}
+
+/// Konvertiert Epoch-Millisekunden in eine UTC-`DateTime`. Out-of-range-Werte fallen auf die
+/// Epoch zurueck (deterministisch, kein Panic).
+fn utc_dt(created_at_ms: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(created_at_ms)
+        .unwrap_or_else(|| DateTime::from_timestamp(0, 0).expect("epoch is valid"))
+}
+
+/// Kalendertag-Bucket (UTC) — entspricht `date(created_at/1000,'unixepoch')`.
+fn calendar_day_key(created_at_ms: i64) -> i32 {
+    utc_dt(created_at_ms).date_naive().num_days_from_ce()
+}
+
+/// Kalenderwochen-Bucket (UTC, Montag-verankert) — entspricht dem Montag der Woche
+/// (`date(...,'-'||((strftime('%w',...)+6)%7)||' days')`). Schluessel = Tagesnummer dieses Montags.
+fn calendar_week_key(created_at_ms: i64) -> i32 {
+    let date = utc_dt(created_at_ms).date_naive();
+    let monday = date - chrono::Duration::days(date.weekday().num_days_from_monday() as i64);
+    monday.num_days_from_ce()
+}
+
+/// Kalendermonat-Bucket (UTC) — entspricht `strftime('%Y-%m',created_at/1000,'unixepoch')`.
+fn calendar_month_key(created_at_ms: i64) -> (i32, u32) {
+    let dt = utc_dt(created_at_ms);
+    (dt.year(), dt.month())
+}
+
+/// #250/#264: Ein redundanter Snapshot darf erst geloescht werden, wenn er das Immutability-Fenster
+/// verlassen hat. DIESELBE Schwelle (`IMMUTABLE_SNAPSHOT_MS`) blockt der DB-Trigger
+/// `protect_recent_snapshots`. Daemon-Skip-Alter == Trigger-Block-Schwelle ist ein GETESTETES
+/// Boundary-Invariant (siehe tests): driftet eine Seite, schlaegt der Test an.
+fn is_past_immutability_window(now_ms: i64, created_at_ms: i64) -> bool {
+    now_ms - created_at_ms >= sentinel_limbo::IMMUTABLE_SNAPSHOT_MS
+}
+
+/// Erkennt den #264-Trigger-Abbruch ('Cannot delete snapshot younger than 7 days') anhand der
+/// RAISE(ABORT)-Message. Andere DB-Fehler (Lock/IO) werden NICHT als Block klassifiziert und vom
+/// Aufrufer propagiert.
+fn is_immutability_block(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains("Cannot delete snapshot younger than")
+}
+
+/// Behandelt einen redundanten Snapshot (es existiert bereits ein Keeper fuer seine Kalenderperiode
+/// im hoeheren Tier) #264-konform (Variante B): loescht ihn NUR wenn er das Immutability-Fenster
+/// verlassen hat. Junge Snapshots werden bewusst uebersprungen (`kept_protected`) — Retention
+/// loescht NIE junge Snapshots, sie altern aus dem Schutzfenster und werden dann geloescht. Ein
+/// dennoch auftretender Trigger-Block wird gezaehlt+geloggt statt geschluckt (`delete_blocked_young`
+/// = #264-Drift-Alarm, bei korrektem Boundary-Invariant immer 0). Echte DB-Fehler propagieren.
+fn delete_redundant(
+    event_store: &Arc<EventStore>,
+    snap: &SnapshotMeta,
+    now_ms: i64,
+    report: &mut MaintenanceReport,
+) -> anyhow::Result<()> {
+    if !is_past_immutability_window(now_ms, snap.created_at_ms) {
+        report.kept_protected += 1;
+        debug!(
+            id = %snap.id,
+            "Redundanter Snapshot bleibt geschuetzt (juenger als Immutability-Fenster)"
+        );
+        return Ok(());
+    }
+    match event_store.delete_world_snapshot(&snap.id) {
+        Ok(true) => report.deleted += 1,
+        Ok(false) => {} // Zeile bereits weg (Race) — kein Fehler.
+        Err(e) if is_immutability_block(&e) => {
+            // Drift-Alarm: bei korrektem Boundary-Invariant unerreichbar (Daemon haette skippt).
+            report.delete_blocked_young += 1;
+            debug!(id = %snap.id, "DELETE vom #264-Trigger geblockt (Drift-Alarm) — uebersprungen");
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
 }
 
 /// Ergebnis einer Maintenance-Operation.
@@ -351,6 +441,14 @@ impl SnapshotManager {
 pub struct MaintenanceReport {
     pub promoted: u32,
     pub deleted: u32,
+    /// #250/#264: redundante Snapshots die NICHT geloescht wurden, weil sie noch im
+    /// Immutability-Fenster (`IMMUTABLE_SNAPSHOT_MS`, 7 Tage) liegen — bewusst uebersprungen
+    /// (Variante B: Retention loescht NIE junge Snapshots, nur promoten/post-7d-loeschen).
+    pub kept_protected: u32,
+    /// #264-Drift-Alarm: DELETE-Versuche die der Trigger geblockt hat, OBWOHL der Daemon sie nicht
+    /// uebersprungen hat. Bei korrekt synchronisierter Schwelle (Boundary-Invariant) immer 0;
+    /// `> 0` bedeutet Daemon-Skip-Alter und Trigger-Block-Schwelle sind auseinandergedriftet.
+    pub delete_blocked_young: u32,
 }
 
 #[cfg(test)]
@@ -461,5 +559,190 @@ mod tests {
             "kein 5-min-Anchor wenn deaktiviert"
         );
         assert!(mgr.should_create_snapshot(3600), "hourly greift");
+    }
+
+    // ── #250: Promotion-Dedup (Kalender-aligned) + #264-Konformitaet ───────────────────────────
+
+    fn utc_ms(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> i64 {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, s)
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    fn snap_at(id: &str, tier: SnapshotTier, created_at_ms: i64) -> SnapshotMeta {
+        SnapshotMeta {
+            id: id.to_string(),
+            tier,
+            tick: 0,
+            sim_hour: 0.0,
+            last_event_id: 0,
+            payload_size_bytes: 0,
+            created_at_ms,
+        }
+    }
+
+    /// #264/#250: Daemon-Skip-Alter == Trigger-Block-Schwelle, exakt am Boundary.
+    /// `is_past_immutability_window(now, created)` ist true gdw. `now - created >= const`; der
+    /// Trigger blockt gdw. `now - created < const` → bei Alter `const-1` skippen BEIDE, bei `const`
+    /// loeschen BEIDE. Das behaviorale Gegenstueck (Trigger blockt jung / erlaubt alt) liegt in
+    /// `sentinel-limbo` (`test_snapshot_delete_blocked_within_7_days` / `_allowed_after_7_days`).
+    #[test]
+    fn immutability_window_boundary_is_exact() {
+        let now = 10_000_000_000_000i64;
+        let c = sentinel_limbo::IMMUTABLE_SNAPSHOT_MS;
+        assert!(
+            !is_past_immutability_window(now, now - (c - 1)),
+            "Alter const-1ms: geschuetzt (Daemon skippt, Trigger blockt)"
+        );
+        assert!(
+            is_past_immutability_window(now, now - c),
+            "Alter == const: loeschbar (Trigger erlaubt: now-created < const ist false)"
+        );
+        assert!(
+            is_past_immutability_window(now, now - (c + 1)),
+            "Alter const+1ms: loeschbar"
+        );
+    }
+
+    #[test]
+    fn immutability_block_classifies_trigger_error_only() {
+        let block = anyhow::anyhow!("Cannot delete snapshot younger than 7 days");
+        assert!(
+            is_immutability_block(&block),
+            "Trigger-Abbruch wird erkannt"
+        );
+        let other = anyhow::anyhow!("database is locked");
+        assert!(
+            !is_immutability_block(&other),
+            "echter DB-Fehler ist KEIN Immutability-Block → muss propagieren"
+        );
+    }
+
+    #[test]
+    fn week_dedup_uses_calendar_week_across_epoch_thursday_boundary() {
+        // 1970-01-01 war ein Donnerstag → die alte `% (7*86400_000)`-Logik brach Wochen Do/Mi.
+        // Mi 2024-01-03 und Do 2024-01-04 liegen in DERSELBEN Kalenderwoche (Mo 2024-01-01..So
+        // 2024-01-07), aber in ZWEI verschiedenen Epoch-Modulo-Wochen → alte Logik haette zwei
+        // Weeklies fuer eine Kalenderwoche behalten (Doppel-Keeper). Repro-Test + Fix-Nachweis.
+        let wed = utc_ms(2024, 1, 3, 12, 0, 0);
+        let thu = utc_ms(2024, 1, 4, 12, 0, 0);
+        let mgr = SnapshotManager::new(RetentionConfig::default());
+        let snaps = vec![snap_at("w", SnapshotTier::Weekly, wed)];
+        assert!(
+            mgr.has_snapshot_for_week(&snaps, SnapshotTier::Weekly, thu),
+            "Mi und Do derselben Kalenderwoche teilen denselben Wochen-Bucket"
+        );
+        let prev_sun = utc_ms(2023, 12, 31, 12, 0, 0); // Sonntag der Vorwoche
+        assert!(
+            !mgr.has_snapshot_for_week(&snaps, SnapshotTier::Weekly, prev_sun),
+            "andere Kalenderwoche → anderer Bucket"
+        );
+    }
+
+    #[test]
+    fn month_dedup_uses_calendar_month_not_30day_block() {
+        // `% (30*86400_000)` driftet gegen echte Monate: der 1. und der 31. desselben Monats lagen
+        // in verschiedenen 30-Tage-Bloecken → alte Logik haette zwei Monthlies behalten. Repro + Fix.
+        let jan1 = utc_ms(2024, 1, 1, 12, 0, 0);
+        let jan31 = utc_ms(2024, 1, 31, 12, 0, 0);
+        let mgr = SnapshotManager::new(RetentionConfig::default());
+        let snaps = vec![snap_at("m", SnapshotTier::Monthly, jan1)];
+        assert!(
+            mgr.has_snapshot_for_month(&snaps, SnapshotTier::Monthly, jan31),
+            "1. und 31. desselben Kalendermonats teilen denselben Monats-Bucket"
+        );
+        let feb1 = utc_ms(2024, 2, 1, 12, 0, 0);
+        assert!(
+            !mgr.has_snapshot_for_month(&snaps, SnapshotTier::Monthly, feb1),
+            "anderer Kalendermonat → anderer Bucket"
+        );
+    }
+
+    #[test]
+    fn day_dedup_uses_calendar_utc_day() {
+        let morning = utc_ms(2024, 1, 5, 1, 0, 0);
+        let evening = utc_ms(2024, 1, 5, 23, 30, 0);
+        let next_day = utc_ms(2024, 1, 6, 0, 30, 0);
+        let mgr = SnapshotManager::new(RetentionConfig::default());
+        let snaps = vec![snap_at("d", SnapshotTier::Daily, morning)];
+        assert!(
+            mgr.has_snapshot_for_day(&snaps, SnapshotTier::Daily, evening),
+            "gleicher UTC-Tag (1:00 und 23:30) → gleicher Bucket"
+        );
+        assert!(
+            !mgr.has_snapshot_for_day(&snaps, SnapshotTier::Daily, next_day),
+            "naechster UTC-Tag → anderer Bucket"
+        );
+    }
+
+    #[test]
+    fn delete_redundant_skips_young_snapshot_as_protected() {
+        // Variante B: ein redundanter junger Snapshot wird NICHT geloescht (Daemon versucht es gar
+        // nicht erst), sondern als kept_protected gezaehlt — er altert spaeter aus dem Schutzfenster.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(EventStore::open(dir.path().join("t.db").to_str().unwrap()).unwrap());
+        store
+            .save_world_snapshot("young", "hourly", 1, 0.0, 0, b"x")
+            .unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let snap = store
+            .list_world_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "young")
+            .unwrap();
+        let mut report = MaintenanceReport::default();
+        delete_redundant(&store, &snap, now, &mut report).unwrap();
+        assert_eq!(
+            report.kept_protected, 1,
+            "junger Snapshot bleibt geschuetzt"
+        );
+        assert_eq!(report.deleted, 0);
+        assert_eq!(
+            report.delete_blocked_young, 0,
+            "Daemon versucht gar nicht erst zu loeschen (kein Trigger-Block-Pfad)"
+        );
+        assert_eq!(
+            store.list_world_snapshots().unwrap().len(),
+            1,
+            "Snapshot noch vorhanden"
+        );
+    }
+
+    #[test]
+    fn delete_redundant_counts_trigger_block_on_clock_drift() {
+        // Simulierte Uhr-Drift: Daemon-Uhr 7d+ VOR der DB-Uhr → Daemon haelt den Snapshot fuer
+        // loeschbar, der #264-Trigger (echte Uhr) blockt ihn aber. Erwartung: gezaehlt+geloggt als
+        // delete_blocked_young (Drift-Alarm), KEIN Crash, KEIN stiller Swallow, Snapshot bleibt.
+        // Beweist zugleich, dass `is_immutability_block` die ECHTE rusqlite-RAISE-Message matcht.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(EventStore::open(dir.path().join("t.db").to_str().unwrap()).unwrap());
+        store
+            .save_world_snapshot("young", "hourly", 1, 0.0, 0, b"x")
+            .unwrap();
+        let snap = store
+            .list_world_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "young")
+            .unwrap();
+        let future_now = snap.created_at_ms + sentinel_limbo::IMMUTABLE_SNAPSHOT_MS + 1000;
+        let mut report = MaintenanceReport::default();
+        delete_redundant(&store, &snap, future_now, &mut report).unwrap();
+        assert_eq!(
+            report.delete_blocked_young, 1,
+            "Trigger-Block wird gezaehlt statt geschluckt"
+        );
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.kept_protected, 0);
+        assert_eq!(
+            store.list_world_snapshots().unwrap().len(),
+            1,
+            "Snapshot bleibt — Trigger schuetzt ihn"
+        );
     }
 }

@@ -19,6 +19,12 @@ use tracing::{debug, info, instrument};
 #[cfg(feature = "telemetry")]
 const LATENCY_BUCKETS: &[f64] = &[50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0];
 
+/// #264/#250: Immutability-Fenster fuer `world_snapshots` in Millisekunden (7 Tage). SSOT — DIESELBE
+/// Konstante speist den `protect_recent_snapshots`-Trigger UND den Daemon-seitigen Retention-Skip
+/// (`SnapshotManager::maintain`). Damit koennen Trigger-Block-Schwelle und Daemon-Skip-Alter nicht
+/// still auseinanderdriften (Boundary-Invariant-Test in sentinel-daemon).
+pub const IMMUTABLE_SNAPSHOT_MS: i64 = 7 * 86400 * 1000;
+
 // ──────────────────────────────────────────────
 // SQL Schema
 // ──────────────────────────────────────────────
@@ -215,8 +221,9 @@ impl EventStore {
         conn.execute(CREATE_IDX_WORLD_SNAPSHOTS_TIER, [])?;
         conn.execute_batch(CREATE_PROJECTION_OFFSETS)?;
 
-        // Security: Immutable Snapshots — Schutz vor Loeschung junger Snapshots
-        let immutable_ms: i64 = 7 * 86400 * 1000; // 7 Tage
+        // Security: Immutable Snapshots — Schutz vor Loeschung junger Snapshots.
+        // #250: dieselbe SSOT-Konstante wie der Daemon-Retention-Skip (siehe IMMUTABLE_SNAPSHOT_MS).
+        let immutable_ms: i64 = IMMUTABLE_SNAPSHOT_MS;
         conn.execute_batch(&format!(
             "DROP TRIGGER IF EXISTS protect_recent_snapshots;
              CREATE TRIGGER protect_recent_snapshots
