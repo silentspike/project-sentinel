@@ -668,6 +668,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn full_roster_cross_shift_replay_from_post_shift_anchor_is_exact() {
+        // #529 AC-5 (Skala): wie within_shift_…, aber mit dem ECHTEN Per-Shift-Roster aus
+        // config/agents/AGENT-*.toml und einem von `detect_shift_from_sim_hour` bestimmten
+        // Schichtwechsel. Ground-Truth laeuft ueber die Shift-Grenze (despawn alte Schicht, spawn
+        // neue); der Post-Shift-Anker (= was Snapshot-on-Shift erzeugt) + bounded Replay reproduziert
+        // die Ground-Truth byte-exakt (STRICT+CORE), 0 Mismatches, bei vollem Roster. Deterministisch,
+        // kein Daemon/keine VM — schliesst die residuale Skala-Luecke von AC-2 (N=4 -> realer Roster).
+        use crate::shift::{agents_for_shift, detect_shift_from_sim_hour};
+        use sentinel_common::agent_config::{
+            load_all_agents_with_validation, AgentConfigValidation,
+        };
+        use sentinel_ecs::{apply_capabilities, apply_personality};
+        use std::path::Path;
+
+        let agents_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/agents");
+        let all = load_all_agents_with_validation(
+            Path::new(agents_dir),
+            AgentConfigValidation::with_max_agent_id(256),
+        )
+        .expect("echte Agent-Configs laden");
+        assert!(
+            all.len() >= 50,
+            "voller Roster geladen ({} Agents)",
+            all.len()
+        );
+
+        let spawn_shift = |world: &mut World, shift: u8| -> usize {
+            let active = agents_for_shift(&all, shift);
+            for a in &active {
+                let e = spawn_agent(
+                    world,
+                    AgentId(a.identity.id),
+                    &a.identity.name,
+                    &a.identity.role,
+                    a.identity.shift_set,
+                    &a.preferences.favorite_room,
+                );
+                apply_personality(world, e, &a.personality);
+                apply_capabilities(world, e, &a.capabilities);
+            }
+            active.len()
+        };
+        let despawn_shift = |world: &mut World, shift: u8| {
+            for a in agents_for_shift(&all, shift) {
+                despawn_agent_from_world(world, AgentId(a.identity.id));
+            }
+        };
+
+        // Echter Schichtwechsel 2 -> 3, wie der Daemon ihn per sim_hour erkennt.
+        let shift_a = detect_shift_from_sim_hour(14.0);
+        let shift_b = detect_shift_from_sim_hour(22.0);
+        assert_ne!(shift_a, shift_b, "echter Schichtwechsel");
+
+        let shift_tick = 25u64;
+        let target_tick = 55u64;
+        let events: Vec<DomainEvent> = vec![]; // reines Vorwaerts-Replay ueber den vollen Roster
+
+        // Ground-Truth: Schicht A aktiv -> bis shift_tick -> SCHICHTWECHSEL -> Post-Shift-Anker -> target.
+        let (mut w, mut sched) = world_with_agents(0);
+        w.resource_mut::<SimulationTime>().sim_hour = 14.0;
+        let n_a = spawn_shift(&mut w, shift_a);
+        run_ticks(&mut w, &mut sched, &events, 0, shift_tick);
+        despawn_shift(&mut w, shift_a);
+        let n_b = spawn_shift(&mut w, shift_b);
+        let post_shift_anchor = snapshot_ecs_state(&mut w); // = Snapshot-on-Shift @ shift_tick
+        run_ticks(&mut w, &mut sched, &events, shift_tick, target_tick);
+        let live = state_hashes(&mut w);
+
+        // Restore vom Post-Shift-Anker + Replay (innerhalb der neuen Schicht, kein Cross-Shift).
+        let (mut w2, mut sched2) = world_with_agents(0);
+        run_ticks(&mut w2, &mut sched2, &events, 0, shift_tick);
+        restore_ecs_state(&mut w2, &post_shift_anchor);
+        run_bounded_replay(&mut w2, &mut sched2, &events, shift_tick, target_tick).expect("replay");
+        let replayed = state_hashes(&mut w2);
+
+        println!(
+            "[AC-5] roster shift_a={n_a} -> shift_b={n_b} agents; STRICT live={} replay={}",
+            live.strict, replayed.strict
+        );
+        assert!(n_b >= 10, "voller Post-Shift-Roster aktiv ({n_b})");
+        assert_eq!(
+            live.strict, replayed.strict,
+            "STRICT: Full-Roster Cross-Shift Replay vom Post-Shift-Anker exakt (0 Mismatches)"
+        );
+        assert_eq!(
+            live.core, replayed.core,
+            "CORE: Full-Roster Cross-Shift Replay vom Post-Shift-Anker exakt (0 Mismatches)"
+        );
+    }
+
     // Hilfs-Tick-Loop fuer den Test (spiegelt run_bounded_replay ohne Resource-Gating, da die
     // Test-World ohnehin keine Limbo/Zenoh/Redb-Resources haelt).
     fn run_ticks(
