@@ -1,0 +1,24 @@
+#491 AC-4 — an invalid restore target is rejected with HTTP 400 and the running state is
+not touched (no rewind). Validation is synchronous in the operator API handler
+(OperatorRestoreCommand::validate) before anything is sent to the restore channel.
+
+$ curl -s http://127.0.0.1:8084/operator/state-hash       # before
+{"strict":"da5f811e966037552b7d95d427378a1e62b12ce6a9035accf9e366d67980743a","core":"1b6c14...","tick":2786244,"last_event_id":12300861}
+
+$ curl -i -X POST .../operator/restore -d '{}'             # zero target fields
+HTTP 400
+{"error":"genau eines von snapshot_id/target_tick/target_event_id erforderlich (keines gesetzt)"}
+
+$ curl -i -X POST .../operator/restore -d '{"target_tick":5,"target_event_id":5}'   # two fields
+HTTP 400
+{"error":"genau eines von snapshot_id/target_tick/target_event_id erlaubt (mehrere gesetzt)"}
+
+$ curl -s http://127.0.0.1:8084/operator/state-hash       # after
+{"strict":"34f168cb4263ca5a4a0785d31d39680bf6684c0f4765a1613e6537e32fb614ff","core":"98257a...","tick":2786247,"last_event_id":12300861}
+
+Result: AC-4 PASS. Both malformed restores returned HTTP 400 with the precise
+exactly-one-of validation message. The tick advanced 2786244 -> 2786247 (+3, normal live
+ticking) with NO rewind and last_event_id unchanged (12300861) — i.e. no restore was
+performed and the simulation state was untouched. The mid-replay failure-injection path
+(partial commit rolls back to the pre-restore safety snapshot) is covered by the
+rollback_world_restore_stores unit tests.

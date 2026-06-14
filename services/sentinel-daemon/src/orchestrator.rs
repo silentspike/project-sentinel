@@ -2983,6 +2983,23 @@ struct RestoreReplayPlan {
     target_event_id: i64,
 }
 
+/// #491: waehlt den Anchor-Snapshot, der STRIKT VOR dem Ziel liegt (Liste ist `tick DESC`, liefert
+/// also den juengsten gueltigen). Beide Bedingungen noetig: `tick < target_tick` stellt sicher, dass
+/// das Replay `(anchor_tick, target_tick]` mindestens den Ziel-Tick voll ausfuehrt; `last_event_id
+/// <= target_event_id` haelt die Range gueltig. NUR `last_event_id` zu pruefen reicht NICHT: in
+/// Ruhephasen (keine Events) teilen sich mehrere Snapshots dieselbe `last_event_id`, und ein
+/// Snapshot mit Tick NACH dem Ziel wuerde sonst als Anchor gewaehlt -> leeres Replay -> Anchor-
+/// Zustand statt Ziel-Zustand (VM-Befund #491).
+fn select_anchor_snapshot(
+    snapshots: &[sentinel_common::SnapshotMeta],
+    target_tick: u64,
+    target_event_id: i64,
+) -> Option<&sentinel_common::SnapshotMeta> {
+    snapshots
+        .iter()
+        .find(|s| s.tick < target_tick && s.last_event_id <= target_event_id)
+}
+
 /// #491: aufgeloestes Restore-Ziel (Anchor + optionaler Replay-Cursor).
 #[derive(Debug, Clone)]
 struct RestoreResolution {
@@ -3040,11 +3057,9 @@ fn resolve_restore_target(
         ));
     };
 
-    // Anchor = juengster Snapshot mit last_event_id <= target_event_id (Liste ist tick DESC).
-    let anchor = snapshots
-        .iter()
-        .find(|s| s.last_event_id <= target_event_id)
-        .ok_or_else(|| anyhow!("kein Anchor-Snapshot <= target_event_id {target_event_id}"))?;
+    let anchor = select_anchor_snapshot(snapshots, target_tick, target_event_id).ok_or_else(|| {
+        anyhow!("kein Anchor-Snapshot vor Ziel (tick<{target_tick}, last_event_id<={target_event_id})")
+    })?;
 
     // exact, wenn das Ziel-Event das letzte seines Ticks ist (sonst tick-granular).
     let exact = event_store.max_event_id_at_tick(target_tick)? == Some(target_event_id);
@@ -6118,6 +6133,43 @@ mod tests {
     use std::sync::Arc;
 
     static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn snap_meta(id: &str, tick: u64, last_event_id: i64) -> sentinel_common::SnapshotMeta {
+        sentinel_common::SnapshotMeta {
+            id: id.to_string(),
+            tier: SnapshotTier::Hourly,
+            tick,
+            sim_hour: 0.0,
+            last_event_id,
+            payload_size_bytes: 0,
+            created_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn select_anchor_requires_tick_strictly_before_target() {
+        // #491 VM-Befund: in Ruhephasen teilen sich Snapshots dieselbe last_event_id. Der Anchor
+        // MUSS tick < target_tick haben, sonst leeres Replay -> Anchor-Zustand statt Ziel.
+        // Liste ist tick DESC.
+        let snapshots = vec![
+            snap_meta("newer", 2_540_056, 12_034_085), // gleiche le wie Ziel, aber tick NACH Ziel
+            snap_meta("valid", 2_539_906, 12_034_085), // tick VOR Ziel -> korrekter Anchor
+            snap_meta("older", 2_536_000, 12_030_000),
+        ];
+        let anchor = select_anchor_snapshot(&snapshots, 2_540_040, 12_034_085)
+            .expect("ein gueltiger Anchor existiert");
+        assert_eq!(
+            anchor.id, "valid",
+            "darf NICHT den tick-zu-neuen 'newer' waehlen"
+        );
+
+        // Ziel vor dem aeltesten Snapshot -> kein gueltiger Anchor.
+        assert!(select_anchor_snapshot(&snapshots, 2_535_000, 12_029_000).is_none());
+
+        // Direkt nach 'older': dessen le<=Ziel und tick<Ziel.
+        let a2 = select_anchor_snapshot(&snapshots, 2_537_000, 12_031_000).expect("anchor");
+        assert_eq!(a2.id, "older");
+    }
 
     #[test]
     fn psi_band_matches_bio_thresholds() {

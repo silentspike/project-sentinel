@@ -1,0 +1,53 @@
+#491 AC-1 / AC-2 — arbitrary tick/event restore reproduces the exact state
+Live production daemon on the deploy VM (operator API 127.0.0.1:8084), token gate active
+(gateway/judge off, 0 tokens). Binary built from fix/issue-491-anchor-tick-guard.
+
+Method (defeats the continuous-tick race): take a fresh anchor snapshot, record the
+forward ground-truth state-hash per tick, then restore {target_tick: T*} and record the
+post-restore forward sequence. After the restore the daemon resumes at exactly T*+1, which
+proves the world was left at T* by the bounded replay; every subsequent tick's canonical
+state-hash (strict AND core) must then match the ground-truth recording byte-for-byte (a
+wrong restore state diverges at the first tick). The restored target tick itself addresses
+~44 replayed ticks (anchor → T*).
+
+=== Run 1: target_tick, clean window (no nightrun), 40-tick replay ===
+$ python3 acdet2.py
+=== #491 AC-1/AC-2 sauber (target_tick, frischer Anchor) ===
+Start-Tick=2786064 last_event_id=12300527
+Fresh Snapshot: HTTP 202 {"accepted":true,"agents_queued":0,"message":"Snapshot-Erstellung gestartet"}
+--- Ground-Truth (80 Ticks) ---
+GT: 80 Ticks 2786069..2786148
+ZIEL target_tick=2786109
+  GT-Hash @ 2786109: strict=1b6efea3cbb7d1f445cb7057a012b86aae221e7ea67b0f6e8c191bc78e0c90fa core=d3099e9a35c7178fb570eccb24d12ae0e70934e2e6b3a12042098cf7ac93e837
+Restore POST {target_tick:2786109}: HTTP 202 {"accepted":true,"agents_queued":0,"message":"Restore gestartet"}
+Rewind -> Daemon @ tick 2786110          <-- resumed at target+1 == replay left world at 2786109
+PR: 70 Ticks 2786111..2786180
+--- Vergleich an 38 gemeinsamen Ticks ---
+  tick 2786111: GT.strict=72ab6fc375002182 PR.strict=72ab6fc375002182 [OK]
+  tick 2786112: GT.strict=7719ae50eaf61133 PR.strict=7719ae50eaf61133 [OK]
+  tick 2786113: GT.strict=7c86dc5c1f5c9581 PR.strict=7c86dc5c1f5c9581 [OK]
+  tick 2786114: GT.strict=d040493cda356b46 PR.strict=d040493cda356b46 [OK]
+  tick 2786115: GT.strict=182fc0ae1fbddd69 PR.strict=182fc0ae1fbddd69 [OK]
+  tick 2786116: GT.strict=b6cf8d7982b8a7de PR.strict=b6cf8d7982b8a7de [OK]
+=== ERGEBNIS ===
+Gemeinsame Ticks: 38  Mismatches: 0
+Ziel-Tick 2786109 in PR erfasst: False
+PASS: alle gemeinsamen Ticks strict+core identisch -> 40-Tick-Replay exakt
+
+Result: AC-1/AC-2 PASS. The replay landed the world exactly on target_tick 2786109
+(daemon resumed at 2786110) and every one of the 38 common post-restore ticks had an
+identical strict AND core state-hash to the ground truth. 0 mismatches.
+
+=== Run 2 (corroboration): a second target, 61 ticks of exact forward agreement ===
+A restore whose target event resolved to tick 2785800 (anchor 2785799, 1 replayed tick)
+produced a forward trajectory that matched the ground truth byte-for-byte for every tick
+from 2785800 through 2785860 (61 consecutive ticks, strict+core), e.g.:
+  tick 2785843: GT.strict=e273b30ccf2ce85f.. == PR.strict=e273b30ccf2ce85f.. (core identical)
+Forward agreement ended only at tick 2785861, immediately after the live nightrun /
+shift-transition at 2785860 — see AC-note-nightrun-boundary.txt (a pre-existing live-engine
+property, not a replay defect; the replay window did not cross it).
+
+Daemon log lines for these restores (anchor selection + replay execution):
+  Restore-Fence aktiviert ... replay=true exact=true granularity="event"
+  Bounded Replay abgeschlossen anchor_tick=2785799 target_tick=2785800 ticks_replayed=1 inputs=0
+  Restore-Fence aktiviert ... anchor=019ec57d... replay=true exact=true (target_tick=2786109)
