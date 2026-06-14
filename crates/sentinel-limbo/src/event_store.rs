@@ -2190,7 +2190,74 @@ mod tests {
             )
             .unwrap();
         assert!(trigger_sql.contains("BEFORE DELETE ON world_snapshots"));
-        assert!(trigger_sql.contains("604800000"));
+        // #250: SSOT-Linkage — der Trigger MUSS exakt die geteilte Konstante einbetten, damit
+        // Trigger-Block-Schwelle und Daemon-Retention-Skip (sentinel-daemon nutzt
+        // IMMUTABLE_SNAPSHOT_MS) nicht auseinanderdriften koennen. Value-Lock haelt die 7 Tage fest.
+        assert_eq!(IMMUTABLE_SNAPSHOT_MS, 7 * 86400 * 1000, "7 Tage in ms");
+        assert_eq!(IMMUTABLE_SNAPSHOT_MS, 604_800_000);
+        assert!(
+            trigger_sql.contains(&IMMUTABLE_SNAPSHOT_MS.to_string()),
+            "Trigger-SQL muss die geteilte Konstante {IMMUTABLE_SNAPSHOT_MS} einbetten: {trigger_sql}"
+        );
+    }
+
+    /// #250/AC-7: Promotion (UPDATE tier) darf den Restore-Anker NICHT veraendern — Payload-Blob,
+    /// `last_event_id` und `tick` bleiben byte-/wert-identisch, nur der Tier aendert sich. Damit ist
+    /// jeder Restore aus einem promoteten Snapshot identisch zu einem Restore vor der Promotion (die
+    /// End-to-End-Bio/Position/Tick-Restore-Korrektheit selbst liegt im #491/#529-Replay-Pfad).
+    #[test]
+    fn test_promote_world_snapshot_preserves_restore_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-promote-anchor.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        let payload = b"restore-anchor-blob-\x00\x01\x02".as_slice();
+        store
+            .save_world_snapshot("snap-x", "hourly", 4242, 13.5, 999, payload)
+            .unwrap();
+        let before = store.load_world_snapshot("snap-x").unwrap().unwrap();
+        let meta_before = store
+            .list_world_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "snap-x")
+            .unwrap();
+
+        // Promotion = reiner Tier-UPDATE (trigger-immun, keine neue Zeile).
+        assert!(store.promote_world_snapshot("snap-x", "daily").unwrap());
+
+        let after = store.load_world_snapshot("snap-x").unwrap().unwrap();
+        let meta_after = store
+            .list_world_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "snap-x")
+            .unwrap();
+
+        assert_eq!(
+            after, before,
+            "Payload-Blob unveraendert (Restore-Anker intakt)"
+        );
+        assert_eq!(after, payload, "Blob == Original");
+        assert_eq!(
+            meta_after.last_event_id, meta_before.last_event_id,
+            "last_event_id stabil"
+        );
+        assert_eq!(meta_after.tick, meta_before.tick, "tick stabil");
+        assert_eq!(
+            meta_after.tier,
+            sentinel_common::SnapshotTier::Daily,
+            "nur der Tier aendert sich"
+        );
+        assert_eq!(meta_before.tier, sentinel_common::SnapshotTier::Hourly);
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM world_snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "Promotion erzeugt KEINE zweite Zeile (1:n, kein Kopieren)"
+        );
     }
 
     /// #264: Immutable Snapshots — DELETE auf alten Snapshot funktioniert.
