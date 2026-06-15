@@ -296,7 +296,8 @@ impl NanoRuntime for BwrapNanoRuntime {
                 self.enforcer.has_bwrap(),
                 self.enforcer.has_cgroups() && policy.cgroups,
                 self.enforcer.has_landlock() && policy.landlock,
-                self.enforcer.has_netns() && policy.network
+                // #75: network isolation = full cage from bwrap --unshare-all.
+                self.enforcer.has_bwrap() && policy.network
             ),
         })
     }

@@ -2,9 +2,9 @@
 //!
 //! Issue #16: BwrapConfig (to_args, for_agent), CgroupLimits, parse_psi, cgroup_path.
 //! Issue #73: IO Delegation (discover_block_device, format_io_max).
-//! Issue #75: Network Namespace Isolation (netns config, nftables, veth).
+//! Issue #75: Full network cage (no --share-net) + post-spawn isolation verifier.
 
-use sentinel_sandbox::{BwrapConfig, CgroupLimits, NetworkNsConfig};
+use sentinel_sandbox::{BwrapConfig, CgroupLimits};
 
 // AC #16.02: to_args() enthaelt --ro-bind, --bind (writable), --tmpfs, --unshare-all
 #[test]
@@ -200,89 +200,33 @@ fn ac_73_n1_existing_limits_unchanged() {
 }
 
 // ================================================================
-// Issue #75: Network Namespace Isolation
+// Issue #75: Full network cage (no --share-net) + isolation verifier
 // ================================================================
 
-// AC #75.01: Agent kann Zenoh Port erreichen (nftables rules erlauben port 7447)
+// AC #75.01: Agents are full-caged by default — BwrapConfig::for_agent() sets
+// share_net=false and to_args() emits --unshare-all WITHOUT --share-net.
+// Agents make no network calls; the daemon proxies LLM traffic to the gateway.
 #[test]
-fn ac_75_01_zenoh_port_allowed() {
-    let config = NetworkNsConfig::for_agent("thomas", 0);
-    let rules = config.generate_nftables_rules();
-
-    assert!(
-        rules.contains("tcp dport 7447 accept"),
-        "nftables rules must allow Zenoh port 7447, got:\n{rules}"
-    );
-    assert!(
-        rules.contains(&config.bridge_ip),
-        "nftables rules must reference bridge IP {}, got:\n{}",
-        config.bridge_ip,
-        rules
-    );
-}
-
-// AC #75.02: Agent kann Cortex Gateway Port erreichen (nftables rules erlauben port 8080)
-#[test]
-fn ac_75_02_cortex_port_allowed() {
-    let config = NetworkNsConfig::for_agent("thomas", 0);
-    let rules = config.generate_nftables_rules();
-
-    assert!(
-        rules.contains("tcp dport 8080 accept"),
-        "nftables rules must allow Cortex Gateway port 8080, got:\n{rules}"
-    );
-}
-
-// AC #75.03: Agent kann NICHT beliebige Hosts erreichen (policy DROP)
-#[test]
-fn ac_75_03_default_policy_drop() {
-    let config = NetworkNsConfig::for_agent("thomas", 0);
-    let rules = config.generate_nftables_rules();
-
-    let drop_count = rules.matches("policy drop").count();
-    assert_eq!(
-        drop_count, 2,
-        "Both input and output chains must have policy DROP, found {drop_count} in:\n{rules}"
-    );
-}
-
-// AC #75.04: Agent verbindet nur ueber bridge IP (nicht localhost)
-#[test]
-fn ac_75_04_only_bridge_ip() {
-    let config = NetworkNsConfig::for_agent("thomas", 0);
-    let rules = config.generate_nftables_rules();
-
-    // Rules should reference bridge IP, not 127.0.0.1
-    assert!(
-        !rules.contains("127.0.0.1"),
-        "nftables rules must NOT reference localhost, should use bridge IP"
-    );
-    assert!(
-        rules.contains("10.42.0.1"),
-        "nftables rules must reference bridge IP 10.42.0.1"
-    );
-}
-
-// AC #75.N1 / #173: BwrapConfig::for_agent() default ist share_net=true
-// (TOGAF: Agent braucht Cortex Gateway API-Zugang, Enforcer setzt share_net=false wenn netns verfuegbar)
-#[test]
-fn ac_75_n1_bwrap_default_isolated() {
+fn ac_75_01_agent_default_full_cage() {
     let config = BwrapConfig::for_agent("thomas");
     assert!(
-        config.share_net,
-        "BwrapConfig::for_agent() default must be share_net=true (TOGAF: Cortex Gateway API-Zugang)"
+        !config.share_net,
+        "BwrapConfig::for_agent() default must be share_net=false (#75 full cage)"
     );
     let args = config.to_args();
     assert!(
-        args.contains(&"--share-net".to_string()),
-        "Default config must contain --share-net (TOGAF: Cortex Gateway API-Zugang)"
+        args.contains(&"--unshare-all".to_string()),
+        "full cage must keep --unshare-all"
+    );
+    assert!(
+        !args.contains(&"--share-net".to_string()),
+        "agents must NOT get --share-net (#75), args:\n{args:?}"
     );
 }
 
-// AC #75.N1 (continued): Bestehende Tests bleiben gruen
+// AC #75.N1: Existing bwrap/cgroup invariants remain unchanged.
 #[test]
-fn ac_75_n1_existing_tests_unchanged() {
-    // BwrapConfig still has all required fields
+fn ac_75_n1_existing_invariants_unchanged() {
     let config = BwrapConfig::for_agent("test");
     let args = config.to_args();
     assert!(args.contains(&"--unshare-all".to_string()));
@@ -291,86 +235,63 @@ fn ac_75_n1_existing_tests_unchanged() {
     assert!(args.contains(&"--bind".to_string()));
     assert!(args.contains(&"--tmpfs".to_string()));
 
-    // CgroupLimits unchanged
     let limits = CgroupLimits::default();
     assert_eq!(limits.cpu_quota_us, 100_000);
     assert_eq!(limits.memory_bytes, 256 * 1024 * 1024);
 }
 
-// VM-only: veth creation test (requires CAP_NET_ADMIN)
+// VM-only (AC-1): a spawned agent lands in its OWN network namespace, distinct
+// from this process. Reads the sandboxed child PID from bwrap --info-fd
+// (SpawnedSandbox.child_pid — NOT the supervisor PID) and compares ns inodes.
+// Requires bwrap + unprivileged user namespaces (deploy VM).
 #[test]
 #[ignore]
-fn ac_75_vm_veth_creation() {
-    let config = NetworkNsConfig::for_agent("vm-test", 99);
-    let veth_host = config.veth_host_name();
-    let veth_peer = config.veth_peer_name();
+fn ac_75_vm_full_cage_distinct_netns() {
+    let config = BwrapConfig::for_agent("vm-cage-test");
+    let mut spawned = config
+        .spawn(&["/usr/bin/sleep".to_string(), "2".to_string()])
+        .expect("bwrap spawn must succeed on the VM");
 
-    // Create veth pair
-    let status = std::process::Command::new("ip")
-        .args([
-            "link", "add", &veth_host, "type", "veth", "peer", "name", &veth_peer,
-        ])
-        .status()
-        .expect("Failed to run ip link add");
-    assert!(status.success(), "veth creation must succeed");
+    let child_pid = spawned
+        .child_pid
+        .expect("bwrap must report the sandboxed child PID via --info-fd");
 
-    // Verify both interfaces exist
-    let check_host = std::process::Command::new("ip")
-        .args(["link", "show", &veth_host])
-        .status()
-        .expect("Failed to check host veth");
-    assert!(check_host.success(), "host veth must exist after creation");
+    let own = std::fs::read_link("/proc/self/ns/net").expect("read own netns");
+    let agent = std::fs::read_link(format!("/proc/{child_pid}/ns/net")).expect("read agent netns");
+    assert_ne!(
+        own, agent,
+        "agent must run in a distinct net namespace (full cage), own={own:?} agent={agent:?}"
+    );
 
-    // Cleanup
-    let _ = std::process::Command::new("ip")
-        .args(["link", "del", &veth_host])
-        .status();
+    let _ = spawned.child.kill();
+    let _ = spawned.child.wait();
 }
 
-// VM-only: nftables enforcement test (requires CAP_NET_ADMIN + nft)
+// VM-only (AC-2): inside a full-caged agent, only loopback exists — no external
+// reachability. Runs `ip -o link` inside the sandbox and asserts only `lo`.
 #[test]
 #[ignore]
-fn ac_75_vm_nftables_enforcement() {
-    use std::io::Write;
-
-    let config = NetworkNsConfig::for_agent("vm-nft-test", 98);
-    let rules = config.generate_nftables_rules();
-
-    // Load rules
-    let mut child = std::process::Command::new("nft")
-        .args(["-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn nft");
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(rules.as_bytes())
-            .expect("Failed to write rules");
-    }
-    let status = child.wait().expect("Failed to wait for nft");
-    assert!(status.success(), "nft rules load must succeed");
-
-    // Verify table exists
-    let output = std::process::Command::new("nft")
-        .args(["list", "table", "inet", "sentinel-agent"])
+fn ac_75_vm_only_loopback_inside_cage() {
+    use std::process::Stdio;
+    let config = BwrapConfig::for_agent("vm-cage-lo");
+    // `ip` must be reachable via the /usr ro-bind on the VM.
+    let mut args = config.to_args();
+    args.extend([
+        "/usr/sbin/ip".to_string(),
+        "-o".to_string(),
+        "link".to_string(),
+    ]);
+    let output = std::process::Command::new("bwrap")
+        .args(&args)
+        .stderr(Stdio::null())
         .output()
-        .expect("Failed to list nft table");
-    assert!(output.status.success(), "sentinel-agent table must exist");
-
-    let table_output = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        table_output.contains("policy drop"),
-        "Table must have DROP policy"
-    );
-    assert!(table_output.contains("7447"), "Table must allow Zenoh port");
-    assert!(
-        table_output.contains("8080"),
-        "Table must allow Cortex port"
-    );
-
-    // Cleanup
-    let _ = std::process::Command::new("nft")
-        .args(["delete", "table", "inet", "sentinel-agent"])
-        .status();
+        .expect("bwrap spawn must succeed on the VM");
+    let links = String::from_utf8_lossy(&output.stdout);
+    // Only the loopback interface should be present in the agent netns.
+    for line in links.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(
+            line.contains(" lo:") || line.contains(": lo:"),
+            "full-caged agent must only have loopback, found:\n{links}"
+        );
+    }
 }

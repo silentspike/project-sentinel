@@ -21,7 +21,6 @@ use tracing::{debug, info, warn};
 use crate::bwrap::BwrapConfig;
 use crate::cgroups::{self, CgroupLimits, PsiMetrics};
 use crate::landlock;
-use crate::netns::{self, NetworkNsConfig};
 
 /// Handle fuer einen laufenden Agent-Prozess in bwrap.
 ///
@@ -29,8 +28,13 @@ use crate::netns::{self, NetworkNsConfig};
 /// stirbt also wenn der Daemon stirbt). stdin ist piped fuer
 /// stream-json Kommunikation mit dem Agent.
 pub struct AgentProcess {
-    /// PID des bwrap-Prozesses.
+    /// PID des bwrap-Supervisor-Prozesses (bleibt by-design im Root-netns;
+    /// genutzt fuer cgroup-Membership und SIGTERM).
     pub pid: u32,
+    /// PID des sandboxed `agent-runtime` im Agent-netns (aus bwrap `--info-fd`).
+    /// `None`, falls bwrap ihn nicht meldete -> netns-Verifikation entfaellt;
+    /// das bwrap-Exit bleibt das primaere fail-closed-Signal (#75).
+    pub child_pid: Option<u32>,
     /// Child handle — NICHT droppen solange Agent laufen soll.
     child: Child,
 }
@@ -152,8 +156,18 @@ pub enum SandboxWarning {
     IoNotDelegated,
     /// Failed to set OOM score for ECS core process.
     OomScoreFailed(String),
-    /// Network namespace isolation not available (no CAP_NET_ADMIN).
-    NetnsNotAvailable,
+}
+
+/// Result of verifying that an agent runs in its own network namespace (#75).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationStatus {
+    /// Agent netns differs from the daemon's — full cage in effect.
+    Isolated,
+    /// Agent shares the daemon's netns (same inode) — NOT caged. Act on this.
+    NotIsolated,
+    /// Namespace inode could not be read (transient). MUST NOT be treated as a
+    /// cage breach — the bwrap exit code is the primary fail-closed signal.
+    ProbeError,
 }
 
 /// Handle returned by setup_agent() — tracks what was created.
@@ -164,10 +178,8 @@ pub struct SandboxHandle {
     pub io_available: bool,
     pub bwrap_pid: Option<u32>,
     pub landlock_applied: bool,
-    /// Whether this agent has network namespace isolation active.
+    /// Whether the post-spawn netns verification confirmed isolation (#75).
     pub network_isolated: bool,
-    /// Network namespace config (set after setup_network()).
-    pub netns_config: Option<NetworkNsConfig>,
 }
 
 /// Central sandbox enforcement facade.
@@ -183,8 +195,6 @@ pub struct SandboxEnforcer {
     cgroup_available: bool,
     /// Whether bwrap with user namespaces works.
     bwrap_available: bool,
-    /// Whether network namespace isolation is available (CAP_NET_ADMIN).
-    netns_available: bool,
     /// Whether OOM score has been set for ECS core.
     oom_set: AtomicBool,
     /// Optional sentinel-fs FUSE mount path.
@@ -199,7 +209,6 @@ impl std::fmt::Debug for SandboxEnforcer {
             .field("cgroup_root", &self.cgroup_root)
             .field("cgroup_available", &self.cgroup_available)
             .field("bwrap_available", &self.bwrap_available)
-            .field("netns_available", &self.netns_available)
             .finish()
     }
 }
@@ -299,18 +308,15 @@ impl SandboxEnforcer {
             }
         };
 
-        // 6. Network namespace support (CAP_NET_ADMIN + ip + nft)
-        let netns_available = netns::detect_netns_support();
-        if !netns_available {
-            warnings.push(SandboxWarning::NetnsNotAvailable);
-        }
+        // #75: no CAP_NET_ADMIN / bridge/veth detection — agents are full-caged
+        // by bwrap --unshare-all (needs user namespaces, checked above). The
+        // daemon verifies isolation post-spawn on the sandboxed child PID.
 
         let enforcer = Self {
             landlock_abi,
             cgroup_root,
             cgroup_available,
             bwrap_available,
-            netns_available,
             oom_set,
             fs_mount: None,
         };
@@ -338,7 +344,6 @@ impl SandboxEnforcer {
             bwrap_pid: None,
             landlock_applied: false,
             network_isolated: false,
-            netns_config: None,
         };
 
         // 1. Create cgroup with resource limits
@@ -385,11 +390,9 @@ impl SandboxEnforcer {
             config = config.with_fs_mount(fs_mount, fs_host_agent_dir.unwrap_or(name), name);
         }
 
-        // TOGAF default: share_net=true (Cortex Gateway API-Zugang)
-        // Wenn netns verfuegbar: isoliertes Netzwerk via veth-Pair (spaeter)
-        if self.netns_available {
-            config.share_net = false;
-        }
+        // #75: full cage is unconditional — BwrapConfig::for_agent already sets
+        // share_net=false (no --share-net). The daemon verifies isolation
+        // post-spawn on the sandboxed child PID.
 
         // Wrap command with Landlock enforcement if available
         let wrapped_command = if self.landlock_abi.is_some() {
@@ -419,10 +422,14 @@ impl SandboxEnforcer {
             command.to_vec()
         };
 
-        let child = config.spawn(&wrapped_command)?;
+        let spawned = config.spawn(&wrapped_command)?;
+        let child = spawned.child;
         let pid = child.id();
+        let child_pid = spawned.child_pid;
 
-        // Add bwrap process to agent's cgroup
+        // Add bwrap process to agent's cgroup (supervisor PID — children inherit
+        // the cgroup; this is correct for cgroups, unlike netns which needs the
+        // sandboxed child PID).
         if self.cgroup_available {
             if let Err(e) = cgroups::add_pid_to_cgroup(name, pid) {
                 warn!("Failed to add bwrap PID {pid} to cgroup {name}: {e}");
@@ -431,50 +438,38 @@ impl SandboxEnforcer {
 
         debug!(
             name,
-            pid, "bwrap process started, returning AgentProcess handle"
+            pid, child_pid, "bwrap process started, returning AgentProcess handle"
         );
 
-        Ok(AgentProcess { pid, child })
+        Ok(AgentProcess {
+            pid,
+            child_pid,
+            child,
+        })
     }
 
-    /// Sets up network namespace isolation for a running agent.
+    /// Verifies that the sandboxed agent process runs in its own network
+    /// namespace (#75 full cage), comparing `/proc/<child_pid>/ns/net` to the
+    /// daemon's `/proc/self/ns/net`.
     ///
-    /// Creates bridge (idempotent), veth pair, and loads nftables rules.
-    /// Must be called AFTER start_agent_process() (needs PID).
-    ///
-    /// Returns true if network isolation was applied, false if skipped.
-    pub fn setup_network(
-        &self,
-        handle: &mut SandboxHandle,
-        pid: u32,
-        agent_index: u8,
-    ) -> Result<bool> {
-        if !self.netns_available {
-            return Ok(false);
-        }
-
-        let config = NetworkNsConfig::for_agent(&handle.agent_name, agent_index);
-
-        // Ensure bridge exists
-        netns::setup_bridge(&config).context("Failed to setup sentinel bridge")?;
-
-        // Setup veth + nftables inside agent NS
-        netns::setup_netns(pid, &config).with_context(|| {
-            format!(
-                "Failed to setup network namespace for agent {}",
-                handle.agent_name
-            )
-        })?;
-
-        handle.network_isolated = true;
-        handle.netns_config = Some(config);
-        Ok(true)
+    /// `child_pid` MUST be the sandboxed `agent-runtime` PID (from bwrap
+    /// `--info-fd`), NOT the bwrap supervisor PID — the supervisor stays in the
+    /// root netns by design, so verifying it would falsely report every agent
+    /// as un-caged. A transient read failure returns [`IsolationStatus::ProbeError`]
+    /// and MUST NOT be treated as a cage breach; the bwrap exit code is the
+    /// primary fail-closed signal.
+    pub fn verify_agent_netns_isolation(&self, child_pid: u32) -> IsolationStatus {
+        let daemon_ns = read_netns_inode("/proc/self/ns/net");
+        let agent_ns = read_netns_inode(&format!("/proc/{child_pid}/ns/net"));
+        classify_isolation(daemon_ns, agent_ns)
     }
 
     /// Tears down sandbox resources for an agent.
     ///
-    /// Kills the bwrap process (if running), removes network namespace
-    /// resources, and removes the cgroup.
+    /// Kills the bwrap process (if running) and removes the cgroup. The agent's
+    /// network namespace is anonymous (bwrap --unshare-all) and is torn down by
+    /// the kernel when the sandboxed process exits — no explicit netns cleanup
+    /// (#75).
     /// Called by RuntimeOrchestrator::despawn_agent().
     pub fn teardown_agent(&self, handle: &SandboxHandle) -> Result<()> {
         // Ask bwrap to exit first; remaining cgroup members are handled below.
@@ -485,15 +480,6 @@ impl SandboxEnforcer {
                 .stderr(std::process::Stdio::null())
                 .status();
             wait_for_pid_exit(pid);
-        }
-
-        // Remove network namespace resources BEFORE cgroup cleanup
-        if handle.network_isolated {
-            if let Some(ref config) = handle.netns_config {
-                if let Err(e) = netns::teardown_netns(config) {
-                    warn!("Failed to teardown netns for {}: {e}", handle.agent_name);
-                }
-            }
         }
 
         if handle.cgroup_created {
@@ -533,11 +519,6 @@ impl SandboxEnforcer {
         self.bwrap_available
     }
 
-    /// Whether network namespace isolation is available.
-    pub fn has_netns(&self) -> bool {
-        self.netns_available
-    }
-
     /// Whether OOM score was set for the ECS core process.
     pub fn oom_score_set(&self) -> bool {
         self.oom_set.load(Ordering::Relaxed)
@@ -569,6 +550,36 @@ fn landlock_wrapper_path() -> PathBuf {
     PathBuf::from("/usr/local/bin/landlock-wrapper")
 }
 
+/// Reads the network-namespace inode behind `/proc/<pid>/ns/net`.
+///
+/// The symlink target has the form `net:[INODE]`; the inode uniquely
+/// identifies the namespace. Returns `None` if the link cannot be read or
+/// parsed (transient race / process already gone).
+fn read_netns_inode(ns_path: &str) -> Option<u64> {
+    let target = std::fs::read_link(ns_path).ok()?;
+    parse_ns_inode(&target.to_string_lossy())
+}
+
+/// Parses the inode out of a `net:[INODE]` namespace link target.
+fn parse_ns_inode(link: &str) -> Option<u64> {
+    let start = link.find('[')? + 1;
+    let end = link.find(']')?;
+    link.get(start..end)?.parse().ok()
+}
+
+/// Classifies isolation from the daemon's and the agent's netns inodes.
+///
+/// Pure decision function (unit-tested): different inodes -> [`IsolationStatus::Isolated`];
+/// equal inodes -> [`IsolationStatus::NotIsolated`] (agent shares the daemon netns);
+/// any missing inode -> [`IsolationStatus::ProbeError`] (never a cage breach).
+fn classify_isolation(daemon_ns: Option<u64>, agent_ns: Option<u64>) -> IsolationStatus {
+    match (daemon_ns, agent_ns) {
+        (Some(d), Some(a)) if d == a => IsolationStatus::NotIsolated,
+        (Some(_), Some(_)) => IsolationStatus::Isolated,
+        _ => IsolationStatus::ProbeError,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,9 +593,8 @@ mod tests {
             SandboxWarning::BwrapUsernsDenied,
             SandboxWarning::IoNotDelegated,
             SandboxWarning::OomScoreFailed("test".into()),
-            SandboxWarning::NetnsNotAvailable,
         ];
-        assert_eq!(warnings.len(), 6);
+        assert_eq!(warnings.len(), 5);
         assert_ne!(warnings[0], warnings[1]);
     }
 
@@ -597,30 +607,43 @@ mod tests {
             bwrap_pid: None,
             landlock_applied: false,
             network_isolated: false,
-            netns_config: None,
         };
         assert_eq!(handle.agent_name, "test");
         assert!(!handle.cgroup_created);
         assert!(handle.bwrap_pid.is_none());
         assert!(!handle.network_isolated);
-        assert!(handle.netns_config.is_none());
     }
 
     #[test]
-    fn sandbox_handle_with_netns() {
-        let config = NetworkNsConfig::for_agent("test", 5);
-        let handle = SandboxHandle {
-            agent_name: "test".into(),
-            cgroup_created: false,
-            io_available: false,
-            bwrap_pid: Some(12345),
-            landlock_applied: false,
-            network_isolated: true,
-            netns_config: Some(config),
-        };
-        assert!(handle.network_isolated);
-        assert!(handle.netns_config.is_some());
-        assert_eq!(handle.netns_config.unwrap().agent_ip(), "10.42.0.7");
+    fn classify_isolation_three_states() {
+        // #75: different inodes -> isolated; equal -> not isolated (cage breach);
+        // missing inode -> probe error (must never terminate a healthy agent).
+        assert_eq!(
+            classify_isolation(Some(4026531840), Some(4026532500)),
+            IsolationStatus::Isolated
+        );
+        assert_eq!(
+            classify_isolation(Some(4026531840), Some(4026531840)),
+            IsolationStatus::NotIsolated
+        );
+        assert_eq!(
+            classify_isolation(None, Some(4026532500)),
+            IsolationStatus::ProbeError
+        );
+        assert_eq!(
+            classify_isolation(Some(4026531840), None),
+            IsolationStatus::ProbeError
+        );
+        assert_eq!(classify_isolation(None, None), IsolationStatus::ProbeError);
+    }
+
+    #[test]
+    fn parse_ns_inode_extracts_inode() {
+        assert_eq!(parse_ns_inode("net:[4026531840]"), Some(4026531840));
+        assert_eq!(parse_ns_inode("net:[1]"), Some(1));
+        assert_eq!(parse_ns_inode("garbage"), None);
+        assert_eq!(parse_ns_inode("net:[notnum]"), None);
+        assert_eq!(parse_ns_inode("net:[]"), None);
     }
 
     #[test]
