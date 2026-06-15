@@ -7,11 +7,43 @@
 //! - PSI stress factors
 //! - Collector meta-metrics (cycle time, mode, drops)
 
+use std::borrow::Cow;
+
 use crate::collector::MetricsSnapshot;
 use crate::loader::MonitoringMode;
 use crate::probes::agent_health::AgentHealthChecker;
 use crate::probes::io_profile::IoProfiler;
 use crate::probes::network::NetworkMonitor;
+
+/// Escapes a Prometheus label **value** per the text exposition format (#25): `\` -> `\\`,
+/// `"` -> `\"`, line feed -> `\n` (escaped, spec-compliant). Carriage return is **stripped**: a
+/// strict Prometheus parser only un-escapes `\\`, `\"`, `\n` and rejects a `\r` escape as an
+/// invalid escape sequence, so CR must not be emitted as `\r`.
+///
+/// Single-pass char-by-char so an inserted backslash is never re-escaped (a chained
+/// `.replace("\"", ..).replace("\\", ..)` would double-escape). Returns [`Cow::Borrowed`] with no
+/// allocation when the value contains none of the four characters — the common case (real agent /
+/// cgroup / destination names are clean), which keeps the 1:n principle (no copy when unnecessary).
+/// Only dynamic string label values are routed through this; numeric and static values are not.
+fn escape_label_value(value: &str) -> Cow<'_, str> {
+    if !value
+        .bytes()
+        .any(|b| matches!(b, b'\\' | b'"' | b'\n' | b'\r'))
+    {
+        return Cow::Borrowed(value);
+    }
+    let mut out = String::with_capacity(value.len() + 8);
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => {} // strip: a `\r` escape is rejected by strict Prometheus parsers
+            _ => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
 
 /// Exports all monitoring metrics in Prometheus text exposition format.
 #[derive(Debug)]
@@ -59,7 +91,7 @@ impl MetricsExporter {
         output.push_str("# TYPE sentinel_io_bytes_total counter\n");
 
         for (cgroup_id, metrics) in profiler.all_metrics() {
-            let name = &metrics.cgroup_name;
+            let name = escape_label_value(&metrics.cgroup_name);
             output.push_str(&format!(
                 "sentinel_io_ops_total{{cgroup_id=\"{}\",cgroup_name=\"{}\",direction=\"read\"}} {}\n",
                 cgroup_id, name, metrics.read_ops
@@ -96,6 +128,7 @@ impl MetricsExporter {
         output.push_str("# TYPE sentinel_llm_bytes_total counter\n");
 
         for (dest, metrics) in monitor.all_metrics() {
+            let dest = escape_label_value(dest);
             if let Some(avg) = metrics.avg_latency() {
                 output.push_str(&format!(
                     "sentinel_llm_request_duration_seconds{{destination=\"{}\"}} {:.6}\n",
@@ -133,7 +166,8 @@ impl MetricsExporter {
         output.push_str("# TYPE sentinel_agent_cpu_pressure_stress gauge\n");
         output.push_str(&format!(
             "sentinel_agent_cpu_pressure_stress{{agent=\"{}\"}} {:.4}\n",
-            agent_id, stress_factor
+            escape_label_value(agent_id),
+            stress_factor
         ));
         output
     }
@@ -147,7 +181,7 @@ impl MetricsExporter {
         output.push_str("# TYPE sentinel_ebpf_monitoring_mode gauge\n");
         output.push_str(&format!(
             "sentinel_ebpf_monitoring_mode{{mode=\"{}\"}} 1\n",
-            mode.as_str()
+            escape_label_value(mode.as_str())
         ));
 
         output.push_str(
@@ -203,13 +237,14 @@ impl MetricsExporter {
         );
         output.push_str("# TYPE sentinel_agent_last_write_seconds gauge\n");
         for agent in &snapshot.stalled_agents {
+            let agent_name = escape_label_value(&agent.agent_name);
             output.push_str(&format!(
                 "sentinel_agent_stalled{{cgroup_id=\"{}\",agent=\"{}\"}} 1\n",
-                agent.cgroup_id, agent.agent_name
+                agent.cgroup_id, agent_name
             ));
             output.push_str(&format!(
                 "sentinel_agent_last_write_seconds{{cgroup_id=\"{}\",agent=\"{}\"}} {}\n",
-                agent.cgroup_id, agent.agent_name, agent.seconds_since_write
+                agent.cgroup_id, agent_name, agent.seconds_since_write
             ));
         }
         // Non-stalled agents count
@@ -226,7 +261,7 @@ impl MetricsExporter {
         output.push_str("# HELP sentinel_io_bytes_total Total I/O bytes per cgroup\n");
         output.push_str("# TYPE sentinel_io_bytes_total counter\n");
         for (cgroup_id, io) in &snapshot.io_metrics {
-            let name = &io.cgroup_name;
+            let name = escape_label_value(&io.cgroup_name);
             output.push_str(&format!(
                 "sentinel_io_ops_total{{cgroup_id=\"{}\",cgroup_name=\"{}\",direction=\"read\"}} {}\n",
                 cgroup_id, name, io.read_ops
@@ -253,28 +288,29 @@ impl MetricsExporter {
         output.push_str("# HELP sentinel_llm_errors_total Total LLM API errors\n");
         output.push_str("# TYPE sentinel_llm_errors_total counter\n");
         for net in snapshot.network_metrics.values() {
+            let destination = escape_label_value(&net.destination);
             if net.avg_latency_us > 0 {
                 output.push_str(&format!(
                     "sentinel_llm_request_duration_seconds{{destination=\"{}\"}} {:.6}\n",
-                    net.destination,
+                    destination,
                     net.avg_latency_us as f64 / 1_000_000.0
                 ));
             }
             output.push_str(&format!(
                 "sentinel_llm_requests_total{{destination=\"{}\"}} {}\n",
-                net.destination, net.request_count
+                destination, net.request_count
             ));
             output.push_str(&format!(
                 "sentinel_llm_errors_total{{destination=\"{}\"}} {}\n",
-                net.destination, net.error_count
+                destination, net.error_count
             ));
             output.push_str(&format!(
                 "sentinel_llm_bytes_total{{destination=\"{}\",direction=\"sent\"}} {}\n",
-                net.destination, net.bytes_sent
+                destination, net.bytes_sent
             ));
             output.push_str(&format!(
                 "sentinel_llm_bytes_total{{destination=\"{}\",direction=\"received\"}} {}\n",
-                net.destination, net.bytes_received
+                destination, net.bytes_received
             ));
         }
 
@@ -284,6 +320,7 @@ impl MetricsExporter {
         );
         output.push_str("# TYPE sentinel_agent_cpu_pressure_stress gauge\n");
         for (agent, psi) in &snapshot.psi_metrics {
+            let agent = escape_label_value(agent);
             output.push_str(&format!(
                 "sentinel_agent_cpu_pressure_stress{{agent=\"{}\"}} {:.4}\n",
                 agent, psi.combined_stress
@@ -487,5 +524,176 @@ mod tests {
         assert!(output
             .contains("sentinel_llm_bytes_total{destination=\"api.anthropic.com:443\",direction=\"received\"} 40960"));
         assert!(output.contains("sentinel_agent_cpu_pressure_stress{agent=\"AGENT-01\"}"));
+    }
+
+    // ── #25: label-value escaping ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn escape_label_value_escapes_quotes() {
+        // AC-1: inner quotes in real agent nicknames (e.g. Tobias "Tobi" Lehmann).
+        assert_eq!(
+            escape_label_value(r#"Tobias "Tobi" Lehmann"#).as_ref(),
+            r#"Tobias \"Tobi\" Lehmann"#
+        );
+    }
+
+    #[test]
+    fn escape_label_value_escapes_backslash() {
+        // AC-2.
+        assert_eq!(escape_label_value(r"A\B").as_ref(), r"A\\B");
+    }
+
+    #[test]
+    fn escape_label_value_escapes_newline() {
+        // AC-3: LF -> \n (backslash+n); no raw 0x0A remains.
+        let escaped = escape_label_value("line1\nline2");
+        assert_eq!(escaped.as_ref(), "line1\\nline2");
+        assert!(!escaped.contains('\n'));
+    }
+
+    #[test]
+    fn escape_label_value_strips_carriage_return() {
+        // AC-8: CR is stripped (a strict parser rejects a `\r` escape).
+        assert_eq!(escape_label_value("a\rb").as_ref(), "ab");
+        assert!(!escape_label_value("a\r\nb").contains('\r'));
+    }
+
+    #[test]
+    fn escape_label_value_clean_is_borrowed() {
+        // AC-9 / 1:n: a clean value takes the no-allocation fast path; a special char allocates.
+        assert!(matches!(escape_label_value("AGENT-07"), Cow::Borrowed(_)));
+        assert!(matches!(escape_label_value("a\"b"), Cow::Owned(_)));
+    }
+
+    /// Minimal Prometheus label-value parser (local replacement for `promtool check metrics`,
+    /// AC-6): for every `{...}` label set each `"..."` value may only contain the escapes
+    /// `\"`, `\\`, `\n` — never a raw `"`, 0x0A, or 0x0D. Panics on a violation.
+    fn assert_no_raw_special_chars_in_labels(metrics: &str) {
+        for line in metrics.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let (Some(start), Some(end)) = (line.find('{'), line.rfind('}')) else {
+                continue;
+            };
+            let bytes = &line.as_bytes()[start + 1..end];
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] != b'"' {
+                    i += 1;
+                    continue;
+                }
+                i += 1; // enter a label value
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => {
+                            assert!(
+                                i + 1 < bytes.len() && matches!(bytes[i + 1], b'\\' | b'"' | b'n'),
+                                "invalid escape in label value: {line}"
+                            );
+                            i += 2;
+                        }
+                        b'"' => {
+                            i += 1;
+                            break; // end of value
+                        }
+                        b'\n' | b'\r' => panic!("raw newline/CR in label value: {line:?}"),
+                        _ => i += 1,
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn export_snapshot_escapes_quoted_agent_name() {
+        // AC-4: a quoted agent name produces a valid, escaped sentinel_agent_stalled line; cgroup
+        // name with quotes+backslash and a destination with a raw newline are also escaped/stripped.
+        use crate::collector::{IoSnapshot, MetricsSnapshot, NetworkSnapshot, StalledAgent};
+        use std::collections::HashMap;
+
+        let mut io_metrics = HashMap::new();
+        io_metrics.insert(
+            7,
+            IoSnapshot {
+                cgroup_name: r#"cg "weird" \name"#.to_string(),
+                read_ops: 1,
+                write_ops: 1,
+                read_bytes: 1,
+                write_bytes: 1,
+            },
+        );
+        let mut network_metrics = HashMap::new();
+        network_metrics.insert(
+            "x".to_string(),
+            NetworkSnapshot {
+                destination: "host\"evil\nline".to_string(),
+                request_count: 1,
+                avg_latency_us: 1,
+                bytes_sent: 1,
+                bytes_received: 1,
+                error_count: 0,
+            },
+        );
+
+        let snapshot = MetricsSnapshot {
+            stalled_agents: vec![StalledAgent {
+                cgroup_id: 42,
+                agent_name: r#"Tobias "Tobi" Lehmann"#.to_string(),
+                seconds_since_write: 65,
+            }],
+            io_metrics,
+            network_metrics,
+            psi_metrics: HashMap::new(),
+            cycle_duration: Duration::from_micros(100),
+            mode: MonitoringMode::Userspace,
+            ring_buffer_drops: 0,
+        };
+
+        let output = MetricsExporter::export_snapshot(&snapshot);
+        assert!(output.contains(
+            r#"sentinel_agent_stalled{cgroup_id="42",agent="Tobias \"Tobi\" Lehmann"} 1"#
+        ));
+        assert!(output.contains(r#"cgroup_name="cg \"weird\" \\name""#));
+        assert!(
+            !output.contains("evil\nline"),
+            "destination newline not stripped/escaped"
+        );
+        assert_no_raw_special_chars_in_labels(&output);
+    }
+
+    #[test]
+    fn parser_check_passes_on_special_char_snapshot() {
+        // AC-6 local equivalent: the full snapshot export passes the minimal label parser.
+        use crate::collector::{MetricsSnapshot, PsiSnapshot, StalledAgent};
+        use std::collections::HashMap;
+
+        let mut psi_metrics = HashMap::new();
+        psi_metrics.insert(
+            r#"Katharina "Kathi" Wiegand"#.to_string(),
+            PsiSnapshot {
+                cpu_avg10: 1.0,
+                memory_avg10: 1.0,
+                io_avg10: 1.0,
+                combined_stress: 0.5,
+            },
+        );
+        let snapshot = MetricsSnapshot {
+            stalled_agents: vec![StalledAgent {
+                cgroup_id: 1,
+                agent_name: r#"Gabriele "Gabi" Fuchs"#.to_string(),
+                seconds_since_write: 40,
+            }],
+            io_metrics: HashMap::new(),
+            network_metrics: HashMap::new(),
+            psi_metrics,
+            cycle_duration: Duration::from_micros(100),
+            mode: MonitoringMode::Userspace,
+            ring_buffer_drops: 0,
+        };
+        let output = MetricsExporter::export_snapshot(&snapshot);
+        assert_no_raw_special_chars_in_labels(&output);
+        assert!(output.contains(r#"agent="Gabriele \"Gabi\" Fuchs""#));
+        assert!(output.contains(r#"agent="Katharina \"Kathi\" Wiegand""#));
     }
 }
