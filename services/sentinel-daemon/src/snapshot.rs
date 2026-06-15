@@ -195,6 +195,13 @@ impl SnapshotManager {
             &bytes,
         )?;
 
+        // #492: pin the CAS blobs this snapshot's FS metadata references, so Trash GC cannot delete
+        // them while the snapshot is retained (pointer manifest from inode hashes, not a blob copy).
+        if let (Some(layer), Some(dump)) = (fs_layer, snapshot.fs_metadata.as_ref()) {
+            let hashes = sentinel_fs::metadata::referenced_blob_hashes(dump);
+            layer.meta().pin_snapshot_blobs(&snapshot_id, &hashes)?;
+        }
+
         self.last_snapshot_tick = tick;
         // #529: erzwungener Shift-Anker erledigt — Flag zuruecksetzen (Intervall ab hier ab tick).
         self.shift_snapshot_pending = false;
@@ -216,7 +223,11 @@ impl SnapshotManager {
     ///
     /// Promoted Snapshots durch die Tiers und loescht abgelaufene.
     /// Auto-Prune loescht Events vor dem zweitneuesten Snapshot.
-    pub fn maintain(&mut self, event_store: &Arc<EventStore>) -> anyhow::Result<MaintenanceReport> {
+    pub fn maintain(
+        &mut self,
+        event_store: &Arc<EventStore>,
+        fs_layer: Option<&LayerManager>,
+    ) -> anyhow::Result<MaintenanceReport> {
         let snapshots = event_store.list_world_snapshots()?;
         if snapshots.is_empty() {
             return Ok(MaintenanceReport::default());
@@ -243,7 +254,7 @@ impl SnapshotManager {
                         debug!(id = %snap.id, "Snapshot promoted: hourly → daily");
                     }
                 } else {
-                    delete_redundant(event_store, snap, now_ms, &mut report)?;
+                    delete_redundant(event_store, fs_layer, snap, now_ms, &mut report)?;
                 }
             }
         }
@@ -262,7 +273,7 @@ impl SnapshotManager {
                         debug!(id = %snap.id, "Snapshot promoted: daily → weekly");
                     }
                 } else {
-                    delete_redundant(event_store, snap, now_ms, &mut report)?;
+                    delete_redundant(event_store, fs_layer, snap, now_ms, &mut report)?;
                 }
             }
         }
@@ -284,7 +295,7 @@ impl SnapshotManager {
                         debug!(id = %snap.id, "Snapshot promoted: weekly → monthly");
                     }
                 } else {
-                    delete_redundant(event_store, snap, now_ms, &mut report)?;
+                    delete_redundant(event_store, fs_layer, snap, now_ms, &mut report)?;
                 }
             }
         }
@@ -411,6 +422,7 @@ fn is_immutability_block(err: &anyhow::Error) -> bool {
 /// = #264-Drift-Alarm, bei korrektem Boundary-Invariant immer 0). Echte DB-Fehler propagieren.
 fn delete_redundant(
     event_store: &Arc<EventStore>,
+    fs_layer: Option<&LayerManager>,
     snap: &SnapshotMeta,
     now_ms: i64,
     report: &mut MaintenanceReport,
@@ -424,7 +436,17 @@ fn delete_redundant(
         return Ok(());
     }
     match event_store.delete_world_snapshot(&snap.id) {
-        Ok(true) => report.deleted += 1,
+        Ok(true) => {
+            report.deleted += 1;
+            // #492: the snapshot is gone → release its blob pins so the referenced blobs become
+            // Trash-GC-eligible once no live refcount / other snapshot pin holds them. Best-effort:
+            // a pin leak only delays GC, never corrupts.
+            if let Some(layer) = fs_layer {
+                if let Err(e) = layer.meta().unpin_snapshot_blobs(&snap.id) {
+                    debug!(id = %snap.id, error = %e, "unpin_snapshot_blobs fehlgeschlagen");
+                }
+            }
+        }
         Ok(false) => {} // Zeile bereits weg (Race) — kein Fehler.
         Err(e) if is_immutability_block(&e) => {
             // Drift-Alarm: bei korrektem Boundary-Invariant unerreichbar (Daemon haette skippt).
@@ -696,7 +718,7 @@ mod tests {
             .find(|s| s.id == "young")
             .unwrap();
         let mut report = MaintenanceReport::default();
-        delete_redundant(&store, &snap, now, &mut report).unwrap();
+        delete_redundant(&store, None, &snap, now, &mut report).unwrap();
         assert_eq!(
             report.kept_protected, 1,
             "junger Snapshot bleibt geschuetzt"
@@ -732,7 +754,7 @@ mod tests {
             .unwrap();
         let future_now = snap.created_at_ms + sentinel_limbo::IMMUTABLE_SNAPSHOT_MS + 1000;
         let mut report = MaintenanceReport::default();
-        delete_redundant(&store, &snap, future_now, &mut report).unwrap();
+        delete_redundant(&store, None, &snap, future_now, &mut report).unwrap();
         assert_eq!(
             report.delete_blocked_young, 1,
             "Trigger-Block wird gezaehlt statt geschluckt"

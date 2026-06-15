@@ -9,6 +9,7 @@ use crate::cas::{CasStore, ChunkGcStats};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 use sentinel_common::FsMetadataDump;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::SystemTime;
 use tracing::instrument;
@@ -27,7 +28,29 @@ const CAS_REFCOUNT: TableDefinition<&[u8; 32], u32> = TableDefinition::new("cas_
 /// Grace-period Trash-Queue fuer null-ref CAS-Bloecke.
 const FS_TRASH_QUEUE: TableDefinition<&[u8; 32], u64> = TableDefinition::new("fs_trash_queue");
 
+/// #492: explicit snapshot blob pin manifest. `(snapshot_id, blob_hash)` -> pinned_at_ms.
+/// A retained world snapshot pins every CAS blob its inode tree references, so Trash GC cannot
+/// delete a blob that a retained snapshot still needs (key ordered by `snapshot_id` first so an
+/// unpin is a prefix range over one snapshot). The pin is a pointer, never a blob copy (1:n).
+const FS_SNAPSHOT_BLOB_REFS: TableDefinition<(&str, &[u8; 32]), u64> =
+    TableDefinition::new("fs_snapshot_blob_refs");
+
 const INODE_DATA_BINCODE_V1: &[u8; 4] = b"SFI1";
+
+/// #492: the CAS blob hashes a snapshot's FS metadata actually references — the inode hashes of
+/// regular files in the dump. NOT the `refcounts` aggregate (that is live-fs metadata state, not a
+/// retention manifest, Codex objection round 3). Deduplicated. Used to build the pin manifest.
+pub fn referenced_blob_hashes(dump: &FsMetadataDump) -> Vec<[u8; 32]> {
+    let mut set: HashSet<[u8; 32]> = HashSet::new();
+    for (_agent_id, _inode, bytes) in &dump.inodes {
+        if let Ok(data) = InodeData::deserialize(bytes) {
+            if data.kind == FileKind::Regular && data.size != u64::MAX && data.hash != [0u8; 32] {
+                set.insert(data.hash);
+            }
+        }
+    }
+    set.into_iter().collect()
+}
 
 // --- Types ---
 
@@ -177,6 +200,7 @@ impl MetadataStore {
             write_txn.open_table(FS_DIRENTS)?;
             write_txn.open_table(CAS_REFCOUNT)?;
             write_txn.open_table(FS_TRASH_QUEUE)?;
+            write_txn.open_table(FS_SNAPSHOT_BLOB_REFS)?;
         }
         write_txn.commit()?;
 
@@ -409,6 +433,70 @@ impl MetadataStore {
         Ok(restored)
     }
 
+    // === #492 SNAPSHOT BLOB PINNING ===
+
+    /// Pin every blob hash a world snapshot references (pointer manifest, no blob copy). Idempotent.
+    pub fn pin_snapshot_blobs(&self, snapshot_id: &str, hashes: &[[u8; 32]]) -> anyhow::Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(FS_SNAPSHOT_BLOB_REFS)?;
+            for hash in hashes {
+                table.insert((snapshot_id, hash), now_ms)?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Release all pins of a snapshot (when it leaves the retention window). Returns count unpinned.
+    pub fn unpin_snapshot_blobs(&self, snapshot_id: &str) -> anyhow::Result<u64> {
+        let to_remove: Vec<[u8; 32]> = {
+            let read_txn = self.db.begin_read()?;
+            let table = read_txn.open_table(FS_SNAPSHOT_BLOB_REFS)?;
+            let mut v = Vec::new();
+            for entry in table.iter()? {
+                let (key, _) = entry?;
+                let (sid, hash) = key.value();
+                if sid == snapshot_id {
+                    v.push(*hash);
+                }
+            }
+            v
+        };
+        if to_remove.is_empty() {
+            return Ok(0);
+        }
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = write_txn.open_table(FS_SNAPSHOT_BLOB_REFS)?;
+            for hash in &to_remove {
+                table.remove((snapshot_id, hash))?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(to_remove.len() as u64)
+    }
+
+    /// All blob hashes currently pinned by any retained snapshot — a transient set for one GC pass.
+    pub fn pinned_hashes(&self) -> anyhow::Result<HashSet<[u8; 32]>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(FS_SNAPSHOT_BLOB_REFS)?;
+        let mut set = HashSet::new();
+        for entry in table.iter()? {
+            let (key, _) = entry?;
+            let (_sid, hash) = key.value();
+            set.insert(*hash);
+        }
+        Ok(set)
+    }
+
     /// Dump all sentinel-fs metadata tables for a world snapshot.
     pub fn dump_all_tables(&self) -> anyhow::Result<FsMetadataDump> {
         let read_txn = self.db.begin_read()?;
@@ -539,6 +627,10 @@ impl MetadataStore {
             .as_millis() as u64;
         let cutoff_ms = now_ms.saturating_sub(grace_period_hours * 3600 * 1000);
 
+        // #492: a blob pinned by any retained snapshot must not be GC'd even at refcount 0.
+        // Read the pin set once per pass into a transient HashSet (O(1) membership per blob).
+        let pinned = self.pinned_hashes()?;
+
         let expired_hashes = {
             let read_txn = self.db.begin_read()?;
             let trash = read_txn.open_table(FS_TRASH_QUEUE)?;
@@ -548,7 +640,10 @@ impl MetadataStore {
                 let (key, value) = entry?;
                 let hash = *key.value();
                 let trashed_at_ms = value.value();
-                if trashed_at_ms <= cutoff_ms && refs.get(&hash)?.is_none() {
+                if trashed_at_ms <= cutoff_ms
+                    && refs.get(&hash)?.is_none()
+                    && !pinned.contains(&hash)
+                {
                     hashes.push(hash);
                 }
             }
@@ -1086,6 +1181,90 @@ mod tests {
         assert_eq!(stats.freed_from_trash, 1);
         assert!(!cas.contains(&hash));
         assert_eq!(store.get_trash_timestamp(&hash).unwrap(), None);
+    }
+
+    /// #492 helper: only regular-file inode hashes are referenced (not directories, not refcounts).
+    #[test]
+    fn referenced_blob_hashes_extracts_regular_inode_hashes() {
+        let (store, _dir) = temp_meta();
+        let h_reg = [11u8; 32];
+        store
+            .set_inode("AGENT-01", 2, &InodeData::regular(h_reg, 10, 0o644))
+            .unwrap();
+        store
+            .set_inode("AGENT-01", 1, &InodeData::directory(0o755))
+            .unwrap();
+        let dump = store.dump_all_tables().unwrap();
+        let refs = referenced_blob_hashes(&dump);
+        assert_eq!(
+            refs,
+            vec![h_reg],
+            "only the regular file's hash, no directory"
+        );
+    }
+
+    /// #492 AC-2/AC-3: a snapshot pin blocks Trash GC; unpinning makes the blob GC-eligible again.
+    #[test]
+    fn snapshot_pin_blocks_gc_then_unpin_frees() {
+        let (store, dir) = temp_meta();
+        let cas = CasStore::open(dir.path()).unwrap();
+        let content = b"issue-492-pinned-blob";
+        let (hash, _) = cas.store(content).unwrap();
+        let data = InodeData::regular(hash, content.len() as u64, 0o644);
+        store.create_file("AGENT-01", 1, "f.txt", 2, &data).unwrap();
+        store.remove_file("AGENT-01", 1, "f.txt", 2).unwrap(); // refcount -> 0, into trash
+        let old = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+            - 25 * 3600 * 1000;
+        store.set_trash_timestamp(&hash, Some(old)).unwrap();
+
+        // AC-2: pinned by a retained snapshot → GC must NOT delete it despite refcount 0 + expired.
+        store.pin_snapshot_blobs("snap-A", &[hash]).unwrap();
+        let stats = store.gc_trash(&cas, 24).unwrap();
+        assert_eq!(stats.freed_from_trash, 0, "pinned blob must survive GC");
+        assert!(cas.contains(&hash), "pinned blob still on disk");
+
+        // AC-3: after the snapshot is removed (unpin), the blob becomes GC-eligible and is freed.
+        let n = store.unpin_snapshot_blobs("snap-A").unwrap();
+        assert_eq!(n, 1);
+        let stats = store.gc_trash(&cas, 24).unwrap();
+        assert_eq!(stats.freed_from_trash, 1, "unpinned blob now GC-eligible");
+        assert!(!cas.contains(&hash));
+    }
+
+    /// #492: pin set survives partial unpin (a blob pinned by two snapshots stays until both go).
+    #[test]
+    fn pin_survives_until_last_snapshot_unpinned() {
+        let (store, _dir) = temp_meta();
+        let hash = [22u8; 32];
+        store.pin_snapshot_blobs("snap-A", &[hash]).unwrap();
+        store.pin_snapshot_blobs("snap-B", &[hash]).unwrap();
+        assert!(store.pinned_hashes().unwrap().contains(&hash));
+        store.unpin_snapshot_blobs("snap-A").unwrap();
+        assert!(
+            store.pinned_hashes().unwrap().contains(&hash),
+            "still pinned by snap-B"
+        );
+        store.unpin_snapshot_blobs("snap-B").unwrap();
+        assert!(!store.pinned_hashes().unwrap().contains(&hash));
+    }
+
+    /// #492 AC-4: a V1 snapshot (no FS metadata → no pins) drives no delete; unpinning a snapshot
+    /// that never pinned is a safe no-op and does not touch other snapshots' pins.
+    #[test]
+    fn v1_snapshot_no_pins_unpin_is_noop() {
+        let (store, _dir) = temp_meta();
+        let hash = [33u8; 32];
+        store.pin_snapshot_blobs("snap-A", &[hash]).unwrap();
+        // V1 snapshot id never pinned anything (fs_metadata: None at create time).
+        let n = store.unpin_snapshot_blobs("v1-snapshot").unwrap();
+        assert_eq!(n, 0, "no pins to release for a V1 snapshot");
+        assert!(
+            store.pinned_hashes().unwrap().contains(&hash),
+            "other snapshot's pin untouched"
+        );
     }
 
     #[test]
