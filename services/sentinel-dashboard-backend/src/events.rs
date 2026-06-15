@@ -106,6 +106,34 @@ pub(crate) fn event_to_json(event: &EventRow) -> Value {
     })
 }
 
+/// #493: read the discarded-future id-intervals from `sim_metadata.dead_ranges` and build a dead-range
+/// exclusion fragment (` AND NOT (id > ? AND id <= ?) …`, anonymous placeholders) plus the params to
+/// append in order. Empty / missing table → empty fragment (graceful on older event.db schemas). The
+/// console event feed consults the SAME `dead_ranges` SSOT the event store guards its reads with, so a
+/// restore's discarded "future" never shows up in the timeline (AC-2).
+pub(crate) fn dead_range_filter(conn: &Connection) -> (String, Vec<SqlValue>) {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM sim_metadata WHERE key = 'dead_ranges'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let ranges: Vec<(i64, i64)> = raw
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    let mut sql = String::new();
+    let mut params = Vec::with_capacity(ranges.len() * 2);
+    for (from, to) in ranges {
+        sql.push_str(" AND NOT (id > ? AND id <= ?)");
+        params.push(SqlValue::Integer(from));
+        params.push(SqlValue::Integer(to));
+    }
+    (sql, params)
+}
+
 fn offline_events_payload(limit: usize, offset: usize) -> Value {
     json!({
         "events": [],
@@ -152,11 +180,18 @@ pub async fn events(State(st): State<AppState>, Query(q): Query<EventsQuery>) ->
         conditions.push("timestamp_ms > ?");
         params.push(SqlValue::Integer(since));
     }
+    // #493: never show events from a restore-discarded future in the console event feed.
+    let (dead_sql, dead_params) = dead_range_filter(&conn);
     let where_clause = if conditions.is_empty() {
-        String::new()
+        if dead_sql.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE 1=1{dead_sql}")
+        }
     } else {
-        format!("WHERE {}", conditions.join(" AND "))
+        format!("WHERE {}{dead_sql}", conditions.join(" AND "))
     };
+    params.extend(dead_params);
 
     let count_sql = format!("SELECT COUNT(*) FROM events {where_clause}");
     let total = conn
@@ -245,15 +280,14 @@ pub(crate) fn events_after_id(
     }
     let conn = open_events_ro(db_path)?;
     let columns = event_select_columns(&conn);
-    let sql = format!("SELECT {columns} FROM events WHERE id > ? ORDER BY id ASC LIMIT ?");
-    let rows = query_event_rows(
-        &conn,
-        &sql,
-        &[
-            SqlValue::Integer(offset),
-            SqlValue::Integer(limit.min(10_000) as i64),
-        ],
-    )?;
+    // #493: the live stream must not surface a restore-discarded future.
+    let (dead_sql, dead_params) = dead_range_filter(&conn);
+    let sql =
+        format!("SELECT {columns} FROM events WHERE id > ?{dead_sql} ORDER BY id ASC LIMIT ?");
+    let mut sql_params = vec![SqlValue::Integer(offset)];
+    sql_params.extend(dead_params);
+    sql_params.push(SqlValue::Integer(limit.min(10_000) as i64));
+    let rows = query_event_rows(&conn, &sql, &sql_params)?;
     Ok(rows.iter().map(event_to_json).collect())
 }
 
@@ -267,12 +301,13 @@ pub(crate) fn event_log_backfill_events(
     }
     let conn = open_events_ro(db_path)?;
     let columns = event_select_columns(&conn);
-    let recent_sql = format!("SELECT {columns} FROM events ORDER BY id DESC LIMIT ?");
-    let mut rows = query_event_rows(
-        &conn,
-        &recent_sql,
-        &[SqlValue::Integer(recent_limit.min(10_000) as i64)],
-    )?;
+    // #493: backfill of the most-recent events excludes a restore-discarded future.
+    let (dead_sql, dead_params) = dead_range_filter(&conn);
+    let recent_sql =
+        format!("SELECT {columns} FROM events WHERE 1=1{dead_sql} ORDER BY id DESC LIMIT ?");
+    let mut recent_params = dead_params;
+    recent_params.push(SqlValue::Integer(recent_limit.min(10_000) as i64));
+    let mut rows = query_event_rows(&conn, &recent_sql, &recent_params)?;
 
     if focus_limit > 0 {
         for event_type in ["chaos_triggered", "agent_action_received"] {
@@ -295,15 +330,15 @@ fn events_by_type(
     event_type: &str,
     limit: usize,
 ) -> rusqlite::Result<Vec<EventRow>> {
-    let sql = format!("SELECT {columns} FROM events WHERE event_type = ? ORDER BY id DESC LIMIT ?");
-    query_event_rows(
-        conn,
-        &sql,
-        &[
-            SqlValue::Text(event_type.to_string()),
-            SqlValue::Integer(limit.min(1_000) as i64),
-        ],
-    )
+    // #493: focus backfill (per event_type) also excludes a restore-discarded future.
+    let (dead_sql, dead_params) = dead_range_filter(conn);
+    let sql = format!(
+        "SELECT {columns} FROM events WHERE event_type = ?{dead_sql} ORDER BY id DESC LIMIT ?"
+    );
+    let mut sql_params = vec![SqlValue::Text(event_type.to_string())];
+    sql_params.extend(dead_params);
+    sql_params.push(SqlValue::Integer(limit.min(1_000) as i64));
+    query_event_rows(conn, &sql, &sql_params)
 }
 
 pub(crate) fn room_history(db_path: &str, room_id: &str) -> Value {
@@ -724,6 +759,72 @@ mod tests {
         let events = events_after_id(&db_path, 0, 10).unwrap();
         assert_eq!(events[0]["id"], 7);
         assert_eq!(events[0]["compensation_type"], "none");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #493 AC-2: the console event feed never surfaces a restore-discarded future. With
+    /// `sim_metadata.dead_ranges = [[2,5]]`, ids 3,4,5 are dead and must not appear in the stream or
+    /// the recent backfill.
+    #[test]
+    fn console_feed_excludes_restore_discarded_future() {
+        let (dir, db_path) = temp_events_db(true);
+        let conn = Connection::open(&db_path).unwrap();
+        for id in 1..=6 {
+            insert_event(&conn, id, "agent_action_received", "agent-1", r#"{"x":1}"#);
+        }
+        conn.execute_batch(
+            "CREATE TABLE sim_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+             INSERT INTO sim_metadata (key, value, updated_at) VALUES ('dead_ranges', '[[2,5]]', 1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let stream_ids: Vec<i64> = events_after_id(&db_path, 0, 500)
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(stream_ids, vec![1, 2, 6], "live stream excludes dead 3,4,5");
+
+        let recent_ids: Vec<i64> = event_log_backfill_events(&db_path, 100, 0)
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            recent_ids,
+            vec![1, 2, 6],
+            "recent backfill excludes dead 3,4,5"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #493: the feed degrades gracefully on an event.db whose schema predates `sim_metadata`
+    /// (the filter is a no-op, all events are returned).
+    #[test]
+    fn console_feed_tolerates_missing_sim_metadata() {
+        let (dir, db_path) = temp_events_db(true);
+        let conn = Connection::open(&db_path).unwrap();
+        for id in 1..=3 {
+            insert_event(&conn, id, "agent_action_received", "agent-1", r#"{"x":1}"#);
+        }
+        // no sim_metadata table at all
+        let (sql, params) = dead_range_filter(&conn);
+        assert!(sql.is_empty(), "missing sim_metadata -> empty fragment");
+        assert!(params.is_empty());
+        drop(conn);
+
+        let ids: Vec<i64> = events_after_id(&db_path, 0, 500)
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "all events returned without sim_metadata"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -3173,6 +3173,19 @@ fn commit_world_restore_stores(
     }
     failure_point.fail_if(RestoreCommitFailurePoint::AfterProjection)?;
 
+    // #493 (TM-5): the jump back discards the "future" `(anchor, head]`. The anchor cursor is the
+    // post-replay target (events up to the target were re-applied and stay alive) or, without replay,
+    // the anchor snapshot's `last_event_id`. Bump the persistent restore generation and record the
+    // dead id-interval so every read path excludes it and the pruner removes it in the retention
+    // window. `push_dead_range` is a no-op when nothing was discarded (anchor == head).
+    let anchor_event_id = target_event_id.unwrap_or(snapshot.last_event_id);
+    event_store
+        .increment_restore_generation()
+        .context("Restore-Generation erhoehen fehlgeschlagen")?;
+    event_store
+        .push_dead_range(anchor_event_id, max_event_id)
+        .context("Dead-Branch markieren fehlgeschlagen")?;
+
     let restore_event = sentinel_common::DomainEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         event_type: "snapshot_restored".to_string(),
@@ -5544,7 +5557,7 @@ fn ecs_tick_loop(
                         Ok(id) => {
                             debug!(snapshot_id = %id, "World Snapshot erstellt");
                             // Maintenance: Promotion + Cleanup
-                            if let Err(e) = snapshot_manager.maintain(&es) {
+                            if let Err(e) = snapshot_manager.maintain(&es, fs_layer.as_deref()) {
                                 warn!(error = %e, "Snapshot Maintenance fehlgeschlagen");
                             }
                         }
@@ -6428,6 +6441,71 @@ mod tests {
                 assert_eq!(nmda_score_max, Some(0.3));
             }
             other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    /// #493 AC-5 (couples #491): a discarded future must NEVER enter the bounded-replay hash chain.
+    /// The live timeline is A,B,E,F; C,D are the old future a restore discards (dead interval (2,4]).
+    /// Replaying the guarded range must reproduce the ground-truth forward hash of A,B,E,F exactly
+    /// (STRICT/CORE) with C,D never contributing — the most dangerous Time-Machine break if regressed.
+    #[test]
+    fn dead_branch_excluded_from_replay_hash_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_store = EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap();
+        let run_id = "replay-dead-boundary";
+        let mk = |name: &str, tick: u64| {
+            sentinel_common::DomainEvent::new(
+                "agent_action_received",
+                "AGENT-01",
+                &format!("{{\"step\":\"{name}\"}}"),
+                run_id,
+                tick,
+            )
+        };
+
+        let a = mk("A", 1);
+        event_store.append_event(&a).unwrap();
+        let b = mk("B", 2);
+        event_store.append_event(&b).unwrap();
+        // old future C,D (ids 3,4) — discarded by the restore below
+        let c = mk("C", 3);
+        event_store.append_event(&c).unwrap();
+        let d = mk("D", 4);
+        event_store.append_event(&d).unwrap();
+
+        event_store.increment_restore_generation().unwrap();
+        event_store.push_dead_range(2, 4).unwrap(); // (2,4] dead -> ids 3,4
+
+        // live continuation E,F (ids 5,6)
+        let e = mk("E", 3);
+        event_store.append_event(&e).unwrap();
+        let f = mk("F", 4);
+        event_store.append_event(&f).unwrap();
+
+        // ground-truth forward hash over the LIVE timeline A,B,E,F (C,D never applied)
+        let mut truth = NightrunHashChain::new(run_id, run_id);
+        for ev in [&a, &b, &e, &f] {
+            truth.extend(ev);
+        }
+
+        // replay the full range through the guarded read (the #491 bounded-replay input)
+        let replayed = event_store.get_events_range(0, 6).unwrap();
+        assert_eq!(replayed.len(), 4, "C,D excluded from the replay input");
+        let mut chain = NightrunHashChain::new(run_id, run_id);
+        for ev in &replayed {
+            chain.extend(ev);
+        }
+        assert_eq!(
+            chain.current_hash(),
+            truth.current_hash(),
+            "STRICT/CORE: a discarded future never replays into the restored world"
+        );
+        for dead in [&c, &d] {
+            assert!(
+                !replayed.iter().any(|ev| ev.event_id == dead.event_id),
+                "dead event {} replayed",
+                dead.event_id
+            );
         }
     }
 

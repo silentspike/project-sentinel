@@ -3,6 +3,7 @@
 //! Erstellt periodisch World Snapshots (bincode), promoted sie durch
 //! Tiers (hourly→daily→weekly→monthly) und loescht abgelaufene.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -195,6 +196,13 @@ impl SnapshotManager {
             &bytes,
         )?;
 
+        // #492: pin the CAS blobs this snapshot's FS metadata references, so Trash GC cannot delete
+        // them while the snapshot is retained (pointer manifest from inode hashes, not a blob copy).
+        if let (Some(layer), Some(dump)) = (fs_layer, snapshot.fs_metadata.as_ref()) {
+            let hashes = sentinel_fs::metadata::referenced_blob_hashes(dump);
+            layer.meta().pin_snapshot_blobs(&snapshot_id, &hashes)?;
+        }
+
         self.last_snapshot_tick = tick;
         // #529: erzwungener Shift-Anker erledigt — Flag zuruecksetzen (Intervall ab hier ab tick).
         self.shift_snapshot_pending = false;
@@ -216,7 +224,11 @@ impl SnapshotManager {
     ///
     /// Promoted Snapshots durch die Tiers und loescht abgelaufene.
     /// Auto-Prune loescht Events vor dem zweitneuesten Snapshot.
-    pub fn maintain(&mut self, event_store: &Arc<EventStore>) -> anyhow::Result<MaintenanceReport> {
+    pub fn maintain(
+        &mut self,
+        event_store: &Arc<EventStore>,
+        fs_layer: Option<&LayerManager>,
+    ) -> anyhow::Result<MaintenanceReport> {
         let snapshots = event_store.list_world_snapshots()?;
         if snapshots.is_empty() {
             return Ok(MaintenanceReport::default());
@@ -229,21 +241,33 @@ impl SnapshotManager {
 
         let mut report = MaintenanceReport::default();
 
+        // #535: the `snapshots` list is read ONCE and never reflects this run's own promotions, so two
+        // siblings of the same calendar period would BOTH pass `has_snapshot_for_*` (which queries the
+        // stale list) and both promote -> a double keeper. This in-run set records the periods already
+        // promoted in THIS pass; a sibling whose period is taken is treated as redundant instead.
+        // Key = (tier discriminant, calendar period key): day/week = num_days_from_ce; month = y*100+m.
+        let mut promoted_periods: HashSet<(u8, i64)> = HashSet::new();
+
         // Promotion: hourly → daily (aelter als daily_keep_hours)
         let daily_cutoff_ms = now_ms - (self.config.daily_keep_hours as i64 * 3600 * 1000);
         for snap in &snapshots {
             if snap.tier == SnapshotTier::Hourly && snap.created_at_ms < daily_cutoff_ms {
                 // Promoten statt loeschen — es sei denn es gibt schon einen Daily fuer diesen Tag
-                if !self.has_snapshot_for_day(&snapshots, SnapshotTier::Daily, snap.created_at_ms) {
+                // (stale-Liste ODER in DIESEM Lauf schon promotet, #535).
+                let period = (0u8, calendar_day_key(snap.created_at_ms) as i64);
+                if !self.has_snapshot_for_day(&snapshots, SnapshotTier::Daily, snap.created_at_ms)
+                    && !promoted_periods.contains(&period)
+                {
                     if event_store
                         .promote_world_snapshot(&snap.id, "daily")
                         .unwrap_or(false)
                     {
                         report.promoted += 1;
+                        promoted_periods.insert(period);
                         debug!(id = %snap.id, "Snapshot promoted: hourly → daily");
                     }
                 } else {
-                    delete_redundant(event_store, snap, now_ms, &mut report)?;
+                    delete_redundant(event_store, fs_layer, snap, now_ms, &mut report)?;
                 }
             }
         }
@@ -252,17 +276,20 @@ impl SnapshotManager {
         let weekly_cutoff_ms = now_ms - (self.config.weekly_keep_days as i64 * 86400 * 1000);
         for snap in &snapshots {
             if snap.tier == SnapshotTier::Daily && snap.created_at_ms < weekly_cutoff_ms {
+                let period = (1u8, calendar_week_key(snap.created_at_ms) as i64);
                 if !self.has_snapshot_for_week(&snapshots, SnapshotTier::Weekly, snap.created_at_ms)
+                    && !promoted_periods.contains(&period)
                 {
                     if event_store
                         .promote_world_snapshot(&snap.id, "weekly")
                         .unwrap_or(false)
                     {
                         report.promoted += 1;
+                        promoted_periods.insert(period);
                         debug!(id = %snap.id, "Snapshot promoted: daily → weekly");
                     }
                 } else {
-                    delete_redundant(event_store, snap, now_ms, &mut report)?;
+                    delete_redundant(event_store, fs_layer, snap, now_ms, &mut report)?;
                 }
             }
         }
@@ -271,20 +298,24 @@ impl SnapshotManager {
         let monthly_cutoff_ms = now_ms - (self.config.monthly_keep_weeks as i64 * 7 * 86400 * 1000);
         for snap in &snapshots {
             if snap.tier == SnapshotTier::Weekly && snap.created_at_ms < monthly_cutoff_ms {
+                let (year, month) = calendar_month_key(snap.created_at_ms);
+                let period = (2u8, year as i64 * 100 + month as i64);
                 if !self.has_snapshot_for_month(
                     &snapshots,
                     SnapshotTier::Monthly,
                     snap.created_at_ms,
-                ) {
+                ) && !promoted_periods.contains(&period)
+                {
                     if event_store
                         .promote_world_snapshot(&snap.id, "monthly")
                         .unwrap_or(false)
                     {
                         report.promoted += 1;
+                        promoted_periods.insert(period);
                         debug!(id = %snap.id, "Snapshot promoted: weekly → monthly");
                     }
                 } else {
-                    delete_redundant(event_store, snap, now_ms, &mut report)?;
+                    delete_redundant(event_store, fs_layer, snap, now_ms, &mut report)?;
                 }
             }
         }
@@ -411,6 +442,7 @@ fn is_immutability_block(err: &anyhow::Error) -> bool {
 /// = #264-Drift-Alarm, bei korrektem Boundary-Invariant immer 0). Echte DB-Fehler propagieren.
 fn delete_redundant(
     event_store: &Arc<EventStore>,
+    fs_layer: Option<&LayerManager>,
     snap: &SnapshotMeta,
     now_ms: i64,
     report: &mut MaintenanceReport,
@@ -424,7 +456,17 @@ fn delete_redundant(
         return Ok(());
     }
     match event_store.delete_world_snapshot(&snap.id) {
-        Ok(true) => report.deleted += 1,
+        Ok(true) => {
+            report.deleted += 1;
+            // #492: the snapshot is gone → release its blob pins so the referenced blobs become
+            // Trash-GC-eligible once no live refcount / other snapshot pin holds them. Best-effort:
+            // a pin leak only delays GC, never corrupts.
+            if let Some(layer) = fs_layer {
+                if let Err(e) = layer.meta().unpin_snapshot_blobs(&snap.id) {
+                    debug!(id = %snap.id, error = %e, "unpin_snapshot_blobs fehlgeschlagen");
+                }
+            }
+        }
         Ok(false) => {} // Zeile bereits weg (Race) — kein Fehler.
         Err(e) if is_immutability_block(&e) => {
             // Drift-Alarm: bei korrektem Boundary-Invariant unerreichbar (Daemon haette skippt).
@@ -677,6 +719,72 @@ mod tests {
     }
 
     #[test]
+    fn maintain_backlog_promotes_one_keeper_per_calendar_period() {
+        // #535: maintain() reads `snapshots` ONCE; without the in-run dedup set, two hourly siblings
+        // of the SAME calendar day both pass has_snapshot_for_day (which queries the stale list) and
+        // both promote -> a double keeper. Here a1+a2 share 2024-01-05, b1 is 2024-01-06: a single
+        // daily keeper must result per day (promoted == 2, NOT 3), the same-day sibling deleted. The
+        // b1 promotion confirms the dedup is per-period, not global (#250 regression stays green).
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let store = Arc::new(EventStore::open(db_path.to_str().unwrap()).unwrap());
+        {
+            let conn = sentinel_limbo::rusqlite::Connection::open(&db_path).unwrap();
+            let rows = [
+                ("a1", 100i64, 10i64, utc_ms(2024, 1, 5, 2, 0, 0)),
+                ("a2", 200, 20, utc_ms(2024, 1, 5, 20, 0, 0)),
+                ("b1", 300, 30, utc_ms(2024, 1, 6, 3, 0, 0)),
+            ];
+            for (id, tick, le, created) in rows {
+                conn.execute(
+                    "INSERT INTO world_snapshots (id, tier, tick, sim_hour, last_event_id, payload_size, payload, created_at) VALUES (?1,'hourly',?2,0.0,?3,1,?4,?5)",
+                    sentinel_limbo::rusqlite::params![id, tick, le, b"x".as_ref(), created],
+                )
+                .unwrap();
+            }
+        }
+
+        let mut mgr = SnapshotManager::new(RetentionConfig {
+            auto_prune: false,
+            ..RetentionConfig::default()
+        });
+        let report = mgr.maintain(&store, None).unwrap();
+
+        assert_eq!(
+            report.promoted, 2,
+            "exactly one daily keeper per calendar day (05th + 06th), NOT 3"
+        );
+        let snaps = store.list_world_snapshots().unwrap();
+        let dailies: Vec<_> = snaps
+            .iter()
+            .filter(|s| s.tier == SnapshotTier::Daily)
+            .collect();
+        assert_eq!(dailies.len(), 2, "two dailies — one per calendar day");
+        let day5 = calendar_day_key(utc_ms(2024, 1, 5, 0, 0, 0));
+        let day6 = calendar_day_key(utc_ms(2024, 1, 6, 0, 0, 0));
+        assert_eq!(
+            dailies
+                .iter()
+                .filter(|s| calendar_day_key(s.created_at_ms) == day5)
+                .count(),
+            1,
+            "the 05th has exactly ONE keeper (sibling deduped)"
+        );
+        assert_eq!(
+            dailies
+                .iter()
+                .filter(|s| calendar_day_key(s.created_at_ms) == day6)
+                .count(),
+            1,
+            "the 06th promoted independently"
+        );
+        assert!(
+            snaps.iter().all(|s| s.tier != SnapshotTier::Hourly),
+            "the redundant same-day hourly sibling was removed"
+        );
+    }
+
+    #[test]
     fn delete_redundant_skips_young_snapshot_as_protected() {
         // Variante B: ein redundanter junger Snapshot wird NICHT geloescht (Daemon versucht es gar
         // nicht erst), sondern als kept_protected gezaehlt — er altert spaeter aus dem Schutzfenster.
@@ -696,7 +804,7 @@ mod tests {
             .find(|s| s.id == "young")
             .unwrap();
         let mut report = MaintenanceReport::default();
-        delete_redundant(&store, &snap, now, &mut report).unwrap();
+        delete_redundant(&store, None, &snap, now, &mut report).unwrap();
         assert_eq!(
             report.kept_protected, 1,
             "junger Snapshot bleibt geschuetzt"
@@ -732,7 +840,7 @@ mod tests {
             .unwrap();
         let future_now = snap.created_at_ms + sentinel_limbo::IMMUTABLE_SNAPSHOT_MS + 1000;
         let mut report = MaintenanceReport::default();
-        delete_redundant(&store, &snap, future_now, &mut report).unwrap();
+        delete_redundant(&store, None, &snap, future_now, &mut report).unwrap();
         assert_eq!(
             report.delete_blocked_young, 1,
             "Trigger-Block wird gezaehlt statt geschluckt"
