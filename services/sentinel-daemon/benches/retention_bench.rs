@@ -130,7 +130,7 @@ fn bench_maintain(label: &str, days: i64, redundant: i64, trials: usize) {
         total = n;
         let mut mgr = SnapshotManager::new(cfg.clone());
         let t0 = Instant::now();
-        let report = mgr.maintain(&store).unwrap();
+        let report = mgr.maintain(&store, None).unwrap();
         durations_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         promoted = report.promoted;
         deleted = report.deleted;
@@ -148,7 +148,7 @@ fn bench_maintain(label: &str, days: i64, redundant: i64, trials: usize) {
 fn bench_queries(label: &str, days: i64, redundant: i64) {
     let (_dir, store, n) = populate_converged(days, redundant, 4, 4);
     let mut mgr = SnapshotManager::new(RetentionConfig::default());
-    mgr.maintain(&store).unwrap();
+    mgr.maintain(&store, None).unwrap();
 
     let t0 = Instant::now();
     let metas = store.list_world_snapshots().unwrap();
@@ -186,7 +186,7 @@ fn correctness_cycles(days: i64, redundant: i64) {
     let mut prev_total = usize::MAX;
     println!("correctness (Start N={n0}, 5 Zyklen):");
     for cycle in 1..=5 {
-        let report = mgr.maintain(&store).unwrap();
+        let report = mgr.maintain(&store, None).unwrap();
         let metas = store.list_world_snapshots().unwrap();
         let total = metas.len();
         let (mut h, mut d, mut w, mut m) = (0, 0, 0, 0);

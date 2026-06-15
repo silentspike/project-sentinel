@@ -5544,7 +5544,7 @@ fn ecs_tick_loop(
                         Ok(id) => {
                             debug!(snapshot_id = %id, "World Snapshot erstellt");
                             // Maintenance: Promotion + Cleanup
-                            if let Err(e) = snapshot_manager.maintain(&es) {
+                            if let Err(e) = snapshot_manager.maintain(&es, fs_layer.as_deref()) {
                                 warn!(error = %e, "Snapshot Maintenance fehlgeschlagen");
                             }
                         }
