@@ -182,13 +182,16 @@ fn spawn_and_wait(config: &BwrapConfig, cmd: &[&str], timeout: Duration) -> Spaw
 // ---------------------------------------------------------------------------
 
 /// AC-N1: Verifies that BwrapConfig, CgroupLimits, LandlockRuleset APIs are unchanged.
-/// TOGAF-konform: proc_mount=/proc, dev_mount=/dev, share_net=true.
+/// proc_mount=/proc, dev_mount=/dev; #75: share_net=false (full cage).
 #[test]
 fn ac_76_n1_existing_apis_unchanged() {
     // BwrapConfig::for_agent still works
     let bwrap = BwrapConfig::for_agent("test-n1");
     assert_eq!(bwrap.hostname, "sentinel-test-n1");
-    assert!(bwrap.share_net, "TOGAF: default is --share-net");
+    assert!(
+        !bwrap.share_net,
+        "#75: agent default is full cage (no --share-net)"
+    );
     assert!(bwrap.die_with_parent);
     assert_eq!(
         bwrap.proc_mount,
