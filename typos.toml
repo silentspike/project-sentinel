@@ -36,6 +36,8 @@ ded = "ded"                   # commit hash fragment, e.g. 300ded0
 fand = "fand"
 relevante = "relevante"
 temporaere = "temporaere"
+brach = "brach"               # German: past tense of "brechen" (#250 retention comments)
+Periode = "Periode"           # German: calendar period (#250 retention comments)
 
 # Sprint 2 domain words (ECS, Bio-Engine, Physics, Room System)
 Buero = "Buero"
