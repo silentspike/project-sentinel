@@ -1,10 +1,35 @@
 //! Bubblewrap sandbox configuration.
 
+use std::fs::File;
+use std::io::Read;
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
+
+/// File descriptor bwrap writes its sandbox info JSON to (`--info-fd`).
+const INFO_FD: RawFd = 3;
+
+/// Bounded wait for bwrap to report the sandboxed child PID, so a stuck bwrap
+/// cannot block the daemon's spawn path indefinitely (bwrap sets up in <10ms).
+const INFO_FD_TIMEOUT_MS: libc::c_int = 5000;
+
+/// Result of spawning a bwrap sandbox.
+///
+/// `child` is the bwrap **supervisor** process (host/root netns by design,
+/// used for cgroup membership and SIGTERM). `child_pid` is the **sandboxed**
+/// process inside the agent's network namespace, reported by bwrap via
+/// `--info-fd`; this is the PID to verify isolation against (#75). `None` if
+/// bwrap did not report it (then netns verification is skipped, but the bwrap
+/// exit code remains the primary fail-closed signal).
+#[derive(Debug)]
+pub struct SpawnedSandbox {
+    pub child: Child,
+    pub child_pid: Option<u32>,
+}
 
 /// Bubblewrap sandbox configuration fuer einen einzelnen Agenten.
 #[derive(Debug, Clone)]
@@ -30,7 +55,8 @@ impl BwrapConfig {
     /// - DNS-Resolution readonly (/etc/resolv.conf)
     /// - Agent-Home writable (TOGAF: --bind /ram/agents/{name} /home/{name})
     /// - /tmp als tmpfs, /proc und /dev gemountet
-    /// - Shared Network fuer Cortex Gateway API-Zugang
+    /// - Full network cage (#75): agents make NO network calls; the daemon
+    ///   proxies all LLM traffic to the Cortex Gateway on the host.
     ///
     /// Landlock (Defense-in-Depth) schraenkt Zugriff innerhalb des Namespace weiter ein.
     pub fn for_agent(name: &str) -> Self {
@@ -54,8 +80,10 @@ impl BwrapConfig {
                 (format!("/ram/agents/{name}"), format!("/home/{name}")),
             ],
             tmpfs: vec!["/tmp".to_string()],
-            // TOGAF: --share-net (Agent braucht Cortex Gateway API-Zugang)
-            share_net: true,
+            // #75 full cage: agents make NO network calls (agent-runtime has no
+            // network code); the daemon proxies all LLM traffic to the Cortex
+            // Gateway on the host. No --share-net -> own netns, loopback only.
+            share_net: false,
             die_with_parent: true,
             // TOGAF: --proc /proc
             proc_mount: Some("/proc".to_string()),
@@ -80,7 +108,10 @@ impl BwrapConfig {
         self
     }
 
-    /// Returns a config with shared network (fallback when netns is not available).
+    /// Returns a config with shared host network.
+    ///
+    /// NOT used for agents — the agent default is full cage (#75). Kept for
+    /// non-agent / diagnostic sandboxes that legitimately need host network.
     pub fn with_shared_net(mut self) -> Self {
         self.share_net = true;
         self
@@ -102,11 +133,18 @@ impl BwrapConfig {
 
     /// Spawns a bwrap sandbox process with the configured isolation.
     ///
-    /// Returns the Child handle. Caller is responsible for managing the child
-    /// (e.g. adding to cgroup, forgetting handle for --die-with-parent).
-    pub fn spawn(&self, command: &[String]) -> Result<Child> {
+    /// Returns a [`SpawnedSandbox`] holding the bwrap supervisor `Child` plus
+    /// the sandboxed child PID (from bwrap `--info-fd`). The caller manages the
+    /// child (cgroup membership uses the supervisor PID; netns isolation must
+    /// be verified against `child_pid`, since the supervisor stays in the root
+    /// netns by design — #75).
+    pub fn spawn(&self, command: &[String]) -> Result<SpawnedSandbox> {
         let config = self.with_existing_host_binds();
         let mut args = config.to_args();
+        // bwrap writes `{"child-pid": N, ...}` to --info-fd once the sandbox is
+        // set up. Options must precede the command.
+        args.push("--info-fd".to_string());
+        args.push(INFO_FD.to_string());
         args.extend(command.iter().cloned());
 
         info!(
@@ -115,11 +153,61 @@ impl BwrapConfig {
             command
         );
 
-        Command::new("bwrap")
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .context("Failed to spawn bwrap process")
+        // Pipe for bwrap's --info-fd. Both ends CLOEXEC; the write end is
+        // re-published at INFO_FD in the child via pre_exec (clearing CLOEXEC
+        // on that descriptor only).
+        let mut fds: [libc::c_int; 2] = [0; 2];
+        // SAFETY: `fds` is a valid 2-element array that pipe2 fills.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("Failed to create bwrap --info-fd pipe");
+        }
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        let mut cmd = Command::new("bwrap");
+        cmd.args(&args).stdin(std::process::Stdio::piped());
+        // SAFETY: the closure runs in the forked child before exec and only
+        // calls async-signal-safe fcntl/dup2 on a captured raw fd.
+        unsafe {
+            cmd.pre_exec(move || {
+                if write_fd == INFO_FD {
+                    let flags = libc::fcntl(write_fd, libc::F_GETFD);
+                    if flags < 0
+                        || libc::fcntl(write_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                } else if libc::dup2(write_fd, INFO_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let spawn_result = cmd.spawn();
+        // Parent never writes to the info pipe.
+        // SAFETY: write_fd is a valid fd owned by this function until here.
+        unsafe { libc::close(write_fd) };
+
+        let child = match spawn_result {
+            Ok(child) => child,
+            Err(e) => {
+                // SAFETY: read_fd is still open and owned here.
+                unsafe { libc::close(read_fd) };
+                return Err(e).context("Failed to spawn bwrap process");
+            }
+        };
+
+        // Takes ownership of read_fd and closes it.
+        let child_pid = read_child_pid_from_info_fd(read_fd, INFO_FD_TIMEOUT_MS);
+        if child_pid.is_none() {
+            warn!(
+                "bwrap did not report a sandboxed child PID via --info-fd; \
+                 netns isolation verification will be skipped for this agent"
+            );
+        }
+
+        Ok(SpawnedSandbox { child, child_pid })
     }
 
     fn with_existing_host_binds(&self) -> Self {
@@ -234,6 +322,48 @@ fn hostname_for_agent(name: &str) -> String {
     }
 }
 
+/// Reads the sandboxed child PID from bwrap's `--info-fd` pipe.
+///
+/// Polls (bounded by `timeout_ms`) for bwrap to write its one-shot info JSON,
+/// then does a single read (the JSON is one small `write()`, well under
+/// `PIPE_BUF`). Takes ownership of `read_fd` and closes it. Returns `None` on
+/// timeout, read error, or if bwrap exited without reporting (fail-closed: the
+/// caller treats a missing PID by skipping verification, while the bwrap exit
+/// code stays the primary signal).
+fn read_child_pid_from_info_fd(read_fd: RawFd, timeout_ms: libc::c_int) -> Option<u32> {
+    let mut pfd = libc::pollfd {
+        fd: read_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: single valid pollfd; poll does not retain the pointer.
+    let prc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if prc <= 0 {
+        // SAFETY: read_fd is still open and owned here.
+        unsafe { libc::close(read_fd) };
+        return None;
+    }
+
+    // SAFETY: read_fd is a valid open fd; File takes ownership and closes it.
+    let mut file = unsafe { File::from_raw_fd(read_fd) };
+    let mut buf = [0u8; 1024];
+    let n = file.read(&mut buf).ok()?;
+    if n == 0 {
+        return None;
+    }
+    let text = std::str::from_utf8(&buf[..n]).ok()?;
+    parse_child_pid(text)
+}
+
+/// Extracts the `child-pid` field from bwrap's info JSON.
+fn parse_child_pid(json: &str) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    value
+        .get("child-pid")
+        .and_then(serde_json::Value::as_u64)
+        .map(|pid| pid as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,13 +404,33 @@ mod tests {
     }
 
     #[test]
-    fn togaf_shared_net_default() {
-        // TOGAF: --share-net (Agent braucht Cortex Gateway API-Zugang)
+    fn agent_default_is_full_cage() {
+        // #75: agents make no network calls; the default is a full network cage
+        // (own netns, loopback only) — NO --share-net.
         let config = BwrapConfig::for_agent("test");
-        assert!(config.share_net, "TOGAF: Default should be --share-net");
+        assert!(!config.share_net, "#75: agent default must be full cage");
         let args = config.to_args();
-        assert!(args.contains(&"--share-net".to_string()));
+        assert!(
+            !args.contains(&"--share-net".to_string()),
+            "agents must not get --share-net, args: {args:?}"
+        );
         assert!(args.contains(&"--unshare-all".to_string()));
+    }
+
+    #[test]
+    fn parse_child_pid_extracts_pid() {
+        assert_eq!(parse_child_pid(r#"{"child-pid": 12345}"#), Some(12345));
+        assert_eq!(
+            parse_child_pid(r#"{"child-pid": 7, "cgroup": "x"}"#),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn parse_child_pid_handles_garbage() {
+        assert_eq!(parse_child_pid(""), None);
+        assert_eq!(parse_child_pid("not json"), None);
+        assert_eq!(parse_child_pid(r#"{"no-pid": 1}"#), None);
     }
 
     #[test]
