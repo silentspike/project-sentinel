@@ -130,7 +130,7 @@ fn bench_maintain(label: &str, days: i64, redundant: i64, trials: usize) {
         total = n;
         let mut mgr = SnapshotManager::new(cfg.clone());
         let t0 = Instant::now();
-        let report = mgr.maintain(&store).unwrap();
+        let report = mgr.maintain(&store, None).unwrap();
         durations_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         promoted = report.promoted;
         deleted = report.deleted;
@@ -148,7 +148,7 @@ fn bench_maintain(label: &str, days: i64, redundant: i64, trials: usize) {
 fn bench_queries(label: &str, days: i64, redundant: i64) {
     let (_dir, store, n) = populate_converged(days, redundant, 4, 4);
     let mut mgr = SnapshotManager::new(RetentionConfig::default());
-    mgr.maintain(&store).unwrap();
+    mgr.maintain(&store, None).unwrap();
 
     let t0 = Instant::now();
     let metas = store.list_world_snapshots().unwrap();
@@ -171,22 +171,23 @@ fn bench_queries(label: &str, days: i64, redundant: i64) {
 }
 
 /// Korrektheit: 5 aufeinanderfolgende maintain()-Zyklen muessen KONVERGIEREN (Total nicht-monoton-
-/// wachsend) und duerfen keinen #264-Drift-Alarm ausloesen (`delete_blocked_young == 0`). Die
-/// rigorose, deterministische Verifikation der Kalender-Dedup (UTC-Tag/Woche/Monat) liegt in den
-/// Unit-Tests (snapshot.rs `week_dedup_*`/`month_dedup_*`/`day_dedup_*`); hier wird die Anzahl
-/// gleicher Kalenderperioden pro Tier nur BERICHTET (nicht asserted), weil maintain() pre-existierende
-/// Gleich-Tier-Snapshots NICHT dedupliziert — die Dedup wirkt ausschliesslich beim Promoten, und der
-/// stale-in-memory-Snapshot innerhalb EINES Laufs kann bei Backlog (zwei Geschwister-Perioden kreuzen
-/// dieselbe Schwelle im selben Lauf) einen Doppel-Keeper erzeugen. Das ist eine PRE-EXISTIERENDE
-/// stale-list-Eigenschaft (von #250 unveraendert: #250 tauscht nur die Bucket-Funktion) und im
-/// inkrementellen Stundenbetrieb selten — als Follow-up-Kandidat notiert, NICHT im #250-Scope.
+/// wachsend), keinen #264-Drift-Alarm ausloesen (`delete_blocked_young == 0`) und NIE zwei Keeper
+/// derselben Kalenderperiode pro Tier hinterlassen (`kalender_dups == 0`). Die rigorose,
+/// deterministische Verifikation der Kalender-Dedup (UTC-Tag/Woche/Monat) liegt in den Unit-Tests
+/// (snapshot.rs `week_dedup_*`/`month_dedup_*`/`day_dedup_*` + `maintain_backlog_*`).
+///
+/// #535 (TM-3): frueher konnte der stale-in-memory-Snapshot innerhalb EINES Laufs bei Backlog (zwei
+/// Geschwister-Perioden kreuzen dieselbe Schwelle im selben Lauf) einen Doppel-Keeper erzeugen — das
+/// `kalender_dups` war damals nur BERICHTET. maintain() dedupliziert Promotions jetzt pro Lauf ueber
+/// ein `promoted_periods`-Set, also wird `kalender_dups == 0` hier hart ASSERTED; `correctness_backlog`
+/// unten exerziert den Fall, der frueher Duplikate erzeugt haette, explizit.
 fn correctness_cycles(days: i64, redundant: i64) {
     let (_dir, store, n0) = populate_converged(days, redundant, 4, 4);
     let mut mgr = SnapshotManager::new(RetentionConfig::default());
     let mut prev_total = usize::MAX;
     println!("correctness (Start N={n0}, 5 Zyklen):");
     for cycle in 1..=5 {
-        let report = mgr.maintain(&store).unwrap();
+        let report = mgr.maintain(&store, None).unwrap();
         let metas = store.list_world_snapshots().unwrap();
         let total = metas.len();
         let (mut h, mut d, mut w, mut m) = (0, 0, 0, 0);
@@ -212,8 +213,70 @@ fn correctness_cycles(days: i64, redundant: i64) {
             "  Zyklus {cycle}: total={total:5} hourly={h} daily={d} weekly={w} monthly={m} | promoted={} deleted={} kept_protected={} blocked_young={} kalender_dups={dups}",
             report.promoted, report.deleted, report.kept_protected, report.delete_blocked_young
         );
+        assert_eq!(
+            dups, 0,
+            "Zyklus {cycle}: {dups} Doppel-Keeper derselben Kalenderperiode (#535-Regression)"
+        );
     }
-    println!("  OK: konvergiert (Total nicht-wachsend), kein #264-Drift-Alarm");
+    println!("  OK: konvergiert (Total nicht-wachsend), kein #264-Drift-Alarm, kalender_dups=0");
+}
+
+/// #535 (TM-3): explizites Backlog — `siblings`-viele promotable hourly pro Kalendertag fuer `days`
+/// Tage, OHNE bestehenden Keeper. Vor dem Fix haette maintain() ALLE Geschwister promotet
+/// (`days*siblings` dailies, `days*(siblings-1)` Duplikate); jetzt genau EINER pro Tag. Tage sind
+/// ueber 7 Tage alt → die redundanten Geschwister werden geloescht, nicht nur geschuetzt.
+fn correctness_backlog(days: i64, siblings: i64) {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        Arc::new(EventStore::open(dir.path().join("backlog.db").to_str().unwrap()).unwrap());
+    let today_midnight = (now_ms() / DAY_MS) * DAY_MS;
+    let mut id = 0u64;
+    for d in 0..days {
+        let day = today_midnight - (8 + d) * DAY_MS; // >7d alt, distinkte Tage
+        for s in 0..siblings {
+            store
+                .save_world_snapshot_at(
+                    &format!("bk{id:07}"),
+                    "hourly",
+                    id,
+                    0.0,
+                    id as i64,
+                    PAYLOAD,
+                    day + HOUR_MS + s * 5 * 60_000, // alle am selben UTC-Tag
+                )
+                .unwrap();
+            id += 1;
+        }
+    }
+    let mut mgr = SnapshotManager::new(RetentionConfig {
+        auto_prune: false,
+        ..RetentionConfig::default()
+    });
+    let report = mgr.maintain(&store, None).unwrap();
+    let metas = store.list_world_snapshots().unwrap();
+    let dailies = metas
+        .iter()
+        .filter(|s| matches!(s.tier, sentinel_common::SnapshotTier::Daily))
+        .count();
+    let dups = calendar_duplicate_count(&metas);
+    println!(
+        "backlog days={days} siblings={siblings} (seed={}): promoted={} dailies={dailies} kalender_dups={dups}",
+        days * siblings,
+        report.promoted
+    );
+    assert_eq!(
+        report.promoted as i64, days,
+        "genau EIN Keeper pro Tag (NICHT pro Geschwister)"
+    );
+    assert_eq!(dailies as i64, days, "genau `days` dailies");
+    assert_eq!(
+        dups, 0,
+        "kein Doppel-Keeper derselben Kalenderperiode (#535)"
+    );
+    println!(
+        "  OK: {} Geschwister/Tag → 1 Keeper/Tag, kalender_dups=0",
+        siblings
+    );
 }
 
 /// Zaehlt Daily/Weekly/Monthly-Snapshots, die dieselbe Kalenderperiode (UTC-Tag / Montag-Woche /
@@ -266,4 +329,6 @@ fn main() {
     bench_queries("headroom(~1000)", 6, 160);
     println!();
     correctness_cycles(6, 28);
+    println!();
+    correctness_backlog(5, 4); // #535: 4 Geschwister/Tag × 5 Tage → 5 Keeper, 0 Duplikate
 }

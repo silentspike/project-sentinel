@@ -35,3 +35,7 @@ tempfile = "3"
 [[bench]]
 name = "sentinel_fs_bench"
 harness = false
+
+[[bench]]
+name = "snapshot_pin_gc"
+harness = false

@@ -112,6 +112,107 @@ CREATE TABLE IF NOT EXISTS projection_offsets (
     updated_at INTEGER NOT NULL
 )";
 
+/// #493 (TM-5): side table for the restore generation epoch + the discarded "future" id-intervals.
+/// `events` stays the untouched append-only SSOT (no per-row generation column); the dead branch is
+/// recorded here as `restore_generation` (monotonic) + `dead_ranges` (JSON `[[from_exclusive,
+/// to_inclusive], ...]`). Read guards exclude these intervals; the pruner deletes them and clears
+/// the spent entry.
+const CREATE_SIM_METADATA: &str = "
+CREATE TABLE IF NOT EXISTS sim_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+)";
+
+// ──────────────────────────────────────────────
+// #493 Dead Branch helpers (free fns over an existing Connection — no re-lock)
+// ──────────────────────────────────────────────
+
+/// Read a `sim_metadata` scalar within an existing (already-locked) connection.
+fn read_sim_metadata(conn: &rusqlite::Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM sim_metadata WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// Upsert a `sim_metadata` scalar within an existing connection.
+fn set_sim_metadata_conn(
+    conn: &rusqlite::Connection,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    conn.execute(
+        "INSERT INTO sim_metadata (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+        params![key, value, now],
+    )?;
+    Ok(())
+}
+
+/// Read the discarded-future id-intervals `(from_exclusive, to_inclusive]` (dead branches).
+fn read_dead_ranges(conn: &rusqlite::Connection) -> Vec<(i64, i64)> {
+    match read_sim_metadata(conn, "dead_ranges") {
+        Some(json) => serde_json::from_str::<Vec<(i64, i64)>>(&json).unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// #493: the single shared dead-range EXCLUSION fragment used in EVERY event-read path so a
+/// discarded "future" is never served. Returns ` AND NOT (id_expr > ?N AND id_expr <= ?M) …` with
+/// numbered placeholders starting at `next_param`, plus the param values (from, to, from, to, …).
+/// Empty ranges → empty fragment (zero-cost fast path). Read paths with no other WHERE append it to
+/// a `WHERE 1=1`. A per-read-path test seeds a dead interval and asserts each read excludes it.
+fn dead_range_exclusion(
+    ranges: &[(i64, i64)],
+    id_expr: &str,
+    next_param: usize,
+) -> (String, Vec<i64>) {
+    let mut sql = String::new();
+    let mut p = Vec::with_capacity(ranges.len() * 2);
+    let mut idx = next_param;
+    for (from, to) in ranges {
+        sql.push_str(&format!(
+            " AND NOT ({id_expr} > ?{idx} AND {id_expr} <= ?{})",
+            idx + 1
+        ));
+        p.push(*from);
+        p.push(*to);
+        idx += 2;
+    }
+    (sql, p)
+}
+
+/// #493: the positive counterpart of [`dead_range_exclusion`], used ONLY by the pruner to SELECT the
+/// dead-interval events for deletion (even when they sit above the retention cutoff). Returns
+/// ` OR ({id_expr} > ?N AND {id_expr} <= ?M) …` with numbered placeholders from `next_param`. Empty
+/// ranges → empty fragment.
+fn dead_range_inclusion(
+    ranges: &[(i64, i64)],
+    id_expr: &str,
+    next_param: usize,
+) -> (String, Vec<i64>) {
+    let mut sql = String::new();
+    let mut p = Vec::with_capacity(ranges.len() * 2);
+    let mut idx = next_param;
+    for (from, to) in ranges {
+        sql.push_str(&format!(
+            " OR ({id_expr} > ?{idx} AND {id_expr} <= ?{})",
+            idx + 1
+        ));
+        p.push(*from);
+        p.push(*to);
+        idx += 2;
+    }
+    (sql, p)
+}
+
 // ──────────────────────────────────────────────
 // OutboxEntry
 // ──────────────────────────────────────────────
@@ -220,6 +321,7 @@ impl EventStore {
         conn.execute_batch(CREATE_WORLD_SNAPSHOTS)?;
         conn.execute(CREATE_IDX_WORLD_SNAPSHOTS_TIER, [])?;
         conn.execute_batch(CREATE_PROJECTION_OFFSETS)?;
+        conn.execute_batch(CREATE_SIM_METADATA)?;
 
         // Security: Immutable Snapshots — Schutz vor Loeschung junger Snapshots.
         // #250: dieselbe SSOT-Konstante wie der Daemon-Retention-Skip (siehe IMMUTABLE_SNAPSHOT_MS).
@@ -461,10 +563,16 @@ impl EventStore {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
-        let mut stmt = conn.prepare(
-            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![after_id, limit as i64], |row| {
+        // #493: exclude any discarded "future" (dead id-intervals) from forward reads.
+        let dead = read_dead_ranges(&conn);
+        let (dead_sql, dead_p) = dead_range_exclusion(&dead, "id", 3);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE id > ?1{dead_sql} ORDER BY id ASC LIMIT ?2"
+        ))?;
+        let limit_i64 = limit as i64;
+        let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&after_id, &limit_i64];
+        bind.extend(dead_p.iter().map(|d| d as &dyn rusqlite::ToSql));
+        let rows = stmt.query_map(bind.as_slice(), |row| {
             Ok(DomainEvent {
                 event_id: row.get(0)?,
                 event_type: row.get(1)?,
@@ -505,10 +613,16 @@ impl EventStore {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
-        let mut stmt = conn.prepare(
-            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE id > ?1 AND id <= ?2 ORDER BY id ASC",
-        )?;
-        let rows = stmt.query_map(params![from_exclusive, to_inclusive], |row| {
+        // #493 (couples #491): a bounded replay over a window that crosses a dead-interval boundary
+        // must NOT feed discarded-future events back into the restored world — exclude them here.
+        let dead = read_dead_ranges(&conn);
+        let (dead_sql, dead_p) = dead_range_exclusion(&dead, "id", 3);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE id > ?1 AND id <= ?2{dead_sql} ORDER BY id ASC"
+        ))?;
+        let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&from_exclusive, &to_inclusive];
+        bind.extend(dead_p.iter().map(|d| d as &dyn rusqlite::ToSql));
+        let rows = stmt.query_map(bind.as_slice(), |row| {
             Ok(DomainEvent {
                 event_id: row.get(0)?,
                 event_type: row.get(1)?,
@@ -541,9 +655,14 @@ impl EventStore {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        // #493: keep the replay-count consistent with `get_events_range` (dead events never replay).
+        let dead = read_dead_ranges(&conn);
+        let (dead_sql, dead_p) = dead_range_exclusion(&dead, "id", 3);
+        let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&from_exclusive, &to_inclusive];
+        bind.extend(dead_p.iter().map(|d| d as &dyn rusqlite::ToSql));
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM events WHERE id > ?1 AND id <= ?2",
-            params![from_exclusive, to_inclusive],
+            &format!("SELECT COUNT(*) FROM events WHERE id > ?1 AND id <= ?2{dead_sql}"),
+            bind.as_slice(),
             |row| row.get(0),
         )?;
         Ok(count.max(0) as u64)
@@ -595,10 +714,16 @@ impl EventStore {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
-        let mut stmt = conn.prepare(
-            "SELECT id, event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![after_id, limit as i64], |row| {
+        // #493: projection workers must skip discarded-future events (offset jumps past dead ids).
+        let dead = read_dead_ranges(&conn);
+        let (dead_sql, dead_p) = dead_range_exclusion(&dead, "id", 3);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE id > ?1{dead_sql} ORDER BY id ASC LIMIT ?2"
+        ))?;
+        let limit_i64 = limit as i64;
+        let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&after_id, &limit_i64];
+        bind.extend(dead_p.iter().map(|d| d as &dyn rusqlite::ToSql));
+        let rows = stmt.query_map(bind.as_slice(), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 DomainEvent {
@@ -644,10 +769,16 @@ impl EventStore {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
-        let mut stmt = conn.prepare(
-            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE aggregate_id = ?1 ORDER BY id ASC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![aggregate_id, limit as i64], |row| {
+        // #493: never serve discarded-future events for an aggregate read.
+        let dead = read_dead_ranges(&conn);
+        let (dead_sql, dead_p) = dead_range_exclusion(&dead, "id", 3);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE aggregate_id = ?1{dead_sql} ORDER BY id ASC LIMIT ?2"
+        ))?;
+        let limit_i64 = limit as i64;
+        let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&aggregate_id, &limit_i64];
+        bind.extend(dead_p.iter().map(|d| d as &dyn rusqlite::ToSql));
+        let rows = stmt.query_map(bind.as_slice(), |row| {
             Ok(DomainEvent {
                 event_id: row.get(0)?,
                 event_type: row.get(1)?,
@@ -679,10 +810,16 @@ impl EventStore {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
-        let mut stmt = conn.prepare(
-            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE correlation_id = ?1 ORDER BY id ASC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![correlation_id, limit as i64], |row| {
+        // #493: never serve discarded-future events for a correlation read.
+        let dead = read_dead_ranges(&conn);
+        let (dead_sql, dead_p) = dead_range_exclusion(&dead, "id", 3);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE correlation_id = ?1{dead_sql} ORDER BY id ASC LIMIT ?2"
+        ))?;
+        let limit_i64 = limit as i64;
+        let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&correlation_id, &limit_i64];
+        bind.extend(dead_p.iter().map(|d| d as &dyn rusqlite::ToSql));
+        let rows = stmt.query_map(bind.as_slice(), |row| {
             Ok(DomainEvent {
                 event_id: row.get(0)?,
                 event_type: row.get(1)?,
@@ -826,10 +963,20 @@ impl EventStore {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
-        let mut stmt = conn.prepare(
-            "SELECT id, event_id, topic, payload, status, created_at FROM outbox WHERE status = 'pending' ORDER BY id ASC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
+        // #493: never publish a discarded-future event. The dead intervals are id-ranges in `events`,
+        // so join the outbox to its event and exclude dead `e.id`s with the shared guard. The join is
+        // INNER, which is safe here: `can_prune` forbids pruning while an outbox entry is pending, so
+        // a pending entry's event row always exists (both are written in one transaction). The
+        // matching `idx_outbox_event_id` / unique `idx_events_event_id` keep the join cheap.
+        let dead = read_dead_ranges(&conn);
+        let (dead_sql, dead_p) = dead_range_exclusion(&dead, "e.id", 2);
+        let limit_i64 = limit as i64;
+        let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&limit_i64];
+        bind.extend(dead_p.iter().map(|d| d as &dyn rusqlite::ToSql));
+        let mut stmt = conn.prepare(&format!(
+            "SELECT o.id, o.event_id, o.topic, o.payload, o.status, o.created_at FROM outbox o JOIN events e ON o.event_id = e.event_id WHERE o.status = 'pending'{dead_sql} ORDER BY o.id ASC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map(bind.as_slice(), |row| {
             Ok(OutboxEntry {
                 id: row.get(0)?,
                 event_id: row.get(1)?,
@@ -917,6 +1064,72 @@ impl EventStore {
         }
     }
 
+    // ── #493 Restore Generation / Dead Branch ──────────────────────────────
+
+    /// Current restore generation epoch (monotonic; 0 before the first restore).
+    pub fn get_restore_generation(&self) -> anyhow::Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        Ok(read_sim_metadata(&conn, "restore_generation")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0))
+    }
+
+    /// Bump the restore generation epoch (called once per restore). Returns the new generation.
+    pub fn increment_restore_generation(&self) -> anyhow::Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let next = read_sim_metadata(&conn, "restore_generation")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0)
+            + 1;
+        set_sim_metadata_conn(&conn, "restore_generation", &next.to_string())?;
+        Ok(next)
+    }
+
+    /// The discarded-future id-intervals `(from_exclusive, to_inclusive]` (dead branches).
+    pub fn dead_ranges(&self) -> anyhow::Result<Vec<(i64, i64)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        Ok(read_dead_ranges(&conn))
+    }
+
+    /// Mark `(from_exclusive, to_inclusive]` as a dead branch (the future discarded by a restore).
+    pub fn push_dead_range(&self, from_exclusive: i64, to_inclusive: i64) -> anyhow::Result<()> {
+        if to_inclusive <= from_exclusive {
+            return Ok(()); // nothing discarded
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let mut ranges = read_dead_ranges(&conn);
+        ranges.push((from_exclusive, to_inclusive));
+        set_sim_metadata_conn(&conn, "dead_ranges", &serde_json::to_string(&ranges)?)?;
+        Ok(())
+    }
+
+    /// Drop a dead-range entry once its events have been pruned (keeps the list bounded).
+    pub fn remove_dead_range(&self, from_exclusive: i64) -> anyhow::Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let mut ranges = read_dead_ranges(&conn);
+        let before = ranges.len();
+        ranges.retain(|(from, _)| *from != from_exclusive);
+        if ranges.len() != before {
+            set_sim_metadata_conn(&conn, "dead_ranges", &serde_json::to_string(&ranges)?)?;
+        }
+        Ok(())
+    }
+
     /// Prueft ob Pruning sicher ist (Projection-Offsets, Outbox-Backlog).
     /// Gibt `Ok(true)` zurueck wenn Pruning erlaubt, `Ok(false)` bei Safety-Guard.
     pub fn can_prune(&self, cutoff_event_id: i64) -> anyhow::Result<bool> {
@@ -938,10 +1151,19 @@ impl EventStore {
             }
         }
 
+        // #493: only LIVE pending outbox entries gate pruning. A discarded future leaves its outbox
+        // entries 'pending' forever (poll_outbox skips them via the same guard), so counting them
+        // would deadlock pruning permanently. Exclude dead `e.id`s with the shared guard.
+        let dead = read_dead_ranges(&conn);
+        let (dead_sql, dead_p) = dead_range_exclusion(&dead, "e.id", 1);
+        let bind: Vec<&dyn rusqlite::ToSql> =
+            dead_p.iter().map(|d| d as &dyn rusqlite::ToSql).collect();
         let pending_outbox: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM outbox WHERE status = 'pending'",
-                [],
+                &format!(
+                    "SELECT COUNT(*) FROM outbox o JOIN events e ON o.event_id = e.event_id WHERE o.status = 'pending'{dead_sql}"
+                ),
+                bind.as_slice(),
                 |row| row.get(0),
             )
             .unwrap_or(0);
@@ -966,6 +1188,12 @@ impl EventStore {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+
+        // #493: dead intervals are pruned ALONGSIDE the retention cutoff — even above it — so a
+        // discarded future is physically removed in the normal retention window (not left to linger).
+        let dead = read_dead_ranges(&conn);
+        let (dead_incl_sql, dead_p) = dead_range_inclusion(&dead, "id", 3);
+
         let tx = conn.transaction()?;
 
         tx.execute_batch(
@@ -976,32 +1204,55 @@ impl EventStore {
             DELETE FROM prune_batch_ids;",
         )?;
 
+        let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&cutoff_event_id, &batch_size];
+        bind.extend(dead_p.iter().map(|d| d as &dyn rusqlite::ToSql));
         let selected = tx.execute(
-            "INSERT INTO prune_batch_ids(id, event_id)
-             SELECT id, event_id
-             FROM events
-             WHERE id < ?1
-             ORDER BY id
-             LIMIT ?2",
-            params![cutoff_event_id, batch_size],
+            &format!(
+                "INSERT INTO prune_batch_ids(id, event_id)
+                 SELECT id, event_id
+                 FROM events
+                 WHERE (id < ?1{dead_incl_sql})
+                 ORDER BY id
+                 LIMIT ?2"
+            ),
+            bind.as_slice(),
         )? as u64;
 
-        if selected == 0 {
-            tx.commit()?;
-            return Ok(0);
+        if selected > 0 {
+            tx.execute(
+                "DELETE FROM outbox
+                 WHERE event_id IN (SELECT event_id FROM prune_batch_ids)",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM events
+                 WHERE id IN (SELECT id FROM prune_batch_ids)",
+                [],
+            )?;
         }
-
-        tx.execute(
-            "DELETE FROM outbox
-             WHERE event_id IN (SELECT event_id FROM prune_batch_ids)",
-            [],
-        )?;
-        tx.execute(
-            "DELETE FROM events
-             WHERE id IN (SELECT id FROM prune_batch_ids)",
-            [],
-        )?;
         tx.commit()?;
+
+        // #493 requirement 2: drop a `dead_ranges` entry once its interval is empty (keeps the list
+        // bounded over many restores). Runs on the same held connection — no re-lock, no deadlock.
+        if !dead.is_empty() {
+            let mut kept = Vec::with_capacity(dead.len());
+            let mut changed = false;
+            for (from, to) in &dead {
+                let remaining: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE id > ?1 AND id <= ?2",
+                    params![from, to],
+                    |row| row.get(0),
+                )?;
+                if remaining > 0 {
+                    kept.push((*from, *to));
+                } else {
+                    changed = true;
+                }
+            }
+            if changed {
+                set_sim_metadata_conn(&conn, "dead_ranges", &serde_json::to_string(&kept)?)?;
+            }
+        }
 
         Ok(selected)
     }
@@ -1140,10 +1391,16 @@ impl EventStore {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
-        let mut stmt = conn.prepare(
-            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events ORDER BY id ASC",
-        )?;
-        let rows = stmt.query_map([], |row| {
+        // #493: a full rebuild must not replay a discarded future — exclude dead intervals here too
+        // (no other WHERE, so the guard hangs off `WHERE 1=1`).
+        let dead = read_dead_ranges(&conn);
+        let (dead_sql, dead_p) = dead_range_exclusion(&dead, "id", 1);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type FROM events WHERE 1=1{dead_sql} ORDER BY id ASC"
+        ))?;
+        let bind: Vec<&dyn rusqlite::ToSql> =
+            dead_p.iter().map(|d| d as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(bind.as_slice(), |row| {
             Ok(DomainEvent {
                 event_id: row.get(0)?,
                 event_type: row.get(1)?,
@@ -2318,5 +2575,310 @@ mod tests {
             .execute("DELETE FROM world_snapshots WHERE id = 'snap-old'", [])
             .unwrap();
         assert_eq!(deleted, 1, "DELETE auf alten Snapshot sollte funktionieren");
+    }
+
+    // ──────────────────────────────────────────────
+    // #493 Dead Branch GC
+    // ──────────────────────────────────────────────
+
+    /// Seeds `n` events (ids 1..=n), each with a pending outbox entry, and returns `(events.id,
+    /// event_id-uuid)` in id order so a test can map ids ↔ uuids for content assertions.
+    fn seed_events_with_outbox(store: &EventStore, n: i64) -> Vec<(i64, String)> {
+        let mut out = Vec::new();
+        for i in 1..=n {
+            let e = DomainEvent::new(
+                "agent_action_received",
+                "AGENT-01",
+                "{}",
+                "corr-1",
+                i as u64,
+            );
+            let id = store.append_with_outbox(&e, "sentinel.events").unwrap();
+            out.push((id, e.event_id.clone()));
+        }
+        out
+    }
+
+    /// #493 AC-1: a restore bumps the persistent generation and records the discarded id-interval;
+    /// a no-op restore (anchor == head, or anchor > head) records nothing.
+    #[test]
+    fn dead_branch_marking_sets_generation_and_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path().join("d.db").to_str().unwrap()).unwrap();
+        assert_eq!(store.get_restore_generation().unwrap(), 0);
+        assert!(store.dead_ranges().unwrap().is_empty());
+
+        assert_eq!(store.increment_restore_generation().unwrap(), 1);
+        store.push_dead_range(5, 10).unwrap();
+        assert_eq!(store.get_restore_generation().unwrap(), 1);
+        assert_eq!(store.dead_ranges().unwrap(), vec![(5, 10)]);
+
+        assert_eq!(store.increment_restore_generation().unwrap(), 2);
+        store.push_dead_range(12, 20).unwrap();
+        assert_eq!(store.dead_ranges().unwrap(), vec![(5, 10), (12, 20)]);
+
+        // nothing discarded → no new interval
+        store.push_dead_range(20, 20).unwrap();
+        store.push_dead_range(25, 20).unwrap();
+        assert_eq!(store.dead_ranges().unwrap(), vec![(5, 10), (12, 20)]);
+    }
+
+    /// #493 AC-2 / requirement 1: EVERY event read path applies the shared dead-range guard. If a new
+    /// read method is added without the guard (or one is dropped), this test goes red.
+    #[test]
+    fn every_read_path_excludes_dead_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path().join("d.db").to_str().unwrap()).unwrap();
+        let seeded = seed_events_with_outbox(&store, 10); // ids 1..=10
+
+        // discard ids 5,6,7 via interval (4, 7]
+        store.push_dead_range(4, 7).unwrap();
+        let dead_uuids: std::collections::HashSet<String> = seeded
+            .iter()
+            .filter(|(id, _)| (5..=7).contains(id))
+            .map(|(_, u)| u.clone())
+            .collect();
+        let assert_clean = |uuids: Vec<String>, ctx: &str| {
+            assert_eq!(uuids.len(), 7, "{ctx}: 3 dead events excluded");
+            for u in &uuids {
+                assert!(!dead_uuids.contains(u), "{ctx} leaked a dead event");
+            }
+        };
+
+        assert_clean(
+            store
+                .get_events_since(0, 100)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.event_id)
+                .collect(),
+            "get_events_since",
+        );
+        assert_clean(
+            store
+                .get_events_since_with_id(0, 100)
+                .unwrap()
+                .into_iter()
+                .map(|(_, e)| e.event_id)
+                .collect(),
+            "get_events_since_with_id",
+        );
+        assert_clean(
+            store
+                .get_events_by_aggregate("AGENT-01", 100)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.event_id)
+                .collect(),
+            "get_events_by_aggregate",
+        );
+        assert_clean(
+            store
+                .get_events_by_correlation("corr-1", 100)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.event_id)
+                .collect(),
+            "get_events_by_correlation",
+        );
+        assert_clean(
+            store
+                .get_all_events()
+                .unwrap()
+                .into_iter()
+                .map(|e| e.event_id)
+                .collect(),
+            "get_all_events",
+        );
+        assert_clean(
+            store
+                .poll_outbox(100)
+                .unwrap()
+                .into_iter()
+                .map(|o| o.event_id)
+                .collect(),
+            "poll_outbox",
+        );
+
+        // range-based reads: window (2, 9] = 3,4,5,6,7,8,9 minus dead 5,6,7 = 3,4,8,9
+        let range: Vec<String> = store
+            .get_events_range(2, 9)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.event_id)
+            .collect();
+        assert_eq!(range.len(), 4, "get_events_range excludes dead in window");
+        for u in &range {
+            assert!(
+                !dead_uuids.contains(u),
+                "get_events_range leaked a dead event"
+            );
+        }
+        assert_eq!(
+            store.count_events_in_range(2, 9).unwrap(),
+            4,
+            "count matches range"
+        );
+        assert_eq!(
+            store.count_events_in_range(0, 10).unwrap(),
+            7,
+            "count excludes all dead"
+        );
+    }
+
+    /// #493 AC-5 (couples #491): a bounded-replay window that crosses a dead-interval boundary feeds
+    /// ONLY the live timeline into the replay (stable id order, dead excluded) and the reported count
+    /// equals the replayed length — a discarded future can never replay back into the restored world.
+    #[test]
+    fn replay_input_excludes_dead_branch_at_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path().join("d.db").to_str().unwrap()).unwrap();
+        let seeded = seed_events_with_outbox(&store, 12);
+
+        // restore to anchor id=6 → discard old future (6, 9] = ids 7,8,9; ids 10,11,12 are live.
+        store.increment_restore_generation().unwrap();
+        store.push_dead_range(6, 9).unwrap();
+
+        // replay window (5, 11] crosses the boundary: 6(live),7,8,9(dead),10,11(live).
+        let replay = store.get_events_range(5, 11).unwrap();
+        let got: Vec<&str> = replay.iter().map(|e| e.event_id.as_str()).collect();
+        let expected: Vec<&str> = seeded
+            .iter()
+            .filter(|(id, _)| [6i64, 10, 11].contains(id))
+            .map(|(_, u)| u.as_str())
+            .collect();
+        assert_eq!(got, expected, "stable id order, dead excluded");
+        assert_eq!(
+            store.count_events_in_range(5, 11).unwrap() as usize,
+            replay.len(),
+            "STRICT/CORE: reported replay count equals replayed length"
+        );
+        for (id, uuid) in &seeded {
+            if (7..=9).contains(id) {
+                assert!(
+                    !replay.iter().any(|e| &e.event_id == uuid),
+                    "dead event id={id} replayed into restored world"
+                );
+            }
+        }
+    }
+
+    /// #493 AC-3 / requirement 2: the pruner deletes dead-interval events even ABOVE the retention
+    /// cutoff and clears the spent `dead_ranges` entry (the list stays bounded).
+    #[test]
+    fn pruner_removes_dead_interval_and_clears_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path().join("d.db").to_str().unwrap()).unwrap();
+        seed_events_with_outbox(&store, 10); // ids 1..=10
+
+        // discard ids 6,7,8 — ABOVE the retention cutoff we use below.
+        store.push_dead_range(5, 8).unwrap();
+
+        // prune with cutoff=3 (retention removes ids < 3: 1,2). The dead interval (5,8] sits above it
+        // and must STILL be removed.
+        let mut total = 0u64;
+        loop {
+            let n = store.prune_batch(3, 500).unwrap();
+            total += n;
+            if n == 0 {
+                break;
+            }
+        }
+        assert_eq!(total, 5, "ids 1,2 (cutoff) + 6,7,8 (dead) removed");
+
+        let conn = store.conn();
+        // raw count (bypasses the read guard) proves the dead events are physically gone (AC-3 verify).
+        let dead_remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE id > 5 AND id <= 8",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dead_remaining, 0, "dead events physically deleted");
+        let total_remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total_remaining, 5, "remaining: ids 3,4,5,9,10");
+        // the dead-event outbox entries are gone too (no leak).
+        let dead_outbox: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbox WHERE event_id NOT IN (SELECT event_id FROM events)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dead_outbox, 0, "no orphaned dead outbox entries");
+        drop(conn);
+
+        assert!(
+            store.dead_ranges().unwrap().is_empty(),
+            "spent dead_ranges entry removed (list bounded)"
+        );
+    }
+
+    /// #493: a discarded future's stuck-pending outbox entries must NOT permanently block pruning
+    /// (`can_prune` counts only LIVE pending entries).
+    #[test]
+    fn can_prune_ignores_dead_pending_outbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path().join("d.db").to_str().unwrap()).unwrap();
+        seed_events_with_outbox(&store, 6); // ids 1..=6, all pending
+                                            // advance the projection past head so the offset check passes
+        store.force_reset_offset("p", 6).unwrap();
+
+        // all 6 pending → blocked
+        assert!(
+            !store.can_prune(4).unwrap(),
+            "live pending entries block pruning"
+        );
+
+        // mark the whole tail dead → those pending entries no longer count
+        store.push_dead_range(0, 6).unwrap();
+        assert!(
+            store.can_prune(4).unwrap(),
+            "dead pending entries do not block pruning"
+        );
+    }
+
+    /// #493 AC-4: the guard reads `dead_ranges` fresh per query; concurrent readers under contention
+    /// never observe a discarded future, even while it is being marked.
+    #[test]
+    fn guard_reads_dead_ranges_fresh_under_contention() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(EventStore::open(dir.path().join("d.db").to_str().unwrap()).unwrap());
+        seed_events_with_outbox(&store, 6); // ids 1..=6
+
+        assert_eq!(
+            store.get_events_since(0, 100).unwrap().len(),
+            6,
+            "all visible before"
+        );
+
+        // mark (3, 5] dead from another thread; a fresh read reflects it immediately.
+        let s2 = Arc::clone(&store);
+        std::thread::spawn(move || s2.push_dead_range(3, 5).unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(
+            store.get_events_since(0, 100).unwrap().len(),
+            4,
+            "fresh dead_ranges applied: ids 4,5 excluded"
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    assert_eq!(s.get_events_range(0, 6).unwrap().len(), 4);
+                    assert_eq!(s.get_all_events().unwrap().len(), 4);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }
