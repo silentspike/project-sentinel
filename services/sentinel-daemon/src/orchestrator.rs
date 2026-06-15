@@ -32,7 +32,9 @@ use sentinel_hippocampus::{NMDA_CONSOLIDATION_THRESHOLD, NMDA_MAX_CONSOLIDATION_
 use sentinel_limbo::EventStore;
 use sentinel_redb::StateStore;
 use sentinel_runtime::RuntimeOrchestrator;
-use sentinel_sandbox::{CgroupLimits, SandboxEnforcer, SandboxHandle, SandboxWarning};
+use sentinel_sandbox::{
+    CgroupLimits, IsolationStatus, SandboxEnforcer, SandboxHandle, SandboxWarning,
+};
 use sentinel_zenoh::SentinelBus;
 use sha2::{Digest, Sha256};
 
@@ -304,6 +306,105 @@ fn terminate_agent_process(mut proc_handle: sentinel_sandbox::AgentProcess) {
     proc_handle.terminate();
 }
 
+/// #75: verifies the just-spawned agent runs in its own network namespace
+/// (full cage) and enforces it.
+///
+/// `child_pid` is the sandboxed `agent-runtime` PID from bwrap `--info-fd`
+/// (NOT the supervisor PID). Behavior per [`IsolationStatus`]:
+/// - `Isolated`: mark the handle, continue.
+/// - `ProbeError`: transient `/proc` read glitch — warn only, do NOT terminate
+///   (the bwrap exit code is the primary fail-closed signal).
+/// - `NotIsolated`: the agent is NOT caged (e.g. forced `share_net`). Make it
+///   visible (warn + health snapshot + string-typed `AgentIsolationFailed`
+///   event where an event store is available) and terminate the un-caged
+///   process — the agent drops to the existing ECS-only fallback rather than
+///   running with host network access.
+///
+/// `event_store` is `Some` on paths that own one (ecs tick loop); the initial
+/// spawn path relies on the warn + health snapshot (the durable signal there).
+#[allow(clippy::too_many_arguments)]
+fn enforce_agent_netns_isolation(
+    agent_id: AgentId,
+    agent_name: &str,
+    child_pid: Option<u32>,
+    sandbox: &SandboxEnforcer,
+    sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &mut EbpfCollector,
+    agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    event_store: Option<&EventStore>,
+) {
+    let Some(cpid) = child_pid else {
+        warn!(
+            agent = %agent_name,
+            "bwrap meldete keinen sandboxed child-pid (--info-fd); netns-Verifikation uebersprungen (bwrap-Exit bleibt fail-closed-Signal)"
+        );
+        return;
+    };
+
+    match sandbox.verify_agent_netns_isolation(cpid) {
+        IsolationStatus::Isolated => {
+            if let Some(handle) = sandbox_handles.get_mut(&agent_id) {
+                handle.network_isolated = true;
+            }
+            debug!(agent = %agent_name, child_pid = cpid, "Agent net-cage verifiziert (#75)");
+        }
+        IsolationStatus::ProbeError => {
+            warn!(
+                agent = %agent_name,
+                child_pid = cpid,
+                "netns-Verifikation nicht lesbar (ProbeError) — Agent laeuft weiter; bwrap-Exit ist primaeres fail-closed-Signal (#75)"
+            );
+        }
+        IsolationStatus::NotIsolated => {
+            warn!(
+                agent = %agent_name,
+                child_pid = cpid,
+                "Agent ist NICHT netz-isoliert (share_net?) — terminiere Prozess, ECS-only Fallback (#75)"
+            );
+            // Durable health/monitoring status: no valid sandboxed process.
+            record_security_runtime_snapshot(
+                security_runtime_state,
+                agent_id,
+                agent_name,
+                None,
+                None,
+            );
+            // String-typed event — no DomainEventPayload enum variant / no
+            // sentinel-common schema change (keeps clear of #493).
+            if let Some(store) = event_store {
+                let aggregate = format!("AGENT-{:02}", agent_id.0);
+                let payload = serde_json::json!({
+                    "agent_id": agent_id.0,
+                    "agent_name": agent_name,
+                    "child_pid": cpid,
+                    "reason": "not_isolated",
+                })
+                .to_string();
+                let event =
+                    DomainEvent::new("AgentIsolationFailed", &aggregate, &payload, &aggregate, 0);
+                if let Err(e) = store.append_event(&event) {
+                    warn!(agent = %agent_name, error = %e, "AgentIsolationFailed-Event speichern fehlgeschlagen");
+                }
+            }
+            // Terminate the un-caged process; fall back to ECS-only.
+            if let Some(proc) = agent_processes.remove(&agent_id) {
+                terminate_agent_process(proc);
+            }
+            if let Some(handle) = sandbox_handles.remove(&agent_id) {
+                if handle.cgroup_created {
+                    if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
+                        ebpf_collector.unregister_agent(cid);
+                    }
+                }
+                if let Err(e) = sandbox.teardown_agent(&handle) {
+                    warn!(agent = %agent_name, error = %e, "Sandbox-Teardown nach Isolations-Fehler fehlgeschlagen");
+                }
+            }
+        }
+    }
+}
+
 fn mountinfo_contains_mountpoint(mountinfo: &str, path: &std::path::Path) -> bool {
     let target = path
         .canonicalize()
@@ -480,6 +581,11 @@ fn spawn_agent_runtime_stack(
 
             sandbox_handles.insert(agent_id, handle);
 
+            // #75: captured inside the handle-borrow block; netns isolation is
+            // verified after the borrow is released (helper needs the maps).
+            let mut agent_process_started = false;
+            let mut started_child_pid: Option<u32> = None;
+
             // Agent-Prozess in bwrap starten (TOGAF: agent-runtime)
             if let Some(handle) = sandbox_handles.get_mut(&agent_id) {
                 if handle.cgroup_created {
@@ -491,6 +597,9 @@ fn spawn_agent_runtime_stack(
                     ) {
                         Ok(proc) => {
                             let pid = proc.pid;
+                            // #75: sandboxed child PID (from bwrap --info-fd) for
+                            // netns verification — NOT the supervisor `pid`.
+                            let proc_child_pid = proc.child_pid;
                             info!(
                                 agent = %agent_cfg.identity.name,
                                 pid,
@@ -514,20 +623,10 @@ fn spawn_agent_runtime_stack(
                                 fs_mount,
                             );
 
-                            // Network-Namespace Isolation (optional)
-                            let agent_index = (agent_cfg.identity.id % 255) as u8;
-                            match sandbox.setup_network(handle, pid, agent_index) {
-                                Ok(true) => info!(
-                                    agent = %agent_cfg.identity.name,
-                                    "Network isolation aktiv"
-                                ),
-                                Ok(false) => {}
-                                Err(e) => warn!(
-                                    agent = %agent_cfg.identity.name,
-                                    error = %e,
-                                    "Netns setup fehlgeschlagen (Agent laeuft ohne Netzwerk-Isolation)"
-                                ),
-                            }
+                            // #75: defer netns isolation check until the handle
+                            // borrow is released (the verifier needs the maps).
+                            agent_process_started = true;
+                            started_child_pid = proc_child_pid;
                         }
                         Err(e) => {
                             warn!(
@@ -553,6 +652,23 @@ fn spawn_agent_runtime_stack(
                         fs_mount,
                     );
                 }
+            }
+
+            // #75: verify full-cage isolation after the handle borrow is
+            // released (the verifier needs the maps). Initial-spawn path has no
+            // event store; warn + health snapshot are the durable signals here.
+            if agent_process_started {
+                enforce_agent_netns_isolation(
+                    agent_id,
+                    &agent_cfg.identity.name,
+                    started_child_pid,
+                    sandbox,
+                    sandbox_handles,
+                    ebpf_collector,
+                    agent_processes,
+                    security_runtime_state,
+                    None,
+                );
             }
         }
         Err(e) => {
@@ -785,16 +901,14 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             SandboxWarning::OomScoreFailed(msg) => {
                 warn!(detail = %msg, "OOM-Score fuer ECS-Core konnte nicht gesetzt werden");
             }
-            SandboxWarning::NetnsNotAvailable => {
-                warn!("Network-Namespace nicht verfuegbar — Agent-Netzwerk-Isolation deaktiviert");
-            }
         }
     }
     info!(
         landlock = sandbox.has_landlock(),
         cgroups = sandbox.has_cgroups(),
         bwrap = sandbox.has_bwrap(),
-        netns = sandbox.has_netns(),
+        // #75: agents are full-caged by bwrap --unshare-all; the daemon verifies
+        // isolation post-spawn on the sandboxed child PID.
         warnings = sandbox_warnings.len(),
         "Sandbox Enforcer initialisiert"
     );
@@ -3723,6 +3837,8 @@ fn ecs_tick_loop(
     }
     let event_store_for_episodes = Arc::clone(&event_store);
     let event_store_for_prune = Arc::clone(&event_store);
+    // #75: kept for the post-spawn isolation verifier (AgentIsolationFailed event).
+    let event_store_for_isolation = Arc::clone(&event_store);
     world.insert_resource(LimboEventStore(event_store));
     world.insert_resource(ActionReceiver(std::sync::Mutex::new(action_rx)));
     world.insert_resource(sentinel_ecs::OperatorCommandReceiver(
@@ -3920,6 +4036,11 @@ fn ecs_tick_loop(
                 }
                 sandbox_handles.insert(agent_id, handle);
 
+                // #75: captured inside the handle-borrow block; netns isolation
+                // is verified after the borrow is released.
+                let mut agent_process_started = false;
+                let mut started_child_pid: Option<u32> = None;
+
                 // Agent-Prozess in bwrap starten (TOGAF: agent-runtime)
                 if let Some(h) = sandbox_handles.get_mut(&agent_id) {
                     if h.cgroup_created {
@@ -3931,6 +4052,9 @@ fn ecs_tick_loop(
                         ) {
                             Ok(proc) => {
                                 let pid = proc.pid;
+                                // #75: sandboxed child PID (bwrap --info-fd) for
+                                // netns verification — NOT the supervisor `pid`.
+                                let proc_child_pid = proc.child_pid;
                                 info!(
                                     agent = %agent_cfg.identity.name,
                                     pid,
@@ -3955,20 +4079,10 @@ fn ecs_tick_loop(
                                     fs_mount.as_deref(),
                                 );
 
-                                // Network-Namespace Isolation (optional)
-                                let agent_index = (agent_cfg.identity.id % 255) as u8;
-                                match sandbox.setup_network(h, pid, agent_index) {
-                                    Ok(true) => info!(
-                                        agent = %agent_cfg.identity.name,
-                                        "Network isolation aktiv"
-                                    ),
-                                    Ok(false) => {}
-                                    Err(e) => warn!(
-                                        agent = %agent_cfg.identity.name,
-                                        error = %e,
-                                        "Netns setup fehlgeschlagen"
-                                    ),
-                                }
+                                // #75: defer netns isolation check until the
+                                // handle borrow is released.
+                                agent_process_started = true;
+                                started_child_pid = proc_child_pid;
                             }
                             Err(e) => {
                                 warn!(
@@ -3994,6 +4108,23 @@ fn ecs_tick_loop(
                             fs_mount.as_deref(),
                         );
                     }
+                }
+
+                // #75: verify full-cage isolation after the handle borrow is
+                // released. ecs_tick_loop owns the event store, so a NotIsolated
+                // agent also gets a string-typed AgentIsolationFailed event.
+                if agent_process_started {
+                    enforce_agent_netns_isolation(
+                        agent_id,
+                        &agent_cfg.identity.name,
+                        started_child_pid,
+                        &sandbox,
+                        &mut sandbox_handles,
+                        &mut ebpf_collector,
+                        &mut agent_processes,
+                        &security_runtime_state,
+                        Some(event_store_for_isolation.as_ref()),
+                    );
                 }
             }
             Err(e) => {

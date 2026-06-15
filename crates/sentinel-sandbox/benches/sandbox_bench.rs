@@ -6,8 +6,8 @@
 //! - PSI String-Parsing
 //! - cgroup create + remove Zyklus (VM only)
 //! - SandboxEnforcer setup + teardown (VM only)
-//! - NetworkNsConfig creation + nftables generation (Tier 1)
-//! - veth/nftables setup + teardown (Tier 2, VM only)
+//! - #75 full-cage netns isolation verifier overhead (readlink + classify)
+//! - bwrap full-cage spawn latency (Tier 2, VM only)
 //!
 //! WICHTIG: Die VM-only Benchmarks liefern nur auf der Deployment-VM
 //! (<deploy-vm>) aussagekraeftige Ergebnisse. Auf anderen Systemen
@@ -95,142 +95,20 @@ fn bench_enforcer_setup_teardown(c: &mut Criterion) {
     });
 }
 
-// --- Tier 1: Network Namespace config benchmarks (run everywhere) ---
+// --- #75: full-cage netns isolation verifier (run everywhere) ---
 
-fn bench_netns_config_creation(c: &mut Criterion) {
-    use sentinel_sandbox::NetworkNsConfig;
+fn bench_netns_verify(c: &mut Criterion) {
+    use sentinel_sandbox::SandboxEnforcer;
 
-    c.bench_function("netns_config_creation", |b| {
+    // Overhead of the post-spawn isolation check: two readlink(/proc/<pid>/ns/net)
+    // + parse + classify. Probing the current PID against the daemon's own netns
+    // exercises the exact code path (result is NotIsolated here, which is fine —
+    // we measure cost, not outcome).
+    let (enforcer, _) = SandboxEnforcer::detect();
+    let pid = std::process::id();
+    c.bench_function("netns_verify", |b| {
         b.iter(|| {
-            std::hint::black_box(NetworkNsConfig::for_agent("bench-agent", 5));
-        });
-    });
-}
-
-fn bench_nftables_rules_generation(c: &mut Criterion) {
-    use sentinel_sandbox::NetworkNsConfig;
-
-    let config = NetworkNsConfig::for_agent("bench-agent", 5);
-    c.bench_function("nftables_rules_generation", |b| {
-        b.iter(|| {
-            std::hint::black_box(config.generate_nftables_rules());
-        });
-    });
-}
-
-fn bench_veth_name_computation(c: &mut Criterion) {
-    use sentinel_sandbox::NetworkNsConfig;
-
-    let config = NetworkNsConfig::for_agent("agent-01-thomas-ceo", 0);
-    c.bench_function("veth_name_computation", |b| {
-        b.iter(|| {
-            std::hint::black_box(config.veth_host_name());
-            std::hint::black_box(config.veth_peer_name());
-        });
-    });
-}
-
-// --- Tier 2: Network Namespace system benchmarks (VM only) ---
-
-fn bench_netns_setup_teardown(c: &mut Criterion) {
-    use sentinel_sandbox::{netns, NetworkNsConfig};
-
-    if !netns::detect_netns_support() {
-        c.bench_function("netns_setup_teardown [no netns — config only]", |b| {
-            b.iter(|| {
-                std::hint::black_box(NetworkNsConfig::for_agent("bench-ns", 99));
-            });
-        });
-        return;
-    }
-
-    // Budget: < 50ms for full setup + teardown
-    let config = NetworkNsConfig::for_agent("bench-ns", 99);
-    c.bench_function("netns_setup_teardown", |b| {
-        b.iter(|| {
-            // Setup bridge is idempotent, include in measurement
-            netns::setup_bridge(&config).unwrap();
-            // We cannot do full setup_netns without a real PID in a netns,
-            // so we measure bridge setup + teardown cycle
-            netns::teardown_netns(&config).ok();
-        });
-    });
-}
-
-fn bench_veth_creation(c: &mut Criterion) {
-    use sentinel_sandbox::netns;
-
-    if !netns::detect_netns_support() {
-        c.bench_function("veth_creation [no netns — skip]", |b| {
-            b.iter(|| {
-                std::hint::black_box(42);
-            });
-        });
-        return;
-    }
-
-    // Budget: < 20ms for veth pair create + delete
-    c.bench_function("veth_creation", |b| {
-        b.iter(|| {
-            let _ = std::process::Command::new("ip")
-                .args([
-                    "link",
-                    "add",
-                    "veth-bench",
-                    "type",
-                    "veth",
-                    "peer",
-                    "name",
-                    "vp-bench",
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            let _ = std::process::Command::new("ip")
-                .args(["link", "del", "veth-bench"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        });
-    });
-}
-
-fn bench_nftables_load(c: &mut Criterion) {
-    use sentinel_sandbox::{netns, NetworkNsConfig};
-
-    if !netns::detect_netns_support() {
-        c.bench_function("nftables_load [no netns — generation only]", |b| {
-            let config = NetworkNsConfig::for_agent("bench-nft", 99);
-            b.iter(|| {
-                std::hint::black_box(config.generate_nftables_rules());
-            });
-        });
-        return;
-    }
-
-    // Budget: < 10ms for nft ruleset load
-    let config = NetworkNsConfig::for_agent("bench-nft", 99);
-    c.bench_function("nftables_load", |b| {
-        let rules = config.generate_nftables_rules();
-        b.iter(|| {
-            use std::io::Write;
-            let mut child = std::process::Command::new("nft")
-                .args(["-f", "-"])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap();
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(rules.as_bytes()).unwrap();
-            }
-            child.wait().unwrap();
-            // Cleanup: flush the table
-            let _ = std::process::Command::new("nft")
-                .args(["delete", "table", "inet", "sentinel-agent"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            std::hint::black_box(enforcer.verify_agent_netns_isolation(pid));
         });
     });
 }
@@ -272,15 +150,9 @@ criterion_group!(
     bench_psi_parse,
     bench_cgroup_create_remove,
     bench_enforcer_setup_teardown,
-    // Tier 1 — Network Namespace
-    bench_netns_config_creation,
-    bench_nftables_rules_generation,
-    bench_veth_name_computation,
-    // Tier 2 — Network Namespace (VM only)
-    bench_netns_setup_teardown,
-    bench_veth_creation,
-    bench_nftables_load,
-    // Tier 2 — bwrap spawn latency (VM only)
+    // #75 — full-cage isolation verifier overhead
+    bench_netns_verify,
+    // Tier 2 — bwrap spawn latency, full cage (VM only)
     bench_bwrap_spawn_latency,
 );
 criterion_main!(benches);

@@ -4761,6 +4761,7 @@ dependencies = [
  "anyhow",
  "criterion 0.8.2",
  "landlock",
+ "libc",
  "sentinel-common",
  "sentinel-zenoh",
  "serde",
