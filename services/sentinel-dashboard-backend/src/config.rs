@@ -260,7 +260,9 @@ fn parse_generated(
 fn shift_distribution(agents: &[AgentConfig]) -> BTreeMap<String, usize> {
     let mut dist = BTreeMap::new();
     for agent in agents {
-        *dist.entry(agent.identity.shift_set.to_string()).or_insert(0) += 1;
+        *dist
+            .entry(agent.identity.shift_set.to_string())
+            .or_insert(0) += 1;
     }
     dist
 }

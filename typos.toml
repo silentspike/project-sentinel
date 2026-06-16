@@ -38,6 +38,7 @@ relevante = "relevante"
 temporaere = "temporaere"
 brach = "brach"               # German: past tense of "brechen" (#250 retention comments)
 Periode = "Periode"           # German: calendar period (#250 retention comments)
+Komma = "Komma"               # German: comma — "Komma-getrennt" UI labels (#422 agent editor)
 
 # Sprint 2 domain words (ECS, Bio-Engine, Physics, Room System)
 Buero = "Buero"
