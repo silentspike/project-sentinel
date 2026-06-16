@@ -5,3 +5,6 @@ test-results/
 playwright-report/
 *.log
 .playwright/
+.playwright-cli/
+# Repo ships no lockfile by design; `npm install` regenerates it locally.
+package-lock.json
