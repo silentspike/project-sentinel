@@ -4,10 +4,11 @@
   "exclude_prefixes": [
     "crates/sentinel-common/src/generated"
   ],
-  "max_unsafe_constructs": 26,
+  "max_unsafe_constructs": 25,
   "notes": [
     "Generated FlatBuffers bindings are excluded because they are machine-generated and regenerated from schemas.",
     "The check also requires a nearby SAFETY comment for every counted unsafe construct.",
-    "2026-06-15 (#75): 19 -> 26. crates/sentinel-sandbox/src/bwrap.rs gained 7 reviewed unsafe constructs for bwrap --info-fd FD plumbing (libc::pipe2, CommandExt::pre_exec with fcntl/dup2, libc::poll, libc::close, File::from_raw_fd) so the daemon can read the sandboxed child PID for post-spawn netns isolation verification. No safe std API exists for passing a specific inherited FD to a child; each construct has a SAFETY comment and is confined to spawn()/read_child_pid_from_info_fd()."
+    "2026-06-15 (#75): 19 -> 26. crates/sentinel-sandbox/src/bwrap.rs gained 7 reviewed unsafe constructs for bwrap --info-fd FD plumbing (libc::pipe2, CommandExt::pre_exec with fcntl/dup2, libc::poll, libc::close, File::from_raw_fd) so the daemon can read the sandboxed child PID for post-spawn netns isolation verification. No safe std API exists for passing a specific inherited FD to a child; each construct has a SAFETY comment and is confined to spawn()/read_child_pid_from_info_fd().",
+    "2026-06-16 (#75 follow-up): 26 -> 25. The robust accumulating --info-fd read loop lets a File own read_fd (RAII close on every path), dropping one manual libc::close from read_child_pid_from_info_fd."
   ]
 }
