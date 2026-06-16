@@ -6,7 +6,6 @@ import {
   validatePersonality,
   validateAgentRequired,
   validateAdjacency,
-  mirrorAdjacency,
 } from "../src/views/config/validation";
 
 const culture = () => ({
@@ -156,16 +155,5 @@ describe("validateAdjacency (mirrors BuildingConfig::validate)", () => {
         e.includes("Duplicate room ID"),
       ),
     ).toBe(true);
-  });
-});
-
-describe("mirrorAdjacency", () => {
-  it("makes a one-sided edge bidirectional (then validateAdjacency passes)", () => {
-    const before = building([room("a", ["b"]), room("b", [])]);
-    expect(validateAdjacency(before).length).toBeGreaterThan(0);
-    const after = mirrorAdjacency(before, "a", "b");
-    expect(validateAdjacency(after)).toEqual([]);
-    // original is not mutated (returns a new building)
-    expect(before.rooms[1].adjacent).toEqual([]);
   });
 });

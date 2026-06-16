@@ -112,13 +112,3 @@ export function validateAdjacency(building: BuildingConfig): string[] {
   }
   return errors;
 }
-
-/** Returns a NEW BuildingConfig with the a↔b adjacency mirrored both ways (UX convenience for #423). */
-export function mirrorAdjacency(building: BuildingConfig, a: string, b: string): BuildingConfig {
-  const rooms = building.rooms.map((r) => {
-    if (r.id === a && !r.adjacent.includes(b)) return { ...r, adjacent: [...r.adjacent, b] };
-    if (r.id === b && !r.adjacent.includes(a)) return { ...r, adjacent: [...r.adjacent, a] };
-    return r;
-  });
-  return { ...building, rooms };
-}
