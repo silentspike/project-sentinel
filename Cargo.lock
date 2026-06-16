@@ -4513,6 +4513,7 @@ dependencies = [
  "rustls",
  "sentinel-common",
  "sentinel-console-plane",
+ "sentinel-gaia",
  "sentinel-limbo",
  "sentinel-projection",
  "serde",

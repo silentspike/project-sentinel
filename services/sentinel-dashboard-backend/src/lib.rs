@@ -181,7 +181,7 @@ impl AppState {
 /// Aus `main` ausgelagert, damit Integrationstests die Auth-Gates (#463) ohne Live-Server pruefen.
 pub fn build_app(state: AppState) -> axum::Router {
     use axum::middleware;
-    use axum::routing::{get, post};
+    use axum::routing::{get, post, put};
     use tower_http::{cors::CorsLayer, services::ServeDir};
 
     // #463: Projection-Read-Routen hinter `require_auth` (konsistent zur Control-Plane) — die echten
@@ -247,9 +247,14 @@ pub fn build_app(state: AppState) -> axum::Router {
     // READ geparst (agents/rooms) + daemon.toml-Rohtext; WRITE validiert + proxyt an #425 (Daemon=Schreiber).
     let config_routes = axum::Router::new()
         .route("/agents", get(config::get_agents))
-        .route("/rooms", get(config::get_rooms))
+        // #422: PUT /agents/{id} — editiert einen Agenten (validate → Apply-Proxy, mode:live).
+        .route("/agents/{id}", put(config::put_agent))
+        // #423: GET liest, PUT editiert rooms (bidirektionale Adjazenz server-autoritativ, mode:live).
+        .route("/rooms", get(config::get_rooms).put(config::put_rooms))
         .route("/daemon", get(config::get_daemon))
         .route("/apply", post(config::apply))
+        // #421: deterministischer Generator (preview-only, kein Persist).
+        .route("/generate", post(config::generate_company))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,

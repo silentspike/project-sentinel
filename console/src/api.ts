@@ -40,6 +40,10 @@ export function deleteJson<T>(path: string, body: unknown): Promise<T> {
   return apiJson<T>(path, { method: "DELETE", body: JSON.stringify(body) });
 }
 
+export function putJson<T>(path: string, body: unknown): Promise<T> {
+  return apiJson<T>(path, { method: "PUT", body: JSON.stringify(body) });
+}
+
 export interface EbpfMetrics {
   available: boolean;
   mode: string;
@@ -248,4 +252,129 @@ export interface SnapshotWorldState {
   present_agent_count: number;
   room_count: number;
   rooms: SnapshotRoomState[];
+}
+
+// ── Config editor schemas (#421/#422/#423) ──
+// These mirror the Rust serde JSON exactly. SSOT of the SHAPE = the Rust structs:
+//   GaiaSpec (services/sentinel-gaia/src/lib.rs), AgentConfig (crates/sentinel-common/src/agent_config.rs),
+//   BuildingConfig (crates/sentinel-common/src/room.rs). Enums serialize snake_case.
+
+export type CompanyType = "software_agency" | "manufacturing" | "healthcare" | "generic";
+export type ShiftModel = "office_hours" | "three_shift" | "hybrid";
+
+export interface CultureSpec {
+  formality: number;
+  collaboration: number;
+  conflict_level: number;
+  innovation: number;
+  diversity: number;
+  mission: string;
+  values: string[];
+}
+
+export interface DepartmentSpec {
+  name: string;
+  weight: number;
+  roles: string[];
+}
+
+export interface GaiaSpec {
+  company_name: string;
+  company_type: CompanyType;
+  city: string;
+  address: string;
+  agent_count: number;
+  seed: number;
+  shift_model: ShiftModel;
+  time_scale: number;
+  departments: DepartmentSpec[];
+  culture: CultureSpec;
+}
+
+export interface IdentityConfig {
+  id: number;
+  name: string;
+  role: string;
+  department: string;
+  shift_set: number;
+  kpis: string[];
+  reports_to?: string | null;
+  direct_reports: string[];
+}
+
+export interface PersonalityConfig {
+  openness: number;
+  conscientiousness: number;
+  extraversion: number;
+  agreeableness: number;
+  neuroticism: number;
+  caffeine_tolerance: number;
+  morning_person: boolean;
+}
+
+export interface PreferencesConfig {
+  favorite_room: string;
+  coffee_preference: string;
+  lunch_time: string;
+}
+
+export interface BackgroundConfig {
+  bio: string;
+  quirks: string[];
+}
+
+export interface RuntimeSelectionConfig {
+  nano_runtime?: string | null;
+}
+
+export interface CapabilitiesConfig {
+  tools: string[];
+  sandbox_allowed_paths: string[];
+}
+
+export interface AgentConfig {
+  identity: IdentityConfig;
+  personality: PersonalityConfig;
+  preferences: PreferencesConfig;
+  background: BackgroundConfig;
+  runtime: RuntimeSelectionConfig;
+  capabilities: CapabilitiesConfig;
+}
+
+export type RoomType = "office" | "meeting" | "common" | "break" | "transit" | "bathroom";
+
+export interface RoomConfig {
+  id: string;
+  name: string;
+  floor: number;
+  capacity: number;
+  room_type: RoomType;
+  adjacent: string[];
+  department?: string | null;
+  has_coffee_machine: boolean;
+  has_printer: boolean;
+}
+
+export interface BuildingMeta {
+  name: string;
+  address: string;
+  floors: number;
+}
+
+export interface BuildingConfig {
+  building: BuildingMeta;
+  rooms: RoomConfig[];
+}
+
+export interface GeneratePreview {
+  summary: { agent_count: number; room_count: number; shift_distribution: Record<string, number> };
+  agents: AgentConfig[];
+  building: BuildingConfig;
+}
+
+export interface DaemonParams {
+  content: string;
+  max_agents: number | null;
+  time_scale: number | null;
+  tick_rate_ms: number | null;
 }
