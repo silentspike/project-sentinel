@@ -769,10 +769,10 @@ PRAGMA page_size = 8192;              -- optimized for NVMe sectors
   --bind /ram/agents/thomas /home/thomas \
   --tmpfs /tmp \
   --proc /proc --dev /dev \
-  --unshare-all --share-net \
+  --unshare-all \
   --die-with-parent \
   -- /usr/bin/agent-runtime</pre>
-                <p class="text-sm mb-3">Each agent sees <strong class="text-bright">only</strong> its own home directory (sentinel-fs CAS mount) and the company data (read-only). Starts in <strong class="text-bright">&lt;10ms</strong> (Docker: 500ms+). <span class="text-dim text-[0.78rem]">Validated: Anthropic uses an identical bwrap+Landlock stack for Claude Code<sup><a href="#ref-28" class="text-neon-blue no-underline text-[0.7rem] font-bold">[28]</a></sup></span></p>
+                <p class="text-sm mb-3">Each agent sees <strong class="text-bright">only</strong> its own home directory (sentinel-fs CAS mount) and the company data (read-only). Starts in <strong class="text-bright">&lt;10ms</strong> (Docker: 500ms+). The agent has <strong class="text-bright">no network</strong> (full cage via <code class="font-mono text-neon-blue text-[0.8em]">--unshare-all</code>, loopback only): all LLM calls are proxied by the daemon to the Cortex Gateway on the host (MITM-enforced) &mdash; the sandbox process makes no network calls itself, so <code class="font-mono text-neon-blue text-[0.8em]">--share-net</code> is deliberately not set (it would bypass the MITM). <span class="text-dim text-[0.78rem]">Validated: Anthropic uses an identical bwrap+Landlock stack for Claude Code<sup><a href="#ref-28" class="text-neon-blue no-underline text-[0.7rem] font-bold">[28]</a></sup></span></p>
                 <h4 class="font-mono font-bold text-[0.8rem] text-accent-gold uppercase mt-4 mb-2 tracking-wider">Landlock ruleset (per agent)</h4>
                 <div class="space-y-1 text-sm">
                     <div class="flex gap-3 py-1.5 border-b border-border/60"><strong class="text-bright w-20 shrink-0">Read</strong><span>Agent definition, company data, shared resources</span></div>
