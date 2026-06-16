@@ -20,6 +20,8 @@ sentinel-console-plane = { path = "../../crates/sentinel-console-plane" }
 sentinel-common = { path = "../../crates/sentinel-common" }
 sentinel-projection = { path = "../../crates/sentinel-projection" }
 sentinel-limbo = { path = "../../crates/sentinel-limbo" }
+# #421: deterministischer Company-Generator (lib, blake3, KEIN LLM) fuer POST /api/config/generate
+sentinel-gaia = { path = "../sentinel-gaia" }
 # Workspace-Deps
 anyhow = { workspace = true }
 thiserror = { workspace = true }
