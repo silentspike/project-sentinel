@@ -7,7 +7,7 @@
 ## Interfaces
 
 - `SandboxEnforcer` starts and tracks isolated agent processes.
-- `BwrapConfig`, `LandlockRuleset`, `NetworkNsConfig`, and `CgroupLimits` describe isolation policy.
+- `BwrapConfig`, `LandlockRuleset`, and `CgroupLimits` describe isolation policy (network: full cage via `bwrap --unshare-all`, post-spawn isolation verified against the child PID).
 - `AgentProcess` and `SandboxHandle` represent managed runtime state.
 - `psi_publisher` exposes pressure metrics for bio stress and monitoring.
 - `BwrapNanoRuntime` implements the shared `NanoRuntime` contract for the
