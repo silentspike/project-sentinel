@@ -317,7 +317,7 @@ async fn put_rooms_one_sided_adjacency_returns_400_no_upstream() {
     // r1.adjacent leeren (garantiert r1->r0 nicht vorhanden), r1 zu r0.adjacent hinzufuegen.
     bad["rooms"][1]["adjacent"] = serde_json::json!([]);
     let r0_adj = bad["rooms"][0]["adjacent"].as_array_mut().unwrap();
-    if !r0_adj.iter().any(|x| *x == r1_id) {
+    if !r0_adj.contains(&r1_id) {
         r0_adj.push(r1_id);
     }
     let (status, json) = authed_request("PUT", "/api/config/rooms", bad).await;
@@ -348,8 +348,5 @@ async fn daemon_read_exposes_parsed_whitelist() {
     let (s, daemon) = authed_get("/api/config/daemon").await;
     assert_eq!(s, StatusCode::OK);
     assert!(daemon["max_agents"].is_number(), "max_agents geparst");
-    assert!(
-        daemon["tick_rate_ms"].is_number(),
-        "tick_rate_ms geparst"
-    );
+    assert!(daemon["tick_rate_ms"].is_number(), "tick_rate_ms geparst");
 }
