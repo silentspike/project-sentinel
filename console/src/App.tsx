@@ -17,6 +17,7 @@ import { FloorplanView } from "./views/FloorplanView";
 import { MetricsView } from "./views/MetricsView";
 import { ProfilingView } from "./views/ProfilingView";
 import { TimeTravelView } from "./views/TimeTravelView";
+import { GaiaWizardView } from "./views/GaiaWizardView";
 
 // Mobile-Breakpoint via matchMedia (Desktop=Tiling, Mobile=BottomTabBar).
 function useIsMobile() {
@@ -26,7 +27,7 @@ function useIsMobile() {
   return m;
 }
 
-const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "profiling", "cockpit", "activity", "chaos", "chat", "control", "timetravel"];
+const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "profiling", "cockpit", "activity", "chaos", "chat", "control", "timetravel", "gaia-wizard"];
 const PANEL_LABEL: Record<PanelKind, string> = {
   agents: "Agents",
   floorplan: "Floorplan",
@@ -38,6 +39,7 @@ const PANEL_LABEL: Record<PanelKind, string> = {
   chat: "Chat",
   control: "Control",
   timetravel: "Zeitreise",
+  "gaia-wizard": "Gaia Wizard",
 };
 
 function Login(props: { onOk: () => void }): JSX.Element {
@@ -83,6 +85,7 @@ const PANELS: Record<PanelKind, () => JSX.Element> = {
   chat: ChatView,
   control: ControlView,
   timetravel: TimeTravelView,
+  "gaia-wizard": GaiaWizardView,
 };
 
 // Tile-Chrome: kompakte Leiste (Split horizontal/vertikal, Schliessen) ueber dem Panel.
