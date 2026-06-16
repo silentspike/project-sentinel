@@ -530,6 +530,9 @@ Plattform = "Plattform"   # German: platform
 invalide = "invalide"     # German: invalid
 Invalide = "Invalide"     # German: invalid (capitalized)
 
+# TOGAF Cluster 12 ADRs (#397) - distributed-systems acronyms
+RTO = "RTO"               # Recovery Time Objective (paired with RPO)
+
 [files]
 extend-exclude = [
     "Cargo.lock",
