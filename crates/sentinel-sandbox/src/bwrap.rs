@@ -2,19 +2,22 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// File descriptor bwrap writes its sandbox info JSON to (`--info-fd`).
 const INFO_FD: RawFd = 3;
 
-/// Bounded wait for bwrap to report the sandboxed child PID, so a stuck bwrap
-/// cannot block the daemon's spawn path indefinitely (bwrap sets up in <10ms).
+/// Total deadline for the accumulating `--info-fd` read loop, so a stuck bwrap
+/// cannot block the daemon's spawn path indefinitely. Generous on purpose: the
+/// eight info-JSON writes happen back-to-back once bwrap reaches the info dump,
+/// so the budget only covers reaching that point under a heavy spawn burst.
 const INFO_FD_TIMEOUT_MS: libc::c_int = 5000;
 
 /// Result of spawning a bwrap sandbox.
@@ -324,34 +327,93 @@ fn hostname_for_agent(name: &str) -> String {
 
 /// Reads the sandboxed child PID from bwrap's `--info-fd` pipe.
 ///
-/// Polls (bounded by `timeout_ms`) for bwrap to write its one-shot info JSON,
-/// then does a single read (the JSON is one small `write()`, well under
-/// `PIPE_BUF`). Takes ownership of `read_fd` and closes it. Returns `None` on
-/// timeout, read error, or if bwrap exited without reporting (fail-closed: the
-/// caller treats a missing PID by skipping verification, while the bwrap exit
-/// code stays the primary signal).
+/// bwrap does NOT write the info JSON in one `write()`: bubblewrap 0.9.0 emits
+/// it across eight syscalls (one per field — verified with strace), so the
+/// first chunk (`{\n    "child-pid": N`) is not valid JSON on its own. A single
+/// poll+read can therefore catch the JSON mid-sequence under load, which is why
+/// ~2/26 agents were skipped during a restart burst (#75 follow-up). This reads
+/// in a loop, accumulating bytes and re-parsing until a complete JSON object is
+/// available, bounded by a total deadline. Takes ownership of `read_fd` (a
+/// `File` closes it on every return path). Returns `None` — and logs the exact
+/// failure mode — on deadline, EOF before complete JSON, or a poll/read error;
+/// the caller then skips verification while the bwrap exit code stays the
+/// primary fail-closed signal.
 fn read_child_pid_from_info_fd(read_fd: RawFd, timeout_ms: libc::c_int) -> Option<u32> {
-    let mut pfd = libc::pollfd {
-        fd: read_fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: single valid pollfd; poll does not retain the pointer.
-    let prc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-    if prc <= 0 {
-        // SAFETY: read_fd is still open and owned here.
-        unsafe { libc::close(read_fd) };
-        return None;
-    }
-
-    // SAFETY: read_fd is a valid open fd; File takes ownership and closes it.
+    // SAFETY: read_fd is a valid open fd; File takes ownership and closes it on drop.
     let mut file = unsafe { File::from_raw_fd(read_fd) };
-    let mut buf = [0u8; 1024];
-    let n = file.read(&mut buf).ok()?;
-    if n == 0 {
-        return None;
+    let fd = file.as_raw_fd();
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
+    let mut acc: Vec<u8> = Vec::with_capacity(256);
+    let mut chunk = [0u8; 256];
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            warn!(
+                bytes = acc.len(),
+                "bwrap --info-fd: deadline reached without a complete JSON (child PID not reported)"
+            );
+            return None;
+        }
+        let remaining_ms = remaining.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: single valid pollfd; poll does not retain the pointer.
+        let prc = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
+        if prc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            warn!(error = %err, "bwrap --info-fd: poll error (child PID not reported)");
+            return None;
+        }
+        if prc == 0 {
+            warn!(
+                bytes = acc.len(),
+                "bwrap --info-fd: poll timeout, no data within deadline (child PID not reported)"
+            );
+            return None;
+        }
+
+        match file.read(&mut chunk) {
+            Ok(0) => {
+                warn!(
+                    bytes = acc.len(),
+                    "bwrap --info-fd: EOF before a complete JSON (child PID not reported)"
+                );
+                return None;
+            }
+            Ok(n) => {
+                acc.extend_from_slice(&chunk[..n]);
+                if let Some(pid) = parse_child_pid_bytes(&acc) {
+                    debug!(
+                        child_pid = pid,
+                        bytes = acc.len(),
+                        "bwrap --info-fd: child PID parsed"
+                    );
+                    return Some(pid);
+                }
+                // Incomplete JSON so far — keep accumulating.
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                warn!(error = %e, "bwrap --info-fd: read error (child PID not reported)");
+                return None;
+            }
+        }
     }
-    let text = std::str::from_utf8(&buf[..n]).ok()?;
+}
+
+/// Extracts the `child-pid` field from an accumulated info-JSON byte buffer.
+///
+/// Returns `None` while the buffer is not yet valid UTF-8 / complete JSON, so
+/// the read loop keeps accumulating.
+fn parse_child_pid_bytes(buf: &[u8]) -> Option<u32> {
+    let text = std::str::from_utf8(buf).ok()?;
     parse_child_pid(text)
 }
 
@@ -431,6 +493,73 @@ mod tests {
         assert_eq!(parse_child_pid(""), None);
         assert_eq!(parse_child_pid("not json"), None);
         assert_eq!(parse_child_pid(r#"{"no-pid": 1}"#), None);
+    }
+
+    #[test]
+    fn parse_child_pid_bytes_accumulates() {
+        // bwrap's first write() is incomplete JSON -> None, so the loop keeps reading.
+        assert_eq!(parse_child_pid_bytes(b"{\n    \"child-pid\": 12345"), None);
+        // A complete object parses, even before the trailing newline.
+        assert_eq!(
+            parse_child_pid_bytes(b"{\n    \"child-pid\": 12345\n}"),
+            Some(12345)
+        );
+        // Full bwrap-style payload with the trailing newline.
+        let full = b"{\n    \"child-pid\": 7,\n    \"net-namespace\": 123\n}\n";
+        assert_eq!(parse_child_pid_bytes(full), Some(7));
+        // Not-yet-valid UTF-8 -> None (keep accumulating).
+        assert_eq!(parse_child_pid_bytes(&[0xff, 0xfe]), None);
+    }
+
+    // Replays bwrap 0.9.0's eight-write info-JSON sequence across a real pipe
+    // with gaps, so the read loop must accumulate across poll/read iterations.
+    #[test]
+    fn read_child_pid_reassembles_chunked_writes() {
+        use std::io::Write;
+        use std::os::fd::{IntoRawFd, OwnedFd};
+
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let handle = std::thread::spawn(move || {
+            let chunks: [&[u8]; 8] = [
+                b"{\n    \"child-pid\": 12345",
+                b",\n    \"cgroup-namespace\": 4026534166",
+                b",\n    \"ipc-namespace\": 4026534164",
+                b",\n    \"mnt-namespace\": 4026534162",
+                b",\n    \"net-namespace\": 4026534167",
+                b",\n    \"pid-namespace\": 4026534165",
+                b",\n    \"uts-namespace\": 4026534163",
+                b"\n}\n",
+            ];
+            for chunk in chunks {
+                let _ = writer.write_all(chunk);
+                let _ = writer.flush();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // writer dropped -> EOF
+        });
+
+        let read_fd = OwnedFd::from(reader).into_raw_fd();
+        let pid = read_child_pid_from_info_fd(read_fd, 5000);
+        handle.join().unwrap();
+        assert_eq!(pid, Some(12345));
+    }
+
+    #[test]
+    fn read_child_pid_eof_before_complete_returns_none() {
+        use std::io::Write;
+        use std::os::fd::{IntoRawFd, OwnedFd};
+
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let handle = std::thread::spawn(move || {
+            // Only the first (incomplete) chunk, then close -> EOF before complete.
+            let _ = writer.write_all(b"{\n    \"child-pid\": 999");
+            // writer dropped -> EOF
+        });
+
+        let read_fd = OwnedFd::from(reader).into_raw_fd();
+        let pid = read_child_pid_from_info_fd(read_fd, 2000);
+        handle.join().unwrap();
+        assert_eq!(pid, None);
     }
 
     #[test]
