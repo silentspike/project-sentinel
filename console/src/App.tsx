@@ -19,6 +19,7 @@ import { ProfilingView } from "./views/ProfilingView";
 import { TimeTravelView } from "./views/TimeTravelView";
 import { GaiaWizardView } from "./views/GaiaWizardView";
 import { AgentEditorView } from "./views/AgentEditorView";
+import { ConfigEditorView } from "./views/ConfigEditorView";
 
 // Mobile-Breakpoint via matchMedia (Desktop=Tiling, Mobile=BottomTabBar).
 function useIsMobile() {
@@ -28,7 +29,7 @@ function useIsMobile() {
   return m;
 }
 
-const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "profiling", "cockpit", "activity", "chaos", "chat", "control", "timetravel", "gaia-wizard", "agent-editor"];
+const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "profiling", "cockpit", "activity", "chaos", "chat", "control", "timetravel", "gaia-wizard", "agent-editor", "config-editor"];
 const PANEL_LABEL: Record<PanelKind, string> = {
   agents: "Agents",
   floorplan: "Floorplan",
@@ -42,6 +43,7 @@ const PANEL_LABEL: Record<PanelKind, string> = {
   timetravel: "Zeitreise",
   "gaia-wizard": "Gaia Wizard",
   "agent-editor": "Agent Editor",
+  "config-editor": "Config Editor",
 };
 
 function Login(props: { onOk: () => void }): JSX.Element {
@@ -89,6 +91,7 @@ const PANELS: Record<PanelKind, () => JSX.Element> = {
   timetravel: TimeTravelView,
   "gaia-wizard": GaiaWizardView,
   "agent-editor": AgentEditorView,
+  "config-editor": ConfigEditorView,
 };
 
 // Tile-Chrome: kompakte Leiste (Split horizontal/vertikal, Schliessen) ueber dem Panel.
