@@ -11,6 +11,7 @@ pub mod components;
 pub mod events;
 pub mod feature_flags;
 pub mod generated;
+pub mod membership;
 pub mod nano_runtime;
 pub mod psi;
 pub mod room;
@@ -21,6 +22,9 @@ pub use cluster::{
     ClusterConfig, ClusterRole, NodeId, NodeIdentity, NodeLifecycleState, PendingBareNode,
 };
 pub use events::{DomainEvent, DomainEventPayload};
+pub use membership::{
+    Heartbeat, IngestOutcome, MembershipConfig, MembershipState, MembershipView, NodeMembership,
+};
 pub use nano_runtime::*;
 pub use snapshot_codec::{
     decode_snapshot_cursor, decode_world_snapshot, encode_snapshot_cursor, encode_world_snapshot,
