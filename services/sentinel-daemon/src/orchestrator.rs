@@ -1007,6 +1007,21 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         }
     };
 
+    // -- Cluster 12 Membership (#495): Heartbeat + Liveness-View, nur mit [daemon.cluster] --
+    if let (Some(b), Some(cluster)) = (bus.as_ref(), config.cluster.as_ref()) {
+        let identity = sentinel_common::NodeIdentity::from_config(cluster);
+        let view = std::sync::Arc::new(std::sync::Mutex::new(
+            sentinel_common::MembershipView::new(sentinel_common::MembershipConfig::default()),
+        ));
+        tokio::spawn(crate::cluster_membership::run_cluster_membership(
+            b.clone(),
+            identity,
+            view,
+            std::time::Duration::from_secs(1),
+        ));
+        info!(node_id = %cluster.node_id, "Cluster 12: Membership-Service gespawnt");
+    }
+
     // -- Zenoh Fan-Out Bridge (Events nach Limbo-Write auf Zenoh publizieren) --
     let fanout_capacity = config.zenoh.fanout_channel_capacity;
     let fanout_sender = if let Some(ref b) = bus {

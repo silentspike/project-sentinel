@@ -5,6 +5,7 @@
 //! `tokio::Runtime` fuer async I/O (Zenoh, Limbo).
 
 pub mod adaptive_tick;
+pub mod cluster_membership;
 pub mod config;
 pub mod config_apply;
 pub mod config_persist;
