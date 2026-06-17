@@ -6,6 +6,7 @@
 //! - External (Dashboard, Logs): MessagePack
 
 pub mod agent_config;
+pub mod cluster;
 pub mod components;
 pub mod events;
 pub mod feature_flags;
@@ -16,6 +17,9 @@ pub mod room;
 pub mod snapshot_codec;
 pub mod types;
 
+pub use cluster::{
+    ClusterConfig, ClusterRole, NodeId, NodeIdentity, NodeLifecycleState, PendingBareNode,
+};
 pub use events::{DomainEvent, DomainEventPayload};
 pub use nano_runtime::*;
 pub use snapshot_codec::{
