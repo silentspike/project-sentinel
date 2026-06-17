@@ -971,6 +971,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let (config_apply_tx, config_apply_rx) =
         mpsc::channel::<sentinel_common::OperatorConfigApplyCommand>();
     let (migrate_tx, migrate_rx) = mpsc::channel::<sentinel_common::OperatorMigrateCommand>();
+    let (provision_tx, provision_rx) = mpsc::channel::<sentinel_common::OperatorProvisionCommand>();
     let (prune_tx, prune_rx) = mpsc::channel::<i64>();
     let (evolution_result_tx, evolution_result_rx) = mpsc::channel::<EvolutionResult>();
     let evolution_job_tx = crate::evolution_task::spawn_evolution_background_task(
@@ -1020,6 +1021,44 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             std::time::Duration::from_secs(1),
         ));
         info!(node_id = %cluster.node_id, "Cluster 12: Membership-Service gespawnt");
+    }
+
+    // -- Cluster 12 ProvisionNode worker (#495, G3): only on the seed --
+    // The seed absorbs allowlisted bare targets into cluster nodes. On a member or a
+    // single-node daemon the receiver is dropped, so a `ProvisionNode` request fails
+    // fast at the operator endpoint (503) instead of buffering forever.
+    match config.cluster.as_ref() {
+        Some(cluster) if cluster.role() == sentinel_common::cluster::ClusterRole::Seed => {
+            let binary_path = cluster
+                .provision_binary_path
+                .clone()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("/opt/sentinel/bin/sentinel-daemon"));
+            let pending_targets = cluster.pending_targets.clone();
+            let cluster_id = cluster.cluster_id;
+            let provision_event_store = Arc::clone(&event_store);
+            if let Err(e) = std::thread::Builder::new()
+                .name("provision-worker".into())
+                .spawn(move || {
+                    run_provision_worker(
+                        provision_rx,
+                        cluster_id,
+                        pending_targets,
+                        binary_path,
+                        "ubuntu".to_string(),
+                        provision_event_store,
+                    );
+                })
+            {
+                warn!(error = %e, "Cluster 12: ProvisionNode-Worker konnte nicht gestartet werden");
+            } else {
+                info!(
+                    targets = cluster.pending_targets.len(),
+                    "Cluster 12: ProvisionNode-Worker gespawnt (seed)"
+                );
+            }
+        }
+        _ => drop(provision_rx),
     }
 
     // -- Zenoh Fan-Out Bridge (Events nach Limbo-Write auf Zenoh publizieren) --
@@ -1122,6 +1161,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 restore_tx.clone(),
                 config_apply_tx.clone(),
                 migrate_tx.clone(),
+                provision_tx.clone(),
                 config.max_agents,
                 agent_validation,
                 Arc::clone(&event_store),
@@ -3745,6 +3785,140 @@ fn update_agent_projection_identity(projection_db_path: &str, cfg: &AgentConfig)
 ///
 /// Verwaltet den RuntimeOrchestrator (Lifecycle-Events, Shift-Wechsel, Snapshots)
 /// UND die ECS World (Entity-Spawning, Simulation). Laeuft bis `shutdown` gesetzt wird.
+/// Cluster 12 ProvisionNode worker (#495, G3): drains `ProvisionNode` commands and
+/// bootstraps bare targets into cluster nodes. Runs **off** the ECS tick (pure infra
+/// I/O — it never touches the world), one op at a time on its own thread, so a slow
+/// SSH bootstrap never stalls the 1 Hz tick. Spawned only on the seed.
+fn run_provision_worker(
+    provision_rx: mpsc::Receiver<sentinel_common::OperatorProvisionCommand>,
+    cluster_id: uuid::Uuid,
+    pending_targets: Vec<sentinel_common::cluster::PendingBareNode>,
+    binary_path: std::path::PathBuf,
+    bootstrap_user: String,
+    event_store: Arc<EventStore>,
+) {
+    use crate::provision_exec::{
+        execute_provision_node, sanitize_alias, sha256_file, ProvisionPlan, ProvisionTiming,
+        SshProvisionTransport,
+    };
+    use sentinel_common::provision::{validate_pending_target, ProvisionOp, ProvisionOpState};
+
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    };
+
+    // sha256 of the binary the seed pushes (the determinism-profile invariant, #494);
+    // computed once. If it is unhashable, provisioning is disabled but we still drain
+    // the channel so the operator endpoint gets a clean rejection rather than backing up.
+    let binary_sha256 = match sha256_file(&binary_path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, path = %binary_path.display(),
+                "ProvisionNode: Binary nicht hashbar — Provisioning deaktiviert");
+            while provision_rx.recv().is_ok() {
+                warn!("ProvisionNode-Request ignoriert: Provision-Binary nicht verfuegbar");
+            }
+            return;
+        }
+    };
+
+    // Idempotency (AC-S2): a completed op for an idempotency_key makes a re-run a no-op.
+    let mut seen: std::collections::HashMap<String, ProvisionOpState> =
+        std::collections::HashMap::new();
+
+    while let Ok(cmd) = provision_rx.recv() {
+        if matches!(
+            seen.get(&cmd.idempotency_key),
+            Some(ProvisionOpState::Completed)
+        ) {
+            info!(idempotency_key = %cmd.idempotency_key,
+                "ProvisionNode: bereits abgeschlossen, no-op (AC-S2)");
+            continue;
+        }
+        let now_unix_s = (now_ms() / 1000) as i64;
+        // V14: host/identity come from the allowlist, never from the request.
+        let pending =
+            match validate_pending_target(&pending_targets, &cmd.pending_target_id, now_unix_s) {
+                Ok(p) => p.clone(),
+                Err(e) => {
+                    warn!(error = %e, "ProvisionNode abgelehnt (Allowlist V14)");
+                    continue;
+                }
+            };
+        let alias = cmd
+            .requested_alias
+            .as_deref()
+            .and_then(sanitize_alias)
+            .or_else(|| sanitize_alias(&cmd.pending_target_id))
+            .unwrap_or_else(|| "node".to_string());
+        let node_id = sentinel_common::NodeId::new();
+        let mut op = ProvisionOp::new(
+            uuid::Uuid::new_v4(),
+            cmd.pending_target_id.clone(),
+            alias.clone(),
+            cmd.idempotency_key.clone(),
+            now_ms(),
+        );
+        let plan = ProvisionPlan {
+            assigned_node_id: node_id,
+            alias: alias.clone(),
+            cluster_id,
+            seed_endpoint: None, // LAN multicast discovery (Track-A default)
+            binary_local_path: binary_path.clone(),
+            binary_sha256: binary_sha256.clone(),
+        };
+        let work_dir = std::env::temp_dir();
+        let transport = match SshProvisionTransport::new(&pending, &bootstrap_user, &work_dir, None)
+        {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "ProvisionNode: Transport-Setup fehlgeschlagen");
+                op.fail(format!("transport: {e}"), now_ms());
+                seen.insert(cmd.idempotency_key, op.state);
+                continue;
+            }
+        };
+        info!(target = %cmd.pending_target_id, %alias, %node_id, "ProvisionNode: Bootstrap gestartet");
+        match execute_provision_node(
+            &mut op,
+            &pending,
+            &plan,
+            &transport,
+            ProvisionTiming::default(),
+            &now_ms,
+        ) {
+            Ok(duration_ms) => {
+                let payload = DomainEventPayload::NodeProvisioned {
+                    node_id: node_id.to_string(),
+                    alias: alias.clone(),
+                    pending_target_id: cmd.pending_target_id.clone(),
+                    target_ip: pending.target_ip.clone(),
+                    duration_ms,
+                };
+                let event = DomainEvent::new(
+                    payload.event_type_str(),
+                    "cluster",
+                    &payload.to_json(),
+                    &format!("provision-{}", op.op_id),
+                    0,
+                );
+                if let Err(e) = event_store.append_event(&event) {
+                    warn!(error = %e, "NodeProvisioned-Event konnte nicht persistiert werden");
+                }
+                info!(%node_id, %alias, duration_ms, "ProvisionNode: Knoten provisioniert");
+            }
+            Err(e) => {
+                warn!(error = %e, target = %cmd.pending_target_id,
+                    "ProvisionNode fehlgeschlagen (Target quarantined, AC-B6)");
+            }
+        }
+        seen.insert(cmd.idempotency_key, op.state);
+    }
+}
+
 /// Speichert Runtime-Snapshot vor Beendigung (AC-4).
 #[allow(clippy::too_many_arguments)]
 fn ecs_tick_loop(
