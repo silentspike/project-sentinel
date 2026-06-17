@@ -51,6 +51,7 @@ const OPERATOR_RESTORE_PATH: &str = "/operator/restore";
 const OPERATOR_STATE_HASH_PATH: &str = "/operator/state-hash";
 const OPERATOR_CONFIG_APPLY_PATH: &str = "/operator/config/apply";
 const OPERATOR_MIGRATE_PATH: &str = "/operator/migrate";
+const OPERATOR_PROVISION_PATH: &str = "/operator/provision";
 const OPERATOR_PRUNE_PATH: &str = "/operator/prune";
 const OPERATOR_CHAT_PATH: &str = "/operator/chat";
 const OPERATOR_GAIA_PATH: &str = "/operator/gaia";
@@ -400,6 +401,7 @@ struct AppState {
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
     config_apply_tx: mpsc::Sender<sentinel_common::OperatorConfigApplyCommand>,
     migrate_tx: mpsc::Sender<sentinel_common::OperatorMigrateCommand>,
+    provision_tx: mpsc::Sender<sentinel_common::OperatorProvisionCommand>,
     config_apply_max_agents: usize,
     config_apply_validation: sentinel_common::agent_config::AgentConfigValidation,
     event_store: Arc<sentinel_limbo::EventStore>,
@@ -501,6 +503,7 @@ pub async fn start_server(
     restore_tx: mpsc::Sender<sentinel_common::OperatorRestoreCommand>,
     config_apply_tx: mpsc::Sender<sentinel_common::OperatorConfigApplyCommand>,
     migrate_tx: mpsc::Sender<sentinel_common::OperatorMigrateCommand>,
+    provision_tx: mpsc::Sender<sentinel_common::OperatorProvisionCommand>,
     config_apply_max_agents: usize,
     config_apply_validation: sentinel_common::agent_config::AgentConfigValidation,
     event_store: Arc<sentinel_limbo::EventStore>,
@@ -529,6 +532,7 @@ pub async fn start_server(
         restore_tx,
         config_apply_tx,
         migrate_tx,
+        provision_tx,
         config_apply_max_agents,
         config_apply_validation,
         event_store,
@@ -822,6 +826,41 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Err(_) => {
                     ApiError::ServiceUnavailable("Migrate-Channel nicht verfuegbar").to_response()
                 }
+            }
+        }
+        OPERATOR_PROVISION_PATH => {
+            // ProvisionNode (#495, G3): absorb an allowlisted bare VM shell into a
+            // cluster node. The host/identity come from the `PendingBareNode`
+            // allowlist via `pending_target_id` (V14) — never from this request.
+            // Only the seed drains the channel; on a member/single-node daemon the
+            // receiver is dropped, so `send` fails fast (503).
+            let payload: sentinel_common::OperatorProvisionCommand =
+                match serde_json::from_slice(&request.body) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return ApiError::BadRequest(
+                            "ProvisionNode benoetigt pending_target_id + idempotency_key",
+                        )
+                        .to_response()
+                    }
+                };
+            info!(
+                pending_target_id = %payload.pending_target_id,
+                idempotency_key = %payload.idempotency_key,
+                "ProvisionNode via Operator-API angefordert"
+            );
+            match state.provision_tx.send(payload) {
+                Ok(()) => json_response(
+                    202,
+                    serde_json::json!({
+                        "accepted": true,
+                        "message": "ProvisionNode-Bootstrap angestossen (Seed-getrieben)"
+                    }),
+                ),
+                Err(_) => ApiError::ServiceUnavailable(
+                    "ProvisionNode nicht verfuegbar (kein Seed-Knoten)",
+                )
+                .to_response(),
             }
         }
         OPERATOR_PRUNE_PATH => {
@@ -2890,6 +2929,7 @@ mod tests {
             restore_tx: mpsc::channel().0,
             config_apply_tx: mpsc::channel().0,
             migrate_tx: mpsc::channel().0,
+            provision_tx: mpsc::channel().0,
             config_apply_max_agents: 60,
             config_apply_validation:
                 sentinel_common::agent_config::AgentConfigValidation::with_max_agent_id(60),
@@ -3306,6 +3346,80 @@ mod tests {
             test_request(
                 OPERATOR_MIGRATE_PATH,
                 serde_json::json!({ "reason": "manual" }),
+            ),
+            &state,
+        );
+        assert_eq!(response.status, 401);
+    }
+
+    #[test]
+    fn provision_request_is_accepted_and_forwarded() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let (tx, provision_rx) = mpsc::channel();
+        state.provision_tx = tx;
+
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_PROVISION_PATH,
+                serde_json::json!({
+                    "pending_target_id": "bare-1",
+                    "requested_alias": "test-node-1",
+                    "idempotency_key": "idem-1"
+                }),
+            ),
+            &state,
+        );
+        assert_eq!(response.status, 202);
+
+        let received = provision_rx.recv().unwrap();
+        assert_eq!(received.pending_target_id, "bare-1");
+        assert_eq!(received.idempotency_key, "idem-1");
+        assert_eq!(received.requested_alias.as_deref(), Some("test-node-1"));
+    }
+
+    #[test]
+    fn provision_without_seed_worker_is_unavailable() {
+        // The default fixture drops the receiver (no seed worker draining) → 503.
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_PROVISION_PATH,
+                serde_json::json!({
+                    "pending_target_id": "bare-1",
+                    "idempotency_key": "idem-1"
+                }),
+            ),
+            &state,
+        );
+        assert_eq!(response.status, 503);
+    }
+
+    #[test]
+    fn provision_bad_body_is_rejected() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let (tx, _provision_rx) = mpsc::channel();
+        state.provision_tx = tx;
+        // Missing the required idempotency_key → 400.
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_PROVISION_PATH,
+                serde_json::json!({ "pending_target_id": "bare-1" }),
+            ),
+            &state,
+        );
+        assert_eq!(response.status, 400);
+    }
+
+    #[test]
+    fn provision_requires_auth() {
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
+        let response = handle_http_request(
+            test_request(
+                OPERATOR_PROVISION_PATH,
+                serde_json::json!({
+                    "pending_target_id": "bare-1",
+                    "idempotency_key": "idem-1"
+                }),
             ),
             &state,
         );

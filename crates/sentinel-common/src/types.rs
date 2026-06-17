@@ -764,6 +764,22 @@ pub struct OperatorMigrateCommand {
     pub reason: String,
 }
 
+/// Operator-Trigger fuer `ProvisionNode` (#495, G3): eine Bare-VM-Huelle wird zu einem
+/// Cluster-Knoten gemacht. Host/Identitaet kommen aus der `PendingBareNode`-Allowlist
+/// (V14, ueber `pending_target_id`) — **nie** aus diesem Request, damit `ProvisionNode`
+/// kein freies Remote-Exec-Werkzeug wird.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorProvisionCommand {
+    /// Allowlist-Schluessel des aufzunehmenden Bare-Targets (V14).
+    pub pending_target_id: String,
+    /// Optionaler Alias fuer den neuen Knoten (Default = `pending_target_id`).
+    #[serde(default)]
+    pub requested_alias: Option<String>,
+    /// Idempotenz-Schluessel: Re-Run mit demselben Schluessel ist ein konvergenter
+    /// No-op (AC-S2).
+    pub idempotency_key: String,
+}
+
 /// Apply-Modus fuer Runtime-Config-Apply (#425).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

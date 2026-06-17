@@ -15,6 +15,7 @@ zenoh = "zenoh"   # Zenoh pub/sub
 
 # German words used in code comments (CLAUDE.md, deny.toml, Rust doc comments)
 ist = "ist"
+Topologie = "Topologie"   # German: topology (cluster comments)
 periodisch = "periodisch"
 ue = "ue"               # Umlaut replacement: .replace("ü", "ue")
 Prozess = "Prozess"
