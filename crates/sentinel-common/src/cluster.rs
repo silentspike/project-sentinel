@@ -132,6 +132,16 @@ pub struct ClusterConfig {
     /// Seed endpoint to join (Zenoh `connect`). `None` on the seed itself.
     #[serde(default)]
     pub seed_endpoint: Option<String>,
+    /// Bare targets this seed may provision (V14 allowlist). The host/identity of a
+    /// `ProvisionNode` request come from here, never from the request. Empty on a
+    /// non-seed node.
+    #[serde(default)]
+    pub pending_targets: Vec<PendingBareNode>,
+    /// Path to the sha256-verified `sentinel-daemon` binary the seed pushes to a new
+    /// node. `None` = the seed's own deployed binary (`/opt/sentinel/bin/sentinel-daemon`).
+    /// The determinism profile (#494) requires an identical binary on every node.
+    #[serde(default)]
+    pub provision_binary_path: Option<String>,
 }
 
 impl ClusterConfig {
@@ -196,6 +206,8 @@ mod tests {
             seed: true,
             alias: Some("test-node-0".into()),
             seed_endpoint: None,
+            pending_targets: Vec::new(),
+            provision_binary_path: None,
         };
         let a = NodeIdentity::from_config(&cfg);
         let b = NodeIdentity::from_config(&cfg);
@@ -215,6 +227,8 @@ mod tests {
             seed: true,
             alias: None,
             seed_endpoint: None,
+            pending_targets: Vec::new(),
+            provision_binary_path: None,
         };
         assert_eq!(cfg.role(), ClusterRole::Seed);
         assert_eq!(cfg.initial_lifecycle(), NodeLifecycleState::GenesisSeed);
