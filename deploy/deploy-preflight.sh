@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # deploy-preflight.sh — Verifies SHA-256 hash parity between release manifest and target VM.
 # Hard-aborts deploy (exit 1) on any mismatch.
+#
+# DEV-010 determinism invariant (#494): the SHA-256 parity check below enforces the
+# "identical binary on ALL nodes" half of the determinism profile (homogeneous replay
+# / homogeneous cross-node migration). The other half is the pinned toolchain: every
+# node's binary MUST be built with the same Rust toolchain (rust-toolchain.toml = 1.94.0,
+# asserted in CI by `scripts/check-determinism-profile.sh` + the per-job rustc assert).
+# A node built with a different toolchain breaks same-CPU-class replay-hash identity.
+#
 # Usage: bash deploy/deploy-preflight.sh <SSH_TARGET> [MANIFEST_PATH]
 #   SSH_TARGET:    e.g. ubuntu@<deploy-vm>
 #   MANIFEST_PATH: optional, defaults to deploy/release-manifest.json

@@ -134,4 +134,58 @@ mod tests {
             "Reihenfolge der Component-Vecs darf den Hash nicht aendern"
         );
     }
+
+    #[test]
+    fn determinism_two_runs_identical_hash() {
+        // #494 (DEV-010): zwei identische bio+ECS-Tick-Sequenzen auf derselben
+        // Maschine/Binary muessen denselben STRICT- UND CORE-Hash ergeben — das
+        // Intra-Run-Determinismus-Gate. Faengt HashMap-/Iterations-Nichtdeterminismus.
+        // Cross-ISA-f32 ist die dokumentierte homogene-only-Grenze (DEV-010), auf
+        // EINER Maschine nicht test-fangbar (siehe #406 fuer heterogene Knoten).
+        fn run_sequence() -> StateHashes {
+            use crate::world::{spawn_agent, SimulationTime};
+            use sentinel_common::{AgentId, Tick};
+
+            let (mut world, mut schedule) = create_simulation_world();
+            for i in 1..=10u16 {
+                spawn_agent(
+                    &mut world,
+                    AgentId(i),
+                    &format!("Agent-{i:02}"),
+                    "Mitarbeiter",
+                    1,
+                    "empfang",
+                );
+            }
+            for tick in 0..50u64 {
+                let mut time = world.resource_mut::<SimulationTime>();
+                time.tick = Tick(tick);
+                time.tick_count = tick;
+                time.delta_seconds = 1.0;
+                time.sim_hour = 8.0 + (tick as f32 / 3600.0);
+                schedule.run(&mut world);
+            }
+            state_hashes(&mut world)
+        }
+
+        let a = run_sequence();
+        let b = run_sequence();
+        // Evidence (sichtbar mit `--nocapture`): der reproduzierbare DEV-010-Hash.
+        eprintln!(
+            "DEV-010 two-run hashes: A.strict={} B.strict={}",
+            a.strict, b.strict
+        );
+        eprintln!(
+            "DEV-010 two-run hashes: A.core={}  B.core={}",
+            a.core, b.core
+        );
+        assert_eq!(
+            a.strict, b.strict,
+            "STRICT-Hash zweier identischer Laeufe muss gleich sein (DEV-010)"
+        );
+        assert_eq!(
+            a.core, b.core,
+            "CORE-Hash zweier identischer Laeufe muss gleich sein (DEV-010)"
+        );
+    }
 }
