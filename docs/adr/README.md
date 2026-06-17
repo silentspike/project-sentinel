@@ -63,3 +63,15 @@ Every Track-A ADR carries this constraint verbatim:
 | [ADR-0496-G-D0-ownermetadatalog](ADR-0496-G-D0-ownermetadatalog.md) | G-D0 | Quorum-backed `OwnerMetadataLog` for owner/voting metadata only — no Raft for agent state | Proposed |
 | [ADR-0498-ADR2-control-plane-transport](ADR-0498-ADR2-control-plane-transport.md) | ADR-2 | One QUIC control stream (reuses the dashboard WebTransport frame codec); SSH only for the bare-shell bootstrap | Proposed |
 | [ADR-0496-ADR3-cluster-meta-schema](ADR-0496-ADR3-cluster-meta-schema.md) | ADR-3 | Cluster metadata persists in dedicated redb tables behind the fenced write entry | Proposed |
+| [ADR-0496-G1-ownership-handoff-safety](ADR-0496-G1-ownership-handoff-safety.md) | G1 | Typed `OwnerWriteGuard` + one fenced write entry per engine + V1 durable-ack handoff | Proposed |
+| [ADR-0498-G2-cas-blockref-hash-model](ADR-0498-G2-cas-blockref-hash-model.md) | G2 | Namespaced `BlockRef`; block map is a locator not liveness; durable CAS publish | Proposed |
+| [ADR-0495-G3-provisionnode-threat-model](ADR-0495-G3-provisionnode-threat-model.md) | G3 | Allowlist targets, out-of-band host-key pin, CSR-not-key certs, repo-templated token-gates | Proposed |
+| [ADR-0497-G4-snapshot-consistency](ADR-0497-G4-snapshot-consistency.md) | G4 | `Frozen` over a classified mutating-system set + `SnapshotCut` + reference integrity | Proposed |
+| [ADR-0501-G5-migration-saga](ADR-0501-G5-migration-saga.md) | G5 | Persistent recoverable `MigrationOp` saga + epoch-correct rollback + pin lifecycle | Proposed |
+| [ADR-0499-G7-cluster-delete-guard](ADR-0499-G7-cluster-delete-guard.md) | G7 / G-DELETE | One `ClusterDeleteGuard::decide` over the full delete inventory (≥11); keep on uncertainty | Proposed |
+| [ADR-0397-G6-G8-state-durability-recovery-point](ADR-0397-G6-G8-state-durability-recovery-point.md) | G6 + G8 | `RecoveryPoint` + durability/RPO classes; forced failover only from a quorum RecoveryPoint at `min_rf` | Proposed |
+| [ADR-0397-G9-binary-provenance](ADR-0397-G9-binary-provenance.md) | G9 | Track A = sha256 manifest; signed release manifest is a Track-H GA hardening | Proposed |
+| [ADR-0397-G-H2-backup-restore](ADR-0397-G-H2-backup-restore.md) | G-H2 | Cold cluster backup/restore that rejects stale certs/retired owners + verifies CAS | Proposed |
+| [ADR-0397-G-N0-n-node-object-model](ADR-0397-G-N0-n-node-object-model.md) | G-N0 | Unified reconcilable control-plane object model; distinct node-sets; fail-closed minority | Proposed |
+| [ADR-0397-G-D2-node-lifecycle](ADR-0397-G-D2-node-lifecycle.md) | G-D2 | Cordon → drain → owner/CAS evacuation → voting-config transition → decommission; quarantine | Proposed |
+| [ADR-0397-G-D3-cas-replication-repair](ADR-0397-G-D3-cas-replication-repair.md) | G-D3 | Continuous CAS replication/repair to `desired_rf`; refuse `RPO=0` failover under `min_rf` | Proposed |
