@@ -392,6 +392,22 @@ pub enum DomainEventPayload {
         /// Mem-PSI ueber `PSI_MEM_STRESS_THRESHOLD`.
         mem_above: bool,
     },
+    /// Eine Bare-VM-Huelle wurde zu einem Cluster-Knoten provisioniert (#495, G3):
+    /// die Seed-Node hat das Binary gepusht, Config/systemd/Token-Gates gerendert,
+    /// den Daemon gestartet und seine Gesundheit bestaetigt. Time-Machine-Audit der
+    /// Cluster-Topologie.
+    NodeProvisioned {
+        /// Die fuer den neuen Knoten vergebene Node-ID.
+        node_id: String,
+        /// Menschenlesbarer Alias.
+        alias: String,
+        /// Allowlist-Target, aus dem provisioniert wurde.
+        pending_target_id: String,
+        /// Target-IP (aus der Allowlist, nie aus dem Request).
+        target_ip: String,
+        /// Wall-Clock-Dauer der Bootstrap-Saga in Millisekunden.
+        duration_ms: u64,
+    },
 }
 
 impl DomainEventPayload {
@@ -438,6 +454,7 @@ impl DomainEventPayload {
             Self::ConfigApplied { .. } => "config_applied",
             Self::MigrationCompleted { .. } => "migration_completed",
             Self::PsiBandChanged { .. } => "psi_band_changed",
+            Self::NodeProvisioned { .. } => "node_provisioned",
         }
     }
 }
