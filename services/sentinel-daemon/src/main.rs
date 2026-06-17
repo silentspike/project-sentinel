@@ -57,6 +57,24 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         "Konfiguration geladen"
     );
 
+    // TOGAF Cluster 12 (#495): optionale Cluster-Identität. Ohne [daemon.cluster]
+    // bleibt der Daemon im Single-Node-Modus (Verhalten unverändert).
+    match &config.cluster {
+        Some(cluster) => {
+            let identity = sentinel_common::NodeIdentity::from_config(cluster);
+            info!(
+                node_id = %identity.node_id,
+                alias = %identity.alias,
+                cluster_id = %cluster.cluster_id,
+                role = ?cluster.role(),
+                lifecycle = ?cluster.initial_lifecycle(),
+                boot_id = %identity.boot_id,
+                "Cluster 12: Node-Identität geladen"
+            );
+        }
+        None => info!("Cluster 12: keine [daemon.cluster] Section — Single-Node-Modus"),
+    }
+
     if cli.dry_run {
         return dry_run(&config);
     }
