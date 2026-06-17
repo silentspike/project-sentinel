@@ -73,6 +73,13 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub fs_mount: Option<String>,
 
+    /// TOGAF Cluster 12: optionale Cluster-Identität (`[daemon.cluster]`).
+    /// **Absent = Single-Node** (aktuelles Verhalten unverändert). Present = dieser
+    /// Knoten hat eine Cluster-Identität (Genesis-Seed oder provisioniertes Mitglied);
+    /// siehe `sentinel_common::cluster` + `docs/adr/ADR-0495-G-GENESIS-…`.
+    #[serde(default)]
+    pub cluster: Option<sentinel_common::ClusterConfig>,
+
     /// redb-Durability fuer sentinel-fs Metadata-Commits.
     ///
     /// `immediate` fsyncs every commit. `eventual` skips fsync for the FUSE
@@ -717,6 +724,43 @@ shared_secret = "secret"
         assert_eq!(
             file.daemon.operator_api.shared_secret.as_deref(),
             Some("secret")
+        );
+    }
+
+    #[test]
+    fn test_cluster_section_optional() {
+        // Single-Node-Default: ohne [daemon.cluster] = None (backward compat).
+        let single = r#"
+[daemon]
+config_dir = "/tmp/cfg"
+data_dir = "/tmp/data"
+"#;
+        let f: DaemonConfigFile = toml::from_str(single).unwrap();
+        assert!(
+            f.daemon.cluster.is_none(),
+            "ohne [daemon.cluster] bleibt der Daemon Single-Node"
+        );
+
+        // Cluster-Seed-Node: [daemon.cluster] vorhanden (Genesis, #495).
+        let seed = r#"
+[daemon]
+config_dir = "/opt/sentinel/config"
+data_dir = "/opt/sentinel/data"
+
+[daemon.cluster]
+node_id = "550e8400-e29b-41d4-a716-446655440000"
+cluster_id = "550e8400-e29b-41d4-a716-446655440001"
+seed = true
+alias = "test-node-0"
+"#;
+        let f: DaemonConfigFile = toml::from_str(seed).unwrap();
+        let cluster = f.daemon.cluster.expect("[daemon.cluster] vorhanden");
+        assert!(cluster.seed);
+        assert_eq!(cluster.alias.as_deref(), Some("test-node-0"));
+        assert_eq!(cluster.role(), sentinel_common::ClusterRole::Seed);
+        assert_eq!(
+            cluster.initial_lifecycle(),
+            sentinel_common::NodeLifecycleState::GenesisSeed
         );
     }
 
