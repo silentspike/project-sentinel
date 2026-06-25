@@ -1061,6 +1061,35 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         _ => drop(provision_rx),
     }
 
+    // -- Cluster 12 control stream (#569, ADR-2): one cert-pinned QUIC RPC server,
+    // started only when [daemon.cluster].control_bind is set. The handle (server kept
+    // alive + outbound client) is shared with the operator API for the live RPC AC. --
+    let cluster_control: Option<Arc<crate::cluster_control::ClusterControl>> =
+        match config.cluster.as_ref() {
+            Some(cluster) => match cluster.control_bind.as_deref() {
+                Some(bind) => {
+                    let alias = cluster
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| cluster.node_id.to_string());
+                    match crate::cluster_control::ClusterControl::start(
+                        bind,
+                        data_dir,
+                        &alias,
+                        &cluster.control_peers,
+                    ) {
+                        Ok(cc) => Some(Arc::new(cc)),
+                        Err(e) => {
+                            warn!(error = %e, "Cluster 12: control stream failed to start");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            },
+            None => None,
+        };
+
     // -- Zenoh Fan-Out Bridge (Events nach Limbo-Write auf Zenoh publizieren) --
     let fanout_capacity = config.zenoh.fanout_channel_capacity;
     let fanout_sender = if let Some(ref b) = bus {
@@ -1170,6 +1199,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 Arc::clone(&platform_state),
                 Arc::clone(&runtime_health),
                 Arc::clone(&security_runtime_state),
+                cluster_control.clone(),
             )
             .await?,
         )
