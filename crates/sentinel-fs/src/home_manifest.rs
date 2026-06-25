@@ -217,7 +217,7 @@ pub fn validate_rel_path(rel: &[u8]) -> Result<PathBuf> {
 
 /// Lexically validate a symlink target relative to the dest root. Rejects an
 /// absolute target and any target that would escape the root via `..`. This is
-/// an early defence; the write-time `openat2` resolution (Finding E) is the
+/// an early defense; the write-time `openat2` resolution (Finding E) is the
 /// authoritative one.
 fn validate_symlink_target(target: &[u8]) -> Result<()> {
     let path = Path::new(OsStr::from_bytes(target));
