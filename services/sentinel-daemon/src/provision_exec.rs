@@ -101,6 +101,13 @@ impl ProvisionPlan {
         if let Some(ep) = &self.seed_endpoint {
             s.push_str(&format!("seed_endpoint = \"{ep}\"\n"));
         }
+        // #568: a provisioned member must not run the Platform LLM Analyzer by default.
+        // The minimal member render otherwise inherits the serde default `llm_enabled =
+        // true`, which starts the analyzer (gateway connect attempts + log noise, and a
+        // token-bleed risk on any node that does have a reachable gateway). Members never
+        // drive LLM analysis — only the seed/single-node config opts in.
+        s.push_str("\n[daemon.platform_controlplane]\n");
+        s.push_str("llm_enabled = false\n");
         s
     }
 }
@@ -683,6 +690,13 @@ mod tests {
         assert!(toml.contains("seed_endpoint = \"tcp/10.0.0.241:7447\""));
         // It must parse back as a valid daemon cluster config.
         assert!(toml.starts_with("[daemon]"));
+        // #568: a provisioned member must not enable the Platform LLM Analyzer.
+        assert!(toml.contains("[daemon.platform_controlplane]"));
+        assert!(toml.contains("llm_enabled = false"));
+        // And it must parse back to a config whose analyzer is disabled.
+        let parsed: crate::config::DaemonConfigFile =
+            toml::from_str(&toml).expect("rendered member daemon.toml must parse");
+        assert!(!parsed.daemon.platform_controlplane.llm_enabled);
     }
 
     #[test]
