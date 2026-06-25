@@ -20,7 +20,8 @@ pub mod snapshot_codec;
 pub mod types;
 
 pub use cluster::{
-    ClusterConfig, ClusterRole, NodeId, NodeIdentity, NodeLifecycleState, PendingBareNode,
+    ClusterConfig, ClusterRole, ControlPeer, NodeId, NodeIdentity, NodeLifecycleState,
+    PendingBareNode,
 };
 pub use events::{DomainEvent, DomainEventPayload};
 pub use membership::{
