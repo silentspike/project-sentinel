@@ -1008,6 +1008,15 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         }
     };
 
+    // -- Cluster 12 (#496 PR2a): pin the owner registry to this node's identity so every
+    // fenced store write validates against the seed's ownership (V19). Single-node — the
+    // seed owns every scope — so the live behavior is unchanged; without [daemon.cluster]
+    // the registry keeps its default single-node owner. --
+    if let Some(cluster) = config.cluster.as_ref() {
+        sentinel_common::OwnerRegistry::init_single_node(cluster.node_id);
+        info!(node_id = %cluster.node_id, "Cluster 12: OwnerRegistry als Single-Node-Seed initialisiert");
+    }
+
     // -- Cluster 12 Membership (#495): Heartbeat + Liveness-View, nur mit [daemon.cluster] --
     if let (Some(b), Some(cluster)) = (bus.as_ref(), config.cluster.as_ref()) {
         let identity = sentinel_common::NodeIdentity::from_config(cluster);

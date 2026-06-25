@@ -9,7 +9,7 @@
 //! rusqlite unterstuetzt keine INSTEAD OF Trigger auf normalen Tabellen.
 
 use rusqlite::{params, Connection, OptionalExtension};
-use sentinel_common::{DomainEvent, OwnerWriteGuard, StateTransferScope};
+use sentinel_common::{DomainEvent, OwnerRegistry, OwnerWriteGuard, StateTransferScope};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -393,17 +393,19 @@ impl EventStore {
     /// its connection here, presenting an [`OwnerWriteGuard`]. A raw write cannot
     /// bypass it — the `conn` field is private to this crate.
     ///
-    /// PR1a is the behavior-preserving strangler step: the guard is accepted
-    /// (single-node has no owner registry, so `unfenced` guards always pass) and the
-    /// locked connection is returned exactly as before. PR2 compares
-    /// `guard.epoch()` against the committed owner epoch for `guard.scope()` and
-    /// rejects a stale write with a `StaleEpochError` (V19).
+    /// PR2a re-checks the guard against the committed owner term (V19) via the
+    /// `OwnerRegistry` before handing out the connection lock; a stale or non-owning
+    /// guard is rejected with a `StaleEpochError`. Single-node — the seed owns every
+    /// scope — so every write passes; PR2b's cooperative handoff makes a guard stale.
     fn begin_fenced_write(
         &self,
         guard: &OwnerWriteGuard,
     ) -> anyhow::Result<std::sync::MutexGuard<'_, Connection>> {
-        // PR1a no-op fence (the scope/epoch are recorded by the guard for PR2).
-        let _ = guard;
+        // PR2a: re-check the guard against the committed owner term (V19) before handing
+        // out the connection lock. Single-node — the seed owns every scope — so this
+        // always passes; the lock is held across the write, so there is no TOCTOU window
+        // for a single-node write (cross-node handoff + commit-recheck land in PR2b).
+        OwnerRegistry::global().validate(guard)?;
         self.conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))
@@ -413,7 +415,7 @@ impl EventStore {
     pub fn append_event(&self, event: &DomainEvent) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
         let conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         conn.execute(
             "INSERT OR IGNORE INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
@@ -448,7 +450,7 @@ impl EventStore {
     pub fn append_with_outbox(&self, event: &DomainEvent, topic: &str) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
         let mut conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         let tx = conn.transaction()?;
 
         // INSERT OR IGNORE: Idempotenz via operation_id UNIQUE INDEX
@@ -510,7 +512,7 @@ impl EventStore {
     {
         let _telemetry_start = std::time::Instant::now();
         let mut conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         let tx = conn.transaction()?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -867,7 +869,7 @@ impl EventStore {
     ) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
         let mut conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         let tx = conn.transaction()?;
 
         // Aktuelle Version ermitteln
@@ -946,7 +948,7 @@ impl EventStore {
     /// `world_snapshots` Time-Machine-Tabelle.
     pub fn retain_latest_snapshots(&self) -> anyhow::Result<u64> {
         let conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         let deleted = conn.execute(
             "DELETE FROM snapshots
              WHERE id NOT IN (
@@ -1013,7 +1015,7 @@ impl EventStore {
     /// Markiert einen Outbox-Eintrag als publiziert.
     pub fn mark_published(&self, event_id: &str) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1088,7 +1090,7 @@ impl EventStore {
     /// Bump the restore generation epoch (called once per restore). Returns the new generation.
     pub fn increment_restore_generation(&self) -> anyhow::Result<i64> {
         let conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         let next = read_sim_metadata(&conn, "restore_generation")
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0)
@@ -1112,7 +1114,7 @@ impl EventStore {
             return Ok(()); // nothing discarded
         }
         let conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         let mut ranges = read_dead_ranges(&conn);
         ranges.push((from_exclusive, to_inclusive));
         set_sim_metadata_conn(&conn, "dead_ranges", &serde_json::to_string(&ranges)?)?;
@@ -1122,7 +1124,7 @@ impl EventStore {
     /// Drop a dead-range entry once its events have been pruned (keeps the list bounded).
     pub fn remove_dead_range(&self, from_exclusive: i64) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         let mut ranges = read_dead_ranges(&conn);
         let before = ranges.len();
         ranges.retain(|(from, _)| *from != from_exclusive);
@@ -1187,7 +1189,7 @@ impl EventStore {
         }
 
         let mut conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
 
         // #493: dead intervals are pruned ALONGSIDE the retention cutoff — even above it — so a
         // discarded future is physically removed in the normal retention window (not left to linger).
@@ -1263,7 +1265,7 @@ impl EventStore {
     /// Diese Methode ist als Maintenance-/Test-Primitive gedacht.
     pub fn delete_orphan_outbox(&self) -> anyhow::Result<u64> {
         let conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         let deleted = conn.execute(
             "DELETE FROM outbox
              WHERE event_id NOT IN (SELECT event_id FROM events)",
@@ -1285,7 +1287,7 @@ impl EventStore {
     /// - `offset < current` → `MonotonicityError` (Rueckwaerts-Drift)
     pub fn update_offset(&self, name: &str, offset: i64) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
 
         // Aktuellen Offset pruefen
         let current: Option<i64> = conn
@@ -1328,7 +1330,7 @@ impl EventStore {
     /// Erzwingt einen Offset-Wert (umgeht Monotonie-Pruefung, fuer Restore).
     pub fn force_reset_offset(&self, name: &str, offset: i64) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1342,7 +1344,7 @@ impl EventStore {
 
     pub fn reset_offset(&self, name: &str) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         conn.execute(
             "DELETE FROM projection_offsets WHERE projection_name = ?1",
             params![name],
@@ -1456,7 +1458,7 @@ impl EventStore {
         created_at_ms: i64,
     ) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         conn.execute(
             "INSERT INTO world_snapshots (id, tier, tick, sim_hour, last_event_id, payload_size, payload, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1518,7 +1520,7 @@ impl EventStore {
     /// Loescht einen World Snapshot anhand seiner ID.
     pub fn delete_world_snapshot(&self, id: &str) -> anyhow::Result<bool> {
         let conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         let deleted = conn.execute("DELETE FROM world_snapshots WHERE id = ?1", params![id])?;
         Ok(deleted > 0)
     }
@@ -1526,7 +1528,7 @@ impl EventStore {
     /// Aktualisiert den Tier eines World Snapshots (fuer Promotion).
     pub fn promote_world_snapshot(&self, id: &str, new_tier: &str) -> anyhow::Result<bool> {
         let conn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         let updated = conn.execute(
             "UPDATE world_snapshots SET tier = ?1 WHERE id = ?2",
             params![new_tier, id],
@@ -1626,12 +1628,13 @@ mod tests {
         assert_eq!(store.event_count().unwrap(), 1);
 
         // The choke point itself yields a usable connection under both scopes —
-        // the PR1a no-op fence accepts every guard, World and per-container alike.
+        // single-node the registry owns every scope, so the issued guard validates,
+        // World and per-container alike.
         for scope in [
             StateTransferScope::World,
             StateTransferScope::NanoContainer("AGENT-07".to_string()),
         ] {
-            let guard = OwnerWriteGuard::unfenced(scope);
+            let guard = OwnerRegistry::global().issue(scope);
             let conn = store.begin_fenced_write(&guard).unwrap();
             let count: i64 = conn
                 .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
