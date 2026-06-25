@@ -414,8 +414,9 @@ impl EventStore {
     /// Append-only: Fuegt ein Event ein. Gibt die interne Row-ID zurueck.
     pub fn append_event(&self, event: &DomainEvent) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
-        let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let conn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_aggregate(&event.aggregate_id)),
+        )?;
         conn.execute(
             "INSERT OR IGNORE INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
@@ -449,8 +450,9 @@ impl EventStore {
     /// Bei Duplikat (gleiche operation_id) wird kein neuer Eintrag erstellt.
     pub fn append_with_outbox(&self, event: &DomainEvent, topic: &str) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
-        let mut conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let mut conn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_aggregate(&event.aggregate_id)),
+        )?;
         let tx = conn.transaction()?;
 
         // INSERT OR IGNORE: Idempotenz via operation_id UNIQUE INDEX
