@@ -4784,9 +4784,11 @@ dependencies = [
  "landlock",
  "libc",
  "sentinel-common",
+ "sentinel-fs",
  "sentinel-zenoh",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

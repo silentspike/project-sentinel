@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use sentinel_common::nano_runtime::{
@@ -7,6 +7,8 @@ use sentinel_common::nano_runtime::{
     NanoIsolationReport, NanoRuntime, NanoSnapshot, NanoSnapshotSemantics, NanoWorkloadSpec,
     RUNTIME_BWRAP_LANDLOCK,
 };
+use sentinel_fs::artifact::ArtifactPlane;
+use sentinel_fs::home_manifest::{self, HomeManifest, RestorePolicy};
 use serde::{Deserialize, Serialize};
 
 use crate::{cgroups, AgentProcess, CgroupLimits, SandboxEnforcer, SandboxHandle};
@@ -15,7 +17,7 @@ use crate::{cgroups, AgentProcess, CgroupLimits, SandboxEnforcer, SandboxHandle}
 struct BwrapSnapshotPayload {
     workload: NanoWorkloadSpec,
     command: Vec<String>,
-    home_files: BTreeMap<String, Vec<u8>>,
+    home_manifest: HomeManifest,
     cgroup_created: bool,
     io_available: bool,
     bwrap_available: bool,
@@ -27,10 +29,20 @@ struct BwrapSnapshotPayload {
 struct BwrapWorkloadState {
     workload: NanoWorkloadSpec,
     command: Vec<String>,
+    /// `ArtifactPlane` object ids pinning the chunks of this workload's last home
+    /// snapshot (released on re-snapshot/teardown to avoid chunk leaks, N1').
+    owned_object_ids: Vec<u64>,
 }
+
+/// Default home content-addressed store location (chunks live under `/ram`).
+const DEFAULT_HOME_CAS_DIR: &str = "/ram/agents/.sentinel-home-cas";
 
 pub struct BwrapNanoRuntime {
     enforcer: SandboxEnforcer,
+    /// Directory holding the home-content `ArtifactPlane`, opened lazily so the
+    /// constructor stays infallible and does no I/O (daemon/registry callers that
+    /// never snapshot are unaffected).
+    cas_dir: PathBuf,
     workloads: HashMap<String, BwrapWorkloadState>,
     handles: HashMap<String, SandboxHandle>,
     processes: HashMap<String, AgentProcess>,
@@ -38,13 +50,27 @@ pub struct BwrapNanoRuntime {
 
 impl BwrapNanoRuntime {
     pub fn detect() -> Self {
+        Self::with_cas_dir(DEFAULT_HOME_CAS_DIR)
+    }
+
+    /// Construct with an explicit home-content CAS directory (used in tests).
+    pub fn with_cas_dir(cas_dir: impl Into<PathBuf>) -> Self {
         let (enforcer, _warnings) = SandboxEnforcer::detect();
         Self {
             enforcer,
+            cas_dir: cas_dir.into(),
             workloads: HashMap::new(),
             handles: HashMap::new(),
             processes: HashMap::new(),
         }
+    }
+
+    /// Open (or create) the home-content `ArtifactPlane`. Called only on the
+    /// snapshot/restore paths, so the constructor stays I/O-free.
+    fn open_plane(&self) -> Result<ArtifactPlane> {
+        std::fs::create_dir_all(&self.cas_dir)
+            .with_context(|| format!("create home CAS dir {}", self.cas_dir.display()))?;
+        ArtifactPlane::open(self.cas_dir.join("home.redb"))
     }
 
     fn command_for(workload: &NanoWorkloadSpec) -> Vec<String> {
@@ -57,54 +83,6 @@ impl BwrapNanoRuntime {
 
     fn home_dir(agent_name: &str) -> PathBuf {
         PathBuf::from(format!("/ram/agents/{agent_name}"))
-    }
-
-    fn collect_home_files(agent_name: &str) -> Result<BTreeMap<String, Vec<u8>>> {
-        let home = Self::home_dir(agent_name);
-        let mut files = BTreeMap::new();
-        if !home.exists() {
-            return Ok(files);
-        }
-
-        let mut stack = vec![home.clone()];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir)
-                .with_context(|| format!("read agent home dir {}", dir.display()))?
-            {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if path.is_file() {
-                    let rel = path
-                        .strip_prefix(&home)
-                        .unwrap_or(path.as_path())
-                        .to_string_lossy()
-                        .to_string();
-                    files.insert(rel, std::fs::read(&path)?);
-                }
-            }
-        }
-        Ok(files)
-    }
-
-    fn restore_home_files(agent_name: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
-        let home = Self::home_dir(agent_name);
-        if home.exists() {
-            std::fs::remove_dir_all(&home)
-                .with_context(|| format!("reset agent home dir {}", home.display()))?;
-        }
-        std::fs::create_dir_all(&home)?;
-        for (rel, bytes) in files {
-            let path = home.join(rel);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(path, bytes)?;
-        }
-        Ok(())
     }
 
     fn write_marker(agent_name: &str, workload_id: &str) -> Result<()> {
@@ -121,7 +99,14 @@ impl BwrapNanoRuntime {
         if let Some(handle) = self.handles.remove(workload_id) {
             let _ = self.enforcer.teardown_agent(&handle);
         }
-        self.workloads.remove(workload_id);
+        if let Some(state) = self.workloads.remove(workload_id) {
+            // Best-effort: unpin the chunks of this workload's last snapshot.
+            if !state.owned_object_ids.is_empty() {
+                if let Ok(plane) = self.open_plane() {
+                    let _ = home_manifest::release_manifest(&plane, &state.owned_object_ids);
+                }
+            }
+        }
     }
 
     fn spawn_state(&mut self, state: BwrapWorkloadState) -> Result<NanoHandle> {
@@ -180,6 +165,7 @@ impl NanoRuntime for BwrapNanoRuntime {
         let state = BwrapWorkloadState {
             command: Self::command_for(&workload),
             workload,
+            owned_object_ids: Vec::new(),
         };
         self.spawn_state(state)
     }
@@ -199,24 +185,45 @@ impl NanoRuntime for BwrapNanoRuntime {
     }
 
     fn snapshot(&mut self, handle: &NanoHandle) -> Result<NanoSnapshot> {
-        let state = self
-            .workloads
-            .get(&handle.workload_id)
-            .ok_or_else(|| anyhow!("unknown bwrap workload '{}'", handle.workload_id))?;
-        let sandbox_handle = self
-            .handles
-            .get(&handle.workload_id)
-            .ok_or_else(|| anyhow!("missing bwrap sandbox handle '{}'", handle.workload_id))?;
-        let home_files = Self::collect_home_files(&state.workload.agent_name)?;
+        // Clone the bits we need so `self` can be re-borrowed mutably below.
+        let (workload, command, prev_owned) = {
+            let state = self
+                .workloads
+                .get(&handle.workload_id)
+                .ok_or_else(|| anyhow!("unknown bwrap workload '{}'", handle.workload_id))?;
+            (
+                state.workload.clone(),
+                state.command.clone(),
+                state.owned_object_ids.clone(),
+            )
+        };
+        let (cgroup_created, io_available) = {
+            let sandbox_handle = self
+                .handles
+                .get(&handle.workload_id)
+                .ok_or_else(|| anyhow!("missing bwrap sandbox handle '{}'", handle.workload_id))?;
+            (sandbox_handle.cgroup_created, sandbox_handle.io_available)
+        };
+
+        // Walk the agent home into a metadata-aware CAS manifest (no file bytes).
+        let home = Self::home_dir(&workload.agent_name);
+        let plane = self.open_plane()?;
+        // Release the previous snapshot's pinned objects before re-walking.
+        home_manifest::release_manifest(&plane, &prev_owned)?;
+        let walked = home_manifest::walk_home(&home, &plane)?;
+        if let Some(state) = self.workloads.get_mut(&handle.workload_id) {
+            state.owned_object_ids = walked.owned_object_ids;
+        }
+
         let payload = BwrapSnapshotPayload {
-            workload: state.workload.clone(),
-            command: state.command.clone(),
-            home_files,
-            cgroup_created: sandbox_handle.cgroup_created,
-            io_available: sandbox_handle.io_available,
+            workload,
+            command,
+            home_manifest: walked.manifest,
+            cgroup_created,
+            io_available,
             bwrap_available: self.enforcer.has_bwrap(),
             landlock_available: self.enforcer.has_landlock(),
-            semantics_note: "bwrap snapshot is config+agent-home filesystem state; no process RAM or CRIU checkpoint".to_string(),
+            semantics_note: "bwrap snapshot is a metadata-aware CAS manifest of the agent-home filesystem; no process RAM or CRIU checkpoint".to_string(),
         };
 
         Ok(NanoSnapshot {
@@ -244,10 +251,26 @@ impl NanoRuntime for BwrapNanoRuntime {
         }
         let payload: BwrapSnapshotPayload = serde_json::from_value(snapshot.payload)?;
         self.teardown_workload(&snapshot.workload_id);
-        Self::restore_home_files(&payload.workload.agent_name, &payload.home_files)?;
+
+        // Rehydrate the agent home from the manifest (metadata-aware, V24 path
+        // safety) instead of writing raw bytes back.
+        let home = Self::home_dir(&payload.workload.agent_name);
+        if home.exists() {
+            std::fs::remove_dir_all(&home)
+                .with_context(|| format!("reset agent home dir {}", home.display()))?;
+        }
+        let plane = self.open_plane()?;
+        home_manifest::rehydrate(
+            &payload.home_manifest,
+            &home,
+            &plane,
+            &RestorePolicy::default(),
+        )?;
+
         self.spawn_state(BwrapWorkloadState {
             workload: payload.workload,
             command: payload.command,
+            owned_object_ids: Vec::new(),
         })
     }
 
@@ -303,10 +326,64 @@ impl NanoRuntime for BwrapNanoRuntime {
     }
 }
 
-#[allow(dead_code)]
-fn ensure_relative(path: &Path) -> Result<()> {
-    if path.is_absolute() {
-        return Err(anyhow!("agent-home snapshot path must be relative"));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// N5 + AC-1 at the adapter level: the bwrap snapshot representation is a
+    /// metadata-aware CAS manifest (not file bytes), and it is deterministic — a
+    /// re-walk of an identical home yields a serde-equal manifest, so the
+    /// conformance harness's `after.payload == before.payload` holds. This
+    /// exercises the rewired snapshot/restore data path without needing a real
+    /// bwrap spawn (which is the `#[ignore]`d host conformance test).
+    #[test]
+    fn home_manifest_is_deterministic_and_block_ref_based() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = BwrapNanoRuntime::with_cas_dir(tmp.path().join("cas"));
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join("d")).unwrap();
+        std::fs::write(home.join("d/f.txt"), b"deterministic agent-home content").unwrap();
+        std::os::unix::fs::symlink("d/f.txt", home.join("link")).unwrap();
+
+        let plane = rt.open_plane().unwrap();
+        let m1 = home_manifest::walk_home(&home, &plane).unwrap().manifest;
+        let m2 = home_manifest::walk_home(&home, &plane).unwrap().manifest;
+        assert_eq!(
+            serde_json::to_value(&m1).unwrap(),
+            serde_json::to_value(&m2).unwrap(),
+            "bwrap home manifest must be deterministic (N5 payload stability)"
+        );
+
+        // AC-1: the file entry carries BLAKE3-128 chunk refs, not bytes.
+        let file = m1
+            .entries
+            .iter()
+            .find(|e| e.rel_path_bytes == b"d/f.txt")
+            .expect("file entry present");
+        assert_eq!(file.kind, home_manifest::EntryKind::File);
+        assert!(!file.content.is_empty());
+        assert!(!file.content[0].chunk_refs.is_empty());
+
+        // The snapshot payload embeds the manifest, never a raw byte map: the
+        // type system guarantees this (BwrapSnapshotPayload.home_manifest), and
+        // the serialized form shows the manifest field and no `home_files`.
+        let workload: NanoWorkloadSpec = serde_json::from_value(serde_json::json!({
+            "workload_id": "w-test",
+            "agent_name": "agent-test",
+        }))
+        .unwrap();
+        let payload = BwrapSnapshotPayload {
+            workload,
+            command: vec![],
+            home_manifest: m1,
+            cgroup_created: false,
+            io_available: false,
+            bwrap_available: false,
+            landlock_available: false,
+            semantics_note: String::new(),
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert!(value.get("home_manifest").is_some());
+        assert!(value.get("home_files").is_none(), "no raw byte map remains");
     }
-    Ok(())
 }
