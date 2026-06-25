@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Issue #571 (closes #571): **bump `quinn-proto` 0.11.14 → 0.11.15 for RUSTSEC-2026-0185** (remote memory-exhaustion / DoS, published 2026-06-22, patched in ≥0.11.15). The crate enters the tree transitively via `wtransport` (the dashboard WebTransport); lockfile-only, semver-compatible patch within the existing `^0.11`. Pre-emptive ahead of the QUIC control stream (#569) which builds on quinn. Refs #397.
+
 ### Fixed
 - Issue #495 (ProvisionNode member bootstrap, partially addresses #495): **three defects found during the live Chunk-4c cross-node verification that prevented a provisioned node from starting.** (1) `RenderingConfig` scp'd `daemon.toml` / the systemd unit / the token-gate drop-ins **directly** into root-owned paths as the unprivileged SSH user → `scp: Permission denied`; the privileged files are now staged to a writable `/tmp` path and `sudo install`ed into place (the same pattern the binary push already used) via a new `install_text` helper. (2) The daemon `read_dir`s `config_dir/agents` on startup (an absent dir is fatal), but the saga never created it → `config/agents` is now created. (3) The systemd unit's `ReadWritePaths` lists `/opt/sentinel/fs`, which `ProtectSystem=strict` requires to exist even when the member runs without a FUSE mount (`fs_mount` defaults to `None`) → the saga now creates `/opt/sentinel/fs` too. With these, the seed bootstraps a bare VM into a **running** cluster member end-to-end (live: node-0 GenesisSeed → `ProvisionNode` → node-1 `role=Member lifecycle=Joining`, both nodes ingesting each other's heartbeats, `NodeProvisioned` event persisted, identical binary sha256 on both nodes). The happy-path unit test asserts the new staged-install command sequence + the `config/agents` creation. Refs #495, #397.
 
