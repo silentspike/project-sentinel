@@ -10,6 +10,7 @@ pub mod cluster;
 pub mod components;
 pub mod events;
 pub mod feature_flags;
+pub mod fencing;
 pub mod generated;
 pub mod membership;
 pub mod nano_runtime;
@@ -24,6 +25,7 @@ pub use cluster::{
     PendingBareNode,
 };
 pub use events::{DomainEvent, DomainEventPayload};
+pub use fencing::{OwnerWriteGuard, StaleEpochError};
 pub use membership::{
     Heartbeat, IngestOutcome, MembershipConfig, MembershipState, MembershipView, NodeMembership,
 };
