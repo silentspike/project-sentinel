@@ -670,6 +670,28 @@ pub enum StateTransferScope {
     NanoContainer(String),
 }
 
+impl StateTransferScope {
+    /// The owner scope for a write whose subject is one agent / nano-container (#496
+    /// G-1): the agent id (`AGENT-NN`) names the container. Single-node the seed owns
+    /// every container, so this is behavior-preserving; PR2b-2 routes the container to
+    /// its owning node.
+    pub fn for_agent(agent_id: impl Into<String>) -> Self {
+        StateTransferScope::NanoContainer(agent_id.into())
+    }
+
+    /// The owner scope for a domain event, derived from its `aggregate_id` (#496 G-1):
+    /// an agent aggregate (`AGENT-NN`) is owned by its nano-container; a room or system
+    /// aggregate without an agent subject (e.g. a `PsiBandChanged` / `ChaosTriggered`
+    /// event) belongs to the `World` scope = the seed / chef owner.
+    pub fn for_aggregate(aggregate_id: &str) -> Self {
+        if aggregate_id.starts_with("AGENT-") {
+            StateTransferScope::NanoContainer(aggregate_id.to_string())
+        } else {
+            StateTransferScope::World
+        }
+    }
+}
+
 /// Stabiler Cursor des Quellzustands fuer Restore/Migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateTransferCursor {
