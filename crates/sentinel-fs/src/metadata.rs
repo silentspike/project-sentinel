@@ -7,7 +7,7 @@
 
 use crate::cas::{CasStore, ChunkGcStats};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
-use sentinel_common::FsMetadataDump;
+use sentinel_common::{FsMetadataDump, OwnerWriteGuard, StateTransferScope};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
@@ -207,7 +207,20 @@ impl MetadataStore {
         Ok(Self { db, durability })
     }
 
-    fn begin_write(&self) -> anyhow::Result<WriteTransaction> {
+    /// The single fenced write entry every persistent mutation of this metadata
+    /// store must route through (#496, V3/V19): a writer obtains its `redb` write
+    /// transaction here, presenting an `OwnerWriteGuard`, and the store's configured
+    /// durability is applied. A raw write cannot bypass it — the `db` field is
+    /// private to this crate.
+    ///
+    /// PR1c is the behavior-preserving strangler step: the guard is accepted
+    /// (single-node has no owner registry, so `unfenced` guards always pass) and the
+    /// write transaction is returned exactly as before. PR2 compares `guard.epoch()`
+    /// against the committed owner epoch for `guard.scope()` and rejects a stale
+    /// write with a `StaleEpochError` (V19).
+    fn begin_fenced_write(&self, guard: &OwnerWriteGuard) -> anyhow::Result<WriteTransaction> {
+        // PR1c no-op fence (the scope/epoch are recorded by the guard for PR2).
+        let _ = guard;
         let mut write_txn = self.db.begin_write()?;
         match self.durability {
             MetadataDurability::Immediate => {}
@@ -233,7 +246,8 @@ impl MetadataStore {
     /// Set inode metadata for an agent.
     pub fn set_inode(&self, agent_id: &str, inode: u64, data: &InodeData) -> anyhow::Result<()> {
         let serialized = data.serialize()?;
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(FS_INODES)?;
             table.insert((agent_id, inode), serialized.as_slice())?;
@@ -244,7 +258,8 @@ impl MetadataStore {
 
     /// Remove an inode. Returns the old data if it existed.
     pub fn remove_inode(&self, agent_id: &str, inode: u64) -> anyhow::Result<Option<InodeData>> {
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         let old = {
             let mut table = write_txn.open_table(FS_INODES)?;
             let x = match table.remove((agent_id, inode))? {
@@ -281,7 +296,8 @@ impl MetadataStore {
         name: &str,
         child_inode: u64,
     ) -> anyhow::Result<()> {
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(FS_DIRENTS)?;
             table.insert((agent_id, parent, name), child_inode)?;
@@ -297,7 +313,8 @@ impl MetadataStore {
         parent: u64,
         name: &str,
     ) -> anyhow::Result<Option<u64>> {
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         let old = {
             let mut table = write_txn.open_table(FS_DIRENTS)?;
             // Deliberate match instead of .map() — redb AccessGuard lifetime workaround
@@ -341,7 +358,8 @@ impl MetadataStore {
 
     /// Increment reference count. Returns the new count.
     pub fn inc_refcount(&self, hash: &[u8; 32]) -> anyhow::Result<u32> {
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         let new_count = {
             let mut table = write_txn.open_table(CAS_REFCOUNT)?;
             let current = table.get(hash)?.map(|g| g.value()).unwrap_or(0);
@@ -359,7 +377,8 @@ impl MetadataStore {
 
     /// Decrement reference count. Returns the new count (clamped to 0).
     pub fn dec_refcount(&self, hash: &[u8; 32]) -> anyhow::Result<u32> {
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         let new_count = {
             let mut table = write_txn.open_table(CAS_REFCOUNT)?;
             let current = table.get(hash)?.map(|g| g.value()).unwrap_or(0);
@@ -398,7 +417,8 @@ impl MetadataStore {
         hash: &[u8; 32],
         trashed_at_ms: Option<u64>,
     ) -> anyhow::Result<bool> {
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         let updated = {
             let mut table = write_txn.open_table(FS_TRASH_QUEUE)?;
             match trashed_at_ms {
@@ -415,7 +435,8 @@ impl MetadataStore {
 
     /// Remove a hash from the trash queue and re-establish a refcount if needed.
     pub fn restore_from_trash(&self, hash: &[u8; 32]) -> anyhow::Result<bool> {
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         let restored = {
             let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
             if trash.remove(hash)?.is_none() {
@@ -444,7 +465,8 @@ impl MetadataStore {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(FS_SNAPSHOT_BLOB_REFS)?;
             for hash in hashes {
@@ -473,7 +495,8 @@ impl MetadataStore {
         if to_remove.is_empty() {
             return Ok(0);
         }
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(FS_SNAPSHOT_BLOB_REFS)?;
             for hash in &to_remove {
@@ -577,7 +600,8 @@ impl MetadataStore {
     /// Restore all sentinel-fs metadata tables from a snapshot dump.
     pub fn restore_all_tables(&self, dump: &FsMetadataDump) -> anyhow::Result<()> {
         let current = self.dump_all_tables()?;
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         {
             let mut inodes = write_txn.open_table(FS_INODES)?;
             for (agent_id, inode, _) in &current.inodes {
@@ -656,7 +680,8 @@ impl MetadataStore {
 
         let gc_stats = cas.gc(&expired_hashes)?;
 
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         {
             let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
             let refs = write_txn.open_table(CAS_REFCOUNT)?;
@@ -688,7 +713,8 @@ impl MetadataStore {
         data: &InodeData,
     ) -> anyhow::Result<()> {
         let serialized = data.serialize()?;
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         {
             let mut inodes = write_txn.open_table(FS_INODES)?;
             inodes.insert((agent_id, inode), serialized.as_slice())?;
@@ -726,7 +752,8 @@ impl MetadataStore {
     ) -> anyhow::Result<u64> {
         let serialized = data.serialize()?;
 
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         let inode = {
             let mut inodes = write_txn.open_table(FS_INODES)?;
 
@@ -780,7 +807,8 @@ impl MetadataStore {
         name: &str,
         inode: u64,
     ) -> anyhow::Result<Option<InodeData>> {
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         let old_data = {
             let mut inodes = write_txn.open_table(FS_INODES)?;
             let old = match inodes.remove((agent_id, inode))? {
@@ -827,7 +855,8 @@ impl MetadataStore {
     /// Allocate the next inode number for an agent.
     /// Uses a special inode 0 entry to track the counter.
     pub fn next_inode(&self, agent_id: &str) -> anyhow::Result<u64> {
-        let write_txn = self.begin_write()?;
+        let write_txn =
+            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
         let next = {
             let mut table = write_txn.open_table(FS_INODES)?;
             // Use inode 0 as the counter (never a real inode in FUSE — root is 1)
@@ -860,6 +889,41 @@ mod tests {
         let path = dir.path().join("test-meta.redb");
         let store = MetadataStore::open(&path).unwrap();
         (store, dir)
+    }
+
+    /// #496 PR1c: the fenced write entry is the single choke point every metadata
+    /// writer routes through. In PR1c it is a behavior-preserving no-op fence that
+    /// accepts any `OwnerWriteGuard` and yields the same `WriteTransaction` (with the
+    /// store's durability applied) a raw writer used before, so a write through it
+    /// must persist exactly as before. Both the `World` and a `NanoContainer(agent)`
+    /// scope are accepted (PR2 adds the epoch check; PR1c must reject nothing).
+    #[test]
+    fn begin_fenced_write_is_behavior_preserving_choke_point() {
+        let (store, _dir) = temp_meta();
+        let agent = "AGENT-07";
+
+        // A routed writer (set_inode → begin_fenced_write) persists as before.
+        let data = InodeData::regular([0x11; 32], 512, 0o600);
+        store.set_inode(agent, 1, &data).unwrap();
+        assert_eq!(store.get_inode(agent, 1).unwrap().unwrap().size, 512);
+
+        // The choke point itself yields a usable, committable write transaction
+        // under both scopes — the PR1c no-op fence accepts every guard.
+        for scope in [
+            StateTransferScope::World,
+            StateTransferScope::NanoContainer(agent.to_string()),
+        ] {
+            let txn = store
+                .begin_fenced_write(&OwnerWriteGuard::unfenced(scope))
+                .unwrap();
+            {
+                let mut table = txn.open_table(FS_INODES).unwrap();
+                let bytes = data.serialize().unwrap();
+                table.insert((agent, 2u64), bytes.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        assert!(store.get_inode(agent, 2).unwrap().is_some());
     }
 
     #[test]
