@@ -7,7 +7,9 @@
 
 use crate::cas::{CasStore, ChunkGcStats};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
-use sentinel_common::{FsMetadataDump, OwnerRegistry, OwnerWriteGuard, StateTransferScope};
+use sentinel_common::{
+    FencedStore, FsMetadataDump, OwnerRegistry, OwnerWriteGuard, StateTransferScope,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
@@ -207,29 +209,9 @@ impl MetadataStore {
         Ok(Self { db, durability })
     }
 
-    /// The single fenced write entry every persistent mutation of this metadata
-    /// store must route through (#496, V3/V19): a writer obtains its `redb` write
-    /// transaction here, presenting an `OwnerWriteGuard`, and the store's configured
-    /// durability is applied. A raw write cannot bypass it — the `db` field is
-    /// private to this crate.
-    ///
-    /// PR2a re-checks the guard against the committed owner term (V19) via the
-    /// `OwnerRegistry` before handing out the write transaction; a stale or non-owning
-    /// guard is rejected with a `StaleEpochError`. Single-node — the seed owns every
-    /// scope — so every write passes; PR2b's cooperative handoff makes a guard stale.
-    fn begin_fenced_write(&self, guard: &OwnerWriteGuard) -> anyhow::Result<WriteTransaction> {
-        // PR2a: re-check the guard against the committed owner term (V19) before the
-        // write transaction. Single-node — the seed owns every scope — so it passes.
-        OwnerRegistry::global().validate(guard)?;
-        let mut write_txn = self.db.begin_write()?;
-        match self.durability {
-            MetadataDurability::Immediate => {}
-            MetadataDurability::Eventual => {
-                write_txn.set_durability(redb::Durability::None)?;
-            }
-        }
-        Ok(write_txn)
-    }
+    // The single fenced write entry (#496 V3/V19) is `impl FencedStore for
+    // MetadataStore` below: it re-checks the guard at begin, applies the configured
+    // durability, and the returned `FencedFsWrite` re-checks again at commit (TOCTOU).
 
     // === INODE OPERATIONS ===
 
@@ -888,6 +870,56 @@ impl MetadataStore {
     }
 }
 
+/// A fenced fs metadata write transaction (#496 V19). Like the redb store, the owner
+/// guard is re-checked at begin (in `begin_fenced_write`, which also applies the
+/// configured durability) **and** again at [`commit`](FencedFsWrite::commit), so a write
+/// that went stale mid-transaction — a cross-node handoff committed a newer owner term —
+/// is rejected at commit (the TOCTOU window). Single-node the owner never changes
+/// mid-write, so this always commits. The inner transaction is private.
+pub struct FencedFsWrite {
+    inner: WriteTransaction,
+    guard: OwnerWriteGuard,
+}
+
+impl FencedFsWrite {
+    /// Open a table in the fenced write transaction (delegates to the inner txn).
+    pub fn open_table<K: redb::Key + 'static, V: redb::Value + 'static>(
+        &self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<redb::Table<'_, K, V>, redb::TableError> {
+        self.inner.open_table(definition)
+    }
+
+    /// Commit the write after re-checking the owner term (V19 TOCTOU). A guard that went
+    /// stale since begin is rejected with `StaleEpochError` and the write is dropped.
+    pub fn commit(self) -> anyhow::Result<()> {
+        OwnerRegistry::global().validate(&self.guard)?;
+        self.inner.commit()?;
+        Ok(())
+    }
+}
+
+impl FencedStore for MetadataStore {
+    type Txn<'a> = FencedFsWrite;
+
+    fn begin_fenced_write(&self, guard: &OwnerWriteGuard) -> anyhow::Result<FencedFsWrite> {
+        // V19: re-check the guard at begin; the returned txn re-checks again at commit.
+        // The store's configured durability is applied before the txn is handed out.
+        OwnerRegistry::global().validate(guard)?;
+        let mut inner = self.db.begin_write()?;
+        match self.durability {
+            MetadataDurability::Immediate => {}
+            MetadataDurability::Eventual => {
+                inner.set_durability(redb::Durability::None)?;
+            }
+        }
+        Ok(FencedFsWrite {
+            inner,
+            guard: guard.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,6 +965,30 @@ mod tests {
             txn.commit().unwrap();
         }
         assert!(store.get_inode(agent, 2).unwrap().is_some());
+    }
+
+    /// #496 PR2b-1b (V19 TOCTOU): the fenced write re-checks the owner term at **commit**,
+    /// not just at begin (see the redb store for the rationale). Single-node it never
+    /// fires; this models the PR2b-2 case where a handoff makes the write stale by commit.
+    #[test]
+    fn commit_rechecks_owner_term_and_rejects_stale() {
+        let (store, _dir) = temp_meta();
+        let stale = super::FencedFsWrite {
+            inner: store.db.begin_write().unwrap(),
+            guard: OwnerWriteGuard::for_test(
+                StateTransferScope::World,
+                OwnerRegistry::global().this_node(),
+                0,
+            ),
+        };
+        assert!(
+            stale.commit().is_err(),
+            "stale guard must be rejected at commit"
+        );
+        let ok = store
+            .begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))
+            .unwrap();
+        ok.commit().unwrap();
     }
 
     #[test]

@@ -58,8 +58,13 @@ impl OwnerWriteGuard {
         self.owner_node
     }
 
-    /// Test-only guard construction (the registry is the only production issuer).
-    #[cfg(test)]
+    /// Construct a guard directly, for tests of the fenced stores (e.g. the redb/fs
+    /// commit-recheck path). This is **not** a production path — a real guard always
+    /// comes from [`OwnerRegistry::issue`]. It is safe to expose because constructing a
+    /// guard grants nothing: every fenced write re-validates the guard against the
+    /// committed owner term at begin (and redb/fs again at commit), so a guard that does
+    /// not match the registry is rejected. Hidden from the public docs.
+    #[doc(hidden)]
     pub fn for_test(scope: StateTransferScope, owner_node: NodeId, epoch: u64) -> Self {
         Self {
             scope,
