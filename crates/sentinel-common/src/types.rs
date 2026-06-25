@@ -680,14 +680,80 @@ impl StateTransferScope {
     }
 
     /// The owner scope for a domain event, derived from its `aggregate_id` (#496 G-1):
-    /// an agent aggregate (`AGENT-NN`) is owned by its nano-container; a room or system
-    /// aggregate without an agent subject (e.g. a `PsiBandChanged` / `ChaosTriggered`
-    /// event) belongs to the `World` scope = the seed / chef owner.
+    /// an agent aggregate is owned by its nano-container; a room, company, nightrun or
+    /// system aggregate without an agent subject belongs to the `World` scope = the
+    /// seed / chef owner.
+    ///
+    /// An agent aggregate is **exactly** the [`AgentId`] display form `AGENT-<n>` (the
+    /// `AGENT-` prefix followed by the numeric id — see `impl Display for AgentId`). The
+    /// classification keys on that structured shape, not a loose `AGENT-` prefix, so a
+    /// non-agent aggregate that merely starts with `AGENT-` (a typo, a future
+    /// `AGENT-LOG`-style id, …) is never incorrectly tagged as a container. A wrong tag is
+    /// harmless single-node (the seed owns every scope) but would be a wrong cross-node
+    /// owner check under PR2b-2, so completeness is asserted by a dedicated test.
     pub fn for_aggregate(aggregate_id: &str) -> Self {
-        if aggregate_id.starts_with("AGENT-") {
-            StateTransferScope::NanoContainer(aggregate_id.to_string())
-        } else {
-            StateTransferScope::World
+        match aggregate_id.strip_prefix("AGENT-") {
+            Some(rest) if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) => {
+                StateTransferScope::NanoContainer(aggregate_id.to_string())
+            }
+            _ => StateTransferScope::World,
+        }
+    }
+}
+
+#[cfg(test)]
+mod scope_classification_tests {
+    use super::{AgentId, StateTransferScope};
+
+    /// R2 acceptance for #496 PR2b-1: every `aggregate_id` form that appears in the
+    /// simulation maps to the correct owner-scope class. An agent aggregate is owned by
+    /// its nano-container; everything else (rooms, the building, company-level, nightrun
+    /// runs, raw event-type ids, malformed agent-ish ids) is `World` = the seed owner.
+    #[test]
+    fn for_aggregate_classifies_every_aggregate_form() {
+        let nano = |s: &str| StateTransferScope::NanoContainer(s.to_string());
+
+        // Agents: the canonical AgentId display form -> their own nano-container.
+        assert_eq!(
+            StateTransferScope::for_aggregate("AGENT-01"),
+            nano("AGENT-01")
+        );
+        assert_eq!(
+            StateTransferScope::for_aggregate("AGENT-60"),
+            nano("AGENT-60")
+        );
+        // Non-zero-padded numeric form is still an agent (classification != validation).
+        assert_eq!(
+            StateTransferScope::for_aggregate("AGENT-7"),
+            nano("AGENT-7")
+        );
+        // It matches what `AgentId` actually renders.
+        let rendered = AgentId(3).to_string();
+        assert_eq!(
+            StateTransferScope::for_aggregate(&rendered),
+            nano(&rendered)
+        );
+
+        // Everything without a numeric agent subject -> World.
+        for world in [
+            "building",        // whole-building chaos / system events
+            "buero-dev-1",     // a room aggregate
+            "empfang",         // a room aggregate
+            "run-1",           // a nightrun run_id
+            "nightrun",        // nightrun pipeline aggregate
+            "PixelPerfekt",    // company-level aggregate
+            "chaos_triggered", // an event-type used as aggregate in older paths
+            "AGENT-",          // malformed: prefix with no id
+            "AGENT-LOG",       // agent-ish prefix but not an id
+            "AGENTX",          // not the prefix at all
+            "agent-1",         // lowercase is not the AgentId display form
+            "",                // empty
+        ] {
+            assert_eq!(
+                StateTransferScope::for_aggregate(world),
+                StateTransferScope::World,
+                "aggregate {world:?} must map to World"
+            );
         }
     }
 }
