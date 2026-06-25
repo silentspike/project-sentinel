@@ -4608,6 +4608,7 @@ dependencies = [
  "libc",
  "rayon",
  "redb",
+ "rustix",
  "sentinel-common",
  "sentinel-telemetry",
  "serde",
@@ -4670,8 +4671,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "sentinel-common",
+ "sentinel-fs",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
 ]
 
@@ -4783,9 +4786,11 @@ dependencies = [
  "landlock",
  "libc",
  "sentinel-common",
+ "sentinel-fs",
  "sentinel-zenoh",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
