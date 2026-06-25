@@ -246,8 +246,9 @@ impl MetadataStore {
     /// Set inode metadata for an agent.
     pub fn set_inode(&self, agent_id: &str, inode: u64, data: &InodeData) -> anyhow::Result<()> {
         let serialized = data.serialize()?;
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+        )?;
         {
             let mut table = write_txn.open_table(FS_INODES)?;
             table.insert((agent_id, inode), serialized.as_slice())?;
@@ -258,8 +259,9 @@ impl MetadataStore {
 
     /// Remove an inode. Returns the old data if it existed.
     pub fn remove_inode(&self, agent_id: &str, inode: u64) -> anyhow::Result<Option<InodeData>> {
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+        )?;
         let old = {
             let mut table = write_txn.open_table(FS_INODES)?;
             let x = match table.remove((agent_id, inode))? {
@@ -296,8 +298,9 @@ impl MetadataStore {
         name: &str,
         child_inode: u64,
     ) -> anyhow::Result<()> {
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+        )?;
         {
             let mut table = write_txn.open_table(FS_DIRENTS)?;
             table.insert((agent_id, parent, name), child_inode)?;
@@ -313,8 +316,9 @@ impl MetadataStore {
         parent: u64,
         name: &str,
     ) -> anyhow::Result<Option<u64>> {
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+        )?;
         let old = {
             let mut table = write_txn.open_table(FS_DIRENTS)?;
             // Deliberate match instead of .map() — redb AccessGuard lifetime workaround
@@ -713,8 +717,9 @@ impl MetadataStore {
         data: &InodeData,
     ) -> anyhow::Result<()> {
         let serialized = data.serialize()?;
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+        )?;
         {
             let mut inodes = write_txn.open_table(FS_INODES)?;
             inodes.insert((agent_id, inode), serialized.as_slice())?;
@@ -752,8 +757,9 @@ impl MetadataStore {
     ) -> anyhow::Result<u64> {
         let serialized = data.serialize()?;
 
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+        )?;
         let inode = {
             let mut inodes = write_txn.open_table(FS_INODES)?;
 
@@ -807,8 +813,9 @@ impl MetadataStore {
         name: &str,
         inode: u64,
     ) -> anyhow::Result<Option<InodeData>> {
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+        )?;
         let old_data = {
             let mut inodes = write_txn.open_table(FS_INODES)?;
             let old = match inodes.remove((agent_id, inode))? {
@@ -855,8 +862,9 @@ impl MetadataStore {
     /// Allocate the next inode number for an agent.
     /// Uses a special inode 0 entry to track the counter.
     pub fn next_inode(&self, agent_id: &str) -> anyhow::Result<u64> {
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+        )?;
         let next = {
             let mut table = write_txn.open_table(FS_INODES)?;
             // Use inode 0 as the counter (never a real inode in FUSE — root is 1)
