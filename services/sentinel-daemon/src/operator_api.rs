@@ -52,6 +52,7 @@ const OPERATOR_STATE_HASH_PATH: &str = "/operator/state-hash";
 const OPERATOR_CONFIG_APPLY_PATH: &str = "/operator/config/apply";
 const OPERATOR_MIGRATE_PATH: &str = "/operator/migrate";
 const OPERATOR_PROVISION_PATH: &str = "/operator/provision";
+const OPERATOR_CONTROL_QUERY_PATH: &str = "/operator/control/query";
 const OPERATOR_PRUNE_PATH: &str = "/operator/prune";
 const OPERATOR_CHAT_PATH: &str = "/operator/chat";
 const OPERATOR_GAIA_PATH: &str = "/operator/gaia";
@@ -410,6 +411,7 @@ struct AppState {
     platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
     runtime_health: crate::runtime_health::SharedRuntimeHealthState,
     security_runtime_state: SharedSecurityRuntimeState,
+    cluster_control: Option<Arc<crate::cluster_control::ClusterControl>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -512,6 +514,7 @@ pub async fn start_server(
     platform_state: Arc<std::sync::RwLock<PlatformStateSnapshot>>,
     runtime_health: crate::runtime_health::SharedRuntimeHealthState,
     security_runtime_state: SharedSecurityRuntimeState,
+    cluster_control: Option<Arc<crate::cluster_control::ClusterControl>>,
 ) -> AnyResult<tokio::task::JoinHandle<()>> {
     let listener = TcpListener::bind(&config.bind_addr)
         .await
@@ -541,6 +544,7 @@ pub async fn start_server(
         platform_state,
         runtime_health,
         security_runtime_state,
+        cluster_control,
     };
 
     info!(
@@ -861,6 +865,73 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                     "ProvisionNode nicht verfuegbar (kein Seed-Knoten)",
                 )
                 .to_response(),
+            }
+        }
+        OPERATOR_CONTROL_QUERY_PATH => {
+            // Cluster 12 (#569, ADR-2): send a control RPC (RefQuery/PinQuery) to a
+            // pinned peer over the QUIC control stream. The live 2-node AC trigger;
+            // later #496/#499 drive these RPCs internally.
+            let cc = match &state.cluster_control {
+                Some(cc) => cc.clone(),
+                None => {
+                    return ApiError::ServiceUnavailable("control stream not configured")
+                        .to_response()
+                }
+            };
+            let body: serde_json::Value = match serde_json::from_slice(&request.body) {
+                Ok(v) => v,
+                Err(_) => {
+                    return ApiError::BadRequest(
+                        "control query needs peer_alias, kind ('ref'|'pin'), block_ref",
+                    )
+                    .to_response()
+                }
+            };
+            let peer = body
+                .get("peer_alias")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let kind = body
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ref")
+                .to_string();
+            let block_ref = body
+                .get("block_ref")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let idem = body
+                .get("idempotency_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("control-query")
+                .to_string();
+            if peer.is_empty() || block_ref.is_empty() {
+                return ApiError::BadRequest("control query needs peer_alias + block_ref")
+                    .to_response();
+            }
+            let req = match kind.as_str() {
+                "ref" => sentinel_cluster_control::ControlRequest::RefQuery {
+                    block_ref: block_ref.clone(),
+                },
+                "pin" => sentinel_cluster_control::ControlRequest::PinQuery {
+                    block_ref: block_ref.clone(),
+                },
+                _ => return ApiError::BadRequest("kind must be 'ref' or 'pin'").to_response(),
+            };
+            info!(%peer, %kind, %block_ref, "control query via Operator-API");
+            // `handle_http_request` is sync (called from the async server loop on a
+            // multi-thread runtime); drive the async RPC to completion here.
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(cc.rpc(&peer, &idem, req))
+            });
+            match result {
+                Ok(reply) => json_response(
+                    200,
+                    serde_json::json!({ "peer": peer, "response": reply.response }),
+                ),
+                Err(e) => json_response(502, serde_json::json!({ "error": e.to_string() })),
             }
         }
         OPERATOR_PRUNE_PATH => {
@@ -3011,6 +3082,7 @@ mod tests {
                 },
             )),
             security_runtime_state,
+            cluster_control: None,
         };
         std::mem::forget(dir);
         (state, rx, platform_rx, runtime_rx)

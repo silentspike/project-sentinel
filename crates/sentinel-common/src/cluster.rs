@@ -142,6 +142,27 @@ pub struct ClusterConfig {
     /// The determinism profile (#494) requires an identical binary on every node.
     #[serde(default)]
     pub provision_binary_path: Option<String>,
+    /// Bind address for this node's QUIC control stream (ADR-2, e.g. `"0.0.0.0:8085"`).
+    /// `None` = the control stream is not started on this node.
+    #[serde(default)]
+    pub control_bind: Option<String>,
+    /// Pinned control-plane peers (V10): each carries the peer's control address +
+    /// SHA-256 cert fingerprint, exchanged out-of-band (like the SSH host-key pin).
+    #[serde(default)]
+    pub control_peers: Vec<ControlPeer>,
+}
+
+/// A pinned control-plane peer (V10): where to reach it + which cert to trust. The
+/// fingerprint is exchanged out-of-band (single trust domain, V21); cert rotation /
+/// distribution via membership is Track-D2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlPeer {
+    /// Human-readable alias of the peer node.
+    pub alias: String,
+    /// The peer's control-stream socket address (e.g. `"10.0.0.242:8085"`).
+    pub addr: String,
+    /// The peer's SHA-256 cert fingerprint (64-hex), pinned out-of-band (V10).
+    pub cert_fingerprint: String,
 }
 
 impl ClusterConfig {
@@ -208,6 +229,8 @@ mod tests {
             seed_endpoint: None,
             pending_targets: Vec::new(),
             provision_binary_path: None,
+            control_bind: None,
+            control_peers: Vec::new(),
         };
         let a = NodeIdentity::from_config(&cfg);
         let b = NodeIdentity::from_config(&cfg);
@@ -229,6 +252,8 @@ mod tests {
             seed_endpoint: None,
             pending_targets: Vec::new(),
             provision_binary_path: None,
+            control_bind: None,
+            control_peers: Vec::new(),
         };
         assert_eq!(cfg.role(), ClusterRole::Seed);
         assert_eq!(cfg.initial_lifecycle(), NodeLifecycleState::GenesisSeed);
