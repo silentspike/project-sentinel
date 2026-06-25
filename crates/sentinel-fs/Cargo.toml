@@ -40,3 +40,7 @@ harness = false
 [[bench]]
 name = "snapshot_pin_gc"
 harness = false
+
+[[bench]]
+name = "cas_manifest_savings"
+harness = false
