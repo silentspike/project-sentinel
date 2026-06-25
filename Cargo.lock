@@ -4426,7 +4426,9 @@ name = "sentinel-cluster-control"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "quinn",
  "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
