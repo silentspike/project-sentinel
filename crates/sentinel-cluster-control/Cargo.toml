@@ -26,3 +26,4 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = "3"
