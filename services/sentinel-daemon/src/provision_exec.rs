@@ -204,15 +204,29 @@ pub fn execute_provision_node<T: ProvisionTransport>(
     op.advance(clock()); // → RenderingConfig
 
     // RenderingConfig → daemon.toml + systemd unit + token-gate drop-ins.
+    // `config/agents` MUST exist — the daemon `read_dir`s it on startup (an absent
+    // dir is fatal). Privileged files are staged to a writable `/tmp` path and then
+    // `sudo install`ed (the SSH user is unprivileged; a direct scp into a root-owned
+    // dir is denied — same staging pattern as the binary push above).
     fenced_step(op, clock, "render config", || {
-        transport
-            .run("sudo install -d -m 0755 /opt/sentinel/config /opt/sentinel/data /etc/sentinel")?;
-        transport.put_text(REMOTE_CONFIG, &plan.render_daemon_toml())?;
-        transport.put_text(REMOTE_UNIT, SYSTEMD_UNIT)?;
+        // Create every Sentinel runtime dir the systemd unit's ReadWritePaths
+        // references (`/opt/sentinel/fs` is required for the ProtectSystem=strict
+        // mount namespace even when the member runs without a FUSE mount). `/ram/*`
+        // tmpfs + `sentinel.target` are base-image requirements.
+        transport.run(
+            "sudo install -d -m 0755 /opt/sentinel/config /opt/sentinel/config/agents /opt/sentinel/data /opt/sentinel/fs /etc/sentinel",
+        )?;
+        install_text(transport, &plan.render_daemon_toml(), REMOTE_CONFIG, "0644")?;
+        install_text(transport, SYSTEMD_UNIT, REMOTE_UNIT, "0644")?;
         for unit in TOKEN_GATE_UNITS {
             let dir = format!("/etc/systemd/system/{unit}.d");
             transport.run(&format!("sudo install -d -m 0755 {dir}"))?;
-            transport.put_text(&format!("{dir}/token-gate.conf"), TOKEN_GATE_DROPIN)?;
+            install_text(
+                transport,
+                TOKEN_GATE_DROPIN,
+                &format!("{dir}/token-gate.conf"),
+                "0644",
+            )?;
         }
         transport.run("sudo systemctl daemon-reload")?;
         Ok(())
@@ -253,6 +267,23 @@ pub fn execute_provision_node<T: ProvisionTransport>(
     // heartbeat. The live both-nodes-alive assertion is AC-B4.
     op.advance(clock()); // → Completed
     Ok(started.elapsed().as_millis() as u64)
+}
+
+/// Write `content` to a privileged `dest` on the target: stage it to a writable
+/// `/tmp` path (the SSH user is unprivileged) and then `sudo install` it into place.
+/// A direct scp into a root-owned dir is denied — this mirrors the binary push.
+fn install_text<T: ProvisionTransport>(
+    transport: &T,
+    content: &str,
+    dest: &str,
+    mode: &str,
+) -> anyhow::Result<()> {
+    let staged = format!("/tmp/sentinel-stage-{}", Uuid::new_v4());
+    transport.put_text(&staged, content)?;
+    transport.run(&format!(
+        "sudo install -D -m {mode} {staged} {dest} && rm -f {staged}"
+    ))?;
+    Ok(())
 }
 
 /// Run one fallible saga step: on `Ok` advance the op one happy-path state, on `Err`
@@ -517,14 +548,23 @@ mod tests {
             joined.contains("put_file /tmp/sentinel-daemon.new"),
             "binary push"
         );
+        // config/agents must be created (the daemon read_dirs it on startup).
         assert!(
-            joined.contains(&format!("put_text {REMOTE_CONFIG}")),
-            "daemon.toml render"
+            joined.contains("/opt/sentinel/config/agents"),
+            "config/agents dir created"
+        );
+        // Privileged files are staged to /tmp then `sudo install`ed (not scp'd
+        // directly into the root-owned dir).
+        assert!(
+            joined.contains("put_text /tmp/sentinel-stage-"),
+            "config staged to /tmp"
         );
         assert!(
-            joined.contains(&format!("put_text {REMOTE_UNIT}")),
-            "systemd unit"
+            joined.contains("sudo install -D -m 0644 /tmp/sentinel-stage-"),
+            "staged file sudo-installed"
         );
+        assert!(joined.contains(REMOTE_CONFIG), "daemon.toml dest");
+        assert!(joined.contains(REMOTE_UNIT), "systemd unit dest");
         assert!(joined.contains("token-gate.conf"), "token-gate drop-in");
         assert!(joined.contains("systemctl daemon-reload"));
         assert!(joined.contains("systemctl enable --now sentinel-daemon.service"));
