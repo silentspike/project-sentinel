@@ -12,6 +12,12 @@
 //! Dateien. Diese Trennung macht `restore(snapshot(x))` payload-stabil (Conformance-Vertrag #408),
 //! waehrend der eigentliche RAM-Zustand ueber die Firecracker-Dateien transportiert wird.
 //!
+//! Die mem/state-Dateien sind gewoehnliche Disk-Dateien und damit content-addressierbar
+//! (siehe [`manifest`], #500a, `docs/microvm-ram-boundary.md`): sie reisen als `BlockRef` statt
+//! als Inline-Kopie. Ein Multi-GB-RAM-Dump dedupliziert aber praktisch nicht und wird daher als
+//! ein SHA-256-Whole-Blob referenziert. Die lebenden Guest-RAM-Pages werden hier NICHT erfasst —
+//! tiefe microVM-Migration (Post-Copy, Consistency-Class) ist Track F (#554), nicht #500a.
+//!
 //! ## Voraussetzungen (Minimal-Setup)
 //!
 //! - KVM: `/dev/kvm` muss vorhanden und beschreibbar sein (sonst sauberer Fehler bei `spawn`).
@@ -22,6 +28,7 @@
 //! ist out-of-scope (Multi-Node-gated).
 
 mod firecracker;
+pub mod manifest;
 mod microvm;
 
 pub use microvm::{MicrovmConfig, MicrovmNanoRuntime};

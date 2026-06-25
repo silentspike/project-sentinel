@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 anyhow = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
+sentinel-fs = { path = "../sentinel-fs" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -16,3 +17,4 @@ tracing = { workspace = true }
 # test-util aktiviert das conformance-Modul in sentinel-common (sonst hinter
 # #[cfg(any(test, feature = "test-util"))] ausgeblendet) — wie bei den anderen Adapter-Crates.
 sentinel-common = { path = "../sentinel-common", features = ["test-util"] }
+tempfile = "3"

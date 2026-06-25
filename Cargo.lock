@@ -4671,8 +4671,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "sentinel-common",
+ "sentinel-fs",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
 ]
 
