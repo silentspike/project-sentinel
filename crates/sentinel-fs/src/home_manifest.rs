@@ -665,27 +665,24 @@ pub fn release_manifest(plane: &ArtifactPlane, owned_object_ids: &[u64]) -> Resu
     Ok(())
 }
 
-// ───────────────────────────────── xattr / sparse FFI (Tier-2) ──────────────────
+// ─────────────────────────── xattr / sparse FFI (rustix, Tier-2) ────────────────
+// All FFI goes through rustix's safe wrappers, so this module contains zero
+// `unsafe` blocks (the secure-restore primitives and these helpers alike).
 
 /// Read all extended attributes of `path` (no-follow), sorted by name. Returns
 /// an empty list if the filesystem does not support xattrs.
 fn read_xattrs(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let c_path = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
-        Ok(p) => p,
+    // First call (empty buffer) sizes the name list.
+    let size = match rustix::fs::llistxattr(path, &mut [] as &mut [u8]) {
+        Ok(s) if s > 0 => s,
+        _ => return Vec::new(),
+    };
+    let mut buf = vec![0u8; size];
+    let got = match rustix::fs::llistxattr(path, buf.as_mut_slice()) {
+        Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    // First call sizes the name list.
-    let size = unsafe { libc::llistxattr(c_path.as_ptr(), std::ptr::null_mut(), 0) };
-    if size <= 0 {
-        return Vec::new();
-    }
-    let mut buf = vec![0u8; size as usize];
-    let got = unsafe { libc::llistxattr(c_path.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len()) };
-    if got <= 0 {
-        return Vec::new();
-    }
-    buf.truncate(got as usize);
+    buf.truncate(got);
 
     let mut out = Vec::new();
     for name in buf.split(|&b| b == 0).filter(|n| !n.is_empty()) {
@@ -693,78 +690,51 @@ fn read_xattrs(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
             Ok(n) => n,
             Err(_) => continue,
         };
-        let vsize =
-            unsafe { libc::lgetxattr(c_path.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0) };
-        if vsize < 0 {
-            continue;
-        }
-        let mut val = vec![0u8; vsize as usize];
-        let vgot = unsafe {
-            libc::lgetxattr(
-                c_path.as_ptr(),
-                c_name.as_ptr(),
-                val.as_mut_ptr() as *mut _,
-                val.len(),
-            )
+        let vsize = match rustix::fs::lgetxattr(path, &c_name, &mut [] as &mut [u8]) {
+            Ok(s) => s,
+            Err(_) => continue,
         };
-        if vgot < 0 {
-            continue;
-        }
-        val.truncate(vgot as usize);
+        let mut val = vec![0u8; vsize];
+        let vgot = match rustix::fs::lgetxattr(path, &c_name, val.as_mut_slice()) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        val.truncate(vgot);
         out.push((name.to_vec(), val));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
 
-/// Set extended attributes on an open fd (best-effort; errors are surfaced only
-/// when there are xattrs to set, so unsupported filesystems do not break Tier-1).
+/// Set extended attributes on an open fd (errors are surfaced only when there
+/// are xattrs to set, so unsupported filesystems do not break the dense path).
 fn set_xattrs<Fd: AsFd>(fd: Fd, xattrs: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
-    use std::os::fd::AsRawFd as _;
-    if xattrs.is_empty() {
-        return Ok(());
-    }
-    let raw = fd.as_fd().as_raw_fd();
     for (name, value) in xattrs {
         let c_name =
             std::ffi::CString::new(name.clone()).map_err(|_| anyhow!("xattr name has NUL"))?;
-        let rc = unsafe {
-            libc::fsetxattr(
-                raw,
-                c_name.as_ptr(),
-                value.as_ptr() as *const _,
-                value.len(),
-                0,
-            )
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("fsetxattr {:?}", String::from_utf8_lossy(name)));
-        }
+        rustix::fs::fsetxattr(&fd, &c_name, value, rustix::fs::XattrFlags::empty())
+            .with_context(|| format!("fsetxattr {:?}", String::from_utf8_lossy(name)))?;
     }
     Ok(())
 }
 
 /// Enumerate the data extents of a sparse file via `SEEK_DATA` / `SEEK_HOLE`.
 fn data_extents(file: &File, size: u64) -> Result<Vec<(u64, u64)>> {
-    use std::os::fd::AsRawFd as _;
-    let fd = file.as_raw_fd();
+    use rustix::fs::{seek, SeekFrom};
     let mut extents = Vec::new();
-    let mut pos: i64 = 0;
-    let end = size as i64;
-    while pos < end {
-        let data = unsafe { libc::lseek(fd, pos, libc::SEEK_DATA) };
-        if data < 0 {
+    let mut pos: u64 = 0;
+    while pos < size {
+        let data = match seek(file, SeekFrom::Data(pos)) {
+            Ok(d) => d,
             // ENXIO == no more data between pos and EOF.
-            break;
-        }
-        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
-        if hole < 0 {
-            bail!("SEEK_HOLE failed: {}", std::io::Error::last_os_error());
-        }
-        let hole = hole.min(end);
+            Err(rustix::io::Errno::NXIO) => break,
+            Err(e) => return Err(e).context("SEEK_DATA"),
+        };
+        let hole = seek(file, SeekFrom::Hole(data))
+            .context("SEEK_HOLE")?
+            .min(size);
         if hole > data {
-            extents.push((data as u64, (hole - data) as u64));
+            extents.push((data, hole - data));
         }
         pos = hole;
     }
@@ -1121,22 +1091,8 @@ mod tests {
     }
 
     fn set_test_xattr(path: &Path, name: &[u8], value: &[u8]) {
-        let cp = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         let cn = std::ffi::CString::new(name).unwrap();
-        let rc = unsafe {
-            libc::lsetxattr(
-                cp.as_ptr(),
-                cn.as_ptr(),
-                value.as_ptr() as *const _,
-                value.len(),
-                0,
-            )
-        };
-        assert_eq!(
-            rc,
-            0,
-            "lsetxattr failed (filesystem may lack xattr support): {}",
-            std::io::Error::last_os_error()
-        );
+        rustix::fs::lsetxattr(path, &cn, value, rustix::fs::XattrFlags::empty())
+            .expect("lsetxattr failed (filesystem may lack xattr support)");
     }
 }
