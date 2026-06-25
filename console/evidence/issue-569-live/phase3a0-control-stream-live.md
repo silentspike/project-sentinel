@@ -10,7 +10,7 @@
 | AC-5 PinQuery cross-host | PASS | node-0→node-1 (distinct key) `{"PinQueryResult":{"block_ref":"blk-pin-1","pinned":false}}` |
 | AC-5 reverse direction | PASS | node-1→node-0 RefQuery `{"RefQueryResult":{"block_ref":"x","referenced":false}}` |
 | AC-2 idempotency (live, over the wire) | PASS | re-sent `idempotency_key="ac-ref"` with kind=pin + block_ref=DIFFERENT → returned the **cached** `RefQueryResult{blk-ref-1}` (handler did not re-run) |
-| AC-4 cert-pin reject (live) | PASS | mis-pinned node-1 (`0000…`) → `{"error":"server cert 72d2f8b3… does not match pin 0000…"}`; correct pin restored → RPC works again |
+| AC-4 cert-pin reject (live) | PASS | node-1 pinned to a wrong fingerprint — (`0000…`) → `{"error":"server cert 72d2f8b3… does not match pin 0000…"}`; correct pin restored → RPC works again |
 | AC-6 0-RTT off | PASS (code) | `tls.rs quic_server_config` sets `max_early_data_size=0`, TLS 1.3 only |
 | cert persistence | PASS | fingerprints `4026ff7a`/`72d2f8b3` stable across the multiple restarts in this run |
 | unknown peer reject | PASS | unknown `peer_alias` → `{"error":"unknown control peer …"}` |
