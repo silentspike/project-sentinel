@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use anyhow::Context;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use sentinel_common::{AgentId, OwnerWriteGuard, RoomId, StateTransferScope};
+use sentinel_common::{AgentId, OwnerRegistry, OwnerWriteGuard, RoomId, StateTransferScope};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
@@ -100,17 +100,18 @@ impl StateStore {
     /// here, presenting an `OwnerWriteGuard`. A raw write cannot bypass it — the
     /// `db` field is private to this crate.
     ///
-    /// PR1b is the behavior-preserving strangler step: the guard is accepted
-    /// (single-node has no owner registry, so `unfenced` guards always pass) and the
-    /// write transaction is returned exactly as before. PR2 compares `guard.epoch()`
-    /// against the committed owner epoch for `guard.scope()` and rejects a stale
-    /// write with a `StaleEpochError` (V19).
+    /// PR2a re-checks the guard against the committed owner term (V19) via the
+    /// `OwnerRegistry` before handing out the transaction; a stale or non-owning guard is
+    /// rejected with a `StaleEpochError`. Single-node — the seed owns every scope — so
+    /// every write passes; PR2b's cooperative handoff is what makes a guard stale.
     fn begin_fenced_write(
         &self,
         guard: &OwnerWriteGuard,
     ) -> anyhow::Result<redb::WriteTransaction> {
-        // PR1b no-op fence (the scope/epoch are recorded by the guard for PR2).
-        let _ = guard;
+        // PR2a: re-check the guard against the committed owner term (V19) before handing
+        // out a write transaction. Single-node — the seed owns every scope — so this
+        // always passes; PR2b's cooperative handoff is what makes a stale guard fail.
+        OwnerRegistry::global().validate(guard)?;
         Ok(self.db.begin_write()?)
     }
 
@@ -140,7 +141,7 @@ impl StateStore {
     pub fn set_agent_state(&self, agent_id: AgentId, state: &[u8]) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(AGENT_STATE)?;
             table.insert(agent_id.0, state)?;
@@ -168,7 +169,7 @@ impl StateStore {
 
         let start = std::time::Instant::now();
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(AGENT_STATE)?;
             for (agent_id, state) in entries {
@@ -191,7 +192,7 @@ impl StateStore {
     pub fn delete_agent_state(&self, agent_id: AgentId) -> anyhow::Result<bool> {
         let start = std::time::Instant::now();
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         let existed;
         {
             let mut table = write_txn.open_table(AGENT_STATE)?;
@@ -250,7 +251,7 @@ impl StateStore {
         let start = std::time::Instant::now();
         let key = relationship_key(a, b);
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(RELATIONSHIPS)?;
             table.insert(key, data)?;
@@ -292,7 +293,7 @@ impl StateStore {
     pub fn set_personality(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(PERSONALITY)?;
             table.insert(agent_id.0, data)?;
@@ -334,7 +335,7 @@ impl StateStore {
     pub fn set_room_state(&self, room_id: RoomId, data: &[u8]) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(ROOM_STATE)?;
             table.insert(room_id.0, data)?;
@@ -364,7 +365,7 @@ impl StateStore {
     /// Set voice style for an agent.
     pub fn set_voice_style(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(VOICE_STYLE)?;
             table.insert(agent_id.0, data)?;
@@ -385,7 +386,7 @@ impl StateStore {
     /// Set behavioral notes for an agent.
     pub fn set_behavioral_notes(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(BEHAVIORAL_NOTES)?;
             table.insert(agent_id.0, data)?;
@@ -406,7 +407,7 @@ impl StateStore {
     /// Set narrative summary for an agent.
     pub fn set_narrative_summary(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(NARRATIVE_SUMMARY)?;
             table.insert(agent_id.0, data)?;
@@ -425,7 +426,7 @@ impl StateStore {
     /// Increment evolution version for an agent, returns the new version.
     pub fn increment_evolution_version(&self, agent_id: AgentId) -> anyhow::Result<u64> {
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         let new_version;
         {
             let mut table = write_txn.open_table(EVOLUTION_VERSION)?;
@@ -447,7 +448,7 @@ impl StateStore {
         agent_facts: Option<&[u8]>,
     ) -> anyhow::Result<u64> {
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         let new_version;
         {
             if let Some(data) = voice_style {
@@ -489,7 +490,7 @@ impl StateStore {
     /// Set agent facts (JSON bytes).
     pub fn set_agent_facts(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(AGENT_FACTS)?;
             table.insert(agent_id.0, data)?;
@@ -503,7 +504,7 @@ impl StateStore {
     pub fn set_nmda_scores(&self, agent_id: AgentId, scores: &[f64]) -> anyhow::Result<()> {
         let json = serde_json::to_vec(scores)?;
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(NMDA_SCORES)?;
             table.insert(agent_id.0, json.as_slice())?;
@@ -549,7 +550,7 @@ impl StateStore {
     /// Persist sim_hour for restart recovery.
     pub fn set_sim_hour(&self, hour: f32) -> anyhow::Result<()> {
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(SIM_META)?;
             table.insert("sim_hour", hour.to_le_bytes().as_slice())?;
@@ -567,7 +568,7 @@ impl StateStore {
 
         let start = std::time::Instant::now();
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(ROOM_STATE)?;
             for (room_id, data) in entries {
@@ -676,7 +677,7 @@ impl StateStore {
     /// Replace the full structured API-CP state atomically.
     pub fn replace_api_patterns_state(&self, snapshot: &ApiCpSnapshot) -> anyhow::Result<()> {
         let write_txn =
-            self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         {
             let mut table = write_txn.open_table(API_PATTERNS)?;
             let keys: Vec<String> = table
@@ -740,7 +741,8 @@ impl StateStore {
 
     /// Restored alle 11 Tables aus einem Dump in einer atomaren Write-Transaktion.
     pub fn restore_all_tables(&self, dump: &sentinel_common::RedbDump) -> anyhow::Result<()> {
-        let txn = self.begin_fenced_write(&OwnerWriteGuard::unfenced(StateTransferScope::World))?;
+        let txn =
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
         {
             Self::restore_u16_bytes(&txn, AGENT_STATE, &dump.agent_states)?;
             Self::restore_u16_bytes(&txn, ROOM_STATE, &dump.room_states)?;
@@ -934,14 +936,15 @@ mod tests {
             Some(b"state-bytes".to_vec())
         );
 
-        // The choke point itself yields a usable, committable write transaction
-        // under both scopes — the PR1b no-op fence accepts every guard.
+        // The choke point itself yields a usable, committable write transaction under
+        // both scopes — single-node the registry owns every scope, so the guard
+        // validates and the write is handed out.
         for scope in [
             StateTransferScope::World,
             StateTransferScope::NanoContainer("AGENT-07".to_string()),
         ] {
             let txn = store
-                .begin_fenced_write(&OwnerWriteGuard::unfenced(scope))
+                .begin_fenced_write(&OwnerRegistry::global().issue(scope))
                 .unwrap();
             {
                 let mut table = txn.open_table(AGENT_STATE).unwrap();
