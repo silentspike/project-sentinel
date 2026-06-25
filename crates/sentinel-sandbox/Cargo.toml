@@ -10,6 +10,7 @@ anyhow = { workspace = true }
 landlock = "0.4"
 libc = "0.2"
 sentinel-common = { path = "../sentinel-common" }
+sentinel-fs = { path = "../sentinel-fs" }
 sentinel-zenoh = { path = "../sentinel-zenoh" }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -19,6 +20,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 sentinel-common = { path = "../sentinel-common", features = ["test-util"] }
+tempfile = "3"
 
 [[bin]]
 name = "breakout-helper"

@@ -14,6 +14,7 @@ pub mod cli;
 pub mod commit_scheduler;
 pub mod fuse;
 pub mod gc;
+pub mod home_manifest;
 pub mod ingest;
 pub mod layer;
 pub mod metadata;

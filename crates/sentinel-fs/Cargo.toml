@@ -24,6 +24,7 @@ blake3 = { workspace = true }
 tracing = { workspace = true }
 fuser = { version = "0.17", optional = true }
 libc = { version = "0.2", optional = true }
+rustix = { version = "1", features = ["fs"] }
 zstd = "0.13"
 rayon = { workspace = true }
 io-uring = { version = "0.7", optional = true }
@@ -38,4 +39,8 @@ harness = false
 
 [[bench]]
 name = "snapshot_pin_gc"
+harness = false
+
+[[bench]]
+name = "cas_manifest_savings"
 harness = false

@@ -534,6 +534,9 @@ Invalide = "Invalide"     # German: invalid (capitalized)
 # TOGAF Cluster 12 ADRs (#397) - distributed-systems acronyms
 RTO = "RTO"               # Recovery Time Objective (paired with RPO)
 
+# Issue #500a - rustix open-flag identifier
+WRONLY = "WRONLY"         # rustix OFlags::WRONLY (the O_WRONLY open flag)
+
 [files]
 extend-exclude = [
     "Cargo.lock",
