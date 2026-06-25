@@ -8,7 +8,7 @@ publish = false
 [features]
 default = ["telemetry"]
 telemetry = ["sentinel-telemetry/telemetry"]
-fuse-tests = ["fuser", "libc"]
+fuse-tests = ["fuser"]
 iouring = ["io-uring"]
 
 [dependencies]
@@ -23,7 +23,8 @@ sha2 = { workspace = true }
 blake3 = { workspace = true }
 tracing = { workspace = true }
 fuser = { version = "0.17", optional = true }
-libc = { version = "0.2", optional = true }
+libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
 zstd = "0.13"
 rayon = { workspace = true }
 io-uring = { version = "0.7", optional = true }
