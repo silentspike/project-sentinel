@@ -13,14 +13,19 @@
 //! bare-shell bootstrap (#495) stays on SSH. 0-RTT is off for control (V18).
 
 pub mod cert;
+pub mod client;
 pub mod envelope;
 pub mod handler;
 pub mod idempotency;
+pub mod server;
+pub mod tls;
 
 pub use cert::{CertFingerprint, NodeCertificate};
+pub use client::ControlClient;
 pub use envelope::{
     decode_frame, encode_frame, CodecError, ControlEnvelope, ControlReply, ControlRequest,
     ControlResponse, MAX_FRAME_BYTES,
 };
 pub use handler::{ControlHandler, StubHandler};
 pub use idempotency::IdempotencyCache;
+pub use server::ControlServer;
