@@ -140,8 +140,9 @@ impl StateStore {
     #[instrument(skip(self, state), level = "trace", fields(agent_id = %agent_id))]
     pub fn set_agent_state(&self, agent_id: AgentId, state: &[u8]) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id.to_string())),
+        )?;
         {
             let mut table = write_txn.open_table(AGENT_STATE)?;
             table.insert(agent_id.0, state)?;
@@ -191,8 +192,9 @@ impl StateStore {
     #[instrument(skip(self), level = "trace", fields(agent_id = %agent_id))]
     pub fn delete_agent_state(&self, agent_id: AgentId) -> anyhow::Result<bool> {
         let start = std::time::Instant::now();
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id.to_string())),
+        )?;
         let existed;
         {
             let mut table = write_txn.open_table(AGENT_STATE)?;
@@ -292,8 +294,9 @@ impl StateStore {
     #[instrument(skip(self, data), level = "trace", fields(agent_id = %agent_id))]
     pub fn set_personality(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id.to_string())),
+        )?;
         {
             let mut table = write_txn.open_table(PERSONALITY)?;
             table.insert(agent_id.0, data)?;
@@ -364,8 +367,9 @@ impl StateStore {
 
     /// Set voice style for an agent.
     pub fn set_voice_style(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id.to_string())),
+        )?;
         {
             let mut table = write_txn.open_table(VOICE_STYLE)?;
             table.insert(agent_id.0, data)?;
@@ -385,8 +389,9 @@ impl StateStore {
 
     /// Set behavioral notes for an agent.
     pub fn set_behavioral_notes(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id.to_string())),
+        )?;
         {
             let mut table = write_txn.open_table(BEHAVIORAL_NOTES)?;
             table.insert(agent_id.0, data)?;
@@ -406,8 +411,9 @@ impl StateStore {
 
     /// Set narrative summary for an agent.
     pub fn set_narrative_summary(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id.to_string())),
+        )?;
         {
             let mut table = write_txn.open_table(NARRATIVE_SUMMARY)?;
             table.insert(agent_id.0, data)?;
@@ -425,8 +431,9 @@ impl StateStore {
 
     /// Increment evolution version for an agent, returns the new version.
     pub fn increment_evolution_version(&self, agent_id: AgentId) -> anyhow::Result<u64> {
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id.to_string())),
+        )?;
         let new_version;
         {
             let mut table = write_txn.open_table(EVOLUTION_VERSION)?;
@@ -489,8 +496,9 @@ impl StateStore {
 
     /// Set agent facts (JSON bytes).
     pub fn set_agent_facts(&self, agent_id: AgentId, data: &[u8]) -> anyhow::Result<()> {
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id.to_string())),
+        )?;
         {
             let mut table = write_txn.open_table(AGENT_FACTS)?;
             table.insert(agent_id.0, data)?;
@@ -503,8 +511,9 @@ impl StateStore {
     /// Scores are serialized as JSON array of f64.
     pub fn set_nmda_scores(&self, agent_id: AgentId, scores: &[f64]) -> anyhow::Result<()> {
         let json = serde_json::to_vec(scores)?;
-        let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let write_txn = self.begin_fenced_write(
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id.to_string())),
+        )?;
         {
             let mut table = write_txn.open_table(NMDA_SCORES)?;
             table.insert(agent_id.0, json.as_slice())?;
