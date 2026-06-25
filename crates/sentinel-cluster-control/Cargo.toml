@@ -1,0 +1,22 @@
+[package]
+name = "sentinel-cluster-control"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Cluster-12 cross-node control plane (Phase 3a0, ADR-2): one cert-pinned QUIC
+# control stream carrying request-scoped `ControlEnvelope`s for the owner /
+# provision / GC RPCs. Skeleton — the real handler logic lands in #496/#499.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+rcgen = "0.13"
+
+[dev-dependencies]
+tokio = { workspace = true }

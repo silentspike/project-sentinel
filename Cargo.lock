@@ -4422,6 +4422,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-cluster-control"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "sentinel-common"
 version = "0.1.0"
 dependencies = [
