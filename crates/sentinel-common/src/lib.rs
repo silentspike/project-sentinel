@@ -25,7 +25,10 @@ pub use cluster::{
     PendingBareNode,
 };
 pub use events::{DomainEvent, DomainEventPayload};
-pub use fencing::{OwnerWriteGuard, StaleEpochError};
+pub use fencing::{
+    FencedStore, LocalOwnerRole, LocalOwnerState, OwnerRegistry, OwnerTerm, OwnerWriteGuard,
+    StaleEpochError,
+};
 pub use membership::{
     Heartbeat, IngestOutcome, MembershipConfig, MembershipState, MembershipView, NodeMembership,
 };
