@@ -62,15 +62,19 @@ type claudeCacheControl struct {
 // claudeResponse is the Anthropic Messages API response format.
 type claudeResponse struct {
 	Content    []json.RawMessage `json:"content"`
-	Model      string      `json:"model"`
-	StopReason string      `json:"stop_reason"`
-	Usage      claudeUsage `json:"usage"`
+	Model      string            `json:"model"`
+	StopReason string            `json:"stop_reason"`
+	Usage      claudeUsage       `json:"usage"`
 }
 
-// claudeUsage tracks token usage in the response.
+// claudeUsage tracks token usage in the response. The Anthropic Messages API
+// reports the fresh input separately from cache-read/cache-creation tokens, so
+// #427 cache-aware telemetry keeps them distinct here too.
 type claudeUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
 }
 
 // ClaudeProvider implements Provider for the Anthropic Claude API.
@@ -184,13 +188,20 @@ func (p *ClaudeProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 
 	content := anthropicContentProjection(cResp.Content)
 
+	// Anthropic reports input_tokens as the fresh (non-cached) input; fold the
+	// cache tokens into InputTokens for per-provider counter parity while
+	// preserving the breakdown for #427 cache-aware per-agent telemetry.
+	foldedInput := cResp.Usage.InputTokens + cResp.Usage.CacheReadInputTokens + cResp.Usage.CacheCreationInputTokens
+
 	return &LLMResponse{
 		Content:       content,
 		ContentBlocks: cloneRawMessages(cResp.Content),
 		Model:         cResp.Model,
-		TokensUsed:    cResp.Usage.InputTokens + cResp.Usage.OutputTokens,
-		InputTokens:   cResp.Usage.InputTokens,
+		TokensUsed:    foldedInput + cResp.Usage.OutputTokens,
+		InputTokens:   foldedInput,
 		OutputTokens:  cResp.Usage.OutputTokens,
+		CacheRead:     cResp.Usage.CacheReadInputTokens,
+		CacheCreation: cResp.Usage.CacheCreationInputTokens,
 		FinishReason:  cResp.StopReason,
 	}, nil
 }
