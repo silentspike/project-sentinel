@@ -1,0 +1,29 @@
+[package]
+name = "sentinel-gaia-memory"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Gaia Console Memory graph, rehydration, and crate-local backup tooling"
+
+[[bin]]
+name = "sentinel-gaia-memory"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+bincode = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+redb = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+sentinel-hippocampus = { path = "../sentinel-hippocampus" }
+sentinel-limbo = { path = "../sentinel-limbo" }
+sentinel-projection = { path = "../sentinel-projection" }
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { workspace = true }
