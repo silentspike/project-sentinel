@@ -56,6 +56,13 @@ impl<H: ControlHandler> ControlHandler for BlockMapGossipHandler<H> {
                     .iter()
                     .filter(|adv| map.apply_advertisement(adv))
                     .count();
+                if applied > 0 {
+                    tracing::info!(
+                        applied,
+                        block_count = map.block_count(),
+                        "#498: merged holder gossip into the block map"
+                    );
+                }
                 ControlResponse::HoldersApplied {
                     applied: applied as u32,
                 }
