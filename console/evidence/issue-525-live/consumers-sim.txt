@@ -1,0 +1,7 @@
+## AC-3 consumers + sim
+### nats-bridge /health
+{"status":"ok","service":"sentinel-nats-bridge"}
+### prometheus :9090 sentinel_ count (e)
+271
+### events.db MAX(id) (sim laeuft)
+13418310
