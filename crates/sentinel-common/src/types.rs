@@ -750,6 +750,27 @@ pub struct NanoContainerSnapshot {
     pub cut: SnapshotCut,
 }
 
+impl NanoContainerSnapshot {
+    /// #489/#496 coupling (#8): express this per-container snapshot as a [`FencedStateTransfer`] with
+    /// `scope = NanoContainer(agent)` and the fence epoch from its [`SnapshotCut`]. ECS-native: empty
+    /// CAS manifest, no projection delta / route update yet — the move saga (#501) fills those.
+    pub fn to_fenced_transfer(&self) -> FencedStateTransfer {
+        FencedStateTransfer {
+            scope: StateTransferScope::for_agent(AgentId(self.agent_id).to_string()),
+            owner_epoch: self.cut.owner_epoch,
+            source_cursor: StateTransferCursor {
+                tick: self.captured_at_tick,
+                last_event_id: self.cut.event_cursor,
+            },
+            snapshot_id: format!("nano-{}-t{}", self.agent_id, self.captured_at_tick),
+            cas_manifest: CasManifest::default(),
+            projection_delta: ProjectionDelta::default(),
+            route_update: RouteUpdate::default(),
+            target_cursor: None,
+        }
+    }
+}
+
 /// Scope einer gefenceten State-Transfer-Operation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StateTransferScope {

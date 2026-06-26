@@ -1755,6 +1755,59 @@ pub fn restore_agent_ecs_state(
         .id()
 }
 
+/// #497 (#8): take a per-container snapshot UNDER the #496 owner fence for the agent's
+/// `NanoContainer` scope. Eligibility-gated (#24) — an active container returns its typed
+/// `NotMigratableReason`, never a silent skip. The returned snapshot's `cut.owner_epoch` records the
+/// fence epoch under which every store was read; in single-node mode the fence is a no-op pass (0
+/// `StaleEpoch`), so the single-node prod path is unchanged. The caller gates invocation on the
+/// `per_container_transfer_enabled` flag (default OFF, Strangler).
+pub fn fenced_per_container_snapshot(
+    world: &mut World,
+    agent_id: AgentId,
+) -> Result<sentinel_common::NanoContainerSnapshot, sentinel_common::NotMigratableReason> {
+    use sentinel_common::{MigrationEligibility, OwnerRegistry, StateTransferScope};
+
+    // Bounded-class gate (#24): never migrate an active container.
+    if let MigrationEligibility::NotMigratable(reason) = migration_eligibility(world, agent_id) {
+        return Err(reason);
+    }
+
+    // #496 owner fence for this container's scope (the same scope the redb writers fence under).
+    // In single-node mode issue()/validate() is a no-op pass (0 StaleEpoch).
+    let scope = StateTransferScope::for_agent(agent_id.to_string());
+    let reg = OwnerRegistry::global();
+    let _guard = reg.issue(scope.clone());
+    let owner_epoch = reg.current_owner(&scope).epoch;
+
+    let tick = world
+        .get_resource::<SimulationTime>()
+        .map(|t| t.tick.0)
+        .unwrap_or(0);
+
+    // Fenced reads: ECS subset + (optional) per-agent redb rows.
+    let Some(ecs) = snapshot_agent_ecs_state(world, agent_id) else {
+        return Err(sentinel_common::NotMigratableReason::UnknownAgent);
+    };
+    let redb_rows = world
+        .get_resource::<RedbStateStore>()
+        .and_then(|r| r.store.dump_agent_tables(agent_id).ok())
+        .unwrap_or_default();
+
+    Ok(sentinel_common::NanoContainerSnapshot {
+        agent_id: agent_id.0,
+        captured_at_tick: tick,
+        ecs,
+        redb_rows,
+        fs_subtree: None,
+        cut: sentinel_common::SnapshotCut {
+            owner_epoch,
+            event_cursor: 0,
+            cas_pin_set: Vec::new(),
+            inbound_cursor: None,
+        },
+    })
+}
+
 /// Restored den ECS-Zustand aus einem Snapshot.
 /// Despawnt ALLE bestehenden Agent-Entities und erstellt neue aus dem Snapshot.
 pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnapshot) {
