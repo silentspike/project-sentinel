@@ -19,7 +19,9 @@
 use crate::cluster::NodeId;
 use crate::types::StateTransferScope;
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 /// The committed ownership of a scope: which node owns it, at which monotonic epoch.
 /// Persisted (ADR-3 `CLUSTER_OWNER`) and replicated (PR2b); the in-memory copy here is
@@ -130,14 +132,27 @@ pub enum LocalOwnerRole {
 
 /// Ownership authority: who owns which scope, at which epoch. The seed node ("chef")
 /// is the sole authority that commits ownership (no Raft for agent state; TOGAF
-/// `:2592`). PR2a runs it in single-node mode where the seed owns **every** scope, so
-/// every fenced write passes and live behavior is unchanged; PR2b extends it to
-/// cooperative cross-node handoff over the #569 control stream.
+/// `:2592`). In **single-node mode** the seed owns **every** scope, so every fenced
+/// write passes and live behavior is unchanged. **Cluster mode** (entered the first
+/// time [`commit_owner`](Self::commit_owner) runs — PR2b's cross-node handoff) tracks
+/// the committed per-scope owner terms, and the old owner's guards then turn stale.
+///
+/// **Single-node fast path (V26):** `validate`/`current_owner` sit on the hot path of
+/// every store write. An atomic `mode` flag is loaded `Relaxed` and short-circuits the
+/// `RwLock`/map lookup entirely while single-node — so the prod write path takes **no**
+/// lock and is byte-for-byte the pre-cluster behavior. Only after a real cross-node
+/// commit does `validate` consult the term map under the read lock.
 #[derive(Debug)]
 pub struct OwnerRegistry {
-    /// The node this registry acts for. In PR2a single-node mode it owns every scope;
-    /// PR2b adds the committed per-scope term map + cluster mode for cross-node handoff.
+    /// The node this registry acts for. Single-node: owns every scope at epoch 1.
     this_node: NodeId,
+    /// Ownership mode (`MODE_SINGLE_NODE`/`MODE_CLUSTER`) — the V26 hot-path fast-path
+    /// gate. Flipped to cluster the first time a term is committed; never flipped back
+    /// (a node that has taken part in a handoff stays term-tracked).
+    mode: AtomicU8,
+    /// Committed per-scope owner terms — **only** consulted in cluster mode. Empty
+    /// single-node (the seed synthesizes its ownership without touching this map).
+    terms: RwLock<HashMap<StateTransferScope, OwnerTerm>>,
 }
 
 static GLOBAL: OnceLock<OwnerRegistry> = OnceLock::new();
@@ -146,6 +161,11 @@ static GLOBAL: OnceLock<OwnerRegistry> = OnceLock::new();
 /// cross-node handoff (PR2b) is what advances an epoch and turns old guards stale.
 const SINGLE_NODE_EPOCH: u64 = 1;
 
+/// `mode`: the seed owns every scope; `validate` short-circuits without a lock (V26).
+const MODE_SINGLE_NODE: u8 = 0;
+/// `mode`: at least one cross-node term committed; `validate` consults the term map.
+const MODE_CLUSTER: u8 = 1;
+
 impl OwnerRegistry {
     /// The process-global registry. Defaults to single-node `OwnsAll` with a nil node
     /// id, so any code path (tests, benches, a not-yet-initialized daemon) gets a
@@ -153,19 +173,23 @@ impl OwnerRegistry {
     /// The daemon calls [`init_single_node`](Self::init_single_node) at startup to pin
     /// the real seed identity.
     pub fn global() -> &'static OwnerRegistry {
-        GLOBAL.get_or_init(OwnerRegistry::single_node_default)
+        GLOBAL.get_or_init(|| OwnerRegistry::single_node(NodeId(uuid::Uuid::nil())))
     }
 
     /// Initialize the global registry as the single-node owner with the seed's real
     /// node id. Idempotent-ish: a no-op if the registry was already initialized
     /// (returns whether this call performed the initialization).
     pub fn init_single_node(this_node: NodeId) -> bool {
-        GLOBAL.set(OwnerRegistry { this_node }).is_ok()
+        GLOBAL.set(OwnerRegistry::single_node(this_node)).is_ok()
     }
 
-    fn single_node_default() -> Self {
+    /// A single-node registry: the seed owns every scope at epoch 1, the term map is
+    /// empty and the fast-path mode flag is set, so `validate` takes no lock.
+    fn single_node(this_node: NodeId) -> Self {
         OwnerRegistry {
-            this_node: NodeId(uuid::Uuid::nil()),
+            this_node,
+            mode: AtomicU8::new(MODE_SINGLE_NODE),
+            terms: RwLock::new(HashMap::new()),
         }
     }
 
@@ -174,11 +198,47 @@ impl OwnerRegistry {
         self.this_node
     }
 
-    /// The current committed owner term for a scope. In PR2a single-node mode the seed
-    /// owns every scope at the single-node epoch; PR2b looks up the committed per-scope
-    /// term (falling back to the seed for the `World` scope) once cross-node handoff
-    /// can hand a scope to another node at a higher epoch.
+    /// Whether the registry has entered cluster mode (a cross-node term was committed).
+    /// Single-node prod stays `false`, so the V26 fast path stays active.
+    pub fn is_cluster_mode(&self) -> bool {
+        self.mode.load(Ordering::Relaxed) == MODE_CLUSTER
+    }
+
+    /// Commit a cross-node owner term (PR2b's handoff `OwnerCommit(E+1)`): record it in
+    /// the in-memory term map and switch the registry to cluster mode so `validate`
+    /// consults the map from now on. The old owner's guards for this scope turn stale (a
+    /// higher epoch / different owner is now committed) — the first real cross-node
+    /// reject path (V19). Durable persistence to the dedicated cluster-meta store
+    /// (ADR-3) is the daemon handler's job: the registry in `sentinel-common`
+    /// deliberately holds only the working view (it cannot depend on the redb store it
+    /// is the authority for).
+    pub fn commit_owner(&self, term: OwnerTerm) {
+        // Enter cluster mode *before* publishing the term so no reader can observe the
+        // new term while still on the single-node fast path.
+        self.mode.store(MODE_CLUSTER, Ordering::Relaxed);
+        let mut terms = self.terms.write().expect("owner term map poisoned");
+        terms.insert(term.scope.clone(), term);
+    }
+
+    /// The current committed owner term for a scope. **Single-node fast path (V26):** a
+    /// `Relaxed` load of `mode` short-circuits to the synthesized seed term without ever
+    /// touching the `RwLock` — the prod write path is unchanged. In cluster mode the
+    /// committed per-scope term is looked up under the read lock, falling back to the
+    /// seed (epoch 1) for a scope no handoff has touched yet.
     pub fn current_owner(&self, scope: &StateTransferScope) -> OwnerTerm {
+        if self.mode.load(Ordering::Relaxed) == MODE_SINGLE_NODE {
+            return self.seed_term(scope);
+        }
+        let terms = self.terms.read().expect("owner term map poisoned");
+        terms
+            .get(scope)
+            .cloned()
+            .unwrap_or_else(|| self.seed_term(scope))
+    }
+
+    /// The synthesized seed ownership of `scope`: this node owns it at epoch 1 — the
+    /// default for every scope no cross-node handoff has committed.
+    fn seed_term(&self, scope: &StateTransferScope) -> OwnerTerm {
         OwnerTerm {
             scope: scope.clone(),
             owner_node: self.this_node,
@@ -224,7 +284,8 @@ mod tests {
 
     #[test]
     fn single_node_registry_owns_every_scope() {
-        let reg = OwnerRegistry::single_node_default();
+        let reg = OwnerRegistry::single_node(node(0));
+        assert!(!reg.is_cluster_mode());
         // Issuing for any scope succeeds and the guard validates (0 stale in single-node).
         for scope in [
             StateTransferScope::World,
@@ -240,7 +301,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_stale_epoch_and_wrong_owner() {
-        let reg = OwnerRegistry { this_node: node(1) };
+        let reg = OwnerRegistry::single_node(node(1));
         // A guard from an older epoch (epoch 0 < committed 1) is stale.
         let stale = OwnerWriteGuard::for_test(StateTransferScope::World, node(1), 0);
         let err = reg.validate(&stale).unwrap_err();
@@ -252,6 +313,52 @@ mod tests {
         assert!(reg.validate(&wrong).is_err());
         // The registry's own freshly-issued guard validates.
         assert!(reg.validate(&reg.issue(StateTransferScope::World)).is_ok());
+    }
+
+    /// #496 PR2b-2a: the cross-node term-tracking foundation. Two simulated owners A and
+    /// B; a `commit_owner` (PR2b's `OwnerCommit(E+1)`) hands a scope from A to B and
+    /// turns A's guard stale — the first real cross-node reject path. Single-node stays
+    /// on the lock-free fast path until that commit.
+    #[test]
+    fn commit_owner_enters_cluster_mode_and_turns_old_guard_stale() {
+        let scope = StateTransferScope::NanoContainer("AGENT-07".into());
+
+        // A (this node) single-node: owns every scope, fast path active, guard validates.
+        let a = OwnerRegistry::single_node(node(1));
+        assert!(!a.is_cluster_mode());
+        let a_guard = a.issue(scope.clone()); // A @ epoch 1
+        assert!(a.validate(&a_guard).is_ok());
+
+        // A cooperative handoff commits the scope to B at epoch 2.
+        a.commit_owner(OwnerTerm {
+            scope: scope.clone(),
+            owner_node: node(2), // B
+            epoch: 2,
+        });
+        assert!(a.is_cluster_mode());
+
+        // A's old guard is now stale (different owner AND lower epoch) — V19 reject.
+        let err = a.validate(&a_guard).unwrap_err();
+        assert_eq!(err.guard_epoch, 1);
+        assert_eq!(err.current_epoch, 2);
+        assert_eq!(err.scope, scope);
+
+        // B's registry, after the same commit, issues a guard at epoch 2 that validates.
+        let b = OwnerRegistry::single_node(node(2));
+        b.commit_owner(OwnerTerm {
+            scope: scope.clone(),
+            owner_node: node(2),
+            epoch: 2,
+        });
+        let b_guard = b.issue(scope.clone());
+        assert_eq!(b_guard.epoch(), 2);
+        assert_eq!(b_guard.owner_node(), node(2));
+        assert!(b.validate(&b_guard).is_ok());
+
+        // A scope no handoff has touched falls back to the seed (epoch 1) even in
+        // cluster mode — unmapped scopes default to this node's ownership.
+        let untouched = StateTransferScope::World;
+        assert!(b.validate(&b.issue(untouched)).is_ok());
     }
 
     #[test]

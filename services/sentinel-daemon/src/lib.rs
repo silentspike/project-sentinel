@@ -20,6 +20,7 @@ pub mod llm_bridge;
 pub mod nats_consumer;
 pub mod operator_api;
 pub mod orchestrator;
+pub mod owner_handler;
 pub mod platform_controlplane;
 pub mod provision_exec;
 pub mod query_responder;
