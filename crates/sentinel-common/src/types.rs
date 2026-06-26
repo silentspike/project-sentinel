@@ -916,6 +916,24 @@ pub struct OperatorProvisionCommand {
     pub idempotency_key: String,
 }
 
+/// Operator-triggered cooperative ownership handoff (#496 PR2b-2c): move ownership of
+/// `scope` from its current owner (`source_alias`) to `target_alias`. Seed-only — the
+/// chef drives the V1/V2 saga. Ownership only; per-container state transfer is #497/#501.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorHandoffCommand {
+    /// Canonical scope wire form (`world` / `nano:<id>`).
+    pub scope: String,
+    /// Alias of the current owner (the source). If it is this node's alias the chef
+    /// retires the scope locally; otherwise it sends `PrepareHandoff` over #569.
+    pub source_alias: String,
+    /// Alias of the target node (for #569 routing of `OwnerCommit`).
+    pub target_alias: String,
+    /// The target's node id (the committed new owner term's node).
+    pub target_node_id: String,
+    /// Idempotency key for the control RPCs.
+    pub idempotency_key: String,
+}
+
 /// Apply-Modus fuer Runtime-Config-Apply (#425).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
