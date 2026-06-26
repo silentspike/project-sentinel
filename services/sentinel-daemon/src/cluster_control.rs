@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use sentinel_cluster_control::{
     BlockMapGossipHandler, CertFingerprint, ControlClient, ControlEnvelope, ControlReply,
-    ControlRequest, ControlServer, NodeCertificate, StubHandler,
+    ControlRequest, ControlResponse, ControlServer, NodeCertificate, StubHandler,
 };
 use sentinel_common::cluster::ControlPeer;
 use sentinel_common::{BlockMap, HolderAdvertisement, NodeId};
@@ -159,7 +159,18 @@ impl ClusterControl {
                 },
             );
             match self.client.rpc(peer.addr, peer.fingerprint, &env).await {
-                Ok(_) => delivered += 1,
+                Ok(reply) => {
+                    delivered += 1;
+                    if let ControlResponse::HoldersApplied { applied } = reply.response {
+                        if applied > 0 {
+                            info!(
+                                peer = %peer.alias,
+                                applied,
+                                "#498 block-map gossip delivered (peer newly applied)"
+                            );
+                        }
+                    }
+                }
                 Err(e) => warn!(
                     peer = %peer.alias,
                     error = %e,
