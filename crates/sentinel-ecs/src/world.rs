@@ -722,6 +722,19 @@ impl RoomChatBuffer {
         true
     }
 
+    /// #497 V11: is there active inbound cross-agent traffic directed at this agent? A container
+    /// with active (non-expired) inbound is `NotMigratable` — the durable inbound queue + dedup is
+    /// Track E/H, so Track A excludes it rather than claiming queue semantics.
+    pub fn has_active_inbound(&self, agent_name: &str, current_tick: u64) -> bool {
+        self.messages.values().any(|entries| {
+            entries.iter().any(|e| {
+                current_tick < e.tick + e.ttl_ticks
+                    && e.agent_name != agent_name
+                    && e.addressed_agents.iter().any(|n| n == agent_name)
+            })
+        })
+    }
+
     /// Gibt aktuelle Messages fuer einen Raum zurueck (exkludiert eigene + bereits gehoerte).
     pub fn get_recent(
         &self,
@@ -1552,6 +1565,247 @@ pub fn snapshot_ecs_state(world: &mut World) -> sentinel_common::EcsSnapshot {
             .and_then(|r| serde_json::to_vec(r).ok())
             .unwrap_or_default(),
     }
+}
+
+/// #497: classify whether a container may be per-container migrated (#501) — always a TYPED reason,
+/// never a silent skip. A resting container is `Eligible`; active inbound chat (V11), active
+/// scheduled work (V23) or a pending Voice-of-Gaia thought (V30) make it `NotMigratable`.
+pub fn migration_eligibility(
+    world: &mut World,
+    agent_id: AgentId,
+) -> sentinel_common::MigrationEligibility {
+    use sentinel_common::{MigrationEligibility, NotMigratableReason};
+
+    let tick = world
+        .get_resource::<SimulationTime>()
+        .map(|t| t.tick.0)
+        .unwrap_or(0);
+
+    let name = {
+        let mut q = world.query::<&AgentIdentity>();
+        q.iter(world)
+            .find(|id| id.agent_id == agent_id)
+            .map(|id| id.name.clone())
+    };
+    let Some(name) = name else {
+        return MigrationEligibility::NotMigratable(NotMigratableReason::UnknownAgent);
+    };
+
+    // V11 — active inbound cross-agent chat directed at the agent.
+    if let Some(chat) = world.get_resource::<RoomChatBuffer>() {
+        if chat.has_active_inbound(&name, tick) {
+            return MigrationEligibility::NotMigratable(NotMigratableReason::ActiveInbound);
+        }
+    }
+    // V30 — a pending Voice-of-Gaia thought (delayed external side-effect / impulse).
+    if let Some(gaia) = world.get_resource::<GaiaBuffer>() {
+        if !gaia.get_active(&agent_id, tick).is_empty() {
+            return MigrationEligibility::NotMigratable(NotMigratableReason::PendingSideEffect);
+        }
+    }
+    // V23 — active scheduled work assigned to the agent (a task that is not Done).
+    let has_active_task = {
+        let mut q = world.query::<&sentinel_common::components::TaskState>();
+        q.iter(world)
+            .any(|t| t.assigned_to == agent_id && t.status != sentinel_common::TaskStatus::Done)
+    };
+    if has_active_task {
+        return MigrationEligibility::NotMigratable(NotMigratableReason::ScheduledWorkActive);
+    }
+
+    MigrationEligibility::Eligible
+}
+
+/// #497: snapshot exactly ONE agent's per-agent ECS components into a
+/// [`sentinel_common::NanoContainerEcsSnapshot`].
+///
+/// Returns `None` if no agent with `agent_id` exists. World-scope resources
+/// (chaos/smells/room-chat/gaia/broadcast) are deliberately NOT captured — they belong to the
+/// `World` scope, never to a container (G0 / AC-1). This is the per-container counterpart of the
+/// whole-world [`snapshot_ecs_state`].
+pub fn snapshot_agent_ecs_state(
+    world: &mut World,
+    agent_id: AgentId,
+) -> Option<sentinel_common::NanoContainerEcsSnapshot> {
+    // Main component set (mirrors snapshot_ecs_state's first query; bevy tuple limit = 12).
+    let mut main = None;
+    {
+        let mut query = world.query::<(
+            &AgentIdentity,
+            &Position,
+            &BioState,
+            &Personality,
+            &Mood,
+            &PerceptionState,
+            &WorkContext,
+            &AgentCapabilities,
+            &EventQueue,
+            &ShiftInfo,
+        )>();
+        for (identity, pos, bio, pers, mood, perc, work, caps, events, shift) in query.iter(world) {
+            if identity.agent_id == agent_id {
+                main = Some((
+                    identity.clone(),
+                    pos.clone(),
+                    bio.clone(),
+                    pers.clone(),
+                    mood.clone(),
+                    perc.clone(),
+                    work.clone(),
+                    caps.clone(),
+                    events.clone(),
+                    shift.clone(),
+                ));
+                break;
+            }
+        }
+    }
+    let (
+        identity,
+        position,
+        bio_state,
+        personality,
+        mood,
+        perception_state,
+        work_context,
+        agent_capabilities,
+        event_queue,
+        shift_info,
+    ) = main?;
+
+    // Relationships + LlmConfig (second query — same tuple-limit split as snapshot_ecs_state).
+    let mut rels_llm = None;
+    {
+        let mut q2 = world.query::<(&AgentIdentity, &Relationships, &LlmConfig)>();
+        for (identity2, rels, llm) in q2.iter(world) {
+            if identity2.agent_id == agent_id {
+                rels_llm = Some((rels.clone(), llm.clone()));
+                break;
+            }
+        }
+    }
+    let (relationships, llm_config) = rels_llm?;
+
+    // AutonomyCooldown (separate component; default 0 if the agent has none yet).
+    let mut autonomy_cooldown_last_action_tick = 0u64;
+    {
+        let mut cq = world.query::<(&AgentIdentity, &AutonomyCooldown)>();
+        for (identity3, cd) in cq.iter(world) {
+            if identity3.agent_id == agent_id {
+                autonomy_cooldown_last_action_tick = cd.last_action_tick;
+                break;
+            }
+        }
+    }
+
+    Some(sentinel_common::NanoContainerEcsSnapshot {
+        agent_id: agent_id.0,
+        identity,
+        position,
+        bio_state,
+        personality,
+        mood,
+        perception_state,
+        work_context,
+        agent_capabilities,
+        event_queue,
+        shift_info,
+        relationships,
+        llm_config,
+        autonomy_cooldown_last_action_tick,
+    })
+}
+
+/// #497: restore exactly ONE agent from a [`sentinel_common::NanoContainerEcsSnapshot`].
+///
+/// Despawns only the agent with the snapshot's `agent_id` (no-op if it is not currently spawned)
+/// and respawns it from the captured components — every other agent is untouched and the global
+/// tick keeps running, unlike the whole-world [`restore_ecs_state`] which despawns ALL agents.
+///
+/// The respawned entity gets a NEW `EntityId`. This is safe because cross-agent references are
+/// `agent_id`-based (`Relationships` is `Vec<(AgentId, _)>`; the `all_agents` lookups resolve by
+/// `agent_id`/name), never cached `EntityId`s — so reference-integrity (AC-3b/V12) is resolved
+/// through `agent_id` / the `RouteRegistry`, never a stale local entity handle. Returns the new
+/// entity.
+pub fn restore_agent_ecs_state(
+    world: &mut World,
+    snapshot: &sentinel_common::NanoContainerEcsSnapshot,
+) -> Entity {
+    let agent_id = AgentId(snapshot.agent_id);
+    // Filtered: despawn ONLY this agent (others stay live; no-op if it is not spawned).
+    despawn_agent_from_world(world, agent_id);
+    world
+        .spawn((
+            snapshot.identity.clone(),
+            snapshot.position.clone(),
+            snapshot.bio_state.clone(),
+            snapshot.personality.clone(),
+            snapshot.mood.clone(),
+            snapshot.perception_state.clone(),
+            snapshot.work_context.clone(),
+            snapshot.relationships.clone(),
+            snapshot.llm_config.clone(),
+            snapshot.shift_info.clone(),
+            snapshot.event_queue.clone(),
+            AutonomyCooldown {
+                last_action_tick: snapshot.autonomy_cooldown_last_action_tick,
+            },
+            snapshot.agent_capabilities.clone(),
+        ))
+        .id()
+}
+
+/// #497 (#8): take a per-container snapshot UNDER the #496 owner fence for the agent's
+/// `NanoContainer` scope. Eligibility-gated (#24) — an active container returns its typed
+/// `NotMigratableReason`, never a silent skip. The returned snapshot's `cut.owner_epoch` records the
+/// fence epoch under which every store was read; in single-node mode the fence is a no-op pass (0
+/// `StaleEpoch`), so the single-node prod path is unchanged. The caller gates invocation on the
+/// `per_container_transfer_enabled` flag (default OFF, Strangler).
+pub fn fenced_per_container_snapshot(
+    world: &mut World,
+    agent_id: AgentId,
+) -> Result<sentinel_common::NanoContainerSnapshot, sentinel_common::NotMigratableReason> {
+    use sentinel_common::{MigrationEligibility, OwnerRegistry, StateTransferScope};
+
+    // Bounded-class gate (#24): never migrate an active container.
+    if let MigrationEligibility::NotMigratable(reason) = migration_eligibility(world, agent_id) {
+        return Err(reason);
+    }
+
+    // #496 owner fence for this container's scope (the same scope the redb writers fence under).
+    // In single-node mode issue()/validate() is a no-op pass (0 StaleEpoch).
+    let scope = StateTransferScope::for_agent(agent_id.to_string());
+    let reg = OwnerRegistry::global();
+    let _guard = reg.issue(scope.clone());
+    let owner_epoch = reg.current_owner(&scope).epoch;
+
+    let tick = world
+        .get_resource::<SimulationTime>()
+        .map(|t| t.tick.0)
+        .unwrap_or(0);
+
+    // Fenced reads: ECS subset + (optional) per-agent redb rows.
+    let Some(ecs) = snapshot_agent_ecs_state(world, agent_id) else {
+        return Err(sentinel_common::NotMigratableReason::UnknownAgent);
+    };
+    let redb_rows = world
+        .get_resource::<RedbStateStore>()
+        .and_then(|r| r.store.dump_agent_tables(agent_id).ok())
+        .unwrap_or_default();
+
+    Ok(sentinel_common::NanoContainerSnapshot {
+        agent_id: agent_id.0,
+        captured_at_tick: tick,
+        ecs,
+        redb_rows,
+        fs_subtree: None,
+        cut: sentinel_common::SnapshotCut {
+            owner_epoch,
+            event_cursor: 0,
+            cas_pin_set: Vec::new(),
+            inbound_cursor: None,
+        },
+    })
 }
 
 /// Restored den ECS-Zustand aus einem Snapshot.

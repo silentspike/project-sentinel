@@ -14,6 +14,10 @@ Restart=on-failure
 RestartSec=5
 MemoryMax=256M
 Environment=SENTINEL_BRIDGE_CONFIG=/opt/sentinel/config/nats-bridge.toml
+# #525: loopback-only secure default for the health endpoint (:8083). The bind
+# address is set via [server] health_bind_addr in nats-bridge.toml (loopback by
+# default). Deliberate exposure = override health_bind_addr there; do NOT re-add
+# a 0.0.0.0/wildcard bind. Consistent with the dashboard-backend posture (#474).
 
 # Logging
 StandardOutput=journal

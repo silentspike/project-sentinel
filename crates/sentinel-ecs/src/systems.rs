@@ -67,13 +67,16 @@ pub fn input_system(
     tool_runtime: Option<Res<ToolRuntimeResource>>,
     room_distances: Option<Res<RoomDistanceMap>>,
     _room_physics_state: Option<Res<RoomPhysicsState>>,
-    mut query: Query<(
-        &AgentIdentity,
-        &mut Position,
-        &mut WorkContext,
-        &mut BioState,
-        &AgentCapabilities,
-    )>,
+    mut query: Query<
+        (
+            &AgentIdentity,
+            &mut Position,
+            &mut WorkContext,
+            &mut BioState,
+            &AgentCapabilities,
+        ),
+        Without<Frozen>,
+    >,
     mut event_buffer: ResMut<EventBuffer>,
     time: Res<SimulationTime>,
     mut active_smells: ResMut<super::world::ActiveSmells>,
@@ -357,8 +360,8 @@ pub fn operator_command_system(
     mut active_chaos: ResMut<ActiveChaos>,
     mut active_room_stimuli: ResMut<ActiveRoomStimuli>,
     mut agent_queries: ParamSet<(
-        Query<(&Position, &mut WorkContext)>,
-        Query<(&AgentIdentity, &mut Position, &Personality, &BioState)>,
+        Query<(&Position, &mut WorkContext), Without<Frozen>>,
+        Query<(&AgentIdentity, &mut Position, &Personality, &BioState), Without<Frozen>>,
     )>,
     mut room_chat_buffer: ResMut<super::world::RoomChatBuffer>,
     mut gaia_buffer: ResMut<super::world::GaiaBuffer>,
@@ -819,15 +822,19 @@ pub fn task_progress_system(
 ///
 /// Erzeugt BioStateUpdated DomainEvents alle 20 Ticks (periodischer Snapshot).
 /// Auto-Coffee: Agents trinken automatisch Kaffee wenn Energy < 50 und kein Koffein im System.
+#[allow(clippy::type_complexity)]
 pub fn bio_system(
-    mut query: Query<(
-        &AgentIdentity,
-        &mut BioState,
-        &Personality,
-        &WorkContext,
-        &Position,
-        &Mood,
-    )>,
+    mut query: Query<
+        (
+            &AgentIdentity,
+            &mut BioState,
+            &Personality,
+            &WorkContext,
+            &Position,
+            &Mood,
+        ),
+        Without<Frozen>,
+    >,
     time: Res<SimulationTime>,
     psi: Option<Res<PsiMetrics>>,
     mut event_buffer: ResMut<EventBuffer>,
@@ -1082,7 +1089,7 @@ const ENCOUNTER_AUTO_RESUME_TICKS: u64 = 120;
 /// Erzeugt TransitCompleted DomainEvents bei abgeschlossenem Transit.
 /// Bei `transit_paused` (Encounter): remaining_ms stoppt, Auto-Resume nach 120 Ticks idle.
 pub fn transit_system(
-    mut query: Query<(&AgentIdentity, &mut Position)>,
+    mut query: Query<(&AgentIdentity, &mut Position), Without<Frozen>>,
     time: Res<SimulationTime>,
     mut event_buffer: ResMut<EventBuffer>,
     room_chat_buffer: Res<super::world::RoomChatBuffer>,
@@ -1175,7 +1182,7 @@ const DEFAULT_ROOM_STIMULUS_DURATION_TICKS: u64 = 120;
 /// - `has_deadline`: Nachmittagsdruck 14-17 Uhr
 /// - `has_conflict`: Zerfallender Cooldown nach Chaos-Events (gesetzt im chaos_system)
 pub fn work_context_system(
-    mut agents: Query<(&Position, &mut WorkContext)>,
+    mut agents: Query<(&Position, &mut WorkContext), Without<Frozen>>,
     time: Res<SimulationTime>,
 ) {
     // Raum-Belegung zaehlen (immutabler Pass)
@@ -1320,7 +1327,7 @@ fn inject_chaos_event(
     duration_ticks: u64,
     event_buffer: &mut EventBuffer,
     active_chaos: &mut ActiveChaos,
-    agents: &mut Query<(&Position, &mut WorkContext)>,
+    agents: &mut Query<(&Position, &mut WorkContext), Without<Frozen>>,
     metadata: Option<InjectedChaosMetadata<'_>>,
 ) {
     active_chaos.set(
@@ -1426,7 +1433,7 @@ pub fn chaos_system(
     time: Res<SimulationTime>,
     mut event_buffer: ResMut<EventBuffer>,
     mut active_chaos: ResMut<ActiveChaos>,
-    mut agents: Query<(&Position, &mut WorkContext)>,
+    mut agents: Query<(&Position, &mut WorkContext), Without<Frozen>>,
 ) {
     active_chaos.cleanup(time.tick.0);
 
@@ -1550,7 +1557,7 @@ pub fn chaos_system(
 /// - Valenz (-1 bis +1): gewichtete Kombination aus Energie, Stress, Hunger, Sozialbedarf
 /// - Arousal (0 bis 1): Stress + Koffein + Meeting-Aktivitaet
 /// - Dominante Emotion: Quadranten-Mapping
-pub fn mood_system(mut query: Query<(&BioState, &mut Mood, &WorkContext)>) {
+pub fn mood_system(mut query: Query<(&BioState, &mut Mood, &WorkContext), Without<Frozen>>) {
     for (bio, mut mood, work) in &mut query {
         // Valenz: positiv = gute Energie, wenig Stress
         let energy_factor = (bio.energy - 50.0) / 50.0;
@@ -1597,7 +1604,7 @@ fn valence_arousal_to_emotion(valence: f32, arousal: f32) -> Emotion {
 /// Wandelt numerische Bio/Mood/Position-Werte in natuerlichsprachliche
 /// deutsche Beschreibungen um, die der Agent-LLM als Kontext erhaelt.
 pub fn perception_system(
-    mut query: Query<(&BioState, &Position, &Mood, &mut PerceptionState)>,
+    mut query: Query<(&BioState, &Position, &Mood, &mut PerceptionState), Without<Frozen>>,
     time: Res<SimulationTime>,
     active_smells: Res<super::world::ActiveSmells>,
 ) {
@@ -2123,7 +2130,7 @@ fn focus_hours_since_shift_start(sim_hour: f32, shift: &ShiftInfo) -> f32 {
 /// Nur Agents im selben Raum koennen sich begegnen (30% Wahrscheinlichkeit).
 /// Bei Encounter: transit_paused = true fuer beide Agents.
 pub fn encounter_system(
-    mut query: Query<(Entity, &AgentIdentity, &mut Position)>,
+    mut query: Query<(Entity, &AgentIdentity, &mut Position), Without<Frozen>>,
     time: Res<SimulationTime>,
     mut event_buffer: ResMut<EventBuffer>,
 ) {

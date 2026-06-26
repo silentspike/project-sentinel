@@ -12,6 +12,8 @@ const (
 
 type RuntimeCostStatus struct {
 	ByProvider               map[string]float64 `json:"by_provider"`
+	CostByAgent              map[string]float64 `json:"cost_by_agent"`
+	TokensByAgent            map[string]int64   `json:"tokens_by_agent"`
 	TotalCostUSD             float64            `json:"total_cost_usd"`
 	TotalSavingsUSD          float64            `json:"total_savings_usd"`
 	AverageForwardCostUSD    float64            `json:"average_forward_cost_usd"`
@@ -26,6 +28,8 @@ type runtimeCostTracker struct {
 	mu              sync.Mutex
 	startedAt       time.Time
 	byProvider      map[string]float64
+	byAgent         map[string]float64
+	tokensByAgent   map[string]int64
 	totalCostUSD    float64
 	totalSavingsUSD float64
 	reportedSavings float64
@@ -34,8 +38,10 @@ type runtimeCostTracker struct {
 }
 
 var runtimeCosts = &runtimeCostTracker{
-	startedAt:  time.Now(),
-	byProvider: make(map[string]float64),
+	startedAt:     time.Now(),
+	byProvider:    make(map[string]float64),
+	byAgent:       make(map[string]float64),
+	tokensByAgent: make(map[string]int64),
 }
 
 func RecordRuntimeForwardCost(provider string, inputTokens, outputTokens int) float64 {
@@ -53,6 +59,26 @@ func RecordRuntimeForwardCost(provider string, inputTokens, outputTokens int) fl
 	runtimeCosts.recomputeSavingsLocked()
 	recordCostMetric(provider, cost)
 	return cost
+}
+
+// RecordRuntimeAgentUsage accumulates per-agent cost + token totals for the
+// /control/traffic-stats aggregate (#427 AC-3). The cost is the already-computed
+// per-call cost (parity with the /metrics per-agent cost counter); tokens is the
+// folded input+output. Zero-cost synthesis/apicp calls still register the agent.
+func RecordRuntimeAgentUsage(agentID string, inputTokens, outputTokens int, cost float64) {
+	if agentID == "" {
+		agentID = "unknown"
+	}
+	runtimeCosts.mu.Lock()
+	defer runtimeCosts.mu.Unlock()
+	if runtimeCosts.byAgent == nil {
+		runtimeCosts.byAgent = make(map[string]float64)
+	}
+	if runtimeCosts.tokensByAgent == nil {
+		runtimeCosts.tokensByAgent = make(map[string]int64)
+	}
+	runtimeCosts.byAgent[agentID] += cost
+	runtimeCosts.tokensByAgent[agentID] += int64(inputTokens + outputTokens)
 }
 
 func RecordRuntimeSynthesisSavings() float64 {
@@ -76,6 +102,15 @@ func RuntimeCostSnapshot() RuntimeCostStatus {
 		byProvider[provider] = cost
 	}
 
+	byAgent := make(map[string]float64, len(runtimeCosts.byAgent))
+	for agent, cost := range runtimeCosts.byAgent {
+		byAgent[agent] = cost
+	}
+	tokensByAgent := make(map[string]int64, len(runtimeCosts.tokensByAgent))
+	for agent, tokens := range runtimeCosts.tokensByAgent {
+		tokensByAgent[agent] = tokens
+	}
+
 	var avgForwardCost float64
 	if runtimeCosts.forwardCalls > 0 {
 		avgForwardCost = runtimeCosts.totalCostUSD / float64(runtimeCosts.forwardCalls)
@@ -97,6 +132,8 @@ func RuntimeCostSnapshot() RuntimeCostStatus {
 
 	return RuntimeCostStatus{
 		ByProvider:               byProvider,
+		CostByAgent:              byAgent,
+		TokensByAgent:            tokensByAgent,
 		TotalCostUSD:             runtimeCosts.totalCostUSD,
 		TotalSavingsUSD:          runtimeCosts.totalSavingsUSD,
 		AverageForwardCostUSD:    avgForwardCost,
@@ -138,6 +175,8 @@ func resetRuntimeCostTrackerForTest() {
 
 	runtimeCosts.startedAt = time.Now()
 	runtimeCosts.byProvider = make(map[string]float64)
+	runtimeCosts.byAgent = make(map[string]float64)
+	runtimeCosts.tokensByAgent = make(map[string]int64)
 	runtimeCosts.totalCostUSD = 0
 	runtimeCosts.totalSavingsUSD = 0
 	runtimeCosts.reportedSavings = 0

@@ -18,7 +18,7 @@ fn test_state() -> AppState {
     AppState::new(config).unwrap()
 }
 
-const READ_ROUTES: [&str; 12] = [
+const READ_ROUTES: [&str; 13] = [
     "/api/agents",
     "/api/rooms",
     "/api/rooms/kueche/detail",
@@ -27,6 +27,7 @@ const READ_ROUTES: [&str; 12] = [
     "/api/metrics/pipeline",
     "/api/metrics/tick",
     "/api/tasks",
+    "/api/cost",
     "/api/cockpit",
     "/api/cockpit/incident/test-event",
     "/api/events",
@@ -191,6 +192,13 @@ async fn authed_degraded_routes_return_200_not_503() {
     let (status, alerts) = get_json("/api/control/judge-alerts").await;
     assert_eq!(status, StatusCode::OK, "judge-alerts degradiert mit 200");
     assert_eq!(alerts.as_array().unwrap().len(), 0);
+
+    // #427: cost degrades to empty arrays when projection.db is offline.
+    let (status, cost) = get_json("/api/cost").await;
+    assert_eq!(status, StatusCode::OK, "cost degradiert mit 200");
+    assert_eq!(cost["projection"], "offline");
+    assert_eq!(cost["by_agent"].as_array().unwrap().len(), 0);
+    assert_eq!(cost["time_series"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]

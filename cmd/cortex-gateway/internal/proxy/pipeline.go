@@ -220,6 +220,13 @@ type PipelineResponse struct {
 	Decision   string `json:"decision,omitempty"`
 	Rule       string `json:"rule,omitempty"`
 	FourthWall string `json:"fourth_wall,omitempty"`
+	// #427: cache-aware breakdown + resolved tier + per-call cost, threaded to
+	// the daemon so it can emit the AgentLlmUsage event (the daemon does not know
+	// the EffectiveModel/cost itself). CostUsd is filled at the response sink.
+	CacheRead     int     `json:"cache_read,omitempty"`
+	CacheCreation int     `json:"cache_creation,omitempty"`
+	Tier          string  `json:"tier,omitempty"`
+	CostUsd       float64 `json:"cost_usd,omitempty"`
 }
 
 // NewPipelineHandler erstellt den Pipeline-Handler.
@@ -440,6 +447,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 						Model:        "sentinel-synth-v1",
 						Provider:     "intercept",
 						Decision:     "dropped",
+						Tier:         "intercept",
 						TokensUsed:   0,
 						FinishReason: "dropped",
 						Actions:      nil,
@@ -478,6 +486,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 					Model:        "sentinel-synth-v1",
 					Provider:     "synthesis",
 					Decision:     "synthesize",
+					Tier:         "synthesis",
 					Rule:         result.Rule,
 					FourthWall:   "clean",
 					TokensUsed:   0,
@@ -515,6 +524,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 							Model:        "sentinel-apicp-v1",
 							Provider:     "intercept",
 							Decision:     "dropped",
+							Tier:         "intercept",
 							TokensUsed:   0,
 							FinishReason: "dropped",
 							Actions:      nil,
@@ -548,6 +558,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 						Model:        "sentinel-apicp-v1",
 						Provider:     "apicp",
 						Decision:     "apicp",
+						Tier:         "apicp",
 						Rule:         learned.Fingerprint,
 						TokensUsed:   0,
 						InputTokens:  0,
@@ -700,6 +711,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 			Model:        resp.Model,
 			Provider:     "intercept",
 			Decision:     "dropped",
+			Tier:         "intercept",
 			TokensUsed:   0,
 			FinishReason: "dropped",
 			Actions:      nil,
@@ -768,6 +780,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		Model:         resp.Model,
 		Provider:      providerName,
 		Decision:      "forward",
+		Tier:          resolveTier(req.EffectiveModel),
+		CacheRead:     resp.CacheRead,
+		CacheCreation: resp.CacheCreation,
 		FourthWall:    fourthWallVerdict,
 		TokensUsed:    resp.TokensUsed,
 		InputTokens:   resp.InputTokens,
@@ -1380,6 +1395,19 @@ func (ph *PipelineHandler) writePipelineResponse(_ context.Context, w http.Respo
 		})
 	}
 
+	// #427: record cache-aware per-agent/tier usage for EVERY response that flows
+	// through this single sink (forward, synthesis, apicp, dropped) — one place,
+	// so the JEDER-Call policy holds. The fresh input is recovered from the folded
+	// InputTokens. CostUsd is computed here and threaded back onto the response so
+	// the daemon can emit the AgentLlmUsage event with the gateway-resolved cost.
+	agentLabel := canonicalAgentID(req.Metadata)
+	rawInput := resp.InputTokens - resp.CacheRead - resp.CacheCreation
+	if rawInput < 0 {
+		rawInput = 0
+	}
+	resp.CostUsd = guardrails.RecordAgentUsage(agentLabel, resp.Tier, resp.Provider, rawInput, resp.OutputTokens, resp.CacheRead, resp.CacheCreation)
+	guardrails.RecordRuntimeAgentUsage(agentLabel, resp.InputTokens, resp.OutputTokens, resp.CostUsd)
+
 	payload := responsePayloadForRequest(req, resp)
 
 	if ph.tickSync != nil && ph.tickSync.Enabled() {
@@ -1423,6 +1451,42 @@ func responsePayloadForRequest(req *LLMRequest, resp PipelineResponse) interface
 		return buildAnthropicMessageResponse(resp)
 	}
 	return resp
+}
+
+// resolveTier maps an effective model name to a #427 cost tier. It is the
+// fallback used until #395 (explicit tier field) is merged. An empty/unknown
+// model resolves to "unknown"; the synthesis/apicp/intercept tiers are set
+// directly at their response sites (no real model is involved there).
+func resolveTier(effectiveModel string) string {
+	m := strings.ToLower(strings.TrimSpace(effectiveModel))
+	switch {
+	case m == "":
+		return "unknown"
+	case strings.Contains(m, "haiku"):
+		return "low"
+	case strings.Contains(m, "sonnet"):
+		return "mid"
+	case strings.Contains(m, "opus"):
+		return "high"
+	default:
+		return "unknown"
+	}
+}
+
+// canonicalAgentID normalizes the request metadata into the "AGENT-NN" label so
+// the /metrics counters, the AgentLlmUsage event and the projection all speak
+// one telemetry language (#429-R3 lesson). Falls back to agent_name, then
+// "unknown" when neither is present (e.g. a direct MITM call without an agent).
+func canonicalAgentID(metadata map[string]string) string {
+	if id := metadata["agent_id"]; id != "" {
+		if n, err := strconv.Atoi(id); err == nil {
+			return fmt.Sprintf("AGENT-%02d", n)
+		}
+	}
+	if name := metadata["agent_name"]; name != "" {
+		return name
+	}
+	return "unknown"
 }
 
 func isAnthropicStreamingRequest(req *LLMRequest) bool {

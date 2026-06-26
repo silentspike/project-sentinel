@@ -83,6 +83,48 @@ CREATE TABLE IF NOT EXISTS kpi_1m (
     updated_at INTEGER NOT NULL
 )";
 
+// #427: per-agent / per-tier / per-minute cost+token read-models. Aggregated from
+// AgentLlmUsage events by CostHandler; the dashboard reads these read-only (1:n — the
+// cost info lives once as the event sequence, the projection is its materialized view).
+const CREATE_COST_BY_AGENT: &str = "
+CREATE TABLE IF NOT EXISTS cost_by_agent (
+    agent_id TEXT PRIMARY KEY,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read INTEGER NOT NULL DEFAULT 0,
+    cache_creation INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0.0,
+    call_count INTEGER NOT NULL DEFAULT 0,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+)";
+
+const CREATE_COST_BY_TIER: &str = "
+CREATE TABLE IF NOT EXISTS cost_by_tier (
+    tier TEXT PRIMARY KEY,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read INTEGER NOT NULL DEFAULT 0,
+    cache_creation INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0.0,
+    call_count INTEGER NOT NULL DEFAULT 0,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+)";
+
+const CREATE_COST_TIMESERIES: &str = "
+CREATE TABLE IF NOT EXISTS cost_timeseries (
+    bucket_start INTEGER PRIMARY KEY,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read INTEGER NOT NULL DEFAULT 0,
+    cache_creation INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0.0,
+    call_count INTEGER NOT NULL DEFAULT 0,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+)";
+
 const CREATE_TASK_KANBAN: &str = "
 CREATE TABLE IF NOT EXISTS task_kanban (
     task_id INTEGER PRIMARY KEY,
@@ -107,6 +149,7 @@ const CREATE_WATERMARK_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS idx_agent_live_view_last_event_id ON agent_live_view(last_event_id);
 CREATE INDEX IF NOT EXISTS idx_room_live_view_last_event_id ON room_live_view(last_event_id);
 CREATE INDEX IF NOT EXISTS idx_kpi_1m_last_event_id ON kpi_1m(last_event_id);
+CREATE INDEX IF NOT EXISTS idx_cost_by_agent_last_event_id ON cost_by_agent(last_event_id);
 ";
 
 const PROJECTION_NAME: &str = "sentinel-projection";
@@ -134,6 +177,9 @@ impl ReadModelStore {
         conn.execute_batch(CREATE_AGENT_LIVE_VIEW)?;
         conn.execute_batch(CREATE_ROOM_LIVE_VIEW)?;
         conn.execute_batch(CREATE_KPI_1M)?;
+        conn.execute_batch(CREATE_COST_BY_AGENT)?;
+        conn.execute_batch(CREATE_COST_BY_TIER)?;
+        conn.execute_batch(CREATE_COST_TIMESERIES)?;
         conn.execute_batch(CREATE_TASK_KANBAN)?;
         conn.execute_batch(CREATE_PROJECTION_WATERMARKS)?;
         conn.execute_batch(CREATE_WATERMARK_INDEXES)?;
@@ -276,6 +322,9 @@ impl ReadModelStore {
             "DELETE FROM agent_live_view;
              DELETE FROM room_live_view;
              DELETE FROM kpi_1m;
+             DELETE FROM cost_by_agent;
+             DELETE FROM cost_by_tier;
+             DELETE FROM cost_timeseries;
              DELETE FROM projection_watermarks;",
         )?;
         info!("All read model tables cleared");
@@ -450,6 +499,64 @@ impl ReadModelStore {
             agents.push(row?);
         }
         Ok(agents)
+    }
+}
+
+/// #427: eine Zeile aus einer der drei Cost-Read-Models. `key` ist die agent_id
+/// ("AGENT-NN"), der Tier-Name oder der Minuten-Bucket-Start (als String).
+#[derive(Debug, Clone)]
+pub struct CostRow {
+    pub key: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read: i64,
+    pub cache_creation: i64,
+    pub cost_usd: f64,
+    pub call_count: i64,
+}
+
+impl ReadModelStore {
+    fn read_cost_table(&self, table: &str, key_col: &str) -> anyhow::Result<Vec<CostRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let sql = format!(
+            "SELECT CAST({key_col} AS TEXT), input_tokens, output_tokens, cache_read, \
+             cache_creation, cost_usd, call_count FROM {table} ORDER BY {key_col}"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(CostRow {
+                key: row.get(0)?,
+                input_tokens: row.get(1)?,
+                output_tokens: row.get(2)?,
+                cache_read: row.get(3)?,
+                cache_creation: row.get(4)?,
+                cost_usd: row.get(5)?,
+                call_count: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Kosten/Tokens aggregiert pro Agent ("AGENT-NN").
+    pub fn cost_by_agent(&self) -> anyhow::Result<Vec<CostRow>> {
+        self.read_cost_table("cost_by_agent", "agent_id")
+    }
+
+    /// Kosten/Tokens aggregiert pro Model-Tier.
+    pub fn cost_by_tier(&self) -> anyhow::Result<Vec<CostRow>> {
+        self.read_cost_table("cost_by_tier", "tier")
+    }
+
+    /// Kosten/Tokens als Minuten-Zeitreihe (aufsteigend nach Bucket-Start).
+    pub fn cost_timeseries(&self) -> anyhow::Result<Vec<CostRow>> {
+        self.read_cost_table("cost_timeseries", "bucket_start")
     }
 }
 
@@ -939,6 +1046,86 @@ impl<'a> ReadModelTransaction<'a> {
             .execute(&sql, params![bucket_start as i64, row_id, now_ms()])?;
         Ok(())
     }
+
+    /// #427: aggregiert einen LLM-Call (cache-aware) in die drei Cost-Read-Models
+    /// (cost_by_agent / cost_by_tier / cost_timeseries). Idempotent via
+    /// `WHERE excluded.last_event_id > <table>.last_event_id` — ein erneut verarbeitetes
+    /// Event (z.B. nach Restart) zaehlt NICHT doppelt.
+    pub fn record_llm_cost(&self, u: &LlmCostUpdate<'_>, row_id: i64) -> anyhow::Result<()> {
+        let now = now_ms();
+        let bucket_start = ((u.bucket_ms / 60_000) * 60_000) as i64;
+        self.guard.execute(
+            &cost_upsert_sql("cost_by_agent", "agent_id"),
+            params![
+                u.agent_id,
+                u.input_tokens,
+                u.output_tokens,
+                u.cache_read,
+                u.cache_creation,
+                u.cost_usd,
+                row_id,
+                now
+            ],
+        )?;
+        self.guard.execute(
+            &cost_upsert_sql("cost_by_tier", "tier"),
+            params![
+                u.tier,
+                u.input_tokens,
+                u.output_tokens,
+                u.cache_read,
+                u.cache_creation,
+                u.cost_usd,
+                row_id,
+                now
+            ],
+        )?;
+        self.guard.execute(
+            &cost_upsert_sql("cost_timeseries", "bucket_start"),
+            params![
+                bucket_start,
+                u.input_tokens,
+                u.output_tokens,
+                u.cache_read,
+                u.cache_creation,
+                u.cost_usd,
+                row_id,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+/// #427: Aggregations-Eingabe fuer einen einzelnen LLM-Call (cache-aware).
+pub struct LlmCostUpdate<'a> {
+    pub agent_id: &'a str,
+    pub tier: &'a str,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_read: u32,
+    pub cache_creation: u32,
+    pub cost_usd: f64,
+    pub bucket_ms: u64,
+}
+
+/// Baut das idempotente Cost-Upsert-SQL fuer eine der drei Cost-Tabellen. Die
+/// Wert-Spalten sind identisch; nur Tabellenname + Key-Spalte unterscheiden sich.
+fn cost_upsert_sql(table: &str, key_col: &str) -> String {
+    format!(
+        "INSERT INTO {table} ({key_col}, input_tokens, output_tokens, cache_read, cache_creation, cost_usd, call_count, last_event_id, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)
+         ON CONFLICT({key_col}) DO UPDATE SET
+           input_tokens = input_tokens + excluded.input_tokens,
+           output_tokens = output_tokens + excluded.output_tokens,
+           cache_read = cache_read + excluded.cache_read,
+           cache_creation = cache_creation + excluded.cache_creation,
+           cost_usd = cost_usd + excluded.cost_usd,
+           call_count = call_count + 1,
+           last_event_id = excluded.last_event_id,
+           updated_at = excluded.updated_at
+         WHERE excluded.last_event_id > {table}.last_event_id"
+    )
 }
 
 /// Bio-State Update fuer einen Agenten.
@@ -974,6 +1161,8 @@ fn bootstrap_projection_watermark(conn: &Connection) -> anyhow::Result<()> {
            SELECT MAX(last_event_id) as m FROM room_live_view
            UNION ALL
            SELECT MAX(last_event_id) as m FROM kpi_1m
+           UNION ALL
+           SELECT MAX(last_event_id) as m FROM cost_by_agent
          )",
         [],
         |row| row.get(0),

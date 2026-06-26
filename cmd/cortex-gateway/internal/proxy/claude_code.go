@@ -275,19 +275,25 @@ func (p *ClaudeCodeProvider) parseOutputStream(r io.Reader) (*LLMResponse, error
 			if event.IsError {
 				return nil, fmt.Errorf("claude-code result error: %s", event.Result)
 			}
-			// Extract token usage from the result event
-			var inputTokens, outputTokens int
+			// Extract token usage from the result event. InputTokens stays the
+			// folded total (fresh + cache) for per-provider counter parity; the
+			// cache breakdown is carried separately for #427 cache-aware telemetry.
+			var inputTokens, outputTokens, cacheRead, cacheCreation int
 			if event.Usage != nil {
-				inputTokens = event.Usage.InputTokens + event.Usage.CacheReadInputTokens + event.Usage.CacheCreationInputTokens
+				cacheRead = event.Usage.CacheReadInputTokens
+				cacheCreation = event.Usage.CacheCreationInputTokens
+				inputTokens = event.Usage.InputTokens + cacheRead + cacheCreation
 				outputTokens = event.Usage.OutputTokens
 			}
 			// Result is the final event, stop reading
 			return &LLMResponse{
-				Content:      strings.Join(contentParts, ""),
-				FinishReason: finishReason,
-				InputTokens:  inputTokens,
-				OutputTokens: outputTokens,
-				TokensUsed:   inputTokens + outputTokens,
+				Content:       strings.Join(contentParts, ""),
+				FinishReason:  finishReason,
+				InputTokens:   inputTokens,
+				OutputTokens:  outputTokens,
+				CacheRead:     cacheRead,
+				CacheCreation: cacheCreation,
+				TokensUsed:    inputTokens + outputTokens,
 			}, nil
 		}
 	}

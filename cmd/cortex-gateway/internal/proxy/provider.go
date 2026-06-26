@@ -58,6 +58,12 @@ type SystemBlock struct {
 }
 
 // LLMResponse represents a response from an LLM provider.
+//
+// InputTokens is the folded input total (fresh + cache-read + cache-creation)
+// for backward compatibility with the per-provider counters. CacheRead and
+// CacheCreation carry the cache breakdown separately so #427 per-agent/tier
+// telemetry can report cache-aware directions (the fresh input is recovered as
+// InputTokens - CacheRead - CacheCreation).
 type LLMResponse struct {
 	Content       string            `json:"content"`
 	ContentBlocks []json.RawMessage `json:"-"`
@@ -65,6 +71,8 @@ type LLMResponse struct {
 	TokensUsed    int               `json:"tokens_used"`
 	InputTokens   int               `json:"input_tokens"`
 	OutputTokens  int               `json:"output_tokens"`
+	CacheRead     int               `json:"cache_read"`
+	CacheCreation int               `json:"cache_creation"`
 	FinishReason  string            `json:"finish_reason"`
 }
 

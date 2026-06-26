@@ -517,6 +517,78 @@ mod tests {
         );
     }
 
+    fn llm_usage_event(tick: u64, agent: u16) -> DomainEvent {
+        let payload = serde_json::json!({
+            "type": "AgentLlmUsage",
+            "agent_id": agent,
+            "tier": "high",
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "cache_read": 200,
+            "cache_creation": 100,
+            "cost_usd": 0.0195,
+        });
+        DomainEvent::new(
+            "agent_llm_usage",
+            &format!("AGENT-{agent:02}"),
+            &payload.to_string(),
+            "corr-llm",
+            tick,
+        )
+    }
+
+    #[test]
+    fn replay_neutral_to_interleaved_agent_llm_usage() {
+        // Teil 7.1 (#427, load-bearing #491): agent_llm_usage is projection-only and MUST NOT be
+        // reconstructed as a replay input. NON-tautological: the live forward truth uses a CLEAN
+        // log (no agent_llm_usage), while the replay uses a log with agent_llm_usage interleaved
+        // across the (anchor, target] range. A reconstruct_inputs that wrongly applied
+        // agent_llm_usage would add inputs and shift the replayed ECS hash away from the clean
+        // forward hash, failing this test.
+        let anchor_tick = 20u64;
+        let target_tick = 60u64;
+
+        let clean: Vec<DomainEvent> = vec![
+            action_event(10, 1, "Move", "kueche"),
+            action_event(25, 2, "Chat", "empfang"),
+            action_event(40, 3, "Move", "flur-eg"),
+            action_event(55, 1, "Chat", "kueche"),
+        ];
+        let mut polluted = clean.clone();
+        polluted.push(llm_usage_event(22, 1));
+        polluted.push(llm_usage_event(40, 2)); // same tick as a real action
+        polluted.push(llm_usage_event(58, 3));
+        polluted.sort_by_key(|e| e.tick); // mimic the ORDER BY id range order
+
+        // Direct proof: interleaving agent_llm_usage adds zero replay inputs.
+        assert_eq!(
+            reconstruct_inputs(&polluted).len(),
+            reconstruct_inputs(&clean).len(),
+            "agent_llm_usage must contribute no replay input"
+        );
+
+        // Ground truth: CLEAN live forward to target.
+        let (mut w, mut sched) = world_with_agents(4);
+        run_ticks(&mut w, &mut sched, &clean, 0, anchor_tick);
+        let anchor = snapshot_ecs_state(&mut w);
+        run_ticks(&mut w, &mut sched, &clean, anchor_tick, target_tick);
+        let live = state_hashes(&mut w).strict;
+
+        // Replay with agent_llm_usage injected into the (anchor, target] range.
+        let (mut w2, mut sched2) = world_with_agents(4);
+        run_ticks(&mut w2, &mut sched2, &clean, 0, anchor_tick);
+        restore_ecs_state(&mut w2, &anchor);
+        let report = run_bounded_replay(&mut w2, &mut sched2, &polluted, anchor_tick, target_tick)
+            .expect("replay");
+        let replayed = state_hashes(&mut w2).strict;
+
+        assert_eq!(report.ticks_replayed, target_tick - anchor_tick);
+        assert_eq!(
+            live, replayed,
+            "agent_llm_usage interleaved in the replay range must not shift the ECS hash"
+        );
+    }
+
     #[test]
     fn replay_reproduces_anchor_delta_at_nonunit_time_scale() {
         // #530: bei time_scale != 1.0 (hier delta_seconds=2.0) muss restore(anchor)+replay den
