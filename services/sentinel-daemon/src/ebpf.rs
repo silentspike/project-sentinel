@@ -414,8 +414,9 @@ mod tests {
         drop(reserve);
         let bind_addr = format!("127.0.0.1:{port}");
 
-        let metrics_text: Arc<RwLock<String>> =
-            Arc::new(RwLock::new("# test\nsentinel_loopback_probe 1\n".to_string()));
+        let metrics_text: Arc<RwLock<String>> = Arc::new(RwLock::new(
+            "# test\nsentinel_loopback_probe 1\n".to_string(),
+        ));
         let server_text = Arc::clone(&metrics_text);
         let handle = tokio::spawn(async move { prometheus_server(server_text, bind_addr).await });
 
@@ -426,10 +427,13 @@ mod tests {
             .await
             .expect("Prometheus loopback listener erreichbar");
         let mut buf = Vec::new();
-        tokio::time::timeout(std::time::Duration::from_secs(2), stream.read_to_end(&mut buf))
-            .await
-            .expect("read innerhalb timeout")
-            .expect("response gelesen");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut buf),
+        )
+        .await
+        .expect("read innerhalb timeout")
+        .expect("response gelesen");
 
         let resp = String::from_utf8_lossy(&buf);
         assert!(resp.starts_with("HTTP/1.1 200"), "response = {resp}");
