@@ -377,7 +377,11 @@ mod tests {
         assert_eq!(map.holders(&blob(7)), map.holders(&blob(7)));
         let mut sorted = map.holders(&blob(7));
         sorted.sort();
-        assert_eq!(map.holders(&blob(7)), sorted, "holders come back NodeId-sorted");
+        assert_eq!(
+            map.holders(&blob(7)),
+            sorted,
+            "holders come back NodeId-sorted"
+        );
     }
 
     // ── V16 conflict resolution ─────────────────

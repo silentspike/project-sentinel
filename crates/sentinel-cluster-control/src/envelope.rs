@@ -55,7 +55,9 @@ pub enum ControlRequest {
     /// #498 V8/V16: push a batch of holder advertisements (block-map gossip). The
     /// receiver merges them into its block map by the conflict-free freshness rule.
     /// Metadata only — block bytes never travel on the control stream (AC-4).
-    AdvertiseHolders { advertisements: Vec<HolderAdvertisement> },
+    AdvertiseHolders {
+        advertisements: Vec<HolderAdvertisement>,
+    },
 }
 
 impl ControlRequest {

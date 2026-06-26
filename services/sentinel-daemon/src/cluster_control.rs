@@ -104,7 +104,10 @@ impl ClusterControl {
                 bind_addr,
                 &node,
                 pins,
-                Arc::new(BlockMapGossipHandler::new(Arc::clone(&block_map), StubHandler)),
+                Arc::new(BlockMapGossipHandler::new(
+                    Arc::clone(&block_map),
+                    StubHandler,
+                )),
             )?,
         };
         let client = ControlClient::new(&node)?;
@@ -234,6 +237,9 @@ pub async fn run_cas_gossip_republish(
                 None => break,
             }
         }
-        debug!(round, advertised, "#498 CAS gossip republish round complete");
+        debug!(
+            round,
+            advertised, "#498 CAS gossip republish round complete"
+        );
     }
 }

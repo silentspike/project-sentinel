@@ -20,9 +20,7 @@ use uuid::Uuid;
 /// `Ord`/`PartialOrd` (over the underlying `Uuid`'s total order) exist so N-node
 /// sets/maps iterate deterministically — never rely on `HashMap` order in cluster
 /// state (avoids order-dependent flakiness; same lesson as the determinism hash).
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub Uuid);
 
 impl NodeId {
