@@ -1062,11 +1062,18 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 })
                 .unwrap_or(false);
             // "Would this node's own write to the scope validate?" — Ok iff this node owns
-            // it and has not locally retired it (V19 term + V4 local fence).
+            // it and has not locally retired it (V19 term + V4 local fence). An optional
+            // `guard_epoch` validates a guard *minted earlier* at that epoch — the V19
+            // commit-recheck / TOCTOU probe: a guard valid when it was issued is caught
+            // stale after a cross-node handoff advanced the committed epoch.
+            let guard_epoch = body
+                .get("guard_epoch")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(term.epoch);
             let probe = reg.validate(&sentinel_common::OwnerWriteGuard::for_test(
                 scope.clone(),
                 this,
-                term.epoch,
+                guard_epoch,
             ));
             json_response(
                 200,
@@ -1075,6 +1082,7 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                     "this_node": this.to_string(),
                     "owner_node": term.owner_node.to_string(),
                     "epoch": term.epoch,
+                    "guard_epoch": guard_epoch,
                     "is_owner": is_owner,
                     "local_retired": local_retired,
                     "own_write_validates": probe.is_ok(),
