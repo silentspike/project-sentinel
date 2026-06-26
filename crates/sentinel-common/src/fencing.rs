@@ -18,12 +18,14 @@
 
 use crate::cluster::NodeId;
 use crate::types::StateTransferScope;
+use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
 /// The committed ownership of a scope: which node owns it, at which monotonic epoch.
 /// Persisted (ADR-3 `CLUSTER_OWNER`) and replicated (PR2b); the in-memory copy here is
-/// the registry's working view.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// the registry's working view. `Serialize`/`Deserialize` so the dedicated cluster-meta
+/// store can persist it durably across restarts (PR2b-1c).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerTerm {
     pub scope: StateTransferScope,
     pub owner_node: NodeId,
