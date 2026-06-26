@@ -187,6 +187,13 @@ impl ControlHandler for OwnerControlHandler {
                 block_ref: block_ref.clone(),
                 pinned: false,
             },
+
+            // #498 holder gossip is intercepted by the BlockMapGossipHandler wrapper
+            // before it reaches this owner handler. Reaching here means it was wired
+            // without the wrapper — reject (typed, never panic) rather than silently drop.
+            ControlRequest::AdvertiseHolders { .. } => ControlResponse::Rejected {
+                reason: "holder gossip must be handled by the BlockMapGossipHandler wrapper".into(),
+            },
         }
     }
 }

@@ -59,13 +59,20 @@ impl CasHolderState {
         }
     }
 
-    /// Rebuild the inventory from the blobs that durably survived on disk (startup /
-    /// V28 reconcile). Incomplete temp writes are skipped by [`CasStore::list_block_refs`].
+    /// Rebuild the inventory to exactly the blobs that durably survive on disk (startup
+    /// / V28 reconcile, and the periodic republish). Incomplete temp writes are skipped
+    /// by [`CasStore::list_block_refs`].
+    ///
+    /// This **replaces** the inventory, so a blob deleted since the last rebuild drops
+    /// out (the node stops advertising it; any peer's stale `Add` is V8-safe over-advertise
+    /// — a failed pull just tries another holder — and expires via `expires_after`).
     pub fn rebuild(&mut self, store: &CasStore) -> anyhow::Result<()> {
         let generation = self.next_generation();
+        let mut fresh = CasInventory::new();
         for block_ref in store.list_block_refs()? {
-            self.inventory.insert(block_ref, generation);
+            fresh.insert(block_ref, generation);
         }
+        self.inventory = fresh;
         Ok(())
     }
 
