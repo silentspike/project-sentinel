@@ -4,6 +4,7 @@
 //! stream, reusing the dashboard `wt.rs` u32-BE length-prefixed frame format. The
 //! `idempotency_key` makes a re-sent RPC an exactly-once effect (V5/V39).
 
+use sentinel_common::HolderAdvertisement;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -51,6 +52,12 @@ pub enum ControlRequest {
     RefQuery { block_ref: String },
     /// V20: does any node pin this block? (GC pin query)
     PinQuery { block_ref: String },
+    /// #498 V8/V16: push a batch of holder advertisements (block-map gossip). The
+    /// receiver merges them into its block map by the conflict-free freshness rule.
+    /// Metadata only — block bytes never travel on the control stream (AC-4).
+    AdvertiseHolders {
+        advertisements: Vec<HolderAdvertisement>,
+    },
 }
 
 impl ControlRequest {
@@ -62,6 +69,7 @@ impl ControlRequest {
             Self::OwnerCommit { .. } => "owner_commit",
             Self::RefQuery { .. } => "ref_query",
             Self::PinQuery { .. } => "pin_query",
+            Self::AdvertiseHolders { .. } => "advertise_holders",
         }
     }
 }
@@ -96,6 +104,11 @@ pub enum ControlResponse {
     PinQueryResult {
         block_ref: String,
         pinned: bool,
+    },
+    /// #498: how many of the pushed advertisements were newly applied (strictly newer
+    /// than the receiver already knew) — the rest were stale/duplicate no-ops.
+    HoldersApplied {
+        applied: u32,
     },
     /// Typed reject (unknown/unsupported request, auth failure, or handler error).
     Rejected {
@@ -182,6 +195,30 @@ mod tests {
         let frame = encode_frame(&reply).unwrap();
         let back: ControlReply = decode_frame(&frame).unwrap();
         assert_eq!(reply, back);
+    }
+
+    #[test]
+    fn advertise_holders_frame_roundtrip() {
+        use sentinel_common::{BlockRef, HolderAction, HolderAdvertisement, NodeId};
+        let adv = HolderAdvertisement {
+            block_ref: BlockRef::blob_sha256([7; 32], 2048),
+            node_id: NodeId::new(),
+            node_boot_id: Uuid::new_v4(),
+            node_incarnation: 2,
+            node_cas_generation: 9,
+            action: HolderAction::Add,
+            expires_after: u64::MAX,
+        };
+        let env = ControlEnvelope::new(
+            "idem-adv",
+            ControlRequest::AdvertiseHolders {
+                advertisements: vec![adv],
+            },
+        );
+        assert_eq!(env.request.method_name(), "advertise_holders");
+        let frame = encode_frame(&env).unwrap();
+        let back: ControlEnvelope = decode_frame(&frame).unwrap();
+        assert_eq!(env, back, "holder gossip survives the wire codec");
     }
 
     #[test]

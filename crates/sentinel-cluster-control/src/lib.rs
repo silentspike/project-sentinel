@@ -26,6 +26,6 @@ pub use envelope::{
     decode_frame, encode_frame, CodecError, ControlEnvelope, ControlReply, ControlRequest,
     ControlResponse, MAX_FRAME_BYTES,
 };
-pub use handler::{ControlHandler, StubHandler};
+pub use handler::{BlockMapGossipHandler, ControlHandler, StubHandler};
 pub use idempotency::IdempotencyCache;
 pub use server::ControlServer;

@@ -177,6 +177,52 @@ impl CasStore {
     pub fn cas_dir(&self) -> &Path {
         &self.cas_dir
     }
+
+    /// List every durably-stored blob as a [`BlockRef`](sentinel_common::BlockRef)
+    /// (namespace `Blob`, SHA-256). Used at startup (#498 / V28 reconcile) to rebuild
+    /// this node's holder advertisements from the files that actually survived on disk.
+    ///
+    /// In-progress `.tmp` writes are skipped (an incomplete blob is not a holder). The
+    /// original (uncompressed) content size — the V7 identity component — is recovered
+    /// by decoding each blob, so an advertised `BlockRef` matches the one a `store`
+    /// produced.
+    pub fn list_block_refs(&self) -> anyhow::Result<Vec<sentinel_common::BlockRef>> {
+        let mut refs = Vec::new();
+        if !self.cas_dir.exists() {
+            return Ok(refs);
+        }
+        for shard in fs::read_dir(&self.cas_dir)? {
+            let shard = shard?;
+            if !shard.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(prefix) = shard.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if prefix.len() != 2 {
+                continue;
+            }
+            for blob in fs::read_dir(shard.path())? {
+                let blob = blob?;
+                if !blob.file_type()?.is_file() {
+                    continue;
+                }
+                let Some(rest) = blob.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                // Skip in-progress temp writes; a complete blob name is 62 hex chars.
+                if rest.len() != 62 {
+                    continue;
+                }
+                let Some(hash) = hex_decode_32(&format!("{prefix}{rest}")) else {
+                    continue;
+                };
+                let size = self.read(&hash)?.len() as u64;
+                refs.push(sentinel_common::BlockRef::blob_sha256(hash, size));
+            }
+        }
+        Ok(refs)
+    }
 }
 
 /// Encode data as a CAS blob (prefix byte + optional zstd compression).
@@ -235,6 +281,18 @@ pub fn hex_encode(bytes: &[u8]) -> String {
         write!(s, "{byte:02x}").unwrap();
     }
     s
+}
+
+/// Decode a 64-char lowercase hex string into a 32-byte array; `None` if malformed.
+fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 #[cfg(test)]

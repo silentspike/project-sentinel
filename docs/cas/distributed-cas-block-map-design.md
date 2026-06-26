@@ -75,11 +75,9 @@ Two transports exist in the workspace, with different reach **today**:
 - **QUIC control plane (#569):** the only cross-subnet session today; `cluster-control/envelope.rs`
   already sketches `RefQuery { block_ref }` / `PinQuery { block_ref }` request variants.
 
-**Decision: option A.** Gossip the map over **Zenoh** (`sentinel/cluster/blockmap/*`), same-L2 now,
-cross-subnet gated on #495 Phase 2; **plus** an on-demand **L3 `RefQuery` over the QUIC control plane**
-as a point lookup for a specific `BlockRef` when a node's gossiped view is cold or cross-subnet.
+**Original decision: option A (Zenoh).** Superseded at implementation time — see the revision below.
 
-Rationale:
+Original rationale:
 - Zenoh for the map keeps the design **consistent with the architecture target** (the TOGAF Cluster
   view fixes Zenoh as the Rust-side bus; the gossip belongs there, not on the control plane).
 - Multicast/peer pub-sub is the right shape for an eventually-consistent directory; doing the map over
@@ -87,12 +85,22 @@ Rationale:
 - The QUIC `RefQuery` is reused for the **point** case (cold/cross-subnet lookup), which is exactly
   what a request/response control RPC is good at -- no new endpoint.
 
-**Named gate:** cross-subnet map propagation depends on **#495 Phase 2** (`connect`/`endpoints`).
-Until then, the map is fully gossiped only within an L2 segment; cross-subnet nodes rely on the QUIC
-`RefQuery` point lookup. This is the one explicit dependency the implementation must track.
-
-(Option B -- map fully over QUIC-control -- is recorded as the rejected alternative: no Zenoh gate,
-but no multicast and O(N) fanout, and it diverges from the Zenoh-fixed target architecture.)
+> **REVISED (#498 PR1 / 4a implementation) -- option B (QUIC control plane), because option A's
+> premise is false.** Option A assumed "membership rides Zenoh, #495 verified it live". The current
+> code does **not**: `sentinel-zenoh/src/lib.rs::pin_loopback_listen` (#525) pins the Zenoh listener to
+> `tcp/127.0.0.1:0` and its comment states *"there are no cross-process Zenoh peers on the deploy VM
+> (cross-node traffic = QUIC ClusterControl/#569, not Zenoh)"*. So Zenoh reaches **no** other node even
+> same-L2, and the membership heartbeats over Zenoh are effectively loopback (a known code/doc
+> contradiction). Gossiping the map over Zenoh would not cross a host at all.
+>
+> The map gossip therefore rides the **#569 QUIC control stream** (`ControlRequest::AdvertiseHolders
+> { Vec<HolderAdvertisement> }` + a `BlockMapGossipHandler` that merges into a shared `BlockMap`).
+> The original O(N)-unicast-fanout objection stands but is **acceptable** for the current rack-local /
+> small-N target (Track A, 2 nodes); a bounded per-round republish (V25 pagination) caps the cost.
+> The "no Zenoh gate" property is now an **advantage**: AC-4 ("no bytes over Zenoh") holds trivially
+> and stronger — Zenoh is untouched. Re-introducing Zenoh multicast for the map is a future
+> optimization, gated on lifting the #525 loopback pin **and** #495 Phase 2 (`connect`/`endpoints`),
+> not a blocker. Verified live 2-VM (.241/.242): `console/evidence/issue-498-live/block-map-gossip.md`.
 
 ### D4 -- Locator, not liveness (V8 / G7)
 
