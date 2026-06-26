@@ -769,6 +769,27 @@ impl NanoContainerSnapshot {
             target_cursor: None,
         }
     }
+
+    /// #497 AC-5: container-scoped, order-stable hash of the AGENT STATE (ECS components + filtered
+    /// redb rows) — NOT the envelope metadata (`captured_at_tick` / `cut`), which varies by when and
+    /// where the snapshot is taken. Two snapshots of the same resting container (e.g. before and
+    /// after a transfer) therefore hash equal.
+    ///
+    /// Order-stable: the snapshot holds no `HashMap` (the #439 lesson — never iterate a `HashMap` in
+    /// a hash) and `Vec`s keep their order through serialization. Deterministic for the same CPU
+    /// class (the f32 agent state is bit-identical across same-class nodes; AC-DX). A cross-CPU-class
+    /// transfer is still correct (state is copied, not recomputed) but is not asserted by this hash.
+    pub fn state_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_vec(&self.ecs)
+            .unwrap_or_default()
+            .hash(&mut h);
+        serde_json::to_vec(&self.redb_rows)
+            .unwrap_or_default()
+            .hash(&mut h);
+        h.finish()
+    }
 }
 
 /// Scope einer gefenceten State-Transfer-Operation.

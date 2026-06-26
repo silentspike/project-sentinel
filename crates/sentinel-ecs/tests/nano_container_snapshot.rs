@@ -174,3 +174,66 @@ fn reference_integrity_after_restore_via_route_registry() {
     }
     assert_eq!(count, 1);
 }
+
+/// #497 AC-5 (single-machine): the container-scoped state hash survives a serialize -> restore
+/// round-trip — the same bytes a manual file-copy carries between the two test VMs. The 2-VM
+/// version runs this exact path across .241/.242 via the `per_container_transfer` binary.
+#[test]
+fn state_hash_survives_serialize_restore_round_trip() {
+    use sentinel_common::{NanoContainerEcsSnapshot, NanoContainerSnapshot, Tick};
+    use sentinel_ecs::SimulationTime;
+
+    fn envelope(ecs: &NanoContainerEcsSnapshot) -> NanoContainerSnapshot {
+        NanoContainerSnapshot {
+            agent_id: ecs.agent_id,
+            captured_at_tick: 0,
+            ecs: ecs.clone(),
+            redb_rows: Default::default(),
+            fs_subtree: None,
+            cut: Default::default(),
+        }
+    }
+
+    let (mut world, mut sched) = create_simulation_world();
+    spawn_agent(&mut world, AgentId(1), "Alice", "Dev", 1, "buero-dev-1");
+    spawn_agent(&mut world, AgentId(2), "Bob", "Dev", 1, "buero-dev-1");
+    // Drift A into a non-trivial state over a few ticks.
+    let start = world.resource::<SimulationTime>().tick.0;
+    for t in 1..=10u64 {
+        world.resource_mut::<SimulationTime>().tick = Tick(start + t);
+        sched.run(&mut world);
+    }
+
+    let env_a = envelope(&snapshot_agent_ecs_state(&mut world, AgentId(1)).unwrap());
+    let hash_a = env_a.state_hash();
+
+    // Serialize -> (file copy) -> deserialize, then restore into a FRESH world (the "other node").
+    let bytes = serde_json::to_vec(&env_a).unwrap();
+    let env_t: NanoContainerSnapshot = serde_json::from_slice(&bytes).unwrap();
+    let (mut world2, _) = create_simulation_world();
+    restore_agent_ecs_state(&mut world2, &env_t.ecs);
+    let hash_b = envelope(&snapshot_agent_ecs_state(&mut world2, AgentId(1)).unwrap()).state_hash();
+
+    assert_eq!(
+        hash_a, hash_b,
+        "container state-hash must survive serialize -> restore (AC-5)"
+    );
+
+    // Envelope metadata (tick / cut) does not affect the hash — only agent state does.
+    let mut env_meta = env_a.clone();
+    env_meta.captured_at_tick = 999;
+    env_meta.cut.owner_epoch = 42;
+    assert_eq!(
+        env_a.state_hash(),
+        env_meta.state_hash(),
+        "state hash ignores envelope metadata"
+    );
+
+    // A different container hashes differently.
+    let env_bob = envelope(&snapshot_agent_ecs_state(&mut world, AgentId(2)).unwrap());
+    assert_ne!(
+        hash_a,
+        env_bob.state_hash(),
+        "per-container hash distinguishes agents"
+    );
+}
