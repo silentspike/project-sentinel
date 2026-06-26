@@ -1,6 +1,9 @@
 package synthesis
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
 
 func TestParseFingerprint(t *testing.T) {
 	fp, err := Parse("H3|E7|B2|S4|C1|SN5|R:buero-dev-1|P:2|CH:0|HR:0|T:10|TMP:1|PE:E|IM:0")
@@ -343,4 +346,89 @@ func findActionTarget(actions []Action, actionType string) string {
 		}
 	}
 	return ""
+}
+
+// #429: per-rule live toggle is effective in Decide.
+func TestPerRuleToggleAffectsDecide(t *testing.T) {
+	// H9, P:0 -> bio_hunger by default (it precedes the routine catch-all rules).
+	meta := testMetadata("H9|E5|B3|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0", map[string]string{
+		"agent_id":         "5",
+		"personality_type": "I",
+	})
+	engine := NewEngine(true, nil)
+
+	if got := engine.Decide(meta, "AGENT-TEST"); got.Decision != Synthesize || got.Rule != "bio_hunger" {
+		t.Fatalf("default: decision=%v rule=%q, want Synthesize/bio_hunger", got.Decision, got.Rule)
+	}
+
+	// Disabling bio_hunger makes the engine skip it; the next matching rule
+	// (routine_idle_alone for PresenceCount==0) fires -> the toggle is effective.
+	if !engine.SetRuleEnabled("bio_hunger", false) {
+		t.Fatal("SetRuleEnabled(bio_hunger,false) returned false for a known rule")
+	}
+	if got := engine.Decide(meta, "AGENT-TEST"); got.Rule == "bio_hunger" {
+		t.Fatalf("after disable: rule still bio_hunger, the toggle had no effect")
+	}
+
+	// Disabling the catch-all routine rule too drives the same fingerprint to Forward.
+	engine.SetRuleEnabled("routine_idle_alone", false)
+	if got := engine.Decide(meta, "AGENT-TEST"); got.Decision != Forward {
+		t.Fatalf("with bio_hunger+routine_idle_alone disabled: decision=%v rule=%q, want Forward", got.Decision, got.Rule)
+	}
+
+	// Re-enabling bio_hunger restores synthesis.
+	engine.SetRuleEnabled("bio_hunger", true)
+	if got := engine.Decide(meta, "AGENT-TEST"); got.Decision != Synthesize || got.Rule != "bio_hunger" {
+		t.Fatalf("after re-enable: decision=%v rule=%q, want Synthesize/bio_hunger", got.Decision, got.Rule)
+	}
+}
+
+// #429: RuleStates lists all default rules (enabled) in order; unknown toggle is rejected.
+func TestRuleStatesAndUnknownToggle(t *testing.T) {
+	engine := NewEngine(true, nil)
+	states := engine.RuleStates()
+	if len(states) != 10 {
+		t.Fatalf("RuleStates len = %d, want 10", len(states))
+	}
+	for _, s := range states {
+		if !s.Enabled {
+			t.Errorf("rule %q should default to enabled", s.Name)
+		}
+	}
+	if states[0].Name != "bio_bladder" {
+		t.Errorf("states[0] = %q, want bio_bladder (DefaultRules order preserved)", states[0].Name)
+	}
+	if engine.SetRuleEnabled("does_not_exist", false) {
+		t.Error("SetRuleEnabled for an unknown rule returned true, want false")
+	}
+}
+
+// #429: live toggling must be race-free against concurrent Decide reads (run with -race).
+func TestRuleToggleConcurrentWithDecide(t *testing.T) {
+	engine := NewEngine(true, nil)
+	meta := testMetadata("H9|E5|B3|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0", map[string]string{
+		"agent_id":         "5",
+		"personality_type": "I",
+	})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				engine.Decide(meta, "AGENT-TEST")
+			}
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				engine.SetRuleEnabled("bio_hunger", j%2 == 0)
+				_ = engine.RuleStates()
+			}
+		}()
+	}
+	wg.Wait()
 }

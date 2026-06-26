@@ -18,6 +18,12 @@ type Rule struct {
 	Build     func(fp Fingerprint, ctx Context) []Action
 }
 
+// RuleState is the per-rule enable state exposed via the control plane (#429).
+type RuleState struct {
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+}
+
 // DefaultRules returns the initial set of deterministic synthesis rules.
 // CRITICAL (AC-6): ALL rules require !HasHeard AND !HasImpulse AND !isAddressed.
 // Chat/social interactions and Operator-Impulses (Gaia/Broadcast) ALWAYS go to the real LLM.
