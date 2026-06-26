@@ -15,5 +15,5 @@ pub mod store;
 pub mod worker;
 
 pub use config::ProjectionConfig;
-pub use store::ReadModelStore;
+pub use store::{CostRow, ReadModelStore};
 pub use worker::ProjectionWorker;

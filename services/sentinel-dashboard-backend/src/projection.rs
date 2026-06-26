@@ -245,6 +245,61 @@ pub async fn tasks(State(st): State<AppState>) -> Response {
     }
 }
 
+/// Liest eine der drei #427 Cost-Read-Models als JSON-Zeilen (`key` = agent_id /
+/// tier / bucket_start). table/key_col sind Konstanten (kein User-Input).
+fn cost_table_rows(
+    db_path: &str,
+    table: &str,
+    key_col: &str,
+) -> Result<Vec<Value>, rusqlite::Error> {
+    let sql = format!(
+        "SELECT CAST({key_col} AS TEXT),input_tokens,output_tokens,cache_read,cache_creation,\
+         cost_usd,call_count FROM {table} ORDER BY {key_col}"
+    );
+    query_json(db_path, &sql, |r| {
+        Ok(json!({
+            "key": r.get::<_, String>(0)?,
+            "input_tokens": r.get::<_, i64>(1)?,
+            "output_tokens": r.get::<_, i64>(2)?,
+            "cache_read": r.get::<_, i64>(3)?,
+            "cache_creation": r.get::<_, i64>(4)?,
+            "cost_usd": r.get::<_, f64>(5)?,
+            "call_count": r.get::<_, i64>(6)?,
+        }))
+    })
+}
+
+/// #427: cache-aware Kosten/Tokens pro Agent + Tier + Minuten-Zeitreihe, gelesen aus der
+/// CostHandler-Projektion (1:n — die Cost-Info lebt EINMAL als AgentLlmUsage-Event-Sequenz,
+/// das Dashboard liest nur diese materialisierte Sicht; KEIN eigener Sample-Puffer).
+pub fn cost_rows(db_path: &str) -> Result<Value, rusqlite::Error> {
+    Ok(json!({
+        "by_agent": cost_table_rows(db_path, "cost_by_agent", "agent_id")?,
+        "by_tier": cost_table_rows(db_path, "cost_by_tier", "tier")?,
+        "time_series": cost_table_rows(db_path, "cost_timeseries", "bucket_start")?,
+    }))
+}
+
+/// GET /api/cost — Kosten/Tokens pro Agent/Tier + Zeitreihe (#427). Degradiert auf
+/// 200 mit leeren Arrays + `projection:"offline"`, wenn die projection.db (bzw. die
+/// cost-Tabellen) noch nicht existiert — der Cost-Panel zeigt dann "keine Daten"
+/// statt eines Fehlers (besser als das harte 503 der aelteren Read-Routen).
+pub async fn cost(State(st): State<AppState>) -> Response {
+    match cost_rows(&st.config.projection_db) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "cost projection read failed, degrading to empty");
+            Json(json!({
+                "by_agent": [],
+                "by_tier": [],
+                "time_series": [],
+                "projection": "offline",
+            }))
+            .into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +406,41 @@ mod tests {
         }
 
         assert!(metrics_row(db.to_str().unwrap()).unwrap().is_null());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cost_rows_reads_three_tables() {
+        let dir = std::env::temp_dir().join(format!("pdb-cost-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("projection.db");
+        {
+            let c = Connection::open(&db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE cost_by_agent (agent_id TEXT PRIMARY KEY,input_tokens INTEGER NOT NULL,\
+                 output_tokens INTEGER NOT NULL,cache_read INTEGER NOT NULL,cache_creation INTEGER NOT NULL,\
+                 cost_usd REAL NOT NULL,call_count INTEGER NOT NULL,last_event_id INTEGER NOT NULL,updated_at INTEGER NOT NULL);\
+                 CREATE TABLE cost_by_tier (tier TEXT PRIMARY KEY,input_tokens INTEGER NOT NULL,\
+                 output_tokens INTEGER NOT NULL,cache_read INTEGER NOT NULL,cache_creation INTEGER NOT NULL,\
+                 cost_usd REAL NOT NULL,call_count INTEGER NOT NULL,last_event_id INTEGER NOT NULL,updated_at INTEGER NOT NULL);\
+                 CREATE TABLE cost_timeseries (bucket_start INTEGER PRIMARY KEY,input_tokens INTEGER NOT NULL,\
+                 output_tokens INTEGER NOT NULL,cache_read INTEGER NOT NULL,cache_creation INTEGER NOT NULL,\
+                 cost_usd REAL NOT NULL,call_count INTEGER NOT NULL,last_event_id INTEGER NOT NULL,updated_at INTEGER NOT NULL);\
+                 INSERT INTO cost_by_agent VALUES ('AGENT-08',1300,600,200,100,0.025,2,9,100);\
+                 INSERT INTO cost_by_tier VALUES ('high',1300,600,200,100,0.025,2,9,100);\
+                 INSERT INTO cost_timeseries VALUES (0,1300,600,200,100,0.025,2,9,100);",
+            )
+            .unwrap();
+        }
+
+        let v = cost_rows(db.to_str().unwrap()).unwrap();
+        assert_eq!(v["by_agent"][0]["key"], "AGENT-08");
+        assert_eq!(v["by_agent"][0]["input_tokens"], 1300);
+        assert_eq!(v["by_agent"][0]["cache_read"], 200);
+        assert_eq!(v["by_agent"][0]["call_count"], 2);
+        assert_eq!(v["by_tier"][0]["key"], "high");
+        assert_eq!(v["time_series"][0]["key"], "0");
+        assert_eq!(v["time_series"][0]["cache_creation"], 100);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
