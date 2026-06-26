@@ -661,6 +661,67 @@ impl WorldSnapshot {
     pub const SCHEMA_VERSION: u32 = 3;
 }
 
+/// Per-container ECS snapshot (#497): exactly ONE agent's per-agent components — and nothing else.
+///
+/// Structurally contains no world-scope resources: `ActiveChaos`/`ActiveSmells`/`RoomChatBuffer`/
+/// `GaiaBuffer`/`BroadcastBuffer` live in [`EcsSnapshot`] and belong to the `World` scope, never to
+/// a container (G0). This is the AC-1 "no foreign state" guarantee made *unrepresentable* rather
+/// than merely checked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NanoContainerEcsSnapshot {
+    pub agent_id: u16,
+    pub identity: crate::components::AgentIdentity,
+    pub position: crate::components::Position,
+    pub bio_state: crate::components::BioState,
+    pub personality: crate::components::Personality,
+    pub mood: crate::components::Mood,
+    pub perception_state: crate::components::PerceptionState,
+    pub work_context: crate::components::WorkContext,
+    pub agent_capabilities: crate::components::AgentCapabilities,
+    pub event_queue: crate::components::EventQueue,
+    pub shift_info: crate::components::ShiftInfo,
+    pub relationships: crate::components::Relationships,
+    pub llm_config: crate::components::LlmConfig,
+    /// `AutonomyCooldown.last_action_tick` (the component lives in sentinel-ecs; the value is
+    /// carried here so the crate boundary stays clean, mirroring [`EcsSnapshot::autonomy_cooldowns`]).
+    pub autonomy_cooldown_last_action_tick: u64,
+}
+
+/// Per-container redb rows (#497): the migrating agent's rows filtered out of the shared StateStore.
+///
+/// Each field is the raw serialized row value (or `None` if the agent has no such row yet). Filled
+/// by `dump_agent_tables` (sentinel-redb) — never a whole-table dump (AC-2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NanoContainerRedbRows {
+    pub agent_id: u16,
+    pub agent_state: Option<Vec<u8>>,
+    pub personality: Option<Vec<u8>>,
+    pub relationships: Option<Vec<u8>>,
+    pub voice_style: Option<Vec<u8>>,
+    pub behavioral_notes: Option<Vec<u8>>,
+    pub narrative_summary: Option<Vec<u8>>,
+    pub nmda_scores: Option<Vec<u8>>,
+    pub agent_facts: Option<Vec<u8>>,
+    pub evolution_version: Option<u64>,
+}
+
+/// Per-container snapshot envelope (#497): ECS subset + filtered redb rows + optional FS subtree.
+///
+/// For Track-A ECS-native containers `fs_subtree` is `None` (no bwrap home); the bwrap-home CAS
+/// manifest (#500a) is wired into the live spawn/snapshot path by #500b/Track B. Self-describing
+/// via `agent_id` + `captured_at_tick`; the owner-epoch fence under which it is taken is applied by
+/// the transfer layer (#489/#496 integration, #497 task wiring).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NanoContainerSnapshot {
+    pub agent_id: u16,
+    pub captured_at_tick: u64,
+    pub ecs: NanoContainerEcsSnapshot,
+    #[serde(default)]
+    pub redb_rows: NanoContainerRedbRows,
+    #[serde(default)]
+    pub fs_subtree: Option<FsMetadataDump>,
+}
+
 /// Scope einer gefenceten State-Transfer-Operation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StateTransferScope {
