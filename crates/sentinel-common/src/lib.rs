@@ -6,6 +6,8 @@
 //! - External (Dashboard, Logs): MessagePack
 
 pub mod agent_config;
+pub mod anti_entropy;
+pub mod block_map;
 pub mod block_ref;
 pub mod cluster;
 pub mod components;
@@ -23,6 +25,8 @@ pub mod route;
 pub mod snapshot_codec;
 pub mod types;
 
+pub use anti_entropy::{CasInventory, GenerationSummary, InventoryPage};
+pub use block_map::{BlockMap, HolderAction, HolderAdvertisement, HolderRecord};
 pub use block_ref::{BlockNamespace, BlockRef, BlockRefError, HashAlgorithm};
 pub use cluster::{
     ClusterConfig, ClusterRole, ControlPeer, NodeId, NodeIdentity, NodeLifecycleState,
