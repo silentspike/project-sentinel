@@ -722,6 +722,19 @@ impl RoomChatBuffer {
         true
     }
 
+    /// #497 V11: is there active inbound cross-agent traffic directed at this agent? A container
+    /// with active (non-expired) inbound is `NotMigratable` — the durable inbound queue + dedup is
+    /// Track E/H, so Track A excludes it rather than claiming queue semantics.
+    pub fn has_active_inbound(&self, agent_name: &str, current_tick: u64) -> bool {
+        self.messages.values().any(|entries| {
+            entries.iter().any(|e| {
+                current_tick < e.tick + e.ttl_ticks
+                    && e.agent_name != agent_name
+                    && e.addressed_agents.iter().any(|n| n == agent_name)
+            })
+        })
+    }
+
     /// Gibt aktuelle Messages fuer einen Raum zurueck (exkludiert eigene + bereits gehoerte).
     pub fn get_recent(
         &self,
@@ -1552,6 +1565,55 @@ pub fn snapshot_ecs_state(world: &mut World) -> sentinel_common::EcsSnapshot {
             .and_then(|r| serde_json::to_vec(r).ok())
             .unwrap_or_default(),
     }
+}
+
+/// #497: classify whether a container may be per-container migrated (#501) — always a TYPED reason,
+/// never a silent skip. A resting container is `Eligible`; active inbound chat (V11), active
+/// scheduled work (V23) or a pending Voice-of-Gaia thought (V30) make it `NotMigratable`.
+pub fn migration_eligibility(
+    world: &mut World,
+    agent_id: AgentId,
+) -> sentinel_common::MigrationEligibility {
+    use sentinel_common::{MigrationEligibility, NotMigratableReason};
+
+    let tick = world
+        .get_resource::<SimulationTime>()
+        .map(|t| t.tick.0)
+        .unwrap_or(0);
+
+    let name = {
+        let mut q = world.query::<&AgentIdentity>();
+        q.iter(world)
+            .find(|id| id.agent_id == agent_id)
+            .map(|id| id.name.clone())
+    };
+    let Some(name) = name else {
+        return MigrationEligibility::NotMigratable(NotMigratableReason::UnknownAgent);
+    };
+
+    // V11 — active inbound cross-agent chat directed at the agent.
+    if let Some(chat) = world.get_resource::<RoomChatBuffer>() {
+        if chat.has_active_inbound(&name, tick) {
+            return MigrationEligibility::NotMigratable(NotMigratableReason::ActiveInbound);
+        }
+    }
+    // V30 — a pending Voice-of-Gaia thought (delayed external side-effect / impulse).
+    if let Some(gaia) = world.get_resource::<GaiaBuffer>() {
+        if !gaia.get_active(&agent_id, tick).is_empty() {
+            return MigrationEligibility::NotMigratable(NotMigratableReason::PendingSideEffect);
+        }
+    }
+    // V23 — active scheduled work assigned to the agent (a task that is not Done).
+    let has_active_task = {
+        let mut q = world.query::<&sentinel_common::components::TaskState>();
+        q.iter(world)
+            .any(|t| t.assigned_to == agent_id && t.status != sentinel_common::TaskStatus::Done)
+    };
+    if has_active_task {
+        return MigrationEligibility::NotMigratable(NotMigratableReason::ScheduledWorkActive);
+    }
+
+    MigrationEligibility::Eligible
 }
 
 /// #497: snapshot exactly ONE agent's per-agent ECS components into a
