@@ -1014,6 +1014,41 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // the registry keeps its default single-node owner. --
     if let Some(cluster) = config.cluster.as_ref() {
         sentinel_common::OwnerRegistry::init_single_node(cluster.node_id);
+        // Re-establish ownership from durable state (ADR-3, PR2b-1c): the dedicated
+        // control-plane cluster-meta store holds the committed owner terms. On first
+        // start the seed's `World` term (epoch 1) is seeded; on restart it is read back,
+        // so ownership survives a restart (and PR2b-2's handoff commits real cross-node
+        // terms here). The seed owns every scope single-node, so behavior is unchanged.
+        let cluster_meta_path = data_dir.join("cluster_meta.redb");
+        match sentinel_redb::ClusterMetaStore::open(&cluster_meta_path.to_string_lossy()) {
+            Ok(meta) => match meta.get_owner_term(&sentinel_common::StateTransferScope::World) {
+                Ok(Some(term)) => {
+                    info!(
+                        epoch = term.epoch,
+                        "Cluster 12: Owner-Term aus Meta-Store geladen (World)"
+                    )
+                }
+                Ok(None) => {
+                    let term = sentinel_common::OwnerTerm {
+                        scope: sentinel_common::StateTransferScope::World,
+                        owner_node: cluster.node_id,
+                        epoch: 1,
+                    };
+                    match meta.put_owner_term(&term) {
+                        Ok(()) => {
+                            info!("Cluster 12: Seed-Owner-Term im Meta-Store angelegt (World @ epoch 1)")
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Cluster 12: Seed-Owner-Term konnte nicht persistiert werden")
+                        }
+                    }
+                }
+                Err(e) => warn!(error = %e, "Cluster 12: Owner-Term-Lesen fehlgeschlagen"),
+            },
+            Err(e) => {
+                warn!(error = %e, "Cluster 12: ClusterMetaStore konnte nicht geoeffnet werden")
+            }
+        }
         info!(node_id = %cluster.node_id, "Cluster 12: OwnerRegistry als Single-Node-Seed initialisiert");
     }
 
