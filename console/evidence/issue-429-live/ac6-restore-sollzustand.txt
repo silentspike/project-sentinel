@@ -1,0 +1,8 @@
+=== journalctl: synthesize-Decision-Evidence (synthesis match) ===
+=== Gateway STOPPEN + Token-Gate entfernen (Soll-Zustand) ===
+=== Soll-Zustand verifizieren ===
+inactive inactive active active
+ls: cannot access '/etc/sentinel/allow-llm': No such file or directory
+  allow-llm entfernt (Soll)
+=== keine neuen Forwards mehr (5s) ===
+  neue completed in 5s nach stop: 0

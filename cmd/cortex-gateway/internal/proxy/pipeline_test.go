@@ -727,6 +727,96 @@ func TestPipelineSynthesisUsesRuleActions(t *testing.T) {
 	}
 }
 
+// #429: the response log records the pipeline decision + rule + fourth-wall verdict.
+func TestPipelineResponseLogDecisions(t *testing.T) {
+	reg := NewRegistry()
+	mock := &pipelineMockProvider{
+		name: "mock",
+		resp: &LLMResponse{Content: "Ich arbeite weiter.", Model: "test-model", TokensUsed: 5, FinishReason: "end_turn"},
+	}
+	reg.Register("mock", mock)
+	cfg := control.NewConfig("mock")
+	if err := cfg.Update(map[string]interface{}{"synthesis_enabled": true}); err != nil {
+		t.Fatalf("update config: %v", err)
+	}
+	logs := NewResponseLogBuffer(50)
+	ph := NewPipelineHandler(PipelineConfig{
+		Registry:     reg,
+		Config:       cfg,
+		Compiler:     compiler.New(),
+		Normalizer:   normalizer.New(),
+		Extractor:    extraction.New(),
+		Capabilities: capability.New(),
+		Logger:       slog.Default(),
+		BreakerCfg:   testConfig(),
+		Synthesis:    synthesis.NewEngine(true, nil),
+		ResponseLogs: logs,
+	})
+
+	doReq := func(body string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		ph.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", w.Code, w.Body.String())
+		}
+	}
+
+	// Synthesis path (bio_hunger via H9) -> decision=synthesize + rule + fourth_wall=clean.
+	doReq(`{"messages":[{"role":"user","content":"x"}],"metadata":{"agent_id":"5","agent_name":"Max","personality_type":"I","synth_fp":"H9|E5|B3|S3|C5|SN5|R:buero-dev-1|P:1|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0"}}`)
+	entries := logs.Entries()
+	if len(entries) != 1 {
+		t.Fatalf("entries after synthesis = %d, want 1", len(entries))
+	}
+	if entries[0].Decision != "synthesize" || entries[0].Rule == "" {
+		t.Fatalf("synthesis entry: decision=%q rule=%q, want synthesize/<rule>", entries[0].Decision, entries[0].Rule)
+	}
+	if entries[0].FourthWall != "clean" {
+		t.Errorf("synthesis fourth_wall = %q, want clean", entries[0].FourthWall)
+	}
+
+	// Forward path (no synth_fp -> Decide forwards; clean LLM response).
+	doReq(`{"messages":[{"role":"user","content":"x"}],"metadata":{"agent_id":"5","agent_name":"Max"}}`)
+	entries = logs.Entries()
+	last := entries[len(entries)-1]
+	if last.Decision != "forward" {
+		t.Fatalf("forward entry decision = %q, want forward", last.Decision)
+	}
+	if last.FourthWall != "clean" {
+		t.Errorf("forward fourth_wall = %q, want clean", last.FourthWall)
+	}
+}
+
+// #429: fourthWallCheck returns clean / regenerated / break verdicts.
+func TestFourthWallCheckVerdicts(t *testing.T) {
+	reg := NewRegistry()
+	cleanMock := &pipelineMockProvider{name: "mock", resp: &LLMResponse{Content: "Ich arbeite weiter.", Model: "m", FinishReason: "end_turn"}}
+	reg.Register("mock", cleanMock)
+	ph := newTestPipelineHandler(reg, nil)
+	req := &LLMRequest{Messages: []Message{{Role: "user", Content: "hi"}}, Metadata: map[string]string{}}
+
+	// Clean content -> "clean" (no regex match, no provider call).
+	if _, v := ph.fourthWallCheck(context.Background(), "Ich gehe in die Kueche.", "Max", "Dev", cleanMock, req); v != "clean" {
+		t.Fatalf("clean verdict = %q, want clean", v)
+	}
+
+	// Breaking content; the judge call errors -> treated as break -> re-generated to clean text.
+	n := 0
+	breakMock := &pipelineMockProvider{name: "mock2", sendFunc: func(_ context.Context, _ *LLMRequest) (*LLMResponse, error) {
+		n++
+		if n == 1 {
+			return nil, errors.New("judge unavailable") // judge call -> "treating as break"
+		}
+		return &LLMResponse{Content: "Ich arbeite ruhig weiter.", Model: "m", FinishReason: "end_turn"}, nil // regen -> clean
+	}}
+	content, v := ph.fourthWallCheck(context.Background(), "Als KI kann ich das nicht beurteilen.", "Max", "Dev", breakMock, req)
+	if v != "regenerated" {
+		t.Fatalf("break verdict = %q, want regenerated (content=%q)", v, content)
+	}
+}
+
 func TestPipelineAPICPLearnedPatternSynthesizes(t *testing.T) {
 	fp := "H5|E5|B5|S5|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0"
 	reg := NewRegistry()

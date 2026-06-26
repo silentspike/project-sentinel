@@ -222,6 +222,11 @@ pub fn build_app(state: AppState) -> axum::Router {
             post(control::agent_provider).delete(control::delete_agent_provider),
         )
         .route("/traffic-stats", get(control::traffic_stats))
+        // #429: synthesis rules editor + request inspector (proxy to Gateway :8081 + events.db).
+        .route("/synthesis-rules", get(control::synthesis_rules))
+        .route("/synthesis-rules/{name}", post(control::set_synthesis_rule))
+        .route("/traffic-responses", get(control::traffic_responses))
+        .route("/judge-alerts", get(events::judge_alerts))
         .route("/platform-state", get(control::platform_state))
         .route("/platform-analyses", get(control::platform_analyses))
         .route("/platform-analyze", post(control::platform_analyze))
