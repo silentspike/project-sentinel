@@ -25,7 +25,7 @@ use thiserror::Error;
 ///
 /// The namespace prevents accidentally resolving, say, a trash-queue digest as a
 /// live blob.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockNamespace {
     /// A whole object stored in `CasStore` (SHA-256 keyed).
@@ -61,7 +61,7 @@ impl BlockNamespace {
 }
 
 /// The digest algorithm of a [`BlockRef`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HashAlgorithm {
     /// SHA-256, 32-byte digest (whole-blob / object integrity identity).
@@ -125,7 +125,10 @@ pub enum BlockRefError {
 /// construction; build via [`BlockRef::new`], [`BlockRef::chunk_blake3_128`] or
 /// [`BlockRef::blob_sha256`]. Deserialization re-checks the invariant via
 /// `#[serde(try_from)]`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Field order defines the total order (`Ord`): namespace, then algorithm, then
+/// digest, … — so blocks sort grouped by namespace/algorithm and then by digest,
+/// which is exactly the order anti-entropy inventory pagination walks (#498 V25).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "BlockRefRepr")]
 pub struct BlockRef {
     namespace: BlockNamespace,
