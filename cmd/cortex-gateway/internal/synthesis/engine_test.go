@@ -1,6 +1,8 @@
 package synthesis
 
 import (
+	"io"
+	"log/slog"
 	"sync"
 	"testing"
 )
@@ -401,6 +403,34 @@ func TestRuleStatesAndUnknownToggle(t *testing.T) {
 	if engine.SetRuleEnabled("does_not_exist", false) {
 		t.Error("SetRuleEnabled for an unknown rule returned true, want false")
 	}
+}
+
+// #429: the per-rule gating (RWMutex + map lookup per rule) must not regress the hot Decide
+// path. all-disabled is the worst case (10 isRuleEnabled RLocks, then Forward); all-enabled
+// matches the first bio rule. A negligible delta proves the gating is proportional.
+func BenchmarkDecide(b *testing.B) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	meta := testMetadata("H9|E5|B3|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0", map[string]string{
+		"agent_id":         "5",
+		"personality_type": "I",
+	})
+	b.Run("all-enabled", func(b *testing.B) {
+		e := NewEngine(true, logger)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = e.Decide(meta, "AGENT-05")
+		}
+	})
+	b.Run("all-disabled", func(b *testing.B) {
+		e := NewEngine(true, logger)
+		for _, s := range e.RuleStates() {
+			e.SetRuleEnabled(s.Name, false)
+		}
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = e.Decide(meta, "AGENT-05")
+		}
+	})
 }
 
 // #429: live toggling must be race-free against concurrent Decide reads (run with -race).
