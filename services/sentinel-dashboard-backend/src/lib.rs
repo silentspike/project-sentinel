@@ -196,6 +196,7 @@ pub fn build_app(state: AppState) -> axum::Router {
         .route("/metrics/tick", get(metrics_extra::tick))
         .route("/metrics/phases", get(metrics_extra::phases))
         .route("/tasks", get(projection::tasks))
+        .route("/cost", get(projection::cost))
         .route("/cockpit", get(cockpit::cockpit))
         .route("/cockpit/incident/{id}", get(cockpit::incident))
         .route("/events", get(events::events))
