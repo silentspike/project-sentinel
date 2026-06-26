@@ -24,5 +24,9 @@ bincode = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 
+[[bench]]
+name = "owner_fencing_overhead"
+harness = false
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

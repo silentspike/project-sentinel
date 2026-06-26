@@ -662,7 +662,7 @@ impl WorldSnapshot {
 }
 
 /// Scope einer gefenceten State-Transfer-Operation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StateTransferScope {
     /// Ganze Welt. Das ist der einzige in dieser Iteration produktiv implementierte Scope.
     World,
@@ -697,6 +697,30 @@ impl StateTransferScope {
                 StateTransferScope::NanoContainer(aggregate_id.to_string())
             }
             _ => StateTransferScope::World,
+        }
+    }
+
+    /// The canonical wire / persistence key for this scope: `"world"` or `"nano:<id>"`.
+    /// This is the single string form shared by the cluster control RPCs (#569 scope
+    /// strings) and the durable cluster-meta store (ADR-3 `scope_key`), so a scope
+    /// round-trips identically across the transport and the redb authority.
+    pub fn to_wire(&self) -> String {
+        match self {
+            StateTransferScope::World => "world".to_string(),
+            StateTransferScope::NanoContainer(id) => format!("nano:{id}"),
+        }
+    }
+
+    /// Parse the canonical wire form produced by [`to_wire`](Self::to_wire). Returns
+    /// `None` for an unrecognized string (an empty nano id or an unknown prefix) so a
+    /// handler can reject a malformed scope rather than silently owning it incorrectly.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        if s == "world" {
+            return Some(StateTransferScope::World);
+        }
+        match s.strip_prefix("nano:") {
+            Some(id) if !id.is_empty() => Some(StateTransferScope::NanoContainer(id.to_string())),
+            _ => None,
         }
     }
 }
@@ -755,6 +779,30 @@ mod scope_classification_tests {
                 "aggregate {world:?} must map to World"
             );
         }
+    }
+
+    /// The canonical wire form round-trips for both variants and rejects unknown forms
+    /// (so a control handler rejects a malformed scope rather than owning it incorrectly). The
+    /// form is shared verbatim with the cluster-meta `scope_key` (ADR-3).
+    #[test]
+    fn wire_form_round_trips_and_rejects_unknown() {
+        for scope in [
+            StateTransferScope::World,
+            StateTransferScope::NanoContainer("AGENT-07".to_string()),
+            StateTransferScope::NanoContainer("AGENT-60".to_string()),
+        ] {
+            assert_eq!(StateTransferScope::from_wire(&scope.to_wire()), Some(scope));
+        }
+        assert_eq!(StateTransferScope::World.to_wire(), "world");
+        assert_eq!(
+            StateTransferScope::NanoContainer("AGENT-07".into()).to_wire(),
+            "nano:AGENT-07"
+        );
+        // Unknown / malformed -> None.
+        assert_eq!(StateTransferScope::from_wire("agent:7"), None);
+        assert_eq!(StateTransferScope::from_wire("nano:"), None);
+        assert_eq!(StateTransferScope::from_wire(""), None);
+        assert_eq!(StateTransferScope::from_wire("World"), None);
     }
 }
 
