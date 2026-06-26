@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS kpi_1m (
 
 // #427: per-agent / per-tier / per-minute cost+token read-models. Aggregated from
 // AgentLlmUsage events by CostHandler; the dashboard reads these read-only (1:n — the
-// cost info lives once as the event sequence, the projection is its materialised view).
+// cost info lives once as the event sequence, the projection is its materialized view).
 const CREATE_COST_BY_AGENT: &str = "
 CREATE TABLE IF NOT EXISTS cost_by_agent (
     agent_id TEXT PRIMARY KEY,

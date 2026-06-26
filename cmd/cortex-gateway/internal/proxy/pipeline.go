@@ -1473,7 +1473,7 @@ func resolveTier(effectiveModel string) string {
 	}
 }
 
-// canonicalAgentID normalises the request metadata into the "AGENT-NN" label so
+// canonicalAgentID normalizes the request metadata into the "AGENT-NN" label so
 // the /metrics counters, the AgentLlmUsage event and the projection all speak
 // one telemetry language (#429-R3 lesson). Falls back to agent_name, then
 // "unknown" when neither is present (e.g. a direct MITM call without an agent).
