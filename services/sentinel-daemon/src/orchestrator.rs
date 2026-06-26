@@ -1447,6 +1447,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             bridge_action_tx,
             bridge_telem,
             Arc::clone(&state_store),
+            Arc::clone(&event_store), // #427: emit AgentLlmUsage per LLM call
             Arc::clone(&llm_circuit_open),
             Arc::clone(&llm_activity_ticks),
         ))

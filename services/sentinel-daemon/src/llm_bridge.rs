@@ -22,7 +22,11 @@ pub mod bridge {
     use tokio::sync::{Mutex as AsyncMutex, Semaphore};
     use tracing::{debug, error, info, instrument, warn};
 
-    use sentinel_common::{ActionType, AgentAction, AgentId, Perception, Tick, Timestamp};
+    use sentinel_common::{
+        ActionType, AgentAction, AgentId, DomainEvent, DomainEventPayload, Perception, Tick,
+        Timestamp,
+    };
+    use sentinel_limbo::EventStore;
     use sentinel_redb::StateStore;
 
     pub type SharedLlmActivityTicks = Arc<Mutex<HashMap<AgentId, u64>>>;
@@ -133,6 +137,53 @@ pub mod bridge {
         tokens_used: i32,
         #[serde(default)]
         request_id: String,
+        // #427: cache-aware breakdown + gateway-resolved tier + per-call cost. input_tokens
+        // is the FOLDED input (fresh + cache); the fresh input for the event is recovered as
+        // input_tokens - cache_read - cache_creation (matches the gateway per-agent counter).
+        #[serde(default)]
+        input_tokens: u32,
+        #[serde(default)]
+        output_tokens: u32,
+        #[serde(default)]
+        cache_read: u32,
+        #[serde(default)]
+        cache_creation: u32,
+        #[serde(default)]
+        tier: String,
+        #[serde(default)]
+        cost_usd: f64,
+    }
+
+    /// #427: baut das `AgentLlmUsage`-Event aus einer Gateway-Response. Die frischen
+    /// (nicht gecachten) Input-Tokens werden aus dem gefoldeten `input_tokens` rekonstruiert,
+    /// damit Event-Aggregation und Gateway-Counter exakt rekonziliieren. `operation_id` ist
+    /// deterministisch aus der `request_id` abgeleitet (Idempotenz, kein Doppel-Append).
+    fn build_usage_event(agent_id: AgentId, tick: u64, resp: &GatewayResponse) -> DomainEvent {
+        let fresh_input = resp
+            .input_tokens
+            .saturating_sub(resp.cache_read)
+            .saturating_sub(resp.cache_creation);
+        let payload = DomainEventPayload::AgentLlmUsage {
+            agent_id,
+            tier: resp.tier.clone(),
+            input_tokens: fresh_input,
+            output_tokens: resp.output_tokens,
+            cache_read: resp.cache_read,
+            cache_creation: resp.cache_creation,
+            cost_usd: resp.cost_usd,
+        };
+        let aggregate_id = format!("AGENT-{:02}", agent_id.0);
+        let mut event = DomainEvent::new(
+            payload.event_type_str(),
+            &aggregate_id,
+            &payload.to_json(),
+            &resp.request_id,
+            tick,
+        );
+        if !resp.request_id.is_empty() {
+            event = event.with_operation_id(&format!("llm_usage_{}", resp.request_id));
+        }
+        event
     }
 
     #[derive(Debug, Deserialize)]
@@ -182,6 +233,7 @@ pub mod bridge {
         action_tx: mpsc::Sender<AgentAction>,
         telemetry: Arc<BridgeTelemetry>,
         state_store: Arc<StateStore>,
+        event_store: Arc<EventStore>,
         llm_unavailable: Arc<AtomicBool>,
         llm_activity_ticks: SharedLlmActivityTicks,
     ) {
@@ -331,6 +383,7 @@ pub mod bridge {
                 let retry_queue = Arc::clone(&pending_retries);
                 let retry_perception = perception.clone();
                 let request = build_gateway_request(&perception, &state_store);
+                let bridge_event_store = Arc::clone(&event_store);
 
                 telemetry.calls_total.fetch_add(1, Ordering::Relaxed);
 
@@ -398,6 +451,16 @@ pub mod bridge {
                                                 ) {
                                                     let _ = action_tx.send(agent_action);
                                                 }
+                                            }
+                                            // #427: emit the per-call usage event (every call, incl. 0-token synthesis).
+                                            if let Err(e) =
+                                                bridge_event_store.append_event(&build_usage_event(
+                                                    agent_id,
+                                                    current_tick,
+                                                    &gateway_resp,
+                                                ))
+                                            {
+                                                warn!(agent = %agent_id, error = %e, "AgentLlmUsage Event append fehlgeschlagen");
                                             }
                                         }
                                         Err(e) => {
@@ -469,6 +532,16 @@ pub mod bridge {
                                                 ) {
                                                     let _ = action_tx.send(agent_action);
                                                 }
+                                            }
+                                            // #427: emit the per-call usage event (every call, incl. 0-token synthesis).
+                                            if let Err(e) =
+                                                bridge_event_store.append_event(&build_usage_event(
+                                                    agent_id,
+                                                    current_tick,
+                                                    &gateway_resp,
+                                                ))
+                                            {
+                                                warn!(agent = %agent_id, error = %e, "AgentLlmUsage Event append fehlgeschlagen");
                                             }
                                         }
                                         Err(e) => {
@@ -922,6 +995,34 @@ pub mod bridge {
         fn should_not_retry_plain_heartbeat() {
             let perception = make_perception(22, "", false);
             assert!(!should_retry_perception(&perception));
+        }
+
+        #[test]
+        fn build_usage_event_reconstructs_fresh_input_and_keys() {
+            // #427: the daemon recovers fresh input from the folded input and keys
+            // the event by AGENT-NN + request_id (deterministic operation_id).
+            let resp = GatewayResponse {
+                content: String::new(),
+                actions: vec![],
+                tokens_used: 1800,
+                request_id: "req-abc".to_string(),
+                input_tokens: 1300, // folded (fresh 1000 + cache 200 + 100)
+                output_tokens: 500,
+                cache_read: 200,
+                cache_creation: 100,
+                tier: "high".to_string(),
+                cost_usd: 0.0195,
+            };
+            let ev = build_usage_event(AgentId(8), 42, &resp);
+            assert_eq!(ev.event_type, "agent_llm_usage");
+            assert_eq!(ev.aggregate_id, "AGENT-08");
+            assert_eq!(ev.correlation_id, "req-abc");
+            assert_eq!(ev.operation_id, "llm_usage_req-abc");
+            assert_eq!(ev.tick, 42);
+            assert!(ev.payload.contains("\"input_tokens\":1000"));
+            assert!(ev.payload.contains("\"cache_read\":200"));
+            assert!(ev.payload.contains("\"cache_creation\":100"));
+            assert!(ev.payload.contains("\"tier\":\"high\""));
         }
     }
 }
