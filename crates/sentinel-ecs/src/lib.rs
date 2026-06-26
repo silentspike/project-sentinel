@@ -29,13 +29,14 @@ pub use sentinel_bio::{PSI_CPU_STRESS_THRESHOLD, PSI_MEM_STRESS_THRESHOLD};
 pub use hash::{canonicalize, state_hashes, StateHashes};
 pub use world::{
     apply_capabilities, apply_identity, apply_personality, attach_redb_store,
-    create_simulation_world, despawn_agent_from_world, rebuild_room_maps, restore_ecs_state,
-    snapshot_ecs_state, spawn_agent, ActionReceiver, ActiveAgentsThisTick, ActiveChaos,
-    ActiveChaosEvent, ActiveRoomStimuli, ActiveSmell, ActiveSmells, BroadcastBuffer, EventBuffer,
-    GaiaBuffer, LimboEventStore, OperatorCommandReceiver, PerceptionSender, PersistTelemetry,
-    PersistWorkspace, PsiMetrics, RedbStateStore, RoomChatBuffer, RoomDistanceMap, RoomInfoMap,
-    RoomPhysicsSnapshot, RoomPhysicsState, RoomPhysicsWorkspace, SimulationTime,
-    ToolRuntimeResource, ZenohFanoutSender,
+    create_simulation_world, despawn_agent_from_world, fenced_per_container_snapshot,
+    migration_eligibility, rebuild_room_maps, restore_agent_ecs_state, restore_ecs_state,
+    snapshot_agent_ecs_state, snapshot_ecs_state, spawn_agent, ActionReceiver,
+    ActiveAgentsThisTick, ActiveChaos, ActiveChaosEvent, ActiveRoomStimuli, ActiveSmell,
+    ActiveSmells, BroadcastBuffer, EventBuffer, GaiaBuffer, LimboEventStore,
+    OperatorCommandReceiver, PerceptionSender, PersistTelemetry, PersistWorkspace, PsiMetrics,
+    RedbStateStore, RoomChatBuffer, RoomDistanceMap, RoomInfoMap, RoomPhysicsSnapshot,
+    RoomPhysicsState, RoomPhysicsWorkspace, SimulationTime, ToolRuntimeResource, ZenohFanoutSender,
 };
 
 #[cfg(test)]
