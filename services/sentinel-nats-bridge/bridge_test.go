@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/nats-io/nats.go"
@@ -111,6 +112,10 @@ func TestConfigDefaults(t *testing.T) {
 	if cfg.Server.HealthPort <= 0 {
 		cfg.Server.HealthPort = 8083
 	}
+	// #525: health_bind_addr default = loopback with configured health_port.
+	if cfg.Server.HealthBindAddr == "" {
+		cfg.Server.HealthBindAddr = fmt.Sprintf("127.0.0.1:%d", cfg.Server.HealthPort)
+	}
 
 	if cfg.EventStore.PollIntervalMs != 1000 {
 		t.Errorf("PollIntervalMs = %d, want 1000", cfg.EventStore.PollIntervalMs)
@@ -120,6 +125,35 @@ func TestConfigDefaults(t *testing.T) {
 	}
 	if cfg.Server.HealthPort != 8083 {
 		t.Errorf("HealthPort = %d, want 8083", cfg.Server.HealthPort)
+	}
+	if cfg.Server.HealthBindAddr != "127.0.0.1:8083" {
+		t.Errorf("HealthBindAddr = %q, want 127.0.0.1:8083", cfg.Server.HealthBindAddr)
+	}
+}
+
+func TestHealthBindAddrDefaultRespectsConfiguredPort(t *testing.T) {
+	// #525 (ORC Finding 2): empty health_bind_addr must default to loopback with
+	// the configured health_port, NOT a hardcoded 8083.
+	var cfg Config
+	cfg.Server.HealthPort = 9999
+	if cfg.Server.HealthBindAddr == "" {
+		cfg.Server.HealthBindAddr = fmt.Sprintf("127.0.0.1:%d", cfg.Server.HealthPort)
+	}
+	if cfg.Server.HealthBindAddr != "127.0.0.1:9999" {
+		t.Errorf("HealthBindAddr = %q, want 127.0.0.1:9999 (must respect configured health_port)", cfg.Server.HealthBindAddr)
+	}
+}
+
+func TestHealthBindAddrExplicitOverridePreserved(t *testing.T) {
+	// #525: an explicit health_bind_addr is preserved (not overwritten) by the default logic.
+	var cfg Config
+	cfg.Server.HealthPort = 8083
+	cfg.Server.HealthBindAddr = "0.0.0.0:8083"
+	if cfg.Server.HealthBindAddr == "" {
+		cfg.Server.HealthBindAddr = fmt.Sprintf("127.0.0.1:%d", cfg.Server.HealthPort)
+	}
+	if cfg.Server.HealthBindAddr != "0.0.0.0:8083" {
+		t.Errorf("explicit override overwritten: %q, want 0.0.0.0:8083", cfg.Server.HealthBindAddr)
 	}
 }
 

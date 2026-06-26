@@ -1,0 +1,16 @@
+## Zenoh-Pin-Gate (definitive proof, CI kann das nicht)
+### (a) ss: zenoh listener auf 127.0.0.1 (process=sentinel-daemon, port!=9090)
+LISTEN 0      128        127.0.0.1:9090       0.0.0.0:*    users:(("sentinel-daemon",pid=222408,fd=45))            
+LISTEN 0      1024       127.0.0.1:35753      0.0.0.0:*    users:(("sentinel-daemon",pid=222408,fd=37))            
+LISTEN 0      128        127.0.0.1:8084       0.0.0.0:*    users:(("sentinel-daemon",pid=222408,fd=44))            
+
+### (b) startup-log: zenoh listen-endpoint loopback
+Jun 26 17:08:41 sentinel-ubuntu-2404 sentinel-daemon[222408]: 2026-06-26T17:08:41.761717Z  INFO zenoh::net::runtime::orchestrator: Zenoh can be reached at: tcp/127.0.0.1:35753
+
+### (c) insert_json5/pin-warn check (MUST be empty = pin griff)
+<empty_above=PASS>
+
+### (d) SHM primary
+Jun 26 17:08:42 sentinel-ubuntu-2404 sentinel-daemon[222408]: 2026-06-26T17:08:42.264018Z  INFO sentinel_zenoh: SentinelBus: SHM transport active
+Jun 26 17:08:42 sentinel-ubuntu-2404 sentinel-daemon[222408]: 2026-06-26T17:08:42.264069Z  INFO sentinel_zenoh: SentinelBus: session opened, transport=Shm, inflight_global=128, inflight_per_agent=8
+Jun 26 17:08:42 sentinel-ubuntu-2404 sentinel-daemon[222408]: 2026-06-26T17:08:42.264085Z  INFO sentinel_daemon::orchestrator: SentinelBus ready transport=Shm

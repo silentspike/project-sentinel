@@ -1400,9 +1400,12 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         })
         .context("ECS Thread spawnen")?;
 
-    // -- Prometheus eBPF Metrics Server (Port 9090) --
+    // -- Prometheus eBPF Metrics Server (loopback, #525: [daemon.metrics] bind_addr) --
     let prom_text = Arc::clone(&prometheus_text);
-    tokio::spawn(crate::ebpf::prometheus_server(prom_text, 9090));
+    tokio::spawn(crate::ebpf::prometheus_server(
+        prom_text,
+        config.metrics.bind_addr.clone(),
+    ));
 
     // -- eBPF Zenoh Publisher + NATS Bridge + Prometheus Text Renderer --
     let prom_text = Arc::clone(&prometheus_text);
