@@ -4,6 +4,7 @@
 //! Der Worker deserialisiert das Payload einmal und reicht es durch.
 
 pub mod agent_live_view;
+pub mod cost;
 pub mod kpi;
 pub mod room_live_view;
 pub mod task_kanban_view;
