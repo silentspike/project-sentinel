@@ -15,11 +15,17 @@
 
 use anyhow::Context;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use sentinel_common::{OwnerTerm, StateTransferScope};
+use sentinel_common::{LocalOwnerState, OwnerTerm, StateTransferScope};
 
 /// `scope-key -> JSON-serialized OwnerTerm`. Keyed by a stable string form of the scope
 /// (`world` or `nano:<container-id>`) so the same scope always maps to the same row.
 const CLUSTER_OWNER: TableDefinition<&str, &[u8]> = TableDefinition::new("cluster_owner");
+
+/// `scope-key -> JSON-serialized LocalOwnerState` (V4). This node's own per-scope role
+/// (e.g. `Retired`), kept durable so a cooperative handoff's source keeps its
+/// retirement fence across a restart — even during a partition that hides the new
+/// owner's committed term.
+const LOCAL_OWNER: TableDefinition<&str, &[u8]> = TableDefinition::new("local_owner");
 
 /// The stable key for a scope in the `CLUSTER_OWNER` table — the canonical wire form
 /// (`world` / `nano:<id>`), shared verbatim with the control RPCs so a scope keys the
@@ -43,6 +49,7 @@ impl ClusterMetaStore {
         let txn = db.begin_write()?;
         {
             txn.open_table(CLUSTER_OWNER)?;
+            txn.open_table(LOCAL_OWNER)?;
         }
         txn.commit()?;
         Ok(Self { db })
@@ -85,6 +92,49 @@ impl ClusterMetaStore {
             terms.push(serde_json::from_slice(value.value()).context("deserialize OwnerTerm")?);
         }
         Ok(terms)
+    }
+
+    /// Persist this node's local owner state for its scope (V4 durable retirement) — a
+    /// control-plane write like the owner terms (not a fenced data write, by design).
+    pub fn put_local_state(&self, state: &LocalOwnerState) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec(state).context("serialize LocalOwnerState")?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(LOCAL_OWNER)?;
+            table.insert(scope_key(&state.scope).as_str(), bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// This node's local owner state for a scope, if persisted.
+    pub fn get_local_state(
+        &self,
+        scope: &StateTransferScope,
+    ) -> anyhow::Result<Option<LocalOwnerState>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(LOCAL_OWNER)?;
+        match table.get(scope_key(scope).as_str())? {
+            Some(guard) => Ok(Some(
+                serde_json::from_slice(guard.value()).context("deserialize LocalOwnerState")?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Every persisted local owner state — read at startup to re-establish the V4
+    /// retirement fences in the in-memory registry (`restore_local_retirements`).
+    pub fn list_local_states(&self) -> anyhow::Result<Vec<LocalOwnerState>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(LOCAL_OWNER)?;
+        let mut states = Vec::new();
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            states.push(
+                serde_json::from_slice(value.value()).context("deserialize LocalOwnerState")?,
+            );
+        }
+        Ok(states)
     }
 }
 
@@ -157,5 +207,32 @@ mod tests {
         let mut terms = store.list_owner_terms().unwrap();
         terms.sort_by_key(|t| t.epoch);
         assert_eq!(terms, vec![world, nano]);
+    }
+
+    /// #496 PR2b-2ii: a local owner state (V4 retirement) is durable across a reopen and
+    /// `list_local_states` returns every persisted one — read at startup to re-fence.
+    #[test]
+    fn local_owner_state_survives_reopen_and_lists() {
+        use sentinel_common::{LocalOwnerRole, LocalOwnerState};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cluster_meta.redb");
+        let p = path.to_str().unwrap();
+        let scope = StateTransferScope::NanoContainer("AGENT-07".into());
+        let state = LocalOwnerState {
+            scope: scope.clone(),
+            node_id: OwnerRegistry::global().this_node(),
+            epoch: 4,
+            role: LocalOwnerRole::Retired,
+        };
+
+        {
+            let store = ClusterMetaStore::open(p).unwrap();
+            assert!(store.get_local_state(&scope).unwrap().is_none());
+            store.put_local_state(&state).unwrap();
+        }
+        // Reopen — the retirement must still fence.
+        let store = ClusterMetaStore::open(p).unwrap();
+        assert_eq!(store.get_local_state(&scope).unwrap(), Some(state.clone()));
+        assert_eq!(store.list_local_states().unwrap(), vec![state]);
     }
 }
