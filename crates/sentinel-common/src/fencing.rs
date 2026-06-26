@@ -138,9 +138,11 @@ pub enum LocalOwnerRole {
 /// the committed per-scope owner terms, and the old owner's guards then turn stale.
 ///
 /// **Single-node fast path (V26):** `validate`/`current_owner` sit on the hot path of
-/// every store write. An atomic `mode` flag is loaded `Relaxed` and short-circuits the
+/// every store write. An atomic `mode` flag is loaded `Acquire` (pairing with the
+/// `Release` store in [`commit_owner`](Self::commit_owner)) and short-circuits the
 /// `RwLock`/map lookup entirely while single-node — so the prod write path takes **no**
-/// lock and is byte-for-byte the pre-cluster behavior. Only after a real cross-node
+/// lock and is byte-for-byte the pre-cluster behavior (the acquire load is a plain load
+/// on x86; one cheap load-acquire on weakly-ordered archs). Only after a real cross-node
 /// commit does `validate` consult the term map under the read lock.
 #[derive(Debug)]
 pub struct OwnerRegistry {
@@ -201,7 +203,7 @@ impl OwnerRegistry {
     /// Whether the registry has entered cluster mode (a cross-node term was committed).
     /// Single-node prod stays `false`, so the V26 fast path stays active.
     pub fn is_cluster_mode(&self) -> bool {
-        self.mode.load(Ordering::Relaxed) == MODE_CLUSTER
+        self.mode.load(Ordering::Acquire) == MODE_CLUSTER
     }
 
     /// Commit a cross-node owner term (PR2b's handoff `OwnerCommit(E+1)`): record it in
@@ -213,11 +215,19 @@ impl OwnerRegistry {
     /// deliberately holds only the working view (it cannot depend on the redb store it
     /// is the authority for).
     pub fn commit_owner(&self, term: OwnerTerm) {
-        // Enter cluster mode *before* publishing the term so no reader can observe the
-        // new term while still on the single-node fast path.
-        self.mode.store(MODE_CLUSTER, Ordering::Relaxed);
-        let mut terms = self.terms.write().expect("owner term map poisoned");
-        terms.insert(term.scope.clone(), term);
+        // **Publish ordering (load-bearing under weak memory):** insert the term under
+        // the write lock FIRST, then flip `mode` to cluster with `Release`. A concurrent
+        // `validate`/`current_owner` that observes `mode == MODE_CLUSTER` via an
+        // `Acquire` load is then guaranteed (release-acquire happens-before) to also see
+        // this insert — it can never read cluster mode, miss the term, fall back to the
+        // seed term and wrongly accept or reject a write (a silent split-brain window).
+        // The reverse order (mode before insert) would expose exactly that window. See
+        // `tests/loom_owner_ordering.rs` for the model-checked proof.
+        {
+            let mut terms = self.terms.write().expect("owner term map poisoned");
+            terms.insert(term.scope.clone(), term);
+        }
+        self.mode.store(MODE_CLUSTER, Ordering::Release);
     }
 
     /// The current committed owner term for a scope. **Single-node fast path (V26):** a
@@ -226,7 +236,11 @@ impl OwnerRegistry {
     /// committed per-scope term is looked up under the read lock, falling back to the
     /// seed (epoch 1) for a scope no handoff has touched yet.
     pub fn current_owner(&self, scope: &StateTransferScope) -> OwnerTerm {
-        if self.mode.load(Ordering::Relaxed) == MODE_SINGLE_NODE {
+        // `Acquire` pairs with the `Release` in `commit_owner`: observing `MODE_CLUSTER`
+        // guarantees the committed term is visible to the `terms.read()` below. On the
+        // single-node fast path this is still a single lock-free load (identical to a
+        // plain load on x86; one cheap load-acquire on weakly-ordered archs).
+        if self.mode.load(Ordering::Acquire) == MODE_SINGLE_NODE {
             return self.seed_term(scope);
         }
         let terms = self.terms.read().expect("owner term map poisoned");
