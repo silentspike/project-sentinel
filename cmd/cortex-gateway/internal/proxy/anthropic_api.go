@@ -202,10 +202,13 @@ func buildAnthropicMessageResponse(resp PipelineResponse) anthropicMessageRespon
 		StopReason:   stopReason,
 		StopSequence: nil,
 		Usage: anthropicMessageResponseUsage{
-			InputTokens:              resp.InputTokens,
+			// resp.InputTokens is the folded total; reconstruct the faithful
+			// Anthropic breakdown (fresh input separate from cache) for MITM
+			// clients (#427 cache-aware).
+			InputTokens:              resp.InputTokens - resp.CacheRead - resp.CacheCreation,
 			OutputTokens:             resp.OutputTokens,
-			CacheCreationInputTokens: 0,
-			CacheReadInputTokens:     0,
+			CacheCreationInputTokens: resp.CacheCreation,
+			CacheReadInputTokens:     resp.CacheRead,
 			ServiceTier:              "standard",
 		},
 	}

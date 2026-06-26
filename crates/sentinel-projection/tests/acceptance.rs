@@ -500,3 +500,127 @@ fn expired_chaos_is_cleared_by_room_physics_update() {
         "expired chaos should be cleared on room physics updates"
     );
 }
+
+// ── #427: Cost projection ──────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn append_usage(
+    store: &EventStore,
+    tick: u64,
+    agent: u16,
+    tier: &str,
+    input: u32,
+    output: u32,
+    cache_read: u32,
+    cache_creation: u32,
+    cost: f64,
+) {
+    let payload = DomainEventPayload::AgentLlmUsage {
+        agent_id: AgentId(agent),
+        tier: tier.to_string(),
+        input_tokens: input,
+        output_tokens: output,
+        cache_read,
+        cache_creation,
+        cost_usd: cost,
+    };
+    // aggregate_id = AGENT-NN: CostHandler keys on this, not the numeric payload id.
+    let mut event = DomainEvent::new(
+        payload.event_type_str(),
+        &format!("AGENT-{agent:02}"),
+        &payload.to_json(),
+        &format!("req-{tick}"),
+        tick,
+    );
+    event.timestamp_ms = tick * 1000;
+    store.append_event(&event).unwrap();
+}
+
+#[test]
+fn cost_projection_aggregates_by_agent_tier_and_bucket() {
+    let dir = tempfile::tempdir().unwrap();
+    let es_path = dir.path().join("cost_es.db");
+    let rm_path = dir.path().join("cost_rm.db");
+    let store = Arc::new(EventStore::open(es_path.to_str().unwrap()).unwrap());
+
+    // AGENT-08 high: two calls in minute bucket 0 (ts 10000, 20000).
+    append_usage(&store, 10, 8, "high", 1000, 500, 200, 100, 0.02);
+    append_usage(&store, 20, 8, "high", 300, 100, 0, 0, 0.005);
+    // AGENT-09 low: one call in minute bucket 60000 (ts 70000).
+    append_usage(&store, 70, 9, "low", 50, 20, 0, 0, 0.0001);
+
+    let worker = rebuild_all(Arc::clone(&store), rm_path.to_str().unwrap());
+    let rs = worker.read_store();
+
+    let by_agent = rs.cost_by_agent().unwrap();
+    assert_eq!(by_agent.len(), 2);
+    let a8 = by_agent.iter().find(|r| r.key == "AGENT-08").unwrap();
+    assert_eq!(a8.input_tokens, 1300);
+    assert_eq!(a8.output_tokens, 600);
+    assert_eq!(a8.cache_read, 200);
+    assert_eq!(a8.cache_creation, 100);
+    assert_eq!(a8.call_count, 2);
+    assert!((a8.cost_usd - 0.025).abs() < 1e-9);
+
+    let by_tier = rs.cost_by_tier().unwrap();
+    let high = by_tier.iter().find(|r| r.key == "high").unwrap();
+    assert_eq!(high.call_count, 2);
+    assert_eq!(high.input_tokens, 1300);
+    let low = by_tier.iter().find(|r| r.key == "low").unwrap();
+    assert_eq!(low.call_count, 1);
+
+    // Two minute buckets, ascending by bucket_start.
+    let ts = rs.cost_timeseries().unwrap();
+    assert_eq!(ts.len(), 2);
+    assert_eq!(ts[0].key, "0");
+    assert_eq!(ts[0].call_count, 2);
+    assert_eq!(ts[1].key, "60000");
+    assert_eq!(ts[1].call_count, 1);
+}
+
+#[test]
+fn cost_record_is_idempotent_on_replay() {
+    use sentinel_projection::store::LlmCostUpdate;
+    use sentinel_projection::ReadModelStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("cost_idem.db");
+    let store = ReadModelStore::open(db.to_str().unwrap()).unwrap();
+    let u = LlmCostUpdate {
+        agent_id: "AGENT-08",
+        tier: "high",
+        input_tokens: 1000,
+        output_tokens: 500,
+        cache_read: 200,
+        cache_creation: 100,
+        cost_usd: 0.02,
+        bucket_ms: 120_000,
+    };
+
+    // Same row_id twice in one batch: the WHERE excluded.last_event_id guard blocks the second.
+    {
+        let txn = store.begin_transaction().unwrap();
+        txn.begin().unwrap();
+        txn.record_llm_cost(&u, 42).unwrap();
+        txn.record_llm_cost(&u, 42).unwrap();
+        txn.commit().unwrap();
+    }
+    let agents = store.cost_by_agent().unwrap();
+    assert_eq!(agents.len(), 1);
+    assert_eq!(
+        agents[0].call_count, 1,
+        "duplicate row_id must not double-count"
+    );
+    assert!((agents[0].cost_usd - 0.02).abs() < 1e-9);
+
+    // A higher row_id DOES apply (real new event).
+    {
+        let txn = store.begin_transaction().unwrap();
+        txn.begin().unwrap();
+        txn.record_llm_cost(&u, 43).unwrap();
+        txn.commit().unwrap();
+    }
+    let agents = store.cost_by_agent().unwrap();
+    assert_eq!(agents[0].call_count, 2);
+    assert!((agents[0].cost_usd - 0.04).abs() < 1e-9);
+}

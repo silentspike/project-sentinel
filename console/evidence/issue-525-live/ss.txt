@@ -1,0 +1,6 @@
+## AC-1: ss -ltnp (9090/8083 loopback)
+LISTEN 0      128        127.0.0.1:9090       0.0.0.0:*    users:(("sentinel-daemon",pid=222408,fd=45))            
+LISTEN 0      4096       127.0.0.1:8083       0.0.0.0:*    users:(("sentinel-nats-b",pid=222331,fd=9))             
+
+## non-loopback audit (nur SSH + systemd-resolve erlaubt)
+LISTEN 0      4096   127.0.0.53%lo:53         0.0.0.0:*    users:(("systemd-resolve",pid=16768,fd=15))             

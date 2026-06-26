@@ -326,3 +326,34 @@ fn config_defaults_match_issue_requirements() {
     assert_eq!(config.max_inflight_global, 128);
     assert_eq!(config.max_inflight_per_agent, 8);
 }
+
+/// #525: loopback listen pin does not break the bus — session opens and an
+/// intra-process pub/sub roundtrip still works. transport_mode is LOGGED only
+/// (not asserted): SHM availability is env-dependent (e.g. absent on the cargo
+/// remote build LXC), so asserting Shm would be flaky. The definitive proof that
+/// the pin actually took effect lives on the deploy VM (no `loopback listen pin
+/// failed` warn in the daemon log + `ss` showing the listener on 127.0.0.1),
+/// NOT in this CI test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac_525_loopback_listen_pin_smoke() {
+    let bus = SentinelBus::with_config(BusConfig::default())
+        .await
+        .expect("bus opens with loopback listen pin applied");
+
+    // transport_mode is env-dependent (SHM may be unavailable in CI) -> log, do NOT assert.
+    eprintln!("#525 smoke: transport_mode = {:?}", bus.transport_mode());
+
+    let topic = "sentinel/test/525_loopback_pin_smoke";
+    let sub = bus.subscribe(topic).await.expect("subscribe");
+    // subscription propagation
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    bus.publish(topic, b"525-loopback").await.expect("publish");
+
+    let sample = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv_async())
+        .await
+        .expect("timeout waiting for pub/sub roundtrip")
+        .expect("recv");
+
+    assert_eq!(sample.payload().to_bytes().as_ref(), b"525-loopback");
+}

@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::ProjectionConfig;
 use crate::handlers::agent_live_view::AgentLiveViewHandler;
+use crate::handlers::cost::CostHandler;
 use crate::handlers::kpi::KpiHandler;
 use crate::handlers::room_live_view::RoomLiveViewHandler;
 use crate::handlers::task_kanban_view::TaskKanbanHandler;
@@ -76,6 +77,7 @@ impl ProjectionWorker {
             Box::new(RoomLiveViewHandler),
             Box::new(KpiHandler),
             Box::new(TaskKanbanHandler),
+            Box::new(CostHandler),
         ];
 
         Ok(Self {

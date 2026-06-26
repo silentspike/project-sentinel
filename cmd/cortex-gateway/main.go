@@ -335,6 +335,8 @@ func main() {
 			"synthesis_count":             costStats.SynthesisCount,
 			"synthesis_rate":              costStats.SynthesisRate,
 			"cost_by_provider":            costStats.ByProvider,
+			"cost_by_agent":               costStats.CostByAgent,
+			"tokens_by_agent":             costStats.TokensByAgent,
 			"local_loop_enabled":          localLoopActive,
 			"primary_provider":            trafficConfig.PrimaryProvider,
 			"internal_primary_provider":   trafficConfig.PrimaryProvider,

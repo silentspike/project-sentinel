@@ -60,6 +60,8 @@ const NON_AGENT_EVENT_TYPES: &[&str] = &[
     "task_status_changed",
     "task_completed",
     "task_blocked",
+    // #427: cost telemetry is projection-only — it changes no live view.
+    "agent_llm_usage",
 ];
 
 const ROOM_EVENT_TYPES: &[&str] = &[
@@ -121,6 +123,7 @@ const KNOWN_EVENT_TYPES: &[&str] = &[
     "operator_broadcast_sent",
     "operator_dm_sent",
     "config_applied",
+    "agent_llm_usage",
 ];
 
 /// Welche Read-Models ein Event-Typ neu lesen/pushen muss.
@@ -430,6 +433,7 @@ mod tests {
         "operator_broadcast_sent",
         "operator_dm_sent",
         "config_applied",
+        "agent_llm_usage",
     ];
 
     /// Die im Plan/Issue explizit agent-relevanten Events MUESSEN einen Push ausloesen.

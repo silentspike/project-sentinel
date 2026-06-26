@@ -21,6 +21,8 @@ import { GaiaWizardView } from "./views/GaiaWizardView";
 import { AgentEditorView } from "./views/AgentEditorView";
 import { ConfigEditorView } from "./views/ConfigEditorView";
 import { SynthesisView } from "./views/SynthesisView";
+import { CostView } from "./views/CostView";
+import { OrgChartView } from "./views/OrgChartView";
 
 // Mobile-Breakpoint via matchMedia (Desktop=Tiling, Mobile=BottomTabBar).
 function useIsMobile() {
@@ -30,7 +32,7 @@ function useIsMobile() {
   return m;
 }
 
-const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "profiling", "cockpit", "activity", "chaos", "chat", "control", "timetravel", "gaia-wizard", "agent-editor", "config-editor", "synthesis"];
+const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "profiling", "cockpit", "activity", "chaos", "chat", "control", "timetravel", "gaia-wizard", "agent-editor", "config-editor", "synthesis", "cost", "org-chart"];
 const PANEL_LABEL: Record<PanelKind, string> = {
   agents: "Agents",
   floorplan: "Floorplan",
@@ -46,6 +48,8 @@ const PANEL_LABEL: Record<PanelKind, string> = {
   "agent-editor": "Agent Editor",
   "config-editor": "Config Editor",
   synthesis: "Synthesis",
+  cost: "Cost",
+  "org-chart": "Org Chart",
 };
 
 function Login(props: { onOk: () => void }): JSX.Element {
@@ -95,6 +99,8 @@ const PANELS: Record<PanelKind, () => JSX.Element> = {
   "agent-editor": AgentEditorView,
   "config-editor": ConfigEditorView,
   synthesis: SynthesisView,
+  cost: CostView,
+  "org-chart": OrgChartView,
 };
 
 // Tile-Chrome: kompakte Leiste (Split horizontal/vertikal, Schliessen) ueber dem Panel.

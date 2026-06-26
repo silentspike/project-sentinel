@@ -661,6 +661,137 @@ impl WorldSnapshot {
     pub const SCHEMA_VERSION: u32 = 3;
 }
 
+/// Per-container ECS snapshot (#497): exactly ONE agent's per-agent components — and nothing else.
+///
+/// Structurally contains no world-scope resources: `ActiveChaos`/`ActiveSmells`/`RoomChatBuffer`/
+/// `GaiaBuffer`/`BroadcastBuffer` live in [`EcsSnapshot`] and belong to the `World` scope, never to
+/// a container (G0). This is the AC-1 "no foreign state" guarantee made *unrepresentable* rather
+/// than merely checked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NanoContainerEcsSnapshot {
+    pub agent_id: u16,
+    pub identity: crate::components::AgentIdentity,
+    pub position: crate::components::Position,
+    pub bio_state: crate::components::BioState,
+    pub personality: crate::components::Personality,
+    pub mood: crate::components::Mood,
+    pub perception_state: crate::components::PerceptionState,
+    pub work_context: crate::components::WorkContext,
+    pub agent_capabilities: crate::components::AgentCapabilities,
+    pub event_queue: crate::components::EventQueue,
+    pub shift_info: crate::components::ShiftInfo,
+    pub relationships: crate::components::Relationships,
+    pub llm_config: crate::components::LlmConfig,
+    /// `AutonomyCooldown.last_action_tick` (the component lives in sentinel-ecs; the value is
+    /// carried here so the crate boundary stays clean, mirroring [`EcsSnapshot::autonomy_cooldowns`]).
+    pub autonomy_cooldown_last_action_tick: u64,
+}
+
+/// Per-container redb rows (#497): the migrating agent's rows filtered out of the shared StateStore.
+///
+/// Each field is the raw serialized row value (or `None` if the agent has no such row yet). Filled
+/// by `dump_agent_tables` (sentinel-redb) — never a whole-table dump (AC-2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NanoContainerRedbRows {
+    pub agent_id: u16,
+    pub agent_state: Option<Vec<u8>>,
+    pub personality: Option<Vec<u8>>,
+    pub relationships: Option<Vec<u8>>,
+    pub voice_style: Option<Vec<u8>>,
+    pub behavioral_notes: Option<Vec<u8>>,
+    pub narrative_summary: Option<Vec<u8>>,
+    pub nmda_scores: Option<Vec<u8>>,
+    pub agent_facts: Option<Vec<u8>>,
+    pub evolution_version: Option<u64>,
+}
+
+/// V27 cross-store consistency cut for a per-container snapshot (#497).
+///
+/// There is no distributed 2PC (TOGAF: no external coordinator). Instead every store is captured
+/// under the SAME owner-epoch fence (#496) and this cut records the boundary so the snapshot is
+/// reconcilable on restore:
+/// - **K1** single-store writes need only the `OwnerWriteGuard` (the epoch below).
+/// - **K2** multi-store assembly is an idempotent saga keyed by the cut (e.g. the post-hoc CAS pin),
+///   reconciled on restart against the recorded boundary — never atomic-across-stores.
+/// - **K3** anything still mutating in the migration window is rejected/queued (V11/V17 bounded class).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SnapshotCut {
+    /// Owner-epoch (#496) the snapshot was fenced under; a stale-epoch write after the cut is rejected.
+    pub owner_epoch: u64,
+    /// Event-store cursor (`last_event_id`) at the cut — a restore replays nothing past it.
+    pub event_cursor: i64,
+    /// CAS blobs pinned for the transfer (in-transit grace pin via the #492 `pin_snapshot_blobs`
+    /// mechanism, which already blocks GC). Empty for ECS-native containers (no bwrap home / no CAS).
+    #[serde(default)]
+    pub cas_pin_set: Vec<String>,
+    /// Inbound-message cursor. `None` for the Track-A bounded class (active inbound = `NotMigratable`,
+    /// #497 AC-3); the durable inbound queue + dedup is Track E/H.
+    #[serde(default)]
+    pub inbound_cursor: Option<u64>,
+}
+
+/// Per-container snapshot envelope (#497): ECS subset + filtered redb rows + optional FS subtree,
+/// all under one V27 [`SnapshotCut`].
+///
+/// For Track-A ECS-native containers `fs_subtree` is `None` (no bwrap home) and `cut.cas_pin_set`
+/// is empty; the bwrap-home CAS manifest (#500a) + its in-transit pin are wired into the live
+/// spawn/snapshot path by #500b/Track B. Self-describing via `agent_id` + `captured_at_tick`; the
+/// owner-epoch fence under which it is taken lives in `cut.owner_epoch` (#489/#496 integration).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NanoContainerSnapshot {
+    pub agent_id: u16,
+    pub captured_at_tick: u64,
+    pub ecs: NanoContainerEcsSnapshot,
+    #[serde(default)]
+    pub redb_rows: NanoContainerRedbRows,
+    #[serde(default)]
+    pub fs_subtree: Option<FsMetadataDump>,
+    #[serde(default)]
+    pub cut: SnapshotCut,
+}
+
+impl NanoContainerSnapshot {
+    /// #489/#496 coupling (#8): express this per-container snapshot as a [`FencedStateTransfer`] with
+    /// `scope = NanoContainer(agent)` and the fence epoch from its [`SnapshotCut`]. ECS-native: empty
+    /// CAS manifest, no projection delta / route update yet — the move saga (#501) fills those.
+    pub fn to_fenced_transfer(&self) -> FencedStateTransfer {
+        FencedStateTransfer {
+            scope: StateTransferScope::for_agent(AgentId(self.agent_id).to_string()),
+            owner_epoch: self.cut.owner_epoch,
+            source_cursor: StateTransferCursor {
+                tick: self.captured_at_tick,
+                last_event_id: self.cut.event_cursor,
+            },
+            snapshot_id: format!("nano-{}-t{}", self.agent_id, self.captured_at_tick),
+            cas_manifest: CasManifest::default(),
+            projection_delta: ProjectionDelta::default(),
+            route_update: RouteUpdate::default(),
+            target_cursor: None,
+        }
+    }
+
+    /// #497 AC-5: container-scoped, order-stable hash of the AGENT STATE (ECS components + filtered
+    /// redb rows) — NOT the envelope metadata (`captured_at_tick` / `cut`), which varies by when and
+    /// where the snapshot is taken. Two snapshots of the same resting container (e.g. before and
+    /// after a transfer) therefore hash equal.
+    ///
+    /// Order-stable: the snapshot holds no `HashMap` (the #439 lesson — never iterate a `HashMap` in
+    /// a hash) and `Vec`s keep their order through serialization. Deterministic for the same CPU
+    /// class (the f32 agent state is bit-identical across same-class nodes; AC-DX). A cross-CPU-class
+    /// transfer is still correct (state is copied, not recomputed) but is not asserted by this hash.
+    pub fn state_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_vec(&self.ecs)
+            .unwrap_or_default()
+            .hash(&mut h);
+        serde_json::to_vec(&self.redb_rows)
+            .unwrap_or_default()
+            .hash(&mut h);
+        h.finish()
+    }
+}
+
 /// Scope einer gefenceten State-Transfer-Operation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StateTransferScope {
