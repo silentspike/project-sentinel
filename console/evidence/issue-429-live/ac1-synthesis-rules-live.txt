@@ -1,0 +1,13 @@
+=== Gateway aktivieren (Token-Fenster) ===
+active
+=== synthesis_enabled=true sicherstellen ===
+  PATCH config HTTP 200
+
+=== AC-1: GET /control/synthesis/rules (10 erwartet) ===
+  count= 10
+  names= ['bio_bladder', 'bio_hunger', 'bio_energy', 'bio_caffeine_low', 'circadian_morning', 'circadian_lunch', 'physics_temp_high', 'physics_noise_high', 'routine_idle_alone', 'routine_idle_with_presence']
+=== AC-1: toggle bio_bladder OFF + re-GET (effective) ===
+{"name":"bio_bladder","enabled":false}
+  POST HTTP 200 -> bio_bladder enabled= False
+=== AC-1: 404 fuer unbekannte Rule ===
+  POST unknown-rule HTTP 404 (404 erwartet)
