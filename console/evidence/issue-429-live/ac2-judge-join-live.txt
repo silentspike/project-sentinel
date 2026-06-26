@@ -1,0 +1,14 @@
+=== Seed: benigner judge_alert_received drift fuer AGENT-05 (#429 live-verify) ===
+4000
+  seed OK
+=== AC-2: authed judge-alerts (AGENT-05 erwartet, aggregate_id-Key) ===
+[{"agent_id":"AGENT-05","alert_type":"drift","details":"#429 live-verify seed (benign)","score":0.42,"severity":"warning","timestamp_ms":1782469376654}]
+=== AC-2: authed traffic-responses decision/rule/fourth_wall + JOIN-Demo ===
+  total= 17
+   agent=54(AGENT-54) decision=forward rule=None 4w=clean
+   agent=50(AGENT-50) decision=forward rule=None 4w=clean
+   agent=5(AGENT-05) decision=forward rule=None 4w=clean
+   agent=47(AGENT-47) decision=forward rule=None 4w=clean
+   agent=50(AGENT-50) decision=forward rule=None 4w=clean
+   agent=54(AGENT-54) decision=forward rule=None 4w=clean
+  -> AGENT-05 vorhanden im Traffic: True

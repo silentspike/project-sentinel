@@ -14,7 +14,11 @@ type ResponseLogEntry struct {
 	AgentID      string       `json:"agent_id,omitempty"`
 	AgentName    string       `json:"agent_name,omitempty"`
 	Content      string       `json:"content"`
-	LoggedAt     time.Time    `json:"logged_at"`
+	// #429: pipeline decision + matched rule + fourth-wall verdict for the Request Inspector.
+	Decision   string    `json:"decision,omitempty"`
+	Rule       string    `json:"rule,omitempty"`
+	FourthWall string    `json:"fourth_wall,omitempty"`
+	LoggedAt   time.Time `json:"logged_at"`
 }
 
 // ResponseLogBuffer keeps recent response bodies in memory for control-plane

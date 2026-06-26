@@ -223,6 +223,61 @@ pub async fn events(State(st): State<AppState>, Query(q): Query<EventsQuery>) ->
     .into_response()
 }
 
+/// GET /api/control/judge-alerts (#429): the latest Sentinel-Judge anomaly per agent for the
+/// Request Inspector's agent-level Judge column. Returns a (possibly empty) array; a missing
+/// events.db degrades to `[]`. Anomaly-based, so most agents have no entry (= healthy).
+pub async fn judge_alerts(State(st): State<AppState>) -> Response {
+    let conn = match open_events_ro(&st.config.events_db) {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %st.config.events_db, "judge-alerts route degraded: events.db unavailable");
+            return Json(Vec::<Value>::new()).into_response();
+        }
+    };
+
+    Json(query_judge_alerts(&conn)).into_response()
+}
+
+/// #429 R3-MUST-FIX: the inspector joins on the aggregate_id COLUMN ("AGENT-NN"), NOT
+/// payload.agent_id (an AgentId newtype that serializes numeric, with a lossy AgentId(1)
+/// parse fallback) — mirrors cockpit.rs's aggregate_id usage. Only alert_type/severity/
+/// score/details come from the payload. Returns the latest alert per agent.
+fn query_judge_alerts(conn: &Connection) -> Vec<Value> {
+    let sql = "SELECT aggregate_id, payload, timestamp_ms FROM events \
+               WHERE event_type = 'judge_alert_received' \
+               AND id IN (SELECT MAX(id) FROM events WHERE event_type = 'judge_alert_received' GROUP BY aggregate_id) \
+               ORDER BY timestamp_ms DESC";
+    let prepared = conn.prepare(sql).and_then(|mut stmt| {
+        stmt.query_map([], |row| {
+            let aggregate_id: String = row.get(0)?;
+            let payload_raw: String = row.get(1)?;
+            let timestamp_ms: i64 = row.get(2)?;
+            Ok((aggregate_id, payload_raw, timestamp_ms))
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
+    });
+    match prepared {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(agent_id, payload_raw, ts)| {
+                let p = parse_payload(&payload_raw);
+                json!({
+                    "agent_id": agent_id, // aggregate_id column = "AGENT-NN" (the join key)
+                    "alert_type": p.get("alert_type").and_then(Value::as_str).unwrap_or(""),
+                    "severity": p.get("severity").and_then(Value::as_str).unwrap_or("info"),
+                    "score": p.get("score").and_then(Value::as_f64).unwrap_or(0.0),
+                    "details": p.get("details").and_then(Value::as_str).unwrap_or(""),
+                    "timestamp_ms": ts,
+                })
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "judge-alerts query failed");
+            Vec::new()
+        }
+    }
+}
+
 pub async fn event_types(State(st): State<AppState>) -> Response {
     let conn = match open_events_ro(&st.config.events_db) {
         Ok(conn) => conn,
@@ -654,6 +709,63 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn judge_alerts_uses_aggregate_id_column_and_latest_per_agent() {
+        let (dir, db_path) = temp_events_db(true);
+        let conn = Connection::open(&db_path).unwrap();
+        // Two alerts for AGENT-07 (latest = id 3) + one for AGENT-03. payload.agent_id is numeric.
+        insert_event(
+            &conn,
+            1,
+            "judge_alert_received",
+            "AGENT-07",
+            r#"{"agent_id":7,"alert_type":"drift","severity":"warning","score":0.4,"details":"old"}"#,
+        );
+        insert_event(
+            &conn,
+            2,
+            "judge_alert_received",
+            "AGENT-03",
+            r#"{"agent_id":3,"alert_type":"fatigue","severity":"info","score":0.2,"details":"f"}"#,
+        );
+        insert_event(
+            &conn,
+            3,
+            "judge_alert_received",
+            "AGENT-07",
+            r#"{"agent_id":7,"alert_type":"quality","severity":"critical","score":0.9,"details":"new"}"#,
+        );
+        // A non-judge event for the same agent must be ignored.
+        insert_event(
+            &conn,
+            4,
+            "agent_action_received",
+            "AGENT-07",
+            r#"{"agent_id":7}"#,
+        );
+
+        let ro = open_events_ro(&db_path).unwrap();
+        let alerts = query_judge_alerts(&ro);
+        assert_eq!(alerts.len(), 2, "exactly one latest alert per agent");
+
+        let a7 = alerts
+            .iter()
+            .find(|a| a["agent_id"] == "AGENT-07")
+            .expect("AGENT-07 present");
+        // Latest (id 3) wins, and the join key is the aggregate_id column, never numeric.
+        assert_eq!(a7["alert_type"], "quality");
+        assert_eq!(a7["severity"], "critical");
+        assert!((a7["score"].as_f64().unwrap() - 0.9).abs() < 1e-9);
+        assert!(
+            alerts
+                .iter()
+                .all(|a| a["agent_id"].as_str().unwrap().starts_with("AGENT-")),
+            "agent_id must be the aggregate_id column (AGENT-NN), not numeric payload.agent_id"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

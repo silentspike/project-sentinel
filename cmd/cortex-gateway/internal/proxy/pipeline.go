@@ -216,6 +216,10 @@ type PipelineResponse struct {
 	FinishReason  string                       `json:"finish_reason"`
 	Actions       []extraction.ExtractedAction `json:"actions,omitempty"`
 	RequestID     string                       `json:"request_id"`
+	// #429: surfaced into the response log for the Request Inspector.
+	Decision   string `json:"decision,omitempty"`
+	Rule       string `json:"rule,omitempty"`
+	FourthWall string `json:"fourth_wall,omitempty"`
 }
 
 // NewPipelineHandler erstellt den Pipeline-Handler.
@@ -435,6 +439,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 						Content:      "",
 						Model:        "sentinel-synth-v1",
 						Provider:     "intercept",
+						Decision:     "dropped",
 						TokensUsed:   0,
 						FinishReason: "dropped",
 						Actions:      nil,
@@ -472,6 +477,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 					Content:      content,
 					Model:        "sentinel-synth-v1",
 					Provider:     "synthesis",
+					Decision:     "synthesize",
+					Rule:         result.Rule,
+					FourthWall:   "clean",
 					TokensUsed:   0,
 					InputTokens:  0,
 					OutputTokens: 0,
@@ -506,6 +514,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 							Content:      "",
 							Model:        "sentinel-apicp-v1",
 							Provider:     "intercept",
+							Decision:     "dropped",
 							TokensUsed:   0,
 							FinishReason: "dropped",
 							Actions:      nil,
@@ -538,6 +547,8 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 						Content:      content,
 						Model:        "sentinel-apicp-v1",
 						Provider:     "apicp",
+						Decision:     "apicp",
+						Rule:         learned.Fingerprint,
 						TokensUsed:   0,
 						InputTokens:  0,
 						OutputTokens: 0,
@@ -677,8 +688,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	}
 
 	// --- Step 7: Fourth-Wall Detection ---
+	fourthWallVerdict := ""
 	if agentName != "" {
-		content = ph.fourthWallCheck(ctx, content, agentName, agentRole, provider, &req)
+		content, fourthWallVerdict = ph.fourthWallCheck(ctx, content, agentName, agentRole, provider, &req)
 	}
 
 	content, dropped := ph.applyOutboundInterception(requestID, agentName, providerName, &req, content, snap)
@@ -687,6 +699,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 			Content:      "",
 			Model:        resp.Model,
 			Provider:     "intercept",
+			Decision:     "dropped",
 			TokensUsed:   0,
 			FinishReason: "dropped",
 			Actions:      nil,
@@ -754,6 +767,8 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		ContentBlocks: pipelineResponseBlocks(content, resp),
 		Model:         resp.Model,
 		Provider:      providerName,
+		Decision:      "forward",
+		FourthWall:    fourthWallVerdict,
 		TokensUsed:    resp.TokensUsed,
 		InputTokens:   resp.InputTokens,
 		OutputTokens:  resp.OutputTokens,
@@ -1091,20 +1106,30 @@ func (ph *PipelineHandler) shouldForwardAfterSynthesisFourthWallCheck(ctx contex
 	return true
 }
 
-// fourthWallCheck fuehrt die 2-Stage Detection durch und re-generiert bei Bedarf.
-func (ph *PipelineHandler) fourthWallCheck(ctx context.Context, content string, agentName, agentRole string, provider Provider, req *LLMRequest) string {
+// fourthWallCheck runs the 2-stage detection and re-generates on a break. It
+// returns the (possibly re-generated) content plus a verdict for the Request
+// Inspector (#429): "clean", "regenerated" (a break was fixed), "break" (a break
+// could not be fixed), or "" (detection errored before any verdict).
+func (ph *PipelineHandler) fourthWallCheck(ctx context.Context, content string, agentName, agentRole string, provider Provider, req *LLMRequest) (string, string) {
 	judgeAdapter := NewJudgeProviderAdapter(provider, req)
+	regenerated := false
 
 	for attempt := 0; attempt < maxRegenAttempts; attempt++ {
 		regenStart := time.Now()
 		result, err := detection.HandleFourthWall(ctx, content, agentName, agentRole, judgeAdapter)
 		if err != nil {
 			ph.logger.Warn("fourth-wall detection error", "error", err)
-			return content
+			if regenerated {
+				return content, "regenerated"
+			}
+			return content, ""
 		}
 
 		if result.Clean {
-			return content
+			if regenerated {
+				return content, "regenerated"
+			}
+			return content, "clean"
 		}
 
 		// Re-generate mit Correction + niedrigerer Temperature
@@ -1121,12 +1146,14 @@ func (ph *PipelineHandler) fourthWallCheck(ctx context.Context, content string, 
 
 		if sendErr != nil {
 			ph.logger.Error("re-generation failed", "error", sendErr)
-			return content
+			return content, "break"
 		}
 
 		content = resp.Content
+		regenerated = true
 	}
-	return content
+	// Attempts exhausted while still breaking.
+	return content, "break"
 }
 
 // personalityGuardCheck runs the DriftDetector on the LLM response.
@@ -1347,6 +1374,9 @@ func (ph *PipelineHandler) writePipelineResponse(_ context.Context, w http.Respo
 			AgentID:      req.Metadata["agent_id"],
 			AgentName:    req.Metadata["agent_name"],
 			Content:      resp.Content,
+			Decision:     resp.Decision,
+			Rule:         resp.Rule,
+			FourthWall:   resp.FourthWall,
 		})
 	}
 

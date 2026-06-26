@@ -4,7 +4,7 @@
 
 use axum::{
     body::Bytes,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -296,6 +296,46 @@ pub async fn traffic_stats(State(st): State<AppState>) -> Response {
         &st,
         reqwest::Method::GET,
         format!("{}/control/traffic-stats", st.config.gateway_url),
+        false,
+        None,
+    )
+    .await
+}
+
+/// GET /api/control/synthesis-rules → Gateway `/control/synthesis/rules` (#429 Rules Editor).
+pub async fn synthesis_rules(State(st): State<AppState>) -> Response {
+    forward(
+        &st,
+        reqwest::Method::GET,
+        format!("{}/control/synthesis/rules", st.config.gateway_url),
+        false,
+        None,
+    )
+    .await
+}
+
+/// POST /api/control/synthesis-rules/{name} → Gateway `/control/synthesis/rules/{name}` (#429 toggle).
+pub async fn set_synthesis_rule(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Response {
+    forward(
+        &st,
+        reqwest::Method::POST,
+        format!("{}/control/synthesis/rules/{name}", st.config.gateway_url),
+        false,
+        Some(body),
+    )
+    .await
+}
+
+/// GET /api/control/traffic-responses → Gateway `/control/traffic-responses` (#429 Request Inspector).
+pub async fn traffic_responses(State(st): State<AppState>) -> Response {
+    forward(
+        &st,
+        reqwest::Method::GET,
+        format!("{}/control/traffic-responses", st.config.gateway_url),
         false,
         None,
     )

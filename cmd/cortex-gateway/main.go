@@ -380,6 +380,27 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(responseLogs.Entries())
 	})
+	// #429: per-rule synthesis visibility + live toggle (process-memory only, like synthesis_enabled).
+	controlMux.HandleFunc("GET /control/synthesis/rules", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(synthEngine.RuleStates())
+	})
+	controlMux.HandleFunc("POST /control/synthesis/rules/{name}", func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		var body struct {
+			Enabled bool `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
+			return
+		}
+		if !synthEngine.SetRuleEnabled(name, body.Enabled) {
+			http.Error(w, `{"error":"unknown rule"}`, http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(synthesis.RuleState{Name: name, Enabled: body.Enabled})
+	})
 	controlMux.HandleFunc("GET /control/intercepts/responses/pending", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(responseInterceptor.Pending())

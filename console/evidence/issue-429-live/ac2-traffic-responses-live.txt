@@ -1,0 +1,14 @@
+=== Gateway proxy-Routen (welche geht durch die Pipeline?) ===
+Jun 26 10:20:44 sentinel-ubuntu-2404 cortex-gateway[203652]: {"time":"2026-06-26T10:20:44.657334857Z","level":"INFO","msg":"proxy server starting","addr":":8080"}
+=== synthetischer Synthesis-Request (bio_hunger H9, agent_id=5) an :8080 ===
+rate limit exceeded
+
+  -> HTTP 429
+
+=== zweiter (bio_bladder B9, agent_id=5) ===
+  -> HTTP 429
+=== AC-2: GET /control/traffic-responses (decision/rule/fourth_wall?) ===
+  total entries= 3
+    {'agent_id': '51', 'provider': 'synthesis', 'decision': 'synthesize', 'rule': 'routine_idle_with_presence', 'fourth_wall': 'clean'}
+    {'agent_id': '50', 'provider': 'claude-code', 'decision': 'forward', 'rule': None, 'fourth_wall': 'clean'}
+    {'agent_id': '54', 'provider': 'claude-code', 'decision': 'forward', 'rule': None, 'fourth_wall': 'clean'}

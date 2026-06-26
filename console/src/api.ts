@@ -44,6 +44,36 @@ export function putJson<T>(path: string, body: unknown): Promise<T> {
   return apiJson<T>(path, { method: "PUT", body: JSON.stringify(body) });
 }
 
+// #429: Synthesis Rules editor + Request Inspector types.
+export interface SynthesisRule {
+  name: string;
+  enabled: boolean;
+}
+
+export interface TrafficResponse {
+  request_id: string;
+  request_class?: string;
+  provider: string;
+  model?: string;
+  agent_id?: string;
+  agent_name?: string;
+  content: string;
+  logged_at: string;
+  decision?: string;
+  rule?: string;
+  fourth_wall?: string;
+}
+
+export interface JudgeAlert {
+  // The events.db aggregate_id ("AGENT-NN") — the inspector's agent-level join key.
+  agent_id: string;
+  alert_type: string;
+  severity: string;
+  score: number;
+  details: string;
+  timestamp_ms: number;
+}
+
 export interface EbpfMetrics {
   available: boolean;
   mode: string;
