@@ -1,6 +1,6 @@
 //! Deterministische Regeln fuer die Platform-Gesundheit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sentinel_common::AgentId;
 
@@ -49,6 +49,7 @@ pub fn evaluate_rules(
     config: &PlatformControlplaneConfig,
     write_rate_baselines: &HashMap<String, f64>,
     agent_name_to_id: &HashMap<String, AgentId>,
+    suspended_agents: &HashSet<String>,
 ) -> Vec<PlatformAction> {
     let mut actions = Vec::new();
 
@@ -58,6 +59,12 @@ pub fn evaluate_rules(
     // aber sie produzieren aktiv Actions. Erst despawnen wenn WIRKLICH tot.
     for agent_name in &metrics.stalled_agents {
         if metrics.llm_circuit_open {
+            continue;
+        }
+        // #428 (Auflage A): bewusst pausierte (Suspended) Agents sind per Definition stall-frei.
+        // Ein SIGSTOPpter Agent macht 0 Syscalls; ohne diesen Skip wuerde er nach Ablauf des
+        // Grace-/Cooldown-Fensters zwangs-restartet und die Pause damit aufgehoben.
+        if suspended_agents.contains(agent_name) {
             continue;
         }
         // Agent hat kuerzlich eine Action ausgefuehrt → nicht stalled
@@ -284,10 +291,55 @@ mod tests {
             &test_config(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "agent_stall");
         assert_eq!(actions[0].target, "Thomas Mueller");
+    }
+
+    #[test]
+    fn test_stall_rule_suppressed_for_suspended_agent() {
+        // #428 (Auflage A): ein bewusst pausierter (Suspended) Agent darf NICHT als Stall
+        // restartet werden — selbst wenn er als stalled gemeldet wird und Grace/Cooldown
+        // ueberschritten sind. Sonst wuerde ein Auto-Restart die Pause aufheben.
+        let metrics = PlatformMetrics {
+            stalled_agents: vec!["Thomas Mueller".to_string()],
+            ..Default::default()
+        };
+        let agent_name_to_id = HashMap::from([("Thomas Mueller".to_string(), AgentId(3))]);
+        let suspended = HashSet::from(["Thomas Mueller".to_string()]);
+
+        // Kontrolle: ohne Suppression feuert die Stall-Regel unter genau diesen Bedingungen.
+        let baseline = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &test_config(),
+            &HashMap::new(),
+            &agent_name_to_id,
+            &HashSet::new(),
+        );
+        assert_eq!(baseline.len(), 1, "ohne Suppression muss die Stall-Regel feuern");
+        assert!(matches!(
+            baseline[0].side_effect,
+            Some(PlatformSideEffect::RestartAgent(_))
+        ));
+
+        // Mit Suspended-Set: kein RestartAgent-Side-Effect (Pause bleibt erhalten).
+        let actions = evaluate_rules(
+            &metrics,
+            &HashMap::new(),
+            100,
+            &test_config(),
+            &HashMap::new(),
+            &agent_name_to_id,
+            &suspended,
+        );
+        assert!(
+            actions.is_empty(),
+            "ein pausierter (Suspended) Agent darf nicht stall-restartet werden"
+        );
     }
 
     #[test]
@@ -310,6 +362,7 @@ mod tests {
             &config,
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         assert!(
             actions.is_empty(),
@@ -337,6 +390,7 @@ mod tests {
             &config,
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         assert!(
             actions.is_empty(),
@@ -364,6 +418,7 @@ mod tests {
             &config,
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         assert_eq!(
             actions.len(),
@@ -390,6 +445,7 @@ mod tests {
             &test_config(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         assert!(actions.is_empty(), "Should be cooled down");
     }
@@ -407,6 +463,7 @@ mod tests {
             &test_config(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "event_store_size");
@@ -426,6 +483,7 @@ mod tests {
             &test_config(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "projection_lag");
@@ -449,6 +507,7 @@ mod tests {
             &test_config(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "memory_pressure");
@@ -493,6 +552,7 @@ mod tests {
             &test_config(),
             &HashMap::new(),
             &agent_name_to_id,
+            &HashSet::new(),
         );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "write_anomaly");
@@ -516,6 +576,7 @@ mod tests {
             &test_config(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         assert!(actions.is_empty());
     }
@@ -540,6 +601,7 @@ mod tests {
             &config,
             &baselines,
             &agent_name_to_id,
+            &HashSet::new(),
         );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].action_label, "sigstop");
@@ -563,6 +625,7 @@ mod tests {
             &test_config(),
             &HashMap::new(),
             &name_to_id,
+            &HashSet::new(),
         );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].action_label, "restart_triggered");
@@ -588,6 +651,7 @@ mod tests {
             &test_config(),
             &HashMap::new(),
             &name_to_id,
+            &HashSet::new(),
         );
 
         assert!(
@@ -622,6 +686,7 @@ mod tests {
             &test_config(),
             &HashMap::new(),
             &name_to_id,
+            &HashSet::new(),
         );
 
         assert_eq!(actions.len(), 1);
@@ -645,6 +710,7 @@ mod tests {
             &test_config(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].rule_name, "service_health");
@@ -670,6 +736,7 @@ mod tests {
             &test_config(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         assert!(actions.is_empty());
     }
