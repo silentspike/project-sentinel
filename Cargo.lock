@@ -4463,6 +4463,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls",
+ "sentinel-common",
  "serde",
  "serde_json",
  "sha2",
@@ -4651,6 +4652,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tracing",
+ "uuid",
  "zstd",
 ]
 
