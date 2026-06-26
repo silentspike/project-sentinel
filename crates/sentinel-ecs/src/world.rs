@@ -1654,6 +1654,45 @@ pub fn snapshot_agent_ecs_state(
     })
 }
 
+/// #497: restore exactly ONE agent from a [`sentinel_common::NanoContainerEcsSnapshot`].
+///
+/// Despawns only the agent with the snapshot's `agent_id` (no-op if it is not currently spawned)
+/// and respawns it from the captured components — every other agent is untouched and the global
+/// tick keeps running, unlike the whole-world [`restore_ecs_state`] which despawns ALL agents.
+///
+/// The respawned entity gets a NEW `EntityId`. This is safe because cross-agent references are
+/// `agent_id`-based (`Relationships` is `Vec<(AgentId, _)>`; the `all_agents` lookups resolve by
+/// `agent_id`/name), never cached `EntityId`s — so reference-integrity (AC-3b/V12) is resolved
+/// through `agent_id` / the `RouteRegistry`, never a stale local entity handle. Returns the new
+/// entity.
+pub fn restore_agent_ecs_state(
+    world: &mut World,
+    snapshot: &sentinel_common::NanoContainerEcsSnapshot,
+) -> Entity {
+    let agent_id = AgentId(snapshot.agent_id);
+    // Filtered: despawn ONLY this agent (others stay live; no-op if it is not spawned).
+    despawn_agent_from_world(world, agent_id);
+    world
+        .spawn((
+            snapshot.identity.clone(),
+            snapshot.position.clone(),
+            snapshot.bio_state.clone(),
+            snapshot.personality.clone(),
+            snapshot.mood.clone(),
+            snapshot.perception_state.clone(),
+            snapshot.work_context.clone(),
+            snapshot.relationships.clone(),
+            snapshot.llm_config.clone(),
+            snapshot.shift_info.clone(),
+            snapshot.event_queue.clone(),
+            AutonomyCooldown {
+                last_action_tick: snapshot.autonomy_cooldown_last_action_tick,
+            },
+            snapshot.agent_capabilities.clone(),
+        ))
+        .id()
+}
+
 /// Restored den ECS-Zustand aus einem Snapshot.
 /// Despawnt ALLE bestehenden Agent-Entities und erstellt neue aus dem Snapshot.
 pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnapshot) {

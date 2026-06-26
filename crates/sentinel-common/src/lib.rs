@@ -18,6 +18,7 @@ pub mod nano_runtime;
 pub mod provision;
 pub mod psi;
 pub mod room;
+pub mod route;
 pub mod snapshot_codec;
 pub mod types;
 
@@ -36,6 +37,7 @@ pub use membership::{
 };
 pub use nano_runtime::*;
 pub use provision::{validate_pending_target, ProvisionError, ProvisionOp, ProvisionOpState};
+pub use route::{RouteEntry, RouteRegistry, RouteState};
 pub use snapshot_codec::{
     decode_snapshot_cursor, decode_world_snapshot, encode_snapshot_cursor, encode_world_snapshot,
     SnapshotCursor,
