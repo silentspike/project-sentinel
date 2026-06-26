@@ -384,6 +384,90 @@ pub async fn platform_analyze(State(st): State<AppState>, body: Bytes) -> Respon
     .await
 }
 
+// ── #428 Agent Deep View: per-Agent FS-Browse (read-only) + Pause/Resume/Despawn ──
+
+/// #428: optionaler `inode`-Query fuer FS-Browse/Read (Default Root inode 1 beim Browse).
+#[derive(Debug, Deserialize)]
+pub struct AgentFsQuery {
+    inode: Option<u64>,
+}
+
+/// GET /api/control/agent/{id}/fs?inode=N → Operator-API `/operator/security/agent-fs` (read-only).
+pub async fn agent_fs(
+    State(st): State<AppState>,
+    Path(id): Path<u32>,
+    Query(q): Query<AgentFsQuery>,
+) -> Response {
+    let inode = q.inode.unwrap_or(1);
+    forward(
+        &st,
+        reqwest::Method::GET,
+        format!(
+            "{}/operator/security/agent-fs?agent_id={id}&inode={inode}",
+            st.config.operator_url
+        ),
+        true,
+        None,
+    )
+    .await
+}
+
+/// GET /api/control/agent/{id}/fs/read?inode=N → Operator-API `/operator/security/agent-fs-read`.
+pub async fn agent_fs_read(
+    State(st): State<AppState>,
+    Path(id): Path<u32>,
+    Query(q): Query<AgentFsQuery>,
+) -> Response {
+    let inode = q.inode.unwrap_or(0);
+    forward(
+        &st,
+        reqwest::Method::GET,
+        format!(
+            "{}/operator/security/agent-fs-read?agent_id={id}&inode={inode}",
+            st.config.operator_url
+        ),
+        true,
+        None,
+    )
+    .await
+}
+
+/// POST /api/control/agent/{id}/stop → Operator-API `/operator/runtime/pause` (Pause, nicht destruktiv).
+pub async fn agent_stop(State(st): State<AppState>, Path(id): Path<u32>) -> Response {
+    forward(
+        &st,
+        reqwest::Method::POST,
+        format!("{}/operator/runtime/pause", st.config.operator_url),
+        true,
+        Some(Bytes::from(format!("{{\"agent_id\":{id}}}"))),
+    )
+    .await
+}
+
+/// POST /api/control/agent/{id}/start → Operator-API `/operator/runtime/resume`.
+pub async fn agent_start(State(st): State<AppState>, Path(id): Path<u32>) -> Response {
+    forward(
+        &st,
+        reqwest::Method::POST,
+        format!("{}/operator/runtime/resume", st.config.operator_url),
+        true,
+        Some(Bytes::from(format!("{{\"agent_id\":{id}}}"))),
+    )
+    .await
+}
+
+/// POST /api/control/agent/{id}/remove → Operator-API `/operator/runtime/despawn` (destruktiv, confirm-gated).
+pub async fn agent_remove(State(st): State<AppState>, Path(id): Path<u32>) -> Response {
+    forward(
+        &st,
+        reqwest::Method::POST,
+        format!("{}/operator/runtime/despawn", st.config.operator_url),
+        true,
+        Some(Bytes::from(format!("{{\"agent_id\":{id}}}"))),
+    )
+    .await
+}
+
 /// GET /api/control/status — aggregierter Gateway-Status, 200 auch bei offline Gateway.
 pub async fn status(State(st): State<AppState>) -> Response {
     let config = match st
