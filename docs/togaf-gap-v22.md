@@ -140,6 +140,7 @@ The numbers reflect the state at the v0.1.0-alpha boundary.
 | Item                          | Status | Evidence |
 |-------------------------------|--------|----------|
 | WorldSnapshot (bincode 2)     | ✅ | `crates/sentinel-limbo/src/snapshot.rs` |
+| WorldSnapshot coverage (#486) | 🟡 | redb dump/restore covers 12 tables including `api_patterns`; `RoomPhysicsState` is not serialized in `EcsSnapshot` and restore/projection reconstructs room occupancy from agent positions; ArtifactPlane tables (`FS_OBJECTS`, `FS_MANIFESTS`, `FS_CHUNKS`, and related indexes) live in `sentinel-fs` separately and are not implied by WorldSnapshot coverage. TOGAF Cluster 11 HTML corrections are main-session-only handoff items. |
 | Hot-swap restore              | ✅ | `services/sentinel-daemon/src/runtime_health.rs` (snapshot reload path) |
 | Deterministic replay          | ✅ | `services/sentinel-nightrun/` |
 | Non-blocking evolution LLM (#278) | 🟡 | Async `evolution_task` moves nightrun/shift LLM calls out of the ECS tick loop; Deploy-VM nightrun returned in 0.669 ms and gateway-down shift jobs failed safe, but total shift transition measured ~1.455 s on the i7-3930K VM, above the strict `<1s` AC target due remaining Hippocampus/sandbox work |
