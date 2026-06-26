@@ -3,7 +3,7 @@
 //! This crate owns the user-facing Gaia memory layer for #443: a local
 //! relational-temporal redb graph, a Markdown memory file, read-only wake-up
 //! rehydration, Hippocampus source access, and a crate-local backup path.
-//! It is intentionally separate from simulation `WorldSnapshot` state.
+//! It is intentionally separate from simulation snapshot state.
 
 pub mod backup;
 pub mod cli;
