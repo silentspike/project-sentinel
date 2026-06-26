@@ -32,7 +32,8 @@ type Config struct {
 		URL string `toml:"url"`
 	} `toml:"nats"`
 	Server struct {
-		HealthPort int `toml:"health_port"`
+		HealthPort     int    `toml:"health_port"`
+		HealthBindAddr string `toml:"health_bind_addr"`
 	} `toml:"server"`
 }
 
@@ -64,6 +65,12 @@ func main() {
 	}
 	if cfg.Server.HealthPort <= 0 {
 		cfg.Server.HealthPort = 8083
+	}
+	// #525: loopback secure default for the health endpoint. An explicit
+	// health_bind_addr overrides; empty -> loopback with the configured
+	// health_port (no hardcoded 8083 — ORC Finding 2).
+	if cfg.Server.HealthBindAddr == "" {
+		cfg.Server.HealthBindAddr = fmt.Sprintf("127.0.0.1:%d", cfg.Server.HealthPort)
 	}
 
 	logger.Info("sentinel-nats-bridge starting",
@@ -127,7 +134,7 @@ func main() {
 		fmt.Fprint(w, `{"status":"ok","service":"sentinel-nats-bridge"}`)
 	})
 	healthServer := &http.Server{
-		Addr:         ":" + strconv.Itoa(cfg.Server.HealthPort),
+		Addr:         cfg.Server.HealthBindAddr,
 		Handler:      healthMux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
