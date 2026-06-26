@@ -32,12 +32,13 @@ Source: `smoke-summary.json`
 
 ## Screenshots
 
-- `old-control.png`
 - `new-control.png`
-- `old-timetravel.png`
 - `new-timetravel.png`
 - `cutover-control.png`
 - `cutover-timetravel.png`
+
+> The `old-*` Bun-baseline screenshots were removed as repo hygiene (the Bun
+> dashboard itself was deleted in #469; the originals remain in git history).
 
 ## Checks
 
