@@ -1,0 +1,61 @@
+# github-runner-ephemeral@.service - systemd template for a single-job GitHub Actions runner.
+#
+# Instantiate per runner slot, e.g.:
+#   systemctl enable --now github-runner-ephemeral@runner-1.service
+#   systemctl enable --now github-runner-ephemeral@runner-2.service
+#
+# %i is the instance name passed to install-ephemeral-runner.sh, which uses it as the
+# GitHub runner --name and as the /opt/actions-runner/<instance> workdir.
+#
+# #435 lifecycle: install-ephemeral-runner.sh registers the runner with config.sh
+# --ephemeral (1 job -> self-destruct) and then runs it. After the single job ends the
+# runner exits; Restart=always re-provisions a fresh runner (new token, new registration)
+# via ExecStartPre wiping only the job bloat + stale registration - the cached binary
+# stays. This is the fix for the CT-150 incident (stuck cgroup remnants + bloat across
+# jobs on a persistent runner).
+#
+# See docs/ci-runner-runbook.md for provisioning, token strategy, and the Part-B
+# live-migration steps.
+[Unit]
+Description=GitHub Actions ephemeral runner %i (1 job -> self-destruct + re-provision, #435)
+Documentation=https://github.com/silentspike/project-sentinel/issues/435
+After=network-online.target
+Wants=network-online.target
+# Re-provision backstop: after a job ends the runner exits; systemd restarts the unit,
+# which re-runs install-ephemeral-runner.sh (fresh token + new --ephemeral registration).
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=actions-runner
+WorkingDirectory=/opt/actions-runner/%i
+# CI jobs (cargo, CodeQL) write to $HOME/.cargo and the runner home. Keep HOME and
+# CARGO_HOME inside the writable workdir so ProtectSystem=strict does not choke the
+# first real job (bloat stays in the ephemeral workdir -> wiped per re-provision).
+# ORC review point 2.
+Environment=HOME=/opt/actions-runner/%i
+Environment=CARGO_HOME=/opt/actions-runner/%i/.cargo
+# Per re-provision wipe ONLY job bloat + stale registration - NOT the cached binary
+# (else a 100MB re-download + an api.github.com call per job -> rate-limit wall).
+# _work/  = checkout/build/CodeQL-db/cargo-target (the CT-150 bloat);
+# .runner/.credentials = stale registration (config.sh --ephemeral re-registers fresh).
+# bin/ externals/ config.sh run.sh stay cached. ORC review point 2.
+ExecStartPre=/bin/rm -rf /opt/actions-runner/%i/_work /opt/actions-runner/%i/.runner /opt/actions-runner/%i/.credentials
+# Token via RUNNER_TOKEN_CMD (host helper, Part B) or RUNNER_REGISTRATION_TOKEN (ad-hoc).
+# Override --url per org/repo if the runner target differs from the default below.
+ExecStart=/opt/actions-runner/install-ephemeral-runner.sh --url https://github.com/silentspike %i
+Restart=always
+RestartSec=5
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=github-runner-%i
+# Security hardening (repo-standard, consistent with deploy/systemd/sentinel-agent@.service)
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/actions-runner /tmp
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
