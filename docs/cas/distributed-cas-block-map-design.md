@@ -126,7 +126,7 @@ There is **no** API that gossips every block ID (unscalable at 100k-1M blocks, V
 `Add` on durable publish (after V28 `temp -> verify -> fsync -> rename -> fsync(dir)`); `Remove` on
 GC reclaim. Merge per V16: same `node_id+boot_id+block_ref` -> higher generation wins; `Remove@G`
 suppresses older `Add<G`; different `boot_id` -> newer membership incarnation (ABA after reboot).
-Receiver stamps the accept time and honours `expires_after` (entries self-expire if a holder goes
+Receiver stamps the accept time and honors `expires_after` (entries self-expire if a holder goes
 silent -- a stale locator, **not** a liveness signal).
 
 ## Failure Modes
