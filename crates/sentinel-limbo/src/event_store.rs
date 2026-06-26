@@ -9,7 +9,9 @@
 //! rusqlite unterstuetzt keine INSTEAD OF Trigger auf normalen Tabellen.
 
 use rusqlite::{params, Connection, OptionalExtension};
-use sentinel_common::{DomainEvent, OwnerRegistry, OwnerWriteGuard, StateTransferScope};
+use sentinel_common::{
+    DomainEvent, FencedStore, OwnerRegistry, OwnerWriteGuard, StateTransferScope,
+};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -389,27 +391,11 @@ impl EventStore {
         })
     }
 
-    /// The single fenced write entry (#496, V3): **every** mutating method acquires
-    /// its connection here, presenting an [`OwnerWriteGuard`]. A raw write cannot
-    /// bypass it — the `conn` field is private to this crate.
-    ///
-    /// PR2a re-checks the guard against the committed owner term (V19) via the
-    /// `OwnerRegistry` before handing out the connection lock; a stale or non-owning
-    /// guard is rejected with a `StaleEpochError`. Single-node — the seed owns every
-    /// scope — so every write passes; PR2b's cooperative handoff makes a guard stale.
-    fn begin_fenced_write(
-        &self,
-        guard: &OwnerWriteGuard,
-    ) -> anyhow::Result<std::sync::MutexGuard<'_, Connection>> {
-        // PR2a: re-check the guard against the committed owner term (V19) before handing
-        // out the connection lock. Single-node — the seed owns every scope — so this
-        // always passes; the lock is held across the write, so there is no TOCTOU window
-        // for a single-node write (cross-node handoff + commit-recheck land in PR2b).
-        OwnerRegistry::global().validate(guard)?;
-        self.conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))
-    }
+    // The single fenced write entry (#496 V3/V19) is `impl FencedStore for EventStore`
+    // below. Unlike redb/fs there is no commit wrapper: SQLite reads and writes share
+    // the one connection mutex, so the write executes under the lock held from begin,
+    // with no TOCTOU window for a single-node write — the begin re-check is sufficient;
+    // a cross-node commit-recheck path is not applicable to the autocommit connection.
 
     /// Append-only: Fuegt ein Event ein. Gibt die interne Row-ID zurueck.
     pub fn append_event(&self, event: &DomainEvent) -> anyhow::Result<i64> {
@@ -1549,6 +1535,26 @@ impl EventStore {
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+}
+
+impl FencedStore for EventStore {
+    type Txn<'a> = std::sync::MutexGuard<'a, Connection>;
+
+    fn begin_fenced_write(
+        &self,
+        guard: &OwnerWriteGuard,
+    ) -> anyhow::Result<std::sync::MutexGuard<'_, Connection>> {
+        // V19: re-check the guard against the committed owner term before handing out the
+        // connection lock. The write executes under this lock, held from begin, so for a
+        // single-node write there is no TOCTOU window — the begin re-check is sufficient.
+        // A stale guard (a cross-node handoff bumped the epoch) is rejected here with
+        // `StaleEpochError`; unlike redb/fs there is no separate commit re-check because
+        // the SQLite connection autocommits each statement under the held lock.
+        OwnerRegistry::global().validate(guard)?;
+        self.conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))
     }
 }
 

@@ -4,7 +4,9 @@ use std::collections::HashMap;
 
 use anyhow::Context;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use sentinel_common::{AgentId, OwnerRegistry, OwnerWriteGuard, RoomId, StateTransferScope};
+use sentinel_common::{
+    AgentId, FencedStore, OwnerRegistry, OwnerWriteGuard, RoomId, StateTransferScope,
+};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
@@ -95,25 +97,9 @@ impl StateStore {
         Ok(Self { db })
     }
 
-    /// The single fenced write entry every persistent mutation of this store must
-    /// route through (#496, V3/V19): a writer obtains its `redb` write transaction
-    /// here, presenting an `OwnerWriteGuard`. A raw write cannot bypass it — the
-    /// `db` field is private to this crate.
-    ///
-    /// PR2a re-checks the guard against the committed owner term (V19) via the
-    /// `OwnerRegistry` before handing out the transaction; a stale or non-owning guard is
-    /// rejected with a `StaleEpochError`. Single-node — the seed owns every scope — so
-    /// every write passes; PR2b's cooperative handoff is what makes a guard stale.
-    fn begin_fenced_write(
-        &self,
-        guard: &OwnerWriteGuard,
-    ) -> anyhow::Result<redb::WriteTransaction> {
-        // PR2a: re-check the guard against the committed owner term (V19) before handing
-        // out a write transaction. Single-node — the seed owns every scope — so this
-        // always passes; PR2b's cooperative handoff is what makes a stale guard fail.
-        OwnerRegistry::global().validate(guard)?;
-        Ok(self.db.begin_write()?)
-    }
+    // The single fenced write entry (#496 V3/V19) is `impl FencedStore for StateStore`
+    // below: it re-checks the guard at begin *and* the returned `FencedRedbWrite`
+    // re-checks again at commit (TOCTOU). Writers call `self.begin_fenced_write(..)`.
 
     // === AGENT STATE ===
 
@@ -827,7 +813,7 @@ impl StateStore {
     // ── Restore Helpers ──
 
     fn restore_u16_bytes(
-        txn: &redb::WriteTransaction,
+        txn: &FencedRedbWrite,
         table_def: TableDefinition<u16, &[u8]>,
         entries: &[(u16, Vec<u8>)],
     ) -> anyhow::Result<()> {
@@ -847,7 +833,7 @@ impl StateStore {
     }
 
     fn restore_u32_bytes(
-        txn: &redb::WriteTransaction,
+        txn: &FencedRedbWrite,
         table_def: TableDefinition<u32, &[u8]>,
         entries: &[(u32, Vec<u8>)],
     ) -> anyhow::Result<()> {
@@ -866,7 +852,7 @@ impl StateStore {
     }
 
     fn restore_u16_u64(
-        txn: &redb::WriteTransaction,
+        txn: &FencedRedbWrite,
         table_def: TableDefinition<u16, u64>,
         entries: &[(u16, u64)],
     ) -> anyhow::Result<()> {
@@ -885,7 +871,7 @@ impl StateStore {
     }
 
     fn restore_str_bytes(
-        txn: &redb::WriteTransaction,
+        txn: &FencedRedbWrite,
         table_def: TableDefinition<&str, &[u8]>,
         entries: &[(String, Vec<u8>)],
     ) -> anyhow::Result<()> {
@@ -915,6 +901,50 @@ pub fn relationship_key(a: AgentId, b: AgentId) -> u32 {
 fn api_pattern_key(agent_id: &str, fingerprint: &str) -> anyhow::Result<String> {
     let suffix = serde_json::to_string(&(agent_id, fingerprint))?;
     Ok(format!("{API_PATTERNS_PATTERN_PREFIX}{suffix}"))
+}
+
+/// A fenced redb write transaction (#496 V19). The owner guard is re-checked at begin
+/// (in `begin_fenced_write`) **and** again at [`commit`](FencedRedbWrite::commit), so a
+/// write that became stale between the two — a cross-node handoff committed a newer
+/// owner term while the transaction was open — is rejected at commit (the TOCTOU
+/// window), not silently committed. Single-node the owner never changes mid-write, so
+/// this always commits. The inner transaction is private, so a write cannot reach
+/// `commit` without the re-check.
+pub struct FencedRedbWrite {
+    inner: redb::WriteTransaction,
+    guard: OwnerWriteGuard,
+}
+
+impl FencedRedbWrite {
+    /// Open a table in the fenced write transaction (delegates to the inner txn).
+    pub fn open_table<K: redb::Key + 'static, V: redb::Value + 'static>(
+        &self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<redb::Table<'_, K, V>, redb::TableError> {
+        self.inner.open_table(definition)
+    }
+
+    /// Commit the write after re-checking the owner term (V19 TOCTOU). A guard that
+    /// went stale since begin is rejected with `StaleEpochError` and the write is
+    /// dropped without committing.
+    pub fn commit(self) -> anyhow::Result<()> {
+        OwnerRegistry::global().validate(&self.guard)?;
+        self.inner.commit()?;
+        Ok(())
+    }
+}
+
+impl FencedStore for StateStore {
+    type Txn<'a> = FencedRedbWrite;
+
+    fn begin_fenced_write(&self, guard: &OwnerWriteGuard) -> anyhow::Result<FencedRedbWrite> {
+        // V19: re-check the guard at begin; the returned txn re-checks again at commit.
+        OwnerRegistry::global().validate(guard)?;
+        Ok(FencedRedbWrite {
+            inner: self.db.begin_write()?,
+            guard: guard.clone(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -966,6 +996,38 @@ mod tests {
             store.get_agent_state(agent(7)).unwrap(),
             Some(b"via-fence".to_vec())
         );
+    }
+
+    /// #496 PR2b-1b (V19 TOCTOU): the fenced write re-checks the owner term at **commit**,
+    /// not just at begin. Single-node the owner never changes mid-write, so this never
+    /// fires in production; the test models the PR2b-2 case where a cross-node handoff
+    /// commits a newer owner term while the transaction is open — `commit()` must reject
+    /// the now-stale write instead of committing it.
+    #[test]
+    fn commit_rechecks_owner_term_and_rejects_stale() {
+        let (store, _dir) = temp_store();
+
+        // A write whose guard is stale by the time it commits (epoch 0 < the committed
+        // single-node epoch 1). The write transaction is real and open, but commit must
+        // re-validate and reject.
+        let stale = super::FencedRedbWrite {
+            inner: store.db.begin_write().unwrap(),
+            guard: OwnerWriteGuard::for_test(
+                StateTransferScope::World,
+                OwnerRegistry::global().this_node(),
+                0,
+            ),
+        };
+        assert!(
+            stale.commit().is_err(),
+            "stale guard must be rejected at commit"
+        );
+
+        // A freshly registry-issued (current) guard commits.
+        let ok = store
+            .begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))
+            .unwrap();
+        ok.commit().unwrap();
     }
 
     fn agent(id: u16) -> AgentId {
