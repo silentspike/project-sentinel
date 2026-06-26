@@ -705,12 +705,38 @@ pub struct NanoContainerRedbRows {
     pub evolution_version: Option<u64>,
 }
 
-/// Per-container snapshot envelope (#497): ECS subset + filtered redb rows + optional FS subtree.
+/// V27 cross-store consistency cut for a per-container snapshot (#497).
 ///
-/// For Track-A ECS-native containers `fs_subtree` is `None` (no bwrap home); the bwrap-home CAS
-/// manifest (#500a) is wired into the live spawn/snapshot path by #500b/Track B. Self-describing
-/// via `agent_id` + `captured_at_tick`; the owner-epoch fence under which it is taken is applied by
-/// the transfer layer (#489/#496 integration, #497 task wiring).
+/// There is no distributed 2PC (TOGAF: no external coordinator). Instead every store is captured
+/// under the SAME owner-epoch fence (#496) and this cut records the boundary so the snapshot is
+/// reconcilable on restore:
+/// - **K1** single-store writes need only the `OwnerWriteGuard` (the epoch below).
+/// - **K2** multi-store assembly is an idempotent saga keyed by the cut (e.g. the post-hoc CAS pin),
+///   reconciled on restart against the recorded boundary — never atomic-across-stores.
+/// - **K3** anything still mutating in the migration window is rejected/queued (V11/V17 bounded class).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SnapshotCut {
+    /// Owner-epoch (#496) the snapshot was fenced under; a stale-epoch write after the cut is rejected.
+    pub owner_epoch: u64,
+    /// Event-store cursor (`last_event_id`) at the cut — a restore replays nothing past it.
+    pub event_cursor: i64,
+    /// CAS blobs pinned for the transfer (in-transit grace pin via the #492 `pin_snapshot_blobs`
+    /// mechanism, which already blocks GC). Empty for ECS-native containers (no bwrap home / no CAS).
+    #[serde(default)]
+    pub cas_pin_set: Vec<String>,
+    /// Inbound-message cursor. `None` for the Track-A bounded class (active inbound = `NotMigratable`,
+    /// #497 AC-3); the durable inbound queue + dedup is Track E/H.
+    #[serde(default)]
+    pub inbound_cursor: Option<u64>,
+}
+
+/// Per-container snapshot envelope (#497): ECS subset + filtered redb rows + optional FS subtree,
+/// all under one V27 [`SnapshotCut`].
+///
+/// For Track-A ECS-native containers `fs_subtree` is `None` (no bwrap home) and `cut.cas_pin_set`
+/// is empty; the bwrap-home CAS manifest (#500a) + its in-transit pin are wired into the live
+/// spawn/snapshot path by #500b/Track B. Self-describing via `agent_id` + `captured_at_tick`; the
+/// owner-epoch fence under which it is taken lives in `cut.owner_epoch` (#489/#496 integration).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NanoContainerSnapshot {
     pub agent_id: u16,
@@ -720,6 +746,8 @@ pub struct NanoContainerSnapshot {
     pub redb_rows: NanoContainerRedbRows,
     #[serde(default)]
     pub fs_subtree: Option<FsMetadataDump>,
+    #[serde(default)]
+    pub cut: SnapshotCut,
 }
 
 /// Scope einer gefenceten State-Transfer-Operation.
