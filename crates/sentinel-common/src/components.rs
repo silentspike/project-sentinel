@@ -10,6 +10,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AgentId, Emotion, TaskId, TaskStatus, Tick};
 
+/// Per-container freeze marker (#497, V11).
+///
+/// Added to the ONE agent entity that is being per-container snapshotted/migrated. Every
+/// per-agent-mutating ECS system carries `Without<Frozen>` (see the AC-0 matrix,
+/// `docs/adr/ADR-0497-G4-AC0-system-matrix.md`), so the frozen agent's components stay
+/// bit-stable across ticks while the global tick keeps running. Removed on unfreeze/abort.
+///
+/// Transient migration state — deliberately NOT `Serialize`/`Deserialize`: it must never be
+/// captured into a snapshot or restored (a restored agent is never born frozen).
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct Frozen;
+
 /// Interrupt-Prioritaet fuer Decision Engine (P0 = hoechste Prioritaet)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Priority {

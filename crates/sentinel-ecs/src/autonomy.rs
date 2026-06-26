@@ -31,12 +31,15 @@ pub struct AutonomyCooldown {
 /// Prueft Bio-Zustand und erzeugt automatische Aktionen fuer kritische Situationen.
 /// Agiert nur wenn der Agent NICHT bereits in Transit ist und der Cooldown abgelaufen ist.
 pub fn autonomy_system(
-    mut query: Query<(
-        &AgentIdentity,
-        &mut Position,
-        &mut BioState,
-        &mut AutonomyCooldown,
-    )>,
+    mut query: Query<
+        (
+            &AgentIdentity,
+            &mut Position,
+            &mut BioState,
+            &mut AutonomyCooldown,
+        ),
+        Without<Frozen>,
+    >,
     room_distances: Option<Res<RoomDistanceMap>>,
     time: Res<SimulationTime>,
     mut event_buffer: ResMut<EventBuffer>,
