@@ -99,7 +99,10 @@ async fn holder_gossip_over_the_wire_merges_into_the_shared_block_map() {
 
     // node-0's server merges inbound holder gossip into this shared block map (#498).
     let block_map = Arc::new(Mutex::new(BlockMap::new()));
-    let handler = Arc::new(BlockMapGossipHandler::new(Arc::clone(&block_map), StubHandler));
+    let handler = Arc::new(BlockMapGossipHandler::new(
+        Arc::clone(&block_map),
+        StubHandler,
+    ));
     let server = ControlServer::bind(loopback(), &server_node, pins, handler).unwrap();
     let addr = server.local_addr();
     let client = ControlClient::new(&client_node).unwrap();

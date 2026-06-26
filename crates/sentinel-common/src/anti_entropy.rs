@@ -49,6 +49,12 @@ fn block_fingerprint(block: &BlockRef) -> [u8; FINGERPRINT_LEN] {
     out
 }
 
+/// Group key while folding L1 summaries: `(namespace, chunk_profile)`.
+type GroupKey = (BlockNamespace, Option<String>);
+
+/// Per-group fold accumulator: `(block_count, max_generation, fingerprint)`.
+type GroupAccumulator = (u64, u64, [u8; FINGERPRINT_LEN]);
+
 /// L1 — a compact, comparable summary of one `(namespace, chunk_profile)` group of a
 /// node's CAS inventory. Cheap to gossip (fixed size, independent of block count).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,16 +128,15 @@ impl CasInventory {
     /// blocks.
     pub fn summaries(&self) -> Vec<GenerationSummary> {
         // Accumulate per group. The key is ordered so the output is deterministic.
-        let mut groups: BTreeMap<(BlockNamespace, Option<String>), (u64, u64, [u8; FINGERPRINT_LEN])> =
-            BTreeMap::new();
+        let mut groups: BTreeMap<GroupKey, GroupAccumulator> = BTreeMap::new();
         for (block, gen) in &self.entries {
             let key = (block.namespace(), block.chunk_profile().map(str::to_owned));
             let acc = groups.entry(key).or_insert((0, 0, [0u8; FINGERPRINT_LEN]));
             acc.0 += 1;
             acc.1 = acc.1.max(*gen);
             let fp = block_fingerprint(block);
-            for i in 0..FINGERPRINT_LEN {
-                acc.2[i] ^= fp[i];
+            for (slot, b) in acc.2.iter_mut().zip(fp) {
+                *slot ^= b;
             }
         }
         groups
@@ -268,7 +273,10 @@ mod tests {
         let mut cursor: Option<BlockRef> = None;
         loop {
             let page = inv.page(cursor.as_ref(), 3);
-            assert!(page.entries.len() <= 3, "page never exceeds the limit (V25)");
+            assert!(
+                page.entries.len() <= 3,
+                "page never exceeds the limit (V25)"
+            );
             seen.extend(page.entries.iter().map(|(b, _)| b.clone()));
             match page.next {
                 Some(c) => cursor = Some(c),
@@ -279,7 +287,10 @@ mod tests {
         let mut sorted = seen.clone();
         sorted.sort();
         sorted.dedup();
-        assert_eq!(seen, sorted, "pages are in sorted order, no overlap, no gap");
+        assert_eq!(
+            seen, sorted,
+            "pages are in sorted order, no overlap, no gap"
+        );
     }
 
     #[test]
