@@ -746,6 +746,16 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let flags = sentinel_common::feature_flags::RuntimeFlags::init();
     info!(?flags, "Runtime Feature Flags geladen");
 
+    // -- Cluster 12 (#496): pin the owner registry to this node's identity FIRST, before
+    // any store opens or writes. An early fenced write (snapshot restore, projection)
+    // would otherwise lock the process-global `OwnerRegistry` to its nil single-node
+    // default (`OnceLock`) and make a later `init_single_node` a silent no-op — leaving
+    // the seed's registry identity as nil. The durable term/retirement reconcile still
+    // runs below, once the cluster-meta store is open. --
+    if let Some(cluster) = config.cluster.as_ref() {
+        sentinel_common::OwnerRegistry::init_single_node(cluster.node_id);
+    }
+
     // -- Datenbanken oeffnen (sync) --
     let data_dir = &config.data_dir;
     std::fs::create_dir_all(data_dir)
@@ -1016,7 +1026,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // control-stream handler so an `OwnerCommit` RPC persists ownership here (PR2b-2). --
     let cluster_meta: Option<Arc<sentinel_redb::ClusterMetaStore>> = match config.cluster.as_ref() {
         Some(cluster) => {
-            sentinel_common::OwnerRegistry::init_single_node(cluster.node_id);
+            // `init_single_node` already ran at the top of `run` (before any store write);
+            // here we only open the durable cluster-meta store and reconcile from it.
             let cluster_meta_path = data_dir.join("cluster_meta.redb");
             match sentinel_redb::ClusterMetaStore::open(&cluster_meta_path.to_string_lossy()) {
                 Ok(meta) => {
@@ -1284,6 +1295,12 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 Arc::clone(&runtime_health),
                 Arc::clone(&security_runtime_state),
                 cluster_control.clone(),
+                cluster_meta.clone(),
+                config
+                    .cluster
+                    .as_ref()
+                    .map(|c| c.alias.clone().unwrap_or_else(|| c.node_id.to_string())),
+                config.cluster.as_ref().map(|c| c.seed).unwrap_or(false),
             )
             .await?,
         )

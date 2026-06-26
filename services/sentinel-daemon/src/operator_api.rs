@@ -53,6 +53,8 @@ const OPERATOR_CONFIG_APPLY_PATH: &str = "/operator/config/apply";
 const OPERATOR_MIGRATE_PATH: &str = "/operator/migrate";
 const OPERATOR_PROVISION_PATH: &str = "/operator/provision";
 const OPERATOR_CONTROL_QUERY_PATH: &str = "/operator/control/query";
+const OPERATOR_HANDOFF_PATH: &str = "/operator/handoff";
+const OPERATOR_OWNER_CHECK_PATH: &str = "/operator/owner-check";
 const OPERATOR_PRUNE_PATH: &str = "/operator/prune";
 const OPERATOR_CHAT_PATH: &str = "/operator/chat";
 const OPERATOR_GAIA_PATH: &str = "/operator/gaia";
@@ -412,6 +414,15 @@ struct AppState {
     runtime_health: crate::runtime_health::SharedRuntimeHealthState,
     security_runtime_state: SharedSecurityRuntimeState,
     cluster_control: Option<Arc<crate::cluster_control::ClusterControl>>,
+    /// The durable cluster-meta store (ADR-3) — the chef's authority for `OwnerCommit`
+    /// during an operator-triggered handoff (#496 PR2b-2c). `None` outside a cluster.
+    cluster_meta: Option<Arc<sentinel_redb::ClusterMetaStore>>,
+    /// This node's cluster alias — the handoff saga's `my_alias` (self vs peer routing).
+    cluster_node_alias: Option<String>,
+    /// Whether this node is the seed/chef. The cooperative handoff saga is **seed-only**
+    /// (Chef-SPOF): a member must reject `/operator/handoff` even though it has a control
+    /// stream + meta store.
+    cluster_is_seed: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -515,6 +526,9 @@ pub async fn start_server(
     runtime_health: crate::runtime_health::SharedRuntimeHealthState,
     security_runtime_state: SharedSecurityRuntimeState,
     cluster_control: Option<Arc<crate::cluster_control::ClusterControl>>,
+    cluster_meta: Option<Arc<sentinel_redb::ClusterMetaStore>>,
+    cluster_node_alias: Option<String>,
+    cluster_is_seed: bool,
 ) -> AnyResult<tokio::task::JoinHandle<()>> {
     let listener = TcpListener::bind(&config.bind_addr)
         .await
@@ -545,6 +559,9 @@ pub async fn start_server(
         runtime_health,
         security_runtime_state,
         cluster_control,
+        cluster_meta,
+        cluster_node_alias,
+        cluster_is_seed,
     };
 
     info!(
@@ -933,6 +950,145 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 ),
                 Err(e) => json_response(502, serde_json::json!({ "error": e.to_string() })),
             }
+        }
+        OPERATOR_HANDOFF_PATH => {
+            // #496 PR2b-2c: operator-triggered cooperative ownership handoff. Seed-only —
+            // the chef drives the V1/V2 saga; peer steps go over the #569 control stream,
+            // a self step is applied locally (the transport routes by alias).
+            // Chef-SPOF: a member must reject the handoff even though it has a control
+            // stream + meta store — only the seed coordinates ownership.
+            if !state.cluster_is_seed {
+                return ApiError::ServiceUnavailable(
+                    "handoff is seed-only (this node is not the chef)",
+                )
+                .to_response();
+            }
+            let cc = match &state.cluster_control {
+                Some(cc) => cc.clone(),
+                None => {
+                    return ApiError::ServiceUnavailable("control stream not configured")
+                        .to_response()
+                }
+            };
+            let meta = match &state.cluster_meta {
+                Some(m) => m.clone(),
+                None => {
+                    return ApiError::ServiceUnavailable("cluster meta store not configured")
+                        .to_response()
+                }
+            };
+            let my_alias = state.cluster_node_alias.clone().unwrap_or_default();
+            let cmd: sentinel_common::OperatorHandoffCommand =
+                match serde_json::from_slice(&request.body) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return ApiError::BadRequest(
+                            "handoff needs scope, source_alias, target_alias, target_node_id, idempotency_key",
+                        )
+                        .to_response()
+                    }
+                };
+            let scope = match sentinel_common::StateTransferScope::from_wire(&cmd.scope) {
+                Some(s) => s,
+                None => {
+                    return ApiError::BadRequest("unrecognized scope (expected world|nano:<id>)")
+                        .to_response()
+                }
+            };
+            let target_node = match cmd.target_node_id.parse::<uuid::Uuid>() {
+                Ok(u) => sentinel_common::NodeId(u),
+                Err(_) => {
+                    return ApiError::BadRequest("target_node_id must be a uuid").to_response()
+                }
+            };
+            let transport = crate::handoff::RpcHandoffTransport::new(
+                cc,
+                meta.clone(),
+                my_alias,
+                cmd.idempotency_key.clone(),
+            );
+            let req = crate::handoff::HandoffRequest {
+                scope,
+                source_alias: cmd.source_alias.clone(),
+                target_alias: cmd.target_alias.clone(),
+                target_node,
+            };
+            info!(scope = %cmd.scope, source = %cmd.source_alias, target = %cmd.target_alias,
+                "handoff via Operator-API");
+            // `run_handoff` is sync; the transport drives each peer RPC with its own
+            // `block_in_place` (so no outer block_in_place here — it must not nest).
+            match crate::handoff::run_handoff(
+                sentinel_common::OwnerRegistry::global(),
+                &meta,
+                &transport,
+                &req,
+            ) {
+                Ok(outcome) => json_response(
+                    200,
+                    serde_json::json!({ "outcome": format!("{outcome:?}") }),
+                ),
+                Err(e) => json_response(502, serde_json::json!({ "error": e.to_string() })),
+            }
+        }
+        OPERATOR_OWNER_CHECK_PATH => {
+            // #496 PR2b-2c diagnostic: report this node's ownership view for a scope, for
+            // deterministic per-node ground-truth in the 2-VM live ACs (no luck involved).
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).unwrap_or(serde_json::json!({}));
+            let scope_wire = body
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let scope = match sentinel_common::StateTransferScope::from_wire(&scope_wire) {
+                Some(s) => s,
+                None => {
+                    return ApiError::BadRequest("owner-check needs scope (world|nano:<id>)")
+                        .to_response()
+                }
+            };
+            let reg = sentinel_common::OwnerRegistry::global();
+            let this = reg.this_node();
+            let term = reg.current_owner(&scope);
+            let is_owner = term.owner_node == this;
+            let local_retired = reg
+                .local_owner_state(&scope)
+                .map(|s| {
+                    matches!(
+                        s.role,
+                        sentinel_common::LocalOwnerRole::Retiring
+                            | sentinel_common::LocalOwnerRole::Retired
+                    )
+                })
+                .unwrap_or(false);
+            // "Would this node's own write to the scope validate?" — Ok iff this node owns
+            // it and has not locally retired it (V19 term + V4 local fence). An optional
+            // `guard_epoch` validates a guard *minted earlier* at that epoch — the V19
+            // commit-recheck / TOCTOU probe: a guard valid when it was issued is caught
+            // stale after a cross-node handoff advanced the committed epoch.
+            let guard_epoch = body
+                .get("guard_epoch")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(term.epoch);
+            let probe = reg.validate(&sentinel_common::OwnerWriteGuard::for_test(
+                scope.clone(),
+                this,
+                guard_epoch,
+            ));
+            json_response(
+                200,
+                serde_json::json!({
+                    "scope": scope_wire,
+                    "this_node": this.to_string(),
+                    "owner_node": term.owner_node.to_string(),
+                    "epoch": term.epoch,
+                    "guard_epoch": guard_epoch,
+                    "is_owner": is_owner,
+                    "local_retired": local_retired,
+                    "own_write_validates": probe.is_ok(),
+                    "reject_reason": probe.err().map(|e| e.to_string()),
+                }),
+            )
         }
         OPERATOR_PRUNE_PATH => {
             info!("Manuelles Pruning via Operator-API angefordert");
@@ -3083,6 +3239,9 @@ mod tests {
             )),
             security_runtime_state,
             cluster_control: None,
+            cluster_meta: None,
+            cluster_node_alias: None,
+            cluster_is_seed: false,
         };
         std::mem::forget(dir);
         (state, rx, platform_rx, runtime_rx)

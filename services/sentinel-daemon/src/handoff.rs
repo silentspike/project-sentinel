@@ -23,9 +23,13 @@
 //! control stream by the daemon (PR2b-2c provides the 2-VM live ACs).
 
 use anyhow::{anyhow, Result};
+use sentinel_cluster_control::{ControlRequest, ControlResponse};
 use sentinel_common::{NodeId, OwnerRegistry, OwnerTerm, StateTransferScope};
 use sentinel_redb::ClusterMetaStore;
+use std::sync::Arc;
 use tracing::{info, warn};
+
+use crate::cluster_control::ClusterControl;
 
 /// The #569 control-RPC seam the saga drives.
 pub trait HandoffTransport: Send + Sync {
@@ -107,6 +111,111 @@ pub fn run_handoff(
         new_epoch, "Handoff committed: ownership moved to target (V1)"
     );
     Ok(HandoffOutcome::Committed { new_epoch })
+}
+
+/// The live `HandoffTransport` (#496 PR2b-2c): a step whose alias is **this** node's is
+/// applied locally; a step for a peer is driven over the #569 control stream. Held by the
+/// seed's operator `/handoff` endpoint (the in-process saga tests use a fake instead).
+pub struct RpcHandoffTransport {
+    cluster_control: Arc<ClusterControl>,
+    meta: Arc<ClusterMetaStore>,
+    my_alias: String,
+    idempotency_key: String,
+}
+
+impl RpcHandoffTransport {
+    pub fn new(
+        cluster_control: Arc<ClusterControl>,
+        meta: Arc<ClusterMetaStore>,
+        my_alias: String,
+        idempotency_key: String,
+    ) -> Self {
+        Self {
+            cluster_control,
+            meta,
+            my_alias,
+            idempotency_key,
+        }
+    }
+
+    /// Drive one control RPC to a peer, blocking the current (sync) handler thread. Must
+    /// run from a sync context on the multi-thread runtime (the operator handler does).
+    fn peer_rpc(
+        &self,
+        peer_alias: &str,
+        key_suffix: &str,
+        request: ControlRequest,
+    ) -> Result<ControlResponse> {
+        let key = format!("{}-{}", self.idempotency_key, key_suffix);
+        let reply = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(self.cluster_control.rpc(peer_alias, &key, request))
+        })?;
+        Ok(reply.response)
+    }
+}
+
+impl HandoffTransport for RpcHandoffTransport {
+    fn prepare_handoff(&self, source_alias: &str, scope_wire: &str, epoch: u64) -> Result<()> {
+        if source_alias == self.my_alias {
+            // This node is the source: retire locally (durable + in-memory), no RPC.
+            let scope = StateTransferScope::from_wire(scope_wire)
+                .ok_or_else(|| anyhow!("unrecognized scope {scope_wire}"))?;
+            OwnerRegistry::global().retire_local(scope.clone(), epoch);
+            let state = OwnerRegistry::global()
+                .local_owner_state(&scope)
+                .ok_or_else(|| anyhow!("local retirement vanished for {scope_wire}"))?;
+            self.meta.put_local_state(&state)?;
+            return Ok(());
+        }
+        match self.peer_rpc(
+            source_alias,
+            "prepare",
+            ControlRequest::PrepareHandoff {
+                scope: scope_wire.to_string(),
+                epoch,
+            },
+        )? {
+            ControlResponse::HandoffPrepared { .. } => Ok(()),
+            other => Err(anyhow!(
+                "PrepareHandoff to {source_alias} rejected: {other:?}"
+            )),
+        }
+    }
+
+    fn owner_commit(
+        &self,
+        target_alias: &str,
+        scope_wire: &str,
+        owner_node: NodeId,
+        epoch: u64,
+    ) -> Result<()> {
+        if target_alias == self.my_alias {
+            // This node is the target: commit locally, no RPC.
+            let scope = StateTransferScope::from_wire(scope_wire)
+                .ok_or_else(|| anyhow!("unrecognized scope {scope_wire}"))?;
+            let term = OwnerTerm {
+                scope,
+                owner_node,
+                epoch,
+            };
+            self.meta.put_owner_term(&term)?;
+            OwnerRegistry::global().commit_owner(term);
+            return Ok(());
+        }
+        match self.peer_rpc(
+            target_alias,
+            "commit",
+            ControlRequest::OwnerCommit {
+                scope: scope_wire.to_string(),
+                owner_node: owner_node.to_string(),
+                epoch,
+            },
+        )? {
+            ControlResponse::OwnerCommitted { .. } => Ok(()),
+            other => Err(anyhow!("OwnerCommit to {target_alias} rejected: {other:?}")),
+        }
+    }
 }
 
 #[cfg(test)]
