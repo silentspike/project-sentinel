@@ -14,19 +14,18 @@
 //! cooperative handoff writes `OwnerCommit(E+1)` here cross-node.
 
 use anyhow::Context;
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use sentinel_common::{OwnerTerm, StateTransferScope};
 
 /// `scope-key -> JSON-serialized OwnerTerm`. Keyed by a stable string form of the scope
 /// (`world` or `nano:<container-id>`) so the same scope always maps to the same row.
 const CLUSTER_OWNER: TableDefinition<&str, &[u8]> = TableDefinition::new("cluster_owner");
 
-/// The stable key for a scope in the `CLUSTER_OWNER` table.
+/// The stable key for a scope in the `CLUSTER_OWNER` table — the canonical wire form
+/// (`world` / `nano:<id>`), shared verbatim with the control RPCs so a scope keys the
+/// same row everywhere (single source of truth in [`StateTransferScope::to_wire`]).
 fn scope_key(scope: &StateTransferScope) -> String {
-    match scope {
-        StateTransferScope::World => "world".to_string(),
-        StateTransferScope::NanoContainer(id) => format!("nano:{id}"),
-    }
+    scope.to_wire()
 }
 
 /// The control-plane cluster-metadata store (ADR-3): the durable home of the committed
@@ -72,6 +71,21 @@ impl ClusterMetaStore {
             None => Ok(None),
         }
     }
+
+    /// Every committed owner term. The daemon reads these at startup to re-establish the
+    /// in-memory `OwnerRegistry` working view (PR2b-2): a persisted cross-node term
+    /// re-enters cluster mode after a restart, so a handoff's `OwnerCommit(E+1)` is
+    /// durable across a reboot (it does not silently fall back to the seed).
+    pub fn list_owner_terms(&self) -> anyhow::Result<Vec<OwnerTerm>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(CLUSTER_OWNER)?;
+        let mut terms = Vec::new();
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            terms.push(serde_json::from_slice(value.value()).context("deserialize OwnerTerm")?);
+        }
+        Ok(terms)
+    }
 }
 
 #[cfg(test)]
@@ -114,5 +128,34 @@ mod tests {
             .get_owner_term(&StateTransferScope::NanoContainer("AGENT-01".into()))
             .unwrap()
             .is_none());
+    }
+
+    /// #496 PR2b-2a: `list_owner_terms` returns every persisted term — the daemon reads
+    /// these at startup to re-establish the registry's cluster-mode working view so a
+    /// committed cross-node term survives a restart.
+    #[test]
+    fn list_owner_terms_returns_all_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cluster_meta.redb");
+        let store = ClusterMetaStore::open(path.to_str().unwrap()).unwrap();
+        assert!(store.list_owner_terms().unwrap().is_empty());
+
+        let node = OwnerRegistry::global().this_node();
+        let world = OwnerTerm {
+            scope: StateTransferScope::World,
+            owner_node: node,
+            epoch: 1,
+        };
+        let nano = OwnerTerm {
+            scope: StateTransferScope::NanoContainer("AGENT-07".into()),
+            owner_node: node,
+            epoch: 4,
+        };
+        store.put_owner_term(&world).unwrap();
+        store.put_owner_term(&nano).unwrap();
+
+        let mut terms = store.list_owner_terms().unwrap();
+        terms.sort_by_key(|t| t.epoch);
+        assert_eq!(terms, vec![world, nano]);
     }
 }

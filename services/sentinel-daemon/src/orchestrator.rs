@@ -1008,49 +1008,70 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         }
     };
 
-    // -- Cluster 12 (#496 PR2a): pin the owner registry to this node's identity so every
-    // fenced store write validates against the seed's ownership (V19). Single-node — the
-    // seed owns every scope — so the live behavior is unchanged; without [daemon.cluster]
-    // the registry keeps its default single-node owner. --
-    if let Some(cluster) = config.cluster.as_ref() {
-        sentinel_common::OwnerRegistry::init_single_node(cluster.node_id);
-        // Re-establish ownership from durable state (ADR-3, PR2b-1c): the dedicated
-        // control-plane cluster-meta store holds the committed owner terms. On first
-        // start the seed's `World` term (epoch 1) is seeded; on restart it is read back,
-        // so ownership survives a restart (and PR2b-2's handoff commits real cross-node
-        // terms here). The seed owns every scope single-node, so behavior is unchanged.
-        let cluster_meta_path = data_dir.join("cluster_meta.redb");
-        match sentinel_redb::ClusterMetaStore::open(&cluster_meta_path.to_string_lossy()) {
-            Ok(meta) => match meta.get_owner_term(&sentinel_common::StateTransferScope::World) {
-                Ok(Some(term)) => {
-                    info!(
-                        epoch = term.epoch,
-                        "Cluster 12: Owner-Term aus Meta-Store geladen (World)"
-                    )
-                }
-                Ok(None) => {
-                    let term = sentinel_common::OwnerTerm {
-                        scope: sentinel_common::StateTransferScope::World,
-                        owner_node: cluster.node_id,
-                        epoch: 1,
-                    };
-                    match meta.put_owner_term(&term) {
-                        Ok(()) => {
-                            info!("Cluster 12: Seed-Owner-Term im Meta-Store angelegt (World @ epoch 1)")
+    // -- Cluster 12 (#496): pin the owner registry to this node's identity so every
+    // fenced store write validates against committed ownership (V19), and open the
+    // durable cluster-meta store (ADR-3). Single-node the seed owns every scope, so live
+    // behavior is unchanged; without [daemon.cluster] the registry keeps its default
+    // single-node owner and no meta store is opened. The `Arc` is shared with the #569
+    // control-stream handler so an `OwnerCommit` RPC persists ownership here (PR2b-2). --
+    let cluster_meta: Option<Arc<sentinel_redb::ClusterMetaStore>> = match config.cluster.as_ref() {
+        Some(cluster) => {
+            sentinel_common::OwnerRegistry::init_single_node(cluster.node_id);
+            let cluster_meta_path = data_dir.join("cluster_meta.redb");
+            match sentinel_redb::ClusterMetaStore::open(&cluster_meta_path.to_string_lossy()) {
+                Ok(meta) => {
+                    // Seed the `World` term on first start; on restart it is read back
+                    // (PR2b-1c) so ownership survives a reboot.
+                    match meta.get_owner_term(&sentinel_common::StateTransferScope::World) {
+                        Ok(Some(term)) => {
+                            info!(
+                                epoch = term.epoch,
+                                "Cluster 12: Owner-Term aus Meta-Store geladen (World)"
+                            )
+                        }
+                        Ok(None) => {
+                            let term = sentinel_common::OwnerTerm {
+                                scope: sentinel_common::StateTransferScope::World,
+                                owner_node: cluster.node_id,
+                                epoch: 1,
+                            };
+                            match meta.put_owner_term(&term) {
+                                Ok(()) => info!("Cluster 12: Seed-Owner-Term im Meta-Store angelegt (World @ epoch 1)"),
+                                Err(e) => warn!(error = %e, "Cluster 12: Seed-Owner-Term konnte nicht persistiert werden"),
+                            }
+                        }
+                        Err(e) => warn!(error = %e, "Cluster 12: Owner-Term-Lesen fehlgeschlagen"),
+                    }
+                    // Restart-reconcile (PR2b-2): re-establish the in-memory registry from
+                    // every persisted term. A committed cross-node term (owner is not this
+                    // seed, or epoch != 1) re-enters cluster mode so a handoff's
+                    // OwnerCommit(E+1) survives a reboot; the seed's own World@1 stays on
+                    // the lock-free fast path (no commit_owner -> mode unchanged).
+                    match meta.list_owner_terms() {
+                        Ok(terms) => {
+                            for term in terms {
+                                if term.owner_node != cluster.node_id || term.epoch != 1 {
+                                    info!(scope = ?term.scope, epoch = term.epoch, owner = %term.owner_node,
+                                        "Cluster 12: Owner-Term aus Meta-Store re-etabliert (Cluster-Mode)");
+                                    sentinel_common::OwnerRegistry::global().commit_owner(term);
+                                }
+                            }
                         }
                         Err(e) => {
-                            warn!(error = %e, "Cluster 12: Seed-Owner-Term konnte nicht persistiert werden")
+                            warn!(error = %e, "Cluster 12: Owner-Terms-Reconcile fehlgeschlagen")
                         }
                     }
+                    info!(node_id = %cluster.node_id, "Cluster 12: OwnerRegistry als Single-Node-Seed initialisiert");
+                    Some(Arc::new(meta))
                 }
-                Err(e) => warn!(error = %e, "Cluster 12: Owner-Term-Lesen fehlgeschlagen"),
-            },
-            Err(e) => {
-                warn!(error = %e, "Cluster 12: ClusterMetaStore konnte nicht geoeffnet werden")
+                Err(e) => {
+                    warn!(error = %e, "Cluster 12: ClusterMetaStore konnte nicht geoeffnet werden");
+                    None
+                }
             }
         }
-        info!(node_id = %cluster.node_id, "Cluster 12: OwnerRegistry als Single-Node-Seed initialisiert");
-    }
+        None => None,
+    };
 
     // -- Cluster 12 Membership (#495): Heartbeat + Liveness-View, nur mit [daemon.cluster] --
     if let (Some(b), Some(cluster)) = (bus.as_ref(), config.cluster.as_ref()) {
@@ -1121,6 +1142,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                         data_dir,
                         &alias,
                         &cluster.control_peers,
+                        cluster_meta.clone(),
                     ) {
                         Ok(cc) => Some(Arc::new(cc)),
                         Err(e) => {
