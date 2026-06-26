@@ -24,7 +24,7 @@ pub mod route;
 pub mod snapshot_codec;
 pub mod types;
 
-pub use block_map::{BlockMap, HolderRecord};
+pub use block_map::{BlockMap, HolderAction, HolderAdvertisement, HolderRecord};
 pub use block_ref::{BlockNamespace, BlockRef, BlockRefError, HashAlgorithm};
 pub use cluster::{
     ClusterConfig, ClusterRole, ControlPeer, NodeId, NodeIdentity, NodeLifecycleState,
