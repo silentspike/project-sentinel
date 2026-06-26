@@ -112,15 +112,78 @@ because the V4 local retirement still fences it. The real 1-owner guarantee is
 `own_write_validates` (only node-0), not the committed-term view — exactly the
 partition-safe property: a retired source cannot write even if it never learns the new owner.
 
-## Remaining ACs (careful ground-truth phase — Control: "mit voller Sorgfalt")
+## Single-node regression smoke (after the init-order fix): PASS
 
-- **AC-4 (V2 partition):** cut the .241↔.242 link, trigger a handoff needing the peer → abort;
-  during the partition neither side steals, a retired scope stays fenced, a non-retired one
-  is writable; after healing exactly one owner. (network manipulation + ground-truth timing)
-- **AC-5 (TOCTOU cross-node):** the V19 commit-recheck catches a guard that went stale between
-  begin and commit across the node boundary.
-- **AC-6 (Chef-SPOF):** kill the seed mid-saga → no new ownership, existing owners keep
-  writing; chef restart recovers exactly one owner from durable `LOCAL_OWNER`/`CLUSTER_OWNER`.
+Both nodes' `cluster_meta.redb` wiped → fresh **single-node mode** on the 2c binary; the
+fix did not scratch the single-node fast-path guarantee:
+```
+node-0: {"epoch":1,"is_owner":true,"local_retired":false,"own_write_validates":true,"owner_node":"5016f6e4…","this_node":"5016f6e4…"}
+node-1: {"epoch":1,"is_owner":true,"local_retired":false,"own_write_validates":true,"owner_node":"6435ca03…","this_node":"6435ca03…"}
+# journal: 0 StaleEpoch / panic, no "Cluster-Mode re-etabliert"; tick advancing (88959 / 88060)
+```
 
-Status: 5/7 ACs verified with ground-truth (+ seed-only gate, + the init-order bug fix);
-the remaining 3 split-brain/partition ACs are the deliberate final phase.
+## AC-4 — V2 partition (no steal): PASS
+
+Setup: AGENT-08 handed node-0 → node-1 (node-0 retired @1, node-1 owns @2); AGENT-09 left
+non-retired on node-0. Then the .241↔.242 link is cut (`iptables -I … 10.0.0.242 DROP`,
+both directions; RefQuery → `HTTP 000`).
+```
+# handoff AGENT-08 back (source = test-node-1, now unreachable), during the partition:
+$ curl … /operator/handoff -d '{"scope":"nano:AGENT-08","source_alias":"test-node-1",…}'    # 10:52:09 → 10:52:40
+{"outcome":"AbortedSourceUnreachable"} [HTTP 200]
+node-0 journal: Handoff aborted: source unreachable/refused — no ownership steal (V2) scope=nano:AGENT-08 source=test-node-1 error=timed out
+
+# during the partition (ground-truth, both nodes):
+node-0 AGENT-08: is_owner=false, local_retired=true, own_write_validates=false, owner_node=6435ca03…   # NOT stolen, retired scope stays fenced
+node-0 AGENT-09: is_owner=true,  local_retired=false, own_write_validates=true                          # non-retired scope still writable
+node-1 AGENT-08: epoch=2, is_owner=true, own_write_validates=true                                       # isolated, keeps its ownership
+
+# after healing (iptables -D …):
+RefQuery node-0 → node-1: RefQueryResult        # control stream restored
+node-0 AGENT-08 own_write_validates=false ; node-1 AGENT-08 epoch=2 is_owner=true own_write_validates=true   # exactly ONE owner @ E+1
+```
+The abort is deterministic (the RPC `timed out` → logged `AbortedSourceUnreachable` with a
+timestamp), distinguishable from "didn't happen to race": no side stole, the retired scope
+stayed fenced while the non-retired one was writable, and after healing exactly one writer
+remained (node-1 @ 2). No split-brain.
+
+## AC-5 — TOCTOU cross-node (V19 commit-recheck): PASS
+
+A guard minted at one epoch is caught stale after a cross-node handoff advanced the
+committed epoch (the optional `guard_epoch` re-validates a previously-issued guard):
+```
+# (1) at issue — guard @ epoch 1 is valid:
+node-0 AGENT-10: {"epoch":1,"guard_epoch":1,"is_owner":true,"own_write_validates":true}
+# (2) cross-node handoff AGENT-10 node-0 → node-1:
+{"outcome":"Committed { new_epoch: 2 }"}
+# (3) re-check the earlier guard (guard_epoch=1) — now rejected at commit:
+node-0 AGENT-10: {"epoch":2,"guard_epoch":1,"own_write_validates":false,"reject_reason":"stale owner term for NanoContainer(\"AGENT-10\"): guard epoch 1 < current committed epoch 2",…}
+```
+The guard that was valid when issued (epoch 1) is rejected after the cross-node handoff
+committed epoch 2 — the V19 begin+commit recheck (the in-process `commit_rechecks_owner_term_and_rejects_stale`
+test proves the same validate runs at `FencedTxn::commit`).
+
+## AC-6 — Chef-SPOF: PASS
+
+```
+# before: node-1 owns AGENT-08 @ 2 (existing owner)
+# kill the seed (chef):
+$ systemctl kill -s SIGKILL sentinel-daemon    # on node-0
+# while the seed is down:
+node-1 AGENT-08 own_write_validates=true                                   # existing owner keeps writing
+node-1 /operator/handoff → {"error":"handoff is seed-only …"} [HTTP 503]   # no new ownership without the chef
+# after the chef restarts:
+node-0 journal: Owner-Term aus Meta-Store re-etabliert ; lokale Retirements aus Meta-Store re-etabliert (V4) count=1
+node-0 AGENT-08: is_owner=false, local_retired=true, own_write_validates=false, owner_node=6435ca03…   # exactly one owner (node-1 @ 2), recovered
+```
+Chef death = no new ownership, existing owners keep writing; the chef restart recovers
+exactly one owner per scope from the durable `CLUSTER_OWNER` + `LOCAL_OWNER` tables (no
+double-owner from the crash).
+
+## Status: 7/7 ACs verified with ground-truth
+
+AC-1 (1 owner), AC-2 (stale-reject), AC-3 (V1 on-wire), AC-4 (V2 partition), AC-5 (TOCTOU),
+AC-6 (Chef-SPOF), AC-7 (restart-durability) — all PASS, plus the seed-only gate and the
+single-node regression smoke. Two real bugs were found and fixed by this live verification:
+the init-order `OnceLock` race (seed identity nil) and the missing seed-only handoff gate.
+VM 1069 (prod) untouched throughout.
