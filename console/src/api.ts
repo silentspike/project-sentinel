@@ -128,6 +128,25 @@ export interface PhaseMetrics {
   prometheus?: string;
 }
 
+// #427: cache-aware cost/token rows. `key` is the agent id ("AGENT-NN"), the tier
+// name, or the minute-bucket start (from /api/cost, the CostHandler projection).
+export interface CostRow {
+  key: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read: number;
+  cache_creation: number;
+  cost_usd: number;
+  call_count: number;
+}
+
+export interface CostStats {
+  by_agent: CostRow[];
+  by_tier: CostRow[];
+  time_series: CostRow[];
+  projection?: string;
+}
+
 export type IncidentSeverity = "critical" | "high" | "medium" | "low" | string;
 export type IncidentStatus = "active" | "pending" | "resolved" | "failed" | string;
 
