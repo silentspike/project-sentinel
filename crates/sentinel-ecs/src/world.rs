@@ -1554,6 +1554,106 @@ pub fn snapshot_ecs_state(world: &mut World) -> sentinel_common::EcsSnapshot {
     }
 }
 
+/// #497: snapshot exactly ONE agent's per-agent ECS components into a
+/// [`sentinel_common::NanoContainerEcsSnapshot`].
+///
+/// Returns `None` if no agent with `agent_id` exists. World-scope resources
+/// (chaos/smells/room-chat/gaia/broadcast) are deliberately NOT captured — they belong to the
+/// `World` scope, never to a container (G0 / AC-1). This is the per-container counterpart of the
+/// whole-world [`snapshot_ecs_state`].
+pub fn snapshot_agent_ecs_state(
+    world: &mut World,
+    agent_id: AgentId,
+) -> Option<sentinel_common::NanoContainerEcsSnapshot> {
+    // Main component set (mirrors snapshot_ecs_state's first query; bevy tuple limit = 12).
+    let mut main = None;
+    {
+        let mut query = world.query::<(
+            &AgentIdentity,
+            &Position,
+            &BioState,
+            &Personality,
+            &Mood,
+            &PerceptionState,
+            &WorkContext,
+            &AgentCapabilities,
+            &EventQueue,
+            &ShiftInfo,
+        )>();
+        for (identity, pos, bio, pers, mood, perc, work, caps, events, shift) in query.iter(world) {
+            if identity.agent_id == agent_id {
+                main = Some((
+                    identity.clone(),
+                    pos.clone(),
+                    bio.clone(),
+                    pers.clone(),
+                    mood.clone(),
+                    perc.clone(),
+                    work.clone(),
+                    caps.clone(),
+                    events.clone(),
+                    shift.clone(),
+                ));
+                break;
+            }
+        }
+    }
+    let (
+        identity,
+        position,
+        bio_state,
+        personality,
+        mood,
+        perception_state,
+        work_context,
+        agent_capabilities,
+        event_queue,
+        shift_info,
+    ) = main?;
+
+    // Relationships + LlmConfig (second query — same tuple-limit split as snapshot_ecs_state).
+    let mut rels_llm = None;
+    {
+        let mut q2 = world.query::<(&AgentIdentity, &Relationships, &LlmConfig)>();
+        for (identity2, rels, llm) in q2.iter(world) {
+            if identity2.agent_id == agent_id {
+                rels_llm = Some((rels.clone(), llm.clone()));
+                break;
+            }
+        }
+    }
+    let (relationships, llm_config) = rels_llm?;
+
+    // AutonomyCooldown (separate component; default 0 if the agent has none yet).
+    let mut autonomy_cooldown_last_action_tick = 0u64;
+    {
+        let mut cq = world.query::<(&AgentIdentity, &AutonomyCooldown)>();
+        for (identity3, cd) in cq.iter(world) {
+            if identity3.agent_id == agent_id {
+                autonomy_cooldown_last_action_tick = cd.last_action_tick;
+                break;
+            }
+        }
+    }
+
+    Some(sentinel_common::NanoContainerEcsSnapshot {
+        agent_id: agent_id.0,
+        identity,
+        position,
+        bio_state,
+        personality,
+        mood,
+        perception_state,
+        work_context,
+        agent_capabilities,
+        event_queue,
+        shift_info,
+        relationships,
+        llm_config,
+        autonomy_cooldown_last_action_tick,
+    })
+}
+
 /// Restored den ECS-Zustand aus einem Snapshot.
 /// Despawnt ALLE bestehenden Agent-Entities und erstellt neue aus dem Snapshot.
 pub fn restore_ecs_state(world: &mut World, snapshot: &sentinel_common::EcsSnapshot) {

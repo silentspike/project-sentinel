@@ -718,6 +718,41 @@ impl StateStore {
         Ok(())
     }
 
+    /// #497: dump exactly ONE agent's per-agent rows out of the shared StateStore.
+    ///
+    /// Never a whole-table dump (AC-2): each per-agent table is read by the agent's key only.
+    /// Room/global tables (ROOM_STATE/SIM_META/API_PATTERNS) are deliberately excluded — they are
+    /// World-scope, not container state (G0). `RELATIONSHIPS` is u32-keyed by `agent_id`,
+    /// `EVOLUTION_VERSION` is u16->u64; the rest are u16->bytes.
+    pub fn dump_agent_tables(
+        &self,
+        agent_id: AgentId,
+    ) -> anyhow::Result<sentinel_common::NanoContainerRedbRows> {
+        let txn = self.db.begin_read()?;
+        let k = agent_id.0;
+        let read_u16 = |def: TableDefinition<u16, &[u8]>| -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(txn.open_table(def)?.get(k)?.map(|v| v.value().to_vec()))
+        };
+        Ok(sentinel_common::NanoContainerRedbRows {
+            agent_id: k,
+            agent_state: read_u16(AGENT_STATE)?,
+            personality: read_u16(PERSONALITY)?,
+            relationships: txn
+                .open_table(RELATIONSHIPS)?
+                .get(k as u32)?
+                .map(|v| v.value().to_vec()),
+            voice_style: read_u16(VOICE_STYLE)?,
+            behavioral_notes: read_u16(BEHAVIORAL_NOTES)?,
+            narrative_summary: read_u16(NARRATIVE_SUMMARY)?,
+            nmda_scores: read_u16(NMDA_SCORES)?,
+            agent_facts: read_u16(AGENT_FACTS)?,
+            evolution_version: txn
+                .open_table(EVOLUTION_VERSION)?
+                .get(k)?
+                .map(|v| v.value()),
+        })
+    }
+
     /// Dumpt alle 11 Tables in einer Read-Transaktion.
     pub fn dump_all_tables(&self) -> anyhow::Result<sentinel_common::RedbDump> {
         let txn = self.db.begin_read()?;
@@ -1064,6 +1099,36 @@ mod tests {
         assert!(store.delete_agent_state(agent(1)).unwrap());
         assert!(store.get_agent_state(agent(1)).unwrap().is_none());
         assert!(!store.delete_agent_state(agent(1)).unwrap()); // already deleted
+    }
+
+    /// #497 AC-2: dump_agent_tables reads exactly ONE agent's rows, never a whole-table dump.
+    #[test]
+    fn test_dump_agent_tables_is_per_agent_filtered() {
+        let (store, _dir) = temp_store();
+
+        store.set_agent_state(agent(1), b"a1-state").unwrap();
+        store.set_agent_state(agent(2), b"a2-state").unwrap();
+
+        let d1 = store.dump_agent_tables(agent(1)).unwrap();
+        assert_eq!(d1.agent_id, 1);
+        assert_eq!(d1.agent_state.as_deref(), Some(&b"a1-state"[..]));
+        assert_ne!(
+            d1.agent_state.as_deref(),
+            Some(&b"a2-state"[..]),
+            "agent 1's dump must not contain agent 2's row (per-agent filtered, not whole-table)"
+        );
+
+        let d2 = store.dump_agent_tables(agent(2)).unwrap();
+        assert_eq!(d2.agent_id, 2);
+        assert_eq!(d2.agent_state.as_deref(), Some(&b"a2-state"[..]));
+
+        let d_unset = store.dump_agent_tables(agent(40)).unwrap();
+        assert!(
+            d_unset.agent_state.is_none()
+                && d_unset.personality.is_none()
+                && d_unset.relationships.is_none(),
+            "an in-range agent with no rows yields all-None, not defaults"
+        );
     }
 
     #[test]
