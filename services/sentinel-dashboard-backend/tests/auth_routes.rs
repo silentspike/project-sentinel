@@ -33,16 +33,20 @@ const READ_ROUTES: [&str; 12] = [
     "/api/events/types",
 ];
 
-const CONTROL_GET_ROUTES: [&str; 6] = [
+const CONTROL_GET_ROUTES: [&str; 9] = [
     "/api/control/config",
     "/api/control/traffic-stats",
+    // #429
+    "/api/control/synthesis-rules",
+    "/api/control/traffic-responses",
+    "/api/control/judge-alerts",
     "/api/control/platform-state",
     "/api/control/platform-analyses",
     "/api/control/status",
     "/api/control/snapshots",
 ];
 
-const CONTROL_POST_ROUTES: [&str; 8] = [
+const CONTROL_POST_ROUTES: [&str; 9] = [
     "/api/control/chaos",
     "/api/control/stimulus",
     "/api/control/nightrun",
@@ -51,6 +55,8 @@ const CONTROL_POST_ROUTES: [&str; 8] = [
     "/api/control/resume",
     "/api/control/platform-analyze",
     "/api/control/snapshot",
+    // #429: per-rule toggle (name path param)
+    "/api/control/synthesis-rules/bio_hunger",
 ];
 
 async fn get_json(path: &str) -> (StatusCode, serde_json::Value) {
@@ -180,6 +186,11 @@ async fn authed_degraded_routes_return_200_not_503() {
     let (status, tick) = get_json("/api/metrics/tick").await;
     assert_eq!(status, StatusCode::OK, "tick degradiert mit 200");
     assert_eq!(tick["prometheus"], "offline");
+
+    // #429: judge-alerts degrades to an empty array when events.db is offline.
+    let (status, alerts) = get_json("/api/control/judge-alerts").await;
+    assert_eq!(status, StatusCode::OK, "judge-alerts degradiert mit 200");
+    assert_eq!(alerts.as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
