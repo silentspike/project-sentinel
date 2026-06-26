@@ -567,7 +567,7 @@ pub struct SnapshotMeta {
     pub created_at_ms: i64,
 }
 
-/// Dump aller 11 redb-Tables (Key-Value Paare als Bytes).
+/// Dump aller 12 redb-Tables inklusive api_patterns (Key-Value Paare als Bytes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedbDump {
     pub agent_states: Vec<(u16, Vec<u8>)>,
