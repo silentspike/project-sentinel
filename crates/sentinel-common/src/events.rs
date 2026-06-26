@@ -408,6 +408,26 @@ pub enum DomainEventPayload {
         /// Wall-Clock-Dauer der Bootstrap-Saga in Millisekunden.
         duration_ms: u64,
     },
+    /// #427: Token-/Kosten-Telemetrie eines einzelnen LLM-Calls (pro Agent + Tier,
+    /// cache-aware). Vom Daemon (`llm_bridge`) aus der echten Provider-Usage emittiert;
+    /// die Cost-Information lebt EINMAL im Event-Store (SSOT) und wird per Cost-Projektion
+    /// gelesen (1:n, kein zweiter Puffer). Hoechstfrequentes Event (jeder Call inkl.
+    /// 0-Token-Synthese). Replay-neutral: projection-only, KEIN ECS-Input (der Daemon
+    /// `reconstruct_inputs` ueberspringt es), beruehrt den STRICT/CORE-Hash nicht.
+    AgentLlmUsage {
+        agent_id: AgentId,
+        /// Aufgeloester Model-Tier (low/mid/high) bzw. synthesis/apicp/intercept/unknown.
+        tier: String,
+        /// Frische (nicht gecachte) Input-Tokens.
+        input_tokens: u32,
+        output_tokens: u32,
+        /// Aus dem Cache gelesene Input-Tokens (Anthropic cache_read).
+        cache_read: u32,
+        /// In den Cache geschriebene Input-Tokens (Anthropic cache_creation).
+        cache_creation: u32,
+        /// Vom Gateway aufgeloeste Kosten dieses Calls in USD.
+        cost_usd: f64,
+    },
 }
 
 impl DomainEventPayload {
@@ -455,6 +475,7 @@ impl DomainEventPayload {
             Self::MigrationCompleted { .. } => "migration_completed",
             Self::PsiBandChanged { .. } => "psi_band_changed",
             Self::NodeProvisioned { .. } => "node_provisioned",
+            Self::AgentLlmUsage { .. } => "agent_llm_usage",
         }
     }
 }
@@ -462,6 +483,28 @@ impl DomainEventPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_llm_usage_event_type_and_roundtrip() {
+        // #427: cache-aware per-agent/tier usage event. serde(tag="type") sets
+        // type="AgentLlmUsage"; the cache breakdown survives the roundtrip.
+        let usage = DomainEventPayload::AgentLlmUsage {
+            agent_id: AgentId(8),
+            tier: "high".to_string(),
+            input_tokens: 1000,
+            output_tokens: 500,
+            cache_read: 200,
+            cache_creation: 100,
+            cost_usd: 0.0195,
+        };
+        assert_eq!(usage.event_type_str(), "agent_llm_usage");
+        let json = usage.to_json();
+        assert!(json.contains("\"type\":\"AgentLlmUsage\""));
+        assert!(json.contains("\"cache_read\":200"));
+        assert!(json.contains("\"cache_creation\":100"));
+        let back: DomainEventPayload = serde_json::from_str(&json).expect("roundtrip");
+        assert_eq!(back.to_json(), json);
+    }
 
     #[test]
     fn task_event_types_and_roundtrip() {
