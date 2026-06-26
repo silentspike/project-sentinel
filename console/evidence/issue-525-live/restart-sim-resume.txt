@@ -1,0 +1,5 @@
+## restart + sim-resume evidence
+### daemon ActiveEnterTimestamp
+Fri 2026-06-26 17:08:41 UTC
+### post-restart events delta
+(gemessen: BASE=13417675 -> +108 in 50s -> weiter steigend)

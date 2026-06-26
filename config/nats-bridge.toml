@@ -8,3 +8,6 @@ url = "nats://127.0.0.1:4222"
 
 [server]
 health_port = 8083
+# #525: loopback secure default for the health endpoint. Deliberate exposure
+# (e.g. LAN scrape) = override here; do NOT use 0.0.0.0 in production.
+health_bind_addr = "127.0.0.1:8083"
