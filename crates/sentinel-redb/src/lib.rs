@@ -753,7 +753,7 @@ impl StateStore {
         })
     }
 
-    /// Dumpt alle 11 Tables in einer Read-Transaktion.
+    /// Dumpt alle 12 Tables inklusive api_patterns in einer Read-Transaktion.
     pub fn dump_all_tables(&self) -> anyhow::Result<sentinel_common::RedbDump> {
         let txn = self.db.begin_read()?;
         Ok(sentinel_common::RedbDump {
@@ -772,7 +772,7 @@ impl StateStore {
         })
     }
 
-    /// Restored alle 11 Tables aus einem Dump in einer atomaren Write-Transaktion.
+    /// Restored alle 12 Tables inklusive api_patterns aus einem Dump in einer atomaren Write-Transaktion.
     pub fn restore_all_tables(&self, dump: &sentinel_common::RedbDump) -> anyhow::Result<()> {
         let txn =
             self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
