@@ -2,7 +2,7 @@
 //!
 //! Diese Benchmarks werden fuer die Deploy-VM gebaut und dort ausgefuehrt.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 
@@ -198,6 +198,7 @@ fn bench_rule_evaluation(c: &mut Criterion) {
         ..PlatformControlplaneConfig::default()
     };
     let cooldowns = HashMap::new();
+    let suspended: HashSet<String> = HashSet::new();
 
     c.bench_function("platform_cp.rule_evaluation", |b| {
         b.iter(|| {
@@ -208,6 +209,7 @@ fn bench_rule_evaluation(c: &mut Criterion) {
                 black_box(&config),
                 black_box(&write_rate_baselines),
                 black_box(&agent_ids),
+                black_box(&suspended),
             );
             black_box(actions);
         });

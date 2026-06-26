@@ -36,9 +36,10 @@ use crate::platform_controlplane::{
     PlatformTriggerTestCommand,
 };
 use crate::runtime_control::{
-    RuntimeAnalysisFloodTestRequest, RuntimeAnalysisFloodTestResponse, RuntimeControlCommand,
-    RuntimePanicTestRequest, RuntimePanicTestResponse, RuntimeReconcileRequest,
-    RuntimeReconcileResponse, RuntimeStallRestartTestRequest, RuntimeStallRestartTestResponse,
+    AgentLifecycleResponse, RuntimeAnalysisFloodTestRequest, RuntimeAnalysisFloodTestResponse,
+    RuntimeControlCommand, RuntimePanicTestRequest, RuntimePanicTestResponse,
+    RuntimeReconcileRequest, RuntimeReconcileResponse, RuntimeStallRestartTestRequest,
+    RuntimeStallRestartTestResponse,
 };
 
 const OPERATOR_CHAOS_PATH: &str = "/operator/chaos";
@@ -70,6 +71,10 @@ const OPERATOR_RUNTIME_RECONCILE_PATH: &str = "/operator/runtime/reconcile";
 const OPERATOR_RUNTIME_ANALYSIS_FLOOD_TEST_PATH: &str = "/operator/runtime/analysis-flood-test";
 const OPERATOR_RUNTIME_PANIC_TEST_PATH: &str = "/operator/runtime/panic-test";
 const OPERATOR_RUNTIME_STALL_RESTART_TEST_PATH: &str = "/operator/runtime/stall-restart-test";
+/// #428 per-Agent Lifecycle: Pause (Stop), Resume (Start), Despawn (destructive remove).
+const OPERATOR_RUNTIME_PAUSE_PATH: &str = "/operator/runtime/pause";
+const OPERATOR_RUNTIME_RESUME_PATH: &str = "/operator/runtime/resume";
+const OPERATOR_RUNTIME_DESPAWN_PATH: &str = "/operator/runtime/despawn";
 const OPERATOR_APICP_SNAPSHOT_PATH: &str = "/operator/apicp/snapshot";
 const OPERATOR_SECURITY_FS_TRASH_PATH: &str = "/operator/security/fs-trash";
 const OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH: &str = "/operator/security/fs-trash-fixture";
@@ -508,6 +513,8 @@ enum ApiError {
     BadRequest(&'static str),
     Unauthorized,
     NotFound(&'static str),
+    /// #428: ungueltiger Zustandsuebergang (z.B. Pause auf bereits pausierten Agent).
+    Conflict(&'static str),
     MethodNotAllowed,
     PayloadTooLarge,
     ServiceUnavailable(&'static str),
@@ -536,6 +543,7 @@ impl ApiError {
                 },
             ),
             Self::NotFound(msg) => json_response(404, ErrorResponse { error: msg }),
+            Self::Conflict(msg) => json_response(409, ErrorResponse { error: msg }),
             Self::MethodNotAllowed => json_response(
                 405,
                 ErrorResponse {
@@ -1373,6 +1381,24 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Err(err) => err.to_response(),
             }
         }
+        OPERATOR_RUNTIME_PAUSE_PATH | OPERATOR_RUNTIME_RESUME_PATH | OPERATOR_RUNTIME_DESPAWN_PATH => {
+            let payload: AgentLifecycleRequest = match serde_json::from_slice(&request.body) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    return ApiError::BadRequest("Request-JSON ungueltig (agent_id erwartet)")
+                        .to_response();
+                }
+            };
+            let action = match path_only {
+                OPERATOR_RUNTIME_PAUSE_PATH => AgentLifecycleAction::Pause,
+                OPERATOR_RUNTIME_RESUME_PATH => AgentLifecycleAction::Resume,
+                _ => AgentLifecycleAction::Despawn,
+            };
+            match dispatch_agent_lifecycle(action, payload.agent_id, state) {
+                Ok(response) => json_response(200, response),
+                Err(err) => err.to_response(),
+            }
+        }
         OPERATOR_APICP_SNAPSHOT_PATH => {
             let payload: ApiCpSnapshot = match serde_json::from_slice(&request.body) {
                 Ok(p) => p,
@@ -1861,6 +1887,58 @@ fn dispatch_runtime_stall_restart_test(
     response_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .map_err(|_| ApiError::ServiceUnavailable("Stall-Restart-Test Timeout"))
+}
+
+/// #428: Request-Body fuer per-Agent Pause/Resume/Despawn.
+#[derive(Debug, Clone, Deserialize)]
+struct AgentLifecycleRequest {
+    agent_id: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AgentLifecycleAction {
+    Pause,
+    Resume,
+    Despawn,
+}
+
+/// #428: schickt einen per-Agent Lifecycle-Befehl in den Tick-Loop und mappt das `outcome`
+/// auf den HTTP-Status (ok->200, invalid_transition->409, not_found->404). Kein Panic/500.
+fn dispatch_agent_lifecycle(
+    action: AgentLifecycleAction,
+    agent_id: u16,
+    state: &AppState,
+) -> std::result::Result<AgentLifecycleResponse, ApiError> {
+    if agent_id == 0 {
+        return Err(ApiError::BadRequest("agent_id fehlt"));
+    }
+    let (response_tx, response_rx) = mpsc::sync_channel(1);
+    let command = match action {
+        AgentLifecycleAction::Pause => RuntimeControlCommand::Pause {
+            agent_id,
+            response_tx,
+        },
+        AgentLifecycleAction::Resume => RuntimeControlCommand::Resume {
+            agent_id,
+            response_tx,
+        },
+        AgentLifecycleAction::Despawn => RuntimeControlCommand::Despawn {
+            agent_id,
+            response_tx,
+        },
+    };
+    state
+        .runtime_tx
+        .send(command)
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-Control-Channel nicht verfuegbar"))?;
+    let response = response_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|_| ApiError::ServiceUnavailable("Agent-Lifecycle Timeout"))?;
+    match response.outcome.as_str() {
+        "invalid_transition" => Err(ApiError::Conflict("Agent ist bereits im Zielzustand")),
+        "not_found" => Err(ApiError::NotFound("agent_id nicht in der Runtime")),
+        _ => Ok(response),
+    }
 }
 
 fn request_path(path: &str) -> &str {
@@ -4100,6 +4178,101 @@ mod tests {
     }
 
     #[test]
+    fn agent_lifecycle_pause_forwards_command_and_maps_ok() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        // Tick-Loop simulieren: Befehl empfangen + Antwort zuruecksenden.
+        let responder = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::Pause {
+                agent_id,
+                response_tx,
+            } => {
+                response_tx
+                    .send(AgentLifecycleResponse {
+                        accepted: true,
+                        agent_id,
+                        aggregate_id: format!("AGENT-{agent_id:02}"),
+                        action: "pause".to_string(),
+                        new_status: "suspended".to_string(),
+                        affected_pids: 2,
+                        outcome: "ok".to_string(),
+                        note: "paused".to_string(),
+                    })
+                    .unwrap();
+                agent_id
+            }
+            other => panic!("unerwartetes Kommando: {other:?}"),
+        });
+        let result = dispatch_agent_lifecycle(AgentLifecycleAction::Pause, 7, &state)
+            .expect("pause dispatch ok");
+        assert_eq!(responder.join().unwrap(), 7);
+        assert_eq!(result.new_status, "suspended");
+        assert_eq!(result.outcome, "ok");
+        assert_eq!(result.affected_pids, 2);
+    }
+
+    #[test]
+    fn agent_lifecycle_invalid_transition_maps_to_conflict_409() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let responder = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::Resume {
+                agent_id,
+                response_tx,
+            } => response_tx
+                .send(AgentLifecycleResponse {
+                    accepted: false,
+                    agent_id,
+                    aggregate_id: format!("AGENT-{agent_id:02}"),
+                    action: "resume".to_string(),
+                    new_status: String::new(),
+                    affected_pids: 0,
+                    outcome: "invalid_transition".to_string(),
+                    note: "already active".to_string(),
+                })
+                .unwrap(),
+            other => panic!("erwartete Resume, war {other:?}"),
+        });
+        let err = dispatch_agent_lifecycle(AgentLifecycleAction::Resume, 7, &state).unwrap_err();
+        responder.join().unwrap();
+        assert!(matches!(err, ApiError::Conflict(_)));
+        assert_eq!(err.to_response().status, 409);
+    }
+
+    #[test]
+    fn agent_lifecycle_not_found_maps_to_404() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let responder = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::Despawn {
+                agent_id,
+                response_tx,
+            } => response_tx
+                .send(AgentLifecycleResponse {
+                    accepted: false,
+                    agent_id,
+                    aggregate_id: format!("AGENT-{agent_id:02}"),
+                    action: "despawn".to_string(),
+                    new_status: String::new(),
+                    affected_pids: 0,
+                    outcome: "not_found".to_string(),
+                    note: "unknown".to_string(),
+                })
+                .unwrap(),
+            other => panic!("erwartete Despawn, war {other:?}"),
+        });
+        let err = dispatch_agent_lifecycle(AgentLifecycleAction::Despawn, 99, &state).unwrap_err();
+        responder.join().unwrap();
+        assert!(matches!(err, ApiError::NotFound(_)));
+        assert_eq!(err.to_response().status, 404);
+    }
+
+    #[test]
+    fn agent_lifecycle_rejects_zero_agent_id() {
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let err = dispatch_agent_lifecycle(AgentLifecycleAction::Pause, 0, &state).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+        assert_eq!(err.to_response().status, 400);
+    }
+
+    #[test]
     fn fs_dedup_benchmark_reports_hits_ratio_and_latency() {
         let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
         attach_test_fs_layer(&mut state);
@@ -4427,6 +4600,7 @@ mod tests {
             RuntimeControlCommand::StateHash { .. } => {
                 panic!("unerwartetes StateHash-Kommando");
             }
+            other => panic!("unerwartetes Lifecycle-Kommando: {other:?}"),
         });
         let response = handle_http_request(
             test_request(
