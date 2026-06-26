@@ -187,3 +187,39 @@ AC-6 (Chef-SPOF), AC-7 (restart-durability) — all PASS, plus the seed-only gat
 single-node regression smoke. Two real bugs were found and fixed by this live verification:
 the init-order `OnceLock` race (seed identity nil) and the missing seed-only handoff gate.
 VM 1069 (prod) untouched throughout.
+
+## Handoff latency benchmark (#496 plan requirement) — added after a self-audit
+
+The plan requires `Handoff p50/p95/p99/max` + a `0 double-writes` bug-finder for #496;
+this measurement was missing when the functional ACs were verified, so it was run after a
+self-audit on the same live 2-node cluster (on node-0's loopback, never `cargo remote`).
+
+**Latency — N=50 handoffs, ping-pong `nano:BENCH-1` node-0 ↔ node-1 (each iteration drives
+exactly one cross-node #569 RPC):**
+```
+handoff latency: N=50, ok=50, failures=0
+min=9.3  p50=11.5  p95=14.2  p99=25.5  max=25.5  mean=11.9  ms
+```
+All in the ms class (p99 = 25.5 ms ≪ the 1 Hz tick budget); the tail is dominated by the
+QUIC connect-per-RPC + the durable redb owner-term write (consistent with #569 RefQuery
+p50 ≈ 7.2 ms). Connection-reuse would cut it further (Track G); 0-RTT stays off (V18).
+
+**0-double-writes bug-finder — 12 handoffs, owner-check both nodes after each:**
+```
+i=1  Committed -> node-0:false node-1:true  (writers=1) OK
+i=2  Committed -> node-0:true  node-1:false (writers=1) OK
+… (i=3..12, alternating) …
+Result: 0 double-owner violations / 12 handoffs
+```
+Across rapid alternating cross-node handoffs there is never a moment with two writers —
+exactly one node has `own_write_validates=true` at all times (the other fenced by the V19
+term + the V4 retirement). The partition steal variant is covered by AC-4 above.
+
+**Sidecar (`vmstat 1` during the run, both VMs; `ss -s` before/after):** node-0
+(chef + sim) us 7–13% / sy 11–23% / id 53–77% — not saturated; node-1 (target, commit RPC
+only) ~93–98% idle; `ss -s` 161/159 sockets unchanged before==after → no socket leak.
+
+**Heartbeat / lease-TTL sweep (plan line): n/a** — the cooperative handoff is RPC-driven
+(`PrepareHandoff → durable SourceRetiredAck → OwnerCommit`); there is no lease/heartbeat
+timeout in the handoff path (the #495 membership heartbeats are liveness-only, V2/V38, and
+do not drive the handoff). Lease/forced-failover is Track D (G-D0).
