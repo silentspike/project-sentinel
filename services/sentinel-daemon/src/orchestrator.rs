@@ -1185,6 +1185,23 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             None => None,
         };
 
+    // -- #498 CAS block-map gossip republish (Cluster 12): only when the control stream
+    // is active (cluster mode). Single-node prod has no [daemon.cluster].control_bind, so
+    // this never spawns — the production tick path is unchanged (Strangler S4). --
+    if let Some(ref cc) = cluster_control {
+        if let Some(cluster) = config.cluster.as_ref() {
+            tokio::spawn(crate::cluster_control::run_cas_gossip_republish(
+                Arc::clone(cc),
+                data_dir.to_path_buf(),
+                cluster.node_id,
+                uuid::Uuid::new_v4(),
+                std::time::Duration::from_secs(15),
+                256,
+            ));
+            info!("Cluster 12: #498 CAS block-map gossip republish gestartet");
+        }
+    }
+
     // -- Zenoh Fan-Out Bridge (Events nach Limbo-Write auf Zenoh publizieren) --
     let fanout_capacity = config.zenoh.fanout_channel_capacity;
     let fanout_sender = if let Some(ref b) = bus {

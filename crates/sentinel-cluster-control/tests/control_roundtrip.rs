@@ -82,6 +82,66 @@ async fn rpc_roundtrip_idempotency_and_server_pin() {
 }
 
 #[tokio::test]
+async fn holder_gossip_over_the_wire_merges_into_the_shared_block_map() {
+    use std::sync::Mutex;
+
+    use sentinel_cluster_control::BlockMapGossipHandler;
+    use sentinel_common::{BlockMap, BlockRef, HolderAction, HolderAdvertisement, NodeId};
+    use uuid::Uuid;
+
+    let server_node = NodeCertificate::generate("node-0").unwrap();
+    let client_node = NodeCertificate::generate("node-1").unwrap();
+    let server_fp = server_node.fingerprint();
+    let client_fp = client_node.fingerprint();
+
+    let mut pins = HashSet::new();
+    pins.insert(client_fp);
+
+    // node-0's server merges inbound holder gossip into this shared block map (#498).
+    let block_map = Arc::new(Mutex::new(BlockMap::new()));
+    let handler = Arc::new(BlockMapGossipHandler::new(Arc::clone(&block_map), StubHandler));
+    let server = ControlServer::bind(loopback(), &server_node, pins, handler).unwrap();
+    let addr = server.local_addr();
+    let client = ControlClient::new(&client_node).unwrap();
+
+    // node-1 advertises that it holds two blocks; the gossip crosses a real QUIC stream.
+    let holder = NodeId::new();
+    let boot = Uuid::new_v4();
+    let adv = |n: u8| HolderAdvertisement {
+        block_ref: BlockRef::blob_sha256([n; 32], 1024),
+        node_id: holder,
+        node_boot_id: boot,
+        node_incarnation: 1,
+        node_cas_generation: 1,
+        action: HolderAction::Add,
+        expires_after: u64::MAX,
+    };
+    let env = ControlEnvelope::new(
+        "gossip-1",
+        ControlRequest::AdvertiseHolders {
+            advertisements: vec![adv(1), adv(2)],
+        },
+    );
+    let reply = client.rpc(addr, server_fp, &env).await.unwrap();
+    assert_eq!(
+        reply.response,
+        ControlResponse::HoldersApplied { applied: 2 },
+        "both advertisements applied on the receiver"
+    );
+
+    // AC-1 (live wire): node-0's block map now knows node-1 holds both blocks.
+    let map = block_map.lock().unwrap();
+    assert_eq!(map.block_count(), 2);
+    assert_eq!(
+        map.holders(&BlockRef::blob_sha256([1; 32], 1024)),
+        vec![holder],
+        "the block map resolves node-1 as the holder after gossip"
+    );
+
+    server.close();
+}
+
+#[tokio::test]
 async fn server_rejects_unpinned_client() {
     let server_node = NodeCertificate::generate("node-0").unwrap();
     let server_fp = server_node.fingerprint();
