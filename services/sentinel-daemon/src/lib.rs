@@ -15,6 +15,7 @@ pub mod ebpf;
 pub mod episode_producer;
 pub mod evolution_task;
 pub mod fanout;
+pub mod handoff;
 pub mod llm_bridge;
 #[cfg(feature = "nats")]
 pub mod nats_consumer;

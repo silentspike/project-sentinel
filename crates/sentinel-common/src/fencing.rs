@@ -20,7 +20,7 @@ use crate::cluster::NodeId;
 use crate::types::StateTransferScope;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 /// The committed ownership of a scope: which node owns it, at which monotonic epoch.
@@ -111,7 +111,7 @@ pub trait FencedStore {
 /// node so a source can enforce its own retirement during a partition even if the
 /// coordinator's update is invisible. PR2a only ever holds `Owner` (single-node); PR2b
 /// drives the `Retiring`/`Retired` transitions during handoff.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalOwnerState {
     pub scope: StateTransferScope,
     pub node_id: NodeId,
@@ -120,7 +120,7 @@ pub struct LocalOwnerState {
 }
 
 /// The local role for a scope (V4). Single-node is always `Owner`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LocalOwnerRole {
     #[default]
     Owner,
@@ -155,6 +155,14 @@ pub struct OwnerRegistry {
     /// Committed per-scope owner terms — **only** consulted in cluster mode. Empty
     /// single-node (the seed synthesizes its ownership without touching this map).
     terms: RwLock<HashMap<StateTransferScope, OwnerTerm>>,
+    /// Fast-path gate for the local-retirement fence (V4), same discipline as `mode`:
+    /// `false` single-node, so `validate` skips the `local_state` lock entirely (V26).
+    /// Set with `Release` once this node cooperatively retires a scope.
+    has_local_retirement: AtomicBool,
+    /// This node's local owner roles per scope (V4) — durable retirement so a source
+    /// keeps rejecting its own writes to a handed-off scope even during a partition (when
+    /// the chef's `OwnerCommit` to the new owner is invisible). Empty single-node.
+    local_state: RwLock<HashMap<StateTransferScope, LocalOwnerState>>,
 }
 
 static GLOBAL: OnceLock<OwnerRegistry> = OnceLock::new();
@@ -192,7 +200,18 @@ impl OwnerRegistry {
             this_node,
             mode: AtomicU8::new(MODE_SINGLE_NODE),
             terms: RwLock::new(HashMap::new()),
+            has_local_retirement: AtomicBool::new(false),
+            local_state: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Construct a standalone (non-global) single-node registry, for tests that need
+    /// several independent registries (e.g. the in-process handoff saga's source/target
+    /// "worlds"). Hidden from docs and not a production path — the daemon uses the
+    /// process-global [`global`](Self::global) registry.
+    #[doc(hidden)]
+    pub fn new_for_test(this_node: NodeId) -> Self {
+        Self::single_node(this_node)
     }
 
     /// The node id this registry acts for.
@@ -260,6 +279,64 @@ impl OwnerRegistry {
         }
     }
 
+    /// Record that this node has locally **retired** `scope` at `epoch` (V4) — the source
+    /// side of a cooperative handoff (`PrepareHandoff`). After this, `validate` rejects
+    /// this node's own writes to `scope` at epoch ≤ `epoch`, **even if** a partition hides
+    /// the chef's `OwnerCommit` to the new owner — the durable local fence that prevents
+    /// the source from continuing to write a scope it gave up (silent split-brain). Same
+    /// publish ordering as `commit_owner`: write the state, then flip the flag with
+    /// `Release`. Durable persistence (ADR-3 `LOCAL_OWNER`) is the daemon's job; this is
+    /// the in-memory working view.
+    pub fn retire_local(&self, scope: StateTransferScope, epoch: u64) {
+        {
+            let mut ls = self
+                .local_state
+                .write()
+                .expect("local owner state poisoned");
+            ls.insert(
+                scope.clone(),
+                LocalOwnerState {
+                    scope,
+                    node_id: self.this_node,
+                    epoch,
+                    role: LocalOwnerRole::Retired,
+                },
+            );
+        }
+        self.has_local_retirement.store(true, Ordering::Release);
+    }
+
+    /// This node's local owner state for a scope, if any (V4). `None` on the fast path
+    /// (no retirement recorded), avoiding the lock.
+    pub fn local_owner_state(&self, scope: &StateTransferScope) -> Option<LocalOwnerState> {
+        if !self.has_local_retirement.load(Ordering::Acquire) {
+            return None;
+        }
+        self.local_state
+            .read()
+            .expect("local owner state poisoned")
+            .get(scope)
+            .cloned()
+    }
+
+    /// Re-establish durable local retirements at startup (V4) so a handed-off scope stays
+    /// fenced across a restart. Sets the fast-path flag iff any retirement is present.
+    pub fn restore_local_retirements(&self, states: Vec<LocalOwnerState>) {
+        if states.is_empty() {
+            return;
+        }
+        {
+            let mut ls = self
+                .local_state
+                .write()
+                .expect("local owner state poisoned");
+            for s in states {
+                ls.insert(s.scope.clone(), s);
+            }
+        }
+        self.has_local_retirement.store(true, Ordering::Release);
+    }
+
     /// Mint a write guard for a scope this node owns. In single-node mode this always
     /// succeeds (the seed owns every scope); the guard carries the committed epoch so
     /// `begin_fenced_write`/commit can re-check it (V19).
@@ -272,9 +349,11 @@ impl OwnerRegistry {
         }
     }
 
-    /// Re-check a guard against the current committed owner term (V19). Rejects a guard
-    /// whose epoch is older than the committed epoch, or that asserts a different owner
-    /// node, with [`StaleEpochError`]. Always `Ok` in single-node mode.
+    /// Re-check a guard against the current committed owner term (V19) **and** this
+    /// node's local retirement (V4). Rejects a guard whose epoch is older than the
+    /// committed epoch, that asserts a different owner node, or that targets a scope this
+    /// node has locally retired, with [`StaleEpochError`]. Always `Ok` in single-node
+    /// mode (no committed term advances, no local retirement is recorded).
     pub fn validate(&self, guard: &OwnerWriteGuard) -> Result<(), StaleEpochError> {
         let term = self.current_owner(&guard.scope);
         if guard.owner_node != term.owner_node || guard.epoch < term.epoch {
@@ -283,6 +362,27 @@ impl OwnerRegistry {
                 guard_epoch: guard.epoch,
                 current_epoch: term.epoch,
             });
+        }
+        // Local-retirement fence (V4): if this node cooperatively retired the scope at an
+        // epoch >= the guard's, it gave up ownership — reject even when the registry's
+        // committed term has not caught up (partition). Skipped on the lock-free fast path
+        // when no retirement exists (V26): the `Acquire` pairs with `retire_local`'s
+        // `Release`.
+        if self.has_local_retirement.load(Ordering::Acquire) {
+            let ls = self.local_state.read().expect("local owner state poisoned");
+            if let Some(state) = ls.get(&guard.scope) {
+                if matches!(
+                    state.role,
+                    LocalOwnerRole::Retiring | LocalOwnerRole::Retired
+                ) && guard.epoch <= state.epoch
+                {
+                    return Err(StaleEpochError {
+                        scope: guard.scope.clone(),
+                        guard_epoch: guard.epoch,
+                        current_epoch: state.epoch + 1, // ownership moved to the new owner at E+1
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -373,6 +473,56 @@ mod tests {
         // cluster mode — unmapped scopes default to this node's ownership.
         let untouched = StateTransferScope::World;
         assert!(b.validate(&b.issue(untouched)).is_ok());
+    }
+
+    /// #496 PR2b-2ii: the V4 local-retirement fence. After a node cooperatively retires a
+    /// scope (the source side of a handoff), its own writes to that scope at the retired
+    /// epoch are rejected — even without a committed term update (the partition-safe local
+    /// fence). A non-retired scope is unaffected; the fast path stays off until the first
+    /// retirement.
+    #[test]
+    fn retire_local_fences_the_source_at_the_retired_epoch() {
+        let reg = OwnerRegistry::single_node(node(1));
+        let scope = StateTransferScope::NanoContainer("AGENT-07".into());
+        let other = StateTransferScope::World;
+
+        // Before any retirement: fast path, the guard validates, no local state.
+        let g = reg.issue(scope.clone()); // node(1) @ epoch 1
+        assert!(reg.validate(&g).is_ok());
+        assert!(reg.local_owner_state(&scope).is_none());
+
+        // A cooperative handoff retires the scope at epoch 1 (source side).
+        reg.retire_local(scope.clone(), 1);
+        assert_eq!(
+            reg.local_owner_state(&scope).map(|s| s.role),
+            Some(LocalOwnerRole::Retired)
+        );
+
+        // The source's own guard (epoch 1) is now fenced — it gave up the scope.
+        let err = reg.validate(&g).unwrap_err();
+        assert_eq!(err.guard_epoch, 1);
+        assert_eq!(err.current_epoch, 2); // the new owner is at E+1
+
+        // A different scope this node never retired still validates.
+        assert!(reg.validate(&reg.issue(other)).is_ok());
+    }
+
+    /// `restore_local_retirements` re-establishes the fence after a restart (durable V4).
+    #[test]
+    fn restore_local_retirements_re_fences_after_restart() {
+        let reg = OwnerRegistry::single_node(node(1));
+        let scope = StateTransferScope::NanoContainer("AGENT-03".into());
+        let g = reg.issue(scope.clone());
+        assert!(reg.validate(&g).is_ok());
+
+        // Simulate reload from the durable LOCAL_OWNER table at startup.
+        reg.restore_local_retirements(vec![LocalOwnerState {
+            scope: scope.clone(),
+            node_id: node(1),
+            epoch: 1,
+            role: LocalOwnerRole::Retired,
+        }]);
+        assert!(reg.validate(&g).is_err());
     }
 
     #[test]
