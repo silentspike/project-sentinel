@@ -63,6 +63,10 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub operator_api: OperatorApiConfig,
 
+    /// Prometheus-eBPF Metrics-HTTP-Server (#525: loopback secure default).
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+
     /// PSI-basierte adaptive Tick-Rate (TOGAF Adaptive Scheduling).
     #[serde(default)]
     pub adaptive: AdaptiveConfig,
@@ -268,6 +272,25 @@ impl Default for OperatorApiConfig {
     }
 }
 
+/// Prometheus-eBPF Metrics-HTTP-Server Konfiguration (#525).
+///
+/// Loopback-only secure default (wie operator_api): der einzige Consumer ist der
+/// dashboard-backend proxy auf 127.0.0.1. Deliberate exposure = override via TOML.
+#[derive(Debug, Deserialize, Clone)]
+pub struct MetricsConfig {
+    /// Bind-Adresse fuer den Prometheus text HTTP-Listener (default: 127.0.0.1:9090).
+    #[serde(default = "default_metrics_bind_addr")]
+    pub bind_addr: String,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: default_metrics_bind_addr(),
+        }
+    }
+}
+
 /// Zenoh SHM Core-Bus Konfiguration.
 ///
 /// TOML-Werte dienen als Defaults. ENV-Variablen ueberschreiben TOML-Werte
@@ -384,6 +407,10 @@ fn default_max_inflight_per_agent() -> usize {
 
 fn default_operator_bind_addr() -> String {
     "127.0.0.1:8084".to_string()
+}
+
+fn default_metrics_bind_addr() -> String {
+    "127.0.0.1:9090".to_string()
 }
 
 fn default_tc_tick_sync_timeout_ms() -> u64 {
@@ -710,6 +737,9 @@ zenoh_prefix = "test"
 enabled = true
 bind_addr = "127.0.0.1:9999"
 shared_secret = "secret"
+
+[daemon.metrics]
+bind_addr = "127.0.0.1:7777"
 "#;
         let file: DaemonConfigFile = toml::from_str(toml_str).unwrap();
         assert_eq!(file.daemon.tick_rate_ms, 500);
@@ -725,6 +755,7 @@ shared_secret = "secret"
             file.daemon.operator_api.shared_secret.as_deref(),
             Some("secret")
         );
+        assert_eq!(file.daemon.metrics.bind_addr, "127.0.0.1:7777");
     }
 
     #[test]
@@ -775,6 +806,7 @@ data_dir = "/tmp/data"
         assert!(file.daemon.operator_api.enabled);
         assert_eq!(file.daemon.operator_api.bind_addr, "127.0.0.1:8084");
         assert!(file.daemon.operator_api.shared_secret.is_none());
+        assert_eq!(file.daemon.metrics.bind_addr, "127.0.0.1:9090");
         assert_eq!(file.daemon.tick_rate_ms, 1000);
         assert_eq!(file.daemon.max_agents, 30);
         assert_eq!(

@@ -56,16 +56,17 @@ pub fn init_ebpf(stall_threshold_secs: u64) -> (EbpfCollector, MonitoringMode) {
 /// Prometheus Metrics HTTP Server (raw TCP, kein hyper noetig).
 ///
 /// Antwortet auf jede TCP-Verbindung mit dem aktuellen Prometheus-Text.
-/// Port default: 9090. Laeuft als tokio::spawn Task.
-pub async fn prometheus_server(metrics_text: Arc<RwLock<String>>, port: u16) {
-    let listener = match TcpListener::bind(("0.0.0.0", port)).await {
+/// Default-Bind: 127.0.0.1:9090 (loopback secure default, #525; uebersteuerbar via
+/// `[daemon.metrics] bind_addr`). Laeuft als tokio::spawn Task.
+pub async fn prometheus_server(metrics_text: Arc<RwLock<String>>, bind_addr: String) {
+    let listener = match TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
         Err(e) => {
-            error!(port, error = %e, "Prometheus TCP Listener bind fehlgeschlagen");
+            error!(bind_addr = %bind_addr, error = %e, "Prometheus TCP Listener bind fehlgeschlagen");
             return;
         }
     };
-    info!(port, "Prometheus eBPF metrics server gestartet");
+    info!(bind_addr = %bind_addr, "Prometheus eBPF metrics server gestartet");
 
     loop {
         match listener.accept().await {
@@ -400,5 +401,43 @@ mod tests {
         let mut text = String::new();
         render_phase_histograms(&mut text, &histograms);
         assert!(text.is_empty());
+    }
+
+    /// #525: prometheus_server bindet auf der uebergebenen loopback-Adresse
+    /// (kein hardcoded 0.0.0.0) und serviert den Prometheus-Text.
+    #[tokio::test]
+    async fn prometheus_server_binds_loopback_and_serves() {
+        use tokio::io::AsyncReadExt;
+        // Freien ephemeralen Port reservieren + freigeben (Server re-bindet loopback).
+        let reserve = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserve.local_addr().unwrap().port();
+        drop(reserve);
+        let bind_addr = format!("127.0.0.1:{port}");
+
+        let metrics_text: Arc<RwLock<String>> =
+            Arc::new(RwLock::new("# test\nsentinel_loopback_probe 1\n".to_string()));
+        let server_text = Arc::clone(&metrics_text);
+        let handle = tokio::spawn(async move { prometheus_server(server_text, bind_addr).await });
+
+        // Kurz warten, bis der Listener aktiv ist.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("Prometheus loopback listener erreichbar");
+        let mut buf = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), stream.read_to_end(&mut buf))
+            .await
+            .expect("read innerhalb timeout")
+            .expect("response gelesen");
+
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.starts_with("HTTP/1.1 200"), "response = {resp}");
+        assert!(
+            resp.contains("sentinel_loopback_probe 1"),
+            "metrics body fehlt: {resp}"
+        );
+
+        handle.abort();
     }
 }

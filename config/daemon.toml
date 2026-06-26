@@ -40,6 +40,11 @@ url = "nats://127.0.0.1:4222"
 enabled = true
 bind_addr = "127.0.0.1:8084"
 
+# Prometheus-eBPF Metrics-HTTP-Server (#525): loopback secure default.
+# Einziger Consumer = dashboard-backend proxy auf 127.0.0.1. Deliberate exposure = override hier.
+[daemon.metrics]
+bind_addr = "127.0.0.1:9090"
+
 [daemon.traffic_control]
 synthesis_enabled = true
 sequencing_enabled = true
