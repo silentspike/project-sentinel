@@ -29,16 +29,19 @@ const MAX_CHAT_EVENTS_PER_TICK: usize = 3;
 /// beschraenkt auf MAX_EVENTS.
 #[allow(clippy::type_complexity)]
 pub fn decision_system(
-    mut query: Query<(
-        &AgentIdentity,
-        &BioState,
-        &Personality,
-        &Mood,
-        &WorkContext,
-        &PerceptionState,
-        &Position,
-        &mut EventQueue,
-    )>,
+    mut query: Query<
+        (
+            &AgentIdentity,
+            &BioState,
+            &Personality,
+            &Mood,
+            &WorkContext,
+            &PerceptionState,
+            &Position,
+            &mut EventQueue,
+        ),
+        Without<Frozen>,
+    >,
     time: Res<SimulationTime>,
     event_buffer: Res<EventBuffer>,
     chat_buffer: Res<RoomChatBuffer>,
