@@ -9,6 +9,7 @@ license = "MIT"
 # provision / GC RPCs. Skeleton — the real handler logic lands in #496/#499.
 
 [dependencies]
+sentinel-common = { path = "../sentinel-common" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
