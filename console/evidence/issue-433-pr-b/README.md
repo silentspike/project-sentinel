@@ -80,12 +80,13 @@ Gateway-dependent metrics degraded visibly as expected (`Gateway offline`) with 
 
 ## Screenshots
 
-Before/after pairs:
+After (the `old-*` Bun-baseline screenshots were removed as repo hygiene — the
+Bun dashboard itself was deleted in #469; the originals remain in git history):
 
-- `old-agents.png` / `new-agents.png`
-- `old-floorplan.png` / `new-floorplan.png`
-- `old-metrics.png` / `new-metrics.png`
-- `old-cockpit.png` / `new-cockpit.png`
+- `new-agents.png`
+- `new-floorplan.png`
+- `new-metrics.png`
+- `new-cockpit.png`
 
 The first new screenshot pass found and fixed three UI issues before this evidence was finalized:
 
