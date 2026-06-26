@@ -5,18 +5,20 @@
 //! persistent authority, in `sentinel-redb`). The registry cannot depend on the redb
 //! store it is the authority for, so this handler — which sees both — orchestrates them.
 //!
-//! **PR2b-2a (this) wires the foundation:** `OwnerCommit` durably persists the new term
-//! (durable-first authority) and re-establishes the in-memory registry, entering cluster
-//! mode so the old owner's guards turn stale — the first real cross-node reject path
-//! (V19). `PrepareHandoff` / `SourceRetiredAck` are acknowledged here so the transport
-//! works end-to-end; the **full V1 handoff saga** (durable retired-marker, ordering,
-//! epoch monotonicity) lands in PR2b-2b. `RefQuery` / `PinQuery` belong to the
-//! cluster-GC handler (#499) and report no refs.
+//! `OwnerCommit` (PR2b-2a) durably persists the new term (durable-first authority) and
+//! re-establishes the in-memory registry, entering cluster mode so the old owner's guards
+//! turn stale (V19). `PrepareHandoff` (PR2b-2ii) is the **source side** of the cooperative
+//! handoff: it durably retires the scope (V4 local fence) before acking, so the source
+//! stops writing it even during a partition. `SourceRetiredAck` is an idempotent
+//! acknowledgement; `RefQuery` / `PinQuery` belong to the cluster-GC handler (#499) and
+//! report no refs. The chef-side saga that orders these RPCs lives in `handoff.rs`.
 
 use std::sync::Arc;
 
 use sentinel_cluster_control::{ControlHandler, ControlRequest, ControlResponse};
-use sentinel_common::{NodeId, OwnerRegistry, OwnerTerm, StateTransferScope};
+use sentinel_common::{
+    LocalOwnerRole, LocalOwnerState, NodeId, OwnerRegistry, OwnerTerm, StateTransferScope,
+};
 use sentinel_redb::ClusterMetaStore;
 use tracing::{info, warn};
 
@@ -74,6 +76,39 @@ impl OwnerControlHandler {
         }
         Ok(term)
     }
+
+    /// Source side of a cooperative handoff (V1/V4): durably persist this node's local
+    /// retirement of `scope` at `epoch`. Returns the persisted state, or a typed
+    /// `Rejected` on a malformed scope / persist failure. The caller then applies it to
+    /// the in-memory registry (kept out of the persist unit test, like `persist_commit`).
+    fn persist_retirement(
+        &self,
+        scope_wire: &str,
+        epoch: u64,
+    ) -> Result<LocalOwnerState, ControlResponse> {
+        let Some(scope) = StateTransferScope::from_wire(scope_wire) else {
+            warn!(
+                scope = scope_wire,
+                "PrepareHandoff rejected: unrecognized scope"
+            );
+            return Err(ControlResponse::Rejected {
+                reason: format!("unrecognized scope {scope_wire:?}"),
+            });
+        };
+        let state = LocalOwnerState {
+            scope,
+            node_id: OwnerRegistry::global().this_node(),
+            epoch,
+            role: LocalOwnerRole::Retired,
+        };
+        if let Err(e) = self.meta.put_local_state(&state) {
+            warn!(error = %e, scope = scope_wire, "PrepareHandoff rejected: persist retirement failed");
+            return Err(ControlResponse::Rejected {
+                reason: format!("persist retirement failed: {e}"),
+            });
+        }
+        Ok(state)
+    }
 }
 
 impl ControlHandler for OwnerControlHandler {
@@ -102,23 +137,27 @@ impl ControlHandler for OwnerControlHandler {
                 Err(rejected) => rejected,
             },
 
-            // PR2b-2a foundation: acknowledge so the 2-VM RPC path works end-to-end; the
-            // full V1 saga (durable retired-marker, ordering, epoch monotonicity) is
-            // PR2b-2b. Reject an unrecognized scope rather than ack it.
+            // PR2b-2ii: the source side of the cooperative handoff — durably retire the
+            // scope (V4) before acking, so this node stops writing it even during a
+            // partition. Reject an unrecognized scope rather than retire it.
             ControlRequest::PrepareHandoff { scope, epoch } => {
-                if StateTransferScope::from_wire(scope).is_none() {
-                    return ControlResponse::Rejected {
-                        reason: format!("unrecognized scope {scope:?}"),
-                    };
-                }
-                info!(
-                    scope = scope.as_str(),
-                    epoch = *epoch,
-                    "PrepareHandoff acknowledged (full saga: PR2b-2b)"
-                );
-                ControlResponse::HandoffPrepared {
-                    scope: scope.clone(),
-                    epoch: *epoch,
+                match self.persist_retirement(scope, *epoch) {
+                    Ok(state) => {
+                        // Durably retired -> apply to the in-memory registry so this node
+                        // stops writing the scope (V4 local fence), then ack (V1 durable
+                        // SourceRetiredAck).
+                        OwnerRegistry::global().retire_local(state.scope, *epoch);
+                        info!(
+                            scope = scope.as_str(),
+                            epoch = *epoch,
+                            "PrepareHandoff: scope durably retired (source side, V4)"
+                        );
+                        ControlResponse::HandoffPrepared {
+                            scope: scope.clone(),
+                            epoch: *epoch,
+                        }
+                    }
+                    Err(rejected) => rejected,
                 }
             }
             ControlRequest::SourceRetiredAck { scope, epoch } => {
@@ -201,27 +240,29 @@ mod tests {
     }
 
     #[test]
-    fn handoff_rpcs_ack_known_scope_and_reject_unknown() {
+    fn prepare_handoff_persists_retirement_and_rejects_unknown() {
         let (_dir, store) = store();
-        let handler = OwnerControlHandler::new(store);
-        assert_eq!(
-            handler.handle(&ControlRequest::PrepareHandoff {
-                scope: "world".into(),
-                epoch: 1
-            }),
-            ControlResponse::HandoffPrepared {
-                scope: "world".into(),
-                epoch: 1
-            }
-        );
+        let handler = OwnerControlHandler::new(store.clone());
+
+        // persist_retirement is the durable path (no global-registry mutation in the test).
+        let state = handler
+            .persist_retirement("nano:AGENT-07", 3)
+            .expect("retire should persist");
+        assert_eq!(state.role, LocalOwnerRole::Retired);
+        assert_eq!(state.epoch, 3);
+        let persisted = store
+            .get_local_state(&StateTransferScope::NanoContainer("AGENT-07".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted, state);
+
+        // Unknown scope -> rejected, nothing persisted.
         assert!(matches!(
-            handler.handle(&ControlRequest::SourceRetiredAck {
-                scope: "bogus".into(),
-                epoch: 1
-            }),
-            ControlResponse::Rejected { .. }
+            handler.persist_retirement("agent:7", 1),
+            Err(ControlResponse::Rejected { .. })
         ));
-        // GC queries report no refs (that authority is #499, not this handler).
+
+        // GC queries still report no refs via the full handle() path (#499 authority).
         assert_eq!(
             handler.handle(&ControlRequest::RefQuery {
                 block_ref: "cas-blob:v1:sha256:ab".into()

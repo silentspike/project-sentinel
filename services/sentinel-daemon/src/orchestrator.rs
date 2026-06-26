@@ -1061,6 +1061,24 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                             warn!(error = %e, "Cluster 12: Owner-Terms-Reconcile fehlgeschlagen")
                         }
                     }
+                    // Re-establish durable local retirements (V4, PR2b-2ii): a scope this
+                    // node retired in a prior cooperative handoff stays fenced across the
+                    // restart, even before any cross-node term update is visible.
+                    match meta.list_local_states() {
+                        Ok(states) if !states.is_empty() => {
+                            let n = states.len();
+                            sentinel_common::OwnerRegistry::global()
+                                .restore_local_retirements(states);
+                            info!(
+                                count = n,
+                                "Cluster 12: lokale Retirements aus Meta-Store re-etabliert (V4)"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(error = %e, "Cluster 12: lokale Retirements-Reconcile fehlgeschlagen")
+                        }
+                    }
                     info!(node_id = %cluster.node_id, "Cluster 12: OwnerRegistry als Single-Node-Seed initialisiert");
                     Some(Arc::new(meta))
                 }
