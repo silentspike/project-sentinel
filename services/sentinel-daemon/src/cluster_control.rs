@@ -17,7 +17,10 @@ use sentinel_cluster_control::{
     NodeCertificate, StubHandler,
 };
 use sentinel_common::cluster::ControlPeer;
+use sentinel_redb::ClusterMetaStore;
 use tracing::info;
+
+use crate::owner_handler::OwnerControlHandler;
 
 /// A running control-plane handle: the server (kept alive for its lifetime) + a
 /// client + the resolved pinned peers, for outbound RPCs (the live RefQuery/PinQuery
@@ -36,13 +39,17 @@ struct ResolvedPeer {
 }
 
 impl ClusterControl {
-    /// Start the control stream: persist/load the node cert under `cert_dir`, spawn
-    /// the server bound to `bind`, and resolve the pinned peers.
+    /// Start the control stream: persist/load the node cert under `cert_dir`, spawn the
+    /// server bound to `bind`, and resolve the pinned peers. `owner_meta` is the durable
+    /// cluster-meta store (ADR-3): when present the server runs the real `#496`
+    /// [`OwnerControlHandler`] (persist `OwnerCommit` + update the registry); the
+    /// Phase-3a0 `StubHandler` remains only as a fallback if the store failed to open.
     pub fn start(
         bind: &str,
         cert_dir: &Path,
         node_alias: &str,
         peers: &[ControlPeer],
+        owner_meta: Option<Arc<ClusterMetaStore>>,
     ) -> anyhow::Result<Self> {
         let cert_path = cert_dir.join("control-node-cert.der");
         let key_path = cert_dir.join("control-node-key.der");
@@ -70,7 +77,17 @@ impl ClusterControl {
         let bind_addr: SocketAddr = bind
             .parse()
             .map_err(|e| anyhow::anyhow!("control_bind {bind}: {e}"))?;
-        let server = ControlServer::bind(bind_addr, &node, pins, Arc::new(StubHandler))?;
+        // The real #496 owner handler when the durable meta store is available; the
+        // Phase-3a0 stub only as a fallback (meta store failed to open).
+        let server = match owner_meta {
+            Some(meta) => ControlServer::bind(
+                bind_addr,
+                &node,
+                pins,
+                Arc::new(OwnerControlHandler::new(meta)),
+            )?,
+            None => ControlServer::bind(bind_addr, &node, pins, Arc::new(StubHandler))?,
+        };
         let client = ControlClient::new(&node)?;
         info!(
             %bind_addr,
