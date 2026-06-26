@@ -3,6 +3,7 @@ import { createStore, reconcile } from "solid-js/store";
 import { apiJson, putJson, type AgentConfig } from "../api";
 import { addToast, SearchFilter } from "../components/controls";
 import { validateAgentRequired, validatePersonality } from "./config/validation";
+import { selectedAgentId, setSelectedAgentId } from "../state/selection";
 
 // #422 Agent Editor — load an existing agent, edit its config, save via PUT /api/config/agents/{id}
 // (the backend assembles the full mode:live apply and proxies it to the daemon, the sole writer).
@@ -75,6 +76,17 @@ export function AgentEditorView(): JSX.Element {
   createEffect(() => {
     const o = original();
     if (o) setEdited(reconcile(structuredClone(o)));
+  });
+
+  // #424: when the Org Chart requested an agent (shared selectedAgentId), select it here once the
+  // agents are loaded — then CONSUME-AND-CLEAR (setSelectedAgentId(null)) so re-opening the editor
+  // without a new click stays in the default state and a stale click never overwrites a manual pick.
+  createEffect(() => {
+    const pre = selectedAgentId();
+    if (pre != null && agents().some((a) => a.identity.id === pre)) {
+      setSelectedId(pre);
+      setSelectedAgentId(null);
+    }
   });
 
   const errors = createMemo<string[]>(() =>
