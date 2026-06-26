@@ -6,7 +6,6 @@ target/
 cmd/cortex-gateway/cortex-gateway
 services/sentinel-nats-bridge/sentinel-nats-bridge
 services/sentinel-judge/sentinel-judge
-deploy/release-manifest.json
 
 # Bun / Node
 node_modules/
@@ -31,6 +30,8 @@ node_modules/
 *.key
 *.pem
 *.p12
+# Keep the documented, secret-free example
+!.env.example
 
 # OS
 .DS_Store
@@ -99,6 +100,7 @@ crates/sentinel-wasm/tests/fixtures/**/target/
 # Stray Go binaries (root-level)
 /sentinel-nats-bridge
 /cortex-gateway
+cortex-gateway-linux
 
 # Docs (selectively gitignored — public-facing docs are tracked)
 # Internal-only doc artefacts that should not appear in Git.
@@ -108,9 +110,10 @@ docs/images/*
 !docs/images/sentinel-demo.gif
 !docs/images/opengraph-preview.png
 docs/screenshots/
+# Keep the one screenshot referenced from CHANGELOG.md
+!docs/screenshots/issue380-dashboard-ebpf.png
 docs/user-testing-report.md
 /AGENTS.md
-/test-288-verification.md
 /hooks/
 
 # Evidence screenshots (binary, not for Git)
@@ -118,27 +121,20 @@ docs/user-testing-report.md
 /dashboard-*.png
 
 # Sentinel Runtime
-*.db-wal
-*.db-shm
 /ram/
 
 # Generated deploy artifacts (created by deploy/generate-manifest.sh)
 deploy/release-manifest.json
-cortex-gateway-linux
-.cache/ >> .gitignore
 .cache/
 
 # Internal sprint tracking — never publish
-PROGRESS.md
 IMPL-PLAN*.md
 
 # Internal working artifacts — not part of the public-facing repo
-.claude/
 docs/gaia-console-architecture.md
 docs/zenoh-wiring-status.md
 docs/functional-audit-judge.md
 docs/benchmarks/
-test-*-verification.md
 tests/E2E_TEST_PLAN.md
 tests/E2E_RESULTS.md
 config/company-context.md
