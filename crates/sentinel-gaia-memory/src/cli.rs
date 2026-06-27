@@ -13,6 +13,7 @@ use crate::graph::{
     Entity, EntityId, FactObject, FactQuery, FactSource, FactWrite, GaiaConsoleMemoryStore,
 };
 use crate::memory_file::{GaiaConsoleMemoryFile, MemorySection};
+use crate::rehydrate::{rehydrate_from_data_dir, RehydrateRequest};
 use crate::GRAPH_FILE_NAME;
 
 const ASSUME_YES_ENV: &str = "SENTINEL_GAIA_MEMORY_ASSUME_YES";
@@ -74,6 +75,21 @@ enum Commands {
     Backup {
         #[command(subcommand)]
         action: BackupAction,
+    },
+    /// Build a read-only wake-up context from existing Sentinel stores.
+    Rehydrate {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long = "fact-key")]
+        fact_keys: Vec<String>,
+        #[arg(long, default_value_t = 16_384)]
+        max_memory_bytes: usize,
+        #[arg(long, default_value_t = 16)]
+        max_agents: usize,
+        #[arg(long, default_value_t = 8)]
+        max_episodes: usize,
     },
 }
 
@@ -250,6 +266,7 @@ fn command_risk(command: &Commands) -> Risk {
             FactAction::Query { .. } => Risk::Read,
         },
         Commands::Backup { .. } => Risk::Mutate,
+        Commands::Rehydrate { .. } => Risk::Read,
     }
 }
 
@@ -269,6 +286,21 @@ fn execute_command(command: &Commands) -> anyhow::Result<Value> {
         Commands::Entity { action } => execute_entity(action),
         Commands::Fact { action } => execute_fact(action),
         Commands::Backup { action } => execute_backup(action),
+        Commands::Rehydrate {
+            data_dir,
+            agent,
+            fact_keys,
+            max_memory_bytes,
+            max_agents,
+            max_episodes,
+        } => execute_rehydrate(
+            data_dir,
+            agent,
+            fact_keys,
+            *max_memory_bytes,
+            *max_agents,
+            *max_episodes,
+        ),
     }
 }
 
@@ -422,6 +454,29 @@ fn execute_backup(action: &BackupAction) -> anyhow::Result<Value> {
             }))
         }
     }
+}
+
+fn execute_rehydrate(
+    data_dir: &Path,
+    agent: &Option<String>,
+    fact_keys: &[String],
+    max_memory_bytes: usize,
+    max_agents: usize,
+    max_episodes: usize,
+) -> anyhow::Result<Value> {
+    let mut request = RehydrateRequest::new(data_dir);
+    request.agent_name = agent.clone();
+    request.fact_keys = fact_keys.to_vec();
+    request.max_memory_bytes = max_memory_bytes;
+    request.max_agents = max_agents;
+    request.max_episodes = max_episodes;
+    let context = rehydrate_from_data_dir(&request)?;
+
+    Ok(json!({
+        "ok": true,
+        "action": "rehydrate",
+        "context": context,
+    }))
 }
 
 fn fact_write_from_args(args: &FactWriteArgs) -> anyhow::Result<FactWrite> {
@@ -654,5 +709,29 @@ mod tests {
             .query_facts(FactQuery::current("company:sentinel", "backup_mode"))
             .unwrap();
         assert_eq!(facts.len(), 1);
+    }
+
+    #[test]
+    fn cli_rehydrate_is_read_only_and_reports_zero_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let cli = Cli {
+            json: true,
+            confirm: false,
+            command: Commands::Rehydrate {
+                data_dir,
+                agent: None,
+                fact_keys: Vec::new(),
+                max_memory_bytes: 256,
+                max_agents: 2,
+                max_episodes: 2,
+            },
+        };
+
+        assert_eq!(command_risk(&cli.command), Risk::Read);
+        let value = execute_cli(&cli, false).unwrap();
+        assert_eq!(value["action"], "rehydrate");
+        assert_eq!(value["context"]["events_replayed"], 0);
+        assert_eq!(value["context"]["event_rows_loaded"], 0);
     }
 }
