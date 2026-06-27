@@ -183,6 +183,15 @@ describe("AgentDeepView (#428)", () => {
     );
   });
 
+  it("falls back to the #deep=<id> URL hash when no agent was selected", async () => {
+    stubFetch();
+    setSelectedAgentId(null);
+    window.location.hash = "#deep=8";
+    const { getByTestId } = render(AgentDeepView);
+    await waitFor(() => expect(getByTestId("deep-agent-name").textContent).toContain("AGENT-08"));
+    window.location.hash = "";
+  });
+
   it("renders the canonical 'suspended' status as 'Pausiert'", async () => {
     stubFetch();
     seedAgent("suspended");

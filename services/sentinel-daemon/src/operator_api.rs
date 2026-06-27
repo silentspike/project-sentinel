@@ -2286,7 +2286,7 @@ fn parse_agent_id_param(agent_id: Option<&String>) -> std::result::Result<u16, A
 
 /// #428 (AC-1): read-only Verzeichnis-Listing eines Agent-Layers ab `inode` (Default Root inode 1).
 /// Strikt lesend (kein `write_file`/`mkdir`); die Navigation ist inode-basiert und damit auf den
-/// `aggregate_id`-Keyspace des Agents beschraenkt — kein Pfad-Traversal-Vektor. Die geteilte
+/// `aggregate_id`-Keyspace des Agents beschraenkt — kein Pfad-Traversal moeglich. Die geteilte
 /// Base-Layer wird nicht separat gezeigt (Browse startet im Agent-Root).
 fn inspect_agent_fs_browse(
     agent_id: Option<&String>,
