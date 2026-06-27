@@ -1381,7 +1381,9 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Err(err) => err.to_response(),
             }
         }
-        OPERATOR_RUNTIME_PAUSE_PATH | OPERATOR_RUNTIME_RESUME_PATH | OPERATOR_RUNTIME_DESPAWN_PATH => {
+        OPERATOR_RUNTIME_PAUSE_PATH
+        | OPERATOR_RUNTIME_RESUME_PATH
+        | OPERATOR_RUNTIME_DESPAWN_PATH => {
             let payload: AgentLifecycleRequest = match serde_json::from_slice(&request.body) {
                 Ok(payload) => payload,
                 Err(_) => {
@@ -2302,9 +2304,9 @@ fn inspect_agent_fs_browse(
     };
     let aggregate_id = resolve_aggregate_id(state, agent_id);
     let layer = open_fs_layer(state)?;
-    layer
-        .ensure_agent_root(&aggregate_id)
-        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Agent-Root nicht initialisierbar"))?;
+    layer.ensure_agent_root(&aggregate_id).map_err(|_| {
+        ApiError::ServiceUnavailable("sentinel-fs Agent-Root nicht initialisierbar")
+    })?;
 
     match layer
         .lookup_inode(&aggregate_id, inode)
@@ -2315,9 +2317,9 @@ fn inspect_agent_fs_browse(
         None => return Err(ApiError::NotFound("inode nicht gefunden")),
     }
 
-    let raw_entries = layer
-        .readdir(&aggregate_id, inode)
-        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Verzeichnis-Listing fehlgeschlagen"))?;
+    let raw_entries = layer.readdir(&aggregate_id, inode).map_err(|_| {
+        ApiError::ServiceUnavailable("sentinel-fs Verzeichnis-Listing fehlgeschlagen")
+    })?;
     let mut entries = Vec::with_capacity(raw_entries.len());
     for (name, child_inode, kind) in raw_entries {
         let data = layer
@@ -2377,9 +2379,9 @@ fn inspect_agent_fs_read(
         .map_err(|_| ApiError::BadRequest("inode muss Integer sein"))?;
     let aggregate_id = resolve_aggregate_id(state, agent_id);
     let layer = open_fs_layer(state)?;
-    layer
-        .ensure_agent_root(&aggregate_id)
-        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Agent-Root nicht initialisierbar"))?;
+    layer.ensure_agent_root(&aggregate_id).map_err(|_| {
+        ApiError::ServiceUnavailable("sentinel-fs Agent-Root nicht initialisierbar")
+    })?;
 
     let data = layer
         .lookup_inode(&aggregate_id, inode)
@@ -4031,7 +4033,9 @@ mod tests {
         layer.mkdir(&fs_agent_dir, 1, "sub", 0o755).unwrap();
 
         let response = handle_http_request(
-            test_get_request(&format!("{OPERATOR_SECURITY_AGENT_FS_PATH}?agent_id=7&inode=1")),
+            test_get_request(&format!(
+                "{OPERATOR_SECURITY_AGENT_FS_PATH}?agent_id=7&inode=1"
+            )),
             &state,
         );
         assert_eq!(response.status, 200);
@@ -4049,7 +4053,10 @@ mod tests {
         assert_eq!(file_a.kind, "file");
         assert_eq!(file_a.size, content.len() as u64);
         assert!(!file_a.hash.is_empty());
-        assert_eq!(file_a.refcount, 2, "zwei inhaltsgleiche Dateien teilen den Blob");
+        assert_eq!(
+            file_a.refcount, 2,
+            "zwei inhaltsgleiche Dateien teilen den Blob"
+        );
 
         let dir = payload
             .entries
@@ -4153,7 +4160,9 @@ mod tests {
 
         // GET ohne x-sentinel-operator-key -> 401.
         let unauth = handle_http_request(
-            test_get_request(&format!("{OPERATOR_SECURITY_AGENT_FS_PATH}?agent_id=7&inode=1")),
+            test_get_request(&format!(
+                "{OPERATOR_SECURITY_AGENT_FS_PATH}?agent_id=7&inode=1"
+            )),
             &state,
         );
         assert_eq!(unauth.status, 401);

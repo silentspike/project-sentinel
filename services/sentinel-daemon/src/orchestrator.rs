@@ -5058,7 +5058,8 @@ fn ecs_tick_loop(
                                     new_status: "suspended".to_string(),
                                     affected_pids: affected,
                                     outcome: "ok".to_string(),
-                                    note: "paused (SIGSTOP; ECS-Entity + Memory bleiben)".to_string(),
+                                    note: "paused (SIGSTOP; ECS-Entity + Memory bleiben)"
+                                        .to_string(),
                                 }
                             }
                             Err(error) => AgentLifecycleResponse {
