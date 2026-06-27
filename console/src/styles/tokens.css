@@ -598,6 +598,83 @@ input, select { font: inherit; color: var(--text); background: var(--surface-0);
 }
 .analysis-item p { margin: 0; }
 .analysis-item__meta { color: var(--text-muted); font-size: 12px; }
+.gaia-console-shell {
+  min-height: 0;
+}
+.gaia-console-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+.gaia-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+}
+.gaia-session-form {
+  display: grid;
+  gap: 8px;
+}
+.gaia-session-form textarea {
+  min-height: 112px;
+  resize: vertical;
+  font: inherit;
+  color: var(--text);
+  background: var(--surface-0);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.gaia-submit-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+.gaia-submit-row input {
+  min-width: 0;
+}
+.gaia-list {
+  display: grid;
+  gap: 8px;
+  max-height: 420px;
+  overflow: auto;
+}
+.gaia-session-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  background: var(--surface-0);
+}
+.gaia-session-row.selected {
+  border-color: var(--accent-2);
+  background: rgba(90, 160, 255, 0.12);
+}
+.gaia-session-row__main {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+.gaia-session-row__main .mono {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gaia-stream-card {
+  min-height: 260px;
+}
+.gaia-stream {
+  max-height: 520px;
+  min-height: 220px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .mini-table {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -722,5 +799,7 @@ input, select { font: inherit; color: var(--text); background: var(--surface-0);
   .event-row { grid-template-columns: minmax(70px, 95px) minmax(0, 1fr) minmax(42px, auto); }
   .event-room { display: none; }
   .control-grid, .tt-layout { grid-template-columns: 1fr; }
+  .gaia-console-grid { grid-template-columns: 1fr; }
+  .gaia-submit-row, .gaia-session-row { grid-template-columns: 1fr; }
   .mini-table--snapshots { grid-template-columns: minmax(76px, 0.8fr) minmax(110px, 1.3fr) minmax(62px, 0.7fr) minmax(78px, 0.8fr); }
 }

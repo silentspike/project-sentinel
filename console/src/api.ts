@@ -28,6 +28,25 @@ export async function apiJson<T>(path: string, init: RequestInit = {}): Promise<
   return payload as T;
 }
 
+export async function apiText(path: string, init: RequestInit = {}): Promise<string> {
+  const response = await fetch(path, {
+    credentials: "include",
+    ...init,
+    headers: {
+      ...init.headers,
+    },
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    const message =
+      payload && typeof payload === "object" && "error" in payload
+        ? String((payload as { error: unknown }).error)
+        : response.statusText;
+    throw new ApiError(response.status, message);
+  }
+  return response.text();
+}
+
 export function postJson<T>(path: string, body: unknown): Promise<T> {
   return apiJson<T>(path, { method: "POST", body: JSON.stringify(body) });
 }
@@ -272,6 +291,62 @@ export interface PlatformState {
   threshold_overrides?: Record<string, unknown>;
   agents?: PlatformAgentState[];
   [key: string]: unknown;
+}
+
+// #442 Gaia Console Memory Loop and explicit Claude session surfaces.
+export interface GaiaAlert {
+  alert_id: string;
+  source_event_id: string;
+  tick: number;
+  timestamp_ms: number;
+  trigger: string;
+  severity: string;
+  target: string;
+  summary: string;
+  recommendation: string;
+  unresolved_keys: string[];
+}
+
+export interface GaiaAlertsResponse {
+  alerts: GaiaAlert[];
+  count: number;
+  source: string;
+}
+
+export type GaiaSessionKind = "deep" | "setup_interview" | string;
+export type GaiaSessionStatus = "started" | "succeeded" | "failed" | "timed_out" | string;
+
+export interface ClaudeUsageSummary {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+  total_cost_usd?: number | null;
+}
+
+export interface GaiaSessionIndexEntry {
+  gaia_session_id: string;
+  claude_session_id?: string | null;
+  kind: GaiaSessionKind;
+  status: GaiaSessionStatus;
+  stream_path: string;
+  started_at_ms: number;
+  finished_at_ms?: number | null;
+  exit_code?: number | null;
+  usage: ClaudeUsageSummary;
+}
+
+export interface GaiaSessionsResponse {
+  sessions: GaiaSessionIndexEntry[];
+  count: number;
+  source: string;
+}
+
+export interface GaiaSessionRun {
+  entry: GaiaSessionIndexEntry;
+  session_dir: string;
+  prompt_path: string;
+  stderr_path: string;
 }
 
 export interface SnapshotInfo {
