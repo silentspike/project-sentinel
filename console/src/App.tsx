@@ -23,6 +23,7 @@ import { ConfigEditorView } from "./views/ConfigEditorView";
 import { SynthesisView } from "./views/SynthesisView";
 import { CostView } from "./views/CostView";
 import { OrgChartView } from "./views/OrgChartView";
+import { AgentDeepView } from "./views/AgentDeepView";
 
 // Mobile-Breakpoint via matchMedia (Desktop=Tiling, Mobile=BottomTabBar).
 function useIsMobile() {
@@ -32,7 +33,7 @@ function useIsMobile() {
   return m;
 }
 
-const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "profiling", "cockpit", "activity", "chaos", "chat", "control", "timetravel", "gaia-wizard", "agent-editor", "config-editor", "synthesis", "cost", "org-chart"];
+const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "profiling", "cockpit", "activity", "chaos", "chat", "control", "timetravel", "gaia-wizard", "agent-editor", "config-editor", "synthesis", "cost", "org-chart", "agent-deep"];
 const PANEL_LABEL: Record<PanelKind, string> = {
   agents: "Agents",
   floorplan: "Floorplan",
@@ -50,6 +51,7 @@ const PANEL_LABEL: Record<PanelKind, string> = {
   synthesis: "Synthesis",
   cost: "Cost",
   "org-chart": "Org Chart",
+  "agent-deep": "Agent Deep View",
 };
 
 function Login(props: { onOk: () => void }): JSX.Element {
@@ -101,6 +103,7 @@ const PANELS: Record<PanelKind, () => JSX.Element> = {
   synthesis: SynthesisView,
   cost: CostView,
   "org-chart": OrgChartView,
+  "agent-deep": AgentDeepView,
 };
 
 // Tile-Chrome: kompakte Leiste (Split horizontal/vertikal, Schliessen) ueber dem Panel.

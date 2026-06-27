@@ -47,9 +47,9 @@ use crate::episode_producer::EpisodeProducer;
 use crate::evolution_task::{EvolutionJob, EvolutionResult, EvolutionSource};
 use crate::operator_api;
 use crate::runtime_control::{
-    RespawnBackoffTracker, RespawnRetryDecision, RuntimeAnalysisFloodTestResponse,
-    RuntimeControlCommand, RuntimePanicTestResponse, RuntimeReconcileRequest,
-    RuntimeReconcileResponse, RuntimeStallRestartTestResponse,
+    AgentLifecycleResponse, RespawnBackoffTracker, RespawnRetryDecision,
+    RuntimeAnalysisFloodTestResponse, RuntimeControlCommand, RuntimePanicTestResponse,
+    RuntimeReconcileRequest, RuntimeReconcileResponse, RuntimeStallRestartTestResponse,
 };
 use crate::runtime_health;
 use crate::shift::{agents_for_shift, detect_current_shift, detect_shift_from_sim_hour};
@@ -517,6 +517,22 @@ fn suspend_agent_cgroup_processes(agent_name: &str, tracked_pid: Option<u32>) ->
     pids.sort_unstable();
     pids.dedup();
     suspend_pids(&pids, tracked_pid)?;
+    Ok(pids)
+}
+
+/// #428: Gegenstueck zu `suspend_agent_cgroup_processes` — schickt SIGCONT an alle Prozesse im
+/// Agent-Cgroup (+ tracked PID), um eine SIGSTOP-Pause aufzuheben. Gibt die fortgesetzten PIDs zurueck.
+fn resume_agent_cgroup_processes(agent_name: &str, tracked_pid: Option<u32>) -> Result<Vec<u32>> {
+    let mut pids = sentinel_sandbox::cgroups::list_pids_in_cgroup(agent_name)
+        .with_context(|| format!("cgroup-Mitglieder fuer {agent_name} nicht lesbar"))?;
+    if let Some(pid) = tracked_pid {
+        pids.push(pid);
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    for pid in &pids {
+        signal_pid(*pid, "CONT")?;
+    }
     Ok(pids)
 }
 
@@ -4467,6 +4483,37 @@ fn ecs_tick_loop(
                         Some(event_store_for_isolation.as_ref()),
                     );
                 }
+
+                // #428 (Auflage B): Restart-Konsistenz. Ein aus dem Snapshot wiederhergestellter
+                // Agent mit Status `Suspended` (= vor dem Restart pausiert) wird oben mit einem
+                // frischen, *aktiven* bwrap-Prozess gespawnt — er wird hier unmittelbar wieder
+                // eingefroren (Re-SIGSTOP), damit der Prozess NICHT weiterlaeuft. Das Aktiv-Fenster
+                // ist µs-ms und liegt vor dem ersten ECS-Input. Bekannte Grenze: das
+                // projektions-/UI-seitige Status-Label re-seedet beim Restart aus dem World-Snapshot
+                // auf "active" (die ECS-Welt kennt kein Pause-Konzept) und re-synchronisiert beim
+                // naechsten Pause/Resume; der Prozess ist real eingefroren (`T`), nicht aktiv.
+                if agent_process_started
+                    && runtime_orch
+                        .agents()
+                        .get(&agent_id)
+                        .map(|handle| handle.status == sentinel_runtime::AgentStatus::Suspended)
+                        .unwrap_or(false)
+                {
+                    if let Some(handle) = sandbox_handles.get(&agent_id) {
+                        match suspend_agent_cgroup_processes(&handle.agent_name, handle.bwrap_pid) {
+                            Ok(pids) => info!(
+                                agent_id = %agent_id,
+                                stopped_pids = pids.len(),
+                                "Restored suspended agent re-eingefroren (#428 Re-SIGSTOP nach Restart)"
+                            ),
+                            Err(error) => warn!(
+                                agent_id = %agent_id,
+                                error = %error,
+                                "Re-SIGSTOP fuer restored suspended agent fehlgeschlagen"
+                            ),
+                        }
+                    }
+                }
             }
             Err(e) => {
                 warn!(
@@ -4968,6 +5015,175 @@ fn ecs_tick_loop(
                         last_event_id,
                     });
                 }
+                // #428: per-Agent Pause — SIGSTOP der Sandbox-Prozesse + Status->Suspended.
+                // Nicht destruktiv: ECS-Entity + Memory/Evolution bleiben (KEIN teardown_agent_full).
+                RuntimeControlCommand::Pause {
+                    agent_id,
+                    response_tx,
+                } => {
+                    let aid = AgentId(agent_id);
+                    let aggregate_id = format!("AGENT-{agent_id:02}");
+                    let response = if !runtime_orch.agents().contains_key(&aid) {
+                        AgentLifecycleResponse {
+                            accepted: false,
+                            agent_id,
+                            aggregate_id,
+                            action: "pause".to_string(),
+                            new_status: String::new(),
+                            affected_pids: 0,
+                            outcome: "not_found".to_string(),
+                            note: "Agent nicht in der Runtime".to_string(),
+                        }
+                    } else {
+                        match runtime_orch.pause_agent(aid) {
+                            Ok(()) => {
+                                let affected = sandbox_handles
+                                    .get(&aid)
+                                    .and_then(|h| {
+                                        suspend_agent_cgroup_processes(&h.agent_name, h.bwrap_pid)
+                                            .ok()
+                                    })
+                                    .map(|pids| pids.len())
+                                    .unwrap_or(0);
+                                info!(
+                                    agent_id = %aid,
+                                    affected_pids = affected,
+                                    "Agent pausiert (#428 SIGSTOP; ECS-Entity + Memory bleiben)"
+                                );
+                                AgentLifecycleResponse {
+                                    accepted: true,
+                                    agent_id,
+                                    aggregate_id,
+                                    action: "pause".to_string(),
+                                    new_status: "suspended".to_string(),
+                                    affected_pids: affected,
+                                    outcome: "ok".to_string(),
+                                    note: "paused (SIGSTOP; ECS-Entity + Memory bleiben)"
+                                        .to_string(),
+                                }
+                            }
+                            Err(error) => AgentLifecycleResponse {
+                                accepted: false,
+                                agent_id,
+                                aggregate_id,
+                                action: "pause".to_string(),
+                                new_status: String::new(),
+                                affected_pids: 0,
+                                outcome: "invalid_transition".to_string(),
+                                note: error.to_string(),
+                            },
+                        }
+                    };
+                    let _ = response_tx.send(response);
+                }
+                // #428: per-Agent Resume — SIGCONT + Status->Active. Gegenstueck zu Pause.
+                RuntimeControlCommand::Resume {
+                    agent_id,
+                    response_tx,
+                } => {
+                    let aid = AgentId(agent_id);
+                    let aggregate_id = format!("AGENT-{agent_id:02}");
+                    let response = if !runtime_orch.agents().contains_key(&aid) {
+                        AgentLifecycleResponse {
+                            accepted: false,
+                            agent_id,
+                            aggregate_id,
+                            action: "resume".to_string(),
+                            new_status: String::new(),
+                            affected_pids: 0,
+                            outcome: "not_found".to_string(),
+                            note: "Agent nicht in der Runtime".to_string(),
+                        }
+                    } else {
+                        match runtime_orch.resume_agent(aid) {
+                            Ok(()) => {
+                                let affected = sandbox_handles
+                                    .get(&aid)
+                                    .and_then(|h| {
+                                        resume_agent_cgroup_processes(&h.agent_name, h.bwrap_pid)
+                                            .ok()
+                                    })
+                                    .map(|pids| pids.len())
+                                    .unwrap_or(0);
+                                info!(
+                                    agent_id = %aid,
+                                    affected_pids = affected,
+                                    "Agent fortgesetzt (#428 SIGCONT)"
+                                );
+                                AgentLifecycleResponse {
+                                    accepted: true,
+                                    agent_id,
+                                    aggregate_id,
+                                    action: "resume".to_string(),
+                                    new_status: "active".to_string(),
+                                    affected_pids: affected,
+                                    outcome: "ok".to_string(),
+                                    note: "resumed (SIGCONT)".to_string(),
+                                }
+                            }
+                            Err(error) => AgentLifecycleResponse {
+                                accepted: false,
+                                agent_id,
+                                aggregate_id,
+                                action: "resume".to_string(),
+                                new_status: String::new(),
+                                affected_pids: 0,
+                                outcome: "invalid_transition".to_string(),
+                                note: error.to_string(),
+                            },
+                        }
+                    };
+                    let _ = response_tx.send(response);
+                }
+                // #428: per-Agent destruktives Despawn — teardown_agent_full -> AgentDespawned.
+                // Separater, bestaetigungs-gegateter Pfad (NICHT Pause).
+                RuntimeControlCommand::Despawn {
+                    agent_id,
+                    response_tx,
+                } => {
+                    let aid = AgentId(agent_id);
+                    let aggregate_id = format!("AGENT-{agent_id:02}");
+                    let present = runtime_orch.agents().contains_key(&aid);
+                    if present {
+                        teardown_agent_full(
+                            aid,
+                            &mut world,
+                            &mut runtime_orch,
+                            &sandbox,
+                            &mut sandbox_handles,
+                            &mut ebpf_collector,
+                            &mut agent_processes,
+                            &security_runtime_state,
+                        );
+                        info!(
+                            agent_id = %aid,
+                            "Agent destruktiv entfernt (#428 teardown_agent_full -> AgentDespawned)"
+                        );
+                    }
+                    let response = AgentLifecycleResponse {
+                        accepted: present,
+                        agent_id,
+                        aggregate_id,
+                        action: "despawn".to_string(),
+                        new_status: if present {
+                            "despawned".to_string()
+                        } else {
+                            String::new()
+                        },
+                        affected_pids: 0,
+                        outcome: if present {
+                            "ok".to_string()
+                        } else {
+                            "not_found".to_string()
+                        },
+                        note: if present {
+                            "despawned (teardown_agent_full)".to_string()
+                        } else {
+                            "Agent nicht in der Runtime".to_string()
+                        },
+                    };
+                    let _ = response_tx.send(response);
+                }
             }
         }
 
@@ -4987,6 +5203,17 @@ fn ecs_tick_loop(
                 llm_circuit_open.as_ref(),
                 llm_activity_ticks.as_ref(),
             );
+            // #428 (Auflage A): pausierte (Suspended) Agents von der Stall->Restart-Regel ausnehmen.
+            // Ein SIGSTOPpter Agent macht 0 Syscalls und wuerde sonst als "stalled" erkannt +
+            // zwangs-restartet (was die Pause aufheben wuerde). SSOT = Runtime-Handle-Status, ueber
+            // den Namen gematcht (stalled_agents sind eBPF-Namen); ueberlebt Restart via Snapshot.
+            let suspended_agents: std::collections::HashSet<String> = runtime_orch
+                .agents()
+                .values()
+                .filter(|handle| handle.status == sentinel_runtime::AgentStatus::Suspended)
+                .map(|handle| handle.identity.name.clone())
+                .collect();
+            platform_cp.set_suspended_agents(suspended_agents);
             let output = platform_cp.cycle(
                 &pcp_metrics,
                 &event_store_for_prune,

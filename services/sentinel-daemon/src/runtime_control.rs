@@ -74,6 +74,41 @@ pub enum RuntimeControlCommand {
     StateHash {
         response_tx: mpsc::SyncSender<StateHashResponse>,
     },
+    /// #428: per-Agent Pause (SIGSTOP der Sandbox-Prozesse + Status->Suspended).
+    /// **Nicht destruktiv** — ECS-Entity + Memory/Evolution bleiben erhalten.
+    Pause {
+        agent_id: u16,
+        response_tx: mpsc::SyncSender<AgentLifecycleResponse>,
+    },
+    /// #428: per-Agent Resume (SIGCONT + Status->Active). Gegenstueck zu `Pause`.
+    Resume {
+        agent_id: u16,
+        response_tx: mpsc::SyncSender<AgentLifecycleResponse>,
+    },
+    /// #428: per-Agent destruktives Despawn (`teardown_agent_full` -> `AgentDespawned`).
+    /// Entfernt ECS-Entity + Sandbox + Runtime-Handle (Gegenstueck zu `Pause`).
+    Despawn {
+        agent_id: u16,
+        response_tx: mpsc::SyncSender<AgentLifecycleResponse>,
+    },
+}
+
+/// #428: Antwort auf `Pause`/`Resume`/`Despawn`. `outcome` steuert den HTTP-Status im Dispatch
+/// ("ok" -> 200, "invalid_transition" -> 409, "not_found" -> 404).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentLifecycleResponse {
+    pub accepted: bool,
+    pub agent_id: u16,
+    pub aggregate_id: String,
+    /// "pause" | "resume" | "despawn".
+    pub action: String,
+    /// "suspended" | "active" | "despawned" (leer bei Fehler).
+    pub new_status: String,
+    /// Anzahl SIGSTOP/SIGCONT-betroffener PIDs (0 bei Despawn/Fehler).
+    pub affected_pids: usize,
+    /// "ok" | "invalid_transition" | "not_found".
+    pub outcome: String,
+    pub note: String,
 }
 
 /// #491 (TM-3): Antwort auf `StateHash` — STRICT/CORE-Hash + Position im Tick-Zyklus.
