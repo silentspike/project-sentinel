@@ -1,0 +1,76 @@
+$ ssh ubuntu@10.0.0.241 <AC-3 deterministic setup generator dry-run final>
+node=sentinel-test-node-0
+date=2026-06-27T17:57:59+00:00
+daemon_bin_check=sentinel-daemon 0.1.0
+{
+  "company_name": "Issue 442 Live Setup GmbH",
+  "output_dir": "config",
+  "agents": 6,
+  "rooms": 11,
+  "files_written": [
+    "gaia-spec.toml",
+    "agents/AGENT-01-ANDREAS-SCHMITT.toml",
+    "agents/AGENT-02-MARTIN-LANG.toml",
+    "agents/AGENT-03-SOPHIE-SCHMITT.toml",
+    "agents/AGENT-04-MARA-KRAUS.toml",
+    "agents/AGENT-05-PAUL-WOLFF.toml",
+    "agents/AGENT-06-ELENA-LANG.toml",
+    "rooms.toml",
+    "daemon.toml",
+    "nightrun.toml",
+    "company-context.md"
+  ],
+  "backup_dir": null,
+  "daemon_dry_run": true,
+  "daemon_started": false
+}
+OK: 6 agents, 11 rooms, total room capacity 110, daemon.max_agents 6, nightrun.max_agent_id 6
+generated_files_begin
+config/agents/AGENT-01-ANDREAS-SCHMITT.toml
+config/agents/AGENT-02-MARTIN-LANG.toml
+config/agents/AGENT-03-SOPHIE-SCHMITT.toml
+config/agents/AGENT-04-MARA-KRAUS.toml
+config/agents/AGENT-05-PAUL-WOLFF.toml
+config/agents/AGENT-06-ELENA-LANG.toml
+config/company-context.md
+config/daemon.toml
+config/gaia-spec.toml
+config/nightrun.toml
+config/rooms.toml
+generated_files_end
+company_context_head=
+# Issue 442 Live Setup GmbH — Firmenkontext
+
+> Deterministisch von `sentinel-gaia` aus der `gaia-spec` erzeugt (#441). Nicht manuell editieren — ueber die gaia-spec + Regenerierung pflegen.
+
+## Unternehmen
+- **Standort:** Nuernberg
+- **Adresse:** Fuerther Strasse 42, 90429 Nuernberg
+- **Typ:** Software-/Digitalagentur
+- **Mitarbeiter:** 6
+- **Arbeitsmodell:** Hybrid (Kernzeit + Schichten)
+
+## Mission & Werte
+Use Gaia Console setup to create a runnable Sentinel company.
+
+Werte:
+- Evidence first
+- Operator control
+- Small reversible steps
+
+## Organigramm
+- **Leitung:** Geschaeftsfuehrung (Abteilung Engineering)
+- **Operations:** diverse Rollen
+
+## Abteilungs-KPIs
+- **Engineering:** Engineering cycle time within target; Engineering handoffs completed
+- **Operations:** Operations cycle time within target; Operations handoffs completed
+
+## Kultur
+- Formalitaet: mittel
+- Zusammenarbeit: hoch
+- Konfliktniveau: niedrig
+- Innovationsgrad: hoch
+- Diversitaet: mittel
+company_context_mentions=1
+agents_count=6

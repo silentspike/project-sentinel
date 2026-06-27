@@ -467,13 +467,36 @@ fn daemon_config_path(output_dir: &Path) -> Result<PathBuf> {
 
 fn daemon_working_dir(output_dir: &Path) -> Result<PathBuf> {
     if output_dir.file_name().is_some_and(|name| name == "config") {
-        Ok(output_dir
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf())
+        let parent = output_dir.parent().unwrap_or_else(|| Path::new("."));
+        if parent.as_os_str().is_empty() {
+            Ok(PathBuf::from("."))
+        } else {
+            Ok(parent.to_path_buf())
+        }
     } else {
         bail!(
             "daemon integration expects --output-dir to be named 'config' because generated daemon.toml uses config_dir = \"config\""
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_working_dir_uses_current_dir_for_bare_config_output() {
+        assert_eq!(
+            daemon_working_dir(Path::new("config")).unwrap(),
+            PathBuf::from(".")
+        );
+    }
+
+    #[test]
+    fn daemon_working_dir_uses_parent_for_nested_config_output() {
+        assert_eq!(
+            daemon_working_dir(Path::new("/tmp/company/config")).unwrap(),
+            PathBuf::from("/tmp/company")
+        );
     }
 }
