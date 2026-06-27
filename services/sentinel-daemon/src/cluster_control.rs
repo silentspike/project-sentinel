@@ -19,7 +19,9 @@ use sentinel_cluster_control::{
     NodeCertificate, StubHandler,
 };
 use sentinel_common::cluster::ControlPeer;
-use sentinel_common::{BlockMap, BlockNamespace, BlockRef, HashAlgorithm, HolderAdvertisement, NodeId};
+use sentinel_common::{
+    BlockMap, BlockNamespace, BlockRef, HashAlgorithm, HolderAdvertisement, NodeId,
+};
 use sentinel_fs::cas::CasStore;
 use sentinel_fs::cas_holder::CasHolderState;
 use sentinel_redb::ClusterMetaStore;

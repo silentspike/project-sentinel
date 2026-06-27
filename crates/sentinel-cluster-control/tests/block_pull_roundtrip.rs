@@ -5,9 +5,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use sentinel_cluster_control::{
-    BlockProvider, BlockPullClient, BlockPullServer, NodeCertificate,
-};
+use sentinel_cluster_control::{BlockProvider, BlockPullClient, BlockPullServer, NodeCertificate};
 use sentinel_common::BlockRef;
 
 fn loopback() -> std::net::SocketAddr {
