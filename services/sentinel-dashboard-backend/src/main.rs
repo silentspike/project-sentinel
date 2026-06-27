@@ -27,14 +27,20 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config = Config::from_env();
 
-    // Geteiltes self-signed Cert (HTTPS + WebTransport), Hash fuer /api/cert-hash.
+    // Shared certificate for HTTPS and WebTransport. Default mode is generated self-signed
+    // plus hash pinning; provided-cert mode disables pinning by leaving cert_hash_b64 empty.
     let cert_dir = std::env::var("SENTINEL_DASHBOARD_CERT_DIR")
         .unwrap_or_else(|_| "/opt/sentinel/console-cert".into());
-    let cert = tls::generate(
+    let cert = tls::resolve_dashboard_cert(
         std::path::Path::new(&cert_dir),
         &["localhost", "127.0.0.1", "10.0.0.240"],
+        config.tls_cert_path.as_deref(),
+        config.tls_key_path.as_deref(),
     )?;
-    config.cert_hash_b64 = Some(cert.cert_hash_b64.clone());
+    if let Some(hostname) = config.dashboard_hostname.as_deref() {
+        tracing::info!(%hostname, "dashboard hostname configured");
+    }
+    config.cert_hash_b64 = cert.cert_hash_b64.clone();
 
     let http_bind: SocketAddr = config.http_bind.parse()?;
     let state = AppState::new(config)?;
