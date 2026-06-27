@@ -6,6 +6,7 @@
 pub mod config;
 pub mod prompts;
 pub mod readiness;
+pub mod session;
 pub mod storage;
 pub mod types;
 

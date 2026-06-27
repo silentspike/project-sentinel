@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use sentinel_gaia_loop::config::GaiaLoopConfig;
 use sentinel_gaia_loop::readiness;
+use sentinel_gaia_loop::session::{ClaudeSessionRunner, GaiaSessionRequest};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -30,6 +31,24 @@ enum Commands {
     },
     /// Run the token-light readiness watcher. This never spawns Claude.
     Serve,
+    /// Start one explicit deep Claude Code session for an operator task.
+    Deep {
+        /// Operator task prompt for this single Claude turn.
+        #[arg(long)]
+        prompt: String,
+        /// Existing Claude session id for a follow-up turn.
+        #[arg(long)]
+        resume: Option<String>,
+    },
+    /// Start one explicit setup-interview Claude Code session.
+    SetupInterview {
+        /// Setup request prompt for this single Claude turn.
+        #[arg(long)]
+        prompt: String,
+        /// Existing Claude session id for a follow-up turn.
+        #[arg(long)]
+        resume: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -46,6 +65,12 @@ async fn main() -> Result<()> {
         Commands::Config { json } => print_config(json),
         Commands::ScanOnce { limit } => scan_once(limit),
         Commands::Serve => serve().await,
+        Commands::Deep { prompt, resume } => {
+            run_session(GaiaSessionRequest::deep(prompt, resume)).await
+        }
+        Commands::SetupInterview { prompt, resume } => {
+            run_session(GaiaSessionRequest::setup_interview(prompt, resume)).await
+        }
     }
 }
 
@@ -79,4 +104,12 @@ fn scan_once(limit: usize) -> Result<()> {
 async fn serve() -> Result<()> {
     let cfg = GaiaLoopConfig::from_env()?;
     readiness::run_readiness_loop(cfg).await
+}
+
+async fn run_session(request: GaiaSessionRequest) -> Result<()> {
+    let cfg = GaiaLoopConfig::from_env()?;
+    let runner = ClaudeSessionRunner::new(cfg);
+    let run = runner.run(request).await?;
+    println!("{}", serde_json::to_string_pretty(&run)?);
+    Ok(())
 }

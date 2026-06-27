@@ -58,6 +58,11 @@ impl GaiaLoopConfig {
         if self.max_turns == 0 {
             bail!("SENTINEL_GAIA_MAX_TURNS must be > 0");
         }
+        if self.max_turns != 1 {
+            bail!(
+                "SENTINEL_GAIA_MAX_TURNS must be 1; Gaia Console v1 enforces one turn through claude -p"
+            );
+        }
         if self.http_bind.trim().is_empty() {
             bail!("SENTINEL_GAIA_HTTP_BIND must not be empty");
         }
@@ -75,8 +80,6 @@ impl GaiaLoopConfig {
         vec![
             "--max-budget-usd".to_string(),
             self.max_budget_usd.to_string(),
-            "--max-turns".to_string(),
-            self.max_turns.to_string(),
         ]
     }
 
@@ -152,10 +155,7 @@ mod tests {
         assert!(cfg.max_budget_usd > 0.0);
         assert!(cfg.session_timeout().as_secs() > 0);
         assert!(cfg.max_turns > 0);
-        assert_eq!(
-            cfg.claude_budget_args(),
-            vec!["--max-budget-usd", "0.05", "--max-turns", "1",]
-        );
+        assert_eq!(cfg.claude_budget_args(), vec!["--max-budget-usd", "0.05",]);
     }
 
     #[test]
@@ -168,6 +168,8 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.session_timeout_secs = DEFAULT_SESSION_TIMEOUT_SECS;
         cfg.max_turns = 0;
+        assert!(cfg.validate().is_err());
+        cfg.max_turns = 2;
         assert!(cfg.validate().is_err());
     }
 
