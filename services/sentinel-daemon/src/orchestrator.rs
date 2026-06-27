@@ -4486,9 +4486,12 @@ fn ecs_tick_loop(
 
                 // #428 (Auflage B): Restart-Konsistenz. Ein aus dem Snapshot wiederhergestellter
                 // Agent mit Status `Suspended` (= vor dem Restart pausiert) wird oben mit einem
-                // frischen, *aktiven* bwrap-Prozess gespawnt. Damit Status (suspended) und
-                // OS-Zustand konsistent bleiben, wird er hier unmittelbar wieder eingefroren
-                // (Re-SIGSTOP). Das Aktiv-Fenster ist µs-ms und liegt vor dem ersten ECS-Input.
+                // frischen, *aktiven* bwrap-Prozess gespawnt — er wird hier unmittelbar wieder
+                // eingefroren (Re-SIGSTOP), damit der Prozess NICHT weiterlaeuft. Das Aktiv-Fenster
+                // ist µs-ms und liegt vor dem ersten ECS-Input. Bekannte Grenze: das
+                // projektions-/UI-seitige Status-Label re-seedet beim Restart aus dem World-Snapshot
+                // auf "active" (die ECS-Welt kennt kein Pause-Konzept) und re-synchronisiert beim
+                // naechsten Pause/Resume; der Prozess ist real eingefroren (`T`), nicht aktiv.
                 if agent_process_started
                     && runtime_orch
                         .agents()

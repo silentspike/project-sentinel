@@ -43,6 +43,14 @@ const BIO_FIELDS: { key: string; label: string }[] = [
 
 const DONUT_COLORS = ["#6cf", "#fc6", "#6f9", "#f69", "#9c6", "#c9f", "#999"];
 
+// Deep-link fallback: read the agent id from the URL hash (`#deep=<id>`) when no agent was selected
+// via a click — useful for sharing a direct link to one agent's deep view.
+function readDeepLinkAgentId(): number | null {
+  if (typeof window === "undefined") return null;
+  const m = /[#&]deep=(\d+)/.exec(window.location.hash);
+  return m ? Number(m[1]) : null;
+}
+
 function Sparkline(props: { values: number[] }): JSX.Element {
   const w = 280;
   const h = 48;
@@ -140,9 +148,10 @@ function Donut(props: { data: { label: string; value: number }[] }): JSX.Element
 }
 
 export function AgentDeepView(): JSX.Element {
-  // Consume-and-clear the shared selection (same pattern as the Agent Editor) so a stale click
-  // never overrides this panel's agent on a later re-open.
-  const initial = selectedAgentId();
+  // The agent id comes from the shared selection (an AgentsView click), with a `#deep=<id>` URL-hash
+  // fallback for deep-linking. Consume-and-clear the shared signal so a stale click never overrides
+  // this panel's agent on a later re-open.
+  const initial = selectedAgentId() ?? readDeepLinkAgentId();
   const [agentId] = createSignal<number | null>(initial);
   setSelectedAgentId(null);
 
