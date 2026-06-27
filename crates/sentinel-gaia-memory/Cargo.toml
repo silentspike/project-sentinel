@@ -10,6 +10,10 @@ description = "Gaia Console Memory graph, rehydration, and crate-local backup to
 name = "sentinel-gaia-memory"
 path = "src/main.rs"
 
+[[bench]]
+name = "gaia_memory_bench"
+harness = false
+
 [dependencies]
 anyhow = { workspace = true }
 bincode = { workspace = true }
