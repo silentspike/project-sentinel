@@ -6,6 +6,9 @@ on:
 
 permissions:
   contents: write
+  # #599: the Generate-SBOM step (anchore/sbom-action) uploads its artifact;
+  # with only contents:write it fails "Resource not accessible by integration".
+  actions: write
 
 jobs:
   release:
