@@ -19,15 +19,16 @@ anyhow = { workspace = true }
 bincode = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 redb = { workspace = true }
+rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 sentinel-hippocampus = { path = "../sentinel-hippocampus" }
-sentinel-limbo = { path = "../sentinel-limbo" }
-sentinel-projection = { path = "../sentinel-projection" }
 
 [dev-dependencies]
 tempfile = "3"
 criterion = { workspace = true }
+sentinel-limbo = { path = "../sentinel-limbo" }
+sentinel-projection = { path = "../sentinel-projection" }
