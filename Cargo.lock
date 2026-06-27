@@ -4671,6 +4671,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-gaia-loop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "sentinel-common",
+ "sentinel-gaia",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "sentinel-gaia-memory"
 version = "0.1.0"
 dependencies = [

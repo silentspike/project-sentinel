@@ -29,6 +29,7 @@ members = [
     "crates/sentinel-microvm",
     "services/sentinel-nightrun",
     "services/sentinel-gaia",
+    "services/sentinel-gaia-loop",
     "services/sentinel-daemon",
     "services/sentinel-projection",
     "services/agent-runtime",
