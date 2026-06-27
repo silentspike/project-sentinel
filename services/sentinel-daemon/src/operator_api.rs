@@ -36,9 +36,10 @@ use crate::platform_controlplane::{
     PlatformTriggerTestCommand,
 };
 use crate::runtime_control::{
-    RuntimeAnalysisFloodTestRequest, RuntimeAnalysisFloodTestResponse, RuntimeControlCommand,
-    RuntimePanicTestRequest, RuntimePanicTestResponse, RuntimeReconcileRequest,
-    RuntimeReconcileResponse, RuntimeStallRestartTestRequest, RuntimeStallRestartTestResponse,
+    AgentLifecycleResponse, RuntimeAnalysisFloodTestRequest, RuntimeAnalysisFloodTestResponse,
+    RuntimeControlCommand, RuntimePanicTestRequest, RuntimePanicTestResponse,
+    RuntimeReconcileRequest, RuntimeReconcileResponse, RuntimeStallRestartTestRequest,
+    RuntimeStallRestartTestResponse,
 };
 
 const OPERATOR_CHAOS_PATH: &str = "/operator/chaos";
@@ -70,6 +71,10 @@ const OPERATOR_RUNTIME_RECONCILE_PATH: &str = "/operator/runtime/reconcile";
 const OPERATOR_RUNTIME_ANALYSIS_FLOOD_TEST_PATH: &str = "/operator/runtime/analysis-flood-test";
 const OPERATOR_RUNTIME_PANIC_TEST_PATH: &str = "/operator/runtime/panic-test";
 const OPERATOR_RUNTIME_STALL_RESTART_TEST_PATH: &str = "/operator/runtime/stall-restart-test";
+/// #428 per-Agent Lifecycle: Pause (Stop), Resume (Start), Despawn (destructive remove).
+const OPERATOR_RUNTIME_PAUSE_PATH: &str = "/operator/runtime/pause";
+const OPERATOR_RUNTIME_RESUME_PATH: &str = "/operator/runtime/resume";
+const OPERATOR_RUNTIME_DESPAWN_PATH: &str = "/operator/runtime/despawn";
 const OPERATOR_APICP_SNAPSHOT_PATH: &str = "/operator/apicp/snapshot";
 const OPERATOR_SECURITY_FS_TRASH_PATH: &str = "/operator/security/fs-trash";
 const OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH: &str = "/operator/security/fs-trash-fixture";
@@ -81,6 +86,11 @@ const OPERATOR_SECURITY_FS_RANSOMWARE_TEST_PATH: &str = "/operator/security/fs-r
 const OPERATOR_SECURITY_AGENT_RUNTIME_STATE_PATH: &str = "/operator/security/agent-runtime-state";
 const OPERATOR_SECURITY_WRITE_ANOMALY_TEST_PATH: &str = "/operator/security/write-anomaly-test";
 const OPERATOR_SECURITY_LANDLOCK_TEST_PATH: &str = "/operator/security/landlock-test";
+/// #428 Agent Deep View: read-only FS-Browse (Verzeichnis-Listing) + File-Read je Agent-Layer.
+const OPERATOR_SECURITY_AGENT_FS_PATH: &str = "/operator/security/agent-fs";
+const OPERATOR_SECURITY_AGENT_FS_READ_PATH: &str = "/operator/security/agent-fs-read";
+/// #428 FS-Read Size-Cap: groessere Dateien werden abgeschnitten (truncated=true).
+const MAX_AGENT_FS_READ_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024;
 const MAX_APICP_SNAPSHOT_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -291,6 +301,54 @@ struct FsStorageStatsResponse {
     unreadable_inode_rows: u64,
 }
 
+/// #428: ein Verzeichnis-Eintrag im read-only FS-Browser.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct AgentFsEntry {
+    name: String,
+    inode: u64,
+    /// "file" | "dir" | "symlink".
+    kind: String,
+    size: u64,
+    mode: u32,
+    mtime: u64,
+    /// Hex-Content-Hash (leer fuer Verzeichnisse/Symlinks).
+    hash: String,
+    /// Wie viele Inodes denselben CAS-Blob teilen (Dedup-Sharing; 0 fuer Nicht-Dateien).
+    refcount: u32,
+}
+
+/// #428: Antwort des read-only FS-Browse (`/operator/security/agent-fs`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct AgentFsBrowseResponse {
+    accepted: bool,
+    agent_id: u16,
+    aggregate_id: String,
+    inode: u64,
+    entries: Vec<AgentFsEntry>,
+    /// Layer-weites Dedup-Aggregat (1:n-Sicht), aus `storage_stats()`.
+    dedup_ratio_percent: f64,
+    cas_blob_count: u64,
+    dedup_savings_bytes: u64,
+}
+
+/// #428: Antwort des read-only File-Read (`/operator/security/agent-fs-read`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct AgentFsReadResponse {
+    accepted: bool,
+    agent_id: u16,
+    aggregate_id: String,
+    inode: u64,
+    /// Volle Dateigroesse (vor Size-Cap).
+    size: u64,
+    returned_bytes: usize,
+    truncated: bool,
+    hash: String,
+    refcount: u32,
+    /// "utf8" (Klartext) oder "hex" (Binaerinhalt).
+    encoding: String,
+    content: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct FsDedupBenchmarkRequest {
     agent_name: String,
@@ -455,6 +513,8 @@ enum ApiError {
     BadRequest(&'static str),
     Unauthorized,
     NotFound(&'static str),
+    /// #428: ungueltiger Zustandsuebergang (z.B. Pause auf bereits pausierten Agent).
+    Conflict(&'static str),
     MethodNotAllowed,
     PayloadTooLarge,
     ServiceUnavailable(&'static str),
@@ -483,6 +543,7 @@ impl ApiError {
                 },
             ),
             Self::NotFound(msg) => json_response(404, ErrorResponse { error: msg }),
+            Self::Conflict(msg) => json_response(409, ErrorResponse { error: msg }),
             Self::MethodNotAllowed => json_response(
                 405,
                 ErrorResponse {
@@ -655,6 +716,18 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
             },
             OPERATOR_SECURITY_AGENT_RUNTIME_STATE_PATH => {
                 match inspect_agent_runtime_state(query.get("agent_id"), state) {
+                    Ok(payload) => json_response(200, payload),
+                    Err(err) => err.to_response(),
+                }
+            }
+            OPERATOR_SECURITY_AGENT_FS_PATH => {
+                match inspect_agent_fs_browse(query.get("agent_id"), query.get("inode"), state) {
+                    Ok(payload) => json_response(200, payload),
+                    Err(err) => err.to_response(),
+                }
+            }
+            OPERATOR_SECURITY_AGENT_FS_READ_PATH => {
+                match inspect_agent_fs_read(query.get("agent_id"), query.get("inode"), state) {
                     Ok(payload) => json_response(200, payload),
                     Err(err) => err.to_response(),
                 }
@@ -1308,6 +1381,26 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 Err(err) => err.to_response(),
             }
         }
+        OPERATOR_RUNTIME_PAUSE_PATH
+        | OPERATOR_RUNTIME_RESUME_PATH
+        | OPERATOR_RUNTIME_DESPAWN_PATH => {
+            let payload: AgentLifecycleRequest = match serde_json::from_slice(&request.body) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    return ApiError::BadRequest("Request-JSON ungueltig (agent_id erwartet)")
+                        .to_response();
+                }
+            };
+            let action = match path_only {
+                OPERATOR_RUNTIME_PAUSE_PATH => AgentLifecycleAction::Pause,
+                OPERATOR_RUNTIME_RESUME_PATH => AgentLifecycleAction::Resume,
+                _ => AgentLifecycleAction::Despawn,
+            };
+            match dispatch_agent_lifecycle(action, payload.agent_id, state) {
+                Ok(response) => json_response(200, response),
+                Err(err) => err.to_response(),
+            }
+        }
         OPERATOR_APICP_SNAPSHOT_PATH => {
             let payload: ApiCpSnapshot = match serde_json::from_slice(&request.body) {
                 Ok(p) => p,
@@ -1798,6 +1891,58 @@ fn dispatch_runtime_stall_restart_test(
         .map_err(|_| ApiError::ServiceUnavailable("Stall-Restart-Test Timeout"))
 }
 
+/// #428: Request-Body fuer per-Agent Pause/Resume/Despawn.
+#[derive(Debug, Clone, Deserialize)]
+struct AgentLifecycleRequest {
+    agent_id: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AgentLifecycleAction {
+    Pause,
+    Resume,
+    Despawn,
+}
+
+/// #428: schickt einen per-Agent Lifecycle-Befehl in den Tick-Loop und mappt das `outcome`
+/// auf den HTTP-Status (ok->200, invalid_transition->409, not_found->404). Kein Panic/500.
+fn dispatch_agent_lifecycle(
+    action: AgentLifecycleAction,
+    agent_id: u16,
+    state: &AppState,
+) -> std::result::Result<AgentLifecycleResponse, ApiError> {
+    if agent_id == 0 {
+        return Err(ApiError::BadRequest("agent_id fehlt"));
+    }
+    let (response_tx, response_rx) = mpsc::sync_channel(1);
+    let command = match action {
+        AgentLifecycleAction::Pause => RuntimeControlCommand::Pause {
+            agent_id,
+            response_tx,
+        },
+        AgentLifecycleAction::Resume => RuntimeControlCommand::Resume {
+            agent_id,
+            response_tx,
+        },
+        AgentLifecycleAction::Despawn => RuntimeControlCommand::Despawn {
+            agent_id,
+            response_tx,
+        },
+    };
+    state
+        .runtime_tx
+        .send(command)
+        .map_err(|_| ApiError::ServiceUnavailable("Runtime-Control-Channel nicht verfuegbar"))?;
+    let response = response_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|_| ApiError::ServiceUnavailable("Agent-Lifecycle Timeout"))?;
+    match response.outcome.as_str() {
+        "invalid_transition" => Err(ApiError::Conflict("Agent ist bereits im Zielzustand")),
+        "not_found" => Err(ApiError::NotFound("agent_id nicht in der Runtime")),
+        _ => Ok(response),
+    }
+}
+
 fn request_path(path: &str) -> &str {
     path.split_once('?').map(|(base, _)| base).unwrap_or(path)
 }
@@ -2107,6 +2252,167 @@ fn inspect_fs_storage_stats(
         dedup_savings_bytes: stats.dedup_savings_bytes,
         dedup_ratio_percent: stats.dedup_ratio_percent,
         unreadable_inode_rows: stats.unreadable_inode_rows,
+    })
+}
+
+/// #428: kurzer String fuer den Datei-Typ im FS-Browser.
+fn file_kind_str(kind: FileKind) -> &'static str {
+    match kind {
+        FileKind::Regular => "file",
+        FileKind::Directory => "dir",
+        FileKind::Symlink => "symlink",
+    }
+}
+
+/// #428: numerische `agent_id` -> `aggregate_id` (= LayerManager-Keyspace-Schluessel "AGENT-NN").
+/// Bevorzugt die Live-Snapshots (Platform -> Security-Runtime), faellt auf das kanonische
+/// Format zurueck. Spiegelt die Aufloesung aus `inspect_agent_runtime_state`.
+fn resolve_aggregate_id(state: &AppState, agent_id: u16) -> String {
+    if let Ok(Some(platform)) = platform_agent_snapshot_for_id(state, agent_id) {
+        return platform.aggregate_id;
+    }
+    if let Ok(runtime_state) = state.security_runtime_state.read() {
+        if let Some(runtime) = runtime_state.get(&agent_id) {
+            return runtime.aggregate_id.clone();
+        }
+    }
+    format!("AGENT-{agent_id:02}")
+}
+
+fn parse_agent_id_param(agent_id: Option<&String>) -> std::result::Result<u16, ApiError> {
+    agent_id
+        .ok_or(ApiError::BadRequest("agent_id Query-Parameter fehlt"))?
+        .parse::<u16>()
+        .map_err(|_| ApiError::BadRequest("agent_id muss Integer sein"))
+}
+
+/// #428 (AC-1): read-only Verzeichnis-Listing eines Agent-Layers ab `inode` (Default Root inode 1).
+/// Strikt lesend (kein `write_file`/`mkdir`); die Navigation ist inode-basiert und damit auf den
+/// `aggregate_id`-Keyspace des Agents beschraenkt — kein Pfad-Traversal moeglich. Die geteilte
+/// Base-Layer wird nicht separat gezeigt (Browse startet im Agent-Root).
+fn inspect_agent_fs_browse(
+    agent_id: Option<&String>,
+    inode: Option<&String>,
+    state: &AppState,
+) -> std::result::Result<AgentFsBrowseResponse, ApiError> {
+    let agent_id = parse_agent_id_param(agent_id)?;
+    let inode = match inode {
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|_| ApiError::BadRequest("inode muss Integer sein"))?,
+        None => 1,
+    };
+    let aggregate_id = resolve_aggregate_id(state, agent_id);
+    let layer = open_fs_layer(state)?;
+    layer.ensure_agent_root(&aggregate_id).map_err(|_| {
+        ApiError::ServiceUnavailable("sentinel-fs Agent-Root nicht initialisierbar")
+    })?;
+
+    match layer
+        .lookup_inode(&aggregate_id, inode)
+        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Inode-Lookup fehlgeschlagen"))?
+    {
+        Some(data) if data.kind == FileKind::Directory => {}
+        Some(_) => return Err(ApiError::BadRequest("inode ist kein Verzeichnis")),
+        None => return Err(ApiError::NotFound("inode nicht gefunden")),
+    }
+
+    let raw_entries = layer.readdir(&aggregate_id, inode).map_err(|_| {
+        ApiError::ServiceUnavailable("sentinel-fs Verzeichnis-Listing fehlgeschlagen")
+    })?;
+    let mut entries = Vec::with_capacity(raw_entries.len());
+    for (name, child_inode, kind) in raw_entries {
+        let data = layer
+            .lookup_inode(&aggregate_id, child_inode)
+            .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Inode-Lookup fehlgeschlagen"))?;
+        let (size, mode, mtime, hash, refcount) = match data {
+            Some(d) => {
+                let (hash, refcount) = if d.kind == FileKind::Regular {
+                    (
+                        sentinel_fs::cas::hex_encode(&d.hash),
+                        layer.meta().get_refcount(&d.hash).unwrap_or(0),
+                    )
+                } else {
+                    (String::new(), 0)
+                };
+                (d.size, d.mode, d.mtime, hash, refcount)
+            }
+            None => (0, 0, 0, String::new(), 0),
+        };
+        entries.push(AgentFsEntry {
+            name,
+            inode: child_inode,
+            kind: file_kind_str(kind).to_string(),
+            size,
+            mode,
+            mtime,
+            hash,
+            refcount,
+        });
+    }
+
+    let stats = layer.storage_stats().ok();
+    Ok(AgentFsBrowseResponse {
+        accepted: true,
+        agent_id,
+        aggregate_id,
+        inode,
+        entries,
+        dedup_ratio_percent: stats.as_ref().map(|s| s.dedup_ratio_percent).unwrap_or(0.0),
+        cas_blob_count: stats.as_ref().map(|s| s.cas_blob_count).unwrap_or(0),
+        dedup_savings_bytes: stats.map(|s| s.dedup_savings_bytes).unwrap_or(0),
+    })
+}
+
+/// #428 (AC-1): read-only File-Read aus einem Agent-Layer mit Size-Cap.
+/// Nur regulaere Dateien; Inhalt wird bei > `MAX_AGENT_FS_READ_BYTES` abgeschnitten
+/// (`truncated=true`). UTF-8-Text wird als Klartext geliefert, Binaerinhalt hex-kodiert.
+fn inspect_agent_fs_read(
+    agent_id: Option<&String>,
+    inode: Option<&String>,
+    state: &AppState,
+) -> std::result::Result<AgentFsReadResponse, ApiError> {
+    let agent_id = parse_agent_id_param(agent_id)?;
+    let inode = inode
+        .ok_or(ApiError::BadRequest("inode Query-Parameter fehlt"))?
+        .parse::<u64>()
+        .map_err(|_| ApiError::BadRequest("inode muss Integer sein"))?;
+    let aggregate_id = resolve_aggregate_id(state, agent_id);
+    let layer = open_fs_layer(state)?;
+    layer.ensure_agent_root(&aggregate_id).map_err(|_| {
+        ApiError::ServiceUnavailable("sentinel-fs Agent-Root nicht initialisierbar")
+    })?;
+
+    let data = layer
+        .lookup_inode(&aggregate_id, inode)
+        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs Inode-Lookup fehlgeschlagen"))?
+        .ok_or(ApiError::NotFound("inode nicht gefunden"))?;
+    if data.kind != FileKind::Regular {
+        return Err(ApiError::BadRequest("inode ist keine regulaere Datei"));
+    }
+
+    let full = layer
+        .read_file(&aggregate_id, inode)
+        .map_err(|_| ApiError::ServiceUnavailable("sentinel-fs File-Read fehlgeschlagen"))?;
+    let truncated = full.len() > MAX_AGENT_FS_READ_BYTES;
+    let slice = &full[..full.len().min(MAX_AGENT_FS_READ_BYTES)];
+    let (encoding, content) = match std::str::from_utf8(slice) {
+        Ok(text) => ("utf8".to_string(), text.to_string()),
+        Err(_) => ("hex".to_string(), sentinel_fs::cas::hex_encode(slice)),
+    };
+
+    Ok(AgentFsReadResponse {
+        accepted: true,
+        agent_id,
+        aggregate_id,
+        inode,
+        size: data.size,
+        returned_bytes: slice.len(),
+        truncated,
+        hash: sentinel_fs::cas::hex_encode(&data.hash),
+        refcount: layer.meta().get_refcount(&data.hash).unwrap_or(0),
+        encoding,
+        content,
     })
 }
 
@@ -3712,6 +4018,270 @@ mod tests {
     }
 
     #[test]
+    fn agent_fs_browse_lists_dirents_read_only_with_dedup() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let layer = attach_test_fs_layer(&mut state);
+        let fs_agent_dir = fs_agent_dir_for_name(&state, "Test Agent").unwrap();
+        // Zwei inhaltsgleiche Dateien -> ein CAS-Blob, refcount 2 (1:n-Dedup sichtbar).
+        let content = b"shared deep-view content";
+        layer
+            .write_file(&fs_agent_dir, 1, "a.txt", content, 0o644)
+            .unwrap();
+        layer
+            .write_file(&fs_agent_dir, 1, "b.txt", content, 0o644)
+            .unwrap();
+        layer.mkdir(&fs_agent_dir, 1, "sub", 0o755).unwrap();
+
+        let response = handle_http_request(
+            test_get_request(&format!(
+                "{OPERATOR_SECURITY_AGENT_FS_PATH}?agent_id=7&inode=1"
+            )),
+            &state,
+        );
+        assert_eq!(response.status, 200);
+        let payload: AgentFsBrowseResponse = serde_json::from_slice(&response.body).unwrap();
+        assert!(payload.accepted);
+        assert_eq!(payload.aggregate_id, "AGENT-07");
+        assert_eq!(payload.inode, 1);
+        assert_eq!(payload.entries.len(), 3);
+
+        let file_a = payload
+            .entries
+            .iter()
+            .find(|e| e.name == "a.txt")
+            .expect("a.txt im Listing");
+        assert_eq!(file_a.kind, "file");
+        assert_eq!(file_a.size, content.len() as u64);
+        assert!(!file_a.hash.is_empty());
+        assert_eq!(
+            file_a.refcount, 2,
+            "zwei inhaltsgleiche Dateien teilen den Blob"
+        );
+
+        let dir = payload
+            .entries
+            .iter()
+            .find(|e| e.name == "sub")
+            .expect("sub-Verzeichnis im Listing");
+        assert_eq!(dir.kind, "dir");
+        assert!(dir.hash.is_empty());
+        assert_eq!(dir.refcount, 0);
+
+        // Layer-weites Dedup-Aggregat sichtbar (AC-1: Dedup/Size visible).
+        assert!(payload.dedup_savings_bytes > 0);
+        assert!(payload.dedup_ratio_percent > 0.0);
+    }
+
+    #[test]
+    fn agent_fs_browse_defaults_to_root_and_rejects_non_dir_inode() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let layer = attach_test_fs_layer(&mut state);
+        let fs_agent_dir = fs_agent_dir_for_name(&state, "Test Agent").unwrap();
+        let file_inode = layer
+            .write_file(&fs_agent_dir, 1, "note.txt", b"hi", 0o644)
+            .unwrap();
+
+        // Ohne inode-Param -> Default Root inode 1 (zeigt note.txt).
+        let root = handle_http_request(
+            test_get_request(&format!("{OPERATOR_SECURITY_AGENT_FS_PATH}?agent_id=7")),
+            &state,
+        );
+        assert_eq!(root.status, 200);
+        let root_payload: AgentFsBrowseResponse = serde_json::from_slice(&root.body).unwrap();
+        assert_eq!(root_payload.inode, 1);
+        assert!(root_payload.entries.iter().any(|e| e.name == "note.txt"));
+
+        // Browse auf eine Datei -> 400 (kein Verzeichnis).
+        let bad = handle_http_request(
+            test_get_request(&format!(
+                "{OPERATOR_SECURITY_AGENT_FS_PATH}?agent_id=7&inode={file_inode}"
+            )),
+            &state,
+        );
+        assert_eq!(bad.status, 400);
+    }
+
+    #[test]
+    fn agent_fs_read_returns_utf8_and_caps_large_files() {
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let layer = attach_test_fs_layer(&mut state);
+        let fs_agent_dir = fs_agent_dir_for_name(&state, "Test Agent").unwrap();
+
+        let text = b"deep view file body";
+        let small_inode = layer
+            .write_file(&fs_agent_dir, 1, "small.txt", text, 0o644)
+            .unwrap();
+        let small = handle_http_request(
+            test_get_request(&format!(
+                "{OPERATOR_SECURITY_AGENT_FS_READ_PATH}?agent_id=7&inode={small_inode}"
+            )),
+            &state,
+        );
+        assert_eq!(small.status, 200);
+        let small_payload: AgentFsReadResponse = serde_json::from_slice(&small.body).unwrap();
+        assert!(small_payload.accepted);
+        assert_eq!(small_payload.encoding, "utf8");
+        assert_eq!(small_payload.content, "deep view file body");
+        assert!(!small_payload.truncated);
+        assert_eq!(small_payload.size, text.len() as u64);
+
+        // Datei groesser als der Size-Cap -> truncated.
+        let big = vec![b'A'; MAX_AGENT_FS_READ_BYTES + 4096];
+        let big_inode = layer
+            .write_file(&fs_agent_dir, 1, "big.txt", &big, 0o644)
+            .unwrap();
+        let big_resp = handle_http_request(
+            test_get_request(&format!(
+                "{OPERATOR_SECURITY_AGENT_FS_READ_PATH}?agent_id=7&inode={big_inode}"
+            )),
+            &state,
+        );
+        assert_eq!(big_resp.status, 200);
+        let big_payload: AgentFsReadResponse = serde_json::from_slice(&big_resp.body).unwrap();
+        assert!(big_payload.truncated);
+        assert_eq!(big_payload.returned_bytes, MAX_AGENT_FS_READ_BYTES);
+        assert_eq!(big_payload.size, big.len() as u64);
+
+        // Read auf ein Verzeichnis (Root inode 1) -> 400.
+        let dir_read = handle_http_request(
+            test_get_request(&format!(
+                "{OPERATOR_SECURITY_AGENT_FS_READ_PATH}?agent_id=7&inode=1"
+            )),
+            &state,
+        );
+        assert_eq!(dir_read.status, 400);
+    }
+
+    #[test]
+    fn agent_fs_browse_requires_operator_key() {
+        // Auflage E: read-only FS-Browse ist auth-pflichtig (is_protected_read_path -> is_security_path).
+        let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
+        attach_test_fs_layer(&mut state);
+
+        // GET ohne x-sentinel-operator-key -> 401.
+        let unauth = handle_http_request(
+            test_get_request(&format!(
+                "{OPERATOR_SECURITY_AGENT_FS_PATH}?agent_id=7&inode=1"
+            )),
+            &state,
+        );
+        assert_eq!(unauth.status, 401);
+
+        let unauth_read = handle_http_request(
+            test_get_request(&format!(
+                "{OPERATOR_SECURITY_AGENT_FS_READ_PATH}?agent_id=7&inode=2"
+            )),
+            &state,
+        );
+        assert_eq!(unauth_read.status, 401);
+
+        // Mit korrektem Key -> Browse erlaubt (200).
+        let mut authed = test_get_request(&format!(
+            "{OPERATOR_SECURITY_AGENT_FS_PATH}?agent_id=7&inode=1"
+        ));
+        authed
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "topsecret".to_string());
+        let ok = handle_http_request(authed, &state);
+        assert_eq!(ok.status, 200);
+    }
+
+    #[test]
+    fn agent_lifecycle_pause_forwards_command_and_maps_ok() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        // Tick-Loop simulieren: Befehl empfangen + Antwort zuruecksenden.
+        let responder = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::Pause {
+                agent_id,
+                response_tx,
+            } => {
+                response_tx
+                    .send(AgentLifecycleResponse {
+                        accepted: true,
+                        agent_id,
+                        aggregate_id: format!("AGENT-{agent_id:02}"),
+                        action: "pause".to_string(),
+                        new_status: "suspended".to_string(),
+                        affected_pids: 2,
+                        outcome: "ok".to_string(),
+                        note: "paused".to_string(),
+                    })
+                    .unwrap();
+                agent_id
+            }
+            other => panic!("unerwartetes Kommando: {other:?}"),
+        });
+        let result = dispatch_agent_lifecycle(AgentLifecycleAction::Pause, 7, &state)
+            .expect("pause dispatch ok");
+        assert_eq!(responder.join().unwrap(), 7);
+        assert_eq!(result.new_status, "suspended");
+        assert_eq!(result.outcome, "ok");
+        assert_eq!(result.affected_pids, 2);
+    }
+
+    #[test]
+    fn agent_lifecycle_invalid_transition_maps_to_conflict_409() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let responder = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::Resume {
+                agent_id,
+                response_tx,
+            } => response_tx
+                .send(AgentLifecycleResponse {
+                    accepted: false,
+                    agent_id,
+                    aggregate_id: format!("AGENT-{agent_id:02}"),
+                    action: "resume".to_string(),
+                    new_status: String::new(),
+                    affected_pids: 0,
+                    outcome: "invalid_transition".to_string(),
+                    note: "already active".to_string(),
+                })
+                .unwrap(),
+            other => panic!("erwartete Resume, war {other:?}"),
+        });
+        let err = dispatch_agent_lifecycle(AgentLifecycleAction::Resume, 7, &state).unwrap_err();
+        responder.join().unwrap();
+        assert!(matches!(err, ApiError::Conflict(_)));
+        assert_eq!(err.to_response().status, 409);
+    }
+
+    #[test]
+    fn agent_lifecycle_not_found_maps_to_404() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let responder = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::Despawn {
+                agent_id,
+                response_tx,
+            } => response_tx
+                .send(AgentLifecycleResponse {
+                    accepted: false,
+                    agent_id,
+                    aggregate_id: format!("AGENT-{agent_id:02}"),
+                    action: "despawn".to_string(),
+                    new_status: String::new(),
+                    affected_pids: 0,
+                    outcome: "not_found".to_string(),
+                    note: "unknown".to_string(),
+                })
+                .unwrap(),
+            other => panic!("erwartete Despawn, war {other:?}"),
+        });
+        let err = dispatch_agent_lifecycle(AgentLifecycleAction::Despawn, 99, &state).unwrap_err();
+        responder.join().unwrap();
+        assert!(matches!(err, ApiError::NotFound(_)));
+        assert_eq!(err.to_response().status, 404);
+    }
+
+    #[test]
+    fn agent_lifecycle_rejects_zero_agent_id() {
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(None);
+        let err = dispatch_agent_lifecycle(AgentLifecycleAction::Pause, 0, &state).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+        assert_eq!(err.to_response().status, 400);
+    }
+
+    #[test]
     fn fs_dedup_benchmark_reports_hits_ratio_and_latency() {
         let (mut state, _rx, _platform_rx, _runtime_rx) = test_state(None);
         attach_test_fs_layer(&mut state);
@@ -4039,6 +4609,7 @@ mod tests {
             RuntimeControlCommand::StateHash { .. } => {
                 panic!("unerwartetes StateHash-Kommando");
             }
+            other => panic!("unerwartetes Lifecycle-Kommando: {other:?}"),
         });
         let response = handle_http_request(
             test_request(

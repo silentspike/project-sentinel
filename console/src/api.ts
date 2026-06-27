@@ -427,3 +427,81 @@ export interface DaemonParams {
   time_scale: number | null;
   tick_rate_ms: number | null;
 }
+
+// #428 Agent Deep View — read-only FS browser (sentinel-fs) + per-agent lifecycle.
+
+/** One entry in a read-only agent FS directory listing. */
+export interface FsEntry {
+  name: string;
+  inode: number;
+  kind: "file" | "dir" | "symlink" | string;
+  size: number;
+  mode: number;
+  mtime: number;
+  /** Hex content hash (empty for directories/symlinks). */
+  hash: string;
+  /** How many inodes share the same CAS blob (dedup sharing; 0 for non-files). */
+  refcount: number;
+}
+
+/** GET /api/control/agent/{id}/fs?inode=N — directory listing of an agent layer. */
+export interface FsListing {
+  accepted: boolean;
+  agent_id: number;
+  aggregate_id: string;
+  inode: number;
+  entries: FsEntry[];
+  dedup_ratio_percent: number;
+  cas_blob_count: number;
+  dedup_savings_bytes: number;
+}
+
+/** GET /api/control/agent/{id}/fs/read?inode=N — file content (size-capped). */
+export interface FsFileRead {
+  accepted: boolean;
+  agent_id: number;
+  aggregate_id: string;
+  inode: number;
+  size: number;
+  returned_bytes: number;
+  truncated: boolean;
+  hash: string;
+  refcount: number;
+  encoding: "utf8" | "hex" | string;
+  content: string;
+}
+
+/** POST /api/control/agent/{id}/{stop,start,remove} — lifecycle result. */
+export interface AgentLifecycleResult {
+  accepted: boolean;
+  agent_id: number;
+  aggregate_id: string;
+  action: "pause" | "resume" | "despawn" | string;
+  new_status: string;
+  affected_pids: number;
+  outcome: "ok" | "invalid_transition" | "not_found" | string;
+  note: string;
+}
+
+/** One row of the event log (GET /api/events?agent=AGENT-NN), used for activity charts. */
+export interface EventRow {
+  id: number;
+  event_id: string;
+  event_type: string;
+  aggregate_id: string;
+  payload: string;
+  correlation_id?: string | null;
+  causation_id?: string | null;
+  tick: number;
+  timestamp_ms: number;
+  compensation_type?: string | null;
+}
+
+/** GET /api/events?agent=AGENT-NN — per-agent event window for sparkline + tool donut. */
+export interface EventsResponse {
+  events: EventRow[];
+  total: number;
+  limit: number;
+  offset: number;
+  events_db: string;
+}

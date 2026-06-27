@@ -237,6 +237,12 @@ pub fn build_app(state: AppState) -> axum::Router {
         .route("/snapshot-state", get(control::snapshot_state))
         .route("/snapshot-restore", post(control::snapshot_restore))
         .route("/restore", post(control::snapshot_restore))
+        // #428 Agent Deep View: per-Agent FS-Browse (read-only) + Start/Stop + destructive remove.
+        .route("/agent/{id}/fs", get(control::agent_fs))
+        .route("/agent/{id}/fs/read", get(control::agent_fs_read))
+        .route("/agent/{id}/stop", post(control::agent_stop))
+        .route("/agent/{id}/start", post(control::agent_start))
+        .route("/agent/{id}/remove", post(control::agent_remove))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,

@@ -166,6 +166,10 @@ pub struct PlatformControlplane {
     last_analysis_trigger: Option<String>,
     last_scheduled_analysis_tick: Option<u64>,
     threshold_overrides: BTreeMap<String, serde_json::Value>,
+    /// #428: Agent-Namen, die aktuell pausiert (Suspended) sind. Wird vom Orchestrator pro
+    /// Zyklus gesetzt und von der Stall->Restart-Regel ausgenommen (sonst wuerde der
+    /// SIGSTOP-bedingte 0-Syscall-Zustand als Stall fehlinterpretiert).
+    suspended_agents: std::collections::HashSet<String>,
 }
 
 impl PlatformControlplane {
@@ -184,7 +188,13 @@ impl PlatformControlplane {
             last_analysis_trigger: None,
             last_scheduled_analysis_tick: None,
             threshold_overrides: BTreeMap::new(),
+            suspended_agents: std::collections::HashSet::new(),
         }
+    }
+
+    /// #428: setzt die aktuell pausierten Agent-Namen (pro Zyklus vom Orchestrator gespeist).
+    pub fn set_suspended_agents(&mut self, suspended: std::collections::HashSet<String>) {
+        self.suspended_agents = suspended;
     }
 
     /// Prueft ob der Zyklus in diesem Tick laufen soll.
@@ -293,6 +303,7 @@ impl PlatformControlplane {
             &effective_config,
             &self.write_rate_baselines,
             agent_name_to_id,
+            &self.suspended_agents,
         );
 
         // 3. Execute: Events emittieren + SideEffects sammeln
@@ -892,6 +903,7 @@ mod tests {
             &cp.effective_config(),
             &HashMap::new(),
             &HashMap::new(),
+            &std::collections::HashSet::new(),
         );
 
         assert_eq!(
