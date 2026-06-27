@@ -1,0 +1,20 @@
+{
+  "mode": "zero-config",
+  "base_url": "https://127.0.0.1:8001",
+  "samples": 20,
+  "tls_handshake_ms": {
+    "samples": 20,
+    "p50_ms": 6.3,
+    "p95_ms": 7.43,
+    "min_ms": 4.43,
+    "max_ms": 7.71
+  },
+  "webtransport_connect_ms": {
+    "samples": 20,
+    "p50_ms": 9,
+    "p95_ms": 10.2,
+    "min_ms": 3.7,
+    "max_ms": 19537.4
+  },
+  "cert_hash_present": true
+}

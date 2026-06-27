@@ -1,0 +1,27 @@
+mode=production
+base_url=https://localhost:8001
+samples=20
+ignore_https_errors=false
+curl_insecure=false
+curl_cacert=/tmp/issue-473-live/production-ca/root.pem
+requested_browser_args=["--no-sandbox","--use-system-ca","--webtransport-developer-mode","--host-resolver-rules=MAP localhost 127.0.0.1"]
+{
+  "mode": "production",
+  "base_url": "https://localhost:8001",
+  "samples": 20,
+  "tls_handshake_ms": {
+    "samples": 20,
+    "p50_ms": 5.65,
+    "p95_ms": 6.58,
+    "min_ms": 5.48,
+    "max_ms": 6.74
+  },
+  "webtransport_connect_ms": {
+    "samples": 20,
+    "p50_ms": 10.5,
+    "p95_ms": 12.2,
+    "min_ms": 4.7,
+    "max_ms": 12.3
+  },
+  "cert_hash_present": false
+}

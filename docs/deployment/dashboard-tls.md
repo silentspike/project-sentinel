@@ -128,6 +128,15 @@ Do not use `--ignore-certificate-errors`, `ignoreHTTPSErrors`, or equivalent
 bypass flags as Production evidence. The browser must trust the issuing root for
 real.
 
+Chrome WebTransport has one extra constraint for local/private test roots:
+QUIC may reject a locally trusted root with `QUIC_TLS_CERTIFICATE_UNKNOWN` when
+the root is not part of the browser known-root set. For lab verification of an
+internal CA, import the root as above and run Chromium with `--use-system-ca`
+plus `--webtransport-developer-mode`. This does not disable certificate
+validation; it only allows WebTransport to use the locally trusted root. Do not
+replace this with `--ignore-certificate-errors`. Public WebPKI certificates,
+such as Let's Encrypt, avoid this lab-only flag.
+
 Restart and verify:
 
 ```bash
