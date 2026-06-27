@@ -97,7 +97,8 @@ async fn main() {
                 .expect("peer holds the block");
             let mut corrupt = encoded.clone();
             corrupt[1] ^= 0xFF;
-            let dir = std::env::temp_dir().join(format!("blockpull-probe-int-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("blockpull-probe-int-{}", std::process::id()));
             let cas = CasStore::open(&dir).expect("tmp cas");
             match cas.store_pulled_blob(&corrupt, &hash, size) {
                 Ok(()) => println!("INTEGRITY FAIL: a corrupt blob was published!"),
