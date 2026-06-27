@@ -21,7 +21,9 @@ pub mod idempotency;
 pub mod server;
 pub mod tls;
 
-pub use block_pull::{BlockProvider, BlockPullError, BlockPullRequest, BlockPullServer};
+pub use block_pull::{
+    BlockProvider, BlockPullClient, BlockPullError, BlockPullRequest, BlockPullServer,
+};
 pub use cert::{CertFingerprint, NodeCertificate};
 pub use client::ControlClient;
 pub use envelope::{

@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 
 use crate::cert::{CertFingerprint, NodeCertificate};
 use crate::envelope::{decode_frame, encode_frame, CodecError};
-use crate::tls::{peer_fingerprint, quic_server_config};
+use crate::tls::{peer_fingerprint, quic_client_config, quic_server_config};
 
 /// Max concurrent block-pull streams served per pinned peer (per-node rate limit, V10).
 const MAX_INFLIGHT_PER_PEER: usize = 16;
@@ -270,6 +270,50 @@ async fn serve_pull_connection<P: BlockProvider + 'static>(
         }
     }
     Ok(())
+}
+
+/// A QUIC block-pull client bound to an ephemeral local port, presenting `node`'s cert.
+pub struct BlockPullClient {
+    endpoint: Endpoint,
+}
+
+impl BlockPullClient {
+    pub fn new(node: &NodeCertificate) -> anyhow::Result<Self> {
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().expect("valid bind addr"))?;
+        endpoint.set_default_client_config(quic_client_config(node)?);
+        Ok(Self { endpoint })
+    }
+
+    /// Pull `block_ref` from a holder at `peer_addr`, enforcing the server cert pin
+    /// (V10 — reject a server whose fingerprint differs from `expected_peer`). Returns
+    /// the raw on-disk **encoded** blob bytes, or `None` if the peer does not hold it.
+    /// The read is bounded by the ref's encoded size (anti-DoS); the content hash is
+    /// verified by the CAS layer (V28) before the bytes are published.
+    pub async fn pull(
+        &self,
+        peer_addr: SocketAddr,
+        expected_peer: CertFingerprint,
+        block_ref: &BlockRef,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let conn = self.endpoint.connect(peer_addr, "sentinel-node")?.await?;
+        let fp = peer_fingerprint(&conn)?;
+        if fp != expected_peer {
+            conn.close(1u32.into(), b"unpinned server");
+            anyhow::bail!("block-pull server cert {fp} does not match pin {expected_peer}");
+        }
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_request(
+            &mut send,
+            &BlockPullRequest {
+                block_ref: block_ref.clone(),
+            },
+        )
+        .await?;
+        send.finish()?;
+        let result = read_response(&mut recv, encoded_read_bound(block_ref)).await?;
+        conn.close(0u32.into(), b"done");
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
