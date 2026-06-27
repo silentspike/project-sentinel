@@ -14,11 +14,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sentinel_cluster_control::{
-    BlockMapGossipHandler, CertFingerprint, ControlClient, ControlEnvelope, ControlReply,
-    ControlRequest, ControlResponse, ControlServer, NodeCertificate, StubHandler,
+    BlockMapGossipHandler, BlockProvider, BlockPullClient, BlockPullServer, CertFingerprint,
+    ControlClient, ControlEnvelope, ControlReply, ControlRequest, ControlResponse, ControlServer,
+    NodeCertificate, StubHandler,
 };
 use sentinel_common::cluster::ControlPeer;
-use sentinel_common::{BlockMap, HolderAdvertisement, NodeId};
+use sentinel_common::{
+    BlockMap, BlockNamespace, BlockRef, HashAlgorithm, HolderAdvertisement, NodeId,
+};
 use sentinel_fs::cas::CasStore;
 use sentinel_fs::cas_holder::CasHolderState;
 use sentinel_redb::ClusterMetaStore;
@@ -38,12 +41,49 @@ pub struct ClusterControl {
     /// #498 block map populated by inbound holder gossip (the server merges into it);
     /// the daemon read paths (#498 PR2/PR3) resolve remote holders from this handle.
     block_map: Arc<Mutex<BlockMap>>,
+    /// #498 4b block-pull server (serves local blobs by hash) — `None` if its bind failed
+    /// (kept alive for its lifetime; the control stream still runs).
+    _pull_server: Option<BlockPullServer>,
+    /// #498 4b block-pull client for outbound pull-by-hash.
+    pull_client: BlockPullClient,
 }
 
 struct ResolvedPeer {
     alias: String,
     addr: SocketAddr,
+    /// Block-pull endpoint = control addr with port+1 (#498 4b).
+    pull_addr: SocketAddr,
     fingerprint: CertFingerprint,
+}
+
+/// The block-pull endpoint for a control endpoint: same host, control port + 1 (#498 4b).
+fn pull_addr_of(control: SocketAddr) -> SocketAddr {
+    SocketAddr::new(control.ip(), control.port().wrapping_add(1))
+}
+
+/// Extract the 32-byte SHA-256 hash from a Blob/SHA-256 `BlockRef`; `None` for any other
+/// namespace/algorithm (the chunk plane is a later step).
+fn blob_sha256_hash(block_ref: &BlockRef) -> Option<[u8; 32]> {
+    if block_ref.namespace() == BlockNamespace::Blob
+        && block_ref.algorithm() == HashAlgorithm::Sha256
+    {
+        block_ref.digest().try_into().ok()
+    } else {
+        None
+    }
+}
+
+/// A `BlockProvider` over this node's CAS: serves a blob's raw on-disk encoded bytes by
+/// content hash (V10 — never a path), for the block-pull server.
+struct CasBlockProvider {
+    cas: CasStore,
+}
+
+impl BlockProvider for CasBlockProvider {
+    fn encoded_blob(&self, block_ref: &BlockRef) -> Option<Vec<u8>> {
+        let hash = blob_sha256_hash(block_ref)?;
+        self.cas.encoded_blob(&hash)
+    }
 }
 
 impl ClusterControl {
@@ -78,6 +118,7 @@ impl ClusterControl {
             resolved.push(ResolvedPeer {
                 alias: p.alias.clone(),
                 addr,
+                pull_addr: pull_addr_of(addr),
                 fingerprint,
             });
         }
@@ -85,6 +126,8 @@ impl ClusterControl {
         let bind_addr: SocketAddr = bind
             .parse()
             .map_err(|e| anyhow::anyhow!("control_bind {bind}: {e}"))?;
+        // The block-pull server reuses the same pinned peers + cert (V10), on port+1.
+        let pull_pins = pins.clone();
         // The real #496 owner handler when the durable meta store is available; the
         // Phase-3a0 stub only as a fallback (meta store failed to open). Both are wrapped
         // in the #498 BlockMapGossipHandler so inbound holder gossip merges into a shared
@@ -111,10 +154,34 @@ impl ClusterControl {
             )?,
         };
         let client = ControlClient::new(&node)?;
+
+        // #498 4b: bind the block-pull server (serves local CAS blobs by hash, V10) on
+        // port+1, backed by this node's CAS. A bind failure is logged, not fatal — the
+        // control stream + gossip still run.
+        let pull_bind = pull_addr_of(bind_addr);
+        let pull_server = match CasStore::open(cert_dir) {
+            Ok(cas) => {
+                let provider = Arc::new(CasBlockProvider { cas });
+                match BlockPullServer::bind(pull_bind, &node, pull_pins, provider) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        warn!(error = %e, "#498 block-pull server failed to bind");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "#498 block-pull: CAS open failed; pull server not started");
+                None
+            }
+        };
+        let pull_client = BlockPullClient::new(&node)?;
+
         info!(
             %bind_addr,
             fingerprint = %my_fingerprint,
             peers = resolved.len(),
+            pull_server = pull_server.is_some(),
             "Cluster 12: control stream started"
         );
         Ok(Self {
@@ -123,6 +190,8 @@ impl ClusterControl {
             peers: resolved,
             my_fingerprint,
             block_map,
+            _pull_server: pull_server,
+            pull_client,
         })
     }
 
@@ -135,6 +204,61 @@ impl ClusterControl {
     /// (#498 PR2/PR3) resolve a remote block's holders from this shared handle.
     pub fn block_map(&self) -> Arc<Mutex<BlockMap>> {
         Arc::clone(&self.block_map)
+    }
+
+    /// #498 4b: ensure `block_ref` is available in `cas`, pulling it **by hash** from a
+    /// peer if missing. Consults the 4a block map (which peers hold it, for observability)
+    /// and pulls from a pinned peer's block-pull endpoint, then verifies + durably
+    /// publishes (V28) before returning. Returns `true` if the block is local after the
+    /// call. Blob/SHA-256 refs only (the chunk plane is a later step).
+    ///
+    /// Peer selection currently tries each pinned peer until one serves a verified copy;
+    /// block-map-guided selection (skip non-holders) is a refinement once `NodeId`→peer
+    /// mapping is configured. Single-flight / negative-cache are PR3 (4c).
+    pub async fn resolve_block(&self, cas: &CasStore, block_ref: &BlockRef) -> bool {
+        let Some(hash) = blob_sha256_hash(block_ref) else {
+            return false;
+        };
+        if cas.contains(&hash) {
+            return true; // local hit
+        }
+        let holder_count = {
+            let map = self.block_map.lock().unwrap_or_else(|p| p.into_inner());
+            map.holders(block_ref).len()
+        };
+        debug!(block_ref = %block_ref, holders = holder_count, "#498 resolve: pulling a missing block");
+        for peer in &self.peers {
+            match self
+                .pull_client
+                .pull(peer.pull_addr, peer.fingerprint, block_ref)
+                .await
+            {
+                Ok(Some(encoded)) => {
+                    match cas.store_pulled_blob(&encoded, &hash, block_ref.size_bytes()) {
+                        Ok(()) => {
+                            info!(
+                                peer = %peer.alias,
+                                block_ref = %block_ref,
+                                "#498 pulled + verified + durably published"
+                            );
+                            return true;
+                        }
+                        Err(e) => warn!(
+                            peer = %peer.alias,
+                            error = %e,
+                            "#498 pulled blob rejected (integrity) — trying next peer"
+                        ),
+                    }
+                }
+                Ok(None) => {} // peer does not hold it
+                Err(e) => debug!(
+                    peer = %peer.alias,
+                    error = %e,
+                    "#498 block-pull to peer failed — trying next"
+                ),
+            }
+        }
+        false
     }
 
     /// #498 block-map gossip: push `advertisements` to **every** pinned peer (fan-out).
@@ -252,5 +376,28 @@ pub async fn run_cas_gossip_republish(
             round,
             advertised, "#498 CAS gossip republish round complete"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pull_addr_is_control_port_plus_one() {
+        let ctrl: SocketAddr = "10.0.0.242:8085".parse().unwrap();
+        let pull = pull_addr_of(ctrl);
+        assert_eq!(pull.port(), 8086, "block-pull rides control port + 1");
+        assert_eq!(pull.ip(), ctrl.ip(), "same host");
+    }
+
+    #[test]
+    fn blob_hash_extracts_only_blob_sha256_refs() {
+        let blob = BlockRef::blob_sha256([9; 32], 100);
+        assert_eq!(blob_sha256_hash(&blob), Some([9u8; 32]));
+        // A chunk (BLAKE3-128) is not a blob/sha256 ref -> not pullable here (4b is the
+        // blob plane; the chunk plane is a later step).
+        let chunk = BlockRef::chunk_blake3_128([1; 16], 50, "gear-v1");
+        assert_eq!(blob_sha256_hash(&chunk), None);
     }
 }

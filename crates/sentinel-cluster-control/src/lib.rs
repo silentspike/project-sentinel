@@ -12,6 +12,7 @@
 //! **Bounded scope (ADR-2):** node→node only, **after** a node has joined; the
 //! bare-shell bootstrap (#495) stays on SSH. 0-RTT is off for control (V18).
 
+pub mod block_pull;
 pub mod cert;
 pub mod client;
 pub mod envelope;
@@ -20,6 +21,9 @@ pub mod idempotency;
 pub mod server;
 pub mod tls;
 
+pub use block_pull::{
+    BlockProvider, BlockPullClient, BlockPullError, BlockPullRequest, BlockPullServer,
+};
 pub use cert::{CertFingerprint, NodeCertificate};
 pub use client::ControlClient;
 pub use envelope::{

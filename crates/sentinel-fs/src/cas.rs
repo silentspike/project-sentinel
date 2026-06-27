@@ -6,7 +6,7 @@
 
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use tracing::instrument;
 
@@ -223,6 +223,94 @@ impl CasStore {
         }
         Ok(refs)
     }
+
+    /// The raw on-disk **encoded** bytes of a stored blob (for the #498 block-pull
+    /// server's `BlockProvider`). `None` if not held. Takes only a content hash, never a
+    /// path (V10).
+    pub fn encoded_blob(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        fs::read(self.blob_path(hash)).ok()
+    }
+
+    /// Store a blob **pulled from a peer** (#498 / V28): verify the content hash + size
+    /// against the expected `BlockRef` identity, then **durably** publish it
+    /// (`fsync(file)` → atomic rename → `fsync(parent dir)`) so it is on disk before it
+    /// can be advertised. The input is the raw on-disk **encoded** form streamed from the
+    /// holder. A corrupt / tampered blob (digest or size mismatch) is **rejected, never
+    /// published** (AC-3).
+    pub fn store_pulled_blob(
+        &self,
+        encoded: &[u8],
+        expected_hash: &[u8; 32],
+        expected_size: u64,
+    ) -> anyhow::Result<()> {
+        // Verify the identity the digest covers — the DECODED content, not the wire bytes.
+        let decoded =
+            decode_blob(encoded).map_err(|e| anyhow::anyhow!("pulled blob decode failed: {e}"))?;
+        let actual = Self::hash(&decoded);
+        if &actual != expected_hash {
+            anyhow::bail!(
+                "pulled blob digest mismatch: got {} want {} — rejected, not published",
+                hex_encode(&actual),
+                hex_encode(expected_hash)
+            );
+        }
+        if decoded.len() as u64 != expected_size {
+            anyhow::bail!(
+                "pulled blob size mismatch: got {} want {expected_size} — rejected",
+                decoded.len()
+            );
+        }
+        self.durable_write_blob(expected_hash, encoded)
+    }
+
+    /// Durably write `encoded` to the canonical path for `hash` (V28): write a temp file,
+    /// `fsync` it, atomically rename it into place, then `fsync` the parent directory so
+    /// the rename itself survives a crash.
+    fn durable_write_blob(&self, hash: &[u8; 32], encoded: &[u8]) -> anyhow::Result<()> {
+        let blob_path = self.blob_path(hash);
+        if self.contains(hash) {
+            return Ok(()); // already durable (dedup)
+        }
+        let parent = blob_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("blob path has no parent"))?;
+        fs::create_dir_all(parent)?;
+        let tmp_path = blob_path.with_extension("tmp");
+        {
+            let mut f = fs::File::create(&tmp_path)?;
+            f.write_all(encoded)?;
+            f.sync_all()?; // fsync(file): the content is durable before the rename
+        }
+        fs::rename(&tmp_path, &blob_path)?; // atomic publish
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all(); // fsync(dir): the rename is durable
+        }
+        Ok(())
+    }
+
+    /// Startup reconcile (#498 / V28): delete incomplete `.tmp` writes left by a crash
+    /// mid-store, so a half-written blob is never mistaken for a durable one (and never
+    /// re-advertised). Returns the count removed.
+    pub fn reconcile_temp(&self) -> anyhow::Result<usize> {
+        let mut removed = 0;
+        if !self.cas_dir.exists() {
+            return Ok(0);
+        }
+        for shard in fs::read_dir(&self.cas_dir)? {
+            let shard = shard?;
+            if !shard.file_type()?.is_dir() {
+                continue;
+            }
+            for f in fs::read_dir(shard.path())? {
+                let f = f?;
+                if f.path().extension().and_then(|e| e.to_str()) == Some("tmp") {
+                    fs::remove_file(f.path())?;
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
+    }
 }
 
 /// Encode data as a CAS blob (prefix byte + optional zstd compression).
@@ -303,6 +391,85 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = CasStore::open(dir.path()).unwrap();
         (store, dir)
+    }
+
+    // ── #498 4b: durable pulled-blob publish + verify (V28) ──
+
+    #[test]
+    fn pulled_blob_round_trips_through_durable_publish() {
+        // Holder stores a blob; the puller receives its raw encoded bytes (the wire form)
+        // and durably publishes them after verifying the content identity.
+        let (holder, _h) = temp_cas();
+        let data = b"distributed cas pull-by-hash content";
+        let (hash, _) = holder.store(data).unwrap();
+        let encoded = holder
+            .encoded_blob(&hash)
+            .expect("holder holds the encoded blob");
+
+        let (puller, _p) = temp_cas();
+        assert!(!puller.contains(&hash), "puller starts without the blob");
+        puller
+            .store_pulled_blob(&encoded, &hash, data.len() as u64)
+            .unwrap();
+        assert!(puller.contains(&hash), "durably published after verify");
+        assert_eq!(
+            puller.read(&hash).unwrap(),
+            data,
+            "content matches the holder"
+        );
+    }
+
+    #[test]
+    fn corrupt_pulled_blob_is_rejected_and_not_published() {
+        let (holder, _h) = temp_cas();
+        let data = b"the bytes that must not be tampered with";
+        let (hash, _) = holder.store(data).unwrap();
+        let mut encoded = holder.encoded_blob(&hash).unwrap();
+        // Flip a content byte (index 0 is the encoding prefix) — a tampered/corrupt pull.
+        encoded[1] ^= 0xFF;
+
+        let (puller, _p) = temp_cas();
+        let err = puller
+            .store_pulled_blob(&encoded, &hash, data.len() as u64)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("digest mismatch"),
+            "a corrupt blob is rejected on the digest"
+        );
+        assert!(
+            !puller.contains(&hash),
+            "a rejected blob is NEVER published (AC-3)"
+        );
+    }
+
+    #[test]
+    fn wrong_size_pulled_blob_is_rejected() {
+        let (holder, _h) = temp_cas();
+        let data = b"size must match the BlockRef identity";
+        let (hash, _) = holder.store(data).unwrap();
+        let encoded = holder.encoded_blob(&hash).unwrap();
+
+        let (puller, _p) = temp_cas();
+        let err = puller
+            .store_pulled_blob(&encoded, &hash, (data.len() + 1) as u64)
+            .unwrap_err();
+        assert!(err.to_string().contains("size mismatch"));
+        assert!(!puller.contains(&hash));
+    }
+
+    #[test]
+    fn reconcile_temp_deletes_incomplete_writes() {
+        let (store, dir) = temp_cas();
+        // Simulate a crash mid-store: a leftover .tmp in a shard dir.
+        let shard = dir.path().join("cas").join("ab");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("deadbeef.tmp"), b"half-written").unwrap();
+        std::fs::write(shard.join("cafef00d"), b"complete blob").unwrap();
+
+        let removed = store.reconcile_temp().unwrap();
+        assert_eq!(removed, 1, "the incomplete .tmp is removed");
+        assert!(!shard.join("deadbeef.tmp").exists());
+        assert!(shard.join("cafef00d").exists(), "the complete blob is kept");
     }
 
     #[test]
