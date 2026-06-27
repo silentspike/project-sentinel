@@ -7,9 +7,12 @@
 //! peer pins, V10).
 //!
 //! Modes (positional args):
+//!
+//! ```text
 //!   pull      <peer_addr> <peer_fp_hex> <blob_hash_hex> <size> <cert_dir> <dest_data_dir>
 //!   integrity <peer_addr> <peer_fp_hex> <blob_hash_hex> <size> <cert_dir>
 //!   bench     <peer_addr> <peer_fp_hex> <blob_hash_hex> <size> <cert_dir> <iters>
+//! ```
 
 use std::path::Path;
 use std::time::Instant;
