@@ -310,6 +310,48 @@ impl ArtifactPlane {
         segments.read(&loc)
     }
 
+    /// Store a chunk **pulled from a peer** (#498 4c): verify its BLAKE3-128 identity
+    /// (decompress → hash == `hash`), then durably store the raw (as-stored) bytes into
+    /// the segment store + index (segment append + `FS_CHUNKS` + refcount, mirroring
+    /// ingest). A corrupt / tampered chunk is **rejected, never stored** (AC-3 for the
+    /// chunk plane). Idempotent (dedup if already held). The input is the raw form
+    /// [`read_chunk_raw`](Self::read_chunk_raw) serves on the holder.
+    pub fn store_pulled_chunk(&self, raw: &[u8], hash: &ChunkHash) -> anyhow::Result<()> {
+        if self.has_chunk(hash)? {
+            return Ok(()); // dedup — already durable
+        }
+        // Verify the identity the hash covers — the DECOMPRESSED chunk, not the wire bytes.
+        let decompressed = crate::ingest::decompress_chunk(raw)
+            .map_err(|e| anyhow::anyhow!("pulled chunk decompress failed: {e}"))?;
+        let actual = crate::chunker::blake3_hash_128(&decompressed);
+        if &actual != hash {
+            anyhow::bail!(
+                "pulled chunk digest mismatch: got {} want {} — rejected, not stored",
+                crate::cas::hex_encode(&actual),
+                crate::cas::hex_encode(hash)
+            );
+        }
+        // Append to the segment store, then index + refcount in one redb txn (as ingest).
+        let loc = {
+            let mut segments = self
+                .segments
+                .lock()
+                .map_err(|e| anyhow::anyhow!("segment lock: {e}"))?;
+            segments.append(raw)?
+        };
+        let wtxn = self.begin_write()?;
+        {
+            let mut chunks = wtxn.open_table(FS_CHUNKS)?;
+            let mut refcount = wtxn.open_table(FS_CHUNK_REFCOUNT)?;
+            let loc_bytes = loc.to_bytes();
+            chunks.insert(hash, loc_bytes.as_slice())?;
+            let current = refcount.get(hash)?.map(|g| g.value()).unwrap_or(0);
+            refcount.insert(hash, current + 1)?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
     /// Read and decompress a chunk, using the L1 cache to avoid redundant I/O + zstd.
     ///
     /// Cache flow: check cache → (hit: return) | (miss: segment read → decompress → insert → return)
@@ -595,6 +637,61 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plane = ArtifactPlane::open(dir.path().join("artifact.redb")).unwrap();
         (plane, dir)
+    }
+
+    // ── #498 4c: durable pulled-chunk store + verify ──
+
+    #[test]
+    fn pulled_chunk_round_trips_through_verify_and_store() {
+        // Holder ingests data -> a chunk; the puller receives its raw (as-stored) bytes
+        // and stores them after verifying the BLAKE3-128 identity.
+        let (holder, _h) = temp_plane();
+        let data = b"distributed cas chunk pull-by-hash content";
+        let id = crate::ingest::commit_ingest({
+            let mut s = crate::ingest::begin_ingest(&holder, "text/plain");
+            s.write(data);
+            s
+        })
+        .unwrap();
+        let hashes = holder.get_manifest(id).unwrap().unwrap();
+        let hash = hashes[0];
+        let raw = holder.read_chunk_raw(&hash).unwrap();
+
+        let (puller, _p) = temp_plane();
+        assert!(!puller.has_chunk(&hash).unwrap(), "puller starts without it");
+        puller.store_pulled_chunk(&raw, &hash).unwrap();
+        assert!(puller.has_chunk(&hash).unwrap(), "stored after verify");
+        // The decompressed chunk on the puller matches the holder's.
+        assert_eq!(
+            puller.read_chunk_decompressed(&hash).unwrap(),
+            holder.read_chunk_decompressed(&hash).unwrap()
+        );
+    }
+
+    #[test]
+    fn corrupt_pulled_chunk_is_rejected_and_not_stored() {
+        let (holder, _h) = temp_plane();
+        let data = b"chunk bytes that must not be tampered with on the wire";
+        let id = crate::ingest::commit_ingest({
+            let mut s = crate::ingest::begin_ingest(&holder, "text/plain");
+            s.write(data);
+            s
+        })
+        .unwrap();
+        let hash = holder.get_manifest(id).unwrap().unwrap()[0];
+        let mut raw = holder.read_chunk_raw(&hash).unwrap();
+        raw[1] ^= 0xFF; // flip a content byte (index 0 is the encoding prefix)
+
+        let (puller, _p) = temp_plane();
+        let err = puller.store_pulled_chunk(&raw, &hash).unwrap_err();
+        assert!(
+            err.to_string().contains("digest mismatch"),
+            "a corrupt chunk is rejected on the BLAKE3-128 digest"
+        );
+        assert!(
+            !puller.has_chunk(&hash).unwrap(),
+            "a rejected chunk is NEVER stored (AC-3)"
+        );
     }
 
     #[test]
