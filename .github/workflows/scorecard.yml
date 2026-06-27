@@ -14,7 +14,12 @@ permissions: read-all
 jobs:
   analysis:
     name: OSSF Scorecard
-    runs-on: ${{ vars.RUNNER_MODE == 'hosted' && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "x64"]') }}
+    # #599: hardcoded ubuntu-latest (NOT the RUNNER_MODE switch). The scorecard
+    # webapp publishing requires "exactly 1 Ubuntu virtual environment"; the
+    # RUNNER_MODE switch resolves to self-hosted by default and publishing fails
+    # with "should have exactly 1 Ubuntu". Scorecard is public-repo + default-
+    # branch only anyway, so a GitHub-hosted ubuntu runner is correct here.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       security-events: write
@@ -28,13 +33,7 @@ jobs:
         with:
           results_file: results.sarif
           results_format: sarif
-          # #599: publish only on the default branch. The scorecard-action
-          # rejects publish_results on non-default branches with "Only the
-          # default branch main is supported"; on main the repo is now public
-          # (the Feb-2026 ListCommits failure was the private-repo era), so
-          # publishing works there. Conditional publish lets the workflow run
-          # green on PR/feature branches (results computed, just not published).
-          publish_results: ${{ github.ref == 'refs/heads/main' }}
+          publish_results: true
 
       - name: Upload SARIF
         uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4.32.4
