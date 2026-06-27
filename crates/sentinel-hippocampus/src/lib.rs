@@ -31,4 +31,4 @@ pub use selection::{
 };
 pub use service::{ConsolidationResult, HippocampusService};
 pub use sleep::{SleepCycle, SleepPhase};
-pub use store::{HippocampusStore, NarrativeState, RedbFactStore};
+pub use store::{HippocampusStore, NarrativeState, ReadOnlyHippocampusStore, RedbFactStore};
