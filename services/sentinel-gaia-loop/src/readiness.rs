@@ -235,36 +235,51 @@ pub async fn run_readiness_loop(config: GaiaLoopConfig) -> Result<()> {
         Err(error) => warn!(%error, "Gaia readiness recovery scan skipped"),
     }
 
-    let client = async_nats::connect(config.nats_url.as_str())
-        .await
-        .with_context(|| format!("connect NATS {}", config.nats_url))?;
-    let jetstream = async_nats::jetstream::new(client);
-    let stream = jetstream
-        .get_or_create_stream(async_nats::jetstream::stream::Config {
-            name: "SENTINEL_EVENTS".to_string(),
-            subjects: vec!["sentinel.events.>".to_string()],
-            ..Default::default()
-        })
-        .await
-        .context("get/create SENTINEL_EVENTS stream")?;
-
-    let consumer = stream
-        .get_or_create_consumer(
-            "sentinel-gaia-loop",
-            async_nats::jetstream::consumer::pull::Config {
-                durable_name: Some("sentinel-gaia-loop".to_string()),
-                filter_subject: NATS_EVENT_FILTER.to_string(),
-                deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::New,
-                ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
-                inactive_threshold: Duration::from_secs(30),
+    let nats_messages = async {
+        let client = async_nats::connect(config.nats_url.as_str())
+            .await
+            .with_context(|| format!("connect NATS {}", config.nats_url))?;
+        let jetstream = async_nats::jetstream::new(client);
+        let stream = jetstream
+            .get_or_create_stream(async_nats::jetstream::stream::Config {
+                name: "SENTINEL_EVENTS".to_string(),
+                subjects: vec!["sentinel.events.>".to_string()],
                 ..Default::default()
-            },
-        )
-        .await
-        .context("get/create sentinel-gaia-loop consumer")?;
-    info!(filter = NATS_EVENT_FILTER, "Gaia readiness loop subscribed");
+            })
+            .await
+            .context("get/create SENTINEL_EVENTS stream")?;
 
-    let mut messages = consumer.messages().await.context("open NATS messages")?;
+        let consumer = stream
+            .get_or_create_consumer(
+                "sentinel-gaia-loop",
+                async_nats::jetstream::consumer::pull::Config {
+                    durable_name: Some("sentinel-gaia-loop".to_string()),
+                    filter_subject: NATS_EVENT_FILTER.to_string(),
+                    deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::New,
+                    ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
+                    inactive_threshold: Duration::from_secs(30),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("get/create sentinel-gaia-loop consumer")?;
+        consumer.messages().await.context("open NATS messages")
+    }
+    .await;
+
+    let mut messages = match nats_messages {
+        Ok(messages) => {
+            info!(filter = NATS_EVENT_FILTER, "Gaia readiness loop subscribed");
+            messages
+        }
+        Err(error) => {
+            warn!(
+                %error,
+                "Gaia readiness NATS unavailable; continuing with scheduled EventStore scans only"
+            );
+            return run_scheduled_scan_loop(processor, config).await;
+        }
+    };
     let scan_every = config.readiness_scan_interval();
     let mut scan_interval = interval_at(Instant::now() + scan_every, scan_every);
     scan_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -278,17 +293,35 @@ pub async fn run_readiness_loop(config: GaiaLoopConfig) -> Result<()> {
                 process_nats_message(&mut processor, msg_result).await;
             }
             _ = scan_interval.tick() => {
-                match processor.scan_event_store_once(&config.events_db.to_string_lossy(), 1_000) {
-                    Ok(summary) => info!(
-                        alerts_created = summary.alerts_created,
-                        duplicates_skipped = summary.duplicates_skipped,
-                        last_event_row_id = summary.last_event_row_id,
-                        "Gaia readiness scheduled scan complete"
-                    ),
-                    Err(error) => warn!(%error, "Gaia readiness scheduled scan skipped"),
-                }
+                run_scheduled_scan(&mut processor, &config);
             }
         }
+    }
+}
+
+async fn run_scheduled_scan_loop(
+    mut processor: ReadinessProcessor,
+    config: GaiaLoopConfig,
+) -> Result<()> {
+    let scan_every = config.readiness_scan_interval();
+    let mut scan_interval = interval_at(Instant::now() + scan_every, scan_every);
+    scan_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        scan_interval.tick().await;
+        run_scheduled_scan(&mut processor, &config);
+    }
+}
+
+fn run_scheduled_scan(processor: &mut ReadinessProcessor, config: &GaiaLoopConfig) {
+    match processor.scan_event_store_once(&config.events_db.to_string_lossy(), 1_000) {
+        Ok(summary) => info!(
+            alerts_created = summary.alerts_created,
+            duplicates_skipped = summary.duplicates_skipped,
+            last_event_row_id = summary.last_event_row_id,
+            "Gaia readiness scheduled scan complete"
+        ),
+        Err(error) => warn!(%error, "Gaia readiness scheduled scan skipped"),
     }
 }
 
