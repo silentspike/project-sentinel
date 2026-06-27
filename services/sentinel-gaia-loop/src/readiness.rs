@@ -21,6 +21,7 @@ const PLATFORM_ANALYSIS_TYPE: &str = "PlatformAnalysis";
 const ESCALATE_TO_OPERATOR: &str = "escalate_to_operator";
 const UNRESOLVED_ESCALATION_TRIGGER: &str = "unresolved_escalation";
 const NATS_EVENT_FILTER: &str = "sentinel.events.platform_analysis.>";
+const EVENTSTORE_CATCH_UP_PAGE_LIMIT: usize = 10_000;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 struct PlatformAnalysisPayload {
@@ -99,6 +100,36 @@ impl ReadinessProcessor {
             .get_events_since_with_id(self.state.last_event_row_id, limit)
             .context("read Gaia readiness events")?;
         self.process_events(events)
+    }
+
+    pub fn scan_event_store_until_caught_up(
+        &mut self,
+        events_db: &str,
+        page_limit: usize,
+    ) -> Result<ReadinessScanSummary> {
+        let page_limit = page_limit.max(1);
+        let mut total = ReadinessScanSummary {
+            events_seen: 0,
+            platform_analysis_seen: 0,
+            alerts_created: 0,
+            duplicates_skipped: 0,
+            ignored: 0,
+            last_event_row_id: self.state.last_event_row_id,
+        };
+
+        loop {
+            let page = self.scan_event_store_once(events_db, page_limit)?;
+            total.events_seen += page.events_seen;
+            total.platform_analysis_seen += page.platform_analysis_seen;
+            total.alerts_created += page.alerts_created;
+            total.duplicates_skipped += page.duplicates_skipped;
+            total.ignored += page.ignored;
+            total.last_event_row_id = page.last_event_row_id;
+
+            if page.events_seen < page_limit {
+                return Ok(total);
+            }
+        }
     }
 
     pub fn process_events(
@@ -226,7 +257,10 @@ pub fn scan_once(config: &GaiaLoopConfig, limit: usize) -> Result<ReadinessScanS
 pub async fn run_readiness_loop(config: GaiaLoopConfig) -> Result<()> {
     let store = AlertStore::from_config(&config);
     let mut processor = ReadinessProcessor::new(store)?;
-    match processor.scan_event_store_once(&config.events_db.to_string_lossy(), 1_000) {
+    match processor.scan_event_store_until_caught_up(
+        &config.events_db.to_string_lossy(),
+        EVENTSTORE_CATCH_UP_PAGE_LIMIT,
+    ) {
         Ok(summary) => info!(
             alerts_created = summary.alerts_created,
             last_event_row_id = summary.last_event_row_id,
@@ -314,7 +348,10 @@ async fn run_scheduled_scan_loop(
 }
 
 fn run_scheduled_scan(processor: &mut ReadinessProcessor, config: &GaiaLoopConfig) {
-    match processor.scan_event_store_once(&config.events_db.to_string_lossy(), 1_000) {
+    match processor.scan_event_store_until_caught_up(
+        &config.events_db.to_string_lossy(),
+        EVENTSTORE_CATCH_UP_PAGE_LIMIT,
+    ) {
         Ok(summary) => info!(
             alerts_created = summary.alerts_created,
             duplicates_skipped = summary.duplicates_skipped,
@@ -483,6 +520,38 @@ mod tests {
         assert_eq!(second.alerts_created, 0);
         let alert_lines = std::fs::read_to_string(cfg.alerts_path()).unwrap();
         assert_eq!(alert_lines.lines().count(), 1);
+    }
+
+    #[test]
+    fn catch_up_scans_multiple_pages_until_current_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg(&dir);
+        let event_store = EventStore::open(cfg.events_db.to_str().unwrap()).unwrap();
+        event_store
+            .append_with_outbox(&platform_event(None, "manual"), "sentinel/events/one")
+            .unwrap();
+        event_store
+            .append_with_outbox(
+                &platform_event(Some(ESCALATE_TO_OPERATOR), "manual"),
+                "sentinel/events/platform_analysis/system",
+            )
+            .unwrap();
+        event_store
+            .append_with_outbox(&platform_event(None, "manual"), "sentinel/events/two")
+            .unwrap();
+        let latest = event_store.get_latest_event_id().unwrap();
+
+        let store = AlertStore::from_config(&cfg);
+        let mut processor = ReadinessProcessor::new(store).unwrap();
+        let summary = processor
+            .scan_event_store_until_caught_up(cfg.events_db.to_str().unwrap(), 1)
+            .unwrap();
+
+        assert_eq!(summary.events_seen, 3);
+        assert_eq!(summary.platform_analysis_seen, 3);
+        assert_eq!(summary.alerts_created, 1);
+        assert_eq!(summary.last_event_row_id, latest);
+        assert_eq!(processor.state().last_event_row_id, latest);
     }
 
     #[test]
