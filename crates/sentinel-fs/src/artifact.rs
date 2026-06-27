@@ -14,9 +14,10 @@ use redb::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
+use crate::block_resolver::ChunkResolve;
 use crate::chunk_cache::{ChunkCache, DEFAULT_CACHE_BYTES};
 use crate::commit_scheduler::{CommitScheduler, SchedulerConfig};
 use crate::segment::{ChunkLocation, SegmentStore};
@@ -160,6 +161,9 @@ pub struct ArtifactPlane {
     cache: Mutex<ChunkCache>,
     /// Adaptive commit scheduler: smooths write spikes under I/O pressure.
     scheduler: Mutex<CommitScheduler>,
+    /// #498 4c (V9): set in cluster mode; on a chunk read miss the plane resolves the
+    /// chunk by hash (pull + verify + durable store), then retries. Unset = unchanged.
+    chunk_resolver: OnceLock<Arc<dyn ChunkResolve>>,
 }
 
 impl ArtifactPlane {
@@ -200,7 +204,22 @@ impl ArtifactPlane {
             segments: Mutex::new(segments),
             cache: Mutex::new(ChunkCache::new(DEFAULT_CACHE_BYTES)),
             scheduler: Mutex::new(CommitScheduler::noop()),
+            chunk_resolver: OnceLock::new(),
         })
+    }
+
+    /// Wire the #498 4c chunk resolver (V9). Called once in cluster mode; a chunk read
+    /// miss then pulls the chunk from a peer (verify + durable store) and retries.
+    pub fn set_chunk_resolver(&self, resolver: Arc<dyn ChunkResolve>) {
+        let _ = self.chunk_resolver.set(resolver);
+    }
+
+    /// #498 4c: ask the wired resolver to make a missing chunk local. `false` if no
+    /// resolver (single-node) — the read fails locally as before.
+    fn resolve_missing_chunk(&self, hash: &ChunkHash) -> bool {
+        self.chunk_resolver
+            .get()
+            .is_some_and(|r| r.ensure_chunk(hash))
     }
 
     /// Start a write transaction with the configured durability level.
@@ -295,19 +314,35 @@ impl ArtifactPlane {
         Ok(table.get(hash)?.is_some())
     }
 
-    /// Read raw (compressed) chunk bytes from the segment store.
+    /// Read raw (compressed) chunk bytes from the segment store (anchor B1). On a local
+    /// miss with a #498 4c resolver wired (cluster mode), the chunk is pulled from a peer
+    /// by hash + durably stored, then the read is retried once (V9). Without a resolver
+    /// this is the unchanged local read.
     pub fn read_chunk_raw(&self, hash: &ChunkHash) -> anyhow::Result<Vec<u8>> {
+        if let Some(bytes) = self.read_chunk_raw_local(hash)? {
+            return Ok(bytes);
+        }
+        if self.resolve_missing_chunk(hash) {
+            if let Some(bytes) = self.read_chunk_raw_local(hash)? {
+                return Ok(bytes);
+            }
+        }
+        anyhow::bail!("Chunk {} not found", crate::cas::hex_encode(hash))
+    }
+
+    /// Local-only read of a chunk's raw bytes; `None` if not in the index (no resolve).
+    fn read_chunk_raw_local(&self, hash: &ChunkHash) -> anyhow::Result<Option<Vec<u8>>> {
         let rtxn = self.db.begin_read()?;
         let table = rtxn.open_table(FS_CHUNKS)?;
-        let loc_bytes = table
-            .get(hash)?
-            .ok_or_else(|| anyhow::anyhow!("Chunk {} not found", crate::cas::hex_encode(hash)))?;
+        let Some(loc_bytes) = table.get(hash)? else {
+            return Ok(None);
+        };
         let loc = ChunkLocation::from_bytes(loc_bytes.value())?;
         let segments = self
             .segments
             .lock()
             .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        segments.read(&loc)
+        Ok(Some(segments.read(&loc)?))
     }
 
     /// Store a chunk **pulled from a peer** (#498 4c): verify its BLAKE3-128 identity
@@ -408,6 +443,27 @@ impl ArtifactPlane {
 
         if miss_indices.is_empty() {
             return Ok(results.into_iter().map(|r| r.unwrap()).collect());
+        }
+
+        // #498 4c (anchor B3 — a separate hook because this batch path bypasses B1):
+        // resolve any cache-missing chunk that is also absent from the local index (pull
+        // it from a peer + durably store), so the Phase-2 lookup finds it. Gated on a
+        // wired resolver — single-node skips this entirely (unchanged).
+        if self.chunk_resolver.get().is_some() {
+            let absent: Vec<ChunkHash> = {
+                let rtxn = self.db.begin_read()?;
+                let table = rtxn.open_table(FS_CHUNKS)?;
+                let mut absent = Vec::new();
+                for &idx in &miss_indices {
+                    if table.get(&hashes[idx])?.is_none() {
+                        absent.push(hashes[idx]);
+                    }
+                }
+                absent
+            };
+            for hash in &absent {
+                self.resolve_missing_chunk(hash);
+            }
         }
 
         // Phase 2: Look up ChunkLocations for all misses in one redb read txn
@@ -692,6 +748,83 @@ mod tests {
             !puller.has_chunk(&hash).unwrap(),
             "a rejected chunk is NEVER stored (AC-3)"
         );
+    }
+
+    // ── #498 4c: chunk anchors B1/B3 resolve a missing chunk via the wired resolver ──
+
+    /// Ingest `data` into a fresh source plane; return its first chunk's hash + raw bytes.
+    fn source_chunk(data: &[u8]) -> (ChunkHash, Vec<u8>, tempfile::TempDir) {
+        let (src, dir) = temp_plane();
+        let id = crate::ingest::commit_ingest({
+            let mut s = crate::ingest::begin_ingest(&src, "text/plain");
+            s.write(data);
+            s
+        })
+        .unwrap();
+        let hash = src.get_manifest(id).unwrap().unwrap()[0];
+        let raw = src.read_chunk_raw(&hash).unwrap();
+        (hash, raw, dir)
+    }
+
+    /// A resolver that "pulls" by storing a known raw chunk into the (Weak-referenced)
+    /// plane — Weak avoids an Arc cycle, exactly as the daemon wiring does.
+    struct PullChunk {
+        plane: std::sync::Weak<ArtifactPlane>,
+        hash: ChunkHash,
+        raw: Vec<u8>,
+    }
+    impl ChunkResolve for PullChunk {
+        fn ensure_chunk(&self, hash: &ChunkHash) -> bool {
+            hash == &self.hash
+                && self
+                    .plane
+                    .upgrade()
+                    .is_some_and(|p| p.store_pulled_chunk(&self.raw, &self.hash).is_ok())
+        }
+    }
+
+    fn target_plane() -> (Arc<ArtifactPlane>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let plane = Arc::new(ArtifactPlane::open(dir.path().join("target.redb")).unwrap());
+        (plane, dir)
+    }
+
+    #[test]
+    fn read_chunk_raw_b1_resolves_a_missing_chunk() {
+        let (hash, raw, _sd) = source_chunk(b"B1: a chunk only a peer holds until resolved");
+        let (plane, _td) = target_plane();
+        plane.set_chunk_resolver(Arc::new(PullChunk {
+            plane: Arc::downgrade(&plane),
+            hash,
+            raw: raw.clone(),
+        }));
+        assert!(!plane.has_chunk(&hash).unwrap(), "not local initially");
+        assert_eq!(plane.read_chunk_raw(&hash).unwrap(), raw, "B1 resolves the miss");
+        assert!(plane.has_chunk(&hash).unwrap(), "chunk is local after resolve");
+    }
+
+    #[test]
+    fn read_chunks_decompressed_b3_resolves_a_missing_chunk() {
+        let data = b"B3: a batch-read chunk only a peer holds until resolved";
+        let (hash, raw, _sd) = source_chunk(data);
+        let (plane, _td) = target_plane();
+        plane.set_chunk_resolver(Arc::new(PullChunk {
+            plane: Arc::downgrade(&plane),
+            hash,
+            raw,
+        }));
+        assert!(!plane.has_chunk(&hash).unwrap());
+        // The batch path (B3, bypasses B1) resolves the missing chunk then reads it.
+        let got = plane.read_chunks_decompressed(&[hash]).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], data, "B3 resolves + decompresses the missing chunk");
+    }
+
+    #[test]
+    fn read_chunk_raw_without_resolver_fails_on_a_miss_unchanged() {
+        let (plane, _td) = target_plane();
+        let absent = crate::chunker::blake3_hash_128(b"never stored");
+        assert!(plane.read_chunk_raw(&absent).is_err());
     }
 
     #[test]
