@@ -21,6 +21,10 @@ use crate::artifact::ChunkHash;
 /// Default negative-cache TTL: a block that failed to pull is not retried for this long.
 const DEFAULT_NEGATIVE_TTL: Duration = Duration::from_secs(5);
 
+/// Default pull-pin grace: a freshly-pulled block is GC-protected for this long, so the
+/// read that triggered the pull can register its reference before GC sees it as zero-ref.
+const DEFAULT_PIN_GRACE: Duration = Duration::from_secs(30);
+
 /// Local existence check for a block (no pull). Lets the resolver re-check after waiting
 /// on single-flight without coupling to a concrete store type (avoids an Arc cycle).
 pub trait BlockStore: Send + Sync {
@@ -78,6 +82,10 @@ pub struct BlockResolver {
     /// Recently-failed keys → when they failed (skip a re-pull within the TTL).
     negative: Mutex<HashMap<Key, Instant>>,
     negative_ttl: Duration,
+    /// Pull-pin (V9): recently-pulled keys → when pulled. GC must not delete a block in
+    /// this grace window (it was just fetched for an in-progress read).
+    recently_pulled: Mutex<HashMap<Key, Instant>>,
+    pin_grace: Duration,
 }
 
 impl BlockResolver {
@@ -88,7 +96,24 @@ impl BlockResolver {
             inflight: Mutex::new(HashMap::new()),
             negative: Mutex::new(HashMap::new()),
             negative_ttl: DEFAULT_NEGATIVE_TTL,
+            recently_pulled: Mutex::new(HashMap::new()),
+            pin_grace: DEFAULT_PIN_GRACE,
         }
+    }
+
+    /// Whether a blob was pulled recently enough to be pull-pinned (GC must keep it).
+    pub fn is_blob_pull_pinned(&self, hash: &[u8; 32]) -> bool {
+        self.is_pinned(&Key::Blob(*hash))
+    }
+
+    /// Whether a chunk was pulled recently enough to be pull-pinned (GC must keep it).
+    pub fn is_chunk_pull_pinned(&self, hash: &ChunkHash) -> bool {
+        self.is_pinned(&Key::Chunk(*hash))
+    }
+
+    fn is_pinned(&self, key: &Key) -> bool {
+        let pins = self.recently_pulled.lock().unwrap_or_else(|p| p.into_inner());
+        pins.get(key).is_some_and(|t| t.elapsed() < self.pin_grace)
     }
 
     #[cfg(test)]
@@ -143,6 +168,7 @@ impl BlockResolver {
             let ok = pull();
             if ok {
                 self.clear_negative(&key);
+                self.pin(key.clone()); // pull-pin: GC must keep it during the read window
             } else {
                 self.record_negative(key.clone());
             }
@@ -177,6 +203,13 @@ impl BlockResolver {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(key);
+    }
+
+    fn pin(&self, key: Key) {
+        self.recently_pulled
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key, Instant::now());
     }
 }
 
@@ -303,6 +336,21 @@ mod tests {
             state.blob_pulls.load(Ordering::SeqCst),
             2,
             "after the TTL the key is retried"
+        );
+    }
+
+    #[test]
+    fn a_freshly_pulled_block_is_pull_pinned() {
+        let (r, _state) = resolver(true);
+        assert!(!r.is_blob_pull_pinned(&[6; 32]), "not pinned before a pull");
+        assert!(r.ensure_blob(&[6; 32]));
+        assert!(
+            r.is_blob_pull_pinned(&[6; 32]),
+            "pull-pinned after a pull — GC must keep it during the read window (V9)"
+        );
+        assert!(
+            !r.is_blob_pull_pinned(&[99; 32]),
+            "an unrelated block is not pinned"
         );
     }
 }
