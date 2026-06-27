@@ -15,7 +15,7 @@ The implementation provides:
 - A bi-temporal redb graph with valid-time and transaction-time fact versions.
 - A Markdown memory file at `gaia-memory.md`.
 - A thin, confirmation-gated CLI binary named `sentinel-gaia-memory`.
-- Read-only rehydration from existing stores using public read APIs.
+- Read-only rehydration from existing stores using immutable SQLite reads for `events.db`/`projection.db` and the read-only Hippocampus store.
 - Crate-local export/restore of `gaia_console_memory.redb` and `gaia-memory.md`.
 - Read-only Hippocampus integration with no writes to agent tables.
 - No vector store, no embedding index, no ANN path, no copied event rows.
@@ -35,12 +35,14 @@ Gaia Console Memory has an exportable/restorable backup path through its own lib
 
 Rehydration is read-only and does not replay events:
 
-- `sentinel-limbo::EventStore::open_readonly` supplies event-store metadata only.
-- `sentinel-projection::ReadModelStore::open_readonly` supplies projection read models.
+- `events.db` is opened via SQLite URI `mode=ro&immutable=1` for metadata only.
+- `projection.db` is opened via SQLite URI `mode=ro&immutable=1` for projection read-model rows.
 - `sentinel-hippocampus::ReadOnlyHippocampusStore` supplies existing memory facts.
 - `gaia-memory.md` is read directly without creating or updating the file.
 
 The returned context records `events_replayed=0`, `event_rows_loaded=0`, and `event_copy_count=0`.
+
+The immutable SQLite path is intentionally stricter than the existing projection/event-store helper APIs for live verification: it avoids WAL/SHM side-file creation under `/opt/sentinel/data`. The tradeoff is that a live WAL-only latest projection row may be invisible until checkpointed, so this path proves safe read-only rehydration and graceful degradation rather than latest-read-model freshness.
 
 ## Main-Session TOGAF Work
 
@@ -50,4 +52,5 @@ Recommended TOGAF update, if the main session decides Cluster 04b should enumera
 - State that it is separate from deterministic `sentinel-gaia`, `gaia_json`, Voice-of-Gaia, and simulation snapshots.
 - State that backup is crate-local export/restore, not `WorldSnapshot`.
 - State that rehydration reads EventStore metadata, projection read models, Hippocampus memory, and the Markdown memory file without event replay or event copying.
+- State that the live verification path uses immutable read-only SQLite for `events.db` and `projection.db` to avoid WAL/SHM writes under the production data directory.
 - State that periodic backup scheduling remains an Ops/#442 integration concern.

@@ -22,15 +22,16 @@ Results:
 
 | Benchmark | Median | Range |
 | --- | ---: | ---: |
-| `gaia_console_memory.graph_insert_fact` | 6.4297 ms | 5.5221 ms - 7.6797 ms |
-| `gaia_console_memory.graph_query_current_1k` | 5.3586 us | 5.3151 us - 5.4137 us |
-| `gaia_console_memory.graph_supersede_fact` | 11.756 ms | 11.415 ms - 11.993 ms |
-| `gaia_console_memory.rehydrate_readonly_zero_replay` | 822.03 us | 821.46 us - 822.60 us |
+| `gaia_console_memory.graph_insert_fact` | 6.5244 ms | 5.2763 ms - 8.1790 ms |
+| `gaia_console_memory.graph_query_current_1k` | 5.2903 us | 5.2398 us - 5.3456 us |
+| `gaia_console_memory.graph_supersede_fact` | 11.592 ms | 11.169 ms - 11.892 ms |
+| `gaia_console_memory.rehydrate_readonly_zero_replay` | 554.99 us | 554.63 us - 555.42 us |
 
 Rehydration benchmark invariant:
 
-- Uses existing read paths only: `EventStore::open_readonly`, `ReadModelStore::open_readonly`, and read-only Hippocampus access.
+- Uses immutable read-only SQLite URI opens for `events.db` and `projection.db` so live verification does not create WAL/SHM side files under `/opt/sentinel/data`.
+- Uses read-only Hippocampus access.
 - Does not replay or copy event rows.
 - Asserts `events_replayed=0`, `event_rows_loaded=0`, and `event_copy_count=0` inside the benchmark loop.
 
-Raw output is committed under `console/evidence/issue-443-live/`.
+Evidence snippets and command output are committed under `console/evidence/issue-443-live/`.

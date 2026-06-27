@@ -4679,6 +4679,7 @@ dependencies = [
  "clap",
  "criterion 0.8.2",
  "redb",
+ "rusqlite",
  "sentinel-hippocampus",
  "sentinel-limbo",
  "sentinel-projection",

@@ -3,8 +3,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sentinel_limbo::EventStore;
-use sentinel_projection::ReadModelStore;
+use anyhow::Context;
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
 use crate::hippocampus_source::{read_hippocampus, HippocampusReadRequest, HippocampusWakeMemory};
@@ -134,28 +134,35 @@ fn read_event_store(path: &Path) -> EventStoreWakeSummary {
         };
     }
 
-    match EventStore::open_readonly(&path.to_string_lossy()) {
-        Ok(store) => {
+    match open_immutable_readonly(path) {
+        Ok(conn) => {
             let mut notes = Vec::new();
-            let event_count = match store.event_count() {
+            let event_count = match conn.query_row("SELECT COUNT(*) FROM events", [], |row| {
+                row.get::<_, i64>(0)
+            }) {
                 Ok(value) => Some(value),
                 Err(error) => {
                     notes.push(format!("event count read failed: {error}"));
                     None
                 }
             };
-            let latest_event_id = match store.get_latest_event_id() {
-                Ok(value) => Some(value),
-                Err(_) if event_count == Some(0) => {
-                    notes.push("empty event store latest id normalized to 0".to_string());
-                    Some(0)
-                }
-                Err(error) => {
-                    notes.push(format!("latest event id read failed: {error}"));
-                    None
-                }
-            };
-            notes.push("metadata-only read; no event rows loaded".to_string());
+            let latest_event_id =
+                match conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+                    row.get::<_, i64>(0)
+                }) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        notes.push(format!("latest event id read failed: {error}"));
+                        None
+                    }
+                };
+            notes.push(
+                "metadata-only immutable SQLite read; no event rows loaded or replayed".to_string(),
+            );
+            notes.push(
+                "schema assumption: events(id) exists; failure degrades to unavailable notes"
+                    .to_string(),
+            );
             EventStoreWakeSummary {
                 status: "ok".to_string(),
                 path: path.to_path_buf(),
@@ -185,36 +192,34 @@ fn read_projection(path: &Path, max_agents: usize) -> ProjectionWakeSummary {
         };
     }
 
-    match ReadModelStore::open_readonly(&path.to_string_lossy()) {
-        Ok(store) => {
+    match open_immutable_readonly(path) {
+        Ok(conn) => {
             let mut notes = Vec::new();
-            let active_agent_count = match store.active_agent_count() {
+            let active_agent_count = match conn.query_row(
+                "SELECT count(*) FROM agent_live_view WHERE status = 'active'",
+                [],
+                |row| row.get::<_, i64>(0),
+            ) {
                 Ok(value) => Some(value),
                 Err(error) => {
                     notes.push(format!("active agent count read failed: {error}"));
                     None
                 }
             };
-            let active_agents = match store.active_agents() {
-                Ok(agents) => agents
-                    .into_iter()
-                    .take(max_agents)
-                    .map(|agent| ProjectionAgentSummary {
-                        agent_id: agent.agent_id,
-                        name: agent.name,
-                        role: agent.role,
-                        status: agent.status,
-                        current_room: agent.current_room,
-                        mood: agent.mood,
-                        last_event_id: agent.last_event_id,
-                    })
-                    .collect(),
+            let active_agents = match read_active_projection_agents(&conn, max_agents) {
+                Ok(agents) => agents,
                 Err(error) => {
                     notes.push(format!("active agent read failed: {error}"));
                     Vec::new()
                 }
             };
-            notes.push("projection read used sentinel-projection public read APIs".to_string());
+            notes.push(
+                "projection read used immutable SQLite to avoid WAL side-file writes".to_string(),
+            );
+            notes.push(
+                "schema assumption: agent_live_view active-agent columns exist; failure degrades to unavailable notes"
+                    .to_string(),
+            );
             ProjectionWakeSummary {
                 status: "ok".to_string(),
                 path: path.to_path_buf(),
@@ -231,6 +236,50 @@ fn read_projection(path: &Path, max_agents: usize) -> ProjectionWakeSummary {
             notes: vec![format!("read-only open failed: {error}")],
         },
     }
+}
+
+fn open_immutable_readonly(path: &Path) -> anyhow::Result<Connection> {
+    let path = path
+        .to_str()
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
+    let uri = format!("file:{path}?mode=ro&immutable=1");
+    Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open immutable read-only SQLite at {path}"))
+}
+
+fn read_active_projection_agents(
+    conn: &Connection,
+    max_agents: usize,
+) -> anyhow::Result<Vec<ProjectionAgentSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT agent_id, name, role, status, current_room, mood, last_event_id
+         FROM agent_live_view
+         WHERE status = 'active'
+         ORDER BY agent_id
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![max_agents as i64], |row| {
+        Ok(ProjectionAgentSummary {
+            agent_id: row.get(0)?,
+            name: row.get(1)?,
+            role: row.get(2)?,
+            status: row.get(3)?,
+            current_room: row.get(4)?,
+            mood: row.get(5)?,
+            last_event_id: row.get(6)?,
+        })
+    })?;
+
+    let mut agents = Vec::new();
+    for row in rows {
+        agents.push(row?);
+    }
+    Ok(agents)
 }
 
 fn read_memory_file(path: &Path, max_bytes: usize) -> MemoryFileWakeSummary {
@@ -319,18 +368,46 @@ mod tests {
         let data_dir = dir.path();
 
         let event_store_path = data_dir.join(EVENTS_DB_FILE_NAME);
-        let event_store = EventStore::open(&event_store_path.to_string_lossy()).unwrap();
-        assert_eq!(event_store.event_count().unwrap(), 0);
+        {
+            let conn = rusqlite::Connection::open(&event_store_path).unwrap();
+            conn.execute(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+                [],
+            )
+            .unwrap();
+        }
 
         let projection_path = data_dir.join(PROJECTION_DB_FILE_NAME);
-        let projection = ReadModelStore::open(&projection_path.to_string_lossy()).unwrap();
         {
-            let txn = projection.begin_transaction().unwrap();
-            txn.begin().unwrap();
-            txn.upsert_agent(7, "Thomas", "Engineer", 1, "active", 10)
-                .unwrap();
-            txn.update_agent_room(7, "buero-dev-1", 11).unwrap();
-            txn.commit().unwrap();
+            let conn = rusqlite::Connection::open(&projection_path).unwrap();
+            conn.execute(
+                "CREATE TABLE agent_live_view (
+                    agent_id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    current_room TEXT,
+                    mood TEXT,
+                    last_event_id INTEGER NOT NULL DEFAULT 0
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_live_view
+                    (agent_id, name, role, status, current_room, mood, last_event_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    7,
+                    "Thomas",
+                    "Engineer",
+                    "active",
+                    "buero-dev-1",
+                    "Focused",
+                    11
+                ],
+            )
+            .unwrap();
         }
 
         let memory_file = GaiaConsoleMemoryFile::open_or_create(data_dir).unwrap();
