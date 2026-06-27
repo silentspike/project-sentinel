@@ -4671,6 +4671,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-gaia-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "clap",
+ "criterion 0.8.2",
+ "redb",
+ "rusqlite",
+ "sentinel-hippocampus",
+ "sentinel-limbo",
+ "sentinel-projection",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "sentinel-hippocampus"
 version = "0.1.0"
 dependencies = [
