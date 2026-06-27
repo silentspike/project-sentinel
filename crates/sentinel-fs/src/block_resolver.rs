@@ -33,8 +33,33 @@ pub trait BlockStore: Send + Sync {
 /// `true` if the block is local afterwards. Sync — the impl bridges to the async
 /// transport; it is never called while the resolver holds the inflight-map lock.
 pub trait RemotePull: Send + Sync {
-    fn pull_blob(&self, hash: &[u8; 32], size: u64) -> bool;
+    /// Pull a blob by hash. The impl resolves the full `BlockRef` (size + holders) from
+    /// the block map by hash itself — the read paths only know the hash.
+    fn pull_blob(&self, hash: &[u8; 32]) -> bool;
     fn pull_chunk(&self, hash: &ChunkHash) -> bool;
+}
+
+/// What a CAS read path calls to make a missing **blob** local (object-safe hook, so
+/// `CasStore` holds an `Arc<dyn BlobResolve>` without depending on the daemon).
+pub trait BlobResolve: Send + Sync {
+    fn ensure_blob(&self, hash: &[u8; 32]) -> bool;
+}
+
+/// What an artifact read path calls to make a missing **chunk** local.
+pub trait ChunkResolve: Send + Sync {
+    fn ensure_chunk(&self, hash: &ChunkHash) -> bool;
+}
+
+impl BlobResolve for BlockResolver {
+    fn ensure_blob(&self, hash: &[u8; 32]) -> bool {
+        BlockResolver::ensure_blob(self, hash)
+    }
+}
+
+impl ChunkResolve for BlockResolver {
+    fn ensure_chunk(&self, hash: &ChunkHash) -> bool {
+        BlockResolver::ensure_chunk(self, hash)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -73,8 +98,9 @@ impl BlockResolver {
     }
 
     /// Ensure a blob is available locally, pulling it if missing. Returns whether it is
-    /// local afterwards.
-    pub fn ensure_blob(&self, hash: &[u8; 32], size: u64) -> bool {
+    /// local afterwards. The read paths know only the hash; the `RemotePull` impl
+    /// resolves the size/holders from the block map.
+    pub fn ensure_blob(&self, hash: &[u8; 32]) -> bool {
         if self.store.has_blob(hash) {
             return true;
         }
@@ -82,7 +108,7 @@ impl BlockResolver {
         let remote = Arc::clone(&self.remote);
         let h = *hash;
         self.guarded(Key::Blob(h), &move || store.has_blob(&h), &move || {
-            remote.pull_blob(&h, size)
+            remote.pull_blob(&h)
         })
     }
 
@@ -180,7 +206,7 @@ mod tests {
 
     struct MockRemote(Arc<MockState>);
     impl RemotePull for MockRemote {
-        fn pull_blob(&self, hash: &[u8; 32], _size: u64) -> bool {
+        fn pull_blob(&self, hash: &[u8; 32]) -> bool {
             self.0.blob_pulls.fetch_add(1, Ordering::SeqCst);
             // Simulate a slow pull so concurrent callers pile up on the gate.
             std::thread::sleep(Duration::from_millis(20));
@@ -212,17 +238,17 @@ mod tests {
     fn local_hit_short_circuits_without_a_pull() {
         let (r, state) = resolver(true);
         state.present.lock().unwrap().insert([1; 32]);
-        assert!(r.ensure_blob(&[1; 32], 10));
+        assert!(r.ensure_blob(&[1; 32]));
         assert_eq!(state.blob_pulls.load(Ordering::SeqCst), 0, "no pull on a local hit");
     }
 
     #[test]
     fn miss_pulls_then_is_local() {
         let (r, state) = resolver(true);
-        assert!(r.ensure_blob(&[2; 32], 10));
+        assert!(r.ensure_blob(&[2; 32]));
         assert_eq!(state.blob_pulls.load(Ordering::SeqCst), 1);
         // A second resolve is a local hit now — no second pull.
-        assert!(r.ensure_blob(&[2; 32], 10));
+        assert!(r.ensure_blob(&[2; 32]));
         assert_eq!(state.blob_pulls.load(Ordering::SeqCst), 1);
     }
 
@@ -238,7 +264,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
-                r.ensure_blob(&[3; 32], 10)
+                r.ensure_blob(&[3; 32])
             }));
         }
         for h in handles {
@@ -254,10 +280,10 @@ mod tests {
     #[test]
     fn negative_cache_skips_a_re_pull_after_a_failure() {
         let (r, state) = resolver(false); // pulls always fail
-        assert!(!r.ensure_blob(&[4; 32], 10));
+        assert!(!r.ensure_blob(&[4; 32]));
         assert_eq!(state.blob_pulls.load(Ordering::SeqCst), 1);
         // Within the TTL, a second resolve does NOT hit the holder again.
-        assert!(!r.ensure_blob(&[4; 32], 10));
+        assert!(!r.ensure_blob(&[4; 32]));
         assert_eq!(
             state.blob_pulls.load(Ordering::SeqCst),
             1,
@@ -269,10 +295,10 @@ mod tests {
     fn negative_cache_expires_and_allows_a_retry() {
         let (r, state) = resolver(false);
         let r = r.with_negative_ttl(Duration::from_millis(10));
-        assert!(!r.ensure_blob(&[5; 32], 10));
+        assert!(!r.ensure_blob(&[5; 32]));
         assert_eq!(state.blob_pulls.load(Ordering::SeqCst), 1);
         std::thread::sleep(Duration::from_millis(25));
-        assert!(!r.ensure_blob(&[5; 32], 10));
+        assert!(!r.ensure_blob(&[5; 32]));
         assert_eq!(
             state.blob_pulls.load(Ordering::SeqCst),
             2,
