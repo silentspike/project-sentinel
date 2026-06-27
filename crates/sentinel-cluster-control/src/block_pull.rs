@@ -18,11 +18,23 @@
 //! layer, V28) before anything is published — a corrupt/tampered blob is rejected, never
 //! cached.
 
+use std::collections::HashSet;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use quinn::Endpoint;
 use sentinel_common::BlockRef;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Semaphore;
+use tracing::{debug, info, warn};
 
+use crate::cert::{CertFingerprint, NodeCertificate};
 use crate::envelope::{decode_frame, encode_frame, CodecError};
+use crate::tls::{peer_fingerprint, quic_server_config};
+
+/// Max concurrent block-pull streams served per pinned peer (per-node rate limit, V10).
+const MAX_INFLIGHT_PER_PEER: usize = 16;
 
 /// Pull one block by its content id. The server accepts **only** this (a `BlockRef`),
 /// never a path (V10).
@@ -131,6 +143,135 @@ pub fn encoded_read_bound(block_ref: &BlockRef) -> u64 {
     block_ref.size_bytes().saturating_add(1)
 }
 
+/// A source of blobs the block-pull server serves, addressed **only** by `BlockRef`
+/// (V10 — the server never maps anything but a content id to a path, never lists
+/// directories). Implementations return the raw on-disk **encoded** blob bytes, or
+/// `None` if the block is not held.
+pub trait BlockProvider: Send + Sync {
+    fn encoded_blob(&self, block_ref: &BlockRef) -> Option<Vec<u8>>;
+}
+
+/// Serve exactly one block-pull request on a `(recv, send)` stream pair: read the
+/// `BlockRef`, look it up via the provider, write the response. Returns the encoded
+/// bytes served (0 = miss). Stream-generic, so it is testable without a live QUIC peer.
+pub async fn handle_pull<R, W, P>(
+    recv: &mut R,
+    send: &mut W,
+    provider: &P,
+    peer: &str,
+) -> Result<usize, BlockPullError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    P: BlockProvider + ?Sized,
+{
+    let req = read_request(recv).await?;
+    let encoded = provider.encoded_blob(&req.block_ref);
+    let bytes = encoded.as_ref().map_or(0, Vec::len);
+    write_response(send, encoded.as_deref()).await?;
+    debug!(
+        peer,
+        block_ref = %req.block_ref,
+        bytes,
+        result = if bytes > 0 { "found" } else { "not_found" },
+        "#498 block-pull served"
+    );
+    Ok(bytes)
+}
+
+/// A running QUIC block-pull server. Reuses the cluster-control cert/TLS stack (V10
+/// pinned peers); each request carries only a `BlockRef`, never a path.
+pub struct BlockPullServer {
+    endpoint: Endpoint,
+    local_addr: SocketAddr,
+}
+
+impl BlockPullServer {
+    /// Bind a block-pull server on `bind_addr` with `node`'s identity, serving only
+    /// peers whose cert fingerprint is pinned, sourcing blobs from `provider`.
+    pub fn bind<P: BlockProvider + 'static>(
+        bind_addr: SocketAddr,
+        node: &NodeCertificate,
+        pinned_peers: HashSet<CertFingerprint>,
+        provider: Arc<P>,
+    ) -> anyhow::Result<Self> {
+        let server_cfg = quic_server_config(node)?;
+        let endpoint = Endpoint::server(server_cfg, bind_addr)?;
+        let local_addr = endpoint.local_addr()?;
+        let ep = endpoint.clone();
+        let pins = Arc::new(pinned_peers);
+        tokio::spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                let pins = pins.clone();
+                let provider = provider.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_pull_connection(incoming, pins, provider).await {
+                        warn!(error = %e, "#498 block-pull connection ended with error");
+                    }
+                });
+            }
+        });
+        info!(%local_addr, "#498 block-pull server listening");
+        Ok(Self {
+            endpoint,
+            local_addr,
+        })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Stop accepting + close existing connections.
+    pub fn close(&self) {
+        self.endpoint.close(0u32.into(), b"shutdown");
+    }
+}
+
+async fn serve_pull_connection<P: BlockProvider + 'static>(
+    incoming: quinn::Incoming,
+    pins: Arc<HashSet<CertFingerprint>>,
+    provider: Arc<P>,
+) -> anyhow::Result<()> {
+    let conn = incoming.await?;
+    // V10: enforce the cert pin post-handshake (same gate as the control server).
+    let fp = peer_fingerprint(&conn)?;
+    if !pins.contains(&fp) {
+        conn.close(1u32.into(), b"unpinned peer");
+        anyhow::bail!("rejected unpinned block-pull peer cert {fp}");
+    }
+    let peer = fp.to_hex();
+    // Per-node rate limit: bound the concurrent pull streams from this pinned peer.
+    let limiter = Arc::new(Semaphore::new(MAX_INFLIGHT_PER_PEER));
+    debug!(peer = %fp, "#498 block-pull peer accepted (pinned)");
+    loop {
+        match conn.accept_bi().await {
+            Ok((mut send, mut recv)) => {
+                let provider = provider.clone();
+                let limiter = limiter.clone();
+                let peer = peer.clone();
+                tokio::spawn(async move {
+                    let Ok(_permit) = limiter.acquire().await else {
+                        return;
+                    };
+                    if let Err(e) =
+                        handle_pull(&mut recv, &mut send, provider.as_ref(), &peer).await
+                    {
+                        debug!(error = %e, "#498 block-pull request stream error");
+                        return;
+                    }
+                    let _ = send.finish();
+                    let _ = send.stopped().await;
+                });
+            }
+            Err(quinn::ConnectionError::ApplicationClosed(_))
+            | Err(quinn::ConnectionError::LocallyClosed) => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +310,65 @@ mod tests {
         write_response(&mut wire, None).await.unwrap();
         let mut cur = Cursor::new(wire);
         assert_eq!(read_response(&mut cur, 1024).await.unwrap(), None);
+    }
+
+    struct OneBlock {
+        want: BlockRef,
+        encoded: Vec<u8>,
+    }
+    impl BlockProvider for OneBlock {
+        fn encoded_blob(&self, block_ref: &BlockRef) -> Option<Vec<u8>> {
+            (block_ref == &self.want).then(|| self.encoded.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_pull_serves_a_held_block_and_misses_an_unknown_one() {
+        let want = blob(3, 6);
+        let provider = OneBlock {
+            want: want.clone(),
+            encoded: vec![0u8, 1, 2, 3, 4, 5],
+        };
+
+        // Hit: the requested ref is held -> FOUND + the encoded bytes.
+        let mut req = Vec::new();
+        write_request(
+            &mut req,
+            &BlockPullRequest {
+                block_ref: want.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut resp = Vec::new();
+        let served = handle_pull(&mut Cursor::new(req), &mut resp, &provider, "test-peer")
+            .await
+            .unwrap();
+        assert_eq!(served, 6);
+        assert_eq!(
+            read_response(&mut Cursor::new(resp), 1024).await.unwrap(),
+            Some(vec![0u8, 1, 2, 3, 4, 5])
+        );
+
+        // Miss: an unknown ref -> NOT_FOUND, no path leak, no bytes.
+        let mut req2 = Vec::new();
+        write_request(
+            &mut req2,
+            &BlockPullRequest {
+                block_ref: blob(9, 6),
+            },
+        )
+        .await
+        .unwrap();
+        let mut resp2 = Vec::new();
+        let served2 = handle_pull(&mut Cursor::new(req2), &mut resp2, &provider, "test-peer")
+            .await
+            .unwrap();
+        assert_eq!(served2, 0);
+        assert_eq!(
+            read_response(&mut Cursor::new(resp2), 1024).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
