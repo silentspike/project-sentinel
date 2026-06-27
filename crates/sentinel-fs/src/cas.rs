@@ -8,7 +8,10 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use tracing::instrument;
+
+use crate::block_resolver::BlobResolve;
 
 /// Blob prefix: uncompressed raw data.
 const PREFIX_RAW: u8 = 0x00;
@@ -29,6 +32,10 @@ const MIN_COMPRESS_SIZE: usize = 256;
 /// atomic (temp file + rename) for crash safety.
 pub struct CasStore {
     cas_dir: PathBuf,
+    /// #498 4c (V9): set in cluster mode; on a local-read miss the CAS resolves the blob
+    /// by hash (pull from a peer + durable store), then retries. Unset = single-node, the
+    /// read path is unchanged.
+    resolver: OnceLock<Arc<dyn BlobResolve>>,
 }
 
 /// Statistics about the CAS store.
@@ -51,7 +58,16 @@ impl CasStore {
     pub fn open(data_dir: &Path) -> anyhow::Result<Self> {
         let cas_dir = data_dir.join("cas");
         fs::create_dir_all(&cas_dir)?;
-        Ok(Self { cas_dir })
+        Ok(Self {
+            cas_dir,
+            resolver: OnceLock::new(),
+        })
+    }
+
+    /// Wire the #498 4c block resolver (V9). Called once in cluster mode after the
+    /// resolver is built; a local-read miss then pulls the blob from a peer + retries.
+    pub fn set_resolver(&self, resolver: Arc<dyn BlobResolve>) {
+        let _ = self.resolver.set(resolver);
     }
 
     /// Compute SHA-256 hash of data.
@@ -99,13 +115,31 @@ impl CasStore {
         Ok((hash, false))
     }
 
-    /// Read and decode a blob by its hash.
+    /// Read and decode a blob by its hash. On a local miss with a #498 4c resolver wired
+    /// (cluster mode), the blob is pulled from a peer by hash + durably stored, then the
+    /// read is retried once (V9). Without a resolver this is the unchanged local read.
     #[instrument(skip(self), level = "trace")]
     pub fn read(&self, hash: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
         let blob_path = self.blob_path(hash);
-        let encoded =
-            fs::read(&blob_path).map_err(|e| anyhow::anyhow!("Blob {}: {e}", hex_encode(hash)))?;
+        let encoded = match fs::read(&blob_path) {
+            Ok(bytes) => bytes,
+            Err(miss) => {
+                if self.resolve_missing_blob(hash) {
+                    fs::read(&blob_path)
+                        .map_err(|e| anyhow::anyhow!("Blob {}: {e}", hex_encode(hash)))?
+                } else {
+                    return Err(anyhow::anyhow!("Blob {}: {miss}", hex_encode(hash)));
+                }
+            }
+        };
         decode_blob(&encoded)
+    }
+
+    /// #498 4c: ask the wired resolver to make a missing blob local (pull + verify +
+    /// durable store). Returns whether it is now local. No resolver → `false` (the read
+    /// fails locally as before).
+    fn resolve_missing_blob(&self, hash: &[u8; 32]) -> bool {
+        self.resolver.get().is_some_and(|r| r.ensure_blob(hash))
     }
 
     /// Remove a blob from the store. Returns true if it existed.
@@ -391,6 +425,48 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = CasStore::open(dir.path()).unwrap();
         (store, dir)
+    }
+
+    // ── #498 4c: cas.read resolves a missing blob via the wired resolver (V9) ──
+
+    #[test]
+    fn read_resolves_a_missing_blob_via_the_wired_resolver() {
+        // A resolver that "pulls" by durably storing the blob into the same CAS dir.
+        struct PullIntoDir {
+            dir: std::path::PathBuf,
+            data: Vec<u8>,
+        }
+        impl crate::block_resolver::BlobResolve for PullIntoDir {
+            fn ensure_blob(&self, _hash: &[u8; 32]) -> bool {
+                CasStore::open(&self.dir)
+                    .and_then(|c| c.store(&self.data))
+                    .is_ok()
+            }
+        }
+
+        let (store, dir) = temp_cas();
+        let data = b"a blob that lives only on a peer until the read resolves it";
+        let hash = CasStore::hash(data);
+        assert!(!store.contains(&hash), "not local initially");
+
+        store.set_resolver(Arc::new(PullIntoDir {
+            dir: dir.path().to_path_buf(),
+            data: data.to_vec(),
+        }));
+        // The read misses locally -> the resolver pulls+stores -> the retry hits.
+        assert_eq!(
+            store.read(&hash).unwrap(),
+            data,
+            "read resolves the missing blob"
+        );
+        assert!(store.contains(&hash), "blob is local after the resolve");
+    }
+
+    #[test]
+    fn read_without_a_resolver_fails_on_a_miss_unchanged() {
+        let (store, _dir) = temp_cas();
+        // No resolver wired (single-node) — a miss is the same local error as before.
+        assert!(store.read(&CasStore::hash(b"never stored")).is_err());
     }
 
     // ── #498 4b: durable pulled-blob publish + verify (V28) ──

@@ -44,7 +44,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::block_ref::BlockRef;
+use crate::block_ref::{BlockNamespace, BlockRef, HashAlgorithm};
 use crate::cluster::NodeId;
 
 /// What the map records about one node that advertises holding one block.
@@ -270,6 +270,23 @@ impl BlockMap {
             .collect();
         refs.sort_by_key(|r| r.to_string());
         refs
+    }
+
+    /// Find a known blob `BlockRef` (namespace `Blob`, SHA-256) whose digest matches
+    /// `hash`, among blocks with a present holder. The read paths know only the hash;
+    /// this recovers the full ref (size + namespace) the block-pull client needs (#498
+    /// 4c). `None` if no holder is known for that blob digest.
+    pub fn find_blob_ref(&self, hash: &[u8; 32]) -> Option<BlockRef> {
+        self.entries
+            .iter()
+            .filter(|(_, h)| h.values().any(|s| s.present))
+            .map(|(r, _)| r)
+            .find(|r| {
+                r.namespace() == BlockNamespace::Blob
+                    && r.algorithm() == HashAlgorithm::Sha256
+                    && r.digest() == hash
+            })
+            .cloned()
     }
 
     /// Drop slots whose `expires_after` is at or before `now` (logical units),

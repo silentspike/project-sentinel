@@ -7,6 +7,7 @@
 //! streaming read planner, and refcount GC for multi-chunk objects.
 
 pub mod artifact;
+pub mod block_resolver;
 pub mod cas;
 pub mod cas_holder;
 pub mod chunk_cache;

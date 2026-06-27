@@ -117,7 +117,12 @@ impl SegmentStore {
     }
 
     /// Read compressed chunk data from a segment.
-    pub fn read(&self, loc: &ChunkLocation) -> anyhow::Result<Vec<u8>> {
+    ///
+    /// `pub(crate)` (V9, #498 4c): reading raw bytes at a `ChunkLocation` is **below the
+    /// content hash** and would bypass the `BlockResolver` — so it is reachable only from
+    /// within `sentinel-fs` (today: the `ArtifactPlane` anchors B1/B3, which DO route
+    /// through the resolver). A cross-crate caller cannot bypass the resolver here.
+    pub(crate) fn read(&self, loc: &ChunkLocation) -> anyhow::Result<Vec<u8>> {
         let path = self.segment_path(loc.segment_id);
         let mut file = File::open(&path).map_err(|e| {
             anyhow::anyhow!(
@@ -138,7 +143,10 @@ impl SegmentStore {
     /// Uses io_uring when the `iouring` feature is enabled for reduced syscall
     /// overhead (one submission for N reads). Falls back to sequential pread()
     /// otherwise. Results are returned in the same order as `locations`.
-    pub fn read_batch(&self, locations: &[ChunkLocation]) -> Vec<anyhow::Result<Vec<u8>>> {
+    ///
+    /// `pub(crate)` (V9, #498 4c): below the content hash — reachable only within
+    /// `sentinel-fs` (the resolver-routed `ArtifactPlane` B3 anchor), no cross-crate bypass.
+    pub(crate) fn read_batch(&self, locations: &[ChunkLocation]) -> Vec<anyhow::Result<Vec<u8>>> {
         if locations.is_empty() {
             return Vec::new();
         }

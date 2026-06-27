@@ -1218,6 +1218,15 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         }
     }
 
+    // -- #498 4c: wire the blob resolver (V9) into the CAS read path (cluster mode only).
+    // On a FUSE read miss the CAS pulls the blob from a peer by hash + retries. Single-node
+    // has no control stream, so the resolver is never set and the read path is unchanged. --
+    if let (Some(cc), Some(fsl)) = (cluster_control.as_ref(), fs_layer.as_ref()) {
+        fsl.cas()
+            .set_resolver(cc.blob_resolver(data_dir.to_path_buf()));
+        info!("Cluster 12: #498 4c blob resolver wired into the CAS read path");
+    }
+
     // -- Zenoh Fan-Out Bridge (Events nach Limbo-Write auf Zenoh publizieren) --
     let fanout_capacity = config.zenoh.fanout_channel_capacity;
     let fanout_sender = if let Some(ref b) = bus {
