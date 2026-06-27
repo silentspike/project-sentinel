@@ -12,13 +12,23 @@
 //!   pull      <peer_addr> <peer_fp_hex> <blob_hash_hex> <size> <cert_dir> <dest_data_dir>
 //!   integrity <peer_addr> <peer_fp_hex> <blob_hash_hex> <size> <cert_dir>
 //!   bench     <peer_addr> <peer_fp_hex> <blob_hash_hex> <size> <cert_dir> <iters>
+//!   resolve   <peer_addr> <peer_fp_hex> <blob_hash_hex> <size> <cert_dir> <dest_data_dir>
 //! ```
+//!
+//! `resolve` is the PR3 (4c) AC: it wires a real `BlockResolver` (V9) into a fresh
+//! `CasStore` and drives the actual `CasStore::read` API — proving a read of a remote-only
+//! blob resolves on a miss (pull + verify + durable store + retry) and a second read is a
+//! local hit with no extra pull. This exercises the same resolver code the daemon wires in.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use sentinel_cluster_control::{BlockPullClient, CertFingerprint, NodeCertificate};
 use sentinel_common::BlockRef;
+use sentinel_fs::artifact::ChunkHash;
+use sentinel_fs::block_resolver::{BlobResolve, BlockResolver, BlockStore, RemotePull};
 use sentinel_fs::cas::CasStore;
 
 fn hex_decode_32(s: &str) -> [u8; 32] {
@@ -130,6 +140,104 @@ async fn main() {
             println!(
                 "BENCH pull-by-hash size={size} wire_bytes={wire} iters={iters}: {}",
                 summarize(pull_us)
+            );
+        }
+        "resolve" => {
+            // PR3 (4c) AC-6: drive the real CasStore::read API with a wired BlockResolver,
+            // proving a remote-only blob resolves on a read miss cross-VM (V9 read path).
+            let dest = a[7].clone();
+            let cas = Arc::new(CasStore::open(Path::new(&dest)).expect("dest cas"));
+            let cached_before = cas.contains(&hash);
+
+            // One bridge object that is both the resolver's local-existence `BlockStore` and
+            // its `RemotePull`: pull_blob block_on's the QUIC pull on a non-worker thread
+            // (mirrors the daemon's DaemonRemotePull / the FUSE sync read path), verifies +
+            // durably stores into a fresh CasStore over `dest` (stateless dir wrapper, no
+            // Arc cycle with the CasStore the resolver is wired into). Shared pull counter.
+            struct Resolve {
+                client: BlockPullClient,
+                peer_addr: std::net::SocketAddr,
+                peer_fp: CertFingerprint,
+                block_ref: BlockRef,
+                hash: [u8; 32],
+                size: u64,
+                dest: std::path::PathBuf,
+                handle: tokio::runtime::Handle,
+                pulls: AtomicUsize,
+            }
+            impl BlockStore for Resolve {
+                fn has_blob(&self, hash: &[u8; 32]) -> bool {
+                    CasStore::open(&self.dest).is_ok_and(|c| c.contains(hash))
+                }
+                fn has_chunk(&self, _hash: &ChunkHash) -> bool {
+                    false
+                }
+            }
+            impl RemotePull for Resolve {
+                fn pull_blob(&self, _hash: &[u8; 32]) -> bool {
+                    self.pulls.fetch_add(1, Ordering::Relaxed);
+                    let pulled = self.handle.block_on(self.client.pull(
+                        self.peer_addr,
+                        self.peer_fp,
+                        &self.block_ref,
+                    ));
+                    let Ok(Some(encoded)) = pulled else {
+                        return false;
+                    };
+                    let Ok(cas) = CasStore::open(&self.dest) else {
+                        return false;
+                    };
+                    cas.store_pulled_blob(&encoded, &self.hash, self.size)
+                        .is_ok()
+                }
+                fn pull_chunk(&self, _hash: &ChunkHash) -> bool {
+                    false
+                }
+            }
+
+            let bridge = Arc::new(Resolve {
+                client,
+                peer_addr,
+                peer_fp,
+                block_ref,
+                hash,
+                size,
+                dest: std::path::PathBuf::from(&dest),
+                handle: tokio::runtime::Handle::current(),
+                pulls: AtomicUsize::new(0),
+            });
+            let resolver = Arc::new(BlockResolver::new(
+                bridge.clone() as Arc<dyn BlockStore>,
+                bridge.clone() as Arc<dyn RemotePull>,
+            ));
+            cas.set_resolver(resolver as Arc<dyn BlobResolve>);
+
+            // The read must run off a runtime worker so the puller's block_on is legal — this
+            // is exactly the daemon's FUSE-thread design.
+            let read_cas = cas.clone();
+            let content = std::thread::spawn(move || read_cas.read(&hash))
+                .join()
+                .expect("read thread")
+                .expect("read resolves the remote-only blob");
+            let pulls_after_first = bridge.pulls.load(Ordering::Relaxed);
+            println!(
+                "RESOLVE ok: hash={} content_len={} cached_before={} pulls={}",
+                a[4],
+                content.len(),
+                cached_before,
+                pulls_after_first
+            );
+
+            // Second read of the now-local blob: a cache hit, no extra pull.
+            let read_cas2 = cas.clone();
+            let content2 = std::thread::spawn(move || read_cas2.read(&hash))
+                .join()
+                .expect("read thread 2")
+                .expect("second read");
+            println!(
+                "SECOND-READ content_len={} pulls={} (no extra pull)",
+                content2.len(),
+                bridge.pulls.load(Ordering::Relaxed)
             );
         }
         other => eprintln!("unknown mode {other:?}"),
