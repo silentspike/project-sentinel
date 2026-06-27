@@ -1,9 +1,12 @@
-//! Self-signed TLS-Cert (#431) — geteilt vom HTTPS-Server (axum) **und** dem WebTransport-Endpoint.
+//! Dashboard TLS certificate handling (#431/#473), shared by the HTTPS server
+//! and the WebTransport endpoint.
 //!
-//! TLS-Primaerpfad (Maintainer 2026-05-31): self-signed + Cert-Hash-Pinning über LAN-IP (wie #439).
-//! WebTransport `serverCertificateHashes` verlangt ein Cert mit Gueltigkeit <14 Tage → not_after = +13d.
-//! Der sha-256(DER)-Hash (base64) wird über `GET /api/cert-hash` ausgeliefert; der Browser pinnt ihn.
-//! (Optionaler CA-Cert-Pfad = eigenes Infra-Folge-Issue, netbird/AD-CS.)
+//! Zero-Config mode generates a 13-day self-signed certificate and exposes its
+//! SHA-256 hash through `GET /api/cert-hash` for WebTransport
+//! `serverCertificateHashes` pinning.
+//!
+//! Production mode loads deployer-provided PEM files and disables pinning by
+//! returning no certificate hash; the browser then uses normal CA validation.
 
 use std::path::{Path, PathBuf};
 
@@ -11,12 +14,12 @@ use anyhow::{bail, Context};
 use base64::Engine;
 use sha2::{Digest, Sha256};
 
-/// Pfade + Hash des geteilten self-signed Certs.
+/// Paths plus optional hash for the certificate shared by HTTPS and WebTransport.
 #[derive(Debug)]
 pub struct SharedCert {
     pub cert_pem_path: PathBuf,
     pub key_pem_path: PathBuf,
-    /// base64(sha-256(cert DER)) — fuer WebTransport `serverCertificateHashes`.
+    /// base64(sha-256(cert DER)) for WebTransport `serverCertificateHashes`.
     pub cert_hash_b64: Option<String>,
 }
 
