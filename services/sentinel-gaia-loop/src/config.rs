@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ALERTS_FILE_NAME, DEFAULT_CLAUDE_BIN, DEFAULT_CONSOLE_DIR, DEFAULT_EVENTS_DB,
     DEFAULT_HTTP_BIND, DEFAULT_MAX_BUDGET_USD, DEFAULT_MAX_TURNS, DEFAULT_NATS_URL,
-    DEFAULT_SENTINEL_CTL_BIN, DEFAULT_SENTINEL_GAIA_BIN, DEFAULT_SESSION_TIMEOUT_SECS,
-    SESSIONS_DIR_NAME, SESSION_INDEX_FILE_NAME, STATE_FILE_NAME,
+    DEFAULT_READINESS_SCAN_INTERVAL_SECS, DEFAULT_SENTINEL_CTL_BIN, DEFAULT_SENTINEL_GAIA_BIN,
+    DEFAULT_SESSION_TIMEOUT_SECS, SESSIONS_DIR_NAME, SESSION_INDEX_FILE_NAME, STATE_FILE_NAME,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -24,6 +24,7 @@ pub struct GaiaLoopConfig {
     pub max_budget_usd: f64,
     pub session_timeout_secs: u64,
     pub max_turns: u32,
+    pub readiness_scan_interval_secs: u64,
 }
 
 impl GaiaLoopConfig {
@@ -43,6 +44,10 @@ impl GaiaLoopConfig {
                 DEFAULT_SESSION_TIMEOUT_SECS,
             )?,
             max_turns: parse_env("SENTINEL_GAIA_MAX_TURNS", DEFAULT_MAX_TURNS)?,
+            readiness_scan_interval_secs: parse_env(
+                "SENTINEL_GAIA_SCAN_INTERVAL_SECS",
+                DEFAULT_READINESS_SCAN_INTERVAL_SECS,
+            )?,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -57,6 +62,9 @@ impl GaiaLoopConfig {
         }
         if self.max_turns == 0 {
             bail!("SENTINEL_GAIA_MAX_TURNS must be > 0");
+        }
+        if self.readiness_scan_interval_secs == 0 {
+            bail!("SENTINEL_GAIA_SCAN_INTERVAL_SECS must be > 0");
         }
         if self.max_turns != 1 {
             bail!(
@@ -74,6 +82,10 @@ impl GaiaLoopConfig {
 
     pub fn session_timeout(&self) -> Duration {
         Duration::from_secs(self.session_timeout_secs)
+    }
+
+    pub fn readiness_scan_interval(&self) -> Duration {
+        Duration::from_secs(self.readiness_scan_interval_secs)
     }
 
     pub fn claude_budget_args(&self) -> Vec<String> {
@@ -145,6 +157,7 @@ mod tests {
             max_budget_usd: DEFAULT_MAX_BUDGET_USD,
             session_timeout_secs: DEFAULT_SESSION_TIMEOUT_SECS,
             max_turns: DEFAULT_MAX_TURNS,
+            readiness_scan_interval_secs: DEFAULT_READINESS_SCAN_INTERVAL_SECS,
         }
     }
 
@@ -155,6 +168,10 @@ mod tests {
         assert!(cfg.max_budget_usd > 0.0);
         assert!(cfg.session_timeout().as_secs() > 0);
         assert!(cfg.max_turns > 0);
+        assert_eq!(
+            cfg.readiness_scan_interval().as_secs(),
+            DEFAULT_READINESS_SCAN_INTERVAL_SECS
+        );
         assert_eq!(cfg.claude_budget_args(), vec!["--max-budget-usd", "0.05",]);
     }
 
@@ -170,6 +187,9 @@ mod tests {
         cfg.max_turns = 0;
         assert!(cfg.validate().is_err());
         cfg.max_turns = 2;
+        assert!(cfg.validate().is_err());
+        cfg.max_turns = DEFAULT_MAX_TURNS;
+        cfg.readiness_scan_interval_secs = 0;
         assert!(cfg.validate().is_err());
     }
 

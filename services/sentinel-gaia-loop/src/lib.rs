@@ -20,6 +20,7 @@ pub const DEFAULT_SENTINEL_GAIA_BIN: &str = "/opt/sentinel/bin/sentinel-gaia";
 pub const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_MAX_TURNS: u32 = 1;
 pub const DEFAULT_MAX_BUDGET_USD: f64 = 0.05;
+pub const DEFAULT_READINESS_SCAN_INTERVAL_SECS: u64 = 60;
 pub const ALERTS_FILE_NAME: &str = "alerts.jsonl";
 pub const STATE_FILE_NAME: &str = "state.json";
 pub const SESSIONS_DIR_NAME: &str = "sessions";

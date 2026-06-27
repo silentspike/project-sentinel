@@ -9,6 +9,7 @@ echo "[init-dirs] Creating Sentinel directory structure..."
 
 # Main directories
 mkdir -p /opt/sentinel/{bin,config,data,logs}
+mkdir -p /opt/sentinel/data/gaia-console/sessions
 
 # RAM-backed directories (created here, mounted by init-tmpfs.sh)
 mkdir -p /ram/sentinel/{ecs,sessions,zenoh,bench}

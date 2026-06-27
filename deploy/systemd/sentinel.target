@@ -1,7 +1,7 @@
 [Unit]
 Description=Sentinel Simulation Stack
 Documentation=https://github.com/silentspike/project-sentinel/issues/28
-Wants=sentinel-daemon.service sentinel-gateway.service sentinel-dashboard-backend.service sentinel-projection.service sentinel-nightrun.timer nats-server.service sentinel-nats-bridge.service sentinel-judge.service sentinel-health-monitor.timer
+Wants=sentinel-daemon.service sentinel-gateway.service sentinel-dashboard-backend.service sentinel-projection.service sentinel-gaia-loop.service sentinel-nightrun.timer nats-server.service sentinel-nats-bridge.service sentinel-judge.service sentinel-health-monitor.timer
 
 [Install]
 WantedBy=multi-user.target
