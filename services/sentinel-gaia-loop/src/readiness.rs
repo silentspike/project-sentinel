@@ -9,6 +9,7 @@ use sentinel_common::DomainEventPayload;
 use sentinel_limbo::EventStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::time::{interval_at, Instant, MissedTickBehavior};
 use tracing::{info, warn};
 
 use crate::config::GaiaLoopConfig;
@@ -264,43 +265,74 @@ pub async fn run_readiness_loop(config: GaiaLoopConfig) -> Result<()> {
     info!(filter = NATS_EVENT_FILTER, "Gaia readiness loop subscribed");
 
     let mut messages = consumer.messages().await.context("open NATS messages")?;
-    while let Some(msg_result) = messages.next().await {
-        let msg = match msg_result {
-            Ok(msg) => msg,
-            Err(error) => {
-                warn!(%error, "Gaia readiness NATS message error");
-                continue;
+    let scan_every = config.readiness_scan_interval();
+    let mut scan_interval = interval_at(Instant::now() + scan_every, scan_every);
+    scan_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            msg_result = messages.next() => {
+                let Some(msg_result) = msg_result else {
+                    anyhow::bail!("Gaia readiness NATS message stream ended");
+                };
+                process_nats_message(&mut processor, msg_result).await;
             }
-        };
-        let source_event_id = nats_header(&msg, "X-Event-ID")
-            .unwrap_or_else(|| format!("nats:{}:{}", msg.subject, now_ms()));
-        let tick = nats_header(&msg, "X-Tick")
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
-        let timestamp_ms = now_ms();
-
-        match processor.process_nats_platform_analysis(
-            &source_event_id,
-            tick,
-            timestamp_ms,
-            msg.payload.as_ref(),
-        ) {
-            Ok(ReadinessOutcome::AlertCreated(alert)) => info!(
-                source_event_id = %alert.source_event_id,
-                trigger = %alert.trigger,
-                target = %alert.target,
-                "Gaia readiness alert persisted"
-            ),
-            Ok(ReadinessOutcome::DuplicateSkipped) => {}
-            Ok(ReadinessOutcome::Ignored) => {}
-            Err(error) => warn!(%error, "Gaia readiness event ignored"),
-        }
-
-        if let Err(error) = msg.ack().await {
-            warn!(%error, "Gaia readiness NATS ack failed");
+            _ = scan_interval.tick() => {
+                match processor.scan_event_store_once(&config.events_db.to_string_lossy(), 1_000) {
+                    Ok(summary) => info!(
+                        alerts_created = summary.alerts_created,
+                        duplicates_skipped = summary.duplicates_skipped,
+                        last_event_row_id = summary.last_event_row_id,
+                        "Gaia readiness scheduled scan complete"
+                    ),
+                    Err(error) => warn!(%error, "Gaia readiness scheduled scan skipped"),
+                }
+            }
         }
     }
-    anyhow::bail!("Gaia readiness NATS message stream ended")
+}
+
+async fn process_nats_message(
+    processor: &mut ReadinessProcessor,
+    msg_result: Result<
+        async_nats::jetstream::Message,
+        async_nats::jetstream::consumer::pull::MessagesError,
+    >,
+) {
+    let msg = match msg_result {
+        Ok(msg) => msg,
+        Err(error) => {
+            warn!(%error, "Gaia readiness NATS message error");
+            return;
+        }
+    };
+    let source_event_id = nats_header(&msg, "X-Event-ID")
+        .unwrap_or_else(|| format!("nats:{}:{}", msg.subject, now_ms()));
+    let tick = nats_header(&msg, "X-Tick")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let timestamp_ms = now_ms();
+
+    match processor.process_nats_platform_analysis(
+        &source_event_id,
+        tick,
+        timestamp_ms,
+        msg.payload.as_ref(),
+    ) {
+        Ok(ReadinessOutcome::AlertCreated(alert)) => info!(
+            source_event_id = %alert.source_event_id,
+            trigger = %alert.trigger,
+            target = %alert.target,
+            "Gaia readiness alert persisted"
+        ),
+        Ok(ReadinessOutcome::DuplicateSkipped) => {}
+        Ok(ReadinessOutcome::Ignored) => {}
+        Err(error) => warn!(%error, "Gaia readiness event ignored"),
+    }
+
+    if let Err(error) = msg.ack().await {
+        warn!(%error, "Gaia readiness NATS ack failed");
+    }
 }
 
 fn nats_header(msg: &async_nats::jetstream::Message, key: &str) -> Option<String> {
@@ -330,6 +362,7 @@ mod tests {
             max_budget_usd: crate::DEFAULT_MAX_BUDGET_USD,
             session_timeout_secs: crate::DEFAULT_SESSION_TIMEOUT_SECS,
             max_turns: crate::DEFAULT_MAX_TURNS,
+            readiness_scan_interval_secs: crate::DEFAULT_READINESS_SCAN_INTERVAL_SECS,
         }
     }
 

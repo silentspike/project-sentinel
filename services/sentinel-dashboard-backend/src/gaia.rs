@@ -147,6 +147,7 @@ fn gaia_loop_config(st: &AppState) -> anyhow::Result<GaiaLoopConfig> {
         max_budget_usd: st.config.gaia_max_budget_usd,
         session_timeout_secs: st.config.gaia_session_timeout_secs,
         max_turns: st.config.gaia_max_turns,
+        readiness_scan_interval_secs: sentinel_gaia_loop::DEFAULT_READINESS_SCAN_INTERVAL_SECS,
     };
     config.validate()?;
     Ok(config)

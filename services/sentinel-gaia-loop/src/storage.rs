@@ -127,6 +127,7 @@ mod tests {
             max_budget_usd: crate::DEFAULT_MAX_BUDGET_USD,
             session_timeout_secs: crate::DEFAULT_SESSION_TIMEOUT_SECS,
             max_turns: crate::DEFAULT_MAX_TURNS,
+            readiness_scan_interval_secs: crate::DEFAULT_READINESS_SCAN_INTERVAL_SECS,
         };
         (dir, AlertStore::from_config(&cfg))
     }

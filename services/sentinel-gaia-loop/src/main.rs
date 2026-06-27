@@ -90,6 +90,10 @@ fn print_config(json: bool) -> Result<()> {
         println!("max_budget_usd={}", cfg.max_budget_usd);
         println!("session_timeout_secs={}", cfg.session_timeout_secs);
         println!("max_turns={}", cfg.max_turns);
+        println!(
+            "readiness_scan_interval_secs={}",
+            cfg.readiness_scan_interval_secs
+        );
     }
     Ok(())
 }

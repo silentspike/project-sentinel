@@ -27,6 +27,13 @@ Environment=SENTINEL_PROJECTION_DB=/opt/sentinel/data/projection.db
 Environment=SENTINEL_EVENTS_DB=/opt/sentinel/data/events.db
 Environment=SENTINEL_DASHBOARD_BUNDLE_DIR=/opt/sentinel/console-dist
 Environment=SENTINEL_DASHBOARD_CERT_DIR=/opt/sentinel/console-cert
+Environment=SENTINEL_GAIA_CONSOLE_DIR=/opt/sentinel/data/gaia-console
+Environment=SENTINEL_GAIA_CLAUDE_BIN=claude
+Environment=SENTINEL_CTL_BIN=/opt/sentinel/bin/sentinel-ctl
+Environment=SENTINEL_GAIA_BIN=/opt/sentinel/bin/sentinel-gaia
+Environment=SENTINEL_GAIA_MAX_BUDGET_USD=0.05
+Environment=SENTINEL_GAIA_SESSION_TIMEOUT_SECS=120
+Environment=SENTINEL_GAIA_MAX_TURNS=1
 Environment=RUST_LOG=info
 Restart=on-failure
 RestartSec=5
@@ -39,9 +46,10 @@ SyslogIdentifier=sentinel-dashboard-backend
 # Security Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-# Projection-DB nur lesen (Backend oeffnet read-only); Cert-Dir schreiben (self-signed beim Start)
+# Projection-DB nur lesen (Backend oeffnet read-only); Cert-Dir schreiben
+# (self-signed beim Start); Gaia Console writes only explicit session streams.
 ReadOnlyPaths=/opt/sentinel/data /opt/sentinel/console-dist
-ReadWritePaths=/opt/sentinel/console-cert
+ReadWritePaths=/opt/sentinel/console-cert /opt/sentinel/data/gaia-console
 PrivateTmp=true
 
 [Install]

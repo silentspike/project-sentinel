@@ -353,8 +353,8 @@ mod tests {
     use super::*;
     use crate::{
         DEFAULT_CLAUDE_BIN, DEFAULT_EVENTS_DB, DEFAULT_HTTP_BIND, DEFAULT_MAX_BUDGET_USD,
-        DEFAULT_MAX_TURNS, DEFAULT_NATS_URL, DEFAULT_SENTINEL_CTL_BIN, DEFAULT_SENTINEL_GAIA_BIN,
-        DEFAULT_SESSION_TIMEOUT_SECS,
+        DEFAULT_MAX_TURNS, DEFAULT_NATS_URL, DEFAULT_READINESS_SCAN_INTERVAL_SECS,
+        DEFAULT_SENTINEL_CTL_BIN, DEFAULT_SENTINEL_GAIA_BIN, DEFAULT_SESSION_TIMEOUT_SECS,
     };
     use tempfile::TempDir;
 
@@ -371,6 +371,7 @@ mod tests {
             max_budget_usd: DEFAULT_MAX_BUDGET_USD,
             session_timeout_secs: DEFAULT_SESSION_TIMEOUT_SECS,
             max_turns: DEFAULT_MAX_TURNS,
+            readiness_scan_interval_secs: DEFAULT_READINESS_SCAN_INTERVAL_SECS,
         }
     }
 

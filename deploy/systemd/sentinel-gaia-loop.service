@@ -1,0 +1,37 @@
+[Unit]
+Description=Sentinel Gaia Console readiness loop (#442)
+Documentation=https://github.com/silentspike/project-sentinel/issues/442
+After=network-online.target nats-server.service sentinel-daemon.service
+Wants=network-online.target nats-server.service
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel-gaia-loop serve
+EnvironmentFile=-/opt/sentinel/config/gaia-loop.env
+Environment=SENTINEL_GAIA_CONSOLE_DIR=/opt/sentinel/data/gaia-console
+Environment=SENTINEL_EVENTS_DB=/opt/sentinel/data/events.db
+Environment=SENTINEL_NATS_URL=nats://127.0.0.1:4222
+Environment=SENTINEL_GAIA_SCAN_INTERVAL_SECS=60
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-gaia-loop
+
+# Security hardening: readiness is token-free and only writes Gaia Console files.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadOnlyPaths=/opt/sentinel/data
+ReadWritePaths=/opt/sentinel/data/gaia-console
+PrivateTmp=true
+
+[Install]
+WantedBy=sentinel.target

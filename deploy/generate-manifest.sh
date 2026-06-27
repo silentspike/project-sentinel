@@ -15,6 +15,9 @@ ARTIFACT_DEFS=(
   "target/release/sentinel-daemon|/opt/sentinel/bin/sentinel-daemon|binary"
   "target/release/sentinel-nightrun|/opt/sentinel/bin/sentinel-nightrun|binary"
   "target/release/sentinel-dashboard-backend|/opt/sentinel/bin/sentinel-dashboard-backend|binary"
+  "target/release/sentinel-gaia-loop|/opt/sentinel/bin/sentinel-gaia-loop|binary"
+  "target/release/sentinel-ctl|/opt/sentinel/bin/sentinel-ctl|binary"
+  "target/release/sentinel-gaia|/opt/sentinel/bin/sentinel-gaia|binary"
   "cmd/cortex-gateway/cortex-gateway|/opt/sentinel/bin/cortex-gateway|binary"
   "services/sentinel-judge/sentinel-judge|/opt/sentinel/bin/sentinel-judge|binary"
   "services/sentinel-nats-bridge/sentinel-nats-bridge|/opt/sentinel/bin/sentinel-nats-bridge|binary"
@@ -37,6 +40,7 @@ ARTIFACT_DEFS=(
   "deploy/systemd/sentinel-nightrun.service|/etc/systemd/system/sentinel-nightrun.service|systemd"
   "deploy/systemd/sentinel-nightrun.timer|/etc/systemd/system/sentinel-nightrun.timer|systemd"
   "deploy/systemd/sentinel-dashboard-backend.service|/etc/systemd/system/sentinel-dashboard-backend.service|systemd"
+  "deploy/systemd/sentinel-gaia-loop.service|/etc/systemd/system/sentinel-gaia-loop.service|systemd"
   "deploy/systemd/nats-server.service|/etc/systemd/system/nats-server.service|systemd"
   "deploy/systemd/sentinel.target|/etc/systemd/system/sentinel.target|systemd"
   # Init scripts
