@@ -714,7 +714,10 @@ mod tests {
         let raw = holder.read_chunk_raw(&hash).unwrap();
 
         let (puller, _p) = temp_plane();
-        assert!(!puller.has_chunk(&hash).unwrap(), "puller starts without it");
+        assert!(
+            !puller.has_chunk(&hash).unwrap(),
+            "puller starts without it"
+        );
         puller.store_pulled_chunk(&raw, &hash).unwrap();
         assert!(puller.has_chunk(&hash).unwrap(), "stored after verify");
         // The decompressed chunk on the puller matches the holder's.
@@ -799,8 +802,15 @@ mod tests {
             raw: raw.clone(),
         }));
         assert!(!plane.has_chunk(&hash).unwrap(), "not local initially");
-        assert_eq!(plane.read_chunk_raw(&hash).unwrap(), raw, "B1 resolves the miss");
-        assert!(plane.has_chunk(&hash).unwrap(), "chunk is local after resolve");
+        assert_eq!(
+            plane.read_chunk_raw(&hash).unwrap(),
+            raw,
+            "B1 resolves the miss"
+        );
+        assert!(
+            plane.has_chunk(&hash).unwrap(),
+            "chunk is local after resolve"
+        );
     }
 
     #[test]
