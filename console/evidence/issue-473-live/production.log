@@ -1,0 +1,14 @@
+mode=production
+base_url=https://localhost:8001
+ignore_https_errors=false
+headless=false
+profile_home=/tmp/issue-473-live/chromium-ca-home
+browser_executable=/home/ubuntu/.cache/ms-playwright/chromium-1228/chrome-linux64/chrome
+requested_browser_args=["--no-sandbox","--use-system-ca","--webtransport-developer-mode","--host-resolver-rules=MAP localhost 127.0.0.1"]
+certificate_bypass_requested=false
+[browser:verbose] [DOM] Password field is not contained in a form: (More info: https://goo.gl/9p2vKq) %o
+[browser:error] Failed to load resource: the server responded with a status of 404 ()
+warning_detected=false
+live_indicator="connected"
+cert_hash_json={"algorithm":"sha-256","hash":null}
+cert_hash_present=false

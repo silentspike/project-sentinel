@@ -30,7 +30,7 @@ async fn spawn_server_with_events(
 
     let dir = std::env::temp_dir().join(format!("wt-test-{}", uuid::Uuid::new_v4()));
     let cert = tls::generate(&dir, &["localhost", "127.0.0.1"]).unwrap();
-    let hash = cert.cert_hash_b64.clone();
+    let hash = cert.cert_hash_b64.clone().unwrap();
 
     let mut config = Config::from_env();
     config.dashboard_api_key = dashboard_api_key;

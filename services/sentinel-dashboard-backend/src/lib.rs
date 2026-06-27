@@ -54,6 +54,12 @@ pub struct Config {
     pub bundle_dir: String,
     /// `Secure`-Flag fuer das Session-Cookie (true bei HTTPS-Serving).
     pub cookie_secure: bool,
+    /// Production TLS certificate PEM path. When set with `tls_key_path`, pinning is disabled.
+    pub tls_cert_path: Option<String>,
+    /// Production TLS private key PEM path. Must be set together with `tls_cert_path`.
+    pub tls_key_path: Option<String>,
+    /// Operator-facing dashboard hostname for deployment docs/logging.
+    pub dashboard_hostname: Option<String>,
     /// base64(sha-256) des self-signed Server-Certs — fuer `GET /api/cert-hash` (leer bei CA-Cert).
     pub cert_hash_b64: Option<String>,
     /// NATS-Server-URL fuer den Event-Stream-Subscriber (#432), Default `nats://127.0.0.1:4222`.
@@ -79,10 +85,11 @@ pub struct Config {
 impl Config {
     /// Liest die Konfiguration aus der Umgebung (Defaults = lokale Single-VM-Deploy).
     pub fn from_env() -> Self {
-        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-        let env_parse = |k: &str, default: u64| -> u64 {
-            env(k).and_then(|v| v.parse().ok()).unwrap_or(default)
-        };
+        Self::from_env_values(|k| std::env::var(k).ok())
+    }
+
+    fn from_env_values(mut read_env: impl FnMut(&str) -> Option<String>) -> Self {
+        let mut env = |k: &str| read_env(k).filter(|v| !v.is_empty());
         let config_dir =
             env("SENTINEL_CONFIG_DIR").unwrap_or_else(|| "/opt/sentinel/config".into());
         // max_agents aus derselben daemon.toml wie der Daemon (Single-Source, kein Drift).
@@ -113,15 +120,24 @@ impl Config {
             cookie_secure: env("DASHBOARD_COOKIE_SECURE")
                 .map(|v| v != "off")
                 .unwrap_or(true),
+            tls_cert_path: env("SENTINEL_DASHBOARD_TLS_CERT"),
+            tls_key_path: env("SENTINEL_DASHBOARD_TLS_KEY"),
+            dashboard_hostname: env("SENTINEL_DASHBOARD_HOSTNAME"),
             cert_hash_b64: None,
             nats_url: env("SENTINEL_NATS_URL").unwrap_or_else(|| "nats://127.0.0.1:4222".into()),
             nats_consumer: env("SENTINEL_DASHBOARD_NATS_CONSUMER")
                 .unwrap_or_else(|| "dashboard-live".into()),
             config_dir,
             max_agents,
-            login_max_fails: env_parse("SENTINEL_DASHBOARD_LOGIN_MAX_FAILS", 5) as u32,
-            login_window_secs: env_parse("SENTINEL_DASHBOARD_LOGIN_WINDOW_SECS", 60),
-            login_block_secs: env_parse("SENTINEL_DASHBOARD_LOGIN_BLOCK_SECS", 300),
+            login_max_fails: env("SENTINEL_DASHBOARD_LOGIN_MAX_FAILS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5) as u32,
+            login_window_secs: env("SENTINEL_DASHBOARD_LOGIN_WINDOW_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+            login_block_secs: env("SENTINEL_DASHBOARD_LOGIN_BLOCK_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
         }
     }
 }
@@ -313,4 +329,54 @@ async fn cert_hash(
 /// GET /api/health — public service liveness probe for deploy smoke/monitoring.
 async fn health() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({ "status": "ok", "service": "sentinel-dashboard-backend" }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use std::collections::HashMap;
+
+    fn config_from(values: &[(&str, &str)]) -> Config {
+        let vars = values
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect::<HashMap<_, _>>();
+        Config::from_env_values(|k| vars.get(k).cloned())
+    }
+
+    #[test]
+    fn tls_env_defaults_to_zero_config() {
+        let config = config_from(&[]);
+        assert!(config.tls_cert_path.is_none());
+        assert!(config.tls_key_path.is_none());
+        assert!(config.dashboard_hostname.is_none());
+        assert!(config.cert_hash_b64.is_none());
+    }
+
+    #[test]
+    fn tls_env_reads_production_paths_and_hostname() {
+        let config = config_from(&[
+            (
+                "SENTINEL_DASHBOARD_TLS_CERT",
+                "/etc/sentinel/tls/fullchain.pem",
+            ),
+            (
+                "SENTINEL_DASHBOARD_TLS_KEY",
+                "/etc/sentinel/tls/privkey.pem",
+            ),
+            ("SENTINEL_DASHBOARD_HOSTNAME", "sentinel.example.com"),
+        ]);
+        assert_eq!(
+            config.tls_cert_path.as_deref(),
+            Some("/etc/sentinel/tls/fullchain.pem")
+        );
+        assert_eq!(
+            config.tls_key_path.as_deref(),
+            Some("/etc/sentinel/tls/privkey.pem")
+        );
+        assert_eq!(
+            config.dashboard_hostname.as_deref(),
+            Some("sentinel.example.com")
+        );
+    }
 }

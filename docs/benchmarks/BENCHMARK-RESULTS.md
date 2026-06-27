@@ -35,3 +35,41 @@ Rehydration benchmark invariant:
 - Asserts `events_replayed=0`, `event_rows_loaded=0`, and `event_copy_count=0` inside the benchmark loop.
 
 Evidence snippets and command output are committed under `console/evidence/issue-443-live/`.
+
+## Issue 473 - Dashboard TLS Modes
+
+Date: 2026-06-27
+
+Scope:
+
+- `sentinel-dashboard-backend` live on `ubuntu@10.0.0.240`
+- TLS handshake latency through `curl` `time_appconnect`
+- WebTransport connect latency through browser `WebTransport.ready`
+- Zero-Config mode with self-signed certificate hash pinning
+- Production mode with provided CA-signed certificate and no certificate hash pinning
+
+Infrastructure:
+
+- Build artifact: `cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- build -p sentinel-dashboard-backend --release`
+- Benchmark VM: `ubuntu@10.0.0.240`
+- `cargo-remote` was not used to execute benchmarks.
+- Browser for benchmark: Playwright 1.61.1, Chrome for Testing 149.0.7827.55.
+- Production test CA root was imported into `sql:/tmp/issue-473-live/chromium-ca-home/.pki/nssdb` and `/usr/local/share/ca-certificates/sentinel-issue473-root.crt`.
+- Production browser run used `--use-system-ca --webtransport-developer-mode` and did not use `ignoreHTTPSErrors` or `--ignore-certificate-errors`.
+- Zero-Config benchmark used `curl -k` and `ignore_https_errors=true` only to load the expected self-signed HTTPS origin; WebTransport still used `serverCertificateHashes`.
+
+Results:
+
+| Mode | Cert hash | TLS handshake p50 | TLS handshake p95 | WT connect p50 | WT connect p95 | Samples |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Zero-Config | present | 6.30 ms | 7.43 ms | 9.00 ms | 10.20 ms | 20 |
+| Production | null | 5.65 ms | 6.58 ms | 10.50 ms | 12.20 ms | 20 |
+
+Notes:
+
+- Zero-Config WebTransport max was `19537.40 ms` in the warm run while p95 stayed `10.20 ms`; raw JSON is kept in evidence.
+- Production WebTransport max was `12.30 ms`.
+- Production `/api/cert-hash` returned `{"algorithm":"sha-256","hash":null}`.
+- Production `curl --cacert /tmp/issue-473-live/production-ca/root.pem https://localhost:8001/api/health` returned HTTP 200.
+
+Evidence snippets, screenshots, setup scripts, and raw benchmark JSON are committed under `console/evidence/issue-473-live/`.
