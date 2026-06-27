@@ -335,7 +335,10 @@ mod tests {
         write_request(&mut wire, &req).await.unwrap();
         let mut cur = Cursor::new(wire);
         let back = read_request(&mut cur).await.unwrap();
-        assert_eq!(back, req, "the request (a BlockRef, never a path) survives the wire");
+        assert_eq!(
+            back, req,
+            "the request (a BlockRef, never a path) survives the wire"
+        );
     }
 
     #[tokio::test]

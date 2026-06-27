@@ -402,7 +402,9 @@ mod tests {
         let (holder, _h) = temp_cas();
         let data = b"distributed cas pull-by-hash content";
         let (hash, _) = holder.store(data).unwrap();
-        let encoded = holder.encoded_blob(&hash).expect("holder holds the encoded blob");
+        let encoded = holder
+            .encoded_blob(&hash)
+            .expect("holder holds the encoded blob");
 
         let (puller, _p) = temp_cas();
         assert!(!puller.contains(&hash), "puller starts without the blob");
@@ -410,7 +412,11 @@ mod tests {
             .store_pulled_blob(&encoded, &hash, data.len() as u64)
             .unwrap();
         assert!(puller.contains(&hash), "durably published after verify");
-        assert_eq!(puller.read(&hash).unwrap(), data, "content matches the holder");
+        assert_eq!(
+            puller.read(&hash).unwrap(),
+            data,
+            "content matches the holder"
+        );
     }
 
     #[test]
