@@ -8,7 +8,7 @@
 //! locally (the `RemotePull` impl does the pull+verify+store, #498 4b). The read then
 //! retries against the now-local store.
 //!
-//! Strangler (S3): wiring the resolver into a read path is **behaviour-preserving for a
+//! Strangler (S3): wiring the resolver into a read path is **behavior-preserving for a
 //! local hit** — it only adds a remote fallback on a miss, and only when a `RemotePull`
 //! (cluster mode) is present. Single-node prod resolves every read locally, unchanged.
 
@@ -112,7 +112,10 @@ impl BlockResolver {
     }
 
     fn is_pinned(&self, key: &Key) -> bool {
-        let pins = self.recently_pulled.lock().unwrap_or_else(|p| p.into_inner());
+        let pins = self
+            .recently_pulled
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         pins.get(key).is_some_and(|t| t.elapsed() < self.pin_grace)
     }
 
@@ -272,7 +275,11 @@ mod tests {
         let (r, state) = resolver(true);
         state.present.lock().unwrap().insert([1; 32]);
         assert!(r.ensure_blob(&[1; 32]));
-        assert_eq!(state.blob_pulls.load(Ordering::SeqCst), 0, "no pull on a local hit");
+        assert_eq!(
+            state.blob_pulls.load(Ordering::SeqCst),
+            0,
+            "no pull on a local hit"
+        );
     }
 
     #[test]

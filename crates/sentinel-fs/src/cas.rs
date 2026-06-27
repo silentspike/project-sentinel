@@ -139,9 +139,7 @@ impl CasStore {
     /// durable store). Returns whether it is now local. No resolver → `false` (the read
     /// fails locally as before).
     fn resolve_missing_blob(&self, hash: &[u8; 32]) -> bool {
-        self.resolver
-            .get()
-            .is_some_and(|r| r.ensure_blob(hash))
+        self.resolver.get().is_some_and(|r| r.ensure_blob(hash))
     }
 
     /// Remove a blob from the store. Returns true if it existed.
@@ -456,7 +454,11 @@ mod tests {
             data: data.to_vec(),
         }));
         // The read misses locally -> the resolver pulls+stores -> the retry hits.
-        assert_eq!(store.read(&hash).unwrap(), data, "read resolves the missing blob");
+        assert_eq!(
+            store.read(&hash).unwrap(),
+            data,
+            "read resolves the missing blob"
+        );
         assert!(store.contains(&hash), "blob is local after the resolve");
     }
 

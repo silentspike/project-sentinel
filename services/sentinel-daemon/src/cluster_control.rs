@@ -22,6 +22,8 @@ use sentinel_common::cluster::ControlPeer;
 use sentinel_common::{
     BlockMap, BlockNamespace, BlockRef, HashAlgorithm, HolderAdvertisement, NodeId,
 };
+use sentinel_fs::artifact::ChunkHash;
+use sentinel_fs::block_resolver::{BlockResolver, BlockStore, RemotePull};
 use sentinel_fs::cas::CasStore;
 use sentinel_fs::cas_holder::CasHolderState;
 use sentinel_redb::ClusterMetaStore;
@@ -83,6 +85,54 @@ impl BlockProvider for CasBlockProvider {
     fn encoded_blob(&self, block_ref: &BlockRef) -> Option<Vec<u8>> {
         let hash = blob_sha256_hash(block_ref)?;
         self.cas.encoded_blob(&hash)
+    }
+}
+
+/// A `BlockStore` (local existence check) over this node's CAS dir, for the #498 4c
+/// resolver. A fresh `CasStore` is a stateless dir wrapper, so this avoids an Arc cycle
+/// with the CAS the resolver is wired into.
+struct CasBlockStore {
+    data_dir: PathBuf,
+}
+
+impl BlockStore for CasBlockStore {
+    fn has_blob(&self, hash: &[u8; 32]) -> bool {
+        CasStore::open(&self.data_dir).is_ok_and(|c| c.contains(hash))
+    }
+    fn has_chunk(&self, _hash: &ChunkHash) -> bool {
+        false // the chunk plane is not in the daemon's FUSE read path (Track B / #548)
+    }
+}
+
+/// The #498 4c `RemotePull` for the daemon: bridges the (sync) read path to the (async)
+/// block-pull. `pull_blob` resolves the `BlockRef` (size) from the block map by hash, then
+/// `block_on`s [`ClusterControl::resolve_block`] (pull + verify + durable store). The CAS
+/// read path is the FUSE/sync side, so `block_on` does not run inside a tokio worker.
+struct DaemonRemotePull {
+    cluster: std::sync::Weak<ClusterControl>,
+    data_dir: PathBuf,
+    handle: tokio::runtime::Handle,
+}
+
+impl RemotePull for DaemonRemotePull {
+    fn pull_blob(&self, hash: &[u8; 32]) -> bool {
+        let Some(cc) = self.cluster.upgrade() else {
+            return false;
+        };
+        let block_ref = {
+            let map = cc.block_map.lock().unwrap_or_else(|p| p.into_inner());
+            map.find_blob_ref(hash)
+        };
+        let Some(block_ref) = block_ref else {
+            return false; // no known holder for this blob digest
+        };
+        let Ok(cas) = CasStore::open(&self.data_dir) else {
+            return false;
+        };
+        self.handle.block_on(cc.resolve_block(&cas, &block_ref))
+    }
+    fn pull_chunk(&self, _hash: &ChunkHash) -> bool {
+        false // chunk cross-node pull is wired when the chunk plane goes cross-node (#548)
     }
 }
 
@@ -259,6 +309,21 @@ impl ClusterControl {
             }
         }
         false
+    }
+
+    /// Build the #498 4c blob resolver (V9) for the daemon's CAS read path: local-or-pull
+    /// with single-flight + negative-cache + pull-pin, pulling missing blobs from a peer.
+    /// Injected via `CasStore::set_resolver` in cluster mode only (single-node unchanged).
+    pub fn blob_resolver(self: &Arc<Self>, data_dir: PathBuf) -> Arc<BlockResolver> {
+        let store: Arc<dyn BlockStore> = Arc::new(CasBlockStore {
+            data_dir: data_dir.clone(),
+        });
+        let remote: Arc<dyn RemotePull> = Arc::new(DaemonRemotePull {
+            cluster: Arc::downgrade(self),
+            data_dir,
+            handle: tokio::runtime::Handle::current(),
+        });
+        Arc::new(BlockResolver::new(store, remote))
     }
 
     /// #498 block-map gossip: push `advertisements` to **every** pinned peer (fan-out).
