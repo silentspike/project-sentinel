@@ -5,6 +5,8 @@
 
 pub mod config;
 pub mod prompts;
+pub mod readiness;
+pub mod storage;
 pub mod types;
 
 pub const DEFAULT_CONSOLE_DIR: &str = "/opt/sentinel/data/gaia-console";
