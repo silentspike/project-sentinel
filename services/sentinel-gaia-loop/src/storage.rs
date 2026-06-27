@@ -9,21 +9,11 @@ use serde::{Deserialize, Serialize};
 use crate::config::GaiaLoopConfig;
 use crate::types::GaiaAlert;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GaiaLoopState {
     pub last_event_row_id: i64,
     pub alerts_created: u64,
     pub last_alert_timestamp_ms: Option<u64>,
-}
-
-impl Default for GaiaLoopState {
-    fn default() -> Self {
-        Self {
-            last_event_row_id: 0,
-            alerts_created: 0,
-            last_alert_timestamp_ms: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

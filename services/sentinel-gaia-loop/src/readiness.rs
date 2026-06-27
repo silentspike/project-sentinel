@@ -61,7 +61,7 @@ pub struct ReadinessScanSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadinessOutcome {
-    AlertCreated(GaiaAlert),
+    AlertCreated(Box<GaiaAlert>),
     DuplicateSkipped,
     Ignored,
 }
@@ -202,7 +202,7 @@ impl ReadinessProcessor {
         self.state.alerts_created = self.state.alerts_created.saturating_add(1);
         self.state.last_alert_timestamp_ms = Some(alert.timestamp_ms);
         self.store.save_state(&self.state)?;
-        Ok(ReadinessOutcome::AlertCreated(alert))
+        Ok(ReadinessOutcome::AlertCreated(Box::new(alert)))
     }
 }
 
