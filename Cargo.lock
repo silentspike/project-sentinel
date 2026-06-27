@@ -4675,9 +4675,12 @@ name = "sentinel-gaia-loop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-nats",
  "clap",
+ "futures",
  "sentinel-common",
  "sentinel-gaia",
+ "sentinel-limbo",
  "serde",
  "serde_json",
  "tempfile",

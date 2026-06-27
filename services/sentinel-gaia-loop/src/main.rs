@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use sentinel_gaia_loop::config::GaiaLoopConfig;
+use sentinel_gaia_loop::readiness;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -21,12 +22,30 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Scan events.db once for operator escalations and persist console alerts.
+    ScanOnce {
+        /// Maximum number of events to read after the stored cursor.
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+    },
+    /// Run the token-light readiness watcher. This never spawns Claude.
+    Serve,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let cli = Cli::parse();
     match cli.command {
         Commands::Config { json } => print_config(json),
+        Commands::ScanOnce { limit } => scan_once(limit),
+        Commands::Serve => serve().await,
     }
 }
 
@@ -48,4 +67,16 @@ fn print_config(json: bool) -> Result<()> {
         println!("max_turns={}", cfg.max_turns);
     }
     Ok(())
+}
+
+fn scan_once(limit: usize) -> Result<()> {
+    let cfg = GaiaLoopConfig::from_env()?;
+    let summary = readiness::scan_once(&cfg, limit)?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+async fn serve() -> Result<()> {
+    let cfg = GaiaLoopConfig::from_env()?;
+    readiness::run_readiness_loop(cfg).await
 }
