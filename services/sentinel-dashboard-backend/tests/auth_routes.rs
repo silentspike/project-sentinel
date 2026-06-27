@@ -203,7 +203,13 @@ async fn authed_degraded_routes_return_200_not_503() {
 
 #[tokio::test]
 async fn cert_hash_stays_public() {
-    let app = build_app(test_state());
+    let mut state = test_state();
+    state.config = std::sync::Arc::new({
+        let mut config = (*state.config).clone();
+        config.cert_hash_b64 = Some("test-hash".into());
+        config
+    });
+    let app = build_app(state);
     let resp = app
         .oneshot(
             Request::builder()
@@ -216,4 +222,26 @@ async fn cert_hash_stays_public() {
     // cert-hash muss ohne Auth erreichbar bleiben (Browser braucht den Hash vor dem Login fuer das
     // WebTransport-`serverCertificateHashes`-Pinning).
     assert_eq!(resp.status(), StatusCode::OK, "cert-hash bleibt public");
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["hash"], "test-hash");
+}
+
+#[tokio::test]
+async fn cert_hash_can_be_null_for_provided_cert_mode() {
+    let app = build_app(test_state());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/cert-hash")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "cert-hash bleibt public");
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["hash"].is_null());
+    assert_eq!(json["algorithm"], "sha-256");
 }
