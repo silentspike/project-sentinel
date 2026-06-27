@@ -320,7 +320,11 @@ mod tests {
             &agent_name_to_id,
             &HashSet::new(),
         );
-        assert_eq!(baseline.len(), 1, "ohne Suppression muss die Stall-Regel feuern");
+        assert_eq!(
+            baseline.len(),
+            1,
+            "ohne Suppression muss die Stall-Regel feuern"
+        );
         assert!(matches!(
             baseline[0].side_effect,
             Some(PlatformSideEffect::RestartAgent(_))
