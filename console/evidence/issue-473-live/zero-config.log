@@ -1,0 +1,18 @@
+mode=zero-config
+base_url=https://127.0.0.1:8001
+ignore_https_errors=false
+headless=false
+profile_home=<default>
+browser_executable=/home/ubuntu/.cache/ms-playwright/chromium-1148/chrome-linux/chrome
+requested_browser_args=["--no-sandbox"]
+certificate_bypass_requested=false
+warning_detected=true
+warning_goto_error=page.goto: net::ERR_CERT_AUTHORITY_INVALID at https://127.0.0.1:8001/
+Call log:
+  - navigating to "https://127.0.0.1:8001/", waiting until "domcontentloaded"
+
+[browser:verbose] [DOM] Password field is not contained in a form: (More info: https://goo.gl/9p2vKq) %o
+[browser:error] Failed to load resource: the server responded with a status of 404 ()
+live_indicator="connected"
+cert_hash_json={"algorithm":"sha-256","hash":"IkypcOID1l04fZQUNupcbdHSLRllT/NUZLm6jSYiRyM="}
+cert_hash_present=true

@@ -1,0 +1,127 @@
+work_dir=/tmp/issue-473-live/production-ca
+nss_home=/tmp/issue-473-live/chromium-ca-home
+env_file=/opt/sentinel/config/dashboard-backend.env
+cert_dir=/opt/sentinel/console-cert/issue-473-production
+Certificate request self-signature ok
+subject=CN = 127.0.0.1
+root_cert=/tmp/issue-473-live/production-ca/root.pem
+installed_cert=/opt/sentinel/console-cert/issue-473-production/server.pem
+installed_key=/opt/sentinel/console-cert/issue-473-production/server.key
+nss_db=sql:/tmp/issue-473-live/chromium-ca-home/.pki/nssdb
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number:
+            30:5b:71:dc:ef:b7:d5:50:6e:f4:fd:b1:ab:31:a4:3e:
+            3a:44:fc:5a
+        Signature Algorithm: PKCS #1 SHA-256 With RSA Encryption
+        Issuer: "CN=Sentinel Issue 473 Test Root"
+        Validity:
+            Not Before: Sat Jun 27 17:55:08 2026
+            Not After : Tue Jun 24 17:55:08 2036
+        Subject: "CN=Sentinel Issue 473 Test Root"
+        Subject Public Key Info:
+            Public Key Algorithm: PKCS #1 RSA Encryption
+            RSA Public Key:
+                Modulus:
+                    cd:03:d5:d7:78:84:a9:96:b7:12:2a:f7:ca:c3:15:d7:
+                    df:d3:65:d7:c0:c6:90:53:39:ea:2e:6d:fd:bd:52:00:
+                    94:17:96:99:be:f3:52:08:af:bf:bf:d2:bb:df:04:8b:
+                    ef:bf:14:1f:3a:f6:6a:02:87:d1:5c:ad:18:a1:f6:a5:
+                    b2:63:74:e3:13:6a:e6:7a:53:f4:ca:e9:63:e8:31:78:
+                    e9:20:b1:6d:d8:62:39:75:d8:4d:fb:93:dc:3c:26:a2:
+                    2a:06:6c:0c:b5:fd:b3:ff:56:b9:e1:73:06:65:3f:dc:
+                    67:08:8b:a3:f0:1c:ba:e7:5c:00:d9:7d:48:81:7b:e4:
+                    45:35:1d:fc:6c:45:e5:87:00:44:8a:2f:5e:50:43:23:
+                    77:66:39:18:02:e9:c8:6f:f6:d3:8d:56:6a:83:7d:eb:
+                    d6:91:fa:12:8c:90:86:59:1d:64:4a:cc:dd:ef:52:94:
+                    f7:f6:30:cd:50:41:2b:14:02:0e:6a:81:d3:43:87:80:
+                    64:8b:f7:c9:1a:f8:ed:d1:44:14:98:2d:5b:06:1c:0f:
+                    d7:d7:c3:8b:d5:63:88:68:92:c7:51:98:88:c8:0e:3f:
+                    cc:25:a7:7c:d2:eb:db:a5:08:0b:f1:44:05:dd:e1:3b:
+                    54:b3:13:7a:8d:11:8c:b2:20:94:6c:19:0c:4b:e4:ed:
+                    cc:0b:59:a5:1f:b5:de:b0:61:d3:37:5a:82:0c:33:ce:
+                    52:a9:d7:b3:40:ad:cd:ef:3d:2d:8a:ee:93:ff:ae:36:
+                    6c:3f:39:f6:44:aa:a5:29:18:d3:1a:ec:ce:a6:11:b0:
+                    7d:21:7f:43:c3:9e:ac:ef:b4:cb:97:ad:5c:9a:5f:b5:
+                    18:7a:b2:cb:17:4d:af:f0:1f:5a:6e:6f:c6:97:24:27:
+                    07:2b:6b:9a:bb:d8:59:e8:ba:27:93:42:e7:93:00:00:
+                    9e:ab:60:a7:22:06:07:fb:06:c2:97:78:e4:f6:24:ae:
+                    67:c0:db:d2:5c:55:05:71:3d:c2:88:2a:e0:c5:a6:fe:
+                    6b:4f:72:32:48:d8:1a:b2:a6:5e:38:5a:db:c0:f1:44:
+                    9a:f5:2b:d6:5d:6f:d0:07:6a:41:de:52:c7:ea:31:2c:
+                    01:20:3b:8c:56:06:bc:cb:f0:4c:a3:28:fe:1a:2a:53:
+                    12:c0:2a:b6:35:23:24:80:6f:ea:80:71:34:24:71:d2:
+                    3b:87:ae:6a:ef:34:f6:30:be:f4:24:bd:79:89:fa:09:
+                    0e:84:dc:09:ea:db:c5:31:37:ae:3b:b0:c5:45:ea:3c:
+                    49:f2:9e:2b:11:aa:20:52:2d:f9:09:d3:31:7a:3c:2d:
+                    9a:55:a5:b7:94:50:4e:2c:fc:7f:9a:b6:ec:f3:70:7f
+                Exponent: 65537 (0x10001)
+        Signed Extensions:
+            Name: Certificate Subject Key ID
+            Data:
+                9c:22:5f:e5:c7:f0:33:51:f2:db:fa:88:64:62:63:c2:
+                4e:fd:9c:74
+
+            Name: Certificate Authority Key Identifier
+            Key ID:
+                9c:22:5f:e5:c7:f0:33:51:f2:db:fa:88:64:62:63:c2:
+                4e:fd:9c:74
+
+            Name: Certificate Basic Constraints
+            Critical: True
+            Data: Is a CA with no maximum path length.
+
+    Signature Algorithm: PKCS #1 SHA-256 With RSA Encryption
+    Signature:
+        a3:db:25:7a:f0:19:c5:03:7f:27:d5:14:c4:e2:ff:af:
+        f8:80:d0:b4:06:0d:8e:e2:81:0a:78:e6:7e:87:3d:8f:
+        50:96:64:a1:b2:22:cc:8d:d0:e0:da:5b:59:f7:08:1b:
+        cc:0b:9f:c6:69:01:dc:9a:5c:8d:94:63:33:67:0f:97:
+        e5:7c:13:3e:f2:6d:59:7a:6b:81:0f:61:d0:df:02:7d:
+        96:9b:bd:56:75:92:1c:19:f7:05:39:95:3b:3d:50:7e:
+        4d:9e:d7:ac:5c:f1:10:c1:65:d5:b7:a9:a4:39:06:8a:
+        71:94:7b:8c:40:c9:7f:05:f4:a9:8c:37:05:3d:03:15:
+        f1:f4:87:6f:33:22:3a:d3:79:0b:64:0e:d2:54:eb:09:
+        8c:c9:d5:49:51:03:b7:da:07:56:21:2d:fe:e3:b3:9e:
+        85:68:d1:b2:99:6f:7c:c4:ef:42:5f:36:52:2f:c9:02:
+        50:16:82:05:a6:cb:3a:13:f8:dd:8e:4f:e3:3a:b2:9a:
+        24:9c:eb:9c:4d:7b:17:87:77:ad:ff:96:28:a4:5d:32:
+        15:6a:5d:67:ed:72:7c:a7:2f:bf:12:6a:91:3b:83:ba:
+        61:53:48:02:6b:bc:fd:53:fc:cc:6e:9b:87:17:93:18:
+        1e:97:31:e2:01:88:69:fe:cd:30:5c:33:08:9d:45:27:
+        81:2c:68:7a:f0:66:c2:b3:66:46:55:ef:0c:6a:d4:6e:
+        3e:cd:a8:ed:76:8f:4c:4f:69:02:7e:fa:4a:5f:5e:8c:
+        9c:47:9e:51:de:d6:6b:e7:a3:7a:4e:ca:82:7d:3f:27:
+        94:e1:68:41:e9:7d:41:49:7d:be:6e:00:65:5d:54:4f:
+        c1:fa:ad:98:27:4c:92:15:b5:2f:3f:a4:d9:29:99:21:
+        88:88:54:e9:43:e2:bf:7b:ca:dd:79:3f:69:3b:f4:c0:
+        cd:49:54:60:1e:c1:ca:54:0b:05:29:a1:f8:d2:f3:17:
+        95:6b:9c:9b:95:bd:02:cb:2f:05:09:d2:25:b9:b4:7c:
+        21:5f:e6:c6:f6:a5:2d:96:fd:6d:91:61:72:e0:53:8c:
+        5b:ca:35:20:27:18:9a:87:3a:97:44:e4:d6:36:9a:c4:
+        b5:4b:8a:61:34:fa:8c:c4:1c:e9:26:3e:5c:2f:9e:d6:
+        f2:d5:9d:46:63:a1:59:c9:36:0e:d0:c3:2d:fe:bc:a9:
+        2c:44:e4:0d:f7:6f:0e:b8:c5:83:07:5e:68:a1:f1:7a:
+        8a:06:36:ae:8c:d0:4e:ec:0b:51:c9:ec:e2:09:b1:8f:
+        71:5e:89:44:8b:1f:bd:af:35:e2:34:a2:fe:a3:20:c7:
+        66:0d:55:9c:da:63:71:ef:ce:13:4e:2f:1e:74:06:3b
+    Fingerprint (SHA-256):
+        06:2F:D7:E9:04:2C:4A:F8:37:57:80:25:41:9D:92:14:D2:23:C6:C4:0C:7B:14:A9:69:89:BC:24:0A:6A:AC:38
+    Fingerprint (SHA1):
+        58:3D:DA:77:A8:CE:08:72:26:30:DC:32:C6:34:1C:CB:DD:08:43:03
+
+    Mozilla-CA-Policy: false (attribute missing)
+    Certificate Trust Flags:
+        SSL Flags:
+            Valid CA
+            Trusted CA
+        Email Flags:
+        Object Signing Flags:
+
+Updating certificates in /etc/ssl/certs...
+0 added, 0 removed; done.
+Running hooks in /etc/ca-certificates/update.d...
+done.
+system_root=/usr/local/share/ca-certificates/sentinel-issue473-root.crt
+/tmp/issue-473-live/production-ca/server.pem: OK
