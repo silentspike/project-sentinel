@@ -22,6 +22,7 @@ pub mod config;
 pub mod control;
 pub mod event_sub;
 pub mod events;
+pub mod gaia;
 pub mod metrics_extra;
 pub mod projection;
 pub mod tls;
@@ -80,6 +81,22 @@ pub struct Config {
     /// #474: block duration in seconds after the threshold is hit
     /// (`SENTINEL_DASHBOARD_LOGIN_BLOCK_SECS`, default 300).
     pub login_block_secs: u64,
+    /// Gaia Console data directory (#442), separate from deterministic sentinel-gaia config generation.
+    pub gaia_console_dir: String,
+    /// Claude Code binary used only for explicit Gaia Console deep/setup requests.
+    pub gaia_claude_bin: String,
+    /// sentinel-ctl binary exposed to explicit Gaia Console deep sessions through Bash.
+    pub gaia_sentinel_ctl_bin: String,
+    /// deterministic sentinel-gaia binary exposed only to setup-interview sessions.
+    pub gaia_sentinel_gaia_bin: String,
+    /// Hard Claude Code budget cap for explicit Gaia Console sessions.
+    pub gaia_max_budget_usd: f64,
+    /// Hard process timeout for explicit Gaia Console sessions.
+    pub gaia_session_timeout_secs: u64,
+    /// v1 stays single-turn through `claude -p`; values other than 1 fail config validation.
+    pub gaia_max_turns: u32,
+    /// Optional Claude Code model override for explicit Gaia Console sessions.
+    pub gaia_model: Option<String>,
 }
 
 impl Config {
@@ -138,6 +155,24 @@ impl Config {
             login_block_secs: env("SENTINEL_DASHBOARD_LOGIN_BLOCK_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
+            gaia_console_dir: env("SENTINEL_GAIA_CONSOLE_DIR")
+                .unwrap_or_else(|| sentinel_gaia_loop::DEFAULT_CONSOLE_DIR.into()),
+            gaia_claude_bin: env("SENTINEL_GAIA_CLAUDE_BIN")
+                .unwrap_or_else(|| sentinel_gaia_loop::DEFAULT_CLAUDE_BIN.into()),
+            gaia_sentinel_ctl_bin: env("SENTINEL_CTL_BIN")
+                .unwrap_or_else(|| sentinel_gaia_loop::DEFAULT_SENTINEL_CTL_BIN.into()),
+            gaia_sentinel_gaia_bin: env("SENTINEL_GAIA_BIN")
+                .unwrap_or_else(|| sentinel_gaia_loop::DEFAULT_SENTINEL_GAIA_BIN.into()),
+            gaia_max_budget_usd: env("SENTINEL_GAIA_MAX_BUDGET_USD")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(sentinel_gaia_loop::DEFAULT_MAX_BUDGET_USD),
+            gaia_session_timeout_secs: env("SENTINEL_GAIA_SESSION_TIMEOUT_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(sentinel_gaia_loop::DEFAULT_SESSION_TIMEOUT_SECS),
+            gaia_max_turns: env("SENTINEL_GAIA_MAX_TURNS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(sentinel_gaia_loop::DEFAULT_MAX_TURNS),
+            gaia_model: env("SENTINEL_GAIA_MODEL"),
         }
     }
 }
@@ -288,6 +323,17 @@ pub fn build_app(state: AppState) -> axum::Router {
             auth::require_auth,
         ));
 
+    let gaia_routes = axum::Router::new()
+        .route("/alerts", get(gaia::alerts))
+        .route("/sessions", get(gaia::sessions))
+        .route("/sessions/{id}/stream", get(gaia::session_stream))
+        .route("/deep", post(gaia::deep))
+        .route("/setup-interview", post(gaia::setup_interview))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+
     let api = axum::Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -308,7 +354,8 @@ pub fn build_app(state: AppState) -> axum::Router {
         .merge(read_routes)
         .nest("/control", control_routes)
         .nest("/operator", operator_routes)
-        .nest("/config", config_routes);
+        .nest("/config", config_routes)
+        .nest("/gaia", gaia_routes);
 
     axum::Router::new()
         .nest("/api", api)
