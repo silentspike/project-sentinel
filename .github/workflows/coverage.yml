@@ -24,6 +24,8 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          components: llvm-tools-preview
 
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
         with:
@@ -35,6 +37,13 @@ jobs:
           tool: cargo-tarpaulin
 
       - name: Generate coverage
+        # #599: --engine llvm (source-based coverage) instead of the default
+        # ptrace engine. All test binaries report `test result: ok` (0 failed)
+        # but the ptrace engine reports "Test failed during run" - a
+        # post-harness abnormal exit that ptrace flags while the test harness
+        # reports success. The llvm engine instruments at the source level
+        # (-Cinstrument-coverage) and does not trace process exits the same
+        # way; the `llvm-tools-preview` component is required for it.
         # Skips and tuning:
         # - --skip ac_10_02_bio_formulas: bio acceptance test flakes only
         #   under tarpaulin's instrumentation (passes locally + on cargo
@@ -45,7 +54,7 @@ jobs:
         # - --timeout 300 raises tarpaulin's per-test ceiling so the
         #   remaining slow-but-finite tests get headroom.
         run: |
-          cargo tarpaulin --workspace --timeout 300 --out xml \
+          cargo tarpaulin --workspace --engine llvm --timeout 300 --out xml \
             --output-dir target/coverage \
             -- --skip ac_10_02_bio_formulas --skip wasm_e2e
 
