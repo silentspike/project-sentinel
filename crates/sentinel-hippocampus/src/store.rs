@@ -3,7 +3,7 @@
 //! Separate database file (`hippocampus.redb`) from the main StateStore.
 //! 6 tables: episodes, narratives, facts, cache_state, goals, archive.
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::episode::Episode;
 use crate::facts::FactStore;
@@ -35,6 +35,13 @@ pub struct HippocampusStore {
     db: Database,
 }
 
+/// Read-only handle for existing hippocampus.redb files.
+///
+/// This does not create missing tables and cannot start write transactions.
+pub struct ReadOnlyHippocampusStore {
+    db: ReadOnlyDatabase,
+}
+
 impl HippocampusStore {
     /// Open or create the hippocampus store at the given path.
     ///
@@ -59,6 +66,11 @@ impl HippocampusStore {
         Ok(Self { db })
     }
 
+    /// Open an existing hippocampus store without write access.
+    pub fn open_readonly(path: &str) -> anyhow::Result<ReadOnlyHippocampusStore> {
+        ReadOnlyHippocampusStore::open(path)
+    }
+
     // === EPISODES ===
 
     /// Store episodes for an agent (overwrites existing).
@@ -80,16 +92,7 @@ impl HippocampusStore {
 
     /// Load episodes for an agent. Returns empty vec if none stored.
     pub fn load_episodes(&self, agent: &str) -> anyhow::Result<Vec<Episode>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(EPISODES)?;
-        match table.get(agent)? {
-            Some(guard) => {
-                let bytes: &[u8] = guard.value();
-                let episodes: Vec<Episode> = serde_json::from_slice(bytes)?;
-                Ok(episodes)
-            }
-            None => Ok(Vec::new()),
-        }
+        load_episodes_from(&self.db, agent)
     }
 
     /// Append episodes to an agent's existing list. Caps at 1000 live episodes per agent.
@@ -126,16 +129,7 @@ impl HippocampusStore {
 
     /// Load narrative state for an agent.
     pub fn load_narrative(&self, agent: &str) -> anyhow::Result<Option<NarrativeState>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(NARRATIVES)?;
-        match table.get(agent)? {
-            Some(guard) => {
-                let bytes: &[u8] = guard.value();
-                let state: NarrativeState = serde_json::from_slice(bytes)?;
-                Ok(Some(state))
-            }
-            None => Ok(None),
-        }
+        load_narrative_from(&self.db, agent)
     }
 
     // === FACTS ===
@@ -153,16 +147,7 @@ impl HippocampusStore {
 
     /// Load a fact by key.
     pub fn load_fact(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(FACTS)?;
-        match table.get(key)? {
-            Some(guard) => {
-                let bytes: &[u8] = guard.value();
-                let value = std::str::from_utf8(bytes)?;
-                Ok(Some(value.to_string()))
-            }
-            None => Ok(None),
-        }
+        load_fact_from(&self.db, key)
     }
 
     /// Delete a fact by key. Returns true if it existed.
@@ -292,16 +277,7 @@ impl HippocampusStore {
 
     /// Load archived episodes for an agent. Returns empty vec if none stored.
     pub fn load_archive(&self, agent: &str) -> anyhow::Result<Vec<Episode>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(ARCHIVE)?;
-        match table.get(agent)? {
-            Some(guard) => {
-                let bytes: &[u8] = guard.value();
-                let episodes: Vec<Episode> = serde_json::from_slice(bytes)?;
-                Ok(episodes)
-            }
-            None => Ok(Vec::new()),
-        }
+        load_archive_from(&self.db, agent)
     }
 
     /// Append episodes to an agent's archive. Caps at 1000 episodes per agent.
@@ -342,6 +318,91 @@ impl HippocampusStore {
             agents.push(key.value().to_string());
         }
         Ok(agents)
+    }
+}
+
+impl ReadOnlyHippocampusStore {
+    /// Open an existing hippocampus store in redb read-only mode.
+    pub fn open(path: &str) -> anyhow::Result<Self> {
+        let db = ReadOnlyDatabase::open(path).map_err(|e| {
+            anyhow::anyhow!("Failed to open hippocampus.redb read-only at {path}: {e}")
+        })?;
+        Ok(Self { db })
+    }
+
+    /// Load episodes for an agent. Returns empty vec if none stored.
+    pub fn load_episodes(&self, agent: &str) -> anyhow::Result<Vec<Episode>> {
+        load_episodes_from(&self.db, agent)
+    }
+
+    /// Load narrative state for an agent.
+    pub fn load_narrative(&self, agent: &str) -> anyhow::Result<Option<NarrativeState>> {
+        load_narrative_from(&self.db, agent)
+    }
+
+    /// Load a fact by key.
+    pub fn load_fact(&self, key: &str) -> anyhow::Result<Option<String>> {
+        load_fact_from(&self.db, key)
+    }
+
+    /// Load archived episodes for an agent. Returns empty vec if none stored.
+    pub fn load_archive(&self, agent: &str) -> anyhow::Result<Vec<Episode>> {
+        load_archive_from(&self.db, agent)
+    }
+}
+
+fn load_episodes_from<D: ReadableDatabase>(db: &D, agent: &str) -> anyhow::Result<Vec<Episode>> {
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(EPISODES)?;
+    match table.get(agent)? {
+        Some(guard) => {
+            let bytes: &[u8] = guard.value();
+            let episodes: Vec<Episode> = serde_json::from_slice(bytes)?;
+            Ok(episodes)
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+fn load_narrative_from<D: ReadableDatabase>(
+    db: &D,
+    agent: &str,
+) -> anyhow::Result<Option<NarrativeState>> {
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(NARRATIVES)?;
+    match table.get(agent)? {
+        Some(guard) => {
+            let bytes: &[u8] = guard.value();
+            let state: NarrativeState = serde_json::from_slice(bytes)?;
+            Ok(Some(state))
+        }
+        None => Ok(None),
+    }
+}
+
+fn load_fact_from<D: ReadableDatabase>(db: &D, key: &str) -> anyhow::Result<Option<String>> {
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(FACTS)?;
+    match table.get(key)? {
+        Some(guard) => {
+            let bytes: &[u8] = guard.value();
+            let value = std::str::from_utf8(bytes)?;
+            Ok(Some(value.to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+fn load_archive_from<D: ReadableDatabase>(db: &D, agent: &str) -> anyhow::Result<Vec<Episode>> {
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(ARCHIVE)?;
+    match table.get(agent)? {
+        Some(guard) => {
+            let bytes: &[u8] = guard.value();
+            let episodes: Vec<Episode> = serde_json::from_slice(bytes)?;
+            Ok(episodes)
+        }
+        None => Ok(Vec::new()),
     }
 }
 
@@ -818,5 +879,48 @@ mod tests {
         let mut agents = store.list_agents_with_archive().unwrap();
         agents.sort();
         assert_eq!(agents, vec!["Lisa", "Thomas"]);
+    }
+
+    #[test]
+    fn test_readonly_store_loads_existing_memory_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly-hippocampus.redb");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let store = HippocampusStore::open(path_str).unwrap();
+            store
+                .store_episodes("Thomas", &[make_episode(1, "Read episode")])
+                .unwrap();
+            store
+                .store_narrative(
+                    "Thomas",
+                    &NarrativeState {
+                        agent_name: "Thomas".to_string(),
+                        summary: "Read narrative".to_string(),
+                        episode_count: 1,
+                    },
+                )
+                .unwrap();
+            store.store_fact("facts/projects/aurora", "Aurora").unwrap();
+            store
+                .store_archive("Thomas", &[make_episode(2, "Archived read")])
+                .unwrap();
+        }
+
+        let readonly = HippocampusStore::open_readonly(path_str).unwrap();
+        assert_eq!(readonly.load_episodes("Thomas").unwrap().len(), 1);
+        assert_eq!(
+            readonly.load_narrative("Thomas").unwrap().unwrap().summary,
+            "Read narrative"
+        );
+        assert_eq!(
+            readonly
+                .load_fact("facts/projects/aurora")
+                .unwrap()
+                .as_deref(),
+            Some("Aurora")
+        );
+        assert_eq!(readonly.load_archive("Thomas").unwrap().len(), 1);
     }
 }
