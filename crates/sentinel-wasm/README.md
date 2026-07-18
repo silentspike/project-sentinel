@@ -18,7 +18,7 @@
 ## Dependencies
 
 - `sentinel-common`, `anyhow`, `serde`, `serde_json`, and `tracing`.
-- Optional `wasmtime 44.0.2` and `wasmtime-wasi 44.0.2` under the `wasm` feature.
+- Optional `wasmtime 45.0.3` and `wasmtime-wasi 45.0.3` under the `wasm` feature.
 
 ## Verify
 

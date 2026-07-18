@@ -59,22 +59,20 @@ pub fn verify_actions_from_cache(
                 }
                 updated.push(action);
             }
-            ActionStatus::Pending => {
-                // TTL-Check fuer nie-ausgefuehrte Actions
-                if current_tick > action.created_tick + action.ttl_ticks {
-                    action.status = ActionStatus::Expired;
-                    action.verify_outcome = Some(VerifyOutcome {
-                        tick: current_tick,
-                        success: false,
-                        reason: "Pending action TTL expired without execution".into(),
-                    });
-                    stats.expired += 1;
-                    warn!(
-                        action_id = %action.id,
-                        "Pending Action TTL abgelaufen"
-                    );
-                    updated.push(action);
-                }
+            // TTL-Check fuer nie-ausgefuehrte Actions
+            ActionStatus::Pending if current_tick > action.created_tick + action.ttl_ticks => {
+                action.status = ActionStatus::Expired;
+                action.verify_outcome = Some(VerifyOutcome {
+                    tick: current_tick,
+                    success: false,
+                    reason: "Pending action TTL expired without execution".into(),
+                });
+                stats.expired += 1;
+                warn!(
+                    action_id = %action.id,
+                    "Pending Action TTL abgelaufen"
+                );
+                updated.push(action);
             }
             _ => {} // Verified, RolledBack, Expired — nichts tun
         }
