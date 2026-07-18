@@ -73,3 +73,31 @@ Post-deploy readiness proof after two complete 60-second cycles:
 NATS is not installed on these test nodes. Both services log the expected
 degraded path, `NATS unavailable; continuing with scheduled EventStore scans
 only`, and then continue their read-only scheduled scans.
+
+## Post-CI-baseline rebuild readback
+
+After the lockfile security patches and Rust 1.95.0 pin were committed, the
+four release binaries were rebuilt remotely and redeployed to `.241/.242`.
+Their hashes remained identical to the final hashes above. Only
+`sentinel-gaia-loop` and `sentinel-dashboard-backend` were restarted; the
+daemon start timestamps remained `2026-06-27 17:20:52 UTC` on `.241` and
+`2026-06-27 17:21:26 UTC` on `.242`. `.240` was not contacted.
+
+```bash
+cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- build \
+  -p sentinel-gaia-loop -p sentinel-dashboard-backend \
+  -p sentinel-gaia -p sentinel-ctl --release
+```
+
+```text
+.241 services: gaia-loop=active dashboard=active daemon=active
+.242 services: gaia-loop=active dashboard=active daemon=active
+both: Claude Code 2.1.214 native ELF; node_present=no; npm_present=no
+
+.241 19:54:18 scheduled scan complete alerts_created=0 duplicates_skipped=0 last_event_row_id=1095428
+.241 19:55:18 scheduled scan complete alerts_created=0 duplicates_skipped=0 last_event_row_id=1095455
+.242 19:54:18 scheduled scan complete alerts_created=0 duplicates_skipped=0 last_event_row_id=291510
+.242 19:55:18 scheduled scan complete alerts_created=0 duplicates_skipped=0 last_event_row_id=291513
+
+both: claude_processes=0 gaia_panic_fatal=0 dashboard_panic_fatal=0
+```
