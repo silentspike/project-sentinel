@@ -99,6 +99,7 @@ impl ClaudeSessionRunner {
             "-p".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
+            "--verbose".to_string(),
             "--mcp-config".to_string(),
             EMPTY_MCP_CONFIG.to_string(),
             "--strict-mcp-config".to_string(),
@@ -383,6 +384,7 @@ mod tests {
         let args = runner.build_args(&request, "session-1", "prompt");
         assert!(args.contains(&"-p".to_string()));
         assert!(has_arg_pair(&args, "--output-format", "stream-json"));
+        assert!(args.contains(&"--verbose".to_string()));
         assert!(has_arg_pair(&args, "--mcp-config", EMPTY_MCP_CONFIG));
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         assert!(has_arg_pair(&args, "--tools", "Bash"));
