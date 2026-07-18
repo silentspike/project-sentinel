@@ -6,9 +6,10 @@ Worker PR scope: no TOGAF HTML edits and no `docs/gaia-console-architecture.md` 
 
 - Issue #442 adds `services/sentinel-gaia-loop`, a standalone Gaia Console runtime distinct from deterministic `services/sentinel-gaia` and from Voice-of-Gaia simulation input.
 - Readiness is token-free: it performs a read-only EventStore scan at startup and on `SENTINEL_GAIA_SCAN_INTERVAL_SECS`, subscribes to NATS `sentinel.events.platform_analysis.>`, writes console artifacts under `/opt/sentinel/data/gaia-console`, and never spawns Claude.
-- Explicit operator sessions are the only Claude path: `deep` and `setup-interview` run one `claude -p` turn with `--output-format stream-json`, `--max-budget-usd`, a process timeout, `--strict-mcp-config`, and Bash-only local tools.
+- Explicit operator sessions are the only Claude path: `deep` and `setup-interview` run one native Claude Code turn with `claude -p`, `--safe-mode`, `--output-format stream-json`, `--max-budget-usd`, a process timeout, `--strict-mcp-config`, `--permission-mode dontAsk`, closed stdin, and Bash-only local tools.
 - Deep mode exposes `sentinel-ctl` only through Bash. Mutating `sentinel-ctl` operations stay confirm-gated by the CLI.
-- Setup interview may also call deterministic `sentinel-gaia` to generate or validate setup artifacts. This is separate from the Gaia Console readiness loop.
+- The neutral system prompt injects bounded dynamic company knowledge from generated `company-context.md` as reference data, never as instructions.
+- Setup interview may also call deterministic `sentinel-gaia` to generate or validate setup artifacts. Its prompt carries the exact `GaiaSpec` JSON shape and enum spellings; a complete checklist leads to one `sentinel-gaia init --spec-json` call and an isolated daemon dry-run. This is separate from the Gaia Console readiness loop.
 - The dashboard backend only nests `/api/gaia/*` routes into the existing authenticated API surface. It does not change TLS/server setup.
 - The Solid console adds a `GaiaConsoleView` panel for persisted readiness alerts, session index rows, and raw stream-json session output.
 - This PR does not add a second autonomous healing loop and does not alter `llm_analyzer`, the ECS tick loop, or `WorldSnapshot`.
@@ -20,4 +21,4 @@ Update Cluster 04b / Gaia Console wording in both TOGAF copies, language-separat
 - EN repo copy: `docs/architecture/togaf-architecture-guide.html`
 - DE SSOT copy: `/home/jan/togaf-llm-architecture-guide.html`
 
-The update should describe Gaia Console readiness as token-free/subscription-and-scan based, and explicit Deep/Setup sessions as budget/timeout-capped Claude Code invocations initiated by an operator.
+The update should describe Gaia Console readiness as token-free/subscription-and-scan based, and explicit Deep/Setup sessions as safe-mode, budget/timeout-capped native Claude Code invocations initiated by an operator. Live accepted-session costs were USD 0.0206505 for the two-turn Deep/resume flow, USD 0.0197928 for complete Setup generation, and USD 0.004407 for the dashboard stream proof.

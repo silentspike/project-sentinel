@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use sentinel_gaia_loop::config::GaiaLoopConfig;
 use sentinel_gaia_loop::readiness;
 use sentinel_gaia_loop::session::{ClaudeSessionRunner, GaiaSessionRequest};
+use sentinel_gaia_loop::types::GaiaSessionStatus;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -86,10 +87,13 @@ fn print_config(json: bool) -> Result<()> {
         println!("claude_bin={}", cfg.claude_bin.display());
         println!("sentinel_ctl_bin={}", cfg.sentinel_ctl_bin.display());
         println!("sentinel_gaia_bin={}", cfg.sentinel_gaia_bin.display());
+        println!(
+            "company_context_path={}",
+            cfg.company_context_path.display()
+        );
         println!("model={}", cfg.model.as_deref().unwrap_or(""));
         println!("max_budget_usd={}", cfg.max_budget_usd);
         println!("session_timeout_secs={}", cfg.session_timeout_secs);
-        println!("max_turns={}", cfg.max_turns);
         println!(
             "readiness_scan_interval_secs={}",
             cfg.readiness_scan_interval_secs
@@ -115,5 +119,12 @@ async fn run_session(request: GaiaSessionRequest) -> Result<()> {
     let runner = ClaudeSessionRunner::new(cfg);
     let run = runner.run(request).await?;
     println!("{}", serde_json::to_string_pretty(&run)?);
+    if run.entry.status != GaiaSessionStatus::Succeeded {
+        bail!(
+            "Claude Code session {} ended with status {:?}",
+            run.entry.gaia_session_id,
+            run.entry.status
+        );
+    }
     Ok(())
 }

@@ -4681,7 +4681,6 @@ dependencies = [
  "clap",
  "futures",
  "sentinel-common",
- "sentinel-gaia",
  "sentinel-limbo",
  "serde",
  "serde_json",

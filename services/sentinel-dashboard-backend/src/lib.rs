@@ -89,12 +89,12 @@ pub struct Config {
     pub gaia_sentinel_ctl_bin: String,
     /// deterministic sentinel-gaia binary exposed only to setup-interview sessions.
     pub gaia_sentinel_gaia_bin: String,
+    /// Generated company context injected as reference data into explicit Gaia sessions.
+    pub gaia_company_context_path: String,
     /// Hard Claude Code budget cap for explicit Gaia Console sessions.
     pub gaia_max_budget_usd: f64,
     /// Hard process timeout for explicit Gaia Console sessions.
     pub gaia_session_timeout_secs: u64,
-    /// v1 stays single-turn through `claude -p`; values other than 1 fail config validation.
-    pub gaia_max_turns: u32,
     /// Optional Claude Code model override for explicit Gaia Console sessions.
     pub gaia_model: Option<String>,
 }
@@ -163,15 +163,14 @@ impl Config {
                 .unwrap_or_else(|| sentinel_gaia_loop::DEFAULT_SENTINEL_CTL_BIN.into()),
             gaia_sentinel_gaia_bin: env("SENTINEL_GAIA_BIN")
                 .unwrap_or_else(|| sentinel_gaia_loop::DEFAULT_SENTINEL_GAIA_BIN.into()),
+            gaia_company_context_path: env("SENTINEL_GAIA_COMPANY_CONTEXT")
+                .unwrap_or_else(|| sentinel_gaia_loop::DEFAULT_COMPANY_CONTEXT_PATH.into()),
             gaia_max_budget_usd: env("SENTINEL_GAIA_MAX_BUDGET_USD")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(sentinel_gaia_loop::DEFAULT_MAX_BUDGET_USD),
             gaia_session_timeout_secs: env("SENTINEL_GAIA_SESSION_TIMEOUT_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(sentinel_gaia_loop::DEFAULT_SESSION_TIMEOUT_SECS),
-            gaia_max_turns: env("SENTINEL_GAIA_MAX_TURNS")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(sentinel_gaia_loop::DEFAULT_MAX_TURNS),
             gaia_model: env("SENTINEL_GAIA_MODEL"),
         }
     }

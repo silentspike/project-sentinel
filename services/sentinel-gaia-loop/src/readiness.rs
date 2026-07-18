@@ -428,10 +428,10 @@ mod tests {
             claude_bin: crate::DEFAULT_CLAUDE_BIN.into(),
             sentinel_ctl_bin: crate::DEFAULT_SENTINEL_CTL_BIN.into(),
             sentinel_gaia_bin: crate::DEFAULT_SENTINEL_GAIA_BIN.into(),
+            company_context_path: crate::DEFAULT_COMPANY_CONTEXT_PATH.into(),
             model: None,
             max_budget_usd: crate::DEFAULT_MAX_BUDGET_USD,
             session_timeout_secs: crate::DEFAULT_SESSION_TIMEOUT_SECS,
-            max_turns: crate::DEFAULT_MAX_TURNS,
             readiness_scan_interval_secs: crate::DEFAULT_READINESS_SCAN_INTERVAL_SECS,
         }
     }

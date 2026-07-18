@@ -3,14 +3,21 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use sentinel_gaia::{CompanyType, CultureSpec, GaiaSpec, ShiftModel};
+use sentinel_gaia::{CompanyType, CultureSpec, DepartmentSpec, GaiaSpec, ShiftModel};
 
 fn gaia_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_sentinel-gaia"))
 }
 
 fn write_spec(root: &Path, agent_count: u16) -> PathBuf {
-    let spec = GaiaSpec {
+    let spec = test_spec(agent_count);
+    let path = root.join("spec.toml");
+    fs::write(&path, toml::to_string_pretty(&spec).unwrap()).unwrap();
+    path
+}
+
+fn test_spec(agent_count: u16) -> GaiaSpec {
+    GaiaSpec {
         company_name: "CLI Test GmbH".to_string(),
         company_type: CompanyType::SoftwareAgency,
         city: "Nuernberg".to_string(),
@@ -21,10 +28,62 @@ fn write_spec(root: &Path, agent_count: u16) -> PathBuf {
         time_scale: 1.0,
         departments: Vec::new(),
         culture: CultureSpec::default(),
-    };
-    let path = root.join("spec.toml");
-    fs::write(&path, toml::to_string_pretty(&spec).unwrap()).unwrap();
-    path
+    }
+}
+
+#[test]
+fn init_from_inline_json_writes_valid_configs() {
+    let temp = tempfile::tempdir().unwrap();
+    let output_dir = temp.path().join("config");
+    let mut spec = test_spec(4);
+    spec.departments = vec![DepartmentSpec {
+        name: "Operations".to_string(),
+        weight: 1,
+        roles: vec!["Operator".to_string()],
+    }];
+
+    let init = Command::new(gaia_bin())
+        .arg("init")
+        .arg("--spec-json")
+        .arg(serde_json::to_string(&spec).unwrap())
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .arg("--yes")
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&init.stdout).unwrap();
+    assert_eq!(summary["agents"], 4);
+    assert!(output_dir.join("gaia-spec.toml").exists());
+    assert!(output_dir.join("company-context.md").exists());
+}
+
+#[test]
+fn init_from_inline_json_rejects_unknown_fields() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut value = serde_json::to_value(test_spec(4)).unwrap();
+    value["mission"] = serde_json::json!("misplaced mission");
+
+    let init = Command::new(gaia_bin())
+        .arg("init")
+        .arg("--spec-json")
+        .arg(value.to_string())
+        .arg("--output-dir")
+        .arg(temp.path().join("config"))
+        .arg("--yes")
+        .output()
+        .unwrap();
+
+    assert!(!init.status.success());
+    assert!(
+        String::from_utf8_lossy(&init.stderr).contains("GaiaSpec contains unknown fields: mission")
+    );
 }
 
 #[test]

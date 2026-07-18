@@ -16,7 +16,6 @@ path = "src/main.rs"
 
 [dependencies]
 sentinel-common = { path = "../../crates/sentinel-common" }
-sentinel-gaia = { path = "../sentinel-gaia" }
 sentinel-limbo = { path = "../../crates/sentinel-limbo" }
 anyhow = { workspace = true }
 async-nats = { workspace = true }
