@@ -293,7 +293,7 @@ export interface PlatformState {
   [key: string]: unknown;
 }
 
-// #442 Gaia Console Memory Loop and explicit Claude session surfaces.
+// #442 Gaia Console readiness loop and explicit Claude session surfaces.
 export interface GaiaAlert {
   alert_id: string;
   source_event_id: string;

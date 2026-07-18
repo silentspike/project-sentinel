@@ -27,6 +27,82 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 Exit status: `0`
 
+## Final Source Gates (2026-07-18)
+
+Command:
+
+```bash
+cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-gaia-loop -p sentinel-dashboard-backend
+```
+
+Output excerpt:
+
+```text
+sentinel-dashboard-backend: 49 passed; 0 failed
+auth_routes: 7 passed; 0 failed
+config_routes: 13 passed; 0 failed
+gaia_routes: 3 passed; 0 failed
+login_rate_limit: 5 passed; 0 failed
+resilience: 1 passed; 0 failed
+wt_roundtrip: 4 passed; 0 failed
+sentinel-gaia-loop: 18 passed; 0 failed
+```
+
+Exit status: `0`
+
+Command:
+
+```bash
+cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
+```
+
+Output excerpt:
+
+```text
+Checking sentinel-gaia-loop v0.1.0
+Checking sentinel-dashboard-backend v0.1.0
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.99s
+```
+
+Exit status: `0`
+
+Command:
+
+```bash
+cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- build -p sentinel-gaia-loop -p sentinel-dashboard-backend -p sentinel-gaia -p sentinel-ctl --release
+```
+
+Output excerpt:
+
+```text
+Finished `release` profile [optimized] target(s) in 33.61s
+```
+
+Exit status: `0`
+
+Command:
+
+```bash
+cd console
+bun run test
+bun run typecheck
+bun run build
+```
+
+Output excerpt:
+
+```text
+Test Files  15 passed (15)
+Tests  67 passed (67)
+$ tsc --noEmit
+vite v6.4.2 building for production...
+60 modules transformed.
+dist/assets/index-C1O8iDTc.js  174.40 kB | gzip: 53.66 kB
+built in 2.35s
+```
+
+Exit status: `0`
+
 ## Native Claude Session Hardening And Final Gates
 
 Live native-client tests exposed three integration requirements that fake process tests did not: native stream JSON needs `--verbose`, child stdin must be closed so remote-shell input cannot become Claude input, and the setup prompt must provide the exact `GaiaSpec` JSON schema and enum spellings. The implementation now covers those constraints, safe mode, dynamic company context, inline `--spec-json` generation, and non-success CLI/API exit behavior.

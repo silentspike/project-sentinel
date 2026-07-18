@@ -20,6 +20,19 @@ const STREAM_FILE_NAME: &str = "stream.jsonl";
 const STDERR_FILE_NAME: &str = "stderr.log";
 const PROMPT_FILE_NAME: &str = "prompt.txt";
 const MAX_COMPANY_CONTEXT_CHARS: usize = 16_000;
+const CHILD_ENV_ALLOWLIST: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "CLAUDE_CONFIG_DIR",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GaiaSessionRequest {
@@ -170,6 +183,12 @@ impl ClaudeSessionRunner {
         let args = self.build_args(&request, &claude_session_id, &system_prompt, &user_prompt);
 
         let mut command = Command::new(&self.config.claude_bin);
+        command.env_clear();
+        for name in CHILD_ENV_ALLOWLIST {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
         command
             .args(&args)
             .current_dir(&self.config.console_dir)
@@ -466,6 +485,8 @@ mod tests {
             r#"#!/usr/bin/env bash
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 printf '%s\n' "$@" > "$script_dir/argv.txt"
+printf 'test_secret=%s\n' "${SENTINEL_GAIA_TEST_SECRET-unset}" > "$script_dir/env.txt"
+printf 'home_present=%s\n' "${HOME:+yes}" >> "$script_dir/env.txt"
 if IFS= read -r -t 0.1 inherited; then
   printf 'inherited=%s\n' "$inherited" > "$script_dir/stdin.txt"
   exit 44
@@ -484,7 +505,9 @@ echo 'fake stderr' >&2
         config.session_timeout_secs = 5;
         let runner = ClaudeSessionRunner::new(config);
         let request = GaiaSessionRequest::deep("Create task evidence", Some("resume-abc".into()));
+        std::env::set_var("SENTINEL_GAIA_TEST_SECRET", "must-not-reach-child");
         let run = runner.run(request).await.unwrap();
+        std::env::remove_var("SENTINEL_GAIA_TEST_SECRET");
 
         assert_eq!(run.entry.status, GaiaSessionStatus::Succeeded);
         assert_eq!(run.entry.exit_code, Some(0));
@@ -513,6 +536,10 @@ echo 'fake stderr' >&2
         assert_eq!(
             fs::read_to_string(dir.path().join("stdin.txt")).unwrap(),
             "closed\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("env.txt")).unwrap(),
+            "test_secret=unset\nhome_present=yes\n"
         );
     }
 
