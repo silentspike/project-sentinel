@@ -8,7 +8,8 @@ SENTINEL_USER="${SENTINEL_USER:-ubuntu}"
 echo "[init-dirs] Creating Sentinel directory structure..."
 
 # Executables and config stay root-owned; runtime data belongs to the service user.
-install -d -o root -g root -m 0755 /opt/sentinel /opt/sentinel/bin /opt/sentinel/config
+install -d -o root -g root -m 0755 \
+  /opt/sentinel /opt/sentinel/bin /opt/sentinel/config /opt/sentinel/scripts
 install -d -o "${SENTINEL_USER}" -g "${SENTINEL_USER}" -m 0750 \
   /opt/sentinel/data /opt/sentinel/logs
 install -d -o "${SENTINEL_USER}" -g "${SENTINEL_USER}" -m 0700 \
