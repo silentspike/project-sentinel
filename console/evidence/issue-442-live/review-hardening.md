@@ -108,11 +108,14 @@ both nodes: exact-name Claude processes after checks=0
 
 ## Live Claude authentication blocker
 
-One minimal real request was attempted after the pinned native client was
-installed. The client started from the hardened service path and wrote a
-private stream, but the VM's existing Claude OAuth session had expired. The
-idempotent retry returned the same failed session and did not launch a second
-provider request. No tokens or cost were incurred.
+One minimal real request was attempted on each node after the pinned native
+client was installed. The client started from the hardened service path and
+wrote a private stream, but neither VM had usable provider credentials. On
+`.241`, `claude auth status` reported `loggedIn=false`; on `.242` it reported a
+stored `claude.ai` login, but the real request still received HTTP 401 Invalid
+authentication credentials. The idempotent retries returned their respective
+same failed sessions and did not launch a second provider request. No tokens or
+cost were incurred.
 
 ```text
 gaia_session_id=gaia-deep-bbec10f4-e4a8-4ecc-92e4-3a90fb73a29b
@@ -120,6 +123,8 @@ claude_session_id=bbec10f4-e4a8-4ecc-92e4-3a90fb73a29b
 status=failed exit_code=1 total_cost_usd=0.0
 retry: same gaia_session_id and claude_session_id
 stream: authentication_failed, OAuth session expired and could not be refreshed
+.242 status=failed exit_code=1 total_cost_usd=0.0
+.242 stream: authentication_failed, API Error: 401 Invalid authentication credentials
 claude_processes_after=0
 ```
 
