@@ -1,6 +1,6 @@
 # Issue #442 Remote Verification
 
-Date: 2026-06-27
+Dates: 2026-06-27 and 2026-07-18
 
 Rust build, test, and clippy verification was executed on the remote build host `root@10.0.0.155` through `cargo remote`.
 
@@ -26,6 +26,153 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 ```
 
 Exit status: `0`
+
+## Native Claude Session Hardening And Final Gates
+
+Live native-client tests exposed three integration requirements that fake process tests did not: native stream JSON needs `--verbose`, child stdin must be closed so remote-shell input cannot become Claude input, and the setup prompt must provide the exact `GaiaSpec` JSON schema and enum spellings. The implementation now covers those constraints, safe mode, dynamic company context, inline `--spec-json` generation, and non-success CLI/API exit behavior.
+
+Command:
+
+```bash
+cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-gaia-loop
+```
+
+Output excerpt:
+
+```text
+running 18 tests
+test session::tests::setup_args_allow_deterministic_sentinel_gaia_binary ... ok
+test session::tests::fake_claude_run_persists_stream_prompt_stderr_and_index ... ok
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Exit status: `0`
+
+After removing the unused compile-time dependency on deterministic
+`sentinel-gaia`, delimiting generated company context as untrusted reference
+data, and removing an unused turn-count setting, the affected remote suites were
+rerun:
+
+```bash
+cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-gaia-loop
+```
+
+Output:
+
+```text
+running 18 tests
+test session::tests::setup_args_allow_deterministic_sentinel_gaia_binary ... ok
+test session::tests::fake_claude_run_persists_stream_prompt_stderr_and_index ... ok
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.04s
+```
+
+Exit status: `0`
+
+Command:
+
+```bash
+cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-gaia-loop -p sentinel-dashboard-backend
+```
+
+Output excerpt:
+
+```text
+sentinel-dashboard-backend: 49 passed; 0 failed
+auth_routes: 7 passed; 0 failed
+config_routes: 13 passed; 0 failed
+gaia_routes: 3 passed; 0 failed
+login_rate_limit: 5 passed; 0 failed
+resilience: 1 passed; 0 failed
+wt_roundtrip: 4 passed; 0 failed
+sentinel-gaia-loop: 18 passed; 0 failed
+```
+
+Exit status: `0`
+
+## Console Tests And Build
+
+Command:
+
+```bash
+cd console
+bun run test
+bun run typecheck
+bun run build
+```
+
+Output excerpt:
+
+```text
+Test Files  15 passed (15)
+Tests  67 passed (67)
+$ tsc --noEmit
+vite v6.4.2 building for production...
+60 modules transformed.
+dist/assets/index-C1O8iDTc.js  174.40 kB | gzip: 53.66 kB
+built in 2.60s
+```
+
+Exit status: `0`
+
+Command:
+
+```bash
+cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- build --release -p sentinel-gaia-loop
+```
+
+Output excerpt:
+
+```text
+Compiling sentinel-gaia-loop v0.1.0
+Finished `release` profile [optimized] target(s) in 13.30s
+```
+
+Exit status: `0`
+
+Command:
+
+```bash
+cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- clippy --workspace --all-targets -- -D warnings
+```
+
+Output excerpt:
+
+```text
+Checking sentinel-gaia-loop v0.1.0
+Checking sentinel-gaia v0.1.0
+Checking sentinel-dashboard-backend v0.1.0
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.62s
+```
+
+Exit status: `0`
+
+## Strict Inline GaiaSpec Parser
+
+The LLM-facing inline JSON path rejects unknown top-level, department, and culture fields instead of silently dropping them. Existing TOML specs retain their previous serde-default compatibility.
+
+Command:
+
+```bash
+cargo remote -H root@10.0.0.155 -t /tmp/builds -c -- test -p sentinel-gaia --test cli
+```
+
+Output:
+
+```text
+Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
+running 5 tests
+test init_from_inline_json_writes_valid_configs ... ok
+test init_from_inline_json_rejects_unknown_fields ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+CARGO_REMOTE_EXIT=0
+```
+
+Final workspace clippy after this change:
+
+```text
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.86s
+CARGO_REMOTE_EXIT=0
+```
 
 ## Dashboard Gaia Routes
 

@@ -38,8 +38,12 @@ enum Commands {
 #[derive(Args, Debug)]
 struct InitArgs {
     /// Read the Gaia spec from a TOML file instead of prompting.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "spec_json")]
     spec: Option<PathBuf>,
+
+    /// Read the Gaia spec from inline JSON instead of prompting.
+    #[arg(long, conflicts_with = "spec")]
+    spec_json: Option<String>,
 
     /// Directory that receives gaia-spec.toml, agents/, rooms.toml, daemon.toml, and nightrun.toml.
     #[arg(long, default_value = "config")]
@@ -113,9 +117,11 @@ fn main() -> Result<()> {
 }
 
 fn init(args: InitArgs) -> Result<()> {
-    let spec = match &args.spec {
-        Some(path) => read_spec(path)?,
-        None => prompt_spec()?,
+    let spec = match (&args.spec, &args.spec_json) {
+        (Some(path), None) => read_spec(path)?,
+        (None, Some(raw)) => parse_inline_spec(raw)?,
+        (None, None) => prompt_spec()?,
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting spec inputs"),
     };
     let generated = generate(spec)?;
     let report = generated.validate()?;
@@ -156,6 +162,69 @@ fn init(args: InitArgs) -> Result<()> {
         print_init_summary(&summary);
     }
 
+    Ok(())
+}
+
+fn parse_inline_spec(raw: &str) -> Result<GaiaSpec> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).context("parse --spec-json as JSON")?;
+    reject_unknown_fields(
+        &value,
+        &[
+            "company_name",
+            "company_type",
+            "city",
+            "address",
+            "agent_count",
+            "seed",
+            "shift_model",
+            "time_scale",
+            "departments",
+            "culture",
+        ],
+        "GaiaSpec",
+    )?;
+
+    if let Some(departments) = value.get("departments").and_then(|item| item.as_array()) {
+        for (index, department) in departments.iter().enumerate() {
+            reject_unknown_fields(
+                department,
+                &["name", "weight", "roles"],
+                &format!("GaiaSpec.departments[{index}]"),
+            )?;
+        }
+    }
+    if let Some(culture) = value.get("culture") {
+        reject_unknown_fields(
+            culture,
+            &[
+                "formality",
+                "collaboration",
+                "conflict_level",
+                "innovation",
+                "diversity",
+                "mission",
+                "values",
+            ],
+            "GaiaSpec.culture",
+        )?;
+    }
+
+    serde_json::from_value(value).context("parse --spec-json as GaiaSpec")
+}
+
+fn reject_unknown_fields(value: &serde_json::Value, allowed: &[&str], label: &str) -> Result<()> {
+    let object = value
+        .as_object()
+        .with_context(|| format!("{label} must be a JSON object"))?;
+    let unknown = object
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        bail!("{label} contains unknown fields: {}", unknown.join(", "));
+    }
     Ok(())
 }
 

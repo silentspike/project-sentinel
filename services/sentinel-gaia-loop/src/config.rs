@@ -5,8 +5,8 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ALERTS_FILE_NAME, DEFAULT_CLAUDE_BIN, DEFAULT_CONSOLE_DIR, DEFAULT_EVENTS_DB,
-    DEFAULT_HTTP_BIND, DEFAULT_MAX_BUDGET_USD, DEFAULT_MAX_TURNS, DEFAULT_NATS_URL,
+    ALERTS_FILE_NAME, DEFAULT_CLAUDE_BIN, DEFAULT_COMPANY_CONTEXT_PATH, DEFAULT_CONSOLE_DIR,
+    DEFAULT_EVENTS_DB, DEFAULT_HTTP_BIND, DEFAULT_MAX_BUDGET_USD, DEFAULT_NATS_URL,
     DEFAULT_READINESS_SCAN_INTERVAL_SECS, DEFAULT_SENTINEL_CTL_BIN, DEFAULT_SENTINEL_GAIA_BIN,
     DEFAULT_SESSION_TIMEOUT_SECS, SESSIONS_DIR_NAME, SESSION_INDEX_FILE_NAME, STATE_FILE_NAME,
 };
@@ -20,10 +20,10 @@ pub struct GaiaLoopConfig {
     pub claude_bin: PathBuf,
     pub sentinel_ctl_bin: PathBuf,
     pub sentinel_gaia_bin: PathBuf,
+    pub company_context_path: PathBuf,
     pub model: Option<String>,
     pub max_budget_usd: f64,
     pub session_timeout_secs: u64,
-    pub max_turns: u32,
     pub readiness_scan_interval_secs: u64,
 }
 
@@ -37,13 +37,16 @@ impl GaiaLoopConfig {
             claude_bin: path_env("SENTINEL_GAIA_CLAUDE_BIN", DEFAULT_CLAUDE_BIN),
             sentinel_ctl_bin: path_env("SENTINEL_CTL_BIN", DEFAULT_SENTINEL_CTL_BIN),
             sentinel_gaia_bin: path_env("SENTINEL_GAIA_BIN", DEFAULT_SENTINEL_GAIA_BIN),
+            company_context_path: path_env(
+                "SENTINEL_GAIA_COMPANY_CONTEXT",
+                DEFAULT_COMPANY_CONTEXT_PATH,
+            ),
             model: optional_string_env("SENTINEL_GAIA_MODEL"),
             max_budget_usd: parse_env("SENTINEL_GAIA_MAX_BUDGET_USD", DEFAULT_MAX_BUDGET_USD)?,
             session_timeout_secs: parse_env(
                 "SENTINEL_GAIA_SESSION_TIMEOUT_SECS",
                 DEFAULT_SESSION_TIMEOUT_SECS,
             )?,
-            max_turns: parse_env("SENTINEL_GAIA_MAX_TURNS", DEFAULT_MAX_TURNS)?,
             readiness_scan_interval_secs: parse_env(
                 "SENTINEL_GAIA_SCAN_INTERVAL_SECS",
                 DEFAULT_READINESS_SCAN_INTERVAL_SECS,
@@ -60,16 +63,8 @@ impl GaiaLoopConfig {
         if self.session_timeout_secs == 0 {
             bail!("SENTINEL_GAIA_SESSION_TIMEOUT_SECS must be > 0");
         }
-        if self.max_turns == 0 {
-            bail!("SENTINEL_GAIA_MAX_TURNS must be > 0");
-        }
         if self.readiness_scan_interval_secs == 0 {
             bail!("SENTINEL_GAIA_SCAN_INTERVAL_SECS must be > 0");
-        }
-        if self.max_turns != 1 {
-            bail!(
-                "SENTINEL_GAIA_MAX_TURNS must be 1; Gaia Console v1 enforces one turn through claude -p"
-            );
         }
         if self.http_bind.trim().is_empty() {
             bail!("SENTINEL_GAIA_HTTP_BIND must not be empty");
@@ -153,10 +148,10 @@ mod tests {
             claude_bin: PathBuf::from(DEFAULT_CLAUDE_BIN),
             sentinel_ctl_bin: PathBuf::from(DEFAULT_SENTINEL_CTL_BIN),
             sentinel_gaia_bin: PathBuf::from(DEFAULT_SENTINEL_GAIA_BIN),
+            company_context_path: PathBuf::from(DEFAULT_COMPANY_CONTEXT_PATH),
             model: None,
             max_budget_usd: DEFAULT_MAX_BUDGET_USD,
             session_timeout_secs: DEFAULT_SESSION_TIMEOUT_SECS,
-            max_turns: DEFAULT_MAX_TURNS,
             readiness_scan_interval_secs: DEFAULT_READINESS_SCAN_INTERVAL_SECS,
         }
     }
@@ -167,7 +162,6 @@ mod tests {
         cfg.validate().unwrap();
         assert!(cfg.max_budget_usd > 0.0);
         assert!(cfg.session_timeout().as_secs() > 0);
-        assert!(cfg.max_turns > 0);
         assert_eq!(
             cfg.readiness_scan_interval().as_secs(),
             DEFAULT_READINESS_SCAN_INTERVAL_SECS
@@ -184,11 +178,6 @@ mod tests {
         cfg.session_timeout_secs = 0;
         assert!(cfg.validate().is_err());
         cfg.session_timeout_secs = DEFAULT_SESSION_TIMEOUT_SECS;
-        cfg.max_turns = 0;
-        assert!(cfg.validate().is_err());
-        cfg.max_turns = 2;
-        assert!(cfg.validate().is_err());
-        cfg.max_turns = DEFAULT_MAX_TURNS;
         cfg.readiness_scan_interval_secs = 0;
         assert!(cfg.validate().is_err());
     }

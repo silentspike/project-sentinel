@@ -15,7 +15,7 @@ use axum::{
 };
 use sentinel_gaia_loop::config::GaiaLoopConfig;
 use sentinel_gaia_loop::session::{ClaudeSessionRunner, GaiaSessionRequest};
-use sentinel_gaia_loop::types::{GaiaAlert, GaiaSessionIndexEntry};
+use sentinel_gaia_loop::types::{GaiaAlert, GaiaSessionIndexEntry, GaiaSessionStatus};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -122,7 +122,18 @@ async fn run_session(st: AppState, request: GaiaSessionRequest) -> Response {
     };
     let runner = ClaudeSessionRunner::new(config);
     match runner.run(request).await {
-        Ok(run) => Json(run).into_response(),
+        Ok(run) if run.entry.status == GaiaSessionStatus::Succeeded => Json(run).into_response(),
+        Ok(run) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": format!(
+                    "Claude Code session ended with status {:?}",
+                    run.entry.status
+                ),
+                "run": run,
+            })),
+        )
+            .into_response(),
         Err(error) => {
             tracing::warn!(error = %error, "Gaia Console session failed");
             (
@@ -143,10 +154,10 @@ fn gaia_loop_config(st: &AppState) -> anyhow::Result<GaiaLoopConfig> {
         claude_bin: PathBuf::from(&st.config.gaia_claude_bin),
         sentinel_ctl_bin: PathBuf::from(&st.config.gaia_sentinel_ctl_bin),
         sentinel_gaia_bin: PathBuf::from(&st.config.gaia_sentinel_gaia_bin),
+        company_context_path: PathBuf::from(&st.config.gaia_company_context_path),
         model: st.config.gaia_model.clone(),
         max_budget_usd: st.config.gaia_max_budget_usd,
         session_timeout_secs: st.config.gaia_session_timeout_secs,
-        max_turns: st.config.gaia_max_turns,
         readiness_scan_interval_secs: sentinel_gaia_loop::DEFAULT_READINESS_SCAN_INTERVAL_SECS,
     };
     config.validate()?;
