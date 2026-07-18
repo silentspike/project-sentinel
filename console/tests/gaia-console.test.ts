@@ -58,7 +58,7 @@ const SETUP_RUN: GaiaSessionRun = {
   },
 };
 
-const posted: { url: string; body: string }[] = [];
+const posted: { url: string; body: string; idempotencyKey: string }[] = [];
 
 function jsonOk(value: unknown) {
   return { ok: true, statusText: "OK", json: async () => value };
@@ -78,11 +78,19 @@ function stubFetch() {
         return textOk('{"type":"message","result":"completed"}\n');
       }
       if (init?.method === "POST" && u.includes("/api/gaia/deep")) {
-        posted.push({ url: u, body: String(init.body) });
+        posted.push({
+          url: u,
+          body: String(init.body),
+          idempotencyKey: String(new Headers(init.headers).get("Idempotency-Key")),
+        });
         return jsonOk(RUN);
       }
       if (init?.method === "POST" && u.includes("/api/gaia/setup-interview")) {
-        posted.push({ url: u, body: String(init.body) });
+        posted.push({
+          url: u,
+          body: String(init.body),
+          idempotencyKey: String(new Headers(init.headers).get("Idempotency-Key")),
+        });
         return jsonOk(SETUP_RUN);
       }
       if (u.includes("/api/gaia/alerts")) return jsonOk({ alerts: ALERTS, count: ALERTS.length, source: "/tmp/alerts.jsonl" });
@@ -119,14 +127,18 @@ describe("GaiaConsoleView (#442)", () => {
     const prompt = getByTestId("gaia-prompt") as HTMLTextAreaElement;
     prompt.value = "inspect open tasks";
     fireEvent.input(prompt);
-    const resume = getByTestId("gaia-resume") as HTMLInputElement;
-    resume.value = "resume-test";
+    const resume = getByTestId("gaia-resume") as HTMLSelectElement;
+    await waitFor(() =>
+      expect(Array.from(resume.options).some((option) => option.value === "gaia-deep-test")).toBe(true),
+    );
+    resume.value = "gaia-deep-test";
     fireEvent.input(resume);
     fireEvent.click(getByTestId("gaia-start"));
 
     await waitFor(() => expect(posted.some((call) => call.url.includes("/api/gaia/deep"))).toBe(true));
     expect(posted[0].body).toContain("inspect open tasks");
-    expect(posted[0].body).toContain("resume-test");
+    expect(posted[0].body).toContain("gaia-deep-test");
+    expect(posted[0].idempotencyKey).toMatch(/^[0-9a-f-]{36}$/);
     await waitFor(() => expect(getByTestId("gaia-stream").textContent).toContain("completed"));
   });
 

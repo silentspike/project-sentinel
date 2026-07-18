@@ -5,10 +5,11 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ALERTS_FILE_NAME, DEFAULT_CLAUDE_BIN, DEFAULT_COMPANY_CONTEXT_PATH, DEFAULT_CONSOLE_DIR,
-    DEFAULT_EVENTS_DB, DEFAULT_HTTP_BIND, DEFAULT_MAX_BUDGET_USD, DEFAULT_NATS_URL,
-    DEFAULT_READINESS_SCAN_INTERVAL_SECS, DEFAULT_SENTINEL_CTL_BIN, DEFAULT_SENTINEL_GAIA_BIN,
-    DEFAULT_SESSION_TIMEOUT_SECS, SESSIONS_DIR_NAME, SESSION_INDEX_FILE_NAME, STATE_FILE_NAME,
+    ALERTS_FILE_NAME, DEFAULT_BUDGET_WINDOW_SECS, DEFAULT_BUDGET_WINDOW_USD, DEFAULT_CLAUDE_BIN,
+    DEFAULT_COMPANY_CONTEXT_PATH, DEFAULT_CONSOLE_DIR, DEFAULT_EVENTS_DB, DEFAULT_HTTP_BIND,
+    DEFAULT_MAX_BUDGET_USD, DEFAULT_NATS_URL, DEFAULT_READINESS_SCAN_INTERVAL_SECS,
+    DEFAULT_SENTINEL_CTL_BIN, DEFAULT_SENTINEL_GAIA_BIN, DEFAULT_SESSION_TIMEOUT_SECS,
+    SESSIONS_DIR_NAME, SESSION_ACTIVE_LOCK_FILE_NAME, SESSION_INDEX_FILE_NAME, STATE_FILE_NAME,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -23,6 +24,8 @@ pub struct GaiaLoopConfig {
     pub company_context_path: PathBuf,
     pub model: Option<String>,
     pub max_budget_usd: f64,
+    pub budget_window_secs: u64,
+    pub budget_window_usd: f64,
     pub session_timeout_secs: u64,
     pub readiness_scan_interval_secs: u64,
 }
@@ -43,6 +46,14 @@ impl GaiaLoopConfig {
             ),
             model: optional_string_env("SENTINEL_GAIA_MODEL"),
             max_budget_usd: parse_env("SENTINEL_GAIA_MAX_BUDGET_USD", DEFAULT_MAX_BUDGET_USD)?,
+            budget_window_secs: parse_env(
+                "SENTINEL_GAIA_BUDGET_WINDOW_SECS",
+                DEFAULT_BUDGET_WINDOW_SECS,
+            )?,
+            budget_window_usd: parse_env(
+                "SENTINEL_GAIA_BUDGET_WINDOW_USD",
+                DEFAULT_BUDGET_WINDOW_USD,
+            )?,
             session_timeout_secs: parse_env(
                 "SENTINEL_GAIA_SESSION_TIMEOUT_SECS",
                 DEFAULT_SESSION_TIMEOUT_SECS,
@@ -57,8 +68,14 @@ impl GaiaLoopConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.max_budget_usd <= 0.0 {
+        if !self.max_budget_usd.is_finite() || self.max_budget_usd <= 0.0 {
             bail!("SENTINEL_GAIA_MAX_BUDGET_USD must be > 0");
+        }
+        if self.budget_window_secs == 0 {
+            bail!("SENTINEL_GAIA_BUDGET_WINDOW_SECS must be > 0");
+        }
+        if !self.budget_window_usd.is_finite() || self.budget_window_usd < self.max_budget_usd {
+            bail!("SENTINEL_GAIA_BUDGET_WINDOW_USD must be finite and >= SENTINEL_GAIA_MAX_BUDGET_USD");
         }
         if self.session_timeout_secs == 0 {
             bail!("SENTINEL_GAIA_SESSION_TIMEOUT_SECS must be > 0");
@@ -104,6 +121,10 @@ impl GaiaLoopConfig {
 
     pub fn session_index_path(&self) -> PathBuf {
         self.sessions_dir().join(SESSION_INDEX_FILE_NAME)
+    }
+
+    pub fn session_active_lock_path(&self) -> PathBuf {
+        self.sessions_dir().join(SESSION_ACTIVE_LOCK_FILE_NAME)
     }
 }
 
@@ -151,6 +172,8 @@ mod tests {
             company_context_path: PathBuf::from(DEFAULT_COMPANY_CONTEXT_PATH),
             model: None,
             max_budget_usd: DEFAULT_MAX_BUDGET_USD,
+            budget_window_secs: DEFAULT_BUDGET_WINDOW_SECS,
+            budget_window_usd: DEFAULT_BUDGET_WINDOW_USD,
             session_timeout_secs: DEFAULT_SESSION_TIMEOUT_SECS,
             readiness_scan_interval_secs: DEFAULT_READINESS_SCAN_INTERVAL_SECS,
         }
@@ -161,6 +184,8 @@ mod tests {
         let cfg = cfg();
         cfg.validate().unwrap();
         assert!(cfg.max_budget_usd > 0.0);
+        assert_eq!(cfg.budget_window_secs, DEFAULT_BUDGET_WINDOW_SECS);
+        assert_eq!(cfg.budget_window_usd, DEFAULT_BUDGET_WINDOW_USD);
         assert!(cfg.session_timeout().as_secs() > 0);
         assert_eq!(
             cfg.readiness_scan_interval().as_secs(),
@@ -175,6 +200,12 @@ mod tests {
         cfg.max_budget_usd = 0.0;
         assert!(cfg.validate().is_err());
         cfg.max_budget_usd = DEFAULT_MAX_BUDGET_USD;
+        cfg.budget_window_secs = 0;
+        assert!(cfg.validate().is_err());
+        cfg.budget_window_secs = DEFAULT_BUDGET_WINDOW_SECS;
+        cfg.budget_window_usd = cfg.max_budget_usd / 2.0;
+        assert!(cfg.validate().is_err());
+        cfg.budget_window_usd = DEFAULT_BUDGET_WINDOW_USD;
         cfg.session_timeout_secs = 0;
         assert!(cfg.validate().is_err());
         cfg.session_timeout_secs = DEFAULT_SESSION_TIMEOUT_SECS;

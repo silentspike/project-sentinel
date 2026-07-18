@@ -22,6 +22,12 @@ Environment=SENTINEL_GAIA_COMPANY_CONTEXT=/opt/sentinel/config/company-context.m
 Environment=RUST_LOG=info
 Restart=on-failure
 RestartSec=5
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=15s
+MemoryMax=512M
+TasksMax=32
+CPUQuota=100%
 
 # Logging
 StandardOutput=journal

@@ -93,6 +93,14 @@ pub struct Config {
     pub gaia_company_context_path: String,
     /// Hard Claude Code budget cap for explicit Gaia Console sessions.
     pub gaia_max_budget_usd: f64,
+    /// Rolling Gaia Console budget window length.
+    pub gaia_budget_window_secs: u64,
+    /// Maximum reserved/observed Claude cost across the rolling window.
+    pub gaia_budget_window_usd: f64,
+    /// Maximum number of distinct Gaia requests admitted per rate-limit window.
+    pub gaia_rate_limit_requests: usize,
+    /// Gaia request rate-limit window in seconds.
+    pub gaia_rate_limit_window_secs: u64,
     /// Hard process timeout for explicit Gaia Console sessions.
     pub gaia_session_timeout_secs: u64,
     /// Optional Claude Code model override for explicit Gaia Console sessions.
@@ -168,6 +176,18 @@ impl Config {
             gaia_max_budget_usd: env("SENTINEL_GAIA_MAX_BUDGET_USD")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(sentinel_gaia_loop::DEFAULT_MAX_BUDGET_USD),
+            gaia_budget_window_secs: env("SENTINEL_GAIA_BUDGET_WINDOW_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(sentinel_gaia_loop::DEFAULT_BUDGET_WINDOW_SECS),
+            gaia_budget_window_usd: env("SENTINEL_GAIA_BUDGET_WINDOW_USD")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(sentinel_gaia_loop::DEFAULT_BUDGET_WINDOW_USD),
+            gaia_rate_limit_requests: env("SENTINEL_GAIA_RATE_LIMIT_REQUESTS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6),
+            gaia_rate_limit_window_secs: env("SENTINEL_GAIA_RATE_LIMIT_WINDOW_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
             gaia_session_timeout_secs: env("SENTINEL_GAIA_SESSION_TIMEOUT_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(sentinel_gaia_loop::DEFAULT_SESSION_TIMEOUT_SECS),
@@ -193,10 +213,15 @@ pub struct AppState {
     pub broadcast_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
     /// Event-Log CAS-Plane (#464): append-only Block-Log fuer den WT-Bi-Stream.
     pub event_cas: Arc<Mutex<cas::EventLogCasPlane>>,
+    pub gaia_request_limiter: gaia::GaiaRequestLimiter,
 }
 
 impl AppState {
     pub fn new(config: Config) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            config.gaia_rate_limit_requests > 0 && config.gaia_rate_limit_window_secs > 0,
+            "Gaia request rate-limit values must be greater than zero"
+        );
         // Kapazitaet 256: ueberlaeuft ein langsamer Client, liefert `recv()` `Lagged` — der naechste
         // Voll-Snapshot ist ohnehin autoritativ (reconcile), also tolerierbar.
         let (broadcast_tx, _) = tokio::sync::broadcast::channel(256);
@@ -212,6 +237,10 @@ impl AppState {
             config.login_window_secs,
             config.login_block_secs,
         );
+        let gaia_request_limiter = gaia::GaiaRequestLimiter::new(
+            config.gaia_rate_limit_requests,
+            std::time::Duration::from_secs(config.gaia_rate_limit_window_secs),
+        );
         Ok(Self {
             sessions: auth::SessionStore::new(),
             login_limiter,
@@ -223,6 +252,7 @@ impl AppState {
             saved_rate_limit: Arc::new(tokio::sync::Mutex::new(None)),
             broadcast_tx,
             event_cas: Arc::new(Mutex::new(cas::EventLogCasPlane::new())),
+            gaia_request_limiter,
         })
     }
 }

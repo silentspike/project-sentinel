@@ -47,8 +47,8 @@ export async function apiText(path: string, init: RequestInit = {}): Promise<str
   return response.text();
 }
 
-export function postJson<T>(path: string, body: unknown): Promise<T> {
-  return apiJson<T>(path, { method: "POST", body: JSON.stringify(body) });
+export function postJson<T>(path: string, body: unknown, headers?: HeadersInit): Promise<T> {
+  return apiJson<T>(path, { method: "POST", body: JSON.stringify(body), headers });
 }
 
 export function patchJson<T>(path: string, body: unknown): Promise<T> {
@@ -327,6 +327,9 @@ export interface ClaudeUsageSummary {
 export interface GaiaSessionIndexEntry {
   gaia_session_id: string;
   claude_session_id?: string | null;
+  resumed_from_gaia_session_id?: string | null;
+  idempotency_key?: string | null;
+  request_fingerprint?: string | null;
   kind: GaiaSessionKind;
   status: GaiaSessionStatus;
   stream_path: string;

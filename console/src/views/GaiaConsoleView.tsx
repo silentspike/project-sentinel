@@ -54,6 +54,7 @@ function sortSessions(sessions: GaiaSessionIndexEntry[]): GaiaSessionIndexEntry[
 }
 
 export function GaiaConsoleView(): JSX.Element {
+  let pendingRequest: { fingerprint: string; key: string } | null = null;
   const [alerts, setAlerts] = createSignal<GaiaAlert[]>([]);
   const [sessions, setSessions] = createSignal<GaiaSessionIndexEntry[]>([]);
   const [stream, setStream] = createSignal("");
@@ -67,6 +68,13 @@ export function GaiaConsoleView(): JSX.Element {
 
   const latestAlerts = createMemo(() => sortAlerts(alerts()).slice(0, 12));
   const latestSessions = createMemo(() => sortSessions(sessions()).slice(0, 12));
+  const resumableSessions = createMemo(() =>
+    sortSessions(sessions()).filter(
+      (session) =>
+        session.status === "succeeded" &&
+        session.kind === (mode() === "setup" ? "setup_interview" : "deep"),
+    ),
+  );
   const selectedSession = createMemo(
     () => sessions().find((session) => session.gaia_session_id === selectedSessionId()) ?? null,
   );
@@ -117,13 +125,18 @@ export function GaiaConsoleView(): JSX.Element {
     const text = prompt().trim();
     if (!text) return;
     const endpoint = mode() === "setup" ? "/api/gaia/setup-interview" : "/api/gaia/deep";
+    const fingerprint = JSON.stringify([endpoint, text, resume()]);
+    if (!pendingRequest || pendingRequest.fingerprint !== fingerprint) {
+      pendingRequest = { fingerprint, key: crypto.randomUUID() };
+    }
     setBusy("session");
     setFeedback(null);
     try {
       const run = await postJson<GaiaSessionRun>(endpoint, {
         prompt: text,
-        resume: resume().trim() || undefined,
-      });
+        resume_session_id: resume() || undefined,
+      }, { "Idempotency-Key": pendingRequest.key });
+      pendingRequest = null;
       setFeedback({ text: `${kindLabel(run.entry.kind)} session ${run.entry.status}`, kind: "ok" });
       addToast("Gaia session abgeschlossen", "ok", 3500);
       await load();
@@ -201,12 +214,16 @@ export function GaiaConsoleView(): JSX.Element {
               onInput={(event) => setPrompt(event.currentTarget.value)}
             />
             <div class="gaia-submit-row">
-              <input
+              <select
                 data-testid="gaia-resume"
                 value={resume()}
-                placeholder="resume session id"
                 onInput={(event) => setResume(event.currentTarget.value)}
-              />
+              >
+                <option value="">Neue Session</option>
+                <For each={resumableSessions()}>
+                  {(session) => <option value={session.gaia_session_id}>{session.gaia_session_id}</option>}
+                </For>
+              </select>
               <button class="primary" data-testid="gaia-start" disabled={!canStart()} type="submit">
                 {busy() === "session" ? "Laeuft..." : "Ausfuehren"}
               </button>

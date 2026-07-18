@@ -1,11 +1,12 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -13,6 +14,10 @@ use uuid::Uuid;
 use crate::config::GaiaLoopConfig;
 use crate::prompts::{GAIA_SYSTEM_PROMPT, SETUP_INTERVIEW_PROMPT};
 use crate::readiness::now_ms;
+use crate::storage::{
+    append_jsonl_locked, create_private_file, ensure_private_dir, harden_private_tree,
+    read_jsonl_locked, try_exclusive_file_lock, write_private,
+};
 use crate::types::{ClaudeUsageSummary, GaiaSessionIndexEntry, GaiaSessionKind, GaiaSessionStatus};
 
 const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
@@ -20,6 +25,7 @@ const STREAM_FILE_NAME: &str = "stream.jsonl";
 const STDERR_FILE_NAME: &str = "stderr.log";
 const PROMPT_FILE_NAME: &str = "prompt.txt";
 const MAX_COMPANY_CONTEXT_CHARS: usize = 16_000;
+const IDEMPOTENCY_KEY_MAX_LEN: usize = 128;
 const CHILD_ENV_ALLOWLIST: &[&str] = &[
     "HOME",
     "USER",
@@ -38,23 +44,45 @@ const CHILD_ENV_ALLOWLIST: &[&str] = &[
 pub struct GaiaSessionRequest {
     pub kind: GaiaSessionKind,
     pub prompt: String,
-    pub resume: Option<String>,
+    pub resume_gaia_session_id: Option<String>,
+    pub idempotency_key: String,
 }
 
 impl GaiaSessionRequest {
-    pub fn deep(prompt: impl Into<String>, resume: Option<String>) -> Self {
+    pub fn deep(prompt: impl Into<String>, resume_gaia_session_id: Option<String>) -> Self {
+        Self::deep_idempotent(prompt, resume_gaia_session_id, Uuid::new_v4().to_string())
+    }
+
+    pub fn deep_idempotent(
+        prompt: impl Into<String>,
+        resume_gaia_session_id: Option<String>,
+        idempotency_key: impl Into<String>,
+    ) -> Self {
         Self {
             kind: GaiaSessionKind::Deep,
             prompt: prompt.into(),
-            resume,
+            resume_gaia_session_id,
+            idempotency_key: idempotency_key.into(),
         }
     }
 
-    pub fn setup_interview(prompt: impl Into<String>, resume: Option<String>) -> Self {
+    pub fn setup_interview(
+        prompt: impl Into<String>,
+        resume_gaia_session_id: Option<String>,
+    ) -> Self {
+        Self::setup_interview_idempotent(prompt, resume_gaia_session_id, Uuid::new_v4().to_string())
+    }
+
+    pub fn setup_interview_idempotent(
+        prompt: impl Into<String>,
+        resume_gaia_session_id: Option<String>,
+        idempotency_key: impl Into<String>,
+    ) -> Self {
         Self {
             kind: GaiaSessionKind::SetupInterview,
             prompt: prompt.into(),
-            resume,
+            resume_gaia_session_id,
+            idempotency_key: idempotency_key.into(),
         }
     }
 
@@ -70,6 +98,26 @@ impl GaiaSessionRequest {
     fn prompt_record(&self, system_prompt: &str) -> String {
         format!("{system_prompt}\n\n{}", self.user_prompt())
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GaiaAdmissionError {
+    #[error("another Gaia Console session is already active")]
+    Busy,
+    #[error(
+        "Gaia Console budget window exhausted: spent ${spent_usd:.4}, next reservation ${reservation_usd:.4}, limit ${limit_usd:.4}"
+    )]
+    BudgetExceeded {
+        spent_usd: f64,
+        reservation_usd: f64,
+        limit_usd: f64,
+    },
+    #[error("invalid Gaia idempotency key")]
+    InvalidIdempotencyKey,
+    #[error("idempotency key was already used for a different Gaia request")]
+    IdempotencyConflict,
+    #[error("invalid Gaia resume session: {0}")]
+    InvalidResume(String),
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -98,6 +146,7 @@ impl ClaudeSessionRunner {
         &self,
         request: &GaiaSessionRequest,
         claude_session_id: &str,
+        resume_claude_session_id: Option<&str>,
         system_prompt: &str,
         rendered_prompt: &str,
     ) -> Vec<String> {
@@ -126,7 +175,7 @@ impl ClaudeSessionRunner {
             args.push("--model".to_string());
             args.push(model.to_string());
         }
-        if let Some(resume) = request.resume.as_deref() {
+        if let Some(resume) = resume_claude_session_id {
             args.push("--resume".to_string());
             args.push(resume.to_string());
         } else {
@@ -142,30 +191,40 @@ impl ClaudeSessionRunner {
         if request.prompt.trim().is_empty() {
             bail!("Gaia session prompt must not be empty");
         }
+        if !valid_idempotency_key(&request.idempotency_key) {
+            return Err(GaiaAdmissionError::InvalidIdempotencyKey.into());
+        }
 
-        fs::create_dir_all(&self.config.console_dir).with_context(|| {
-            format!(
-                "create Gaia Console dir {}",
-                self.config.console_dir.display()
-            )
-        })?;
-        fs::create_dir_all(self.config.sessions_dir()).with_context(|| {
-            format!(
-                "create Gaia Console sessions dir {}",
-                self.config.sessions_dir().display()
-            )
-        })?;
+        ensure_private_dir(&self.config.console_dir)?;
+        ensure_private_dir(&self.config.sessions_dir())?;
+        harden_private_tree(&self.config.console_dir)?;
+
+        let request_fingerprint = request_fingerprint(&request);
+        let index_path = self.config.session_index_path();
+        let mut entries = read_jsonl_locked::<GaiaSessionIndexEntry>(&index_path)?;
+        if let Some(run) = self.idempotent_result(&entries, &request, &request_fingerprint)? {
+            return Ok(run);
+        }
+
+        let _active_lock = try_exclusive_file_lock(&self.config.session_active_lock_path())?
+            .ok_or(GaiaAdmissionError::Busy)?;
+
+        entries = read_jsonl_locked::<GaiaSessionIndexEntry>(&index_path)?;
+        if let Some(run) = self.idempotent_result(&entries, &request, &request_fingerprint)? {
+            return Ok(run);
+        }
+
+        self.enforce_budget_window(&entries)?;
+        let resume_claude_session_id = self.resolve_resume(&entries, &request)?;
 
         let started_at_ms = now_ms();
         let session_uuid = Uuid::new_v4().to_string();
         let gaia_session_id = format!("gaia-{}-{session_uuid}", request.kind.slug());
-        let claude_session_id = request
-            .resume
+        let claude_session_id = resume_claude_session_id
             .clone()
             .unwrap_or_else(|| session_uuid.clone());
         let session_dir = self.config.sessions_dir().join(&gaia_session_id);
-        fs::create_dir_all(&session_dir)
-            .with_context(|| format!("create Gaia session dir {}", session_dir.display()))?;
+        ensure_private_dir(&session_dir)?;
         let setup_output_dir = session_dir.join("config");
         let system_prompt = self.system_prompt(request.kind, &setup_output_dir);
         let prompt_record = request.prompt_record(&system_prompt);
@@ -173,14 +232,17 @@ impl ClaudeSessionRunner {
         let stream_path = session_dir.join(STREAM_FILE_NAME);
         let stderr_path = session_dir.join(STDERR_FILE_NAME);
         let prompt_path = session_dir.join(PROMPT_FILE_NAME);
-        fs::write(&prompt_path, prompt_record.as_bytes())
-            .with_context(|| format!("write {}", prompt_path.display()))?;
+        write_private(&prompt_path, prompt_record.as_bytes())?;
 
-        let stdout = fs::File::create(&stream_path)
-            .with_context(|| format!("create {}", stream_path.display()))?;
-        let stderr = fs::File::create(&stderr_path)
-            .with_context(|| format!("create {}", stderr_path.display()))?;
-        let args = self.build_args(&request, &claude_session_id, &system_prompt, &user_prompt);
+        let stdout = create_private_file(&stream_path)?;
+        let stderr = create_private_file(&stderr_path)?;
+        let args = self.build_args(
+            &request,
+            &claude_session_id,
+            resume_claude_session_id.as_deref(),
+            &system_prompt,
+            &user_prompt,
+        );
 
         let mut command = Command::new(&self.config.claude_bin);
         command.env_clear();
@@ -199,6 +261,7 @@ impl ClaudeSessionRunner {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .kill_on_drop(true);
+        command.as_std_mut().process_group(0);
 
         let mut child = command.spawn().with_context(|| {
             format!(
@@ -207,6 +270,8 @@ impl ClaudeSessionRunner {
                 request.kind.slug()
             )
         })?;
+        let child_pid = child.id().context("Claude Code child pid unavailable")?;
+        let mut process_group_guard = ProcessGroupGuard::new(child_pid);
 
         let (status, exit_code) = match timeout(self.config.session_timeout(), child.wait()).await {
             Ok(wait_result) => {
@@ -219,17 +284,22 @@ impl ClaudeSessionRunner {
                 (status, exit_status.code())
             }
             Err(_) => {
-                let _ = child.start_kill();
+                process_group_guard.kill();
                 let _ = child.wait().await;
                 (GaiaSessionStatus::TimedOut, None)
             }
         };
+        process_group_guard.kill();
+        process_group_guard.disarm();
 
         let finished_at_ms = Some(now_ms());
         let usage = ClaudeUsageSummary::from_stream_jsonl(&stream_path)?;
         let entry = GaiaSessionIndexEntry {
             gaia_session_id,
             claude_session_id: Some(claude_session_id),
+            resumed_from_gaia_session_id: request.resume_gaia_session_id.clone(),
+            idempotency_key: Some(request.idempotency_key.clone()),
+            request_fingerprint: Some(request_fingerprint),
             kind: request.kind,
             status,
             stream_path: stream_path.display().to_string(),
@@ -238,13 +308,100 @@ impl ClaudeSessionRunner {
             exit_code,
             usage,
         };
-        append_session_index(&self.config.session_index_path(), &entry)?;
+        append_jsonl_locked(&index_path, &entry)?;
 
         Ok(GaiaSessionRun {
             entry,
             session_dir,
             prompt_path,
             stderr_path,
+        })
+    }
+
+    fn idempotent_result(
+        &self,
+        entries: &[GaiaSessionIndexEntry],
+        request: &GaiaSessionRequest,
+        fingerprint: &str,
+    ) -> Result<Option<GaiaSessionRun>> {
+        let Some(entry) = entries
+            .iter()
+            .rev()
+            .find(|entry| entry.idempotency_key.as_deref() == Some(&request.idempotency_key))
+        else {
+            return Ok(None);
+        };
+        if entry.request_fingerprint.as_deref() != Some(fingerprint) {
+            return Err(GaiaAdmissionError::IdempotencyConflict.into());
+        }
+        Ok(Some(self.run_from_entry(entry.clone())))
+    }
+
+    fn run_from_entry(&self, entry: GaiaSessionIndexEntry) -> GaiaSessionRun {
+        let session_dir = self.config.sessions_dir().join(&entry.gaia_session_id);
+        GaiaSessionRun {
+            entry,
+            prompt_path: session_dir.join(PROMPT_FILE_NAME),
+            stderr_path: session_dir.join(STDERR_FILE_NAME),
+            session_dir,
+        }
+    }
+
+    fn enforce_budget_window(&self, entries: &[GaiaSessionIndexEntry]) -> Result<()> {
+        let cutoff_ms = now_ms().saturating_sub(self.config.budget_window_secs * 1000);
+        let spent_usd = entries
+            .iter()
+            .filter(|entry| entry.started_at_ms >= cutoff_ms)
+            .map(|entry| {
+                entry
+                    .usage
+                    .total_cost_usd
+                    .unwrap_or(self.config.max_budget_usd)
+            })
+            .sum::<f64>();
+        if spent_usd + self.config.max_budget_usd > self.config.budget_window_usd + f64::EPSILON {
+            return Err(GaiaAdmissionError::BudgetExceeded {
+                spent_usd,
+                reservation_usd: self.config.max_budget_usd,
+                limit_usd: self.config.budget_window_usd,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn resolve_resume(
+        &self,
+        entries: &[GaiaSessionIndexEntry],
+        request: &GaiaSessionRequest,
+    ) -> Result<Option<String>> {
+        let Some(gaia_session_id) = request.resume_gaia_session_id.as_deref() else {
+            return Ok(None);
+        };
+        if !valid_gaia_session_id(gaia_session_id) {
+            return Err(GaiaAdmissionError::InvalidResume(
+                "expected a local gaia-* session id".to_string(),
+            )
+            .into());
+        }
+        let entry = entries
+            .iter()
+            .rev()
+            .find(|entry| entry.gaia_session_id == gaia_session_id)
+            .ok_or_else(|| {
+                GaiaAdmissionError::InvalidResume(
+                    "session is not present in the Gaia journal".into(),
+                )
+            })?;
+        if entry.kind != request.kind || entry.status != GaiaSessionStatus::Succeeded {
+            return Err(GaiaAdmissionError::InvalidResume(
+                "session must be a successful Gaia session of the same mode".into(),
+            )
+            .into());
+        }
+        entry.claude_session_id.clone().map(Some).ok_or_else(|| {
+            GaiaAdmissionError::InvalidResume("journal entry has no Claude session id".into())
+                .into()
         })
     }
 
@@ -288,20 +445,65 @@ impl ClaudeSessionRunner {
     }
 }
 
-fn append_session_index(path: &Path, entry: &GaiaSessionIndexEntry) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create Gaia session index dir {}", parent.display()))?;
+fn valid_idempotency_key(key: &str) -> bool {
+    (8..=IDEMPOTENCY_KEY_MAX_LEN).contains(&key.len())
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn valid_gaia_session_id(id: &str) -> bool {
+    id.starts_with("gaia-")
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn request_fingerprint(request: &GaiaSessionRequest) -> String {
+    let mut digest = Sha256::new();
+    digest.update(request.kind.slug().as_bytes());
+    digest.update([0]);
+    digest.update(
+        request
+            .resume_gaia_session_id
+            .as_deref()
+            .unwrap_or("")
+            .as_bytes(),
+    );
+    digest.update([0]);
+    digest.update(request.prompt.trim().as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+struct ProcessGroupGuard {
+    pgid: Option<i32>,
+}
+
+impl ProcessGroupGuard {
+    fn new(pid: u32) -> Self {
+        Self {
+            pgid: Some(pid as i32),
+        }
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    serde_json::to_writer(&mut file, entry).context("serialize Gaia session index entry")?;
-    file.write_all(b"\n")
-        .with_context(|| format!("append {}", path.display()))?;
-    Ok(())
+
+    fn kill(&self) {
+        if let Some(pgid) = self.pgid {
+            // The child starts its own process group, so a negative pid targets Claude and tools.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.pgid = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 impl GaiaSessionKind {
@@ -390,9 +592,10 @@ fn max_optional_f64(left: Option<f64>, right: Option<f64>) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::{
-        DEFAULT_CLAUDE_BIN, DEFAULT_COMPANY_CONTEXT_PATH, DEFAULT_EVENTS_DB, DEFAULT_HTTP_BIND,
-        DEFAULT_MAX_BUDGET_USD, DEFAULT_NATS_URL, DEFAULT_READINESS_SCAN_INTERVAL_SECS,
-        DEFAULT_SENTINEL_CTL_BIN, DEFAULT_SENTINEL_GAIA_BIN, DEFAULT_SESSION_TIMEOUT_SECS,
+        DEFAULT_BUDGET_WINDOW_SECS, DEFAULT_BUDGET_WINDOW_USD, DEFAULT_CLAUDE_BIN,
+        DEFAULT_COMPANY_CONTEXT_PATH, DEFAULT_EVENTS_DB, DEFAULT_HTTP_BIND, DEFAULT_MAX_BUDGET_USD,
+        DEFAULT_NATS_URL, DEFAULT_READINESS_SCAN_INTERVAL_SECS, DEFAULT_SENTINEL_CTL_BIN,
+        DEFAULT_SENTINEL_GAIA_BIN, DEFAULT_SESSION_TIMEOUT_SECS,
     };
     use tempfile::TempDir;
 
@@ -408,6 +611,8 @@ mod tests {
             company_context_path: PathBuf::from(DEFAULT_COMPANY_CONTEXT_PATH),
             model: None,
             max_budget_usd: DEFAULT_MAX_BUDGET_USD,
+            budget_window_secs: DEFAULT_BUDGET_WINDOW_SECS,
+            budget_window_usd: DEFAULT_BUDGET_WINDOW_USD,
             session_timeout_secs: DEFAULT_SESSION_TIMEOUT_SECS,
             readiness_scan_interval_secs: DEFAULT_READINESS_SCAN_INTERVAL_SECS,
         }
@@ -417,8 +622,14 @@ mod tests {
     fn builds_deep_args_with_budget_resume_and_sentinel_ctl_only() {
         let dir = tempfile::tempdir().unwrap();
         let runner = ClaudeSessionRunner::new(cfg(&dir));
-        let request = GaiaSessionRequest::deep("inspect task", Some("resume-1".to_string()));
-        let args = runner.build_args(&request, "session-1", "system", "prompt");
+        let request = GaiaSessionRequest::deep("inspect task", Some("gaia-deep-1".to_string()));
+        let args = runner.build_args(
+            &request,
+            "session-1",
+            Some("claude-resume-1"),
+            "system",
+            "prompt",
+        );
         assert!(args.contains(&"-p".to_string()));
         assert!(args.contains(&"--safe-mode".to_string()));
         assert!(has_arg_pair(&args, "--output-format", "stream-json"));
@@ -429,7 +640,7 @@ mod tests {
         assert!(has_arg_pair(&args, "--permission-mode", "dontAsk"));
         assert!(has_arg_pair(&args, "--system-prompt", "system"));
         assert!(has_arg_pair(&args, "--max-budget-usd", "0.05"));
-        assert!(has_arg_pair(&args, "--resume", "resume-1"));
+        assert!(has_arg_pair(&args, "--resume", "claude-resume-1"));
         assert!(!args.contains(&"--max-turns".to_string()));
 
         let allowed_tools = args
@@ -454,7 +665,7 @@ mod tests {
         let request = GaiaSessionRequest::setup_interview("new company", None);
         let output_dir = dir.path().join("config");
         let system_prompt = runner.system_prompt(request.kind, &output_dir);
-        let args = runner.build_args(&request, "session-1", &system_prompt, "prompt");
+        let args = runner.build_args(&request, "session-1", None, &system_prompt, "prompt");
         let allowed_tools = args
             .windows(2)
             .find_map(|pair| (pair[0] == "--allowedTools").then_some(pair[1].as_str()))
@@ -504,14 +715,27 @@ echo 'fake stderr' >&2
         config.claude_bin = fake_claude;
         config.session_timeout_secs = 5;
         let runner = ClaudeSessionRunner::new(config);
-        let request = GaiaSessionRequest::deep("Create task evidence", Some("resume-abc".into()));
         std::env::set_var("SENTINEL_GAIA_TEST_SECRET", "must-not-reach-child");
-        let run = runner.run(request).await.unwrap();
+        let first = runner
+            .run(GaiaSessionRequest::deep("Create task evidence", None))
+            .await
+            .unwrap();
+        let run = runner
+            .run(GaiaSessionRequest::deep(
+                "Continue task evidence",
+                Some(first.entry.gaia_session_id.clone()),
+            ))
+            .await
+            .unwrap();
         std::env::remove_var("SENTINEL_GAIA_TEST_SECRET");
 
         assert_eq!(run.entry.status, GaiaSessionStatus::Succeeded);
         assert_eq!(run.entry.exit_code, Some(0));
-        assert_eq!(run.entry.claude_session_id.as_deref(), Some("resume-abc"));
+        assert_eq!(run.entry.claude_session_id, first.entry.claude_session_id);
+        assert_eq!(
+            run.entry.resumed_from_gaia_session_id.as_deref(),
+            Some(first.entry.gaia_session_id.as_str())
+        );
         assert_eq!(run.entry.usage.input_tokens, 3);
         assert_eq!(run.entry.usage.output_tokens, 5);
         assert_eq!(run.entry.usage.cache_read_input_tokens, 7);
@@ -520,7 +744,7 @@ echo 'fake stderr' >&2
 
         let prompt = fs::read_to_string(&run.prompt_path).unwrap();
         assert!(prompt.contains("Mutating `sentinel-ctl` commands require `--confirm`"));
-        assert!(prompt.contains("Create task evidence"));
+        assert!(prompt.contains("Continue task evidence"));
         let stream = fs::read_to_string(&run.entry.stream_path).unwrap();
         assert!(stream.contains("\"type\":\"message\""));
         let stderr = fs::read_to_string(&run.stderr_path).unwrap();
@@ -530,7 +754,10 @@ echo 'fake stderr' >&2
 
         let argv = fs::read_to_string(argv_path).unwrap();
         assert!(argv.contains("--max-budget-usd\n0.05"));
-        assert!(argv.contains("--resume\nresume-abc"));
+        assert!(argv.contains(&format!(
+            "--resume\n{}",
+            first.entry.claude_session_id.as_deref().unwrap()
+        )));
         assert!(argv.contains("--safe-mode"));
         assert!(!argv.contains("--max-turns"));
         assert_eq!(
@@ -541,6 +768,125 @@ echo 'fake stderr' >&2
             fs::read_to_string(dir.path().join("env.txt")).unwrap(),
             "test_secret=unset\nhome_present=yes\n"
         );
+
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(runner.config().sessions_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        for path in [
+            &run.prompt_path,
+            &run.stderr_path,
+            Path::new(&run.entry.stream_path),
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "{} must be private",
+                path.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_enforces_idempotency_budget_resume_and_single_active_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_claude = dir.path().join("fake-claude.sh");
+        fs::write(
+            &fake_claude,
+            r#"#!/usr/bin/env bash
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+printf 'run\n' >> "$script_dir/invocations.txt"
+echo '{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cost_usd":0.001}}'
+"#,
+        )
+        .unwrap();
+        make_executable(&fake_claude);
+
+        let mut config = cfg(&dir);
+        config.claude_bin = fake_claude;
+        config.max_budget_usd = 0.05;
+        config.budget_window_usd = 0.05;
+        let runner = ClaudeSessionRunner::new(config);
+        let request =
+            GaiaSessionRequest::deep_idempotent("inspect evidence", None, "idempotency-key-0001");
+        let active_lock = try_exclusive_file_lock(&runner.config().session_active_lock_path())
+            .unwrap()
+            .expect("test must acquire active-session lock");
+        let busy = runner
+            .run(GaiaSessionRequest::deep_idempotent(
+                "parallel request",
+                None,
+                "idempotency-key-0004",
+            ))
+            .await
+            .unwrap_err();
+        drop(active_lock);
+        assert!(matches!(
+            busy.downcast_ref::<GaiaAdmissionError>(),
+            Some(GaiaAdmissionError::Busy)
+        ));
+
+        let invalid_resume = runner
+            .run(GaiaSessionRequest::deep_idempotent(
+                "resume foreign context",
+                Some("11111111-1111-1111-1111-111111111111".to_string()),
+                "idempotency-key-0003",
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            invalid_resume.downcast_ref::<GaiaAdmissionError>(),
+            Some(GaiaAdmissionError::InvalidResume(_))
+        ));
+
+        let first = runner.run(request.clone()).await.unwrap();
+        let replay = runner.run(request).await.unwrap();
+        assert_eq!(first.entry.gaia_session_id, replay.entry.gaia_session_id);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("invocations.txt"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        let conflict = runner
+            .run(GaiaSessionRequest::deep_idempotent(
+                "different request",
+                None,
+                "idempotency-key-0001",
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            conflict.downcast_ref::<GaiaAdmissionError>(),
+            Some(GaiaAdmissionError::IdempotencyConflict)
+        ));
+
+        let budget = runner
+            .run(GaiaSessionRequest::deep_idempotent(
+                "second paid request",
+                None,
+                "idempotency-key-0002",
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            budget.downcast_ref::<GaiaAdmissionError>(),
+            Some(GaiaAdmissionError::BudgetExceeded { .. })
+        ));
+
+        assert!(
+            try_exclusive_file_lock(&runner.config().session_active_lock_path())
+                .unwrap()
+                .is_some(),
+            "admission errors must release the active-session lock"
+        );
     }
 
     #[tokio::test]
@@ -550,7 +896,10 @@ echo 'fake stderr' >&2
         fs::write(
             &fake_claude,
             r#"#!/usr/bin/env bash
-sleep 5
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+sleep 30 &
+echo "$!" > "$script_dir/tool-child.pid"
+wait
 "#,
         )
         .unwrap();
@@ -572,6 +921,21 @@ sleep 5
         let prompt = fs::read_to_string(&run.prompt_path).unwrap();
         assert!(prompt.contains("GaiaSpec"));
         assert!(prompt.contains("company-context.md"));
+
+        let child_pid = fs::read_to_string(dir.path().join("tool-child.pid"))
+            .unwrap()
+            .trim()
+            .to_string();
+        let proc_stat = PathBuf::from(format!("/proc/{child_pid}/stat"));
+        for _ in 0..50 {
+            let stopped = !proc_stat.exists()
+                || fs::read_to_string(&proc_stat).is_ok_and(|stat| stat.contains(") Z "));
+            if stopped {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("tool subprocess {child_pid} survived the Gaia timeout");
     }
 
     #[test]
