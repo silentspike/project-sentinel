@@ -58,6 +58,12 @@ impl ClaudeUsageSummary {
 pub struct GaiaSessionIndexEntry {
     pub gaia_session_id: String,
     pub claude_session_id: Option<String>,
+    #[serde(default)]
+    pub resumed_from_gaia_session_id: Option<String>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub request_fingerprint: Option<String>,
     pub kind: GaiaSessionKind,
     pub status: GaiaSessionStatus,
     pub stream_path: String,

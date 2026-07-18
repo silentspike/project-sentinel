@@ -33,12 +33,34 @@ async fn request(
     body: impl Into<Body>,
     authed: bool,
 ) -> (StatusCode, serde_json::Value) {
+    request_with_idempotency(
+        state,
+        method,
+        path,
+        body,
+        authed,
+        Some("test-idempotency-0001"),
+    )
+    .await
+}
+
+async fn request_with_idempotency(
+    state: AppState,
+    method: Method,
+    path: &str,
+    body: impl Into<Body>,
+    authed: bool,
+    idempotency_key: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
     let token = state.sessions.create();
     let app = build_app(state);
     let mut builder = Request::builder()
         .method(method)
         .uri(path)
         .header(header::CONTENT_TYPE, "application/json");
+    if let Some(idempotency_key) = idempotency_key {
+        builder = builder.header("Idempotency-Key", idempotency_key);
+    }
     if authed {
         builder = builder.header(header::COOKIE, format!("{}={token}", auth::SESSION_COOKIE));
     }
@@ -103,6 +125,9 @@ async fn gaia_read_routes_return_console_jsonl() {
         &GaiaSessionIndexEntry {
             gaia_session_id: "gaia-deep-test".into(),
             claude_session_id: Some("claude-test".into()),
+            resumed_from_gaia_session_id: None,
+            idempotency_key: None,
+            request_fingerprint: None,
             kind: GaiaSessionKind::Deep,
             status: GaiaSessionStatus::Succeeded,
             stream_path: console_dir
@@ -190,22 +215,171 @@ echo '{"type":"message","usage":{"input_tokens":2,"output_tokens":3,"cost_usd":0
         state.clone(),
         Method::POST,
         "/api/gaia/deep",
-        Body::from(r#"{"prompt":"create task evidence","resume":"resume-test"}"#),
+        Body::from(r#"{"prompt":"create task evidence"}"#),
         true,
     )
     .await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["entry"]["status"], "succeeded");
-    assert_eq!(body["entry"]["claude_session_id"], "resume-test");
+    assert!(body["entry"]["claude_session_id"].as_str().is_some());
     assert_eq!(body["entry"]["usage"]["input_tokens"], 2);
     let stream_path = body["entry"]["stream_path"].as_str().unwrap();
     assert!(Path::new(stream_path).exists());
 
     let argv = fs::read_to_string(dir.path().join("argv.txt")).unwrap();
     assert!(argv.contains("--max-budget-usd\n0.05"));
-    assert!(argv.contains("--resume\nresume-test"));
+    assert!(argv.contains("--session-id"));
     assert!(!argv.contains("--max-turns"));
+
+    let (replay_status, replay) = request(
+        state,
+        Method::POST,
+        "/api/gaia/deep",
+        Body::from(r#"{"prompt":"create task evidence"}"#),
+        true,
+    )
+    .await;
+    assert_eq!(replay_status, StatusCode::OK);
+    assert_eq!(
+        replay["entry"]["gaia_session_id"],
+        body["entry"]["gaia_session_id"]
+    );
+}
+
+#[tokio::test]
+async fn gaia_write_admission_maps_missing_key_conflict_busy_budget_and_foreign_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let base_state = test_state(&dir);
+    let mut config = (*base_state.config).clone();
+    config.gaia_budget_window_usd = 0.05;
+    let state = AppState::new(config).unwrap();
+    let fake_claude = PathBuf::from(&state.config.gaia_claude_bin);
+    fs::write(
+        &fake_claude,
+        r#"#!/usr/bin/env bash
+echo '{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cost_usd":0.001}}'
+"#,
+    )
+    .unwrap();
+    make_executable(&fake_claude);
+
+    let (missing, _) = request_with_idempotency(
+        state.clone(),
+        Method::POST,
+        "/api/gaia/deep",
+        Body::from(r#"{"prompt":"one"}"#),
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(missing, StatusCode::BAD_REQUEST);
+
+    let (foreign, _) = request_with_idempotency(
+        state.clone(),
+        Method::POST,
+        "/api/gaia/deep",
+        Body::from(
+            r#"{"prompt":"one","resume_session_id":"11111111-1111-1111-1111-111111111111"}"#,
+        ),
+        true,
+        Some("test-idempotency-foreign"),
+    )
+    .await;
+    assert_eq!(foreign, StatusCode::BAD_REQUEST);
+
+    let lock_path = PathBuf::from(&state.config.gaia_console_dir)
+        .join("sessions")
+        .join(sentinel_gaia_loop::SESSION_ACTIVE_LOCK_FILE_NAME);
+    let active_lock = sentinel_gaia_loop::storage::try_exclusive_file_lock(&lock_path)
+        .unwrap()
+        .unwrap();
+    let (busy, _) = request_with_idempotency(
+        state.clone(),
+        Method::POST,
+        "/api/gaia/deep",
+        Body::from(r#"{"prompt":"one"}"#),
+        true,
+        Some("test-idempotency-busy"),
+    )
+    .await;
+    drop(active_lock);
+    assert_eq!(busy, StatusCode::TOO_MANY_REQUESTS);
+
+    let (first, _) = request_with_idempotency(
+        state.clone(),
+        Method::POST,
+        "/api/gaia/deep",
+        Body::from(r#"{"prompt":"one"}"#),
+        true,
+        Some("test-idempotency-first"),
+    )
+    .await;
+    assert_eq!(first, StatusCode::OK);
+
+    let (conflict, _) = request_with_idempotency(
+        state.clone(),
+        Method::POST,
+        "/api/gaia/deep",
+        Body::from(r#"{"prompt":"different"}"#),
+        true,
+        Some("test-idempotency-first"),
+    )
+    .await;
+    assert_eq!(conflict, StatusCode::CONFLICT);
+
+    let (budget, _) = request_with_idempotency(
+        state,
+        Method::POST,
+        "/api/gaia/deep",
+        Body::from(r#"{"prompt":"two"}"#),
+        true,
+        Some("test-idempotency-second"),
+    )
+    .await;
+    assert_eq!(budget, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn gaia_rate_limit_counts_new_operations_and_allows_idempotent_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let base_state = test_state(&dir);
+    let mut config = (*base_state.config).clone();
+    config.gaia_rate_limit_requests = 1;
+    let state = AppState::new(config).unwrap();
+    let fake_claude = PathBuf::from(&state.config.gaia_claude_bin);
+    fs::write(
+        &fake_claude,
+        r#"#!/usr/bin/env bash
+echo '{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cost_usd":0.001}}'
+"#,
+    )
+    .unwrap();
+    make_executable(&fake_claude);
+
+    for _ in 0..2 {
+        let (status, _) = request_with_idempotency(
+            state.clone(),
+            Method::POST,
+            "/api/gaia/deep",
+            Body::from(r#"{"prompt":"one"}"#),
+            true,
+            Some("rate-operation-one"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let (limited, _) = request_with_idempotency(
+        state,
+        Method::POST,
+        "/api/gaia/deep",
+        Body::from(r#"{"prompt":"two"}"#),
+        true,
+        Some("rate-operation-two"),
+    )
+    .await;
+    assert_eq!(limited, StatusCode::TOO_MANY_REQUESTS);
 }
 
 fn append_jsonl<T: serde::Serialize>(path: &Path, value: &T) {

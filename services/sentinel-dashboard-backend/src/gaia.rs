@@ -4,17 +4,21 @@
 //! JSONL files. POST routes run one bounded Claude Code session through the
 //! `sentinel-gaia-loop` library; the readiness service path remains token-free.
 
+use std::collections::VecDeque;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{Path as AxumPath, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use sentinel_gaia_loop::config::GaiaLoopConfig;
-use sentinel_gaia_loop::session::{ClaudeSessionRunner, GaiaSessionRequest};
+use sentinel_gaia_loop::session::{ClaudeSessionRunner, GaiaAdmissionError, GaiaSessionRequest};
+use sentinel_gaia_loop::storage::read_jsonl_locked;
 use sentinel_gaia_loop::types::{GaiaAlert, GaiaSessionIndexEntry, GaiaSessionStatus};
 use serde::Deserialize;
 use serde_json::json;
@@ -25,14 +29,50 @@ use crate::AppState;
 pub struct StartSessionRequest {
     prompt: String,
     #[serde(default)]
-    resume: Option<String>,
+    resume_session_id: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct GaiaRequestLimiter {
+    attempts: Arc<Mutex<VecDeque<(Instant, String)>>>,
+    max_requests: usize,
+    window: Duration,
+}
+
+impl GaiaRequestLimiter {
+    pub fn new(max_requests: usize, window: Duration) -> Self {
+        Self {
+            attempts: Arc::new(Mutex::new(VecDeque::new())),
+            max_requests,
+            window,
+        }
+    }
+
+    fn allow(&self, idempotency_key: &str) -> bool {
+        let now = Instant::now();
+        let mut attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+        while attempts
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= self.window)
+        {
+            attempts.pop_front();
+        }
+        if attempts.iter().any(|(_, key)| key == idempotency_key) {
+            return true;
+        }
+        if attempts.len() >= self.max_requests {
+            return false;
+        }
+        attempts.push_back((now, idempotency_key.to_string()));
+        true
+    }
 }
 
 /// GET /api/gaia/alerts — persisted readiness alerts from the token-free Gaia loop.
 pub async fn alerts(State(st): State<AppState>) -> Response {
     let path =
         PathBuf::from(&st.config.gaia_console_dir).join(sentinel_gaia_loop::ALERTS_FILE_NAME);
-    match read_jsonl::<GaiaAlert>(&path) {
+    match read_jsonl_locked::<GaiaAlert>(&path) {
         Ok(alerts) => Json(json!({
             "alerts": alerts,
             "count": alerts.len(),
@@ -48,7 +88,7 @@ pub async fn sessions(State(st): State<AppState>) -> Response {
     let path = PathBuf::from(&st.config.gaia_console_dir)
         .join(sentinel_gaia_loop::SESSIONS_DIR_NAME)
         .join(sentinel_gaia_loop::SESSION_INDEX_FILE_NAME);
-    match read_jsonl::<GaiaSessionIndexEntry>(&path) {
+    match read_jsonl_locked::<GaiaSessionIndexEntry>(&path) {
         Ok(sessions) => Json(json!({
             "sessions": sessions,
             "count": sessions.len(),
@@ -92,18 +132,43 @@ pub async fn session_stream(
 }
 
 /// POST /api/gaia/deep — explicit one-turn Claude Code deep session.
-pub async fn deep(State(st): State<AppState>, Json(req): Json<StartSessionRequest>) -> Response {
-    run_session(st, GaiaSessionRequest::deep(req.prompt, req.resume)).await
+pub async fn deep(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<StartSessionRequest>,
+) -> Response {
+    let Some(idempotency_key) = idempotency_key(&headers) else {
+        return missing_idempotency_key();
+    };
+    if !st.gaia_request_limiter.allow(&idempotency_key) {
+        return request_rate_limited();
+    }
+    run_session(
+        st,
+        GaiaSessionRequest::deep_idempotent(req.prompt, req.resume_session_id, idempotency_key),
+    )
+    .await
 }
 
 /// POST /api/gaia/setup-interview — explicit setup interview Claude Code session.
 pub async fn setup_interview(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<StartSessionRequest>,
 ) -> Response {
+    let Some(idempotency_key) = idempotency_key(&headers) else {
+        return missing_idempotency_key();
+    };
+    if !st.gaia_request_limiter.allow(&idempotency_key) {
+        return request_rate_limited();
+    }
     run_session(
         st,
-        GaiaSessionRequest::setup_interview(req.prompt, req.resume),
+        GaiaSessionRequest::setup_interview_idempotent(
+            req.prompt,
+            req.resume_session_id,
+            idempotency_key,
+        ),
     )
     .await
 }
@@ -134,6 +199,18 @@ async fn run_session(st: AppState, request: GaiaSessionRequest) -> Response {
             })),
         )
             .into_response(),
+        Err(error) if error.downcast_ref::<GaiaAdmissionError>().is_some() => {
+            let admission = error.downcast_ref::<GaiaAdmissionError>().expect("checked");
+            let status = match admission {
+                GaiaAdmissionError::Busy | GaiaAdmissionError::BudgetExceeded { .. } => {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+                GaiaAdmissionError::IdempotencyConflict => StatusCode::CONFLICT,
+                GaiaAdmissionError::InvalidIdempotencyKey
+                | GaiaAdmissionError::InvalidResume(_) => StatusCode::BAD_REQUEST,
+            };
+            (status, Json(json!({"error": admission.to_string()}))).into_response()
+        }
         Err(error) => {
             tracing::warn!(error = %error, "Gaia Console session failed");
             (
@@ -157,6 +234,8 @@ fn gaia_loop_config(st: &AppState) -> anyhow::Result<GaiaLoopConfig> {
         company_context_path: PathBuf::from(&st.config.gaia_company_context_path),
         model: st.config.gaia_model.clone(),
         max_budget_usd: st.config.gaia_max_budget_usd,
+        budget_window_secs: st.config.gaia_budget_window_secs,
+        budget_window_usd: st.config.gaia_budget_window_usd,
         session_timeout_secs: st.config.gaia_session_timeout_secs,
         readiness_scan_interval_secs: sentinel_gaia_loop::DEFAULT_READINESS_SCAN_INTERVAL_SECS,
     };
@@ -164,18 +243,29 @@ fn gaia_loop_config(st: &AppState) -> anyhow::Result<GaiaLoopConfig> {
     Ok(config)
 }
 
-fn read_jsonl<T>(path: &Path) -> anyhow::Result<Vec<T>>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let raw = fs::read_to_string(path)?;
-    raw.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str::<T>(line).map_err(Into::into))
-        .collect()
+fn idempotency_key(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn missing_idempotency_key() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "Idempotency-Key header is required"})),
+    )
+        .into_response()
+}
+
+fn request_rate_limited() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error": "Gaia request rate limit exceeded"})),
+    )
+        .into_response()
 }
 
 fn safe_session_id(id: &str) -> Option<&str> {
@@ -208,5 +298,14 @@ mod tests {
         assert_eq!(safe_session_id("../gaia-deep-abc"), None);
         assert_eq!(safe_session_id("gaia/abc"), None);
         assert_eq!(safe_session_id("deep-abc"), None);
+    }
+
+    #[test]
+    fn limiter_counts_distinct_operations_but_allows_safe_retries() {
+        let limiter = GaiaRequestLimiter::new(2, Duration::from_secs(60));
+        assert!(limiter.allow("operation-1"));
+        assert!(limiter.allow("operation-1"));
+        assert!(limiter.allow("operation-2"));
+        assert!(!limiter.allow("operation-3"));
     }
 }

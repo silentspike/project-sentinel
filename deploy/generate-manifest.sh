@@ -46,6 +46,8 @@ ARTIFACT_DEFS=(
   # Init scripts
   "deploy/scripts/init-cgroups.sh|/opt/sentinel/scripts/init-cgroups.sh|script"
   "deploy/scripts/init-dirs.sh|/opt/sentinel/scripts/init-dirs.sh|script"
+  "deploy/scripts/init-dashboard-auth.sh|/opt/sentinel/scripts/init-dashboard-auth.sh|script"
+  "deploy/scripts/install-native-claude.sh|/opt/sentinel/scripts/install-native-claude.sh|script"
   "deploy/scripts/init-hugepages.sh|/opt/sentinel/scripts/init-hugepages.sh|script"
   "deploy/scripts/init-sysctl.sh|/opt/sentinel/scripts/init-sysctl.sh|script"
   "deploy/scripts/init-tmpfs.sh|/opt/sentinel/scripts/init-tmpfs.sh|script"

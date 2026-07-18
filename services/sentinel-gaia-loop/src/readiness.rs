@@ -431,6 +431,8 @@ mod tests {
             company_context_path: crate::DEFAULT_COMPANY_CONTEXT_PATH.into(),
             model: None,
             max_budget_usd: crate::DEFAULT_MAX_BUDGET_USD,
+            budget_window_secs: crate::DEFAULT_BUDGET_WINDOW_SECS,
+            budget_window_usd: crate::DEFAULT_BUDGET_WINDOW_USD,
             session_timeout_secs: crate::DEFAULT_SESSION_TIMEOUT_SECS,
             readiness_scan_interval_secs: crate::DEFAULT_READINESS_SCAN_INTERVAL_SECS,
         }

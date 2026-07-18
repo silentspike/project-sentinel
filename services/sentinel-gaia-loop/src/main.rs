@@ -37,7 +37,7 @@ enum Commands {
         /// Operator task prompt for this single Claude turn.
         #[arg(long)]
         prompt: String,
-        /// Existing Claude session id for a follow-up turn.
+        /// Existing local Gaia session id for a follow-up turn.
         #[arg(long)]
         resume: Option<String>,
     },
@@ -46,7 +46,7 @@ enum Commands {
         /// Setup request prompt for this single Claude turn.
         #[arg(long)]
         prompt: String,
-        /// Existing Claude session id for a follow-up turn.
+        /// Existing local Gaia session id for a follow-up turn.
         #[arg(long)]
         resume: Option<String>,
     },
@@ -93,6 +93,8 @@ fn print_config(json: bool) -> Result<()> {
         );
         println!("model={}", cfg.model.as_deref().unwrap_or(""));
         println!("max_budget_usd={}", cfg.max_budget_usd);
+        println!("budget_window_secs={}", cfg.budget_window_secs);
+        println!("budget_window_usd={}", cfg.budget_window_usd);
         println!("session_timeout_secs={}", cfg.session_timeout_secs);
         println!(
             "readiness_scan_interval_secs={}",
