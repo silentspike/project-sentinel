@@ -54,6 +54,20 @@ both nodes: 2.1.214 (Claude Code)
 both nodes: /opt/sentinel/bin/claude -> /opt/sentinel/bin/claude-2.1.214 (root-owned symlink)
 ```
 
+The pinned version was also checked against Anthropic's official release
+repository on the deploy date:
+
+```bash
+gh api repos/anthropics/claude-code/releases/latest \
+  --jq '{tag_name,published_at,html_url}'
+```
+
+```text
+tag_name=v2.1.214
+published_at=2026-07-18T01:20:30Z
+https://github.com/anthropics/claude-code/releases/tag/v2.1.214
+```
+
 Authenticated readback used the persistent secret without printing it:
 
 ```text
