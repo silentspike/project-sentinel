@@ -17,6 +17,7 @@ Environment=SENTINEL_GAIA_CONSOLE_DIR=/opt/sentinel/data/gaia-console
 Environment=SENTINEL_EVENTS_DB=/opt/sentinel/data/events.db
 Environment=SENTINEL_NATS_URL=nats://127.0.0.1:4222
 Environment=SENTINEL_GAIA_SCAN_INTERVAL_SECS=60
+Environment=SENTINEL_GAIA_CLAUDE_BIN=/opt/sentinel/bin/claude
 Environment=RUST_LOG=info
 Restart=on-failure
 RestartSec=5

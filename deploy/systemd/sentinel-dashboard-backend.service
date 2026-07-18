@@ -8,6 +8,8 @@ StartLimitIntervalSec=300
 
 [Service]
 Type=simple
+User=ubuntu
+Group=ubuntu
 WorkingDirectory=/opt/sentinel
 ExecStart=/opt/sentinel/bin/sentinel-dashboard-backend
 # Operator secret (SENTINEL_DASHBOARD_API_KEY) + login rate-limit knobs; see
@@ -28,7 +30,7 @@ Environment=SENTINEL_EVENTS_DB=/opt/sentinel/data/events.db
 Environment=SENTINEL_DASHBOARD_BUNDLE_DIR=/opt/sentinel/console-dist
 Environment=SENTINEL_DASHBOARD_CERT_DIR=/opt/sentinel/console-cert
 Environment=SENTINEL_GAIA_CONSOLE_DIR=/opt/sentinel/data/gaia-console
-Environment=SENTINEL_GAIA_CLAUDE_BIN=claude
+Environment=SENTINEL_GAIA_CLAUDE_BIN=/opt/sentinel/bin/claude
 Environment=SENTINEL_CTL_BIN=/opt/sentinel/bin/sentinel-ctl
 Environment=SENTINEL_GAIA_BIN=/opt/sentinel/bin/sentinel-gaia
 Environment=SENTINEL_GAIA_MAX_BUDGET_USD=0.05
