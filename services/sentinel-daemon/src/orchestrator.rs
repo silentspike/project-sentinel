@@ -1143,6 +1143,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                         &alias,
                         cluster.cluster_id,
                         cluster.node_id,
+                        cluster.effective_chef_node_id(),
                         &cluster.control_peers,
                         Arc::clone(
                             cluster_membership
@@ -1223,6 +1224,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                     seed_fingerprint: control.fingerprint().to_hex(),
                     pending_targets: cluster.pending_targets.clone(),
                     binary_path,
+                    journal_path: data_dir.join("provision-ops.json"),
                     bootstrap_user: "ubuntu".to_string(),
                 };
                 let provision_event_store = Arc::clone(&event_store);
@@ -4034,6 +4036,7 @@ struct ProvisionWorkerConfig {
     seed_fingerprint: String,
     pending_targets: Vec<sentinel_common::cluster::PendingBareNode>,
     binary_path: std::path::PathBuf,
+    journal_path: std::path::PathBuf,
     bootstrap_user: String,
 }
 
@@ -4058,10 +4061,10 @@ fn run_provision_worker(
     event_store: Arc<EventStore>,
 ) {
     use crate::provision_exec::{
-        execute_provision_node, sanitize_alias, sha256_file, ProvisionPlan, ProvisionTiming,
-        SshProvisionTransport,
+        execute_provision_node, sanitize_alias, sha256_file, ProvisionJournal, ProvisionPlan,
+        ProvisionReservation, ProvisionTiming, SshProvisionTransport,
     };
-    use sentinel_common::provision::{validate_pending_target, ProvisionOp, ProvisionOpState};
+    use sentinel_common::provision::validate_pending_target;
 
     let ProvisionWorkerConfig {
         cluster_id,
@@ -4071,6 +4074,7 @@ fn run_provision_worker(
         seed_fingerprint,
         pending_targets,
         binary_path,
+        journal_path,
         bootstrap_user,
     } = config;
 
@@ -4109,18 +4113,33 @@ fn run_provision_worker(
         }
     };
 
-    // Idempotency (AC-S2): a completed op for an idempotency_key makes a re-run a no-op.
-    let mut seen: std::collections::HashMap<String, ProvisionOpState> =
-        std::collections::HashMap::new();
+    let journal = match ProvisionJournal::open(&journal_path) {
+        Ok(journal) => journal,
+        Err(error) => {
+            warn!(%error, path = %journal_path.display(),
+                "ProvisionNode disabled: durable journal unavailable");
+            return;
+        }
+    };
 
     while let Ok(cmd) = provision_rx.recv() {
-        if matches!(
-            seen.get(&cmd.idempotency_key),
-            Some(ProvisionOpState::Completed)
-        ) {
-            info!(idempotency_key = %cmd.idempotency_key,
-                "ProvisionNode: bereits abgeschlossen, no-op (AC-S2)");
-            continue;
+        let alias = cmd
+            .requested_alias
+            .as_deref()
+            .and_then(sanitize_alias)
+            .or_else(|| sanitize_alias(&cmd.pending_target_id))
+            .unwrap_or_else(|| "node".to_string());
+        match journal.lookup(&cmd.pending_target_id, &alias, &cmd.idempotency_key) {
+            Ok(Some(op)) if op.state == sentinel_common::provision::ProvisionOpState::Completed => {
+                info!(idempotency_key = %cmd.idempotency_key, node_id = ?op.node_id,
+                    "ProvisionNode: durably completed, no-op (AC-S2)");
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(%error, "ProvisionNode rejected: durable identity conflict");
+                continue;
+            }
         }
         let now_unix_s = (now_ms() / 1000) as i64;
         // V14: host/identity come from the allowlist, never from the request.
@@ -4132,17 +4151,31 @@ fn run_provision_worker(
                     continue;
                 }
             };
-        let alias = cmd
-            .requested_alias
-            .as_deref()
-            .and_then(sanitize_alias)
-            .or_else(|| sanitize_alias(&cmd.pending_target_id))
-            .unwrap_or_else(|| "node".to_string());
-        let node_id = sentinel_common::NodeId::new();
+        let mut op = match journal.reserve(
+            &cmd.pending_target_id,
+            &alias,
+            &cmd.idempotency_key,
+            now_ms(),
+        ) {
+            Ok(ProvisionReservation::Execute(op)) => op,
+            Ok(ProvisionReservation::Completed(_)) => continue,
+            Err(error) => {
+                warn!(%error, "ProvisionNode rejected: journal reservation failed");
+                continue;
+            }
+        };
+        let Some(node_id) = op.node_id else {
+            warn!(op_id = %op.op_id, "ProvisionNode rejected: journal entry has no NodeId");
+            continue;
+        };
         let target_ip: std::net::IpAddr = match pending.target_ip.parse() {
             Ok(ip) => ip,
             Err(e) => {
                 warn!(error = %e, target = %pending.target_ip, "ProvisionNode target IP is invalid");
+                op.fail(format!("invalid target IP: {e}"), now_ms());
+                if let Err(error) = journal.update(&op) {
+                    warn!(%error, "ProvisionNode invalid-target state could not be journaled");
+                }
                 continue;
             }
         };
@@ -4153,13 +4186,6 @@ fn run_provision_worker(
         } else {
             format!("0.0.0.0:{}", seed_control_addr.port())
         };
-        let mut op = ProvisionOp::new(
-            uuid::Uuid::new_v4(),
-            cmd.pending_target_id.clone(),
-            alias.clone(),
-            cmd.idempotency_key.clone(),
-            now_ms(),
-        );
         let plan = ProvisionPlan {
             assigned_node_id: node_id,
             alias: alias.clone(),
@@ -4182,7 +4208,9 @@ fn run_provision_worker(
             Err(e) => {
                 warn!(error = %e, "ProvisionNode: Transport-Setup fehlgeschlagen");
                 op.fail(format!("transport: {e}"), now_ms());
-                seen.insert(cmd.idempotency_key, op.state);
+                if let Err(error) = journal.update(&op) {
+                    warn!(%error, "ProvisionNode failure state could not be journaled");
+                }
                 continue;
             }
         };
@@ -4195,6 +4223,7 @@ fn run_provision_worker(
             &provision_cluster,
             ProvisionTiming::default(),
             &now_ms,
+            &|op| journal.update(op),
         ) {
             Ok(duration_ms) => {
                 let payload = DomainEventPayload::NodeProvisioned {
@@ -4221,7 +4250,6 @@ fn run_provision_worker(
                     "ProvisionNode fehlgeschlagen (Target quarantined, AC-B6)");
             }
         }
-        seen.insert(cmd.idempotency_key, op.state);
     }
 }
 

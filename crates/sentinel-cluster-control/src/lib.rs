@@ -23,14 +23,17 @@ pub mod server;
 pub mod tls;
 
 pub use block_pull::{
-    BlockProvider, BlockPullClient, BlockPullError, BlockPullRequest, BlockPullServer,
+    BlockProvider, BlockPullClient, BlockPullConnection, BlockPullError, BlockPullRequest,
+    BlockPullServer,
 };
 pub use cert::{CertFingerprint, NodeCertificate};
-pub use client::ControlClient;
+pub use client::{ControlClient, ControlConnection};
 pub use envelope::{
     decode_frame, encode_frame, CodecError, ControlEnvelope, ControlReply, ControlRequest,
     ControlResponse, MAX_FRAME_BYTES,
 };
-pub use handler::{BlockMapGossipHandler, ControlHandler, StubHandler};
-pub use idempotency::IdempotencyCache;
+pub use handler::{
+    BlockMapGossipHandler, ChefAuthorizingHandler, ControlHandler, FailClosedHandler, StubHandler,
+};
+pub use idempotency::{IdempotencyCache, IdempotencyOutcome, IdempotencyScope, RequestDigest};
 pub use server::{AuthenticatedPeer, ControlServer, PeerRegistry};

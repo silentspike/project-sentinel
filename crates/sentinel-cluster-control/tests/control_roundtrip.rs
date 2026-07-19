@@ -45,23 +45,35 @@ async fn rpc_roundtrip_idempotency_and_server_pin() {
         }
     ));
 
-    // AC-2 (live): a re-send with the SAME idempotency_key returns the cached reply,
-    // not the new request's — even though env2 carries a different request body.
+    // Reusing the same peer/method/key tuple for a different payload is rejected.
     let env2 = ControlEnvelope::new(
+        "k1",
+        ControlRequest::RefQuery {
+            block_ref: "something-else".into(),
+        },
+    );
+    let reply2 = client.rpc(addr, server_fp, &env2).await.unwrap();
+    assert_eq!(reply2.request_id, env2.request_id);
+    assert!(
+        matches!(reply2.response, ControlResponse::IdempotencyConflict { .. }),
+        "a reused key cannot alias a different payload"
+    );
+
+    // The method is part of the scope, so another method may use the same operator key.
+    let env_method = ControlEnvelope::new(
         "k1",
         ControlRequest::PinQuery {
             block_ref: "something-else".into(),
         },
     );
-    let reply2 = client.rpc(addr, server_fp, &env2).await.unwrap();
-    assert_eq!(
-        reply2.request_id, env.request_id,
-        "idempotency: re-send returns the ORIGINAL cached reply"
-    );
-    assert!(
-        matches!(reply2.response, ControlResponse::RefQueryResult { .. }),
-        "cached reply, not the second request's PinQueryResult"
-    );
+    assert!(matches!(
+        client
+            .rpc(addr, server_fp, &env_method)
+            .await
+            .unwrap()
+            .response,
+        ControlResponse::PinQueryResult { .. }
+    ));
 
     // AC-4: the client rejects a server whose fingerprint does not match the pin.
     let wrong = NodeCertificate::generate("evil").unwrap().fingerprint();
@@ -165,7 +177,8 @@ async fn holder_gossip_over_the_wire_merges_into_the_shared_block_map() {
     let server_fp = server_node.fingerprint();
     let client_fp = client_node.fingerprint();
 
-    let peers = PeerRegistry::new([(client_fp, NodeId::new())]).unwrap();
+    let holder = NodeId::new();
+    let peers = PeerRegistry::new([(client_fp, holder)]).unwrap();
 
     // node-0's server merges inbound holder gossip into this shared block map (#498).
     let block_map = Arc::new(Mutex::new(BlockMap::new()));
@@ -178,7 +191,6 @@ async fn holder_gossip_over_the_wire_merges_into_the_shared_block_map() {
     let client = ControlClient::new(&client_node).unwrap();
 
     // node-1 advertises that it holds two blocks; the gossip crosses a real QUIC stream.
-    let holder = NodeId::new();
     let boot = Uuid::new_v4();
     let adv = |n: u8| HolderAdvertisement {
         block_ref: BlockRef::blob_sha256([n; 32], 1024),
@@ -246,5 +258,73 @@ async fn server_rejects_unpinned_client() {
         "server must reject an unpinned client"
     );
 
+    server.close();
+}
+
+#[tokio::test]
+async fn revocation_closes_an_established_control_session_and_blocks_reconnect() {
+    let server_node = NodeCertificate::generate("node-0").unwrap();
+    let client_node = NodeCertificate::generate("node-1").unwrap();
+    let server_fp = server_node.fingerprint();
+    let client_fp = client_node.fingerprint();
+    let client_node_id = sentinel_common::NodeId::new();
+    let peers = PeerRegistry::new([(client_fp, client_node_id)]).unwrap();
+    let server = ControlServer::bind(
+        loopback(),
+        &server_node,
+        peers.clone(),
+        Arc::new(StubHandler),
+    )
+    .unwrap();
+    let client = ControlClient::new(&client_node).unwrap();
+    let session = client
+        .connect(server.local_addr(), server_fp)
+        .await
+        .unwrap();
+    let request = || {
+        ControlEnvelope::new(
+            uuid::Uuid::new_v4().to_string(),
+            ControlRequest::RefQuery {
+                block_ref: "cas-blob:v1:sha256:revocation".into(),
+            },
+        )
+    };
+
+    assert!(matches!(
+        session.rpc(&request()).await.unwrap().response,
+        ControlResponse::RefQueryResult { .. }
+    ));
+    assert_eq!(
+        peers.revoke(client_node_id),
+        1,
+        "the established control connection must be registered for active close"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), session.rpc(&request()))
+            .await
+            .expect("revoked session must terminate promptly")
+            .is_err(),
+        "a revoked established session cannot open another RPC stream"
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.rpc(server.local_addr(), server_fp, &request()),
+        )
+        .await
+        .expect("reconnect rejection must be prompt")
+        .is_err(),
+        "the revoked certificate cannot reconnect"
+    );
+
+    peers.authorize(client_fp, client_node_id).unwrap();
+    assert!(matches!(
+        client
+            .rpc(server.local_addr(), server_fp, &request())
+            .await
+            .unwrap()
+            .response,
+        ControlResponse::RefQueryResult { .. }
+    ));
     server.close();
 }

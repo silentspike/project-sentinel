@@ -2,12 +2,16 @@
 //!
 //! ADR-2: control RPCs travel as a `ControlEnvelope` over a cert-pinned QUIC bidi
 //! stream, reusing the dashboard `wt.rs` u32-BE length-prefixed frame format. The
-//! `idempotency_key` makes a re-sent RPC an exactly-once effect (V5/V39).
+//! The receiver binds `idempotency_key` to authenticated peer, RPC method, and
+//! request digest for process-local duplicate suppression (V5/V39).
 
 use sentinel_common::{Heartbeat, HolderAdvertisement, NodeId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+use crate::idempotency::RequestDigest;
 
 /// Hard cap on a single control frame (1 MiB). Control messages are tiny; the cap
 /// guards the decoder against a hostile/oversized length prefix.
@@ -81,10 +85,24 @@ impl ControlRequest {
     }
 
     /// Whether the server may reuse a cached reply for this request. Membership
-    /// heartbeats are observations, not exactly-once effects: every received packet
+    /// heartbeats are observations, not deduplicated effects: every received packet
     /// must reach the handler to refresh liveness and must not grow the dedup cache.
     pub fn cache_response(&self) -> bool {
         !matches!(self, Self::MembershipHeartbeat { .. })
+    }
+
+    /// Stable digest used to bind an idempotency key to one exact request body.
+    pub fn digest(&self) -> Result<RequestDigest, serde_json::Error> {
+        let encoded = serde_json::to_vec(self)?;
+        Ok(RequestDigest(Sha256::digest(encoded).into()))
+    }
+
+    /// Owner-state mutations are accepted only from the configured chef node.
+    pub fn requires_chef_authorization(&self) -> bool {
+        matches!(
+            self,
+            Self::PrepareHandoff { .. } | Self::SourceRetiredAck { .. } | Self::OwnerCommit { .. }
+        )
     }
 }
 
@@ -127,6 +145,11 @@ pub enum ControlResponse {
     /// than the receiver already knew) — the rest were stale/duplicate no-ops.
     HoldersApplied {
         applied: u32,
+    },
+    /// The same peer/method/idempotency tuple was reused with another payload.
+    IdempotencyConflict {
+        method: String,
+        idempotency_key: String,
     },
     /// Typed reject (unknown/unsupported request, auth failure, or handler error).
     Rejected {
