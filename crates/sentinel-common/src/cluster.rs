@@ -152,6 +152,10 @@ pub struct ClusterConfig {
     /// an unspecified IP address.
     #[serde(default)]
     pub control_advertise: Option<String>,
+    /// Chef-controller identity authorized to mutate owner state. Seeds derive this
+    /// as their own NodeId; provisioned members persist the seed's NodeId here.
+    #[serde(default)]
+    pub chef_node_id: Option<NodeId>,
     /// Pinned control-plane peers (V10): each carries the peer's control address +
     /// SHA-256 cert fingerprint, exchanged out-of-band (like the SSH host-key pin).
     #[serde(default)]
@@ -190,6 +194,14 @@ impl ClusterConfig {
             NodeLifecycleState::GenesisSeed
         } else {
             NodeLifecycleState::Joining
+        }
+    }
+
+    pub fn effective_chef_node_id(&self) -> Option<NodeId> {
+        if self.seed {
+            Some(self.node_id)
+        } else {
+            self.chef_node_id
         }
     }
 }
@@ -238,6 +250,7 @@ mod tests {
             provision_binary_path: None,
             control_bind: None,
             control_advertise: None,
+            chef_node_id: None,
             control_peers: Vec::new(),
         };
         let a = NodeIdentity::from_config(&cfg);
@@ -261,13 +274,18 @@ mod tests {
             provision_binary_path: None,
             control_bind: None,
             control_advertise: None,
+            chef_node_id: None,
             control_peers: Vec::new(),
         };
         assert_eq!(cfg.role(), ClusterRole::Seed);
         assert_eq!(cfg.initial_lifecycle(), NodeLifecycleState::GenesisSeed);
+        assert_eq!(cfg.effective_chef_node_id(), Some(cfg.node_id));
+        let chef = NodeId::new();
         cfg.seed = false;
+        cfg.chef_node_id = Some(chef);
         assert_eq!(cfg.role(), ClusterRole::Member);
         assert_eq!(cfg.initial_lifecycle(), NodeLifecycleState::Joining);
+        assert_eq!(cfg.effective_chef_node_id(), Some(chef));
     }
 
     #[test]

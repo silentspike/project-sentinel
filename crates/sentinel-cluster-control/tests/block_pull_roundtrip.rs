@@ -2,6 +2,7 @@
 //! over loopback, exercising pull-by-hash, a miss, and mutual cert-pinning (V10). Proves
 //! the byte-path transport without a VM; the cross-host 2-VM ACs run after deploy.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use sentinel_cluster_control::{
@@ -98,5 +99,90 @@ async fn server_rejects_an_unpinned_client() {
         "server must reject an unpinned block-pull client"
     );
 
+    server.close();
+}
+
+struct CountingBlock {
+    want: BlockRef,
+    encoded: Vec<u8>,
+    calls: AtomicUsize,
+}
+
+impl BlockProvider for CountingBlock {
+    fn encoded_blob(&self, block_ref: &BlockRef) -> Option<Vec<u8>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        (block_ref == &self.want).then(|| self.encoded.clone())
+    }
+}
+
+#[tokio::test]
+async fn revocation_closes_an_established_pull_session_and_blocks_reconnect() {
+    let server_node = NodeCertificate::generate("holder").unwrap();
+    let client_node = NodeCertificate::generate("puller").unwrap();
+    let server_fp = server_node.fingerprint();
+    let client_fp = client_node.fingerprint();
+    let client_node_id = NodeId::new();
+    let held = BlockRef::blob_sha256([9; 32], 3);
+    let provider = Arc::new(CountingBlock {
+        want: held.clone(),
+        encoded: vec![0x00, b'a', b'b', b'c'],
+        calls: AtomicUsize::new(0),
+    });
+    let peers = PeerRegistry::new([(client_fp, client_node_id)]).unwrap();
+    let server = BlockPullServer::bind(
+        loopback(),
+        &server_node,
+        peers.clone(),
+        Arc::clone(&provider),
+    )
+    .unwrap();
+    let client = BlockPullClient::new(&client_node).unwrap();
+    let session = client
+        .connect(server.local_addr(), server_fp)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session.pull(&held).await.unwrap(),
+        Some(provider.encoded.clone())
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        peers.revoke(client_node_id),
+        1,
+        "the established pull connection must be registered for active close"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), session.pull(&held))
+            .await
+            .expect("revoked pull session must terminate promptly")
+            .is_err(),
+        "a revoked established session cannot pull another block"
+    );
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        1,
+        "revocation must stop the request before provider access"
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.pull(server.local_addr(), server_fp, &held),
+        )
+        .await
+        .expect("pull reconnect rejection must be prompt")
+        .is_err(),
+        "the revoked certificate cannot reconnect to block-pull"
+    );
+
+    peers.authorize(client_fp, client_node_id).unwrap();
+    assert_eq!(
+        client
+            .pull(server.local_addr(), server_fp, &held)
+            .await
+            .unwrap(),
+        Some(provider.encoded.clone())
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     server.close();
 }

@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use quinn::Endpoint;
+use quinn::{Connection, Endpoint};
 
 use crate::cert::{CertFingerprint, NodeCertificate};
 use crate::envelope::{decode_frame, encode_frame, ControlEnvelope, ControlReply, MAX_FRAME_BYTES};
@@ -22,27 +22,52 @@ impl ControlClient {
         Ok(Self { endpoint })
     }
 
-    /// Connect to `peer_addr`, enforce the server cert pin (V10 — reject if the
-    /// server's fingerprint differs from `expected_peer`), send `envelope` over a bidi
-    /// stream and return the reply.
-    pub async fn rpc(
+    /// Connect to `peer_addr` and enforce the server certificate pin. The returned
+    /// session can carry multiple request streams and observes server-side revocation.
+    pub async fn connect(
         &self,
         peer_addr: SocketAddr,
         expected_peer: CertFingerprint,
-        envelope: &ControlEnvelope,
-    ) -> anyhow::Result<ControlReply> {
+    ) -> anyhow::Result<ControlConnection> {
         let conn = self.endpoint.connect(peer_addr, "sentinel-node")?.await?;
         let fp = peer_fingerprint(&conn)?;
         if fp != expected_peer {
             conn.close(1u32.into(), b"unpinned server");
             anyhow::bail!("server cert {fp} does not match pin {expected_peer}");
         }
-        let (mut send, mut recv) = conn.open_bi().await?;
+        Ok(ControlConnection { connection: conn })
+    }
+
+    /// Connect, send one request, and close the session. Call [`Self::connect`] when a
+    /// caller needs to reuse one authenticated QUIC connection across requests.
+    pub async fn rpc(
+        &self,
+        peer_addr: SocketAddr,
+        expected_peer: CertFingerprint,
+        envelope: &ControlEnvelope,
+    ) -> anyhow::Result<ControlReply> {
+        let connection = self.connect(peer_addr, expected_peer).await?;
+        let reply = connection.rpc(envelope).await;
+        connection.close();
+        reply
+    }
+}
+
+/// An authenticated, cert-pinned control session that can carry multiple RPC streams.
+pub struct ControlConnection {
+    connection: Connection,
+}
+
+impl ControlConnection {
+    pub async fn rpc(&self, envelope: &ControlEnvelope) -> anyhow::Result<ControlReply> {
+        let (mut send, mut recv) = self.connection.open_bi().await?;
         send.write_all(&encode_frame(envelope)?).await?;
         send.finish()?;
         let frame = recv.read_to_end(MAX_FRAME_BYTES + 4).await?;
-        let reply: ControlReply = decode_frame(&frame)?;
-        conn.close(0u32.into(), b"done");
-        Ok(reply)
+        Ok(decode_frame(&frame)?)
+    }
+
+    pub fn close(&self) {
+        self.connection.close(0u32.into(), b"done");
     }
 }

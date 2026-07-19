@@ -80,9 +80,11 @@ repo-templated token-gates, role separation, short-lived bootstrap credential.**
 `ProvisionOp`: `Idle -> VerifyTarget -> PinHostKey -> PushBinary(sha256) ->
 IssueCert(target-local key) -> RenderConfig+TokenGates+reciprocal peer pins ->
 StartDaemon -> AwaitHealth -> ObserveAuthenticatedJoin -> NodeProvisioned`.
-Individual transport operations are convergent within a running worker. Durable
-operation recovery across a seed restart remains tied to the ADR-3 `PROVISION_OPS`
-store; the current in-memory operation map must not be described as restart-durable.
+Before SSH mutation, the seed atomically writes and fsyncs the `ProvisionOp`, including
+its assigned `NodeId`, to `<data_dir>/provision-ops.json`. A retry after seed restart
+must present the same idempotency key, pending target, and alias; it reuses that
+operation and NodeId. A completed operation is a durable no-op. Any attempted key,
+target, or alias rebinding is rejected.
 
 `ObserveAuthenticatedJoin` polls the seed's receiver-local membership view. A running
 systemd unit is necessary but insufficient: completion requires an accepted heartbeat
@@ -91,26 +93,35 @@ stops the target service and revokes the seed-side dynamic peer entry.
 
 ## Failure Modes
 
-- **Half-deploy (AC-S4/B6):** error mid-bootstrap -> defined cleanup (service stopped,
-  partial artifacts removed, node NOT in membership) or `Quarantined/ProvisionFailed`.
+- **Half-deploy (AC-S4/B6):** every fallible bootstrap fence persists `Failed`, disables
+  the target daemon, removes staging files, revokes the seed-side peer, and writes a
+  mode-0600 target quarantine marker. Cleanup failure is retained in the returned
+  error; the seed-side failed operation remains durable for an explicit convergent
+  retry with the same identity.
+  A retry keeps the target marker until the exact reserved NodeId rejoins authenticated
+  membership; marker removal must succeed before the operation becomes `Completed`.
   Tested with real `qm snapshot`/`qm rollback` of the fresh test VM (S9). `qm rollback`
   is the **provision drill only**, never migration-failure recovery.
 - **Host-key mismatch:** target rejected (pinned key ≠ presented key).
 - **NodeId/certificate collision (AC-S5):** the dynamic peer registry rejects a
   certificate already bound to another NodeId and a NodeId already bound to another
   certificate. A heartbeat claiming a NodeId other than its authenticated binding is
-  typed-rejected.
+  typed-rejected. Removing a failed peer also closes every already authenticated
+  control and block-pull QUIC connection under that binding; deleting only the durable
+  registry row is not sufficient revocation.
 - **NodeId collision (AC-S5):** `ProvisionNode` with an already-assigned `NodeId` ->
   reject (no split identity).
-- **Re-run (AC-S2/B5):** idempotent — second run is a no-op/convergent (no double
-  deploy, no second membership entry).
+- **Re-run (AC-S2/B5):** idempotent across a seed restart: a completed run is a no-op;
+  an incomplete/failed run reuses the persisted operation and NodeId (no split target
+  identity or second membership entry).
 
 ## Tests
 
 AC-S1..S6 + AC-B1..B7 on a real second VM: target starts without Sentinel (B1);
 allowlist-only (B2); seed deploys binary/config/systemd/certs/token-gates (B3); target
 self-registers through an authenticated heartbeat observed by the seed (B4);
-idempotent re-run (B5/S2); failed bootstrap -> no alive node
+idempotent re-run, including journal reopen (B5/S2); failed bootstrap at early and
+late fences -> durable failed/quarantine record and no alive node
 (B6/S4); no secrets/token (B7/S3); host-key pinned (S1); cred lifecycle (S6); NodeId
 collision rejected (S5).
 
@@ -127,9 +138,10 @@ token-gate template is new (no existing unit changed).
 ## Security
 
 This whole ADR **is** the security boundary for onboarding. Single trust domain (Track
-A); revocation/quarantine are Track D2/H. No secret transfer; allowlist; out-of-band
-host-key; target-local private key; certificate fingerprint bound to the assigned
-NodeId.
+A); general certificate lifecycle is Track D2/H. Provision failure quarantine is a
+bounded bootstrap compensation, not general cluster quarantine infrastructure. No
+secret transfer; allowlist; out-of-band host-key; target-local private key;
+certificate fingerprint bound to the assigned NodeId.
 
 ## Public Claim Boundary
 

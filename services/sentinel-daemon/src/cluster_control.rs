@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use sentinel_cluster_control::{
     BlockMapGossipHandler, BlockProvider, BlockPullClient, BlockPullServer, CertFingerprint,
-    ControlClient, ControlEnvelope, ControlReply, ControlRequest, ControlResponse, ControlServer,
-    NodeCertificate, PeerRegistry, StubHandler,
+    ChefAuthorizingHandler, ControlClient, ControlEnvelope, ControlReply, ControlRequest,
+    ControlResponse, ControlServer, FailClosedHandler, NodeCertificate, PeerRegistry,
 };
 use sentinel_common::cluster::ControlPeer;
 use sentinel_common::{
@@ -36,6 +36,18 @@ use crate::owner_handler::OwnerControlHandler;
 
 const MEMBERSHIP_RPC_TIMEOUT: Duration = Duration::from_millis(750);
 const DYNAMIC_PEERS_FILE: &str = "control-peers.json";
+
+fn holder_gossip_idempotency_key(
+    round: u64,
+    page_index: usize,
+    request: &ControlRequest,
+) -> anyhow::Result<String> {
+    let digest = request.digest()?;
+    let digest_hex: String = digest.0.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!(
+        "advertise-holders-r{round}-p{page_index}-{digest_hex}"
+    ))
+}
 
 /// A running control-plane handle: the server (kept alive for its lifetime) + a
 /// client + the resolved pinned peers, for outbound RPCs (the live RefQuery/PinQuery
@@ -208,14 +220,16 @@ impl ClusterControl {
     /// Start the control stream: persist/load the node cert under `cert_dir`, spawn the
     /// server bound to `bind`, and resolve the pinned peers. `owner_meta` is the durable
     /// cluster-meta store (ADR-3): when present the server runs the real `#496`
-    /// [`OwnerControlHandler`] (persist `OwnerCommit` + update the registry); the
-    /// Phase-3a0 `StubHandler` remains only as a fallback if the store failed to open.
+    /// [`OwnerControlHandler`] (persist `OwnerCommit` + update the registry). When the
+    /// store is unavailable, owner/GC requests fail closed while the independent
+    /// membership wrapper remains available.
     pub fn start(
         bind: &str,
         cert_dir: &Path,
         node_alias: &str,
         cluster_id: Uuid,
         local_node_id: NodeId,
+        chef_node_id: Option<NodeId>,
         peers: &[ControlPeer],
         membership: Arc<MembershipRuntime>,
         owner_meta: Option<Arc<ClusterMetaStore>>,
@@ -252,11 +266,16 @@ impl ClusterControl {
             .parse()
             .map_err(|e| anyhow::anyhow!("control_bind {bind}: {e}"))?;
         // The block-pull server reuses the same pinned peers + cert (V10), on port+1.
-        // The real #496 owner handler when the durable meta store is available; the
-        // Phase-3a0 stub only as a fallback (meta store failed to open). Both are wrapped
+        // The real #496 owner handler when the durable meta store is available; a typed
+        // fail-closed terminal when it is not. Both are wrapped
         // in the #498 BlockMapGossipHandler so inbound holder gossip merges into a shared
         // block map while every other RPC still reaches the owner/GC handler.
         let block_map = Arc::new(Mutex::new(BlockMap::new()));
+        if owner_meta.is_none() {
+            warn!(
+                "Cluster 12: cluster metastore unavailable; owner and GC control requests fail closed"
+            );
+        }
         let server = match owner_meta {
             Some(meta) => ControlServer::bind(
                 bind_addr,
@@ -268,7 +287,7 @@ impl ClusterControl {
                     Arc::clone(&membership),
                     BlockMapGossipHandler::new(
                         Arc::clone(&block_map),
-                        OwnerControlHandler::new(meta),
+                        ChefAuthorizingHandler::new(chef_node_id, OwnerControlHandler::new(meta)),
                     ),
                 )),
             )?,
@@ -280,7 +299,13 @@ impl ClusterControl {
                     cluster_id,
                     local_node_id,
                     Arc::clone(&membership),
-                    BlockMapGossipHandler::new(Arc::clone(&block_map), StubHandler),
+                    BlockMapGossipHandler::new(
+                        Arc::clone(&block_map),
+                        ChefAuthorizingHandler::new(
+                            chef_node_id,
+                            FailClosedHandler::new("cluster metastore unavailable"),
+                        ),
+                    ),
                 )),
             )?,
         };
@@ -369,7 +394,7 @@ impl ClusterControl {
         peers.insert(peer.node_id, peer.clone());
         if let Err(error) = persist_peers(&self.peer_store_path, &peers) {
             peers.remove(&peer.node_id);
-            self.peer_registry.revoke(peer.node_id);
+            let _ = self.peer_registry.revoke(peer.node_id);
             return Err(error);
         }
         Ok(())
@@ -388,7 +413,8 @@ impl ClusterControl {
             peers.insert(node_id, removed);
             return Err(error);
         }
-        self.peer_registry.revoke(node_id);
+        let closed_connections = self.peer_registry.revoke(node_id);
+        info!(%node_id, closed_connections, "Cluster 12: peer revoked and live sessions closed");
         Ok(())
     }
 
@@ -534,19 +560,23 @@ impl ClusterControl {
         &self,
         advertisements: Vec<HolderAdvertisement>,
         round: u64,
+        page_index: usize,
     ) -> usize {
         let peers = self.peer_snapshot();
         if advertisements.is_empty() || peers.is_empty() {
             return 0;
         }
+        let request = ControlRequest::AdvertiseHolders { advertisements };
+        let idempotency_key = match holder_gossip_idempotency_key(round, page_index, &request) {
+            Ok(key) => key,
+            Err(error) => {
+                warn!(%error, "#498 block-map gossip request digest failed");
+                return 0;
+            }
+        };
         let mut delivered = 0;
         for peer in peers {
-            let env = ControlEnvelope::new(
-                format!("advertise-holders-r{round}"),
-                ControlRequest::AdvertiseHolders {
-                    advertisements: advertisements.clone(),
-                },
-            );
+            let env = ControlEnvelope::new(idempotency_key.clone(), request.clone());
             match self.client.rpc(peer.addr, peer.fingerprint, &env).await {
                 Ok(reply) => {
                     delivered += 1;
@@ -625,13 +655,17 @@ pub async fn run_cas_gossip_republish(
         // Broadcast in bounded pages (V25). A bounded page also caps the control frame.
         let mut cursor: Option<sentinel_common::BlockRef> = None;
         let mut advertised = 0usize;
+        let mut page_index = 0usize;
         loop {
             let (advs, next) = holder_state.advertisement_page(cursor.as_ref(), page_limit);
             if advs.is_empty() {
                 break;
             }
             advertised += advs.len();
-            cluster_control.broadcast_holders(advs, round).await;
+            cluster_control
+                .broadcast_holders(advs, round, page_index)
+                .await;
+            page_index = page_index.saturating_add(1);
             match next {
                 Some(c) => cursor = Some(c),
                 None => break,
@@ -654,6 +688,33 @@ mod tests {
         let pull = pull_addr_of(ctrl);
         assert_eq!(pull.port(), 8086, "block-pull rides control port + 1");
         assert_eq!(pull.ip(), ctrl.ip(), "same host");
+    }
+
+    #[test]
+    fn holder_gossip_keys_bind_page_and_payload() {
+        let first = ControlRequest::AdvertiseHolders {
+            advertisements: Vec::new(),
+        };
+        let second = ControlRequest::AdvertiseHolders {
+            advertisements: vec![HolderAdvertisement {
+                block_ref: BlockRef::blob_sha256([7; 32], 1),
+                node_id: NodeId::new(),
+                node_boot_id: Uuid::new_v4(),
+                node_incarnation: 1,
+                node_cas_generation: 1,
+                action: sentinel_common::HolderAction::Add,
+                expires_after: u64::MAX,
+            }],
+        };
+        let page_zero = holder_gossip_idempotency_key(4, 0, &first).unwrap();
+        assert_ne!(
+            page_zero,
+            holder_gossip_idempotency_key(4, 1, &first).unwrap()
+        );
+        assert_ne!(
+            page_zero,
+            holder_gossip_idempotency_key(4, 0, &second).unwrap()
+        );
     }
 
     #[test]

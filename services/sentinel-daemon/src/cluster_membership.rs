@@ -244,7 +244,7 @@ pub async fn run_cluster_membership(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentinel_cluster_control::StubHandler;
+    use sentinel_cluster_control::{ChefAuthorizingHandler, FailClosedHandler, StubHandler};
 
     fn heartbeat(node_id: NodeId, boot_id: Uuid, incarnation: u64) -> Heartbeat {
         Heartbeat {
@@ -318,6 +318,48 @@ mod tests {
             ),
             ControlResponse::Rejected { reason } if reason.contains("authenticated peer")
         ));
+    }
+
+    #[test]
+    fn membership_stays_available_while_missing_metastore_rejects_owner_mutation() {
+        let cluster_id = Uuid::new_v4();
+        let local_node = NodeId::new();
+        let chef = NodeId::new();
+        let runtime = Arc::new(MembershipRuntime::new(MembershipConfig::default()));
+        let handler = QuicMembershipHandler::new(
+            cluster_id,
+            local_node,
+            Arc::clone(&runtime),
+            ChefAuthorizingHandler::new(
+                Some(chef),
+                FailClosedHandler::new("cluster metastore unavailable"),
+            ),
+        );
+
+        assert!(matches!(
+            handler.handle(
+                authenticated(chef),
+                &ControlRequest::MembershipHeartbeat {
+                    cluster_id,
+                    heartbeat: heartbeat(chef, Uuid::new_v4(), 1),
+                },
+            ),
+            ControlResponse::MembershipAccepted { node_id, .. } if node_id == chef
+        ));
+        assert_eq!(runtime.state(&chef), Some(MembershipState::Alive));
+        assert_eq!(
+            handler.handle(
+                authenticated(chef),
+                &ControlRequest::OwnerCommit {
+                    scope: "world".into(),
+                    owner_node: chef.to_string(),
+                    epoch: 2,
+                },
+            ),
+            ControlResponse::Rejected {
+                reason: "cluster metastore unavailable".into(),
+            }
+        );
     }
 
     #[test]

@@ -21,15 +21,17 @@
 //! - **No secrets / LLM tokens are copied** (AC-B7/AC-S3): the token-gate drop-ins
 //!   keep gateway/judge/health boot-gated on `ConditionPathExists=/etc/sentinel/allow-llm`,
 //!   which the seed never creates.
-//! - `ProvisionOp` durability (ADR-3 `PROVISION_OPS`, V5 restart-recovery) is an
-//!   in-memory map here; the redb persistence lands with #496's cluster tables.
+//! - `ProvisionOp` and its assigned NodeId are atomically persisted in the seed data
+//!   directory before remote mutation. Retries reuse the same identity across restarts.
 //!
 //! The full bare-VM bootstrap remains a destructive cross-node acceptance drill.
 //! Unit tests cover the complete transport sequence and fail-closed join behavior;
 //! live correction evidence exercises target-local identity generation and the
 //! authenticated membership boundary without reprovisioning an active node.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use sentinel_cluster_control::CertFingerprint;
@@ -57,6 +59,184 @@ const REMOTE_CONFIG: &str = "/opt/sentinel/config/daemon.toml";
 const REMOTE_UNIT: &str = "/etc/systemd/system/sentinel-daemon.service";
 const REMOTE_CONTROL_CERT: &str = "/opt/sentinel/data/control-node-cert.der";
 const REMOTE_CONTROL_KEY: &str = "/opt/sentinel/data/control-node-key.der";
+const REMOTE_QUARANTINE: &str = "/opt/sentinel/data/provision-quarantine.json";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisionReservation {
+    Completed(ProvisionOp),
+    Execute(ProvisionOp),
+}
+
+/// Seed-local durable journal. The NodeId is reserved and fsynced before any SSH
+/// mutation, so a seed restart cannot mint a second identity for the same target.
+pub struct ProvisionJournal {
+    path: PathBuf,
+    ops: Mutex<Vec<ProvisionOp>>,
+}
+
+impl ProvisionJournal {
+    pub fn open(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let path = path.into();
+        let ops: Vec<ProvisionOp> = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| anyhow::anyhow!("parse {}: {error}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(anyhow::anyhow!("read {}: {error}", path.display())),
+        };
+        let mut keys = HashSet::new();
+        let mut targets = HashSet::new();
+        let mut nodes = HashSet::new();
+        for op in &ops {
+            if !keys.insert(op.idempotency_key.clone()) {
+                anyhow::bail!("duplicate idempotency key in {}", path.display());
+            }
+            if !targets.insert(op.pending_target_id.clone()) {
+                anyhow::bail!("duplicate pending target in {}", path.display());
+            }
+            let node_id = op.node_id.ok_or_else(|| {
+                anyhow::anyhow!("provision op {} has no reserved NodeId", op.op_id)
+            })?;
+            if !nodes.insert(node_id) {
+                anyhow::bail!("duplicate reserved NodeId in {}", path.display());
+            }
+        }
+        Ok(Self {
+            path,
+            ops: Mutex::new(ops),
+        })
+    }
+
+    pub fn reserve(
+        &self,
+        pending_target_id: &str,
+        requested_alias: &str,
+        idempotency_key: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<ProvisionReservation> {
+        let mut ops = self
+            .ops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut next = ops.clone();
+        let existing = next.iter().position(|op| {
+            op.idempotency_key == idempotency_key || op.pending_target_id == pending_target_id
+        });
+        if let Some(index) = existing {
+            let op = &mut next[index];
+            if op.idempotency_key != idempotency_key
+                || op.pending_target_id != pending_target_id
+                || op.requested_alias != requested_alias
+            {
+                anyhow::bail!(
+                    "provision identity conflict: key/target/alias is already bound to op {}",
+                    op.op_id
+                );
+            }
+            if op.state == sentinel_common::provision::ProvisionOpState::Completed {
+                return Ok(ProvisionReservation::Completed(op.clone()));
+            }
+            op.state = sentinel_common::provision::ProvisionOpState::VerifyingTarget;
+            op.started_at_ms = now_ms;
+            op.updated_at_ms = now_ms;
+            op.failure_reason = None;
+            let reserved = op.clone();
+            self.persist_locked(&next)?;
+            *ops = next;
+            return Ok(ProvisionReservation::Execute(reserved));
+        }
+
+        let mut op = ProvisionOp::new(
+            Uuid::new_v4(),
+            pending_target_id.to_string(),
+            requested_alias.to_string(),
+            idempotency_key.to_string(),
+            now_ms,
+        );
+        let reserved_nodes: HashSet<_> = next.iter().filter_map(|op| op.node_id).collect();
+        let mut node_id = NodeId::new();
+        while reserved_nodes.contains(&node_id) {
+            node_id = NodeId::new();
+        }
+        op.assign_node(node_id, now_ms);
+        next.push(op.clone());
+        self.persist_locked(&next)?;
+        *ops = next;
+        Ok(ProvisionReservation::Execute(op))
+    }
+
+    pub fn lookup(
+        &self,
+        pending_target_id: &str,
+        requested_alias: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<Option<ProvisionOp>> {
+        let ops = self
+            .ops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let existing = ops.iter().find(|op| {
+            op.idempotency_key == idempotency_key || op.pending_target_id == pending_target_id
+        });
+        let Some(op) = existing else {
+            return Ok(None);
+        };
+        if op.idempotency_key != idempotency_key
+            || op.pending_target_id != pending_target_id
+            || op.requested_alias != requested_alias
+        {
+            anyhow::bail!(
+                "provision identity conflict: key/target/alias is already bound to op {}",
+                op.op_id
+            );
+        }
+        Ok(Some(op.clone()))
+    }
+
+    pub fn update(&self, op: &ProvisionOp) -> anyhow::Result<()> {
+        let mut ops = self
+            .ops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut next = ops.clone();
+        let stored = next
+            .iter_mut()
+            .find(|stored| stored.op_id == op.op_id)
+            .ok_or_else(|| anyhow::anyhow!("provision op {} is not reserved", op.op_id))?;
+        *stored = op.clone();
+        self.persist_locked(&next)?;
+        *ops = next;
+        Ok(())
+    }
+
+    fn persist_locked(&self, ops: &[ProvisionOp]) -> anyhow::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec_pretty(ops)?;
+        let tmp = self.path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        let result = (|| -> anyhow::Result<()> {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &self.path)?;
+            if let Some(parent) = self.path.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
+    }
+}
 
 /// Health-poll cadence for `AwaitingHealth` (injected so tests don't sleep).
 #[derive(Debug, Clone, Copy)]
@@ -109,6 +289,7 @@ impl ProvisionPlan {
         s.push_str(&format!("cluster_id = \"{}\"\n", self.cluster_id));
         s.push_str("seed = false\n");
         s.push_str(&format!("alias = \"{}\"\n", self.alias));
+        s.push_str(&format!("chef_node_id = \"{}\"\n", self.seed_peer.node_id));
         s.push_str(&format!(
             "control_bind = \"{}\"\n",
             self.target_control_bind
@@ -189,28 +370,41 @@ pub fn execute_provision_node<T: ProvisionTransport>(
     cluster: &impl ProvisionCluster,
     timing: ProvisionTiming,
     clock: &dyn Fn() -> u64,
+    persist: &dyn Fn(&ProvisionOp) -> anyhow::Result<()>,
 ) -> anyhow::Result<u64> {
     let started = Instant::now();
 
     // VerifyingTarget → the allowlist host key must be pinned (AC-S1 precondition).
     if pending.expected_host_key.trim().is_empty() {
         op.fail("no pinned host key for target (AC-S1)", clock());
+        persist(op)?;
         anyhow::bail!(
             "provision: target {} has no pinned host key",
             pending.pending_target_id
         );
     }
-    op.assign_node(plan.assigned_node_id, clock());
+    match op.node_id {
+        Some(node_id) if node_id != plan.assigned_node_id => {
+            op.fail("reserved NodeId differs from provision plan", clock());
+            persist(op)?;
+            anyhow::bail!("provision: reserved NodeId differs from provision plan");
+        }
+        None => op.assign_node(plan.assigned_node_id, clock()),
+        Some(_) => {}
+    }
     op.advance(clock()); // → PinningHostKey
+    persist(op)?;
 
     // PinningHostKey → the transport was constructed with the pinned key for strict
     // checking; confirm reachability over that pinned channel.
-    fenced_step(op, clock, "reachability", || {
+    if let Err(error) = fenced_step(op, clock, persist, "reachability", || {
         transport.run("true").map(|_| ())
-    })?; // → PushingBinary
+    }) {
+        return Err(with_quarantine(error, cluster, transport, op));
+    } // → PushingBinary
 
     // PushingBinary → verify local sha256 == expected, push, verify remote sha256.
-    fenced_step(op, clock, "push binary", || {
+    if let Err(error) = fenced_step(op, clock, persist, "push binary", || {
         let local_sha = sha256_file(&plan.binary_local_path)?;
         if local_sha != plan.binary_sha256 {
             anyhow::bail!(
@@ -232,12 +426,14 @@ pub fn execute_provision_node<T: ProvisionTransport>(
             );
         }
         Ok(())
-    })?; // → IssuingCert
+    }) {
+        return Err(with_quarantine(error, cluster, transport, op));
+    } // → IssuingCert
 
     // IssuingCert: the verified target binary generates its private key locally. Only
     // the public certificate fingerprint returns over the pinned SSH channel.
     let mut target_fingerprint = None;
-    fenced_step(op, clock, "issue control identity", || {
+    if let Err(error) = fenced_step(op, clock, persist, "issue control identity", || {
         let output = transport.run(&format!(
             "sudo {REMOTE_BIN} generate-control-identity --alias {} --cert {REMOTE_CONTROL_CERT} --key {REMOTE_CONTROL_KEY}",
             plan.alias
@@ -253,7 +449,9 @@ pub fn execute_provision_node<T: ProvisionTransport>(
         }
         target_fingerprint = Some(fingerprint);
         Ok(())
-    })?; // → RenderingConfig
+    }) {
+        return Err(with_quarantine(error, cluster, transport, op));
+    } // → RenderingConfig
     let target_fingerprint = target_fingerprint.expect("identity step produced a fingerprint");
 
     // RenderingConfig → daemon.toml + systemd unit + token-gate drop-ins.
@@ -261,8 +459,7 @@ pub fn execute_provision_node<T: ProvisionTransport>(
     // dir is fatal). Privileged files are staged to a writable `/tmp` path and then
     // `sudo install`ed (the SSH user is unprivileged; a direct scp into a root-owned
     // dir is denied — same staging pattern as the binary push above).
-    let mut peer_authorized = false;
-    fenced_step(op, clock, "render config", || {
+    if let Err(error) = fenced_step(op, clock, persist, "render config", || {
         // Create every Sentinel runtime dir the systemd unit's ReadWritePaths
         // references (`/opt/sentinel/fs` is required for the ProtectSystem=strict
         // mount namespace even when the member runs without a FUSE mount). `/ram/*`
@@ -289,17 +486,17 @@ pub fn execute_provision_node<T: ProvisionTransport>(
             addr: plan.target_control_addr.clone(),
             cert_fingerprint: target_fingerprint.to_hex(),
         })?;
-        peer_authorized = true;
         Ok(())
-    })?; // → StartingDaemon
+    }) {
+        return Err(with_quarantine(error, cluster, transport, op));
+    } // → StartingDaemon
 
     // StartingDaemon → enable + start the daemon (gateway/judge stay gated).
-    if let Err(error) = fenced_step(op, clock, "start daemon", || {
+    if let Err(error) = fenced_step(op, clock, persist, "start daemon", || {
         transport.run("sudo systemctl enable --now sentinel-daemon.service")?;
         Ok(())
     }) {
-        cleanup_failed_join(cluster, transport, plan.assigned_node_id, peer_authorized);
-        return Err(error);
+        return Err(with_quarantine(error, cluster, transport, op));
     } // → AwaitingHealth
 
     // AwaitingHealth → poll `systemctl is-active` over the same SSH channel (avoids
@@ -319,13 +516,17 @@ pub fn execute_provision_node<T: ProvisionTransport>(
     }
     if !healthy {
         op.fail("target daemon did not become active", clock());
-        cleanup_failed_join(cluster, transport, plan.assigned_node_id, peer_authorized);
-        anyhow::bail!(
+        let mut error = anyhow::anyhow!(
             "provision: target {} did not become active after bootstrap",
             pending.pending_target_id
         );
+        if let Err(persist_error) = persist(op) {
+            error = anyhow::anyhow!("{error}; persist failed state: {persist_error}");
+        }
+        return Err(with_quarantine(error, cluster, transport, op));
     }
     op.advance(clock()); // → ObservingJoin
+    persist_remote_state(op, clock, persist, cluster, transport, "health")?;
 
     // ObservingJoin: completion requires the seed's authenticated membership view to
     // contain this exact NodeId as Alive. Process activity alone is insufficient.
@@ -341,26 +542,103 @@ pub fn execute_provision_node<T: ProvisionTransport>(
     }
     if !joined {
         op.fail("target did not join authenticated membership", clock());
-        cleanup_failed_join(cluster, transport, plan.assigned_node_id, peer_authorized);
-        anyhow::bail!(
+        let mut error = anyhow::anyhow!(
             "provision: target {} did not join authenticated membership",
             pending.pending_target_id
         );
+        if let Err(persist_error) = persist(op) {
+            error = anyhow::anyhow!("{error}; persist failed state: {persist_error}");
+        }
+        return Err(with_quarantine(error, cluster, transport, op));
+    }
+    // A retry may have inherited a durable marker from an earlier failed attempt.
+    // Keep it until the exact assigned NodeId has joined, then require its removal
+    // before recording terminal success.
+    if let Err(error) = transport.run(&format!("sudo rm -f {REMOTE_QUARANTINE}")) {
+        op.fail(format!("clear quarantine marker: {error}"), clock());
+        let mut error = anyhow::anyhow!("provision: clear quarantine marker: {error}");
+        if let Err(persist_error) = persist(op) {
+            error = anyhow::anyhow!("{error}; persist failed state: {persist_error}");
+        }
+        return Err(with_quarantine(error, cluster, transport, op));
     }
     op.advance(clock()); // → Completed
+    persist_remote_state(op, clock, persist, cluster, transport, "completion")?;
     Ok(started.elapsed().as_millis() as u64)
 }
 
-fn cleanup_failed_join(
+fn quarantine_failed_provision(
     cluster: &impl ProvisionCluster,
     transport: &impl ProvisionTransport,
-    node_id: NodeId,
-    peer_authorized: bool,
-) {
-    let _ = transport.run("sudo systemctl disable --now sentinel-daemon.service");
-    if peer_authorized {
-        let _ = cluster.revoke_peer(node_id);
+    op: &ProvisionOp,
+) -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+    if let Err(error) = transport.run("sudo systemctl disable --now sentinel-daemon.service") {
+        failures.push(format!("stop target: {error}"));
     }
+    if let Err(error) = transport.run("rm -f /tmp/sentinel-daemon.new /tmp/sentinel-stage-*") {
+        failures.push(format!("remove staging files: {error}"));
+    }
+    let marker = serde_json::json!({
+        "op_id": op.op_id,
+        "pending_target_id": op.pending_target_id,
+        "node_id": op.node_id,
+        "state": "quarantined",
+        "reason": op.failure_reason,
+        "updated_at_ms": op.updated_at_ms,
+    });
+    match serde_json::to_string_pretty(&marker) {
+        Ok(marker) => {
+            if let Err(error) = install_text(transport, &marker, REMOTE_QUARANTINE, "0600") {
+                failures.push(format!("write target quarantine marker: {error}"));
+            }
+        }
+        Err(error) => failures.push(format!("serialize quarantine marker: {error}")),
+    }
+    if let Some(node_id) = op.node_id {
+        if let Err(error) = cluster.revoke_peer(node_id) {
+            failures.push(format!("revoke peer: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
+}
+
+fn with_quarantine(
+    error: anyhow::Error,
+    cluster: &impl ProvisionCluster,
+    transport: &impl ProvisionTransport,
+    op: &ProvisionOp,
+) -> anyhow::Error {
+    match quarantine_failed_provision(cluster, transport, op) {
+        Ok(()) => error,
+        Err(cleanup_error) => {
+            anyhow::anyhow!("{error}; quarantine cleanup incomplete: {cleanup_error}")
+        }
+    }
+}
+
+fn persist_remote_state(
+    op: &mut ProvisionOp,
+    clock: &dyn Fn() -> u64,
+    persist: &dyn Fn(&ProvisionOp) -> anyhow::Result<()>,
+    cluster: &impl ProvisionCluster,
+    transport: &impl ProvisionTransport,
+    label: &str,
+) -> anyhow::Result<()> {
+    if let Err(error) = persist(op) {
+        op.fail(format!("persist after {label}: {error}"), clock());
+        let secondary = persist(op).err();
+        let mut error = anyhow::anyhow!("persist after {label}: {error}");
+        if let Some(secondary) = secondary {
+            error = anyhow::anyhow!("{error}; persist failed state: {secondary}");
+        }
+        return Err(with_quarantine(error, cluster, transport, op));
+    }
+    Ok(())
 }
 
 /// Write `content` to a privileged `dest` on the target: stage it to a writable
@@ -386,16 +664,23 @@ fn install_text<T: ProvisionTransport>(
 fn fenced_step(
     op: &mut ProvisionOp,
     clock: &dyn Fn() -> u64,
+    persist: &dyn Fn(&ProvisionOp) -> anyhow::Result<()>,
     label: &str,
     f: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     match f() {
         Ok(()) => {
             op.advance(clock());
+            if let Err(error) = persist(op) {
+                op.fail(format!("persist after {label}: {error}"), clock());
+                let _ = persist(op);
+                return Err(error);
+            }
             Ok(())
         }
         Err(e) => {
             op.fail(format!("{label}: {e}"), clock());
+            persist(op)?;
             Err(e)
         }
     }
@@ -508,6 +793,7 @@ mod tests {
     use sentinel_common::provision::ProvisionOpState;
     use std::cell::RefCell;
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
 
     fn pending(id: &str, host_key: &str) -> PendingBareNode {
         PendingBareNode {
@@ -555,9 +841,15 @@ mod tests {
 
     impl ProvisionTransport for FakeTransport {
         fn put_file(&self, _local: &Path, remote_path: &str) -> anyhow::Result<()> {
-            self.calls
-                .borrow_mut()
-                .push(format!("put_file {remote_path}"));
+            let call = format!("put_file {remote_path}");
+            self.calls.borrow_mut().push(call.clone());
+            if self
+                .fail_on
+                .as_deref()
+                .is_some_and(|needle| call.contains(needle))
+            {
+                anyhow::bail!("forced failure on `{call}`");
+            }
             Ok(())
         }
         fn put_text(&self, remote_path: &str, _contents: &str) -> anyhow::Result<()> {
@@ -593,6 +885,58 @@ mod tests {
     const EXPECTED_SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const TEST_FINGERPRINT: &str =
         "1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn journal_reuses_reserved_node_id_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provision-ops.json");
+        let first = ProvisionJournal::open(&path).unwrap();
+        let op = match first.reserve("bare-1", "node-1", "idem-1", 10).unwrap() {
+            ProvisionReservation::Execute(op) => op,
+            ProvisionReservation::Completed(_) => panic!("new op cannot be completed"),
+        };
+        let node_id = op.node_id.unwrap();
+        drop(first);
+
+        let reopened = ProvisionJournal::open(&path).unwrap();
+        let retry = match reopened.reserve("bare-1", "node-1", "idem-1", 20).unwrap() {
+            ProvisionReservation::Execute(op) => op,
+            ProvisionReservation::Completed(_) => panic!("incomplete op must be retried"),
+        };
+        assert_eq!(retry.node_id, Some(node_id));
+        assert_eq!(retry.op_id, op.op_id);
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn journal_rejects_key_or_target_rebinding() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = ProvisionJournal::open(dir.path().join("provision-ops.json")).unwrap();
+        journal.reserve("bare-1", "node-1", "idem-1", 10).unwrap();
+        assert!(journal.reserve("bare-2", "node-2", "idem-1", 20).is_err());
+        assert!(journal.reserve("bare-1", "node-1", "idem-2", 20).is_err());
+    }
+
+    #[test]
+    fn completed_journal_entry_stays_noop_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provision-ops.json");
+        let journal = ProvisionJournal::open(&path).unwrap();
+        let mut op = match journal.reserve("bare-1", "node-1", "idem-1", 10).unwrap() {
+            ProvisionReservation::Execute(op) => op,
+            ProvisionReservation::Completed(_) => panic!("new op cannot be completed"),
+        };
+        while op.advance(11) {}
+        journal.update(&op).unwrap();
+        drop(journal);
+
+        let reopened = ProvisionJournal::open(path).unwrap();
+        let reservation = reopened.reserve("bare-1", "node-1", "idem-1", 20).unwrap();
+        assert!(matches!(reservation, ProvisionReservation::Completed(_)));
+    }
 
     struct FakeCluster {
         alive_node: Option<NodeId>,
@@ -693,6 +1037,7 @@ mod tests {
             &cluster,
             fast_timing(),
             &clock,
+            &|_| Ok(()),
         )
         .unwrap();
         assert_eq!(op.state, ProvisionOpState::Completed);
@@ -743,6 +1088,10 @@ mod tests {
         assert!(joined.contains("systemctl daemon-reload"));
         assert!(joined.contains("systemctl enable --now sentinel-daemon.service"));
         assert!(joined.contains("is-active"));
+        assert!(
+            joined.contains(&format!("sudo rm -f {REMOTE_QUARANTINE}")),
+            "stale quarantine marker cleared only after authenticated join"
+        );
         // A token-gate drop-in is installed for EACH LLM-touching unit.
         for unit in TOKEN_GATE_UNITS {
             assert!(joined.contains(&format!("/etc/systemd/system/{unit}.d/token-gate.conf")));
@@ -766,6 +1115,7 @@ mod tests {
             &cluster,
             fast_timing(),
             &clock,
+            &|_| Ok(()),
         );
         assert!(err.is_err());
         assert_eq!(op.state, ProvisionOpState::Failed);
@@ -790,6 +1140,7 @@ mod tests {
             &cluster,
             fast_timing(),
             &clock,
+            &|_| Ok(()),
         );
         assert!(err.is_err());
         assert_eq!(op.state, ProvisionOpState::Failed);
@@ -821,6 +1172,7 @@ mod tests {
             &cluster,
             fast_timing(),
             &clock,
+            &|_| Ok(()),
         );
         assert!(err.is_err());
         assert_eq!(op.state, ProvisionOpState::Failed);
@@ -829,6 +1181,42 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("sha256 mismatch"));
+        let calls = t.calls.borrow().join("\n");
+        assert!(calls.contains("disable --now sentinel-daemon.service"));
+        assert!(calls.contains("put_text /tmp/sentinel-stage-"));
+        assert_eq!(
+            cluster.revoked.borrow().as_slice(),
+            &[plan.assigned_node_id]
+        );
+    }
+
+    #[test]
+    fn binary_push_failure_is_durably_quarantined() {
+        let bin = empty_binary();
+        let plan = plan_for(bin.path());
+        let t = FakeTransport::failing("put_file /tmp/sentinel-daemon.new");
+        let cluster = FakeCluster::joined(plan.assigned_node_id);
+        let mut op = ProvisionOp::new(Uuid::new_v4(), "bare-1".into(), "n".into(), "i".into(), 0);
+        let result = execute_provision_node(
+            &mut op,
+            &pending("bare-1", "ssh-ed25519 AAAA"),
+            &plan,
+            &t,
+            &cluster,
+            fast_timing(),
+            &|| 4,
+            &|_| Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(op.state, ProvisionOpState::Failed);
+        let calls = t.calls.borrow().join("\n");
+        assert!(calls.contains("disable --now sentinel-daemon.service"));
+        assert!(calls.contains("rm -f /tmp/sentinel-daemon.new"));
+        assert!(calls.contains("put_text /tmp/sentinel-stage-"));
+        assert_eq!(
+            cluster.revoked.borrow().as_slice(),
+            &[plan.assigned_node_id]
+        );
     }
 
     #[test]
@@ -847,6 +1235,7 @@ mod tests {
             &cluster,
             fast_timing(),
             &clock,
+            &|_| Ok(()),
         );
         assert!(err.is_err());
         assert_eq!(op.state, ProvisionOpState::Failed);
@@ -876,6 +1265,7 @@ mod tests {
             &cluster,
             fast_timing(),
             &|| 10,
+            &|_| Ok(()),
         );
         assert!(err.is_err());
         assert_eq!(op.state, ProvisionOpState::Failed);
@@ -896,6 +1286,36 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_marker_must_clear_before_completion() {
+        let bin = empty_binary();
+        let plan = plan_for(bin.path());
+        let t = FakeTransport::failing(REMOTE_QUARANTINE);
+        let cluster = FakeCluster::joined(plan.assigned_node_id);
+        let mut op = ProvisionOp::new(Uuid::new_v4(), "bare-1".into(), "n".into(), "i".into(), 0);
+        let result = execute_provision_node(
+            &mut op,
+            &pending("bare-1", "ssh-ed25519 AAAA"),
+            &plan,
+            &t,
+            &cluster,
+            fast_timing(),
+            &|| 11,
+            &|_| Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(op.state, ProvisionOpState::Failed);
+        assert!(op
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("clear quarantine marker"));
+        assert_eq!(
+            cluster.revoked.borrow().as_slice(),
+            &[plan.assigned_node_id]
+        );
+    }
+
+    #[test]
     fn render_daemon_toml_is_member_config() {
         let bin = empty_binary();
         let plan = plan_for(bin.path());
@@ -903,6 +1323,7 @@ mod tests {
         assert!(toml.contains("seed = false"));
         assert!(toml.contains(&format!("node_id = \"{}\"", plan.assigned_node_id)));
         assert!(toml.contains(&format!("cluster_id = \"{}\"", plan.cluster_id)));
+        assert!(toml.contains(&format!("chef_node_id = \"{}\"", plan.seed_peer.node_id)));
         assert!(toml.contains("control_bind = \"0.0.0.0:8085\""));
         assert!(toml.contains("[[daemon.cluster.control_peers]]"));
         assert!(toml.contains(&format!("node_id = \"{}\"", plan.seed_peer.node_id)));
@@ -922,6 +1343,7 @@ mod tests {
         let cluster = parsed.daemon.cluster.as_ref().unwrap();
         assert_eq!(cluster.control_bind.as_deref(), Some("0.0.0.0:8085"));
         assert_eq!(cluster.control_peers, vec![plan.seed_peer.clone()]);
+        assert_eq!(cluster.chef_node_id, Some(plan.seed_peer.node_id));
         assert!(!parsed.daemon.platform_controlplane.llm_enabled);
         assert!(parsed
             .daemon
