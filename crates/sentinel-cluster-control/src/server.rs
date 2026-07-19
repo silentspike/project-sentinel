@@ -1,18 +1,183 @@
 //! The QUIC control server: accept cert-pinned peer connections + bidi RPC streams,
-//! dedup per `idempotency_key`, dispatch to a [`ControlHandler`].
+//! dedup per authenticated peer/method/key/request digest, dispatch to a
+//! [`ControlHandler`].
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use quinn::Endpoint;
+use quinn::{Connection, Endpoint};
 use tracing::{debug, info, warn};
 
 use crate::cert::{CertFingerprint, NodeCertificate};
-use crate::envelope::{decode_frame, encode_frame, ControlEnvelope, ControlReply, MAX_FRAME_BYTES};
+use crate::envelope::{
+    decode_frame, encode_frame, ControlEnvelope, ControlReply, ControlResponse, MAX_FRAME_BYTES,
+};
 use crate::handler::ControlHandler;
-use crate::idempotency::IdempotencyCache;
+use crate::idempotency::{IdempotencyCache, IdempotencyOutcome, IdempotencyScope};
 use crate::tls::{peer_fingerprint, quic_server_config};
+
+use sentinel_common::NodeId;
+
+/// Certificate-authenticated identity supplied to every control handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthenticatedPeer {
+    pub fingerprint: CertFingerprint,
+    pub node_id: NodeId,
+}
+
+/// Dynamic pinned-peer registry shared by control and block-pull clients and servers.
+/// Both directions are unique: one certificate maps to one NodeId and one NodeId
+/// maps to one certificate until the explicit rotation lifecycle is implemented.
+#[derive(Clone, Default)]
+pub struct PeerRegistry {
+    inner: Arc<RwLock<PeerRegistryState>>,
+}
+
+#[derive(Default)]
+struct PeerRegistryState {
+    bindings: HashMap<CertFingerprint, NodeId>,
+    connections: HashMap<CertFingerprint, HashMap<u64, Connection>>,
+    next_connection_id: u64,
+}
+
+impl PeerRegistry {
+    pub fn new(
+        bindings: impl IntoIterator<Item = (CertFingerprint, NodeId)>,
+    ) -> anyhow::Result<Self> {
+        let registry = Self::default();
+        for (fingerprint, node_id) in bindings {
+            registry.authorize(fingerprint, node_id)?;
+        }
+        Ok(registry)
+    }
+
+    pub fn authorize(&self, fingerprint: CertFingerprint, node_id: NodeId) -> anyhow::Result<()> {
+        let mut state = self.inner.write().expect("peer registry lock");
+        if let Some(existing) = state.bindings.get(&fingerprint) {
+            if *existing != node_id {
+                anyhow::bail!("certificate {fingerprint} is already bound to node {existing}");
+            }
+            return Ok(());
+        }
+        if let Some((existing_fingerprint, _)) = state
+            .bindings
+            .iter()
+            .find(|(_, existing_node_id)| **existing_node_id == node_id)
+        {
+            anyhow::bail!("node {node_id} is already bound to certificate {existing_fingerprint}");
+        }
+        state.bindings.insert(fingerprint, node_id);
+        Ok(())
+    }
+
+    /// Revoke a NodeId and actively close every inbound and outbound control and
+    /// block-pull connection authenticated under its certificate. Returns the number
+    /// of closed connections.
+    pub fn revoke(&self, node_id: NodeId) -> usize {
+        let connections = {
+            let mut state = self.inner.write().expect("peer registry lock");
+            let fingerprints: Vec<_> = state
+                .bindings
+                .iter()
+                .filter_map(|(fingerprint, bound_node_id)| {
+                    (*bound_node_id == node_id).then_some(*fingerprint)
+                })
+                .collect();
+            for fingerprint in &fingerprints {
+                state.bindings.remove(fingerprint);
+            }
+            fingerprints
+                .into_iter()
+                .filter_map(|fingerprint| state.connections.remove(&fingerprint))
+                .flat_map(HashMap::into_values)
+                .collect::<Vec<_>>()
+        };
+        let closed = connections.len();
+        for connection in connections {
+            connection.close(2u32.into(), b"peer revoked");
+        }
+        closed
+    }
+
+    pub fn resolve(&self, fingerprint: CertFingerprint) -> Option<AuthenticatedPeer> {
+        self.inner
+            .read()
+            .expect("peer registry lock")
+            .bindings
+            .get(&fingerprint)
+            .copied()
+            .map(|node_id| AuthenticatedPeer {
+                fingerprint,
+                node_id,
+            })
+    }
+
+    pub fn fingerprints(&self) -> Vec<CertFingerprint> {
+        self.inner
+            .read()
+            .expect("peer registry lock")
+            .bindings
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Atomically re-check authorization and bind a live QUIC connection to it.
+    /// Revocation and registration take the same write lock, closing the race between
+    /// handshake authentication and connection tracking.
+    pub(crate) fn register_connection(
+        &self,
+        fingerprint: CertFingerprint,
+        connection: &Connection,
+    ) -> Option<(AuthenticatedPeer, u64)> {
+        let mut state = self.inner.write().expect("peer registry lock");
+        let node_id = *state.bindings.get(&fingerprint)?;
+        let connection_id = state.next_connection_id;
+        state.next_connection_id = state
+            .next_connection_id
+            .checked_add(1)
+            .expect("peer connection id exhausted");
+        state
+            .connections
+            .entry(fingerprint)
+            .or_default()
+            .insert(connection_id, connection.clone());
+        drop(state);
+
+        // The wrapper that owns this connection may outlive a remote close. Remove
+        // the registry entry as soon as Quinn observes termination so later
+        // revocation counts only sessions that are still live.
+        let registry = self.clone();
+        let tracked = connection.clone();
+        tokio::spawn(async move {
+            tracked.closed().await;
+            registry.unregister_connection(fingerprint, connection_id);
+        });
+        Some((
+            AuthenticatedPeer {
+                fingerprint,
+                node_id,
+            },
+            connection_id,
+        ))
+    }
+
+    pub(crate) fn unregister_connection(&self, fingerprint: CertFingerprint, connection_id: u64) {
+        let mut state = self.inner.write().expect("peer registry lock");
+        let remove_fingerprint =
+            state
+                .connections
+                .get_mut(&fingerprint)
+                .is_some_and(|connections| {
+                    connections.remove(&connection_id);
+                    connections.is_empty()
+                });
+        if remove_fingerprint {
+            state.connections.remove(&fingerprint);
+        }
+    }
+}
 
 /// A running control server. Holds the quinn endpoint; the accept loop runs on a
 /// spawned task for the server's lifetime.
@@ -23,27 +188,28 @@ pub struct ControlServer {
 
 impl ControlServer {
     /// Bind a QUIC control server on `bind_addr` with `node`'s identity. Only peers
-    /// whose cert fingerprint is in `pinned_peers` are served (V10); requests are
-    /// deduplicated per `idempotency_key` and dispatched to `handler`.
+    /// whose cert fingerprint resolves through `peers` are served (V10). The resolved
+    /// NodeId accompanies every dispatched request; cacheable requests are atomically
+    /// deduplicated per authenticated peer/method/key/request digest within this
+    /// daemon process.
     pub fn bind<H: ControlHandler + 'static>(
         bind_addr: SocketAddr,
         node: &NodeCertificate,
-        pinned_peers: HashSet<CertFingerprint>,
+        peers: PeerRegistry,
         handler: Arc<H>,
     ) -> anyhow::Result<Self> {
         let server_cfg = quic_server_config(node)?;
         let endpoint = Endpoint::server(server_cfg, bind_addr)?;
         let local_addr = endpoint.local_addr()?;
         let ep = endpoint.clone();
-        let pins = Arc::new(pinned_peers);
-        let cache: Arc<IdempotencyCache<ControlReply>> = Arc::new(IdempotencyCache::new());
+        let cache: Arc<IdempotencyCache<ControlResponse>> = Arc::new(IdempotencyCache::new());
         tokio::spawn(async move {
             while let Some(incoming) = ep.accept().await {
-                let pins = pins.clone();
+                let peers = peers.clone();
                 let handler = handler.clone();
                 let cache = cache.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_connection(incoming, pins, handler, cache).await {
+                    if let Err(e) = serve_connection(incoming, peers, handler, cache).await {
                         warn!(error = %e, "control connection ended with error");
                     }
                 });
@@ -68,59 +234,110 @@ impl ControlServer {
 
 async fn serve_connection<H: ControlHandler + 'static>(
     incoming: quinn::Incoming,
-    pins: Arc<HashSet<CertFingerprint>>,
+    peers: PeerRegistry,
     handler: Arc<H>,
-    cache: Arc<IdempotencyCache<ControlReply>>,
+    cache: Arc<IdempotencyCache<ControlResponse>>,
 ) -> anyhow::Result<()> {
     let conn = incoming.await?;
     // V10: enforce the cert pin post-handshake. The TLS layer accepted any cert
     // identity but verified key ownership; serving requires the pin to match.
     let fp = peer_fingerprint(&conn)?;
-    if !pins.contains(&fp) {
+    let Some((peer, connection_id)) = peers.register_connection(fp, &conn) else {
         conn.close(1u32.into(), b"unpinned peer");
         anyhow::bail!("rejected unpinned peer cert {fp}");
-    }
+    };
     debug!(peer = %fp, "control peer accepted (pinned)");
-    loop {
+    let result = loop {
         match conn.accept_bi().await {
             Ok((send, recv)) => {
                 let handler = handler.clone();
                 let cache = cache.clone();
+                let peers = peers.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_request(send, recv, handler, cache).await {
+                    if let Err(e) = serve_request(send, recv, peer, peers, handler, cache).await {
                         debug!(error = %e, "control request stream error");
                     }
                 });
             }
             Err(quinn::ConnectionError::ApplicationClosed(_))
-            | Err(quinn::ConnectionError::LocallyClosed) => break,
-            Err(e) => return Err(e.into()),
+            | Err(quinn::ConnectionError::LocallyClosed) => break Ok(()),
+            Err(e) => break Err(e.into()),
         }
-    }
-    Ok(())
+    };
+    peers.unregister_connection(fp, connection_id);
+    result
 }
 
 async fn serve_request<H: ControlHandler>(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    peer: AuthenticatedPeer,
+    peers: PeerRegistry,
     handler: Arc<H>,
-    cache: Arc<IdempotencyCache<ControlReply>>,
+    cache: Arc<IdempotencyCache<ControlResponse>>,
 ) -> anyhow::Result<()> {
     let frame = recv.read_to_end(MAX_FRAME_BYTES + 4).await?;
     let env: ControlEnvelope = decode_frame(&frame)?;
+    if peers.resolve(peer.fingerprint) != Some(peer) {
+        anyhow::bail!("control peer was revoked before request dispatch");
+    }
     let method = env.request.method_name();
-    let (reply, cached) = cache.get_or_compute(&env.idempotency_key, || {
-        let response = handler.handle(&env.request);
-        ControlReply {
-            request_id: env.request_id,
-            response,
+    let (response, cache_status) = if env.request.cache_response() {
+        let scope = IdempotencyScope::new(peer.node_id, method, &env.idempotency_key);
+        let digest = env.request.digest()?;
+        match cache.get_or_compute(scope, digest, || handler.handle(peer, &env.request)) {
+            IdempotencyOutcome::Computed(response) => (response, "computed"),
+            IdempotencyOutcome::Cached(response) => (response, "cached"),
+            IdempotencyOutcome::DigestConflict => (
+                ControlResponse::IdempotencyConflict {
+                    method: method.to_string(),
+                    idempotency_key: env.idempotency_key.clone(),
+                },
+                "conflict",
+            ),
+            IdempotencyOutcome::CapacityExhausted => (
+                ControlResponse::Rejected {
+                    reason: "idempotency cache capacity exhausted; retry later".into(),
+                },
+                "capacity-exhausted",
+            ),
         }
-    });
-    debug!(method, key = %env.idempotency_key, cached, "control request handled");
+    } else {
+        (handler.handle(peer, &env.request), "bypass")
+    };
+    let reply = ControlReply {
+        request_id: env.request_id,
+        response,
+    };
+    debug!(method, key = %env.idempotency_key, cache_status, "control request handled");
     let out = encode_frame(&reply)?;
     send.write_all(&out).await?;
     send.finish()?;
     // Keep the stream open until the peer has acknowledged the response.
     let _ = send.stopped().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_registry_enforces_one_to_one_certificate_node_binding() {
+        let registry = PeerRegistry::default();
+        let first_node = NodeId::new();
+        let second_node = NodeId::new();
+        let first_cert = CertFingerprint([1; 32]);
+        let second_cert = CertFingerprint([2; 32]);
+
+        registry.authorize(first_cert, first_node).unwrap();
+        registry.authorize(first_cert, first_node).unwrap();
+        assert_eq!(registry.resolve(first_cert).unwrap().node_id, first_node);
+        assert!(registry.authorize(first_cert, second_node).is_err());
+        assert!(registry.authorize(second_cert, first_node).is_err());
+
+        assert_eq!(registry.revoke(first_node), 0);
+        assert!(registry.resolve(first_cert).is_none());
+        registry.authorize(second_cert, first_node).unwrap();
+    }
 }

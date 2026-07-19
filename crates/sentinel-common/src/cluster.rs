@@ -133,9 +133,6 @@ pub struct ClusterConfig {
     /// Human-readable alias (defaults to the `node_id` string).
     #[serde(default)]
     pub alias: Option<String>,
-    /// Seed endpoint to join (Zenoh `connect`). `None` on the seed itself.
-    #[serde(default)]
-    pub seed_endpoint: Option<String>,
     /// Bare targets this seed may provision (V14 allowlist). The host/identity of a
     /// `ProvisionNode` request come from here, never from the request. Empty on a
     /// non-seed node.
@@ -150,6 +147,15 @@ pub struct ClusterConfig {
     /// `None` = the control stream is not started on this node.
     #[serde(default)]
     pub control_bind: Option<String>,
+    /// Reachable control address advertised to newly provisioned peers. Required on
+    /// a seed that enables `ProvisionNode`; unlike `control_bind`, this must not use
+    /// an unspecified IP address.
+    #[serde(default)]
+    pub control_advertise: Option<String>,
+    /// Chef-controller identity authorized to mutate owner state. Seeds derive this
+    /// as their own NodeId; provisioned members persist the seed's NodeId here.
+    #[serde(default)]
+    pub chef_node_id: Option<NodeId>,
     /// Pinned control-plane peers (V10): each carries the peer's control address +
     /// SHA-256 cert fingerprint, exchanged out-of-band (like the SSH host-key pin).
     #[serde(default)]
@@ -161,6 +167,8 @@ pub struct ClusterConfig {
 /// distribution via membership is Track-D2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlPeer {
+    /// Stable node identity bound to this peer's certificate fingerprint.
+    pub node_id: NodeId,
     /// Human-readable alias of the peer node.
     pub alias: String,
     /// The peer's control-stream socket address (e.g. `"10.0.0.242:8085"`).
@@ -186,6 +194,14 @@ impl ClusterConfig {
             NodeLifecycleState::GenesisSeed
         } else {
             NodeLifecycleState::Joining
+        }
+    }
+
+    pub fn effective_chef_node_id(&self) -> Option<NodeId> {
+        if self.seed {
+            Some(self.node_id)
+        } else {
+            self.chef_node_id
         }
     }
 }
@@ -230,10 +246,11 @@ mod tests {
             cluster_id: Uuid::new_v4(),
             seed: true,
             alias: Some("test-node-0".into()),
-            seed_endpoint: None,
             pending_targets: Vec::new(),
             provision_binary_path: None,
             control_bind: None,
+            control_advertise: None,
+            chef_node_id: None,
             control_peers: Vec::new(),
         };
         let a = NodeIdentity::from_config(&cfg);
@@ -253,17 +270,22 @@ mod tests {
             cluster_id: Uuid::new_v4(),
             seed: true,
             alias: None,
-            seed_endpoint: None,
             pending_targets: Vec::new(),
             provision_binary_path: None,
             control_bind: None,
+            control_advertise: None,
+            chef_node_id: None,
             control_peers: Vec::new(),
         };
         assert_eq!(cfg.role(), ClusterRole::Seed);
         assert_eq!(cfg.initial_lifecycle(), NodeLifecycleState::GenesisSeed);
+        assert_eq!(cfg.effective_chef_node_id(), Some(cfg.node_id));
+        let chef = NodeId::new();
         cfg.seed = false;
+        cfg.chef_node_id = Some(chef);
         assert_eq!(cfg.role(), ClusterRole::Member);
         assert_eq!(cfg.initial_lifecycle(), NodeLifecycleState::Joining);
+        assert_eq!(cfg.effective_chef_node_id(), Some(chef));
     }
 
     #[test]

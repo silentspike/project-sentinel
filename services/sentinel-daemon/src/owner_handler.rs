@@ -15,7 +15,9 @@
 
 use std::sync::Arc;
 
-use sentinel_cluster_control::{ControlHandler, ControlRequest, ControlResponse};
+use sentinel_cluster_control::{
+    AuthenticatedPeer, ControlHandler, ControlRequest, ControlResponse,
+};
 use sentinel_common::{
     LocalOwnerRole, LocalOwnerState, NodeId, OwnerRegistry, OwnerTerm, StateTransferScope,
 };
@@ -112,8 +114,11 @@ impl OwnerControlHandler {
 }
 
 impl ControlHandler for OwnerControlHandler {
-    fn handle(&self, request: &ControlRequest) -> ControlResponse {
+    fn handle(&self, _peer: AuthenticatedPeer, request: &ControlRequest) -> ControlResponse {
         match request {
+            ControlRequest::MembershipHeartbeat { .. } => ControlResponse::Rejected {
+                reason: "membership heartbeat must be handled by the membership wrapper".into(),
+            },
             ControlRequest::OwnerCommit {
                 scope,
                 owner_node,
@@ -271,9 +276,15 @@ mod tests {
 
         // GC queries still report no refs via the full handle() path (#499 authority).
         assert_eq!(
-            handler.handle(&ControlRequest::RefQuery {
-                block_ref: "cas-blob:v1:sha256:ab".into()
-            }),
+            handler.handle(
+                AuthenticatedPeer {
+                    fingerprint: sentinel_cluster_control::CertFingerprint([3; 32]),
+                    node_id: sentinel_common::NodeId::new(),
+                },
+                &ControlRequest::RefQuery {
+                    block_ref: "cas-blob:v1:sha256:ab".into()
+                },
+            ),
             ControlResponse::RefQueryResult {
                 block_ref: "cas-blob:v1:sha256:ab".into(),
                 referenced: false

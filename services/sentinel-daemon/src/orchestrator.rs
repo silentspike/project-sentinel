@@ -1118,58 +1118,13 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         None => None,
     };
 
-    // -- Cluster 12 Membership (#495): Heartbeat + Liveness-View, nur mit [daemon.cluster] --
-    if let (Some(b), Some(cluster)) = (bus.as_ref(), config.cluster.as_ref()) {
-        let identity = sentinel_common::NodeIdentity::from_config(cluster);
-        let view = std::sync::Arc::new(std::sync::Mutex::new(
-            sentinel_common::MembershipView::new(sentinel_common::MembershipConfig::default()),
-        ));
-        tokio::spawn(crate::cluster_membership::run_cluster_membership(
-            b.clone(),
-            identity,
-            view,
-            std::time::Duration::from_secs(1),
-        ));
-        info!(node_id = %cluster.node_id, "Cluster 12: Membership-Service gespawnt");
-    }
-
-    // -- Cluster 12 ProvisionNode worker (#495, G3): only on the seed --
-    // The seed absorbs allowlisted bare targets into cluster nodes. On a member or a
-    // single-node daemon the receiver is dropped, so a `ProvisionNode` request fails
-    // fast at the operator endpoint (503) instead of buffering forever.
-    match config.cluster.as_ref() {
-        Some(cluster) if cluster.role() == sentinel_common::cluster::ClusterRole::Seed => {
-            let binary_path = cluster
-                .provision_binary_path
-                .clone()
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("/opt/sentinel/bin/sentinel-daemon"));
-            let pending_targets = cluster.pending_targets.clone();
-            let cluster_id = cluster.cluster_id;
-            let provision_event_store = Arc::clone(&event_store);
-            if let Err(e) = std::thread::Builder::new()
-                .name("provision-worker".into())
-                .spawn(move || {
-                    run_provision_worker(
-                        provision_rx,
-                        cluster_id,
-                        pending_targets,
-                        binary_path,
-                        "ubuntu".to_string(),
-                        provision_event_store,
-                    );
-                })
-            {
-                warn!(error = %e, "Cluster 12: ProvisionNode-Worker konnte nicht gestartet werden");
-            } else {
-                info!(
-                    targets = cluster.pending_targets.len(),
-                    "Cluster 12: ProvisionNode-Worker gespawnt (seed)"
-                );
-            }
-        }
-        _ => drop(provision_rx),
-    }
+    // -- Cluster 12 Membership (#495): one shared view for the inbound QUIC handler
+    // and the receiver-local liveness ticker. The task starts after the control stream. --
+    let cluster_membership = config.cluster.as_ref().map(|_| {
+        Arc::new(crate::cluster_membership::MembershipRuntime::new(
+            sentinel_common::MembershipConfig::default(),
+        ))
+    });
 
     // -- Cluster 12 control stream (#569, ADR-2): one cert-pinned QUIC RPC server,
     // started only when [daemon.cluster].control_bind is set. The handle (server kept
@@ -1186,7 +1141,15 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                         bind,
                         data_dir,
                         &alias,
+                        cluster.cluster_id,
+                        cluster.node_id,
+                        cluster.effective_chef_node_id(),
                         &cluster.control_peers,
+                        Arc::clone(
+                            cluster_membership
+                                .as_ref()
+                                .expect("cluster membership exists with cluster config"),
+                        ),
                         cluster_meta.clone(),
                     ) {
                         Ok(cc) => Some(Arc::new(cc)),
@@ -1200,6 +1163,100 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             },
             None => None,
         };
+
+    // Membership is cross-node liveness and therefore starts only on the explicit,
+    // cert-pinned QUIC peer graph. Zenoh remains loopback-only daemon IPC.
+    match (
+        cluster_control.as_ref(),
+        config.cluster.as_ref(),
+        cluster_membership.as_ref(),
+    ) {
+        (Some(control), Some(cluster), Some(runtime)) => {
+            tokio::spawn(crate::cluster_membership::run_cluster_membership(
+                Arc::clone(control),
+                cluster.cluster_id,
+                sentinel_common::NodeIdentity::from_config(cluster),
+                Arc::clone(runtime),
+                std::time::Duration::from_secs(1),
+            ));
+            info!(
+                node_id = %cluster.node_id,
+                peers = cluster.control_peers.len(),
+                "Cluster 12: QUIC membership service spawned"
+            );
+        }
+        (None, Some(cluster), Some(_)) => warn!(
+            node_id = %cluster.node_id,
+            "Cluster 12: membership disabled because the QUIC control stream is unavailable"
+        ),
+        _ => {}
+    }
+
+    // -- Cluster 12 ProvisionNode worker (#495, G3): only a fully configured seed --
+    // Onboarding needs the live QUIC trust registry plus the same membership view used
+    // by inbound heartbeats. Without either, the operator endpoint fails fast instead
+    // of producing a daemon process that can never join the cluster.
+    match (
+        config.cluster.as_ref(),
+        cluster_control.as_ref(),
+        cluster_membership.as_ref(),
+    ) {
+        (Some(cluster), Some(control), Some(membership))
+            if cluster.role() == sentinel_common::cluster::ClusterRole::Seed =>
+        {
+            if let Some(seed_control_addr) = cluster.control_advertise.clone() {
+                let binary_path = cluster
+                    .provision_binary_path
+                    .clone()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from("/opt/sentinel/bin/sentinel-daemon")
+                    });
+                let seed_node_id = cluster.node_id;
+                let worker_config = ProvisionWorkerConfig {
+                    cluster_id: cluster.cluster_id,
+                    seed_node_id,
+                    seed_alias: cluster
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| seed_node_id.to_string()),
+                    seed_control_addr,
+                    seed_fingerprint: control.fingerprint().to_hex(),
+                    pending_targets: cluster.pending_targets.clone(),
+                    binary_path,
+                    journal_path: data_dir.join("provision-ops.json"),
+                    bootstrap_user: "ubuntu".to_string(),
+                };
+                let provision_event_store = Arc::clone(&event_store);
+                let provision_cluster = RuntimeProvisionCluster {
+                    control: Arc::clone(control),
+                    membership: Arc::clone(membership),
+                };
+                if let Err(e) = std::thread::Builder::new()
+                    .name("provision-worker".into())
+                    .spawn(move || {
+                        run_provision_worker(
+                            provision_rx,
+                            worker_config,
+                            provision_cluster,
+                            provision_event_store,
+                        );
+                    })
+                {
+                    warn!(error = %e, "Cluster 12: ProvisionNode worker failed to start");
+                } else {
+                    info!(
+                        targets = cluster.pending_targets.len(),
+                        "Cluster 12: ProvisionNode worker spawned with QUIC join verification"
+                    );
+                }
+            } else {
+                warn!("Cluster 12: ProvisionNode disabled because control_advertise is absent");
+                drop(provision_rx);
+            }
+        }
+        _ => drop(provision_rx),
+    }
 
     // -- #498 CAS block-map gossip republish (Cluster 12): only when the control stream
     // is active (cluster mode). Single-node prod has no [daemon.cluster].control_bind, so
@@ -3966,19 +4023,60 @@ fn update_agent_projection_identity(projection_db_path: &str, cfg: &AgentConfig)
 /// bootstraps bare targets into cluster nodes. Runs **off** the ECS tick (pure infra
 /// I/O — it never touches the world), one op at a time on its own thread, so a slow
 /// SSH bootstrap never stalls the 1 Hz tick. Spawned only on the seed.
-fn run_provision_worker(
-    provision_rx: mpsc::Receiver<sentinel_common::OperatorProvisionCommand>,
+struct RuntimeProvisionCluster {
+    control: Arc<crate::cluster_control::ClusterControl>,
+    membership: Arc<crate::cluster_membership::MembershipRuntime>,
+}
+
+struct ProvisionWorkerConfig {
     cluster_id: uuid::Uuid,
+    seed_node_id: sentinel_common::NodeId,
+    seed_alias: String,
+    seed_control_addr: String,
+    seed_fingerprint: String,
     pending_targets: Vec<sentinel_common::cluster::PendingBareNode>,
     binary_path: std::path::PathBuf,
+    journal_path: std::path::PathBuf,
     bootstrap_user: String,
+}
+
+impl crate::provision_exec::ProvisionCluster for RuntimeProvisionCluster {
+    fn authorize_peer(&self, peer: sentinel_common::cluster::ControlPeer) -> anyhow::Result<()> {
+        self.control.add_peer(peer)
+    }
+
+    fn revoke_peer(&self, node_id: sentinel_common::NodeId) -> anyhow::Result<()> {
+        self.control.remove_peer(node_id)
+    }
+
+    fn is_alive(&self, node_id: sentinel_common::NodeId) -> bool {
+        self.membership.is_alive(&node_id)
+    }
+}
+
+fn run_provision_worker(
+    provision_rx: mpsc::Receiver<sentinel_common::OperatorProvisionCommand>,
+    config: ProvisionWorkerConfig,
+    provision_cluster: RuntimeProvisionCluster,
     event_store: Arc<EventStore>,
 ) {
     use crate::provision_exec::{
-        execute_provision_node, sanitize_alias, sha256_file, ProvisionPlan, ProvisionTiming,
-        SshProvisionTransport,
+        execute_provision_node, sanitize_alias, sha256_file, ProvisionJournal, ProvisionPlan,
+        ProvisionReservation, ProvisionTiming, SshProvisionTransport,
     };
-    use sentinel_common::provision::{validate_pending_target, ProvisionOp, ProvisionOpState};
+    use sentinel_common::provision::validate_pending_target;
+
+    let ProvisionWorkerConfig {
+        cluster_id,
+        seed_node_id,
+        seed_alias,
+        seed_control_addr,
+        seed_fingerprint,
+        pending_targets,
+        binary_path,
+        journal_path,
+        bootstrap_user,
+    } = config;
 
     let now_ms = || {
         std::time::SystemTime::now()
@@ -3986,6 +4084,19 @@ fn run_provision_worker(
             .unwrap_or_default()
             .as_millis() as u64
     };
+
+    let seed_control_addr: std::net::SocketAddr =
+        match seed_control_addr.parse::<std::net::SocketAddr>() {
+            Ok(addr) if !addr.ip().is_unspecified() => addr,
+            Ok(_) => {
+                warn!("ProvisionNode disabled: control_advertise uses an unspecified IP");
+                return;
+            }
+            Err(e) => {
+                warn!(error = %e, "ProvisionNode disabled: malformed control_advertise");
+                return;
+            }
+        };
 
     // sha256 of the binary the seed pushes (the determinism-profile invariant, #494);
     // computed once. If it is unhashable, provisioning is disabled but we still drain
@@ -4002,18 +4113,33 @@ fn run_provision_worker(
         }
     };
 
-    // Idempotency (AC-S2): a completed op for an idempotency_key makes a re-run a no-op.
-    let mut seen: std::collections::HashMap<String, ProvisionOpState> =
-        std::collections::HashMap::new();
+    let journal = match ProvisionJournal::open(&journal_path) {
+        Ok(journal) => journal,
+        Err(error) => {
+            warn!(%error, path = %journal_path.display(),
+                "ProvisionNode disabled: durable journal unavailable");
+            return;
+        }
+    };
 
     while let Ok(cmd) = provision_rx.recv() {
-        if matches!(
-            seen.get(&cmd.idempotency_key),
-            Some(ProvisionOpState::Completed)
-        ) {
-            info!(idempotency_key = %cmd.idempotency_key,
-                "ProvisionNode: bereits abgeschlossen, no-op (AC-S2)");
-            continue;
+        let alias = cmd
+            .requested_alias
+            .as_deref()
+            .and_then(sanitize_alias)
+            .or_else(|| sanitize_alias(&cmd.pending_target_id))
+            .unwrap_or_else(|| "node".to_string());
+        match journal.lookup(&cmd.pending_target_id, &alias, &cmd.idempotency_key) {
+            Ok(Some(op)) if op.state == sentinel_common::provision::ProvisionOpState::Completed => {
+                info!(idempotency_key = %cmd.idempotency_key, node_id = ?op.node_id,
+                    "ProvisionNode: durably completed, no-op (AC-S2)");
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(%error, "ProvisionNode rejected: durable identity conflict");
+                continue;
+            }
         }
         let now_unix_s = (now_ms() / 1000) as i64;
         // V14: host/identity come from the allowlist, never from the request.
@@ -4025,25 +4151,53 @@ fn run_provision_worker(
                     continue;
                 }
             };
-        let alias = cmd
-            .requested_alias
-            .as_deref()
-            .and_then(sanitize_alias)
-            .or_else(|| sanitize_alias(&cmd.pending_target_id))
-            .unwrap_or_else(|| "node".to_string());
-        let node_id = sentinel_common::NodeId::new();
-        let mut op = ProvisionOp::new(
-            uuid::Uuid::new_v4(),
-            cmd.pending_target_id.clone(),
-            alias.clone(),
-            cmd.idempotency_key.clone(),
+        let mut op = match journal.reserve(
+            &cmd.pending_target_id,
+            &alias,
+            &cmd.idempotency_key,
             now_ms(),
-        );
+        ) {
+            Ok(ProvisionReservation::Execute(op)) => op,
+            Ok(ProvisionReservation::Completed(_)) => continue,
+            Err(error) => {
+                warn!(%error, "ProvisionNode rejected: journal reservation failed");
+                continue;
+            }
+        };
+        let Some(node_id) = op.node_id else {
+            warn!(op_id = %op.op_id, "ProvisionNode rejected: journal entry has no NodeId");
+            continue;
+        };
+        let target_ip: std::net::IpAddr = match pending.target_ip.parse() {
+            Ok(ip) => ip,
+            Err(e) => {
+                warn!(error = %e, target = %pending.target_ip, "ProvisionNode target IP is invalid");
+                op.fail(format!("invalid target IP: {e}"), now_ms());
+                if let Err(error) = journal.update(&op) {
+                    warn!(%error, "ProvisionNode invalid-target state could not be journaled");
+                }
+                continue;
+            }
+        };
+        let target_control_addr =
+            std::net::SocketAddr::new(target_ip, seed_control_addr.port()).to_string();
+        let target_control_bind = if target_ip.is_ipv6() {
+            format!("[::]:{}", seed_control_addr.port())
+        } else {
+            format!("0.0.0.0:{}", seed_control_addr.port())
+        };
         let plan = ProvisionPlan {
             assigned_node_id: node_id,
             alias: alias.clone(),
             cluster_id,
-            seed_endpoint: None, // LAN multicast discovery (Track-A default)
+            target_control_bind,
+            target_control_addr,
+            seed_peer: sentinel_common::cluster::ControlPeer {
+                node_id: seed_node_id,
+                alias: seed_alias.clone(),
+                addr: seed_control_addr.to_string(),
+                cert_fingerprint: seed_fingerprint.clone(),
+            },
             binary_local_path: binary_path.clone(),
             binary_sha256: binary_sha256.clone(),
         };
@@ -4054,7 +4208,9 @@ fn run_provision_worker(
             Err(e) => {
                 warn!(error = %e, "ProvisionNode: Transport-Setup fehlgeschlagen");
                 op.fail(format!("transport: {e}"), now_ms());
-                seen.insert(cmd.idempotency_key, op.state);
+                if let Err(error) = journal.update(&op) {
+                    warn!(%error, "ProvisionNode failure state could not be journaled");
+                }
                 continue;
             }
         };
@@ -4064,10 +4220,11 @@ fn run_provision_worker(
             &pending,
             &plan,
             &transport,
+            &provision_cluster,
             ProvisionTiming::default(),
             &now_ms,
-        ) {
-            Ok(duration_ms) => {
+            &|op| journal.update(op),
+            &|completed_op, duration_ms| {
                 let payload = DomainEventPayload::NodeProvisioned {
                     node_id: node_id.to_string(),
                     alias: alias.clone(),
@@ -4075,16 +4232,19 @@ fn run_provision_worker(
                     target_ip: pending.target_ip.clone(),
                     duration_ms,
                 };
+                let operation_id = format!("provision-{}", completed_op.op_id);
                 let event = DomainEvent::new(
                     payload.event_type_str(),
                     "cluster",
                     &payload.to_json(),
-                    &format!("provision-{}", op.op_id),
+                    &operation_id,
                     0,
-                );
-                if let Err(e) = event_store.append_event(&event) {
-                    warn!(error = %e, "NodeProvisioned-Event konnte nicht persistiert werden");
-                }
+                )
+                .with_operation_id(&operation_id);
+                event_store.append_event(&event).map(|_| ())
+            },
+        ) {
+            Ok(duration_ms) => {
                 info!(%node_id, %alias, duration_ms, "ProvisionNode: Knoten provisioniert");
             }
             Err(e) => {
@@ -4092,7 +4252,6 @@ fn run_provision_worker(
                     "ProvisionNode fehlgeschlagen (Target quarantined, AC-B6)");
             }
         }
-        seen.insert(cmd.idempotency_key, op.state);
     }
 }
 
