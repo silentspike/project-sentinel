@@ -73,12 +73,15 @@ Terminal recovery states are `RollbackBeforeAuthority`, `RollbackAfterAuthority`
 9. **OwnerAuthorityCommit:** one coordinator redb transaction writes the step claim,
    target global term E+1, incremented owner snapshot revision/metadata, and operation
    state `OwnerAuthorityCommitted`. Recovery becomes forward-first at this transaction.
-10. **CommitMigrationOwner:** target transaction persists the target global term,
-    base `Owner/NotRoutable`, `OwnerActivating` overlay, and participant outcome. Normal
-    guard issue remains closed.
+10. **CommitMigrationOwner:** target transaction persists only the recipient-local
+    target state with the complete committed term: base `Owner/NotRoutable`,
+    `OwnerActivating` overlay, and participant outcome. It does not write
+    `CLUSTER_OWNER` or an install marker. Normal guard issue remains closed.
 11. **ReplicateOwnerSnapshot:** coordinator sends the full global snapshot and each
     recipient-local snapshot to every Track A member, including source and target. All
-    acknowledgements are required before restore. Replication leaves overlays intact.
+    acknowledgements are required before restore. Each recipient installs the complete
+    global and local snapshot only through `install_owner_snapshot(global, local)`;
+    replication leaves overlays intact.
 12. **BeginRestore:** target restores only under the sealed permit, spawns `Frozen`,
     validates the digest, and atomically restores every per-agent row. It remains
     `OwnerActivating`.
