@@ -21,7 +21,7 @@ use crate::handlers::kpi::KpiHandler;
 use crate::handlers::room_live_view::RoomLiveViewHandler;
 use crate::handlers::task_kanban_view::TaskKanbanHandler;
 use crate::handlers::ProjectionHandler;
-use crate::store::ReadModelStore;
+use crate::store::{LlmHierarchyCostUpdate, ReadModelStore};
 
 /// Alle 26 Raum-IDs aus config/rooms.toml (statisches Gebaeudelayout).
 pub const ROOM_IDS: &[&str] = &[
@@ -54,6 +54,7 @@ pub const ROOM_IDS: &[&str] = &[
 ];
 
 const PROJECTION_NAME: &str = "sentinel-projection";
+pub const HIERARCHY_PROJECTION_NAME: &str = "sentinel-projection-cost-hierarchy-v2";
 
 /// CQRS-lite Projection Worker.
 ///
@@ -114,6 +115,7 @@ impl ProjectionWorker {
                 next_rebuild_poll = Instant::now() + self.config.rebuild_request_poll_interval;
             }
 
+            let hierarchy_processed = self.process_hierarchy_pending_batch()?;
             let offset = self.event_store.get_offset(PROJECTION_NAME)?.unwrap_or(0);
 
             let batch = self
@@ -121,7 +123,9 @@ impl ProjectionWorker {
                 .get_events_since_with_id(offset, self.config.batch_size)?;
 
             if batch.is_empty() {
-                thread::sleep(self.config.poll_interval);
+                if hierarchy_processed == 0 {
+                    thread::sleep(self.config.poll_interval);
+                }
                 continue;
             }
 
@@ -154,6 +158,7 @@ impl ProjectionWorker {
 
         self.read_store.clear_all()?;
         self.event_store.reset_offset(PROJECTION_NAME)?;
+        self.event_store.reset_offset(HIERARCHY_PROJECTION_NAME)?;
         self.read_store.initialize_rooms(ROOM_IDS)?;
 
         let mut total_processed = 0usize;
@@ -194,9 +199,121 @@ impl ProjectionWorker {
         // Delta-based counting drifts when the event stream has gaps (e.g. daemon
         // restarts without despawn events in historical data).
         self.read_store.recompute_occupant_counts()?;
+        self.rebuild_hierarchy_projection()?;
 
         info!(total = total_processed, "Full rebuild complete");
         Ok(total_processed)
+    }
+
+    /// Replays the complete event stream through the independent hierarchy
+    /// projection. This intentionally ignores the shared projection offset.
+    fn rebuild_hierarchy_projection(&self) -> anyhow::Result<usize> {
+        let mut total = 0usize;
+        loop {
+            let processed = self.process_hierarchy_pending_batch()?;
+            if processed == 0 {
+                return Ok(total);
+            }
+            total += processed;
+        }
+    }
+
+    /// Catches the hierarchy projection up to the current end of the event
+    /// stream without consulting or mutating the shared projection offset.
+    pub fn catch_up_hierarchy(&self) -> anyhow::Result<usize> {
+        self.rebuild_hierarchy_projection()
+    }
+
+    /// Advances one hierarchy-projection batch using its own EventStore offset.
+    fn process_hierarchy_pending_batch(&self) -> anyhow::Result<usize> {
+        let offset = self
+            .event_store
+            .get_offset(HIERARCHY_PROJECTION_NAME)?
+            .unwrap_or(0);
+        let batch = self
+            .event_store
+            .get_events_since_with_id(offset, self.config.batch_size)?;
+        if batch.is_empty() {
+            return Ok(0);
+        }
+
+        let txn = self.read_store.begin_transaction()?;
+        txn.begin()?;
+        let apply_result = (|| -> anyhow::Result<()> {
+            for (row_id, event) in &batch {
+                let payload = match deserialize_payload(event) {
+                    Some(payload) => payload,
+                    None if event.schema_version >= 2 && event.event_type == "agent_llm_usage" => {
+                        anyhow::bail!("malformed v2 agent_llm_usage payload at row_id={row_id}")
+                    }
+                    None => continue,
+                };
+                if event.event_type != "agent_llm_usage" {
+                    continue;
+                }
+                let DomainEventPayload::AgentLlmUsage {
+                    tier,
+                    hierarchy_tier,
+                    cost_source,
+                    input_tokens,
+                    output_tokens,
+                    cache_read,
+                    cache_creation,
+                    cost_usd,
+                    ..
+                } = payload
+                else {
+                    if event.schema_version >= 2 {
+                        anyhow::bail!(
+                            "v2 agent_llm_usage payload type mismatch at row_id={row_id}"
+                        );
+                    }
+                    continue;
+                };
+                if event.schema_version >= 2 {
+                    if tier.trim().is_empty() {
+                        anyhow::bail!("v2 agent_llm_usage is missing model tier");
+                    }
+                    if !cost_usd.is_finite() || cost_usd < 0.0 {
+                        anyhow::bail!("v2 agent_llm_usage has invalid cost_usd");
+                    }
+                    let hierarchy_key = hierarchy_tier
+                        .context("v2 agent_llm_usage is missing hierarchy_tier")?
+                        .get()
+                        .to_string();
+                    cost_source.context("v2 agent_llm_usage is missing cost_source")?;
+                    txn.record_hierarchy_cost(
+                        &LlmHierarchyCostUpdate {
+                            hierarchy_tier: &hierarchy_key,
+                            input_tokens,
+                            output_tokens,
+                            cache_read,
+                            cache_creation,
+                            cost_usd,
+                        },
+                        *row_id,
+                    )?;
+                    txn.record_hierarchy_usage_meta(*row_id, true)?;
+                } else {
+                    txn.record_hierarchy_usage_meta(*row_id, false)?;
+                }
+            }
+
+            let last_row_id = batch.last().expect("non-empty hierarchy batch").0;
+            txn.update_projection_watermark(HIERARCHY_PROJECTION_NAME, last_row_id)?;
+            Ok(())
+        })();
+        if let Err(error) = apply_result {
+            txn.rollback()
+                .context("hierarchy projection batch rollback failed")?;
+            return Err(error).context("hierarchy projection batch failed");
+        }
+
+        let last_row_id = batch.last().expect("non-empty hierarchy batch").0;
+        txn.commit()?;
+        self.event_store
+            .update_offset(HIERARCHY_PROJECTION_NAME, last_row_id)?;
+        Ok(batch.len())
     }
 
     fn handle_rebuild_request_if_present(&self) -> anyhow::Result<bool> {
@@ -249,24 +366,13 @@ impl ProjectionWorker {
 
         for (row_id, event) in batch {
             // Payload deserialisieren (mit Fallback fuer alte Events ohne "type" Tag)
-            let payload: DomainEventPayload = match serde_json::from_str(&event.payload) {
-                Ok(p) => p,
-                Err(_first_err) => {
-                    // Fallback: Alte Events (vor serde tag="type") haben kein "type" Feld.
-                    // Wir injizieren den Tag aus event.event_type (DB-Spalte).
-                    match deserialize_legacy_payload(&event.event_type, &event.payload) {
-                        Some(p) => p,
-                        None => {
-                            warn!(
-                                row_id,
-                                event_type = event.event_type,
-                                error = %_first_err,
-                                "Unknown or malformed event payload, skipping"
-                            );
-                            continue;
-                        }
-                    }
-                }
+            let Some(payload) = deserialize_payload(event) else {
+                warn!(
+                    row_id,
+                    event_type = event.event_type,
+                    "Unknown or malformed event payload, skipping"
+                );
+                continue;
             };
 
             // Alle Handler aufrufen (Reihenfolge: agent -> room -> kpi)
@@ -301,6 +407,12 @@ impl ProjectionWorker {
         txn.commit()?;
         Ok(processed)
     }
+}
+
+fn deserialize_payload(event: &sentinel_common::DomainEvent) -> Option<DomainEventPayload> {
+    serde_json::from_str(&event.payload)
+        .ok()
+        .or_else(|| deserialize_legacy_payload(&event.event_type, &event.payload))
 }
 
 /// Fallback-Deserializer fuer Legacy-Events (vor `serde(tag = "type")` Einfuehrung).

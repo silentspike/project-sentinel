@@ -76,3 +76,20 @@ func TestRecordRuntimeAgentUsage_TrafficStats(t *testing.T) {
 		t.Fatalf("AC-3: tokens_by_agent[AGENT-09] = %d, want 500", tok)
 	}
 }
+
+func TestRecordRuntimeAgentUsage_DimensionsStaySemanticallySeparate(t *testing.T) {
+	resetRuntimeCostTrackerForTest()
+	RecordRuntimeAgentUsageDimensions("AGENT-03", "low", 1, "usage_price_table", 100, 20, 0.25)
+	RecordRuntimeAgentUsageDimensions("AGENT-09", "high", 3, "provider_reported", 200, 40, 0.75)
+
+	snapshot := RuntimeCostSnapshot()
+	if snapshot.ByModelTier["low"] != 0.25 || snapshot.ByModelTier["high"] != 0.75 {
+		t.Fatalf("model-tier cost dimensions drifted: %#v", snapshot.ByModelTier)
+	}
+	if snapshot.ByHierarchyTier["1"] != 0.25 || snapshot.ByHierarchyTier["3"] != 0.75 {
+		t.Fatalf("hierarchy-tier cost dimensions drifted: %#v", snapshot.ByHierarchyTier)
+	}
+	if snapshot.ByCostSource["provider_reported"] != 0.75 {
+		t.Fatalf("cost-source dimensions drifted: %#v", snapshot.ByCostSource)
+	}
+}

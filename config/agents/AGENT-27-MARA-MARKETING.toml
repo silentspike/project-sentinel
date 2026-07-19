@@ -3,6 +3,7 @@ id = 27
 name = "Mara Schneider"
 role = "Marketing & Content Managerin"
 department = "Marketing"
+tier = 2
 shift_set = 2
 kpis = ["Content-Output 6 Beitraege/Monat", "Newsletter-Oeffnungsrate > 25%", "Website-Traffic +10% pro Quartal"]
 reports_to = "Michael Hartmann"

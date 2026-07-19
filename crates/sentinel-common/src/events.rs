@@ -8,7 +8,18 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::agent_config::HierarchyTier;
 use crate::{AgentId, EventType, RoomStimulusType, TaskId};
+
+/// Provenance of the cost attached to one provider pipeline response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostSource {
+    ProviderReported,
+    UsagePriceTable,
+    PricingUnknown,
+    NonProviderZero,
+}
 
 /// Domain-Event mit Saga-ready Kettenfeldern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +92,12 @@ impl DomainEvent {
     /// Setzt eine explizite operation_id (Idempotenz).
     pub fn with_operation_id(mut self, operation_id: &str) -> Self {
         self.operation_id = operation_id.to_string();
+        self
+    }
+
+    /// Sets the event schema version for additive wire/event migrations.
+    pub fn with_schema_version(mut self, schema_version: u32) -> Self {
+        self.schema_version = schema_version;
         self
     }
 
@@ -418,6 +435,12 @@ pub enum DomainEventPayload {
         agent_id: AgentId,
         /// Aufgeloester Model-Tier (low/mid/high) bzw. synthesis/apicp/intercept/unknown.
         tier: String,
+        /// Gateway-resolved organization hierarchy class. Missing on v1 events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hierarchy_tier: Option<HierarchyTier>,
+        /// Cost provenance. Missing on v1 events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_source: Option<CostSource>,
         /// Frische (nicht gecachte) Input-Tokens.
         input_tokens: u32,
         output_tokens: u32,
@@ -491,6 +514,8 @@ mod tests {
         let usage = DomainEventPayload::AgentLlmUsage {
             agent_id: AgentId(8),
             tier: "high".to_string(),
+            hierarchy_tier: Some(HierarchyTier::TIER_2),
+            cost_source: Some(CostSource::ProviderReported),
             input_tokens: 1000,
             output_tokens: 500,
             cache_read: 200,
@@ -502,8 +527,27 @@ mod tests {
         assert!(json.contains("\"type\":\"AgentLlmUsage\""));
         assert!(json.contains("\"cache_read\":200"));
         assert!(json.contains("\"cache_creation\":100"));
+        assert!(json.contains("\"hierarchy_tier\":2"));
+        assert!(json.contains("\"cost_source\":\"provider_reported\""));
         let back: DomainEventPayload = serde_json::from_str(&json).expect("roundtrip");
         assert_eq!(back.to_json(), json);
+    }
+
+    #[test]
+    fn agent_llm_usage_v1_remains_deserializable() {
+        let json = r#"{"type":"AgentLlmUsage","agent_id":8,"tier":"high","input_tokens":1,"output_tokens":2,"cache_read":0,"cache_creation":0,"cost_usd":0.0}"#;
+        let payload: DomainEventPayload = serde_json::from_str(json).expect("v1 usage parses");
+        match payload {
+            DomainEventPayload::AgentLlmUsage {
+                hierarchy_tier,
+                cost_source,
+                ..
+            } => {
+                assert_eq!(hierarchy_tier, None);
+                assert_eq!(cost_source, None);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
     }
 
     #[test]

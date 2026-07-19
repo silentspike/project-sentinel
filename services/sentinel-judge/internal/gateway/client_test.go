@@ -17,6 +17,9 @@ func TestClientChat(t *testing.T) {
 		if r.URL.Path != "/internal/llm" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
+		if got := r.Header.Get("Authorization"); got != "Bearer judge-test-credential" {
+			t.Errorf("authorization = %q", got)
+		}
 
 		var req ChatRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -35,7 +38,9 @@ func TestClientChat(t *testing.T) {
 			TokensUsed: 150,
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode response: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -45,6 +50,7 @@ func TestClientChat(t *testing.T) {
 		Temperature: 0.2,
 		MaxTokens:   500,
 		Timeout:     5 * time.Second,
+		Credential:  "judge-test-credential",
 	})
 
 	result, err := client.Chat(context.Background(),
@@ -66,12 +72,29 @@ func TestClientChatServerError(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(ClientConfig{
-		URL:     server.URL,
-		Timeout: 5 * time.Second,
+		URL:        server.URL,
+		Timeout:    5 * time.Second,
+		Credential: "judge-test-credential",
 	})
 
 	_, err := client.Chat(context.Background(), "system", "user")
 	if err == nil {
 		t.Error("expected error for server error response")
+	}
+}
+
+func TestClientChatRejectsMissingCredentialBeforeNetwork(t *testing.T) {
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		called = true
+	}))
+	defer server.Close()
+
+	client := NewClient(ClientConfig{URL: server.URL})
+	if _, err := client.Chat(context.Background(), "system", "user"); err == nil {
+		t.Fatal("missing caller credential accepted")
+	}
+	if called {
+		t.Fatal("client reached the network without a caller credential")
 	}
 }

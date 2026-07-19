@@ -3,6 +3,7 @@ id = 15
 name = "Hannah Meier"
 role = "Werkstudentin (20h/Woche)"
 department = "Entwicklung"
+tier = 3
 shift_set = 1
 reports_to = "Andreas Wolff"
 

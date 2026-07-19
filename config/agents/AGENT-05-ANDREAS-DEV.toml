@@ -3,6 +3,7 @@ id = 5
 name = "Andreas Wolff"
 role = "Head of Development / Tech Lead"
 department = "Entwicklung"
+tier = 2
 shift_set = 1
 kpis = ["Code-Review-Durchlaufzeit < 4h", "Bug-Rate < 2 pro Sprint", "Deployment-Frequenz > 2x/Woche"]
 reports_to = "Thomas Mueller"

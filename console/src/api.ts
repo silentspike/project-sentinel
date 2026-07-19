@@ -162,6 +162,17 @@ export interface CostRow {
 export interface CostStats {
   by_agent: CostRow[];
   by_tier: CostRow[];
+  /** Additive #395 API data; CostView deliberately remains unchanged. */
+  by_hierarchy_tier?: CostRow[];
+  hierarchy_coverage?: {
+    attributed_calls: number;
+    first_v2_event_id: number | null;
+    last_usage_event_id: number;
+    last_hierarchy_event_id: number;
+    unattributed_v1_usage_events: number;
+    hierarchy_projection_offset: number;
+    global_projection_offset: number;
+  };
   time_series: CostRow[];
   projection?: string;
 }
@@ -423,6 +434,8 @@ export interface IdentityConfig {
   name: string;
   role: string;
   department: string;
+  /** Organization hierarchy class used for provider-specific model routing. */
+  tier?: 1 | 2 | 3 | null;
   shift_set: number;
   kpis: string[];
   reports_to?: string | null;

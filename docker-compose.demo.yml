@@ -12,9 +12,8 @@
 #
 # Ports exposed on the host (every Sentinel-app port uses a +10000 offset
 # to avoid colliding with common local dev services on 8000-8090):
-#   18001  Console UI             (browser)              -> container :8001
+#   18001  Console UI             (browser)              -> shared gateway namespace :8001
 #   18080  Cortex Gateway (proxy) -- also serves /metrics-> container :8080
-#   18081  Cortex Gateway (control plane)               -> container :8081
 #   18082  sentinel-judge        (health, /metrics)     -> container :8082
 #   18083  sentinel-nats-bridge  (health)               -> container :8083
 #   18084  sentinel-daemon (operator API)               -> container :8084
@@ -50,6 +49,23 @@ services:
     container_name: sentinel-demo-daemon
     environment:
       SENTINEL_ROLE: daemon
+      SENTINEL_AGENT_RUNTIME_CREDENTIAL_FILE: /run/secrets/caller-agent-runtime
+      SENTINEL_PLATFORM_CREDENTIAL_FILE: /run/secrets/caller-platform
+      SENTINEL_EVOLUTION_CREDENTIAL_FILE: /run/secrets/caller-evolution
+      SENTINEL_LLM_USAGE_V2_ENABLED: "false"
+    secrets:
+      - source: caller-agent-runtime
+        uid: "65001"
+        gid: "65001"
+        mode: 0400
+      - source: caller-platform
+        uid: "65001"
+        gid: "65001"
+        mode: 0400
+      - source: caller-evolution
+        uid: "65001"
+        gid: "65001"
+        mode: 0400
     depends_on:
       nats:
         condition: service_healthy
@@ -72,16 +88,41 @@ services:
     container_name: sentinel-demo-gateway
     environment:
       SENTINEL_ROLE: gateway
+      CORTEX_PROXY_BIND: 0.0.0.0
+      # The unauthenticated control plane remains loopback-only and is not published.
+      CORTEX_CONTROL_BIND: 127.0.0.1
+      CORTEX_AGENT_RUNTIME_CREDENTIAL_FILE: /run/secrets/caller-agent-runtime
+      CORTEX_PLATFORM_CREDENTIAL_FILE: /run/secrets/caller-platform
+      CORTEX_EVOLUTION_CREDENTIAL_FILE: /run/secrets/caller-evolution
+      CORTEX_JUDGE_CREDENTIAL_FILE: /run/secrets/caller-judge
+      SENTINEL_CORTEX_CONFIG: /opt/sentinel/config-default/cortex-gateway.toml
+    secrets:
+      - source: caller-agent-runtime
+        uid: "65001"
+        gid: "65001"
+        mode: 0400
+      - source: caller-platform
+        uid: "65001"
+        gid: "65001"
+        mode: 0400
+      - source: caller-evolution
+        uid: "65001"
+        gid: "65001"
+        mode: 0400
+      - source: caller-judge
+        uid: "65001"
+        gid: "65001"
+        mode: 0400
     depends_on:
       daemon:
         condition: service_healthy
-    # gateway exposes the proxy on 8080 (also serves /metrics) and the
-    # control plane on 8081 inside the container. Host ports 18080/18081
-    # use the +10000 offset to avoid colliding with local dev servers
-    # (gradle, java app servers, custom proxies on 8080/8081).
+    # The proxy is published on 8080 (also serves /metrics). The control plane
+    # remains loopback-only. The console sidecar shares this network namespace
+    # so it can retain control-plane functionality without exposing port 8081.
     ports:
       - "18080:8080"
-      - "18081:8081"
+      - "18001:8001/tcp"
+      - "18001:8001/udp"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "--max-time", "3", "http://localhost:8080/health"]
       interval: 10s
@@ -95,6 +136,12 @@ services:
     container_name: sentinel-demo-judge
     environment:
       SENTINEL_ROLE: judge
+      SENTINEL_JUDGE_CREDENTIAL_FILE: /run/secrets/caller-judge
+    secrets:
+      - source: caller-judge
+        uid: "65001"
+        gid: "65001"
+        mode: 0400
     depends_on:
       nats:
         condition: service_healthy
@@ -142,6 +189,7 @@ services:
   console:
     image: sentinel-demo:local
     container_name: sentinel-demo-console
+    network_mode: "service:gateway"
     environment:
       SENTINEL_ROLE: console
       SENTINEL_DASHBOARD_HTTP_BIND: "0.0.0.0:8001"
@@ -149,19 +197,15 @@ services:
       SENTINEL_DASHBOARD_API_KEY: "demo"
       SENTINEL_NATS_URL: "nats://nats:4222"
       SENTINEL_OPERATOR_API_URL: "http://daemon:8084"
-      CORTEX_GATEWAY_PROXY_URL: "http://gateway:8080"
-      CORTEX_GATEWAY_CONTROL_URL: "http://gateway:8081"
+      CORTEX_GATEWAY_PROXY_URL: "http://127.0.0.1:8080"
+      CORTEX_GATEWAY_CONTROL_URL: "http://127.0.0.1:8081"
     depends_on:
       gateway:
         condition: service_healthy
       projection:
         condition: service_started
-    ports:
-      - "18001:8001/tcp"
-      - "18001:8001/udp"
     volumes:
       - sentinel-data:/opt/sentinel/data:ro
-    networks: [sentinel]
 
 networks:
   sentinel:
@@ -170,3 +214,13 @@ networks:
 volumes:
   sentinel-data:
     name: sentinel-demo-data
+
+secrets:
+  caller-agent-runtime:
+    external: true
+  caller-platform:
+    external: true
+  caller-evolution:
+    external: true
+  caller-judge:
+    external: true

@@ -3,6 +3,7 @@ id = 3
 name = "Max Richter"
 role = "Senior UI/UX Designer"
 department = "Design"
+tier = 3
 shift_set = 1
 reports_to = "Lisa Brenner"
 

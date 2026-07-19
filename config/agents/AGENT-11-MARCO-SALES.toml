@@ -3,6 +3,7 @@ id = 11
 name = "Marco Rossi"
 role = "Head of Sales"
 department = "Vertrieb"
+tier = 2
 shift_set = 1
 kpis = ["Neukundengewinnung > 3 pro Quartal", "Angebotskonversion > 40%", "Umsatzziel pro Quartal erreicht"]
 reports_to = "Thomas Mueller"

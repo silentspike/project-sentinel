@@ -17,8 +17,9 @@ MemoryMax=2G
 OOMScoreAdjust=-900
 
 Environment=CORTEX_PRIMARY_PROVIDER=claude-code
+Environment=CORTEX_PROXY_BIND=0.0.0.0
+Environment=CORTEX_CONTROL_BIND=127.0.0.1
 Environment=CLAUDE_CODE_BINARY=/usr/bin/claude
-Environment=CLAUDE_CODE_MODEL=claude-opus-4-6
 Environment=SENTINEL_CORTEX_EVENT_STORE_PATH=/opt/sentinel/data/events.db
 Environment=SENTINEL_CORTEX_CB_FAILURE_THRESHOLD=15
 Environment=SENTINEL_CORTEX_CB_WINDOW_SECONDS=60
@@ -30,6 +31,15 @@ Environment=SENTINEL_SYNTHESIS_ENABLED=1
 Environment=SENTINEL_SEQUENCING_ENABLED=1
 Environment=SENTINEL_TICK_SYNC_ENABLED=1
 Environment=SENTINEL_APICP_ENABLED=1
+LoadCredential=caller-agent-runtime:/etc/sentinel/credentials/caller-agent-runtime
+LoadCredential=caller-platform:/etc/sentinel/credentials/caller-platform
+LoadCredential=caller-evolution:/etc/sentinel/credentials/caller-evolution
+LoadCredential=caller-judge:/etc/sentinel/credentials/caller-judge
+Environment=CORTEX_AGENT_RUNTIME_CREDENTIAL_FILE=%d/caller-agent-runtime
+Environment=CORTEX_PLATFORM_CREDENTIAL_FILE=%d/caller-platform
+Environment=CORTEX_EVOLUTION_CREDENTIAL_FILE=%d/caller-evolution
+Environment=CORTEX_JUDGE_CREDENTIAL_FILE=%d/caller-judge
+Environment=SENTINEL_CORTEX_CONFIG=/opt/sentinel/config/cortex-gateway.toml
 
 StandardOutput=journal
 StandardError=journal

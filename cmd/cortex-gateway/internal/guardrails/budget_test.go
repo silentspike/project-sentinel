@@ -64,8 +64,12 @@ func TestBudgetTracker_AllowChecksCumulative(t *testing.T) {
 
 func TestBudgetTracker_HourlyReset(t *testing.T) {
 	bt := NewBudgetTracker(1000, 100000)
-	now := time.Now()
+	// Use a deterministic non-midnight hour so advancing the hourly boundary
+	// cannot also trigger the daily reset when this test runs after 23:00.
+	now := time.Date(2026, time.January, 2, 12, 30, 0, 0, time.UTC)
 	bt.nowFunc = func() time.Time { return now }
+	bt.hourlyReset = now.Truncate(time.Hour).Add(time.Hour)
+	bt.dailyReset = nextMidnight(now)
 
 	bt.Record(500, 400) // 900 used
 

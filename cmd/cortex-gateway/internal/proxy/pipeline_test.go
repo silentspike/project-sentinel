@@ -88,6 +88,53 @@ func newTestPipelineHandler(registry *Registry, controlCfg *control.Config) *Pip
 	})
 }
 
+func newAgentRuntimeTestRequest(t *testing.T, body string) *http.Request {
+	t.Helper()
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("decode agent-runtime test request: %v", err)
+	}
+	metadata, _ := payload["metadata"].(map[string]any)
+	if metadata == nil {
+		metadata = make(map[string]any)
+		payload["metadata"] = metadata
+	}
+	if _, ok := metadata["agent_id"]; !ok {
+		metadata["agent_id"] = "1"
+	}
+	if _, ok := metadata["hierarchy_tier"]; !ok {
+		metadata["hierarchy_tier"] = "2"
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("encode agent-runtime test request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/internal/agent-runtime", strings.NewReader(string(encoded)))
+	return req.WithContext(callerRoleContext(req.Context(), CallerRoleAgentRuntime))
+}
+
+func TestPipelineInternalPathWithoutServerCallerContextFailsClosed(t *testing.T) {
+	reg := NewRegistry()
+	mock := &pipelineMockProvider{
+		name: "mock",
+		resp: &LLMResponse{Content: "unexpected", Model: "mock-tier1"},
+	}
+	reg.Register("mock", mock)
+	ph := newTestPipelineHandler(reg, nil)
+	body := `{"messages":[{"role":"user","content":"test"}],"metadata":{"agent_id":"1","agent_role":"CEO","hierarchy_tier":"1"}}`
+	req := httptest.NewRequest(http.MethodPost, "/internal/agent-runtime", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+
+	ph.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if mock.calls != 0 {
+		t.Fatalf("provider calls = %d, want 0", mock.calls)
+	}
+}
+
 func TestPipelineFullFlow(t *testing.T) {
 	reg := NewRegistry()
 	mock := &pipelineMockProvider{
@@ -104,7 +151,7 @@ func TestPipelineFullFlow(t *testing.T) {
 	ph := newTestPipelineHandler(reg, nil)
 
 	body := `{"messages":[{"role":"user","content":"Was machst du?"}],"metadata":{"agent_name":"Max Mueller","agent_role":"Senior Entwickler","perception":"CIRCADIAN: 11:42"}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req := newAgentRuntimeTestRequest(t, body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -168,7 +215,7 @@ func TestPipelineStructuredSystemBlocksForAnthropicDirect(t *testing.T) {
 	ph := newTestPipelineHandler(reg, nil)
 
 	body := `{"messages":[{"role":"user","content":"Was machst du?"}],"metadata":{"agent_name":"Thomas Mueller","agent_role":"CEO","body":"Hunger: 45%, Energy: 62%","environment":"Buero der Geschaeftsfuehrung (OG)","impulse":"Du musst jetzt in die Kueche gehen.","room_id":"buero-ceo"}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req := newAgentRuntimeTestRequest(t, body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -210,10 +257,14 @@ func TestPipelineAgentRuntimeAppliesHaikuPolicy(t *testing.T) {
 	reg.Register("mock", mock)
 
 	cfg := control.NewConfig("mock")
+	if err := cfg.Update(map[string]interface{}{"agent_runtime_model_policy": "haiku"}); err != nil {
+		t.Fatal(err)
+	}
 	ph := newTestPipelineHandler(reg, cfg)
 
-	body := `{"messages":[{"role":"user","content":"Was machst du?"}],"metadata":{"agent_id":"12","agent_name":"Thomas Mueller","agent_role":"CEO"}}`
-	req := httptest.NewRequest(http.MethodPost, "/internal/llm", strings.NewReader(body))
+	body := `{"messages":[{"role":"user","content":"Was machst du?"}],"metadata":{"agent_id":"12","agent_name":"Thomas Mueller","agent_role":"CEO","hierarchy_tier":"1"}}`
+	req := httptest.NewRequest(http.MethodPost, "/internal/agent-runtime", strings.NewReader(body))
+	req = req.WithContext(callerRoleContext(req.Context(), CallerRoleAgentRuntime))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -577,8 +628,9 @@ func TestPipelineLocalLoopInternalExtractsActionsAndAvoidsUpstream(t *testing.T)
 	}
 	ph := newTestPipelineHandler(reg, cfg)
 
-	body := `{"messages":[{"role":"user","content":"Bitte antworte."}],"metadata":{"agent_id":"4","agent_name":"AGENT-04","tick":"88","heard":"Hallo","room_id":"engineering"}}`
-	req := httptest.NewRequest(http.MethodPost, "/internal/llm", strings.NewReader(body))
+	body := `{"messages":[{"role":"user","content":"Bitte antworte."}],"metadata":{"agent_id":"4","agent_name":"AGENT-04","hierarchy_tier":"3","tick":"88","heard":"Hallo","room_id":"engineering"}}`
+	req := httptest.NewRequest(http.MethodPost, "/internal/agent-runtime", strings.NewReader(body))
+	req = req.WithContext(callerRoleContext(req.Context(), CallerRoleAgentRuntime))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -636,8 +688,9 @@ func TestPipelineLocalLoopDefaultOffForwardsNormally(t *testing.T) {
 
 	ph := newTestPipelineHandler(reg, control.NewConfig("mock"))
 
-	body := `{"messages":[{"role":"user","content":"test"}],"metadata":{"agent_id":"6","tick":"12"}}`
-	req := httptest.NewRequest(http.MethodPost, "/internal/llm", strings.NewReader(body))
+	body := `{"messages":[{"role":"user","content":"test"}],"metadata":{"agent_id":"6","hierarchy_tier":"3","tick":"12"}}`
+	req := httptest.NewRequest(http.MethodPost, "/internal/agent-runtime", strings.NewReader(body))
+	req = req.WithContext(callerRoleContext(req.Context(), CallerRoleAgentRuntime))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -689,7 +742,7 @@ func TestPipelineSynthesisUsesRuleActions(t *testing.T) {
 	})
 
 	body := `{"messages":[{"role":"user","content":"Was machst du?"}],"metadata":{"agent_id":"5","personality_type":"I","synth_fp":"H5|E5|B9|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0"}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req := newAgentRuntimeTestRequest(t, body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -755,7 +808,7 @@ func TestPipelineResponseLogDecisions(t *testing.T) {
 
 	doReq := func(body string) {
 		t.Helper()
-		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req := newAgentRuntimeTestRequest(t, body)
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		ph.ServeHTTP(w, req)
@@ -858,7 +911,7 @@ func TestPipelineAPICPLearnedPatternSynthesizes(t *testing.T) {
 	})
 
 	body := `{"messages":[{"role":"user","content":"Bitte antworte."}],"metadata":{"agent_id":"1","synth_fp":"` + fp + `"}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req := newAgentRuntimeTestRequest(t, body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -927,7 +980,7 @@ func TestPipelineAPICPProbeForwardsAndDegrades(t *testing.T) {
 	})
 
 	body := `{"messages":[{"role":"user","content":"Bitte antworte."}],"metadata":{"agent_id":"1","synth_fp":"` + fp + `"}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req := newAgentRuntimeTestRequest(t, body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -1002,7 +1055,7 @@ func TestPipelineManualInterceptModify(t *testing.T) {
 	}()
 
 	body := `{"messages":[{"role":"user","content":"Bitte antworte."}],"metadata":{"agent_id":"5"}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req := newAgentRuntimeTestRequest(t, body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -1065,7 +1118,7 @@ func TestPipelineSequencingInjectsP1Context(t *testing.T) {
 	p1Done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		body := `{"messages":[{"role":"user","content":"Thomas, bitte uebernimm das."}],"metadata":{"agent_id":"1","room_id":"room-1","heard":"Thomas, bitte uebernimm das.","is_directly_addressed":"true"}}`
-		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req := newAgentRuntimeTestRequest(t, body)
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		ph.ServeHTTP(w, req)
@@ -1075,7 +1128,7 @@ func TestPipelineSequencingInjectsP1Context(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	p3Body := `{"messages":[{"role":"user","content":"Was ist hier los?"}],"metadata":{"agent_id":"2","room_id":"room-1","heard":"Thomas, bitte uebernimm das.","is_directly_addressed":"false"}}`
-	p3Req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(p3Body))
+	p3Req := newAgentRuntimeTestRequest(t, p3Body)
 	p3Req.Header.Set("Content-Type", "application/json")
 	p3W := httptest.NewRecorder()
 	ph.ServeHTTP(p3W, p3Req)
@@ -1152,7 +1205,7 @@ func TestPipelineSequencingTimeoutForwardsWithoutContext(t *testing.T) {
 	p1Done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		body := `{"messages":[{"role":"user","content":"Thomas, bitte uebernimm das."}],"metadata":{"agent_id":"1","room_id":"room-1","heard":"Thomas, bitte uebernimm das.","is_directly_addressed":"true"}}`
-		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req := newAgentRuntimeTestRequest(t, body)
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		ph.ServeHTTP(w, req)
@@ -1162,7 +1215,7 @@ func TestPipelineSequencingTimeoutForwardsWithoutContext(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	p3Body := `{"messages":[{"role":"user","content":"Was ist hier los?"}],"metadata":{"agent_id":"2","room_id":"room-1","heard":"Thomas, bitte uebernimm das.","is_directly_addressed":"false"}}`
-	p3Req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(p3Body))
+	p3Req := newAgentRuntimeTestRequest(t, p3Body)
 	p3Req.Header.Set("Content-Type", "application/json")
 	p3W := httptest.NewRecorder()
 	ph.ServeHTTP(p3W, p3Req)
@@ -1241,7 +1294,7 @@ func TestPipelineManualResponseReplace(t *testing.T) {
 	}()
 
 	body := `{"messages":[{"role":"user","content":"Bitte antworte."}],"metadata":{"agent_id":"5"}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req := newAgentRuntimeTestRequest(t, body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -1318,7 +1371,7 @@ func TestPipelineSynthesisAndForwardShareOutboundResponsePath(t *testing.T) {
 
 	resolveNext("{\"action_type\":\"Chat\",\"target\":\"\",\"content\":\"synthetisch ersetzt\"}")
 	synthBody := `{"messages":[{"role":"user","content":"Bitte handle."}],"metadata":{"agent_id":"5","synth_fp":"H5|E5|B9|S3|C5|SN5|R:buero-dev-1|P:0|CH:0|HR:0|T:10|TMP:0|PE:I|IM:0"}}`
-	synthReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(synthBody))
+	synthReq := newAgentRuntimeTestRequest(t, synthBody)
 	synthReq.Header.Set("Content-Type", "application/json")
 	synthW := httptest.NewRecorder()
 	ph.ServeHTTP(synthW, synthReq)
@@ -1340,7 +1393,7 @@ func TestPipelineSynthesisAndForwardShareOutboundResponsePath(t *testing.T) {
 
 	resolveNext("{\"action_type\":\"Chat\",\"target\":\"\",\"content\":\"forward ersetzt\"}")
 	forwardBody := `{"messages":[{"role":"user","content":"Bitte antworte."}],"metadata":{"agent_id":"7","room_id":"room-1"}}`
-	forwardReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(forwardBody))
+	forwardReq := newAgentRuntimeTestRequest(t, forwardBody)
 	forwardReq.Header.Set("Content-Type", "application/json")
 	forwardW := httptest.NewRecorder()
 	ph.ServeHTTP(forwardW, forwardReq)
@@ -1508,7 +1561,7 @@ func TestPipelineQueueTickSyncAndSequencingIntegrate(t *testing.T) {
 	p1Done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		body := `{"messages":[{"role":"user","content":"Thomas, bitte uebernimm das."}],"metadata":{"agent_id":"1","room_id":"room-1","heard":"Thomas, bitte uebernimm das.","is_directly_addressed":"true","tick":"100"}}`
-		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req := newAgentRuntimeTestRequest(t, body)
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		ph.ServeHTTP(w, req)
@@ -1520,7 +1573,7 @@ func TestPipelineQueueTickSyncAndSequencingIntegrate(t *testing.T) {
 	p3Done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		body := `{"messages":[{"role":"user","content":"Was ist hier los?"}],"metadata":{"agent_id":"2","room_id":"room-1","heard":"Thomas, bitte uebernimm das.","is_directly_addressed":"false","tick":"100"}}`
-		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req := newAgentRuntimeTestRequest(t, body)
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		ph.ServeHTTP(w, req)
@@ -2072,7 +2125,7 @@ func TestPersonalityGuardDisabledByDefault(t *testing.T) {
 	ph := newTestPipelineHandlerWithDrift(reg, nil, drift, quality)
 
 	body := `{"messages":[{"role":"user","content":"test"}],"metadata":{"agent_id":"1","agent_name":"AGENT-01"}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req := newAgentRuntimeTestRequest(t, body)
 	w := httptest.NewRecorder()
 	ph.ServeHTTP(w, req)
 
@@ -2117,7 +2170,7 @@ func TestPersonalityGuardDetectsDrift(t *testing.T) {
 	ph := newTestPipelineHandlerWithDrift(reg, cfg, drift, quality)
 
 	body := `{"messages":[{"role":"user","content":"Was machst du?"}],"metadata":{"agent_id":"1","agent_name":"AGENT-01"}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req := newAgentRuntimeTestRequest(t, body)
 	w := httptest.NewRecorder()
 	ph.ServeHTTP(w, req)
 
@@ -2191,7 +2244,7 @@ func TestQualityGateTriggersRegen(t *testing.T) {
 	ph := newTestPipelineHandlerWithDrift(reg, cfg, drift, quality)
 
 	body := `{"messages":[{"role":"user","content":"Was hast du vor?"}],"metadata":{"agent_id":"1","agent_name":"AGENT-01"}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req := newAgentRuntimeTestRequest(t, body)
 	w := httptest.NewRecorder()
 	ph.ServeHTTP(w, req)
 
@@ -2231,7 +2284,7 @@ func TestQualityGateMaxRegen(t *testing.T) {
 	ph := newTestPipelineHandlerWithDrift(reg, cfg, drift, quality)
 
 	body := `{"messages":[{"role":"user","content":"test"}],"metadata":{"agent_id":"1","agent_name":"AGENT-01"}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req := newAgentRuntimeTestRequest(t, body)
 	w := httptest.NewRecorder()
 	ph.ServeHTTP(w, req)
 
@@ -2259,7 +2312,7 @@ func TestNarrativeNudgeInjection(t *testing.T) {
 	ph := newTestPipelineHandlerWithDrift(reg, cfg, nil, nil)
 
 	body := `{"messages":[{"role":"user","content":"Was machst du?"}],"metadata":{"agent_name":"Max Mueller","agent_role":"Developer","perception":"CIRCADIAN: 11:42"}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req := newAgentRuntimeTestRequest(t, body)
 	w := httptest.NewRecorder()
 	ph.ServeHTTP(w, req)
 
@@ -2298,7 +2351,7 @@ func TestNarrativeNudgeEmpty(t *testing.T) {
 	ph := newTestPipelineHandlerWithDrift(reg, nil, nil, nil)
 
 	body := `{"messages":[{"role":"user","content":"Was machst du?"}],"metadata":{"agent_name":"Max Mueller","agent_role":"Developer","perception":"CIRCADIAN: 11:42"}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req := newAgentRuntimeTestRequest(t, body)
 	w := httptest.NewRecorder()
 	ph.ServeHTTP(w, req)
 

@@ -3,6 +3,7 @@ id = 18
 name = "Robin Krause"
 role = "UX/UI Designer"
 department = "Design"
+tier = 3
 shift_set = 2
 reports_to = "Carla Mendez"
 

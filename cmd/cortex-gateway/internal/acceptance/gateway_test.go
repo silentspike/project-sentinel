@@ -449,18 +449,25 @@ func TestAC_13_AC5_CommandEventMapping(t *testing.T) {
 		BreakerCfg:   proxy.BreakerConfig{},
 		EventStore:   store,
 	})
+	securedHandler := proxy.CallerCredentials{
+		AgentRuntime:         "acceptance-agent-runtime",
+		PlatformControlplane: "acceptance-platform",
+		Evolution:            "acceptance-evolution",
+		Judge:                "acceptance-judge",
+	}.Middleware(handler)
 
 	// 3. HTTP-Request mit agent_name Metadata und X-Request-ID
 	reqBody := `{
 		"messages":[{"role":"user","content":"Was machst du jetzt?"}],
-		"metadata":{"agent_name":"AGENT-03","agent_role":"Designer","tick":"42"}
+		"metadata":{"agent_id":"3","agent_name":"AGENT-03","agent_role":"Designer","hierarchy_tier":"3","tick":"42"}
 	}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req := httptest.NewRequest(http.MethodPost, "/internal/agent-runtime", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer acceptance-agent-runtime")
 	req.Header.Set("X-Request-ID", "test-req-ac5-001")
 	w := httptest.NewRecorder()
 
-	handler.ServeHTTP(w, req)
+	securedHandler.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
@@ -513,11 +520,12 @@ func TestAC_13_AC5_CommandEventMapping(t *testing.T) {
 	}
 
 	// 8. Verify: Retry-Idempotenz (gleicher Request nochmal → kein Duplikat)
-	req2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req2 := httptest.NewRequest(http.MethodPost, "/internal/agent-runtime", strings.NewReader(reqBody))
 	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Authorization", "Bearer acceptance-agent-runtime")
 	req2.Header.Set("X-Request-ID", "test-req-ac5-001") // gleiche ID
 	w2 := httptest.NewRecorder()
-	handler.ServeHTTP(w2, req2)
+	securedHandler.ServeHTTP(w2, req2)
 
 	eventCountAfterRetry, _ := store.EventCount()
 	if eventCountAfterRetry != eventCount {

@@ -3,6 +3,7 @@ id = 19
 name = "Tim Vogt"
 role = "Motion/Visual Designer"
 department = "Design"
+tier = 3
 shift_set = 2
 reports_to = "Carla Mendez"
 

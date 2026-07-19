@@ -3,6 +3,7 @@ id = 49
 name = "Carla Friedmann"
 role = "Betriebspsychologin"
 department = "Betriebsgesundheit"
+tier = 2
 shift_set = 0
 kpis = ["Mitarbeitergespraeche > 5 pro Woche", "Burnout-Praevention Workshops > 2/Quartal", "Vertraulichkeit 100% eingehalten"]
 reports_to = ""

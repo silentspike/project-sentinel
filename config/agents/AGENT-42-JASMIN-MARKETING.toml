@@ -3,6 +3,7 @@ id = 42
 name = "Jasmin Keller"
 role = "Marketing & Social Media Managerin"
 department = "Marketing"
+tier = 2
 shift_set = 3
 kpis = ["Social-Media-Engagement-Rate > 3%", "TikTok/Instagram Follower-Wachstum > 20%/Quartal", "Content-Kalender Einhaltung > 90%"]
 reports_to = "Sandra Vogel"

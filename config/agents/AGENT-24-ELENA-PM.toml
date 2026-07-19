@@ -3,6 +3,7 @@ id = 24
 name = "Elena Bauer"
 role = "Head of Projektmanagement / Senior Projektmanagerin"
 department = "Projektmanagement"
+tier = 2
 shift_set = 2
 kpis = ["Projekt-Meilensteine on-time > 85%", "Budget-Einhaltung < 5% Abweichung", "Stakeholder-Zufriedenheit > 4/5"]
 reports_to = "Michael Hartmann"

@@ -7,8 +7,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sentinel_common::{AgentId, DomainEvent, DomainEventPayload, EventType};
+use sentinel_common::agent_config::HierarchyTier;
+use sentinel_common::{AgentId, CostSource, DomainEvent, DomainEventPayload, EventType};
 use sentinel_limbo::EventStore;
+use sentinel_projection::worker::HIERARCHY_PROJECTION_NAME;
 use sentinel_projection::{ProjectionConfig, ProjectionWorker};
 
 // ── Helpers ────────────────────────────────────
@@ -514,10 +516,13 @@ fn append_usage(
     cache_read: u32,
     cache_creation: u32,
     cost: f64,
+    hierarchy_tier: Option<HierarchyTier>,
 ) {
     let payload = DomainEventPayload::AgentLlmUsage {
         agent_id: AgentId(agent),
         tier: tier.to_string(),
+        hierarchy_tier,
+        cost_source: hierarchy_tier.map(|_| CostSource::ProviderReported),
         input_tokens: input,
         output_tokens: output,
         cache_read,
@@ -532,6 +537,9 @@ fn append_usage(
         &format!("req-{tick}"),
         tick,
     );
+    if hierarchy_tier.is_some() {
+        event = event.with_schema_version(2);
+    }
     event.timestamp_ms = tick * 1000;
     store.append_event(&event).unwrap();
 }
@@ -544,10 +552,10 @@ fn cost_projection_aggregates_by_agent_tier_and_bucket() {
     let store = Arc::new(EventStore::open(es_path.to_str().unwrap()).unwrap());
 
     // AGENT-08 high: two calls in minute bucket 0 (ts 10000, 20000).
-    append_usage(&store, 10, 8, "high", 1000, 500, 200, 100, 0.02);
-    append_usage(&store, 20, 8, "high", 300, 100, 0, 0, 0.005);
+    append_usage(&store, 10, 8, "high", 1000, 500, 200, 100, 0.02, None);
+    append_usage(&store, 20, 8, "high", 300, 100, 0, 0, 0.005, None);
     // AGENT-09 low: one call in minute bucket 60000 (ts 70000).
-    append_usage(&store, 70, 9, "low", 50, 20, 0, 0, 0.0001);
+    append_usage(&store, 70, 9, "low", 50, 20, 0, 0, 0.0001, None);
 
     let worker = rebuild_all(Arc::clone(&store), rm_path.to_str().unwrap());
     let rs = worker.read_store();
@@ -576,6 +584,123 @@ fn cost_projection_aggregates_by_agent_tier_and_bucket() {
     assert_eq!(ts[0].call_count, 2);
     assert_eq!(ts[1].key, "60000");
     assert_eq!(ts[1].call_count, 1);
+
+    let by_hierarchy = rs.cost_by_hierarchy_tier().unwrap();
+    assert!(
+        by_hierarchy.is_empty(),
+        "v1 usage must not enter hierarchy aggregates"
+    );
+    let coverage = rs.hierarchy_projection_meta().unwrap();
+    assert_eq!(coverage.first_v2_event_id, None);
+    assert_eq!(coverage.unattributed_v1_usage_events, 3);
+    assert_eq!(coverage.last_hierarchy_event_id, 0);
+}
+
+#[test]
+fn hierarchy_projection_catches_up_when_shared_offset_already_advanced() {
+    let dir = tempfile::tempdir().unwrap();
+    let es_path = dir.path().join("hierarchy_es.db");
+    let rm_path = dir.path().join("hierarchy_rm.db");
+    let store = Arc::new(EventStore::open(es_path.to_str().unwrap()).unwrap());
+
+    append_usage(&store, 5, 7, "low", 10, 2, 0, 0, 0.0001, None);
+    append_usage(
+        &store,
+        10,
+        8,
+        "mid",
+        100,
+        20,
+        0,
+        0,
+        0.001,
+        Some(HierarchyTier::TIER_2),
+    );
+    store
+        .update_offset("sentinel-projection", 1_000_000)
+        .unwrap();
+
+    let worker =
+        ProjectionWorker::new(Arc::clone(&store), make_config(rm_path.to_str().unwrap())).unwrap();
+    assert!(worker.catch_up_hierarchy().unwrap() > 0);
+
+    let rows = worker.read_store().cost_by_hierarchy_tier().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key, "2");
+    assert_eq!(rows[0].call_count, 1);
+    let coverage = worker.read_store().hierarchy_projection_meta().unwrap();
+    assert_eq!(coverage.first_v2_event_id, Some(2));
+    assert_eq!(coverage.last_usage_event_id, 2);
+    assert_eq!(coverage.last_hierarchy_event_id, 2);
+    assert_eq!(coverage.unattributed_v1_usage_events, 1);
+    assert_eq!(
+        store.get_offset("sentinel-projection").unwrap(),
+        Some(1_000_000)
+    );
+    assert!(store
+        .get_offset(HIERARCHY_PROJECTION_NAME)
+        .unwrap()
+        .is_some());
+
+    // Simulate a crash after the read-model transaction committed but before
+    // its EventStore offset became durable. The row-id guard prevents a replay
+    // from incrementing the hierarchy aggregate a second time.
+    store.reset_offset(HIERARCHY_PROJECTION_NAME).unwrap();
+    assert!(worker.catch_up_hierarchy().unwrap() > 0);
+    let replayed = worker.read_store().cost_by_hierarchy_tier().unwrap();
+    assert_eq!(replayed[0].call_count, 1);
+    assert!((replayed[0].cost_usd - 0.001).abs() < 1e-9);
+    assert_eq!(
+        worker
+            .read_store()
+            .hierarchy_projection_meta()
+            .unwrap()
+            .unattributed_v1_usage_events,
+        1,
+        "crash replay must not count v1 coverage twice"
+    );
+}
+
+#[test]
+fn hierarchy_projection_rejects_mismatched_v2_payload_without_advancing_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let es_path = dir.path().join("hierarchy_invalid_es.db");
+    let rm_path = dir.path().join("hierarchy_invalid_rm.db");
+    let store = Arc::new(EventStore::open(es_path.to_str().unwrap()).unwrap());
+
+    let payload = DomainEventPayload::TickSnapshot {
+        tick: 1,
+        agent_count: 1,
+    };
+    let mut event = DomainEvent::new(
+        "agent_llm_usage",
+        "AGENT-01",
+        &payload.to_json(),
+        "req-invalid-v2",
+        1,
+    )
+    .with_schema_version(2);
+    event.operation_id = "llm_usage_req-invalid-v2".to_string();
+    store.append_event(&event).unwrap();
+
+    let worker =
+        ProjectionWorker::new(Arc::clone(&store), make_config(rm_path.to_str().unwrap())).unwrap();
+    let error = format!("{:#}", worker.catch_up_hierarchy().unwrap_err());
+    assert!(error.contains("payload type mismatch"), "{error}");
+    assert_eq!(store.get_offset(HIERARCHY_PROJECTION_NAME).unwrap(), None);
+    assert!(worker
+        .read_store()
+        .cost_by_hierarchy_tier()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        worker
+            .read_store()
+            .hierarchy_projection_meta()
+            .unwrap()
+            .last_usage_event_id,
+        0
+    );
 }
 
 #[test]

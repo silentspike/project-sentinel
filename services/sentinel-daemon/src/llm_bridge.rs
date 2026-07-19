@@ -15,7 +15,7 @@ pub mod bridge {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock, RwLock};
     use std::time::{Duration, Instant};
 
     use serde::{Deserialize, Serialize};
@@ -23,8 +23,8 @@ pub mod bridge {
     use tracing::{debug, error, info, instrument, warn};
 
     use sentinel_common::{
-        ActionType, AgentAction, AgentId, DomainEvent, DomainEventPayload, Perception, Tick,
-        Timestamp,
+        ActionType, AgentAction, AgentId, CostSource, DomainEvent, DomainEventPayload,
+        HierarchyTier, Perception, Tick, Timestamp,
     };
     use sentinel_limbo::EventStore;
     use sentinel_redb::StateStore;
@@ -32,7 +32,7 @@ pub mod bridge {
     pub type SharedLlmActivityTicks = Arc<Mutex<HashMap<AgentId, u64>>>;
 
     /// LLM Bridge Konfiguration.
-    #[derive(Debug, Clone)]
+    #[derive(Clone)]
     pub struct LlmBridgeConfig {
         /// Cortex Gateway Base URL (default: http://localhost:8080)
         pub gateway_url: String,
@@ -46,6 +46,10 @@ pub mod bridge {
         pub circuit_breaker_threshold: u32,
         /// Circuit Breaker: Reset-Zeit nach Open
         pub circuit_breaker_reset: Duration,
+        /// Dedicated agent-runtime credential. Never log this value.
+        pub credential: String,
+        /// Producer cutover flag. Disabled until the hierarchy projection has backfilled.
+        pub usage_v2_enabled: bool,
     }
 
     impl Default for LlmBridgeConfig {
@@ -57,6 +61,8 @@ pub mod bridge {
                 request_timeout: Duration::from_secs(35),
                 circuit_breaker_threshold: 3,
                 circuit_breaker_reset: Duration::from_secs(30),
+                credential: String::new(),
+                usage_v2_enabled: false,
             }
         }
     }
@@ -152,13 +158,42 @@ pub mod bridge {
         tier: String,
         #[serde(default)]
         cost_usd: f64,
+        hierarchy_tier: Option<HierarchyTier>,
+        cost_source: Option<CostSource>,
+        #[serde(default)]
+        effective_model: String,
+    }
+
+    fn agent_runtime_request(
+        client: &reqwest::Client,
+        url: &str,
+        credential: &str,
+        request: &GatewayRequest,
+    ) -> reqwest::RequestBuilder {
+        client.post(url).bearer_auth(credential).json(request)
     }
 
     /// #427: baut das `AgentLlmUsage`-Event aus einer Gateway-Response. Die frischen
     /// (nicht gecachten) Input-Tokens werden aus dem gefoldeten `input_tokens` rekonstruiert,
     /// damit Event-Aggregation und Gateway-Counter exakt rekonziliieren. `operation_id` ist
     /// deterministisch aus der `request_id` abgeleitet (Idempotenz, kein Doppel-Append).
-    fn build_usage_event(agent_id: AgentId, tick: u64, resp: &GatewayResponse) -> DomainEvent {
+    fn build_usage_event(
+        agent_id: AgentId,
+        tick: u64,
+        resp: &GatewayResponse,
+        usage_v2_enabled: bool,
+    ) -> Result<DomainEvent, String> {
+        if usage_v2_enabled {
+            if resp.effective_model.trim().is_empty() {
+                return Err("v2 response missing effective_model".to_string());
+            }
+            if resp.tier.trim().is_empty() {
+                return Err("v2 response missing model tier".to_string());
+            }
+            if !resp.cost_usd.is_finite() || resp.cost_usd < 0.0 {
+                return Err("v2 response has invalid cost_usd".to_string());
+            }
+        }
         let fresh_input = resp
             .input_tokens
             .saturating_sub(resp.cache_read)
@@ -166,6 +201,19 @@ pub mod bridge {
         let payload = DomainEventPayload::AgentLlmUsage {
             agent_id,
             tier: resp.tier.clone(),
+            hierarchy_tier: if usage_v2_enabled {
+                Some(
+                    resp.hierarchy_tier
+                        .ok_or("v2 response missing hierarchy_tier")?,
+                )
+            } else {
+                None
+            },
+            cost_source: if usage_v2_enabled {
+                Some(resp.cost_source.ok_or("v2 response missing cost_source")?)
+            } else {
+                None
+            },
             input_tokens: fresh_input,
             output_tokens: resp.output_tokens,
             cache_read: resp.cache_read,
@@ -183,7 +231,40 @@ pub mod bridge {
         if !resp.request_id.is_empty() {
             event = event.with_operation_id(&format!("llm_usage_{}", resp.request_id));
         }
-        event
+        if usage_v2_enabled {
+            event = event.with_schema_version(2);
+        }
+        Ok(event)
+    }
+
+    #[derive(Clone)]
+    struct AgentRoutingClaim {
+        role: String,
+        tier: HierarchyTier,
+    }
+
+    static AGENT_ROUTING: OnceLock<RwLock<HashMap<AgentId, AgentRoutingClaim>>> = OnceLock::new();
+
+    /// Replace the node-local derived routing cache after startup or a committed
+    /// config apply. Agent TOML remains the source of truth.
+    pub fn replace_agent_routing(agents: &[sentinel_common::agent_config::AgentConfig]) {
+        let claims = agents
+            .iter()
+            .map(|agent| {
+                let tier = agent.identity.tier.unwrap_or_else(|| {
+                    sentinel_common::legacy_hierarchy_tier_from_role(&agent.identity.role)
+                });
+                (
+                    AgentId(agent.identity.id),
+                    AgentRoutingClaim {
+                        role: agent.identity.role.clone(),
+                        tier,
+                    },
+                )
+            })
+            .collect();
+        let cache = AGENT_ROUTING.get_or_init(|| RwLock::new(HashMap::new()));
+        *cache.write().expect("agent routing cache poisoned") = claims;
     }
 
     #[derive(Debug, Deserialize)]
@@ -376,7 +457,7 @@ pub mod bridge {
                     "LLM call triggered");
 
                 let client = client.clone();
-                let url = format!("{}/internal/llm", config.gateway_url);
+                let url = format!("{}/internal/agent-runtime", config.gateway_url);
                 let action_tx = action_tx.clone();
                 let telemetry = Arc::clone(&telemetry);
                 let cb = Arc::clone(&circuit_breaker);
@@ -384,6 +465,8 @@ pub mod bridge {
                 let retry_perception = perception.clone();
                 let request = build_gateway_request(&perception, &state_store);
                 let bridge_event_store = Arc::clone(&event_store);
+                let credential = config.credential.clone();
+                let usage_v2_enabled = config.usage_v2_enabled;
 
                 telemetry.calls_total.fetch_add(1, Ordering::Relaxed);
 
@@ -418,12 +501,53 @@ pub mod bridge {
                             }
                         };
                         let call_start = Instant::now();
-                        match client.post(&url).json(&request).send().await {
+                        match agent_runtime_request(&client, &url, &credential, &request)
+                            .send()
+                            .await
+                        {
                             Ok(response) => {
                                 let status = response.status();
                                 if status.is_success() {
                                     match response.json::<GatewayResponse>().await {
                                         Ok(gateway_resp) => {
+                                            let usage_event = match build_usage_event(
+                                                agent_id,
+                                                current_tick,
+                                                &gateway_resp,
+                                                usage_v2_enabled,
+                                            ) {
+                                                Ok(event) => event,
+                                                Err(e) => {
+                                                    warn!(agent = %agent_id, error = %e, "AgentLlmUsage v2 response abgelehnt");
+                                                    telemetry
+                                                        .calls_failed
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    cb.lock().unwrap().record_failure();
+                                                    queue_retry(
+                                                        &retry_queue,
+                                                        retry_perception.clone(),
+                                                    )
+                                                    .await;
+                                                    return;
+                                                }
+                                            };
+                                            if let Err(e) =
+                                                bridge_event_store.append_event(&usage_event)
+                                            {
+                                                warn!(agent = %agent_id, error = %e, "AgentLlmUsage Event append fehlgeschlagen");
+                                                if usage_v2_enabled {
+                                                    telemetry
+                                                        .calls_failed
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    cb.lock().unwrap().record_failure();
+                                                    queue_retry(
+                                                        &retry_queue,
+                                                        retry_perception.clone(),
+                                                    )
+                                                    .await;
+                                                    return;
+                                                }
+                                            }
                                             let latency_ms = call_start.elapsed().as_millis();
                                             telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
                                             telemetry.tokens_total.fetch_add(
@@ -451,16 +575,6 @@ pub mod bridge {
                                                 ) {
                                                     let _ = action_tx.send(agent_action);
                                                 }
-                                            }
-                                            // #427: emit the per-call usage event (every call, incl. 0-token synthesis).
-                                            if let Err(e) =
-                                                bridge_event_store.append_event(&build_usage_event(
-                                                    agent_id,
-                                                    current_tick,
-                                                    &gateway_resp,
-                                                ))
-                                            {
-                                                warn!(agent = %agent_id, error = %e, "AgentLlmUsage Event append fehlgeschlagen");
                                             }
                                         }
                                         Err(e) => {
@@ -499,12 +613,43 @@ pub mod bridge {
                     };
                     tokio::spawn(async move {
                         let call_start = Instant::now();
-                        match client.post(&url).json(&request).send().await {
+                        match agent_runtime_request(&client, &url, &credential, &request)
+                            .send()
+                            .await
+                        {
                             Ok(response) => {
                                 let status = response.status();
                                 if status.is_success() {
                                     match response.json::<GatewayResponse>().await {
                                         Ok(gateway_resp) => {
+                                            let usage_event = match build_usage_event(
+                                                agent_id,
+                                                current_tick,
+                                                &gateway_resp,
+                                                usage_v2_enabled,
+                                            ) {
+                                                Ok(event) => event,
+                                                Err(e) => {
+                                                    warn!(agent = %agent_id, error = %e, "AgentLlmUsage v2 response abgelehnt");
+                                                    telemetry
+                                                        .calls_failed
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    cb.lock().unwrap().record_failure();
+                                                    return;
+                                                }
+                                            };
+                                            if let Err(e) =
+                                                bridge_event_store.append_event(&usage_event)
+                                            {
+                                                warn!(agent = %agent_id, error = %e, "AgentLlmUsage Event append fehlgeschlagen");
+                                                if usage_v2_enabled {
+                                                    telemetry
+                                                        .calls_failed
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    cb.lock().unwrap().record_failure();
+                                                    return;
+                                                }
+                                            }
                                             let latency_ms = call_start.elapsed().as_millis();
                                             telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
                                             telemetry.tokens_total.fetch_add(
@@ -532,16 +677,6 @@ pub mod bridge {
                                                 ) {
                                                     let _ = action_tx.send(agent_action);
                                                 }
-                                            }
-                                            // #427: emit the per-call usage event (every call, incl. 0-token synthesis).
-                                            if let Err(e) =
-                                                bridge_event_store.append_event(&build_usage_event(
-                                                    agent_id,
-                                                    current_tick,
-                                                    &gateway_resp,
-                                                ))
-                                            {
-                                                warn!(agent = %agent_id, error = %e, "AgentLlmUsage Event append fehlgeschlagen");
                                             }
                                         }
                                         Err(e) => {
@@ -628,6 +763,14 @@ pub mod bridge {
         let formatted_perception = format_perception_metadata(perception);
         let mut metadata = HashMap::new();
         metadata.insert("agent_id".to_string(), perception.agent_id.0.to_string());
+        if let Some(claim) = AGENT_ROUTING
+            .get()
+            .and_then(|cache| cache.read().ok())
+            .and_then(|claims| claims.get(&perception.agent_id).cloned())
+        {
+            metadata.insert("agent_role".to_string(), claim.role);
+            metadata.insert("hierarchy_tier".to_string(), claim.tier.get().to_string());
+        }
         metadata.insert("circadian".to_string(), perception.circadian_text.clone());
         metadata.insert("body".to_string(), perception.body_text.clone());
         metadata.insert(
@@ -803,6 +946,30 @@ pub mod bridge {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn agent_runtime_request_uses_dedicated_path_and_bearer_credential() {
+            let request = GatewayRequest {
+                messages: vec![],
+                temperature: 0.1,
+                max_tokens: 10,
+                model: String::new(),
+                metadata: HashMap::new(),
+            };
+            let built = agent_runtime_request(
+                &reqwest::Client::new(),
+                "http://127.0.0.1:8080/internal/agent-runtime",
+                "agent-runtime-test-credential",
+                &request,
+            )
+            .build()
+            .unwrap();
+            assert_eq!(built.url().path(), "/internal/agent-runtime");
+            assert_eq!(
+                built.headers().get(reqwest::header::AUTHORIZATION).unwrap(),
+                "Bearer agent-runtime-test-credential"
+            );
+        }
 
         #[test]
         fn build_gateway_request_formats_perception_for_gateway_compiler() {
@@ -1012,8 +1179,11 @@ pub mod bridge {
                 cache_creation: 100,
                 tier: "high".to_string(),
                 cost_usd: 0.0195,
+                hierarchy_tier: Some(HierarchyTier::TIER_2),
+                cost_source: Some(CostSource::ProviderReported),
+                effective_model: "claude-sonnet-5".to_string(),
             };
-            let ev = build_usage_event(AgentId(8), 42, &resp);
+            let ev = build_usage_event(AgentId(8), 42, &resp, true).unwrap();
             assert_eq!(ev.event_type, "agent_llm_usage");
             assert_eq!(ev.aggregate_id, "AGENT-08");
             assert_eq!(ev.correlation_id, "req-abc");
@@ -1023,6 +1193,32 @@ pub mod bridge {
             assert!(ev.payload.contains("\"cache_read\":200"));
             assert!(ev.payload.contains("\"cache_creation\":100"));
             assert!(ev.payload.contains("\"tier\":\"high\""));
+            assert!(ev.payload.contains("\"hierarchy_tier\":2"));
+            assert!(ev.payload.contains("\"cost_source\":\"provider_reported\""));
+            assert_eq!(ev.schema_version, 2);
+        }
+
+        #[test]
+        fn usage_v2_rejects_missing_gateway_resolution() {
+            let resp: GatewayResponse =
+                serde_json::from_str(r#"{"tier":"mid","cost_usd":0,"request_id":"missing-v2"}"#)
+                    .unwrap();
+            assert!(build_usage_event(AgentId(1), 1, &resp, true).is_err());
+            assert!(build_usage_event(AgentId(1), 1, &resp, false).is_ok());
+        }
+
+        #[test]
+        fn issue_395_gateway_response_golden_decodes_in_rust() {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/contracts/issue-395-agent-runtime-response-v2.json");
+            let golden = std::fs::read_to_string(path).expect("read shared Go/Rust fixture");
+            let response: GatewayResponse =
+                serde_json::from_str(&golden).expect("decode shared gateway response");
+
+            assert_eq!(response.hierarchy_tier, Some(HierarchyTier::TIER_2));
+            assert_eq!(response.cost_source, Some(CostSource::ProviderReported));
+            assert_eq!(response.effective_model, "claude-sonnet-5");
+            assert!(build_usage_event(AgentId(8), 42, &response, true).is_ok());
         }
     }
 }

@@ -3,6 +3,7 @@ id = 46
 name = "Ralf Steinbach"
 role = "Betriebsratsvorsitzender (50% BR-Taetigkeit, 50% regulaere Aufgaben)"
 department = "Betriebsrat"
+tier = 2
 shift_set = 0
 kpis = ["Betriebsvereinbarungen aktuell und eingehalten", "Mitarbeiter-Beschwerden bearbeitet < 5 Werktage", "Betriebsratssitzungen monatlich durchgefuehrt"]
 reports_to = ""

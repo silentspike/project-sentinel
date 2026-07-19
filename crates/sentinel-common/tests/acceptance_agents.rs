@@ -5,7 +5,10 @@
 
 use std::path::PathBuf;
 
-use sentinel_common::agent_config::{load_agent_config, load_all_agents, PersonalityConfig};
+use sentinel_common::agent_config::{
+    legacy_hierarchy_tier_from_role, load_agent_config, load_all_agents, PersonalityConfig,
+};
+use sha2::{Digest, Sha256};
 
 fn config_dir() -> PathBuf {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -139,5 +142,34 @@ fn ac_20_05_shift_set() {
         config.identity.shift_set, 1,
         "AGENT-01 (Thomas, Frueh-Schicht) should have shift_set=1, got: {}",
         config.identity.shift_set
+    );
+}
+
+// AC #395.01: every repository agent has the maintainer-approved explicit tier.
+#[test]
+fn ac_395_01_approved_hierarchy_tier_matrix() {
+    let agents = load_all_agents(&config_dir()).expect("load all approved agents");
+    let mut canonical = String::new();
+    let mut counts = [0usize; 3];
+
+    for agent in &agents {
+        let tier = agent
+            .identity
+            .tier
+            .unwrap_or_else(|| panic!("agent {:02} is missing identity.tier", agent.identity.id));
+        counts[usize::from(tier.get() - 1)] += 1;
+        canonical.push_str(&format!("{:02}={}\n", agent.identity.id, tier.get()));
+        assert_eq!(
+            legacy_hierarchy_tier_from_role(&agent.identity.role),
+            tier,
+            "legacy fallback drift for agent {:02}",
+            agent.identity.id
+        );
+    }
+
+    assert_eq!(counts, [3, 29, 28]);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(canonical.as_bytes())),
+        "a297f22b7c9c32fee18a9f450f12cf52ccef97bd2fcb68e68401b35ea76f6cb5"
     );
 }

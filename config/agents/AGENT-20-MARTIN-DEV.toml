@@ -3,6 +3,7 @@ id = 20
 name = "Martin Stein"
 role = "Tech Lead / Head of Development"
 department = "Entwicklung"
+tier = 2
 shift_set = 2
 kpis = ["Code-Review-Durchlaufzeit < 4h", "Sprint-Velocity stabil +/-10%", "Technische Schulden < 15% der Sprint-Kapazitaet"]
 reports_to = "Michael Hartmann"
