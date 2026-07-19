@@ -1,112 +1,185 @@
-# ADR-0501: Migration saga & operation log (G5)
+# ADR-0501: Cross-node stop-and-copy migration saga (G5)
 
 - **Gate:** G5 (blocks #501)
-- **Status:** Proposed
-- **Primary issue:** #501 (cross-node ECS-native stop-and-copy PoC)
-- **Related issues / gates:** G1 (handoff), G4 (snapshot), G2 (CAS), V5/V6/V20/V22
-- **Supersedes / Superseded by:** —
+- **Status:** Accepted
+- **Primary issue:** #501
+- **Related gates:** G1, ADR-2, ADR-3, G4, G7
 
-> **N-node-native rule:** all schemas/messages/APIs MUST be `NodeId`-keyed, never a hard
-> source/target pair. Two nodes are the first test, not the ceiling.
+> Even though the foundation is verified on a two-node cluster first, all schemas,
+> messages, and APIs are N-node-native and keyed by `NodeId`. Two nodes are the first
+> test, not the cluster model.
 
 ## Context
 
-#501 composes G1 (fence) + G4 (snapshot) + G2/#498 (pull) + #500a (manifest) into one
-cross-node move. Single-node migration primitives exist and are live-verified
-(`FencedStateTransfer`, `crates/sentinel-common/src/types.rs:700`; the daemon migrate
-path #413). A move that is a transient command rather than a persistent, recoverable
-saga loses correctness on a chef/target/source restart mid-move.
+#501 composes owner fencing, per-container snapshots, cert-pinned QUIC transfer, and
+route resolution into one persistent and recoverable move. A transient command or a
+process-local retry cache cannot preserve correctness across coordinator, source, or
+target crashes.
 
 ## Problem
 
-How is a cross-node move made idempotent, recoverable at every step, and rolled back
-epoch-correctly?
+What single durable order makes a source-to-target move recoverable at every boundary,
+prevents early target writes/routing, and defines honest RPO/rollback behavior?
 
 ## Decision
 
-**A persistent `MigrationOp` saga with a recoverable state machine and epoch-correct
-rollback.**
+Use a coordinator-owned `MigrationOp`, per-participant durable step journals, and the
+following one-way stop-and-copy saga. Cross-node migration remains behind a
+repository-default-OFF flag; the existing single-node migration command is unchanged.
 
-- **Persistent op log (V5):** `MigrationOp { op_id, scope, source, target, source_epoch,
-  target_epoch, state, snapshot_id, manifest_refs, started_at, updated_at,
-  failure_reason }`, persisted in ADR-3 `MIGRATION_OPS`. Each step is idempotent and
-  recoverable (chef/target/source restart mid-move).
-- **State machine (V22 naming — target never serves too early):** `Idle →
-  PreparingSource → SourceRetiring → SourceRetired → SnapshotCreated → TargetPrepared →
-  OwnerCommittedToTarget → TargetActivatedNotRoutable → RouteSwitched → TargetRoutable →
-  SourceRetiredFinal → Completed` (+ `RollbackBeforeCommit | RollbackAfterCommit |
-  ManualRecoveryRequired`).
-- **Epoch-correct rollback (V6):** failure **before** `SourceRetiredAck` → source keeps
-  running, no change. After ack / before `OwnerCommit` → source unfreezes with a
-  recovery epoch, target discards Prepared. **After `OwnerCommit(Target, E+1)` the
-  source must NOT simply keep running** — either finish activating the target OR make
-  the source owner again via `OwnerCommit(Source, E+2)`. After the target serves,
-  rollback = a new handoff back.
-- **Pin lifecycle (V20):** `Pin { pin_id, op_id, scope, block_ref, owner_node,
-  owner_epoch, reason, created_at, expires_at, renewable, durable }`. On restart durable
-  pins are reconciled against `MigrationOp`/manifest refs; only pins whose owning op is
-  Completed/Failed **and** whose refs are gone expire (no eternal hang, no premature
-  drop).
-- **In-transit pin source:** the grace pin protecting a blob during transfer comes from
-  **#497**'s migrate path (single-node testable), **not** a speculative #499 fragment.
+## Migration operation
 
-## Non-Goals
+`MigrationOp` contains at least:
 
-- bwrap/WASM/microVM **live** cross-node move (Track E, needs #472/#500b); Track A is
-  **ECS-native only**.
-- The "ms" claim without a measured per-runtime-type pause (TOGAF bounded class).
-- Forced-failover recovery (Track D); `qm rollback` is never migration recovery (V6 only).
+`op_id(UUIDv7), scope, source, target, source_term, target_term, state, snapshot_id, snapshot_digest, snapshot_schema_version, staging_id, authority_snapshot_revision, transition_seq, started_at_ms, updated_at_ms, failure_reason`
 
-## Data Types
+`MIGRATION_OPS` and `ACTIVE_MIGRATION_BY_SCOPE` are claimed atomically. Only the
+coordinator advances the operation through
+`transition_migration(expected_state, expected_seq, next)`. The audit row remains after
+completion; only the active-scope index is released.
 
-`MigrationOp`, `Pin` (new, ADR-3 tables). Reuses `FencedStateTransfer` (`types.rs:700`,
-now carrying source/target cursors) and the G4 `SnapshotCut`.
+## Durable states
 
-## State Machine / Protocol
+States name completed durable steps:
 
-As above. Idempotency: each transition checks the persisted state and is a no-op if
-already past it. Recovery: on startup, an in-flight `MigrationOp` resumes from its last
-durable state.
+`Claimed -> TransferReserved -> TargetStreamReady -> SourceQuiescing -> Frozen -> SnapshotCreated -> TargetStagedDurable -> SourceRetired -> OwnerAuthorityCommitted -> OwnerCommittedToTarget -> OwnerSnapshotReplicated -> TargetRestored -> TargetActivatedNotRoutable -> RouteSwitchCommitted -> TargetUnfrozen -> TargetRoutable -> SourceRetiredFinal -> Completed`
 
-## Failure Modes
+Terminal recovery states are `RollbackBeforeAuthority`, `RollbackAfterAuthority`, and
+`ManualRecoveryRequired`.
 
-- **Chef/target/source restart mid-move:** the saga resumes from the persisted state.
-- **Route-switch failure:** rollback per the current state (V6).
-- **Double move / partition:** rejected by the fence (G1) + the saga's single-active-op
-  invariant.
+## Canonical saga
 
-## Tests
+1. **EligibilityPreflight:** verify bounded eligibility, feature flag, source/target
+   liveness, complete terms, and route state.
+2. **ReserveTransfer:** source persists a bounded reservation binding operation,
+   source/target node ids, both certificate fingerprints, scope, complete source term,
+   size cap, and expiry.
+3. **PrepareTargetStream:** target establishes the certificate-pinned connection to
+   the dedicated source snapshot listener but sends no snapshot request. Connection
+   setup is outside the pause.
+4. **BeginSourceQuiesce:** source overlay becomes `Retiring`, route becomes
+   `Migrating`, agent-scoped admission closes, in-flight writes drain or fail commit
+   recheck, and eligibility is checked again.
+5. **Frozen:** source sets the ECS `Frozen` marker while other agents keep ticking.
+6. **SnapshotCreated:** under the same barrier, source cuts ECS, every per-agent redb
+   row, and the real source provenance watermark; it computes the versioned SHA-256
+   digest and publishes the reserved transfer as ready.
+7. **StartSnapshotPull:** only now target requests by operation id on the already-open
+   connection, receives bounded bytes, durably stages them, and acknowledges digest and
+   staging id.
+8. **CommitSourceRetirement:** after durable staging, source persists `Retired` plus
+   participant outcome and acknowledges. Rollback to source ownership remains possible
+   until authority commit.
+9. **OwnerAuthorityCommit:** one coordinator redb transaction writes the step claim,
+   target global term E+1, incremented owner snapshot revision/metadata, and operation
+   state `OwnerAuthorityCommitted`. Recovery becomes forward-first at this transaction.
+10. **CommitMigrationOwner:** target transaction persists the target global term,
+    base `Owner/NotRoutable`, `OwnerActivating` overlay, and participant outcome. Normal
+    guard issue remains closed.
+11. **ReplicateOwnerSnapshot:** coordinator sends the full global snapshot and each
+    recipient-local snapshot to every Track A member, including source and target. All
+    acknowledgements are required before restore. Replication leaves overlays intact.
+12. **BeginRestore:** target restores only under the sealed permit, spawns `Frozen`,
+    validates the digest, and atomically restores every per-agent row. It remains
+    `OwnerActivating`.
+13. **TargetActivatedNotRoutable:** target route remains `Prepared`; normal writes and
+    external routing remain closed.
+14. **RouteSwitch:** target persists only the durable route-switch decision and
+    participant outcome. The cache route remains `Prepared` until final activation.
+15. **ApplyTargetUnfreeze:** under the world/tick barrier target removes `Frozen`,
+    persists `UnfreezeApplied`, then acknowledges. Startup reconciliation can refreeze
+    or idempotently forward-complete this effect.
+16. **FinalizeTargetActivation:** four serialized layers execute in order:
+    - transactionally set base activation `Routable`, remove `OwnerActivating`, and
+      persist the participant outcome;
+    - rebuild owner and route caches under the activation lock;
+    - open owner and route readiness latches last;
+    - send `TargetRoutableAck`, after which only the coordinator advances the operation.
+17. **FinalizeSourceRetirement:** source despawns the frozen agent, caches
+    `Remote { target }`, persists the final participant outcome, then acknowledges.
+    Source role remains `Retired`. If source is unreachable, the safe operation remains
+    at `TargetRoutable` until reconciliation completes the final source step.
 
-Failure-injection: chef/target/source restart mid-move, route-switch fail, double-move,
-partition → no state loss / no double write. 1 owner throughout (`owner_epoch` log;
-source hard-fenced after OwnerCommit). V1 handoff (target never serves before durable
-ack). V6 rollback per saga state.
+## Participant effect idempotency
 
-## Benchmarks
+Every mutating participant step uses the ADR-3 claim/probe/complete journal and a
+request digest. The process-local control cache is reply deduplication only. A crash
+after effect but before journal completion is resolved by a deterministic outcome
+probe; the mutation is never blindly replayed.
 
-**Pause time per runtime type p50/p95/p99/max (the central number, prove/refute the
-"ms" class)** + components separated (V21:
-`prewarm/prep_pull_bytes/pause/snapshot/restore/route_switch/post_validation/total`).
-Bug-finder: 0 state-loss / 0 double-write. Sweep state-size + warm/cold. Register:
-`sentinel-daemon-cross-node-migrate (#501)`.
+## Recovery and RPO contract
 
-## Backward Compatibility
+- **Before `TargetStagedDurable`:** abort, reopen/unfreeze source E, and make no new
+  migration-specific replica guarantee.
+- **From `TargetStagedDurable`:** preserve the verified target digest while that
+  target storage survives. Loss of the only target copy follows the existing
+  single-replica RPO; replication is Track D.
+- **After source retirement but before authority commit:** source may reactivate only
+  under a new recovery epoch; target discards prepared/staged state idempotently.
+- **From `OwnerAuthorityCommitted`:** always reconcile forward to the target. Source
+  E+2 is permitted only after proving the exact digest or transferring/restoring the
+  staged copy back under a new permit.
+- **After target routability:** moving back is a new cooperative migration.
+- There is no two-node forced failover and `qm rollback` is never migration recovery.
 
-New tables/types additive; the existing single-node migrate path is unchanged. No
-`events` migration.
+## Route and activation invariant
 
-## Security
+`RouteState = Local | Migrating | Prepared | Remote`. A route entry carries node id,
+complete term, state, operation id, and transition sequence. Stale updates compare the
+complete term plus operation/sequence. Startup rebuild uses owner terms, migration
+operations, and participant outcomes, never owner terms alone.
 
-Single trust domain (Track A); the saga is driven over the cert-pinned QUIC control
-stream (ADR-2). No 0-RTT for any migration state transition (V18).
+Normal writes require both owner/activation and route latches. The target is never
+normal-writable or externally routable during `OwnerActivating`, `Prepared`, or any
+earlier state.
 
-## Public Claim Boundary
+## Bounded eligibility
 
-- May claim after #501: 2-node ECS-native stop-and-copy PoC, bounded class **measured**
-  (excludes active inbound + active external side-effects).
-- **May NOT claim:** Cluster-GA, all-runtime live migration, or "ms" without the cited
-  bench value.
+Track A supports resting, non-interacting ECS-native containers only. Active inbound
+cross-agent traffic, active external side effects/LLM calls, and active scheduled or
+delayed effects return typed `NotMigratable`. Per-agent time travel after a move returns
+`NotSupportedForMigratedContainer` until Track E/H.
 
-## Open Follow-ups
+## Failure injection
 
-- All-runtime migration (Track E); microVM deep migration (Track F).
+Tests cover coordinator/source/target restart at every durable boundary, partition,
+double move, route failure, authority commit before RPC, crash after each of the four
+activation layers, and acknowledgement loss after activation is fully open. Every case
+must deterministically resume, perform an allowed rollback, or require manual recovery
+without a duplicate write.
+
+## Pause measurement
+
+Pause is source quiesce start through `TargetRoutableAck`, measured on a
+coordinator/source monotonic clock. Target-local staging fsync and restore durations are
+reported as local components and are never subtracted across node clocks.
+
+Report connect, quiesce drain, snapshot, staging fsync, authority commit, restore,
+route switch, pause, total, retries, and failures with p50/p95/p99/max. Warm and cold
+bounded-state claim cells each require at least 1000 successful runs. Smaller
+exploratory state-size sweeps carry no p99 claim.
+
+## Tests and evidence
+
+- State ordering and coordinator-only transition tests.
+- Crash/resume tests at every state and double-move rejection.
+- Atomic authority commit and forward-first tests.
+- Complete participant outcome-probe matrix.
+- Real two-node state/digest/reference, exactly-one-owner, typed stale write, and
+  no-early-routability evidence.
+- Recovery/RPO evidence uses only the boundaries stated above.
+- Contention with CAS pull, #499a dry-run query, and the 1 Hz tick after #499a merges.
+
+## Consequences
+
+- The authority transaction, not RPC delivery, is the forward-first boundary.
+- Durable target staging exists before source retirement.
+- Activation is intentionally multi-layered and readiness opens last.
+- Source cleanup can lag safely after target routability.
+
+## Public claim boundary
+
+After live acceptance, Sentinel may claim a measured two-node ECS-native stop-and-copy
+PoC for the bounded resting class. It may not claim Cluster GA, forced failover,
+post-copy, all runtime types, active-interaction continuity, absolute RPO=0, or a
+millisecond class without cited VM values.

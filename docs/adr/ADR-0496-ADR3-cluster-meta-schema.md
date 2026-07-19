@@ -1,136 +1,199 @@
-# ADR-0496: Cluster-metadata persistence schema (ADR-3)
+# ADR-0496: Cluster authority and operation persistence (ADR-3)
 
-- **Gate:** ADR-3 (top-level persistence decision)
-- **Status:** Proposed
-- **Primary issue:** #496 (owner registry / fencing) — introduces the cluster tables
-- **Related issues / gates:** G-D0 (OwnerMetadataLog), G1 (fencing scope), ADR-2 (transport)
-- **Supersedes / Superseded by:** —
+- **Gate:** ADR-3 (blocks #615 and #501)
+- **Status:** Accepted
+- **Primary issues:** #496, #615, and #501
+- **Related gates:** G1, ADR-2, G4, G5, G-D0
 
-> **N-node-native rule:** Even though the foundation is verified on a 2-node cluster
-> first, all schemas, messages and APIs MUST be N-node-native (`NodeId`-keyed
-> sets/maps, never a hard source/target pair as the cluster model). Two nodes are the
-> first test, not the ceiling.
+> Even though the foundation is verified on a two-node cluster first, all schemas,
+> messages, and APIs are N-node-native and keyed by `NodeId`. Two nodes are the first
+> test, not the cluster model.
 
 ## Context
 
-Cluster metadata (who owns which scope, open migration/provision sagas, cluster pins,
-node registry, recovery points, voting config) has **nowhere to live** today. redb
-holds only per-agent / per-room simulation state — `AGENT_STATE`
-(`TableDefinition<u16, &[u8]>`), `RELATIONSHIPS` (`<u32, &[u8]>`), `PERSONALITY`
-(`<u16, &[u8]>`), `ROOM_STATE` (`<u16, &[u8]>`), plus voice/notes/nmda/facts and the
-`SIM_META` (`<&str, &[u8]>`) / `API_PATTERNS` key-value tables
-(`crates/sentinel-redb/src/lib.rs:15-33`). There are **no** cluster tables (verified:
-`CLUSTER_OWNER`/`MIGRATION_OPS`/… = 0 hits). The Limbo SQLite event store is the
-append-only world history and `sim_metadata` side-table; it is **not** the place for
-mutable per-container ownership.
+The current `ClusterMetaStore` has separate transactions for `CLUSTER_OWNER` and
+`LOCAL_OWNER`. It cannot atomically install complete global authority, recipient-local
+activation, and an installation marker. The current schema also mixes stable local
+roles with handoff transition roles and lacks durable migration operation/participant
+journals.
 
-The `owner_epoch` is a bare in-memory value today (`RestoreFence` in the daemon) and a
-bare `u64` field on `FencedStateTransfer` (`crates/sentinel-common/src/types.rs:702`)
-— it is not persisted as cluster ownership.
+An owner-term replacement is a control-plane authority operation. It cannot be
+authorized by the old `OwnerWriteGuard` whose authority it is replacing.
 
 ## Problem
 
-Where does mutable cluster metadata persist, durably and behind the fencing barrier,
-without polluting the append-only event log or the per-agent simulation tables?
+How does Sentinel persist complete owner snapshots, local transition overlays, and
+recoverable migration steps atomically without weakening normal data-plane fencing?
 
 ## Decision
 
-**Dedicated redb tables, all written through the fenced write entry (#496). NodeId
-also lives in `daemon.toml`.**
+Use a dedicated redb cluster metadata database with explicit atomic control-plane APIs.
+Normal simulation-state stores continue to require `OwnerWriteGuard`; authority and
+saga transitions require authenticated actor context, expected terms/sequences,
+request digests, and CAS semantics.
 
-New redb tables:
+## Owner authority schema
 
-- `CLUSTER_OWNER` — `OwnerTerm` per container/company scope (holds `owner_epoch` /
-  `OwnerTerm`).
-- `MIGRATION_OPS` — persistent `MigrationOp` sagas (recoverable mid-move).
-- `PROVISION_OPS` — persistent `ProvisionOp` sagas (recoverable mid-bootstrap).
-- `CLUSTER_PINS` — durable CAS pins (snapshot/migration/manifest/pull-in-progress).
-- `NODE_REGISTRY` — `NodeIdentity` + `NodeLifecycleState` + membership metadata.
-- `RECOVERY_POINTS` — `RecoveryPoint` metadata (G6/G8).
-- `VOTING_CONFIG` — `VotingConfig` (G-D0, Track D).
+`OwnerTerm` is:
 
-**Rationale:**
+`OwnerTerm { scope, owner_node, epoch, coordinator_generation }`
 
-- redb (not Limbo): cluster metadata is **mutable key→value** (owner of a scope
-  changes; saga state advances), which is redb's model. Limbo is append-only event
-  history — ownership is not an event stream.
-- All cluster tables are written **only** through the `FencedStore` fenced write entry
-  introduced by #496 (a raw write must not bypass the guard) — see G1. This is why the
-  schema lives in #496's scope.
-- `NodeId` is additionally recorded in `daemon.toml` so a node knows its own identity
-  before opening redb.
+Track A installs coordinator generation 1. Generation 0 is legacy. Epochs are
+monotonic per scope and can never decrease during installation.
 
-The `OwnerMetadataLog` (G-D0, Track D) replicates a **subset** of this metadata
-(`OwnerTerm`/`VotingConfig`/`RecoveryPoint`/`MigrationOp` summary) across nodes for
-quorum safety; ADR-3 is the **local** durable schema, G-D0 is the **replicated**
-metadata. They are consistent: the log replicates what these tables hold for the
-metadata it covers, never agent state.
+The global envelope is:
 
-## Non-Goals
+`OwnerTermSnapshot { schema_version, coordinator_generation, term_snapshot_revision, sorted_terms, checksum }`
 
-- Does not put agent state, CAS bytes, or events into these tables (those stay in
-  their stores).
-- Does not define the replication protocol (G-D0) — only the local schema.
-- Does not specify exact serde field layouts of each row (produced by #496/Track-D
-  ADRs as the types are built; pre-inventing them is unverifiable).
+The recipient-bound envelope is:
 
-## Data Types
+`LocalOwnerStateSnapshot { schema_version, recipient_node, coordinator_generation, term_snapshot_revision, sorted_base_states, checksum }`
 
-Keys are `NodeId`- / scope-keyed (N-node-native), values are versioned serde blobs
-(`#[serde(default)]` + `schema_version`, the established #491 pattern). `OwnerTerm`,
-`MigrationOp`, `ProvisionOp`, `Pin`, `NodeIdentity`, `RecoveryPoint`, `VotingConfig`
-are defined by their respective gates (G1/G5/G-D0).
+`term_snapshot_revision` belongs only to these envelopes, never to `OwnerTerm`.
+Every term in a global snapshot must carry the envelope's coordinator generation, and
+the install marker stores both the global and recipient-local checksums.
 
-## State Machine / Protocol
+Canonical codecs use fixed field order, big-endian integers, length prefixes, and
+sorted scope/row lists. SHA-256 covers the canonical payload without the checksum
+field. Golden vectors prevent serializer drift.
 
-Each table is mutated only inside a fenced write transaction (G1). Saga tables
-(`MIGRATION_OPS`/`PROVISION_OPS`) advance through their state machines idempotently and
-are reconciled on restart.
+## Owner tables
 
-## Failure Modes
+- `CLUSTER_OWNER`: complete global terms.
+- `LOCAL_OWNER`: recipient-bound stable base states.
+- `LOCAL_OWNER_SAGA`: one scope-keyed active overlay for legacy reconciliation,
+  handoff, or migration.
+- `OWNER_TERM_SNAPSHOT_META`: installed generation/revision, both checksums, and
+  install/conflict status.
 
-- **Crash mid-saga:** `MIGRATION_OPS`/`PROVISION_OPS` rows are durable and reconciled
-  on startup (each step idempotent).
-- **Raw write bypass attempt:** prevented by the type system (G1 `OwnerWriteGuard`) —
-  cluster tables expose no un-fenced write path.
-- **Pin reconcile on restart:** `CLUSTER_PINS` are reconciled against open
-  MigrationOps/manifest refs (V20) so pins neither hang forever nor expire too early.
+`ActivationState` is `LegacyUnknown|NotRoutable|Routable`; legacy decoding defaults to
+`LegacyUnknown`. `LocalOwnerBaseState` contains scope, recipient, complete term, base
+role `Owner|Follower`, and activation. `LocalOwnerSagaState` contains scope, operation
+kind, optional operation id, complete term, transition role, and transition sequence.
 
-## Tests
+Effective local state is the overlay when present, otherwise the base state. A general
+snapshot install never changes `LOCAL_OWNER_SAGA`. Only the matching active operation
+may CAS-replace or complete it. Competing active operations for one scope require
+manual recovery.
 
-- A cluster-table write without an `OwnerWriteGuard` does not compile (G1 type
-  barrier).
-- Saga tables survive a daemon restart and reconcile to a consistent state.
-- Backward-compat decode of an older `schema_version` row.
+The coordinator derives each recipient snapshot deterministically from global terms,
+the durable `MigrationOp`, and participant outcomes. A stable current owner is
+`Owner/Routable`, a non-owner is `Follower/NotRoutable`, and a migration target before
+`TargetRoutable` is `Owner/NotRoutable`. After `TargetRoutableAck`, the persisted
+recipient-local routable state remains the truth and later snapshots derive the same
+value from the advanced operation. Recipients never invent roles or activation from
+volatile caches.
 
-## Benchmarks
+## Atomic full-snapshot installation
 
-Cluster-table write overhead is part of the #496 fencing-overhead bench (it sits on
-the cluster write path). No separate latency target. Register: covered under
-`sentinel-daemon-owner-fencing (#496)`.
+The only public bootstrap/replication API is:
 
-## Backward Compatibility
+`install_owner_snapshot(global, local) -> InstallOutcome`
 
-Additive: new tables only; existing redb tables and data are untouched. Existing
-single-node snapshots/restore are unaffected (cluster tables are empty/absent in
-single-node mode). No migration of `events`.
+In one redb transaction it:
 
-## Security
+1. validates schema, recipient, generation, revision, canonical checksums, and
+   non-decreasing epochs;
+2. fully replaces `CLUSTER_OWNER`;
+3. fully replaces this recipient's `LOCAL_OWNER` base rows;
+4. deletes legacy term/base rows absent from the incoming full snapshot;
+5. writes `OWNER_TERM_SNAPSHOT_META`;
+6. leaves `LOCAL_OWNER_SAGA` untouched.
 
-Single trust domain (Track A). Writes gated by the typed `OwnerWriteGuard` (G1).
-Cluster metadata is local-durable; cross-node trust is the OwnerMetadataLog quorum
-(G-D0), not these tables alone.
+Outcomes are deterministic:
 
-## Public Claim Boundary
+- no marker or installed generation 0: install;
+- different non-legacy generation: `GenerationMismatch`, no authority mutation;
+- lower same-generation revision: `StaleSnapshot`, no mutation;
+- equal revision and equal checksums: `AlreadyInstalled`, no mutation;
+- equal revision and different checksum: persist `SnapshotConflict`, close readiness,
+  and require manual recovery;
+- higher same-generation revision: install atomically.
 
-- May claim today: cluster metadata persists in dedicated redb tables behind the
-  fenced write entry (decided).
-- **May NOT claim:** that ownership is persisted/enforced — the tables and the fenced
-  write entry are built by #496; today `owner_epoch` is in-memory only.
+Individual owner/local put methods do not implement bootstrap readiness or snapshot
+replication.
 
-## Open Follow-ups
+The seed materializes the initial scope set from `World` and every configured agent
+scope in the boot roster. A dynamically created scope is first materialized with a
+new term and incremented snapshot revision in one coordinator transaction, replicated
+successfully, and only then spawned or published. Unknown scopes are never synthesized
+as self-owned.
 
-- G1 fencing scope spec (`OwnerWriteGuard`, `FencedStore` trait, the three engine
-  impls) — #496.
-- G-D0 replication of the owner/voting subset (Track D).
-- RecoveryPoint field set (G6/G8).
+## Legacy reconciliation
+
+Before the first full install, legacy `Retiring|Retired|PreparedTarget` rows become
+scope-keyed `LegacyReconciliation` overlays with no operation id. Legacy owner/follower
+base rows are replaced by the seed snapshot. Generation-0 terms are not retained as
+authority. The existing #496 handoff moves to the same overlay contract.
+
+## Migration operation schema
+
+The coordinator owns:
+
+- `MIGRATION_OPS`: durable `MigrationOp` rows retained after completion;
+- `ACTIVE_MIGRATION_BY_SCOPE`: one active operation per scope;
+- snapshot revision metadata used by the authority commit.
+
+Claim creates the operation and active-scope index atomically.
+`transition_migration(expected_state, expected_seq, next)` is monotonic CAS.
+
+`commit_migration_owner_authority` performs one coordinator transaction containing:
+
+1. the authority-commit step claim;
+2. `CLUSTER_OWNER` target term E+1;
+3. incremented owner snapshot revision and metadata;
+4. the operation transition to `OwnerAuthorityCommitted`.
+
+The active-scope index is removed only after terminal completion/recovery. Audit rows
+remain.
+
+## Participant journal
+
+Each participant stores:
+
+`MIGRATION_PARTICIPANT_STEPS(op_id, step, peer, request_digest, boot_id, attempt, status, outcome)`
+
+Status is `Executing|Succeeded|DigestConflict`. A mutation atomically claims its step,
+executes or probes the deterministic outcome, and CAS-completes the row. A crash after
+effect but before completion is resolved by the probe; the effect is never blindly
+replayed.
+
+## Other cluster tables
+
+Existing provision, node registry, pin, recovery-point, and voting metadata remain
+versioned dedicated cluster tables. Their later quorum/replication contracts remain
+Track D. Agent state, CAS bytes, and append-only events do not move into this database.
+
+## Authorization boundary
+
+- Data-plane EventStore/redb/FS state writes require complete V19
+  `OwnerWriteGuard` validation.
+- Owner snapshot install, handoff overlay CAS, migration claim/transition, and authority
+  commit are authenticated control-plane operations with explicit expected state,
+  complete term, actor, digest, and sequence checks.
+- No raw public table mutation may bypass those APIs.
+
+## Tests and evidence
+
+- Canonical codec golden vectors and checksum mismatch tests.
+- Legacy generation-0, stale, equal-idempotent, equal-conflicting, newer, generation
+  mismatch, full replacement/deletion, and overlay-preservation tests.
+- Atomic operation/scope claim, monotonic transition, and authority-commit crash tests.
+- Participant claim/effect/probe/complete and digest-conflict tests.
+- Restart tests rebuild only from a valid marker and durable rows.
+- Two-node replication evidence proves identical global authority and recipient-correct
+  local activation without deleting overlays.
+
+## Consequences
+
+- Bootstrap and replication gain one atomic authority installation point.
+- Authority transitions no longer misuse the data-plane guard they replace.
+- Durable operation/participant journals provide recoverability and effect idempotency.
+- Track D can later replicate a defined subset without changing agent-state stores.
+
+## Public claim boundary
+
+After #615, Sentinel may claim atomic complete owner snapshot installation and durable
+local activation state. After #501, it may claim a durable migration operation and
+participant journal. It may not claim quorum authority, coordinator replacement, or
+replicated RPO before Track D.
