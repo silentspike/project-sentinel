@@ -7,6 +7,7 @@ on:
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - 'rust-toolchain.toml'
       - '**/go.mod'
       - '**/go.sum'
       - '**/package.json'
