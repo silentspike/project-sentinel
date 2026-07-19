@@ -9,8 +9,9 @@
 //! [`StubHandler`]. The real owner/GC handler logic lands with #496 / #499; the QUIC
 //! server + client transport is wired on top of these types.
 //!
-//! **Bounded scope (ADR-2):** node→node only, **after** a node has joined; the
-//! bare-shell bootstrap (#495) stays on SSH. 0-RTT is off for control (V18).
+//! **Bounded scope (ADR-2):** node-to-node only once the target daemon is running;
+//! the bare-shell bootstrap (#495) stays on SSH, and the first authenticated
+//! membership heartbeat completes the join. 0-RTT is off for control (V18).
 
 pub mod block_pull;
 pub mod cert;
@@ -22,14 +23,17 @@ pub mod server;
 pub mod tls;
 
 pub use block_pull::{
-    BlockProvider, BlockPullClient, BlockPullError, BlockPullRequest, BlockPullServer,
+    BlockProvider, BlockPullClient, BlockPullConnection, BlockPullError, BlockPullRequest,
+    BlockPullServer,
 };
 pub use cert::{CertFingerprint, NodeCertificate};
-pub use client::ControlClient;
+pub use client::{ControlClient, ControlConnection};
 pub use envelope::{
     decode_frame, encode_frame, CodecError, ControlEnvelope, ControlReply, ControlRequest,
     ControlResponse, MAX_FRAME_BYTES,
 };
-pub use handler::{BlockMapGossipHandler, ControlHandler, StubHandler};
-pub use idempotency::IdempotencyCache;
-pub use server::ControlServer;
+pub use handler::{
+    BlockMapGossipHandler, ChefAuthorizingHandler, ControlHandler, FailClosedHandler, StubHandler,
+};
+pub use idempotency::{IdempotencyCache, IdempotencyOutcome, IdempotencyScope, RequestDigest};
+pub use server::{AuthenticatedPeer, ControlServer, PeerRegistry};

@@ -1,58 +1,137 @@
-//! Idempotency dedup for control RPCs (V5/V39).
+//! Process-local idempotency dedup for control RPCs.
 //!
-//! A re-sent `ControlEnvelope` (same `idempotency_key`) must produce a single
-//! effect: the handler runs once, and the re-send returns the cached reply. This
-//! is the **in-memory** cache for the Phase-3a0 skeleton; durable dedup across a
-//! daemon restart is the ADR-3 redb `PROVISION_OPS`/cluster-meta concern.
+//! A key is scoped to the authenticated peer and RPC method. The first request
+//! digest bound to that scope wins; reusing the operator key with another payload
+//! is a conflict, never a cache hit. Entries are bounded by age and count.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-/// A response cache keyed by `idempotency_key`. `R` is the cached reply type.
+use sentinel_common::NodeId;
+
+pub const DEFAULT_IDEMPOTENCY_TTL: Duration = Duration::from_secs(5 * 60);
+pub const DEFAULT_IDEMPOTENCY_CAPACITY: usize = 4_096;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IdempotencyScope {
+    pub peer_node: NodeId,
+    pub method: &'static str,
+    pub idempotency_key: String,
+}
+
+impl IdempotencyScope {
+    pub fn new(
+        peer_node: NodeId,
+        method: &'static str,
+        idempotency_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            peer_node,
+            method,
+            idempotency_key: idempotency_key.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestDigest(pub [u8; 32]);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdempotencyOutcome<R> {
+    Computed(R),
+    Cached(R),
+    DigestConflict,
+    CapacityExhausted,
+}
+
+struct CacheEntry<R> {
+    digest: RequestDigest,
+    inserted_at: Instant,
+    response: Arc<OnceLock<R>>,
+}
+
 pub struct IdempotencyCache<R> {
-    inner: Mutex<HashMap<String, R>>,
+    inner: Mutex<HashMap<IdempotencyScope, CacheEntry<R>>>,
+    ttl: Duration,
+    capacity: usize,
 }
 
 impl<R: Clone> IdempotencyCache<R> {
     pub fn new() -> Self {
+        Self::with_limits(DEFAULT_IDEMPOTENCY_TTL, DEFAULT_IDEMPOTENCY_CAPACITY)
+    }
+
+    pub fn with_limits(ttl: Duration, capacity: usize) -> Self {
+        assert!(capacity > 0, "idempotency capacity must be non-zero");
         Self {
             inner: Mutex::new(HashMap::new()),
+            ttl,
+            capacity,
         }
     }
 
-    /// The cached reply for `key`, if this key was already handled.
-    pub fn get(&self, key: &str) -> Option<R> {
-        self.inner
-            .lock()
-            .expect("idempotency lock")
-            .get(key)
-            .cloned()
-    }
+    pub fn get_or_compute(
+        &self,
+        scope: IdempotencyScope,
+        digest: RequestDigest,
+        f: impl FnOnce() -> R,
+    ) -> IdempotencyOutcome<R> {
+        let (response, existed) = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = Instant::now();
+            inner.retain(|_, entry| {
+                entry.response.get().is_none()
+                    || now.saturating_duration_since(entry.inserted_at) < self.ttl
+            });
 
-    /// Record the reply for `key`. First writer wins (a concurrent duplicate does
-    /// not overwrite the original effect's reply).
-    pub fn record(&self, key: &str, reply: R) {
-        self.inner
-            .lock()
-            .expect("idempotency lock")
-            .entry(key.to_string())
-            .or_insert(reply);
-    }
+            if let Some(entry) = inner.get(&scope) {
+                if entry.digest != digest {
+                    return IdempotencyOutcome::DigestConflict;
+                }
+                (Arc::clone(&entry.response), true)
+            } else {
+                if inner.len() >= self.capacity {
+                    let oldest_completed = inner
+                        .iter()
+                        .filter(|(_, entry)| entry.response.get().is_some())
+                        .min_by_key(|(_, entry)| entry.inserted_at)
+                        .map(|(key, _)| key.clone());
+                    if let Some(key) = oldest_completed {
+                        inner.remove(&key);
+                    } else {
+                        return IdempotencyOutcome::CapacityExhausted;
+                    }
+                }
+                let response = Arc::new(OnceLock::new());
+                inner.insert(
+                    scope,
+                    CacheEntry {
+                        digest,
+                        inserted_at: now,
+                        response: Arc::clone(&response),
+                    },
+                );
+                (response, false)
+            }
+        };
 
-    /// Run `f` exactly once per `key`: return the cached reply on a re-send,
-    /// otherwise compute, cache and return it.
-    pub fn get_or_compute(&self, key: &str, f: impl FnOnce() -> R) -> (R, bool) {
-        if let Some(cached) = self.get(key) {
-            return (cached, true);
+        let value = response.get_or_init(f).clone();
+        if existed {
+            IdempotencyOutcome::Cached(value)
+        } else {
+            IdempotencyOutcome::Computed(value)
         }
-        let reply = f();
-        self.record(key, reply.clone());
-        // Re-read in case of a race: the first writer's reply is authoritative.
-        (self.get(key).unwrap_or(reply), false)
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("idempotency lock").len()
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -70,31 +149,132 @@ impl<R: Clone> Default for IdempotencyCache<R> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn second_call_same_key_is_cached_handler_runs_once() {
-        let cache: IdempotencyCache<u64> = IdempotencyCache::new();
-        let mut runs = 0u64;
-        let (a, cached_a) = cache.get_or_compute("k", || {
-            runs += 1;
-            42
-        });
-        assert_eq!(a, 42);
-        assert!(!cached_a, "first call computes");
-        let (b, cached_b) = cache.get_or_compute("k", || {
-            runs += 1;
-            99
-        });
-        assert_eq!(b, 42, "re-send returns the cached reply, not the new value");
-        assert!(cached_b, "second call is a cache hit");
-        assert_eq!(runs, 1, "handler ran exactly once (exactly-once effect)");
+    fn scope(key: &str) -> IdempotencyScope {
+        IdempotencyScope::new(NodeId::new(), "owner_commit", key)
     }
 
     #[test]
-    fn distinct_keys_each_compute() {
-        let cache: IdempotencyCache<u64> = IdempotencyCache::new();
-        let (a, _) = cache.get_or_compute("a", || 1);
-        let (b, _) = cache.get_or_compute("b", || 2);
-        assert_eq!((a, b), (1, 2));
+    fn identical_scoped_request_computes_once() {
+        let cache = IdempotencyCache::new();
+        let scope = scope("k");
+        let digest = RequestDigest([1; 32]);
+        let mut runs = 0;
+        assert_eq!(
+            cache.get_or_compute(scope.clone(), digest, || {
+                runs += 1;
+                42
+            }),
+            IdempotencyOutcome::Computed(42)
+        );
+        assert_eq!(
+            cache.get_or_compute(scope, digest, || {
+                runs += 1;
+                99
+            }),
+            IdempotencyOutcome::Cached(42)
+        );
+        assert_eq!(runs, 1);
+    }
+
+    #[test]
+    fn same_operator_key_with_another_digest_is_conflict() {
+        let cache = IdempotencyCache::new();
+        let scope = scope("k");
+        assert_eq!(
+            cache.get_or_compute(scope.clone(), RequestDigest([1; 32]), || 1),
+            IdempotencyOutcome::Computed(1)
+        );
+        assert_eq!(
+            cache.get_or_compute(scope, RequestDigest([2; 32]), || 2),
+            IdempotencyOutcome::DigestConflict
+        );
+    }
+
+    #[test]
+    fn peer_and_method_are_part_of_the_scope() {
+        let cache = IdempotencyCache::new();
+        let peer = NodeId::new();
+        let digest = RequestDigest([1; 32]);
+        let a = IdempotencyScope::new(peer, "ref_query", "k");
+        let b = IdempotencyScope::new(peer, "pin_query", "k");
+        let c = IdempotencyScope::new(NodeId::new(), "ref_query", "k");
+        assert!(matches!(
+            cache.get_or_compute(a, digest, || 1),
+            IdempotencyOutcome::Computed(1)
+        ));
+        assert!(matches!(
+            cache.get_or_compute(b, digest, || 2),
+            IdempotencyOutcome::Computed(2)
+        ));
+        assert!(matches!(
+            cache.get_or_compute(c, digest, || 3),
+            IdempotencyOutcome::Computed(3)
+        ));
+    }
+
+    #[test]
+    fn capacity_evicts_oldest_completed_entry() {
+        let cache = IdempotencyCache::with_limits(Duration::from_secs(60), 2);
+        for n in 0..3 {
+            let result =
+                cache.get_or_compute(scope(&format!("k{n}")), RequestDigest([n; 32]), || n);
+            assert!(matches!(result, IdempotencyOutcome::Computed(_)));
+        }
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn expired_completed_entry_is_recomputed() {
+        let cache = IdempotencyCache::with_limits(Duration::ZERO, 2);
+        let scope = scope("expires");
+        let digest = RequestDigest([9; 32]);
+        assert_eq!(
+            cache.get_or_compute(scope.clone(), digest, || 1),
+            IdempotencyOutcome::Computed(1)
+        );
+        assert_eq!(
+            cache.get_or_compute(scope, digest, || 2),
+            IdempotencyOutcome::Computed(2)
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_duplicate_computes_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let cache = Arc::new(IdempotencyCache::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(3));
+        let scope = scope("same");
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            let start = Arc::clone(&start);
+            let scope = scope.clone();
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                cache.get_or_compute(scope, RequestDigest([1; 32]), || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    42
+                })
+            }));
+        }
+        start.wait();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, IdempotencyOutcome::Cached(42)))
+                .count(),
+            1
+        );
     }
 }

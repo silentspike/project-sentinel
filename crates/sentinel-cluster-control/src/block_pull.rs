@@ -18,11 +18,10 @@
 //! layer, V28) before anything is published — a corrupt/tampered blob is rejected, never
 //! cached.
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use quinn::Endpoint;
+use quinn::{Connection, Endpoint};
 use sentinel_common::BlockRef;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -31,6 +30,7 @@ use tracing::{debug, info, warn};
 
 use crate::cert::{CertFingerprint, NodeCertificate};
 use crate::envelope::{decode_frame, encode_frame, CodecError};
+use crate::server::PeerRegistry;
 use crate::tls::{peer_fingerprint, quic_client_config, quic_server_config};
 
 /// Max concurrent block-pull streams served per pinned peer (per-node rate limit, V10).
@@ -192,20 +192,19 @@ impl BlockPullServer {
     pub fn bind<P: BlockProvider + 'static>(
         bind_addr: SocketAddr,
         node: &NodeCertificate,
-        pinned_peers: HashSet<CertFingerprint>,
+        peers: PeerRegistry,
         provider: Arc<P>,
     ) -> anyhow::Result<Self> {
         let server_cfg = quic_server_config(node)?;
         let endpoint = Endpoint::server(server_cfg, bind_addr)?;
         let local_addr = endpoint.local_addr()?;
         let ep = endpoint.clone();
-        let pins = Arc::new(pinned_peers);
         tokio::spawn(async move {
             while let Some(incoming) = ep.accept().await {
-                let pins = pins.clone();
+                let peers = peers.clone();
                 let provider = provider.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_pull_connection(incoming, pins, provider).await {
+                    if let Err(e) = serve_pull_connection(incoming, peers, provider).await {
                         warn!(error = %e, "#498 block-pull connection ended with error");
                     }
                 });
@@ -230,30 +229,35 @@ impl BlockPullServer {
 
 async fn serve_pull_connection<P: BlockProvider + 'static>(
     incoming: quinn::Incoming,
-    pins: Arc<HashSet<CertFingerprint>>,
+    peers: PeerRegistry,
     provider: Arc<P>,
 ) -> anyhow::Result<()> {
     let conn = incoming.await?;
     // V10: enforce the cert pin post-handshake (same gate as the control server).
     let fp = peer_fingerprint(&conn)?;
-    if !pins.contains(&fp) {
+    let Some((_authenticated_peer, connection_id)) = peers.register_connection(fp, &conn) else {
         conn.close(1u32.into(), b"unpinned peer");
         anyhow::bail!("rejected unpinned block-pull peer cert {fp}");
-    }
+    };
     let peer = fp.to_hex();
     // Per-node rate limit: bound the concurrent pull streams from this pinned peer.
     let limiter = Arc::new(Semaphore::new(MAX_INFLIGHT_PER_PEER));
     debug!(peer = %fp, "#498 block-pull peer accepted (pinned)");
-    loop {
+    let result = loop {
         match conn.accept_bi().await {
             Ok((mut send, mut recv)) => {
                 let provider = provider.clone();
                 let limiter = limiter.clone();
                 let peer = peer.clone();
+                let peers = peers.clone();
                 tokio::spawn(async move {
                     let Ok(_permit) = limiter.acquire().await else {
                         return;
                     };
+                    if peers.resolve(fp).is_none() {
+                        debug!(peer = %fp, "#498 block-pull peer revoked before request dispatch");
+                        return;
+                    }
                     if let Err(e) =
                         handle_pull(&mut recv, &mut send, provider.as_ref(), &peer).await
                     {
@@ -265,43 +269,78 @@ async fn serve_pull_connection<P: BlockProvider + 'static>(
                 });
             }
             Err(quinn::ConnectionError::ApplicationClosed(_))
-            | Err(quinn::ConnectionError::LocallyClosed) => break,
-            Err(e) => return Err(e.into()),
+            | Err(quinn::ConnectionError::LocallyClosed) => break Ok(()),
+            Err(e) => break Err(e.into()),
         }
-    }
-    Ok(())
+    };
+    peers.unregister_connection(fp, connection_id);
+    result
 }
 
 /// A QUIC block-pull client bound to an ephemeral local port, presenting `node`'s cert.
 pub struct BlockPullClient {
     endpoint: Endpoint,
+    peers: PeerRegistry,
 }
 
 impl BlockPullClient {
-    pub fn new(node: &NodeCertificate) -> anyhow::Result<Self> {
+    pub fn new(node: &NodeCertificate, peers: PeerRegistry) -> anyhow::Result<Self> {
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().expect("valid bind addr"))?;
         endpoint.set_default_client_config(quic_client_config(node)?);
-        Ok(Self { endpoint })
+        Ok(Self { endpoint, peers })
     }
 
-    /// Pull `block_ref` from a holder at `peer_addr`, enforcing the server cert pin
-    /// (V10 — reject a server whose fingerprint differs from `expected_peer`). Returns
-    /// the raw on-disk **encoded** blob bytes, or `None` if the peer does not hold it.
-    /// The read is bounded by the ref's encoded size (anti-DoS); the content hash is
-    /// verified by the CAS layer (V28) before the bytes are published.
-    pub async fn pull(
+    /// Connect to one holder and enforce its server certificate pin. The returned
+    /// session can carry multiple pull streams and observes local peer revocation.
+    pub async fn connect(
         &self,
         peer_addr: SocketAddr,
         expected_peer: CertFingerprint,
-        block_ref: &BlockRef,
-    ) -> anyhow::Result<Option<Vec<u8>>> {
+    ) -> anyhow::Result<BlockPullConnection> {
         let conn = self.endpoint.connect(peer_addr, "sentinel-node")?.await?;
         let fp = peer_fingerprint(&conn)?;
         if fp != expected_peer {
             conn.close(1u32.into(), b"unpinned server");
             anyhow::bail!("block-pull server cert {fp} does not match pin {expected_peer}");
         }
-        let (mut send, mut recv) = conn.open_bi().await?;
+        let Some((_, connection_id)) = self.peers.register_connection(fp, &conn) else {
+            conn.close(2u32.into(), b"peer revoked");
+            anyhow::bail!("block-pull server cert {fp} is not authorized");
+        };
+        Ok(BlockPullConnection {
+            connection: conn,
+            peers: self.peers.clone(),
+            fingerprint: fp,
+            connection_id,
+        })
+    }
+
+    /// Pull one block over a short-lived authenticated session. The content hash is
+    /// still verified by the CAS layer before publication (V28).
+    pub async fn pull(
+        &self,
+        peer_addr: SocketAddr,
+        expected_peer: CertFingerprint,
+        block_ref: &BlockRef,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let connection = self.connect(peer_addr, expected_peer).await?;
+        let result = connection.pull(block_ref).await;
+        connection.close();
+        result
+    }
+}
+
+/// An authenticated block-pull session that can carry multiple request streams.
+pub struct BlockPullConnection {
+    connection: Connection,
+    peers: PeerRegistry,
+    fingerprint: CertFingerprint,
+    connection_id: u64,
+}
+
+impl BlockPullConnection {
+    pub async fn pull(&self, block_ref: &BlockRef) -> anyhow::Result<Option<Vec<u8>>> {
+        let (mut send, mut recv) = self.connection.open_bi().await?;
         write_request(
             &mut send,
             &BlockPullRequest {
@@ -310,9 +349,19 @@ impl BlockPullClient {
         )
         .await?;
         send.finish()?;
-        let result = read_response(&mut recv, encoded_read_bound(block_ref)).await?;
-        conn.close(0u32.into(), b"done");
-        Ok(result)
+        Ok(read_response(&mut recv, encoded_read_bound(block_ref)).await?)
+    }
+
+    pub fn close(self) {
+        self.connection.close(0u32.into(), b"done");
+    }
+}
+
+impl Drop for BlockPullConnection {
+    fn drop(&mut self) {
+        self.peers
+            .unregister_connection(self.fingerprint, self.connection_id);
+        self.connection.close(0u32.into(), b"session dropped");
     }
 }
 

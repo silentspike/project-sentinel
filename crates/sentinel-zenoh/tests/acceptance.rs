@@ -327,18 +327,17 @@ fn config_defaults_match_issue_requirements() {
     assert_eq!(config.max_inflight_per_agent, 8);
 }
 
-/// #525: loopback listen pin does not break the bus — session opens and an
-/// intra-process pub/sub roundtrip still works. transport_mode is LOGGED only
-/// (not asserted): SHM availability is env-dependent (e.g. absent on the cargo
-/// remote build LXC), so asserting Shm would be flaky. The definitive proof that
-/// the pin actually took effect lives on the deploy VM (no `loopback listen pin
-/// failed` warn in the daemon log + `ss` showing the listener on 127.0.0.1),
-/// NOT in this CI test.
+/// #525: the loopback-only transport does not break the bus - a session opens and
+/// an intra-process pub/sub roundtrip still works with multicast scouting disabled.
+/// `transport_mode` is logged only: SHM availability is environment-dependent, so
+/// asserting SHM would be flaky. The unit test verifies the effective multicast
+/// setting; the deploy VM verifies the loopback listener, absent multicast socket,
+/// and quiet runtime logs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ac_525_loopback_listen_pin_smoke() {
     let bus = SentinelBus::with_config(BusConfig::default())
         .await
-        .expect("bus opens with loopback listen pin applied");
+        .expect("bus opens with loopback-only transport applied");
 
     // transport_mode is env-dependent (SHM may be unavailable in CI) -> log, do NOT assert.
     eprintln!("#525 smoke: transport_mode = {:?}", bus.transport_mode());

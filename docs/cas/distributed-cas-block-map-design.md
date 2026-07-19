@@ -56,10 +56,13 @@ Mapping to the membership primitives that already exist (`crates/sentinel-common
 | `ingest` (`:115`): boot_id change -> `Restarted`; older incarnation -> `RejectedStale` | higher `node_cas_generation` wins; `Remove@G` suppresses older `Add<G`; different `node_boot_id` -> newer incarnation (ABA) | same ABA / monotonic-merge logic |
 | receiver-stamped `last_seen_ms` | receiver-stamped advertisement time + `expires_after` | receiver-monotonic clock (never trust sender wall-clock) |
 
-### D2 -- Subject naming (mirrors membership)
+### D2 -- Subject naming (original Zenoh design, superseded)
 
-Membership uses `sentinel/cluster/membership/{node_id}` with a wildcard subscribe `.../*`
-(`services/sentinel-daemon/src/cluster_membership.rs:16`). The block map mirrors it:
+The original design mirrored the former membership subjects
+`sentinel/cluster/membership/{node_id}` and `.../*`. Membership now uses
+`ControlRequest::MembershipHeartbeat` over the cert-pinned QUIC control plane, and
+the block-map transport was likewise revised to QUIC in D3. These names are retained
+only as design history; no cross-node runtime depends on them:
 
 - **Publish:** `sentinel/cluster/blockmap/{node_id}` (each node owns its subtree).
 - **Subscribe:** wildcard `sentinel/cluster/blockmap/*`.
@@ -67,11 +70,11 @@ Membership uses `sentinel/cluster/membership/{node_id}` with a wildcard subscrib
 
 ### D3 -- Gossip transport (Finding 3 -- DECIDED, not left open)
 
-Two transports exist in the workspace, with different reach **today**:
+The original transport comparison used these assumptions; the implementation-time
+revision below supersedes them:
 
-- **Zenoh pub/sub:** works **same-L2 LAN now** -- membership rides it and #495 verified it live
-  (heartbeats over Zenoh peer discovery). **Cross-subnet** Zenoh is gated on **#495 Phase 2**
-  (`connect`/`endpoints`), which is **not yet implemented**.
+- **Zenoh pub/sub (superseded assumption):** was expected to work on the same L2 LAN
+  through multicast peer discovery, with cross-subnet use gated on explicit endpoints.
 - **QUIC control plane (#569):** the only cross-subnet session today; `cluster-control/envelope.rs`
   already sketches `RefQuery { block_ref }` / `PinQuery { block_ref }` request variants.
 
