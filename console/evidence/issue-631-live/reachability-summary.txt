@@ -1,0 +1,11 @@
+lockfile_packages=717
+classified_primary=717
+unclassified=0
+duplicate_primary_assignments=0
+release_roots_resolved=8/8
+release-normal=499
+release-build=91
+non-release-workspace-normal=2
+dev-bench-only=31
+target-only=90
+optional-disabled=4

@@ -1,0 +1,183 @@
+0sentinel-gaia v0.1.0 (<REMOTE_PROJECT>/services/sentinel-gaia)
+1anyhow v1.0.103
+1blake3 v1.8.3
+2arrayref v0.3.9
+2arrayvec v0.7.6
+2cfg-if v1.0.4
+2constant_time_eq v0.4.2
+2cpufeatures v0.2.17
+1clap v4.5.60
+2clap_builder v4.5.60
+3anstream v0.6.21
+4anstyle v1.0.13
+4anstyle-parse v0.2.7
+5utf8parse v0.2.2
+4anstyle-query v1.1.5
+4colorchoice v1.0.4
+4is_terminal_polyfill v1.70.2
+4utf8parse v0.2.2
+3anstyle v1.0.13
+3clap_lex v1.0.0
+3strsim v0.11.1
+2clap_derive v4.5.55 (proc-macro)
+3heck v0.5.0
+3proc-macro2 v1.0.106
+4unicode-ident v1.0.24
+3quote v1.0.44
+4proc-macro2 v1.0.106 (*)
+3syn v2.0.117
+4proc-macro2 v1.0.106 (*)
+4quote v1.0.44 (*)
+4unicode-ident v1.0.24
+1sentinel-common v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-common)
+2anyhow v1.0.103
+2bevy_ecs v0.18.1
+3bevy_ecs_macros v0.18.0 (proc-macro)
+4bevy_macro_utils v0.18.0
+5proc-macro2 v1.0.106 (*)
+5quote v1.0.44 (*)
+5syn v2.0.117 (*)
+5toml_edit v0.23.10+spec-1.0.0
+6indexmap v2.14.0
+7equivalent v1.0.2
+7hashbrown v0.17.1
+6toml_datetime v0.7.5+spec-1.1.0
+6toml_parser v1.0.9+spec-1.1.0
+7winnow v0.7.14
+6winnow v0.7.14
+4proc-macro2 v1.0.106 (*)
+4quote v1.0.44 (*)
+4syn v2.0.117 (*)
+3bevy_platform v0.18.0
+4foldhash v0.2.0
+4hashbrown v0.16.1
+5equivalent v1.0.2
+5serde_core v1.0.228
+4serde v1.0.228
+5serde_core v1.0.228
+5serde_derive v1.0.228 (proc-macro)
+6proc-macro2 v1.0.106 (*)
+6quote v1.0.44 (*)
+6syn v2.0.117 (*)
+4spin v0.10.1
+3bevy_ptr v0.18.0
+3bevy_reflect v0.18.0
+4assert_type_match v0.1.1 (proc-macro)
+5proc-macro2 v1.0.106 (*)
+5quote v1.0.44 (*)
+5syn v2.0.117 (*)
+4bevy_platform v0.18.0 (*)
+4bevy_ptr v0.18.0
+4bevy_reflect_derive v0.18.0 (proc-macro)
+5bevy_macro_utils v0.18.0 (*)
+5indexmap v2.14.0 (*)
+5proc-macro2 v1.0.106 (*)
+5quote v1.0.44 (*)
+5syn v2.0.117 (*)
+4bevy_utils v0.18.0
+5bevy_platform v0.18.0 (*)
+5disqualified v1.0.0
+5thread_local v1.1.9
+6cfg-if v1.0.4
+4derive_more v2.1.1
+5derive_more-impl v2.1.1 (proc-macro)
+6convert_case v0.10.0
+7unicode-segmentation v1.12.0
+6proc-macro2 v1.0.106 (*)
+6quote v1.0.44 (*)
+6syn v2.0.117 (*)
+6unicode-xid v0.2.6
+4disqualified v1.0.0
+4downcast-rs v2.0.2
+4erased-serde v0.4.9
+5serde_core v1.0.228
+5typeid v1.0.3
+4foldhash v0.2.0
+4indexmap v2.14.0
+5equivalent v1.0.2
+5hashbrown v0.17.1
+4serde v1.0.228 (*)
+4smallvec v1.15.1
+4thiserror v2.0.18
+5thiserror-impl v2.0.18 (proc-macro)
+6proc-macro2 v1.0.106 (*)
+6quote v1.0.44 (*)
+6syn v2.0.117 (*)
+4variadics_please v1.1.0 (proc-macro)
+5proc-macro2 v1.0.106 (*)
+5quote v1.0.44 (*)
+5syn v2.0.117 (*)
+3bevy_tasks v0.18.0
+4async-executor v1.14.0
+5async-task v4.7.1
+5concurrent-queue v2.5.0
+6crossbeam-utils v0.8.21
+5fastrand v2.3.0
+5futures-lite v2.6.1
+6fastrand v2.3.0
+6futures-core v0.3.32
+6futures-io v0.3.32
+6parking v2.2.1
+6pin-project-lite v0.2.16
+5pin-project-lite v0.2.16
+5slab v0.4.12
+4async-task v4.7.1
+4atomic-waker v1.1.2
+4bevy_platform v0.18.0 (*)
+4crossbeam-queue v0.3.12
+5crossbeam-utils v0.8.21
+4derive_more v2.1.1 (*)
+4futures-lite v2.6.1 (*)
+3bevy_utils v0.18.0 (*)
+3bitflags v2.11.0
+3bumpalo v3.20.2
+3concurrent-queue v2.5.0 (*)
+3derive_more v2.1.1 (*)
+3fixedbitset v0.5.7
+3indexmap v2.14.0 (*)
+3log v0.4.29
+3nonmax v0.5.5
+3slotmap v1.1.1
+3smallvec v1.15.1
+3thiserror v2.0.18 (*)
+3variadics_please v1.1.0 (proc-macro) (*)
+2bincode v2.0.1
+3bincode_derive v2.0.1 (proc-macro)
+4virtue v0.0.18
+3serde v1.0.228 (*)
+3unty v0.0.4
+2flatbuffers v25.12.19
+3bitflags v2.11.0
+2serde v1.0.228 (*)
+2serde_json v1.0.149
+3itoa v1.0.17
+3memchr v2.8.0
+3serde_core v1.0.228
+3zmij v1.0.21
+2thiserror v2.0.18 (*)
+2toml v1.0.6+spec-1.1.0
+3serde_core v1.0.228
+3serde_spanned v1.0.4
+4serde_core v1.0.228
+3toml_datetime v1.0.0+spec-1.1.0
+4serde_core v1.0.228
+3toml_parser v1.0.9+spec-1.1.0
+4winnow v0.7.14
+3toml_writer v1.0.6+spec-1.1.0
+3winnow v0.7.14
+2tracing v0.1.44
+3pin-project-lite v0.2.16
+3tracing-attributes v0.1.31 (proc-macro)
+4proc-macro2 v1.0.106 (*)
+4quote v1.0.44 (*)
+4syn v2.0.117 (*)
+3tracing-core v0.1.36
+4once_cell v1.21.3
+2uuid v1.22.0
+3getrandom v0.4.1
+4cfg-if v1.0.4
+4libc v0.2.186
+3serde_core v1.0.228
+1serde v1.0.228 (*)
+1serde_json v1.0.149 (*)
+1toml v1.0.6+spec-1.1.0 (*)

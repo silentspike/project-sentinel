@@ -1,0 +1,9 @@
+run	remote_target_state	cargo_finished	e2e_seconds	status	load_samples	overlap_markers	included_in_median
+C01	new-empty	n/a	243.29	CONTENDED_ABORTED	48	26	no
+C02	new-empty	n/a	170.56	CONTENDED_ABORTED	34	12	no
+C03	new-empty	n/a	342.73	UNCLASSIFIED_OVERLAP_ABORTED	68	7	no
+C04	new-empty	n/a	96.43	MONITOR_RACE_ABORTED	18	1	no
+C05	new-empty	7m 18s	466.91	UNCONTENDED	86	0	yes
+C06	new-empty	7m 17s	459.00	UNCONTENDED	85	0	yes
+C07	new-empty	7m 17s	458.55	UNCONTENDED	85	0	yes
+MEDIAN	new-empty	7m 17s	459.00	UNCONTENDED_ONLY	256	0	n/a
