@@ -488,7 +488,9 @@ impl ProcessGroupGuard {
 
     fn kill(&self) {
         if let Some(pgid) = self.pgid {
-            // The child starts its own process group, so a negative pid targets Claude and tools.
+            // SAFETY: the child starts its own process group before exec, so its
+            // pid is also the process-group id and a negative pid targets only
+            // that Claude process tree. `kill` does not retain any pointers.
             unsafe {
                 libc::kill(-pgid, libc::SIGKILL);
             }
