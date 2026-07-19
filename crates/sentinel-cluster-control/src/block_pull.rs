@@ -18,7 +18,6 @@
 //! layer, V28) before anything is published — a corrupt/tampered blob is rejected, never
 //! cached.
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -31,6 +30,7 @@ use tracing::{debug, info, warn};
 
 use crate::cert::{CertFingerprint, NodeCertificate};
 use crate::envelope::{decode_frame, encode_frame, CodecError};
+use crate::server::PeerRegistry;
 use crate::tls::{peer_fingerprint, quic_client_config, quic_server_config};
 
 /// Max concurrent block-pull streams served per pinned peer (per-node rate limit, V10).
@@ -192,20 +192,19 @@ impl BlockPullServer {
     pub fn bind<P: BlockProvider + 'static>(
         bind_addr: SocketAddr,
         node: &NodeCertificate,
-        pinned_peers: HashSet<CertFingerprint>,
+        peers: PeerRegistry,
         provider: Arc<P>,
     ) -> anyhow::Result<Self> {
         let server_cfg = quic_server_config(node)?;
         let endpoint = Endpoint::server(server_cfg, bind_addr)?;
         let local_addr = endpoint.local_addr()?;
         let ep = endpoint.clone();
-        let pins = Arc::new(pinned_peers);
         tokio::spawn(async move {
             while let Some(incoming) = ep.accept().await {
-                let pins = pins.clone();
+                let peers = peers.clone();
                 let provider = provider.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_pull_connection(incoming, pins, provider).await {
+                    if let Err(e) = serve_pull_connection(incoming, peers, provider).await {
                         warn!(error = %e, "#498 block-pull connection ended with error");
                     }
                 });
@@ -230,13 +229,13 @@ impl BlockPullServer {
 
 async fn serve_pull_connection<P: BlockProvider + 'static>(
     incoming: quinn::Incoming,
-    pins: Arc<HashSet<CertFingerprint>>,
+    peers: PeerRegistry,
     provider: Arc<P>,
 ) -> anyhow::Result<()> {
     let conn = incoming.await?;
     // V10: enforce the cert pin post-handshake (same gate as the control server).
     let fp = peer_fingerprint(&conn)?;
-    if !pins.contains(&fp) {
+    if peers.resolve(fp).is_none() {
         conn.close(1u32.into(), b"unpinned peer");
         anyhow::bail!("rejected unpinned block-pull peer cert {fp}");
     }

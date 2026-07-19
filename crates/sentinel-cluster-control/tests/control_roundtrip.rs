@@ -3,12 +3,11 @@
 //! wire, and mutual cert-pinning (V10). This proves the transport without a VM; the
 //! cross-host 2-node ACs run after deploy.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use sentinel_cluster_control::{
-    ControlClient, ControlEnvelope, ControlRequest, ControlResponse, ControlServer,
-    NodeCertificate, StubHandler,
+    AuthenticatedPeer, ControlClient, ControlEnvelope, ControlHandler, ControlRequest,
+    ControlResponse, ControlServer, NodeCertificate, PeerRegistry, StubHandler,
 };
 
 fn loopback() -> std::net::SocketAddr {
@@ -23,10 +22,9 @@ async fn rpc_roundtrip_idempotency_and_server_pin() {
     let client_fp = client_node.fingerprint();
 
     // The server pins the client (V10).
-    let mut pins = HashSet::new();
-    pins.insert(client_fp);
+    let peers = PeerRegistry::new([(client_fp, sentinel_common::NodeId::new())]).unwrap();
     let server =
-        ControlServer::bind(loopback(), &server_node, pins, Arc::new(StubHandler)).unwrap();
+        ControlServer::bind(loopback(), &server_node, peers, Arc::new(StubHandler)).unwrap();
     let addr = server.local_addr();
     let client = ControlClient::new(&client_node).unwrap();
 
@@ -82,6 +80,79 @@ async fn rpc_roundtrip_idempotency_and_server_pin() {
 }
 
 #[tokio::test]
+async fn membership_heartbeats_bypass_response_cache() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use sentinel_common::{Heartbeat, NodeId};
+    use uuid::Uuid;
+
+    struct CountingMembershipHandler {
+        calls: AtomicUsize,
+    }
+
+    impl ControlHandler for CountingMembershipHandler {
+        fn handle(&self, _peer: AuthenticatedPeer, request: &ControlRequest) -> ControlResponse {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match request {
+                ControlRequest::MembershipHeartbeat { heartbeat, .. } => {
+                    ControlResponse::MembershipAccepted {
+                        node_id: heartbeat.node_id,
+                        incarnation: heartbeat.incarnation,
+                    }
+                }
+                _ => ControlResponse::Rejected {
+                    reason: "unexpected request".into(),
+                },
+            }
+        }
+    }
+
+    let server_node = NodeCertificate::generate("node-0").unwrap();
+    let client_node = NodeCertificate::generate("node-1").unwrap();
+    let server_fp = server_node.fingerprint();
+    let node_id = NodeId::new();
+    let peers = PeerRegistry::new([(client_node.fingerprint(), node_id)]).unwrap();
+    let handler = Arc::new(CountingMembershipHandler {
+        calls: AtomicUsize::new(0),
+    });
+    let server =
+        ControlServer::bind(loopback(), &server_node, peers, Arc::clone(&handler)).unwrap();
+    let client = ControlClient::new(&client_node).unwrap();
+    let request = ControlRequest::MembershipHeartbeat {
+        cluster_id: Uuid::new_v4(),
+        heartbeat: Heartbeat {
+            node_id,
+            alias: "node-1".into(),
+            boot_id: Uuid::new_v4(),
+            incarnation: 1,
+            endpoints: vec![],
+        },
+    };
+
+    for _ in 0..2 {
+        let envelope = ControlEnvelope::new("same-heartbeat-key", request.clone());
+        let reply = client
+            .rpc(server.local_addr(), server_fp, &envelope)
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.response,
+            ControlResponse::MembershipAccepted {
+                node_id,
+                incarnation: 1,
+            }
+        );
+    }
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        2,
+        "every heartbeat arrival must refresh liveness instead of hitting dedup"
+    );
+
+    server.close();
+}
+
+#[tokio::test]
 async fn holder_gossip_over_the_wire_merges_into_the_shared_block_map() {
     use std::sync::Mutex;
 
@@ -94,8 +165,7 @@ async fn holder_gossip_over_the_wire_merges_into_the_shared_block_map() {
     let server_fp = server_node.fingerprint();
     let client_fp = client_node.fingerprint();
 
-    let mut pins = HashSet::new();
-    pins.insert(client_fp);
+    let peers = PeerRegistry::new([(client_fp, NodeId::new())]).unwrap();
 
     // node-0's server merges inbound holder gossip into this shared block map (#498).
     let block_map = Arc::new(Mutex::new(BlockMap::new()));
@@ -103,7 +173,7 @@ async fn holder_gossip_over_the_wire_merges_into_the_shared_block_map() {
         Arc::clone(&block_map),
         StubHandler,
     ));
-    let server = ControlServer::bind(loopback(), &server_node, pins, handler).unwrap();
+    let server = ControlServer::bind(loopback(), &server_node, peers, handler).unwrap();
     let addr = server.local_addr();
     let client = ControlClient::new(&client_node).unwrap();
 
@@ -151,10 +221,13 @@ async fn server_rejects_unpinned_client() {
     let stranger = NodeCertificate::generate("stranger").unwrap();
 
     // The server pins only some OTHER cert, never the stranger.
-    let mut pins = HashSet::new();
-    pins.insert(NodeCertificate::generate("allowed").unwrap().fingerprint());
+    let peers = PeerRegistry::new([(
+        NodeCertificate::generate("allowed").unwrap().fingerprint(),
+        sentinel_common::NodeId::new(),
+    )])
+    .unwrap();
     let server =
-        ControlServer::bind(loopback(), &server_node, pins, Arc::new(StubHandler)).unwrap();
+        ControlServer::bind(loopback(), &server_node, peers, Arc::new(StubHandler)).unwrap();
     let client = ControlClient::new(&stranger).unwrap();
 
     let env = ControlEnvelope::new(

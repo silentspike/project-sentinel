@@ -6,29 +6,34 @@
 //! SSH/scp seam): validate the target against the `PendingBareNode` allowlist
 //! (V14), confirm the out-of-band host-key pin (AC-S1), push the sha256-verified
 //! binary, render `daemon.toml` + the systemd unit + the #517 token-gate drop-ins,
-//! start the daemon and wait for it to become healthy. The saga/decision/render
-//! logic is transport-agnostic and unit-tested; the real [`SshProvisionTransport`]
-//! is a thin wrapper over `ssh`/`scp`.
+//! create the target's private QUIC identity locally, render a reciprocal pinned-peer
+//! configuration, start the daemon, and wait for an authenticated membership join.
+//! The saga/decision/render logic is transport-agnostic and unit-tested; the real
+//! [`SshProvisionTransport`] is a thin wrapper over `ssh`/`scp`.
 //!
 //! **Track-A bounded scope (documented, not a silent gap):**
-//! - The SSH bootstrap establishes trust. The mTLS node cert (the `IssuingCert`
-//!   saga step) is a deliberate **no-op** here — membership runs over Zenoh (no
-//!   peer auth yet) and the authenticated QUIC control stream (ADR-2 / #498) is
-//!   where a node cert first matters. The saga state exists so the shape is
-//!   N-node-native; the execution fills it in a later track.
+//! - The SSH bootstrap establishes host trust. During `IssuingCert`, the verified
+//!   target binary generates or loads its self-signed QUIC certificate and private
+//!   key on the target. Only the public certificate fingerprint returns to the seed.
+//!   The seed durably binds that fingerprint to the assigned [`NodeId`], while the
+//!   target config pins the seed. Membership starts only on that reciprocal pinned
+//!   graph; provisioning never falls back to unauthenticated LAN discovery.
 //! - **No secrets / LLM tokens are copied** (AC-B7/AC-S3): the token-gate drop-ins
 //!   keep gateway/judge/health boot-gated on `ConditionPathExists=/etc/sentinel/allow-llm`,
 //!   which the seed never creates.
 //! - `ProvisionOp` durability (ADR-3 `PROVISION_OPS`, V5 restart-recovery) is an
 //!   in-memory map here; the redb persistence lands with #496's cluster tables.
 //!
-//! The full live bootstrap against a real bare VM is the cross-node live AC
-//! (`AC-B2..B6` / `AC-S1..S6`) verified on the test cluster after deploy.
+//! The full bare-VM bootstrap remains a destructive cross-node acceptance drill.
+//! Unit tests cover the complete transport sequence and fail-closed join behavior;
+//! live correction evidence exercises target-local identity generation and the
+//! authenticated membership boundary without reprovisioning an active node.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use sentinel_common::cluster::{NodeId, PendingBareNode};
+use sentinel_cluster_control::CertFingerprint;
+use sentinel_common::cluster::{ControlPeer, NodeId, PendingBareNode};
 use sentinel_common::provision::ProvisionOp;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -50,12 +55,16 @@ pub const TOKEN_GATE_UNITS: &[&str] = &[
 const REMOTE_BIN: &str = "/opt/sentinel/bin/sentinel-daemon";
 const REMOTE_CONFIG: &str = "/opt/sentinel/config/daemon.toml";
 const REMOTE_UNIT: &str = "/etc/systemd/system/sentinel-daemon.service";
+const REMOTE_CONTROL_CERT: &str = "/opt/sentinel/data/control-node-cert.der";
+const REMOTE_CONTROL_KEY: &str = "/opt/sentinel/data/control-node-key.der";
 
 /// Health-poll cadence for `AwaitingHealth` (injected so tests don't sleep).
 #[derive(Debug, Clone, Copy)]
 pub struct ProvisionTiming {
     pub health_poll_interval: Duration,
     pub health_poll_max: u32,
+    pub join_poll_interval: Duration,
+    pub join_poll_max: u32,
 }
 
 impl Default for ProvisionTiming {
@@ -64,6 +73,8 @@ impl Default for ProvisionTiming {
         Self {
             health_poll_interval: Duration::from_secs(2),
             health_poll_max: 30,
+            join_poll_interval: Duration::from_secs(1),
+            join_poll_max: 30,
         }
     }
 }
@@ -75,9 +86,9 @@ pub struct ProvisionPlan {
     pub assigned_node_id: NodeId,
     pub alias: String,
     pub cluster_id: Uuid,
-    /// Zenoh connect endpoint for the member to reach the seed; `None` = rely on
-    /// LAN multicast discovery (Track-A default — the test nodes share a subnet).
-    pub seed_endpoint: Option<String>,
+    pub target_control_bind: String,
+    pub target_control_addr: String,
+    pub seed_peer: ControlPeer,
     /// Local path to the sha256-verified binary the seed pushes.
     pub binary_local_path: PathBuf,
     /// Expected sha256 of that binary (lowercase hex); verified before + after push.
@@ -98,15 +109,23 @@ impl ProvisionPlan {
         s.push_str(&format!("cluster_id = \"{}\"\n", self.cluster_id));
         s.push_str("seed = false\n");
         s.push_str(&format!("alias = \"{}\"\n", self.alias));
-        if let Some(ep) = &self.seed_endpoint {
-            s.push_str(&format!("seed_endpoint = \"{ep}\"\n"));
-        }
-        // #568: a provisioned member must not run the Platform LLM Analyzer by default.
-        // The minimal member render otherwise inherits the serde default `llm_enabled =
-        // true`, which starts the analyzer (gateway connect attempts + log noise, and a
-        // token-bleed risk on any node that does have a reachable gateway). Members never
-        // drive LLM analysis — only the seed/single-node config opts in.
+        s.push_str(&format!(
+            "control_bind = \"{}\"\n",
+            self.target_control_bind
+        ));
+        s.push_str("\n[[daemon.cluster.control_peers]]\n");
+        s.push_str(&format!("node_id = \"{}\"\n", self.seed_peer.node_id));
+        s.push_str(&format!("alias = \"{}\"\n", self.seed_peer.alias));
+        s.push_str(&format!("addr = \"{}\"\n", self.seed_peer.addr));
+        s.push_str(&format!(
+            "cert_fingerprint = \"{}\"\n",
+            self.seed_peer.cert_fingerprint
+        ));
+        // A provisioned member only installs sentinel-daemon. Do not inherit supervisor
+        // defaults for services that are intentionally absent, and never run the Platform
+        // LLM Analyzer on a member unless a later explicit configuration opts in.
         s.push_str("\n[daemon.platform_controlplane]\n");
+        s.push_str("monitored_services = []\n");
         s.push_str("llm_enabled = false\n");
         s
     }
@@ -150,6 +169,13 @@ pub trait ProvisionTransport {
     fn run(&self, cmd: &str) -> anyhow::Result<String>;
 }
 
+/// Seed-side cluster seam used to authorize a target and prove its observed join.
+pub trait ProvisionCluster {
+    fn authorize_peer(&self, peer: ControlPeer) -> anyhow::Result<()>;
+    fn revoke_peer(&self, node_id: NodeId) -> anyhow::Result<()>;
+    fn is_alive(&self, node_id: NodeId) -> bool;
+}
+
 /// Drive the provision saga to `Completed` (or `Failed`). Any transport error fails
 /// the op (rollback/quarantine, AC-B6) and returns `Err`; a completed op is left
 /// terminal. Returns the wall-clock duration of the bootstrap on success.
@@ -160,6 +186,7 @@ pub fn execute_provision_node<T: ProvisionTransport>(
     pending: &PendingBareNode,
     plan: &ProvisionPlan,
     transport: &T,
+    cluster: &impl ProvisionCluster,
     timing: ProvisionTiming,
     clock: &dyn Fn() -> u64,
 ) -> anyhow::Result<u64> {
@@ -207,14 +234,34 @@ pub fn execute_provision_node<T: ProvisionTransport>(
         Ok(())
     })?; // → IssuingCert
 
-    // IssuingCert → Track-A no-op (SSH trust; mTLS node cert deferred to QUIC/#498).
-    op.advance(clock()); // → RenderingConfig
+    // IssuingCert: the verified target binary generates its private key locally. Only
+    // the public certificate fingerprint returns over the pinned SSH channel.
+    let mut target_fingerprint = None;
+    fenced_step(op, clock, "issue control identity", || {
+        let output = transport.run(&format!(
+            "sudo {REMOTE_BIN} generate-control-identity --alias {} --cert {REMOTE_CONTROL_CERT} --key {REMOTE_CONTROL_KEY}",
+            plan.alias
+        ))?;
+        let fingerprint = CertFingerprint::from_hex(output.trim())
+            .ok_or_else(|| anyhow::anyhow!("target returned malformed control fingerprint"))?;
+        let key_mode = transport.run(&format!("stat -c %a {REMOTE_CONTROL_KEY}"))?;
+        if key_mode.trim() != "600" {
+            anyhow::bail!(
+                "target control private key mode is {}, expected 600",
+                key_mode.trim()
+            );
+        }
+        target_fingerprint = Some(fingerprint);
+        Ok(())
+    })?; // → RenderingConfig
+    let target_fingerprint = target_fingerprint.expect("identity step produced a fingerprint");
 
     // RenderingConfig → daemon.toml + systemd unit + token-gate drop-ins.
     // `config/agents` MUST exist — the daemon `read_dir`s it on startup (an absent
     // dir is fatal). Privileged files are staged to a writable `/tmp` path and then
     // `sudo install`ed (the SSH user is unprivileged; a direct scp into a root-owned
     // dir is denied — same staging pattern as the binary push above).
+    let mut peer_authorized = false;
     fenced_step(op, clock, "render config", || {
         // Create every Sentinel runtime dir the systemd unit's ReadWritePaths
         // references (`/opt/sentinel/fs` is required for the ProtectSystem=strict
@@ -236,14 +283,24 @@ pub fn execute_provision_node<T: ProvisionTransport>(
             )?;
         }
         transport.run("sudo systemctl daemon-reload")?;
+        cluster.authorize_peer(ControlPeer {
+            node_id: plan.assigned_node_id,
+            alias: plan.alias.clone(),
+            addr: plan.target_control_addr.clone(),
+            cert_fingerprint: target_fingerprint.to_hex(),
+        })?;
+        peer_authorized = true;
         Ok(())
     })?; // → StartingDaemon
 
     // StartingDaemon → enable + start the daemon (gateway/judge stay gated).
-    fenced_step(op, clock, "start daemon", || {
+    if let Err(error) = fenced_step(op, clock, "start daemon", || {
         transport.run("sudo systemctl enable --now sentinel-daemon.service")?;
         Ok(())
-    })?; // → AwaitingHealth
+    }) {
+        cleanup_failed_join(cluster, transport, plan.assigned_node_id, peer_authorized);
+        return Err(error);
+    } // → AwaitingHealth
 
     // AwaitingHealth → poll `systemctl is-active` over the same SSH channel (avoids
     // depending on the target's operator-API network bind/auth).
@@ -262,6 +319,7 @@ pub fn execute_provision_node<T: ProvisionTransport>(
     }
     if !healthy {
         op.fail("target daemon did not become active", clock());
+        cleanup_failed_join(cluster, transport, plan.assigned_node_id, peer_authorized);
         anyhow::bail!(
             "provision: target {} did not become active after bootstrap",
             pending.pending_target_id
@@ -269,11 +327,40 @@ pub fn execute_provision_node<T: ProvisionTransport>(
     }
     op.advance(clock()); // → ObservingJoin
 
-    // ObservingJoin → membership convergence is observed by the membership service
-    // (Chunk 4a); the join is confirmed by the daemon being active + publishing its
-    // heartbeat. The live both-nodes-alive assertion is AC-B4.
+    // ObservingJoin: completion requires the seed's authenticated membership view to
+    // contain this exact NodeId as Alive. Process activity alone is insufficient.
+    let mut joined = false;
+    for _ in 0..timing.join_poll_max {
+        if cluster.is_alive(plan.assigned_node_id) {
+            joined = true;
+            break;
+        }
+        if timing.join_poll_interval > Duration::ZERO {
+            std::thread::sleep(timing.join_poll_interval);
+        }
+    }
+    if !joined {
+        op.fail("target did not join authenticated membership", clock());
+        cleanup_failed_join(cluster, transport, plan.assigned_node_id, peer_authorized);
+        anyhow::bail!(
+            "provision: target {} did not join authenticated membership",
+            pending.pending_target_id
+        );
+    }
     op.advance(clock()); // → Completed
     Ok(started.elapsed().as_millis() as u64)
+}
+
+fn cleanup_failed_join(
+    cluster: &impl ProvisionCluster,
+    transport: &impl ProvisionTransport,
+    node_id: NodeId,
+    peer_authorized: bool,
+) {
+    let _ = transport.run("sudo systemctl disable --now sentinel-daemon.service");
+    if peer_authorized {
+        let _ = cluster.revoke_peer(node_id);
+    }
 }
 
 /// Write `content` to a privileged `dest` on the target: stage it to a writable
@@ -489,6 +576,12 @@ mod tests {
             if cmd.contains("is-active") {
                 return Ok(self.active.borrow().clone());
             }
+            if cmd.contains("generate-control-identity") {
+                return Ok(TEST_FINGERPRINT.to_string());
+            }
+            if cmd.contains("stat -c %a") {
+                return Ok("600".into());
+            }
             if cmd.contains("sha256sum") {
                 // Echo the expected sha so the post-push check passes.
                 return Ok(EXPECTED_SHA.to_string());
@@ -498,11 +591,59 @@ mod tests {
     }
 
     const EXPECTED_SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const TEST_FINGERPRINT: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+
+    struct FakeCluster {
+        alive_node: Option<NodeId>,
+        authorized: RefCell<Vec<ControlPeer>>,
+        revoked: RefCell<Vec<NodeId>>,
+        checked: RefCell<Vec<NodeId>>,
+    }
+
+    impl FakeCluster {
+        fn joined(node_id: NodeId) -> Self {
+            Self {
+                alive_node: Some(node_id),
+                authorized: RefCell::new(Vec::new()),
+                revoked: RefCell::new(Vec::new()),
+                checked: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn absent() -> Self {
+            Self {
+                alive_node: None,
+                authorized: RefCell::new(Vec::new()),
+                revoked: RefCell::new(Vec::new()),
+                checked: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ProvisionCluster for FakeCluster {
+        fn authorize_peer(&self, peer: ControlPeer) -> anyhow::Result<()> {
+            self.authorized.borrow_mut().push(peer);
+            Ok(())
+        }
+
+        fn revoke_peer(&self, node_id: NodeId) -> anyhow::Result<()> {
+            self.revoked.borrow_mut().push(node_id);
+            Ok(())
+        }
+
+        fn is_alive(&self, node_id: NodeId) -> bool {
+            self.checked.borrow_mut().push(node_id);
+            self.alive_node == Some(node_id)
+        }
+    }
 
     fn fast_timing() -> ProvisionTiming {
         ProvisionTiming {
             health_poll_interval: Duration::ZERO,
             health_poll_max: 3,
+            join_poll_interval: Duration::ZERO,
+            join_poll_max: 3,
         }
     }
 
@@ -516,7 +657,15 @@ mod tests {
             assigned_node_id: NodeId::new(),
             alias: "test-node-1".into(),
             cluster_id: Uuid::new_v4(),
-            seed_endpoint: None,
+            target_control_bind: "0.0.0.0:8085".into(),
+            target_control_addr: "10.0.0.242:8085".into(),
+            seed_peer: ControlPeer {
+                node_id: NodeId::new(),
+                alias: "test-node-0".into(),
+                addr: "10.0.0.241:8085".into(),
+                cert_fingerprint:
+                    "2222222222222222222222222222222222222222222222222222222222222222".into(),
+            },
             binary_local_path: bin.to_path_buf(),
             binary_sha256: EXPECTED_SHA.into(),
         }
@@ -527,6 +676,7 @@ mod tests {
         let bin = empty_binary();
         let plan = plan_for(bin.path());
         let t = FakeTransport::healthy();
+        let cluster = FakeCluster::joined(plan.assigned_node_id);
         let mut op = ProvisionOp::new(
             Uuid::new_v4(),
             "bare-1".into(),
@@ -540,6 +690,7 @@ mod tests {
             &pending("bare-1", "ssh-ed25519 AAAA"),
             &plan,
             &t,
+            &cluster,
             fast_timing(),
             &clock,
         )
@@ -554,6 +705,22 @@ mod tests {
         assert!(
             joined.contains("put_file /tmp/sentinel-daemon.new"),
             "binary push"
+        );
+        assert!(joined.contains("generate-control-identity"));
+        assert!(joined.contains(REMOTE_CONTROL_CERT));
+        assert!(joined.contains(REMOTE_CONTROL_KEY));
+        assert_eq!(cluster.authorized.borrow().len(), 1);
+        assert_eq!(
+            cluster.authorized.borrow()[0].node_id,
+            plan.assigned_node_id
+        );
+        assert_eq!(
+            cluster.authorized.borrow()[0].cert_fingerprint,
+            TEST_FINGERPRINT
+        );
+        assert_eq!(
+            cluster.checked.borrow().as_slice(),
+            &[plan.assigned_node_id]
         );
         // config/agents must be created (the daemon read_dirs it on startup).
         assert!(
@@ -587,6 +754,7 @@ mod tests {
         let bin = empty_binary();
         let plan = plan_for(bin.path());
         let t = FakeTransport::healthy();
+        let cluster = FakeCluster::joined(plan.assigned_node_id);
         let mut op = ProvisionOp::new(Uuid::new_v4(), "bare-1".into(), "n".into(), "i".into(), 0);
         let clock = || 1u64;
         // Empty pinned host key → AC-S1 precondition fails, no transport calls.
@@ -595,6 +763,7 @@ mod tests {
             &pending("bare-1", "  "),
             &plan,
             &t,
+            &cluster,
             fast_timing(),
             &clock,
         );
@@ -610,6 +779,7 @@ mod tests {
         let plan = plan_for(bin.path());
         // Fail when starting the daemon → op must end Failed (AC-B6), never alive.
         let t = FakeTransport::failing("enable --now");
+        let cluster = FakeCluster::joined(plan.assigned_node_id);
         let mut op = ProvisionOp::new(Uuid::new_v4(), "bare-1".into(), "n".into(), "i".into(), 0);
         let clock = || 7u64;
         let err = execute_provision_node(
@@ -617,6 +787,7 @@ mod tests {
             &pending("bare-1", "ssh-ed25519 AAAA"),
             &plan,
             &t,
+            &cluster,
             fast_timing(),
             &clock,
         );
@@ -627,6 +798,10 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("start daemon"));
+        assert_eq!(
+            cluster.revoked.borrow().as_slice(),
+            &[plan.assigned_node_id]
+        );
     }
 
     #[test]
@@ -635,6 +810,7 @@ mod tests {
         bin.write_all(b"not empty").unwrap(); // sha != EXPECTED_SHA
         let plan = plan_for(bin.path());
         let t = FakeTransport::healthy();
+        let cluster = FakeCluster::joined(plan.assigned_node_id);
         let mut op = ProvisionOp::new(Uuid::new_v4(), "bare-1".into(), "n".into(), "i".into(), 0);
         let clock = || 3u64;
         let err = execute_provision_node(
@@ -642,6 +818,7 @@ mod tests {
             &pending("bare-1", "ssh-ed25519 AAAA"),
             &plan,
             &t,
+            &cluster,
             fast_timing(),
             &clock,
         );
@@ -659,6 +836,7 @@ mod tests {
         let bin = empty_binary();
         let plan = plan_for(bin.path());
         let t = FakeTransport::never_active();
+        let cluster = FakeCluster::joined(plan.assigned_node_id);
         let mut op = ProvisionOp::new(Uuid::new_v4(), "bare-1".into(), "n".into(), "i".into(), 0);
         let clock = || 9u64;
         let err = execute_provision_node(
@@ -666,6 +844,7 @@ mod tests {
             &pending("bare-1", "ssh-ed25519 AAAA"),
             &plan,
             &t,
+            &cluster,
             fast_timing(),
             &clock,
         );
@@ -676,27 +855,79 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("did not become active"));
+        assert_eq!(
+            cluster.revoked.borrow().as_slice(),
+            &[plan.assigned_node_id]
+        );
+    }
+
+    #[test]
+    fn active_process_without_membership_join_never_completes() {
+        let bin = empty_binary();
+        let plan = plan_for(bin.path());
+        let t = FakeTransport::healthy();
+        let cluster = FakeCluster::absent();
+        let mut op = ProvisionOp::new(Uuid::new_v4(), "bare-1".into(), "n".into(), "i".into(), 0);
+        let err = execute_provision_node(
+            &mut op,
+            &pending("bare-1", "ssh-ed25519 AAAA"),
+            &plan,
+            &t,
+            &cluster,
+            fast_timing(),
+            &|| 10,
+        );
+        assert!(err.is_err());
+        assert_eq!(op.state, ProvisionOpState::Failed);
+        assert!(op
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("authenticated membership"));
+        assert_eq!(
+            cluster.revoked.borrow().as_slice(),
+            &[plan.assigned_node_id]
+        );
+        assert!(t
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.contains("disable --now sentinel-daemon")));
     }
 
     #[test]
     fn render_daemon_toml_is_member_config() {
         let bin = empty_binary();
-        let mut plan = plan_for(bin.path());
-        plan.seed_endpoint = Some("tcp/10.0.0.241:7447".into());
+        let plan = plan_for(bin.path());
         let toml = plan.render_daemon_toml();
         assert!(toml.contains("seed = false"));
         assert!(toml.contains(&format!("node_id = \"{}\"", plan.assigned_node_id)));
         assert!(toml.contains(&format!("cluster_id = \"{}\"", plan.cluster_id)));
-        assert!(toml.contains("seed_endpoint = \"tcp/10.0.0.241:7447\""));
+        assert!(toml.contains("control_bind = \"0.0.0.0:8085\""));
+        assert!(toml.contains("[[daemon.cluster.control_peers]]"));
+        assert!(toml.contains(&format!("node_id = \"{}\"", plan.seed_peer.node_id)));
+        assert!(toml.contains("addr = \"10.0.0.241:8085\""));
+        assert!(toml.contains(&plan.seed_peer.cert_fingerprint));
+        assert!(!toml.contains("seed_endpoint"));
         // It must parse back as a valid daemon cluster config.
         assert!(toml.starts_with("[daemon]"));
         // #568: a provisioned member must not enable the Platform LLM Analyzer.
         assert!(toml.contains("[daemon.platform_controlplane]"));
+        assert!(toml.contains("monitored_services = []"));
         assert!(toml.contains("llm_enabled = false"));
-        // And it must parse back to a config whose analyzer is disabled.
+        // And it must parse back to a config whose analyzer and absent-service monitoring
+        // are both disabled.
         let parsed: crate::config::DaemonConfigFile =
             toml::from_str(&toml).expect("rendered member daemon.toml must parse");
+        let cluster = parsed.daemon.cluster.as_ref().unwrap();
+        assert_eq!(cluster.control_bind.as_deref(), Some("0.0.0.0:8085"));
+        assert_eq!(cluster.control_peers, vec![plan.seed_peer.clone()]);
         assert!(!parsed.daemon.platform_controlplane.llm_enabled);
+        assert!(parsed
+            .daemon
+            .platform_controlplane
+            .monitored_services
+            .is_empty());
     }
 
     #[test]

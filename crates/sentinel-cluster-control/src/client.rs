@@ -10,6 +10,7 @@ use crate::tls::{peer_fingerprint, quic_client_config};
 
 /// A QUIC control client bound to an ephemeral local port, presenting `node`'s cert
 /// for mutual auth.
+#[derive(Clone)]
 pub struct ControlClient {
     endpoint: Endpoint,
 }

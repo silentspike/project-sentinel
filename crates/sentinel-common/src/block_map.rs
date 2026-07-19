@@ -35,9 +35,9 @@
 //! summaries and tests never depend on `HashMap` order.
 //!
 //! This module is the in-memory data model + conflict-free merge mechanics. The
-//! gossip wire (publishing/subscribing `HolderAdvertisement` over Zenoh) and the CAS
-//! coupling live in later #498 steps; the bytes themselves travel over QUIC, never
-//! over the map.
+//! gossip wire (`AdvertiseHolders` over the cert-pinned QUIC control stream) and the
+//! CAS coupling live in later #498 steps; block bytes use the separate QUIC pull
+//! stream, never the map.
 
 use std::collections::{BTreeMap, HashMap};
 

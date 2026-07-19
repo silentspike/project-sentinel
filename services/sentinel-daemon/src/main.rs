@@ -4,11 +4,11 @@
 //! laufenden Daemon zusammen. Tick-basierte ECS-Simulation
 //! mit async I/O Bridge (Zenoh, Limbo, redb).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::{error, info};
 
 use sentinel_daemon::config::DaemonConfig;
@@ -17,6 +17,9 @@ use sentinel_daemon::config::DaemonConfig;
 #[derive(Parser, Debug)]
 #[command(name = "sentinel-daemon", version, about)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Pfad zur Daemon-Konfigurationsdatei.
     #[arg(long, default_value = "config/daemon.toml")]
     config: String,
@@ -24,6 +27,19 @@ struct Cli {
     /// Dry-Run: Config laden, Agents parsen, Schicht erkennen, dann beenden.
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Generate or read the persistent QUIC control identity and print its fingerprint.
+    GenerateControlIdentity {
+        #[arg(long)]
+        alias: String,
+        #[arg(long)]
+        cert: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -46,6 +62,19 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
+    if let Some(Command::GenerateControlIdentity { alias, cert, key }) = cli.command {
+        if let Some(parent) = cert.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Some(parent) = key.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let identity =
+            sentinel_cluster_control::NodeCertificate::load_or_generate(&cert, &key, &alias)?;
+        println!("{}", identity.fingerprint());
+        return Ok(());
+    }
+
     let config = DaemonConfig::load(Path::new(&cli.config))
         .with_context(|| format!("Config laden: {}", cli.config))?;
 

@@ -10,11 +10,12 @@ use std::sync::{Arc, Mutex};
 use sentinel_common::BlockMap;
 
 use crate::envelope::{ControlRequest, ControlResponse};
+use crate::server::AuthenticatedPeer;
 
 /// Maps a `ControlRequest` to a `ControlResponse`. Implementations MUST be total
 /// (return a typed `Rejected` rather than panic on anything they cannot serve).
 pub trait ControlHandler: Send + Sync {
-    fn handle(&self, request: &ControlRequest) -> ControlResponse;
+    fn handle(&self, peer: AuthenticatedPeer, request: &ControlRequest) -> ControlResponse;
 }
 
 /// A composable handler that merges #498 `AdvertiseHolders` gossip into a **shared**
@@ -43,7 +44,7 @@ impl<H: ControlHandler> BlockMapGossipHandler<H> {
 }
 
 impl<H: ControlHandler> ControlHandler for BlockMapGossipHandler<H> {
-    fn handle(&self, request: &ControlRequest) -> ControlResponse {
+    fn handle(&self, peer: AuthenticatedPeer, request: &ControlRequest) -> ControlResponse {
         match request {
             ControlRequest::AdvertiseHolders { advertisements } => {
                 // A poisoned lock means another thread panicked mid-merge; recover the
@@ -67,7 +68,7 @@ impl<H: ControlHandler> ControlHandler for BlockMapGossipHandler<H> {
                     applied: applied as u32,
                 }
             }
-            other => self.inner.handle(other),
+            other => self.inner.handle(peer, other),
         }
     }
 }
@@ -79,8 +80,11 @@ impl<H: ControlHandler> ControlHandler for BlockMapGossipHandler<H> {
 pub struct StubHandler;
 
 impl ControlHandler for StubHandler {
-    fn handle(&self, request: &ControlRequest) -> ControlResponse {
+    fn handle(&self, _peer: AuthenticatedPeer, request: &ControlRequest) -> ControlResponse {
         match request {
+            ControlRequest::MembershipHeartbeat { .. } => ControlResponse::Rejected {
+                reason: "membership heartbeat requires the daemon membership handler".into(),
+            },
             ControlRequest::PrepareHandoff { scope, epoch } => ControlResponse::HandoffPrepared {
                 scope: scope.clone(),
                 epoch: *epoch,
@@ -118,6 +122,13 @@ mod tests {
     use sentinel_common::{BlockRef, HolderAction, HolderAdvertisement};
     use uuid::Uuid;
 
+    fn peer() -> AuthenticatedPeer {
+        AuthenticatedPeer {
+            fingerprint: crate::CertFingerprint([1; 32]),
+            node_id: sentinel_common::NodeId::new(),
+        }
+    }
+
     fn advert(n: u8, gen: u64, action: HolderAction) -> HolderAdvertisement {
         HolderAdvertisement {
             block_ref: BlockRef::blob_sha256([n; 32], 1024),
@@ -137,16 +148,22 @@ mod tests {
 
         let a = advert(1, 5, HolderAction::Add);
         let b = advert(2, 5, HolderAction::Add);
-        let resp = h.handle(&ControlRequest::AdvertiseHolders {
-            advertisements: vec![a.clone(), b.clone()],
-        });
+        let resp = h.handle(
+            peer(),
+            &ControlRequest::AdvertiseHolders {
+                advertisements: vec![a.clone(), b.clone()],
+            },
+        );
         assert_eq!(resp, ControlResponse::HoldersApplied { applied: 2 });
         assert_eq!(map.lock().unwrap().block_count(), 2, "both holders merged");
 
         // Re-sending the same batch is a no-op (stale/duplicate) — 0 newly applied.
-        let resp2 = h.handle(&ControlRequest::AdvertiseHolders {
-            advertisements: vec![a, b],
-        });
+        let resp2 = h.handle(
+            peer(),
+            &ControlRequest::AdvertiseHolders {
+                advertisements: vec![a, b],
+            },
+        );
         assert_eq!(resp2, ControlResponse::HoldersApplied { applied: 0 });
     }
 
@@ -156,11 +173,14 @@ mod tests {
         let h = BlockMapGossipHandler::new(map, StubHandler);
         // An owner RPC is served by the inner StubHandler unchanged.
         assert_eq!(
-            h.handle(&ControlRequest::OwnerCommit {
-                scope: "agent:7".into(),
-                owner_node: "node-1".into(),
-                epoch: 5,
-            }),
+            h.handle(
+                peer(),
+                &ControlRequest::OwnerCommit {
+                    scope: "agent:7".into(),
+                    owner_node: "node-1".into(),
+                    epoch: 5,
+                }
+            ),
             ControlResponse::OwnerCommitted {
                 scope: "agent:7".into(),
                 epoch: 5
@@ -172,20 +192,26 @@ mod tests {
     fn stub_acknowledges_owner_rpcs_and_reports_no_refs() {
         let h = StubHandler;
         assert_eq!(
-            h.handle(&ControlRequest::OwnerCommit {
-                scope: "agent:7".into(),
-                owner_node: "node-1".into(),
-                epoch: 5,
-            }),
+            h.handle(
+                peer(),
+                &ControlRequest::OwnerCommit {
+                    scope: "agent:7".into(),
+                    owner_node: "node-1".into(),
+                    epoch: 5,
+                }
+            ),
             ControlResponse::OwnerCommitted {
                 scope: "agent:7".into(),
                 epoch: 5
             }
         );
         assert_eq!(
-            h.handle(&ControlRequest::RefQuery {
-                block_ref: "cas-blob:v1:sha256:ab".into()
-            }),
+            h.handle(
+                peer(),
+                &ControlRequest::RefQuery {
+                    block_ref: "cas-blob:v1:sha256:ab".into()
+                }
+            ),
             ControlResponse::RefQueryResult {
                 block_ref: "cas-blob:v1:sha256:ab".into(),
                 referenced: false,

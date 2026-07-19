@@ -85,18 +85,17 @@ impl SentinelBus {
         })
     }
 
-    /// #525: Pin the Zenoh listen endpoint to loopback.
+    /// Keep the daemon-internal Zenoh bus entirely on loopback.
     ///
-    /// Single-node, daemon-internal bus: there are no cross-process Zenoh peers on the
-    /// deploy VM (cross-node traffic = QUIC ClusterControl/#569, not Zenoh), so a loopback
-    /// listen has zero functional risk. `insert_json5` is warn-not-fatal: if the key/syntax
-    /// is rejected the listener silently stays default — therefore the CI test CANNOT prove
-    /// the pin took effect; the definitive proof is the absence of this warn in the .240
-    /// daemon log (no `loopback listen pin failed` line) plus `ss` showing the listener on
-    /// 127.0.0.1.
-    fn pin_loopback_listen(config: &mut zenoh::Config) {
+    /// Cross-node traffic uses QUIC ClusterControl/#569. Multicast scouting must therefore
+    /// be disabled together with the loopback-only listener; otherwise LAN peers discover
+    /// each other and repeatedly try to connect to the remote host's advertised 127.0.0.1.
+    fn configure_loopback_transport(config: &mut zenoh::Config) {
         if let Err(e) = config.insert_json5("listen/endpoints", "[\"tcp/127.0.0.1:0\"]") {
             warn!("SentinelBus: loopback listen pin failed ({e}) — Zenoh listener stays default");
+        }
+        if let Err(e) = config.insert_json5("scouting/multicast/enabled", "false") {
+            warn!("SentinelBus: disabling multicast scouting failed ({e})");
         }
     }
 
@@ -104,7 +103,7 @@ impl SentinelBus {
     async fn open_session(config: &BusConfig) -> anyhow::Result<(Session, TransportMode)> {
         if config.shm_enabled {
             let mut shm_config = zenoh::Config::default();
-            Self::pin_loopback_listen(&mut shm_config);
+            Self::configure_loopback_transport(&mut shm_config);
             if let Err(e) = shm_config.insert_json5("transport/shared_memory/enabled", "true") {
                 warn!("SentinelBus: SHM config insertion failed ({e}), using network transport");
             } else {
@@ -129,7 +128,7 @@ impl SentinelBus {
         }
         // Fallback: Standard Network-Transport
         let mut default_config = zenoh::Config::default();
-        Self::pin_loopback_listen(&mut default_config);
+        Self::configure_loopback_transport(&mut default_config);
         let session = zenoh::open(default_config)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to open Zenoh session: {e}"))?;
@@ -357,6 +356,20 @@ impl SentinelBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_transport_disables_multicast_scouting() {
+        let mut config = zenoh::Config::default();
+
+        SentinelBus::configure_loopback_transport(&mut config);
+
+        assert_eq!(
+            config
+                .get_json("scouting/multicast/enabled")
+                .expect("multicast scouting setting"),
+            "false"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pub_sub_roundtrip() {
