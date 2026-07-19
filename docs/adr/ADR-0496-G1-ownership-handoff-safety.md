@@ -1,144 +1,153 @@
-# ADR-0496: Ownership & handoff safety (G1)
+# ADR-0496: Ownership, activation, and handoff safety (G1)
 
-- **Gate:** G1 (blocks #496 PR2; the route-quiescence part V17 also blocks #497)
-- **Status:** Proposed
-- **Primary issue:** #496 (owner registry / fencing)
-- **Related issues / gates:** ADR-3 (cluster meta schema), G-D0 (HA evolution), V1–V6/V17/V19
-- **Supersedes / Superseded by:** —
+- **Gate:** G1 (blocks the A5 follow-up to #496 and #501)
+- **Status:** Accepted
+- **Primary issues:** #496 and #615
+- **Related issues / gates:** ADR-2, ADR-3, G4, G5, G-D0
 
-> **N-node-native rule:** all schemas/messages/APIs MUST be `NodeId`-keyed, never a
-> hard source/target pair. Two nodes are the first test, not the ceiling.
+> Even though the foundation is verified on a two-node cluster first, all schemas,
+> messages, and APIs are N-node-native and keyed by `NodeId`. Two nodes are the first
+> test, not the cluster model.
 
 ## Context
 
-`owner_epoch` is a **bare `u64`** today (`crates/sentinel-common/src/types.rs:702`),
-in-memory only (`RestoreFence` in the daemon). There is **no single choke-point per
-store**: the EventStore has ~9 write methods each with its own transaction
-(`append_event:393`, `append_with_outbox:430`, `append_with_outbox_batch:491`,
-`save_snapshot:847`, `delete_orphan_outbox:1264`, `update_offset:1288`,
-`save_world_snapshot:1434`, `save_world_snapshot_at:1456`, `delete_world_snapshot:1526`
-in `crates/sentinel-limbo/src/event_store.rs`), redb has **19** `begin_write()` sites
-(`crates/sentinel-redb/src/lib.rs`), and the FS metadata layer **18**
-(`crates/sentinel-fs/src/metadata.rs`). A single forgotten write path = split-brain
-(the worst failure class).
+#496 introduced real fenced writes, durable owner terms, local retirement, and a
+cooperative ownership handoff. The current implementation still has an unsafe cluster
+bootstrap boundary: `OwnerTerm` lacks a coordinator generation, `LocalOwnerRole`
+defaults to `Owner`, `OwnerRegistry::issue()` is infallible, and clustered nodes enter
+through the single-node initializer. A complete handoff or migration must also stage a
+recoverable copy before retiring the only live source.
 
 ## Problem
 
-How is a stale or non-owning write made impossible across **every** persistence path,
-without a distributed 2PC, and how is the handoff sequenced so a stale source can never
-serve after the target takes over?
+How does Sentinel make a stale, non-owning, non-routable, or not-yet-bootstrapped write
+impossible while preserving the existing single-node fast path and allowing a
+recoverable stop-and-copy move?
 
 ## Decision
 
-**Refactor every store onto one fenced write entry per engine, gated by a typed
-`OwnerWriteGuard`, and sequence the handoff so the source is durably retired before the
-target serves.**
+Sentinel separates data-plane write authority, control-plane authority transitions,
+local activation, and route readiness. A normal write is admitted only after every
+layer agrees on the complete authority term.
 
-- **Typed guard, not a raw `u64` (V3/V19):** `OwnerWriteGuard { scope, node_id, epoch,
-  coordinator_generation, issued_by }` is constructible **only** by the OwnerRegistry.
-  Both `begin_fenced_write(&guard)` **and** `commit()` re-check the **whole**
-  `OwnerTerm` (scope + owner_node + epoch + coordinator_generation + `local_role ==
-  Owner`), not just `epoch < current` (TOCTOU protection). The strongest barrier is the
-  **type system**: a mutating path does not compile without a guard; grep/lint is only
-  an extra.
-- **One entry per engine, three impls (no shared wrapper):** the three transaction
-  types are incompatible (limbo `conn.lock()` mutex / redb `WriteTransaction` / the FS
-  wrapper), so the contract is `trait FencedStore { type Txn; fn
-  begin_fenced_write(&self, guard: &OwnerWriteGuard) -> Result<Self::Txn,
-  StaleEpochError>; }` with **three** impls (matches the PR1a/b/c split). Raw
-  `begin_write`/append become `pub(crate)`; all public write methods route through the
-  fenced entry.
-- **Per-write subject tagging (G-1 scope spec):** `OwnerTerm.scope =
-  StateTransferScope { World | NanoContainer(agent_id) }` (the type exists,
-  `types.rs:666`). The store is company-global, so each fenced write declares its
-  subject from the `DomainEvent` (events carry `agent_id`/`target_agent_id`,
-  `types.rs:289/357`); the entry check is *"does this node hold a current `OwnerTerm`
-  for this subject scope?"*. World/system events without `agent_id` (e.g.
-  `PsiBandChanged`/`ChaosTriggered`) belong to the `World` scope = seed/chef owner.
-- **Handoff sequence (V1, the strict, TOGAF-compatible tightening):** source sets a
-  durable `Retiring`/`no_new_writes`/`retired_after_epoch=E` marker, drains in-flight
-  writes, emits a **durable `SourceRetiredAck(E)`**, *then* snapshot+cursor under fence
-  E, target restores as `Prepared`, chef persists `Owner=Target epoch=E+1`, target
-  activates, route switches, source stays hard-fenced for epoch ≤ E. **The target never
-  serves before `SourceRetiredAck` is durable.**
-- **No forced failover in 2-node mode (V2):** membership says only
-  `Alive|Suspect|Dead|Left`; ownership is never stolen on unreachability. Cooperative
-  migration only; forced failover is Track D (G-D0/G6).
-- **LocalOwnerState (V4):** each node holds a durable
-  `LocalOwnerState { scope, node_id, epoch, role, durable_retired_marker }` so a source
-  rejects writes from its own store layer during a partition (the chef update may be
-  invisible).
-- **Route-quiescence before snapshot (V17):** before `SourceRetiredAck` the route layer
-  enters `Migrating(scope, op_id)`; new inbound is handled per the #497 inbound policy
-  (Track A excludes active inbound).
+### Complete authority term
 
-## Non-Goals
+The authoritative term is:
 
-- Forced failover / witness / quorum (Track D, G-D0/G6).
-- Per-container **write parallelism**: serialization stays node-global (one
-  `conn.lock()` / one redb writer) — fencing granularity is logical per-container, not
-  parallel writes (a deliberate Track-A boundary; relevant to "ms"/Tier-2 contention).
-- The durable inbound queue (Track E/H, G0).
+`OwnerTerm { scope, owner_node, epoch, coordinator_generation }`
 
-## Data Types
+- `epoch` is monotonic per scope.
+- `coordinator_generation` identifies the authority line. Track A uses generation 1;
+  generation 0 is legacy.
+- A guard carries the complete term, not only the epoch.
+- Unknown scopes are never synthesized as self-owned in cluster mode.
 
-`OwnerWriteGuard`, `OwnerTerm`, `LocalOwnerState`, `StaleEpochError` (new in
-`sentinel-common`/daemon). `OwnerTerm.scope` reuses `StateTransferScope` (`types.rs:666`).
-Persisted in the ADR-3 redb tables (`CLUSTER_OWNER`).
+### Complete V19 validation
 
-## State Machine / Protocol
+`OwnerRegistry::issue(scope)` is fallible in cluster mode. It returns a normal
+`OwnerWriteGuard` only when:
 
-Handoff: `Idle → PreparingSource → SourceRetiring → SourceRetired(ack durable) →
-SnapshotCreated → TargetPrepared → OwnerCommitted(E+1) → … (see G5 for the full saga)`.
-The chef is a deliberate SPOF: chef death = no new ownerships/migrations, **existing
-owners keep writing (no data loss)**.
+1. owner/activation readiness is open;
+2. scope, owner node, epoch, and coordinator generation exactly equal the current term;
+3. `term.owner_node == this_node`;
+4. the effective local role is `Owner`;
+5. activation is `Routable`.
 
-## Failure Modes
+Write begin and commit recheck the same complete conditions. A mismatched generation,
+owner, epoch, role, activation, scope, or readiness latch produces a typed rejection.
+The final #501 path additionally requires route readiness before normal guards can be
+issued.
 
-- **Partition:** `LocalOwnerState` lets the source enforce its own retirement locally;
-  no second owner is created (V2).
-- **TOCTOU at commit:** `commit()` re-checks the whole `OwnerTerm`.
-- **Forgotten write path:** prevented by the type barrier (no guard → no compile) +
-  `pub(crate)` raw writes + a grep/lint CI extra.
-- **Crash between ack and owner-commit (V6):** before ack → source keeps running; after
-  ack/before commit → source unfreezes with a recovery epoch, target discards Prepared.
+### Local base state and saga overlay
 
-## Tests
+Stable recipient state is stored as `LocalOwnerBaseState` with base role
+`Owner|Follower` and `ActivationState`. Transitional state is a scope-keyed
+`LocalOwnerSagaState` for `LegacyReconciliation|Handoff|Migration`.
 
-- 2-VM: a second owner is rejected.
-- Stale write → `StaleEpochError`.
-- A raw write without a guard **does not compile** (type barrier).
-- Commit re-check (TOCTOU) test.
-- V1: target never serves without a durable `SourceRetiredAck`.
-- V2 partition: source unreachable → no new owner.
-- Chef-SPOF behavior. (2-VM live ACs hang on the QUIC control stream, ADR-2; saga logic
-  also covered by in-process 2-World tests.)
+The effective local state is the saga overlay when present, otherwise the base state.
+General owner snapshot replication never removes an overlay. Only the active handoff
+or migration can CAS-replace or complete it. Conflicting active operations for one
+scope require manual recovery.
 
-## Benchmarks
+### Readiness and single-node compatibility
 
-Handoff latency p50/p95/**p99/max** + fencing overhead per write (the entry wrapper, on
-**every** write) + steady-state no-op-guard vs real guard begin+commit vs stale-reject.
-Bug-finder: **0 double writes** under partition/pause. Sweep heartbeat/lease-TTL.
-Register: `sentinel-daemon-owner-fencing (#496)`.
+The owner/activation latch starts closed on every process start. Cluster mode opens it
+only after a valid atomic snapshot marker is checked and owner/local caches are rebuilt
+under the tick barrier. Network loss never creates self-ownership.
 
-## Backward Compatibility
+A daemon without `[daemon.cluster]` retains the single-node fast path and explicitly
+promotes legacy activation to `Routable`.
 
-The store refactor is behavior-preserving first (PR1: `begin_fenced_write` wraps the
-existing write with a no-op guard → full suite proves zero change), then the real epoch
-check lands in PR2. New fields via `#[serde(default)]`. No `events` migration.
+### Quiesce, copy, then retire
 
-## Security
+The pre-authority portion of a migration is ordered as follows:
 
-Single trust domain (Track A). The guard authority is the OwnerRegistry; raw writes are
-unconstructible without it.
+1. validate the bounded eligibility class;
+2. reserve transfer and establish the target-to-source snapshot connection outside
+   the pause;
+3. set the source overlay to `Retiring`, route to `Migrating`, and close agent-scoped
+   admission;
+4. drain in-flight ECS, EventStore, redb, and operator writes and recheck eligibility;
+5. freeze the source container;
+6. cut ECS state, all per-agent rows, and the real source watermark under the same
+   barrier;
+7. transfer and durably stage the verified target copy;
+8. only then persist source `Retired` and acknowledge retirement;
+9. only after that acknowledgement may the coordinator commit target authority E+1.
 
-## Public Claim Boundary
+This order preserves a verified staged copy before the only source is retired. The
+target cannot become routable before source retirement, full owner snapshot
+replication, restore, unfreeze, and final activation.
 
-- May claim after #496: stale/non-owning writes rejected; cooperative handoff is
-  V1-safe.
-- **May NOT claim:** forced failover, HA, per-container write parallelism, or "ms"
-  handoff without the measured bench.
+### No forced failover in Track A
 
-## Open Follow-ups
+Unreachability never steals ownership in the two-node foundation. Existing owners keep
+their valid authority; new ownership and migration stop when the coordinator is
+unavailable. Witness, quorum, coordinator replacement, and forced failover remain
+Track D.
 
-- G-D0 quorum OwnerMetadataLog (HA); G6/G8 RecoveryPoint; G5 the full migration saga.
+## Control-plane authority exception
+
+The control-plane operations that replace an owner term cannot be authorized by the
+old `OwnerWriteGuard` whose authority they are changing. They use the authenticated,
+CAS-checked atomic store APIs defined by ADR-3. Normal simulation-state writes remain
+behind `FencedStore`.
+
+## Failure modes
+
+- **Cluster bootstrap without a snapshot:** readiness remains closed and writes fail.
+- **Partition after retirement:** the local saga overlay continues to fence the source.
+- **TOCTOU:** commit rechecks the complete term and effective local state.
+- **Crash before durable target staging:** source E can reopen and continue under the
+  existing single-replica RPO.
+- **Crash after source retirement but before authority commit:** source reactivation
+  requires a new recovery epoch.
+- **Crash after authority commit:** recovery is forward-first to the target.
+
+## Tests and evidence
+
+- Single-node compatibility and lock-free fast path.
+- Legacy generation-0 and activation decoding.
+- Fallible guard issue and complete V19 begin/commit rechecks.
+- Restart latch and cache rebuild under the tick barrier.
+- Scope-keyed overlay preservation and authorized counter-handoff CAS.
+- Two-node live evidence: one owner, a real owner store write succeeds, non-owner write
+  rejects, residency exists only at the effective owner, and restart opens only after
+  rebuild.
+- #501 ordering tests prove staging before retirement and no routability before the
+  final activation acknowledgement.
+
+## Consequences
+
+- Cluster startup is intentionally fail closed.
+- A handoff and a migration share one local overlay model without sharing their full
+  orchestration state machine.
+- Authority changes are explicit control-plane transactions rather than ordinary data
+  writes.
+- The single-node operator migration path remains unchanged.
+
+## Public claim boundary
+
+After #615 is live-accepted, Sentinel may claim complete owner/activation fencing for
+the two-node Track A foundation. It may not claim forced failover, quorum, replicated
+RPO, Cluster GA, or migration of active interaction/side-effect workloads.
