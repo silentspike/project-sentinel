@@ -7,6 +7,8 @@
 [![Release](https://img.shields.io/github/v/release/silentspike/project-sentinel?include_prereleases&label=release)](https://github.com/silentspike/project-sentinel/releases)
 [![Stack: Rust 1.93+ / Go 1.26+](https://img.shields.io/badge/stack-rust%201.93%2B%20%2F%20go%201.26%2B-orange.svg)](#)
 
+Acronym reference: [OSSF Scorecard](docs/glossary.md#acronyms).
+
 A reference testbed for runtime governance of LLM coding agents:
 sandbox each agent, audit each action, and verify failure modes before
 customers run agents against production code.
@@ -25,10 +27,10 @@ operate: per-agent sandboxing (bwrap + Landlock + cgroups + netns),
 event-sourced audit trails, three independent control planes, and a
 9/9-passing breakout test report.
 
-The full stack is documented as a TOGAF v22.1 architecture and runs on a
+The full stack is documented as a [TOGAF](docs/glossary.md#acronyms) v22.1 architecture and runs on a
 provisioned VM. The included docker demo is a deliberate behavioral
 subset: it shows the workload and dashboard, but not the kernel-bound
-parts (eBPF, Landlock, FUSE) that need a real host.
+parts ([eBPF](docs/glossary.md#acronyms), Landlock, FUSE) that need a real host.
 
 [Architecture Guide (TOGAF v22.1)](docs/architecture/togaf-architecture-guide.html) ·
 [Sandbox Test Report (9/9)](docs/security-test-report.md) ·
@@ -56,6 +58,10 @@ environment:
    underpins the workload.
 
 ## Architecture at a Glance
+
+The quality and memory plane uses [NATS](docs/glossary.md#acronyms)
+JetStream for event streaming and an [NMDA](docs/glossary.md#acronyms)
+night-run for memory consolidation.
 
 ```mermaid
 flowchart TB
@@ -128,7 +134,7 @@ For deliberate deviations from the spec see
 
 | Tool        | Version  | Purpose                       |
 |-------------|----------|-------------------------------|
-| Rust        | 1.93+    | ECS world, all Rust crates    |
+| Rust        | 1.93+    | [ECS](docs/glossary.md#acronyms) world, all Rust crates    |
 | Go          | 1.23+    | Gateway, judge, nats-bridge   |
 | Bun         | 1.x      | Dashboard                     |
 | cargo-remote (optional) | latest | Remote build server  |
@@ -290,7 +296,7 @@ target; the docker demo is a deliberate behavioral subset.
 | Cortex Gateway 7-step pipeline + 10-rule synthesis engine | ✅ implemented + exercised | yes | yes |
 | Console (SolidJS + Rust WebTransport) | ✅ implemented + exercised | yes | yes |
 | sentinel-judge quality + drift monitoring (NATS streaming) | ✅ implemented + exercised | yes | yes |
-| sentinel-projection CQRS read-models | ✅ implemented + exercised | yes | yes |
+| sentinel-projection [CQRS](docs/glossary.md#acronyms) read-models | ✅ implemented + exercised | yes | yes |
 | sentinel-nightrun batch consolidation, deterministic replay | ✅ implemented, manual trigger | yes | yes |
 | **bwrap + Landlock per-agent isolation** | ✅ implemented + 9/9 breakout-tested (`crates/sentinel-sandbox/`) | **no (kernel-caps)** | **yes** |
 | **cgroups v2 per-agent caps** | ✅ implemented | **no (kernel-caps)** | **yes** |
@@ -379,7 +385,7 @@ private development and public visibility, not the start of the project.
 CI on `main`: ci, lint, coverage, supply-chain (cargo-deny, npm-audit,
 go-vuln, rust-audit), conventional-commits, dependency-freshness — green.
 CodeQL goes green on the first scheduled run after the public flip
-(GHAS gating). Security: dependency audit + `gitleaks` + `trufflehog` clean,
+([GHAS](docs/glossary.md#acronyms) gating). Security: dependency audit + `gitleaks` + `trufflehog` clean,
 9/9 sandbox breakout tests passing on a privileged host.
 
 See [docs/known-limitations.md](docs/known-limitations.md) for full caveats
