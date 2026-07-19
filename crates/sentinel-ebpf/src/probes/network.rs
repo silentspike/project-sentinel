@@ -51,13 +51,9 @@ impl NetworkMetrics {
 
     /// Average latency as Duration, or None if no samples.
     pub fn avg_latency(&self) -> Option<Duration> {
-        if self.latency_count == 0 {
-            None
-        } else {
-            Some(Duration::from_micros(
-                self.latency_sum_us / self.latency_count,
-            ))
-        }
+        self.latency_sum_us
+            .checked_div(self.latency_count)
+            .map(Duration::from_micros)
     }
 
     /// Minimum observed latency, or None if no samples.

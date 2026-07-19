@@ -125,7 +125,7 @@ impl ControlplaneStore {
         }
 
         // Neueste zuerst (hoechste Tick-Werte)
-        incidents.sort_by(|a, b| b.tick.cmp(&a.tick));
+        incidents.sort_by_key(|incident| std::cmp::Reverse(incident.tick));
         incidents.truncate(limit);
         Ok(incidents)
     }
