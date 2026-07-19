@@ -32,7 +32,7 @@ fn main() {
 
     let reg = OwnerRegistry::global(); // process-global, single-node default
     let scope = StateTransferScope::World;
-    let guard = reg.issue(scope.clone());
+    let guard = reg.issue(scope.clone()).unwrap();
 
     println!("== #496 PR2b-2a owner-fence V26 overhead (iters={iters}) ==");
     assert!(
@@ -55,6 +55,7 @@ fn main() {
         scope: StateTransferScope::NanoContainer("AGENT-99".into()),
         owner_node: NodeId::default(),
         epoch: 2,
+        coordinator_generation: sentinel_common::TRACK_A_COORDINATOR_GENERATION,
     });
     assert!(reg.is_cluster_mode());
 

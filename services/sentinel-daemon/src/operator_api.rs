@@ -483,6 +483,113 @@ struct AppState {
     cluster_is_seed: bool,
 }
 
+fn materialize_config_owner_scopes(
+    state: &AppState,
+    agents: &[sentinel_common::agent_config::AgentConfig],
+) -> anyhow::Result<()> {
+    let Some(meta) = state.cluster_meta.as_ref() else {
+        return Ok(());
+    };
+    let (installed, _) = meta
+        .installed_owner_snapshot()?
+        .context("cluster owner snapshot is not installed")?;
+    let (global, changed) = extend_owner_snapshot_for_agents(
+        &installed,
+        agents,
+        sentinel_common::OwnerRegistry::global().this_node(),
+        state.cluster_is_seed,
+    )?;
+
+    if changed {
+        let _tick_barrier = sentinel_common::owner_tick_barrier();
+        let local = crate::handoff::local_snapshot_for(
+            &global,
+            sentinel_common::OwnerRegistry::global().this_node(),
+        )?;
+        sentinel_common::OwnerRegistry::global().close_owner_readiness();
+        match meta.install_owner_snapshot(&global, &local)? {
+            sentinel_common::OwnerSnapshotInstallOutcome::Installed
+            | sentinel_common::OwnerSnapshotInstallOutcome::AlreadyInstalled => {}
+            outcome => anyhow::bail!("materialize owner scopes failed: {outcome:?}"),
+        }
+        sentinel_common::OwnerRegistry::global().rebuild_from_owner_snapshot(
+            &global,
+            &local,
+            meta.list_local_saga_states()?,
+        )?;
+    }
+
+    if state.cluster_is_seed {
+        let control = state
+            .cluster_control
+            .as_ref()
+            .context("control stream is required to replicate dynamic owner scopes")?;
+        for (peer_node, peer_alias) in control.configured_peers() {
+            let local = crate::handoff::local_snapshot_for(&global, peer_node)?;
+            let outcome = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(control.replicate_owner_snapshot(
+                    &peer_alias,
+                    global.clone(),
+                    local,
+                ))
+            })?;
+            if !matches!(
+                outcome,
+                sentinel_common::OwnerSnapshotInstallOutcome::Installed
+                    | sentinel_common::OwnerSnapshotInstallOutcome::AlreadyInstalled
+            ) {
+                anyhow::bail!("peer {peer_alias} refused dynamic owner snapshot: {outcome:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn extend_owner_snapshot_for_agents(
+    installed: &sentinel_common::OwnerTermSnapshot,
+    agents: &[sentinel_common::agent_config::AgentConfig],
+    chef_node: sentinel_common::NodeId,
+    cluster_is_seed: bool,
+) -> anyhow::Result<(sentinel_common::OwnerTermSnapshot, bool)> {
+    let mut terms = installed.sorted_terms.clone();
+    let mut changed = false;
+    for agent in agents {
+        let scope = sentinel_common::StateTransferScope::for_agent(
+            sentinel_common::AgentId(agent.identity.id).to_string(),
+        );
+        if terms.iter().any(|term| term.scope == scope) {
+            continue;
+        }
+        if !cluster_is_seed {
+            anyhow::bail!("unknown agent scope can only be materialized by the chef");
+        }
+        terms.push(sentinel_common::OwnerTerm {
+            scope,
+            owner_node: chef_node,
+            epoch: 1,
+            coordinator_generation: sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+        });
+        changed = true;
+    }
+
+    if changed {
+        let next = installed
+            .term_snapshot_revision
+            .checked_add(1)
+            .context("owner snapshot revision overflow")?;
+        Ok((
+            sentinel_common::OwnerTermSnapshot::new(
+                sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+                next,
+                terms,
+            )?,
+            true,
+        ))
+    } else {
+        Ok((installed.clone(), false))
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct HttpRequest {
     method: String,
@@ -877,6 +984,13 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                     }),
                 );
             }
+            if let Err(error) = materialize_config_owner_scopes(state, &payload.agents) {
+                warn!(%error, "Config-Apply owner-scope materialization failed");
+                return ApiError::ServiceUnavailable(
+                    "Config-Apply owner scopes could not be replicated",
+                )
+                .to_response();
+            }
             info!(
                 mode = ?payload.mode,
                 agents = payload.agents.len(),
@@ -1122,7 +1236,20 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
             };
             let reg = sentinel_common::OwnerRegistry::global();
             let this = reg.this_node();
-            let term = reg.current_owner(&scope);
+            let term = match reg.current_owner(&scope) {
+                Ok(term) => term,
+                Err(error) => {
+                    return json_response(
+                        409,
+                        serde_json::json!({
+                            "scope": scope_wire,
+                            "this_node": this.to_string(),
+                            "own_write_validates": false,
+                            "reject_reason": error.to_string(),
+                        }),
+                    )
+                }
+            };
             let is_owner = term.owner_node == this;
             let local_retired = reg
                 .local_owner_state(&scope)
@@ -1143,10 +1270,11 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
                 .get("guard_epoch")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(term.epoch);
-            let probe = reg.validate(&sentinel_common::OwnerWriteGuard::for_test(
+            let probe = reg.validate(&sentinel_common::OwnerWriteGuard::for_test_full(
                 scope.clone(),
                 this,
                 guard_epoch,
+                term.coordinator_generation,
             ));
             json_response(
                 200,
@@ -3777,6 +3905,45 @@ mod tests {
             building: config_apply_building(),
         };
         serde_json::to_value(&cmd).unwrap()
+    }
+
+    #[test]
+    fn dynamic_owner_scopes_are_materialized_once_by_the_chef_before_config_apply() {
+        let chef = sentinel_common::NodeId(uuid::Uuid::from_bytes([7; 16]));
+        let world = sentinel_common::OwnerTerm {
+            scope: sentinel_common::StateTransferScope::World,
+            owner_node: chef,
+            epoch: 1,
+            coordinator_generation: sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+        };
+        let installed = sentinel_common::OwnerTermSnapshot::new(
+            sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+            4,
+            vec![world],
+        )
+        .unwrap();
+        let agents = vec![config_apply_agent(9, 0.5), config_apply_agent(7, 0.5)];
+
+        let (extended, changed) =
+            extend_owner_snapshot_for_agents(&installed, &agents, chef, true).unwrap();
+        assert!(changed);
+        assert_eq!(extended.term_snapshot_revision, 5);
+        assert_eq!(extended.sorted_terms.len(), 3);
+        assert!(extended
+            .sorted_terms
+            .windows(2)
+            .all(|rows| { rows[0].scope.to_wire() < rows[1].scope.to_wire() }));
+        assert!(extended.sorted_terms.iter().all(|term| {
+            term.owner_node == chef
+                && term.epoch == 1
+                && term.coordinator_generation == sentinel_common::TRACK_A_COORDINATOR_GENERATION
+        }));
+
+        let (unchanged, changed_again) =
+            extend_owner_snapshot_for_agents(&extended, &agents, chef, true).unwrap();
+        assert!(!changed_again);
+        assert_eq!(unchanged, extended);
+        assert!(extend_owner_snapshot_for_agents(&installed, &agents, chef, false).is_err());
     }
 
     #[test]

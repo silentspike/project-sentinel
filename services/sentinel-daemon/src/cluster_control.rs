@@ -373,6 +373,58 @@ impl ClusterControl {
             .collect()
     }
 
+    /// Stable identity/alias pairs for every cert-pinned peer. Bootstrap uses this
+    /// to construct the recipient-bound local half of a full owner snapshot; callers
+    /// never receive socket addresses or fingerprints from this read-only view.
+    pub fn configured_peers(&self) -> Vec<(NodeId, String)> {
+        self.peer_snapshot()
+            .into_iter()
+            .map(|peer| (peer.node_id, peer.alias))
+            .collect()
+    }
+
+    /// Replicate one complete global + recipient-local owner snapshot to a pinned
+    /// peer. The idempotency key is deterministic for the installed revision and full
+    /// checksums, so transport retries remain reply-deduplicated while the durable
+    /// install API is the actual idempotency boundary.
+    pub async fn replicate_owner_snapshot(
+        &self,
+        peer_alias: &str,
+        global: sentinel_common::OwnerTermSnapshot,
+        local: sentinel_common::LocalOwnerStateSnapshot,
+    ) -> anyhow::Result<sentinel_common::OwnerSnapshotInstallOutcome> {
+        let global_checksum: String = global
+            .checksum
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let local_checksum: String = local
+            .checksum
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let idempotency_key = format!(
+            "owner-snapshot-{}-{}-{global_checksum}-{local_checksum}",
+            local.recipient_node, global.term_snapshot_revision,
+        );
+        let reply = self
+            .rpc(
+                peer_alias,
+                &idempotency_key,
+                ControlRequest::ReplicateOwnerSnapshot { global, local },
+            )
+            .await?;
+        match reply.response {
+            ControlResponse::OwnerSnapshotAck { outcome } => Ok(outcome),
+            ControlResponse::Rejected { reason } => {
+                anyhow::bail!("owner snapshot rejected by {peer_alias}: {reason}")
+            }
+            response => {
+                anyhow::bail!("unexpected owner snapshot response from {peer_alias}: {response:?}")
+            }
+        }
+    }
+
     /// Authorize and persist a newly provisioned peer without restarting the seed.
     pub fn add_peer(&self, peer: ControlPeer) -> anyhow::Result<()> {
         let peer = ResolvedPeer::from_config(&peer)?;
