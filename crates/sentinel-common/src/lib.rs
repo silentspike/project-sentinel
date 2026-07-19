@@ -34,8 +34,12 @@ pub use cluster::{
 };
 pub use events::{DomainEvent, DomainEventPayload};
 pub use fencing::{
-    FencedStore, LocalOwnerRole, LocalOwnerState, OwnerRegistry, OwnerTerm, OwnerWriteGuard,
-    StaleEpochError,
+    owner_tick_barrier, validate_owner_snapshot_pair, ActivationState, FencedStore,
+    LocalOwnerBaseRole, LocalOwnerBaseState, LocalOwnerOperationKind, LocalOwnerRole,
+    LocalOwnerSagaRole, LocalOwnerSagaState, LocalOwnerState, LocalOwnerStateSnapshot,
+    LocalResidency, OwnerIssueError, OwnerRegistry, OwnerSnapshotError,
+    OwnerSnapshotInstallOutcome, OwnerTerm, OwnerTermSnapshot, OwnerWriteGuard, StaleEpochError,
+    OWNER_SNAPSHOT_SCHEMA_VERSION, TRACK_A_COORDINATOR_GENERATION,
 };
 pub use membership::{
     Heartbeat, IngestOutcome, MembershipConfig, MembershipState, MembershipView, NodeMembership,
