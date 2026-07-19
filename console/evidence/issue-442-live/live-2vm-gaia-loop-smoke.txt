@@ -1,0 +1,57 @@
+$ ssh ubuntu@10.0.0.241/242 <2-VM Gaia loop smoke, exact claude process check>
+== 10.0.0.241 ==
+node=sentinel-test-node-0
+date=2026-06-27T17:50:49+00:00
+service=active
+sentinel-gaia-loop 0.1.0
+    PID   RSS %CPU COMMAND         COMMAND
+  71192 17036  0.2 sentinel-gaia-l /opt/sentinel/bin/sentinel-gaia-loop serve
+exact_claude_processes_begin
+exact_claude_processes_end
+state={
+  "last_event_row_id": 111352,
+  "alerts_created": 2,
+  "last_alert_timestamp_ms": 1782582600434
+}
+Jun 27 17:49:21 sentinel-test-node-0 systemd[1]: Stopping sentinel-gaia-loop.service - Sentinel Gaia Console readiness loop (#442)...
+Jun 27 17:49:21 sentinel-test-node-0 systemd[1]: sentinel-gaia-loop.service: Deactivated successfully.
+Jun 27 17:49:21 sentinel-test-node-0 systemd[1]: Stopped sentinel-gaia-loop.service - Sentinel Gaia Console readiness loop (#442).
+Jun 27 17:49:21 sentinel-test-node-0 systemd[1]: Started sentinel-gaia-loop.service - Sentinel Gaia Console readiness loop (#442).
+Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49:21.575232Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49:21.598083Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49:21.619676Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49:21.639696Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49:21.660552Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49:21.680607Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49:21.701158Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49:21.721346Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49:21.741741Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49:21.762183Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49:21.782028Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49:21.802462Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49:21.805249Z  INFO sentinel_gaia_loop::readiness: Gaia readiness recovery scan complete alerts_created=1 last_event_row_id=111324
+Jun 27 17:49:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:49:21.806784Z  WARN sentinel_gaia_loop::readiness: Gaia readiness NATS unavailable; continuing with scheduled EventStore scans only error=connect NATS nats://127.0.0.1:4222
+Jun 27 17:50:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:50:21.807982Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:50:21 sentinel-test-node-0 sentinel-gaia-loop[71192]: 2026-06-27T17:50:21.808657Z  INFO sentinel_gaia_loop::readiness: Gaia readiness scheduled scan complete alerts_created=1 duplicates_skipped=0 last_event_row_id=111352
+== 10.0.0.242 ==
+node=sentinel-test-node-1
+date=2026-06-27T17:50:50+00:00
+service=active
+sentinel-gaia-loop 0.1.0
+    PID   RSS %CPU COMMAND         COMMAND
+  86537 17004  0.0 sentinel-gaia-l /opt/sentinel/bin/sentinel-gaia-loop serve
+exact_claude_processes_begin
+exact_claude_processes_end
+state=
+Jun 27 17:49:25 sentinel-test-node-1 systemd[1]: Stopping sentinel-gaia-loop.service - Sentinel Gaia Console readiness loop (#442)...
+Jun 27 17:49:25 sentinel-test-node-1 systemd[1]: sentinel-gaia-loop.service: Deactivated successfully.
+Jun 27 17:49:25 sentinel-test-node-1 systemd[1]: Stopped sentinel-gaia-loop.service - Sentinel Gaia Console readiness loop (#442).
+Jun 27 17:49:25 sentinel-test-node-1 systemd[1]: Started sentinel-gaia-loop.service - Sentinel Gaia Console readiness loop (#442).
+Jun 27 17:49:25 sentinel-test-node-1 sentinel-gaia-loop[86537]: 2026-06-27T17:49:25.697895Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:25 sentinel-test-node-1 sentinel-gaia-loop[86537]: 2026-06-27T17:49:25.720164Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:25 sentinel-test-node-1 sentinel-gaia-loop[86537]: 2026-06-27T17:49:25.742207Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:25 sentinel-test-node-1 sentinel-gaia-loop[86537]: 2026-06-27T17:49:25.763457Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:49:25 sentinel-test-node-1 sentinel-gaia-loop[86537]: 2026-06-27T17:49:25.770878Z  INFO sentinel_gaia_loop::readiness: Gaia readiness recovery scan complete alerts_created=0 last_event_row_id=33567
+Jun 27 17:49:25 sentinel-test-node-1 sentinel-gaia-loop[86537]: 2026-06-27T17:49:25.772572Z  WARN sentinel_gaia_loop::readiness: Gaia readiness NATS unavailable; continuing with scheduled EventStore scans only error=connect NATS nats://127.0.0.1:4222
+Jun 27 17:50:25 sentinel-test-node-1 sentinel-gaia-loop[86537]: 2026-06-27T17:50:25.774725Z  INFO sentinel_limbo::event_store: EventStore opened READ-ONLY at /opt/sentinel/data/events.db
+Jun 27 17:50:25 sentinel-test-node-1 sentinel-gaia-loop[86537]: 2026-06-27T17:50:25.775082Z  INFO sentinel_gaia_loop::readiness: Gaia readiness scheduled scan complete alerts_created=0 duplicates_skipped=0 last_event_row_id=33570

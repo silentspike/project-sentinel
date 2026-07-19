@@ -22,6 +22,8 @@ sentinel-projection = { path = "../../crates/sentinel-projection" }
 sentinel-limbo = { path = "../../crates/sentinel-limbo" }
 # #421: deterministischer Company-Generator (lib, blake3, KEIN LLM) fuer POST /api/config/generate
 sentinel-gaia = { path = "../sentinel-gaia" }
+# #442: Gaia Console alerts/session bridge (Claude only on explicit POST /api/gaia/*).
+sentinel-gaia-loop = { path = "../sentinel-gaia-loop" }
 # Workspace-Deps
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -59,3 +61,4 @@ futures = "0.3"
 tokio = { workspace = true }
 # Auth-Gate-Test (#463): app.oneshot() braucht das tower `util`-Feature.
 tower = { version = "0.5", features = ["util"] }
+tempfile = "3"

@@ -27,10 +27,12 @@ Current first-party count:
 | `crates/sentinel-ebpf-probes` | 10 | eBPF helper calls, verifier-checked map pointers, ring-buffer writes |
 | `crates/sentinel-ebpf` | 6 | eBPF userspace ring-buffer reads, `aya::Pod`, monotonic clock FFI |
 | `crates/sentinel-fs` | 1 | `io_uring` submission queue push |
+| `crates/sentinel-sandbox` | 6 | bwrap child-FD plumbing and PID handoff |
 | `services/sentinel-nightrun` | 2 | `localtime_r` FFI and `MaybeUninit::assume_init` |
+| `services/sentinel-gaia-loop` | 1 | Process-group termination for Claude and spawned tools |
 | Other first-party sources in scope | 0 | No counted unsafe constructs |
 
-Total baseline: 19 counted unsafe constructs, all with nearby `SAFETY:`
+Total baseline: 26 counted unsafe constructs, all with nearby `SAFETY:`
 justification.
 
 ## cargo-geiger Evidence
@@ -79,5 +81,5 @@ python3 scripts/check-unsafe-baseline.py
 Expected summary:
 
 ```text
-unsafe constructs: 19 / baseline 19
+unsafe constructs: 26 / baseline 26
 ```

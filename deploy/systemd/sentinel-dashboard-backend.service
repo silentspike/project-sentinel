@@ -8,11 +8,13 @@ StartLimitIntervalSec=300
 
 [Service]
 Type=simple
+User=ubuntu
+Group=ubuntu
 WorkingDirectory=/opt/sentinel
 ExecStart=/opt/sentinel/bin/sentinel-dashboard-backend
 # Operator secret (SENTINEL_DASHBOARD_API_KEY) + login rate-limit knobs; see
 # docs/security/dashboard-key-management.md (#474). Strong deploy-specific secret, never a smoke/test key.
-EnvironmentFile=-/opt/sentinel/config/dashboard-backend.env
+EnvironmentFile=/opt/sentinel/config/dashboard-backend.env
 # #474: loopback-only secure default. On-VM access is full (incl. WebTransport); an `ssh -L`
 # tunnel is HTTP-only (WT/QUIC = UDP does not traverse a TCP tunnel; full remote console: #522).
 # Deliberate LAN/third-party exposure: override SENTINEL_DASHBOARD_*_BIND via the env-file above;
@@ -27,9 +29,26 @@ Environment=SENTINEL_PROJECTION_DB=/opt/sentinel/data/projection.db
 Environment=SENTINEL_EVENTS_DB=/opt/sentinel/data/events.db
 Environment=SENTINEL_DASHBOARD_BUNDLE_DIR=/opt/sentinel/console-dist
 Environment=SENTINEL_DASHBOARD_CERT_DIR=/opt/sentinel/console-cert
+Environment=SENTINEL_GAIA_CONSOLE_DIR=/opt/sentinel/data/gaia-console
+Environment=SENTINEL_GAIA_CLAUDE_BIN=/opt/sentinel/bin/claude
+Environment=SENTINEL_GAIA_COMPANY_CONTEXT=/opt/sentinel/config/company-context.md
+Environment=SENTINEL_CTL_BIN=/opt/sentinel/bin/sentinel-ctl
+Environment=SENTINEL_GAIA_BIN=/opt/sentinel/bin/sentinel-gaia
+Environment=SENTINEL_GAIA_MAX_BUDGET_USD=0.05
+Environment=SENTINEL_GAIA_BUDGET_WINDOW_SECS=3600
+Environment=SENTINEL_GAIA_BUDGET_WINDOW_USD=0.10
+Environment=SENTINEL_GAIA_RATE_LIMIT_REQUESTS=6
+Environment=SENTINEL_GAIA_RATE_LIMIT_WINDOW_SECS=60
+Environment=SENTINEL_GAIA_SESSION_TIMEOUT_SECS=120
 Environment=RUST_LOG=info
 Restart=on-failure
 RestartSec=5
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=15s
+MemoryMax=1536M
+TasksMax=96
+CPUQuota=200%
 
 # Logging
 StandardOutput=journal
@@ -39,9 +58,10 @@ SyslogIdentifier=sentinel-dashboard-backend
 # Security Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-# Projection-DB nur lesen (Backend oeffnet read-only); Cert-Dir schreiben (self-signed beim Start)
+# Projection-DB nur lesen (Backend oeffnet read-only); Cert-Dir schreiben
+# (self-signed beim Start); Gaia Console writes only explicit session streams.
 ReadOnlyPaths=/opt/sentinel/data /opt/sentinel/console-dist
-ReadWritePaths=/opt/sentinel/console-cert
+ReadWritePaths=/opt/sentinel/console-cert /opt/sentinel/data/gaia-console
 PrivateTmp=true
 
 [Install]
