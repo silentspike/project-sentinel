@@ -106,7 +106,7 @@ both nodes: dashboard/gaia panic or fatal lines since deploy=0
 both nodes: exact-name Claude processes after checks=0
 ```
 
-## Live Claude authentication blocker
+## Live Claude authentication recovery
 
 One minimal real request was attempted on each node after the pinned native
 client was installed. The client started from the hardened service path and
@@ -128,7 +128,40 @@ stream: authentication_failed, OAuth session expired and could not be refreshed
 claude_processes_after=0
 ```
 
-Until the `ubuntu` account's native Claude Code OAuth session is renewed on the
-test nodes, a fresh successful token-spending Deep/Setup acceptance cannot be
-claimed. Persistent dashboard authentication and all token-free API/runtime
-gates are deployed and verified.
+After the operator renewed both native Claude Code logins on 2026-07-19,
+`claude auth status` reported `loggedIn=true`, `authMethod=claude.ai` on both
+nodes. Fresh bounded Deep sessions then succeeded through the authenticated
+dashboard API. Repeating each request with the same idempotency key returned
+the same Gaia and Claude session IDs without a second provider run.
+
+```text
+.241 login_http=200 first_http=200 retry_http=200
+.241 status=succeeded exit_code=0 total_cost_usd=0.01895
+.241 gaia_session_id=gaia-deep-b3d4bbf8-7595-4657-a186-149bd284930d
+.241 same_gaia_session=true same_claude_session=true
+.241 stream_http=200 marker_count=2 claude_processes_after=0
+.242 login_http=200 first_http=200 retry_http=200
+.242 status=succeeded exit_code=0 total_cost_usd=0.003968500000000001
+.242 gaia_session_id=gaia-deep-16c772eb-9114-410e-8b34-7a5e559990dd
+.242 same_gaia_session=true same_claude_session=true
+.242 stream_http=200 marker_count=2 claude_processes_after=0
+```
+
+A fresh Setup Interview on `.242` invoked the deterministic generator once,
+produced a private config directory, and passed `sentinel-gaia validate`. Its
+idempotent retry returned the same successful session.
+
+```text
+login_http=200 first_http=200 retry_http=200
+status=succeeded exit_code=0 total_cost_usd=0.0451395
+same_gaia_session=true same_claude_session=true
+gaia_session_id=gaia-setup-d976a6ab-f502-4320-8470-07ec2eb39b30
+OK: 2 agents, 10 rooms, total room capacity 104, daemon.max_agents 2, nightrun.max_agent_id 2
+generated_files=7 company_context=present claude_processes_after=0
+dashboard=active gaia=active daemon=active
+```
+
+Post-login live token cost was USD 0.068058 total across the three distinct
+sessions. Retries did not add provider cost. Persistent dashboard auth,
+token-free API gates, native provider execution, and Setup generation are now
+deployed and live-verified.
