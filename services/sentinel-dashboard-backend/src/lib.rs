@@ -22,6 +22,7 @@ pub mod config;
 pub mod control;
 pub mod event_sub;
 pub mod events;
+pub mod gaia;
 pub mod metrics_extra;
 pub mod projection;
 pub mod tls;
@@ -80,6 +81,30 @@ pub struct Config {
     /// #474: block duration in seconds after the threshold is hit
     /// (`SENTINEL_DASHBOARD_LOGIN_BLOCK_SECS`, default 300).
     pub login_block_secs: u64,
+    /// Gaia Console data directory (#442), separate from deterministic sentinel-gaia config generation.
+    pub gaia_console_dir: String,
+    /// Claude Code binary used only for explicit Gaia Console deep/setup requests.
+    pub gaia_claude_bin: String,
+    /// sentinel-ctl binary exposed to explicit Gaia Console deep sessions through Bash.
+    pub gaia_sentinel_ctl_bin: String,
+    /// deterministic sentinel-gaia binary exposed only to setup-interview sessions.
+    pub gaia_sentinel_gaia_bin: String,
+    /// Generated company context injected as reference data into explicit Gaia sessions.
+    pub gaia_company_context_path: String,
+    /// Hard Claude Code budget cap for explicit Gaia Console sessions.
+    pub gaia_max_budget_usd: f64,
+    /// Rolling Gaia Console budget window length.
+    pub gaia_budget_window_secs: u64,
+    /// Maximum reserved/observed Claude cost across the rolling window.
+    pub gaia_budget_window_usd: f64,
+    /// Maximum number of distinct Gaia requests admitted per rate-limit window.
+    pub gaia_rate_limit_requests: usize,
+    /// Gaia request rate-limit window in seconds.
+    pub gaia_rate_limit_window_secs: u64,
+    /// Hard process timeout for explicit Gaia Console sessions.
+    pub gaia_session_timeout_secs: u64,
+    /// Optional Claude Code model override for explicit Gaia Console sessions.
+    pub gaia_model: Option<String>,
 }
 
 impl Config {
@@ -138,6 +163,35 @@ impl Config {
             login_block_secs: env("SENTINEL_DASHBOARD_LOGIN_BLOCK_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
+            gaia_console_dir: env("SENTINEL_GAIA_CONSOLE_DIR")
+                .unwrap_or_else(|| sentinel_gaia_loop::DEFAULT_CONSOLE_DIR.into()),
+            gaia_claude_bin: env("SENTINEL_GAIA_CLAUDE_BIN")
+                .unwrap_or_else(|| sentinel_gaia_loop::DEFAULT_CLAUDE_BIN.into()),
+            gaia_sentinel_ctl_bin: env("SENTINEL_CTL_BIN")
+                .unwrap_or_else(|| sentinel_gaia_loop::DEFAULT_SENTINEL_CTL_BIN.into()),
+            gaia_sentinel_gaia_bin: env("SENTINEL_GAIA_BIN")
+                .unwrap_or_else(|| sentinel_gaia_loop::DEFAULT_SENTINEL_GAIA_BIN.into()),
+            gaia_company_context_path: env("SENTINEL_GAIA_COMPANY_CONTEXT")
+                .unwrap_or_else(|| sentinel_gaia_loop::DEFAULT_COMPANY_CONTEXT_PATH.into()),
+            gaia_max_budget_usd: env("SENTINEL_GAIA_MAX_BUDGET_USD")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(sentinel_gaia_loop::DEFAULT_MAX_BUDGET_USD),
+            gaia_budget_window_secs: env("SENTINEL_GAIA_BUDGET_WINDOW_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(sentinel_gaia_loop::DEFAULT_BUDGET_WINDOW_SECS),
+            gaia_budget_window_usd: env("SENTINEL_GAIA_BUDGET_WINDOW_USD")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(sentinel_gaia_loop::DEFAULT_BUDGET_WINDOW_USD),
+            gaia_rate_limit_requests: env("SENTINEL_GAIA_RATE_LIMIT_REQUESTS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6),
+            gaia_rate_limit_window_secs: env("SENTINEL_GAIA_RATE_LIMIT_WINDOW_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+            gaia_session_timeout_secs: env("SENTINEL_GAIA_SESSION_TIMEOUT_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(sentinel_gaia_loop::DEFAULT_SESSION_TIMEOUT_SECS),
+            gaia_model: env("SENTINEL_GAIA_MODEL"),
         }
     }
 }
@@ -159,10 +213,15 @@ pub struct AppState {
     pub broadcast_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
     /// Event-Log CAS-Plane (#464): append-only Block-Log fuer den WT-Bi-Stream.
     pub event_cas: Arc<Mutex<cas::EventLogCasPlane>>,
+    pub gaia_request_limiter: gaia::GaiaRequestLimiter,
 }
 
 impl AppState {
     pub fn new(config: Config) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            config.gaia_rate_limit_requests > 0 && config.gaia_rate_limit_window_secs > 0,
+            "Gaia request rate-limit values must be greater than zero"
+        );
         // Kapazitaet 256: ueberlaeuft ein langsamer Client, liefert `recv()` `Lagged` — der naechste
         // Voll-Snapshot ist ohnehin autoritativ (reconcile), also tolerierbar.
         let (broadcast_tx, _) = tokio::sync::broadcast::channel(256);
@@ -178,6 +237,10 @@ impl AppState {
             config.login_window_secs,
             config.login_block_secs,
         );
+        let gaia_request_limiter = gaia::GaiaRequestLimiter::new(
+            config.gaia_rate_limit_requests,
+            std::time::Duration::from_secs(config.gaia_rate_limit_window_secs),
+        );
         Ok(Self {
             sessions: auth::SessionStore::new(),
             login_limiter,
@@ -189,6 +252,7 @@ impl AppState {
             saved_rate_limit: Arc::new(tokio::sync::Mutex::new(None)),
             broadcast_tx,
             event_cas: Arc::new(Mutex::new(cas::EventLogCasPlane::new())),
+            gaia_request_limiter,
         })
     }
 }
@@ -288,6 +352,17 @@ pub fn build_app(state: AppState) -> axum::Router {
             auth::require_auth,
         ));
 
+    let gaia_routes = axum::Router::new()
+        .route("/alerts", get(gaia::alerts))
+        .route("/sessions", get(gaia::sessions))
+        .route("/sessions/{id}/stream", get(gaia::session_stream))
+        .route("/deep", post(gaia::deep))
+        .route("/setup-interview", post(gaia::setup_interview))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+
     let api = axum::Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -308,7 +383,8 @@ pub fn build_app(state: AppState) -> axum::Router {
         .merge(read_routes)
         .nest("/control", control_routes)
         .nest("/operator", operator_routes)
-        .nest("/config", config_routes);
+        .nest("/config", config_routes)
+        .nest("/gaia", gaia_routes);
 
     axum::Router::new()
         .nest("/api", api)

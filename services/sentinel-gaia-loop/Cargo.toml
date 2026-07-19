@@ -1,0 +1,36 @@
+[package]
+name = "sentinel-gaia-loop"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Reactive Gaia Console readiness loop and Claude Code session bridge (#442)"
+
+[lib]
+name = "sentinel_gaia_loop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sentinel-gaia-loop"
+path = "src/main.rs"
+
+[dependencies]
+sentinel-common = { path = "../../crates/sentinel-common" }
+sentinel-limbo = { path = "../../crates/sentinel-limbo" }
+anyhow = { workspace = true }
+async-nats = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+fs2 = "0.4"
+libc = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,5 +1,34 @@
 # Benchmark Results
 
+## Issue 442 - Gaia Console Readiness And Native Sessions
+
+Date: 2026-07-18
+
+Infrastructure:
+
+- Remote Rust gates and release builds ran through `cargo remote` on `.155`.
+- Runtime benchmarks ran directly on `ubuntu@10.0.0.241`; `.240` was not used.
+- Native Claude Code `2.1.214` (ELF) was used; Node.js/npm were absent.
+
+Results:
+
+| Benchmark | Result |
+| --- | ---: |
+| Readiness idle duration / samples | 3602 s / 61 |
+| Readiness average CPU | 0.000833% |
+| Readiness RSS min / avg / max | 9368 / 9368 / 9368 KiB |
+| Claude processes across idle samples | 0 |
+| Event to in-console alert latency | 22 s |
+| Deep + resume | 31,496 token accounting units / USD 0.0206505 |
+| Complete setup | 12,267 token accounting units / USD 0.0197928 |
+| Dashboard stream proof | 4,119 token accounting units / USD 0.004407 |
+
+Native installation smokes cost USD 0.027488 and the final environment-hardening
+smoke cost USD 0.004439. Accepted native verification cost USD 0.0767773 in
+total. A failed pre-fix diagnostic cost USD 0.0642571 and is reported but
+excluded from accepted-session metrics. Command/output evidence and the raw
+61-row idle sample set are committed under `console/evidence/issue-442-live/`.
+
 ## Issue 443 - Gaia Console Memory
 
 Date: 2026-06-27

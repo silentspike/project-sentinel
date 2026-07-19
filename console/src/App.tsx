@@ -18,6 +18,7 @@ import { MetricsView } from "./views/MetricsView";
 import { ProfilingView } from "./views/ProfilingView";
 import { TimeTravelView } from "./views/TimeTravelView";
 import { GaiaWizardView } from "./views/GaiaWizardView";
+import { GaiaConsoleView } from "./views/GaiaConsoleView";
 import { AgentEditorView } from "./views/AgentEditorView";
 import { ConfigEditorView } from "./views/ConfigEditorView";
 import { SynthesisView } from "./views/SynthesisView";
@@ -33,7 +34,7 @@ function useIsMobile() {
   return m;
 }
 
-const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "profiling", "cockpit", "activity", "chaos", "chat", "control", "timetravel", "gaia-wizard", "agent-editor", "config-editor", "synthesis", "cost", "org-chart", "agent-deep"];
+const MOBILE_PANELS: PanelKind[] = ["agents", "floorplan", "metrics", "profiling", "cockpit", "activity", "chaos", "chat", "control", "timetravel", "gaia-wizard", "gaia-console", "agent-editor", "config-editor", "synthesis", "cost", "org-chart", "agent-deep"];
 const PANEL_LABEL: Record<PanelKind, string> = {
   agents: "Agents",
   floorplan: "Floorplan",
@@ -46,6 +47,7 @@ const PANEL_LABEL: Record<PanelKind, string> = {
   control: "Control",
   timetravel: "Zeitreise",
   "gaia-wizard": "Gaia Wizard",
+  "gaia-console": "Gaia Console",
   "agent-editor": "Agent Editor",
   "config-editor": "Config Editor",
   synthesis: "Synthesis",
@@ -98,6 +100,7 @@ const PANELS: Record<PanelKind, () => JSX.Element> = {
   control: ControlView,
   timetravel: TimeTravelView,
   "gaia-wizard": GaiaWizardView,
+  "gaia-console": GaiaConsoleView,
   "agent-editor": AgentEditorView,
   "config-editor": ConfigEditorView,
   synthesis: SynthesisView,
