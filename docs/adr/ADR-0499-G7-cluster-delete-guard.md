@@ -1,112 +1,145 @@
-# ADR-0499: ClusterDeleteGuard — destructive-GC enablement (G7 / G-DELETE)
+# ADR-0499: Two-stage ClusterDeleteGuard enablement (G7)
 
-- **Gate:** G7 / G-DELETE (blocks #499b)
-- **Status:** Proposed
-- **Primary issue:** #499 (cluster CAS GC) — the destructive half #499b
-- **Related issues / gates:** G2 (block map = locator), #498 (block map), #501 (move), V8
-- **Supersedes / Superseded by:** —
+- **Gate:** G7 / G-DELETE
+- **Status:** Accepted
+- **Primary issues:** #499 (#499a dry-run) and #547 (#499b destructive)
+- **Related gates:** G2, ADR-2, ADR-3, G4, G5
 
-> **N-node-native rule:** all schemas/messages/APIs MUST be `NodeId`-keyed, never a hard
-> source/target pair. Two nodes are the first test, not the ceiling.
+> Even though the foundation is verified on a two-node cluster first, all schemas,
+> messages, and APIs are N-node-native and keyed by `NodeId`. Two nodes are the first
+> test, not the cluster model.
 
 ## Context
 
-Cluster GC must cover **every** destructive path, not just one. The `rg` inventory shows
-**≥11** delete/prune/gc paths: `prune_batch` (event-prune #250,
-`crates/sentinel-limbo/src/event_store.rs:1182`), `delete_world_snapshot:1526`
-(snapshot-prune), `delete_orphan_outbox:1264`, personality_evolution retention
-(`services/sentinel-daemon/src/orchestrator.rs:62` agent-field + `:89` global, both
-`DELETE FROM personality_evolution`), `gc_trash`
-(`crates/sentinel-fs/src/metadata.rs:619`), `CasStore::remove`
-(`crates/sentinel-fs/src/cas.rs:112`), `CasStore::gc:124`, `gc_chunks`
-(`crates/sentinel-fs/src/gc.rs:20`), `gc_trash` (ArtifactPlane, `gc.rs:57`), plus the
-projection DELETE. The dead-branch GC (#493) lives inside `prune_batch`. After a move
-A(node-0→node-1), node-0's tiered retention (#250) would prune A's events/snapshots →
-node-1's time-travel/pull breaks → **#250/#493 are NOT cluster-safe multi-node**.
+Sentinel has multiple event, snapshot, CAS, outbox, retention, and derived-view delete
+paths. Cross-node visibility is incomplete, and the real migration/GC contention race
+does not exist until #501. Treating a non-destructive query as proof of safe deletion
+would create a false safety claim.
 
 ## Problem
 
-How is every destructive path made cluster-safe so a delete never removes data another
-node still references, without distributed consensus?
+How does Sentinel introduce cluster-wide reference decisions early while preventing
+any destructive enablement before the real migration race and commit-time authority
+checks are proven?
 
 ## Decision
 
-**One `ClusterDeleteGuard::decide` that every destructive path routes through, over the
-complete `rg` delete inventory, with a fail-safe "keep on uncertainty" rule.**
+G7 has two explicit acceptance stages.
 
-- **Central guard:** no path calls delete/prune/remove directly — all go through
-  `ClusterDeleteGuard::decide(DeleteKind, …) -> { AllowedLocalOnly |
-  AllowedClusterSafe | BlockedByRemoteRef | BlockedByUncertainty | ForbiddenUntilTrackH
-  }`.
-- **Pre-classification (canonical vs. derived):** canonical/non-rebuildable
-  (events/snapshots/CAS/personality_evolution) → cluster-ref-check **mandatory**;
-  derived/rebuildable (projections / incidents / terminal-actions → node-local-safe).
-  The complete inventory is enumerated by `rg` (≥11 known), and **every** path is
-  classified — not "all 8".
-- **Light cluster-ref query (V8), not consensus:** a destructive path asks the block map
-  (#498) + remote snapshot pins (gossip): *"does any node reference/pin this hash?"*.
-  Delete only when: no local refs/pins/manifests, no in-transit pins, remote query says
-  "no known refs", and **uncertainty/timeout/unknown-node → KEEP**. The block map is a
-  **locator, never liveness** (G2/V8).
-- **CI gate:** a new delete path that is not registered with a `DeleteKind` fails CI.
-- **Mandatory metrics (V8):** `blocked_by_uncertainty_count`,
-  `blocked_by_unknown_node_count`, `blocked_by_remote_timeout_count`,
-  `oldest_blocked_gc_age`.
-- **Ordering:** #499b (destructive) is **mandatory after #501** (the real move path) —
-  the most dangerous race (migration ∥ GC) must be tested against a real move.
+### Stage A: #499a query, pin, and dry-run
 
-## Non-Goals
+Stage A may be built before or in parallel with #501. It provides:
 
-- The non-destructive query/pin infra + dry-run GC = **#499a** (Phase 6.5, may be built
-  before #501).
-- CAS replication/repair (G-D3) and forced-failover evacuation (Track D2).
+- a complete repository-derived deletion inventory;
+- `DeleteKind` classification as canonical/non-rebuildable or derived/rebuildable;
+- a CI registration gate for new delete paths;
+- authenticated remote reference and pin queries;
+- local snapshot and #497 in-transit pin visibility;
+- conservative dry-run decisions and keep-reason metrics.
 
-## Data Types
+Stage A cannot invoke deletion. `AllowedClusterSafe` means only that the dry-run
+decision would permit a future guarded delete under the observed inputs. It is not a
+destructive authorization.
 
-`DeleteKind` enum (one per inventory path), `ClusterDeleteGuard`, `DeleteDecision`
-(above). Reuses `BlockRef` (G2) for the ref query and the `CLUSTER_PINS` table (ADR-3).
+Uncertainty, timeout, unknown member, incomplete reply, stale generation/term, or
+conflicting authority always returns a typed keep decision.
 
-## State Machine / Protocol
+### Stage B: #547/#499b destructive guard
 
-`decide`: local-ref/pin check → in-transit-pin check → remote ref/pin query → decision.
-Any failure/timeout/unknown → `BlockedByUncertainty`/`BlockedByUnknownNode`/
-`BlockedByRemoteTimeout` (keep).
+Stage B begins only after #501 is merged and live-verified. Every destructive path must
+route through `ClusterDeleteGuard`. At destructive commit time it revalidates:
 
-## Failure Modes
+- registered `DeleteKind` and canonical/derived class;
+- current local refs, manifests, and pins;
+- current in-transit pins;
+- authenticated remote query completeness;
+- current owner/coordinator generation and any required migration state;
+- absence of uncertainty.
 
-- **Migration ∥ GC race:** in-transit pin (from #497) + the remote-ref query make a
-  delete of an in-flight blob impossible; tested live with the #501 move path.
-- **Remote node unreachable:** `BlockedByUnknownNode` → keep (never delete on missing
-  information).
-- **Unregistered delete path:** CI fails (no silent bypass).
+Only Stage B may execute deletion. Its acceptance must include the real #501
+migration-versus-GC race and prove that no registered path bypasses the guard.
 
-## Tests
+## Inventory contract
 
-No delete of a foreign-referenced blob (2-VM); no delete of a remote-pinned blob;
-**migration ∥ GC race tested with the real #501 move**; after all refs gone → deletable;
-the V8 metrics present; a per-`DeleteKind` registration test.
+The inventory is generated from a fresh repository search and checked into an
+auditable artifact. It includes every direct delete/prune/remove/GC path, not a fixed
+historical count. Each path maps to exactly one `DeleteKind` and classification.
+
+Canonical/non-rebuildable data requires the cluster decision. Derived/rebuildable
+data may be explicitly local-only only when its reconstruction contract is documented.
+An unregistered new path fails CI.
+
+## Query contract
+
+The block map is a locator, never liveness or consensus. The dry-run decision combines:
+
+1. local refs, manifests, and pins;
+2. local in-transit pins;
+3. authenticated remote reference/pin replies;
+4. membership completeness and authority generation.
+
+The in-memory control cache is reply deduplication only. Query correlation and
+authentication use the ADR-2 handler context and request digest.
+
+## Observability
+
+Stage A records, at minimum:
+
+- candidate decision by `DeleteKind`;
+- blocked-by-remote-reference count;
+- blocked-by-uncertainty count;
+- blocked-by-unknown-node count;
+- blocked-by-remote-timeout count;
+- oldest blocked age;
+- query retries/failures and response completeness.
+
+Dry-run evidence includes before/after object counts or hashes proving no object was
+removed.
+
+## Failure modes
+
+- **Remote node unavailable:** conservative keep.
+- **Conflicting authority/generation:** conservative keep and alert.
+- **In-transit migration pin:** conservative keep.
+- **New unregistered delete path:** CI failure.
+- **Stage A code attempts deletion:** test/static gate failure.
+- **Stage B authority changes before commit:** commit recheck rejects and keeps.
+
+## Tests and evidence
+
+### Stage A acceptance
+
+- Fresh inventory and per-path classification.
+- Deliberately unregistered path fails the CI gate.
+- Two-node remote reference/pin and timeout/unknown-member keep evidence.
+- In-transit pin visibility.
+- Dry-run output plus byte/object immutability proof.
+- Under CAS-pull/tick contention: zero false-positive dry-run decisions.
+
+Stage A makes no zero-false-delete claim because it deletes nothing.
+
+### Stage B acceptance
+
+- Every registered destructive path passes through the guard.
+- Commit-time authority/reference/pin rechecks.
+- Real #501 migration in parallel with destructive GC.
+- No destructive action under uncertainty or stale authority.
+- Only after these tests may evidence state a false-delete result.
 
 ## Benchmarks
 
-GC latency with the cluster query p50/p95; bug-finder **0 false delete under
-migration**; sweep blob-count 1k/10k/100k + node-count. Register:
-`sentinel-fs-cluster-cas-gc (#499)`.
+Stage A reports cross-node query and dry-run scan p50/p95/p99/max plus retries/failures
+and system sidecars. Stage B separately measures guarded delete latency and the real
+migration contention scenario. Benchmarks run on test VMs, never the Rust build server.
 
-## Backward Compatibility
+## Consequences
 
-The guard wraps existing delete paths behavior-preservingly first (local-only decision
-= today's behavior), then the cluster-ref check activates. No data format change.
+- Useful query/pin infrastructure does not wait for the migration implementation.
+- Destructive authority cannot accidentally arrive with the dry-run phase.
+- Public evidence distinguishes decision correctness from deletion correctness.
 
-## Security
+## Public claim boundary
 
-Single trust domain (Track A). The ref query is a light read, not a mutation; no 0-RTT.
-
-## Public Claim Boundary
-
-- May claim after #499b: cluster-safe destructive GC across the full delete inventory.
-- **May NOT claim:** cluster-safe deletion before #501 exists (the race would be
-  untested); #250/#493 are explicitly not multi-node-safe until this guard covers them.
-
-## Open Follow-ups
-
-- #499a non-destructive query/pin infra; G-D3 CAS replication so evacuation has targets.
+After #499a, Sentinel may claim conservative cross-node reference/pin queries and
+non-destructive dry-run decisions. It may not claim cluster-safe deletion or zero false
+deletes. Those claims remain blocked until #547/#499b completes after #501.
