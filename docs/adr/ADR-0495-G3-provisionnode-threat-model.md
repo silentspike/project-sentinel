@@ -25,7 +25,7 @@ primitive, MITM'd on first contact, or used to copy secrets?
 
 ## Decision
 
-**Allowlist-only targets, out-of-band host-key pinning, CSR-not-key-copy certs,
+**Allowlist-only targets, out-of-band host-key pinning, target-local private keys,
 repo-templated token-gates, role separation, short-lived bootstrap credential.**
 
 - **Pending-target allowlist (V14):** the command is `ProvisionNode { pending_target_id,
@@ -38,12 +38,16 @@ repo-templated token-gates, role separation, short-lived bootstrap credential.**
   unauthenticated by cloud-init. **Precondition:** `qemu-guest-agent` is installed +
   active in the bare image and the Proxmox channel is declared trusted out-of-band —
   otherwise AC-S1 is not executable. The seed pins the key.
-- **Certs via CSR, never key copy:** the target generates its **private key locally**
-  and sends only a CSR/public key to the seed; the seed signs and returns only the
-  cert/CA/config. **Node private keys are never scp'd.**
-- **No secret transfer:** binary + config + systemd + cert go over; **no LLM API keys /
-  `.env` / secrets**. `/etc/sentinel/allow-llm` is deliberately absent so gateway/judge
-  stay condition-blocked.
+- **Pinned certs, never key copy:** the verified target daemon binary generates or
+  loads its self-signed QUIC identity **on the target** and returns only the public
+  certificate fingerprint. The seed binds that fingerprint one-to-one to the assigned
+  `NodeId` in its durable dynamic-peer registry; the target config pins the seed's
+  `NodeId`, address, and fingerprint. **Node private keys are never scp'd.** Track A
+  deliberately uses explicit pinned trust; CA issuance/rotation remains Track D2/H.
+- **No secret transfer:** binary + config + systemd + token gates go over; the private
+  key and self-signed certificate are created on the target. **No LLM API keys / `.env`
+  / secrets** are transferred. `/etc/sentinel/allow-llm` is deliberately absent so
+  gateway/judge stay condition-blocked.
 - **Token-gate drop-ins from a repo template (single variant):** the gateway/judge/
   health-monitor `ConditionPathExists=/etc/sentinel/allow-llm` drop-ins are **VM-side
   drift, not in the repo** (`deploy/systemd/sentinel-gateway.service` has no such
@@ -73,18 +77,30 @@ repo-templated token-gates, role separation, short-lived bootstrap credential.**
 
 ## State Machine / Protocol
 
-`ProvisionOp`: `Idle → VerifyTarget → PinHostKey → PushBinary(sha256) → IssueCert(CSR)
-→ RenderConfig+TokenGates → StartDaemon → AwaitHealth → ObserveJoin → NodeProvisioned`
-(each step idempotent + recoverable; chef/target restart mid-bootstrap reconciles).
+`ProvisionOp`: `Idle -> VerifyTarget -> PinHostKey -> PushBinary(sha256) ->
+IssueCert(target-local key) -> RenderConfig+TokenGates+reciprocal peer pins ->
+StartDaemon -> AwaitHealth -> ObserveAuthenticatedJoin -> NodeProvisioned`.
+Individual transport operations are convergent within a running worker. Durable
+operation recovery across a seed restart remains tied to the ADR-3 `PROVISION_OPS`
+store; the current in-memory operation map must not be described as restart-durable.
+
+`ObserveAuthenticatedJoin` polls the seed's receiver-local membership view. A running
+systemd unit is necessary but insufficient: completion requires an accepted heartbeat
+whose payload `node_id` equals the NodeId bound to the presented certificate. Timeout
+stops the target service and revokes the seed-side dynamic peer entry.
 
 ## Failure Modes
 
-- **Half-deploy (AC-S4/B6):** error mid-bootstrap → defined cleanup (service stopped,
+- **Half-deploy (AC-S4/B6):** error mid-bootstrap -> defined cleanup (service stopped,
   partial artifacts removed, node NOT in membership) or `Quarantined/ProvisionFailed`.
   Tested with real `qm snapshot`/`qm rollback` of the fresh test VM (S9). `qm rollback`
   is the **provision drill only**, never migration-failure recovery.
 - **Host-key mismatch:** target rejected (pinned key ≠ presented key).
-- **NodeId collision (AC-S5):** `ProvisionNode` with an already-assigned `NodeId` →
+- **NodeId/certificate collision (AC-S5):** the dynamic peer registry rejects a
+  certificate already bound to another NodeId and a NodeId already bound to another
+  certificate. A heartbeat claiming a NodeId other than its authenticated binding is
+  typed-rejected.
+- **NodeId collision (AC-S5):** `ProvisionNode` with an already-assigned `NodeId` ->
   reject (no split identity).
 - **Re-run (AC-S2/B5):** idempotent — second run is a no-op/convergent (no double
   deploy, no second membership entry).
@@ -93,7 +109,8 @@ repo-templated token-gates, role separation, short-lived bootstrap credential.**
 
 AC-S1..S6 + AC-B1..B7 on a real second VM: target starts without Sentinel (B1);
 allowlist-only (B2); seed deploys binary/config/systemd/certs/token-gates (B3); target
-self-registers (B4); idempotent re-run (B5/S2); failed bootstrap → no alive node
+self-registers through an authenticated heartbeat observed by the seed (B4);
+idempotent re-run (B5/S2); failed bootstrap -> no alive node
 (B6/S4); no secrets/token (B7/S3); host-key pinned (S1); cred lifecycle (S6); NodeId
 collision rejected (S5).
 
@@ -110,8 +127,9 @@ token-gate template is new (no existing unit changed).
 ## Security
 
 This whole ADR **is** the security boundary for onboarding. Single trust domain (Track
-A); revocation/quarantine are Track D2/H. No secret transfer; CSR-not-key; allowlist;
-out-of-band host-key.
+A); revocation/quarantine are Track D2/H. No secret transfer; allowlist; out-of-band
+host-key; target-local private key; certificate fingerprint bound to the assigned
+NodeId.
 
 ## Public Claim Boundary
 
@@ -122,4 +140,5 @@ out-of-band host-key.
 
 ## Open Follow-ups
 
-- Cert rotation/revocation/quarantine (Track D2/H); CA lifecycle.
+- Cert rotation/revocation/quarantine and CA lifecycle (Track D2/H). Track A uses
+  explicit self-signed certificate pins.

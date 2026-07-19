@@ -9,8 +9,9 @@
 //! [`StubHandler`]. The real owner/GC handler logic lands with #496 / #499; the QUIC
 //! server + client transport is wired on top of these types.
 //!
-//! **Bounded scope (ADR-2):** node→node only, **after** a node has joined; the
-//! bare-shell bootstrap (#495) stays on SSH. 0-RTT is off for control (V18).
+//! **Bounded scope (ADR-2):** node-to-node only once the target daemon is running;
+//! the bare-shell bootstrap (#495) stays on SSH, and the first authenticated
+//! membership heartbeat completes the join. 0-RTT is off for control (V18).
 
 pub mod block_pull;
 pub mod cert;
@@ -32,4 +33,4 @@ pub use envelope::{
 };
 pub use handler::{BlockMapGossipHandler, ControlHandler, StubHandler};
 pub use idempotency::IdempotencyCache;
-pub use server::ControlServer;
+pub use server::{AuthenticatedPeer, ControlServer, PeerRegistry};

@@ -1,8 +1,8 @@
 //! Cluster membership: a lightweight heartbeat-based liveness view (V13).
 //!
-//! Each node periodically publishes a [`Heartbeat`] (over Zenoh — the transport is
-//! wired in a later step); a [`MembershipView`] ingests them and tracks each node's
-//! liveness (`Alive → Suspect → Dead`, plus an explicit `Left`).
+//! Each node periodically sends a [`Heartbeat`] over the cert-pinned QUIC control
+//! plane; a [`MembershipView`] ingests them and tracks each node's liveness
+//! (`Alive → Suspect → Dead`, plus an explicit `Left`).
 //!
 //! **Membership reports liveness only** — it never decides ownership (V2): "Alive"
 //! implies nothing about voting / owner / schedulable. The owner registry and the
@@ -30,7 +30,7 @@ pub enum MembershipState {
     Left,
 }
 
-/// A liveness heartbeat published by a node (the Zenoh wire message). Carries the
+/// A liveness heartbeat published by a node. Carries the
 /// ABA guards `boot_id` (fresh per process boot) + `incarnation` (monotonic within
 /// a boot). It deliberately carries **no trusted wall-clock** — recency is the
 /// receiver's local clock.
@@ -40,7 +40,7 @@ pub struct Heartbeat {
     pub alias: String,
     pub boot_id: Uuid,
     pub incarnation: u64,
-    /// Reachable endpoints (QUIC control / Zenoh). Informational for the view.
+    /// Reachable QUIC control endpoints. Informational for the view.
     #[serde(default)]
     pub endpoints: Vec<String>,
 }
@@ -195,6 +195,12 @@ impl MembershipView {
             .values()
             .filter(|n| n.state == MembershipState::Alive)
             .collect()
+    }
+
+    /// Iterate over every known membership record for observability and transition
+    /// detection. The view remains the sole mutation owner.
+    pub fn records(&self) -> impl Iterator<Item = &NodeMembership> {
+        self.nodes.values()
     }
 
     pub fn len(&self) -> usize {

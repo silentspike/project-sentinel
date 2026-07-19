@@ -4,7 +4,7 @@
 //! stream, reusing the dashboard `wt.rs` u32-BE length-prefixed frame format. The
 //! `idempotency_key` makes a re-sent RPC an exactly-once effect (V5/V39).
 
-use sentinel_common::HolderAdvertisement;
+use sentinel_common::{Heartbeat, HolderAdvertisement, NodeId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -38,6 +38,12 @@ impl ControlEnvelope {
 /// the transport, envelope, idempotency and cert-pinning can be built + verified now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlRequest {
+    /// Liveness-only membership heartbeat. Unlike effectful control RPCs, this request
+    /// must bypass response deduplication so every arrival refreshes receiver-local time.
+    MembershipHeartbeat {
+        cluster_id: Uuid,
+        heartbeat: Heartbeat,
+    },
     /// G1/V1: the chef asks the source to prepare a scoped handoff at an epoch.
     PrepareHandoff { scope: String, epoch: u64 },
     /// V1: the source's durable acknowledgement that it has retired the scope.
@@ -65,12 +71,20 @@ impl ControlRequest {
     pub fn method_name(&self) -> &'static str {
         match self {
             Self::PrepareHandoff { .. } => "prepare_handoff",
+            Self::MembershipHeartbeat { .. } => "membership_heartbeat",
             Self::SourceRetiredAck { .. } => "source_retired_ack",
             Self::OwnerCommit { .. } => "owner_commit",
             Self::RefQuery { .. } => "ref_query",
             Self::PinQuery { .. } => "pin_query",
             Self::AdvertiseHolders { .. } => "advertise_holders",
         }
+    }
+
+    /// Whether the server may reuse a cached reply for this request. Membership
+    /// heartbeats are observations, not exactly-once effects: every received packet
+    /// must reach the handler to refresh liveness and must not grow the dedup cache.
+    pub fn cache_response(&self) -> bool {
+        !matches!(self, Self::MembershipHeartbeat { .. })
     }
 }
 
@@ -85,6 +99,10 @@ pub struct ControlReply {
 /// / unauthorized / failed request (a typed reject, never a panic — AC-3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlResponse {
+    MembershipAccepted {
+        node_id: NodeId,
+        incarnation: u64,
+    },
     HandoffPrepared {
         scope: String,
         epoch: u64,
@@ -219,6 +237,27 @@ mod tests {
         let frame = encode_frame(&env).unwrap();
         let back: ControlEnvelope = decode_frame(&frame).unwrap();
         assert_eq!(env, back, "holder gossip survives the wire codec");
+    }
+
+    #[test]
+    fn membership_heartbeat_frame_roundtrip_and_cache_policy() {
+        use sentinel_common::{Heartbeat, NodeId};
+
+        let request = ControlRequest::MembershipHeartbeat {
+            cluster_id: Uuid::new_v4(),
+            heartbeat: Heartbeat {
+                node_id: NodeId::new(),
+                alias: "node-1".into(),
+                boot_id: Uuid::new_v4(),
+                incarnation: 4,
+                endpoints: vec![],
+            },
+        };
+        assert!(!request.cache_response());
+        let envelope = ControlEnvelope::new("same-key", request.clone());
+        let frame = encode_frame(&envelope).unwrap();
+        let decoded: ControlEnvelope = decode_frame(&frame).unwrap();
+        assert_eq!(decoded.request, request);
     }
 
     #[test]

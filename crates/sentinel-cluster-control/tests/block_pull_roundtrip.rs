@@ -2,11 +2,12 @@
 //! over loopback, exercising pull-by-hash, a miss, and mutual cert-pinning (V10). Proves
 //! the byte-path transport without a VM; the cross-host 2-VM ACs run after deploy.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
-use sentinel_cluster_control::{BlockProvider, BlockPullClient, BlockPullServer, NodeCertificate};
-use sentinel_common::BlockRef;
+use sentinel_cluster_control::{
+    BlockProvider, BlockPullClient, BlockPullServer, NodeCertificate, PeerRegistry,
+};
+use sentinel_common::{BlockRef, NodeId};
 
 fn loopback() -> std::net::SocketAddr {
     "127.0.0.1:0".parse().unwrap()
@@ -39,9 +40,8 @@ async fn pull_by_hash_roundtrip_miss_and_server_pin() {
     });
 
     // The server pins the client (V10).
-    let mut pins = HashSet::new();
-    pins.insert(client_fp);
-    let server = BlockPullServer::bind(loopback(), &server_node, pins, provider).unwrap();
+    let peers = PeerRegistry::new([(client_fp, NodeId::new())]).unwrap();
+    let server = BlockPullServer::bind(loopback(), &server_node, peers, provider).unwrap();
     let addr = server.local_addr();
     let client = BlockPullClient::new(&client_node).unwrap();
 
@@ -80,9 +80,12 @@ async fn server_rejects_an_unpinned_client() {
     });
 
     // The server pins only some OTHER cert, never the stranger.
-    let mut pins = HashSet::new();
-    pins.insert(NodeCertificate::generate("allowed").unwrap().fingerprint());
-    let server = BlockPullServer::bind(loopback(), &server_node, pins, provider).unwrap();
+    let peers = PeerRegistry::new([(
+        NodeCertificate::generate("allowed").unwrap().fingerprint(),
+        NodeId::new(),
+    )])
+    .unwrap();
+    let server = BlockPullServer::bind(loopback(), &server_node, peers, provider).unwrap();
     let client = BlockPullClient::new(&stranger).unwrap();
 
     // The handshake succeeds, but the server closes the connection on the unpinned
