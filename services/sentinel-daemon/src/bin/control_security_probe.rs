@@ -7,7 +7,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context};
 use sentinel_cluster_control::{
-    ControlClient, ControlEnvelope, ControlRequest, ControlResponse, NodeCertificate,
+    ControlClient, ControlEnvelope, ControlRequest, ControlResponse, NodeCertificate, PeerRegistry,
 };
 use sentinel_common::{BlockRef, HolderAction, HolderAdvertisement, NodeId};
 use sentinel_daemon::config::DaemonConfig;
@@ -41,11 +41,14 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| cluster.node_id.to_string());
     let identity = NodeCertificate::load_or_generate(&cert_path, &key_path, &local_alias)?;
-    let client = ControlClient::new(&identity)?;
     let peer_addr = peer.addr.parse().context("peer address is invalid")?;
     let peer_fingerprint =
         sentinel_cluster_control::CertFingerprint::from_hex(&peer.cert_fingerprint)
             .context("peer certificate fingerprint is invalid")?;
+    let client = ControlClient::new(
+        &identity,
+        PeerRegistry::new([(peer_fingerprint, peer.node_id)])?,
+    )?;
 
     let conflict_key = format!("security-idempotency-{}", Uuid::new_v4());
     let first = ControlEnvelope::new(

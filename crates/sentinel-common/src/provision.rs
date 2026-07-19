@@ -26,7 +26,7 @@ pub enum ProvisionOpState {
     PinningHostKey,
     /// Push the sha256-verified `sentinel-daemon` binary.
     PushingBinary,
-    /// Issue the node cert from the target's CSR (CSR, never private-key copy).
+    /// Generate the node identity on the target; the private key never leaves it.
     IssuingCert,
     /// Render `daemon.toml` + systemd units + the #517 token-gate drop-ins.
     RenderingConfig,

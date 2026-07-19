@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let server_fingerprint = server_identity.fingerprint();
     let client_fingerprint = client_identity.fingerprint();
     let peers = PeerRegistry::new([(client_fingerprint, client_node_id)])?;
+    let client_peers = PeerRegistry::new([(server_fingerprint, server_node_id)])?;
     let membership = Arc::new(MembershipRuntime::new(Default::default()));
     let handler = QuicMembershipHandler::new(
         cluster_id,
@@ -75,8 +76,8 @@ async fn main() -> anyhow::Result<()> {
             encoded: encoded.clone(),
         }),
     )?;
-    let control_client = ControlClient::new(&client_identity)?;
-    let pull_client = BlockPullClient::new(&client_identity)?;
+    let control_client = ControlClient::new(&client_identity, client_peers.clone())?;
+    let pull_client = BlockPullClient::new(&client_identity, client_peers.clone())?;
     let control_session = control_client
         .connect(control_server.local_addr(), server_fingerprint)
         .await?;
@@ -179,10 +180,80 @@ async fn main() -> anyhow::Result<()> {
         pull_client
             .pull(pull_server.local_addr(), server_fingerprint, &block_ref)
             .await?
-            == Some(encoded),
+            == Some(encoded.clone()),
         "block pull did not recover after explicit re-authorization"
     );
     println!("EXPLICIT_REAUTH_RECOVERED control=true block_pull=true");
+
+    let outbound_control_session = control_client
+        .connect(control_server.local_addr(), server_fingerprint)
+        .await?;
+    let outbound_pull_session = pull_client
+        .connect(pull_server.local_addr(), server_fingerprint)
+        .await?;
+    let outbound_closed = client_peers.revoke(server_node_id);
+    ensure!(
+        outbound_closed == 2,
+        "expected two outbound sessions to close, got {outbound_closed}"
+    );
+    println!("OUTBOUND_SESSIONS_REVOKED count={outbound_closed}");
+
+    ensure!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            outbound_control_session.rpc(&heartbeat(cluster_id, client_node_id, 5)),
+        )
+        .await
+        .context("revoked outbound control session did not terminate")?
+        .is_err(),
+        "revoked outbound control session opened another stream"
+    );
+    ensure!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            outbound_pull_session.pull(&block_ref),
+        )
+        .await
+        .context("revoked outbound pull session did not terminate")?
+        .is_err(),
+        "revoked outbound pull session opened another stream"
+    );
+    ensure!(
+        control_client
+            .rpc(
+                control_server.local_addr(),
+                server_fingerprint,
+                &heartbeat(cluster_id, client_node_id, 6),
+            )
+            .await
+            .is_err(),
+        "locally revoked server reconnected"
+    );
+    println!("OUTBOUND_POST_REVOKE_DENIED control=true block_pull=true reconnect=true");
+
+    client_peers.authorize(server_fingerprint, server_node_id)?;
+    let outbound_recovered = control_client
+        .rpc(
+            control_server.local_addr(),
+            server_fingerprint,
+            &heartbeat(cluster_id, client_node_id, 7),
+        )
+        .await?;
+    ensure!(
+        matches!(
+            outbound_recovered.response,
+            ControlResponse::MembershipAccepted { .. }
+        ),
+        "outbound control did not recover after explicit re-authorization"
+    );
+    ensure!(
+        pull_client
+            .pull(pull_server.local_addr(), server_fingerprint, &block_ref)
+            .await?
+            == Some(encoded),
+        "outbound block pull did not recover after explicit re-authorization"
+    );
+    println!("OUTBOUND_REAUTH_RECOVERED control=true block_pull=true");
 
     control_server.close();
     pull_server.close();

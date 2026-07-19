@@ -14,6 +14,17 @@ fn loopback() -> std::net::SocketAddr {
     "127.0.0.1:0".parse().unwrap()
 }
 
+fn client_for(
+    node: &NodeCertificate,
+    server_fp: sentinel_cluster_control::CertFingerprint,
+) -> BlockPullClient {
+    BlockPullClient::new(
+        node,
+        PeerRegistry::new([(server_fp, NodeId::new())]).unwrap(),
+    )
+    .unwrap()
+}
+
 /// A provider holding one block, by its on-disk encoded bytes.
 struct OneBlock {
     want: BlockRef,
@@ -44,7 +55,7 @@ async fn pull_by_hash_roundtrip_miss_and_server_pin() {
     let peers = PeerRegistry::new([(client_fp, NodeId::new())]).unwrap();
     let server = BlockPullServer::bind(loopback(), &server_node, peers, provider).unwrap();
     let addr = server.local_addr();
-    let client = BlockPullClient::new(&client_node).unwrap();
+    let client = client_for(&client_node, server_fp);
 
     // AC-2 (transport): pull the held block by hash -> the encoded bytes come back.
     let got = client.pull(addr, server_fp, &held).await.unwrap();
@@ -87,7 +98,7 @@ async fn server_rejects_an_unpinned_client() {
     )])
     .unwrap();
     let server = BlockPullServer::bind(loopback(), &server_node, peers, provider).unwrap();
-    let client = BlockPullClient::new(&stranger).unwrap();
+    let client = client_for(&stranger, server_fp);
 
     // The handshake succeeds, but the server closes the connection on the unpinned
     // fingerprint, so the pull fails.
@@ -136,7 +147,7 @@ async fn revocation_closes_an_established_pull_session_and_blocks_reconnect() {
         Arc::clone(&provider),
     )
     .unwrap();
-    let client = BlockPullClient::new(&client_node).unwrap();
+    let client = client_for(&client_node, server_fp);
     let session = client
         .connect(server.local_addr(), server_fp)
         .await
@@ -184,5 +195,62 @@ async fn revocation_closes_an_established_pull_session_and_blocks_reconnect() {
         Some(provider.encoded.clone())
     );
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    server.close();
+}
+
+#[tokio::test]
+async fn local_revocation_closes_outbound_pull_session_and_blocks_reconnect() {
+    let server_node = NodeCertificate::generate("holder").unwrap();
+    let client_node = NodeCertificate::generate("puller").unwrap();
+    let server_fp = server_node.fingerprint();
+    let client_fp = client_node.fingerprint();
+    let server_node_id = NodeId::new();
+    let client_node_id = NodeId::new();
+    let held = BlockRef::blob_sha256([10; 32], 3);
+    let provider = Arc::new(OneBlock {
+        want: held.clone(),
+        encoded: vec![0x00, b'x', b'y', b'z'],
+    });
+    let server_peers = PeerRegistry::new([(client_fp, client_node_id)]).unwrap();
+    let client_peers = PeerRegistry::new([(server_fp, server_node_id)]).unwrap();
+    let server =
+        BlockPullServer::bind(loopback(), &server_node, server_peers, provider.clone()).unwrap();
+    let client = BlockPullClient::new(&client_node, client_peers.clone()).unwrap();
+    let session = client
+        .connect(server.local_addr(), server_fp)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session.pull(&held).await.unwrap(),
+        Some(provider.encoded.clone())
+    );
+    assert_eq!(
+        client_peers.revoke(server_node_id),
+        1,
+        "the outbound pull session must be registered on the initiating node"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), session.pull(&held))
+            .await
+            .expect("outbound pull revocation must terminate promptly")
+            .is_err()
+    );
+    assert!(
+        client
+            .pull(server.local_addr(), server_fp, &held)
+            .await
+            .is_err(),
+        "the initiating node must reject pull reconnect while the peer is revoked"
+    );
+
+    client_peers.authorize(server_fp, server_node_id).unwrap();
+    assert_eq!(
+        client
+            .pull(server.local_addr(), server_fp, &held)
+            .await
+            .unwrap(),
+        Some(provider.encoded.clone())
+    );
     server.close();
 }

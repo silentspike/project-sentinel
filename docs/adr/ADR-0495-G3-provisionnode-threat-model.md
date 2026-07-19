@@ -1,7 +1,7 @@
 # ADR-0495: ProvisionNode threat model (G3)
 
 - **Gate:** G3 (blocks the #495 `ProvisionNode` ACs)
-- **Status:** Proposed
+- **Status:** Accepted
 - **Primary issue:** #495 (operator-approved self-provisioning node bootstrap)
 - **Related issues / gates:** G-GENESIS (first seed), ADR-2 (SSH for bootstrap), V14
 - **Supersedes / Superseded by:** —
@@ -91,6 +91,13 @@ systemd unit is necessary but insufficient: completion requires an accepted hear
 whose payload `node_id` equals the NodeId bound to the presented certificate. Timeout
 stops the target service and revokes the seed-side dynamic peer entry.
 
+After the authenticated join and quarantine-marker removal, the seed durably appends
+the idempotent `NodeProvisioned` audit event while the operation is still
+`ObserveAuthenticatedJoin`. Only a successful append permits the durable transition to
+`Completed`. An append failure persists `Failed`, revokes the peer, and quarantines the
+target; a retry uses the same operation identity, so an already appended event is
+deduplicated by its durable `operation_id`.
+
 ## Failure Modes
 
 - **Half-deploy (AC-S4/B6):** every fallible bootstrap fence persists `Failed`, disables
@@ -114,6 +121,9 @@ stops the target service and revokes the seed-side dynamic peer entry.
 - **Re-run (AC-S2/B5):** idempotent across a seed restart: a completed run is a no-op;
   an incomplete/failed run reuses the persisted operation and NodeId (no split target
   identity or second membership entry).
+- **Audit append failure:** `Completed` is never persisted without a durable
+  `NodeProvisioned` event. The node is revoked and quarantined until a convergent retry
+  completes under the same operation identity.
 
 ## Tests
 
@@ -123,7 +133,8 @@ self-registers through an authenticated heartbeat observed by the seed (B4);
 idempotent re-run, including journal reopen (B5/S2); failed bootstrap at early and
 late fences -> durable failed/quarantine record and no alive node
 (B6/S4); no secrets/token (B7/S3); host-key pinned (S1); cred lifecycle (S6); NodeId
-collision rejected (S5).
+collision rejected (S5); event-append failure never persists `Completed` and
+quarantines the joined target.
 
 ## Benchmarks
 

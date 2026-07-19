@@ -26,7 +26,7 @@ pub struct AuthenticatedPeer {
     pub node_id: NodeId,
 }
 
-/// Dynamic pinned-peer registry shared by the control and block-pull servers.
+/// Dynamic pinned-peer registry shared by control and block-pull clients and servers.
 /// Both directions are unique: one certificate maps to one NodeId and one NodeId
 /// maps to one certificate until the explicit rotation lifecycle is implemented.
 #[derive(Clone, Default)]
@@ -71,8 +71,9 @@ impl PeerRegistry {
         Ok(())
     }
 
-    /// Revoke a NodeId and actively close every control and block-pull connection
-    /// authenticated under its certificate. Returns the number of closed connections.
+    /// Revoke a NodeId and actively close every inbound and outbound control and
+    /// block-pull connection authenticated under its certificate. Returns the number
+    /// of closed connections.
     pub fn revoke(&self, node_id: NodeId) -> usize {
         let connections = {
             let mut state = self.inner.write().expect("peer registry lock");
@@ -142,6 +143,17 @@ impl PeerRegistry {
             .entry(fingerprint)
             .or_default()
             .insert(connection_id, connection.clone());
+        drop(state);
+
+        // The wrapper that owns this connection may outlive a remote close. Remove
+        // the registry entry as soon as Quinn observes termination so later
+        // revocation counts only sessions that are still live.
+        let registry = self.clone();
+        let tracked = connection.clone();
+        tokio::spawn(async move {
+            tracked.closed().await;
+            registry.unregister_connection(fingerprint, connection_id);
+        });
         Some((
             AuthenticatedPeer {
                 fingerprint,

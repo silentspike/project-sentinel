@@ -4224,8 +4224,7 @@ fn run_provision_worker(
             ProvisionTiming::default(),
             &now_ms,
             &|op| journal.update(op),
-        ) {
-            Ok(duration_ms) => {
+            &|completed_op, duration_ms| {
                 let payload = DomainEventPayload::NodeProvisioned {
                     node_id: node_id.to_string(),
                     alias: alias.clone(),
@@ -4233,16 +4232,19 @@ fn run_provision_worker(
                     target_ip: pending.target_ip.clone(),
                     duration_ms,
                 };
+                let operation_id = format!("provision-{}", completed_op.op_id);
                 let event = DomainEvent::new(
                     payload.event_type_str(),
                     "cluster",
                     &payload.to_json(),
-                    &format!("provision-{}", op.op_id),
+                    &operation_id,
                     0,
-                );
-                if let Err(e) = event_store.append_event(&event) {
-                    warn!(error = %e, "NodeProvisioned-Event konnte nicht persistiert werden");
-                }
+                )
+                .with_operation_id(&operation_id);
+                event_store.append_event(&event).map(|_| ())
+            },
+        ) {
+            Ok(duration_ms) => {
                 info!(%node_id, %alias, duration_ms, "ProvisionNode: Knoten provisioniert");
             }
             Err(e) => {

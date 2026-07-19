@@ -357,7 +357,7 @@ pub trait ProvisionCluster {
     fn is_alive(&self, node_id: NodeId) -> bool;
 }
 
-/// Drive the provision saga to `Completed` (or `Failed`). Any transport error fails
+/// Drive the provision saga to `Completed` (or `Failed`). Any transport or event error fails
 /// the op (rollback/quarantine, AC-B6) and returns `Err`; a completed op is left
 /// terminal. Returns the wall-clock duration of the bootstrap on success.
 ///
@@ -371,6 +371,7 @@ pub fn execute_provision_node<T: ProvisionTransport>(
     timing: ProvisionTiming,
     clock: &dyn Fn() -> u64,
     persist: &dyn Fn(&ProvisionOp) -> anyhow::Result<()>,
+    emit_completed: &dyn Fn(&ProvisionOp, u64) -> anyhow::Result<()>,
 ) -> anyhow::Result<u64> {
     let started = Instant::now();
 
@@ -562,9 +563,18 @@ pub fn execute_provision_node<T: ProvisionTransport>(
         }
         return Err(with_quarantine(error, cluster, transport, op));
     }
-    op.advance(clock()); // → Completed
+    let duration_ms = started.elapsed().as_millis() as u64;
+    if let Err(error) = emit_completed(op, duration_ms) {
+        op.fail(format!("emit NodeProvisioned event: {error}"), clock());
+        let mut error = anyhow::anyhow!("provision: emit NodeProvisioned event: {error}");
+        if let Err(persist_error) = persist(op) {
+            error = anyhow::anyhow!("{error}; persist failed state: {persist_error}");
+        }
+        return Err(with_quarantine(error, cluster, transport, op));
+    }
+    op.advance(clock()); // → Completed, only after the idempotent event append succeeded
     persist_remote_state(op, clock, persist, cluster, transport, "completion")?;
-    Ok(started.elapsed().as_millis() as u64)
+    Ok(duration_ms)
 }
 
 fn quarantine_failed_provision(
@@ -1029,6 +1039,7 @@ mod tests {
             0,
         );
         let clock = || 42u64;
+        let emitted_states = RefCell::new(Vec::new());
         let dur = execute_provision_node(
             &mut op,
             &pending("bare-1", "ssh-ed25519 AAAA"),
@@ -1038,10 +1049,19 @@ mod tests {
             fast_timing(),
             &clock,
             &|_| Ok(()),
+            &|op, _| {
+                emitted_states.borrow_mut().push(op.state);
+                Ok(())
+            },
         )
         .unwrap();
         assert_eq!(op.state, ProvisionOpState::Completed);
         assert_eq!(op.node_id, Some(plan.assigned_node_id));
+        assert_eq!(
+            emitted_states.borrow().as_slice(),
+            &[ProvisionOpState::ObservingJoin],
+            "NodeProvisioned must be emitted before Completed is persisted"
+        );
         assert!(dur < 5_000);
         let calls = t.calls.borrow();
         // The exact remote command sequence the SshProvisionTransport will run.
@@ -1099,6 +1119,56 @@ mod tests {
     }
 
     #[test]
+    fn event_append_failure_never_persists_completed() {
+        let bin = empty_binary();
+        let plan = plan_for(bin.path());
+        let t = FakeTransport::healthy();
+        let cluster = FakeCluster::joined(plan.assigned_node_id);
+        let mut op = ProvisionOp::new(
+            Uuid::new_v4(),
+            "bare-1".into(),
+            "test-node-1".into(),
+            "idem".into(),
+            0,
+        );
+        let persisted_states = RefCell::new(Vec::new());
+
+        let result = execute_provision_node(
+            &mut op,
+            &pending("bare-1", "ssh-ed25519 AAAA"),
+            &plan,
+            &t,
+            &cluster,
+            fast_timing(),
+            &|| 43,
+            &|op| {
+                persisted_states.borrow_mut().push(op.state);
+                Ok(())
+            },
+            &|op, _| {
+                assert_eq!(op.state, ProvisionOpState::ObservingJoin);
+                anyhow::bail!("event store unavailable")
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(op.state, ProvisionOpState::Failed);
+        assert!(op
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("emit NodeProvisioned event"));
+        assert!(!persisted_states
+            .borrow()
+            .contains(&ProvisionOpState::Completed));
+        assert_eq!(
+            cluster.revoked.borrow().as_slice(),
+            &[plan.assigned_node_id],
+            "an unaudited joined node must be quarantined"
+        );
+    }
+
+    #[test]
     fn missing_host_key_pin_fails_before_any_io() {
         let bin = empty_binary();
         let plan = plan_for(bin.path());
@@ -1116,6 +1186,7 @@ mod tests {
             fast_timing(),
             &clock,
             &|_| Ok(()),
+            &|_, _| Ok(()),
         );
         assert!(err.is_err());
         assert_eq!(op.state, ProvisionOpState::Failed);
@@ -1141,6 +1212,7 @@ mod tests {
             fast_timing(),
             &clock,
             &|_| Ok(()),
+            &|_, _| Ok(()),
         );
         assert!(err.is_err());
         assert_eq!(op.state, ProvisionOpState::Failed);
@@ -1173,6 +1245,7 @@ mod tests {
             fast_timing(),
             &clock,
             &|_| Ok(()),
+            &|_, _| Ok(()),
         );
         assert!(err.is_err());
         assert_eq!(op.state, ProvisionOpState::Failed);
@@ -1206,6 +1279,7 @@ mod tests {
             fast_timing(),
             &|| 4,
             &|_| Ok(()),
+            &|_, _| Ok(()),
         );
         assert!(result.is_err());
         assert_eq!(op.state, ProvisionOpState::Failed);
@@ -1236,6 +1310,7 @@ mod tests {
             fast_timing(),
             &clock,
             &|_| Ok(()),
+            &|_, _| Ok(()),
         );
         assert!(err.is_err());
         assert_eq!(op.state, ProvisionOpState::Failed);
@@ -1266,6 +1341,7 @@ mod tests {
             fast_timing(),
             &|| 10,
             &|_| Ok(()),
+            &|_, _| Ok(()),
         );
         assert!(err.is_err());
         assert_eq!(op.state, ProvisionOpState::Failed);
@@ -1301,6 +1377,7 @@ mod tests {
             fast_timing(),
             &|| 11,
             &|_| Ok(()),
+            &|_, _| Ok(()),
         );
         assert!(result.is_err());
         assert_eq!(op.state, ProvisionOpState::Failed);

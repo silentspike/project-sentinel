@@ -8,7 +8,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context};
 use sentinel_cluster_control::{
-    ControlClient, ControlEnvelope, ControlRequest, ControlResponse, NodeCertificate,
+    ControlClient, ControlEnvelope, ControlRequest, ControlResponse, NodeCertificate, PeerRegistry,
 };
 use sentinel_common::{Heartbeat, NodeId};
 use sentinel_daemon::config::DaemonConfig;
@@ -47,7 +47,6 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| cluster.node_id.to_string());
     let identity = NodeCertificate::load_or_generate(&cert_path, &key_path, &local_alias)?;
-    let client = ControlClient::new(&identity)?;
     let heartbeat = Heartbeat {
         node_id: claimed_node_id,
         alias: "spoof-probe".into(),
@@ -66,6 +65,10 @@ async fn main() -> anyhow::Result<()> {
     let peer_fingerprint =
         sentinel_cluster_control::CertFingerprint::from_hex(&peer.cert_fingerprint)
             .context("peer certificate fingerprint is invalid")?;
+    let client = ControlClient::new(
+        &identity,
+        PeerRegistry::new([(peer_fingerprint, peer.node_id)])?,
+    )?;
     let reply = client.rpc(peer_addr, peer_fingerprint, &envelope).await?;
 
     match reply.response {
