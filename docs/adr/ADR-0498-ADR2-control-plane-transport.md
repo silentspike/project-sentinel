@@ -1,7 +1,7 @@
 # ADR-0498: Cross-node control-plane transport (ADR-2)
 
 - **Gate:** ADR-2 (top-level transport decision)
-- **Status:** Proposed
+- **Status:** Accepted
 - **Primary issue:** #498 (distributed CAS) — shares the transport; also serves #496/#499/Track-C-D control RPCs
 - **Related issues / gates:** #495 (bootstrap, SSH-only), V10 (cert pinning), V18 (no 0-RTT for control)
 - **Supersedes / Superseded by:** —
@@ -77,10 +77,10 @@ peer registry; Zenoh is not a fallback transport.
 `ControlEnvelope { request_id, idempotency_key, request }`, `ControlRequest`, and
 `ControlReply`. `ControlPeer { node_id, alias, addr, cert_fingerprint }` is the durable
 trust declaration. `PeerRegistry` enforces a one-to-one certificate/NodeId mapping and
-atomically registers every accepted control and block-pull QUIC connection under that
-binding. Revoking a NodeId removes the binding and actively closes every registered
-connection for its certificate. N-node-native: addressing is by `NodeId`, not a fixed
-source/target pair.
+atomically registers every authenticated inbound or outbound control and block-pull
+QUIC connection under that binding. Revoking a NodeId removes the binding and actively
+closes every registered connection for its certificate. N-node-native: addressing is
+by `NodeId`, not a fixed source/target pair.
 
 ## State Machine / Protocol
 
@@ -115,10 +115,13 @@ arrival refreshes receiver-local liveness. No 0-RTT is enabled for control RPCs.
 - **Cluster metastore unavailable:** the membership wrapper continues to accept
   authenticated liveness heartbeats, but every owner/GC request reaching the terminal
   handler returns typed `Rejected`; no synthetic ownership acknowledgement is emitted.
-- **Stream loss mid-RPC:** request is retried under the same `idempotency_key`;
-  non-idempotent effects are guarded by the dedup cache, not by 0-RTT.
+- **Stream loss mid-RPC:** request is retried under the same `idempotency_key`. The
+  process-local cache can deduplicate a reply only while that process survives;
+  durable journals, operation claims, and owner-term checks make mutations safe to
+  reconcile after a crash. Neither the cache nor disabled 0-RTT provides durable
+  exactly-once effects.
 
-## Tests (for the 3a0 skeleton that realizes this ADR)
+## Tests
 
 - `ControlEnvelope` round-trip stable.
 - Peer/method/key/digest scoping dedups identical sequential and concurrent re-sends,

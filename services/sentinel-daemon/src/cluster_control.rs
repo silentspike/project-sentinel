@@ -309,7 +309,7 @@ impl ClusterControl {
                 )),
             )?,
         };
-        let client = ControlClient::new(&node)?;
+        let client = ControlClient::new(&node, peer_registry.clone())?;
 
         // #498 4b: bind the block-pull server (serves local CAS blobs by hash, V10) on
         // port+1, backed by this node's CAS. A bind failure is logged, not fatal — the
@@ -331,7 +331,7 @@ impl ClusterControl {
                 None
             }
         };
-        let pull_client = BlockPullClient::new(&node)?;
+        let pull_client = BlockPullClient::new(&node, peer_registry.clone())?;
 
         info!(
             %bind_addr,

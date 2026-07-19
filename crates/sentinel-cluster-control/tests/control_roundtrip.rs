@@ -14,6 +14,17 @@ fn loopback() -> std::net::SocketAddr {
     "127.0.0.1:0".parse().unwrap()
 }
 
+fn client_for(
+    node: &NodeCertificate,
+    server_fp: sentinel_cluster_control::CertFingerprint,
+) -> ControlClient {
+    ControlClient::new(
+        node,
+        PeerRegistry::new([(server_fp, sentinel_common::NodeId::new())]).unwrap(),
+    )
+    .unwrap()
+}
+
 #[tokio::test]
 async fn rpc_roundtrip_idempotency_and_server_pin() {
     let server_node = NodeCertificate::generate("node-0").unwrap();
@@ -26,7 +37,7 @@ async fn rpc_roundtrip_idempotency_and_server_pin() {
     let server =
         ControlServer::bind(loopback(), &server_node, peers, Arc::new(StubHandler)).unwrap();
     let addr = server.local_addr();
-    let client = ControlClient::new(&client_node).unwrap();
+    let client = client_for(&client_node, server_fp);
 
     // AC-5: RefQuery round-trip returns a correct typed response.
     let env = ControlEnvelope::new(
@@ -129,7 +140,7 @@ async fn membership_heartbeats_bypass_response_cache() {
     });
     let server =
         ControlServer::bind(loopback(), &server_node, peers, Arc::clone(&handler)).unwrap();
-    let client = ControlClient::new(&client_node).unwrap();
+    let client = client_for(&client_node, server_fp);
     let request = ControlRequest::MembershipHeartbeat {
         cluster_id: Uuid::new_v4(),
         heartbeat: Heartbeat {
@@ -188,7 +199,7 @@ async fn holder_gossip_over_the_wire_merges_into_the_shared_block_map() {
     ));
     let server = ControlServer::bind(loopback(), &server_node, peers, handler).unwrap();
     let addr = server.local_addr();
-    let client = ControlClient::new(&client_node).unwrap();
+    let client = client_for(&client_node, server_fp);
 
     // node-1 advertises that it holds two blocks; the gossip crosses a real QUIC stream.
     let boot = Uuid::new_v4();
@@ -240,7 +251,7 @@ async fn server_rejects_unpinned_client() {
     .unwrap();
     let server =
         ControlServer::bind(loopback(), &server_node, peers, Arc::new(StubHandler)).unwrap();
-    let client = ControlClient::new(&stranger).unwrap();
+    let client = client_for(&stranger, server_fp);
 
     let env = ControlEnvelope::new(
         "k",
@@ -276,7 +287,7 @@ async fn revocation_closes_an_established_control_session_and_blocks_reconnect()
         Arc::new(StubHandler),
     )
     .unwrap();
-    let client = ControlClient::new(&client_node).unwrap();
+    let client = client_for(&client_node, server_fp);
     let session = client
         .connect(server.local_addr(), server_fp)
         .await
@@ -326,5 +337,110 @@ async fn revocation_closes_an_established_control_session_and_blocks_reconnect()
             .response,
         ControlResponse::RefQueryResult { .. }
     ));
+    server.close();
+}
+
+#[tokio::test]
+async fn local_revocation_closes_outbound_control_session_and_blocks_reconnect() {
+    let server_node = NodeCertificate::generate("node-0").unwrap();
+    let client_node = NodeCertificate::generate("node-1").unwrap();
+    let server_fp = server_node.fingerprint();
+    let client_fp = client_node.fingerprint();
+    let server_node_id = sentinel_common::NodeId::new();
+    let client_node_id = sentinel_common::NodeId::new();
+    let server_peers = PeerRegistry::new([(client_fp, client_node_id)]).unwrap();
+    let client_peers = PeerRegistry::new([(server_fp, server_node_id)]).unwrap();
+    let server = ControlServer::bind(
+        loopback(),
+        &server_node,
+        server_peers,
+        Arc::new(StubHandler),
+    )
+    .unwrap();
+    let client = ControlClient::new(&client_node, client_peers.clone()).unwrap();
+    let session = client
+        .connect(server.local_addr(), server_fp)
+        .await
+        .unwrap();
+    let request = || {
+        ControlEnvelope::new(
+            uuid::Uuid::new_v4().to_string(),
+            ControlRequest::RefQuery {
+                block_ref: "cas-blob:v1:sha256:outbound-revocation".into(),
+            },
+        )
+    };
+
+    assert!(session.rpc(&request()).await.is_ok());
+    assert_eq!(
+        client_peers.revoke(server_node_id),
+        1,
+        "the outbound control session must be registered on the initiating node"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), session.rpc(&request()))
+            .await
+            .expect("outbound revocation must terminate promptly")
+            .is_err()
+    );
+    assert!(
+        client
+            .rpc(server.local_addr(), server_fp, &request())
+            .await
+            .is_err(),
+        "the initiating node must reject reconnect while the peer is revoked"
+    );
+
+    client_peers.authorize(server_fp, server_node_id).unwrap();
+    assert!(client
+        .rpc(server.local_addr(), server_fp, &request())
+        .await
+        .is_ok());
+    server.close();
+}
+
+#[tokio::test]
+async fn remotely_closed_outbound_session_is_removed_from_the_local_registry() {
+    let server_node = NodeCertificate::generate("node-0").unwrap();
+    let client_node = NodeCertificate::generate("node-1").unwrap();
+    let server_fp = server_node.fingerprint();
+    let client_fp = client_node.fingerprint();
+    let server_node_id = sentinel_common::NodeId::new();
+    let client_node_id = sentinel_common::NodeId::new();
+    let server_peers = PeerRegistry::new([(client_fp, client_node_id)]).unwrap();
+    let client_peers = PeerRegistry::new([(server_fp, server_node_id)]).unwrap();
+    let server = ControlServer::bind(
+        loopback(),
+        &server_node,
+        server_peers.clone(),
+        Arc::new(StubHandler),
+    )
+    .unwrap();
+    let client = ControlClient::new(&client_node, client_peers.clone()).unwrap();
+    let session = client
+        .connect(server.local_addr(), server_fp)
+        .await
+        .unwrap();
+    let request = ControlEnvelope::new(
+        uuid::Uuid::new_v4().to_string(),
+        ControlRequest::RefQuery {
+            block_ref: "cas-blob:v1:sha256:remote-close-cleanup".into(),
+        },
+    );
+
+    assert!(session.rpc(&request).await.is_ok());
+    assert_eq!(server_peers.revoke(client_node_id), 1);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), session.rpc(&request))
+            .await
+            .expect("remote revocation must terminate promptly")
+            .is_err()
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        client_peers.revoke(server_node_id),
+        0,
+        "a remotely closed session must not remain registered as live"
+    );
     server.close();
 }

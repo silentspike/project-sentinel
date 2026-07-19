@@ -9,10 +9,10 @@
 //! Modes (positional args):
 //!
 //! ```text
-//!   pull      <peer_addr> <peer_fp_hex> <blob_hash_hex> <size> <cert_dir> <dest_data_dir>
-//!   integrity <peer_addr> <peer_fp_hex> <blob_hash_hex> <size> <cert_dir>
-//!   bench     <peer_addr> <peer_fp_hex> <blob_hash_hex> <size> <cert_dir> <iters>
-//!   resolve   <peer_addr> <peer_fp_hex> <blob_hash_hex> <size> <cert_dir> <dest_data_dir>
+//!   pull      <peer_addr> <peer_fp_hex> <blob_hash_hex> <size> <cert_dir> <peer_node_id> <dest_data_dir>
+//!   integrity <peer_addr> <peer_fp_hex> <blob_hash_hex> <size> <cert_dir> <peer_node_id>
+//!   bench     <peer_addr> <peer_fp_hex> <blob_hash_hex> <size> <cert_dir> <peer_node_id> <iters>
+//!   resolve   <peer_addr> <peer_fp_hex> <blob_hash_hex> <size> <cert_dir> <peer_node_id> <dest_data_dir>
 //! ```
 //!
 //! `resolve` is the PR3 (4c) AC: it wires a real `BlockResolver` (V9) into a fresh
@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use sentinel_cluster_control::{BlockPullClient, CertFingerprint, NodeCertificate};
-use sentinel_common::BlockRef;
+use sentinel_cluster_control::{BlockPullClient, CertFingerprint, NodeCertificate, PeerRegistry};
+use sentinel_common::{BlockRef, NodeId};
 use sentinel_fs::artifact::ChunkHash;
 use sentinel_fs::block_resolver::{BlobResolve, BlockResolver, BlockStore, RemotePull};
 use sentinel_fs::cas::CasStore;
@@ -70,14 +70,19 @@ async fn main() {
     let hash = hex_decode_32(&a[4]);
     let size: u64 = a[5].parse().expect("size");
     let cert_dir = &a[6];
+    let peer_node_id = NodeId(uuid::Uuid::parse_str(&a[7]).expect("peer_node_id UUID"));
     let block_ref = BlockRef::blob_sha256(hash, size);
 
     let node = load_cert(cert_dir);
-    let client = BlockPullClient::new(&node).expect("client");
+    let client = BlockPullClient::new(
+        &node,
+        PeerRegistry::new([(peer_fp, peer_node_id)]).expect("peer registry"),
+    )
+    .expect("client");
 
     match mode {
         "pull" => {
-            let dest = &a[7];
+            let dest = &a[8];
             let cas = CasStore::open(Path::new(dest)).expect("dest cas");
             let already = cas.contains(&hash);
             let pulled = client
@@ -119,7 +124,7 @@ async fn main() {
             }
         }
         "bench" => {
-            let iters: usize = a[7].parse().expect("iters");
+            let iters: usize = a[8].parse().expect("iters");
             let dir =
                 std::env::temp_dir().join(format!("blockpull-probe-bench-{}", std::process::id()));
             let cas = CasStore::open(&dir).expect("tmp cas");
@@ -145,7 +150,7 @@ async fn main() {
         "resolve" => {
             // PR3 (4c) AC-6: drive the real CasStore::read API with a wired BlockResolver,
             // proving a remote-only blob resolves on a read miss cross-VM (V9 read path).
-            let dest = a[7].clone();
+            let dest = a[8].clone();
             let cas = Arc::new(CasStore::open(Path::new(&dest)).expect("dest cas"));
             let cached_before = cas.contains(&hash);
 

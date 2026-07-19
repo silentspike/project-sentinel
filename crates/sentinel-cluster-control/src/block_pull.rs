@@ -280,17 +280,18 @@ async fn serve_pull_connection<P: BlockProvider + 'static>(
 /// A QUIC block-pull client bound to an ephemeral local port, presenting `node`'s cert.
 pub struct BlockPullClient {
     endpoint: Endpoint,
+    peers: PeerRegistry,
 }
 
 impl BlockPullClient {
-    pub fn new(node: &NodeCertificate) -> anyhow::Result<Self> {
+    pub fn new(node: &NodeCertificate, peers: PeerRegistry) -> anyhow::Result<Self> {
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().expect("valid bind addr"))?;
         endpoint.set_default_client_config(quic_client_config(node)?);
-        Ok(Self { endpoint })
+        Ok(Self { endpoint, peers })
     }
 
     /// Connect to one holder and enforce its server certificate pin. The returned
-    /// session can carry multiple pull streams and observes server-side revocation.
+    /// session can carry multiple pull streams and observes local peer revocation.
     pub async fn connect(
         &self,
         peer_addr: SocketAddr,
@@ -302,7 +303,16 @@ impl BlockPullClient {
             conn.close(1u32.into(), b"unpinned server");
             anyhow::bail!("block-pull server cert {fp} does not match pin {expected_peer}");
         }
-        Ok(BlockPullConnection { connection: conn })
+        let Some((_, connection_id)) = self.peers.register_connection(fp, &conn) else {
+            conn.close(2u32.into(), b"peer revoked");
+            anyhow::bail!("block-pull server cert {fp} is not authorized");
+        };
+        Ok(BlockPullConnection {
+            connection: conn,
+            peers: self.peers.clone(),
+            fingerprint: fp,
+            connection_id,
+        })
     }
 
     /// Pull one block over a short-lived authenticated session. The content hash is
@@ -323,6 +333,9 @@ impl BlockPullClient {
 /// An authenticated block-pull session that can carry multiple request streams.
 pub struct BlockPullConnection {
     connection: Connection,
+    peers: PeerRegistry,
+    fingerprint: CertFingerprint,
+    connection_id: u64,
 }
 
 impl BlockPullConnection {
@@ -339,8 +352,16 @@ impl BlockPullConnection {
         Ok(read_response(&mut recv, encoded_read_bound(block_ref)).await?)
     }
 
-    pub fn close(&self) {
+    pub fn close(self) {
         self.connection.close(0u32.into(), b"done");
+    }
+}
+
+impl Drop for BlockPullConnection {
+    fn drop(&mut self) {
+        self.peers
+            .unregister_connection(self.fingerprint, self.connection_id);
+        self.connection.close(0u32.into(), b"session dropped");
     }
 }
 

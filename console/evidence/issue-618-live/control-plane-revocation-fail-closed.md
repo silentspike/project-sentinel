@@ -161,3 +161,100 @@ misreported as warnings.
 - General certificate-authority lifecycle and certificate rotation remain outside
   issue #618. This change enforces the existing pinned-certificate revocation boundary.
 - `.240`, TOGAF HTML, and unrelated services were not modified.
+
+## ORC final correction and re-verification
+
+The ORC review found that the first correction tracked only server-accepted sessions
+and that `ProvisionNode` could persist `Completed` before its audit event. The final
+revision therefore also registers outbound client sessions, removes remotely closed
+sessions from the registry immediately, and makes the idempotent `NodeProvisioned`
+append a prerequisite for `Completed`. An injected append failure persists `Failed`,
+revokes the peer, and quarantines the target.
+
+The first expanded release probe correctly rejected the candidate because closed
+client wrappers were still counted in the local registry (`expected 2, got 4`). The
+registry lifecycle was fixed and a regression test added before the final build and
+deployment. This failed attempt was not accepted as evidence.
+
+```console
+$ cargo remote -c -- fmt --all -- --check
+exit=0
+
+$ cargo remote -c -- test -p sentinel-cluster-control
+exit=0
+
+$ cargo remote -c -- test -p sentinel-daemon provision_exec
+exit=0
+
+$ cargo remote -c -- test -p sentinel-daemon --lib
+exit=0
+
+$ cargo remote -c -- clippy --workspace --all-targets -- -D warnings
+exit=0
+
+$ cargo remote -c -- build -p sentinel-daemon --release --bins
+exit=0
+
+$ typos
+exit=0
+
+$ git diff --check
+exit=0
+
+$ sha256sum target/release/sentinel-daemon target/release/cluster_fail_closed_probe
+815b6118441960f1eae13dea0dcf694b0f723cfe16ddc92628e46134886f2ba9  target/release/sentinel-daemon
+e5ad876e2ea72ec8b08fe5c43db4e381bc3fac18d2a2ac9f28e50d724923e928  target/release/cluster_fail_closed_probe
+```
+
+The final release artifacts were installed identically on `.241` and `.242`. The
+previous daemon binary remains on each node as
+`/opt/sentinel/bin/sentinel-daemon.pre-issue-618` for rollback.
+
+```console
+$ sha256sum /opt/sentinel/bin/sentinel-daemon /tmp/cluster_fail_closed_probe.issue-618
+.241 815b6118441960f1eae13dea0dcf694b0f723cfe16ddc92628e46134886f2ba9  /opt/sentinel/bin/sentinel-daemon
+.241 e5ad876e2ea72ec8b08fe5c43db4e381bc3fac18d2a2ac9f28e50d724923e928  /tmp/cluster_fail_closed_probe.issue-618
+.242 815b6118441960f1eae13dea0dcf694b0f723cfe16ddc92628e46134886f2ba9  /opt/sentinel/bin/sentinel-daemon
+.242 e5ad876e2ea72ec8b08fe5c43db4e381bc3fac18d2a2ac9f28e50d724923e928  /tmp/cluster_fail_closed_probe.issue-618
+
+$ timeout 20 /tmp/cluster_fail_closed_probe.issue-618
+.241 and .242 (identical output, exit=0):
+MEMBERSHIP_AVAILABLE response=MembershipAccepted
+METASTORE_FAIL_CLOSED response=Rejected reason=cluster_metastore_unavailable
+LIVE_SESSIONS_REVOKED count=2
+POST_REVOKE_DENIED control=true block_pull=true reconnect=true
+EXPLICIT_REAUTH_RECOVERED control=true block_pull=true
+OUTBOUND_SESSIONS_REVOKED count=2
+OUTBOUND_POST_REVOKE_DENIED control=true block_pull=true reconnect=true
+OUTBOUND_REAUTH_RECOVERED control=true block_pull=true
+```
+
+Post-deploy runtime readback used the final daemon start time
+`2026-07-19 17:03:51 UTC` on both nodes.
+
+```console
+$ systemctl show sentinel-daemon sentinel-gaia-loop sentinel-dashboard-backend -p Id -p ActiveState -p SubState -p NRestarts
+.241 sentinel-daemon=active/running NRestarts=0
+.241 sentinel-gaia-loop=active/running NRestarts=0
+.241 sentinel-dashboard-backend=active/running NRestarts=0
+.242 sentinel-daemon=active/running NRestarts=0
+.242 sentinel-gaia-loop=active/running NRestarts=0
+.242 sentinel-dashboard-backend=active/running NRestarts=0
+
+$ journalctl -u sentinel-daemon --since '2026-07-19 17:03:50 UTC' --grep 'membership peer became Alive over QUIC'
+.241 peer=.242 previous=None outcome=Joined state=Alive
+.242 peer=.241 previous=None outcome=Joined state=Alive
+
+$ post-deploy counters since 2026-07-19 17:03:50 UTC
+.241 zenoh_warning_error=0 restart_failure=0 panic_fatal=0
+.242 zenoh_warning_error=0 restart_failure=0 panic_fatal=0
+
+$ sudo ss -ulnp | grep -E '(:8085|:8086)'
+.241 0.0.0.0:8085 sentinel-daemon; 0.0.0.0:8086 sentinel-daemon
+.242 0.0.0.0:8085 sentinel-daemon; 0.0.0.0:8086 sentinel-daemon
+```
+
+The active `.242` was not destructively reprovisioned again. The event-before-
+`Completed` failure boundary is deterministic saga behavior covered by the injected
+EventStore-failure test; the existing live provisioning/quarantine/retry evidence
+remains in `console/evidence/issue-442-live/control-plane-security-hardening.md`.
