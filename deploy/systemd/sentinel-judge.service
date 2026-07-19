@@ -14,6 +14,8 @@ Restart=on-failure
 RestartSec=5
 MemoryMax=512M
 Environment=SENTINEL_JUDGE_CONFIG=/opt/sentinel/config/judge.toml
+LoadCredential=caller-judge:/etc/sentinel/credentials/caller-judge
+Environment=SENTINEL_JUDGE_CREDENTIAL_FILE=%d/caller-judge
 
 # Logging
 StandardOutput=journal

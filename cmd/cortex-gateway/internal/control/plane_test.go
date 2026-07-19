@@ -2,6 +2,8 @@ package control
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -9,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/modelpolicy"
 )
 
 func testLogger() *slog.Logger {
@@ -56,8 +60,8 @@ func TestNewConfig_Defaults(t *testing.T) {
 	if snapshot.InterceptMode != "auto" {
 		t.Errorf("expected intercept_mode auto, got %q", snapshot.InterceptMode)
 	}
-	if snapshot.AgentRuntimeModelPolicy != "haiku" {
-		t.Errorf("expected agent_runtime_model_policy haiku, got %q", snapshot.AgentRuntimeModelPolicy)
+	if legacy, ok := snapshot.AgentRuntimeModelPolicy.LegacyValue(); !ok || legacy != "" {
+		t.Errorf("expected no default agent_runtime_model_policy override")
 	}
 	if snapshot.LocalLoopEnabled {
 		t.Error("expected local_loop_enabled false by default")
@@ -172,21 +176,89 @@ func TestConfig_Update_UnknownKey(t *testing.T) {
 	}
 }
 
+func TestConfig_Update_MixedInvalidPatchIsAtomic(t *testing.T) {
+	cfg := NewConfig("claude-code")
+	before := cfg.Get()
+	err := cfg.Update(map[string]interface{}{
+		"temperature": 1.2,
+		"max_tokens":  0,
+	})
+	if err == nil {
+		t.Fatal("mixed invalid patch accepted")
+	}
+	after := cfg.Get()
+	if after.Temperature != before.Temperature || after.MaxTokens != before.MaxTokens {
+		t.Fatalf("partial mutation: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestConfig_ProviderValidationIsFailClosedAndAtomic(t *testing.T) {
+	cfg := NewConfig("known")
+	cfg.SetProviderValidator(func(provider string) error {
+		if provider != "known" {
+			return fmt.Errorf("unknown provider %q", provider)
+		}
+		return nil
+	})
+	before := cfg.Get()
+	if err := cfg.Update(map[string]interface{}{
+		"temperature":      1.2,
+		"primary_provider": "unknown",
+	}); err == nil {
+		t.Fatal("unknown primary provider accepted")
+	}
+	after := cfg.Get()
+	if after.Temperature != before.Temperature || after.PrimaryProvider != before.PrimaryProvider {
+		t.Fatalf("provider validation partially mutated config: before=%+v after=%+v", before, after)
+	}
+	if err := cfg.SetAgentProvider("AGENT-01", "unknown"); err == nil {
+		t.Fatal("unknown per-agent provider accepted")
+	}
+}
+
+func TestConfig_Update_MixedInvalidPolicyPatchIsAtomic(t *testing.T) {
+	cfg := NewConfig("local-loop")
+	cfg.SetAgentRuntimePolicyValidator(func(policy modelpolicy.Policy) error {
+		if _, legacy := policy.LegacyValue(); legacy {
+			return nil
+		}
+		return errors.New("catalog rejected policy")
+	})
+	before := cfg.Get()
+	err := cfg.Update(map[string]interface{}{
+		"temperature": 1.2,
+		"agent_runtime_model_policy": map[string]interface{}{
+			"providers": map[string]interface{}{
+				"local-loop": map[string]interface{}{
+					"tier1": "one", "tier2": "two", "tier3": "three",
+				},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("mixed invalid policy patch accepted")
+	}
+	after := cfg.Get()
+	if after.Temperature != before.Temperature {
+		t.Fatalf("valid field partially committed: before=%v after=%v", before.Temperature, after.Temperature)
+	}
+}
+
 func TestConfig_Update_AgentRuntimeModelPolicy(t *testing.T) {
 	cfg := NewConfig("claude")
 
 	if err := cfg.Update(map[string]interface{}{"agent_runtime_model_policy": "haiku"}); err != nil {
 		t.Fatalf("update haiku policy: %v", err)
 	}
-	if got := cfg.Get().AgentRuntimeModelPolicy; got != "haiku" {
-		t.Fatalf("AgentRuntimeModelPolicy = %q, want haiku", got)
+	if got, ok := cfg.Get().AgentRuntimeModelPolicy.LegacyValue(); !ok || got != "haiku" {
+		t.Fatalf("AgentRuntimeModelPolicy legacy = %q/%v, want haiku/true", got, ok)
 	}
 
 	if err := cfg.Update(map[string]interface{}{"agent_runtime_model_policy": ""}); err != nil {
 		t.Fatalf("clear policy: %v", err)
 	}
-	if got := cfg.Get().AgentRuntimeModelPolicy; got != "" {
-		t.Fatalf("AgentRuntimeModelPolicy = %q, want empty", got)
+	if got, ok := cfg.Get().AgentRuntimeModelPolicy.LegacyValue(); !ok || got != "" {
+		t.Fatalf("AgentRuntimeModelPolicy legacy = %q/%v, want empty/true", got, ok)
 	}
 
 	if err := cfg.Update(map[string]interface{}{"agent_runtime_model_policy": "opus"}); err == nil {
@@ -194,6 +266,31 @@ func TestConfig_Update_AgentRuntimeModelPolicy(t *testing.T) {
 	}
 	if err := cfg.Update(map[string]interface{}{"agent_runtime_model_policy": 42}); err == nil {
 		t.Fatal("expected non-string policy to be rejected")
+	}
+
+	tiered := map[string]interface{}{
+		"providers": map[string]interface{}{
+			"local-loop": map[string]interface{}{
+				"tier1": "local-loop-tier1",
+				"tier2": "local-loop-tier2",
+				"tier3": "local-loop-tier3",
+			},
+		},
+	}
+	if err := cfg.Update(map[string]interface{}{"agent_runtime_model_policy": tiered}); err != nil {
+		t.Fatalf("update tiered policy: %v", err)
+	}
+	got := cfg.Get().AgentRuntimeModelPolicy.Providers()["local-loop"]
+	if got.Tier1 != "local-loop-tier1" || got.Tier3 != "local-loop-tier3" {
+		t.Fatalf("tiered policy did not round-trip: %+v", got)
+	}
+	copy := cfg.Get()
+	providers := copy.AgentRuntimeModelPolicy.Providers()
+	mutated := providers["local-loop"]
+	mutated.Tier2 = "mutated"
+	providers["local-loop"] = mutated
+	if cfg.Get().AgentRuntimeModelPolicy.Providers()["local-loop"].Tier2 != "local-loop-tier2" {
+		t.Fatal("policy snapshot was not deep-copied")
 	}
 }
 

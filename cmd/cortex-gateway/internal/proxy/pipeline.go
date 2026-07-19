@@ -90,11 +90,17 @@ var (
 		Name: "sentinel_pipeline_tokens_total",
 		Help: "Total tokens consumed per provider and direction (always emitted)",
 	}, []string{"provider", "direction"})
+
+	pipelineHierarchyRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sentinel_pipeline_hierarchy_requests_total",
+		Help: "Agent-runtime responses by provider, hierarchy tier, effective model, and cost source",
+	}, []string{"provider", "hierarchy_tier", "effective_model", "cost_source"})
 )
 
 // PipelineConfig haelt alle Abhaengigkeiten fuer den PipelineHandler.
 type PipelineConfig struct {
 	Registry            *Registry
+	Catalog             *ProviderCatalog
 	Config              *control.Config
 	Compiler            *compiler.Compiler
 	Normalizer          *normalizer.Normalizer
@@ -163,6 +169,7 @@ func InflightDeadlineFromEnv() time.Duration {
 // PipelineHandler orchestriert die 7-Step LLM-Pipeline.
 type PipelineHandler struct {
 	registry            *Registry
+	catalog             *ProviderCatalog
 	config              *control.Config
 	compiler            *compiler.Compiler
 	norm                *normalizer.Normalizer
@@ -223,10 +230,14 @@ type PipelineResponse struct {
 	// #427: cache-aware breakdown + resolved tier + per-call cost, threaded to
 	// the daemon so it can emit the AgentLlmUsage event (the daemon does not know
 	// the EffectiveModel/cost itself). CostUsd is filled at the response sink.
-	CacheRead     int     `json:"cache_read,omitempty"`
-	CacheCreation int     `json:"cache_creation,omitempty"`
-	Tier          string  `json:"tier,omitempty"`
-	CostUsd       float64 `json:"cost_usd,omitempty"`
+	CacheRead       int      `json:"cache_read,omitempty"`
+	CacheCreation   int      `json:"cache_creation,omitempty"`
+	Tier            string   `json:"tier,omitempty"`
+	CostUsd         float64  `json:"cost_usd"`
+	CostSource      string   `json:"cost_source,omitempty"`
+	HierarchyTier   int      `json:"hierarchy_tier,omitempty"`
+	EffectiveModel  string   `json:"effective_model,omitempty"`
+	ReportedCostUSD *float64 `json:"-"`
 }
 
 // NewPipelineHandler erstellt den Pipeline-Handler.
@@ -245,6 +256,7 @@ func NewPipelineHandler(cfg PipelineConfig) *PipelineHandler {
 
 	return &PipelineHandler{
 		registry:            cfg.Registry,
+		catalog:             cfg.Catalog,
 		config:              cfg.Config,
 		compiler:            cfg.Compiler,
 		norm:                cfg.Normalizer,
@@ -357,7 +369,27 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 
 	// --- Step 1: Config-Snapshot ---
 	snap := ph.config.Get()
-	req.RequestClass = ClassifyRequest(r.URL.Path, &req)
+	callerRole, authenticated := callerRoleFromContext(r.Context())
+	if !authenticated && strings.HasPrefix(r.URL.Path, "/v1/") {
+		// Direct handler composition remains safe: public paths have a fixed
+		// non-authoritative class even when the outer middleware is absent.
+		callerRole = CallerRoleExternalCompat
+		authenticated = true
+	}
+	if !authenticated {
+		ph.writeRequestError(w, &req, "authenticated caller context required", http.StatusUnauthorized)
+		return
+	}
+	var classifyErr error
+	req.RequestClass, classifyErr = ClassifyRequest(r.URL.Path, &req, callerRole)
+	if classifyErr != nil {
+		ph.writeRequestError(w, &req, classifyErr.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	if req.RequestClass == RequestClassAgentRuntime && req.Stream {
+		ph.writeRequestError(w, &req, "agent-runtime wire contract does not support streaming", http.StatusUnprocessableEntity)
+		return
+	}
 	if isLocalLoopActive(snap) {
 		req.PreferredProvider = LocalLoopProviderName
 	}
@@ -591,12 +623,34 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 				"reason", decision.Reason,
 			)
 		case intercept.RequestDrop:
-			w.WriteHeader(http.StatusNoContent)
+			if req.RequestClass == RequestClassAgentRuntime {
+				ph.writePipelineResponse(r.Context(), w, &req, PipelineResponse{
+					Model:        "sentinel-intercept-v1",
+					Provider:     "intercept",
+					Decision:     "dropped",
+					Tier:         "intercept",
+					FinishReason: "dropped",
+					RequestID:    requestID,
+				})
+			} else {
+				w.WriteHeader(http.StatusNoContent)
+			}
 			return
 		}
 	}
 
-	policyResolution, err := ResolveModelPolicy(providerName, req.RequestClass, req.Model, snap.AgentRuntimeModelPolicy)
+	var policyResolution ModelPolicyResolution
+	var err error
+	if ph.catalog != nil {
+		policyResolution, err = ph.catalog.ResolvePolicy(providerName, req.RequestClass, req.HierarchyTier, req.Model, snap.AgentRuntimeModelPolicy)
+	} else {
+		legacyPolicy, legacy := snap.AgentRuntimeModelPolicy.LegacyValue()
+		if !legacy {
+			err = fmt.Errorf("tiered model policy requires an immutable provider catalog")
+		} else {
+			policyResolution, err = ResolveModelPolicy(providerName, req.RequestClass, req.Model, legacyPolicy)
+		}
+	}
 	if err != nil {
 		ph.logger.Error("model policy rejected",
 			"request_id", requestID,
@@ -685,7 +739,9 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	if ph.guardrails != nil {
 		ph.guardrails.Record(providerName, resp.InputTokens, resp.OutputTokens)
 	}
-	guardrails.RecordRuntimeForwardCost(providerName, resp.InputTokens, resp.OutputTokens)
+	if ph.catalog == nil {
+		guardrails.RecordRuntimeForwardCost(providerName, resp.InputTokens, resp.OutputTokens)
+	}
 
 	// --- Step 6d: Personality Guard Check ---
 	content := resp.Content
@@ -707,15 +763,20 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	content, dropped := ph.applyOutboundInterception(requestID, agentName, providerName, &req, content, snap)
 	if dropped {
 		ph.writePipelineResponse(r.Context(), w, &req, PipelineResponse{
-			Content:      "",
-			Model:        resp.Model,
-			Provider:     "intercept",
-			Decision:     "dropped",
-			Tier:         "intercept",
-			TokensUsed:   0,
-			FinishReason: "dropped",
-			Actions:      nil,
-			RequestID:    requestID,
+			Content:         "",
+			Model:           resp.Model,
+			Provider:        providerName,
+			Decision:        "dropped",
+			Tier:            "intercept",
+			TokensUsed:      resp.TokensUsed,
+			InputTokens:     resp.InputTokens,
+			OutputTokens:    resp.OutputTokens,
+			CacheRead:       resp.CacheRead,
+			CacheCreation:   resp.CacheCreation,
+			ReportedCostUSD: resp.ReportedCostUSD,
+			FinishReason:    "dropped",
+			Actions:         nil,
+			RequestID:       requestID,
 		})
 		return
 	}
@@ -775,21 +836,22 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 	)
 
 	pipelineResp := PipelineResponse{
-		Content:       content,
-		ContentBlocks: pipelineResponseBlocks(content, resp),
-		Model:         resp.Model,
-		Provider:      providerName,
-		Decision:      "forward",
-		Tier:          resolveTier(req.EffectiveModel),
-		CacheRead:     resp.CacheRead,
-		CacheCreation: resp.CacheCreation,
-		FourthWall:    fourthWallVerdict,
-		TokensUsed:    resp.TokensUsed,
-		InputTokens:   resp.InputTokens,
-		OutputTokens:  resp.OutputTokens,
-		FinishReason:  resp.FinishReason,
-		Actions:       actions,
-		RequestID:     requestID,
+		Content:         content,
+		ContentBlocks:   pipelineResponseBlocks(content, resp),
+		Model:           resp.Model,
+		Provider:        providerName,
+		Decision:        "forward",
+		Tier:            resolveTier(req.EffectiveModel),
+		CacheRead:       resp.CacheRead,
+		CacheCreation:   resp.CacheCreation,
+		FourthWall:      fourthWallVerdict,
+		TokensUsed:      resp.TokensUsed,
+		InputTokens:     resp.InputTokens,
+		OutputTokens:    resp.OutputTokens,
+		FinishReason:    resp.FinishReason,
+		Actions:         actions,
+		RequestID:       requestID,
+		ReportedCostUSD: resp.ReportedCostUSD,
 	}
 	ph.writePipelineResponse(r.Context(), w, &req, pipelineResp)
 }
@@ -1379,6 +1441,20 @@ func (ph *PipelineHandler) persistActionRejection(action extraction.ExtractedAct
 }
 
 func (ph *PipelineHandler) writePipelineResponse(_ context.Context, w http.ResponseWriter, req *LLMRequest, resp PipelineResponse) {
+	resp.HierarchyTier = req.HierarchyTier
+	resp.EffectiveModel = effectiveModelForLog(req, resp.Model)
+	if ph.catalog != nil {
+		resp.CostUsd, resp.CostSource = resolveResponseCost(resp)
+	}
+	if resp.HierarchyTier >= 1 && resp.HierarchyTier <= 3 {
+		pipelineHierarchyRequestsTotal.WithLabelValues(
+			resp.Provider,
+			strconv.Itoa(resp.HierarchyTier),
+			resp.EffectiveModel,
+			resp.CostSource,
+		).Inc()
+	}
+
 	if ph.responseLogs != nil {
 		ph.responseLogs.Add(ResponseLogEntry{
 			RequestID:    resp.RequestID,
@@ -1405,10 +1481,34 @@ func (ph *PipelineHandler) writePipelineResponse(_ context.Context, w http.Respo
 	if rawInput < 0 {
 		rawInput = 0
 	}
-	resp.CostUsd = guardrails.RecordAgentUsage(agentLabel, resp.Tier, resp.Provider, rawInput, resp.OutputTokens, resp.CacheRead, resp.CacheCreation)
-	guardrails.RecordRuntimeAgentUsage(agentLabel, resp.InputTokens, resp.OutputTokens, resp.CostUsd)
+	if ph.catalog == nil {
+		resp.CostUsd = guardrails.RecordAgentUsage(agentLabel, resp.Tier, resp.Provider, rawInput, resp.OutputTokens, resp.CacheRead, resp.CacheCreation)
+	} else {
+		guardrails.RecordAgentUsageResolved(agentLabel, resp.Tier, rawInput, resp.OutputTokens, resp.CacheRead, resp.CacheCreation, resp.CostUsd)
+		if resp.Decision == "forward" || (resp.Decision == "dropped" && resp.Provider != "intercept") {
+			guardrails.RecordRuntimeForwardCostResolved(resp.Provider, resp.CostUsd)
+		}
+	}
+	guardrails.RecordRuntimeAgentUsageDimensions(
+		agentLabel,
+		resp.Tier,
+		resp.HierarchyTier,
+		resp.CostSource,
+		resp.InputTokens,
+		resp.OutputTokens,
+		resp.CostUsd,
+	)
 
-	payload := responsePayloadForRequest(req, resp)
+	wireResponse := resp
+	if req.RequestClass != RequestClassAgentRuntime {
+		// The usage-v2 wire contract is private to the authenticated agent
+		// runtime endpoint. Other callers still contribute to internal metrics,
+		// but do not receive hierarchy/cost-source routing internals.
+		wireResponse.HierarchyTier = 0
+		wireResponse.CostSource = ""
+		wireResponse.EffectiveModel = ""
+	}
+	payload := responsePayloadForRequest(req, wireResponse)
 
 	if ph.tickSync != nil && ph.tickSync.Enabled() {
 		if tick := parseTick(req.Metadata); tick > 0 {
@@ -1431,6 +1531,11 @@ func (ph *PipelineHandler) writePipelineResponse(_ context.Context, w http.Respo
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		ph.logger.Error("failed to encode response", "error", err)
 	}
+}
+
+func resolveResponseCost(resp PipelineResponse) (float64, string) {
+	result := resolveResponseCostAt(resp, time.Now())
+	return result.USD, result.Source
 }
 
 func effectiveModelForLog(req *LLMRequest, responseModel string) string {
@@ -1674,6 +1779,7 @@ func cloneRegenRequest(base *LLMRequest, messages []Message, temperature float64
 		RequestClass:       base.RequestClass,
 		EffectiveModel:     base.EffectiveModel,
 		PolicySource:       base.PolicySource,
+		HierarchyTier:      base.HierarchyTier,
 		ProviderTimeout:    base.ProviderTimeout,
 	}
 }

@@ -3,6 +3,7 @@ id = 2
 name = "Lisa Brenner"
 role = "Head of Design / Art Director"
 department = "Design"
+tier = 2
 shift_set = 1
 kpis = ["Design-Durchlaufzeit < 5 Werktage", "Kunden-Revisionsrunden < 3 pro Projekt", "Design-System-Konsistenz > 90%"]
 reports_to = "Thomas Mueller"

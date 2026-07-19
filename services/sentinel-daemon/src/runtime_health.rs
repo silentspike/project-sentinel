@@ -435,6 +435,7 @@ mod tests {
                 name: name.to_string(),
                 role: "Role".to_string(),
                 department: "Dept".to_string(),
+                tier: None,
                 shift_set,
                 kpis: Vec::new(),
                 reports_to: None,

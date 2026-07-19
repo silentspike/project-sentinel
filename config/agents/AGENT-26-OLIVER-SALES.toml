@@ -3,6 +3,7 @@ id = 26
 name = "Oliver Brandt"
 role = "Head of Sales"
 department = "Vertrieb"
+tier = 2
 shift_set = 2
 kpis = ["Neukundengewinnung > 3 pro Quartal", "Angebots-Pipeline > 500k EUR", "Bestandskunden-Upselling > 20%"]
 reports_to = "Michael Hartmann"

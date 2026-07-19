@@ -3,6 +3,7 @@ id = 9
 name = "Sarah Bergmann"
 role = "Head of PM / Senior Projektmanagerin"
 department = "Projektmanagement"
+tier = 2
 shift_set = 1
 kpis = ["Projekt-Meilensteine on-time > 80%", "Kundenkommunikation-Responsetime < 4h", "Team-Auslastung 75-85%"]
 reports_to = "Thomas Mueller"

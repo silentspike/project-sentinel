@@ -3,6 +3,7 @@ id = 56
 name = "Tobias Hartmann"
 role = "Delivery Manager"
 department = "Projektmanagement"
+tier = 2
 shift_set = 1
 kpis = ["On-Time-Delivery > 90%", "Kunden-Zufriedenheit nach Abnahme > 4/5", "Release-Defects < 1 pro Auslieferung"]
 reports_to = "Sarah Bergmann"

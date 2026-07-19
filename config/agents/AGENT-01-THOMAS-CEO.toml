@@ -3,6 +3,7 @@ id = 1
 name = "Thomas Mueller"
 role = "CEO / Geschaeftsfuehrer / Gruender"
 department = "Geschaeftsfuehrung"
+tier = 1
 shift_set = 1
 kpis = ["Kundenzufriedenheit NPS > 8", "Projekte on-time > 85%", "Umsatzwachstum 10%/Jahr"]
 reports_to = ""

@@ -3,6 +3,7 @@ id = 32
 name = "Jens Krueger"
 role = "Design-Lead / Art Director"
 department = "Design"
+tier = 2
 shift_set = 3
 kpis = ["Design-Qualitaet Kunden-Score > 4.5/5", "Kreativ-Konzept-Abnahme in < 2 Iterationen", "Design-Konsistenz ueber alle Projekte"]
 reports_to = "Sandra Vogel"

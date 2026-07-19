@@ -3,6 +3,7 @@ id = 16
 name = "Michael Hartmann"
 role = "CEO / Geschaeftsfuehrer"
 department = "Geschaeftsfuehrung"
+tier = 1
 shift_set = 2
 kpis = ["Mitarbeiterzufriedenheit > 80%", "Projektmarge > 25%", "Kundenbindungsrate > 70%"]
 reports_to = ""

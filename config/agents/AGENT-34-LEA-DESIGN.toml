@@ -3,6 +3,7 @@ id = 34
 name = "Lea Hoffmann"
 role = "Motion/Visual Designerin (Junior)"
 department = "Design"
+tier = 3
 shift_set = 3
 reports_to = "Jens Krueger"
 

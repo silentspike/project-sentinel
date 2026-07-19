@@ -3,6 +3,7 @@ id = 50
 name = "Katharina \"Kathi\" Wiegand"
 role = "Betriebspsychologin"
 department = "Betriebsgesundheit"
+tier = 2
 shift_set = 0
 kpis = ["Mitarbeitergespraeche > 5 pro Woche", "Teamworkshops > 1/Quartal", "Fruehwarnindikatoren dokumentiert"]
 reports_to = ""

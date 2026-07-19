@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -55,17 +56,43 @@ func main() {
 	// 2. Configuration from environment
 	port := envOrDefault("CORTEX_PORT", "8080")
 	controlPort := envOrDefault("CORTEX_CONTROL_PORT", "8081")
+	proxyBind := envOrDefault("CORTEX_PROXY_BIND", "0.0.0.0")
+	controlBind := envOrDefault("CORTEX_CONTROL_BIND", "127.0.0.1")
+	catalogPath := os.Getenv("SENTINEL_CORTEX_CONFIG")
+	if catalogPath == "" {
+		catalogPath = envOrDefault("CORTEX_GATEWAY_CONFIG", "config/cortex-gateway.toml")
+	}
+	catalog, err := proxy.LoadProviderCatalog(catalogPath)
+	if err != nil {
+		logger.Error("provider catalog rejected", "error", err)
+		os.Exit(1)
+	}
+	if err := catalog.RequireProviders(map[string]string{
+		"anthropic-direct":          "anthropic-direct",
+		"claude-code":               "claude-code",
+		"ollama":                    "ollama",
+		proxy.LocalLoopProviderName: "local-loop",
+	}); err != nil {
+		logger.Error("provider catalog does not match gateway composition", "error", err)
+		os.Exit(1)
+	}
+	credentials, err := proxy.LoadCallerCredentialsFromFiles()
+	if err != nil {
+		logger.Error("internal caller credentials rejected", "error", err)
+		os.Exit(1)
+	}
 
 	// 3. Provider registry
 	registry := proxy.NewRegistry()
 	forwardQueue := forwardqueue.NewManager(envIntOrDefault("SENTINEL_MAX_FORWARD_CONCURRENCY", 3))
 
 	// Optional provider: direct Anthropic Messages API with structured system[]
-	anthropicModel := envOrDefault("ANTHROPIC_MODEL", "claude-opus-4-6")
+	anthropicCatalog, _ := catalog.Entry("anthropic-direct")
+	anthropicModel := anthropicCatalog.DefaultModel
 	anthropicDirectProvider := proxy.NewQueuedProvider(proxy.NewAnthropicDirectProvider(proxy.ProviderConfig{
 		Name:      "anthropic-direct",
 		Type:      "anthropic-direct",
-		BaseURL:   envOrDefault("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+		BaseURL:   envOrDefault("ANTHROPIC_BASE_URL", anthropicCatalog.BaseURL),
 		APIKey:    os.Getenv("ANTHROPIC_API_KEY"),
 		Model:     anthropicModel,
 		MaxTokens: 4096,
@@ -75,18 +102,27 @@ func main() {
 	logger.Info("registered provider", "name", "anthropic-direct", "model", anthropicModel)
 
 	// Optional legacy/debug provider: Claude Code subprocess
+	claudeCodeCatalog, _ := catalog.Entry("claude-code")
 	claudeCodeProvider := proxy.NewQueuedProvider(proxy.NewClaudeCodeProvider(proxy.ProviderConfig{
 		Name:    "claude-code",
 		Type:    "claude-code",
-		BaseURL: envOrDefault("CLAUDE_CODE_BINARY", "claude"), // binary path
-		Model:   envOrDefault("CLAUDE_CODE_MODEL", "claude-opus-4-6"),
+		BaseURL: envOrDefault("CLAUDE_CODE_BINARY", claudeCodeCatalog.Binary), // binary path
+		Model:   claudeCodeCatalog.DefaultModel,
 	}, logger), forwardQueue)
 	registry.Register("claude-code", claudeCodeProvider)
-	logger.Info("registered provider", "name", "claude-code", "model", envOrDefault("CLAUDE_CODE_MODEL", "claude-opus-4-6"))
+	logger.Info("registered provider", "name", "claude-code", "model", claudeCodeCatalog.DefaultModel)
 
+	ollamaCatalog, _ := catalog.Entry("ollama")
+	registry.Register("ollama", proxy.NewQueuedProvider(proxy.NewOllamaProvider(proxy.ProviderConfig{
+		Name: "ollama", Type: "ollama", BaseURL: envOrDefault("OLLAMA_BASE_URL", ollamaCatalog.BaseURL),
+		Model: ollamaCatalog.DefaultModel, MaxTokens: ollamaCatalog.MaxTokens,
+	}), forwardQueue))
+	logger.Info("registered provider", "name", "ollama", "model", ollamaCatalog.DefaultModel)
+
+	localLoopCatalog, _ := catalog.Entry(proxy.LocalLoopProviderName)
 	localLoopProvider, err := proxy.NewLocalLoopProvider(proxy.LocalLoopConfig{
 		Name:         proxy.LocalLoopProviderName,
-		Model:        envOrDefault("CORTEX_LOCAL_LOOP_MODEL", "local-loop"),
+		Model:        localLoopCatalog.DefaultModel,
 		ScenarioPath: os.Getenv("CORTEX_LOCAL_LOOP_SCENARIO"),
 	})
 	if err != nil {
@@ -94,10 +130,22 @@ func main() {
 		os.Exit(1)
 	}
 	registry.Register(proxy.LocalLoopProviderName, localLoopProvider)
-	logger.Info("registered provider", "name", proxy.LocalLoopProviderName, "model", envOrDefault("CORTEX_LOCAL_LOOP_MODEL", "local-loop"))
+	logger.Info("registered provider", "name", proxy.LocalLoopProviderName, "model", localLoopCatalog.DefaultModel)
 
 	// 4. Control config (shared between pipeline + control plane)
-	controlConfig := control.NewConfig(defaultPrimaryProvider())
+	primaryProvider := defaultPrimaryProvider()
+	if _, ok := catalog.Entry(primaryProvider); !ok {
+		logger.Error("primary provider is not in immutable startup catalog", "provider", primaryProvider)
+		os.Exit(1)
+	}
+	controlConfig := control.NewConfig(primaryProvider)
+	controlConfig.SetAgentRuntimePolicyValidator(catalog.ValidatePolicy)
+	controlConfig.SetProviderValidator(func(provider string) error {
+		if _, ok := catalog.Entry(provider); !ok {
+			return fmt.Errorf("provider %q is not in the immutable startup catalog", provider)
+		}
+		return nil
+	})
 	applyTrafficControlDefaults(controlConfig, logger)
 	applyHardeningDefaults(controlConfig, logger)
 
@@ -251,6 +299,7 @@ func main() {
 
 	pipelineHandler := proxy.NewPipelineHandler(proxy.PipelineConfig{
 		Registry:            registry,
+		Catalog:             catalog,
 		Config:              controlConfig,
 		Compiler:            promptCompiler,
 		Normalizer:          normalizer.New(),
@@ -281,13 +330,14 @@ func main() {
 	proxyMux.Handle("POST /v1/chat/completions", pipelineHandler)
 	// Canonical internal gateway contract for daemon/judge traffic.
 	proxyMux.Handle("POST /internal/llm", pipelineHandler)
+	proxyMux.Handle("POST /internal/agent-runtime", pipelineHandler)
 	proxyMux.HandleFunc("GET /health", handleHealth(pipelineHandler, guardrailsEnforcer != nil))
-	proxyMux.HandleFunc("GET /ready", handleReady)
+	proxyMux.HandleFunc("GET /ready", handleReady(catalog, controlConfig, registry))
 	proxyMux.Handle("GET /metrics", promhttp.Handler())
 
 	proxyServer := &http.Server{
-		Addr:         ":" + port,
-		Handler:      proxyMux,
+		Addr:         net.JoinHostPort(proxyBind, port),
+		Handler:      credentials.Middleware(proxyMux),
 		ReadTimeout:  readTimeout,
 		WriteTimeout: writeTimeout,
 		IdleTimeout:  idleTimeout,
@@ -337,6 +387,9 @@ func main() {
 			"cost_by_provider":            costStats.ByProvider,
 			"cost_by_agent":               costStats.CostByAgent,
 			"tokens_by_agent":             costStats.TokensByAgent,
+			"by_model_tier":               costStats.ByModelTier,
+			"by_hierarchy_tier":           costStats.ByHierarchyTier,
+			"by_cost_source":              costStats.ByCostSource,
 			"local_loop_enabled":          localLoopActive,
 			"primary_provider":            trafficConfig.PrimaryProvider,
 			"internal_primary_provider":   trafficConfig.PrimaryProvider,
@@ -526,7 +579,7 @@ func main() {
 	})
 
 	controlServer := &http.Server{
-		Addr:         ":" + controlPort,
+		Addr:         net.JoinHostPort(controlBind, controlPort),
 		Handler:      controlMux,
 		ReadTimeout:  readTimeout,
 		WriteTimeout: writeTimeout,
@@ -593,9 +646,54 @@ func handleHealth(pipeline *proxy.PipelineHandler, guardrailsEnabled bool) http.
 	}
 }
 
-func handleReady(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = fmt.Fprint(w, `{"ready":true}`)
+func handleReady(catalog *proxy.ProviderCatalog, cfg *control.Config, registry *proxy.Registry) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		response := map[string]interface{}{
+			"ready":                                true,
+			"caller_credentials_present":           true,
+			"caller_credentials_pairwise_distinct": true,
+			"caller_credential_count":              4,
+			"catalog_digest_algorithm":             proxy.CatalogDigestAlgorithm,
+			"catalog_semantic_digest":              catalog.Digest(),
+			"catalog_provider_ids":                  catalog.ProviderIDs(),
+			"model_inventory_status":               "not_applicable",
+		}
+
+		primary := cfg.Get().PrimaryProvider
+		response["active_provider"] = primary
+		provider, ok := registry.Get(primary)
+		if !ok {
+			response["ready"] = false
+			response["model_inventory_status"] = "provider_unavailable"
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(response)
+			return
+		}
+		inventoryProvider, ok := provider.(proxy.ModelInventoryProvider)
+		if !ok {
+			_ = json.NewEncoder(w).Encode(response)
+			return
+		}
+
+		models, err := inventoryProvider.ModelInventory(r.Context())
+		if err != nil {
+			response["ready"] = false
+			response["model_inventory_status"] = "unavailable"
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(response)
+			return
+		}
+		if err := catalog.ValidateInventory(primary, models); err != nil {
+			response["ready"] = false
+			response["model_inventory_status"] = "drift"
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(response)
+			return
+		}
+		response["model_inventory_status"] = "validated"
+		_ = json.NewEncoder(w).Encode(response)
+	}
 }
 
 type interceptDecisionPayload struct {

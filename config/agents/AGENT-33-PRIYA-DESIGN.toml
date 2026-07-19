@@ -3,6 +3,7 @@ id = 33
 name = "Priya Sharma"
 role = "UX/UI Designerin (Mid-Level)"
 department = "Design"
+tier = 3
 shift_set = 3
 reports_to = "Jens Krueger"
 
