@@ -1,0 +1,579 @@
+0sentinel-gaia v0.1.0 (<REMOTE_PROJECT>/services/sentinel-gaia)
+1anyhow feature "default"
+2anyhow v1.0.103
+2anyhow feature "std"
+3anyhow v1.0.103
+1blake3 feature "default"
+2blake3 v1.8.3
+3arrayvec v0.7.6
+3constant_time_eq v0.4.2
+3arrayref feature "default"
+4arrayref v0.3.9
+3cfg-if feature "default"
+4cfg-if v1.0.4
+3cpufeatures feature "default"
+4cpufeatures v0.2.17
+2blake3 feature "std"
+3blake3 v1.8.3 (*)
+3constant_time_eq feature "std"
+4constant_time_eq v0.4.2
+1clap feature "default"
+2clap v4.5.60
+3clap_builder v4.5.60
+4anstream feature "default"
+5anstream v0.6.21
+6anstyle feature "default"
+7anstyle v1.0.13
+7anstyle feature "std"
+8anstyle v1.0.13
+6anstyle-parse feature "default"
+7anstyle-parse v0.2.7
+8utf8parse feature "default"
+9utf8parse v0.2.2
+7anstyle-parse feature "utf8"
+8anstyle-parse v0.2.7 (*)
+6utf8parse feature "default" (*)
+6anstyle-query feature "default"
+7anstyle-query v1.1.5
+6colorchoice feature "default"
+7colorchoice v1.0.4
+6is_terminal_polyfill feature "default"
+7is_terminal_polyfill v1.70.2
+5anstream feature "auto"
+6anstream v0.6.21 (*)
+5anstream feature "wincon"
+6anstream v0.6.21 (*)
+4anstyle feature "default" (*)
+4clap_lex feature "default"
+5clap_lex v1.0.0
+4strsim feature "default"
+5strsim v0.11.1
+3clap_derive feature "default"
+4clap_derive v4.5.55 (proc-macro)
+5heck feature "default"
+6heck v0.5.0
+5proc-macro2 feature "default"
+6proc-macro2 v1.0.106
+7unicode-ident feature "default"
+8unicode-ident v1.0.24
+6proc-macro2 feature "proc-macro"
+7proc-macro2 v1.0.106 (*)
+5quote feature "default"
+6quote v1.0.44
+7proc-macro2 v1.0.106 (*)
+6quote feature "proc-macro"
+7quote v1.0.44 (*)
+7proc-macro2 feature "proc-macro" (*)
+5syn feature "default"
+6syn v2.0.117
+7proc-macro2 v1.0.106 (*)
+7quote v1.0.44 (*)
+7unicode-ident feature "default" (*)
+6syn feature "clone-impls"
+7syn v2.0.117 (*)
+6syn feature "derive"
+7syn v2.0.117 (*)
+6syn feature "parsing"
+7syn v2.0.117 (*)
+6syn feature "printing"
+7syn v2.0.117 (*)
+6syn feature "proc-macro"
+7syn v2.0.117 (*)
+7proc-macro2 feature "proc-macro" (*)
+7quote feature "proc-macro" (*)
+5syn feature "full"
+6syn v2.0.117 (*)
+2clap feature "color"
+3clap v4.5.60 (*)
+3clap_builder feature "color"
+4clap_builder v4.5.60 (*)
+2clap feature "error-context"
+3clap v4.5.60 (*)
+3clap_builder feature "error-context"
+4clap_builder v4.5.60 (*)
+2clap feature "help"
+3clap v4.5.60 (*)
+3clap_builder feature "help"
+4clap_builder v4.5.60 (*)
+2clap feature "std"
+3clap v4.5.60 (*)
+3clap_builder feature "std"
+4clap_builder v4.5.60 (*)
+4anstyle feature "std" (*)
+2clap feature "suggestions"
+3clap v4.5.60 (*)
+3clap_builder feature "suggestions"
+4clap_builder v4.5.60 (*)
+4clap_builder feature "error-context" (*)
+2clap feature "usage"
+3clap v4.5.60 (*)
+3clap_builder feature "usage"
+4clap_builder v4.5.60 (*)
+1clap feature "derive"
+2clap v4.5.60 (*)
+1sentinel-common feature "default"
+2sentinel-common v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-common)
+3anyhow feature "default" (*)
+3bevy_ecs feature "default"
+4bevy_ecs v0.18.1
+5bevy_tasks v0.18.0
+6async-task v4.7.1
+6atomic-waker v1.1.2
+6bevy_platform feature "alloc"
+7bevy_platform v0.18.0
+8foldhash v0.2.0
+8serde v1.0.228
+9serde_core feature "result"
+10serde_core v1.0.228
+9serde_derive feature "default"
+10serde_derive v1.0.228 (proc-macro)
+11proc-macro2 feature "proc-macro" (*)
+11quote feature "proc-macro" (*)
+11syn feature "clone-impls" (*)
+11syn feature "derive" (*)
+11syn feature "parsing" (*)
+11syn feature "printing" (*)
+11syn feature "proc-macro" (*)
+8hashbrown feature "equivalent"
+9hashbrown v0.16.1
+10equivalent v1.0.2
+10serde_core v1.0.228
+8hashbrown feature "raw-entry"
+9hashbrown v0.16.1 (*)
+8spin feature "barrier"
+9spin v0.10.1
+9spin feature "mutex"
+10spin v0.10.1
+8spin feature "lazy"
+9spin v0.10.1
+9spin feature "once"
+10spin v0.10.1
+8spin feature "mutex" (*)
+8spin feature "once" (*)
+8spin feature "rwlock"
+9spin v0.10.1
+8spin feature "spin_mutex"
+9spin v0.10.1
+9spin feature "mutex" (*)
+7serde feature "alloc"
+8serde v1.0.228 (*)
+8serde_core feature "alloc"
+9serde_core v1.0.228
+6derive_more feature "deref"
+7derive_more v2.1.1
+8derive_more-impl feature "default"
+9derive_more-impl v2.1.1 (proc-macro)
+10proc-macro2 feature "default" (*)
+10quote feature "default" (*)
+10syn feature "default" (*)
+10convert_case feature "default"
+11convert_case v0.10.0
+12unicode-segmentation feature "default"
+13unicode-segmentation v1.12.0
+10unicode-xid feature "default"
+11unicode-xid v0.2.6
+7derive_more-impl feature "deref"
+8derive_more-impl v2.1.1 (proc-macro) (*)
+6derive_more feature "deref_mut"
+7derive_more v2.1.1 (*)
+7derive_more-impl feature "deref_mut"
+8derive_more-impl v2.1.1 (proc-macro) (*)
+6async-executor feature "default"
+7async-executor v1.14.0
+8futures-lite v2.6.1
+9fastrand v2.3.0
+9futures-core v0.3.32
+9futures-io feature "default"
+10futures-io v0.3.32
+10futures-io feature "std"
+11futures-io v0.3.32
+9parking feature "default"
+10parking v2.2.1
+9pin-project-lite feature "default"
+10pin-project-lite v0.2.16
+8async-task feature "default"
+9async-task v4.7.1
+9async-task feature "std"
+10async-task v4.7.1
+8concurrent-queue feature "default"
+9concurrent-queue v2.5.0
+10crossbeam-utils v0.8.21
+9concurrent-queue feature "std"
+10concurrent-queue v2.5.0 (*)
+8fastrand feature "default"
+9fastrand v2.3.0
+9fastrand feature "std"
+10fastrand v2.3.0
+10fastrand feature "alloc"
+11fastrand v2.3.0
+8pin-project-lite feature "default" (*)
+8slab feature "default"
+9slab v0.4.12
+9slab feature "std"
+10slab v0.4.12
+6futures-lite feature "alloc"
+7futures-lite v2.6.1 (*)
+6crossbeam-queue feature "alloc"
+7crossbeam-queue v0.3.12
+8crossbeam-utils v0.8.21
+5bevy_utils v0.18.0
+6bevy_platform v0.18.0 (*)
+6disqualified v1.0.0
+6thread_local feature "default"
+7thread_local v1.1.9
+8cfg-if feature "default" (*)
+5bitflags v2.11.0
+5concurrent-queue v2.5.0 (*)
+5fixedbitset v0.5.7
+5indexmap v2.14.0
+6equivalent v1.0.2
+6hashbrown v0.17.1
+5log v0.4.29
+5nonmax v0.5.5
+5slotmap v1.1.1
+5thiserror v2.0.18
+6thiserror-impl feature "default"
+7thiserror-impl v2.0.18 (proc-macro)
+8proc-macro2 feature "default" (*)
+8quote feature "default" (*)
+8syn feature "default" (*)
+5variadics_please v1.1.0 (proc-macro)
+6proc-macro2 feature "default" (*)
+6quote feature "default" (*)
+6syn feature "default" (*)
+5bevy_ecs_macros feature "default"
+6bevy_ecs_macros v0.18.0 (proc-macro)
+7proc-macro2 feature "default" (*)
+7quote feature "default" (*)
+7syn feature "default" (*)
+7syn feature "extra-traits"
+8syn v2.0.117 (*)
+7syn feature "full" (*)
+7bevy_macro_utils feature "default"
+8bevy_macro_utils v0.18.0
+9proc-macro2 feature "default" (*)
+9quote feature "default" (*)
+9syn feature "default" (*)
+9toml_edit feature "parse"
+10toml_edit v0.23.10+spec-1.0.0
+11indexmap feature "default"
+12indexmap v2.14.0
+13equivalent v1.0.2
+13hashbrown v0.17.1
+12indexmap feature "std"
+13indexmap v2.14.0 (*)
+11indexmap feature "std" (*)
+11toml_datetime feature "default"
+12toml_datetime v0.7.5+spec-1.1.0
+12toml_datetime feature "std"
+13toml_datetime v0.7.5+spec-1.1.0
+13toml_datetime feature "alloc"
+14toml_datetime v0.7.5+spec-1.1.0
+11toml_parser feature "default"
+12toml_parser v1.0.9+spec-1.1.0
+13winnow v0.7.14
+12toml_parser feature "std"
+13toml_parser v1.0.9+spec-1.1.0 (*)
+13toml_parser feature "alloc"
+14toml_parser v1.0.9+spec-1.1.0 (*)
+11winnow feature "default"
+12winnow v0.7.14
+12winnow feature "std"
+13winnow v0.7.14
+13winnow feature "alloc"
+14winnow v0.7.14
+5bevy_platform feature "alloc" (*)
+5bevy_ptr feature "default"
+6bevy_ptr v0.18.0
+5bevy_reflect feature "indexmap"
+6bevy_reflect v0.18.0
+7bevy_utils v0.18.0 (*)
+7disqualified v1.0.0
+7downcast-rs v2.0.2
+7foldhash v0.2.0
+7indexmap v2.14.0 (*)
+7smallvec v1.15.1
+7thiserror v2.0.18 (*)
+7bevy_platform feature "alloc" (*)
+7bevy_platform feature "serialize"
+8bevy_platform v0.18.0 (*)
+8bevy_platform feature "hashbrown"
+9bevy_platform v0.18.0 (*)
+8hashbrown feature "serde"
+9hashbrown v0.16.1 (*)
+7serde feature "alloc" (*)
+7bevy_ptr feature "default" (*)
+7assert_type_match feature "default"
+8assert_type_match v0.1.1 (proc-macro)
+9proc-macro2 feature "default" (*)
+9quote feature "default" (*)
+9syn feature "default" (*)
+7bevy_reflect_derive feature "default"
+8bevy_reflect_derive v0.18.0 (proc-macro)
+9proc-macro2 feature "default" (*)
+9quote feature "default" (*)
+9syn feature "default" (*)
+9syn feature "extra-traits" (*)
+9syn feature "full" (*)
+9bevy_macro_utils feature "default" (*)
+9indexmap feature "default" (*)
+7derive_more feature "from"
+8derive_more v2.1.1 (*)
+8derive_more-impl feature "from"
+9derive_more-impl v2.1.1 (proc-macro) (*)
+9syn feature "extra-traits" (*)
+7erased-serde feature "alloc"
+8erased-serde v0.4.9
+9serde_core v1.0.228
+9typeid feature "default"
+10typeid v1.0.3
+8serde_core feature "alloc" (*)
+7variadics_please feature "default"
+8variadics_please v1.1.0 (proc-macro) (*)
+8variadics_please feature "alloc"
+9variadics_please v1.1.0 (proc-macro) (*)
+5bevy_reflect feature "smallvec"
+6bevy_reflect v0.18.0 (*)
+5derive_more feature "as_ref"
+6derive_more v2.1.1 (*)
+6derive_more-impl feature "as_ref"
+7derive_more-impl v2.1.1 (proc-macro) (*)
+7syn feature "extra-traits" (*)
+7syn feature "visit"
+8syn v2.0.117 (*)
+5derive_more feature "display"
+6derive_more v2.1.1 (*)
+6derive_more-impl feature "display"
+7derive_more-impl v2.1.1 (proc-macro) (*)
+7syn feature "extra-traits" (*)
+5derive_more feature "from" (*)
+5derive_more feature "into"
+6derive_more v2.1.1 (*)
+6derive_more-impl feature "into"
+7derive_more-impl v2.1.1 (proc-macro) (*)
+7syn feature "extra-traits" (*)
+7syn feature "visit-mut"
+8syn v2.0.117 (*)
+5smallvec feature "const_generics"
+6smallvec v1.15.1
+5smallvec feature "union"
+6smallvec v1.15.1
+5bumpalo feature "default"
+6bumpalo v3.20.2
+4bevy_ecs feature "async_executor"
+5bevy_ecs v0.18.1 (*)
+5bevy_ecs feature "std"
+6bevy_ecs v0.18.1 (*)
+6bevy_platform feature "std"
+7bevy_platform v0.18.0 (*)
+7bevy_platform feature "alloc" (*)
+7foldhash feature "std"
+8foldhash v0.2.0
+7serde feature "std"
+8serde v1.0.228 (*)
+8serde_core feature "std"
+9serde_core v1.0.228
+7spin feature "std"
+8spin v0.10.1
+6bevy_reflect feature "std"
+7bevy_reflect v0.18.0 (*)
+7bevy_platform feature "std" (*)
+7serde feature "std" (*)
+7downcast-rs feature "std"
+8downcast-rs v2.0.2
+7erased-serde feature "std"
+8erased-serde v0.4.9 (*)
+8serde_core feature "std" (*)
+8erased-serde feature "alloc" (*)
+6bevy_utils feature "parallel"
+7bevy_utils v0.18.0 (*)
+7bevy_platform feature "std" (*)
+6bevy_utils feature "std"
+7bevy_utils v0.18.0 (*)
+7disqualified feature "alloc"
+8disqualified v1.0.0
+6indexmap feature "std"
+7indexmap v2.14.0 (*)
+6concurrent-queue feature "std" (*)
+6bitflags feature "std"
+7bitflags v2.11.0
+6fixedbitset feature "std"
+7fixedbitset v0.5.7
+6log feature "std"
+7log v0.4.29
+6nonmax feature "std"
+7nonmax v0.5.5
+5bevy_tasks feature "async_executor"
+6bevy_tasks v0.18.0 (*)
+6bevy_platform feature "std" (*)
+6bevy_tasks feature "futures-lite"
+7bevy_tasks v0.18.0 (*)
+7bevy_platform feature "std" (*)
+7futures-lite feature "std"
+8futures-lite v2.6.1 (*)
+8fastrand feature "std" (*)
+8futures-lite feature "alloc" (*)
+8futures-lite feature "fastrand"
+9futures-lite v2.6.1 (*)
+8futures-lite feature "futures-io"
+9futures-lite v2.6.1 (*)
+8futures-lite feature "parking"
+9futures-lite v2.6.1 (*)
+4bevy_ecs feature "backtrace"
+5bevy_ecs v0.18.1 (*)
+5bevy_ecs feature "std" (*)
+4bevy_ecs feature "bevy_reflect"
+5bevy_ecs v0.18.1 (*)
+4bevy_ecs feature "std" (*)
+3serde feature "default"
+4serde v1.0.228 (*)
+4serde feature "std" (*)
+3serde feature "derive"
+4serde v1.0.228 (*)
+4serde feature "serde_derive"
+5serde v1.0.228 (*)
+3thiserror feature "default"
+4thiserror v2.0.18 (*)
+4thiserror feature "std"
+5thiserror v2.0.18 (*)
+3bincode feature "default"
+4bincode v2.0.1
+5serde v1.0.228 (*)
+5bincode_derive feature "default"
+6bincode_derive v2.0.1 (proc-macro)
+7virtue feature "default"
+8virtue v0.0.18
+5unty feature "default"
+6unty v0.0.4
+4bincode feature "derive"
+5bincode v2.0.1 (*)
+5bincode feature "bincode_derive"
+6bincode v2.0.1 (*)
+4bincode feature "std"
+5bincode v2.0.1 (*)
+5serde feature "std" (*)
+5bincode feature "alloc"
+6bincode v2.0.1 (*)
+6serde feature "alloc" (*)
+3bincode feature "serde"
+4bincode v2.0.1 (*)
+3flatbuffers feature "default"
+4flatbuffers v25.12.19
+5bitflags feature "default"
+6bitflags v2.11.0
+4flatbuffers feature "std"
+5flatbuffers v25.12.19 (*)
+3serde_json feature "default"
+4serde_json v1.0.149
+5memchr v2.8.0
+5serde_core v1.0.228
+5itoa feature "default"
+6itoa v1.0.17
+5zmij feature "default"
+6zmij v1.0.21
+4serde_json feature "std"
+5serde_json v1.0.149 (*)
+5serde_core feature "std" (*)
+5memchr feature "std"
+6memchr v2.8.0
+6memchr feature "alloc"
+7memchr v2.8.0
+3toml feature "default"
+4toml v1.0.6+spec-1.1.0
+5winnow v0.7.14
+5serde_core feature "alloc" (*)
+5serde_spanned feature "alloc"
+6serde_spanned v1.0.4
+7serde_core v1.0.228
+6serde_core feature "alloc" (*)
+5toml_datetime feature "alloc"
+6toml_datetime v1.0.0+spec-1.1.0
+7serde_core v1.0.228
+6serde_core feature "alloc" (*)
+5toml_parser feature "alloc"
+6toml_parser v1.0.9+spec-1.1.0
+7winnow v0.7.14
+5toml_writer feature "alloc"
+6toml_writer v1.0.6+spec-1.1.0
+4toml feature "display"
+5toml v1.0.6+spec-1.1.0 (*)
+4toml feature "parse"
+5toml v1.0.6+spec-1.1.0 (*)
+4toml feature "serde"
+5toml v1.0.6+spec-1.1.0 (*)
+5serde_spanned feature "serde"
+6serde_spanned v1.0.4 (*)
+5toml_datetime feature "serde"
+6toml_datetime v1.0.0+spec-1.1.0 (*)
+4toml feature "std"
+5toml v1.0.6+spec-1.1.0 (*)
+5serde_core feature "std" (*)
+5serde_spanned feature "std"
+6serde_spanned v1.0.4 (*)
+6serde_core feature "std" (*)
+6serde_spanned feature "alloc" (*)
+5toml_datetime feature "std"
+6toml_datetime v1.0.0+spec-1.1.0 (*)
+6serde_core feature "std" (*)
+6toml_datetime feature "alloc" (*)
+5toml_parser feature "std"
+6toml_parser v1.0.9+spec-1.1.0 (*)
+6toml_parser feature "alloc" (*)
+5toml_writer feature "std"
+6toml_writer v1.0.6+spec-1.1.0
+6toml_writer feature "alloc" (*)
+3tracing feature "default"
+4tracing v0.1.44
+5tracing-core v0.1.36
+6once_cell feature "default"
+7once_cell v1.21.3
+7once_cell feature "std"
+8once_cell v1.21.3
+8once_cell feature "alloc"
+9once_cell v1.21.3
+9once_cell feature "race"
+10once_cell v1.21.3
+5pin-project-lite feature "default" (*)
+5tracing-attributes feature "default"
+6tracing-attributes v0.1.31 (proc-macro)
+7proc-macro2 feature "default" (*)
+7quote feature "default" (*)
+7syn feature "clone-impls" (*)
+7syn feature "extra-traits" (*)
+7syn feature "full" (*)
+7syn feature "parsing" (*)
+7syn feature "printing" (*)
+7syn feature "proc-macro" (*)
+7syn feature "visit-mut" (*)
+4tracing feature "attributes"
+5tracing v0.1.44 (*)
+5tracing feature "tracing-attributes"
+6tracing v0.1.44 (*)
+4tracing feature "std"
+5tracing v0.1.44 (*)
+5tracing-core feature "std"
+6tracing-core v0.1.36 (*)
+6tracing-core feature "once_cell"
+7tracing-core v0.1.36 (*)
+3uuid feature "default"
+4uuid v1.22.0
+5serde_core v1.0.228
+5getrandom feature "default"
+6getrandom v0.4.1
+7libc v0.2.186
+7cfg-if feature "default" (*)
+4uuid feature "std"
+5uuid v1.22.0 (*)
+3uuid feature "serde"
+4uuid v1.22.0 (*)
+3uuid feature "v4"
+4uuid v1.22.0 (*)
+4uuid feature "rng"
+5uuid v1.22.0 (*)
+3uuid feature "v7"
+4uuid v1.22.0 (*)
+4uuid feature "rng" (*)
+1serde feature "default" (*)
+1serde feature "derive" (*)
+1serde_json feature "default" (*)
+1toml feature "default" (*)

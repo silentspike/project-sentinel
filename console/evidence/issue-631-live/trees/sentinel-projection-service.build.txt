@@ -1,0 +1,1 @@
+0sentinel-projection-service v0.1.0 (<REMOTE_PROJECT>/services/sentinel-projection)

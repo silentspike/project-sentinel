@@ -1,0 +1,496 @@
+0sentinel-gaia-loop v0.1.0 (<REMOTE_PROJECT>/services/sentinel-gaia-loop)
+1anyhow v1.0.103
+1async-nats v0.47.0
+2base64 v0.22.1
+2bytes v1.11.1
+3serde v1.0.228
+4serde_core v1.0.228
+4serde_derive v1.0.228 (proc-macro)
+5proc-macro2 v1.0.106
+6unicode-ident v1.0.24
+5quote v1.0.44
+6proc-macro2 v1.0.106 (*)
+5syn v2.0.117
+6proc-macro2 v1.0.106 (*)
+6quote v1.0.44 (*)
+6unicode-ident v1.0.24
+2futures-util v0.3.32
+3futures-channel v0.3.32
+4futures-core v0.3.32
+4futures-sink v0.3.32
+3futures-core v0.3.32
+3futures-io v0.3.32
+3futures-macro v0.3.32 (proc-macro)
+4proc-macro2 v1.0.106 (*)
+4quote v1.0.44 (*)
+4syn v2.0.117 (*)
+3futures-sink v0.3.32
+3futures-task v0.3.32
+3memchr v2.8.0
+3pin-project-lite v0.2.16
+3slab v0.4.12
+2memchr v2.8.0
+2nkeys v0.4.5
+3data-encoding v2.10.0
+3ed25519 v2.2.3
+4signature v2.2.0
+5digest v0.10.7
+6block-buffer v0.10.4
+7generic-array v0.14.7
+8typenum v1.19.0
+6crypto-common v0.1.7
+7generic-array v0.14.7 (*)
+7typenum v1.19.0
+3ed25519-dalek v2.2.0
+4curve25519-dalek v4.1.3
+5cfg-if v1.0.4
+5cpufeatures v0.2.17
+5curve25519-dalek-derive v0.1.1 (proc-macro)
+6proc-macro2 v1.0.106 (*)
+6quote v1.0.44 (*)
+6syn v2.0.117 (*)
+5digest v0.10.7 (*)
+5subtle v2.6.1
+4ed25519 v2.2.3 (*)
+4sha2 v0.10.9
+5cfg-if v1.0.4
+5cpufeatures v0.2.17
+5digest v0.10.7 (*)
+4signature v2.2.0 (*)
+4subtle v2.6.1
+3log v0.4.29
+3rand v0.8.6
+4libc v0.2.186
+4rand_chacha v0.3.1
+5ppv-lite86 v0.2.21
+6zerocopy v0.8.40
+5rand_core v0.6.4
+6getrandom v0.2.17
+7cfg-if v1.0.4
+7libc v0.2.186
+4rand_core v0.6.4 (*)
+3signatory v0.27.1
+4pkcs8 v0.10.2
+5der v0.7.10
+6const-oid v0.9.6
+6pem-rfc7468 v0.7.0
+7base64ct v1.8.3
+6zeroize v1.8.2
+5spki v0.7.3
+6der v0.7.10 (*)
+4rand_core v0.6.4 (*)
+4signature v2.2.0 (*)
+4zeroize v1.8.2
+2nuid v0.5.0
+3rand v0.8.6 (*)
+2pin-project v1.1.10
+3pin-project-internal v1.1.10 (proc-macro)
+4proc-macro2 v1.0.106 (*)
+4quote v1.0.44 (*)
+4syn v2.0.117 (*)
+2portable-atomic v1.13.1
+2rand v0.8.6 (*)
+2regex v1.12.3
+3aho-corasick v1.1.4
+4memchr v2.8.0
+3memchr v2.8.0
+3regex-automata v0.4.14
+4aho-corasick v1.1.4 (*)
+4memchr v2.8.0
+4regex-syntax v0.8.10
+3regex-syntax v0.8.10
+2ring v0.17.14
+3cfg-if v1.0.4
+3getrandom v0.2.17 (*)
+3untrusted v0.9.0
+2rustls-native-certs v0.8.3
+3openssl-probe v0.2.1
+3rustls-pki-types v1.14.0
+4zeroize v1.8.2
+2rustls-pki-types v1.14.0 (*)
+2rustls-webpki v0.103.13
+3ring v0.17.14 (*)
+3rustls-pki-types v1.14.0 (*)
+3untrusted v0.9.0
+2serde v1.0.228 (*)
+2serde_json v1.0.149
+3itoa v1.0.17
+3memchr v2.8.0
+3serde_core v1.0.228
+3zmij v1.0.21
+2serde_nanos v0.1.4
+3serde v1.0.228 (*)
+2serde_repr v0.1.20 (proc-macro)
+3proc-macro2 v1.0.106 (*)
+3quote v1.0.44 (*)
+3syn v2.0.117 (*)
+2thiserror v1.0.69
+3thiserror-impl v1.0.69 (proc-macro)
+4proc-macro2 v1.0.106 (*)
+4quote v1.0.44 (*)
+4syn v2.0.117 (*)
+2time v0.3.47
+3deranged v0.5.8
+4powerfmt v0.2.0
+4serde_core v1.0.228
+3itoa v1.0.17
+3num-conv v0.2.0
+3powerfmt v0.2.0
+3serde_core v1.0.228
+3time-core v0.1.8
+2tokio v1.52.3
+3bytes v1.11.1 (*)
+3libc v0.2.186
+3mio v1.2.1
+4libc v0.2.186
+3parking_lot v0.12.5
+4lock_api v0.4.14
+5scopeguard v1.2.0
+4parking_lot_core v0.9.12
+5cfg-if v1.0.4
+5libc v0.2.186
+5smallvec v1.15.1
+3pin-project-lite v0.2.16
+3signal-hook-registry v1.4.8
+4errno v0.3.14
+5libc v0.2.186
+4libc v0.2.186
+3socket2 v0.6.4
+4libc v0.2.186
+3tokio-macros v2.7.0 (proc-macro)
+4proc-macro2 v1.0.106 (*)
+4quote v1.0.44 (*)
+4syn v2.0.117 (*)
+2tokio-rustls v0.26.4
+3rustls v0.23.37
+4once_cell v1.21.3
+4ring v0.17.14 (*)
+4rustls-pki-types v1.14.0 (*)
+4rustls-webpki v0.103.13 (*)
+4subtle v2.6.1
+4zeroize v1.8.2
+3tokio v1.52.3 (*)
+2tokio-stream v0.1.18
+3futures-core v0.3.32
+3pin-project-lite v0.2.16
+3tokio v1.52.3 (*)
+2tokio-util v0.7.18
+3bytes v1.11.1 (*)
+3futures-core v0.3.32
+3futures-sink v0.3.32
+3pin-project-lite v0.2.16
+3tokio v1.52.3 (*)
+2tokio-websockets v0.10.1
+3base64 v0.22.1
+3bytes v1.11.1 (*)
+3futures-core v0.3.32
+3futures-sink v0.3.32
+3http v1.4.0
+4bytes v1.11.1 (*)
+4itoa v1.0.17
+3httparse v1.10.1
+3rand v0.8.6 (*)
+3ring v0.17.14 (*)
+3rustls-pki-types v1.14.0 (*)
+3tokio v1.52.3 (*)
+3tokio-rustls v0.26.4 (*)
+3tokio-util v0.7.18 (*)
+3webpki-roots v0.26.11
+4webpki-roots v1.0.6
+5rustls-pki-types v1.14.0 (*)
+2tracing v0.1.44
+3pin-project-lite v0.2.16
+3tracing-attributes v0.1.31 (proc-macro)
+4proc-macro2 v1.0.106 (*)
+4quote v1.0.44 (*)
+4syn v2.0.117 (*)
+3tracing-core v0.1.36
+4once_cell v1.21.3
+2tryhard v0.5.2
+3pin-project-lite v0.2.16
+3tokio v1.52.3 (*)
+2url v2.5.8
+3form_urlencoded v1.2.2
+4percent-encoding v2.3.2
+3idna v1.1.0
+4idna_adapter v1.2.1
+5icu_normalizer v2.1.1
+6icu_collections v2.1.1
+7displaydoc v0.2.5 (proc-macro)
+8proc-macro2 v1.0.106 (*)
+8quote v1.0.44 (*)
+8syn v2.0.117 (*)
+7potential_utf v0.1.4
+8zerovec v0.11.5
+9yoke v0.8.1
+10stable_deref_trait v1.2.1
+10yoke-derive v0.8.1 (proc-macro)
+11proc-macro2 v1.0.106 (*)
+11quote v1.0.44 (*)
+11syn v2.0.117 (*)
+11synstructure v0.13.2
+12proc-macro2 v1.0.106 (*)
+12quote v1.0.44 (*)
+12syn v2.0.117 (*)
+10zerofrom v0.1.6
+11zerofrom-derive v0.1.6 (proc-macro)
+12proc-macro2 v1.0.106 (*)
+12quote v1.0.44 (*)
+12syn v2.0.117 (*)
+12synstructure v0.13.2 (*)
+9zerofrom v0.1.6 (*)
+9zerovec-derive v0.11.2 (proc-macro)
+10proc-macro2 v1.0.106 (*)
+10quote v1.0.44 (*)
+10syn v2.0.117 (*)
+7yoke v0.8.1 (*)
+7zerofrom v0.1.6 (*)
+7zerovec v0.11.5 (*)
+6icu_normalizer_data v2.1.1
+6icu_provider v2.1.1
+7displaydoc v0.2.5 (proc-macro) (*)
+7icu_locale_core v2.1.1
+8displaydoc v0.2.5 (proc-macro) (*)
+8litemap v0.8.1
+8tinystr v0.8.2
+9displaydoc v0.2.5 (proc-macro) (*)
+9zerovec v0.11.5 (*)
+8writeable v0.6.2
+8zerovec v0.11.5 (*)
+7writeable v0.6.2
+7yoke v0.8.1 (*)
+7zerofrom v0.1.6 (*)
+7zerotrie v0.2.3
+8displaydoc v0.2.5 (proc-macro) (*)
+8yoke v0.8.1 (*)
+8zerofrom v0.1.6 (*)
+7zerovec v0.11.5 (*)
+6smallvec v1.15.1
+6zerovec v0.11.5 (*)
+5icu_properties v2.1.2
+6icu_collections v2.1.1 (*)
+6icu_locale_core v2.1.1 (*)
+6icu_properties_data v2.1.2
+6icu_provider v2.1.1 (*)
+6zerotrie v0.2.3 (*)
+6zerovec v0.11.5 (*)
+4smallvec v1.15.1
+4utf8_iter v1.0.4
+3percent-encoding v2.3.2
+1clap v4.5.60
+2clap_builder v4.5.60
+3anstream v0.6.21
+4anstyle v1.0.13
+4anstyle-parse v0.2.7
+5utf8parse v0.2.2
+4anstyle-query v1.1.5
+4colorchoice v1.0.4
+4is_terminal_polyfill v1.70.2
+4utf8parse v0.2.2
+3anstyle v1.0.13
+3clap_lex v1.0.0
+3strsim v0.11.1
+2clap_derive v4.5.55 (proc-macro)
+3heck v0.5.0
+3proc-macro2 v1.0.106 (*)
+3quote v1.0.44 (*)
+3syn v2.0.117 (*)
+1fs2 v0.4.3
+2libc v0.2.186
+1futures v0.3.32
+2futures-channel v0.3.32 (*)
+2futures-core v0.3.32
+2futures-executor v0.3.32
+3futures-core v0.3.32
+3futures-task v0.3.32
+3futures-util v0.3.32 (*)
+2futures-io v0.3.32
+2futures-sink v0.3.32
+2futures-task v0.3.32
+2futures-util v0.3.32 (*)
+1libc v0.2.186
+1sentinel-common v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-common)
+2anyhow v1.0.103
+2bevy_ecs v0.18.1
+3bevy_ecs_macros v0.18.0 (proc-macro)
+4bevy_macro_utils v0.18.0
+5proc-macro2 v1.0.106 (*)
+5quote v1.0.44 (*)
+5syn v2.0.117 (*)
+5toml_edit v0.23.10+spec-1.0.0
+6indexmap v2.14.0
+7equivalent v1.0.2
+7hashbrown v0.17.1
+6toml_datetime v0.7.5+spec-1.1.0
+6toml_parser v1.0.9+spec-1.1.0
+7winnow v0.7.14
+6winnow v0.7.14
+4proc-macro2 v1.0.106 (*)
+4quote v1.0.44 (*)
+4syn v2.0.117 (*)
+3bevy_platform v0.18.0
+4foldhash v0.2.0
+4hashbrown v0.16.1
+5equivalent v1.0.2
+5foldhash v0.2.0
+5serde_core v1.0.228
+4serde v1.0.228 (*)
+4spin v0.10.1
+3bevy_ptr v0.18.0
+3bevy_reflect v0.18.0
+4assert_type_match v0.1.1 (proc-macro)
+5proc-macro2 v1.0.106 (*)
+5quote v1.0.44 (*)
+5syn v2.0.117 (*)
+4bevy_platform v0.18.0 (*)
+4bevy_ptr v0.18.0
+4bevy_reflect_derive v0.18.0 (proc-macro)
+5bevy_macro_utils v0.18.0 (*)
+5indexmap v2.14.0 (*)
+5proc-macro2 v1.0.106 (*)
+5quote v1.0.44 (*)
+5syn v2.0.117 (*)
+4bevy_utils v0.18.0
+5bevy_platform v0.18.0 (*)
+5disqualified v1.0.0
+5thread_local v1.1.9
+6cfg-if v1.0.4
+4derive_more v2.1.1
+5derive_more-impl v2.1.1 (proc-macro)
+6convert_case v0.10.0
+7unicode-segmentation v1.12.0
+6proc-macro2 v1.0.106 (*)
+6quote v1.0.44 (*)
+6syn v2.0.117 (*)
+6unicode-xid v0.2.6
+4disqualified v1.0.0
+4downcast-rs v2.0.2
+4erased-serde v0.4.9
+5serde_core v1.0.228
+5typeid v1.0.3
+4foldhash v0.2.0
+4indexmap v2.14.0
+5equivalent v1.0.2
+5hashbrown v0.17.1
+4serde v1.0.228 (*)
+4smallvec v1.15.1
+4thiserror v2.0.18
+5thiserror-impl v2.0.18 (proc-macro)
+6proc-macro2 v1.0.106 (*)
+6quote v1.0.44 (*)
+6syn v2.0.117 (*)
+4variadics_please v1.1.0 (proc-macro)
+5proc-macro2 v1.0.106 (*)
+5quote v1.0.44 (*)
+5syn v2.0.117 (*)
+3bevy_tasks v0.18.0
+4async-executor v1.14.0
+5async-task v4.7.1
+5concurrent-queue v2.5.0
+6crossbeam-utils v0.8.21
+5fastrand v2.3.0
+5futures-lite v2.6.1
+6fastrand v2.3.0
+6futures-core v0.3.32
+6futures-io v0.3.32
+6parking v2.2.1
+6pin-project-lite v0.2.16
+5pin-project-lite v0.2.16
+5slab v0.4.12
+4async-task v4.7.1
+4atomic-waker v1.1.2
+4bevy_platform v0.18.0 (*)
+4crossbeam-queue v0.3.12
+5crossbeam-utils v0.8.21
+4derive_more v2.1.1 (*)
+4futures-lite v2.6.1 (*)
+3bevy_utils v0.18.0 (*)
+3bitflags v2.11.0
+3bumpalo v3.20.2
+3concurrent-queue v2.5.0 (*)
+3derive_more v2.1.1 (*)
+3fixedbitset v0.5.7
+3indexmap v2.14.0 (*)
+3log v0.4.29
+3nonmax v0.5.5
+3slotmap v1.1.1
+3smallvec v1.15.1
+3thiserror v2.0.18 (*)
+3variadics_please v1.1.0 (proc-macro) (*)
+2bincode v2.0.1
+3bincode_derive v2.0.1 (proc-macro)
+4virtue v0.0.18
+3serde v1.0.228 (*)
+3unty v0.0.4
+2flatbuffers v25.12.19
+3bitflags v2.11.0
+2serde v1.0.228 (*)
+2serde_json v1.0.149 (*)
+2thiserror v2.0.18 (*)
+2toml v1.0.6+spec-1.1.0
+3serde_core v1.0.228
+3serde_spanned v1.0.4
+4serde_core v1.0.228
+3toml_datetime v1.0.0+spec-1.1.0
+4serde_core v1.0.228
+3toml_parser v1.0.9+spec-1.1.0
+4winnow v0.7.14
+3toml_writer v1.0.6+spec-1.1.0
+3winnow v0.7.14
+2tracing v0.1.44 (*)
+2uuid v1.22.0
+3getrandom v0.4.1
+4cfg-if v1.0.4
+4libc v0.2.186
+3serde_core v1.0.228
+1sentinel-limbo v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-limbo)
+2anyhow v1.0.103
+2rusqlite v0.38.0
+3bitflags v2.11.0
+3fallible-iterator v0.3.0
+3fallible-streaming-iterator v0.1.9
+3hashlink v0.11.0
+4hashbrown v0.16.1 (*)
+3libsqlite3-sys v0.36.0
+3smallvec v1.15.1
+2sentinel-common v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-common) (*)
+2sentinel-telemetry v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-telemetry)
+3sentinel-common v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-common) (*)
+3serde v1.0.228 (*)
+3serde_json v1.0.149 (*)
+3tracing v0.1.44 (*)
+3tracing-subscriber v0.3.22
+4matchers v0.2.0
+5regex-automata v0.4.14 (*)
+4nu-ansi-term v0.50.3
+4once_cell v1.21.3
+4regex-automata v0.4.14 (*)
+4serde v1.0.228 (*)
+4serde_json v1.0.149 (*)
+4sharded-slab v0.1.7
+5lazy_static v1.5.0
+4smallvec v1.15.1
+4thread_local v1.1.9 (*)
+4tracing v0.1.44 (*)
+4tracing-core v0.1.36 (*)
+4tracing-log v0.2.0
+5log v0.4.29
+5once_cell v1.21.3
+5tracing-core v0.1.36 (*)
+4tracing-serde v0.2.0
+5serde v1.0.228 (*)
+5tracing-core v0.1.36 (*)
+3uuid v1.22.0 (*)
+2serde v1.0.228 (*)
+2serde_json v1.0.149 (*)
+2tokio v1.52.3 (*)
+2tracing v0.1.44 (*)
+2uuid v1.22.0 (*)
+1serde v1.0.228 (*)
+1serde_json v1.0.149 (*)
+1sha2 v0.10.9 (*)
+1thiserror v2.0.18 (*)
+1tokio v1.52.3 (*)
+1tracing v0.1.44 (*)
+1tracing-subscriber v0.3.22 (*)
+1uuid v1.22.0 (*)

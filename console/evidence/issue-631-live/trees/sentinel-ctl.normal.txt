@@ -1,0 +1,237 @@
+0sentinel-ctl v0.1.0 (<REMOTE_PROJECT>/services/sentinel-ctl)
+1anyhow v1.0.103
+1clap v4.5.60
+2clap_builder v4.5.60
+3anstream v0.6.21
+4anstyle v1.0.13
+4anstyle-parse v0.2.7
+5utf8parse v0.2.2
+4anstyle-query v1.1.5
+4colorchoice v1.0.4
+4is_terminal_polyfill v1.70.2
+4utf8parse v0.2.2
+3anstyle v1.0.13
+3clap_lex v1.0.0
+3strsim v0.11.1
+2clap_derive v4.5.55 (proc-macro)
+3heck v0.5.0
+3proc-macro2 v1.0.106
+4unicode-ident v1.0.24
+3quote v1.0.44
+4proc-macro2 v1.0.106 (*)
+3syn v2.0.117
+4proc-macro2 v1.0.106 (*)
+4quote v1.0.44 (*)
+4unicode-ident v1.0.24
+1reqwest v0.12.28
+2base64 v0.22.1
+2bytes v1.11.1
+2futures-channel v0.3.32
+3futures-core v0.3.32
+3futures-sink v0.3.32
+2futures-core v0.3.32
+2futures-util v0.3.32
+3futures-core v0.3.32
+3futures-io v0.3.32
+3futures-sink v0.3.32
+3futures-task v0.3.32
+3memchr v2.8.0
+3pin-project-lite v0.2.16
+3slab v0.4.12
+2http v1.4.0
+3bytes v1.11.1
+3itoa v1.0.17
+2http-body v1.0.1
+3bytes v1.11.1
+3http v1.4.0 (*)
+2http-body-util v0.1.3
+3bytes v1.11.1
+3futures-core v0.3.32
+3http v1.4.0 (*)
+3http-body v1.0.1 (*)
+3pin-project-lite v0.2.16
+2hyper v1.8.1
+3atomic-waker v1.1.2
+3bytes v1.11.1
+3futures-channel v0.3.32 (*)
+3futures-core v0.3.32
+3http v1.4.0 (*)
+3http-body v1.0.1 (*)
+3httparse v1.10.1
+3itoa v1.0.17
+3pin-project-lite v0.2.16
+3pin-utils v0.1.0
+3smallvec v1.15.1
+3tokio v1.52.3
+4bytes v1.11.1
+4libc v0.2.186
+4mio v1.2.1
+5libc v0.2.186
+4pin-project-lite v0.2.16
+4socket2 v0.6.4
+5libc v0.2.186
+3want v0.3.1
+4try-lock v0.2.5
+2hyper-rustls v0.27.7
+3http v1.4.0 (*)
+3hyper v1.8.1 (*)
+3hyper-util v0.1.20
+4base64 v0.22.1
+4bytes v1.11.1
+4futures-channel v0.3.32 (*)
+4futures-util v0.3.32 (*)
+4http v1.4.0 (*)
+4http-body v1.0.1 (*)
+4hyper v1.8.1 (*)
+4ipnet v2.11.0
+4libc v0.2.186
+4percent-encoding v2.3.2
+4pin-project-lite v0.2.16
+4socket2 v0.6.4 (*)
+4tokio v1.52.3 (*)
+4tower-service v0.3.3
+4tracing v0.1.44
+5pin-project-lite v0.2.16
+5tracing-core v0.1.36
+6once_cell v1.21.3
+3rustls v0.23.37
+4once_cell v1.21.3
+4ring v0.17.14
+5cfg-if v1.0.4
+5getrandom v0.2.17
+6cfg-if v1.0.4
+6libc v0.2.186
+5untrusted v0.9.0
+4rustls-pki-types v1.14.0
+5zeroize v1.8.2
+4rustls-webpki v0.103.13
+5ring v0.17.14 (*)
+5rustls-pki-types v1.14.0 (*)
+5untrusted v0.9.0
+4subtle v2.6.1
+4zeroize v1.8.2
+3rustls-pki-types v1.14.0 (*)
+3tokio v1.52.3 (*)
+3tokio-rustls v0.26.4
+4rustls v0.23.37 (*)
+4tokio v1.52.3 (*)
+3tower-service v0.3.3
+3webpki-roots v1.0.6
+4rustls-pki-types v1.14.0 (*)
+2hyper-util v0.1.20 (*)
+2log v0.4.29
+2percent-encoding v2.3.2
+2pin-project-lite v0.2.16
+2rustls v0.23.37 (*)
+2rustls-pki-types v1.14.0 (*)
+2serde v1.0.228
+3serde_core v1.0.228
+3serde_derive v1.0.228 (proc-macro)
+4proc-macro2 v1.0.106 (*)
+4quote v1.0.44 (*)
+4syn v2.0.117 (*)
+2serde_json v1.0.149
+3itoa v1.0.17
+3memchr v2.8.0
+3serde_core v1.0.228
+3zmij v1.0.21
+2serde_urlencoded v0.7.1
+3form_urlencoded v1.2.2
+4percent-encoding v2.3.2
+3itoa v1.0.17
+3ryu v1.0.23
+3serde v1.0.228 (*)
+2sync_wrapper v1.0.2
+3futures-core v0.3.32
+2tokio v1.52.3 (*)
+2tokio-rustls v0.26.4 (*)
+2tower v0.5.3
+3futures-core v0.3.32
+3futures-util v0.3.32 (*)
+3pin-project-lite v0.2.16
+3sync_wrapper v1.0.2 (*)
+3tokio v1.52.3 (*)
+3tower-layer v0.3.3
+3tower-service v0.3.3
+2tower-http v0.6.8
+3bitflags v2.11.0
+3bytes v1.11.1
+3futures-util v0.3.32 (*)
+3http v1.4.0 (*)
+3http-body v1.0.1 (*)
+3iri-string v0.7.10
+3pin-project-lite v0.2.16
+3tower v0.5.3 (*)
+3tower-layer v0.3.3
+3tower-service v0.3.3
+2tower-service v0.3.3
+2url v2.5.8
+3form_urlencoded v1.2.2 (*)
+3idna v1.1.0
+4idna_adapter v1.2.1
+5icu_normalizer v2.1.1
+6icu_collections v2.1.1
+7displaydoc v0.2.5 (proc-macro)
+8proc-macro2 v1.0.106 (*)
+8quote v1.0.44 (*)
+8syn v2.0.117 (*)
+7potential_utf v0.1.4
+8zerovec v0.11.5
+9yoke v0.8.1
+10stable_deref_trait v1.2.1
+10yoke-derive v0.8.1 (proc-macro)
+11proc-macro2 v1.0.106 (*)
+11quote v1.0.44 (*)
+11syn v2.0.117 (*)
+11synstructure v0.13.2
+12proc-macro2 v1.0.106 (*)
+12quote v1.0.44 (*)
+12syn v2.0.117 (*)
+10zerofrom v0.1.6
+11zerofrom-derive v0.1.6 (proc-macro)
+12proc-macro2 v1.0.106 (*)
+12quote v1.0.44 (*)
+12syn v2.0.117 (*)
+12synstructure v0.13.2 (*)
+9zerofrom v0.1.6 (*)
+9zerovec-derive v0.11.2 (proc-macro)
+10proc-macro2 v1.0.106 (*)
+10quote v1.0.44 (*)
+10syn v2.0.117 (*)
+7yoke v0.8.1 (*)
+7zerofrom v0.1.6 (*)
+7zerovec v0.11.5 (*)
+6icu_normalizer_data v2.1.1
+6icu_provider v2.1.1
+7displaydoc v0.2.5 (proc-macro) (*)
+7icu_locale_core v2.1.1
+8displaydoc v0.2.5 (proc-macro) (*)
+8litemap v0.8.1
+8tinystr v0.8.2
+9displaydoc v0.2.5 (proc-macro) (*)
+9zerovec v0.11.5 (*)
+8writeable v0.6.2
+8zerovec v0.11.5 (*)
+7writeable v0.6.2
+7yoke v0.8.1 (*)
+7zerofrom v0.1.6 (*)
+7zerotrie v0.2.3
+8displaydoc v0.2.5 (proc-macro) (*)
+8yoke v0.8.1 (*)
+8zerofrom v0.1.6 (*)
+7zerovec v0.11.5 (*)
+6smallvec v1.15.1
+6zerovec v0.11.5 (*)
+5icu_properties v2.1.2
+6icu_collections v2.1.1 (*)
+6icu_locale_core v2.1.1 (*)
+6icu_properties_data v2.1.2
+6icu_provider v2.1.1 (*)
+6zerotrie v0.2.3 (*)
+6zerovec v0.11.5 (*)
+4smallvec v1.15.1
+4utf8_iter v1.0.4
+3percent-encoding v2.3.2
+2webpki-roots v1.0.6 (*)
+1serde v1.0.228 (*)
+1serde_json v1.0.149 (*)
