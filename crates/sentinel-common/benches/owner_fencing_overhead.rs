@@ -46,7 +46,7 @@ fn main() {
         black_box(reg.validate(black_box(&guard))).ok();
     });
     bench("owner     single-node (fast-path, no lock)", iters, || {
-        black_box(reg.current_owner(black_box(&scope)));
+        black_box(reg.current_owner(black_box(&scope)).unwrap());
     });
 
     // Flip to cluster mode (a cross-node commit on an unrelated scope sets the flag), so
@@ -63,7 +63,7 @@ fn main() {
         black_box(reg.validate(black_box(&guard))).ok();
     });
     bench("owner     cluster-mode (RwLock read+lookup)", iters, || {
-        black_box(reg.current_owner(black_box(&scope)));
+        black_box(reg.current_owner(black_box(&scope)).unwrap());
     });
 
     println!("(single-node = the prod path; the fast-path delta vs cluster-mode is the lock cost avoided)");

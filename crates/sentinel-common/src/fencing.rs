@@ -53,17 +53,12 @@ pub const TRACK_A_COORDINATOR_GENERATION: u64 = 1;
 pub const OWNER_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
 /// Whether an owner is allowed to publish routes and issue normal write guards.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActivationState {
+    #[default]
     LegacyUnknown,
     NotRoutable,
     Routable,
-}
-
-impl Default for ActivationState {
-    fn default() -> Self {
-        Self::LegacyUnknown
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
