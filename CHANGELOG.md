@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Issue #336: added a compact acronym index to the glossary and linked the first README uses of project acronyms to it.
 - Updated the enforced Rust/DEV-010 toolchain contract to 1.95.0, refreshed vulnerable or yanked transitive dependencies, pinned the reproducible RustSec audit command, and moved the Cortex Gateway to the patched Go 1.26.5 toolchain.
 
 ### Added

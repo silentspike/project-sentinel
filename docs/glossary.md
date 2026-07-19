@@ -130,3 +130,16 @@ sensations rather than as out-of-band signals.
 | API timeout      | migraine                  |
 | RAM pressure     | trouble concentrating     |
 | Network latency  | "having a slow day"       |
+
+## Acronyms
+
+- **TOGAF** - The Open Group Architecture Framework (the architecture framework this project follows, v22.1).
+- **SBOM** - Software Bill of Materials (machine-readable dependency and component inventory).
+- **GHAS** - GitHub Advanced Security (secret scanning, code scanning, and dependency review).
+- **OSSF Scorecard** - Open Source Security Foundation Scorecard (automated repository security assessment).
+- **CQRS** - Command Query Responsibility Segregation (write/read model separation; here the event store feeds projections).
+- **ECS** - Entity Component System (data-oriented simulation architecture implemented with `bevy_ecs`).
+- **NMDA** - N-Methyl-D-Aspartate receptor (the neuroscience mechanism behind sleep-driven synaptic and memory consolidation; namesake of the night-run consolidation cycle described in the "NMDA Night-Run" section above).
+- **eBPF** - extended Berkeley Packet Filter (kernel-mode observability probes implemented with aya-rs).
+- **NATS** - the messaging and event-streaming system used as the event bus (NATS JetStream and the Go bridge).
+- **MITM** - Man-in-the-Middle (the gateway intercepts and enriches LLM requests; see the architecture documentation).
