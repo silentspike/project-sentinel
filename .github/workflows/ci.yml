@@ -42,6 +42,7 @@ jobs:
               - 'services/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'rust-toolchain.toml'
             go:
               - 'cmd/**'
               - 'services/sentinel-judge/**'
@@ -101,7 +102,7 @@ jobs:
       CARGO_BUILD_JOBS: ${{ vars.RUNNER_MODE == 'hosted' && '2' || '3' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # pinned
         with:
           toolchain: "1.97.1"
           components: rustfmt, clippy
@@ -145,7 +146,7 @@ jobs:
       CARGO_BUILD_JOBS: ${{ vars.RUNNER_MODE == 'hosted' && '2' || '3' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # pinned
         with:
           toolchain: "1.97.1"
       - name: Assert determinism toolchain (DEV-010)
@@ -181,7 +182,7 @@ jobs:
       CARGO_BUILD_JOBS: ${{ vars.RUNNER_MODE == 'hosted' && '2' || '3' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # pinned
         with:
           toolchain: "1.97.1"
       - name: Assert determinism toolchain (DEV-010)
@@ -221,7 +222,7 @@ jobs:
       CARGO_BUILD_JOBS: ${{ vars.RUNNER_MODE == 'hosted' && '2' || '3' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # pinned
         with:
           toolchain: "1.97.1"
           components: clippy

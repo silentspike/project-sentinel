@@ -1,125 +1,148 @@
-# ADR-0497: Per-container snapshot consistency (G4)
+# ADR-0497: Per-container snapshot, staging, and restore consistency (G4)
 
-- **Gate:** G4 (blocks #497; the uid/gid+path part V24 also blocks #500a)
-- **Status:** Proposed
-- **Primary issue:** #497 (per-container snapshot/restore)
-- **Related issues / gates:** G0 (sub-worlds), G-ROUTE (AgentLocator), V11/V12/V23/V24/V27/V30
-- **Supersedes / Superseded by:** —
+- **Gate:** G4 (blocks #501 snapshot transfer/restore)
+- **Status:** Accepted
+- **Primary issues:** #497 and #501
+- **Related gates:** G1, ADR-2, ADR-3, G5, G-ROUTE
 
-> **N-node-native rule:** all schemas/messages/APIs MUST be `NodeId`-keyed, never a hard
-> source/target pair. Two nodes are the first test, not the ceiling.
+> Even though the foundation is verified on a two-node cluster first, all schemas,
+> messages, and APIs are N-node-native and keyed by `NodeId`. Two nodes are the first
+> test, not the cluster model.
 
 ## Context
 
-A consistent per-container snapshot is more than a frozen ECS marker. The codebase has
-**no `Frozen` marker** today; the agent-mutating ECS systems run unconditionally —
-verified: `bio_system` (`crates/sentinel-ecs/src/systems.rs:822`), `transit_system:1084`,
-`work_context_system:1177`, `chaos_system:1425`, `mood_system:1553`,
-`perception_system:1599`, `encounter_system:2125`, `persist_system:2269`,
-`task_progress_system:786`, `autonomy_system` (`autonomy.rs:33`), `decision_system`
-(`decision.rs:31`). Snapshots write sequentially across stores with no cross-store
-atomicity; the Limbo save is the SSOT and the FS pin is a reconcilable post-hoc
-best-effort.
+#497 delivered the `Frozen` mutating-system matrix, per-agent ECS/redb/FS snapshot and
+restore primitives, and route registry foundation. The current `SnapshotCut` still
+stores a bare `event_cursor: i64`, and the per-agent ECS cut writes 0. #501 requires a
+real source-local provenance watermark, a canonical digest, durable target staging,
+and restore authorization bound to the committed target term.
 
 ## Problem
 
-What makes a per-container snapshot torn-free and restorable without corrupting the
-other agents or the migrated agent's references?
+How does Sentinel produce a torn-free, source-identifiable snapshot, stage it durably,
+and restore it without admitting writes or stale authority at the target?
 
 ## Decision
 
-**A `Frozen` marker over a fully-classified mutating-system set, a `SnapshotCut` across
-stores, reference integrity on restore, and explicit exclusions for inbound /
-side-effects / scheduled work.**
+Keep the #497 per-container freeze model and extend the cut, digest, staging, and
+restore contracts for cross-node use.
 
-- **`Frozen` marker (V11):** a new `Frozen` component (`sentinel-common/components.rs`);
-  the agent-mutating systems get `Without<Frozen>` (query filter / run condition).
-  Sequence: `freeze → filtered-snapshot → filtered-restore → unfreeze`. The global tick
-  keeps running (AC-3).
-- **AC-0 mandatory mutating-system matrix:** **every** system above is classified —
-  `Without<Frozen>`-guarded / route-queued / "never mutates per-agent" / "excluded from
-  the migration class". A forgotten mutating system → a frozen-but-indirectly-changed
-  agent = torn snapshot. A per-system-group test ("frozen agent bit-identical over N
-  ticks") + a negative test that catches an unguarded system.
-- **Reference integrity (V12), via AgentLocator (G-ROUTE):** restore is despawn+respawn
-  of only the one agent (`despawn_agent_from_world` + `spawn_agent`, not global). ACs:
-  `agent_id`/`container_id` identical; global registries point at the **new** entity;
-  other agents can still reference the migrated one (resolved via `RouteRegistry` by
-  `node_id`+`owner_term`, never a stale local `EntityId`); no despawned entity lingers
-  in relationship/perception/scheduler structures.
-- **Cross-store boundary, not 2PC (V27):** each multi-store op carries a class — **K1**
-  single-store (guard suffices) / **K2** idempotent saga with `op_id` (restart-reconcile,
-  like the existing post-hoc pin) / **K3** rejected/queued in the migration window.
-  Migration additionally uses a `SnapshotCut { owner_term, event_cursor, redb_gen,
-  fs_dump, cas_pin_set, inbound_cursor }` — all parts exist in `WorldSnapshot`.
-- **uid/gid + path safety (V24):** never restore raw host uid/gid → sandbox identity
-  mapping. Restore ACs validate symlink targets before creation, no absolute path, no
-  `..`, no symlink escape, no device file unless explicitly allowed.
-- **Inbound policy = EXCLUDE (V11, G0):** a container with active inbound cross-agent
-  traffic is `NotMigratable` (typed reason) in Track A — **no** queue/no-drop/no-dup
-  claim. The durable inbound queue is Track E/H.
-- **Scheduled work + side-effects excluded (V23/V30):** active timers/tasks/delayed
-  effects → the container is rejected/waited; active external side-effects (LLM-bridge,
-  `PlatformSideEffect`) are excluded from the Track-A bounded class.
-- **Sub-world (G0/G-6):** "per-node sub-world" is **not** a new container — it is the
-  node's spawned agents in the existing global World. Migration despawns the subject at
-  the source (this filtered-restore path) and the target spawns it.
+## Quiesce and frozen cut
 
-## Non-Goals
+Before the cut, agent-scoped admission closes across ECS, EventStore, redb, and
+operator writes. Existing writes drain or fail their complete-term commit recheck.
+Eligibility is rechecked under the closed barrier. The agent is then `Frozen`; other
+agents and the global 1 Hz tick continue.
 
-- The durable inbound queue, full side-effect outbox, per-agent time-travel after move
-  (G-EVENTHIST → `NotSupportedForMigratedContainer`) — all Track E/H.
-- Cross-store 2PC (TOGAF: no external coordinator).
+The cut captures:
 
-## Data Types
+- the complete owner term;
+- ECS components for exactly the subject container;
+- every per-agent redb row, including explicit absence;
+- filtered FS metadata and referenced CAS rows;
+- a typed source provenance watermark.
 
-`Frozen` (new component), `NanoContainerSnapshot { ecs, redb_rows, fs_meta_subtree,
-blob_hashes }`, `SnapshotCut { … }`. `StateTransferScope::NanoContainer` (`types.rs:666`)
-implemented. `dump_agent_tables(agent_id)` (redb u16-keyed + FS `(agent_id,…)`-keyed
-filtered).
+## Source provenance watermark
 
-## State Machine / Protocol
+Replace the bare cursor with:
 
-`freeze(agent) → snapshot_agent(ecs+redb+fs subtree under cut) → transfer → restore
-(despawn+respawn only the agent) → unfreeze`.
+`SourceProvenanceWatermark { source_node, scope, local_event_row_id: i64 }`
 
-## Failure Modes
+The row id is the real source EventStore watermark obtained after the write drain under
+the same barrier. Negative values are rejected. Legacy `event_cursor: i64` decodes
+versionedly as `LegacySourceLocal(i64)` and never pretends to be a cluster-global
+cursor.
 
-- **Forgotten mutating system:** caught by the AC-0 matrix + negative test.
-- **Torn cross-store write:** K2 saga `op_id` reconcile on restart.
-- **Stale reference after move:** AgentLocator resolves, never a stale `EntityId`.
+## Canonical digest
 
-## Tests
+The versioned SHA-256 snapshot digest covers canonical, fixed-order encoding of:
 
-AC-0 matrix; AC-1 complete+consistent snapshot, no foreign state (runtime-state only);
-AC-2 restore without despawning others; AC-3 per-container fence (global tick runs,
-frozen agent stable) + inbound=EXCLUDE; AC-3b reference integrity (V12); AC-5 (2-VM)
-container-scoped state-hash B==A for a **resting** container (not whole-world, G0).
+- header, schema, scope, and complete owner term;
+- ECS state;
+- every per-agent redb table row and explicit absence marker;
+- FS metadata/CAS references;
+- the source provenance watermark.
 
-## Benchmarks
+Golden vectors and round trips prevent serializer drift. `state_hash()` is only an
+additional runtime smoke value and is not the transfer-integrity digest.
 
-Snapshot/restore latency p50/p95/**p99/max** + bytes/agent (KB thesis, 1:n);
-bug-finder completeness/consistency; sweep agent-memory small/med/large. Register:
-`sentinel-daemon-per-container-transfer (#497)`.
+## Durable target staging
 
-## Backward Compatibility
+The staging header contains schema version, operation id, scope, complete term, byte
+size, and digest. The target performs:
 
-`Frozen` + new types via `#[serde(default)]`; existing snapshots/restore unaffected
-(single-node never sets `Frozen`). No `events` migration.
+1. bounded temporary write;
+2. size, schema, term, and digest validation;
+3. `fsync(file)`;
+4. atomic rename;
+5. `fsync(directory)`;
+6. durable participant outcome;
+7. `StagingAck { digest, staging_id }`.
 
-## Security
+Startup reconciliation handles a crash between rename and journal completion. It may
+delete only staging files that are unambiguously incomplete, invalid, or expired; a
+valid staged copy for an active operation is preserved.
 
-Restore uid/gid via sandbox mapping (no raw host ids); path-safety ACs prevent
-symlink/`..`/device escape.
+## Sealed restore permit
 
-## Public Claim Boundary
+Restore requires:
 
-- May claim after #497: consistent per-container snapshot/restore for the resting
-  bounded class.
-- **May NOT claim:** migration of actively-interacting containers, per-agent
-  time-travel after move, or exactly-once inbound — all deferred.
+`MigrationRestorePermit { scope, target, full_term, op_id, digest, schema, staging_id, transition_seq }`
 
-## Open Follow-ups
+The permit is sealed by the migration module. Restore begin and commit recheck target,
+complete term, operation state/sequence, digest, schema, and staging id. ECS spawn
+begins `Frozen`.
 
-- Durable inbound queue + side-effect outbox + per-agent EventHistory continuity (Track
-  E/H).
+`restore_agent_tables(rows, &permit)` writes all per-agent rows in one redb
+transaction. An input `None` deletes an existing target row, so stale target data
+cannot survive a restore. The target remains `OwnerActivating` and `NotRoutable` after
+restore.
+
+## Reference integrity and route boundary
+
+The restore despawns/respawns only the subject agent. Stable identity remains the
+agent/container id; local `EntityId` is never a cross-node reference. Named
+relationship/perception lookups resolve a typed `RemoteRoute { node, full_term }`
+through the route registry after migration. This decision does not claim cross-node
+message delivery.
+
+## Bounded eligibility
+
+Track A returns typed `NotMigratable` for active inbound cross-agent traffic, active
+external side effects/LLM calls, and active scheduled/delayed effects. Per-agent time
+travel after migration returns `NotSupportedForMigratedContainer` until Track E/H.
+
+## Failure modes
+
+- **Late writer:** commit recheck rejects after quiesce/term change.
+- **Torn cut:** one barrier covers drain, watermark, ECS, and per-agent row capture.
+- **Partial staging:** no acknowledgement before both fsyncs and durable outcome.
+- **Crash after rename:** startup probe recognizes the valid staged artifact.
+- **Wrong/stale permit:** restore rejects at begin or commit.
+- **Stale target row:** explicit absence deletes it in the restore transaction.
+- **Stale entity reference:** route lookup uses stable id plus complete term.
+
+## Tests and evidence
+
+- The #497 mutating-system matrix and frozen-agent bit-identity tests remain required.
+- A write that begins before quiesce and commits late receives a typed reject.
+- Real positive source watermark and legacy/negative decode tests.
+- Canonical digest golden vectors include all per-agent rows and watermark.
+- Staging fsync/rename/journal crash-point and startup-reconcile tests.
+- Restore permit begin/commit TOCTOU, explicit-delete, and frozen-spawn tests.
+- Two-node source/target digest equality and remote-reference resolution evidence.
+
+## Consequences
+
+- The snapshot has explicit source provenance rather than a misleading global cursor.
+- Durable staging becomes the first migration-specific recoverable copy boundary.
+- Restore cannot independently grant routability or normal write authority.
+- The existing single-node snapshot/restore path remains compatible through versioned
+  legacy decode.
+
+## Public claim boundary
+
+After #501, Sentinel may claim a versioned, digest-verified ECS-native snapshot transfer
+and permitted restore for the resting bounded class. It may not claim active inbound or
+side-effect continuity, per-agent event-history continuity, all-runtime migration, or
+absolute RPO=0.
