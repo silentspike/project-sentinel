@@ -197,7 +197,7 @@
                     </div>
                 </div>
                 <div class="text-center">
-                    <div class="font-mono font-extrabold text-4xl gradient-text counter" data-target="11">0</div>
+                    <div class="font-mono font-extrabold text-4xl gradient-text counter" data-target="19">0</div>
                     <div class="flex items-center gap-1.5 mt-2 text-dim font-mono text-[0.7rem] uppercase tracking-widest">
                         <i data-lucide="package" class="w-3.5 h-3.5"></i> Crates
                     </div>
@@ -403,7 +403,7 @@
         <!-- Plain Language -->
         <div class="border-l-3 border-accent-cyan bg-accent-cyan/[0.03] px-5 py-4 my-6 rounded-r text-[0.88rem]" style="border-left: 3px solid #06b6d4;">
             <strong class="text-accent-cyan block text-[0.65rem] uppercase tracking-[1.5px] mb-2 flex items-center gap-2">
-                <i data-lucide="lightbulb" class="w-3.5 h-3.5"></i> In einfachen Worten
+                <i data-lucide="lightbulb" class="w-3.5 h-3.5"></i> In plain language
             </strong>
             Every agent has a simulated body. Just like a human, it gets hungry,
             grows tired, needs coffee, and eventually has to use the bathroom. These bodily states
@@ -466,7 +466,7 @@ IMPULSE: [P1] Andreas is addressing you. [P0] Urgent need to take a break.
             <p class="text-dim text-[0.72rem] italic mt-3">Chaos &rarr; physics coupling: <code class="text-neon-blue text-[0.8em]">AirConBroken</code> raises temperature, <code class="text-neon-blue text-[0.8em]">PrinterBroken</code> raises noise. Agents react to the physical effects, not to the chaos event itself.</p>
         </div>
 
-        <!-- Room-Kommunikation (Ohren-System) -->
+        <!-- Room communication (ears system) -->
         <div class="bg-surface-1 border border-neon-green/30 p-7 mt-6 card-hover" style="background: linear-gradient(135deg, #0e0e18, rgba(0,255,157,0.02));">
             <div class="flex items-center justify-between mb-4">
                 <span class="font-mono font-bold text-[0.65rem] uppercase tracking-widest flex items-center gap-2">
@@ -587,7 +587,7 @@ IMPULSE: [P1] Andreas is addressing you. [P0] Urgent need to take a break.
                 </div>
             </div>
 
-            <p class="text-dim text-[0.72rem] italic mt-3">The ECS <code class="font-mono text-neon-blue text-[0.8em]">decision_system</code> runs after <code class="font-mono text-neon-blue text-[0.8em]">perception_system</code> and before <code class="font-mono text-neon-blue text-[0.8em]">output_system</code> (12 systems). 5 sources: bio, work, mood, chaos, <strong class="text-neon-green">chat</strong>. MAX_EVENTS = 8 per injection. <code class="font-mono text-neon-blue text-[0.8em]">RoomChatBuffer</code> + <code class="font-mono text-neon-blue text-[0.8em]">GaiaBuffer</code> + <code class="font-mono text-neon-blue text-[0.8em]">BroadcastBuffer</code> als In-Memory ECS Resources (Zero Disk-I/O).</p>
+            <p class="text-dim text-[0.72rem] italic mt-3">The ECS <code class="font-mono text-neon-blue text-[0.8em]">decision_system</code> runs after <code class="font-mono text-neon-blue text-[0.8em]">perception_system</code> and before <code class="font-mono text-neon-blue text-[0.8em]">output_system</code> (12 systems). 5 sources: bio, work, mood, chaos, <strong class="text-neon-green">chat</strong>. MAX_EVENTS = 8 per injection. <code class="font-mono text-neon-blue text-[0.8em]">RoomChatBuffer</code> + <code class="font-mono text-neon-blue text-[0.8em]">GaiaBuffer</code> + <code class="font-mono text-neon-blue text-[0.8em]">BroadcastBuffer</code> as in-memory ECS resources (zero disk I/O).</p>
         </div>
 
         <!-- Hippocampus Strategy -->
@@ -637,7 +637,7 @@ IMPULSE: [P1] Andreas is addressing you. [P0] Urgent need to take a break.
 
             <div class="border-l-3 border-accent-cyan bg-accent-cyan/[0.03] px-5 py-4 mt-5 rounded-r text-[0.88rem]" style="border-left: 3px solid #06b6d4;">
                 <strong class="text-accent-cyan block text-[0.65rem] uppercase tracking-[1.5px] mb-2 flex items-center gap-2">
-                    <i data-lucide="lightbulb" class="w-3.5 h-3.5"></i> In einfachen Worten
+                    <i data-lucide="lightbulb" class="w-3.5 h-3.5"></i> In plain language
                 </strong>
                 Just as our brain decides during sleep which memories stay and which are forgotten,
                 every agent goes through a nightly &ldquo;dream phase.&rdquo; Important experiences (the
@@ -693,7 +693,7 @@ IMPULSE: [P1] Andreas is addressing you. [P0] Urgent need to take a break.
         </div>
 
         <div class="border-l-3 border-accent-cyan bg-accent-cyan/[0.03] px-5 py-4 my-6 rounded-r text-[0.88rem]" style="border-left: 3px solid #06b6d4;">
-            <strong class="text-accent-cyan block text-[0.65rem] uppercase tracking-[1.5px] mb-2 flex items-center gap-2"><i data-lucide="lightbulb" class="w-3.5 h-3.5"></i> In einfachen Worten</strong>
+            <strong class="text-accent-cyan block text-[0.65rem] uppercase tracking-[1.5px] mb-2 flex items-center gap-2"><i data-lucide="lightbulb" class="w-3.5 h-3.5"></i> In plain language</strong>
             Instead of running 54 separate programs (extremely expensive), all agents share
             a common working memory &mdash; like employees in an open-plan office rather than
             in 54 separate houses. That saves over 90% of resources.
@@ -711,7 +711,7 @@ IMPULSE: [P1] Andreas is addressing you. [P0] Urgent need to take a break.
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Zenoh SHM Gate</strong></td><td class="p-3 border-b border-border/60">P0 acceptance + auto-fallback</td><td class="p-3 border-b border-border/60">Binding acceptance criterion on the target VM: <code class="font-mono text-[0.85em] bg-white/[0.04] px-1.5 rounded text-neon-blue">p99 &lt; 200&micro;s</code>. If SHM is unstable: a reproducible fallback (Unix socket/TCP).</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Hot State</strong></td><td class="p-3 border-b border-border/60">redb<sup><a href="#ref-7" class="text-neon-blue no-underline text-[0.7rem] font-bold hover:underline">[7]</a></sup> <span class="inline-block px-1.5 py-0.5 font-mono font-extrabold text-[0.5rem] uppercase rounded bg-neon-green/12 text-neon-green border border-neon-green/25">Chosen</span></td><td class="p-3 border-b border-border/60">Pure-Rust KV store. No FFI, ACID + MVCC, crash-safe copy-on-write B-tree.</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Structured Data</strong></td><td class="p-3 border-b border-border/60">rusqlite <span class="inline-block px-1.5 py-0.5 font-mono font-extrabold text-[0.5rem] uppercase rounded bg-neon-green/12 text-neon-green border border-neon-green/25">ADR-002</span></td><td class="p-3 border-b border-border/60">SQLite binding for Rust. WAL mode, PRAGMA tuning, busy_timeout. Limbo (Rust rewrite) evaluated but rejected due to missing PRAGMA support.</td></tr>
-                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Kernel I/O</strong></td><td class="p-3 border-b border-border/60">io_uring<sup><a href="#ref-10" class="text-neon-blue no-underline text-[0.7rem] font-bold hover:underline">[10]</a></sup> <span class="inline-block px-1.5 py-0.5 font-mono font-extrabold text-[0.5rem] uppercase rounded bg-neon-purple/15 text-neon-purple border border-neon-purple/30">SOTA</span></td><td class="p-3 border-b border-border/60">Zero-syscall I/O via ring buffer. Hundreds of ops batched. 50-100x fewer syscalls.</td></tr>
+                    <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Kernel I/O</strong></td><td class="p-3 border-b border-border/60">io_uring<sup><a href="#ref-10" class="text-neon-blue no-underline text-[0.7rem] font-bold hover:underline">[10]</a></sup> <span class="inline-block px-1.5 py-0.5 font-mono font-extrabold text-[0.5rem] uppercase rounded bg-neon-purple/15 text-neon-purple border border-neon-purple/30">SOTA</span></td><td class="p-3 border-b border-border/60">Zero-syscall I/O via ring buffer. Hundreds of ops batched. 50-100x fewer syscalls. Contract: runtime probe with transparent sync fallback (kernels/seccomp policies without io_uring stay fully functional); rings are long-lived and reused, never constructed per operation.</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Agent FS</strong></td><td class="p-3 border-b border-border/60">sentinel-fs (CAS + FUSE + io_uring)<sup><a href="#ref-14" class="text-neon-blue no-underline text-[0.7rem] font-bold hover:underline">[14]</a></sup> <span class="inline-block px-1.5 py-0.5 font-mono font-extrabold text-[0.5rem] uppercase rounded bg-neon-blue/12 text-neon-blue border border-neon-blue/25">Kernel 6.14+</span></td><td class="p-3 border-b border-border/60">Content-addressed storage: inline dedup on every write. 15 agents &times; npm install &asymp; 87% projected; <strong class="text-neon-green">live VM measurement: 99% savings (#379)</strong>. Metadata in redb, blobs zstd-compressed.</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Sandbox</strong></td><td class="p-3 border-b border-border/60">bwrap + Landlock<sup><a href="#ref-16" class="text-neon-blue no-underline text-[0.7rem] font-bold hover:underline">[16]</a></sup> + cgroups v2 <span class="inline-block px-1.5 py-0.5 font-mono font-extrabold text-[0.5rem] uppercase rounded bg-neon-green/12 text-neon-green border border-neon-green/25">Validated</span></td><td class="p-3 border-b border-border/60">~4.9 ms start measured (i7-3930K, vs Docker ~500ms). <a href="https://github.com/anthropic-experimental/sandbox-runtime" class="text-neon-blue hover:underline">Anthropic uses bwrap for Claude Code</a>. Fine-grained FS control without privileges.</td></tr>
                     <tr class="hover:bg-white/[0.01]"><td class="p-3 border-b border-border/60"><strong class="text-bright">Tool Execution</strong></td><td class="p-3 border-b border-border/60">Wasmtime 42 Component Model<sup><a href="#ref-11" class="text-neon-blue no-underline text-[0.7rem] font-bold hover:underline">[11]</a></sup> (WIT + WASI 0.2<sup><a href="#ref-12" class="text-neon-blue no-underline text-[0.7rem] font-bold hover:underline">[12]</a></sup>) <span class="inline-block px-1.5 py-0.5 font-mono font-extrabold text-[0.5rem] uppercase rounded bg-neon-purple/15 text-neon-purple border border-neon-purple/30">SOTA</span></td><td class="p-3 border-b border-border/60">&micro;s startup. WIT IDL for compile-time type-safe host functions. WASI 0.2 filesystem (preopened dirs &rarr; sentinel-fs). Fuel-based CPU metering. StoreLimits for memory. InstancePre cache for plugin hot-reload. 24-month LTS (Bytecode Alliance).</td></tr>
@@ -824,7 +824,7 @@ PRAGMA page_size = 8192;              -- optimized for NVMe sectors
         </h3>
 
         <div class="bg-surface-1 border border-border p-7 card-hover">
-            <p class="text-sm mb-4">Each agent gets an <strong class="text-bright">isolated, deduplicated filesystem</strong> via FUSE. SHA-256 inline hashing on every write &mdash; identical content exists only once as a blob.</p>
+            <p class="text-sm mb-4">Each agent gets an <strong class="text-bright">isolated, deduplicated filesystem</strong> via FUSE. Inline hashing on every write &mdash; identical content exists only once. Two-level hash model (self-describing <code class="font-mono text-neon-blue text-[0.8em]">BlockRef</code>s): <strong class="text-bright">BLAKE3-128 content fingerprints</strong> as the canonical chunk identity, <strong class="text-bright">SHA-256 digests</strong> as the object-level integrity contract.</p>
 
             <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
                 <div class="bg-surface-2 border border-border/60 p-4 text-center">
@@ -897,7 +897,7 @@ PRAGMA page_size = 8192;              -- optimized for NVMe sectors
                 <span class="text-dim">External file</span><br>
                 &nbsp;&nbsp;<span class="text-neon-green">&rarr;</span> sentinel-fs: <span class="text-neon-blue">streaming ingest</span><br>
                 &nbsp;&nbsp;<span class="text-neon-green">&rarr;</span> <span class="text-neon-blue">FastCDC chunking</span> (content-defined, deduplicated)<br>
-                &nbsp;&nbsp;<span class="text-neon-green">&rarr;</span> CAS backend (SHA-256, segment packs, zstd)<br>
+                &nbsp;&nbsp;<span class="text-neon-green">&rarr;</span> CAS backend (BLAKE3-128 chunk identity + SHA-256 object digest, segment packs, zstd)<br>
                 &nbsp;&nbsp;<span class="text-neon-green">&rarr;</span> <span class="text-neon-purple">bevy ECS</span> (1 chunk = 1 block in the World)<br>
                 &nbsp;&nbsp;&nbsp;&nbsp;<span class="text-dim">&bull;</span> N agents reference the same block (1:N mapping)<br>
                 &nbsp;&nbsp;&nbsp;&nbsp;<span class="text-dim">&bull;</span> no copying, only pointers<br>
@@ -907,6 +907,18 @@ PRAGMA page_size = 8192;              -- optimized for NVMe sectors
                 &nbsp;&nbsp;&nbsp;&nbsp;<span class="text-dim">&bull;</span> the agent notices nothing of the virtualization
             </div>
             <p class="text-dim text-[0.72rem] italic">The same pointer principle as the Time-Machine restore: immutable blocks, only the pointers change. Low I/O, low latency.</p>
+
+            <!-- Dedup pipeline contract -->
+            <h4 class="font-mono font-bold text-[0.8rem] text-accent-gold uppercase mt-5 mb-3 tracking-wider flex items-center gap-2">
+                <i data-lucide="zap" class="w-3.5 h-3.5"></i> Dedup Pipeline Contract &mdash; the Data Plane, Not a Background Job
+            </h4>
+            <p class="text-sm mb-3">Every agent write crosses this pipeline, so it scales with the aggregated write bandwidth of the whole simulation. Its architectural contract:</p>
+            <div class="space-y-2 text-sm">
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-52 shrink-0">Single memory traversal</strong><span>Boundary detection (FastCDC-class, versioned chunk profiles), BLAKE3 chunk fingerprinting, and the incremental object SHA-256 are fed from <strong class="text-bright">one</strong> pass over the data &mdash; per-byte work is memory-bandwidth-bound, so passes are fused, never stacked.</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-52 shrink-0">Copy-after-dedup</strong><span>Chunk bytes are copied only for content the store does not already hold. Duplicates cost a hash and a lookup &mdash; never an allocation.</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-bright whitespace-nowrap w-52 shrink-0">Exact RAM existence index</strong><span>A sharded, exact in-memory membership index accelerates the per-chunk existence check in front of the durable store. The durable store remains the sole authority: misses always verify, all destructive mutations go through one central path, and a durable store generation invalidates the index on restore. An accelerator may never become a second source of truth.</span></div>
+                <div class="flex gap-3 py-2"><strong class="text-bright whitespace-nowrap w-52 shrink-0">Content-based identity</strong><span>Chunk identity is the content fingerprint alone; the chunk profile records boundary <em>provenance</em>. Identical bytes dedup across profile generations automatically, and chunker upgrades ship as new, coexisting profiles &mdash; never as a silent boundary change.</span></div>
+            </div>
 
             <!-- Warum-Box -->
             <div class="border-l-4 border-accent-cyan bg-accent-cyan/[0.02] p-4 mt-5">
@@ -1126,14 +1138,14 @@ PRAGMA page_size = 8192;              -- optimized for NVMe sectors
         </div>
 
         <div class="border-l-3 border-accent-cyan bg-accent-cyan/[0.03] px-5 py-4 my-6 rounded-r text-[0.88rem]" style="border-left: 3px solid #06b6d4;">
-            <strong class="text-accent-cyan block text-[0.65rem] uppercase tracking-[1.5px] mb-2 flex items-center gap-2"><i data-lucide="lightbulb" class="w-3.5 h-3.5"></i> In einfachen Worten</strong>
+            <strong class="text-accent-cyan block text-[0.65rem] uppercase tracking-[1.5px] mb-2 flex items-center gap-2"><i data-lucide="lightbulb" class="w-3.5 h-3.5"></i> In plain language</strong>
             The Cortex Gateway is like the behind-the-scenes director in The Truman Show. It controls
             what every agent perceives and feels, without the agent noticing. The Prompt Compiler
             assembles each scene individually &mdash; from the fixed identity (TOML), the accumulated
             experience (redb), and the current situation (live injection).
         </div>
 
-        <!-- Personality Evolution Kreislauf -->
+        <!-- Personality evolution cycle -->
         <div class="bg-surface-1 border border-neon-purple/30 p-6 my-6 card-hover" style="background: linear-gradient(135deg, #0e0e18, rgba(168,85,247,0.02));">
             <div class="flex items-center justify-between mb-3">
                 <span class="font-mono font-bold text-[0.65rem] text-neon-purple uppercase tracking-widest flex items-center gap-2"><i data-lucide="refresh-cw" class="w-4 h-4"></i> Personality Evolution Cycle</span>
@@ -1415,6 +1427,21 @@ PRAGMA page_size = 8192;              -- optimized for NVMe sectors
             </div>
         </div>
 
+        <!-- Dependency sovereignty -->
+        <h3 class="font-sans font-bold text-xl text-bright mt-10 mb-5 flex items-center gap-3 border-l-[3px] border-neon-purple pl-4">
+            <i data-lucide="package-check" class="w-5 h-5 text-neon-purple"></i> Dependency Sovereignty &mdash; the OSS Intervention Ladder
+        </h3>
+        <div class="bg-surface-1 border border-border p-7 card-hover">
+            <p class="text-sm mb-4">A 100% open-source stack means every dependency is modifiable at source level &mdash; but a fork is a standing liability (rebase and CVE responsibility), not a free optimization. Interventions therefore follow a cost-aware ladder, and dependency facts are established by <strong class="text-bright">reachability analysis of the release binaries</strong>, never by raw lockfile counting (dev-, build- and foreign-target dependencies are not runtime surface).</p>
+            <div class="space-y-2 text-sm">
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-neon-green whitespace-nowrap w-44 shrink-0">Stage 0 &middot; Configure</strong><span>Feature minimization (<code class="font-mono text-neon-blue text-[0.8em]">default-features = false</code> + explicit lists) and duplicate-version consolidation, justified per audit row; a deny-gate keeps new duplicates out of the tree.</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-neon-blue whitespace-nowrap w-44 shrink-0">Stage 1 &middot; Build</strong><span>Profile-level optimization across the whole tree (LTO, codegen units, ISA baseline) &mdash; optimizing foreign code without touching it.</span></div>
+                <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-accent-gold whitespace-nowrap w-44 shrink-0">Stage 2 &middot; Patch</strong><span>Surgical <code class="font-mono text-neon-blue text-[0.8em]">[patch.crates-io]</code> changes, each requiring a measured justification, a registry entry (reason, diff size, upstream PR), and an upstream-first obligation &mdash; a merged upstream PR retires the patch. CI verifies registry and patches stay in sync.</span></div>
+                <div class="flex gap-3 py-2"><strong class="text-neon-purple whitespace-nowrap w-44 shrink-0">Stage 3 &middot; Own</strong><span>Full in-house implementation, reserved for core-domain hot paths (the chunker is the canonical example) with the project's complete test and benchmark discipline.</span></div>
+            </div>
+            <p class="text-dim text-[0.72rem] italic mt-3">Patched or owned code transfers CVE responsibility to us &mdash; supply-chain governance (cargo-deny, geiger baseline, SBOM) is part of the contract, not an afterthought.</p>
+        </div>
+
     </section>
 
     <!-- ================================================================== -->
@@ -1595,6 +1622,12 @@ sentinel/telemetry/spans        # SpanExport (optional, debug-only)</pre>
         <div class="border-l-4 border-accent-gold bg-accent-gold/[0.02] p-6 mb-6">
             <strong class="text-accent-gold flex items-center gap-2"><i data-lucide="shield" class="w-4 h-4"></i> Focus: stability through cloud routing + a deterministic night-run</strong>
             <p class="text-sm mt-2">No local model training, no mandatory GPU. The result: less complexity, lower risk, faster to ship.</p>
+        </div>
+
+        <!-- Efficiency doctrine -->
+        <div class="border-l-4 border-neon-green bg-neon-green/[0.02] p-6 mb-6">
+            <strong class="text-neon-green flex items-center gap-2"><i data-lucide="gauge" class="w-4 h-4"></i> Efficiency doctrine: resources per unit of work, not raw throughput</strong>
+            <p class="text-sm mt-2">Anyone can be fast on 96 cores. This platform is designed to be impressive on a 15-year-old six-core with 8 GB &mdash; which is only possible if efficiency, not hardware, does the work. Consequently, performance is judged on <strong class="text-bright">co-primary metrics</strong>: throughput and tail latency (p99) together with <strong class="text-bright">CPU-seconds per GB, syscalls per operation, and RAM per agent</strong>. An optimization that wins one axis by losing another does not win. Optimization decisions carry pre-committed adopt/reject rules, are measured against a recorded baseline on target-class hardware, and an evidence-based rejection is a first-class outcome.</p>
         </div>
 
         <h3 class="font-sans font-bold text-xl text-bright mt-10 mb-5 flex items-center gap-3 border-l-[3px] border-neon-purple pl-4"><i data-lucide="cpu" class="w-5 h-5 text-neon-purple"></i> Proxmox Host Hardware</h3>
@@ -2583,6 +2616,18 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
             </div>
         </div>
 
+        <!-- Cluster transport + release engineering contracts -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
+            <div class="bg-surface-1 border border-neon-blue/30 p-6 card-hover">
+                <h4 class="font-sans font-bold text-lg text-bright mb-3 flex items-center gap-2"><i data-lucide="split" class="w-4 h-4 text-neon-blue"></i> Transport profiles per traffic class</h4>
+                <p class="text-[0.85rem] leading-relaxed">Node-to-node QUIC carries three traffic classes with conflicting needs &mdash; small latency-critical <strong class="text-bright">control RPCs</strong>, bulk <strong class="text-bright">block-pull</strong>, and <strong class="text-bright">snapshot streaming</strong>. Each class runs under its own named transport profile (congestion control, flow-control windows sized from measured path properties, per-connection memory bound). The invariant: <strong class="text-bright">the data plane may never alter the control plane's resource contract</strong> &mdash; bulk windows and congestion tuning must not degrade control-RPC latency or fairness. Conservative congestion defaults; experimental algorithms only behind soak/failure hardening evidence.</p>
+            </div>
+            <div class="bg-surface-1 border border-neon-green/30 p-6 card-hover">
+                <h4 class="font-sans font-bold text-lg text-bright mb-3 flex items-center gap-2"><i data-lucide="package" class="w-4 h-4 text-neon-green"></i> Release engineering as an architecture contract</h4>
+                <p class="text-[0.85rem] leading-relaxed">One identical, provenance-bound binary for every node (binary parity): the codegen configuration &mdash; LTO shape, codegen units, ISA baseline &mdash; is <strong class="text-bright">part of the determinism profile</strong>, chosen by measured evidence with pre-committed decision rules, and recorded in release provenance/SBOM. The ISA baseline is a product decision about the supported platform class (adopted only after validation on the lowest supported class); newer CPUs are exploited via runtime dispatch inside the one binary, never via per-node builds. Any codegen change requires re-validating bit-exact replay before rollout.</p>
+            </div>
+        </div>
+
         <!-- Open decisions -->
         <h3 class="font-sans font-bold text-xl text-bright mt-10 mb-5 flex items-center gap-3 border-l-[3px] border-accent-red pl-4">
             <i data-lucide="git-pull-request-draft" class="w-5 h-5 text-accent-red"></i> Open Decisions (ADR needed)
@@ -2595,7 +2640,7 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
 
         <!-- Determinism profile -->
         <div class="bg-surface-1 border border-border p-5 mt-6">
-            <p class="text-[0.82rem] leading-relaxed"><strong class="text-accent-gold">Determinism &mdash; the homogeneous profile:</strong> &ldquo;same CPU architecture&rdquo; is <strong class="text-bright">not</strong> enough &mdash; transcendental float functions (exp/sin/ln) are not guaranteed bit-identical even within one ISA (platform, compiler, version). The goal is therefore a strict <strong class="text-bright">determinism profile</strong> as an operating condition: identical binary/toolchain, no FMA contraction/fast-math, fixed iteration and DB ordering. Under it, faithful replay <em>and</em> homogeneous cross-node migration are bit-exact &mdash; <strong class="text-bright">without</strong> the large fixed-point rebuild. Fixed-point arithmetic remains necessary only for <em>heterogeneous</em> architectures; pure snapshot/restore (without replay) does not need the profile at all. <strong class="text-neon-green">Measured (spike #490):</strong> under this profile (same binary, rustc 1.94.0, no RUSTFLAGS, x86-64 baseline) re-execution is bit-exact over 10,000 ticks including f32 exp/ln/sin, in- and cross-process on the deploy VM.</p>
+            <p class="text-[0.82rem] leading-relaxed"><strong class="text-accent-gold">Determinism &mdash; the homogeneous profile:</strong> &ldquo;same CPU architecture&rdquo; is <strong class="text-bright">not</strong> enough &mdash; transcendental float functions (exp/sin/ln) are not guaranteed bit-identical even within one ISA (platform, compiler, version). The goal is therefore a strict <strong class="text-bright">determinism profile</strong> as an operating condition: identical binary/toolchain, no FMA contraction/fast-math, fixed iteration and DB ordering. Under it, faithful replay <em>and</em> homogeneous cross-node migration are bit-exact &mdash; <strong class="text-bright">without</strong> the large fixed-point rebuild. Fixed-point arithmetic remains necessary only for <em>heterogeneous</em> architectures; pure snapshot/restore (without replay) does not need the profile at all. <strong class="text-neon-green">Measured (spike #490):</strong> under this profile (same binary, rustc 1.94.0, no RUSTFLAGS, x86-64 baseline) re-execution is bit-exact over 10,000 ticks including f32 exp/ln/sin, in- and cross-process on the deploy VM. The codegen configuration (LTO shape, codegen units, ISA baseline) is an integral part of this profile: changing it redefines the profile and requires the bit-exactness proof to be re-established before rollout &mdash; a determinism regression vetoes any performance gain.</p>
         </div>
     </section>
 
@@ -2745,7 +2790,7 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
         <div class="flex flex-col items-center gap-3">
             <div class="font-mono text-[0.65rem] text-dim tracking-[3px] uppercase">Project Sentinel &mdash; The Synthetic Enterprise Reality</div>
             <div class="font-mono text-[0.6rem] text-dim/60">
-                VER 22.2 &middot; 2026-05-29 &middot; Tailwind CSS + Lucide Icons &middot; 15 crates + 4 services + shared Go pkg &middot; Architecture principles (P1 dedup + P2 zero-copy + P3 latency constraint) &middot; Security model (honest assessment) &middot; Target architecture v23 (nano-container contract + live migration + affinity sharding) &middot; 31 references
+                VER 22.2 &middot; 2026-05-29 &middot; Tailwind CSS + Lucide Icons &middot; 19 crates + 7 Rust services + 3 Go services + shared Go pkg &middot; Architecture principles (P1 dedup + P2 zero-copy + P3 latency constraint) &middot; Security model (honest assessment) &middot; Target architecture v23 (nano-container contract + live migration + affinity sharding) &middot; 31 references
             </div>
             <div class="font-mono text-[0.55rem] text-dim/40 mt-2">
                 &copy; 2026 obtFusi &mdash; Built with Rust, Go, TypeScript and obsessive attention to detail.
