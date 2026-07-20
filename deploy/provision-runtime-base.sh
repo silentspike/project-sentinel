@@ -18,7 +18,7 @@ LANDLOCK_WRAPPER="${REPO_ROOT}/target/release/landlock-wrapper"
 DAEMON_UNIT="${REPO_ROOT}/deploy/systemd/sentinel-daemon.service"
 INIT_CGROUPS="${REPO_ROOT}/deploy/scripts/init-cgroups.sh"
 INIT_SYSCTL="${REPO_ROOT}/deploy/scripts/init-sysctl.sh"
-INIT_DIRS="${REPO_ROOT}/deploy/scripts/init-dirs.sh"
+INIT_BASE_DIRS="${REPO_ROOT}/deploy/scripts/init-runtime-base-dirs.sh"
 APT_PIN="${REPO_ROOT}/deploy/apt/sentinel-runtime.pref"
 BWRAP_SYSCTL="${REPO_ROOT}/deploy/vm-config/99-sentinel-bwrap.conf"
 
@@ -29,7 +29,7 @@ for source in \
   "${DAEMON_UNIT}" \
   "${INIT_CGROUPS}" \
   "${INIT_SYSCTL}" \
-  "${INIT_DIRS}" \
+  "${INIT_BASE_DIRS}" \
   "${APT_PIN}" \
   "${BWRAP_SYSCTL}"; do
   if [ ! -f "${source}" ]; then
@@ -53,7 +53,7 @@ declare -a sources=(
   "${DAEMON_UNIT}"
   "${INIT_CGROUPS}"
   "${INIT_SYSCTL}"
-  "${INIT_DIRS}"
+  "${INIT_BASE_DIRS}"
   "${APT_PIN}"
   "${BWRAP_SYSCTL}"
 )
@@ -88,6 +88,7 @@ ssh -o BatchMode=yes -o ConnectTimeout=5 "${SSH_TARGET}" bash -s -- \
   "${SENTINEL_DAEMON_USER}" \
   "${SENTINEL_DAEMON_GROUP}" \
   "${SENTINEL_DATA_USER}" \
+  "${SENTINEL_DATA_GROUP}" \
   "${SENTINEL_BUBBLEWRAP_VERSION}" \
   "${SENTINEL_BUBBLEWRAP_BINARY_SHA256}" \
   "${hashes[@]}" <<'REMOTE'
@@ -100,9 +101,10 @@ expected_arch="$4"
 daemon_user="$5"
 daemon_group="$6"
 data_user="$7"
-bwrap_version="$8"
-bwrap_binary_sha="$9"
-shift 9
+data_group="$8"
+bwrap_version="$9"
+bwrap_binary_sha="${10}"
+shift 10
 expected_hashes=("$@")
 
 artifacts=(
@@ -112,7 +114,7 @@ artifacts=(
   sentinel-daemon.service
   init-cgroups.sh
   init-sysctl.sh
-  init-dirs.sh
+  init-runtime-base-dirs.sh
   sentinel-runtime.pref
   99-sentinel-bwrap.conf
 )
@@ -143,14 +145,19 @@ require_inactive() {
   fi
 }
 
-tree_digest() {
+protected_metadata_digest() {
   local root="$1"
   if ! sudo test -e "${root}"; then
     printf 'ABSENT'
     return
   fi
-  sudo find "${root}" -xdev -type f -exec sha256sum {} + \
-    | LC_ALL=C sort \
+
+  # Never open protected file contents. This record covers every entry,
+  # including directories and symlinks, plus type, ownership, permissions,
+  # size, timestamps, inode/link metadata, and the symlink target.
+  sudo find -P "${root}" -xdev \
+    -printf '%P\037%y\037%U\037%G\037%m\037%s\037%T@\037%C@\037%D\037%i\037%n\037%b\037%l\0' \
+    | LC_ALL=C sort -z \
     | sha256sum \
     | awk '{print $1}'
 }
@@ -166,6 +173,7 @@ sudo -n true
 getent passwd "${daemon_user}" >/dev/null
 getent group "${daemon_group}" >/dev/null
 getent passwd "${data_user}" >/dev/null
+getent group "${data_group}" >/dev/null
 
 # shellcheck disable=SC1091
 source /etc/os-release
@@ -182,10 +190,20 @@ if [ "$(stat -fc %T /sys/fs/cgroup)" != "cgroup2fs" ]; then
   exit 1
 fi
 
-config_before="$(tree_digest /opt/sentinel/config)"
-data_before="$(tree_digest /opt/sentinel/data)"
-identity_before="$(tree_digest /etc/sentinel)"
-machine_id_before="$(sha256sum /etc/machine-id | awk '{print $1}')"
+if [ ! -d /opt/sentinel/config ] || [ ! -d /opt/sentinel/data ]; then
+  echo "ERROR: node config and data overlays must exist before base provisioning" >&2
+  exit 1
+fi
+if [ -L /etc/machine-id ] || [ ! -f /etc/machine-id ]; then
+  echo "ERROR: machine identity must be a regular file" >&2
+  exit 1
+fi
+
+config_metadata_before="$(protected_metadata_digest /opt/sentinel/config)"
+data_metadata_before="$(protected_metadata_digest /opt/sentinel/data)"
+secret_metadata_before="$(protected_metadata_digest /etc/sentinel)"
+machine_id_metadata_before="$(protected_metadata_digest /etc/machine-id)"
+company_metadata_before="$(protected_metadata_digest /work/company)"
 
 sudo install -o root -g root -m 0644 \
   "${staging_dir}/sentinel-runtime.pref" /etc/apt/preferences.d/sentinel-runtime
@@ -217,8 +235,13 @@ if [ -n "$(getcap /usr/bin/bwrap)" ]; then
   exit 1
 fi
 
-sudo install -d -o root -g root -m 0755 \
-  /opt/sentinel/bin /opt/sentinel/scripts /opt/sentinel/share
+sudo env \
+  SENTINEL_BASE_USER=root \
+  SENTINEL_BASE_GROUP=root \
+  SENTINEL_DATA_USER="${data_user}" \
+  SENTINEL_DATA_GROUP="${data_group}" \
+  bash "${staging_dir}/init-runtime-base-dirs.sh"
+
 sudo install -o root -g root -m 0755 \
   "${staging_dir}/agent-runtime" /usr/bin/agent-runtime
 sudo install -o root -g root -m 0755 \
@@ -230,18 +253,12 @@ sudo install -o root -g root -m 0755 \
 sudo install -o root -g root -m 0755 \
   "${staging_dir}/init-sysctl.sh" /opt/sentinel/scripts/init-sysctl.sh
 sudo install -o root -g root -m 0755 \
-  "${staging_dir}/init-dirs.sh" /opt/sentinel/scripts/init-dirs.sh
+  "${staging_dir}/init-runtime-base-dirs.sh" /opt/sentinel/scripts/init-runtime-base-dirs.sh
 sudo install -o root -g root -m 0644 \
   "${staging_dir}/runtime-base.env" /opt/sentinel/share/runtime-base.env
 sudo install -o root -g root -m 0644 \
   "${staging_dir}/99-sentinel-bwrap.conf" /etc/sysctl.d/99-sentinel-bwrap.conf
 
-# The path is structural. Existing company content and ownership are untouched.
-if [ ! -d /work/company ]; then
-  sudo install -d -o root -g root -m 0755 /work/company
-fi
-
-sudo env SENTINEL_USER="${data_user}" bash /opt/sentinel/scripts/init-dirs.sh
 sudo bash /opt/sentinel/scripts/init-cgroups.sh
 sudo bash /opt/sentinel/scripts/init-sysctl.sh
 sudo sysctl --load /etc/sysctl.d/99-sentinel-bwrap.conf >/dev/null
@@ -255,7 +272,7 @@ verify_hash "${expected_hashes[2]}" /opt/sentinel/bin/landlock-wrapper
 verify_hash "${expected_hashes[3]}" /etc/systemd/system/sentinel-daemon.service
 verify_hash "${expected_hashes[4]}" /opt/sentinel/scripts/init-cgroups.sh
 verify_hash "${expected_hashes[5]}" /opt/sentinel/scripts/init-sysctl.sh
-verify_hash "${expected_hashes[6]}" /opt/sentinel/scripts/init-dirs.sh
+verify_hash "${expected_hashes[6]}" /opt/sentinel/scripts/init-runtime-base-dirs.sh
 verify_hash "${expected_hashes[0]}" /opt/sentinel/share/runtime-base.env
 verify_hash "${expected_hashes[7]}" /etc/apt/preferences.d/sentinel-runtime
 verify_hash "${expected_hashes[8]}" /etc/sysctl.d/99-sentinel-bwrap.conf
@@ -389,18 +406,31 @@ if ! grep -Fq 'agent-runtime: started' "${probe_log}" \
 fi
 probe_cleanup
 trap - EXIT HUP INT TERM
-
-config_after="$(tree_digest /opt/sentinel/config)"
-data_after="$(tree_digest /opt/sentinel/data)"
-identity_after="$(tree_digest /etc/sentinel)"
-machine_id_after="$(sha256sum /etc/machine-id | awk '{print $1}')"
-if [ "${config_before}" != "${config_after}" ] \
-  || [ "${data_before}" != "${data_after}" ] \
-  || [ "${identity_before}" != "${identity_after}" ] \
-  || [ "${machine_id_before}" != "${machine_id_after}" ]; then
-  echo "ERROR: protected config, data, credential, or machine identity bytes changed" >&2
+if sudo test -e "${probe_home}" || sudo test -e "${probe_cgroup}"; then
+  echo "ERROR: runtime-base sandbox probe left undeclared residue" >&2
   exit 1
 fi
 
-echo "Runtime base installed and functionally verified; protected node state preserved; services remain stopped"
+config_metadata_after="$(protected_metadata_digest /opt/sentinel/config)"
+data_metadata_after="$(protected_metadata_digest /opt/sentinel/data)"
+secret_metadata_after="$(protected_metadata_digest /etc/sentinel)"
+machine_id_metadata_after="$(protected_metadata_digest /etc/machine-id)"
+company_metadata_after="$(protected_metadata_digest /work/company)"
+if [ "${config_metadata_before}" != "${config_metadata_after}" ] \
+  || [ "${data_metadata_before}" != "${data_metadata_after}" ] \
+  || [ "${secret_metadata_before}" != "${secret_metadata_after}" ] \
+  || [ "${machine_id_metadata_before}" != "${machine_id_metadata_after}" ] \
+  || { [ "${company_metadata_before}" != "ABSENT" ] \
+    && [ "${company_metadata_before}" != "${company_metadata_after}" ]; }; then
+  echo "ERROR: protected config, data, secret, machine identity, or company metadata changed" >&2
+  exit 1
+fi
+if [ "${company_metadata_before}" = "ABSENT" ] \
+  && { [ "$(sudo stat -c '%U:%G:%a:%F' /work/company)" != "root:root:755:directory" ] \
+    || sudo find /work/company -mindepth 1 -print -quit | grep -q .; }; then
+  echo "ERROR: newly created company bind root is not empty and canonical" >&2
+  exit 1
+fi
+
+echo "Runtime base installed and functionally verified; protected metadata preserved without reading protected contents; services remain stopped"
 REMOTE
