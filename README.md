@@ -339,6 +339,7 @@ caveat list.
 |--------------------------------------------------------------|-----------------------------------------------|
 | [llms.txt](llms.txt)                                         | LLM-friendly project index (read first)       |
 | [docs/architecture/togaf-architecture-guide.html](docs/architecture/togaf-architecture-guide.html) | Authoritative architecture reference (v22.1) |
+| [docs/virtual-company-work-execution.md](docs/virtual-company-work-execution.md) | Executable M0 customer-to-delivery product contract |
 | [docs/governance.md](docs/governance.md)                     | Governance mechanisms ↔ code path mapping     |
 | [docs/togaf-gap-v22.md](docs/togaf-gap-v22.md)               | Per-cluster implementation status             |
 | [docs/togaf-deviations-v22.md](docs/togaf-deviations-v22.md) | Intentional deviations from the spec          |
