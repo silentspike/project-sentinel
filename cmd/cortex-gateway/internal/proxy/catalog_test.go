@@ -340,6 +340,32 @@ func TestCredentialFileRequiresOwnerOnlyPermissions(t *testing.T) {
 	}
 }
 
+func TestSystemdCredentialPermissions(t *testing.T) {
+	const directory = "/run/credentials/sentinel-gateway.service"
+	path := filepath.Join(directory, "caller-agent-runtime")
+	if !secureCredentialMode(0o440, 0, 0, path, directory) {
+		t.Fatal("systemd root:root 0440 credential rejected")
+	}
+	for _, test := range []struct {
+		name      string
+		mode      os.FileMode
+		uid, gid  uint32
+		path, dir string
+	}{
+		{"outside credential directory", 0o440, 0, 0, "/tmp/token", directory},
+		{"group writable", 0o460, 0, 0, path, directory},
+		{"wrong owner", 0o440, 1000, 0, path, directory},
+		{"wrong group", 0o440, 0, 1000, path, directory},
+		{"missing credential directory", 0o440, 0, 0, path, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if secureCredentialMode(test.mode, test.uid, test.gid, test.path, test.dir) {
+				t.Fatal("insecure systemd credential permissions accepted")
+			}
+		})
+	}
+}
+
 func TestAuthorizedClassificationAndPublicClaimStripping(t *testing.T) {
 	agent := &LLMRequest{Metadata: map[string]string{"agent_id": "7", "agent_role": "Engineer", "hierarchy_tier": "2"}}
 	class, err := ClassifyRequest("/internal/agent-runtime", agent, CallerRoleAgentRuntime)
