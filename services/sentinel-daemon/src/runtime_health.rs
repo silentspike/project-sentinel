@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use sentinel_common::agent_config::AgentConfig;
-use sentinel_common::AgentId;
+use sentinel_common::{AgentId, LocalResidency, OwnerRegistry, StateTransferScope};
 use sentinel_projection::ReadModelStore;
 use sentinel_runtime::RuntimeOrchestrator;
 use sentinel_sandbox::cgroups::list_pids_in_cgroup;
@@ -98,8 +98,50 @@ pub fn build_runtime_health_snapshot(
     service_health_state: ServiceHealthWorkerSnapshot,
     previous: Option<&RuntimeHealthSnapshot>,
 ) -> RuntimeHealthSnapshot {
+    build_runtime_health_snapshot_with_registry(
+        all_agents,
+        current_shift,
+        runtime_orch,
+        sandbox_handles,
+        agent_processes,
+        security_runtime_state,
+        projection_db_path,
+        operator_auth_required,
+        service_health_state,
+        previous,
+        OwnerRegistry::global(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_health_snapshot_with_registry(
+    all_agents: &[AgentConfig],
+    current_shift: u8,
+    runtime_orch: &RuntimeOrchestrator,
+    sandbox_handles: &HashMap<AgentId, SandboxHandle>,
+    agent_processes: &HashMap<AgentId, AgentProcess>,
+    security_runtime_state: &SharedSecurityRuntimeState,
+    projection_db_path: &Path,
+    operator_auth_required: bool,
+    service_health_state: ServiceHealthWorkerSnapshot,
+    previous: Option<&RuntimeHealthSnapshot>,
+    owner_registry: &OwnerRegistry,
+) -> RuntimeHealthSnapshot {
     let snapshot_started = Instant::now();
-    let expected_agents = agents_for_shift(all_agents, current_shift);
+    let configured_ids = all_agents
+        .iter()
+        .map(|agent| agent.identity.id)
+        .collect::<BTreeSet<_>>();
+    let expected_agents = agents_for_shift(all_agents, current_shift)
+        .into_iter()
+        .filter(|agent| {
+            let scope = StateTransferScope::for_agent(AgentId(agent.identity.id).to_string());
+            matches!(
+                owner_registry.local_residency(&scope),
+                Ok(LocalResidency::Active)
+            )
+        })
+        .collect::<Vec<_>>();
     let expected_active_ids = expected_agents
         .iter()
         .map(|cfg| cfg.identity.id)
@@ -120,6 +162,11 @@ pub fn build_runtime_health_snapshot(
     let projection_active_by_id = projection_active_agents
         .iter()
         .filter_map(|view| u16::try_from(view.agent_id).ok().map(|id| (id, view)))
+        .filter(|(id, _)| {
+            !owner_registry.is_cluster_mode()
+                || expected_active_ids.contains(id)
+                || !configured_ids.contains(id)
+        })
         .collect::<HashMap<_, _>>();
     let projection_agents = projection_active_by_id.len();
     let runtime_agents = runtime_orch.agent_count();
@@ -426,6 +473,10 @@ mod tests {
         AgentConfig, BackgroundConfig, IdentityConfig, PersonalityConfig, PreferencesConfig,
     };
     use sentinel_common::components::{AgentIdentity, ShiftInfo};
+    use sentinel_common::{
+        ActivationState, LocalOwnerBaseRole, LocalOwnerBaseState, LocalOwnerStateSnapshot, NodeId,
+        OwnerTerm, OwnerTermSnapshot, TRACK_A_COORDINATOR_GENERATION,
+    };
     use tempfile::tempdir;
 
     fn test_agent(id: u16, shift_set: u8, name: &str) -> AgentConfig {
@@ -461,6 +512,86 @@ mod tests {
             runtime: Default::default(),
             capabilities: Default::default(),
         }
+    }
+
+    fn follower_registry_for_agent(agent_id: u16) -> OwnerRegistry {
+        let seed = NodeId(uuid::Uuid::from_bytes([1; 16]));
+        let follower = NodeId(uuid::Uuid::from_bytes([2; 16]));
+        let scopes = [
+            StateTransferScope::World,
+            StateTransferScope::for_agent(AgentId(agent_id).to_string()),
+        ];
+        let terms = scopes
+            .into_iter()
+            .map(|scope| OwnerTerm {
+                scope,
+                owner_node: seed,
+                epoch: 1,
+                coordinator_generation: TRACK_A_COORDINATOR_GENERATION,
+            })
+            .collect::<Vec<_>>();
+        let global = OwnerTermSnapshot::new(TRACK_A_COORDINATOR_GENERATION, 1, terms).unwrap();
+        let local = LocalOwnerStateSnapshot::new(
+            follower,
+            TRACK_A_COORDINATOR_GENERATION,
+            1,
+            global
+                .sorted_terms
+                .iter()
+                .cloned()
+                .map(|owner_term| LocalOwnerBaseState {
+                    scope: owner_term.scope.clone(),
+                    recipient_node: follower,
+                    owner_term,
+                    base_role: LocalOwnerBaseRole::Follower,
+                    activation_state: ActivationState::NotRoutable,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let registry = OwnerRegistry::new_cluster_for_test(follower);
+        registry
+            .rebuild_from_owner_snapshot(&global, &local, vec![])
+            .unwrap();
+        registry
+    }
+
+    #[test]
+    fn follower_health_uses_local_residency_not_the_shift_roster() {
+        let tmp = tempdir().unwrap();
+        let projection_path = tmp.path().join("projection.db");
+        let projection_store =
+            sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap();
+        {
+            let txn = projection_store.begin_transaction().unwrap();
+            txn.begin().unwrap();
+            txn.upsert_agent(7, "Remote Agent", "Role", 1, "active", 1)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        drop(projection_store);
+
+        let registry = follower_registry_for_agent(7);
+        let snapshot = build_runtime_health_snapshot_with_registry(
+            &[test_agent(7, 1, "Remote Agent")],
+            1,
+            &RuntimeOrchestrator::new(30),
+            &HashMap::new(),
+            &HashMap::new(),
+            &Arc::new(RwLock::new(HashMap::new())),
+            &projection_path,
+            false,
+            ServiceHealthWorkerSnapshot::default(),
+            None,
+            &registry,
+        );
+
+        assert_eq!(snapshot.expected_active_agents, 0);
+        assert_eq!(snapshot.runtime_agents, 0);
+        assert_eq!(snapshot.projection_agents, 0);
+        assert!(!snapshot.projection_drift_detected);
+        assert_eq!(snapshot.stale_runtime_entries, 0);
+        assert!(snapshot.agents.is_empty());
     }
 
     #[test]
