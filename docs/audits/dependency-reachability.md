@@ -13,9 +13,12 @@ decisions.
 - Eight Rust binary roots contribute to release, helper, or packaged-demo supply-chain
   reachability. `sentinel-gaia-loop` is included; non-deployed workspace binaries are
   not silently treated as services.
-- Linux release reachability contains 499 normal and 91 build/proc-macro packages.
+- Linux release reachability contains 485 normal and 90 build/proc-macro packages.
 - The lockfile also contains 2 non-release workspace packages, 31 dev/bench-only
-  packages, 90 foreign-target-only packages, and 4 disabled optional packages.
+  packages, 80 foreign-target-only packages, and 29 disabled optional packages.
+- Secondary context is retained independently: 155 packages participate in at least
+  one native dev path and 162 participate in at least one foreign-target path, including
+  packages whose primary category is release reachability.
 - There are 41 duplicate package names covering 94 locked versions. Two dev-only
   groups are ready to align, ten foreign-target groups are explicit `leave` results,
   and the remaining groups require upstream-chain or provider analysis.
@@ -76,12 +79,23 @@ files.
 
 ## Classification Method
 
-Package identity is `(name, version, source)`, not name alone. The classifier consumes
-locked remote `cargo metadata` for all targets and for the native Linux target. It walks
-each root's normal graph, carries build context through build dependencies, classifies
-proc-macro packages as build-time, separately walks non-release workspace roots and dev
-edges, and compares all-target edges with the native graph for foreign-target secondary
-membership.
+Package identity is `(name, version, source)`, not name alone. Reachability comes from
+feature-resolved remote `cargo tree` output, never from the workspace-unified dependency
+list in `cargo metadata`. Each release root has a native `normal` tree and a native
+`normal,build` tree. Proc-macro nodes and their descendants are build context; packages
+present only in the combined tree are build-only. Three workspace trees provide exact
+native normal/build, native all-edge, and all-target all-edge sets. Set differences
+separate dev/bench-only, target-only, and optional-disabled packages.
+
+A fourth native dev-only tree seeds dev context, which is then propagated through only
+Cargo-active native edges. Foreign-target context is propagated through active
+all-target edges when the edge's target specification is absent from the native
+metadata resolution. This preserves real overlaps without allowing inactive optional
+edges to affect primary release membership.
+
+Locked metadata remains useful only for stable package identity, direct manifest feature
+requests, and dependency kind/target labels on edges that Cargo proved active. This
+boundary prevents disabled optional declarations from becoming release dependencies.
 
 Each lockfile package receives the first matching primary category:
 
@@ -92,31 +106,36 @@ Each lockfile package receives the first matching primary category:
 5. `target-only`
 6. `optional-disabled`
 
-The classifier fails if a root does not resolve exactly once, metadata cannot map to the
-lockfile, any package remains unclassified, or category totals do not equal the lockfile
-count. Secondary columns retain dev and foreign-target overlap rather than erasing it.
+The classifier fails if a root does not resolve exactly once, a normal tree is not a
+subset of its normal/build tree, workspace tree roots differ from the 27 metadata
+members, package-set nesting is invalid, an active edge lacks metadata annotation, any
+package remains unclassified, or committed tables differ byte-for-byte from recomputed
+results. Secondary columns retain dev and foreign-target overlap rather than erasing it.
 
 ## Reachability Results
 
 | Primary category | Packages |
 | --- | ---: |
-| `release-normal` | 499 |
-| `release-build` | 91 |
+| `release-normal` | 485 |
+| `release-build` | 90 |
 | `non-release-workspace-normal` | 2 |
 | `dev-bench-only` | 31 |
-| `target-only` | 90 |
-| `optional-disabled` | 4 |
+| `target-only` | 80 |
+| `optional-disabled` | 29 |
 | **Total** | **717** |
 
-The four packages present in the lockfile but absent from the all-target default
-resolution are `generator 0.8.9`, `io-uring 0.7.11`, `loom 0.7.2`, and
-`scoped-tls 1.0.1`. They are classified `optional-disabled`, not falsely counted as
-Linux release dependencies.
+Twenty-nine packages are present in the lockfile but absent from Cargo's all-target,
+all-edge workspace tree. They are classified `optional-disabled`, not falsely counted
+as release dependencies. This includes `embedded-io 0.4.0` and `embedded-io 0.6.1`,
+which are optional declarations in resolved metadata but are absent from every claimed
+release-root tree.
 
 The complete package table is
 [`reachability.tsv`](../../console/evidence/issue-631-live/reachability.tsv). The
 machine-checkable invariants are in
-[`reachability-summary.txt`](../../console/evidence/issue-631-live/reachability-summary.txt).
+[`reachability-summary.txt`](../../console/evidence/issue-631-live/reachability-summary.txt),
+with the exact workspace set inputs in
+[`workspace-reachability-sets.tsv`](../../console/evidence/issue-631-live/workspace-reachability-sets.tsv).
 
 ## Feature Origin and Source Review
 
@@ -153,10 +172,17 @@ Key findings:
 ## Duplicate Versions
 
 The lockfile contains 41 duplicate names and 94 version rows. The full table records
-primary reachability, release roots, immediate lockfile forcers, and a decision for each
-version: [`duplicate-versions.tsv`](../../console/evidence/issue-631-live/duplicate-versions.tsv).
-The native Linux reverse graph is retained in normalized form under
-[`duplicates/`](../../console/evidence/issue-631-live/duplicates/).
+primary reachability, immediate forcers, every reachable workspace/release root, closure
+size, closure basis, and a decision for each version:
+[`duplicate-versions.tsv`](../../console/evidence/issue-631-live/duplicate-versions.tsv).
+All 94 rows have a complete reverse closure: 85 use only active all-target Cargo edges;
+nine optional-disabled rows use explicitly labelled metadata-constraint edges. The
+8,425 target-annotated closure rows are in
+[`duplicates/reverse-closure.tsv`](../../console/evidence/issue-631-live/duplicates/reverse-closure.tsv),
+backed by the deduplicated edge inventory in
+[`workspace-all-target-edges.tsv`](../../console/evidence/issue-631-live/workspace-all-target-edges.tsv).
+Every edge records dependency kind, target expression, and whether Cargo activated it,
+so inactive declarations cannot masquerade as release reachability.
 
 Decision summary by duplicate name:
 
@@ -273,9 +299,12 @@ connection configuration:
 cargo remote -c -- metadata --locked --format-version 1
 cargo remote -c -- metadata --locked --format-version 1 --filter-platform x86_64-unknown-linux-gnu
 cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal --prefix depth --no-dedupe
-cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e build --prefix depth --no-dedupe
+cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,build --prefix depth
 cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,features --prefix depth --no-dedupe
-cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu --duplicates -e normal,build,dev
+cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build --prefix depth --no-dedupe
+cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build,dev --prefix depth --no-dedupe
+cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu -e dev --prefix depth --no-dedupe
+cargo remote -c -- tree --workspace --target all -e normal,build,dev --prefix depth --no-dedupe
 cargo remote -c -- build --release --locked -p <PACKAGE> --bin <BINARY>
 cargo remote -c -- bloat --release --locked -p <PACKAGE> --bin <BINARY> --crates -n 20
 ```
@@ -284,7 +313,10 @@ Classifier and sanitization checks are Python-only and do not invoke local Rust 
 
 ```bash
 python3 -m unittest scripts.tests.test_dependency_reachability_audit
-python3 scripts/dependency-reachability-audit.py audit --check --lock Cargo.lock --metadata-all <RAW_ALL> --metadata-native <RAW_NATIVE>
+python3 scripts/dependency-reachability-audit.py audit --check \
+  --lock Cargo.lock --metadata-all <RAW_ALL> --metadata-native <RAW_NATIVE> \
+  --trees-dir console/evidence/issue-631-live/trees \
+  --output-dir console/evidence/issue-631-live
 python3 scripts/dependency-reachability-audit.py check-public-evidence docs/audits/dependency-reachability.md console/evidence/issue-631-live
 python3 scripts/dependency-reachability-audit.py check-staged
 ```
