@@ -8,9 +8,17 @@ target. Gate C and a current Gate B reservation are prerequisites.
 
 - Gate C pins `config/cortex-gateway.toml` by Git blob OID, file SHA-256, and
   `cortex-catalog-v1` semantic digest. The normalized digest input includes
-  provider ID/type, default, and the complete allowlist. The hierarchy-model
-  mappings are validated fail-closed and remain pinned by the blob/file hashes,
-  but are deliberately outside the semantic digest.
+  provider ID/type, default, the complete allowlist, and all three
+  `hierarchy_models` mappings. Reassigning a hierarchy tier therefore changes
+  the semantic digest and rejects every attestation pinned to the previous
+  digest.
+- The current Gate C candidate pins are:
+  - Git blob OID: `4a575661a99182eabeb67edd34dd277fb9485e32`
+  - file SHA-256: `1138e60eaee2fb022394de46c3b49e8c43c509f3d69645c65357f2c82d7a78da`
+  - `cortex-catalog-v1` semantic digest:
+    `10ed8408bd69c9b10acda44f4cebc889680435945b08a5c3ef2cf068a58680aa`
+  - 60-agent matrix SHA-256:
+    `a297f22b7c9c32fee18a9f450f12cf52ccef97bd2fcb68e68401b35ea76f6cb5`
 - Gate B names one isolated target, owner, exclusive time window, mutation
   scope, rollback owner, and the exactly-one-daemon invariant.
 - The production reference and any target reserved by another issue remain out
@@ -119,7 +127,22 @@ improvise a migration.
     The bridge reserves `request_id` plus request digest immediately before the
     network call. A crash while that call is ambiguous leaves a
     `provider_in_flight` record and fails closed instead of issuing the request
-    again.
+    again. The reservation persists the canonical `nano:AGENT-NN` owner scope;
+    every later enqueue, usage transition, failure, action claim, completion,
+    and operator resolution uses that same scope. World ownership neither
+    authorizes nor blocks an agent completion. A non-owner receives `NotOwner`.
+12. Verify the bounded terminal lifecycle. `enqueue_llm_completion` may only
+    transition an existing `provider_in_flight` row to `pending_usage` when its
+    request ID, request digest, and persisted owner scope still match. It never
+    creates an unreserved row. Automatic recovery has a finite attempt limit.
+    `provider_in_flight`, `failed`, and `action_claimed` remain fail-closed until
+    an authenticated operator resolves their exact request ID and digest through
+    `POST /operator/llm-completions/resolve`. Resolution is owner-fenced, deletes
+    the full response row, and writes the compact append-only
+    `llm_resolution_<request_id>` idempotency marker. The marker blocks future
+    provider replay without retaining the provider payload. New reservations
+    fail closed once 10,000 unresolved terminal rows exist; clear the backlog by
+    resolving reviewed rows, never by deleting the table.
 
 ## Pass conditions
 
@@ -137,7 +160,11 @@ improvise a migration.
   produces one provider call, two local append attempts, one usage event, and
   one action. Actions are claimed durably before channel delivery. A crash after
   that claim is deliberately fail-closed/at-most-once: the action is not replayed
-  automatically and the `action_claimed` row remains for operator diagnosis.
+  automatically and the `action_claimed` row remains for operator diagnosis and
+  explicit authenticated resolution.
+- With World remotely owned and `AGENT-07` locally Owner/Routable, the complete
+  reservation-to-completion recovery path succeeds for `AGENT-07`. The same
+  operation for a foreign agent fails with `NotOwner`.
 
 ## Rollback order
 

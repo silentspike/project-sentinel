@@ -299,24 +299,39 @@ func (c *ProviderCatalog) Resolve(provider string, hierarchyTier int, explicitMo
 }
 
 func (c *ProviderCatalog) SemanticDigest() (string, error) {
-	// cortex-catalog-v1 intentionally excludes hierarchy_models. They are
-	// validated above and pinned by Gate C's full-file/blob hashes; the semantic
-	// digest covers only provider identity/type, default, and complete allowlist.
+	payload, err := c.semanticBytes()
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (c *ProviderCatalog) semanticBytes() ([]byte, error) {
+	// cortex-catalog-v1 binds every routing-relevant catalog field. Endpoint,
+	// binary, limits, priority, and credentials remain deployment concerns.
 	entries := make([]map[string]any, 0, len(c.providers))
 	for id, provider := range c.providers {
 		allowed := append([]string(nil), provider.AllowedModels...)
 		sort.Strings(allowed)
 		entries = append(entries, map[string]any{
-			"id": id, "type": provider.Type, "default_model": provider.DefaultModel, "allowed_models": allowed,
+			"id":             id,
+			"type":           provider.Type,
+			"default_model":  provider.DefaultModel,
+			"allowed_models": allowed,
+			"hierarchy_models": map[string]string{
+				"tier_1": provider.HierarchyModels.Tier1,
+				"tier_2": provider.HierarchyModels.Tier2,
+				"tier_3": provider.HierarchyModels.Tier3,
+			},
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i]["id"].(string) < entries[j]["id"].(string) })
 	payload, err := json.Marshal(map[string]any{"algorithm": CatalogDigestAlgorithm, "providers": entries})
 	if err != nil {
-		return "", fmt.Errorf("encode semantic provider catalog: %w", err)
+		return nil, fmt.Errorf("encode semantic provider catalog: %w", err)
 	}
-	sum := sha256.Sum256(append(payload, '\n'))
-	return hex.EncodeToString(sum[:]), nil
+	return append(payload, '\n'), nil
 }
 
 func (c *ProviderCatalog) Digest() string {

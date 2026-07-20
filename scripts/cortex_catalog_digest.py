@@ -69,6 +69,11 @@ def normalize(document: dict[str, Any]) -> bytes:
                 "type": provider_type,
                 "default_model": default_model,
                 "allowed_models": sorted(allowed_models),
+                "hierarchy_models": {
+                    "tier_1": hierarchy["tier_1"],
+                    "tier_2": hierarchy["tier_2"],
+                    "tier_3": hierarchy["tier_3"],
+                },
             }
         )
 

@@ -73,7 +73,7 @@ func TestProviderCatalogRealConfigAndTierMatrix(t *testing.T) {
 	if _, err := catalog.Resolve("unknown", 1, ""); err == nil {
 		t.Fatal("unknown provider accepted")
 	}
-	if catalog.Digest() != "84896179df1758a8d544607621a5528122d518b83d8b5cdf8adb4affda99a660" {
+	if catalog.Digest() != "10ed8408bd69c9b10acda44f4cebc889680435945b08a5c3ef2cf068a58680aa" {
 		t.Fatalf("semantic digest drifted: %s", catalog.Digest())
 	}
 	entry, _ := catalog.Entry("ollama")
@@ -131,6 +131,51 @@ func TestProviderActivationRequiresExactGateBAttestationWithoutInventory(t *test
 	}
 	if err := catalog.ValidateProviderActivation(LocalLoopProviderName, false, ""); err != nil {
 		t.Fatalf("token-free local-loop blocked: %v", err)
+	}
+}
+
+func TestCatalogDigestAndGateBAttestationBindHierarchyMapping(t *testing.T) {
+	catalog := &ProviderCatalog{providers: map[string]ProviderCatalogEntry{
+		"provider": {
+			Type:          "mock",
+			DefaultModel:  "model-2",
+			AllowedModels: []string{"model-3", "model-1", "model-2"},
+			HierarchyModels: HierarchyModelMap{
+				Tier1: "model-1", Tier2: "model-2", Tier3: "model-3",
+			},
+		},
+	}}
+	if err := catalog.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	firstBytes, err := catalog.semanticBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "{\"algorithm\":\"cortex-catalog-v1\",\"providers\":[{\"allowed_models\":[\"model-1\",\"model-2\",\"model-3\"],\"default_model\":\"model-2\",\"hierarchy_models\":{\"tier_1\":\"model-1\",\"tier_2\":\"model-2\",\"tier_3\":\"model-3\"},\"id\":\"provider\",\"type\":\"mock\"}]}\n"
+	if string(firstBytes) != want {
+		t.Fatalf("canonical bytes:\n%s\nwant:\n%s", firstBytes, want)
+	}
+	firstDigest, err := catalog.SemanticDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog.digest = firstDigest
+	staleAttestation := catalog.ExpectedGateBAttestation("provider")
+
+	entry := catalog.providers["provider"]
+	entry.HierarchyModels.Tier1, entry.HierarchyModels.Tier3 = entry.HierarchyModels.Tier3, entry.HierarchyModels.Tier1
+	catalog.providers["provider"] = entry
+	secondDigest, err := catalog.SemanticDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondDigest == firstDigest {
+		t.Fatal("hierarchy remapping did not change semantic digest")
+	}
+	catalog.digest = secondDigest
+	if err := catalog.ValidateProviderActivation("provider", false, staleAttestation); err == nil {
+		t.Fatal("stale Gate B attestation survived hierarchy remapping")
 	}
 }
 
