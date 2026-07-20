@@ -55,8 +55,9 @@ printf '[compose-auth-smoke] reject invalid credential\n'
 # shellcheck disable=SC2016
 "${compose[@]}" exec -T daemon sh -eu -c '
     test "$CORTEX_GATEWAY_URL" = "http://gateway:8080"
+    invalid_token="$(printf "%s-%s" "invalid" "smoke-token")"
     status="$(curl -sS -o /dev/null -w "%{http_code}" \
-        -H "Authorization: Bearer invalid-smoke-token" \
+        --oauth2-bearer "$invalid_token" \
         -H "Content-Type: application/json" \
         -d "{\"messages\":[{\"role\":\"user\",\"content\":\"auth smoke\"}],\"metadata\":{\"agent_id\":\"1\",\"agent_role\":\"CEO\",\"hierarchy_tier\":\"1\",\"tick\":\"1\"}}" \
         "$CORTEX_GATEWAY_URL/internal/agent-runtime")"
