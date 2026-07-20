@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 type CallerRole string
@@ -62,7 +64,7 @@ func readCredentialFile(path, env string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("stat %s credential: %w", env, err)
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+	if !info.Mode().IsRegular() || !secureCredentialFile(path, info) {
 		return "", fmt.Errorf("%s credential must be an owner-only regular file", env)
 	}
 	value, err := os.ReadFile(path) //nolint:gosec // path is an operator-supplied systemd credential
@@ -76,6 +78,27 @@ func readCredentialFile(path, env string) (string, error) {
 		return token, nil
 	}
 	return "", fmt.Errorf("%s credential is empty", env)
+}
+
+func secureCredentialFile(path string, info os.FileInfo) bool {
+	if info.Mode().Perm()&0o077 == 0 {
+		return true
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return secureCredentialMode(
+		info.Mode().Perm(), stat.Uid, stat.Gid, path, os.Getenv("CREDENTIALS_DIRECTORY"),
+	)
+}
+
+// systemd exposes credentials to non-root services as root:root 0440 below the
+// private CREDENTIALS_DIRECTORY. That directory is inaccessible to unrelated
+// services, so this is equivalent to an owner-only standalone credential.
+func secureCredentialMode(mode os.FileMode, uid, gid uint32, path, credentialsDirectory string) bool {
+	return mode == 0o440 && uid == 0 && gid == 0 && credentialsDirectory != "" &&
+		filepath.Clean(filepath.Dir(path)) == filepath.Clean(credentialsDirectory)
 }
 
 func trimCredentialLineEnding(value string) string {
