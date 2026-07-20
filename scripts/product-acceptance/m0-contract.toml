@@ -1,0 +1,339 @@
+schema_version = 1
+profile = "web-project-v1"
+profile_path = "config/work-profiles/web-project-v1.toml"
+contract_path = "docs/virtual-company-work-execution.md"
+epic = 650
+delivery_issues = [75, 472, 650, 693, 694, 695, 696]
+required_categories = [
+  "contract",
+  "deployment",
+  "identity",
+  "customer",
+  "agreement",
+  "project",
+  "authority",
+  "collaboration",
+  "runtime",
+  "tools",
+  "workspace",
+  "security",
+  "artifact",
+  "qa",
+  "release",
+  "delivery",
+  "inference",
+  "gaia",
+  "memory",
+  "recovery",
+  "console",
+  "cost",
+  "stability",
+]
+
+[[requirements]]
+id = "M0-CONTRACT-001"
+category = "contract"
+title = "Versioned work-execution contract"
+togaf_anchor = "Virtual-company single-node delivery lane"
+contract_section = "Purpose and Claim Boundary"
+owner_issue = 693
+test_id = "m0.contract.document"
+live_probe = "contract-section-readback"
+evidence = "console/evidence/issue-693-live/contract-gate.md"
+status = "pass"
+
+[[requirements]]
+id = "M0-CONTRACT-002"
+category = "contract"
+title = "Fail-closed machine-readable conformance gate"
+togaf_anchor = "Target architecture governance and evidence"
+contract_section = "Observability and Evidence"
+owner_issue = 693
+test_id = "m0.contract.validator"
+live_probe = "contract-validator-positive-and-negative"
+evidence = "console/evidence/issue-693-live/contract-gate.md"
+status = "pass"
+
+[[requirements]]
+id = "M0-DEPLOYMENT-001"
+category = "deployment"
+title = "Cluster-disabled single-node readiness"
+togaf_anchor = "Single-node virtual-company acceptance lane"
+contract_section = "Single-Node Deployment Boundary"
+owner_issue = 650
+test_id = "m0.deployment.single_node_boot"
+live_probe = "restart-without-cluster-config"
+evidence = "console/evidence/issue-650-live/ac-01-readiness.md"
+status = "not_tested"
+
+[[requirements]]
+id = "M0-IDENTITY-001"
+category = "identity"
+title = "Roster, residency, runtime, event, and projection identity parity"
+togaf_anchor = "Agent identity and runtime truth"
+contract_section = "Single-Node Deployment Boundary"
+owner_issue = 650
+test_id = "m0.identity.runtime_projection_parity"
+live_probe = "reconcile-all-agent-identity-sets"
+evidence = "console/evidence/issue-650-live/ac-02-identity-parity.md"
+status = "not_tested"
+
+[[requirements]]
+id = "M0-CUSTOMER-001"
+category = "customer"
+title = "Authenticated customer intake and qualification"
+togaf_anchor = "Virtual-company customer interaction"
+contract_section = "Company Workflow"
+owner_issue = 695
+test_id = "m0.workflow.customer_intake"
+live_probe = "submit-clarify-and-qualify-request"
+evidence = "console/evidence/issue-695-live/customer-intake.md"
+status = "not_tested"
+
+[[requirements]]
+id = "M0-AGREEMENT-001"
+category = "agreement"
+title = "Explicit digest-bound customer agreement"
+togaf_anchor = "Customer authority and accountable work"
+contract_section = "State Machines"
+owner_issue = 695
+test_id = "m0.workflow.explicit_agreement"
+live_probe = "accept-exact-proposal-digest"
+evidence = "console/evidence/issue-695-live/customer-agreement.md"
+status = "not_tested"
+
+[[requirements]]
+id = "M0-PROJECT-001"
+category = "project"
+title = "Governed project and acyclic work graph"
+togaf_anchor = "Hierarchy-driven virtual company"
+contract_section = "Company Workflow"
+owner_issue = 695
+test_id = "m0.workflow.project_dag"
+live_probe = "agreement-to-project-and-work-graph"
+evidence = "console/evidence/issue-695-live/project-graph.md"
+status = "not_tested"
+
+[[requirements]]
+id = "M0-AUTHORITY-001"
+category = "authority"
+title = "Hierarchy, assignment, delegation, and approval authority"
+togaf_anchor = "Organization graph and role authority"
+contract_section = "Actors and Authority"
+owner_issue = 695
+test_id = "m0.workflow.authority_policy"
+live_probe = "authorized-and-denied-assignment-transitions"
+evidence = "console/evidence/issue-695-live/authority.md"
+status = "not_tested"
+
+[[requirements]]
+id = "M0-COLLABORATION-001"
+category = "collaboration"
+title = "Structured decisions, handoffs, blockers, and escalation"
+togaf_anchor = "Rooms plus durable company coordination"
+contract_section = "Collaboration Contract"
+owner_issue = 695
+test_id = "m0.workflow.structured_collaboration"
+live_probe = "project-room-handoff-and-chat-negative"
+evidence = "console/evidence/issue-695-live/collaboration.md"
+status = "not_tested"
+
+[[requirements]]
+id = "M0-RUNTIME-001"
+category = "runtime"
+title = "Production runtime selection through NanoRuntimeRegistry"
+togaf_anchor = "Everything is a nano-container"
+contract_section = "Runtime and Security Contract"
+owner_issue = 472
+test_id = "m0.runtime.production_registry_selection"
+live_probe = "select-bwrap-without-fallback"
+evidence = "console/evidence/issue-472-live/m0-runtime-selection.md"
+status = "blocked"
+blocked_by = [472]
+blocker = "Issue #472 is open and its production-daemon selection path is not yet verified for M0."
+
+[[requirements]]
+id = "M0-TOOLS-001"
+category = "tools"
+title = "Capability-scoped agent workbench protocol"
+togaf_anchor = "Low-level isolated agent execution"
+contract_section = "Agent Workbench Contract"
+owner_issue = 694
+test_id = "m0.workbench.capability_scoped_tools"
+live_probe = "assigned-agent-builds-static-site"
+evidence = "console/evidence/issue-694-live/tool-execution.md"
+status = "blocked"
+blocked_by = [472]
+blocker = "Secure production dispatch depends on the #472 runtime-selection path."
+
+[[requirements]]
+id = "M0-WORKSPACE-001"
+category = "workspace"
+title = "Per-project and per-work-item isolated workspace"
+togaf_anchor = "Nano-container filesystem and capability isolation"
+contract_section = "Runtime and Security Contract"
+owner_issue = 694
+test_id = "m0.workbench.workspace_isolation"
+live_probe = "workspace-positive-and-escape-probes"
+evidence = "console/evidence/issue-694-live/workspace-isolation.md"
+status = "blocked"
+blocked_by = [75, 472]
+blocker = "M0 workspace closure requires #75 network isolation and #472 runtime selection."
+
+[[requirements]]
+id = "M0-SECURITY-001"
+category = "security"
+title = "Default-deny agent network and host boundary"
+togaf_anchor = "Landlock, capabilities, namespaces, and least privilege"
+contract_section = "Runtime and Security Contract"
+owner_issue = 75
+test_id = "m0.security.sandbox_network_deny"
+live_probe = "deny-egress-host-and-secret-access"
+evidence = "console/evidence/issue-75-live/m0-network-isolation.md"
+status = "blocked"
+blocked_by = [75]
+blocker = "Issue #75 is open and the production sandbox network contract is not verified."
+
+[[requirements]]
+id = "M0-ARTIFACT-001"
+category = "artifact"
+title = "Digest-addressed artifacts with complete provenance"
+togaf_anchor = "One-to-many information and content-addressed storage"
+contract_section = "Artifact and Release Contract"
+owner_issue = 694
+test_id = "m0.workbench.artifact_manifest"
+live_probe = "commit-and-resolve-workbench-artifact"
+evidence = "console/evidence/issue-694-live/artifact-provenance.md"
+status = "not_tested"
+
+[[requirements]]
+id = "M0-QA-001"
+category = "qa"
+title = "Independent digest-bound quality assurance"
+togaf_anchor = "Autonomous company quality control"
+contract_section = "Artifact and Release Contract"
+owner_issue = 696
+test_id = "m0.delivery.independent_qa"
+live_probe = "qa-pass-and-digest-substitution-negative"
+evidence = "console/evidence/issue-696-live/qa.md"
+status = "blocked"
+blocked_by = [694, 695]
+blocker = "QA requires executable workbench artifacts and the governed project workflow."
+
+[[requirements]]
+id = "M0-RELEASE-001"
+category = "release"
+title = "Immutable approved release and governed rollback"
+togaf_anchor = "Artifact provenance and reversible operation"
+contract_section = "Artifact and Release Contract"
+owner_issue = 696
+test_id = "m0.delivery.release_and_rollback"
+live_probe = "promote-preview-rollback-and-restore"
+evidence = "console/evidence/issue-696-live/release.md"
+status = "blocked"
+blocked_by = [694, 695]
+blocker = "Release promotion depends on completed implementation and workflow slices."
+
+[[requirements]]
+id = "M0-DELIVERY-001"
+category = "delivery"
+title = "Authenticated delivery and explicit customer acceptance"
+togaf_anchor = "Customer-facing autonomous company outcome"
+contract_section = "Artifact and Release Contract"
+owner_issue = 696
+test_id = "m0.delivery.customer_acceptance"
+live_probe = "deliver-accept-and-governed-rework"
+evidence = "console/evidence/issue-696-live/customer-delivery.md"
+status = "blocked"
+blocked_by = [694, 695]
+blocker = "Customer delivery requires the integrated workbench and company workflow."
+
+[[requirements]]
+id = "M0-INFERENCE-001"
+category = "inference"
+title = "Caller-bound, costed, capped provider execution"
+togaf_anchor = "Cortex inference control plane"
+contract_section = "Cortex, Gaia, NMDA, and Night-Run Integration"
+owner_issue = 650
+test_id = "m0.inference.capped_provider_lineage"
+live_probe = "one-approved-real-provider-leg"
+evidence = "console/evidence/issue-650-live/ac-11-provider-cost.md"
+status = "not_tested"
+
+[[requirements]]
+id = "M0-GAIA-001"
+category = "gaia"
+title = "Gaia oversight without authority bypass"
+togaf_anchor = "Gaia company awareness and governance"
+contract_section = "Cortex, Gaia, NMDA, and Night-Run Integration"
+owner_issue = 696
+test_id = "m0.delivery.gaia_oversight"
+live_probe = "observe-blocker-and-deny-bypass"
+evidence = "console/evidence/issue-696-live/gaia-oversight.md"
+status = "blocked"
+blocked_by = [695]
+blocker = "Gaia oversight needs the authoritative project and blocker workflow."
+
+[[requirements]]
+id = "M0-MEMORY-001"
+category = "memory"
+title = "Source-linked NMDA and Night-Run project closeout"
+togaf_anchor = "Bi-temporal memory and Night-Run consolidation"
+contract_section = "Cortex, Gaia, NMDA, and Night-Run Integration"
+owner_issue = 696
+test_id = "m0.delivery.memory_closeout"
+live_probe = "closeout-background-cycle-and-provenance"
+evidence = "console/evidence/issue-696-live/memory-closeout.md"
+status = "blocked"
+blocked_by = [695]
+blocker = "Closeout memory requires an accepted governed project lineage."
+
+[[requirements]]
+id = "M0-RECOVERY-001"
+category = "recovery"
+title = "No duplicate effects across restart boundaries"
+togaf_anchor = "Durable events, outbox, idempotency, and recovery"
+contract_section = "Idempotency and Recovery"
+owner_issue = 650
+test_id = "m0.recovery.boundary_matrix"
+live_probe = "restart-every-product-boundary"
+evidence = "console/evidence/issue-650-live/ac-12-recovery.md"
+status = "not_tested"
+
+[[requirements]]
+id = "M0-CONSOLE-001"
+category = "console"
+title = "Matching customer-to-acceptance Console lineage"
+togaf_anchor = "Built-in operational Console"
+contract_section = "Observability and Evidence"
+owner_issue = 696
+test_id = "m0.delivery.console_lineage"
+live_probe = "playwright-and-durable-readback"
+evidence = "console/evidence/issue-696-live/console-lineage.md"
+status = "blocked"
+blocked_by = [694, 695]
+blocker = "The final lineage view depends on workbench and workflow read models."
+
+[[requirements]]
+id = "M0-COST-001"
+category = "cost"
+title = "Atomic project budget and explicit real-provider ceiling"
+togaf_anchor = "Efficiency and inference-cost governance"
+contract_section = "Cost and Resource Control"
+owner_issue = 650
+test_id = "m0.cost.project_budget"
+live_probe = "budget-admission-concurrency-and-cost-readback"
+evidence = "console/evidence/issue-650-live/ac-11-provider-cost.md"
+status = "not_tested"
+
+[[requirements]]
+id = "M0-STABILITY-001"
+category = "stability"
+title = "Stable 600-tick and 60-minute product window"
+togaf_anchor = "Deterministic real-time virtual company"
+contract_section = "Acceptance and Rollout"
+owner_issue = 650
+test_id = "m0.stability.product_soak"
+live_probe = "full-service-soak-and-consistency-scan"
+evidence = "console/evidence/issue-650-live/ac-15-soak.md"
+status = "not_tested"
