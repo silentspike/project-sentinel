@@ -84,6 +84,9 @@ jobs:
       - name: Projection provisioning contract (#644)
         run: bash scripts/check-projection-provisioning.sh
 
+      - name: Runtime-base provisioning contract (#646)
+        run: bash scripts/check-runtime-base-provisioning.sh
+
       - name: Validate TOML configs
         run: |
           for f in $(find config -name '*.toml' 2>/dev/null); do

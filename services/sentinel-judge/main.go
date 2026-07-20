@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -224,7 +225,7 @@ func readCredentialFile(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+	if !info.Mode().IsRegular() || !secureCredentialFile(path, info) {
 		return "", fmt.Errorf("credential must be an owner-only regular file")
 	}
 	value, err := os.ReadFile(path) //nolint:gosec // operator-provided systemd credential path
@@ -241,4 +242,22 @@ func readCredentialFile(path string) (string, error) {
 		return "", fmt.Errorf("credential is empty or contains surrounding whitespace")
 	}
 	return credential, nil
+}
+
+func secureCredentialFile(path string, info os.FileInfo) bool {
+	if info.Mode().Perm()&0o077 == 0 {
+		return true
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return secureCredentialMode(
+		info.Mode().Perm(), stat.Uid, stat.Gid, path, os.Getenv("CREDENTIALS_DIRECTORY"),
+	)
+}
+
+func secureCredentialMode(mode os.FileMode, uid, gid uint32, path, credentialsDirectory string) bool {
+	return mode == 0o440 && uid == 0 && gid == 0 && credentialsDirectory != "" &&
+		filepath.Clean(filepath.Dir(path)) == filepath.Clean(credentialsDirectory)
 }
