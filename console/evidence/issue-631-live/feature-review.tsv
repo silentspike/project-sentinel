@@ -9,7 +9,7 @@ FR-007	tracing-subscriber	A/B/C	workspace features=env-filter,json,fmt	fmt and E
 FR-008	tracing	A/B/C	workspace defaults	Event macros and instrument attributes are used throughout release crates	crates/sentinel-zenoh/src/lib.rs:63	needed
 FR-009	sentinel-limbo	A/B/C	five path dependencies	EventStore is imported by daemon, projection, Gaia loop, and nightrun paths	services/sentinel-projection/src/main.rs:15	needed
 FR-010	uuid	A/B/C	workspace features=v4,v7,serde	Both v4 and v7 constructors and serialized UUID-bearing contracts are present	services/sentinel-daemon/src/snapshot.rs:167; services/sentinel-daemon/src/provision_exec.rs:149	needed
-FR-011	sha2	A/B/C	workspace default	SHA-256 is used for certificate and content digests	services/sentinel-dashboard-backend/src/tls.rs:92	needed
+FR-011	sha2	A/B/C	workspace; sentinel-common normal plus sentinel-redb dev	SHA-256 is used for release owner-snapshot checksums and TLS certificate digests	crates/sentinel-common/src/fencing.rs:18,224; services/sentinel-dashboard-backend/src/tls.rs:92	needed
 FR-012	toml	A/B/C	workspace default	Both parsing and serialization are release behavior	services/sentinel-daemon/src/config.rs:702; services/sentinel-daemon/src/config_persist.rs:61	needed
 FR-013	async-nats	A	workspace default	JetStream client and subscriber APIs are release behavior	services/sentinel-dashboard-backend/src/event_sub.rs:203-222	needed
 FR-014	reqwest	A/B	per-root json,rustls-tls and daemon/ctl blocking	Async JSON, blocking JSON, and rustls clients are all used	services/sentinel-daemon/src/evolution_task.rs:84-228; services/sentinel-daemon/src/orchestrator.rs:6742-6748; services/sentinel-ctl/src/main.rs:435-450	needed

@@ -21,8 +21,32 @@ cpufeatures	0.2.17	nkeys	0.4.5	async-nats	0.47.0	normal:all	false		true
 cpufeatures	0.2.17	pest_derive	2.8.6	json5	0.4.1	normal:all	false		true
 cpufeatures	0.2.17	pest_generator	2.8.6	pest_derive	2.8.6	normal:all	false		true
 cpufeatures	0.2.17	pest_meta	2.8.6	pest_generator	2.8.6	normal:all	false		true
+cpufeatures	0.2.17	sentinel-bio	0.1.0	sentinel-ecs	0.1.0	normal:all	true		true
 cpufeatures	0.2.17	sentinel-cluster-control	0.1.0	sentinel-daemon	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-bio	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-cluster-control	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-daemon	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-dashboard-backend	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-ebpf	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-ecs	0.1.0	dev:all;normal:all	true		true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-fs	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-gaia	0.1.0	normal:all	true	B	true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-gaia-loop	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-hippocampus	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-limbo	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-microvm	0.1.0	dev:all;normal:all	true		true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-nightrun	0.1.0	normal:all	true	C	true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-physics	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-projection	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-projection-service	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-redb	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-runtime	0.1.0	dev:all;normal:all	true		true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-sandbox	0.1.0	dev:all;normal:all	true		true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-telemetry	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-wasm	0.1.0	dev:all;normal:all	true		true
+cpufeatures	0.2.17	sentinel-common	0.1.0	sentinel-zenoh	0.1.0	dev:all;normal:all	true		true
 cpufeatures	0.2.17	sentinel-console-plane	0.1.0	sentinel-dashboard-backend	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-ebpf	0.1.0	sentinel-daemon	0.1.0	normal:all	true	A	true
 cpufeatures	0.2.17	sentinel-ecs	0.1.0	sentinel-daemon	0.1.0	normal:all	true	A	true
 cpufeatures	0.2.17	sentinel-ecs	0.1.0	sentinel-runtime	0.1.0	normal:all	true		true
 cpufeatures	0.2.17	sentinel-fs	0.1.0	sentinel-console-plane	0.1.0	normal:all	true		true
@@ -31,8 +55,37 @@ cpufeatures	0.2.17	sentinel-fs	0.1.0	sentinel-microvm	0.1.0	normal:all	true		tru
 cpufeatures	0.2.17	sentinel-fs	0.1.0	sentinel-sandbox	0.1.0	normal:all	true		true
 cpufeatures	0.2.17	sentinel-gaia	0.1.0	sentinel-dashboard-backend	0.1.0	normal:all	true	A	true
 cpufeatures	0.2.17	sentinel-gaia-loop	0.1.0	sentinel-dashboard-backend	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-hippocampus	0.1.0	sentinel-daemon	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-hippocampus	0.1.0	sentinel-gaia-memory	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-hippocampus	0.1.0	sentinel-nightrun	0.1.0	normal:all	true	C	true
+cpufeatures	0.2.17	sentinel-limbo	0.1.0	sentinel-daemon	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-limbo	0.1.0	sentinel-dashboard-backend	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-limbo	0.1.0	sentinel-ecs	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-limbo	0.1.0	sentinel-gaia-loop	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-limbo	0.1.0	sentinel-gaia-memory	0.1.0	dev:all	true		true
+cpufeatures	0.2.17	sentinel-limbo	0.1.0	sentinel-nightrun	0.1.0	normal:all	true	C	true
+cpufeatures	0.2.17	sentinel-limbo	0.1.0	sentinel-projection	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-limbo	0.1.0	sentinel-projection-service	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-limbo	0.1.0	sentinel-runtime	0.1.0	dev:all;normal:all	true		true
+cpufeatures	0.2.17	sentinel-physics	0.1.0	sentinel-ecs	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-physics	0.1.0	sentinel-projection	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-projection	0.1.0	sentinel-daemon	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-projection	0.1.0	sentinel-dashboard-backend	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-projection	0.1.0	sentinel-gaia-memory	0.1.0	dev:all	true		true
+cpufeatures	0.2.17	sentinel-projection	0.1.0	sentinel-projection-service	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-redb	0.1.0	sentinel-daemon	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-redb	0.1.0	sentinel-ecs	0.1.0	normal:all	true		true
 cpufeatures	0.2.17	sentinel-runtime	0.1.0	sentinel-daemon	0.1.0	normal:all	true	A	true
 cpufeatures	0.2.17	sentinel-sandbox	0.1.0	sentinel-daemon	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-telemetry	0.1.0	sentinel-daemon	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-telemetry	0.1.0	sentinel-ecs	0.1.0	dev:all	true		true
+cpufeatures	0.2.17	sentinel-telemetry	0.1.0	sentinel-fs	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-telemetry	0.1.0	sentinel-limbo	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-telemetry	0.1.0	sentinel-nightrun	0.1.0	normal:all	true	C	true
+cpufeatures	0.2.17	sentinel-telemetry	0.1.0	sentinel-projection	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-telemetry	0.1.0	sentinel-projection-service	0.1.0	normal:all	true	A	true
+cpufeatures	0.2.17	sentinel-telemetry	0.1.0	sentinel-redb	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sentinel-telemetry	0.1.0	sentinel-zenoh	0.1.0	normal:all	true		true
 cpufeatures	0.2.17	sentinel-wasm	0.1.0	sentinel-daemon	0.1.0	normal:all	true	A	true
 cpufeatures	0.2.17	sentinel-wasm	0.1.0	sentinel-ecs	0.1.0	normal:all	true		true
 cpufeatures	0.2.17	sentinel-zenoh	0.1.0	sentinel-daemon	0.1.0	normal:all	true	A	true
@@ -41,6 +94,7 @@ cpufeatures	0.2.17	sha1	0.10.6	tungstenite	0.24.0	normal:all	false		true
 cpufeatures	0.2.17	sha2	0.10.9	ed25519-dalek	2.2.0	normal:all	false		true
 cpufeatures	0.2.17	sha2	0.10.9	pest_meta	2.8.6	build:all	false		true
 cpufeatures	0.2.17	sha2	0.10.9	sentinel-cluster-control	0.1.0	normal:all	true		true
+cpufeatures	0.2.17	sha2	0.10.9	sentinel-common	0.1.0	normal:all	true		true
 cpufeatures	0.2.17	sha2	0.10.9	sentinel-daemon	0.1.0	normal:all	true	A	true
 cpufeatures	0.2.17	sha2	0.10.9	sentinel-dashboard-backend	0.1.0	normal:all	true	A	true
 cpufeatures	0.2.17	sha2	0.10.9	sentinel-ecs	0.1.0	normal:all	true		true
@@ -48,6 +102,7 @@ cpufeatures	0.2.17	sha2	0.10.9	sentinel-fs	0.1.0	normal:all	true		true
 cpufeatures	0.2.17	sha2	0.10.9	sentinel-gaia-loop	0.1.0	normal:all	true	A	true
 cpufeatures	0.2.17	sha2	0.10.9	sentinel-gaia-memory	0.1.0	normal:all	true		true
 cpufeatures	0.2.17	sha2	0.10.9	sentinel-nightrun	0.1.0	normal:all	true	C	true
+cpufeatures	0.2.17	sha2	0.10.9	sentinel-redb	0.1.0	dev:all	true		true
 cpufeatures	0.2.17	sha2	0.10.9	wasmtime-environ	45.0.3	normal:all	false		true
 cpufeatures	0.2.17	sha2	0.10.9	wasmtime-internal-cache	45.0.3	normal:all	false		true
 cpufeatures	0.2.17	sha2	0.10.9	wtransport	0.6.1	normal:all	false		true
@@ -1418,6 +1473,7 @@ getrandom	0.4.1	uuid	1.22.0	sentinel-gaia-memory	0.1.0	normal:all	true		true
 getrandom	0.4.1	uuid	1.22.0	sentinel-limbo	0.1.0	normal:all	true		true
 getrandom	0.4.1	uuid	1.22.0	sentinel-nightrun	0.1.0	normal:all	true	C	true
 getrandom	0.4.1	uuid	1.22.0	sentinel-projection	0.1.0	normal:all	true		true
+getrandom	0.4.1	uuid	1.22.0	sentinel-redb	0.1.0	dev:all	true		true
 getrandom	0.4.1	uuid	1.22.0	sentinel-runtime	0.1.0	normal:all	true		true
 getrandom	0.4.1	uuid	1.22.0	sentinel-telemetry	0.1.0	normal:all	true		true
 getrandom	0.4.1	uuid	1.22.0	sentinel-zenoh	0.1.0	dev:all;normal:all	true		true
@@ -2984,6 +3040,7 @@ rand_core	0.10.1	uuid	1.22.0	sentinel-gaia-memory	0.1.0	normal:all	true		true
 rand_core	0.10.1	uuid	1.22.0	sentinel-limbo	0.1.0	normal:all	true		true
 rand_core	0.10.1	uuid	1.22.0	sentinel-nightrun	0.1.0	normal:all	true	C	true
 rand_core	0.10.1	uuid	1.22.0	sentinel-projection	0.1.0	normal:all	true		true
+rand_core	0.10.1	uuid	1.22.0	sentinel-redb	0.1.0	dev:all	true		true
 rand_core	0.10.1	uuid	1.22.0	sentinel-runtime	0.1.0	normal:all	true		true
 rand_core	0.10.1	uuid	1.22.0	sentinel-telemetry	0.1.0	normal:all	true		true
 rand_core	0.10.1	uuid	1.22.0	sentinel-zenoh	0.1.0	dev:all;normal:all	true		true
@@ -5177,6 +5234,7 @@ wasm-encoder	0.244.0	uuid	1.22.0	sentinel-gaia-memory	0.1.0	normal:all	true		tru
 wasm-encoder	0.244.0	uuid	1.22.0	sentinel-limbo	0.1.0	normal:all	true		true
 wasm-encoder	0.244.0	uuid	1.22.0	sentinel-nightrun	0.1.0	normal:all	true	C	true
 wasm-encoder	0.244.0	uuid	1.22.0	sentinel-projection	0.1.0	normal:all	true		true
+wasm-encoder	0.244.0	uuid	1.22.0	sentinel-redb	0.1.0	dev:all	true		true
 wasm-encoder	0.244.0	uuid	1.22.0	sentinel-runtime	0.1.0	normal:all	true		true
 wasm-encoder	0.244.0	uuid	1.22.0	sentinel-telemetry	0.1.0	normal:all	true		true
 wasm-encoder	0.244.0	uuid	1.22.0	sentinel-zenoh	0.1.0	dev:all;normal:all	true		true
@@ -5616,6 +5674,7 @@ wasmparser	0.244.0	uuid	1.22.0	sentinel-gaia-memory	0.1.0	normal:all	true		true
 wasmparser	0.244.0	uuid	1.22.0	sentinel-limbo	0.1.0	normal:all	true		true
 wasmparser	0.244.0	uuid	1.22.0	sentinel-nightrun	0.1.0	normal:all	true	C	true
 wasmparser	0.244.0	uuid	1.22.0	sentinel-projection	0.1.0	normal:all	true		true
+wasmparser	0.244.0	uuid	1.22.0	sentinel-redb	0.1.0	dev:all	true		true
 wasmparser	0.244.0	uuid	1.22.0	sentinel-runtime	0.1.0	normal:all	true		true
 wasmparser	0.244.0	uuid	1.22.0	sentinel-telemetry	0.1.0	normal:all	true		true
 wasmparser	0.244.0	uuid	1.22.0	sentinel-zenoh	0.1.0	dev:all;normal:all	true		true
@@ -8246,6 +8305,7 @@ wit-parser	0.244.0	uuid	1.22.0	sentinel-gaia-memory	0.1.0	normal:all	true		true
 wit-parser	0.244.0	uuid	1.22.0	sentinel-limbo	0.1.0	normal:all	true		true
 wit-parser	0.244.0	uuid	1.22.0	sentinel-nightrun	0.1.0	normal:all	true	C	true
 wit-parser	0.244.0	uuid	1.22.0	sentinel-projection	0.1.0	normal:all	true		true
+wit-parser	0.244.0	uuid	1.22.0	sentinel-redb	0.1.0	dev:all	true		true
 wit-parser	0.244.0	uuid	1.22.0	sentinel-runtime	0.1.0	normal:all	true		true
 wit-parser	0.244.0	uuid	1.22.0	sentinel-telemetry	0.1.0	normal:all	true		true
 wit-parser	0.244.0	uuid	1.22.0	sentinel-zenoh	0.1.0	dev:all;normal:all	true		true

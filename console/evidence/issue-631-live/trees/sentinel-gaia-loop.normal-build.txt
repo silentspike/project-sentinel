@@ -1,4 +1,4 @@
-0sentinel-gaia-loop v0.1.0 (<HOME>/remote-builds/2910130700751017293/services/sentinel-gaia-loop)
+0sentinel-gaia-loop v0.1.0 (<REMOTE_TARGET>)
 1anyhow v1.0.103
 1async-nats v0.47.0
 2base64 v0.22.1
@@ -315,7 +315,7 @@
 2futures-task v0.3.32
 2futures-util v0.3.32 (*)
 1libc v0.2.186
-1sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common)
+1sentinel-common v0.1.0 (<REMOTE_TARGET>)
 2anyhow v1.0.103
 2bevy_ecs v0.18.1
 3bevy_ecs_macros v0.18.0 (proc-macro)
@@ -435,6 +435,7 @@
 3rustc_version v0.4.1 (*)
 2serde v1.0.228 (*)
 2serde_json v1.0.149 (*)
+2sha2 v0.10.9 (*)
 2thiserror v2.0.18 (*)
 2toml v1.0.6+spec-1.1.0
 3serde_core v1.0.228
@@ -452,7 +453,7 @@
 4cfg-if v1.0.4
 4libc v0.2.186
 3serde_core v1.0.228
-1sentinel-limbo v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-limbo)
+1sentinel-limbo v0.1.0 (<REMOTE_TARGET>)
 2anyhow v1.0.103
 2rusqlite v0.38.0
 3bitflags v2.11.0
@@ -465,9 +466,9 @@
 4pkg-config v0.3.32
 4vcpkg v0.2.15
 3smallvec v1.15.1
-2sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
-2sentinel-telemetry v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-telemetry)
-3sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
+2sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
+2sentinel-telemetry v0.1.0 (<REMOTE_TARGET>)
+3sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
 3serde v1.0.228 (*)
 3serde_json v1.0.149 (*)
 3tracing v0.1.44 (*)

@@ -1,4 +1,4 @@
-0sentinel-daemon v0.1.0 (<REMOTE_PROJECT>/services/sentinel-daemon)
+0sentinel-daemon v0.1.0 (<REMOTE_TARGET>)
 1anyhow feature "default"
 2anyhow v1.0.103
 2anyhow feature "std"
@@ -1705,7 +1705,7 @@
 5hyper-rustls feature "webpki-roots"
 6hyper-rustls v0.27.7 (*)
 1sentinel-cluster-control feature "default"
-2sentinel-cluster-control v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-cluster-control)
+2sentinel-cluster-control v0.1.0 (<REMOTE_TARGET>)
 3anyhow feature "default" (*)
 3serde feature "default" (*)
 3serde feature "derive" (*)
@@ -1852,10 +1852,11 @@
 5rcgen v0.13.2 (*)
 5rcgen feature "crypto" (*)
 3sentinel-common feature "default"
-4sentinel-common v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-common)
+4sentinel-common v0.1.0 (<REMOTE_TARGET>)
 5anyhow feature "default" (*)
 5serde feature "default" (*)
 5serde feature "derive" (*)
+5sha2 feature "default" (*)
 5serde_json feature "default" (*)
 5tracing feature "default" (*)
 5bevy_ecs feature "default" (*)
@@ -1942,7 +1943,7 @@
 1uuid feature "v4" (*)
 1uuid feature "v7" (*)
 1sentinel-ebpf feature "default"
-2sentinel-ebpf v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-ebpf)
+2sentinel-ebpf v0.1.0 (<REMOTE_TARGET>)
 3aya v0.13.2 (https://github.com/aya-rs/aya#b93ee8c2)
 4assert_matches v1.5.0
 4bitflags v2.11.0 (*)
@@ -2131,8 +2132,8 @@
 1tracing-subscriber feature "fmt" (*)
 1tracing-subscriber feature "json" (*)
 1sentinel-ecs feature "default"
-2sentinel-ecs v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-ecs)
-3sentinel-limbo v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-limbo)
+2sentinel-ecs v0.1.0 (<REMOTE_TARGET>)
+3sentinel-limbo v0.1.0 (<REMOTE_TARGET>)
 4anyhow feature "default" (*)
 4serde feature "default" (*)
 4serde feature "derive" (*)
@@ -2182,7 +2183,7 @@
 6rusqlite feature "hashlink"
 7rusqlite v0.38.0 (*)
 4sentinel-telemetry feature "default"
-5sentinel-telemetry v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-telemetry)
+5sentinel-telemetry v0.1.0 (<REMOTE_TARGET>)
 6serde feature "default" (*)
 6serde feature "derive" (*)
 6serde_json feature "default" (*)
@@ -2197,7 +2198,7 @@
 6tracing-subscriber feature "fmt" (*)
 6tracing-subscriber feature "json" (*)
 5sentinel-telemetry feature "telemetry"
-6sentinel-telemetry v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-telemetry) (*)
+6sentinel-telemetry v0.1.0 (<REMOTE_TARGET>) (*)
 3serde feature "default" (*)
 3serde feature "derive" (*)
 3sha2 feature "default" (*)
@@ -2214,13 +2215,13 @@
 3uuid feature "v4" (*)
 3uuid feature "v7" (*)
 3sentinel-bio feature "default"
-4sentinel-bio v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-bio)
+4sentinel-bio v0.1.0 (<REMOTE_TARGET>)
 5sentinel-common feature "default" (*)
 3sentinel-physics feature "default"
-4sentinel-physics v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-physics)
+4sentinel-physics v0.1.0 (<REMOTE_TARGET>)
 5sentinel-common feature "default" (*)
 3sentinel-redb feature "default"
-4sentinel-redb v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-redb)
+4sentinel-redb v0.1.0 (<REMOTE_TARGET>)
 5anyhow feature "default" (*)
 5serde feature "default" (*)
 5serde feature "derive" (*)
@@ -2230,10 +2231,10 @@
 5sentinel-common feature "default" (*)
 5sentinel-telemetry feature "default" (*)
 4sentinel-redb feature "telemetry"
-5sentinel-redb v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-redb) (*)
+5sentinel-redb v0.1.0 (<REMOTE_TARGET>) (*)
 5sentinel-telemetry feature "telemetry" (*)
 3sentinel-wasm feature "default"
-4sentinel-wasm v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-wasm)
+4sentinel-wasm v0.1.0 (<REMOTE_TARGET>)
 5anyhow feature "default" (*)
 5serde feature "default" (*)
 5serde feature "derive" (*)
@@ -3321,15 +3322,15 @@
 8wasmtime feature "component-model" (*)
 6wasmtime-wasi feature "p2" (*)
 1sentinel-limbo feature "default"
-2sentinel-limbo v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-limbo) (*)
+2sentinel-limbo v0.1.0 (<REMOTE_TARGET>) (*)
 2sentinel-limbo feature "telemetry"
-3sentinel-limbo v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-limbo) (*)
+3sentinel-limbo v0.1.0 (<REMOTE_TARGET>) (*)
 3sentinel-telemetry feature "telemetry" (*)
 1sentinel-telemetry feature "default" (*)
 1sentinel-redb feature "default" (*)
 1sentinel-wasm feature "default" (*)
 1sentinel-fs feature "default"
-2sentinel-fs v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-fs)
+2sentinel-fs v0.1.0 (<REMOTE_TARGET>)
 3anyhow feature "default" (*)
 3serde feature "default" (*)
 3serde feature "derive" (*)
@@ -3441,10 +3442,10 @@
 9quote feature "default" (*)
 9syn feature "default" (*)
 2sentinel-fs feature "telemetry"
-3sentinel-fs v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-fs) (*)
+3sentinel-fs v0.1.0 (<REMOTE_TARGET>) (*)
 3sentinel-telemetry feature "telemetry" (*)
 1sentinel-hippocampus feature "default"
-2sentinel-hippocampus v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-hippocampus)
+2sentinel-hippocampus v0.1.0 (<REMOTE_TARGET>)
 3anyhow feature "default" (*)
 3serde feature "default" (*)
 3serde feature "derive" (*)
@@ -3453,7 +3454,7 @@
 3redb feature "default" (*)
 3sentinel-common feature "default" (*)
 1sentinel-projection feature "default"
-2sentinel-projection v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-projection)
+2sentinel-projection v0.1.0 (<REMOTE_TARGET>)
 3anyhow feature "default" (*)
 3serde feature "default" (*)
 3serde feature "derive" (*)
@@ -3470,11 +3471,11 @@
 3sentinel-telemetry feature "default" (*)
 3sentinel-physics feature "default" (*)
 2sentinel-projection feature "telemetry"
-3sentinel-projection v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-projection) (*)
+3sentinel-projection v0.1.0 (<REMOTE_TARGET>) (*)
 3sentinel-telemetry feature "telemetry" (*)
 1sentinel-runtime feature "default"
-2sentinel-runtime v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-runtime)
-3sentinel-limbo v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-limbo) (*)
+2sentinel-runtime v0.1.0 (<REMOTE_TARGET>)
+3sentinel-limbo v0.1.0 (<REMOTE_TARGET>) (*)
 3anyhow feature "default" (*)
 3serde feature "default" (*)
 3serde feature "derive" (*)
@@ -3488,7 +3489,7 @@
 3uuid feature "v7" (*)
 3sentinel-ecs feature "default" (*)
 1sentinel-sandbox feature "default"
-2sentinel-sandbox v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-sandbox)
+2sentinel-sandbox v0.1.0 (<REMOTE_TARGET>)
 3anyhow feature "default" (*)
 3serde feature "default" (*)
 3serde feature "derive" (*)
@@ -3514,7 +3515,7 @@
 9syn feature "printing" (*)
 9syn feature "proc-macro" (*)
 3sentinel-zenoh feature "default"
-4sentinel-zenoh v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-zenoh)
+4sentinel-zenoh v0.1.0 (<REMOTE_TARGET>)
 5anyhow feature "default" (*)
 5serde feature "default" (*)
 5serde feature "derive" (*)
@@ -4995,6 +4996,6 @@
 9zenoh-link feature "zenoh-link-ws"
 10zenoh-link v1.7.2 (*)
 4sentinel-zenoh feature "telemetry"
-5sentinel-zenoh v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-zenoh) (*)
+5sentinel-zenoh v0.1.0 (<REMOTE_TARGET>) (*)
 5sentinel-telemetry feature "telemetry" (*)
 1sentinel-zenoh feature "default" (*)

@@ -1,4 +1,4 @@
-0sentinel-gaia v0.1.0 (<HOME>/remote-builds/2910130700751017293/services/sentinel-gaia)
+0sentinel-gaia v0.1.0 (<REMOTE_TARGET>)
 1anyhow v1.0.103
 1blake3 v1.8.3
 2arrayref v0.3.9
@@ -32,7 +32,7 @@
 4proc-macro2 v1.0.106 (*)
 4quote v1.0.44 (*)
 4unicode-ident v1.0.24
-1sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common)
+1sentinel-common v0.1.0 (<REMOTE_TARGET>)
 2anyhow v1.0.103
 2bevy_ecs v0.18.1
 3bevy_ecs_macros v0.18.0 (proc-macro)
@@ -161,6 +161,17 @@
 3memchr v2.8.0
 3serde_core v1.0.228
 3zmij v1.0.21
+2sha2 v0.10.9
+3cfg-if v1.0.4
+3cpufeatures v0.2.17
+3digest v0.10.7
+4block-buffer v0.10.4
+5generic-array v0.14.7
+6typenum v1.19.0
+6version_check v0.9.5
+4crypto-common v0.1.7
+5generic-array v0.14.7 (*)
+5typenum v1.19.0
 2thiserror v2.0.18 (*)
 2toml v1.0.6+spec-1.1.0
 3serde_core v1.0.228

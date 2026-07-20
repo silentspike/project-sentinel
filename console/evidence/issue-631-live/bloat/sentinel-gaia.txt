@@ -1,23 +1,23 @@
 File  .text     Size Crate
-5.6%  24.1% 378.8KiB std
-4.5%  19.6% 306.8KiB clap_builder
-4.4%  18.8% 295.4KiB sentinel_common
-3.2%  13.7% 215.1KiB sentinel_gaia
-1.4%   6.0%  93.4KiB toml
-0.9%   3.8%  59.5KiB serde_json
+5.6%  24.1% 378.7KiB std
+4.5%  19.5% 306.8KiB clap_builder
+4.3%  18.7% 293.9KiB sentinel_common
+3.2%  13.7% 215.2KiB sentinel_gaia
+1.4%   6.1%  95.0KiB toml
+0.9%   3.8%  59.4KiB serde_json
 0.6%   2.7%  42.1KiB toml_parser
-0.2%   0.9%  13.5KiB anyhow
+0.2%   0.9%  13.6KiB anyhow
 0.2%   0.8%  13.2KiB blake3
-0.2%   0.8%  12.9KiB convert_case
-0.1%   0.6%   9.4KiB proc_macro2
+0.2%   0.8%  13.0KiB convert_case
+0.1%   0.6%   9.9KiB version_check
+0.1%   0.6%   9.0KiB proc_macro2
 0.1%   0.3%   5.4KiB cc
 0.1%   0.3%   5.4KiB memchr
 0.1%   0.3%   5.3KiB toml_datetime
-0.1%   0.3%   4.0KiB version_check
 0.1%   0.2%   3.5KiB serde_core
-0.0%   0.2%   2.8KiB winnow
 0.0%   0.2%   2.5KiB clap_lex
-0.0%   0.1%   2.3KiB bevy_macro_utils
 0.0%   0.1%   2.1KiB anstyle
-0.2%   0.8%  12.7KiB And 18 more crates. Use -n N to show more.
-23.2% 100.0%   1.5MiB .text section size, the file size is 6.6MiB
+0.0%   0.1%   1.8KiB bevy_ecs
+0.0%   0.1%   1.6KiB anstream
+0.1%   0.6%   9.3KiB And 19 more crates. Use -n N to show more.
+23.1% 100.0%   1.5MiB .text section size, the file size is 6.6MiB
