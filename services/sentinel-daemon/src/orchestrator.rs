@@ -61,8 +61,16 @@ fn read_credential_file(path: &str, env_name: &str) -> Result<String> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = metadata.permissions().mode() & 0o777;
+        let credentials_directory = std::env::var_os("CREDENTIALS_DIRECTORY");
+        if !secure_credential_mode(
+            mode,
+            metadata.uid(),
+            metadata.gid(),
+            std::path::Path::new(path),
+            credentials_directory.as_deref().map(std::path::Path::new),
+        ) {
             return Err(anyhow!(
                 "credential file from {env_name} must be owner-only"
             ));
@@ -84,6 +92,23 @@ fn read_credential_file(path: &str, env_name: &str) -> Result<String> {
         ));
     }
     Ok(credential)
+}
+
+#[cfg(all(unix, feature = "llm"))]
+fn secure_credential_mode(
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    path: &std::path::Path,
+    credentials_directory: Option<&std::path::Path>,
+) -> bool {
+    if mode & 0o077 == 0 {
+        return true;
+    }
+    mode == 0o440
+        && uid == 0
+        && gid == 0
+        && credentials_directory.is_some_and(|directory| path.parent() == Some(directory))
 }
 use crate::episode_producer::EpisodeProducer;
 use crate::evolution_task::{EvolutionJob, EvolutionResult, EvolutionSource};
@@ -7556,6 +7581,31 @@ mod tests {
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         assert!(read_credential_file(path.to_str().unwrap(), "TEST_CREDENTIAL_FILE").is_err());
+    }
+
+    #[cfg(all(unix, feature = "llm"))]
+    #[test]
+    fn systemd_credential_permissions_are_narrowly_scoped() {
+        use std::path::Path;
+
+        let directory = Path::new("/run/credentials/sentinel-daemon.service");
+        let path = directory.join("caller-agent-runtime");
+        assert!(secure_credential_mode(0o440, 0, 0, &path, Some(directory)));
+        assert!(!secure_credential_mode(
+            0o440,
+            1000,
+            0,
+            &path,
+            Some(directory)
+        ));
+        assert!(!secure_credential_mode(
+            0o440,
+            0,
+            0,
+            Path::new("/tmp/caller-agent-runtime"),
+            Some(directory)
+        ));
+        assert!(!secure_credential_mode(0o444, 0, 0, &path, Some(directory)));
     }
 
     #[test]
