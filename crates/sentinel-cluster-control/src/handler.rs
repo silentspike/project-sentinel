@@ -162,6 +162,9 @@ impl ControlHandler for StubHandler {
                 scope: scope.clone(),
                 epoch: *epoch,
             },
+            ControlRequest::ReplicateOwnerSnapshot { .. } => ControlResponse::Rejected {
+                reason: "owner snapshot replication requires a durable owner handler".into(),
+            },
             ControlRequest::RefQuery { block_ref } => ControlResponse::RefQueryResult {
                 block_ref: block_ref.clone(),
                 referenced: false,

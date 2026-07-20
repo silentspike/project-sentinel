@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use sentinel_cluster_control::{
-    AuthenticatedPeer, ControlClient, ControlEnvelope, ControlHandler, ControlRequest,
-    ControlResponse, ControlServer, NodeCertificate, PeerRegistry, StubHandler,
+    AuthenticatedPeer, ChefAuthorizingHandler, ControlClient, ControlEnvelope, ControlHandler,
+    ControlRequest, ControlResponse, ControlServer, NodeCertificate, PeerRegistry, StubHandler,
 };
 
 fn loopback() -> std::net::SocketAddr {
@@ -99,6 +99,116 @@ async fn rpc_roundtrip_idempotency_and_server_pin() {
         "wrong server pin must be rejected"
     );
 
+    server.close();
+}
+
+#[tokio::test]
+async fn owner_snapshot_replication_is_chef_authenticated_and_digest_bound_over_wire() {
+    use sentinel_common::{
+        ActivationState, LocalOwnerBaseRole, LocalOwnerBaseState, LocalOwnerStateSnapshot, NodeId,
+        OwnerSnapshotInstallOutcome, OwnerTerm, OwnerTermSnapshot, StateTransferScope,
+        TRACK_A_COORDINATOR_GENERATION,
+    };
+
+    #[derive(Clone, Copy)]
+    struct SnapshotHandler {
+        expected_chef: NodeId,
+    }
+
+    impl ControlHandler for SnapshotHandler {
+        fn handle(&self, peer: AuthenticatedPeer, request: &ControlRequest) -> ControlResponse {
+            assert_eq!(peer.node_id, self.expected_chef);
+            match request {
+                ControlRequest::ReplicateOwnerSnapshot { .. } => {
+                    ControlResponse::OwnerSnapshotAck {
+                        outcome: OwnerSnapshotInstallOutcome::Installed,
+                    }
+                }
+                _ => ControlResponse::Rejected {
+                    reason: "unexpected request".into(),
+                },
+            }
+        }
+    }
+
+    let server_node = NodeCertificate::generate("member").unwrap();
+    let chef_cert = NodeCertificate::generate("chef").unwrap();
+    let chef_id = NodeId::new();
+    let member_id = NodeId::new();
+    let server_fp = server_node.fingerprint();
+    let chef_fp = chef_cert.fingerprint();
+    let peers = PeerRegistry::new([(chef_fp, chef_id)]).unwrap();
+    let handler = ChefAuthorizingHandler::new(
+        Some(chef_id),
+        SnapshotHandler {
+            expected_chef: chef_id,
+        },
+    );
+    let server = ControlServer::bind(loopback(), &server_node, peers, Arc::new(handler)).unwrap();
+    let client = ControlClient::new(
+        &chef_cert,
+        PeerRegistry::new([(server_fp, member_id)]).unwrap(),
+    )
+    .unwrap();
+
+    let term = OwnerTerm {
+        scope: StateTransferScope::World,
+        owner_node: chef_id,
+        epoch: 1,
+        coordinator_generation: TRACK_A_COORDINATOR_GENERATION,
+    };
+    let global =
+        OwnerTermSnapshot::new(TRACK_A_COORDINATOR_GENERATION, 1, vec![term.clone()]).unwrap();
+    let local = LocalOwnerStateSnapshot::new(
+        member_id,
+        TRACK_A_COORDINATOR_GENERATION,
+        1,
+        vec![LocalOwnerBaseState {
+            scope: term.scope.clone(),
+            recipient_node: member_id,
+            owner_term: term,
+            base_role: LocalOwnerBaseRole::Follower,
+            activation_state: ActivationState::NotRoutable,
+        }],
+    )
+    .unwrap();
+    let first = ControlEnvelope::new(
+        "owner-snapshot-r1",
+        ControlRequest::ReplicateOwnerSnapshot {
+            global: global.clone(),
+            local: local.clone(),
+        },
+    );
+    assert!(matches!(
+        client
+            .rpc(server.local_addr(), server_fp, &first)
+            .await
+            .unwrap()
+            .response,
+        ControlResponse::OwnerSnapshotAck {
+            outcome: OwnerSnapshotInstallOutcome::Installed
+        }
+    ));
+
+    // Reusing the authenticated chef's idempotency key with a different snapshot
+    // revision is rejected by the request-digest binding before the handler runs.
+    let mut changed_global = global;
+    changed_global.term_snapshot_revision = 2;
+    let conflicting = ControlEnvelope::new(
+        "owner-snapshot-r1",
+        ControlRequest::ReplicateOwnerSnapshot {
+            global: changed_global,
+            local,
+        },
+    );
+    assert!(matches!(
+        client
+            .rpc(server.local_addr(), server_fp, &conflicting)
+            .await
+            .unwrap()
+            .response,
+        ControlResponse::IdempotencyConflict { .. }
+    ));
     server.close();
 }
 
