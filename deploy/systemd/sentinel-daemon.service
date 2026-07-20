@@ -8,7 +8,10 @@ StartLimitIntervalSec=300
 
 [Service]
 Type=simple
+User=root
+Group=root
 WorkingDirectory=/opt/sentinel
+EnvironmentFile=-/etc/sentinel/env
 ExecStart=/opt/sentinel/bin/sentinel-daemon --config /opt/sentinel/config/daemon.toml
 Restart=on-failure
 RestartSec=5
@@ -33,6 +36,7 @@ SyslogIdentifier=sentinel-daemon
 
 # Security Hardening
 NoNewPrivileges=true
+AmbientCapabilities=CAP_SYS_PTRACE
 ProtectSystem=strict
 # config_dir muss schreibbar sein: der Daemon ist der alleinige config_dir-Schreiber fuer den
 # Runtime Config-Apply Write-Back (#425/#420) — sonst ueberlebt eine zur Laufzeit geaenderte
