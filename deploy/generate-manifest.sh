@@ -14,6 +14,7 @@ ARTIFACT_DEFS=(
   # Binaries (Rust: target/release/, Go: per-module build output)
   "target/release/sentinel-daemon|/opt/sentinel/bin/sentinel-daemon|binary"
   "target/release/sentinel-nightrun|/opt/sentinel/bin/sentinel-nightrun|binary"
+  "target/release/sentinel-projection|/opt/sentinel/bin/sentinel-projection|binary"
   "target/release/sentinel-dashboard-backend|/opt/sentinel/bin/sentinel-dashboard-backend|binary"
   "target/release/sentinel-gaia-loop|/opt/sentinel/bin/sentinel-gaia-loop|binary"
   "target/release/sentinel-ctl|/opt/sentinel/bin/sentinel-ctl|binary"
@@ -39,6 +40,7 @@ ARTIFACT_DEFS=(
   "deploy/systemd/sentinel-nats-bridge.service|/etc/systemd/system/sentinel-nats-bridge.service|systemd"
   "deploy/systemd/sentinel-nightrun.service|/etc/systemd/system/sentinel-nightrun.service|systemd"
   "deploy/systemd/sentinel-nightrun.timer|/etc/systemd/system/sentinel-nightrun.timer|systemd"
+  "deploy/systemd/sentinel-projection.service|/etc/systemd/system/sentinel-projection.service|systemd"
   "deploy/systemd/sentinel-dashboard-backend.service|/etc/systemd/system/sentinel-dashboard-backend.service|systemd"
   "deploy/systemd/sentinel-gaia-loop.service|/etc/systemd/system/sentinel-gaia-loop.service|systemd"
   "deploy/systemd/nats-server.service|/etc/systemd/system/nats-server.service|systemd"
