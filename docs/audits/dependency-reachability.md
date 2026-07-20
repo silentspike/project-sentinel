@@ -90,6 +90,13 @@ present only in the combined tree are build-only. Three workspace trees provide 
 native normal/build, native all-edge, and all-target all-edge sets. Set differences
 separate dev/bench-only, target-only, and optional-disabled packages.
 
+The committed tree sources are canonical compact graphs generated from the complete
+non-deduplicated Cargo output: one row per package plus one row per unique active edge,
+with explicit context and root flags. Expanded root-to-leaf path repetition remains
+internal and untracked. Check mode loads only these compact source graphs and recomputes
+workspace membership, active-edge flags, classifications, and duplicate closures; the
+derived membership and edge TSVs are never accepted as inputs.
+
 A fourth native dev-only tree seeds dev context, which is then propagated through only
 Cargo-active native edges. Foreign-target context is propagated through active
 all-target edges when the edge's target specification is absent from the native
@@ -137,8 +144,10 @@ The complete package table is
 [`reachability.tsv`](../../console/evidence/issue-631-live/reachability.tsv). The
 machine-checkable invariants are in
 [`reachability-summary.txt`](../../console/evidence/issue-631-live/reachability-summary.txt),
-with the exact workspace set inputs in
+with the derived workspace sets in
 [`workspace-reachability-sets.tsv`](../../console/evidence/issue-631-live/workspace-reachability-sets.tsv).
+The independent source inputs are the four compact `workspace-*.graph.tsv` files under
+[`trees/`](../../console/evidence/issue-631-live/trees/).
 
 ## Feature Origin and Source Review
 
@@ -148,7 +157,8 @@ the per-root `cargo tree -e normal,features` output. The direct-feature table se
 `release_features` from `metadata_union_features` so the two cannot be confused.
 Feature trees use Cargo's deduplicated rendering: activated feature nodes remain visible,
 while repeated transitive subtrees are marked with `(*)` to keep the public evidence
-bounded. Reachability classification uses the separate non-deduplicated normal trees.
+bounded. Reachability classification uses the separate compact normal/build graphs
+derived from complete non-deduplicated Cargo trees.
 
 The deterministic high-value review selected Tier-A direct dependencies first, then
 multi-root dependencies, security/runtime/database dependencies, broad feature sets,
@@ -185,7 +195,7 @@ primary reachability, immediate forcers, every reachable workspace/release root,
 size, closure basis, and a decision for each version:
 [`duplicate-versions.tsv`](../../console/evidence/issue-631-live/duplicate-versions.tsv).
 All 94 rows have a complete reverse closure: 85 use only active all-target Cargo edges;
-nine optional-disabled rows use explicitly labelled metadata-constraint edges. The
+nine optional-disabled rows use explicitly labeled metadata-constraint edges. The
 8,485 target-annotated closure rows are in
 [`duplicates/reverse-closure.tsv`](../../console/evidence/issue-631-live/duplicates/reverse-closure.tsv),
 backed by the deduplicated edge inventory in
@@ -264,9 +274,10 @@ performance evidence belongs only on authorized runtime VMs or cluster nodes.
 
 ## Public Evidence Sanitization
 
-Unmodified remote output remains internal and untracked. Committed metadata summaries,
-trees, duplicate chains, release-artifact summaries, and bloat output are deterministic normalized
-derivatives. The normalizer replaces private locations and authorities with:
+Unmodified remote output and repeated Cargo path expansions remain internal and
+untracked. Committed metadata summaries, compact package/edge graphs, duplicate chains,
+release-artifact summaries, and bloat output are deterministic normalized derivatives.
+The normalizer replaces private locations and authorities with:
 
 ```text
 <WORKSPACE>
@@ -313,6 +324,11 @@ python3 scripts/dependency-reachability-audit.py audit --check \
 python3 scripts/dependency-reachability-audit.py check-public-evidence docs/audits/dependency-reachability.md console/evidence/issue-631-live
 python3 scripts/dependency-reachability-audit.py check-staged
 ```
+
+The committed compact graph bundle contains 20 files and 19,959 unique package/edge
+rows. A fresh regeneration from the retained raw Cargo trees is byte-identical, with
+bundle digest
+`0dc77be62ce50e759076465378d6af6f7fda0e8cac9e391b089f412b37d6f8c4`.
 
 ## Separate Findings and Boundaries
 

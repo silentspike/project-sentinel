@@ -46,10 +46,13 @@ roots_with_normal_tree=8/8
 roots_with_normal_build_tree=8/8
 ```
 
-Evidence: `trees/*.normal.txt`, `trees/*.normal-build.txt`,
-`workspace-reachability-sets.tsv`, and the artifact inventory in the canonical audit.
-The classifier derives root membership only from these resolved Cargo trees; metadata
-does not activate optional dependencies.
+Evidence: `trees/*.normal.graph.tsv`, `trees/*.normal-build.graph.tsv`, the four
+`trees/workspace-*.graph.tsv` source graphs, `workspace-reachability-sets.tsv`, and the
+artifact inventory in the canonical audit. The compact graph files contain each package
+and active parent/child edge once, with context and root flags; repeated path expansions
+from Cargo's `--no-dedupe` rendering remain internal. The classifier derives root
+membership only from these resolved Cargo graph sources; metadata does not activate
+optional dependencies.
 
 Workspace context commands:
 
@@ -83,8 +86,8 @@ source_review_rows=30
 Evidence: `direct-release-features.tsv`, `feature-review.tsv`, and
 `trees/*.features.txt`.
 The feature trees use Cargo's deduplicated rendering so activated features remain visible
-without repeating identical transitive subtrees. The non-deduplicated normal trees remain
-the classifier input.
+without repeating identical transitive subtrees. The compact normal/build graph sources,
+derived from complete non-deduplicated raw trees, remain the classifier input.
 
 ### AC-4: Duplicate Forcing Chains
 
@@ -104,11 +107,12 @@ disabled_metadata_closures=9
 reverse_closure_rows=8485
 ```
 
-Evidence: `duplicate-versions.tsv`, `workspace-all-target-edges.tsv`, and the complete
-per-version reverse closures in `duplicates/reverse-closure.tsv`. Every edge carries
-its dependency kind/target constraint and an explicit Cargo-active boolean. Disabled
-optional versions use a separately labelled metadata-constraint closure and are never
-reported as active reachability.
+Evidence: `duplicate-versions.tsv`, the independently derived
+`trees/workspace-all-targets.graph.tsv`, `workspace-all-target-edges.tsv`, and the
+complete per-version reverse closures in `duplicates/reverse-closure.tsv`. Every edge
+carries its dependency kind/target constraint and an explicit Cargo-active boolean.
+Disabled optional versions use a separately labeled metadata-constraint closure and are
+never reported as active reachability.
 
 ### AC-5: Binary and Crate Contributions
 
@@ -162,6 +166,28 @@ The graph regeneration base and the verified zero manifest/lockfile delta throug
 pinned base are recorded separately; source-dependent daemon and dashboard contribution
 rows were refreshed on the pinned base.
 
+Compact source regeneration from the complete internal Cargo trees:
+
+```bash
+python3 scripts/dependency-reachability-audit.py audit --compact-sources-only \
+  --lock Cargo.lock --metadata-all <RAW_ALL> --metadata-native <RAW_NATIVE> \
+  --raw-trees-dir <RAW_ROOT_TREES> --trees-dir <FRESH_COMPACT_DIR> \
+  --workspace-native-build-tree <RAW_WORKSPACE_NATIVE_BUILD> \
+  --workspace-native-all-tree <RAW_WORKSPACE_NATIVE_ALL> \
+  --workspace-native-dev-tree <RAW_WORKSPACE_NATIVE_DEV> \
+  --workspace-all-targets-tree <RAW_WORKSPACE_ALL_TARGETS>
+diff -qr <FRESH_COMPACT_DIR> console/evidence/issue-631-live/trees \
+  --exclude='*.features.txt'
+```
+
+Output:
+
+```text
+compact_graph_files=20 compact_graph_rows=19959
+compact_source_diff=PASS
+compact_graph_bundle_sha256=0dc77be62ce50e759076465378d6af6f7fda0e8cac9e391b089f412b37d6f8c4
+```
+
 ### AC-8: Pinned Before-Baseline
 
 Status: **COMPLETE**. Hardware-independent graph and contribution metrics are pinned:
@@ -199,14 +225,16 @@ python3 scripts/dependency-reachability-audit.py check-staged
 Final output:
 
 ```text
-Ran 21 tests
+Ran 24 tests
 OK
-public-evidence-scan=PASS files=46
+public-evidence-scan=PASS files=50
 staged-new-lines-scan=PASS
 ```
 
 The test suite includes negative fixtures for IP addresses, home/workspace/remote/Cargo
-paths, SSH authorities, unexpected absolute paths, and wrapper timestamp filtering.
+paths, SSH authorities, unexpected absolute paths, and wrapper timestamp filtering. It
+also proves that modifying a derived workspace-membership flag or Cargo-active edge makes
+`audit --check` fail while the compact Cargo graph sources remain unchanged.
 
 ## Verification Gates
 

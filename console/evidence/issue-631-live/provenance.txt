@@ -16,6 +16,11 @@ issue_labels=prio:medium,quality:ready,scope:full,size:M,status:ready,type:deps
 pr_611_state=OPEN
 pr_611_scope=Cargo.lock only
 raw_data=internal untracked
+compact_graph_format=package rows with root and context flags plus unique active edge rows
+compact_graph_files=20
+compact_graph_rows=19959
+compact_graph_bundle_sha256=0dc77be62ce50e759076465378d6af6f7fda0e8cac9e391b089f412b37d6f8c4
+expanded_path_rows=internal untracked
 vm_access=none
 manifest_lockfile_mutation=none
 

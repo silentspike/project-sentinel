@@ -1,9 +1,11 @@
 import contextlib
 import importlib.util
 import io
+import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -242,6 +244,120 @@ def prepared_audit():
     return result, optional
 
 
+def write_check_fixture(base: Path) -> SimpleNamespace:
+    lock, metadata_all, metadata_native = fixture()
+    lock_lines = []
+    for package_value in lock["package"]:
+        lock_lines.extend(
+            [
+                "[[package]]",
+                f'name = "{package_value["name"]}"',
+                f'version = "{package_value["version"]}"',
+            ]
+        )
+        if package_value["source"] is not None:
+            lock_lines.append(f'source = "{package_value["source"]}"')
+        lock_lines.append("")
+    lock_path = base / "Cargo.lock"
+    lock_path.write_text("\n".join(lock_lines), encoding="utf-8")
+    metadata_all_path = base / "metadata-all.json"
+    metadata_native_path = base / "metadata-native.json"
+    metadata_all_path.write_text(json.dumps(metadata_all), encoding="utf-8")
+    metadata_native_path.write_text(json.dumps(metadata_native), encoding="utf-8")
+
+    source, _ = prepared_audit()
+    trees_dir = base / "trees"
+    trees_dir.mkdir()
+    for root in ROOTS:
+        (trees_dir / f"{root}.normal.graph.tsv").write_text(
+            audit_module.compact_tree_text(source.root_normal_graphs[root]),
+            encoding="utf-8",
+        )
+        (trees_dir / f"{root}.normal-build.graph.tsv").write_text(
+            audit_module.compact_tree_text(source.root_combined_graphs[root]),
+            encoding="utf-8",
+        )
+        (trees_dir / f"{root}.features.txt").write_text("", encoding="utf-8")
+
+    roots = set(source.workspace_keys)
+    native_build = source.workspace_sets["native_normal_build"]
+    native_all = source.workspace_sets["native_all_edges"]
+    all_targets = source.workspace_sets["all_targets_all_edges"]
+    dev_packages = roots | source.workspace_sets["native_dev_context"]
+
+    def graph(packages, edges):
+        return audit_module.TreeGraph(
+            packages=set(packages),
+            normal_context=set(packages),
+            edges=set(edges),
+            roots=roots,
+        )
+
+    workspace_graphs = {
+        "native-normal-build": graph(
+            native_build,
+            {
+                edge
+                for edge in source.active_all_target_edges
+                if edge[0] in native_build and edge[1] in native_build
+            },
+        ),
+        "native-all": graph(
+            native_all,
+            {
+                edge
+                for edge in source.active_all_target_edges
+                if edge[0] in native_all and edge[1] in native_all
+            },
+        ),
+        "native-dev": graph(
+            dev_packages,
+            {
+                edge
+                for edge in source.active_all_target_edges
+                if edge[0] in dev_packages and edge[1] in dev_packages
+            },
+        ),
+        "all-targets": graph(all_targets, source.active_all_target_edges),
+    }
+    for label, graph_value in workspace_graphs.items():
+        (trees_dir / f"workspace-{label}.graph.tsv").write_text(
+            audit_module.compact_tree_text(graph_value), encoding="utf-8"
+        )
+
+    verifier = audit_module.ReachabilityAudit(lock, metadata_all, metadata_native)
+    verifier.load_release_trees(trees_dir, compact=True)
+    all_targets_graph = verifier.load_workspace_tree_sets(
+        trees_dir / "workspace-native-normal-build.graph.tsv",
+        trees_dir / "workspace-native-all.graph.tsv",
+        trees_dir / "workspace-native-dev.graph.tsv",
+        trees_dir / "workspace-all-targets.graph.tsv",
+        compact=True,
+    )
+    verifier.set_all_target_edges(all_targets_graph)
+    generated, _, _, _ = audit_module.generated_outputs(verifier, trees_dir)
+    output_dir = base / "output"
+    for relative_path, value in generated.items():
+        path = output_dir / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value, encoding="utf-8")
+
+    return SimpleNamespace(
+        lock=lock_path,
+        metadata_all=metadata_all_path,
+        metadata_native=metadata_native_path,
+        output_dir=output_dir,
+        trees_dir=trees_dir,
+        raw_trees_dir=None,
+        workspace_native_build_tree=None,
+        workspace_native_all_tree=None,
+        workspace_native_dev_tree=None,
+        workspace_all_targets_tree=None,
+        check=True,
+        compact_sources_only=False,
+    )
+
+
 class ReachabilityTests(unittest.TestCase):
     def test_primary_categories_and_proc_macro_context(self):
         result, _ = prepared_audit()
@@ -336,20 +452,73 @@ class ReachabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             trees = Path(temp)
             for root in ROOTS:
-                line = f"0{root} v0.1.0\n"
-                (trees / f"{root}.normal.txt").write_text(line, encoding="utf-8")
-                (trees / f"{root}.normal-build.txt").write_text(line, encoding="utf-8")
-            (trees / f"{ROOTS[0]}.normal-build.txt").write_text(
-                f"0{ROOTS[1]} v0.1.0\n", encoding="utf-8"
+                graph = audit_module.TreeGraph(
+                    packages={result.root_keys[root]},
+                    normal_context={result.root_keys[root]},
+                    roots={result.root_keys[root]},
+                )
+                for label in ("normal", "normal-build"):
+                    (trees / f"{root}.{label}.graph.tsv").write_text(
+                        audit_module.compact_tree_text(graph), encoding="utf-8"
+                    )
+            wrong_graph = audit_module.TreeGraph(
+                packages={result.root_keys[ROOTS[1]]},
+                normal_context={result.root_keys[ROOTS[1]]},
+                roots={result.root_keys[ROOTS[1]]},
+            )
+            (trees / f"{ROOTS[0]}.normal-build.graph.tsv").write_text(
+                audit_module.compact_tree_text(wrong_graph), encoding="utf-8"
             )
             with self.assertRaisesRegex(audit_module.AuditError, "exactly to their root"):
-                result.load_release_trees(trees)
+                result.load_release_trees(trees, compact=True)
 
-    def test_workspace_set_loader_rejects_hardcoded_coverage(self):
-        lock, metadata_all, metadata_native = fixture()
-        result = audit_module.ReachabilityAudit(lock, metadata_all, metadata_native)
-        with self.assertRaisesRegex(audit_module.AuditError, "lockfile rows"):
-            result.load_workspace_set_rows([])
+    def test_compact_tree_roundtrip_preserves_unique_graph(self):
+        source, _ = prepared_audit()
+        graph = source.root_combined_graphs[ROOTS[0]]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "tree.graph.tsv"
+            path.write_text(audit_module.compact_tree_text(graph), encoding="utf-8")
+            loaded = audit_module.load_compact_tree(path, source.keys_by_name_version)
+        self.assertEqual(loaded, graph)
+
+    def test_compact_tree_rejects_package_unreachable_from_roots(self):
+        source, _ = prepared_audit()
+        root = source.root_keys[ROOTS[0]]
+        orphan = source.keys_by_name_version[("normal-dep", "1.0.0")]
+        graph = audit_module.TreeGraph(
+            packages={root, orphan},
+            normal_context={root, orphan},
+            roots={root},
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "tree.graph.tsv"
+            path.write_text(audit_module.compact_tree_text(graph), encoding="utf-8")
+            with self.assertRaisesRegex(audit_module.AuditError, "unreachable"):
+                audit_module.load_compact_tree(path, source.keys_by_name_version)
+
+    def test_check_rejects_manipulated_workspace_membership_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = write_check_fixture(Path(temp))
+            path = args.output_dir / "workspace-reachability-sets.tsv"
+            rows = audit_module.read_tsv(path)
+            row = next(item for item in rows if item["name"] == "dev-dep")
+            row["native_dev_context"] = "false"
+            audit_module.write_tsv(path, rows, audit_module.WORKSPACE_SET_FIELDS)
+            with self.assertRaisesRegex(audit_module.AuditError, "workspace-reachability"):
+                audit_module.run_audit(args)
+
+    def test_check_rejects_manipulated_active_edge_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = write_check_fixture(Path(temp))
+            path = args.output_dir / "workspace-all-target-edges.tsv"
+            rows = audit_module.read_tsv(path)
+            row = next(
+                item for item in rows if item["cargo_all_targets_active"] == "true"
+            )
+            row["cargo_all_targets_active"] = "false"
+            audit_module.write_tsv(path, rows, audit_module.EDGE_FIELDS)
+            with self.assertRaisesRegex(audit_module.AuditError, "workspace-all-target-edges"):
+                audit_module.run_audit(args)
 
     def test_duplicate_closure_fails_when_active_chain_is_missing(self):
         result, _ = prepared_audit()
