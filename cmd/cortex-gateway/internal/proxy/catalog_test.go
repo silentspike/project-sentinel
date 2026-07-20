@@ -111,6 +111,29 @@ func TestProviderCatalogRealConfigAndTierMatrix(t *testing.T) {
 	}
 }
 
+func TestProviderActivationRequiresExactGateBAttestationWithoutInventory(t *testing.T) {
+	catalog, err := LoadProviderCatalog(filepath.Join("..", "..", "..", "..", "config", "cortex-gateway.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.ValidateProviderActivation("claude-code", false, ""); err == nil {
+		t.Fatal("claude-code activated without Gate B attestation")
+	}
+	if err := catalog.ValidateProviderActivation("claude-code", false, "gate-b:claude-code:stale"); err == nil {
+		t.Fatal("claude-code accepted stale catalog attestation")
+	}
+	if err := catalog.ValidateProviderActivation(
+		"claude-code",
+		false,
+		catalog.ExpectedGateBAttestation("claude-code"),
+	); err != nil {
+		t.Fatalf("exact Gate B attestation rejected: %v", err)
+	}
+	if err := catalog.ValidateProviderActivation(LocalLoopProviderName, false, ""); err != nil {
+		t.Fatalf("token-free local-loop blocked: %v", err)
+	}
+}
+
 func TestProviderCatalogRejectsIncompleteHierarchyMap(t *testing.T) {
 	catalog := &ProviderCatalog{providers: map[string]ProviderCatalogEntry{
 		"broken": {
@@ -292,6 +315,34 @@ func TestAuthorizedClassificationAndPublicClaimStripping(t *testing.T) {
 	}
 }
 
+func assertAuthorizedAgentRuntimeResponseLog(
+	t *testing.T,
+	entry ResponseLogEntry,
+	catalog *ProviderCatalog,
+	credentials CallerCredentials,
+) {
+	t.Helper()
+	if entry.CallerRole != CallerRoleAgentRuntime || entry.HierarchyTier != 1 ||
+		entry.ModelTier != "unknown" || entry.EffectiveModel != "mock-tier1" ||
+		entry.CatalogDigest != catalog.Digest() || entry.CostSource != CostSourceNonProviderZero {
+		t.Fatalf("response inspector entry=%+v", entry)
+	}
+	encodedLog, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{
+		credentials.AgentRuntime,
+		credentials.PlatformControlplane,
+		credentials.Evolution,
+		credentials.Judge,
+	} {
+		if strings.Contains(string(encodedLog), secret) {
+			t.Fatalf("response inspector leaked credential material: %s", encodedLog)
+		}
+	}
+}
+
 func TestAuthorizedAgentRuntimePipelineResolvesCatalogModelAndWireFields(t *testing.T) {
 	catalog := &ProviderCatalog{providers: map[string]ProviderCatalogEntry{
 		"mock": {
@@ -305,6 +356,11 @@ func TestAuthorizedAgentRuntimePipelineResolvesCatalogModelAndWireFields(t *test
 	if err := catalog.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	digest, err := catalog.SemanticDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog.digest = digest
 	config := control.NewConfig("mock")
 	config.SetAgentRuntimePolicyValidator(catalog.ValidatePolicy)
 	provider := &pipelineMockProvider{name: "mock", resp: &LLMResponse{
@@ -314,12 +370,18 @@ func TestAuthorizedAgentRuntimePipelineResolvesCatalogModelAndWireFields(t *test
 	registry.Register("mock", provider)
 	handler := newTestPipelineHandler(registry, config)
 	handler.catalog = catalog
-	credentials := CallerCredentials{AgentRuntime: "agent", PlatformControlplane: "platform", Evolution: "evolution", Judge: "judge"}
+	handler.responseLogs = NewResponseLogBuffer(10)
+	credentials := CallerCredentials{
+		AgentRuntime:         "agent-runtime-secret-value",
+		PlatformControlplane: "platform-secret-value",
+		Evolution:            "evolution-secret-value",
+		Judge:                "judge-secret-value",
+	}
 
 	req := httptest.NewRequest(http.MethodPost, "/internal/agent-runtime", strings.NewReader(
 		`{"messages":[{"role":"user","content":"test"}],"metadata":{"agent_id":"7","agent_role":"Engineer","hierarchy_tier":"1"}}`,
 	))
-	req.Header.Set("Authorization", "Bearer agent")
+	req.Header.Set("Authorization", "Bearer "+credentials.AgentRuntime)
 	recorder := httptest.NewRecorder()
 	credentials.Middleware(handler).ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusOK {
@@ -335,6 +397,39 @@ func TestAuthorizedAgentRuntimePipelineResolvesCatalogModelAndWireFields(t *test
 	if response.HierarchyTier != 1 || response.EffectiveModel != "mock-tier1" ||
 		response.CostSource != CostSourceNonProviderZero || response.Tier != "unknown" {
 		t.Fatalf("wire response=%+v", response)
+	}
+	entries := handler.responseLogs.Entries()
+	if len(entries) != 1 {
+		t.Fatalf("response log entries=%d, want 1", len(entries))
+	}
+	assertAuthorizedAgentRuntimeResponseLog(t, entries[0], catalog, credentials)
+}
+
+func TestResponseInspectorDistinguishesEvolutionAndJudgeCallerRoles(t *testing.T) {
+	provider := &pipelineMockProvider{name: "mock", resp: &LLMResponse{
+		Content: "ok", Model: "mock-model", InputTokens: 1, OutputTokens: 1, TokensUsed: 2,
+	}}
+	registry := NewRegistry()
+	registry.Register("mock", provider)
+	handler := newTestPipelineHandler(registry, control.NewConfig("mock"))
+	handler.responseLogs = NewResponseLogBuffer(10)
+
+	for _, role := range []CallerRole{CallerRoleEvolution, CallerRoleJudge} {
+		req := httptest.NewRequest(http.MethodPost, "/internal/llm", strings.NewReader(
+			`{"messages":[{"role":"user","content":"test"}]}`,
+		))
+		req = req.WithContext(callerRoleContext(req.Context(), role))
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("role=%s status=%d body=%s", role, recorder.Code, recorder.Body.String())
+		}
+	}
+
+	entries := handler.responseLogs.Entries()
+	if len(entries) != 2 || entries[0].CallerRole != CallerRoleEvolution ||
+		entries[1].CallerRole != CallerRoleJudge {
+		t.Fatalf("caller roles not preserved: %+v", entries)
 	}
 }
 

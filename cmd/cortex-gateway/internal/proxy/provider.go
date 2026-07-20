@@ -31,6 +31,7 @@ type LLMRequest struct {
 	PreferredProvider  string            `json:"-"`
 	PassthroughHeaders map[string]string `json:"-"`
 	RequestClass       RequestClass      `json:"-"`
+	CallerRole         CallerRole        `json:"-"`
 	EffectiveModel     string            `json:"-"`
 	PolicySource       string            `json:"-"`
 	HierarchyTier      int               `json:"-"`

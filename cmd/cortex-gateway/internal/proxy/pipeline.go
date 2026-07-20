@@ -122,6 +122,7 @@ type PipelineConfig struct {
 	ResponseInterceptor *intercept.ResponseManager // optional: nil disables manual response interception
 	TickSync            *ticksync.Buffer           // optional: nil disables tick sync
 	ResponseLogs        *ResponseLogBuffer         // optional: nil disables response-body ring buffer
+	ProviderActivation  func(string) error         // optional: fail-closed deployment activation gate
 }
 
 func durationFromEnvSeconds(primaryKey, legacyKey string, minSeconds, maxSeconds int, fallback time.Duration) time.Duration {
@@ -190,6 +191,7 @@ type PipelineHandler struct {
 	responseInterceptor *intercept.ResponseManager
 	tickSync            *ticksync.Buffer
 	responseLogs        *ResponseLogBuffer
+	providerActivation  func(string) error
 
 	breakerMu  sync.RWMutex
 	breakers   map[string]*CircuitBreaker
@@ -277,6 +279,7 @@ func NewPipelineHandler(cfg PipelineConfig) *PipelineHandler {
 		responseInterceptor: cfg.ResponseInterceptor,
 		tickSync:            cfg.TickSync,
 		responseLogs:        cfg.ResponseLogs,
+		providerActivation:  cfg.ProviderActivation,
 		breakers:            make(map[string]*CircuitBreaker),
 		breakerCfg:          cfg.BreakerCfg,
 		regenCooldown:       make(map[string]time.Time),
@@ -386,6 +389,7 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		ph.writeRequestError(w, &req, classifyErr.Error(), http.StatusUnprocessableEntity)
 		return
 	}
+	req.CallerRole = callerRole
 	if req.RequestClass == RequestClassAgentRuntime && req.Stream {
 		ph.writeRequestError(w, &req, "agent-runtime wire contract does not support streaming", http.StatusUnprocessableEntity)
 		return
@@ -404,6 +408,13 @@ func (ph *PipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { /
 		ph.logger.Error("no provider available", "requested", resolvedProviderName)
 		ph.writeRequestError(w, &req, "no provider available", http.StatusServiceUnavailable)
 		return
+	}
+	if ph.providerActivation != nil {
+		if err := ph.providerActivation(providerName); err != nil {
+			ph.logger.Warn("provider activation blocked", "provider", providerName, "error", err)
+			ph.writeRequestError(w, &req, "provider activation gate not satisfied", http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	// --- Step 3: Circuit Breaker (SENTINEL_CORTEX_CB_ENABLED gate, AC-5) ---
@@ -1456,18 +1467,28 @@ func (ph *PipelineHandler) writePipelineResponse(_ context.Context, w http.Respo
 	}
 
 	if ph.responseLogs != nil {
+		catalogDigest := ""
+		if ph.catalog != nil {
+			catalogDigest = ph.catalog.Digest()
+		}
 		ph.responseLogs.Add(ResponseLogEntry{
-			RequestID:    resp.RequestID,
-			RequestClass: req.RequestClass,
-			Provider:     resp.Provider,
-			Model:        effectiveModelForLog(req, resp.Model),
-			PolicySource: req.PolicySource,
-			AgentID:      req.Metadata["agent_id"],
-			AgentName:    req.Metadata["agent_name"],
-			Content:      resp.Content,
-			Decision:     resp.Decision,
-			Rule:         resp.Rule,
-			FourthWall:   resp.FourthWall,
+			RequestID:      resp.RequestID,
+			RequestClass:   req.RequestClass,
+			CallerRole:     req.CallerRole,
+			Provider:       resp.Provider,
+			Model:          resp.EffectiveModel,
+			EffectiveModel: resp.EffectiveModel,
+			ModelTier:      resp.Tier,
+			HierarchyTier:  resp.HierarchyTier,
+			CatalogDigest:  catalogDigest,
+			CostSource:     resp.CostSource,
+			PolicySource:   req.PolicySource,
+			AgentID:        req.Metadata["agent_id"],
+			AgentName:      req.Metadata["agent_name"],
+			Content:        resp.Content,
+			Decision:       resp.Decision,
+			Rule:           resp.Rule,
+			FourthWall:     resp.FourthWall,
 		})
 	}
 
@@ -1777,6 +1798,7 @@ func cloneRegenRequest(base *LLMRequest, messages []Message, temperature float64
 		PreferredProvider:  base.PreferredProvider,
 		PassthroughHeaders: clonePassthroughHeaders(base.PassthroughHeaders),
 		RequestClass:       base.RequestClass,
+		CallerRole:         base.CallerRole,
 		EffectiveModel:     base.EffectiveModel,
 		PolicySource:       base.PolicySource,
 		HierarchyTier:      base.HierarchyTier,

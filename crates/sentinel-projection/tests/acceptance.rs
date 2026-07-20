@@ -523,6 +523,7 @@ fn append_usage(
         tier: tier.to_string(),
         hierarchy_tier,
         cost_source: hierarchy_tier.map(|_| CostSource::ProviderReported),
+        effective_model: hierarchy_tier.map(|_| "test-model".to_string()),
         input_tokens: input,
         output_tokens: output,
         cache_read,

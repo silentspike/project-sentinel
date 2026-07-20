@@ -49,6 +49,7 @@ services:
     container_name: sentinel-demo-daemon
     environment:
       SENTINEL_ROLE: daemon
+      CORTEX_GATEWAY_URL: http://gateway:8080
       SENTINEL_AGENT_RUNTIME_CREDENTIAL_FILE: /run/secrets/caller-agent-runtime
       SENTINEL_PLATFORM_CREDENTIAL_FILE: /run/secrets/caller-platform
       SENTINEL_EVOLUTION_CREDENTIAL_FILE: /run/secrets/caller-evolution
@@ -88,6 +89,8 @@ services:
     container_name: sentinel-demo-gateway
     environment:
       SENTINEL_ROLE: gateway
+      CORTEX_PRIMARY_PROVIDER: local-loop
+      CORTEX_LOCAL_LOOP: "1"
       CORTEX_PROXY_BIND: 0.0.0.0
       # The unauthenticated control plane remains loopback-only and is not published.
       CORTEX_CONTROL_BIND: 127.0.0.1
@@ -124,7 +127,7 @@ services:
       - "18001:8001/tcp"
       - "18001:8001/udp"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "--max-time", "3", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-fsS", "--max-time", "3", "http://localhost:8080/ready"]
       interval: 10s
       timeout: 5s
       retries: 12

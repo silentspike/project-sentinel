@@ -135,6 +135,32 @@ func TestPipelineInternalPathWithoutServerCallerContextFailsClosed(t *testing.T)
 	}
 }
 
+func TestPipelineBlocksProviderSendWhenActivationGateIsNotSatisfied(t *testing.T) {
+	registry := NewRegistry()
+	provider := &pipelineMockProvider{
+		name: "claude-code",
+		resp: &LLMResponse{Content: "must not run", Model: "claude-sonnet-5"},
+	}
+	registry.Register("claude-code", provider)
+	handler := newTestPipelineHandler(registry, control.NewConfig("claude-code"))
+	handler.providerActivation = func(string) error {
+		return errors.New("Gate B attestation required")
+	}
+	req := newAgentRuntimeTestRequest(t,
+		`{"messages":[{"role":"user","content":"test"}],"metadata":{"agent_id":"1","hierarchy_tier":"1"}}`,
+	)
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if provider.calls != 0 {
+		t.Fatalf("provider calls=%d, want 0", provider.calls)
+	}
+}
+
 func TestPipelineFullFlow(t *testing.T) {
 	reg := NewRegistry()
 	mock := &pipelineMockProvider{

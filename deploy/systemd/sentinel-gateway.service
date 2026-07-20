@@ -20,6 +20,10 @@ Environment=CORTEX_PRIMARY_PROVIDER=claude-code
 Environment=CORTEX_PROXY_BIND=0.0.0.0
 Environment=CORTEX_CONTROL_BIND=127.0.0.1
 Environment=CLAUDE_CODE_BINARY=/usr/bin/claude
+# Deliberately unset by default. Gate B must provide
+# CORTEX_MODEL_CATALOG_GATE_B_ATTESTATION=gate-b:<provider>:<semantic-catalog-digest>
+# in an authorized deployment drop-in before a provider without token-free
+# inventory can become ready or receive a request.
 Environment=SENTINEL_CORTEX_EVENT_STORE_PATH=/opt/sentinel/data/events.db
 Environment=SENTINEL_CORTEX_CB_FAILURE_THRESHOLD=15
 Environment=SENTINEL_CORTEX_CB_WINDOW_SECONDS=60

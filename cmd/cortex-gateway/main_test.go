@@ -24,6 +24,14 @@ type inventoryTestProvider struct {
 	err    error
 }
 
+type noInventoryTestProvider struct{ name string }
+
+func (p *noInventoryTestProvider) Name() string { return p.name }
+func (p *noInventoryTestProvider) Send(context.Context, *proxy.LLMRequest) (*proxy.LLMResponse, error) {
+	return nil, nil
+}
+func (p *noInventoryTestProvider) HealthCheck(context.Context) error { return nil }
+
 func (p *inventoryTestProvider) Name() string { return p.name }
 
 func (p *inventoryTestProvider) Send(context.Context, *proxy.LLMRequest) (*proxy.LLMResponse, error) {
@@ -68,7 +76,7 @@ func TestReadyValidatesActiveProviderInventoryWithoutExposingModels(t *testing.T
 	})
 
 	recorder := httptest.NewRecorder()
-	handleReady(catalog, cfg, registry).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	handleReady(catalog, cfg, registry, "").ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -100,7 +108,7 @@ func TestReadyFailsClosedOnActiveProviderInventoryDrift(t *testing.T) {
 	registry.Register("ollama", &inventoryTestProvider{name: "ollama", models: []string{"qwen3:8b"}})
 
 	recorder := httptest.NewRecorder()
-	handleReady(catalog, cfg, registry).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	handleReady(catalog, cfg, registry, "").ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -110,6 +118,63 @@ func TestReadyFailsClosedOnActiveProviderInventoryDrift(t *testing.T) {
 	}
 	if response["ready"] != false || response["model_inventory_status"] != "drift" {
 		t.Fatalf("unexpected readiness response: %#v", response)
+	}
+}
+
+func TestReadyBlocksClaudeCodeWithoutExactGateBAttestation(t *testing.T) {
+	catalog, err := proxy.LoadProviderCatalog(filepath.Join("..", "..", "config", "cortex-gateway.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := control.NewConfig("claude-code")
+	registry := proxy.NewRegistry()
+	registry.Register("claude-code", &noInventoryTestProvider{name: "claude-code"})
+
+	for _, test := range []struct {
+		name        string
+		attestation string
+		wantStatus  int
+		wantGate    string
+	}{
+		{name: "missing", wantStatus: http.StatusServiceUnavailable, wantGate: "gate_b_attestation_required"},
+		{name: "wrong catalog", attestation: "gate-b:claude-code:stale", wantStatus: http.StatusServiceUnavailable, wantGate: "gate_b_attestation_required"},
+		{name: "exact", attestation: catalog.ExpectedGateBAttestation("claude-code"), wantStatus: http.StatusOK, wantGate: "gate_b_attested"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handleReady(catalog, cfg, registry, test.attestation).ServeHTTP(
+				recorder,
+				httptest.NewRequest(http.MethodGet, "/ready", nil),
+			)
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			var response map[string]any
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response["model_inventory_status"] != test.wantGate {
+				t.Fatalf("response=%#v", response)
+			}
+		})
+	}
+}
+
+func TestReadyAllowsTokenFreeLocalLoopWithoutGateBAttestation(t *testing.T) {
+	catalog, err := proxy.LoadProviderCatalog(filepath.Join("..", "..", "config", "cortex-gateway.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := control.NewConfig(proxy.LocalLoopProviderName)
+	registry := proxy.NewRegistry()
+	registry.Register(proxy.LocalLoopProviderName, &noInventoryTestProvider{name: proxy.LocalLoopProviderName})
+	recorder := httptest.NewRecorder()
+	handleReady(catalog, cfg, registry, "").ServeHTTP(
+		recorder,
+		httptest.NewRequest(http.MethodGet, "/ready", nil),
+	)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"model_inventory_status":"token_free_local"`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 
