@@ -856,6 +856,40 @@ fn world_background_work_allowed(registry: &sentinel_common::OwnerRegistry) -> b
         .is_ok()
 }
 
+fn attempt_world_owned_runtime_snapshot<F>(
+    registry: &sentinel_common::OwnerRegistry,
+    save: F,
+) -> Option<anyhow::Result<()>>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
+    world_background_work_allowed(registry).then(save)
+}
+
+fn attempt_periodic_runtime_snapshot<F>(
+    tick_count: u64,
+    registry: &sentinel_common::OwnerRegistry,
+    save: F,
+) -> Option<anyhow::Result<()>>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
+    if tick_count == 0 || !tick_count.is_multiple_of(600) {
+        return None;
+    }
+    attempt_world_owned_runtime_snapshot(registry, save)
+}
+
+fn attempt_shutdown_runtime_snapshot<F>(
+    registry: &sentinel_common::OwnerRegistry,
+    save: F,
+) -> Option<anyhow::Result<()>>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
+    attempt_world_owned_runtime_snapshot(registry, save)
+}
+
 fn rebuild_owner_registry_from_store(
     meta: &sentinel_redb::ClusterMetaStore,
 ) -> Result<sentinel_common::OwnerTermSnapshot> {
@@ -7286,8 +7320,12 @@ fn ecs_tick_loop(
         }
 
         // Periodischer Runtime-Snapshot (alle 600 Ticks = ~10 Minuten bei 1s Tick-Rate)
-        if tick_count > 0 && tick_count.is_multiple_of(600) {
-            if let Err(e) = runtime_orch.save_state() {
+        if let Some(snapshot_result) = attempt_periodic_runtime_snapshot(
+            tick_count,
+            sentinel_common::OwnerRegistry::global(),
+            || runtime_orch.save_state(),
+        ) {
+            if let Err(e) = snapshot_result {
                 warn!(error = %e, tick = tick_count, "Periodischer Snapshot fehlgeschlagen");
             } else {
                 info!(
@@ -7389,15 +7427,23 @@ fn ecs_tick_loop(
     //    nicht 0. Beim Restart erkennt shift_transition() ob Schichtwechsel stattfand
     //    und entfernt/spawnt Agents entsprechend.)
     let t = Instant::now();
-    if let Err(e) = runtime_orch.save_state() {
-        error!(error = %e, "Runtime State Snapshot fehlgeschlagen");
-    } else {
-        info!(
-            agent_count = runtime_orch.agent_count(),
-            "Runtime State Snapshot gespeichert"
-        );
+    let runtime_snapshot_result =
+        attempt_shutdown_runtime_snapshot(sentinel_common::OwnerRegistry::global(), || {
+            runtime_orch.save_state()
+        });
+    let runtime_snapshot_attempted = runtime_snapshot_result.is_some();
+    if let Some(runtime_snapshot_result) = runtime_snapshot_result {
+        if let Err(e) = runtime_snapshot_result {
+            error!(error = %e, "Runtime State Snapshot fehlgeschlagen");
+        } else {
+            info!(
+                agent_count = runtime_orch.agent_count(),
+                "Runtime State Snapshot gespeichert"
+            );
+        }
     }
     info!(
+        attempted = runtime_snapshot_attempted,
         duration_ms = t.elapsed().as_millis() as u64,
         "Shutdown: Runtime-Snapshot"
     );
@@ -7471,6 +7517,37 @@ mod tests {
 
         let closed = sentinel_common::OwnerRegistry::new_cluster_for_test(follower_node);
         assert!(!world_background_work_allowed(&closed));
+    }
+
+    #[test]
+    fn follower_callsites_never_attempt_periodic_or_shutdown_runtime_snapshots() {
+        use std::cell::Cell;
+
+        let seed = sentinel_common::NodeId(uuid::Uuid::from_bytes([1; 16]));
+        let follower_node = sentinel_common::NodeId(uuid::Uuid::from_bytes([2; 16]));
+        let global = initial_owner_snapshot(seed, &[]).unwrap();
+        let follower = sentinel_common::OwnerRegistry::new_cluster_for_test(follower_node);
+        follower
+            .rebuild_from_owner_snapshot(
+                &global,
+                &recipient_owner_snapshot(&global, follower_node).unwrap(),
+                vec![],
+            )
+            .unwrap();
+
+        let attempts = Cell::new(0usize);
+        let periodic = attempt_periodic_runtime_snapshot(600, &follower, || {
+            attempts.set(attempts.get() + 1);
+            Ok(())
+        });
+        let shutdown = attempt_shutdown_runtime_snapshot(&follower, || {
+            attempts.set(attempts.get() + 1);
+            Ok(())
+        });
+
+        assert!(periodic.is_none());
+        assert!(shutdown.is_none());
+        assert_eq!(attempts.get(), 0);
     }
 
     #[tokio::test]
