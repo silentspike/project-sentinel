@@ -35,7 +35,7 @@ Build-server timing and performance data are deliberately excluded.
 
 | Item | Value |
 | --- | --- |
-| Base commit | `94134b14c380e0cdc55c34222cd74698f97cf555` |
+| Base commit | `c64bb0ce3ee6d8b9b6b8ef6e19d0bc73fd59cea9` |
 | `Cargo.lock` SHA-256 | `29b97c217ff9694e116e0e6ce856e5ab761b808d5b2289bd56cb255373e14b93` |
 | Lockfile packages | 717 |
 | Workspace members | 27 |
@@ -45,10 +45,10 @@ Build-server timing and performance data are deliberately excluded.
 | Remote Cargo | `cargo 1.97.1 (c980f4866 2026-06-30)` |
 | cargo-bloat | `0.12.1`, installed under an issue-local remote tool directory |
 
-The dependency graph was fully regenerated after PR #640 at
-`7b24caeb9dd7d687018f35f0aa96a478d533b2b3`. The later mainline changes through the
-pinned base changed neither `Cargo.lock` nor any `Cargo.toml`; source-dependent daemon
-and dashboard artifact and cargo-bloat rows were refreshed on the pinned base.
+The dependency graph, feature evidence, release artifacts, and cargo-bloat rows were
+fully regenerated on the pinned base after the latest mainline manifest and Rust-source
+changes. `Cargo.lock` remained unchanged; the new `sentinel-common` dev edge to `sha2`
+is reflected in the workspace edge and reverse-closure evidence.
 
 PR #611 remains open and changes only `Cargo.lock`. If it or any other lockfile change
 lands before completion, this branch must rebase and regenerate metadata, trees,
@@ -90,12 +90,14 @@ present only in the combined tree are build-only. Three workspace trees provide 
 native normal/build, native all-edge, and all-target all-edge sets. Set differences
 separate dev/bench-only, target-only, and optional-disabled packages.
 
-The committed tree sources are canonical compact graphs generated from the complete
-non-deduplicated Cargo output: one row per package plus one row per unique active edge,
-with explicit context and root flags. Expanded root-to-leaf path repetition remains
-internal and untracked. Check mode loads only these compact source graphs and recomputes
-workspace membership, active-edge flags, classifications, and duplicate closures; the
-derived membership and edge TSVs are never accepted as inputs.
+The committed tree sources are canonical compact graphs: one row per package plus one
+row per unique active edge, with explicit context and root flags. Per-root graphs derive
+from complete non-deduplicated Cargo output. Workspace graphs use Cargo's deduplicated
+rendering, which retains every direct active edge but suppresses repeated descendant
+subtrees. Expanded root-to-leaf repetition remains internal and untracked. Check mode
+loads only these compact source graphs and recomputes workspace membership, active-edge
+flags, classifications, and duplicate closures; the derived membership and edge TSVs
+are never accepted as inputs.
 
 A fourth native dev-only tree seeds dev context, which is then propagated through only
 Cargo-active native edges. Foreign-target context is propagated through active
@@ -238,14 +240,14 @@ Only deterministic artifact bytes and SHA-256 values are retained:
 
 | Root | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `sentinel-daemon` | 54,671,272 | `9066107775377130adb9b3b54f6f7849d9051b441065187dfdd281540e012940` |
-| `sentinel-projection-service` | 4,399,432 | `edf0cdec0e099415b7909a68923ea356d01825d1cf50814c62fd1f551ee22f93` |
-| `sentinel-dashboard-backend` | 18,966,712 | `132d003dfb9c0f5901dc710d3de79b788651b4f1747f582e376c3805e2eff446` |
-| `sentinel-gaia-loop` | 8,905,560 | `a8b8e0d2e98d2971002fb9bf07b75d911cdb788df6601391511ee12b855aeb47` |
+| `sentinel-daemon` | 54,922,536 | `858f81bcb0b8627ac3f50475855696d8c23789f6a48d936adaac1174bd80a440` |
+| `sentinel-projection-service` | 4,428,168 | `ecc9ca0f3f1cc0f69443e87bfe83540c12a7fbabc06c9f349dcc13d767e0e3fa` |
+| `sentinel-dashboard-backend` | 18,968,952 | `9d34ec97f35ca6d4d5a8e11bdde95472b64805a4bacc4d60e7db5cd6a1d8a73a` |
+| `sentinel-gaia-loop` | 8,909,144 | `797bc5582c2a9c3642ae63f6ce35713d386ebcb3953b119dda5f378522a571ed` |
 | `agent-runtime` | 369,776 | `12dda746c12e5685258f15111ec7ccc08201cbe28d5cc4898b3fc356a50a1f0c` |
 | `sentinel-ctl` | 4,192,976 | `20da53f6f6749c6982b4461baca27ced106d044097e2de3c91ca4694736cc604` |
-| `sentinel-gaia` | 2,126,144 | `f08e9da7ae4ed638d8862e71e3aed62ac5e8fd57b21967a740fed7c237085cce` |
-| `sentinel-nightrun` | 5,643,664 | `bdb54dceb9a41291bcd2e1aa464b803531a11b65e07e2cbf6686bb8f135bd790` |
+| `sentinel-gaia` | 2,111,088 | `862f4d9bff7b7c529ed715586ea0e2b9c9dc97fca1c92c79752424dccb431ee2` |
+| `sentinel-nightrun` | 5,646,416 | `f9d05af45036adc6516d4afcfe68efc6ce7ac0f0c894a66fdccceac350ccdf9a` |
 
 The canonical machine-readable artifact table is
 [`release-builds.tsv`](../../console/evidence/issue-631-live/release-builds.tsv).
@@ -256,14 +258,14 @@ analysis `.text`, and analysis-file size in separate columns:
 
 | Root | Release bytes | Analysis `.text` | Analysis file | Largest reported crate |
 | --- | ---: | ---: | ---: | --- |
-| `sentinel-daemon` | 54,671,272 | 38.2 MiB | 83.0 MiB | `cranelift_codegen`, 3.1 MiB / 8.0% of `.text` |
-| `sentinel-projection-service` | 4,399,432 | 3.2 MiB | 9.2 MiB | `[Unknown]`, 1.4 MiB / 43.2% |
-| `sentinel-dashboard-backend` | 18,966,712 | 12.6 MiB | 30.2 MiB | `[Unknown]`, 2.2 MiB / 17.5% |
-| `sentinel-gaia-loop` | 8,905,560 | 5.7 MiB | 17.1 MiB | `[Unknown]`, 1.5 MiB / 25.6% |
+| `sentinel-daemon` | 54,922,536 | 38.4 MiB | 83.3 MiB | `cranelift_codegen`, 3.1 MiB / 8.0% of `.text` |
+| `sentinel-projection-service` | 4,428,168 | 3.2 MiB | 9.3 MiB | `[Unknown]`, 1.4 MiB / 43.0% |
+| `sentinel-dashboard-backend` | 18,968,952 | 12.6 MiB | 30.2 MiB | `[Unknown]`, 2.2 MiB / 17.5% |
+| `sentinel-gaia-loop` | 8,909,144 | 5.7 MiB | 17.1 MiB | `[Unknown]`, 1.5 MiB / 25.6% |
 | `agent-runtime` | 369,776 | 260.7 KiB | 4.2 MiB | `std`, 254.7 KiB / 97.7% |
-| `sentinel-ctl` | 4,192,976 | 2.7 MiB | 11.2 MiB | `rustls`, 459.9 KiB / 16.8% |
-| `sentinel-gaia` | 2,126,144 | 1.5 MiB | 6.6 MiB | `std`, 378.7 KiB / 24.1% |
-| `sentinel-nightrun` | 5,643,664 | 4.2 MiB | 10.8 MiB | `[Unknown]`, 1.4 MiB / 33.4% |
+| `sentinel-ctl` | 4,192,976 | 2.7 MiB | 11.2 MiB | `rustls`, 459.4 KiB / 16.8% |
+| `sentinel-gaia` | 2,111,088 | 1.5 MiB | 6.6 MiB | `std`, 380.4 KiB / 24.4% |
+| `sentinel-nightrun` | 5,646,416 | 4.2 MiB | 10.8 MiB | `[Unknown]`, 1.4 MiB / 33.4% |
 
 The normalized top-20 tables are in
 [`bloat/`](../../console/evidence/issue-631-live/bloat/); their deterministic summary is
@@ -303,12 +305,12 @@ connection configuration:
 cargo remote --no-copy-lock -- metadata --locked --format-version 1
 cargo remote --no-copy-lock -- metadata --locked --format-version 1 --filter-platform x86_64-unknown-linux-gnu
 cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal --prefix depth --no-dedupe
-cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,build --prefix depth
+cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,build --prefix depth --no-dedupe
 cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,features --prefix depth
-cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build --prefix depth --no-dedupe
-cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build,dev --prefix depth --no-dedupe
-cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e dev --prefix depth --no-dedupe
-cargo remote --no-copy-lock -- tree --workspace --target all -e normal,build,dev --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build --prefix depth
+cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build,dev --prefix depth
+cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e dev --prefix depth
+cargo remote --no-copy-lock -- tree --workspace --target all -e normal,build,dev --prefix depth
 cargo remote --no-copy-lock -- build --release --locked -p <PACKAGE> --bin <BINARY>
 cargo remote --no-copy-lock -- bloat --release --locked -p <PACKAGE> --bin <BINARY> --crates -n 20
 ```
@@ -325,10 +327,10 @@ python3 scripts/dependency-reachability-audit.py check-public-evidence docs/audi
 python3 scripts/dependency-reachability-audit.py check-staged
 ```
 
-The committed compact graph bundle contains 20 files and 19,959 unique package/edge
+The committed compact graph bundle contains 20 files and 19,960 unique package/edge
 rows. A fresh regeneration from the retained raw Cargo trees is byte-identical, with
 bundle digest
-`0dc77be62ce50e759076465378d6af6f7fda0e8cac9e391b089f412b37d6f8c4`.
+`a5368ce919b08e3af2ca30f4a3c2e6c1695f9e439ac4790b5cb33bdaf4b520ae`.
 
 ## Separate Findings and Boundaries
 

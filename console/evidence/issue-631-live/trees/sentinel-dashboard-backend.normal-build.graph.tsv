@@ -213,7 +213,7 @@ package				rustls-webpki	0.103.13	registry	true	false	false
 package				rustversion	1.0.22	registry	false	true	false
 package				ryu	1.0.23	registry	true	false	false
 package				scopeguard	1.2.0	registry	true	false	false
-package				semver	1.0.27	registry	true	false	false
+package				semver	1.0.27	registry	true	true	false
 package				sentinel-common	0.1.0	workspace	true	false	false
 package				sentinel-console-plane	0.1.0	workspace	true	false	false
 package				sentinel-dashboard-backend	0.1.0	workspace	true	false	true

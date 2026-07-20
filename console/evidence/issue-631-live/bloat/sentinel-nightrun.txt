@@ -1,23 +1,23 @@
 File  .text     Size Crate
 12.9%  33.4%   1.4MiB [Unknown]
 4.6%  12.0% 513.8KiB redb
-3.7%   9.6% 411.0KiB std
-3.4%   8.7% 372.5KiB sentinel_nightrun
+3.7%   9.7% 413.1KiB std
+3.4%   8.8% 376.1KiB sentinel_nightrun
 2.8%   7.2% 310.3KiB clap_builder
 1.7%   4.4% 186.7KiB regex_syntax
-1.6%   4.1% 174.8KiB sentinel_common
+1.5%   3.9% 167.9KiB sentinel_common
 1.4%   3.6% 155.6KiB regex_automata
 1.2%   3.1% 132.6KiB tracing_subscriber
-0.9%   2.3%  98.4KiB libsqlite3_sys
-0.6%   1.7%  71.2KiB sentinel_hippocampus
-0.5%   1.3%  55.2KiB toml
-0.4%   1.1%  47.6KiB serde_json
+0.9%   2.3%  98.5KiB libsqlite3_sys
+0.6%   1.6%  69.2KiB sentinel_hippocampus
+0.5%   1.3%  54.8KiB toml
+0.4%   1.1%  47.7KiB serde_json
+0.4%   1.0%  42.8KiB sentinel_limbo
 0.4%   1.0%  42.2KiB toml_parser
-0.3%   0.9%  38.7KiB sentinel_limbo
+0.2%   0.4%  17.4KiB convert_case
 0.2%   0.4%  17.4KiB tracing_core
 0.2%   0.4%  16.7KiB sentinel_telemetry
-0.1%   0.4%  16.1KiB rusqlite
-0.1%   0.3%  15.0KiB toml_edit
-0.1%   0.3%  13.9KiB proc_macro2
-0.9%   2.4% 103.9KiB And 43 more crates. Use -n N to show more.
+0.1%   0.3%  14.5KiB rusqlite
+0.1%   0.3%  13.7KiB proc_macro2
+0.9%   2.4% 100.9KiB And 43 more crates. Use -n N to show more.
 38.6% 100.0%   4.2MiB .text section size, the file size is 10.8MiB

@@ -36,7 +36,7 @@ Commands, once per each of eight roots:
 
 ```bash
 cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal --prefix depth --no-dedupe
-cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,build --prefix depth
+cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,build --prefix depth --no-dedupe
 ```
 
 Output assertion:
@@ -49,18 +49,19 @@ roots_with_normal_build_tree=8/8
 Evidence: `trees/*.normal.graph.tsv`, `trees/*.normal-build.graph.tsv`, the four
 `trees/workspace-*.graph.tsv` source graphs, `workspace-reachability-sets.tsv`, and the
 artifact inventory in the canonical audit. The compact graph files contain each package
-and active parent/child edge once, with context and root flags; repeated path expansions
-from Cargo's `--no-dedupe` rendering remain internal. The classifier derives root
-membership only from these resolved Cargo graph sources; metadata does not activate
-optional dependencies.
+and active parent/child edge once, with context and root flags. Expanded per-root paths
+remain internal; workspace trees use Cargo's deduplicated graph rendering, which retains
+every direct active edge while suppressing repeated descendant subtrees. The classifier
+derives root membership only from these resolved Cargo graph sources; metadata does not
+activate optional dependencies.
 
 Workspace context commands:
 
 ```bash
-cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build --prefix depth --no-dedupe
-cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build,dev --prefix depth --no-dedupe
-cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e dev --prefix depth --no-dedupe
-cargo remote --no-copy-lock -- tree --workspace --target all -e normal,build,dev --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build --prefix depth
+cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build,dev --prefix depth
+cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e dev --prefix depth
+cargo remote --no-copy-lock -- tree --workspace --target all -e normal,build,dev --prefix depth
 ```
 
 The dev-only tree seeds dev context, which is expanded only across Cargo-active native
@@ -85,16 +86,17 @@ source_review_rows=30
 
 Evidence: `direct-release-features.tsv`, `feature-review.tsv`, and
 `trees/*.features.txt`.
-The feature trees use Cargo's deduplicated rendering so activated features remain visible
-without repeating identical transitive subtrees. The compact normal/build graph sources,
-derived from complete non-deduplicated raw trees, remain the classifier input.
+The feature and workspace trees use Cargo's deduplicated rendering so activated nodes
+and direct edges remain visible without repeating identical descendant subtrees. The
+per-root compact normal/build graph sources derive from complete non-deduplicated raw
+trees and remain the release-root classifier input.
 
 ### AC-4: Duplicate Forcing Chains
 
 Command:
 
 ```bash
-cargo remote --no-copy-lock -- tree --workspace --target all -e normal,build,dev --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree --workspace --target all -e normal,build,dev --prefix depth
 ```
 
 Output summary:
@@ -128,7 +130,7 @@ Output summary:
 ```text
 release_root_builds=8/8
 cargo_bloat_tables=8/8
-aggregate_release_artifact_bytes=99275536
+aggregate_release_artifact_bytes=99549056
 cargo_bloat=0.12.1
 ```
 
@@ -154,7 +156,7 @@ effect, and a revisit condition.
 Pinned values:
 
 ```text
-base_commit=94134b14c380e0cdc55c34222cd74698f97cf555
+base_commit=c64bb0ce3ee6d8b9b6b8ef6e19d0bc73fd59cea9
 cargo_lock_sha256=29b97c217ff9694e116e0e6ce856e5ab761b808d5b2289bd56cb255373e14b93
 target=x86_64-unknown-linux-gnu
 remote_rustc=1.97.1
@@ -183,9 +185,9 @@ diff -qr <FRESH_COMPACT_DIR> console/evidence/issue-631-live/trees \
 Output:
 
 ```text
-compact_graph_files=20 compact_graph_rows=19959
+compact_graph_files=20 compact_graph_rows=19960
 compact_source_diff=PASS
-compact_graph_bundle_sha256=0dc77be62ce50e759076465378d6af6f7fda0e8cac9e391b089f412b37d6f8c4
+compact_graph_bundle_sha256=a5368ce919b08e3af2ca30f4a3c2e6c1695f9e439ac4790b5cb33bdaf4b520ae
 ```
 
 ### AC-8: Pinned Before-Baseline
@@ -203,7 +205,7 @@ duplicate_version_rows=94
 reverse_closure_rows=8485
 release_root_builds=8/8
 cargo_bloat_tables=8/8
-aggregate_release_artifact_bytes=99275536
+aggregate_release_artifact_bytes=99549056
 ```
 
 Evidence: `reachability-summary.txt`, `direct-release-features.tsv`,
