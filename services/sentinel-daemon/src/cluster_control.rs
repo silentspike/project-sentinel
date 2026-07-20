@@ -287,7 +287,10 @@ impl ClusterControl {
                     Arc::clone(&membership),
                     BlockMapGossipHandler::new(
                         Arc::clone(&block_map),
-                        ChefAuthorizingHandler::new(chef_node_id, OwnerControlHandler::new(meta)),
+                        ChefAuthorizingHandler::new(
+                            chef_node_id,
+                            OwnerControlHandler::new(meta, local_node_id),
+                        ),
                     ),
                 )),
             )?,

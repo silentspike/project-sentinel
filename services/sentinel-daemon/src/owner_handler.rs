@@ -29,11 +29,12 @@ use tracing::{info, warn};
 /// in-memory working view is the process-global [`OwnerRegistry`].
 pub struct OwnerControlHandler {
     meta: Arc<ClusterMetaStore>,
+    this_node: NodeId,
 }
 
 impl OwnerControlHandler {
-    pub fn new(meta: Arc<ClusterMetaStore>) -> Self {
-        Self { meta }
+    pub fn new(meta: Arc<ClusterMetaStore>, this_node: NodeId) -> Self {
+        Self { meta, this_node }
     }
 
     /// Complete the target-local activation of an ownership-only handoff. The complete
@@ -130,29 +131,77 @@ impl OwnerControlHandler {
         scope_wire: &str,
         epoch: u64,
     ) -> Result<LocalOwnerState, ControlResponse> {
-        let Some(scope) = StateTransferScope::from_wire(scope_wire) else {
-            warn!(
-                scope = scope_wire,
-                "PrepareHandoff rejected: unrecognized scope"
-            );
-            return Err(ControlResponse::Rejected {
-                reason: format!("unrecognized scope {scope_wire:?}"),
-            });
-        };
-        let state = LocalOwnerState {
-            scope,
-            node_id: OwnerRegistry::global().this_node(),
-            epoch,
-            role: LocalOwnerRole::Retired,
-        };
-        if let Err(e) = self.meta.put_local_state(&state) {
-            warn!(error = %e, scope = scope_wire, "PrepareHandoff rejected: persist retirement failed");
-            return Err(ControlResponse::Rejected {
-                reason: format!("persist retirement failed: {e}"),
-            });
-        }
-        Ok(state)
+        persist_source_retirement(&self.meta, self.this_node, scope_wire, epoch).map_err(|reason| {
+            warn!(scope = scope_wire, %reason, "PrepareHandoff rejected: source authority mismatch");
+            ControlResponse::Rejected { reason }
+        })
     }
+}
+
+/// Validate and durably retire the source against the complete installed authority.
+/// The caller holds the owner tick barrier so validation and overlay persistence cannot
+/// race a local snapshot install. This is shared by inbound RPC and chef-local handoff.
+pub(crate) fn persist_source_retirement(
+    meta: &ClusterMetaStore,
+    this_node: NodeId,
+    scope_wire: &str,
+    epoch: u64,
+) -> Result<LocalOwnerState, String> {
+    let scope = StateTransferScope::from_wire(scope_wire)
+        .ok_or_else(|| format!("unrecognized scope {scope_wire:?}"))?;
+    let (global, local) = meta
+        .installed_owner_snapshot()
+        .map_err(|error| format!("owner snapshot readback failed: {error}"))?
+        .ok_or_else(|| "owner snapshot must be installed before PrepareHandoff".to_string())?;
+    let term = global
+        .sorted_terms
+        .iter()
+        .find(|candidate| candidate.scope == scope)
+        .ok_or_else(|| "handoff scope is absent from installed owner snapshot".to_string())?;
+    let local_state = local
+        .sorted_base_states
+        .iter()
+        .find(|candidate| candidate.scope == scope)
+        .ok_or_else(|| {
+            "recipient-local owner state is absent from installed snapshot".to_string()
+        })?;
+
+    if global.coordinator_generation != TRACK_A_COORDINATOR_GENERATION
+        || local.coordinator_generation != TRACK_A_COORDINATOR_GENERATION
+        || term.coordinator_generation != TRACK_A_COORDINATOR_GENERATION
+    {
+        return Err("PrepareHandoff coordinator generation mismatch".into());
+    }
+    if term.epoch != epoch {
+        return Err(format!(
+            "PrepareHandoff epoch mismatch: installed {}, requested {epoch}",
+            term.epoch
+        ));
+    }
+    if term.owner_node != this_node {
+        return Err(format!(
+            "PrepareHandoff source mismatch: installed owner {}, this node {this_node}",
+            term.owner_node
+        ));
+    }
+    if local.recipient_node != this_node
+        || local_state.recipient_node != this_node
+        || local_state.owner_term != *term
+        || local_state.base_role != LocalOwnerBaseRole::Owner
+        || local_state.activation_state != ActivationState::Routable
+    {
+        return Err("PrepareHandoff recipient-local state is not active owner authority".into());
+    }
+
+    let state = LocalOwnerState {
+        scope,
+        node_id: this_node,
+        epoch,
+        role: LocalOwnerRole::Retired,
+    };
+    meta.put_local_state(&state)
+        .map_err(|error| format!("persist retirement failed: {error}"))?;
+    Ok(state)
 }
 
 impl ControlHandler for OwnerControlHandler {
@@ -358,11 +407,59 @@ mod tests {
         (dir, store)
     }
 
+    fn install_authority(
+        store: &ClusterMetaStore,
+        recipient: NodeId,
+        owner: NodeId,
+        epoch: u64,
+        revision: u64,
+    ) {
+        let scope = StateTransferScope::NanoContainer("AGENT-07".into());
+        let term = OwnerTerm {
+            scope: scope.clone(),
+            owner_node: owner,
+            epoch,
+            coordinator_generation: TRACK_A_COORDINATOR_GENERATION,
+        };
+        let global = sentinel_common::OwnerTermSnapshot::new(
+            TRACK_A_COORDINATOR_GENERATION,
+            revision,
+            vec![term.clone()],
+        )
+        .unwrap();
+        let owns_scope = recipient == owner;
+        let local = sentinel_common::LocalOwnerStateSnapshot::new(
+            recipient,
+            TRACK_A_COORDINATOR_GENERATION,
+            revision,
+            vec![sentinel_common::LocalOwnerBaseState {
+                scope,
+                recipient_node: recipient,
+                owner_term: term,
+                base_role: if owns_scope {
+                    LocalOwnerBaseRole::Owner
+                } else {
+                    LocalOwnerBaseRole::Follower
+                },
+                activation_state: if owns_scope {
+                    ActivationState::Routable
+                } else {
+                    ActivationState::NotRoutable
+                },
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.install_owner_snapshot(&global, &local).unwrap(),
+            OwnerSnapshotInstallOutcome::Installed | OwnerSnapshotInstallOutcome::AlreadyInstalled
+        ));
+    }
+
     #[test]
     fn owner_commit_requires_preinstalled_full_snapshot_and_preserves_marker() {
         let (_dir, store) = store();
-        let handler = OwnerControlHandler::new(store.clone());
         let node = NodeId(uuid::Uuid::from_bytes([9u8; 16]));
+        let handler = OwnerControlHandler::new(store.clone(), node);
         let scope = StateTransferScope::NanoContainer("AGENT-07".into());
         let expected = OwnerTerm {
             scope: scope.clone(),
@@ -403,7 +500,7 @@ mod tests {
     #[test]
     fn owner_commit_rejects_malformed_scope_and_node() {
         let (_dir, store) = store();
-        let handler = OwnerControlHandler::new(store);
+        let handler = OwnerControlHandler::new(store, NodeId::new());
         // Unrecognized scope wire form.
         assert!(matches!(
             handler.persist_commit("agent:7", &uuid::Uuid::nil().to_string(), 1),
@@ -419,7 +516,9 @@ mod tests {
     #[test]
     fn prepare_handoff_persists_retirement_and_rejects_unknown() {
         let (_dir, store) = store();
-        let handler = OwnerControlHandler::new(store.clone());
+        let source = NodeId(uuid::Uuid::from_bytes([1u8; 16]));
+        let handler = OwnerControlHandler::new(store.clone(), source);
+        install_authority(&store, source, source, 3, 1);
 
         // persist_retirement is the durable path (no global-registry mutation in the test).
         let state = handler
@@ -454,6 +553,45 @@ mod tests {
                 block_ref: "cas-blob:v1:sha256:ab".into(),
                 referenced: false
             }
+        );
+    }
+
+    #[test]
+    fn prepare_handoff_rejects_wrong_epoch_without_retiring_source() {
+        let (_dir, store) = store();
+        let source = NodeId(uuid::Uuid::from_bytes([1u8; 16]));
+        let handler = OwnerControlHandler::new(store.clone(), source);
+        install_authority(&store, source, source, 3, 1);
+
+        let rejection = handler.persist_retirement("nano:AGENT-07", 2);
+        assert!(matches!(rejection, Err(ControlResponse::Rejected { .. })));
+        assert!(store
+            .get_local_state(&StateTransferScope::NanoContainer("AGENT-07".into()))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn prepare_handoff_replay_after_owner_change_is_rejected() {
+        let (_dir, store) = store();
+        let source = NodeId(uuid::Uuid::from_bytes([1u8; 16]));
+        let target = NodeId(uuid::Uuid::from_bytes([2u8; 16]));
+        let handler = OwnerControlHandler::new(store.clone(), source);
+        install_authority(&store, source, source, 3, 1);
+        handler
+            .persist_retirement("nano:AGENT-07", 3)
+            .expect("initial retirement should succeed");
+        install_authority(&store, source, target, 4, 2);
+
+        let rejection = handler.persist_retirement("nano:AGENT-07", 3);
+        assert!(matches!(rejection, Err(ControlResponse::Rejected { .. })));
+        assert_eq!(
+            store
+                .get_owner_term(&StateTransferScope::NanoContainer("AGENT-07".into()))
+                .unwrap()
+                .unwrap()
+                .owner_node,
+            target
         );
     }
 }
