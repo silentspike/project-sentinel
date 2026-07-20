@@ -858,6 +858,69 @@ fn rebuild_owner_registry_from_store(
     Ok(global)
 }
 
+async fn gate_seed_snapshot_replication<F, Fut>(snapshot_changed: bool, replicate: F) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    if snapshot_changed {
+        replicate().await
+    } else {
+        Ok(())
+    }
+}
+
+async fn run_owner_snapshot_reconciliation(
+    control: Arc<crate::cluster_control::ClusterControl>,
+    meta: Arc<sentinel_redb::ClusterMetaStore>,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let global = match meta.installed_owner_snapshot() {
+            Ok(Some((global, _))) => global,
+            Ok(None) => {
+                warn!("owner snapshot reconciliation skipped: install marker is absent");
+                continue;
+            }
+            Err(error) => {
+                warn!(%error, "owner snapshot reconciliation readback failed");
+                continue;
+            }
+        };
+        for (peer_node, peer_alias) in control.configured_peers() {
+            let local = match recipient_owner_snapshot(&global, peer_node) {
+                Ok(local) => local,
+                Err(error) => {
+                    warn!(peer = %peer_alias, %error, "owner snapshot reconciliation payload failed");
+                    continue;
+                }
+            };
+            match control
+                .replicate_owner_snapshot(&peer_alias, global.clone(), local)
+                .await
+            {
+                Ok(
+                    sentinel_common::OwnerSnapshotInstallOutcome::Installed
+                    | sentinel_common::OwnerSnapshotInstallOutcome::AlreadyInstalled,
+                ) => {}
+                Ok(outcome) => warn!(
+                    peer = %peer_alias,
+                    ?outcome,
+                    "owner snapshot reconciliation was refused"
+                ),
+                Err(error) => debug!(
+                    peer = %peer_alias,
+                    %error,
+                    "owner snapshot peer remains unavailable; will reconcile later"
+                ),
+            }
+        }
+    }
+}
+
 /// Startet den Daemon-Hauptloop.
 ///
 /// 1. Oeffnet EventStore + StateStore
@@ -891,6 +954,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     // authenticated full-snapshot install. Without [daemon.cluster], the established
     // lock-free single-node fast path remains unchanged.
     let mut bootstrap_global_snapshot = None;
+    let mut seed_snapshot_changed = false;
     let cluster_meta: Option<Arc<sentinel_redb::ClusterMetaStore>> = match config.cluster.as_ref() {
         Some(cluster) => {
             let initialized = sentinel_common::OwnerRegistry::init_cluster(cluster.node_id);
@@ -955,6 +1019,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                         "Cluster 12: deterministic seed owner snapshot installed"
                     );
                     bootstrap_global_snapshot = Some(installed);
+                    seed_snapshot_changed = true;
                 }
                 None | Some(_) => info!(
                     node_id = %cluster.node_id,
@@ -993,6 +1058,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                         "Cluster 12: boot-roster owner scopes materialized before runtime start"
                     );
                     bootstrap_global_snapshot = Some(installed);
+                    seed_snapshot_changed = true;
                 }
             }
             Some(meta)
@@ -1043,52 +1109,56 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             let global = bootstrap_global_snapshot
                 .as_ref()
                 .context("seed owner snapshot missing after local bootstrap")?;
-            for (peer_node, peer_alias) in control.configured_peers() {
-                let local = recipient_owner_snapshot(global, peer_node)?;
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-                loop {
-                    let result = tokio::time::timeout(
-                        Duration::from_secs(3),
-                        control.replicate_owner_snapshot(
-                            &peer_alias,
-                            global.clone(),
-                            local.clone(),
-                        ),
-                    )
-                    .await;
-                    match result {
-                        Ok(Ok(
-                            sentinel_common::OwnerSnapshotInstallOutcome::Installed
-                            | sentinel_common::OwnerSnapshotInstallOutcome::AlreadyInstalled,
-                        )) => {
-                            info!(
-                                peer = %peer_alias,
-                                recipient = %peer_node,
-                                revision = global.term_snapshot_revision,
-                                "Cluster 12: owner snapshot replicated before runtime start"
-                            );
-                            break;
+            gate_seed_snapshot_replication(seed_snapshot_changed, || async {
+                for (peer_node, peer_alias) in control.configured_peers() {
+                    let local = recipient_owner_snapshot(global, peer_node)?;
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+                    loop {
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            control.replicate_owner_snapshot(
+                                &peer_alias,
+                                global.clone(),
+                                local.clone(),
+                            ),
+                        )
+                        .await;
+                        match result {
+                            Ok(Ok(
+                                sentinel_common::OwnerSnapshotInstallOutcome::Installed
+                                | sentinel_common::OwnerSnapshotInstallOutcome::AlreadyInstalled,
+                            )) => {
+                                info!(
+                                    peer = %peer_alias,
+                                    recipient = %peer_node,
+                                    revision = global.term_snapshot_revision,
+                                    "Cluster 12: owner snapshot replicated before runtime start"
+                                );
+                                break;
+                            }
+                            Ok(Ok(outcome)) => anyhow::bail!(
+                                "peer {peer_alias} refused owner snapshot with {outcome:?}"
+                            ),
+                            Ok(Err(error)) if tokio::time::Instant::now() < deadline => {
+                                warn!(peer = %peer_alias, %error, "owner snapshot replication retry");
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                            }
+                            Err(_) if tokio::time::Instant::now() < deadline => {
+                                warn!(peer = %peer_alias, "owner snapshot replication timed out; retrying");
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                            }
+                            Ok(Err(error)) => return Err(error).context(format!(
+                                "replicate owner snapshot to {peer_alias} before runtime start"
+                            )),
+                            Err(_) => anyhow::bail!(
+                                "replicate owner snapshot to {peer_alias} timed out before runtime start"
+                            ),
                         }
-                        Ok(Ok(outcome)) => anyhow::bail!(
-                            "peer {peer_alias} refused owner snapshot with {outcome:?}"
-                        ),
-                        Ok(Err(error)) if tokio::time::Instant::now() < deadline => {
-                            warn!(peer = %peer_alias, %error, "owner snapshot replication retry");
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                        }
-                        Err(_) if tokio::time::Instant::now() < deadline => {
-                            warn!(peer = %peer_alias, "owner snapshot replication timed out; retrying");
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                        }
-                        Ok(Err(error)) => return Err(error).context(format!(
-                            "replicate owner snapshot to {peer_alias} before runtime start"
-                        )),
-                        Err(_) => anyhow::bail!(
-                            "replicate owner snapshot to {peer_alias} timed out before runtime start"
-                        ),
                     }
                 }
-            }
+                Ok(())
+            })
+            .await?;
         } else if !sentinel_common::OwnerRegistry::global().owner_readiness() {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             while !sentinel_common::OwnerRegistry::global().owner_readiness()
@@ -1486,6 +1556,24 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             }
         }
         _ => drop(provision_rx),
+    }
+
+    // A seed restart from an unchanged valid marker never blocks on peer reachability.
+    // Reconcile the durable full snapshot in the background so a first-boot/offline
+    // member remains fail-closed and receives authority when it later becomes reachable.
+    if let (Some(control), Some(meta), Some(cluster)) = (
+        cluster_control.as_ref(),
+        cluster_meta.as_ref(),
+        config.cluster.as_ref(),
+    ) {
+        if cluster.seed {
+            tokio::spawn(run_owner_snapshot_reconciliation(
+                Arc::clone(control),
+                Arc::clone(meta),
+                Duration::from_secs(15),
+            ));
+            info!("Cluster 12: owner snapshot background reconciliation started");
+        }
     }
 
     // -- #498 CAS block-map gossip republish (Cluster 12): only when the control stream
@@ -7307,6 +7395,19 @@ mod tests {
     use std::sync::Arc;
 
     static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[tokio::test]
+    async fn seed_valid_marker_restart_does_not_gate_on_unreachable_member() {
+        let calls = AtomicUsize::new(0);
+        let result = gate_seed_snapshot_replication(false, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("member unreachable")
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 
     fn snap_meta(id: &str, tick: u64, last_event_id: i64) -> sentinel_common::SnapshotMeta {
         sentinel_common::SnapshotMeta {

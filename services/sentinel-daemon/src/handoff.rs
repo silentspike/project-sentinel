@@ -37,6 +37,11 @@ use crate::cluster_control::ClusterControl;
 
 /// The #569 control-RPC seam the saga drives.
 pub trait HandoffTransport: Send + Sync {
+    /// Resolve the configured alias for one durable node identity. The saga uses this
+    /// to bind an operator-supplied source alias to the authoritative owner term before
+    /// any participant mutation is attempted.
+    fn alias_for_node(&self, node: NodeId) -> Result<String>;
+
     /// Send `PrepareHandoff(scope, epoch)` to the **source** (current owner) and return
     /// only once it has **durably retired** the scope (V1 — the durable SourceRetiredAck).
     /// An `Err` means the source is unreachable or refused: the saga aborts (V2 — no
@@ -126,6 +131,14 @@ pub fn run_handoff(
 ) -> Result<HandoffOutcome> {
     let scope_wire = req.scope.to_wire();
     let current = registry.current_owner(&req.scope)?;
+    let source_alias = transport.alias_for_node(current.owner_node)?;
+    if req.source_alias != source_alias {
+        anyhow::bail!(
+            "source alias {:?} does not match authoritative owner {} ({source_alias:?}) for {scope_wire}",
+            req.source_alias,
+            current.owner_node
+        );
+    }
     let source_epoch = current.epoch;
     let new_epoch = source_epoch
         .checked_add(1)
@@ -133,9 +146,9 @@ pub fn run_handoff(
 
     // (V1, step 1) Ask the source to durably retire the scope at its current epoch. This
     // returns only after the durable SourceRetiredAck; an error => abort (V2).
-    if let Err(e) = transport.prepare_handoff(&req.source_alias, &scope_wire, source_epoch) {
+    if let Err(e) = transport.prepare_handoff(&source_alias, &scope_wire, source_epoch) {
         warn!(
-            scope = %scope_wire, source = %req.source_alias, error = %e,
+            scope = %scope_wire, source = %source_alias, error = %e,
             "Handoff aborted: source unreachable/refused — no ownership steal (V2)"
         );
         return Ok(HandoffOutcome::AbortedSourceUnreachable);
@@ -186,14 +199,14 @@ pub fn run_handoff(
 
     if current.owner_node != registry.this_node() && current.owner_node != req.target_node {
         let source_local = local_snapshot_for(&global, current.owner_node)?;
-        transport.replicate_owner_snapshot(&req.source_alias, &global, &source_local)?;
+        transport.replicate_owner_snapshot(&source_alias, &global, &source_local)?;
     }
     let target_local = local_snapshot_for(&global, req.target_node)?;
     transport.replicate_owner_snapshot(&req.target_alias, &global, &target_local)?;
     transport.owner_commit(&req.target_alias, &scope_wire, req.target_node, new_epoch)?;
 
     info!(
-        scope = %scope_wire, source = %req.source_alias, target = %req.target_alias,
+        scope = %scope_wire, source = %source_alias, target = %req.target_alias,
         new_epoch, "Handoff committed: ownership moved to target (V1)"
     );
     Ok(HandoffOutcome::Committed { new_epoch })
@@ -242,20 +255,29 @@ impl RpcHandoffTransport {
 }
 
 impl HandoffTransport for RpcHandoffTransport {
+    fn alias_for_node(&self, node: NodeId) -> Result<String> {
+        if node == OwnerRegistry::global().this_node() {
+            return Ok(self.my_alias.clone());
+        }
+        self.cluster_control
+            .configured_peers()
+            .into_iter()
+            .find_map(|(peer_node, alias)| (peer_node == node).then_some(alias))
+            .with_context(|| format!("no cert-pinned control alias for owner node {node}"))
+    }
+
     fn prepare_handoff(&self, source_alias: &str, scope_wire: &str, epoch: u64) -> Result<()> {
         if source_alias == self.my_alias {
             // This node is the source: retire locally (durable + in-memory), no RPC.
-            let scope = StateTransferScope::from_wire(scope_wire)
-                .ok_or_else(|| anyhow!("unrecognized scope {scope_wire}"))?;
             let _tick_barrier = sentinel_common::owner_tick_barrier();
-            let state = sentinel_common::LocalOwnerState {
-                scope: scope.clone(),
-                node_id: OwnerRegistry::global().this_node(),
+            let state = crate::owner_handler::persist_source_retirement(
+                &self.meta,
+                OwnerRegistry::global().this_node(),
+                scope_wire,
                 epoch,
-                role: sentinel_common::LocalOwnerRole::Retired,
-            };
-            self.meta.put_local_state(&state)?;
-            OwnerRegistry::global().retire_local(scope, epoch);
+            )
+            .map_err(|reason| anyhow!(reason))?;
+            OwnerRegistry::global().retire_local(state.scope, epoch);
             return Ok(());
         }
         match self.peer_rpc(
@@ -405,6 +427,16 @@ mod tests {
     }
 
     impl HandoffTransport for FakeCluster<'_> {
+        fn alias_for_node(&self, owner: NodeId) -> Result<String> {
+            if owner == self.source.this_node() {
+                Ok("node-1".into())
+            } else if owner == self.target.this_node() {
+                Ok("node-2".into())
+            } else {
+                anyhow::bail!("unknown fake node {owner}")
+            }
+        }
+
         fn prepare_handoff(&self, _src: &str, scope_wire: &str, epoch: u64) -> Result<()> {
             if self.fail_prepare {
                 return Err(anyhow!("source unreachable"));
@@ -587,6 +619,48 @@ mod tests {
         );
         assert_eq!(
             target_meta
+                .get_owner_term(&scope)
+                .unwrap()
+                .unwrap()
+                .owner_node,
+            node(1)
+        );
+    }
+
+    #[test]
+    fn handoff_rejects_source_alias_that_does_not_match_authoritative_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = OwnerRegistry::new_cluster_for_test(node(1));
+        let seed_meta = store(dir.path(), "seed.redb");
+        let target = OwnerRegistry::new_cluster_for_test(node(2));
+        let target_meta = store(dir.path(), "target.redb");
+        let scope = StateTransferScope::NanoContainer("AGENT-07".into());
+        install_initial(&seed, &seed_meta, node(1), scope.clone());
+        install_initial(&target, &target_meta, node(1), scope.clone());
+        let source_guard = seed.issue(scope.clone()).unwrap();
+        let fake = FakeCluster {
+            source: &seed,
+            source_meta: &seed_meta,
+            target: &target,
+            target_meta: &target_meta,
+            fail_prepare: false,
+            log: Mutex::new(Vec::new()),
+        };
+        let req = HandoffRequest {
+            scope: scope.clone(),
+            source_alias: "node-2".into(),
+            target_alias: "node-2".into(),
+            target_node: node(2),
+        };
+
+        let error = run_handoff(&seed, &seed_meta, &fake, &req).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match authoritative owner"));
+        assert!(fake.log.lock().unwrap().is_empty());
+        assert!(seed.validate(&source_guard).is_ok());
+        assert_eq!(
+            seed_meta
                 .get_owner_term(&scope)
                 .unwrap()
                 .unwrap()
