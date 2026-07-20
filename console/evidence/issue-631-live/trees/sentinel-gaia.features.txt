@@ -1,4 +1,4 @@
-0sentinel-gaia v0.1.0 (<REMOTE_PROJECT>/services/sentinel-gaia)
+0sentinel-gaia v0.1.0 (<REMOTE_TARGET>)
 1anyhow feature "default"
 2anyhow v1.0.103
 2anyhow feature "std"
@@ -112,7 +112,7 @@
 1clap feature "derive"
 2clap v4.5.60 (*)
 1sentinel-common feature "default"
-2sentinel-common v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-common)
+2sentinel-common v0.1.0 (<REMOTE_TARGET>)
 3anyhow feature "default" (*)
 3bevy_ecs feature "default"
 4bevy_ecs v0.18.1
@@ -478,6 +478,36 @@
 6memchr v2.8.0
 6memchr feature "alloc"
 7memchr v2.8.0
+3sha2 feature "default"
+4sha2 v0.10.9
+5cfg-if feature "default" (*)
+5cpufeatures feature "default" (*)
+5digest feature "default"
+6digest v0.10.7
+7block-buffer feature "default"
+8block-buffer v0.10.4
+9generic-array feature "default"
+10generic-array v0.14.7
+11typenum feature "default"
+12typenum v1.19.0
+7crypto-common feature "default"
+8crypto-common v0.1.7
+9generic-array feature "default" (*)
+9generic-array feature "more_lengths"
+10generic-array v0.14.7 (*)
+9typenum feature "default" (*)
+6digest feature "core-api"
+7digest v0.10.7 (*)
+7digest feature "block-buffer"
+8digest v0.10.7 (*)
+4sha2 feature "std"
+5sha2 v0.10.9 (*)
+5digest feature "std"
+6digest v0.10.7 (*)
+6digest feature "alloc"
+7digest v0.10.7 (*)
+6crypto-common feature "std"
+7crypto-common v0.1.7 (*)
 3toml feature "default"
 4toml v1.0.6+spec-1.1.0
 5winnow v0.7.14

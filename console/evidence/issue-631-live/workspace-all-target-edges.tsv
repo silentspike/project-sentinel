@@ -1206,6 +1206,7 @@ sentinel-common	0.1.0	bincode	2.0.1	normal:all	true
 sentinel-common	0.1.0	flatbuffers	25.12.19	normal:all	true
 sentinel-common	0.1.0	serde	1.0.228	normal:all	true
 sentinel-common	0.1.0	serde_json	1.0.149	normal:all	true
+sentinel-common	0.1.0	sha2	0.10.9	normal:all	true
 sentinel-common	0.1.0	tempfile	3.27.0	dev:all	true
 sentinel-common	0.1.0	thiserror	2.0.18	normal:all	true
 sentinel-common	0.1.0	toml	1.0.6+spec-1.1.0	normal:all	true
@@ -1451,8 +1452,10 @@ sentinel-redb	0.1.0	sentinel-common	0.1.0	normal:all	true
 sentinel-redb	0.1.0	sentinel-telemetry	0.1.0	normal:all	true
 sentinel-redb	0.1.0	serde	1.0.228	normal:all	true
 sentinel-redb	0.1.0	serde_json	1.0.149	normal:all	true
+sentinel-redb	0.1.0	sha2	0.10.9	dev:all	true
 sentinel-redb	0.1.0	tempfile	3.27.0	dev:all	true
 sentinel-redb	0.1.0	tracing	0.1.44	normal:all	true
+sentinel-redb	0.1.0	uuid	1.22.0	dev:all	true
 sentinel-runtime	0.1.0	anyhow	1.0.103	normal:all	true
 sentinel-runtime	0.1.0	bevy_ecs	0.18.1	normal:all	true
 sentinel-runtime	0.1.0	criterion	0.8.2	dev:all	true

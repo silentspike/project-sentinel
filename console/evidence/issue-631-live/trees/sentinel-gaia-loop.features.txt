@@ -1,4 +1,4 @@
-0sentinel-gaia-loop v0.1.0 (<REMOTE_PROJECT>/services/sentinel-gaia-loop)
+0sentinel-gaia-loop v0.1.0 (<REMOTE_TARGET>)
 1anyhow feature "default"
 2anyhow v1.0.103
 2anyhow feature "std"
@@ -1095,10 +1095,11 @@
 4futures-task feature "std" (*)
 2futures feature "std" (*)
 1sentinel-common feature "default"
-2sentinel-common v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-common)
+2sentinel-common v0.1.0 (<REMOTE_TARGET>)
 3anyhow feature "default" (*)
 3serde feature "default" (*)
 3serde feature "derive" (*)
+3sha2 feature "default" (*)
 3serde_json feature "default" (*)
 3tracing feature "default" (*)
 3bevy_ecs feature "default"
@@ -1488,7 +1489,7 @@
 1uuid feature "v4" (*)
 1uuid feature "v7" (*)
 1sentinel-limbo feature "default"
-2sentinel-limbo v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-limbo)
+2sentinel-limbo v0.1.0 (<REMOTE_TARGET>)
 3anyhow feature "default" (*)
 3serde feature "default" (*)
 3serde feature "derive" (*)
@@ -1539,7 +1540,7 @@
 5rusqlite feature "hashlink"
 6rusqlite v0.38.0 (*)
 3sentinel-telemetry feature "default"
-4sentinel-telemetry v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-telemetry)
+4sentinel-telemetry v0.1.0 (<REMOTE_TARGET>)
 5serde feature "default" (*)
 5serde feature "derive" (*)
 5serde_json feature "default" (*)
@@ -1634,9 +1635,9 @@
 6tracing-subscriber feature "tracing-serde"
 7tracing-subscriber v0.3.22 (*)
 4sentinel-telemetry feature "telemetry"
-5sentinel-telemetry v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-telemetry) (*)
+5sentinel-telemetry v0.1.0 (<REMOTE_TARGET>) (*)
 2sentinel-limbo feature "telemetry"
-3sentinel-limbo v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-limbo) (*)
+3sentinel-limbo v0.1.0 (<REMOTE_TARGET>) (*)
 3sentinel-telemetry feature "telemetry" (*)
 1tracing-subscriber feature "default" (*)
 1tracing-subscriber feature "env-filter" (*)

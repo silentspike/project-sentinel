@@ -6,10 +6,8 @@ deployment, manifest, lockfile, or dependency change was made.
 
 ## Scope and Status
 
-The graph, source-audit, root-artifact, cargo-bloat, and clean-target workspace release
-build ACs are complete. Three successful runs used separate empty issue-specific remote
-project/target directories while retaining registry, source, and toolchain caches. The
-included runs observed no concurrent foreign Cargo/rustc process group.
+The graph, source-audit, root-artifact, cargo-bloat, and structural baseline ACs are
+complete. Build-server timing and performance data are excluded.
 
 ## AC Mapping
 
@@ -27,7 +25,7 @@ python3 scripts/dependency-reachability-audit.py audit --check \
 Output:
 
 ```text
-coverage=717/717 unclassified=0 roots=8/8 duplicate_versions=94 closure_rows=8425 evidence_match=PASS
+coverage=717/717 unclassified=0 roots=8/8 duplicate_versions=94 closure_rows=8485 evidence_match=PASS
 ```
 
 Evidence: `reachability.tsv`, `reachability-summary.txt`.
@@ -37,8 +35,8 @@ Evidence: `reachability.tsv`, `reachability-summary.txt`.
 Commands, once per each of eight roots:
 
 ```bash
-cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal --prefix depth --no-dedupe
-cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,build --prefix depth
+cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,build --prefix depth
 ```
 
 Output assertion:
@@ -56,10 +54,10 @@ does not activate optional dependencies.
 Workspace context commands:
 
 ```bash
-cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build --prefix depth --no-dedupe
-cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build,dev --prefix depth --no-dedupe
-cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu -e dev --prefix depth --no-dedupe
-cargo remote -c -- tree --workspace --target all -e normal,build,dev --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build,dev --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e dev --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree --workspace --target all -e normal,build,dev --prefix depth --no-dedupe
 ```
 
 The dev-only tree seeds dev context, which is expanded only across Cargo-active native
@@ -71,7 +69,7 @@ whose target specification is absent from the native metadata resolution.
 Command, once per root:
 
 ```bash
-cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,features --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,features --prefix depth
 ```
 
 Output assertion:
@@ -84,13 +82,16 @@ source_review_rows=30
 
 Evidence: `direct-release-features.tsv`, `feature-review.tsv`, and
 `trees/*.features.txt`.
+The feature trees use Cargo's deduplicated rendering so activated features remain visible
+without repeating identical transitive subtrees. The non-deduplicated normal trees remain
+the classifier input.
 
 ### AC-4: Duplicate Forcing Chains
 
 Command:
 
 ```bash
-cargo remote -c -- tree --workspace --target all -e normal,build,dev --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree --workspace --target all -e normal,build,dev --prefix depth --no-dedupe
 ```
 
 Output summary:
@@ -100,7 +101,7 @@ duplicate_names=41
 duplicate_version_rows=94
 active_tree_closures=85
 disabled_metadata_closures=9
-reverse_closure_rows=8425
+reverse_closure_rows=8485
 ```
 
 Evidence: `duplicate-versions.tsv`, `workspace-all-target-edges.tsv`, and the complete
@@ -109,7 +110,28 @@ its dependency kind/target constraint and an explicit Cargo-active boolean. Disa
 optional versions use a separately labelled metadata-constraint closure and are never
 reported as active reachability.
 
-### AC-5: Recommendations
+### AC-5: Binary and Crate Contributions
+
+Command, once per root:
+
+```bash
+cargo remote --no-copy-lock -- build --release --locked -p <PACKAGE> --bin <BINARY>
+cargo remote --no-copy-lock -- bloat --release --locked -p <PACKAGE> --bin <BINARY> --crates -n 20
+```
+
+Output summary:
+
+```text
+release_root_builds=8/8
+cargo_bloat_tables=8/8
+aggregate_release_artifact_bytes=99275536
+cargo_bloat=0.12.1
+```
+
+Status: binary contribution **COMPLETE**. Evidence: `release-builds.tsv`,
+`bloat-summary.tsv`, and `bloat/*.txt`.
+
+### AC-6: Actionable Recommendations
 
 Output summary:
 
@@ -123,80 +145,45 @@ investigate=2
 Evidence: `recommendations.tsv`. Rows include stable IDs, source/tree evidence, expected
 effect, and a revisit condition.
 
-### AC-6: Binary Contributions and Structural Build Cost
-
-Command, once per root:
-
-```bash
-cargo remote -c -- build --release --locked -p <PACKAGE> --bin <BINARY>
-cargo remote -c -- bloat --release --locked -p <PACKAGE> --bin <BINARY> --crates -n 20
-```
-
-Output summary:
-
-```text
-release_root_builds=8/8
-cargo_bloat_tables=8/8
-aggregate_release_artifact_bytes=98740464
-cargo_bloat=0.12.1
-shared_target_build_timing=CONTENDED, excluded from baseline
-```
-
-Status: binary contribution **COMPLETE**. Evidence: `release-builds.tsv`,
-`bloat-summary.tsv`, and `bloat/*.txt`. The clean-target builds are reported under AC-8.
-
 ### AC-7: Reproducibility
 
 Pinned values:
 
 ```text
-base_commit=f622885d7137b8cb334adf655d42749c5aa1d881
-cargo_lock_sha256=9ea96b715b709d43b9b90352968c06998111476a0ebb546254db0f43e4034b22
+base_commit=94134b14c380e0cdc55c34222cd74698f97cf555
+cargo_lock_sha256=29b97c217ff9694e116e0e6ce856e5ab761b808d5b2289bd56cb255373e14b93
 target=x86_64-unknown-linux-gnu
 remote_rustc=1.97.1
 remote_cargo=1.97.1
 ```
 
 Evidence: `provenance.txt` and the canonical audit.
+The graph regeneration base and the verified zero manifest/lockfile delta through the
+pinned base are recorded separately; source-dependent daemon and dashboard contribution
+rows were refreshed on the pinned base.
 
 ### AC-8: Pinned Before-Baseline
 
-Status: **COMPLETE**. Graph counts, binary contribution, three uncontended clean-target
-build-cost values, and medians are pinned:
+Status: **COMPLETE**. Hardware-independent graph and contribution metrics are pinned:
 
 ```text
-run  cargo_finished  cargo_remote_e2e  overlap_markers
-C05  7m 18s         466.91s           0
-C06  7m 17s         459.00s           0
-C07  7m 17s         458.55s           0
-median 7m 17s       459.00s
+lockfile_packages=717
+release_normal=485
+release_build=90
+direct_feature_rows=115
+source_review_rows=30
+duplicate_names=41
+duplicate_version_rows=94
+reverse_closure_rows=8485
+release_root_builds=8/8
+cargo_bloat_tables=8/8
+aggregate_release_artifact_bytes=99275536
 ```
 
-Each included run acquired an issue-local remote lease, passed an idle preflight, used
-a new empty remote project/target directory, and sampled remote Cargo/rustc process
-groups every five seconds. Registry, source, and toolchain caches were retained, so
-these are clean-target release builds, not cache-purged builds. Cargo's own duration and
-the cargo-remote end-to-end wall time are deliberately separate.
-
-Two attempted clean-target runs are retained in `clean-builds.tsv` as
-`CONTENDED_ABORTED`. C01 observed 26 foreign-wrapper markers across 48 five-second
-samples; C02 observed 12 across 34. Neither produced a Cargo `Finished in` value and
-neither is eligible for a median.
-
-C03 is retained as `UNCLASSIFIED_OVERLAP_ABORTED`: a short-lived foreign local wrapper
-produced seven markers across 68 samples, but ended before its remote load could be
-classified. Subsequent runs classify competing Cargo/rustc process groups directly on
-the buildserver so a local wrapper without remote Rust load cannot create a false
-positive.
-
-C04 is retained as `MONITOR_RACE_ABORTED`: one process exited between `pgrep` and the
-PGID/CWD readback, leaving an empty process record. Later runs ignore vanished PIDs and
-accept an overlap marker only when a non-empty foreign process-group ID is still
-readable.
-
-The excluded attempts are evidence of the fail-closed load gate and do not contribute
-to either median. `clean-builds.tsv` contains all seven attempts, sample counts, overlap
-markers, inclusion decisions, and the median row.
+Evidence: `reachability-summary.txt`, `direct-release-features.tsv`,
+`feature-review.tsv`, `duplicate-versions.tsv`, `duplicates/reverse-closure.tsv`,
+`release-builds.tsv`, and `bloat-summary.tsv`. No build-server timing or performance
+result is retained.
 
 ### AC-9: Public Evidence Sanitization
 
@@ -214,7 +201,7 @@ Final output:
 ```text
 Ran 21 tests
 OK
-public-evidence-scan=PASS files=47
+public-evidence-scan=PASS files=46
 staged-new-lines-scan=PASS
 ```
 
@@ -229,19 +216,22 @@ omitted from these public command renderings.
 Commands:
 
 ```bash
-cargo remote -c -- check --workspace --all-targets --locked
-cargo remote -c -- test --workspace --locked
-cargo remote -c -- clippy --workspace --all-targets --locked -- -D warnings
+cargo remote --no-copy-lock -- check --workspace --all-targets --locked
+cargo remote --no-copy-lock -- test --workspace --locked
+cargo remote --no-copy-lock -- clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-Output excerpts:
+Output assertions:
 
 ```text
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 19s
-Finished `test` profile [unoptimized + debuginfo] target(s) in 8m 01s
-test result: ok. 321 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 36.62s
+remote_check=PASS
+remote_test=PASS
+remote_clippy=PASS
 ```
+
+The first workspace-test invocation hit a pre-existing wall-clock assertion in the Gaia
+Loop timeout test. The isolated test rerun and the complete workspace rerun both passed;
+no timing value from either invocation is retained as audit evidence.
 
 ## Not Tested
 

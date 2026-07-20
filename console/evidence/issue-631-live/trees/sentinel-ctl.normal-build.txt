@@ -1,4 +1,4 @@
-0sentinel-ctl v0.1.0 (<HOME>/remote-builds/2910130700751017293/services/sentinel-ctl)
+0sentinel-ctl v0.1.0 (<REMOTE_TARGET>)
 1anyhow v1.0.103
 1clap v4.5.60
 2clap_builder v4.5.60

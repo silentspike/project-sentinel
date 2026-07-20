@@ -1,4 +1,4 @@
-0sentinel-daemon v0.1.0 (<HOME>/remote-builds/2910130700751017293/services/sentinel-daemon)
+0sentinel-daemon v0.1.0 (<REMOTE_TARGET>)
 1anyhow v1.0.103
 1async-nats v0.47.0
 2base64 v0.22.1
@@ -550,7 +550,7 @@
 2tower-service v0.3.3
 2url v2.5.8 (*)
 2webpki-roots v1.0.6 (*)
-1sentinel-cluster-control v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-cluster-control)
+1sentinel-cluster-control v0.1.0 (<REMOTE_TARGET>)
 2anyhow v1.0.103
 2quinn v0.11.9
 3bytes v1.11.1 (*)
@@ -605,7 +605,7 @@
 3yasna v0.5.2
 4time v0.3.47 (*)
 2rustls v0.23.37 (*)
-2sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common)
+2sentinel-common v0.1.0 (<REMOTE_TARGET>)
 3anyhow v1.0.103
 3bevy_ecs v0.18.1 (*)
 3bincode v2.0.1 (*)
@@ -614,6 +614,7 @@
 4rustc_version v0.4.1 (*)
 3serde v1.0.228 (*)
 3serde_json v1.0.149 (*)
+3sha2 v0.10.9 (*)
 3thiserror v2.0.18 (*)
 3toml v1.0.6+spec-1.1.0
 4serde_core v1.0.228
@@ -639,8 +640,8 @@
 2tokio v1.52.3 (*)
 2tracing v0.1.44 (*)
 2uuid v1.22.0 (*)
-1sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
-1sentinel-ebpf v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-ebpf)
+1sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
+1sentinel-ebpf v0.1.0 (<REMOTE_TARGET>)
 2anyhow v1.0.103
 2aya v0.13.2 (https://github.com/aya-rs/aya#b93ee8c2)
 3assert_matches v1.5.0
@@ -682,7 +683,7 @@
 3thiserror v2.0.18 (*)
 2libc v0.2.186
 2object v0.38.1 (*)
-2sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
+2sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
 2serde v1.0.228 (*)
 2serde_json v1.0.149 (*)
 2thiserror v2.0.18 (*)
@@ -711,13 +712,13 @@
 3tracing-serde v0.2.0
 4serde v1.0.228 (*)
 4tracing-core v0.1.36 (*)
-1sentinel-ecs v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-ecs)
+1sentinel-ecs v0.1.0 (<REMOTE_TARGET>)
 2bevy_ecs v0.18.1 (*)
 2bincode v2.0.1 (*)
-2sentinel-bio v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-bio)
-3sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
-2sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
-2sentinel-limbo v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-limbo)
+2sentinel-bio v0.1.0 (<REMOTE_TARGET>)
+3sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
+2sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
+2sentinel-limbo v0.1.0 (<REMOTE_TARGET>)
 3anyhow v1.0.103
 3rusqlite v0.38.0
 4bitflags v2.11.0 (*)
@@ -730,9 +731,9 @@
 5pkg-config v0.3.32
 5vcpkg v0.2.15
 4smallvec v1.15.1 (*)
-3sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
-3sentinel-telemetry v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-telemetry)
-4sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
+3sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
+3sentinel-telemetry v0.1.0 (<REMOTE_TARGET>)
+4sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
 4serde v1.0.228 (*)
 4serde_json v1.0.149 (*)
 4tracing v0.1.44 (*)
@@ -743,19 +744,19 @@
 3tokio v1.52.3 (*)
 3tracing v0.1.44 (*)
 3uuid v1.22.0 (*)
-2sentinel-physics v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-physics)
-3sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
-2sentinel-redb v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-redb)
+2sentinel-physics v0.1.0 (<REMOTE_TARGET>)
+3sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
+2sentinel-redb v0.1.0 (<REMOTE_TARGET>)
 3anyhow v1.0.103
 3redb v3.1.1
-3sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
-3sentinel-telemetry v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-telemetry) (*)
+3sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
+3sentinel-telemetry v0.1.0 (<REMOTE_TARGET>) (*)
 3serde v1.0.228 (*)
 3serde_json v1.0.149 (*)
 3tracing v0.1.44 (*)
-2sentinel-wasm v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-wasm)
+2sentinel-wasm v0.1.0 (<REMOTE_TARGET>)
 3anyhow v1.0.103
-3sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
+3sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
 3serde v1.0.228 (*)
 3serde_json v1.0.149 (*)
 3tracing v0.1.44 (*)
@@ -1189,7 +1190,7 @@
 2tokio v1.52.3 (*)
 2tracing v0.1.44 (*)
 2uuid v1.22.0 (*)
-1sentinel-fs v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-fs)
+1sentinel-fs v0.1.0 (<REMOTE_TARGET>)
 2anyhow v1.0.103
 2bincode v2.0.1 (*)
 2blake3 v1.8.3
@@ -1227,45 +1228,45 @@
 2rayon v1.11.0 (*)
 2redb v3.1.1
 2rustix v1.1.4 (*)
-2sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
-2sentinel-telemetry v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-telemetry) (*)
+2sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
+2sentinel-telemetry v0.1.0 (<REMOTE_TARGET>) (*)
 2serde v1.0.228 (*)
 2serde_json v1.0.149 (*)
 2sha2 v0.10.9 (*)
 2tracing v0.1.44 (*)
 2uuid v1.22.0 (*)
 2zstd v0.13.3 (*)
-1sentinel-hippocampus v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-hippocampus)
+1sentinel-hippocampus v0.1.0 (<REMOTE_TARGET>)
 2anyhow v1.0.103
 2redb v3.1.1
-2sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
+2sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
 2serde v1.0.228 (*)
 2serde_json v1.0.149 (*)
 2thiserror v2.0.18 (*)
-1sentinel-limbo v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-limbo) (*)
-1sentinel-projection v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-projection)
+1sentinel-limbo v0.1.0 (<REMOTE_TARGET>) (*)
+1sentinel-projection v0.1.0 (<REMOTE_TARGET>)
 2anyhow v1.0.103
 2rusqlite v0.38.0 (*)
-2sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
-2sentinel-limbo v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-limbo) (*)
-2sentinel-physics v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-physics) (*)
-2sentinel-telemetry v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-telemetry) (*)
+2sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
+2sentinel-limbo v0.1.0 (<REMOTE_TARGET>) (*)
+2sentinel-physics v0.1.0 (<REMOTE_TARGET>) (*)
+2sentinel-telemetry v0.1.0 (<REMOTE_TARGET>) (*)
 2serde v1.0.228 (*)
 2serde_json v1.0.149 (*)
 2tracing v0.1.44 (*)
 2uuid v1.22.0 (*)
-1sentinel-redb v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-redb) (*)
-1sentinel-runtime v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-runtime)
+1sentinel-redb v0.1.0 (<REMOTE_TARGET>) (*)
+1sentinel-runtime v0.1.0 (<REMOTE_TARGET>)
 2anyhow v1.0.103
 2bevy_ecs v0.18.1 (*)
-2sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
-2sentinel-ecs v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-ecs) (*)
-2sentinel-limbo v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-limbo) (*)
+2sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
+2sentinel-ecs v0.1.0 (<REMOTE_TARGET>) (*)
+2sentinel-limbo v0.1.0 (<REMOTE_TARGET>) (*)
 2serde v1.0.228 (*)
 2serde_json v1.0.149 (*)
 2tracing v0.1.44 (*)
 2uuid v1.22.0 (*)
-1sentinel-sandbox v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-sandbox)
+1sentinel-sandbox v0.1.0 (<REMOTE_TARGET>)
 2anyhow v1.0.103
 2landlock v0.4.4
 3enumflags2 v0.7.12
@@ -1276,13 +1277,13 @@
 3libc v0.2.186
 3thiserror v2.0.18 (*)
 2libc v0.2.186
-2sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
-2sentinel-fs v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-fs) (*)
-2sentinel-zenoh v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-zenoh)
+2sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
+2sentinel-fs v0.1.0 (<REMOTE_TARGET>) (*)
+2sentinel-zenoh v0.1.0 (<REMOTE_TARGET>)
 3anyhow v1.0.103
 3flatbuffers v25.12.19 (*)
-3sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
-3sentinel-telemetry v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-telemetry) (*)
+3sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
+3sentinel-telemetry v0.1.0 (<REMOTE_TARGET>) (*)
 3serde v1.0.228 (*)
 3serde_json v1.0.149 (*)
 3tokio v1.52.3 (*)
@@ -1895,9 +1896,9 @@
 2serde_json v1.0.149 (*)
 2tokio v1.52.3 (*)
 2tracing v0.1.44 (*)
-1sentinel-telemetry v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-telemetry) (*)
-1sentinel-wasm v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-wasm) (*)
-1sentinel-zenoh v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-zenoh) (*)
+1sentinel-telemetry v0.1.0 (<REMOTE_TARGET>) (*)
+1sentinel-wasm v0.1.0 (<REMOTE_TARGET>) (*)
+1sentinel-zenoh v0.1.0 (<REMOTE_TARGET>) (*)
 1serde v1.0.228 (*)
 1serde_json v1.0.149 (*)
 1sha2 v0.10.9 (*)

@@ -1,4 +1,4 @@
-0sentinel-nightrun v0.1.0 (<REMOTE_PROJECT>/services/sentinel-nightrun)
+0sentinel-nightrun v0.1.0 (<REMOTE_TARGET>)
 1anyhow feature "default"
 2anyhow v1.0.103
 2anyhow feature "std"
@@ -144,7 +144,7 @@
 3rusqlite feature "hashlink"
 4rusqlite v0.38.0 (*)
 1sentinel-common feature "default"
-2sentinel-common v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-common)
+2sentinel-common v0.1.0 (<REMOTE_TARGET>)
 3anyhow feature "default" (*)
 3bevy_ecs feature "default"
 4bevy_ecs v0.18.1
@@ -508,6 +508,37 @@
 6memchr v2.8.0
 6memchr feature "alloc"
 7memchr v2.8.0
+3sha2 feature "default"
+4sha2 v0.10.9
+5cfg-if feature "default" (*)
+5cpufeatures feature "default"
+6cpufeatures v0.2.17
+5digest feature "default"
+6digest v0.10.7
+7block-buffer feature "default"
+8block-buffer v0.10.4
+9generic-array feature "default"
+10generic-array v0.14.7
+11typenum feature "default"
+12typenum v1.19.0
+7crypto-common feature "default"
+8crypto-common v0.1.7
+9generic-array feature "default" (*)
+9generic-array feature "more_lengths"
+10generic-array v0.14.7 (*)
+9typenum feature "default" (*)
+6digest feature "core-api"
+7digest v0.10.7 (*)
+7digest feature "block-buffer"
+8digest v0.10.7 (*)
+4sha2 feature "std"
+5sha2 v0.10.9 (*)
+5digest feature "std"
+6digest v0.10.7 (*)
+6digest feature "alloc"
+7digest v0.10.7 (*)
+6crypto-common feature "std"
+7crypto-common v0.1.7 (*)
 3toml feature "default"
 4toml v1.0.6+spec-1.1.0
 5winnow v0.7.14
@@ -606,6 +637,7 @@
 1serde feature "default" (*)
 1serde feature "derive" (*)
 1serde_json feature "default" (*)
+1sha2 feature "default" (*)
 1toml feature "default" (*)
 1tracing feature "default" (*)
 1uuid feature "default" (*)
@@ -613,7 +645,7 @@
 1uuid feature "v4" (*)
 1uuid feature "v7" (*)
 1sentinel-hippocampus feature "default"
-2sentinel-hippocampus v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-hippocampus)
+2sentinel-hippocampus v0.1.0 (<REMOTE_TARGET>)
 3anyhow feature "default" (*)
 3sentinel-common feature "default" (*)
 3serde feature "default" (*)
@@ -623,7 +655,7 @@
 3redb feature "default"
 4redb v3.1.1
 1sentinel-limbo feature "default"
-2sentinel-limbo v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-limbo)
+2sentinel-limbo v0.1.0 (<REMOTE_TARGET>)
 3anyhow feature "default" (*)
 3rusqlite feature "bundled" (*)
 3rusqlite feature "default" (*)
@@ -637,7 +669,7 @@
 3uuid feature "v4" (*)
 3uuid feature "v7" (*)
 3sentinel-telemetry feature "default"
-4sentinel-telemetry v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-telemetry)
+4sentinel-telemetry v0.1.0 (<REMOTE_TARGET>)
 5sentinel-common feature "default" (*)
 5serde feature "default" (*)
 5serde feature "derive" (*)
@@ -743,7 +775,7 @@
 6tracing-subscriber feature "tracing-serde"
 7tracing-subscriber v0.3.22 (*)
 4sentinel-telemetry feature "telemetry"
-5sentinel-telemetry v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-telemetry) (*)
+5sentinel-telemetry v0.1.0 (<REMOTE_TARGET>) (*)
 3tokio feature "default"
 4tokio v1.52.3
 5mio v1.2.1
@@ -845,7 +877,7 @@
 4tokio feature "time"
 5tokio v1.52.3 (*)
 2sentinel-limbo feature "telemetry"
-3sentinel-limbo v0.1.0 (<REMOTE_PROJECT>/crates/sentinel-limbo) (*)
+3sentinel-limbo v0.1.0 (<REMOTE_TARGET>) (*)
 3sentinel-telemetry feature "telemetry" (*)
 1sentinel-telemetry feature "default" (*)
 1tracing-subscriber feature "default" (*)
@@ -854,34 +886,3 @@
 1tracing-subscriber feature "json" (*)
 1tokio feature "default" (*)
 1tokio feature "full" (*)
-1sha2 feature "default"
-2sha2 v0.10.9
-3cfg-if feature "default" (*)
-3cpufeatures feature "default"
-4cpufeatures v0.2.17
-3digest feature "default"
-4digest v0.10.7
-5block-buffer feature "default"
-6block-buffer v0.10.4
-7generic-array feature "default"
-8generic-array v0.14.7
-9typenum feature "default"
-10typenum v1.19.0
-5crypto-common feature "default"
-6crypto-common v0.1.7
-7generic-array feature "default" (*)
-7generic-array feature "more_lengths"
-8generic-array v0.14.7 (*)
-7typenum feature "default" (*)
-4digest feature "core-api"
-5digest v0.10.7 (*)
-5digest feature "block-buffer"
-6digest v0.10.7 (*)
-2sha2 feature "std"
-3sha2 v0.10.9 (*)
-3digest feature "std"
-4digest v0.10.7 (*)
-4digest feature "alloc"
-5digest v0.10.7 (*)
-4crypto-common feature "std"
-5crypto-common v0.1.7 (*)

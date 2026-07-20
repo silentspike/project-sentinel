@@ -1,4 +1,4 @@
-0sentinel-ctl v0.1.0 (<REMOTE_PROJECT>/services/sentinel-ctl)
+0sentinel-ctl v0.1.0 (<REMOTE_TARGET>)
 1anyhow feature "default"
 2anyhow v1.0.103
 2anyhow feature "std"

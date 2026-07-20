@@ -1,6 +1,8 @@
 issue=631
-base_commit=f622885d7137b8cb334adf655d42749c5aa1d881
-cargo_lock_sha256=9ea96b715b709d43b9b90352968c06998111476a0ebb546254db0f43e4034b22
+base_commit=94134b14c380e0cdc55c34222cd74698f97cf555
+graph_regeneration_base=7b24caeb9dd7d687018f35f0aa96a478d533b2b3
+post_regeneration_manifest_lock_delta=none
+cargo_lock_sha256=29b97c217ff9694e116e0e6ce856e5ab761b808d5b2289bd56cb255373e14b93
 target=x86_64-unknown-linux-gnu
 workspace_members=27
 lockfile_packages=717
@@ -9,7 +11,7 @@ remote_rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)
 remote_cargo=cargo 1.97.1 (c980f4866 2026-06-30)
 cargo_bloat=0.12.1
 cargo_bloat_binary_sha256=6b9cf542f54ab97d0f3301584adef105302f7af794cc8332958f16404d4d8f55
-issue_body_sha256=e4ebf88ab67ae88cd5532c0c4aa1aff5d82209d21a227aca0c89978ec05cdff3
+issue_body_sha256=3e07c00d5d2a48d129c9aa5785e6e3ae8868b945af758586efea806e22852f89
 issue_labels=prio:medium,quality:ready,scope:full,size:M,status:ready,type:deps
 pr_611_state=OPEN
 pr_611_scope=Cargo.lock only
@@ -18,27 +20,27 @@ vm_access=none
 manifest_lockfile_mutation=none
 
 [remote-cargo-commands]
-cargo remote -c -- --version
-cargo remote -c -- metadata --locked --format-version 1
-cargo remote -c -- metadata --locked --format-version 1 --filter-platform x86_64-unknown-linux-gnu
-cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal --prefix depth --no-dedupe
-cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,build --prefix depth
-cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,features --prefix depth --no-dedupe
-cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build --prefix depth --no-dedupe
-cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build,dev --prefix depth --no-dedupe
-cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu -e dev --prefix depth --no-dedupe
-cargo remote -c -- tree --workspace --target all -e normal,build,dev --prefix depth --no-dedupe
-cargo remote -c -- build --release --locked -p <PACKAGE> --bin <BINARY>
-cargo remote -c -- bloat --version
-cargo remote -c -- bloat --release --locked -p <PACKAGE> --bin <BINARY> --crates -n 20
-cargo remote -c -- check --workspace --all-targets --locked
-cargo remote -c -- test --workspace --locked
-cargo remote -c -- clippy --workspace --all-targets --locked -- -D warnings
+cargo remote --no-copy-lock -- --version
+cargo remote --no-copy-lock -- metadata --locked --format-version 1
+cargo remote --no-copy-lock -- metadata --locked --format-version 1 --filter-platform x86_64-unknown-linux-gnu
+cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,build --prefix depth
+cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,features --prefix depth
+cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build,dev --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e dev --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree --workspace --target all -e normal,build,dev --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- build --release --locked -p <PACKAGE> --bin <BINARY>
+cargo remote --no-copy-lock -- bloat --version
+cargo remote --no-copy-lock -- bloat --release --locked -p <PACKAGE> --bin <BINARY> --crates -n 20
+cargo remote --no-copy-lock -- check --workspace --all-targets --locked
+cargo remote --no-copy-lock -- test --workspace --locked
+cargo remote --no-copy-lock -- clippy --workspace --all-targets --locked -- -D warnings
 
 [completion]
-binary_builds=8/8 complete; timing status CONTENDED
+binary_builds=8/8 complete; bytes and sha256 recorded
 cargo_bloat_tables=8/8 complete
-clean_target_workspace_builds=3/3 complete
-clean_target_cargo_median=7m 17s
-clean_target_e2e_median_seconds=459.00
-clean_target_overlap_markers=0 across included runs
+structural_packages=717/717 classified
+structural_features=115 direct rows; 30 source-reviewed rows
+structural_duplicates=41 names; 94 versions; 8485 closure rows
+build_server_performance_data=excluded

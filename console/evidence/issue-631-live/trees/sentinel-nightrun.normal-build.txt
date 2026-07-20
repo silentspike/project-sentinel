@@ -1,4 +1,4 @@
-0sentinel-nightrun v0.1.0 (<HOME>/remote-builds/2910130700751017293/services/sentinel-nightrun)
+0sentinel-nightrun v0.1.0 (<REMOTE_TARGET>)
 1anyhow v1.0.103
 1clap v4.5.60
 2clap_builder v4.5.60
@@ -40,7 +40,7 @@
 3pkg-config v0.3.32
 3vcpkg v0.2.15
 2smallvec v1.15.1
-1sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common)
+1sentinel-common v0.1.0 (<REMOTE_TARGET>)
 2anyhow v1.0.103
 2bevy_ecs v0.18.1
 3bevy_ecs_macros v0.18.0 (proc-macro)
@@ -167,6 +167,17 @@
 3memchr v2.8.0
 3serde_core v1.0.228
 3zmij v1.0.21
+2sha2 v0.10.9
+3cfg-if v1.0.4
+3cpufeatures v0.2.17
+3digest v0.10.7
+4block-buffer v0.10.4
+5generic-array v0.14.7
+6typenum v1.19.0
+6version_check v0.9.5
+4crypto-common v0.1.7
+5generic-array v0.14.7 (*)
+5typenum v1.19.0
 2thiserror v2.0.18 (*)
 2toml v1.0.6+spec-1.1.0
 3serde_core v1.0.228
@@ -191,19 +202,19 @@
 4cfg-if v1.0.4
 4libc v0.2.186
 3serde_core v1.0.228
-1sentinel-hippocampus v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-hippocampus)
+1sentinel-hippocampus v0.1.0 (<REMOTE_TARGET>)
 2anyhow v1.0.103
 2redb v3.1.1
-2sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
+2sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
 2serde v1.0.228 (*)
 2serde_json v1.0.149 (*)
 2thiserror v2.0.18 (*)
-1sentinel-limbo v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-limbo)
+1sentinel-limbo v0.1.0 (<REMOTE_TARGET>)
 2anyhow v1.0.103
 2rusqlite v0.38.0 (*)
-2sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
-2sentinel-telemetry v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-telemetry)
-3sentinel-common v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-common) (*)
+2sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
+2sentinel-telemetry v0.1.0 (<REMOTE_TARGET>)
+3sentinel-common v0.1.0 (<REMOTE_TARGET>) (*)
 3serde v1.0.228 (*)
 3serde_json v1.0.149 (*)
 3tracing v0.1.44 (*)
@@ -257,20 +268,10 @@
 4syn v2.0.117 (*)
 2tracing v0.1.44 (*)
 2uuid v1.22.0 (*)
-1sentinel-telemetry v0.1.0 (<HOME>/remote-builds/2910130700751017293/crates/sentinel-telemetry) (*)
+1sentinel-telemetry v0.1.0 (<REMOTE_TARGET>) (*)
 1serde v1.0.228 (*)
 1serde_json v1.0.149 (*)
-1sha2 v0.10.9
-2cfg-if v1.0.4
-2cpufeatures v0.2.17
-2digest v0.10.7
-3block-buffer v0.10.4
-4generic-array v0.14.7
-5typenum v1.19.0
-5version_check v0.9.5
-3crypto-common v0.1.7
-4generic-array v0.14.7 (*)
-4typenum v1.19.0
+1sha2 v0.10.9 (*)
 1tokio v1.52.3 (*)
 1toml v1.0.6+spec-1.1.0 (*)
 1tracing v0.1.44 (*)
