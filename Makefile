@@ -1,6 +1,6 @@
 .PHONY: help lint lint-all test build build-rust build-go build-console \
        fmt check clean hooks ci deny coverage typos doc machete safe-merge \
-       manifest preflight smoke-test deploy fuzz verify snapshot-test snapshot-review
+       manifest preflight smoke-test deploy provision-projection fuzz verify snapshot-test snapshot-review
 
 # Default target
 help: ## Show this help
@@ -207,6 +207,9 @@ preflight: ## Verify manifest hashes against VM (usage: make preflight [SSH=ubun
 
 smoke-test: ## Post-deploy smoke test (usage: make smoke-test [SSH=ubuntu@<deploy-vm>])
 	bash deploy/smoke-test.sh "$(SSH)"
+
+provision-projection: ## Install canonical projection artifacts without starting services
+	bash deploy/provision-projection.sh "$(SSH)"
 
 deploy: preflight ## Deploy to VM: preflight + sync + smoke (usage: make deploy [SSH=ubuntu@<deploy-vm>])
 	@echo ""
