@@ -8,6 +8,8 @@ StartLimitIntervalSec=300
 
 [Service]
 Type=simple
+User=root
+Group=root
 WorkingDirectory=/opt/sentinel
 ExecStart=/opt/sentinel/bin/sentinel-projection \
   --event-store /opt/sentinel/data/events.db \
