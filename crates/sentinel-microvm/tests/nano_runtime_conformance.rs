@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use sentinel_common::nano_runtime::conformance::assert_nano_runtime_conformance;
+use sentinel_common::nano_runtime::conformance::{
+    assert_nano_runtime_conformance, assert_nano_runtime_stop_isolation,
+};
 use sentinel_common::nano_runtime::{NanoRuntime, NanoWorkloadSpec, RUNTIME_MICROVM};
 use sentinel_common::AgentId;
 use sentinel_microvm::MicrovmNanoRuntime;
@@ -29,6 +31,20 @@ fn workload_spec() -> NanoWorkloadSpec {
 fn microvm_runtime_satisfies_nano_runtime_conformance() {
     let mut runtime = MicrovmNanoRuntime::detect();
     assert_nano_runtime_conformance(&mut runtime, workload_spec());
+}
+
+#[test]
+#[ignore = "benoetigt KVM + Gast-Kernel/rootfs (Deploy-VM)"]
+fn microvm_stop_is_idempotent_and_workload_scoped() {
+    let mut runtime = MicrovmNanoRuntime::detect();
+    let workload_a = workload_spec();
+    let workload_b = NanoWorkloadSpec {
+        workload_id: "microvm-stop-b".to_string(),
+        agent_id: Some(AgentId(2)),
+        agent_name: "Conformance microVM B".to_string(),
+        ..workload_a.clone()
+    };
+    assert_nano_runtime_stop_isolation(&mut runtime, workload_a, workload_b);
 }
 
 /// KVM-freier Pfad (#417 AC-4): ohne `/dev/kvm` muss `spawn` mit einem sauberen, KVM-benennenden

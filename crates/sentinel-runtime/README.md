@@ -12,7 +12,8 @@
 - Event emission uses `sentinel-limbo` so lifecycle changes remain replayable.
 - `EcsNativeRuntime` implements the shared `NanoRuntime` contract for the
   `ecs-native` runtime key. It maps `snapshot`/`restore` to the ECS world
-  snapshot codec and uses the shared conformance harness as its contract test.
+  snapshot codec, stops individual workloads idempotently in both runtime and
+  ECS state, and uses the shared conformance harness as its contract test.
 
 ## Dependencies
 
