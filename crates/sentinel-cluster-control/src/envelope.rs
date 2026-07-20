@@ -5,7 +5,10 @@
 //! The receiver binds `idempotency_key` to authenticated peer, RPC method, and
 //! request digest for process-local duplicate suppression (V5/V39).
 
-use sentinel_common::{Heartbeat, HolderAdvertisement, NodeId};
+use sentinel_common::{
+    Heartbeat, HolderAdvertisement, LocalOwnerStateSnapshot, NodeId, OwnerSnapshotInstallOutcome,
+    OwnerTermSnapshot,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -58,6 +61,12 @@ pub enum ControlRequest {
         owner_node: String,
         epoch: u64,
     },
+    /// #615: install one complete chef authority snapshot plus the authenticated
+    /// recipient's complete local base-state snapshot.
+    ReplicateOwnerSnapshot {
+        global: OwnerTermSnapshot,
+        local: LocalOwnerStateSnapshot,
+    },
     /// V8/G7: does any node still reference this block? (GC liveness query)
     RefQuery { block_ref: String },
     /// V20: does any node pin this block? (GC pin query)
@@ -78,6 +87,7 @@ impl ControlRequest {
             Self::MembershipHeartbeat { .. } => "membership_heartbeat",
             Self::SourceRetiredAck { .. } => "source_retired_ack",
             Self::OwnerCommit { .. } => "owner_commit",
+            Self::ReplicateOwnerSnapshot { .. } => "replicate_owner_snapshot",
             Self::RefQuery { .. } => "ref_query",
             Self::PinQuery { .. } => "pin_query",
             Self::AdvertiseHolders { .. } => "advertise_holders",
@@ -101,7 +111,10 @@ impl ControlRequest {
     pub fn requires_chef_authorization(&self) -> bool {
         matches!(
             self,
-            Self::PrepareHandoff { .. } | Self::SourceRetiredAck { .. } | Self::OwnerCommit { .. }
+            Self::PrepareHandoff { .. }
+                | Self::SourceRetiredAck { .. }
+                | Self::OwnerCommit { .. }
+                | Self::ReplicateOwnerSnapshot { .. }
         )
     }
 }
@@ -132,6 +145,9 @@ pub enum ControlResponse {
     OwnerCommitted {
         scope: String,
         epoch: u64,
+    },
+    OwnerSnapshotAck {
+        outcome: OwnerSnapshotInstallOutcome,
     },
     RefQueryResult {
         block_ref: String,
@@ -236,6 +252,33 @@ mod tests {
         let frame = encode_frame(&reply).unwrap();
         let back: ControlReply = decode_frame(&frame).unwrap();
         assert_eq!(reply, back);
+    }
+
+    #[test]
+    fn owner_snapshot_outcomes_roundtrip_without_losing_typed_detail() {
+        let outcomes = [
+            OwnerSnapshotInstallOutcome::Installed,
+            OwnerSnapshotInstallOutcome::AlreadyInstalled,
+            OwnerSnapshotInstallOutcome::StaleSnapshot {
+                installed_revision: 8,
+                received_revision: 7,
+            },
+            OwnerSnapshotInstallOutcome::GenerationMismatch {
+                installed_generation: 1,
+                received_generation: 2,
+            },
+            OwnerSnapshotInstallOutcome::SnapshotConflict,
+        ];
+        for outcome in outcomes {
+            let reply = ControlReply {
+                request_id: Uuid::new_v4(),
+                response: ControlResponse::OwnerSnapshotAck {
+                    outcome: outcome.clone(),
+                },
+            };
+            let decoded: ControlReply = decode_frame(&encode_frame(&reply).unwrap()).unwrap();
+            assert_eq!(decoded, reply);
+        }
     }
 
     #[test]

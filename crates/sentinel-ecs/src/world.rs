@@ -1270,6 +1270,34 @@ pub fn spawn_agent(
     shift_set: u8,
     room_id: &str,
 ) -> Entity {
+    spawn_agent_inner(world, agent_id, name, role, shift_set, room_id, true, false)
+}
+
+/// Materialize a prepared migration target without publishing an `AgentSpawned`
+/// event. Every simulation system observes the `Frozen` marker, so the entity is
+/// present for deterministic residency reconciliation but cannot tick or emit work.
+pub fn spawn_prepared_agent(
+    world: &mut World,
+    agent_id: AgentId,
+    name: &str,
+    role: &str,
+    shift_set: u8,
+    room_id: &str,
+) -> Entity {
+    spawn_agent_inner(world, agent_id, name, role, shift_set, room_id, false, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_agent_inner(
+    world: &mut World,
+    agent_id: AgentId,
+    name: &str,
+    role: &str,
+    shift_set: u8,
+    room_id: &str,
+    emit_spawn_event: bool,
+    frozen: bool,
+) -> Entity {
     let (shift_start, shift_end) = match shift_set {
         1 => (6, 14),  // Fruehschicht
         2 => (14, 22), // Mittelschicht
@@ -1354,27 +1382,33 @@ pub fn spawn_agent(
         ))
         .id();
 
+    if frozen {
+        world.entity_mut(entity).insert(Frozen);
+    }
+
     // AgentSpawned Event erzeugen (damit Dashboard/Projection Agent kennt)
-    let tick = world
-        .get_resource::<SimulationTime>()
-        .map(|t| t.tick.0)
-        .unwrap_or(0);
-    let payload = DomainEventPayload::AgentSpawned {
-        agent_id,
-        name: name.to_string(),
-        role: role.to_string(),
-        shift_set,
-        room_id: room_id.to_string(),
-    };
-    let event = DomainEvent::new(
-        payload.event_type_str(),
-        &agent_id.to_string(),
-        &payload.to_json(),
-        &uuid::Uuid::new_v4().to_string(),
-        tick,
-    );
-    if let Some(mut event_buffer) = world.get_resource_mut::<EventBuffer>() {
-        event_buffer.events.push(event);
+    if emit_spawn_event {
+        let tick = world
+            .get_resource::<SimulationTime>()
+            .map(|t| t.tick.0)
+            .unwrap_or(0);
+        let payload = DomainEventPayload::AgentSpawned {
+            agent_id,
+            name: name.to_string(),
+            role: role.to_string(),
+            shift_set,
+            room_id: room_id.to_string(),
+        };
+        let event = DomainEvent::new(
+            payload.event_type_str(),
+            &agent_id.to_string(),
+            &payload.to_json(),
+            &uuid::Uuid::new_v4().to_string(),
+            tick,
+        );
+        if let Some(mut event_buffer) = world.get_resource_mut::<EventBuffer>() {
+            event_buffer.events.push(event);
+        }
     }
 
     entity
@@ -1776,8 +1810,10 @@ pub fn fenced_per_container_snapshot(
     // In single-node mode issue()/validate() is a no-op pass (0 StaleEpoch).
     let scope = StateTransferScope::for_agent(agent_id.to_string());
     let reg = OwnerRegistry::global();
-    let _guard = reg.issue(scope.clone());
-    let owner_epoch = reg.current_owner(&scope).epoch;
+    let guard = reg
+        .issue(scope)
+        .map_err(|_| sentinel_common::NotMigratableReason::OwnerFenceRejected)?;
+    let owner_epoch = guard.epoch();
 
     let tick = world
         .get_resource::<SimulationTime>()
@@ -2063,6 +2099,16 @@ mod room_physics_workspace_tests {
 
         assert_eq!(workspace.len(), 1);
         assert_eq!(workspace.room_stats(0), ("empfang", 2, true));
+    }
+
+    #[test]
+    fn prepared_target_is_present_frozen_without_spawn_event() {
+        let (mut world, _) = create_simulation_world();
+        let entity =
+            spawn_prepared_agent(&mut world, AgentId(7), "Prepared", "Tester", 1, "empfang");
+
+        assert!(world.get::<Frozen>(entity).is_some());
+        assert!(world.resource::<EventBuffer>().events.is_empty());
     }
 }
 
