@@ -65,6 +65,8 @@ def fixture():
     non_release = package("internal-only")
     foreign = package("windows-only")
     optional = package("disabled-optional")
+    split_one = package("split-dep", "1.0.0")
+    split_two = package("split-dep", "2.0.0")
 
     roots[0]["dependencies"] = [
         {
@@ -73,19 +75,41 @@ def fixture():
             "kind": "normal",
             "uses_default_features": True,
             "features": ["tls"],
-        }
+        },
+        {
+            "name": optional["name"],
+            "rename": None,
+            "kind": "normal",
+            "optional": True,
+            "uses_default_features": True,
+            "features": [],
+        },
     ]
 
-    native_packages = roots + [other_root, normal, build, build_child, proc_macro, dev, non_release]
+    native_packages = roots + [
+        other_root,
+        normal,
+        build,
+        build_child,
+        proc_macro,
+        dev,
+        non_release,
+        optional,
+        split_one,
+        split_two,
+    ]
     all_packages = native_packages + [foreign]
     root_zero_deps = [
         dependency(normal),
         dependency(build, "build"),
         dependency(proc_macro),
         dependency(dev, "dev"),
+        dependency(optional),
+        dependency(split_one),
     ]
     native_nodes = [node(roots[0], root_zero_deps)]
-    native_nodes.extend(node(root) for root in roots[1:])
+    native_nodes.append(node(roots[1], [dependency(split_two)]))
+    native_nodes.extend(node(root) for root in roots[2:])
     native_nodes.extend(
         [
             node(other_root, [dependency(non_release)]),
@@ -95,6 +119,9 @@ def fixture():
             node(proc_macro),
             node(dev),
             node(non_release),
+            node(optional),
+            node(split_one),
+            node(split_two),
         ]
     )
     all_nodes = [dict(item) for item in native_nodes]
@@ -113,7 +140,7 @@ def fixture():
         "resolve": {"nodes": all_nodes},
     }
     lock_packages = []
-    for item in all_packages + [optional]:
+    for item in all_packages:
         lock_packages.append(
             {
                 "name": item["name"],
@@ -124,13 +151,105 @@ def fixture():
     return {"package": lock_packages}, metadata_all, metadata_native
 
 
+def prepared_audit():
+    lock, metadata_all, metadata_native = fixture()
+    result = audit_module.ReachabilityAudit(lock, metadata_all, metadata_native)
+    key = result.keys_by_name_version
+    roots = result.root_keys
+
+    normal = key[("normal-dep", "1.0.0")]
+    build = key[("build-dep", "1.0.0")]
+    build_child = key[("build-child", "1.0.0")]
+    proc_macro = key[("derive-dep", "1.0.0")]
+    dev = key[("dev-dep", "1.0.0")]
+    non_release = key[("internal-only", "1.0.0")]
+    foreign = key[("windows-only", "1.0.0")]
+    optional = key[("disabled-optional", "1.0.0")]
+    split_one = key[("split-dep", "1.0.0")]
+    split_two = key[("split-dep", "2.0.0")]
+    other_root = key[("internal-tool", "0.1.0")]
+
+    for root_name, root_key in roots.items():
+        normal_graph = audit_module.TreeGraph(
+            packages={root_key}, normal_context={root_key}, roots={root_key}
+        )
+        combined_graph = audit_module.TreeGraph(
+            packages={root_key}, normal_context={root_key}, roots={root_key}
+        )
+        if root_name == ROOTS[0]:
+            normal_graph.packages |= {normal, proc_macro, split_one}
+            normal_graph.normal_context |= {normal, split_one}
+            normal_graph.build_context.add(proc_macro)
+            normal_graph.edges |= {
+                (root_key, normal),
+                (root_key, proc_macro),
+                (root_key, split_one),
+            }
+            combined_graph.packages |= {
+                normal,
+                proc_macro,
+                split_one,
+                build,
+                build_child,
+            }
+            combined_graph.normal_context |= {normal, split_one, build, build_child}
+            combined_graph.build_context.add(proc_macro)
+            combined_graph.edges |= normal_graph.edges | {
+                (root_key, build),
+                (build, build_child),
+            }
+        elif root_name == ROOTS[1]:
+            normal_graph.packages.add(split_two)
+            normal_graph.normal_context.add(split_two)
+            normal_graph.edges.add((root_key, split_two))
+            combined_graph.packages.add(split_two)
+            combined_graph.normal_context.add(split_two)
+            combined_graph.edges.add((root_key, split_two))
+        result.root_normal_graphs[root_name] = normal_graph
+        result.root_combined_graphs[root_name] = combined_graph
+
+    native_build = (
+        set(roots.values())
+        | {other_root, normal, build, build_child, proc_macro, non_release, split_one, split_two}
+    )
+    native_all = native_build | {dev}
+    all_targets = native_all | {foreign}
+    result.set_workspace_sets(
+        native_build,
+        native_all,
+        all_targets,
+        {dev, normal},
+        {foreign, normal},
+    )
+    active_edges = {
+        (roots[ROOTS[0]], normal),
+        (roots[ROOTS[0]], build),
+        (roots[ROOTS[0]], proc_macro),
+        (roots[ROOTS[0]], dev),
+        (roots[ROOTS[0]], foreign),
+        (roots[ROOTS[0]], split_one),
+        (roots[ROOTS[1]], split_two),
+        (build, build_child),
+        (other_root, non_release),
+    }
+    result.set_all_target_edges(
+        audit_module.TreeGraph(
+            packages=all_targets,
+            edges=active_edges,
+            roots=set(roots.values()) | {other_root},
+        )
+    )
+    return result, optional
+
+
 class ReachabilityTests(unittest.TestCase):
     def test_primary_categories_and_proc_macro_context(self):
-        lock, metadata_all, metadata_native = fixture()
-        result = audit_module.ReachabilityAudit(lock, metadata_all, metadata_native)
+        result, _ = prepared_audit()
         rows = {row["name"]: row for row in result.classify()}
 
         self.assertEqual(rows["normal-dep"]["primary_reachability"], "release-normal")
+        self.assertEqual(rows["normal-dep"]["also_dev"], "true")
+        self.assertEqual(rows["normal-dep"]["also_foreign_target"], "true")
         self.assertEqual(rows["build-dep"]["primary_reachability"], "release-build")
         self.assertEqual(rows["build-child"]["primary_reachability"], "release-build")
         self.assertEqual(rows["derive-dep"]["primary_reachability"], "release-build")
@@ -145,8 +264,7 @@ class ReachabilityTests(unittest.TestCase):
         )
 
     def test_direct_feature_origin(self):
-        lock, metadata_all, metadata_native = fixture()
-        result = audit_module.ReachabilityAudit(lock, metadata_all, metadata_native)
+        result, _ = prepared_audit()
         result.classify()
         rows = result.direct_feature_rows()
 
@@ -156,21 +274,92 @@ class ReachabilityTests(unittest.TestCase):
         self.assertEqual(row["release_features"], "")
         self.assertEqual(row["default_features"], "true")
         self.assertEqual(row["manifest"], "services/sentinel-daemon/Cargo.toml")
+        self.assertNotIn("disabled-optional", {item["dependency"] for item in rows})
 
-    def test_unreachable_metadata_package_fails_closed(self):
-        lock, metadata_all, metadata_native = fixture()
-        orphan = package("orphan")
-        metadata_all["packages"].append(orphan)
-        metadata_all["resolve"]["nodes"].append(node(orphan))
-        metadata_native["packages"].append(orphan)
-        metadata_native["resolve"]["nodes"].append(node(orphan))
-        lock["package"].append(
-            {"name": orphan["name"], "version": orphan["version"], "source": orphan["source"]}
+    def test_optional_metadata_edge_absent_from_cargo_tree_is_disabled(self):
+        result, optional = prepared_audit()
+        rows = {(row["name"], row["version"]): row for row in result.classify()}
+        self.assertEqual(
+            rows[(optional[0], optional[1])]["primary_reachability"],
+            "optional-disabled",
         )
 
+    def test_duplicate_versions_have_complete_root_closures(self):
+        result, _ = prepared_audit()
+        result.classify()
+        rows, closure = result.duplicate_rows_and_closure()
+        split_rows = [row for row in rows if row["name"] == "split-dep"]
+        self.assertEqual(len(split_rows), 2)
+        self.assertTrue(all(row["workspace_roots"] for row in split_rows))
+        self.assertTrue(all(int(row["closure_edges"]) > 0 for row in split_rows))
+        self.assertEqual(
+            {row["closure_basis"] for row in split_rows}, {"active-all-target-tree"}
+        )
+        self.assertTrue(any(row["duplicate_name"] == "split-dep" for row in closure))
+
+    def test_target_constraint_is_preserved_on_active_edge(self):
+        result, _ = prepared_audit()
+        foreign = result.keys_by_name_version[("windows-only", "1.0.0")]
+        root = result.root_keys[ROOTS[0]]
+        self.assertEqual(
+            result.all_target_edges[(root, foreign)], {"normal:cfg(windows)"}
+        )
+
+    def test_tree_parser_marks_proc_macro_subtree_as_build_context(self):
+        keys = {
+            ("root", "1.0.0"): ("root", "1.0.0", "workspace"),
+            ("derive", "1.0.0"): ("derive", "1.0.0", "registry"),
+            ("quote", "1.0.0"): ("quote", "1.0.0", "registry"),
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "tree.txt"
+            path.write_text(
+                "0root v1.0.0\n1derive v1.0.0 (proc-macro)\n2quote v1.0.0\n",
+                encoding="utf-8",
+            )
+            graph = audit_module.parse_tree(path, keys)
+        self.assertEqual(
+            graph.build_context,
+            {keys[("derive", "1.0.0")], keys[("quote", "1.0.0")]},
+        )
+
+    def test_exact_evidence_check_rejects_root_overclaim(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "reachability.tsv"
+            path.write_text("claimed-root\n", encoding="utf-8")
+            with self.assertRaisesRegex(audit_module.AuditError, "differs"):
+                audit_module.verify_exact(path, "tree-root\n")
+
+    def test_release_tree_loader_rejects_wrong_claimed_root(self):
+        lock, metadata_all, metadata_native = fixture()
         result = audit_module.ReachabilityAudit(lock, metadata_all, metadata_native)
-        with self.assertRaisesRegex(audit_module.AuditError, "unclassified"):
-            result.classify()
+        with tempfile.TemporaryDirectory() as temp:
+            trees = Path(temp)
+            for root in ROOTS:
+                line = f"0{root} v0.1.0\n"
+                (trees / f"{root}.normal.txt").write_text(line, encoding="utf-8")
+                (trees / f"{root}.normal-build.txt").write_text(line, encoding="utf-8")
+            (trees / f"{ROOTS[0]}.normal-build.txt").write_text(
+                f"0{ROOTS[1]} v0.1.0\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(audit_module.AuditError, "exactly to their root"):
+                result.load_release_trees(trees)
+
+    def test_workspace_set_loader_rejects_hardcoded_coverage(self):
+        lock, metadata_all, metadata_native = fixture()
+        result = audit_module.ReachabilityAudit(lock, metadata_all, metadata_native)
+        with self.assertRaisesRegex(audit_module.AuditError, "lockfile rows"):
+            result.load_workspace_set_rows([])
+
+    def test_duplicate_closure_fails_when_active_chain_is_missing(self):
+        result, _ = prepared_audit()
+        result.classify()
+        split_one = result.keys_by_name_version[("split-dep", "1.0.0")]
+        result.active_all_target_edges = {
+            edge for edge in result.active_all_target_edges if edge[1] != split_one
+        }
+        with self.assertRaisesRegex(audit_module.AuditError, "complete workspace-root closure"):
+            result.duplicate_rows_and_closure()
 
 
 class SanitizationTests(unittest.TestCase):

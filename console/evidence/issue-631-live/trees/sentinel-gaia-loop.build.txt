@@ -1,1 +1,0 @@
-0sentinel-gaia-loop v0.1.0 (<REMOTE_PROJECT>/services/sentinel-gaia-loop)

@@ -19,13 +19,15 @@ Command:
 
 ```bash
 python3 scripts/dependency-reachability-audit.py audit --check \
-  --lock Cargo.lock --metadata-all <RAW_ALL> --metadata-native <RAW_NATIVE>
+  --lock Cargo.lock --metadata-all <RAW_ALL> --metadata-native <RAW_NATIVE> \
+  --trees-dir console/evidence/issue-631-live/trees \
+  --output-dir console/evidence/issue-631-live
 ```
 
 Output:
 
 ```text
-coverage=717/717 unclassified=0 roots=8/8
+coverage=717/717 unclassified=0 roots=8/8 duplicate_versions=94 closure_rows=8425 evidence_match=PASS
 ```
 
 Evidence: `reachability.tsv`, `reachability-summary.txt`.
@@ -36,18 +38,33 @@ Commands, once per each of eight roots:
 
 ```bash
 cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal --prefix depth --no-dedupe
-cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e build --prefix depth --no-dedupe
+cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,build --prefix depth
 ```
 
 Output assertion:
 
 ```text
 roots_with_normal_tree=8/8
-roots_with_build_tree=8/8
+roots_with_normal_build_tree=8/8
 ```
 
-Evidence: `trees/*.normal.txt`, `trees/*.build.txt` and the artifact inventory in the
-canonical audit.
+Evidence: `trees/*.normal.txt`, `trees/*.normal-build.txt`,
+`workspace-reachability-sets.tsv`, and the artifact inventory in the canonical audit.
+The classifier derives root membership only from these resolved Cargo trees; metadata
+does not activate optional dependencies.
+
+Workspace context commands:
+
+```bash
+cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build --prefix depth --no-dedupe
+cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build,dev --prefix depth --no-dedupe
+cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu -e dev --prefix depth --no-dedupe
+cargo remote -c -- tree --workspace --target all -e normal,build,dev --prefix depth --no-dedupe
+```
+
+The dev-only tree seeds dev context, which is expanded only across Cargo-active native
+edges. Foreign-target context is propagated only across all-target Cargo-active edges
+whose target specification is absent from the native metadata resolution.
 
 ### AC-3: Feature Origin and Needed-vs-Pulled
 
@@ -73,7 +90,7 @@ Evidence: `direct-release-features.tsv`, `feature-review.tsv`, and
 Command:
 
 ```bash
-cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu --duplicates -e normal,build,dev --prefix depth
+cargo remote -c -- tree --workspace --target all -e normal,build,dev --prefix depth --no-dedupe
 ```
 
 Output summary:
@@ -81,10 +98,16 @@ Output summary:
 ```text
 duplicate_names=41
 duplicate_version_rows=94
+active_tree_closures=85
+disabled_metadata_closures=9
+reverse_closure_rows=8425
 ```
 
-Evidence: `duplicate-versions.tsv` and the compact deduplicated reverse graph in
-`duplicates/linux-reverse-trees.txt`.
+Evidence: `duplicate-versions.tsv`, `workspace-all-target-edges.tsv`, and the complete
+per-version reverse closures in `duplicates/reverse-closure.tsv`. Every edge carries
+its dependency kind/target constraint and an explicit Cargo-active boolean. Disabled
+optional versions use a separately labelled metadata-constraint closure and are never
+reported as active reachability.
 
 ### AC-5: Recommendations
 
@@ -189,9 +212,9 @@ python3 scripts/dependency-reachability-audit.py check-staged
 Final output:
 
 ```text
-Ran 14 tests
+Ran 21 tests
 OK
-public-evidence-scan=PASS files=45
+public-evidence-scan=PASS files=47
 staged-new-lines-scan=PASS
 ```
 

@@ -22,9 +22,12 @@ cargo remote -c -- --version
 cargo remote -c -- metadata --locked --format-version 1
 cargo remote -c -- metadata --locked --format-version 1 --filter-platform x86_64-unknown-linux-gnu
 cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal --prefix depth --no-dedupe
-cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e build --prefix depth --no-dedupe
+cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,build --prefix depth
 cargo remote -c -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,features --prefix depth --no-dedupe
-cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu --duplicates -e normal,build,dev --prefix depth
+cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build --prefix depth --no-dedupe
+cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build,dev --prefix depth --no-dedupe
+cargo remote -c -- tree --workspace --target x86_64-unknown-linux-gnu -e dev --prefix depth --no-dedupe
+cargo remote -c -- tree --workspace --target all -e normal,build,dev --prefix depth --no-dedupe
 cargo remote -c -- build --release --locked -p <PACKAGE> --bin <BINARY>
 cargo remote -c -- bloat --version
 cargo remote -c -- bloat --release --locked -p <PACKAGE> --bin <BINARY> --crates -n 20

@@ -7,6 +7,7 @@ import argparse
 import csv
 import getpass
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -82,8 +83,99 @@ class Membership:
     non_release_workspace: bool = False
     dev: bool = False
     foreign_target: bool = False
-    metadata_native: bool = False
-    metadata_all: bool = False
+    workspace_all: bool = False
+
+
+@dataclass
+class TreeGraph:
+    packages: set[tuple[str, str, str]] = field(default_factory=set)
+    normal_context: set[tuple[str, str, str]] = field(default_factory=set)
+    build_context: set[tuple[str, str, str]] = field(default_factory=set)
+    edges: set[
+        tuple[tuple[str, str, str], tuple[str, str, str]]
+    ] = field(default_factory=set)
+    roots: set[tuple[str, str, str]] = field(default_factory=set)
+
+
+TREE_LINE = re.compile(
+    r"^(?P<depth>[0-9]+)(?P<name>[A-Za-z0-9_-]+) v(?P<version>[^\s]+)(?P<tail>.*)$"
+)
+
+WORKSPACE_SET_FIELDS = (
+    "name",
+    "version",
+    "source",
+    "native_normal_build",
+    "native_all_edges",
+    "all_targets_all_edges",
+    "native_dev_context",
+    "foreign_target_context",
+)
+
+EDGE_FIELDS = (
+    "parent_name",
+    "parent_version",
+    "child_name",
+    "child_version",
+    "edge_contexts",
+    "cargo_all_targets_active",
+)
+
+REVERSE_CLOSURE_FIELDS = (
+    "duplicate_name",
+    "duplicate_version",
+    "child_name",
+    "child_version",
+    "parent_name",
+    "parent_version",
+    "edge_contexts",
+    "parent_workspace_root",
+    "parent_release_tier",
+    "cargo_all_targets_active",
+)
+
+
+def parse_tree(
+    path: Path,
+    keys_by_name_version: Mapping[tuple[str, str], tuple[str, str, str]],
+) -> TreeGraph:
+    graph = TreeGraph()
+    stack: dict[int, tuple[tuple[str, str, str], bool]] = {}
+    matched = 0
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for physical_line in handle:
+            for line in physical_line.replace("\r", "\n").splitlines():
+                match = TREE_LINE.fullmatch(line.strip())
+                if match is None:
+                    continue
+                matched += 1
+                depth = int(match.group("depth"))
+                pair = (match.group("name"), match.group("version"))
+                key = keys_by_name_version.get(pair)
+                if key is None:
+                    raise AuditError(
+                        f"tree package {pair[0]}@{pair[1]} is absent or ambiguous in Cargo.lock"
+                    )
+                parent_entry = stack.get(depth - 1) if depth > 0 else None
+                if depth > 0 and parent_entry is None:
+                    raise AuditError(f"tree depth jumps to {depth} at {pair[0]}@{pair[1]}")
+                proc_macro = "(proc-macro)" in match.group("tail")
+                build_context = proc_macro or bool(parent_entry and parent_entry[1])
+                graph.packages.add(key)
+                if build_context:
+                    graph.build_context.add(key)
+                else:
+                    graph.normal_context.add(key)
+                if depth == 0:
+                    graph.roots.add(key)
+                else:
+                    graph.edges.add((parent_entry[0], key))
+                stack[depth] = (key, build_context)
+                for stale_depth in [value for value in stack if value > depth]:
+                    del stack[stale_depth]
+    if matched == 0 or not graph.roots:
+        raise AuditError(f"tree output has no package rows: {path}")
+    return graph
 
 
 class ReachabilityAudit:
@@ -115,13 +207,28 @@ class ReachabilityAudit:
             package_id: package_key(package)
             for package_id, package in self.all_packages.items()
         }
-        self.proc_macros = {
-            package_id
-            for package_id, package in self.all_packages.items()
-            if any("proc-macro" in target.get("kind", []) for target in package["targets"])
-        }
         self.workspace_ids = set(str(value) for value in metadata_all["workspace_members"])
+        self.workspace_keys = {self.key_for_id[value] for value in self.workspace_ids}
         self.root_ids = self._resolve_roots()
+        self.root_keys = {
+            name: self.key_for_id[package_id] for name, package_id in self.root_ids.items()
+        }
+        pairs: dict[tuple[str, str], list[tuple[str, str, str]]] = defaultdict(list)
+        for key in self.lock_packages:
+            pairs[(key[0], key[1])].append(key)
+        ambiguous = {pair: keys for pair, keys in pairs.items() if len(keys) != 1}
+        if ambiguous:
+            raise AuditError(f"ambiguous Cargo.lock name/version identities: {ambiguous!r}")
+        self.keys_by_name_version = {pair: keys[0] for pair, keys in pairs.items()}
+        self.root_normal_graphs: dict[str, TreeGraph] = {}
+        self.root_combined_graphs: dict[str, TreeGraph] = {}
+        self.workspace_sets: dict[str, set[tuple[str, str, str]]] = {}
+        self.all_target_edges: dict[
+            tuple[tuple[str, str, str], tuple[str, str, str]], set[str]
+        ] = {}
+        self.active_all_target_edges: set[
+            tuple[tuple[str, str, str], tuple[str, str, str]]
+        ] = set()
         self.rows: list[dict[str, str]] = []
 
     def _resolve_roots(self) -> dict[str, str]:
@@ -139,131 +246,216 @@ class ReachabilityAudit:
         return roots
 
     @staticmethod
-    def _edge_kinds(dep: Mapping[str, object]) -> set[str]:
-        kinds = set()
-        for item in dep.get("dep_kinds", []):
-            kinds.add(str(item.get("kind") or "normal"))
-        return kinds or {"normal"}
-
-    @staticmethod
     def _edge_specs(dep: Mapping[str, object]) -> set[tuple[str, str]]:
         specs = set()
         for item in dep.get("dep_kinds", []):
             specs.add((str(item.get("kind") or "normal"), str(item.get("target") or "")))
         return specs or {("normal", "")}
 
-    def _walk_release(self, root_name: str, root_id: str) -> None:
-        queue = deque([(root_id, "normal")])
-        visited: set[tuple[str, str]] = set()
-        while queue:
-            package_id, context = queue.popleft()
-            if (package_id, context) in visited:
-                continue
-            visited.add((package_id, context))
-            key = self.key_for_id[package_id]
-            membership = self.memberships[key]
-            if context == "build":
-                membership.release_build.add(root_name)
-            else:
-                membership.release_normal.add(root_name)
-            for dep in self.native_nodes[package_id].get("deps", []):
-                dep_id = str(dep["pkg"])
-                for kind in self._edge_kinds(dep):
-                    if kind == "dev":
-                        continue
-                    next_context = context
-                    if kind == "build" or dep_id in self.proc_macros:
-                        next_context = "build"
-                    queue.append((dep_id, next_context))
+    def load_release_trees(self, trees_dir: Path) -> None:
+        for root_name, root_key in self.root_keys.items():
+            normal = parse_tree(
+                trees_dir / f"{root_name}.normal.txt", self.keys_by_name_version
+            )
+            combined = parse_tree(
+                trees_dir / f"{root_name}.normal-build.txt",
+                self.keys_by_name_version,
+            )
+            if normal.roots != {root_key} or combined.roots != {root_key}:
+                raise AuditError(f"{root_name} trees do not resolve exactly to their root")
+            if not normal.packages <= combined.packages:
+                raise AuditError(f"{root_name} normal tree is not a subset of normal+build")
+            self.root_normal_graphs[root_name] = normal
+            self.root_combined_graphs[root_name] = combined
 
-    def _walk_workspace_non_dev(self, root_id: str) -> set[str]:
-        seen: set[tuple[str, str]] = set()
-        queue = deque([(root_id, "normal")])
-        result: set[str] = set()
-        while queue:
-            package_id, context = queue.popleft()
-            if (package_id, context) in seen:
-                continue
-            seen.add((package_id, context))
-            result.add(package_id)
-            for dep in self.native_nodes[package_id].get("deps", []):
-                dep_id = str(dep["pkg"])
-                for kind in self._edge_kinds(dep):
-                    if kind == "dev":
-                        continue
-                    next_context = "build" if kind == "build" else context
-                    if dep_id in self.proc_macros:
-                        next_context = "build"
-                    queue.append((dep_id, next_context))
-        return result
+    def set_workspace_sets(
+        self,
+        native_normal_build: set[tuple[str, str, str]],
+        native_all_edges: set[tuple[str, str, str]],
+        all_targets_all_edges: set[tuple[str, str, str]],
+        native_dev_context: set[tuple[str, str, str]] | None = None,
+        foreign_target_context: set[tuple[str, str, str]] | None = None,
+    ) -> None:
+        if not native_normal_build <= native_all_edges:
+            raise AuditError("native normal+build set is not a subset of native all-edge set")
+        if not native_all_edges <= all_targets_all_edges:
+            raise AuditError("native all-edge set is not a subset of all-target set")
+        if not all_targets_all_edges <= set(self.lock_packages):
+            raise AuditError("workspace trees contain packages absent from Cargo.lock")
+        native_dev_context = (
+            native_dev_context
+            if native_dev_context is not None
+            else native_all_edges - native_normal_build
+        )
+        foreign_target_context = (
+            foreign_target_context
+            if foreign_target_context is not None
+            else all_targets_all_edges - native_all_edges
+        )
+        if not native_dev_context <= native_all_edges:
+            raise AuditError("dev context contains packages absent from native all-edge tree")
+        if not foreign_target_context <= all_targets_all_edges:
+            raise AuditError("foreign context contains packages absent from all-target tree")
+        missing_workspace = self.workspace_keys - native_normal_build
+        if missing_workspace:
+            raise AuditError(f"native workspace tree misses members: {missing_workspace!r}")
+        self.workspace_sets = {
+            "native_normal_build": native_normal_build,
+            "native_all_edges": native_all_edges,
+            "all_targets_all_edges": all_targets_all_edges,
+            "native_dev_context": native_dev_context,
+            "foreign_target_context": foreign_target_context,
+        }
 
-    def _walk_dev(self, root_id: str) -> set[str]:
-        seen: set[tuple[str, bool]] = set()
-        queue = deque([(root_id, False)])
-        result: set[str] = set()
+    def load_workspace_tree_sets(
+        self, native_build: Path, native_all: Path, native_dev: Path, all_targets: Path
+    ) -> TreeGraph:
+        native_build_graph = parse_tree(native_build, self.keys_by_name_version)
+        native_all_graph = parse_tree(native_all, self.keys_by_name_version)
+        native_dev_graph = parse_tree(native_dev, self.keys_by_name_version)
+        all_targets_graph = parse_tree(all_targets, self.keys_by_name_version)
+        if native_dev_graph.roots != self.workspace_keys:
+            raise AuditError("native dev tree roots differ from workspace members")
+        native_forward = defaultdict(set)
+        for parent, child in native_all_graph.edges:
+            native_forward[parent].add(child)
+        dev_context = set(native_dev_graph.packages - native_dev_graph.roots)
+        queue = deque(dev_context)
         while queue:
-            package_id, dev_context = queue.popleft()
-            if (package_id, dev_context) in seen:
-                continue
-            seen.add((package_id, dev_context))
-            if dev_context:
-                result.add(package_id)
-            for dep in self.native_nodes[package_id].get("deps", []):
-                dep_id = str(dep["pkg"])
-                for kind in self._edge_kinds(dep):
-                    queue.append((dep_id, dev_context or kind == "dev"))
-        return result
+            parent = queue.popleft()
+            for child in native_forward[parent]:
+                if child not in dev_context:
+                    dev_context.add(child)
+                    queue.append(child)
 
-    def _walk_foreign_targets(self, root_id: str) -> set[str]:
-        native_edges: set[tuple[str, str, str, str]] = set()
-        for package_id, node in self.native_nodes.items():
+        native_specs = set()
+        for parent_id, node in self.native_nodes.items():
             for dep in node.get("deps", []):
                 for kind, target in self._edge_specs(dep):
-                    native_edges.add((package_id, str(dep["pkg"]), kind, target))
-
-        seen: set[tuple[str, bool]] = set()
-        queue = deque([(root_id, False)])
-        result: set[str] = set()
+                    native_specs.add(
+                        (
+                            self.key_for_id[parent_id],
+                            self.key_for_id[str(dep["pkg"])],
+                            kind,
+                            target,
+                        )
+                    )
+        foreign_edges = set()
+        for parent, child in all_targets_graph.edges:
+            all_specs = {
+                (parent, child, kind, target)
+                for kind, target in self._edge_specs_for_keys(parent, child)
+            }
+            if all_specs - native_specs:
+                foreign_edges.add((parent, child))
+        all_forward = defaultdict(set)
+        for parent, child in all_targets_graph.edges:
+            all_forward[parent].add(child)
+        foreign_context = set()
+        queue = deque((root, False) for root in self.workspace_keys)
+        visited = set()
         while queue:
-            package_id, foreign_context = queue.popleft()
-            if (package_id, foreign_context) in seen:
+            parent, inherited_foreign = queue.popleft()
+            if (parent, inherited_foreign) in visited:
                 continue
-            seen.add((package_id, foreign_context))
-            if foreign_context:
-                result.add(package_id)
-            for dep in self.all_nodes[package_id].get("deps", []):
-                dep_id = str(dep["pkg"])
-                for kind, target in self._edge_specs(dep):
-                    edge_is_native = (package_id, dep_id, kind, target) in native_edges
-                    queue.append((dep_id, foreign_context or not edge_is_native))
-        return result
+            visited.add((parent, inherited_foreign))
+            if inherited_foreign:
+                foreign_context.add(parent)
+            for child in all_forward[parent]:
+                queue.append(
+                    (child, inherited_foreign or (parent, child) in foreign_edges)
+                )
+        self.set_workspace_sets(
+            native_build_graph.packages,
+            native_all_graph.packages,
+            all_targets_graph.packages,
+            dev_context,
+            foreign_context,
+        )
+        for label, graph in (
+            ("native normal+build", native_build_graph),
+            ("native all-edge", native_all_graph),
+            ("all-target", all_targets_graph),
+        ):
+            if graph.roots != self.workspace_keys:
+                raise AuditError(f"{label} tree roots differ from workspace members")
+        return all_targets_graph
+
+    def _edge_specs_for_keys(self, parent_key, child_key) -> set[tuple[str, str]]:
+        parent_ids = [value for value, key in self.key_for_id.items() if key == parent_key]
+        child_ids = {value for value, key in self.key_for_id.items() if key == child_key}
+        specs = set()
+        for parent_id in parent_ids:
+            for dep in self.all_nodes[parent_id].get("deps", []):
+                if str(dep["pkg"]) in child_ids:
+                    specs.update(self._edge_specs(dep))
+        return specs
+
+    def load_workspace_set_rows(self, rows: Sequence[Mapping[str, str]]) -> None:
+        if len(rows) != len(self.lock_packages):
+            raise AuditError(
+                f"workspace set rows={len(rows)}, lockfile rows={len(self.lock_packages)}"
+            )
+        source_lookup = defaultdict(list)
+        for key in self.lock_packages:
+            source_lookup[(key[0], key[1], display_source(key[2]))].append(key)
+        seen = set()
+        sets = {
+            "native_normal_build": set(),
+            "native_all_edges": set(),
+            "all_targets_all_edges": set(),
+            "native_dev_context": set(),
+            "foreign_target_context": set(),
+        }
+        for row in rows:
+            candidates = source_lookup[(row["name"], row["version"], row["source"])]
+            if len(candidates) != 1:
+                raise AuditError(f"workspace set row has ambiguous identity: {row!r}")
+            key = candidates[0]
+            if key in seen:
+                raise AuditError(f"duplicate workspace set row: {key!r}")
+            seen.add(key)
+            for field_name in sets:
+                value = row[field_name]
+                if value not in {"true", "false"}:
+                    raise AuditError(f"invalid boolean {field_name}={value!r}")
+                if value == "true":
+                    sets[field_name].add(key)
+        if seen != set(self.lock_packages):
+            raise AuditError("workspace set identities differ from Cargo.lock")
+        self.set_workspace_sets(**sets)
 
     def classify(self) -> list[dict[str, str]]:
-        metadata_all_keys = {package_key(package) for package in self.all_packages.values()}
-        metadata_native_keys = {
-            package_key(package) for package in self.native_packages.values()
-        }
-        unknown_metadata = metadata_all_keys - set(self.lock_packages)
-        if unknown_metadata:
-            raise AuditError(f"metadata packages missing from lockfile: {unknown_metadata!r}")
+        if set(self.root_normal_graphs) != set(RELEASE_ROOTS):
+            raise AuditError("release trees are not loaded for every root")
+        if set(self.workspace_sets) != {
+            "native_normal_build",
+            "native_all_edges",
+            "all_targets_all_edges",
+            "native_dev_context",
+            "foreign_target_context",
+        }:
+            raise AuditError("workspace reachability sets are not loaded")
 
-        for key in metadata_all_keys:
-            self.memberships[key].metadata_all = True
-        for key in metadata_native_keys:
-            self.memberships[key].metadata_native = True
+        for root_name in RELEASE_ROOTS:
+            normal = self.root_normal_graphs[root_name]
+            combined = self.root_combined_graphs[root_name]
+            for key in normal.normal_context:
+                self.memberships[key].release_normal.add(root_name)
+            for key in normal.build_context | (combined.packages - normal.packages):
+                self.memberships[key].release_build.add(root_name)
 
-        for root_name, root_id in self.root_ids.items():
-            self._walk_release(root_name, root_id)
-
-        release_ids = set(self.root_ids.values())
-        for workspace_id in self.workspace_ids - release_ids:
-            for package_id in self._walk_workspace_non_dev(workspace_id):
-                self.memberships[self.key_for_id[package_id]].non_release_workspace = True
-        for workspace_id in self.workspace_ids:
-            for package_id in self._walk_dev(workspace_id):
-                self.memberships[self.key_for_id[package_id]].dev = True
-            for package_id in self._walk_foreign_targets(workspace_id):
-                self.memberships[self.key_for_id[package_id]].foreign_target = True
+        release_union = set().union(
+            *(graph.packages for graph in self.root_combined_graphs.values())
+        )
+        for key in self.workspace_sets["native_normal_build"] - release_union:
+            self.memberships[key].non_release_workspace = True
+        for key in self.workspace_sets["native_dev_context"]:
+            self.memberships[key].dev = True
+        for key in self.workspace_sets["foreign_target_context"]:
+            self.memberships[key].foreign_target = True
+        for key in self.workspace_sets["all_targets_all_edges"]:
+            self.memberships[key].workspace_all = True
 
         rows: list[dict[str, str]] = []
         for key in sorted(self.lock_packages):
@@ -279,7 +471,7 @@ class ReachabilityAudit:
                 primary = "dev-bench-only"
             elif membership.foreign_target:
                 primary = "target-only"
-            elif not membership.metadata_all:
+            elif not membership.workspace_all:
                 primary = "optional-disabled"
             else:
                 primary = "unclassified"
@@ -310,6 +502,11 @@ class ReachabilityAudit:
         for root_name, root_id in sorted(self.root_ids.items()):
             package = self.native_packages[root_id]
             node = self.native_nodes[root_id]
+            direct_tree_keys = {
+                child
+                for parent, child in self.root_normal_graphs[root_name].edges
+                if parent == self.root_keys[root_name]
+            }
             node_deps = defaultdict(list)
             for dep in node.get("deps", []):
                 node_deps[str(dep["name"])].append(dep)
@@ -321,6 +518,8 @@ class ReachabilityAudit:
                 if not matches:
                     continue
                 dep_id = str(matches[0]["pkg"])
+                if self.key_for_id[dep_id] not in direct_tree_keys:
+                    continue
                 dep_node = self.native_nodes[dep_id]
                 rows.append(
                     {
@@ -339,27 +538,157 @@ class ReachabilityAudit:
                 )
         return sorted(rows, key=lambda row: (row["root"], row["dependency"], row["version"]))
 
-    def duplicate_rows(self) -> list[dict[str, str]]:
+    def edge_contexts(self, parent_key, child_key) -> set[str]:
+        parent_ids = [value for value, key in self.key_for_id.items() if key == parent_key]
+        child_ids = {value for value, key in self.key_for_id.items() if key == child_key}
+        contexts = set()
+        for parent_id in parent_ids:
+            for dep in self.all_nodes[parent_id].get("deps", []):
+                if str(dep["pkg"]) not in child_ids:
+                    continue
+                for kind, target in self._edge_specs(dep):
+                    contexts.add(f"{kind}:{target or 'all'}")
+        if not contexts:
+            raise AuditError(
+                f"active Cargo edge lacks metadata annotation: {parent_key!r} -> {child_key!r}"
+            )
+        return contexts
+
+    def set_all_target_edges(self, graph: TreeGraph) -> None:
+        metadata_edges: dict[
+            tuple[tuple[str, str, str], tuple[str, str, str]], set[str]
+        ] = defaultdict(set)
+        for parent_id, node in self.all_nodes.items():
+            parent_key = self.key_for_id[parent_id]
+            for dep in node.get("deps", []):
+                child_key = self.key_for_id[str(dep["pkg"])]
+                for kind, target in self._edge_specs(dep):
+                    metadata_edges[(parent_key, child_key)].add(
+                        f"{kind}:{target or 'all'}"
+                    )
+        missing = graph.edges - set(metadata_edges)
+        if missing:
+            raise AuditError(f"active Cargo edges lack metadata annotation: {missing!r}")
+        self.all_target_edges = dict(metadata_edges)
+        self.active_all_target_edges = set(graph.edges)
+
+    def workspace_set_rows(self) -> list[dict[str, str]]:
+        return [
+            {
+                "name": key[0],
+                "version": key[1],
+                "source": display_source(key[2]),
+                "native_normal_build": str(
+                    key in self.workspace_sets["native_normal_build"]
+                ).lower(),
+                "native_all_edges": str(
+                    key in self.workspace_sets["native_all_edges"]
+                ).lower(),
+                "all_targets_all_edges": str(
+                    key in self.workspace_sets["all_targets_all_edges"]
+                ).lower(),
+                "native_dev_context": str(
+                    key in self.workspace_sets["native_dev_context"]
+                ).lower(),
+                "foreign_target_context": str(
+                    key in self.workspace_sets["foreign_target_context"]
+                ).lower(),
+            }
+            for key in sorted(self.lock_packages)
+        ]
+
+    def edge_rows(self) -> list[dict[str, str]]:
+        return [
+            {
+                "parent_name": parent[0],
+                "parent_version": parent[1],
+                "child_name": child[0],
+                "child_version": child[1],
+                "edge_contexts": ";".join(sorted(contexts)),
+                "cargo_all_targets_active": str(
+                    (parent, child) in self.active_all_target_edges
+                ).lower(),
+            }
+            for (parent, child), contexts in sorted(self.all_target_edges.items())
+        ]
+
+    def load_edge_rows(self, rows: Sequence[Mapping[str, str]]) -> None:
+        edges = {}
+        for row in rows:
+            parent = self.keys_by_name_version.get(
+                (row["parent_name"], row["parent_version"])
+            )
+            child = self.keys_by_name_version.get(
+                (row["child_name"], row["child_version"])
+            )
+            if parent is None or child is None:
+                raise AuditError(f"edge row package is absent from Cargo.lock: {row!r}")
+            contexts = {value for value in row["edge_contexts"].split(";") if value}
+            if not contexts:
+                raise AuditError(f"edge row lacks context: {row!r}")
+            edge = (parent, child)
+            if edge in edges:
+                raise AuditError(f"duplicate all-target edge row: {row!r}")
+            expected_contexts = self.edge_contexts(parent, child)
+            if contexts != expected_contexts:
+                raise AuditError(
+                    f"edge contexts differ from metadata for {parent!r} -> {child!r}"
+                )
+            edges[edge] = contexts
+            active = row["cargo_all_targets_active"]
+            if active not in {"true", "false"}:
+                raise AuditError(f"invalid active-edge boolean: {row!r}")
+            if active == "true":
+                self.active_all_target_edges.add(edge)
+        metadata_edges = set()
+        for parent_id, node in self.all_nodes.items():
+            parent = self.key_for_id[parent_id]
+            for dep in node.get("deps", []):
+                metadata_edges.add((parent, self.key_for_id[str(dep["pkg"])]))
+        if set(edges) != metadata_edges:
+            raise AuditError("committed edge inventory differs from metadata edge inventory")
+        all_targets = self.workspace_sets["all_targets_all_edges"]
+        if any(
+            parent not in all_targets or child not in all_targets
+            for parent, child in self.active_all_target_edges
+        ):
+            raise AuditError("active all-target edge graph references inactive packages")
+        reverse_active = defaultdict(set)
+        for parent, child in self.active_all_target_edges:
+            reverse_active[child].add(parent)
+        reached = set(self.workspace_keys)
+        queue = deque(self.workspace_keys)
+        forward_active = defaultdict(set)
+        for parent, child in self.active_all_target_edges:
+            forward_active[parent].add(child)
+        while queue:
+            parent = queue.popleft()
+            for child in forward_active[parent]:
+                if child not in reached:
+                    reached.add(child)
+                    queue.append(child)
+        if reached != all_targets:
+            raise AuditError("active all-target edges do not cover the committed package set")
+        self.all_target_edges = edges
+
+    def duplicate_rows_and_closure(
+        self,
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
         by_name: dict[str, list[dict[str, str]]] = defaultdict(list)
         for row in self.rows:
             by_name[row["name"]].append(row)
-        lock_by_name: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
-        for key in self.lock_packages:
-            lock_by_name[key[0]].append(key)
-        reverse: dict[tuple[str, str, str], set[str]] = defaultdict(set)
-        for parent_key, package in self.lock_packages.items():
-            for raw_dependency in package.get("dependencies", []):
-                if not isinstance(raw_dependency, str):
-                    continue
-                parts = raw_dependency.split()
-                dep_name = parts[0]
-                dep_version = parts[1] if len(parts) > 1 and parts[1][0].isdigit() else None
-                candidates = lock_by_name.get(dep_name, [])
-                if dep_version is not None:
-                    candidates = [key for key in candidates if key[1] == dep_version]
-                if len(candidates) == 1:
-                    reverse[candidates[0]].add(f"{parent_key[0]}@{parent_key[1]}")
+        if not self.all_target_edges:
+            raise AuditError("all-target edge graph is not loaded")
+        reverse_all: dict[tuple[str, str, str], set[tuple[str, str, str]]] = defaultdict(set)
+        reverse_active: dict[
+            tuple[str, str, str], set[tuple[str, str, str]]
+        ] = defaultdict(set)
+        for parent_key, child_key in self.all_target_edges:
+            reverse_all[child_key].add(parent_key)
+            if (parent_key, child_key) in self.active_all_target_edges:
+                reverse_active[child_key].add(parent_key)
         result = []
+        closure_rows = []
         for name, rows in sorted(by_name.items()):
             if len(rows) < 2:
                 continue
@@ -390,22 +719,82 @@ class ReachabilityAudit:
                     for key in self.lock_packages
                     if key[0] == name and key[1] == row["version"]
                 ]
-                forcers = set()
-                for key in key_matches:
-                    forcers.update(reverse[key])
+                if len(key_matches) != 1:
+                    raise AuditError(f"duplicate row identity is ambiguous: {name}@{row['version']}")
+                duplicate_key = key_matches[0]
+                active_duplicate = duplicate_key in self.workspace_sets["all_targets_all_edges"]
+                reverse = reverse_active if active_duplicate else reverse_all
+                closure_basis = "active-all-target-tree" if active_duplicate else "disabled-metadata"
+                immediate = reverse[duplicate_key]
+                queue = deque([duplicate_key])
+                visited = {duplicate_key}
+                closure_edges = set()
+                reached_roots = set()
+                while queue:
+                    child_key = queue.popleft()
+                    if child_key in self.workspace_keys:
+                        reached_roots.add(child_key)
+                    for parent_key in reverse[child_key]:
+                        closure_edges.add((parent_key, child_key))
+                        if parent_key not in visited:
+                            visited.add(parent_key)
+                            queue.append(parent_key)
+                if not reached_roots or not closure_edges:
+                    raise AuditError(
+                        f"duplicate version lacks complete workspace-root closure: {name}@{row['version']}"
+                    )
+                root_names = sorted(key[0] for key in reached_roots)
+                release_root_names = sorted(set(root_names) & set(RELEASE_ROOTS))
+                for parent_key, child_key in sorted(closure_edges):
+                    closure_rows.append(
+                        {
+                            "duplicate_name": name,
+                            "duplicate_version": row["version"],
+                            "child_name": child_key[0],
+                            "child_version": child_key[1],
+                            "parent_name": parent_key[0],
+                            "parent_version": parent_key[1],
+                            "edge_contexts": ";".join(
+                                sorted(self.all_target_edges[(parent_key, child_key)])
+                            ),
+                            "cargo_all_targets_active": str(
+                                (parent_key, child_key) in self.active_all_target_edges
+                            ).lower(),
+                            "parent_workspace_root": str(
+                                parent_key in self.workspace_keys
+                            ).lower(),
+                            "parent_release_tier": RELEASE_ROOTS.get(parent_key[0], ""),
+                        }
+                    )
                 result.append(
                     {
                         "name": name,
                         "version": row["version"],
                         "primary_reachability": row["primary_reachability"],
                         "reachable_in_roots": row["reachable_in_roots"],
-                        "immediate_forcers": ",".join(sorted(forcers)),
+                        "immediate_forcers": ",".join(
+                            sorted(f"{key[0]}@{key[1]}" for key in immediate)
+                        ),
+                        "workspace_roots": ",".join(root_names),
+                        "release_roots": ",".join(release_root_names),
+                        "closure_edges": str(len(closure_edges)),
+                        "closure_basis": closure_basis,
                         "decision": group_decision,
                         "constraint_assessment": constraint_assessment,
                         "revisit_condition": revisit_condition,
                     }
                 )
-        return result
+        closure_rows.sort(
+            key=lambda item: (
+                item["duplicate_name"],
+                item["duplicate_version"],
+                item["child_name"],
+                item["child_version"],
+                item["parent_name"],
+                item["parent_version"],
+            )
+        )
+        return result, closure_rows
 
 
 def relative_manifest(value: str) -> str:
@@ -429,7 +818,20 @@ def write_tsv(path: Path, rows: Sequence[Mapping[str, str]], fields: Sequence[st
         writer.writerows(rows)
 
 
-def write_summary(path: Path, rows: Sequence[Mapping[str, str]], root_count: int) -> None:
+def tsv_text(rows: Sequence[Mapping[str, str]], fields: Sequence[str]) -> str:
+    handle = io.StringIO(newline="")
+    writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t", lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return handle.getvalue()
+
+
+def read_tsv(path: Path) -> list[dict[str, str]]:
+    with path.open(encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle, delimiter="\t"))
+
+
+def summary_text(rows: Sequence[Mapping[str, str]], root_count: int) -> str:
     counts = {category: 0 for category in PRIMARY_ORDER}
     for row in rows:
         counts[row["primary_reachability"]] += 1
@@ -439,9 +841,17 @@ def write_summary(path: Path, rows: Sequence[Mapping[str, str]], root_count: int
         "unclassified=0",
         "duplicate_primary_assignments=0",
         f"release_roots_resolved={root_count}/{len(RELEASE_ROOTS)}",
+        f"also_dev={sum(row['also_dev'] == 'true' for row in rows)}",
+        f"also_foreign_target={sum(row['also_foreign_target'] == 'true' for row in rows)}",
     ]
     lines.extend(f"{category}={counts[category]}" for category in PRIMARY_ORDER)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return "\n".join(lines) + "\n"
+
+
+def verify_exact(path: Path, expected: str) -> None:
+    actual = path.read_text(encoding="utf-8")
+    if actual != expected:
+        raise AuditError(f"committed evidence differs from recomputed result: {path}")
 
 
 def add_release_tree_features(
@@ -480,48 +890,91 @@ def run_audit(args: argparse.Namespace) -> int:
         load_json(args.metadata_all),
         load_json(args.metadata_native),
     )
-    rows = audit.classify()
-    if args.check:
-        print(f"coverage={len(rows)}/{len(rows)} unclassified=0 roots=8/8")
-        return 0
     if args.output_dir is None:
-        raise AuditError("--output-dir is required unless --check is used")
-    write_tsv(args.output_dir / "reachability.tsv", rows, TSV_FIELDS)
-    write_summary(args.output_dir / "reachability-summary.txt", rows, len(audit.root_ids))
+        raise AuditError("--output-dir is required")
+    if args.trees_dir is None:
+        raise AuditError("--trees-dir is required")
+    audit.load_release_trees(args.trees_dir)
+    if args.check:
+        audit.load_workspace_set_rows(
+            read_tsv(args.output_dir / "workspace-reachability-sets.tsv")
+        )
+        audit.load_edge_rows(
+            read_tsv(args.output_dir / "workspace-all-target-edges.tsv")
+        )
+    else:
+        raw_paths = (
+            args.workspace_native_build_tree,
+            args.workspace_native_all_tree,
+            args.workspace_native_dev_tree,
+            args.workspace_all_targets_tree,
+        )
+        if any(path is None for path in raw_paths):
+            raise AuditError(
+                "generation requires all three --workspace-*-tree inputs"
+            )
+        all_targets_graph = audit.load_workspace_tree_sets(*raw_paths)
+        audit.set_all_target_edges(all_targets_graph)
+
+    rows = audit.classify()
     feature_rows = add_release_tree_features(audit.direct_feature_rows(), args.trees_dir)
-    write_tsv(
-        args.output_dir / "direct-release-features.tsv",
-        feature_rows,
-        (
-            "root",
-            "tier",
-            "dependency",
-            "version",
-            "requested_features",
-            "default_features",
-            "release_features",
-            "metadata_union_features",
-            "manifest",
-        ),
+    feature_fields = (
+        "root",
+        "tier",
+        "dependency",
+        "version",
+        "requested_features",
+        "default_features",
+        "release_features",
+        "metadata_union_features",
+        "manifest",
     )
-    duplicate_rows = audit.duplicate_rows()
-    write_tsv(
-        args.output_dir / "duplicate-versions.tsv",
-        duplicate_rows,
-        (
-            "name",
-            "version",
-            "primary_reachability",
-            "reachable_in_roots",
-            "immediate_forcers",
-            "decision",
-            "constraint_assessment",
-            "revisit_condition",
-        ),
+    duplicate_rows, closure_rows = audit.duplicate_rows_and_closure()
+    duplicate_fields = (
+        "name",
+        "version",
+        "primary_reachability",
+        "reachable_in_roots",
+        "immediate_forcers",
+        "workspace_roots",
+        "release_roots",
+        "closure_edges",
+        "closure_basis",
+        "decision",
+        "constraint_assessment",
+        "revisit_condition",
     )
+    generated = {
+        "reachability.tsv": tsv_text(rows, TSV_FIELDS),
+        "reachability-summary.txt": summary_text(rows, len(audit.root_ids)),
+        "direct-release-features.tsv": tsv_text(feature_rows, feature_fields),
+        "duplicate-versions.tsv": tsv_text(duplicate_rows, duplicate_fields),
+        "workspace-reachability-sets.tsv": tsv_text(
+            audit.workspace_set_rows(), WORKSPACE_SET_FIELDS
+        ),
+        "workspace-all-target-edges.tsv": tsv_text(audit.edge_rows(), EDGE_FIELDS),
+        "duplicates/reverse-closure.tsv": tsv_text(
+            closure_rows, REVERSE_CLOSURE_FIELDS
+        ),
+    }
+    if args.check:
+        for relative_path, expected in generated.items():
+            verify_exact(args.output_dir / relative_path, expected)
+        print(
+            f"coverage={len(rows)}/{len(audit.lock_packages)} unclassified=0 "
+            f"roots={len(audit.root_ids)}/{len(RELEASE_ROOTS)} "
+            f"duplicate_versions={len(duplicate_rows)} "
+            f"closure_rows={len(closure_rows)} evidence_match=PASS"
+        )
+        return 0
+    for relative_path, value in generated.items():
+        path = args.output_dir / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value, encoding="utf-8")
     print(
         f"wrote {len(rows)} packages, {len(feature_rows)} direct feature rows, "
-        f"and {len(duplicate_rows)} duplicate-version rows"
+        f"{len(duplicate_rows)} duplicate-version rows, and "
+        f"{len(closure_rows)} reverse-closure rows"
     )
     return 0
 
@@ -785,6 +1238,10 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--metadata-native", type=Path, required=True)
     audit.add_argument("--output-dir", type=Path)
     audit.add_argument("--trees-dir", type=Path)
+    audit.add_argument("--workspace-native-build-tree", type=Path)
+    audit.add_argument("--workspace-native-all-tree", type=Path)
+    audit.add_argument("--workspace-native-dev-tree", type=Path)
+    audit.add_argument("--workspace-all-targets-tree", type=Path)
     audit.add_argument("--check", action="store_true")
 
     normalize = subparsers.add_parser("normalize", help="normalize a raw text file")
