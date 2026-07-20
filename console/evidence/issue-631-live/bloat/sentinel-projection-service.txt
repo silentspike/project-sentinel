@@ -12,11 +12,11 @@ File  .text     Size Crate
 0.2%   0.6%  20.7KiB sentinel_telemetry
 0.2%   0.5%  16.8KiB tracing_core
 0.2%   0.5%  16.7KiB rusqlite
-0.1%   0.4%  12.1KiB proc_macro2
+0.2%   0.4%  14.7KiB proc_macro2
 0.1%   0.4%  12.0KiB sentinel_common
 0.1%   0.3%  10.8KiB convert_case
-0.1%   0.3%   8.8KiB version_check
 0.1%   0.2%   7.3KiB anyhow
+0.1%   0.2%   6.2KiB version_check
 0.1%   0.2%   5.4KiB memchr
 0.0%   0.1%   4.1KiB serde_core
 0.5%   1.3%  44.0KiB And 38 more crates. Use -n N to show more.

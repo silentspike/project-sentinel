@@ -1,7 +1,7 @@
 File  .text     Size Crate
 8.6%  25.6%   1.5MiB [Unknown]
 4.9%  14.6% 855.2KiB std
-3.3%   9.9% 581.2KiB async_nats
+3.3%   9.9% 581.4KiB async_nats
 2.4%   7.2% 421.0KiB rustls
 1.7%   5.1% 297.3KiB clap_builder
 1.7%   5.0% 293.4KiB ring
@@ -19,5 +19,5 @@ File  .text     Size Crate
 0.2%   0.6%  36.0KiB tokio_websockets
 0.2%   0.5%  30.0KiB sha2
 0.2%   0.5%  29.8KiB curve25519_dalek
-2.3%   6.9% 407.8KiB And 83 more crates. Use -n N to show more.
+2.3%   6.9% 407.6KiB And 85 more crates. Use -n N to show more.
 33.5% 100.0%   5.7MiB .text section size, the file size is 17.1MiB
