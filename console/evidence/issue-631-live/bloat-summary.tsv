@@ -1,5 +1,5 @@
 package	tier	release_artifact_bytes	text_size	analysis_file_size	top_crate	top_crate_text_percent	top_crate_size	remainder_crates	remainder_text_percent
-sentinel-daemon	A	54922536	38.4MiB	83.3MiB	cranelift_codegen	8.0%	3.1MiB	286	27.8%
+sentinel-daemon	A	54922920	38.4MiB	83.3MiB	cranelift_codegen	8.0%	3.1MiB	286	27.8%
 sentinel-projection-service	A	4428168	3.2MiB	9.3MiB	[Unknown]	43.0%	1.4MiB	38	1.3%
 sentinel-dashboard-backend	A	18968952	12.6MiB	30.2MiB	[Unknown]	17.5%	2.2MiB	142	14.3%
 sentinel-gaia-loop	A	8909144	5.7MiB	17.1MiB	[Unknown]	25.6%	1.5MiB	83	6.9%

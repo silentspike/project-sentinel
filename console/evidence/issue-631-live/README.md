@@ -130,7 +130,7 @@ Output summary:
 ```text
 release_root_builds=8/8
 cargo_bloat_tables=8/8
-aggregate_release_artifact_bytes=99549056
+aggregate_release_artifact_bytes=99549440
 cargo_bloat=0.12.1
 ```
 
@@ -156,7 +156,7 @@ effect, and a revisit condition.
 Pinned values:
 
 ```text
-base_commit=c64bb0ce3ee6d8b9b6b8ef6e19d0bc73fd59cea9
+base_commit=91795dd8c3e5105a8377667d33a6ed8d439ad2d2
 cargo_lock_sha256=29b97c217ff9694e116e0e6ce856e5ab761b808d5b2289bd56cb255373e14b93
 target=x86_64-unknown-linux-gnu
 remote_rustc=1.97.1
@@ -205,7 +205,7 @@ duplicate_version_rows=94
 reverse_closure_rows=8485
 release_root_builds=8/8
 cargo_bloat_tables=8/8
-aggregate_release_artifact_bytes=99549056
+aggregate_release_artifact_bytes=99549440
 ```
 
 Evidence: `reachability-summary.txt`, `direct-release-features.tsv`,
