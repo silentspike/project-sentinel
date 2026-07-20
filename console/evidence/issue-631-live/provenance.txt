@@ -1,6 +1,6 @@
 issue=631
-base_commit=91795dd8c3e5105a8377667d33a6ed8d439ad2d2
-graph_regeneration_base=c64bb0ce3ee6d8b9b6b8ef6e19d0bc73fd59cea9
+base_commit=dade246e244bf1809200da5c0464e80bc79c5cdf
+graph_regeneration_base=dade246e244bf1809200da5c0464e80bc79c5cdf
 post_regeneration_manifest_lock_delta=none
 cargo_lock_sha256=29b97c217ff9694e116e0e6ce856e5ab761b808d5b2289bd56cb255373e14b93
 target=x86_64-unknown-linux-gnu
@@ -11,7 +11,7 @@ remote_rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)
 remote_cargo=cargo 1.97.1 (c980f4866 2026-06-30)
 cargo_bloat=0.12.1
 cargo_bloat_binary_sha256=6b9cf542f54ab97d0f3301584adef105302f7af794cc8332958f16404d4d8f55
-issue_body_sha256=3e07c00d5d2a48d129c9aa5785e6e3ae8868b945af758586efea806e22852f89
+issue_body_sha256=e2b977da166ba890b0ab03f49bf156382a4f82c9d1496ad987b4f9c65a153b6d
 issue_labels=prio:medium,quality:ready,scope:full,size:M,status:ready,type:deps
 pr_611_state=OPEN
 pr_611_scope=Cargo.lock only

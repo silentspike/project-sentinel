@@ -35,7 +35,7 @@ Build-server timing and performance data are deliberately excluded.
 
 | Item | Value |
 | --- | --- |
-| Base commit | `91795dd8c3e5105a8377667d33a6ed8d439ad2d2` |
+| Base commit | `dade246e244bf1809200da5c0464e80bc79c5cdf` |
 | `Cargo.lock` SHA-256 | `29b97c217ff9694e116e0e6ce856e5ab761b808d5b2289bd56cb255373e14b93` |
 | Lockfile packages | 717 |
 | Workspace members | 27 |
@@ -45,18 +45,18 @@ Build-server timing and performance data are deliberately excluded.
 | Remote Cargo | `cargo 1.97.1 (c980f4866 2026-06-30)` |
 | cargo-bloat | `0.12.1`, installed under an issue-local remote tool directory |
 
-The dependency graph and feature evidence were fully regenerated at
-`c64bb0ce3ee6d8b9b6b8ef6e19d0bc73fd59cea9`, the last mainline commit that changed a
-Cargo manifest. `Cargo.lock` remained unchanged; the new `sentinel-common` dev edge to
-`sha2` is reflected in the workspace edge and reverse-closure evidence. Mainline source
-changes through the pinned base affected only `sentinel-daemon` among the audited Rust
-roots, so its release artifact and cargo-bloat rows were refreshed again at the pinned
-base; the other seven root artifacts remain tied to unchanged source inputs.
+The dependency graph, feature evidence, all eight release artifacts, and all eight
+cargo-bloat tables were fully regenerated at
+`dade246e244bf1809200da5c0464e80bc79c5cdf`. `Cargo.lock` and all Cargo manifests are
+unchanged from the preceding audit basis, so the compact graph bundle and all derived
+reachability, feature, duplicate, and recommendation rows remain byte-identical. The
+artifact and bloat evidence below comes entirely from the new regeneration run.
 
 PR #611 remains open and changes only `Cargo.lock`. If it or any other lockfile change
-lands before completion, this branch must rebase and regenerate metadata, trees,
-duplicates, feature reviews, binary sizes, bloat, and
-recommendations. Results from different lockfile hashes must never be mixed.
+lands before completion, the new mainline state must be integrated as directed by the
+ORC and metadata, trees, duplicates, feature reviews, binary sizes, bloat, and
+recommendations must all be regenerated. Results from different lockfile hashes must
+never be mixed.
 
 ## Release Artifact Inventory
 
@@ -243,7 +243,7 @@ Only deterministic artifact bytes and SHA-256 values are retained:
 
 | Root | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `sentinel-daemon` | 54,922,920 | `0c81f5c4b189e9e58c06b962275b42a22103dede6cc5f500ecee12e009780c33` |
+| `sentinel-daemon` | 54,922,728 | `5fd1e282449de393024a652fca4e913a24996ed24226a407cc1d16a8087af7ba` |
 | `sentinel-projection-service` | 4,428,168 | `ecc9ca0f3f1cc0f69443e87bfe83540c12a7fbabc06c9f349dcc13d767e0e3fa` |
 | `sentinel-dashboard-backend` | 18,968,952 | `9d34ec97f35ca6d4d5a8e11bdde95472b64805a4bacc4d60e7db5cd6a1d8a73a` |
 | `sentinel-gaia-loop` | 8,909,144 | `797bc5582c2a9c3642ae63f6ce35713d386ebcb3953b119dda5f378522a571ed` |
@@ -261,7 +261,7 @@ analysis `.text`, and analysis-file size in separate columns:
 
 | Root | Release bytes | Analysis `.text` | Analysis file | Largest reported crate |
 | --- | ---: | ---: | ---: | --- |
-| `sentinel-daemon` | 54,922,920 | 38.4 MiB | 83.3 MiB | `cranelift_codegen`, 3.1 MiB / 8.0% of `.text` |
+| `sentinel-daemon` | 54,922,728 | 38.4 MiB | 83.3 MiB | `cranelift_codegen`, 3.1 MiB / 8.0% of `.text` |
 | `sentinel-projection-service` | 4,428,168 | 3.2 MiB | 9.3 MiB | `[Unknown]`, 1.4 MiB / 43.0% |
 | `sentinel-dashboard-backend` | 18,968,952 | 12.6 MiB | 30.2 MiB | `[Unknown]`, 2.2 MiB / 17.5% |
 | `sentinel-gaia-loop` | 8,909,144 | 5.7 MiB | 17.1 MiB | `[Unknown]`, 1.5 MiB / 25.6% |
