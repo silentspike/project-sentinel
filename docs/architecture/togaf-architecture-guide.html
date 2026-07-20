@@ -1442,6 +1442,19 @@ PRAGMA page_size = 8192;              -- optimized for NVMe sectors
             <p class="text-dim text-[0.72rem] italic mt-3">Patched or owned code transfers CVE responsibility to us &mdash; supply-chain governance (cargo-deny, geiger baseline, SBOM) is part of the contract, not an afterthought.</p>
         </div>
 
+        <!-- Agent-operated dependency upgrade loop -->
+        <div class="bg-surface-1 border border-neon-purple/30 p-7 card-hover mt-4">
+            <h4 class="font-sans font-bold text-lg text-bright mb-3 flex items-center gap-2"><i data-lucide="bot" class="w-4 h-4 text-neon-purple"></i> Agent-operated upgrade loop &mdash; understand the delta before updating</h4>
+            <p class="text-sm leading-relaxed mb-4">Every release-reachable Cargo, Go, and npm dependency has a machine-readable <strong class="text-bright">DependencyContract</strong>: owning component, release roots, enabled features, APIs in use, unsafe/FFI boundaries, local patches, security and performance invariants, mandatory tests, runtime smokes, and rollback. The same policy-as-code pattern applies to provider and model catalogs. An upgrade agent therefore evaluates more than &ldquo;old versus new&rdquo;: it explains the <strong class="text-bright">upstream delta against our actual usage contract</strong>.</p>
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-3 text-[0.76rem]">
+                <div class="bg-surface-2 border border-border/60 p-3"><strong class="text-neon-green block mb-1">1 &middot; Detect</strong>Renovate and advisories create a reproducible candidate; they never promote it directly.</div>
+                <div class="bg-surface-2 border border-border/60 p-3"><strong class="text-neon-blue block mb-1">2 &middot; Analyze</strong>Lock/module graph, API/source diff, release notes, CVEs, features, and reachability changes are explained against the contract.</div>
+                <div class="bg-surface-2 border border-border/60 p-3"><strong class="text-accent-gold block mb-1">3 &middot; Prove</strong>The agent selects targeted unit, integration, failure, and runtime gates; performance is measured only on the declared target hardware, never on the build server.</div>
+                <div class="bg-surface-2 border border-border/60 p-3"><strong class="text-neon-purple block mb-1">4 &middot; Attest</strong>CycloneDX SBOM<sup><a href="#ref-39" class="text-neon-blue no-underline text-[0.7rem] font-bold">[39]</a></sup>, SLSA provenance<sup><a href="#ref-38" class="text-neon-blue no-underline text-[0.7rem] font-bold">[38]</a></sup>, evidence, and rollback are immutably bound to the release.</div>
+            </div>
+            <p class="text-dim text-[0.72rem] italic mt-3">Agent-operated means automatically analyzed and evidence-prepared, not blindly auto-merged. Storage, wire, determinism, security, and other critical contracts retain an explicit maintainer gate.</p>
+        </div>
+
     </section>
 
     <!-- ================================================================== -->
@@ -2563,6 +2576,17 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
             <p class="text-[0.85rem] leading-relaxed"><strong class="text-accent-gold">This is target architecture (v23 direction), NOT the current state.</strong> Clusters 00&ndash;11 describe what is built &amp; verified. This section describes the planned direction. What is written here is a decision or an open question &mdash; never to be read as &ldquo;done&rdquo; until it migrates into the baseline clusters.</p>
         </div>
 
+        <!-- Three independent delivery lanes -->
+        <div class="bg-surface-1 border border-border p-6 mb-8">
+            <h3 class="font-sans font-bold text-lg text-bright mb-4 flex items-center gap-2"><i data-lucide="milestone" class="w-4 h-4 text-accent-gold"></i> One target, three independent delivery lanes</h3>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-[0.78rem]">
+                <div class="bg-surface-2 border border-neon-green/30 p-4"><strong class="text-neon-green block mb-2">M0 &middot; Virtual company</strong>The single-node product experience is accepted end-to-end: real user impulse, Gaia/CEO, hierarchical work, durable result, restart, and visible evidence (#650). It waits for neither Cluster GA nor the native host.</div>
+                <div class="bg-surface-2 border border-neon-blue/30 p-4"><strong class="text-neon-blue block mb-2">Cluster foundation</strong>The existing product node expands onto bare, authenticated hardware. NodeBlueprint, ownership, replication, migration, and failover grow through Tracks A&ndash;H into the N-node platform (#397, #657).</div>
+                <div class="bg-surface-2 border border-neon-purple/30 p-4"><strong class="text-neon-purple block mb-2">Native platform</strong>The Linux-compatible Nano-Hypervisor gains progressively deeper host and topology control (#654, #655). This long-term lane must not block product operation or cluster delivery.</div>
+            </div>
+            <p class="text-dim text-[0.72rem] italic mt-3">The lanes share contracts and evidence, but not an artificial finish line. Progress in one lane must never reset the others.</p>
+        </div>
+
         <!-- Nano container -->
         <h3 class="font-sans font-bold text-xl text-bright mt-8 mb-5 flex items-center gap-3 border-l-[3px] border-accent-gold pl-4">
             <i data-lucide="boxes" class="w-5 h-5 text-accent-gold"></i> The Nano-Container as a Unified Compute Unit
@@ -2578,12 +2602,83 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
             </div>
         </div>
 
+        <!-- Native Nano-Hypervisor -->
+        <h3 class="font-sans font-bold text-xl text-bright mt-8 mb-5 flex items-center gap-3 border-l-[3px] border-neon-purple pl-4">
+            <i data-lucide="cpu" class="w-5 h-5 text-neon-purple"></i> Nano-Hypervisor: native Rust core plus a minimal compatibility surface
+        </h3>
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div class="bg-surface-1 border border-neon-purple/30 p-6 card-hover">
+                <h4 class="font-sans font-bold text-lg text-bright mb-3">Native execution plane</h4>
+                <p class="text-[0.85rem] leading-relaxed">ECS-native and WASM run as close as practical to memory, timers, networking, and storage. Over time, a custom Rust target and boot path<sup><a href="#ref-40" class="text-neon-blue no-underline text-[0.7rem] font-bold">[40]</a></sup> with UEFI Secure/Measured Boot, TPM attestation, and IOMMU can reduce the host surface further. <strong class="text-bright">Nano-Hypervisor</strong> names this owned lifecycle, scheduling, isolation, state, and authority layer &mdash; not a rebuild of a general-purpose cloud IaaS.</p>
+            </div>
+            <div class="bg-surface-1 border border-neon-blue/30 p-6 card-hover">
+                <h4 class="font-sans font-bold text-lg text-bright mb-3">Immutable Linux compatibility plane</h4>
+                <p class="text-[0.85rem] leading-relaxed">bwrap/Landlock, cgroups v2, KVM/Firecracker, FUSE/io_uring, eBPF, NATS/JetStream, and required host services remain a <strong class="text-bright">small, versioned compatibility surface</strong> wherever they provide the best security/performance boundary. Proxmox is a development and lab substrate, not a product dependency. From OpenStack Ironic<sup><a href="#ref-32" class="text-neon-blue no-underline text-[0.7rem] font-bold">[32]</a></sup> we adopt enrollment, power, trait, and deploy-state-machine patterns &mdash; not its control-plane stack.</p>
+            </div>
+        </div>
+
+        <!-- NodeBlueprint + readiness tiers -->
+        <h3 class="font-sans font-bold text-xl text-bright mt-8 mb-5 flex items-center gap-3 border-l-[3px] border-neon-blue pl-4">
+            <i data-lucide="server-cog" class="w-5 h-5 text-neon-blue"></i> Node expansion: one complete blueprint, multiple readiness tiers
+        </h3>
+        <div class="bg-surface-1 border border-border p-7 card-hover">
+            <p class="text-sm leading-relaxed mb-4"><strong class="text-bright">A new node starts bare.</strong> The active seed node authenticates the hardware and operator approval, then materializes a signed, versioned, content-addressed <strong class="text-bright">NodeBlueprint</strong> (#657): OS/kernel baseline, sysctls, cgroups, identical binaries, units, configuration schemas, certificate roles, sandbox prerequisites, redb/Limbo/CAS, NATS/JetStream, projection, observability, health, and rollback contract. Shared bytes arrive by hash; node identity, private keys, and local state are created locally. Every admitted node is <strong class="text-bright">capability-complete</strong> &mdash; only authority, active workloads, and local state copies differ.</p>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-[0.76rem] border-collapse">
+                    <thead><tr class="border-b border-border"><th class="p-3 text-neon-blue">Tier</th><th class="p-3 text-neon-blue">Guaranteed state</th><th class="p-3 text-neon-blue">Permitted claim</th></tr></thead>
+                    <tbody>
+                        <tr class="border-b border-border/50"><td class="p-3 font-bold text-bright">Bare</td><td class="p-3">Authenticated hardware/minimal shell; no Sentinel capability yet.</td><td class="p-3">Enrollment started; no &lt;30s claim.</td></tr>
+                        <tr class="border-b border-border/50"><td class="p-3 font-bold text-bright">Cold</td><td class="p-3">Boot/blueprint artifacts available; node powered off or not yet joined.</td><td class="p-3">Time includes boot, truly missing bytes, verification, and join.</td></tr>
+                        <tr class="border-b border-border/50"><td class="p-3 font-bold text-bright">Warm</td><td class="p-3">Capability-complete; services, images, and CAS artifacts present; state/checkpoint catch-up may remain.</td><td class="p-3">Fast workload start, but not interruption-free takeover.</td></tr>
+                        <tr class="border-b border-border/50"><td class="p-3 font-bold text-bright">Hot</td><td class="p-3">Current RecoveryPoints/replicas, routes, and fencing metadata within the declared lag budget.</td><td class="p-3">Promotion at a tick/commit boundary within measured RTO.</td></tr>
+                        <tr><td class="p-3 font-bold text-bright">Active</td><td class="p-3">Owns authoritative terms and serves assigned nano-containers.</td><td class="p-3">Production authority; still replicated and observed.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="border-l-3 border-accent-gold bg-accent-gold/[0.03] px-4 py-3 mt-4 text-[0.78rem]" style="border-left: 3px solid #f59e0b;"><strong class="text-accent-gold">Honest timing contract:</strong> discovery, attestation, blueprint transfer, boot, join, state catch-up, and <em>first workload ready</em> are separate clocks. A &lt;30s target applies only to an exactly named starting tier and payload class. Information and hashes avoid redundant transfers; bytes that have never existed on a node remain bounded by network and disk bandwidth.</div>
+        </div>
+
+        <!-- Availability + survivor contract -->
+        <h3 class="font-sans font-bold text-xl text-bright mt-8 mb-5 flex items-center gap-3 border-l-[3px] border-neon-green pl-4">
+            <i data-lucide="shield-check" class="w-5 h-5 text-neon-green"></i> Availability: readiness, durability, and authority are separate axes
+        </h3>
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div class="bg-surface-1 border border-neon-green/30 p-6 card-hover">
+                <h4 class="font-sans font-bold text-lg text-bright mb-3">Workload durability classes</h4>
+                <div class="space-y-2 text-[0.8rem]">
+                    <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-dim w-32 shrink-0">Ephemeral</strong><span>Restart is allowed; no state-survival claim.</span></div>
+                    <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-neon-blue w-32 shrink-0">Recoverable</strong><span>Durable RecoveryPoint + event tail; explicit RPO/RTO.</span></div>
+                    <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-neon-green w-32 shrink-0">Replicated</strong><span>ReplicaGroup with defined RF, lag, promotion, and repair.</span></div>
+                    <div class="flex gap-3 py-2"><strong class="text-accent-gold w-32 shrink-0">QuorumCritical</strong><span>Owner/routing/revocation metadata only after durable quorum commit.</span></div>
+                </div>
+                <p class="text-dim text-[0.72rem] italic mt-3">If <em>any arbitrary single node</em> must be able to continue the whole system alone, every required RecoveryPoint/log/ref must be present on every such node (effectively RF=N for that critical set). A complete binary stack alone is not HA.</p>
+            </div>
+            <div class="bg-surface-1 border border-accent-red/30 p-6 card-hover">
+                <h4 class="font-sans font-bold text-lg text-bright mb-3">Single survivor requires proven isolation</h4>
+                <p class="text-[0.85rem] leading-relaxed mb-3">After quorum loss, a remaining node may issue new authority only if it (1) possesses the last required RecoveryPoint and (2) proves the absence of old writers through <strong class="text-bright">independent hardware fencing</strong> &mdash; for example BMC/Redfish power state<sup><a href="#ref-33" class="text-neon-blue no-underline text-[0.7rem] font-bold">[33]</a></sup> plus a durable fence receipt. Without that proof, the control plane remains fail-closed; a membership timeout or &ldquo;peer unreachable&rdquo; is never sufficient.</p>
+                <p class="text-[0.85rem] leading-relaxed"><strong class="text-bright">&ldquo;No functional loss&rdquo;</strong> applies only to explicitly Hot+Replicated classes: after failure, functions and already accepted work survive; throughput, parallelism, and if necessary the rate of logical 1 Hz time may fall. External side effects are authorized exactly once through outbox, idempotency, and OwnerTerm.</p>
+            </div>
+        </div>
+        <div class="bg-surface-1 border border-border p-6 mt-4">
+            <h4 class="font-sans font-bold text-lg text-bright mb-3 flex items-center gap-2"><i data-lucide="timer-reset" class="w-4 h-4 text-neon-blue"></i> ReplicaGroups and tick continuity</h4>
+            <p class="text-[0.85rem] leading-relaxed">We replicate <strong class="text-bright">information</strong>, not transient cache contents: deterministic inputs/event tails, OwnerTerms, RecoveryPoints, queue/outbox positions, and CAS references. One primary tick executor owns side-effect authority; hot replicas hold the declared tick/commit boundary, while warm replicas catch up from checkpoint + event tail. Under resource loss, the load governor reduces parallelism and simulated-time speed in a controlled way &mdash; systems and security boundaries are never disabled.</p>
+        </div>
+
+        <!-- Topology-aware execution -->
+        <h3 class="font-sans font-bold text-xl text-bright mt-8 mb-5 flex items-center gap-3 border-l-[3px] border-accent-cyan pl-4" style="border-left-color:#06b6d4;">
+            <i data-lucide="microchip" class="w-5 h-5 text-accent-cyan"></i> Topology-aware execution: cluster &rarr; NUMA &rarr; cache
+        </h3>
+        <div class="bg-surface-1 border border-accent-cyan/30 p-7 card-hover">
+            <p class="text-sm leading-relaxed mb-4">Placement does not end at <em>which node?</em> The scheduler decides hierarchically: <strong class="text-bright">(1) cluster</strong> by interaction graph, durability, and resources; <strong class="text-bright">(2) node</strong> by NUMA proximity, CPU/memory pressure, and I/O locality; <strong class="text-bright">(3) hot path</strong> by worker affinity, per-core queues, prewarm, and cache working set. cgroups v2<sup><a href="#ref-34" class="text-neon-blue no-underline text-[0.7rem] font-bold">[34]</a></sup> and NUMA policy<sup><a href="#ref-35" class="text-neon-blue no-underline text-[0.7rem] font-bold">[35]</a></sup> form the portable baseline. resctrl for cache/memory-bandwidth classes<sup><a href="#ref-36" class="text-neon-blue no-underline text-[0.7rem] font-bold">[36]</a></sup> and sched_ext/eBPF policies<sup><a href="#ref-37" class="text-neon-blue no-underline text-[0.7rem] font-bold">[37]</a></sup> remain optional, capability-gated, and immediately reversible optimizations.</p>
+            <p class="text-[0.78rem] text-dim">L1/L2/L3 contents are not a durability layer and are never transferred. The work description, state references, and priority move; cache heat is rebuilt locally through deterministic prewarm. Every optimization must improve CPU-s/workload, cache misses, tail latency, and fairness without weakening determinism or isolation.</p>
+        </div>
+
         <!-- Live-Migration (Fenced State Transfer) + Soft-Affinity -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-6">
             <div class="bg-surface-1 border border-neon-green/30 p-6 card-hover">
                 <h4 class="font-sans font-bold text-lg text-bright mb-3 flex items-center gap-2"><i data-lucide="move" class="w-4 h-4 text-neon-green"></i> Live Migration = Fenced State Transfer</h4>
                 <p class="text-[0.85rem] leading-relaxed mb-2">K8s cannot live-snapshot/migrate pods &mdash; for us, snapshot/restore is a core primitive. The key: <strong class="text-bright">time travel (Time Machine) and space travel (migration) are the <em>same</em> primitive</strong> &mdash; an atomic, fenced state transfer.</p>
-                <p class="text-[0.85rem] leading-relaxed"><code class="font-mono text-neon-green text-[0.8em]">FencedStateTransfer&nbsp;{&nbsp;scope,&nbsp;owner_epoch,&nbsp;cas_manifest,&nbsp;route_update&nbsp;}</code> with <code class="text-neon-blue text-[0.8em]">scope=world</code> (rewinding) or <code class="text-neon-blue text-[0.8em]">scope=nano_container</code> (relocation); phases <em>prepare&rarr;validate&rarr;fence&rarr;commit&rarr;postcommit</em>. <strong class="text-bright">Per-container fencing instead of globally halting</strong> the simulation. &ldquo;Milliseconds&rdquo; applies to the lightweight class (ECS-native, small state, pre-warmed target, CAS blocks local/pullable); heavier runtimes are proportionally more expensive &mdash; honestly, no blanket promise.</p>
+                <p class="text-[0.85rem] leading-relaxed"><code class="font-mono text-neon-green text-[0.8em] break-all whitespace-normal">FencedStateTransfer&nbsp;{&nbsp;scope,&nbsp;owner_epoch,&nbsp;cas_manifest,&nbsp;route_update&nbsp;}</code> with <code class="text-neon-blue text-[0.8em]">scope=world</code> (rewinding) or <code class="text-neon-blue text-[0.8em]">scope=nano_container</code> (relocation); phases <em>prepare&rarr;validate&rarr;fence&rarr;commit&rarr;postcommit</em>. <strong class="text-bright">Per-container fencing instead of globally halting</strong> the simulation. &ldquo;Milliseconds&rdquo; applies to the lightweight class (ECS-native, small state, pre-warmed target, CAS blocks local/pullable); heavier runtimes are proportionally more expensive &mdash; honestly, no blanket promise.</p>
             </div>
             <div class="bg-surface-1 border border-neon-blue/30 p-6 card-hover">
                 <h4 class="font-sans font-bold text-lg text-bright mb-3 flex items-center gap-2"><i data-lucide="network" class="w-4 h-4 text-neon-blue"></i> Soft affinity: the nano-container is the unit, not the company</h4>
@@ -2604,7 +2699,7 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
             </div>
         </div>
 
-        <!-- Verteiltes CAS + Scheduler -->
+        <!-- Distributed CAS + scheduler -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
             <div class="bg-surface-1 border border-neon-purple/30 p-6 card-hover">
                 <h4 class="font-sans font-bold text-lg text-bright mb-3 flex items-center gap-2"><i data-lucide="boxes" class="w-4 h-4 text-neon-purple"></i> Built-in distributed CAS &mdash; only hashes travel</h4>
@@ -2633,14 +2728,16 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
             <i data-lucide="git-pull-request-draft" class="w-5 h-5 text-accent-red"></i> Open Decisions (ADR needed)
         </h3>
         <div class="space-y-2 text-sm">
-            <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-neon-green whitespace-nowrap w-56 shrink-0">Runtime fork &mdash; decided</strong><span><strong class="text-bright">Resolved (DEV-007, supersedes DEV-006):</strong> a runtime-agnostic CRI contract, <strong class="text-bright">no fixed default</strong>. Plural runtimes (ECS-native, WASM/WASI, bwrap+Landlock, microVM) fulfill the same contract (spawn/exec/snapshot/restore/migrate/health/isolate), chosen per workload. WASM = density/portability, native code = freedom &mdash; both first-class behind the contract rather than a default choice. Delivered: the <code class="font-mono text-neon-blue text-[0.8em]">NanoRuntime</code> trait in sentinel-common + ECS-native/WASM/bwrap adapters (#407&ndash;#411, merged).</span></div>
-            <div class="flex gap-3 py-2 border-b border-border/60"><strong class="text-neon-green whitespace-nowrap w-56 shrink-0">Cluster ownership &mdash; decided</strong><span><strong class="text-bright">No full Raft</strong> for agent state (the company is shared-nothing per container). Instead <strong class="text-bright">owner_epoch / fencing tokens</strong>: every mutating write carries a monotonically increasing marker, stores reject stale ones (no split-brain from a paused old owner). An <strong class="text-bright">authoritative head controller</strong> grants ownership for 1&ndash;2 nodes (a deliberate, openly documented SPOF); real automatic failover only from a <strong class="text-bright">3rd witness node</strong> (without a majority there is no safe HA). Handoff = <em>freeze &rarr; durable snapshot/cursor &rarr; new epoch &rarr; restore &rarr; route switch &rarr; source hard-fenced</em>.</span></div>
-            <div class="flex gap-3 py-2"><strong class="text-neon-blue whitespace-nowrap w-56 shrink-0">Illusion &ne; isolation</strong><span>Resolved: the illusion (the agent never grows suspicious) is a <strong class="text-bright">perception/tool-output problem</strong> &mdash; the agent never touches the kernel, only the prompt. Isolation (preventing escape) is a <strong class="text-bright">sandbox problem</strong>. Two axes: gVisor is <em>not</em> needed for the illusion, only for real execution.</span></div>
+            <div class="flex flex-col md:flex-row gap-3 py-2 border-b border-border/60"><strong class="text-neon-green w-full md:w-56 md:shrink-0">Runtime fork &mdash; decided</strong><span><strong class="text-bright">Resolved (DEV-007, supersedes DEV-006):</strong> a runtime-agnostic CRI contract, <strong class="text-bright">no fixed default</strong>. Plural runtimes (ECS-native, WASM/WASI, bwrap+Landlock, microVM) fulfill the same contract (spawn/exec/snapshot/restore/migrate/health/isolate), chosen per workload. WASM = density/portability, native code = freedom &mdash; both first-class behind the contract rather than a default choice. Delivered: the <code class="font-mono text-neon-blue text-[0.8em]">NanoRuntime</code> trait in sentinel-common + ECS-native/WASM/bwrap adapters (#407&ndash;#411, merged).</span></div>
+            <div class="flex flex-col md:flex-row gap-3 py-2 border-b border-border/60"><strong class="text-neon-green w-full md:w-56 md:shrink-0">Cluster ownership &mdash; decided</strong><span><strong class="text-bright">No full Raft for agent state</strong>; quorum covers owner/routing/recovery metadata. Mutating writes carry full OwnerTerms/fencing tokens and stores reject stale authority. One or two nodes remain cooperative-only; normal automatic failover starts at N&ge;3 with a durable metadata quorum. After quorum loss, single-survivor continuation is exclusively the hardware-fenced recovery path defined above (#652), never a membership heuristic. Migration = durable quiesce/staging &rarr; authoritative owner commit &rarr; gated restore &rarr; routable activation &rarr; durable source finalization.</span></div>
+            <div class="flex flex-col md:flex-row gap-3 py-2 border-b border-border/60"><strong class="text-accent-gold w-full md:w-56 md:shrink-0">Readiness + durability</strong><span>The target contract is set; exact persistence schemas, promotion CAS, and the failure matrix are closed through ADRs #651&ndash;#653. Membership <code class="font-mono text-neon-blue text-[0.8em]">Alive</code> is never equivalent to <code class="font-mono text-neon-green text-[0.8em]">Ready</code> or <code class="font-mono text-accent-gold text-[0.8em]">SafeToPromote</code>.</span></div>
+            <div class="flex flex-col md:flex-row gap-3 py-2 border-b border-border/60"><strong class="text-accent-gold w-full md:w-56 md:shrink-0">Native host + topology</strong><span>The Linux compatibility surface, native boot path, and CPU/NUMA/cache policy are target decisions; capability matrix, portability, and adopt/reject gates are worked out in #654/#655. No experimental kernel path becomes a single point of failure.</span></div>
+            <div class="flex flex-col md:flex-row gap-3 py-2"><strong class="text-neon-blue w-full md:w-56 md:shrink-0">Illusion &ne; isolation</strong><span>Resolved: the illusion (the agent never grows suspicious) is a <strong class="text-bright">perception/tool-output problem</strong> &mdash; the agent never touches the kernel, only the prompt. Isolation (preventing escape) is a <strong class="text-bright">sandbox problem</strong>. Two axes: gVisor is <em>not</em> needed for the illusion, only for real execution.</span></div>
         </div>
 
         <!-- Determinism profile -->
         <div class="bg-surface-1 border border-border p-5 mt-6">
-            <p class="text-[0.82rem] leading-relaxed"><strong class="text-accent-gold">Determinism &mdash; the homogeneous profile:</strong> &ldquo;same CPU architecture&rdquo; is <strong class="text-bright">not</strong> enough &mdash; transcendental float functions (exp/sin/ln) are not guaranteed bit-identical even within one ISA (platform, compiler, version). The goal is therefore a strict <strong class="text-bright">determinism profile</strong> as an operating condition: identical binary/toolchain, no FMA contraction/fast-math, fixed iteration and DB ordering. Under it, faithful replay <em>and</em> homogeneous cross-node migration are bit-exact &mdash; <strong class="text-bright">without</strong> the large fixed-point rebuild. Fixed-point arithmetic remains necessary only for <em>heterogeneous</em> architectures; pure snapshot/restore (without replay) does not need the profile at all. <strong class="text-neon-green">Measured (spike #490):</strong> under this profile (same binary, rustc 1.94.0, no RUSTFLAGS, x86-64 baseline) re-execution is bit-exact over 10,000 ticks including f32 exp/ln/sin, in- and cross-process on the deploy VM. The codegen configuration (LTO shape, codegen units, ISA baseline) is an integral part of this profile: changing it redefines the profile and requires the bit-exactness proof to be re-established before rollout &mdash; a determinism regression vetoes any performance gain.</p>
+            <p class="text-[0.82rem] leading-relaxed"><strong class="text-accent-gold">Determinism &mdash; the homogeneous profile:</strong> &ldquo;same CPU architecture&rdquo; is <strong class="text-bright">not</strong> enough &mdash; transcendental float functions (exp/sin/ln) are not guaranteed bit-identical even within one ISA (platform, compiler, version). The goal is therefore a strict <strong class="text-bright">determinism profile</strong> as an operating condition: identical binary/toolchain, no FMA contraction/fast-math, fixed iteration and DB ordering. Under it, faithful replay <em>and</em> homogeneous cross-node migration are bit-exact &mdash; <strong class="text-bright">without</strong> the large fixed-point rebuild. Fixed-point arithmetic remains necessary only for <em>heterogeneous</em> architectures; pure snapshot/restore (without replay) does not need the profile at all. <strong class="text-neon-green">Historically measured (spike #490):</strong> that profile (same binary, rustc 1.94.0, no RUSTFLAGS, x86-64 baseline) re-executed 10,000 ticks bit-exactly, including f32 exp/ln/sin, in- and cross-process on the deploy VM. That result does not pin today's toolchain: the active repository-pinned toolchain and codegen configuration (LTO shape, codegen units, ISA baseline) define a new profile revision and must pass the same bit-exactness proof before rollout &mdash; a determinism regression vetoes any performance gain.</p>
         </div>
     </section>
 
@@ -2776,9 +2873,45 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
                 <span class="text-dim font-mono text-[0.75rem] shrink-0 w-8 text-right">[30]</span>
                 <div><strong class="text-bright">Turso &ldquo;AgentFS&rdquo;</strong> &mdash; <a href="https://github.com/tursodatabase/agentfs" class="text-neon-blue underline-offset-2 hover:underline" target="_blank">github.com/tursodatabase/agentfs</a> <span class="text-dim">&mdash; SQLite-backed FUSE for AI agents (validates the FUSE-for-agents approach)</span></div>
             </div>
-            <div id="ref-31" class="flex gap-4 py-3 hover:bg-white/[0.01] px-2 -mx-2 rounded">
+            <div id="ref-31" class="flex gap-4 py-3 border-b border-border/40 hover:bg-white/[0.01] px-2 -mx-2 rounded">
                 <span class="text-dim font-mono text-[0.75rem] shrink-0 w-8 text-right">[31]</span>
                 <div><strong class="text-bright">redb Benchmarks 3.1</strong> &mdash; <a href="https://github.com/cberner/redb?tab=readme-ov-file#benchmarks" class="text-neon-blue underline-offset-2 hover:underline" target="_blank">github.com/cberner/redb#benchmarks</a> <span class="text-dim">&mdash; 920ms individual write (vs lmdb 1598ms), pure Rust, CoW crash-safe</span></div>
+            </div>
+            <div id="ref-32" class="flex gap-4 py-3 border-b border-border/40 hover:bg-white/[0.01] px-2 -mx-2 rounded">
+                <span class="text-dim font-mono text-[0.75rem] shrink-0 w-8 text-right">[32]</span>
+                <div><strong class="text-bright">OpenStack Ironic</strong> &mdash; <a href="https://docs.openstack.org/ironic/latest/user/deploy.html" class="text-neon-blue underline-offset-2 hover:underline" target="_blank">Bare Metal Deployment Guide</a> <span class="text-dim">&mdash; reference patterns for enrollment, traits, power control, and a recoverable bare-metal deployment state machine.</span></div>
+            </div>
+            <div id="ref-33" class="flex gap-4 py-3 border-b border-border/40 hover:bg-white/[0.01] px-2 -mx-2 rounded">
+                <span class="text-dim font-mono text-[0.75rem] shrink-0 w-8 text-right">[33]</span>
+                <div><strong class="text-bright">DMTF Redfish</strong> &mdash; <a href="https://redfish.dmtf.org/schemas/v1/DSP2046_2025.2.html" class="text-neon-blue underline-offset-2 hover:underline" target="_blank">DSP2046 Schema</a> <span class="text-dim">&mdash; standardized out-of-band power/reset interface for independent hardware fencing.</span></div>
+            </div>
+            <div id="ref-34" class="flex gap-4 py-3 border-b border-border/40 hover:bg-white/[0.01] px-2 -mx-2 rounded">
+                <span class="text-dim font-mono text-[0.75rem] shrink-0 w-8 text-right">[34]</span>
+                <div><strong class="text-bright">Linux cgroup v2</strong> &mdash; <a href="https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html" class="text-neon-blue underline-offset-2 hover:underline" target="_blank">Kernel Documentation</a> <span class="text-dim">&mdash; portable CPU, memory, I/O, and process resource hierarchy.</span></div>
+            </div>
+            <div id="ref-35" class="flex gap-4 py-3 border-b border-border/40 hover:bg-white/[0.01] px-2 -mx-2 rounded">
+                <span class="text-dim font-mono text-[0.75rem] shrink-0 w-8 text-right">[35]</span>
+                <div><strong class="text-bright">Linux NUMA Memory Policy</strong> &mdash; <a href="https://docs.kernel.org/admin-guide/mm/numa_memory_policy.html" class="text-neon-blue underline-offset-2 hover:underline" target="_blank">Kernel Documentation</a> <span class="text-dim">&mdash; thread/task/VMA policy for topology-local memory placement.</span></div>
+            </div>
+            <div id="ref-36" class="flex gap-4 py-3 border-b border-border/40 hover:bg-white/[0.01] px-2 -mx-2 rounded">
+                <span class="text-dim font-mono text-[0.75rem] shrink-0 w-8 text-right">[36]</span>
+                <div><strong class="text-bright">Linux resctrl</strong> &mdash; <a href="https://docs.kernel.org/filesystems/resctrl.html" class="text-neon-blue underline-offset-2 hover:underline" target="_blank">Kernel Documentation</a> <span class="text-dim">&mdash; cache allocation, memory bandwidth allocation, and monitoring as optional topology capabilities.</span></div>
+            </div>
+            <div id="ref-37" class="flex gap-4 py-3 border-b border-border/40 hover:bg-white/[0.01] px-2 -mx-2 rounded">
+                <span class="text-dim font-mono text-[0.75rem] shrink-0 w-8 text-right">[37]</span>
+                <div><strong class="text-bright">Linux sched_ext</strong> &mdash; <a href="https://www.kernel.org/doc/html/latest/scheduler/sched-ext.html" class="text-neon-blue underline-offset-2 hover:underline" target="_blank">Kernel Documentation</a> <span class="text-dim">&mdash; dynamic BPF schedulers with kernel fallback; experimental and API-unstable.</span></div>
+            </div>
+            <div id="ref-38" class="flex gap-4 py-3 border-b border-border/40 hover:bg-white/[0.01] px-2 -mx-2 rounded">
+                <span class="text-dim font-mono text-[0.75rem] shrink-0 w-8 text-right">[38]</span>
+                <div><strong class="text-bright">SLSA Build Provenance v1.2</strong> &mdash; <a href="https://slsa.dev/spec/v1.2/build-provenance" class="text-neon-blue underline-offset-2 hover:underline" target="_blank">slsa.dev</a> <span class="text-dim">&mdash; verifiable origin and parameters of a software artifact.</span></div>
+            </div>
+            <div id="ref-39" class="flex gap-4 py-3 border-b border-border/40 hover:bg-white/[0.01] px-2 -mx-2 rounded">
+                <span class="text-dim font-mono text-[0.75rem] shrink-0 w-8 text-right">[39]</span>
+                <div><strong class="text-bright">CycloneDX Specification</strong> &mdash; <a href="https://cyclonedx.org/docs/latest/" class="text-neon-blue underline-offset-2 hover:underline" target="_blank">cyclonedx.org</a> <span class="text-dim">&mdash; machine-readable SBOM and supply-chain component contracts.</span></div>
+            </div>
+            <div id="ref-40" class="flex gap-4 py-3 hover:bg-white/[0.01] px-2 -mx-2 rounded">
+                <span class="text-dim font-mono text-[0.75rem] shrink-0 w-8 text-right">[40]</span>
+                <div><strong class="text-bright">Rust Target Specification RFC 0131</strong> &mdash; <a href="https://rust-lang.github.io/rfcs/0131-target-specification.html" class="text-neon-blue underline-offset-2 hover:underline" target="_blank">rust-lang.github.io</a> <span class="text-dim">&mdash; foundation for controlled custom targets and long-term bare-metal experiments.</span></div>
             </div>
         </div>
     </section>
@@ -2790,7 +2923,7 @@ Restore:  Pointer &rarr; S_hourly_1 (only change the offset)</pre>
         <div class="flex flex-col items-center gap-3">
             <div class="font-mono text-[0.65rem] text-dim tracking-[3px] uppercase">Project Sentinel &mdash; The Synthetic Enterprise Reality</div>
             <div class="font-mono text-[0.6rem] text-dim/60">
-                VER 22.2 &middot; 2026-05-29 &middot; Tailwind CSS + Lucide Icons &middot; 19 crates + 7 Rust services + 3 Go services + shared Go pkg &middot; Architecture principles (P1 dedup + P2 zero-copy + P3 latency constraint) &middot; Security model (honest assessment) &middot; Target architecture v23 (nano-container contract + live migration + affinity sharding) &middot; 31 references
+                VER 23.0 &middot; 2026-07-20 &middot; Tailwind CSS + Lucide Icons &middot; 19 crates + 7 Rust services + 3 Go services + shared Go pkg &middot; Architecture principles (P1 dedup + P2 zero-copy + P3 latency constraint) &middot; Security model (honest assessment) &middot; Target architecture v23 (Nano-Hypervisor + NodeBlueprint + ReplicaGroups + topology-aware execution) &middot; 40 references
             </div>
             <div class="font-mono text-[0.55rem] text-dim/40 mt-2">
                 &copy; 2026 obtFusi &mdash; Built with Rust, Go, TypeScript and obsessive attention to detail.
