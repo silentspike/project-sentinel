@@ -1,0 +1,17 @@
+{
+  "content": "ok",
+  "model": "claude-sonnet-5",
+  "provider": "claude-code",
+  "tokens_used": 1800,
+  "input_tokens": 1300,
+  "output_tokens": 500,
+  "finish_reason": "stop",
+  "request_id": "req-issue-395-golden",
+  "cache_read": 200,
+  "cache_creation": 100,
+  "tier": "mid",
+  "cost_usd": 0.0195,
+  "cost_source": "provider_reported",
+  "hierarchy_tier": 2,
+  "effective_model": "claude-sonnet-5"
+}

@@ -3,6 +3,7 @@ id = 12
 name = "Nina Wagner"
 role = "Marketing & Social Media Managerin"
 department = "Marketing"
+tier = 2
 shift_set = 1
 kpis = ["Social-Media-Reichweite +15% pro Quartal", "Blog-Content 4 Artikel/Monat", "Lead-Generierung ueber Website > 10/Monat"]
 reports_to = "Thomas Mueller"

@@ -3,6 +3,7 @@ id = 43
 name = "Monika Weber"
 role = "Office Managerin / Buchhaltung"
 department = "Verwaltung"
+tier = 2
 shift_set = 3
 kpis = ["Rechnungsstellung innerhalb 3 Werktage", "Kostenabweichung < 3%", "Personalunterlagen vollstaendig und aktuell"]
 reports_to = "Sandra Vogel"

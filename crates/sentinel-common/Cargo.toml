@@ -30,6 +30,7 @@ loom = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+sha2 = { workspace = true }
 
 [[bench]]
 name = "owner_fencing_overhead"

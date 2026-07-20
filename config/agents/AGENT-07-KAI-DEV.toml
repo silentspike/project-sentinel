@@ -3,6 +3,7 @@ id = 7
 name = "Kai Fischer"
 role = "Backend-Entwickler"
 department = "Entwicklung"
+tier = 3
 shift_set = 1
 reports_to = "Andreas Wolff"
 

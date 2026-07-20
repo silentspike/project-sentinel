@@ -3,6 +3,7 @@ id = 4
 name = "Sophie Klein"
 role = "Junior Designerin / Motion Graphics"
 department = "Design"
+tier = 3
 shift_set = 1
 reports_to = "Lisa Brenner"
 

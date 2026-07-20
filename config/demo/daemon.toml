@@ -30,7 +30,7 @@ data_dir     = "/opt/sentinel/data"
 # fall back to /ram/agents/<name> on a normal filesystem.
 tick_rate_ms = 200       # 5 Hz so a 10-minute demo feels alive
 time_scale   = 4.0       # one wall-clock minute = ~4 simulated minutes
-max_agents   = 5         # small demo cohort
+max_agents   = 60        # must cover every bundled AGENT-NN config ID
 
 [daemon.adaptive]
 enabled = false          # deterministic demo, no PSI feedback

@@ -18,6 +18,7 @@ type Client struct {
 	temperature float64
 	maxTokens   int
 	httpClient  *http.Client
+	credential  string
 }
 
 // ClientConfig configures the gateway client.
@@ -27,6 +28,7 @@ type ClientConfig struct {
 	Temperature float64
 	MaxTokens   int
 	Timeout     time.Duration
+	Credential  string
 }
 
 // NewClient creates a gateway client for judge LLM analysis.
@@ -41,15 +43,16 @@ func NewClient(cfg ClientConfig) *Client {
 		temperature: cfg.Temperature,
 		maxTokens:   cfg.MaxTokens,
 		httpClient:  &http.Client{Timeout: timeout},
+		credential:  cfg.Credential,
 	}
 }
 
 // ChatRequest is the request to the Cortex Gateway.
 type ChatRequest struct {
-	Messages    []Message `json:"messages"`
-	Model       string    `json:"model,omitempty"`
-	Temperature float64   `json:"temperature,omitempty"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
+	Messages    []Message         `json:"messages"`
+	Model       string            `json:"model,omitempty"`
+	Temperature float64           `json:"temperature,omitempty"`
+	MaxTokens   int               `json:"max_tokens,omitempty"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
@@ -68,6 +71,9 @@ type ChatResponse struct {
 
 // Chat sends a chat request to the gateway and returns the response content.
 func (c *Client) Chat(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	if c.credential == "" {
+		return "", fmt.Errorf("gateway caller credential is required")
+	}
 	req := ChatRequest{
 		Messages: []Message{
 			{Role: "system", Content: systemPrompt},
@@ -78,7 +84,6 @@ func (c *Client) Chat(ctx context.Context, systemPrompt, userPrompt string) (str
 		MaxTokens:   c.maxTokens,
 		Metadata: map[string]string{
 			"agent_name": "sentinel-judge",
-			"agent_role": "quality-agent",
 		},
 	}
 
@@ -95,6 +100,7 @@ func (c *Client) Chat(ctx context.Context, systemPrompt, userPrompt string) (str
 		return "", fmt.Errorf("gateway new request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.credential)
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {

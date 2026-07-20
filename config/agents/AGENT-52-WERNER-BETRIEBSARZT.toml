@@ -3,6 +3,7 @@ id = 52
 name = "Dr. Werner Hoffmann"
 role = "Betriebsarzt (nach ASiG - Arbeitssicherheitsgesetz)"
 department = "Betriebsgesundheit"
+tier = 2
 shift_set = 0
 kpis = ["Arbeitsplatzbegehungen > 2/Jahr", "Vorsorgeuntersuchungen termingerecht", "Arbeitsunfaelle dokumentiert und analysiert"]
 reports_to = ""

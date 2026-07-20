@@ -3,6 +3,7 @@ id = 17
 name = "Carla Mendez"
 role = "Design Lead / Art Director"
 department = "Design"
+tier = 2
 shift_set = 2
 kpis = ["Design-Qualitaet Kunden-Score > 4.5/5", "Design-Review-Durchlaufzeit < 2 Tage", "Brand-Konsistenz ueber alle Projekte"]
 reports_to = "Michael Hartmann"

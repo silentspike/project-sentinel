@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 const defaultOllamaBaseURL = "http://localhost:11434"
@@ -41,6 +42,14 @@ type ollamaResponse struct {
 	TotalDuration   int64         `json:"total_duration"`
 	EvalCount       int           `json:"eval_count"`
 	PromptEvalCount int           `json:"prompt_eval_count"`
+}
+
+type ollamaTagsResponse struct {
+	Models []struct {
+		Name   string `json:"name"`
+		Model  string `json:"model"`
+		Digest string `json:"digest"`
+	} `json:"models"`
 }
 
 // OllamaProvider implements Provider for Ollama.
@@ -159,27 +168,59 @@ func (p *OllamaProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 	}, nil
 }
 
-// HealthCheck verifies that the Ollama API is reachable via GET /api/tags.
-func (p *OllamaProvider) HealthCheck(ctx context.Context) error {
+// ModelInventory reads Ollama's token-free model inventory. Content digests
+// must be present so a later authorized Gate B readback can pin the exact local
+// artifacts independently of the immutable catalog's model-ID validation.
+func (p *OllamaProvider) ModelInventory(ctx context.Context) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, healthCheckTimeout)
 	defer cancel()
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/api/tags", nil)
+	endpoint, err := url.JoinPath(p.baseURL, "/api/tags")
 	if err != nil {
-		return fmt.Errorf("create health check request: %w", err)
+		return nil, fmt.Errorf("build ollama inventory URL: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create ollama inventory request: %w", err)
 	}
 
 	resp, err := p.client.Do(httpReq) //nolint:gosec // URL from trusted config
 	if err != nil {
-		return fmt.Errorf("ollama health check: %w", err)
+		return nil, fmt.Errorf("ollama inventory request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	// Drain the body to allow connection reuse
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("ollama health check returned status %d", resp.StatusCode)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize))
+	if err != nil {
+		return nil, fmt.Errorf("read ollama inventory: %w", err)
 	}
 
-	return nil
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("ollama inventory returned status %d", resp.StatusCode)
+	}
+	var tags ollamaTagsResponse
+	if err := json.Unmarshal(body, &tags); err != nil {
+		return nil, fmt.Errorf("decode ollama inventory: %w", err)
+	}
+	models := make([]string, 0, len(tags.Models))
+	for _, item := range tags.Models {
+		model := strings.TrimSpace(item.Model)
+		if model == "" {
+			model = strings.TrimSpace(item.Name)
+		}
+		if model == "" {
+			return nil, fmt.Errorf("ollama inventory contains an empty model id")
+		}
+		if strings.TrimSpace(item.Digest) == "" {
+			return nil, fmt.Errorf("ollama inventory model %q has no content digest", model)
+		}
+		models = append(models, model)
+	}
+	return models, nil
+}
+
+// HealthCheck verifies that the Ollama API and its inventory response are
+// reachable and structurally valid without generating tokens.
+func (p *OllamaProvider) HealthCheck(ctx context.Context) error {
+	_, err := p.ModelInventory(ctx)
+	return err
 }

@@ -15,6 +15,7 @@ type AgentIdentity struct {
 	Name          string   `toml:"name"`
 	Role          string   `toml:"role"`
 	Department    string   `toml:"department"`
+	Tier          int      `toml:"tier"`
 	ShiftSet      int      `toml:"shift_set"`
 	KPIs          []string `toml:"kpis"`
 	ReportsTo     string   `toml:"reports_to"`

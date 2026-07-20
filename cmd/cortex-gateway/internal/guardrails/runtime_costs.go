@@ -1,6 +1,7 @@
 package guardrails
 
 import (
+	"strconv"
 	"sync"
 	"time"
 )
@@ -14,6 +15,9 @@ type RuntimeCostStatus struct {
 	ByProvider               map[string]float64 `json:"by_provider"`
 	CostByAgent              map[string]float64 `json:"cost_by_agent"`
 	TokensByAgent            map[string]int64   `json:"tokens_by_agent"`
+	ByModelTier              map[string]float64 `json:"by_model_tier"`
+	ByHierarchyTier          map[string]float64 `json:"by_hierarchy_tier"`
+	ByCostSource             map[string]float64 `json:"by_cost_source"`
 	TotalCostUSD             float64            `json:"total_cost_usd"`
 	TotalSavingsUSD          float64            `json:"total_savings_usd"`
 	AverageForwardCostUSD    float64            `json:"average_forward_cost_usd"`
@@ -30,6 +34,9 @@ type runtimeCostTracker struct {
 	byProvider      map[string]float64
 	byAgent         map[string]float64
 	tokensByAgent   map[string]int64
+	byModelTier     map[string]float64
+	byHierarchyTier map[string]float64
+	byCostSource    map[string]float64
 	totalCostUSD    float64
 	totalSavingsUSD float64
 	reportedSavings float64
@@ -38,16 +45,30 @@ type runtimeCostTracker struct {
 }
 
 var runtimeCosts = &runtimeCostTracker{
-	startedAt:     time.Now(),
-	byProvider:    make(map[string]float64),
-	byAgent:       make(map[string]float64),
-	tokensByAgent: make(map[string]int64),
+	startedAt:       time.Now(),
+	byProvider:      make(map[string]float64),
+	byAgent:         make(map[string]float64),
+	tokensByAgent:   make(map[string]int64),
+	byModelTier:     make(map[string]float64),
+	byHierarchyTier: make(map[string]float64),
+	byCostSource:    make(map[string]float64),
 }
 
 func RecordRuntimeForwardCost(provider string, inputTokens, outputTokens int) float64 {
 	cost := calculateForwardCostUSD(provider, inputTokens, outputTokens)
 	if cost <= 0 {
 		return 0
+	}
+	RecordRuntimeForwardCostResolved(provider, cost)
+	return cost
+}
+
+// RecordRuntimeForwardCostResolved accumulates an authoritative cost selected
+// by the gateway. A valid zero is retained as a forward call without inventing
+// a price-table value.
+func RecordRuntimeForwardCostResolved(provider string, cost float64) {
+	if cost < 0 {
+		return
 	}
 
 	runtimeCosts.mu.Lock()
@@ -58,7 +79,6 @@ func RecordRuntimeForwardCost(provider string, inputTokens, outputTokens int) fl
 	runtimeCosts.forwardCalls++
 	runtimeCosts.recomputeSavingsLocked()
 	recordCostMetric(provider, cost)
-	return cost
 }
 
 // RecordRuntimeAgentUsage accumulates per-agent cost + token totals for the
@@ -66,6 +86,12 @@ func RecordRuntimeForwardCost(provider string, inputTokens, outputTokens int) fl
 // per-call cost (parity with the /metrics per-agent cost counter); tokens is the
 // folded input+output. Zero-cost synthesis/apicp calls still register the agent.
 func RecordRuntimeAgentUsage(agentID string, inputTokens, outputTokens int, cost float64) {
+	RecordRuntimeAgentUsageDimensions(agentID, "unknown", 0, "unknown", inputTokens, outputTokens, cost)
+}
+
+// RecordRuntimeAgentUsageDimensions keeps model/pricing tier and organization
+// hierarchy tier in independent runtime aggregates.
+func RecordRuntimeAgentUsageDimensions(agentID, modelTier string, hierarchyTier int, costSource string, inputTokens, outputTokens int, cost float64) {
 	if agentID == "" {
 		agentID = "unknown"
 	}
@@ -77,8 +103,22 @@ func RecordRuntimeAgentUsage(agentID string, inputTokens, outputTokens int, cost
 	if runtimeCosts.tokensByAgent == nil {
 		runtimeCosts.tokensByAgent = make(map[string]int64)
 	}
+	if runtimeCosts.byModelTier == nil {
+		runtimeCosts.byModelTier = make(map[string]float64)
+	}
+	if runtimeCosts.byHierarchyTier == nil {
+		runtimeCosts.byHierarchyTier = make(map[string]float64)
+	}
+	if runtimeCosts.byCostSource == nil {
+		runtimeCosts.byCostSource = make(map[string]float64)
+	}
 	runtimeCosts.byAgent[agentID] += cost
 	runtimeCosts.tokensByAgent[agentID] += int64(inputTokens + outputTokens)
+	runtimeCosts.byModelTier[modelTier] += cost
+	if hierarchyTier >= 1 && hierarchyTier <= 3 {
+		runtimeCosts.byHierarchyTier[strconv.Itoa(hierarchyTier)] += cost
+	}
+	runtimeCosts.byCostSource[costSource] += cost
 }
 
 func RecordRuntimeSynthesisSavings() float64 {
@@ -110,6 +150,18 @@ func RuntimeCostSnapshot() RuntimeCostStatus {
 	for agent, tokens := range runtimeCosts.tokensByAgent {
 		tokensByAgent[agent] = tokens
 	}
+	byModelTier := make(map[string]float64, len(runtimeCosts.byModelTier))
+	for tier, cost := range runtimeCosts.byModelTier {
+		byModelTier[tier] = cost
+	}
+	byHierarchyTier := make(map[string]float64, len(runtimeCosts.byHierarchyTier))
+	for tier, cost := range runtimeCosts.byHierarchyTier {
+		byHierarchyTier[tier] = cost
+	}
+	byCostSource := make(map[string]float64, len(runtimeCosts.byCostSource))
+	for source, cost := range runtimeCosts.byCostSource {
+		byCostSource[source] = cost
+	}
 
 	var avgForwardCost float64
 	if runtimeCosts.forwardCalls > 0 {
@@ -134,6 +186,9 @@ func RuntimeCostSnapshot() RuntimeCostStatus {
 		ByProvider:               byProvider,
 		CostByAgent:              byAgent,
 		TokensByAgent:            tokensByAgent,
+		ByModelTier:              byModelTier,
+		ByHierarchyTier:          byHierarchyTier,
+		ByCostSource:             byCostSource,
 		TotalCostUSD:             runtimeCosts.totalCostUSD,
 		TotalSavingsUSD:          runtimeCosts.totalSavingsUSD,
 		AverageForwardCostUSD:    avgForwardCost,
@@ -177,6 +232,9 @@ func resetRuntimeCostTrackerForTest() {
 	runtimeCosts.byProvider = make(map[string]float64)
 	runtimeCosts.byAgent = make(map[string]float64)
 	runtimeCosts.tokensByAgent = make(map[string]int64)
+	runtimeCosts.byModelTier = make(map[string]float64)
+	runtimeCosts.byHierarchyTier = make(map[string]float64)
+	runtimeCosts.byCostSource = make(map[string]float64)
 	runtimeCosts.totalCostUSD = 0
 	runtimeCosts.totalSavingsUSD = 0
 	runtimeCosts.reportedSavings = 0

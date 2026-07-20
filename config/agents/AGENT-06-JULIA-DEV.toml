@@ -3,6 +3,7 @@ id = 6
 name = "Julia Neumann"
 role = "Senior Frontend-Entwicklerin"
 department = "Entwicklung"
+tier = 3
 shift_set = 1
 reports_to = "Andreas Wolff"
 

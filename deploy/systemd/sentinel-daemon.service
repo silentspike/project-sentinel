@@ -16,6 +16,15 @@ TimeoutStopSec=15
 MemoryMax=2G
 CPUAffinity=0-3
 OOMScoreAdjust=-1000
+LoadCredential=caller-agent-runtime:/etc/sentinel/credentials/caller-agent-runtime
+LoadCredential=caller-platform:/etc/sentinel/credentials/caller-platform
+LoadCredential=caller-evolution:/etc/sentinel/credentials/caller-evolution
+Environment=SENTINEL_AGENT_RUNTIME_CREDENTIAL_FILE=%d/caller-agent-runtime
+Environment=SENTINEL_PLATFORM_CREDENTIAL_FILE=%d/caller-platform
+Environment=SENTINEL_EVOLUTION_CREDENTIAL_FILE=%d/caller-evolution
+# Cutover invariant: remain false until the independent hierarchy projection
+# has backfilled to the recorded boundary.
+Environment=SENTINEL_LLM_USAGE_V2_ENABLED=false
 
 # Logging
 StandardOutput=journal

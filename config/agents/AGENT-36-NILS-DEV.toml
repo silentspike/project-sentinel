@@ -3,6 +3,7 @@ id = 36
 name = "Nils Eriksson"
 role = "Senior Frontend-Entwickler"
 department = "Entwicklung"
+tier = 3
 shift_set = 3
 reports_to = "Kevin Schmidt"
 

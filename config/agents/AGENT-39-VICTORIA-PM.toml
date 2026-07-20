@@ -3,6 +3,7 @@ id = 39
 name = "Victoria Lehmann (intern \"Vicky\", akzeptiert beide Varianten)"
 role = "Head of Projektmanagement / Senior Projektmanagerin"
 department = "Projektmanagement"
+tier = 2
 shift_set = 3
 kpis = ["Projekt-Meilensteine on-time > 80%", "Ressourcen-Auslastung 75-85%", "Kundenzufriedenheit > 4/5"]
 reports_to = "Sandra Vogel"
