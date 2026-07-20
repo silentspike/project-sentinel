@@ -88,8 +88,11 @@ improvise a migration.
    - the hierarchy offset, coverage metadata, and event boundary reconcile;
    - restarting or replaying the projection does not increment aggregates.
 5. Deploy the gateway and all four authenticated callers with distinct
-   owner-only credentials. Keep the daemon producer flag disabled. Use only
-   mock or local-loop traffic.
+   owner-only credentials through the checked-in `LoadCredential` units. A
+   non-root service receives systemd's private `root:root 0440` projection;
+   this mode is accepted only below that unit's `CREDENTIALS_DIRECTORY`.
+   Standalone group-readable credential files remain invalid. Keep the daemon
+   producer flag disabled. Use only mock or local-loop traffic.
 6. Satisfy the active-provider activation gate without making a provider call:
    - For Ollama, record the exact `name`, `model`, and non-empty content `digest`
      values returned by its token-free inventory. The model IDs must exactly equal
