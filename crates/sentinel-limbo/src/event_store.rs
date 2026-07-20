@@ -82,6 +82,7 @@ const CREATE_LLM_COMPLETION_OUTBOX: &str = "
 CREATE TABLE IF NOT EXISTS llm_completion_outbox (
     request_id TEXT PRIMARY KEY,
     request_digest TEXT NOT NULL,
+    owner_scope TEXT NOT NULL,
     payload TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('provider_in_flight', 'pending_usage', 'ready_for_action', 'action_claimed', 'failed')),
     attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -92,6 +93,11 @@ CREATE TABLE IF NOT EXISTS llm_completion_outbox (
 
 const CREATE_IDX_LLM_COMPLETION_RECOVERABLE: &str =
     "CREATE INDEX IF NOT EXISTS idx_llm_completion_recoverable ON llm_completion_outbox(status, created_at) WHERE status IN ('pending_usage', 'ready_for_action')";
+
+/// Fail closed before unresolved terminal rows can grow without bound. Operators
+/// compact exact terminal identities into the append-only event log.
+pub const LLM_COMPLETION_TERMINAL_LIMIT: i64 = 10_000;
+const LLM_COMPLETION_RESOLUTION_REASON_MAX_BYTES: usize = 512;
 
 const CREATE_SNAPSHOTS: &str = "
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -285,6 +291,7 @@ pub struct OutboxEntry {
 pub struct LlmCompletionEntry {
     pub request_id: String,
     pub request_digest: String,
+    pub owner_scope: StateTransferScope,
     pub payload: String,
     pub status: String,
     pub attempt_count: u32,
@@ -294,15 +301,24 @@ pub struct LlmCompletionEntry {
 }
 
 fn llm_completion_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmCompletionEntry> {
+    let owner_scope_wire: String = row.get(2)?;
+    let owner_scope = StateTransferScope::from_wire(&owner_scope_wire).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            format!("invalid LLM completion owner scope {owner_scope_wire:?}").into(),
+        )
+    })?;
     Ok(LlmCompletionEntry {
         request_id: row.get(0)?,
         request_digest: row.get(1)?,
-        payload: row.get(2)?,
-        status: row.get(3)?,
-        attempt_count: row.get::<_, i64>(4)? as u32,
-        last_error: row.get(5)?,
-        created_at: row.get::<_, i64>(6)? as u64,
-        updated_at: row.get::<_, i64>(7)? as u64,
+        owner_scope,
+        payload: row.get(3)?,
+        status: row.get(4)?,
+        attempt_count: row.get::<_, i64>(5)? as u32,
+        last_error: row.get(6)?,
+        created_at: row.get::<_, i64>(7)? as u64,
+        updated_at: row.get::<_, i64>(8)? as u64,
     })
 }
 
@@ -330,12 +346,23 @@ pub struct SnapshotRow {
 pub struct EventStore {
     conn: Arc<Mutex<Connection>>,
     path: PathBuf,
+    owner_registry: &'static OwnerRegistry,
 }
 
 impl EventStore {
     /// Oeffnet oder erstellt den Event Store.
     #[instrument(level = "debug", fields(path = %path))]
     pub fn open(path: &str) -> anyhow::Result<Self> {
+        Self::open_with_owner_registry(path, OwnerRegistry::global())
+    }
+
+    /// Dependency-injected owner authority for cluster contract tests. Production
+    /// callers use [`open`](Self::open) and the process-global registry.
+    #[doc(hidden)]
+    pub fn open_with_owner_registry(
+        path: &str,
+        owner_registry: &'static OwnerRegistry,
+    ) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
 
         // Performance Pragmas
@@ -360,6 +387,7 @@ impl EventStore {
         conn.execute(CREATE_IDX_OUTBOX_PENDING, [])?;
         conn.execute(CREATE_IDX_OUTBOX_EVENT_ID, [])?;
         conn.execute_batch(CREATE_LLM_COMPLETION_OUTBOX)?;
+        Self::ensure_llm_completion_migrations(&conn)?;
         conn.execute(CREATE_IDX_LLM_COMPLETION_RECOVERABLE, [])?;
         conn.execute_batch(CREATE_SNAPSHOTS)?;
         conn.execute(CREATE_IDX_SNAPSHOTS_AGGREGATE, [])?;
@@ -385,6 +413,7 @@ impl EventStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path: PathBuf::from(path),
+            owner_registry,
         })
     }
 
@@ -397,6 +426,19 @@ impl EventStore {
         }
         if !Self::table_has_column(conn, "outbox", "last_error")? {
             conn.execute("ALTER TABLE outbox ADD COLUMN last_error TEXT", [])?;
+        }
+        Ok(())
+    }
+
+    fn ensure_llm_completion_migrations(conn: &Connection) -> anyhow::Result<()> {
+        if !Self::table_has_column(conn, "llm_completion_outbox", "owner_scope")? {
+            // No released runtime has written the pre-scope schema. Preserve any
+            // development rows fail-closed: an empty scope cannot be recovered or
+            // resolved and therefore cannot authorize a provider replay.
+            conn.execute(
+                "ALTER TABLE llm_completion_outbox ADD COLUMN owner_scope TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
         }
         Ok(())
     }
@@ -431,6 +473,7 @@ impl EventStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path: PathBuf::from(path),
+            owner_registry: OwnerRegistry::global(),
         })
     }
 
@@ -442,7 +485,8 @@ impl EventStore {
     pub fn append_event(&self, event: &DomainEvent) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
         let conn = self.begin_fenced_write(
-            &OwnerRegistry::global()
+            &self
+                .owner_registry
                 .issue(StateTransferScope::for_aggregate(&event.aggregate_id))?,
         )?;
         conn.execute(
@@ -473,61 +517,6 @@ impl EventStore {
         Ok(row_id)
     }
 
-    /// Store a completed provider response before attempting the local usage append.
-    /// Reusing a request ID with different request bytes or response bytes fails closed.
-    pub fn enqueue_llm_completion(
-        &self,
-        request_id: &str,
-        request_digest: &str,
-        payload: &str,
-    ) -> anyhow::Result<()> {
-        let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        let existing = conn
-            .query_row(
-                "SELECT request_digest, payload, status FROM llm_completion_outbox WHERE request_id = ?1",
-                params![request_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        match existing {
-            None => {
-                conn.execute(
-                    "INSERT INTO llm_completion_outbox
-                     (request_id, request_digest, payload, status, attempt_count, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, 'pending_usage', 0, ?4, ?4)",
-                    params![request_id, request_digest, payload, now_ms],
-                )?;
-            }
-            Some((existing_digest, _, status))
-                if existing_digest == request_digest && status == "provider_in_flight" =>
-            {
-                conn.execute(
-                    "UPDATE llm_completion_outbox
-                     SET payload = ?3, status = 'pending_usage', updated_at = ?4
-                     WHERE request_id = ?1 AND request_digest = ?2 AND status = 'provider_in_flight'",
-                    params![request_id, request_digest, payload, now_ms],
-                )?;
-            }
-            Some((existing_digest, existing_payload, _)) => anyhow::ensure!(
-                existing_digest == request_digest && existing_payload == payload,
-                "LLM completion request_id conflict for {request_id}"
-            ),
-        }
-        conn.commit()?;
-        Ok(())
-    }
-
     /// Reserve the stable request ID immediately before network execution. If the
     /// process dies after the provider may have run but before its response is
     /// durable, the reservation remains fail-closed and prevents a paid replay.
@@ -535,32 +524,156 @@ impl EventStore {
         &self,
         request_id: &str,
         request_digest: &str,
+        agent_id: &str,
     ) -> anyhow::Result<bool> {
-        let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+        let owner_scope = StateTransferScope::for_aggregate(agent_id);
+        anyhow::ensure!(
+            matches!(owner_scope, StateTransferScope::NanoContainer(_)),
+            "LLM completion owner must be a canonical agent aggregate"
+        );
+        let owner_scope_wire = owner_scope.to_wire();
+        let conn = self.begin_fenced_write(&self.owner_registry.issue(owner_scope)?)?;
+        let terminal_count: i64 = conn.query_row(
+            "SELECT count(*) FROM llm_completion_outbox
+             WHERE status IN ('provider_in_flight', 'failed', 'action_claimed')",
+            [],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            terminal_count < LLM_COMPLETION_TERMINAL_LIMIT,
+            "LLM completion terminal backlog reached its fail-closed limit"
+        );
+        let usage_operation = format!("llm_usage_{request_id}");
+        let resolution_operation = format!("llm_resolution_{request_id}");
+        let already_final: bool = conn
+            .query_row(
+                "SELECT 1 FROM events WHERE operation_id IN (?1, ?2) LIMIT 1",
+                params![usage_operation, resolution_operation],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if already_final {
+            conn.commit()?;
+            return Ok(false);
+        }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO llm_completion_outbox
-             (request_id, request_digest, payload, status, attempt_count, created_at, updated_at)
-             VALUES (?1, ?2, '', 'provider_in_flight', 0, ?3, ?3)",
-            params![request_id, request_digest, now_ms],
+             (request_id, request_digest, owner_scope, payload, status, attempt_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, '', 'provider_in_flight', 0, ?4, ?4)",
+            params![request_id, request_digest, owner_scope_wire, now_ms],
         )?;
         if inserted == 0 {
-            let existing_digest: String = conn.query_row(
-                "SELECT request_digest FROM llm_completion_outbox WHERE request_id = ?1",
+            let (existing_digest, existing_scope): (String, String) = conn.query_row(
+                "SELECT request_digest, owner_scope FROM llm_completion_outbox WHERE request_id = ?1",
                 params![request_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             anyhow::ensure!(
-                existing_digest == request_digest,
+                existing_digest == request_digest && existing_scope == owner_scope_wire,
                 "LLM request reservation digest conflict for {request_id}"
             );
         }
         conn.commit()?;
         Ok(inserted == 1)
+    }
+
+    fn llm_completion_scope(&self, request_id: &str) -> anyhow::Result<StateTransferScope> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let wire: String = conn
+            .query_row(
+                "SELECT owner_scope FROM llm_completion_outbox WHERE request_id = ?1",
+                params![request_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("missing LLM completion {request_id}"))?;
+        let scope = StateTransferScope::from_wire(&wire)
+            .ok_or_else(|| anyhow::anyhow!("invalid LLM completion owner scope {wire:?}"))?;
+        anyhow::ensure!(
+            matches!(scope, StateTransferScope::NanoContainer(_)),
+            "LLM completion owner scope is not an agent"
+        );
+        Ok(scope)
+    }
+
+    fn begin_fenced_write_for_llm_completion(
+        &self,
+        request_id: &str,
+    ) -> anyhow::Result<FencedSqliteWrite<'_>> {
+        let scope = self.llm_completion_scope(request_id)?;
+        let guard = self.owner_registry.issue(scope)?;
+        self.begin_fenced_write(&guard)
+    }
+
+    /// Store a completed provider response before attempting the local usage append.
+    /// Only the exact reserved identity may transition to `pending_usage`.
+    pub fn enqueue_llm_completion(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        payload: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.begin_fenced_write_for_llm_completion(request_id)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let (existing_digest, existing_scope, existing_payload, status): (
+            String,
+            String,
+            String,
+            String,
+        ) = conn.query_row(
+            "SELECT request_digest, owner_scope, payload, status
+                 FROM llm_completion_outbox WHERE request_id = ?1",
+            params![request_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let scope = self.llm_completion_scope_from_wire(&existing_scope)?;
+        anyhow::ensure!(
+            existing_digest == request_digest,
+            "LLM completion digest conflict for {request_id}"
+        );
+        match status.as_str() {
+            "provider_in_flight" => {
+                let changed = conn.execute(
+                    "UPDATE llm_completion_outbox
+                     SET payload = ?3, status = 'pending_usage', updated_at = ?4
+                     WHERE request_id = ?1 AND request_digest = ?2
+                       AND owner_scope = ?5 AND status = 'provider_in_flight'",
+                    params![request_id, request_digest, payload, now_ms, scope.to_wire()],
+                )?;
+                anyhow::ensure!(
+                    changed == 1,
+                    "LLM completion reservation changed concurrently"
+                );
+            }
+            "pending_usage" => anyhow::ensure!(
+                existing_payload == payload,
+                "LLM completion response conflict for {request_id}"
+            ),
+            _ => anyhow::bail!("LLM completion {request_id} cannot enqueue from status {status}"),
+        }
+        conn.commit()?;
+        Ok(())
+    }
+
+    fn llm_completion_scope_from_wire(&self, wire: &str) -> anyhow::Result<StateTransferScope> {
+        let scope = StateTransferScope::from_wire(wire)
+            .ok_or_else(|| anyhow::anyhow!("invalid LLM completion owner scope {wire:?}"))?;
+        anyhow::ensure!(
+            matches!(scope, StateTransferScope::NanoContainer(_)),
+            "LLM completion owner scope is not an agent"
+        );
+        Ok(scope)
     }
 
     /// Return one durable completion by its stable request ID.
@@ -573,7 +686,7 @@ impl EventStore {
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
         conn.query_row(
-            "SELECT request_id, request_digest, payload, status, attempt_count, last_error,
+            "SELECT request_id, request_digest, owner_scope, payload, status, attempt_count, last_error,
                     created_at, updated_at
              FROM llm_completion_outbox WHERE request_id = ?1",
             params![request_id],
@@ -591,14 +704,18 @@ impl EventStore {
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
-            "SELECT request_id, request_digest, payload, status, attempt_count, last_error,
+            "SELECT request_id, request_digest, owner_scope, payload, status, attempt_count, last_error,
                     created_at, updated_at
              FROM llm_completion_outbox
              WHERE status IN ('pending_usage', 'ready_for_action')
              ORDER BY created_at ASC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], llm_completion_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let entries = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| self.owner_registry.issue(entry.owner_scope.clone()).is_ok())
+            .collect())
     }
 
     /// Atomically append the usage event and advance the durable response to the
@@ -609,15 +726,13 @@ impl EventStore {
         request_digest: &str,
         event: &DomainEvent,
     ) -> anyhow::Result<()> {
-        let conn = self.begin_fenced_write(
-            &OwnerRegistry::global()
-                .issue(StateTransferScope::for_aggregate(&event.aggregate_id))?,
-        )?;
+        let owner_scope = self.llm_completion_scope(request_id)?.to_wire();
+        let conn = self.begin_fenced_write_for_llm_completion(request_id)?;
         let state = conn
             .query_row(
-                "SELECT request_digest, status FROM llm_completion_outbox WHERE request_id = ?1",
+                "SELECT request_digest, owner_scope, status FROM llm_completion_outbox WHERE request_id = ?1",
                 params![request_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
             )
             .optional()?
             .ok_or_else(|| anyhow::anyhow!("missing LLM completion {request_id}"))?;
@@ -625,14 +740,18 @@ impl EventStore {
             state.0 == request_digest,
             "LLM completion digest conflict for {request_id}"
         );
-        if state.1 == "ready_for_action" || state.1 == "action_claimed" {
+        anyhow::ensure!(
+            state.1 == StateTransferScope::for_aggregate(&event.aggregate_id).to_wire(),
+            "LLM completion owner scope does not match usage aggregate"
+        );
+        if state.2 == "ready_for_action" || state.2 == "action_claimed" {
             conn.commit()?;
             return Ok(());
         }
         anyhow::ensure!(
-            state.1 == "pending_usage",
+            state.2 == "pending_usage",
             "LLM completion {request_id} is not recoverable from status {}",
-            state.1
+            state.2
         );
         conn.execute(
             "INSERT OR IGNORE INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -657,8 +776,9 @@ impl EventStore {
         conn.execute(
             "UPDATE llm_completion_outbox
              SET status = 'ready_for_action', last_error = NULL, updated_at = ?3
-             WHERE request_id = ?1 AND request_digest = ?2 AND status = 'pending_usage'",
-            params![request_id, request_digest, now_ms],
+             WHERE request_id = ?1 AND request_digest = ?2 AND status = 'pending_usage'
+               AND owner_scope = ?4",
+            params![request_id, request_digest, now_ms, owner_scope],
         )?;
         conn.commit()?;
         Ok(())
@@ -675,8 +795,8 @@ impl EventStore {
         max_attempts: u32,
     ) -> anyhow::Result<(u32, bool)> {
         anyhow::ensure!(max_attempts > 0, "max_attempts must be positive");
-        let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+        let owner_scope = self.llm_completion_scope(request_id)?.to_wire();
+        let conn = self.begin_fenced_write_for_llm_completion(request_id)?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -685,8 +805,9 @@ impl EventStore {
             .query_row(
                 "SELECT attempt_count, status FROM llm_completion_outbox
                  WHERE request_id = ?1 AND request_digest = ?2
+                   AND owner_scope = ?3
                    AND status IN ('pending_usage', 'ready_for_action')",
-                params![request_id, request_digest],
+                params![request_id, request_digest, owner_scope],
                 |row| Ok((row.get::<_, i64>(0)?, row.get(1)?)),
             )
             .optional()?
@@ -703,8 +824,17 @@ impl EventStore {
             "UPDATE llm_completion_outbox
              SET attempt_count = ?3, last_error = ?4, status = ?5, updated_at = ?6
              WHERE request_id = ?1 AND request_digest = ?2
+               AND owner_scope = ?7
                AND status IN ('pending_usage', 'ready_for_action')",
-            params![request_id, request_digest, attempts, error, status, now_ms],
+            params![
+                request_id,
+                request_digest,
+                attempts,
+                error,
+                status,
+                now_ms,
+                owner_scope
+            ],
         )?;
         conn.commit()?;
         Ok((attempts, terminal))
@@ -717,8 +847,8 @@ impl EventStore {
         request_id: &str,
         request_digest: &str,
     ) -> anyhow::Result<bool> {
-        let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+        let owner_scope = self.llm_completion_scope(request_id)?.to_wire();
+        let conn = self.begin_fenced_write_for_llm_completion(request_id)?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -726,8 +856,9 @@ impl EventStore {
         let changed = conn.execute(
             "UPDATE llm_completion_outbox
              SET status = 'action_claimed', updated_at = ?3
-             WHERE request_id = ?1 AND request_digest = ?2 AND status = 'ready_for_action'",
-            params![request_id, request_digest, now_ms],
+             WHERE request_id = ?1 AND request_digest = ?2 AND status = 'ready_for_action'
+               AND owner_scope = ?4",
+            params![request_id, request_digest, now_ms, owner_scope],
         )?;
         conn.commit()?;
         Ok(changed == 1)
@@ -740,15 +871,105 @@ impl EventStore {
         request_id: &str,
         request_digest: &str,
     ) -> anyhow::Result<bool> {
-        let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+        let owner_scope = self.llm_completion_scope(request_id)?.to_wire();
+        let conn = self.begin_fenced_write_for_llm_completion(request_id)?;
         let changed = conn.execute(
             "DELETE FROM llm_completion_outbox
-             WHERE request_id = ?1 AND request_digest = ?2 AND status = 'action_claimed'",
-            params![request_id, request_digest],
+             WHERE request_id = ?1 AND request_digest = ?2 AND status = 'action_claimed'
+               AND owner_scope = ?3",
+            params![request_id, request_digest, owner_scope],
         )?;
         conn.commit()?;
         Ok(changed == 1)
+    }
+
+    /// Resolve an ambiguous terminal row without making it replayable. The full
+    /// provider payload is removed and replaced by a compact, append-only audit and
+    /// idempotency marker. Only exact terminal identities are operator-resolvable.
+    pub fn resolve_llm_completion_terminal(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        reason: &str,
+    ) -> anyhow::Result<bool> {
+        let reason = reason.trim();
+        anyhow::ensure!(!reason.is_empty(), "resolution reason must not be empty");
+        anyhow::ensure!(
+            reason.len() <= LLM_COMPLETION_RESOLUTION_REASON_MAX_BYTES,
+            "resolution reason exceeds {} bytes",
+            LLM_COMPLETION_RESOLUTION_REASON_MAX_BYTES
+        );
+        let conn = self.begin_fenced_write_for_llm_completion(request_id)?;
+        let (existing_digest, owner_scope, status): (String, String, String) = conn.query_row(
+            "SELECT request_digest, owner_scope, status FROM llm_completion_outbox
+                 WHERE request_id = ?1",
+            params![request_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        anyhow::ensure!(
+            existing_digest == request_digest,
+            "LLM completion digest conflict for {request_id}"
+        );
+        anyhow::ensure!(
+            matches!(
+                status.as_str(),
+                "provider_in_flight" | "failed" | "action_claimed"
+            ),
+            "LLM completion {request_id} is not terminal"
+        );
+        let scope = self.llm_completion_scope_from_wire(&owner_scope)?;
+        let aggregate_id = match scope {
+            StateTransferScope::NanoContainer(agent_id) => agent_id,
+            StateTransferScope::World => unreachable!("validated agent scope"),
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut event = DomainEvent::new(
+            "llm_completion_resolved",
+            &aggregate_id,
+            &serde_json::json!({
+                "request_id": request_id,
+                "request_digest": request_digest,
+                "terminal_status": status,
+                "resolution": "operator_abandoned",
+                "reason": reason,
+            })
+            .to_string(),
+            request_id,
+            0,
+        )
+        .with_operation_id(&format!("llm_resolution_{request_id}"));
+        event.timestamp_ms = now_ms;
+        conn.execute(
+            "INSERT OR IGNORE INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                event.event_id,
+                event.event_type,
+                event.aggregate_id,
+                event.payload,
+                event.correlation_id,
+                event.causation_id,
+                event.operation_id,
+                event.tick as i64,
+                event.timestamp_ms as i64,
+                event.schema_version,
+                event.compensation_type,
+            ],
+        )?;
+        let changed = conn.execute(
+            "DELETE FROM llm_completion_outbox
+             WHERE request_id = ?1 AND request_digest = ?2 AND owner_scope = ?3
+               AND status IN ('provider_in_flight', 'failed', 'action_claimed')",
+            params![request_id, request_digest, owner_scope],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "LLM completion terminal state changed concurrently"
+        );
+        conn.commit()?;
+        Ok(true)
     }
 
     /// Check the durable operation id before issuing a provider call for a
@@ -776,7 +997,8 @@ impl EventStore {
     pub fn append_with_outbox(&self, event: &DomainEvent, topic: &str) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
         let conn = self.begin_fenced_write(
-            &OwnerRegistry::global()
+            &self
+                .owner_registry
                 .issue(StateTransferScope::for_aggregate(&event.aggregate_id))?,
         )?;
 
@@ -839,7 +1061,7 @@ impl EventStore {
     {
         let _telemetry_start = std::time::Instant::now();
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1195,7 +1417,7 @@ impl EventStore {
     ) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
 
         // Aktuelle Version ermitteln
         let current_version: i32 = conn
@@ -1273,7 +1495,7 @@ impl EventStore {
     /// `world_snapshots` Time-Machine-Tabelle.
     pub fn retain_latest_snapshots(&self) -> anyhow::Result<u64> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
         let deleted = conn.execute(
             "DELETE FROM snapshots
              WHERE id NOT IN (
@@ -1341,7 +1563,7 @@ impl EventStore {
     /// Markiert einen Outbox-Eintrag als publiziert.
     pub fn mark_published(&self, event_id: &str) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1417,7 +1639,7 @@ impl EventStore {
     /// Bump the restore generation epoch (called once per restore). Returns the new generation.
     pub fn increment_restore_generation(&self) -> anyhow::Result<i64> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
         let next = read_sim_metadata(&conn, "restore_generation")
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0)
@@ -1442,7 +1664,7 @@ impl EventStore {
             return Ok(()); // nothing discarded
         }
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
         let mut ranges = read_dead_ranges(&conn);
         ranges.push((from_exclusive, to_inclusive));
         set_sim_metadata_conn(&conn, "dead_ranges", &serde_json::to_string(&ranges)?)?;
@@ -1453,7 +1675,7 @@ impl EventStore {
     /// Drop a dead-range entry once its events have been pruned (keeps the list bounded).
     pub fn remove_dead_range(&self, from_exclusive: i64) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
         let mut ranges = read_dead_ranges(&conn);
         let before = ranges.len();
         ranges.retain(|(from, _)| *from != from_exclusive);
@@ -1519,7 +1741,7 @@ impl EventStore {
         }
 
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
 
         // #493: dead intervals are pruned ALONGSIDE the retention cutoff — even above it — so a
         // discarded future is physically removed in the normal retention window (not left to linger).
@@ -1592,7 +1814,7 @@ impl EventStore {
     /// Diese Methode ist als Maintenance-/Test-Primitive gedacht.
     pub fn delete_orphan_outbox(&self) -> anyhow::Result<u64> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
         let deleted = conn.execute(
             "DELETE FROM outbox
              WHERE event_id NOT IN (SELECT event_id FROM events)",
@@ -1615,7 +1837,7 @@ impl EventStore {
     /// - `offset < current` → `MonotonicityError` (Rueckwaerts-Drift)
     pub fn update_offset(&self, name: &str, offset: i64) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
 
         // Aktuellen Offset pruefen
         let current: Option<i64> = conn
@@ -1659,7 +1881,7 @@ impl EventStore {
     /// Erzwingt einen Offset-Wert (umgeht Monotonie-Pruefung, fuer Restore).
     pub fn force_reset_offset(&self, name: &str, offset: i64) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1674,7 +1896,7 @@ impl EventStore {
 
     pub fn reset_offset(&self, name: &str) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
         conn.execute(
             "DELETE FROM projection_offsets WHERE projection_name = ?1",
             params![name],
@@ -1789,7 +2011,7 @@ impl EventStore {
         created_at_ms: i64,
     ) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
         conn.execute(
             "INSERT INTO world_snapshots (id, tier, tick, sim_hour, last_event_id, payload_size, payload, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1852,7 +2074,7 @@ impl EventStore {
     /// Loescht einen World Snapshot anhand seiner ID.
     pub fn delete_world_snapshot(&self, id: &str) -> anyhow::Result<bool> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
         let deleted = conn.execute("DELETE FROM world_snapshots WHERE id = ?1", params![id])?;
         conn.commit()?;
         Ok(deleted > 0)
@@ -1861,7 +2083,7 @@ impl EventStore {
     /// Aktualisiert den Tier eines World Snapshots (fuer Promotion).
     pub fn promote_world_snapshot(&self, id: &str, new_tier: &str) -> anyhow::Result<bool> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+            self.begin_fenced_write(&self.owner_registry.issue(StateTransferScope::World)?)?;
         let updated = conn.execute(
             "UPDATE world_snapshots SET tier = ?1 WHERE id = ?2",
             params![new_tier, id],
@@ -1887,6 +2109,7 @@ impl EventStore {
 pub struct FencedSqliteWrite<'a> {
     conn: std::sync::MutexGuard<'a, Connection>,
     guard: OwnerWriteGuard,
+    owner_registry: &'static OwnerRegistry,
     committed: bool,
 }
 
@@ -1906,7 +2129,7 @@ impl std::ops::DerefMut for FencedSqliteWrite<'_> {
 
 impl FencedSqliteWrite<'_> {
     pub fn commit(mut self) -> anyhow::Result<()> {
-        OwnerRegistry::global().validate(&self.guard)?;
+        self.owner_registry.validate(&self.guard)?;
         self.conn.execute_batch("COMMIT")?;
         self.committed = true;
         Ok(())
@@ -1925,7 +2148,7 @@ impl FencedStore for EventStore {
     type Txn<'a> = FencedSqliteWrite<'a>;
 
     fn begin_fenced_write(&self, guard: &OwnerWriteGuard) -> anyhow::Result<FencedSqliteWrite<'_>> {
-        OwnerRegistry::global().validate(guard)?;
+        self.owner_registry.validate(guard)?;
         let conn = self
             .conn
             .lock()
@@ -1934,6 +2157,7 @@ impl FencedStore for EventStore {
         Ok(FencedSqliteWrite {
             conn,
             guard: guard.clone(),
+            owner_registry: self.owner_registry,
             committed: false,
         })
     }
@@ -1963,7 +2187,11 @@ pub trait OutboxTransport: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentinel_common::DomainEvent;
+    use sentinel_common::{
+        ActivationState, DomainEvent, LocalOwnerBaseRole, LocalOwnerBaseState,
+        LocalOwnerStateSnapshot, NodeId, OwnerTerm, OwnerTermSnapshot,
+        TRACK_A_COORDINATOR_GENERATION,
+    };
 
     fn test_event(event_type: &str, aggregate_id: &str) -> DomainEvent {
         DomainEvent::new(event_type, aggregate_id, r#"{"test":true}"#, "corr-1", 42)
@@ -2007,9 +2235,18 @@ mod tests {
         let request_id = "agent-runtime-07-55";
         let digest = "request-digest";
         let payload = r#"{"completed":true}"#;
-        assert!(store.reserve_llm_request(request_id, digest).unwrap());
-        assert!(!store.reserve_llm_request(request_id, digest).unwrap());
-        assert!(store.reserve_llm_request(request_id, "different").is_err());
+        assert!(store
+            .reserve_llm_request(request_id, digest, "AGENT-07")
+            .unwrap());
+        assert!(!store
+            .reserve_llm_request(request_id, digest, "AGENT-07")
+            .unwrap());
+        assert!(store
+            .reserve_llm_request(request_id, "different", "AGENT-07")
+            .is_err());
+        assert!(store
+            .reserve_llm_request(request_id, digest, "AGENT-08")
+            .is_err());
         assert_eq!(
             store
                 .get_llm_completion(request_id)
@@ -2018,11 +2255,21 @@ mod tests {
                 .status,
             "provider_in_flight"
         );
+        assert_eq!(
+            store
+                .get_llm_completion(request_id)
+                .unwrap()
+                .unwrap()
+                .owner_scope,
+            StateTransferScope::for_agent("AGENT-07")
+        );
         assert!(store.poll_llm_completions(10).unwrap().is_empty());
         drop(store);
 
         let store = EventStore::open(path.to_str().unwrap()).unwrap();
-        assert!(!store.reserve_llm_request(request_id, digest).unwrap());
+        assert!(!store
+            .reserve_llm_request(request_id, digest, "AGENT-07")
+            .unwrap());
         assert_eq!(
             store
                 .get_llm_completion(request_id)
@@ -2075,6 +2322,9 @@ mod tests {
             .complete_llm_completion_actions(request_id, digest)
             .unwrap());
         assert!(store.get_llm_completion(request_id).unwrap().is_none());
+        assert!(!store
+            .reserve_llm_request(request_id, digest, "AGENT-07")
+            .unwrap());
     }
 
     #[test]
@@ -2082,6 +2332,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("llm-completion-terminal.db");
         let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        assert!(store
+            .enqueue_llm_completion("request-1", "digest-1", "{}")
+            .is_err());
+        store
+            .reserve_llm_request("request-1", "digest-1", "AGENT-07")
+            .unwrap();
         store
             .enqueue_llm_completion("request-1", "digest-1", "{}")
             .unwrap();
@@ -2101,6 +2357,149 @@ mod tests {
         assert_eq!(terminal.status, "failed");
         assert_eq!(terminal.attempt_count, 2);
         assert!(store.poll_llm_completions(10).unwrap().is_empty());
+        assert!(store
+            .resolve_llm_completion_terminal(
+                "request-1",
+                "digest-1",
+                "operator verified no action can be replayed",
+            )
+            .unwrap());
+        assert!(store.get_llm_completion("request-1").unwrap().is_none());
+        assert!(store
+            .has_event_operation_id("llm_resolution_request-1")
+            .unwrap());
+        assert!(!store
+            .reserve_llm_request("request-1", "digest-1", "AGENT-07")
+            .unwrap());
+    }
+
+    #[test]
+    fn terminal_outbox_backlog_is_bounded_fail_closed() {
+        let store = EventStore::open(":memory:").unwrap();
+        {
+            let conn = store.conn();
+            let tx = conn.unchecked_transaction().unwrap();
+            for index in 0..LLM_COMPLETION_TERMINAL_LIMIT {
+                tx.execute(
+                    "INSERT INTO llm_completion_outbox
+                     (request_id, request_digest, owner_scope, payload, status, attempt_count, created_at, updated_at)
+                     VALUES (?1, 'digest', 'nano:AGENT-07', '', 'provider_in_flight', 0, 0, 0)",
+                    params![format!("terminal-{index}")],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        assert!(store
+            .reserve_llm_request("blocked", "digest", "AGENT-07")
+            .is_err());
+    }
+
+    fn cluster_owner_registry() -> &'static OwnerRegistry {
+        let local = NodeId(uuid::Uuid::from_bytes([7; 16]));
+        let remote = NodeId(uuid::Uuid::from_bytes([8; 16]));
+        let terms = vec![
+            OwnerTerm {
+                scope: StateTransferScope::World,
+                owner_node: remote,
+                epoch: 1,
+                coordinator_generation: TRACK_A_COORDINATOR_GENERATION,
+            },
+            OwnerTerm {
+                scope: StateTransferScope::for_agent("AGENT-07"),
+                owner_node: local,
+                epoch: 1,
+                coordinator_generation: TRACK_A_COORDINATOR_GENERATION,
+            },
+            OwnerTerm {
+                scope: StateTransferScope::for_agent("AGENT-08"),
+                owner_node: remote,
+                epoch: 1,
+                coordinator_generation: TRACK_A_COORDINATOR_GENERATION,
+            },
+        ];
+        let global =
+            OwnerTermSnapshot::new(TRACK_A_COORDINATOR_GENERATION, 1, terms.clone()).unwrap();
+        let local_snapshot = LocalOwnerStateSnapshot::new(
+            local,
+            TRACK_A_COORDINATOR_GENERATION,
+            1,
+            terms
+                .into_iter()
+                .map(|term| LocalOwnerBaseState {
+                    scope: term.scope.clone(),
+                    recipient_node: local,
+                    base_role: if term.owner_node == local {
+                        LocalOwnerBaseRole::Owner
+                    } else {
+                        LocalOwnerBaseRole::Follower
+                    },
+                    activation_state: if term.owner_node == local {
+                        ActivationState::Routable
+                    } else {
+                        ActivationState::NotRoutable
+                    },
+                    owner_term: term,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let registry = Box::leak(Box::new(OwnerRegistry::new_cluster_for_test(local)));
+        registry
+            .rebuild_from_owner_snapshot(&global, &local_snapshot, vec![])
+            .unwrap();
+        registry
+    }
+
+    #[test]
+    fn llm_completion_cluster_path_uses_agent_owner_not_world_owner() {
+        let registry = cluster_owner_registry();
+        assert!(matches!(
+            registry.issue(StateTransferScope::World),
+            Err(sentinel_common::OwnerIssueError::NotOwner { .. })
+        ));
+        let store = EventStore::open_with_owner_registry(":memory:", registry).unwrap();
+        let request_id = "agent-runtime-07-cluster";
+        let digest = "cluster-digest";
+        assert!(store
+            .reserve_llm_request(request_id, digest, "AGENT-07")
+            .unwrap());
+        store
+            .enqueue_llm_completion(request_id, digest, "{}")
+            .unwrap();
+        assert_eq!(
+            store
+                .record_llm_completion_failure(
+                    request_id,
+                    digest,
+                    "injected local append failure",
+                    2,
+                )
+                .unwrap(),
+            (1, false)
+        );
+        let mut usage = test_event("agent_llm_usage", "AGENT-07");
+        usage.operation_id = format!("llm_usage_{request_id}");
+        store
+            .persist_llm_completion_usage(request_id, digest, &usage)
+            .unwrap();
+        assert!(store
+            .claim_llm_completion_actions(request_id, digest)
+            .unwrap());
+        assert!(store
+            .complete_llm_completion_actions(request_id, digest)
+            .unwrap());
+        assert!(store.get_llm_completion(request_id).unwrap().is_none());
+
+        let foreign = store
+            .reserve_llm_request("agent-runtime-08-cluster", "foreign", "AGENT-08")
+            .unwrap_err();
+        assert!(foreign
+            .downcast_ref::<sentinel_common::OwnerIssueError>()
+            .is_some_and(|error| matches!(
+                error,
+                sentinel_common::OwnerIssueError::NotOwner { .. }
+            )));
     }
 
     /// #496: the fenced write entry is the single choke point every SQLite writer
@@ -2150,6 +2549,7 @@ mod tests {
                 OwnerRegistry::global().this_node(),
                 0,
             ),
+            owner_registry: store.owner_registry,
             committed: false,
         };
         stale

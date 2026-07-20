@@ -182,7 +182,12 @@ pub mod bridge {
     }
 
     trait CompletionStore: Send + Sync {
-        fn reserve_request(&self, request_id: &str, request_digest: &str) -> anyhow::Result<bool>;
+        fn reserve_request(
+            &self,
+            request_id: &str,
+            request_digest: &str,
+            agent_id: &str,
+        ) -> anyhow::Result<bool>;
         fn enqueue_completion(
             &self,
             request_id: &str,
@@ -210,8 +215,13 @@ pub mod bridge {
     }
 
     impl CompletionStore for EventStore {
-        fn reserve_request(&self, request_id: &str, request_digest: &str) -> anyhow::Result<bool> {
-            self.reserve_llm_request(request_id, request_digest)
+        fn reserve_request(
+            &self,
+            request_id: &str,
+            request_digest: &str,
+            agent_id: &str,
+        ) -> anyhow::Result<bool> {
+            self.reserve_llm_request(request_id, request_digest, agent_id)
         }
 
         fn enqueue_completion(
@@ -883,7 +893,11 @@ pub mod bridge {
                             }
                         };
                         let call_start = Instant::now();
-                        match bridge_event_store.reserve_request(&request_id, &request_digest) {
+                        match bridge_event_store.reserve_request(
+                            &request_id,
+                            &request_digest,
+                            &agent_id.to_string(),
+                        ) {
                             Ok(true) => {}
                             Ok(false) => {
                                 warn!(request_id = %request_id, "LLM provider request already reserved");
@@ -979,7 +993,11 @@ pub mod bridge {
                     };
                     tokio::spawn(async move {
                         let call_start = Instant::now();
-                        match bridge_event_store.reserve_request(&request_id, &request_digest) {
+                        match bridge_event_store.reserve_request(
+                            &request_id,
+                            &request_digest,
+                            &agent_id.to_string(),
+                        ) {
                             Ok(true) => {}
                             Ok(false) => {
                                 warn!(request_id = %request_id, "LLM provider request already reserved");
@@ -1362,8 +1380,10 @@ pub mod bridge {
                 &self,
                 request_id: &str,
                 request_digest: &str,
+                agent_id: &str,
             ) -> anyhow::Result<bool> {
-                self.inner.reserve_llm_request(request_id, request_digest)
+                self.inner
+                    .reserve_llm_request(request_id, request_digest, agent_id)
             }
 
             fn enqueue_completion(

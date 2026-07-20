@@ -75,6 +75,7 @@ const OPERATOR_RUNTIME_STALL_RESTART_TEST_PATH: &str = "/operator/runtime/stall-
 const OPERATOR_RUNTIME_PAUSE_PATH: &str = "/operator/runtime/pause";
 const OPERATOR_RUNTIME_RESUME_PATH: &str = "/operator/runtime/resume";
 const OPERATOR_RUNTIME_DESPAWN_PATH: &str = "/operator/runtime/despawn";
+const OPERATOR_LLM_COMPLETION_RESOLVE_PATH: &str = "/operator/llm-completions/resolve";
 const OPERATOR_APICP_SNAPSHOT_PATH: &str = "/operator/apicp/snapshot";
 const OPERATOR_SECURITY_FS_TRASH_PATH: &str = "/operator/security/fs-trash";
 const OPERATOR_SECURITY_FS_TRASH_FIXTURE_PATH: &str = "/operator/security/fs-trash-fixture";
@@ -444,6 +445,19 @@ struct LandlockTestResponse {
     audit_event_id: Option<String>,
     stdout: String,
     stderr: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ResolveLlmCompletionRequest {
+    request_id: String,
+    request_digest: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ResolveLlmCompletionResponse {
+    resolved: bool,
+    request_id: String,
 }
 
 #[derive(Clone)]
@@ -866,6 +880,34 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
     }
 
     match path_only {
+        OPERATOR_LLM_COMPLETION_RESOLVE_PATH => {
+            let payload: ResolveLlmCompletionRequest = match serde_json::from_slice(&request.body) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    return ApiError::BadRequest(
+                        "Invalid request JSON (expected request_id, request_digest, reason)",
+                    )
+                    .to_response();
+                }
+            };
+            match state.event_store.resolve_llm_completion_terminal(
+                &payload.request_id,
+                &payload.request_digest,
+                &payload.reason,
+            ) {
+                Ok(resolved) => json_response(
+                    200,
+                    ResolveLlmCompletionResponse {
+                        resolved,
+                        request_id: payload.request_id,
+                    },
+                ),
+                Err(error) => {
+                    warn!(request_id = %payload.request_id, %error, "LLM completion resolution rejected");
+                    ApiError::Conflict("LLM completion resolution rejected").to_response()
+                }
+            }
+        }
         OPERATOR_CHAOS_PATH => {
             let payload: TriggerChaosRequest = match serde_json::from_slice(&request.body) {
                 Ok(payload) => payload,
@@ -3508,6 +3550,7 @@ async fn write_http_response(stream: &mut TcpStream, response: HttpResponse) -> 
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        409 => "Conflict",
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
         503 => "Service Unavailable",
@@ -3801,6 +3844,60 @@ mod tests {
             }
             other => panic!("unerwartetes Kommando: {other:?}"),
         }
+    }
+
+    #[test]
+    fn llm_completion_terminal_resolution_requires_auth_and_leaves_compact_marker() {
+        let (state, _rx, _platform_rx, _runtime_rx) = test_state(Some("topsecret"));
+        let request_id = "operator-resolution-request";
+        let request_digest = "operator-resolution-digest";
+        assert!(state
+            .event_store
+            .reserve_llm_request(request_id, request_digest, "AGENT-07")
+            .unwrap());
+
+        let payload = serde_json::json!({
+            "request_id": request_id,
+            "request_digest": request_digest,
+            "reason": "Provider outcome cannot be proven after process loss"
+        });
+        let unauthorized = handle_http_request(
+            test_request(OPERATOR_LLM_COMPLETION_RESOLVE_PATH, payload.clone()),
+            &state,
+        );
+        assert_eq!(unauthorized.status, 401);
+        assert!(state
+            .event_store
+            .get_llm_completion(request_id)
+            .unwrap()
+            .is_some());
+
+        let mut request = test_request(OPERATOR_LLM_COMPLETION_RESOLVE_PATH, payload);
+        request
+            .headers
+            .insert(OPERATOR_KEY_HEADER.to_string(), "topsecret".to_string());
+        let resolved = handle_http_request(request, &state);
+        assert_eq!(resolved.status, 200);
+        assert_eq!(
+            serde_json::from_slice::<ResolveLlmCompletionResponse>(&resolved.body).unwrap(),
+            ResolveLlmCompletionResponse {
+                resolved: true,
+                request_id: request_id.to_string(),
+            }
+        );
+        assert!(state
+            .event_store
+            .get_llm_completion(request_id)
+            .unwrap()
+            .is_none());
+        assert!(state
+            .event_store
+            .has_event_operation_id(&format!("llm_resolution_{request_id}"))
+            .unwrap());
+        assert!(!state
+            .event_store
+            .reserve_llm_request(request_id, request_digest, "AGENT-07")
+            .unwrap());
     }
 
     #[test]

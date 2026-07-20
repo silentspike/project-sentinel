@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import tomllib
 import unittest
+from pathlib import Path
 
 from scripts.cortex_catalog_digest import normalize
 
@@ -46,7 +49,7 @@ class CatalogDigestTests(unittest.TestCase):
         second["providers"]["alpha"]["default_model"] = "a1"
         self.assertNotEqual(normalize(first), normalize(second))
 
-    def test_hierarchy_mapping_is_validated_but_excluded_from_semantic_bytes(self) -> None:
+    def test_hierarchy_mapping_changes_semantic_bytes(self) -> None:
         first = catalog()
         second = copy.deepcopy(first)
         second["providers"]["alpha"]["hierarchy_models"] = {
@@ -54,7 +57,28 @@ class CatalogDigestTests(unittest.TestCase):
             "tier_2": "a2",
             "tier_3": "a1",
         }
-        self.assertEqual(normalize(first), normalize(second))
+        self.assertNotEqual(normalize(first), normalize(second))
+
+    def test_normalized_bytes_match_v1_golden(self) -> None:
+        expected = (
+            b'{"algorithm":"cortex-catalog-v1","providers":['
+            b'{"allowed_models":["a1","a2","a3"],"default_model":"a2",'
+            b'"hierarchy_models":{"tier_1":"a1","tier_2":"a2","tier_3":"a3"},'
+            b'"id":"alpha","type":"local-loop"},'
+            b'{"allowed_models":["b1","b2","b3"],"default_model":"b2",'
+            b'"hierarchy_models":{"tier_1":"b1","tier_2":"b2","tier_3":"b3"},'
+            b'"id":"beta","type":"mock"}]}'
+            b"\n"
+        )
+        self.assertEqual(normalize(catalog()), expected)
+
+    def test_repository_catalog_matches_gate_c_semantic_pin(self) -> None:
+        path = Path(__file__).resolve().parents[1] / "config" / "cortex-gateway.toml"
+        document = tomllib.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            hashlib.sha256(normalize(document)).hexdigest(),
+            "10ed8408bd69c9b10acda44f4cebc889680435945b08a5c3ef2cf068a58680aa",
+        )
 
     def test_incomplete_hierarchy_map_fails_closed(self) -> None:
         document = catalog()
