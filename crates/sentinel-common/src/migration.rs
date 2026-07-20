@@ -34,6 +34,8 @@ pub enum NotMigratableReason {
     PendingSideEffect,
     /// The container is not spawned on this node.
     UnknownAgent,
+    /// The local node is not ready/authorized to read the container under V19.
+    OwnerFenceRejected,
 }
 
 impl fmt::Display for NotMigratableReason {
@@ -43,6 +45,7 @@ impl fmt::Display for NotMigratableReason {
             NotMigratableReason::ScheduledWorkActive => "active scheduled work (V23)",
             NotMigratableReason::PendingSideEffect => "pending external side-effect (V30)",
             NotMigratableReason::UnknownAgent => "agent not spawned on this node",
+            NotMigratableReason::OwnerFenceRejected => "owner fence rejected the container scope",
         };
         f.write_str(s)
     }
@@ -81,6 +84,7 @@ mod tests {
             NotMigratableReason::ScheduledWorkActive,
             NotMigratableReason::PendingSideEffect,
             NotMigratableReason::UnknownAgent,
+            NotMigratableReason::OwnerFenceRejected,
         ] {
             assert!(!r.to_string().is_empty());
             assert!(!MigrationEligibility::NotMigratable(r).is_eligible());

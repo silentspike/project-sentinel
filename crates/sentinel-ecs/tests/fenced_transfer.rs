@@ -17,10 +17,13 @@ fn fenced_snapshot_is_taken_under_the_owner_fence() {
     // The cut's owner_epoch is the #496 fence epoch for this container's NanoContainer scope.
     let scope = StateTransferScope::for_agent(AgentId(1).to_string());
     let reg = OwnerRegistry::global();
-    assert_eq!(snap.cut.owner_epoch, reg.current_owner(&scope).epoch);
+    assert_eq!(
+        snap.cut.owner_epoch,
+        reg.current_owner(&scope).unwrap().epoch
+    );
 
     // Single-node fence is a no-op pass: a guard for the scope validates with 0 StaleEpoch.
-    let guard = reg.issue(scope.clone());
+    let guard = reg.issue(scope.clone()).unwrap();
     assert!(
         reg.validate(&guard).is_ok(),
         "single-node fence must pass (0 StaleEpoch) — prod path unchanged"
