@@ -113,7 +113,13 @@ improvise a migration.
    runtime stats, and Prometheus dimensions at one recorded boundary C.
 11. Confirm advancing simulation ticks and the absence of panic, drift,
     unbounded retry, crash loop, or unexpected restart before ending the
-    window.
+    window. Completed gateway responses must enter `llm_completion_outbox`
+    before the usage append. Verify the finite append-attempt limit and that a
+    terminal `failed` row is quarantined instead of requeued to the provider.
+    The bridge reserves `request_id` plus request digest immediately before the
+    network call. A crash while that call is ambiguous leaves a
+    `provider_in_flight` record and fails closed instead of issuing the request
+    again.
 
 ## Pass conditions
 
@@ -127,6 +133,11 @@ improvise a migration.
 - Replaying from a stale hierarchy offset is idempotent.
 - The additive API reports both offsets and coverage without requiring a
   `CostView` change.
+- Restarting after a completed provider response but before its usage append
+  produces one provider call, two local append attempts, one usage event, and
+  one action. Actions are claimed durably before channel delivery. A crash after
+  that claim is deliberately fail-closed/at-most-once: the action is not replayed
+  automatically and the `action_claimed` row remains for operator diagnosis.
 
 ## Rollback order
 
