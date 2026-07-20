@@ -26,7 +26,7 @@ use sentinel_ebpf::collector::MetricsSnapshot;
 use sentinel_ebpf::EbpfCollector;
 use sentinel_ecs::{
     apply_personality, create_simulation_world, despawn_agent_from_world, spawn_agent,
-    ActionReceiver, LimboEventStore, PerceptionSender, SimulationTime,
+    spawn_prepared_agent, ActionReceiver, LimboEventStore, PerceptionSender, SimulationTime,
 };
 use sentinel_hippocampus::{NMDA_CONSOLIDATION_THRESHOLD, NMDA_MAX_CONSOLIDATION_EPISODES};
 use sentinel_limbo::EventStore;
@@ -750,6 +750,177 @@ fn spawn_agent_full(
     true
 }
 
+fn initial_owner_snapshot(
+    seed_node: sentinel_common::NodeId,
+    agents: &[AgentConfig],
+) -> Result<sentinel_common::OwnerTermSnapshot> {
+    let mut scopes = Vec::with_capacity(agents.len() + 1);
+    scopes.push(sentinel_common::StateTransferScope::World);
+    scopes.extend(agents.iter().map(|agent| {
+        sentinel_common::StateTransferScope::for_agent(
+            sentinel_common::AgentId(agent.identity.id).to_string(),
+        )
+    }));
+    scopes.sort_by_key(sentinel_common::StateTransferScope::to_wire);
+    scopes.dedup();
+    let terms = scopes
+        .into_iter()
+        .map(|scope| sentinel_common::OwnerTerm {
+            scope,
+            owner_node: seed_node,
+            epoch: 1,
+            coordinator_generation: sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+        })
+        .collect();
+    sentinel_common::OwnerTermSnapshot::new(
+        sentinel_common::TRACK_A_COORDINATOR_GENERATION,
+        1,
+        terms,
+    )
+    .context("build initial owner snapshot")
+}
+
+fn recipient_owner_snapshot(
+    global: &sentinel_common::OwnerTermSnapshot,
+    recipient: sentinel_common::NodeId,
+) -> Result<sentinel_common::LocalOwnerStateSnapshot> {
+    let states = global
+        .sorted_terms
+        .iter()
+        .cloned()
+        .map(|owner_term| {
+            let owns_scope = owner_term.owner_node == recipient;
+            sentinel_common::LocalOwnerBaseState {
+                scope: owner_term.scope.clone(),
+                recipient_node: recipient,
+                owner_term,
+                base_role: if owns_scope {
+                    sentinel_common::LocalOwnerBaseRole::Owner
+                } else {
+                    sentinel_common::LocalOwnerBaseRole::Follower
+                },
+                activation_state: if owns_scope {
+                    sentinel_common::ActivationState::Routable
+                } else {
+                    sentinel_common::ActivationState::NotRoutable
+                },
+            }
+        })
+        .collect();
+    sentinel_common::LocalOwnerStateSnapshot::new(
+        recipient,
+        global.coordinator_generation,
+        global.term_snapshot_revision,
+        states,
+    )
+    .context("build recipient owner snapshot")
+}
+
+fn agents_for_local_residency(all: &[AgentConfig], shift: u8) -> Vec<&AgentConfig> {
+    agents_for_shift(all, shift)
+        .into_iter()
+        .filter(|agent| {
+            let scope = sentinel_common::StateTransferScope::for_agent(
+                sentinel_common::AgentId(agent.identity.id).to_string(),
+            );
+            matches!(
+                sentinel_common::OwnerRegistry::global().local_residency(&scope),
+                Ok(sentinel_common::LocalResidency::Active)
+            )
+        })
+        .collect()
+}
+
+fn agents_for_prepared_residency(all: &[AgentConfig]) -> Vec<&AgentConfig> {
+    all.iter()
+        .filter(|agent| {
+            let scope = sentinel_common::StateTransferScope::for_agent(
+                sentinel_common::AgentId(agent.identity.id).to_string(),
+            );
+            matches!(
+                sentinel_common::OwnerRegistry::global().local_residency(&scope),
+                Ok(sentinel_common::LocalResidency::PreparedFrozen)
+            )
+        })
+        .collect()
+}
+
+fn rebuild_owner_registry_from_store(
+    meta: &sentinel_redb::ClusterMetaStore,
+) -> Result<sentinel_common::OwnerTermSnapshot> {
+    let (global, local) = meta
+        .installed_owner_snapshot()?
+        .context("owner snapshot install marker is absent")?;
+    let sagas = meta.list_local_saga_states()?;
+    sentinel_common::OwnerRegistry::global()
+        .rebuild_from_owner_snapshot(&global, &local, sagas)
+        .context("rebuild owner registry from durable snapshot")?;
+    Ok(global)
+}
+
+async fn gate_seed_snapshot_replication<F, Fut>(snapshot_changed: bool, replicate: F) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    if snapshot_changed {
+        replicate().await
+    } else {
+        Ok(())
+    }
+}
+
+async fn run_owner_snapshot_reconciliation(
+    control: Arc<crate::cluster_control::ClusterControl>,
+    meta: Arc<sentinel_redb::ClusterMetaStore>,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let global = match meta.installed_owner_snapshot() {
+            Ok(Some((global, _))) => global,
+            Ok(None) => {
+                warn!("owner snapshot reconciliation skipped: install marker is absent");
+                continue;
+            }
+            Err(error) => {
+                warn!(%error, "owner snapshot reconciliation readback failed");
+                continue;
+            }
+        };
+        for (peer_node, peer_alias) in control.configured_peers() {
+            let local = match recipient_owner_snapshot(&global, peer_node) {
+                Ok(local) => local,
+                Err(error) => {
+                    warn!(peer = %peer_alias, %error, "owner snapshot reconciliation payload failed");
+                    continue;
+                }
+            };
+            match control
+                .replicate_owner_snapshot(&peer_alias, global.clone(), local)
+                .await
+            {
+                Ok(
+                    sentinel_common::OwnerSnapshotInstallOutcome::Installed
+                    | sentinel_common::OwnerSnapshotInstallOutcome::AlreadyInstalled,
+                ) => {}
+                Ok(outcome) => warn!(
+                    peer = %peer_alias,
+                    ?outcome,
+                    "owner snapshot reconciliation was refused"
+                ),
+                Err(error) => debug!(
+                    peer = %peer_alias,
+                    %error,
+                    "owner snapshot peer remains unavailable; will reconcile later"
+                ),
+            }
+        }
+    }
+}
+
 /// Startet den Daemon-Hauptloop.
 ///
 /// 1. Oeffnet EventStore + StateStore
@@ -762,20 +933,253 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let flags = sentinel_common::feature_flags::RuntimeFlags::init();
     info!(?flags, "Runtime Feature Flags geladen");
 
-    // -- Cluster 12 (#496): pin the owner registry to this node's identity FIRST, before
-    // any store opens or writes. An early fenced write (snapshot restore, projection)
-    // would otherwise lock the process-global `OwnerRegistry` to its nil single-node
-    // default (`OnceLock`) and make a later `init_single_node` a silent no-op — leaving
-    // the seed's registry identity as nil. The durable term/retirement reconcile still
-    // runs below, once the cluster-meta store is open. --
-    if let Some(cluster) = config.cluster.as_ref() {
-        sentinel_common::OwnerRegistry::init_single_node(cluster.node_id);
-    }
-
-    // -- Datenbanken oeffnen (sync) --
+    // Load the complete boot roster before opening any fenced data store. In cluster
+    // mode the seed must materialize World plus every configured agent scope in one
+    // full authority snapshot; an unknown scope is never synthesized as self-owned.
     let data_dir = &config.data_dir;
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("data_dir erstellen: {}", data_dir.display()))?;
+
+    let agents_dir = config.config_dir.join("agents");
+    let agent_validation = config.agent_config_validation()?;
+    let all_agents = load_all_agents_with_validation(&agents_dir, agent_validation)
+        .with_context(|| format!("Agents laden aus: {}", agents_dir.display()))?;
+    info!(
+        total_agents = all_agents.len(),
+        "Agent-Definitionen geladen"
+    );
+
+    // A cluster process starts with both ownership and activation closed. The only
+    // paths that may open the latch are a valid durable install marker or an inbound
+    // authenticated full-snapshot install. Without [daemon.cluster], the established
+    // lock-free single-node fast path remains unchanged.
+    let mut bootstrap_global_snapshot = None;
+    let mut seed_snapshot_changed = false;
+    let cluster_meta: Option<Arc<sentinel_redb::ClusterMetaStore>> = match config.cluster.as_ref() {
+        Some(cluster) => {
+            let initialized = sentinel_common::OwnerRegistry::init_cluster(cluster.node_id);
+            let registry = sentinel_common::OwnerRegistry::global();
+            if !initialized
+                && (registry.this_node() != cluster.node_id || !registry.is_cluster_mode())
+            {
+                anyhow::bail!(
+                    "owner registry was initialized before cluster bootstrap for node {}",
+                    cluster.node_id
+                );
+            }
+
+            let path = data_dir.join("cluster_meta.redb");
+            let meta = Arc::new(
+                sentinel_redb::ClusterMetaStore::open(&path.to_string_lossy())
+                    .context("open cluster owner metadata")?,
+            );
+            let marker = meta.install_marker()?;
+            if let Some(marker) = marker.as_ref() {
+                if marker.coordinator_generation != 0
+                    && marker.coordinator_generation
+                        != sentinel_common::TRACK_A_COORDINATOR_GENERATION
+                {
+                    anyhow::bail!(
+                        "installed owner generation {} does not match Track-A generation {}",
+                        marker.coordinator_generation,
+                        sentinel_common::TRACK_A_COORDINATOR_GENERATION
+                    );
+                }
+            }
+            match marker {
+                Some(marker)
+                    if marker.coordinator_generation
+                        == sentinel_common::TRACK_A_COORDINATOR_GENERATION =>
+                {
+                    let global = rebuild_owner_registry_from_store(&meta)?;
+                    info!(
+                        node_id = %cluster.node_id,
+                        revision = global.term_snapshot_revision,
+                        scopes = global.sorted_terms.len(),
+                        "Cluster 12: owner/activation caches rebuilt from durable snapshot"
+                    );
+                    bootstrap_global_snapshot = Some(global);
+                }
+                None | Some(_) if cluster.seed => {
+                    let global = initial_owner_snapshot(cluster.node_id, &all_agents)?;
+                    let local = recipient_owner_snapshot(&global, cluster.node_id)?;
+                    let outcome = meta.install_owner_snapshot(&global, &local)?;
+                    if !matches!(
+                        outcome,
+                        sentinel_common::OwnerSnapshotInstallOutcome::Installed
+                            | sentinel_common::OwnerSnapshotInstallOutcome::AlreadyInstalled
+                    ) {
+                        anyhow::bail!("initial owner snapshot install failed: {outcome:?}");
+                    }
+                    let installed = rebuild_owner_registry_from_store(&meta)?;
+                    info!(
+                        node_id = %cluster.node_id,
+                        revision = installed.term_snapshot_revision,
+                        scopes = installed.sorted_terms.len(),
+                        "Cluster 12: deterministic seed owner snapshot installed"
+                    );
+                    bootstrap_global_snapshot = Some(installed);
+                    seed_snapshot_changed = true;
+                }
+                None | Some(_) => info!(
+                    node_id = %cluster.node_id,
+                    "Cluster 12: member awaiting authenticated Track-A owner snapshot"
+                ),
+            }
+
+            // A valid marker can predate a newly configured boot-roster scope. The
+            // chef must materialize every such scope in one higher-revision authority
+            // transaction before the control listener replicates it and before runtime
+            // residency is evaluated. Members never invent the missing term locally.
+            if cluster.seed {
+                let installed = bootstrap_global_snapshot
+                    .as_ref()
+                    .context("seed owner snapshot missing during boot-roster reconciliation")?;
+                let (reconciled, changed) = crate::operator_api::extend_owner_snapshot_for_agents(
+                    installed,
+                    &all_agents,
+                    cluster.node_id,
+                    true,
+                )?;
+                if changed {
+                    let local = recipient_owner_snapshot(&reconciled, cluster.node_id)?;
+                    registry.close_owner_readiness();
+                    match meta.install_owner_snapshot(&reconciled, &local)? {
+                        sentinel_common::OwnerSnapshotInstallOutcome::Installed
+                        | sentinel_common::OwnerSnapshotInstallOutcome::AlreadyInstalled => {}
+                        outcome => anyhow::bail!(
+                            "boot-roster owner snapshot reconciliation failed: {outcome:?}"
+                        ),
+                    }
+                    let installed = rebuild_owner_registry_from_store(&meta)?;
+                    info!(
+                        revision = installed.term_snapshot_revision,
+                        scopes = installed.sorted_terms.len(),
+                        "Cluster 12: boot-roster owner scopes materialized before runtime start"
+                    );
+                    bootstrap_global_snapshot = Some(installed);
+                    seed_snapshot_changed = true;
+                }
+            }
+            Some(meta)
+        }
+        None => None,
+    };
+
+    // Start the authenticated control listener before any cluster data-plane store.
+    // A first-boot member can therefore receive its full snapshot while every normal
+    // write and every runtime spawn remains fail-closed.
+    let cluster_membership = config.cluster.as_ref().map(|_| {
+        Arc::new(crate::cluster_membership::MembershipRuntime::new(
+            sentinel_common::MembershipConfig::default(),
+        ))
+    });
+    let cluster_control: Option<Arc<crate::cluster_control::ClusterControl>> =
+        match config.cluster.as_ref() {
+            Some(cluster) => {
+                let bind = cluster
+                    .control_bind
+                    .as_deref()
+                    .context("cluster control_bind is required for fail-closed bootstrap")?;
+                let alias = cluster
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| cluster.node_id.to_string());
+                Some(Arc::new(crate::cluster_control::ClusterControl::start(
+                    bind,
+                    data_dir,
+                    &alias,
+                    cluster.cluster_id,
+                    cluster.node_id,
+                    cluster.effective_chef_node_id(),
+                    &cluster.control_peers,
+                    Arc::clone(
+                        cluster_membership
+                            .as_ref()
+                            .expect("cluster membership exists with cluster config"),
+                    ),
+                    cluster_meta.clone(),
+                )?))
+            }
+            None => None,
+        };
+
+    if let (Some(cluster), Some(control)) = (config.cluster.as_ref(), cluster_control.as_ref()) {
+        if cluster.seed {
+            let global = bootstrap_global_snapshot
+                .as_ref()
+                .context("seed owner snapshot missing after local bootstrap")?;
+            gate_seed_snapshot_replication(seed_snapshot_changed, || async {
+                for (peer_node, peer_alias) in control.configured_peers() {
+                    let local = recipient_owner_snapshot(global, peer_node)?;
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+                    loop {
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            control.replicate_owner_snapshot(
+                                &peer_alias,
+                                global.clone(),
+                                local.clone(),
+                            ),
+                        )
+                        .await;
+                        match result {
+                            Ok(Ok(
+                                sentinel_common::OwnerSnapshotInstallOutcome::Installed
+                                | sentinel_common::OwnerSnapshotInstallOutcome::AlreadyInstalled,
+                            )) => {
+                                info!(
+                                    peer = %peer_alias,
+                                    recipient = %peer_node,
+                                    revision = global.term_snapshot_revision,
+                                    "Cluster 12: owner snapshot replicated before runtime start"
+                                );
+                                break;
+                            }
+                            Ok(Ok(outcome)) => anyhow::bail!(
+                                "peer {peer_alias} refused owner snapshot with {outcome:?}"
+                            ),
+                            Ok(Err(error)) if tokio::time::Instant::now() < deadline => {
+                                warn!(peer = %peer_alias, %error, "owner snapshot replication retry");
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                            }
+                            Err(_) if tokio::time::Instant::now() < deadline => {
+                                warn!(peer = %peer_alias, "owner snapshot replication timed out; retrying");
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                            }
+                            Ok(Err(error)) => return Err(error).context(format!(
+                                "replicate owner snapshot to {peer_alias} before runtime start"
+                            )),
+                            Err(_) => anyhow::bail!(
+                                "replicate owner snapshot to {peer_alias} timed out before runtime start"
+                            ),
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+        } else if !sentinel_common::OwnerRegistry::global().owner_readiness() {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while !sentinel_common::OwnerRegistry::global().owner_readiness()
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if !sentinel_common::OwnerRegistry::global().owner_readiness() {
+                anyhow::bail!(
+                    "member owner snapshot was not installed before the bootstrap deadline"
+                );
+            }
+            let _ = rebuild_owner_registry_from_store(
+                cluster_meta
+                    .as_deref()
+                    .expect("cluster metadata exists with cluster config"),
+            )?;
+        }
+    }
+
+    // -- Datenbanken oeffnen (sync) --
 
     let events_path = data_dir.join("events.db");
     let state_path = data_dir.join("state.redb");
@@ -818,19 +1222,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         None
     };
 
-    // -- Agent-Definitionen laden --
-    let agents_dir = config.config_dir.join("agents");
-    let agent_validation = config.agent_config_validation()?;
-    let all_agents = load_all_agents_with_validation(&agents_dir, agent_validation)
-        .with_context(|| format!("Agents laden aus: {}", agents_dir.display()))?;
-    info!(
-        total_agents = all_agents.len(),
-        "Agent-Definitionen geladen"
-    );
-
     // -- Schicht erkennen --
     let current_shift = detect_current_shift();
-    let shift_agents = agents_for_shift(&all_agents, current_shift);
+    let shift_agents = agents_for_local_residency(&all_agents, current_shift);
     info!(
         shift_set = current_shift,
         active_agents = shift_agents.len(),
@@ -838,7 +1232,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     );
 
     // -- Runtime Orchestrator (Restore oder Neu) --
-    let runtime_orch =
+    let mut runtime_orch =
         match RuntimeOrchestrator::restore(Arc::clone(&event_store), config.max_agents) {
             Ok(restored) => {
                 info!(
@@ -853,6 +1247,42 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                     .with_event_store(Arc::clone(&event_store))
             }
         };
+
+    if config.cluster.is_some() {
+        let active_ids: HashSet<_> = all_agents
+            .iter()
+            .filter_map(|agent| {
+                let agent_id = sentinel_common::AgentId(agent.identity.id);
+                let scope = sentinel_common::StateTransferScope::for_agent(agent_id.to_string());
+                matches!(
+                    sentinel_common::OwnerRegistry::global().local_residency(&scope),
+                    Ok(sentinel_common::LocalResidency::Active)
+                )
+                .then_some(agent_id)
+            })
+            .collect();
+        let prepared_ids: HashSet<_> = all_agents
+            .iter()
+            .filter_map(|agent| {
+                let agent_id = sentinel_common::AgentId(agent.identity.id);
+                let scope = sentinel_common::StateTransferScope::for_agent(agent_id.to_string());
+                matches!(
+                    sentinel_common::OwnerRegistry::global().local_residency(&scope),
+                    Ok(sentinel_common::LocalResidency::PreparedFrozen)
+                )
+                .then_some(agent_id)
+            })
+            .collect();
+        let resident_ids: HashSet<_> = active_ids.union(&prepared_ids).copied().collect();
+        let (removed, sealed) =
+            runtime_orch.reconcile_bootstrap_residents(&resident_ids, &prepared_ids);
+        if removed > 0 || sealed > 0 {
+            info!(
+                removed,
+                sealed, "Cluster 12: restored runtime handles reconciled before runtime start"
+            );
+        }
+    }
 
     // -- sentinel-fs FUSE Mount (optional, konfigurierbar) --
     let active_fs_mount: Option<String> = {
@@ -1034,136 +1464,6 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
         }
     };
 
-    // -- Cluster 12 (#496): pin the owner registry to this node's identity so every
-    // fenced store write validates against committed ownership (V19), and open the
-    // durable cluster-meta store (ADR-3). Single-node the seed owns every scope, so live
-    // behavior is unchanged; without [daemon.cluster] the registry keeps its default
-    // single-node owner and no meta store is opened. The `Arc` is shared with the #569
-    // control-stream handler so an `OwnerCommit` RPC persists ownership here (PR2b-2). --
-    let cluster_meta: Option<Arc<sentinel_redb::ClusterMetaStore>> = match config.cluster.as_ref() {
-        Some(cluster) => {
-            // `init_single_node` already ran at the top of `run` (before any store write);
-            // here we only open the durable cluster-meta store and reconcile from it.
-            let cluster_meta_path = data_dir.join("cluster_meta.redb");
-            match sentinel_redb::ClusterMetaStore::open(&cluster_meta_path.to_string_lossy()) {
-                Ok(meta) => {
-                    // Seed the `World` term on first start; on restart it is read back
-                    // (PR2b-1c) so ownership survives a reboot.
-                    match meta.get_owner_term(&sentinel_common::StateTransferScope::World) {
-                        Ok(Some(term)) => {
-                            info!(
-                                epoch = term.epoch,
-                                "Cluster 12: Owner-Term aus Meta-Store geladen (World)"
-                            )
-                        }
-                        Ok(None) => {
-                            let term = sentinel_common::OwnerTerm {
-                                scope: sentinel_common::StateTransferScope::World,
-                                owner_node: cluster.node_id,
-                                epoch: 1,
-                            };
-                            match meta.put_owner_term(&term) {
-                                Ok(()) => info!("Cluster 12: Seed-Owner-Term im Meta-Store angelegt (World @ epoch 1)"),
-                                Err(e) => warn!(error = %e, "Cluster 12: Seed-Owner-Term konnte nicht persistiert werden"),
-                            }
-                        }
-                        Err(e) => warn!(error = %e, "Cluster 12: Owner-Term-Lesen fehlgeschlagen"),
-                    }
-                    // Restart-reconcile (PR2b-2): re-establish the in-memory registry from
-                    // every persisted term. A committed cross-node term (owner is not this
-                    // seed, or epoch != 1) re-enters cluster mode so a handoff's
-                    // OwnerCommit(E+1) survives a reboot; the seed's own World@1 stays on
-                    // the lock-free fast path (no commit_owner -> mode unchanged).
-                    match meta.list_owner_terms() {
-                        Ok(terms) => {
-                            for term in terms {
-                                if term.owner_node != cluster.node_id || term.epoch != 1 {
-                                    info!(scope = ?term.scope, epoch = term.epoch, owner = %term.owner_node,
-                                        "Cluster 12: Owner-Term aus Meta-Store re-etabliert (Cluster-Mode)");
-                                    sentinel_common::OwnerRegistry::global().commit_owner(term);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Cluster 12: Owner-Terms-Reconcile fehlgeschlagen")
-                        }
-                    }
-                    // Re-establish durable local retirements (V4, PR2b-2ii): a scope this
-                    // node retired in a prior cooperative handoff stays fenced across the
-                    // restart, even before any cross-node term update is visible.
-                    match meta.list_local_states() {
-                        Ok(states) if !states.is_empty() => {
-                            let n = states.len();
-                            sentinel_common::OwnerRegistry::global()
-                                .restore_local_retirements(states);
-                            info!(
-                                count = n,
-                                "Cluster 12: lokale Retirements aus Meta-Store re-etabliert (V4)"
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            warn!(error = %e, "Cluster 12: lokale Retirements-Reconcile fehlgeschlagen")
-                        }
-                    }
-                    info!(node_id = %cluster.node_id, "Cluster 12: OwnerRegistry als Single-Node-Seed initialisiert");
-                    Some(Arc::new(meta))
-                }
-                Err(e) => {
-                    warn!(error = %e, "Cluster 12: ClusterMetaStore konnte nicht geoeffnet werden");
-                    None
-                }
-            }
-        }
-        None => None,
-    };
-
-    // -- Cluster 12 Membership (#495): one shared view for the inbound QUIC handler
-    // and the receiver-local liveness ticker. The task starts after the control stream. --
-    let cluster_membership = config.cluster.as_ref().map(|_| {
-        Arc::new(crate::cluster_membership::MembershipRuntime::new(
-            sentinel_common::MembershipConfig::default(),
-        ))
-    });
-
-    // -- Cluster 12 control stream (#569, ADR-2): one cert-pinned QUIC RPC server,
-    // started only when [daemon.cluster].control_bind is set. The handle (server kept
-    // alive + outbound client) is shared with the operator API for the live RPC AC. --
-    let cluster_control: Option<Arc<crate::cluster_control::ClusterControl>> =
-        match config.cluster.as_ref() {
-            Some(cluster) => match cluster.control_bind.as_deref() {
-                Some(bind) => {
-                    let alias = cluster
-                        .alias
-                        .clone()
-                        .unwrap_or_else(|| cluster.node_id.to_string());
-                    match crate::cluster_control::ClusterControl::start(
-                        bind,
-                        data_dir,
-                        &alias,
-                        cluster.cluster_id,
-                        cluster.node_id,
-                        cluster.effective_chef_node_id(),
-                        &cluster.control_peers,
-                        Arc::clone(
-                            cluster_membership
-                                .as_ref()
-                                .expect("cluster membership exists with cluster config"),
-                        ),
-                        cluster_meta.clone(),
-                    ) {
-                        Ok(cc) => Some(Arc::new(cc)),
-                        Err(e) => {
-                            warn!(error = %e, "Cluster 12: control stream failed to start");
-                            None
-                        }
-                    }
-                }
-                None => None,
-            },
-            None => None,
-        };
-
     // Membership is cross-node liveness and therefore starts only on the explicit,
     // cert-pinned QUIC peer graph. Zenoh remains loopback-only daemon IPC.
     match (
@@ -1256,6 +1556,24 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
             }
         }
         _ => drop(provision_rx),
+    }
+
+    // A seed restart from an unchanged valid marker never blocks on peer reachability.
+    // Reconcile the durable full snapshot in the background so a first-boot/offline
+    // member remains fail-closed and receives authority when it later becomes reachable.
+    if let (Some(control), Some(meta), Some(cluster)) = (
+        cluster_control.as_ref(),
+        cluster_meta.as_ref(),
+        config.cluster.as_ref(),
+    ) {
+        if cluster.seed {
+            tokio::spawn(run_owner_snapshot_reconciliation(
+                Arc::clone(control),
+                Arc::clone(meta),
+                Duration::from_secs(15),
+            ));
+            info!("Cluster 12: owner snapshot background reconciliation started");
+        }
     }
 
     // -- #498 CAS block-map gossip republish (Cluster 12): only when the control stream
@@ -2379,8 +2697,12 @@ fn run_runtime_reconcile(
         ctx.service_health_state.clone(),
         previous.as_ref(),
     );
-    let expected_agents = agents_for_shift(ctx.all_agents, ctx.current_shift);
+    let expected_agents = agents_for_local_residency(ctx.all_agents, ctx.current_shift);
     let expected_ids = expected_agents
+        .iter()
+        .map(|cfg| cfg.identity.id)
+        .collect::<HashSet<_>>();
+    let prepared_ids = agents_for_prepared_residency(ctx.all_agents)
         .iter()
         .map(|cfg| cfg.identity.id)
         .collect::<HashSet<_>>();
@@ -2427,7 +2749,9 @@ fn run_runtime_reconcile(
     if !request.dry_run {
         for agent in before.agents.iter().filter(|agent| {
             let expected_active = expected_ids.contains(&agent.agent_id);
+            let expected_prepared = prepared_ids.contains(&agent.agent_id);
             !expected_active
+                && !expected_prepared
                 && (agent.runtime_present
                     || agent.projection_present
                     || agent.security_runtime_present
@@ -4495,12 +4819,17 @@ fn ecs_tick_loop(
 
     // -- Agent-Spawning (Orchestrator + ECS + Sandbox) --
     let is_restored = runtime_orch.agent_count() > 0;
-    let shift_agents = agents_for_shift(&all_agents, initial_shift);
+    let shift_agents = agents_for_local_residency(&all_agents, initial_shift);
+    let prepared_agents = agents_for_prepared_residency(&all_agents);
+    let prepared_agent_ids: HashSet<_> = prepared_agents
+        .iter()
+        .map(|agent| AgentId(agent.identity.id))
+        .collect();
 
     if is_restored {
         // Nach Restore: Shift-Transition durchfuehren falls Schicht gewechselt hat
         // (z.B. Daemon um 13:59 gestoppt, um 14:05 neu gestartet)
-        let removed = runtime_orch.shift_transition(initial_shift);
+        let removed = runtime_orch.shift_transition_except(initial_shift, &prepared_agent_ids);
         if !removed.is_empty() {
             info!(
                 removed_count = removed.len(),
@@ -4509,7 +4838,38 @@ fn ecs_tick_loop(
         }
     }
 
-    // Agents spawnen: Orchestrator registriert (falls nicht via Restore), ECS erstellt Entity,
+    // Prepared targets are resident ECS-native containers but remain frozen and have
+    // no sandbox/LLM process. No AgentSpawned event is emitted before activation.
+    for agent_cfg in &prepared_agents {
+        let agent_id = AgentId(agent_cfg.identity.id);
+        let identity = AgentIdentity {
+            agent_id,
+            name: agent_cfg.identity.name.clone(),
+            role: agent_cfg.identity.role.clone(),
+        };
+        let (start, end) = shift_hours(agent_cfg.identity.shift_set);
+        let shift = ShiftInfo {
+            shift_set: agent_cfg.identity.shift_set,
+            shift_start_hour: start,
+            shift_end_hour: end,
+            is_on_duty: false,
+        };
+        runtime_orch
+            .install_prepared_agent(identity, shift)
+            .with_context(|| format!("materialize frozen prepared target {agent_id}"))?;
+        let entity = spawn_prepared_agent(
+            &mut world,
+            agent_id,
+            &agent_cfg.identity.name,
+            &agent_cfg.identity.role,
+            agent_cfg.identity.shift_set,
+            &agent_cfg.preferences.favorite_room,
+        );
+        apply_personality(&mut world, entity, &agent_cfg.personality);
+        sentinel_ecs::apply_capabilities(&mut world, entity, &agent_cfg.capabilities);
+    }
+
+    // Active agents: Orchestrator registers (unless restored), ECS creates the entity,
     // Sandbox Setup (cgroup + home dir) bei jedem Spawn (AC-4).
     for agent_cfg in &shift_agents {
         let agent_id = AgentId(agent_cfg.identity.id);
@@ -4750,6 +5110,7 @@ fn ecs_tick_loop(
 
     info!(
         agent_count = shift_agents.len(),
+        prepared_frozen_count = prepared_agents.len(),
         orchestrator_count = runtime_orch.agent_count(),
         restored = is_restored,
         shift_set = initial_shift,
@@ -4806,6 +5167,11 @@ fn ecs_tick_loop(
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
+
+        // Owner snapshot installs and activation rebuilds take the same guard. They
+        // therefore happen strictly between ECS ticks, while closing readiness still
+        // prevents normal guards from being minted or committed against either view.
+        let owner_tick_barrier = sentinel_common::owner_tick_barrier();
 
         if let Some(rx) = evolution_result_rx.as_ref() {
             drain_evolution_results(&state_store_for_sim, rx);
@@ -5626,7 +5992,11 @@ fn ecs_tick_loop(
                 );
 
                 // Alte Schicht-Agents entfernen (Orchestrator entfernt + emittiert Events)
-                let removed = runtime_orch.shift_transition(new_shift);
+                let protected_prepared: HashSet<_> = agents_for_prepared_residency(&all_agents)
+                    .iter()
+                    .map(|agent| AgentId(agent.identity.id))
+                    .collect();
+                let removed = runtime_orch.shift_transition_except(new_shift, &protected_prepared);
                 for agent_id in &removed {
                     if let Some(proc_handle) = agent_processes.remove(agent_id) {
                         terminate_agent_process(proc_handle);
@@ -6005,7 +6375,7 @@ fn ecs_tick_loop(
                 }
 
                 // Neue Schicht-Agents spawnen (mit Sandbox-Setup)
-                let new_agents = agents_for_shift(&all_agents, new_shift);
+                let new_agents = agents_for_local_residency(&all_agents, new_shift);
                 let mut spawned_count = 0u32;
                 for agent_cfg in &new_agents {
                     let agent_id = AgentId(agent_cfg.identity.id);
@@ -6601,7 +6971,7 @@ fn ecs_tick_loop(
                         );
                         despawned += 1;
                     }
-                    for cfg in agents_for_shift(&apply_cmd.agents, current_shift) {
+                    for cfg in agents_for_local_residency(&apply_cmd.agents, current_shift) {
                         if spawn_agent_full(
                             &mut runtime_orch,
                             &mut world,
@@ -6900,6 +7270,8 @@ fn ecs_tick_loop(
             );
         }
 
+        drop(owner_tick_barrier);
+
         // Adaptive Tick-Rate: PSI-basiert (TOGAF Adaptive Scheduling)
         let effective_rate = adaptive_tick.compute_effective_rate(tick_rate);
         let tick_elapsed = tick_start.elapsed();
@@ -7023,6 +7395,19 @@ mod tests {
     use std::sync::Arc;
 
     static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[tokio::test]
+    async fn seed_valid_marker_restart_does_not_gate_on_unreachable_member() {
+        let calls = AtomicUsize::new(0);
+        let result = gate_seed_snapshot_replication(false, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("member unreachable")
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 
     fn snap_meta(id: &str, tick: u64, last_event_id: i64) -> sentinel_common::SnapshotMeta {
         sentinel_common::SnapshotMeta {
