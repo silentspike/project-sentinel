@@ -2,6 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +17,32 @@ import (
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/synthesis"
 	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/ticksync"
 )
+
+type inventoryTestProvider struct {
+	name   string
+	models []string
+	err    error
+}
+
+type noInventoryTestProvider struct{ name string }
+
+func (p *noInventoryTestProvider) Name() string { return p.name }
+func (p *noInventoryTestProvider) Send(context.Context, *proxy.LLMRequest) (*proxy.LLMResponse, error) {
+	return nil, nil
+}
+func (p *noInventoryTestProvider) HealthCheck(context.Context) error { return nil }
+
+func (p *inventoryTestProvider) Name() string { return p.name }
+
+func (p *inventoryTestProvider) Send(context.Context, *proxy.LLMRequest) (*proxy.LLMResponse, error) {
+	return nil, nil
+}
+
+func (p *inventoryTestProvider) HealthCheck(context.Context) error { return p.err }
+
+func (p *inventoryTestProvider) ModelInventory(context.Context) ([]string, error) {
+	return append([]string(nil), p.models...), p.err
+}
 
 func TestDefaultPrimaryProviderFallsBackToClaudeCodeWithoutAPIKey(t *testing.T) {
 	t.Setenv("CORTEX_PRIMARY_PROVIDER", "")
@@ -29,6 +60,121 @@ func TestDefaultPrimaryProviderUsesLocalLoopFlag(t *testing.T) {
 
 	if got := defaultPrimaryProvider(); got != proxy.LocalLoopProviderName {
 		t.Fatalf("defaultPrimaryProvider() = %q, want %q", got, proxy.LocalLoopProviderName)
+	}
+}
+
+func TestReadyValidatesActiveProviderInventoryWithoutExposingModels(t *testing.T) {
+	catalog, err := proxy.LoadProviderCatalog(filepath.Join("..", "..", "config", "cortex-gateway.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := control.NewConfig("ollama")
+	registry := proxy.NewRegistry()
+	registry.Register("ollama", &inventoryTestProvider{
+		name:   "ollama",
+		models: []string{"qwen3:14b", "qwen3:8b", "qwen3:4b-instruct"},
+	})
+
+	recorder := httptest.NewRecorder()
+	handleReady(catalog, cfg, registry, "").ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["ready"] != true || response["model_inventory_status"] != "validated" {
+		t.Fatalf("unexpected readiness response: %#v", response)
+	}
+	providerIDs, ok := response["catalog_provider_ids"].([]any)
+	if !ok || len(providerIDs) != 4 {
+		t.Fatalf("catalog provider IDs missing: %#v", response)
+	}
+	for _, model := range []string{"qwen3:14b", "qwen3:8b", "qwen3:4b-instruct"} {
+		if responseBody := recorder.Body.String(); strings.Contains(responseBody, model) {
+			t.Fatalf("readiness response exposed provider inventory model %q: %s", model, responseBody)
+		}
+	}
+}
+
+func TestReadyFailsClosedOnActiveProviderInventoryDrift(t *testing.T) {
+	catalog, err := proxy.LoadProviderCatalog(filepath.Join("..", "..", "config", "cortex-gateway.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := control.NewConfig("ollama")
+	registry := proxy.NewRegistry()
+	registry.Register("ollama", &inventoryTestProvider{name: "ollama", models: []string{"qwen3:8b"}})
+
+	recorder := httptest.NewRecorder()
+	handleReady(catalog, cfg, registry, "").ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["ready"] != false || response["model_inventory_status"] != "drift" {
+		t.Fatalf("unexpected readiness response: %#v", response)
+	}
+}
+
+func TestReadyBlocksClaudeCodeWithoutExactGateBAttestation(t *testing.T) {
+	catalog, err := proxy.LoadProviderCatalog(filepath.Join("..", "..", "config", "cortex-gateway.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := control.NewConfig("claude-code")
+	registry := proxy.NewRegistry()
+	registry.Register("claude-code", &noInventoryTestProvider{name: "claude-code"})
+
+	for _, test := range []struct {
+		name        string
+		attestation string
+		wantStatus  int
+		wantGate    string
+	}{
+		{name: "missing", wantStatus: http.StatusServiceUnavailable, wantGate: "gate_b_attestation_required"},
+		{name: "wrong catalog", attestation: "gate-b:claude-code:stale", wantStatus: http.StatusServiceUnavailable, wantGate: "gate_b_attestation_required"},
+		{name: "exact", attestation: catalog.ExpectedGateBAttestation("claude-code"), wantStatus: http.StatusOK, wantGate: "gate_b_attested"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handleReady(catalog, cfg, registry, test.attestation).ServeHTTP(
+				recorder,
+				httptest.NewRequest(http.MethodGet, "/ready", nil),
+			)
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			var response map[string]any
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response["model_inventory_status"] != test.wantGate {
+				t.Fatalf("response=%#v", response)
+			}
+		})
+	}
+}
+
+func TestReadyAllowsTokenFreeLocalLoopWithoutGateBAttestation(t *testing.T) {
+	catalog, err := proxy.LoadProviderCatalog(filepath.Join("..", "..", "config", "cortex-gateway.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := control.NewConfig(proxy.LocalLoopProviderName)
+	registry := proxy.NewRegistry()
+	registry.Register(proxy.LocalLoopProviderName, &noInventoryTestProvider{name: proxy.LocalLoopProviderName})
+	recorder := httptest.NewRecorder()
+	handleReady(catalog, cfg, registry, "").ServeHTTP(
+		recorder,
+		httptest.NewRequest(http.MethodGet, "/ready", nil),
+	)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"model_inventory_status":"token_free_local"`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 

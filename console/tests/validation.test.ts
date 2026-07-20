@@ -37,6 +37,7 @@ const validAgent = (): AgentConfig => ({
     name: "Thomas",
     role: "CEO",
     department: "Leitung",
+    tier: 1,
     shift_set: 1,
     kpis: [],
     reports_to: null,

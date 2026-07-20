@@ -3,6 +3,7 @@ id = 57
 name = "Chen Wei Li"
 role = "QA Engineer"
 department = "Qualitaetssicherung"
+tier = 3
 shift_set = 2
 kpis = ["Bug-Detection-Rate > 90% vor Release", "Testautomatisierungsgrad > 70%", "Regressionstest-Durchlaufzeit < 1 Tag"]
 reports_to = "Elena Bauer"

@@ -3,6 +3,7 @@ id = 48
 name = "Stefan Huber"
 role = "Betriebsrat-Mitglied (50% BR-Taetigkeit / 50% regulaere Aufgaben)"
 department = "Betriebsrat"
+tier = 3
 shift_set = 0
 reports_to = "Ralf Steinbach"
 

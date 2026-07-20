@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -96,6 +97,7 @@ func main() {
 		Temperature: cfg.Gateway.Temperature,
 		MaxTokens:   cfg.Gateway.MaxTokens,
 		Timeout:     time.Duration(cfg.Gateway.TimeoutSeconds) * time.Second,
+		Credential:  mustReadCredential("SENTINEL_JUDGE_CREDENTIAL_FILE", logger),
 	})
 
 	// Create analyzer (LLM-based)
@@ -205,4 +207,38 @@ func envOrDefault(key, defaultVal string) string {
 		return val
 	}
 	return defaultVal
+}
+
+func mustReadCredential(envName string, logger *slog.Logger) string {
+	path := os.Getenv(envName)
+	credential, err := readCredentialFile(path)
+	if err != nil || path == "" {
+		logger.Error("required caller credential unavailable", "credential_env", envName)
+		os.Exit(1)
+	}
+	return credential
+}
+
+func readCredentialFile(path string) (string, error) {
+	info, err := os.Stat(path) //nolint:gosec // operator-provided systemd credential path
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("credential must be an owner-only regular file")
+	}
+	value, err := os.ReadFile(path) //nolint:gosec // operator-provided systemd credential path
+	if err != nil {
+		return "", err
+	}
+	credential := string(value)
+	if strings.HasSuffix(credential, "\r\n") {
+		credential = strings.TrimSuffix(credential, "\r\n")
+	} else {
+		credential = strings.TrimSuffix(credential, "\n")
+	}
+	if credential == "" || strings.TrimSpace(credential) != credential {
+		return "", fmt.Errorf("credential is empty or contains surrounding whitespace")
+	}
+	return credential, nil
 }

@@ -3,6 +3,7 @@ id = 53
 name = "Dr. Katharina Wiesner"
 role = "Betriebsaerztin (extern bestellte Betriebsaerztin nach ASiG)"
 department = "Betriebsgesundheit"
+tier = 2
 shift_set = 0
 kpis = ["Bildschirmarbeitsplatz-Untersuchungen termingerecht", "Ergonomie-Beratungen > 10/Jahr", "Impfaktionen organisiert"]
 reports_to = ""

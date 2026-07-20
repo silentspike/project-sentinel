@@ -147,6 +147,7 @@ mod tests {
                 name: name.to_string(),
                 role: role.to_string(),
                 department: "Dev".to_string(),
+                tier: None,
                 shift_set: 1,
                 kpis: vec![],
                 reports_to: None,

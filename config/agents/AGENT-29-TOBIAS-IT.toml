@@ -3,6 +3,7 @@ id = 29
 name = "Tobias \"Tobi\" Lehmann"
 role = "Systemadministrator"
 department = "Verwaltung"
+tier = 3
 shift_set = 2
 kpis = ["Systemverfuegbarkeit > 99.5%", "Offene IT-Tickets < 10", "Security-Patches innerhalb 48h"]
 reports_to = "Gabriele \"Gabi\" Fuchs"

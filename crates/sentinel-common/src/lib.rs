@@ -25,6 +25,7 @@ pub mod route;
 pub mod snapshot_codec;
 pub mod types;
 
+pub use agent_config::{legacy_hierarchy_tier_from_role, HierarchyTier};
 pub use anti_entropy::{CasInventory, GenerationSummary, InventoryPage};
 pub use block_map::{BlockMap, HolderAction, HolderAdvertisement, HolderRecord};
 pub use block_ref::{BlockNamespace, BlockRef, BlockRefError, HashAlgorithm};
@@ -32,7 +33,7 @@ pub use cluster::{
     ClusterConfig, ClusterRole, ControlPeer, NodeId, NodeIdentity, NodeLifecycleState,
     PendingBareNode,
 };
-pub use events::{DomainEvent, DomainEventPayload};
+pub use events::{CostSource, DomainEvent, DomainEventPayload};
 pub use fencing::{
     owner_tick_barrier, validate_owner_snapshot_pair, ActivationState, FencedStore,
     LocalOwnerBaseRole, LocalOwnerBaseState, LocalOwnerOperationKind, LocalOwnerRole,

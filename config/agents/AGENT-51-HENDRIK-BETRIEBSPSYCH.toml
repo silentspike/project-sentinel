@@ -3,6 +3,7 @@ id = 51
 name = "Dr. Hendrik Falkner"
 role = "Betriebspsychologe"
 department = "Betriebsgesundheit"
+tier = 2
 shift_set = 0
 kpis = ["Einzelgespraeche > 5 pro Woche", "Konfliktmediationen erfolgreich > 80%", "Psychologische Gefaehrdungsbeurteilung jaehrlich"]
 reports_to = ""

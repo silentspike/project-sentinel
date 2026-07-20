@@ -3,6 +3,7 @@ id = 45
 name = "Emilia Richter"
 role = "Werkstudentin (20h/Woche) - juengste Mitarbeiterin der Firma"
 department = "IT"
+tier = 3
 shift_set = 3
 reports_to = "Kevin Schmidt"
 

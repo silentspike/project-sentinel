@@ -48,7 +48,7 @@ type claudeCodeEvent struct {
 	Message *claudeCodeAssistantMsg `json:"message,omitempty"`
 	// For result events
 	Result     string           `json:"result,omitempty"`
-	CostUSD    float64          `json:"total_cost_usd,omitempty"`
+	CostUSD    *float64         `json:"total_cost_usd,omitempty"`
 	DurationMs int              `json:"duration_ms,omitempty"`
 	IsError    bool             `json:"is_error,omitempty"`
 	Usage      *claudeCodeUsage `json:"usage,omitempty"`
@@ -287,13 +287,14 @@ func (p *ClaudeCodeProvider) parseOutputStream(r io.Reader) (*LLMResponse, error
 			}
 			// Result is the final event, stop reading
 			return &LLMResponse{
-				Content:       strings.Join(contentParts, ""),
-				FinishReason:  finishReason,
-				InputTokens:   inputTokens,
-				OutputTokens:  outputTokens,
-				CacheRead:     cacheRead,
-				CacheCreation: cacheCreation,
-				TokensUsed:    inputTokens + outputTokens,
+				Content:         strings.Join(contentParts, ""),
+				FinishReason:    finishReason,
+				InputTokens:     inputTokens,
+				OutputTokens:    outputTokens,
+				CacheRead:       cacheRead,
+				CacheCreation:   cacheCreation,
+				TokensUsed:      inputTokens + outputTokens,
+				ReportedCostUSD: event.CostUSD,
 			}, nil
 		}
 	}

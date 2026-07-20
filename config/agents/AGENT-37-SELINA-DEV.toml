@@ -3,6 +3,7 @@ id = 37
 name = "Selina Hoffmann"
 role = "Backend-Entwicklerin (Mid-Level)"
 department = "Entwicklung"
+tier = 3
 shift_set = 3
 reports_to = "Kevin Schmidt"
 

@@ -672,6 +672,7 @@ struct AgentIdentityToml {
     name: String,
     role: String,
     department: String,
+    tier: u8,
     shift_set: u8,
     kpis: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -752,6 +753,13 @@ fn build_agents(
                 name,
                 role,
                 department: department.name.clone(),
+                tier: if is_company_lead {
+                    1
+                } else if is_department_lead {
+                    2
+                } else {
+                    3
+                },
                 shift_set: shift_for(spec, id, is_company_lead || is_department_lead),
             });
             id += 1;
@@ -794,6 +802,7 @@ fn build_agents(
                     name: agent.name.clone(),
                     role: agent.role,
                     department: agent.department.clone(),
+                    tier: agent.tier,
                     shift_set: agent.shift_set,
                     kpis: kpis_for(&agent.department),
                     reports_to,
@@ -823,6 +832,7 @@ struct RawAgent {
     name: String,
     role: String,
     department: String,
+    tier: u8,
     shift_set: u8,
 }
 
@@ -1610,6 +1620,23 @@ mod tests {
             .iter()
             .skip(1)
             .all(|agent| agent.identity.reports_to.is_some()));
+        assert_eq!(
+            agents
+                .iter()
+                .map(|agent| agent.identity.tier.map(|tier| tier.get()))
+                .collect::<Vec<_>>(),
+            vec![
+                Some(1),
+                Some(3),
+                Some(3),
+                Some(3),
+                Some(3),
+                Some(3),
+                Some(2),
+                Some(3)
+            ],
+            "Gaia must deterministically emit company lead=1, department lead=2, others=3"
+        );
         assert_eq!(
             agents
                 .iter()
