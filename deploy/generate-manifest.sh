@@ -13,6 +13,8 @@ OUTPUT="${REPO_ROOT}/deploy/release-manifest.json"
 ARTIFACT_DEFS=(
   # Binaries (Rust: target/release/, Go: per-module build output)
   "target/release/sentinel-daemon|/opt/sentinel/bin/sentinel-daemon|binary"
+  "target/release/agent-runtime|/usr/bin/agent-runtime|binary"
+  "target/release/landlock-wrapper|/opt/sentinel/bin/landlock-wrapper|binary"
   "target/release/sentinel-nightrun|/opt/sentinel/bin/sentinel-nightrun|binary"
   "target/release/sentinel-projection|/opt/sentinel/bin/sentinel-projection|binary"
   "target/release/sentinel-dashboard-backend|/opt/sentinel/bin/sentinel-dashboard-backend|binary"
@@ -53,6 +55,10 @@ ARTIFACT_DEFS=(
   "deploy/scripts/init-hugepages.sh|/opt/sentinel/scripts/init-hugepages.sh|script"
   "deploy/scripts/init-sysctl.sh|/opt/sentinel/scripts/init-sysctl.sh|script"
   "deploy/scripts/init-tmpfs.sh|/opt/sentinel/scripts/init-tmpfs.sh|script"
+  # Host runtime-base contract
+  "deploy/runtime-base.env|/opt/sentinel/share/runtime-base.env|config"
+  "deploy/apt/sentinel-runtime.pref|/etc/apt/preferences.d/sentinel-runtime|config"
+  "deploy/vm-config/99-sentinel-bwrap.conf|/etc/sysctl.d/99-sentinel-bwrap.conf|config"
 )
 
 cd "${REPO_ROOT}"
