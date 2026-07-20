@@ -156,7 +156,7 @@ effect, and a revisit condition.
 Pinned values:
 
 ```text
-base_commit=dade246e244bf1809200da5c0464e80bc79c5cdf
+base_commit=c37d9a487ed7e3385bbff9b8e8b3c4f555d5e429
 cargo_lock_sha256=29b97c217ff9694e116e0e6ce856e5ab761b808d5b2289bd56cb255373e14b93
 target=x86_64-unknown-linux-gnu
 remote_rustc=1.97.1
@@ -164,9 +164,10 @@ remote_cargo=1.97.1
 ```
 
 Evidence: `provenance.txt` and the canonical audit.
-The graph regeneration base equals the pinned base. Metadata, every Cargo tree, all
-eight release artifacts, and all eight cargo-bloat tables were regenerated there; the
-manifest/lockfile delta from the preceding audit basis is zero.
+Metadata, every Cargo tree, all eight release artifacts, and all eight cargo-bloat
+tables were regenerated at `dade246e244bf1809200da5c0464e80bc79c5cdf`. The delta from
+that regeneration base through the pinned base changes no Cargo manifest, lockfile, or
+Rust source.
 
 Compact source regeneration from the complete internal Cargo trees:
 

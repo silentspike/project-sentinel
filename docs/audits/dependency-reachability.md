@@ -35,7 +35,7 @@ Build-server timing and performance data are deliberately excluded.
 
 | Item | Value |
 | --- | --- |
-| Base commit | `dade246e244bf1809200da5c0464e80bc79c5cdf` |
+| Base commit | `c37d9a487ed7e3385bbff9b8e8b3c4f555d5e429` |
 | `Cargo.lock` SHA-256 | `29b97c217ff9694e116e0e6ce856e5ab761b808d5b2289bd56cb255373e14b93` |
 | Lockfile packages | 717 |
 | Workspace members | 27 |
@@ -47,10 +47,12 @@ Build-server timing and performance data are deliberately excluded.
 
 The dependency graph, feature evidence, all eight release artifacts, and all eight
 cargo-bloat tables were fully regenerated at
-`dade246e244bf1809200da5c0464e80bc79c5cdf`. `Cargo.lock` and all Cargo manifests are
-unchanged from the preceding audit basis, so the compact graph bundle and all derived
-reachability, feature, duplicate, and recommendation rows remain byte-identical. The
-artifact and bloat evidence below comes entirely from the new regeneration run.
+`dade246e244bf1809200da5c0464e80bc79c5cdf`. The mainline delta through the pinned base
+changes only CI, configuration, and documentation for the M0 work-execution contract;
+it changes no Cargo manifest, lockfile, or Rust source. The compact graph bundle and all
+derived reachability, feature, duplicate, and recommendation rows therefore remain
+byte-identical, and the artifact and bloat evidence below remains tied to unchanged
+audited source inputs.
 
 PR #611 remains open and changes only `Cargo.lock`. If it or any other lockfile change
 lands before completion, the new mainline state must be integrated as directed by the
