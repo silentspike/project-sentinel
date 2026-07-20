@@ -6,14 +6,20 @@ import (
 )
 
 type ResponseLogEntry struct {
-	RequestID    string       `json:"request_id"`
-	RequestClass RequestClass `json:"request_class,omitempty"`
-	Provider     string       `json:"provider"`
-	Model        string       `json:"model,omitempty"`
-	PolicySource string       `json:"policy_source,omitempty"`
-	AgentID      string       `json:"agent_id,omitempty"`
-	AgentName    string       `json:"agent_name,omitempty"`
-	Content      string       `json:"content"`
+	RequestID      string       `json:"request_id"`
+	RequestClass   RequestClass `json:"request_class,omitempty"`
+	CallerRole     CallerRole   `json:"caller_role,omitempty"`
+	Provider       string       `json:"provider"`
+	Model          string       `json:"model,omitempty"` // compatibility alias for effective_model
+	EffectiveModel string       `json:"effective_model,omitempty"`
+	ModelTier      string       `json:"model_tier,omitempty"`
+	HierarchyTier  int          `json:"hierarchy_tier,omitempty"`
+	CatalogDigest  string       `json:"catalog_digest,omitempty"`
+	CostSource     string       `json:"cost_source,omitempty"`
+	PolicySource   string       `json:"policy_source,omitempty"`
+	AgentID        string       `json:"agent_id,omitempty"`
+	AgentName      string       `json:"agent_name,omitempty"`
+	Content        string       `json:"content"`
 	// #429: pipeline decision + matched rule + fourth-wall verdict for the Request Inspector.
 	Decision   string    `json:"decision,omitempty"`
 	Rule       string    `json:"rule,omitempty"`

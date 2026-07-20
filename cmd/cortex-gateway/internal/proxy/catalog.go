@@ -15,6 +15,8 @@ import (
 
 const CatalogDigestAlgorithm = "cortex-catalog-v1"
 
+const GateBAttestationPrefix = "gate-b"
+
 // HierarchyModelMap is a complete provider-specific model map. Hierarchy tier
 // and model/pricing tier are deliberately different concepts.
 type HierarchyModelMap struct {
@@ -322,4 +324,28 @@ func (c *ProviderCatalog) Digest() string {
 		return ""
 	}
 	return c.digest
+}
+
+// ExpectedGateBAttestation binds an explicit deployment approval to both the
+// active provider and the immutable semantic catalog. It is public deployment
+// metadata, not a credential.
+func (c *ProviderCatalog) ExpectedGateBAttestation(provider string) string {
+	return strings.Join([]string{GateBAttestationPrefix, strings.TrimSpace(provider), c.Digest()}, ":")
+}
+
+// ValidateProviderActivation keeps providers without a token-free inventory
+// contract disabled until Gate B records an exact provider+catalog attestation.
+// The deterministic local-loop fixture is the sole no-inventory exception.
+func (c *ProviderCatalog) ValidateProviderActivation(provider string, inventoryCapable bool, attestation string) error {
+	provider = strings.TrimSpace(provider)
+	if _, ok := c.Entry(provider); !ok {
+		return fmt.Errorf("provider %q is not in the startup catalog", provider)
+	}
+	if provider == LocalLoopProviderName || inventoryCapable {
+		return nil
+	}
+	if strings.TrimSpace(attestation) != c.ExpectedGateBAttestation(provider) {
+		return fmt.Errorf("provider %q requires an explicit Gate B model-catalog attestation", provider)
+	}
+	return nil
 }

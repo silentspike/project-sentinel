@@ -131,6 +131,19 @@ func main() {
 	}
 	registry.Register(proxy.LocalLoopProviderName, localLoopProvider)
 	logger.Info("registered provider", "name", proxy.LocalLoopProviderName, "model", localLoopCatalog.DefaultModel)
+	providerActivationAttestation := os.Getenv("CORTEX_MODEL_CATALOG_GATE_B_ATTESTATION")
+	validateProviderActivation := func(providerName string) error {
+		provider, ok := registry.Get(providerName)
+		if !ok {
+			return fmt.Errorf("provider %q is not registered", providerName)
+		}
+		_, inventoryCapable := provider.(proxy.ModelInventoryProvider)
+		return catalog.ValidateProviderActivation(
+			providerName,
+			inventoryCapable,
+			providerActivationAttestation,
+		)
+	}
 
 	// 4. Control config (shared between pipeline + control plane)
 	primaryProvider := defaultPrimaryProvider()
@@ -321,6 +334,7 @@ func main() {
 		ResponseInterceptor: responseInterceptor,
 		TickSync:            tickSync,
 		ResponseLogs:        responseLogs,
+		ProviderActivation:  validateProviderActivation,
 	})
 
 	// 6. HTTP proxy server
@@ -332,7 +346,7 @@ func main() {
 	proxyMux.Handle("POST /internal/llm", pipelineHandler)
 	proxyMux.Handle("POST /internal/agent-runtime", pipelineHandler)
 	proxyMux.HandleFunc("GET /health", handleHealth(pipelineHandler, guardrailsEnforcer != nil))
-	proxyMux.HandleFunc("GET /ready", handleReady(catalog, controlConfig, registry))
+	proxyMux.HandleFunc("GET /ready", handleReady(catalog, controlConfig, registry, providerActivationAttestation))
 	proxyMux.Handle("GET /metrics", promhttp.Handler())
 
 	proxyServer := &http.Server{
@@ -646,7 +660,7 @@ func handleHealth(pipeline *proxy.PipelineHandler, guardrailsEnabled bool) http.
 	}
 }
 
-func handleReady(catalog *proxy.ProviderCatalog, cfg *control.Config, registry *proxy.Registry) http.HandlerFunc {
+func handleReady(catalog *proxy.ProviderCatalog, cfg *control.Config, registry *proxy.Registry, gateBAttestation string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		response := map[string]interface{}{
@@ -656,7 +670,7 @@ func handleReady(catalog *proxy.ProviderCatalog, cfg *control.Config, registry *
 			"caller_credential_count":              4,
 			"catalog_digest_algorithm":             proxy.CatalogDigestAlgorithm,
 			"catalog_semantic_digest":              catalog.Digest(),
-			"catalog_provider_ids":                  catalog.ProviderIDs(),
+			"catalog_provider_ids":                 catalog.ProviderIDs(),
 			"model_inventory_status":               "not_applicable",
 		}
 
@@ -670,8 +684,20 @@ func handleReady(catalog *proxy.ProviderCatalog, cfg *control.Config, registry *
 			_ = json.NewEncoder(w).Encode(response)
 			return
 		}
-		inventoryProvider, ok := provider.(proxy.ModelInventoryProvider)
-		if !ok {
+		inventoryProvider, inventoryCapable := provider.(proxy.ModelInventoryProvider)
+		if !inventoryCapable {
+			if err := catalog.ValidateProviderActivation(primary, false, gateBAttestation); err != nil {
+				response["ready"] = false
+				response["model_inventory_status"] = "gate_b_attestation_required"
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(response)
+				return
+			}
+			if primary == proxy.LocalLoopProviderName {
+				response["model_inventory_status"] = "token_free_local"
+			} else {
+				response["model_inventory_status"] = "gate_b_attested"
+			}
 			_ = json.NewEncoder(w).Encode(response)
 			return
 		}

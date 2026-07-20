@@ -255,6 +255,7 @@ impl ProjectionWorker {
                     tier,
                     hierarchy_tier,
                     cost_source,
+                    effective_model,
                     input_tokens,
                     output_tokens,
                     cache_read,
@@ -282,6 +283,12 @@ impl ProjectionWorker {
                         .get()
                         .to_string();
                     cost_source.context("v2 agent_llm_usage is missing cost_source")?;
+                    if effective_model
+                        .as_deref()
+                        .is_none_or(|model| model.trim().is_empty())
+                    {
+                        anyhow::bail!("v2 agent_llm_usage is missing effective_model");
+                    }
                     txn.record_hierarchy_cost(
                         &LlmHierarchyCostUpdate {
                             hierarchy_tier: &hierarchy_key,

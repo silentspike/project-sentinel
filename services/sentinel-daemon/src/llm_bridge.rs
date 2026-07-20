@@ -168,9 +168,21 @@ pub mod bridge {
         client: &reqwest::Client,
         url: &str,
         credential: &str,
+        request_id: &str,
         request: &GatewayRequest,
     ) -> reqwest::RequestBuilder {
-        client.post(url).bearer_auth(credential).json(request)
+        client
+            .post(url)
+            .bearer_auth(credential)
+            .header("X-Request-ID", request_id)
+            .json(request)
+    }
+
+    fn agent_runtime_request_id(perception: &Perception) -> String {
+        format!(
+            "agent-runtime-{:02}-{}",
+            perception.agent_id.0, perception.tick.0
+        )
     }
 
     /// #427: baut das `AgentLlmUsage`-Event aus einer Gateway-Response. Die frischen
@@ -214,6 +226,7 @@ pub mod bridge {
             } else {
                 None
             },
+            effective_model: usage_v2_enabled.then(|| resp.effective_model.clone()),
             input_tokens: fresh_input,
             output_tokens: resp.output_tokens,
             cache_read: resp.cache_read,
@@ -235,6 +248,38 @@ pub mod bridge {
             event = event.with_schema_version(2);
         }
         Ok(event)
+    }
+
+    /// Retry only the local append after a successful gateway response. The
+    /// completed provider result remains owned by the task, so storage recovery
+    /// can never trigger another paid provider call or duplicate an action.
+    async fn append_usage_event_until_durable<F, E>(
+        event: &DomainEvent,
+        agent_id: AgentId,
+        mut append: F,
+    ) -> usize
+    where
+        F: FnMut(&DomainEvent) -> Result<i64, E>,
+        E: std::fmt::Display,
+    {
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            match append(event) {
+                Ok(_) => return attempt,
+                Err(error) => {
+                    let delay_ms = (100u64.saturating_mul(1u64 << attempt.min(5))).min(5_000);
+                    warn!(
+                        agent = %agent_id,
+                        attempt,
+                        retry_delay_ms = delay_ms,
+                        error = %error,
+                        "AgentLlmUsage local append failed; retaining provider result"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -464,6 +509,7 @@ pub mod bridge {
                 let retry_queue = Arc::clone(&pending_retries);
                 let retry_perception = perception.clone();
                 let request = build_gateway_request(&perception, &state_store);
+                let request_id = agent_runtime_request_id(&perception);
                 let bridge_event_store = Arc::clone(&event_store);
                 let credential = config.credential.clone();
                 let usage_v2_enabled = config.usage_v2_enabled;
@@ -501,9 +547,15 @@ pub mod bridge {
                             }
                         };
                         let call_start = Instant::now();
-                        match agent_runtime_request(&client, &url, &credential, &request)
-                            .send()
-                            .await
+                        match agent_runtime_request(
+                            &client,
+                            &url,
+                            &credential,
+                            &request_id,
+                            &request,
+                        )
+                        .send()
+                        .await
                         {
                             Ok(response) => {
                                 let status = response.status();
@@ -531,23 +583,15 @@ pub mod bridge {
                                                     return;
                                                 }
                                             };
-                                            if let Err(e) =
-                                                bridge_event_store.append_event(&usage_event)
-                                            {
-                                                warn!(agent = %agent_id, error = %e, "AgentLlmUsage Event append fehlgeschlagen");
-                                                if usage_v2_enabled {
-                                                    telemetry
-                                                        .calls_failed
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                    cb.lock().unwrap().record_failure();
-                                                    queue_retry(
-                                                        &retry_queue,
-                                                        retry_perception.clone(),
-                                                    )
-                                                    .await;
-                                                    return;
-                                                }
-                                            }
+                                            // Provider execution is complete. Release scarce
+                                            // capacity before waiting for local storage recovery.
+                                            drop(permit);
+                                            append_usage_event_until_durable(
+                                                &usage_event,
+                                                agent_id,
+                                                |event| bridge_event_store.append_event(event),
+                                            )
+                                            .await;
                                             let latency_ms = call_start.elapsed().as_millis();
                                             telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
                                             telemetry.tokens_total.fetch_add(
@@ -600,7 +644,6 @@ pub mod bridge {
                                 queue_retry(&retry_queue, retry_perception.clone()).await;
                             }
                         }
-                        drop(permit);
                     });
                 } else {
                     // Normal (Heartbeats): try_acquire — droppen OK, Heartbeats sind nicht kritisch.
@@ -613,9 +656,15 @@ pub mod bridge {
                     };
                     tokio::spawn(async move {
                         let call_start = Instant::now();
-                        match agent_runtime_request(&client, &url, &credential, &request)
-                            .send()
-                            .await
+                        match agent_runtime_request(
+                            &client,
+                            &url,
+                            &credential,
+                            &request_id,
+                            &request,
+                        )
+                        .send()
+                        .await
                         {
                             Ok(response) => {
                                 let status = response.status();
@@ -638,18 +687,15 @@ pub mod bridge {
                                                     return;
                                                 }
                                             };
-                                            if let Err(e) =
-                                                bridge_event_store.append_event(&usage_event)
-                                            {
-                                                warn!(agent = %agent_id, error = %e, "AgentLlmUsage Event append fehlgeschlagen");
-                                                if usage_v2_enabled {
-                                                    telemetry
-                                                        .calls_failed
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                    cb.lock().unwrap().record_failure();
-                                                    return;
-                                                }
-                                            }
+                                            // Do not let local durability retry consume a
+                                            // provider concurrency slot or re-run the request.
+                                            drop(permit);
+                                            append_usage_event_until_durable(
+                                                &usage_event,
+                                                agent_id,
+                                                |event| bridge_event_store.append_event(event),
+                                            )
+                                            .await;
                                             let latency_ms = call_start.elapsed().as_millis();
                                             telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
                                             telemetry.tokens_total.fetch_add(
@@ -698,7 +744,6 @@ pub mod bridge {
                                 cb.lock().unwrap().record_failure();
                             }
                         }
-                        drop(permit);
                     });
                 }
             }
@@ -960,6 +1005,7 @@ pub mod bridge {
                 &reqwest::Client::new(),
                 "http://127.0.0.1:8080/internal/agent-runtime",
                 "agent-runtime-test-credential",
+                "agent-runtime-07-55",
                 &request,
             )
             .build()
@@ -969,6 +1015,39 @@ pub mod bridge {
                 built.headers().get(reqwest::header::AUTHORIZATION).unwrap(),
                 "Bearer agent-runtime-test-credential"
             );
+            assert_eq!(
+                built.headers().get("X-Request-ID").unwrap(),
+                "agent-runtime-07-55"
+            );
+        }
+
+        #[tokio::test]
+        async fn completed_provider_result_retries_only_local_append() {
+            let provider_calls = std::sync::atomic::AtomicUsize::new(1);
+            let append_calls = std::sync::atomic::AtomicUsize::new(0);
+            let completed_actions = ["move-once"];
+            let event = DomainEvent::new(
+                "agent_llm_usage",
+                "AGENT-07",
+                "{}",
+                "agent-runtime-07-55",
+                55,
+            );
+
+            let attempts = append_usage_event_until_durable(&event, AgentId(7), |_| {
+                let call = append_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    Err("injected local append failure")
+                } else {
+                    Ok(1)
+                }
+            })
+            .await;
+
+            assert_eq!(attempts, 2);
+            assert_eq!(append_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(completed_actions, ["move-once"]);
         }
 
         #[test]
@@ -1195,6 +1274,9 @@ pub mod bridge {
             assert!(ev.payload.contains("\"tier\":\"high\""));
             assert!(ev.payload.contains("\"hierarchy_tier\":2"));
             assert!(ev.payload.contains("\"cost_source\":\"provider_reported\""));
+            assert!(ev
+                .payload
+                .contains("\"effective_model\":\"claude-sonnet-5\""));
             assert_eq!(ev.schema_version, 2);
         }
 

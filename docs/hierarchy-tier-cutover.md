@@ -82,13 +82,22 @@ improvise a migration.
 5. Deploy the gateway and all four authenticated callers with distinct
    owner-only credentials. Keep the daemon producer flag disabled. Use only
    mock or local-loop traffic.
-6. If Ollama is the active provider, record the exact `name`, `model`, and
-   non-empty content `digest` values returned by its token-free model inventory.
-   The model IDs must exactly equal the immutable catalog allowlist, and gateway
-   `/ready` must report `model_inventory_status=validated`. Missing, additional,
-   duplicate, digest-less, or unreachable inventory fails readiness. Do not pull
-   or replace a model unless the current Gate B mutation scope explicitly allows
-   it.
+6. Satisfy the active-provider activation gate without making a provider call:
+   - For Ollama, record the exact `name`, `model`, and non-empty content `digest`
+     values returned by its token-free inventory. The model IDs must exactly equal
+     the immutable catalog allowlist, and `/ready` must report
+     `model_inventory_status=validated`. Missing, additional, duplicate,
+     digest-less, or unreachable inventory fails readiness. Do not pull or replace
+     a model unless the current Gate B mutation scope explicitly allows it.
+   - `local-loop` is the only provider without inventory that is intrinsically
+     token-free; `/ready` reports `model_inventory_status=token_free_local`.
+   - A provider without a token-free inventory contract, including `claude-code`,
+     remains blocked both in `/ready` and immediately before provider execution.
+     Gate B must materialize the exact public attestation
+     `gate-b:<provider-id>:<cortex-catalog-v1 semantic digest>` as
+     `CORTEX_MODEL_CATALOG_GATE_B_ATTESTATION`. A stale catalog digest or different
+     provider keeps activation fail-closed. This attestation does not authorize a
+     real provider call or any spend.
 7. Verify that `/internal/agent-runtime` accepts only the Agent LLM bridge role,
    `/internal/llm` accepts only the Platform Analyzer, Evolution, and Judge
    roles, and public `/v1/*` claims are non-authoritative. Evidence must contain
@@ -110,7 +119,7 @@ improvise a migration.
 
 - Every v2 event has a model/pricing `tier`, `hierarchy_tier` in `1..3`, a
   closed-enum `cost_source`, non-negative finite cost, and the gateway-resolved
-  effective model.
+  `effective_model` persisted in the event payload.
 - Existing `cost_by_tier` semantics and totals are unchanged.
 - The sum of hierarchy aggregate call counts equals attributed v2 coverage at
   the recorded boundary.

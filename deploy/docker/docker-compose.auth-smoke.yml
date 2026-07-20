@@ -1,0 +1,48 @@
+services:
+  daemon:
+    secrets:
+      - source: caller-agent-runtime
+        uid: "65001"
+        gid: "65001"
+        mode: 0400
+      - source: caller-platform
+        uid: "65001"
+        gid: "65001"
+        mode: 0400
+      - source: caller-evolution
+        uid: "65001"
+        gid: "65001"
+        mode: 0400
+
+  gateway:
+    secrets:
+      - source: caller-agent-runtime
+        uid: "65001"
+        gid: "65001"
+        mode: 0400
+      - source: caller-platform
+        uid: "65001"
+        gid: "65001"
+        mode: 0400
+      - source: caller-evolution
+        uid: "65001"
+        gid: "65001"
+        mode: 0400
+      - source: caller-judge
+        uid: "65001"
+        gid: "65001"
+        mode: 0400
+
+secrets:
+  caller-agent-runtime:
+    external: false
+    file: ${SENTINEL_DEMO_CREDENTIAL_DIR:?}/caller-agent-runtime
+  caller-platform:
+    external: false
+    file: ${SENTINEL_DEMO_CREDENTIAL_DIR:?}/caller-platform
+  caller-evolution:
+    external: false
+    file: ${SENTINEL_DEMO_CREDENTIAL_DIR:?}/caller-evolution
+  caller-judge:
+    external: false
+    file: ${SENTINEL_DEMO_CREDENTIAL_DIR:?}/caller-judge

@@ -441,6 +441,9 @@ pub enum DomainEventPayload {
         /// Cost provenance. Missing on v1 events.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost_source: Option<CostSource>,
+        /// Exact gateway-resolved model used for this call. Missing on v1 events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effective_model: Option<String>,
         /// Frische (nicht gecachte) Input-Tokens.
         input_tokens: u32,
         output_tokens: u32,
@@ -516,6 +519,7 @@ mod tests {
             tier: "high".to_string(),
             hierarchy_tier: Some(HierarchyTier::TIER_2),
             cost_source: Some(CostSource::ProviderReported),
+            effective_model: Some("claude-sonnet-5".to_string()),
             input_tokens: 1000,
             output_tokens: 500,
             cache_read: 200,
@@ -529,6 +533,7 @@ mod tests {
         assert!(json.contains("\"cache_creation\":100"));
         assert!(json.contains("\"hierarchy_tier\":2"));
         assert!(json.contains("\"cost_source\":\"provider_reported\""));
+        assert!(json.contains("\"effective_model\":\"claude-sonnet-5\""));
         let back: DomainEventPayload = serde_json::from_str(&json).expect("roundtrip");
         assert_eq!(back.to_json(), json);
     }
@@ -541,10 +546,12 @@ mod tests {
             DomainEventPayload::AgentLlmUsage {
                 hierarchy_tier,
                 cost_source,
+                effective_model,
                 ..
             } => {
                 assert_eq!(hierarchy_tier, None);
                 assert_eq!(cost_source, None);
+                assert_eq!(effective_model, None);
             }
             other => panic!("unexpected payload: {other:?}"),
         }
