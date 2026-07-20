@@ -1,0 +1,246 @@
+schema_version = 1
+id = "web-project-v1"
+display_name = "Static website project"
+status = "contract"
+claim = "A bounded customer website request reaches explicit acceptance through governed multi-role work."
+runtime_mode = "single_node"
+cluster_required = false
+external_production_deploy = false
+
+lifecycle = [
+  "customer_intake",
+  "qualification",
+  "proposal",
+  "customer_agreement",
+  "project_planning",
+  "specialist_execution",
+  "independent_qa",
+  "release",
+  "delivery",
+  "customer_acceptance",
+  "memory_closeout",
+]
+
+[customer_contract]
+explicit_acceptance_required = true
+proposal_digest_binding = true
+required_fields = [
+  "scope",
+  "deliverables",
+  "exclusions",
+  "acceptance_criteria",
+  "assumptions",
+  "cost_ceiling",
+  "expires_at",
+]
+
+[project]
+work_graph = "dag"
+minimum_distinct_internal_roles = 6
+minimum_worker_specialties = 2
+evidence_backed_completion = true
+chat_is_authoritative = false
+
+[cost]
+default_real_provider_budget_usd = 0.0
+maintainer_approval_required = true
+hard_ceiling_required = true
+atomic_project_budget = true
+
+[runtime]
+tool_runtime = "bwrap"
+runtime_registry_required = true
+allow_secure_runtime_fallback = false
+dependency_install_at_runtime = false
+toolchain_source = "versioned-release-profile"
+
+[security]
+network_default = "deny"
+host_filesystem_visible = false
+cross_project_workspace_access = false
+secret_paths_visible = false
+landlock_required = true
+linux_capability_policy_required = true
+cgroup_limits_required = true
+environment_allowlist_required = true
+complete_process_tree_cancellation = true
+
+[recovery]
+durable_request_reservation = true
+canonical_request_digest = true
+outcome_probe_before_retry = true
+outbox_required = true
+compare_and_set_transitions = true
+
+[memory]
+closeout_after_customer_acceptance = true
+source_provenance_required = true
+derived_memory_is_not_authority = true
+nightrun_direct_workflow_mutation = false
+
+[[roles]]
+id = "sales"
+authority = ["qualify_request", "author_proposal"]
+required_capabilities = ["customer_intake", "scope_analysis"]
+
+[[roles]]
+id = "project_manager"
+authority = ["create_project", "plan_work", "manage_blocker", "request_assignment"]
+required_capabilities = ["project_planning", "dependency_management"]
+
+[[roles]]
+id = "technical_lead"
+authority = ["decompose_technical_work", "assign_specialist", "approve_handoff"]
+required_capabilities = ["technical_design", "work_review"]
+
+[[roles]]
+id = "designer"
+authority = ["claim_assigned_work", "produce_design_artifact"]
+required_capabilities = ["web_design", "artifact_authoring"]
+
+[[roles]]
+id = "developer"
+authority = ["claim_assigned_work", "produce_source_artifact", "run_developer_tests"]
+required_capabilities = ["web_development", "artifact_authoring", "test_execution"]
+
+[[roles]]
+id = "qa"
+authority = ["claim_qa", "record_finding", "approve_candidate", "reject_candidate"]
+required_capabilities = ["quality_assurance", "browser_validation", "security_validation"]
+
+[[roles]]
+id = "release_manager"
+authority = ["promote_release", "deliver_release", "rollback_release"]
+required_capabilities = ["release_management", "provenance_validation"]
+
+[[roles]]
+id = "gaia"
+authority = ["observe_project", "recommend_escalation"]
+required_capabilities = ["company_oversight"]
+
+[[tool_profiles]]
+id = "web-authoring-v1"
+roles = ["designer", "developer"]
+runtime = "bwrap"
+tools = [
+  "file.inspect",
+  "file.write",
+  "patch.apply",
+  "command.run_allowlisted",
+  "test.run_profile",
+  "artifact.commit",
+]
+network = "deny"
+
+[[tool_profiles]]
+id = "web-qa-v1"
+roles = ["qa"]
+runtime = "bwrap"
+tools = [
+  "file.inspect",
+  "command.run_allowlisted",
+  "test.run_profile",
+  "browser.validate_local",
+  "artifact.attest",
+]
+network = "deny"
+
+[[tool_profiles]]
+id = "web-release-v1"
+roles = ["release_manager"]
+runtime = "control_plane"
+tools = [
+  "artifact.inspect",
+  "release.promote",
+  "delivery.publish_preview",
+  "release.rollback",
+]
+network = "internal_only"
+
+[[required_artifacts]]
+kind = "customer_brief"
+producer_role = "sales"
+immutable = true
+
+[[required_artifacts]]
+kind = "agreement"
+producer_role = "sales"
+immutable = true
+
+[[required_artifacts]]
+kind = "project_plan"
+producer_role = "project_manager"
+immutable = true
+
+[[required_artifacts]]
+kind = "design_specification"
+producer_role = "designer"
+immutable = true
+
+[[required_artifacts]]
+kind = "source_tree"
+producer_role = "developer"
+immutable = true
+
+[[required_artifacts]]
+kind = "qa_report"
+producer_role = "qa"
+immutable = true
+
+[[required_artifacts]]
+kind = "release_manifest"
+producer_role = "release_manager"
+immutable = true
+
+[[required_artifacts]]
+kind = "delivery_receipt"
+producer_role = "release_manager"
+immutable = true
+
+[[required_artifacts]]
+kind = "customer_acceptance"
+producer_role = "customer"
+immutable = true
+
+[[required_artifacts]]
+kind = "project_closeout_memory"
+producer_role = "project_manager"
+immutable = true
+
+[[quality_gates]]
+id = "html_structure"
+runner = "web-qa-v1"
+required = true
+
+[[quality_gates]]
+id = "local_link_integrity"
+runner = "web-qa-v1"
+required = true
+
+[[quality_gates]]
+id = "static_security"
+runner = "web-qa-v1"
+required = true
+
+[[quality_gates]]
+id = "browser_smoke"
+runner = "web-qa-v1"
+required = true
+
+[[quality_gates]]
+id = "agreement_acceptance_criteria"
+runner = "web-qa-v1"
+required = true
+
+[[quality_gates]]
+id = "digest_provenance"
+runner = "web-release-v1"
+required = true
+
+[acceptance]
+explicit_customer_action = true
+rollback_rehearsal_required = true
+minimum_ticks = 600
+minimum_service_window_minutes = 60
+matching_console_and_durable_readback = true
+issue_specific_vm_snapshot = true
