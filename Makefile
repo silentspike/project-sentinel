@@ -1,6 +1,6 @@
 .PHONY: help lint lint-all test build build-rust build-go build-console \
        fmt check clean hooks ci deny coverage typos doc machete safe-merge \
-       manifest preflight smoke-test deploy provision-projection fuzz verify snapshot-test snapshot-review
+       manifest preflight smoke-test deploy provision-projection provision-runtime-base fuzz verify snapshot-test snapshot-review
 
 # Default target
 help: ## Show this help
@@ -210,6 +210,9 @@ smoke-test: ## Post-deploy smoke test (usage: make smoke-test [SSH=ubuntu@<deplo
 
 provision-projection: ## Install canonical projection artifacts without starting services
 	bash deploy/provision-projection.sh "$(SSH)"
+
+provision-runtime-base: ## Install and verify the common runtime underlay without starting services
+	bash deploy/provision-runtime-base.sh "$(SSH)"
 
 deploy: preflight ## Deploy to VM: preflight + sync + smoke (usage: make deploy [SSH=ubuntu@<deploy-vm>])
 	@echo ""
