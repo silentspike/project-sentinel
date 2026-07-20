@@ -845,6 +845,51 @@ fn agents_for_prepared_residency(all: &[AgentConfig]) -> Vec<&AgentConfig> {
         .collect()
 }
 
+/// Automatic World work is opportunistically suppressed on followers. Every store
+/// still performs its own V19 begin/commit checks, so an authority change between
+/// this scheduling decision and a write remains fail closed. Explicit operator
+/// mutations deliberately bypass this scheduling predicate and reach their typed
+/// store rejection paths.
+fn world_background_work_allowed(registry: &sentinel_common::OwnerRegistry) -> bool {
+    registry
+        .issue(sentinel_common::StateTransferScope::World)
+        .is_ok()
+}
+
+fn attempt_world_owned_runtime_snapshot<F>(
+    registry: &sentinel_common::OwnerRegistry,
+    save: F,
+) -> Option<anyhow::Result<()>>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
+    world_background_work_allowed(registry).then(save)
+}
+
+fn attempt_periodic_runtime_snapshot<F>(
+    tick_count: u64,
+    registry: &sentinel_common::OwnerRegistry,
+    save: F,
+) -> Option<anyhow::Result<()>>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
+    if tick_count == 0 || !tick_count.is_multiple_of(600) {
+        return None;
+    }
+    attempt_world_owned_runtime_snapshot(registry, save)
+}
+
+fn attempt_shutdown_runtime_snapshot<F>(
+    registry: &sentinel_common::OwnerRegistry,
+    save: F,
+) -> Option<anyhow::Result<()>>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
+    attempt_world_owned_runtime_snapshot(registry, save)
+}
+
 fn rebuild_owner_registry_from_store(
     meta: &sentinel_redb::ClusterMetaStore,
 ) -> Result<sentinel_common::OwnerTermSnapshot> {
@@ -2366,6 +2411,16 @@ fn periodic_runtime_reconcile_request(
     }
 }
 
+fn should_request_projection_rebuild(
+    request: &RuntimeReconcileRequest,
+    source: RuntimeReconcileSource,
+    projection_drift_detected: bool,
+) -> bool {
+    request.projection_rebuild
+        && !request.dry_run
+        && (projection_drift_detected || !source.is_periodic())
+}
+
 fn runtime_agent_is_healthy(agent: &runtime_health::RuntimeHealthAgentSnapshot) -> bool {
     agent.runtime_present
         && agent.projection_present
@@ -2991,29 +3046,30 @@ fn run_runtime_reconcile(
         }
     }
 
-    let projection_rebuild_requested = if request.projection_rebuild && !request.dry_run {
-        let reason = if projection_drift_before {
-            "projection_drift"
+    let projection_rebuild_requested =
+        if should_request_projection_rebuild(&request, source, projection_drift_before) {
+            let reason = if projection_drift_before {
+                "projection_drift"
+            } else {
+                "manual_request"
+            };
+            match crate::runtime_control::write_projection_rebuild_request(
+                ctx.data_dir,
+                ctx.tick_count,
+                reason,
+            ) {
+                Ok(()) => {
+                    repair_ops_total += 1;
+                    true
+                }
+                Err(error) => {
+                    errors.push(error.to_string());
+                    false
+                }
+            }
         } else {
-            "manual_request"
+            false
         };
-        match crate::runtime_control::write_projection_rebuild_request(
-            ctx.data_dir,
-            ctx.tick_count,
-            reason,
-        ) {
-            Ok(()) => {
-                repair_ops_total += 1;
-                true
-            }
-            Err(error) => {
-                errors.push(error.to_string());
-                false
-            }
-        }
-    } else {
-        false
-    };
 
     let mut after = runtime_health::build_runtime_health_snapshot(
         ctx.all_agents,
@@ -5172,31 +5228,39 @@ fn ecs_tick_loop(
         // therefore happen strictly between ECS ticks, while closing readiness still
         // prevents normal guards from being minted or committed against either view.
         let owner_tick_barrier = sentinel_common::owner_tick_barrier();
+        let world_background_allowed =
+            world_background_work_allowed(sentinel_common::OwnerRegistry::global());
 
-        if let Some(rx) = evolution_result_rx.as_ref() {
-            drain_evolution_results(&state_store_for_sim, rx);
+        if world_background_allowed {
+            if let Some(rx) = evolution_result_rx.as_ref() {
+                drain_evolution_results(&state_store_for_sim, rx);
+            }
         }
 
         // PSI-basierte adaptive Tick-Rate aktualisieren (alle N Ticks)
         adaptive_tick.update(tick_count);
 
         // SimulationTime aktualisieren (Zeitvirtualisierung via time_scale)
-        if let Some(mut time) = world.get_resource_mut::<SimulationTime>() {
-            time.tick = sentinel_common::Tick(tick_count);
-            time.tick_count = tick_count;
-            // delta_seconds = echte Tick-Dauer * time_scale (Zeitvirtualisierung)
-            time.delta_seconds = tick_rate.as_secs_f32() * time_scale;
-            // sim_hour inkrementell (persistiert in redb, ueberlebt Restart)
-            sim_hour = (sim_hour + time.delta_seconds / 3600.0) % 24.0;
-            time.sim_hour = sim_hour;
+        if world_background_allowed {
+            if let Some(mut time) = world.get_resource_mut::<SimulationTime>() {
+                time.tick = sentinel_common::Tick(tick_count);
+                time.tick_count = tick_count;
+                // delta_seconds = echte Tick-Dauer * time_scale (Zeitvirtualisierung)
+                time.delta_seconds = tick_rate.as_secs_f32() * time_scale;
+                // sim_hour inkrementell (persistiert in redb, ueberlebt Restart)
+                sim_hour = (sim_hour + time.delta_seconds / 3600.0) % 24.0;
+                time.sim_hour = sim_hour;
+            }
         }
 
         // PSI-Metriken in ECS World injizieren (fuer bio_system → apply_psi_stress)
         let psi_cpu_avg10 = adaptive_tick.cpu_avg10();
         let psi_mem_avg10 = adaptive_tick.mem_avg10();
-        if let Some(mut psi) = world.get_resource_mut::<sentinel_ecs::PsiMetrics>() {
-            psi.cpu_avg10 = psi_cpu_avg10;
-            psi.mem_avg10 = psi_mem_avg10;
+        if world_background_allowed {
+            if let Some(mut psi) = world.get_resource_mut::<sentinel_ecs::PsiMetrics>() {
+                psi.cpu_avg10 = psi_cpu_avg10;
+                psi.mem_avg10 = psi_mem_avg10;
+            }
         }
 
         // #491 (TM-3): PSI-Band als sparse Event aufzeichnen (nur bei Wechsel). apply_psi_stress
@@ -5204,7 +5268,7 @@ fn ecs_tick_loop(
         // Replay-Input. Push in den EventBuffer VOR schedule.run -> persist_system schreibt das
         // Event mit GENAU diesem Tick; das Band wirkt im Replay ab demselben Tick (kein Off-by-one).
         let current_band = psi_band_from_metrics(psi_cpu_avg10, psi_mem_avg10);
-        if psi_band != Some(current_band) {
+        if world_background_allowed && psi_band != Some(current_band) {
             psi_band = Some(current_band);
             let payload = sentinel_common::DomainEventPayload::PsiBandChanged {
                 cpu_above: current_band.0,
@@ -5225,10 +5289,12 @@ fn ecs_tick_loop(
         runtime_orch.set_tick(tick_count);
 
         // ECS Schedule ausfuehren (alle 12 Systems in Reihenfolge)
-        schedule.run(&mut world);
+        if world_background_allowed {
+            schedule.run(&mut world);
+        }
 
         // Per-Phase-Dauern recorden (#381): 10x observe, ~25ns each — im Budget.
-        if !phase_histograms.is_empty() {
+        if world_background_allowed && !phase_histograms.is_empty() {
             if let Some(timings) = world.get_resource::<sentinel_ecs::PhaseTimings>() {
                 for (i, hist) in phase_histograms.iter().enumerate() {
                     if let Some(ms) = timings.duration_ms(i) {
@@ -5239,22 +5305,27 @@ fn ecs_tick_loop(
         }
 
         // Activity-Tracking: Agents die eine Action ausgefuehrt haben als aktiv markieren
-        if let Some(active) = world.get_resource::<sentinel_ecs::ActiveAgentsThisTick>() {
-            for agent_id in &active.0 {
-                runtime_orch.record_activity(*agent_id, tick_count);
+        if world_background_allowed {
+            if let Some(active) = world.get_resource::<sentinel_ecs::ActiveAgentsThisTick>() {
+                for agent_id in &active.0 {
+                    runtime_orch.record_activity(*agent_id, tick_count);
+                }
             }
-        }
-        if let Some(mut active) = world.get_resource_mut::<sentinel_ecs::ActiveAgentsThisTick>() {
-            active.0.clear();
+            if let Some(mut active) = world.get_resource_mut::<sentinel_ecs::ActiveAgentsThisTick>()
+            {
+                active.0.clear();
+            }
         }
 
         // Smart Resource Management: Profil-Erkennung + cgroup Hot-Resize
-        resource_manager.cycle(
-            tick_count,
-            &runtime_orch,
-            &event_store_for_prune,
-            adaptive_tick.should_block_spawn(),
-        );
+        if world_background_allowed {
+            resource_manager.cycle(
+                tick_count,
+                &runtime_orch,
+                &event_store_for_prune,
+                adaptive_tick.should_block_spawn(),
+            );
+        }
 
         while let Ok(command) = platform_rx.try_recv() {
             info!(command = ?command, "Platform-Controlplane Trigger empfangen");
@@ -5969,7 +6040,8 @@ fn ecs_tick_loop(
         }
 
         // Controlplane-Zyklus (alle N Ticks) — SENTINEL_CONTROLPLANE_ENABLED gate (AC-6)
-        if sentinel_common::feature_flags::RuntimeFlags::global().controlplane_enabled
+        if world_background_allowed
+            && sentinel_common::feature_flags::RuntimeFlags::global().controlplane_enabled
             && controlplane.should_run(tick_count)
         {
             if let Err(e) = controlplane.cycle(&mut world, tick_count) {
@@ -5978,7 +6050,7 @@ fn ecs_tick_loop(
         }
 
         // Shift-Erkennung (alle 60 Ticks = ~1 Minute bei 1s Tick-Rate)
-        if tick_count > 0 && tick_count.is_multiple_of(60) {
+        if world_background_allowed && tick_count > 0 && tick_count.is_multiple_of(60) {
             let new_shift = if (time_scale - 1.0).abs() < f32::EPSILON {
                 detect_current_shift() // Production: System-Uhrzeit
             } else {
@@ -6769,7 +6841,10 @@ fn ecs_tick_loop(
         }
 
         // Time Machine: Periodische World Snapshots
-        if !restore_fence.is_active() && snapshot_manager.should_create_snapshot(tick_count) {
+        if world_background_allowed
+            && !restore_fence.is_active()
+            && snapshot_manager.should_create_snapshot(tick_count)
+        {
             let event_store_for_snapshot = world
                 .get_resource::<sentinel_ecs::LimboEventStore>()
                 .map(|es| Arc::clone(&es.0));
@@ -7239,14 +7314,18 @@ fn ecs_tick_loop(
         }
 
         // Episode Producer (alle 30 Ticks = ~30s bei 1s Tick-Rate)
-        if episode_producer.should_run(tick_count) {
+        if world_background_allowed && episode_producer.should_run(tick_count) {
             let tick_rate_s = tick_rate.as_secs_f64();
             episode_producer.tick(&event_store_for_episodes, tick_count, tick_rate_s);
         }
 
         // Periodischer Runtime-Snapshot (alle 600 Ticks = ~10 Minuten bei 1s Tick-Rate)
-        if tick_count > 0 && tick_count.is_multiple_of(600) {
-            if let Err(e) = runtime_orch.save_state() {
+        if let Some(snapshot_result) = attempt_periodic_runtime_snapshot(
+            tick_count,
+            sentinel_common::OwnerRegistry::global(),
+            || runtime_orch.save_state(),
+        ) {
+            if let Err(e) = snapshot_result {
                 warn!(error = %e, tick = tick_count, "Periodischer Snapshot fehlgeschlagen");
             } else {
                 info!(
@@ -7258,7 +7337,7 @@ fn ecs_tick_loop(
 
         tick_count += 1;
 
-        if tick_count.is_multiple_of(60) {
+        if world_background_allowed && tick_count.is_multiple_of(60) {
             // sim_hour periodisch persistieren
             if let Err(e) = state_store_for_sim.set_sim_hour(sim_hour) {
                 warn!(error = %e, "sim_hour persist fehlgeschlagen");
@@ -7334,8 +7413,10 @@ fn ecs_tick_loop(
 
     // 4. sim_hour persistieren
     let t = Instant::now();
-    if let Err(e) = state_store_for_sim.set_sim_hour(sim_hour) {
-        warn!(error = %e, "sim_hour Shutdown-Persist fehlgeschlagen");
+    if world_background_work_allowed(sentinel_common::OwnerRegistry::global()) {
+        if let Err(e) = state_store_for_sim.set_sim_hour(sim_hour) {
+            warn!(error = %e, "sim_hour Shutdown-Persist fehlgeschlagen");
+        }
     }
     info!(
         duration_ms = t.elapsed().as_millis() as u64,
@@ -7346,15 +7427,23 @@ fn ecs_tick_loop(
     //    nicht 0. Beim Restart erkennt shift_transition() ob Schichtwechsel stattfand
     //    und entfernt/spawnt Agents entsprechend.)
     let t = Instant::now();
-    if let Err(e) = runtime_orch.save_state() {
-        error!(error = %e, "Runtime State Snapshot fehlgeschlagen");
-    } else {
-        info!(
-            agent_count = runtime_orch.agent_count(),
-            "Runtime State Snapshot gespeichert"
-        );
+    let runtime_snapshot_result =
+        attempt_shutdown_runtime_snapshot(sentinel_common::OwnerRegistry::global(), || {
+            runtime_orch.save_state()
+        });
+    let runtime_snapshot_attempted = runtime_snapshot_result.is_some();
+    if let Some(runtime_snapshot_result) = runtime_snapshot_result {
+        if let Err(e) = runtime_snapshot_result {
+            error!(error = %e, "Runtime State Snapshot fehlgeschlagen");
+        } else {
+            info!(
+                agent_count = runtime_orch.agent_count(),
+                "Runtime State Snapshot gespeichert"
+            );
+        }
     }
     info!(
+        attempted = runtime_snapshot_attempted,
         duration_ms = t.elapsed().as_millis() as u64,
         "Shutdown: Runtime-Snapshot"
     );
@@ -7395,6 +7484,71 @@ mod tests {
     use std::sync::Arc;
 
     static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn world_background_work_runs_only_for_the_routable_world_owner() {
+        let seed = sentinel_common::NodeId(uuid::Uuid::from_bytes([1; 16]));
+        let follower_node = sentinel_common::NodeId(uuid::Uuid::from_bytes([2; 16]));
+        let global = initial_owner_snapshot(seed, &[]).unwrap();
+
+        let owner = sentinel_common::OwnerRegistry::new_cluster_for_test(seed);
+        owner
+            .rebuild_from_owner_snapshot(
+                &global,
+                &recipient_owner_snapshot(&global, seed).unwrap(),
+                vec![],
+            )
+            .unwrap();
+        assert!(world_background_work_allowed(&owner));
+
+        let follower = sentinel_common::OwnerRegistry::new_cluster_for_test(follower_node);
+        follower
+            .rebuild_from_owner_snapshot(
+                &global,
+                &recipient_owner_snapshot(&global, follower_node).unwrap(),
+                vec![],
+            )
+            .unwrap();
+        assert!(!world_background_work_allowed(&follower));
+        assert!(matches!(
+            follower.issue(sentinel_common::StateTransferScope::World),
+            Err(sentinel_common::OwnerIssueError::NotOwner { .. })
+        ));
+
+        let closed = sentinel_common::OwnerRegistry::new_cluster_for_test(follower_node);
+        assert!(!world_background_work_allowed(&closed));
+    }
+
+    #[test]
+    fn follower_callsites_never_attempt_periodic_or_shutdown_runtime_snapshots() {
+        use std::cell::Cell;
+
+        let seed = sentinel_common::NodeId(uuid::Uuid::from_bytes([1; 16]));
+        let follower_node = sentinel_common::NodeId(uuid::Uuid::from_bytes([2; 16]));
+        let global = initial_owner_snapshot(seed, &[]).unwrap();
+        let follower = sentinel_common::OwnerRegistry::new_cluster_for_test(follower_node);
+        follower
+            .rebuild_from_owner_snapshot(
+                &global,
+                &recipient_owner_snapshot(&global, follower_node).unwrap(),
+                vec![],
+            )
+            .unwrap();
+
+        let attempts = Cell::new(0usize);
+        let periodic = attempt_periodic_runtime_snapshot(600, &follower, || {
+            attempts.set(attempts.get() + 1);
+            Ok(())
+        });
+        let shutdown = attempt_shutdown_runtime_snapshot(&follower, || {
+            attempts.set(attempts.get() + 1);
+            Ok(())
+        });
+
+        assert!(periodic.is_none());
+        assert!(shutdown.is_none());
+        assert_eq!(attempts.get(), 0);
+    }
 
     #[tokio::test]
     async fn seed_valid_marker_restart_does_not_gate_on_unreachable_member() {
@@ -8582,6 +8736,41 @@ mod tests {
         assert!(!request.dry_run);
         assert!(!request.respawn_missing);
         assert!(!request.projection_rebuild);
+    }
+
+    #[test]
+    fn periodic_projection_rebuild_requires_drift_but_operator_request_does_not() {
+        let request = RuntimeReconcileRequest {
+            dry_run: false,
+            projection_rebuild: true,
+            respawn_missing: false,
+        };
+
+        assert!(!should_request_projection_rebuild(
+            &request,
+            RuntimeReconcileSource::Periodic,
+            false,
+        ));
+        assert!(should_request_projection_rebuild(
+            &request,
+            RuntimeReconcileSource::Periodic,
+            true,
+        ));
+        assert!(should_request_projection_rebuild(
+            &request,
+            RuntimeReconcileSource::Operator,
+            false,
+        ));
+
+        let dry_run = RuntimeReconcileRequest {
+            dry_run: true,
+            ..request
+        };
+        assert!(!should_request_projection_rebuild(
+            &dry_run,
+            RuntimeReconcileSource::Operator,
+            true,
+        ));
     }
 
     #[test]

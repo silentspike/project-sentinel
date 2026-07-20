@@ -10,10 +10,8 @@ use std::sync::RwLock;
 
 use crate::cas::CasStore;
 use crate::metadata::{FileKind, InodeData, MetadataStore};
+use crate::SHARED_BASE_LAYER_ID;
 use tracing::instrument;
-
-/// Special agent ID for the shared base layer.
-const BASE_LAYER: &str = "__BASE__";
 
 /// Whiteout marker: inode data with a zeroed hash and size=u64::MAX.
 fn is_whiteout(data: &InodeData) -> bool {
@@ -109,11 +107,13 @@ impl LayerManager {
         content: &[u8],
         mode: u32,
     ) -> anyhow::Result<u64> {
+        self.meta
+            .validate_layer_write_authority(SHARED_BASE_LAYER_ID)?;
         let (hash, _deduped) = self.cas.store(content)?;
-        let inode = self.meta.next_inode(BASE_LAYER)?;
+        let inode = self.meta.next_inode(SHARED_BASE_LAYER_ID)?;
         let data = InodeData::regular(hash, content.len() as u64, mode);
         self.meta
-            .create_file(BASE_LAYER, parent_inode, name, inode, &data)?;
+            .create_file(SHARED_BASE_LAYER_ID, parent_inode, name, inode, &data)?;
         Ok(inode)
     }
 
@@ -124,19 +124,18 @@ impl LayerManager {
         name: &str,
         mode: u32,
     ) -> anyhow::Result<u64> {
-        let inode = self.meta.next_inode(BASE_LAYER)?;
+        self.meta
+            .validate_layer_write_authority(SHARED_BASE_LAYER_ID)?;
+        let inode = self.meta.next_inode(SHARED_BASE_LAYER_ID)?;
         let data = InodeData::directory(mode);
         self.meta
-            .create_file(BASE_LAYER, parent_inode, name, inode, &data)?;
+            .create_file(SHARED_BASE_LAYER_ID, parent_inode, name, inode, &data)?;
         Ok(inode)
     }
 
     /// Initialize the base layer root directory (inode 1).
     pub fn init_base_root(&self) -> anyhow::Result<()> {
-        if self.meta.get_inode(BASE_LAYER, 1)?.is_none() {
-            let root = InodeData::directory(0o755);
-            self.meta.set_inode(BASE_LAYER, 1, &root)?;
-        }
+        self.meta.bootstrap_shared_base_root_node_local()?;
         Ok(())
     }
 
@@ -184,7 +183,7 @@ impl LayerManager {
             return Ok(Some(data));
         }
         // Base layer fallback
-        self.meta.get_inode(BASE_LAYER, inode)
+        self.meta.get_inode(SHARED_BASE_LAYER_ID, inode)
     }
 
     /// Lookup a directory entry: agent layer first, then base layer.
@@ -205,7 +204,7 @@ impl LayerManager {
             return Ok(Some(child));
         }
         // Base layer fallback
-        self.meta.get_dirent(BASE_LAYER, parent, name)
+        self.meta.get_dirent(SHARED_BASE_LAYER_ID, parent, name)
     }
 
     /// Read file content by looking up the inode and reading from CAS.
@@ -231,6 +230,7 @@ impl LayerManager {
         content: &[u8],
         mode: u32,
     ) -> anyhow::Result<u64> {
+        self.meta.validate_layer_write_authority(agent_id)?;
         let (hash, _deduped) = self.cas.store(content)?;
         let data = InodeData::regular(hash, content.len() as u64, mode);
         let ensure_root = !self.agent_root_known(agent_id)?;
@@ -255,6 +255,7 @@ impl LayerManager {
         name: &str,
         mode: u32,
     ) -> anyhow::Result<u64> {
+        self.meta.validate_layer_write_authority(agent_id)?;
         let data = InodeData::directory(mode);
         let ensure_root = !self.agent_root_known(agent_id)?;
         let inode = self.meta.create_file_allocating_inode(
@@ -287,7 +288,7 @@ impl LayerManager {
         // If entry exists in base layer, place whiteout
         if self
             .meta
-            .get_dirent(BASE_LAYER, parent_inode, name)?
+            .get_dirent(SHARED_BASE_LAYER_ID, parent_inode, name)?
             .is_some()
         {
             let wo = whiteout_marker();
@@ -322,12 +323,12 @@ impl LayerManager {
         }
 
         // Base layer entries (only if not already in agent layer or whiteout)
-        let base_entries = self.meta.list_dirents(BASE_LAYER, parent_inode)?;
+        let base_entries = self.meta.list_dirents(SHARED_BASE_LAYER_ID, parent_inode)?;
         for (name, child_inode) in base_entries {
             if seen_names.contains(&name) || whiteout_names.contains(&name) {
                 continue;
             }
-            if let Some(data) = self.meta.get_inode(BASE_LAYER, child_inode)? {
+            if let Some(data) = self.meta.get_inode(SHARED_BASE_LAYER_ID, child_inode)? {
                 result.push((name, child_inode, data.kind));
             }
         }
@@ -359,7 +360,7 @@ mod tests {
             .unwrap();
 
         // Read via base layer
-        let content = lm.read_file(BASE_LAYER, inode).unwrap();
+        let content = lm.read_file(SHARED_BASE_LAYER_ID, inode).unwrap();
         assert_eq!(content, b"Hello World");
 
         // Agent sees base content
@@ -385,7 +386,7 @@ mod tests {
         assert_eq!(content, b"agent content");
 
         // Base still has original content
-        let base_content = lm.read_file(BASE_LAYER, base_inode).unwrap();
+        let base_content = lm.read_file(SHARED_BASE_LAYER_ID, base_inode).unwrap();
         assert_eq!(base_content, b"base content");
 
         // Other agent doesn't see AGENT-01's file
@@ -450,7 +451,7 @@ mod tests {
         // Base layer untouched
         assert!(lm
             .meta()
-            .get_dirent(BASE_LAYER, 1, "deleteme.txt")
+            .get_dirent(SHARED_BASE_LAYER_ID, 1, "deleteme.txt")
             .unwrap()
             .is_some());
     }
@@ -469,7 +470,7 @@ mod tests {
 
         let base2_inode = lm
             .meta()
-            .get_dirent(BASE_LAYER, 1, "base2.txt")
+            .get_dirent(SHARED_BASE_LAYER_ID, 1, "base2.txt")
             .unwrap()
             .unwrap();
         lm.unlink("AGENT-01", 1, "base2.txt", base2_inode).unwrap();
