@@ -7,7 +7,8 @@ import { selectedAgentId, setSelectedAgentId } from "../state/selection";
 
 // #422 Agent Editor — load an existing agent, edit its config, save via PUT /api/config/agents/{id}
 // (the backend assembles the full mode:live apply and proxies it to the daemon, the sole writer).
-// runtime.nano_runtime stays read-only until #395 ships the explicit tier schema.
+// identity.tier is the organization hierarchy class. runtime.nano_runtime remains
+// an independent, read-only execution-runtime selection.
 
 const BIG_FIVE = [
   "openness",
@@ -28,7 +29,7 @@ const fromCsv = (s: string): string[] =>
 /** A typed blank agent so the editable store is always a full AgentConfig (form shown only when loaded). */
 function blankAgent(): AgentConfig {
   return {
-    identity: { id: 0, name: "", role: "", department: "", shift_set: 1, kpis: [], reports_to: null, direct_reports: [] },
+    identity: { id: 0, name: "", role: "", department: "", tier: null, shift_set: 1, kpis: [], reports_to: null, direct_reports: [] },
     personality: {
       openness: 0.5,
       conscientiousness: 0.5,
@@ -51,6 +52,7 @@ export function AgentEditorView(): JSX.Element {
   const [filter, setFilter] = createSignal("");
   const [edited, setEdited] = createStore<AgentConfig>(blankAgent());
   const [busy, setBusy] = createSignal(false);
+  const [serverError, setServerError] = createSignal<string | null>(null);
 
   const original = createMemo(() => agents().find((a) => a.identity.id === selectedId()) ?? null);
   const isLoaded = (): boolean => selectedId() !== null;
@@ -75,7 +77,10 @@ export function AgentEditorView(): JSX.Element {
   // When the selection changes, copy the original into the editable store.
   createEffect(() => {
     const o = original();
-    if (o) setEdited(reconcile(structuredClone(o)));
+    if (o) {
+      setEdited(reconcile(structuredClone(o)));
+      setServerError(null);
+    }
   });
 
   // #424: when the Org Chart requested an agent (shared selectedAgentId), select it here once the
@@ -102,12 +107,15 @@ export function AgentEditorView(): JSX.Element {
   async function save(): Promise<void> {
     if (!isLoaded() || errors().length > 0) return;
     setBusy(true);
+    setServerError(null);
     try {
       await putJson(`/api/config/agents/${e().identity.id}`, e());
       addToast(`Agent ${e().identity.name} gespeichert (Daemon-Apply #425)`, "ok", 4000);
       await load();
     } catch (err) {
-      addToast(err instanceof Error ? err.message : "Speichern fehlgeschlagen", "error", 5000);
+      const message = err instanceof Error ? err.message : "Speichern fehlgeschlagen";
+      setServerError(message);
+      addToast(message, "error", 5000);
     } finally {
       setBusy(false);
     }
@@ -139,6 +147,9 @@ export function AgentEditorView(): JSX.Element {
         </select>
 
         <Show when={isLoaded()} fallback={<p class="muted">Waehle einen Agenten zum Bearbeiten.</p>}>
+          <Show when={serverError()}>
+            {(message) => <p data-testid="ae-server-error" class="degraded-panel" role="alert">{message()}</p>}
+          </Show>
           <fieldset style={{ border: "1px solid var(--border)", "border-radius": "6px", padding: "8px" }}>
             <legend>Identity (id {e().identity.id} — read-only)</legend>
             <label>
@@ -160,6 +171,24 @@ export function AgentEditorView(): JSX.Element {
                 value={e().identity.department}
                 onInput={(ev) => setEdited("identity", "department", ev.currentTarget.value)}
               />
+            </label>
+            <label>
+              Hierarchy tier
+              <select
+                data-testid="ae-hierarchy-tier"
+                aria-label="Organization hierarchy tier"
+                style={fieldStyle(e().identity.tier !== original()?.identity.tier)}
+                value={e().identity.tier ?? ""}
+                onChange={(ev) => {
+                  const tier = Number(ev.currentTarget.value);
+                  setEdited("identity", "tier", tier === 1 || tier === 2 || tier === 3 ? tier : null);
+                }}
+              >
+                <option value="">— Select tier —</option>
+                <option value="1">Tier 1</option>
+                <option value="2">Tier 2</option>
+                <option value="3">Tier 3</option>
+              </select>
             </label>
             <label>
               shift_set
@@ -246,7 +275,7 @@ export function AgentEditorView(): JSX.Element {
               />
             </label>
             <label>
-              nano_runtime (read-only bis #395)
+              nano_runtime (independent, read-only)
               <input data-testid="ae-nano-runtime" readOnly value={e().runtime.nano_runtime ?? "—"} />
             </label>
           </fieldset>

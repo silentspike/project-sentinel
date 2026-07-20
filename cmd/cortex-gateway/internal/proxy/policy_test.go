@@ -5,77 +5,96 @@ import (
 	"testing"
 )
 
-func TestClassifyRequestStrictAgentRuntime(t *testing.T) {
+func TestClassifyRequestRequiresServerSideRole(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name string
-		path string
-		meta map[string]string
-		want RequestClass
+		name    string
+		path    string
+		role    CallerRole
+		meta    map[string]string
+		want    RequestClass
+		wantErr bool
 	}{
 		{
-			name: "anthropic messages stays external even with agent id",
+			name: "public role stays external and strips forged agent claims",
 			path: "/v1/messages",
+			role: CallerRoleExternalCompat,
 			meta: map[string]string{"agent_id": "12", "agent_name": "Thomas Mueller"},
 			want: RequestClassExternalCompat,
 		},
 		{
-			name: "platform analysis metadata wins over agent id",
+			name: "platform role creates platform class",
 			path: "/internal/llm",
-			meta: map[string]string{"agent_id": "12", "platform_analysis": "true"},
+			role: CallerRolePlatformControlplane,
+			meta: map[string]string{"platform_analysis": "true"},
 			want: RequestClassPlatformControlplane,
 		},
 		{
-			name: "platform controlplane identity wins over agent id",
+			name: "evolution role creates service class",
 			path: "/internal/llm",
-			meta: map[string]string{"agent_id": "12", "agent_name": "PLATFORM-CONTROLPLANE"},
-			want: RequestClassPlatformControlplane,
-		},
-		{
-			name: "request type marks service internal",
-			path: "/internal/llm",
-			meta: map[string]string{"agent_id": "12", "request_type": "evolution_analysis"},
+			role: CallerRoleEvolution,
+			meta: map[string]string{"request_type": "evolution_analysis"},
 			want: RequestClassServiceInternal,
 		},
 		{
-			name: "sentinel judge identity marks service internal",
-			path: "/internal/llm",
-			meta: map[string]string{"agent_id": "12", "agent_name": "sentinel-judge"},
-			want: RequestClassServiceInternal,
+			name:    "judge role rejects agent claims",
+			path:    "/internal/llm",
+			role:    CallerRoleJudge,
+			meta:    map[string]string{"agent_id": "12"},
+			wantErr: true,
 		},
 		{
-			name: "positive numeric agent id marks runtime",
-			path: "/internal/llm",
-			meta: map[string]string{"agent_id": "12", "agent_name": "Thomas Mueller"},
+			name: "agent role creates runtime only on dedicated path",
+			path: "/internal/agent-runtime",
+			role: CallerRoleAgentRuntime,
+			meta: map[string]string{"agent_id": "12", "hierarchy_tier": "2"},
 			want: RequestClassAgentRuntime,
 		},
 		{
-			name: "zero is not a runtime agent",
-			path: "/internal/llm",
-			meta: map[string]string{"agent_id": "0", "agent_name": "Thomas Mueller"},
-			want: RequestClassInternalOther,
+			name:    "agent role rejects shared internal path",
+			path:    "/internal/llm",
+			role:    CallerRoleAgentRuntime,
+			meta:    map[string]string{"agent_id": "12", "hierarchy_tier": "2"},
+			wantErr: true,
 		},
 		{
-			name: "leading zero is not a runtime agent",
-			path: "/internal/llm",
-			meta: map[string]string{"agent_id": "012", "agent_name": "Thomas Mueller"},
-			want: RequestClassInternalOther,
+			name:    "agent role rejects invalid tier",
+			path:    "/internal/agent-runtime",
+			role:    CallerRoleAgentRuntime,
+			meta:    map[string]string{"agent_id": "12", "hierarchy_tier": "4"},
+			wantErr: true,
 		},
 		{
-			name: "non numeric agent id is not a runtime agent",
-			path: "/internal/llm",
-			meta: map[string]string{"agent_id": "agent-12", "agent_name": "Thomas Mueller"},
-			want: RequestClassInternalOther,
+			name:    "unknown server role fails closed",
+			path:    "/internal/llm",
+			role:    CallerRole("forged"),
+			meta:    map[string]string{},
+			wantErr: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := ClassifyRequest(tt.path, &LLMRequest{Metadata: tt.meta})
+			request := &LLMRequest{Metadata: tt.meta}
+			got, err := ClassifyRequest(tt.path, request, tt.role)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ClassifyRequest() = %q, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ClassifyRequest() error = %v", err)
+			}
 			if got != tt.want {
 				t.Fatalf("ClassifyRequest() = %q, want %q", got, tt.want)
+			}
+			if tt.role == CallerRoleExternalCompat {
+				if _, retained := request.Metadata["agent_id"]; retained {
+					t.Fatalf("public agent claim retained: %#v", request.Metadata)
+				}
 			}
 		})
 	}

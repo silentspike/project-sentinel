@@ -3,6 +3,7 @@ id = 40
 name = "David Nguyen"
 role = "Junior Projektmanager"
 department = "Projektmanagement"
+tier = 3
 shift_set = 3
 reports_to = "Victoria Lehmann (intern \"Vicky\", akzeptiert beide Varianten)"
 

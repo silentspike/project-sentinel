@@ -3,6 +3,7 @@ id = 10
 name = "Daniel Koch"
 role = "Junior Projektmanager"
 department = "Projektmanagement"
+tier = 3
 shift_set = 1
 reports_to = "Sarah Bergmann"
 

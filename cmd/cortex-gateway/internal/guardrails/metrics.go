@@ -70,6 +70,15 @@ func recordCostMetric(provider string, cost float64) {
 // traffic occurred (AC-2). The cost series is always touched so an agent is
 // visible even on a zero-cost synthesis/apicp call. Returns the computed cost.
 func RecordAgentUsage(agentID, tier, provider string, rawInput, output, cacheRead, cacheCreation int) float64 {
+	cost := calculateForwardCostUSD(provider, rawInput+cacheRead+cacheCreation, output)
+	RecordAgentUsageResolved(agentID, tier, rawInput, output, cacheRead, cacheCreation, cost)
+	return cost
+}
+
+// RecordAgentUsageResolved records usage with a cost already resolved by the
+// gateway. It prevents telemetry from silently recomputing a provider-reported
+// cost with a stale provider-wide price assumption.
+func RecordAgentUsageResolved(agentID, tier string, rawInput, output, cacheRead, cacheCreation int, cost float64) {
 	if rawInput != 0 {
 		tokensByAgentTotal.WithLabelValues(agentID, tier, "input").Add(float64(rawInput))
 	}
@@ -82,9 +91,7 @@ func RecordAgentUsage(agentID, tier, provider string, rawInput, output, cacheRea
 	if cacheCreation != 0 {
 		tokensByAgentTotal.WithLabelValues(agentID, tier, "cache_creation").Add(float64(cacheCreation))
 	}
-	cost := calculateForwardCostUSD(provider, rawInput+cacheRead+cacheCreation, output)
 	costByAgentUSDTotal.WithLabelValues(agentID, tier).Add(cost)
-	return cost
 }
 
 // recordRateLimited increments the rate-limited counter.

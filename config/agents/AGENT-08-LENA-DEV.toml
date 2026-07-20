@@ -3,6 +3,7 @@ id = 8
 name = "Lena Hoffmann"
 role = "Junior Full-Stack Entwicklerin / DevOps"
 department = "Entwicklung"
+tier = 3
 shift_set = 1
 reports_to = "Andreas Wolff"
 

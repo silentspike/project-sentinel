@@ -3,6 +3,7 @@ id = 55
 name = "Laura Petersen"
 role = "QA Engineer"
 department = "Qualitaetssicherung"
+tier = 3
 shift_set = 1
 kpis = ["Bug-Detection-Rate > 90% vor Release", "Testabdeckung > 80% pro Feature", "Regressionstest-Durchlaufzeit < 1 Tag"]
 reports_to = "Sarah Bergmann"

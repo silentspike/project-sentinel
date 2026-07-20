@@ -3,6 +3,7 @@ id = 13
 name = "Petra Zimmermann"
 role = "Office Managerin / Buchhaltung"
 department = "Verwaltung"
+tier = 2
 shift_set = 1
 kpis = ["Rechnungsstellung innerhalb 3 Werktage", "Bueromaterial-Budget eingehalten", "Buchhaltung monatsabschlussfertig bis 5. des Folgemonats"]
 reports_to = "Thomas Mueller"

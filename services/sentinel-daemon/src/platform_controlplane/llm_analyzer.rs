@@ -27,7 +27,7 @@ use crate::config::PlatformControlplaneConfig;
 const DEFAULT_GATEWAY_URL: &str = "http://localhost:8080";
 const RECENT_EVENT_SCAN_LIMIT: usize = 256;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LlmAnalyzerConfig {
     pub enabled: bool,
     pub gateway_url: String,
@@ -36,6 +36,7 @@ pub struct LlmAnalyzerConfig {
     pub max_context_events: usize,
     pub max_failed_interventions: usize,
     pub channel_capacity: usize,
+    pub credential: String,
 }
 
 impl LlmAnalyzerConfig {
@@ -48,6 +49,7 @@ impl LlmAnalyzerConfig {
             max_context_events: config.llm_max_context_events.max(1),
             max_failed_interventions: config.llm_max_failed_interventions.max(1),
             channel_capacity: config.llm_analysis_channel_capacity.max(1),
+            credential: String::new(),
         }
     }
 }
@@ -62,6 +64,7 @@ impl Default for LlmAnalyzerConfig {
             max_context_events: 10,
             max_failed_interventions: 3,
             channel_capacity: 16,
+            credential: "test-platform-credential".to_string(),
         }
     }
 }
@@ -262,6 +265,7 @@ async fn analyze_and_dispatch(
             "{}/internal/llm",
             config.gateway_url.trim_end_matches('/')
         ))
+        .bearer_auth(&config.credential)
         .json(&gateway_request)
         .send()
         .await
@@ -291,12 +295,10 @@ async fn analyze_and_dispatch(
 fn build_gateway_request(config: &LlmAnalyzerConfig, context: &PromptContext) -> GatewayRequest {
     let mut metadata = HashMap::new();
     metadata.insert("request_id".to_string(), uuid::Uuid::new_v4().to_string());
-    metadata.insert("agent_id".to_string(), "0".to_string());
     metadata.insert(
         "agent_name".to_string(),
         "PLATFORM-CONTROLPLANE".to_string(),
     );
-    metadata.insert("agent_role".to_string(), "platform-analyst".to_string());
     metadata.insert("room_id".to_string(), "system".to_string());
     metadata.insert("platform_trigger".to_string(), context.trigger.clone());
     metadata.insert(
@@ -459,6 +461,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct CapturedRequest {
         path: String,
+        authorization: String,
         body: String,
     }
 
@@ -513,9 +516,19 @@ mod tests {
                 .and_then(|line| line.split_whitespace().nth(1))
                 .unwrap_or("/")
                 .to_string();
+            let authorization = header_text
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
+                .map(|(_, value)| value.trim().to_string())
+                .unwrap_or_default();
             let body =
                 String::from_utf8(buf[header_end..header_end + content_length].to_vec()).unwrap();
-            *captured_clone.lock().unwrap() = Some(CapturedRequest { path, body });
+            *captured_clone.lock().unwrap() = Some(CapturedRequest {
+                path,
+                authorization,
+                body,
+            });
 
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
@@ -611,6 +624,7 @@ mod tests {
 
         let captured = captured.lock().unwrap().clone().unwrap();
         assert_eq!(captured.path, "/internal/llm");
+        assert_eq!(captured.authorization, "Bearer test-platform-credential");
         let body: Value = serde_json::from_str(&captured.body).unwrap();
         assert_eq!(body["metadata"]["platform_analysis"], "true");
         assert_eq!(body["metadata"]["platform_trigger"], "manual");

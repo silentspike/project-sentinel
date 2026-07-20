@@ -3,6 +3,7 @@ id = 21
 name = "Fatima Al-Hassan"
 role = "Senior Frontend-Entwicklerin"
 department = "Entwicklung"
+tier = 3
 shift_set = 2
 reports_to = "Martin Stein"
 

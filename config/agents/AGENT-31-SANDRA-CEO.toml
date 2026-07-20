@@ -3,6 +3,7 @@ id = 31
 name = "Sandra Vogel"
 role = "CEO / Geschaeftsfuehrerin"
 department = "Geschaeftsfuehrung"
+tier = 1
 shift_set = 3
 kpis = ["Gewinnmarge > 15%", "Mitarbeiterfluktuation < 10%", "Strategische Partnerschaften > 2/Jahr"]
 reports_to = ""

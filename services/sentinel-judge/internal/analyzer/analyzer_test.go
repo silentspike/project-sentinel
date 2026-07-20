@@ -26,7 +26,7 @@ func TestAnalyzeVoice(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := gateway.NewClient(gateway.ClientConfig{URL: server.URL})
+	client := gateway.NewClient(gateway.ClientConfig{URL: server.URL, Credential: "judge-test-credential"})
 
 	evolPath := filepath.Join(t.TempDir(), "evolution.db")
 	evol, err := persistence.OpenEvolution(evolPath)
@@ -83,7 +83,7 @@ func TestAnalyzeBehavior(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := gateway.NewClient(gateway.ClientConfig{URL: server.URL})
+	client := gateway.NewClient(gateway.ClientConfig{URL: server.URL, Credential: "judge-test-credential"})
 
 	evolPath := filepath.Join(t.TempDir(), "evolution.db")
 	evol, err := persistence.OpenEvolution(evolPath)
@@ -139,7 +139,7 @@ func TestAnalyzeNarrative(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := gateway.NewClient(gateway.ClientConfig{URL: server.URL})
+	client := gateway.NewClient(gateway.ClientConfig{URL: server.URL, Credential: "judge-test-credential"})
 
 	evolPath := filepath.Join(t.TempDir(), "evolution.db")
 	evol, err := persistence.OpenEvolution(evolPath)
@@ -195,7 +195,7 @@ func TestAnalyzeRelationships(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := gateway.NewClient(gateway.ClientConfig{URL: server.URL})
+	client := gateway.NewClient(gateway.ClientConfig{URL: server.URL, Credential: "judge-test-credential"})
 
 	evolPath := filepath.Join(t.TempDir(), "evolution.db")
 	evol, err := persistence.OpenEvolution(evolPath)
@@ -282,7 +282,7 @@ func TestAnalyzeVoiceInvalidJSON(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := gateway.NewClient(gateway.ClientConfig{URL: server.URL})
+	client := gateway.NewClient(gateway.ClientConfig{URL: server.URL, Credential: "judge-test-credential"})
 
 	evolPath := filepath.Join(t.TempDir(), "evolution.db")
 	evol, _ := persistence.OpenEvolution(evolPath)

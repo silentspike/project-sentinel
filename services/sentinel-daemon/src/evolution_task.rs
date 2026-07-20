@@ -45,11 +45,12 @@ pub struct EvolutionResult {
     pub narrative: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EvolutionTaskConfig {
     pub gateway_url: String,
     pub timeout: Duration,
     pub max_concurrent_jobs: usize,
+    pub credential: String,
 }
 
 impl EvolutionTaskConfig {
@@ -59,6 +60,9 @@ impl EvolutionTaskConfig {
                 .unwrap_or_else(|_| "http://localhost:8080".to_string()),
             timeout: DEFAULT_EVOLUTION_TIMEOUT,
             max_concurrent_jobs: DEFAULT_MAX_CONCURRENT_JOBS,
+            // The composition root injects the owner-only credential after
+            // validating its file. This module never performs a weaker read.
+            credential: String::new(),
         }
     }
 }
@@ -108,7 +112,9 @@ pub async fn evolution_background_task(
 
             #[cfg(feature = "llm")]
             let result = match client {
-                Some(client) => run_evolution_job(&client, &config.gateway_url, job).await,
+                Some(client) => {
+                    run_evolution_job(&client, &config.gateway_url, &config.credential, job).await
+                }
                 None => fail_safe_result(job),
             };
 
@@ -133,9 +139,10 @@ pub async fn evolution_background_task(
 async fn run_evolution_job(
     client: &reqwest::Client,
     gateway_url: &str,
+    credential: &str,
     job: EvolutionJob,
 ) -> EvolutionResult {
-    let url = format!("{}/v1/chat/completions", gateway_url.trim_end_matches('/'));
+    let url = format!("{}/internal/llm", gateway_url.trim_end_matches('/'));
     info!(
         agent = %job.agent_name,
         source = job.source.as_str(),
@@ -151,6 +158,7 @@ async fn run_evolution_job(
         llm_evolution_call(
             client,
             &url,
+            credential,
             &job.agent_name,
             voice_style_system_prompt(),
             &voice_user_prompt,
@@ -158,6 +166,7 @@ async fn run_evolution_job(
         llm_evolution_call(
             client,
             &url,
+            credential,
             &job.agent_name,
             behavioral_notes_system_prompt(),
             &behavioral_user_prompt,
@@ -204,9 +213,20 @@ fn fail_safe_result(job: EvolutionJob) -> EvolutionResult {
 }
 
 #[cfg(feature = "llm")]
+fn evolution_request(
+    client: &reqwest::Client,
+    url: &str,
+    credential: &str,
+    body: &serde_json::Value,
+) -> reqwest::RequestBuilder {
+    client.post(url).bearer_auth(credential).json(body)
+}
+
+#[cfg(feature = "llm")]
 async fn llm_evolution_call(
     client: &reqwest::Client,
     url: &str,
+    credential: &str,
     agent_name: &str,
     system_prompt: &str,
     user_prompt: &str,
@@ -218,14 +238,16 @@ async fn llm_evolution_call(
         ],
         "temperature": 0.3,
         "max_tokens": 500,
-        "model": "default",
         "metadata": {
-            "agent_id": agent_name,
+            "subject_agent_name": agent_name,
             "request_type": "evolution_analysis"
         }
     });
 
-    match client.post(url).json(&body).send().await {
+    match evolution_request(client, url, credential, &body)
+        .send()
+        .await
+    {
         Ok(response) => {
             if !response.status().is_success() {
                 warn!(
@@ -424,6 +446,28 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "llm")]
+    #[test]
+    fn evolution_request_uses_internal_path_and_bearer_credential() {
+        let body = serde_json::json!({"messages": []});
+        let request = evolution_request(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:8080/internal/llm",
+            "evolution-test-credential",
+            &body,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(request.url().path(), "/internal/llm");
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .unwrap(),
+            "Bearer evolution-test-credential"
+        );
+    }
+
     #[tokio::test]
     async fn test_evolution_background_task_fail_safe_on_gateway_failure() {
         let (result_tx, result_rx) = mpsc::channel();
@@ -432,6 +476,7 @@ mod tests {
             gateway_url: "http://127.0.0.1:9".to_string(),
             timeout: Duration::from_millis(100),
             max_concurrent_jobs: 1,
+            credential: "test-evolution-credential".to_string(),
         };
 
         tokio::spawn(evolution_background_task(job_rx, result_tx, config));

@@ -7,8 +7,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
+
+	"github.com/silentspike/project-sentinel/cmd/cortex-gateway/internal/modelpolicy"
 )
 
 // maxConfigBodySize limits incoming config update bodies to 1 MB.
@@ -24,13 +27,13 @@ const (
 
 // ConfigSnapshot is a mutex-free copy of Config for serialization and reads.
 type ConfigSnapshot struct {
-	PrimaryProvider         string            `json:"primary_provider"`
-	Temperature             float64           `json:"temperature"`
-	MaxTokens               int               `json:"max_tokens"`
-	RateLimit               float64           `json:"rate_limit_rps"`
-	AgentOverrides          map[string]string `json:"agent_overrides"`
-	AgentRuntimeModelPolicy string            `json:"agent_runtime_model_policy"`
-	LocalLoopEnabled        bool              `json:"local_loop_enabled"`
+	PrimaryProvider         string             `json:"primary_provider"`
+	Temperature             float64            `json:"temperature"`
+	MaxTokens               int                `json:"max_tokens"`
+	RateLimit               float64            `json:"rate_limit_rps"`
+	AgentOverrides          map[string]string  `json:"agent_overrides"`
+	AgentRuntimeModelPolicy modelpolicy.Policy `json:"agent_runtime_model_policy"`
+	LocalLoopEnabled        bool               `json:"local_loop_enabled"`
 
 	// Traffic Control (#288)
 	SynthesisEnabled      bool   `json:"synthesis_enabled"`
@@ -59,7 +62,9 @@ type Config struct {
 	maxTokens               int
 	rateLimit               float64
 	agentOverrides          map[string]string // agent_id -> provider_name
-	agentRuntimeModelPolicy string
+	agentRuntimeModelPolicy modelpolicy.Policy
+	policyValidator         func(modelpolicy.Policy) error
+	providerValidator       func(string) error
 	localLoopEnabled        bool
 
 	// Traffic Control (#288)
@@ -89,7 +94,7 @@ func NewConfig(primaryProvider string) *Config {
 		maxTokens:               4096,
 		rateLimit:               0,
 		agentOverrides:          make(map[string]string),
-		agentRuntimeModelPolicy: "haiku",
+		agentRuntimeModelPolicy: modelpolicy.Legacy(""),
 		localLoopEnabled:        strings.EqualFold(strings.TrimSpace(primaryProvider), "local-loop"),
 
 		synthesisEnabled:      false,
@@ -110,6 +115,22 @@ func NewConfig(primaryProvider string) *Config {
 	}
 }
 
+// SetAgentRuntimePolicyValidator attaches immutable startup-catalog
+// validation before any mutable control update can commit.
+func (c *Config) SetAgentRuntimePolicyValidator(validator func(modelpolicy.Policy) error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.policyValidator = validator
+}
+
+// SetProviderValidator binds primary/per-agent provider changes to the
+// immutable startup catalog.
+func (c *Config) SetProviderValidator(validator func(string) error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.providerValidator = validator
+}
+
 // AgentProvider returns the override provider for a specific agent, if any.
 func (c *Config) AgentProvider(agentID string) (string, bool) {
 	c.mu.RLock()
@@ -119,10 +140,16 @@ func (c *Config) AgentProvider(agentID string) (string, bool) {
 }
 
 // SetAgentProvider sets a provider override for a specific agent.
-func (c *Config) SetAgentProvider(agentID, provider string) {
+func (c *Config) SetAgentProvider(agentID, provider string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.providerValidator != nil {
+		if err := c.providerValidator(provider); err != nil {
+			return err
+		}
+	}
 	c.agentOverrides[agentID] = provider
+	return nil
 }
 
 // ClearAgentProvider removes a provider override for a specific agent.
@@ -147,7 +174,7 @@ func (c *Config) Get() ConfigSnapshot {
 		MaxTokens:               c.maxTokens,
 		RateLimit:               c.rateLimit,
 		AgentOverrides:          overrides,
-		AgentRuntimeModelPolicy: c.agentRuntimeModelPolicy,
+		AgentRuntimeModelPolicy: c.agentRuntimeModelPolicy.Clone(),
 		LocalLoopEnabled:        c.localLoopEnabled,
 
 		SynthesisEnabled:      c.synthesisEnabled,
@@ -215,19 +242,25 @@ var configUpdaters = map[string]configUpdater{
 		if v == "" {
 			return errors.New("primary_provider must not be empty")
 		}
+		if c.providerValidator != nil {
+			if err := c.providerValidator(v); err != nil {
+				return err
+			}
+		}
 		c.primaryProvider = v
 		return nil
 	},
 	"agent_runtime_model_policy": func(c *Config, val interface{}) error {
-		v, ok := val.(string)
-		if !ok {
-			return fmt.Errorf("agent_runtime_model_policy must be a string, got %T", val)
+		policy, err := modelpolicy.ParseValue(val)
+		if err != nil {
+			return fmt.Errorf("agent_runtime_model_policy: %w", err)
 		}
-		v = strings.TrimSpace(v)
-		if v != "" && v != "haiku" {
-			return fmt.Errorf("agent_runtime_model_policy must be empty or %q, got %q", "haiku", v)
+		if c.policyValidator != nil {
+			if err := c.policyValidator(policy); err != nil {
+				return fmt.Errorf("agent_runtime_model_policy: %w", err)
+			}
 		}
-		c.agentRuntimeModelPolicy = v
+		c.agentRuntimeModelPolicy = policy.Clone()
 		return nil
 	},
 	"local_loop_enabled": func(c *Config, val interface{}) error {
@@ -379,16 +412,69 @@ func (c *Config) Update(updates map[string]interface{}) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for key, val := range updates {
+	candidate := c.cloneUnlocked()
+	keys := make([]string, 0, len(updates))
+	for key := range updates {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		val := updates[key]
 		fn, ok := configUpdaters[key]
 		if !ok {
 			return fmt.Errorf("unknown config key: %q", key)
 		}
-		if err := fn(c, val); err != nil {
+		if err := fn(candidate, val); err != nil {
 			return err
 		}
 	}
+	c.commitUnlocked(candidate)
 	return nil
+}
+
+func (c *Config) cloneUnlocked() *Config {
+	overrides := make(map[string]string, len(c.agentOverrides))
+	for key, value := range c.agentOverrides {
+		overrides[key] = value
+	}
+	return &Config{
+		primaryProvider: c.primaryProvider, temperature: c.temperature, maxTokens: c.maxTokens,
+		rateLimit: c.rateLimit, agentOverrides: overrides,
+		agentRuntimeModelPolicy: c.agentRuntimeModelPolicy.Clone(), policyValidator: c.policyValidator,
+		providerValidator: c.providerValidator,
+		localLoopEnabled:  c.localLoopEnabled,
+		synthesisEnabled:  c.synthesisEnabled, sequencingEnabled: c.sequencingEnabled,
+		tickSyncEnabled: c.tickSyncEnabled, apicpEnabled: c.apicpEnabled,
+		tickSyncTimeoutMs: c.tickSyncTimeoutMs, p3TimeoutMs: c.p3TimeoutMs,
+		maxForwardConcurrency: c.maxForwardConcurrency, interceptMode: c.interceptMode,
+		personalityGuardEnabled: c.personalityGuardEnabled, driftThreshold: c.driftThreshold,
+		qualityGateEnabled: c.qualityGateEnabled, qualityThreshold: c.qualityThreshold,
+		qualityMaxRegen: c.qualityMaxRegen, narrativeNudge: c.narrativeNudge,
+	}
+}
+
+func (c *Config) commitUnlocked(candidate *Config) {
+	c.primaryProvider = candidate.primaryProvider
+	c.temperature = candidate.temperature
+	c.maxTokens = candidate.maxTokens
+	c.rateLimit = candidate.rateLimit
+	c.agentOverrides = candidate.agentOverrides
+	c.agentRuntimeModelPolicy = candidate.agentRuntimeModelPolicy.Clone()
+	c.localLoopEnabled = candidate.localLoopEnabled
+	c.synthesisEnabled = candidate.synthesisEnabled
+	c.sequencingEnabled = candidate.sequencingEnabled
+	c.tickSyncEnabled = candidate.tickSyncEnabled
+	c.apicpEnabled = candidate.apicpEnabled
+	c.tickSyncTimeoutMs = candidate.tickSyncTimeoutMs
+	c.p3TimeoutMs = candidate.p3TimeoutMs
+	c.maxForwardConcurrency = candidate.maxForwardConcurrency
+	c.interceptMode = candidate.interceptMode
+	c.personalityGuardEnabled = candidate.personalityGuardEnabled
+	c.driftThreshold = candidate.driftThreshold
+	c.qualityGateEnabled = candidate.qualityGateEnabled
+	c.qualityThreshold = candidate.qualityThreshold
+	c.qualityMaxRegen = candidate.qualityMaxRegen
+	c.narrativeNudge = candidate.narrativeNudge
 }
 
 // toFloat64 converts a JSON number (which json.Unmarshal decodes as float64) to float64.
@@ -579,7 +665,10 @@ func (p *Plane) handleSetAgentProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.config.SetAgentProvider(req.AgentID, req.Provider)
+	if err := p.config.SetAgentProvider(req.AgentID, req.Provider); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	p.logger.Info("agent provider override set", "agent_id", req.AgentID, "provider", req.Provider)
 
 	w.Header().Set("Content-Type", "application/json")

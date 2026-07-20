@@ -3,6 +3,7 @@ id = 25
 name = "Lukas Richter"
 role = "Junior Projektmanager"
 department = "Projektmanagement"
+tier = 3
 shift_set = 2
 reports_to = "Elena Bauer"
 

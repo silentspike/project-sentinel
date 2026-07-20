@@ -81,6 +81,8 @@ export function validateAgentRequired(agent: AgentConfig): string[] {
   if (!agent.identity.name.trim()) errors.push("name must not be empty");
   if (!agent.identity.role.trim()) errors.push("role must not be empty");
   if (!agent.identity.department.trim()) errors.push("department must not be empty");
+  if (agent.identity.tier !== 1 && agent.identity.tier !== 2 && agent.identity.tier !== 3)
+    errors.push("hierarchy tier must be 1, 2, or 3");
   if (!agent.preferences.favorite_room.trim()) errors.push("favorite_room must not be empty");
   if (!agent.background.bio.trim()) errors.push("bio must not be empty");
   if (agent.background.quirks.length === 0) errors.push("at least one quirk required");

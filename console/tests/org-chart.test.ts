@@ -17,12 +17,13 @@ function mkAgent(
   name: string,
   department: string,
   role: string,
+  tier: 1 | 2 | 3 | null,
   nano_runtime: string | null = null,
   reports_to: string | null = null,
   direct_reports: string[] = [],
 ): AgentConfig {
   return {
-    identity: { id, name, role, department, shift_set: 1, kpis: [], reports_to, direct_reports },
+    identity: { id, name, role, department, tier, shift_set: 1, kpis: [], reports_to, direct_reports },
     personality: {
       openness: 0.5,
       conscientiousness: 0.5,
@@ -40,10 +41,10 @@ function mkAgent(
 }
 
 const AGENTS: AgentConfig[] = [
-  mkAgent(1, "Thomas", "Leitung", "CEO", "opus", null, ["2", "3"]),
-  mkAgent(2, "Lisa", "Design", "Designer", "sonnet", "Thomas"),
-  mkAgent(3, "Max", "Design", "Designer", null, "Thomas"), // null tier -> "—"
-  mkAgent(4, "Anna", "Dev", "Backend", "haiku", "Thomas"),
+  mkAgent(1, "Thomas", "Leitung", "CEO", 1, "opus", null, ["2", "3"]),
+  mkAgent(2, "Lisa", "Design", "Designer", 2, "sonnet", "Thomas"),
+  mkAgent(3, "Max", "Design", "Designer", null, null, "Thomas"), // legacy omission -> "—"
+  mkAgent(4, "Anna", "Dev", "Backend", 3, "haiku", "Thomas"),
 ];
 
 function stubFetch(agents: AgentConfig[] = AGENTS) {
@@ -81,7 +82,7 @@ describe("OrgChartView (#424)", () => {
     await waitFor(() => expect(getAllByTestId("org-agent-node").length).toBe(4));
     expect(getAllByTestId("org-dept").length).toBe(3);
     const tiers = getAllByTestId("org-tier").map((e) => e.textContent ?? "");
-    expect(tiers.some((t) => t.includes("opus"))).toBe(true);
+    expect(tiers.some((t) => t.includes("hierarchy tier: 1"))).toBe(true);
     expect(tiers.some((t) => t.includes("—"))).toBe(true); // Max's null tier
   });
 
@@ -93,6 +94,35 @@ describe("OrgChartView (#424)", () => {
     fireEvent.click(getAllByTestId("org-agent-node")[0]); // Lisa, id 2
     expect(selectedAgentId()).toBe(2);
     expect(openPanel).toHaveBeenCalledWith("agent-editor");
+  });
+
+  it("exposes agent nodes as keyboard-focusable buttons", async () => {
+    stubFetch();
+    const { getAllByTestId } = render(OrgChartView);
+    await waitFor(() => expect(getAllByTestId("org-agent-node").length).toBe(4));
+    const lisa = getAllByTestId("org-agent-node")[0] as HTMLButtonElement;
+    expect(lisa.tagName).toBe("BUTTON");
+    expect(lisa.type).toBe("button");
+    expect(lisa.getAttribute("aria-label")).toContain("hierarchy tier 2");
+    lisa.focus();
+    expect(document.activeElement).toBe(lisa);
+  });
+
+  it("distinguishes loading, empty, and server error states", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: false, status: 503, statusText: "Unavailable", json: async () => ({ error: "projection offline" }) })),
+    );
+    const { getByTestId, findByTestId } = render(OrgChartView);
+    expect(getByTestId("org-loading")).toBeTruthy();
+    expect((await findByTestId("org-error")).textContent).toContain("projection offline");
+  });
+
+  it("renders a distinct empty state after a successful empty response", async () => {
+    stubFetch([]);
+    const { findByTestId, queryByTestId } = render(OrgChartView);
+    expect(await findByTestId("org-empty")).toBeTruthy();
+    expect(queryByTestId("org-error")).toBeNull();
   });
 });
 

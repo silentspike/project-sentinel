@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -31,9 +32,39 @@ func (m *mockProvider) Send(_ context.Context, _ *LLMRequest) (*LLMResponse, err
 }
 func (m *mockProvider) HealthCheck(_ context.Context) error { return nil }
 
+type inventoryMockProvider struct {
+	*mockProvider
+	models []string
+}
+
+func (p *inventoryMockProvider) ModelInventory(context.Context) ([]string, error) {
+	return append([]string(nil), p.models...), nil
+}
+
 type timeoutAwareProvider struct {
 	name  string
 	sleep time.Duration
+}
+
+func TestQueuedProviderPreservesOnlySupportedInventoryCapability(t *testing.T) {
+	queue := forwardqueue.NewManager(1)
+	withoutInventory := NewQueuedProvider(&mockProvider{name: "plain"}, queue)
+	if _, ok := withoutInventory.(ModelInventoryProvider); ok {
+		t.Fatal("queued provider invented an unsupported model inventory capability")
+	}
+
+	withInventory := NewQueuedProvider(&inventoryMockProvider{
+		mockProvider: &mockProvider{name: "inventory"},
+		models:       []string{"model-a"},
+	}, queue)
+	inventory, ok := withInventory.(ModelInventoryProvider)
+	if !ok {
+		t.Fatal("queued provider dropped a supported model inventory capability")
+	}
+	models, err := inventory.ModelInventory(context.Background())
+	if err != nil || !reflect.DeepEqual(models, []string{"model-a"}) {
+		t.Fatalf("inventory = %#v, err = %v", models, err)
+	}
 }
 
 func (p *timeoutAwareProvider) Name() string { return p.name }
@@ -1094,6 +1125,40 @@ func TestOllamaProvider_HealthCheck_Unhealthy(t *testing.T) {
 	}
 }
 
+func TestOllamaProvider_ModelInventory(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/tags" {
+			t.Errorf("expected path /api/tags, got %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"models":[{"name":"qwen3:14b","model":"qwen3:14b","digest":"sha256:one"},{"name":"qwen3:8b","model":"qwen3:8b","digest":"sha256:two"},{"name":"qwen3:4b-instruct","model":"qwen3:4b-instruct","digest":"sha256:three"}]}`))
+	}))
+	defer server.Close()
+
+	p := NewOllamaProvider(ProviderConfig{Name: "ollama", BaseURL: server.URL})
+	models, err := p.ModelInventory(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"qwen3:14b", "qwen3:8b", "qwen3:4b-instruct"}
+	if !reflect.DeepEqual(models, want) {
+		t.Fatalf("models = %#v, want %#v", models, want)
+	}
+}
+
+func TestOllamaProvider_ModelInventoryRejectsMissingDigest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"models":[{"name":"qwen3:8b"}]}`))
+	}))
+	defer server.Close()
+
+	p := NewOllamaProvider(ProviderConfig{Name: "ollama", BaseURL: server.URL})
+	if _, err := p.ModelInventory(context.Background()); err == nil || !strings.Contains(err.Error(), "content digest") {
+		t.Fatalf("expected missing digest error, got %v", err)
+	}
+}
+
 // --- Claude Code Provider Tests ---
 
 func TestClaudeCodeProvider_Name(t *testing.T) {
@@ -1317,6 +1382,9 @@ func TestClaudeCodeProvider_ParseOutputStream_Success(t *testing.T) {
 	}
 	if resp.FinishReason != "success" {
 		t.Errorf("expected finish_reason %q, got %q", "success", resp.FinishReason)
+	}
+	if resp.ReportedCostUSD == nil || *resp.ReportedCostUSD != 0.01 {
+		t.Fatalf("reported provider cost = %v, want 0.01", resp.ReportedCostUSD)
 	}
 }
 

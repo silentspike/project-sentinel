@@ -3,6 +3,7 @@ id = 47
 name = "Aylin Demirci"
 role = "Betriebsrat-Mitglied (stellvertretende Vorsitzende) / Personalreferentin"
 department = "Betriebsrat"
+tier = 2
 shift_set = 0
 kpis = ["Onboarding-Zufriedenheit > 90%", "Personalakten aktuell und vollstaendig", "Gleichstellungsmassnahmen dokumentiert"]
 reports_to = "Ralf Steinbach"

@@ -16,10 +16,18 @@ func NewQueuedProvider(wrapped Provider, queue *forwardqueue.Manager) Provider {
 	if wrapped == nil || queue == nil {
 		return wrapped
 	}
-	return &queuedProvider{
+	queued := &queuedProvider{
 		wrapped: wrapped,
 		queue:   queue,
 	}
+	if _, ok := wrapped.(ModelInventoryProvider); ok {
+		return &queuedInventoryProvider{queuedProvider: queued}
+	}
+	return queued
+}
+
+type queuedInventoryProvider struct {
+	*queuedProvider
 }
 
 func (p *queuedProvider) Name() string {
@@ -37,4 +45,9 @@ func (p *queuedProvider) Send(ctx context.Context, req *LLMRequest) (*LLMRespons
 
 func (p *queuedProvider) HealthCheck(ctx context.Context) error {
 	return p.wrapped.HealthCheck(ctx)
+}
+
+func (p *queuedInventoryProvider) ModelInventory(ctx context.Context) ([]string, error) {
+	inventory := p.wrapped.(ModelInventoryProvider) // constructor preserves this invariant
+	return inventory.ModelInventory(ctx)
 }
