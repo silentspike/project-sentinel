@@ -78,6 +78,21 @@ const CREATE_IDX_OUTBOX_PENDING: &str =
 const CREATE_IDX_OUTBOX_EVENT_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_outbox_event_id ON outbox(event_id)";
 
+const CREATE_LLM_COMPLETION_OUTBOX: &str = "
+CREATE TABLE IF NOT EXISTS llm_completion_outbox (
+    request_id TEXT PRIMARY KEY,
+    request_digest TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('provider_in_flight', 'pending_usage', 'ready_for_action', 'action_claimed', 'failed')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+)";
+
+const CREATE_IDX_LLM_COMPLETION_RECOVERABLE: &str =
+    "CREATE INDEX IF NOT EXISTS idx_llm_completion_recoverable ON llm_completion_outbox(status, created_at) WHERE status IN ('pending_usage', 'ready_for_action')";
+
 const CREATE_SNAPSHOTS: &str = "
 CREATE TABLE IF NOT EXISTS snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -265,6 +280,32 @@ pub struct OutboxEntry {
     pub created_at: u64,
 }
 
+/// Durable provider result awaiting local usage persistence and action delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmCompletionEntry {
+    pub request_id: String,
+    pub request_digest: String,
+    pub payload: String,
+    pub status: String,
+    pub attempt_count: u32,
+    pub last_error: Option<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+fn llm_completion_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmCompletionEntry> {
+    Ok(LlmCompletionEntry {
+        request_id: row.get(0)?,
+        request_digest: row.get(1)?,
+        payload: row.get(2)?,
+        status: row.get(3)?,
+        attempt_count: row.get::<_, i64>(4)? as u32,
+        last_error: row.get(5)?,
+        created_at: row.get::<_, i64>(6)? as u64,
+        updated_at: row.get::<_, i64>(7)? as u64,
+    })
+}
+
 /// Zeile aus der Snapshots-Tabelle.
 #[derive(Debug, Clone)]
 pub struct SnapshotRow {
@@ -318,6 +359,8 @@ impl EventStore {
         Self::ensure_outbox_migrations(&conn)?;
         conn.execute(CREATE_IDX_OUTBOX_PENDING, [])?;
         conn.execute(CREATE_IDX_OUTBOX_EVENT_ID, [])?;
+        conn.execute_batch(CREATE_LLM_COMPLETION_OUTBOX)?;
+        conn.execute(CREATE_IDX_LLM_COMPLETION_RECOVERABLE, [])?;
         conn.execute_batch(CREATE_SNAPSHOTS)?;
         conn.execute(CREATE_IDX_SNAPSHOTS_AGGREGATE, [])?;
         conn.execute_batch(CREATE_WORLD_SNAPSHOTS)?;
@@ -428,6 +471,302 @@ impl EventStore {
                 .observe(_telemetry_start.elapsed().as_micros() as f64);
         }
         Ok(row_id)
+    }
+
+    /// Store a completed provider response before attempting the local usage append.
+    /// Reusing a request ID with different request bytes or response bytes fails closed.
+    pub fn enqueue_llm_completion(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        payload: &str,
+    ) -> anyhow::Result<()> {
+        let conn =
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let existing = conn
+            .query_row(
+                "SELECT request_digest, payload, status FROM llm_completion_outbox WHERE request_id = ?1",
+                params![request_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match existing {
+            None => {
+                conn.execute(
+                    "INSERT INTO llm_completion_outbox
+                     (request_id, request_digest, payload, status, attempt_count, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'pending_usage', 0, ?4, ?4)",
+                    params![request_id, request_digest, payload, now_ms],
+                )?;
+            }
+            Some((existing_digest, _, status))
+                if existing_digest == request_digest && status == "provider_in_flight" =>
+            {
+                conn.execute(
+                    "UPDATE llm_completion_outbox
+                     SET payload = ?3, status = 'pending_usage', updated_at = ?4
+                     WHERE request_id = ?1 AND request_digest = ?2 AND status = 'provider_in_flight'",
+                    params![request_id, request_digest, payload, now_ms],
+                )?;
+            }
+            Some((existing_digest, existing_payload, _)) => anyhow::ensure!(
+                existing_digest == request_digest && existing_payload == payload,
+                "LLM completion request_id conflict for {request_id}"
+            ),
+        }
+        conn.commit()?;
+        Ok(())
+    }
+
+    /// Reserve the stable request ID immediately before network execution. If the
+    /// process dies after the provider may have run but before its response is
+    /// durable, the reservation remains fail-closed and prevents a paid replay.
+    pub fn reserve_llm_request(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+    ) -> anyhow::Result<bool> {
+        let conn =
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO llm_completion_outbox
+             (request_id, request_digest, payload, status, attempt_count, created_at, updated_at)
+             VALUES (?1, ?2, '', 'provider_in_flight', 0, ?3, ?3)",
+            params![request_id, request_digest, now_ms],
+        )?;
+        if inserted == 0 {
+            let existing_digest: String = conn.query_row(
+                "SELECT request_digest FROM llm_completion_outbox WHERE request_id = ?1",
+                params![request_id],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                existing_digest == request_digest,
+                "LLM request reservation digest conflict for {request_id}"
+            );
+        }
+        conn.commit()?;
+        Ok(inserted == 1)
+    }
+
+    /// Return one durable completion by its stable request ID.
+    pub fn get_llm_completion(
+        &self,
+        request_id: &str,
+    ) -> anyhow::Result<Option<LlmCompletionEntry>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        conn.query_row(
+            "SELECT request_id, request_digest, payload, status, attempt_count, last_error,
+                    created_at, updated_at
+             FROM llm_completion_outbox WHERE request_id = ?1",
+            params![request_id],
+            llm_completion_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Poll only records that can make automatic progress. Claimed and terminal
+    /// records are deliberately excluded to prevent ambiguous action redelivery.
+    pub fn poll_llm_completions(&self, limit: usize) -> anyhow::Result<Vec<LlmCompletionEntry>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT request_id, request_digest, payload, status, attempt_count, last_error,
+                    created_at, updated_at
+             FROM llm_completion_outbox
+             WHERE status IN ('pending_usage', 'ready_for_action')
+             ORDER BY created_at ASC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], llm_completion_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Atomically append the usage event and advance the durable response to the
+    /// action-ready state. Retrying this operation is idempotent by operation_id.
+    pub fn persist_llm_completion_usage(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        event: &DomainEvent,
+    ) -> anyhow::Result<()> {
+        let conn = self.begin_fenced_write(
+            &OwnerRegistry::global()
+                .issue(StateTransferScope::for_aggregate(&event.aggregate_id))?,
+        )?;
+        let state = conn
+            .query_row(
+                "SELECT request_digest, status FROM llm_completion_outbox WHERE request_id = ?1",
+                params![request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("missing LLM completion {request_id}"))?;
+        anyhow::ensure!(
+            state.0 == request_digest,
+            "LLM completion digest conflict for {request_id}"
+        );
+        if state.1 == "ready_for_action" || state.1 == "action_claimed" {
+            conn.commit()?;
+            return Ok(());
+        }
+        anyhow::ensure!(
+            state.1 == "pending_usage",
+            "LLM completion {request_id} is not recoverable from status {}",
+            state.1
+        );
+        conn.execute(
+            "INSERT OR IGNORE INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                event.event_id,
+                event.event_type,
+                event.aggregate_id,
+                event.payload,
+                event.correlation_id,
+                event.causation_id,
+                event.operation_id,
+                event.tick as i64,
+                event.timestamp_ms as i64,
+                event.schema_version,
+                event.compensation_type,
+            ],
+        )?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        conn.execute(
+            "UPDATE llm_completion_outbox
+             SET status = 'ready_for_action', last_error = NULL, updated_at = ?3
+             WHERE request_id = ?1 AND request_digest = ?2 AND status = 'pending_usage'",
+            params![request_id, request_digest, now_ms],
+        )?;
+        conn.commit()?;
+        Ok(())
+    }
+
+    /// Count one failed recovery attempt and stop automatic recovery at the
+    /// supplied finite limit. Both pre-usage and pre-action failures use the same
+    /// durable budget so no corrupt or unavailable record spins forever.
+    pub fn record_llm_completion_failure(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+        error: &str,
+        max_attempts: u32,
+    ) -> anyhow::Result<(u32, bool)> {
+        anyhow::ensure!(max_attempts > 0, "max_attempts must be positive");
+        let conn =
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let (attempts, current_status): (i64, String) = conn
+            .query_row(
+                "SELECT attempt_count, status FROM llm_completion_outbox
+                 WHERE request_id = ?1 AND request_digest = ?2
+                   AND status IN ('pending_usage', 'ready_for_action')",
+                params![request_id, request_digest],
+                |row| Ok((row.get::<_, i64>(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("LLM completion {request_id} is not pending"))?;
+        let attempts: u32 = attempts.try_into().unwrap_or(u32::MAX);
+        let attempts = attempts.saturating_add(1);
+        let terminal = attempts >= max_attempts;
+        let status = if terminal {
+            "failed"
+        } else {
+            current_status.as_str()
+        };
+        conn.execute(
+            "UPDATE llm_completion_outbox
+             SET attempt_count = ?3, last_error = ?4, status = ?5, updated_at = ?6
+             WHERE request_id = ?1 AND request_digest = ?2
+               AND status IN ('pending_usage', 'ready_for_action')",
+            params![request_id, request_digest, attempts, error, status, now_ms],
+        )?;
+        conn.commit()?;
+        Ok((attempts, terminal))
+    }
+
+    /// Claim actions before sending them. A crash after this transition is
+    /// intentionally at-most-once/fail-closed: claimed actions are never replayed.
+    pub fn claim_llm_completion_actions(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+    ) -> anyhow::Result<bool> {
+        let conn =
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let changed = conn.execute(
+            "UPDATE llm_completion_outbox
+             SET status = 'action_claimed', updated_at = ?3
+             WHERE request_id = ?1 AND request_digest = ?2 AND status = 'ready_for_action'",
+            params![request_id, request_digest, now_ms],
+        )?;
+        conn.commit()?;
+        Ok(changed == 1)
+    }
+
+    /// Remove a claimed completion after all actions were accepted by the local
+    /// channel. The durable usage event remains the long-term idempotency marker.
+    pub fn complete_llm_completion_actions(
+        &self,
+        request_id: &str,
+        request_digest: &str,
+    ) -> anyhow::Result<bool> {
+        let conn =
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
+        let changed = conn.execute(
+            "DELETE FROM llm_completion_outbox
+             WHERE request_id = ?1 AND request_digest = ?2 AND status = 'action_claimed'",
+            params![request_id, request_digest],
+        )?;
+        conn.commit()?;
+        Ok(changed == 1)
+    }
+
+    /// Check the durable operation id before issuing a provider call for a
+    /// perception that has already completed in an earlier process.
+    pub fn has_event_operation_id(&self, operation_id: &str) -> anyhow::Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM events WHERE operation_id = ?1 LIMIT 1",
+                params![operation_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(exists)
     }
 
     /// Atomar: Event + Outbox-Eintrag in einer Transaktion (AC1, AC3).
@@ -1658,6 +1997,110 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn llm_completion_outbox_is_durable_bounded_and_action_claimed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("llm-completion.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        let request_id = "agent-runtime-07-55";
+        let digest = "request-digest";
+        let payload = r#"{"completed":true}"#;
+        assert!(store.reserve_llm_request(request_id, digest).unwrap());
+        assert!(!store.reserve_llm_request(request_id, digest).unwrap());
+        assert!(store.reserve_llm_request(request_id, "different").is_err());
+        assert_eq!(
+            store
+                .get_llm_completion(request_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "provider_in_flight"
+        );
+        assert!(store.poll_llm_completions(10).unwrap().is_empty());
+        drop(store);
+
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        assert!(!store.reserve_llm_request(request_id, digest).unwrap());
+        assert_eq!(
+            store
+                .get_llm_completion(request_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "provider_in_flight"
+        );
+        store
+            .enqueue_llm_completion(request_id, digest, payload)
+            .unwrap();
+        store
+            .enqueue_llm_completion(request_id, digest, payload)
+            .unwrap();
+        assert!(store
+            .enqueue_llm_completion(request_id, "different", payload)
+            .is_err());
+
+        let pending = store.get_llm_completion(request_id).unwrap().unwrap();
+        assert_eq!(pending.status, "pending_usage");
+        assert_eq!(store.poll_llm_completions(10).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .record_llm_completion_failure(request_id, digest, "injected", 3)
+                .unwrap(),
+            (1, false)
+        );
+
+        let mut usage = test_event("agent_llm_usage", "AGENT-07");
+        usage.operation_id = format!("llm_usage_{request_id}");
+        store
+            .persist_llm_completion_usage(request_id, digest, &usage)
+            .unwrap();
+        assert!(store.has_event_operation_id(&usage.operation_id).unwrap());
+        assert_eq!(
+            store
+                .get_llm_completion(request_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "ready_for_action"
+        );
+        assert!(store
+            .claim_llm_completion_actions(request_id, digest)
+            .unwrap());
+        assert!(!store
+            .claim_llm_completion_actions(request_id, digest)
+            .unwrap());
+        assert!(store
+            .complete_llm_completion_actions(request_id, digest)
+            .unwrap());
+        assert!(store.get_llm_completion(request_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn llm_completion_failure_limit_is_terminal_and_not_polled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("llm-completion-terminal.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+        store
+            .enqueue_llm_completion("request-1", "digest-1", "{}")
+            .unwrap();
+        assert_eq!(
+            store
+                .record_llm_completion_failure("request-1", "digest-1", "first", 2)
+                .unwrap(),
+            (1, false)
+        );
+        assert_eq!(
+            store
+                .record_llm_completion_failure("request-1", "digest-1", "second", 2)
+                .unwrap(),
+            (2, true)
+        );
+        let terminal = store.get_llm_completion("request-1").unwrap().unwrap();
+        assert_eq!(terminal.status, "failed");
+        assert_eq!(terminal.attempt_count, 2);
+        assert!(store.poll_llm_completions(10).unwrap().is_empty());
     }
 
     /// #496: the fenced write entry is the single choke point every SQLite writer

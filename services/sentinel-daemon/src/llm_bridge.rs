@@ -12,13 +12,14 @@
 
 #[cfg(feature = "llm")]
 pub mod bridge {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex, OnceLock, RwLock};
     use std::time::{Duration, Instant};
 
     use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
     use tokio::sync::{Mutex as AsyncMutex, Semaphore};
     use tracing::{debug, error, info, instrument, warn};
 
@@ -26,7 +27,7 @@ pub mod bridge {
         ActionType, AgentAction, AgentId, CostSource, DomainEvent, DomainEventPayload,
         HierarchyTier, Perception, Tick, Timestamp,
     };
-    use sentinel_limbo::EventStore;
+    use sentinel_limbo::{EventStore, LlmCompletionEntry};
     use sentinel_redb::StateStore;
 
     pub type SharedLlmActivityTicks = Arc<Mutex<HashMap<AgentId, u64>>>;
@@ -50,6 +51,10 @@ pub mod bridge {
         pub credential: String,
         /// Producer cutover flag. Disabled until the hierarchy projection has backfilled.
         pub usage_v2_enabled: bool,
+        /// Delay between durable completed-response recovery passes.
+        pub completion_retry_interval: Duration,
+        /// Finite local usage-persistence attempts before fail-closed quarantine.
+        pub completion_max_attempts: u32,
     }
 
     impl Default for LlmBridgeConfig {
@@ -63,6 +68,8 @@ pub mod bridge {
                 circuit_breaker_reset: Duration::from_secs(30),
                 credential: String::new(),
                 usage_v2_enabled: false,
+                completion_retry_interval: Duration::from_secs(1),
+                completion_max_attempts: 5,
             }
         }
     }
@@ -123,7 +130,7 @@ pub mod bridge {
         temperature: f64,
         max_tokens: i32,
         model: String,
-        metadata: HashMap<String, String>,
+        metadata: BTreeMap<String, String>,
     }
 
     #[derive(Debug, Serialize)]
@@ -164,17 +171,111 @@ pub mod bridge {
         effective_model: String,
     }
 
+    #[derive(Debug, Serialize, Deserialize)]
+    struct CompletedLlmResponse {
+        version: u32,
+        request_id: String,
+        request_digest: String,
+        usage_event: DomainEvent,
+        actions: Vec<AgentAction>,
+        tokens_used: u64,
+    }
+
+    trait CompletionStore: Send + Sync {
+        fn reserve_request(&self, request_id: &str, request_digest: &str) -> anyhow::Result<bool>;
+        fn enqueue_completion(
+            &self,
+            request_id: &str,
+            request_digest: &str,
+            payload: &str,
+        ) -> anyhow::Result<()>;
+        fn get_completion(&self, request_id: &str) -> anyhow::Result<Option<LlmCompletionEntry>>;
+        fn poll_completions(&self, limit: usize) -> anyhow::Result<Vec<LlmCompletionEntry>>;
+        fn persist_usage(
+            &self,
+            request_id: &str,
+            request_digest: &str,
+            event: &DomainEvent,
+        ) -> anyhow::Result<()>;
+        fn record_failure(
+            &self,
+            request_id: &str,
+            request_digest: &str,
+            error: &str,
+            max_attempts: u32,
+        ) -> anyhow::Result<(u32, bool)>;
+        fn claim_actions(&self, request_id: &str, request_digest: &str) -> anyhow::Result<bool>;
+        fn complete_actions(&self, request_id: &str, request_digest: &str) -> anyhow::Result<bool>;
+        fn has_operation(&self, operation_id: &str) -> anyhow::Result<bool>;
+    }
+
+    impl CompletionStore for EventStore {
+        fn reserve_request(&self, request_id: &str, request_digest: &str) -> anyhow::Result<bool> {
+            self.reserve_llm_request(request_id, request_digest)
+        }
+
+        fn enqueue_completion(
+            &self,
+            request_id: &str,
+            request_digest: &str,
+            payload: &str,
+        ) -> anyhow::Result<()> {
+            self.enqueue_llm_completion(request_id, request_digest, payload)
+        }
+
+        fn get_completion(&self, request_id: &str) -> anyhow::Result<Option<LlmCompletionEntry>> {
+            self.get_llm_completion(request_id)
+        }
+
+        fn poll_completions(&self, limit: usize) -> anyhow::Result<Vec<LlmCompletionEntry>> {
+            self.poll_llm_completions(limit)
+        }
+
+        fn persist_usage(
+            &self,
+            request_id: &str,
+            request_digest: &str,
+            event: &DomainEvent,
+        ) -> anyhow::Result<()> {
+            self.persist_llm_completion_usage(request_id, request_digest, event)
+        }
+
+        fn record_failure(
+            &self,
+            request_id: &str,
+            request_digest: &str,
+            error: &str,
+            max_attempts: u32,
+        ) -> anyhow::Result<(u32, bool)> {
+            self.record_llm_completion_failure(request_id, request_digest, error, max_attempts)
+        }
+
+        fn claim_actions(&self, request_id: &str, request_digest: &str) -> anyhow::Result<bool> {
+            self.claim_llm_completion_actions(request_id, request_digest)
+        }
+
+        fn complete_actions(&self, request_id: &str, request_digest: &str) -> anyhow::Result<bool> {
+            self.complete_llm_completion_actions(request_id, request_digest)
+        }
+
+        fn has_operation(&self, operation_id: &str) -> anyhow::Result<bool> {
+            self.has_event_operation_id(operation_id)
+        }
+    }
+
     fn agent_runtime_request(
         client: &reqwest::Client,
         url: &str,
         credential: &str,
         request_id: &str,
+        request_digest: &str,
         request: &GatewayRequest,
     ) -> reqwest::RequestBuilder {
         client
             .post(url)
             .bearer_auth(credential)
             .header("X-Request-ID", request_id)
+            .header("X-Request-Digest", request_digest)
             .json(request)
     }
 
@@ -183,6 +284,11 @@ pub mod bridge {
             "agent-runtime-{:02}-{}",
             perception.agent_id.0, perception.tick.0
         )
+    }
+
+    fn gateway_request_digest(request: &GatewayRequest) -> Result<String, serde_json::Error> {
+        let bytes = serde_json::to_vec(request)?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
     }
 
     /// #427: baut das `AgentLlmUsage`-Event aus einer Gateway-Response. Die frischen
@@ -250,36 +356,162 @@ pub mod bridge {
         Ok(event)
     }
 
-    /// Retry only the local append after a successful gateway response. The
-    /// completed provider result remains owned by the task, so storage recovery
-    /// can never trigger another paid provider call or duplicate an action.
-    async fn append_usage_event_until_durable<F, E>(
-        event: &DomainEvent,
-        agent_id: AgentId,
-        mut append: F,
-    ) -> usize
-    where
-        F: FnMut(&DomainEvent) -> Result<i64, E>,
-        E: std::fmt::Display,
-    {
-        let mut attempt = 0usize;
-        loop {
-            attempt += 1;
-            match append(event) {
-                Ok(_) => return attempt,
-                Err(error) => {
-                    let delay_ms = (100u64.saturating_mul(1u64 << attempt.min(5))).min(5_000);
-                    warn!(
-                        agent = %agent_id,
+    fn recover_completion<S: CompletionStore>(
+        store: &S,
+        entry: LlmCompletionEntry,
+        action_tx: &mpsc::Sender<AgentAction>,
+        max_attempts: u32,
+    ) {
+        let completed: CompletedLlmResponse = match serde_json::from_str(&entry.payload) {
+            Ok(completed) => completed,
+            Err(error) => {
+                error!(request_id = %entry.request_id, error = %error, "Durable LLM completion payload is invalid");
+                let _ = store.record_failure(
+                    &entry.request_id,
+                    &entry.request_digest,
+                    &format!("invalid completion payload: {error}"),
+                    max_attempts,
+                );
+                return;
+            }
+        };
+        if completed.version != 1
+            || completed.request_id != entry.request_id
+            || completed.request_digest != entry.request_digest
+        {
+            error!(request_id = %entry.request_id, "Durable LLM completion identity mismatch");
+            let _ = store.record_failure(
+                &entry.request_id,
+                &entry.request_digest,
+                "completion identity mismatch",
+                max_attempts,
+            );
+            return;
+        }
+
+        if entry.status == "pending_usage" {
+            if let Err(error) = store.persist_usage(
+                &entry.request_id,
+                &entry.request_digest,
+                &completed.usage_event,
+            ) {
+                match store.record_failure(
+                    &entry.request_id,
+                    &entry.request_digest,
+                    &error.to_string(),
+                    max_attempts,
+                ) {
+                    Ok((attempt, terminal)) => warn!(
+                        request_id = %entry.request_id,
                         attempt,
-                        retry_delay_ms = delay_ms,
+                        max_attempts,
+                        terminal,
                         error = %error,
-                        "AgentLlmUsage local append failed; retaining provider result"
-                    );
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        "AgentLlmUsage local append failed"
+                    ),
+                    Err(record_error) => error!(
+                        request_id = %entry.request_id,
+                        error = %record_error,
+                        "Failed to record LLM completion append failure"
+                    ),
                 }
+                return;
             }
         }
+
+        let claimed = match store.claim_actions(&entry.request_id, &entry.request_digest) {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                error!(request_id = %entry.request_id, error = %error, "Failed to claim completed LLM actions");
+                let _ = store.record_failure(
+                    &entry.request_id,
+                    &entry.request_digest,
+                    &format!("action claim failed: {error}"),
+                    max_attempts,
+                );
+                return;
+            }
+        };
+        if !claimed {
+            return;
+        }
+
+        for action in completed.actions {
+            if let Err(error) = action_tx.send(action) {
+                error!(
+                    request_id = %entry.request_id,
+                    error = %error,
+                    "Claimed LLM action could not be delivered; left fail-closed"
+                );
+                return;
+            }
+        }
+        if let Err(error) = store.complete_actions(&entry.request_id, &entry.request_digest) {
+            error!(
+                request_id = %entry.request_id,
+                error = %error,
+                "Completed LLM action cleanup failed; claim remains non-replayable"
+            );
+        }
+    }
+
+    fn recover_completion_batch<S: CompletionStore>(
+        store: &S,
+        action_tx: &mpsc::Sender<AgentAction>,
+        max_attempts: u32,
+    ) {
+        match store.poll_completions(64) {
+            Ok(entries) => {
+                for entry in entries {
+                    recover_completion(store, entry, action_tx, max_attempts);
+                }
+            }
+            Err(error) => error!(error = %error, "Failed to poll durable LLM completions"),
+        }
+    }
+
+    fn store_gateway_completion<S: CompletionStore>(
+        store: &S,
+        action_tx: &mpsc::Sender<AgentAction>,
+        request_id: &str,
+        request_digest: &str,
+        agent_id: AgentId,
+        tick: u64,
+        gateway_resp: &GatewayResponse,
+        usage_v2_enabled: bool,
+        max_attempts: u32,
+    ) -> Result<(), String> {
+        if gateway_resp.request_id != request_id {
+            return Err(format!(
+                "gateway request_id mismatch: sent {request_id}, received {}",
+                gateway_resp.request_id
+            ));
+        }
+        let usage_event = build_usage_event(agent_id, tick, gateway_resp, usage_v2_enabled)?;
+        let is_synthesis = gateway_resp.tokens_used == 0;
+        let actions = gateway_resp
+            .actions
+            .iter()
+            .filter_map(|action| map_extracted_to_action(agent_id, action, tick, is_synthesis))
+            .collect();
+        let completed = CompletedLlmResponse {
+            version: 1,
+            request_id: request_id.to_string(),
+            request_digest: request_digest.to_string(),
+            usage_event,
+            actions,
+            tokens_used: gateway_resp.tokens_used.max(0) as u64,
+        };
+        let payload = serde_json::to_string(&completed).map_err(|error| error.to_string())?;
+        store
+            .enqueue_completion(request_id, request_digest, &payload)
+            .map_err(|error| error.to_string())?;
+        let entry = store
+            .get_completion(request_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("durable LLM completion {request_id} disappeared"))?;
+        recover_completion(store, entry, action_tx, max_attempts);
+        Ok(())
     }
 
     #[derive(Clone)]
@@ -363,6 +595,29 @@ pub mod bridge {
         llm_unavailable: Arc<AtomicBool>,
         llm_activity_ticks: SharedLlmActivityTicks,
     ) {
+        run_llm_bridge_with_store(
+            config,
+            perception_rx,
+            action_tx,
+            telemetry,
+            state_store,
+            event_store,
+            llm_unavailable,
+            llm_activity_ticks,
+        )
+        .await;
+    }
+
+    async fn run_llm_bridge_with_store<S: CompletionStore + 'static>(
+        config: LlmBridgeConfig,
+        perception_rx: mpsc::Receiver<Perception>,
+        action_tx: mpsc::Sender<AgentAction>,
+        telemetry: Arc<BridgeTelemetry>,
+        state_store: Arc<StateStore>,
+        event_store: Arc<S>,
+        llm_unavailable: Arc<AtomicBool>,
+        llm_activity_ticks: SharedLlmActivityTicks,
+    ) {
         info!(
             max_concurrent = config.max_concurrent,
             min_ticks = config.min_ticks_between_calls,
@@ -397,6 +652,42 @@ pub mod bridge {
         // Debounce: Operator-Impulse (Gaia/Broadcast) nur beim ERSTEN Tick urgent,
         // danach 60 Ticks Cooldown. Verhindert Semaphore-Starvation bei 300-Tick TTL.
         let mut impulse_acked: HashMap<AgentId, u64> = HashMap::new();
+
+        // Recover provider results committed by an earlier process before accepting
+        // new perceptions. The periodic worker has a bounded per-record attempt budget
+        // and is explicitly cancelled when the bridge receiver closes.
+        let completion_max_attempts = config.completion_max_attempts.max(1);
+        let completion_retry_interval = if config.completion_retry_interval.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            config.completion_retry_interval
+        };
+        recover_completion_batch(event_store.as_ref(), &action_tx, completion_max_attempts);
+        let (recovery_shutdown_tx, mut recovery_shutdown_rx) = tokio::sync::watch::channel(false);
+        let recovery_store = Arc::clone(&event_store);
+        let recovery_action_tx = action_tx.clone();
+        let recovery_interval = completion_retry_interval;
+        let recovery_max_attempts = completion_max_attempts;
+        let recovery_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(recovery_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Startup recovery was performed synchronously above.
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => recover_completion_batch(
+                        recovery_store.as_ref(),
+                        &recovery_action_tx,
+                        recovery_max_attempts,
+                    ),
+                    changed = recovery_shutdown_rx.changed() => {
+                        if changed.is_err() || *recovery_shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
 
         // Blocking receive in eigenem Thread, forward an async channel
         let (async_tx, mut async_rx) = tokio::sync::mpsc::channel::<Perception>(256);
@@ -496,6 +787,52 @@ pub mod bridge {
                     });
                 }
 
+                let request = build_gateway_request(&perception, &state_store);
+                let request_id = agent_runtime_request_id(&perception);
+                let request_digest = match gateway_request_digest(&request) {
+                    Ok(digest) => digest,
+                    Err(error) => {
+                        error!(agent = %agent_id, error = %error, "Gateway request digest failed");
+                        continue;
+                    }
+                };
+                match event_store.get_completion(&request_id) {
+                    Ok(Some(entry))
+                        if entry.request_digest == request_digest
+                            && entry.status == "provider_in_flight" =>
+                    {
+                        warn!(request_id = %request_id, "Ambiguous prior provider execution remains fail-closed");
+                        continue;
+                    }
+                    Ok(Some(entry)) if entry.request_digest == request_digest => {
+                        recover_completion(
+                            event_store.as_ref(),
+                            entry,
+                            &action_tx,
+                            completion_max_attempts,
+                        );
+                        continue;
+                    }
+                    Ok(Some(_)) => {
+                        error!(request_id = %request_id, "Stable LLM request ID reused with different request digest");
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        error!(request_id = %request_id, error = %error, "LLM completion lookup failed closed");
+                        continue;
+                    }
+                }
+                let operation_id = format!("llm_usage_{request_id}");
+                match event_store.has_operation(&operation_id) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        error!(request_id = %request_id, error = %error, "LLM usage lookup failed closed");
+                        continue;
+                    }
+                }
+
                 info!(agent = %agent_id,
                     priority = if perception.is_directly_addressed { "P1" } else { "normal" },
                     has_heard = !perception.heard_text.is_empty(),
@@ -508,11 +845,10 @@ pub mod bridge {
                 let cb = Arc::clone(&circuit_breaker);
                 let retry_queue = Arc::clone(&pending_retries);
                 let retry_perception = perception.clone();
-                let request = build_gateway_request(&perception, &state_store);
-                let request_id = agent_runtime_request_id(&perception);
                 let bridge_event_store = Arc::clone(&event_store);
                 let credential = config.credential.clone();
                 let usage_v2_enabled = config.usage_v2_enabled;
+                let request_completion_max_attempts = completion_max_attempts;
 
                 telemetry.calls_total.fetch_add(1, Ordering::Relaxed);
 
@@ -547,11 +883,23 @@ pub mod bridge {
                             }
                         };
                         let call_start = Instant::now();
+                        match bridge_event_store.reserve_request(&request_id, &request_digest) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(request_id = %request_id, "LLM provider request already reserved");
+                                return;
+                            }
+                            Err(error) => {
+                                error!(request_id = %request_id, error = %error, "LLM provider reservation failed closed");
+                                return;
+                            }
+                        }
                         match agent_runtime_request(
                             &client,
                             &url,
                             &credential,
                             &request_id,
+                            &request_digest,
                             &request,
                         )
                         .send()
@@ -562,40 +910,31 @@ pub mod bridge {
                                 if status.is_success() {
                                     match response.json::<GatewayResponse>().await {
                                         Ok(gateway_resp) => {
-                                            let usage_event = match build_usage_event(
+                                            // Provider execution is complete. Release scarce
+                                            // capacity before local durable recovery.
+                                            drop(permit);
+                                            if let Err(e) = store_gateway_completion(
+                                                bridge_event_store.as_ref(),
+                                                &action_tx,
+                                                &request_id,
+                                                &request_digest,
                                                 agent_id,
                                                 current_tick,
                                                 &gateway_resp,
                                                 usage_v2_enabled,
+                                                request_completion_max_attempts,
                                             ) {
-                                                Ok(event) => event,
-                                                Err(e) => {
-                                                    warn!(agent = %agent_id, error = %e, "AgentLlmUsage v2 response abgelehnt");
-                                                    telemetry
-                                                        .calls_failed
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                    cb.lock().unwrap().record_failure();
-                                                    queue_retry(
-                                                        &retry_queue,
-                                                        retry_perception.clone(),
-                                                    )
-                                                    .await;
-                                                    return;
-                                                }
-                                            };
-                                            // Provider execution is complete. Release scarce
-                                            // capacity before waiting for local storage recovery.
-                                            drop(permit);
-                                            append_usage_event_until_durable(
-                                                &usage_event,
-                                                agent_id,
-                                                |event| bridge_event_store.append_event(event),
-                                            )
-                                            .await;
+                                                warn!(agent = %agent_id, error = %e, "Completed gateway response rejected fail-closed");
+                                                telemetry
+                                                    .calls_failed
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                cb.lock().unwrap().record_failure();
+                                                return;
+                                            }
                                             let latency_ms = call_start.elapsed().as_millis();
                                             telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
                                             telemetry.tokens_total.fetch_add(
-                                                gateway_resp.tokens_used as u64,
+                                                gateway_resp.tokens_used.max(0) as u64,
                                                 Ordering::Relaxed,
                                             );
                                             cb.lock().unwrap().record_success();
@@ -608,32 +947,17 @@ pub mod bridge {
                                                 latency_ms = latency_ms,
                                                 "URGENT LLM Response erhalten"
                                             );
-
-                                            let is_synthesis = gateway_resp.tokens_used == 0;
-                                            for extracted in &gateway_resp.actions {
-                                                if let Some(agent_action) = map_extracted_to_action(
-                                                    agent_id,
-                                                    extracted,
-                                                    current_tick,
-                                                    is_synthesis,
-                                                ) {
-                                                    let _ = action_tx.send(agent_action);
-                                                }
-                                            }
                                         }
                                         Err(e) => {
                                             warn!(agent = %agent_id, error = %e, "Gateway Response Parse-Fehler");
                                             telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                             cb.lock().unwrap().record_failure();
-                                            queue_retry(&retry_queue, retry_perception.clone())
-                                                .await;
                                         }
                                     }
                                 } else {
                                     warn!(agent = %agent_id, status = status.as_u16(), "Gateway HTTP Fehler");
                                     telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                     cb.lock().unwrap().record_failure();
-                                    queue_retry(&retry_queue, retry_perception.clone()).await;
                                 }
                             }
                             Err(e) => {
@@ -641,7 +965,6 @@ pub mod bridge {
                                 warn!(agent = %agent_id, error = %e, is_timeout = is_timeout, "Gateway Request fehlgeschlagen");
                                 telemetry.calls_failed.fetch_add(1, Ordering::Relaxed);
                                 cb.lock().unwrap().record_failure();
-                                queue_retry(&retry_queue, retry_perception.clone()).await;
                             }
                         }
                     });
@@ -656,11 +979,23 @@ pub mod bridge {
                     };
                     tokio::spawn(async move {
                         let call_start = Instant::now();
+                        match bridge_event_store.reserve_request(&request_id, &request_digest) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(request_id = %request_id, "LLM provider request already reserved");
+                                return;
+                            }
+                            Err(error) => {
+                                error!(request_id = %request_id, error = %error, "LLM provider reservation failed closed");
+                                return;
+                            }
+                        }
                         match agent_runtime_request(
                             &client,
                             &url,
                             &credential,
                             &request_id,
+                            &request_digest,
                             &request,
                         )
                         .send()
@@ -671,35 +1006,29 @@ pub mod bridge {
                                 if status.is_success() {
                                     match response.json::<GatewayResponse>().await {
                                         Ok(gateway_resp) => {
-                                            let usage_event = match build_usage_event(
+                                            drop(permit);
+                                            if let Err(e) = store_gateway_completion(
+                                                bridge_event_store.as_ref(),
+                                                &action_tx,
+                                                &request_id,
+                                                &request_digest,
                                                 agent_id,
                                                 current_tick,
                                                 &gateway_resp,
                                                 usage_v2_enabled,
+                                                request_completion_max_attempts,
                                             ) {
-                                                Ok(event) => event,
-                                                Err(e) => {
-                                                    warn!(agent = %agent_id, error = %e, "AgentLlmUsage v2 response abgelehnt");
-                                                    telemetry
-                                                        .calls_failed
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                    cb.lock().unwrap().record_failure();
-                                                    return;
-                                                }
-                                            };
-                                            // Do not let local durability retry consume a
-                                            // provider concurrency slot or re-run the request.
-                                            drop(permit);
-                                            append_usage_event_until_durable(
-                                                &usage_event,
-                                                agent_id,
-                                                |event| bridge_event_store.append_event(event),
-                                            )
-                                            .await;
+                                                warn!(agent = %agent_id, error = %e, "Completed gateway response rejected fail-closed");
+                                                telemetry
+                                                    .calls_failed
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                cb.lock().unwrap().record_failure();
+                                                return;
+                                            }
                                             let latency_ms = call_start.elapsed().as_millis();
                                             telemetry.calls_success.fetch_add(1, Ordering::Relaxed);
                                             telemetry.tokens_total.fetch_add(
-                                                gateway_resp.tokens_used as u64,
+                                                gateway_resp.tokens_used.max(0) as u64,
                                                 Ordering::Relaxed,
                                             );
                                             cb.lock().unwrap().record_success();
@@ -712,18 +1041,6 @@ pub mod bridge {
                                                 latency_ms = latency_ms,
                                                 "LLM Response erhalten"
                                             );
-
-                                            let is_synthesis = gateway_resp.tokens_used == 0;
-                                            for extracted in &gateway_resp.actions {
-                                                if let Some(agent_action) = map_extracted_to_action(
-                                                    agent_id,
-                                                    extracted,
-                                                    current_tick,
-                                                    is_synthesis,
-                                                ) {
-                                                    let _ = action_tx.send(agent_action);
-                                                }
-                                            }
                                         }
                                         Err(e) => {
                                             warn!(agent = %agent_id, error = %e, "Gateway Response Parse-Fehler");
@@ -749,6 +1066,10 @@ pub mod bridge {
             }
         }
 
+        let _ = recovery_shutdown_tx.send(true);
+        if let Err(error) = recovery_task.await {
+            error!(error = %error, "LLM completion recovery task failed");
+        }
         info!("LLM Bridge beendet");
     }
 
@@ -806,7 +1127,7 @@ pub mod bridge {
         };
 
         let formatted_perception = format_perception_metadata(perception);
-        let mut metadata = HashMap::new();
+        let mut metadata = BTreeMap::new();
         metadata.insert("agent_id".to_string(), perception.agent_id.0.to_string());
         if let Some(claim) = AGENT_ROUTING
             .get()
@@ -828,7 +1149,10 @@ pub mod bridge {
         metadata.insert("impulse".to_string(), perception.impulse_text.clone());
         metadata.insert("perception".to_string(), formatted_perception);
         metadata.insert("tick".to_string(), perception.tick.0.to_string());
-        metadata.insert("request_id".to_string(), uuid::Uuid::new_v4().to_string());
+        metadata.insert(
+            "request_id".to_string(),
+            agent_runtime_request_id(perception),
+        );
 
         // Traffic Control Metadata (Synthesis, Chat-Sequencing)
         metadata.insert("room_id".to_string(), perception.room_id.clone());
@@ -999,13 +1323,14 @@ pub mod bridge {
                 temperature: 0.1,
                 max_tokens: 10,
                 model: String::new(),
-                metadata: HashMap::new(),
+                metadata: BTreeMap::new(),
             };
             let built = agent_runtime_request(
                 &reqwest::Client::new(),
                 "http://127.0.0.1:8080/internal/agent-runtime",
                 "agent-runtime-test-credential",
                 "agent-runtime-07-55",
+                "digest-07-55",
                 &request,
             )
             .build()
@@ -1019,35 +1344,295 @@ pub mod bridge {
                 built.headers().get("X-Request-ID").unwrap(),
                 "agent-runtime-07-55"
             );
+            assert_eq!(
+                built.headers().get("X-Request-Digest").unwrap(),
+                "digest-07-55"
+            );
+        }
+
+        struct FailFirstCompletionStore {
+            inner: EventStore,
+            fail_next_usage: AtomicBool,
+            append_calls: Arc<std::sync::atomic::AtomicUsize>,
+            failure_observed: Arc<tokio::sync::Notify>,
+        }
+
+        impl CompletionStore for FailFirstCompletionStore {
+            fn reserve_request(
+                &self,
+                request_id: &str,
+                request_digest: &str,
+            ) -> anyhow::Result<bool> {
+                self.inner.reserve_llm_request(request_id, request_digest)
+            }
+
+            fn enqueue_completion(
+                &self,
+                request_id: &str,
+                request_digest: &str,
+                payload: &str,
+            ) -> anyhow::Result<()> {
+                self.inner
+                    .enqueue_llm_completion(request_id, request_digest, payload)
+            }
+
+            fn get_completion(
+                &self,
+                request_id: &str,
+            ) -> anyhow::Result<Option<LlmCompletionEntry>> {
+                self.inner.get_llm_completion(request_id)
+            }
+
+            fn poll_completions(&self, limit: usize) -> anyhow::Result<Vec<LlmCompletionEntry>> {
+                self.inner.poll_llm_completions(limit)
+            }
+
+            fn persist_usage(
+                &self,
+                request_id: &str,
+                request_digest: &str,
+                event: &DomainEvent,
+            ) -> anyhow::Result<()> {
+                self.append_calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail_next_usage.swap(false, Ordering::SeqCst) {
+                    self.failure_observed.notify_one();
+                    anyhow::bail!("injected local usage append failure");
+                }
+                self.inner
+                    .persist_llm_completion_usage(request_id, request_digest, event)
+            }
+
+            fn record_failure(
+                &self,
+                request_id: &str,
+                request_digest: &str,
+                error: &str,
+                max_attempts: u32,
+            ) -> anyhow::Result<(u32, bool)> {
+                self.inner.record_llm_completion_failure(
+                    request_id,
+                    request_digest,
+                    error,
+                    max_attempts,
+                )
+            }
+
+            fn claim_actions(
+                &self,
+                request_id: &str,
+                request_digest: &str,
+            ) -> anyhow::Result<bool> {
+                self.inner
+                    .claim_llm_completion_actions(request_id, request_digest)
+            }
+
+            fn complete_actions(
+                &self,
+                request_id: &str,
+                request_digest: &str,
+            ) -> anyhow::Result<bool> {
+                self.inner
+                    .complete_llm_completion_actions(request_id, request_digest)
+            }
+
+            fn has_operation(&self, operation_id: &str) -> anyhow::Result<bool> {
+                self.inner.has_event_operation_id(operation_id)
+            }
+        }
+
+        async fn start_mock_agent_provider(
+            provider_calls: Arc<std::sync::atomic::AtomicUsize>,
+        ) -> (String, tokio::task::JoinHandle<()>) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = match listener.accept().await {
+                        Ok(connection) => connection,
+                        Err(_) => return,
+                    };
+                    let provider_calls = Arc::clone(&provider_calls);
+                    tokio::spawn(async move {
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            let read = stream.read(&mut chunk).await.unwrap();
+                            if read == 0 {
+                                return;
+                            }
+                            request.extend_from_slice(&chunk[..read]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let request_text = String::from_utf8_lossy(&request);
+                        assert!(request_text.starts_with("POST /internal/agent-runtime "));
+                        assert!(request_text.lines().any(|line| line
+                            .eq_ignore_ascii_case("authorization: Bearer test-credential")));
+                        let request_id = request_text
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("X-Request-ID: ")
+                                    .or_else(|| line.strip_prefix("x-request-id: "))
+                            })
+                            .unwrap()
+                            .trim();
+                        assert!(request_text.lines().any(|line| {
+                            line.to_ascii_lowercase().starts_with("x-request-digest: ")
+                        }));
+                        provider_calls.fetch_add(1, Ordering::SeqCst);
+                        let body = serde_json::json!({
+                            "content": "move",
+                            "actions": [{"type": "move", "target": "meeting-room"}],
+                            "tokens_used": 7,
+                            "request_id": request_id,
+                            "input_tokens": 5,
+                            "output_tokens": 2,
+                            "cache_read": 0,
+                            "cache_creation": 0,
+                            "tier": "mid",
+                            "cost_usd": 0.0,
+                            "hierarchy_tier": 2,
+                            "cost_source": "non_provider_zero",
+                            "effective_model": "mock/model"
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    });
+                }
+            });
+            (format!("http://{address}"), task)
+        }
+
+        fn recovery_test_perception() -> Perception {
+            Perception {
+                agent_id: AgentId(7),
+                circadian_text: String::new(),
+                body_text: "ready".to_string(),
+                environment_text: String::new(),
+                acoustic_text: String::new(),
+                heard_text: String::new(),
+                presence_text: String::new(),
+                impulse_text: "move".to_string(),
+                is_directly_addressed: false,
+                timestamp: Timestamp(1234),
+                tick: Tick(55),
+                room_id: "office".to_string(),
+                max_priority: "P2".to_string(),
+                synth_fingerprint: "test".to_string(),
+                personality_type: "E".to_string(),
+                has_operator_impulse: false,
+            }
         }
 
         #[tokio::test]
-        async fn completed_provider_result_retries_only_local_append() {
-            let provider_calls = std::sync::atomic::AtomicUsize::new(1);
-            let append_calls = std::sync::atomic::AtomicUsize::new(0);
-            let completed_actions = ["move-once"];
-            let event = DomainEvent::new(
-                "agent_llm_usage",
-                "AGENT-07",
-                "{}",
-                "agent-runtime-07-55",
-                55,
-            );
+        async fn completed_response_survives_restart_without_provider_or_action_replay() {
+            let dir = tempfile::tempdir().unwrap();
+            let event_path = dir.path().join("events.db");
+            let state_path = dir.path().join("state.redb");
+            let state_store = Arc::new(StateStore::open(state_path.to_str().unwrap()).unwrap());
+            let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let append_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let failure_observed = Arc::new(tokio::sync::Notify::new());
+            let (gateway_url, provider_task) =
+                start_mock_agent_provider(Arc::clone(&provider_calls)).await;
+            let config = LlmBridgeConfig {
+                gateway_url,
+                credential: "test-credential".to_string(),
+                usage_v2_enabled: true,
+                completion_retry_interval: Duration::from_secs(3600),
+                completion_max_attempts: 3,
+                ..Default::default()
+            };
+            let first_store = Arc::new(FailFirstCompletionStore {
+                inner: EventStore::open(event_path.to_str().unwrap()).unwrap(),
+                fail_next_usage: AtomicBool::new(true),
+                append_calls: Arc::clone(&append_calls),
+                failure_observed: Arc::clone(&failure_observed),
+            });
+            let (first_perception_tx, first_perception_rx) = mpsc::channel();
+            let (action_tx, action_rx) = mpsc::channel();
+            let first_failure = failure_observed.notified();
+            let first_bridge = tokio::spawn(run_llm_bridge_with_store(
+                config.clone(),
+                first_perception_rx,
+                action_tx.clone(),
+                Arc::new(BridgeTelemetry::default()),
+                Arc::clone(&state_store),
+                Arc::clone(&first_store),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(HashMap::new())),
+            ));
+            first_perception_tx
+                .send(recovery_test_perception())
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), first_failure)
+                .await
+                .expect("first usage append was not attempted");
+            assert!(action_rx.try_recv().is_err());
+            let pending = first_store
+                .get_completion("agent-runtime-07-55")
+                .unwrap()
+                .unwrap();
+            assert_eq!(pending.status, "pending_usage");
+            assert_eq!(pending.attempt_count, 1);
 
-            let attempts = append_usage_event_until_durable(&event, AgentId(7), |_| {
-                let call = append_calls.fetch_add(1, Ordering::SeqCst);
-                if call == 0 {
-                    Err("injected local append failure")
-                } else {
-                    Ok(1)
-                }
-            })
+            // End the first bridge after the completed response is durable but before
+            // the usage append succeeds, then construct a fresh store from the same DB.
+            drop(first_perception_tx);
+            tokio::time::timeout(Duration::from_secs(5), first_bridge)
+                .await
+                .expect("first bridge did not shut down")
+                .unwrap();
+            drop(first_store);
+
+            let second_store = Arc::new(FailFirstCompletionStore {
+                inner: EventStore::open(event_path.to_str().unwrap()).unwrap(),
+                fail_next_usage: AtomicBool::new(false),
+                append_calls: Arc::clone(&append_calls),
+                failure_observed,
+            });
+            let (second_perception_tx, second_perception_rx) = mpsc::channel();
+            drop(second_perception_tx);
+            run_llm_bridge_with_store(
+                config,
+                second_perception_rx,
+                action_tx,
+                Arc::new(BridgeTelemetry::default()),
+                state_store,
+                Arc::clone(&second_store),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(HashMap::new())),
+            )
             .await;
 
-            assert_eq!(attempts, 2);
-            assert_eq!(append_calls.load(Ordering::SeqCst), 2);
+            let action = action_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(action.agent_id, AgentId(7));
+            assert_eq!(action.action_type, ActionType::Move);
+            assert_eq!(action.target_room.as_deref(), Some("meeting-room"));
+            assert!(action_rx.try_recv().is_err());
             assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
-            assert_eq!(completed_actions, ["move-once"]);
+            assert_eq!(append_calls.load(Ordering::SeqCst), 2);
+            let usage_events = second_store
+                .inner
+                .get_events_since(0, 10)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.event_type == "agent_llm_usage")
+                .collect::<Vec<_>>();
+            assert_eq!(usage_events.len(), 1);
+            assert!(second_store
+                .get_completion("agent-runtime-07-55")
+                .unwrap()
+                .is_none());
+            provider_task.abort();
         }
 
         #[test]
