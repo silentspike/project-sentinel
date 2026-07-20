@@ -83,7 +83,7 @@ machine-readable matrix contains no `not_tested` or `blocked` M0 entry.
 | AC-13 Console/API/event/artifact agreement | `BLOCKED` | Playwright screenshots plus matching API/event/artifact data for the complete journey; secret, browser-error, overflow, and focus checks |
 | AC-14 Release rollback and restoration | `BLOCKED` | Live rollback to prior approved release and restore to accepted generation with manifest, preview, event, and audit readback |
 | AC-15 Stability soak | `BLOCKED` | At least 600 advancing ticks and 60 minutes; unchanged restart counters; no panic/fatal/drift/stale runtime/duplicate effect/unresolved blocker; resource sidecars |
-| AC-16 Recoverable deployment | `PRECHECK PASS` | Snapshot created and read back immediately before first deployment; pre-deploy artifact hashes/backups; delete only after every AC passes |
+| AC-16 Recoverable deployment | `IN PROGRESS` | Snapshot and pre-deploy artifact backup are verified; retain through all acceptance work; delete only after every AC passes |
 | AC-17 Honest milestone name | `PASS (wording gate)` | Final evidence uses only `Single-Node Product Ready` and repeats the excluded claims |
 
 ## Negative Criteria
@@ -120,8 +120,8 @@ Pre-deployment verification:
 - targeted remote tests passed for the daemon (`338/338`) and the common,
   projection, projection-service, dashboard-backend, Gaia, Gaia-loop, control CLI,
   and agent-runtime packages;
-- targeted remote Clippy passed for the non-daemon M0 component set; the separate
-  daemon Clippy run remains in progress;
+- targeted remote Clippy passed for both the daemon and the non-daemon M0 component
+  set with warnings denied;
 - Console Vitest (`71/71`), TypeScript typecheck, and production build completed
   successfully;
 - Gateway, Judge, and NATS bridge Go test suites and builds completed successfully;
@@ -177,10 +177,11 @@ their accepted scope; duplicate issues are forbidden.
 | --- | --- | --- |
 | Live VM and hypervisor placement identified | `PASS` | Read-only host inventory plus guest-agent identity match |
 | Existing snapshots inventoried | `PASS` | Read-only snapshot tree captured privately |
-| Dependency gate closed | `BLOCKED` | All hard dependency issues must be verified first |
-| `pre-650-<UTC timestamp>` created | `NOT STARTED` | Must occur immediately before the first deployment |
-| Snapshot read back | `NOT STARTED` | Exact name, creation time, and current-parent readback |
-| Snapshot retained through all ACs | `NOT STARTED` | Required on every failure or partial result |
+| `pre-650-20260720T215926Z` created | `PASS` | Created before any deployment or service restart |
+| Snapshot read back | `PASS` | Snapshot tree shows the issue snapshot as the immediate parent of `current` |
+| Pre-deploy artifacts and hashes backed up | `PASS` | Root-only same-VM backup; archive SHA-256 `4d96ccb12e7e579962ede7d700cfed8aeb35760ee39b137dcc9faff8b7c5bfc7`; manifest SHA-256 `e37b7a514c86697b8a2f31ef95254b489957b6ead6f7b2c9d72c7ea319d4c961` |
+| Dependency gate closed | `BLOCKED` | All hard dependency issues must be verified before the final epic deployment |
+| Snapshot retained through all ACs | `IN PROGRESS` | Required on every failure or partial result |
 | Snapshot deleted after complete success | `NOT STARTED` | Allowed only after AC-1 through AC-17 pass and final runtime stability readback |
 
 ## Evidence Rules
