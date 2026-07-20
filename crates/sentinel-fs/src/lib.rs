@@ -22,3 +22,9 @@ pub mod layer;
 pub mod metadata;
 pub mod read_planner;
 pub mod segment;
+
+/// Stable metadata namespace for the shared read-only filesystem layer.
+///
+/// The root row for this namespace is node-local storage structure. Visible content
+/// mutations within the namespace remain fenced by the World owner term.
+pub const SHARED_BASE_LAYER_ID: &str = "__BASE__";
