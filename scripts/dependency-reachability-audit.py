@@ -101,6 +101,19 @@ TREE_LINE = re.compile(
     r"^(?P<depth>[0-9]+)(?P<name>[A-Za-z0-9_-]+) v(?P<version>[^\s]+)(?P<tail>.*)$"
 )
 
+COMPACT_TREE_FIELDS = (
+    "record",
+    "parent_name",
+    "parent_version",
+    "parent_source",
+    "name",
+    "version",
+    "source",
+    "normal_context",
+    "build_context",
+    "is_root",
+)
+
 WORKSPACE_SET_FIELDS = (
     "name",
     "version",
@@ -178,6 +191,135 @@ def parse_tree(
     return graph
 
 
+def compact_tree_rows(graph: TreeGraph) -> list[dict[str, str]]:
+    rows = [
+        {
+            "record": "package",
+            "name": key[0],
+            "version": key[1],
+            "source": display_source(key[2]),
+            "normal_context": str(key in graph.normal_context).lower(),
+            "build_context": str(key in graph.build_context).lower(),
+            "is_root": str(key in graph.roots).lower(),
+            "parent_name": "",
+            "parent_version": "",
+            "parent_source": "",
+        }
+        for key in sorted(graph.packages)
+    ]
+    rows.extend(
+        {
+            "record": "edge",
+            "parent_name": parent[0],
+            "parent_version": parent[1],
+            "parent_source": display_source(parent[2]),
+            "name": child[0],
+            "version": child[1],
+            "source": display_source(child[2]),
+            "normal_context": "false",
+            "build_context": "false",
+            "is_root": "false",
+        }
+        for parent, child in sorted(graph.edges)
+    )
+    return rows
+
+
+def compact_tree_text(graph: TreeGraph) -> str:
+    return tsv_text(compact_tree_rows(graph), COMPACT_TREE_FIELDS)
+
+
+def load_compact_tree(
+    path: Path,
+    keys_by_name_version: Mapping[tuple[str, str], tuple[str, str, str]],
+) -> TreeGraph:
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if tuple(reader.fieldnames or ()) != COMPACT_TREE_FIELDS:
+            raise AuditError(f"invalid compact tree header: {path}")
+        rows = list(reader)
+
+    graph = TreeGraph()
+    package_rows = set()
+    edge_rows = set()
+
+    def resolve(row: Mapping[str, str], prefix: str = "") -> tuple[str, str, str]:
+        name = row[f"{prefix}name"]
+        version = row[f"{prefix}version"]
+        source = row[f"{prefix}source"]
+        key = keys_by_name_version.get((name, version))
+        if key is None or display_source(key[2]) != source:
+            raise AuditError(
+                f"compact tree package {name}@{version} ({source}) is absent from Cargo.lock"
+            )
+        return key
+
+    for row in rows:
+        record = row["record"]
+        if record == "package":
+            key = resolve(row)
+            if key in package_rows:
+                raise AuditError(f"duplicate compact tree package row: {key!r}")
+            package_rows.add(key)
+            for field_name in ("normal_context", "build_context", "is_root"):
+                if row[field_name] not in {"true", "false"}:
+                    raise AuditError(
+                        f"invalid compact tree boolean {field_name}={row[field_name]!r}"
+                    )
+            if any(
+                row[field_name]
+                for field_name in ("parent_name", "parent_version", "parent_source")
+            ):
+                raise AuditError(f"compact package row has parent fields: {key!r}")
+            if row["normal_context"] == "false" and row["build_context"] == "false":
+                raise AuditError(f"compact tree package lacks a dependency context: {key!r}")
+            graph.packages.add(key)
+            if row["normal_context"] == "true":
+                graph.normal_context.add(key)
+            if row["build_context"] == "true":
+                graph.build_context.add(key)
+            if row["is_root"] == "true":
+                graph.roots.add(key)
+        elif record == "edge":
+            child = resolve(row)
+            parent = resolve(row, "parent_")
+            edge = (parent, child)
+            if edge in edge_rows:
+                raise AuditError(f"duplicate compact tree edge row: {edge!r}")
+            edge_rows.add(edge)
+            if any(
+                row[field_name] != "false"
+                for field_name in ("normal_context", "build_context", "is_root")
+            ):
+                raise AuditError(f"compact edge row has package flags: {edge!r}")
+            graph.edges.add(edge)
+        else:
+            raise AuditError(f"invalid compact tree record {record!r}: {path}")
+
+    if not graph.packages or not graph.roots:
+        raise AuditError(f"compact tree has no packages or roots: {path}")
+    edge_packages = {key for edge in graph.edges for key in edge}
+    if not edge_packages <= graph.packages:
+        raise AuditError(
+            f"compact tree edges reference packages without package rows: {path}"
+        )
+    forward = defaultdict(set)
+    for parent, child in graph.edges:
+        forward[parent].add(child)
+    reached = set(graph.roots)
+    queue = deque(graph.roots)
+    while queue:
+        for child in forward[queue.popleft()]:
+            if child not in reached:
+                reached.add(child)
+                queue.append(child)
+    if reached != graph.packages:
+        raise AuditError(
+            f"compact tree contains packages unreachable from its roots: {path}"
+        )
+    return graph
+
+
 class ReachabilityAudit:
     def __init__(
         self,
@@ -252,13 +394,15 @@ class ReachabilityAudit:
             specs.add((str(item.get("kind") or "normal"), str(item.get("target") or "")))
         return specs or {("normal", "")}
 
-    def load_release_trees(self, trees_dir: Path) -> None:
+    def load_release_trees(self, trees_dir: Path, *, compact: bool) -> None:
+        loader = load_compact_tree if compact else parse_tree
+        suffix = ".graph.tsv" if compact else ".txt"
         for root_name, root_key in self.root_keys.items():
-            normal = parse_tree(
-                trees_dir / f"{root_name}.normal.txt", self.keys_by_name_version
+            normal = loader(
+                trees_dir / f"{root_name}.normal{suffix}", self.keys_by_name_version
             )
-            combined = parse_tree(
-                trees_dir / f"{root_name}.normal-build.txt",
+            combined = loader(
+                trees_dir / f"{root_name}.normal-build{suffix}",
                 self.keys_by_name_version,
             )
             if normal.roots != {root_key} or combined.roots != {root_key}:
@@ -308,12 +452,33 @@ class ReachabilityAudit:
         }
 
     def load_workspace_tree_sets(
-        self, native_build: Path, native_all: Path, native_dev: Path, all_targets: Path
+        self,
+        native_build: Path,
+        native_all: Path,
+        native_dev: Path,
+        all_targets: Path,
+        *,
+        compact: bool = False,
     ) -> TreeGraph:
-        native_build_graph = parse_tree(native_build, self.keys_by_name_version)
-        native_all_graph = parse_tree(native_all, self.keys_by_name_version)
-        native_dev_graph = parse_tree(native_dev, self.keys_by_name_version)
-        all_targets_graph = parse_tree(all_targets, self.keys_by_name_version)
+        loader = load_compact_tree if compact else parse_tree
+        native_build_graph = loader(native_build, self.keys_by_name_version)
+        native_all_graph = loader(native_all, self.keys_by_name_version)
+        native_dev_graph = loader(native_dev, self.keys_by_name_version)
+        all_targets_graph = loader(all_targets, self.keys_by_name_version)
+        return self.set_workspace_graphs(
+            native_build_graph,
+            native_all_graph,
+            native_dev_graph,
+            all_targets_graph,
+        )
+
+    def set_workspace_graphs(
+        self,
+        native_build_graph: TreeGraph,
+        native_all_graph: TreeGraph,
+        native_dev_graph: TreeGraph,
+        all_targets_graph: TreeGraph,
+    ) -> TreeGraph:
         if native_dev_graph.roots != self.workspace_keys:
             raise AuditError("native dev tree roots differ from workspace members")
         native_forward = defaultdict(set)
@@ -381,6 +546,23 @@ class ReachabilityAudit:
                 raise AuditError(f"{label} tree roots differ from workspace members")
         return all_targets_graph
 
+    def write_compact_sources(
+        self,
+        trees_dir: Path,
+        workspace_graphs: Sequence[tuple[str, TreeGraph]],
+    ) -> None:
+        trees_dir.mkdir(parents=True, exist_ok=True)
+        for root_name in RELEASE_ROOTS:
+            for label, graph in (
+                ("normal", self.root_normal_graphs[root_name]),
+                ("normal-build", self.root_combined_graphs[root_name]),
+            ):
+                path = trees_dir / f"{root_name}.{label}.graph.tsv"
+                path.write_text(compact_tree_text(graph), encoding="utf-8")
+        for label, graph in workspace_graphs:
+            path = trees_dir / f"workspace-{label}.graph.tsv"
+            path.write_text(compact_tree_text(graph), encoding="utf-8")
+
     def _edge_specs_for_keys(self, parent_key, child_key) -> set[tuple[str, str]]:
         parent_ids = [value for value, key in self.key_for_id.items() if key == parent_key]
         child_ids = {value for value, key in self.key_for_id.items() if key == child_key}
@@ -390,40 +572,6 @@ class ReachabilityAudit:
                 if str(dep["pkg"]) in child_ids:
                     specs.update(self._edge_specs(dep))
         return specs
-
-    def load_workspace_set_rows(self, rows: Sequence[Mapping[str, str]]) -> None:
-        if len(rows) != len(self.lock_packages):
-            raise AuditError(
-                f"workspace set rows={len(rows)}, lockfile rows={len(self.lock_packages)}"
-            )
-        source_lookup = defaultdict(list)
-        for key in self.lock_packages:
-            source_lookup[(key[0], key[1], display_source(key[2]))].append(key)
-        seen = set()
-        sets = {
-            "native_normal_build": set(),
-            "native_all_edges": set(),
-            "all_targets_all_edges": set(),
-            "native_dev_context": set(),
-            "foreign_target_context": set(),
-        }
-        for row in rows:
-            candidates = source_lookup[(row["name"], row["version"], row["source"])]
-            if len(candidates) != 1:
-                raise AuditError(f"workspace set row has ambiguous identity: {row!r}")
-            key = candidates[0]
-            if key in seen:
-                raise AuditError(f"duplicate workspace set row: {key!r}")
-            seen.add(key)
-            for field_name in sets:
-                value = row[field_name]
-                if value not in {"true", "false"}:
-                    raise AuditError(f"invalid boolean {field_name}={value!r}")
-                if value == "true":
-                    sets[field_name].add(key)
-        if seen != set(self.lock_packages):
-            raise AuditError("workspace set identities differ from Cargo.lock")
-        self.set_workspace_sets(**sets)
 
     def classify(self) -> list[dict[str, str]]:
         if set(self.root_normal_graphs) != set(RELEASE_ROOTS):
@@ -538,22 +686,6 @@ class ReachabilityAudit:
                 )
         return sorted(rows, key=lambda row: (row["root"], row["dependency"], row["version"]))
 
-    def edge_contexts(self, parent_key, child_key) -> set[str]:
-        parent_ids = [value for value, key in self.key_for_id.items() if key == parent_key]
-        child_ids = {value for value, key in self.key_for_id.items() if key == child_key}
-        contexts = set()
-        for parent_id in parent_ids:
-            for dep in self.all_nodes[parent_id].get("deps", []):
-                if str(dep["pkg"]) not in child_ids:
-                    continue
-                for kind, target in self._edge_specs(dep):
-                    contexts.add(f"{kind}:{target or 'all'}")
-        if not contexts:
-            raise AuditError(
-                f"active Cargo edge lacks metadata annotation: {parent_key!r} -> {child_key!r}"
-            )
-        return contexts
-
     def set_all_target_edges(self, graph: TreeGraph) -> None:
         metadata_edges: dict[
             tuple[tuple[str, str, str], tuple[str, str, str]], set[str]
@@ -611,65 +743,6 @@ class ReachabilityAudit:
             }
             for (parent, child), contexts in sorted(self.all_target_edges.items())
         ]
-
-    def load_edge_rows(self, rows: Sequence[Mapping[str, str]]) -> None:
-        edges = {}
-        for row in rows:
-            parent = self.keys_by_name_version.get(
-                (row["parent_name"], row["parent_version"])
-            )
-            child = self.keys_by_name_version.get(
-                (row["child_name"], row["child_version"])
-            )
-            if parent is None or child is None:
-                raise AuditError(f"edge row package is absent from Cargo.lock: {row!r}")
-            contexts = {value for value in row["edge_contexts"].split(";") if value}
-            if not contexts:
-                raise AuditError(f"edge row lacks context: {row!r}")
-            edge = (parent, child)
-            if edge in edges:
-                raise AuditError(f"duplicate all-target edge row: {row!r}")
-            expected_contexts = self.edge_contexts(parent, child)
-            if contexts != expected_contexts:
-                raise AuditError(
-                    f"edge contexts differ from metadata for {parent!r} -> {child!r}"
-                )
-            edges[edge] = contexts
-            active = row["cargo_all_targets_active"]
-            if active not in {"true", "false"}:
-                raise AuditError(f"invalid active-edge boolean: {row!r}")
-            if active == "true":
-                self.active_all_target_edges.add(edge)
-        metadata_edges = set()
-        for parent_id, node in self.all_nodes.items():
-            parent = self.key_for_id[parent_id]
-            for dep in node.get("deps", []):
-                metadata_edges.add((parent, self.key_for_id[str(dep["pkg"])]))
-        if set(edges) != metadata_edges:
-            raise AuditError("committed edge inventory differs from metadata edge inventory")
-        all_targets = self.workspace_sets["all_targets_all_edges"]
-        if any(
-            parent not in all_targets or child not in all_targets
-            for parent, child in self.active_all_target_edges
-        ):
-            raise AuditError("active all-target edge graph references inactive packages")
-        reverse_active = defaultdict(set)
-        for parent, child in self.active_all_target_edges:
-            reverse_active[child].add(parent)
-        reached = set(self.workspace_keys)
-        queue = deque(self.workspace_keys)
-        forward_active = defaultdict(set)
-        for parent, child in self.active_all_target_edges:
-            forward_active[parent].add(child)
-        while queue:
-            parent = queue.popleft()
-            for child in forward_active[parent]:
-                if child not in reached:
-                    reached.add(child)
-                    queue.append(child)
-        if reached != all_targets:
-            raise AuditError("active all-target edges do not cover the committed package set")
-        self.all_target_edges = edges
 
     def duplicate_rows_and_closure(
         self,
@@ -877,47 +950,11 @@ def add_release_tree_features(
     return rows
 
 
-def load_json(path: Path) -> Mapping[str, object]:
-    with path.open(encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def run_audit(args: argparse.Namespace) -> int:
-    with args.lock.open("rb") as handle:
-        lock_data = tomllib.load(handle)
-    audit = ReachabilityAudit(
-        lock_data,
-        load_json(args.metadata_all),
-        load_json(args.metadata_native),
-    )
-    if args.output_dir is None:
-        raise AuditError("--output-dir is required")
-    if args.trees_dir is None:
-        raise AuditError("--trees-dir is required")
-    audit.load_release_trees(args.trees_dir)
-    if args.check:
-        audit.load_workspace_set_rows(
-            read_tsv(args.output_dir / "workspace-reachability-sets.tsv")
-        )
-        audit.load_edge_rows(
-            read_tsv(args.output_dir / "workspace-all-target-edges.tsv")
-        )
-    else:
-        raw_paths = (
-            args.workspace_native_build_tree,
-            args.workspace_native_all_tree,
-            args.workspace_native_dev_tree,
-            args.workspace_all_targets_tree,
-        )
-        if any(path is None for path in raw_paths):
-            raise AuditError(
-                "generation requires all three --workspace-*-tree inputs"
-            )
-        all_targets_graph = audit.load_workspace_tree_sets(*raw_paths)
-        audit.set_all_target_edges(all_targets_graph)
-
+def generated_outputs(
+    audit: ReachabilityAudit, trees_dir: Path
+) -> tuple[dict[str, str], int, int, int]:
     rows = audit.classify()
-    feature_rows = add_release_tree_features(audit.direct_feature_rows(), args.trees_dir)
+    feature_rows = add_release_tree_features(audit.direct_feature_rows(), trees_dir)
     feature_fields = (
         "root",
         "tier",
@@ -957,14 +994,90 @@ def run_audit(args: argparse.Namespace) -> int:
             closure_rows, REVERSE_CLOSURE_FIELDS
         ),
     }
+    return generated, len(rows), len(duplicate_rows), len(closure_rows)
+
+
+def load_json(path: Path) -> Mapping[str, object]:
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def run_audit(args: argparse.Namespace) -> int:
+    if args.check and args.compact_sources_only:
+        raise AuditError("--check and --compact-sources-only are mutually exclusive")
+    with args.lock.open("rb") as handle:
+        lock_data = tomllib.load(handle)
+    audit = ReachabilityAudit(
+        lock_data,
+        load_json(args.metadata_all),
+        load_json(args.metadata_native),
+    )
+    if args.output_dir is None and not args.compact_sources_only:
+        raise AuditError("--output-dir is required")
+    if args.trees_dir is None:
+        raise AuditError("--trees-dir is required")
+    if args.check:
+        audit.load_release_trees(args.trees_dir, compact=True)
+        workspace_paths = (
+            args.trees_dir / "workspace-native-normal-build.graph.tsv",
+            args.trees_dir / "workspace-native-all.graph.tsv",
+            args.trees_dir / "workspace-native-dev.graph.tsv",
+            args.trees_dir / "workspace-all-targets.graph.tsv",
+        )
+        all_targets_graph = audit.load_workspace_tree_sets(
+            *workspace_paths, compact=True
+        )
+        audit.set_all_target_edges(all_targets_graph)
+    else:
+        if args.raw_trees_dir is None:
+            raise AuditError("generation requires --raw-trees-dir")
+        audit.load_release_trees(args.raw_trees_dir, compact=False)
+        raw_paths = (
+            args.workspace_native_build_tree,
+            args.workspace_native_all_tree,
+            args.workspace_native_dev_tree,
+            args.workspace_all_targets_tree,
+        )
+        if any(path is None for path in raw_paths):
+            raise AuditError(
+                "generation requires all four --workspace-*-tree inputs"
+            )
+        workspace_graphs = tuple(
+            (label, parse_tree(path, audit.keys_by_name_version))
+            for label, path in zip(
+                ("native-normal-build", "native-all", "native-dev", "all-targets"),
+                raw_paths,
+                strict=True,
+            )
+        )
+        all_targets_graph = audit.set_workspace_graphs(
+            *(graph for _, graph in workspace_graphs)
+        )
+        audit.set_all_target_edges(all_targets_graph)
+        audit.write_compact_sources(args.trees_dir, workspace_graphs)
+        if args.compact_sources_only:
+            graph_paths = sorted(args.trees_dir.glob("*.graph.tsv"))
+            graph_rows = sum(
+                max(len(path.read_text(encoding="utf-8").splitlines()) - 1, 0)
+                for path in graph_paths
+            )
+            print(
+                f"compact_graph_files={len(graph_paths)} "
+                f"compact_graph_rows={graph_rows}"
+            )
+            return 0
+
+    generated, row_count, duplicate_count, closure_count = generated_outputs(
+        audit, args.trees_dir
+    )
     if args.check:
         for relative_path, expected in generated.items():
             verify_exact(args.output_dir / relative_path, expected)
         print(
-            f"coverage={len(rows)}/{len(audit.lock_packages)} unclassified=0 "
+            f"coverage={row_count}/{len(audit.lock_packages)} unclassified=0 "
             f"roots={len(audit.root_ids)}/{len(RELEASE_ROOTS)} "
-            f"duplicate_versions={len(duplicate_rows)} "
-            f"closure_rows={len(closure_rows)} evidence_match=PASS"
+            f"duplicate_versions={duplicate_count} "
+            f"closure_rows={closure_count} evidence_match=PASS"
         )
         return 0
     for relative_path, value in generated.items():
@@ -972,9 +1085,8 @@ def run_audit(args: argparse.Namespace) -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(value, encoding="utf-8")
     print(
-        f"wrote {len(rows)} packages, {len(feature_rows)} direct feature rows, "
-        f"{len(duplicate_rows)} duplicate-version rows, and "
-        f"{len(closure_rows)} reverse-closure rows"
+        f"wrote {row_count} packages, {duplicate_count} duplicate-version rows, and "
+        f"{closure_count} reverse-closure rows"
     )
     return 0
 
@@ -1238,11 +1350,13 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--metadata-native", type=Path, required=True)
     audit.add_argument("--output-dir", type=Path)
     audit.add_argument("--trees-dir", type=Path)
+    audit.add_argument("--raw-trees-dir", type=Path)
     audit.add_argument("--workspace-native-build-tree", type=Path)
     audit.add_argument("--workspace-native-all-tree", type=Path)
     audit.add_argument("--workspace-native-dev-tree", type=Path)
     audit.add_argument("--workspace-all-targets-tree", type=Path)
     audit.add_argument("--check", action="store_true")
+    audit.add_argument("--compact-sources-only", action="store_true")
 
     normalize = subparsers.add_parser("normalize", help="normalize a raw text file")
     normalize.add_argument("input", type=Path)
