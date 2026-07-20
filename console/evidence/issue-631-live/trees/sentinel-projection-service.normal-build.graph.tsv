@@ -86,7 +86,7 @@ package				regex-syntax	0.8.10	registry	true	false	false
 package				rusqlite	0.38.0	registry	true	false	false
 package				rustc_version	0.4.1	registry	true	true	false
 package				scopeguard	1.2.0	registry	true	false	false
-package				semver	1.0.27	registry	false	true	false
+package				semver	1.0.27	registry	true	true	false
 package				sentinel-common	0.1.0	workspace	true	false	false
 package				sentinel-limbo	0.1.0	workspace	true	false	false
 package				sentinel-physics	0.1.0	workspace	true	false	false

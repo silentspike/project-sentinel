@@ -227,7 +227,7 @@ package				leb128	0.2.5	registry	false	true	false
 package				leb128fmt	0.1.0	registry	true	false	false
 package				libc	0.2.186	registry	true	true	false
 package				libloading	0.8.9	registry	true	false	false
-package				libm	0.2.16	registry	true	true	false
+package				libm	0.2.16	registry	true	false	false
 package				libsqlite3-sys	0.36.0	registry	true	false	false
 package				linux-raw-sys	0.12.1	registry	true	false	false
 package				litemap	0.8.1	registry	true	false	false

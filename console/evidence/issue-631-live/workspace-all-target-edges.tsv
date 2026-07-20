@@ -1206,7 +1206,7 @@ sentinel-common	0.1.0	bincode	2.0.1	normal:all	true
 sentinel-common	0.1.0	flatbuffers	25.12.19	normal:all	true
 sentinel-common	0.1.0	serde	1.0.228	normal:all	true
 sentinel-common	0.1.0	serde_json	1.0.149	normal:all	true
-sentinel-common	0.1.0	sha2	0.10.9	normal:all	true
+sentinel-common	0.1.0	sha2	0.10.9	dev:all;normal:all	true
 sentinel-common	0.1.0	tempfile	3.27.0	dev:all	true
 sentinel-common	0.1.0	thiserror	2.0.18	normal:all	true
 sentinel-common	0.1.0	toml	1.0.6+spec-1.1.0	normal:all	true
