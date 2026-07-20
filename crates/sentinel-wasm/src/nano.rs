@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use sentinel_common::nano_runtime::{
-    NanoExecRequest, NanoExecResult, NanoHandle, NanoHealth, NanoHealthState, NanoIsolationPolicy,
-    NanoIsolationReport, NanoRuntime, NanoSnapshot, NanoSnapshotSemantics, NanoWorkloadSpec,
-    RUNTIME_WASM_WASMTIME,
+    ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle, NanoHealth,
+    NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime, NanoSnapshot,
+    NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_WASM_WASMTIME,
 };
 use serde::{Deserialize, Serialize};
 
@@ -147,6 +147,15 @@ impl NanoRuntime for WasmtimeNanoRuntime {
         })
     }
 
+    fn stop(&mut self, handle: &NanoHandle) -> Result<NanoStopResult> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        Ok(NanoStopResult::new(
+            self.runtime_key(),
+            &handle.workload_id,
+            self.workloads.remove(&handle.workload_id).is_some(),
+        ))
+    }
+
     fn exec(&mut self, handle: &NanoHandle, request: NanoExecRequest) -> Result<NanoExecResult> {
         let state = self
             .workloads
@@ -226,10 +235,15 @@ impl NanoRuntime for WasmtimeNanoRuntime {
     }
 
     fn health(&mut self, handle: &NanoHandle) -> Result<NanoHealth> {
-        let state = self
-            .workloads
-            .get(&handle.workload_id)
-            .ok_or_else(|| anyhow!("unknown wasm workload '{}'", handle.workload_id))?;
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        let Some(state) = self.workloads.get(&handle.workload_id) else {
+            return Ok(NanoHealth {
+                runtime_key: self.runtime_key().to_string(),
+                workload_id: handle.workload_id.clone(),
+                state: NanoHealthState::Stopped,
+                detail: "Wasm workload stopped".to_string(),
+            });
+        };
         let loaded = self.runtime.plugin_host().is_loaded(&state.wasm_path);
         Ok(NanoHealth {
             runtime_key: self.runtime_key().to_string(),

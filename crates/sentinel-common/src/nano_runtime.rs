@@ -68,6 +68,49 @@ pub struct NanoHandle {
     pub pid: Option<u32>,
 }
 
+pub const NANO_STOP_RESULT_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NanoStopOutcome {
+    Stopped,
+    AlreadyStopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NanoStopResult {
+    pub version: u16,
+    pub runtime_key: String,
+    pub workload_id: String,
+    pub outcome: NanoStopOutcome,
+}
+
+impl NanoStopResult {
+    pub fn new(runtime_key: &str, workload_id: &str, stopped: bool) -> Self {
+        Self {
+            version: NANO_STOP_RESULT_VERSION,
+            runtime_key: runtime_key.to_string(),
+            workload_id: workload_id.to_string(),
+            outcome: if stopped {
+                NanoStopOutcome::Stopped
+            } else {
+                NanoStopOutcome::AlreadyStopped
+            },
+        }
+    }
+}
+
+pub fn ensure_handle_runtime(handle: &NanoHandle, expected_runtime_key: &str) -> Result<()> {
+    if handle.runtime_key != expected_runtime_key {
+        return Err(anyhow!(
+            "NanoHandle for runtime '{}' cannot be used with runtime '{}'",
+            handle.runtime_key,
+            expected_runtime_key
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NanoExecRequest {
     pub operation: String,
@@ -149,6 +192,7 @@ pub struct NanoIsolationReport {
 pub trait NanoRuntime: Send {
     fn runtime_key(&self) -> &'static str;
     fn spawn(&mut self, workload: NanoWorkloadSpec) -> Result<NanoHandle>;
+    fn stop(&mut self, handle: &NanoHandle) -> Result<NanoStopResult>;
     fn exec(&mut self, handle: &NanoHandle, request: NanoExecRequest) -> Result<NanoExecResult>;
     fn snapshot(&mut self, handle: &NanoHandle) -> Result<NanoSnapshot>;
     fn restore(&mut self, snapshot: NanoSnapshot) -> Result<NanoHandle>;
@@ -218,11 +262,66 @@ impl NanoRuntimeRegistry {
             Err(anyhow!("NanoRuntime '{key}' is not registered"))
         }
     }
+
+    pub fn stop(&mut self, handle: &NanoHandle) -> Result<NanoStopResult> {
+        self.get_mut(&handle.runtime_key)?.stop(handle)
+    }
 }
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod conformance {
     use super::*;
+
+    pub fn assert_nano_runtime_stop_isolation<R>(
+        runtime: &mut R,
+        workload_a: NanoWorkloadSpec,
+        workload_b: NanoWorkloadSpec,
+    ) where
+        R: NanoRuntime,
+    {
+        assert_ne!(workload_a.workload_id, workload_b.workload_id);
+        let handle_a = runtime.spawn(workload_a).expect("spawn workload A");
+        let handle_b = runtime.spawn(workload_b).expect("spawn workload B");
+
+        assert_eq!(
+            runtime.health(&handle_a).expect("health workload A").state,
+            NanoHealthState::Healthy,
+            "workload A must be live before stop is exercised"
+        );
+        assert_eq!(
+            runtime.health(&handle_b).expect("health workload B").state,
+            NanoHealthState::Healthy,
+            "workload B must be live before stop is exercised"
+        );
+
+        let wrong_runtime = NanoHandle {
+            runtime_key: "wrong-runtime".to_string(),
+            ..handle_a.clone()
+        };
+        assert!(
+            runtime.stop(&wrong_runtime).is_err(),
+            "adapter must reject a handle owned by another runtime"
+        );
+
+        let stopped = runtime.stop(&handle_a).expect("stop workload A");
+        assert_eq!(stopped.version, NANO_STOP_RESULT_VERSION);
+        assert_eq!(stopped.outcome, NanoStopOutcome::Stopped);
+        assert_eq!(
+            runtime.health(&handle_a).expect("health workload A").state,
+            NanoHealthState::Stopped
+        );
+        assert!(matches!(
+            runtime.health(&handle_b).expect("health workload B").state,
+            NanoHealthState::Healthy | NanoHealthState::Degraded
+        ));
+
+        let replay = runtime.stop(&handle_a).expect("replay stop workload A");
+        assert_eq!(replay.outcome, NanoStopOutcome::AlreadyStopped);
+        assert_eq!(
+            runtime.stop(&handle_b).expect("stop workload B").outcome,
+            NanoStopOutcome::Stopped
+        );
+    }
 
     pub fn assert_nano_runtime_conformance<R>(runtime: &mut R, workload: NanoWorkloadSpec)
     where
@@ -287,12 +386,31 @@ pub mod conformance {
             .expect("nano runtime isolate must succeed");
         assert_eq!(isolation.runtime_key, runtime.runtime_key());
         assert_eq!(isolation.workload_id, workload.workload_id);
+
+        let stopped = runtime
+            .stop(&restored)
+            .expect("nano runtime stop must succeed");
+        assert_eq!(stopped.version, NANO_STOP_RESULT_VERSION);
+        assert_eq!(stopped.outcome, NanoStopOutcome::Stopped);
+        assert_eq!(stopped.runtime_key, runtime.runtime_key());
+        assert_eq!(stopped.workload_id, workload.workload_id);
+
+        let replay = runtime
+            .stop(&restored)
+            .expect("replayed nano runtime stop must succeed");
+        assert_eq!(replay.outcome, NanoStopOutcome::AlreadyStopped);
+
+        let health = runtime
+            .health(&restored)
+            .expect("health after stop must be readable");
+        assert_eq!(health.state, NanoHealthState::Stopped);
     }
 
     #[cfg(test)]
     #[derive(Default)]
     struct DummyRuntime {
         snapshot: Option<NanoSnapshot>,
+        active: HashMap<String, ()>,
     }
 
     #[cfg(test)]
@@ -302,12 +420,22 @@ pub mod conformance {
         }
 
         fn spawn(&mut self, workload: NanoWorkloadSpec) -> Result<NanoHandle> {
+            self.active.insert(workload.workload_id.clone(), ());
             Ok(NanoHandle {
                 runtime_key: self.runtime_key().to_string(),
                 workload_id: workload.workload_id,
                 agent_id: workload.agent_id,
                 pid: None,
             })
+        }
+
+        fn stop(&mut self, handle: &NanoHandle) -> Result<NanoStopResult> {
+            ensure_handle_runtime(handle, self.runtime_key())?;
+            Ok(NanoStopResult::new(
+                self.runtime_key(),
+                &handle.workload_id,
+                self.active.remove(&handle.workload_id).is_some(),
+            ))
         }
 
         fn exec(
@@ -335,6 +463,7 @@ pub mod conformance {
 
         fn restore(&mut self, snapshot: NanoSnapshot) -> Result<NanoHandle> {
             self.snapshot = Some(snapshot.clone());
+            self.active.insert(snapshot.workload_id.clone(), ());
             Ok(NanoHandle {
                 runtime_key: self.runtime_key().to_string(),
                 workload_id: snapshot.workload_id,
@@ -344,10 +473,15 @@ pub mod conformance {
         }
 
         fn health(&mut self, handle: &NanoHandle) -> Result<NanoHealth> {
+            ensure_handle_runtime(handle, self.runtime_key())?;
             Ok(NanoHealth {
                 runtime_key: self.runtime_key().to_string(),
                 workload_id: handle.workload_id.clone(),
-                state: NanoHealthState::Healthy,
+                state: if self.active.contains_key(&handle.workload_id) {
+                    NanoHealthState::Healthy
+                } else {
+                    NanoHealthState::Stopped
+                },
                 detail: "dummy".to_string(),
             })
         }
@@ -408,5 +542,41 @@ pub mod conformance {
         };
 
         assert_nano_runtime_conformance(&mut runtime, workload);
+    }
+
+    #[test]
+    fn registry_dispatches_idempotent_stop_and_rejects_wrong_runtime() {
+        let mut registry = NanoRuntimeRegistry::new(None);
+        registry.register(DummyRuntime::default()).unwrap();
+        let workload = NanoWorkloadSpec {
+            workload_id: "registry-stop".to_string(),
+            runtime_key: Some("dummy-runtime".to_string()),
+            agent_id: None,
+            agent_name: "Agent".to_string(),
+            role: "Tester".to_string(),
+            room_id: "empfang".to_string(),
+            shift_set: 1,
+            command: Vec::new(),
+            capabilities: Vec::new(),
+            metadata: BTreeMap::new(),
+            ecs_snapshot: None,
+        };
+        let key = registry.select_key(&workload).unwrap();
+        let handle = registry.get_mut(&key).unwrap().spawn(workload).unwrap();
+
+        let first = registry.stop(&handle).unwrap();
+        assert_eq!(first.version, NANO_STOP_RESULT_VERSION);
+        assert_eq!(first.outcome, NanoStopOutcome::Stopped);
+        let wire = serde_json::to_value(&first).unwrap();
+        assert_eq!(wire["version"], NANO_STOP_RESULT_VERSION);
+        assert_eq!(wire["outcome"], "stopped");
+        let replay = registry.stop(&handle).unwrap();
+        assert_eq!(replay.outcome, NanoStopOutcome::AlreadyStopped);
+
+        let wrong = NanoHandle {
+            runtime_key: "other-runtime".to_string(),
+            ..handle
+        };
+        assert!(registry.stop(&wrong).is_err());
     }
 }

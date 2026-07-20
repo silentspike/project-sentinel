@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Result};
 use sentinel_common::nano_runtime::{
-    NanoExecRequest, NanoExecResult, NanoHandle, NanoHealth, NanoHealthState, NanoIsolationPolicy,
-    NanoIsolationReport, NanoRuntime, NanoSnapshot, NanoSnapshotSemantics, NanoWorkloadSpec,
-    RUNTIME_MICROVM,
+    ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle, NanoHealth,
+    NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime, NanoSnapshot,
+    NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_MICROVM,
 };
 use serde::{Deserialize, Serialize};
 
@@ -142,12 +142,24 @@ impl MicrovmNanoRuntime {
         Ok(proc)
     }
 
-    fn teardown_workload(&mut self, workload_id: &str) {
+    fn remove_runtime_file(path: &Path) -> Result<bool> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn teardown_workload(&mut self, workload_id: &str) -> Result<bool> {
+        let mut stopped = false;
         if let Some(mut proc) = self.processes.remove(workload_id) {
+            stopped = true;
             proc.terminate();
         }
-        let _ = std::fs::remove_file(self.vsock_uds_path(workload_id));
-        self.workloads.remove(workload_id);
+        stopped |= Self::remove_runtime_file(&self.api_sock_path(workload_id))?;
+        stopped |= Self::remove_runtime_file(&self.vsock_uds_path(workload_id))?;
+        stopped |= self.workloads.remove(workload_id).is_some();
+        Ok(stopped)
     }
 }
 
@@ -159,9 +171,16 @@ impl Default for MicrovmNanoRuntime {
 
 impl Drop for MicrovmNanoRuntime {
     fn drop(&mut self) {
-        let ids: Vec<String> = self.processes.keys().cloned().collect();
+        let mut ids: Vec<String> = self
+            .processes
+            .keys()
+            .chain(self.workloads.keys())
+            .cloned()
+            .collect();
+        ids.sort();
+        ids.dedup();
         for id in ids {
-            self.teardown_workload(&id);
+            let _ = self.teardown_workload(&id);
         }
     }
 }
@@ -190,6 +209,15 @@ impl NanoRuntime for MicrovmNanoRuntime {
             agent_id: workload.agent_id,
             pid: Some(pid),
         })
+    }
+
+    fn stop(&mut self, handle: &NanoHandle) -> Result<NanoStopResult> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        Ok(NanoStopResult::new(
+            self.runtime_key(),
+            &handle.workload_id,
+            self.teardown_workload(&handle.workload_id)?,
+        ))
     }
 
     fn exec(&mut self, handle: &NanoHandle, request: NanoExecRequest) -> Result<NanoExecResult> {
@@ -271,7 +299,7 @@ impl NanoRuntime for MicrovmNanoRuntime {
         let payload: MicrovmSnapshotPayload = serde_json::from_value(snapshot.payload)?;
         firecracker::ensure_kvm_available()?;
 
-        self.teardown_workload(&snapshot.workload_id);
+        self.teardown_workload(&snapshot.workload_id)?;
         std::fs::create_dir_all(&self.config.work_dir)?;
 
         let sock = self.api_sock_path(&snapshot.workload_id);
@@ -299,6 +327,7 @@ impl NanoRuntime for MicrovmNanoRuntime {
     }
 
     fn health(&mut self, handle: &NanoHandle) -> Result<NanoHealth> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
         let sock = self.api_sock_path(&handle.workload_id);
         let running = self
             .processes
@@ -366,6 +395,40 @@ fn sanitize(id: &str) -> String {
 mod tests {
     use super::*;
 
+    fn fixture_workload(workload_id: &str, agent_id: u16) -> NanoWorkloadSpec {
+        NanoWorkloadSpec {
+            workload_id: workload_id.to_string(),
+            runtime_key: Some(RUNTIME_MICROVM.to_string()),
+            agent_id: Some(sentinel_common::AgentId(agent_id)),
+            agent_name: format!("Fixture {workload_id}"),
+            role: "Tester".to_string(),
+            room_id: "empfang".to_string(),
+            shift_set: 1,
+            command: Vec::new(),
+            capabilities: Vec::new(),
+            metadata: Default::default(),
+            ecs_snapshot: None,
+        }
+    }
+
+    fn insert_fixture(runtime: &mut MicrovmNanoRuntime, workload: NanoWorkloadSpec) -> NanoHandle {
+        let workload_id = workload.workload_id.clone();
+        let api_sock = runtime.api_sock_path(&workload_id);
+        let process = FirecrackerProcess::launch_fixture(&api_sock).unwrap();
+        let pid = process.pid();
+        std::fs::write(runtime.vsock_uds_path(&workload_id), b"fixture vsock").unwrap();
+        runtime
+            .workloads
+            .insert(workload_id.clone(), MicrovmWorkloadState { workload });
+        runtime.processes.insert(workload_id.clone(), process);
+        NanoHandle {
+            runtime_key: RUNTIME_MICROVM.to_string(),
+            workload_id,
+            agent_id: None,
+            pid: Some(pid),
+        }
+    }
+
     #[test]
     fn sanitize_makes_paths_safe() {
         assert_eq!(sanitize("ecs-world-migrate-123"), "ecs-world-migrate-123");
@@ -386,5 +449,50 @@ mod tests {
     fn runtime_key_is_microvm() {
         let rt = MicrovmNanoRuntime::detect();
         assert_eq!(rt.runtime_key(), RUNTIME_MICROVM);
+    }
+
+    #[test]
+    fn stop_fixture_reaps_process_removes_sockets_and_preserves_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = MicrovmConfig {
+            work_dir: temp.path().to_string_lossy().into_owned(),
+            ..MicrovmConfig::default()
+        };
+        let mut runtime = MicrovmNanoRuntime::with_config(config);
+        let handle_a = insert_fixture(&mut runtime, fixture_workload("fixture-a", 1));
+        let handle_b = insert_fixture(&mut runtime, fixture_workload("fixture-b", 2));
+        let snapshot_file = runtime
+            .snapshot_dir(&handle_a.workload_id)
+            .join("retained.state");
+        std::fs::create_dir_all(snapshot_file.parent().unwrap()).unwrap();
+        std::fs::write(&snapshot_file, b"retained snapshot").unwrap();
+
+        let stopped = runtime.stop(&handle_a).unwrap();
+        assert_eq!(
+            stopped.outcome,
+            sentinel_common::nano_runtime::NanoStopOutcome::Stopped
+        );
+        assert!(!Path::new(&format!("/proc/{}", handle_a.pid.unwrap())).exists());
+        assert!(!runtime.api_sock_path(&handle_a.workload_id).exists());
+        assert!(!runtime.vsock_uds_path(&handle_a.workload_id).exists());
+        assert!(snapshot_file.exists());
+        assert_eq!(
+            runtime.health(&handle_a).unwrap().state,
+            NanoHealthState::Stopped
+        );
+        assert!(matches!(
+            runtime.health(&handle_b).unwrap().state,
+            NanoHealthState::Healthy | NanoHealthState::Degraded
+        ));
+
+        let replay = runtime.stop(&handle_a).unwrap();
+        assert_eq!(
+            replay.outcome,
+            sentinel_common::nano_runtime::NanoStopOutcome::AlreadyStopped
+        );
+        assert_eq!(
+            runtime.stop(&handle_b).unwrap().outcome,
+            sentinel_common::nano_runtime::NanoStopOutcome::Stopped
+        );
     }
 }
