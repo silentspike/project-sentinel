@@ -2315,6 +2315,7 @@ mod config_apply_helper_tests {
             name: "Neuer Name".to_string(),
             role: "Neue Rolle".to_string(),
             department: "Dev".to_string(),
+            tier: None,
             shift_set: 1,
             kpis: vec![],
             reports_to: None,

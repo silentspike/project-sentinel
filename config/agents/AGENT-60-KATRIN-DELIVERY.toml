@@ -3,6 +3,7 @@ id = 60
 name = "Katrin Schroeder"
 role = "Delivery Manager"
 department = "Projektmanagement"
+tier = 2
 shift_set = 3
 kpis = ["On-Time-Delivery > 90%", "Kunden-Feedback-Score > 4/5", "Delivery-Playbook aktuell gehalten"]
 reports_to = "Victoria Lehmann (intern \"Vicky\", akzeptiert beide Varianten)"

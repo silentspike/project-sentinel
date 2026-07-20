@@ -31,8 +31,10 @@ type LLMRequest struct {
 	PreferredProvider  string            `json:"-"`
 	PassthroughHeaders map[string]string `json:"-"`
 	RequestClass       RequestClass      `json:"-"`
+	CallerRole         CallerRole        `json:"-"`
 	EffectiveModel     string            `json:"-"`
 	PolicySource       string            `json:"-"`
+	HierarchyTier      int               `json:"-"`
 	// ProviderTimeout applies only to the real provider execution, not queue wait.
 	ProviderTimeout time.Duration `json:"-"`
 }
@@ -74,6 +76,9 @@ type LLMResponse struct {
 	CacheRead     int               `json:"cache_read"`
 	CacheCreation int               `json:"cache_creation"`
 	FinishReason  string            `json:"finish_reason"`
+	// ReportedCostUSD preserves presence separately from value so a provider-
+	// reported zero remains authoritative.
+	ReportedCostUSD *float64 `json:"-"`
 }
 
 // Provider interface for LLM backends.
@@ -81,6 +86,14 @@ type Provider interface {
 	Name() string
 	Send(ctx context.Context, req *LLMRequest) (*LLMResponse, error)
 	HealthCheck(ctx context.Context) error
+}
+
+// ModelInventoryProvider is an optional, token-free capability for providers
+// that can report the model IDs installed at the configured endpoint. The
+// immutable startup catalog remains authoritative; inventory is validation
+// input only.
+type ModelInventoryProvider interface {
+	ModelInventory(ctx context.Context) ([]string, error)
 }
 
 // StreamingProvider is an optional provider capability for relaying HTTP

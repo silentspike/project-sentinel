@@ -43,6 +43,48 @@ use crate::config::DaemonConfig;
 use crate::controlplane::config::ControlplaneConfig;
 use crate::controlplane::store::ControlplaneStore;
 use crate::controlplane::ControlplaneKernel;
+
+#[cfg(feature = "llm")]
+fn read_required_credential(env_name: &str) -> Result<String> {
+    let path = std::env::var(env_name).with_context(|| format!("{env_name} is required"))?;
+    read_credential_file(&path, env_name)
+}
+
+#[cfg(feature = "llm")]
+fn read_credential_file(path: &str, env_name: &str) -> Result<String> {
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("stat credential file from {env_name}"))?;
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "credential file from {env_name} must be a regular file"
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(anyhow!(
+                "credential file from {env_name} must be owner-only"
+            ));
+        }
+    }
+    let mut credential = std::fs::read_to_string(path)
+        .with_context(|| format!("read credential file from {env_name}"))?;
+    if credential.ends_with("\r\n") {
+        credential.truncate(credential.len() - 2);
+    } else if credential.ends_with('\n') {
+        credential.pop();
+    }
+    if credential.is_empty() {
+        return Err(anyhow!("credential file from {env_name} is empty"));
+    }
+    if credential.trim() != credential {
+        return Err(anyhow!(
+            "credential file from {env_name} contains surrounding whitespace"
+        ));
+    }
+    Ok(credential)
+}
 use crate::episode_producer::EpisodeProducer;
 use crate::evolution_task::{EvolutionJob, EvolutionResult, EvolutionSource};
 use crate::operator_api;
@@ -989,6 +1031,8 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let agent_validation = config.agent_config_validation()?;
     let all_agents = load_all_agents_with_validation(&agents_dir, agent_validation)
         .with_context(|| format!("Agents laden aus: {}", agents_dir.display()))?;
+    #[cfg(feature = "llm")]
+    crate::llm_bridge::bridge::replace_agent_routing(&all_agents);
     info!(
         total_agents = all_agents.len(),
         "Agent-Definitionen geladen"
@@ -1475,8 +1519,14 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let (provision_tx, provision_rx) = mpsc::channel::<sentinel_common::OperatorProvisionCommand>();
     let (prune_tx, prune_rx) = mpsc::channel::<i64>();
     let (evolution_result_tx, evolution_result_rx) = mpsc::channel::<EvolutionResult>();
+    let mut evolution_config = crate::evolution_task::EvolutionTaskConfig::from_env();
+    #[cfg(feature = "llm")]
+    {
+        evolution_config.credential =
+            read_required_credential("SENTINEL_EVOLUTION_CREDENTIAL_FILE")?;
+    }
     let evolution_job_tx = crate::evolution_task::spawn_evolution_background_task(
-        crate::evolution_task::EvolutionTaskConfig::from_env(),
+        evolution_config,
         evolution_result_tx,
     );
     info!("Evolution Background-Task initialisiert");
@@ -1709,11 +1759,12 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     let platform_llm_analyzer = {
         let gateway_url =
             std::env::var("CORTEX_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8080".into());
-        let analyzer_config =
+        let mut analyzer_config =
             crate::platform_controlplane::llm_analyzer::LlmAnalyzerConfig::from_platform_config(
                 &config.platform_controlplane,
                 gateway_url,
             );
+        analyzer_config.credential = read_required_credential("SENTINEL_PLATFORM_CREDENTIAL_FILE")?;
         let handle = crate::platform_controlplane::llm_analyzer::PlatformLlmAnalyzerHandle::spawn(
             analyzer_config,
             Arc::clone(&event_store),
@@ -1894,6 +1945,9 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
                 .unwrap_or_else(|_| "http://localhost:8080".to_string()),
             max_concurrent: config.traffic_control.max_forward_concurrency.max(1),
             request_timeout: std::time::Duration::from_millis(gateway_request_timeout_ms),
+            credential: read_required_credential("SENTINEL_AGENT_RUNTIME_CREDENTIAL_FILE")?,
+            usage_v2_enabled: std::env::var("SENTINEL_LLM_USAGE_V2_ENABLED")
+                .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
             ..Default::default()
         };
         let bridge_telemetry =
@@ -7144,6 +7198,8 @@ fn ecs_tick_loop(
                 .collect();
             all_agents = apply_cmd.agents.clone();
             all_agents.extend(deferred_configs);
+            #[cfg(feature = "llm")]
+            crate::llm_bridge::bridge::replace_agent_routing(&all_agents);
 
             // 5. ConfigApplied-DomainEvent (Audit + durabler Trigger fuer Gateway-DNA-Reload #440).
             let payload = DomainEventPayload::ConfigApplied {
@@ -7484,6 +7540,23 @@ mod tests {
     use std::sync::Arc;
 
     static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(all(unix, feature = "llm"))]
+    #[test]
+    fn credential_file_requires_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("caller-token");
+        std::fs::write(&path, "agent-token\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_credential_file(path.to_str().unwrap(), "TEST_CREDENTIAL_FILE").unwrap(),
+            "agent-token"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(read_credential_file(path.to_str().unwrap(), "TEST_CREDENTIAL_FILE").is_err());
+    }
 
     #[test]
     fn world_background_work_runs_only_for_the_routable_world_owner() {
@@ -7966,6 +8039,7 @@ mod tests {
                 name: name.to_string(),
                 role: role.to_string(),
                 department: "Test".to_string(),
+                tier: None,
                 shift_set,
                 kpis: Vec::new(),
                 reports_to: None,

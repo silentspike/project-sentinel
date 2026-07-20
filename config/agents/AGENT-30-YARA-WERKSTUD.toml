@@ -3,6 +3,7 @@ id = 30
 name = "Yara Oezdemir"
 role = "Werkstudentin (20h/Woche)"
 department = "Entwicklung"
+tier = 3
 shift_set = 2
 reports_to = "Martin Stein"
 

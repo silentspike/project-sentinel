@@ -112,6 +112,32 @@ CREATE TABLE IF NOT EXISTS cost_by_tier (
     updated_at INTEGER NOT NULL
 )";
 
+// #395: additive organization-hierarchy aggregation. This table is maintained
+// by an independent event-store offset and never changes cost_by_tier semantics.
+const CREATE_COST_BY_HIERARCHY_TIER: &str = "
+CREATE TABLE IF NOT EXISTS cost_by_hierarchy_tier (
+    hierarchy_tier TEXT PRIMARY KEY,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read INTEGER NOT NULL DEFAULT 0,
+    cache_creation INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0.0,
+    call_count INTEGER NOT NULL DEFAULT 0,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+)";
+
+const CREATE_COST_HIERARCHY_PROJECTION_META: &str = "
+CREATE TABLE IF NOT EXISTS cost_hierarchy_projection_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    first_v2_event_id INTEGER,
+    last_usage_event_id INTEGER NOT NULL DEFAULT 0,
+    last_hierarchy_event_id INTEGER NOT NULL DEFAULT 0,
+    unattributed_v1_usage_events INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO cost_hierarchy_projection_meta (id) VALUES (1)";
+
 const CREATE_COST_TIMESERIES: &str = "
 CREATE TABLE IF NOT EXISTS cost_timeseries (
     bucket_start INTEGER PRIMARY KEY,
@@ -150,6 +176,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_live_view_last_event_id ON agent_live_view(
 CREATE INDEX IF NOT EXISTS idx_room_live_view_last_event_id ON room_live_view(last_event_id);
 CREATE INDEX IF NOT EXISTS idx_kpi_1m_last_event_id ON kpi_1m(last_event_id);
 CREATE INDEX IF NOT EXISTS idx_cost_by_agent_last_event_id ON cost_by_agent(last_event_id);
+CREATE INDEX IF NOT EXISTS idx_cost_by_hierarchy_tier_last_event_id ON cost_by_hierarchy_tier(last_event_id);
 ";
 
 const PROJECTION_NAME: &str = "sentinel-projection";
@@ -179,6 +206,8 @@ impl ReadModelStore {
         conn.execute_batch(CREATE_KPI_1M)?;
         conn.execute_batch(CREATE_COST_BY_AGENT)?;
         conn.execute_batch(CREATE_COST_BY_TIER)?;
+        conn.execute_batch(CREATE_COST_BY_HIERARCHY_TIER)?;
+        conn.execute_batch(CREATE_COST_HIERARCHY_PROJECTION_META)?;
         conn.execute_batch(CREATE_COST_TIMESERIES)?;
         conn.execute_batch(CREATE_TASK_KANBAN)?;
         conn.execute_batch(CREATE_PROJECTION_WATERMARKS)?;
@@ -324,6 +353,14 @@ impl ReadModelStore {
              DELETE FROM kpi_1m;
              DELETE FROM cost_by_agent;
              DELETE FROM cost_by_tier;
+             DELETE FROM cost_by_hierarchy_tier;
+             UPDATE cost_hierarchy_projection_meta SET
+               first_v2_event_id = NULL,
+               last_usage_event_id = 0,
+               last_hierarchy_event_id = 0,
+               unattributed_v1_usage_events = 0,
+               updated_at = 0
+             WHERE id = 1;
              DELETE FROM cost_timeseries;
              DELETE FROM projection_watermarks;",
         )?;
@@ -515,6 +552,14 @@ pub struct CostRow {
     pub call_count: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HierarchyProjectionMeta {
+    pub first_v2_event_id: Option<i64>,
+    pub last_usage_event_id: i64,
+    pub last_hierarchy_event_id: i64,
+    pub unattributed_v1_usage_events: i64,
+}
+
 impl ReadModelStore {
     fn read_cost_table(&self, table: &str, key_col: &str) -> anyhow::Result<Vec<CostRow>> {
         let conn = self
@@ -552,6 +597,33 @@ impl ReadModelStore {
     /// Kosten/Tokens aggregiert pro Model-Tier.
     pub fn cost_by_tier(&self) -> anyhow::Result<Vec<CostRow>> {
         self.read_cost_table("cost_by_tier", "tier")
+    }
+
+    /// Kosten/Tokens aggregiert pro explizitem Organisationstier. Legacy-v1
+    /// usage events are coverage-only and never enter this table.
+    pub fn cost_by_hierarchy_tier(&self) -> anyhow::Result<Vec<CostRow>> {
+        self.read_cost_table("cost_by_hierarchy_tier", "hierarchy_tier")
+    }
+
+    pub fn hierarchy_projection_meta(&self) -> anyhow::Result<HierarchyProjectionMeta> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        conn.query_row(
+            "SELECT first_v2_event_id,last_usage_event_id,last_hierarchy_event_id,\
+             unattributed_v1_usage_events FROM cost_hierarchy_projection_meta WHERE id = 1",
+            [],
+            |row| {
+                Ok(HierarchyProjectionMeta {
+                    first_v2_event_id: row.get(0)?,
+                    last_usage_event_id: row.get(1)?,
+                    last_hierarchy_event_id: row.get(2)?,
+                    unattributed_v1_usage_events: row.get(3)?,
+                })
+            },
+        )
+        .map_err(Into::into)
     }
 
     /// Kosten/Tokens als Minuten-Zeitreihe (aufsteigend nach Bucket-Start).
@@ -1095,6 +1167,51 @@ impl<'a> ReadModelTransaction<'a> {
         )?;
         Ok(())
     }
+
+    /// #395: independently aggregates one usage event by organization hierarchy.
+    pub fn record_hierarchy_cost(
+        &self,
+        u: &LlmHierarchyCostUpdate<'_>,
+        row_id: i64,
+    ) -> anyhow::Result<()> {
+        self.guard.execute(
+            &cost_upsert_sql("cost_by_hierarchy_tier", "hierarchy_tier"),
+            params![
+                u.hierarchy_tier,
+                u.input_tokens,
+                u.output_tokens,
+                u.cache_read,
+                u.cache_creation,
+                u.cost_usd,
+                row_id,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Records coverage for each usage event exactly once. V1 usage is counted
+    /// as unattributed but is never inserted into the hierarchy aggregate.
+    pub fn record_hierarchy_usage_meta(
+        &self,
+        row_id: i64,
+        attributed_v2: bool,
+    ) -> anyhow::Result<()> {
+        self.guard.execute(
+            "UPDATE cost_hierarchy_projection_meta SET
+               first_v2_event_id = CASE
+                 WHEN ?2 THEN COALESCE(first_v2_event_id, ?1)
+                 ELSE first_v2_event_id
+               END,
+               last_usage_event_id = ?1,
+               last_hierarchy_event_id = CASE WHEN ?2 THEN ?1 ELSE last_hierarchy_event_id END,
+               unattributed_v1_usage_events = unattributed_v1_usage_events + CASE WHEN ?2 THEN 0 ELSE 1 END,
+               updated_at = ?3
+             WHERE id = 1 AND ?1 > last_usage_event_id",
+            params![row_id, attributed_v2, now_ms()],
+        )?;
+        Ok(())
+    }
 }
 
 /// #427: Aggregations-Eingabe fuer einen einzelnen LLM-Call (cache-aware).
@@ -1107,6 +1224,16 @@ pub struct LlmCostUpdate<'a> {
     pub cache_creation: u32,
     pub cost_usd: f64,
     pub bucket_ms: u64,
+}
+
+/// #395: aggregation input for the independent hierarchy projection.
+pub struct LlmHierarchyCostUpdate<'a> {
+    pub hierarchy_tier: &'a str,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_read: u32,
+    pub cache_creation: u32,
+    pub cost_usd: f64,
 }
 
 /// Baut das idempotente Cost-Upsert-SQL fuer eine der drei Cost-Tabellen. Die

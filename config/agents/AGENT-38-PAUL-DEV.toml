@@ -3,6 +3,7 @@ id = 38
 name = "Paul Zimmermann"
 role = "Junior Full-Stack / DevOps"
 department = "Entwicklung"
+tier = 3
 shift_set = 3
 reports_to = "Kevin Schmidt"
 

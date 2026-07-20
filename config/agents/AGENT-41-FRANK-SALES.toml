@@ -3,6 +3,7 @@ id = 41
 name = "Frank Berger"
 role = "Head of Sales"
 department = "Vertrieb"
+tier = 2
 shift_set = 3
 kpis = ["Neukundengewinnung > 2 pro Quartal", "Angebotsvolumen > 400k EUR/Quartal", "Kundenbindung > 60%"]
 reports_to = "Sandra Vogel"

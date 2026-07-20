@@ -1,5 +1,6 @@
 # Cortex Gateway Configuration
-# Environment variables override these values
+# Provider/model catalog values are immutable for the process lifetime.
+# Environment variables may supply credentials and transport endpoints only.
 
 [server]
 proxy_port = 8080
@@ -10,15 +11,50 @@ write_timeout_seconds = 60
 [providers.claude-code]
 type = "claude-code"
 binary = "claude"
-model = "claude-opus-4-6"
+default_model = "claude-sonnet-5"
+allowed_models = ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001"]
 priority = 1
+
+[providers.claude-code.hierarchy_models]
+tier_1 = "claude-opus-4-8"
+tier_2 = "claude-sonnet-5"
+tier_3 = "claude-haiku-4-5-20251001"
+
+[providers.anthropic-direct]
+type = "anthropic-direct"
+base_url = "https://api.anthropic.com"
+default_model = "claude-sonnet-5"
+allowed_models = ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001"]
+priority = 2
+
+[providers.anthropic-direct.hierarchy_models]
+tier_1 = "claude-opus-4-8"
+tier_2 = "claude-sonnet-5"
+tier_3 = "claude-haiku-4-5-20251001"
 
 [providers.ollama]
 type = "ollama"
 base_url = "http://localhost:11434"
-model = "qwen3:7b"
+default_model = "qwen3:8b"
+allowed_models = ["qwen3:14b", "qwen3:8b", "qwen3:4b-instruct"]
 max_tokens = 4096
-priority = 2
+priority = 3
+
+[providers.ollama.hierarchy_models]
+tier_1 = "qwen3:14b"
+tier_2 = "qwen3:8b"
+tier_3 = "qwen3:4b-instruct"
+
+[providers.local-loop]
+type = "local-loop"
+default_model = "local-loop-tier2"
+allowed_models = ["local-loop-tier1", "local-loop-tier2", "local-loop-tier3"]
+priority = 4
+
+[providers.local-loop.hierarchy_models]
+tier_1 = "local-loop-tier1"
+tier_2 = "local-loop-tier2"
+tier_3 = "local-loop-tier3"
 
 [pipeline]
 temperature = 0.7

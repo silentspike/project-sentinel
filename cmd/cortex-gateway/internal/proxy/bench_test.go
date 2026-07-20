@@ -188,18 +188,19 @@ func BenchmarkAnthropicDirectRequestAssembly(b *testing.B) {
 }
 
 func BenchmarkClassifyRequestAgentRuntime(b *testing.B) {
-	req := &LLMRequest{Metadata: map[string]string{
-		"agent_id":   "12",
-		"agent_name": "Thomas Mueller",
-		"room_id":    "buero-ceo",
-	}}
-
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if got := ClassifyRequest("/internal/llm", req); got != RequestClassAgentRuntime {
-			b.Fatalf("ClassifyRequest() = %q, want %q", got, RequestClassAgentRuntime)
+		req := &LLMRequest{Metadata: map[string]string{
+			"agent_id":       "12",
+			"agent_name":     "Thomas Mueller",
+			"hierarchy_tier": "2",
+			"room_id":        "buero-ceo",
+		}}
+		got, err := ClassifyRequest("/internal/agent-runtime", req, CallerRoleAgentRuntime)
+		if err != nil || got != RequestClassAgentRuntime || req.HierarchyTier != 2 {
+			b.Fatalf("ClassifyRequest() = %q/tier=%d/error=%v", got, req.HierarchyTier, err)
 		}
 	}
 }

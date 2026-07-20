@@ -14,7 +14,8 @@ mod kani;
 pub mod outbox_publisher;
 
 pub use event_store::{
-    EventStore, MonotonicityError, OutboxEntry, OutboxTransport, SnapshotRow, IMMUTABLE_SNAPSHOT_MS,
+    EventStore, LlmCompletionEntry, MonotonicityError, OutboxEntry, OutboxTransport, SnapshotRow,
+    IMMUTABLE_SNAPSHOT_MS,
 };
 pub use outbox_publisher::{OutboxPublisher, OutboxPublisherConfig, PublishCycleStats};
 

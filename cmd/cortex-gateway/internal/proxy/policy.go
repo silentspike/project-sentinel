@@ -21,33 +21,8 @@ const (
 	PolicySourceProviderDefault = "provider_default"
 	PolicySourceRequestOverride = "request_override"
 	PolicySourceAgentRuntime    = "agent_runtime_policy"
+	PolicySourceHierarchyTier   = "hierarchy_tier"
 )
-
-func ClassifyRequest(path string, req *LLMRequest) RequestClass {
-	if isAnthropicMessagesPath(path) {
-		return RequestClassExternalCompat
-	}
-	if req == nil {
-		return RequestClassInternalOther
-	}
-
-	metadata := req.Metadata
-	agentName := strings.TrimSpace(metadata["agent_name"])
-	if strings.EqualFold(strings.TrimSpace(metadata["platform_analysis"]), "true") ||
-		strings.EqualFold(agentName, "PLATFORM-CONTROLPLANE") {
-		return RequestClassPlatformControlplane
-	}
-
-	if strings.TrimSpace(metadata["request_type"]) != "" || isServiceIdentity(agentName) {
-		return RequestClassServiceInternal
-	}
-
-	if isPositiveNumericAgentID(metadata["agent_id"]) {
-		return RequestClassAgentRuntime
-	}
-
-	return RequestClassInternalOther
-}
 
 type ModelPolicyResolution struct {
 	Model  string
@@ -96,15 +71,6 @@ func resolveAgentRuntimePolicyModel(providerName, policy string) (string, error)
 		}
 	default:
 		return "", fmt.Errorf("unknown agent_runtime_model_policy %q", policy)
-	}
-}
-
-func isServiceIdentity(agentName string) bool {
-	switch strings.ToLower(strings.TrimSpace(agentName)) {
-	case "sentinel-judge":
-		return true
-	default:
-		return false
 	}
 }
 

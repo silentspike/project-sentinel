@@ -3,6 +3,7 @@ id = 14
 name = "Florian Braun"
 role = "Systemadministrator"
 department = "Verwaltung"
+tier = 3
 shift_set = 1
 kpis = ["Systemverfuegbarkeit > 99.5%", "Ticket-Reaktionszeit < 2h", "Backup-Erfolgsrate 100%"]
 reports_to = "Petra Zimmermann"

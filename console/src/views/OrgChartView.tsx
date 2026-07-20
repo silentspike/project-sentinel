@@ -4,7 +4,7 @@ import { openPanel } from "../tiling/engine";
 import { setSelectedAgentId } from "../state/selection";
 
 // #424: read-only Org Chart — the company hierarchy (department -> role -> agent) built from the
-// agent configs (GET /api/config/agents, #420), with the model tier per node. Read-first; clicking
+// agent configs (GET /api/config/agents, #420), with the hierarchy tier per node. Read-first; clicking
 // an agent jumps to the Agent Editor (#422), pre-selected via the shared selectedAgentId signal
 // (reports_to/direct_reports are shown as node metadata; the primary tree axis is dept->role->agent).
 
@@ -43,10 +43,10 @@ export function buildOrgTree(agents: AgentConfig[]): DeptGroup[] {
     });
 }
 
-/** Model tier (#395 read-only raw): null/empty -> "—" (never guessed/mapped). */
+/** Organization hierarchy tier: legacy omission -> "—" (never guessed/mapped). */
 function tierOf(a: AgentConfig): string {
-  const t = a.runtime?.nano_runtime;
-  return t && t.trim() !== "" ? t : "—";
+  const t = a.identity.tier;
+  return t === 1 || t === 2 || t === 3 ? String(t) : "—";
 }
 
 /** reports_to / direct_reports as a compact node-metadata hint. */
@@ -60,13 +60,18 @@ function reportingHint(a: AgentConfig): string {
 
 export function OrgChartView(): JSX.Element {
   const [agents, setAgents] = createSignal<AgentConfig[]>([]);
+  const [loading, setLoading] = createSignal(true);
+  const [loadError, setLoadError] = createSignal<string | null>(null);
 
   async function load(): Promise<void> {
     try {
       const v = await apiJson<AgentConfig[]>("/api/config/agents");
       if (Array.isArray(v)) setAgents(v);
-    } catch {
-      /* keep last good data on a transient read error */
+      setLoadError(null);
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : "Org Chart konnte nicht geladen werden");
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -90,10 +95,21 @@ export function OrgChartView(): JSX.Element {
       <h3 style={{ margin: "0 0 4px" }}>Org Chart — {agents().length} Agents</h3>
       <p class="muted" style={{ "margin-top": 0, "font-size": "12px" }}>
         Hierarchie aus den Agent-Configs (Abteilung → Rolle → Agent). Klick auf einen Agent öffnet den
-        Agent-Editor. Tier = nano_runtime (read-only bis #395).
+        Agent Editor. Hierarchy tier is read from identity.tier; nano_runtime remains separate.
       </p>
-      <Show when={agents().length > 0} fallback={<p class="muted">Keine Agent-Configs geladen.</p>}>
-        <For each={buildOrgTree(agents())}>
+      <Show
+        when={!loading()}
+        fallback={<p class="muted" data-testid="org-loading">Agent-Configs werden geladen.</p>}
+      >
+        <Show
+          when={!loadError()}
+          fallback={<p class="degraded-panel" data-testid="org-error" role="alert">{loadError()}</p>}
+        >
+          <Show
+            when={agents().length > 0}
+            fallback={<p class="muted" data-testid="org-empty">Keine Agent-Configs geladen.</p>}
+          >
+            <For each={buildOrgTree(agents())}>
           {(dept) => (
             <section data-testid="org-dept" class="control-card" style={{ padding: "8px" }}>
               <div style={{ "font-weight": "600", "margin-bottom": "4px" }}>
@@ -108,19 +124,26 @@ export function OrgChartView(): JSX.Element {
                     </div>
                     <For each={roleGroup.agents}>
                       {(a) => (
-                        <div
+                        <button
+                          type="button"
                           data-testid="org-agent-node"
                           onClick={() => openAgent(a)}
                           title="Im Agent-Editor öffnen"
+                          aria-label={`${a.identity.name} im Agent-Editor öffnen, hierarchy tier ${tierOf(a)}`}
                           style={{
                             "margin-left": "12px",
                             display: "grid",
-                            "grid-template-columns": "1fr 130px",
+                            "grid-template-columns": "minmax(0, 1fr) auto",
                             gap: "8px",
                             cursor: "pointer",
                             padding: "2px 4px",
                             "border-radius": "4px",
                             "font-size": "13px",
+                            width: "100%",
+                            border: "0",
+                            background: "transparent",
+                            color: "inherit",
+                            "text-align": "left",
                           }}
                         >
                           <span>
@@ -129,10 +152,15 @@ export function OrgChartView(): JSX.Element {
                               {reportingHint(a)}
                             </span>
                           </span>
-                          <span data-testid="org-tier" class="muted" style={{ "font-family": "monospace" }}>
-                            tier: {tierOf(a)}
+                          <span
+                            data-testid="org-tier"
+                            aria-label={`Organization hierarchy tier ${tierOf(a)}`}
+                            class="muted"
+                            style={{ "font-family": "monospace" }}
+                          >
+                            hierarchy tier: {tierOf(a)}
                           </span>
-                        </div>
+                        </button>
                       )}
                     </For>
                   </div>
@@ -140,7 +168,9 @@ export function OrgChartView(): JSX.Element {
               </For>
             </section>
           )}
-        </For>
+            </For>
+          </Show>
+        </Show>
       </Show>
     </div>
   );

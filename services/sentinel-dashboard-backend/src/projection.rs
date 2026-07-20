@@ -269,13 +269,73 @@ fn cost_table_rows(
     })
 }
 
+fn missing_projection_schema(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(_, Some(message)) if message.contains("no such table")
+    )
+}
+
+fn hierarchy_coverage(db_path: &str) -> Result<Value, rusqlite::Error> {
+    let conn = open_ro(db_path)?;
+    conn.query_row(
+        "SELECT first_v2_event_id,last_usage_event_id,last_hierarchy_event_id,\
+         unattributed_v1_usage_events,\
+         COALESCE((SELECT last_event_id FROM projection_watermarks \
+                   WHERE projection_name='sentinel-projection-cost-hierarchy-v2'),0),\
+         COALESCE((SELECT last_event_id FROM projection_watermarks \
+                   WHERE projection_name='sentinel-projection'),0) \
+         FROM cost_hierarchy_projection_meta WHERE id=1",
+        [],
+        |row| {
+            Ok(json!({
+                "first_v2_event_id": row.get::<_, Option<i64>>(0)?,
+                "last_usage_event_id": row.get::<_, i64>(1)?,
+                "last_hierarchy_event_id": row.get::<_, i64>(2)?,
+                "unattributed_v1_usage_events": row.get::<_, i64>(3)?,
+                "hierarchy_projection_offset": row.get::<_, i64>(4)?,
+                "global_projection_offset": row.get::<_, i64>(5)?,
+            }))
+        },
+    )
+}
+
+fn empty_hierarchy_coverage() -> Value {
+    json!({
+        "first_v2_event_id": null,
+        "last_usage_event_id": 0,
+        "last_hierarchy_event_id": 0,
+        "unattributed_v1_usage_events": 0,
+        "hierarchy_projection_offset": 0,
+        "global_projection_offset": 0,
+    })
+}
+
 /// #427: cache-aware Kosten/Tokens pro Agent + Tier + Minuten-Zeitreihe, gelesen aus der
 /// CostHandler-Projektion (1:n — die Cost-Info lebt EINMAL als AgentLlmUsage-Event-Sequenz,
 /// das Dashboard liest nur diese materialisierte Sicht; KEIN eigener Sample-Puffer).
 pub fn cost_rows(db_path: &str) -> Result<Value, rusqlite::Error> {
+    let hierarchy_rows = match cost_table_rows(db_path, "cost_by_hierarchy_tier", "hierarchy_tier")
+    {
+        Ok(rows) => rows,
+        Err(error) if missing_projection_schema(&error) => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let attributed_calls = hierarchy_rows
+        .iter()
+        .filter_map(|row| row["call_count"].as_i64())
+        .sum::<i64>();
+    let mut coverage = match hierarchy_coverage(db_path) {
+        Ok(value) => value,
+        Err(error) if missing_projection_schema(&error) => empty_hierarchy_coverage(),
+        Err(error) => return Err(error),
+    };
+    coverage["attributed_calls"] = json!(attributed_calls);
     Ok(json!({
         "by_agent": cost_table_rows(db_path, "cost_by_agent", "agent_id")?,
         "by_tier": cost_table_rows(db_path, "cost_by_tier", "tier")?,
+        "by_hierarchy_tier": hierarchy_rows,
+        "hierarchy_coverage": coverage,
         "time_series": cost_table_rows(db_path, "cost_timeseries", "bucket_start")?,
     }))
 }
@@ -292,6 +352,16 @@ pub async fn cost(State(st): State<AppState>) -> Response {
             Json(json!({
                 "by_agent": [],
                 "by_tier": [],
+                "by_hierarchy_tier": [],
+                "hierarchy_coverage": {
+                    "attributed_calls": 0,
+                    "first_v2_event_id": null,
+                    "last_usage_event_id": 0,
+                    "last_hierarchy_event_id": 0,
+                    "unattributed_v1_usage_events": 0,
+                    "hierarchy_projection_offset": 0,
+                    "global_projection_offset": 0,
+                },
                 "time_series": [],
                 "projection": "offline",
             }))
@@ -423,11 +493,22 @@ mod tests {
                  CREATE TABLE cost_by_tier (tier TEXT PRIMARY KEY,input_tokens INTEGER NOT NULL,\
                  output_tokens INTEGER NOT NULL,cache_read INTEGER NOT NULL,cache_creation INTEGER NOT NULL,\
                  cost_usd REAL NOT NULL,call_count INTEGER NOT NULL,last_event_id INTEGER NOT NULL,updated_at INTEGER NOT NULL);\
+                 CREATE TABLE cost_by_hierarchy_tier (hierarchy_tier TEXT PRIMARY KEY,input_tokens INTEGER NOT NULL,\
+                 output_tokens INTEGER NOT NULL,cache_read INTEGER NOT NULL,cache_creation INTEGER NOT NULL,\
+                 cost_usd REAL NOT NULL,call_count INTEGER NOT NULL,last_event_id INTEGER NOT NULL,updated_at INTEGER NOT NULL);\
+                 CREATE TABLE cost_hierarchy_projection_meta (id INTEGER PRIMARY KEY,first_v2_event_id INTEGER,\
+                 last_usage_event_id INTEGER NOT NULL,last_hierarchy_event_id INTEGER NOT NULL,\
+                 unattributed_v1_usage_events INTEGER NOT NULL,updated_at INTEGER NOT NULL);\
+                 CREATE TABLE projection_watermarks (projection_name TEXT PRIMARY KEY,last_event_id INTEGER NOT NULL,updated_at INTEGER NOT NULL);\
                  CREATE TABLE cost_timeseries (bucket_start INTEGER PRIMARY KEY,input_tokens INTEGER NOT NULL,\
                  output_tokens INTEGER NOT NULL,cache_read INTEGER NOT NULL,cache_creation INTEGER NOT NULL,\
                  cost_usd REAL NOT NULL,call_count INTEGER NOT NULL,last_event_id INTEGER NOT NULL,updated_at INTEGER NOT NULL);\
                  INSERT INTO cost_by_agent VALUES ('AGENT-08',1300,600,200,100,0.025,2,9,100);\
                  INSERT INTO cost_by_tier VALUES ('high',1300,600,200,100,0.025,2,9,100);\
+                 INSERT INTO cost_by_hierarchy_tier VALUES ('2',1300,600,200,100,0.025,2,9,100);\
+                 INSERT INTO cost_hierarchy_projection_meta VALUES (1,4,10,9,1,100);\
+                 INSERT INTO projection_watermarks VALUES ('sentinel-projection',12,100);\
+                 INSERT INTO projection_watermarks VALUES ('sentinel-projection-cost-hierarchy-v2',11,100);\
                  INSERT INTO cost_timeseries VALUES (0,1300,600,200,100,0.025,2,9,100);",
             )
             .unwrap();
@@ -439,8 +520,52 @@ mod tests {
         assert_eq!(v["by_agent"][0]["cache_read"], 200);
         assert_eq!(v["by_agent"][0]["call_count"], 2);
         assert_eq!(v["by_tier"][0]["key"], "high");
+        assert_eq!(v["by_hierarchy_tier"][0]["key"], "2");
+        assert_eq!(v["hierarchy_coverage"]["attributed_calls"], 2);
+        assert_eq!(v["hierarchy_coverage"]["unattributed_v1_usage_events"], 1);
+        assert_eq!(v["hierarchy_coverage"]["first_v2_event_id"], 4);
+        assert_eq!(v["hierarchy_coverage"]["hierarchy_projection_offset"], 11);
+        assert_eq!(v["hierarchy_coverage"]["global_projection_offset"], 12);
         assert_eq!(v["time_series"][0]["key"], "0");
         assert_eq!(v["time_series"][0]["cache_creation"], 100);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cost_rows_keeps_legacy_cost_data_when_hierarchy_schema_is_absent() {
+        let dir = std::env::temp_dir().join(format!("pdb-cost-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("projection.db");
+        {
+            let c = Connection::open(&db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE cost_by_agent (agent_id TEXT PRIMARY KEY,input_tokens INTEGER NOT NULL,\
+                 output_tokens INTEGER NOT NULL,cache_read INTEGER NOT NULL,cache_creation INTEGER NOT NULL,\
+                 cost_usd REAL NOT NULL,call_count INTEGER NOT NULL,last_event_id INTEGER NOT NULL,updated_at INTEGER NOT NULL);\
+                 CREATE TABLE cost_by_tier (tier TEXT PRIMARY KEY,input_tokens INTEGER NOT NULL,\
+                 output_tokens INTEGER NOT NULL,cache_read INTEGER NOT NULL,cache_creation INTEGER NOT NULL,\
+                 cost_usd REAL NOT NULL,call_count INTEGER NOT NULL,last_event_id INTEGER NOT NULL,updated_at INTEGER NOT NULL);\
+                 CREATE TABLE cost_timeseries (bucket_start INTEGER PRIMARY KEY,input_tokens INTEGER NOT NULL,\
+                 output_tokens INTEGER NOT NULL,cache_read INTEGER NOT NULL,cache_creation INTEGER NOT NULL,\
+                 cost_usd REAL NOT NULL,call_count INTEGER NOT NULL,last_event_id INTEGER NOT NULL,updated_at INTEGER NOT NULL);\
+                 INSERT INTO cost_by_agent VALUES ('AGENT-08',1,2,0,0,0.0,1,3,100);\
+                 INSERT INTO cost_by_tier VALUES ('low',1,2,0,0,0.0,1,3,100);\
+                 INSERT INTO cost_timeseries VALUES (0,1,2,0,0,0.0,1,3,100);",
+            )
+            .unwrap();
+        }
+
+        let value = cost_rows(db.to_str().unwrap()).unwrap();
+        assert_eq!(value["by_agent"][0]["key"], "AGENT-08");
+        assert_eq!(value["by_hierarchy_tier"], json!([]));
+        assert_eq!(
+            value["hierarchy_coverage"]["first_v2_event_id"],
+            Value::Null
+        );
+        assert_eq!(
+            value["hierarchy_coverage"]["hierarchy_projection_offset"],
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

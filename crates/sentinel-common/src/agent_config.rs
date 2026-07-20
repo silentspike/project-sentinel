@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 use crate::{AgentId, AgentIdBounds};
 
@@ -47,6 +47,12 @@ pub struct IdentityConfig {
     pub name: String,
     pub role: String,
     pub department: String,
+    /// Explicit organization hierarchy class used for model routing.
+    ///
+    /// Missing remains accepted for legacy documents. Current repository and
+    /// Gaia-generated agents always materialize a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<HierarchyTier>,
     pub shift_set: u8,
     #[serde(default)]
     pub kpis: Vec<String>,
@@ -54,6 +60,85 @@ pub struct IdentityConfig {
     pub reports_to: Option<String>,
     #[serde(default)]
     pub direct_reports: Vec<String>,
+}
+
+/// Organization hierarchy class. This is deliberately distinct from the
+/// model/pricing tier stored in LLM usage events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct HierarchyTier(u8);
+
+impl HierarchyTier {
+    pub const TIER_1: Self = Self(1);
+    pub const TIER_2: Self = Self(2);
+    pub const TIER_3: Self = Self(3);
+
+    pub fn new(value: u8) -> Result<Self> {
+        match value {
+            1..=3 => Ok(Self(value)),
+            _ => Err(anyhow!("hierarchy tier must be in 1..=3, got {value}")),
+        }
+    }
+
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+/// Deterministic compatibility fallback for legacy identities without an
+/// explicit hierarchy tier.
+///
+/// The explicit TOML value always wins. This classifier follows the approved
+/// role categories for the repository's existing roles; unknown roles take the
+/// least-privileged/cost-conservative Tier 3 route.
+pub fn legacy_hierarchy_tier_from_role(role: &str) -> HierarchyTier {
+    let normalized = role.to_ascii_lowercase();
+
+    if normalized.contains("ceo") || normalized.contains("geschaeftsfuehr") {
+        return HierarchyTier::TIER_1;
+    }
+
+    const TIER_2_MARKERS: &[&str] = &[
+        "head of ",
+        "tech lead",
+        "design lead",
+        "design-lead",
+        "art director",
+        "betriebsratsvorsitz",
+        "stellvertretende vorsitz",
+        "betriebspsycholog",
+        "betriebsarzt",
+        "betriebsaerzt",
+        "delivery manager",
+        "marketing &",
+        "marketing and ",
+        "office manager",
+    ];
+
+    if TIER_2_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        HierarchyTier::TIER_2
+    } else {
+        HierarchyTier::TIER_3
+    }
+}
+
+impl<'de> Deserialize<'de> for HierarchyTier {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u8::deserialize(deserializer)?;
+        Self::new(value).map_err(D::Error::custom)
+    }
+}
+
+impl std::fmt::Display for HierarchyTier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -175,6 +260,53 @@ mod tests {
         assert_eq!(config.identity.name, "Thomas Mueller");
         assert_eq!(config.identity.role, "CEO / Geschaeftsfuehrer / Gruender");
         assert_eq!(config.identity.id, 1);
+        assert_eq!(config.identity.tier, Some(HierarchyTier::TIER_1));
+    }
+
+    #[test]
+    fn hierarchy_tier_accepts_legacy_and_rejects_out_of_range_values() {
+        let legacy = r#"id = 1
+name = "Legacy"
+role = "Role"
+department = "Dept"
+shift_set = 1
+"#;
+        let parsed: IdentityConfig = toml::from_str(legacy).expect("legacy identity parses");
+        assert_eq!(parsed.tier, None);
+
+        for valid in 1..=3 {
+            let source = format!("{legacy}tier = {valid}\n");
+            let parsed: IdentityConfig = toml::from_str(&source).expect("valid tier parses");
+            assert_eq!(parsed.tier.map(HierarchyTier::get), Some(valid));
+        }
+
+        for invalid in [0, 4] {
+            let source = format!("{legacy}tier = {invalid}\n");
+            let error = toml::from_str::<IdentityConfig>(&source).expect_err("invalid tier fails");
+            assert!(error
+                .to_string()
+                .contains("hierarchy tier must be in 1..=3"));
+        }
+    }
+
+    #[test]
+    fn legacy_role_fallback_is_deterministic_and_fail_closed() {
+        assert_eq!(
+            legacy_hierarchy_tier_from_role("CEO / Geschaeftsfuehrer"),
+            HierarchyTier::TIER_1
+        );
+        assert_eq!(
+            legacy_hierarchy_tier_from_role("Betriebspsychologin"),
+            HierarchyTier::TIER_2
+        );
+        assert_eq!(
+            legacy_hierarchy_tier_from_role("Junior Projektmanager"),
+            HierarchyTier::TIER_3
+        );
+        assert_eq!(
+            legacy_hierarchy_tier_from_role("Unrecognized legacy role"),
+            HierarchyTier::TIER_3
+        );
     }
 
     #[test]

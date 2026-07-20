@@ -3,6 +3,7 @@ id = 54
 name = "Dr. Katharina Brandt"
 role = "Betriebsaerztin (nach Arbeitssicherheitsgesetz / ASiG)"
 department = "Betriebsgesundheit"
+tier = 2
 shift_set = 0
 kpis = ["Erste-Hilfe-Schulungen jaehrlich", "Gefaehrdungsbeurteilungen aktuell", "Krankenstandsanalyse quartalsweise"]
 reports_to = ""
