@@ -38,7 +38,15 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FENCE = "begin_fenced_write"
 # Constructors / schema bootstrap run once before the store serves writes; they legitimately
 # take a raw write handle because no ownership exists yet.
-CONSTRUCTORS = {"open", "open_with_durability", "new", "ensure_outbox_migrations"}
+CONSTRUCTORS = {
+    "open",
+    "open_with_durability",
+    "new",
+    "ensure_outbox_migrations",
+    # Node-local invariant metadata only: inserts the fixed shared root row when
+    # absent. Visible base content continues through World-fenced writers.
+    "bootstrap_shared_base_root_node_local",
+}
 
 # Each fenced store file and the regex identifying a *raw write* in that store's shape.
 STORES = [

@@ -6,6 +6,7 @@
 //! - `CAS_REFCOUNT`: `sha256_hash` -> reference count (u32)
 
 use crate::cas::{CasStore, ChunkGcStats};
+use crate::SHARED_BASE_LAYER_ID;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 use sentinel_common::{
     FencedStore, FsMetadataDump, OwnerRegistry, OwnerWriteGuard, StateTransferScope,
@@ -38,7 +39,6 @@ const FS_SNAPSHOT_BLOB_REFS: TableDefinition<(&str, &[u8; 32]), u64> =
     TableDefinition::new("fs_snapshot_blob_refs");
 
 const INODE_DATA_BINCODE_V1: &[u8; 4] = b"SFI1";
-const SHARED_BASE_LAYER_ID: &str = "__BASE__";
 
 /// The shared read-only base layer belongs to the world authority. Per-agent
 /// layers remain fenced by their nano-container scope.
@@ -218,6 +218,34 @@ impl MetadataStore {
         write_txn.commit()?;
 
         Ok(Self { db, durability })
+    }
+
+    /// Create the invariant root row for the shared namespace without claiming World
+    /// authority. This is node-local schema/bootstrap structure, not shared content.
+    /// The transaction can only insert the fixed `(__BASE__, 1)` directory when it is
+    /// absent; every later base-layer mutation still enters through a World-fenced API.
+    pub(crate) fn bootstrap_shared_base_root_node_local(&self) -> anyhow::Result<bool> {
+        let root = InodeData::directory(0o755).serialize()?;
+        let write_txn = self.db.begin_write()?;
+        let inserted = {
+            let mut table = write_txn.open_table(FS_INODES)?;
+            if table.get((SHARED_BASE_LAYER_ID, 1u64))?.is_some() {
+                false
+            } else {
+                table.insert((SHARED_BASE_LAYER_ID, 1u64), root.as_slice())?;
+                true
+            }
+        };
+        write_txn.commit()?;
+        Ok(inserted)
+    }
+
+    /// Fail before any CAS side effect when a layer mutation lacks authority. The
+    /// actual metadata transaction independently rechecks the same complete term at
+    /// begin and commit.
+    pub(crate) fn validate_layer_write_authority(&self, layer_id: &str) -> anyhow::Result<()> {
+        OwnerRegistry::global().issue(owner_scope_for_layer(layer_id))?;
+        Ok(())
     }
 
     // The single fenced write entry (#496 V3/V19) is `impl FencedStore for
