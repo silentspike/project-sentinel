@@ -229,7 +229,7 @@ impl MetadataStore {
     pub fn set_inode(&self, agent_id: &str, inode: u64, data: &InodeData) -> anyhow::Result<()> {
         let serialized = data.serialize()?;
         let write_txn = self.begin_fenced_write(
-            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id))?,
         )?;
         {
             let mut table = write_txn.open_table(FS_INODES)?;
@@ -242,7 +242,7 @@ impl MetadataStore {
     /// Remove an inode. Returns the old data if it existed.
     pub fn remove_inode(&self, agent_id: &str, inode: u64) -> anyhow::Result<Option<InodeData>> {
         let write_txn = self.begin_fenced_write(
-            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id))?,
         )?;
         let old = {
             let mut table = write_txn.open_table(FS_INODES)?;
@@ -281,7 +281,7 @@ impl MetadataStore {
         child_inode: u64,
     ) -> anyhow::Result<()> {
         let write_txn = self.begin_fenced_write(
-            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id))?,
         )?;
         {
             let mut table = write_txn.open_table(FS_DIRENTS)?;
@@ -299,7 +299,7 @@ impl MetadataStore {
         name: &str,
     ) -> anyhow::Result<Option<u64>> {
         let write_txn = self.begin_fenced_write(
-            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id))?,
         )?;
         let old = {
             let mut table = write_txn.open_table(FS_DIRENTS)?;
@@ -345,7 +345,7 @@ impl MetadataStore {
     /// Increment reference count. Returns the new count.
     pub fn inc_refcount(&self, hash: &[u8; 32]) -> anyhow::Result<u32> {
         let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         let new_count = {
             let mut table = write_txn.open_table(CAS_REFCOUNT)?;
             let current = table.get(hash)?.map(|g| g.value()).unwrap_or(0);
@@ -364,7 +364,7 @@ impl MetadataStore {
     /// Decrement reference count. Returns the new count (clamped to 0).
     pub fn dec_refcount(&self, hash: &[u8; 32]) -> anyhow::Result<u32> {
         let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         let new_count = {
             let mut table = write_txn.open_table(CAS_REFCOUNT)?;
             let current = table.get(hash)?.map(|g| g.value()).unwrap_or(0);
@@ -404,7 +404,7 @@ impl MetadataStore {
         trashed_at_ms: Option<u64>,
     ) -> anyhow::Result<bool> {
         let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         let updated = {
             let mut table = write_txn.open_table(FS_TRASH_QUEUE)?;
             match trashed_at_ms {
@@ -422,7 +422,7 @@ impl MetadataStore {
     /// Remove a hash from the trash queue and re-establish a refcount if needed.
     pub fn restore_from_trash(&self, hash: &[u8; 32]) -> anyhow::Result<bool> {
         let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         let restored = {
             let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
             if trash.remove(hash)?.is_none() {
@@ -452,7 +452,7 @@ impl MetadataStore {
             .unwrap_or_default()
             .as_millis() as u64;
         let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         {
             let mut table = write_txn.open_table(FS_SNAPSHOT_BLOB_REFS)?;
             for hash in hashes {
@@ -482,7 +482,7 @@ impl MetadataStore {
             return Ok(0);
         }
         let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         {
             let mut table = write_txn.open_table(FS_SNAPSHOT_BLOB_REFS)?;
             for hash in &to_remove {
@@ -587,7 +587,7 @@ impl MetadataStore {
     pub fn restore_all_tables(&self, dump: &FsMetadataDump) -> anyhow::Result<()> {
         let current = self.dump_all_tables()?;
         let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         {
             let mut inodes = write_txn.open_table(FS_INODES)?;
             for (agent_id, inode, _) in &current.inodes {
@@ -667,7 +667,7 @@ impl MetadataStore {
         let gc_stats = cas.gc(&expired_hashes)?;
 
         let write_txn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         {
             let mut trash = write_txn.open_table(FS_TRASH_QUEUE)?;
             let refs = write_txn.open_table(CAS_REFCOUNT)?;
@@ -700,7 +700,7 @@ impl MetadataStore {
     ) -> anyhow::Result<()> {
         let serialized = data.serialize()?;
         let write_txn = self.begin_fenced_write(
-            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id))?,
         )?;
         {
             let mut inodes = write_txn.open_table(FS_INODES)?;
@@ -740,7 +740,7 @@ impl MetadataStore {
         let serialized = data.serialize()?;
 
         let write_txn = self.begin_fenced_write(
-            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id))?,
         )?;
         let inode = {
             let mut inodes = write_txn.open_table(FS_INODES)?;
@@ -796,7 +796,7 @@ impl MetadataStore {
         inode: u64,
     ) -> anyhow::Result<Option<InodeData>> {
         let write_txn = self.begin_fenced_write(
-            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id))?,
         )?;
         let old_data = {
             let mut inodes = write_txn.open_table(FS_INODES)?;
@@ -845,7 +845,7 @@ impl MetadataStore {
     /// Uses a special inode 0 entry to track the counter.
     pub fn next_inode(&self, agent_id: &str) -> anyhow::Result<u64> {
         let write_txn = self.begin_fenced_write(
-            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id)),
+            &OwnerRegistry::global().issue(StateTransferScope::for_agent(agent_id))?,
         )?;
         let next = {
             let mut table = write_txn.open_table(FS_INODES)?;
@@ -955,7 +955,7 @@ mod tests {
             StateTransferScope::NanoContainer(agent.to_string()),
         ] {
             let txn = store
-                .begin_fenced_write(&OwnerRegistry::global().issue(scope))
+                .begin_fenced_write(&OwnerRegistry::global().issue(scope).unwrap())
                 .unwrap();
             {
                 let mut table = txn.open_table(FS_INODES).unwrap();
@@ -986,7 +986,11 @@ mod tests {
             "stale guard must be rejected at commit"
         );
         let ok = store
-            .begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))
+            .begin_fenced_write(
+                &OwnerRegistry::global()
+                    .issue(StateTransferScope::World)
+                    .unwrap(),
+            )
             .unwrap();
         ok.commit().unwrap();
     }

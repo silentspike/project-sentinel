@@ -4495,6 +4495,7 @@ dependencies = [
  "loom",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "toml 1.0.6+spec-1.1.0",
@@ -4849,8 +4850,10 @@ dependencies = [
  "sentinel-telemetry",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

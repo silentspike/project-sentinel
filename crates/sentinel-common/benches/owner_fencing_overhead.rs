@@ -32,7 +32,7 @@ fn main() {
 
     let reg = OwnerRegistry::global(); // process-global, single-node default
     let scope = StateTransferScope::World;
-    let guard = reg.issue(scope.clone());
+    let guard = reg.issue(scope.clone()).unwrap();
 
     println!("== #496 PR2b-2a owner-fence V26 overhead (iters={iters}) ==");
     assert!(
@@ -46,7 +46,7 @@ fn main() {
         black_box(reg.validate(black_box(&guard))).ok();
     });
     bench("owner     single-node (fast-path, no lock)", iters, || {
-        black_box(reg.current_owner(black_box(&scope)));
+        black_box(reg.current_owner(black_box(&scope)).unwrap());
     });
 
     // Flip to cluster mode (a cross-node commit on an unrelated scope sets the flag), so
@@ -55,6 +55,7 @@ fn main() {
         scope: StateTransferScope::NanoContainer("AGENT-99".into()),
         owner_node: NodeId::default(),
         epoch: 2,
+        coordinator_generation: sentinel_common::TRACK_A_COORDINATOR_GENERATION,
     });
     assert!(reg.is_cluster_mode());
 
@@ -62,7 +63,7 @@ fn main() {
         black_box(reg.validate(black_box(&guard))).ok();
     });
     bench("owner     cluster-mode (RwLock read+lookup)", iters, || {
-        black_box(reg.current_owner(black_box(&scope)));
+        black_box(reg.current_owner(black_box(&scope)).unwrap());
     });
 
     println!("(single-node = the prod path; the fast-path delta vs cluster-mode is the lock cost avoided)");

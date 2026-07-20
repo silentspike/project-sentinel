@@ -392,16 +392,15 @@ impl EventStore {
     }
 
     // The single fenced write entry (#496 V3/V19) is `impl FencedStore for EventStore`
-    // below. Unlike redb/fs there is no commit wrapper: SQLite reads and writes share
-    // the one connection mutex, so the write executes under the lock held from begin,
-    // with no TOCTOU window for a single-node write — the begin re-check is sufficient;
-    // a cross-node commit-recheck path is not applicable to the autocommit connection.
+    // below. It opens an explicit SQLite transaction and rechecks the complete owner
+    // term immediately before COMMIT; dropping the wrapper rolls the transaction back.
 
     /// Append-only: Fuegt ein Event ein. Gibt die interne Row-ID zurueck.
     pub fn append_event(&self, event: &DomainEvent) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
         let conn = self.begin_fenced_write(
-            &OwnerRegistry::global().issue(StateTransferScope::for_aggregate(&event.aggregate_id)),
+            &OwnerRegistry::global()
+                .issue(StateTransferScope::for_aggregate(&event.aggregate_id))?,
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -420,6 +419,7 @@ impl EventStore {
             ],
         )?;
         let row_id = conn.last_insert_rowid();
+        conn.commit()?;
         #[cfg(feature = "telemetry")]
         {
             let reg = sentinel_telemetry::MetricsRegistry::global();
@@ -436,13 +436,13 @@ impl EventStore {
     /// Bei Duplikat (gleiche operation_id) wird kein neuer Eintrag erstellt.
     pub fn append_with_outbox(&self, event: &DomainEvent, topic: &str) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
-        let mut conn = self.begin_fenced_write(
-            &OwnerRegistry::global().issue(StateTransferScope::for_aggregate(&event.aggregate_id)),
+        let conn = self.begin_fenced_write(
+            &OwnerRegistry::global()
+                .issue(StateTransferScope::for_aggregate(&event.aggregate_id))?,
         )?;
-        let tx = conn.transaction()?;
 
         // INSERT OR IGNORE: Idempotenz via operation_id UNIQUE INDEX
-        let inserted = tx.execute(
+        let inserted = conn.execute(
             "INSERT OR IGNORE INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 event.event_id,
@@ -466,14 +466,14 @@ impl EventStore {
                 .unwrap_or_default()
                 .as_millis() as i64;
 
-            tx.execute(
+            conn.execute(
                 "INSERT INTO outbox (event_id, topic, payload, status, created_at) VALUES (?1, ?2, ?3, 'pending', ?4)",
                 params![event.event_id, topic, event.payload, now_ms],
             )?;
         }
 
-        let row_id = tx.last_insert_rowid();
-        tx.commit()?;
+        let row_id = conn.last_insert_rowid();
+        conn.commit()?;
 
         debug!(event_id = %event.event_id, event_type = %event.event_type, "event appended");
         #[cfg(feature = "telemetry")]
@@ -499,19 +499,18 @@ impl EventStore {
         I: IntoIterator<Item = (&'a DomainEvent, &'a str)>,
     {
         let _telemetry_start = std::time::Instant::now();
-        let mut conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
-        let tx = conn.transaction()?;
+        let conn =
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
 
         let inserted_count = {
-            let mut insert_event = tx.prepare(
+            let mut insert_event = conn.prepare(
                 "INSERT OR IGNORE INTO events (event_id, event_type, aggregate_id, payload, correlation_id, causation_id, operation_id, tick, timestamp_ms, schema_version, compensation_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
-            let mut insert_outbox = tx.prepare(
+            let mut insert_outbox = conn.prepare(
                 "INSERT INTO outbox (event_id, topic, payload, status, created_at) VALUES (?1, ?2, ?3, 'pending', ?4)",
             )?;
             let mut inserted_count = 0usize;
@@ -540,7 +539,7 @@ impl EventStore {
             inserted_count
         };
 
-        tx.commit()?;
+        conn.commit()?;
 
         #[cfg(feature = "telemetry")]
         {
@@ -856,12 +855,11 @@ impl EventStore {
         last_event_id: i64,
     ) -> anyhow::Result<i64> {
         let _telemetry_start = std::time::Instant::now();
-        let mut conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
-        let tx = conn.transaction()?;
+        let conn =
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
 
         // Aktuelle Version ermitteln
-        let current_version: i32 = tx
+        let current_version: i32 = conn
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM snapshots WHERE aggregate_id = ?1",
                 params![aggregate_id],
@@ -874,7 +872,7 @@ impl EventStore {
             .unwrap_or_default()
             .as_millis() as i64;
 
-        tx.execute(
+        conn.execute(
             "INSERT INTO snapshots (aggregate_id, snapshot_type, payload, last_event_id, version, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 aggregate_id,
@@ -885,12 +883,12 @@ impl EventStore {
                 now_ms,
             ],
         )?;
-        let row_id = tx.last_insert_rowid();
-        tx.execute(
+        let row_id = conn.last_insert_rowid();
+        conn.execute(
             "DELETE FROM snapshots WHERE aggregate_id = ?1 AND id <> ?2",
             params![aggregate_id, row_id],
         )?;
-        tx.commit()?;
+        conn.commit()?;
         #[cfg(feature = "telemetry")]
         {
             let reg = sentinel_telemetry::MetricsRegistry::global();
@@ -936,7 +934,7 @@ impl EventStore {
     /// `world_snapshots` Time-Machine-Tabelle.
     pub fn retain_latest_snapshots(&self) -> anyhow::Result<u64> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         let deleted = conn.execute(
             "DELETE FROM snapshots
              WHERE id NOT IN (
@@ -951,6 +949,7 @@ impl EventStore {
              )",
             [],
         )? as u64;
+        conn.commit()?;
         Ok(deleted)
     }
 
@@ -1003,7 +1002,7 @@ impl EventStore {
     /// Markiert einen Outbox-Eintrag als publiziert.
     pub fn mark_published(&self, event_id: &str) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1012,6 +1011,7 @@ impl EventStore {
             "UPDATE outbox SET status = 'published', published_at = ?1 WHERE event_id = ?2",
             params![now_ms, event_id],
         )?;
+        conn.commit()?;
         Ok(())
     }
 
@@ -1078,12 +1078,13 @@ impl EventStore {
     /// Bump the restore generation epoch (called once per restore). Returns the new generation.
     pub fn increment_restore_generation(&self) -> anyhow::Result<i64> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         let next = read_sim_metadata(&conn, "restore_generation")
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0)
             + 1;
         set_sim_metadata_conn(&conn, "restore_generation", &next.to_string())?;
+        conn.commit()?;
         Ok(next)
     }
 
@@ -1102,23 +1103,25 @@ impl EventStore {
             return Ok(()); // nothing discarded
         }
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         let mut ranges = read_dead_ranges(&conn);
         ranges.push((from_exclusive, to_inclusive));
         set_sim_metadata_conn(&conn, "dead_ranges", &serde_json::to_string(&ranges)?)?;
+        conn.commit()?;
         Ok(())
     }
 
     /// Drop a dead-range entry once its events have been pruned (keeps the list bounded).
     pub fn remove_dead_range(&self, from_exclusive: i64) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         let mut ranges = read_dead_ranges(&conn);
         let before = ranges.len();
         ranges.retain(|(from, _)| *from != from_exclusive);
         if ranges.len() != before {
             set_sim_metadata_conn(&conn, "dead_ranges", &serde_json::to_string(&ranges)?)?;
         }
+        conn.commit()?;
         Ok(())
     }
 
@@ -1176,17 +1179,15 @@ impl EventStore {
             return Ok(0);
         }
 
-        let mut conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+        let conn =
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
 
         // #493: dead intervals are pruned ALONGSIDE the retention cutoff — even above it — so a
         // discarded future is physically removed in the normal retention window (not left to linger).
         let dead = read_dead_ranges(&conn);
         let (dead_incl_sql, dead_p) = dead_range_inclusion(&dead, "id", 3);
 
-        let tx = conn.transaction()?;
-
-        tx.execute_batch(
+        conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS prune_batch_ids (
                 id INTEGER PRIMARY KEY,
                 event_id TEXT NOT NULL
@@ -1196,7 +1197,7 @@ impl EventStore {
 
         let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&cutoff_event_id, &batch_size];
         bind.extend(dead_p.iter().map(|d| d as &dyn rusqlite::ToSql));
-        let selected = tx.execute(
+        let selected = conn.execute(
             &format!(
                 "INSERT INTO prune_batch_ids(id, event_id)
                  SELECT id, event_id
@@ -1209,19 +1210,17 @@ impl EventStore {
         )? as u64;
 
         if selected > 0 {
-            tx.execute(
+            conn.execute(
                 "DELETE FROM outbox
                  WHERE event_id IN (SELECT event_id FROM prune_batch_ids)",
                 [],
             )?;
-            tx.execute(
+            conn.execute(
                 "DELETE FROM events
                  WHERE id IN (SELECT id FROM prune_batch_ids)",
                 [],
             )?;
         }
-        tx.commit()?;
-
         // #493 requirement 2: drop a `dead_ranges` entry once its interval is empty (keeps the list
         // bounded over many restores). Runs on the same held connection — no re-lock, no deadlock.
         if !dead.is_empty() {
@@ -1244,6 +1243,7 @@ impl EventStore {
             }
         }
 
+        conn.commit()?;
         Ok(selected)
     }
 
@@ -1253,12 +1253,13 @@ impl EventStore {
     /// Diese Methode ist als Maintenance-/Test-Primitive gedacht.
     pub fn delete_orphan_outbox(&self) -> anyhow::Result<u64> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         let deleted = conn.execute(
             "DELETE FROM outbox
              WHERE event_id NOT IN (SELECT event_id FROM events)",
             [],
         )? as u64;
+        conn.commit()?;
         Ok(deleted)
     }
 
@@ -1275,7 +1276,7 @@ impl EventStore {
     /// - `offset < current` → `MonotonicityError` (Rueckwaerts-Drift)
     pub fn update_offset(&self, name: &str, offset: i64) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
 
         // Aktuellen Offset pruefen
         let current: Option<i64> = conn
@@ -1307,6 +1308,7 @@ impl EventStore {
             "INSERT INTO projection_offsets (projection_name, last_event_id, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(projection_name) DO UPDATE SET last_event_id = ?2, updated_at = ?3",
             params![name, offset, now_ms],
         )?;
+        conn.commit()?;
         Ok(())
     }
 
@@ -1318,7 +1320,7 @@ impl EventStore {
     /// Erzwingt einen Offset-Wert (umgeht Monotonie-Pruefung, fuer Restore).
     pub fn force_reset_offset(&self, name: &str, offset: i64) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1327,16 +1329,18 @@ impl EventStore {
             "INSERT OR REPLACE INTO projection_offsets (projection_name, last_event_id, updated_at) VALUES (?1, ?2, ?3)",
             params![name, offset, now_ms],
         )?;
+        conn.commit()?;
         Ok(())
     }
 
     pub fn reset_offset(&self, name: &str) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         conn.execute(
             "DELETE FROM projection_offsets WHERE projection_name = ?1",
             params![name],
         )?;
+        conn.commit()?;
         Ok(())
     }
 
@@ -1446,7 +1450,7 @@ impl EventStore {
         created_at_ms: i64,
     ) -> anyhow::Result<()> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         conn.execute(
             "INSERT INTO world_snapshots (id, tier, tick, sim_hour, last_event_id, payload_size, payload, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1461,6 +1465,7 @@ impl EventStore {
                 created_at_ms,
             ],
         )?;
+        conn.commit()?;
         Ok(())
     }
 
@@ -1508,19 +1513,21 @@ impl EventStore {
     /// Loescht einen World Snapshot anhand seiner ID.
     pub fn delete_world_snapshot(&self, id: &str) -> anyhow::Result<bool> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         let deleted = conn.execute("DELETE FROM world_snapshots WHERE id = ?1", params![id])?;
+        conn.commit()?;
         Ok(deleted > 0)
     }
 
     /// Aktualisiert den Tier eines World Snapshots (fuer Promotion).
     pub fn promote_world_snapshot(&self, id: &str, new_tier: &str) -> anyhow::Result<bool> {
         let conn =
-            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World))?;
+            self.begin_fenced_write(&OwnerRegistry::global().issue(StateTransferScope::World)?)?;
         let updated = conn.execute(
             "UPDATE world_snapshots SET tier = ?1 WHERE id = ?2",
             params![new_tier, id],
         )?;
+        conn.commit()?;
         Ok(updated > 0)
     }
 
@@ -1538,23 +1545,58 @@ impl EventStore {
     }
 }
 
-impl FencedStore for EventStore {
-    type Txn<'a> = std::sync::MutexGuard<'a, Connection>;
+pub struct FencedSqliteWrite<'a> {
+    conn: std::sync::MutexGuard<'a, Connection>,
+    guard: OwnerWriteGuard,
+    committed: bool,
+}
 
-    fn begin_fenced_write(
-        &self,
-        guard: &OwnerWriteGuard,
-    ) -> anyhow::Result<std::sync::MutexGuard<'_, Connection>> {
-        // V19: re-check the guard against the committed owner term before handing out the
-        // connection lock. The write executes under this lock, held from begin, so for a
-        // single-node write there is no TOCTOU window — the begin re-check is sufficient.
-        // A stale guard (a cross-node handoff bumped the epoch) is rejected here with
-        // `StaleEpochError`; unlike redb/fs there is no separate commit re-check because
-        // the SQLite connection autocommits each statement under the held lock.
+impl std::ops::Deref for FencedSqliteWrite<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for FencedSqliteWrite<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.conn
+    }
+}
+
+impl FencedSqliteWrite<'_> {
+    pub fn commit(mut self) -> anyhow::Result<()> {
+        OwnerRegistry::global().validate(&self.guard)?;
+        self.conn.execute_batch("COMMIT")?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for FencedSqliteWrite<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+impl FencedStore for EventStore {
+    type Txn<'a> = FencedSqliteWrite<'a>;
+
+    fn begin_fenced_write(&self, guard: &OwnerWriteGuard) -> anyhow::Result<FencedSqliteWrite<'_>> {
         OwnerRegistry::global().validate(guard)?;
-        self.conn
+        let conn = self
+            .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(FencedSqliteWrite {
+            conn,
+            guard: guard.clone(),
+            committed: false,
+        })
     }
 }
 
@@ -1618,12 +1660,9 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    /// #496 PR1a: the fenced write entry is the single choke point every writer
-    /// routes through. In PR1a it is a behavior-preserving no-op fence (it accepts
-    /// any [`OwnerWriteGuard`] and yields the same locked connection a raw writer
-    /// used before), so a write through it must persist exactly as before. Both the
-    /// `World` and a `NanoContainer(agent)` scope are accepted (PR2 adds the epoch
-    /// check; PR1a must reject nothing).
+    /// #496: the fenced write entry is the single choke point every SQLite writer
+    /// routes through. Both the `World` and a `NanoContainer(agent)` scope remain
+    /// behavior-compatible on the single-node fast path.
     #[test]
     fn test_begin_fenced_write_is_behavior_preserving_choke_point() {
         let dir = tempfile::tempdir().unwrap();
@@ -1642,13 +1681,44 @@ mod tests {
             StateTransferScope::World,
             StateTransferScope::NanoContainer("AGENT-07".to_string()),
         ] {
-            let guard = OwnerRegistry::global().issue(scope);
+            let guard = OwnerRegistry::global().issue(scope).unwrap();
             let conn = store.begin_fenced_write(&guard).unwrap();
             let count: i64 = conn
                 .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(count, 1);
         }
+    }
+
+    /// V19 TOCTOU: a guard that is no longer current when SQLite reaches COMMIT is
+    /// rejected and the explicit transaction is rolled back.
+    #[test]
+    fn commit_rechecks_owner_term_and_rolls_back_stale_sqlite_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-stale-fenced.db");
+        let store = EventStore::open(path.to_str().unwrap()).unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let stale = super::FencedSqliteWrite {
+            conn,
+            guard: OwnerWriteGuard::for_test(
+                StateTransferScope::World,
+                OwnerRegistry::global().this_node(),
+                0,
+            ),
+            committed: false,
+        };
+        stale
+            .execute(
+                "INSERT INTO projection_offsets \
+                 (projection_name, last_event_id, updated_at) VALUES ('stale', 1, 1)",
+                [],
+            )
+            .unwrap();
+        assert!(stale.commit().is_err());
+
+        assert_eq!(store.get_offset("stale").unwrap(), None);
     }
 
     /// AC1: Event+Outbox atomar in einer Transaktion

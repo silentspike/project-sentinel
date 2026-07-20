@@ -349,6 +349,17 @@ impl RuntimeOrchestrator {
     /// Schichtwechsel: Entfernt alle Agenten deren shift_set != new_shift_set UND != 0 (Sonder).
     /// Gibt die entfernten AgentIds zurueck.
     pub fn shift_transition(&mut self, new_shift_set: u8) -> Vec<AgentId> {
+        self.shift_transition_except(new_shift_set, &std::collections::HashSet::new())
+    }
+
+    /// Shift transition with a bootstrap-residency exclusion set. Prepared migration
+    /// targets remain present and suspended even when their configured work shift is
+    /// not current.
+    pub fn shift_transition_except(
+        &mut self,
+        new_shift_set: u8,
+        protected: &std::collections::HashSet<AgentId>,
+    ) -> Vec<AgentId> {
         let to_remove: Vec<AgentId> = self
             .agents
             .iter()
@@ -356,6 +367,7 @@ impl RuntimeOrchestrator {
                 // Behalte: Sonder-Schicht (0) ODER neue Schicht
                 handle.shift.shift_set != 0 && handle.shift.shift_set != new_shift_set
             })
+            .filter(|(id, _)| !protected.contains(id))
             .map(|(id, _)| *id)
             .collect();
 
@@ -422,6 +434,57 @@ impl RuntimeOrchestrator {
     /// Read-only Zugriff auf alle Agent-Handles (fuer Resource Manager).
     pub fn agents(&self) -> &std::collections::HashMap<AgentId, AgentHandle> {
         &self.agents
+    }
+
+    /// Remove restored in-memory handles that are not locally resident, without
+    /// emitting lifecycle writes. Cluster bootstrap calls this before ECS, sandbox,
+    /// or agent processes start; the durable owner snapshot is the authority for
+    /// residency and a follower must not briefly resurrect a stale runtime handle.
+    pub fn reconcile_bootstrap_residents(
+        &mut self,
+        residents: &std::collections::HashSet<AgentId>,
+        prepared_frozen: &std::collections::HashSet<AgentId>,
+    ) -> (usize, usize) {
+        let before = self.agents.len();
+        self.agents
+            .retain(|agent_id, _| residents.contains(agent_id));
+        let mut sealed = 0;
+        for agent_id in prepared_frozen {
+            if let Some(handle) = self.agents.get_mut(agent_id) {
+                if handle.status != AgentStatus::Suspended {
+                    handle.status = AgentStatus::Suspended;
+                    sealed += 1;
+                }
+            }
+        }
+        (before - self.agents.len(), sealed)
+    }
+
+    /// Materialize a prepared target in the in-memory runtime without lifecycle
+    /// events or external process activation. Its ECS counterpart is created with the
+    /// `Frozen` marker by the daemon bootstrap.
+    pub fn install_prepared_agent(
+        &mut self,
+        identity: AgentIdentity,
+        shift: ShiftInfo,
+    ) -> Result<()> {
+        if let Some(handle) = self.agents.get_mut(&identity.agent_id) {
+            handle.status = AgentStatus::Suspended;
+            return Ok(());
+        }
+        if self.agents.len() >= self.max_agents {
+            return Err(anyhow!("Maximum agent count ({}) reached", self.max_agents));
+        }
+        self.agents.insert(
+            identity.agent_id,
+            AgentHandle {
+                identity,
+                shift,
+                status: AgentStatus::Suspended,
+                last_activity_tick: Tick(self.current_tick),
+            },
+        );
+        Ok(())
     }
 
     /// Aktualisiert last_activity_tick fuer einen Agent.
@@ -660,6 +723,31 @@ mod tests {
         // Nur Set 2 Agent sollte uebrig sein
         assert!(orchestrator.get_agent_mut(AgentId(16)).is_some());
         assert!(orchestrator.get_agent_mut(AgentId(1)).is_none());
+    }
+
+    #[test]
+    fn prepared_bootstrap_resident_stays_suspended_across_shift_transition() {
+        let mut orchestrator = RuntimeOrchestrator::new(10);
+        orchestrator
+            .install_prepared_agent(
+                create_identity(7, "Prepared", "Tester"),
+                create_shift(1, 6, 14),
+            )
+            .unwrap();
+        assert_eq!(
+            orchestrator.agents()[&AgentId(7)].status,
+            AgentStatus::Suspended
+        );
+
+        let protected = std::collections::HashSet::from([AgentId(7)]);
+        assert!(orchestrator
+            .shift_transition_except(2, &protected)
+            .is_empty());
+        assert_eq!(orchestrator.agent_count(), 1);
+        assert_eq!(
+            orchestrator.agents()[&AgentId(7)].status,
+            AgentStatus::Suspended
+        );
     }
 
     #[test]
