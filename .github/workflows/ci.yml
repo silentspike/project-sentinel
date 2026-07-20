@@ -87,6 +87,11 @@ jobs:
       - name: Runtime-base provisioning contract (#646)
         run: bash scripts/check-runtime-base-provisioning.sh
 
+      - name: Virtual-company M0 product contract (#693)
+        run: |
+          python3 scripts/product-acceptance/check_contract.py --check
+          python3 -m unittest discover -s scripts/product-acceptance -p 'test_*.py'
+
       - name: Validate TOML configs
         run: |
           for f in $(find config -name '*.toml' 2>/dev/null); do
