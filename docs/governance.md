@@ -76,7 +76,7 @@ cannot escape its assigned room of state.
 |--------------------|--------------------------------------------|-----------------------------------------------------|
 | File system        | bwrap + Landlock LSM                       | `crates/sentinel-sandbox/src/bwrap.rs`              |
 | CPU + memory       | cgroups v2 (per-agent)                     | `crates/sentinel-sandbox/src/cgroups.rs`            |
-| Network            | netns + nftables                           | `crates/sentinel-sandbox/src/netns.rs`              |
+| Network            | bwrap full-cage netns, loopback only       | `crates/sentinel-sandbox/src/{bwrap.rs,enforcer.rs}`|
 | Tool execution     | Wasmtime WASM runtime                      | `crates/sentinel-wasm/`                             |
 | Verification       | 9/9 breakout tests                         | [docs/security-test-report.md](security-test-report.md) |
 
