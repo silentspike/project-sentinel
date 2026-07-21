@@ -86,11 +86,12 @@ fn jsonl_process_handles_health_rejection_and_execution() {
         .unwrap()
     )
     .unwrap();
+    let request = write_request();
     writeln!(
         input,
         "{}",
         serde_json::to_string(&WorkbenchCommand::Execute {
-            request: write_request(),
+            request: Box::new(request.clone()),
         })
         .unwrap()
     )
@@ -121,22 +122,71 @@ fn jsonl_process_handles_health_rejection_and_execution() {
                 assert!(!output.values().any(|value| value.contains("secret")));
                 succeeded = true;
             }
-            WorkbenchMessage::Progress { stage, .. }
-                if stage == sentinel_common::WorkbenchProgressStage::Completed =>
-            {
+            WorkbenchMessage::Progress {
+                stage: sentinel_common::WorkbenchProgressStage::Completed,
+                ..
+            } => {
                 completed = true;
             }
             _ => {}
         }
     }
+    writeln!(
+        input,
+        "{}",
+        serde_json::to_string(&WorkbenchCommand::Recover {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+        })
+        .unwrap()
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let mut recovered = false;
+    let mut recovery_completed = false;
+    while !recovery_completed {
+        let mut line = String::new();
+        assert!(output.read_line(&mut line).unwrap() > 0);
+        match serde_json::from_str::<WorkbenchMessage>(&line).unwrap() {
+            WorkbenchMessage::Result {
+                invocation_id,
+                input_digest,
+                outcome: WorkbenchOutcome::Succeeded,
+                output,
+                ..
+            } if invocation_id == request.invocation_id => {
+                assert_eq!(input_digest, request.input_digest);
+                assert!(output.is_empty());
+                recovered = true;
+            }
+            WorkbenchMessage::Progress {
+                invocation_id,
+                stage: sentinel_common::WorkbenchProgressStage::Completed,
+                ..
+            } if invocation_id == request.invocation_id => recovery_completed = true,
+            _ => {}
+        }
+    }
     drop(input);
     assert!(child.wait().unwrap().success());
-    assert!(malformed_rejected && healthy && succeeded);
+    assert!(malformed_rejected && healthy && succeeded && recovered);
     assert_eq!(
-        std::fs::read_to_string(workspace.join("src/index.html")).unwrap(),
+        std::fs::read_to_string(
+            workspace
+                .join("project-01")
+                .join("work-04")
+                .join("src/index.html"),
+        )
+        .unwrap(),
         "<!doctype html>"
     );
-    let diagnostics =
-        String::from_utf8(child.stderr.take().unwrap().bytes().flatten().collect()).unwrap();
+    let mut diagnostics = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut diagnostics)
+        .unwrap();
     assert!(!diagnostics.contains("<!doctype html>"));
 }

@@ -22,8 +22,8 @@ use sentinel_common::agent_config::{load_all_agents_with_validation, AgentConfig
 use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::events::{DomainEvent, DomainEventPayload};
 use sentinel_common::nano_runtime::{
-    NanoHandle, NanoRuntimeRegistry, NanoRuntimeResources, NanoStopResult, NanoWorkloadSpec,
-    RUNTIME_BWRAP_LANDLOCK,
+    NanoExecRequest, NanoExecResult, NanoHandle, NanoRuntimeRegistry, NanoRuntimeResources,
+    NanoStopResult, NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
 };
 use sentinel_common::{AgentId, AgentIdBounds, OperatorCommand, Perception};
 use sentinel_ebpf::collector::MetricsSnapshot;
@@ -289,6 +289,37 @@ impl DaemonNanoRuntimeRegistry {
     #[cfg(test)]
     fn registered_keys(&self) -> Vec<String> {
         self.registry.keys()
+    }
+}
+
+impl crate::workbench::WorkbenchRuntimeClient for DaemonNanoRuntimeRegistry {
+    fn exchange(&mut self, agent_id: AgentId, request: NanoExecRequest) -> Result<NanoExecResult> {
+        let handle = self
+            .handles
+            .get(&agent_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("NanoRuntime handle does not exist for {agent_id}"))?;
+        if handle.runtime_key != RUNTIME_BWRAP_LANDLOCK {
+            return Err(anyhow!(
+                "workbench requires '{RUNTIME_BWRAP_LANDLOCK}', selected '{}'",
+                handle.runtime_key
+            ));
+        }
+        let resources = self.registry.resources(&handle)?;
+        if !resources.cgroup_created
+            || !resources.landlock_applied
+            || !resources.network_isolated
+            || resources.child_pid.is_none()
+        {
+            return Err(anyhow!(
+                "workbench runtime isolation is not fully attested: cgroup={}, landlock={}, network={}, child_pid={}",
+                resources.cgroup_created,
+                resources.landlock_applied,
+                resources.network_isolated,
+                resources.child_pid.is_some()
+            ));
+        }
+        self.registry.exec(&handle, request)
     }
 }
 
@@ -8245,6 +8276,17 @@ mod tests {
         let (second_handle, _) = registry.spawn(&second, &[]).unwrap();
         assert_eq!(first_handle.agent_id, Some(AgentId(1)));
         assert_eq!(second_handle.agent_id, Some(AgentId(2)));
+        assert!(crate::workbench::WorkbenchRuntimeClient::exchange(
+            &mut registry,
+            AgentId(1),
+            NanoExecRequest {
+                operation: "workbench_poll".to_string(),
+                input: "invocation".to_string(),
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("workbench requires"));
 
         let stopped = registry.stop(AgentId(1)).unwrap().unwrap();
         assert_eq!(

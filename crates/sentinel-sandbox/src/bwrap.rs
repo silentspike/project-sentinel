@@ -43,6 +43,8 @@ pub struct BwrapConfig {
     pub tmpfs: Vec<String>,
     pub share_net: bool,
     pub die_with_parent: bool,
+    /// Clear the parent daemon environment before starting the sandbox.
+    pub clear_environment: bool,
     /// Mount /proc inside the sandbox (TOGAF: --proc /proc).
     pub proc_mount: Option<String>,
     /// Mount /dev inside the sandbox (TOGAF: --dev /dev).
@@ -88,6 +90,7 @@ impl BwrapConfig {
             // Gateway on the host. No --share-net -> own netns, loopback only.
             share_net: false,
             die_with_parent: true,
+            clear_environment: false,
             // TOGAF: --proc /proc
             proc_mount: Some("/proc".to_string()),
             // TOGAF: --dev /dev
@@ -108,6 +111,38 @@ impl BwrapConfig {
             format!("{fs_mount}/{host_agent_dir}"),
             format!("/home/{guest_name}"),
         ));
+        self
+    }
+
+    /// Mounts the agent-owned workbench roots at the stable protocol paths.
+    ///
+    /// The backing directories remain inside the same per-agent filesystem;
+    /// the additional binds do not expose any host path outside that boundary.
+    pub fn with_workbench_roots(mut self, host_agent_root: &Path) -> Self {
+        self.writable_binds.push((
+            host_agent_root
+                .join("workspaces")
+                .to_string_lossy()
+                .into_owned(),
+            "/workspace".to_string(),
+        ));
+        self.writable_binds.push((
+            host_agent_root
+                .join("artifacts")
+                .to_string_lossy()
+                .into_owned(),
+            "/artifacts".to_string(),
+        ));
+        self
+    }
+
+    /// Removes broad host-data binds that are not part of an explicit M0 input.
+    pub fn for_workbench(mut self) -> Self {
+        self.readonly_binds
+            .retain(|(_, guest)| guest != "/company" && guest != "/etc/resolv.conf");
+        self.writable_binds
+            .retain(|(_, guest)| !guest.starts_with("/home/"));
+        self.clear_environment = true;
         self
     }
 
@@ -168,6 +203,14 @@ impl BwrapConfig {
         let (read_fd, write_fd) = (fds[0], fds[1]);
 
         let mut cmd = Command::new("bwrap");
+        if config.clear_environment {
+            cmd.env_clear().envs([
+                ("HOME", "/workspace"),
+                ("LANG", "C.UTF-8"),
+                ("LC_ALL", "C.UTF-8"),
+                ("PATH", "/usr/bin:/bin"),
+            ]);
+        }
         cmd.args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped());
@@ -465,6 +508,30 @@ mod tests {
         assert!(args.contains(&"--bind".to_string()));
         assert!(args.contains(&"/ram/agents/test".to_string()));
         assert!(args.contains(&"/home/test".to_string()));
+    }
+
+    #[test]
+    fn workbench_roots_stay_inside_the_agent_backing_directory() {
+        let config = BwrapConfig::for_agent("test")
+            .for_workbench()
+            .with_workbench_roots(Path::new("/ram/agents/test"));
+        assert!(config.writable_binds.contains(&(
+            "/ram/agents/test/workspaces".to_string(),
+            "/workspace".to_string(),
+        )));
+        assert!(!config
+            .readonly_binds
+            .iter()
+            .any(|(_, guest)| guest == "/company" || guest == "/etc/resolv.conf"));
+        assert!(!config
+            .writable_binds
+            .iter()
+            .any(|(_, guest)| guest.starts_with("/home/")));
+        assert!(config.clear_environment);
+        assert!(config.writable_binds.contains(&(
+            "/ram/agents/test/artifacts".to_string(),
+            "/artifacts".to_string(),
+        )));
     }
 
     #[test]
