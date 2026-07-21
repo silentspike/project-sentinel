@@ -5,7 +5,7 @@ use std::io::Read;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -43,7 +43,7 @@ impl SpawnedSandbox {
 
 pub(crate) fn terminate_sandbox_process(child: &mut Child, child_pid: Option<u32>) {
     if let Some(pid) = child_pid {
-        signal_pid(pid, libc::SIGTERM);
+        signal_pid(pid, "TERM");
     }
 
     match child.try_wait() {
@@ -62,7 +62,7 @@ pub(crate) fn terminate_sandbox_process(child: &mut Child, child_pid: Option<u32
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        signal_pid(pid, libc::SIGKILL);
+        signal_pid(pid, "KILL");
         for _ in 0..20 {
             if !Path::new(&format!("/proc/{pid}")).exists() {
                 return;
@@ -73,13 +73,12 @@ pub(crate) fn terminate_sandbox_process(child: &mut Child, child_pid: Option<u32
     }
 }
 
-fn signal_pid(pid: u32, signal: libc::c_int) {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return;
-    };
-    // SAFETY: kill only reads the validated PID and signal value. ESRCH is an
-    // expected race when bwrap has already reaped the sandboxed process.
-    let _ = unsafe { libc::kill(pid, signal) };
+fn signal_pid(pid: u32, signal: &str) {
+    let _ = Command::new("kill")
+        .args([format!("-{signal}"), pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Bubblewrap sandbox configuration fuer einen einzelnen Agenten.
