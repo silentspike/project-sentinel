@@ -168,7 +168,9 @@ impl BwrapConfig {
         let (read_fd, write_fd) = (fds[0], fds[1]);
 
         let mut cmd = Command::new("bwrap");
-        cmd.args(&args).stdin(std::process::Stdio::piped());
+        cmd.args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
         // SAFETY: the closure runs in the forked child before exec and only
         // calls async-signal-safe fcntl/dup2 on a captured raw fd.
         unsafe {

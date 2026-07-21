@@ -15,6 +15,9 @@
   metadata, and agent-home filesystem state. It does not checkpoint process RAM
   and does not claim CRIU/live-process migration. Its idempotent `stop` releases
   the addressed process, cgroup, retained home-snapshot pins, and adapter state.
+  Its workbench exec channel uses bounded nonblocking start/poll/cancel JSONL
+  exchanges, binds every response to one invocation, and terminates the selected
+  workload on protocol, output, deadline, cancellation, or EOF boundary failure.
 
 ## Dependencies
 
