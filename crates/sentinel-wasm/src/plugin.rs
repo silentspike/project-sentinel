@@ -111,6 +111,15 @@ impl PluginHost {
         self.cache.contains_key(&Self::canonical(wasm_path))
     }
 
+    /// Removes one compiled component and its execution limits from the cache.
+    /// Callers must ensure no remaining workload references the path.
+    pub fn unload(&mut self, wasm_path: &Path) -> bool {
+        let canonical = Self::canonical(wasm_path);
+        let removed_component = self.cache.remove(&canonical).is_some();
+        let removed_config = self.configs.remove(&canonical).is_some();
+        removed_component || removed_config
+    }
+
     /// Kanonisiert einen Pfad fuer konsistente Cache-Key-Lookups.
     fn canonical(path: &Path) -> PathBuf {
         path.canonicalize().unwrap_or_else(|_| path.to_path_buf())

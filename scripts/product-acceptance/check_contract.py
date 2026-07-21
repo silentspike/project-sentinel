@@ -38,7 +38,7 @@ REQUIRED_CATEGORIES = {
     "workspace",
 }
 
-DELIVERY_ISSUES = {75, 472, 650, 693, 694, 695, 696}
+DELIVERY_ISSUES = {75, 472, 650, 693, 694, 695, 696, 698}
 ALLOWED_STATUSES = {"blocked", "not_tested", "pass"}
 
 REQUIRED_ROLES = {
