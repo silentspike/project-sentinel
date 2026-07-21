@@ -43,6 +43,7 @@ impl Clock for SystemClock {
 pub struct WorkflowEngine {
     store: Arc<WorkflowStore>,
     execution_port: Arc<dyn WorkExecutionPort>,
+    organization_port: Arc<dyn OrganizationRuntimePort>,
     clock: Arc<dyn Clock>,
 }
 
@@ -55,25 +56,36 @@ impl std::fmt::Debug for WorkflowEngine {
 }
 
 impl WorkflowEngine {
-    pub fn new(store: Arc<WorkflowStore>, execution_port: Arc<dyn WorkExecutionPort>) -> Self {
-        Self::with_clock(store, execution_port, Arc::new(SystemClock))
+    pub fn new(
+        store: Arc<WorkflowStore>,
+        execution_port: Arc<dyn WorkExecutionPort>,
+        organization_port: Arc<dyn OrganizationRuntimePort>,
+    ) -> Self {
+        Self::with_clock(
+            store,
+            execution_port,
+            organization_port,
+            Arc::new(SystemClock),
+        )
     }
 
     pub fn with_clock(
         store: Arc<WorkflowStore>,
         execution_port: Arc<dyn WorkExecutionPort>,
+        organization_port: Arc<dyn OrganizationRuntimePort>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             store,
             execution_port,
+            organization_port,
             clock,
         }
     }
 
     pub fn execute(
         &self,
-        actor: AuthenticatedActor,
+        actor: AuthenticatedPrincipal,
         operation_id: &str,
         command: WorkflowCommand,
     ) -> Result<CommandOutcome, WorkflowError> {
@@ -81,11 +93,36 @@ impl WorkflowEngine {
         validate_text(operation_id, "operation id")?;
         let operation_digest = canonical_digest(&(actor.clone(), command.clone()))?;
         let digest_for_apply = operation_digest.clone();
+        let operation_namespace = actor.idempotency_namespace();
         let now_ms = self.clock.now_ms();
-        self.store
-            .execute(operation_id, &operation_digest, now_ms, move |tx| {
-                apply_command(tx, &actor, operation_id, &digest_for_apply, command, now_ms)
-            })
+        let organization_port = Arc::clone(&self.organization_port);
+        self.store.execute(
+            &operation_namespace,
+            operation_id,
+            &operation_digest,
+            now_ms,
+            move |tx| {
+                apply_command(
+                    tx,
+                    organization_port.as_ref(),
+                    &actor,
+                    operation_id,
+                    &digest_for_apply,
+                    command,
+                    now_ms,
+                )
+            },
+        )
+    }
+
+    pub fn mutation_readiness(&self) -> DependencyReadiness {
+        if self.execution_port.readiness() == DependencyReadiness::Ready
+            && self.organization_port.readiness() == DependencyReadiness::Ready
+        {
+            DependencyReadiness::Ready
+        } else {
+            DependencyReadiness::Unavailable
+        }
     }
 
     /// Dispatches durable execution requests through the injected port.
@@ -99,6 +136,20 @@ impl WorkflowEngine {
         let mut receipts = Vec::new();
         for request in pending {
             let now_ms = self.clock.now_ms();
+            let authority = self
+                .organization_port
+                .agent_snapshot(request.agent_id)
+                .map_err(|_| organization_conflict("organization authority is unavailable"))?;
+            authority
+                .verify()
+                .map_err(|_| organization_conflict("organization authority digest is invalid"))?;
+            if authority.generation != request.organization_generation
+                || authority.digest != request.organization_digest
+            {
+                return Err(organization_conflict(
+                    "organization authority changed before execution dispatch",
+                ));
+            }
             let receipt = match self.execution_port.reserve(&request) {
                 Ok(receipt)
                     if receipt.accepted && receipt.invocation_id == request.invocation_id =>
@@ -152,6 +203,7 @@ impl WorkflowEngine {
                     &item.spec.id.0,
                     &request.requested_by,
                     request.requested_role,
+                    &request.tenant_id,
                     &request.invocation_id,
                     &canonical_digest(&request)?,
                     Some("claimed"),
@@ -211,6 +263,7 @@ impl WorkflowEngine {
                     &blocker.id.0,
                     &request.requested_by,
                     request.requested_role,
+                    &request.tenant_id,
                     &request.invocation_id,
                     &canonical_digest(request)?,
                     None,
@@ -233,12 +286,66 @@ impl WorkflowEngine {
         self.store.entity(ENTITY_REQUEST, &request_id.0)
     }
 
+    pub fn customer_request_for(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        request_id: &CustomerRequestId,
+    ) -> Result<Option<CustomerRequest>, WorkflowError> {
+        validate_actor(principal)?;
+        let request = self.customer_request(request_id)?;
+        match request {
+            Some(request) if principal_can_read_request(principal, &request) => Ok(Some(request)),
+            Some(_) => unauthorized("principal cannot read another tenant's customer request"),
+            None => Ok(None),
+        }
+    }
+
     pub fn project(&self, project_id: &ProjectId) -> Result<Option<Project>, WorkflowError> {
         self.store.entity(ENTITY_PROJECT, &project_id.0)
     }
 
+    pub fn project_for(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        project_id: &ProjectId,
+    ) -> Result<Option<Project>, WorkflowError> {
+        validate_actor(principal)?;
+        let project = self.project(project_id)?;
+        match project {
+            Some(project) if principal_can_read_project(principal, &project) => Ok(Some(project)),
+            Some(_) => unauthorized("principal cannot read another tenant's project"),
+            None => Ok(None),
+        }
+    }
+
     pub fn work_item(&self, work_item_id: &WorkItemId) -> Result<Option<WorkItem>, WorkflowError> {
         self.store.entity(ENTITY_WORK_ITEM, &work_item_id.0)
+    }
+
+    pub fn work_item_for(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        work_item_id: &WorkItemId,
+    ) -> Result<Option<WorkItem>, WorkflowError> {
+        validate_actor(principal)?;
+        let item = self.work_item(work_item_id)?;
+        match item {
+            Some(item) => {
+                let project = self.project(&item.project_id)?.ok_or_else(|| {
+                    WorkflowError::new(
+                        WorkflowErrorCode::NotFound,
+                        false,
+                        "work-item project was not found",
+                    )
+                })?;
+                if principal_can_read_project(principal, &project) {
+                    Ok(Some(item))
+                } else {
+                    unauthorized("principal cannot read another tenant's work item")
+                }
+            }
+            None => Ok(None),
+        }
     }
 
     pub fn project_projection(
@@ -248,17 +355,53 @@ impl WorkflowEngine {
         self.store.project_projection(project_id)
     }
 
+    pub fn project_projection_for(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        project_id: &ProjectId,
+    ) -> Result<Option<ProjectProjection>, WorkflowError> {
+        validate_actor(principal)?;
+        let projection = self.project_projection(project_id)?;
+        match projection {
+            Some(projection) if projection.tenant_id == principal.tenant_id => Ok(Some(projection)),
+            Some(_) => unauthorized("principal cannot read another tenant's projection"),
+            None => Ok(None),
+        }
+    }
+
     pub fn events_since(
         &self,
+        principal: &AuthenticatedPrincipal,
         after_sequence: i64,
         limit: usize,
     ) -> Result<Vec<WorkflowEvent>, WorkflowError> {
-        self.store.events_since(after_sequence, limit)
+        validate_actor(principal)?;
+        self.store
+            .events_since(&principal.tenant_id, after_sequence, limit)
+    }
+
+    pub fn projection_checkpoint(&self) -> Result<ProjectionCheckpoint, WorkflowError> {
+        self.store.projection_checkpoint()
+    }
+
+    pub fn rebuild_project_projections(&self) -> Result<ProjectionCheckpoint, WorkflowError> {
+        let now_ms = self.clock.now_ms();
+        self.store.write(|tx| {
+            tx.clear_projections()?;
+            let high_watermark = tx.event_high_watermark()?;
+            for project_id in tx.project_ids()? {
+                refresh_project_projection(tx, &project_id, high_watermark, now_ms)?;
+            }
+            tx.mark_projection_rebuilt(now_ms)?;
+            Ok(())
+        })?;
+        self.store.projection_checkpoint()
     }
 }
 
 fn apply_command(
     tx: &WorkflowTransaction<'_>,
+    organization_port: &dyn OrganizationRuntimePort,
     actor: &AuthenticatedActor,
     operation_id: &str,
     operation_digest: &str,
@@ -267,20 +410,21 @@ fn apply_command(
 ) -> Result<WorkflowResponse, WorkflowError> {
     match command {
         WorkflowCommand::SubmitCustomerRequest {
-            customer_id,
             summary_ref,
             desired_outcome,
             constraints,
         } => {
             require_role(actor, &[ActorRole::Customer])?;
-            if actor.customer_id.as_deref() != Some(customer_id.as_str()) {
-                return unauthorized("customer identity does not match the authenticated actor");
-            }
+            let customer_id = actor
+                .customer_id
+                .clone()
+                .ok_or_else(|| organization_conflict("customer principal is not bound"))?;
             validate_text(&summary_ref, "summary reference")?;
             validate_text(&desired_outcome, "desired outcome")?;
             let request = CustomerRequest {
                 schema_version: WORKFLOW_SCHEMA_VERSION,
                 id: CustomerRequestId::new("request"),
+                tenant_id: actor.tenant_id.clone(),
                 customer_id,
                 summary_ref,
                 desired_outcome,
@@ -333,7 +477,7 @@ fn apply_command(
             request.clarifications.push(Clarification {
                 question_ref,
                 answer_ref,
-                recorded_by: actor.actor_id.clone(),
+                recorded_by: actor.principal_id.clone(),
                 recorded_at_ms: now_ms,
             });
             request.state = CustomerRequestState::Clarifying;
@@ -365,6 +509,7 @@ fn apply_command(
             validate_text(&reason, "qualification reason")?;
             let mut request: CustomerRequest =
                 required_entity(tx, ENTITY_REQUEST, &request_id.0, "customer request")?;
+            authorize_customer_request(actor, &request)?;
             require_version(request.version, expected_version)?;
             if !matches!(
                 request.state,
@@ -402,6 +547,7 @@ fn apply_command(
             validate_proposal(&binding, now_ms)?;
             let mut request: CustomerRequest =
                 required_entity(tx, ENTITY_REQUEST, &request_id.0, "customer request")?;
+            authorize_customer_request(actor, &request)?;
             require_version(request.version, expected_version)?;
             if request.state != CustomerRequestState::Qualified {
                 return invalid_transition("proposal requires a qualified request");
@@ -409,11 +555,12 @@ fn apply_command(
             let proposal = Proposal {
                 schema_version: WORKFLOW_SCHEMA_VERSION,
                 id: ProposalId::new("proposal"),
+                tenant_id: request.tenant_id.clone(),
                 customer_request_id: request.id.clone(),
                 generation: request.proposal_ids.len() as u32 + 1,
                 digest: canonical_digest(&binding)?,
                 binding,
-                created_by: actor.actor_id.clone(),
+                created_by: actor.principal_id.clone(),
                 created_at_ms: now_ms,
             };
             request.proposal_ids.push(proposal.id.clone());
@@ -443,9 +590,6 @@ fn apply_command(
             expected_version,
             proposal_id,
             proposal_digest,
-            profile_id,
-            project_owner,
-            mut participants,
         } => {
             require_role(actor, &[ActorRole::Customer])?;
             let mut request: CustomerRequest =
@@ -457,7 +601,10 @@ fn apply_command(
             }
             let proposal: Proposal =
                 required_entity(tx, ENTITY_PROPOSAL, &proposal_id.0, "proposal")?;
-            if proposal.customer_request_id != request.id || proposal.digest != proposal_digest {
+            if proposal.customer_request_id != request.id
+                || proposal.digest != proposal_digest
+                || proposal.digest != canonical_digest(&proposal.binding)?
+            {
                 return Err(WorkflowError::new(
                     WorkflowErrorCode::DigestConflict,
                     false,
@@ -467,31 +614,32 @@ fn apply_command(
             if proposal.binding.expires_at_ms <= now_ms {
                 return invalid_transition("proposal is expired");
             }
-            validate_text(&profile_id, "profile id")?;
-            if !participants.contains(&project_owner) {
-                participants.push(project_owner);
+            validate_proposal_governance(&proposal.binding.governance)?;
+            if proposal.tenant_id != request.tenant_id {
+                return unauthorized("proposal belongs to another tenant");
             }
-            participants.sort_by_key(|agent_id| agent_id.0);
-            participants.dedup();
+            let governance = &proposal.binding.governance;
             let agreement = Agreement {
                 schema_version: WORKFLOW_SCHEMA_VERSION,
                 id: AgreementId::new("agreement"),
+                tenant_id: request.tenant_id.clone(),
                 customer_request_id: request.id.clone(),
                 proposal_id: proposal.id.clone(),
                 proposal_digest: proposal.digest.clone(),
                 proposal_binding: proposal.binding.clone(),
                 customer_id: request.customer_id.clone(),
-                accepted_by: actor.actor_id.clone(),
+                accepted_by: actor.principal_id.clone(),
                 accepted_at_ms: now_ms,
             };
             let project = Project {
                 schema_version: WORKFLOW_SCHEMA_VERSION,
                 id: ProjectId::new("project"),
+                tenant_id: request.tenant_id.clone(),
                 agreement_id: agreement.id.clone(),
                 agreement_digest: agreement.proposal_digest.clone(),
-                profile_id,
-                owner: project_owner,
-                participants,
+                profile_id: governance.profile_id.clone(),
+                owner: governance.owner,
+                participants: governance.participants.clone(),
                 cost_ceiling_micros: proposal.binding.cost_ceiling_micros,
                 provider_cost_ceilings_micros: proposal
                     .binding
@@ -539,7 +687,10 @@ fn apply_command(
                 now_ms,
             )?;
             refresh_project_projection(tx, &project.id, sequence, now_ms)?;
-            Ok(WorkflowResponse::AgreementProject { agreement, project })
+            Ok(WorkflowResponse::AgreementProject {
+                agreement: Box::new(agreement),
+                project: Box::new(project),
+            })
         }
         WorkflowCommand::RejectProposal {
             request_id,
@@ -650,7 +801,7 @@ fn apply_command(
             }
             let feedback = CustomerFeedback {
                 feedback_ref,
-                recorded_by: actor.actor_id.clone(),
+                recorded_by: actor.principal_id.clone(),
                 recorded_at_ms: now_ms,
             };
             request.feedback.push(feedback.clone());
@@ -759,6 +910,7 @@ fn apply_command(
             reason,
         } => assign_work(
             tx,
+            organization_port,
             actor,
             operation_id,
             operation_digest,
@@ -776,6 +928,7 @@ fn apply_command(
             deadline_ms,
         } => claim_work(
             tx,
+            organization_port,
             actor,
             operation_id,
             operation_digest,
@@ -831,7 +984,7 @@ fn apply_command(
                 alternatives,
                 rationale_ref,
                 evidence_refs,
-                decided_by: actor.actor_id.clone(),
+                decided_by: actor.principal_id.clone(),
                 created_at_ms: now_ms,
             };
             tx.put_entity(ENTITY_DECISION, &decision.id.0, 1, &decision)?;
@@ -1062,12 +1215,13 @@ fn apply_command(
 #[allow(clippy::too_many_arguments)]
 fn assign_work(
     tx: &WorkflowTransaction<'_>,
+    organization_port: &dyn OrganizationRuntimePort,
     actor: &AuthenticatedActor,
     operation_id: &str,
     operation_digest: &str,
     work_item_id: WorkItemId,
     expected_version: u64,
-    assignee: AgentProfile,
+    assignee_id: AgentId,
     reason: String,
     now_ms: u64,
 ) -> Result<WorkflowResponse, WorkflowError> {
@@ -1076,6 +1230,18 @@ fn assign_work(
         &[ActorRole::ProjectManager, ActorRole::TechnicalLead],
     )?;
     validate_text(&reason, "assignment reason")?;
+    let authority = organization_port
+        .agent_snapshot(assignee_id)
+        .map_err(|_| organization_conflict("authoritative agent profile is unavailable"))?;
+    authority
+        .verify()
+        .map_err(|_| organization_conflict("authoritative agent profile digest is invalid"))?;
+    if authority.profile.agent_id != assignee_id {
+        return Err(organization_conflict(
+            "organization snapshot subject does not match requested assignee",
+        ));
+    }
+    let assignee = authority.profile.clone();
     let mut item: WorkItem = required_entity(tx, ENTITY_WORK_ITEM, &work_item_id.0, "work item")?;
     require_version(item.version, expected_version)?;
     if !matches!(item.state, WorkItemState::Ready | WorkItemState::Assigned) {
@@ -1130,7 +1296,9 @@ fn assign_work(
         work_item_id: item.spec.id.clone(),
         assignee: assignee.agent_id,
         assignee_profile: assignee,
-        assigned_by: actor.actor_id.clone(),
+        organization_generation: authority.generation,
+        organization_digest: authority.digest,
+        assigned_by: actor.principal_id.clone(),
         assignment_version: item.assignment_version,
         reason,
         active: true,
@@ -1160,6 +1328,7 @@ fn assign_work(
 #[allow(clippy::too_many_arguments)]
 fn claim_work(
     tx: &WorkflowTransaction<'_>,
+    organization_port: &dyn OrganizationRuntimePort,
     actor: &AuthenticatedActor,
     operation_id: &str,
     operation_digest: &str,
@@ -1185,6 +1354,36 @@ fn claim_work(
     if actor.role != item.spec.required_role {
         return unauthorized("authenticated role does not match the work assignment");
     }
+    let project: Project = required_entity(tx, ENTITY_PROJECT, &item.project_id.0, "project")?;
+    authorize_project_actor(actor, &project)?;
+    let assignment = tx
+        .entities::<Assignment>(ENTITY_ASSIGNMENT)?
+        .into_iter()
+        .find(|assignment| {
+            assignment.work_item_id == item.spec.id
+                && assignment.assignment_version == item.assignment_version
+                && assignment.active
+        })
+        .ok_or_else(|| {
+            WorkflowError::new(
+                WorkflowErrorCode::InvalidTransition,
+                false,
+                "active assignment authority snapshot was not found",
+            )
+        })?;
+    let current_authority = organization_port
+        .agent_snapshot(agent_id)
+        .map_err(|_| organization_conflict("organization authority is unavailable at claim"))?;
+    current_authority
+        .verify()
+        .map_err(|_| organization_conflict("organization authority digest is invalid at claim"))?;
+    if current_authority.generation != assignment.organization_generation
+        || current_authority.digest != assignment.organization_digest
+    {
+        return Err(organization_conflict(
+            "organization authority changed after assignment",
+        ));
+    }
     item.state = WorkItemState::Claimed;
     item.version += 1;
     item.updated_at_ms = now_ms;
@@ -1195,9 +1394,12 @@ fn claim_work(
         project_id: item.project_id.clone(),
         work_item_id: item.spec.id.clone(),
         agent_id,
-        requested_by: actor.actor_id.clone(),
+        requested_by: actor.principal_id.clone(),
         requested_role: actor.role,
+        tenant_id: project.tenant_id,
         assignment_version: item.assignment_version,
+        organization_generation: assignment.organization_generation,
+        organization_digest: assignment.organization_digest,
         capabilities: item.spec.required_capabilities.clone(),
         input_digest,
         deadline_ms,
@@ -1259,6 +1461,8 @@ fn complete_work(
     if item.state != WorkItemState::InProgress {
         return invalid_transition("work item has no accepted execution in progress");
     }
+    let mut project: Project = required_entity(tx, ENTITY_PROJECT, &item.project_id.0, "project")?;
+    authorize_project_actor(actor, &project)?;
     if item.assignment_version != assignment_version {
         return Err(WorkflowError::new(
             WorkflowErrorCode::VersionConflict,
@@ -1286,7 +1490,7 @@ fn complete_work(
         output_refs: output_refs.clone(),
         gate_id,
         gate_passed,
-        recorded_by: actor.actor_id.clone(),
+        recorded_by: actor.principal_id.clone(),
         recorded_at_ms: now_ms,
     };
     item.output_refs = output_refs;
@@ -1297,7 +1501,6 @@ fn complete_work(
     tx.put_entity(ENTITY_EVIDENCE, &evidence.id.0, 1, &evidence)?;
     tx.put_entity(ENTITY_WORK_ITEM, &item.spec.id.0, item.version, &item)?;
     unlock_dependents(tx, &item.project_id, &item.spec.id, now_ms)?;
-    let mut project: Project = required_entity(tx, ENTITY_PROJECT, &item.project_id.0, "project")?;
     let all_items: Vec<WorkItem> = tx
         .entities::<WorkItem>(ENTITY_WORK_ITEM)?
         .into_iter()
@@ -1349,6 +1552,7 @@ fn create_handoff(
         return unauthorized("only the authenticated producer may create a handoff");
     }
     let project: Project = required_entity(tx, ENTITY_PROJECT, &project_id.0, "project")?;
+    authorize_project_actor(actor, &project)?;
     if !project.participants.contains(&producer) || !project.participants.contains(&consumer) {
         return unauthorized("handoff participants must belong to the project");
     }
@@ -1408,6 +1612,8 @@ fn acknowledge_handoff(
     now_ms: u64,
 ) -> Result<WorkflowResponse, WorkflowError> {
     let mut handoff: Handoff = required_entity(tx, ENTITY_HANDOFF, &handoff_id.0, "handoff")?;
+    let project: Project = required_entity(tx, ENTITY_PROJECT, &handoff.project_id.0, "project")?;
+    authorize_project_actor(actor, &project)?;
     if actor.agent_id != Some(handoff.consumer) || handoff.state != HandoffState::Offered {
         return unauthorized("only the designated consumer may acknowledge an open handoff");
     }
@@ -1668,7 +1874,7 @@ fn record_approval(
         } else {
             ApprovalState::Rejected
         },
-        actor_id: actor.actor_id.clone(),
+        actor_id: actor.principal_id.clone(),
         actor_role: actor.role,
         reason,
         created_at_ms: now_ms,
@@ -1812,7 +2018,7 @@ fn reserve_cost(
         provider,
         amount_micros,
         committed_micros: None,
-        created_by: actor.actor_id.clone(),
+        created_by: actor.principal_id.clone(),
         created_at_ms: now_ms,
     };
     tx.put_entity(ENTITY_COST_RESERVATION, &reservation.id.0, 1, &reservation)?;
@@ -2002,7 +2208,7 @@ fn create_project_room(
         kind,
         team_ref,
         members,
-        created_by: actor.actor_id.clone(),
+        created_by: actor.principal_id.clone(),
         created_at_ms: now_ms,
     };
     tx.put_entity(ENTITY_PROJECT_ROOM, &room.id.0, 1, &room)?;
@@ -2061,7 +2267,7 @@ fn record_action_item(
         due_at_ms,
         state: ActionItemState::Open,
         resolution_ref: None,
-        created_by: actor.actor_id.clone(),
+        created_by: actor.principal_id.clone(),
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
     };
@@ -2165,7 +2371,7 @@ fn record_question(
         owner,
         state: ProjectQuestionState::Open,
         resolution_ref: None,
-        created_by: actor.actor_id.clone(),
+        created_by: actor.principal_id.clone(),
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
     };
@@ -2251,19 +2457,30 @@ fn validate_optional_work_item(
 }
 
 fn validate_actor(actor: &AuthenticatedActor) -> Result<(), WorkflowError> {
-    validate_text(&actor.actor_id, "actor id")?;
-    match actor.role {
-        ActorRole::Customer
-            if actor
-                .customer_id
-                .as_deref()
-                .is_some_and(|id| !id.is_empty()) =>
+    validate_text(&actor.principal_id, "principal id")?;
+    validate_text(&actor.tenant_id, "principal tenant")?;
+    match actor.kind {
+        PrincipalKind::Customer
+            if actor.role == ActorRole::Customer
+                && actor
+                    .customer_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty())
+                && actor.agent_id.is_none() =>
         {
             Ok(())
         }
-        ActorRole::Customer => invalid_input("customer actor requires a customer identity"),
-        _ if actor.agent_id.is_some() => Ok(()),
-        _ => invalid_input("internal actor requires an AgentId"),
+        PrincipalKind::Customer => invalid_input("customer principal binding is inconsistent"),
+        PrincipalKind::Operator | PrincipalKind::Agent
+            if actor.role.is_internal()
+                && actor.customer_id.is_none()
+                && actor.agent_id.is_some() =>
+        {
+            Ok(())
+        }
+        PrincipalKind::Operator | PrincipalKind::Agent => {
+            invalid_input("internal principal binding is inconsistent")
+        }
     }
 }
 
@@ -2279,7 +2496,9 @@ fn authorize_customer_request(
     actor: &AuthenticatedActor,
     request: &CustomerRequest,
 ) -> Result<(), WorkflowError> {
-    if actor.role == ActorRole::Customer
+    if actor.tenant_id != request.tenant_id {
+        unauthorized("principal cannot access another tenant's customer request")
+    } else if actor.role == ActorRole::Customer
         && actor.customer_id.as_deref() != Some(request.customer_id.as_str())
     {
         unauthorized("customer cannot access another customer's request")
@@ -2292,10 +2511,36 @@ fn authorize_project_actor(
     actor: &AuthenticatedActor,
     project: &Project,
 ) -> Result<(), WorkflowError> {
+    if actor.tenant_id != project.tenant_id {
+        return unauthorized("principal cannot access another tenant's project");
+    }
     match actor.agent_id {
         Some(agent_id) if project.participants.contains(&agent_id) => Ok(()),
         _ => unauthorized("actor is not an authorized project participant"),
     }
+}
+
+fn principal_can_read_request(
+    principal: &AuthenticatedPrincipal,
+    request: &CustomerRequest,
+) -> bool {
+    if principal.tenant_id != request.tenant_id {
+        return false;
+    }
+    match principal.kind {
+        PrincipalKind::Customer => {
+            principal.customer_id.as_deref() == Some(request.customer_id.as_str())
+        }
+        PrincipalKind::Operator | PrincipalKind::Agent => true,
+    }
+}
+
+fn principal_can_read_project(principal: &AuthenticatedPrincipal, project: &Project) -> bool {
+    principal.tenant_id == project.tenant_id
+        && matches!(
+            principal.kind,
+            PrincipalKind::Operator | PrincipalKind::Agent
+        )
 }
 
 fn validate_work_graph(items: &[WorkItemSpec]) -> Result<(), WorkflowError> {
@@ -2369,6 +2614,7 @@ fn visit_dag(
 
 fn validate_proposal(binding: &ProposalBinding, now_ms: u64) -> Result<(), WorkflowError> {
     validate_text(&binding.scope, "proposal scope")?;
+    validate_proposal_governance(&binding.governance)?;
     if binding.deliverables.is_empty()
         || binding.acceptance_criteria.is_empty()
         || binding.cost_ceiling_micros == 0
@@ -2382,6 +2628,21 @@ fn validate_proposal(binding: &ProposalBinding, now_ms: u64) -> Result<(), Workf
         if *ceiling == 0 || *ceiling > binding.cost_ceiling_micros {
             return invalid_input("provider ceiling must be positive and within project budget");
         }
+    }
+    Ok(())
+}
+
+fn validate_proposal_governance(governance: &ProposalGovernance) -> Result<(), WorkflowError> {
+    validate_text(&governance.profile_id, "proposal governance profile")?;
+    validate_text(&governance.policy_id, "proposal governance policy")?;
+    if governance.participants.is_empty() || !governance.participants.contains(&governance.owner) {
+        return invalid_input("proposal governance owner and participants are incomplete");
+    }
+    let mut participants = governance.participants.clone();
+    participants.sort_by_key(|agent_id| agent_id.0);
+    participants.dedup();
+    if participants != governance.participants {
+        return invalid_input("proposal governance participants must be sorted and unique");
     }
     Ok(())
 }
@@ -2514,6 +2775,7 @@ fn refresh_project_projection(
     tx.put_projection(&ProjectProjection {
         schema_version: WORKFLOW_SCHEMA_VERSION,
         project_id: project.id,
+        tenant_id: project.tenant_id,
         agreement,
         state: project.state,
         work_items_total: work_items.len() as u32,
@@ -2559,8 +2821,9 @@ fn append_event<T: Serialize>(
         event_type,
         aggregate_type,
         aggregate_id,
-        &actor.actor_id,
+        &actor.principal_id,
         actor.role,
+        &actor.tenant_id,
         operation_id,
         operation_digest,
         before_state,
@@ -2579,6 +2842,7 @@ fn workflow_event<T: Serialize>(
     aggregate_id: &str,
     actor_id: &str,
     actor_role: ActorRole,
+    tenant_id: &str,
     operation_id: &str,
     operation_digest: &str,
     before_state: Option<&str>,
@@ -2594,6 +2858,8 @@ fn workflow_event<T: Serialize>(
         event_type,
         aggregate_type: aggregate_type.to_string(),
         aggregate_id: aggregate_id.to_string(),
+        tenant_id: tenant_id.to_string(),
+        principal_id: actor_id.to_string(),
         actor_id: actor_id.to_string(),
         actor_role,
         operation_id: operation_id.to_string(),
@@ -2711,6 +2977,14 @@ fn unauthorized<T>(message: &str) -> Result<T, WorkflowError> {
         false,
         message,
     ))
+}
+
+fn organization_conflict(message: &str) -> WorkflowError {
+    WorkflowError::new(
+        WorkflowErrorCode::OrganizationAuthorityConflict,
+        true,
+        message,
+    )
 }
 
 fn budget_exceeded<T>(message: &str) -> Result<T, WorkflowError> {

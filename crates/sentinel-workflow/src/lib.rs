@@ -15,9 +15,10 @@ pub use engine::{Clock, SystemClock, WorkflowEngine};
 pub use error::{WorkflowError, WorkflowErrorCode};
 pub use model::*;
 pub use port::{
-    ExecutionReceipt, PendingExecution, UnavailableExecutionPort, WorkExecutionError,
-    WorkExecutionPort,
+    DependencyReadiness, ExecutionReceipt, OrganizationAgentSnapshot, OrganizationRuntimePort,
+    PendingExecution, UnavailableExecutionPort, UnavailableOrganizationRuntimePort,
+    WorkExecutionError, WorkExecutionPort,
 };
-pub use store::WorkflowStore;
+pub use store::{ProjectionCheckpoint, WorkflowBackupManifest, WorkflowStore};
 
-pub const WORKFLOW_SCHEMA_VERSION: u32 = 1;
+pub const WORKFLOW_SCHEMA_VERSION: u32 = 2;
