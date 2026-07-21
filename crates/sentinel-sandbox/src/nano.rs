@@ -1,12 +1,13 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use sentinel_common::nano_runtime::{
     ensure_handle_instance, ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle,
     NanoHealth, NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime,
-    NanoRuntimeResources, NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec,
-    RUNTIME_BWRAP_LANDLOCK,
+    NanoRuntimeControlAction, NanoRuntimeControlResult, NanoRuntimeResources, NanoSnapshot,
+    NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
 };
 use sentinel_fs::artifact::ArtifactPlane;
 use sentinel_fs::home_manifest::{self, HomeManifest, RestorePolicy};
@@ -34,6 +35,22 @@ struct BwrapWorkloadState {
     /// `ArtifactPlane` object ids pinning the chunks of this workload's last home
     /// snapshot (released on re-snapshot/teardown to avoid chunk leaks, N1').
     owned_object_ids: Vec<u64>,
+    suspended: bool,
+}
+
+struct BwrapSpawnTransaction {
+    state: BwrapWorkloadState,
+    marker_written: bool,
+    setup_started: bool,
+    handle: Option<SandboxHandle>,
+    process: Option<AgentProcess>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BwrapSpawnStage {
+    MarkerWritten,
+    SetupComplete,
+    ProcessStarted,
 }
 
 /// Default home content-addressed store location (chunks live under `/ram`).
@@ -50,6 +67,7 @@ pub struct BwrapNanoRuntime {
     workloads: HashMap<String, BwrapWorkloadState>,
     handles: HashMap<String, SandboxHandle>,
     processes: HashMap<String, AgentProcess>,
+    pending_spawns: HashMap<String, BwrapSpawnTransaction>,
 }
 
 impl BwrapNanoRuntime {
@@ -67,6 +85,7 @@ impl BwrapNanoRuntime {
             workloads: HashMap::new(),
             handles: HashMap::new(),
             processes: HashMap::new(),
+            pending_spawns: HashMap::new(),
         }
     }
 
@@ -106,8 +125,34 @@ impl BwrapNanoRuntime {
     fn write_marker(&self, agent_name: &str, workload_id: &str) -> Result<()> {
         let home = self.home_dir(agent_name);
         std::fs::create_dir_all(&home)?;
-        std::fs::write(home.join(".nano-runtime"), workload_id.as_bytes())?;
-        Ok(())
+        let marker = home.join(".nano-runtime");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            Ok(mut file) => {
+                if let Err(error) = (|| -> std::io::Result<()> {
+                    file.write_all(workload_id.as_bytes())?;
+                    file.sync_all()
+                })() {
+                    let _ = std::fs::remove_file(&marker);
+                    return Err(error.into());
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let recorded = std::fs::read_to_string(&marker)?;
+                if recorded == workload_id {
+                    Ok(())
+                } else {
+                    Err(anyhow!(
+                        "bwrap marker for '{agent_name}' belongs to workload '{recorded}', not '{workload_id}'"
+                    ))
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn remove_marker(&self, agent_name: &str, workload_id: &str) -> Result<bool> {
@@ -154,10 +199,76 @@ impl BwrapNanoRuntime {
         Ok(stopped)
     }
 
+    fn rollback_pending_spawn(&mut self, workload_id: &str) -> Result<bool> {
+        if !self.pending_spawns.contains_key(workload_id) {
+            return Ok(false);
+        }
+        if let Some(process) = self
+            .pending_spawns
+            .get_mut(workload_id)
+            .and_then(|transaction| transaction.process.as_mut())
+        {
+            process
+                .terminate_checked()
+                .with_context(|| format!("rollback process for {workload_id}"))?;
+        }
+        let handle = self
+            .pending_spawns
+            .get(workload_id)
+            .and_then(|transaction| transaction.handle.clone());
+        let (setup_started, marker_written, agent_name, marker_workload_id) = {
+            let transaction = self
+                .pending_spawns
+                .get(workload_id)
+                .expect("pending spawn checked above");
+            (
+                transaction.setup_started,
+                transaction.marker_written,
+                transaction.state.workload.agent_name.clone(),
+                transaction.state.workload.workload_id.clone(),
+            )
+        };
+        if let Some(handle) = handle.as_ref() {
+            self.enforcer
+                .teardown_agent(handle)
+                .with_context(|| format!("rollback sandbox for {workload_id}"))?;
+        } else if setup_started {
+            self.enforcer
+                .recover_partial_agent_setup(&agent_name)
+                .with_context(|| format!("rollback partial setup for {workload_id}"))?;
+        }
+        if marker_written {
+            self.remove_marker(&agent_name, &marker_workload_id)
+                .with_context(|| format!("rollback marker for {workload_id}"))?;
+        }
+        self.pending_spawns.remove(workload_id);
+        Ok(true)
+    }
+
+    fn reconcile_durable_spawn_marker(&self, agent_name: &str, workload_id: &str) -> Result<bool> {
+        let marker = self.home_dir(agent_name).join(".nano-runtime");
+        let recorded = match std::fs::read_to_string(&marker) {
+            Ok(recorded) => recorded,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if recorded != workload_id {
+            return Err(anyhow!(
+                "bwrap agent home '{agent_name}' has durable ownership by workload '{recorded}'"
+            ));
+        }
+        self.enforcer
+            .recover_partial_agent_setup(agent_name)
+            .with_context(|| format!("recover durable bwrap spawn for {workload_id}"))?;
+        self.remove_marker(agent_name, workload_id)?;
+        Ok(true)
+    }
+
     fn ensure_workload_available(&self, workload: &NanoWorkloadSpec) -> Result<()> {
         if self.workloads.contains_key(&workload.workload_id)
             || self.handles.contains_key(&workload.workload_id)
             || self.processes.contains_key(&workload.workload_id)
+            || self.pending_spawns.contains_key(&workload.workload_id)
         {
             return Err(anyhow!(
                 "bwrap workload '{}' is already active",
@@ -173,6 +284,17 @@ impl BwrapNanoRuntime {
                 "bwrap agent home '{}' is already owned by workload '{}'",
                 workload.agent_name,
                 existing.workload.workload_id
+            ));
+        }
+        if let Some(existing) = self
+            .pending_spawns
+            .values()
+            .find(|transaction| transaction.state.workload.agent_name == workload.agent_name)
+        {
+            return Err(anyhow!(
+                "bwrap agent home '{}' has pending ownership by workload '{}'",
+                workload.agent_name,
+                existing.state.workload.workload_id
             ));
         }
         Ok(())
@@ -200,37 +322,208 @@ impl BwrapNanoRuntime {
                 existing.workload.workload_id
             ));
         }
+        if let Some(existing) = self.pending_spawns.values().find(|transaction| {
+            transaction.state.workload.workload_id != snapshot_workload_id
+                && transaction.state.workload.agent_name == workload.agent_name
+        }) {
+            return Err(anyhow!(
+                "bwrap agent home '{}' has pending ownership by workload '{}'",
+                workload.agent_name,
+                existing.state.workload.workload_id
+            ));
+        }
         Ok(())
     }
 
-    fn spawn_state(&mut self, state: BwrapWorkloadState) -> Result<NanoHandle> {
+    fn workload_pids(&self, workload_id: &str) -> Result<Vec<u32>> {
+        let handle = self
+            .handles
+            .get(workload_id)
+            .ok_or_else(|| anyhow!("missing bwrap sandbox handle '{workload_id}'"))?;
+        let mut pids = if handle.cgroup_created {
+            cgroups::list_pids_in_cgroup(&handle.agent_name)
+                .with_context(|| format!("list bwrap cgroup members for {}", handle.agent_name))?
+        } else {
+            Vec::new()
+        };
+        if let Some(process) = self.processes.get(workload_id) {
+            pids.push(process.pid);
+            if let Some(child_pid) = process.child_pid {
+                pids.push(child_pid);
+            }
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        if pids.is_empty() {
+            return Err(anyhow!(
+                "bwrap workload '{workload_id}' has no live execution unit"
+            ));
+        }
+        Ok(pids)
+    }
+
+    fn signal_workload(&self, workload_id: &str, signal: i32) -> Result<usize> {
+        let pids = self.workload_pids(workload_id)?;
+        for pid in &pids {
+            // SAFETY: libc::kill does not dereference memory. The PID belongs to
+            // this exact adapter-owned workload and the signal is fixed by the
+            // caller to SIGSTOP or SIGCONT.
+            let result = unsafe { libc::kill(*pid as i32, signal) };
+            if result != 0 && std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("signal {signal} to bwrap PID {pid}"));
+            }
+        }
+        let expect_stopped = signal == libc::SIGSTOP;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let states = pids
+                .iter()
+                .filter_map(|pid| {
+                    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+                    let state = status.lines().find_map(|line| {
+                        line.strip_prefix("State:")
+                            .and_then(|value| value.trim().chars().next())
+                    })?;
+                    (state != 'Z').then_some((*pid, state))
+                })
+                .collect::<Vec<_>>();
+            let confirmed = if expect_stopped {
+                !states.is_empty() && states.iter().all(|(_, state)| *state == 'T')
+            } else {
+                !states.is_empty() && states.iter().all(|(_, state)| *state != 'T')
+            };
+            if confirmed {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "bwrap workload '{workload_id}' did not confirm signal {signal}; states={states:?}"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        Ok(pids.len())
+    }
+
+    fn spawn_state_with<Start, Checkpoint>(
+        &mut self,
+        state: BwrapWorkloadState,
+        start_process: Start,
+        mut checkpoint: Checkpoint,
+    ) -> Result<NanoHandle>
+    where
+        Start: FnOnce(&SandboxEnforcer, &str, &str, &[String]) -> Result<AgentProcess>,
+        Checkpoint: FnMut(BwrapSpawnStage) -> Result<()>,
+    {
         let workload = state.workload.clone();
         let instance_id = state.instance_id;
         let agent_name = workload.agent_name.clone();
-        self.write_marker(&agent_name, &workload.workload_id)?;
+        let workload_id = workload.workload_id.clone();
+        self.pending_spawns.insert(
+            workload_id.clone(),
+            BwrapSpawnTransaction {
+                state,
+                marker_written: false,
+                setup_started: false,
+                handle: None,
+                process: None,
+            },
+        );
 
-        let mut handle = self
-            .enforcer
-            .setup_agent(&agent_name, &CgroupLimits::default())
-            .with_context(|| format!("bwrap setup_agent failed for {agent_name}"))?;
-        let proc = self
-            .enforcer
-            .start_agent_process(&agent_name, Some(&workload.workload_id), &state.command)
-            .with_context(|| format!("bwrap start_agent_process failed for {agent_name}"))?;
-        let pid = proc.pid;
-        handle.bwrap_pid = Some(pid);
+        let attempted = (|| -> Result<u32> {
+            // Claim marker cleanup ownership before attempting the write. If
+            // write/fsync fails and the immediate unlink also fails, rollback
+            // must still probe and retain this exact transaction for retry.
+            self.pending_spawns
+                .get_mut(&workload_id)
+                .expect("pending spawn inserted")
+                .marker_written = true;
+            self.write_marker(&agent_name, &workload_id)?;
+            checkpoint(BwrapSpawnStage::MarkerWritten)?;
 
-        self.processes.insert(workload.workload_id.clone(), proc);
-        self.handles.insert(workload.workload_id.clone(), handle);
-        self.workloads.insert(workload.workload_id.clone(), state);
+            self.pending_spawns
+                .get_mut(&workload_id)
+                .expect("pending spawn inserted")
+                .setup_started = true;
+            let handle = self
+                .enforcer
+                .setup_agent(&agent_name, &CgroupLimits::default())
+                .with_context(|| format!("bwrap setup_agent failed for {agent_name}"))?;
+            self.pending_spawns
+                .get_mut(&workload_id)
+                .expect("pending spawn inserted")
+                .handle = Some(handle);
+            checkpoint(BwrapSpawnStage::SetupComplete)?;
+
+            let command = &self
+                .pending_spawns
+                .get(&workload_id)
+                .expect("pending spawn inserted")
+                .state
+                .command;
+            let process = start_process(&self.enforcer, &agent_name, &workload_id, command)
+                .with_context(|| format!("bwrap start_agent_process failed for {agent_name}"))?;
+            let pid = process.pid;
+            let transaction = self
+                .pending_spawns
+                .get_mut(&workload_id)
+                .expect("pending spawn inserted");
+            transaction
+                .handle
+                .as_mut()
+                .expect("setup completed before process start")
+                .bwrap_pid = Some(pid);
+            transaction.process = Some(process);
+            checkpoint(BwrapSpawnStage::ProcessStarted)?;
+            Ok(pid)
+        })();
+
+        let pid = match attempted {
+            Ok(pid) => pid,
+            Err(error) => {
+                let rollback_error = self.rollback_pending_spawn(&workload_id).err();
+                return Err(match rollback_error {
+                    Some(rollback_error) => anyhow!(
+                        "bwrap spawn transaction failed: {error}; rollback retained for retry: {rollback_error}"
+                    ),
+                    None => error,
+                });
+            }
+        };
+
+        let transaction = self
+            .pending_spawns
+            .remove(&workload_id)
+            .expect("successful spawn has pending transaction");
+        self.processes.insert(
+            workload_id.clone(),
+            transaction.process.expect("process started before commit"),
+        );
+        self.handles.insert(
+            workload_id.clone(),
+            transaction.handle.expect("setup completed before commit"),
+        );
+        self.workloads
+            .insert(workload_id.clone(), transaction.state);
 
         Ok(NanoHandle {
             instance_id,
             runtime_key: RUNTIME_BWRAP_LANDLOCK.to_string(),
-            workload_id: workload.workload_id,
+            workload_id,
             agent_id: workload.agent_id,
             pid: Some(pid),
         })
+    }
+
+    fn spawn_state(&mut self, state: BwrapWorkloadState) -> Result<NanoHandle> {
+        self.spawn_state_with(
+            state,
+            |enforcer, agent_name, workload_id, command| {
+                enforcer.start_agent_process(agent_name, Some(workload_id), command)
+            },
+            |_| Ok(()),
+        )
     }
 }
 
@@ -247,11 +540,13 @@ impl Drop for BwrapNanoRuntime {
             .keys()
             .chain(self.handles.keys())
             .chain(self.workloads.keys())
+            .chain(self.pending_spawns.keys())
             .cloned()
             .collect();
         ids.sort();
         ids.dedup();
         for id in ids {
+            let _ = self.rollback_pending_spawn(&id);
             let _ = self.teardown_workload(&id);
         }
     }
@@ -266,12 +561,23 @@ impl NanoRuntime for BwrapNanoRuntime {
         if workload.agent_name.is_empty() {
             return Err(anyhow!("bwrap workload requires agent_name"));
         }
+        if self.pending_spawns.contains_key(&workload.workload_id) {
+            self.rollback_pending_spawn(&workload.workload_id)
+                .with_context(|| {
+                    format!(
+                        "recover previous bwrap spawn for '{}'",
+                        workload.workload_id
+                    )
+                })?;
+        }
         self.ensure_workload_available(&workload)?;
+        self.reconcile_durable_spawn_marker(&workload.agent_name, &workload.workload_id)?;
         let state = BwrapWorkloadState {
             instance_id: uuid::Uuid::new_v4(),
             command: Self::command_for(&workload),
             workload,
             owned_object_ids: Vec::new(),
+            suspended: false,
         };
         self.spawn_state(state)
     }
@@ -308,6 +614,7 @@ impl NanoRuntime for BwrapNanoRuntime {
             pid: Some(process.pid),
             child_pid: process.child_pid,
             cgroup_created: sandbox.cgroup_created,
+            cgroup_id: sandbox.cgroup_id,
             io_available: sandbox.io_available,
             landlock_applied: sandbox.landlock_applied,
             network_isolated: sandbox.network_isolated,
@@ -396,7 +703,17 @@ impl NanoRuntime for BwrapNanoRuntime {
             ));
         }
         let payload: BwrapSnapshotPayload = serde_json::from_value(snapshot.payload)?;
+        self.rollback_pending_spawn(&snapshot.workload_id)?;
         self.ensure_restore_target_available(&snapshot.workload_id, &payload.workload)?;
+        if !self.workloads.contains_key(&snapshot.workload_id)
+            && !self.handles.contains_key(&snapshot.workload_id)
+            && !self.processes.contains_key(&snapshot.workload_id)
+        {
+            self.reconcile_durable_spawn_marker(
+                &payload.workload.agent_name,
+                &snapshot.workload_id,
+            )?;
+        }
         self.teardown_workload(&snapshot.workload_id)?;
 
         // Rehydrate the agent home from the manifest (metadata-aware, V24 path
@@ -419,6 +736,7 @@ impl NanoRuntime for BwrapNanoRuntime {
             workload: payload.workload,
             command: payload.command,
             owned_object_ids: Vec::new(),
+            suspended: false,
         })
     }
 
@@ -427,7 +745,13 @@ impl NanoRuntime for BwrapNanoRuntime {
         if let Some(state) = self.workloads.get(&handle.workload_id) {
             ensure_handle_instance(handle, state.instance_id)?;
         }
-        let state = if let Some(process) = self.processes.get_mut(&handle.workload_id) {
+        let state = if self
+            .workloads
+            .get(&handle.workload_id)
+            .is_some_and(|state| state.suspended)
+        {
+            NanoHealthState::Degraded
+        } else if let Some(process) = self.processes.get_mut(&handle.workload_id) {
             if process.is_running() {
                 NanoHealthState::Healthy
             } else {
@@ -480,6 +804,43 @@ impl NanoRuntime for BwrapNanoRuntime {
             ),
         })
     }
+
+    fn control(
+        &mut self,
+        handle: &NanoHandle,
+        action: NanoRuntimeControlAction,
+    ) -> Result<NanoRuntimeControlResult> {
+        self.resources(handle)?;
+        let suspended = self
+            .workloads
+            .get(&handle.workload_id)
+            .map(|state| state.suspended)
+            .ok_or_else(|| anyhow!("unknown bwrap workload '{}'", handle.workload_id))?;
+        let should_apply = match action {
+            NanoRuntimeControlAction::Suspend => !suspended,
+            NanoRuntimeControlAction::Resume => suspended,
+        };
+        let affected_units = if should_apply {
+            let signal = match action {
+                NanoRuntimeControlAction::Suspend => libc::SIGSTOP,
+                NanoRuntimeControlAction::Resume => libc::SIGCONT,
+            };
+            let affected = self.signal_workload(&handle.workload_id, signal)?;
+            if let Some(state) = self.workloads.get_mut(&handle.workload_id) {
+                state.suspended = matches!(action, NanoRuntimeControlAction::Suspend);
+            }
+            affected
+        } else {
+            0
+        };
+        Ok(NanoRuntimeControlResult::new(
+            self.runtime_key(),
+            &handle.workload_id,
+            action,
+            should_apply,
+            affected_units,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -517,6 +878,7 @@ mod tests {
             SandboxHandle {
                 agent_name,
                 cgroup_created: false,
+                cgroup_id: None,
                 io_available: false,
                 bwrap_pid: Some(pid),
                 landlock_applied: false,
@@ -530,6 +892,7 @@ mod tests {
                 workload,
                 command: Vec::new(),
                 owned_object_ids,
+                suspended: false,
             },
         );
         NanoHandle {
@@ -539,6 +902,174 @@ mod tests {
             agent_id: None,
             pid: Some(pid),
         }
+    }
+
+    fn transactional_fixture_state(workload_id: &str, agent_name: &str) -> BwrapWorkloadState {
+        let workload = fixture_workload(workload_id, agent_name);
+        BwrapWorkloadState {
+            instance_id: uuid::Uuid::new_v4(),
+            command: vec!["/usr/bin/sleep".to_string(), "30".to_string()],
+            workload,
+            owned_object_ids: Vec::new(),
+            suspended: false,
+        }
+    }
+
+    #[test]
+    fn spawn_failure_after_each_side_effect_rolls_back_transactionally() {
+        for stage in [
+            BwrapSpawnStage::MarkerWritten,
+            BwrapSpawnStage::SetupComplete,
+            BwrapSpawnStage::ProcessStarted,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut runtime = BwrapNanoRuntime::with_test_dirs(
+                temp.path().join("cas"),
+                temp.path().join("homes"),
+            );
+            let workload_id = format!("failure-{stage:?}");
+            let agent_name = format!("failure-agent-{stage:?}-{}", std::process::id());
+            let state = transactional_fixture_state(&workload_id, &agent_name);
+            let started_pid = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let pid_observer = std::sync::Arc::clone(&started_pid);
+
+            let error = runtime
+                .spawn_state_with(
+                    state,
+                    move |_, _, _, _| {
+                        let process = AgentProcess::launch_fixture()?;
+                        *pid_observer.lock().unwrap() = Some(process.pid);
+                        Ok(process)
+                    },
+                    |reached| {
+                        if reached == stage {
+                            Err(anyhow!("injected failure after {stage:?}"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+                .unwrap_err();
+
+            assert!(error.to_string().contains("injected failure"));
+            assert!(!runtime.pending_spawns.contains_key(&workload_id));
+            assert!(!runtime.workloads.contains_key(&workload_id));
+            assert!(!runtime.handles.contains_key(&workload_id));
+            assert!(!runtime.processes.contains_key(&workload_id));
+            assert!(!runtime.home_dir(&agent_name).join(".nano-runtime").exists());
+            let started_pid = *started_pid.lock().unwrap();
+            if let Some(pid) = started_pid {
+                assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn failed_spawn_rollback_retains_exact_transaction_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime =
+            BwrapNanoRuntime::with_test_dirs(temp.path().join("cas"), temp.path().join("homes"));
+        let workload_id = "retry-spawn";
+        let agent_name = format!("retry-spawn-agent-{}", std::process::id());
+        let state = transactional_fixture_state(workload_id, &agent_name);
+        let marker = runtime.home_dir(&agent_name).join(".nano-runtime");
+
+        let error = runtime
+            .spawn_state_with(
+                state,
+                |_, _, _, _| AgentProcess::launch_fixture(),
+                |stage| {
+                    if stage == BwrapSpawnStage::ProcessStarted {
+                        std::fs::write(&marker, b"foreign-owner")?;
+                        Err(anyhow!("injected post-process failure"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("rollback retained for retry"));
+        assert!(runtime.pending_spawns.contains_key(workload_id));
+
+        std::fs::write(&marker, workload_id.as_bytes()).unwrap();
+        assert!(runtime.rollback_pending_spawn(workload_id).unwrap());
+        assert!(!runtime.pending_spawns.contains_key(workload_id));
+        assert!(!marker.exists());
+
+        let handle = runtime
+            .spawn_state_with(
+                transactional_fixture_state(workload_id, &agent_name),
+                |_, _, _, _| AgentProcess::launch_fixture(),
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.stop(&handle).unwrap().outcome,
+            sentinel_common::nano_runtime::NanoStopOutcome::Stopped
+        );
+    }
+
+    #[test]
+    fn durable_spawn_marker_recovery_is_exact_and_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let cas = temp.path().join("cas");
+        let homes = temp.path().join("homes");
+        let first = BwrapNanoRuntime::with_test_dirs(cas.clone(), homes.clone());
+        first
+            .write_marker("durable-agent", "durable-workload")
+            .unwrap();
+        drop(first);
+
+        let recovered = BwrapNanoRuntime::with_test_dirs(cas.clone(), homes.clone());
+        assert!(recovered
+            .reconcile_durable_spawn_marker("durable-agent", "durable-workload")
+            .unwrap());
+        assert!(!homes.join("durable-agent/.nano-runtime").exists());
+
+        recovered
+            .write_marker("durable-agent", "foreign-workload")
+            .unwrap();
+        let error = recovered
+            .reconcile_durable_spawn_marker("durable-agent", "durable-workload")
+            .unwrap_err();
+        assert!(error.to_string().contains("durable ownership"));
+        assert_eq!(
+            std::fs::read_to_string(homes.join("durable-agent/.nano-runtime")).unwrap(),
+            "foreign-workload"
+        );
+    }
+
+    #[test]
+    fn bwrap_control_suspends_and_resumes_adapter_owned_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime =
+            BwrapNanoRuntime::with_test_dirs(temp.path().join("cas"), temp.path().join("homes"));
+        let handle = insert_fixture(
+            &mut runtime,
+            fixture_workload("control-fixture", "control-agent"),
+            Vec::new(),
+        );
+        let pid = handle.pid.unwrap();
+
+        let suspended = runtime
+            .control(&handle, NanoRuntimeControlAction::Suspend)
+            .unwrap();
+        assert_eq!(suspended.affected_units, 1);
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        assert!(status.lines().any(|line| line.starts_with("State:\tT")));
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Degraded
+        );
+
+        runtime
+            .control(&handle, NanoRuntimeControlAction::Resume)
+            .unwrap();
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Healthy
+        );
+        runtime.stop(&handle).unwrap();
     }
 
     #[test]
@@ -653,9 +1184,13 @@ mod tests {
         }
         drop(plane);
 
-        runtime
-            .write_marker("agent-fixture-retry", &handle.workload_id)
-            .unwrap();
+        std::fs::write(
+            runtime
+                .home_dir("agent-fixture-retry")
+                .join(".nano-runtime"),
+            handle.workload_id.as_bytes(),
+        )
+        .unwrap();
         assert_eq!(
             runtime.stop(&handle).unwrap().outcome,
             sentinel_common::nano_runtime::NanoStopOutcome::Stopped

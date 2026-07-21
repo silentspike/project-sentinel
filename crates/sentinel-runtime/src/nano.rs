@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
 use bevy_ecs::prelude::World;
@@ -6,8 +6,8 @@ use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::nano_runtime::{
     ensure_handle_instance, ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle,
     NanoHealth, NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime,
-    NanoRuntimeResources, NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec,
-    RUNTIME_ECS_NATIVE,
+    NanoRuntimeControlAction, NanoRuntimeControlResult, NanoRuntimeResources, NanoSnapshot,
+    NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_ECS_NATIVE,
 };
 use sentinel_common::AgentId;
 
@@ -17,6 +17,7 @@ pub struct EcsNativeRuntime {
     orchestrator: Option<RuntimeOrchestrator>,
     world: Option<World>,
     handles: HashMap<String, (Option<AgentId>, uuid::Uuid)>,
+    suspended: HashSet<String>,
     max_agents: usize,
 }
 
@@ -27,6 +28,7 @@ impl EcsNativeRuntime {
             orchestrator: Some(RuntimeOrchestrator::new(max_agents)),
             world: Some(world),
             handles: HashMap::new(),
+            suspended: HashSet::new(),
             max_agents,
         }
     }
@@ -39,6 +41,7 @@ impl EcsNativeRuntime {
             orchestrator: None,
             world: None,
             handles: HashMap::new(),
+            suspended: HashSet::new(),
             max_agents,
         }
     }
@@ -73,6 +76,7 @@ impl EcsNativeRuntime {
     ) -> Result<()> {
         self.orchestrator = Some(RuntimeOrchestrator::new(self.max_agents));
         self.handles.clear();
+        self.suspended.clear();
 
         for (id, identity) in &snapshot.identities {
             let agent_id = AgentId(*id);
@@ -190,6 +194,7 @@ impl NanoRuntime for EcsNativeRuntime {
             sentinel_ecs::despawn_agent_from_world(world, agent_id);
         }
         self.handles.remove(&handle.workload_id);
+        self.suspended.remove(&handle.workload_id);
         Ok(NanoStopResult::new(
             self.runtime_key(),
             &handle.workload_id,
@@ -301,6 +306,7 @@ impl NanoRuntime for EcsNativeRuntime {
                 ));
             }
             let instance_id = uuid::Uuid::new_v4();
+            self.suspended.remove(&snapshot.workload_id);
             self.handles
                 .insert(snapshot.workload_id.clone(), (Some(agent_id), instance_id));
             return Ok(NanoHandle {
@@ -384,16 +390,20 @@ impl NanoRuntime for EcsNativeRuntime {
                 handle.workload_id
             ));
         }
-        let state = match (&self.orchestrator, mapped_agent_id) {
-            (Some(orchestrator), Some(agent_id)) => orchestrator
-                .agents()
-                .get(&agent_id)
-                .map(|handle| Self::health_state(handle.status))
-                .ok_or_else(|| anyhow!("ecs-native handle references stopped {agent_id}"))?,
-            (Some(orchestrator), None) if orchestrator.agents().is_empty() => {
-                NanoHealthState::Stopped
+        let state = if self.suspended.contains(&handle.workload_id) {
+            NanoHealthState::Degraded
+        } else {
+            match (&self.orchestrator, mapped_agent_id) {
+                (Some(orchestrator), Some(agent_id)) => orchestrator
+                    .agents()
+                    .get(&agent_id)
+                    .map(|handle| Self::health_state(handle.status))
+                    .ok_or_else(|| anyhow!("ecs-native handle references stopped {agent_id}"))?,
+                (Some(orchestrator), None) if orchestrator.agents().is_empty() => {
+                    NanoHealthState::Stopped
+                }
+                _ => NanoHealthState::Healthy,
             }
-            _ => NanoHealthState::Healthy,
         };
 
         Ok(NanoHealth {
@@ -416,6 +426,25 @@ impl NanoRuntime for EcsNativeRuntime {
             applied: true,
             detail: "logical ECS isolation only; no process boundary".to_string(),
         })
+    }
+
+    fn control(
+        &mut self,
+        handle: &NanoHandle,
+        action: NanoRuntimeControlAction,
+    ) -> Result<NanoRuntimeControlResult> {
+        self.resources(handle)?;
+        let applied = match action {
+            NanoRuntimeControlAction::Suspend => self.suspended.insert(handle.workload_id.clone()),
+            NanoRuntimeControlAction::Resume => self.suspended.remove(&handle.workload_id),
+        };
+        Ok(NanoRuntimeControlResult::new(
+            self.runtime_key(),
+            &handle.workload_id,
+            action,
+            applied,
+            0,
+        ))
     }
 }
 
@@ -592,5 +621,45 @@ mod migration_tests {
         assert!(runtime
             .isolate(&original, NanoIsolationPolicy::default())
             .is_err());
+    }
+
+    #[test]
+    fn external_lifecycle_suspend_resume_is_stateful_and_instance_fenced() {
+        let mut runtime = EcsNativeRuntime::external_lifecycle(8);
+        let handle = runtime
+            .spawn(workload_spec(8, "external-control-8"))
+            .unwrap();
+        let suspended = runtime
+            .control(&handle, NanoRuntimeControlAction::Suspend)
+            .unwrap();
+        assert_eq!(
+            suspended.outcome,
+            sentinel_common::nano_runtime::NanoRuntimeControlOutcome::Applied
+        );
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Degraded
+        );
+        assert_eq!(
+            runtime
+                .control(&handle, NanoRuntimeControlAction::Suspend)
+                .unwrap()
+                .outcome,
+            sentinel_common::nano_runtime::NanoRuntimeControlOutcome::AlreadyApplied
+        );
+        let stale = NanoHandle {
+            instance_id: uuid::Uuid::new_v4(),
+            ..handle.clone()
+        };
+        assert!(runtime
+            .control(&stale, NanoRuntimeControlAction::Resume)
+            .is_err());
+        runtime
+            .control(&handle, NanoRuntimeControlAction::Resume)
+            .unwrap();
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Healthy
+        );
     }
 }

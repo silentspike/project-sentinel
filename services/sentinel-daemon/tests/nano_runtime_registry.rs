@@ -120,6 +120,8 @@ fn productive_lifecycle_call_sites_remain_registry_owned() {
 
     let stop_layer = rust_function_body(source, "fn stop_agent_runtime_layer(");
     assert!(stop_layer.contains("nano_runtimes.stop(agent_id)"));
+    assert!(stop_layer.contains("captured_cgroup_id"));
+    assert!(stop_layer.contains("ebpf_collector.unregister_agent(cgroup_id)"));
     let registry_stop = rust_function_body(source, "fn stop(&mut self, agent_id: AgentId)");
     assert!(registry_stop.contains("self.registry.stop(&handle)"));
     assert!(registry_stop.contains("self.handles.remove(&agent_id)"));
@@ -128,6 +130,16 @@ fn productive_lifecycle_call_sites_remain_registry_owned() {
     assert!(source.contains("runtime_orch.commit_shift_transition"));
     assert!(source.contains("shutdown blocked by NanoRuntime cleanup failure"));
     assert!(source.contains("runtime switch failed: {error}"));
+    assert!(source.contains("fn apply_agent_runtime_control("));
+    assert!(source.contains("fn reapply_persisted_runtime_suspension("));
+    assert!(
+        !source.contains("fn suspend_agent_cgroup_processes("),
+        "adapter-specific suspension must not escape the NanoRuntime owner"
+    );
+    assert!(
+        source.matches("apply_agent_runtime_control(").count() >= 4,
+        "operator pause/resume, control-plane suspend, and restart re-suspend must share the ownership barrier"
+    );
 
     let reconcile = rust_source_region(
         source,
