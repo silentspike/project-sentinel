@@ -536,15 +536,18 @@ class SanitizationTests(unittest.TestCase):
         authority = "root" + "@" + ".".join(["10", "0", "0", "155"])
         workspace = "/" + "work" + "/" + "company" + "/ps-631-dep-audit"
         cargo_home = "/" + "root" + "/" + ".cargo"
+        remote_host_key = "remote_" + "host"
+        remote_user_key = "remote_" + "user"
         remote_targets = (
             "/" + "tmp" + "/" + "issue-631-run",
             "/" + "tmp" + "/" + "issue631-tree/1234567890",
             "/" + "tmp" + "/" + "cargo-remote/project",
+            "/" + "tmp" + "/" + "previously-unknown/session-output",
         )
         raw = (
             f"{authority} {workspace} {REMOTE_PROJECT} {cargo_home} "
             + " ".join(remote_targets)
-            + "\n"
+            + f"\n{remote_host_key}=build-node {remote_user_key}=build-user\n"
         )
         normalized = audit_module.normalize_text(raw)
 
@@ -553,6 +556,8 @@ class SanitizationTests(unittest.TestCase):
         self.assertIn("<REMOTE_PROJECT>", normalized)
         self.assertIn("<CARGO_HOME>", normalized)
         self.assertEqual(normalized.count("<REMOTE_TARGET>"), len(remote_targets))
+        self.assertIn(f"{remote_host_key}=<HOST>", normalized)
+        self.assertIn(f"{remote_user_key}=<USER>", normalized)
         self.assertEqual(audit_module.suspicious_tokens(normalized), [])
 
     def test_tree_normalizer_ignores_wrapper_timestamps(self):
@@ -628,12 +633,46 @@ class SanitizationTests(unittest.TestCase):
             "remote-no-hyphen": "/" + "tmp" + "/issue631-tree/project",
             "cargo-remote-temp": "/" + "tmp" + "/cargo-remote/project",
             "cargo-home": "." + "cargo" + "/registry",
-            "authority": "builder" + "@" + "example" + ".internal",
+            "authority": "ssh " + "builder" + "@" + "example" + ".internal",
             "absolute": "/" + "opt" + "/private/bin",
         }
         for name, value in fixtures.items():
             with self.subTest(name=name):
                 self.assertTrue(audit_module.suspicious_tokens(value))
+
+    def test_scan_rejects_remote_host_field(self):
+        key = "remote_" + "host"
+        self.assertEqual(
+            audit_module.suspicious_tokens(f"{key}=build-node\n"),
+            ["remote-host-field"],
+        )
+
+    def test_scan_rejects_remote_user_field(self):
+        key = "remote_" + "user"
+        self.assertEqual(
+            audit_module.suspicious_tokens(f'{key}: "build-user"\n'),
+            ["remote-user-field"],
+        )
+
+    def test_scan_rejects_unknown_remote_temp_path(self):
+        path = "/" + "tmp" + "/" + "unrecognized-build/session/output.txt"
+        self.assertEqual(
+            audit_module.suspicious_tokens(f"artifact={path}\n"),
+            ["remote-temp-path"],
+        )
+
+    def test_scan_accepts_private_field_placeholders(self):
+        host_key = "remote_" + "host"
+        user_key = "remote_" + "user"
+        value = f'{host_key}="<HOST>"\n{user_key}=<USER>\n'
+        self.assertEqual(audit_module.suspicious_tokens(value), [])
+
+    def test_scan_does_not_block_public_domains(self):
+        value = (
+            "repository=https://github.com/example/project\n"
+            "contact=maintainer@example.com\n"
+        )
+        self.assertEqual(audit_module.suspicious_tokens(value), [])
 
     def test_public_scan_is_fail_closed(self):
         with tempfile.TemporaryDirectory() as temp:

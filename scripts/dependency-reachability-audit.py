@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import getpass
 import hashlib
 import io
 import ipaddress
@@ -13,7 +12,6 @@ import json
 import os
 from pathlib import Path
 import re
-import socket
 import subprocess
 import sys
 import tomllib
@@ -1094,14 +1092,27 @@ def run_audit(args: argparse.Namespace) -> int:
 TEMP_ROOT = "/" + "tmp" + "/"
 WORK_ROOT = "/" + "work" + "/"
 CARGO_PATH = "." + "cargo" + "/"
+REMOTE_FIELD_PREFIX = "remote_"
+
+
+PRIVATE_FIELD_SPECS = {
+    REMOTE_FIELD_PREFIX + "host": ("<HOST>", "remote-host-field"),
+    REMOTE_FIELD_PREFIX + "user": ("<USER>", "remote-user-field"),
+}
+PRIVATE_FIELD_PATTERN = re.compile(
+    r"(?P<key_quote>[\"']?)(?P<key>"
+    + "|".join(re.escape(key) for key in PRIVATE_FIELD_SPECS)
+    + r")(?P=key_quote)(?P<separator>\s*(?:=|:)\s*)"
+    + r"(?:(?P<value_quote>[\"'])(?P<quoted_value>[^\"']*)(?P=value_quote)"
+    + r"|(?P<bare_value>[^\s,;}\]]+))",
+    re.IGNORECASE,
+)
 
 
 PLACEHOLDER_REPLACEMENTS = (
     (re.compile(re.escape(TEMP_ROOT + "builds/") + r"[0-9]+"), "<REMOTE_PROJECT>"),
     (
-        re.compile(
-            re.escape(TEMP_ROOT) + r"(?:issue-?631|cargo-remote)[^\s\"')]*"
-        ),
+        re.compile(re.escape(TEMP_ROOT) + r"[^\s\"'`),;}\]]+"),
         "<REMOTE_TARGET>",
     ),
     (re.compile(r"/(?:root|home/[^/]+)/\.cargo"), "<CARGO_HOME>"),
@@ -1115,9 +1126,25 @@ PLACEHOLDER_REPLACEMENTS = (
 )
 
 
+def private_field_value(match: re.Match[str]) -> str:
+    return match.group("quoted_value") or match.group("bare_value") or ""
+
+
+def normalize_private_field(match: re.Match[str]) -> str:
+    key = match.group("key")
+    placeholder, _ = PRIVATE_FIELD_SPECS[key.lower()]
+    key_quote = match.group("key_quote") or ""
+    value_quote = match.group("value_quote") or ""
+    return (
+        f"{key_quote}{key}{key_quote}{match.group('separator')}"
+        f"{value_quote}{placeholder}{value_quote}"
+    )
+
+
 def normalize_text(value: str) -> str:
     value = value.replace("\r", "\n")
     value = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", value)
+    value = PRIVATE_FIELD_PATTERN.sub(normalize_private_field, value)
     for pattern, replacement in PLACEHOLDER_REPLACEMENTS:
         value = pattern.sub(replacement, value)
     value = re.sub(r"[ \t]+$", "", value, flags=re.MULTILINE)
@@ -1252,12 +1279,14 @@ def write_bloat_summary(bloat_dir: Path, root_builds: Path, output: Path) -> Non
 
 def suspicious_tokens(value: str) -> list[str]:
     findings: set[str] = set()
+    for match in PRIVATE_FIELD_PATTERN.finditer(value):
+        placeholder, label = PRIVATE_FIELD_SPECS[match.group("key").lower()]
+        if private_field_value(match) != placeholder:
+            findings.add(label)
     forbidden_patterns = {
         "home-path": r"/(?:home/[^/\s]+|root)(?:/|\b)",
         "workspace-path": re.escape(WORK_ROOT) + r"[^/\s]+(?:/|\b)",
-        "remote-temp-path": (
-            re.escape(TEMP_ROOT) + r"(?:builds|issue-?631|cargo-remote)(?:/|[-_])"
-        ),
+        "remote-temp-path": re.escape(TEMP_ROOT) + r"[^\s`\"'\])},;]+",
         "cargo-home": (
             r"(?:"
             + re.escape(CARGO_PATH)
@@ -1265,7 +1294,10 @@ def suspicious_tokens(value: str) -> list[str]:
             + re.escape("CARGO" + "_HOME=/")
             + r"(?![<]))"
         ),
-        "ssh-authority": r"\b[A-Za-z_][A-Za-z0-9_-]*@[A-Za-z][A-Za-z0-9._-]+\b",
+        "ssh-authority": (
+            r"(?im)^\s*(?:ssh|scp|sftp|rsync|cargo\s+remote)\b[^\n]*"
+            r"\b[A-Za-z_][A-Za-z0-9_-]*@[A-Za-z][A-Za-z0-9._-]+\b"
+        ),
         "absolute-path": r"(?<![<\w])/(?:etc|opt|srv|var|usr/local)/[^\s`\"')]+",
     }
     for label, pattern in forbidden_patterns.items():
@@ -1278,14 +1310,6 @@ def suspicious_tokens(value: str) -> list[str]:
         except ValueError:
             continue
         findings.add("ip-address")
-    dynamic_tokens = {
-        "local-username": getpass.getuser(),
-        "local-hostname": socket.gethostname(),
-        "local-home": str(Path.home()),
-    }
-    for label, token in dynamic_tokens.items():
-        if token and len(token) >= 4 and token in value:
-            findings.add(label)
     return sorted(findings)
 
 
