@@ -79,6 +79,8 @@ pub struct NanoHandle {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NanoRuntimeResources {
     #[serde(default)]
+    pub instance_id: Option<Uuid>,
+    #[serde(default)]
     pub pid: Option<u32>,
     #[serde(default)]
     pub child_pid: Option<u32>,
@@ -259,10 +261,11 @@ pub trait NanoRuntime: Send {
     /// adapter remains their sole lifecycle owner.
     fn resources(&self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
         ensure_handle_runtime(handle, self.runtime_key())?;
-        Ok(NanoRuntimeResources {
-            pid: handle.pid,
-            ..NanoRuntimeResources::default()
-        })
+        Err(anyhow!(
+            "NanoRuntime '{}' does not expose instance-fenced resources for workload '{}'",
+            self.runtime_key(),
+            handle.workload_id
+        ))
     }
 
     fn migrate(&mut self, target: &mut dyn NanoRuntime, handle: &NanoHandle) -> Result<NanoHandle>
@@ -331,6 +334,19 @@ impl NanoRuntimeRegistry {
 
     pub fn resources(&mut self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
         self.get_mut(&handle.runtime_key)?.resources(handle)
+    }
+
+    pub fn snapshot(&mut self, handle: &NanoHandle) -> Result<NanoSnapshot> {
+        self.get_mut(&handle.runtime_key)?.snapshot(handle)
+    }
+
+    pub fn restore(&mut self, snapshot: NanoSnapshot) -> Result<NanoHandle> {
+        let runtime_key = snapshot.runtime_key.clone();
+        self.get_mut(&runtime_key)?.restore(snapshot)
+    }
+
+    pub fn health(&mut self, handle: &NanoHandle) -> Result<NanoHealth> {
+        self.get_mut(&handle.runtime_key)?.health(handle)
     }
 }
 

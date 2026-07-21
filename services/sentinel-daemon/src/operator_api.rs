@@ -189,6 +189,12 @@ pub struct SecurityAgentRuntimeSnapshot {
     pub agent_id: u16,
     pub aggregate_id: String,
     pub agent_name: String,
+    #[serde(default)]
+    pub runtime_key: String,
+    #[serde(default)]
+    pub instance_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    pub runtime_pid: Option<u32>,
     pub bwrap_pid: Option<u32>,
     pub home_host_path: String,
     #[serde(default)]
@@ -3609,6 +3615,9 @@ mod tests {
                 agent_id: 7,
                 aggregate_id: "AGENT-07".to_string(),
                 agent_name: "Test Agent".to_string(),
+                runtime_key: sentinel_common::RUNTIME_BWRAP_LANDLOCK.to_string(),
+                instance_id: None,
+                runtime_pid: Some(4242),
                 bwrap_pid: Some(4242),
                 home_host_path: "/ram/agents/Test Agent".to_string(),
                 fs_mount: None,
@@ -3703,6 +3712,7 @@ mod tests {
                         agent_id: 7,
                         aggregate_id: "AGENT-07".to_string(),
                         name: "Test Agent".to_string(),
+                        runtime_key: sentinel_common::RUNTIME_BWRAP_LANDLOCK.to_string(),
                         runtime_present: true,
                         projection_present: false,
                         tracked_pid: Some(4242),

@@ -23,7 +23,7 @@ use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::events::{DomainEvent, DomainEventPayload};
 use sentinel_common::nano_runtime::{
     NanoHandle, NanoRuntimeRegistry, NanoRuntimeResources, NanoStopResult, NanoWorkloadSpec,
-    RUNTIME_BWRAP_LANDLOCK,
+    RUNTIME_BWRAP_LANDLOCK, RUNTIME_ECS_NATIVE, RUNTIME_MICROVM, RUNTIME_WASM_WASMTIME,
 };
 use sentinel_common::{AgentId, AgentIdBounds, OperatorCommand, Perception};
 use sentinel_ebpf::collector::MetricsSnapshot;
@@ -210,7 +210,7 @@ struct DaemonNanoRuntimeRegistry {
 impl DaemonNanoRuntimeRegistry {
     fn production(max_agents: usize, fs_mount: Option<&str>) -> Result<Self> {
         let mut registry = NanoRuntimeRegistry::new(Some(RUNTIME_BWRAP_LANDLOCK.to_string()));
-        registry.register(EcsNativeRuntime::new(max_agents))?;
+        registry.register(EcsNativeRuntime::external_lifecycle(max_agents))?;
         let mut bwrap = BwrapNanoRuntime::detect();
         if let Some(fs_mount) = fs_mount {
             bwrap.set_fs_mount(fs_mount);
@@ -226,6 +226,13 @@ impl DaemonNanoRuntimeRegistry {
     }
 
     fn workload(agent_cfg: &AgentConfig, agent_command: &[String]) -> NanoWorkloadSpec {
+        let mut metadata = std::collections::BTreeMap::new();
+        if let Some(wasm_path) = &agent_cfg.runtime.wasm_path {
+            metadata.insert("wasm_path".to_string(), wasm_path.clone());
+        }
+        if let Some(tool_name) = &agent_cfg.runtime.wasm_tool_name {
+            metadata.insert("tool_name".to_string(), tool_name.clone());
+        }
         NanoWorkloadSpec {
             workload_id: format!("AGENT-{:02}", agent_cfg.identity.id),
             runtime_key: agent_cfg.runtime.nano_runtime.clone(),
@@ -234,9 +241,17 @@ impl DaemonNanoRuntimeRegistry {
             role: agent_cfg.identity.role.clone(),
             room_id: agent_cfg.preferences.favorite_room.clone(),
             shift_set: agent_cfg.identity.shift_set,
-            command: agent_command.to_vec(),
+            command: if agent_cfg.runtime.nano_runtime.as_deref().is_none()
+                || matches!(
+                    agent_cfg.runtime.nano_runtime.as_deref(),
+                    Some(RUNTIME_BWRAP_LANDLOCK) | Some(RUNTIME_MICROVM)
+                ) {
+                agent_command.to_vec()
+            } else {
+                Vec::new()
+            },
             capabilities: agent_cfg.capabilities.tools.clone(),
-            metadata: Default::default(),
+            metadata,
             ecs_snapshot: None,
         }
     }
@@ -253,10 +268,31 @@ impl DaemonNanoRuntimeRegistry {
         let workload = Self::workload(agent_cfg, agent_command);
         let selected = self.registry.select_key(&workload)?;
         let handle = self.registry.get_mut(&selected)?.spawn(workload)?;
+        self.handles.insert(agent_id, handle.clone());
         let resources = match self.registry.resources(&handle) {
-            Ok(resources) => resources,
+            Ok(resources) if resources.instance_id == Some(handle.instance_id) => resources,
+            Ok(resources) => {
+                let error = anyhow!(
+                    "NanoRuntime resources returned instance {:?}, expected {}",
+                    resources.instance_id,
+                    handle.instance_id
+                );
+                let stop_error = self.registry.stop(&handle).err();
+                if stop_error.is_none() {
+                    self.handles.remove(&agent_id);
+                }
+                return Err(match stop_error {
+                    Some(stop_error) => anyhow!(
+                        "observe newly spawned NanoRuntime workload: {error}; rollback stop failed: {stop_error}"
+                    ),
+                    None => error,
+                });
+            }
             Err(error) => {
                 let stop_error = self.registry.stop(&handle).err();
+                if stop_error.is_none() {
+                    self.handles.remove(&agent_id);
+                }
                 return Err(match stop_error {
                     Some(stop_error) => anyhow!(
                         "observe newly spawned NanoRuntime workload: {error}; rollback stop failed: {stop_error}"
@@ -265,12 +301,28 @@ impl DaemonNanoRuntimeRegistry {
                 });
             }
         };
-        self.handles.insert(agent_id, handle.clone());
         Ok((handle, resources))
     }
 
     fn handle(&self, agent_id: AgentId) -> Option<&NanoHandle> {
         self.handles.get(&agent_id)
+    }
+
+    fn observe(&mut self, agent_id: AgentId) -> Result<(NanoHandle, NanoRuntimeResources)> {
+        let handle = self
+            .handles
+            .get(&agent_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("NanoRuntime handle missing for {agent_id}"))?;
+        let resources = self.registry.resources(&handle)?;
+        if resources.instance_id != Some(handle.instance_id) {
+            return Err(anyhow!(
+                "NanoRuntime resources returned instance {:?}, expected {}",
+                resources.instance_id,
+                handle.instance_id
+            ));
+        }
+        Ok((handle, resources))
     }
 
     fn stop(&mut self, agent_id: AgentId) -> Result<Option<NanoStopResult>> {
@@ -280,6 +332,75 @@ impl DaemonNanoRuntimeRegistry {
         let result = self.registry.stop(&handle)?;
         self.handles.remove(&agent_id);
         Ok(Some(result))
+    }
+
+    fn snapshot_all(&mut self) -> Result<Vec<sentinel_common::nano_runtime::NanoSnapshot>> {
+        let mut entries = self
+            .handles
+            .iter()
+            .map(|(agent_id, handle)| (*agent_id, handle.clone()))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(agent_id, _)| agent_id.0);
+        entries
+            .into_iter()
+            .map(|(agent_id, handle)| {
+                self.registry
+                    .snapshot(&handle)
+                    .with_context(|| format!("snapshot NanoRuntime workload for {agent_id}"))
+            })
+            .collect()
+    }
+
+    fn restore(
+        &mut self,
+        snapshot: sentinel_common::nano_runtime::NanoSnapshot,
+    ) -> Result<(NanoHandle, NanoRuntimeResources)> {
+        let agent_id = snapshot
+            .agent_id
+            .ok_or_else(|| anyhow!("NanoRuntime restore snapshot has no agent_id"))?;
+        if self.handles.contains_key(&agent_id) {
+            return Err(anyhow!("NanoRuntime handle already exists for {agent_id}"));
+        }
+        let handle = self.registry.restore(snapshot)?;
+        // Retain the exact incarnation before any fallible observation or
+        // identity validation. If rollback stop fails, the next retry must use
+        // this handle rather than reconstructing one from workload metadata.
+        self.handles.insert(agent_id, handle.clone());
+        if handle.agent_id != Some(agent_id) {
+            let rollback = self.registry.stop(&handle).err();
+            if rollback.is_none() {
+                self.handles.remove(&agent_id);
+            }
+            return Err(anyhow!(
+                "restored NanoRuntime handle agent {:?} does not match {agent_id}; rollback={rollback:?}",
+                handle.agent_id
+            ));
+        }
+        match self.registry.resources(&handle) {
+            Ok(resources) if resources.instance_id == Some(handle.instance_id) => {
+                Ok((handle, resources))
+            }
+            observed => {
+                let observation_error = match observed {
+                    Ok(resources) => anyhow!(
+                        "restored NanoRuntime resources returned instance {:?}, expected {}",
+                        resources.instance_id,
+                        handle.instance_id
+                    ),
+                    Err(error) => error.context("observe restored NanoRuntime workload"),
+                };
+                let stop_error = self.registry.stop(&handle).err();
+                if stop_error.is_none() {
+                    self.handles.remove(&agent_id);
+                }
+                Err(match stop_error {
+                    Some(stop_error) => {
+                        anyhow!("{observation_error}; rollback stop failed: {stop_error}")
+                    }
+                    None => observation_error,
+                })
+            }
+        }
     }
 
     fn agent_ids(&self) -> Vec<AgentId> {
@@ -403,6 +524,7 @@ fn append_nightrun_event(
     Ok(event)
 }
 
+#[cfg(test)]
 fn record_security_runtime_snapshot(
     security_runtime_state: &operator_api::SharedSecurityRuntimeState,
     agent_id: AgentId,
@@ -418,7 +540,42 @@ fn record_security_runtime_snapshot(
                 agent_id: agent_id.0,
                 aggregate_id: aggregate_id.clone(),
                 agent_name: agent_name.to_string(),
+                runtime_key: RUNTIME_BWRAP_LANDLOCK.to_string(),
+                instance_id: None,
+                runtime_pid: bwrap_pid,
                 bwrap_pid,
+                home_host_path: match fs_mount {
+                    Some(mount) => format!("{mount}/{aggregate_id}"),
+                    None => format!("/ram/agents/{agent_name}"),
+                },
+                fs_mount: fs_mount.map(str::to_string),
+            },
+        );
+    }
+}
+
+fn record_nano_runtime_snapshot(
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    agent_id: AgentId,
+    agent_name: &str,
+    handle: &NanoHandle,
+    resources: &NanoRuntimeResources,
+    fs_mount: Option<&str>,
+) {
+    let aggregate_id = format!("AGENT-{:02}", agent_id.0);
+    if let Ok(mut state) = security_runtime_state.write() {
+        state.insert(
+            agent_id.0,
+            operator_api::SecurityAgentRuntimeSnapshot {
+                agent_id: agent_id.0,
+                aggregate_id: aggregate_id.clone(),
+                agent_name: agent_name.to_string(),
+                runtime_key: handle.runtime_key.clone(),
+                instance_id: Some(handle.instance_id),
+                runtime_pid: resources.pid,
+                bwrap_pid: (handle.runtime_key == RUNTIME_BWRAP_LANDLOCK)
+                    .then_some(resources.pid)
+                    .flatten(),
                 home_host_path: match fs_mount {
                     Some(mount) => format!("{mount}/{aggregate_id}"),
                     None => format!("/ram/agents/{agent_name}"),
@@ -480,8 +637,8 @@ fn terminate_agent_process(mut proc_handle: sentinel_sandbox::AgentProcess) {
 /// - `NotIsolated`: the agent is NOT caged (e.g. forced `share_net`). Make it
 ///   visible (warn + health snapshot + string-typed `AgentIsolationFailed`
 ///   event) and terminate the un-caged
-///   process — the agent drops to the existing ECS-only fallback rather than
-///   running with host network access.
+///   process and reject the spawn rather than leaving an ECS-only or host-networked
+///   incarnation active.
 ///
 #[allow(clippy::too_many_arguments)]
 fn enforce_agent_netns_isolation(
@@ -495,13 +652,13 @@ fn enforce_agent_netns_isolation(
     nano_runtimes: &mut DaemonNanoRuntimeRegistry,
     security_runtime_state: &operator_api::SharedSecurityRuntimeState,
     event_store: &EventStore,
-) {
+) -> Result<()> {
     let Some(cpid) = child_pid else {
         warn!(
             agent = %agent_name,
             "bwrap meldete keinen sandboxed child-pid (--info-fd); netns-Verifikation uebersprungen (bwrap-Exit bleibt fail-closed-Signal)"
         );
-        return;
+        return Ok(());
     };
 
     match sandbox.verify_agent_netns_isolation(cpid) {
@@ -522,16 +679,15 @@ fn enforce_agent_netns_isolation(
             warn!(
                 agent = %agent_name,
                 child_pid = cpid,
-                "Agent ist NICHT netz-isoliert (share_net?) — terminiere Prozess, ECS-only Fallback (#75)"
+                "Agent ist NICHT netz-isoliert (share_net?) — terminiere Prozess und lehne Spawn ab (#75)"
             );
             // Durable health/monitoring status: no valid sandboxed process.
-            record_security_runtime_snapshot(
-                security_runtime_state,
-                agent_id,
-                agent_name,
-                None,
-                None,
-            );
+            if let Ok(mut state) = security_runtime_state.write() {
+                if let Some(snapshot) = state.get_mut(&agent_id.0) {
+                    snapshot.runtime_pid = None;
+                    snapshot.bwrap_pid = None;
+                }
+            }
             // String-typed event — no DomainEventPayload enum variant / no
             // sentinel-common schema change (keeps clear of #493).
             let aggregate = format!("AGENT-{:02}", agent_id.0);
@@ -544,7 +700,8 @@ fn enforce_agent_netns_isolation(
             .to_string();
             let event =
                 DomainEvent::new("AgentIsolationFailed", &aggregate, &payload, &aggregate, 0);
-            if let Err(e) = event_store.append_event(&event) {
+            let event_error = event_store.append_event(&event).err();
+            if let Some(e) = &event_error {
                 warn!(agent = %agent_name, error = %e, "AgentIsolationFailed-Event speichern fehlgeschlagen");
             }
             // Stop through the adapter that owns the workload. The legacy
@@ -552,10 +709,9 @@ fn enforce_agent_netns_isolation(
             // fixtures only.
             let nano_owned = nano_runtimes.handle(agent_id).is_some();
             if nano_owned {
-                if let Err(error) = nano_runtimes.stop(agent_id) {
-                    warn!(agent = %agent_name, error = %error, "NanoRuntime-Stop nach Isolations-Fehler fehlgeschlagen; Handle und Beobachtung bleiben fuer Retry erhalten");
-                    return;
-                }
+                nano_runtimes.stop(agent_id).with_context(|| {
+                    format!("NanoRuntime stop after isolation failure for {agent_id}")
+                })?;
             }
             if !nano_owned {
                 if let Some(proc) = agent_processes.remove(&agent_id) {
@@ -569,13 +725,18 @@ fn enforce_agent_netns_isolation(
                     }
                 }
                 if !nano_owned {
-                    if let Err(e) = sandbox.teardown_agent(&handle) {
-                        warn!(agent = %agent_name, error = %e, "Sandbox-Teardown nach Isolations-Fehler fehlgeschlagen");
-                    }
+                    sandbox.teardown_agent(&handle)?;
                 }
             }
+            if let Some(event_error) = event_error {
+                return Err(event_error.context("persist AgentIsolationFailed event"));
+            }
+            return Err(anyhow!(
+                "bwrap workload {agent_id} failed network namespace isolation"
+            ));
         }
     }
+    Ok(())
 }
 
 fn mountinfo_contains_mountpoint(mountinfo: &str, path: &std::path::Path) -> bool {
@@ -733,13 +894,7 @@ fn spawn_agent_nano_runtime(
                 error = %error,
                 "NanoRuntime-Spawn fehlgeschlagen"
             );
-            record_security_runtime_snapshot(
-                security_runtime_state,
-                agent_id,
-                &agent_cfg.identity.name,
-                None,
-                fs_mount,
-            );
+            remove_security_runtime_snapshot(security_runtime_state, agent_id);
             return false;
         }
     };
@@ -774,13 +929,91 @@ fn spawn_agent_nano_runtime(
             }
         }
         sandbox_handles.insert(agent_id, observed);
-        record_security_runtime_snapshot(
+        record_nano_runtime_snapshot(
             security_runtime_state,
             agent_id,
             &agent_cfg.identity.name,
-            resources.pid,
+            &handle,
+            &resources,
             fs_mount,
         );
+        if let Err(error) = enforce_agent_netns_isolation(
+            agent_id,
+            &agent_cfg.identity.name,
+            resources.child_pid,
+            sandbox,
+            sandbox_handles,
+            ebpf_collector,
+            agent_processes,
+            nano_runtimes,
+            security_runtime_state,
+            event_store.expect("production bwrap spawn always provides an EventStore"),
+        ) {
+            warn!(agent = %agent_cfg.identity.name, error = %error, "NanoRuntime-Spawn nach Netns-Pruefung abgelehnt");
+            return false;
+        }
+    } else {
+        record_nano_runtime_snapshot(
+            security_runtime_state,
+            agent_id,
+            &agent_cfg.identity.name,
+            &handle,
+            &resources,
+            fs_mount,
+        );
+    }
+
+    nano_runtimes.handle(agent_id).is_some()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_agent_nano_runtime(
+    agent_cfg: &AgentConfig,
+    snapshot: sentinel_common::nano_runtime::NanoSnapshot,
+    nano_runtimes: &mut DaemonNanoRuntimeRegistry,
+    sandbox: &SandboxEnforcer,
+    sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &mut EbpfCollector,
+    agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    fs_mount: Option<&str>,
+    event_store: &EventStore,
+) -> Result<()> {
+    let agent_id = AgentId(agent_cfg.identity.id);
+    let (handle, resources) = nano_runtimes.restore(snapshot)?;
+    if handle.runtime_key == RUNTIME_BWRAP_LANDLOCK {
+        let observed = SandboxHandle {
+            agent_name: agent_cfg.identity.name.clone(),
+            cgroup_created: resources.cgroup_created,
+            io_available: resources.io_available,
+            bwrap_pid: resources.pid,
+            landlock_applied: resources.landlock_applied,
+            network_isolated: resources.network_isolated,
+        };
+        if observed.cgroup_created {
+            if let Some(cid) = sentinel_sandbox::cgroup_id(&agent_cfg.identity.name) {
+                ebpf_collector.register_agent(sentinel_ebpf::AgentCgroupMapping {
+                    agent_name: agent_cfg.identity.name.clone(),
+                    cgroup_path: sentinel_sandbox::cgroup_path(&agent_cfg.identity.name),
+                    cgroup_id: cid,
+                    pid: resources.pid,
+                });
+                if let Some(pid) = resources.pid {
+                    ebpf_collector.update_agent_pid(cid, pid);
+                }
+            }
+        }
+        sandbox_handles.insert(agent_id, observed);
+    }
+    record_nano_runtime_snapshot(
+        security_runtime_state,
+        agent_id,
+        &agent_cfg.identity.name,
+        &handle,
+        &resources,
+        fs_mount,
+    );
+    if handle.runtime_key == RUNTIME_BWRAP_LANDLOCK {
         enforce_agent_netns_isolation(
             agent_id,
             &agent_cfg.identity.name,
@@ -792,18 +1025,62 @@ fn spawn_agent_nano_runtime(
             nano_runtimes,
             security_runtime_state,
             event_store,
-        );
-    } else {
-        record_security_runtime_snapshot(
-            security_runtime_state,
-            agent_id,
-            &agent_cfg.identity.name,
-            None,
-            fs_mount,
-        );
+        )?;
     }
+    Ok(())
+}
 
-    nano_runtimes.handle(agent_id).is_some()
+#[allow(clippy::too_many_arguments)]
+fn restore_agent_runtime_stack(
+    runtime_orch: &mut RuntimeOrchestrator,
+    agent_cfg: &AgentConfig,
+    snapshot: sentinel_common::nano_runtime::NanoSnapshot,
+    sandbox: &SandboxEnforcer,
+    sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &mut EbpfCollector,
+    agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    nano_runtimes: &mut DaemonNanoRuntimeRegistry,
+    security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    event_store: &EventStore,
+    fs_mount: Option<&str>,
+) -> Result<()> {
+    let agent_id = AgentId(agent_cfg.identity.id);
+    let identity = AgentIdentity {
+        agent_id,
+        name: agent_cfg.identity.name.clone(),
+        role: agent_cfg.identity.role.clone(),
+    };
+    let (start, end) = shift_hours(agent_cfg.identity.shift_set);
+    runtime_orch.spawn_agent(
+        identity,
+        ShiftInfo {
+            shift_set: agent_cfg.identity.shift_set,
+            shift_start_hour: start,
+            shift_end_hour: end,
+            is_on_duty: true,
+        },
+        &agent_cfg.preferences.favorite_room,
+    )?;
+    if let Err(error) = restore_agent_nano_runtime(
+        agent_cfg,
+        snapshot,
+        nano_runtimes,
+        sandbox,
+        sandbox_handles,
+        ebpf_collector,
+        agent_processes,
+        security_runtime_state,
+        fs_mount,
+        event_store,
+    ) {
+        return match runtime_orch.despawn_agent(agent_id) {
+            Ok(_) => Err(error),
+            Err(cleanup_error) => Err(error.context(format!(
+                "logical runtime rollback failed for {agent_id}: {cleanup_error}"
+            ))),
+        };
+    }
+    Ok(())
 }
 
 /// Spawnt einen Agenten sowohl im RuntimeOrchestrator als auch in der ECS World.
@@ -854,7 +1131,13 @@ fn spawn_agent_runtime_stack(
         fs_mount,
         Some(event_store),
     ) {
-        let _ = runtime_orch.despawn_agent(agent_id);
+        if let Err(cleanup_error) = runtime_orch.despawn_agent(agent_id) {
+            error!(
+                agent_id = %agent_id,
+                error = %cleanup_error,
+                "Logical runtime rollback after NanoRuntime spawn failure failed"
+            );
+        }
         return false;
     }
 
@@ -2419,7 +2702,7 @@ fn tracked_pid_for_agent(
             security_runtime_state.read().ok().and_then(|state| {
                 state
                     .get(&agent_id.0)
-                    .and_then(|snapshot| snapshot.bwrap_pid)
+                    .and_then(|snapshot| snapshot.runtime_pid.or(snapshot.bwrap_pid))
             })
         })
 }
@@ -2467,6 +2750,43 @@ fn stop_agent_runtime_layer(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn stop_all_nano_runtimes_with_retries(
+    nano_runtimes: &mut DaemonNanoRuntimeRegistry,
+    sandbox: &SandboxEnforcer,
+    sandbox_handles: &mut HashMap<AgentId, SandboxHandle>,
+    ebpf_collector: &mut EbpfCollector,
+    agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
+    max_attempts: usize,
+) -> Result<usize> {
+    let ids = nano_runtimes.agent_ids();
+    let total = ids.len();
+    let mut failures = Vec::new();
+    for attempt in 1..=max_attempts.max(1) {
+        failures.clear();
+        for agent_id in nano_runtimes.agent_ids() {
+            if let Err(error) = stop_agent_runtime_layer(
+                agent_id,
+                nano_runtimes,
+                sandbox,
+                sandbox_handles,
+                ebpf_collector,
+                agent_processes,
+            ) {
+                failures.push((agent_id, error.to_string()));
+            }
+        }
+        if failures.is_empty() {
+            return Ok(total);
+        }
+        warn!(attempt, failures = ?failures, "NanoRuntime shutdown cleanup will retry exact handles");
+    }
+    Err(anyhow!(
+        "NanoRuntime shutdown cleanup exhausted retries: {:?}",
+        failures
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn restart_agent_fast_path(
     world: &mut bevy_ecs::prelude::World,
     runtime_orch: &mut RuntimeOrchestrator,
@@ -2500,8 +2820,12 @@ fn restart_agent_fast_path(
     .context("NanoRuntime teardown before fast restart")?;
 
     remove_security_runtime_snapshot(security_runtime_state, agent_id);
-    let _ = despawn_agent_from_world(world, agent_id);
-    let _ = runtime_orch.despawn_agent(agent_id);
+    despawn_agent_from_world(world, agent_id);
+    if runtime_orch.agents().contains_key(&agent_id) {
+        runtime_orch
+            .despawn_agent(agent_id)
+            .context("logical runtime teardown before fast restart")?;
+    }
 
     if !spawn_agent_full(
         runtime_orch,
@@ -2630,12 +2954,22 @@ fn should_request_projection_rebuild(
         && (projection_drift_detected || !source.is_periodic())
 }
 
+fn runtime_resources_are_healthy(agent: &runtime_health::RuntimeHealthAgentSnapshot) -> bool {
+    match agent.runtime_key.as_str() {
+        RUNTIME_BWRAP_LANDLOCK => agent.tracked_pid_alive && agent.cgroup_live_pid_count > 0,
+        RUNTIME_MICROVM => agent.tracked_pid_alive,
+        RUNTIME_ECS_NATIVE | RUNTIME_WASM_WASMTIME => {
+            agent.tracked_pid.is_none() && agent.cgroup_live_pid_count == 0
+        }
+        _ => false,
+    }
+}
+
 fn runtime_agent_is_healthy(agent: &runtime_health::RuntimeHealthAgentSnapshot) -> bool {
     agent.runtime_present
         && agent.projection_present
         && agent.security_runtime_present
-        && agent.tracked_pid_alive
-        && agent.cgroup_live_pid_count > 0
+        && runtime_resources_are_healthy(agent)
 }
 
 fn emit_runtime_repair_blocked_event(
@@ -2806,7 +3140,7 @@ fn upsert_agent_projection_seed(
 fn remove_agent_runtime_fragments(
     ctx: &mut RuntimeReconcileContext<'_>,
     agent: &runtime_health::RuntimeHealthAgentSnapshot,
-) -> RuntimeCleanupStats {
+) -> Result<RuntimeCleanupStats> {
     let agent_id = AgentId(agent.agent_id);
     let mut stats = RuntimeCleanupStats::default();
 
@@ -2822,9 +3156,7 @@ fn remove_agent_runtime_fragments(
             stats.repairs += 1;
         }
         Ok(false) => {}
-        Err(error) => {
-            warn!(agent_id = %agent_id, error = %error, "NanoRuntime-Teardown bei Runtime-Reconcile fehlgeschlagen");
-        }
+        Err(error) => return Err(error.context("NanoRuntime teardown during runtime reconcile")),
     }
 
     if agent.cgroup_live_pid_count > 0 {
@@ -2841,6 +3173,17 @@ fn remove_agent_runtime_fragments(
         }
     }
 
+    if ctx.runtime_orch.agents().contains_key(&agent_id) {
+        ctx.runtime_orch
+            .despawn_agent(agent_id)
+            .with_context(|| format!("logical runtime teardown for {agent_id}"))?;
+        stats.repairs += 1;
+    }
+
+    if despawn_agent_from_world(ctx.world, agent_id) {
+        stats.repairs += 1;
+    }
+
     let security_removed = ctx
         .security_runtime_state
         .write()
@@ -2848,18 +3191,6 @@ fn remove_agent_runtime_fragments(
         .unwrap_or(false);
     if security_removed {
         stats.security_snapshots_removed += 1;
-        stats.repairs += 1;
-    }
-
-    if ctx.runtime_orch.agents().contains_key(&agent_id) {
-        if let Err(error) = ctx.runtime_orch.despawn_agent(agent_id) {
-            warn!(agent_id = %agent_id, error = %error, "Runtime-Despawn bei Reconcile fehlgeschlagen");
-        } else {
-            stats.repairs += 1;
-        }
-    }
-
-    if despawn_agent_from_world(ctx.world, agent_id) {
         stats.repairs += 1;
     }
 
@@ -2881,7 +3212,7 @@ fn remove_agent_runtime_fragments(
         }
     }
 
-    stats
+    Ok(stats)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3023,7 +3354,18 @@ fn run_runtime_reconcile(
                     || agent.tracked_pid_alive
                     || agent.cgroup_live_pid_count > 0)
         }) {
-            let stats = remove_agent_runtime_fragments(ctx, agent);
+            let stats = match remove_agent_runtime_fragments(ctx, agent) {
+                Ok(stats) => stats,
+                Err(error) => {
+                    errors.push(format!(
+                        "Runtime-Teardown fehlgeschlagen fuer {}: {error}",
+                        agent.name
+                    ));
+                    agent_status_updates
+                        .insert(agent.agent_id, "teardown_retry_pending".to_string());
+                    continue;
+                }
+            };
             if stats.repairs > 0 {
                 unexpected_runtime_removed += 1;
                 security_snapshots_removed += stats.security_snapshots_removed;
@@ -3117,34 +3459,40 @@ fn run_runtime_reconcile(
         let snapshot = before_by_id.get(&agent_id);
 
         if let Some(snapshot) = snapshot {
-            let runtime_core_healthy = snapshot.runtime_present
-                && snapshot.tracked_pid_alive
-                && snapshot.cgroup_live_pid_count > 0;
-            if runtime_agent_is_healthy(snapshot) {
-                respawn_backoff.record_success(agent_id);
-                continue;
-            }
-            if runtime_core_healthy && !snapshot.security_runtime_present {
+            if snapshot.runtime_present && !snapshot.security_runtime_present {
                 if request.dry_run {
                     agent_status_updates
                         .insert(agent_id, "security_runtime_restore_planned".to_string());
-                } else {
-                    let tracked_pid = ctx
-                        .sandbox_handles
-                        .get(&AgentId(agent_id))
-                        .and_then(|handle| handle.bwrap_pid)
-                        .or(snapshot.tracked_pid);
-                    record_security_runtime_snapshot(
-                        ctx.security_runtime_state,
-                        AgentId(agent_id),
-                        &agent_cfg.identity.name,
-                        tracked_pid,
-                        ctx.fs_mount,
-                    );
-                    repair_ops_total += 1;
-                    repaired_agents.push(agent_cfg.identity.name.clone());
-                    agent_status_updates.insert(agent_id, "security_runtime_restored".to_string());
+                    continue;
                 }
+                match ctx.nano_runtimes.observe(AgentId(agent_id)) {
+                    Ok((handle, resources)) => {
+                        record_nano_runtime_snapshot(
+                            ctx.security_runtime_state,
+                            AgentId(agent_id),
+                            &agent_cfg.identity.name,
+                            &handle,
+                            &resources,
+                            ctx.fs_mount,
+                        );
+                        repair_ops_total += 1;
+                        repaired_agents.push(agent_cfg.identity.name.clone());
+                        agent_status_updates
+                            .insert(agent_id, "security_runtime_restored".to_string());
+                        respawn_backoff.record_success(agent_id);
+                        continue;
+                    }
+                    Err(error) => {
+                        errors.push(format!(
+                            "NanoRuntime-Beobachtung fehlgeschlagen fuer {}: {error}",
+                            agent_cfg.identity.name
+                        ));
+                    }
+                }
+            }
+            let runtime_core_healthy =
+                snapshot.runtime_present && runtime_resources_are_healthy(snapshot);
+            if runtime_agent_is_healthy(snapshot) {
                 respawn_backoff.record_success(agent_id);
                 continue;
             }
@@ -3209,7 +3557,19 @@ fn run_runtime_reconcile(
         }
 
         if let Some(snapshot) = snapshot {
-            let stats = remove_agent_runtime_fragments(ctx, snapshot);
+            let stats = match remove_agent_runtime_fragments(ctx, snapshot) {
+                Ok(stats) => stats,
+                Err(error) => {
+                    respawn_failures_added += 1;
+                    errors.push(format!(
+                        "Runtime-Teardown vor Respawn fehlgeschlagen fuer {}: {error}",
+                        snapshot.name
+                    ));
+                    agent_status_updates.insert(agent_id, "teardown_retry_pending".to_string());
+                    let _ = respawn_backoff.record_failure(agent_id, ctx.tick_count);
+                    continue;
+                }
+            };
             security_snapshots_removed += stats.security_snapshots_removed;
             orphan_cgroups_removed += stats.orphan_cgroups_removed;
             repair_ops_total += stats.repairs;
@@ -3597,24 +3957,24 @@ fn teardown_agent_full(
     agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
     nano_runtimes: &mut DaemonNanoRuntimeRegistry,
     security_runtime_state: &operator_api::SharedSecurityRuntimeState,
-) {
-    if let Err(error) = stop_agent_runtime_layer(
+) -> Result<bool> {
+    let adapter_stopped = stop_agent_runtime_layer(
         agent_id,
         nano_runtimes,
         sandbox,
         sandbox_handles,
         ebpf_collector,
         agent_processes,
-    ) {
-        warn!(agent_id = %agent_id, error = %error, "NanoRuntime-Teardown bei Config-Apply fehlgeschlagen");
-    }
-    remove_security_runtime_snapshot(security_runtime_state, agent_id);
+    )
+    .with_context(|| format!("NanoRuntime teardown for {agent_id}"))?;
     if runtime_orch.agents().contains_key(&agent_id) {
-        if let Err(e) = runtime_orch.despawn_agent(agent_id) {
-            warn!(agent_id = %agent_id, error = %e, "Runtime-Despawn bei Config-Apply fehlgeschlagen");
-        }
+        runtime_orch
+            .despawn_agent(agent_id)
+            .with_context(|| format!("logical runtime teardown for {agent_id}"))?;
     }
-    let _ = despawn_agent_from_world(world, agent_id);
+    let ecs_removed = despawn_agent_from_world(world, agent_id);
+    remove_security_runtime_snapshot(security_runtime_state, agent_id);
+    Ok(adapter_stopped || ecs_removed)
 }
 
 /// Alle Agent-IDs der aktuellen ECS-Welt (fuer Fresh-Load Reset).
@@ -3924,7 +4284,7 @@ fn teardown_runtime_for_world_restore(
     agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
     nano_runtimes: &mut DaemonNanoRuntimeRegistry,
     security_runtime_state: &operator_api::SharedSecurityRuntimeState,
-) -> usize {
+) -> Result<usize> {
     let mut ids = agent_processes.keys().copied().collect::<HashSet<_>>();
     ids.extend(sandbox_handles.keys().copied());
     ids.extend(nano_runtimes.agent_ids());
@@ -3934,25 +4294,90 @@ fn teardown_runtime_for_world_restore(
     }
 
     for agent_id in &ids {
-        if let Err(error) = stop_agent_runtime_layer(
+        stop_agent_runtime_layer(
             *agent_id,
             nano_runtimes,
             sandbox,
             sandbox_handles,
             ebpf_collector,
             agent_processes,
-        ) {
-            warn!(agent_id = %agent_id, error = %error, "NanoRuntime teardown bei Restore fehlgeschlagen");
+        )
+        .with_context(|| format!("NanoRuntime teardown before restore for {agent_id}"))?;
+        if runtime_orch.agents().contains_key(agent_id) {
+            runtime_orch.despawn_agent(*agent_id).with_context(|| {
+                format!("logical runtime teardown before restore for {agent_id}")
+            })?;
         }
         remove_security_runtime_snapshot(security_runtime_state, *agent_id);
-        if runtime_orch.agents().contains_key(agent_id) {
-            if let Err(e) = runtime_orch.despawn_agent(*agent_id) {
-                warn!(agent_id = %agent_id, error = %e, "Runtime-Despawn bei Restore fehlgeschlagen");
-            }
+    }
+
+    Ok(ids.len())
+}
+
+fn validate_nano_runtime_snapshot_set(
+    snapshots: &[sentinel_common::nano_runtime::NanoSnapshot],
+    expected_agent_ids: &[AgentId],
+    all_agents: &[AgentConfig],
+) -> Result<()> {
+    let mut by_agent = HashMap::new();
+    for snapshot in snapshots {
+        let agent_id = snapshot.agent_id.ok_or_else(|| {
+            anyhow!(
+                "NanoRuntime snapshot {} has no agent_id",
+                snapshot.workload_id
+            )
+        })?;
+        if by_agent.insert(agent_id, snapshot).is_some() {
+            return Err(anyhow!("Duplicate NanoRuntime snapshot for {agent_id}"));
         }
     }
 
-    ids.len()
+    let expected = expected_agent_ids.iter().copied().collect::<HashSet<_>>();
+    let actual = by_agent.keys().copied().collect::<HashSet<_>>();
+    let mut missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+    missing.sort_by_key(|agent_id| agent_id.0);
+    if !missing.is_empty() {
+        return Err(anyhow!(
+            "NanoRuntime snapshots missing for: {}",
+            missing
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let mut unknown = actual.difference(&expected).copied().collect::<Vec<_>>();
+    unknown.sort_by_key(|agent_id| agent_id.0);
+    if !unknown.is_empty() {
+        return Err(anyhow!(
+            "NanoRuntime snapshots contain unknown agents: {}",
+            unknown
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    for agent_id in expected_agent_ids {
+        let agent_cfg = all_agents
+            .iter()
+            .find(|cfg| cfg.identity.id == agent_id.0)
+            .ok_or_else(|| anyhow!("Agent configuration missing for {agent_id}"))?;
+        let expected_runtime = agent_cfg
+            .runtime
+            .nano_runtime
+            .as_deref()
+            .unwrap_or(RUNTIME_BWRAP_LANDLOCK);
+        let snapshot = by_agent.get(agent_id).expect("set equality checked above");
+        if snapshot.runtime_key != expected_runtime {
+            return Err(anyhow!(
+                "NanoRuntime snapshot for {agent_id} uses {}, config expects {expected_runtime}",
+                snapshot.runtime_key
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// #491 (TM-3): Sicherungs-Obergrenze fuer die Replay-Spanne in Ticks. Das Feature zielt auf die
@@ -4254,6 +4679,7 @@ fn rollback_world_restore_stores(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn rollback_world_restore_after_commit_failure(
     commit_error: anyhow::Error,
     pre_snapshot_id: &str,
@@ -4317,6 +4743,17 @@ fn execute_world_restore_transfer(
     current_shift: &mut u8,
 ) -> Result<()> {
     let started = Instant::now();
+    let pre_restore_nano_snapshots = nano_runtimes
+        .snapshot_all()
+        .context("Pre-Restore NanoRuntime snapshots failed")?;
+    let pre_restore_agent_ids = world_agent_ids(world);
+    validate_nano_runtime_snapshot_set(
+        &pre_restore_nano_snapshots,
+        &pre_restore_agent_ids,
+        all_agents,
+    )
+    .context("Pre-Restore NanoRuntime snapshot set is incomplete")?;
+    let pre_restore_runtime_recovery = pre_restore_nano_snapshots.clone();
     let pre_snapshot_id = snapshot_manager
         .create_and_store(
             world,
@@ -4327,6 +4764,7 @@ fn execute_world_restore_transfer(
             fs_mount,
             *tick_count,
             *sim_hour,
+            pre_restore_nano_snapshots,
         )
         .context("Pre-Restore Snapshot fatal fehlgeschlagen")?;
     info!(snapshot_id = %pre_snapshot_id, "Pre-Restore Snapshot erstellt (Rollback-Punkt)");
@@ -4343,6 +4781,21 @@ fn execute_world_restore_transfer(
         .ok_or_else(|| anyhow!("Snapshot nicht gefunden: {}", resolution.anchor_snapshot_id))?;
     let snapshot = sentinel_common::decode_world_snapshot(&bytes)
         .with_context(|| format!("Snapshot dekodieren: {}", resolution.anchor_snapshot_id))?;
+
+    if snapshot.schema_version >= 4 {
+        let target_agent_ids = snapshot
+            .ecs
+            .identities
+            .iter()
+            .map(|(id, _)| AgentId(*id))
+            .collect::<Vec<_>>();
+        validate_nano_runtime_snapshot_set(
+            &snapshot.nano_runtime_snapshots,
+            &target_agent_ids,
+            all_agents,
+        )
+        .context("Restore NanoRuntime snapshot set is invalid")?;
+    }
 
     if let Some(fs_metadata) = &snapshot.fs_metadata {
         if fs_layer.is_none() {
@@ -4434,6 +4887,18 @@ fn execute_world_restore_transfer(
         "Restore-Fence aktiviert"
     );
 
+    // Adapter teardown is part of the fenced pre-commit phase. A failed exact
+    // handle stop aborts before redb/ECS/projection state is replaced.
+    let terminated = teardown_runtime_for_world_restore(
+        runtime_orch,
+        sandbox,
+        sandbox_handles,
+        ebpf_collector,
+        agent_processes,
+        nano_runtimes,
+        security_runtime_state,
+    )?;
+
     let anchor_snapshot_id = resolution.anchor_snapshot_id.clone();
     let commit_result = commit_world_restore_stores(
         &anchor_snapshot_id,
@@ -4460,17 +4925,54 @@ fn execute_world_restore_transfer(
                 pre_snapshot_id = %pre_snapshot_id,
                 "Restore-Commit fehlgeschlagen — Rollback auf Pre-Snapshot gestartet"
             );
-            return rollback_world_restore_after_commit_failure(
-                commit_error,
+            if let Err(rollback_error) = rollback_world_restore_stores(
                 &pre_snapshot_id,
-                restore_fence,
                 world,
                 event_store,
                 state_store,
                 fs_layer,
                 data_dir,
                 projection_db_path,
-            );
+            ) {
+                error!(error = %rollback_error, "Restore-Rollback fehlgeschlagen — Fence bleibt aktiv");
+                return Err(commit_error.context(format!(
+                    "critical restore rollback failure: {rollback_error}"
+                )));
+            }
+
+            for runtime_snapshot in pre_restore_runtime_recovery {
+                let agent_id = runtime_snapshot
+                    .agent_id
+                    .expect("pre-restore snapshot set validated before teardown");
+                let agent_cfg = all_agents
+                    .iter()
+                    .find(|cfg| cfg.identity.id == agent_id.0)
+                    .expect("pre-restore agent config validated before teardown");
+                if let Err(runtime_error) = restore_agent_runtime_stack(
+                    runtime_orch,
+                    agent_cfg,
+                    runtime_snapshot,
+                    sandbox,
+                    sandbox_handles,
+                    ebpf_collector,
+                    agent_processes,
+                    nano_runtimes,
+                    security_runtime_state,
+                    event_store,
+                    fs_mount,
+                ) {
+                    error!(
+                        agent_id = %agent_id,
+                        error = %runtime_error,
+                        "Restore-Rollback konnte exakte Runtime nicht wiederherstellen — Fence bleibt aktiv"
+                    );
+                    return Err(commit_error.context(format!(
+                        "critical restore runtime rollback failure for {agent_id}: {runtime_error}"
+                    )));
+                }
+            }
+            restore_fence.end();
+            return Err(commit_error.context("Restore rollback succeeded"));
         }
         Ok(report) => {
             info!(
@@ -4487,24 +4989,66 @@ fn execute_world_restore_transfer(
         }
     }
 
-    let terminated = teardown_runtime_for_world_restore(
-        runtime_orch,
-        sandbox,
-        sandbox_handles,
-        ebpf_collector,
-        agent_processes,
-        nano_runtimes,
-        security_runtime_state,
-    );
-
     let mut respawned = 0u32;
     let mut respawn_errors = Vec::new();
+    let mut runtime_snapshots = HashMap::new();
+    for runtime_snapshot in snapshot.nano_runtime_snapshots.clone() {
+        let Some(agent_id) = runtime_snapshot.agent_id else {
+            respawn_errors.push(format!(
+                "NanoRuntime snapshot {} has no agent_id",
+                runtime_snapshot.workload_id
+            ));
+            continue;
+        };
+        if runtime_snapshots
+            .insert(agent_id, runtime_snapshot)
+            .is_some()
+        {
+            respawn_errors.push(format!("Duplicate NanoRuntime snapshot for {agent_id}"));
+        }
+    }
     for (id, _) in &snapshot.ecs.identities {
         let Some(agent_cfg) = all_agents.iter().find(|cfg| cfg.identity.id == *id) else {
             respawn_errors.push(format!("Agent-Konfiguration fehlt fuer AGENT-{id:02}"));
             continue;
         };
-        if spawn_agent_runtime_stack(
+        let agent_id = AgentId(*id);
+        if snapshot.schema_version >= 4 {
+            let Some(runtime_snapshot) = runtime_snapshots.remove(&agent_id) else {
+                respawn_errors.push(format!("NanoRuntime snapshot fehlt fuer AGENT-{id:02}"));
+                continue;
+            };
+            let expected_runtime = agent_cfg
+                .runtime
+                .nano_runtime
+                .as_deref()
+                .unwrap_or(RUNTIME_BWRAP_LANDLOCK);
+            if runtime_snapshot.runtime_key != expected_runtime {
+                respawn_errors.push(format!(
+                    "NanoRuntime snapshot fuer AGENT-{id:02} nutzt {}, Config erwartet {expected_runtime}",
+                    runtime_snapshot.runtime_key
+                ));
+                continue;
+            }
+            match restore_agent_runtime_stack(
+                runtime_orch,
+                agent_cfg,
+                runtime_snapshot,
+                sandbox,
+                sandbox_handles,
+                ebpf_collector,
+                agent_processes,
+                nano_runtimes,
+                security_runtime_state,
+                event_store,
+                fs_mount,
+            ) {
+                Ok(()) => respawned += 1,
+                Err(error) => respawn_errors.push(format!(
+                    "NanoRuntime restore fehlgeschlagen fuer AGENT-{id:02}: {error}"
+                )),
+            }
+        } else if spawn_agent_runtime_stack(
             runtime_orch,
             agent_cfg,
             sandbox,
@@ -4521,6 +5065,12 @@ fn execute_world_restore_transfer(
         } else {
             respawn_errors.push(format!("Runtime-Respawn fehlgeschlagen fuer AGENT-{id:02}"));
         }
+    }
+    if !runtime_snapshots.is_empty() {
+        respawn_errors.push(format!(
+            "NanoRuntime snapshot enthaelt {} unbekannte Agenten",
+            runtime_snapshots.len()
+        ));
     }
 
     *tick_count = final_tick;
@@ -4547,8 +5097,8 @@ fn execute_world_restore_transfer(
         }
     }
 
-    restore_fence.end();
     if respawn_errors.is_empty() {
+        restore_fence.end();
         info!(
             anchor_snapshot_id = %anchor_snapshot_id,
             tick = final_tick,
@@ -4562,7 +5112,7 @@ fn execute_world_restore_transfer(
         Ok(())
     } else {
         Err(anyhow!(
-            "Restore committed, aber PostCommit-Respawn ist degraded: {}",
+            "Restore committed, aber PostCommit-Runtime-Restore ist degraded und bleibt gefenced: {}",
             respawn_errors.join("; ")
         ))
     }
@@ -5180,7 +5730,13 @@ fn ecs_tick_loop(
             fs_mount.as_deref(),
             Some(event_store_for_isolation.as_ref()),
         ) {
-            let _ = runtime_orch.despawn_agent(agent_id);
+            if let Err(cleanup_error) = runtime_orch.despawn_agent(agent_id) {
+                error!(
+                    agent_id = %agent_id,
+                    error = %cleanup_error,
+                    "Startup logical runtime rollback after NanoRuntime failure failed"
+                );
+            }
             continue;
         }
 
@@ -5845,7 +6401,7 @@ fn ecs_tick_loop(
                     let aid = AgentId(agent_id);
                     let aggregate_id = format!("AGENT-{agent_id:02}");
                     let present = runtime_orch.agents().contains_key(&aid);
-                    if present {
+                    let teardown = if present {
                         teardown_agent_full(
                             aid,
                             &mut world,
@@ -5856,30 +6412,40 @@ fn ecs_tick_loop(
                             &mut agent_processes,
                             &mut nano_runtimes,
                             &security_runtime_state,
-                        );
-                        info!(
-                            agent_id = %aid,
-                            "Agent destruktiv entfernt (#428 teardown_agent_full -> AgentDespawned)"
-                        );
+                        )
+                    } else {
+                        Ok(false)
+                    };
+                    if teardown.is_ok() && present {
+                        info!(agent_id = %aid, "Agent destruktiv entfernt (#428 teardown_agent_full -> AgentDespawned)");
                     }
+                    let teardown_error = teardown.as_ref().err().map(ToString::to_string);
+                    if let Some(error) = &teardown_error {
+                        error!(agent_id = %aid, error, "Agent-Despawn fail-closed abgebrochen");
+                    }
+                    let accepted = present && teardown_error.is_none();
                     let response = AgentLifecycleResponse {
-                        accepted: present,
+                        accepted,
                         agent_id,
                         aggregate_id,
                         action: "despawn".to_string(),
-                        new_status: if present {
+                        new_status: if accepted {
                             "despawned".to_string()
                         } else {
                             String::new()
                         },
                         affected_pids: 0,
-                        outcome: if present {
+                        outcome: if accepted {
                             "ok".to_string()
+                        } else if teardown_error.is_some() {
+                            "stop_failed".to_string()
                         } else {
                             "not_found".to_string()
                         },
-                        note: if present {
+                        note: if accepted {
                             "despawned (teardown_agent_full)".to_string()
+                        } else if let Some(error) = teardown_error {
+                            error
                         } else {
                             "Agent nicht in der Runtime".to_string()
                         },
@@ -6163,29 +6729,35 @@ fn ecs_tick_loop(
                     "Schichtwechsel erkannt"
                 );
 
-                // Alte Schicht-Agents entfernen (Orchestrator entfernt + emittiert Events)
+                // Determine removals without mutating logical state. Each owning
+                // adapter must confirm stop before the runtime/ECS commit.
                 let protected_prepared: HashSet<_> = agents_for_prepared_residency(&all_agents)
                     .iter()
                     .map(|agent| AgentId(agent.identity.id))
                     .collect();
-                let removed = runtime_orch.shift_transition_except(new_shift, &protected_prepared);
-                for agent_id in &removed {
+                let candidates =
+                    runtime_orch.shift_removal_candidates(new_shift, &protected_prepared);
+                let mut removed = Vec::new();
+                for agent_id in candidates {
                     if let Err(error) = stop_agent_runtime_layer(
-                        *agent_id,
+                        agent_id,
                         &mut nano_runtimes,
                         &sandbox,
                         &mut sandbox_handles,
                         &mut ebpf_collector,
                         &mut agent_processes,
                     ) {
-                        warn!(agent_id = %agent_id, error = %error, "NanoRuntime teardown beim Schichtwechsel fehlgeschlagen");
+                        error!(agent_id = %agent_id, error = %error, "Schichtwechsel-Teardown fehlgeschlagen; Agent bleibt logisch aktiv");
+                        continue;
                     }
-                    remove_security_runtime_snapshot(&security_runtime_state, *agent_id);
+                    remove_security_runtime_snapshot(&security_runtime_state, agent_id);
 
-                    if !despawn_agent_from_world(&mut world, *agent_id) {
+                    if !despawn_agent_from_world(&mut world, agent_id) {
                         warn!(agent_id = %agent_id, "ECS Entity fuer entfernten Agent nicht gefunden");
                     }
+                    removed.push(agent_id);
                 }
+                runtime_orch.commit_shift_transition(new_shift, &removed);
 
                 // Memory-Konsolidierung fuer entfernte Agents (nutzt den
                 // bereits geoeffneten HippocampusService Handle, vermeidet
@@ -6953,16 +7525,20 @@ fn ecs_tick_loop(
                     let data_dir = std::path::Path::new(&events_db_path_str)
                         .parent()
                         .unwrap_or(std::path::Path::new("/opt/sentinel/data"));
-                    match snapshot_manager.create_and_store(
-                        &mut world,
-                        &ss,
-                        &es,
-                        data_dir,
-                        fs_layer.as_deref(),
-                        fs_mount.as_deref(),
-                        tick_count,
-                        sim_hour,
-                    ) {
+                    let snapshot_result = nano_runtimes.snapshot_all().and_then(|snapshots| {
+                        snapshot_manager.create_and_store(
+                            &mut world,
+                            &ss,
+                            &es,
+                            data_dir,
+                            fs_layer.as_deref(),
+                            fs_mount.as_deref(),
+                            tick_count,
+                            sim_hour,
+                            snapshots,
+                        )
+                    });
+                    match snapshot_result {
                         Ok(id) => {
                             debug!(snapshot_id = %id, "World Snapshot erstellt");
                             // Maintenance: Promotion + Cleanup
@@ -6994,16 +7570,20 @@ fn ecs_tick_loop(
                 let data_dir = std::path::Path::new(&events_db_path_str)
                     .parent()
                     .unwrap_or(std::path::Path::new("/opt/sentinel/data"));
-                match snapshot_manager.create_and_store(
-                    &mut world,
-                    &ss,
-                    &es,
-                    data_dir,
-                    fs_layer.as_deref(),
-                    fs_mount.as_deref(),
-                    tick_count,
-                    sim_hour,
-                ) {
+                let snapshot_result = nano_runtimes.snapshot_all().and_then(|snapshots| {
+                    snapshot_manager.create_and_store(
+                        &mut world,
+                        &ss,
+                        &es,
+                        data_dir,
+                        fs_layer.as_deref(),
+                        fs_mount.as_deref(),
+                        tick_count,
+                        sim_hour,
+                        snapshots,
+                    )
+                });
+                match snapshot_result {
                     Ok(id) => info!(snapshot_id = %id, "Manueller World Snapshot erstellt"),
                     Err(e) => warn!(error = %e, "Manueller Snapshot fehlgeschlagen"),
                 }
@@ -7100,16 +7680,20 @@ fn ecs_tick_loop(
                     let data_dir = std::path::Path::new(&events_db_path_str)
                         .parent()
                         .unwrap_or(std::path::Path::new("/opt/sentinel/data"));
-                    match snapshot_manager.create_and_store(
-                        &mut world,
-                        &ss,
-                        &es,
-                        data_dir,
-                        fs_layer.as_deref(),
-                        fs_mount.as_deref(),
-                        tick_count,
-                        sim_hour,
-                    ) {
+                    let snapshot_result = nano_runtimes.snapshot_all().and_then(|snapshots| {
+                        snapshot_manager.create_and_store(
+                            &mut world,
+                            &ss,
+                            &es,
+                            data_dir,
+                            fs_layer.as_deref(),
+                            fs_mount.as_deref(),
+                            tick_count,
+                            sim_hour,
+                            snapshots,
+                        )
+                    });
+                    match snapshot_result {
                         Ok(id) => info!(snapshot_id = %id, "Pre-Apply Safety-Snapshot erstellt"),
                         Err(e) => {
                             warn!(error = %e, "Pre-Apply Snapshot fehlgeschlagen (Apply wird fortgesetzt)")
@@ -7125,6 +7709,7 @@ fn ecs_tick_loop(
             let mut updated = 0u32;
             let mut despawned = 0u32;
             let mut deferred_ids: Vec<AgentId> = Vec::new();
+            let mut lifecycle_errors: Vec<String> = Vec::new();
             // IDs der live-geaenderten Agents → gezielte Gateway-DNA-Invalidierung (#440).
             let mut changed_ids: Vec<u16> = Vec::new();
 
@@ -7132,7 +7717,7 @@ fn ecs_tick_loop(
                 sentinel_common::ApplyMode::Fresh => {
                     // Fresh-Load: gesamte Agent-Welt abbauen, dann Schicht-Agents neu spawnen.
                     for agent_id in world_agent_ids(&mut world) {
-                        teardown_agent_full(
+                        match teardown_agent_full(
                             agent_id,
                             &mut world,
                             &mut runtime_orch,
@@ -7142,25 +7727,32 @@ fn ecs_tick_loop(
                             &mut agent_processes,
                             &mut nano_runtimes,
                             &security_runtime_state,
-                        );
-                        despawned += 1;
-                    }
-                    for cfg in agents_for_local_residency(&apply_cmd.agents, current_shift) {
-                        if spawn_agent_full(
-                            &mut runtime_orch,
-                            &mut world,
-                            cfg,
-                            &sandbox,
-                            &mut sandbox_handles,
-                            &mut ebpf_collector,
-                            &mut agent_processes,
-                            &mut nano_runtimes,
-                            &agent_command,
-                            &security_runtime_state,
-                            event_store.as_ref(),
-                            fs_mount.as_deref(),
                         ) {
-                            spawned += 1;
+                            Ok(_) => despawned += 1,
+                            Err(error) => {
+                                deferred_ids.push(agent_id);
+                                lifecycle_errors.push(format!("{agent_id}: {error}"));
+                            }
+                        }
+                    }
+                    if lifecycle_errors.is_empty() {
+                        for cfg in agents_for_local_residency(&apply_cmd.agents, current_shift) {
+                            if spawn_agent_full(
+                                &mut runtime_orch,
+                                &mut world,
+                                cfg,
+                                &sandbox,
+                                &mut sandbox_handles,
+                                &mut ebpf_collector,
+                                &mut agent_processes,
+                                &mut nano_runtimes,
+                                &agent_command,
+                                &security_runtime_state,
+                                event_store.as_ref(),
+                                fs_mount.as_deref(),
+                            ) {
+                                spawned += 1;
+                            }
                         }
                     }
                 }
@@ -7193,9 +7785,7 @@ fn ecs_tick_loop(
                         let runtime_changed = all_agents
                             .iter()
                             .find(|current| current.identity.id == cfg.identity.id)
-                            .is_some_and(|current| {
-                                current.runtime.nano_runtime != cfg.runtime.nano_runtime
-                            });
+                            .is_some_and(|current| current.runtime != cfg.runtime);
                         if crate::config_apply::apply_agent_update(&mut world, cfg) {
                             updated += 1;
                             changed_ids.push(cfg.identity.id);
@@ -7232,7 +7822,10 @@ fn ecs_tick_loop(
                                 });
                                 if let Err(error) = switched {
                                     error!(agent_id = %agent_id, error = %error, "Runtime-Auswahl konnte nicht fail-closed umgeschaltet werden");
-                                    teardown_agent_full(
+                                    lifecycle_errors.push(format!(
+                                        "{agent_id}: runtime switch failed: {error}"
+                                    ));
+                                    if let Err(teardown_error) = teardown_agent_full(
                                         agent_id,
                                         &mut world,
                                         &mut runtime_orch,
@@ -7242,7 +7835,10 @@ fn ecs_tick_loop(
                                         &mut agent_processes,
                                         &mut nano_runtimes,
                                         &security_runtime_state,
-                                    );
+                                    ) {
+                                        lifecycle_errors
+                                            .push(format!("{agent_id}: {teardown_error}"));
+                                    }
                                 }
                             }
                         }
@@ -7254,7 +7850,7 @@ fn ecs_tick_loop(
                             deferred_ids.push(*agent_id);
                             continue;
                         }
-                        teardown_agent_full(
+                        match teardown_agent_full(
                             *agent_id,
                             &mut world,
                             &mut runtime_orch,
@@ -7264,31 +7860,41 @@ fn ecs_tick_loop(
                             &mut agent_processes,
                             &mut nano_runtimes,
                             &security_runtime_state,
-                        );
-                        despawned += 1;
+                        ) {
+                            Ok(_) => despawned += 1,
+                            Err(error) => {
+                                deferred_ids.push(*agent_id);
+                                lifecycle_errors.push(format!("{agent_id}: {error}"));
+                            }
+                        }
                     }
                 }
             }
 
             // 3. Persistenz (config_dir Write-Back) — Daemon ist alleiniger Schreiber (#420).
-            let persisted = match crate::config_persist::persist_company_config(
-                &config_dir,
-                &apply_cmd.agents,
-                &apply_cmd.building,
-                &tick_count.to_string(),
-            ) {
-                Ok(result) => {
-                    info!(
-                        agents = result.agents_written,
-                        removed = result.agents_removed,
-                        "Config in config_dir persistiert (ueberlebt Restart)"
-                    );
-                    true
+            let persisted = if lifecycle_errors.is_empty() {
+                match crate::config_persist::persist_company_config(
+                    &config_dir,
+                    &apply_cmd.agents,
+                    &apply_cmd.building,
+                    &tick_count.to_string(),
+                ) {
+                    Ok(result) => {
+                        info!(
+                            agents = result.agents_written,
+                            removed = result.agents_removed,
+                            "Config in config_dir persistiert (ueberlebt Restart)"
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Config-Persistenz fehlgeschlagen — Laufzeit-Welt ist bereits aktualisiert (Safety-Snapshot erlaubt Rollback)");
+                        false
+                    }
                 }
-                Err(e) => {
-                    error!(error = %e, "Config-Persistenz fehlgeschlagen — Laufzeit-Welt ist bereits aktualisiert (Safety-Snapshot erlaubt Rollback)");
-                    false
-                }
+            } else {
+                error!(errors = ?lifecycle_errors, "Config-Persistenz wegen fehlgeschlagenem Runtime-Teardown blockiert");
+                false
             };
 
             // 4. Angewandte Config fuer den naechsten Diff uebernehmen. Deferred (CP-Heilung) Agents
@@ -7297,8 +7903,10 @@ fn ecs_tick_loop(
                 .iter()
                 .filter_map(|id| all_agents.iter().find(|a| a.identity.id == id.0).cloned())
                 .collect();
-            all_agents = apply_cmd.agents.clone();
-            all_agents.extend(deferred_configs);
+            if persisted {
+                all_agents = apply_cmd.agents.clone();
+                all_agents.extend(deferred_configs);
+            }
             #[cfg(feature = "llm")]
             crate::llm_bridge::bridge::replace_agent_routing(&all_agents);
 
@@ -7531,20 +8139,15 @@ fn ecs_tick_loop(
 
     // 1. Stop every workload through its owning adapter (#698/#472).
     let t = Instant::now();
-    let runtime_agent_ids = nano_runtimes.agent_ids();
-    let agent_count = runtime_agent_ids.len();
-    for agent_id in runtime_agent_ids {
-        if let Err(error) = stop_agent_runtime_layer(
-            agent_id,
-            &mut nano_runtimes,
-            &sandbox,
-            &mut sandbox_handles,
-            &mut ebpf_collector,
-            &mut agent_processes,
-        ) {
-            warn!(agent_id = %agent_id, error = %error, "NanoRuntime-Stop beim Shutdown fehlgeschlagen");
-        }
-    }
+    let agent_count = stop_all_nano_runtimes_with_retries(
+        &mut nano_runtimes,
+        &sandbox,
+        &mut sandbox_handles,
+        &mut ebpf_collector,
+        &mut agent_processes,
+        3,
+    )
+    .context("shutdown blocked by NanoRuntime cleanup failure")?;
     // Compatibility cleanup for any pre-registry fixture/process.
     for proc in agent_processes.values_mut() {
         proc.terminate();
@@ -7647,6 +8250,50 @@ mod tests {
     use std::sync::Arc;
 
     static PROJECTION_RESTART_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn reconcile_health_fixture(
+        runtime_key: &str,
+        tracked_pid: Option<u32>,
+        tracked_pid_alive: bool,
+        cgroup_live_pid_count: usize,
+    ) -> runtime_health::RuntimeHealthAgentSnapshot {
+        runtime_health::RuntimeHealthAgentSnapshot {
+            agent_id: 7,
+            aggregate_id: "AGENT-07".to_string(),
+            name: "Runtime Agent".to_string(),
+            runtime_key: runtime_key.to_string(),
+            runtime_present: true,
+            projection_present: true,
+            tracked_pid,
+            tracked_pid_alive,
+            tracked_pid_state: tracked_pid_alive.then(|| "S".to_string()),
+            cgroup_live_pid_count,
+            security_runtime_present: true,
+            last_repair_status: None,
+        }
+    }
+
+    #[test]
+    fn periodic_reconcile_uses_runtime_specific_resource_health() {
+        for runtime_key in [RUNTIME_ECS_NATIVE, RUNTIME_WASM_WASMTIME] {
+            let snapshot = reconcile_health_fixture(runtime_key, None, false, 0);
+            assert!(runtime_resources_are_healthy(&snapshot), "{runtime_key}");
+            assert!(runtime_agent_is_healthy(&snapshot), "{runtime_key}");
+        }
+
+        let microvm = reconcile_health_fixture(RUNTIME_MICROVM, Some(42), true, 0);
+        assert!(runtime_resources_are_healthy(&microvm));
+        assert!(runtime_agent_is_healthy(&microvm));
+
+        let bwrap = reconcile_health_fixture(RUNTIME_BWRAP_LANDLOCK, Some(42), true, 1);
+        assert!(runtime_resources_are_healthy(&bwrap));
+        assert!(runtime_agent_is_healthy(&bwrap));
+
+        let missing_bwrap_cgroup =
+            reconcile_health_fixture(RUNTIME_BWRAP_LANDLOCK, Some(42), true, 0);
+        assert!(!runtime_resources_are_healthy(&missing_bwrap_cgroup));
+        assert!(!runtime_agent_is_healthy(&missing_bwrap_cgroup));
+    }
 
     #[cfg(all(unix, feature = "llm"))]
     #[test]
@@ -8176,6 +8823,7 @@ mod tests {
         )]);
         let mut agent_processes = HashMap::new();
         let (mut ebpf_collector, _ebpf_tx) = test_ebpf();
+        let mut nano_runtimes = DaemonNanoRuntimeRegistry::production(10, None).unwrap();
         let security_runtime_state: operator_api::SharedSecurityRuntimeState = Default::default();
         record_security_runtime_snapshot(
             &security_runtime_state,
@@ -8193,9 +8841,11 @@ mod tests {
             &mut sandbox_handles,
             &mut ebpf_collector,
             &mut agent_processes,
+            &mut nano_runtimes,
             &security_runtime_state,
             &event_store,
-        );
+        )
+        .unwrap();
 
         assert!(
             sandbox_handles.contains_key(&agent_id),
@@ -8229,7 +8879,7 @@ mod tests {
         let agent_id = AgentId(60);
         let agent_name = format!("issue75-fault-{}", std::process::id());
         let mut handle = sandbox
-            .setup_agent(&agent_name, &default_agent_limits())
+            .setup_agent(&agent_name, &sentinel_sandbox::CgroupLimits::default())
             .expect("fault-injection sandbox setup must succeed");
         let process = sentinel_sandbox::AgentProcess::from(
             sentinel_sandbox::BwrapConfig::for_agent(&agent_name)
@@ -8250,6 +8900,7 @@ mod tests {
         let mut sandbox_handles = HashMap::from([(agent_id, handle)]);
         let mut agent_processes = HashMap::from([(agent_id, process)]);
         let (mut ebpf_collector, _ebpf_tx) = test_ebpf();
+        let mut nano_runtimes = DaemonNanoRuntimeRegistry::production(10, None).unwrap();
         let security_runtime_state: operator_api::SharedSecurityRuntimeState = Default::default();
         record_security_runtime_snapshot(
             &security_runtime_state,
@@ -8271,9 +8922,11 @@ mod tests {
             &mut sandbox_handles,
             &mut ebpf_collector,
             &mut agent_processes,
+            &mut nano_runtimes,
             &security_runtime_state,
             &event_store,
-        );
+        )
+        .unwrap();
 
         assert!(
             !agent_processes.contains_key(&agent_id),
@@ -8424,6 +9077,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn productive_registry_snapshots_and_restores_selected_ecs_runtime() {
+        let mut registry = DaemonNanoRuntimeRegistry::production(64, None).unwrap();
+        let mut agent = test_agent_config(7, "Native Restore", "Tester", 1);
+        agent.runtime.nano_runtime =
+            Some(sentinel_common::nano_runtime::RUNTIME_ECS_NATIVE.to_string());
+
+        let (original, resources) = registry.spawn(&agent, &[]).unwrap();
+        assert_eq!(resources.instance_id, Some(original.instance_id));
+        let snapshots = registry.snapshot_all().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots[0].semantics,
+            sentinel_common::nano_runtime::NanoSnapshotSemantics::RuntimeMetadata
+        );
+
+        registry.stop(AgentId(7)).unwrap().unwrap();
+        let (restored, restored_resources) = registry.restore(snapshots[0].clone()).unwrap();
+        assert_ne!(restored.instance_id, original.instance_id);
+        assert_eq!(restored_resources.instance_id, Some(restored.instance_id));
+        assert_eq!(registry.handle(AgentId(7)), Some(&restored));
+        let (observed, observed_resources) = registry.observe(AgentId(7)).unwrap();
+        assert_eq!(observed, restored);
+        assert_eq!(observed_resources.instance_id, Some(restored.instance_id));
+        assert!(registry.restore(snapshots[0].clone()).is_err());
+    }
+
+    #[test]
+    fn world_restore_snapshot_set_validation_is_exact_and_runtime_aware() {
+        let mut agent = test_agent_config(7, "Native Restore", "Tester", 1);
+        agent.runtime.nano_runtime =
+            Some(sentinel_common::nano_runtime::RUNTIME_ECS_NATIVE.to_string());
+        let snapshot = sentinel_common::nano_runtime::NanoSnapshot {
+            runtime_key: sentinel_common::nano_runtime::RUNTIME_ECS_NATIVE.to_string(),
+            workload_id: "AGENT-07".to_string(),
+            agent_id: Some(AgentId(7)),
+            semantics: sentinel_common::nano_runtime::NanoSnapshotSemantics::RuntimeMetadata,
+            payload: serde_json::json!({"external_canonical_world": true}),
+        };
+        assert!(validate_nano_runtime_snapshot_set(
+            std::slice::from_ref(&snapshot),
+            &[AgentId(7)],
+            std::slice::from_ref(&agent),
+        )
+        .is_ok());
+        assert!(validate_nano_runtime_snapshot_set(&[], &[AgentId(7)], &[agent.clone()]).is_err());
+        assert!(validate_nano_runtime_snapshot_set(
+            &[snapshot.clone(), snapshot.clone()],
+            &[AgentId(7)],
+            &[agent.clone()],
+        )
+        .is_err());
+
+        let mut wrong_runtime = snapshot;
+        wrong_runtime.runtime_key = sentinel_common::nano_runtime::RUNTIME_MICROVM.to_string();
+        assert!(
+            validate_nano_runtime_snapshot_set(&[wrong_runtime], &[AgentId(7)], &[agent],).is_err()
+        );
+    }
+
     fn empty_redb_dump() -> RedbDump {
         RedbDump {
             agent_states: Vec::new(),
@@ -8536,6 +9249,7 @@ mod tests {
             },
             projection_offsets: vec![("sentinel-projection".to_string(), 321)],
             fs_metadata: None,
+            nano_runtime_snapshots: Vec::new(),
         }
     }
 
@@ -9084,7 +9798,8 @@ mod tests {
             &mut agent_processes,
             &mut nano_runtimes,
             &security_runtime_state,
-        );
+        )
+        .unwrap();
 
         assert_eq!(removed, 1);
         assert!(!runtime_orch.agents().contains_key(&AgentId(1)));
@@ -9332,7 +10047,7 @@ mod tests {
         let mut agent_processes = HashMap::new();
         let mut nano_runtimes = DaemonNanoRuntimeRegistry::production(10, None).unwrap();
         let security_runtime_state = Arc::new(RwLock::new(HashMap::new()));
-        let agent_cfg = test_agent_config(1, "Test Agent", "Tester", 1);
+        let agent_cfg = test_agent_config(1, "Fast Restart Agent", "Tester", 1);
         let agent_command = vec!["true".to_string()];
 
         assert!(spawn_agent_full(
@@ -9372,7 +10087,7 @@ mod tests {
         )
         .expect("fast restart");
 
-        assert_eq!(result.agent_name, "Test Agent");
+        assert_eq!(result.agent_name, "Fast Restart Agent");
         assert_eq!(result.pid_before, before_pid);
         assert!(result.runtime_present_after);
         assert!(result.security_runtime_present_after);
@@ -9677,7 +10392,7 @@ mod tests {
 
         let controlplane = test_controlplane(&tmp);
         let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
-        let all_agents = vec![test_agent_config(1, "Test Agent", "Tester", 1)];
+        let all_agents = vec![test_agent_config(1, "Tick Loop Agent", "Tester", 1)];
 
         let (ebpf_collector, ebpf_tx) = test_ebpf();
         let ep = test_episode_producer(&tmp, &event_store);
@@ -9907,7 +10622,7 @@ mod tests {
 
         let controlplane = test_controlplane(&tmp);
         let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
-        let all_agents = vec![test_agent_config(1, "Test Agent", "Tester", 1)];
+        let all_agents = vec![test_agent_config(1, "Operator Loop Agent", "Tester", 1)];
         let ep = test_episode_producer(&tmp, &event_store);
         let (ebpf_collector, ebpf_tx) = test_ebpf();
 
@@ -10075,6 +10790,7 @@ mod tests {
             agent_id,
             aggregate_id: format!("AGENT-{agent_id:02}"),
             name: format!("Agent{agent_id}"),
+            runtime_key: sentinel_common::RUNTIME_ECS_NATIVE.to_string(),
             runtime_present: true,
             projection_present: true,
             tracked_pid: None,

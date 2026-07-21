@@ -7,7 +7,8 @@ use anyhow::{anyhow, bail, Result};
 use sentinel_common::nano_runtime::{
     ensure_handle_instance, ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle,
     NanoHealth, NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime,
-    NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_MICROVM,
+    NanoRuntimeResources, NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec,
+    RUNTIME_MICROVM,
 };
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +21,10 @@ pub struct MicrovmConfig {
     pub kernel_image_path: String,
     pub rootfs_path: String,
     pub rootfs_read_only: bool,
+    /// Guest PID 1 that consumes `sentinel.workload_spec_hex` and executes the
+    /// requested command. The kernel is never allowed to fall back to a
+    /// generic rootfs init for a Nano workload.
+    pub guest_init_path: String,
     /// Basisverzeichnis fuer API-Sockets und Snapshot-Dateien.
     pub work_dir: String,
     pub vcpu_count: u32,
@@ -41,6 +46,10 @@ impl MicrovmConfig {
                 "/opt/sentinel/microvm/rootfs.ext4",
             ),
             rootfs_read_only: true,
+            guest_init_path: env(
+                "SENTINEL_MICROVM_GUEST_INIT",
+                "/opt/sentinel/bin/sentinel-nano-init",
+            ),
             work_dir: env("SENTINEL_MICROVM_WORKDIR", "/opt/sentinel/microvm/run"),
             vcpu_count: 1,
             mem_size_mib: 128,
@@ -118,8 +127,42 @@ impl MicrovmNanoRuntime {
         Path::new(&self.config.work_dir).join(format!("{}.vsock", sanitize(workload_id)))
     }
 
-    /// Bootet eine frische microVM fuer `workload_id` (KVM + Kernel/rootfs vorausgesetzt).
-    fn boot_fresh(&self, workload_id: &str) -> Result<FirecrackerProcess> {
+    fn workload_boot_args(&self, workload: &NanoWorkloadSpec) -> Result<String> {
+        if workload.command.is_empty() {
+            return Err(anyhow!(
+                "microVM workload '{}' requires a guest command",
+                workload.workload_id
+            ));
+        }
+        if !self.config.guest_init_path.starts_with('/')
+            || self.config.guest_init_path.chars().any(char::is_whitespace)
+        {
+            return Err(anyhow!(
+                "microVM guest init must be an absolute path without whitespace"
+            ));
+        }
+        let encoded = serde_json::to_vec(workload)?
+            .into_iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let boot_args = format!(
+            "{} init={} sentinel.nano_contract=kernel-cmdline-v1 sentinel.workload_spec_hex={encoded}",
+            self.config.boot_args, self.config.guest_init_path
+        );
+        if boot_args.len() > 4096 {
+            return Err(anyhow!(
+                "microVM workload '{}' exceeds the 4096-byte guest boot contract",
+                workload.workload_id
+            ));
+        }
+        Ok(boot_args)
+    }
+
+    /// Boots a fresh microVM and passes the complete workload identity and
+    /// command to the guest launcher through the versioned kernel-cmdline
+    /// contract. A generic rootfs boot without an executable workload is
+    /// rejected.
+    fn boot_fresh(&self, workload: &NanoWorkloadSpec) -> Result<FirecrackerProcess> {
         firecracker::ensure_kvm_available()?;
         let cfg = &self.config;
         if !Path::new(&cfg.kernel_image_path).exists() {
@@ -130,13 +173,14 @@ impl MicrovmNanoRuntime {
         }
         std::fs::create_dir_all(&cfg.work_dir)?;
 
-        let sock = self.api_sock_path(workload_id);
+        let sock = self.api_sock_path(&workload.workload_id);
         let proc = FirecrackerProcess::launch(&cfg.firecracker_bin, &sock)?;
         firecracker::configure_machine(&sock, cfg.vcpu_count, cfg.mem_size_mib)?;
-        firecracker::configure_boot_source(&sock, &cfg.kernel_image_path, &cfg.boot_args)?;
+        let boot_args = self.workload_boot_args(workload)?;
+        firecracker::configure_boot_source(&sock, &cfg.kernel_image_path, &boot_args)?;
         firecracker::configure_rootfs(&sock, "rootfs", &cfg.rootfs_path, cfg.rootfs_read_only)?;
         // vsock-Geraet fuer optionale Host<->Gast-Steuerung (guest_cid 3); stale Listener entfernen.
-        let vsock_uds = self.vsock_uds_path(workload_id);
+        let vsock_uds = self.vsock_uds_path(&workload.workload_id);
         let _ = std::fs::remove_file(&vsock_uds);
         firecracker::configure_vsock(&sock, 3, &vsock_uds.to_string_lossy())?;
         firecracker::instance_start(&sock)?;
@@ -237,7 +281,7 @@ impl NanoRuntime for MicrovmNanoRuntime {
             ));
         }
         self.ensure_runtime_paths_available(&workload.workload_id)?;
-        let proc = self.boot_fresh(&workload.workload_id)?;
+        let proc = self.boot_fresh(&workload)?;
         let pid = proc.pid();
         let instance_id = uuid::Uuid::new_v4();
         self.processes.insert(workload.workload_id.clone(), proc);
@@ -269,7 +313,26 @@ impl NanoRuntime for MicrovmNanoRuntime {
         ))
     }
 
+    fn resources(&self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        let state = self
+            .workloads
+            .get(&handle.workload_id)
+            .ok_or_else(|| anyhow!("unknown microVM workload '{}'", handle.workload_id))?;
+        ensure_handle_instance(handle, state.instance_id)?;
+        let process = self
+            .processes
+            .get(&handle.workload_id)
+            .ok_or_else(|| anyhow!("missing microVM process '{}'", handle.workload_id))?;
+        Ok(NanoRuntimeResources {
+            instance_id: Some(state.instance_id),
+            pid: Some(process.pid()),
+            ..NanoRuntimeResources::default()
+        })
+    }
+
     fn exec(&mut self, handle: &NanoHandle, request: NanoExecRequest) -> Result<NanoExecResult> {
+        self.resources(handle)?;
         let output = match request.operation.as_str() {
             "health" => format!("{:?}", self.health(handle)?.state),
             "state" => {
@@ -287,12 +350,13 @@ impl NanoRuntime for MicrovmNanoRuntime {
     }
 
     fn snapshot(&mut self, handle: &NanoHandle) -> Result<NanoSnapshot> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
         let workload = self
             .workloads
             .get(&handle.workload_id)
-            .ok_or_else(|| anyhow!("unknown microVM workload '{}'", handle.workload_id))?
-            .workload
-            .clone();
+            .ok_or_else(|| anyhow!("unknown microVM workload '{}'", handle.workload_id))?;
+        ensure_handle_instance(handle, workload.instance_id)?;
+        let workload = workload.workload.clone();
 
         let sock = self.api_sock_path(&handle.workload_id);
         let dir = self.snapshot_dir(&handle.workload_id);
@@ -382,6 +446,9 @@ impl NanoRuntime for MicrovmNanoRuntime {
 
     fn health(&mut self, handle: &NanoHandle) -> Result<NanoHealth> {
         ensure_handle_runtime(handle, self.runtime_key())?;
+        if let Some(state) = self.workloads.get(&handle.workload_id) {
+            ensure_handle_instance(handle, state.instance_id)?;
+        }
         let sock = self.api_sock_path(&handle.workload_id);
         let running = self
             .processes
@@ -420,6 +487,10 @@ impl NanoRuntime for MicrovmNanoRuntime {
         handle: &NanoHandle,
         _policy: NanoIsolationPolicy,
     ) -> Result<NanoIsolationReport> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        if let Some(state) = self.workloads.get(&handle.workload_id) {
+            ensure_handle_instance(handle, state.instance_id)?;
+        }
         let applied = self.processes.contains_key(&handle.workload_id);
         Ok(NanoIsolationReport {
             runtime_key: self.runtime_key().to_string(),
@@ -459,7 +530,7 @@ mod tests {
             role: "Tester".to_string(),
             room_id: "empfang".to_string(),
             shift_set: 1,
-            command: Vec::new(),
+            command: vec!["/opt/sentinel/bin/agent-runtime".to_string()],
             capabilities: Vec::new(),
             metadata: Default::default(),
             ecs_snapshot: None,
@@ -531,6 +602,39 @@ mod tests {
         assert!(cfg.mem_size_mib >= 64);
         assert!(!cfg.firecracker_bin.is_empty());
         assert!(cfg.boot_args.contains("console="));
+    }
+
+    #[test]
+    fn boot_contract_carries_complete_workload_identity_and_command() {
+        let runtime = MicrovmNanoRuntime::with_config(MicrovmConfig {
+            boot_args: "console=ttyS0 root=/dev/vda".to_string(),
+            ..MicrovmConfig::default()
+        });
+        let workload = fixture_workload("identity-contract", 17);
+        let boot_args = runtime.workload_boot_args(&workload).unwrap();
+        assert!(boot_args.contains("sentinel.nano_contract=kernel-cmdline-v1"));
+        assert!(boot_args.contains("init=/opt/sentinel/bin/sentinel-nano-init"));
+        let encoded = boot_args
+            .split("sentinel.workload_spec_hex=")
+            .nth(1)
+            .expect("encoded workload contract");
+        let bytes = encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let text = std::str::from_utf8(pair).unwrap();
+                u8::from_str_radix(text, 16).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let decoded: NanoWorkloadSpec = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.workload_id, workload.workload_id);
+        assert_eq!(decoded.agent_id, workload.agent_id);
+        assert_eq!(decoded.agent_name, workload.agent_name);
+        assert_eq!(decoded.command, workload.command);
+
+        let mut invalid = workload;
+        invalid.command.clear();
+        assert!(runtime.workload_boot_args(&invalid).is_err());
     }
 
     #[test]

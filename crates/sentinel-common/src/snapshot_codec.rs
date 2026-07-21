@@ -113,7 +113,7 @@ impl From<EcsSnapshotV2> for EcsSnapshot {
     }
 }
 
-/// World-Snapshot Schema v2: aktuelle Form VOR #491 (mit `fs_metadata`, ohne die v3-ECS-Felder).
+/// World-Snapshot Schema v2: form before #491 (with `fs_metadata`, without v3 ECS fields).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorldSnapshotV2 {
     snapshot_id: String,
@@ -130,6 +130,42 @@ struct WorldSnapshotV2 {
     fs_metadata: Option<FsMetadataDump>,
 }
 
+/// World-Snapshot Schema v3: current ECS shape before runtime-owned Nano snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorldSnapshotV3 {
+    snapshot_id: String,
+    schema_version: u32,
+    tick: u64,
+    sim_hour: f32,
+    timestamp_ms: u64,
+    tier: SnapshotTier,
+    last_event_id: i64,
+    redb: RedbDump,
+    ecs: EcsSnapshot,
+    projection_offsets: Vec<(String, i64)>,
+    #[serde(default)]
+    fs_metadata: Option<FsMetadataDump>,
+}
+
+impl From<WorldSnapshotV3> for WorldSnapshot {
+    fn from(snapshot: WorldSnapshotV3) -> Self {
+        Self {
+            snapshot_id: snapshot.snapshot_id,
+            schema_version: snapshot.schema_version,
+            tick: snapshot.tick,
+            sim_hour: snapshot.sim_hour,
+            timestamp_ms: snapshot.timestamp_ms,
+            tier: snapshot.tier,
+            last_event_id: snapshot.last_event_id,
+            redb: snapshot.redb,
+            ecs: snapshot.ecs,
+            projection_offsets: snapshot.projection_offsets,
+            fs_metadata: snapshot.fs_metadata,
+            nano_runtime_snapshots: Vec::new(),
+        }
+    }
+}
+
 impl From<WorldSnapshotV2> for WorldSnapshot {
     fn from(snapshot: WorldSnapshotV2) -> Self {
         Self {
@@ -144,6 +180,7 @@ impl From<WorldSnapshotV2> for WorldSnapshot {
             ecs: snapshot.ecs.into(),
             projection_offsets: snapshot.projection_offsets,
             fs_metadata: snapshot.fs_metadata,
+            nano_runtime_snapshots: Vec::new(),
         }
     }
 }
@@ -177,15 +214,16 @@ impl From<WorldSnapshotV1> for WorldSnapshot {
             ecs: snapshot.ecs.into(),
             projection_offsets: snapshot.projection_offsets,
             fs_metadata: None,
+            nano_runtime_snapshots: Vec::new(),
         }
     }
 }
 
 pub fn decode_world_snapshot(bytes: &[u8]) -> anyhow::Result<WorldSnapshot> {
-    // v3 (aktuell): nur akzeptieren wenn vollstaendig konsumiert UND schema_version == 3.
-    // Der schema_version-Guard verhindert, dass ein aelterer (v2/v1) Byte-Stream durch zufaellige
-    // bincode-Ausrichtung als v3 fehl-dekodiert wird (schema_version liegt in allen Versionen an
-    // derselben Position: direkt hinter dem fuehrenden snapshot_id-String).
+    // v4 (current): accept only when fully consumed AND schema_version == 4.
+    // The schema-version guard prevents an older (v3/v2/v1) byte stream from being
+    // incorrectly decoded as v4 through accidental bincode alignment. `schema_version` is
+    // in the same position in every version, directly after the leading snapshot id.
     if let Ok((snapshot, consumed)) =
         bincode::serde::decode_from_slice::<WorldSnapshot, _>(bytes, legacy_config())
     {
@@ -194,7 +232,16 @@ pub fn decode_world_snapshot(bytes: &[u8]) -> anyhow::Result<WorldSnapshot> {
         }
     }
 
-    // v2: aktuelle Form vor #491 (mit fs_metadata, ohne v3-ECS-Felder).
+    // v3: current ECS snapshot shape, before NanoRuntime snapshots.
+    if let Ok((snapshot, consumed)) =
+        bincode::serde::decode_from_slice::<WorldSnapshotV3, _>(bytes, legacy_config())
+    {
+        if consumed == bytes.len() && snapshot.schema_version == 3 {
+            return Ok(WorldSnapshot::from(snapshot));
+        }
+    }
+
+    // v2: form before #491 (with fs_metadata, without v3 ECS fields).
     if let Ok((snapshot, consumed)) =
         bincode::serde::decode_from_slice::<WorldSnapshotV2, _>(bytes, legacy_config())
     {
@@ -271,6 +318,7 @@ mod tests {
             },
             projection_offsets: Vec::new(),
             fs_metadata: Some(FsMetadataDump::default()),
+            nano_runtime_snapshots: Vec::new(),
         }
     }
 
@@ -393,18 +441,43 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_preserves_v3_fields() {
+    fn roundtrip_preserves_v4_fields() {
         let snapshot = base_snapshot();
         let bytes = encode_world_snapshot(&snapshot).unwrap();
         let decoded = decode_world_snapshot(&bytes).unwrap();
-        assert_eq!(decoded.schema_version, 3);
+        assert_eq!(decoded.schema_version, WorldSnapshot::SCHEMA_VERSION);
         assert_eq!(decoded.ecs.autonomy_cooldowns, vec![(3, 100), (7, 250)]);
         assert_eq!(decoded.ecs.smells_json, b"{\"smells\":{}}".to_vec());
+        assert!(decoded.nano_runtime_snapshots.is_empty());
+    }
+
+    #[test]
+    fn decode_falls_back_to_v3_snapshots() {
+        let current = base_snapshot();
+        let legacy = WorldSnapshotV3 {
+            snapshot_id: "snap-v3".to_string(),
+            schema_version: 3,
+            tick: current.tick,
+            sim_hour: current.sim_hour,
+            timestamp_ms: current.timestamp_ms,
+            tier: current.tier,
+            last_event_id: current.last_event_id,
+            redb: current.redb,
+            ecs: current.ecs,
+            projection_offsets: current.projection_offsets,
+            fs_metadata: current.fs_metadata,
+        };
+        let bytes = bincode::serde::encode_to_vec(&legacy, legacy_config()).unwrap();
+        let decoded = decode_world_snapshot(&bytes).unwrap();
+        assert_eq!(decoded.snapshot_id, "snap-v3");
+        assert_eq!(decoded.schema_version, 3);
+        assert_eq!(decoded.ecs.autonomy_cooldowns, vec![(3, 100), (7, 250)]);
+        assert!(decoded.nano_runtime_snapshots.is_empty());
     }
 
     #[test]
     fn decode_falls_back_to_v2_snapshots() {
-        // v2 = aktuelle Form VOR #491 (mit fs_metadata, ohne v3-ECS-Felder), schema_version == 2.
+        // v2 = form before #491 (with fs_metadata, without v3 ECS fields), schema_version == 2.
         let legacy = WorldSnapshotV2 {
             snapshot_id: "snap-v2".to_string(),
             schema_version: 2,
@@ -420,8 +493,8 @@ mod tests {
         };
         let bytes = bincode::serde::encode_to_vec(&legacy, legacy_config()).unwrap();
         let decoded = decode_world_snapshot(&bytes).unwrap();
-        // Muss ueber den v2-Zweig laufen (NICHT als v3 fehl-akzeptiert): alte Daten erhalten,
-        // neue Felder leer.
+        // Must use the v2 branch (not be accepted as a newer schema): preserve old data and
+        // initialize newer fields empty.
         assert_eq!(decoded.snapshot_id, "snap-v2");
         assert_eq!(decoded.schema_version, 2);
         assert_eq!(decoded.tick, 21);
