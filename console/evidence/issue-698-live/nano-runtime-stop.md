@@ -6,17 +6,22 @@ Scope: the shared `NanoRuntime` stop contract and the ECS-native,
 WASM/Wasmtime, bwrap/Landlock, and microVM adapters. Runtime diagnostics were
 run only on the canonical #650 single-node VM. No cluster node was contacted.
 
-## Candidate and rollback guard
+## Candidate and scope guard
 
 - Source branch: `feat/issue-698-nano-stop`
-- The live test executables were produced by `cargo remote -c --` from the
-  candidate worktree. Their final SHA-256 values were:
+- The final source gates below ran at the review candidate in PR #699 with
+  `rustc 1.97.1`; the exact pushed commit is recorded by the PR head.
+- No service, installed binary, configuration, or cluster node was changed by
+  the final review delta.
+- Earlier single-node diagnostics used executables produced by
+  `cargo remote -c --` from the initial candidate. Their SHA-256 values were:
   - bwrap conformance executable:
     `c6f072be9826a1cbe93e31c2a5f00e9ec74a7c7fb79a11898a3aca9efcd8f40f`
   - ECS-native conformance executable:
     `35a7c0d61b6f9419f75dd64ec959862a3d9595be8350421b57e9298c42f117af`
-- The issue #650 pre-deployment VM snapshot remained present throughout the
-  diagnostic. No service, installed binary, or configuration was replaced.
+- The issue #650 pre-deployment VM snapshot remained present throughout that
+  diagnostic. These earlier runtime results are retained below as lineage
+  evidence and are not represented as a final-head deployment.
 
 ## Static and remote build gates
 
@@ -26,24 +31,38 @@ tool or Rust executable was run.
 | Gate | Command | Result |
 |---|---|---|
 | Format | `cargo remote -c -- fmt --all -- --check` | PASS |
-| Check | `cargo remote -c -- check -p sentinel-common -p sentinel-runtime -p sentinel-sandbox -p sentinel-wasm -p sentinel-microvm` | PASS |
-| Tests | `cargo remote -c -- test -p sentinel-common -p sentinel-runtime -p sentinel-sandbox -p sentinel-wasm -p sentinel-microvm` | PASS |
-| Clippy | `cargo remote -c -- clippy -p sentinel-common -p sentinel-runtime -p sentinel-sandbox -p sentinel-wasm -p sentinel-microvm --all-targets -- -D warnings` | PASS |
+| Check | `cargo remote -c -- check -j1 -p sentinel-common -p sentinel-runtime -p sentinel-sandbox -p sentinel-microvm -p sentinel-wasm` | PASS |
+| Default tests | `cargo remote -c -- test -j1 -p <crate>` for each of `sentinel-common`, `sentinel-runtime`, `sentinel-sandbox`, `sentinel-microvm`, and `sentinel-wasm` | PASS |
+| WASM feature check | `cargo remote -c -- check -j1 -p sentinel-wasm --features wasm` | PASS |
+| WASM feature tests | `cargo remote -c -- test -j1 -p sentinel-wasm --features wasm` | PASS |
+| Default Clippy | `cargo remote -c -- clippy -j1 -p sentinel-common -p sentinel-runtime -p sentinel-sandbox -p sentinel-microvm -p sentinel-wasm --all-targets -- -D warnings` | PASS |
+| WASM feature Clippy | `cargo remote -c -- clippy -j1 -p sentinel-wasm --features wasm --all-targets -- -D warnings` | PASS |
 | M0 contract | `python3 scripts/product-acceptance/check_contract.py --matrix scripts/product-acceptance/m0-contract.toml` | PASS |
 | M0 validator tests | `python3 -m unittest test_check_contract.py` from `scripts/product-acceptance/` | PASS, 18/18 |
 
-The final Rust test run included:
+The final exact-source Rust test runs included:
 
-- shared contract and registry tests: 122 passed;
-- microVM unit/fixture tests: 6 passed, including process/socket teardown and
-  retained snapshot preservation;
-- ECS-native adapter conformance: 2 passed;
-- sandbox unit tests: 47 passed, with 3 host-capability tests ignored;
+- shared contract and registry tests: 123 unit tests passed, plus all
+  acceptance and snapshot suites;
+- ECS-native: 25 unit tests passed (1 host metric test ignored), 8 acceptance
+  tests passed, and 2 NanoRuntime conformance tests passed;
+- microVM: 9 unit/fixture tests passed, including a real Unix socket fixture,
+  process/socket retry cleanup, retained snapshot preservation, path-alias
+  rejection, and restore-envelope identity rejection;
+- sandbox unit tests: 50 passed, with 3 host-capability tests ignored; the new
+  retry, duplicate-home, and restore-envelope negative tests passed;
 - bwrap integration tests compiled and remained ignored on the build host for
   execution on the single-node VM;
-- WASM adapter and tool-runtime suites passed.
+- WASM with `--features wasm`: 57 unit tests, 62 acceptance tests, and 2
+  NanoRuntime conformance tests passed. Tool-name collisions, shared-component
+  reference cleanup, removed-source unload, duplicate workload ids, and
+  restore-envelope identity rejection are covered.
 
-## Single-node runtime diagnostics
+## Prior single-node runtime diagnostics
+
+The following diagnostics were captured from the initial PR candidate before
+the final adversarial corrections. They remain useful operational lineage, but
+the final candidate was not deployed or executed on a VM without ORC approval.
 
 The bwrap diagnostic used `/usr/bin/agent-runtime`, the production-approved
 Landlock entrypoint. The common conformance harness first required both
@@ -63,7 +82,7 @@ bwrap_elapsed_seconds=0.01
 The first exploratory run used `/usr/bin/sleep`; Landlock correctly denied that
 entrypoint. Its formal test result was discarded because the old harness did not
 require a healthy pre-stop workload. The harness and fixture were corrected
-before the final evidence above.
+before the retained diagnostic above.
 
 Post-stop readback on the single-node VM:
 
@@ -92,11 +111,12 @@ removed after the negative readback; cleanup was verified.
 
 | AC | Status | Evidence |
 |---|---|---|
-| AC-1 | PASS | Version-1 `NanoStopResult` uses a closed `stopped` / `already_stopped` outcome. Unit tests cover first stop, replay, JSON wire form, and wrong-runtime rejection. |
-| AC-2 | PASS | All four adapters use the shared two-workload conformance contract. Remote suites passed; bwrap and ECS-native were additionally executed on the single-node VM. |
-| AC-3 | PASS | Unit coverage proves process reap, CAS release, state removal, replay, and second-workload preservation. Live readback proves zero test process, cgroup, and runtime marker after stop. Cgroup cleanup errors now propagate. |
-| AC-4 | PASS | A fixture Firecracker process is reaped; API/vsock paths are removed; a retained snapshot remains; the second workload remains healthy; replay is idempotent. |
-| AC-5 | PASS | ECS-native removes the addressed orchestrator and ECS state. WASM removes only the addressed workload state. Both pass two-workload conformance. |
+| AC-1 | PASS | Version-1 `NanoStopResult` uses a closed `stopped` / `already_stopped` outcome. Per-incarnation UUIDs reject stale, legacy-nil, and rewritten active handles; first stop, replay, and JSON wire tests pass. |
+| AC-2 | PASS | All four adapters implement the shared two-workload contract and reject active duplicate ownership. Exact-source remote suites passed; initial-candidate bwrap and ECS-native diagnostics are separately identified above. |
+| AC-3 | PASS | Exact-source unit coverage proves checked process reap, retry-safe CAS/cgroup/marker cleanup, ownership retention after partial failure, duplicate-home rejection, and second-workload preservation. The zero process/cgroup/marker readback above belongs to the initial candidate. |
+| AC-4 | PASS | The exact-source fixture uses a real Unix socket; Firecracker is reaped, cleanup failures retain ownership for retry, API/vsock paths are removed, path aliases and mismatched restore envelopes fail closed, and retained snapshots survive stop. |
+| AC-5 | PASS | ECS-native removes only addressed runtime/ECS state. WASM exact-feature tests prove last-reference tool/component unload, shared-reference preservation, duplicate and tool-collision rejection, and mismatched restore-envelope rejection. |
 | AC-6 | NOT VERIFIED | The compile-time production-daemon registry integration belongs to #472 and is intentionally outside this patch. #698 must remain open until #472 supplies that evidence against the merged contract. |
 
-No panic, service restart, cluster access, deployment, or provider call occurred.
+No final-delta service restart, cluster access, deployment, or provider call
+occurred.

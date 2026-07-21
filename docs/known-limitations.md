@@ -11,18 +11,18 @@ The companion document [docs/togaf-gap-v22.md](togaf-gap-v22.md) lists what
 
 ## What the docker demo does NOT exercise
 
-The `docker-compose.demo.yml` stack is deliberately a behavioural demo:
+The `docker-compose.demo.yml` stack is deliberately a behavioral demo:
 ECS world, bio-engine, physics, event-sourcing, gateway pipeline, dashboard.
 
 It does **not** exercise the kernel-bound sandbox primitives, because a plain
-unprivileged container does not have user-namespaces, `CAP_BPF`,
-`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, or a writable `/dev/fuse`:
+unprivileged container does not expose user namespaces, cgroups v2,
+`CAP_BPF`, a writable bpf-fs, or `/dev/fuse`:
 
 | Component                  | Demo container | VM deploy |
 |----------------------------|----------------|-----------|
 | bwrap + Landlock isolation | no             | yes       |
 | cgroups v2 per-agent caps  | no             | yes       |
-| netns + nftables egress    | no             | yes       |
+| full-cage per-agent netns  | no             | yes       |
 | eBPF probes (aya-rs)       | no             | yes       |
 | sentinel-fs CAS-FUSE       | no             | yes       |
 | Zenoh SHM transport        | no (TCP only)  | yes       |
@@ -64,7 +64,7 @@ The demo `cortex-gateway.toml` selects an `ollama` provider on
 `http://localhost:11434` so the demo does not require Anthropic credentials.
 If you do not have a local ollama serving `qwen3:7b`, agent calls will not
 succeed — the dashboard still shows ECS state, room telemetry, and bio
-events, which is the intent of a behavioural demo.
+events, which is the intent of a behavioral demo.
 
 To wire a real provider, set the corresponding API key in `.env` and edit
 `config/demo/cortex-gateway.toml` to enable `claude-code` or

@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{AgentId, EcsSnapshot};
 
@@ -60,6 +61,11 @@ fn default_shift_set() -> u8 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NanoHandle {
+    /// Unique identity for this concrete workload incarnation. Runtime keys and
+    /// workload ids are routing metadata; neither is sufficient to prevent a
+    /// stale or rewritten handle from addressing a newer workload instance.
+    #[serde(default)]
+    pub instance_id: Uuid,
     pub runtime_key: String,
     pub workload_id: String,
     #[serde(default)]
@@ -84,6 +90,23 @@ pub struct NanoRuntimeResources {
     pub landlock_applied: bool,
     #[serde(default)]
     pub network_isolated: bool,
+}
+
+impl NanoHandle {
+    pub fn new(
+        runtime_key: &str,
+        workload_id: String,
+        agent_id: Option<AgentId>,
+        pid: Option<u32>,
+    ) -> Self {
+        Self {
+            instance_id: Uuid::new_v4(),
+            runtime_key: runtime_key.to_string(),
+            workload_id,
+            agent_id,
+            pid,
+        }
+    }
 }
 
 pub const NANO_STOP_RESULT_VERSION: u16 = 1;
@@ -124,6 +147,17 @@ pub fn ensure_handle_runtime(handle: &NanoHandle, expected_runtime_key: &str) ->
             "NanoHandle for runtime '{}' cannot be used with runtime '{}'",
             handle.runtime_key,
             expected_runtime_key
+        ));
+    }
+    Ok(())
+}
+
+pub fn ensure_handle_instance(handle: &NanoHandle, expected_instance_id: Uuid) -> Result<()> {
+    if handle.instance_id != expected_instance_id {
+        return Err(anyhow!(
+            "NanoHandle instance '{}' does not own active workload '{}'",
+            handle.instance_id,
+            handle.workload_id
         ));
     }
     Ok(())
@@ -312,8 +346,14 @@ pub mod conformance {
         R: NanoRuntime,
     {
         assert_ne!(workload_a.workload_id, workload_b.workload_id);
+        let duplicate_a = workload_a.clone();
         let handle_a = runtime.spawn(workload_a).expect("spawn workload A");
+        assert!(
+            runtime.spawn(duplicate_a).is_err(),
+            "adapter must reject an active duplicate workload id"
+        );
         let handle_b = runtime.spawn(workload_b).expect("spawn workload B");
+        assert_ne!(handle_a.instance_id, handle_b.instance_id);
 
         assert_eq!(
             runtime.health(&handle_a).expect("health workload A").state,
@@ -333,6 +373,15 @@ pub mod conformance {
         assert!(
             runtime.stop(&wrong_runtime).is_err(),
             "adapter must reject a handle owned by another runtime"
+        );
+
+        let stale_for_b = NanoHandle {
+            instance_id: handle_a.instance_id,
+            ..handle_b.clone()
+        };
+        assert!(
+            runtime.stop(&stale_for_b).is_err(),
+            "adapter must reject a stale instance identity for an active workload"
         );
 
         let stopped = runtime.stop(&handle_a).expect("stop workload A");
@@ -400,6 +449,14 @@ pub mod conformance {
             .expect("nano runtime restore must succeed");
         assert_eq!(restored.runtime_key, runtime.runtime_key());
         assert_eq!(restored.workload_id, workload.workload_id);
+        assert_ne!(
+            restored.instance_id, handle.instance_id,
+            "restore must create a new workload incarnation"
+        );
+        assert!(
+            runtime.stop(&handle).is_err(),
+            "a pre-restore handle must not stop the restored incarnation"
+        );
 
         let after = runtime
             .snapshot(&restored)
@@ -439,30 +496,59 @@ pub mod conformance {
     }
 
     #[cfg(test)]
-    #[derive(Default)]
     struct DummyRuntime {
+        key: &'static str,
         snapshot: Option<NanoSnapshot>,
-        active: HashMap<String, ()>,
+        active: HashMap<String, Uuid>,
+    }
+
+    #[cfg(test)]
+    impl Default for DummyRuntime {
+        fn default() -> Self {
+            Self::named("dummy-runtime")
+        }
+    }
+
+    #[cfg(test)]
+    impl DummyRuntime {
+        fn named(key: &'static str) -> Self {
+            Self {
+                key,
+                snapshot: None,
+                active: HashMap::new(),
+            }
+        }
     }
 
     #[cfg(test)]
     impl NanoRuntime for DummyRuntime {
         fn runtime_key(&self) -> &'static str {
-            "dummy-runtime"
+            self.key
         }
 
         fn spawn(&mut self, workload: NanoWorkloadSpec) -> Result<NanoHandle> {
-            self.active.insert(workload.workload_id.clone(), ());
-            Ok(NanoHandle {
-                runtime_key: self.runtime_key().to_string(),
-                workload_id: workload.workload_id,
-                agent_id: workload.agent_id,
-                pid: None,
-            })
+            if self.active.contains_key(&workload.workload_id) {
+                return Err(anyhow!(
+                    "dummy workload '{}' is already active",
+                    workload.workload_id
+                ));
+            }
+            let handle = NanoHandle::new(
+                self.runtime_key(),
+                workload.workload_id,
+                workload.agent_id,
+                None,
+            );
+            self.active
+                .insert(handle.workload_id.clone(), handle.instance_id);
+            Ok(handle)
         }
 
         fn stop(&mut self, handle: &NanoHandle) -> Result<NanoStopResult> {
             ensure_handle_runtime(handle, self.runtime_key())?;
+            if let Some(instance_id) = self.active.get(&handle.workload_id) {
+                ensure_handle_instance(handle, *instance_id)?;
+            }
             Ok(NanoStopResult::new(
                 self.runtime_key(),
                 &handle.workload_id,
@@ -495,13 +581,15 @@ pub mod conformance {
 
         fn restore(&mut self, snapshot: NanoSnapshot) -> Result<NanoHandle> {
             self.snapshot = Some(snapshot.clone());
-            self.active.insert(snapshot.workload_id.clone(), ());
-            Ok(NanoHandle {
-                runtime_key: self.runtime_key().to_string(),
-                workload_id: snapshot.workload_id,
-                agent_id: snapshot.agent_id,
-                pid: None,
-            })
+            let handle = NanoHandle::new(
+                self.runtime_key(),
+                snapshot.workload_id,
+                snapshot.agent_id,
+                None,
+            );
+            self.active
+                .insert(handle.workload_id.clone(), handle.instance_id);
+            Ok(handle)
         }
 
         fn health(&mut self, handle: &NanoHandle) -> Result<NanoHealth> {
@@ -580,6 +668,9 @@ pub mod conformance {
     fn registry_dispatches_idempotent_stop_and_rejects_wrong_runtime() {
         let mut registry = NanoRuntimeRegistry::new(None);
         registry.register(DummyRuntime::default()).unwrap();
+        registry
+            .register(DummyRuntime::named("other-runtime"))
+            .unwrap();
         let workload = NanoWorkloadSpec {
             workload_id: "registry-stop".to_string(),
             runtime_key: Some("dummy-runtime".to_string()),
@@ -594,7 +685,35 @@ pub mod conformance {
             ecs_snapshot: None,
         };
         let key = registry.select_key(&workload).unwrap();
-        let handle = registry.get_mut(&key).unwrap().spawn(workload).unwrap();
+        let handle = registry
+            .get_mut(&key)
+            .unwrap()
+            .spawn(workload.clone())
+            .unwrap();
+        let other_handle = registry
+            .get_mut("other-runtime")
+            .unwrap()
+            .spawn(NanoWorkloadSpec {
+                runtime_key: Some("other-runtime".to_string()),
+                ..workload
+            })
+            .unwrap();
+
+        let forged = NanoHandle {
+            runtime_key: "other-runtime".to_string(),
+            ..handle.clone()
+        };
+        assert!(registry.stop(&forged).is_err());
+        assert_eq!(
+            registry
+                .get_mut("other-runtime")
+                .unwrap()
+                .health(&other_handle)
+                .unwrap()
+                .state,
+            NanoHealthState::Healthy,
+            "rewriting a handle runtime key must not stop the other adapter's same-id workload"
+        );
 
         let first = registry.stop(&handle).unwrap();
         assert_eq!(first.version, NANO_STOP_RESULT_VERSION);
@@ -604,11 +723,43 @@ pub mod conformance {
         assert_eq!(wire["outcome"], "stopped");
         let replay = registry.stop(&handle).unwrap();
         assert_eq!(replay.outcome, NanoStopOutcome::AlreadyStopped);
+        assert_eq!(
+            registry.stop(&other_handle).unwrap().outcome,
+            NanoStopOutcome::Stopped
+        );
+    }
 
-        let wrong = NanoHandle {
-            runtime_key: "other-runtime".to_string(),
-            ..handle
-        };
-        assert!(registry.stop(&wrong).is_err());
+    #[test]
+    fn legacy_handle_decodes_to_fail_closed_nil_instance() {
+        let handle: NanoHandle = serde_json::from_value(serde_json::json!({
+            "runtime_key": "dummy-runtime",
+            "workload_id": "legacy-handle",
+            "agent_id": null,
+            "pid": null
+        }))
+        .unwrap();
+        assert!(handle.instance_id.is_nil());
+
+        let mut runtime = DummyRuntime::default();
+        let active = runtime
+            .spawn(NanoWorkloadSpec {
+                workload_id: handle.workload_id.clone(),
+                runtime_key: Some("dummy-runtime".to_string()),
+                agent_id: None,
+                agent_name: "Legacy".to_string(),
+                role: "Tester".to_string(),
+                room_id: "empfang".to_string(),
+                shift_set: 1,
+                command: Vec::new(),
+                capabilities: Vec::new(),
+                metadata: BTreeMap::new(),
+                ecs_snapshot: None,
+            })
+            .unwrap();
+        assert!(runtime.stop(&handle).is_err());
+        assert_eq!(
+            runtime.stop(&active).unwrap().outcome,
+            NanoStopOutcome::Stopped
+        );
     }
 }

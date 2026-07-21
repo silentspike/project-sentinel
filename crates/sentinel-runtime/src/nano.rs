@@ -4,9 +4,9 @@ use anyhow::{anyhow, Result};
 use bevy_ecs::prelude::World;
 use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::nano_runtime::{
-    ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle, NanoHealth,
-    NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime, NanoSnapshot,
-    NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_ECS_NATIVE,
+    ensure_handle_instance, ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle,
+    NanoHealth, NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime,
+    NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_ECS_NATIVE,
 };
 use sentinel_common::AgentId;
 
@@ -15,7 +15,7 @@ use crate::{AgentStatus, RuntimeOrchestrator};
 pub struct EcsNativeRuntime {
     orchestrator: RuntimeOrchestrator,
     world: World,
-    handles: HashMap<String, AgentId>,
+    handles: HashMap<String, (AgentId, uuid::Uuid)>,
     max_agents: usize,
 }
 
@@ -82,8 +82,10 @@ impl EcsNativeRuntime {
                 .unwrap_or("empfang");
             self.orchestrator
                 .spawn_agent(identity.clone(), shift, room_id)?;
-            self.handles
-                .insert(format!("ecs-native-{}", agent_id.0), agent_id);
+            self.handles.insert(
+                format!("ecs-native-{}", agent_id.0),
+                (agent_id, uuid::Uuid::new_v4()),
+            );
         }
 
         Ok(())
@@ -102,6 +104,12 @@ impl NanoRuntime for EcsNativeRuntime {
     }
 
     fn spawn(&mut self, workload: NanoWorkloadSpec) -> Result<NanoHandle> {
+        if self.handles.contains_key(&workload.workload_id) {
+            return Err(anyhow!(
+                "ecs-native workload '{}' is already active",
+                workload.workload_id
+            ));
+        }
         let agent_id = workload
             .agent_id
             .ok_or_else(|| anyhow!("ecs-native workload requires agent_id"))?;
@@ -128,9 +136,12 @@ impl NanoRuntime for EcsNativeRuntime {
             workload.shift_set,
             room_id,
         );
-        self.handles.insert(workload.workload_id.clone(), agent_id);
+        let instance_id = uuid::Uuid::new_v4();
+        self.handles
+            .insert(workload.workload_id.clone(), (agent_id, instance_id));
 
         Ok(NanoHandle {
+            instance_id,
             runtime_key: self.runtime_key().to_string(),
             workload_id: workload.workload_id,
             agent_id: Some(agent_id),
@@ -140,13 +151,14 @@ impl NanoRuntime for EcsNativeRuntime {
 
     fn stop(&mut self, handle: &NanoHandle) -> Result<NanoStopResult> {
         ensure_handle_runtime(handle, self.runtime_key())?;
-        let Some(agent_id) = self.handles.get(&handle.workload_id).copied() else {
+        let Some((agent_id, instance_id)) = self.handles.get(&handle.workload_id).copied() else {
             return Ok(NanoStopResult::new(
                 self.runtime_key(),
                 &handle.workload_id,
                 false,
             ));
         };
+        ensure_handle_instance(handle, instance_id)?;
         if handle.agent_id.is_some_and(|id| id != agent_id) {
             return Err(anyhow!(
                 "ecs-native handle agent does not match workload '{}'",
@@ -227,11 +239,21 @@ impl NanoRuntime for EcsNativeRuntime {
                     "ecs-native snapshot handle references missing {agent_id}"
                 ));
             }
-            self.handles.retain(|_, mapped_id| *mapped_id != agent_id);
-            self.handles.insert(workload_id.clone(), agent_id);
+            let instance_id = uuid::Uuid::new_v4();
+            self.handles
+                .retain(|_, (mapped_id, _)| *mapped_id != agent_id);
+            self.handles
+                .insert(workload_id.clone(), (agent_id, instance_id));
         }
 
+        let instance_id = self
+            .handles
+            .get(&workload_id)
+            .map(|(_, instance_id)| *instance_id)
+            .unwrap_or_else(uuid::Uuid::new_v4);
+
         Ok(NanoHandle {
+            instance_id,
             runtime_key: self.runtime_key().to_string(),
             workload_id,
             agent_id: snapshot_agent_id,
