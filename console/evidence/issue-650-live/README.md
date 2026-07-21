@@ -51,18 +51,22 @@ The live issue contract makes every row below a hard prerequisite for deployment
 and final acceptance. The M0 lead must not substitute preflight evidence for these
 deliverables.
 
-| Issue | Delivery surface | Live state at preflight | Gate |
+Last dependency readback: 2026-07-21 UTC.
+
+| Issue | Delivery surface | Current live state | Gate |
 | --- | --- | --- | --- |
-| #693 | Versioned work-execution contract and fail-closed conformance matrix | Open, ready | `BLOCKED` |
-| #75 | Sandbox network isolation | Open, in progress | `BLOCKED` |
-| #472 | Production `NanoRuntimeRegistry` selection path | Open, triage | `BLOCKED` |
+| #693 | Versioned work-execution contract and fail-closed conformance matrix | Closed with `status:verified`; merged by PR #697 at `c37d9a4` | `PASS` |
+| #75 | Sandbox network isolation | Open with `status:in-progress`; live readback exists, but the required `NotIsolated` fault-injection proof is incomplete | `BLOCKED` |
+| #698 | Idempotent per-workload NanoRuntime stop lifecycle required by #472 | Open with `status:in-progress`; PR #699 is mergeable/clean but unmerged | `BLOCKED` |
+| #472 | Production `NanoRuntimeRegistry` selection path | Open with `status:blocked`; stacked draft PR #700 is mergeable/clean at `a1945ce`, its applicable draft checks are green, and live ACs remain pending | `BLOCKED` |
 | #694 | Capability-scoped isolated agent workbench | Open, ready | `BLOCKED` |
 | #695 | Customer intake, governance, and multi-agent workflow | Open, ready | `BLOCKED` |
 | #696 | Independent QA, release, delivery, Console lineage, and memory closeout | Open, ready | `BLOCKED` |
 
-Final deployment may begin only after all six issues are closed with
-`status:verified`, their target-runtime evidence is linked, and the #693
-machine-readable matrix contains no `not_tested` or `blocked` M0 entry.
+Final deployment may begin only after the six direct dependency issues are closed
+with `status:verified`, all transitive blockers such as #698 are merged and
+verified, their target-runtime evidence is linked, and the #693 machine-readable
+matrix contains no `not_tested` or `blocked` M0 entry.
 
 ## Acceptance Matrix
 
