@@ -9009,6 +9009,17 @@ mod tests {
         }
     }
 
+    /// Host-independent fixture for daemon lifecycle tests. The production
+    /// bwrap fallback is covered by the selection test below and by the
+    /// sentinel-sandbox adapter tests; generic orchestration tests must not
+    /// require `/ram/agents`, user namespaces, or cgroup access.
+    fn test_ecs_agent_config(id: u16, name: &str, role: &str, shift_set: u8) -> AgentConfig {
+        let mut config = test_agent_config(id, name, role, shift_set);
+        config.runtime.nano_runtime =
+            Some(sentinel_common::nano_runtime::RUNTIME_ECS_NATIVE.to_string());
+        config
+    }
+
     #[test]
     fn production_nano_runtime_registry_contains_every_supported_adapter() {
         let registry = DaemonNanoRuntimeRegistry::production(64, None).unwrap();
@@ -9830,11 +9841,14 @@ mod tests {
         explicit_ecs.runtime.nano_runtime =
             Some(sentinel_common::nano_runtime::RUNTIME_ECS_NATIVE.to_string());
         let cases = [
-            ("startup", test_agent_config(1, "Startup Agent", "Ops", 1)),
-            ("shift", test_agent_config(2, "Shift Agent", "Ops", 2)),
+            (
+                "startup",
+                test_ecs_agent_config(1, "Startup Agent", "Ops", 1),
+            ),
+            ("shift", test_ecs_agent_config(2, "Shift Agent", "Ops", 2)),
             (
                 "config_apply",
-                test_agent_config(3, "Config Apply Agent", "Ops", 3),
+                test_ecs_agent_config(3, "Config Apply Agent", "Ops", 3),
             ),
             ("explicit_ecs", explicit_ecs),
         ];
@@ -10047,7 +10061,7 @@ mod tests {
         let mut agent_processes = HashMap::new();
         let mut nano_runtimes = DaemonNanoRuntimeRegistry::production(10, None).unwrap();
         let security_runtime_state = Arc::new(RwLock::new(HashMap::new()));
-        let agent_cfg = test_agent_config(1, "Fast Restart Agent", "Tester", 1);
+        let agent_cfg = test_ecs_agent_config(1, "Fast Restart Agent", "Tester", 1);
         let agent_command = vec!["true".to_string()];
 
         assert!(spawn_agent_full(
@@ -10392,7 +10406,7 @@ mod tests {
 
         let controlplane = test_controlplane(&tmp);
         let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
-        let all_agents = vec![test_agent_config(1, "Tick Loop Agent", "Tester", 1)];
+        let all_agents = vec![test_ecs_agent_config(1, "Tick Loop Agent", "Tester", 1)];
 
         let (ebpf_collector, ebpf_tx) = test_ebpf();
         let ep = test_episode_producer(&tmp, &event_store);
@@ -10499,8 +10513,8 @@ mod tests {
         let controlplane = test_controlplane(&tmp);
         let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
         let all_agents = vec![
-            test_agent_config(1, "Thomas", "CEO", 1),
-            test_agent_config(2, "Lisa", "Designer", 1),
+            test_ecs_agent_config(1, "Thomas", "CEO", 1),
+            test_ecs_agent_config(2, "Lisa", "Designer", 1),
         ];
 
         let es_clone = Arc::clone(&event_store);
@@ -10622,7 +10636,7 @@ mod tests {
 
         let controlplane = test_controlplane(&tmp);
         let runtime_orch = RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
-        let all_agents = vec![test_agent_config(1, "Operator Loop Agent", "Tester", 1)];
+        let all_agents = vec![test_ecs_agent_config(1, "Operator Loop Agent", "Tester", 1)];
         let ep = test_episode_producer(&tmp, &event_store);
         let (ebpf_collector, ebpf_tx) = test_ebpf();
 
