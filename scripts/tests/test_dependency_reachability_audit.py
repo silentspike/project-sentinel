@@ -545,7 +545,7 @@ class SanitizationTests(unittest.TestCase):
             "/" + "tmp" + "/" + "previously-unknown/session-output",
         )
         raw = (
-            f"{authority} {workspace} {REMOTE_PROJECT} {cargo_home} "
+            f"ssh {authority} {workspace} {REMOTE_PROJECT} {cargo_home} "
             + " ".join(remote_targets)
             + f"\n{remote_host_key}=build-node {remote_user_key}=build-user\n"
         )
@@ -673,6 +673,67 @@ class SanitizationTests(unittest.TestCase):
             "contact=maintainer@example.com\n"
         )
         self.assertEqual(audit_module.suspicious_tokens(value), [])
+
+    def test_normalizer_replaces_authorities_in_supported_shell_contexts(self):
+        authority = "builder" + "@" + "build-node.example"
+        commands = (
+            f"$ ssh {authority}\n",
+            f"# sudo -u operator scp artifact {authority}:artifact\n",
+            f"% env MODE=audit sftp {authority}\n",
+            f"- rsync artifact {authority}:artifact\n",
+            f"1. cargo remote --host {authority} -c -- check\n",
+            f"> - $ sudo -u operator env MODE=audit ssh {authority}\n",
+            f"- `ssh {authority}`\n",
+            f"[{authority} ~]$ ssh {authority}\n",
+        )
+        raw = "".join(commands)
+        normalized = audit_module.normalize_text(raw)
+        self.assertEqual(normalized.count("<USER>@<HOST>"), raw.count(authority))
+        self.assertNotIn(authority, normalized)
+        self.assertEqual(audit_module.suspicious_tokens(normalized), [])
+
+    def test_scan_rejects_authorities_in_supported_shell_contexts(self):
+        authority = "builder" + "@" + "build-node.example"
+        commands = {
+            "shell-prompt": f"$ ssh {authority}",
+            "sudo": f"sudo -u operator scp artifact {authority}:artifact",
+            "env": f"env MODE=audit sftp {authority}",
+            "markdown-list": f"- rsync artifact {authority}:artifact",
+            "ordered-list": f"1. cargo remote --host {authority} -c -- check",
+            "combined-prefixes": (
+                f"> - $ sudo -u operator env MODE=audit ssh {authority}"
+            ),
+            "markdown-inline-code": f"- `ssh {authority}`",
+            "bracketed-shell-prompt": f"[{authority} ~]$ ssh {authority}",
+        }
+        for name, command in commands.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    audit_module.suspicious_tokens(command), ["ssh-authority"]
+                )
+
+    def test_scan_accepts_authority_outside_remote_command_context(self):
+        value = (
+            "contact=maintainer@example.com\n"
+            "- release contact: builder@example.org\n"
+            "printf '%s' developer@example.net\n"
+        )
+        self.assertEqual(audit_module.suspicious_tokens(value), [])
+
+    def test_normalizer_preserves_http_tmp_urls(self):
+        value = (
+            "source=http://example.com/tmp/release/artifact.tar.zst\n"
+            "docs=https://docs.example.org/tmp/build/output.html\n"
+        )
+        self.assertEqual(audit_module.normalize_text(value), value)
+        self.assertEqual(audit_module.suspicious_tokens(value), [])
+
+    def test_scan_rejects_absolute_tmp_paths_beside_http_urls(self):
+        path = "/" + "tmp" + "/private-build/output.txt"
+        value = f"docs=https://docs.example.org/tmp/public/output.html artifact={path}\n"
+        self.assertEqual(
+            audit_module.suspicious_tokens(value), ["remote-temp-path"]
+        )
 
     def test_public_scan_is_fail_closed(self):
         with tempfile.TemporaryDirectory() as temp:

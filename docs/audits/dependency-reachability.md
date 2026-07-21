@@ -294,13 +294,19 @@ The normalizer replaces private locations and authorities with:
 <HOST>
 ```
 
-The fail-closed scanner rejects IP addresses, command-context SSH authorities,
+The fail-closed scanner rejects IP addresses, remote-command SSH authorities,
 non-placeholder `remote_host` and `remote_user` fields, home paths, workspace paths,
-every absolute remote temporary path, Cargo-home paths, unexpected absolute paths, and
-binary evidence. Host/user field matching is key-aware, so public URLs and contact
-domains are not rejected merely for containing a hostname. Negative unit fixtures cover
-each private class, and positive fixtures cover the placeholders and public domains. A
-green scan is required before every commit and push.
+every absolute remote temporary filesystem path, Cargo-home paths, unexpected absolute
+paths, and binary evidence. Authority parsing is token- and context-aware: it recognizes
+`ssh`, `scp`, `sftp`, `rsync`, and `cargo remote` after shell prompts, Markdown list
+markers, `sudo`, `env`, and environment assignments. Host/user field matching remains
+key-aware, so public URLs and contact domains are not rejected merely for containing a
+hostname. HTTP(S) URL spans are excluded specifically from temporary-path replacement
+and rejection, so `https://example.invalid/tmp/...` remains unchanged while a real
+absolute path represented publicly as `<REMOTE_TARGET>` fails closed. Negative unit fixtures cover each private class
+and command context; positive fixtures cover placeholders, public domains, non-command
+contacts, and HTTP(S) temporary-path URLs. A green scan is required before every commit
+and push.
 
 ## Reproduction Commands
 
