@@ -495,6 +495,7 @@ struct AppState {
     /// (Chef-SPOF): a member must reject `/operator/handoff` even though it has a control
     /// stream + meta store.
     cluster_is_seed: bool,
+    workflow_api: Arc<crate::workflow_api::WorkflowApi>,
 }
 
 fn materialize_config_owner_scopes(
@@ -716,6 +717,13 @@ pub async fn start_server(
         .await
         .with_context(|| format!("Operator-API bind fehlgeschlagen: {}", config.bind_addr))?;
     let room_count = allowed_rooms.len();
+    let workflow_api = Arc::new(
+        crate::workflow_api::WorkflowApi::open(
+            data_dir.join("company-workflow.sqlite"),
+            std::env::var("SENTINEL_CUSTOMER_API_KEY").ok(),
+        )
+        .context("Company workflow store could not be opened")?,
+    );
     let state = AppState {
         allowed_rooms: Arc::new(allowed_rooms.into_iter().collect()),
         shared_secret: config.shared_secret,
@@ -744,6 +752,7 @@ pub async fn start_server(
         cluster_meta,
         cluster_node_alias,
         cluster_is_seed,
+        workflow_api,
     };
 
     info!(
@@ -783,6 +792,20 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) -> AnyResult<
 fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
     let path_only = request_path(&request.path);
     let query = parse_query_params(&request.path);
+
+    if let Some(response) = state.workflow_api.handle(
+        &request.method,
+        &request.path,
+        &request.headers,
+        &request.body,
+        state.shared_secret.is_some()
+            && is_authorized(&request.headers, state.shared_secret.as_deref()),
+    ) {
+        return HttpResponse {
+            status: response.status,
+            body: response.body,
+        };
+    }
 
     // GET-Endpoints ohne Auth (read-only)
     if request.method == "GET" {
@@ -3536,6 +3559,9 @@ fn max_body_bytes_for_path(path: &str) -> usize {
     match request_path(path) {
         OPERATOR_APICP_SNAPSHOT_PATH => MAX_APICP_SNAPSHOT_BODY_BYTES,
         OPERATOR_CONFIG_APPLY_PATH => MAX_CONFIG_APPLY_BODY_BYTES,
+        crate::workflow_api::CUSTOMER_COMMAND_PATH | crate::workflow_api::OPERATOR_COMMAND_PATH => {
+            crate::workflow_api::MAX_WORKFLOW_BODY_BYTES
+        }
         _ => MAX_BODY_BYTES,
     }
 }
@@ -3719,6 +3745,13 @@ mod tests {
             cluster_meta: None,
             cluster_node_alias: None,
             cluster_is_seed: false,
+            workflow_api: Arc::new(
+                crate::workflow_api::WorkflowApi::open(
+                    ":memory:",
+                    Some("customer-test-secret".to_string()),
+                )
+                .expect("in-memory workflow API"),
+            ),
         };
         std::mem::forget(dir);
         (state, rx, platform_rx, runtime_rx)
