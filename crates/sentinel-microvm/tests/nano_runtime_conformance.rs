@@ -16,7 +16,7 @@ fn workload_spec() -> NanoWorkloadSpec {
         role: "Tester".to_string(),
         room_id: "empfang".to_string(),
         shift_set: 1,
-        command: Vec::new(),
+        command: vec!["/opt/sentinel/bin/agent-runtime".to_string()],
         capabilities: Vec::new(),
         metadata: BTreeMap::new(),
         ecs_snapshot: None,

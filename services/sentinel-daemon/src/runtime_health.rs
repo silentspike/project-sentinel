@@ -4,6 +4,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use sentinel_common::agent_config::AgentConfig;
+use sentinel_common::nano_runtime::{
+    RUNTIME_BWRAP_LANDLOCK, RUNTIME_ECS_NATIVE, RUNTIME_MICROVM, RUNTIME_WASM_WASMTIME,
+};
 use sentinel_common::{AgentId, LocalResidency, OwnerRegistry, StateTransferScope};
 use sentinel_projection::ReadModelStore;
 use sentinel_runtime::RuntimeOrchestrator;
@@ -33,6 +36,8 @@ pub struct RuntimeHealthAgentSnapshot {
     pub agent_id: u16,
     pub aggregate_id: String,
     pub name: String,
+    #[serde(default)]
+    pub runtime_key: String,
     pub runtime_present: bool,
     pub projection_present: bool,
     pub tracked_pid: Option<u32>,
@@ -147,6 +152,20 @@ fn build_runtime_health_snapshot_with_registry(
         .map(|cfg| cfg.identity.id)
         .collect::<BTreeSet<_>>();
     let expected_active_agents = expected_active_ids.len();
+    let configured_runtime_by_id = all_agents
+        .iter()
+        .map(|agent| {
+            (
+                agent.identity.id,
+                agent
+                    .runtime
+                    .nano_runtime
+                    .as_deref()
+                    .unwrap_or(RUNTIME_BWRAP_LANDLOCK)
+                    .to_string(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let security_state = security_runtime_state
         .read()
         .map(|state| state.clone())
@@ -209,10 +228,16 @@ fn build_runtime_health_snapshot_with_registry(
         let runtime_present = runtime_orch.agents().contains_key(&AgentId(agent_id));
         let security_snapshot = security_state.get(&agent_id);
         let security_runtime_present = security_snapshot.is_some();
+        let runtime_key = security_snapshot
+            .map(|snapshot| snapshot.runtime_key.as_str())
+            .filter(|key| !key.is_empty())
+            .or_else(|| configured_runtime_by_id.get(&agent_id).map(String::as_str))
+            .unwrap_or(RUNTIME_BWRAP_LANDLOCK)
+            .to_string();
         let sandbox_handle = sandbox_handles.get(&AgentId(agent_id));
         let agent_process = agent_processes.get(&AgentId(agent_id));
         let tracked_pid = security_snapshot
-            .and_then(|snapshot| snapshot.bwrap_pid)
+            .and_then(|snapshot| snapshot.runtime_pid.or(snapshot.bwrap_pid))
             .or_else(|| sandbox_handle.and_then(|handle| handle.bwrap_pid))
             .or_else(|| agent_process.map(|proc| proc.pid));
         let tracked_pid_state = tracked_pid
@@ -238,11 +263,18 @@ fn build_runtime_health_snapshot_with_registry(
         if projection_drift {
             projection_drift_agents += 1;
         }
+        let runtime_resources_healthy = match runtime_key.as_str() {
+            RUNTIME_BWRAP_LANDLOCK => tracked_pid_alive && cgroup_live_pid_count > 0,
+            RUNTIME_MICROVM => tracked_pid_alive,
+            RUNTIME_ECS_NATIVE | RUNTIME_WASM_WASMTIME => {
+                tracked_pid.is_none() && cgroup_live_pid_count == 0
+            }
+            _ => false,
+        };
         let healthy = runtime_present
             && projection_present
             && security_runtime_present
-            && tracked_pid_alive
-            && cgroup_live_pid_count > 0;
+            && runtime_resources_healthy;
         let unexpected_extra = !expected_active
             && (runtime_present
                 || projection_present
@@ -268,6 +300,7 @@ fn build_runtime_health_snapshot_with_registry(
             agent_id,
             aggregate_id,
             name,
+            runtime_key,
             runtime_present,
             projection_present,
             tracked_pid,
@@ -639,6 +672,88 @@ mod tests {
         assert!(snapshot.agents[0].runtime_present);
         assert!(!snapshot.agents[0].projection_present);
         assert!(!snapshot.agents[0].security_runtime_present);
+    }
+
+    fn healthy_non_bwrap_runtime(runtime_key: &str, runtime_pid: Option<u32>) {
+        let tmp = tempdir().unwrap();
+        let projection_path = tmp.path().join("projection.db");
+        let projection_store =
+            sentinel_projection::ReadModelStore::open(projection_path.to_str().unwrap()).unwrap();
+        {
+            let txn = projection_store.begin_transaction().unwrap();
+            txn.begin().unwrap();
+            txn.upsert_agent(7, "Runtime Agent", "Role", 1, "active", 1)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        drop(projection_store);
+
+        let mut agent = test_agent(7, 1, "Runtime Agent");
+        agent.runtime.nano_runtime = Some(runtime_key.to_string());
+        if runtime_key == RUNTIME_WASM_WASMTIME {
+            agent.runtime.wasm_path = Some("/opt/sentinel/wasm/runtime-agent.wasm".to_string());
+        }
+        let mut runtime = RuntimeOrchestrator::new(30);
+        runtime
+            .spawn_agent(
+                AgentIdentity {
+                    agent_id: AgentId(7),
+                    name: "Runtime Agent".to_string(),
+                    role: "Role".to_string(),
+                },
+                ShiftInfo {
+                    shift_set: 1,
+                    shift_start_hour: 6,
+                    shift_end_hour: 14,
+                    is_on_duty: true,
+                },
+                "empfang",
+            )
+            .unwrap();
+        let security = Arc::new(RwLock::new(HashMap::from([(
+            7,
+            crate::operator_api::SecurityAgentRuntimeSnapshot {
+                agent_id: 7,
+                aggregate_id: "AGENT-07".to_string(),
+                agent_name: "Runtime Agent".to_string(),
+                runtime_key: runtime_key.to_string(),
+                instance_id: Some(uuid::Uuid::new_v4()),
+                runtime_pid,
+                bwrap_pid: None,
+                home_host_path: "/ram/agents/Runtime Agent".to_string(),
+                fs_mount: None,
+            },
+        )])));
+
+        let snapshot = build_runtime_health_snapshot(
+            &[agent],
+            1,
+            &runtime,
+            &HashMap::new(),
+            &HashMap::new(),
+            &security,
+            &projection_path,
+            false,
+            ServiceHealthWorkerSnapshot::default(),
+            None,
+        );
+        assert_eq!(snapshot.stale_runtime_entries, 0, "{runtime_key}");
+        assert!(!snapshot.projection_drift_detected, "{runtime_key}");
+        assert_eq!(
+            snapshot.agents[0].last_repair_status.as_deref(),
+            Some("healthy")
+        );
+    }
+
+    #[test]
+    fn pidless_ecs_and_wasm_runtimes_do_not_enter_repair_loops() {
+        healthy_non_bwrap_runtime(RUNTIME_ECS_NATIVE, None);
+        healthy_non_bwrap_runtime(RUNTIME_WASM_WASMTIME, None);
+    }
+
+    #[test]
+    fn microvm_runtime_does_not_require_a_bwrap_cgroup() {
+        healthy_non_bwrap_runtime(RUNTIME_MICROVM, Some(std::process::id()));
     }
 
     #[test]

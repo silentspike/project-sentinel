@@ -7,7 +7,8 @@ use anyhow::{anyhow, Context, Result};
 use sentinel_common::nano_runtime::{
     ensure_handle_instance, ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle,
     NanoHealth, NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime,
-    NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_WASM_WASMTIME,
+    NanoRuntimeResources, NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec,
+    RUNTIME_WASM_WASMTIME,
 };
 use serde::{Deserialize, Serialize};
 
@@ -234,12 +235,27 @@ impl NanoRuntime for WasmtimeNanoRuntime {
         ))
     }
 
+    fn resources(&self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        let state = self
+            .workloads
+            .get(&handle.workload_id)
+            .ok_or_else(|| anyhow!("unknown WASM workload '{}'", handle.workload_id))?;
+        ensure_handle_instance(handle, state.instance_id)?;
+        Ok(NanoRuntimeResources {
+            instance_id: Some(state.instance_id),
+            ..NanoRuntimeResources::default()
+        })
+    }
+
     fn exec(&mut self, handle: &NanoHandle, request: NanoExecRequest) -> Result<NanoExecResult> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
         let state = self
             .workloads
             .get(&handle.workload_id)
             .cloned()
             .ok_or_else(|| anyhow!("unknown wasm workload '{}'", handle.workload_id))?;
+        ensure_handle_instance(handle, state.instance_id)?;
         let input = if request.input.is_empty() {
             request.operation
         } else {
@@ -262,10 +278,12 @@ impl NanoRuntime for WasmtimeNanoRuntime {
     }
 
     fn snapshot(&mut self, handle: &NanoHandle) -> Result<NanoSnapshot> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
         let state = self
             .workloads
             .get(&handle.workload_id)
             .ok_or_else(|| anyhow!("unknown wasm workload '{}'", handle.workload_id))?;
+        ensure_handle_instance(handle, state.instance_id)?;
         Ok(NanoSnapshot {
             runtime_key: self.runtime_key().to_string(),
             workload_id: handle.workload_id.clone(),
@@ -336,6 +354,7 @@ impl NanoRuntime for WasmtimeNanoRuntime {
                 detail: "Wasm workload stopped".to_string(),
             });
         };
+        ensure_handle_instance(handle, state.instance_id)?;
         let loaded = self.runtime.plugin_host().is_loaded(&state.wasm_path);
         Ok(NanoHealth {
             runtime_key: self.runtime_key().to_string(),
@@ -354,6 +373,7 @@ impl NanoRuntime for WasmtimeNanoRuntime {
         handle: &NanoHandle,
         policy: NanoIsolationPolicy,
     ) -> Result<NanoIsolationReport> {
+        self.resources(handle)?;
         Ok(NanoIsolationReport {
             runtime_key: self.runtime_key().to_string(),
             workload_id: handle.workload_id.clone(),

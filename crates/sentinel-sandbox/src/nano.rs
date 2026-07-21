@@ -290,6 +290,11 @@ impl NanoRuntime for BwrapNanoRuntime {
 
     fn resources(&self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
         ensure_handle_runtime(handle, self.runtime_key())?;
+        let state = self
+            .workloads
+            .get(&handle.workload_id)
+            .ok_or_else(|| anyhow!("missing bwrap workload '{}'", handle.workload_id))?;
+        ensure_handle_instance(handle, state.instance_id)?;
         let sandbox = self
             .handles
             .get(&handle.workload_id)
@@ -299,6 +304,7 @@ impl NanoRuntime for BwrapNanoRuntime {
             .get(&handle.workload_id)
             .ok_or_else(|| anyhow!("missing bwrap process '{}'", handle.workload_id))?;
         Ok(NanoRuntimeResources {
+            instance_id: Some(state.instance_id),
             pid: Some(process.pid),
             child_pid: process.child_pid,
             cgroup_created: sandbox.cgroup_created,
@@ -323,12 +329,14 @@ impl NanoRuntime for BwrapNanoRuntime {
     }
 
     fn snapshot(&mut self, handle: &NanoHandle) -> Result<NanoSnapshot> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
         // Clone the bits we need so `self` can be re-borrowed mutably below.
         let (workload, command, prev_owned) = {
             let state = self
                 .workloads
                 .get(&handle.workload_id)
                 .ok_or_else(|| anyhow!("unknown bwrap workload '{}'", handle.workload_id))?;
+            ensure_handle_instance(handle, state.instance_id)?;
             (
                 state.workload.clone(),
                 state.command.clone(),
@@ -416,6 +424,9 @@ impl NanoRuntime for BwrapNanoRuntime {
 
     fn health(&mut self, handle: &NanoHandle) -> Result<NanoHealth> {
         ensure_handle_runtime(handle, self.runtime_key())?;
+        if let Some(state) = self.workloads.get(&handle.workload_id) {
+            ensure_handle_instance(handle, state.instance_id)?;
+        }
         let state = if let Some(process) = self.processes.get_mut(&handle.workload_id) {
             if process.is_running() {
                 NanoHealthState::Healthy
@@ -450,6 +461,10 @@ impl NanoRuntime for BwrapNanoRuntime {
         handle: &NanoHandle,
         policy: NanoIsolationPolicy,
     ) -> Result<NanoIsolationReport> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        if let Some(state) = self.workloads.get(&handle.workload_id) {
+            ensure_handle_instance(handle, state.instance_id)?;
+        }
         let applied = self.handles.contains_key(&handle.workload_id);
         Ok(NanoIsolationReport {
             runtime_key: self.runtime_key().to_string(),
