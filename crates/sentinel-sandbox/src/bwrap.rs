@@ -171,7 +171,7 @@ impl BwrapConfig {
             // Inheriting child stderr would bypass that redaction boundary.
             .stderr(std::process::Stdio::null());
         // SAFETY: the closure runs in the forked child before exec and only
-        // calls async-signal-safe fcntl/dup2 on a captured raw fd.
+        // calls async-signal-safe setpgid/fcntl/dup2 operations.
         unsafe {
             cmd.pre_exec(move || {
                 if libc::setpgid(0, 0) != 0 {

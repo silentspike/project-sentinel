@@ -97,6 +97,17 @@ fn parse_control_frame(input: &str) -> Result<serde_json::Value> {
             "workbench control frame exceeds the configured limit",
         ));
     }
+    if input
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b'\n' | b'\r'))
+    {
+        return Err(exec_error(
+            NanoExecErrorCode::InvalidFrame,
+            false,
+            "workbench control input must contain exactly one JSONL record",
+        ));
+    }
     serde_json::from_str(input).map_err(|_| {
         exec_error(
             NanoExecErrorCode::InvalidFrame,
@@ -1191,6 +1202,31 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn control_input_rejects_embedded_jsonl_record_boundaries() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2900";
+        for (workload_id, suffix) in [("lf-control", "\n"), ("crlf-control", "\r\n")] {
+            let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+            let handle = insert_protocol_fixture(&mut runtime, workload_id, &[]);
+            let input = format!(
+                "{}{}",
+                start_frame(invocation_id, unix_time_ms() + 10_000),
+                suffix
+            );
+            let error = runtime
+                .exec(
+                    &handle,
+                    NanoExecRequest {
+                        operation: "workbench_start".to_string(),
+                        input,
+                    },
+                )
+                .unwrap_err();
+            assert_exec_error(&error, NanoExecErrorCode::InvalidFrame);
+            assert!(!runtime.exchanges.contains_key(workload_id));
+        }
+    }
+
     fn poll_frame(invocation_id: &str) -> String {
         serde_json::to_string(&serde_json::json!({
             "kind": "poll",
@@ -1235,6 +1271,18 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    fn wait_for_recorded_lines(path: &std::path::Path, expected: usize) -> String {
+        for _ in 0..100 {
+            if let Ok(recorded) = std::fs::read_to_string(path) {
+                if recorded.lines().count() >= expected {
+                    return recorded;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("protocol fixture did not record {expected} frame(s)");
     }
 
     fn poll_until_terminal(
@@ -1323,7 +1371,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(terminal_replay.output, terminal.output);
-        let recorded = std::fs::read_to_string(&record_path).unwrap();
+        let recorded = wait_for_recorded_lines(&record_path, 1);
         assert_eq!(recorded.lines().count(), 1, "start replay wrote to child");
 
         let descendant_pid: u32 = std::fs::read_to_string(&descendant_pid_path)
@@ -1424,10 +1472,7 @@ mod tests {
         let mut registry = sentinel_common::nano_runtime::NanoRuntimeRegistry::new(None);
         registry.register(runtime).unwrap();
 
-        for (handle, invocation_id) in [
-            (&handle_a, invocation_a),
-            (&handle_b, invocation_b),
-        ] {
+        for (handle, invocation_id) in [(&handle_a, invocation_a), (&handle_b, invocation_b)] {
             registry
                 .exec(
                     handle,
@@ -1547,8 +1592,8 @@ mod tests {
             )
             .unwrap_err();
         assert_exec_error(&error, NanoExecErrorCode::DigestConflict);
+        let recorded = wait_for_recorded_lines(&record_path, 2);
         runtime.stop(&handle).unwrap();
-        let recorded = std::fs::read_to_string(&record_path).unwrap();
         assert_eq!(
             recorded.lines().count(),
             2,
@@ -1751,7 +1796,7 @@ mod tests {
             .unwrap_err();
         assert_exec_error(&replay, NanoExecErrorCode::Cancelled);
         assert_eq!(replay.to_string(), error.to_string());
-        let recorded = std::fs::read_to_string(&record_path).unwrap();
+        let recorded = wait_for_recorded_lines(&record_path, 2);
         assert_eq!(recorded.lines().count(), 2, "cancel replay wrote to child");
         let descendant_pid: u32 = std::fs::read_to_string(&descendant_pid_path)
             .unwrap()
@@ -1861,17 +1906,20 @@ mod tests {
         assert_exec_error(&error, NanoExecErrorCode::ProtocolViolation);
 
         let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2914";
-        let oversized = serde_json::json!({
+        let output_chunk = serde_json::json!({
             "kind": "progress",
             "schema_version": 1,
             "invocation_id": invocation_id,
             "stage": "running",
-            "padding": "x".repeat(MAX_WORKBENCH_OUTPUT_BYTES)
+            "padding": "x".repeat(MAX_WORKBENCH_OUTPUT_BYTES / 3)
         })
         .to_string();
         let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
-        let handle =
-            insert_protocol_fixture(&mut runtime, "protocol-output-overflow", &[&oversized]);
+        let handle = insert_protocol_fixture(
+            &mut runtime,
+            "protocol-output-overflow",
+            &[&output_chunk, &output_chunk, &output_chunk, &output_chunk],
+        );
         runtime
             .exec(
                 &handle,
@@ -1933,8 +1981,7 @@ mod tests {
                 frame["stage"] = serde_json::json!(stage);
             }
             let frame = serde_json::to_string(&frame).unwrap();
-            let mut runtime =
-                BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+            let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
             let handle = insert_protocol_fixture(&mut runtime, workload_id, &[&frame]);
             runtime
                 .exec(
@@ -1971,8 +2018,7 @@ mod tests {
 
         for (workload_id, invocation_id, script) in cases {
             let process = AgentProcess::launch_raw_protocol_fixture(script).unwrap();
-            let mut runtime =
-                BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+            let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
             let handle = insert_protocol_process(&mut runtime, workload_id, process);
             runtime
                 .exec(
