@@ -14,6 +14,7 @@ sentinel-fs = { path = "../sentinel-fs" }
 sentinel-zenoh = { path = "../sentinel-zenoh" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
@@ -21,6 +22,7 @@ tracing = { workspace = true }
 criterion = { workspace = true }
 sentinel-common = { path = "../sentinel-common", features = ["test-util"] }
 tempfile = "3"
+tracing-subscriber = { workspace = true }
 
 [[bin]]
 name = "breakout-helper"

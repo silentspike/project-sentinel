@@ -4,13 +4,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use sentinel_common::nano_runtime::{
-    ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle, NanoHealth,
-    NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime, NanoRuntimeResources,
-    NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
+    ensure_handle_runtime, NanoExecError, NanoExecErrorCode, NanoExecRequest, NanoExecResult,
+    NanoHandle, NanoHealth, NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime,
+    NanoRuntimeResources, NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec,
+    RUNTIME_BWRAP_LANDLOCK,
 };
 use sentinel_fs::artifact::ArtifactPlane;
 use sentinel_fs::home_manifest::{self, HomeManifest, RestorePolicy};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{cgroups, AgentProcess, CgroupLimits, SandboxEnforcer, SandboxHandle};
 
@@ -38,11 +40,29 @@ struct BwrapWorkloadState {
 #[derive(Debug)]
 struct WorkbenchExchange {
     invocation_id: String,
+    request_digest: String,
     deadline_unix_ms: u64,
     cancel_requested_at_ms: Option<u64>,
+    cancel_digest: Option<String>,
+    cancel_origin: Option<WorkbenchCancelOrigin>,
     messages: Vec<serde_json::Value>,
     retained_bytes: usize,
     result_seen: bool,
+    terminal: Option<WorkbenchTerminal>,
+    terminal_error: Option<NanoExecError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkbenchCancelOrigin {
+    Explicit,
+    Deadline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkbenchTerminal {
+    Succeeded,
+    Failed,
+    Cancelled,
 }
 
 /// Default home content-addressed store location (chunks live under `/ram`).
@@ -50,6 +70,52 @@ const DEFAULT_HOME_CAS_DIR: &str = "/ram/agents/.sentinel-home-cas";
 const MAX_WORKBENCH_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_WORKBENCH_OUTPUT_BYTES: usize = 256 * 1024;
 const WORKBENCH_CANCEL_GRACE_MS: u64 = 1_000;
+
+fn exec_error(
+    code: NanoExecErrorCode,
+    retryable: bool,
+    safe_message: &'static str,
+) -> anyhow::Error {
+    NanoExecError::new(code, retryable, safe_message).into()
+}
+
+fn frame_digest(input: &str) -> String {
+    let digest = Sha256::digest(input.as_bytes());
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn parse_control_frame(input: &str) -> Result<serde_json::Value> {
+    if input.len() > MAX_WORKBENCH_FRAME_BYTES {
+        return Err(exec_error(
+            NanoExecErrorCode::InvalidFrame,
+            false,
+            "workbench control frame exceeds the configured limit",
+        ));
+    }
+    serde_json::from_str(input).map_err(|_| {
+        exec_error(
+            NanoExecErrorCode::InvalidFrame,
+            false,
+            "workbench control frame is not valid JSON",
+        )
+    })
+}
+
+fn require_schema_version(value: Option<&serde_json::Value>) -> Result<()> {
+    match value.and_then(serde_json::Value::as_u64) {
+        Some(1) => Ok(()),
+        _ => Err(exec_error(
+            NanoExecErrorCode::UnsupportedVersion,
+            false,
+            "workbench protocol version is not supported",
+        )),
+    }
+}
 
 pub struct BwrapNanoRuntime {
     enforcer: SandboxEnforcer,
@@ -132,15 +198,32 @@ impl BwrapNanoRuntime {
 
     fn teardown_workload(&mut self, workload_id: &str) -> Result<bool> {
         self.exchanges.remove(workload_id);
+        self.teardown_runtime_resources(workload_id)
+    }
+
+    fn teardown_runtime_resources(&mut self, workload_id: &str) -> Result<bool> {
         let mut stopped = false;
-        if let Some(mut process) = self.processes.remove(workload_id) {
+        let mut tracked_process_reaped = false;
+        let mut process = self.processes.remove(workload_id);
+        if let Some(process) = process.as_mut() {
             stopped = true;
-            process.terminate();
+            process.terminate_process_group();
+            tracked_process_reaped = true;
         }
-        if let Some(handle) = self.handles.get(workload_id).cloned() {
+        if let Some(mut handle) = self.handles.get(workload_id).cloned() {
             stopped = true;
+            // Do not signal the numeric PID again after the owned Child was
+            // reaped; it may be reused before cgroup cleanup runs.
+            if tracked_process_reaped {
+                handle.bwrap_pid = None;
+            }
             self.enforcer.teardown_agent(&handle)?;
             self.handles.remove(workload_id);
+        }
+        if let Some(process) = process.as_mut() {
+            // Production cgroup cleanup above kills descendants that escaped
+            // the original process group before we wait for stdout EOF.
+            process.join_protocol_reader();
         }
         if let Some(state) = self.workloads.get(workload_id) {
             if !state.owned_object_ids.is_empty() {
@@ -181,52 +264,146 @@ impl BwrapNanoRuntime {
         })
     }
 
+    fn fail_workbench_exchange(
+        &mut self,
+        workload_id: &str,
+        code: NanoExecErrorCode,
+        safe_message: &'static str,
+    ) -> anyhow::Error {
+        let failure = NanoExecError::new(code, false, safe_message);
+        if let Some(exchange) = self.exchanges.get_mut(workload_id) {
+            exchange.terminal_error = Some(failure.clone());
+        }
+        let _ = self.teardown_runtime_resources(workload_id);
+        failure.into()
+    }
+
     fn start_workbench_exchange(
         &mut self,
         handle: &NanoHandle,
         input: &str,
     ) -> Result<NanoExecResult> {
-        if input.len() > MAX_WORKBENCH_FRAME_BYTES {
-            return Err(anyhow!("workbench protocol frame exceeds the input limit"));
-        }
-        if self.exchanges.contains_key(&handle.workload_id) {
-            return Err(anyhow!("workbench exchange already active for workload"));
-        }
-        let frame: serde_json::Value =
-            serde_json::from_str(input).context("parse workbench start frame")?;
+        let frame = parse_control_frame(input)?;
         if frame.get("kind").and_then(|value| value.as_str()) != Some("execute") {
-            return Err(anyhow!("workbench start requires an execute frame"));
+            return Err(exec_error(
+                NanoExecErrorCode::InvalidFrame,
+                false,
+                "workbench start requires an execute frame",
+            ));
         }
         let request = frame
             .get("request")
             .and_then(|value| value.as_object())
-            .context("workbench execute frame lacks request")?;
+            .ok_or_else(|| {
+                exec_error(
+                    NanoExecErrorCode::InvalidFrame,
+                    false,
+                    "workbench execute frame lacks a request object",
+                )
+            })?;
+        require_schema_version(request.get("schema_version"))?;
         let invocation_id = request
             .get("invocation_id")
             .and_then(|value| value.as_str())
             .filter(|value| !value.is_empty())
-            .context("workbench request lacks invocation_id")?
+            .ok_or_else(|| {
+                exec_error(
+                    NanoExecErrorCode::InvalidFrame,
+                    false,
+                    "workbench request lacks an invocation id",
+                )
+            })?
             .to_string();
         let deadline_unix_ms = request
             .get("deadline_unix_ms")
             .and_then(|value| value.as_u64())
-            .context("workbench request lacks deadline_unix_ms")?;
+            .ok_or_else(|| {
+                exec_error(
+                    NanoExecErrorCode::InvalidFrame,
+                    false,
+                    "workbench request lacks an absolute deadline",
+                )
+            })?;
         if deadline_unix_ms <= unix_time_ms() {
-            return Err(anyhow!("workbench request deadline has expired"));
+            return Err(exec_error(
+                NanoExecErrorCode::DeadlineExceeded,
+                false,
+                "workbench request deadline has expired",
+            ));
         }
-        self.processes
+        let request_digest = frame_digest(input);
+        if let Some(exchange) = self.exchanges.get(&handle.workload_id) {
+            if exchange.invocation_id != invocation_id {
+                return Err(exec_error(
+                    NanoExecErrorCode::InvocationConflict,
+                    false,
+                    "workbench workload already has another invocation",
+                ));
+            }
+            if exchange.request_digest != request_digest {
+                return Err(exec_error(
+                    NanoExecErrorCode::DigestConflict,
+                    false,
+                    "workbench invocation request digest conflicts with retained state",
+                ));
+            }
+            if let Some(failure) = exchange.terminal_error.as_ref() {
+                return Err(failure.clone().into());
+            }
+            return workbench_exec_result(
+                handle,
+                true,
+                &invocation_id,
+                exchange_state(exchange),
+                exchange.messages.clone(),
+            );
+        }
+        let channel_available = self
+            .processes
+            .get(&handle.workload_id)
+            .ok_or_else(|| {
+                exec_error(
+                    NanoExecErrorCode::WorkloadUnavailable,
+                    false,
+                    "workbench workload process is unavailable",
+                )
+            })?
+            .protocol_channel_available();
+        if !channel_available {
+            let _ = self.teardown_workload(&handle.workload_id);
+            return Err(exec_error(
+                NanoExecErrorCode::ChannelUnavailable,
+                false,
+                "workbench protocol channel is unavailable",
+            ));
+        }
+        let send_result = self
+            .processes
             .get_mut(&handle.workload_id)
-            .context("missing bwrap process for workbench exchange")?
-            .send_protocol_line(input)?;
+            .expect("workload retained after channel validation")
+            .send_protocol_line(input);
+        if send_result.is_err() {
+            let _ = self.teardown_workload(&handle.workload_id);
+            return Err(exec_error(
+                NanoExecErrorCode::ChannelDisconnected,
+                false,
+                "workbench request channel disconnected",
+            ));
+        }
         self.exchanges.insert(
             handle.workload_id.clone(),
             WorkbenchExchange {
                 invocation_id: invocation_id.clone(),
+                request_digest,
                 deadline_unix_ms,
                 cancel_requested_at_ms: None,
+                cancel_digest: None,
+                cancel_origin: None,
                 messages: Vec::new(),
                 retained_bytes: 0,
                 result_seen: false,
+                terminal: None,
+                terminal_error: None,
             },
         );
         workbench_exec_result(handle, true, &invocation_id, "accepted", Vec::new())
@@ -237,75 +414,224 @@ impl BwrapNanoRuntime {
         handle: &NanoHandle,
         input: &str,
     ) -> Result<NanoExecResult> {
-        if input.len() > MAX_WORKBENCH_FRAME_BYTES {
-            return Err(anyhow!("workbench cancel frame exceeds the input limit"));
-        }
-        let frame: serde_json::Value =
-            serde_json::from_str(input).context("parse workbench cancel frame")?;
+        let frame = parse_control_frame(input)?;
         if frame.get("kind").and_then(|value| value.as_str()) != Some("cancel") {
-            return Err(anyhow!("workbench cancel requires a cancel frame"));
+            return Err(exec_error(
+                NanoExecErrorCode::InvalidFrame,
+                false,
+                "workbench cancel requires a cancel frame",
+            ));
         }
+        require_schema_version(frame.get("schema_version"))?;
         let invocation_id = frame
             .get("invocation_id")
             .and_then(|value| value.as_str())
-            .context("workbench cancel frame lacks invocation_id")?;
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                exec_error(
+                    NanoExecErrorCode::InvalidFrame,
+                    false,
+                    "workbench cancel frame lacks an invocation id",
+                )
+            })?;
+        let cancel_digest = frame_digest(input);
+        let exchange = self.exchanges.get_mut(&handle.workload_id).ok_or_else(|| {
+            exec_error(
+                NanoExecErrorCode::WorkloadUnavailable,
+                false,
+                "workbench exchange is unavailable",
+            )
+        })?;
+        if exchange.invocation_id != invocation_id {
+            return Err(exec_error(
+                NanoExecErrorCode::InvocationConflict,
+                false,
+                "workbench cancel invocation conflicts with retained state",
+            ));
+        }
+        if let Some(existing_digest) = exchange.cancel_digest.as_deref() {
+            if existing_digest != cancel_digest {
+                return Err(exec_error(
+                    NanoExecErrorCode::DigestConflict,
+                    false,
+                    "workbench cancel digest conflicts with retained state",
+                ));
+            }
+            if let Some(failure) = exchange.terminal_error.as_ref() {
+                return Err(failure.clone().into());
+            }
+            return workbench_exec_result(
+                handle,
+                true,
+                invocation_id,
+                exchange_state(exchange),
+                exchange.messages.clone(),
+            );
+        }
+        if let Some(failure) = exchange.terminal_error.as_ref() {
+            return Err(failure.clone().into());
+        }
+        if exchange.terminal.is_some() {
+            return workbench_exec_result(
+                handle,
+                true,
+                invocation_id,
+                "completed",
+                exchange.messages.clone(),
+            );
+        }
+        let channel_available = self
+            .processes
+            .get(&handle.workload_id)
+            .is_some_and(AgentProcess::protocol_channel_available);
+        if !channel_available {
+            return Err(self.fail_workbench_exchange(
+                &handle.workload_id,
+                NanoExecErrorCode::ChannelUnavailable,
+                "workbench protocol channel is unavailable",
+            ));
+        }
+        let send_result = self
+            .processes
+            .get_mut(&handle.workload_id)
+            .expect("workload retained after channel validation")
+            .send_protocol_line(input);
+        if send_result.is_err() {
+            return Err(self.fail_workbench_exchange(
+                &handle.workload_id,
+                NanoExecErrorCode::ChannelDisconnected,
+                "workbench cancellation channel disconnected",
+            ));
+        }
         let exchange = self
             .exchanges
             .get_mut(&handle.workload_id)
-            .context("no active workbench exchange")?;
-        if exchange.invocation_id != invocation_id {
-            return Err(anyhow!(
-                "workbench cancel invocation does not match active exchange"
-            ));
-        }
-        self.processes
-            .get_mut(&handle.workload_id)
-            .context("missing bwrap process for workbench cancellation")?
-            .send_protocol_line(input)?;
-        exchange
-            .cancel_requested_at_ms
-            .get_or_insert(unix_time_ms());
-        workbench_exec_result(handle, true, invocation_id, "cancelling", Vec::new())
+            .expect("exchange retained while cancellation is sent");
+        exchange.cancel_requested_at_ms = Some(unix_time_ms());
+        exchange.cancel_digest = Some(cancel_digest);
+        exchange.cancel_origin = Some(WorkbenchCancelOrigin::Explicit);
+        workbench_exec_result(
+            handle,
+            true,
+            invocation_id,
+            "cancelling",
+            exchange.messages.clone(),
+        )
     }
 
     fn poll_workbench_exchange(
         &mut self,
         handle: &NanoHandle,
-        invocation_id: &str,
+        input: &str,
     ) -> Result<NanoExecResult> {
-        let lines = match self
+        let frame = parse_control_frame(input)?;
+        if frame.get("kind").and_then(|value| value.as_str()) != Some("poll") {
+            return Err(exec_error(
+                NanoExecErrorCode::InvalidFrame,
+                false,
+                "workbench poll requires a poll frame",
+            ));
+        }
+        require_schema_version(frame.get("schema_version"))?;
+        let invocation_id = frame
+            .get("invocation_id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                exec_error(
+                    NanoExecErrorCode::InvalidFrame,
+                    false,
+                    "workbench poll frame lacks an invocation id",
+                )
+            })?;
+        let exchange = self.exchanges.get(&handle.workload_id).ok_or_else(|| {
+            exec_error(
+                NanoExecErrorCode::WorkloadUnavailable,
+                false,
+                "workbench exchange is unavailable",
+            )
+        })?;
+        if exchange.invocation_id != invocation_id {
+            return Err(exec_error(
+                NanoExecErrorCode::InvocationConflict,
+                false,
+                "workbench poll invocation conflicts with retained state",
+            ));
+        }
+        if let Some(failure) = exchange.terminal_error.as_ref() {
+            return Err(failure.clone().into());
+        }
+        let terminal_messages = exchange
+            .terminal
+            .is_some()
+            .then(|| exchange.messages.clone());
+        let channel_status = self
+            .processes
+            .get(&handle.workload_id)
+            .map(AgentProcess::protocol_channel_available);
+        match channel_status {
+            None if terminal_messages.is_some() => {
+                return workbench_exec_result(
+                    handle,
+                    true,
+                    invocation_id,
+                    "completed",
+                    terminal_messages.expect("terminal messages were present"),
+                );
+            }
+            None => {
+                return Err(self.fail_workbench_exchange(
+                    &handle.workload_id,
+                    NanoExecErrorCode::ChannelDisconnected,
+                    "workbench workload process disappeared before a terminal frame",
+                ));
+            }
+            Some(false) => {
+                return Err(self.fail_workbench_exchange(
+                    &handle.workload_id,
+                    NanoExecErrorCode::ChannelUnavailable,
+                    "workbench protocol channel is unavailable",
+                ));
+            }
+            Some(true) => {}
+        }
+        let drain = match self
             .processes
             .get_mut(&handle.workload_id)
-            .context("missing bwrap process for workbench poll")?
+            .expect("workload retained after channel validation")
             .drain_protocol_lines()
         {
-            Ok(lines) => lines,
-            Err(error) => {
-                let _ = self.teardown_workload(&handle.workload_id);
-                return Err(error.context("workbench protocol channel failed closed"));
+            Ok(drain) => drain,
+            Err(_) => {
+                return Err(self.fail_workbench_exchange(
+                    &handle.workload_id,
+                    NanoExecErrorCode::ProtocolViolation,
+                    "workbench output frame violated its configured bound",
+                ));
             }
         };
         let now_ms = unix_time_ms();
-        let mut terminal = false;
-        let mut kill_for_bound = false;
+        let mut violation = None;
+        let mut send_deadline_cancel = None;
+        let mut forced_cancel = None;
+        let mut terminal_requires_stop = false;
         {
             let exchange = self
                 .exchanges
                 .get_mut(&handle.workload_id)
-                .context("no active workbench exchange")?;
-            if exchange.invocation_id != invocation_id {
-                return Err(anyhow!(
-                    "workbench poll invocation does not match active exchange"
-                ));
-            }
-            for line in lines {
+                .expect("exchange validated before draining protocol output");
+            for line in drain.lines {
+                if exchange.terminal.is_some() {
+                    violation = Some(NanoExecErrorCode::ProtocolViolation);
+                    break;
+                }
                 exchange.retained_bytes = exchange.retained_bytes.saturating_add(line.len());
                 if exchange.retained_bytes > MAX_WORKBENCH_OUTPUT_BYTES {
-                    kill_for_bound = true;
+                    violation = Some(NanoExecErrorCode::OutputLimitExceeded);
                     break;
                 }
                 let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
-                    kill_for_bound = true;
+                    violation = Some(NanoExecErrorCode::InvalidFrame);
                     break;
                 };
                 if message
@@ -313,20 +639,20 @@ impl BwrapNanoRuntime {
                     .and_then(|value| value.as_u64())
                     != Some(1)
                 {
-                    kill_for_bound = true;
+                    violation = Some(NanoExecErrorCode::UnsupportedVersion);
                     break;
                 }
                 let message_invocation = message
                     .get("invocation_id")
                     .and_then(|value| value.as_str());
                 if message_invocation != Some(exchange.invocation_id.as_str()) {
-                    kill_for_bound = true;
+                    violation = Some(NanoExecErrorCode::InvocationConflict);
                     break;
                 }
                 match message.get("kind").and_then(|value| value.as_str()) {
                     Some("result") => {
-                        if exchange.result_seen {
-                            kill_for_bound = true;
+                        if exchange.result_seen || exchange.terminal.is_some() {
+                            violation = Some(NanoExecErrorCode::ProtocolViolation);
                             break;
                         }
                         exchange.result_seen = true;
@@ -335,59 +661,143 @@ impl BwrapNanoRuntime {
                         if message.get("stage").and_then(|value| value.as_str())
                             == Some("completed") =>
                     {
-                        if !exchange.result_seen {
-                            kill_for_bound = true;
+                        if !exchange.result_seen || exchange.terminal.is_some() {
+                            violation = Some(NanoExecErrorCode::ProtocolViolation);
                             break;
                         }
-                        terminal = true;
+                        exchange.terminal = Some(WorkbenchTerminal::Succeeded);
                     }
-                    Some("error") => terminal = true,
-                    Some("progress") | Some("cancelled") => {}
+                    Some("progress") => {
+                        if exchange.result_seen {
+                            violation = Some(NanoExecErrorCode::ProtocolViolation);
+                            break;
+                        }
+                    }
+                    Some("error") => {
+                        if exchange.result_seen || exchange.terminal.is_some() {
+                            violation = Some(NanoExecErrorCode::ProtocolViolation);
+                            break;
+                        }
+                        exchange.terminal = Some(WorkbenchTerminal::Failed);
+                        terminal_requires_stop = true;
+                    }
+                    Some("cancelled") => {
+                        if exchange.cancel_requested_at_ms.is_none()
+                            || exchange.result_seen
+                            || exchange.terminal.is_some()
+                        {
+                            violation = Some(NanoExecErrorCode::ProtocolViolation);
+                            break;
+                        }
+                        exchange.terminal = Some(WorkbenchTerminal::Cancelled);
+                        terminal_requires_stop = true;
+                    }
                     _ => {
-                        kill_for_bound = true;
+                        violation = Some(NanoExecErrorCode::ProtocolViolation);
                         break;
                     }
                 }
                 exchange.messages.push(message);
             }
-            if !terminal {
+            if violation.is_none() && drain.disconnected && exchange.terminal.is_none() {
+                violation = Some(NanoExecErrorCode::ChannelDisconnected);
+            }
+            if violation.is_none() && exchange.terminal.is_none() {
                 if let Some(cancelled_at) = exchange.cancel_requested_at_ms {
-                    kill_for_bound =
-                        now_ms.saturating_sub(cancelled_at) >= WORKBENCH_CANCEL_GRACE_MS;
+                    if now_ms.saturating_sub(cancelled_at) >= WORKBENCH_CANCEL_GRACE_MS {
+                        forced_cancel = exchange.cancel_origin;
+                    }
                 } else if now_ms >= exchange.deadline_unix_ms {
                     exchange.cancel_requested_at_ms = Some(now_ms);
+                    exchange.cancel_origin = Some(WorkbenchCancelOrigin::Deadline);
+                    let cancel = serde_json::json!({
+                        "kind": "cancel",
+                        "schema_version": 1,
+                        "invocation_id": exchange.invocation_id,
+                        "reason": "deadline_expired"
+                    });
+                    let cancel = serde_json::to_string(&cancel)?;
+                    exchange.cancel_digest = Some(frame_digest(&cancel));
+                    send_deadline_cancel = Some(cancel);
                 }
             }
         }
-        if kill_for_bound {
-            let _ = self.teardown_workload(&handle.workload_id);
-            return Err(anyhow!(
-                "workbench exchange violated its protocol, output, or cancellation bound"
-            ));
+        if let Some(code) = violation {
+            let message = match code {
+                NanoExecErrorCode::OutputLimitExceeded => {
+                    "workbench output exceeded the configured limit"
+                }
+                NanoExecErrorCode::ChannelDisconnected => {
+                    "workbench output channel disconnected before a terminal frame"
+                }
+                NanoExecErrorCode::UnsupportedVersion => {
+                    "workbench child emitted an unsupported protocol version"
+                }
+                NanoExecErrorCode::InvocationConflict => {
+                    "workbench child emitted a foreign invocation id"
+                }
+                NanoExecErrorCode::InvalidFrame => "workbench child emitted an invalid JSON frame",
+                _ => "workbench child violated the protocol state machine",
+            };
+            return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
+        }
+        if let Some(cancel) = send_deadline_cancel {
+            let send_result = self
+                .processes
+                .get_mut(&handle.workload_id)
+                .ok_or_else(|| {
+                    exec_error(
+                        NanoExecErrorCode::WorkloadUnavailable,
+                        false,
+                        "workbench workload process is unavailable",
+                    )
+                })?
+                .send_protocol_line(&cancel);
+            if send_result.is_err() {
+                return Err(self.fail_workbench_exchange(
+                    &handle.workload_id,
+                    NanoExecErrorCode::ChannelDisconnected,
+                    "workbench deadline cancellation channel disconnected",
+                ));
+            }
+        }
+        if let Some(origin) = forced_cancel {
+            let (code, message) = match origin {
+                WorkbenchCancelOrigin::Deadline => (
+                    NanoExecErrorCode::DeadlineExceeded,
+                    "workbench deadline expired without a terminal acknowledgement",
+                ),
+                WorkbenchCancelOrigin::Explicit => (
+                    NanoExecErrorCode::Cancelled,
+                    "workbench cancellation was not acknowledged within its grace period",
+                ),
+            };
+            return Err(self.fail_workbench_exchange(&handle.workload_id, code, message));
+        }
+        if terminal_requires_stop {
+            self.teardown_runtime_resources(&handle.workload_id)?;
         }
         let exchange = self
             .exchanges
-            .get_mut(&handle.workload_id)
-            .context("workbench exchange disappeared during poll")?;
-        if now_ms >= exchange.deadline_unix_ms && exchange.cancel_requested_at_ms == Some(now_ms) {
-            let cancel = serde_json::json!({
-                "kind": "cancel",
-                "schema_version": 1,
-                "invocation_id": exchange.invocation_id,
-                "reason": "deadline_expired"
-            });
-            self.processes
-                .get_mut(&handle.workload_id)
-                .context("missing bwrap process for deadline cancellation")?
-                .send_protocol_line(&serde_json::to_string(&cancel)?)?;
-        }
-        let messages = std::mem::take(&mut exchange.messages);
-        let state = if terminal { "completed" } else { "pending" };
-        let result = workbench_exec_result(handle, true, invocation_id, state, messages)?;
-        if terminal {
-            self.exchanges.remove(&handle.workload_id);
-        }
-        Ok(result)
+            .get(&handle.workload_id)
+            .expect("exchange retained after a valid poll");
+        workbench_exec_result(
+            handle,
+            true,
+            invocation_id,
+            exchange_state(exchange),
+            exchange.messages.clone(),
+        )
+    }
+}
+
+fn exchange_state(exchange: &WorkbenchExchange) -> &'static str {
+    if exchange.terminal.is_some() {
+        "completed"
+    } else if exchange.cancel_requested_at_ms.is_some() {
+        "cancelling"
+    } else {
+        "pending"
     }
 }
 
@@ -501,14 +911,24 @@ impl NanoRuntime for BwrapNanoRuntime {
                 })
             }
             "workbench_start" => {
-                if self.health(handle)?.state != NanoHealthState::Healthy {
-                    return Err(anyhow!("bwrap workload is not healthy"));
+                if !self.exchanges.contains_key(&handle.workload_id)
+                    && self.health(handle)?.state != NanoHealthState::Healthy
+                {
+                    return Err(exec_error(
+                        NanoExecErrorCode::WorkloadUnavailable,
+                        false,
+                        "workbench workload is not healthy",
+                    ));
                 }
                 self.start_workbench_exchange(handle, &request.input)
             }
             "workbench_poll" => self.poll_workbench_exchange(handle, &request.input),
             "workbench_cancel" => self.cancel_workbench_exchange(handle, &request.input),
-            other => Err(anyhow!("bwrap exec operation '{other}' is not supported")),
+            _ => Err(exec_error(
+                NanoExecErrorCode::UnsupportedOperation,
+                false,
+                "bwrap exec operation is not supported",
+            )),
         }
     }
 
@@ -771,6 +1191,52 @@ mod tests {
         .unwrap()
     }
 
+    fn poll_frame(invocation_id: &str) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "kind": "poll",
+            "schema_version": 1,
+            "invocation_id": invocation_id
+        }))
+        .unwrap()
+    }
+
+    fn assert_exec_error(error: &anyhow::Error, expected: NanoExecErrorCode) {
+        let typed = error
+            .downcast_ref::<NanoExecError>()
+            .expect("exec failure must retain its typed public-safe classification");
+        assert_eq!(typed.code, expected);
+        assert!(!typed.retryable);
+    }
+
+    fn poll_until_error(
+        runtime: &mut BwrapNanoRuntime,
+        handle: &NanoHandle,
+        invocation_id: &str,
+    ) -> anyhow::Error {
+        for _ in 0..100 {
+            match runtime.exec(
+                handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            ) {
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(error) => return error,
+            }
+        }
+        panic!("protocol fixture did not produce the expected error");
+    }
+
+    fn wait_until_pid_exits(pid: u32) {
+        for _ in 0..100 {
+            if !PathBuf::from(format!("/proc/{pid}")).exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     fn poll_until_terminal(
         registry: &mut sentinel_common::nano_runtime::NanoRuntimeRegistry,
         handle: &NanoHandle,
@@ -782,7 +1248,7 @@ mod tests {
                     handle,
                     NanoExecRequest {
                         operation: "workbench_poll".to_string(),
-                        input: invocation_id.to_string(),
+                        input: poll_frame(invocation_id),
                     },
                 )
                 .unwrap();
@@ -808,15 +1274,86 @@ mod tests {
         let completed = format!(
             r#"{{"kind":"progress","schema_version":1,"invocation_id":"{invocation_id}","stage":"completed","elapsed_ms":1}}"#
         );
+        let temp = tempfile::tempdir().unwrap();
+        let record_path = temp.path().join("protocol-input.jsonl");
+        let descendant_pid_path = temp.path().join("descendant.pid");
+        let process = AgentProcess::launch_recording_protocol_fixture(
+            &[&progress, &result, &completed],
+            &record_path,
+            &descendant_pid_path,
+        )
+        .unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, "protocol-success", process);
+        let mut registry = sentinel_common::nano_runtime::NanoRuntimeRegistry::new(None);
+        registry.register(runtime).unwrap();
+        let start = start_frame(invocation_id, unix_time_ms() + 10_000);
+        let accepted = registry
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start.clone(),
+                },
+            )
+            .unwrap();
+        assert!(accepted.success);
+        let start_replay = registry
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start,
+                },
+            )
+            .unwrap();
+        assert!(start_replay.output.contains("pending"));
+        let terminal = poll_until_terminal(&mut registry, &handle, invocation_id);
+        let output: serde_json::Value = serde_json::from_str(&terminal.output).unwrap();
+        assert_eq!(output["invocation_id"], invocation_id);
+        assert_eq!(output["state"], "completed");
+        assert_eq!(output["messages"].as_array().unwrap().len(), 3);
+        let terminal_replay = registry
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap();
+        assert_eq!(terminal_replay.output, terminal.output);
+        let recorded = std::fs::read_to_string(&record_path).unwrap();
+        assert_eq!(recorded.lines().count(), 1, "start replay wrote to child");
+
+        let descendant_pid: u32 = std::fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        registry.stop(&handle).unwrap();
+        wait_until_pid_exits(descendant_pid);
+        assert!(
+            !PathBuf::from(format!("/proc/{descendant_pid}")).exists(),
+            "descendant survived runtime stop"
+        );
+    }
+
+    #[test]
+    fn foreign_poll_is_rejected_before_matching_output_is_consumed() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2910";
+        let result =
+            format!(r#"{{"kind":"result","schema_version":1,"invocation_id":"{invocation_id}"}}"#);
+        let completed = format!(
+            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{invocation_id}","stage":"completed"}}"#
+        );
         let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
         let handle = insert_protocol_fixture(
             &mut runtime,
-            "protocol-success",
-            &[&progress, &result, &completed],
+            "protocol-foreign-poll",
+            &[&result, &completed],
         );
-        let mut registry = sentinel_common::nano_runtime::NanoRuntimeRegistry::new(None);
-        registry.register(runtime).unwrap();
-        let accepted = registry
+        runtime
             .exec(
                 &handle,
                 NanoExecRequest {
@@ -825,12 +1362,246 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(accepted.success);
-        let terminal = poll_until_terminal(&mut registry, &handle, invocation_id);
-        let output: serde_json::Value = serde_json::from_str(&terminal.output).unwrap();
-        assert_eq!(output["invocation_id"], invocation_id);
-        assert_eq!(output["state"], "completed");
-        assert_eq!(output["messages"].as_array().unwrap().len(), 3);
+
+        let error = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame("foreign-invocation"),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&error, NanoExecErrorCode::InvocationConflict);
+
+        for _ in 0..100 {
+            let output = runtime
+                .exec(
+                    &handle,
+                    NanoExecRequest {
+                        operation: "workbench_poll".to_string(),
+                        input: poll_frame(invocation_id),
+                    },
+                )
+                .unwrap();
+            if output.output.contains("completed") {
+                let envelope: serde_json::Value = serde_json::from_str(&output.output).unwrap();
+                assert_eq!(envelope["messages"].as_array().unwrap().len(), 2);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("matching poll did not receive retained child output");
+    }
+
+    #[test]
+    fn concurrent_workloads_cannot_cross_wire_protocol_frames() {
+        let invocation_a = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2918";
+        let invocation_b = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2919";
+        let result_a = format!(
+            r#"{{"kind":"result","schema_version":1,"invocation_id":"{invocation_a}","output":{{"marker":"A"}}}}"#
+        );
+        let completed_a = format!(
+            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{invocation_a}","stage":"completed"}}"#
+        );
+        let result_b = format!(
+            r#"{{"kind":"result","schema_version":1,"invocation_id":"{invocation_b}","output":{{"marker":"B"}}}}"#
+        );
+        let completed_b = format!(
+            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{invocation_b}","stage":"completed"}}"#
+        );
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+        let handle_a = insert_protocol_fixture(
+            &mut runtime,
+            "protocol-concurrent-a",
+            &[&result_a, &completed_a],
+        );
+        let handle_b = insert_protocol_fixture(
+            &mut runtime,
+            "protocol-concurrent-b",
+            &[&result_b, &completed_b],
+        );
+        let mut registry = sentinel_common::nano_runtime::NanoRuntimeRegistry::new(None);
+        registry.register(runtime).unwrap();
+
+        for (handle, invocation_id) in [
+            (&handle_a, invocation_a),
+            (&handle_b, invocation_b),
+        ] {
+            registry
+                .exec(
+                    handle,
+                    NanoExecRequest {
+                        operation: "workbench_start".to_string(),
+                        input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                    },
+                )
+                .unwrap();
+        }
+
+        let terminal_b = poll_until_terminal(&mut registry, &handle_b, invocation_b);
+        let terminal_a = poll_until_terminal(&mut registry, &handle_a, invocation_a);
+        for (terminal, invocation_id, marker) in [
+            (terminal_a, invocation_a, "A"),
+            (terminal_b, invocation_b, "B"),
+        ] {
+            let envelope: serde_json::Value = serde_json::from_str(&terminal.output).unwrap();
+            assert_eq!(envelope["invocation_id"], invocation_id);
+            let messages = envelope["messages"].as_array().unwrap();
+            assert!(messages
+                .iter()
+                .all(|message| message["invocation_id"] == invocation_id));
+            assert_eq!(messages[0]["output"]["marker"], marker);
+        }
+        registry.stop(&handle_a).unwrap();
+        registry.stop(&handle_b).unwrap();
+    }
+
+    #[test]
+    fn start_replay_is_digest_bound_and_control_frames_are_versioned() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2911";
+        let temp = tempfile::tempdir().unwrap();
+        let record_path = temp.path().join("protocol-input.jsonl");
+        let descendant_pid_path = temp.path().join("descendant.pid");
+        let process = AgentProcess::launch_recording_protocol_fixture(
+            &[],
+            &record_path,
+            &descendant_pid_path,
+        )
+        .unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, "protocol-digest", process);
+        let start = start_frame(invocation_id, unix_time_ms() + 10_000);
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start.clone(),
+                },
+            )
+            .unwrap();
+
+        let mut conflicting: serde_json::Value = serde_json::from_str(&start).unwrap();
+        conflicting["request"]["opaque"] = serde_json::json!("different bytes");
+        let error = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: serde_json::to_string(&conflicting).unwrap(),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&error, NanoExecErrorCode::DigestConflict);
+
+        let error = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: invocation_id.to_string(),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&error, NanoExecErrorCode::InvalidFrame);
+
+        let mut version: serde_json::Value =
+            serde_json::from_str(&poll_frame(invocation_id)).unwrap();
+        version["schema_version"] = serde_json::json!(2);
+        let error = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: serde_json::to_string(&version).unwrap(),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&error, NanoExecErrorCode::UnsupportedVersion);
+
+        let cancel = serde_json::json!({
+            "kind": "cancel",
+            "schema_version": 1,
+            "invocation_id": invocation_id,
+            "reason": "operator_cancelled"
+        });
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_cancel".to_string(),
+                    input: serde_json::to_string(&cancel).unwrap(),
+                },
+            )
+            .unwrap();
+        let mut conflicting_cancel = cancel;
+        conflicting_cancel["reason"] = serde_json::json!("different_reason");
+        let error = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_cancel".to_string(),
+                    input: serde_json::to_string(&conflicting_cancel).unwrap(),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&error, NanoExecErrorCode::DigestConflict);
+        runtime.stop(&handle).unwrap();
+        let recorded = std::fs::read_to_string(&record_path).unwrap();
+        assert_eq!(
+            recorded.lines().count(),
+            2,
+            "conflicting start or cancel replay wrote an extra child frame"
+        );
+    }
+
+    #[test]
+    fn missing_protocol_channel_fails_closed_with_a_typed_error() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2917";
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+        let handle = insert_fixture(
+            &mut runtime,
+            fixture_workload("protocol-missing", "agent-missing-protocol"),
+            Vec::new(),
+        );
+
+        let error = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_unknown".to_string(),
+                    input: "SECRET=must-not-be-reflected".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&error, NanoExecErrorCode::UnsupportedOperation);
+        assert!(!error.to_string().contains("SECRET"));
+
+        let error = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&error, NanoExecErrorCode::ChannelUnavailable);
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Stopped
+        );
+        let error = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&error, NanoExecErrorCode::WorkloadUnavailable);
     }
 
     #[test]
@@ -854,12 +1625,12 @@ mod tests {
                 &handle,
                 NanoExecRequest {
                     operation: "workbench_poll".to_string(),
-                    input: invocation_id.to_string(),
+                    input: poll_frame(invocation_id),
                 },
             ) {
                 Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
                 Err(error) => {
-                    assert!(error.to_string().contains("violated"));
+                    assert_exec_error(&error, NanoExecErrorCode::InvocationConflict);
                     rejected = true;
                     break;
                 }
@@ -893,7 +1664,7 @@ mod tests {
                 &handle,
                 NanoExecRequest {
                     operation: "workbench_poll".to_string(),
-                    input: invocation_id.to_string(),
+                    input: poll_frame(invocation_id),
                 },
             ) {
                 Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
@@ -904,15 +1675,108 @@ mod tests {
             }
         }
         let error = failure.expect("malformed output must fail closed");
-        assert!(error.to_string().contains("violated"));
+        assert_exec_error(&error, NanoExecErrorCode::InvalidFrame);
         assert!(!error.to_string().contains("SECRET"));
     }
 
     #[test]
     fn unacknowledged_cancel_is_bounded_and_kills_the_process_tree() {
         let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2903";
+        let temp = tempfile::tempdir().unwrap();
+        let record_path = temp.path().join("protocol-input.jsonl");
+        let descendant_pid_path = temp.path().join("descendant.pid");
+        let process = AgentProcess::launch_recording_protocol_fixture(
+            &[],
+            &record_path,
+            &descendant_pid_path,
+        )
+        .unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, "protocol-cancel", process);
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                },
+            )
+            .unwrap();
+        let cancel = serde_json::json!({
+            "kind": "cancel",
+            "schema_version": 1,
+            "invocation_id": invocation_id,
+            "reason": "operator_cancelled"
+        });
+        let cancel_input = serde_json::to_string(&cancel).unwrap();
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_cancel".to_string(),
+                    input: cancel_input.clone(),
+                },
+            )
+            .unwrap();
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_cancel".to_string(),
+                    input: cancel_input,
+                },
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(
+            WORKBENCH_CANCEL_GRACE_MS + 20,
+        ));
+        let error = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&error, NanoExecErrorCode::Cancelled);
+        let replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&replay, NanoExecErrorCode::Cancelled);
+        assert_eq!(replay.to_string(), error.to_string());
+        let recorded = std::fs::read_to_string(&record_path).unwrap();
+        assert_eq!(recorded.lines().count(), 2, "cancel replay wrote to child");
+        let descendant_pid: u32 = std::fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        wait_until_pid_exits(descendant_pid);
+        assert!(
+            !PathBuf::from(format!("/proc/{descendant_pid}")).exists(),
+            "descendant survived forced cancellation"
+        );
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Stopped
+        );
+    }
+
+    #[test]
+    fn acknowledged_cancel_is_terminal_replayable_and_releases_the_process() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2912";
+        let cancelled = format!(
+            r#"{{"kind":"cancelled","schema_version":1,"invocation_id":"{invocation_id}"}}"#
+        );
         let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
-        let handle = insert_protocol_fixture(&mut runtime, "protocol-cancel", &[]);
+        let handle = insert_protocol_fixture(&mut runtime, "protocol-cancelled", &[&cancelled]);
         runtime
             .exec(
                 &handle,
@@ -937,23 +1801,308 @@ mod tests {
                 },
             )
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(
-            WORKBENCH_CANCEL_GRACE_MS + 20,
-        ));
-        let error = runtime
-            .exec(
-                &handle,
-                NanoExecRequest {
-                    operation: "workbench_poll".to_string(),
-                    input: invocation_id.to_string(),
-                },
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("cancellation bound"));
+
+        let mut terminal = None;
+        for _ in 0..100 {
+            let output = runtime
+                .exec(
+                    &handle,
+                    NanoExecRequest {
+                        operation: "workbench_poll".to_string(),
+                        input: poll_frame(invocation_id),
+                    },
+                )
+                .unwrap();
+            if output.output.contains("completed") {
+                terminal = Some(output);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let terminal = terminal.expect("cancelled exchange did not become terminal");
         assert_eq!(
             runtime.health(&handle).unwrap().state,
             NanoHealthState::Stopped
         );
+        let replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap();
+        assert_eq!(replay.output, terminal.output);
+    }
+
+    #[test]
+    fn duplicate_terminal_and_output_overflow_fail_with_typed_safe_errors() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2913";
+        let terminal =
+            format!(r#"{{"kind":"error","schema_version":1,"invocation_id":"{invocation_id}"}}"#);
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+        let handle = insert_protocol_fixture(
+            &mut runtime,
+            "protocol-duplicate-terminal",
+            &[&terminal, &terminal],
+        );
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                },
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let error = poll_until_error(&mut runtime, &handle, invocation_id);
+        assert_exec_error(&error, NanoExecErrorCode::ProtocolViolation);
+
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2914";
+        let oversized = serde_json::json!({
+            "kind": "progress",
+            "schema_version": 1,
+            "invocation_id": invocation_id,
+            "stage": "running",
+            "padding": "x".repeat(MAX_WORKBENCH_OUTPUT_BYTES)
+        })
+        .to_string();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+        let handle =
+            insert_protocol_fixture(&mut runtime, "protocol-output-overflow", &[&oversized]);
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                },
+            )
+            .unwrap();
+        let error = poll_until_error(&mut runtime, &handle, invocation_id);
+        assert_exec_error(&error, NanoExecErrorCode::OutputLimitExceeded);
+        assert!(!error.to_string().contains(&"x".repeat(32)));
+    }
+
+    #[test]
+    fn invalid_child_protocol_variants_fail_closed() {
+        let cases = [
+            (
+                "protocol-child-v2",
+                "018f3f32-4f01-7f2c-a6c1-f6f4a81b2920",
+                "result",
+                2,
+                None,
+                NanoExecErrorCode::UnsupportedVersion,
+            ),
+            (
+                "protocol-unknown-kind",
+                "018f3f32-4f01-7f2c-a6c1-f6f4a81b2921",
+                "unknown",
+                1,
+                None,
+                NanoExecErrorCode::ProtocolViolation,
+            ),
+            (
+                "protocol-premature-completed",
+                "018f3f32-4f01-7f2c-a6c1-f6f4a81b2922",
+                "progress",
+                1,
+                Some("completed"),
+                NanoExecErrorCode::ProtocolViolation,
+            ),
+            (
+                "protocol-unsolicited-cancelled",
+                "018f3f32-4f01-7f2c-a6c1-f6f4a81b2923",
+                "cancelled",
+                1,
+                None,
+                NanoExecErrorCode::ProtocolViolation,
+            ),
+        ];
+
+        for (workload_id, invocation_id, kind, version, stage, expected) in cases {
+            let mut frame = serde_json::json!({
+                "kind": kind,
+                "schema_version": version,
+                "invocation_id": invocation_id
+            });
+            if let Some(stage) = stage {
+                frame["stage"] = serde_json::json!(stage);
+            }
+            let frame = serde_json::to_string(&frame).unwrap();
+            let mut runtime =
+                BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+            let handle = insert_protocol_fixture(&mut runtime, workload_id, &[&frame]);
+            runtime
+                .exec(
+                    &handle,
+                    NanoExecRequest {
+                        operation: "workbench_start".to_string(),
+                        input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                    },
+                )
+                .unwrap();
+            let error = poll_until_error(&mut runtime, &handle, invocation_id);
+            assert_exec_error(&error, expected);
+            assert_eq!(
+                runtime.health(&handle).unwrap().state,
+                NanoHealthState::Stopped
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_and_individual_frame_overflow_fail_closed() {
+        let cases = [
+            (
+                "protocol-invalid-utf8",
+                "018f3f32-4f01-7f2c-a6c1-f6f4a81b2924",
+                r#"IFS= read -r frame; printf '\377\n'; sleep 5"#,
+            ),
+            (
+                "protocol-frame-overflow",
+                "018f3f32-4f01-7f2c-a6c1-f6f4a81b2925",
+                r#"IFS= read -r frame; head -c 1048577 /dev/zero | tr '\000' x; printf '\n'; sleep 5"#,
+            ),
+        ];
+
+        for (workload_id, invocation_id, script) in cases {
+            let process = AgentProcess::launch_raw_protocol_fixture(script).unwrap();
+            let mut runtime =
+                BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+            let handle = insert_protocol_process(&mut runtime, workload_id, process);
+            runtime
+                .exec(
+                    &handle,
+                    NanoExecRequest {
+                        operation: "workbench_start".to_string(),
+                        input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                    },
+                )
+                .unwrap();
+            let error = poll_until_error(&mut runtime, &handle, invocation_id);
+            assert_exec_error(&error, NanoExecErrorCode::ProtocolViolation);
+            assert_eq!(
+                runtime.health(&handle).unwrap().state,
+                NanoHealthState::Stopped
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_reader_queue_applies_backpressure_without_losing_frames() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2915";
+        let mut frames: Vec<String> = (0..=64)
+            .map(|sequence| {
+                serde_json::json!({
+                    "kind": "progress",
+                    "schema_version": 1,
+                    "invocation_id": invocation_id,
+                    "stage": "running",
+                    "sequence": sequence
+                })
+                .to_string()
+            })
+            .collect();
+        frames.push(
+            serde_json::json!({
+                "kind": "result",
+                "schema_version": 1,
+                "invocation_id": invocation_id
+            })
+            .to_string(),
+        );
+        frames.push(
+            serde_json::json!({
+                "kind": "progress",
+                "schema_version": 1,
+                "invocation_id": invocation_id,
+                "stage": "completed"
+            })
+            .to_string(),
+        );
+        let frame_refs: Vec<&str> = frames.iter().map(String::as_str).collect();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+        let handle = insert_protocol_fixture(&mut runtime, "protocol-backpressure", &frame_refs);
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: start_frame(invocation_id, unix_time_ms() + 10_000),
+                },
+            )
+            .unwrap();
+
+        for _ in 0..100 {
+            let output = runtime
+                .exec(
+                    &handle,
+                    NanoExecRequest {
+                        operation: "workbench_poll".to_string(),
+                        input: poll_frame(invocation_id),
+                    },
+                )
+                .unwrap();
+            let envelope: serde_json::Value = serde_json::from_str(&output.output).unwrap();
+            if envelope["state"] == "completed" {
+                assert_eq!(envelope["messages"].as_array().unwrap().len(), 67);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("bounded queue did not drain to a terminal exchange");
+    }
+
+    #[test]
+    fn protocol_metacharacters_remain_stdin_data_and_are_never_reparsed() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2916";
+        let temp = tempfile::tempdir().unwrap();
+        let record_path = temp.path().join("protocol-input.jsonl");
+        let descendant_pid_path = temp.path().join("descendant.pid");
+        let injected_path = temp.path().join("must-not-exist");
+        let process = AgentProcess::launch_recording_protocol_fixture(
+            &[],
+            &record_path,
+            &descendant_pid_path,
+        )
+        .unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let handle = insert_protocol_process(&mut runtime, "protocol-data-only", process);
+        let mut start: serde_json::Value =
+            serde_json::from_str(&start_frame(invocation_id, unix_time_ms() + 10_000)).unwrap();
+        start["request"]["opaque"] = serde_json::json!(format!(
+            "$(touch {}) ; `touch {}`",
+            injected_path.display(),
+            injected_path.display()
+        ));
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: serde_json::to_string(&start).unwrap(),
+                },
+            )
+            .unwrap();
+        for _ in 0..100 {
+            if record_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            record_path.exists(),
+            "fixture did not receive execute frame"
+        );
+        assert!(
+            !injected_path.exists(),
+            "protocol content reached a shell parser"
+        );
+        runtime.stop(&handle).unwrap();
     }
 
     #[test]
@@ -976,25 +2125,35 @@ mod tests {
                 &handle,
                 NanoExecRequest {
                     operation: "workbench_poll".to_string(),
-                    input: invocation_id.to_string(),
+                    input: poll_frame(invocation_id),
                 },
             )
             .unwrap();
-        assert!(pending.output.contains("pending"));
+        assert!(pending.output.contains("cancelling"));
         std::thread::sleep(std::time::Duration::from_millis(
             WORKBENCH_CANCEL_GRACE_MS + 20,
         ));
-        assert!(runtime
+        let error = runtime
             .exec(
                 &handle,
                 NanoExecRequest {
                     operation: "workbench_poll".to_string(),
-                    input: invocation_id.to_string(),
+                    input: poll_frame(invocation_id),
                 },
             )
-            .unwrap_err()
-            .to_string()
-            .contains("cancellation bound"));
+            .unwrap_err();
+        assert_exec_error(&error, NanoExecErrorCode::DeadlineExceeded);
+        let replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&replay, NanoExecErrorCode::DeadlineExceeded);
+        assert_eq!(replay.to_string(), error.to_string());
     }
 
     #[test]
@@ -1015,28 +2174,39 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut failed_closed = false;
+        let mut failed_closed = None;
         for _ in 0..100 {
             match runtime.exec(
                 &handle,
                 NanoExecRequest {
                     operation: "workbench_poll".to_string(),
-                    input: invocation_id.to_string(),
+                    input: poll_frame(invocation_id),
                 },
             ) {
                 Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
                 Err(error) => {
-                    assert!(error.to_string().contains("failed closed"));
-                    failed_closed = true;
+                    assert_exec_error(&error, NanoExecErrorCode::ChannelDisconnected);
+                    failed_closed = Some(error);
                     break;
                 }
             }
         }
-        assert!(failed_closed);
+        let failure = failed_closed.expect("EOF did not fail closed");
         assert_eq!(
             runtime.health(&handle).unwrap().state,
             NanoHealthState::Stopped
         );
+        let replay = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_poll".to_string(),
+                    input: poll_frame(invocation_id),
+                },
+            )
+            .unwrap_err();
+        assert_exec_error(&replay, NanoExecErrorCode::ChannelDisconnected);
+        assert_eq!(replay.to_string(), failure.to_string());
     }
 
     #[test]

@@ -12,6 +12,8 @@
 //! 4. `teardown_agent()` — beendet bwrap-Reste + entfernt cgroup
 
 use std::io::{BufRead, BufReader, Write};
+#[cfg(test)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +34,11 @@ enum ProtocolFrame {
     Rejected,
 }
 
+pub(crate) struct ProtocolDrain {
+    pub(crate) lines: Vec<String>,
+    pub(crate) disconnected: bool,
+}
+
 /// Handle fuer einen laufenden Agent-Prozess in bwrap.
 ///
 /// Haelt den Child-Handle am Leben (bwrap hat --die-with-parent,
@@ -49,31 +56,44 @@ pub struct AgentProcess {
     child: Child,
     protocol_stdin: Option<ChildStdin>,
     protocol_stdout: Option<Receiver<ProtocolFrame>>,
+    protocol_reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AgentProcess {
     #[cfg(test)]
     pub(crate) fn launch_fixture() -> Result<Self> {
-        let mut child = std::process::Command::new("/usr/bin/sleep")
+        let mut command = std::process::Command::new("/usr/bin/sleep");
+        command
             .arg("30")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .context("start sandbox lifecycle fixture")?;
+            .stderr(std::process::Stdio::null());
+        // SAFETY: setpgid is async-signal-safe and gives the fixture the same
+        // complete-tree termination boundary as production bwrap processes.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().context("start sandbox lifecycle fixture")?;
         let pid = child.id();
         Ok(Self {
             pid,
             child_pid: None,
             protocol_stdin: child.stdin.take(),
             protocol_stdout: None,
+            protocol_reader: None,
             child,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn launch_protocol_fixture(lines: &[&str]) -> Result<Self> {
-        let mut child = std::process::Command::new("/bin/sh")
+        let mut command = std::process::Command::new("/bin/sh");
+        command
             .args([
                 "-c",
                 "IFS= read -r frame; if [ \"$#\" -gt 0 ]; then printf '%s\\n' \"$@\"; fi; sleep 5",
@@ -82,38 +102,136 @@ impl AgentProcess {
             .args(lines)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .context("start sandbox protocol fixture")?;
+            .stderr(std::process::Stdio::null());
+        // SAFETY: see launch_fixture.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().context("start sandbox protocol fixture")?;
         let pid = child.id();
         let protocol_stdin = child.stdin.take();
-        let protocol_stdout = child.stdout.take().map(protocol_line_receiver);
+        let (protocol_stdout, protocol_reader) = protocol_reader_parts(child.stdout.take());
         Ok(Self {
             pid,
             child_pid: None,
             protocol_stdin,
             protocol_stdout,
+            protocol_reader,
             child,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn launch_protocol_eof_fixture() -> Result<Self> {
-        let mut child = std::process::Command::new("/bin/sh")
+        let mut command = std::process::Command::new("/bin/sh");
+        command
             .args(["-c", "IFS= read -r frame; exit 0"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: see launch_fixture.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command
             .spawn()
             .context("start sandbox protocol EOF fixture")?;
         let pid = child.id();
         let protocol_stdin = child.stdin.take();
-        let protocol_stdout = child.stdout.take().map(protocol_line_receiver);
+        let (protocol_stdout, protocol_reader) = protocol_reader_parts(child.stdout.take());
         Ok(Self {
             pid,
             child_pid: None,
             protocol_stdin,
             protocol_stdout,
+            protocol_reader,
+            child,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launch_raw_protocol_fixture(script: &str) -> Result<Self> {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: see launch_fixture.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command
+            .spawn()
+            .context("start raw sandbox protocol fixture")?;
+        let pid = child.id();
+        let protocol_stdin = child.stdin.take();
+        let (protocol_stdout, protocol_reader) = protocol_reader_parts(child.stdout.take());
+        Ok(Self {
+            pid,
+            child_pid: None,
+            protocol_stdin,
+            protocol_stdout,
+            protocol_reader,
+            child,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launch_recording_protocol_fixture(
+        lines: &[&str],
+        record_path: &Path,
+        descendant_pid_path: &Path,
+    ) -> Result<Self> {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "record=$1; descendant_file=$2; shift 2; sleep 30 & descendant=$!; printf '%s\\n' \"$descendant\" > \"$descendant_file\"; emitted=0; while IFS= read -r frame; do printf '%s\\n' \"$frame\" >> \"$record\"; if [ \"$emitted\" -eq 0 ]; then printf '%s\\n' \"$@\"; emitted=1; fi; done; wait \"$descendant\"",
+                "fixture",
+            ])
+            .arg(record_path)
+            .arg(descendant_pid_path)
+            .args(lines)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: see launch_fixture.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command
+            .spawn()
+            .context("start recording sandbox protocol fixture")?;
+        let pid = child.id();
+        let protocol_stdin = child.stdin.take();
+        let (protocol_stdout, protocol_reader) = protocol_reader_parts(child.stdout.take());
+        Ok(Self {
+            pid,
+            child_pid: None,
+            protocol_stdin,
+            protocol_stdout,
+            protocol_reader,
             child,
         })
     }
@@ -136,14 +254,19 @@ impl AgentProcess {
             .context("write sandbox protocol frame")
     }
 
+    pub(crate) fn protocol_channel_available(&self) -> bool {
+        self.protocol_stdin.is_some() && self.protocol_stdout.is_some()
+    }
+
     /// Drains complete JSONL frames already emitted by the child. Reading is
     /// performed by a dedicated thread so registry polling never blocks.
-    pub fn drain_protocol_lines(&mut self) -> Result<Vec<String>> {
+    pub(crate) fn drain_protocol_lines(&mut self) -> Result<ProtocolDrain> {
         let receiver = self
             .protocol_stdout
             .as_ref()
             .context("sandbox protocol stdout is unavailable")?;
         let mut lines = Vec::new();
+        let mut disconnected = false;
         loop {
             match receiver.try_recv() {
                 Ok(ProtocolFrame::Line(line)) => lines.push(line),
@@ -151,13 +274,16 @@ impl AgentProcess {
                     anyhow::bail!("sandbox protocol stdout emitted an invalid or oversized frame")
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) if lines.is_empty() => {
-                    anyhow::bail!("sandbox protocol stdout disconnected")
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
                 }
-                Err(mpsc::TryRecvError::Disconnected) => break,
             }
         }
-        Ok(lines)
+        Ok(ProtocolDrain {
+            lines,
+            disconnected,
+        })
     }
 
     /// Prueft ob der Prozess noch laeuft.
@@ -167,6 +293,21 @@ impl AgentProcess {
 
     /// Terminates and reaps the child process owned by this handle.
     pub fn terminate(&mut self) {
+        self.terminate_process_group();
+        self.join_protocol_reader();
+    }
+
+    pub(crate) fn terminate_process_group(&mut self) {
+        self.protocol_stdin.take();
+        self.protocol_stdout.take();
+        if let Ok(group) = i32::try_from(self.pid) {
+            // Every AgentProcess is launched as its own process-group leader.
+            // Signal the group even if the tracked leader has already exited,
+            // because a descendant may still own stdout or other resources.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
         match self.child.try_wait() {
             Ok(Some(_status)) => {}
             Ok(None) => {
@@ -176,22 +317,21 @@ impl AgentProcess {
             Err(_) => {}
         }
     }
+
+    pub(crate) fn join_protocol_reader(&mut self) {
+        if let Some(reader) = self.protocol_reader.take() {
+            let _ = reader.join();
+        }
+    }
 }
 
 impl Drop for AgentProcess {
     fn drop(&mut self) {
-        // Reap the child process to prevent zombies.
-        // try_wait() is non-blocking — if the child is still running,
-        // --die-with-parent will handle cleanup when the daemon exits.
-        match self.child.try_wait() {
-            Ok(Some(_status)) => {} // Already exited, reaped by try_wait
-            Ok(None) => {
-                // Still running — let --die-with-parent handle it.
-                // We intentionally do NOT kill the child here, because
-                // the daemon might be shutting down gracefully.
-            }
-            Err(_) => {} // Error checking status, nothing we can do
-        }
+        // The runtime's normal teardown joins the reader after cgroup cleanup.
+        // Drop still closes pipes and kills/reaps the owned process group, but
+        // does not risk blocking forever on a descendant that escaped that
+        // group while remaining in the production cgroup.
+        self.terminate_process_group();
     }
 }
 
@@ -542,7 +682,7 @@ impl SandboxEnforcer {
         let pid = child.id();
         let child_pid = spawned.child_pid;
         let protocol_stdin = child.stdin.take();
-        let protocol_stdout = child.stdout.take().map(protocol_line_receiver);
+        let (protocol_stdout, protocol_reader) = protocol_reader_parts(child.stdout.take());
 
         // Add bwrap process to agent's cgroup (supervisor PID — children inherit
         // the cgroup; this is correct for cgroups, unlike netns which needs the
@@ -563,6 +703,7 @@ impl SandboxEnforcer {
             child_pid,
             protocol_stdin,
             protocol_stdout,
+            protocol_reader,
             child,
         })
     }
@@ -643,9 +784,26 @@ impl SandboxEnforcer {
     }
 }
 
-fn protocol_line_receiver(stdout: std::process::ChildStdout) -> Receiver<ProtocolFrame> {
+fn protocol_reader_parts(
+    stdout: Option<std::process::ChildStdout>,
+) -> (
+    Option<Receiver<ProtocolFrame>>,
+    Option<std::thread::JoinHandle<()>>,
+) {
+    match stdout {
+        Some(stdout) => {
+            let (receiver, reader) = protocol_line_receiver(stdout);
+            (Some(receiver), Some(reader))
+        }
+        None => (None, None),
+    }
+}
+
+fn protocol_line_receiver(
+    stdout: std::process::ChildStdout,
+) -> (Receiver<ProtocolFrame>, std::thread::JoinHandle<()>) {
     let (sender, receiver) = mpsc::sync_channel(PROTOCOL_QUEUE_DEPTH);
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         loop {
             let mut bytes = Vec::new();
@@ -697,7 +855,7 @@ fn protocol_line_receiver(stdout: std::process::ChildStdout) -> Receiver<Protoco
             }
         }
     });
-    receiver
+    (receiver, reader)
 }
 
 /// Returns the expected path for the landlock-wrapper binary.
