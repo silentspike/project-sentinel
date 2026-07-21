@@ -14,7 +14,7 @@
 # Docker — full setup runs on a privileged VM, see docs/governance.md):
 #   - bwrap / Landlock per-agent isolation
 #   - cgroups v2 per-agent resource caps
-#   - network namespaces + nftables egress filtering
+#   - per-agent full-cage network namespaces (loopback only)
 #   - eBPF probes (CAP_BPF + bpf-fs not available)
 #   - sentinel-fs CAS-FUSE (no /dev/fuse access)
 #   - Zenoh SHM transport (cross-namespace SHM does not work)

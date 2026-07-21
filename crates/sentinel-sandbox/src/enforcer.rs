@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
-use crate::bwrap::BwrapConfig;
+use crate::bwrap::{terminate_sandbox_process, BwrapConfig, SpawnedSandbox};
 use crate::cgroups::{self, CgroupLimits, PsiMetrics};
 use crate::landlock;
 
@@ -52,13 +52,17 @@ impl AgentProcess {
 
     /// Terminates and reaps the child process owned by this handle.
     pub fn terminate(&mut self) {
-        match self.child.try_wait() {
-            Ok(Some(_status)) => {}
-            Ok(None) => {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-            }
-            Err(_) => {}
+        terminate_sandbox_process(&mut self.child, self.child_pid);
+    }
+}
+
+impl From<SpawnedSandbox> for AgentProcess {
+    fn from(spawned: SpawnedSandbox) -> Self {
+        let pid = spawned.child.id();
+        Self {
+            pid,
+            child_pid: spawned.child_pid,
+            child: spawned.child,
         }
     }
 }
@@ -422,10 +426,9 @@ impl SandboxEnforcer {
             command.to_vec()
         };
 
-        let spawned = config.spawn(&wrapped_command)?;
-        let child = spawned.child;
-        let pid = child.id();
-        let child_pid = spawned.child_pid;
+        let process = AgentProcess::from(config.spawn(&wrapped_command)?);
+        let pid = process.pid;
+        let child_pid = process.child_pid;
 
         // Add bwrap process to agent's cgroup (supervisor PID — children inherit
         // the cgroup; this is correct for cgroups, unlike netns which needs the
@@ -441,11 +444,7 @@ impl SandboxEnforcer {
             pid, child_pid, "bwrap process started, returning AgentProcess handle"
         );
 
-        Ok(AgentProcess {
-            pid,
-            child_pid,
-            child,
-        })
+        Ok(process)
     }
 
     /// Verifies that the sandboxed agent process runs in its own network

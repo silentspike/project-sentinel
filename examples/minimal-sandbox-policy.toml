@@ -5,7 +5,7 @@
 # when an agent is spawned. Copy + adapt for your workload.
 #
 # Use-case: one agent process, one sandbox stack (bwrap + Landlock + cgroups
-# v2 + netns). Drop into config/ next to an agent TOML to override
+# v2 + a full-cage network namespace). Drop into config/ next to an agent TOML to override
 # per-agent. See the SandboxEnforcer
 # (`crates/sentinel-sandbox/src/enforcer.rs`) for how these fields are
 # applied at boot.
@@ -19,7 +19,8 @@
 # Expected outcome: agent process runs with FS reads restricted to
 # `read_paths`, FS writes restricted to `write_paths`, exec restricted to
 # `exec_paths`, CPU capped to one core, memory capped to 256 MB, fork
-# bomb prevented at 50 PIDs, network in its own namespace.
+# bomb prevented at 50 PIDs, and network restricted to an isolated
+# loopback-only namespace.
 
 [bwrap]
 hostname        = "sentinel-agent"
@@ -33,7 +34,6 @@ readonly_binds = [
   ["/usr",     "/usr"],   # system binaries (exec_paths target)
   ["/lib",     "/lib"],   # shared libs
   ["/lib64",   "/lib64"], # shared libs
-  ["/etc/ssl", "/etc/ssl"], # for HTTPS to LLM gateway
 ]
 
 # Writable binds (host -> guest path)
@@ -46,7 +46,7 @@ tmpfs = ["/tmp", "/run"]
 
 [landlock]
 # Filesystem read access — kernel-level enforcement.
-read_paths = ["/usr", "/lib", "/lib64", "/etc/ssl", "/home/agent"]
+read_paths = ["/usr", "/lib", "/lib64", "/home/agent"]
 
 # Filesystem write access. Note: Landlock grants `all_access` on
 # `write_paths`, INCLUDING execute. The bwrap mount namespace is the
@@ -73,10 +73,3 @@ pids_max = 50
 # I/O throttling.
 io_max_iops = 300
 io_max_bps  = 10485760     # 10 * 1024 * 1024 = 10 MB/s
-
-[netns]
-# Per-agent network namespace. Agent only sees lo + the explicitly
-# bridged interface to the gateway.
-mode      = "isolated"
-gateway_addr = "10.42.0.1"
-agent_subnet = "10.42.0.0/16"
