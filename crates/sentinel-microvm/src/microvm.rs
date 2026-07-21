@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Result};
 use sentinel_common::nano_runtime::{
-    ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle, NanoHealth,
-    NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime, NanoSnapshot,
-    NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_MICROVM,
+    ensure_handle_instance, ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle,
+    NanoHealth, NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime,
+    NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_MICROVM,
 };
 use serde::{Deserialize, Serialize};
 
@@ -74,6 +74,7 @@ struct MicrovmSnapshotPayload {
 }
 
 struct MicrovmWorkloadState {
+    instance_id: uuid::Uuid,
     workload: NanoWorkloadSpec,
 }
 
@@ -151,15 +152,48 @@ impl MicrovmNanoRuntime {
     }
 
     fn teardown_workload(&mut self, workload_id: &str) -> Result<bool> {
-        let mut stopped = false;
-        if let Some(mut proc) = self.processes.remove(workload_id) {
-            stopped = true;
-            proc.terminate();
+        let stopped = self.processes.contains_key(workload_id)
+            || self.workloads.contains_key(workload_id)
+            || self.api_sock_path(workload_id).exists()
+            || self.vsock_uds_path(workload_id).exists();
+        if let Some(proc) = self.processes.get_mut(workload_id) {
+            proc.terminate()?;
         }
-        stopped |= Self::remove_runtime_file(&self.api_sock_path(workload_id))?;
-        stopped |= Self::remove_runtime_file(&self.vsock_uds_path(workload_id))?;
-        stopped |= self.workloads.remove(workload_id).is_some();
+        Self::remove_runtime_file(&self.api_sock_path(workload_id))?;
+        Self::remove_runtime_file(&self.vsock_uds_path(workload_id))?;
+        self.processes.remove(workload_id);
+        self.workloads.remove(workload_id);
         Ok(stopped)
+    }
+
+    fn ensure_runtime_paths_available(&self, workload_id: &str) -> Result<()> {
+        let runtime_name = sanitize(workload_id);
+        if let Some(existing) = self
+            .workloads
+            .keys()
+            .find(|existing| existing.as_str() != workload_id && sanitize(existing) == runtime_name)
+        {
+            return Err(anyhow!(
+                "microVM workload '{}' collides with active workload '{}' after path sanitization",
+                workload_id,
+                existing
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_snapshot_identity(
+        snapshot_workload_id: &str,
+        workload: &NanoWorkloadSpec,
+    ) -> Result<()> {
+        if workload.workload_id != snapshot_workload_id {
+            return Err(anyhow!(
+                "microVM snapshot workload '{}' does not match envelope '{}'",
+                workload.workload_id,
+                snapshot_workload_id
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -194,16 +228,28 @@ impl NanoRuntime for MicrovmNanoRuntime {
         if workload.workload_id.is_empty() {
             return Err(anyhow!("microVM workload requires workload_id"));
         }
+        if self.workloads.contains_key(&workload.workload_id)
+            || self.processes.contains_key(&workload.workload_id)
+        {
+            return Err(anyhow!(
+                "microVM workload '{}' is already active",
+                workload.workload_id
+            ));
+        }
+        self.ensure_runtime_paths_available(&workload.workload_id)?;
         let proc = self.boot_fresh(&workload.workload_id)?;
         let pid = proc.pid();
+        let instance_id = uuid::Uuid::new_v4();
         self.processes.insert(workload.workload_id.clone(), proc);
         self.workloads.insert(
             workload.workload_id.clone(),
             MicrovmWorkloadState {
+                instance_id,
                 workload: workload.clone(),
             },
         );
         Ok(NanoHandle {
+            instance_id,
             runtime_key: RUNTIME_MICROVM.to_string(),
             workload_id: workload.workload_id,
             agent_id: workload.agent_id,
@@ -213,6 +259,9 @@ impl NanoRuntime for MicrovmNanoRuntime {
 
     fn stop(&mut self, handle: &NanoHandle) -> Result<NanoStopResult> {
         ensure_handle_runtime(handle, self.runtime_key())?;
+        if let Some(state) = self.workloads.get(&handle.workload_id) {
+            ensure_handle_instance(handle, state.instance_id)?;
+        }
         Ok(NanoStopResult::new(
             self.runtime_key(),
             &handle.workload_id,
@@ -297,8 +346,10 @@ impl NanoRuntime for MicrovmNanoRuntime {
             ));
         }
         let payload: MicrovmSnapshotPayload = serde_json::from_value(snapshot.payload)?;
+        Self::ensure_snapshot_identity(&snapshot.workload_id, &payload.workload)?;
         firecracker::ensure_kvm_available()?;
 
+        self.ensure_runtime_paths_available(&snapshot.workload_id)?;
         self.teardown_workload(&snapshot.workload_id)?;
         std::fs::create_dir_all(&self.config.work_dir)?;
 
@@ -309,16 +360,19 @@ impl NanoRuntime for MicrovmNanoRuntime {
         let _ = std::fs::remove_file(self.vsock_uds_path(&snapshot.workload_id));
         firecracker::load_snapshot(&sock, &payload.snapshot_path, &payload.mem_file_path, true)?;
         let pid = proc.pid();
+        let instance_id = uuid::Uuid::new_v4();
 
         self.processes.insert(snapshot.workload_id.clone(), proc);
         self.workloads.insert(
             snapshot.workload_id.clone(),
             MicrovmWorkloadState {
+                instance_id,
                 workload: payload.workload,
             },
         );
 
         Ok(NanoHandle {
+            instance_id,
             runtime_key: self.runtime_key().to_string(),
             workload_id: snapshot.workload_id,
             agent_id: snapshot.agent_id,
@@ -394,6 +448,7 @@ fn sanitize(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::FileTypeExt;
 
     fn fixture_workload(workload_id: &str, agent_id: u16) -> NanoWorkloadSpec {
         NanoWorkloadSpec {
@@ -416,12 +471,18 @@ mod tests {
         let api_sock = runtime.api_sock_path(&workload_id);
         let process = FirecrackerProcess::launch_fixture(&api_sock).unwrap();
         let pid = process.pid();
+        let instance_id = uuid::Uuid::new_v4();
         std::fs::write(runtime.vsock_uds_path(&workload_id), b"fixture vsock").unwrap();
-        runtime
-            .workloads
-            .insert(workload_id.clone(), MicrovmWorkloadState { workload });
+        runtime.workloads.insert(
+            workload_id.clone(),
+            MicrovmWorkloadState {
+                instance_id,
+                workload,
+            },
+        );
         runtime.processes.insert(workload_id.clone(), process);
         NanoHandle {
+            instance_id,
             runtime_key: RUNTIME_MICROVM.to_string(),
             workload_id,
             agent_id: None,
@@ -433,6 +494,33 @@ mod tests {
     fn sanitize_makes_paths_safe() {
         assert_eq!(sanitize("ecs-world-migrate-123"), "ecs-world-migrate-123");
         assert_eq!(sanitize("agent/01:weird"), "agent_01_weird");
+    }
+
+    #[test]
+    fn path_alias_duplicate_is_rejected_without_touching_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = MicrovmConfig {
+            work_dir: temp.path().to_string_lossy().into_owned(),
+            ..MicrovmConfig::default()
+        };
+        let mut runtime = MicrovmNanoRuntime::with_config(config);
+        let owner = insert_fixture(&mut runtime, fixture_workload("fixture/a", 1));
+
+        assert!(runtime.ensure_runtime_paths_available("fixture_a").is_err());
+        assert!(runtime.processes.contains_key(&owner.workload_id));
+        assert!(runtime.workloads.contains_key(&owner.workload_id));
+        assert_eq!(
+            runtime.stop(&owner).unwrap().outcome,
+            sentinel_common::nano_runtime::NanoStopOutcome::Stopped
+        );
+    }
+
+    #[test]
+    fn restore_rejects_mismatched_workload_identity_before_kvm_or_mutation() {
+        let payload = fixture_workload("payload-workload", 1);
+        assert!(
+            MicrovmNanoRuntime::ensure_snapshot_identity("envelope-workload", &payload).is_err()
+        );
     }
 
     #[test]
@@ -461,6 +549,17 @@ mod tests {
         let mut runtime = MicrovmNanoRuntime::with_config(config);
         let handle_a = insert_fixture(&mut runtime, fixture_workload("fixture-a", 1));
         let handle_b = insert_fixture(&mut runtime, fixture_workload("fixture-b", 2));
+        assert!(
+            std::fs::metadata(runtime.api_sock_path(&handle_a.workload_id))
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        let stale_for_b = NanoHandle {
+            instance_id: handle_a.instance_id,
+            ..handle_b.clone()
+        };
+        assert!(runtime.stop(&stale_for_b).is_err());
         let snapshot_file = runtime
             .snapshot_dir(&handle_a.workload_id)
             .join("retained.state");
@@ -494,5 +593,35 @@ mod tests {
             runtime.stop(&handle_b).unwrap().outcome,
             sentinel_common::nano_runtime::NanoStopOutcome::Stopped
         );
+    }
+
+    #[test]
+    fn failed_socket_cleanup_retains_ownership_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = MicrovmConfig {
+            work_dir: temp.path().to_string_lossy().into_owned(),
+            ..MicrovmConfig::default()
+        };
+        let mut runtime = MicrovmNanoRuntime::with_config(config);
+        let handle = insert_fixture(&mut runtime, fixture_workload("fixture-retry", 1));
+        let vsock_path = runtime.vsock_uds_path(&handle.workload_id);
+        std::fs::remove_file(&vsock_path).unwrap();
+        std::fs::create_dir(&vsock_path).unwrap();
+
+        assert!(runtime.stop(&handle).is_err());
+        assert!(runtime.processes.contains_key(&handle.workload_id));
+        assert!(runtime.workloads.contains_key(&handle.workload_id));
+        assert!(!runtime.api_sock_path(&handle.workload_id).exists());
+        assert!(std::fs::metadata(&vsock_path).unwrap().file_type().is_dir());
+
+        std::fs::remove_dir(&vsock_path).unwrap();
+        assert_eq!(
+            runtime.stop(&handle).unwrap().outcome,
+            sentinel_common::nano_runtime::NanoStopOutcome::Stopped
+        );
+        assert!(!runtime.processes.contains_key(&handle.workload_id));
+        assert!(!runtime.workloads.contains_key(&handle.workload_id));
+        assert!(!runtime.api_sock_path(&handle.workload_id).exists());
+        assert!(!vsock_path.exists());
     }
 }

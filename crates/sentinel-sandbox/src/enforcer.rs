@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::bwrap::{terminate_sandbox_process, BwrapConfig, SpawnedSandbox};
@@ -70,6 +70,28 @@ impl AgentProcess {
     /// Terminates and reaps the child process owned by this handle.
     pub fn terminate(&mut self) {
         terminate_sandbox_process(&mut self.child, self.child_pid);
+    }
+
+    /// Terminates and reaps the child, surfacing incomplete cleanup so the
+    /// NanoRuntime can retain ownership and retry instead of forgetting a live
+    /// sandbox process.
+    pub fn terminate_checked(&mut self) -> Result<()> {
+        self.terminate();
+        match self
+            .child
+            .try_wait()
+            .context("query sandbox supervisor after termination")?
+        {
+            Some(_) => {}
+            None => bail!(
+                "sandbox supervisor {} remained alive after termination",
+                self.pid
+            ),
+        }
+        if self.child_pid.is_some_and(pid_exists) {
+            bail!("sandboxed child remained alive after termination");
+        }
+        Ok(())
     }
 }
 

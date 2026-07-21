@@ -4770,6 +4770,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -4889,6 +4890,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -4915,6 +4917,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+ "uuid",
  "wasmtime",
  "wasmtime-wasi",
 ]
