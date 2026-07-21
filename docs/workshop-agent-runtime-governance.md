@@ -54,7 +54,7 @@ independent control planes.
   ┌──────────────────────────────────────────────────────────┐
   │  Sandbox stack (per agent, kernel-enforced)              │
   │  bwrap (user-ns) · Landlock LSM · cgroups v2 ·           │
-  │  netns + nftables · Wasmtime tool runtime                │
+  │  full-cage netns · Wasmtime tool runtime                │
   └──────────────────────────────────────────────────────────┘
          │ stdin/stdout JSON · audited stream
          ▼
@@ -98,8 +98,9 @@ pasteable file in [`examples/`](../examples/).
 ### Exercise A — Sandbox-policy inspection (5 min)
 
 Open [`examples/minimal-sandbox-policy.toml`](../examples/minimal-sandbox-policy.toml).
-Walk through the four blocks (`[bwrap]`, `[landlock]`, `[cgroups]`,
-`[netns]`) and identify which kernel primitive enforces what. The TOML
+Walk through the three blocks (`[bwrap]`, `[landlock]`, and `[cgroups]`)
+and identify which kernel primitive enforces what. The bwrap
+`share_net = false` setting creates the loopback-only network cage. The TOML
 mirrors the production defaults at `crates/sentinel-sandbox/src/`.
 
 ### Exercise B — Event-stream replay (5 min)
@@ -162,8 +163,9 @@ Cover the limits explicitly:
   table](../README.md#what-the-docker-demo-shows--and-what-it-does-not)
   lists this row-by-row.
 - **Production runs on a provisioned VM**, not in a container. The full
-  sandbox stack assumes user namespaces, `CAP_BPF`, `CAP_SYS_ADMIN`,
-  `CAP_NET_ADMIN`, and a writeable bpf-fs / `/dev/fuse`.
+  sandbox stack assumes user namespaces, cgroups v2, `CAP_BPF`, and a
+  writeable bpf-fs / `/dev/fuse` as applicable. The full-cage network
+  model needs no bridge, veth pair, nftables rules, or `CAP_NET_ADMIN`.
 - **Synthesis intercept rate ~70%** is measured on the demo workload;
   your mileage will vary by prompt distribution.
 - **No multi-tenant company configs yet** ([#266](https://github.com/silentspike/project-sentinel/issues/266));
