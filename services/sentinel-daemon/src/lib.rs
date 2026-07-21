@@ -33,3 +33,4 @@ pub mod service_health;
 pub mod shift;
 pub mod signal;
 pub mod snapshot;
+pub mod workflow_api;
