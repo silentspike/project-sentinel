@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::bwrap::{terminate_sandbox_process, BwrapConfig, SpawnedSandbox};
@@ -40,6 +40,23 @@ pub struct AgentProcess {
 }
 
 impl AgentProcess {
+    #[cfg(test)]
+    pub(crate) fn launch_fixture() -> Result<Self> {
+        let child = std::process::Command::new("/usr/bin/sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("start sandbox lifecycle fixture")?;
+        let pid = child.id();
+        Ok(Self {
+            pid,
+            child_pid: None,
+            child,
+        })
+    }
+
     /// Nimmt den stdin-Handle fuer stream-json Kommunikation (einmalig).
     pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
         self.child.stdin.take()
@@ -53,6 +70,28 @@ impl AgentProcess {
     /// Terminates and reaps the child process owned by this handle.
     pub fn terminate(&mut self) {
         terminate_sandbox_process(&mut self.child, self.child_pid);
+    }
+
+    /// Terminates and reaps the child, surfacing incomplete cleanup so the
+    /// NanoRuntime can retain ownership and retry instead of forgetting a live
+    /// sandbox process.
+    pub fn terminate_checked(&mut self) -> Result<()> {
+        self.terminate();
+        match self
+            .child
+            .try_wait()
+            .context("query sandbox supervisor after termination")?
+        {
+            Some(_) => {}
+            None => bail!(
+                "sandbox supervisor {} remained alive after termination",
+                self.pid
+            ),
+        }
+        if self.child_pid.is_some_and(pid_exists) {
+            bail!("sandboxed child remained alive after termination");
+        }
+        Ok(())
     }
 }
 
@@ -482,9 +521,8 @@ impl SandboxEnforcer {
         }
 
         if handle.cgroup_created {
-            if let Err(e) = cleanup_cgroup_after_process_exit(&handle.agent_name) {
-                warn!("Failed to remove cgroup for {}: {e}", handle.agent_name);
-            }
+            cleanup_cgroup_after_process_exit(&handle.agent_name)
+                .with_context(|| format!("remove sandbox cgroup for {}", handle.agent_name))?;
         }
 
         Ok(())
