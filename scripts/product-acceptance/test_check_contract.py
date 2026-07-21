@@ -60,8 +60,8 @@ class ContractValidatorTests(unittest.TestCase):
     def test_duplicate_delivery_issue_is_rejected(self) -> None:
         self.replace(
             MATRIX_REL,
-            "delivery_issues = [75, 472, 650, 693, 694, 695, 696]",
-            "delivery_issues = [75, 75, 472, 650, 693, 694, 695, 696]",
+            "delivery_issues = [75, 472, 650, 693, 694, 695, 696, 698]",
+            "delivery_issues = [75, 75, 472, 650, 693, 694, 695, 696, 698]",
         )
         self.assert_error(self.validate(), "matrix.delivery_issues")
 

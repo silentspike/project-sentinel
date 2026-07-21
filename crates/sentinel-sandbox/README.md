@@ -13,7 +13,8 @@
 - `BwrapNanoRuntime` implements the shared `NanoRuntime` contract for the
   `bwrap-landlock` key. Its `snapshot` captures workload config, isolation
   metadata, and agent-home filesystem state. It does not checkpoint process RAM
-  and does not claim CRIU/live-process migration.
+  and does not claim CRIU/live-process migration. Its idempotent `stop` releases
+  the addressed process, cgroup, retained home-snapshot pins, and adapter state.
 
 ## Dependencies
 
