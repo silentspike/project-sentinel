@@ -5,9 +5,17 @@
 //! (kleine JSON-Bodies, 2xx/4xx-Antworten), dass ein robuster Content-Length-Reader genuegt.
 
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(test)]
+use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -147,6 +155,10 @@ fn patch(sock: &Path, path: &str, body: &str) -> Result<()> {
 pub struct FirecrackerProcess {
     child: Child,
     api_sock: PathBuf,
+    #[cfg(test)]
+    fixture_stop: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    fixture_server: Option<JoinHandle<()>>,
 }
 
 impl FirecrackerProcess {
@@ -168,14 +180,22 @@ impl FirecrackerProcess {
             let mut proc = Self {
                 child,
                 api_sock: api_sock.to_path_buf(),
+                #[cfg(test)]
+                fixture_stop: None,
+                #[cfg(test)]
+                fixture_server: None,
             };
-            proc.terminate();
+            let _ = proc.terminate();
             return Err(e).context("Firecracker API-Socket erschien nicht nach dem Start");
         }
 
         Ok(Self {
             child,
             api_sock: api_sock.to_path_buf(),
+            #[cfg(test)]
+            fixture_stop: None,
+            #[cfg(test)]
+            fixture_server: None,
         })
     }
 
@@ -184,17 +204,56 @@ impl FirecrackerProcess {
         if let Some(parent) = api_sock.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(api_sock, b"fixture socket")?;
-        let child = Command::new("/usr/bin/sleep")
+        let listener = UnixListener::bind(api_sock).context("bind fixture API socket")?;
+        listener
+            .set_nonblocking(true)
+            .context("set fixture API socket nonblocking")?;
+        let fixture_stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&fixture_stop);
+        let fixture_server = std::thread::spawn(move || {
+            while !server_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        if server_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let mut request = [0u8; 4096];
+                        let _ = stream.read(&mut request);
+                        let body = r#"{"state":"Running"}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let child = match Command::new("/usr/bin/sleep")
             .arg("30")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .context("start Firecracker lifecycle fixture")?;
+        {
+            Ok(child) => child,
+            Err(error) => {
+                fixture_stop.store(true, Ordering::Release);
+                let _ = UnixStream::connect(api_sock);
+                let _ = fixture_server.join();
+                return Err(error).context("start Firecracker lifecycle fixture");
+            }
+        };
         Ok(Self {
             child,
             api_sock: api_sock.to_path_buf(),
+            fixture_stop: Some(fixture_stop),
+            fixture_server: Some(fixture_server),
         })
     }
 
@@ -207,17 +266,47 @@ impl FirecrackerProcess {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// Beendet den Prozess und raeumt den API-Socket auf (idempotent).
-    pub fn terminate(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.api_sock);
+    /// Beendet den Prozess, reap't ihn und raeumt den API-Socket auf.
+    ///
+    /// Fehler werden dem expliziten Stop-Pfad gemeldet, damit der Runtime-
+    /// Besitzer die Workload fuer einen Retry behalten kann. `Drop` bleibt
+    /// lediglich das best-effort Sicherheitsnetz.
+    pub fn terminate(&mut self) -> Result<()> {
+        match self
+            .child
+            .try_wait()
+            .context("query Firecracker process state")?
+        {
+            Some(_) => {}
+            None => {
+                self.child.kill().context("kill Firecracker process")?;
+                self.child.wait().context("reap Firecracker process")?;
+            }
+        }
+        #[cfg(test)]
+        if let Some(stop) = self.fixture_stop.take() {
+            stop.store(true, Ordering::Release);
+            let _ = UnixStream::connect(&self.api_sock);
+        }
+        #[cfg(test)]
+        if let Some(server) = self.fixture_server.take() {
+            server
+                .join()
+                .map_err(|_| anyhow!("Firecracker fixture server panicked"))?;
+        }
+        match std::fs::remove_file(&self.api_sock) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| {
+                format!("remove Firecracker API socket {}", self.api_sock.display())
+            }),
+        }
     }
 }
 
 impl Drop for FirecrackerProcess {
     fn drop(&mut self) {
-        self.terminate();
+        let _ = self.terminate();
     }
 }
 

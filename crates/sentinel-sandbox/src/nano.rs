@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use sentinel_common::nano_runtime::{
-    ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle, NanoHealth,
-    NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime, NanoSnapshot,
-    NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
+    ensure_handle_instance, ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle,
+    NanoHealth, NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime,
+    NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
 };
 use sentinel_fs::artifact::ArtifactPlane;
 use sentinel_fs::home_manifest::{self, HomeManifest, RestorePolicy};
@@ -27,6 +27,7 @@ struct BwrapSnapshotPayload {
 
 #[derive(Debug, Clone)]
 struct BwrapWorkloadState {
+    instance_id: uuid::Uuid,
     workload: NanoWorkloadSpec,
     command: Vec<String>,
     /// `ArtifactPlane` object ids pinning the chunks of this workload's last home
@@ -109,29 +110,85 @@ impl BwrapNanoRuntime {
     }
 
     fn teardown_workload(&mut self, workload_id: &str) -> Result<bool> {
-        let mut stopped = false;
-        if let Some(mut process) = self.processes.remove(workload_id) {
-            stopped = true;
-            process.terminate();
+        let stopped = self.processes.contains_key(workload_id)
+            || self.handles.contains_key(workload_id)
+            || self.workloads.contains_key(workload_id);
+        if let Some(process) = self.processes.get_mut(workload_id) {
+            process.terminate_checked()?;
         }
         if let Some(handle) = self.handles.get(workload_id).cloned() {
-            stopped = true;
             self.enforcer.teardown_agent(&handle)?;
-            self.handles.remove(workload_id);
         }
-        if let Some(state) = self.workloads.get(workload_id) {
-            if !state.owned_object_ids.is_empty() {
+        if let Some((agent_name, owned_object_ids)) = self.workloads.get(workload_id).map(|state| {
+            (
+                state.workload.agent_name.clone(),
+                state.owned_object_ids.clone(),
+            )
+        }) {
+            if !owned_object_ids.is_empty() {
                 let plane = self.open_plane()?;
-                home_manifest::release_manifest(&plane, &state.owned_object_ids)?;
+                home_manifest::release_manifest(&plane, &owned_object_ids)?;
             }
-            stopped |= Self::remove_marker(&state.workload.agent_name, workload_id)?;
+            Self::remove_marker(&agent_name, workload_id)?;
         }
-        stopped |= self.workloads.remove(workload_id).is_some();
+        self.processes.remove(workload_id);
+        self.handles.remove(workload_id);
+        self.workloads.remove(workload_id);
         Ok(stopped)
+    }
+
+    fn ensure_workload_available(&self, workload: &NanoWorkloadSpec) -> Result<()> {
+        if self.workloads.contains_key(&workload.workload_id)
+            || self.handles.contains_key(&workload.workload_id)
+            || self.processes.contains_key(&workload.workload_id)
+        {
+            return Err(anyhow!(
+                "bwrap workload '{}' is already active",
+                workload.workload_id
+            ));
+        }
+        if let Some(existing) = self
+            .workloads
+            .values()
+            .find(|state| state.workload.agent_name == workload.agent_name)
+        {
+            return Err(anyhow!(
+                "bwrap agent home '{}' is already owned by workload '{}'",
+                workload.agent_name,
+                existing.workload.workload_id
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_restore_target_available(
+        &self,
+        snapshot_workload_id: &str,
+        workload: &NanoWorkloadSpec,
+    ) -> Result<()> {
+        if workload.workload_id != snapshot_workload_id {
+            return Err(anyhow!(
+                "bwrap snapshot workload '{}' does not match envelope '{}'",
+                workload.workload_id,
+                snapshot_workload_id
+            ));
+        }
+        if let Some(existing) = self.workloads.values().find(|state| {
+            state.workload.workload_id != snapshot_workload_id
+                && state.workload.agent_name == workload.agent_name
+        }) {
+            return Err(anyhow!(
+                "bwrap agent home '{}' is already owned by workload '{}'",
+                workload.agent_name,
+                existing.workload.workload_id
+            ));
+        }
+        Ok(())
     }
 
     fn spawn_state(&mut self, state: BwrapWorkloadState) -> Result<NanoHandle> {
         let workload = state.workload.clone();
+        let instance_id = state.instance_id;
         let agent_name = workload.agent_name.clone();
         Self::write_marker(&agent_name, &workload.workload_id)?;
 
@@ -151,6 +208,7 @@ impl BwrapNanoRuntime {
         self.workloads.insert(workload.workload_id.clone(), state);
 
         Ok(NanoHandle {
+            instance_id,
             runtime_key: RUNTIME_BWRAP_LANDLOCK.to_string(),
             workload_id: workload.workload_id,
             agent_id: workload.agent_id,
@@ -191,7 +249,9 @@ impl NanoRuntime for BwrapNanoRuntime {
         if workload.agent_name.is_empty() {
             return Err(anyhow!("bwrap workload requires agent_name"));
         }
+        self.ensure_workload_available(&workload)?;
         let state = BwrapWorkloadState {
+            instance_id: uuid::Uuid::new_v4(),
             command: Self::command_for(&workload),
             workload,
             owned_object_ids: Vec::new(),
@@ -201,6 +261,9 @@ impl NanoRuntime for BwrapNanoRuntime {
 
     fn stop(&mut self, handle: &NanoHandle) -> Result<NanoStopResult> {
         ensure_handle_runtime(handle, self.runtime_key())?;
+        if let Some(state) = self.workloads.get(&handle.workload_id) {
+            ensure_handle_instance(handle, state.instance_id)?;
+        }
         Ok(NanoStopResult::new(
             self.runtime_key(),
             &handle.workload_id,
@@ -288,6 +351,7 @@ impl NanoRuntime for BwrapNanoRuntime {
             ));
         }
         let payload: BwrapSnapshotPayload = serde_json::from_value(snapshot.payload)?;
+        self.ensure_restore_target_available(&snapshot.workload_id, &payload.workload)?;
         self.teardown_workload(&snapshot.workload_id)?;
 
         // Rehydrate the agent home from the manifest (metadata-aware, V24 path
@@ -306,6 +370,7 @@ impl NanoRuntime for BwrapNanoRuntime {
         )?;
 
         self.spawn_state(BwrapWorkloadState {
+            instance_id: uuid::Uuid::new_v4(),
             workload: payload.workload,
             command: payload.command,
             owned_object_ids: Vec::new(),
@@ -409,12 +474,14 @@ mod tests {
         runtime.workloads.insert(
             workload_id.clone(),
             BwrapWorkloadState {
+                instance_id: uuid::Uuid::new_v4(),
                 workload,
                 command: Vec::new(),
                 owned_object_ids,
             },
         );
         NanoHandle {
+            instance_id: runtime.workloads[&workload_id].instance_id,
             runtime_key: RUNTIME_BWRAP_LANDLOCK.to_string(),
             workload_id,
             agent_id: None,
@@ -455,6 +522,12 @@ mod tests {
             owned_b.clone(),
         );
 
+        let stale_for_b = NanoHandle {
+            instance_id: handle_a.instance_id,
+            ..handle_b.clone()
+        };
+        assert!(runtime.stop(&stale_for_b).is_err());
+
         let stopped = runtime.stop(&handle_a).unwrap();
         assert_eq!(
             stopped.outcome,
@@ -491,6 +564,91 @@ mod tests {
         for object_id in owned_b {
             assert!(plane.get_object(object_id).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn failed_cleanup_retains_ownership_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let source_home = temp.path().join("retry-home");
+        std::fs::create_dir_all(&source_home).unwrap();
+        std::fs::write(source_home.join("owned.txt"), b"retry-owned content").unwrap();
+        let plane = runtime.open_plane().unwrap();
+        let owned_object_ids = home_manifest::walk_home(&source_home, &plane)
+            .unwrap()
+            .owned_object_ids;
+        assert!(!owned_object_ids.is_empty());
+        drop(plane);
+        let handle = insert_fixture(
+            &mut runtime,
+            fixture_workload("fixture-retry", "agent-fixture-retry"),
+            owned_object_ids.clone(),
+        );
+        BwrapNanoRuntime::write_marker("agent-fixture-retry", "different-workload").unwrap();
+
+        assert!(runtime.stop(&handle).is_err());
+        assert!(runtime.processes.contains_key(&handle.workload_id));
+        assert!(runtime.handles.contains_key(&handle.workload_id));
+        assert!(runtime.workloads.contains_key(&handle.workload_id));
+        let plane = runtime.open_plane().unwrap();
+        for object_id in &owned_object_ids {
+            assert!(plane.get_object(*object_id).unwrap().is_none());
+        }
+        drop(plane);
+
+        BwrapNanoRuntime::write_marker("agent-fixture-retry", &handle.workload_id).unwrap();
+        assert_eq!(
+            runtime.stop(&handle).unwrap().outcome,
+            sentinel_common::nano_runtime::NanoStopOutcome::Stopped
+        );
+        assert!(!runtime.processes.contains_key(&handle.workload_id));
+        assert!(!runtime.handles.contains_key(&handle.workload_id));
+        assert!(!runtime.workloads.contains_key(&handle.workload_id));
+    }
+
+    #[test]
+    fn duplicate_agent_home_is_rejected_without_touching_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let owner = insert_fixture(
+            &mut runtime,
+            fixture_workload("fixture-owner", "shared-agent-home"),
+            Vec::new(),
+        );
+        let alias = fixture_workload("fixture-alias", "shared-agent-home");
+
+        assert!(runtime.ensure_workload_available(&alias).is_err());
+        assert!(runtime
+            .ensure_restore_target_available(&alias.workload_id, &alias)
+            .is_err());
+        assert!(runtime.processes.contains_key(&owner.workload_id));
+        assert!(runtime.workloads.contains_key(&owner.workload_id));
+        assert_eq!(
+            runtime.stop(&owner).unwrap().outcome,
+            sentinel_common::nano_runtime::NanoStopOutcome::Stopped
+        );
+    }
+
+    #[test]
+    fn restore_rejects_mismatched_workload_identity_without_touching_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let owner = insert_fixture(
+            &mut runtime,
+            fixture_workload("fixture-owner", "fixture-owner-home"),
+            Vec::new(),
+        );
+        let payload = fixture_workload("payload-workload", "payload-home");
+
+        assert!(runtime
+            .ensure_restore_target_available("envelope-workload", &payload)
+            .is_err());
+        assert!(runtime.processes.contains_key(&owner.workload_id));
+        assert!(runtime.workloads.contains_key(&owner.workload_id));
+        assert_eq!(
+            runtime.stop(&owner).unwrap().outcome,
+            sentinel_common::nano_runtime::NanoStopOutcome::Stopped
+        );
     }
 
     /// N5 + AC-1 at the adapter level: the bwrap snapshot representation is a
