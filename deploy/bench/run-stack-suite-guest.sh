@@ -187,7 +187,6 @@ for run in $(seq 1 "${RUNS}"); do
       --proc /proc \
       --dev /dev \
       --unshare-all \
-      --share-net \
       -- /bin/true
   done
   end_ns="$(date +%s%N)"
