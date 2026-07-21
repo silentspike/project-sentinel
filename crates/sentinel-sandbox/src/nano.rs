@@ -362,19 +362,22 @@ impl BwrapNanoRuntime {
         Ok(pids)
     }
 
-    fn signal_workload(&self, workload_id: &str, signal: i32) -> Result<usize> {
+    fn signal_workload(
+        &self,
+        workload_id: &str,
+        signal: nix::sys::signal::Signal,
+    ) -> Result<usize> {
         let pids = self.workload_pids(workload_id)?;
         for pid in &pids {
-            // SAFETY: libc::kill does not dereference memory. The PID belongs to
-            // this exact adapter-owned workload and the signal is fixed by the
-            // caller to SIGSTOP or SIGCONT.
-            let result = unsafe { libc::kill(*pid as i32, signal) };
-            if result != 0 && std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("signal {signal} to bwrap PID {pid}"));
+            let result = nix::sys::signal::kill(nix::unistd::Pid::from_raw(*pid as i32), signal);
+            if let Err(error) = result {
+                if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                    return Err(error)
+                        .with_context(|| format!("signal {signal:?} to bwrap PID {pid}"));
+                }
             }
         }
-        let expect_stopped = signal == libc::SIGSTOP;
+        let expect_stopped = signal == nix::sys::signal::Signal::SIGSTOP;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let states = pids
@@ -822,8 +825,8 @@ impl NanoRuntime for BwrapNanoRuntime {
         };
         let affected_units = if should_apply {
             let signal = match action {
-                NanoRuntimeControlAction::Suspend => libc::SIGSTOP,
-                NanoRuntimeControlAction::Resume => libc::SIGCONT,
+                NanoRuntimeControlAction::Suspend => nix::sys::signal::Signal::SIGSTOP,
+                NanoRuntimeControlAction::Resume => nix::sys::signal::Signal::SIGCONT,
             };
             let affected = self.signal_workload(&handle.workload_id, signal)?;
             if let Some(state) = self.workloads.get_mut(&handle.workload_id) {
