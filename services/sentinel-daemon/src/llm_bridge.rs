@@ -1730,7 +1730,7 @@ pub mod bridge {
             assert!(breaker.is_open());
             assert!(open_signal.load(Ordering::Relaxed));
 
-            std::thread::sleep(Duration::from_millis(2));
+            breaker.last_failure = Some(Instant::now() - Duration::from_millis(2));
             assert!(!breaker.is_open());
             assert!(!open_signal.load(Ordering::Relaxed));
 
