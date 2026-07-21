@@ -202,7 +202,7 @@ impl AgentProcess {
         command
             .args([
                 "-c",
-                "record=$1; descendant_file=$2; shift 2; sleep 30 & descendant=$!; printf '%s\\n' \"$descendant\" > \"$descendant_file\"; emitted=0; while IFS= read -r frame; do printf '%s\\n' \"$frame\" >> \"$record\"; if [ \"$emitted\" -eq 0 ]; then printf '%s\\n' \"$@\"; emitted=1; fi; done; wait \"$descendant\"",
+                "record=$1; descendant_file=$2; shift 2; sleep 30 & descendant=$!; printf '%s\\n' \"$descendant\" > \"$descendant_file\"; emitted=0; while IFS= read -r frame; do printf '%s\\n' \"$frame\" >> \"$record\"; if [ \"$emitted\" -eq 0 ]; then if [ \"$#\" -gt 0 ]; then printf '%s\\n' \"$@\"; fi; emitted=1; fi; done; wait \"$descendant\"",
                 "fixture",
             ])
             .arg(record_path)
@@ -243,6 +243,16 @@ impl AgentProcess {
 
     /// Sends one bounded JSONL protocol frame to the sandboxed child.
     pub fn send_protocol_line(&mut self, line: &str) -> Result<()> {
+        if line.len() > PROTOCOL_LINE_LIMIT_BYTES {
+            anyhow::bail!("sandbox protocol input exceeded its configured bound");
+        }
+        if line
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b'\n' | b'\r'))
+        {
+            anyhow::bail!("sandbox protocol input must contain exactly one JSONL record");
+        }
         let stdin = self
             .protocol_stdin
             .as_mut()

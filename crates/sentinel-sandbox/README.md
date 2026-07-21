@@ -18,7 +18,8 @@
   Its workbench exec channel uses schema-versioned, nonblocking start/poll/cancel
   JSONL exchanges, binds every response to one invocation and byte-exact start
   digest, and retains bounded terminal results for retry-safe polling. Frames are
-  limited to 1 MiB, retained output to 256 KiB, and the reader queue to 64 frames.
+  limited to 1 MiB, retained output to 256 KiB, and the reader queue to 64 frames;
+  each control input must be exactly one record without embedded CR/LF boundaries.
   Protocol/order/correlation failures, overflow, EOF, and an unacknowledged cancel
   or deadline terminate and reap the selected process group; production cgroup
   cleanup is the stronger process-tree backstop. Child frames and command
