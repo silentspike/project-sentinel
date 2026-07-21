@@ -68,6 +68,24 @@ pub struct NanoHandle {
     pub pid: Option<u32>,
 }
 
+/// Runtime-owned resources that the production orchestrator may observe without
+/// taking ownership away from the selected adapter.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NanoRuntimeResources {
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub child_pid: Option<u32>,
+    #[serde(default)]
+    pub cgroup_created: bool,
+    #[serde(default)]
+    pub io_available: bool,
+    #[serde(default)]
+    pub landlock_applied: bool,
+    #[serde(default)]
+    pub network_isolated: bool,
+}
+
 pub const NANO_STOP_RESULT_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +221,16 @@ pub trait NanoRuntime: Send {
         policy: NanoIsolationPolicy,
     ) -> Result<NanoIsolationReport>;
 
+    /// Return process/isolation resources for monitoring side effects. The
+    /// adapter remains their sole lifecycle owner.
+    fn resources(&self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        Ok(NanoRuntimeResources {
+            pid: handle.pid,
+            ..NanoRuntimeResources::default()
+        })
+    }
+
     fn migrate(&mut self, target: &mut dyn NanoRuntime, handle: &NanoHandle) -> Result<NanoHandle>
     where
         Self: Sized,
@@ -265,6 +293,10 @@ impl NanoRuntimeRegistry {
 
     pub fn stop(&mut self, handle: &NanoHandle) -> Result<NanoStopResult> {
         self.get_mut(&handle.runtime_key)?.stop(handle)
+    }
+
+    pub fn resources(&mut self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
+        self.get_mut(&handle.runtime_key)?.resources(handle)
     }
 }
 

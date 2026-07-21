@@ -14,6 +14,11 @@ path = "src/lib.rs"
 name = "sentinel-daemon"
 path = "src/main.rs"
 
+[[bin]]
+name = "nano_runtime_bench"
+path = "src/bin/nano_runtime_bench.rs"
+required-features = ["wasm"]
+
 [dependencies]
 sentinel-common = { path = "../../crates/sentinel-common" }
 sentinel-cluster-control = { path = "../../crates/sentinel-cluster-control" }
@@ -24,6 +29,7 @@ sentinel-zenoh = { path = "../../crates/sentinel-zenoh" }
 sentinel-limbo = { path = "../../crates/sentinel-limbo" }
 sentinel-redb = { path = "../../crates/sentinel-redb" }
 sentinel-sandbox = { path = "../../crates/sentinel-sandbox" }
+sentinel-microvm = { path = "../../crates/sentinel-microvm" }
 sentinel-telemetry = { path = "../../crates/sentinel-telemetry" }
 sentinel-ebpf = { path = "../../crates/sentinel-ebpf" }
 sentinel-hippocampus = { path = "../../crates/sentinel-hippocampus" }

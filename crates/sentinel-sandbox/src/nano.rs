@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
 use sentinel_common::nano_runtime::{
     ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle, NanoHealth,
-    NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime, NanoSnapshot,
-    NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
+    NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime, NanoRuntimeResources,
+    NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
 };
 use sentinel_fs::artifact::ArtifactPlane;
 use sentinel_fs::home_manifest::{self, HomeManifest, RestorePolicy};
@@ -63,6 +63,12 @@ impl BwrapNanoRuntime {
             handles: HashMap::new(),
             processes: HashMap::new(),
         }
+    }
+
+    /// Keep daemon FUSE routing identical when bwrap lifecycle ownership moves
+    /// behind the NanoRuntime adapter.
+    pub fn set_fs_mount(&mut self, mount: impl Into<String>) {
+        self.enforcer.set_fs_mount(mount.into());
     }
 
     /// Open (or create) the home-content `ArtifactPlane`. Called only on the
@@ -206,6 +212,26 @@ impl NanoRuntime for BwrapNanoRuntime {
             &handle.workload_id,
             self.teardown_workload(&handle.workload_id)?,
         ))
+    }
+
+    fn resources(&self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        let sandbox = self
+            .handles
+            .get(&handle.workload_id)
+            .ok_or_else(|| anyhow!("missing bwrap sandbox handle '{}'", handle.workload_id))?;
+        let process = self
+            .processes
+            .get(&handle.workload_id)
+            .ok_or_else(|| anyhow!("missing bwrap process '{}'", handle.workload_id))?;
+        Ok(NanoRuntimeResources {
+            pid: Some(process.pid),
+            child_pid: process.child_pid,
+            cgroup_created: sandbox.cgroup_created,
+            io_available: sandbox.io_available,
+            landlock_applied: sandbox.landlock_applied,
+            network_isolated: sandbox.network_isolated,
+        })
     }
 
     fn exec(&mut self, handle: &NanoHandle, request: NanoExecRequest) -> Result<NanoExecResult> {
