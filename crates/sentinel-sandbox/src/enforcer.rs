@@ -11,9 +11,11 @@
 //! 3. `start_agent_process()` — startet bwrap (spaeter: mit Landlock im Child)
 //! 4. `teardown_agent()` — beendet bwrap-Reste + entfernt cgroup
 
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, ChildStdin};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
@@ -21,6 +23,14 @@ use tracing::{debug, info, warn};
 use crate::bwrap::BwrapConfig;
 use crate::cgroups::{self, CgroupLimits, PsiMetrics};
 use crate::landlock;
+
+const PROTOCOL_LINE_LIMIT_BYTES: usize = 1024 * 1024;
+const PROTOCOL_QUEUE_DEPTH: usize = 64;
+
+enum ProtocolFrame {
+    Line(String),
+    Rejected,
+}
 
 /// Handle fuer einen laufenden Agent-Prozess in bwrap.
 ///
@@ -37,12 +47,14 @@ pub struct AgentProcess {
     pub child_pid: Option<u32>,
     /// Child handle — NICHT droppen solange Agent laufen soll.
     child: Child,
+    protocol_stdin: Option<ChildStdin>,
+    protocol_stdout: Option<Receiver<ProtocolFrame>>,
 }
 
 impl AgentProcess {
     #[cfg(test)]
     pub(crate) fn launch_fixture() -> Result<Self> {
-        let child = std::process::Command::new("/usr/bin/sleep")
+        let mut child = std::process::Command::new("/usr/bin/sleep")
             .arg("30")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -53,13 +65,99 @@ impl AgentProcess {
         Ok(Self {
             pid,
             child_pid: None,
+            protocol_stdin: child.stdin.take(),
+            protocol_stdout: None,
+            child,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launch_protocol_fixture(lines: &[&str]) -> Result<Self> {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "IFS= read -r frame; if [ \"$#\" -gt 0 ]; then printf '%s\\n' \"$@\"; fi; sleep 5",
+                "fixture",
+            ])
+            .args(lines)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("start sandbox protocol fixture")?;
+        let pid = child.id();
+        let protocol_stdin = child.stdin.take();
+        let protocol_stdout = child.stdout.take().map(protocol_line_receiver);
+        Ok(Self {
+            pid,
+            child_pid: None,
+            protocol_stdin,
+            protocol_stdout,
+            child,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launch_protocol_eof_fixture() -> Result<Self> {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "IFS= read -r frame; exit 0"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("start sandbox protocol EOF fixture")?;
+        let pid = child.id();
+        let protocol_stdin = child.stdin.take();
+        let protocol_stdout = child.stdout.take().map(protocol_line_receiver);
+        Ok(Self {
+            pid,
+            child_pid: None,
+            protocol_stdin,
+            protocol_stdout,
             child,
         })
     }
 
     /// Nimmt den stdin-Handle fuer stream-json Kommunikation (einmalig).
     pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
-        self.child.stdin.take()
+        self.protocol_stdin.take()
+    }
+
+    /// Sends one bounded JSONL protocol frame to the sandboxed child.
+    pub fn send_protocol_line(&mut self, line: &str) -> Result<()> {
+        let stdin = self
+            .protocol_stdin
+            .as_mut()
+            .context("sandbox protocol stdin is unavailable")?;
+        stdin
+            .write_all(line.as_bytes())
+            .and_then(|_| stdin.write_all(b"\n"))
+            .and_then(|_| stdin.flush())
+            .context("write sandbox protocol frame")
+    }
+
+    /// Drains complete JSONL frames already emitted by the child. Reading is
+    /// performed by a dedicated thread so registry polling never blocks.
+    pub fn drain_protocol_lines(&mut self) -> Result<Vec<String>> {
+        let receiver = self
+            .protocol_stdout
+            .as_ref()
+            .context("sandbox protocol stdout is unavailable")?;
+        let mut lines = Vec::new();
+        loop {
+            match receiver.try_recv() {
+                Ok(ProtocolFrame::Line(line)) => lines.push(line),
+                Ok(ProtocolFrame::Rejected) => {
+                    anyhow::bail!("sandbox protocol stdout emitted an invalid or oversized frame")
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) if lines.is_empty() => {
+                    anyhow::bail!("sandbox protocol stdout disconnected")
+                }
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        Ok(lines)
     }
 
     /// Prueft ob der Prozess noch laeuft.
@@ -440,9 +538,11 @@ impl SandboxEnforcer {
         };
 
         let spawned = config.spawn(&wrapped_command)?;
-        let child = spawned.child;
+        let mut child = spawned.child;
         let pid = child.id();
         let child_pid = spawned.child_pid;
+        let protocol_stdin = child.stdin.take();
+        let protocol_stdout = child.stdout.take().map(protocol_line_receiver);
 
         // Add bwrap process to agent's cgroup (supervisor PID — children inherit
         // the cgroup; this is correct for cgroups, unlike netns which needs the
@@ -461,6 +561,8 @@ impl SandboxEnforcer {
         Ok(AgentProcess {
             pid,
             child_pid,
+            protocol_stdin,
+            protocol_stdout,
             child,
         })
     }
@@ -539,6 +641,63 @@ impl SandboxEnforcer {
     pub fn oom_score_set(&self) -> bool {
         self.oom_set.load(Ordering::Relaxed)
     }
+}
+
+fn protocol_line_receiver(stdout: std::process::ChildStdout) -> Receiver<ProtocolFrame> {
+    let (sender, receiver) = mpsc::sync_channel(PROTOCOL_QUEUE_DEPTH);
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut bytes = Vec::new();
+            let mut rejected = false;
+            let mut reached_eof = false;
+            loop {
+                let available = match reader.fill_buf() {
+                    Ok(available) => available,
+                    Err(_) => {
+                        rejected = true;
+                        reached_eof = true;
+                        &[]
+                    }
+                };
+                if available.is_empty() {
+                    reached_eof = true;
+                    break;
+                }
+                let newline = available.iter().position(|byte| *byte == b'\n');
+                let consumed = newline.map_or(available.len(), |index| index + 1);
+                let payload = if newline.is_some() {
+                    &available[..consumed - 1]
+                } else {
+                    &available[..consumed]
+                };
+                if bytes.len().saturating_add(payload.len()) > PROTOCOL_LINE_LIMIT_BYTES {
+                    rejected = true;
+                } else if !rejected {
+                    bytes.extend_from_slice(payload);
+                }
+                reader.consume(consumed);
+                if newline.is_some() {
+                    break;
+                }
+            }
+            if reached_eof && bytes.is_empty() && !rejected {
+                break;
+            }
+            let frame = if rejected {
+                ProtocolFrame::Rejected
+            } else {
+                match String::from_utf8(bytes) {
+                    Ok(line) => ProtocolFrame::Line(line),
+                    Err(_) => ProtocolFrame::Rejected,
+                }
+            };
+            if sender.send(frame).is_err() || reached_eof {
+                break;
+            }
+        }
+    });
+    receiver
 }
 
 /// Returns the expected path for the landlock-wrapper binary.
