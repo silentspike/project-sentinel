@@ -229,6 +229,7 @@ Team leads are accountable for graph health, assignment, blockers, and completio
 ## Agent Workbench Contract
 
 The workbench is the only production path for tool-bearing agent work.
+The implementation and recovery boundaries are detailed in [Agent Workbench](agent-workbench.md).
 
 A versioned request binds:
 

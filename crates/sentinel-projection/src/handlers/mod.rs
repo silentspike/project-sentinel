@@ -8,6 +8,7 @@ pub mod cost;
 pub mod kpi;
 pub mod room_live_view;
 pub mod task_kanban_view;
+pub mod workbench;
 
 use sentinel_common::{DomainEvent, DomainEventPayload};
 

@@ -20,6 +20,7 @@ use crate::handlers::cost::CostHandler;
 use crate::handlers::kpi::KpiHandler;
 use crate::handlers::room_live_view::RoomLiveViewHandler;
 use crate::handlers::task_kanban_view::TaskKanbanHandler;
+use crate::handlers::workbench::WorkbenchHandler;
 use crate::handlers::ProjectionHandler;
 use crate::store::{LlmHierarchyCostUpdate, ReadModelStore};
 
@@ -79,6 +80,7 @@ impl ProjectionWorker {
             Box::new(KpiHandler),
             Box::new(TaskKanbanHandler),
             Box::new(CostHandler),
+            Box::new(WorkbenchHandler),
         ];
 
         Ok(Self {
