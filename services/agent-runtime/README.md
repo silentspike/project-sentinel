@@ -2,18 +2,23 @@
 
 ## Purpose
 
-`agent-runtime` is the lightweight process launched inside an agent sandbox. It has zero external Rust dependencies and exists to provide a minimal controllable process with observable heartbeat I/O.
+`agent-runtime` is the capability-scoped tool process launched inside an agent sandbox. It accepts only the versioned Project Sentinel workbench protocol and executes one digest-bound operation at a time inside the workspace and resource boundary supplied by the daemon.
 
 ## Interfaces
 
-- `main.rs` reads stdin for future command dispatch and exits on EOF or `shutdown`.
-- It writes `/tmp/heartbeat` every five seconds so eBPF/userspace health collectors can observe activity.
-- stderr logs process start, shutdown, and heartbeat write failures.
+- stdin and stdout use newline-delimited JSON (`WorkbenchCommand` and `WorkbenchMessage`).
+- Commands cover execute, cancel, and health. Messages cover progress, result, cancellation, health, and safe protocol errors.
+- The runtime rejects unknown schema versions, unknown fields, stale deadlines, digest conflicts, undeclared capabilities, paths outside the assigned workspace, symlinks at effect boundaries, and commands outside the digest-bound allowlist before the requested effect.
+- Supported M0 tools inspect UTF-8 files, atomically create or update files, apply digest-bound text patches, run allowlisted commands/tests, and commit immutable content-addressed artifact manifests.
+- EOF requests bounded shutdown. Cancellation and deadline expiry terminate the complete process group for a running command.
+- stderr carries lifecycle diagnostics only. Request content, environment values, command output, and credentials are not logged.
 
 ## Dependencies
 
-- Rust standard library only.
-- Runtime host dependencies come from the parent sandbox: bwrap, cgroups, and daemon process supervision.
+- The shared `sentinel-common` protocol types and bounded serialization/digest helpers.
+- Runtime host enforcement comes from the parent sandbox: bwrap, Landlock, namespaces, cgroups, and daemon process supervision.
+
+The process does not establish the security boundary by itself. Production tool-bearing work must be launched through the daemon's authorized `NanoRuntimeRegistry` bwrap selection; direct host execution is not a supported production path.
 
 ## Verify
 
@@ -22,4 +27,4 @@ cargo remote -c -- test -p agent-runtime
 cargo remote -c -- build -p agent-runtime --release
 ```
 
-Live behavior is verified through `sentinel-daemon` sandbox/runtime-health tests because the daemon owns process launch and supervision.
+Live behavior is verified through the daemon workbench and sandbox acceptance path because the daemon owns authority, durable invocation state, runtime selection, launch, and supervision.
