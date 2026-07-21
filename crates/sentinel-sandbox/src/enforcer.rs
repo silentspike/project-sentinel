@@ -45,6 +45,9 @@ pub struct AgentProcess {
     /// `None`, falls bwrap ihn nicht meldete -> netns-Verifikation entfaellt;
     /// das bwrap-Exit bleibt das primaere fail-closed-Signal (#75).
     pub child_pid: Option<u32>,
+    /// True only when the process was launched through the mandatory Landlock
+    /// wrapper. The wrapper exits before the workload on enforcement failure.
+    pub landlock_applied: bool,
     /// Child handle — NICHT droppen solange Agent laufen soll.
     child: Child,
     protocol_stdin: Option<ChildStdin>,
@@ -65,6 +68,7 @@ impl AgentProcess {
         Ok(Self {
             pid,
             child_pid: None,
+            landlock_applied: false,
             protocol_stdin: child.stdin.take(),
             protocol_stdout: None,
             child,
@@ -91,6 +95,7 @@ impl AgentProcess {
         Ok(Self {
             pid,
             child_pid: None,
+            landlock_applied: false,
             protocol_stdin,
             protocol_stdout,
             child,
@@ -112,6 +117,7 @@ impl AgentProcess {
         Ok(Self {
             pid,
             child_pid: None,
+            landlock_applied: false,
             protocol_stdin,
             protocol_stdout,
             child,
@@ -498,11 +504,49 @@ impl SandboxEnforcer {
             anyhow::bail!("bwrap not available — cannot start agent process");
         }
 
+        let is_workbench = command.first().map(String::as_str) == Some("/usr/bin/agent-runtime");
         let mut config = BwrapConfig::for_agent(name);
+        if is_workbench {
+            config = config.for_workbench();
+        }
 
         // sentinel-fs FUSE mount: replace /ram/agents/ with FUSE mount path
         if let Some(ref fs_mount) = self.fs_mount {
             config = config.with_fs_mount(fs_mount, fs_host_agent_dir.unwrap_or(name), name);
+        }
+
+        if is_workbench {
+            let host_agent_root = match self.fs_mount.as_deref() {
+                Some(fs_mount) => {
+                    std::path::PathBuf::from(fs_mount).join(fs_host_agent_dir.unwrap_or(name))
+                }
+                None => std::path::PathBuf::from("/ram/agents").join(name),
+            };
+            let root_metadata = std::fs::symlink_metadata(&host_agent_root)
+                .with_context(|| format!("stat workbench agent root for {name}"))?;
+            if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+                anyhow::bail!("workbench agent root failed containment validation for {name}");
+            }
+            let canonical_root = std::fs::canonicalize(&host_agent_root)
+                .with_context(|| format!("canonicalize workbench agent root for {name}"))?;
+            for child in ["workspaces", "artifacts"] {
+                let path = host_agent_root.join(child);
+                std::fs::create_dir_all(&path)
+                    .with_context(|| format!("create workbench {child} root for {name}"))?;
+                let metadata = std::fs::symlink_metadata(&path)
+                    .with_context(|| format!("stat workbench {child} root for {name}"))?;
+                let canonical = std::fs::canonicalize(&path)
+                    .with_context(|| format!("canonicalize workbench {child} root for {name}"))?;
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                    || !canonical.starts_with(&canonical_root)
+                {
+                    anyhow::bail!(
+                        "workbench {child} root failed containment validation for {name}"
+                    );
+                }
+            }
+            config = config.with_workbench_roots(&host_agent_root);
         }
 
         // #75: full cage is unconditional — BwrapConfig::for_agent already sets
@@ -510,10 +554,12 @@ impl SandboxEnforcer {
         // post-spawn on the sandboxed child PID.
 
         // Wrap command with Landlock enforcement if available
+        let mut landlock_applied = false;
         let wrapped_command = if self.landlock_abi.is_some() {
             // Bind the wrapper binary into the namespace
             let wrapper_path = landlock_wrapper_path();
             if wrapper_path.exists() {
+                landlock_applied = true;
                 config.readonly_binds.push((
                     wrapper_path.to_string_lossy().into_owned(),
                     "/landlock-wrapper".to_string(),
@@ -549,6 +595,13 @@ impl SandboxEnforcer {
         // sandboxed child PID).
         if self.cgroup_available {
             if let Err(e) = cgroups::add_pid_to_cgroup(name, pid) {
+                if is_workbench {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e).with_context(|| {
+                        format!("workbench bwrap PID {pid} was not attached to cgroup {name}")
+                    });
+                }
                 warn!("Failed to add bwrap PID {pid} to cgroup {name}: {e}");
             }
         }
@@ -561,6 +614,7 @@ impl SandboxEnforcer {
         Ok(AgentProcess {
             pid,
             child_pid,
+            landlock_applied,
             protocol_stdin,
             protocol_stdout,
             child,

@@ -232,6 +232,9 @@ impl WorkbenchRequest {
         ] {
             validate_identifier(name, value)?;
         }
+        if self.workspace_id != format!("{}:{}", self.project_id, self.work_item_id) {
+            return Err(WorkbenchValidationError::InvalidWorkspaceBinding);
+        }
         for (name, digest) in [
             ("policy_digest", self.policy_digest.as_str()),
             ("tool_profile_digest", self.tool_profile_digest.as_str()),
@@ -278,6 +281,9 @@ impl WorkbenchRequest {
         validate_tool_paths(&self.tool)?;
         if let Some((program, args)) = self.tool.command() {
             validate_program(program)?;
+            for argument in args {
+                validate_command_argument(argument)?;
+            }
             if !self
                 .command_policy
                 .iter()
@@ -294,6 +300,26 @@ impl WorkbenchRequest {
     }
 }
 
+fn validate_command_argument(argument: &str) -> Result<(), WorkbenchValidationError> {
+    let path = std::path::Path::new(argument);
+    if argument.is_empty()
+        || argument.contains('\0')
+        || argument.starts_with('~')
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(WorkbenchValidationError::CommandArgumentEscape);
+    }
+    Ok(())
+}
+
 impl CommandRule {
     fn validate(&self) -> Result<(), WorkbenchValidationError> {
         validate_program(&self.program)?;
@@ -307,6 +333,9 @@ impl CommandRule {
         self.program == program
             && args.len() <= usize::from(self.max_args)
             && args.starts_with(&self.required_arg_prefix)
+            && args[self.required_arg_prefix.len()..]
+                .iter()
+                .all(|argument| !argument.starts_with('-'))
     }
 }
 
@@ -477,12 +506,17 @@ fn constant_time_ascii_eq(left: &[u8], right: &[u8]) -> bool {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkbenchCommand {
     Execute {
-        request: WorkbenchRequest,
+        request: Box<WorkbenchRequest>,
     },
     Cancel {
         schema_version: u16,
         invocation_id: String,
         reason: String,
+    },
+    Recover {
+        schema_version: u16,
+        invocation_id: String,
+        input_digest: String,
     },
     Health {
         schema_version: u16,
@@ -608,6 +642,8 @@ pub enum WorkbenchValidationError {
     InvalidDigest(String),
     #[error("invalid assignment, credential, or attempt generation")]
     InvalidGeneration,
+    #[error("workspace ID is not bound to its project and work item")]
+    InvalidWorkspaceBinding,
     #[error("request deadline has expired")]
     DeadlineExpired,
     #[error("invalid resource limits")]
@@ -620,6 +656,8 @@ pub enum WorkbenchValidationError {
     InvalidProgram,
     #[error("invalid command policy rule")]
     InvalidCommandRule,
+    #[error("command argument escapes the assigned workspace")]
+    CommandArgumentEscape,
     #[error("invalid patch definition")]
     InvalidPatch,
     #[error("invalid workspace-relative path")]
@@ -684,14 +722,14 @@ mod tests {
     fn request_round_trip_preserves_digest_and_validates() {
         let request = request();
         let json = serde_json::to_string(&WorkbenchCommand::Execute {
-            request: request.clone(),
+            request: Box::new(request.clone()),
         })
         .unwrap();
         let decoded: WorkbenchCommand = serde_json::from_str(&json).unwrap();
         assert_eq!(
             decoded,
             WorkbenchCommand::Execute {
-                request: request.clone()
+                request: Box::new(request.clone())
             }
         );
         request.validate_at(1_900_000_000_000).unwrap();
@@ -748,6 +786,34 @@ mod tests {
     }
 
     #[test]
+    fn workspace_binding_and_command_argument_escape_fail_closed() {
+        let mut mismatched = request();
+        mismatched.workspace_id = "project-01:work-99".to_string();
+        mismatched.input_digest = mismatched.canonical_digest().unwrap();
+        assert_eq!(
+            mismatched.validate_at(1_900_000_000_000),
+            Err(WorkbenchValidationError::InvalidWorkspaceBinding)
+        );
+
+        let mut command = request();
+        command.capabilities = BTreeSet::from(["command.run_allowlisted".to_string()]);
+        command.command_policy = vec![CommandRule {
+            program: "node".to_string(),
+            required_arg_prefix: vec!["--check".to_string()],
+            max_args: 2,
+        }];
+        command.tool = WorkbenchTool::RunCommand {
+            program: "node".to_string(),
+            args: vec!["--check".to_string(), "../foreign/index.js".to_string()],
+        };
+        command.input_digest = command.canonical_digest().unwrap();
+        assert_eq!(
+            command.validate_at(1_900_000_000_000),
+            Err(WorkbenchValidationError::CommandArgumentEscape)
+        );
+    }
+
+    #[test]
     fn command_must_match_the_digest_bound_rule() {
         let mut request = request();
         request.capabilities = BTreeSet::from(["command.run_allowlisted".to_string()]);
@@ -762,6 +828,19 @@ mod tests {
         };
         request.input_digest = request.canonical_digest().unwrap();
         request.validate_at(1_900_000_000_000).unwrap();
+
+        request.tool = WorkbenchTool::RunCommand {
+            program: "node".to_string(),
+            args: vec![
+                "--check".to_string(),
+                "--require=/proc/self/environ".to_string(),
+            ],
+        };
+        request.input_digest = request.canonical_digest().unwrap();
+        assert_eq!(
+            request.validate_at(1_900_000_000_000),
+            Err(WorkbenchValidationError::CommandDenied)
+        );
 
         request.tool = WorkbenchTool::RunCommand {
             program: "sh".to_string(),

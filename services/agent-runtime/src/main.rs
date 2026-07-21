@@ -133,25 +133,30 @@ fn handle_command(
                 return;
             }
             let cancellation = Arc::new(AtomicBool::new(false));
-            let already_active = {
+            let active_conflict = {
                 let mut active_guard = active.lock().unwrap_or_else(|error| error.into_inner());
                 if active_guard.contains_key(&invocation_id) {
-                    true
+                    Some((
+                        "invocation_already_active",
+                        "the invocation is already executing",
+                    ))
+                } else if !active_guard.is_empty() {
+                    Some((
+                        "runtime_busy",
+                        "the isolated agent runtime already has an active invocation",
+                    ))
                 } else {
                     active_guard.insert(invocation_id.clone(), cancellation.clone());
-                    false
+                    None
                 }
             };
-            if already_active {
+            if let Some((code, message)) = active_conflict {
                 emit(
                     &output_lock,
                     &WorkbenchMessage::Error {
                         schema_version: WORKBENCH_SCHEMA_VERSION,
                         invocation_id: Some(invocation_id),
-                        error: protocol_error(
-                            "invocation_already_active",
-                            "the invocation is already executing",
-                        ),
+                        error: protocol_error(code, message),
                     },
                 );
                 return;
@@ -170,8 +175,18 @@ fn handle_command(
                     WorkbenchProgressStage::Executing,
                     0,
                 );
-                let result = executor.execute(request, cancellation);
-                emit(&output_lock, &result);
+                let result = executor.execute(*request, cancellation);
+                match executor.persist_completion_receipt(&result) {
+                    Ok(()) => emit(&output_lock, &result),
+                    Err(error) => emit(
+                        &output_lock,
+                        &WorkbenchMessage::Error {
+                            schema_version: WORKBENCH_SCHEMA_VERSION,
+                            invocation_id: Some(invocation_id.clone()),
+                            error,
+                        },
+                    ),
+                };
                 let mut active_guard = active.lock().unwrap_or_else(|error| error.into_inner());
                 active_guard.remove(&invocation_id);
                 drop(active_guard);
@@ -227,6 +242,45 @@ fn handle_command(
                             "invocation_not_active",
                             "the invocation is not active in this runtime",
                         ),
+                    },
+                ),
+            }
+        }
+        WorkbenchCommand::Recover {
+            schema_version,
+            invocation_id,
+            input_digest,
+        } => {
+            if schema_version != WORKBENCH_SCHEMA_VERSION {
+                emit(
+                    &output_lock,
+                    &WorkbenchMessage::Error {
+                        schema_version: WORKBENCH_SCHEMA_VERSION,
+                        invocation_id: Some(invocation_id),
+                        error: protocol_error(
+                            "unsupported_version",
+                            "the workbench command version is unsupported",
+                        ),
+                    },
+                );
+                return;
+            }
+            match executor.recover_completion(&invocation_id, &input_digest) {
+                Ok(message) => {
+                    emit(&output_lock, &message);
+                    emit_progress(
+                        &output_lock,
+                        &invocation_id,
+                        WorkbenchProgressStage::Completed,
+                        0,
+                    );
+                }
+                Err(error) => emit(
+                    &output_lock,
+                    &WorkbenchMessage::Error {
+                        schema_version: WORKBENCH_SCHEMA_VERSION,
+                        invocation_id: Some(invocation_id),
+                        error,
                     },
                 ),
             }

@@ -11,14 +11,15 @@ use std::path::Path;
 use anyhow::{bail, Context};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use sentinel_common::{
-    AgentId, DomainEventPayload, WorkbenchArtifactRef, WorkbenchErrorInfo, WorkbenchMessage,
-    WorkbenchOutcome, WorkbenchRequest, WorkbenchResourceUsage, WORKBENCH_SCHEMA_VERSION,
+    AgentId, DomainEvent, DomainEventPayload, NanoExecRequest, NanoExecResult,
+    WorkbenchArtifactRef, WorkbenchCommand, WorkbenchErrorInfo, WorkbenchMessage, WorkbenchOutcome,
+    WorkbenchRequest, WorkbenchResourceUsage, WORKBENCH_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const INVOCATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("workbench_invocations_v1");
-const STORE_SCHEMA_VERSION: u16 = 1;
+const STORE_SCHEMA_VERSION: u16 = 2;
 const PROFILE_SCHEMA_VERSION: u16 = 1;
 const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
 
@@ -162,6 +163,73 @@ pub enum WorkbenchStoreError {
     OutputRejected,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkbenchRuntimeEnvelope {
+    pub schema_version: u16,
+    pub invocation_id: String,
+    pub state: String,
+    pub messages: Vec<WorkbenchMessage>,
+}
+
+impl WorkbenchRuntimeEnvelope {
+    pub fn start(request: &WorkbenchRequest) -> anyhow::Result<NanoExecRequest> {
+        Ok(NanoExecRequest {
+            operation: "workbench_start".to_string(),
+            input: serde_json::to_string(&WorkbenchCommand::Execute {
+                request: Box::new(request.clone()),
+            })?,
+        })
+    }
+
+    pub fn poll(invocation_id: &str) -> NanoExecRequest {
+        NanoExecRequest {
+            operation: "workbench_poll".to_string(),
+            input: invocation_id.to_string(),
+        }
+    }
+
+    pub fn cancel(invocation_id: &str, reason: &str) -> anyhow::Result<NanoExecRequest> {
+        Ok(NanoExecRequest {
+            operation: "workbench_cancel".to_string(),
+            input: serde_json::to_string(&WorkbenchCommand::Cancel {
+                schema_version: WORKBENCH_SCHEMA_VERSION,
+                invocation_id: invocation_id.to_string(),
+                reason: reason.to_string(),
+            })?,
+        })
+    }
+
+    pub fn recover(invocation_id: &str, input_digest: &str) -> anyhow::Result<NanoExecRequest> {
+        Ok(NanoExecRequest {
+            operation: "workbench_recover".to_string(),
+            input: serde_json::to_string(&WorkbenchCommand::Recover {
+                schema_version: WORKBENCH_SCHEMA_VERSION,
+                invocation_id: invocation_id.to_string(),
+                input_digest: input_digest.to_string(),
+            })?,
+        })
+    }
+
+    pub fn decode(expected_invocation_id: &str, result: &NanoExecResult) -> anyhow::Result<Self> {
+        if result.runtime_key != sentinel_common::WORKBENCH_RUNTIME_BWRAP || !result.success {
+            bail!("workbench runtime result is not a successful bwrap exchange");
+        }
+        let envelope: Self = serde_json::from_str(&result.output)
+            .context("decode workbench runtime response envelope")?;
+        if envelope.schema_version != WORKBENCH_SCHEMA_VERSION
+            || envelope.invocation_id != expected_invocation_id
+            || !matches!(
+                envelope.state.as_str(),
+                "accepted" | "pending" | "cancelling" | "completed"
+            )
+        {
+            bail!("workbench runtime response envelope mismatched its request");
+        }
+        Ok(envelope)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkbenchInvocationState {
@@ -215,6 +283,7 @@ pub struct WorkbenchInvocationRecord {
     pub tool_profile_digest: String,
     pub runtime_key: String,
     pub tool_class: String,
+    pub capabilities: BTreeSet<String>,
     pub output_artifact_kinds: BTreeSet<String>,
     pub attempt: u32,
     pub state: WorkbenchInvocationState,
@@ -246,6 +315,7 @@ impl WorkbenchInvocationRecord {
             tool_profile_digest: request.tool_profile_digest.clone(),
             runtime_key: request.runtime_key.clone(),
             tool_class: request.tool.required_capability().to_string(),
+            capabilities: request.capabilities.clone(),
             output_artifact_kinds: request.output_artifact_kinds.clone(),
             attempt: request.attempt,
             state: WorkbenchInvocationState::Reserved,
@@ -276,6 +346,35 @@ impl WorkbenchInvocationRecord {
             error_code: self.error.as_ref().map(|error| error.code.clone()),
         }
     }
+
+    pub fn safe_event(&self, tick: u64) -> anyhow::Result<DomainEvent> {
+        let payload = self.safe_event_payload();
+        let payload_json = payload.to_json();
+        let operation_id = format!(
+            "workbench:{}:{}",
+            self.invocation_id,
+            hex_sha256(payload_json.as_bytes())
+        );
+        Ok(DomainEvent::new(
+            payload.event_type_str(),
+            &format!("AGENT-{:02}", self.agent_id.0),
+            &payload_json,
+            &self.invocation_id,
+            tick,
+        )
+        .with_operation_id(&operation_id))
+    }
+}
+
+pub fn publish_workbench_records(
+    event_store: &sentinel_limbo::EventStore,
+    records: &[WorkbenchInvocationRecord],
+    tick: u64,
+) -> anyhow::Result<Vec<i64>> {
+    records
+        .iter()
+        .map(|record| event_store.append_event(&record.safe_event(tick)?))
+        .collect()
 }
 
 fn invocation_state_name(state: WorkbenchInvocationState) -> &'static str {
@@ -297,7 +396,7 @@ pub enum ReservationOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkbenchRecoveryAction {
-    DispatchReserved,
+    AwaitAuthorizedReplay,
     ProbeExecuting,
     ReplayTerminal,
 }
@@ -439,6 +538,139 @@ impl WorkbenchInvocationStore {
         })
     }
 
+    pub fn mark_failed(
+        &self,
+        invocation_id: &str,
+        request_digest: &str,
+        now_ms: u64,
+        error: WorkbenchErrorInfo,
+    ) -> anyhow::Result<WorkbenchInvocationRecord> {
+        self.transition(invocation_id, request_digest, now_ms, |record| {
+            if !record.state.permits(WorkbenchInvocationState::Failed) {
+                return Err(WorkbenchStoreError::InvalidTransition {
+                    from: record.state,
+                    to: WorkbenchInvocationState::Failed,
+                }
+                .into());
+            }
+            record.state = WorkbenchInvocationState::Failed;
+            record.completed_at_ms = Some(now_ms);
+            record.resources = Some(WorkbenchResourceUsage::default());
+            record.artifacts.clear();
+            record.error = Some(error);
+            Ok(())
+        })
+    }
+
+    pub fn mark_cancelled(
+        &self,
+        invocation_id: &str,
+        request_digest: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<WorkbenchInvocationRecord> {
+        self.transition(invocation_id, request_digest, now_ms, |record| {
+            if !record.state.permits(WorkbenchInvocationState::Cancelled) {
+                return Err(WorkbenchStoreError::InvalidTransition {
+                    from: record.state,
+                    to: WorkbenchInvocationState::Cancelled,
+                }
+                .into());
+            }
+            record.state = WorkbenchInvocationState::Cancelled;
+            record.completed_at_ms = Some(now_ms);
+            record.resources = Some(WorkbenchResourceUsage::default());
+            record.artifacts.clear();
+            record.error = Some(WorkbenchErrorInfo {
+                class: sentinel_common::WorkbenchErrorClass::Runtime,
+                code: "cancelled_before_dispatch".to_string(),
+                safe_message: "the invocation was cancelled before dispatch".to_string(),
+                retryable: false,
+            });
+            Ok(())
+        })
+    }
+
+    pub fn accept_runtime_envelope(
+        &self,
+        envelope: &WorkbenchRuntimeEnvelope,
+        now_ms: u64,
+    ) -> anyhow::Result<Option<WorkbenchInvocationRecord>> {
+        let mut current = self
+            .load(&envelope.invocation_id)?
+            .ok_or(WorkbenchStoreError::NotReserved)?;
+        let mut terminal_messages = 0_u8;
+        for message in &envelope.messages {
+            match message {
+                WorkbenchMessage::Progress {
+                    schema_version,
+                    invocation_id,
+                    ..
+                }
+                | WorkbenchMessage::Cancelled {
+                    schema_version,
+                    invocation_id,
+                } => {
+                    validate_message_binding(
+                        *schema_version,
+                        invocation_id,
+                        &envelope.invocation_id,
+                    )?;
+                }
+                WorkbenchMessage::Result {
+                    schema_version,
+                    invocation_id,
+                    ..
+                } => {
+                    validate_message_binding(
+                        *schema_version,
+                        invocation_id,
+                        &envelope.invocation_id,
+                    )?;
+                    terminal_messages = terminal_messages.saturating_add(1);
+                }
+                WorkbenchMessage::Error {
+                    schema_version,
+                    invocation_id,
+                    ..
+                } => {
+                    if *schema_version != WORKBENCH_SCHEMA_VERSION
+                        || invocation_id.as_deref() != Some(envelope.invocation_id.as_str())
+                    {
+                        bail!("workbench runtime message mismatched its invocation");
+                    }
+                    terminal_messages = terminal_messages.saturating_add(1);
+                }
+                WorkbenchMessage::Health { .. } => {
+                    bail!("health response is invalid inside a workbench exchange");
+                }
+            }
+        }
+        if terminal_messages > 1 {
+            bail!("workbench runtime envelope contains duplicate terminal messages");
+        }
+
+        for message in &envelope.messages {
+            match message {
+                WorkbenchMessage::Result { .. } => {
+                    current = self.accept_result(message, now_ms)?;
+                }
+                WorkbenchMessage::Error { error, .. } => {
+                    current = self.mark_failed(
+                        &envelope.invocation_id,
+                        &current.request_digest,
+                        now_ms,
+                        error.clone(),
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        if envelope.state == "completed" && !current.state.is_terminal() {
+            bail!("completed workbench exchange has no durable terminal result");
+        }
+        Ok(current.state.is_terminal().then_some(current))
+    }
+
     pub fn recovery_items(&self) -> anyhow::Result<Vec<WorkbenchRecoveryItem>> {
         let read = self.db.begin_read()?;
         let table = read.open_table(INVOCATIONS)?;
@@ -447,7 +679,9 @@ impl WorkbenchInvocationStore {
             let (_, value) = entry?;
             let record = decode_record(value.value())?;
             let action = match record.state {
-                WorkbenchInvocationState::Reserved => WorkbenchRecoveryAction::DispatchReserved,
+                WorkbenchInvocationState::Reserved => {
+                    WorkbenchRecoveryAction::AwaitAuthorizedReplay
+                }
                 WorkbenchInvocationState::Executing => WorkbenchRecoveryAction::ProbeExecuting,
                 state if state.is_terminal() => WorkbenchRecoveryAction::ReplayTerminal,
                 _ => unreachable!("all workbench states are covered"),
@@ -485,6 +719,17 @@ impl WorkbenchInvocationStore {
         write.commit()?;
         Ok(record)
     }
+}
+
+fn validate_message_binding(
+    schema_version: u16,
+    invocation_id: &str,
+    expected_invocation_id: &str,
+) -> anyhow::Result<()> {
+    if schema_version != WORKBENCH_SCHEMA_VERSION || invocation_id != expected_invocation_id {
+        bail!("workbench runtime message mismatched its invocation");
+    }
+    Ok(())
 }
 
 fn validate_bound_outputs(
@@ -591,6 +836,319 @@ pub fn authorize_workbench_request(
     Ok(effective)
 }
 
+pub fn authorize_workbench_record(
+    record: &WorkbenchInvocationRecord,
+    authority: &WorkbenchAuthoritySnapshot,
+) -> anyhow::Result<BTreeSet<String>> {
+    if !authority.assignment_active {
+        bail!("workbench assignment is not active");
+    }
+    if record.agent_id != authority.agent_id
+        || record.caller_id != authority.caller_id
+        || record.caller_role != authority.caller_role
+        || record.project_id != authority.project_id
+        || record.work_item_id != authority.work_item_id
+        || record.assignment_version != authority.assignment_version
+        || record.credential_generation != authority.credential_generation
+        || record.policy_digest != authority.policy_digest
+        || record.tool_profile != authority.tool_profile
+        || record.tool_profile_digest != authority.tool_profile_digest
+        || record.runtime_key != authority.runtime_key
+    {
+        bail!("workbench authority binding is stale or mismatched");
+    }
+    let effective = authority
+        .agent_capabilities
+        .intersection(&authority.role_capabilities)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .intersection(&authority.assignment_capabilities)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .intersection(&authority.project_capabilities)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .intersection(&authority.profile_capabilities)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !record.capabilities.is_subset(&effective) {
+        bail!("workbench capability was revoked before output acceptance");
+    }
+    Ok(effective)
+}
+
+pub trait WorkbenchRuntimeClient {
+    fn exchange(
+        &mut self,
+        agent_id: AgentId,
+        request: NanoExecRequest,
+    ) -> anyhow::Result<NanoExecResult>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkbenchCoordinatorUpdate {
+    pub records: Vec<WorkbenchInvocationRecord>,
+    pub runtime_state: Option<String>,
+    pub replayed: bool,
+}
+
+pub struct WorkbenchCoordinator<'a> {
+    store: &'a WorkbenchInvocationStore,
+    profile: &'a WorkbenchProfile,
+    profile_digest: &'a str,
+}
+
+impl<'a> WorkbenchCoordinator<'a> {
+    pub fn new(
+        store: &'a WorkbenchInvocationStore,
+        profile: &'a WorkbenchProfile,
+        profile_digest: &'a str,
+    ) -> Self {
+        Self {
+            store,
+            profile,
+            profile_digest,
+        }
+    }
+
+    pub fn submit(
+        &self,
+        runtime: &mut dyn WorkbenchRuntimeClient,
+        request: &WorkbenchRequest,
+        authority: &WorkbenchAuthoritySnapshot,
+        now_ms: u64,
+    ) -> anyhow::Result<WorkbenchCoordinatorUpdate> {
+        self.profile
+            .authorize_request(self.profile_digest, request)?;
+        authorize_workbench_request(request, authority)?;
+        let reservation = self.store.reserve(request, now_ms)?;
+        let (record, replayed) = match reservation {
+            ReservationOutcome::Reserved(record) => (record, false),
+            ReservationOutcome::Replay(record) => (record, true),
+        };
+        if record.state.is_terminal() || record.state == WorkbenchInvocationState::Executing {
+            return Ok(WorkbenchCoordinatorUpdate {
+                records: vec![record],
+                runtime_state: None,
+                replayed: true,
+            });
+        }
+
+        let mut records = if replayed { Vec::new() } else { vec![record] };
+        let executing =
+            self.store
+                .mark_executing(&request.invocation_id, &request.input_digest, now_ms)?;
+        records.push(executing);
+        self.apply_exchange(
+            runtime,
+            request.agent_id,
+            &request.invocation_id,
+            &request.input_digest,
+            WorkbenchRuntimeEnvelope::start(request)?,
+            now_ms,
+            records,
+            replayed,
+            authority,
+        )
+    }
+
+    pub fn poll(
+        &self,
+        runtime: &mut dyn WorkbenchRuntimeClient,
+        invocation_id: &str,
+        authority: &WorkbenchAuthoritySnapshot,
+        now_ms: u64,
+    ) -> anyhow::Result<WorkbenchCoordinatorUpdate> {
+        let record = self
+            .store
+            .load(invocation_id)?
+            .ok_or(WorkbenchStoreError::NotReserved)?;
+        if record.state.is_terminal() {
+            return Ok(WorkbenchCoordinatorUpdate {
+                records: vec![record],
+                runtime_state: None,
+                replayed: true,
+            });
+        }
+        if record.state != WorkbenchInvocationState::Executing {
+            bail!("only an executing workbench invocation can be polled");
+        }
+        self.apply_exchange(
+            runtime,
+            record.agent_id,
+            &record.invocation_id,
+            &record.request_digest,
+            WorkbenchRuntimeEnvelope::poll(&record.invocation_id),
+            now_ms,
+            Vec::new(),
+            false,
+            authority,
+        )
+    }
+
+    pub fn recover_executing(
+        &self,
+        runtime: &mut dyn WorkbenchRuntimeClient,
+        invocation_id: &str,
+        authority: &WorkbenchAuthoritySnapshot,
+        now_ms: u64,
+    ) -> anyhow::Result<WorkbenchCoordinatorUpdate> {
+        let record = self
+            .store
+            .load(invocation_id)?
+            .ok_or(WorkbenchStoreError::NotReserved)?;
+        if record.state.is_terminal() {
+            return Ok(WorkbenchCoordinatorUpdate {
+                records: vec![record],
+                runtime_state: None,
+                replayed: true,
+            });
+        }
+        if record.state != WorkbenchInvocationState::Executing {
+            bail!("reserved workbench invocations require an authorized request replay");
+        }
+        self.apply_exchange(
+            runtime,
+            record.agent_id,
+            &record.invocation_id,
+            &record.request_digest,
+            WorkbenchRuntimeEnvelope::recover(&record.invocation_id, &record.request_digest)?,
+            now_ms,
+            Vec::new(),
+            false,
+            authority,
+        )
+    }
+
+    pub fn cancel(
+        &self,
+        runtime: &mut dyn WorkbenchRuntimeClient,
+        invocation_id: &str,
+        reason: &str,
+        authority: &WorkbenchAuthoritySnapshot,
+        now_ms: u64,
+    ) -> anyhow::Result<WorkbenchCoordinatorUpdate> {
+        let record = self
+            .store
+            .load(invocation_id)?
+            .ok_or(WorkbenchStoreError::NotReserved)?;
+        authorize_workbench_record(&record, authority)?;
+        if record.state.is_terminal() {
+            return Ok(WorkbenchCoordinatorUpdate {
+                records: vec![record],
+                runtime_state: None,
+                replayed: true,
+            });
+        }
+        if record.state == WorkbenchInvocationState::Reserved {
+            let cancelled =
+                self.store
+                    .mark_cancelled(&record.invocation_id, &record.request_digest, now_ms)?;
+            return Ok(WorkbenchCoordinatorUpdate {
+                records: vec![cancelled],
+                runtime_state: Some("completed".to_string()),
+                replayed: false,
+            });
+        }
+        self.apply_cancel_exchange(runtime, &record, reason, authority, now_ms)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_exchange(
+        &self,
+        runtime: &mut dyn WorkbenchRuntimeClient,
+        agent_id: AgentId,
+        invocation_id: &str,
+        request_digest: &str,
+        request: NanoExecRequest,
+        now_ms: u64,
+        mut records: Vec<WorkbenchInvocationRecord>,
+        replayed: bool,
+        authority: &WorkbenchAuthoritySnapshot,
+    ) -> anyhow::Result<WorkbenchCoordinatorUpdate> {
+        let current = self
+            .store
+            .load(invocation_id)?
+            .ok_or(WorkbenchStoreError::NotReserved)?;
+        authorize_workbench_record(&current, authority)?;
+        // A transport failure is not evidence that the isolated workload did
+        // not complete. Keep the durable invocation executing so recovery can
+        // probe the runtime receipt without dispatching the external effect a
+        // second time.
+        let result = runtime.exchange(agent_id, request)?;
+        let envelope = match WorkbenchRuntimeEnvelope::decode(invocation_id, &result) {
+            Ok(envelope) => envelope,
+            Err(_) => {
+                let failed = self.store.mark_failed(
+                    invocation_id,
+                    request_digest,
+                    now_ms,
+                    safe_runtime_failure("runtime_response_rejected"),
+                )?;
+                records.push(failed);
+                return Ok(WorkbenchCoordinatorUpdate {
+                    records,
+                    runtime_state: Some("completed".to_string()),
+                    replayed,
+                });
+            }
+        };
+        let runtime_state = Some(envelope.state.clone());
+        let current = self
+            .store
+            .load(invocation_id)?
+            .ok_or(WorkbenchStoreError::NotReserved)?;
+        authorize_workbench_record(&current, authority)?;
+        if let Some(terminal) = self.store.accept_runtime_envelope(&envelope, now_ms)? {
+            records.push(terminal);
+        }
+        Ok(WorkbenchCoordinatorUpdate {
+            records,
+            runtime_state,
+            replayed,
+        })
+    }
+
+    fn apply_cancel_exchange(
+        &self,
+        runtime: &mut dyn WorkbenchRuntimeClient,
+        record: &WorkbenchInvocationRecord,
+        reason: &str,
+        authority: &WorkbenchAuthoritySnapshot,
+        now_ms: u64,
+    ) -> anyhow::Result<WorkbenchCoordinatorUpdate> {
+        authorize_workbench_record(record, authority)?;
+        let result = runtime.exchange(
+            record.agent_id,
+            WorkbenchRuntimeEnvelope::cancel(&record.invocation_id, reason)?,
+        )?;
+        let envelope = WorkbenchRuntimeEnvelope::decode(&record.invocation_id, &result)?;
+        let current = self
+            .store
+            .load(&record.invocation_id)?
+            .ok_or(WorkbenchStoreError::NotReserved)?;
+        authorize_workbench_record(&current, authority)?;
+        let mut records = Vec::new();
+        if let Some(terminal) = self.store.accept_runtime_envelope(&envelope, now_ms)? {
+            records.push(terminal);
+        }
+        Ok(WorkbenchCoordinatorUpdate {
+            records,
+            runtime_state: Some(envelope.state),
+            replayed: false,
+        })
+    }
+}
+
+fn safe_runtime_failure(code: &str) -> WorkbenchErrorInfo {
+    WorkbenchErrorInfo {
+        class: sentinel_common::WorkbenchErrorClass::Runtime,
+        code: code.to_string(),
+        safe_message: "the selected workbench runtime failed closed".to_string(),
+        retryable: false,
+    }
+}
+
 fn state_for_outcome(outcome: WorkbenchOutcome) -> anyhow::Result<WorkbenchInvocationState> {
     match outcome {
         WorkbenchOutcome::Succeeded => Ok(WorkbenchInvocationState::Succeeded),
@@ -616,10 +1174,11 @@ fn decode_record(bytes: &[u8]) -> anyhow::Result<WorkbenchInvocationRecord> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     use sentinel_common::{
-        WorkbenchErrorClass, WorkbenchResourceLimits, WorkbenchTool, WORKBENCH_RUNTIME_BWRAP,
+        WorkbenchErrorClass, WorkbenchProgressStage, WorkbenchResourceLimits, WorkbenchTool,
+        WORKBENCH_RUNTIME_BWRAP,
     };
 
     use super::*;
@@ -668,6 +1227,50 @@ mod tests {
 
     fn store(directory: &tempfile::TempDir) -> WorkbenchInvocationStore {
         WorkbenchInvocationStore::open(directory.path().join("workbench.redb")).unwrap()
+    }
+
+    fn authority(
+        request: &WorkbenchRequest,
+        profile: &WorkbenchProfile,
+    ) -> WorkbenchAuthoritySnapshot {
+        let granted = profile.capabilities.clone();
+        WorkbenchAuthoritySnapshot {
+            agent_id: request.agent_id,
+            caller_id: request.caller_id.clone(),
+            caller_role: request.caller_role.clone(),
+            project_id: request.project_id.clone(),
+            work_item_id: request.work_item_id.clone(),
+            assignment_version: request.assignment_version,
+            credential_generation: request.credential_generation,
+            policy_digest: request.policy_digest.clone(),
+            tool_profile: request.tool_profile.clone(),
+            tool_profile_digest: request.tool_profile_digest.clone(),
+            runtime_key: request.runtime_key.clone(),
+            assignment_active: true,
+            agent_capabilities: granted.clone(),
+            role_capabilities: granted.clone(),
+            assignment_capabilities: granted.clone(),
+            project_capabilities: granted.clone(),
+            profile_capabilities: granted,
+        }
+    }
+
+    struct FakeRuntime {
+        calls: usize,
+        responses: VecDeque<anyhow::Result<NanoExecResult>>,
+    }
+
+    impl WorkbenchRuntimeClient for FakeRuntime {
+        fn exchange(
+            &mut self,
+            _agent_id: AgentId,
+            _request: NanoExecRequest,
+        ) -> anyhow::Result<NanoExecResult> {
+            self.calls += 1;
+            self.responses
+                .pop_front()
+                .unwrap_or_else(|| Err(anyhow::anyhow!("unexpected runtime exchange")))
+        }
     }
 
     #[test]
@@ -762,7 +1365,10 @@ mod tests {
             )
             .unwrap();
         let items = store.recovery_items().unwrap();
-        assert_eq!(items[0].action, WorkbenchRecoveryAction::DispatchReserved);
+        assert_eq!(
+            items[0].action,
+            WorkbenchRecoveryAction::AwaitAuthorizedReplay
+        );
         assert_eq!(items[1].action, WorkbenchRecoveryAction::ProbeExecuting);
     }
 
@@ -940,6 +1546,406 @@ mod tests {
         assert_eq!(
             store.load(&request.invocation_id).unwrap().unwrap().state,
             WorkbenchInvocationState::Executing
+        );
+    }
+
+    #[test]
+    fn runtime_envelope_is_bound_committed_and_recoverable_without_private_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        let request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2810");
+        store.reserve(&request, 1_900_000_000_000).unwrap();
+        store
+            .mark_executing(
+                &request.invocation_id,
+                &request.input_digest,
+                1_900_000_000_001,
+            )
+            .unwrap();
+        let result = WorkbenchMessage::Result {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+            outcome: WorkbenchOutcome::Succeeded,
+            resources: WorkbenchResourceUsage {
+                duration_ms: 12,
+                ..WorkbenchResourceUsage::default()
+            },
+            artifacts: Vec::new(),
+            output: BTreeMap::from([("content".to_string(), "PRIVATE".to_string())]),
+            error: None,
+        };
+        let wire = NanoExecResult {
+            runtime_key: WORKBENCH_RUNTIME_BWRAP.to_string(),
+            workload_id: "agent-7".to_string(),
+            success: true,
+            output: serde_json::to_string(&serde_json::json!({
+                "schema_version": WORKBENCH_SCHEMA_VERSION,
+                "invocation_id": request.invocation_id,
+                "state": "pending",
+                "messages": [result],
+            }))
+            .unwrap(),
+        };
+        let envelope = WorkbenchRuntimeEnvelope::decode(&request.invocation_id, &wire).unwrap();
+        let completed = store
+            .accept_runtime_envelope(&envelope, 1_900_000_000_012)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.state, WorkbenchInvocationState::Succeeded);
+        assert!(!serde_json::to_string(&completed)
+            .unwrap()
+            .contains("PRIVATE"));
+
+        let completion = WorkbenchRuntimeEnvelope {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            state: "completed".to_string(),
+            messages: vec![WorkbenchMessage::Progress {
+                schema_version: WORKBENCH_SCHEMA_VERSION,
+                invocation_id: request.invocation_id.clone(),
+                stage: WorkbenchProgressStage::Completed,
+                elapsed_ms: 13,
+            }],
+        };
+        assert_eq!(
+            store
+                .accept_runtime_envelope(&completion, 1_900_000_000_013)
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkbenchInvocationState::Succeeded
+        );
+        let recovery =
+            WorkbenchRuntimeEnvelope::recover(&request.invocation_id, &request.input_digest)
+                .unwrap();
+        assert_eq!(recovery.operation, "workbench_recover");
+        assert!(recovery.input.contains(&request.input_digest));
+    }
+
+    #[test]
+    fn foreign_or_duplicate_runtime_messages_cannot_mutate_the_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        let request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2811");
+        store.reserve(&request, 1_900_000_000_000).unwrap();
+        store
+            .mark_executing(
+                &request.invocation_id,
+                &request.input_digest,
+                1_900_000_000_001,
+            )
+            .unwrap();
+        let foreign = WorkbenchRuntimeEnvelope {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            state: "pending".to_string(),
+            messages: vec![WorkbenchMessage::Progress {
+                schema_version: WORKBENCH_SCHEMA_VERSION,
+                invocation_id: "018f3f32-4f01-7f2c-a6c1-f6f4a81b2999".to_string(),
+                stage: WorkbenchProgressStage::Executing,
+                elapsed_ms: 1,
+            }],
+        };
+        assert!(store.accept_runtime_envelope(&foreign, 2).is_err());
+        assert_eq!(
+            store.load(&request.invocation_id).unwrap().unwrap().state,
+            WorkbenchInvocationState::Executing
+        );
+
+        let error = WorkbenchMessage::Error {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: Some(request.invocation_id.clone()),
+            error: WorkbenchErrorInfo {
+                class: WorkbenchErrorClass::Protocol,
+                code: "protocol_failed".to_string(),
+                safe_message: "failed".to_string(),
+                retryable: false,
+            },
+        };
+        let duplicate = WorkbenchRuntimeEnvelope {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            state: "completed".to_string(),
+            messages: vec![error.clone(), error],
+        };
+        assert!(store.accept_runtime_envelope(&duplicate, 3).is_err());
+        assert_eq!(
+            store.load(&request.invocation_id).unwrap().unwrap().state,
+            WorkbenchInvocationState::Executing
+        );
+    }
+
+    #[test]
+    fn coordinator_replays_without_duplicate_dispatch_and_recovers_a_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        let profile_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/workbench-profiles/web-authoring-v1.toml");
+        let (profile, profile_digest) = WorkbenchProfile::load(profile_path).unwrap();
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2812");
+        request.tool_profile_digest = profile_digest.clone();
+        request.input_digest = request.canonical_digest().unwrap();
+        let authority = authority(&request, &profile);
+        let accepted = NanoExecResult {
+            runtime_key: WORKBENCH_RUNTIME_BWRAP.to_string(),
+            workload_id: "agent-7".to_string(),
+            success: true,
+            output: serde_json::to_string(&serde_json::json!({
+                "schema_version": WORKBENCH_SCHEMA_VERSION,
+                "invocation_id": request.invocation_id,
+                "state": "accepted",
+                "messages": [],
+            }))
+            .unwrap(),
+        };
+        let recovered_result = WorkbenchMessage::Result {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+            outcome: WorkbenchOutcome::Succeeded,
+            resources: WorkbenchResourceUsage {
+                bytes_written: 2,
+                ..WorkbenchResourceUsage::default()
+            },
+            artifacts: Vec::new(),
+            output: BTreeMap::new(),
+            error: None,
+        };
+        let recovered = NanoExecResult {
+            runtime_key: WORKBENCH_RUNTIME_BWRAP.to_string(),
+            workload_id: "agent-7".to_string(),
+            success: true,
+            output: serde_json::to_string(&serde_json::json!({
+                "schema_version": WORKBENCH_SCHEMA_VERSION,
+                "invocation_id": request.invocation_id,
+                "state": "completed",
+                "messages": [
+                    recovered_result,
+                    WorkbenchMessage::Progress {
+                        schema_version: WORKBENCH_SCHEMA_VERSION,
+                        invocation_id: request.invocation_id.clone(),
+                        stage: WorkbenchProgressStage::Completed,
+                        elapsed_ms: 2,
+                    }
+                ],
+            }))
+            .unwrap(),
+        };
+        let mut runtime = FakeRuntime {
+            calls: 0,
+            responses: VecDeque::from([Ok(accepted), Ok(recovered)]),
+        };
+        let coordinator = WorkbenchCoordinator::new(&store, &profile, &profile_digest);
+
+        let started = coordinator
+            .submit(&mut runtime, &request, &authority, 1_900_000_000_000)
+            .unwrap();
+        assert_eq!(runtime.calls, 1);
+        assert_eq!(started.records.len(), 2);
+        assert_eq!(
+            started.records.last().unwrap().state,
+            WorkbenchInvocationState::Executing
+        );
+        let replay = coordinator
+            .submit(&mut runtime, &request, &authority, 1_900_000_000_001)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(runtime.calls, 1, "executing replay must not redispatch");
+
+        let completed = coordinator
+            .recover_executing(
+                &mut runtime,
+                &request.invocation_id,
+                &authority,
+                1_900_000_000_002,
+            )
+            .unwrap();
+        assert_eq!(runtime.calls, 2);
+        assert_eq!(completed.runtime_state.as_deref(), Some("completed"));
+        assert_eq!(
+            completed.records.last().unwrap().state,
+            WorkbenchInvocationState::Succeeded
+        );
+    }
+
+    #[test]
+    fn output_acceptance_rechecks_current_authority_and_events_are_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        let profile_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/workbench-profiles/web-authoring-v1.toml");
+        let (profile, profile_digest) = WorkbenchProfile::load(profile_path).unwrap();
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2813");
+        request.tool_profile_digest = profile_digest.clone();
+        request.input_digest = request.canonical_digest().unwrap();
+        let mut authority = authority(&request, &profile);
+        let accepted = NanoExecResult {
+            runtime_key: WORKBENCH_RUNTIME_BWRAP.to_string(),
+            workload_id: "agent-7".to_string(),
+            success: true,
+            output: serde_json::to_string(&serde_json::json!({
+                "schema_version": WORKBENCH_SCHEMA_VERSION,
+                "invocation_id": request.invocation_id,
+                "state": "accepted",
+                "messages": [],
+            }))
+            .unwrap(),
+        };
+        let mut runtime = FakeRuntime {
+            calls: 0,
+            responses: VecDeque::from([Ok(accepted)]),
+        };
+        let coordinator = WorkbenchCoordinator::new(&store, &profile, &profile_digest);
+        let started = coordinator
+            .submit(&mut runtime, &request, &authority, 1_900_000_000_000)
+            .unwrap();
+
+        authority.assignment_active = false;
+        assert!(coordinator
+            .poll(
+                &mut runtime,
+                &request.invocation_id,
+                &authority,
+                1_900_000_000_001,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("assignment is not active"));
+        assert_eq!(
+            runtime.calls, 1,
+            "revocation must reject before runtime I/O"
+        );
+
+        let first = started.records[0].safe_event(42).unwrap();
+        let replay = started.records[0].safe_event(42).unwrap();
+        assert_eq!(first.operation_id, replay.operation_id);
+        assert_eq!(first.payload, replay.payload);
+        assert!(!first.payload.contains("PRIVATE"));
+        let executing = started.records[1].safe_event(42).unwrap();
+        assert_ne!(first.operation_id, executing.operation_id);
+    }
+
+    #[test]
+    fn cancellation_requires_current_authority_before_runtime_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        let profile_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/workbench-profiles/web-authoring-v1.toml");
+        let (profile, profile_digest) = WorkbenchProfile::load(profile_path).unwrap();
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2814");
+        request.tool_profile_digest = profile_digest.clone();
+        request.input_digest = request.canonical_digest().unwrap();
+        store.reserve(&request, 1_900_000_000_000).unwrap();
+        let mut authority = authority(&request, &profile);
+        authority.assignment_active = false;
+        let mut runtime = FakeRuntime {
+            calls: 0,
+            responses: VecDeque::new(),
+        };
+        let coordinator = WorkbenchCoordinator::new(&store, &profile, &profile_digest);
+
+        assert!(coordinator
+            .cancel(
+                &mut runtime,
+                &request.invocation_id,
+                "operator_cancelled",
+                &authority,
+                1_900_000_000_001,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("assignment is not active"));
+        assert_eq!(runtime.calls, 0);
+        assert_eq!(
+            store.load(&request.invocation_id).unwrap().unwrap().state,
+            WorkbenchInvocationState::Reserved
+        );
+
+        authority.assignment_active = true;
+        let cancelled = coordinator
+            .cancel(
+                &mut runtime,
+                &request.invocation_id,
+                "operator_cancelled",
+                &authority,
+                1_900_000_000_002,
+            )
+            .unwrap();
+        assert_eq!(runtime.calls, 0);
+        assert_eq!(
+            cancelled.records.last().unwrap().state,
+            WorkbenchInvocationState::Cancelled
+        );
+    }
+
+    #[test]
+    fn transport_failure_keeps_execution_recoverable_without_redispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        let profile_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/workbench-profiles/web-authoring-v1.toml");
+        let (profile, profile_digest) = WorkbenchProfile::load(profile_path).unwrap();
+        let mut request = request("018f3f32-4f01-7f2c-a6c1-f6f4a81b2815");
+        request.tool_profile_digest = profile_digest.clone();
+        request.input_digest = request.canonical_digest().unwrap();
+        let authority = authority(&request, &profile);
+        let recovered_result = WorkbenchMessage::Result {
+            schema_version: WORKBENCH_SCHEMA_VERSION,
+            invocation_id: request.invocation_id.clone(),
+            input_digest: request.input_digest.clone(),
+            outcome: WorkbenchOutcome::Succeeded,
+            resources: WorkbenchResourceUsage::default(),
+            artifacts: Vec::new(),
+            output: BTreeMap::new(),
+            error: None,
+        };
+        let recovered = NanoExecResult {
+            runtime_key: WORKBENCH_RUNTIME_BWRAP.to_string(),
+            workload_id: "agent-7".to_string(),
+            success: true,
+            output: serde_json::to_string(&serde_json::json!({
+                "schema_version": WORKBENCH_SCHEMA_VERSION,
+                "invocation_id": request.invocation_id,
+                "state": "completed",
+                "messages": [recovered_result],
+            }))
+            .unwrap(),
+        };
+        let mut runtime = FakeRuntime {
+            calls: 0,
+            responses: VecDeque::from([
+                Err(anyhow::anyhow!("runtime transport unavailable")),
+                Ok(recovered),
+            ]),
+        };
+        let coordinator = WorkbenchCoordinator::new(&store, &profile, &profile_digest);
+
+        assert!(coordinator
+            .submit(&mut runtime, &request, &authority, 1_900_000_000_000)
+            .is_err());
+        assert_eq!(runtime.calls, 1);
+        assert_eq!(
+            store.load(&request.invocation_id).unwrap().unwrap().state,
+            WorkbenchInvocationState::Executing
+        );
+        let replay = coordinator
+            .submit(&mut runtime, &request, &authority, 1_900_000_000_001)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(runtime.calls, 1, "replay must not dispatch a second start");
+        let recovered = coordinator
+            .recover_executing(
+                &mut runtime,
+                &request.invocation_id,
+                &authority,
+                1_900_000_000_002,
+            )
+            .unwrap();
+        assert_eq!(runtime.calls, 2);
+        assert_eq!(
+            recovered.records.last().unwrap().state,
+            WorkbenchInvocationState::Succeeded
         );
     }
 }

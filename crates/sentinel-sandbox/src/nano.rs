@@ -12,7 +12,7 @@ use sentinel_fs::artifact::ArtifactPlane;
 use sentinel_fs::home_manifest::{self, HomeManifest, RestorePolicy};
 use serde::{Deserialize, Serialize};
 
-use crate::{cgroups, AgentProcess, CgroupLimits, SandboxEnforcer, SandboxHandle};
+use crate::{cgroups, AgentProcess, CgroupLimits, IsolationStatus, SandboxEnforcer, SandboxHandle};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BwrapSnapshotPayload {
@@ -30,6 +30,9 @@ struct BwrapSnapshotPayload {
 struct BwrapWorkloadState {
     workload: NanoWorkloadSpec,
     command: Vec<String>,
+    /// Production workbench processes own a dedicated kernel cgroup. Protocol
+    /// fixtures deliberately do not and therefore skip only this kernel write.
+    enforce_cgroup_limits: bool,
     /// `ArtifactPlane` object ids pinning the chunks of this workload's last home
     /// snapshot (released on re-snapshot/teardown to avoid chunk leaks, N1').
     owned_object_ids: Vec<u64>,
@@ -50,6 +53,15 @@ const DEFAULT_HOME_CAS_DIR: &str = "/ram/agents/.sentinel-home-cas";
 const MAX_WORKBENCH_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_WORKBENCH_OUTPUT_BYTES: usize = 256 * 1024;
 const WORKBENCH_CANCEL_GRACE_MS: u64 = 1_000;
+const WORKBENCH_RECOVERY_GRACE_MS: u64 = 5_000;
+
+fn workbench_cgroup_limits() -> CgroupLimits {
+    CgroupLimits {
+        memory_bytes: 128 * 1024 * 1024,
+        process_count: 16,
+        ..CgroupLimits::default()
+    }
+}
 
 pub struct BwrapNanoRuntime {
     enforcer: SandboxEnforcer,
@@ -158,16 +170,87 @@ impl BwrapNanoRuntime {
         let agent_name = workload.agent_name.clone();
         Self::write_marker(&agent_name, &workload.workload_id)?;
 
-        let mut handle = self
-            .enforcer
-            .setup_agent(&agent_name, &CgroupLimits::default())
-            .with_context(|| format!("bwrap setup_agent failed for {agent_name}"))?;
-        let proc = self
-            .enforcer
-            .start_agent_process(&agent_name, Some(&workload.workload_id), &state.command)
-            .with_context(|| format!("bwrap start_agent_process failed for {agent_name}"))?;
+        let is_workbench =
+            state.command.first().map(String::as_str) == Some("/usr/bin/agent-runtime");
+        let limits = if is_workbench {
+            workbench_cgroup_limits()
+        } else {
+            CgroupLimits::default()
+        };
+        let mut handle = match self.enforcer.setup_agent(&agent_name, &limits) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = Self::remove_marker(&agent_name, &workload.workload_id);
+                return Err(error)
+                    .with_context(|| format!("bwrap setup_agent failed for {agent_name}"));
+            }
+        };
+        let mut proc = match self.enforcer.start_agent_process(
+            &agent_name,
+            Some(&workload.workload_id),
+            &state.command,
+        ) {
+            Ok(proc) => proc,
+            Err(error) => {
+                let teardown_error = self.enforcer.teardown_agent(&handle).err();
+                let marker_error = Self::remove_marker(&agent_name, &workload.workload_id).err();
+                return Err(anyhow!(
+                    "bwrap start_agent_process failed for {agent_name}: {error}; \
+                     cgroup teardown: {}; marker cleanup: {}",
+                    teardown_error
+                        .as_ref()
+                        .map_or_else(|| "ok".to_string(), ToString::to_string),
+                    marker_error
+                        .as_ref()
+                        .map_or_else(|| "ok".to_string(), ToString::to_string)
+                ));
+            }
+        };
         let pid = proc.pid;
         handle.bwrap_pid = Some(pid);
+        handle.landlock_applied = proc.landlock_applied;
+
+        if is_workbench {
+            let attestation_error = if !handle.cgroup_created {
+                Some("dedicated cgroup was not created")
+            } else if !handle.landlock_applied {
+                Some("Landlock was not applied")
+            } else {
+                match proc.child_pid {
+                    Some(child_pid) => {
+                        match self.enforcer.verify_agent_netns_isolation(child_pid) {
+                            IsolationStatus::Isolated => {
+                                handle.network_isolated = true;
+                                None
+                            }
+                            IsolationStatus::NotIsolated => {
+                                Some("sandboxed process shares the daemon network namespace")
+                            }
+                            IsolationStatus::ProbeError => {
+                                Some("network namespace isolation could not be attested")
+                            }
+                        }
+                    }
+                    None => Some("sandboxed child PID was not reported"),
+                }
+            };
+
+            if let Some(reason) = attestation_error {
+                proc.terminate();
+                let teardown_error = self.enforcer.teardown_agent(&handle).err();
+                let marker_error = Self::remove_marker(&agent_name, &workload.workload_id).err();
+                return Err(anyhow!(
+                    "workbench isolation attestation failed for {agent_name}: {reason}; \
+                     cgroup teardown: {}; marker cleanup: {}",
+                    teardown_error
+                        .as_ref()
+                        .map_or_else(|| "ok".to_string(), ToString::to_string),
+                    marker_error
+                        .as_ref()
+                        .map_or_else(|| "ok".to_string(), ToString::to_string)
+                ));
+            }
+        }
 
         self.processes.insert(workload.workload_id.clone(), proc);
         self.handles.insert(workload.workload_id.clone(), handle);
@@ -223,6 +306,57 @@ impl BwrapNanoRuntime {
             WorkbenchExchange {
                 invocation_id: invocation_id.clone(),
                 deadline_unix_ms,
+                cancel_requested_at_ms: None,
+                messages: Vec::new(),
+                retained_bytes: 0,
+                result_seen: false,
+            },
+        );
+        workbench_exec_result(handle, true, &invocation_id, "accepted", Vec::new())
+    }
+
+    fn start_workbench_recovery(
+        &mut self,
+        handle: &NanoHandle,
+        input: &str,
+    ) -> Result<NanoExecResult> {
+        if input.len() > MAX_WORKBENCH_FRAME_BYTES {
+            return Err(anyhow!("workbench recovery frame exceeds the input limit"));
+        }
+        if self.exchanges.contains_key(&handle.workload_id) {
+            return Err(anyhow!("workbench exchange already active for workload"));
+        }
+        let frame: serde_json::Value =
+            serde_json::from_str(input).context("parse workbench recovery frame")?;
+        if frame.get("kind").and_then(|value| value.as_str()) != Some("recover") {
+            return Err(anyhow!("workbench recovery requires a recover frame"));
+        }
+        let invocation_id = frame
+            .get("invocation_id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .context("workbench recovery frame lacks invocation_id")?
+            .to_string();
+        let input_digest = frame
+            .get("input_digest")
+            .and_then(|value| value.as_str())
+            .filter(|value| value.len() == 64)
+            .context("workbench recovery frame lacks input_digest")?;
+        if !input_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(anyhow!("workbench recovery digest is invalid"));
+        }
+        self.processes
+            .get_mut(&handle.workload_id)
+            .context("missing bwrap process for workbench recovery")?
+            .send_protocol_line(input)?;
+        self.exchanges.insert(
+            handle.workload_id.clone(),
+            WorkbenchExchange {
+                invocation_id: invocation_id.clone(),
+                deadline_unix_ms: unix_time_ms().saturating_add(WORKBENCH_RECOVERY_GRACE_MS),
                 cancel_requested_at_ms: None,
                 messages: Vec::new(),
                 retained_bytes: 0,
@@ -455,6 +589,7 @@ impl NanoRuntime for BwrapNanoRuntime {
         let state = BwrapWorkloadState {
             command: Self::command_for(&workload),
             workload,
+            enforce_cgroup_limits: true,
             owned_object_ids: Vec::new(),
         };
         self.spawn_state(state)
@@ -504,7 +639,21 @@ impl NanoRuntime for BwrapNanoRuntime {
                 if self.health(handle)?.state != NanoHealthState::Healthy {
                     return Err(anyhow!("bwrap workload is not healthy"));
                 }
+                let state = self
+                    .workloads
+                    .get(&handle.workload_id)
+                    .ok_or_else(|| anyhow!("unknown bwrap workload '{}'", handle.workload_id))?;
+                if state.enforce_cgroup_limits {
+                    cgroups::resize_cgroup(&state.workload.agent_name, &workbench_cgroup_limits())
+                        .context("restore workbench cgroup ceiling before execution")?;
+                }
                 self.start_workbench_exchange(handle, &request.input)
+            }
+            "workbench_recover" => {
+                if self.health(handle)?.state != NanoHealthState::Healthy {
+                    return Err(anyhow!("bwrap workload is not healthy"));
+                }
+                self.start_workbench_recovery(handle, &request.input)
             }
             "workbench_poll" => self.poll_workbench_exchange(handle, &request.input),
             "workbench_cancel" => self.cancel_workbench_exchange(handle, &request.input),
@@ -598,6 +747,7 @@ impl NanoRuntime for BwrapNanoRuntime {
         self.spawn_state(BwrapWorkloadState {
             workload: payload.workload,
             command: payload.command,
+            enforce_cgroup_limits: true,
             owned_object_ids: Vec::new(),
         })
     }
@@ -701,6 +851,7 @@ mod tests {
             BwrapWorkloadState {
                 workload,
                 command: Vec::new(),
+                enforce_cgroup_limits: false,
                 owned_object_ids,
             },
         );
@@ -748,6 +899,7 @@ mod tests {
             BwrapWorkloadState {
                 workload,
                 command: Vec::new(),
+                enforce_cgroup_limits: false,
                 owned_object_ids: Vec::new(),
             },
         );
@@ -767,6 +919,16 @@ mod tests {
                 "invocation_id": invocation_id,
                 "deadline_unix_ms": deadline_unix_ms
             }
+        }))
+        .unwrap()
+    }
+
+    fn recovery_frame(invocation_id: &str, input_digest: &str) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "kind": "recover",
+            "schema_version": 1,
+            "invocation_id": invocation_id,
+            "input_digest": input_digest,
         }))
         .unwrap()
     }
@@ -831,6 +993,36 @@ mod tests {
         assert_eq!(output["invocation_id"], invocation_id);
         assert_eq!(output["state"], "completed");
         assert_eq!(output["messages"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn registry_recovery_channel_returns_digest_bound_receipt_without_reexecution() {
+        let invocation_id = "018f3f32-4f01-7f2c-a6c1-f6f4a81b2910";
+        let input_digest = "a".repeat(64);
+        let result = format!(
+            r#"{{"kind":"result","schema_version":1,"invocation_id":"{invocation_id}","input_digest":"{input_digest}","outcome":"succeeded","resources":{{"duration_ms":1,"cpu_time_ms":0,"peak_memory_bytes":0,"peak_process_count":0,"bytes_read":0,"bytes_written":1,"artifact_bytes":0}},"artifacts":[],"output":{{}},"error":null}}"#
+        );
+        let completed = format!(
+            r#"{{"kind":"progress","schema_version":1,"invocation_id":"{invocation_id}","stage":"completed","elapsed_ms":0}}"#
+        );
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(tempfile::tempdir().unwrap().path());
+        let handle =
+            insert_protocol_fixture(&mut runtime, "protocol-recovery", &[&result, &completed]);
+        runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_recover".to_string(),
+                    input: recovery_frame(invocation_id, &input_digest),
+                },
+            )
+            .unwrap();
+        let mut registry = sentinel_common::nano_runtime::NanoRuntimeRegistry::new(None);
+        registry.register(runtime).unwrap();
+        let terminal = poll_until_terminal(&mut registry, &handle, invocation_id);
+        let output: serde_json::Value = serde_json::from_str(&terminal.output).unwrap();
+        assert_eq!(output["state"], "completed");
+        assert_eq!(output["messages"][0]["input_digest"], input_digest);
     }
 
     #[test]

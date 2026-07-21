@@ -34,10 +34,13 @@ fn main() {
         sentinel_sandbox::LandlockRuleset::for_agent(agent_name).with_entrypoint_exec(&command[0]);
     match rules.apply() {
         Ok(true) => eprintln!("[landlock-wrapper] Landlock enforced for {agent_name}"),
-        Ok(false) => eprintln!("[landlock-wrapper] Landlock not enforced (kernel too old)"),
+        Ok(false) => {
+            eprintln!("[landlock-wrapper] Landlock not enforced");
+            process::exit(126);
+        }
         Err(e) => {
             eprintln!("[landlock-wrapper] Landlock apply failed: {e}");
-            // Non-fatal: continue with bwrap-only isolation
+            process::exit(126);
         }
     }
 

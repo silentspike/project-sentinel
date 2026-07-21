@@ -28,6 +28,9 @@ impl LandlockRuleset {
     fn default_exec_paths() -> Vec<PathBuf> {
         vec![
             PathBuf::from("/usr/bin/agent-runtime"),
+            // M0 web-authoring profile: syntax validation only; arguments are
+            // separately constrained by the digest-bound command policy.
+            PathBuf::from("/usr/bin/node"),
             PathBuf::from("/breakout-helper"),
             // Dynamically linked ELF binaries also need their loader executable.
             PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
@@ -51,10 +54,18 @@ impl LandlockRuleset {
                 PathBuf::from("/usr"),
                 PathBuf::from("/lib"),
                 PathBuf::from("/lib64"),
+                // bwrap creates a private PID namespace; this read grant is
+                // required for bounded process-group resource accounting and
+                // cannot expose host process metadata.
+                PathBuf::from("/proc"),
             ],
             write_paths: vec![
                 PathBuf::from(format!("/home/{name}")),
+                PathBuf::from("/workspace"),
+                PathBuf::from("/artifacts"),
                 PathBuf::from("/tmp"),
+                // Command stdio uses Stdio::null after Landlock is active.
+                PathBuf::from("/dev/null"),
             ],
             exec_paths: Self::default_exec_paths(),
         }
@@ -171,13 +182,18 @@ mod tests {
         assert!(rs.read_paths.contains(&PathBuf::from("/company")));
         assert!(rs.read_paths.contains(&PathBuf::from("/etc/resolv.conf")));
         assert!(rs.read_paths.contains(&PathBuf::from("/usr")));
+        assert!(rs.read_paths.contains(&PathBuf::from("/proc")));
         assert!(rs.read_paths.contains(&PathBuf::from("/lib")));
         assert!(rs.read_paths.contains(&PathBuf::from("/lib64")));
         assert!(rs.write_paths.contains(&PathBuf::from("/home/thomas")));
+        assert!(rs.write_paths.contains(&PathBuf::from("/workspace")));
+        assert!(rs.write_paths.contains(&PathBuf::from("/artifacts")));
         assert!(rs.write_paths.contains(&PathBuf::from("/tmp")));
+        assert!(rs.write_paths.contains(&PathBuf::from("/dev/null")));
         assert!(rs
             .exec_paths
             .contains(&PathBuf::from("/usr/bin/agent-runtime")));
+        assert!(rs.exec_paths.contains(&PathBuf::from("/usr/bin/node")));
         assert!(rs.exec_paths.contains(&PathBuf::from("/breakout-helper")));
         assert!(rs
             .exec_paths
