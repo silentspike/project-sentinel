@@ -295,6 +295,14 @@ impl NanoRuntimeRegistry {
         self.get_mut(&handle.runtime_key)?.stop(handle)
     }
 
+    pub fn exec(
+        &mut self,
+        handle: &NanoHandle,
+        request: NanoExecRequest,
+    ) -> Result<NanoExecResult> {
+        self.get_mut(&handle.runtime_key)?.exec(handle, request)
+    }
+
     pub fn resources(&mut self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
         self.get_mut(&handle.runtime_key)?.resources(handle)
     }
