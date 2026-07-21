@@ -1,0 +1,22 @@
+{
+  "agent_netns": "net:[4026532455]",
+  "agent_pid": 582215,
+  "benchmark": "sentinel-sandbox-netns (#75)",
+  "bwrap_version": "bubblewrap 0.9.0",
+  "daemon_netns": "net:[4026531833]",
+  "full_cage_spawn": {
+    "max_us": 53836.252,
+    "mean_us": 11335.725832,
+    "p50_us": 9522.685,
+    "p95_us": 20977.043,
+    "samples": 1000
+  },
+  "host": "sentinel-ubuntu-2404",
+  "netns_verify": {
+    "max_us": 75.043,
+    "mean_us": 7.6980896,
+    "p50_us": 6.625,
+    "p95_us": 15.381,
+    "samples": 10000
+  }
+}
