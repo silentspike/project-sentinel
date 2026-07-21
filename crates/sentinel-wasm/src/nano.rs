@@ -1,14 +1,14 @@
 #![cfg(feature = "wasm")]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use sentinel_common::nano_runtime::{
     ensure_handle_instance, ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle,
     NanoHealth, NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime,
-    NanoRuntimeResources, NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec,
-    RUNTIME_WASM_WASMTIME,
+    NanoRuntimeControlAction, NanoRuntimeControlResult, NanoRuntimeResources, NanoSnapshot,
+    NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_WASM_WASMTIME,
 };
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +42,7 @@ struct WasmWorkloadState {
 pub struct WasmtimeNanoRuntime {
     runtime: ToolRuntime,
     workloads: HashMap<String, WasmWorkloadState>,
+    suspended: HashSet<String>,
 }
 
 impl WasmtimeNanoRuntime {
@@ -49,6 +50,7 @@ impl WasmtimeNanoRuntime {
         Self {
             runtime: ToolRuntime::new(),
             workloads: HashMap::new(),
+            suspended: HashSet::new(),
         }
     }
 
@@ -227,6 +229,7 @@ impl NanoRuntime for WasmtimeNanoRuntime {
             .workloads
             .remove(&handle.workload_id)
             .expect("workload checked above");
+        self.suspended.remove(&handle.workload_id);
         self.release_unreferenced_resources(&state);
         Ok(NanoStopResult::new(
             self.runtime_key(),
@@ -250,6 +253,12 @@ impl NanoRuntime for WasmtimeNanoRuntime {
 
     fn exec(&mut self, handle: &NanoHandle, request: NanoExecRequest) -> Result<NanoExecResult> {
         ensure_handle_runtime(handle, self.runtime_key())?;
+        if self.suspended.contains(&handle.workload_id) {
+            return Err(anyhow!(
+                "WASM workload '{}' is suspended",
+                handle.workload_id
+            ));
+        }
         let state = self
             .workloads
             .get(&handle.workload_id)
@@ -332,6 +341,7 @@ impl NanoRuntime for WasmtimeNanoRuntime {
         }
 
         let instance_id = state.instance_id;
+        self.suspended.remove(&snapshot.workload_id);
         if let Some(previous) = self.workloads.insert(snapshot.workload_id.clone(), state) {
             self.release_unreferenced_resources(&previous);
         }
@@ -359,7 +369,9 @@ impl NanoRuntime for WasmtimeNanoRuntime {
         Ok(NanoHealth {
             runtime_key: self.runtime_key().to_string(),
             workload_id: handle.workload_id.clone(),
-            state: if loaded {
+            state: if self.suspended.contains(&handle.workload_id) {
+                NanoHealthState::Degraded
+            } else if loaded {
                 NanoHealthState::Healthy
             } else {
                 NanoHealthState::Unavailable
@@ -383,6 +395,25 @@ impl NanoRuntime for WasmtimeNanoRuntime {
                 policy.wasm_fuel
             ),
         })
+    }
+
+    fn control(
+        &mut self,
+        handle: &NanoHandle,
+        action: NanoRuntimeControlAction,
+    ) -> Result<NanoRuntimeControlResult> {
+        self.resources(handle)?;
+        let applied = match action {
+            NanoRuntimeControlAction::Suspend => self.suspended.insert(handle.workload_id.clone()),
+            NanoRuntimeControlAction::Resume => self.suspended.remove(&handle.workload_id),
+        };
+        Ok(NanoRuntimeControlResult::new(
+            self.runtime_key(),
+            &handle.workload_id,
+            action,
+            applied,
+            0,
+        ))
     }
 }
 
@@ -525,5 +556,34 @@ mod tests {
         );
         assert_eq!(runtime.runtime.tool_count(), 0);
         assert_eq!(runtime.runtime.plugin_host().cached_count(), 0);
+    }
+
+    #[test]
+    fn suspended_wasm_workload_rejects_execution_until_resumed() {
+        let mut runtime = WasmtimeNanoRuntime::new();
+        let handle = runtime.spawn(workload("wasm-control")).unwrap();
+        runtime
+            .control(&handle, NanoRuntimeControlAction::Suspend)
+            .unwrap();
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Degraded
+        );
+        assert!(runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "echo".to_string(),
+                    input: "blocked".to_string(),
+                },
+            )
+            .is_err());
+        runtime
+            .control(&handle, NanoRuntimeControlAction::Resume)
+            .unwrap();
+        assert_eq!(
+            runtime.health(&handle).unwrap().state,
+            NanoHealthState::Healthy
+        );
     }
 }

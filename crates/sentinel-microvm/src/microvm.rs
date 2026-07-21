@@ -7,8 +7,8 @@ use anyhow::{anyhow, bail, Result};
 use sentinel_common::nano_runtime::{
     ensure_handle_instance, ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle,
     NanoHealth, NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime,
-    NanoRuntimeResources, NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec,
-    RUNTIME_MICROVM,
+    NanoRuntimeControlAction, NanoRuntimeControlResult, NanoRuntimeResources, NanoSnapshot,
+    NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_MICROVM,
 };
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +85,7 @@ struct MicrovmSnapshotPayload {
 struct MicrovmWorkloadState {
     instance_id: uuid::Uuid,
     workload: NanoWorkloadSpec,
+    suspended: bool,
 }
 
 /// microVM-Runtime: jeder Workload laeuft als eigene Firecracker-microVM (KVM).
@@ -290,6 +291,7 @@ impl NanoRuntime for MicrovmNanoRuntime {
             MicrovmWorkloadState {
                 instance_id,
                 workload: workload.clone(),
+                suspended: false,
             },
         );
         Ok(NanoHandle {
@@ -368,9 +370,17 @@ impl NanoRuntime for MicrovmNanoRuntime {
 
         // Firecracker verlangt: Pause -> Snapshot -> Resume. Resume best-effort, damit ein
         // Snapshot-Fehler die VM nicht pausiert zuruecklaesst.
-        firecracker::pause(&sock)?;
+        let was_suspended = self
+            .workloads
+            .get(&handle.workload_id)
+            .is_some_and(|state| state.suspended);
+        if !was_suspended {
+            firecracker::pause(&sock)?;
+        }
         let created = firecracker::create_snapshot(&sock, &snap_str, &mem_str);
-        let _ = firecracker::resume(&sock);
+        if !was_suspended {
+            let _ = firecracker::resume(&sock);
+        }
         created?;
 
         let payload = MicrovmSnapshotPayload {
@@ -432,6 +442,7 @@ impl NanoRuntime for MicrovmNanoRuntime {
             MicrovmWorkloadState {
                 instance_id,
                 workload: payload.workload,
+                suspended: false,
             },
         );
 
@@ -501,6 +512,40 @@ impl NanoRuntime for MicrovmNanoRuntime {
                     .to_string(),
         })
     }
+
+    fn control(
+        &mut self,
+        handle: &NanoHandle,
+        action: NanoRuntimeControlAction,
+    ) -> Result<NanoRuntimeControlResult> {
+        self.resources(handle)?;
+        let suspended = self
+            .workloads
+            .get(&handle.workload_id)
+            .map(|state| state.suspended)
+            .ok_or_else(|| anyhow!("unknown microVM workload '{}'", handle.workload_id))?;
+        let should_apply = match action {
+            NanoRuntimeControlAction::Suspend => !suspended,
+            NanoRuntimeControlAction::Resume => suspended,
+        };
+        if should_apply {
+            let sock = self.api_sock_path(&handle.workload_id);
+            match action {
+                NanoRuntimeControlAction::Suspend => firecracker::pause(&sock)?,
+                NanoRuntimeControlAction::Resume => firecracker::resume(&sock)?,
+            }
+            if let Some(state) = self.workloads.get_mut(&handle.workload_id) {
+                state.suspended = matches!(action, NanoRuntimeControlAction::Suspend);
+            }
+        }
+        Ok(NanoRuntimeControlResult::new(
+            self.runtime_key(),
+            &handle.workload_id,
+            action,
+            should_apply,
+            usize::from(should_apply),
+        ))
+    }
 }
 
 /// Macht eine `workload_id` dateisystem-sicher (fuer Socket-/Snapshot-Pfade).
@@ -549,6 +594,7 @@ mod tests {
             MicrovmWorkloadState {
                 instance_id,
                 workload,
+                suspended: false,
             },
         );
         runtime.processes.insert(workload_id.clone(), process);
@@ -727,5 +773,34 @@ mod tests {
         assert!(!runtime.workloads.contains_key(&handle.workload_id));
         assert!(!runtime.api_sock_path(&handle.workload_id).exists());
         assert!(!vsock_path.exists());
+    }
+
+    #[test]
+    fn microvm_control_uses_firecracker_pause_resume_and_tracks_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = MicrovmConfig {
+            work_dir: temp.path().to_string_lossy().into_owned(),
+            ..MicrovmConfig::default()
+        };
+        let mut runtime = MicrovmNanoRuntime::with_config(config);
+        let handle = insert_fixture(&mut runtime, fixture_workload("fixture-control", 3));
+
+        let suspended = runtime
+            .control(&handle, NanoRuntimeControlAction::Suspend)
+            .unwrap();
+        assert_eq!(suspended.affected_units, 1);
+        assert!(runtime.workloads[&handle.workload_id].suspended);
+        assert_eq!(
+            runtime
+                .control(&handle, NanoRuntimeControlAction::Suspend)
+                .unwrap()
+                .outcome,
+            sentinel_common::nano_runtime::NanoRuntimeControlOutcome::AlreadyApplied
+        );
+        runtime
+            .control(&handle, NanoRuntimeControlAction::Resume)
+            .unwrap();
+        assert!(!runtime.workloads[&handle.workload_id].suspended);
+        runtime.stop(&handle).unwrap();
     }
 }

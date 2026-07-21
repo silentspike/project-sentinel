@@ -642,6 +642,7 @@ enum ApiError {
     NotFound(&'static str),
     /// #428: ungueltiger Zustandsuebergang (z.B. Pause auf bereits pausierten Agent).
     Conflict(&'static str),
+    UnprocessableEntity(&'static str),
     MethodNotAllowed,
     PayloadTooLarge,
     ServiceUnavailable(&'static str),
@@ -671,6 +672,7 @@ impl ApiError {
             ),
             Self::NotFound(msg) => json_response(404, ErrorResponse { error: msg }),
             Self::Conflict(msg) => json_response(409, ErrorResponse { error: msg }),
+            Self::UnprocessableEntity(msg) => json_response(422, ErrorResponse { error: msg }),
             Self::MethodNotAllowed => json_response(
                 405,
                 ErrorResponse {
@@ -2080,8 +2082,9 @@ enum AgentLifecycleAction {
     Despawn,
 }
 
-/// #428: schickt einen per-Agent Lifecycle-Befehl in den Tick-Loop und mappt das `outcome`
-/// auf den HTTP-Status (ok->200, invalid_transition->409, not_found->404). Kein Panic/500.
+/// #428: schickt einen per-Agent Lifecycle-Befehl in den Tick-Loop und mappt nur bestaetigte
+/// Erfolge auf 200. Ungueltige Transitionen, fehlende Agents sowie typisierte nicht
+/// unterstuetzte oder fehlgeschlagene Runtime-Aktionen bleiben fail-closed.
 fn dispatch_agent_lifecycle(
     action: AgentLifecycleAction,
     agent_id: u16,
@@ -2113,9 +2116,18 @@ fn dispatch_agent_lifecycle(
         .recv_timeout(std::time::Duration::from_secs(10))
         .map_err(|_| ApiError::ServiceUnavailable("Agent-Lifecycle Timeout"))?;
     match response.outcome.as_str() {
+        "ok" if response.accepted => Ok(response),
         "invalid_transition" => Err(ApiError::Conflict("Agent ist bereits im Zielzustand")),
         "not_found" => Err(ApiError::NotFound("agent_id nicht in der Runtime")),
-        _ => Ok(response),
+        "unsupported_runtime_action" => Err(ApiError::UnprocessableEntity(
+            "Ausgewaehlte Runtime unterstuetzt diese Lifecycle-Aktion nicht",
+        )),
+        "runtime_action_failed" | "stop_failed" => Err(ApiError::ServiceUnavailable(
+            "Runtime-Lifecycle-Aktion ist fehlgeschlagen",
+        )),
+        _ => Err(ApiError::ServiceUnavailable(
+            "Runtime-Lifecycle lieferte kein bestaetigtes Ergebnis",
+        )),
     }
 }
 
@@ -4519,6 +4531,87 @@ mod tests {
         responder.join().unwrap();
         assert!(matches!(err, ApiError::Conflict(_)));
         assert_eq!(err.to_response().status, 409);
+    }
+
+    #[test]
+    fn unsupported_runtime_lifecycle_maps_to_unprocessable_entity_422() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let responder = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::Pause {
+                agent_id,
+                response_tx,
+            } => response_tx
+                .send(AgentLifecycleResponse {
+                    accepted: false,
+                    agent_id,
+                    aggregate_id: format!("AGENT-{agent_id:02}"),
+                    action: "pause".to_string(),
+                    new_status: String::new(),
+                    affected_pids: 0,
+                    outcome: "unsupported_runtime_action".to_string(),
+                    note: "adapter rejected suspend".to_string(),
+                })
+                .unwrap(),
+            other => panic!("expected Pause, got {other:?}"),
+        });
+        let error = dispatch_agent_lifecycle(AgentLifecycleAction::Pause, 7, &state).unwrap_err();
+        responder.join().unwrap();
+        assert!(matches!(error, ApiError::UnprocessableEntity(_)));
+        assert_eq!(error.to_response().status, 422);
+    }
+
+    #[test]
+    fn failed_runtime_lifecycle_maps_to_service_unavailable_503() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let responder = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::Resume {
+                agent_id,
+                response_tx,
+            } => response_tx
+                .send(AgentLifecycleResponse {
+                    accepted: false,
+                    agent_id,
+                    aggregate_id: format!("AGENT-{agent_id:02}"),
+                    action: "resume".to_string(),
+                    new_status: String::new(),
+                    affected_pids: 0,
+                    outcome: "runtime_action_failed".to_string(),
+                    note: "adapter failed resume".to_string(),
+                })
+                .unwrap(),
+            other => panic!("expected Resume, got {other:?}"),
+        });
+        let error = dispatch_agent_lifecycle(AgentLifecycleAction::Resume, 7, &state).unwrap_err();
+        responder.join().unwrap();
+        assert!(matches!(error, ApiError::ServiceUnavailable(_)));
+        assert_eq!(error.to_response().status, 503);
+    }
+
+    #[test]
+    fn unconfirmed_ok_lifecycle_response_fails_closed() {
+        let (state, _rx, _platform_rx, runtime_rx) = test_state(None);
+        let responder = std::thread::spawn(move || match runtime_rx.recv().unwrap() {
+            RuntimeControlCommand::Pause {
+                agent_id,
+                response_tx,
+            } => response_tx
+                .send(AgentLifecycleResponse {
+                    accepted: false,
+                    agent_id,
+                    aggregate_id: format!("AGENT-{agent_id:02}"),
+                    action: "pause".to_string(),
+                    new_status: String::new(),
+                    affected_pids: 0,
+                    outcome: "ok".to_string(),
+                    note: "unconfirmed".to_string(),
+                })
+                .unwrap(),
+            other => panic!("expected Pause, got {other:?}"),
+        });
+        let error = dispatch_agent_lifecycle(AgentLifecycleAction::Pause, 7, &state).unwrap_err();
+        responder.join().unwrap();
+        assert!(matches!(error, ApiError::ServiceUnavailable(_)));
+        assert_eq!(error.to_response().status, 503);
     }
 
     #[test]

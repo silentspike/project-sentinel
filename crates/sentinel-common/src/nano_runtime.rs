@@ -86,6 +86,10 @@ pub struct NanoRuntimeResources {
     pub child_pid: Option<u32>,
     #[serde(default)]
     pub cgroup_created: bool,
+    /// Stable cgroup inode captured while the adapter still owns the cgroup.
+    /// Consumers must not try to rediscover it after stop removes the path.
+    #[serde(default)]
+    pub cgroup_id: Option<u64>,
     #[serde(default)]
     pub io_available: bool,
     #[serde(default)]
@@ -126,6 +130,74 @@ pub struct NanoStopResult {
     pub runtime_key: String,
     pub workload_id: String,
     pub outcome: NanoStopOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NanoRuntimeControlAction {
+    Suspend,
+    Resume,
+}
+
+impl std::fmt::Display for NanoRuntimeControlAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Suspend => write!(f, "suspend"),
+            Self::Resume => write!(f, "resume"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NanoRuntimeControlOutcome {
+    Applied,
+    AlreadyApplied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NanoRuntimeControlResult {
+    pub runtime_key: String,
+    pub workload_id: String,
+    pub action: NanoRuntimeControlAction,
+    pub outcome: NanoRuntimeControlOutcome,
+    /// Number of runtime-owned execution units affected by the action. Logical
+    /// runtimes report zero while still recording the state transition.
+    pub affected_units: usize,
+}
+
+impl NanoRuntimeControlResult {
+    pub fn new(
+        runtime_key: &str,
+        workload_id: &str,
+        action: NanoRuntimeControlAction,
+        applied: bool,
+        affected_units: usize,
+    ) -> Self {
+        Self {
+            runtime_key: runtime_key.to_string(),
+            workload_id: workload_id.to_string(),
+            action,
+            outcome: if applied {
+                NanoRuntimeControlOutcome::Applied
+            } else {
+                NanoRuntimeControlOutcome::AlreadyApplied
+            },
+            affected_units,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NanoRuntimeControlError {
+    #[error(
+        "NanoRuntime '{runtime_key}' does not support '{action}' for workload '{workload_id}'"
+    )]
+    Unsupported {
+        runtime_key: String,
+        workload_id: String,
+        action: NanoRuntimeControlAction,
+    },
 }
 
 impl NanoStopResult {
@@ -257,6 +329,23 @@ pub trait NanoRuntime: Send {
         policy: NanoIsolationPolicy,
     ) -> Result<NanoIsolationReport>;
 
+    /// Apply a runtime-owned suspend/resume action. The default is a typed,
+    /// fail-closed rejection so a newly added adapter can never inherit a
+    /// silent no-op success.
+    fn control(
+        &mut self,
+        handle: &NanoHandle,
+        action: NanoRuntimeControlAction,
+    ) -> Result<NanoRuntimeControlResult> {
+        ensure_handle_runtime(handle, self.runtime_key())?;
+        Err(NanoRuntimeControlError::Unsupported {
+            runtime_key: self.runtime_key().to_string(),
+            workload_id: handle.workload_id.clone(),
+            action,
+        }
+        .into())
+    }
+
     /// Return process/isolation resources for monitoring side effects. The
     /// adapter remains their sole lifecycle owner.
     fn resources(&self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
@@ -347,6 +436,14 @@ impl NanoRuntimeRegistry {
 
     pub fn health(&mut self, handle: &NanoHandle) -> Result<NanoHealth> {
         self.get_mut(&handle.runtime_key)?.health(handle)
+    }
+
+    pub fn control(
+        &mut self,
+        handle: &NanoHandle,
+        action: NanoRuntimeControlAction,
+    ) -> Result<NanoRuntimeControlResult> {
+        self.get_mut(&handle.runtime_key)?.control(handle, action)
     }
 }
 
@@ -742,6 +839,49 @@ pub mod conformance {
         assert_eq!(
             registry.stop(&other_handle).unwrap().outcome,
             NanoStopOutcome::Stopped
+        );
+    }
+
+    #[test]
+    fn runtime_control_defaults_to_typed_fail_closed_rejection() {
+        let mut registry = NanoRuntimeRegistry::new(None);
+        registry.register(DummyRuntime::default()).unwrap();
+        let workload = NanoWorkloadSpec {
+            workload_id: "unsupported-control".to_string(),
+            runtime_key: Some("dummy-runtime".to_string()),
+            agent_id: None,
+            agent_name: "Agent".to_string(),
+            role: "Tester".to_string(),
+            room_id: "empfang".to_string(),
+            shift_set: 1,
+            command: Vec::new(),
+            capabilities: Vec::new(),
+            metadata: BTreeMap::new(),
+            ecs_snapshot: None,
+        };
+        let handle = registry
+            .get_mut("dummy-runtime")
+            .unwrap()
+            .spawn(workload)
+            .unwrap();
+
+        let error = registry
+            .control(&handle, NanoRuntimeControlAction::Suspend)
+            .unwrap_err();
+        let typed = error
+            .downcast_ref::<NanoRuntimeControlError>()
+            .expect("unsupported control must remain typed");
+        assert!(matches!(
+            typed,
+            NanoRuntimeControlError::Unsupported {
+                action: NanoRuntimeControlAction::Suspend,
+                ..
+            }
+        ));
+        assert_eq!(
+            registry.health(&handle).unwrap().state,
+            NanoHealthState::Healthy,
+            "unsupported control must not mutate the workload"
         );
     }
 

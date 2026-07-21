@@ -241,6 +241,13 @@ impl EbpfCollector {
         self.prev_cgroup_io.remove(&cgroup_id);
     }
 
+    /// Read-only ownership probe used by lifecycle reconciliation and tests.
+    pub fn is_agent_registered(&self, cgroup_id: u64) -> bool {
+        self.agent_mappings
+            .iter()
+            .any(|mapping| mapping.cgroup_id == cgroup_id)
+    }
+
     /// Collects one cycle of metrics.
     ///
     /// In userspace mode: reads /proc and cgroup files.

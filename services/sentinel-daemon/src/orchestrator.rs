@@ -22,7 +22,8 @@ use sentinel_common::agent_config::{load_all_agents_with_validation, AgentConfig
 use sentinel_common::components::{AgentIdentity, ShiftInfo};
 use sentinel_common::events::{DomainEvent, DomainEventPayload};
 use sentinel_common::nano_runtime::{
-    NanoHandle, NanoRuntimeRegistry, NanoRuntimeResources, NanoStopResult, NanoWorkloadSpec,
+    NanoHandle, NanoRuntimeControlAction, NanoRuntimeControlError, NanoRuntimeControlResult,
+    NanoRuntimeRegistry, NanoRuntimeResources, NanoStopResult, NanoWorkloadSpec,
     RUNTIME_BWRAP_LANDLOCK, RUNTIME_ECS_NATIVE, RUNTIME_MICROVM, RUNTIME_WASM_WASMTIME,
 };
 use sentinel_common::{AgentId, AgentIdBounds, OperatorCommand, Perception};
@@ -334,6 +335,19 @@ impl DaemonNanoRuntimeRegistry {
         Ok(Some(result))
     }
 
+    fn control(
+        &mut self,
+        agent_id: AgentId,
+        action: NanoRuntimeControlAction,
+    ) -> Result<NanoRuntimeControlResult> {
+        let handle = self
+            .handles
+            .get(&agent_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("NanoRuntime handle missing for {agent_id}"))?;
+        self.registry.control(&handle, action)
+    }
+
     fn snapshot_all(&mut self) -> Result<Vec<sentinel_common::nano_runtime::NanoSnapshot>> {
         let mut entries = self
             .handles
@@ -595,37 +609,6 @@ fn remove_security_runtime_snapshot(
     }
 }
 
-fn proc_state(pid: u32) -> Option<char> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    status.lines().find_map(|line| {
-        let value = line.strip_prefix("State:")?.trim();
-        value.chars().next()
-    })
-}
-
-fn signal_pid(pid: u32, signal: &str) -> Result<()> {
-    let status = std::process::Command::new("kill")
-        .args([format!("-{signal}"), pid.to_string()])
-        .status()
-        .with_context(|| format!("kill -{signal} fuer PID {pid} fehlgeschlagen"))?;
-    if status.success() || !std::path::Path::new(&format!("/proc/{pid}")).exists() {
-        Ok(())
-    } else {
-        Err(anyhow!("kill -{signal} fuer PID {pid} lieferte {status}"))
-    }
-}
-
-fn terminate_agent_process(mut proc_handle: sentinel_sandbox::AgentProcess) {
-    let _ = signal_pid(proc_handle.pid, "TERM");
-    for _ in 0..10 {
-        if !proc_handle.is_running() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    proc_handle.terminate();
-}
-
 /// #75: verifies the just-spawned agent runs in its own network namespace
 /// (full cage) and enforces it.
 ///
@@ -681,13 +664,6 @@ fn enforce_agent_netns_isolation(
                 child_pid = cpid,
                 "Agent ist NICHT netz-isoliert (share_net?) — terminiere Prozess und lehne Spawn ab (#75)"
             );
-            // Durable health/monitoring status: no valid sandboxed process.
-            if let Ok(mut state) = security_runtime_state.write() {
-                if let Some(snapshot) = state.get_mut(&agent_id.0) {
-                    snapshot.runtime_pid = None;
-                    snapshot.bwrap_pid = None;
-                }
-            }
             // String-typed event — no DomainEventPayload enum variant / no
             // sentinel-common schema change (keeps clear of #493).
             let aggregate = format!("AGENT-{:02}", agent_id.0);
@@ -708,24 +684,37 @@ fn enforce_agent_netns_isolation(
             // process map remains as a compatibility fallback for pre-registry
             // fixtures only.
             let nano_owned = nano_runtimes.handle(agent_id).is_some();
+            let captured_cgroup_id = sandbox_handles
+                .get(&agent_id)
+                .filter(|handle| handle.cgroup_created)
+                .and_then(|handle| handle.cgroup_id);
             if nano_owned {
                 nano_runtimes.stop(agent_id).with_context(|| {
                     format!("NanoRuntime stop after isolation failure for {agent_id}")
                 })?;
             }
             if !nano_owned {
-                if let Some(proc) = agent_processes.remove(&agent_id) {
-                    terminate_agent_process(proc);
+                if let Some(process) = agent_processes.get_mut(&agent_id) {
+                    process.terminate_checked().with_context(|| {
+                        format!("legacy process stop after isolation failure for {agent_id}")
+                    })?;
+                }
+                if let Some(handle) = sandbox_handles.get(&agent_id) {
+                    sandbox.teardown_agent(handle)?;
                 }
             }
-            if let Some(handle) = sandbox_handles.remove(&agent_id) {
-                if handle.cgroup_created {
-                    if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
-                        ebpf_collector.unregister_agent(cid);
-                    }
-                }
-                if !nano_owned {
-                    sandbox.teardown_agent(&handle)?;
+            agent_processes.remove(&agent_id);
+            sandbox_handles.remove(&agent_id);
+            if let Some(cgroup_id) = captured_cgroup_id {
+                ebpf_collector.unregister_agent(cgroup_id);
+            }
+            // Publish the stopped observation only after the owning adapter (or
+            // legacy compatibility path) confirmed cleanup. A stop failure
+            // retains every observation and the exact retry handle.
+            if let Ok(mut state) = security_runtime_state.write() {
+                if let Some(snapshot) = state.get_mut(&agent_id.0) {
+                    snapshot.runtime_pid = None;
+                    snapshot.bwrap_pid = None;
                 }
             }
             if let Some(event_error) = event_error {
@@ -779,97 +768,6 @@ fn wait_for_fuse_mount(path: &std::path::Path, timeout: Duration) -> bool {
     mountpoint_is_active(path)
 }
 
-fn suspend_pids(pids: &[u32], tracked_pid: Option<u32>) -> Result<()> {
-    let mut unique_pids = pids.to_vec();
-    unique_pids.sort_unstable();
-    unique_pids.dedup();
-    if unique_pids.is_empty() {
-        return Err(anyhow!("keine PIDs zum Suspendieren vorhanden"));
-    }
-
-    for pid in &unique_pids {
-        signal_pid(*pid, "STOP")?;
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let mut stopped = Vec::new();
-        let mut still_running = Vec::new();
-        let mut tracked_state = None;
-        for pid in &unique_pids {
-            match proc_state(*pid) {
-                Some('T') => stopped.push(*pid),
-                Some(state) => {
-                    if Some(*pid) == tracked_pid {
-                        tracked_state = Some(state);
-                    }
-                    if state != 'Z' {
-                        still_running.push((*pid, state));
-                    }
-                }
-                None => {
-                    if Some(*pid) == tracked_pid {
-                        tracked_state = None;
-                    }
-                }
-            }
-        }
-        if still_running.is_empty() && !stopped.is_empty() {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            if !still_running.is_empty() {
-                let details = still_running
-                    .into_iter()
-                    .map(|(pid, state)| format!("{pid}:{state}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(anyhow!("PIDs nach SIGSTOP nicht angehalten: {details}"));
-            }
-            if let Some(pid) = tracked_pid {
-                let suffix = tracked_state
-                    .map(|state| format!(" (tracked state={state})"))
-                    .unwrap_or_default();
-                return Err(anyhow!(
-                    "kein laufender PID erreichte nach SIGSTOP Zustand T; tracked PID {pid}{suffix}"
-                ));
-            }
-            return Err(anyhow!(
-                "kein laufender PID erreichte nach SIGSTOP Zustand T"
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn suspend_agent_cgroup_processes(agent_name: &str, tracked_pid: Option<u32>) -> Result<Vec<u32>> {
-    let mut pids = sentinel_sandbox::cgroups::list_pids_in_cgroup(agent_name)
-        .with_context(|| format!("cgroup-Mitglieder fuer {agent_name} nicht lesbar"))?;
-    if let Some(pid) = tracked_pid {
-        pids.push(pid);
-    }
-    pids.sort_unstable();
-    pids.dedup();
-    suspend_pids(&pids, tracked_pid)?;
-    Ok(pids)
-}
-
-/// #428: Gegenstueck zu `suspend_agent_cgroup_processes` — schickt SIGCONT an alle Prozesse im
-/// Agent-Cgroup (+ tracked PID), um eine SIGSTOP-Pause aufzuheben. Gibt die fortgesetzten PIDs zurueck.
-fn resume_agent_cgroup_processes(agent_name: &str, tracked_pid: Option<u32>) -> Result<Vec<u32>> {
-    let mut pids = sentinel_sandbox::cgroups::list_pids_in_cgroup(agent_name)
-        .with_context(|| format!("cgroup-Mitglieder fuer {agent_name} nicht lesbar"))?;
-    if let Some(pid) = tracked_pid {
-        pids.push(pid);
-    }
-    pids.sort_unstable();
-    pids.dedup();
-    for pid in &pids {
-        signal_pid(*pid, "CONT")?;
-    }
-    Ok(pids)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent_nano_runtime(
     agent_cfg: &AgentConfig,
@@ -910,13 +808,14 @@ fn spawn_agent_nano_runtime(
         let observed = SandboxHandle {
             agent_name: agent_cfg.identity.name.clone(),
             cgroup_created: resources.cgroup_created,
+            cgroup_id: resources.cgroup_id,
             io_available: resources.io_available,
             bwrap_pid: resources.pid,
             landlock_applied: resources.landlock_applied,
             network_isolated: resources.network_isolated,
         };
         if observed.cgroup_created {
-            if let Some(cid) = sentinel_sandbox::cgroup_id(&agent_cfg.identity.name) {
+            if let Some(cid) = observed.cgroup_id {
                 ebpf_collector.register_agent(sentinel_ebpf::AgentCgroupMapping {
                     agent_name: agent_cfg.identity.name.clone(),
                     cgroup_path: sentinel_sandbox::cgroup_path(&agent_cfg.identity.name),
@@ -985,13 +884,14 @@ fn restore_agent_nano_runtime(
         let observed = SandboxHandle {
             agent_name: agent_cfg.identity.name.clone(),
             cgroup_created: resources.cgroup_created,
+            cgroup_id: resources.cgroup_id,
             io_available: resources.io_available,
             bwrap_pid: resources.pid,
             landlock_applied: resources.landlock_applied,
             network_isolated: resources.network_isolated,
         };
         if observed.cgroup_created {
-            if let Some(cid) = sentinel_sandbox::cgroup_id(&agent_cfg.identity.name) {
+            if let Some(cid) = observed.cgroup_id {
                 ebpf_collector.register_agent(sentinel_ebpf::AgentCgroupMapping {
                     agent_name: agent_cfg.identity.name.clone(),
                     cgroup_path: sentinel_sandbox::cgroup_path(&agent_cfg.identity.name),
@@ -2707,6 +2607,75 @@ fn tracked_pid_for_agent(
         })
 }
 
+fn runtime_control_outcome(error: &anyhow::Error) -> &'static str {
+    if error.downcast_ref::<NanoRuntimeControlError>().is_some() {
+        "unsupported_runtime_action"
+    } else {
+        "runtime_action_failed"
+    }
+}
+
+fn apply_agent_runtime_control(
+    runtime_orch: &mut RuntimeOrchestrator,
+    nano_runtimes: &mut DaemonNanoRuntimeRegistry,
+    agent_id: AgentId,
+    action: NanoRuntimeControlAction,
+) -> Result<NanoRuntimeControlResult> {
+    let current = runtime_orch
+        .agents()
+        .get(&agent_id)
+        .map(|handle| handle.status)
+        .ok_or_else(|| anyhow!("Agent {agent_id} not found"))?;
+    let target = match action {
+        NanoRuntimeControlAction::Suspend => sentinel_runtime::AgentStatus::Suspended,
+        NanoRuntimeControlAction::Resume => sentinel_runtime::AgentStatus::Active,
+    };
+    if !current.can_transition_to(target) {
+        return Err(anyhow!(
+            "Cannot {action} agent {agent_id} in state {current:?}"
+        ));
+    }
+
+    // Adapter authority moves first. Unsupported adapters reject before the
+    // logical state or its event stream can claim success.
+    let applied = nano_runtimes.control(agent_id, action)?;
+    let logical = match action {
+        NanoRuntimeControlAction::Suspend => runtime_orch.pause_agent(agent_id),
+        NanoRuntimeControlAction::Resume => runtime_orch.resume_agent(agent_id),
+    };
+    if let Err(logical_error) = logical {
+        let inverse = match action {
+            NanoRuntimeControlAction::Suspend => NanoRuntimeControlAction::Resume,
+            NanoRuntimeControlAction::Resume => NanoRuntimeControlAction::Suspend,
+        };
+        let rollback = nano_runtimes.control(agent_id, inverse).err();
+        return Err(match rollback {
+            Some(rollback) => anyhow!(
+                "logical {action} failed after adapter apply: {logical_error}; adapter rollback failed: {rollback}"
+            ),
+            None => logical_error.context(format!("logical {action} after adapter apply")),
+        });
+    }
+    Ok(applied)
+}
+
+fn reapply_persisted_runtime_suspension(
+    runtime_orch: &RuntimeOrchestrator,
+    nano_runtimes: &mut DaemonNanoRuntimeRegistry,
+    agent_id: AgentId,
+) -> Result<Option<NanoRuntimeControlResult>> {
+    if runtime_orch
+        .agents()
+        .get(&agent_id)
+        .is_some_and(|handle| handle.status == sentinel_runtime::AgentStatus::Suspended)
+    {
+        return nano_runtimes
+            .control(agent_id, NanoRuntimeControlAction::Suspend)
+            .map(Some);
+    }
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stop_agent_runtime_layer(
     agent_id: AgentId,
@@ -2717,6 +2686,10 @@ fn stop_agent_runtime_layer(
     agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
 ) -> Result<bool> {
     let nano_owned = nano_runtimes.handle(agent_id).is_some();
+    let captured_cgroup_id = sandbox_handles
+        .get(&agent_id)
+        .filter(|handle| handle.cgroup_created)
+        .and_then(|handle| handle.cgroup_id);
 
     // Keep the observation and eBPF registration intact until the selected
     // adapter confirms the stop.  A failed adapter stop retains its handle for
@@ -2724,29 +2697,29 @@ fn stop_agent_runtime_layer(
     // retry blind and leave the controller in a split state.
     if nano_owned {
         nano_runtimes.stop(agent_id)?;
-    }
-
-    let observed = sandbox_handles.remove(&agent_id);
-    if let Some(handle) = &observed {
-        if handle.cgroup_created {
-            if let Some(cid) = sentinel_sandbox::cgroup_id(&handle.agent_name) {
-                ebpf_collector.unregister_agent(cid);
-            }
+        sandbox_handles.remove(&agent_id);
+        if let Some(cgroup_id) = captured_cgroup_id {
+            ebpf_collector.unregister_agent(cgroup_id);
         }
-    }
-
-    if nano_owned {
         return Ok(true);
     }
 
-    if let Some(proc_handle) = agent_processes.remove(&agent_id) {
-        terminate_agent_process(proc_handle);
+    let legacy_process_present = agent_processes.contains_key(&agent_id);
+    let legacy_sandbox_present = sandbox_handles.contains_key(&agent_id);
+    if let Some(process) = agent_processes.get_mut(&agent_id) {
+        process
+            .terminate_checked()
+            .with_context(|| format!("legacy runtime stop for {agent_id}"))?;
     }
-    if let Some(handle) = observed {
-        sandbox.teardown_agent(&handle)?;
-        return Ok(true);
+    if let Some(handle) = sandbox_handles.get(&agent_id) {
+        sandbox.teardown_agent(handle)?;
     }
-    Ok(false)
+    agent_processes.remove(&agent_id);
+    sandbox_handles.remove(&agent_id);
+    if let Some(cgroup_id) = captured_cgroup_id {
+        ebpf_collector.unregister_agent(cgroup_id);
+    }
+    Ok(legacy_process_present || legacy_sandbox_present)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2802,6 +2775,10 @@ fn restart_agent_fast_path(
     fs_mount: Option<&str>,
 ) -> Result<FastRestartResult> {
     let agent_id = AgentId(agent_cfg.identity.id);
+    let was_suspended = runtime_orch
+        .agents()
+        .get(&agent_id)
+        .is_some_and(|handle| handle.status == sentinel_runtime::AgentStatus::Suspended);
     let pid_before = tracked_pid_for_agent(
         agent_id,
         sandbox_handles,
@@ -2845,6 +2822,31 @@ fn restart_agent_fast_path(
             "Fast-Respawn fuer {} fehlgeschlagen",
             agent_cfg.identity.name
         ));
+    }
+
+    if was_suspended {
+        if let Err(control_error) = apply_agent_runtime_control(
+            runtime_orch,
+            nano_runtimes,
+            agent_id,
+            NanoRuntimeControlAction::Suspend,
+        ) {
+            let runtime_cleanup = stop_agent_runtime_layer(
+                agent_id,
+                nano_runtimes,
+                sandbox,
+                sandbox_handles,
+                ebpf_collector,
+                agent_processes,
+            )
+            .err();
+            remove_security_runtime_snapshot(security_runtime_state, agent_id);
+            despawn_agent_from_world(world, agent_id);
+            let logical_cleanup = runtime_orch.despawn_agent(agent_id).err();
+            return Err(anyhow!(
+                "re-suspend after restart failed: {control_error}; runtime_cleanup={runtime_cleanup:?}; logical_cleanup={logical_cleanup:?}"
+            ));
+        }
     }
 
     let pid_after = tracked_pid_for_agent(
@@ -5740,28 +5742,21 @@ fn ecs_tick_loop(
             continue;
         }
 
-        // #428: restore the suspended process state after the selected runtime
-        // has materialized its workload.
-        if runtime_orch
-            .agents()
-            .get(&agent_id)
-            .map(|handle| handle.status == sentinel_runtime::AgentStatus::Suspended)
-            .unwrap_or(false)
+        // #428: restore the suspended state through the selected adapter after
+        // materializing the workload. Failure aborts startup; an active
+        // incarnation must never be published for a persisted Suspended agent.
+        if let Some(applied) =
+            reapply_persisted_runtime_suspension(&runtime_orch, &mut nano_runtimes, agent_id)
+                .with_context(|| {
+                    format!("re-suspend restored {agent_id} through selected NanoRuntime")
+                })?
         {
-            if let Some(handle) = sandbox_handles.get(&agent_id) {
-                match suspend_agent_cgroup_processes(&handle.agent_name, handle.bwrap_pid) {
-                    Ok(pids) => info!(
-                        agent_id = %agent_id,
-                        stopped_pids = pids.len(),
-                        "Restored suspended agent re-eingefroren (#428 Re-SIGSTOP nach Restart)"
-                    ),
-                    Err(error) => warn!(
-                        agent_id = %agent_id,
-                        error = %error,
-                        "Re-SIGSTOP fuer restored suspended agent fehlgeschlagen"
-                    ),
-                }
-            }
+            info!(
+                agent_id = %agent_id,
+                runtime = %applied.runtime_key,
+                affected_units = applied.affected_units,
+                "Restored suspended agent re-suspended through selected NanoRuntime"
+            );
         }
 
         // ECS Entity erstellen
@@ -6155,11 +6150,9 @@ fn ecs_tick_loop(
                             let bookkeeping_elapsed_ns =
                                 bookkeeping_started.elapsed().as_nanos() as u64;
                             let pre_suspend_result = match request.mode.as_str() {
-                                "sigstop" => suspend_agent_cgroup_processes(
-                                    &agent_cfg.identity.name,
-                                    pid_before,
-                                )
-                                .map(|_| ()),
+                                "sigstop" => nano_runtimes
+                                    .control(agent_id, NanoRuntimeControlAction::Suspend)
+                                    .map(|_| ()),
                                 "direct" => Ok(()),
                                 _ => Err(anyhow!("unbekannter stall-restart-test mode")),
                             };
@@ -6272,8 +6265,8 @@ fn ecs_tick_loop(
                         last_event_id,
                     });
                 }
-                // #428: per-Agent Pause — SIGSTOP der Sandbox-Prozesse + Status->Suspended.
-                // Nicht destruktiv: ECS-Entity + Memory/Evolution bleiben (KEIN teardown_agent_full).
+                // #428: per-Agent Pause through the selected runtime adapter.
+                // Non-destructive: ECS entity and memory/evolution remain.
                 RuntimeControlCommand::Pause {
                     agent_id,
                     response_tx,
@@ -6291,21 +6284,34 @@ fn ecs_tick_loop(
                             outcome: "not_found".to_string(),
                             note: "Agent nicht in der Runtime".to_string(),
                         }
+                    } else if !runtime_orch.agents().get(&aid).is_some_and(|handle| {
+                        handle
+                            .status
+                            .can_transition_to(sentinel_runtime::AgentStatus::Suspended)
+                    }) {
+                        AgentLifecycleResponse {
+                            accepted: false,
+                            agent_id,
+                            aggregate_id,
+                            action: "pause".to_string(),
+                            new_status: String::new(),
+                            affected_pids: 0,
+                            outcome: "invalid_transition".to_string(),
+                            note: "Agent is already suspended or cannot be suspended".to_string(),
+                        }
                     } else {
-                        match runtime_orch.pause_agent(aid) {
-                            Ok(()) => {
-                                let affected = sandbox_handles
-                                    .get(&aid)
-                                    .and_then(|h| {
-                                        suspend_agent_cgroup_processes(&h.agent_name, h.bwrap_pid)
-                                            .ok()
-                                    })
-                                    .map(|pids| pids.len())
-                                    .unwrap_or(0);
+                        match apply_agent_runtime_control(
+                            &mut runtime_orch,
+                            &mut nano_runtimes,
+                            aid,
+                            NanoRuntimeControlAction::Suspend,
+                        ) {
+                            Ok(applied) => {
                                 info!(
                                     agent_id = %aid,
-                                    affected_pids = affected,
-                                    "Agent pausiert (#428 SIGSTOP; ECS-Entity + Memory bleiben)"
+                                    runtime = %applied.runtime_key,
+                                    affected_units = applied.affected_units,
+                                    "Agent paused through selected NanoRuntime"
                                 );
                                 AgentLifecycleResponse {
                                     accepted: true,
@@ -6313,10 +6319,12 @@ fn ecs_tick_loop(
                                     aggregate_id,
                                     action: "pause".to_string(),
                                     new_status: "suspended".to_string(),
-                                    affected_pids: affected,
+                                    affected_pids: applied.affected_units,
                                     outcome: "ok".to_string(),
-                                    note: "paused (SIGSTOP; ECS-Entity + Memory bleiben)"
-                                        .to_string(),
+                                    note: format!(
+                                        "paused through {} ({:?})",
+                                        applied.runtime_key, applied.outcome
+                                    ),
                                 }
                             }
                             Err(error) => AgentLifecycleResponse {
@@ -6326,14 +6334,14 @@ fn ecs_tick_loop(
                                 action: "pause".to_string(),
                                 new_status: String::new(),
                                 affected_pids: 0,
-                                outcome: "invalid_transition".to_string(),
+                                outcome: runtime_control_outcome(&error).to_string(),
                                 note: error.to_string(),
                             },
                         }
                     };
                     let _ = response_tx.send(response);
                 }
-                // #428: per-Agent Resume — SIGCONT + Status->Active. Gegenstueck zu Pause.
+                // #428: per-Agent Resume through the selected runtime adapter.
                 RuntimeControlCommand::Resume {
                     agent_id,
                     response_tx,
@@ -6351,21 +6359,34 @@ fn ecs_tick_loop(
                             outcome: "not_found".to_string(),
                             note: "Agent nicht in der Runtime".to_string(),
                         }
+                    } else if !runtime_orch.agents().get(&aid).is_some_and(|handle| {
+                        handle
+                            .status
+                            .can_transition_to(sentinel_runtime::AgentStatus::Active)
+                    }) {
+                        AgentLifecycleResponse {
+                            accepted: false,
+                            agent_id,
+                            aggregate_id,
+                            action: "resume".to_string(),
+                            new_status: String::new(),
+                            affected_pids: 0,
+                            outcome: "invalid_transition".to_string(),
+                            note: "Agent is already active or cannot be resumed".to_string(),
+                        }
                     } else {
-                        match runtime_orch.resume_agent(aid) {
-                            Ok(()) => {
-                                let affected = sandbox_handles
-                                    .get(&aid)
-                                    .and_then(|h| {
-                                        resume_agent_cgroup_processes(&h.agent_name, h.bwrap_pid)
-                                            .ok()
-                                    })
-                                    .map(|pids| pids.len())
-                                    .unwrap_or(0);
+                        match apply_agent_runtime_control(
+                            &mut runtime_orch,
+                            &mut nano_runtimes,
+                            aid,
+                            NanoRuntimeControlAction::Resume,
+                        ) {
+                            Ok(applied) => {
                                 info!(
                                     agent_id = %aid,
-                                    affected_pids = affected,
-                                    "Agent fortgesetzt (#428 SIGCONT)"
+                                    runtime = %applied.runtime_key,
+                                    affected_units = applied.affected_units,
+                                    "Agent resumed through selected NanoRuntime"
                                 );
                                 AgentLifecycleResponse {
                                     accepted: true,
@@ -6373,9 +6394,12 @@ fn ecs_tick_loop(
                                     aggregate_id,
                                     action: "resume".to_string(),
                                     new_status: "active".to_string(),
-                                    affected_pids: affected,
+                                    affected_pids: applied.affected_units,
                                     outcome: "ok".to_string(),
-                                    note: "resumed (SIGCONT)".to_string(),
+                                    note: format!(
+                                        "resumed through {} ({:?})",
+                                        applied.runtime_key, applied.outcome
+                                    ),
                                 }
                             }
                             Err(error) => AgentLifecycleResponse {
@@ -6385,7 +6409,7 @@ fn ecs_tick_loop(
                                 action: "resume".to_string(),
                                 new_status: String::new(),
                                 affected_pids: 0,
-                                outcome: "invalid_transition".to_string(),
+                                outcome: runtime_control_outcome(&error).to_string(),
                                 note: error.to_string(),
                             },
                         }
@@ -6531,35 +6555,24 @@ fn ecs_tick_loop(
                     crate::platform_controlplane::rules::PlatformSideEffect::SuspendAgent(
                         agent_id,
                     ) => {
-                        if let Some(handle) = sandbox_handles.get(&agent_id) {
-                            match suspend_agent_cgroup_processes(
-                                &handle.agent_name,
-                                handle.bwrap_pid,
-                            ) {
-                                Ok(pids) => {
-                                    info!(
-                                        agent_id = %agent_id,
-                                        agent = %handle.agent_name,
-                                        tracked_pid = ?handle.bwrap_pid,
-                                        stopped_pids = pids.len(),
-                                        "Agent nach Write-Anomaly via SIGSTOP suspendiert"
-                                    );
-                                }
-                                Err(error) => {
-                                    warn!(
-                                        agent_id = %agent_id,
-                                        agent = %handle.agent_name,
-                                        tracked_pid = ?handle.bwrap_pid,
-                                        error = %error,
-                                        "SIGSTOP fuer Write-Anomaly fehlgeschlagen"
-                                    );
-                                }
-                            }
-                        } else {
-                            warn!(
+                        match apply_agent_runtime_control(
+                            &mut runtime_orch,
+                            &mut nano_runtimes,
+                            agent_id,
+                            NanoRuntimeControlAction::Suspend,
+                        ) {
+                            Ok(applied) => info!(
                                 agent_id = %agent_id,
-                                "SandboxHandle fuer Write-Anomaly-Suspend fehlt"
-                            );
+                                runtime = %applied.runtime_key,
+                                affected_units = applied.affected_units,
+                                "Agent suspended by control plane through selected NanoRuntime"
+                            ),
+                            Err(error) => error!(
+                                agent_id = %agent_id,
+                                outcome = runtime_control_outcome(&error),
+                                error = %error,
+                                "Control-plane suspend rejected fail-closed"
+                            ),
                         }
                     }
                     crate::platform_controlplane::rules::PlatformSideEffect::RestartAgent(
@@ -8815,6 +8828,7 @@ mod tests {
             SandboxHandle {
                 agent_name: agent_name.to_string(),
                 cgroup_created: false,
+                cgroup_id: None,
                 io_available: false,
                 bwrap_pid: Some(123),
                 landlock_applied: false,
@@ -9086,6 +9100,334 @@ mod tests {
             registry.stop(AgentId(2)).unwrap().unwrap().outcome,
             sentinel_common::nano_runtime::NanoStopOutcome::Stopped
         );
+    }
+
+    fn ecs_registry_with_handle(
+        agent_id: AgentId,
+        handle_in_daemon: NanoHandle,
+        adapter: EcsNativeRuntime,
+    ) -> DaemonNanoRuntimeRegistry {
+        let mut registry = NanoRuntimeRegistry::new(None);
+        registry.register(adapter).unwrap();
+        DaemonNanoRuntimeRegistry {
+            registry,
+            handles: HashMap::from([(agent_id, handle_in_daemon)]),
+        }
+    }
+
+    #[test]
+    fn stop_captures_cgroup_id_before_adapter_cleanup_and_unregisters_after_success() {
+        use sentinel_common::nano_runtime::NanoRuntime;
+
+        let agent_id = AgentId(8);
+        let mut adapter = EcsNativeRuntime::external_lifecycle(4);
+        let workload = DaemonNanoRuntimeRegistry::workload(
+            &test_ecs_agent_config(8, "Captured Cgroup", "Tester", 1),
+            &[],
+        );
+        let handle = adapter.spawn(workload).unwrap();
+        let mut nano_runtimes = ecs_registry_with_handle(agent_id, handle, adapter);
+        let sandbox = test_sandbox();
+        let mut sandbox_handles = HashMap::from([(
+            agent_id,
+            SandboxHandle {
+                agent_name: "Captured Cgroup".to_string(),
+                cgroup_created: true,
+                cgroup_id: Some(4242),
+                io_available: false,
+                bwrap_pid: None,
+                landlock_applied: false,
+                network_isolated: false,
+            },
+        )]);
+        let mut agent_processes = HashMap::new();
+        let (mut ebpf_collector, _) = test_ebpf();
+        ebpf_collector.register_agent(sentinel_ebpf::AgentCgroupMapping {
+            agent_name: "Captured Cgroup".to_string(),
+            cgroup_path: "/removed/by-adapter".to_string(),
+            cgroup_id: 4242,
+            pid: None,
+        });
+
+        assert!(stop_agent_runtime_layer(
+            agent_id,
+            &mut nano_runtimes,
+            &sandbox,
+            &mut sandbox_handles,
+            &mut ebpf_collector,
+            &mut agent_processes,
+        )
+        .unwrap());
+        assert!(!ebpf_collector.is_agent_registered(4242));
+        assert!(!sandbox_handles.contains_key(&agent_id));
+        assert!(nano_runtimes.handle(agent_id).is_none());
+    }
+
+    #[test]
+    fn failed_adapter_stop_retains_handle_observation_and_ebpf_registration() {
+        use sentinel_common::nano_runtime::NanoRuntime;
+
+        let agent_id = AgentId(9);
+        let mut adapter = EcsNativeRuntime::external_lifecycle(4);
+        let workload = DaemonNanoRuntimeRegistry::workload(
+            &test_ecs_agent_config(9, "Retry Cgroup", "Tester", 1),
+            &[],
+        );
+        let active = adapter.spawn(workload).unwrap();
+        let stale = NanoHandle {
+            instance_id: uuid::Uuid::new_v4(),
+            ..active
+        };
+        let mut nano_runtimes = ecs_registry_with_handle(agent_id, stale, adapter);
+        let sandbox = test_sandbox();
+        let mut sandbox_handles = HashMap::from([(
+            agent_id,
+            SandboxHandle {
+                agent_name: "Retry Cgroup".to_string(),
+                cgroup_created: true,
+                cgroup_id: Some(4343),
+                io_available: false,
+                bwrap_pid: None,
+                landlock_applied: false,
+                network_isolated: false,
+            },
+        )]);
+        let mut agent_processes = HashMap::new();
+        let (mut ebpf_collector, _) = test_ebpf();
+        ebpf_collector.register_agent(sentinel_ebpf::AgentCgroupMapping {
+            agent_name: "Retry Cgroup".to_string(),
+            cgroup_path: "/still-owned".to_string(),
+            cgroup_id: 4343,
+            pid: None,
+        });
+
+        assert!(stop_agent_runtime_layer(
+            agent_id,
+            &mut nano_runtimes,
+            &sandbox,
+            &mut sandbox_handles,
+            &mut ebpf_collector,
+            &mut agent_processes,
+        )
+        .is_err());
+        assert!(ebpf_collector.is_agent_registered(4343));
+        assert!(sandbox_handles.contains_key(&agent_id));
+        assert!(nano_runtimes.handle(agent_id).is_some());
+    }
+
+    #[test]
+    fn isolation_failure_with_failed_adapter_stop_retains_all_observations() {
+        use sentinel_common::nano_runtime::NanoRuntime;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let event_store = EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap();
+        let agent_id = AgentId(10);
+        let mut adapter = EcsNativeRuntime::external_lifecycle(4);
+        let workload = DaemonNanoRuntimeRegistry::workload(
+            &test_ecs_agent_config(10, "Isolation Retry", "Tester", 1),
+            &[],
+        );
+        let active = adapter.spawn(workload).unwrap();
+        let stale = NanoHandle {
+            instance_id: uuid::Uuid::new_v4(),
+            ..active
+        };
+        let mut nano_runtimes = ecs_registry_with_handle(agent_id, stale, adapter);
+        let sandbox = test_sandbox();
+        let mut sandbox_handles = HashMap::from([(
+            agent_id,
+            SandboxHandle {
+                agent_name: "Isolation Retry".to_string(),
+                cgroup_created: true,
+                cgroup_id: Some(4444),
+                io_available: false,
+                bwrap_pid: Some(std::process::id()),
+                landlock_applied: false,
+                network_isolated: false,
+            },
+        )]);
+        let mut agent_processes = HashMap::new();
+        let (mut ebpf_collector, _) = test_ebpf();
+        ebpf_collector.register_agent(sentinel_ebpf::AgentCgroupMapping {
+            agent_name: "Isolation Retry".to_string(),
+            cgroup_path: "/still-owned".to_string(),
+            cgroup_id: 4444,
+            pid: Some(std::process::id()),
+        });
+        let security_runtime_state: operator_api::SharedSecurityRuntimeState = Default::default();
+        record_nano_runtime_snapshot(
+            &security_runtime_state,
+            agent_id,
+            "Isolation Retry",
+            nano_runtimes.handle(agent_id).unwrap(),
+            &NanoRuntimeResources {
+                instance_id: Some(nano_runtimes.handle(agent_id).unwrap().instance_id),
+                pid: Some(std::process::id()),
+                cgroup_created: true,
+                cgroup_id: Some(4444),
+                ..NanoRuntimeResources::default()
+            },
+            None,
+        );
+
+        assert!(enforce_agent_netns_isolation(
+            agent_id,
+            "Isolation Retry",
+            Some(std::process::id()),
+            &sandbox,
+            &mut sandbox_handles,
+            &mut ebpf_collector,
+            &mut agent_processes,
+            &mut nano_runtimes,
+            &security_runtime_state,
+            &event_store,
+        )
+        .is_err());
+        assert!(nano_runtimes.handle(agent_id).is_some());
+        assert!(sandbox_handles.contains_key(&agent_id));
+        assert!(ebpf_collector.is_agent_registered(4444));
+        let snapshot = security_runtime_state.read().unwrap();
+        assert_eq!(snapshot[&agent_id.0].runtime_pid, Some(std::process::id()));
+        assert_eq!(snapshot[&agent_id.0].bwrap_pid, None);
+    }
+
+    #[test]
+    fn runtime_control_is_registry_owned_and_updates_logical_state_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_store =
+            Arc::new(EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap());
+        let mut runtime_orch =
+            RuntimeOrchestrator::new(4).with_event_store(Arc::clone(&event_store));
+        let (mut world, _) = create_simulation_world();
+        let sandbox = test_sandbox();
+        let mut sandbox_handles = HashMap::new();
+        let mut agent_processes = HashMap::new();
+        let (mut ebpf_collector, _) = test_ebpf();
+        let mut nano_runtimes = DaemonNanoRuntimeRegistry::production(4, None).unwrap();
+        let security_runtime_state: operator_api::SharedSecurityRuntimeState = Default::default();
+        let agent = test_ecs_agent_config(11, "Registry Control", "Tester", 1);
+
+        assert!(spawn_agent_full(
+            &mut runtime_orch,
+            &mut world,
+            &agent,
+            &sandbox,
+            &mut sandbox_handles,
+            &mut ebpf_collector,
+            &mut agent_processes,
+            &mut nano_runtimes,
+            &[],
+            &security_runtime_state,
+            event_store.as_ref(),
+            None,
+        ));
+        let agent_id = AgentId(11);
+        apply_agent_runtime_control(
+            &mut runtime_orch,
+            &mut nano_runtimes,
+            agent_id,
+            NanoRuntimeControlAction::Suspend,
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_orch.agents()[&agent_id].status,
+            sentinel_runtime::AgentStatus::Suspended
+        );
+        let handle = nano_runtimes.handle(agent_id).unwrap().clone();
+        assert_eq!(
+            nano_runtimes.registry.health(&handle).unwrap().state,
+            sentinel_common::nano_runtime::NanoHealthState::Degraded
+        );
+
+        // Model a process restart: the persisted logical state remains
+        // Suspended while the newly materialized adapter starts active.
+        nano_runtimes
+            .control(agent_id, NanoRuntimeControlAction::Resume)
+            .unwrap();
+        assert!(
+            reapply_persisted_runtime_suspension(&runtime_orch, &mut nano_runtimes, agent_id,)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            nano_runtimes.registry.health(&handle).unwrap().state,
+            sentinel_common::nano_runtime::NanoHealthState::Degraded
+        );
+
+        apply_agent_runtime_control(
+            &mut runtime_orch,
+            &mut nano_runtimes,
+            agent_id,
+            NanoRuntimeControlAction::Resume,
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_orch.agents()[&agent_id].status,
+            sentinel_runtime::AgentStatus::Active
+        );
+        assert_eq!(
+            nano_runtimes.registry.health(&handle).unwrap().state,
+            sentinel_common::nano_runtime::NanoHealthState::Healthy
+        );
+    }
+
+    #[test]
+    fn failed_runtime_control_does_not_publish_a_logical_transition() {
+        use sentinel_common::nano_runtime::NanoRuntime;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let event_store =
+            Arc::new(EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap());
+        let mut runtime_orch =
+            RuntimeOrchestrator::new(4).with_event_store(Arc::clone(&event_store));
+        let identity = AgentIdentity {
+            agent_id: AgentId(13),
+            name: "Control Failure".to_string(),
+            role: "Tester".to_string(),
+        };
+        runtime_orch
+            .spawn_agent(
+                identity,
+                ShiftInfo {
+                    shift_set: 1,
+                    shift_start_hour: 6,
+                    shift_end_hour: 14,
+                    is_on_duty: true,
+                },
+                "empfang",
+            )
+            .unwrap();
+
+        let mut adapter = EcsNativeRuntime::external_lifecycle(4);
+        let active = adapter
+            .spawn(DaemonNanoRuntimeRegistry::workload(
+                &test_ecs_agent_config(13, "Control Failure", "Tester", 1),
+                &[],
+            ))
+            .unwrap();
+        let stale = NanoHandle {
+            instance_id: uuid::Uuid::new_v4(),
+            ..active
+        };
+        let mut nano_runtimes = ecs_registry_with_handle(AgentId(13), stale, adapter);
+
+        assert!(apply_agent_runtime_control(
+            &mut runtime_orch,
+            &mut nano_runtimes,
+            AgentId(13),
+            NanoRuntimeControlAction::Suspend,
+        )
+        .is_err());
+        assert_eq!(
+            runtime_orch.agents()[&AgentId(13)].status,
+            sentinel_runtime::AgentStatus::Active,
+            "adapter failure must not publish a logical suspend or event"
+        );
+        assert!(event_store
+            .get_events_by_aggregate("AGENT-13", 100)
+            .unwrap()
+            .iter()
+            .all(|event| event.event_type != "agent_status_changed"));
     }
 
     #[test]
@@ -10032,21 +10374,6 @@ mod tests {
     }
 
     #[test]
-    fn test_suspend_pids_stops_tracked_process() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("sleep child");
-        let pid = child.id();
-
-        suspend_pids(&[pid], Some(pid)).expect("pid suspended");
-        assert_eq!(proc_state(pid), Some('T'));
-
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    #[test]
     fn test_restart_agent_fast_path_recreates_runtime_and_security_state() {
         let tmp = tempfile::tempdir().unwrap();
         let events_path = tmp.path().join("events.db");
@@ -10114,6 +10441,71 @@ mod tests {
                 "Fast-Restart sollte einen neuen PID liefern"
             );
         }
+    }
+
+    #[test]
+    fn restart_agent_fast_path_reapplies_selected_runtime_suspension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_store =
+            Arc::new(EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap());
+        let mut runtime_orch =
+            RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
+        let (mut world, _) = create_simulation_world();
+        let sandbox = test_sandbox();
+        let (mut ebpf_collector, _) = test_ebpf();
+        let mut sandbox_handles = HashMap::new();
+        let mut agent_processes = HashMap::new();
+        let mut nano_runtimes = DaemonNanoRuntimeRegistry::production(10, None).unwrap();
+        let security_runtime_state = Arc::new(RwLock::new(HashMap::new()));
+        let agent_cfg = test_ecs_agent_config(12, "Suspended Restart", "Tester", 1);
+
+        assert!(spawn_agent_full(
+            &mut runtime_orch,
+            &mut world,
+            &agent_cfg,
+            &sandbox,
+            &mut sandbox_handles,
+            &mut ebpf_collector,
+            &mut agent_processes,
+            &mut nano_runtimes,
+            &[],
+            &security_runtime_state,
+            event_store.as_ref(),
+            None,
+        ));
+        apply_agent_runtime_control(
+            &mut runtime_orch,
+            &mut nano_runtimes,
+            AgentId(12),
+            NanoRuntimeControlAction::Suspend,
+        )
+        .unwrap();
+
+        restart_agent_fast_path(
+            &mut world,
+            &mut runtime_orch,
+            &agent_cfg,
+            &sandbox,
+            &mut sandbox_handles,
+            &mut ebpf_collector,
+            &mut agent_processes,
+            &mut nano_runtimes,
+            &[],
+            &security_runtime_state,
+            event_store.as_ref(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime_orch.agents()[&AgentId(12)].status,
+            sentinel_runtime::AgentStatus::Suspended
+        );
+        let handle = nano_runtimes.handle(AgentId(12)).unwrap().clone();
+        assert_eq!(
+            nano_runtimes.registry.health(&handle).unwrap().state,
+            sentinel_common::nano_runtime::NanoHealthState::Degraded
+        );
     }
 
     #[test]
