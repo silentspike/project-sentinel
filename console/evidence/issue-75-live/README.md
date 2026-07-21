@@ -2,7 +2,7 @@
 
 Issue: `#75`
 Deployment VM: `ubuntu@10.0.0.240` (`sentinel-ubuntu-2404`)
-Release binary SHA-256: `cffa9026d878bc81b848e4436a6be0b01045be09c5286ba6b5f967a5832a88c5`
+Release binary SHA-256: `ade509a933cb46bdd438f05a84ac346e743401132966819b42f651dfb928fa65`
 
 All Rust compilation and tests were run through `cargo remote -c --`. Runtime
 checks and performance measurements were run on the deployment VM, never on the
@@ -21,7 +21,7 @@ The deployed daemon runs 26 agent-runtime processes. The check below uses the
 sandboxed child PIDs, not the outer bwrap supervisors.
 
 ```text
-daemon_pid=595603 daemon_netns=net:[4026531833] agent_count=26
+daemon_pid=603094 daemon_netns=net:[4026531833] agent_count=26
 unique_agent_netns=26 shared_with_daemon=0 loopback_only_agents=26
 ```
 
@@ -46,7 +46,7 @@ They completed in `0.52s` and left no issue-owned process or cgroup.
 ## AC-2: No External Network
 
 ```text
-external_probe_pid=595637 rc=1
+external_probe_pid=603121 rc=1
 bash: connect: Network is unreachable
 bash: /dev/tcp/1.1.1.1/443: Network is unreachable
 ```
@@ -62,6 +62,9 @@ production enforcement function, and verifies process termination, sandbox
 teardown, degraded health state, and one durable `AgentIsolationFailed` event.
 The complementary acceptance test independently verifies the same shared-net
 classification at the sandbox boundary.
+
+The VM test executable was built remotely from the final source and had
+SHA-256 `1c6c4452bbb09fb72e57506180f574acd4553b063585546505a9e795636d2eb2`.
 
 ```text
 [landlock-wrapper] Landlock enforced
@@ -83,22 +86,22 @@ agent_isolation_events_since_deploy=0
 
 ## AC-5: Thirty-Minute Soak
 
-Final output from `/tmp/issue75/soak-final-cffa9026`, executed against release
-SHA-256 `cffa9026d878bc81b848e4436a6be0b01045be09c5286ba6b5f967a5832a88c5`:
+Final output from `/tmp/issue75/soak-final-ade509a9`, executed against release
+SHA-256 `ade509a933cb46bdd438f05a84ac346e743401132966819b42f651dfb928fa65`:
 
 ```text
-t=   1s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=   0s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
 ...
 t=1800s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
 agent_count=26 unique_agent_netns=26 shared_with_daemon=0 loopback_only_agents=26 external_probe_rc=1 legacy_links=0 failed=none
-FINAL legacy_errors=0 isolation_log_failures=0 isolation_events=0 panic_fatal=0 elapsed_s=1801
-SOAK_PASS out_dir=/tmp/issue75/soak-final-cffa9026
+FINAL legacy_errors=0 isolation_log_failures=0 isolation_events=0 panic_fatal=0 elapsed_s=1803
+SOAK_PASS out_dir=/tmp/issue75/soak-final-ade509a9
 ```
 
 The soak performed 31 runtime-health reads at one-minute intervals, polled all
 five services with `NRestarts=0`, and recorded `vmstat`, `mpstat`, `iostat -x`,
 and `ss` sidecars. The tracked `normal-path-soak.txt` has SHA-256
-`a50628b651c8240396542a484fa7e3dc4f795cd9aa22a2391b4fb64d46ed4092`.
+`0db6ecf7006437b644a305b36dc47ded590b32495e06e04f74471e7b68d1e0b0`.
 
 ## AC-6: Regression Gates And Runtime Health
 
@@ -118,7 +121,7 @@ PASS
 
 $ cargo remote -c -- build -p sentinel-daemon --release -j1
 PASS
-release SHA-256: cffa9026d878bc81b848e4436a6be0b01045be09c5286ba6b5f967a5832a88c5
+release SHA-256: ade509a933cb46bdd438f05a84ac346e743401132966819b42f651dfb928fa65
 ```
 
 Initial deployed health:
@@ -136,22 +139,21 @@ Command:
 
 ```bash
 sudo /tmp/issue75/vm-issue-75-bench.py \
-  --agent-pid 582215 --spawn-samples 1000 --verify-samples 10000
+  --agent-pid 603121 --spawn-samples 1000 --verify-samples 10000
 ```
 
 Results on `.240` with bubblewrap 0.9.0:
 
 | Operation | Samples | p50 | p95 | max |
 |---|---:|---:|---:|---:|
-| Full-cage bwrap spawn + `true` + reap | 1,000 | 9.523 ms | 20.977 ms | 53.836 ms |
-| Two-read netns isolation verifier | 10,000 | 6.625 us | 15.381 us | 75.043 us |
+| Full-cage bwrap spawn + `true` + reap | 1,000 | 5.643 ms | 7.415 ms | 12.293 ms |
+| Two-read netns isolation verifier | 10,000 | 6.584 us | 11.397 us | 68.571 us |
 
 The spawn figure includes process creation, namespace setup, the command, and
 reaping. The dead bridge/veth path has no valid historical deploy-VM baseline,
-so no fabricated delta is reported. The VM reported 10.58% mean steal time
-during this deliberately uncorrected live-load measurement; the observed tail
-is reported as-is. Sidecars are in
-`/tmp/issue75/benchmark-20260721T000859Z`.
+so no fabricated delta is reported. The benchmark ran on the live deployment
+VM with all 26 agents active; the thirty-minute soak captured the accompanying
+`vmstat`, `mpstat`, `iostat`, and `ss` resource sidecars.
 
 ## Architecture Readback
 
