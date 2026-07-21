@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 pub use sentinel_common::AgentId;
 
+fn legacy_tenant_id() -> String {
+    "legacy".to_owned()
+}
+
 macro_rules! string_id {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -60,15 +64,55 @@ impl ActorRole {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalKind {
+    Customer,
+    Operator,
+    Agent,
+}
+
+impl PrincipalKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Customer => "customer",
+            Self::Operator => "operator",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+/// Identity established by a trusted transport adapter.
+///
+/// API payloads never deserialize this type. The authentication adapter binds
+/// the subject and the organization role to a credential before the workflow
+/// engine receives a command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthenticatedActor {
-    pub actor_id: String,
+pub struct AuthenticatedPrincipal {
+    pub principal_id: String,
+    pub tenant_id: String,
+    pub kind: PrincipalKind,
     pub role: ActorRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub customer_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
 }
+
+impl AuthenticatedPrincipal {
+    pub fn idempotency_namespace(&self) -> String {
+        format!(
+            "v1:{}:{}:{}:{}:{}",
+            self.tenant_id.len(),
+            self.tenant_id,
+            self.kind.as_str(),
+            self.principal_id.len(),
+            self.principal_id
+        )
+    }
+}
+
+pub(crate) type AuthenticatedActor = AuthenticatedPrincipal;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,6 +146,8 @@ pub struct CustomerFeedback {
 pub struct CustomerRequest {
     pub schema_version: u32,
     pub id: CustomerRequestId,
+    #[serde(default = "legacy_tenant_id")]
+    pub tenant_id: String,
     pub customer_id: String,
     pub summary_ref: String,
     pub desired_outcome: String,
@@ -126,13 +172,38 @@ pub struct ProposalBinding {
     /// Immutable per-provider admission ceilings. Callers cannot supply or
     /// raise these limits when reserving cost.
     pub provider_cost_ceilings_micros: BTreeMap<String, u64>,
+    /// Governance is part of the proposal digest and cannot be supplied or
+    /// changed by the customer during acceptance.
+    #[serde(default)]
+    pub governance: ProposalGovernance,
     pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalGovernance {
+    pub profile_id: String,
+    pub policy_id: String,
+    pub owner: AgentId,
+    pub participants: Vec<AgentId>,
+}
+
+impl Default for ProposalGovernance {
+    fn default() -> Self {
+        Self {
+            profile_id: String::new(),
+            policy_id: String::new(),
+            owner: AgentId(0),
+            participants: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Proposal {
     pub schema_version: u32,
     pub id: ProposalId,
+    #[serde(default = "legacy_tenant_id")]
+    pub tenant_id: String,
     pub customer_request_id: CustomerRequestId,
     pub generation: u32,
     pub binding: ProposalBinding,
@@ -145,6 +216,8 @@ pub struct Proposal {
 pub struct Agreement {
     pub schema_version: u32,
     pub id: AgreementId,
+    #[serde(default = "legacy_tenant_id")]
+    pub tenant_id: String,
     pub customer_request_id: CustomerRequestId,
     pub proposal_id: ProposalId,
     pub proposal_digest: String,
@@ -168,6 +241,8 @@ pub enum ProjectState {
 pub struct Project {
     pub schema_version: u32,
     pub id: ProjectId,
+    #[serde(default = "legacy_tenant_id")]
+    pub tenant_id: String,
     pub agreement_id: AgreementId,
     pub agreement_digest: String,
     pub profile_id: String,
@@ -248,6 +323,10 @@ pub struct Assignment {
     pub assignee: AgentId,
     /// Immutable policy input used for this assignment decision.
     pub assignee_profile: AgentProfile,
+    #[serde(default)]
+    pub organization_generation: u64,
+    #[serde(default)]
+    pub organization_digest: String,
     pub assigned_by: String,
     pub assignment_version: u64,
     pub reason: String,
@@ -475,6 +554,10 @@ pub struct WorkflowEvent {
     pub event_type: WorkflowEventType,
     pub aggregate_type: String,
     pub aggregate_id: String,
+    #[serde(default = "legacy_tenant_id")]
+    pub tenant_id: String,
+    #[serde(default)]
+    pub principal_id: String,
     pub actor_id: String,
     pub actor_role: ActorRole,
     pub operation_id: String,
@@ -490,6 +573,8 @@ pub struct WorkflowEvent {
 pub struct ProjectProjection {
     pub schema_version: u32,
     pub project_id: ProjectId,
+    #[serde(default = "legacy_tenant_id")]
+    pub tenant_id: String,
     pub agreement: Agreement,
     pub state: ProjectState,
     pub work_items_total: u32,
@@ -516,10 +601,9 @@ pub struct ProjectProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkflowCommand {
     SubmitCustomerRequest {
-        customer_id: String,
         summary_ref: String,
         desired_outcome: String,
         constraints: Vec<String>,
@@ -545,9 +629,6 @@ pub enum WorkflowCommand {
         expected_version: u64,
         proposal_id: ProposalId,
         proposal_digest: String,
-        profile_id: String,
-        project_owner: AgentId,
-        participants: Vec<AgentId>,
     },
     RejectProposal {
         request_id: CustomerRequestId,
@@ -573,7 +654,7 @@ pub enum WorkflowCommand {
     AssignWork {
         work_item_id: WorkItemId,
         expected_version: u64,
-        assignee: AgentProfile,
+        assignee: AgentId,
         reason: String,
     },
     ClaimWork {
@@ -683,8 +764,8 @@ pub enum WorkflowResponse {
     CustomerRequest(CustomerRequest),
     Proposal(Proposal),
     AgreementProject {
-        agreement: Agreement,
-        project: Project,
+        agreement: Box<Agreement>,
+        project: Box<Project>,
     },
     Project(Project),
     WorkItems(Vec<WorkItem>),

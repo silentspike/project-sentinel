@@ -15,6 +15,9 @@ pub enum WorkflowErrorCode {
     CapabilityDenied,
     BudgetExceeded,
     ExecutionUnavailable,
+    DispatcherNotReady,
+    OrganizationAuthorityConflict,
+    BackupVerificationFailed,
     PersistenceFailure,
 }
 

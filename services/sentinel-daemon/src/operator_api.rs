@@ -720,7 +720,7 @@ pub async fn start_server(
     let workflow_api = Arc::new(
         crate::workflow_api::WorkflowApi::open(
             data_dir.join("company-workflow.sqlite"),
-            std::env::var("SENTINEL_CUSTOMER_API_KEY").ok(),
+            std::env::var_os("SENTINEL_WORKFLOW_PRINCIPALS_FILE").map(PathBuf::from),
         )
         .context("Company workflow store could not be opened")?,
     );
@@ -798,8 +798,6 @@ fn handle_http_request(request: HttpRequest, state: &AppState) -> HttpResponse {
         &request.path,
         &request.headers,
         &request.body,
-        state.shared_secret.is_some()
-            && is_authorized(&request.headers, state.shared_secret.as_deref()),
     ) {
         return HttpResponse {
             status: response.status,
@@ -3559,9 +3557,9 @@ fn max_body_bytes_for_path(path: &str) -> usize {
     match request_path(path) {
         OPERATOR_APICP_SNAPSHOT_PATH => MAX_APICP_SNAPSHOT_BODY_BYTES,
         OPERATOR_CONFIG_APPLY_PATH => MAX_CONFIG_APPLY_BODY_BYTES,
-        crate::workflow_api::CUSTOMER_COMMAND_PATH | crate::workflow_api::OPERATOR_COMMAND_PATH => {
-            crate::workflow_api::MAX_WORKFLOW_BODY_BYTES
-        }
+        crate::workflow_api::CUSTOMER_COMMAND_PATH
+        | crate::workflow_api::OPERATOR_COMMAND_PATH
+        | crate::workflow_api::AGENT_COMMAND_PATH => crate::workflow_api::MAX_WORKFLOW_BODY_BYTES,
         _ => MAX_BODY_BYTES,
     }
 }
@@ -3746,11 +3744,8 @@ mod tests {
             cluster_node_alias: None,
             cluster_is_seed: false,
             workflow_api: Arc::new(
-                crate::workflow_api::WorkflowApi::open(
-                    ":memory:",
-                    Some("customer-test-secret".to_string()),
-                )
-                .expect("in-memory workflow API"),
+                crate::workflow_api::WorkflowApi::open(":memory:", None)
+                    .expect("in-memory workflow API"),
             ),
         };
         std::mem::forget(dir);
