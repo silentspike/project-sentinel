@@ -179,6 +179,25 @@ impl FirecrackerProcess {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn launch_fixture(api_sock: &Path) -> Result<Self> {
+        if let Some(parent) = api_sock.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(api_sock, b"fixture socket")?;
+        let child = Command::new("/usr/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("start Firecracker lifecycle fixture")?;
+        Ok(Self {
+            child,
+            api_sock: api_sock.to_path_buf(),
+        })
+    }
+
     pub fn pid(&self) -> u32 {
         self.child.id()
     }

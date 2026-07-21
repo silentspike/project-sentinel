@@ -4552,6 +4552,7 @@ dependencies = [
  "sentinel-fs",
  "sentinel-hippocampus",
  "sentinel-limbo",
+ "sentinel-microvm",
  "sentinel-projection",
  "sentinel-redb",
  "sentinel-runtime",
