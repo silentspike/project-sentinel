@@ -462,7 +462,7 @@ fn terminate_agent_process(mut proc_handle: sentinel_sandbox::AgentProcess) {
     let _ = signal_pid(proc_handle.pid, "TERM");
     for _ in 0..10 {
         if !proc_handle.is_running() {
-            return;
+            break;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -479,12 +479,10 @@ fn terminate_agent_process(mut proc_handle: sentinel_sandbox::AgentProcess) {
 ///   (the bwrap exit code is the primary fail-closed signal).
 /// - `NotIsolated`: the agent is NOT caged (e.g. forced `share_net`). Make it
 ///   visible (warn + health snapshot + string-typed `AgentIsolationFailed`
-///   event where an event store is available) and terminate the un-caged
+///   event) and terminate the un-caged
 ///   process — the agent drops to the existing ECS-only fallback rather than
 ///   running with host network access.
 ///
-/// `event_store` is `Some` on paths that own one (ecs tick loop); the initial
-/// spawn path relies on the warn + health snapshot (the durable signal there).
 #[allow(clippy::too_many_arguments)]
 fn enforce_agent_netns_isolation(
     agent_id: AgentId,
@@ -496,7 +494,7 @@ fn enforce_agent_netns_isolation(
     agent_processes: &mut HashMap<AgentId, sentinel_sandbox::AgentProcess>,
     nano_runtimes: &mut DaemonNanoRuntimeRegistry,
     security_runtime_state: &operator_api::SharedSecurityRuntimeState,
-    event_store: Option<&EventStore>,
+    event_store: &EventStore,
 ) {
     let Some(cpid) = child_pid else {
         warn!(
@@ -536,20 +534,18 @@ fn enforce_agent_netns_isolation(
             );
             // String-typed event — no DomainEventPayload enum variant / no
             // sentinel-common schema change (keeps clear of #493).
-            if let Some(store) = event_store {
-                let aggregate = format!("AGENT-{:02}", agent_id.0);
-                let payload = serde_json::json!({
-                    "agent_id": agent_id.0,
-                    "agent_name": agent_name,
-                    "child_pid": cpid,
-                    "reason": "not_isolated",
-                })
-                .to_string();
-                let event =
-                    DomainEvent::new("AgentIsolationFailed", &aggregate, &payload, &aggregate, 0);
-                if let Err(e) = store.append_event(&event) {
-                    warn!(agent = %agent_name, error = %e, "AgentIsolationFailed-Event speichern fehlgeschlagen");
-                }
+            let aggregate = format!("AGENT-{:02}", agent_id.0);
+            let payload = serde_json::json!({
+                "agent_id": agent_id.0,
+                "agent_name": agent_name,
+                "child_pid": cpid,
+                "reason": "not_isolated",
+            })
+            .to_string();
+            let event =
+                DomainEvent::new("AgentIsolationFailed", &aggregate, &payload, &aggregate, 0);
+            if let Err(e) = event_store.append_event(&event) {
+                warn!(agent = %agent_name, error = %e, "AgentIsolationFailed-Event speichern fehlgeschlagen");
             }
             // Stop through the adapter that owns the workload. The legacy
             // process map remains as a compatibility fallback for pre-registry
@@ -824,6 +820,7 @@ fn spawn_agent_runtime_stack(
     nano_runtimes: &mut DaemonNanoRuntimeRegistry,
     agent_command: &[String],
     security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    event_store: &EventStore,
     fs_mount: Option<&str>,
 ) -> bool {
     let agent_id = AgentId(agent_cfg.identity.id);
@@ -855,7 +852,7 @@ fn spawn_agent_runtime_stack(
         agent_command,
         security_runtime_state,
         fs_mount,
-        None,
+        Some(event_store),
     ) {
         let _ = runtime_orch.despawn_agent(agent_id);
         return false;
@@ -879,6 +876,7 @@ fn spawn_agent_full(
     nano_runtimes: &mut DaemonNanoRuntimeRegistry,
     agent_command: &[String],
     security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    event_store: &EventStore,
     fs_mount: Option<&str>,
 ) -> bool {
     if !spawn_agent_runtime_stack(
@@ -891,6 +889,7 @@ fn spawn_agent_full(
         nano_runtimes,
         agent_command,
         security_runtime_state,
+        event_store,
         fs_mount,
     ) {
         return false;
@@ -2479,6 +2478,7 @@ fn restart_agent_fast_path(
     nano_runtimes: &mut DaemonNanoRuntimeRegistry,
     agent_command: &[String],
     security_runtime_state: &operator_api::SharedSecurityRuntimeState,
+    event_store: &EventStore,
     fs_mount: Option<&str>,
 ) -> Result<FastRestartResult> {
     let agent_id = AgentId(agent_cfg.identity.id);
@@ -2514,6 +2514,7 @@ fn restart_agent_fast_path(
         nano_runtimes,
         agent_command,
         security_runtime_state,
+        event_store,
         fs_mount,
     ) {
         return Err(anyhow!(
@@ -3225,6 +3226,7 @@ fn run_runtime_reconcile(
             ctx.nano_runtimes,
             ctx.agent_command,
             ctx.security_runtime_state,
+            ctx.event_store,
             ctx.fs_mount,
         ) {
             respawned_agents += 1;
@@ -4512,6 +4514,7 @@ fn execute_world_restore_transfer(
             nano_runtimes,
             agent_command,
             security_runtime_state,
+            event_store,
             fs_mount,
         ) {
             respawned += 1;
@@ -4948,7 +4951,7 @@ fn ecs_tick_loop(
     let event_store_for_prune = Arc::clone(&event_store);
     // #75: kept for the post-spawn isolation verifier (AgentIsolationFailed event).
     let event_store_for_isolation = Arc::clone(&event_store);
-    world.insert_resource(LimboEventStore(event_store));
+    world.insert_resource(LimboEventStore(Arc::clone(&event_store)));
     world.insert_resource(ActionReceiver(std::sync::Mutex::new(action_rx)));
     world.insert_resource(sentinel_ecs::OperatorCommandReceiver(
         std::sync::Mutex::new(operator_rx),
@@ -5617,6 +5620,7 @@ fn ecs_tick_loop(
                                     &mut nano_runtimes,
                                     &agent_command,
                                     &security_runtime_state,
+                                    event_store.as_ref(),
                                     fs_mount.as_deref(),
                                 )
                             }) {
@@ -6006,6 +6010,7 @@ fn ecs_tick_loop(
                             &mut nano_runtimes,
                             &agent_command,
                             &security_runtime_state,
+                            event_store.as_ref(),
                             fs_mount.as_deref(),
                         ) {
                             Ok(result) => info!(
@@ -6556,6 +6561,7 @@ fn ecs_tick_loop(
                         &mut nano_runtimes,
                         &agent_command,
                         &security_runtime_state,
+                        event_store.as_ref(),
                         fs_mount.as_deref(),
                     ) {
                         // GOLF: Default-Goals fuer neuen Schicht-Agent erstellen
@@ -7151,6 +7157,7 @@ fn ecs_tick_loop(
                             &mut nano_runtimes,
                             &agent_command,
                             &security_runtime_state,
+                            event_store.as_ref(),
                             fs_mount.as_deref(),
                         ) {
                             spawned += 1;
@@ -7174,6 +7181,7 @@ fn ecs_tick_loop(
                                 &mut nano_runtimes,
                                 &agent_command,
                                 &security_runtime_state,
+                                event_store.as_ref(),
                                 fs_mount.as_deref(),
                             )
                         {
@@ -8148,6 +8156,162 @@ mod tests {
         enforcer
     }
 
+    #[test]
+    fn netns_probe_error_preserves_runtime_and_emits_no_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_store = EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap();
+        let sandbox = test_sandbox();
+        let agent_id = AgentId(59);
+        let agent_name = "issue75-probe-error";
+        let mut sandbox_handles = HashMap::from([(
+            agent_id,
+            SandboxHandle {
+                agent_name: agent_name.to_string(),
+                cgroup_created: false,
+                io_available: false,
+                bwrap_pid: Some(123),
+                landlock_applied: false,
+                network_isolated: false,
+            },
+        )]);
+        let mut agent_processes = HashMap::new();
+        let (mut ebpf_collector, _ebpf_tx) = test_ebpf();
+        let security_runtime_state: operator_api::SharedSecurityRuntimeState = Default::default();
+        record_security_runtime_snapshot(
+            &security_runtime_state,
+            agent_id,
+            agent_name,
+            Some(123),
+            None,
+        );
+
+        enforce_agent_netns_isolation(
+            agent_id,
+            agent_name,
+            Some(u32::MAX),
+            &sandbox,
+            &mut sandbox_handles,
+            &mut ebpf_collector,
+            &mut agent_processes,
+            &security_runtime_state,
+            &event_store,
+        );
+
+        assert!(
+            sandbox_handles.contains_key(&agent_id),
+            "ProbeError must not tear down the sandbox"
+        );
+        assert_eq!(
+            security_runtime_state
+                .read()
+                .unwrap()
+                .get(&agent_id.0)
+                .and_then(|snapshot| snapshot.bwrap_pid),
+            Some(123),
+            "ProbeError must not degrade the runtime health snapshot"
+        );
+        assert!(
+            event_store
+                .get_all_events()
+                .unwrap()
+                .into_iter()
+                .all(|event| event.event_type != "AgentIsolationFailed"),
+            "ProbeError must not emit a cage-breach event"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires deploy-VM bwrap/userns support"]
+    fn netns_not_isolated_enforcement_terminates_and_records_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_store = EventStore::open(tmp.path().join("events.db").to_str().unwrap()).unwrap();
+        let sandbox = test_sandbox();
+        let agent_id = AgentId(60);
+        let agent_name = format!("issue75-fault-{}", std::process::id());
+        let mut handle = sandbox
+            .setup_agent(&agent_name, &default_agent_limits())
+            .expect("fault-injection sandbox setup must succeed");
+        let process = sentinel_sandbox::AgentProcess::from(
+            sentinel_sandbox::BwrapConfig::for_agent(&agent_name)
+                .with_shared_net()
+                .spawn(&["/usr/bin/agent-runtime".to_string()])
+                .expect("shared-net fault-injection bwrap process must start"),
+        );
+        let supervisor_pid = process.pid;
+        let sandboxed_child_pid = process
+            .child_pid
+            .expect("agent-runtime child PID must be reported");
+        assert!(
+            std::path::Path::new(&format!("/proc/{sandboxed_child_pid}")).exists(),
+            "agent-runtime must be running before fault injection"
+        );
+        handle.bwrap_pid = Some(supervisor_pid);
+
+        let mut sandbox_handles = HashMap::from([(agent_id, handle)]);
+        let mut agent_processes = HashMap::from([(agent_id, process)]);
+        let (mut ebpf_collector, _ebpf_tx) = test_ebpf();
+        let security_runtime_state: operator_api::SharedSecurityRuntimeState = Default::default();
+        record_security_runtime_snapshot(
+            &security_runtime_state,
+            agent_id,
+            &agent_name,
+            Some(supervisor_pid),
+            None,
+        );
+
+        assert_eq!(
+            sandbox.verify_agent_netns_isolation(sandboxed_child_pid),
+            IsolationStatus::NotIsolated
+        );
+        enforce_agent_netns_isolation(
+            agent_id,
+            &agent_name,
+            Some(sandboxed_child_pid),
+            &sandbox,
+            &mut sandbox_handles,
+            &mut ebpf_collector,
+            &mut agent_processes,
+            &security_runtime_state,
+            &event_store,
+        );
+
+        assert!(
+            !agent_processes.contains_key(&agent_id),
+            "uncaged process handle must be removed"
+        );
+        assert!(
+            !sandbox_handles.contains_key(&agent_id),
+            "uncaged sandbox resources must be torn down"
+        );
+        assert_eq!(
+            security_runtime_state
+                .read()
+                .unwrap()
+                .get(&agent_id.0)
+                .and_then(|snapshot| snapshot.bwrap_pid),
+            None,
+            "health state must expose the degraded runtime"
+        );
+        assert!(
+            !std::path::Path::new(&format!("/proc/{supervisor_pid}")).exists(),
+            "uncaged bwrap supervisor must be terminated"
+        );
+        assert!(
+            !std::path::Path::new(&format!("/proc/{sandboxed_child_pid}")).exists(),
+            "uncaged agent-runtime must be terminated"
+        );
+
+        let failure = event_store
+            .get_all_events()
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "AgentIsolationFailed")
+            .expect("AgentIsolationFailed must be persisted");
+        let payload: serde_json::Value = serde_json::from_str(&failure.payload).unwrap();
+        assert_eq!(payload["agent_id"], agent_id.0);
+        assert_eq!(payload["reason"], "not_isolated");
+    }
+
     /// Erstellt EpisodeProducer fuer Tests (tempfile-basiert).
     fn test_episode_producer(tmp: &tempfile::TempDir, event_store: &EventStore) -> EpisodeProducer {
         let path = tmp.path().join("test-hippocampus.redb");
@@ -8869,7 +9033,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let events_path = tmp.path().join("events.db");
         let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
-        let mut runtime_orch = RuntimeOrchestrator::new(10).with_event_store(event_store);
+        let mut runtime_orch =
+            RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
         let (mut world, _schedule) = create_simulation_world();
         spawn_agent(
             &mut world,
@@ -8935,7 +9100,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let events_path = tmp.path().join("events.db");
         let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
-        let mut runtime_orch = RuntimeOrchestrator::new(10).with_event_store(event_store);
+        let mut runtime_orch =
+            RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
         let (mut world, _schedule) = create_simulation_world();
         let sandbox = test_sandbox();
         let (mut ebpf_collector, _ebpf_tx) = test_ebpf();
@@ -8971,6 +9137,7 @@ mod tests {
                     &mut nano_runtimes,
                     &agent_command,
                     &security_runtime_state,
+                    event_store.as_ref(),
                     None,
                 ),
                 "{path_name} spawn path failed"
@@ -9156,7 +9323,8 @@ mod tests {
         let events_path = tmp.path().join("events.db");
         let event_store = Arc::new(EventStore::open(events_path.to_str().unwrap()).unwrap());
 
-        let mut runtime_orch = RuntimeOrchestrator::new(10).with_event_store(event_store);
+        let mut runtime_orch =
+            RuntimeOrchestrator::new(10).with_event_store(Arc::clone(&event_store));
         let (mut world, _schedule) = create_simulation_world();
         let sandbox = test_sandbox();
         let (mut ebpf_collector, _ebpf_tx) = test_ebpf();
@@ -9178,6 +9346,7 @@ mod tests {
             &mut nano_runtimes,
             &agent_command,
             &security_runtime_state,
+            event_store.as_ref(),
             None,
         ));
 
@@ -9198,6 +9367,7 @@ mod tests {
             &mut nano_runtimes,
             &agent_command,
             &security_runtime_state,
+            event_store.as_ref(),
             None,
         )
         .expect("fast restart");

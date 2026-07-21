@@ -14,7 +14,8 @@
   `wasm-wasmtime` key. Its `snapshot` is declarative ToolRuntime/input state
   plus ECS-side state for deterministic re-execute. It is not a bitwise
   Wasmtime `Store` dump because current plugin calls create fresh stores. Its
-  idempotent `stop` removes only the addressed workload state.
+  idempotent `stop` removes only the addressed workload state and releases a
+  tool definition or compiled component after its final owning workload stops.
 
 ## Dependencies
 
