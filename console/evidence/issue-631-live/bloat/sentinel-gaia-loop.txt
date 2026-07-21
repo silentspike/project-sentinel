@@ -19,5 +19,5 @@ File  .text     Size Crate
 0.2%   0.6%  36.0KiB tokio_websockets
 0.2%   0.5%  30.0KiB sha2
 0.2%   0.5%  29.8KiB curve25519_dalek
-2.3%   6.9% 407.6KiB And 85 more crates. Use -n N to show more.
+2.3%   6.9% 407.6KiB And 84 more crates. Use -n N to show more.
 33.5% 100.0%   5.7MiB .text section size, the file size is 17.1MiB

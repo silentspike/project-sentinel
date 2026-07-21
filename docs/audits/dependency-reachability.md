@@ -35,8 +35,8 @@ Build-server timing and performance data are deliberately excluded.
 
 | Item | Value |
 | --- | --- |
-| Base commit | `c37d9a487ed7e3385bbff9b8e8b3c4f555d5e429` |
-| `Cargo.lock` SHA-256 | `29b97c217ff9694e116e0e6ce856e5ab761b808d5b2289bd56cb255373e14b93` |
+| Base commit | `13e87b663cc3b47223a2b0052db1cc6c274e66c8` |
+| `Cargo.lock` SHA-256 | `bcb6412f833fda3809f1c988ef5f0a6cc121d410ee45245aec5c0357908eeed7` |
 | Lockfile packages | 717 |
 | Workspace members | 27 |
 | Release roots | 8 |
@@ -47,12 +47,10 @@ Build-server timing and performance data are deliberately excluded.
 
 The dependency graph, feature evidence, all eight release artifacts, and all eight
 cargo-bloat tables were fully regenerated at
-`dade246e244bf1809200da5c0464e80bc79c5cdf`. The mainline delta through the pinned base
-changes only CI, configuration, and documentation for the M0 work-execution contract;
-it changes no Cargo manifest, lockfile, or Rust source. The compact graph bundle and all
-derived reachability, feature, duplicate, and recommendation rows therefore remain
-byte-identical, and the artifact and bloat evidence below remains tied to unchanged
-audited source inputs.
+`13e87b663cc3b47223a2b0052db1cc6c274e66c8`. This mainline state adds active `uuid`
+normal edges to `sentinel-microvm`, `sentinel-sandbox`, and `sentinel-wasm`. The compact
+graphs, reachability tables, feature inventory, duplicate closures, release artifacts,
+and cargo-bloat tables were regenerated from the changed inputs.
 
 PR #611 remains open and changes only `Cargo.lock`. If it or any other lockfile change
 lands before completion, the new mainline state must be integrated as directed by the
@@ -203,7 +201,7 @@ size, closure basis, and a decision for each version:
 [`duplicate-versions.tsv`](../../console/evidence/issue-631-live/duplicate-versions.tsv).
 All 94 rows have a complete reverse closure: 85 use only active all-target Cargo edges;
 nine optional-disabled rows use explicitly labeled metadata-constraint edges. The
-8,485 target-annotated closure rows are in
+8,500 target-annotated closure rows are in
 [`duplicates/reverse-closure.tsv`](../../console/evidence/issue-631-live/duplicates/reverse-closure.tsv),
 backed by the deduplicated edge inventory in
 [`workspace-all-target-edges.tsv`](../../console/evidence/issue-631-live/workspace-all-target-edges.tsv).
@@ -245,14 +243,14 @@ Only deterministic artifact bytes and SHA-256 values are retained:
 
 | Root | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `sentinel-daemon` | 54,922,728 | `5fd1e282449de393024a652fca4e913a24996ed24226a407cc1d16a8087af7ba` |
-| `sentinel-projection-service` | 4,428,168 | `ecc9ca0f3f1cc0f69443e87bfe83540c12a7fbabc06c9f349dcc13d767e0e3fa` |
-| `sentinel-dashboard-backend` | 18,968,952 | `9d34ec97f35ca6d4d5a8e11bdde95472b64805a4bacc4d60e7db5cd6a1d8a73a` |
+| `sentinel-daemon` | 54,929,896 | `3b0f463e87a5cde038e126075dc4920abd825c267321b44d49664849b6d2e4d6` |
+| `sentinel-projection-service` | 4,427,976 | `99b2730c2a5e5db40d0db08a68dec758d887a4292e1323250575ebadccf33d6c` |
+| `sentinel-dashboard-backend` | 18,968,856 | `b9580924cf18e007818d0ed3e3d41b9796b99d46363eb719a8a1667c14f97dc4` |
 | `sentinel-gaia-loop` | 8,909,144 | `797bc5582c2a9c3642ae63f6ce35713d386ebcb3953b119dda5f378522a571ed` |
 | `agent-runtime` | 369,776 | `12dda746c12e5685258f15111ec7ccc08201cbe28d5cc4898b3fc356a50a1f0c` |
 | `sentinel-ctl` | 4,192,976 | `20da53f6f6749c6982b4461baca27ced106d044097e2de3c91ca4694736cc604` |
-| `sentinel-gaia` | 2,111,088 | `862f4d9bff7b7c529ed715586ea0e2b9c9dc97fca1c92c79752424dccb431ee2` |
-| `sentinel-nightrun` | 5,646,416 | `f9d05af45036adc6516d4afcfe68efc6ce7ac0f0c894a66fdccceac350ccdf9a` |
+| `sentinel-gaia` | 2,110,864 | `14c86c8400a022a0df72bc2b186afd0eabf913158aaefd6a56963c284b8c4e50` |
+| `sentinel-nightrun` | 5,646,192 | `572db6cea5088d66a50801abfda36dc45a4cab127861b6f82c53cc34093d26d8` |
 
 The canonical machine-readable artifact table is
 [`release-builds.tsv`](../../console/evidence/issue-631-live/release-builds.tsv).
@@ -263,14 +261,14 @@ analysis `.text`, and analysis-file size in separate columns:
 
 | Root | Release bytes | Analysis `.text` | Analysis file | Largest reported crate |
 | --- | ---: | ---: | ---: | --- |
-| `sentinel-daemon` | 54,922,728 | 38.4 MiB | 83.3 MiB | `cranelift_codegen`, 3.1 MiB / 8.0% of `.text` |
-| `sentinel-projection-service` | 4,428,168 | 3.2 MiB | 9.3 MiB | `[Unknown]`, 1.4 MiB / 43.0% |
-| `sentinel-dashboard-backend` | 18,968,952 | 12.6 MiB | 30.2 MiB | `[Unknown]`, 2.2 MiB / 17.5% |
+| `sentinel-daemon` | 54,929,896 | 38.4 MiB | 83.3 MiB | `cranelift_codegen`, 3.1 MiB / 8.0% of `.text` |
+| `sentinel-projection-service` | 4,427,976 | 3.2 MiB | 9.3 MiB | `[Unknown]`, 1.4 MiB / 43.0% |
+| `sentinel-dashboard-backend` | 18,968,856 | 12.6 MiB | 30.2 MiB | `[Unknown]`, 2.2 MiB / 17.5% |
 | `sentinel-gaia-loop` | 8,909,144 | 5.7 MiB | 17.1 MiB | `[Unknown]`, 1.5 MiB / 25.6% |
 | `agent-runtime` | 369,776 | 260.7 KiB | 4.2 MiB | `std`, 254.7 KiB / 97.7% |
-| `sentinel-ctl` | 4,192,976 | 2.7 MiB | 11.2 MiB | `rustls`, 459.4 KiB / 16.8% |
-| `sentinel-gaia` | 2,111,088 | 1.5 MiB | 6.6 MiB | `std`, 380.4 KiB / 24.4% |
-| `sentinel-nightrun` | 5,646,416 | 4.2 MiB | 10.8 MiB | `[Unknown]`, 1.4 MiB / 33.4% |
+| `sentinel-ctl` | 4,192,976 | 2.7 MiB | 11.2 MiB | `rustls`, 459.9 KiB / 16.8% |
+| `sentinel-gaia` | 2,110,864 | 1.5 MiB | 6.6 MiB | `std`, 380.4 KiB / 24.4% |
+| `sentinel-nightrun` | 5,646,192 | 4.2 MiB | 10.8 MiB | `[Unknown]`, 1.4 MiB / 33.4% |
 
 The normalized top-20 tables are in
 [`bloat/`](../../console/evidence/issue-631-live/bloat/); their deterministic summary is
@@ -332,10 +330,10 @@ python3 scripts/dependency-reachability-audit.py check-public-evidence docs/audi
 python3 scripts/dependency-reachability-audit.py check-staged
 ```
 
-The committed compact graph bundle contains 20 files and 19,960 unique package/edge
+The committed compact graph bundle contains 20 files and 19,973 unique package/edge
 rows. A fresh regeneration from the retained raw Cargo trees is byte-identical, with
 bundle digest
-`a5368ce919b08e3af2ca30f4a3c2e6c1695f9e439ac4790b5cb33bdaf4b520ae`.
+`22aa1bc8865133a0e2cfeb73fe69e8d9beb740b2b7aba78047d94c714d4345c4`.
 
 ## Separate Findings and Boundaries
 

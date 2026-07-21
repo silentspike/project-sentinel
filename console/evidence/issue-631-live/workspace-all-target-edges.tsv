@@ -1402,6 +1402,7 @@ sentinel-microvm	0.1.0	serde	1.0.228	normal:all	true
 sentinel-microvm	0.1.0	serde_json	1.0.149	normal:all	true
 sentinel-microvm	0.1.0	tempfile	3.27.0	dev:all	true
 sentinel-microvm	0.1.0	tracing	0.1.44	normal:all	true
+sentinel-microvm	0.1.0	uuid	1.22.0	normal:all	true
 sentinel-nightrun	0.1.0	anyhow	1.0.103	normal:all	true
 sentinel-nightrun	0.1.0	approx	0.5.1	dev:all	true
 sentinel-nightrun	0.1.0	clap	4.5.60	normal:all	true
@@ -1479,6 +1480,7 @@ sentinel-sandbox	0.1.0	serde_json	1.0.149	normal:all	true
 sentinel-sandbox	0.1.0	tempfile	3.27.0	dev:all	true
 sentinel-sandbox	0.1.0	tokio	1.52.3	normal:all	true
 sentinel-sandbox	0.1.0	tracing	0.1.44	normal:all	true
+sentinel-sandbox	0.1.0	uuid	1.22.0	normal:all	true
 sentinel-telemetry	0.1.0	criterion	0.5.1	dev:all	true
 sentinel-telemetry	0.1.0	sentinel-common	0.1.0	normal:all	true
 sentinel-telemetry	0.1.0	serde	1.0.228	normal:all	true
@@ -1493,6 +1495,7 @@ sentinel-wasm	0.1.0	serde	1.0.228	normal:all	true
 sentinel-wasm	0.1.0	serde_json	1.0.149	normal:all	true
 sentinel-wasm	0.1.0	tempfile	3.27.0	dev:all	true
 sentinel-wasm	0.1.0	tracing	0.1.44	normal:all	true
+sentinel-wasm	0.1.0	uuid	1.22.0	normal:all	true
 sentinel-wasm	0.1.0	wasmtime	45.0.3	normal:all	true
 sentinel-wasm	0.1.0	wasmtime-wasi	45.0.3	normal:all	true
 sentinel-zenoh	0.1.0	anyhow	1.0.103	normal:all	true

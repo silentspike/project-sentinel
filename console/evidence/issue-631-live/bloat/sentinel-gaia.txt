@@ -1,23 +1,23 @@
 File  .text     Size Crate
 5.6%  24.4% 380.4KiB std
 4.5%  19.6% 306.8KiB clap_builder
-4.3%  18.4% 288.0KiB sentinel_common
-3.1%  13.6% 212.4KiB sentinel_gaia
+4.3%  18.4% 287.5KiB sentinel_common
+3.2%  13.6% 212.8KiB sentinel_gaia
 1.4%   6.0%  94.2KiB toml
 0.9%   3.8%  59.5KiB serde_json
 0.6%   2.7%  42.1KiB toml_parser
 0.2%   0.9%  14.1KiB anyhow
 0.2%   0.8%  13.2KiB blake3
-0.2%   0.8%  13.0KiB convert_case
 0.2%   0.8%  11.9KiB proc_macro2
-0.1%   0.4%   7.0KiB version_check
+0.1%   0.6%   9.9KiB toml_edit
+0.1%   0.4%   6.2KiB version_check
 0.1%   0.3%   5.4KiB cc
 0.1%   0.3%   5.4KiB memchr
 0.1%   0.3%   5.3KiB toml_datetime
+0.1%   0.3%   4.3KiB convert_case
 0.1%   0.2%   3.5KiB serde_core
 0.0%   0.2%   2.5KiB clap_lex
 0.0%   0.1%   2.1KiB anstyle
 0.0%   0.1%   1.6KiB anstream
-0.0%   0.1%   1.6KiB zmij
-0.1%   0.6%   9.2KiB And 19 more crates. Use -n N to show more.
+0.2%   0.7%  10.4KiB And 19 more crates. Use -n N to show more.
 23.1% 100.0%   1.5MiB .text section size, the file size is 6.6MiB
