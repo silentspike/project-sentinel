@@ -229,19 +229,21 @@ python3 scripts/dependency-reachability-audit.py check-staged
 Final output:
 
 ```text
-Ran 29 tests
+Ran 34 tests
 OK
 public-evidence-scan=PASS files=50
 staged-new-lines-scan=PASS
 ```
 
 The test suite includes negative fixtures for IP addresses, home/workspace/remote/Cargo
-paths, command-context SSH authorities, standalone `remote_host` and `remote_user`
-fields, arbitrary remote temporary paths, unexpected absolute paths, and wrapper
-timestamp filtering. Positive fixtures prove that normalized host/user placeholders and
-public URLs/contact domains pass. The suite also proves that modifying a derived
-workspace-membership flag or Cargo-active edge makes `audit --check` fail while the
-compact Cargo graph sources remain unchanged.
+paths, tokenized remote-command authorities after shell prompts, `sudo`, `env`, and
+Markdown list markers, standalone `remote_host` and `remote_user` fields, arbitrary
+remote temporary paths, unexpected absolute paths, and wrapper timestamp filtering.
+Positive fixtures prove that normalized host/user placeholders, authorities outside a
+remote-command context, public URLs/contact domains, and HTTP(S) URLs containing
+`https://example.invalid/tmp/...` pass unchanged. The suite also proves that modifying a derived workspace-
+membership flag or Cargo-active edge makes `audit --check` fail while the compact Cargo
+graph sources remain unchanged.
 
 ## Verification Gates
 

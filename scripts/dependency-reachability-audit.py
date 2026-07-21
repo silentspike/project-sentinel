@@ -1109,19 +1109,47 @@ PRIVATE_FIELD_PATTERN = re.compile(
 )
 
 
+HTTP_URL_PATTERN = re.compile(r"https?://[^\s`\"'<>)\]}]+", re.IGNORECASE)
+REMOTE_PROJECT_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9._~/-])" + re.escape(TEMP_ROOT + "builds/") + r"[0-9]+"
+)
+REMOTE_TEMP_PATH_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9._~/-])" + re.escape(TEMP_ROOT) + r"[^\s`\"'\])},;]+"
+)
+SHELL_TOKEN_PATTERN = re.compile(r"`[^`]*`|'[^']*'|\"[^\"]*\"|[^\s]+")
+SSH_AUTHORITY_PATTERN = re.compile(
+    r"\b[A-Za-z_][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"(?=[:/\s\"'`]|$)"
+)
+REMOTE_COMMANDS = {"ssh", "scp", "sftp", "rsync"}
+SUDO_OPTIONS_WITH_VALUE = {
+    "-C",
+    "-D",
+    "-g",
+    "-h",
+    "-p",
+    "-R",
+    "-T",
+    "-u",
+    "--chdir",
+    "--close-from",
+    "--group",
+    "--host",
+    "--prompt",
+    "--role",
+    "--type",
+    "--user",
+}
+ENV_OPTIONS_WITH_VALUE = {"-C", "-S", "-u", "--chdir", "--split-string", "--unset"}
+
+
 PLACEHOLDER_REPLACEMENTS = (
-    (re.compile(re.escape(TEMP_ROOT + "builds/") + r"[0-9]+"), "<REMOTE_PROJECT>"),
-    (
-        re.compile(re.escape(TEMP_ROOT) + r"[^\s\"'`),;}\]]+"),
-        "<REMOTE_TARGET>",
-    ),
     (re.compile(r"/(?:root|home/[^/]+)/\.cargo"), "<CARGO_HOME>"),
     (
         re.compile(re.escape(WORK_ROOT) + r"[^/\s]+/(?:project-sentinel|ps-631-dep-audit)"),
         "<WORKSPACE>",
     ),
     (re.compile(r"/(?:root|home/[^/]+)"), "<HOME>"),
-    (re.compile(r"\b(?:root|ubuntu)@(?:[A-Za-z0-9._-]+|(?:\d{1,3}\.){3}\d{1,3})"), "<USER>@<HOST>"),
     (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "<HOST>"),
 )
 
@@ -1141,10 +1169,125 @@ def normalize_private_field(match: re.Match[str]) -> str:
     )
 
 
+def unquote_shell_token(token: str) -> str:
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in "`'\"":
+        return token[1:-1]
+    return token.strip("`'\"")
+
+
+def shell_command_name(token: str) -> str:
+    return unquote_shell_token(token).rstrip(";:").rsplit("/", 1)[-1]
+
+
+def skip_command_options(
+    tokens: list[str], index: int, options_with_value: set[str]
+) -> int:
+    while index < len(tokens):
+        token = unquote_shell_token(tokens[index])
+        if token == "--":
+            return index + 1
+        if not token.startswith("-") or token == "-":
+            return index
+        option = token.split("=", 1)[0]
+        index += 1
+        if option in options_with_value and "=" not in token and index < len(tokens):
+            index += 1
+    return index
+
+
+def is_shell_assignment(token: str) -> bool:
+    return re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", unquote_shell_token(token)) is not None
+
+
+def has_remote_command_context(line: str) -> bool:
+    # Markdown inline-code delimiters are presentation, not shell tokens.
+    tokens = SHELL_TOKEN_PATTERN.findall(line.replace("`", ""))
+    index = 0
+
+    while index < len(tokens) and (
+        tokens[index] in {">", "-", "*", "+"}
+        or re.fullmatch(r"[0-9]+[.)]", tokens[index])
+    ):
+        index += 1
+    if index < len(tokens) and tokens[index].startswith("["):
+        prompt_end = next(
+            (
+                candidate
+                for candidate in range(index, len(tokens))
+                if re.search(r"\][$#%]$", tokens[candidate])
+            ),
+            None,
+        )
+        if prompt_end is not None:
+            index = prompt_end + 1
+    elif index < len(tokens) and (
+        tokens[index] in {"$", "#", "%"}
+        or re.fullmatch(r"\S+[$#%]", tokens[index])
+    ):
+        index += 1
+
+    while index < len(tokens):
+        while index < len(tokens) and is_shell_assignment(tokens[index]):
+            index += 1
+        if index >= len(tokens):
+            return False
+        command = shell_command_name(tokens[index])
+        if command == "sudo":
+            index = skip_command_options(tokens, index + 1, SUDO_OPTIONS_WITH_VALUE)
+            continue
+        if command == "env":
+            index = skip_command_options(tokens, index + 1, ENV_OPTIONS_WITH_VALUE)
+            continue
+        if command in REMOTE_COMMANDS:
+            return True
+        return command == "cargo" and index + 1 < len(tokens) and shell_command_name(
+            tokens[index + 1]
+        ) == "remote"
+    return False
+
+
+def transform_outside_http_urls(
+    value: str, pattern: re.Pattern[str], replacement: str
+) -> str:
+    pieces = []
+    cursor = 0
+    for match in HTTP_URL_PATTERN.finditer(value):
+        pieces.append(pattern.sub(replacement, value[cursor : match.start()]))
+        pieces.append(match.group(0))
+        cursor = match.end()
+    pieces.append(pattern.sub(replacement, value[cursor:]))
+    return "".join(pieces)
+
+
+def pattern_exists_outside_http_urls(value: str, pattern: re.Pattern[str]) -> bool:
+    cursor = 0
+    for match in HTTP_URL_PATTERN.finditer(value):
+        if pattern.search(value[cursor : match.start()]):
+            return True
+        cursor = match.end()
+    return pattern.search(value[cursor:]) is not None
+
+
+def normalize_remote_authorities(value: str) -> str:
+    return "".join(
+        SSH_AUTHORITY_PATTERN.sub("<USER>@<HOST>", line)
+        if has_remote_command_context(line)
+        else line
+        for line in value.splitlines(keepends=True)
+    )
+
+
 def normalize_text(value: str) -> str:
     value = value.replace("\r", "\n")
     value = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", value)
+    value = normalize_remote_authorities(value)
     value = PRIVATE_FIELD_PATTERN.sub(normalize_private_field, value)
+    value = transform_outside_http_urls(
+        value, REMOTE_PROJECT_PATTERN, "<REMOTE_PROJECT>"
+    )
+    value = transform_outside_http_urls(
+        value, REMOTE_TEMP_PATH_PATTERN, "<REMOTE_TARGET>"
+    )
     for pattern, replacement in PLACEHOLDER_REPLACEMENTS:
         value = pattern.sub(replacement, value)
     value = re.sub(r"[ \t]+$", "", value, flags=re.MULTILINE)
@@ -1286,7 +1429,6 @@ def suspicious_tokens(value: str) -> list[str]:
     forbidden_patterns = {
         "home-path": r"/(?:home/[^/\s]+|root)(?:/|\b)",
         "workspace-path": re.escape(WORK_ROOT) + r"[^/\s]+(?:/|\b)",
-        "remote-temp-path": re.escape(TEMP_ROOT) + r"[^\s`\"'\])},;]+",
         "cargo-home": (
             r"(?:"
             + re.escape(CARGO_PATH)
@@ -1294,15 +1436,18 @@ def suspicious_tokens(value: str) -> list[str]:
             + re.escape("CARGO" + "_HOME=/")
             + r"(?![<]))"
         ),
-        "ssh-authority": (
-            r"(?im)^\s*(?:ssh|scp|sftp|rsync|cargo\s+remote)\b[^\n]*"
-            r"\b[A-Za-z_][A-Za-z0-9_-]*@[A-Za-z][A-Za-z0-9._-]+\b"
-        ),
         "absolute-path": r"(?<![<\w])/(?:etc|opt|srv|var|usr/local)/[^\s`\"')]+",
     }
     for label, pattern in forbidden_patterns.items():
         if re.search(pattern, value):
             findings.add(label)
+    if pattern_exists_outside_http_urls(value, REMOTE_TEMP_PATH_PATTERN):
+        findings.add("remote-temp-path")
+    if any(
+        has_remote_command_context(line) and SSH_AUTHORITY_PATTERN.search(line)
+        for line in value.splitlines()
+    ):
+        findings.add("ssh-authority")
     for token in re.findall(r"(?<![\w.])[0-9A-Fa-f:.]{2,}(?![\w.])", value):
         candidate = token.strip("[](),.;")
         try:
