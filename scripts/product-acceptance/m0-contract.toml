@@ -3,7 +3,7 @@ profile = "web-project-v1"
 profile_path = "config/work-profiles/web-project-v1.toml"
 contract_path = "docs/virtual-company-work-execution.md"
 epic = 650
-delivery_issues = [75, 472, 650, 693, 694, 695, 696]
+delivery_issues = [75, 472, 650, 693, 694, 695, 696, 698]
 required_categories = [
   "contract",
   "deployment",
@@ -151,6 +151,18 @@ evidence = "console/evidence/issue-472-live/m0-runtime-selection.md"
 status = "blocked"
 blocked_by = [472]
 blocker = "Issue #472 is open and its production-daemon selection path is not yet verified for M0."
+
+[[requirements]]
+id = "M0-RUNTIME-002"
+category = "runtime"
+title = "Idempotent per-workload runtime stop lifecycle"
+togaf_anchor = "Nano-container lifecycle and resource ownership"
+contract_section = "Runtime and Security Contract"
+owner_issue = 698
+test_id = "m0.runtime.idempotent_stop"
+live_probe = "stop-replay-and-resource-release"
+evidence = "console/evidence/issue-698-live/nano-runtime-stop.md"
+status = "not_tested"
 
 [[requirements]]
 id = "M0-TOOLS-001"

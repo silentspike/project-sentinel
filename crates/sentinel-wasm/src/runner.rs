@@ -110,6 +110,11 @@ impl ToolRuntime {
         Ok(())
     }
 
+    /// Removes a tool definition after its last owning workload stops.
+    pub fn unregister_tool(&mut self, name: &str) -> bool {
+        self.tools.remove(name).is_some()
+    }
+
     /// Gibt alle registrierten Tools zurueck.
     pub fn list_tools(&self) -> Vec<&ToolDefinition> {
         self.tools.values().collect()
