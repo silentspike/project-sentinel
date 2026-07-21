@@ -181,6 +181,7 @@ python3 scripts/dependency-reachability-audit.py audit --compact-sources-only \
   --workspace-all-targets-tree <RAW_WORKSPACE_ALL_TARGETS>
 diff -qr <FRESH_COMPACT_DIR> console/evidence/issue-631-live/trees \
   --exclude='*.features.txt'
+(cd console/evidence/issue-631-live/trees && sha256sum *.graph.tsv | sha256sum)
 ```
 
 Output:
@@ -188,7 +189,7 @@ Output:
 ```text
 compact_graph_files=20 compact_graph_rows=19973
 compact_source_diff=PASS
-compact_graph_bundle_sha256=22aa1bc8865133a0e2cfeb73fe69e8d9beb740b2b7aba78047d94c714d4345c4
+22aa1bc8865133a0e2cfeb73fe69e8d9beb740b2b7aba78047d94c714d4345c4  -
 ```
 
 ### AC-8: Pinned Before-Baseline
@@ -228,16 +229,19 @@ python3 scripts/dependency-reachability-audit.py check-staged
 Final output:
 
 ```text
-Ran 24 tests
+Ran 29 tests
 OK
 public-evidence-scan=PASS files=50
 staged-new-lines-scan=PASS
 ```
 
 The test suite includes negative fixtures for IP addresses, home/workspace/remote/Cargo
-paths, SSH authorities, unexpected absolute paths, and wrapper timestamp filtering. It
-also proves that modifying a derived workspace-membership flag or Cargo-active edge makes
-`audit --check` fail while the compact Cargo graph sources remain unchanged.
+paths, command-context SSH authorities, standalone `remote_host` and `remote_user`
+fields, arbitrary remote temporary paths, unexpected absolute paths, and wrapper
+timestamp filtering. Positive fixtures prove that normalized host/user placeholders and
+public URLs/contact domains pass. The suite also proves that modifying a derived
+workspace-membership flag or Cargo-active edge makes `audit --check` fail while the
+compact Cargo graph sources remain unchanged.
 
 ## Verification Gates
 

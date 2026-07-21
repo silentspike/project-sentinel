@@ -294,10 +294,13 @@ The normalizer replaces private locations and authorities with:
 <HOST>
 ```
 
-The fail-closed scanner rejects IP addresses, SSH authorities, usernames, hostnames,
-home paths, workspace paths, remote temporary paths, Cargo-home paths, unexpected
-absolute paths, and binary evidence. Negative unit fixtures cover each class. A green
-scan is required before every commit and push.
+The fail-closed scanner rejects IP addresses, command-context SSH authorities,
+non-placeholder `remote_host` and `remote_user` fields, home paths, workspace paths,
+every absolute remote temporary path, Cargo-home paths, unexpected absolute paths, and
+binary evidence. Host/user field matching is key-aware, so public URLs and contact
+domains are not rejected merely for containing a hostname. Negative unit fixtures cover
+each private class, and positive fixtures cover the placeholders and public domains. A
+green scan is required before every commit and push.
 
 ## Reproduction Commands
 
@@ -332,8 +335,15 @@ python3 scripts/dependency-reachability-audit.py check-staged
 
 The committed compact graph bundle contains 20 files and 19,973 unique package/edge
 rows. A fresh regeneration from the retained raw Cargo trees is byte-identical, with
-bundle digest
-`22aa1bc8865133a0e2cfeb73fe69e8d9beb740b2b7aba78047d94c714d4345c4`.
+bundle digest produced by:
+
+```bash
+(cd console/evidence/issue-631-live/trees && sha256sum *.graph.tsv | sha256sum)
+```
+
+```text
+22aa1bc8865133a0e2cfeb73fe69e8d9beb740b2b7aba78047d94c714d4345c4  -
+```
 
 ## Separate Findings and Boundaries
 
