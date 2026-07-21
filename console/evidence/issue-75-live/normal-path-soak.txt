@@ -1,0 +1,38 @@
+started_at=2026-07-21 03:50:02 UTC
+duration_seconds=1800
+interval_seconds=60
+binary_sha256=ade509a933cb46bdd438f05a84ac346e743401132966819b42f651dfb928fa65
+t=   0s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=  61s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t= 121s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t= 181s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t= 241s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t= 302s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t= 362s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t= 423s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t= 483s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t= 543s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t= 604s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t= 664s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t= 724s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t= 785s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t= 845s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t= 905s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t= 965s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=1026s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=1086s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=1146s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=1207s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=1267s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=1327s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=1388s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=1448s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=1508s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=1569s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=1629s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=1689s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=1750s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+t=1800s expected=26 runtime=26 projection=26 cgroups=26 stale=0 orphans=0 zombies=0 drift=false failed=none agents=26 unique_netns=26 shared_with_daemon=0 services=healthy restarts=0
+agent_count=26 unique_agent_netns=26 shared_with_daemon=0 loopback_only_agents=26 external_probe_rc=1 legacy_links=0 failed=none
+FINAL legacy_errors=0 isolation_log_failures=0 isolation_events=0 panic_fatal=0 elapsed_s=1803
+SOAK_PASS out_dir=/tmp/issue75/soak-final-ade509a9
