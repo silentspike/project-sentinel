@@ -37,6 +37,7 @@ struct BwrapWorkloadState {
 
 /// Default home content-addressed store location (chunks live under `/ram`).
 const DEFAULT_HOME_CAS_DIR: &str = "/ram/agents/.sentinel-home-cas";
+const DEFAULT_AGENT_HOME_ROOT: &str = "/ram/agents";
 
 pub struct BwrapNanoRuntime {
     enforcer: SandboxEnforcer,
@@ -44,6 +45,7 @@ pub struct BwrapNanoRuntime {
     /// constructor stays infallible and does no I/O (daemon/registry callers that
     /// never snapshot are unaffected).
     cas_dir: PathBuf,
+    agent_home_root: PathBuf,
     workloads: HashMap<String, BwrapWorkloadState>,
     handles: HashMap<String, SandboxHandle>,
     processes: HashMap<String, AgentProcess>,
@@ -60,10 +62,18 @@ impl BwrapNanoRuntime {
         Self {
             enforcer,
             cas_dir: cas_dir.into(),
+            agent_home_root: PathBuf::from(DEFAULT_AGENT_HOME_ROOT),
             workloads: HashMap::new(),
             handles: HashMap::new(),
             processes: HashMap::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_dirs(cas_dir: impl Into<PathBuf>, agent_home_root: impl Into<PathBuf>) -> Self {
+        let mut runtime = Self::with_cas_dir(cas_dir);
+        runtime.agent_home_root = agent_home_root.into();
+        runtime
     }
 
     /// Open (or create) the home-content `ArtifactPlane`. Called only on the
@@ -82,19 +92,19 @@ impl BwrapNanoRuntime {
         }
     }
 
-    fn home_dir(agent_name: &str) -> PathBuf {
-        PathBuf::from(format!("/ram/agents/{agent_name}"))
+    fn home_dir(&self, agent_name: &str) -> PathBuf {
+        self.agent_home_root.join(agent_name)
     }
 
-    fn write_marker(agent_name: &str, workload_id: &str) -> Result<()> {
-        let home = Self::home_dir(agent_name);
+    fn write_marker(&self, agent_name: &str, workload_id: &str) -> Result<()> {
+        let home = self.home_dir(agent_name);
         std::fs::create_dir_all(&home)?;
         std::fs::write(home.join(".nano-runtime"), workload_id.as_bytes())?;
         Ok(())
     }
 
-    fn remove_marker(agent_name: &str, workload_id: &str) -> Result<bool> {
-        let marker = Self::home_dir(agent_name).join(".nano-runtime");
+    fn remove_marker(&self, agent_name: &str, workload_id: &str) -> Result<bool> {
+        let marker = self.home_dir(agent_name).join(".nano-runtime");
         let recorded = match std::fs::read_to_string(&marker) {
             Ok(recorded) => recorded,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -129,7 +139,7 @@ impl BwrapNanoRuntime {
                 let plane = self.open_plane()?;
                 home_manifest::release_manifest(&plane, &owned_object_ids)?;
             }
-            Self::remove_marker(&agent_name, workload_id)?;
+            self.remove_marker(&agent_name, workload_id)?;
         }
         self.processes.remove(workload_id);
         self.handles.remove(workload_id);
@@ -190,7 +200,7 @@ impl BwrapNanoRuntime {
         let workload = state.workload.clone();
         let instance_id = state.instance_id;
         let agent_name = workload.agent_name.clone();
-        Self::write_marker(&agent_name, &workload.workload_id)?;
+        self.write_marker(&agent_name, &workload.workload_id)?;
 
         let mut handle = self
             .enforcer
@@ -307,7 +317,7 @@ impl NanoRuntime for BwrapNanoRuntime {
         };
 
         // Walk the agent home into a metadata-aware CAS manifest (no file bytes).
-        let home = Self::home_dir(&workload.agent_name);
+        let home = self.home_dir(&workload.agent_name);
         let plane = self.open_plane()?;
         // Release the previous snapshot's pinned objects before re-walking.
         home_manifest::release_manifest(&plane, &prev_owned)?;
@@ -356,7 +366,7 @@ impl NanoRuntime for BwrapNanoRuntime {
 
         // Rehydrate the agent home from the manifest (metadata-aware, V24 path
         // safety) instead of writing raw bytes back.
-        let home = Self::home_dir(&payload.workload.agent_name);
+        let home = self.home_dir(&payload.workload.agent_name);
         if home.exists() {
             std::fs::remove_dir_all(&home)
                 .with_context(|| format!("reset agent home dir {}", home.display()))?;
@@ -569,7 +579,10 @@ mod tests {
     #[test]
     fn failed_cleanup_retains_ownership_for_retry() {
         let temp = tempfile::tempdir().unwrap();
-        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let mut runtime = BwrapNanoRuntime::with_test_dirs(
+            temp.path().join("cas"),
+            temp.path().join("agent-homes"),
+        );
         let source_home = temp.path().join("retry-home");
         std::fs::create_dir_all(&source_home).unwrap();
         std::fs::write(source_home.join("owned.txt"), b"retry-owned content").unwrap();
@@ -584,7 +597,9 @@ mod tests {
             fixture_workload("fixture-retry", "agent-fixture-retry"),
             owned_object_ids.clone(),
         );
-        BwrapNanoRuntime::write_marker("agent-fixture-retry", "different-workload").unwrap();
+        runtime
+            .write_marker("agent-fixture-retry", "different-workload")
+            .unwrap();
 
         assert!(runtime.stop(&handle).is_err());
         assert!(runtime.processes.contains_key(&handle.workload_id));
@@ -596,7 +611,9 @@ mod tests {
         }
         drop(plane);
 
-        BwrapNanoRuntime::write_marker("agent-fixture-retry", &handle.workload_id).unwrap();
+        runtime
+            .write_marker("agent-fixture-retry", &handle.workload_id)
+            .unwrap();
         assert_eq!(
             runtime.stop(&handle).unwrap().outcome,
             sentinel_common::nano_runtime::NanoStopOutcome::Stopped
