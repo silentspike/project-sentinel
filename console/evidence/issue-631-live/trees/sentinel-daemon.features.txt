@@ -2241,6 +2241,10 @@
 5serde_json feature "default" (*)
 5tracing feature "default" (*)
 5sentinel-common feature "default" (*)
+5uuid feature "default" (*)
+5uuid feature "serde" (*)
+5uuid feature "v4" (*)
+5uuid feature "v7" (*)
 5wasmtime feature "component-model"
 6wasmtime v45.0.3
 7addr2line v0.26.0
@@ -3499,6 +3503,10 @@
 3tokio feature "full" (*)
 3tracing feature "default" (*)
 3sentinel-common feature "default" (*)
+3uuid feature "default" (*)
+3uuid feature "serde" (*)
+3uuid feature "v4" (*)
+3uuid feature "v7" (*)
 3sentinel-fs feature "default" (*)
 3landlock feature "default"
 4landlock v0.4.4

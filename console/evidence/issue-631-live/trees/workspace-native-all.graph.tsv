@@ -1808,6 +1808,7 @@ edge	sentinel-microvm	0.1.0	workspace	serde	1.0.228	registry	false	false	false
 edge	sentinel-microvm	0.1.0	workspace	serde_json	1.0.149	registry	false	false	false
 edge	sentinel-microvm	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
 edge	sentinel-microvm	0.1.0	workspace	tracing	0.1.44	registry	false	false	false
+edge	sentinel-microvm	0.1.0	workspace	uuid	1.22.0	registry	false	false	false
 edge	sentinel-nightrun	0.1.0	workspace	anyhow	1.0.103	registry	false	false	false
 edge	sentinel-nightrun	0.1.0	workspace	approx	0.5.1	registry	false	false	false
 edge	sentinel-nightrun	0.1.0	workspace	clap	4.5.60	registry	false	false	false
@@ -1885,6 +1886,7 @@ edge	sentinel-sandbox	0.1.0	workspace	serde_json	1.0.149	registry	false	false	fa
 edge	sentinel-sandbox	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
 edge	sentinel-sandbox	0.1.0	workspace	tokio	1.52.3	registry	false	false	false
 edge	sentinel-sandbox	0.1.0	workspace	tracing	0.1.44	registry	false	false	false
+edge	sentinel-sandbox	0.1.0	workspace	uuid	1.22.0	registry	false	false	false
 edge	sentinel-telemetry	0.1.0	workspace	criterion	0.5.1	registry	false	false	false
 edge	sentinel-telemetry	0.1.0	workspace	sentinel-common	0.1.0	workspace	false	false	false
 edge	sentinel-telemetry	0.1.0	workspace	serde	1.0.228	registry	false	false	false
@@ -1899,6 +1901,7 @@ edge	sentinel-wasm	0.1.0	workspace	serde	1.0.228	registry	false	false	false
 edge	sentinel-wasm	0.1.0	workspace	serde_json	1.0.149	registry	false	false	false
 edge	sentinel-wasm	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
 edge	sentinel-wasm	0.1.0	workspace	tracing	0.1.44	registry	false	false	false
+edge	sentinel-wasm	0.1.0	workspace	uuid	1.22.0	registry	false	false	false
 edge	sentinel-wasm	0.1.0	workspace	wasmtime	45.0.3	registry	false	false	false
 edge	sentinel-wasm	0.1.0	workspace	wasmtime-wasi	45.0.3	registry	false	false	false
 edge	sentinel-zenoh	0.1.0	workspace	anyhow	1.0.103	registry	false	false	false

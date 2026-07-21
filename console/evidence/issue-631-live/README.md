@@ -25,7 +25,7 @@ python3 scripts/dependency-reachability-audit.py audit --check \
 Output:
 
 ```text
-coverage=717/717 unclassified=0 roots=8/8 duplicate_versions=94 closure_rows=8485 evidence_match=PASS
+coverage=717/717 unclassified=0 roots=8/8 duplicate_versions=94 closure_rows=8500 evidence_match=PASS
 ```
 
 Evidence: `reachability.tsv`, `reachability-summary.txt`.
@@ -106,7 +106,7 @@ duplicate_names=41
 duplicate_version_rows=94
 active_tree_closures=85
 disabled_metadata_closures=9
-reverse_closure_rows=8485
+reverse_closure_rows=8500
 ```
 
 Evidence: `duplicate-versions.tsv`, the independently derived
@@ -130,7 +130,7 @@ Output summary:
 ```text
 release_root_builds=8/8
 cargo_bloat_tables=8/8
-aggregate_release_artifact_bytes=99549248
+aggregate_release_artifact_bytes=99555680
 cargo_bloat=0.12.1
 ```
 
@@ -156,8 +156,8 @@ effect, and a revisit condition.
 Pinned values:
 
 ```text
-base_commit=c37d9a487ed7e3385bbff9b8e8b3c4f555d5e429
-cargo_lock_sha256=29b97c217ff9694e116e0e6ce856e5ab761b808d5b2289bd56cb255373e14b93
+base_commit=13e87b663cc3b47223a2b0052db1cc6c274e66c8
+cargo_lock_sha256=bcb6412f833fda3809f1c988ef5f0a6cc121d410ee45245aec5c0357908eeed7
 target=x86_64-unknown-linux-gnu
 remote_rustc=1.97.1
 remote_cargo=1.97.1
@@ -165,9 +165,9 @@ remote_cargo=1.97.1
 
 Evidence: `provenance.txt` and the canonical audit.
 Metadata, every Cargo tree, all eight release artifacts, and all eight cargo-bloat
-tables were regenerated at `dade246e244bf1809200da5c0464e80bc79c5cdf`. The delta from
-that regeneration base through the pinned base changes no Cargo manifest, lockfile, or
-Rust source.
+tables were regenerated at `13e87b663cc3b47223a2b0052db1cc6c274e66c8`. This base
+adds active `uuid` normal edges to `sentinel-microvm`, `sentinel-sandbox`, and
+`sentinel-wasm`; all classifications and closures were regenerated from those inputs.
 
 Compact source regeneration from the complete internal Cargo trees:
 
@@ -186,9 +186,9 @@ diff -qr <FRESH_COMPACT_DIR> console/evidence/issue-631-live/trees \
 Output:
 
 ```text
-compact_graph_files=20 compact_graph_rows=19960
+compact_graph_files=20 compact_graph_rows=19973
 compact_source_diff=PASS
-compact_graph_bundle_sha256=a5368ce919b08e3af2ca30f4a3c2e6c1695f9e439ac4790b5cb33bdaf4b520ae
+compact_graph_bundle_sha256=22aa1bc8865133a0e2cfeb73fe69e8d9beb740b2b7aba78047d94c714d4345c4
 ```
 
 ### AC-8: Pinned Before-Baseline
@@ -203,10 +203,10 @@ direct_feature_rows=115
 source_review_rows=30
 duplicate_names=41
 duplicate_version_rows=94
-reverse_closure_rows=8485
+reverse_closure_rows=8500
 release_root_builds=8/8
 cargo_bloat_tables=8/8
-aggregate_release_artifact_bytes=99549248
+aggregate_release_artifact_bytes=99555680
 ```
 
 Evidence: `reachability-summary.txt`, `direct-release-features.tsv`,

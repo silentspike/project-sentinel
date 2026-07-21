@@ -1471,11 +1471,14 @@ getrandom	0.4.1	uuid	1.22.0	sentinel-fs	0.1.0	normal:all	true		true
 getrandom	0.4.1	uuid	1.22.0	sentinel-gaia-loop	0.1.0	normal:all	true	A	true
 getrandom	0.4.1	uuid	1.22.0	sentinel-gaia-memory	0.1.0	normal:all	true		true
 getrandom	0.4.1	uuid	1.22.0	sentinel-limbo	0.1.0	normal:all	true		true
+getrandom	0.4.1	uuid	1.22.0	sentinel-microvm	0.1.0	normal:all	true		true
 getrandom	0.4.1	uuid	1.22.0	sentinel-nightrun	0.1.0	normal:all	true	C	true
 getrandom	0.4.1	uuid	1.22.0	sentinel-projection	0.1.0	normal:all	true		true
 getrandom	0.4.1	uuid	1.22.0	sentinel-redb	0.1.0	dev:all	true		true
 getrandom	0.4.1	uuid	1.22.0	sentinel-runtime	0.1.0	normal:all	true		true
+getrandom	0.4.1	uuid	1.22.0	sentinel-sandbox	0.1.0	normal:all	true		true
 getrandom	0.4.1	uuid	1.22.0	sentinel-telemetry	0.1.0	normal:all	true		true
+getrandom	0.4.1	uuid	1.22.0	sentinel-wasm	0.1.0	normal:all	true		true
 getrandom	0.4.1	uuid	1.22.0	sentinel-zenoh	0.1.0	dev:all;normal:all	true		true
 getrandom	0.4.1	uuid	1.22.0	zenoh-link-unixsock_stream	1.7.2	normal:all	false		true
 getrandom	0.4.1	wasmtime	45.0.3	sentinel-wasm	0.1.0	normal:all	true		true
@@ -3038,11 +3041,14 @@ rand_core	0.10.1	uuid	1.22.0	sentinel-fs	0.1.0	normal:all	true		true
 rand_core	0.10.1	uuid	1.22.0	sentinel-gaia-loop	0.1.0	normal:all	true	A	true
 rand_core	0.10.1	uuid	1.22.0	sentinel-gaia-memory	0.1.0	normal:all	true		true
 rand_core	0.10.1	uuid	1.22.0	sentinel-limbo	0.1.0	normal:all	true		true
+rand_core	0.10.1	uuid	1.22.0	sentinel-microvm	0.1.0	normal:all	true		true
 rand_core	0.10.1	uuid	1.22.0	sentinel-nightrun	0.1.0	normal:all	true	C	true
 rand_core	0.10.1	uuid	1.22.0	sentinel-projection	0.1.0	normal:all	true		true
 rand_core	0.10.1	uuid	1.22.0	sentinel-redb	0.1.0	dev:all	true		true
 rand_core	0.10.1	uuid	1.22.0	sentinel-runtime	0.1.0	normal:all	true		true
+rand_core	0.10.1	uuid	1.22.0	sentinel-sandbox	0.1.0	normal:all	true		true
 rand_core	0.10.1	uuid	1.22.0	sentinel-telemetry	0.1.0	normal:all	true		true
+rand_core	0.10.1	uuid	1.22.0	sentinel-wasm	0.1.0	normal:all	true		true
 rand_core	0.10.1	uuid	1.22.0	sentinel-zenoh	0.1.0	dev:all;normal:all	true		true
 rand_core	0.10.1	uuid	1.22.0	zenoh-link-unixsock_stream	1.7.2	normal:all	false		true
 rand_core	0.10.1	wasmtime	45.0.3	sentinel-wasm	0.1.0	normal:all	true		true
@@ -5232,11 +5238,14 @@ wasm-encoder	0.244.0	uuid	1.22.0	sentinel-fs	0.1.0	normal:all	true		true
 wasm-encoder	0.244.0	uuid	1.22.0	sentinel-gaia-loop	0.1.0	normal:all	true	A	true
 wasm-encoder	0.244.0	uuid	1.22.0	sentinel-gaia-memory	0.1.0	normal:all	true		true
 wasm-encoder	0.244.0	uuid	1.22.0	sentinel-limbo	0.1.0	normal:all	true		true
+wasm-encoder	0.244.0	uuid	1.22.0	sentinel-microvm	0.1.0	normal:all	true		true
 wasm-encoder	0.244.0	uuid	1.22.0	sentinel-nightrun	0.1.0	normal:all	true	C	true
 wasm-encoder	0.244.0	uuid	1.22.0	sentinel-projection	0.1.0	normal:all	true		true
 wasm-encoder	0.244.0	uuid	1.22.0	sentinel-redb	0.1.0	dev:all	true		true
 wasm-encoder	0.244.0	uuid	1.22.0	sentinel-runtime	0.1.0	normal:all	true		true
+wasm-encoder	0.244.0	uuid	1.22.0	sentinel-sandbox	0.1.0	normal:all	true		true
 wasm-encoder	0.244.0	uuid	1.22.0	sentinel-telemetry	0.1.0	normal:all	true		true
+wasm-encoder	0.244.0	uuid	1.22.0	sentinel-wasm	0.1.0	normal:all	true		true
 wasm-encoder	0.244.0	uuid	1.22.0	sentinel-zenoh	0.1.0	dev:all;normal:all	true		true
 wasm-encoder	0.244.0	uuid	1.22.0	zenoh-link-unixsock_stream	1.7.2	normal:all	false		true
 wasm-encoder	0.244.0	wasip2	1.0.2+wasi-0.2.9	getrandom	0.3.4	"normal:cfg(all(target_arch = ""wasm32"", target_os = ""wasi"", target_env = ""p2""))"	false		true
@@ -5672,11 +5681,14 @@ wasmparser	0.244.0	uuid	1.22.0	sentinel-fs	0.1.0	normal:all	true		true
 wasmparser	0.244.0	uuid	1.22.0	sentinel-gaia-loop	0.1.0	normal:all	true	A	true
 wasmparser	0.244.0	uuid	1.22.0	sentinel-gaia-memory	0.1.0	normal:all	true		true
 wasmparser	0.244.0	uuid	1.22.0	sentinel-limbo	0.1.0	normal:all	true		true
+wasmparser	0.244.0	uuid	1.22.0	sentinel-microvm	0.1.0	normal:all	true		true
 wasmparser	0.244.0	uuid	1.22.0	sentinel-nightrun	0.1.0	normal:all	true	C	true
 wasmparser	0.244.0	uuid	1.22.0	sentinel-projection	0.1.0	normal:all	true		true
 wasmparser	0.244.0	uuid	1.22.0	sentinel-redb	0.1.0	dev:all	true		true
 wasmparser	0.244.0	uuid	1.22.0	sentinel-runtime	0.1.0	normal:all	true		true
+wasmparser	0.244.0	uuid	1.22.0	sentinel-sandbox	0.1.0	normal:all	true		true
 wasmparser	0.244.0	uuid	1.22.0	sentinel-telemetry	0.1.0	normal:all	true		true
+wasmparser	0.244.0	uuid	1.22.0	sentinel-wasm	0.1.0	normal:all	true		true
 wasmparser	0.244.0	uuid	1.22.0	sentinel-zenoh	0.1.0	dev:all;normal:all	true		true
 wasmparser	0.244.0	uuid	1.22.0	zenoh-link-unixsock_stream	1.7.2	normal:all	false		true
 wasmparser	0.244.0	wasip2	1.0.2+wasi-0.2.9	getrandom	0.3.4	"normal:cfg(all(target_arch = ""wasm32"", target_os = ""wasi"", target_env = ""p2""))"	false		true
@@ -8303,11 +8315,14 @@ wit-parser	0.244.0	uuid	1.22.0	sentinel-fs	0.1.0	normal:all	true		true
 wit-parser	0.244.0	uuid	1.22.0	sentinel-gaia-loop	0.1.0	normal:all	true	A	true
 wit-parser	0.244.0	uuid	1.22.0	sentinel-gaia-memory	0.1.0	normal:all	true		true
 wit-parser	0.244.0	uuid	1.22.0	sentinel-limbo	0.1.0	normal:all	true		true
+wit-parser	0.244.0	uuid	1.22.0	sentinel-microvm	0.1.0	normal:all	true		true
 wit-parser	0.244.0	uuid	1.22.0	sentinel-nightrun	0.1.0	normal:all	true	C	true
 wit-parser	0.244.0	uuid	1.22.0	sentinel-projection	0.1.0	normal:all	true		true
 wit-parser	0.244.0	uuid	1.22.0	sentinel-redb	0.1.0	dev:all	true		true
 wit-parser	0.244.0	uuid	1.22.0	sentinel-runtime	0.1.0	normal:all	true		true
+wit-parser	0.244.0	uuid	1.22.0	sentinel-sandbox	0.1.0	normal:all	true		true
 wit-parser	0.244.0	uuid	1.22.0	sentinel-telemetry	0.1.0	normal:all	true		true
+wit-parser	0.244.0	uuid	1.22.0	sentinel-wasm	0.1.0	normal:all	true		true
 wit-parser	0.244.0	uuid	1.22.0	sentinel-zenoh	0.1.0	dev:all;normal:all	true		true
 wit-parser	0.244.0	uuid	1.22.0	zenoh-link-unixsock_stream	1.7.2	normal:all	false		true
 wit-parser	0.244.0	wasip2	1.0.2+wasi-0.2.9	getrandom	0.3.4	"normal:cfg(all(target_arch = ""wasm32"", target_os = ""wasi"", target_env = ""p2""))"	false		true
