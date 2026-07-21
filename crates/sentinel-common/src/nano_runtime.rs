@@ -144,6 +144,46 @@ pub struct NanoExecResult {
     pub output: String,
 }
 
+/// Stable, public-safe classification for failures at the NanoRuntime exec
+/// boundary. Runtime adapters return this error through `anyhow::Error`, so
+/// callers can downcast without parsing display text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NanoExecErrorCode {
+    UnsupportedOperation,
+    UnsupportedRuntime,
+    WorkloadUnavailable,
+    ChannelUnavailable,
+    InvalidFrame,
+    UnsupportedVersion,
+    InvocationConflict,
+    DigestConflict,
+    ProtocolViolation,
+    OutputLimitExceeded,
+    DeadlineExceeded,
+    Cancelled,
+    ChannelDisconnected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("{safe_message}")]
+pub struct NanoExecError {
+    pub code: NanoExecErrorCode,
+    pub retryable: bool,
+    /// This text is deliberately payload-free and safe for operator logs.
+    pub safe_message: String,
+}
+
+impl NanoExecError {
+    pub fn new(code: NanoExecErrorCode, retryable: bool, safe_message: impl Into<String>) -> Self {
+        Self {
+            code,
+            retryable,
+            safe_message: safe_message.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NanoSnapshotSemantics {
@@ -300,7 +340,24 @@ impl NanoRuntimeRegistry {
         handle: &NanoHandle,
         request: NanoExecRequest,
     ) -> Result<NanoExecResult> {
-        self.get_mut(&handle.runtime_key)?.exec(handle, request)
+        if request.operation.starts_with("workbench_")
+            && handle.runtime_key != RUNTIME_BWRAP_LANDLOCK
+        {
+            return Err(NanoExecError::new(
+                NanoExecErrorCode::UnsupportedRuntime,
+                false,
+                "workbench execution requires the bwrap runtime",
+            )
+            .into());
+        }
+        let runtime = self.runtimes.get_mut(&handle.runtime_key).ok_or_else(|| {
+            NanoExecError::new(
+                NanoExecErrorCode::UnsupportedRuntime,
+                false,
+                "selected NanoRuntime is not registered",
+            )
+        })?;
+        runtime.exec(handle, request)
     }
 
     pub fn resources(&mut self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
@@ -618,5 +675,42 @@ pub mod conformance {
             ..handle
         };
         assert!(registry.stop(&wrong).is_err());
+    }
+
+    #[test]
+    fn registry_rejects_workbench_operations_for_non_bwrap_runtimes() {
+        let mut registry = NanoRuntimeRegistry::new(None);
+        registry.register(DummyRuntime::default()).unwrap();
+        let handle = registry
+            .get_mut("dummy-runtime")
+            .unwrap()
+            .spawn(NanoWorkloadSpec {
+                workload_id: "registry-workbench".to_string(),
+                runtime_key: Some("dummy-runtime".to_string()),
+                agent_id: None,
+                agent_name: "Agent".to_string(),
+                role: "Tester".to_string(),
+                room_id: "empfang".to_string(),
+                shift_set: 1,
+                command: Vec::new(),
+                capabilities: Vec::new(),
+                metadata: BTreeMap::new(),
+                ecs_snapshot: None,
+            })
+            .unwrap();
+
+        let error = registry
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "workbench_start".to_string(),
+                    input: "SECRET=must-not-be-reflected".to_string(),
+                },
+            )
+            .unwrap_err();
+        let typed = error.downcast_ref::<NanoExecError>().unwrap();
+        assert_eq!(typed.code, NanoExecErrorCode::UnsupportedRuntime);
+        assert!(!typed.retryable);
+        assert!(!typed.safe_message.contains("SECRET"));
     }
 }

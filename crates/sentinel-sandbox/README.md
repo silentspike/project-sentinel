@@ -15,9 +15,18 @@
   metadata, and agent-home filesystem state. It does not checkpoint process RAM
   and does not claim CRIU/live-process migration. Its idempotent `stop` releases
   the addressed process, cgroup, retained home-snapshot pins, and adapter state.
-  Its workbench exec channel uses bounded nonblocking start/poll/cancel JSONL
-  exchanges, binds every response to one invocation, and terminates the selected
-  workload on protocol, output, deadline, cancellation, or EOF boundary failure.
+  Its workbench exec channel uses schema-versioned, nonblocking start/poll/cancel
+  JSONL exchanges, binds every response to one invocation and byte-exact start
+  digest, and retains bounded terminal results for retry-safe polling. Frames are
+  limited to 1 MiB, retained output to 256 KiB, and the reader queue to 64 frames.
+  Protocol/order/correlation failures, overflow, EOF, and an unacknowledged cancel
+  or deadline terminate and reap the selected process group; production cgroup
+  cleanup is the stronger process-tree backstop. Child frames and command
+  arguments are not logged, child stderr is discarded, and failures expose
+  typed public-safe `NanoExecErrorCode` values instead of payload text. Terminal
+  transport failures are retained for stable in-process retry responses while
+  their process resources are released immediately; durable restart recovery
+  remains a caller responsibility.
 
 ## Dependencies
 
