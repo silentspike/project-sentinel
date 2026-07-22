@@ -129,7 +129,37 @@ fn productive_lifecycle_call_sites_remain_registry_owned() {
     assert!(source.contains("runtime_orch.shift_removal_candidates"));
     assert!(source.contains("runtime_orch.commit_shift_transition"));
     assert!(source.contains("shutdown blocked by NanoRuntime cleanup failure"));
-    assert!(source.contains("runtime switch failed: {error}"));
+    let config_replace = rust_function_body(source, "fn apply_runtime_changing_agent_update(");
+    let exact_stop = config_replace
+        .find("stop_agent_runtime_layer(")
+        .expect("config replacement must stop the exact old runtime");
+    let ecs_publish = config_replace
+        .find("apply_agent_update(world, staged_cfg)")
+        .expect("config replacement must publish staged ECS state");
+    let projection_publish = config_replace
+        .find("update_agent_projection_identity(projection_db_path, staged_cfg)")
+        .expect("config replacement must publish staged projection state");
+    let replacement_spawn = config_replace
+        .find("spawn_agent_nano_runtime(")
+        .expect("config replacement must start the staged runtime");
+    assert!(exact_stop < ecs_publish);
+    assert!(ecs_publish < projection_publish);
+    assert!(projection_publish < replacement_spawn);
+    assert!(config_replace.contains("persist_runtime_config_recovery_required("));
+
+    let world_teardown = rust_function_body(source, "fn teardown_runtime_for_world_restore(");
+    assert!(world_teardown.contains("stopped_runtime_ids.push(*agent_id)"));
+    let world_compensation =
+        rust_function_body(source, "fn compensate_world_restore_runtime_teardown(");
+    assert!(world_compensation.contains("stopped_runtime_ids.iter().rev()"));
+    let world_precommit = rust_function_body(source, "fn teardown_world_restore_precommit(");
+    let automatic_compensation = world_precommit
+        .find("compensate_world_restore_runtime_teardown(")
+        .expect("pre-commit teardown failures must compensate confirmed stops");
+    let fence_release = world_precommit
+        .find("restore_fence.end()")
+        .expect("restore fence must open after successful compensation");
+    assert!(automatic_compensation < fence_release);
     assert!(source.contains("fn apply_agent_runtime_control("));
     assert!(source.contains("fn reapply_persisted_runtime_suspension("));
     assert!(
@@ -150,4 +180,6 @@ fn productive_lifecycle_call_sites_remain_registry_owned() {
     assert!(reconcile.contains("runtime_agent_is_healthy(snapshot)"));
     assert!(reconcile.contains("nano_runtimes.observe(AgentId(agent_id))"));
     assert!(reconcile.contains("record_nano_runtime_snapshot("));
+    assert!(reconcile.contains("ctx.nano_runtimes.handle(agent_key).is_some()"));
+    assert!(reconcile.contains("registry_logical_recovered"));
 }

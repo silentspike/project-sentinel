@@ -25,6 +25,9 @@ pub struct RuntimeFlags {
     /// #497 (#8): Strangler gate for the per-container transfer path. Default OFF so the single-node
     /// prod path is unchanged until explicitly enabled on a cluster node.
     pub per_container_transfer_enabled: bool,
+    /// #472/#548 boundary: productive bwrap world snapshots remain disabled until #548
+    /// supplies durable snapshot ownership and GC-safe pin transfer.
+    pub bwrap_cas_world_snapshot_enabled: bool,
 }
 
 static FLAGS: OnceLock<RuntimeFlags> = OnceLock::new();
@@ -52,6 +55,10 @@ impl RuntimeFlags {
                 // #497: default OFF (Strangler) — the per-container transfer path stays inert in prod.
                 per_container_transfer_enabled: env_flag(
                     "SENTINEL_PER_CONTAINER_TRANSFER_ENABLED",
+                    false,
+                ),
+                bwrap_cas_world_snapshot_enabled: env_flag(
+                    "SENTINEL_BWRAP_CAS_WORLD_SNAPSHOT_ENABLED",
                     false,
                 ),
             };
@@ -93,6 +100,8 @@ impl RuntimeFlags {
             platform_controlplane_enabled: true,
             // #497 (#8): per-container transfer defaults OFF (Strangler), unlike the others.
             per_container_transfer_enabled: false,
+            // #548 owns productive bwrap CAS snapshot ownership and pin transfer.
+            bwrap_cas_world_snapshot_enabled: false,
         })
     }
 }
