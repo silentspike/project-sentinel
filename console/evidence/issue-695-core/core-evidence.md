@@ -31,6 +31,7 @@ Every Rust command was dispatched through `cargo remote -c --`; no local Cargo, 
 |---|---|---|
 | Workflow package | `cargo remote -c -- test -p sentinel-workflow` | PASS: 4 unit tests and 12 integration tests passed; doc-test target had 0 tests |
 | Daemon workflow API | `cargo remote -c -- test -p sentinel-daemon --lib workflow_api::tests -- --nocapture` | PASS: 5 passed, 0 failed, 340 filtered out |
+| Daemon library regression | `cargo remote -c -- test -p sentinel-daemon --lib -j1` | PASS after the canonical-profile test-path correction: 344 passed, 0 failed, 1 ignored |
 | Format | `cargo remote -c -- fmt --all -- --check` | PASS |
 | Targeted compile | `cargo remote -c -- check -p sentinel-workflow -p sentinel-daemon --all-targets` | PASS, no diagnostics |
 | Workspace compile | `cargo remote -c -- check --workspace --all-targets` | PASS after removal of three test-only unused imports, no remaining diagnostics |
@@ -45,11 +46,13 @@ Every Rust command was dispatched through `cargo remote -c --`; no local Cargo, 
 
 The two SIGKILL outcomes are build-host resource failures, not passing gates and not code/test failures. They are not benchmark evidence. Full workspace tests, Clippy, and rustdoc must pass on the pushed exact head in GitHub CI before ORC approval.
 
+The first exact-head CI run exposed that Cargo executes daemon library tests from the package directory, while the default canonical-profile path had assumed the workspace root. That run failed 49 existing daemon API fixtures before their assertions. Test builds now resolve the checked-in profile through `CARGO_MANIFEST_DIR`; non-test builds still use the deployed `config/work-profiles/web-project-v1.toml` path or the explicit `SENTINEL_WORK_PROFILE_FILE`. The complete daemon library regression then passed as recorded above.
+
 Release artifact after the current release command:
 
 - File: `target/release/sentinel-daemon`
-- Size: `57113992` bytes
-- SHA-256: `2583e55e29aa195c68404badc5d0754af685173081a82b4689aa424fb1ce869f`
+- Size: `57114184` bytes
+- SHA-256: `b4cf8a25920b6e8cf2508536dfcecf6e8393d0a48caf9b9f02e0e389b3cbe50e`
 - Toolchain readback: `rustc 1.97.1 (8bab26f4f 2026-07-14)`
 
 The artifact was not deployed. Final release provenance must be rebuilt from the eventual merge revision before live acceptance.
