@@ -11,7 +11,6 @@ name = "sentinel-projection"
 path = "src/main.rs"
 
 [dependencies]
-sentinel-common = { path = "../../crates/sentinel-common" }
 sentinel-limbo = { path = "../../crates/sentinel-limbo" }
 sentinel-projection = { path = "../../crates/sentinel-projection" }
 sentinel-telemetry = { path = "../../crates/sentinel-telemetry" }
