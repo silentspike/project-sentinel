@@ -55,7 +55,7 @@ base64 = "0.22"
 wtransport = "0.6"
 # Event-Stream-Push (#432): NATS JetStream Subscribe + Stream-Iteration
 async-nats = { workspace = true }
-futures = "0.3"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
