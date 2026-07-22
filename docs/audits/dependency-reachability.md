@@ -227,8 +227,9 @@ Stable row IDs must be preserved by #632. Current decisions are:
 
 | Decision | Rows | Meaning |
 | --- | ---: | --- |
-| `prune-features` | 10 | source and feature origin support a bounded removal or explicit feature set |
+| `prune-features` | 9 | source and feature origin support a bounded removal or explicit feature set |
 | `align-version` | 1 | dev-only Criterion pair can converge on the workspace version |
+| `leave` | 1 | #632 compilation disproved the proposed tracing-subscriber JSON prune |
 | `investigate` | 2 | provider or public-feature ownership needs proof before mutation |
 
 #632 may implement only `prune-features` and `align-version` rows. `investigate` and
