@@ -23,8 +23,8 @@ decisions.
   groups are ready to align, ten foreign-target groups are explicit `leave` results,
   and the remaining groups require upstream-chain or provider analysis.
 - Thirty high-value direct dependencies were checked against release source. The
-  resulting table contains ten actionable prune rows, one dev-only alignment row, and
-  two investigation rows.
+  resulting table contains eight actionable prune rows, one dev-only alignment row,
+  two explicit leave rows, and two investigation rows.
 - No VM, deploy, service restart, or runtime assertion belongs to this audit.
 
 All eight explicit root builds and all eight cargo-bloat contribution tables are complete.
@@ -179,8 +179,9 @@ Key findings:
   sync, time, and async IO utilities.
 - All three direct `futures` consumers import only `StreamExt`; the default
   `futures-executor` activation has no release consumer.
-- `tracing-subscriber` release roots use `fmt` and `EnvFilter`, but do not enable JSON
-  subscriber formatting in code.
+- `tracing-subscriber` release roots use `fmt` and `EnvFilter`; `sentinel-telemetry`
+  also constructs the JSON subscriber layer in release library code, so `json` remains
+  part of the workspace feature contract.
 - Dashboard zstd calls are limited to `encode_all` and `decode_all`, but its release
   graph also reaches the default-enabled zstd edge through
   `sentinel-console-plane -> sentinel-fs`. A direct-only prune has no graph effect.
