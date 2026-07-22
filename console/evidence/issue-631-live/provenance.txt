@@ -1,0 +1,52 @@
+issue=631
+base_commit=13e87b663cc3b47223a2b0052db1cc6c274e66c8
+graph_regeneration_base=13e87b663cc3b47223a2b0052db1cc6c274e66c8
+post_regeneration_manifest_lock_delta=none
+post_regeneration_rust_source_delta=none
+cargo_lock_sha256=bcb6412f833fda3809f1c988ef5f0a6cc121d410ee45245aec5c0357908eeed7
+target=x86_64-unknown-linux-gnu
+workspace_members=27
+lockfile_packages=717
+release_roots=8
+remote_rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)
+remote_cargo=cargo 1.97.1 (c980f4866 2026-06-30)
+cargo_bloat=0.12.1
+cargo_bloat_binary_sha256=6b9cf542f54ab97d0f3301584adef105302f7af794cc8332958f16404d4d8f55
+issue_body_sha256=df4eb614f340de352e9038cc5759a8df6453b48772fcdc4d0641cc924410c29f
+issue_labels=prio:medium,quality:ready,scope:full,size:M,status:ready,type:deps
+pr_611_state=OPEN
+pr_611_scope=Cargo.lock only
+raw_data=internal untracked
+compact_graph_format=package rows with root and context flags plus unique active edge rows
+compact_graph_files=20
+compact_graph_rows=19973
+compact_graph_bundle_sha256=22aa1bc8865133a0e2cfeb73fe69e8d9beb740b2b7aba78047d94c714d4345c4
+expanded_path_rows=internal untracked
+vm_access=none
+manifest_lockfile_mutation=none
+
+[remote-cargo-commands]
+cargo remote --no-copy-lock -- --version
+cargo remote --no-copy-lock -- metadata --locked --format-version 1
+cargo remote --no-copy-lock -- metadata --locked --format-version 1 --filter-platform x86_64-unknown-linux-gnu
+cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,build --prefix depth --no-dedupe
+cargo remote --no-copy-lock -- tree -p <ROOT> --target x86_64-unknown-linux-gnu -e normal,features --prefix depth
+cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build --prefix depth
+cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e normal,build,dev --prefix depth
+cargo remote --no-copy-lock -- tree --workspace --target x86_64-unknown-linux-gnu -e dev --prefix depth
+cargo remote --no-copy-lock -- tree --workspace --target all -e normal,build,dev --prefix depth
+cargo remote --no-copy-lock -- build --release --locked -p <PACKAGE> --bin <BINARY>
+cargo remote --no-copy-lock -- bloat --version
+cargo remote --no-copy-lock -- bloat --release --locked -p <PACKAGE> --bin <BINARY> --crates -n 20
+cargo remote --no-copy-lock -- check --workspace --all-targets --locked
+cargo remote --no-copy-lock -- test --workspace --locked
+cargo remote --no-copy-lock -- clippy --workspace --all-targets --locked -- -D warnings
+
+[completion]
+binary_builds=8/8 complete; bytes and sha256 recorded
+cargo_bloat_tables=8/8 complete
+structural_packages=717/717 classified
+structural_features=115 direct rows; 30 source-reviewed rows
+structural_duplicates=41 names; 94 versions; 8500 closure rows
+build_server_performance_data=excluded

@@ -1,0 +1,116 @@
+root	tier	dependency	version	requested_features	default_features	release_features	metadata_union_features	manifest
+sentinel-ctl	B	anyhow	1.0.103		true	default,std	default,std	services/sentinel-ctl/Cargo.toml
+sentinel-ctl	B	clap	4.5.60	derive	true	color,default,derive,error-context,help,std,suggestions,usage	color,default,derive,error-context,help,std,suggestions,usage	services/sentinel-ctl/Cargo.toml
+sentinel-ctl	B	reqwest	0.12.28	blocking,json,rustls-tls	false	__rustls,__rustls-ring,__tls,blocking,json,rustls-tls,rustls-tls-webpki-roots,rustls-tls-webpki-roots-no-provider	__rustls,__rustls-ring,__tls,blocking,json,rustls-tls,rustls-tls-webpki-roots,rustls-tls-webpki-roots-no-provider	services/sentinel-ctl/Cargo.toml
+sentinel-ctl	B	serde	1.0.228	derive	true	default,derive,serde_derive,std	alloc,default,derive,serde_derive,std	services/sentinel-ctl/Cargo.toml
+sentinel-ctl	B	serde_json	1.0.149		true	default,std	alloc,default,raw_value,std	services/sentinel-ctl/Cargo.toml
+sentinel-daemon	A	anyhow	1.0.103		true	default,std	default,std	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	async-nats	0.47.0		true	crypto,default,jetstream,kv,nkeys,nuid,object-store,ring,server_2_10,server_2_11,server_2_12,service,websockets	crypto,default,jetstream,kv,nkeys,nuid,object-store,ring,server_2_10,server_2_11,server_2_12,service,websockets	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	bevy_ecs	0.18.1		true	async_executor,backtrace,bevy_reflect,default,std	async_executor,backtrace,bevy_reflect,default,std	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	bincode	2.0.1	serde	true	alloc,bincode_derive,default,derive,serde,std	alloc,bincode_derive,default,derive,serde,std	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	chrono	0.4.44		true	alloc,clock,default,iana-time-zone,js-sys,now,oldtime,std,wasm-bindgen,wasmbind,winapi,windows-link	alloc,clock,default,iana-time-zone,js-sys,now,oldtime,serde,std,wasm-bindgen,wasmbind,winapi,windows-link	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	clap	4.5.60	derive	true	color,default,derive,error-context,help,std,suggestions,usage	color,default,derive,error-context,help,std,suggestions,usage	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	futures	0.3.32		true	alloc,async-await,default,executor,futures-executor,std	alloc,async-await,default,executor,futures-executor,std	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	redb	3.1.1		true	default		services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	reqwest	0.12.28	blocking,json,rustls-tls	false	__rustls,__rustls-ring,__tls,blocking,json,rustls-tls,rustls-tls-webpki-roots,rustls-tls-webpki-roots-no-provider	__rustls,__rustls-ring,__tls,blocking,json,rustls-tls,rustls-tls-webpki-roots,rustls-tls-webpki-roots-no-provider	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	sentinel-cluster-control	0.1.0		true	default		services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	sentinel-common	0.1.0		true	default	default,test-util	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	sentinel-ebpf	0.1.0		true	default	aya,aya-log,default,ebpf,libc,object	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	sentinel-ecs	0.1.0		true	default	default,wasm	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	sentinel-fs	0.1.0		true	default,telemetry	default,fuse-tests,fuser,libc,telemetry	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	sentinel-hippocampus	0.1.0		true	default		services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	sentinel-limbo	0.1.0		true	default,telemetry	default,telemetry	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	sentinel-projection	0.1.0		true	default,telemetry	default,telemetry	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	sentinel-redb	0.1.0		true	default,telemetry	default,telemetry	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	sentinel-runtime	0.1.0		true	default		services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	sentinel-sandbox	0.1.0		true	default		services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	sentinel-telemetry	0.1.0		true	default,telemetry	default,telemetry	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	sentinel-wasm	0.1.0		true	default	default,wasm	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	sentinel-zenoh	0.1.0		true	default,telemetry	default,telemetry	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	serde	1.0.228	derive	true	alloc,default,derive,serde_derive,std	alloc,default,derive,serde_derive,std	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	serde_json	1.0.149		true	alloc,default,std	alloc,default,raw_value,std	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	sha2	0.10.9		true	default,std	default,std	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	tokio	1.52.3	full	true	bytes,default,fs,full,io-std,io-util,libc,macros,mio,net,parking_lot,process,rt,rt-multi-thread,signal,signal-hook-registry,socket2,sync,test-util,time,tokio-macros	bytes,default,fs,full,io-std,io-util,libc,macros,mio,net,parking_lot,process,rt,rt-multi-thread,signal,signal-hook-registry,socket2,sync,test-util,time,tokio-macros,windows-sys	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	toml	1.0.6+spec-1.1.0		true	default,display,parse,serde,std	default,display,parse,serde,std	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	tracing	0.1.44		true	attributes,default,log,std,tracing-attributes	attributes,default,log,std,tracing-attributes	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	tracing-subscriber	0.3.22	env-filter,fmt,json	true	alloc,ansi,default,env-filter,fmt,json,matchers,nu-ansi-term,once_cell,registry,serde,serde_json,sharded-slab,smallvec,std,thread_local,tracing,tracing-log,tracing-serde	alloc,ansi,default,env-filter,fmt,json,matchers,nu-ansi-term,once_cell,registry,serde,serde_json,sharded-slab,smallvec,std,thread_local,tracing,tracing-log,tracing-serde	services/sentinel-daemon/Cargo.toml
+sentinel-daemon	A	uuid	1.22.0	serde,v4,v7	true	default,rng,serde,std,v4,v7	default,js,rng,serde,std,v4,v7	services/sentinel-daemon/Cargo.toml
+sentinel-dashboard-backend	A	anyhow	1.0.103		true	default,std	default,std	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	async-nats	0.47.0		true	crypto,default,jetstream,kv,nkeys,nuid,object-store,ring,server_2_10,server_2_11,server_2_12,service,websockets	crypto,default,jetstream,kv,nkeys,nuid,object-store,ring,server_2_10,server_2_11,server_2_12,service,websockets	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	axum	0.8.9		true	default,form,http1,json,matched-path,original-uri,query,tokio,tower-log,tracing	default,form,http1,json,matched-path,original-uri,query,tokio,tower-log,tracing	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	axum-server	0.7.3	tls-rustls	true	arc-swap,default,rustls,rustls-pemfile,rustls-pki-types,tls-rustls,tls-rustls-no-provider,tokio-rustls	arc-swap,default,rustls,rustls-pemfile,rustls-pki-types,tls-rustls,tls-rustls-no-provider,tokio-rustls	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	base64	0.22.1		true	alloc,default,std	alloc,default,std	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	futures	0.3.32		true	alloc,async-await,default,executor,futures-executor,std	alloc,async-await,default,executor,futures-executor,std	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	rcgen	0.13.2		true	crypto,default,pem,ring	crypto,default,pem,ring	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	reqwest	0.12.28	json,rustls-tls	false	__rustls,__rustls-ring,__tls,json,rustls-tls,rustls-tls-webpki-roots,rustls-tls-webpki-roots-no-provider	__rustls,__rustls-ring,__tls,blocking,json,rustls-tls,rustls-tls-webpki-roots,rustls-tls-webpki-roots-no-provider	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	rmp-serde	1.3.1		true	default		services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	rusqlite	0.38.0	bundled	true	bundled,cache,default,hashlink,modern_sqlite	bundled,cache,default,hashlink,modern_sqlite	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	rustls	0.23.37		true	aws-lc-rs,aws_lc_rs,default,log,logging,prefer-post-quantum,ring,std,tls12	aws-lc-rs,aws_lc_rs,default,log,logging,prefer-post-quantum,ring,std,tls12	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	sentinel-common	0.1.0		true	default	default,test-util	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	sentinel-console-plane	0.1.0		true	default		services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	sentinel-gaia	0.1.0		true	default		services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	sentinel-gaia-loop	0.1.0		true	default		services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	sentinel-limbo	0.1.0		true	default,telemetry	default,telemetry	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	sentinel-projection	0.1.0		true	default,telemetry	default,telemetry	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	serde	1.0.228	derive	true	alloc,default,derive,serde_derive,std	alloc,default,derive,serde_derive,std	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	serde_json	1.0.149		true	default,raw_value,std	alloc,default,raw_value,std	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	sha2	0.10.9		true	default,std	default,std	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	thiserror	2.0.18		true	default,std	default,std	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	time	0.3.47		true	alloc,default,formatting,macros,parsing,serde,serde-well-known,std	alloc,default,formatting,macros,parsing,serde,serde-well-known,std	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	tokio	1.52.3	full	true	bytes,default,fs,full,io-std,io-util,libc,macros,mio,net,parking_lot,process,rt,rt-multi-thread,signal,signal-hook-registry,socket2,sync,test-util,time,tokio-macros	bytes,default,fs,full,io-std,io-util,libc,macros,mio,net,parking_lot,process,rt,rt-multi-thread,signal,signal-hook-registry,socket2,sync,test-util,time,tokio-macros,windows-sys	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	toml	1.0.6+spec-1.1.0		true	default,display,parse,serde,std	default,display,parse,serde,std	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	tower	0.5.3		true	default,futures-core,futures-util,log,make,pin-project-lite,retry,sync_wrapper,timeout,tokio,tracing,util	futures-core,futures-util,log,make,pin-project-lite,retry,sync_wrapper,timeout,tokio,tracing,util	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	tower-http	0.6.8	cors,fs	true	cors,default,follow-redirect,fs,futures-core,futures-util,httpdate,iri-string,mime,mime_guess,percent-encoding,set-status,tokio,tokio-util,tower,tracing	cors,default,follow-redirect,fs,futures-core,futures-util,httpdate,iri-string,mime,mime_guess,percent-encoding,set-status,tokio,tokio-util,tower,tracing	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	tracing	0.1.44		true	attributes,default,log,std,tracing-attributes	attributes,default,log,std,tracing-attributes	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	tracing-subscriber	0.3.22	env-filter,fmt,json	true	alloc,ansi,default,env-filter,fmt,json,matchers,nu-ansi-term,once_cell,registry,serde,serde_json,sharded-slab,smallvec,std,thread_local,tracing,tracing-log,tracing-serde	alloc,ansi,default,env-filter,fmt,json,matchers,nu-ansi-term,once_cell,registry,serde,serde_json,sharded-slab,smallvec,std,thread_local,tracing,tracing-log,tracing-serde	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	uuid	1.22.0	serde,v4,v7	true	default,rng,serde,std,v4,v7	default,js,rng,serde,std,v4,v7	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	wtransport	0.6.1		true	default,ring,self-signed	default,ring,self-signed	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-dashboard-backend	A	zstd	0.13.3		true	arrays,default,legacy,zdict_builder	arrays,default,legacy,zdict_builder	services/sentinel-dashboard-backend/Cargo.toml
+sentinel-gaia	B	anyhow	1.0.103		true	default,std	default,std	services/sentinel-gaia/Cargo.toml
+sentinel-gaia	B	blake3	1.8.3		true	default,std	default,std	services/sentinel-gaia/Cargo.toml
+sentinel-gaia	B	clap	4.5.60	derive	true	color,default,derive,error-context,help,std,suggestions,usage	color,default,derive,error-context,help,std,suggestions,usage	services/sentinel-gaia/Cargo.toml
+sentinel-gaia	B	sentinel-common	0.1.0		true	default	default,test-util	services/sentinel-gaia/Cargo.toml
+sentinel-gaia	B	serde	1.0.228	derive	true	alloc,default,derive,serde_derive,std	alloc,default,derive,serde_derive,std	services/sentinel-gaia/Cargo.toml
+sentinel-gaia	B	serde_json	1.0.149		true	default,std	alloc,default,raw_value,std	services/sentinel-gaia/Cargo.toml
+sentinel-gaia	B	toml	1.0.6+spec-1.1.0		true	default,display,parse,serde,std	default,display,parse,serde,std	services/sentinel-gaia/Cargo.toml
+sentinel-gaia-loop	A	anyhow	1.0.103		true	default,std	default,std	services/sentinel-gaia-loop/Cargo.toml
+sentinel-gaia-loop	A	async-nats	0.47.0		true	crypto,default,jetstream,kv,nkeys,nuid,object-store,ring,server_2_10,server_2_11,server_2_12,service,websockets	crypto,default,jetstream,kv,nkeys,nuid,object-store,ring,server_2_10,server_2_11,server_2_12,service,websockets	services/sentinel-gaia-loop/Cargo.toml
+sentinel-gaia-loop	A	clap	4.5.60	derive	true	color,default,derive,error-context,help,std,suggestions,usage	color,default,derive,error-context,help,std,suggestions,usage	services/sentinel-gaia-loop/Cargo.toml
+sentinel-gaia-loop	A	fs2	0.4.3		true	default		services/sentinel-gaia-loop/Cargo.toml
+sentinel-gaia-loop	A	futures	0.3.32		true	alloc,async-await,default,executor,futures-executor,std	alloc,async-await,default,executor,futures-executor,std	services/sentinel-gaia-loop/Cargo.toml
+sentinel-gaia-loop	A	libc	0.2.186		true	default,std	default,extra_traits,std	services/sentinel-gaia-loop/Cargo.toml
+sentinel-gaia-loop	A	sentinel-common	0.1.0		true	default	default,test-util	services/sentinel-gaia-loop/Cargo.toml
+sentinel-gaia-loop	A	sentinel-limbo	0.1.0		true	default,telemetry	default,telemetry	services/sentinel-gaia-loop/Cargo.toml
+sentinel-gaia-loop	A	serde	1.0.228	derive	true	alloc,default,derive,serde_derive,std	alloc,default,derive,serde_derive,std	services/sentinel-gaia-loop/Cargo.toml
+sentinel-gaia-loop	A	serde_json	1.0.149		true	default,std	alloc,default,raw_value,std	services/sentinel-gaia-loop/Cargo.toml
+sentinel-gaia-loop	A	sha2	0.10.9		true	default,std	default,std	services/sentinel-gaia-loop/Cargo.toml
+sentinel-gaia-loop	A	thiserror	2.0.18		true	default,std	default,std	services/sentinel-gaia-loop/Cargo.toml
+sentinel-gaia-loop	A	tokio	1.52.3	full	true	bytes,default,fs,full,io-std,io-util,libc,macros,mio,net,parking_lot,process,rt,rt-multi-thread,signal,signal-hook-registry,socket2,sync,test-util,time,tokio-macros	bytes,default,fs,full,io-std,io-util,libc,macros,mio,net,parking_lot,process,rt,rt-multi-thread,signal,signal-hook-registry,socket2,sync,test-util,time,tokio-macros,windows-sys	services/sentinel-gaia-loop/Cargo.toml
+sentinel-gaia-loop	A	tracing	0.1.44		true	attributes,default,std,tracing-attributes	attributes,default,log,std,tracing-attributes	services/sentinel-gaia-loop/Cargo.toml
+sentinel-gaia-loop	A	tracing-subscriber	0.3.22	env-filter,fmt,json	true	alloc,ansi,default,env-filter,fmt,json,matchers,nu-ansi-term,once_cell,registry,serde,serde_json,sharded-slab,smallvec,std,thread_local,tracing,tracing-log,tracing-serde	alloc,ansi,default,env-filter,fmt,json,matchers,nu-ansi-term,once_cell,registry,serde,serde_json,sharded-slab,smallvec,std,thread_local,tracing,tracing-log,tracing-serde	services/sentinel-gaia-loop/Cargo.toml
+sentinel-gaia-loop	A	uuid	1.22.0	serde,v4,v7	true	default,rng,serde,std,v4,v7	default,js,rng,serde,std,v4,v7	services/sentinel-gaia-loop/Cargo.toml
+sentinel-nightrun	C	anyhow	1.0.103		true	default,std	default,std	services/sentinel-nightrun/Cargo.toml
+sentinel-nightrun	C	clap	4.5.60	derive	true	color,default,derive,error-context,help,std,suggestions,usage	color,default,derive,error-context,help,std,suggestions,usage	services/sentinel-nightrun/Cargo.toml
+sentinel-nightrun	C	libc	0.2.186		true	default,std	default,extra_traits,std	services/sentinel-nightrun/Cargo.toml
+sentinel-nightrun	C	rusqlite	0.38.0	bundled	true	bundled,cache,default,hashlink,modern_sqlite	bundled,cache,default,hashlink,modern_sqlite	services/sentinel-nightrun/Cargo.toml
+sentinel-nightrun	C	sentinel-common	0.1.0		true	default	default,test-util	services/sentinel-nightrun/Cargo.toml
+sentinel-nightrun	C	sentinel-hippocampus	0.1.0		true	default		services/sentinel-nightrun/Cargo.toml
+sentinel-nightrun	C	sentinel-limbo	0.1.0		true	default,telemetry	default,telemetry	services/sentinel-nightrun/Cargo.toml
+sentinel-nightrun	C	sentinel-telemetry	0.1.0		true	default,telemetry	default,telemetry	services/sentinel-nightrun/Cargo.toml
+sentinel-nightrun	C	serde	1.0.228	derive	true	alloc,default,derive,serde_derive,std	alloc,default,derive,serde_derive,std	services/sentinel-nightrun/Cargo.toml
+sentinel-nightrun	C	serde_json	1.0.149		true	default,std	alloc,default,raw_value,std	services/sentinel-nightrun/Cargo.toml
+sentinel-nightrun	C	sha2	0.10.9		true	default,std	default,std	services/sentinel-nightrun/Cargo.toml
+sentinel-nightrun	C	tokio	1.52.3	full	true	bytes,default,fs,full,io-std,io-util,libc,macros,mio,net,parking_lot,process,rt,rt-multi-thread,signal,signal-hook-registry,socket2,sync,time,tokio-macros	bytes,default,fs,full,io-std,io-util,libc,macros,mio,net,parking_lot,process,rt,rt-multi-thread,signal,signal-hook-registry,socket2,sync,test-util,time,tokio-macros,windows-sys	services/sentinel-nightrun/Cargo.toml
+sentinel-nightrun	C	toml	1.0.6+spec-1.1.0		true	default,display,parse,serde,std	default,display,parse,serde,std	services/sentinel-nightrun/Cargo.toml
+sentinel-nightrun	C	tracing	0.1.44		true	attributes,default,std,tracing-attributes	attributes,default,log,std,tracing-attributes	services/sentinel-nightrun/Cargo.toml
+sentinel-nightrun	C	tracing-subscriber	0.3.22	env-filter,fmt,json	true	alloc,ansi,default,env-filter,fmt,json,matchers,nu-ansi-term,once_cell,registry,serde,serde_json,sharded-slab,smallvec,std,thread_local,tracing,tracing-log,tracing-serde	alloc,ansi,default,env-filter,fmt,json,matchers,nu-ansi-term,once_cell,registry,serde,serde_json,sharded-slab,smallvec,std,thread_local,tracing,tracing-log,tracing-serde	services/sentinel-nightrun/Cargo.toml
+sentinel-nightrun	C	uuid	1.22.0	serde,v4,v7	true	default,rng,serde,std,v4,v7	default,js,rng,serde,std,v4,v7	services/sentinel-nightrun/Cargo.toml
+sentinel-projection-service	A	anyhow	1.0.103		true	default,std	default,std	services/sentinel-projection/Cargo.toml
+sentinel-projection-service	A	clap	4.5.60	derive	true	color,default,derive,error-context,help,std,suggestions,usage	color,default,derive,error-context,help,std,suggestions,usage	services/sentinel-projection/Cargo.toml
+sentinel-projection-service	A	sentinel-common	0.1.0		true	default	default,test-util	services/sentinel-projection/Cargo.toml
+sentinel-projection-service	A	sentinel-limbo	0.1.0		true	default,telemetry	default,telemetry	services/sentinel-projection/Cargo.toml
+sentinel-projection-service	A	sentinel-projection	0.1.0		true	default,telemetry	default,telemetry	services/sentinel-projection/Cargo.toml
+sentinel-projection-service	A	sentinel-telemetry	0.1.0		true	default,telemetry	default,telemetry	services/sentinel-projection/Cargo.toml
+sentinel-projection-service	A	tokio	1.52.3	full	true	bytes,default,fs,full,io-std,io-util,libc,macros,mio,net,parking_lot,process,rt,rt-multi-thread,signal,signal-hook-registry,socket2,sync,time,tokio-macros	bytes,default,fs,full,io-std,io-util,libc,macros,mio,net,parking_lot,process,rt,rt-multi-thread,signal,signal-hook-registry,socket2,sync,test-util,time,tokio-macros,windows-sys	services/sentinel-projection/Cargo.toml
+sentinel-projection-service	A	tracing	0.1.44		true	attributes,default,std,tracing-attributes	attributes,default,log,std,tracing-attributes	services/sentinel-projection/Cargo.toml
+sentinel-projection-service	A	tracing-subscriber	0.3.22	env-filter,fmt,json	true	alloc,ansi,default,env-filter,fmt,json,matchers,nu-ansi-term,once_cell,registry,serde,serde_json,sharded-slab,smallvec,std,thread_local,tracing,tracing-log,tracing-serde	alloc,ansi,default,env-filter,fmt,json,matchers,nu-ansi-term,once_cell,registry,serde,serde_json,sharded-slab,smallvec,std,thread_local,tracing,tracing-log,tracing-serde	services/sentinel-projection/Cargo.toml
