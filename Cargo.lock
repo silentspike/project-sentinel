@@ -4785,7 +4785,6 @@ dependencies = [
  "sentinel-common",
  "sentinel-hippocampus",
  "sentinel-limbo",
- "sentinel-telemetry",
  "serde",
  "serde_json",
  "sha2",
@@ -4831,7 +4830,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "sentinel-common",
  "sentinel-limbo",
  "sentinel-projection",
  "sentinel-telemetry",
