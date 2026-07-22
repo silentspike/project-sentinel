@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sentinel_workflow::{
-    AuthenticatedPrincipal, CustomerRequestId, DependencyReadiness, OrganizationRuntimePort,
-    PrincipalKind, ProjectId, UnavailableExecutionPort, UnavailableOrganizationRuntimePort,
-    WorkExecutionPort, WorkItemId, WorkflowCommand, WorkflowEngine, WorkflowError,
+    AuthenticatedPrincipal, CanonicalWorkProfile, CustomerRequestId, DependencyReadiness,
+    PrincipalKind, ProjectId, UnavailableCompletionEvidencePort, UnavailableExecutionPort,
+    UnavailableOrganizationRuntimePort, WorkItemId, WorkflowCommand, WorkflowEngine, WorkflowError,
     WorkflowErrorCode, WorkflowStore,
 };
 use serde::{Deserialize, Serialize};
@@ -130,26 +130,38 @@ impl WorkflowApi {
         path: impl AsRef<Path>,
         principal_bindings_file: Option<PathBuf>,
     ) -> Result<Self, WorkflowError> {
-        Self::with_dependencies(
-            path,
-            PrincipalAuthenticator::from_file(principal_bindings_file)?,
-            Arc::new(UnavailableExecutionPort),
-            Arc::new(UnavailableOrganizationRuntimePort),
-        )
+        let profile_path = std::env::var("SENTINEL_WORK_PROFILE_FILE")
+            .unwrap_or_else(|_| "config/work-profiles/web-project-v1.toml".into());
+        let profile = Arc::new(CanonicalWorkProfile::load_verified(profile_path)?);
+        let store = Arc::new(WorkflowStore::open(path)?);
+        Ok(Self {
+            engine: Arc::new(WorkflowEngine::with_ports(
+                store,
+                Arc::new(UnavailableExecutionPort),
+                Arc::new(UnavailableOrganizationRuntimePort),
+                Arc::new(UnavailableCompletionEvidencePort),
+                profile,
+            )),
+            principals: Arc::new(PrincipalAuthenticator::from_file(principal_bindings_file)?),
+        })
     }
 
+    #[cfg(test)]
     fn with_dependencies(
         path: impl AsRef<Path>,
         principals: PrincipalAuthenticator,
-        execution_port: Arc<dyn WorkExecutionPort>,
-        organization_port: Arc<dyn OrganizationRuntimePort>,
+        execution_port: Arc<dyn sentinel_workflow::WorkExecutionPort>,
+        organization_port: Arc<dyn sentinel_workflow::OrganizationRuntimePort>,
+        completion_port: Arc<dyn sentinel_workflow::CompletionEvidencePort>,
     ) -> Result<Self, WorkflowError> {
         let store = Arc::new(WorkflowStore::open(path)?);
         Ok(Self {
-            engine: Arc::new(WorkflowEngine::new(
+            engine: Arc::new(WorkflowEngine::with_ports(
                 store,
                 execution_port,
                 organization_port,
+                completion_port,
+                Arc::new(CanonicalWorkProfile::embedded()?),
             )),
             principals: Arc::new(principals),
         })
@@ -503,7 +515,9 @@ fn json<T: Serialize>(status: u16, payload: &T) -> WorkflowHttpResponse {
 mod tests {
     use super::*;
     use sentinel_workflow::{
-        AgentId, ExecutionReceipt, OrganizationAgentSnapshot, WorkExecutionError,
+        AgentId, CompletionEvidencePort, CompletionReceiptQuery, ExecutionReceipt,
+        OrganizationAgentSnapshot, OrganizationRuntimePort, SealedCompletionReceipt,
+        WorkExecutionError, WorkExecutionPort,
     };
     use serde_json::json;
 
@@ -543,6 +557,22 @@ mod tests {
             &self,
             _agent_id: AgentId,
         ) -> Result<OrganizationAgentSnapshot, WorkExecutionError> {
+            Err(WorkExecutionError::Unavailable)
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReadyCompletion;
+
+    impl CompletionEvidencePort for ReadyCompletion {
+        fn readiness(&self) -> DependencyReadiness {
+            DependencyReadiness::Ready
+        }
+
+        fn completion_receipt(
+            &self,
+            _query: &CompletionReceiptQuery,
+        ) -> Result<SealedCompletionReceipt, WorkExecutionError> {
             Err(WorkExecutionError::Unavailable)
         }
     }
@@ -604,6 +634,7 @@ mod tests {
             principals,
             execution,
             Arc::new(ReadyOrganization),
+            Arc::new(ReadyCompletion),
         )
         .expect("API")
     }
@@ -722,6 +753,30 @@ mod tests {
                 .status,
             404
         );
+    }
+
+    #[test]
+    fn agent_api_rejects_forged_outputs_and_self_attested_gates() {
+        let api = api(true);
+        let body = serde_json::to_vec(&json!({
+            "operation_id": "forged-completion",
+            "command": {
+                "command": "request_work_completion",
+                "work_item_id": "work-forged",
+                "expected_version": 4,
+                "assignment_version": 1,
+                "output_refs": {"source_tree": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                "gate_passed": true,
+                "gate_id": "browser_smoke"
+            }
+        }))
+        .expect("JSON");
+        let response = api
+            .handle("POST", AGENT_COMMAND_PATH, &headers(AGENT_TOKEN), &body)
+            .expect("workflow response");
+        assert_eq!(response.status, 400);
+        let value: serde_json::Value = serde_json::from_slice(&response.body).expect("JSON");
+        assert_eq!(value["code"], "invalid_input");
     }
 
     #[test]

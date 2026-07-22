@@ -64,6 +64,91 @@ impl WorkExecutionPort for FakeExecutionPort {
 }
 
 #[derive(Debug, Default)]
+struct FakeCompletionPort {
+    override_receipt: Mutex<Option<SealedCompletionReceipt>>,
+}
+
+impl FakeCompletionPort {
+    fn set_receipt(&self, receipt: SealedCompletionReceipt) {
+        *self.override_receipt.lock().expect("completion lock") = Some(receipt);
+    }
+}
+
+impl CompletionEvidencePort for FakeCompletionPort {
+    fn readiness(&self) -> DependencyReadiness {
+        DependencyReadiness::Ready
+    }
+
+    fn completion_receipt(
+        &self,
+        query: &CompletionReceiptQuery,
+    ) -> Result<SealedCompletionReceipt, WorkExecutionError> {
+        if let Some(receipt) = self
+            .override_receipt
+            .lock()
+            .expect("completion lock")
+            .clone()
+        {
+            return Ok(receipt);
+        }
+        completion_receipt(query, query.agent_id, "qa-authority", true)
+    }
+}
+
+fn completion_receipt(
+    query: &CompletionReceiptQuery,
+    artifact_owner: AgentId,
+    issued_by: &str,
+    passed: bool,
+) -> Result<SealedCompletionReceipt, WorkExecutionError> {
+    let artifacts = vec![ArtifactReceipt {
+        kind: "source_tree".into(),
+        digest: "b".repeat(64),
+        owner: artifact_owner,
+        invocation_id: query.invocation_id.clone(),
+        project_id: query.project_id.clone(),
+        work_item_id: query.work_item_id.clone(),
+    }];
+    let output_refs = BTreeMap::from([("source_tree".to_owned(), "b".repeat(64))]);
+    let subject_digest = canonical_json_digest(&output_refs);
+    let gate = GateReceipt {
+        receipt_id: format!("gate-{}", query.invocation_id),
+        invocation_id: query.invocation_id.clone(),
+        project_id: query.project_id.clone(),
+        work_item_id: query.work_item_id.clone(),
+        gate_id: "browser_smoke".into(),
+        runner_id: "web-qa-v1".into(),
+        subject_digest,
+        issued_by: issued_by.into(),
+        issuer_role: ActorRole::Qa,
+        passed,
+    };
+    SealedCompletionReceipt::seal(
+        format!("completion-{}", query.invocation_id),
+        query.invocation_id.clone(),
+        query.project_id.clone(),
+        query.work_item_id.clone(),
+        query.assignment_version,
+        query.agent_id,
+        query.input_digest.clone(),
+        artifacts,
+        gate,
+    )
+}
+
+fn canonical_json_digest<T: serde::Serialize>(value: &T) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    Sha256::digest(serde_json::to_vec(value).expect("canonical fixture JSON"))
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            let _ = write!(output, "{byte:02x}");
+            output
+        })
+}
+
+#[derive(Debug, Default)]
 struct FakeOrganizationPort {
     snapshots: Mutex<HashMap<AgentId, OrganizationAgentSnapshot>>,
 }
@@ -71,11 +156,52 @@ struct FakeOrganizationPort {
 impl FakeOrganizationPort {
     fn with_defaults() -> Self {
         let port = Self::default();
-        port.set_profile(1, ActorRole::ProjectManager, &["coordination"], None, 1);
-        port.set_profile(2, ActorRole::Developer, &["implementation"], Some(1), 1);
-        port.set_profile(3, ActorRole::Qa, &["quality"], Some(1), 1);
-        port.set_profile(4, ActorRole::Designer, &["design"], Some(1), 1);
-        port.set_profile(5, ActorRole::ReleaseManager, &["release"], Some(1), 1);
+        port.set_profile(
+            1,
+            ActorRole::ProjectManager,
+            &["project_planning", "dependency_management"],
+            None,
+            1,
+        );
+        port.set_profile(
+            2,
+            ActorRole::Developer,
+            &["web_development", "artifact_authoring", "test_execution"],
+            Some(1),
+            1,
+        );
+        port.set_profile(
+            3,
+            ActorRole::Qa,
+            &[
+                "quality_assurance",
+                "browser_validation",
+                "security_validation",
+            ],
+            Some(1),
+            1,
+        );
+        port.set_profile(
+            4,
+            ActorRole::Designer,
+            &["web_design", "artifact_authoring"],
+            Some(1),
+            1,
+        );
+        port.set_profile(
+            5,
+            ActorRole::ReleaseManager,
+            &["release_management", "provenance_validation"],
+            Some(1),
+            1,
+        );
+        port.set_profile(
+            6,
+            ActorRole::TechnicalLead,
+            &["technical_design", "work_review"],
+            Some(1),
+            1,
+        );
         port
     }
 
@@ -183,11 +309,27 @@ fn engine_with_organization(
     port: Arc<dyn WorkExecutionPort>,
     organization: Arc<dyn OrganizationRuntimePort>,
 ) -> (WorkflowEngine, Arc<WorkflowStore>) {
+    engine_with_ports(
+        path,
+        port,
+        organization,
+        Arc::new(FakeCompletionPort::default()),
+    )
+}
+
+fn engine_with_ports(
+    path: &std::path::Path,
+    port: Arc<dyn WorkExecutionPort>,
+    organization: Arc<dyn OrganizationRuntimePort>,
+    completion: Arc<dyn CompletionEvidencePort>,
+) -> (WorkflowEngine, Arc<WorkflowStore>) {
     let store = Arc::new(WorkflowStore::open(path).expect("open workflow store"));
-    let engine = WorkflowEngine::with_clock(
+    let engine = WorkflowEngine::with_ports_and_clock(
         store.clone(),
         port,
         organization,
+        completion,
+        Arc::new(CanonicalWorkProfile::embedded().expect("embedded profile")),
         Arc::new(FixedClock::new(1_000_000)),
     );
     (engine, store)
@@ -220,19 +362,28 @@ fn proposal_binding(expires_at_ms: u64) -> ProposalBinding {
             profile_id: "web-project-v1".into(),
             policy_id: "governance-v1".into(),
             owner: agent(1),
-            participants: vec![agent(1), agent(2), agent(3), agent(4), agent(5)],
+            participants: vec![agent(1), agent(2), agent(3), agent(4), agent(5), agent(6)],
         },
         expires_at_ms,
     }
 }
 
 fn bootstrap_project(engine: &WorkflowEngine) -> (CustomerRequestId, Project) {
-    let customer_actor = customer("customer-a");
+    bootstrap_project_for(engine, "a", "tenant-a", "customer-a")
+}
+
+fn bootstrap_project_for(
+    engine: &WorkflowEngine,
+    suffix: &str,
+    tenant_id: &str,
+    customer_id: &str,
+) -> (CustomerRequestId, Project) {
+    let customer_actor = customer_for_tenant(customer_id, tenant_id);
     let request = response_request(
         engine
             .execute(
                 customer_actor.clone(),
-                "submit-a",
+                &format!("submit-{suffix}"),
                 WorkflowCommand::SubmitCustomerRequest {
                     summary_ref: "ref:request/sha256:1111".into(),
                     desired_outcome: "Deliver the agreed web project".into(),
@@ -244,8 +395,8 @@ fn bootstrap_project(engine: &WorkflowEngine) -> (CustomerRequestId, Project) {
     let request = response_request(
         engine
             .execute(
-                actor(ActorRole::Sales, 10),
-                "qualify-a",
+                actor_for_tenant(ActorRole::Sales, 10, tenant_id),
+                &format!("qualify-{suffix}"),
                 WorkflowCommand::QualifyCustomerRequest {
                     request_id: request.id.clone(),
                     expected_version: request.version,
@@ -257,8 +408,8 @@ fn bootstrap_project(engine: &WorkflowEngine) -> (CustomerRequestId, Project) {
     let proposal = response_proposal(
         engine
             .execute(
-                actor(ActorRole::Sales, 10),
-                "proposal-a",
+                actor_for_tenant(ActorRole::Sales, 10, tenant_id),
+                &format!("proposal-{suffix}"),
                 WorkflowCommand::CreateProposal {
                     request_id: request.id.clone(),
                     expected_version: request.version,
@@ -270,7 +421,7 @@ fn bootstrap_project(engine: &WorkflowEngine) -> (CustomerRequestId, Project) {
     let outcome = engine
         .execute(
             customer_actor,
-            "accept-a",
+            &format!("accept-{suffix}"),
             WorkflowCommand::AcceptProposal {
                 request_id: request.id.clone(),
                 expected_version: request.version + 1,
@@ -286,30 +437,95 @@ fn bootstrap_project(engine: &WorkflowEngine) -> (CustomerRequestId, Project) {
     (request.id, project)
 }
 
-fn work_spec(id: &str, role: ActorRole, dependencies: &[&str], capability: &str) -> WorkItemSpec {
+fn work_spec(
+    id: &str,
+    role: ActorRole,
+    dependencies: &[&str],
+    capabilities: &[&str],
+    outputs: &[&str],
+    gate: &str,
+) -> WorkItemSpec {
     WorkItemSpec {
         id: WorkItemId(id.into()),
         title: format!("Work {id}"),
         objective: format!("Produce the bounded {id} result"),
         owner: agent(1),
         required_role: role,
-        required_capabilities: BTreeSet::from([capability.into()]),
+        required_capabilities: capabilities.iter().map(|value| (*value).into()).collect(),
         dependency_ids: dependencies
             .iter()
             .map(|dependency| WorkItemId((*dependency).into()))
             .collect(),
         input_refs: vec!["sha256:input".into()],
-        required_output_kinds: BTreeSet::from(["artifact".into()]),
-        quality_gate: "gate:unit".into(),
-        budget_micros: 4_000,
+        required_output_kinds: outputs.iter().map(|value| (*value).into()).collect(),
+        quality_gate: gate.into(),
+        budget_micros: 1_000,
     }
+}
+
+fn canonical_work_graph(prefix: &str) -> Vec<WorkItemSpec> {
+    let id = |role: &str| format!("{prefix}-{role}");
+    vec![
+        work_spec(
+            &id("plan"),
+            ActorRole::ProjectManager,
+            &[],
+            &["project_planning", "dependency_management"],
+            &["project_plan", "project_closeout_memory"],
+            "html_structure",
+        ),
+        work_spec(
+            &id("technical"),
+            ActorRole::TechnicalLead,
+            &[],
+            &["technical_design", "work_review"],
+            &["technical_design"],
+            "local_link_integrity",
+        ),
+        work_spec(
+            &id("design"),
+            ActorRole::Designer,
+            &[],
+            &["web_design", "artifact_authoring"],
+            &["design_specification"],
+            "static_security",
+        ),
+        work_spec(
+            &id("developer"),
+            ActorRole::Developer,
+            &[],
+            &["web_development", "artifact_authoring", "test_execution"],
+            &["source_tree"],
+            "browser_smoke",
+        ),
+        work_spec(
+            &id("qa"),
+            ActorRole::Qa,
+            &[&id("developer")],
+            &[
+                "quality_assurance",
+                "browser_validation",
+                "security_validation",
+            ],
+            &["qa_report"],
+            "agreement_acceptance_criteria",
+        ),
+        work_spec(
+            &id("release"),
+            ActorRole::ReleaseManager,
+            &[&id("qa")],
+            &["release_management", "provenance_validation"],
+            &["release_manifest", "delivery_receipt"],
+            "digest_provenance",
+        ),
+    ]
 }
 
 fn assign_developer(engine: &WorkflowEngine, work_item_id: &str, version: u64) -> Assignment {
     let outcome = engine
         .execute(
             actor(ActorRole::ProjectManager, 1),
-            &format!("assign-{work_item_id}"),
+            &format!("assign-{work_item_id}-v{version}"),
             WorkflowCommand::AssignWork {
                 work_item_id: WorkItemId(work_item_id.into()),
                 expected_version: version,
@@ -353,10 +569,12 @@ fn agreement_project_creation_is_atomic_idempotent_and_digest_bound() {
         .expect("project exists");
     assert_eq!(stored.agreement_digest, project.agreement_digest);
     assert_eq!(stored.profile_id, "web-project-v1");
+    assert_eq!(stored.profile_version, 1);
+    assert_eq!(stored.profile_digest.len(), 64);
     assert_eq!(stored.owner, agent(1));
     assert_eq!(
         stored.participants,
-        vec![agent(1), agent(2), agent(3), agent(4), agent(5)]
+        vec![agent(1), agent(2), agent(3), agent(4), agent(5), agent(6)]
     );
     let cross_tenant = engine
         .execute(
@@ -365,12 +583,7 @@ fn agreement_project_creation_is_atomic_idempotent_and_digest_bound() {
             WorkflowCommand::PlanWorkGraph {
                 project_id: project.id.clone(),
                 expected_version: project.version,
-                items: vec![work_spec(
-                    "cross-tenant-work",
-                    ActorRole::Developer,
-                    &[],
-                    "implementation",
-                )],
+                items: canonical_work_graph("cross-tenant"),
             },
         )
         .expect_err("matching agent ID in another tenant has no project authority");
@@ -381,6 +594,57 @@ fn agreement_project_creation_is_atomic_idempotent_and_digest_bound() {
         .expect("projection exists");
     assert!(projection.last_event_sequence > 0);
     assert_eq!(projection.project_id, project.id);
+    assert_eq!(projection.agreement.profile.id, "web-project-v1");
+    assert_eq!(projection.agreement.profile.digest, stored.profile_digest);
+}
+
+#[test]
+fn proposal_creation_rejects_an_unknown_profile_before_persisting_it() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (engine, _) = engine_at(
+        &directory.path().join("workflow.db"),
+        Arc::new(UnavailableExecutionPort),
+    );
+    let request = response_request(
+        engine
+            .execute(
+                customer("unknown-profile-customer"),
+                "submit-unknown-profile",
+                WorkflowCommand::SubmitCustomerRequest {
+                    summary_ref: "ref:unknown-profile".into(),
+                    desired_outcome: "Fail closed".into(),
+                    constraints: Vec::new(),
+                },
+            )
+            .expect("submit request"),
+    );
+    let request = response_request(
+        engine
+            .execute(
+                actor(ActorRole::Sales, 10),
+                "qualify-unknown-profile",
+                WorkflowCommand::QualifyCustomerRequest {
+                    request_id: request.id,
+                    expected_version: request.version,
+                    reason: "bounded".into(),
+                },
+            )
+            .expect("qualify request"),
+    );
+    let mut binding = proposal_binding(2_000_000);
+    binding.governance.profile_id = "attacker-profile".into();
+    let error = engine
+        .execute(
+            actor(ActorRole::Sales, 10),
+            "proposal-unknown-profile",
+            WorkflowCommand::CreateProposal {
+                request_id: request.id,
+                expected_version: request.version,
+                binding,
+            },
+        )
+        .expect_err("unknown profile must fail closed");
+    assert_eq!(error.code, WorkflowErrorCode::DigestConflict);
 }
 
 #[test]
@@ -599,20 +863,15 @@ fn invalid_dag_and_assignment_policy_fail_without_partial_state() {
         organization,
     );
     let (_, project) = bootstrap_project(&engine);
-    let cyclic = vec![
-        work_spec(
-            "work-a",
-            ActorRole::Developer,
-            &["work-b"],
-            "implementation",
-        ),
-        work_spec(
-            "work-b",
-            ActorRole::Developer,
-            &["work-a"],
-            "implementation",
-        ),
-    ];
+    let mut cyclic = canonical_work_graph("cycle");
+    let developer_id = WorkItemId("cycle-developer".into());
+    let qa_id = WorkItemId("cycle-qa".into());
+    cyclic
+        .iter_mut()
+        .find(|item| item.id == developer_id)
+        .expect("developer fixture")
+        .dependency_ids
+        .insert(qa_id);
     let error = engine
         .execute(
             actor(ActorRole::ProjectManager, 1),
@@ -626,7 +885,7 @@ fn invalid_dag_and_assignment_policy_fail_without_partial_state() {
         .expect_err("cyclic graph must fail");
     assert_eq!(error.code, WorkflowErrorCode::DagInvalid);
     assert!(engine
-        .work_item(&WorkItemId("work-a".into()))
+        .work_item(&WorkItemId("cycle-developer".into()))
         .expect("read work item")
         .is_none());
     assert_eq!(
@@ -638,6 +897,49 @@ fn invalid_dag_and_assignment_policy_fail_without_partial_state() {
         ProjectState::Planned
     );
 
+    let shortcut = canonical_work_graph("shortcut")
+        .into_iter()
+        .filter(|item| item.required_role == ActorRole::Developer)
+        .collect();
+    let error = engine
+        .execute(
+            actor(ActorRole::ProjectManager, 1),
+            "plan-one-item-shortcut",
+            WorkflowCommand::PlanWorkGraph {
+                project_id: project.id.clone(),
+                expected_version: project.version,
+                items: shortcut,
+            },
+        )
+        .expect_err("one work item cannot shortcut the canonical delivery topology");
+    assert_eq!(error.code, WorkflowErrorCode::DigestConflict);
+
+    let mut wrong_artifact_owner = canonical_work_graph("wrong-artifact-owner");
+    wrong_artifact_owner
+        .iter_mut()
+        .find(|item| item.required_role == ActorRole::ProjectManager)
+        .expect("project manager item")
+        .required_output_kinds
+        .remove("project_plan");
+    wrong_artifact_owner
+        .iter_mut()
+        .find(|item| item.required_role == ActorRole::Developer)
+        .expect("developer item")
+        .required_output_kinds
+        .insert("project_plan".into());
+    let error = engine
+        .execute(
+            actor(ActorRole::ProjectManager, 1),
+            "plan-wrong-artifact-owner",
+            WorkflowCommand::PlanWorkGraph {
+                project_id: project.id.clone(),
+                expected_version: project.version,
+                items: wrong_artifact_owner,
+            },
+        )
+        .expect_err("canonical artifact ownership cannot be reassigned to another role");
+    assert_eq!(error.code, WorkflowErrorCode::DigestConflict);
+
     engine
         .execute(
             actor(ActorRole::ProjectManager, 1),
@@ -645,12 +947,7 @@ fn invalid_dag_and_assignment_policy_fail_without_partial_state() {
             WorkflowCommand::PlanWorkGraph {
                 project_id: project.id,
                 expected_version: project.version,
-                items: vec![work_spec(
-                    "work-a",
-                    ActorRole::Developer,
-                    &[],
-                    "implementation",
-                )],
+                items: canonical_work_graph("valid"),
             },
         )
         .expect("valid graph");
@@ -659,7 +956,7 @@ fn invalid_dag_and_assignment_policy_fail_without_partial_state() {
             actor(ActorRole::ProjectManager, 1),
             "assign-invalid-capability",
             WorkflowCommand::AssignWork {
-                work_item_id: WorkItemId("work-a".into()),
+                work_item_id: WorkItemId("valid-developer".into()),
                 expected_version: 1,
                 assignee: agent(2),
                 reason: "should be denied".into(),
@@ -669,7 +966,7 @@ fn invalid_dag_and_assignment_policy_fail_without_partial_state() {
     assert_eq!(error.code, WorkflowErrorCode::CapabilityDenied);
     assert_eq!(
         engine
-            .work_item(&WorkItemId("work-a".into()))
+            .work_item(&WorkItemId("valid-developer".into()))
             .expect("read work item")
             .expect("work item exists")
             .state,
@@ -694,16 +991,11 @@ fn durable_execution_outbox_recovers_after_restart_without_duplicate_dispatch() 
                 WorkflowCommand::PlanWorkGraph {
                     project_id: project.id,
                     expected_version: project.version,
-                    items: vec![work_spec(
-                        "work-exec",
-                        ActorRole::Developer,
-                        &[],
-                        "implementation",
-                    )],
+                    items: canonical_work_graph("exec"),
                 },
             )
             .expect("plan graph");
-        let assignment = assign_developer(&engine, "work-exec", 1);
+        let assignment = assign_developer(&engine, "exec-developer", 1);
         engine
             .execute(
                 actor(ActorRole::Developer, 2),
@@ -724,7 +1016,7 @@ fn durable_execution_outbox_recovers_after_restart_without_duplicate_dispatch() 
         assert_eq!(failing_port.calls().len(), 1);
         assert_eq!(
             engine
-                .work_item(&WorkItemId("work-exec".into()))
+                .work_item(&WorkItemId("exec-developer".into()))
                 .expect("read work")
                 .expect("work exists")
                 .state,
@@ -746,7 +1038,7 @@ fn durable_execution_outbox_recovers_after_restart_without_duplicate_dispatch() 
     assert_eq!(healthy_port.calls().len(), 1);
     assert_eq!(
         restarted
-            .work_item(&WorkItemId("work-exec".into()))
+            .work_item(&WorkItemId("exec-developer".into()))
             .expect("read work")
             .expect("work exists")
             .state,
@@ -772,16 +1064,11 @@ fn execution_retries_are_bounded_and_materialize_an_operator_blocker() {
             WorkflowCommand::PlanWorkGraph {
                 project_id: project.id.clone(),
                 expected_version: project.version,
-                items: vec![work_spec(
-                    "work-bounded-retry",
-                    ActorRole::Developer,
-                    &[],
-                    "implementation",
-                )],
+                items: canonical_work_graph("bounded-retry"),
             },
         )
         .expect("plan graph");
-    let assignment = assign_developer(&engine, "work-bounded-retry", 1);
+    let assignment = assign_developer(&engine, "bounded-retry-developer", 1);
     engine
         .execute(
             actor(ActorRole::Developer, 2),
@@ -845,28 +1132,26 @@ fn execution_retries_are_bounded_and_materialize_an_operator_blocker() {
 fn completion_unlocks_dag_and_enforces_gate_and_assignment_version() {
     let directory = tempfile::tempdir().expect("tempdir");
     let port = Arc::new(FakeExecutionPort::default());
-    let (engine, _) = engine_at(&directory.path().join("workflow.db"), port);
+    let completion = Arc::new(FakeCompletionPort::default());
+    let (engine, _) = engine_with_ports(
+        &directory.path().join("workflow.db"),
+        port,
+        Arc::new(FakeOrganizationPort::with_defaults()),
+        completion.clone(),
+    );
     let (_, project) = bootstrap_project(&engine);
     engine
         .execute(
             actor(ActorRole::ProjectManager, 1),
             "plan-dag",
             WorkflowCommand::PlanWorkGraph {
-                project_id: project.id,
+                project_id: project.id.clone(),
                 expected_version: project.version,
-                items: vec![
-                    work_spec("work-a", ActorRole::Developer, &[], "implementation"),
-                    work_spec(
-                        "work-b",
-                        ActorRole::Developer,
-                        &["work-a"],
-                        "implementation",
-                    ),
-                ],
+                items: canonical_work_graph("completion"),
             },
         )
         .expect("plan graph");
-    let assignment = assign_developer(&engine, "work-a", 1);
+    let assignment = assign_developer(&engine, "completion-developer", 1);
     engine
         .execute(
             actor(ActorRole::Developer, 2),
@@ -883,38 +1168,82 @@ fn completion_unlocks_dag_and_enforces_gate_and_assignment_version() {
     engine
         .dispatch_pending_executions(10)
         .expect("fake accepts work");
+    let query = CompletionReceiptQuery {
+        invocation_id: format!(
+            "work-exec-{}-v{}",
+            assignment.work_item_id.0, assignment.assignment_version
+        ),
+        project_id: project.id,
+        work_item_id: assignment.work_item_id.clone(),
+        assignment_version: assignment.assignment_version,
+        agent_id: agent(2),
+        input_digest: "a".repeat(64),
+    };
+    completion.set_receipt(
+        completion_receipt(&query, agent(3), "qa-authority", true)
+            .expect("sealed forged artifact receipt"),
+    );
+    let forged_output = engine
+        .execute(
+            actor(ActorRole::Developer, 2),
+            "complete-forged-output-owner",
+            WorkflowCommand::RequestWorkCompletion {
+                work_item_id: assignment.work_item_id.clone(),
+                expected_version: 4,
+                assignment_version: assignment.assignment_version,
+            },
+        )
+        .expect_err("artifact owned by another principal cannot complete work");
+    assert_eq!(forged_output.code, WorkflowErrorCode::DigestConflict);
+    completion.set_receipt(
+        completion_receipt(&query, agent(2), "fixture-Developer-2", true)
+            .expect("sealed self-attested receipt"),
+    );
+    let self_attested = engine
+        .execute(
+            actor(ActorRole::Developer, 2),
+            "complete-self-attested-gate",
+            WorkflowCommand::RequestWorkCompletion {
+                work_item_id: assignment.work_item_id.clone(),
+                expected_version: 4,
+                assignment_version: assignment.assignment_version,
+            },
+        )
+        .expect_err("assignee cannot issue its own gate receipt");
+    assert_eq!(self_attested.code, WorkflowErrorCode::DigestConflict);
+    completion.set_receipt(
+        completion_receipt(&query, agent(2), "qa-authority", false)
+            .expect("sealed failing receipt"),
+    );
     let error = engine
         .execute(
             actor(ActorRole::Developer, 2),
             "complete-bad-gate",
-            WorkflowCommand::CompleteWork {
+            WorkflowCommand::RequestWorkCompletion {
                 work_item_id: assignment.work_item_id.clone(),
                 expected_version: 4,
                 assignment_version: assignment.assignment_version,
-                output_refs: BTreeMap::from([("artifact".into(), "b".repeat(64))]),
-                gate_id: "gate:unit".into(),
-                gate_passed: false,
             },
         )
         .expect_err("failed gate cannot complete work");
-    assert_eq!(error.code, WorkflowErrorCode::InvalidTransition);
+    assert_eq!(error.code, WorkflowErrorCode::DigestConflict);
+    completion.set_receipt(
+        completion_receipt(&query, agent(2), "qa-authority", true).expect("sealed passing receipt"),
+    );
     engine
         .execute(
             actor(ActorRole::Developer, 2),
             "complete-a",
-            WorkflowCommand::CompleteWork {
+            WorkflowCommand::RequestWorkCompletion {
                 work_item_id: assignment.work_item_id,
                 expected_version: 4,
                 assignment_version: assignment.assignment_version,
-                output_refs: BTreeMap::from([("artifact".into(), "b".repeat(64))]),
-                gate_id: "gate:unit".into(),
-                gate_passed: true,
             },
         )
         .expect("complete work");
     assert_eq!(
         engine
-            .work_item(&WorkItemId("work-b".into()))
+            .work_item(&WorkItemId("completion-qa".into()))
             .expect("read dependent")
             .expect("dependent exists")
             .state,
@@ -935,12 +1264,7 @@ fn structured_collaboration_and_cost_controls_are_authoritative() {
             WorkflowCommand::PlanWorkGraph {
                 project_id: project.id.clone(),
                 expected_version: project.version,
-                items: vec![work_spec(
-                    "work-cost",
-                    ActorRole::Developer,
-                    &[],
-                    "implementation",
-                )],
+                items: canonical_work_graph("cost"),
             },
         )
         .expect("activate project with a bounded graph");
@@ -950,7 +1274,7 @@ fn structured_collaboration_and_cost_controls_are_authoritative() {
             "raise-delivery-blocker",
             WorkflowCommand::RaiseBlocker {
                 project_id: project.id.clone(),
-                work_item_id: Some(WorkItemId("work-cost".into())),
+                work_item_id: Some(WorkItemId("cost-developer".into())),
                 cause_ref: "input:customer-copy-missing".into(),
                 impact: "implementation cannot start".into(),
                 owner: agent(2),
@@ -1030,7 +1354,7 @@ fn structured_collaboration_and_cost_controls_are_authoritative() {
             "record-action",
             WorkflowCommand::RecordActionItem {
                 project_id: project.id.clone(),
-                work_item_id: Some(WorkItemId("work-cost".into())),
+                work_item_id: Some(WorkItemId("cost-developer".into())),
                 owner: agent(2),
                 action_ref: "action:prepare-fixture".into(),
                 due_at_ms: Some(1_500_000),
@@ -1058,13 +1382,13 @@ fn structured_collaboration_and_cost_controls_are_authoritative() {
             "record-question",
             WorkflowCommand::RecordQuestion {
                 project_id: project.id.clone(),
-                work_item_id: Some(WorkItemId("work-cost".into())),
+                work_item_id: Some(WorkItemId("cost-developer".into())),
                 owner: agent(3),
                 question_ref: "question:approved-copy".into(),
             },
         )
         .expect("record unresolved structured question");
-    let assignment = assign_developer(&engine, "work-cost", 3);
+    let assignment = assign_developer(&engine, "cost-developer", 3);
     engine
         .execute(
             actor(ActorRole::Qa, 3),
@@ -1196,13 +1520,10 @@ fn structured_collaboration_and_cost_controls_are_authoritative() {
         .execute(
             actor(ActorRole::Developer, 2),
             "complete-cost-work",
-            WorkflowCommand::CompleteWork {
+            WorkflowCommand::RequestWorkCompletion {
                 work_item_id: assignment.work_item_id,
                 expected_version: 6,
                 assignment_version: assignment.assignment_version,
-                output_refs: BTreeMap::from([("artifact".into(), "a".repeat(64))]),
-                gate_id: "gate:unit".into(),
-                gate_passed: true,
             },
         )
         .expect("accepted execution completes with digest-bound evidence");
@@ -1220,7 +1541,7 @@ fn structured_collaboration_and_cost_controls_are_authoritative() {
     assert_eq!(projection.handoffs.len(), 1);
     assert_eq!(projection.approvals.len(), 1);
     assert_eq!(projection.completion_evidence.len(), 1);
-    assert_eq!(projection.state, ProjectState::DeliveryCandidate);
+    assert_eq!(projection.state, ProjectState::Active);
     let events = engine
         .events_since(&actor(ActorRole::ProjectManager, 1), 0, 1_000)
         .expect("read event stream");
@@ -1246,7 +1567,68 @@ fn structured_collaboration_and_cost_controls_are_authoritative() {
     assert_eq!(recovered.committed_cost_micros, 3_500);
     assert_eq!(recovered.approvals.len(), 1);
     assert_eq!(recovered.completion_evidence.len(), 1);
-    assert_eq!(recovered.state, ProjectState::DeliveryCandidate);
+    assert_eq!(recovered.state, ProjectState::Active);
+}
+
+#[test]
+fn record_decision_rejects_cross_project_and_cross_tenant_work_items() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (engine, _) = engine_at(
+        &directory.path().join("workflow.db"),
+        Arc::new(FakeExecutionPort::default()),
+    );
+    let (_, project_a) = bootstrap_project_for(&engine, "decision-a", "tenant-a", "customer-a");
+    let (_, project_b) = bootstrap_project_for(&engine, "decision-b", "tenant-a", "customer-b");
+    let (_, project_c) = bootstrap_project_for(&engine, "decision-c", "tenant-b", "customer-c");
+    for (suffix, project, tenant) in [
+        ("decision-a", &project_a, "tenant-a"),
+        ("decision-b", &project_b, "tenant-a"),
+        ("decision-c", &project_c, "tenant-b"),
+    ] {
+        engine
+            .execute(
+                actor_for_tenant(ActorRole::ProjectManager, 1, tenant),
+                &format!("plan-{suffix}"),
+                WorkflowCommand::PlanWorkGraph {
+                    project_id: project.id.clone(),
+                    expected_version: project.version,
+                    items: canonical_work_graph(suffix),
+                },
+            )
+            .expect("plan fixture project");
+    }
+    let decision = |operation: &str, work_item_id: WorkItemId| {
+        engine.execute(
+            actor(ActorRole::ProjectManager, 1),
+            operation,
+            WorkflowCommand::RecordDecision {
+                project_id: project_a.id.clone(),
+                work_item_id: Some(work_item_id),
+                choice: "invalid cross-boundary choice".into(),
+                alternatives: Vec::new(),
+                rationale_ref: "sha256:rationale".into(),
+                evidence_refs: Vec::new(),
+            },
+        )
+    };
+    assert_eq!(
+        decision(
+            "decision-cross-project",
+            WorkItemId("decision-b-developer".into())
+        )
+        .expect_err("work item from another project")
+        .code,
+        WorkflowErrorCode::Unauthorized
+    );
+    assert_eq!(
+        decision(
+            "decision-cross-tenant",
+            WorkItemId("decision-c-developer".into())
+        )
+        .expect_err("work item from another tenant")
+        .code,
+        WorkflowErrorCode::Unauthorized
+    );
 }
 
 #[test]
@@ -1344,7 +1726,7 @@ fn principal_scoped_idempotency_and_tenant_reads_fail_closed() {
 }
 
 #[test]
-fn organization_generation_changes_block_claim_and_dispatch_without_external_call() {
+fn authority_drift_is_durable_recoverable_and_does_not_poison_other_rows() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("workflow.db");
     let execution = Arc::new(FakeExecutionPort::default());
@@ -1356,20 +1738,16 @@ fn organization_generation_changes_block_claim_and_dispatch_without_external_cal
             actor(ActorRole::ProjectManager, 1),
             "plan-toctou",
             WorkflowCommand::PlanWorkGraph {
-                project_id: project.id,
+                project_id: project.id.clone(),
                 expected_version: project.version,
-                items: vec![work_spec(
-                    "work-toctou",
-                    ActorRole::Developer,
-                    &[],
-                    "implementation",
-                )],
+                items: canonical_work_graph("toctou"),
             },
         )
         .expect("plan work");
-    let assignment = assign_developer(&engine, "work-toctou", 1);
+    let assignment = assign_developer(&engine, "toctou-developer", 1);
+    let developer_capabilities = ["web_development", "artifact_authoring", "test_execution"];
 
-    organization.set_profile(2, ActorRole::Developer, &["implementation"], Some(1), 2);
+    organization.set_profile(2, ActorRole::Developer, &developer_capabilities, Some(1), 2);
     let stale_claim = engine
         .execute(
             agent_principal(ActorRole::Developer, 2, "tenant-a"),
@@ -1389,7 +1767,7 @@ fn organization_generation_changes_block_claim_and_dispatch_without_external_cal
     );
     assert!(execution.calls().is_empty());
 
-    organization.set_profile(2, ActorRole::Developer, &["implementation"], Some(1), 1);
+    organization.set_profile(2, ActorRole::Developer, &developer_capabilities, Some(1), 1);
     engine
         .execute(
             agent_principal(ActorRole::Developer, 2, "tenant-a"),
@@ -1403,23 +1781,101 @@ fn organization_generation_changes_block_claim_and_dispatch_without_external_cal
             },
         )
         .expect("unchanged authoritative snapshot allows claim");
-    organization.set_profile(2, ActorRole::Developer, &["implementation"], Some(1), 3);
-    let stale_dispatch = engine
-        .dispatch_pending_executions(1)
-        .expect_err("organization change after claim blocks dispatch");
-    assert_eq!(
-        stale_dispatch.code,
-        WorkflowErrorCode::OrganizationAuthorityConflict
-    );
-    assert!(execution.calls().is_empty());
+    let designer_assignment = match engine
+        .execute(
+            actor(ActorRole::ProjectManager, 1),
+            "assign-independent-designer",
+            WorkflowCommand::AssignWork {
+                work_item_id: WorkItemId("toctou-design".into()),
+                expected_version: 1,
+                assignee: agent(4),
+                reason: "independent work row".into(),
+            },
+        )
+        .expect("assign independent designer")
+        .response
+    {
+        WorkflowResponse::Assignment(value) => value,
+        other => panic!("expected assignment, got {other:?}"),
+    };
+    engine
+        .execute(
+            agent_principal(ActorRole::Designer, 4, "tenant-a"),
+            "claim-independent-designer",
+            WorkflowCommand::ClaimWork {
+                work_item_id: designer_assignment.work_item_id,
+                expected_version: 2,
+                agent_id: agent(4),
+                input_digest: "c".repeat(64),
+                deadline_ms: 2_000_000,
+            },
+        )
+        .expect("claim independent row");
+    organization.set_profile(2, ActorRole::Developer, &developer_capabilities, Some(1), 3);
+    let receipts = engine
+        .dispatch_pending_executions(10)
+        .expect("authority conflict is isolated without poisoning independent rows");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(execution.calls().len(), 1);
+    assert!(execution.calls()[0].contains("toctou-design"));
     assert_eq!(
         engine
-            .work_item(&WorkItemId("work-toctou".into()))
+            .work_item(&WorkItemId("toctou-developer".into()))
             .expect("read work item")
             .expect("work item exists")
             .state,
-        WorkItemState::Claimed
+        WorkItemState::Blocked
     );
+    let projection = engine
+        .project_projection(&project.id)
+        .expect("projection")
+        .expect("project projection");
+    assert_eq!(projection.authority_conflicts.len(), 1);
+    assert_eq!(
+        projection.authority_conflicts[0].state,
+        AuthorityConflictState::Open
+    );
+    let conflict_id = projection.authority_conflicts[0].id.clone();
+    drop(engine);
+
+    let (restarted, _) = engine_with_organization(&path, execution.clone(), organization.clone());
+    assert!(restarted
+        .dispatch_pending_executions(10)
+        .expect("terminal conflict row is not retried after restart")
+        .is_empty());
+    assert_eq!(execution.calls().len(), 1);
+    restarted
+        .execute(
+            actor(ActorRole::ProjectManager, 1),
+            "resolve-authority-conflict",
+            WorkflowCommand::ResolveAuthorityConflict {
+                conflict_id,
+                resolution_ref: "organization:snapshot-reviewed".into(),
+            },
+        )
+        .expect("resolve into reassignment-ready state");
+    let reassignment = assign_developer(&restarted, "toctou-developer", 5);
+    restarted
+        .execute(
+            agent_principal(ActorRole::Developer, 2, "tenant-a"),
+            "claim-after-authority-resolution",
+            WorkflowCommand::ClaimWork {
+                work_item_id: reassignment.work_item_id,
+                expected_version: 6,
+                agent_id: agent(2),
+                input_digest: "d".repeat(64),
+                deadline_ms: 2_000_000,
+            },
+        )
+        .expect("resolved work is claimable with a fresh authority snapshot");
+    assert_eq!(
+        restarted
+            .dispatch_pending_executions(10)
+            .expect("fresh invocation dispatches exactly once")
+            .len(),
+        1
+    );
+    assert_eq!(execution.calls().len(), 2);
 }
 
 #[test]

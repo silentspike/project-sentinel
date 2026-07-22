@@ -9,16 +9,20 @@ mod engine;
 mod error;
 mod model;
 mod port;
+mod profile;
 mod store;
 
 pub use engine::{Clock, SystemClock, WorkflowEngine};
 pub use error::{WorkflowError, WorkflowErrorCode};
 pub use model::*;
 pub use port::{
-    DependencyReadiness, ExecutionReceipt, OrganizationAgentSnapshot, OrganizationRuntimePort,
-    PendingExecution, UnavailableExecutionPort, UnavailableOrganizationRuntimePort,
-    WorkExecutionError, WorkExecutionPort,
+    ArtifactReceipt, CompletionEvidencePort, CompletionReceiptQuery, DependencyReadiness,
+    ExecutionReceipt, GateReceipt, OrganizationAgentSnapshot, OrganizationRuntimePort,
+    PendingExecution, SealedCompletionReceipt, UnavailableCompletionEvidencePort,
+    UnavailableExecutionPort, UnavailableOrganizationRuntimePort, WorkExecutionError,
+    WorkExecutionPort,
 };
+pub use profile::CanonicalWorkProfile;
 pub use store::{ProjectionCheckpoint, WorkflowBackupManifest, WorkflowStore};
 
 pub const WORKFLOW_SCHEMA_VERSION: u32 = 2;

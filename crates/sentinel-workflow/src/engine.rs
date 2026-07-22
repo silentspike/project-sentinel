@@ -23,6 +23,7 @@ const ENTITY_COST_RESERVATION: &str = "cost_reservation";
 const ENTITY_PROJECT_ROOM: &str = "project_room";
 const ENTITY_ACTION_ITEM: &str = "action_item";
 const ENTITY_QUESTION: &str = "project_question";
+const ENTITY_AUTHORITY_CONFLICT: &str = "authority_conflict";
 
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
@@ -44,6 +45,8 @@ pub struct WorkflowEngine {
     store: Arc<WorkflowStore>,
     execution_port: Arc<dyn WorkExecutionPort>,
     organization_port: Arc<dyn OrganizationRuntimePort>,
+    completion_port: Arc<dyn CompletionEvidencePort>,
+    profile: Arc<CanonicalWorkProfile>,
     clock: Arc<dyn Clock>,
 }
 
@@ -61,10 +64,12 @@ impl WorkflowEngine {
         execution_port: Arc<dyn WorkExecutionPort>,
         organization_port: Arc<dyn OrganizationRuntimePort>,
     ) -> Self {
-        Self::with_clock(
+        Self::with_ports_and_clock(
             store,
             execution_port,
             organization_port,
+            Arc::new(UnavailableCompletionEvidencePort),
+            Arc::new(CanonicalWorkProfile::embedded().expect("embedded work profile is valid")),
             Arc::new(SystemClock),
         )
     }
@@ -75,10 +80,47 @@ impl WorkflowEngine {
         organization_port: Arc<dyn OrganizationRuntimePort>,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        Self::with_ports_and_clock(
+            store,
+            execution_port,
+            organization_port,
+            Arc::new(UnavailableCompletionEvidencePort),
+            Arc::new(CanonicalWorkProfile::embedded().expect("embedded work profile is valid")),
+            clock,
+        )
+    }
+
+    pub fn with_ports(
+        store: Arc<WorkflowStore>,
+        execution_port: Arc<dyn WorkExecutionPort>,
+        organization_port: Arc<dyn OrganizationRuntimePort>,
+        completion_port: Arc<dyn CompletionEvidencePort>,
+        profile: Arc<CanonicalWorkProfile>,
+    ) -> Self {
+        Self::with_ports_and_clock(
+            store,
+            execution_port,
+            organization_port,
+            completion_port,
+            profile,
+            Arc::new(SystemClock),
+        )
+    }
+
+    pub fn with_ports_and_clock(
+        store: Arc<WorkflowStore>,
+        execution_port: Arc<dyn WorkExecutionPort>,
+        organization_port: Arc<dyn OrganizationRuntimePort>,
+        completion_port: Arc<dyn CompletionEvidencePort>,
+        profile: Arc<CanonicalWorkProfile>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             store,
             execution_port,
             organization_port,
+            completion_port,
+            profile,
             clock,
         }
     }
@@ -96,6 +138,8 @@ impl WorkflowEngine {
         let operation_namespace = actor.idempotency_namespace();
         let now_ms = self.clock.now_ms();
         let organization_port = Arc::clone(&self.organization_port);
+        let completion_port = Arc::clone(&self.completion_port);
+        let profile = Arc::clone(&self.profile);
         self.store.execute(
             &operation_namespace,
             operation_id,
@@ -105,6 +149,8 @@ impl WorkflowEngine {
                 apply_command(
                     tx,
                     organization_port.as_ref(),
+                    completion_port.as_ref(),
+                    profile.as_ref(),
                     &actor,
                     operation_id,
                     &digest_for_apply,
@@ -118,6 +164,7 @@ impl WorkflowEngine {
     pub fn mutation_readiness(&self) -> DependencyReadiness {
         if self.execution_port.readiness() == DependencyReadiness::Ready
             && self.organization_port.readiness() == DependencyReadiness::Ready
+            && self.completion_port.readiness() == DependencyReadiness::Ready
         {
             DependencyReadiness::Ready
         } else {
@@ -136,19 +183,15 @@ impl WorkflowEngine {
         let mut receipts = Vec::new();
         for request in pending {
             let now_ms = self.clock.now_ms();
-            let authority = self
-                .organization_port
-                .agent_snapshot(request.agent_id)
-                .map_err(|_| organization_conflict("organization authority is unavailable"))?;
-            authority
-                .verify()
-                .map_err(|_| organization_conflict("organization authority digest is invalid"))?;
-            if authority.generation != request.organization_generation
-                || authority.digest != request.organization_digest
-            {
-                return Err(organization_conflict(
-                    "organization authority changed before execution dispatch",
-                ));
+            let authority = self.organization_port.agent_snapshot(request.agent_id).ok();
+            let authority_valid = authority.as_ref().is_some_and(|value| {
+                value.verify().is_ok()
+                    && value.generation == request.organization_generation
+                    && value.digest == request.organization_digest
+            });
+            if !authority_valid {
+                self.record_authority_conflict(&request, authority.as_ref(), now_ms)?;
+                continue;
             }
             let receipt = match self.execution_port.reserve(&request) {
                 Ok(receipt)
@@ -219,6 +262,66 @@ impl WorkflowEngine {
             receipts.push(receipt);
         }
         Ok(receipts)
+    }
+
+    fn record_authority_conflict(
+        &self,
+        request: &PendingExecution,
+        observed: Option<&OrganizationAgentSnapshot>,
+        now_ms: u64,
+    ) -> Result<(), WorkflowError> {
+        self.store.write(|tx| {
+            let mut item: WorkItem =
+                required_entity(tx, ENTITY_WORK_ITEM, &request.work_item_id.0, "work item")?;
+            if item.state != WorkItemState::Claimed
+                || item.assignee != Some(request.agent_id)
+                || item.assignment_version != request.assignment_version
+            {
+                return invalid_transition(
+                    "claimed work changed before authority conflict handling",
+                );
+            }
+            let conflict = AuthorityConflictOutcome {
+                schema_version: WORKFLOW_SCHEMA_VERSION,
+                id: AuthorityConflictId(format!("authority-conflict-{}", request.invocation_id)),
+                invocation_id: request.invocation_id.clone(),
+                project_id: request.project_id.clone(),
+                work_item_id: request.work_item_id.clone(),
+                assignment_version: request.assignment_version,
+                expected_generation: request.organization_generation,
+                expected_digest: request.organization_digest.clone(),
+                observed_generation: observed.map(|value| value.generation),
+                observed_digest: observed.map(|value| value.digest.clone()),
+                state: AuthorityConflictState::Open,
+                resolution_ref: None,
+                created_at_ms: now_ms,
+                resolved_at_ms: None,
+            };
+            tx.mark_execution_authority_conflict(&request.invocation_id, now_ms)?;
+            item.state = WorkItemState::Blocked;
+            item.version += 1;
+            item.updated_at_ms = now_ms;
+            tx.put_entity(ENTITY_WORK_ITEM, &item.spec.id.0, item.version, &item)?;
+            tx.put_entity(ENTITY_AUTHORITY_CONFLICT, &conflict.id.0, 1, &conflict)?;
+            let mut event = workflow_event(
+                WorkflowEventType::WorkAuthorityConflictRecorded,
+                "authority_conflict",
+                &conflict.id.0,
+                &request.requested_by,
+                request.requested_role,
+                &request.tenant_id,
+                &request.invocation_id,
+                &canonical_digest(request)?,
+                Some("claimed"),
+                Some("blocked"),
+                "organization authority drift was durably isolated",
+                &conflict,
+                now_ms,
+            )?;
+            let sequence = tx.append_event(&mut event)?;
+            refresh_project_projection(tx, &request.project_id, sequence, now_ms)?;
+            Ok(())
+        })
     }
 
     fn record_execution_failure(
@@ -402,6 +505,8 @@ impl WorkflowEngine {
 fn apply_command(
     tx: &WorkflowTransaction<'_>,
     organization_port: &dyn OrganizationRuntimePort,
+    completion_port: &dyn CompletionEvidencePort,
+    profile: &CanonicalWorkProfile,
     actor: &AuthenticatedActor,
     operation_id: &str,
     operation_digest: &str,
@@ -545,6 +650,7 @@ fn apply_command(
         } => {
             require_role(actor, &[ActorRole::Sales])?;
             validate_proposal(&binding, now_ms)?;
+            let profile_reference = profile.require_id(&binding.governance.profile_id)?;
             let mut request: CustomerRequest =
                 required_entity(tx, ENTITY_REQUEST, &request_id.0, "customer request")?;
             authorize_customer_request(actor, &request)?;
@@ -558,7 +664,8 @@ fn apply_command(
                 tenant_id: request.tenant_id.clone(),
                 customer_request_id: request.id.clone(),
                 generation: request.proposal_ids.len() as u32 + 1,
-                digest: canonical_digest(&binding)?,
+                digest: canonical_digest(&(&binding, &profile_reference))?,
+                profile: profile_reference,
                 binding,
                 created_by: actor.principal_id.clone(),
                 created_at_ms: now_ms,
@@ -603,7 +710,7 @@ fn apply_command(
                 required_entity(tx, ENTITY_PROPOSAL, &proposal_id.0, "proposal")?;
             if proposal.customer_request_id != request.id
                 || proposal.digest != proposal_digest
-                || proposal.digest != canonical_digest(&proposal.binding)?
+                || proposal.digest != canonical_digest(&(&proposal.binding, &proposal.profile))?
             {
                 return Err(WorkflowError::new(
                     WorkflowErrorCode::DigestConflict,
@@ -615,6 +722,14 @@ fn apply_command(
                 return invalid_transition("proposal is expired");
             }
             validate_proposal_governance(&proposal.binding.governance)?;
+            profile.require_reference(&proposal.profile)?;
+            if proposal.binding.governance.profile_id != proposal.profile.id {
+                return Err(WorkflowError::new(
+                    WorkflowErrorCode::DigestConflict,
+                    false,
+                    "proposal governance profile does not match its immutable profile binding",
+                ));
+            }
             if proposal.tenant_id != request.tenant_id {
                 return unauthorized("proposal belongs to another tenant");
             }
@@ -627,6 +742,7 @@ fn apply_command(
                 proposal_id: proposal.id.clone(),
                 proposal_digest: proposal.digest.clone(),
                 proposal_binding: proposal.binding.clone(),
+                profile: proposal.profile.clone(),
                 customer_id: request.customer_id.clone(),
                 accepted_by: actor.principal_id.clone(),
                 accepted_at_ms: now_ms,
@@ -638,6 +754,8 @@ fn apply_command(
                 agreement_id: agreement.id.clone(),
                 agreement_digest: agreement.proposal_digest.clone(),
                 profile_id: governance.profile_id.clone(),
+                profile_version: proposal.profile.version,
+                profile_digest: proposal.profile.digest.clone(),
                 owner: governance.owner,
                 participants: governance.participants.clone(),
                 cost_ceiling_micros: proposal.binding.cost_ceiling_micros,
@@ -833,9 +951,15 @@ fn apply_command(
                 actor,
                 &[ActorRole::ProjectManager, ActorRole::TechnicalLead],
             )?;
-            validate_work_graph(&items)?;
             let mut project: Project =
                 required_entity(tx, ENTITY_PROJECT, &project_id.0, "project")?;
+            profile.require_reference(&WorkProfileRef {
+                id: project.profile_id.clone(),
+                version: project.profile_version,
+                digest: project.profile_digest.clone(),
+            })?;
+            validate_work_graph(&items)?;
+            profile.validate_work_graph(&items)?;
             authorize_project_actor(actor, &project)?;
             require_version(project.version, expected_version)?;
             if items
@@ -939,24 +1063,32 @@ fn apply_command(
             deadline_ms,
             now_ms,
         ),
-        WorkflowCommand::CompleteWork {
+        WorkflowCommand::RequestWorkCompletion {
             work_item_id,
             expected_version,
             assignment_version,
-            output_refs,
-            gate_id,
-            gate_passed,
         } => complete_work(
             tx,
+            completion_port,
+            profile,
             actor,
             operation_id,
             operation_digest,
             work_item_id,
             expected_version,
             assignment_version,
-            output_refs,
-            gate_id,
-            gate_passed,
+            now_ms,
+        ),
+        WorkflowCommand::ResolveAuthorityConflict {
+            conflict_id,
+            resolution_ref,
+        } => resolve_authority_conflict(
+            tx,
+            actor,
+            operation_id,
+            operation_digest,
+            conflict_id,
+            resolution_ref,
             now_ms,
         ),
         WorkflowCommand::RecordDecision {
@@ -973,6 +1105,7 @@ fn apply_command(
             )?;
             let project: Project = required_entity(tx, ENTITY_PROJECT, &project_id.0, "project")?;
             authorize_project_actor(actor, &project)?;
+            validate_optional_work_item(tx, &project.id, work_item_id.as_ref())?;
             validate_text(&choice, "decision choice")?;
             validate_text(&rationale_ref, "decision rationale reference")?;
             let decision = ProjectDecision {
@@ -1442,21 +1575,20 @@ fn claim_work(
 #[allow(clippy::too_many_arguments)]
 fn complete_work(
     tx: &WorkflowTransaction<'_>,
+    completion_port: &dyn CompletionEvidencePort,
+    profile: &CanonicalWorkProfile,
     actor: &AuthenticatedActor,
     operation_id: &str,
     operation_digest: &str,
     work_item_id: WorkItemId,
     expected_version: u64,
     assignment_version: u64,
-    output_refs: BTreeMap<String, String>,
-    gate_id: String,
-    gate_passed: bool,
     now_ms: u64,
 ) -> Result<WorkflowResponse, WorkflowError> {
     let mut item: WorkItem = required_entity(tx, ENTITY_WORK_ITEM, &work_item_id.0, "work item")?;
     require_version(item.version, expected_version)?;
     if actor.agent_id != item.assignee || actor.role != item.spec.required_role {
-        return unauthorized("only the current assignee may submit completion evidence");
+        return unauthorized("only the current assignee may request work completion");
     }
     if item.state != WorkItemState::InProgress {
         return invalid_transition("work item has no accepted execution in progress");
@@ -1467,30 +1599,128 @@ fn complete_work(
         return Err(WorkflowError::new(
             WorkflowErrorCode::VersionConflict,
             false,
-            "completion evidence targets a stale assignment",
+            "completion request targets a stale assignment",
         ));
     }
-    if gate_id != item.spec.quality_gate || !gate_passed {
-        return invalid_transition("required work-item quality gate did not pass");
+    let invocation_id = format!("work-exec-{}-v{}", item.spec.id.0, assignment_version);
+    let (request, outbox_state) = tx.execution_request(&invocation_id)?;
+    if outbox_state != "dispatched" {
+        return invalid_transition("completion requires a dispatched execution reservation");
+    }
+    let query = CompletionReceiptQuery {
+        invocation_id: invocation_id.clone(),
+        project_id: project.id.clone(),
+        work_item_id: item.spec.id.clone(),
+        assignment_version,
+        agent_id: item.assignee.expect("assignee checked above"),
+        input_digest: request.input_digest.clone(),
+    };
+    let receipt = completion_port.completion_receipt(&query).map_err(|_| {
+        WorkflowError::new(
+            WorkflowErrorCode::ExecutionUnavailable,
+            true,
+            "sealed completion evidence is unavailable",
+        )
+    })?;
+    receipt.verify().map_err(|_| {
+        WorkflowError::new(
+            WorkflowErrorCode::DigestConflict,
+            false,
+            "completion receipt seal is invalid",
+        )
+    })?;
+    if receipt.invocation_id != query.invocation_id
+        || receipt.project_id != query.project_id
+        || receipt.work_item_id != query.work_item_id
+        || receipt.assignment_version != query.assignment_version
+        || receipt.agent_id != query.agent_id
+        || receipt.input_digest != query.input_digest
+    {
+        return Err(WorkflowError::new(
+            WorkflowErrorCode::DigestConflict,
+            false,
+            "completion receipt does not match the durable invocation and assignment",
+        ));
+    }
+    let mut output_refs = BTreeMap::new();
+    for artifact in &receipt.artifacts {
+        validate_digest(&artifact.digest)?;
+        if artifact.owner != query.agent_id
+            || artifact.invocation_id != query.invocation_id
+            || artifact.project_id != query.project_id
+            || artifact.work_item_id != query.work_item_id
+            || output_refs
+                .insert(artifact.kind.clone(), artifact.digest.clone())
+                .is_some()
+        {
+            return Err(WorkflowError::new(
+                WorkflowErrorCode::DigestConflict,
+                false,
+                "completion artifact ownership or invocation binding is invalid",
+            ));
+        }
     }
     let output_kinds: BTreeSet<_> = output_refs.keys().cloned().collect();
-    if !item.spec.required_output_kinds.is_subset(&output_kinds)
-        || output_refs
-            .values()
-            .any(|digest| validate_digest(digest).is_err())
-    {
-        return invalid_input("completion evidence is missing a required digest-bound output");
+    if !item.spec.required_output_kinds.is_subset(&output_kinds) {
+        return invalid_input("completion receipt is missing a required digest-bound output");
     }
+    let output_bundle_digest = canonical_digest(&output_refs)?;
+    let gate = &receipt.gate;
+    let expected_runner = profile
+        .gate_runner(&item.spec.quality_gate)
+        .ok_or_else(|| {
+            WorkflowError::new(
+                WorkflowErrorCode::DigestConflict,
+                false,
+                "work-item gate is not part of the canonical profile",
+            )
+        })?;
+    if gate.invocation_id != query.invocation_id
+        || gate.project_id != query.project_id
+        || gate.work_item_id != query.work_item_id
+        || gate.gate_id != item.spec.quality_gate
+        || gate.runner_id != expected_runner
+        || gate.subject_digest != output_bundle_digest
+        || gate.issued_by == actor.principal_id
+        || !matches!(gate.issuer_role, ActorRole::Qa | ActorRole::ReleaseManager)
+        || !gate.passed
+    {
+        return Err(WorkflowError::new(
+            WorkflowErrorCode::DigestConflict,
+            false,
+            "completion gate receipt lacks independent canonical authority",
+        ));
+    }
+    append_event(
+        tx,
+        WorkflowEventType::WorkCompletionRequested,
+        "work_item",
+        &item.spec.id.0,
+        actor,
+        operation_id,
+        operation_digest,
+        Some("in_progress"),
+        Some("in_progress"),
+        "the assigned agent requested authoritative completion evidence",
+        &query,
+        now_ms,
+    )?;
     let evidence = CompletionEvidence {
         schema_version: WORKFLOW_SCHEMA_VERSION,
         id: EvidenceId::new("evidence"),
         project_id: item.project_id.clone(),
         work_item_id: item.spec.id.clone(),
         assignment_version,
+        invocation_id,
+        input_digest: query.input_digest,
         output_refs: output_refs.clone(),
-        gate_id,
-        gate_passed,
-        recorded_by: actor.principal_id.clone(),
+        output_bundle_digest,
+        gate_id: gate.gate_id.clone(),
+        gate_passed: gate.passed,
+        gate_receipt_id: gate.receipt_id.clone(),
+        gate_authority: gate.issued_by.clone(),
+        receipt_digest: receipt.seal_digest,
+        recorded_by: gate.issued_by.clone(),
         recorded_at_ms: now_ms,
     };
     item.output_refs = output_refs;
@@ -1511,6 +1741,16 @@ fn complete_work(
             .iter()
             .all(|candidate| candidate.state == WorkItemState::Done)
     {
+        profile.require_reference(&WorkProfileRef {
+            id: project.profile_id.clone(),
+            version: project.profile_version,
+            digest: project.profile_digest.clone(),
+        })?;
+        let specs: Vec<_> = all_items
+            .iter()
+            .map(|candidate| candidate.spec.clone())
+            .collect();
+        profile.validate_work_graph(&specs)?;
         project.state = ProjectState::DeliveryCandidate;
         project.version += 1;
         project.updated_at_ms = now_ms;
@@ -1526,12 +1766,82 @@ fn complete_work(
         operation_digest,
         Some("in_progress"),
         Some("done"),
-        "required outputs and completion evidence passed the declared gate",
+        "sealed outputs and an independent gate receipt authorized completion",
         &evidence,
         now_ms,
     )?;
     refresh_project_projection(tx, &project.id, sequence, now_ms)?;
     Ok(WorkflowResponse::WorkItem(item))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_authority_conflict(
+    tx: &WorkflowTransaction<'_>,
+    actor: &AuthenticatedActor,
+    operation_id: &str,
+    operation_digest: &str,
+    conflict_id: AuthorityConflictId,
+    resolution_ref: String,
+    now_ms: u64,
+) -> Result<WorkflowResponse, WorkflowError> {
+    require_role(
+        actor,
+        &[ActorRole::ProjectManager, ActorRole::TechnicalLead],
+    )?;
+    validate_text(&resolution_ref, "authority conflict resolution reference")?;
+    let mut conflict: AuthorityConflictOutcome = required_entity(
+        tx,
+        ENTITY_AUTHORITY_CONFLICT,
+        &conflict_id.0,
+        "authority conflict",
+    )?;
+    if conflict.state != AuthorityConflictState::Open {
+        return invalid_transition("authority conflict is already resolved");
+    }
+    let project: Project = required_entity(tx, ENTITY_PROJECT, &conflict.project_id.0, "project")?;
+    authorize_project_actor(actor, &project)?;
+    let mut item: WorkItem =
+        required_entity(tx, ENTITY_WORK_ITEM, &conflict.work_item_id.0, "work item")?;
+    if item.state != WorkItemState::Blocked
+        || item.assignment_version != conflict.assignment_version
+    {
+        return invalid_transition("authority conflict no longer matches the blocked assignment");
+    }
+    for mut assignment in tx.entities::<Assignment>(ENTITY_ASSIGNMENT)? {
+        if assignment.work_item_id == item.spec.id
+            && assignment.assignment_version == conflict.assignment_version
+            && assignment.active
+        {
+            assignment.active = false;
+            assignment.revoked_at_ms = Some(now_ms);
+            tx.put_entity(ENTITY_ASSIGNMENT, &assignment.id.0, 2, &assignment)?;
+        }
+    }
+    item.assignee = None;
+    item.state = WorkItemState::Ready;
+    item.version += 1;
+    item.updated_at_ms = now_ms;
+    conflict.state = AuthorityConflictState::Resolved;
+    conflict.resolution_ref = Some(resolution_ref);
+    conflict.resolved_at_ms = Some(now_ms);
+    tx.put_entity(ENTITY_WORK_ITEM, &item.spec.id.0, item.version, &item)?;
+    tx.put_entity(ENTITY_AUTHORITY_CONFLICT, &conflict.id.0, 2, &conflict)?;
+    let sequence = append_event(
+        tx,
+        WorkflowEventType::WorkAuthorityConflictResolved,
+        "authority_conflict",
+        &conflict.id.0,
+        actor,
+        operation_id,
+        operation_digest,
+        Some("open"),
+        Some("resolved"),
+        "project leadership resolved authority drift and reopened reassignment",
+        &conflict,
+        now_ms,
+    )?;
+    refresh_project_projection(tx, &project.id, sequence, now_ms)?;
+    Ok(WorkflowResponse::AuthorityConflict(conflict))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2719,6 +3029,12 @@ fn refresh_project_projection(
         .filter(|evidence| work_item_ids.contains(&evidence.work_item_id))
         .collect();
     completion_evidence.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut authority_conflicts: Vec<AuthorityConflictOutcome> = tx
+        .entities::<AuthorityConflictOutcome>(ENTITY_AUTHORITY_CONFLICT)?
+        .into_iter()
+        .filter(|conflict| conflict.project_id == *project_id)
+        .collect();
+    authority_conflicts.sort_by(|left, right| left.id.cmp(&right.id));
     let mut blockers: Vec<Blocker> = tx
         .entities::<Blocker>(ENTITY_BLOCKER)?
         .into_iter()
@@ -2784,6 +3100,7 @@ fn refresh_project_projection(
         work_items,
         assignments,
         completion_evidence,
+        authority_conflicts,
         decisions,
         handoffs,
         blockers,

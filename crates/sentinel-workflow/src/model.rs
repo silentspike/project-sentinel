@@ -43,8 +43,9 @@ string_id!(CostReservationId);
 string_id!(ProjectRoomId);
 string_id!(ActionItemId);
 string_id!(QuestionId);
+string_id!(AuthorityConflictId);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorRole {
     Customer,
@@ -187,6 +188,13 @@ pub struct ProposalGovernance {
     pub participants: Vec<AgentId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkProfileRef {
+    pub id: String,
+    pub version: u32,
+    pub digest: String,
+}
+
 impl Default for ProposalGovernance {
     fn default() -> Self {
         Self {
@@ -206,6 +214,7 @@ pub struct Proposal {
     pub tenant_id: String,
     pub customer_request_id: CustomerRequestId,
     pub generation: u32,
+    pub profile: WorkProfileRef,
     pub binding: ProposalBinding,
     pub digest: String,
     pub created_by: String,
@@ -222,6 +231,7 @@ pub struct Agreement {
     pub proposal_id: ProposalId,
     pub proposal_digest: String,
     pub proposal_binding: ProposalBinding,
+    pub profile: WorkProfileRef,
     pub customer_id: String,
     pub accepted_by: String,
     pub accepted_at_ms: u64,
@@ -246,6 +256,8 @@ pub struct Project {
     pub agreement_id: AgreementId,
     pub agreement_digest: String,
     pub profile_id: String,
+    pub profile_version: u32,
+    pub profile_digest: String,
     pub owner: AgentId,
     pub participants: Vec<AgentId>,
     pub cost_ceiling_micros: u64,
@@ -342,11 +354,42 @@ pub struct CompletionEvidence {
     pub project_id: ProjectId,
     pub work_item_id: WorkItemId,
     pub assignment_version: u64,
+    pub invocation_id: String,
+    pub input_digest: String,
     pub output_refs: BTreeMap<String, String>,
+    pub output_bundle_digest: String,
     pub gate_id: String,
     pub gate_passed: bool,
+    pub gate_receipt_id: String,
+    pub gate_authority: String,
+    pub receipt_digest: String,
     pub recorded_by: String,
     pub recorded_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorityConflictState {
+    Open,
+    Resolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityConflictOutcome {
+    pub schema_version: u32,
+    pub id: AuthorityConflictId,
+    pub invocation_id: String,
+    pub project_id: ProjectId,
+    pub work_item_id: WorkItemId,
+    pub assignment_version: u64,
+    pub expected_generation: u64,
+    pub expected_digest: String,
+    pub observed_generation: Option<u64>,
+    pub observed_digest: Option<String>,
+    pub state: AuthorityConflictState,
+    pub resolution_ref: Option<String>,
+    pub created_at_ms: u64,
+    pub resolved_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -528,6 +571,9 @@ pub enum WorkflowEventType {
     WorkClaimed,
     WorkExecutionRequested,
     WorkExecutionStarted,
+    WorkAuthorityConflictRecorded,
+    WorkAuthorityConflictResolved,
+    WorkCompletionRequested,
     WorkCompleted,
     DecisionRecorded,
     HandoffCreated,
@@ -583,6 +629,7 @@ pub struct ProjectProjection {
     pub work_items: Vec<WorkItem>,
     pub assignments: Vec<Assignment>,
     pub completion_evidence: Vec<CompletionEvidence>,
+    pub authority_conflicts: Vec<AuthorityConflictOutcome>,
     pub decisions: Vec<ProjectDecision>,
     pub handoffs: Vec<Handoff>,
     pub blockers: Vec<Blocker>,
@@ -664,13 +711,14 @@ pub enum WorkflowCommand {
         input_digest: String,
         deadline_ms: u64,
     },
-    CompleteWork {
+    RequestWorkCompletion {
         work_item_id: WorkItemId,
         expected_version: u64,
         assignment_version: u64,
-        output_refs: BTreeMap<String, String>,
-        gate_id: String,
-        gate_passed: bool,
+    },
+    ResolveAuthorityConflict {
+        conflict_id: AuthorityConflictId,
+        resolution_ref: String,
     },
     RecordDecision {
         project_id: ProjectId,
@@ -771,6 +819,7 @@ pub enum WorkflowResponse {
     WorkItems(Vec<WorkItem>),
     Assignment(Assignment),
     WorkItem(WorkItem),
+    AuthorityConflict(AuthorityConflictOutcome),
     Decision(ProjectDecision),
     Handoff(Handoff),
     Blocker(Blocker),
