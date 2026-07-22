@@ -12,3 +12,4 @@ runtime_claims=none
 performance_claims=none
 raw_remote_output=untracked
 pr_evidence_section=Evidence (AC Mapping)
+pr_template_sections=7
