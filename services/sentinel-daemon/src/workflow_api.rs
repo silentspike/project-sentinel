@@ -26,6 +26,20 @@ pub const OPERATOR_PROJECTION_PATH: &str = "/operator/workflow/projections";
 pub const OPERATOR_EVENTS_PATH: &str = "/operator/workflow/events";
 pub const MAX_WORKFLOW_BODY_BYTES: usize = 256 * 1024;
 
+fn work_profile_path() -> PathBuf {
+    if let Ok(path) = std::env::var("SENTINEL_WORK_PROFILE_FILE") {
+        return path.into();
+    }
+    #[cfg(test)]
+    {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/work-profiles/web-project-v1.toml")
+    }
+    #[cfg(not(test))]
+    {
+        "config/work-profiles/web-project-v1.toml".into()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommandEnvelope {
@@ -130,8 +144,7 @@ impl WorkflowApi {
         path: impl AsRef<Path>,
         principal_bindings_file: Option<PathBuf>,
     ) -> Result<Self, WorkflowError> {
-        let profile_path = std::env::var("SENTINEL_WORK_PROFILE_FILE")
-            .unwrap_or_else(|_| "config/work-profiles/web-project-v1.toml".into());
+        let profile_path = work_profile_path();
         let profile = Arc::new(CanonicalWorkProfile::load_verified(profile_path)?);
         let store = Arc::new(WorkflowStore::open(path)?);
         Ok(Self {
