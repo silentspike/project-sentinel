@@ -6,8 +6,9 @@
 //! - Gauge operations:   < 1 ns
 //! - Metrics snapshot:   < 100 µs
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use sentinel_telemetry::metrics::MetricsRegistry;
+use std::hint::black_box;
 
 // ──────────────────────────────────────────────
 // 1. Counter — Budget: < 1 ns per increment
