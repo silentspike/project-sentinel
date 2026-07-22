@@ -1,0 +1,23 @@
+File  .text     Size Crate
+15.1%  43.0%   1.4MiB [Unknown]
+3.8%  10.8% 359.0KiB std
+3.7%  10.6% 352.4KiB sentinel_projection
+3.3%   9.3% 310.7KiB clap_builder
+2.0%   5.6% 186.7KiB regex_syntax
+1.6%   4.7% 155.5KiB regex_automata
+1.4%   4.1% 136.8KiB tracing_subscriber
+1.0%   3.0%  98.6KiB libsqlite3_sys
+0.5%   1.4%  47.7KiB serde_json
+0.5%   1.4%  45.5KiB sentinel_limbo
+0.2%   0.6%  20.7KiB sentinel_telemetry
+0.2%   0.5%  16.8KiB tracing_core
+0.2%   0.5%  16.7KiB rusqlite
+0.2%   0.4%  14.7KiB proc_macro2
+0.1%   0.4%  12.0KiB sentinel_common
+0.1%   0.2%   7.6KiB toml_edit
+0.1%   0.2%   7.3KiB anyhow
+0.1%   0.2%   6.0KiB convert_case
+0.1%   0.2%   5.4KiB memchr
+0.1%   0.1%   4.9KiB version_check
+0.5%   1.4%  46.5KiB And 38 more crates. Use -n N to show more.
+35.0% 100.0%   3.2MiB .text section size, the file size is 9.3MiB
