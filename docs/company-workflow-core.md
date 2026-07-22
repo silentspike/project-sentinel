@@ -34,12 +34,23 @@ work graph, assignment policy snapshots, completion evidence, rooms,
 decisions, handoffs, blockers, approvals, action items, unresolved questions,
 spend, progress, and the last projected event sequence.
 
-All newly written public schemas carry `schema_version = 2`. The store migrates
-version 1 records without reinterpreting their authority fields. IDs are durable
-UUIDv7-based opaque strings, except the existing validated `AgentId` type.
-Legacy operation IDs become global fail-closed tombstones: their principal and
-tenant cannot be proven, so their stored responses are never replayed into a
-version 2 namespace.
+All newly written public schemas carry `schema_version = 2`. The version 1 to
+version 2 migration runs under one SQLite `BEGIN IMMEDIATE` transaction. The
+schema-version marker is written last. An injected failure after any destructive
+DDL step rolls back the complete transaction, leaves the version 1 image
+readable, and permits the same migration to be retried deterministically. IDs
+are durable UUIDv7-based opaque strings, except the existing validated
+`AgentId` type. Legacy operation IDs become global fail-closed tombstones: their
+principal and tenant cannot be proven, so their stored responses are never
+replayed into a version 2 namespace.
+
+At daemon startup the server loads `web-project-v1` from
+`SENTINEL_WORK_PROFILE_FILE` or the checked-in default path. Its bytes must
+exactly match the copy embedded in the release binary. Profile ID, schema
+version, and SHA-256 digest are bound into the Proposal digest and copied
+unchanged into the Agreement and Project. Unknown IDs, altered bytes, stale
+digests, missing roles or specialties, missing immutable artifacts, missing
+quality gates, and insufficient topology fail closed.
 
 ## Legal transitions
 
@@ -85,7 +96,7 @@ positive budget, and the sum of item budgets is within the Agreement ceiling.
 | `ready` or `assigned` | authorized assignment policy passes | `assigned` |
 | `assigned` | current assignee claims with digest and future deadline | `claimed` |
 | `claimed` | idempotent execution port accepts durable invocation | `in_progress` |
-| `in_progress` | current assignment version, required output digests, and declared gate pass | `done` |
+| `in_progress` | assignee requests completion and a sealed independent receipt proves the invocation, outputs, ownership, and declared gate | `done` |
 | non-terminal | authoritative blocker | `blocked` |
 | `blocked` | authorized blocker resolution | `ready` or `proposed` |
 
@@ -96,15 +107,21 @@ self-assign. A Technical Lead can assign only a declared direct report. The
 engine resolves the assignee through `OrganizationRuntimePort`; the immutable
 Assignment records the exact profile plus the authoritative organization
 generation and digest. Claim and dispatch re-read that authority and reject a
-generation or digest change before any execution call. Cross-project,
-cross-tenant, stale-authority, and unroutable assignments fail closed.
+generation or digest change before any execution call. If authority drifts
+after reservation, dispatch completes that outbox row as `authority_conflict`,
+persists a typed conflict outcome, blocks the work item for reassignment, and
+continues with independent rows. An authorized resolution deactivates the stale
+assignment and returns the item to a recoverable state; it does not re-arm or
+busy-loop the stale invocation. Cross-project, cross-tenant, stale-authority,
+and unroutable assignments fail closed.
 
 ### Collaboration and governance
 
 - Project and team rooms contain only project participants and are references
   for collaboration, not state-mutation channels.
 - Decisions are structured records with alternatives, rationale, evidence,
-  actor, and optional work-item scope.
+  actor, and optional work-item scope. An optional work-item ID must resolve to
+  the same project and authenticated tenant.
 - Action items and unresolved questions have stable owners and explicit
   open/resolved states.
 - Handoffs bind producer, consumer, work item, and artifact digests; only the
@@ -143,6 +160,14 @@ explicitly bounded to three attempts. Exhaustion moves the outbox record to
 loop or unconditional provider call per tick. Resolving that exact blocker
 explicitly re-arms the same durable invocation with its original digest and a
 fresh three-attempt budget.
+
+Agents cannot submit output references or attest their own gates. The completion
+command only records their request. `CompletionEvidencePort` is a narrow sealed
+boundary for #694: its receipt must match the durable invocation, assignment,
+agent and input digest; every artifact must prove project/work/invocation
+ownership; and the canonical output-bundle digest must be covered by an
+independent QA or Release Manager gate receipt from the profile-declared runner.
+Only that verified receipt permits `in_progress -> done`.
 
 ## Event store, projection, backup, and restore
 
@@ -197,10 +222,13 @@ The dependency-independent tests cover schema serialization through durable
 round trips, legal and illegal transitions, stale versions and digests,
 proposal expiry, duplicate operations, transaction rollback, DAG cycles,
 capability/hierarchy policy, organization-generation TOCTOU rejection,
-completion gates, collaboration records, provider and project ceilings, outbox
-restart, bounded retry, event ordering, projection recovery, verified
-backup/restore, principal-scoped idempotency, cross-tenant read and mutation
-denial, authority spoofing, and chat-only rejection.
+authority-conflict recovery without queue poisoning, sealed completion receipts,
+forged artifact ownership and self-attested gate rejection, collaboration
+records, provider and project ceilings, outbox restart, bounded retry, crash-
+atomic schema migration from every destructive-DDL failpoint, event ordering,
+projection recovery, verified backup/restore, principal-scoped idempotency,
+cross-project and cross-tenant decision denial, authority spoofing, and
+chat-only rejection.
 
 AC-6 is only partially satisfied: claim, durable reservation, deterministic
 port dispatch, completion evidence, and tick-independent state transitions are

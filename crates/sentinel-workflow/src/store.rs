@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS workflow_execution_outbox (
     assignment_version INTEGER NOT NULL,
     request_digest TEXT NOT NULL,
     request BLOB NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('pending', 'dispatched', 'failed')),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'dispatched', 'failed', 'authority_conflict')),
     receipt BLOB,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
@@ -95,25 +95,63 @@ INSERT OR IGNORE INTO workflow_projection_checkpoint
     VALUES (1, 0, 0, 0);
 "#;
 
-const MIGRATE_V1_TO_V2: &str = r#"
-DROP INDEX IF EXISTS idx_workflow_events_aggregate;
-DROP INDEX IF EXISTS idx_workflow_events_operation;
-ALTER TABLE workflow_operations RENAME TO workflow_operations_v1;
-CREATE TABLE workflow_operations (
+const MIGRATE_V1_TO_V2_STEPS: &[&str] = &[
+    r#"CREATE TABLE IF NOT EXISTS workflow_entity_history (
+        mutation_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        payload BLOB NOT NULL,
+        UNIQUE (entity_type, entity_id, version)
+    );
+    CREATE TABLE IF NOT EXISTS workflow_project_projections (
+        project_id TEXT PRIMARY KEY,
+        last_event_sequence INTEGER NOT NULL,
+        payload BLOB NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS workflow_execution_outbox (
+        invocation_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        work_item_id TEXT NOT NULL,
+        assignment_version INTEGER NOT NULL,
+        request_digest TEXT NOT NULL,
+        request BLOB NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'dispatched', 'failed', 'authority_conflict')),
+        receipt BLOB,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS workflow_projection_checkpoint (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        source_event_high_watermark INTEGER NOT NULL,
+        projected_event_high_watermark INTEGER NOT NULL,
+        project_count INTEGER NOT NULL,
+        rebuilt_at_ms INTEGER
+    );
+    INSERT OR IGNORE INTO workflow_projection_checkpoint
+        (singleton, source_event_high_watermark, projected_event_high_watermark, project_count)
+        VALUES (1, 0, 0, 0);"#,
+    "DROP INDEX IF EXISTS idx_workflow_events_aggregate;",
+    "DROP INDEX IF EXISTS idx_workflow_events_operation;",
+    "ALTER TABLE workflow_operations RENAME TO workflow_operations_v1;",
+    r#"CREATE TABLE workflow_operations (
     operation_namespace TEXT NOT NULL,
     operation_id TEXT NOT NULL,
     operation_digest TEXT NOT NULL,
     response BLOB NOT NULL,
     created_at_ms INTEGER NOT NULL,
     PRIMARY KEY (operation_namespace, operation_id)
-);
-INSERT INTO workflow_operations
+);"#,
+    r#"INSERT INTO workflow_operations
     (operation_namespace, operation_id, operation_digest, response, created_at_ms)
     SELECT 'legacy', operation_id, operation_digest, response, created_at_ms
-    FROM workflow_operations_v1;
-DROP TABLE workflow_operations_v1;
-ALTER TABLE workflow_events RENAME TO workflow_events_v1;
-CREATE TABLE workflow_events (
+    FROM workflow_operations_v1;"#,
+    "DROP TABLE workflow_operations_v1;",
+    "ALTER TABLE workflow_events RENAME TO workflow_events_v1;",
+    r#"CREATE TABLE workflow_events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id TEXT NOT NULL UNIQUE,
     event_type TEXT NOT NULL,
@@ -123,24 +161,24 @@ CREATE TABLE workflow_events (
     operation_id TEXT NOT NULL,
     payload BLOB NOT NULL,
     created_at_ms INTEGER NOT NULL
-);
-INSERT INTO workflow_events
+);"#,
+    r#"INSERT INTO workflow_events
     (sequence, event_id, event_type, aggregate_type, aggregate_id, tenant_id,
      operation_id, payload, created_at_ms)
     SELECT sequence, event_id, event_type, aggregate_type, aggregate_id, 'legacy',
            operation_id, payload, created_at_ms
-    FROM workflow_events_v1;
-DROP TABLE workflow_events_v1;
-INSERT OR IGNORE INTO workflow_entity_history
+    FROM workflow_events_v1;"#,
+    "DROP TABLE workflow_events_v1;",
+    r#"INSERT OR IGNORE INTO workflow_entity_history
     (entity_type, entity_id, version, payload)
-    SELECT entity_type, entity_id, version, payload FROM workflow_entities;
-UPDATE workflow_projection_checkpoint
+    SELECT entity_type, entity_id, version, payload FROM workflow_entities;"#,
+    r#"UPDATE workflow_projection_checkpoint
 SET source_event_high_watermark = (SELECT COALESCE(MAX(sequence), 0) FROM workflow_events),
     projected_event_high_watermark = (SELECT COALESCE(MAX(sequence), 0) FROM workflow_events),
     project_count = (SELECT COUNT(*) FROM workflow_project_projections)
-WHERE singleton = 1;
-UPDATE workflow_schema_meta SET schema_version = 2 WHERE singleton = 1;
-"#;
+WHERE singleton = 1;"#,
+    "UPDATE workflow_schema_meta SET schema_version = 2 WHERE singleton = 1;",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectionCheckpoint {
@@ -177,7 +215,14 @@ impl std::fmt::Debug for WorkflowStore {
 
 impl WorkflowStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WorkflowError> {
-        let connection = Connection::open(path).map_err(|_| WorkflowError::persistence())?;
+        Self::open_with_migration_failpoint(path, None)
+    }
+
+    fn open_with_migration_failpoint(
+        path: impl AsRef<Path>,
+        fail_after_step: Option<usize>,
+    ) -> Result<Self, WorkflowError> {
+        let mut connection = Connection::open(path).map_err(|_| WorkflowError::persistence())?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|_| WorkflowError::persistence())?;
@@ -187,9 +232,18 @@ impl WorkflowStore {
         connection
             .pragma_update(None, "synchronous", "FULL")
             .map_err(|_| WorkflowError::persistence())?;
-        connection
-            .execute_batch(SCHEMA)
+        let has_schema: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workflow_schema_meta')",
+                [],
+                |row| row.get(0),
+            )
             .map_err(|_| WorkflowError::persistence())?;
+        if !has_schema {
+            connection
+                .execute_batch(SCHEMA)
+                .map_err(|_| WorkflowError::persistence())?;
+        }
         let mut schema_version: u32 = connection
             .query_row(
                 "SELECT schema_version FROM workflow_schema_meta WHERE singleton = 1",
@@ -198,9 +252,7 @@ impl WorkflowStore {
             )
             .map_err(|_| WorkflowError::persistence())?;
         if schema_version == 1 {
-            connection
-                .execute_batch(MIGRATE_V1_TO_V2)
-                .map_err(|_| WorkflowError::persistence())?;
+            migrate_v1_to_v2(&mut connection, fail_after_step)?;
             schema_version = crate::WORKFLOW_SCHEMA_VERSION;
         }
         if schema_version != crate::WORKFLOW_SCHEMA_VERSION {
@@ -210,6 +262,9 @@ impl WorkflowStore {
                 "workflow store schema version is unsupported",
             ));
         }
+        connection
+            .execute_batch(SCHEMA)
+            .map_err(|_| WorkflowError::persistence())?;
         connection
             .execute_batch(
                 "CREATE INDEX IF NOT EXISTS idx_workflow_events_aggregate
@@ -769,6 +824,54 @@ impl WorkflowTransaction<'_> {
         Ok(())
     }
 
+    pub(crate) fn execution_request(
+        &self,
+        invocation_id: &str,
+    ) -> Result<(PendingExecution, String), WorkflowError> {
+        let (payload, state): (Vec<u8>, String) = self
+            .transaction
+            .query_row(
+                "SELECT request, state FROM workflow_execution_outbox WHERE invocation_id = ?1",
+                [invocation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| WorkflowError::persistence())?
+            .ok_or_else(|| {
+                WorkflowError::new(
+                    crate::WorkflowErrorCode::NotFound,
+                    false,
+                    "execution outbox entry not found",
+                )
+            })?;
+        Ok((serde_json::from_slice(&payload)?, state))
+    }
+
+    pub(crate) fn mark_execution_authority_conflict(
+        &self,
+        invocation_id: &str,
+        now_ms: u64,
+    ) -> Result<(), WorkflowError> {
+        let changed = self
+            .transaction
+            .execute(
+                "UPDATE workflow_execution_outbox
+             SET state = 'authority_conflict', attempts = attempts + 1,
+                 last_error = 'organization_authority_conflict', updated_at_ms = ?1
+             WHERE invocation_id = ?2 AND state = 'pending'",
+                params![sql_integer(now_ms)?, invocation_id],
+            )
+            .map_err(|_| WorkflowError::persistence())?;
+        if changed != 1 {
+            return Err(WorkflowError::new(
+                crate::WorkflowErrorCode::InvalidTransition,
+                false,
+                "execution outbox entry is no longer pending",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn mark_execution_attempt(
         &self,
         invocation_id: &str,
@@ -841,6 +944,30 @@ impl WorkflowTransaction<'_> {
         }
         Ok(())
     }
+}
+
+fn migrate_v1_to_v2(
+    connection: &mut Connection,
+    fail_after_step: Option<usize>,
+) -> Result<(), WorkflowError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| WorkflowError::persistence())?;
+    for (index, step) in MIGRATE_V1_TO_V2_STEPS.iter().enumerate() {
+        transaction
+            .execute_batch(step)
+            .map_err(|_| WorkflowError::persistence())?;
+        if fail_after_step == Some(index) {
+            return Err(WorkflowError::new(
+                crate::WorkflowErrorCode::PersistenceFailure,
+                true,
+                "injected workflow migration interruption",
+            ));
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|_| WorkflowError::persistence())
 }
 
 fn sql_integer(value: u64) -> Result<i64, WorkflowError> {
@@ -1004,6 +1131,109 @@ fn file_sha256(path: &Path) -> Result<String, WorkflowError> {
 mod tests {
     use super::*;
     use crate::{WorkflowErrorCode, WorkflowResponse};
+
+    fn create_version_one_database(path: &Path) {
+        let response = WorkflowResponse::WorkItems(Vec::new());
+        let response_bytes = serde_json::to_vec(&response).expect("serialize response");
+        let connection = Connection::open(path).expect("create version 1 database");
+        connection
+            .execute_batch(
+                "CREATE TABLE workflow_schema_meta (
+                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                     schema_version INTEGER NOT NULL
+                 );
+                 INSERT INTO workflow_schema_meta VALUES (1, 1);
+                 CREATE TABLE workflow_entities (
+                     entity_type TEXT NOT NULL,
+                     entity_id TEXT NOT NULL,
+                     version INTEGER NOT NULL,
+                     payload BLOB NOT NULL,
+                     PRIMARY KEY (entity_type, entity_id)
+                 );
+                 CREATE TABLE workflow_operations (
+                     operation_id TEXT PRIMARY KEY,
+                     operation_digest TEXT NOT NULL,
+                     response BLOB NOT NULL,
+                     created_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE workflow_events (
+                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                     event_id TEXT NOT NULL UNIQUE,
+                     event_type TEXT NOT NULL,
+                     aggregate_type TEXT NOT NULL,
+                     aggregate_id TEXT NOT NULL,
+                     operation_id TEXT NOT NULL,
+                     payload BLOB NOT NULL,
+                     created_at_ms INTEGER NOT NULL
+                 );",
+            )
+            .expect("create version 1 schema");
+        connection
+            .execute(
+                "INSERT INTO workflow_entities VALUES ('request', 'request-v1', 1, ?1)",
+                [b"{}".as_slice()],
+            )
+            .expect("insert legacy entity");
+        connection
+            .execute(
+                "INSERT INTO workflow_operations VALUES ('legacy-operation', 'legacy-digest', ?1, 1)",
+                [response_bytes],
+            )
+            .expect("insert legacy operation");
+        connection
+            .execute(
+                "INSERT INTO workflow_events
+                 (event_id, event_type, aggregate_type, aggregate_id, operation_id, payload, created_at_ms)
+                 VALUES ('event-v1', 'legacy', 'request', 'request-v1', 'legacy-operation', ?1, 1)",
+                [b"{}".as_slice()],
+            )
+            .expect("insert legacy event");
+    }
+
+    #[test]
+    fn every_version_one_migration_failpoint_rolls_back_and_retries_cleanly() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        for fail_after_step in 0..MIGRATE_V1_TO_V2_STEPS.len() {
+            let database = directory
+                .path()
+                .join(format!("workflow-v1-failpoint-{fail_after_step}.db"));
+            create_version_one_database(&database);
+            let error =
+                WorkflowStore::open_with_migration_failpoint(&database, Some(fail_after_step))
+                    .expect_err("injected migration interruption must fail");
+            assert_eq!(error.code, WorkflowErrorCode::PersistenceFailure);
+            let connection = Connection::open(&database).expect("inspect rolled back database");
+            let schema_version: u32 = connection
+                .query_row(
+                    "SELECT schema_version FROM workflow_schema_meta WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("version marker");
+            assert_eq!(schema_version, 1, "failpoint {fail_after_step}");
+            let legacy_operations: i64 = connection
+                .query_row("SELECT COUNT(*) FROM workflow_operations", [], |row| {
+                    row.get(0)
+                })
+                .expect("legacy operation table restored");
+            let legacy_events: i64 = connection
+                .query_row("SELECT COUNT(*) FROM workflow_events", [], |row| row.get(0))
+                .expect("legacy event table restored");
+            assert_eq!(legacy_operations, 1, "failpoint {fail_after_step}");
+            assert_eq!(legacy_events, 1, "failpoint {fail_after_step}");
+            drop(connection);
+
+            let recovered = WorkflowStore::open(&database)
+                .expect("next startup deterministically retries the whole migration");
+            assert_eq!(
+                recovered
+                    .projection_checkpoint()
+                    .expect("recovered checkpoint")
+                    .source_event_high_watermark,
+                1
+            );
+        }
+    }
 
     #[test]
     fn version_one_migration_preserves_replay_history_and_backup_watermarks() {
