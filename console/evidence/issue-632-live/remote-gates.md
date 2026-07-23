@@ -3,6 +3,10 @@
 All Rust commands run through cargo-remote. No local Cargo, rustc, rust-analyzer,
 benchmark, VM, or runtime command is used.
 
+The gates below verify the final PR head. Detached per-group replay gates and the
+separately rejected DEP-002 and DEP-004 experiments are recorded in
+`group-gates.md`.
+
 ## Formatting
 
 ```bash
