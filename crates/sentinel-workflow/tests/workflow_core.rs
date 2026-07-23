@@ -63,8 +63,9 @@ impl WorkExecutionPort for FakeExecutionPort {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 enum CompletionMode {
+    #[default]
     Valid,
     ArtifactOwner(AgentId),
     Issuer(AgentId),
@@ -77,12 +78,6 @@ enum CompletionMode {
     TimeoutOnce,
     AlwaysTimeout,
     CrashAfterAuthority,
-}
-
-impl Default for CompletionMode {
-    fn default() -> Self {
-        Self::Valid
-    }
 }
 
 #[derive(Debug, Clone)]
