@@ -1169,7 +1169,9 @@ mod tests {
     #[test]
     fn default_bwrap_snapshot_is_reproducible_recreate_without_cas_manifest_claim() {
         let temp = tempfile::tempdir().unwrap();
-        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let mut runtime =
+            BwrapNanoRuntime::with_test_dirs(temp.path().join("cas"), temp.path().join("homes"));
+        runtime.set_cas_manifest_enabled(false);
         let agent_name = "compatibility-agent";
         let home = runtime.home_dir(agent_name);
         std::fs::create_dir_all(&home).unwrap();
