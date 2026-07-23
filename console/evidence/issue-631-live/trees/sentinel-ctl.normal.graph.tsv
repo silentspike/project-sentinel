@@ -1,0 +1,342 @@
+record	parent_name	parent_version	parent_source	name	version	source	normal_context	build_context	is_root
+package				anstream	0.6.21	registry	true	false	false
+package				anstyle	1.0.13	registry	true	false	false
+package				anstyle-parse	0.2.7	registry	true	false	false
+package				anstyle-query	1.1.5	registry	true	false	false
+package				anyhow	1.0.103	registry	true	false	false
+package				atomic-waker	1.1.2	registry	true	false	false
+package				base64	0.22.1	registry	true	false	false
+package				bitflags	2.11.0	registry	true	false	false
+package				bytes	1.11.1	registry	true	false	false
+package				cfg-if	1.0.4	registry	true	false	false
+package				clap	4.5.60	registry	true	false	false
+package				clap_builder	4.5.60	registry	true	false	false
+package				clap_derive	4.5.55	registry	false	true	false
+package				clap_lex	1.0.0	registry	true	false	false
+package				colorchoice	1.0.4	registry	true	false	false
+package				displaydoc	0.2.5	registry	false	true	false
+package				form_urlencoded	1.2.2	registry	true	false	false
+package				futures-channel	0.3.32	registry	true	false	false
+package				futures-core	0.3.32	registry	true	false	false
+package				futures-io	0.3.32	registry	true	false	false
+package				futures-sink	0.3.32	registry	true	false	false
+package				futures-task	0.3.32	registry	true	false	false
+package				futures-util	0.3.32	registry	true	false	false
+package				getrandom	0.2.17	registry	true	false	false
+package				heck	0.5.0	registry	false	true	false
+package				http	1.4.0	registry	true	false	false
+package				http-body	1.0.1	registry	true	false	false
+package				http-body-util	0.1.3	registry	true	false	false
+package				httparse	1.10.1	registry	true	false	false
+package				hyper	1.8.1	registry	true	false	false
+package				hyper-rustls	0.27.7	registry	true	false	false
+package				hyper-util	0.1.20	registry	true	false	false
+package				icu_collections	2.1.1	registry	true	false	false
+package				icu_locale_core	2.1.1	registry	true	false	false
+package				icu_normalizer	2.1.1	registry	true	false	false
+package				icu_normalizer_data	2.1.1	registry	true	false	false
+package				icu_properties	2.1.2	registry	true	false	false
+package				icu_properties_data	2.1.2	registry	true	false	false
+package				icu_provider	2.1.1	registry	true	false	false
+package				idna	1.1.0	registry	true	false	false
+package				idna_adapter	1.2.1	registry	true	false	false
+package				ipnet	2.11.0	registry	true	false	false
+package				iri-string	0.7.10	registry	true	false	false
+package				is_terminal_polyfill	1.70.2	registry	true	false	false
+package				itoa	1.0.17	registry	true	false	false
+package				libc	0.2.186	registry	true	false	false
+package				litemap	0.8.1	registry	true	false	false
+package				log	0.4.29	registry	true	false	false
+package				memchr	2.8.0	registry	true	false	false
+package				mio	1.2.1	registry	true	false	false
+package				once_cell	1.21.3	registry	true	false	false
+package				percent-encoding	2.3.2	registry	true	false	false
+package				pin-project-lite	0.2.16	registry	true	false	false
+package				pin-utils	0.1.0	registry	true	false	false
+package				potential_utf	0.1.4	registry	true	false	false
+package				proc-macro2	1.0.106	registry	false	true	false
+package				quote	1.0.44	registry	false	true	false
+package				reqwest	0.12.28	registry	true	false	false
+package				ring	0.17.14	registry	true	false	false
+package				rustls	0.23.37	registry	true	false	false
+package				rustls-pki-types	1.14.0	registry	true	false	false
+package				rustls-webpki	0.103.13	registry	true	false	false
+package				ryu	1.0.23	registry	true	false	false
+package				sentinel-ctl	0.1.0	workspace	true	false	true
+package				serde	1.0.228	registry	true	false	false
+package				serde_core	1.0.228	registry	true	false	false
+package				serde_derive	1.0.228	registry	false	true	false
+package				serde_json	1.0.149	registry	true	false	false
+package				serde_urlencoded	0.7.1	registry	true	false	false
+package				slab	0.4.12	registry	true	false	false
+package				smallvec	1.15.1	registry	true	false	false
+package				socket2	0.6.4	registry	true	false	false
+package				stable_deref_trait	1.2.1	registry	true	false	false
+package				strsim	0.11.1	registry	true	false	false
+package				subtle	2.6.1	registry	true	false	false
+package				syn	2.0.117	registry	false	true	false
+package				sync_wrapper	1.0.2	registry	true	false	false
+package				synstructure	0.13.2	registry	false	true	false
+package				tinystr	0.8.2	registry	true	false	false
+package				tokio	1.52.3	registry	true	false	false
+package				tokio-rustls	0.26.4	registry	true	false	false
+package				tower	0.5.3	registry	true	false	false
+package				tower-http	0.6.8	registry	true	false	false
+package				tower-layer	0.3.3	registry	true	false	false
+package				tower-service	0.3.3	registry	true	false	false
+package				tracing	0.1.44	registry	true	false	false
+package				tracing-core	0.1.36	registry	true	false	false
+package				try-lock	0.2.5	registry	true	false	false
+package				unicode-ident	1.0.24	registry	false	true	false
+package				untrusted	0.9.0	registry	true	false	false
+package				url	2.5.8	registry	true	false	false
+package				utf8_iter	1.0.4	registry	true	false	false
+package				utf8parse	0.2.2	registry	true	false	false
+package				want	0.3.1	registry	true	false	false
+package				webpki-roots	1.0.6	registry	true	false	false
+package				writeable	0.6.2	registry	true	false	false
+package				yoke	0.8.1	registry	true	false	false
+package				yoke-derive	0.8.1	registry	false	true	false
+package				zerofrom	0.1.6	registry	true	false	false
+package				zerofrom-derive	0.1.6	registry	false	true	false
+package				zeroize	1.8.2	registry	true	false	false
+package				zerotrie	0.2.3	registry	true	false	false
+package				zerovec	0.11.5	registry	true	false	false
+package				zerovec-derive	0.11.2	registry	false	true	false
+package				zmij	1.0.21	registry	true	false	false
+edge	anstream	0.6.21	registry	anstyle	1.0.13	registry	false	false	false
+edge	anstream	0.6.21	registry	anstyle-parse	0.2.7	registry	false	false	false
+edge	anstream	0.6.21	registry	anstyle-query	1.1.5	registry	false	false	false
+edge	anstream	0.6.21	registry	colorchoice	1.0.4	registry	false	false	false
+edge	anstream	0.6.21	registry	is_terminal_polyfill	1.70.2	registry	false	false	false
+edge	anstream	0.6.21	registry	utf8parse	0.2.2	registry	false	false	false
+edge	anstyle-parse	0.2.7	registry	utf8parse	0.2.2	registry	false	false	false
+edge	clap	4.5.60	registry	clap_builder	4.5.60	registry	false	false	false
+edge	clap	4.5.60	registry	clap_derive	4.5.55	registry	false	false	false
+edge	clap_builder	4.5.60	registry	anstream	0.6.21	registry	false	false	false
+edge	clap_builder	4.5.60	registry	anstyle	1.0.13	registry	false	false	false
+edge	clap_builder	4.5.60	registry	clap_lex	1.0.0	registry	false	false	false
+edge	clap_builder	4.5.60	registry	strsim	0.11.1	registry	false	false	false
+edge	clap_derive	4.5.55	registry	heck	0.5.0	registry	false	false	false
+edge	clap_derive	4.5.55	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	clap_derive	4.5.55	registry	quote	1.0.44	registry	false	false	false
+edge	clap_derive	4.5.55	registry	syn	2.0.117	registry	false	false	false
+edge	displaydoc	0.2.5	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	displaydoc	0.2.5	registry	quote	1.0.44	registry	false	false	false
+edge	displaydoc	0.2.5	registry	syn	2.0.117	registry	false	false	false
+edge	form_urlencoded	1.2.2	registry	percent-encoding	2.3.2	registry	false	false	false
+edge	futures-channel	0.3.32	registry	futures-core	0.3.32	registry	false	false	false
+edge	futures-channel	0.3.32	registry	futures-sink	0.3.32	registry	false	false	false
+edge	futures-util	0.3.32	registry	futures-core	0.3.32	registry	false	false	false
+edge	futures-util	0.3.32	registry	futures-io	0.3.32	registry	false	false	false
+edge	futures-util	0.3.32	registry	futures-sink	0.3.32	registry	false	false	false
+edge	futures-util	0.3.32	registry	futures-task	0.3.32	registry	false	false	false
+edge	futures-util	0.3.32	registry	memchr	2.8.0	registry	false	false	false
+edge	futures-util	0.3.32	registry	pin-project-lite	0.2.16	registry	false	false	false
+edge	futures-util	0.3.32	registry	slab	0.4.12	registry	false	false	false
+edge	getrandom	0.2.17	registry	cfg-if	1.0.4	registry	false	false	false
+edge	getrandom	0.2.17	registry	libc	0.2.186	registry	false	false	false
+edge	http	1.4.0	registry	bytes	1.11.1	registry	false	false	false
+edge	http	1.4.0	registry	itoa	1.0.17	registry	false	false	false
+edge	http-body	1.0.1	registry	bytes	1.11.1	registry	false	false	false
+edge	http-body	1.0.1	registry	http	1.4.0	registry	false	false	false
+edge	http-body-util	0.1.3	registry	bytes	1.11.1	registry	false	false	false
+edge	http-body-util	0.1.3	registry	futures-core	0.3.32	registry	false	false	false
+edge	http-body-util	0.1.3	registry	http	1.4.0	registry	false	false	false
+edge	http-body-util	0.1.3	registry	http-body	1.0.1	registry	false	false	false
+edge	http-body-util	0.1.3	registry	pin-project-lite	0.2.16	registry	false	false	false
+edge	hyper	1.8.1	registry	atomic-waker	1.1.2	registry	false	false	false
+edge	hyper	1.8.1	registry	bytes	1.11.1	registry	false	false	false
+edge	hyper	1.8.1	registry	futures-channel	0.3.32	registry	false	false	false
+edge	hyper	1.8.1	registry	futures-core	0.3.32	registry	false	false	false
+edge	hyper	1.8.1	registry	http	1.4.0	registry	false	false	false
+edge	hyper	1.8.1	registry	http-body	1.0.1	registry	false	false	false
+edge	hyper	1.8.1	registry	httparse	1.10.1	registry	false	false	false
+edge	hyper	1.8.1	registry	itoa	1.0.17	registry	false	false	false
+edge	hyper	1.8.1	registry	pin-project-lite	0.2.16	registry	false	false	false
+edge	hyper	1.8.1	registry	pin-utils	0.1.0	registry	false	false	false
+edge	hyper	1.8.1	registry	smallvec	1.15.1	registry	false	false	false
+edge	hyper	1.8.1	registry	tokio	1.52.3	registry	false	false	false
+edge	hyper	1.8.1	registry	want	0.3.1	registry	false	false	false
+edge	hyper-rustls	0.27.7	registry	http	1.4.0	registry	false	false	false
+edge	hyper-rustls	0.27.7	registry	hyper	1.8.1	registry	false	false	false
+edge	hyper-rustls	0.27.7	registry	hyper-util	0.1.20	registry	false	false	false
+edge	hyper-rustls	0.27.7	registry	rustls	0.23.37	registry	false	false	false
+edge	hyper-rustls	0.27.7	registry	rustls-pki-types	1.14.0	registry	false	false	false
+edge	hyper-rustls	0.27.7	registry	tokio	1.52.3	registry	false	false	false
+edge	hyper-rustls	0.27.7	registry	tokio-rustls	0.26.4	registry	false	false	false
+edge	hyper-rustls	0.27.7	registry	tower-service	0.3.3	registry	false	false	false
+edge	hyper-rustls	0.27.7	registry	webpki-roots	1.0.6	registry	false	false	false
+edge	hyper-util	0.1.20	registry	base64	0.22.1	registry	false	false	false
+edge	hyper-util	0.1.20	registry	bytes	1.11.1	registry	false	false	false
+edge	hyper-util	0.1.20	registry	futures-channel	0.3.32	registry	false	false	false
+edge	hyper-util	0.1.20	registry	futures-util	0.3.32	registry	false	false	false
+edge	hyper-util	0.1.20	registry	http	1.4.0	registry	false	false	false
+edge	hyper-util	0.1.20	registry	http-body	1.0.1	registry	false	false	false
+edge	hyper-util	0.1.20	registry	hyper	1.8.1	registry	false	false	false
+edge	hyper-util	0.1.20	registry	ipnet	2.11.0	registry	false	false	false
+edge	hyper-util	0.1.20	registry	libc	0.2.186	registry	false	false	false
+edge	hyper-util	0.1.20	registry	percent-encoding	2.3.2	registry	false	false	false
+edge	hyper-util	0.1.20	registry	pin-project-lite	0.2.16	registry	false	false	false
+edge	hyper-util	0.1.20	registry	socket2	0.6.4	registry	false	false	false
+edge	hyper-util	0.1.20	registry	tokio	1.52.3	registry	false	false	false
+edge	hyper-util	0.1.20	registry	tower-service	0.3.3	registry	false	false	false
+edge	hyper-util	0.1.20	registry	tracing	0.1.44	registry	false	false	false
+edge	icu_collections	2.1.1	registry	displaydoc	0.2.5	registry	false	false	false
+edge	icu_collections	2.1.1	registry	potential_utf	0.1.4	registry	false	false	false
+edge	icu_collections	2.1.1	registry	yoke	0.8.1	registry	false	false	false
+edge	icu_collections	2.1.1	registry	zerofrom	0.1.6	registry	false	false	false
+edge	icu_collections	2.1.1	registry	zerovec	0.11.5	registry	false	false	false
+edge	icu_locale_core	2.1.1	registry	displaydoc	0.2.5	registry	false	false	false
+edge	icu_locale_core	2.1.1	registry	litemap	0.8.1	registry	false	false	false
+edge	icu_locale_core	2.1.1	registry	tinystr	0.8.2	registry	false	false	false
+edge	icu_locale_core	2.1.1	registry	writeable	0.6.2	registry	false	false	false
+edge	icu_locale_core	2.1.1	registry	zerovec	0.11.5	registry	false	false	false
+edge	icu_normalizer	2.1.1	registry	icu_collections	2.1.1	registry	false	false	false
+edge	icu_normalizer	2.1.1	registry	icu_normalizer_data	2.1.1	registry	false	false	false
+edge	icu_normalizer	2.1.1	registry	icu_provider	2.1.1	registry	false	false	false
+edge	icu_normalizer	2.1.1	registry	smallvec	1.15.1	registry	false	false	false
+edge	icu_normalizer	2.1.1	registry	zerovec	0.11.5	registry	false	false	false
+edge	icu_properties	2.1.2	registry	icu_collections	2.1.1	registry	false	false	false
+edge	icu_properties	2.1.2	registry	icu_locale_core	2.1.1	registry	false	false	false
+edge	icu_properties	2.1.2	registry	icu_properties_data	2.1.2	registry	false	false	false
+edge	icu_properties	2.1.2	registry	icu_provider	2.1.1	registry	false	false	false
+edge	icu_properties	2.1.2	registry	zerotrie	0.2.3	registry	false	false	false
+edge	icu_properties	2.1.2	registry	zerovec	0.11.5	registry	false	false	false
+edge	icu_provider	2.1.1	registry	displaydoc	0.2.5	registry	false	false	false
+edge	icu_provider	2.1.1	registry	icu_locale_core	2.1.1	registry	false	false	false
+edge	icu_provider	2.1.1	registry	writeable	0.6.2	registry	false	false	false
+edge	icu_provider	2.1.1	registry	yoke	0.8.1	registry	false	false	false
+edge	icu_provider	2.1.1	registry	zerofrom	0.1.6	registry	false	false	false
+edge	icu_provider	2.1.1	registry	zerotrie	0.2.3	registry	false	false	false
+edge	icu_provider	2.1.1	registry	zerovec	0.11.5	registry	false	false	false
+edge	idna	1.1.0	registry	idna_adapter	1.2.1	registry	false	false	false
+edge	idna	1.1.0	registry	smallvec	1.15.1	registry	false	false	false
+edge	idna	1.1.0	registry	utf8_iter	1.0.4	registry	false	false	false
+edge	idna_adapter	1.2.1	registry	icu_normalizer	2.1.1	registry	false	false	false
+edge	idna_adapter	1.2.1	registry	icu_properties	2.1.2	registry	false	false	false
+edge	mio	1.2.1	registry	libc	0.2.186	registry	false	false	false
+edge	potential_utf	0.1.4	registry	zerovec	0.11.5	registry	false	false	false
+edge	proc-macro2	1.0.106	registry	unicode-ident	1.0.24	registry	false	false	false
+edge	quote	1.0.44	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	reqwest	0.12.28	registry	base64	0.22.1	registry	false	false	false
+edge	reqwest	0.12.28	registry	bytes	1.11.1	registry	false	false	false
+edge	reqwest	0.12.28	registry	futures-channel	0.3.32	registry	false	false	false
+edge	reqwest	0.12.28	registry	futures-core	0.3.32	registry	false	false	false
+edge	reqwest	0.12.28	registry	futures-util	0.3.32	registry	false	false	false
+edge	reqwest	0.12.28	registry	http	1.4.0	registry	false	false	false
+edge	reqwest	0.12.28	registry	http-body	1.0.1	registry	false	false	false
+edge	reqwest	0.12.28	registry	http-body-util	0.1.3	registry	false	false	false
+edge	reqwest	0.12.28	registry	hyper	1.8.1	registry	false	false	false
+edge	reqwest	0.12.28	registry	hyper-rustls	0.27.7	registry	false	false	false
+edge	reqwest	0.12.28	registry	hyper-util	0.1.20	registry	false	false	false
+edge	reqwest	0.12.28	registry	log	0.4.29	registry	false	false	false
+edge	reqwest	0.12.28	registry	percent-encoding	2.3.2	registry	false	false	false
+edge	reqwest	0.12.28	registry	pin-project-lite	0.2.16	registry	false	false	false
+edge	reqwest	0.12.28	registry	rustls	0.23.37	registry	false	false	false
+edge	reqwest	0.12.28	registry	rustls-pki-types	1.14.0	registry	false	false	false
+edge	reqwest	0.12.28	registry	serde	1.0.228	registry	false	false	false
+edge	reqwest	0.12.28	registry	serde_json	1.0.149	registry	false	false	false
+edge	reqwest	0.12.28	registry	serde_urlencoded	0.7.1	registry	false	false	false
+edge	reqwest	0.12.28	registry	sync_wrapper	1.0.2	registry	false	false	false
+edge	reqwest	0.12.28	registry	tokio	1.52.3	registry	false	false	false
+edge	reqwest	0.12.28	registry	tokio-rustls	0.26.4	registry	false	false	false
+edge	reqwest	0.12.28	registry	tower	0.5.3	registry	false	false	false
+edge	reqwest	0.12.28	registry	tower-http	0.6.8	registry	false	false	false
+edge	reqwest	0.12.28	registry	tower-service	0.3.3	registry	false	false	false
+edge	reqwest	0.12.28	registry	url	2.5.8	registry	false	false	false
+edge	reqwest	0.12.28	registry	webpki-roots	1.0.6	registry	false	false	false
+edge	ring	0.17.14	registry	cfg-if	1.0.4	registry	false	false	false
+edge	ring	0.17.14	registry	getrandom	0.2.17	registry	false	false	false
+edge	ring	0.17.14	registry	untrusted	0.9.0	registry	false	false	false
+edge	rustls	0.23.37	registry	once_cell	1.21.3	registry	false	false	false
+edge	rustls	0.23.37	registry	ring	0.17.14	registry	false	false	false
+edge	rustls	0.23.37	registry	rustls-pki-types	1.14.0	registry	false	false	false
+edge	rustls	0.23.37	registry	rustls-webpki	0.103.13	registry	false	false	false
+edge	rustls	0.23.37	registry	subtle	2.6.1	registry	false	false	false
+edge	rustls	0.23.37	registry	zeroize	1.8.2	registry	false	false	false
+edge	rustls-pki-types	1.14.0	registry	zeroize	1.8.2	registry	false	false	false
+edge	rustls-webpki	0.103.13	registry	ring	0.17.14	registry	false	false	false
+edge	rustls-webpki	0.103.13	registry	rustls-pki-types	1.14.0	registry	false	false	false
+edge	rustls-webpki	0.103.13	registry	untrusted	0.9.0	registry	false	false	false
+edge	sentinel-ctl	0.1.0	workspace	anyhow	1.0.103	registry	false	false	false
+edge	sentinel-ctl	0.1.0	workspace	clap	4.5.60	registry	false	false	false
+edge	sentinel-ctl	0.1.0	workspace	reqwest	0.12.28	registry	false	false	false
+edge	sentinel-ctl	0.1.0	workspace	serde	1.0.228	registry	false	false	false
+edge	sentinel-ctl	0.1.0	workspace	serde_json	1.0.149	registry	false	false	false
+edge	serde	1.0.228	registry	serde_core	1.0.228	registry	false	false	false
+edge	serde	1.0.228	registry	serde_derive	1.0.228	registry	false	false	false
+edge	serde_derive	1.0.228	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	serde_derive	1.0.228	registry	quote	1.0.44	registry	false	false	false
+edge	serde_derive	1.0.228	registry	syn	2.0.117	registry	false	false	false
+edge	serde_json	1.0.149	registry	itoa	1.0.17	registry	false	false	false
+edge	serde_json	1.0.149	registry	memchr	2.8.0	registry	false	false	false
+edge	serde_json	1.0.149	registry	serde_core	1.0.228	registry	false	false	false
+edge	serde_json	1.0.149	registry	zmij	1.0.21	registry	false	false	false
+edge	serde_urlencoded	0.7.1	registry	form_urlencoded	1.2.2	registry	false	false	false
+edge	serde_urlencoded	0.7.1	registry	itoa	1.0.17	registry	false	false	false
+edge	serde_urlencoded	0.7.1	registry	ryu	1.0.23	registry	false	false	false
+edge	serde_urlencoded	0.7.1	registry	serde	1.0.228	registry	false	false	false
+edge	socket2	0.6.4	registry	libc	0.2.186	registry	false	false	false
+edge	syn	2.0.117	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	syn	2.0.117	registry	quote	1.0.44	registry	false	false	false
+edge	syn	2.0.117	registry	unicode-ident	1.0.24	registry	false	false	false
+edge	sync_wrapper	1.0.2	registry	futures-core	0.3.32	registry	false	false	false
+edge	synstructure	0.13.2	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	synstructure	0.13.2	registry	quote	1.0.44	registry	false	false	false
+edge	synstructure	0.13.2	registry	syn	2.0.117	registry	false	false	false
+edge	tinystr	0.8.2	registry	displaydoc	0.2.5	registry	false	false	false
+edge	tinystr	0.8.2	registry	zerovec	0.11.5	registry	false	false	false
+edge	tokio	1.52.3	registry	bytes	1.11.1	registry	false	false	false
+edge	tokio	1.52.3	registry	libc	0.2.186	registry	false	false	false
+edge	tokio	1.52.3	registry	mio	1.2.1	registry	false	false	false
+edge	tokio	1.52.3	registry	pin-project-lite	0.2.16	registry	false	false	false
+edge	tokio	1.52.3	registry	socket2	0.6.4	registry	false	false	false
+edge	tokio-rustls	0.26.4	registry	rustls	0.23.37	registry	false	false	false
+edge	tokio-rustls	0.26.4	registry	tokio	1.52.3	registry	false	false	false
+edge	tower	0.5.3	registry	futures-core	0.3.32	registry	false	false	false
+edge	tower	0.5.3	registry	futures-util	0.3.32	registry	false	false	false
+edge	tower	0.5.3	registry	pin-project-lite	0.2.16	registry	false	false	false
+edge	tower	0.5.3	registry	sync_wrapper	1.0.2	registry	false	false	false
+edge	tower	0.5.3	registry	tokio	1.52.3	registry	false	false	false
+edge	tower	0.5.3	registry	tower-layer	0.3.3	registry	false	false	false
+edge	tower	0.5.3	registry	tower-service	0.3.3	registry	false	false	false
+edge	tower-http	0.6.8	registry	bitflags	2.11.0	registry	false	false	false
+edge	tower-http	0.6.8	registry	bytes	1.11.1	registry	false	false	false
+edge	tower-http	0.6.8	registry	futures-util	0.3.32	registry	false	false	false
+edge	tower-http	0.6.8	registry	http	1.4.0	registry	false	false	false
+edge	tower-http	0.6.8	registry	http-body	1.0.1	registry	false	false	false
+edge	tower-http	0.6.8	registry	iri-string	0.7.10	registry	false	false	false
+edge	tower-http	0.6.8	registry	pin-project-lite	0.2.16	registry	false	false	false
+edge	tower-http	0.6.8	registry	tower	0.5.3	registry	false	false	false
+edge	tower-http	0.6.8	registry	tower-layer	0.3.3	registry	false	false	false
+edge	tower-http	0.6.8	registry	tower-service	0.3.3	registry	false	false	false
+edge	tracing	0.1.44	registry	pin-project-lite	0.2.16	registry	false	false	false
+edge	tracing	0.1.44	registry	tracing-core	0.1.36	registry	false	false	false
+edge	tracing-core	0.1.36	registry	once_cell	1.21.3	registry	false	false	false
+edge	url	2.5.8	registry	form_urlencoded	1.2.2	registry	false	false	false
+edge	url	2.5.8	registry	idna	1.1.0	registry	false	false	false
+edge	url	2.5.8	registry	percent-encoding	2.3.2	registry	false	false	false
+edge	want	0.3.1	registry	try-lock	0.2.5	registry	false	false	false
+edge	webpki-roots	1.0.6	registry	rustls-pki-types	1.14.0	registry	false	false	false
+edge	yoke	0.8.1	registry	stable_deref_trait	1.2.1	registry	false	false	false
+edge	yoke	0.8.1	registry	yoke-derive	0.8.1	registry	false	false	false
+edge	yoke	0.8.1	registry	zerofrom	0.1.6	registry	false	false	false
+edge	yoke-derive	0.8.1	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	yoke-derive	0.8.1	registry	quote	1.0.44	registry	false	false	false
+edge	yoke-derive	0.8.1	registry	syn	2.0.117	registry	false	false	false
+edge	yoke-derive	0.8.1	registry	synstructure	0.13.2	registry	false	false	false
+edge	zerofrom	0.1.6	registry	zerofrom-derive	0.1.6	registry	false	false	false
+edge	zerofrom-derive	0.1.6	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	zerofrom-derive	0.1.6	registry	quote	1.0.44	registry	false	false	false
+edge	zerofrom-derive	0.1.6	registry	syn	2.0.117	registry	false	false	false
+edge	zerofrom-derive	0.1.6	registry	synstructure	0.13.2	registry	false	false	false
+edge	zerotrie	0.2.3	registry	displaydoc	0.2.5	registry	false	false	false
+edge	zerotrie	0.2.3	registry	yoke	0.8.1	registry	false	false	false
+edge	zerotrie	0.2.3	registry	zerofrom	0.1.6	registry	false	false	false
+edge	zerovec	0.11.5	registry	yoke	0.8.1	registry	false	false	false
+edge	zerovec	0.11.5	registry	zerofrom	0.1.6	registry	false	false	false
+edge	zerovec	0.11.5	registry	zerovec-derive	0.11.2	registry	false	false	false
+edge	zerovec-derive	0.11.2	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	zerovec-derive	0.11.2	registry	quote	1.0.44	registry	false	false	false
+edge	zerovec-derive	0.11.2	registry	syn	2.0.117	registry	false	false	false

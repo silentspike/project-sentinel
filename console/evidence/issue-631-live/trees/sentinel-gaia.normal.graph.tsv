@@ -1,0 +1,298 @@
+record	parent_name	parent_version	parent_source	name	version	source	normal_context	build_context	is_root
+package				anstream	0.6.21	registry	true	false	false
+package				anstyle	1.0.13	registry	true	false	false
+package				anstyle-parse	0.2.7	registry	true	false	false
+package				anstyle-query	1.1.5	registry	true	false	false
+package				anyhow	1.0.103	registry	true	false	false
+package				arrayref	0.3.9	registry	true	false	false
+package				arrayvec	0.7.6	registry	true	false	false
+package				assert_type_match	0.1.1	registry	false	true	false
+package				async-executor	1.14.0	registry	true	false	false
+package				async-task	4.7.1	registry	true	false	false
+package				atomic-waker	1.1.2	registry	true	false	false
+package				bevy_ecs	0.18.1	registry	true	false	false
+package				bevy_ecs_macros	0.18.0	registry	false	true	false
+package				bevy_macro_utils	0.18.0	registry	false	true	false
+package				bevy_platform	0.18.0	registry	true	false	false
+package				bevy_ptr	0.18.0	registry	true	false	false
+package				bevy_reflect	0.18.0	registry	true	false	false
+package				bevy_reflect_derive	0.18.0	registry	false	true	false
+package				bevy_tasks	0.18.0	registry	true	false	false
+package				bevy_utils	0.18.0	registry	true	false	false
+package				bincode	2.0.1	registry	true	false	false
+package				bincode_derive	2.0.1	registry	false	true	false
+package				bitflags	2.11.0	registry	true	false	false
+package				blake3	1.8.3	registry	true	false	false
+package				block-buffer	0.10.4	registry	true	false	false
+package				bumpalo	3.20.2	registry	true	false	false
+package				cfg-if	1.0.4	registry	true	false	false
+package				clap	4.5.60	registry	true	false	false
+package				clap_builder	4.5.60	registry	true	false	false
+package				clap_derive	4.5.55	registry	false	true	false
+package				clap_lex	1.0.0	registry	true	false	false
+package				colorchoice	1.0.4	registry	true	false	false
+package				concurrent-queue	2.5.0	registry	true	false	false
+package				constant_time_eq	0.4.2	registry	true	false	false
+package				convert_case	0.10.0	registry	false	true	false
+package				cpufeatures	0.2.17	registry	true	false	false
+package				crossbeam-queue	0.3.12	registry	true	false	false
+package				crossbeam-utils	0.8.21	registry	true	false	false
+package				crypto-common	0.1.7	registry	true	false	false
+package				derive_more	2.1.1	registry	true	false	false
+package				derive_more-impl	2.1.1	registry	false	true	false
+package				digest	0.10.7	registry	true	false	false
+package				disqualified	1.0.0	registry	true	false	false
+package				downcast-rs	2.0.2	registry	true	false	false
+package				equivalent	1.0.2	registry	true	true	false
+package				erased-serde	0.4.9	registry	true	false	false
+package				fastrand	2.3.0	registry	true	false	false
+package				fixedbitset	0.5.7	registry	true	false	false
+package				flatbuffers	25.12.19	registry	true	false	false
+package				foldhash	0.2.0	registry	true	false	false
+package				futures-core	0.3.32	registry	true	false	false
+package				futures-io	0.3.32	registry	true	false	false
+package				futures-lite	2.6.1	registry	true	false	false
+package				generic-array	0.14.7	registry	true	false	false
+package				getrandom	0.4.1	registry	true	false	false
+package				hashbrown	0.16.1	registry	true	false	false
+package				hashbrown	0.17.1	registry	true	true	false
+package				heck	0.5.0	registry	false	true	false
+package				indexmap	2.14.0	registry	true	true	false
+package				is_terminal_polyfill	1.70.2	registry	true	false	false
+package				itoa	1.0.17	registry	true	false	false
+package				libc	0.2.186	registry	true	false	false
+package				log	0.4.29	registry	true	false	false
+package				memchr	2.8.0	registry	true	false	false
+package				nonmax	0.5.5	registry	true	false	false
+package				once_cell	1.21.3	registry	true	false	false
+package				parking	2.2.1	registry	true	false	false
+package				pin-project-lite	0.2.16	registry	true	false	false
+package				proc-macro2	1.0.106	registry	false	true	false
+package				quote	1.0.44	registry	false	true	false
+package				sentinel-common	0.1.0	workspace	true	false	false
+package				sentinel-gaia	0.1.0	workspace	true	false	true
+package				serde	1.0.228	registry	true	false	false
+package				serde_core	1.0.228	registry	true	false	false
+package				serde_derive	1.0.228	registry	false	true	false
+package				serde_json	1.0.149	registry	true	false	false
+package				serde_spanned	1.0.4	registry	true	false	false
+package				sha2	0.10.9	registry	true	false	false
+package				slab	0.4.12	registry	true	false	false
+package				slotmap	1.1.1	registry	true	false	false
+package				smallvec	1.15.1	registry	true	false	false
+package				spin	0.10.1	registry	true	false	false
+package				strsim	0.11.1	registry	true	false	false
+package				syn	2.0.117	registry	false	true	false
+package				thiserror	2.0.18	registry	true	false	false
+package				thiserror-impl	2.0.18	registry	false	true	false
+package				thread_local	1.1.9	registry	true	false	false
+package				toml	1.0.6+spec-1.1.0	registry	true	false	false
+package				toml_datetime	0.7.5+spec-1.1.0	registry	false	true	false
+package				toml_datetime	1.0.0+spec-1.1.0	registry	true	false	false
+package				toml_edit	0.23.10+spec-1.0.0	registry	false	true	false
+package				toml_parser	1.0.9+spec-1.1.0	registry	true	true	false
+package				toml_writer	1.0.6+spec-1.1.0	registry	true	false	false
+package				tracing	0.1.44	registry	true	false	false
+package				tracing-attributes	0.1.31	registry	false	true	false
+package				tracing-core	0.1.36	registry	true	false	false
+package				typeid	1.0.3	registry	true	false	false
+package				typenum	1.19.0	registry	true	false	false
+package				unicode-ident	1.0.24	registry	false	true	false
+package				unicode-segmentation	1.12.0	registry	false	true	false
+package				unicode-xid	0.2.6	registry	false	true	false
+package				unty	0.0.4	registry	true	false	false
+package				utf8parse	0.2.2	registry	true	false	false
+package				uuid	1.22.0	registry	true	false	false
+package				variadics_please	1.1.0	registry	false	true	false
+package				virtue	0.0.18	registry	false	true	false
+package				winnow	0.7.14	registry	true	true	false
+package				zmij	1.0.21	registry	true	false	false
+edge	anstream	0.6.21	registry	anstyle	1.0.13	registry	false	false	false
+edge	anstream	0.6.21	registry	anstyle-parse	0.2.7	registry	false	false	false
+edge	anstream	0.6.21	registry	anstyle-query	1.1.5	registry	false	false	false
+edge	anstream	0.6.21	registry	colorchoice	1.0.4	registry	false	false	false
+edge	anstream	0.6.21	registry	is_terminal_polyfill	1.70.2	registry	false	false	false
+edge	anstream	0.6.21	registry	utf8parse	0.2.2	registry	false	false	false
+edge	anstyle-parse	0.2.7	registry	utf8parse	0.2.2	registry	false	false	false
+edge	assert_type_match	0.1.1	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	assert_type_match	0.1.1	registry	quote	1.0.44	registry	false	false	false
+edge	assert_type_match	0.1.1	registry	syn	2.0.117	registry	false	false	false
+edge	async-executor	1.14.0	registry	async-task	4.7.1	registry	false	false	false
+edge	async-executor	1.14.0	registry	concurrent-queue	2.5.0	registry	false	false	false
+edge	async-executor	1.14.0	registry	fastrand	2.3.0	registry	false	false	false
+edge	async-executor	1.14.0	registry	futures-lite	2.6.1	registry	false	false	false
+edge	async-executor	1.14.0	registry	pin-project-lite	0.2.16	registry	false	false	false
+edge	async-executor	1.14.0	registry	slab	0.4.12	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	bevy_ecs_macros	0.18.0	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	bevy_platform	0.18.0	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	bevy_ptr	0.18.0	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	bevy_reflect	0.18.0	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	bevy_tasks	0.18.0	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	bevy_utils	0.18.0	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	bitflags	2.11.0	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	bumpalo	3.20.2	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	concurrent-queue	2.5.0	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	derive_more	2.1.1	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	fixedbitset	0.5.7	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	indexmap	2.14.0	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	log	0.4.29	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	nonmax	0.5.5	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	slotmap	1.1.1	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	smallvec	1.15.1	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	thiserror	2.0.18	registry	false	false	false
+edge	bevy_ecs	0.18.1	registry	variadics_please	1.1.0	registry	false	false	false
+edge	bevy_ecs_macros	0.18.0	registry	bevy_macro_utils	0.18.0	registry	false	false	false
+edge	bevy_ecs_macros	0.18.0	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	bevy_ecs_macros	0.18.0	registry	quote	1.0.44	registry	false	false	false
+edge	bevy_ecs_macros	0.18.0	registry	syn	2.0.117	registry	false	false	false
+edge	bevy_macro_utils	0.18.0	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	bevy_macro_utils	0.18.0	registry	quote	1.0.44	registry	false	false	false
+edge	bevy_macro_utils	0.18.0	registry	syn	2.0.117	registry	false	false	false
+edge	bevy_macro_utils	0.18.0	registry	toml_edit	0.23.10+spec-1.0.0	registry	false	false	false
+edge	bevy_platform	0.18.0	registry	foldhash	0.2.0	registry	false	false	false
+edge	bevy_platform	0.18.0	registry	hashbrown	0.16.1	registry	false	false	false
+edge	bevy_platform	0.18.0	registry	serde	1.0.228	registry	false	false	false
+edge	bevy_platform	0.18.0	registry	spin	0.10.1	registry	false	false	false
+edge	bevy_reflect	0.18.0	registry	assert_type_match	0.1.1	registry	false	false	false
+edge	bevy_reflect	0.18.0	registry	bevy_platform	0.18.0	registry	false	false	false
+edge	bevy_reflect	0.18.0	registry	bevy_ptr	0.18.0	registry	false	false	false
+edge	bevy_reflect	0.18.0	registry	bevy_reflect_derive	0.18.0	registry	false	false	false
+edge	bevy_reflect	0.18.0	registry	bevy_utils	0.18.0	registry	false	false	false
+edge	bevy_reflect	0.18.0	registry	derive_more	2.1.1	registry	false	false	false
+edge	bevy_reflect	0.18.0	registry	disqualified	1.0.0	registry	false	false	false
+edge	bevy_reflect	0.18.0	registry	downcast-rs	2.0.2	registry	false	false	false
+edge	bevy_reflect	0.18.0	registry	erased-serde	0.4.9	registry	false	false	false
+edge	bevy_reflect	0.18.0	registry	foldhash	0.2.0	registry	false	false	false
+edge	bevy_reflect	0.18.0	registry	indexmap	2.14.0	registry	false	false	false
+edge	bevy_reflect	0.18.0	registry	serde	1.0.228	registry	false	false	false
+edge	bevy_reflect	0.18.0	registry	smallvec	1.15.1	registry	false	false	false
+edge	bevy_reflect	0.18.0	registry	thiserror	2.0.18	registry	false	false	false
+edge	bevy_reflect	0.18.0	registry	variadics_please	1.1.0	registry	false	false	false
+edge	bevy_reflect_derive	0.18.0	registry	bevy_macro_utils	0.18.0	registry	false	false	false
+edge	bevy_reflect_derive	0.18.0	registry	indexmap	2.14.0	registry	false	false	false
+edge	bevy_reflect_derive	0.18.0	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	bevy_reflect_derive	0.18.0	registry	quote	1.0.44	registry	false	false	false
+edge	bevy_reflect_derive	0.18.0	registry	syn	2.0.117	registry	false	false	false
+edge	bevy_tasks	0.18.0	registry	async-executor	1.14.0	registry	false	false	false
+edge	bevy_tasks	0.18.0	registry	async-task	4.7.1	registry	false	false	false
+edge	bevy_tasks	0.18.0	registry	atomic-waker	1.1.2	registry	false	false	false
+edge	bevy_tasks	0.18.0	registry	bevy_platform	0.18.0	registry	false	false	false
+edge	bevy_tasks	0.18.0	registry	crossbeam-queue	0.3.12	registry	false	false	false
+edge	bevy_tasks	0.18.0	registry	derive_more	2.1.1	registry	false	false	false
+edge	bevy_tasks	0.18.0	registry	futures-lite	2.6.1	registry	false	false	false
+edge	bevy_utils	0.18.0	registry	bevy_platform	0.18.0	registry	false	false	false
+edge	bevy_utils	0.18.0	registry	disqualified	1.0.0	registry	false	false	false
+edge	bevy_utils	0.18.0	registry	thread_local	1.1.9	registry	false	false	false
+edge	bincode	2.0.1	registry	bincode_derive	2.0.1	registry	false	false	false
+edge	bincode	2.0.1	registry	serde	1.0.228	registry	false	false	false
+edge	bincode	2.0.1	registry	unty	0.0.4	registry	false	false	false
+edge	bincode_derive	2.0.1	registry	virtue	0.0.18	registry	false	false	false
+edge	blake3	1.8.3	registry	arrayref	0.3.9	registry	false	false	false
+edge	blake3	1.8.3	registry	arrayvec	0.7.6	registry	false	false	false
+edge	blake3	1.8.3	registry	cfg-if	1.0.4	registry	false	false	false
+edge	blake3	1.8.3	registry	constant_time_eq	0.4.2	registry	false	false	false
+edge	blake3	1.8.3	registry	cpufeatures	0.2.17	registry	false	false	false
+edge	block-buffer	0.10.4	registry	generic-array	0.14.7	registry	false	false	false
+edge	clap	4.5.60	registry	clap_builder	4.5.60	registry	false	false	false
+edge	clap	4.5.60	registry	clap_derive	4.5.55	registry	false	false	false
+edge	clap_builder	4.5.60	registry	anstream	0.6.21	registry	false	false	false
+edge	clap_builder	4.5.60	registry	anstyle	1.0.13	registry	false	false	false
+edge	clap_builder	4.5.60	registry	clap_lex	1.0.0	registry	false	false	false
+edge	clap_builder	4.5.60	registry	strsim	0.11.1	registry	false	false	false
+edge	clap_derive	4.5.55	registry	heck	0.5.0	registry	false	false	false
+edge	clap_derive	4.5.55	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	clap_derive	4.5.55	registry	quote	1.0.44	registry	false	false	false
+edge	clap_derive	4.5.55	registry	syn	2.0.117	registry	false	false	false
+edge	concurrent-queue	2.5.0	registry	crossbeam-utils	0.8.21	registry	false	false	false
+edge	convert_case	0.10.0	registry	unicode-segmentation	1.12.0	registry	false	false	false
+edge	crossbeam-queue	0.3.12	registry	crossbeam-utils	0.8.21	registry	false	false	false
+edge	crypto-common	0.1.7	registry	generic-array	0.14.7	registry	false	false	false
+edge	crypto-common	0.1.7	registry	typenum	1.19.0	registry	false	false	false
+edge	derive_more	2.1.1	registry	derive_more-impl	2.1.1	registry	false	false	false
+edge	derive_more-impl	2.1.1	registry	convert_case	0.10.0	registry	false	false	false
+edge	derive_more-impl	2.1.1	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	derive_more-impl	2.1.1	registry	quote	1.0.44	registry	false	false	false
+edge	derive_more-impl	2.1.1	registry	syn	2.0.117	registry	false	false	false
+edge	derive_more-impl	2.1.1	registry	unicode-xid	0.2.6	registry	false	false	false
+edge	digest	0.10.7	registry	block-buffer	0.10.4	registry	false	false	false
+edge	digest	0.10.7	registry	crypto-common	0.1.7	registry	false	false	false
+edge	erased-serde	0.4.9	registry	serde_core	1.0.228	registry	false	false	false
+edge	erased-serde	0.4.9	registry	typeid	1.0.3	registry	false	false	false
+edge	flatbuffers	25.12.19	registry	bitflags	2.11.0	registry	false	false	false
+edge	futures-lite	2.6.1	registry	fastrand	2.3.0	registry	false	false	false
+edge	futures-lite	2.6.1	registry	futures-core	0.3.32	registry	false	false	false
+edge	futures-lite	2.6.1	registry	futures-io	0.3.32	registry	false	false	false
+edge	futures-lite	2.6.1	registry	parking	2.2.1	registry	false	false	false
+edge	futures-lite	2.6.1	registry	pin-project-lite	0.2.16	registry	false	false	false
+edge	generic-array	0.14.7	registry	typenum	1.19.0	registry	false	false	false
+edge	getrandom	0.4.1	registry	cfg-if	1.0.4	registry	false	false	false
+edge	getrandom	0.4.1	registry	libc	0.2.186	registry	false	false	false
+edge	hashbrown	0.16.1	registry	equivalent	1.0.2	registry	false	false	false
+edge	hashbrown	0.16.1	registry	serde_core	1.0.228	registry	false	false	false
+edge	indexmap	2.14.0	registry	equivalent	1.0.2	registry	false	false	false
+edge	indexmap	2.14.0	registry	hashbrown	0.17.1	registry	false	false	false
+edge	proc-macro2	1.0.106	registry	unicode-ident	1.0.24	registry	false	false	false
+edge	quote	1.0.44	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	sentinel-common	0.1.0	workspace	anyhow	1.0.103	registry	false	false	false
+edge	sentinel-common	0.1.0	workspace	bevy_ecs	0.18.1	registry	false	false	false
+edge	sentinel-common	0.1.0	workspace	bincode	2.0.1	registry	false	false	false
+edge	sentinel-common	0.1.0	workspace	flatbuffers	25.12.19	registry	false	false	false
+edge	sentinel-common	0.1.0	workspace	serde	1.0.228	registry	false	false	false
+edge	sentinel-common	0.1.0	workspace	serde_json	1.0.149	registry	false	false	false
+edge	sentinel-common	0.1.0	workspace	sha2	0.10.9	registry	false	false	false
+edge	sentinel-common	0.1.0	workspace	thiserror	2.0.18	registry	false	false	false
+edge	sentinel-common	0.1.0	workspace	toml	1.0.6+spec-1.1.0	registry	false	false	false
+edge	sentinel-common	0.1.0	workspace	tracing	0.1.44	registry	false	false	false
+edge	sentinel-common	0.1.0	workspace	uuid	1.22.0	registry	false	false	false
+edge	sentinel-gaia	0.1.0	workspace	anyhow	1.0.103	registry	false	false	false
+edge	sentinel-gaia	0.1.0	workspace	blake3	1.8.3	registry	false	false	false
+edge	sentinel-gaia	0.1.0	workspace	clap	4.5.60	registry	false	false	false
+edge	sentinel-gaia	0.1.0	workspace	sentinel-common	0.1.0	workspace	false	false	false
+edge	sentinel-gaia	0.1.0	workspace	serde	1.0.228	registry	false	false	false
+edge	sentinel-gaia	0.1.0	workspace	serde_json	1.0.149	registry	false	false	false
+edge	sentinel-gaia	0.1.0	workspace	toml	1.0.6+spec-1.1.0	registry	false	false	false
+edge	serde	1.0.228	registry	serde_core	1.0.228	registry	false	false	false
+edge	serde	1.0.228	registry	serde_derive	1.0.228	registry	false	false	false
+edge	serde_derive	1.0.228	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	serde_derive	1.0.228	registry	quote	1.0.44	registry	false	false	false
+edge	serde_derive	1.0.228	registry	syn	2.0.117	registry	false	false	false
+edge	serde_json	1.0.149	registry	itoa	1.0.17	registry	false	false	false
+edge	serde_json	1.0.149	registry	memchr	2.8.0	registry	false	false	false
+edge	serde_json	1.0.149	registry	serde_core	1.0.228	registry	false	false	false
+edge	serde_json	1.0.149	registry	zmij	1.0.21	registry	false	false	false
+edge	serde_spanned	1.0.4	registry	serde_core	1.0.228	registry	false	false	false
+edge	sha2	0.10.9	registry	cfg-if	1.0.4	registry	false	false	false
+edge	sha2	0.10.9	registry	cpufeatures	0.2.17	registry	false	false	false
+edge	sha2	0.10.9	registry	digest	0.10.7	registry	false	false	false
+edge	syn	2.0.117	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	syn	2.0.117	registry	quote	1.0.44	registry	false	false	false
+edge	syn	2.0.117	registry	unicode-ident	1.0.24	registry	false	false	false
+edge	thiserror	2.0.18	registry	thiserror-impl	2.0.18	registry	false	false	false
+edge	thiserror-impl	2.0.18	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	thiserror-impl	2.0.18	registry	quote	1.0.44	registry	false	false	false
+edge	thiserror-impl	2.0.18	registry	syn	2.0.117	registry	false	false	false
+edge	thread_local	1.1.9	registry	cfg-if	1.0.4	registry	false	false	false
+edge	toml	1.0.6+spec-1.1.0	registry	serde_core	1.0.228	registry	false	false	false
+edge	toml	1.0.6+spec-1.1.0	registry	serde_spanned	1.0.4	registry	false	false	false
+edge	toml	1.0.6+spec-1.1.0	registry	toml_datetime	1.0.0+spec-1.1.0	registry	false	false	false
+edge	toml	1.0.6+spec-1.1.0	registry	toml_parser	1.0.9+spec-1.1.0	registry	false	false	false
+edge	toml	1.0.6+spec-1.1.0	registry	toml_writer	1.0.6+spec-1.1.0	registry	false	false	false
+edge	toml	1.0.6+spec-1.1.0	registry	winnow	0.7.14	registry	false	false	false
+edge	toml_datetime	1.0.0+spec-1.1.0	registry	serde_core	1.0.228	registry	false	false	false
+edge	toml_edit	0.23.10+spec-1.0.0	registry	indexmap	2.14.0	registry	false	false	false
+edge	toml_edit	0.23.10+spec-1.0.0	registry	toml_datetime	0.7.5+spec-1.1.0	registry	false	false	false
+edge	toml_edit	0.23.10+spec-1.0.0	registry	toml_parser	1.0.9+spec-1.1.0	registry	false	false	false
+edge	toml_edit	0.23.10+spec-1.0.0	registry	winnow	0.7.14	registry	false	false	false
+edge	toml_parser	1.0.9+spec-1.1.0	registry	winnow	0.7.14	registry	false	false	false
+edge	tracing	0.1.44	registry	pin-project-lite	0.2.16	registry	false	false	false
+edge	tracing	0.1.44	registry	tracing-attributes	0.1.31	registry	false	false	false
+edge	tracing	0.1.44	registry	tracing-core	0.1.36	registry	false	false	false
+edge	tracing-attributes	0.1.31	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	tracing-attributes	0.1.31	registry	quote	1.0.44	registry	false	false	false
+edge	tracing-attributes	0.1.31	registry	syn	2.0.117	registry	false	false	false
+edge	tracing-core	0.1.36	registry	once_cell	1.21.3	registry	false	false	false
+edge	uuid	1.22.0	registry	getrandom	0.4.1	registry	false	false	false
+edge	uuid	1.22.0	registry	serde_core	1.0.228	registry	false	false	false
+edge	variadics_please	1.1.0	registry	proc-macro2	1.0.106	registry	false	false	false
+edge	variadics_please	1.1.0	registry	quote	1.0.44	registry	false	false	false
+edge	variadics_please	1.1.0	registry	syn	2.0.117	registry	false	false	false
