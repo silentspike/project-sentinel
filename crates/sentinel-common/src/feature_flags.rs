@@ -25,8 +25,9 @@ pub struct RuntimeFlags {
     /// #497 (#8): Strangler gate for the per-container transfer path. Default OFF so the single-node
     /// prod path is unchanged until explicitly enabled on a cluster node.
     pub per_container_transfer_enabled: bool,
-    /// #472/#548 boundary: productive bwrap world snapshots remain disabled until #548
-    /// supplies durable snapshot ownership and GC-safe pin transfer.
+    /// #472/#548 boundary: only the bwrap CAS filesystem-manifest extension is
+    /// disabled until #548 supplies durable snapshot ownership and GC-safe pin
+    /// transfer. The compatibility workload-recreate snapshot remains available.
     pub bwrap_cas_world_snapshot_enabled: bool,
 }
 
@@ -100,7 +101,7 @@ impl RuntimeFlags {
             platform_controlplane_enabled: true,
             // #497 (#8): per-container transfer defaults OFF (Strangler), unlike the others.
             per_container_transfer_enabled: false,
-            // #548 owns productive bwrap CAS snapshot ownership and pin transfer.
+            // #548 owns the optional bwrap CAS-manifest ownership and pin transfer.
             bwrap_cas_world_snapshot_enabled: false,
         })
     }

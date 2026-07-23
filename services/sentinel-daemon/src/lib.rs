@@ -29,6 +29,7 @@ pub mod replay;
 pub mod resource_manager;
 pub mod runtime_control;
 pub mod runtime_health;
+mod runtime_lifecycle;
 pub mod service_health;
 pub mod shift;
 pub mod signal;

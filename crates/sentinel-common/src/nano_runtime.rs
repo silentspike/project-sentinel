@@ -263,6 +263,11 @@ pub enum NanoSnapshotSemantics {
     /// deterministische Pfade zu Firecracker mem/state-Dateien je workload_id), NICHT die volatilen
     /// Guest-RAM-Bytes. Der echte Speicher-Snapshot liegt in den referenzierten Firecracker-Dateien.
     MicrovmMemory,
+    /// Safe bwrap compatibility snapshot: the bound workload specification and
+    /// command are sufficient to create a fresh sandbox/process incarnation.
+    /// It carries no process-memory or filesystem-content claim. Appended to
+    /// preserve bincode discriminants of existing schema-v4 snapshot variants.
+    BwrapRecreate,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -315,6 +320,14 @@ pub struct NanoIsolationReport {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NanoRecoveryResult {
+    pub runtime_key: String,
+    pub workload_id: String,
+    pub cleaned: bool,
+    pub detail: String,
+}
+
 pub trait NanoRuntime: Send {
     fn runtime_key(&self) -> &'static str;
     fn spawn(&mut self, workload: NanoWorkloadSpec) -> Result<NanoHandle>;
@@ -328,6 +341,29 @@ pub trait NanoRuntime: Send {
         handle: &NanoHandle,
         policy: NanoIsolationPolicy,
     ) -> Result<NanoIsolationReport>;
+
+    /// Reconcile durable resources left by a process crash before the workload
+    /// may be spawned again. Adapters without cross-process resources have a
+    /// safe no-op implementation; process-backed adapters override it.
+    fn reconcile_abandoned(&mut self, workload: &NanoWorkloadSpec) -> Result<NanoRecoveryResult> {
+        let runtime_key = workload
+            .runtime_key
+            .as_deref()
+            .unwrap_or(self.runtime_key());
+        anyhow::ensure!(
+            runtime_key == self.runtime_key(),
+            "workload '{}' selects runtime '{}', not '{}'",
+            workload.workload_id,
+            runtime_key,
+            self.runtime_key()
+        );
+        Ok(NanoRecoveryResult {
+            runtime_key: self.runtime_key().to_string(),
+            workload_id: workload.workload_id.clone(),
+            cleaned: false,
+            detail: "adapter has no durable abandoned resources".to_string(),
+        })
+    }
 
     /// Apply a runtime-owned suspend/resume action. The default is a typed,
     /// fail-closed rejection so a newly added adapter can never inherit a
@@ -444,6 +480,14 @@ impl NanoRuntimeRegistry {
         action: NanoRuntimeControlAction,
     ) -> Result<NanoRuntimeControlResult> {
         self.get_mut(&handle.runtime_key)?.control(handle, action)
+    }
+
+    pub fn reconcile_abandoned(
+        &mut self,
+        workload: &NanoWorkloadSpec,
+    ) -> Result<NanoRecoveryResult> {
+        let key = self.select_key(workload)?;
+        self.get_mut(&key)?.reconcile_abandoned(workload)
     }
 }
 

@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
 use sentinel_common::nano_runtime::{
     ensure_handle_instance, ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle,
-    NanoHealth, NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime,
-    NanoRuntimeControlAction, NanoRuntimeControlResult, NanoRuntimeResources, NanoSnapshot,
-    NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
+    NanoHealth, NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRecoveryResult,
+    NanoRuntime, NanoRuntimeControlAction, NanoRuntimeControlResult, NanoRuntimeResources,
+    NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_BWRAP_LANDLOCK,
 };
 use sentinel_fs::artifact::ArtifactPlane;
 use sentinel_fs::home_manifest::{self, HomeManifest, RestorePolicy};
@@ -24,6 +24,13 @@ struct BwrapSnapshotPayload {
     io_available: bool,
     bwrap_available: bool,
     landlock_available: bool,
+    semantics_note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BwrapRecreateSnapshotPayload {
+    workload: NanoWorkloadSpec,
+    command: Vec<String>,
     semantics_note: String,
 }
 
@@ -68,6 +75,7 @@ pub struct BwrapNanoRuntime {
     handles: HashMap<String, SandboxHandle>,
     processes: HashMap<String, AgentProcess>,
     pending_spawns: HashMap<String, BwrapSpawnTransaction>,
+    cas_manifest_enabled: bool,
 }
 
 impl BwrapNanoRuntime {
@@ -86,7 +94,15 @@ impl BwrapNanoRuntime {
             handles: HashMap::new(),
             processes: HashMap::new(),
             pending_spawns: HashMap::new(),
+            cas_manifest_enabled: false,
         }
+    }
+
+    /// #548 feature boundary. Disabled production instances retain the safe
+    /// workload-spec recreate semantics and never walk, pin, or rehydrate CAS
+    /// home manifests.
+    pub fn set_cas_manifest_enabled(&mut self, enabled: bool) {
+        self.cas_manifest_enabled = enabled;
     }
 
     /// Keep daemon FUSE routing identical when bwrap lifecycle ownership moves
@@ -99,6 +115,7 @@ impl BwrapNanoRuntime {
     fn with_test_dirs(cas_dir: impl Into<PathBuf>, agent_home_root: impl Into<PathBuf>) -> Self {
         let mut runtime = Self::with_cas_dir(cas_dir);
         runtime.agent_home_root = agent_home_root.into();
+        runtime.cas_manifest_enabled = true;
         runtime
     }
 
@@ -585,6 +602,35 @@ impl NanoRuntime for BwrapNanoRuntime {
         self.spawn_state(state)
     }
 
+    fn reconcile_abandoned(&mut self, workload: &NanoWorkloadSpec) -> Result<NanoRecoveryResult> {
+        let selected = workload
+            .runtime_key
+            .as_deref()
+            .unwrap_or(RUNTIME_BWRAP_LANDLOCK);
+        anyhow::ensure!(
+            selected == RUNTIME_BWRAP_LANDLOCK,
+            "bwrap cannot reconcile workload '{}' for runtime '{}'",
+            workload.workload_id,
+            selected
+        );
+        anyhow::ensure!(
+            !self.workloads.contains_key(&workload.workload_id)
+                && !self.handles.contains_key(&workload.workload_id)
+                && !self.processes.contains_key(&workload.workload_id),
+            "bwrap workload '{}' is active in this adapter instance",
+            workload.workload_id
+        );
+        let rolled_back = self.rollback_pending_spawn(&workload.workload_id)?;
+        let marker_reconciled =
+            self.reconcile_durable_spawn_marker(&workload.agent_name, &workload.workload_id)?;
+        Ok(NanoRecoveryResult {
+            runtime_key: self.runtime_key().to_string(),
+            workload_id: workload.workload_id.clone(),
+            cleaned: rolled_back || marker_reconciled,
+            detail: "durable bwrap marker and partial sandbox state reconciled".to_string(),
+        })
+    }
+
     fn stop(&mut self, handle: &NanoHandle) -> Result<NanoStopResult> {
         ensure_handle_runtime(handle, self.runtime_key())?;
         if let Some(state) = self.workloads.get(&handle.workload_id) {
@@ -653,6 +699,21 @@ impl NanoRuntime for BwrapNanoRuntime {
                 state.owned_object_ids.clone(),
             )
         };
+
+        if !self.cas_manifest_enabled {
+            return Ok(NanoSnapshot {
+                runtime_key: self.runtime_key().to_string(),
+                workload_id: handle.workload_id.clone(),
+                agent_id: handle.agent_id,
+                semantics: NanoSnapshotSemantics::BwrapRecreate,
+                payload: serde_json::to_value(BwrapRecreateSnapshotPayload {
+                    workload,
+                    command,
+                    semantics_note: "bwrap compatibility snapshot recreates a fresh runtime from the bound workload specification; it contains no process RAM, CRIU state, or filesystem manifest".to_string(),
+                })?,
+            });
+        }
+
         let (cgroup_created, io_available) = {
             let sandbox_handle = self
                 .handles
@@ -699,48 +760,77 @@ impl NanoRuntime for BwrapNanoRuntime {
                 self.runtime_key()
             ));
         }
-        if snapshot.semantics != NanoSnapshotSemantics::BwrapConfigFs {
-            return Err(anyhow!(
-                "bwrap restore requires BwrapConfigFs snapshot, got {:?}",
-                snapshot.semantics
-            ));
-        }
-        let payload: BwrapSnapshotPayload = serde_json::from_value(snapshot.payload)?;
-        self.rollback_pending_spawn(&snapshot.workload_id)?;
-        self.ensure_restore_target_available(&snapshot.workload_id, &payload.workload)?;
-        if !self.workloads.contains_key(&snapshot.workload_id)
-            && !self.handles.contains_key(&snapshot.workload_id)
-            && !self.processes.contains_key(&snapshot.workload_id)
-        {
-            self.reconcile_durable_spawn_marker(
-                &payload.workload.agent_name,
-                &snapshot.workload_id,
-            )?;
-        }
-        self.teardown_workload(&snapshot.workload_id)?;
+        match snapshot.semantics {
+            NanoSnapshotSemantics::BwrapRecreate => {
+                let payload: BwrapRecreateSnapshotPayload =
+                    serde_json::from_value(snapshot.payload)?;
+                self.rollback_pending_spawn(&snapshot.workload_id)?;
+                self.ensure_restore_target_available(&snapshot.workload_id, &payload.workload)?;
+                if !self.workloads.contains_key(&snapshot.workload_id)
+                    && !self.handles.contains_key(&snapshot.workload_id)
+                    && !self.processes.contains_key(&snapshot.workload_id)
+                {
+                    self.reconcile_durable_spawn_marker(
+                        &payload.workload.agent_name,
+                        &snapshot.workload_id,
+                    )?;
+                }
+                self.teardown_workload(&snapshot.workload_id)?;
+                self.spawn_state(BwrapWorkloadState {
+                    instance_id: uuid::Uuid::new_v4(),
+                    workload: payload.workload,
+                    command: payload.command,
+                    owned_object_ids: Vec::new(),
+                    suspended: false,
+                })
+            }
+            NanoSnapshotSemantics::BwrapConfigFs => {
+                anyhow::ensure!(
+                    self.cas_manifest_enabled,
+                    "bwrap CAS-manifest restore is disabled until #548 is enabled"
+                );
+                let payload: BwrapSnapshotPayload = serde_json::from_value(snapshot.payload)?;
+                self.rollback_pending_spawn(&snapshot.workload_id)?;
+                self.ensure_restore_target_available(&snapshot.workload_id, &payload.workload)?;
+                if !self.workloads.contains_key(&snapshot.workload_id)
+                    && !self.handles.contains_key(&snapshot.workload_id)
+                    && !self.processes.contains_key(&snapshot.workload_id)
+                {
+                    self.reconcile_durable_spawn_marker(
+                        &payload.workload.agent_name,
+                        &snapshot.workload_id,
+                    )?;
+                }
+                self.teardown_workload(&snapshot.workload_id)?;
 
-        // Rehydrate the agent home from the manifest (metadata-aware, V24 path
-        // safety) instead of writing raw bytes back.
-        let home = self.home_dir(&payload.workload.agent_name);
-        if home.exists() {
-            std::fs::remove_dir_all(&home)
-                .with_context(|| format!("reset agent home dir {}", home.display()))?;
-        }
-        let plane = self.open_plane()?;
-        home_manifest::rehydrate(
-            &payload.home_manifest,
-            &home,
-            &plane,
-            &RestorePolicy::default(),
-        )?;
+                // #548 path: rehydrate the metadata-aware home manifest. The
+                // feature remains default-off until durable retained ownership
+                // and GC-safe pin transfer are complete.
+                let home = self.home_dir(&payload.workload.agent_name);
+                if home.exists() {
+                    std::fs::remove_dir_all(&home)
+                        .with_context(|| format!("reset agent home dir {}", home.display()))?;
+                }
+                let plane = self.open_plane()?;
+                home_manifest::rehydrate(
+                    &payload.home_manifest,
+                    &home,
+                    &plane,
+                    &RestorePolicy::default(),
+                )?;
 
-        self.spawn_state(BwrapWorkloadState {
-            instance_id: uuid::Uuid::new_v4(),
-            workload: payload.workload,
-            command: payload.command,
-            owned_object_ids: Vec::new(),
-            suspended: false,
-        })
+                self.spawn_state(BwrapWorkloadState {
+                    instance_id: uuid::Uuid::new_v4(),
+                    workload: payload.workload,
+                    command: payload.command,
+                    owned_object_ids: Vec::new(),
+                    suspended: false,
+                })
+            }
+            semantics => Err(anyhow!(
+                "bwrap restore requires BwrapRecreate or BwrapConfigFs snapshot, got {semantics:?}"
+            )),
+        }
     }
 
     fn health(&mut self, handle: &NanoHandle) -> Result<NanoHealth> {
@@ -873,6 +963,7 @@ mod tests {
     ) -> NanoHandle {
         let workload_id = workload.workload_id.clone();
         let agent_name = workload.agent_name.clone();
+        let command = workload.command.clone();
         let process = AgentProcess::launch_fixture().unwrap();
         let pid = process.pid;
         runtime.processes.insert(workload_id.clone(), process);
@@ -893,7 +984,7 @@ mod tests {
             BwrapWorkloadState {
                 instance_id: uuid::Uuid::new_v4(),
                 workload,
-                command: Vec::new(),
+                command,
                 owned_object_ids,
                 suspended: false,
             },
@@ -1071,6 +1162,37 @@ mod tests {
         assert_eq!(
             runtime.health(&handle).unwrap().state,
             NanoHealthState::Healthy
+        );
+        runtime.stop(&handle).unwrap();
+    }
+
+    #[test]
+    fn default_bwrap_snapshot_is_reproducible_recreate_without_cas_manifest_claim() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = BwrapNanoRuntime::with_cas_dir(temp.path().join("cas"));
+        let agent_name = "compatibility-agent";
+        let home = runtime.home_dir(agent_name);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("existing.txt"),
+            b"must remain outside compatibility snapshot",
+        )
+        .unwrap();
+        let mut workload = fixture_workload("compatibility-workload", agent_name);
+        workload.command = vec!["/usr/bin/true".to_string()];
+        let handle = insert_fixture(&mut runtime, workload, Vec::new());
+
+        let snapshot = runtime.snapshot(&handle).unwrap();
+        assert_eq!(snapshot.semantics, NanoSnapshotSemantics::BwrapRecreate);
+        assert_eq!(
+            snapshot.payload["workload"]["workload_id"],
+            "compatibility-workload"
+        );
+        assert_eq!(snapshot.payload["command"][0], "/usr/bin/true");
+        assert!(snapshot.payload.get("home_manifest").is_none());
+        assert_eq!(
+            std::fs::read(home.join("existing.txt")).unwrap(),
+            b"must remain outside compatibility snapshot"
         );
         runtime.stop(&handle).unwrap();
     }

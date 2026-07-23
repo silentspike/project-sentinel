@@ -66,120 +66,99 @@ fn runtime_registry_routes_explicit_workload_keys() {
     );
 }
 
-fn rust_function_body<'a>(source: &'a str, signature: &str) -> &'a str {
-    let start = source
-        .find(signature)
-        .expect("function signature must exist");
-    let function = &source[start..];
-    let open = function.find('{').expect("function body must start");
-    let mut depth = 0usize;
-    for (offset, byte) in function.as_bytes()[open..].iter().enumerate() {
-        match byte {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &function[..open + offset + 1];
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("function body must end")
+struct OwnershipEscapeVisitor {
+    file: String,
+    violations: Vec<String>,
 }
 
-fn rust_source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-    let start = source.find(start).expect("source region must start");
-    let tail = &source[start..];
-    let end = tail.find(end).expect("source region must end");
-    &tail[..end]
+impl<'ast> syn::visit::Visit<'ast> for OwnershipEscapeVisitor {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        let test_only = node.attrs.iter().any(|attr| {
+            attr.path().is_ident("cfg")
+                && attr
+                    .meta
+                    .require_list()
+                    .is_ok_and(|list| list.tokens.to_string().contains("test"))
+        });
+        if !test_only {
+            syn::visit::visit_item_mod(self, node);
+        }
+    }
+
+    fn visit_path(&mut self, node: &'ast syn::Path) {
+        const RAW_OWNERS: &[&str] = &[
+            "NanoRuntimeRegistry",
+            "BwrapNanoRuntime",
+            "EcsNativeRuntime",
+            "MicrovmNanoRuntime",
+            "WasmtimeNanoRuntime",
+        ];
+        for segment in &node.segments {
+            if RAW_OWNERS.contains(&segment.ident.to_string().as_str()) {
+                self.violations
+                    .push(format!("{}:{}", self.file, segment.ident));
+            }
+        }
+        syn::visit::visit_path(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        const RAW_LIFECYCLE_METHODS: &[&str] = &[
+            "setup_agent",
+            "start_agent_process",
+            "teardown_agent",
+            "terminate_checked",
+        ];
+        if RAW_LIFECYCLE_METHODS.contains(&node.method.to_string().as_str()) {
+            self.violations
+                .push(format!("{}:.{}()", self.file, node.method));
+        }
+        syn::visit::visit_expr_method_call(self, node);
+    }
+}
+
+fn rust_sources(root: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            // Standalone diagnostic/benchmark binaries do not participate in
+            // the daemon's serving lifecycle. Their direct adapter use is
+            // intentional and cannot mutate the live daemon registry.
+            if path.file_name().is_some_and(|name| name == "bin") {
+                continue;
+            }
+            rust_sources(&path, files);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path);
+        }
+    }
 }
 
 #[test]
-fn productive_lifecycle_call_sites_remain_registry_owned() {
-    // Compile this against the exact daemon source so a future callsite cannot
-    // silently restore direct process/cgroup ownership next to the registry.
-    let source = include_str!("../src/orchestrator.rs");
-    let production_registry = rust_function_body(source, "fn production(");
-    assert!(production_registry.contains("EcsNativeRuntime::external_lifecycle"));
-    assert!(production_registry.contains("registry.register(bwrap)"));
-    assert!(production_registry.contains("WasmtimeNanoRuntime::new"));
-    assert!(production_registry.contains("MicrovmNanoRuntime::detect"));
-
-    for signature in [
-        "fn teardown_agent_full(",
-        "fn teardown_runtime_for_world_restore(",
-        "fn stop_all_nano_runtimes_with_retries(",
-    ] {
-        let body = rust_function_body(source, signature);
-        assert!(
-            body.contains("stop_agent_runtime_layer("),
-            "{signature} must stop through the owning adapter"
-        );
+fn ast_inventory_finds_no_raw_adapter_owner_outside_lifecycle_boundary() {
+    // This is a static architecture inventory, not a compile-time proof. The
+    // actual enforcement is Rust visibility: raw adapters and their registry
+    // are private to runtime_lifecycle.rs.
+    let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let owner = source_root.join("runtime_lifecycle.rs");
+    let mut files = Vec::new();
+    rust_sources(&source_root, &mut files);
+    let mut violations = Vec::new();
+    for path in files {
+        if path == owner {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).unwrap();
+        let parsed = syn::parse_file(&source).unwrap();
+        let mut visitor = OwnershipEscapeVisitor {
+            file: path.display().to_string(),
+            violations: Vec::new(),
+        };
+        syn::visit::Visit::visit_file(&mut visitor, &parsed);
+        violations.extend(visitor.violations);
     }
-
-    let stop_layer = rust_function_body(source, "fn stop_agent_runtime_layer(");
-    assert!(stop_layer.contains("nano_runtimes.stop(agent_id)"));
-    assert!(stop_layer.contains("captured_cgroup_id"));
-    assert!(stop_layer.contains("ebpf_collector.unregister_agent(cgroup_id)"));
-    let registry_stop = rust_function_body(source, "fn stop(&mut self, agent_id: AgentId)");
-    assert!(registry_stop.contains("self.registry.stop(&handle)"));
-    assert!(registry_stop.contains("self.handles.remove(&agent_id)"));
-
-    assert!(source.contains("runtime_orch.shift_removal_candidates"));
-    assert!(source.contains("runtime_orch.commit_shift_transition"));
-    assert!(source.contains("shutdown blocked by NanoRuntime cleanup failure"));
-    let config_replace = rust_function_body(source, "fn apply_runtime_changing_agent_update(");
-    let exact_stop = config_replace
-        .find("stop_agent_runtime_layer(")
-        .expect("config replacement must stop the exact old runtime");
-    let ecs_publish = config_replace
-        .find("apply_agent_update(world, staged_cfg)")
-        .expect("config replacement must publish staged ECS state");
-    let projection_publish = config_replace
-        .find("update_agent_projection_identity(projection_db_path, staged_cfg)")
-        .expect("config replacement must publish staged projection state");
-    let replacement_spawn = config_replace
-        .find("spawn_agent_nano_runtime(")
-        .expect("config replacement must start the staged runtime");
-    assert!(exact_stop < ecs_publish);
-    assert!(ecs_publish < projection_publish);
-    assert!(projection_publish < replacement_spawn);
-    assert!(config_replace.contains("persist_runtime_config_recovery_required("));
-
-    let world_teardown = rust_function_body(source, "fn teardown_runtime_for_world_restore(");
-    assert!(world_teardown.contains("stopped_runtime_ids.push(*agent_id)"));
-    let world_compensation =
-        rust_function_body(source, "fn compensate_world_restore_runtime_teardown(");
-    assert!(world_compensation.contains("stopped_runtime_ids.iter().rev()"));
-    let world_precommit = rust_function_body(source, "fn teardown_world_restore_precommit(");
-    let automatic_compensation = world_precommit
-        .find("compensate_world_restore_runtime_teardown(")
-        .expect("pre-commit teardown failures must compensate confirmed stops");
-    let fence_release = world_precommit
-        .find("restore_fence.end()")
-        .expect("restore fence must open after successful compensation");
-    assert!(automatic_compensation < fence_release);
-    assert!(source.contains("fn apply_agent_runtime_control("));
-    assert!(source.contains("fn reapply_persisted_runtime_suspension("));
     assert!(
-        !source.contains("fn suspend_agent_cgroup_processes("),
-        "adapter-specific suspension must not escape the NanoRuntime owner"
+        violations.is_empty(),
+        "raw adapter ownership escaped runtime_lifecycle.rs: {violations:?}"
     );
-    assert!(
-        source.matches("apply_agent_runtime_control(").count() >= 4,
-        "operator pause/resume, control-plane suspend, and restart re-suspend must share the ownership barrier"
-    );
-
-    let reconcile = rust_source_region(
-        source,
-        "fn run_runtime_reconcile(",
-        "fn resolve_platform_analysis_target(",
-    );
-    assert!(reconcile.contains("runtime_resources_are_healthy("));
-    assert!(reconcile.contains("runtime_agent_is_healthy(snapshot)"));
-    assert!(reconcile.contains("nano_runtimes.observe(AgentId(agent_id))"));
-    assert!(reconcile.contains("record_nano_runtime_snapshot("));
-    assert!(reconcile.contains("ctx.nano_runtimes.handle(agent_key).is_some()"));
-    assert!(reconcile.contains("registry_logical_recovered"));
 }
