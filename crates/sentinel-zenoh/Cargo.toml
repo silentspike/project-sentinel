@@ -27,7 +27,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
 sentinel-common = { path = "../sentinel-common" }
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+criterion = { workspace = true, features = ["async_tokio"] }
 
 [[bench]]
 name = "shm_benchmark"

@@ -3,10 +3,11 @@
 //! Misst Latenz, Throughput und Concurrency-Verhalten des Zenoh SHM Core-Bus.
 //! NUR auf Deploy-VM (<deploy-vm>) ausfuehren — NIEMALS auf cargo remote oder lokal!
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use sentinel_common::{AgentId, BioStateUpdate, ChaosEvent, EventType, RoomId, Tick, Timestamp};
 use sentinel_zenoh::flatbuf;
 use sentinel_zenoh::SentinelBus;
+use std::hint::black_box;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
