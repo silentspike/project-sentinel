@@ -362,7 +362,11 @@ pub struct CompletionEvidence {
     pub gate_passed: bool,
     pub gate_receipt_id: String,
     pub gate_authority: String,
-    pub receipt_digest: String,
+    pub authority_receipt_id: String,
+    pub request_digest: String,
+    pub issuer_authority_generation: u64,
+    pub issuer_authority_digest: String,
+    pub replay_domain: String,
     pub recorded_by: String,
     pub recorded_at_ms: u64,
 }

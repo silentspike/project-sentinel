@@ -98,12 +98,31 @@ pub struct ExecutionReceipt {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionReceiptQuery {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub request_digest: String,
     pub invocation_id: String,
     pub project_id: ProjectId,
+    pub project_version: u64,
     pub work_item_id: WorkItemId,
+    pub work_item_version: u64,
     pub assignment_version: u64,
     pub agent_id: AgentId,
+    pub assignment_authority_generation: u64,
+    pub assignment_authority_digest: String,
     pub input_digest: String,
+    pub replay_domain: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCompletionEvidence {
+    pub query: CompletionReceiptQuery,
+    pub requested_by: String,
+    pub requested_role: ActorRole,
+    pub tenant_id: String,
+    pub operation_id: String,
+    pub operation_digest: String,
+    pub created_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,61 +144,34 @@ pub struct GateReceipt {
     pub gate_id: String,
     pub runner_id: String,
     pub subject_digest: String,
-    pub issued_by: String,
-    pub issuer_role: ActorRole,
     pub passed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SealedCompletionReceipt {
-    pub receipt_id: String,
-    pub invocation_id: String,
-    pub project_id: ProjectId,
-    pub work_item_id: WorkItemId,
-    pub assignment_version: u64,
-    pub agent_id: AgentId,
-    pub input_digest: String,
-    pub artifacts: Vec<ArtifactReceipt>,
-    pub gate: GateReceipt,
-    pub seal_digest: String,
-}
-
-impl SealedCompletionReceipt {
-    #[allow(clippy::too_many_arguments)]
-    pub fn seal(
-        receipt_id: String,
-        invocation_id: String,
-        project_id: ProjectId,
-        work_item_id: WorkItemId,
-        assignment_version: u64,
-        agent_id: AgentId,
-        input_digest: String,
-        artifacts: Vec<ArtifactReceipt>,
-        gate: GateReceipt,
-    ) -> Result<Self, WorkExecutionError> {
-        let mut receipt = Self {
-            receipt_id,
-            invocation_id,
-            project_id,
-            work_item_id,
-            assignment_version,
-            agent_id,
-            input_digest,
-            artifacts,
-            gate,
-            seal_digest: String::new(),
-        };
-        receipt.seal_digest = completion_seal(&receipt)?;
-        Ok(receipt)
-    }
-
-    pub fn verify(&self) -> Result<(), WorkExecutionError> {
-        if self.seal_digest == completion_seal(self)? {
-            Ok(())
-        } else {
-            Err(WorkExecutionError::InvalidCompletionReceipt)
-        }
-    }
+/// Opaque authority result returned only by the configured evidence port.
+///
+/// The workflow never accepts a receipt from an API caller and deliberately
+/// exposes no concrete receipt constructor. A production #694 adapter owns its
+/// private receipt representation and implements these read-only claims after
+/// it has verified the authority's signature or capability.
+pub trait CompletionAuthorityReceipt: Send + Sync {
+    fn schema_version(&self) -> u32;
+    fn receipt_id(&self) -> &str;
+    fn request_digest(&self) -> &str;
+    fn invocation_id(&self) -> &str;
+    fn project_id(&self) -> &ProjectId;
+    fn project_version(&self) -> u64;
+    fn work_item_id(&self) -> &WorkItemId;
+    fn work_item_version(&self) -> u64;
+    fn assignment_version(&self) -> u64;
+    fn assignment_authority_generation(&self) -> u64;
+    fn issuer(&self) -> AgentId;
+    fn issuer_authority_generation(&self) -> u64;
+    fn issuer_authority_digest(&self) -> &str;
+    fn issued_at_ms(&self) -> u64;
+    fn expires_at_ms(&self) -> u64;
+    fn replay_domain(&self) -> &str;
+    fn artifacts(&self) -> &[ArtifactReceipt];
+    fn gate(&self) -> &GateReceipt;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -192,6 +184,8 @@ pub enum WorkExecutionError {
     InvalidAuthoritySnapshot,
     #[error("completion evidence receipt is invalid or stale")]
     InvalidCompletionReceipt,
+    #[error("completion evidence authority timed out")]
+    TimedOut,
 }
 
 /// Narrow boundary implemented by #694 after its dependency chain merges.
@@ -202,15 +196,15 @@ pub trait WorkExecutionPort: Send + Sync {
     fn reserve(&self, request: &PendingExecution) -> Result<ExecutionReceipt, WorkExecutionError>;
 }
 
-/// Sealed evidence boundary implemented by #694. The caller asks for
-/// completion; only this authority may attest outputs and gate results.
+/// Evidence boundary implemented by #694. The caller asks for completion; only
+/// this configured authority may return an opaque receipt implementation.
 pub trait CompletionEvidencePort: Send + Sync {
     fn readiness(&self) -> DependencyReadiness;
 
     fn completion_receipt(
         &self,
         query: &CompletionReceiptQuery,
-    ) -> Result<SealedCompletionReceipt, WorkExecutionError>;
+    ) -> Result<Box<dyn CompletionAuthorityReceipt>, WorkExecutionError>;
 }
 
 #[derive(Debug, Default)]
@@ -224,7 +218,7 @@ impl CompletionEvidencePort for UnavailableCompletionEvidencePort {
     fn completion_receipt(
         &self,
         _query: &CompletionReceiptQuery,
-    ) -> Result<SealedCompletionReceipt, WorkExecutionError> {
+    ) -> Result<Box<dyn CompletionAuthorityReceipt>, WorkExecutionError> {
         Err(WorkExecutionError::Unavailable)
     }
 }
@@ -255,30 +249,6 @@ fn organization_snapshot_digest(
     for byte in hash {
         write!(&mut digest, "{byte:02x}")
             .map_err(|_| WorkExecutionError::InvalidAuthoritySnapshot)?;
-    }
-    Ok(digest)
-}
-
-fn completion_seal(receipt: &SealedCompletionReceipt) -> Result<String, WorkExecutionError> {
-    use std::fmt::Write as _;
-
-    let bytes = serde_json::to_vec(&(
-        &receipt.receipt_id,
-        &receipt.invocation_id,
-        &receipt.project_id,
-        &receipt.work_item_id,
-        receipt.assignment_version,
-        receipt.agent_id,
-        &receipt.input_digest,
-        &receipt.artifacts,
-        &receipt.gate,
-    ))
-    .map_err(|_| WorkExecutionError::InvalidCompletionReceipt)?;
-    let hash = Sha256::digest(bytes);
-    let mut digest = String::with_capacity(64);
-    for byte in hash {
-        write!(&mut digest, "{byte:02x}")
-            .map_err(|_| WorkExecutionError::InvalidCompletionReceipt)?;
     }
     Ok(digest)
 }
