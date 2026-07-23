@@ -6,6 +6,9 @@ Scope: source and remote-build validation for the findings in the ORC review of
 PR #700. No service, VM, installed binary, configuration, or runtime data was
 accessed or changed during this correction pass.
 
+Current `origin/main@1a4f44cbde2cf016ce12c96c68e7df91c41f0756` is included
+through merge commit `77b4541`; the feature branch was not rebased.
+
 ## Review finding mapping
 
 | Finding | Correction | Failure and lifecycle coverage |
