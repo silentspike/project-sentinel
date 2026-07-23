@@ -18,7 +18,6 @@ path = "src/main.rs"
 sentinel-common = { path = "../../crates/sentinel-common" }
 sentinel-hippocampus = { path = "../../crates/sentinel-hippocampus" }
 sentinel-limbo = { path = "../../crates/sentinel-limbo" }
-sentinel-telemetry = { path = "../../crates/sentinel-telemetry" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
