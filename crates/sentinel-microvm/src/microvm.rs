@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Result};
 use sentinel_common::nano_runtime::{
     ensure_handle_instance, ensure_handle_runtime, NanoExecRequest, NanoExecResult, NanoHandle,
-    NanoHealth, NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRuntime,
-    NanoRuntimeControlAction, NanoRuntimeControlResult, NanoRuntimeResources, NanoSnapshot,
-    NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_MICROVM,
+    NanoHealth, NanoHealthState, NanoIsolationPolicy, NanoIsolationReport, NanoRecoveryResult,
+    NanoRuntime, NanoRuntimeControlAction, NanoRuntimeControlResult, NanoRuntimeResources,
+    NanoSnapshot, NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_MICROVM,
 };
 use serde::{Deserialize, Serialize};
 
@@ -267,6 +267,35 @@ impl Drop for MicrovmNanoRuntime {
 impl NanoRuntime for MicrovmNanoRuntime {
     fn runtime_key(&self) -> &'static str {
         RUNTIME_MICROVM
+    }
+
+    fn reconcile_abandoned(&mut self, workload: &NanoWorkloadSpec) -> Result<NanoRecoveryResult> {
+        let selected = workload.runtime_key.as_deref().unwrap_or(RUNTIME_MICROVM);
+        anyhow::ensure!(
+            selected == RUNTIME_MICROVM,
+            "microVM cannot reconcile workload '{}' for runtime '{}'",
+            workload.workload_id,
+            selected
+        );
+        anyhow::ensure!(
+            !self.processes.contains_key(&workload.workload_id)
+                && !self.workloads.contains_key(&workload.workload_id),
+            "microVM workload '{}' is active in this adapter instance",
+            workload.workload_id
+        );
+        let api_sock = self.api_sock_path(&workload.workload_id);
+        let vsock = self.vsock_uds_path(&workload.workload_id);
+        anyhow::ensure!(
+            !api_sock.exists() && !vsock.exists(),
+            "microVM workload '{}' has durable runtime sockets but no process-incarnation proof; recovery remains fail-closed",
+            workload.workload_id
+        );
+        Ok(NanoRecoveryResult {
+            runtime_key: self.runtime_key().to_string(),
+            workload_id: workload.workload_id.clone(),
+            cleaned: false,
+            detail: "verified that no durable microVM runtime sockets remain".to_string(),
+        })
     }
 
     fn spawn(&mut self, workload: NanoWorkloadSpec) -> Result<NanoHandle> {
@@ -687,6 +716,28 @@ mod tests {
     fn runtime_key_is_microvm() {
         let rt = MicrovmNanoRuntime::detect();
         assert_eq!(rt.runtime_key(), RUNTIME_MICROVM);
+    }
+
+    #[test]
+    fn abandoned_reconcile_is_verified_or_fails_closed_on_unowned_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = MicrovmConfig {
+            work_dir: temp.path().to_string_lossy().into_owned(),
+            ..MicrovmConfig::default()
+        };
+        let mut runtime = MicrovmNanoRuntime::with_config(config);
+        let workload = fixture_workload("recovery-fixture", 18);
+        let socket = runtime.api_sock_path(&workload.workload_id);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let error = runtime.reconcile_abandoned(&workload).unwrap_err();
+        assert!(format!("{error:#}").contains("recovery remains fail-closed"));
+
+        drop(listener);
+        std::fs::remove_file(&socket).unwrap();
+        let reconciled = runtime.reconcile_abandoned(&workload).unwrap();
+        assert!(!reconciled.cleaned);
+        assert!(reconciled.detail.contains("verified"));
     }
 
     #[test]

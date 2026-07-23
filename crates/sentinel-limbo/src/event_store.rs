@@ -10,7 +10,8 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use sentinel_common::{
-    DomainEvent, FencedStore, OwnerRegistry, OwnerWriteGuard, StateTransferScope,
+    agent_config::AgentConfig, AgentId, DomainEvent, FencedStore, OwnerRegistry, OwnerWriteGuard,
+    StateTransferScope,
 };
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -144,6 +145,19 @@ const CREATE_SIM_METADATA: &str = "
 CREATE TABLE IF NOT EXISTS sim_metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+)";
+
+const CREATE_RUNTIME_CONFIG_RECOVERY: &str = "
+CREATE TABLE IF NOT EXISTS runtime_config_recovery (
+    agent_id INTEGER PRIMARY KEY,
+    owner_scope TEXT NOT NULL,
+    old_config_json TEXT NOT NULL,
+    staged_config_json TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('transitioning', 'recovery_required')),
+    reason TEXT NOT NULL DEFAULT '',
+    started_tick INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 )";
 
@@ -334,6 +348,34 @@ pub struct SnapshotRow {
     pub created_at: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeConfigRecoveryPhase {
+    Transitioning,
+    RecoveryRequired,
+}
+
+impl RuntimeConfigRecoveryPhase {
+    fn from_persisted(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "transitioning" => Ok(Self::Transitioning),
+            "recovery_required" => Ok(Self::RecoveryRequired),
+            other => anyhow::bail!("unknown runtime config recovery phase '{other}'"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeConfigRecoveryMarker {
+    pub agent_id: AgentId,
+    pub old_config: AgentConfig,
+    pub staged_config: AgentConfig,
+    pub phase: RuntimeConfigRecoveryPhase,
+    pub reason: String,
+    pub started_tick: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
 // ──────────────────────────────────────────────
 // EventStore
 // ──────────────────────────────────────────────
@@ -395,6 +437,7 @@ impl EventStore {
         conn.execute(CREATE_IDX_WORLD_SNAPSHOTS_TIER, [])?;
         conn.execute_batch(CREATE_PROJECTION_OFFSETS)?;
         conn.execute_batch(CREATE_SIM_METADATA)?;
+        conn.execute_batch(CREATE_RUNTIME_CONFIG_RECOVERY)?;
 
         // Security: Immutable Snapshots — Schutz vor Loeschung junger Snapshots.
         // #250: dieselbe SSOT-Konstante wie der Daemon-Retention-Skip (siehe IMMUTABLE_SNAPSHOT_MS).
@@ -515,6 +558,154 @@ impl EventStore {
                 .observe(_telemetry_start.elapsed().as_micros() as f64);
         }
         Ok(row_id)
+    }
+
+    /// Persist the recovery obligation before the first runtime mutation. A
+    /// second transition for the same agent is rejected until the original
+    /// marker has been reconciled and cleared.
+    pub fn begin_runtime_config_recovery(
+        &self,
+        old_config: &AgentConfig,
+        staged_config: &AgentConfig,
+        started_tick: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            old_config.identity.id == staged_config.identity.id,
+            "runtime config recovery identity mismatch"
+        );
+        let agent_id = AgentId(old_config.identity.id);
+        let scope = StateTransferScope::for_agent(agent_id.to_string());
+        let scope_wire = scope.to_wire();
+        let started_tick = i64::try_from(started_tick)
+            .map_err(|_| anyhow::anyhow!("runtime config recovery tick exceeds i64"))?;
+        let conn = self.begin_fenced_write(&self.owner_registry.issue(scope)?)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO runtime_config_recovery
+             (agent_id, owner_scope, old_config_json, staged_config_json, phase, reason,
+              started_tick, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'transitioning', '', ?5, ?6, ?6)",
+            params![
+                i64::from(agent_id.0),
+                scope_wire,
+                serde_json::to_string(old_config)?,
+                serde_json::to_string(staged_config)?,
+                started_tick,
+                now_ms,
+            ],
+        )?;
+        anyhow::ensure!(
+            inserted == 1,
+            "unresolved runtime config recovery already exists for {agent_id}"
+        );
+        conn.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_runtime_config_recovery_required(
+        &self,
+        agent_id: AgentId,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let scope = StateTransferScope::for_agent(agent_id.to_string());
+        let conn = self.begin_fenced_write(&self.owner_registry.issue(scope)?)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let updated = conn.execute(
+            "UPDATE runtime_config_recovery
+             SET phase = 'recovery_required', reason = ?2, updated_at = ?3
+             WHERE agent_id = ?1 AND phase = 'transitioning'",
+            params![i64::from(agent_id.0), reason, now_ms],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "runtime config recovery marker for {agent_id} is missing or not transitioning"
+        );
+        conn.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_runtime_config_recovery(&self, agent_id: AgentId) -> anyhow::Result<()> {
+        let scope = StateTransferScope::for_agent(agent_id.to_string());
+        let conn = self.begin_fenced_write(&self.owner_registry.issue(scope)?)?;
+        let deleted = conn.execute(
+            "DELETE FROM runtime_config_recovery WHERE agent_id = ?1",
+            params![i64::from(agent_id.0)],
+        )?;
+        anyhow::ensure!(
+            deleted == 1,
+            "missing runtime config recovery marker for {agent_id}"
+        );
+        conn.commit()?;
+        Ok(())
+    }
+
+    pub fn list_runtime_config_recoveries(
+        &self,
+    ) -> anyhow::Result<Vec<RuntimeConfigRecoveryMarker>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| anyhow::anyhow!("Lock poisoned: {error}"))?;
+        let mut statement = conn.prepare(
+            "SELECT agent_id, owner_scope, old_config_json, staged_config_json, phase, reason,
+                    started_tick, created_at, updated_at
+             FROM runtime_config_recovery
+             ORDER BY agent_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (
+                agent_id_value,
+                owner_scope,
+                old_config_json,
+                staged_config_json,
+                phase,
+                reason,
+                started_tick,
+                created_at_ms,
+                updated_at_ms,
+            ) = row?;
+            let agent_id = AgentId(u16::try_from(agent_id_value)?);
+            anyhow::ensure!(
+                owner_scope == StateTransferScope::for_agent(agent_id.to_string()).to_wire(),
+                "runtime config recovery scope mismatch for {agent_id}"
+            );
+            let old_config: AgentConfig = serde_json::from_str(&old_config_json)?;
+            let staged_config: AgentConfig = serde_json::from_str(&staged_config_json)?;
+            anyhow::ensure!(
+                old_config.identity.id == agent_id.0 && staged_config.identity.id == agent_id.0,
+                "runtime config recovery payload identity mismatch for {agent_id}"
+            );
+            Ok(RuntimeConfigRecoveryMarker {
+                agent_id,
+                old_config,
+                staged_config,
+                phase: RuntimeConfigRecoveryPhase::from_persisted(&phase)?,
+                reason,
+                started_tick: u64::try_from(started_tick)?,
+                created_at_ms: u64::try_from(created_at_ms)?,
+                updated_at_ms: u64::try_from(updated_at_ms)?,
+            })
+        })
+        .collect()
     }
 
     /// Reserve the stable request ID immediately before network execution. If the

@@ -65,6 +65,7 @@ fuse = ["sentinel-fs/fuse-tests"]
 [dev-dependencies]
 criterion = { workspace = true }
 tempfile = "3"
+syn = { version = "2", features = ["full", "visit"] }
 
 [[bench]]
 name = "platform_controlplane_bench"
