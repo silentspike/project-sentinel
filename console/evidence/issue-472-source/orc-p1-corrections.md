@@ -32,10 +32,12 @@ was not changed. Build duration and host load are not runtime evidence.
 | Ownership boundary | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472 CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-daemon --test nano_runtime_registry -j1` | PASS, 2 passed |
 | microVM abandoned recovery | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472 CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-microvm abandoned_reconcile_is_verified_or_fails_closed_on_unowned_socket -j1` | PASS, 1 passed |
 | bwrap compatibility adapter | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472 CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-sandbox default_bwrap_snapshot_is_reproducible_recreate_without_cas_manifest_claim -j1` | PASS, 1 passed |
+| WASM feature check | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472 CARGO_BUILD_JOBS=1' -c -- check -p sentinel-wasm --features wasm -j1` | PASS |
+| WASM feature tests | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472 CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test -p sentinel-wasm --features wasm -j1` | PASS, 58 unit, 62 acceptance, 2 conformance |
 | Workspace tests | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472 CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1' -c -- test --workspace -j1` | PASS |
 | Workspace Clippy | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472 CARGO_BUILD_JOBS=1' -c -- clippy --workspace --all-targets -j1 -- -D warnings` | PASS |
 | Rustdoc | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472 CARGO_BUILD_JOBS=1 RUSTDOCFLAGS=-Dwarnings' -c -- doc --workspace --no-deps -j1` | PASS |
-| Release build | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472 CARGO_BUILD_JOBS=1' -c -- build -p sentinel-daemon --bin sentinel-daemon --release -j1` | IN PROGRESS |
+| Release build | `cargo remote -b 'CARGO_TARGET_DIR=/var/tmp/cdx3-target-472 CARGO_BUILD_JOBS=1' -c -- build -p sentinel-daemon --bin sentinel-daemon --release -j1` | PASS |
 
 ## Non-Rust source gates
 
@@ -55,7 +57,7 @@ was not changed. Build duration and host load are not runtime evidence.
 | AC-3 | NOT TESTED live | Source tests cover bwrap lifecycle ownership, cgroup/eBPF ordering, retry retention, and stop-before-publication. No VM was accessed. |
 | AC-4 | PASS (source); NOT TESTED live | Default bwrap compatibility snapshot/restore supports the existing World Snapshot, Restore, and Time Machine paths by recreating a fresh bound workload. It makes no process-state claim. The separate CAS-manifest extension remains default-off for #548. |
 | AC-5 | PASS (source) | DEV-007, the TOGAF gap, feature documentation, and the changelog state the typed ownership and #548 boundary without overclaiming. |
-| AC-6 | NOT TESTED live | The required productive lifecycle integration belongs to the post-review single-node validation on `.240`. |
+| #698 AC-6 | NOT TESTED live | The required productive lifecycle integration belongs to the post-review single-node validation on `.240`. |
 
 Benchmarks, deployment, and live VM validation are **NOT TESTED**. PR #700 is
 not authorized for merge or deployment in this phase.
