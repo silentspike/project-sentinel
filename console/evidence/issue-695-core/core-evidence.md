@@ -6,8 +6,8 @@ Date: 2026-07-23
 
 - Branch: `feat/issue-695-company-workflow-core`
 - Branch point: `13e87b663cc3b47223a2b0052db1cc6c274e66c8`
-- Merged upstream: `origin/main@9d8bb2fc9cca1140867aff20280df7fb54b0a6f2`
-- Verified code commit: `a9e8fc7f9b34bac8a113da9cd1aa119f9de7a456`
+- Merged upstream: `origin/main@16c0e353861e29a9b4d181bebd9a9f4a432a49b3`
+- Verified code commit: `85a339e42fb6979688d7dcdb1e3e620cc0643286`
 - Runtime target class: `SINGLE_NODE`
 - Runtime access: not performed
 - Deployment: not performed
@@ -35,12 +35,11 @@ Every Rust command was dispatched through `cargo remote -c --`; no local Cargo, 
 | Check | Command | Result |
 |---|---|---|
 | Workflow package | `cargo remote -c -- test -p sentinel-workflow -j1` | PASS on the verified code commit: 4 unit tests and 18 integration tests passed; doc-test target had 0 tests |
-| Daemon workflow API | `cargo remote -c -- test -j1 -p sentinel-daemon --lib workflow_api::tests -- --nocapture` | PASS on the merged-main code state: 9 passed, 0 failed, 340 filtered out |
-| Daemon library regression | `cargo remote -c -- test -p sentinel-daemon --lib -j1` | PASS before the ORC correction delta: 344 passed, 0 failed, 1 ignored; the correction delta is covered by the 9 focused API tests and final Clippy compile |
-| Format | `cargo remote -c -- fmt --all -- --check` | PASS after the final code correction |
-| Workspace compile | `cargo remote -c -- check --workspace --all-targets -j1` | PASS on merged `origin/main`, no diagnostics |
-| Workspace Clippy | `cargo remote -c -- clippy --workspace --all-targets -j1 -- -D warnings` | PASS after replacing the one derivable test-only `Default` implementation |
-| Workspace tests | `cargo remote -c -- test --workspace -j1` | BUILDER RESOURCE BLOCKED: `sentinel-daemon` lib-test linking failed with `clang: error: unable to execute command: Killed` and linker exit 254; no compiler or test assertion failed |
+| Daemon workflow API | `cargo remote -c -- test -j1 -p sentinel-daemon --lib workflow_api::tests -- --nocapture` | PASS on the verified code commit: 9 passed, 0 failed, 340 filtered out |
+| Format | `cargo remote -c -- fmt --all -- --check` | PASS on the verified code commit |
+| Workspace compile | `cargo remote -c -- check --workspace --all-targets -j1` | PASS on the verified code commit, no diagnostics |
+| Workspace Clippy | `cargo remote -c -- clippy --workspace --all-targets -j1 -- -D warnings` | PASS on the verified code commit |
+| Workspace tests | `cargo remote -c -- test --workspace -j1` | PASS on the verified code commit; the daemon library reported 348 passed, 0 failed, and 1 deploy-VM-only test ignored, and all remaining workspace unit, integration, and doc-test targets completed successfully |
 | Workspace rustdoc | `RUSTDOCFLAGS="-D warnings" cargo remote -c -- doc --workspace --no-deps -j1` | PASS; Cargo emitted the pre-existing Projection lib/bin output-filename collision warning, while rustdoc completed with `-D warnings` |
 | Release build | `cargo remote -c -- build -j1 -p sentinel-daemon --release` | PASS: optimized release profile completed |
 | M0 contract | `python3 scripts/product-acceptance/check_contract.py --check` | PASS |
@@ -48,13 +47,13 @@ Every Rust command was dispatched through `cargo remote -c --`; no local Cargo, 
 | Typos | `typos .` | PASS |
 | Patch integrity | `git diff --check` | PASS |
 
-The failed full-workspace test command is a remote linker resource failure, not a passing gate and not a code/test failure. Its build time is diagnostic only and is not benchmark evidence. GitHub CI remains the authoritative clean full-workspace run for the pushed exact head.
+Build and transfer durations are diagnostic only and are not benchmark evidence. GitHub CI remains the authoritative clean full-workspace run for the pushed exact head.
 
 Release artifact from the verified code commit:
 
 - File: `target/release/sentinel-daemon`
-- Size: `57187624` bytes
-- SHA-256: `ead84cb1a888c2a9df5823d75c4fdf11db337bd6ddb3cf6e8c24d4efe3c5e285`
+- Size: `57184176` bytes
+- SHA-256: `acc45eb674631806859e38e482be0ce757d81d693e2f65761e9b41c58c72c43f`
 - Toolchain readback: `rustc 1.97.1 (8bab26f4f 2026-07-14)`
 
 The artifact was not deployed. Final release provenance must be rebuilt from the eventual merge revision before live acceptance.
@@ -66,7 +65,7 @@ The artifact was not deployed. Final release provenance must be rebuilt from the
 | AC-1 | PASS | Versioned domain records, durable typed IDs, explicit state enums, transition documentation, invalid-transition tests, and crash-atomic v1-to-v2 migration with failpoint recovery | None for the independent core |
 | AC-2 | PASS for core/API | Default-OFF daemon startup, typed unavailable routes, server-owned credential-to-principal bindings, payload authority rejection, replay, stale version, wrong digest, expiry, rejection, feedback, cancellation, tenant isolation, route-kind isolation, forged evidence, self-attested gates, and unauthorized-role tests | Live API probe remains part of AC-12 |
 | AC-3 | PASS | One SQLite immediate transaction binds the accepted proposal digest, canonical profile ID/version/digest, governance policy, owner, participants, and immutable commercial terms to Agreement, Project, events, and projection; scoped idempotency conflicts are tested | Live readback remains part of AC-12 |
-| AC-4 | PASS for core | Canonical profile and DAG validation reject unknown or modified profiles, digest mismatch, missing roles/specialties/artifacts/gates, insufficient topology, cycles, duplicate or missing dependencies, empty contracts, self-dependencies, zero budgets, and a one-work-item shortcut to `DeliveryCandidate` | Full-workspace clean-run proof comes from PR CI |
+| AC-4 | PASS for core | Canonical profile and DAG validation reject unknown or modified profiles, digest mismatch, missing roles/specialties/artifacts/gates, insufficient topology, cycles, duplicate or missing dependencies, empty contracts, self-dependencies, zero budgets, and a one-work-item shortcut to `DeliveryCandidate`; the complete remote workspace test passed | Exact-head GitHub CI remains required |
 | AC-5 | PASS for core policy | Assignment resolves the assignee through the authoritative organization port and persists its generation/digest; claim, dispatch, and completion revalidate the exact snapshot; participant, role, capability, reporting line, active state, workload, version, self-assignment, tenant, and cross-project checks fail closed | Effective live roster probe is deferred |
 | AC-6 | PARTIAL | Claim creates a tenant/principal-bound durable execution request. Completion uses a durable evidence request, an external opaque authority receipt outside the writer transaction, and a second full CAS transaction. Request, invocation, project/item/assignment/authority versions, replay domain, output ownership, and an independent profile gate are verified. Restart, crash, timeout, duplicate, forged, stale, and replay paths pass | Production #694 execution and completion-authority adapters plus live integration are deferred |
 | AC-7 | PASS for core | Project and team rooms, decisions, action items, questions, handoffs, acknowledgements, and blockers are structured entities/events; optional decision work-item scope is project/tenant checked; `/operator/chat` is not a workflow route | Live API journey is deferred |
