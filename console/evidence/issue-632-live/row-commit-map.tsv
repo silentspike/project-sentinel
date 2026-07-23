@@ -1,8 +1,8 @@
 row_id	decision	commit	result
 DEP-001	prune-features	776b108	Tokio workspace full feature replaced by the audited explicit set
-DEP-002	leave	776b108,d0fa379,27e4d6b	Attempt falsified by isolated telemetry compilation; JSON restored and audit corrected
+DEP-002	leave	776b108,d0fa379,27e4d6b	Attempt falsified by isolated telemetry compilation; JSON restored and append-only erratum E632-001 records the effective decision
 DEP-003	prune-features	b6552e4	Futures defaults and executor removed from three direct service declarations
-DEP-004	leave	ee639af,ef0ad9d	Attempt had no dashboard release-graph effect through sentinel-fs; manifest restored and audit corrected
+DEP-004	leave	ee639af,ef0ad9d	Attempt had no dashboard release-graph effect through sentinel-fs; manifest restored and append-only erratum E632-002 records the effective decision
 DEP-005	prune-features	ee639af	WebTransport defaults disabled with ring retained
 DEP-006	prune-features	ee639af	Unused normal Tower edge removed; dev util edge retained
 DEP-007	prune-features	ee639af	Axum defaults replaced with the audited explicit server and route features
