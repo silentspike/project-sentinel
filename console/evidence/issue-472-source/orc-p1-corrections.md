@@ -3,8 +3,8 @@
 Date: 2026-07-23
 
 Scope: source and remote-build validation for the findings in the ORC review of
-PR #700. No service, VM, installed binary, configuration, or runtime data was
-accessed or changed during this correction pass.
+PR #700. No runtime service, deployment VM, installed binary, configuration, or
+runtime data was accessed or changed during this correction pass.
 
 Current `origin/main@1a4f44cbde2cf016ce12c96c68e7df91c41f0756` is included
 through merge commit `77b4541`; the feature branch was not rebased.
@@ -13,7 +13,7 @@ through merge commit `77b4541`; the feature branch was not rebased.
 
 | Finding | Correction | Failure and lifecycle coverage |
 |---|---|---|
-| Default bwrap snapshots | Default bwrap snapshots now persist a compatibility payload containing the bound workload specification and command. Restore creates a fresh runtime incarnation from that binding. It does not claim process, memory, or complete filesystem-state capture. Only the new CAS-manifest mode from #548 remains default-off. | `default_bwrap_snapshot_is_reproducible_recreate_without_cas_manifest_claim`; `default_bwrap_compatibility_snapshot_supports_world_restore_without_cas_manifest`; the complete workspace suite exercises manual/periodic world snapshot, pre-restore, and pre-config-apply call sites. |
+| Default bwrap snapshots | Default bwrap snapshots now persist a compatibility payload containing the bound workload specification and command. Restore creates a fresh runtime incarnation from that binding. It does not claim process, memory, or complete filesystem-state capture. Only the new CAS-manifest mode from #548 remains default-off. | `default_bwrap_snapshot_is_reproducible_recreate_without_cas_manifest_claim` uses isolated temporary CAS/home roots while explicitly retaining the default-off CAS-manifest flag, so it also runs under an unprivileged hosted-runner filesystem; `default_bwrap_compatibility_snapshot_supports_world_restore_without_cas_manifest`; the complete workspace suite exercises manual/periodic world snapshot, pre-restore, and pre-config-apply call sites. |
 | Config-apply safety snapshot | A runtime-changing apply requires its pre-apply safety snapshot. A missing store or failed adapter snapshot aborts before runtime, ECS, or projection mutation. | Functional config-apply tests exercise the staged transition and fail-closed stop/replacement paths. |
 | Persistent config recovery | `runtime_config_recovery` is an owner-fenced SQLite table. The daemon atomically creates a `transitioning` marker before stopping the exact old runtime. Incomplete rollback changes it to `recovery_required`; startup reads and reconciles markers before API/readiness/ECS/runtime publication, and spawn/reconcile reject blocked agents. A marker is cleared only after verified adapter cleanup/reconcile. | `runtime_config_recovery_survives_restart_and_blocks_startup_until_reconciled`; `recovery_block_rejects_spawn_instead_of_reconciler_resurrection`; stop and replacement failure tests. |
 | Adapter-owned cleanup | bwrap and microVM implement typed abandoned-runtime reconciliation. microVM fails closed when only unowned durable sockets remain; it does not kill by an unverified PID or delete unowned state. | `abandoned_reconcile_is_verified_or_fails_closed_on_unowned_socket`; bwrap marker/setup/process failure-injection and retry tests in the workspace suite. |
