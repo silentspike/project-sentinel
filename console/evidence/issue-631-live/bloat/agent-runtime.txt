@@ -1,0 +1,6 @@
+File  .text     Size Crate
+5.9%  97.7% 254.7KiB std
+0.0%   0.8%   2.0KiB agent_runtime
+0.0%   0.0%      73B [Unknown]
+0.0%   0.0%      21B __rustc
+6.0% 100.0% 260.7KiB .text section size, the file size is 4.2MiB
