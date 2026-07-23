@@ -1332,34 +1332,6 @@ dependencies = [
 
 [[package]]
 name = "criterion"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2b12d017a929603d80db1831cd3a24082f8137ce19c69e6447f54f5fc8d692f"
-dependencies = [
- "anes",
- "cast",
- "ciborium",
- "clap",
- "criterion-plot 0.5.0",
- "futures",
- "is-terminal",
- "itertools 0.10.5",
- "num-traits",
- "once_cell",
- "oorandom",
- "plotters",
- "rayon",
- "regex",
- "serde",
- "serde_derive",
- "serde_json",
- "tinytemplate",
- "tokio",
- "walkdir",
-]
-
-[[package]]
-name = "criterion"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "950046b2aa2492f9a536f5f4f9a3de7b9e2476e575e05bd6c333371add4d98f3"
@@ -1369,7 +1341,7 @@ dependencies = [
  "cast",
  "ciborium",
  "clap",
- "criterion-plot 0.8.2",
+ "criterion-plot",
  "itertools 0.13.0",
  "num-traits",
  "oorandom",
@@ -1380,17 +1352,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tinytemplate",
+ "tokio",
  "walkdir",
-]
-
-[[package]]
-name = "criterion-plot"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b50826342786a51a89e2da3a28f1c32b06e387201bc2d19791f622c673706b1"
-dependencies = [
- "cast",
- "itertools 0.10.5",
 ]
 
 [[package]]
@@ -2725,30 +2688,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "is-terminal"
-version = "0.4.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
-dependencies = [
- "hermit-abi",
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
-
-[[package]]
-name = "itertools"
-version = "0.10.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
-dependencies = [
- "either",
-]
 
 [[package]]
 name = "itertools"
@@ -4533,7 +4476,7 @@ dependencies = [
  "bincode",
  "chrono",
  "clap",
- "criterion 0.8.2",
+ "criterion",
  "futures",
  "redb",
  "reqwest",
@@ -4584,7 +4527,6 @@ dependencies = [
  "sentinel-gaia",
  "sentinel-gaia-loop",
  "sentinel-limbo",
- "sentinel-projection",
  "serde",
  "serde_json",
  "sha2",
@@ -4627,7 +4569,7 @@ version = "0.1.0"
 dependencies = [
  "bevy_ecs",
  "bincode",
- "criterion 0.8.2",
+ "criterion",
  "insta",
  "sentinel-bio",
  "sentinel-common",
@@ -4653,7 +4595,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "blake3",
- "criterion 0.8.2",
+ "criterion",
  "fuser",
  "io-uring",
  "libc",
@@ -4715,7 +4657,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "clap",
- "criterion 0.8.2",
+ "criterion",
  "redb",
  "rusqlite",
  "sentinel-hippocampus",
@@ -4735,7 +4677,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "approx",
- "criterion 0.8.2",
+ "criterion",
  "redb",
  "sentinel-common",
  "serde",
@@ -4749,7 +4691,7 @@ name = "sentinel-limbo"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "criterion 0.8.2",
+ "criterion",
  "rusqlite",
  "sentinel-common",
  "sentinel-telemetry",
@@ -4782,13 +4724,12 @@ dependencies = [
  "anyhow",
  "approx",
  "clap",
- "criterion 0.8.2",
+ "criterion",
  "libc",
  "rusqlite",
  "sentinel-common",
  "sentinel-hippocampus",
  "sentinel-limbo",
- "sentinel-telemetry",
  "serde",
  "serde_json",
  "sha2",
@@ -4815,7 +4756,7 @@ name = "sentinel-projection"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "criterion 0.8.2",
+ "criterion",
  "rusqlite",
  "sentinel-common",
  "sentinel-limbo",
@@ -4834,7 +4775,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "sentinel-common",
  "sentinel-limbo",
  "sentinel-projection",
  "sentinel-telemetry",
@@ -4865,7 +4805,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bevy_ecs",
- "criterion 0.8.2",
+ "criterion",
  "sentinel-common",
  "sentinel-ecs",
  "sentinel-limbo",
@@ -4881,7 +4821,7 @@ name = "sentinel-sandbox"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "criterion 0.8.2",
+ "criterion",
  "landlock",
  "libc",
  "nix 0.30.1",
@@ -4900,7 +4840,7 @@ dependencies = [
 name = "sentinel-telemetry"
 version = "0.1.0"
 dependencies = [
- "criterion 0.5.1",
+ "criterion",
  "sentinel-common",
  "serde",
  "serde_json",
@@ -4914,7 +4854,7 @@ name = "sentinel-wasm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "criterion 0.8.2",
+ "criterion",
  "sentinel-common",
  "serde",
  "serde_json",
@@ -4930,7 +4870,7 @@ name = "sentinel-zenoh"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "criterion 0.5.1",
+ "criterion",
  "flatbuffers",
  "sentinel-common",
  "sentinel-telemetry",
@@ -5558,7 +5498,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2 0.6.4",
@@ -7175,7 +7114,6 @@ dependencies = [
  "bytes",
  "pem",
  "quinn",
- "rcgen",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
