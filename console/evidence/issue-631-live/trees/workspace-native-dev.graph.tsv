@@ -1,0 +1,106 @@
+record	parent_name	parent_version	parent_source	name	version	source	normal_context	build_context	is_root
+package				agent-runtime	0.1.0	workspace	true	false	true
+package				approx	0.5.1	registry	true	false	false
+package				bolero	0.13.4	registry	true	false	false
+package				criterion	0.5.1	registry	true	false	false
+package				criterion	0.8.2	registry	true	false	false
+package				insta	1.46.3	registry	true	false	false
+package				rusqlite	0.38.0	registry	true	false	false
+package				sentinel-bio	0.1.0	workspace	true	false	true
+package				sentinel-cluster-control	0.1.0	workspace	true	false	true
+package				sentinel-common	0.1.0	workspace	true	false	true
+package				sentinel-console-plane	0.1.0	workspace	true	false	true
+package				sentinel-ctl	0.1.0	workspace	true	false	true
+package				sentinel-daemon	0.1.0	workspace	true	false	true
+package				sentinel-dashboard-backend	0.1.0	workspace	true	false	true
+package				sentinel-ebpf	0.1.0	workspace	true	false	true
+package				sentinel-ecs	0.1.0	workspace	true	false	true
+package				sentinel-fs	0.1.0	workspace	true	false	true
+package				sentinel-gaia	0.1.0	workspace	true	false	true
+package				sentinel-gaia-loop	0.1.0	workspace	true	false	true
+package				sentinel-gaia-memory	0.1.0	workspace	true	false	true
+package				sentinel-hippocampus	0.1.0	workspace	true	false	true
+package				sentinel-limbo	0.1.0	workspace	true	false	true
+package				sentinel-microvm	0.1.0	workspace	true	false	true
+package				sentinel-nightrun	0.1.0	workspace	true	false	true
+package				sentinel-physics	0.1.0	workspace	true	false	true
+package				sentinel-projection	0.1.0	workspace	true	false	true
+package				sentinel-projection-service	0.1.0	workspace	true	false	true
+package				sentinel-redb	0.1.0	workspace	true	false	true
+package				sentinel-runtime	0.1.0	workspace	true	false	true
+package				sentinel-sandbox	0.1.0	workspace	true	false	true
+package				sentinel-telemetry	0.1.0	workspace	true	false	true
+package				sentinel-wasm	0.1.0	workspace	true	false	true
+package				sentinel-zenoh	0.1.0	workspace	true	false	true
+package				serde_json	1.0.149	registry	true	false	false
+package				sha2	0.10.9	registry	true	false	false
+package				tempfile	3.27.0	registry	true	false	false
+package				tokio	1.52.3	registry	true	false	false
+package				toml	1.0.6+spec-1.1.0	registry	true	false	false
+package				tower	0.5.3	registry	true	false	false
+package				tracing-subscriber	0.3.22	registry	true	false	false
+package				uuid	1.22.0	registry	true	false	false
+edge	sentinel-bio	0.1.0	workspace	approx	0.5.1	registry	false	false	false
+edge	sentinel-bio	0.1.0	workspace	bolero	0.13.4	registry	false	false	false
+edge	sentinel-cluster-control	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-cluster-control	0.1.0	workspace	tokio	1.52.3	registry	false	false	false
+edge	sentinel-common	0.1.0	workspace	sha2	0.10.9	registry	false	false	false
+edge	sentinel-common	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-daemon	0.1.0	workspace	criterion	0.8.2	registry	false	false	false
+edge	sentinel-daemon	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-dashboard-backend	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-dashboard-backend	0.1.0	workspace	tokio	1.52.3	registry	false	false	false
+edge	sentinel-dashboard-backend	0.1.0	workspace	tower	0.5.3	registry	false	false	false
+edge	sentinel-ebpf	0.1.0	workspace	approx	0.5.1	registry	false	false	false
+edge	sentinel-ebpf	0.1.0	workspace	tracing-subscriber	0.3.22	registry	false	false	false
+edge	sentinel-ecs	0.1.0	workspace	criterion	0.8.2	registry	false	false	false
+edge	sentinel-ecs	0.1.0	workspace	insta	1.46.3	registry	false	false	false
+edge	sentinel-ecs	0.1.0	workspace	sentinel-common	0.1.0	workspace	false	false	false
+edge	sentinel-ecs	0.1.0	workspace	sentinel-telemetry	0.1.0	workspace	false	false	false
+edge	sentinel-ecs	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-ecs	0.1.0	workspace	toml	1.0.6+spec-1.1.0	registry	false	false	false
+edge	sentinel-fs	0.1.0	workspace	criterion	0.8.2	registry	false	false	false
+edge	sentinel-fs	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-gaia	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-gaia-loop	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-gaia-memory	0.1.0	workspace	criterion	0.8.2	registry	false	false	false
+edge	sentinel-gaia-memory	0.1.0	workspace	sentinel-limbo	0.1.0	workspace	false	false	false
+edge	sentinel-gaia-memory	0.1.0	workspace	sentinel-projection	0.1.0	workspace	false	false	false
+edge	sentinel-gaia-memory	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-hippocampus	0.1.0	workspace	approx	0.5.1	registry	false	false	false
+edge	sentinel-hippocampus	0.1.0	workspace	criterion	0.8.2	registry	false	false	false
+edge	sentinel-hippocampus	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-limbo	0.1.0	workspace	criterion	0.8.2	registry	false	false	false
+edge	sentinel-limbo	0.1.0	workspace	rusqlite	0.38.0	registry	false	false	false
+edge	sentinel-limbo	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-limbo	0.1.0	workspace	tokio	1.52.3	registry	false	false	false
+edge	sentinel-microvm	0.1.0	workspace	sentinel-common	0.1.0	workspace	false	false	false
+edge	sentinel-microvm	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-nightrun	0.1.0	workspace	approx	0.5.1	registry	false	false	false
+edge	sentinel-nightrun	0.1.0	workspace	criterion	0.8.2	registry	false	false	false
+edge	sentinel-nightrun	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-physics	0.1.0	workspace	approx	0.5.1	registry	false	false	false
+edge	sentinel-physics	0.1.0	workspace	bolero	0.13.4	registry	false	false	false
+edge	sentinel-physics	0.1.0	workspace	insta	1.46.3	registry	false	false	false
+edge	sentinel-projection	0.1.0	workspace	criterion	0.8.2	registry	false	false	false
+edge	sentinel-projection	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-redb	0.1.0	workspace	sha2	0.10.9	registry	false	false	false
+edge	sentinel-redb	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-redb	0.1.0	workspace	uuid	1.22.0	registry	false	false	false
+edge	sentinel-runtime	0.1.0	workspace	criterion	0.8.2	registry	false	false	false
+edge	sentinel-runtime	0.1.0	workspace	sentinel-common	0.1.0	workspace	false	false	false
+edge	sentinel-runtime	0.1.0	workspace	sentinel-limbo	0.1.0	workspace	false	false	false
+edge	sentinel-runtime	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-sandbox	0.1.0	workspace	criterion	0.8.2	registry	false	false	false
+edge	sentinel-sandbox	0.1.0	workspace	sentinel-common	0.1.0	workspace	false	false	false
+edge	sentinel-sandbox	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-telemetry	0.1.0	workspace	criterion	0.5.1	registry	false	false	false
+edge	sentinel-wasm	0.1.0	workspace	criterion	0.8.2	registry	false	false	false
+edge	sentinel-wasm	0.1.0	workspace	sentinel-common	0.1.0	workspace	false	false	false
+edge	sentinel-wasm	0.1.0	workspace	tempfile	3.27.0	registry	false	false	false
+edge	sentinel-zenoh	0.1.0	workspace	criterion	0.5.1	registry	false	false	false
+edge	sentinel-zenoh	0.1.0	workspace	sentinel-common	0.1.0	workspace	false	false	false
+edge	sentinel-zenoh	0.1.0	workspace	serde_json	1.0.149	registry	false	false	false
+edge	sentinel-zenoh	0.1.0	workspace	tokio	1.52.3	registry	false	false	false
+edge	sentinel-zenoh	0.1.0	workspace	tracing-subscriber	0.3.22	registry	false	false	false
+edge	sentinel-zenoh	0.1.0	workspace	uuid	1.22.0	registry	false	false	false
