@@ -44,13 +44,18 @@ are durable UUIDv7-based opaque strings, except the existing validated
 principal and tenant cannot be proven, so their stored responses are never
 replayed into a version 2 namespace.
 
-At daemon startup the server loads `web-project-v1` from
-`SENTINEL_WORK_PROFILE_FILE` or the checked-in default path. Its bytes must
-exactly match the copy embedded in the release binary. Profile ID, schema
-version, and SHA-256 digest are bound into the Proposal digest and copied
-unchanged into the Agreement and Project. Unknown IDs, altered bytes, stale
-digests, missing roles or specialties, missing immutable artifacts, missing
-quality gates, and insufficient topology fail closed.
+The workflow is deployment-safe and disabled by default.
+`SENTINEL_COMPANY_WORKFLOW_ENABLED=true` is the only value that enables it.
+When disabled, the daemon starts without loading workflow deployment files and
+all workflow endpoints return the typed `workflow_unavailable` response. When
+enabled, the server loads `web-project-v1` from
+`SENTINEL_WORK_PROFILE_FILE` or the checked-in default path and loads the
+server-owned principal registry. Profile bytes must exactly match the copy
+embedded in the release binary. Profile ID, schema version, and SHA-256 digest
+are bound into the Proposal digest and copied unchanged into the Agreement and
+Project. Unknown IDs, altered bytes, stale digests, missing principals, missing
+roles or specialties, missing immutable artifacts, missing quality gates, and
+insufficient topology fail closed before the workflow API becomes available.
 
 ## Legal transitions
 
@@ -96,7 +101,7 @@ positive budget, and the sum of item budgets is within the Agreement ceiling.
 | `ready` or `assigned` | authorized assignment policy passes | `assigned` |
 | `assigned` | current assignee claims with digest and future deadline | `claimed` |
 | `claimed` | idempotent execution port accepts durable invocation | `in_progress` |
-| `in_progress` | assignee requests completion and a sealed independent receipt proves the invocation, outputs, ownership, and declared gate | `done` |
+| `in_progress` | assignee requests completion and an opaque independent authority receipt proves the invocation, outputs, ownership, and declared gate | `done` |
 | non-terminal | authoritative blocker | `blocked` |
 | `blocked` | authorized blocker resolution | `ready` or `proposed` |
 
@@ -162,17 +167,40 @@ explicitly re-arms the same durable invocation with its original digest and a
 fresh three-attempt budget.
 
 Agents cannot submit output references or attest their own gates. The completion
-command only records their request. `CompletionEvidencePort` is a narrow sealed
-boundary for #694: its receipt must match the durable invocation, assignment,
-agent and input digest; every artifact must prove project/work/invocation
-ownership; and the canonical output-bundle digest must be covered by an
-independent QA or Release Manager gate receipt from the profile-declared runner.
-Only that verified receipt permits `in_progress -> done`.
+command only creates a durable, digest-bound evidence request in transaction 1.
+That request fixes its schema, request and operation digest, invocation, project
+and project version, work item and work-item version, assignment version,
+assignment authority generation and digest, agent, input digest, and replay
+domain. The writer transaction commits before `CompletionEvidencePort` is
+called.
+
+`CompletionEvidencePort` is the narrow authority boundary for #694. It returns
+an opaque result whose production representation and verification mechanism are
+owned by the adapter; the core exposes no public constructor, public hash
+recipe, or caller-submittable receipt. Transaction 2 re-reads the complete
+request, Project, Work Item, Assignment, and authoritative organization
+snapshots and compares every version and digest before committing completion.
+The receipt must bind the request digest, all aggregate and assignment versions,
+authority generations, validity interval, and replay domain. Every artifact
+must prove project/work/invocation ownership, and the canonical output-bundle
+digest must be covered by an independent QA or Release Manager gate receipt.
+The issuer must be an active Project participant in the current authoritative
+organization snapshot with the exact receipt-bound generation and digest.
+Forged roles, non-participants, revoked or stale authority, caller-computed
+hashes, and cross-assignment or cross-version replay fail closed.
+
+The evidence request is restart-recoverable between either transaction and the
+external authority call. Timeout and dependency failures retain the pending
+request for at most three attempts; exhaustion makes it durably terminal instead
+of busy-looping. A crash after receipt acquisition but before transaction 2
+causes an idempotent re-query of the authority and the same full CAS check.
+Duplicate completion commands cannot create another request or complete twice.
 
 ## Event store, projection, backup, and restore
 
-The workflow SQLite file is the authoritative event/aggregate/operation/outbox
-store. `workflow_entity_history` is append-only by entity type, ID, and version;
+The workflow SQLite file is the authoritative
+event/aggregate/operation/execution-outbox/completion-evidence-outbox store.
+`workflow_entity_history` is append-only by entity type, ID, and version;
 `workflow_entities` is the current-state index. Project projections are
 rebuildable read models. A durable projection checkpoint records the source
 event high watermark, projected high watermark, project count, and last rebuild
@@ -182,7 +210,8 @@ transaction. A backup is refused unless those watermarks agree.
 `WorkflowStore::backup_to` creates a transactionally consistent standalone
 SQLite image with `VACUUM INTO` and returns a manifest containing schema
 version, database SHA-256, event and entity-history watermarks, entity,
-operation, outbox, and project-projection counts, and the projection checkpoint.
+operation, execution-outbox, completion-evidence-outbox, and project-projection
+counts, and the projection checkpoint.
 The destination must not exist, and a failed creation or verification removes
 the incomplete destination. Restore is an offline operation into another
 non-existent path: it verifies the source image, manifest, SQLite integrity,
@@ -212,9 +241,12 @@ registry path is configured with `SENTINEL_WORKFLOW_PRINCIPALS_FILE`; each
 binding points to a credential environment variable and fixes one tenant,
 principal kind, role, and subject. No credential or credential digest is
 serialized into workflow state. A credential cannot cross customer, operator,
-or agent routes. All mutating routes return `503 dispatcher_not_ready` until
-both the production #694 dispatcher and authoritative organization adapter
-report ready; read-only authenticated recovery remains available.
+or agent routes. While the workflow is disabled, every workflow route returns
+typed `503 workflow_unavailable` and the rest of the daemon remains available.
+When enabled and provisioned, mutating routes return typed
+`503 dispatcher_not_ready` until the production #694 dispatcher, authoritative
+organization adapter, and completion evidence authority all report ready;
+read-only authenticated recovery remains available.
 
 ## Verification and deferred boundaries
 
@@ -222,13 +254,15 @@ The dependency-independent tests cover schema serialization through durable
 round trips, legal and illegal transitions, stale versions and digests,
 proposal expiry, duplicate operations, transaction rollback, DAG cycles,
 capability/hierarchy policy, organization-generation TOCTOU rejection,
-authority-conflict recovery without queue poisoning, sealed completion receipts,
-forged artifact ownership and self-attested gate rejection, collaboration
-records, provider and project ceilings, outbox restart, bounded retry, crash-
-atomic schema migration from every destructive-DDL failpoint, event ordering,
-projection recovery, verified backup/restore, principal-scoped idempotency,
-cross-project and cross-tenant decision denial, authority spoofing, and
-chat-only rejection.
+authority-conflict recovery without queue poisoning, two-transaction completion
+evidence recovery, opaque authority receipts, forged roles and artifact
+ownership, non-participant and revoked-issuer rejection, self-attested gate and
+public-hash rejection, assignment/version/replay-domain isolation, collaboration
+records, provider and project ceilings, outbox restart, bounded timeout and
+retry, crash-atomic schema migration from every destructive-DDL failpoint, event
+ordering, projection recovery, verified backup/restore, principal-scoped
+idempotency, cross-project and cross-tenant decision denial, authority spoofing,
+disabled and fully provisioned daemon startup, and chat-only rejection.
 
 AC-6 is only partially satisfied: claim, durable reservation, deterministic
 port dispatch, completion evidence, and tick-independent state transitions are

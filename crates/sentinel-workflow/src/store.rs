@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CommandOutcome, PendingExecution, ProjectId, ProjectProjection, WorkflowError, WorkflowEvent,
-    WorkflowResponse,
+    CommandOutcome, PendingCompletionEvidence, PendingExecution, ProjectId, ProjectProjection,
+    WorkflowError, WorkflowEvent, WorkflowResponse,
 };
 
 const SCHEMA: &str = r#"
@@ -83,6 +83,24 @@ CREATE TABLE IF NOT EXISTS workflow_execution_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_workflow_execution_outbox_work
     ON workflow_execution_outbox(project_id, work_item_id, state);
+CREATE TABLE IF NOT EXISTS workflow_completion_outbox (
+    request_id TEXT PRIMARY KEY,
+    invocation_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    assignment_version INTEGER NOT NULL,
+    request_digest TEXT NOT NULL,
+    request BLOB NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed')),
+    authority_receipt_id TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    UNIQUE (invocation_id, assignment_version)
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_completion_outbox_pending
+    ON workflow_completion_outbox(state, created_at_ms, request_id);
 CREATE TABLE IF NOT EXISTS workflow_projection_checkpoint (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     source_event_high_watermark INTEGER NOT NULL,
@@ -197,6 +215,7 @@ pub struct WorkflowBackupManifest {
     pub entity_count: u64,
     pub operation_count: u64,
     pub execution_outbox_count: u64,
+    pub completion_outbox_count: u64,
     pub project_projection_count: u64,
     pub projection_checkpoint: ProjectionCheckpoint,
 }
@@ -586,6 +605,53 @@ impl WorkflowStore {
         }
         Ok(pending)
     }
+
+    pub fn pending_completion_evidence(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PendingCompletionEvidence>, WorkflowError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| WorkflowError::persistence())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT request FROM workflow_completion_outbox
+                 WHERE state = 'pending'
+                 ORDER BY created_at_ms, request_id LIMIT ?1",
+            )
+            .map_err(|_| WorkflowError::persistence())?;
+        let rows = statement
+            .query_map([limit.clamp(1, 100) as i64], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|_| WorkflowError::persistence())?;
+        let mut pending = Vec::new();
+        for row in rows {
+            pending.push(serde_json::from_slice(
+                &row.map_err(|_| WorkflowError::persistence())?,
+            )?);
+        }
+        Ok(pending)
+    }
+
+    pub fn completion_evidence_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<(PendingCompletionEvidence, String)>, WorkflowError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| WorkflowError::persistence())?;
+        let row: Option<(Vec<u8>, String)> = connection
+            .query_row(
+                "SELECT request, state FROM workflow_completion_outbox WHERE request_id = ?1",
+                [request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| WorkflowError::persistence())?;
+        row.map(|(payload, state)| Ok((serde_json::from_slice(&payload)?, state)))
+            .transpose()
+    }
 }
 
 pub(crate) struct WorkflowTransaction<'a> {
@@ -944,6 +1010,144 @@ impl WorkflowTransaction<'_> {
         }
         Ok(())
     }
+
+    pub(crate) fn enqueue_completion_evidence(
+        &self,
+        request: &PendingCompletionEvidence,
+    ) -> Result<bool, WorkflowError> {
+        let payload = serde_json::to_vec(request)?;
+        let now_ms = sql_integer(request.created_at_ms)?;
+        let existing: Option<String> = self
+            .transaction
+            .query_row(
+                "SELECT request_digest FROM workflow_completion_outbox
+                 WHERE request_id = ?1 OR (invocation_id = ?2 AND assignment_version = ?3)",
+                params![
+                    request.query.request_id,
+                    request.query.invocation_id,
+                    sql_integer(request.query.assignment_version)?
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| WorkflowError::persistence())?;
+        if let Some(existing_digest) = existing {
+            if existing_digest != request.query.request_digest {
+                return Err(WorkflowError::new(
+                    crate::WorkflowErrorCode::DigestConflict,
+                    false,
+                    "completion evidence request conflicts with a durable assignment request",
+                ));
+            }
+            return Ok(false);
+        }
+        self.transaction
+            .execute(
+                "INSERT INTO workflow_completion_outbox
+                 (request_id, invocation_id, project_id, work_item_id, assignment_version,
+                  request_digest, request, state, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?8)",
+                params![
+                    request.query.request_id,
+                    request.query.invocation_id,
+                    request.query.project_id.0,
+                    request.query.work_item_id.0,
+                    sql_integer(request.query.assignment_version)?,
+                    request.query.request_digest,
+                    payload,
+                    now_ms
+                ],
+            )
+            .map_err(|_| WorkflowError::persistence())?;
+        Ok(true)
+    }
+
+    pub(crate) fn completion_request_state(
+        &self,
+        request_id: &str,
+    ) -> Result<String, WorkflowError> {
+        self.transaction
+            .query_row(
+                "SELECT state FROM workflow_completion_outbox WHERE request_id = ?1",
+                [request_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| WorkflowError::persistence())?
+            .ok_or_else(|| {
+                WorkflowError::new(
+                    crate::WorkflowErrorCode::NotFound,
+                    false,
+                    "completion evidence request not found",
+                )
+            })
+    }
+
+    pub(crate) fn mark_completion_attempt_failed(
+        &self,
+        request_id: &str,
+        error: &str,
+        now_ms: u64,
+        terminal: bool,
+    ) -> Result<(), WorkflowError> {
+        let attempts: i64 = self
+            .transaction
+            .query_row(
+                "SELECT attempts FROM workflow_completion_outbox
+                 WHERE request_id = ?1 AND state = 'pending'",
+                [request_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| WorkflowError::persistence())?
+            .ok_or_else(|| {
+                WorkflowError::new(
+                    crate::WorkflowErrorCode::InvalidTransition,
+                    false,
+                    "completion evidence request is not pending",
+                )
+            })?;
+        let state = if terminal || attempts >= 2 {
+            "failed"
+        } else {
+            "pending"
+        };
+        self.transaction
+            .execute(
+                "UPDATE workflow_completion_outbox
+                 SET state = ?1, attempts = attempts + 1, last_error = ?2, updated_at_ms = ?3
+                 WHERE request_id = ?4 AND state = 'pending'",
+                params![state, error, sql_integer(now_ms)?, request_id],
+            )
+            .map_err(|_| WorkflowError::persistence())?;
+        Ok(())
+    }
+
+    pub(crate) fn mark_completion_completed(
+        &self,
+        request_id: &str,
+        authority_receipt_id: &str,
+        now_ms: u64,
+    ) -> Result<(), WorkflowError> {
+        let changed = self
+            .transaction
+            .execute(
+                "UPDATE workflow_completion_outbox
+                 SET state = 'completed', authority_receipt_id = ?1, attempts = attempts + 1,
+                     last_error = NULL, updated_at_ms = ?2
+                 WHERE request_id = ?3 AND state = 'pending'",
+                params![authority_receipt_id, sql_integer(now_ms)?, request_id],
+            )
+            .map_err(|_| WorkflowError::persistence())?;
+        if changed != 1 {
+            return Err(WorkflowError::new(
+                crate::WorkflowErrorCode::InvalidTransition,
+                false,
+                "completion evidence request is no longer pending",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn migrate_v1_to_v2(
@@ -1046,6 +1250,7 @@ fn inspect_backup(path: &Path) -> Result<WorkflowBackupManifest, WorkflowError> 
         .map_err(|_| WorkflowError::persistence())?
         .max(0) as u64;
     let execution_outbox_count = table_count(&connection, "workflow_execution_outbox")?;
+    let completion_outbox_count = table_count(&connection, "workflow_completion_outbox")?;
     let project_projection_count = table_count(&connection, "workflow_project_projections")?;
     let current_entities_without_history: i64 = connection
         .query_row(
@@ -1087,6 +1292,7 @@ fn inspect_backup(path: &Path) -> Result<WorkflowBackupManifest, WorkflowError> 
         entity_count,
         operation_count,
         execution_outbox_count,
+        completion_outbox_count,
         project_projection_count,
         projection_checkpoint,
     })
@@ -1096,6 +1302,7 @@ fn table_count(connection: &Connection, table: &str) -> Result<u64, WorkflowErro
     let sql = match table {
         "workflow_entities" => "SELECT COUNT(*) FROM workflow_entities",
         "workflow_execution_outbox" => "SELECT COUNT(*) FROM workflow_execution_outbox",
+        "workflow_completion_outbox" => "SELECT COUNT(*) FROM workflow_completion_outbox",
         "workflow_project_projections" => "SELECT COUNT(*) FROM workflow_project_projections",
         _ => return Err(WorkflowError::persistence()),
     };
@@ -1331,6 +1538,7 @@ mod tests {
         assert_eq!(manifest.entity_count, 1);
         assert_eq!(manifest.operation_count, 1);
         assert_eq!(manifest.execution_outbox_count, 0);
+        assert_eq!(manifest.completion_outbox_count, 0);
         assert_eq!(manifest.project_projection_count, 0);
 
         let rejected_backup = directory.path().join("workflow-stale-projection.db");

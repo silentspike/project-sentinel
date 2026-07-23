@@ -40,6 +40,30 @@ fn work_profile_path() -> PathBuf {
     }
 }
 
+fn workflow_enabled() -> Result<bool, WorkflowError> {
+    match std::env::var("SENTINEL_COMPANY_WORKFLOW_ENABLED") {
+        Err(std::env::VarError::NotPresent) => parse_workflow_enabled(None),
+        Ok(value) => parse_workflow_enabled(Some(&value)),
+        _ => Err(WorkflowError::new(
+            WorkflowErrorCode::PersistenceFailure,
+            false,
+            "company workflow enablement flag is invalid",
+        )),
+    }
+}
+
+fn parse_workflow_enabled(value: Option<&str>) -> Result<bool, WorkflowError> {
+    match value.map(str::trim) {
+        None | Some("0" | "false" | "FALSE") => Ok(false),
+        Some("1" | "true" | "TRUE") => Ok(true),
+        Some(_) => Err(WorkflowError::new(
+            WorkflowErrorCode::PersistenceFailure,
+            false,
+            "company workflow enablement flag is invalid",
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommandEnvelope {
@@ -129,6 +153,7 @@ pub struct WorkflowHttpResponse {
 pub struct WorkflowApi {
     engine: Arc<WorkflowEngine>,
     principals: Arc<PrincipalAuthenticator>,
+    enabled: bool,
 }
 
 impl std::fmt::Debug for WorkflowApi {
@@ -144,8 +169,38 @@ impl WorkflowApi {
         path: impl AsRef<Path>,
         principal_bindings_file: Option<PathBuf>,
     ) -> Result<Self, WorkflowError> {
-        let profile_path = work_profile_path();
-        let profile = Arc::new(CanonicalWorkProfile::load_verified(profile_path)?);
+        Self::open_configured(
+            path,
+            workflow_enabled()?,
+            Some(work_profile_path()),
+            principal_bindings_file,
+        )
+    }
+
+    fn open_configured(
+        path: impl AsRef<Path>,
+        enabled: bool,
+        profile_file: Option<PathBuf>,
+        principal_bindings_file: Option<PathBuf>,
+    ) -> Result<Self, WorkflowError> {
+        if !enabled {
+            let store = Arc::new(WorkflowStore::open(":memory:")?);
+            return Ok(Self {
+                engine: Arc::new(WorkflowEngine::with_ports(
+                    store,
+                    Arc::new(UnavailableExecutionPort),
+                    Arc::new(UnavailableOrganizationRuntimePort),
+                    Arc::new(UnavailableCompletionEvidencePort),
+                    Arc::new(CanonicalWorkProfile::embedded()?),
+                )),
+                principals: Arc::new(PrincipalAuthenticator::default()),
+                enabled: false,
+            });
+        }
+        let profile_file = profile_file.ok_or_else(auth_configuration_error)?;
+        let principal_bindings_file =
+            principal_bindings_file.ok_or_else(auth_configuration_error)?;
+        let profile = Arc::new(CanonicalWorkProfile::load_verified(profile_file)?);
         let store = Arc::new(WorkflowStore::open(path)?);
         Ok(Self {
             engine: Arc::new(WorkflowEngine::with_ports(
@@ -155,7 +210,10 @@ impl WorkflowApi {
                 Arc::new(UnavailableCompletionEvidencePort),
                 profile,
             )),
-            principals: Arc::new(PrincipalAuthenticator::from_file(principal_bindings_file)?),
+            principals: Arc::new(PrincipalAuthenticator::from_file(Some(
+                principal_bindings_file,
+            ))?),
+            enabled: true,
         })
     }
 
@@ -177,6 +235,7 @@ impl WorkflowApi {
                 Arc::new(CanonicalWorkProfile::embedded()?),
             )),
             principals: Arc::new(principals),
+            enabled: true,
         })
     }
 
@@ -188,6 +247,14 @@ impl WorkflowApi {
         body: &[u8],
     ) -> Option<WorkflowHttpResponse> {
         let path_only = path.split('?').next().unwrap_or(path);
+        if !self.enabled && is_workflow_path(path_only) {
+            return Some(json_error(
+                503,
+                "workflow_unavailable",
+                "company workflow is disabled or not provisioned",
+                true,
+            ));
+        }
         match (method, path_only) {
             ("POST", CUSTOMER_COMMAND_PATH) => Some(self.handle_customer_command(headers, body)),
             ("GET", CUSTOMER_REQUEST_PATH) => Some(self.handle_customer_request(headers, path)),
@@ -528,9 +595,9 @@ fn json<T: Serialize>(status: u16, payload: &T) -> WorkflowHttpResponse {
 mod tests {
     use super::*;
     use sentinel_workflow::{
-        AgentId, CompletionEvidencePort, CompletionReceiptQuery, ExecutionReceipt,
-        OrganizationAgentSnapshot, OrganizationRuntimePort, SealedCompletionReceipt,
-        WorkExecutionError, WorkExecutionPort,
+        AgentId, CompletionAuthorityReceipt, CompletionEvidencePort, CompletionReceiptQuery,
+        ExecutionReceipt, OrganizationAgentSnapshot, OrganizationRuntimePort, WorkExecutionError,
+        WorkExecutionPort,
     };
     use serde_json::json;
 
@@ -538,6 +605,32 @@ mod tests {
     const CUSTOMER_B_TOKEN: &str = "customer-b-token-that-is-long-enough";
     const OPERATOR_TOKEN: &str = "operator-token-that-is-long-enough-1";
     const AGENT_TOKEN: &str = "agent-token-that-is-long-enough-0001";
+
+    fn canonical_profile_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/work-profiles/web-project-v1.toml")
+    }
+
+    fn principal_file(directory: &Path, env_name: &str) -> PathBuf {
+        let path = directory.join("principals.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "bindings": [{
+                    "credential_env": env_name,
+                    "principal": {
+                        "principal_id": "startup-customer",
+                        "tenant_id": "startup-tenant",
+                        "kind": "customer",
+                        "role": "customer",
+                        "customer_id": "startup-customer-id"
+                    }
+                }]
+            }))
+            .expect("principal JSON"),
+        )
+        .expect("write principals");
+        path
+    }
 
     #[derive(Debug)]
     struct ReadyExecution;
@@ -585,7 +678,7 @@ mod tests {
         fn completion_receipt(
             &self,
             _query: &CompletionReceiptQuery,
-        ) -> Result<SealedCompletionReceipt, WorkExecutionError> {
+        ) -> Result<Box<dyn CompletionAuthorityReceipt>, WorkExecutionError> {
             Err(WorkExecutionError::Unavailable)
         }
     }
@@ -650,6 +743,89 @@ mod tests {
             Arc::new(ReadyCompletion),
         )
         .expect("API")
+    }
+
+    #[test]
+    fn workflow_is_default_off_and_unprovisioned_start_is_non_fatal() {
+        assert!(!parse_workflow_enabled(None).expect("absent flag is disabled"));
+        assert!(!parse_workflow_enabled(Some("false")).expect("explicit false is disabled"));
+        assert!(parse_workflow_enabled(Some("true")).expect("explicit true is enabled"));
+        assert!(parse_workflow_enabled(Some("enabled")).is_err());
+
+        let api = WorkflowApi::open_configured(
+            "/definitely/not/created/workflow.sqlite",
+            false,
+            Some("/missing/profile.toml".into()),
+            Some("/missing/principals.json".into()),
+        )
+        .expect("disabled workflow must not touch provisioning");
+        let response = api
+            .handle("GET", OPERATOR_PROJECT_PATH, &HashMap::new(), &[])
+            .expect("typed workflow response");
+        assert_eq!(response.status, 503);
+        let value: serde_json::Value = serde_json::from_slice(&response.body).expect("JSON");
+        assert_eq!(value["code"], "workflow_unavailable");
+    }
+
+    #[test]
+    fn enabled_start_fails_closed_for_missing_or_modified_profile_and_principals() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let missing_profile = WorkflowApi::open_configured(
+            directory.path().join("missing-profile.db"),
+            true,
+            Some(directory.path().join("missing-profile.toml")),
+            Some(directory.path().join("principals.json")),
+        )
+        .expect_err("enabled workflow requires deployed canonical profile");
+        assert!(matches!(
+            missing_profile.code,
+            WorkflowErrorCode::PersistenceFailure | WorkflowErrorCode::DigestConflict
+        ));
+
+        let mut modified = std::fs::read(canonical_profile_path()).expect("canonical profile");
+        modified.extend_from_slice(b"\n# modified\n");
+        let modified_path = directory.path().join("modified-profile.toml");
+        std::fs::write(&modified_path, modified).expect("modified profile");
+        let digest_conflict = WorkflowApi::open_configured(
+            directory.path().join("modified-profile.db"),
+            true,
+            Some(modified_path),
+            Some(directory.path().join("principals.json")),
+        )
+        .expect_err("modified canonical profile must fail closed");
+        assert_eq!(digest_conflict.code, WorkflowErrorCode::DigestConflict);
+
+        let missing_principals = WorkflowApi::open_configured(
+            directory.path().join("missing-principals.db"),
+            true,
+            Some(canonical_profile_path()),
+            None,
+        )
+        .expect_err("enabled workflow requires principal binding configuration");
+        assert_eq!(
+            missing_principals.code,
+            WorkflowErrorCode::PersistenceFailure
+        );
+    }
+
+    #[test]
+    fn fully_provisioned_enabled_start_loads_external_ssot() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let env_name = "SENTINEL_TEST_WORKFLOW_STARTUP_TOKEN";
+        std::env::set_var(env_name, CUSTOMER_A_TOKEN);
+        let principals = principal_file(directory.path(), env_name);
+        let result = WorkflowApi::open_configured(
+            directory.path().join("workflow.db"),
+            true,
+            Some(canonical_profile_path()),
+            Some(principals),
+        );
+        std::env::remove_var(env_name);
+        let api = result.expect("fully provisioned workflow starts");
+        assert!(api.enabled);
+        assert!(api.principals.configured());
     }
 
     fn headers(token: &str) -> HashMap<String, String> {
@@ -781,6 +957,28 @@ mod tests {
                 "output_refs": {"source_tree": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
                 "gate_passed": true,
                 "gate_id": "browser_smoke"
+            }
+        }))
+        .expect("JSON");
+        let response = api
+            .handle("POST", AGENT_COMMAND_PATH, &headers(AGENT_TOKEN), &body)
+            .expect("workflow response");
+        assert_eq!(response.status, 400);
+        let value: serde_json::Value = serde_json::from_slice(&response.body).expect("JSON");
+        assert_eq!(value["code"], "invalid_input");
+    }
+
+    #[test]
+    fn agent_api_rejects_a_caller_computed_completion_seal() {
+        let api = api(true);
+        let body = serde_json::to_vec(&json!({
+            "operation_id": "forged-completion-seal",
+            "command": {
+                "command": "request_work_completion",
+                "work_item_id": "work-forged",
+                "expected_version": 4,
+                "assignment_version": 1,
+                "receipt_seal": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             }
         }))
         .expect("JSON");

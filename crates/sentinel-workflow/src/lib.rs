@@ -16,11 +16,11 @@ pub use engine::{Clock, SystemClock, WorkflowEngine};
 pub use error::{WorkflowError, WorkflowErrorCode};
 pub use model::*;
 pub use port::{
-    ArtifactReceipt, CompletionEvidencePort, CompletionReceiptQuery, DependencyReadiness,
-    ExecutionReceipt, GateReceipt, OrganizationAgentSnapshot, OrganizationRuntimePort,
-    PendingExecution, SealedCompletionReceipt, UnavailableCompletionEvidencePort,
-    UnavailableExecutionPort, UnavailableOrganizationRuntimePort, WorkExecutionError,
-    WorkExecutionPort,
+    ArtifactReceipt, CompletionAuthorityReceipt, CompletionEvidencePort, CompletionReceiptQuery,
+    DependencyReadiness, ExecutionReceipt, GateReceipt, OrganizationAgentSnapshot,
+    OrganizationRuntimePort, PendingCompletionEvidence, PendingExecution,
+    UnavailableCompletionEvidencePort, UnavailableExecutionPort,
+    UnavailableOrganizationRuntimePort, WorkExecutionError, WorkExecutionPort,
 };
 pub use profile::CanonicalWorkProfile;
 pub use store::{ProjectionCheckpoint, WorkflowBackupManifest, WorkflowStore};

@@ -138,9 +138,19 @@ impl WorkflowEngine {
         let operation_namespace = actor.idempotency_namespace();
         let now_ms = self.clock.now_ms();
         let organization_port = Arc::clone(&self.organization_port);
-        let completion_port = Arc::clone(&self.completion_port);
         let profile = Arc::clone(&self.profile);
-        self.store.execute(
+        let completion_request_id = match &command {
+            WorkflowCommand::RequestWorkCompletion {
+                work_item_id,
+                assignment_version,
+                ..
+            } => Some(format!(
+                "completion-work-exec-{}-v{}",
+                work_item_id.0, assignment_version
+            )),
+            _ => None,
+        };
+        let mut outcome = self.store.execute(
             &operation_namespace,
             operation_id,
             &operation_digest,
@@ -149,7 +159,6 @@ impl WorkflowEngine {
                 apply_command(
                     tx,
                     organization_port.as_ref(),
-                    completion_port.as_ref(),
                     profile.as_ref(),
                     &actor,
                     operation_id,
@@ -158,7 +167,22 @@ impl WorkflowEngine {
                     now_ms,
                 )
             },
-        )
+        )?;
+        if let Some(request_id) = completion_request_id {
+            self.dispatch_completion_request(&request_id)?;
+            if let WorkflowResponse::WorkItem(item) = &outcome.response {
+                outcome.response = WorkflowResponse::WorkItem(
+                    self.work_item(&item.spec.id)?.ok_or_else(|| {
+                        WorkflowError::new(
+                            WorkflowErrorCode::NotFound,
+                            false,
+                            "completed work item disappeared after evidence commit",
+                        )
+                    })?,
+                );
+            }
+        }
+        Ok(outcome)
     }
 
     pub fn mutation_readiness(&self) -> DependencyReadiness {
@@ -262,6 +286,144 @@ impl WorkflowEngine {
             receipts.push(receipt);
         }
         Ok(receipts)
+    }
+
+    /// Resolves durable completion requests without holding the SQLite writer
+    /// transaction across the external evidence-authority call.
+    pub fn dispatch_pending_completion_evidence(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<String>, WorkflowError> {
+        let pending = self.store.pending_completion_evidence(limit)?;
+        let mut completed = Vec::new();
+        let mut first_error = None;
+        for request in pending {
+            match self.resolve_completion_evidence(&request) {
+                Ok(()) => completed.push(request.query.request_id.clone()),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(completed)
+        }
+    }
+
+    fn dispatch_completion_request(&self, request_id: &str) -> Result<(), WorkflowError> {
+        let Some((request, state)) = self.store.completion_evidence_request(request_id)? else {
+            return Err(WorkflowError::new(
+                WorkflowErrorCode::NotFound,
+                false,
+                "completion evidence request not found",
+            ));
+        };
+        match state.as_str() {
+            "pending" => self.resolve_completion_evidence(&request),
+            "completed" => Ok(()),
+            "failed" => Err(WorkflowError::new(
+                WorkflowErrorCode::DigestConflict,
+                false,
+                "completion evidence request is terminally failed",
+            )),
+            _ => Err(WorkflowError::new(
+                WorkflowErrorCode::InvalidTransition,
+                false,
+                "completion evidence request is not dispatchable",
+            )),
+        }
+    }
+
+    fn resolve_completion_evidence(
+        &self,
+        request: &PendingCompletionEvidence,
+    ) -> Result<(), WorkflowError> {
+        let receipt = match self.completion_port.completion_receipt(&request.query) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let now_ms = self.clock.now_ms();
+                self.store.write(|tx| {
+                    tx.mark_completion_attempt_failed(
+                        &request.query.request_id,
+                        match error {
+                            WorkExecutionError::TimedOut => "evidence_authority_timeout",
+                            _ => "evidence_authority_unavailable",
+                        },
+                        now_ms,
+                        false,
+                    )
+                })?;
+                return Err(WorkflowError::new(
+                    WorkflowErrorCode::ExecutionUnavailable,
+                    true,
+                    "completion evidence authority is unavailable",
+                ));
+            }
+        };
+
+        let snapshots = (|| {
+            let issuer_snapshot = self
+                .organization_port
+                .agent_snapshot(receipt.issuer())
+                .map_err(|_| {
+                    invalid_completion_receipt("completion issuer is not authoritative")
+                })?;
+            issuer_snapshot
+                .verify()
+                .map_err(|_| invalid_completion_receipt("completion issuer snapshot is invalid"))?;
+            let assignee_snapshot = self
+                .organization_port
+                .agent_snapshot(request.query.agent_id)
+                .map_err(|_| invalid_completion_receipt("assignment authority is unavailable"))?;
+            assignee_snapshot.verify().map_err(|_| {
+                invalid_completion_receipt("assignment authority snapshot is invalid")
+            })?;
+            Ok::<_, WorkflowError>((issuer_snapshot, assignee_snapshot))
+        })();
+        let (issuer_snapshot, assignee_snapshot) = match snapshots {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
+                let now_ms = self.clock.now_ms();
+                self.store.write(|tx| {
+                    tx.mark_completion_attempt_failed(
+                        &request.query.request_id,
+                        "completion_authority_rejected",
+                        now_ms,
+                        true,
+                    )
+                })?;
+                return Err(error);
+            }
+        };
+
+        let now_ms = self.clock.now_ms();
+        let result = self.store.write(|tx| {
+            finalize_work_completion(
+                tx,
+                self.profile.as_ref(),
+                request,
+                receipt.as_ref(),
+                &issuer_snapshot,
+                &assignee_snapshot,
+                now_ms,
+            )
+        });
+        if let Err(error) = result {
+            let _ = self.store.write(|tx| {
+                tx.mark_completion_attempt_failed(
+                    &request.query.request_id,
+                    "completion_receipt_rejected",
+                    now_ms,
+                    true,
+                )
+            });
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn record_authority_conflict(
@@ -505,7 +667,6 @@ impl WorkflowEngine {
 fn apply_command(
     tx: &WorkflowTransaction<'_>,
     organization_port: &dyn OrganizationRuntimePort,
-    completion_port: &dyn CompletionEvidencePort,
     profile: &CanonicalWorkProfile,
     actor: &AuthenticatedActor,
     operation_id: &str,
@@ -1067,10 +1228,8 @@ fn apply_command(
             work_item_id,
             expected_version,
             assignment_version,
-        } => complete_work(
+        } => request_work_completion(
             tx,
-            completion_port,
-            profile,
             actor,
             operation_id,
             operation_digest,
@@ -1573,10 +1732,8 @@ fn claim_work(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn complete_work(
+fn request_work_completion(
     tx: &WorkflowTransaction<'_>,
-    completion_port: &dyn CompletionEvidencePort,
-    profile: &CanonicalWorkProfile,
     actor: &AuthenticatedActor,
     operation_id: &str,
     operation_digest: &str,
@@ -1585,7 +1742,7 @@ fn complete_work(
     assignment_version: u64,
     now_ms: u64,
 ) -> Result<WorkflowResponse, WorkflowError> {
-    let mut item: WorkItem = required_entity(tx, ENTITY_WORK_ITEM, &work_item_id.0, "work item")?;
+    let item: WorkItem = required_entity(tx, ENTITY_WORK_ITEM, &work_item_id.0, "work item")?;
     require_version(item.version, expected_version)?;
     if actor.agent_id != item.assignee || actor.role != item.spec.required_role {
         return unauthorized("only the current assignee may request work completion");
@@ -1593,7 +1750,7 @@ fn complete_work(
     if item.state != WorkItemState::InProgress {
         return invalid_transition("work item has no accepted execution in progress");
     }
-    let mut project: Project = required_entity(tx, ENTITY_PROJECT, &item.project_id.0, "project")?;
+    let project: Project = required_entity(tx, ENTITY_PROJECT, &item.project_id.0, "project")?;
     authorize_project_actor(actor, &project)?;
     if item.assignment_version != assignment_version {
         return Err(WorkflowError::new(
@@ -1607,43 +1764,175 @@ fn complete_work(
     if outbox_state != "dispatched" {
         return invalid_transition("completion requires a dispatched execution reservation");
     }
-    let query = CompletionReceiptQuery {
+    let assignment = tx
+        .entities::<Assignment>(ENTITY_ASSIGNMENT)?
+        .into_iter()
+        .find(|assignment| {
+            assignment.project_id == project.id
+                && assignment.work_item_id == item.spec.id
+                && assignment.assignment_version == assignment_version
+                && assignment.active
+        })
+        .ok_or_else(|| {
+            WorkflowError::new(
+                WorkflowErrorCode::InvalidTransition,
+                false,
+                "completion requires the active durable assignment",
+            )
+        })?;
+    let request_id = format!("completion-{invocation_id}");
+    let replay_domain = format!(
+        "workflow-completion-v1:{}:{}:{}:{}",
+        project.id.0, item.spec.id.0, assignment_version, assignment.organization_generation
+    );
+    let mut query = CompletionReceiptQuery {
+        schema_version: WORKFLOW_SCHEMA_VERSION,
+        request_id,
+        request_digest: String::new(),
         invocation_id: invocation_id.clone(),
         project_id: project.id.clone(),
+        project_version: project.version,
         work_item_id: item.spec.id.clone(),
+        work_item_version: item.version,
         assignment_version,
         agent_id: item.assignee.expect("assignee checked above"),
+        assignment_authority_generation: assignment.organization_generation,
+        assignment_authority_digest: assignment.organization_digest.clone(),
         input_digest: request.input_digest.clone(),
+        replay_domain,
     };
-    let receipt = completion_port.completion_receipt(&query).map_err(|_| {
-        WorkflowError::new(
-            WorkflowErrorCode::ExecutionUnavailable,
-            true,
-            "sealed completion evidence is unavailable",
-        )
-    })?;
-    receipt.verify().map_err(|_| {
-        WorkflowError::new(
-            WorkflowErrorCode::DigestConflict,
-            false,
-            "completion receipt seal is invalid",
-        )
-    })?;
-    if receipt.invocation_id != query.invocation_id
-        || receipt.project_id != query.project_id
-        || receipt.work_item_id != query.work_item_id
-        || receipt.assignment_version != query.assignment_version
-        || receipt.agent_id != query.agent_id
-        || receipt.input_digest != query.input_digest
+    query.request_digest = completion_request_digest(&query)?;
+    let pending = PendingCompletionEvidence {
+        query: query.clone(),
+        requested_by: actor.principal_id.clone(),
+        requested_role: actor.role,
+        tenant_id: actor.tenant_id.clone(),
+        operation_id: operation_id.to_owned(),
+        operation_digest: operation_digest.to_owned(),
+        created_at_ms: now_ms,
+    };
+    if tx.enqueue_completion_evidence(&pending)? {
+        let sequence = append_event(
+            tx,
+            WorkflowEventType::WorkCompletionRequested,
+            "work_item",
+            &item.spec.id.0,
+            actor,
+            operation_id,
+            operation_digest,
+            Some("in_progress"),
+            Some("in_progress"),
+            "the assigned agent requested authoritative completion evidence",
+            &query,
+            now_ms,
+        )?;
+        refresh_project_projection(tx, &item.project_id, sequence, now_ms)?;
+    }
+    Ok(WorkflowResponse::WorkItem(item))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_work_completion(
+    tx: &WorkflowTransaction<'_>,
+    profile: &CanonicalWorkProfile,
+    request: &PendingCompletionEvidence,
+    receipt: &dyn CompletionAuthorityReceipt,
+    issuer_snapshot: &OrganizationAgentSnapshot,
+    assignee_snapshot: &OrganizationAgentSnapshot,
+    now_ms: u64,
+) -> Result<WorkflowResponse, WorkflowError> {
+    let query = &request.query;
+    if tx.completion_request_state(&query.request_id)? != "pending" {
+        return invalid_transition("completion evidence request is no longer pending");
+    }
+    if query.request_digest != completion_request_digest(query)? {
+        return Err(invalid_completion_receipt(
+            "durable completion request digest is invalid",
+        ));
+    }
+    let mut item: WorkItem =
+        required_entity(tx, ENTITY_WORK_ITEM, &query.work_item_id.0, "work item")?;
+    let mut project: Project = required_entity(tx, ENTITY_PROJECT, &query.project_id.0, "project")?;
+    if item.project_id != project.id
+        || item.version != query.work_item_version
+        || project.version != query.project_version
+        || item.state != WorkItemState::InProgress
+        || item.assignee != Some(query.agent_id)
+        || item.assignment_version != query.assignment_version
     {
         return Err(WorkflowError::new(
-            WorkflowErrorCode::DigestConflict,
+            WorkflowErrorCode::VersionConflict,
             false,
-            "completion receipt does not match the durable invocation and assignment",
+            "project or work item changed while completion evidence was resolved",
+        ));
+    }
+    let assignment = tx
+        .entities::<Assignment>(ENTITY_ASSIGNMENT)?
+        .into_iter()
+        .find(|assignment| {
+            assignment.project_id == query.project_id
+                && assignment.work_item_id == query.work_item_id
+                && assignment.assignment_version == query.assignment_version
+                && assignment.active
+        })
+        .ok_or_else(|| invalid_completion_receipt("active completion assignment is missing"))?;
+    if assignment.assignee != query.agent_id
+        || assignment.organization_generation != query.assignment_authority_generation
+        || assignment.organization_digest != query.assignment_authority_digest
+        || assignee_snapshot.generation != query.assignment_authority_generation
+        || assignee_snapshot.digest != query.assignment_authority_digest
+        || !assignee_snapshot.profile.active
+        || assignee_snapshot.profile.agent_id != query.agent_id
+    {
+        return Err(invalid_completion_receipt(
+            "assignment authority changed before completion",
+        ));
+    }
+    if receipt.schema_version() != WORKFLOW_SCHEMA_VERSION
+        || receipt.request_digest() != query.request_digest
+        || receipt.invocation_id() != query.invocation_id
+        || receipt.project_id() != &query.project_id
+        || receipt.project_version() != query.project_version
+        || receipt.work_item_id() != &query.work_item_id
+        || receipt.work_item_version() != query.work_item_version
+        || receipt.assignment_version() != query.assignment_version
+        || receipt.assignment_authority_generation() != query.assignment_authority_generation
+        || receipt.replay_domain() != query.replay_domain
+    {
+        return Err(invalid_completion_receipt(
+            "completion receipt does not match the durable request and replay domain",
+        ));
+    }
+    validate_text(receipt.receipt_id(), "authority receipt id")?;
+    if receipt.issued_at_ms() > now_ms
+        || receipt.expires_at_ms() <= now_ms
+        || receipt
+            .expires_at_ms()
+            .saturating_sub(receipt.issued_at_ms())
+            > 15 * 60 * 1_000
+    {
+        return Err(invalid_completion_receipt(
+            "completion receipt validity window is invalid",
+        ));
+    }
+    let issuer = receipt.issuer();
+    if issuer == query.agent_id
+        || !project.participants.contains(&issuer)
+        || issuer_snapshot.profile.agent_id != issuer
+        || !issuer_snapshot.profile.active
+        || !matches!(
+            issuer_snapshot.profile.role,
+            ActorRole::Qa | ActorRole::ReleaseManager
+        )
+        || issuer_snapshot.generation != receipt.issuer_authority_generation()
+        || issuer_snapshot.digest != receipt.issuer_authority_digest()
+    {
+        return Err(invalid_completion_receipt(
+            "completion issuer is not an active independent project authority",
         ));
     }
     let mut output_refs = BTreeMap::new();
-    for artifact in &receipt.artifacts {
+    for artifact in receipt.artifacts() {
         validate_digest(&artifact.digest)?;
         if artifact.owner != query.agent_id
             || artifact.invocation_id != query.invocation_id
@@ -1665,7 +1954,7 @@ fn complete_work(
         return invalid_input("completion receipt is missing a required digest-bound output");
     }
     let output_bundle_digest = canonical_digest(&output_refs)?;
-    let gate = &receipt.gate;
+    let gate = receipt.gate();
     let expected_runner = profile
         .gate_runner(&item.spec.quality_gate)
         .ok_or_else(|| {
@@ -1681,8 +1970,6 @@ fn complete_work(
         || gate.gate_id != item.spec.quality_gate
         || gate.runner_id != expected_runner
         || gate.subject_digest != output_bundle_digest
-        || gate.issued_by == actor.principal_id
-        || !matches!(gate.issuer_role, ActorRole::Qa | ActorRole::ReleaseManager)
         || !gate.passed
     {
         return Err(WorkflowError::new(
@@ -1691,36 +1978,27 @@ fn complete_work(
             "completion gate receipt lacks independent canonical authority",
         ));
     }
-    append_event(
-        tx,
-        WorkflowEventType::WorkCompletionRequested,
-        "work_item",
-        &item.spec.id.0,
-        actor,
-        operation_id,
-        operation_digest,
-        Some("in_progress"),
-        Some("in_progress"),
-        "the assigned agent requested authoritative completion evidence",
-        &query,
-        now_ms,
-    )?;
+    let authority_id = format!("agent:{}", issuer.0);
     let evidence = CompletionEvidence {
         schema_version: WORKFLOW_SCHEMA_VERSION,
         id: EvidenceId::new("evidence"),
         project_id: item.project_id.clone(),
         work_item_id: item.spec.id.clone(),
-        assignment_version,
-        invocation_id,
-        input_digest: query.input_digest,
+        assignment_version: query.assignment_version,
+        invocation_id: query.invocation_id.clone(),
+        input_digest: query.input_digest.clone(),
         output_refs: output_refs.clone(),
         output_bundle_digest,
         gate_id: gate.gate_id.clone(),
         gate_passed: gate.passed,
         gate_receipt_id: gate.receipt_id.clone(),
-        gate_authority: gate.issued_by.clone(),
-        receipt_digest: receipt.seal_digest,
-        recorded_by: gate.issued_by.clone(),
+        gate_authority: authority_id.clone(),
+        authority_receipt_id: receipt.receipt_id().to_owned(),
+        request_digest: query.request_digest.clone(),
+        issuer_authority_generation: issuer_snapshot.generation,
+        issuer_authority_digest: issuer_snapshot.digest.clone(),
+        replay_domain: query.replay_domain.clone(),
+        recorded_by: authority_id,
         recorded_at_ms: now_ms,
     };
     item.output_refs = output_refs;
@@ -1730,6 +2008,7 @@ fn complete_work(
     item.updated_at_ms = now_ms;
     tx.put_entity(ENTITY_EVIDENCE, &evidence.id.0, 1, &evidence)?;
     tx.put_entity(ENTITY_WORK_ITEM, &item.spec.id.0, item.version, &item)?;
+    tx.mark_completion_completed(&query.request_id, receipt.receipt_id(), now_ms)?;
     unlock_dependents(tx, &item.project_id, &item.spec.id, now_ms)?;
     let all_items: Vec<WorkItem> = tx
         .entities::<WorkItem>(ENTITY_WORK_ITEM)?
@@ -1761,12 +2040,19 @@ fn complete_work(
         WorkflowEventType::WorkCompleted,
         "work_item",
         &item.spec.id.0,
-        actor,
-        operation_id,
-        operation_digest,
+        &AuthenticatedPrincipal {
+            principal_id: request.requested_by.clone(),
+            tenant_id: request.tenant_id.clone(),
+            kind: PrincipalKind::Agent,
+            role: request.requested_role,
+            customer_id: None,
+            agent_id: Some(query.agent_id),
+        },
+        &request.operation_id,
+        &request.operation_digest,
         Some("in_progress"),
         Some("done"),
-        "sealed outputs and an independent gate receipt authorized completion",
+        "opaque authority evidence and an independent gate receipt authorized completion",
         &evidence,
         now_ms,
     )?;
@@ -3226,6 +3512,28 @@ fn canonical_digest<T: Serialize>(value: &T) -> Result<String, WorkflowError> {
         write!(&mut digest, "{byte:02x}").map_err(|_| WorkflowError::persistence())?;
     }
     Ok(digest)
+}
+
+fn completion_request_digest(query: &CompletionReceiptQuery) -> Result<String, WorkflowError> {
+    canonical_digest(&(
+        query.schema_version,
+        &query.request_id,
+        &query.invocation_id,
+        &query.project_id,
+        query.project_version,
+        &query.work_item_id,
+        query.work_item_version,
+        query.assignment_version,
+        query.agent_id,
+        query.assignment_authority_generation,
+        &query.assignment_authority_digest,
+        &query.input_digest,
+        &query.replay_domain,
+    ))
+}
+
+fn invalid_completion_receipt(message: &str) -> WorkflowError {
+    WorkflowError::new(WorkflowErrorCode::DigestConflict, false, message)
 }
 
 fn validate_digest(value: &str) -> Result<(), WorkflowError> {

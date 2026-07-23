@@ -63,14 +63,125 @@ impl WorkExecutionPort for FakeExecutionPort {
     }
 }
 
+#[derive(Debug, Clone)]
+enum CompletionMode {
+    Valid,
+    ArtifactOwner(AgentId),
+    Issuer(AgentId),
+    FailedGate,
+    StaleIssuerAuthority,
+    ReplayAssignment,
+    ReplayProjectVersion,
+    ReplayWorkItemVersion,
+    ReplayDomain,
+    TimeoutOnce,
+    AlwaysTimeout,
+    CrashAfterAuthority,
+}
+
+impl Default for CompletionMode {
+    fn default() -> Self {
+        Self::Valid
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TestCompletionReceipt {
+    schema_version: u32,
+    receipt_id: String,
+    request_digest: String,
+    invocation_id: String,
+    project_id: ProjectId,
+    project_version: u64,
+    work_item_id: WorkItemId,
+    work_item_version: u64,
+    assignment_version: u64,
+    assignment_authority_generation: u64,
+    issuer: AgentId,
+    issuer_authority_generation: u64,
+    issuer_authority_digest: String,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+    replay_domain: String,
+    artifacts: Vec<ArtifactReceipt>,
+    gate: GateReceipt,
+    crash_on_validation: bool,
+}
+
+impl CompletionAuthorityReceipt for TestCompletionReceipt {
+    fn schema_version(&self) -> u32 {
+        assert!(
+            !self.crash_on_validation,
+            "injected crash after authority response"
+        );
+        self.schema_version
+    }
+    fn receipt_id(&self) -> &str {
+        &self.receipt_id
+    }
+    fn request_digest(&self) -> &str {
+        &self.request_digest
+    }
+    fn invocation_id(&self) -> &str {
+        &self.invocation_id
+    }
+    fn project_id(&self) -> &ProjectId {
+        &self.project_id
+    }
+    fn project_version(&self) -> u64 {
+        self.project_version
+    }
+    fn work_item_id(&self) -> &WorkItemId {
+        &self.work_item_id
+    }
+    fn work_item_version(&self) -> u64 {
+        self.work_item_version
+    }
+    fn assignment_version(&self) -> u64 {
+        self.assignment_version
+    }
+    fn assignment_authority_generation(&self) -> u64 {
+        self.assignment_authority_generation
+    }
+    fn issuer(&self) -> AgentId {
+        self.issuer
+    }
+    fn issuer_authority_generation(&self) -> u64 {
+        self.issuer_authority_generation
+    }
+    fn issuer_authority_digest(&self) -> &str {
+        &self.issuer_authority_digest
+    }
+    fn issued_at_ms(&self) -> u64 {
+        self.issued_at_ms
+    }
+    fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
+    fn replay_domain(&self) -> &str {
+        &self.replay_domain
+    }
+    fn artifacts(&self) -> &[ArtifactReceipt] {
+        &self.artifacts
+    }
+    fn gate(&self) -> &GateReceipt {
+        &self.gate
+    }
+}
+
 #[derive(Debug, Default)]
 struct FakeCompletionPort {
-    override_receipt: Mutex<Option<SealedCompletionReceipt>>,
+    mode: Mutex<CompletionMode>,
+    calls: AtomicU64,
 }
 
 impl FakeCompletionPort {
-    fn set_receipt(&self, receipt: SealedCompletionReceipt) {
-        *self.override_receipt.lock().expect("completion lock") = Some(receipt);
+    fn set_mode(&self, mode: CompletionMode) {
+        *self.mode.lock().expect("completion lock") = mode;
+    }
+
+    fn calls(&self) -> u64 {
+        self.calls.load(Ordering::SeqCst)
     }
 }
 
@@ -82,25 +193,49 @@ impl CompletionEvidencePort for FakeCompletionPort {
     fn completion_receipt(
         &self,
         query: &CompletionReceiptQuery,
-    ) -> Result<SealedCompletionReceipt, WorkExecutionError> {
-        if let Some(receipt) = self
-            .override_receipt
-            .lock()
-            .expect("completion lock")
-            .clone()
-        {
-            return Ok(receipt);
+    ) -> Result<Box<dyn CompletionAuthorityReceipt>, WorkExecutionError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut mode = self.mode.lock().expect("completion lock");
+        if matches!(*mode, CompletionMode::TimeoutOnce) {
+            *mode = CompletionMode::Valid;
+            return Err(WorkExecutionError::TimedOut);
         }
-        completion_receipt(query, query.agent_id, "qa-authority", true)
+        if matches!(*mode, CompletionMode::AlwaysTimeout) {
+            return Err(WorkExecutionError::TimedOut);
+        }
+        let selected = mode.clone();
+        if matches!(*mode, CompletionMode::CrashAfterAuthority) {
+            *mode = CompletionMode::Valid;
+        }
+        Ok(Box::new(test_completion_receipt(query, &selected)))
     }
 }
 
-fn completion_receipt(
+fn test_completion_receipt(
     query: &CompletionReceiptQuery,
-    artifact_owner: AgentId,
-    issued_by: &str,
-    passed: bool,
-) -> Result<SealedCompletionReceipt, WorkExecutionError> {
+    mode: &CompletionMode,
+) -> TestCompletionReceipt {
+    let artifact_owner = match mode {
+        CompletionMode::ArtifactOwner(owner) => *owner,
+        _ => query.agent_id,
+    };
+    let issuer = match mode {
+        CompletionMode::Issuer(issuer) => *issuer,
+        _ => agent(3),
+    };
+    let issuer_snapshot = fixture_snapshot(
+        issuer,
+        if issuer == agent(5) {
+            ActorRole::ReleaseManager
+        } else {
+            ActorRole::Qa
+        },
+        if matches!(mode, CompletionMode::StaleIssuerAuthority) {
+            2
+        } else {
+            1
+        },
+    );
     let artifacts = vec![ArtifactReceipt {
         kind: "source_tree".into(),
         digest: "b".repeat(64),
@@ -119,21 +254,45 @@ fn completion_receipt(
         gate_id: "browser_smoke".into(),
         runner_id: "web-qa-v1".into(),
         subject_digest,
-        issued_by: issued_by.into(),
-        issuer_role: ActorRole::Qa,
-        passed,
+        passed: !matches!(mode, CompletionMode::FailedGate),
     };
-    SealedCompletionReceipt::seal(
-        format!("completion-{}", query.invocation_id),
-        query.invocation_id.clone(),
-        query.project_id.clone(),
-        query.work_item_id.clone(),
-        query.assignment_version,
-        query.agent_id,
-        query.input_digest.clone(),
+    TestCompletionReceipt {
+        schema_version: query.schema_version,
+        receipt_id: format!("authority-receipt-{}", query.request_id),
+        request_digest: query.request_digest.clone(),
+        invocation_id: query.invocation_id.clone(),
+        project_id: query.project_id.clone(),
+        project_version: if matches!(mode, CompletionMode::ReplayProjectVersion) {
+            query.project_version + 1
+        } else {
+            query.project_version
+        },
+        work_item_id: query.work_item_id.clone(),
+        work_item_version: if matches!(mode, CompletionMode::ReplayWorkItemVersion) {
+            query.work_item_version + 1
+        } else {
+            query.work_item_version
+        },
+        assignment_version: if matches!(mode, CompletionMode::ReplayAssignment) {
+            query.assignment_version + 1
+        } else {
+            query.assignment_version
+        },
+        assignment_authority_generation: query.assignment_authority_generation,
+        issuer,
+        issuer_authority_generation: issuer_snapshot.generation,
+        issuer_authority_digest: issuer_snapshot.digest,
+        issued_at_ms: 999_000,
+        expires_at_ms: 1_100_000,
+        replay_domain: if matches!(mode, CompletionMode::ReplayDomain) {
+            format!("{}:foreign", query.replay_domain)
+        } else {
+            query.replay_domain.clone()
+        },
         artifacts,
         gate,
-    )
+        crash_on_validation: matches!(mode, CompletionMode::CrashAfterAuthority),
+    }
 }
 
 fn canonical_json_digest<T: serde::Serialize>(value: &T) -> String {
@@ -232,6 +391,18 @@ impl FakeOrganizationPort {
             .expect("organization snapshots lock")
             .insert(agent(id), snapshot);
     }
+
+    fn set_active(&self, id: u16, active: bool) {
+        let mut snapshots = self.snapshots.lock().expect("organization snapshots lock");
+        let existing = snapshots.get(&agent(id)).expect("fixture profile").clone();
+        let mut profile = existing.profile;
+        profile.active = active;
+        snapshots.insert(
+            agent(id),
+            OrganizationAgentSnapshot::new(existing.generation, profile)
+                .expect("construct authoritative organization snapshot"),
+        );
+    }
 }
 
 impl OrganizationRuntimePort for FakeOrganizationPort {
@@ -254,6 +425,41 @@ impl OrganizationRuntimePort for FakeOrganizationPort {
 
 fn agent(id: u16) -> AgentId {
     AgentId::new(id).expect("valid fixture AgentId")
+}
+
+fn fixture_snapshot(
+    agent_id: AgentId,
+    role: ActorRole,
+    generation: u64,
+) -> OrganizationAgentSnapshot {
+    let capabilities = match role {
+        ActorRole::Qa => [
+            "quality_assurance",
+            "browser_validation",
+            "security_validation",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        ActorRole::ReleaseManager => ["release_management", "provenance_validation"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        _ => BTreeSet::new(),
+    };
+    OrganizationAgentSnapshot::new(
+        generation,
+        AgentProfile {
+            agent_id,
+            role,
+            capabilities,
+            reports_to: Some(agent(1)),
+            active: true,
+            current_assignments: 0,
+            max_assignments: 2,
+        },
+    )
+    .expect("fixture authority snapshot")
 }
 
 fn actor(role: ActorRole, id: u16) -> AuthenticatedPrincipal {
@@ -538,6 +744,40 @@ fn assign_developer(engine: &WorkflowEngine, work_item_id: &str, version: u64) -
         WorkflowResponse::Assignment(value) => value,
         other => panic!("expected assignment, got {other:?}"),
     }
+}
+
+fn prepare_completion(engine: &WorkflowEngine, suffix: &str) -> Assignment {
+    let (_, project) =
+        bootstrap_project_for(engine, suffix, "tenant-a", &format!("customer-{suffix}"));
+    engine
+        .execute(
+            actor(ActorRole::ProjectManager, 1),
+            &format!("plan-{suffix}"),
+            WorkflowCommand::PlanWorkGraph {
+                project_id: project.id,
+                expected_version: project.version,
+                items: canonical_work_graph(suffix),
+            },
+        )
+        .expect("plan completion graph");
+    let assignment = assign_developer(engine, &format!("{suffix}-developer"), 1);
+    engine
+        .execute(
+            actor(ActorRole::Developer, 2),
+            &format!("claim-{suffix}"),
+            WorkflowCommand::ClaimWork {
+                work_item_id: assignment.work_item_id.clone(),
+                expected_version: 2,
+                agent_id: agent(2),
+                input_digest: "a".repeat(64),
+                deadline_ms: 2_000_000,
+            },
+        )
+        .expect("claim completion work");
+    engine
+        .dispatch_pending_executions(1)
+        .expect("dispatch completion work");
+    assignment
 }
 
 #[test]
@@ -945,7 +1185,7 @@ fn invalid_dag_and_assignment_policy_fail_without_partial_state() {
             actor(ActorRole::ProjectManager, 1),
             "plan-valid",
             WorkflowCommand::PlanWorkGraph {
-                project_id: project.id,
+                project_id: project.id.clone(),
                 expected_version: project.version,
                 items: canonical_work_graph("valid"),
             },
@@ -989,7 +1229,7 @@ fn durable_execution_outbox_recovers_after_restart_without_duplicate_dispatch() 
                 actor(ActorRole::ProjectManager, 1),
                 "plan-execution",
                 WorkflowCommand::PlanWorkGraph {
-                    project_id: project.id,
+                    project_id: project.id.clone(),
                     expected_version: project.version,
                     items: canonical_work_graph("exec"),
                 },
@@ -1131,11 +1371,10 @@ fn execution_retries_are_bounded_and_materialize_an_operator_blocker() {
 #[test]
 fn completion_unlocks_dag_and_enforces_gate_and_assignment_version() {
     let directory = tempfile::tempdir().expect("tempdir");
-    let port = Arc::new(FakeExecutionPort::default());
     let completion = Arc::new(FakeCompletionPort::default());
     let (engine, _) = engine_with_ports(
         &directory.path().join("workflow.db"),
-        port,
+        Arc::new(FakeExecutionPort::default()),
         Arc::new(FakeOrganizationPort::with_defaults()),
         completion.clone(),
     );
@@ -1145,7 +1384,7 @@ fn completion_unlocks_dag_and_enforces_gate_and_assignment_version() {
             actor(ActorRole::ProjectManager, 1),
             "plan-dag",
             WorkflowCommand::PlanWorkGraph {
-                project_id: project.id.clone(),
+                project_id: project.id,
                 expected_version: project.version,
                 items: canonical_work_graph("completion"),
             },
@@ -1168,68 +1407,6 @@ fn completion_unlocks_dag_and_enforces_gate_and_assignment_version() {
     engine
         .dispatch_pending_executions(10)
         .expect("fake accepts work");
-    let query = CompletionReceiptQuery {
-        invocation_id: format!(
-            "work-exec-{}-v{}",
-            assignment.work_item_id.0, assignment.assignment_version
-        ),
-        project_id: project.id,
-        work_item_id: assignment.work_item_id.clone(),
-        assignment_version: assignment.assignment_version,
-        agent_id: agent(2),
-        input_digest: "a".repeat(64),
-    };
-    completion.set_receipt(
-        completion_receipt(&query, agent(3), "qa-authority", true)
-            .expect("sealed forged artifact receipt"),
-    );
-    let forged_output = engine
-        .execute(
-            actor(ActorRole::Developer, 2),
-            "complete-forged-output-owner",
-            WorkflowCommand::RequestWorkCompletion {
-                work_item_id: assignment.work_item_id.clone(),
-                expected_version: 4,
-                assignment_version: assignment.assignment_version,
-            },
-        )
-        .expect_err("artifact owned by another principal cannot complete work");
-    assert_eq!(forged_output.code, WorkflowErrorCode::DigestConflict);
-    completion.set_receipt(
-        completion_receipt(&query, agent(2), "fixture-Developer-2", true)
-            .expect("sealed self-attested receipt"),
-    );
-    let self_attested = engine
-        .execute(
-            actor(ActorRole::Developer, 2),
-            "complete-self-attested-gate",
-            WorkflowCommand::RequestWorkCompletion {
-                work_item_id: assignment.work_item_id.clone(),
-                expected_version: 4,
-                assignment_version: assignment.assignment_version,
-            },
-        )
-        .expect_err("assignee cannot issue its own gate receipt");
-    assert_eq!(self_attested.code, WorkflowErrorCode::DigestConflict);
-    completion.set_receipt(
-        completion_receipt(&query, agent(2), "qa-authority", false)
-            .expect("sealed failing receipt"),
-    );
-    let error = engine
-        .execute(
-            actor(ActorRole::Developer, 2),
-            "complete-bad-gate",
-            WorkflowCommand::RequestWorkCompletion {
-                work_item_id: assignment.work_item_id.clone(),
-                expected_version: 4,
-                assignment_version: assignment.assignment_version,
-            },
-        )
-        .expect_err("failed gate cannot complete work");
-    assert_eq!(error.code, WorkflowErrorCode::DigestConflict);
-    completion.set_receipt(
-        completion_receipt(&query, agent(2), "qa-authority", true).expect("sealed passing receipt"),
-    );
     engine
         .execute(
             actor(ActorRole::Developer, 2),
@@ -1241,6 +1418,7 @@ fn completion_unlocks_dag_and_enforces_gate_and_assignment_version() {
             },
         )
         .expect("complete work");
+    assert_eq!(completion.calls(), 1);
     assert_eq!(
         engine
             .work_item(&WorkItemId("completion-qa".into()))
@@ -1249,6 +1427,337 @@ fn completion_unlocks_dag_and_enforces_gate_and_assignment_version() {
             .state,
         WorkItemState::Ready
     );
+}
+
+#[test]
+fn completion_rejects_forged_authority_artifacts_gates_and_replay() {
+    let cases = [
+        (
+            CompletionMode::ArtifactOwner(agent(3)),
+            "artifact owned by another agent",
+        ),
+        (
+            CompletionMode::Issuer(agent(2)),
+            "self-issued or forged QA authority",
+        ),
+        (
+            CompletionMode::Issuer(agent(7)),
+            "non-participant authority",
+        ),
+        (
+            CompletionMode::StaleIssuerAuthority,
+            "stale issuer generation",
+        ),
+        (CompletionMode::FailedGate, "failed quality gate"),
+        (
+            CompletionMode::ReplayAssignment,
+            "cross-assignment receipt replay",
+        ),
+        (
+            CompletionMode::ReplayProjectVersion,
+            "cross-project-version receipt replay",
+        ),
+        (
+            CompletionMode::ReplayWorkItemVersion,
+            "cross-work-item-version receipt replay",
+        ),
+        (CompletionMode::ReplayDomain, "cross-domain receipt replay"),
+    ];
+    for (index, (mode, label)) in cases.into_iter().enumerate() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let completion = Arc::new(FakeCompletionPort::default());
+        completion.set_mode(mode);
+        let (engine, _) = engine_with_ports(
+            &directory.path().join("workflow.db"),
+            Arc::new(FakeExecutionPort::default()),
+            Arc::new(FakeOrganizationPort::with_defaults()),
+            completion,
+        );
+        let (_, project) = bootstrap_project(&engine);
+        engine
+            .execute(
+                actor(ActorRole::ProjectManager, 1),
+                &format!("plan-negative-{index}"),
+                WorkflowCommand::PlanWorkGraph {
+                    project_id: project.id,
+                    expected_version: project.version,
+                    items: canonical_work_graph(&format!("negative-{index}")),
+                },
+            )
+            .expect("plan graph");
+        let assignment = assign_developer(&engine, &format!("negative-{index}-developer"), 1);
+        engine
+            .execute(
+                actor(ActorRole::Developer, 2),
+                &format!("claim-negative-{index}"),
+                WorkflowCommand::ClaimWork {
+                    work_item_id: assignment.work_item_id.clone(),
+                    expected_version: 2,
+                    agent_id: agent(2),
+                    input_digest: "a".repeat(64),
+                    deadline_ms: 2_000_000,
+                },
+            )
+            .expect("claim work");
+        engine
+            .dispatch_pending_executions(1)
+            .expect("dispatch work");
+        let error = engine
+            .execute(
+                actor(ActorRole::Developer, 2),
+                &format!("complete-negative-{index}"),
+                WorkflowCommand::RequestWorkCompletion {
+                    work_item_id: assignment.work_item_id,
+                    expected_version: 4,
+                    assignment_version: assignment.assignment_version,
+                },
+            )
+            .expect_err(label);
+        assert_eq!(error.code, WorkflowErrorCode::DigestConflict, "{label}");
+    }
+}
+
+#[test]
+fn completion_rejects_revoked_issuer_authority() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let organization = Arc::new(FakeOrganizationPort::with_defaults());
+    organization.set_active(3, false);
+    let (engine, _) = engine_with_ports(
+        &directory.path().join("workflow.db"),
+        Arc::new(FakeExecutionPort::default()),
+        organization,
+        Arc::new(FakeCompletionPort::default()),
+    );
+    let assignment = prepare_completion(&engine, "completion-revoked");
+    let error = engine
+        .execute(
+            actor(ActorRole::Developer, 2),
+            "completion-revoked-request",
+            WorkflowCommand::RequestWorkCompletion {
+                work_item_id: assignment.work_item_id,
+                expected_version: 4,
+                assignment_version: assignment.assignment_version,
+            },
+        )
+        .expect_err("revoked issuer authority must fail closed");
+    assert_eq!(error.code, WorkflowErrorCode::DigestConflict);
+}
+
+#[test]
+fn completion_outbox_recovers_timeout_restart_and_duplicate_without_double_commit() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let database = directory.path().join("workflow.db");
+    let completion = Arc::new(FakeCompletionPort::default());
+    completion.set_mode(CompletionMode::TimeoutOnce);
+    let (engine, store) = engine_with_ports(
+        &database,
+        Arc::new(FakeExecutionPort::default()),
+        Arc::new(FakeOrganizationPort::with_defaults()),
+        completion.clone(),
+    );
+    let assignment = prepare_completion(&engine, "completion-restart");
+    let command = WorkflowCommand::RequestWorkCompletion {
+        work_item_id: assignment.work_item_id.clone(),
+        expected_version: 4,
+        assignment_version: assignment.assignment_version,
+    };
+    let timeout = engine
+        .execute(
+            actor(ActorRole::Developer, 2),
+            "completion-timeout",
+            command.clone(),
+        )
+        .expect_err("first authority lookup times out");
+    assert_eq!(timeout.code, WorkflowErrorCode::ExecutionUnavailable);
+    assert_eq!(
+        store
+            .pending_completion_evidence(10)
+            .expect("pending")
+            .len(),
+        1
+    );
+    assert_eq!(
+        engine
+            .work_item(&assignment.work_item_id)
+            .expect("work item")
+            .expect("present")
+            .state,
+        WorkItemState::InProgress
+    );
+    drop(engine);
+    drop(store);
+
+    let (restarted, _) = engine_with_ports(
+        &database,
+        Arc::new(FakeExecutionPort::default()),
+        Arc::new(FakeOrganizationPort::with_defaults()),
+        completion.clone(),
+    );
+    assert_eq!(
+        restarted
+            .dispatch_pending_completion_evidence(10)
+            .expect("restart resolves durable request")
+            .len(),
+        1
+    );
+    assert_eq!(completion.calls(), 2);
+    let replay = restarted
+        .execute(
+            actor(ActorRole::Developer, 2),
+            "completion-timeout",
+            command,
+        )
+        .expect("duplicate command reads completed result");
+    assert!(replay.replayed);
+    assert_eq!(completion.calls(), 2);
+    assert_eq!(
+        restarted
+            .work_item(&assignment.work_item_id)
+            .expect("work item")
+            .expect("present")
+            .state,
+        WorkItemState::Done
+    );
+}
+
+#[test]
+fn completion_outbox_survives_crash_after_authority_response_before_cas_commit() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let database = directory.path().join("workflow.db");
+    let completion = Arc::new(FakeCompletionPort::default());
+    completion.set_mode(CompletionMode::CrashAfterAuthority);
+    let (engine, store) = engine_with_ports(
+        &database,
+        Arc::new(FakeExecutionPort::default()),
+        Arc::new(FakeOrganizationPort::with_defaults()),
+        completion.clone(),
+    );
+    let assignment = prepare_completion(&engine, "completion-crash");
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = engine.execute(
+            actor(ActorRole::Developer, 2),
+            "completion-crash-request",
+            WorkflowCommand::RequestWorkCompletion {
+                work_item_id: assignment.work_item_id.clone(),
+                expected_version: 4,
+                assignment_version: assignment.assignment_version,
+            },
+        );
+    }));
+    assert!(crashed.is_err());
+    drop(engine);
+    drop(store);
+
+    let (restarted, _) = engine_with_ports(
+        &database,
+        Arc::new(FakeExecutionPort::default()),
+        Arc::new(FakeOrganizationPort::with_defaults()),
+        completion.clone(),
+    );
+    restarted
+        .dispatch_pending_completion_evidence(10)
+        .expect("same digest-bound authority request is safe to retry after restart");
+    assert_eq!(completion.calls(), 2);
+    assert_eq!(
+        restarted
+            .work_item(&assignment.work_item_id)
+            .expect("work item")
+            .expect("present")
+            .state,
+        WorkItemState::Done
+    );
+}
+
+#[test]
+fn completion_outbox_is_bounded_when_evidence_authority_keeps_timing_out() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let completion = Arc::new(FakeCompletionPort::default());
+    completion.set_mode(CompletionMode::AlwaysTimeout);
+    let (engine, store) = engine_with_ports(
+        &directory.path().join("workflow.db"),
+        Arc::new(FakeExecutionPort::default()),
+        Arc::new(FakeOrganizationPort::with_defaults()),
+        completion.clone(),
+    );
+    let assignment = prepare_completion(&engine, "completion-bounded-timeout");
+    let error = engine
+        .execute(
+            actor(ActorRole::Developer, 2),
+            "completion-bounded-timeout-request",
+            WorkflowCommand::RequestWorkCompletion {
+                work_item_id: assignment.work_item_id,
+                expected_version: 4,
+                assignment_version: assignment.assignment_version,
+            },
+        )
+        .expect_err("initial authority timeout");
+    assert_eq!(error.code, WorkflowErrorCode::ExecutionUnavailable);
+    for _ in 0..2 {
+        let error = engine
+            .dispatch_pending_completion_evidence(1)
+            .expect_err("bounded authority retry times out");
+        assert_eq!(error.code, WorkflowErrorCode::ExecutionUnavailable);
+    }
+    assert_eq!(completion.calls(), 3);
+    assert!(engine
+        .dispatch_pending_completion_evidence(1)
+        .expect("terminal request is no longer retried")
+        .is_empty());
+    assert_eq!(completion.calls(), 3);
+    let (_, state) = store
+        .completion_evidence_request("completion-work-exec-completion-bounded-timeout-developer-v1")
+        .expect("read completion outbox")
+        .expect("completion outbox entry");
+    assert_eq!(state, "failed");
+}
+
+#[test]
+fn completion_cas_rejects_project_drift_after_evidence_request() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let completion = Arc::new(FakeCompletionPort::default());
+    completion.set_mode(CompletionMode::TimeoutOnce);
+    let (engine, store) = engine_with_ports(
+        &directory.path().join("workflow.db"),
+        Arc::new(FakeExecutionPort::default()),
+        Arc::new(FakeOrganizationPort::with_defaults()),
+        completion.clone(),
+    );
+    let assignment = prepare_completion(&engine, "completion-toctou");
+    engine
+        .execute(
+            actor(ActorRole::Developer, 2),
+            "completion-toctou-request",
+            WorkflowCommand::RequestWorkCompletion {
+                work_item_id: assignment.work_item_id,
+                expected_version: 4,
+                assignment_version: assignment.assignment_version,
+            },
+        )
+        .expect_err("tx1 survives the authority timeout");
+    engine
+        .execute(
+            actor(ActorRole::Developer, 2),
+            "completion-toctou-drift",
+            WorkflowCommand::RaiseBlocker {
+                project_id: assignment.project_id,
+                work_item_id: None,
+                cause_ref: "authority-review".into(),
+                impact: "project authority changed while evidence was pending".into(),
+                owner: agent(2),
+                required_resolution_role: ActorRole::ProjectManager,
+            },
+        )
+        .expect("mutate project after tx1");
+    let error = engine
+        .dispatch_pending_completion_evidence(1)
+        .expect_err("tx2 rejects stale project version");
+    assert_eq!(error.code, WorkflowErrorCode::VersionConflict);
+    assert_eq!(completion.calls(), 2);
+    let (_, state) = store
+        .completion_evidence_request("completion-work-exec-completion-toctou-developer-v1")
+        .expect("read completion outbox")
+        .expect("completion outbox entry");
+    assert_eq!(state, "failed");
 }
 
 #[test]
