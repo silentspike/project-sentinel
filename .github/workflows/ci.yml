@@ -41,8 +41,13 @@ jobs:
               - 'crates/**'
               - 'services/**'
               - 'Cargo.toml'
+              - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
+              - '.c[a]rgo/config'
+              - '.c[a]rgo/config.toml'
+              - '**/.c[a]rgo/config'
+              - '**/.c[a]rgo/config.toml'
             go:
               - 'cmd/**'
               - 'services/sentinel-judge/**'
