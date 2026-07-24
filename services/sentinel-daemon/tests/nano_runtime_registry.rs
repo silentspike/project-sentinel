@@ -138,9 +138,9 @@ fn rust_sources(root: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
 fn ast_inventory_finds_no_raw_adapter_owner_outside_lifecycle_boundary() {
     // This is a static architecture inventory, not a compile-time proof. The
     // actual enforcement is Rust visibility: raw adapters and their registry
-    // are private to runtime_lifecycle.rs.
+    // are private to the orchestrator's runtime_lifecycle submodule.
     let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let owner = source_root.join("runtime_lifecycle.rs");
+    let owner = source_root.join("orchestrator/runtime_lifecycle.rs");
     let mut files = Vec::new();
     rust_sources(&source_root, &mut files);
     let mut violations = Vec::new();
@@ -159,6 +159,6 @@ fn ast_inventory_finds_no_raw_adapter_owner_outside_lifecycle_boundary() {
     }
     assert!(
         violations.is_empty(),
-        "raw adapter ownership escaped runtime_lifecycle.rs: {violations:?}"
+        "raw adapter ownership escaped orchestrator/runtime_lifecycle.rs: {violations:?}"
     );
 }

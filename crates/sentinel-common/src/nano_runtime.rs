@@ -256,6 +256,9 @@ pub struct NanoExecResult {
 #[serde(rename_all = "snake_case")]
 pub enum NanoSnapshotSemantics {
     EcsWorld,
+    /// Legacy schema name for WASM snapshots created before bound-result restore.
+    /// Restorers must never interpret this variant as authorization to replay a
+    /// stored input.
     WasmReexecute,
     BwrapConfigFs,
     RuntimeMetadata,
@@ -268,6 +271,11 @@ pub enum NanoSnapshotSemantics {
     /// It carries no process-memory or filesystem-content claim. Appended to
     /// preserve bincode discriminants of existing schema-v4 snapshot variants.
     BwrapRecreate,
+    /// Declarative WASM workload binding plus an already-bound execution result.
+    /// Restore creates a fresh runtime incarnation but never executes the stored
+    /// input. Any retry of an external effect requires a separate durable
+    /// idempotency key and receipt contract.
+    WasmBoundState,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

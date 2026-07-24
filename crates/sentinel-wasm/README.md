@@ -11,11 +11,14 @@
 - `registry` and `runner` resolve and execute tools.
 - `host` and `plugin` are compiled with the `wasm` feature for Wasmtime Component Model plugins.
 - `WasmtimeNanoRuntime` implements the shared `NanoRuntime` contract for the
-  `wasm-wasmtime` key. Its `snapshot` is declarative ToolRuntime/input state
-  plus ECS-side state for deterministic re-execute. It is not a bitwise
-  Wasmtime `Store` dump because current plugin calls create fresh stores. Its
-  idempotent `stop` removes only the addressed workload state and releases a
-  tool definition or compiled component after its final owning workload stops.
+  `wasm-wasmtime` key. Its snapshot is declarative workload/tool binding plus
+  an already-bound execution result. Restore creates a fresh runtime
+  incarnation and never re-executes stored input. It is not a bitwise Wasmtime
+  `Store` dump because current plugin calls create fresh stores. Retrying an
+  external effect requires a separate durable idempotency key and receipt; a
+  runtime snapshot is not that receipt. Its idempotent `stop` removes only the
+  addressed workload state and releases a tool definition or compiled
+  component after its final owning workload stops.
 
 ## Dependencies
 

@@ -16,12 +16,12 @@ use sentinel_sandbox::BwrapNanoRuntime;
 #[cfg(feature = "wasm")]
 use sentinel_wasm::WasmtimeNanoRuntime;
 
-pub(crate) struct RuntimeAdapterOwner {
+pub(super) struct RuntimeAdapterOwner {
     registry: NanoRuntimeRegistry,
 }
 
 impl RuntimeAdapterOwner {
-    pub(crate) fn production(max_agents: usize, fs_mount: Option<&str>) -> Result<Self> {
+    pub(super) fn production(max_agents: usize, fs_mount: Option<&str>) -> Result<Self> {
         let mut registry = NanoRuntimeRegistry::new(Some(RUNTIME_BWRAP_LANDLOCK.to_string()));
         registry.register(EcsNativeRuntime::external_lifecycle(max_agents))?;
         let mut bwrap = BwrapNanoRuntime::detect();
@@ -38,15 +38,15 @@ impl RuntimeAdapterOwner {
         Ok(Self { registry })
     }
 
-    pub(crate) fn keys(&self) -> Vec<String> {
+    pub(super) fn keys(&self) -> Vec<String> {
         self.registry.keys()
     }
 
-    pub(crate) fn select_key(&self, workload: &NanoWorkloadSpec) -> Result<String> {
+    pub(super) fn select_key(&self, workload: &NanoWorkloadSpec) -> Result<String> {
         self.registry.select_key(workload)
     }
 
-    pub(crate) fn spawn(
+    pub(super) fn spawn(
         &mut self,
         runtime_key: &str,
         workload: NanoWorkloadSpec,
@@ -54,15 +54,15 @@ impl RuntimeAdapterOwner {
         self.registry.get_mut(runtime_key)?.spawn(workload)
     }
 
-    pub(crate) fn resources(&mut self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
+    pub(super) fn resources(&mut self, handle: &NanoHandle) -> Result<NanoRuntimeResources> {
         self.registry.resources(handle)
     }
 
-    pub(crate) fn stop(&mut self, handle: &NanoHandle) -> Result<NanoStopResult> {
+    pub(super) fn stop(&mut self, handle: &NanoHandle) -> Result<NanoStopResult> {
         self.registry.stop(handle)
     }
 
-    pub(crate) fn control(
+    pub(super) fn control(
         &mut self,
         handle: &NanoHandle,
         action: NanoRuntimeControlAction,
@@ -70,15 +70,15 @@ impl RuntimeAdapterOwner {
         self.registry.control(handle, action)
     }
 
-    pub(crate) fn snapshot(&mut self, handle: &NanoHandle) -> Result<NanoSnapshot> {
+    pub(super) fn snapshot(&mut self, handle: &NanoHandle) -> Result<NanoSnapshot> {
         self.registry.snapshot(handle)
     }
 
-    pub(crate) fn restore(&mut self, snapshot: NanoSnapshot) -> Result<NanoHandle> {
+    pub(super) fn restore(&mut self, snapshot: NanoSnapshot) -> Result<NanoHandle> {
         self.registry.restore(snapshot)
     }
 
-    pub(crate) fn reconcile_abandoned(
+    pub(super) fn reconcile_abandoned(
         &mut self,
         workload: &NanoWorkloadSpec,
     ) -> Result<NanoRecoveryResult> {
@@ -86,7 +86,7 @@ impl RuntimeAdapterOwner {
     }
 
     #[cfg(test)]
-    pub(crate) fn health(
+    pub(super) fn health(
         &mut self,
         handle: &NanoHandle,
     ) -> Result<sentinel_common::nano_runtime::NanoHealth> {
@@ -94,7 +94,7 @@ impl RuntimeAdapterOwner {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_registry(registry: NanoRuntimeRegistry) -> Self {
+    pub(super) fn from_registry(registry: NanoRuntimeRegistry) -> Self {
         Self { registry }
     }
 }

@@ -11,17 +11,42 @@ use sentinel_common::nano_runtime::{
     NanoSnapshotSemantics, NanoStopResult, NanoWorkloadSpec, RUNTIME_WASM_WASMTIME,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     AgentSnapshot, ExecutionContext, PluginConfig, SandboxConfig, ToolDefinition, ToolRuntime,
     ToolType,
 };
 
+const WASM_RUNTIME_SNAPSHOT_VERSION: u16 = 2;
+
+fn legacy_wasm_runtime_snapshot_version() -> u16 {
+    1
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WasmBoundExecution {
+    /// SHA-256 of the input whose completed result is bound below. Legacy
+    /// output-only snapshots have no input digest.
+    #[serde(default)]
+    input_sha256: Option<String>,
+    output: String,
+    success: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WasmRuntimeSnapshot {
+    #[serde(default = "legacy_wasm_runtime_snapshot_version")]
+    schema_version: u16,
     workload: NanoWorkloadSpec,
     tool_name: String,
     wasm_path: String,
+    /// A completed result is observational runtime state, not a command to
+    /// execute during restore.
+    #[serde(default)]
+    bound_execution: Option<WasmBoundExecution>,
+    /// Legacy v1 fields are decode-only. Restore may bind their completed
+    /// result, but it must never replay `last_input`.
     #[serde(default)]
     last_input: Option<String>,
     #[serde(default)]
@@ -35,8 +60,7 @@ struct WasmWorkloadState {
     workload: NanoWorkloadSpec,
     tool_name: String,
     wasm_path: PathBuf,
-    last_input: Option<String>,
-    last_output: Option<String>,
+    bound_execution: Option<WasmBoundExecution>,
 }
 
 pub struct WasmtimeNanoRuntime {
@@ -74,8 +98,7 @@ impl WasmtimeNanoRuntime {
             workload: workload.clone(),
             tool_name,
             wasm_path,
-            last_input: None,
-            last_output: None,
+            bound_execution: None,
         })
     }
 
@@ -168,16 +191,46 @@ impl WasmtimeNanoRuntime {
 
     fn snapshot_payload(state: &WasmWorkloadState) -> Result<serde_json::Value> {
         let payload = WasmRuntimeSnapshot {
+            schema_version: WASM_RUNTIME_SNAPSHOT_VERSION,
             workload: state.workload.clone(),
             tool_name: state.tool_name.clone(),
             wasm_path: state.wasm_path.to_string_lossy().to_string(),
-            last_input: state.last_input.clone(),
-            last_output: state.last_output.clone(),
+            bound_execution: state.bound_execution.clone(),
+            last_input: None,
+            last_output: None,
             semantics_note:
-                "wasm-wasmtime snapshot is declarative input+ECS re-execute state; no Store dump"
+                "wasm-wasmtime snapshot is declarative workload state plus an already-bound result; restore never re-executes stored input and external-effect retries require a durable idempotency receipt"
                     .to_string(),
         };
         Ok(serde_json::to_value(payload)?)
+    }
+
+    fn input_sha256(input: &str) -> String {
+        format!("{:x}", Sha256::digest(input.as_bytes()))
+    }
+
+    fn bound_execution_from_snapshot(
+        payload: &WasmRuntimeSnapshot,
+    ) -> Result<Option<WasmBoundExecution>> {
+        if let Some(bound) = &payload.bound_execution {
+            return Ok(Some(bound.clone()));
+        }
+        match (&payload.last_input, &payload.last_output) {
+            (Some(input), Some(output)) => Ok(Some(WasmBoundExecution {
+                input_sha256: Some(Self::input_sha256(input)),
+                output: output.clone(),
+                success: true,
+            })),
+            (None, Some(output)) => Ok(Some(WasmBoundExecution {
+                input_sha256: None,
+                output: output.clone(),
+                success: true,
+            })),
+            (Some(_), None) => Err(anyhow!(
+                "legacy WASM snapshot contains an input without a bound result; replay during restore is forbidden"
+            )),
+            (None, None) => Ok(None),
+        }
     }
 }
 
@@ -274,8 +327,11 @@ impl NanoRuntime for WasmtimeNanoRuntime {
         let result = self.runtime.execute(&state.tool_name, &input, &ctx)?;
 
         if let Some(stored) = self.workloads.get_mut(&handle.workload_id) {
-            stored.last_input = Some(input.clone());
-            stored.last_output = Some(result.output.clone());
+            stored.bound_execution = Some(WasmBoundExecution {
+                input_sha256: Some(Self::input_sha256(&input)),
+                output: result.output.clone(),
+                success: result.success,
+            });
         }
 
         Ok(NanoExecResult {
@@ -297,7 +353,7 @@ impl NanoRuntime for WasmtimeNanoRuntime {
             runtime_key: self.runtime_key().to_string(),
             workload_id: handle.workload_id.clone(),
             agent_id: handle.agent_id,
-            semantics: NanoSnapshotSemantics::WasmReexecute,
+            semantics: NanoSnapshotSemantics::WasmBoundState,
             payload: Self::snapshot_payload(state)?,
         })
     }
@@ -310,7 +366,24 @@ impl NanoRuntime for WasmtimeNanoRuntime {
                 self.runtime_key()
             ));
         }
+        if !matches!(
+            snapshot.semantics,
+            NanoSnapshotSemantics::WasmBoundState | NanoSnapshotSemantics::WasmReexecute
+        ) {
+            return Err(anyhow!(
+                "cannot restore {:?} snapshot into {} runtime",
+                snapshot.semantics,
+                self.runtime_key()
+            ));
+        }
         let payload: WasmRuntimeSnapshot = serde_json::from_value(snapshot.payload)?;
+        if payload.schema_version == 0 || payload.schema_version > WASM_RUNTIME_SNAPSHOT_VERSION {
+            return Err(anyhow!(
+                "unsupported WASM runtime snapshot schema {}",
+                payload.schema_version
+            ));
+        }
+        let bound_execution = Self::bound_execution_from_snapshot(&payload)?;
         let mut metadata = payload.workload.metadata.clone();
         metadata.insert("wasm_path".to_string(), payload.wasm_path.clone());
         metadata.insert("tool_name".to_string(), payload.tool_name.clone());
@@ -324,21 +397,7 @@ impl NanoRuntime for WasmtimeNanoRuntime {
             self.release_unreferenced_resources(&state);
             return Err(error);
         }
-
-        if let Some(input) = payload.last_input.clone() {
-            let ctx = Self::execution_context(&state);
-            let result = match self.runtime.execute(&state.tool_name, &input, &ctx) {
-                Ok(result) => result,
-                Err(error) => {
-                    self.release_unreferenced_resources(&state);
-                    return Err(error);
-                }
-            };
-            state.last_input = Some(input);
-            state.last_output = Some(result.output);
-        } else {
-            state.last_output = payload.last_output;
-        }
+        state.bound_execution = bound_execution;
 
         let instance_id = state.instance_id;
         self.suspended.remove(&snapshot.workload_id);
@@ -553,6 +612,119 @@ mod tests {
 
         assert!(
             WasmtimeNanoRuntime::ensure_snapshot_identity("envelope-workload", &workload).is_err()
+        );
+        assert_eq!(runtime.runtime.tool_count(), 0);
+        assert_eq!(runtime.runtime.plugin_host().cached_count(), 0);
+    }
+
+    #[test]
+    fn snapshot_binds_completed_result_without_storing_a_replay_command() {
+        let mut runtime = WasmtimeNanoRuntime::new();
+        let handle = runtime.spawn(workload("wasm-bound-result")).unwrap();
+        let result = runtime
+            .exec(
+                &handle,
+                NanoExecRequest {
+                    operation: "echo".to_string(),
+                    input: "completed input".to_string(),
+                },
+            )
+            .unwrap();
+        let snapshot = runtime.snapshot(&handle).unwrap();
+
+        assert_eq!(snapshot.semantics, NanoSnapshotSemantics::WasmBoundState);
+        assert_eq!(
+            snapshot.payload["schema_version"],
+            WASM_RUNTIME_SNAPSHOT_VERSION
+        );
+        assert_eq!(snapshot.payload["bound_execution"]["output"], result.output);
+        assert_eq!(snapshot.payload["last_input"], serde_json::Value::Null);
+        assert_eq!(snapshot.payload["last_output"], serde_json::Value::Null);
+
+        let restored = runtime.restore(snapshot.clone()).unwrap();
+        assert_ne!(restored.instance_id, handle.instance_id);
+        assert_eq!(
+            runtime.snapshot(&restored).unwrap().payload,
+            snapshot.payload
+        );
+    }
+
+    #[test]
+    fn restore_never_replays_legacy_effectful_last_input() {
+        let temp = tempfile::Builder::new()
+            .prefix("sentinel-wasm-restore-effect-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let relative_dir = temp.path().strip_prefix("/tmp").unwrap().to_string_lossy();
+        let effect_path = temp.path().join("restore-replay.txt");
+        let effect_input = format!("write {relative_dir}/restore-replay.txt replayed");
+        let effect_workload = workload_with("wasm-legacy-effect", fs_fixture(), "effectful-fs");
+        let payload = serde_json::json!({
+            "workload": effect_workload,
+            "tool_name": "effectful-fs",
+            "wasm_path": fs_fixture().canonicalize().unwrap().to_string_lossy(),
+            "last_input": effect_input,
+            "last_output": "legacy bound receipt",
+            "semantics_note": "legacy re-execute schema"
+        });
+        let snapshot = NanoSnapshot {
+            runtime_key: RUNTIME_WASM_WASMTIME.to_string(),
+            workload_id: "wasm-legacy-effect".to_string(),
+            agent_id: None,
+            semantics: NanoSnapshotSemantics::WasmReexecute,
+            payload,
+        };
+
+        let mut runtime = WasmtimeNanoRuntime::new();
+        let restored = runtime.restore(snapshot).unwrap();
+
+        assert!(
+            !effect_path.exists(),
+            "restore must not replay an effect-bearing legacy last_input"
+        );
+        let rebound = runtime.snapshot(&restored).unwrap();
+        assert_eq!(rebound.semantics, NanoSnapshotSemantics::WasmBoundState);
+        assert_eq!(
+            rebound.payload["bound_execution"]["output"],
+            "legacy bound receipt"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_legacy_effect_without_bound_result() {
+        let temp = tempfile::Builder::new()
+            .prefix("sentinel-wasm-restore-unbound-effect-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let relative_dir = temp.path().strip_prefix("/tmp").unwrap().to_string_lossy();
+        let effect_path = temp.path().join("restore-replay.txt");
+        let effect_input = format!("write {relative_dir}/restore-replay.txt replayed");
+        let effect_workload = workload_with("wasm-unbound-effect", fs_fixture(), "effectful-fs");
+        let payload = serde_json::json!({
+            "workload": effect_workload,
+            "tool_name": "effectful-fs",
+            "wasm_path": fs_fixture().canonicalize().unwrap().to_string_lossy(),
+            "last_input": effect_input,
+            "semantics_note": "legacy re-execute schema"
+        });
+        let snapshot = NanoSnapshot {
+            runtime_key: RUNTIME_WASM_WASMTIME.to_string(),
+            workload_id: "wasm-unbound-effect".to_string(),
+            agent_id: None,
+            semantics: NanoSnapshotSemantics::WasmReexecute,
+            payload,
+        };
+
+        let mut runtime = WasmtimeNanoRuntime::new();
+        let error = runtime.restore(snapshot).unwrap_err();
+
+        assert!(
+            error.to_string().contains("bound result"),
+            "unreceipted effect must fail closed: {error}"
+        );
+        assert!(
+            !effect_path.exists(),
+            "rejected restore must not execute the effect-bearing input"
         );
         assert_eq!(runtime.runtime.tool_count(), 0);
         assert_eq!(runtime.runtime.plugin_host().cached_count(), 0);
