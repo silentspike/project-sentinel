@@ -41,8 +41,13 @@ jobs:
               - 'crates/**'
               - 'services/**'
               - 'Cargo.toml'
+              - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
+              - '.c[a]rgo/config'
+              - '.c[a]rgo/config.toml'
+              - '**/.c[a]rgo/config'
+              - '**/.c[a]rgo/config.toml'
             go:
               - 'cmd/**'
               - 'services/sentinel-judge/**'
@@ -80,6 +85,11 @@ jobs:
 
       - name: Fenced-writer enforcement (#496)
         run: python3 scripts/check-fenced-writers.py
+
+      - name: Dependency patch registry enforcement (#634)
+        run: |
+          python3 scripts/check-patch-registry.py
+          python3 -m unittest discover -s scripts/tests -p 'test_check_patch_registry.py'
 
       - name: Projection provisioning contract (#644)
         run: bash scripts/check-projection-provisioning.sh
