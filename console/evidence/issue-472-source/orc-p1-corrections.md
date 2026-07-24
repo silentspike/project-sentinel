@@ -6,8 +6,8 @@ Scope: source and remote-build validation for the findings in the ORC review of
 PR #700. No runtime service, deployment VM, installed binary, configuration, or
 runtime data was accessed or changed during this correction pass.
 
-Current `origin/main@16c0e353861e29a9b4d181bebd9a9f4a432a49b3` is included
-through merge commit `1e7e89a`; the feature branch was not rebased. The
+Current `origin/main@85b8bef1f1f4bba758bee7eb04248e2622612392` is included
+through merge commit `b6a5289`; the feature branch was not rebased. The
 `llm_bridge` conflict retains main's one-second circuit-breaker reset and
 expires the stored deadline directly without a scheduler-dependent sleep.
 
@@ -51,6 +51,8 @@ was not changed. Build duration and host load are not runtime evidence.
 | Typos | `typos` | PASS |
 | Fenced writers | `python3 scripts/check-fenced-writers.py` | PASS |
 | Unsafe baseline | `python3 scripts/check-unsafe-baseline.py` | PASS, 26/26 |
+| Dependency patch registry | `python3 scripts/check-patch-registry.py` | PASS, 0 overrides, 0 registry entries, 4 direct Git dependencies |
+| Patch-registry unit tests | `python3 -m unittest scripts.tests.test_check_patch_registry` | PASS, 15 passed |
 
 ## Issue acceptance mapping
 
