@@ -454,6 +454,11 @@ pub enum DomainEventPayload {
         /// Vom Gateway aufgeloeste Kosten dieses Calls in USD.
         cost_usd: f64,
     },
+    /// Durable company-workflow event mirrored from the workflow-local
+    /// transaction into Limbo. The nested value preserves the complete
+    /// versioned workflow envelope without making sentinel-common depend on
+    /// the workflow crate.
+    CompanyWorkflowEvent { workflow_event: serde_json::Value },
 }
 
 impl DomainEventPayload {
@@ -502,6 +507,7 @@ impl DomainEventPayload {
             Self::PsiBandChanged { .. } => "psi_band_changed",
             Self::NodeProvisioned { .. } => "node_provisioned",
             Self::AgentLlmUsage { .. } => "agent_llm_usage",
+            Self::CompanyWorkflowEvent { .. } => "company_workflow_event",
         }
     }
 }

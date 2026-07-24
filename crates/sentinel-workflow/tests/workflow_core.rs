@@ -1563,7 +1563,7 @@ fn completion_outbox_recovers_timeout_restart_and_duplicate_without_double_commi
             command.clone(),
         )
         .expect_err("first authority lookup times out");
-    assert_eq!(timeout.code, WorkflowErrorCode::ExecutionUnavailable);
+    assert_eq!(timeout.code, WorkflowErrorCode::CompletionUnavailable);
     assert_eq!(
         store
             .pending_completion_evidence(10)
@@ -1600,7 +1600,7 @@ fn completion_outbox_recovers_timeout_restart_and_duplicate_without_double_commi
         .execute(
             actor(ActorRole::Developer, 2),
             "completion-timeout",
-            command,
+            command.clone(),
         )
         .expect("duplicate command reads completed result");
     assert!(replay.replayed);
@@ -1613,6 +1613,22 @@ fn completion_outbox_recovers_timeout_restart_and_duplicate_without_double_commi
             .state,
         WorkItemState::Done
     );
+
+    drop(restarted);
+    let (degraded, _) = engine_with_ports(
+        &database,
+        Arc::new(FakeExecutionPort::default()),
+        Arc::new(FakeOrganizationPort::with_defaults()),
+        Arc::new(UnavailableCompletionEvidencePort),
+    );
+    let degraded_replay = degraded
+        .execute(
+            actor(ActorRole::Developer, 2),
+            "completion-timeout",
+            command,
+        )
+        .expect("durable completion replay does not require a live authority");
+    assert!(degraded_replay.replayed);
 }
 
 #[test]
@@ -1686,12 +1702,12 @@ fn completion_outbox_is_bounded_when_evidence_authority_keeps_timing_out() {
             },
         )
         .expect_err("initial authority timeout");
-    assert_eq!(error.code, WorkflowErrorCode::ExecutionUnavailable);
+    assert_eq!(error.code, WorkflowErrorCode::CompletionUnavailable);
     for _ in 0..2 {
         let error = engine
             .dispatch_pending_completion_evidence(1)
             .expect_err("bounded authority retry times out");
-        assert_eq!(error.code, WorkflowErrorCode::ExecutionUnavailable);
+        assert_eq!(error.code, WorkflowErrorCode::CompletionUnavailable);
     }
     assert_eq!(completion.calls(), 3);
     assert!(engine

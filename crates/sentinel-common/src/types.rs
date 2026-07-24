@@ -593,6 +593,17 @@ pub struct FsMetadataDump {
     pub trash_queue: Vec<([u8; 32], u64)>,
 }
 
+/// Verified company-workflow SQLite image embedded in a world snapshot.
+///
+/// The manifest remains JSON bytes so this common snapshot envelope does not
+/// depend on the workflow crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompanyWorkflowSnapshot {
+    pub database: Vec<u8>,
+    pub manifest_json: Vec<u8>,
+    pub limbo_event_cursor: i64,
+}
+
 /// ECS World-State Snapshot (alle Components + Resources).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EcsSnapshot {
@@ -651,14 +662,16 @@ pub struct WorldSnapshot {
     pub projection_offsets: Vec<(String, i64)>,
     #[serde(default)]
     pub fs_metadata: Option<FsMetadataDump>,
+    #[serde(default)]
+    pub company_workflow: Option<CompanyWorkflowSnapshot>,
 }
 
 impl WorldSnapshot {
     /// Aktuelle Schema-Version fuer bincode Kompatibilitaet.
-    /// v3 (#491): EcsSnapshot um `autonomy_cooldowns` + 4 Buffer-JSON-Felder erweitert.
-    /// Der Decoder faellt ueber `WorldSnapshotV2` (v2, Buffer-frei) und `WorldSnapshotV1`
-    /// (pre-`fs_metadata`) zurueck. Replay (#491 PR-B) verlangt Anchor `schema_version >= 3`.
-    pub const SCHEMA_VERSION: u32 = 3;
+    /// v4 (#695) adds a verified company-workflow SQLite image and its Limbo
+    /// publication cursor. v3 (#491) added `autonomy_cooldowns` and four
+    /// buffer fields. The decoder retains v3, v2, and v1 fallbacks.
+    pub const SCHEMA_VERSION: u32 = 4;
 }
 
 /// Per-container ECS snapshot (#497): exactly ONE agent's per-agent components — and nothing else.

@@ -23,6 +23,6 @@ pub use port::{
     UnavailableOrganizationRuntimePort, WorkExecutionError, WorkExecutionPort,
 };
 pub use profile::CanonicalWorkProfile;
-pub use store::{ProjectionCheckpoint, WorkflowBackupManifest, WorkflowStore};
+pub use store::{ProjectionCheckpoint, WorkflowBackupImage, WorkflowBackupManifest, WorkflowStore};
 
 pub const WORKFLOW_SCHEMA_VERSION: u32 = 2;

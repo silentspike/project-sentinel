@@ -144,6 +144,44 @@ impl From<WorldSnapshotV2> for WorldSnapshot {
             ecs: snapshot.ecs.into(),
             projection_offsets: snapshot.projection_offsets,
             fs_metadata: snapshot.fs_metadata,
+            company_workflow: None,
+        }
+    }
+}
+
+/// World-Snapshot schema v3: current ECS shape before #695 added the
+/// company-workflow database to the application restore boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorldSnapshotV3 {
+    snapshot_id: String,
+    schema_version: u32,
+    tick: u64,
+    sim_hour: f32,
+    timestamp_ms: u64,
+    tier: SnapshotTier,
+    last_event_id: i64,
+    redb: RedbDump,
+    ecs: EcsSnapshot,
+    projection_offsets: Vec<(String, i64)>,
+    #[serde(default)]
+    fs_metadata: Option<FsMetadataDump>,
+}
+
+impl From<WorldSnapshotV3> for WorldSnapshot {
+    fn from(snapshot: WorldSnapshotV3) -> Self {
+        Self {
+            snapshot_id: snapshot.snapshot_id,
+            schema_version: snapshot.schema_version,
+            tick: snapshot.tick,
+            sim_hour: snapshot.sim_hour,
+            timestamp_ms: snapshot.timestamp_ms,
+            tier: snapshot.tier,
+            last_event_id: snapshot.last_event_id,
+            redb: snapshot.redb,
+            ecs: snapshot.ecs,
+            projection_offsets: snapshot.projection_offsets,
+            fs_metadata: snapshot.fs_metadata,
+            company_workflow: None,
         }
     }
 }
@@ -177,12 +215,13 @@ impl From<WorldSnapshotV1> for WorldSnapshot {
             ecs: snapshot.ecs.into(),
             projection_offsets: snapshot.projection_offsets,
             fs_metadata: None,
+            company_workflow: None,
         }
     }
 }
 
 pub fn decode_world_snapshot(bytes: &[u8]) -> anyhow::Result<WorldSnapshot> {
-    // v3 (aktuell): nur akzeptieren wenn vollstaendig konsumiert UND schema_version == 3.
+    // v4 (aktuell): nur akzeptieren wenn vollstaendig konsumiert UND schema_version == 4.
     // Der schema_version-Guard verhindert, dass ein aelterer (v2/v1) Byte-Stream durch zufaellige
     // bincode-Ausrichtung als v3 fehl-dekodiert wird (schema_version liegt in allen Versionen an
     // derselben Position: direkt hinter dem fuehrenden snapshot_id-String).
@@ -191,6 +230,15 @@ pub fn decode_world_snapshot(bytes: &[u8]) -> anyhow::Result<WorldSnapshot> {
     {
         if consumed == bytes.len() && snapshot.schema_version == WorldSnapshot::SCHEMA_VERSION {
             return Ok(snapshot);
+        }
+    }
+
+    // v3: current ECS replay fields, no company-workflow image.
+    if let Ok((snapshot, consumed)) =
+        bincode::serde::decode_from_slice::<WorldSnapshotV3, _>(bytes, legacy_config())
+    {
+        if consumed == bytes.len() && snapshot.schema_version == 3 {
+            return Ok(WorldSnapshot::from(snapshot));
         }
     }
 
@@ -271,6 +319,7 @@ mod tests {
             },
             projection_offsets: Vec::new(),
             fs_metadata: Some(FsMetadataDump::default()),
+            company_workflow: None,
         }
     }
 
@@ -393,13 +442,36 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_preserves_v3_fields() {
+    fn roundtrip_preserves_v4_and_v3_ecs_fields() {
         let snapshot = base_snapshot();
         let bytes = encode_world_snapshot(&snapshot).unwrap();
         let decoded = decode_world_snapshot(&bytes).unwrap();
-        assert_eq!(decoded.schema_version, 3);
+        assert_eq!(decoded.schema_version, 4);
         assert_eq!(decoded.ecs.autonomy_cooldowns, vec![(3, 100), (7, 250)]);
         assert_eq!(decoded.ecs.smells_json, b"{\"smells\":{}}".to_vec());
+    }
+
+    #[test]
+    fn decode_falls_back_to_v3_snapshots() {
+        let current = base_snapshot();
+        let legacy = WorldSnapshotV3 {
+            snapshot_id: "snap-v3".to_string(),
+            schema_version: 3,
+            tick: current.tick,
+            sim_hour: current.sim_hour,
+            timestamp_ms: current.timestamp_ms,
+            tier: current.tier,
+            last_event_id: current.last_event_id,
+            redb: current.redb,
+            ecs: current.ecs,
+            projection_offsets: current.projection_offsets,
+            fs_metadata: current.fs_metadata,
+        };
+        let bytes = bincode::serde::encode_to_vec(&legacy, legacy_config()).unwrap();
+        let decoded = decode_world_snapshot(&bytes).unwrap();
+        assert_eq!(decoded.schema_version, 3);
+        assert!(decoded.company_workflow.is_none());
+        assert_eq!(decoded.ecs.autonomy_cooldowns, vec![(3, 100), (7, 250)]);
     }
 
     #[test]

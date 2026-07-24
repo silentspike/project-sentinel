@@ -134,6 +134,7 @@ impl SnapshotManager {
         world: &mut bevy_ecs::world::World,
         state_store: &Arc<StateStore>,
         event_store: &Arc<EventStore>,
+        workflow_api: &crate::workflow_api::WorkflowApi,
         _data_dir: &Path,
         fs_layer: Option<&LayerManager>,
         fs_mount: Option<&str>,
@@ -160,8 +161,14 @@ impl SnapshotManager {
         // 3. Projection Offsets lesen
         let projection_offsets = event_store.get_all_offsets().unwrap_or_default();
 
-        // 4. Last Event ID
-        let last_event_id = event_store.get_latest_event_id().unwrap_or(0);
+        // 4. Flush the workflow-local event outbox and capture the verified
+        // workflow SQLite image at the exact Limbo cursor. If the workflow is
+        // disabled, preserve the existing event cursor behavior.
+        let company_workflow = workflow_api.time_machine_snapshot()?;
+        let last_event_id = company_workflow
+            .as_ref()
+            .map(|snapshot| snapshot.limbo_event_cursor)
+            .unwrap_or(event_store.get_latest_event_id().unwrap_or(0));
 
         // 5. WorldSnapshot zusammenbauen
         let snapshot_id = uuid::Uuid::now_v7().to_string();
@@ -182,6 +189,7 @@ impl SnapshotManager {
             ecs: ecs_snapshot,
             projection_offsets,
             fs_metadata,
+            company_workflow,
         };
 
         // 6. Snapshot serialisieren + in Limbo speichern

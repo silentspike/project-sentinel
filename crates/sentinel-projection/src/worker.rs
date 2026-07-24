@@ -593,4 +593,43 @@ mod tests {
         assert!(format!("{err:#}").contains("synthetic handler failure"));
         assert_eq!(worker.read_store().active_agent_count().unwrap(), 0);
     }
+
+    #[test]
+    fn company_workflow_events_advance_the_existing_projection_pipeline() {
+        let dir = tempdir().unwrap();
+        let event_store =
+            Arc::new(EventStore::open(dir.path().join("events.db").to_str().unwrap()).unwrap());
+        append_event(
+            &event_store,
+            1,
+            &DomainEventPayload::CompanyWorkflowEvent {
+                workflow_event: serde_json::json!({
+                    "event_id": "workflow-event-1",
+                    "aggregate_type": "request",
+                    "aggregate_id": "request-1"
+                }),
+            },
+        );
+
+        let config = ProjectionConfig {
+            poll_interval: std::time::Duration::from_millis(1),
+            batch_size: 16,
+            db_path: dir
+                .path()
+                .join("projection.db")
+                .to_string_lossy()
+                .to_string(),
+            rebuild_request_path: dir
+                .path()
+                .join(".projection-rebuild-request")
+                .to_string_lossy()
+                .to_string(),
+            rebuild_request_poll_interval: std::time::Duration::from_secs(1),
+        };
+        let worker = ProjectionWorker::new(Arc::clone(&event_store), config).unwrap();
+        let batch = event_store.get_events_since_with_id(0, 16).unwrap();
+
+        assert_eq!(worker.process_batch(&batch).unwrap(), 1);
+        assert_eq!(batch.len(), 1);
+    }
 }
