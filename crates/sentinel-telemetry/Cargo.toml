@@ -19,6 +19,7 @@ sentinel-common = { path = "../sentinel-common" }
 
 [dev-dependencies]
 criterion = { workspace = true }
+itertools = "=0.12.1" # Issue #633 artificial duplicate negative-gate fixture.
 
 [[bench]]
 name = "telemetry_bench"
